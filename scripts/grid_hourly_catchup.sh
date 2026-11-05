@@ -6,9 +6,19 @@
 
 set -u
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-GRID_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-/home/grid/grid_v4/venv/bin/python}"
+# Symlinks resolved (pwd -P): when cron calls the script through
+# /data/grid_v4/grid_release, the whole pass stays on one release even if a
+# deploy swaps the link mid-run.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+GRID_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+export GRID_ROOT
+
+# shellcheck source=grid_cron_env.sh
+source "${SCRIPT_DIR}/grid_cron_env.sh"
+
+# Same interpreter as the release systemd units unless PYTHON_BIN/GRID_PYTHON
+# says otherwise (this used to default to the old ~/grid_v4/venv).
+PYTHON_BIN="${PYTHON_BIN:-$(grid_cron_python)}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="${PYTHON_FALLBACK:-/usr/bin/python3}"
@@ -16,14 +26,9 @@ fi
 
 cd "${GRID_ROOT}" || exit 1
 
-if [[ -f ".env" ]]; then
-    set -a
-    set +u
-    # shellcheck disable=SC1091
-    source ".env"
-    set -u
-    set +a
-fi
+# The release tree has no .env, so load the GRID env file explicitly and
+# stop here if it is missing: every step needs DB settings.
+grid_cron_load_env || exit $?
 
 run_step() {
     local name="$1"

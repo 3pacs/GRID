@@ -1,0 +1,41 @@
+{
+  "skill_name": "data-health",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Give me a health report on data sources before I run inference.",
+      "expected_output": "Staleness against per-type thresholds from the table, not a flat threshold; verifies source list against real files.",
+      "files": [],
+      "expectations": [
+        "Queries source freshness (resolved_series / source_catalog or the system health endpoint) rather than assuming",
+        "Applies per-source-type thresholds (real-time >1h, daily >36h, weekly >8d, monthly >35d, high-frequency alt-data >6h) rather than a single cutoff",
+        "Reports OK/WARNING/CRITICAL by source and a summary count",
+        "Verifies that endpoints and ingestion file paths the skill names actually exist before relying on them (for example /api/health/sources and ingestion/market/*) and reports any that do not"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Check which API keys are configured and tell me what will break silently.",
+      "expected_output": "FRED_API_KEY is the only one validated at startup; others fail silently.",
+      "files": [],
+      "expectations": [
+        "States FRED_API_KEY is the only key validated at startup (config.py) and is required",
+        "Lists KOSIS, COMTRADE, JQUANTS, USDA, NOAA, EIA keys as silent-failure keys (401 / empty results / rate limits)",
+        "Checks presence of keys via config values (booleans) and never prints the key values themselves",
+        "Recommends warning-level logging for missing optional keys"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Model predictions look off. I think a series has NaNs that got silently converted. How do I audit it?",
+      "expected_output": "ATTENTION #13/#14 NaN handling audit and graceful degradation.",
+      "files": [],
+      "expectations": [
+        "Treats silent NaN conversion as a candidate cause and audits the specific series over a recent window (for example 7 days)",
+        "Compares NaN handling across ingestion modules for inconsistency",
+        "Recommends flagging or failing on NaN rather than silently coercing to 0 or forward-filling without a log",
+        "Checks data freshness for the affected series as a competing explanation"
+      ]
+    }
+  ]
+}

@@ -261,7 +261,7 @@ async def get_scorecard(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Hybrid AstroGrid market scorecard using existing GRID read paths."""
-    from api.routers.watchlist import _batch_fetch_prices, _cache_price_to_db
+    from api.routers.watchlist import _batch_fetch_prices
 
     engine = get_db_engine()
     history_start = date.today() - timedelta(days=120)
@@ -287,10 +287,6 @@ async def get_scorecard(
                 else []
             )
             live_quote = live_quotes.get(asset["lookup_ticker"])
-            if live_quote and live_quote.get("price") is not None:
-                _cache_price_to_db(
-                    engine, asset["lookup_ticker"], float(live_quote["price"]), date.today()
-                )
             item = _build_scorecard_item(
                 asset, feature_name, candidate_features, history, live_quote
             )

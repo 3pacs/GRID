@@ -37,7 +37,7 @@ Use to find:
 - Outstanding shares
 
 ### 3. griddb (PostgreSQL — already loaded with GRID features)
-Connection: postgresql://grid:grid2026@localhost:5432/griddb
+Connection: postgresql://grid:${GRID_DB_PASSWORD}@localhost:5432/griddb
 
 Key tables:
 - `trial_signals`     ← YOUR OUTPUT TABLE (schema below)

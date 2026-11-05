@@ -46,11 +46,11 @@ Add to your `~/.claude/settings.json`:
     "PreToolUse": [
       {
         "matcher": "Edit",
-        "hooks": [{ "type": "command", "command": "node ~/.claude/skills/strategic-compact/suggest-compact.js" }]
+        "hooks": [{ "type": "command", "command": "bash ~/dev/GRID/.claude/skills/strategic-compact/suggest-compact.sh" }]
       },
       {
         "matcher": "Write",
-        "hooks": [{ "type": "command", "command": "node ~/.claude/skills/strategic-compact/suggest-compact.js" }]
+        "hooks": [{ "type": "command", "command": "bash ~/dev/GRID/.claude/skills/strategic-compact/suggest-compact.sh" }]
       }
     ]
   }
@@ -103,8 +103,8 @@ Instead of loading full skill content at session start, use a trigger table that
 
 | Trigger | Skill | Load When |
 |---------|-------|-----------|
-| "test", "tdd", "coverage" | tdd-workflow | User mentions testing |
-| "security", "auth", "xss" | security-review | Security-related work |
+| "test", "tdd", "coverage" | python-testing | User mentions testing |
+| "security", "auth", "xss" | security-reviewer agent | Security-related work |
 | "deploy", "ci/cd" | deployment-patterns | Deployment context |
 
 ### Context Composition Awareness
@@ -128,4 +128,4 @@ Common sources of duplicate context:
 
 - [The Longform Guide](https://x.com/affaanmustafa/status/2014040193557471352) — Token optimization section
 - Memory persistence hooks — For state that survives compaction
-- `continuous-learning` skill — Extracts patterns before session ends
+- `/learn` command — Extracts patterns before session ends

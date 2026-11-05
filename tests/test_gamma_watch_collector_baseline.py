@@ -2,6 +2,7 @@
 import ast
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,13 @@ def test_import_matches_captured_manifest():
     assert len(manifest["files"]) == 16
     for entry in manifest["files"]:
         body = (ROOT / entry["path"]).read_bytes()
+        if entry["path"] == "index.html":
+            # The manifest is an immutable import receipt, not a current-page
+            # checksum. Verify the original bytes beneath the additive alert.
+            body, additions = re.subn(
+                rb'<script id="gamma-regime-alert">.*?</script>\n',
+                b"", body, flags=re.S)
+            assert additions == 1
         assert hashlib.sha256(body).hexdigest() == entry["repository_lf_sha256"]
 
 

@@ -24,8 +24,31 @@ BLS_SERIES_LIST: list[str] = [
     "LNS14000000",     # Unemployment Rate
     "CUUR0000SA0",     # CPI-U All Items
     "PRS85006092",     # Nonfarm Business Productivity
-    "JTS00000000JOL",  # JOLTS Job Openings
+    # JOLTS job openings, total nonfarm. The 14-character "JTS00000000JOL"
+    # this list carried is not a BLS id: the API answered "Series does not
+    # exist for Series JTS00000000JOL" (probed from grid-svr 2026-11-04) and
+    # nothing was ever stored. The 21-character id returns data (2026 M09
+    # 7523). normalization/entity_map.py still maps the old id.
+    "JTS000000000000000JOL",
 ]
+
+# BLS publishes "-" for an observation that will never exist -- e.g. October
+# 2025 for LNS14000000 / CUUR0000SA0, footnote "Data unavailable due to the
+# 2025 lapse in appropriations." It is a known no-data marker, not bad data.
+_BLS_NO_DATA_MARKERS: frozenset[str] = frozenset({"-", ""})
+
+# Process-scoped de-duplication for messages that are identical on every run
+# (no-data markers, BLS per-series messages). The first sighting is logged;
+# repeats are DEBUG.
+_REPORTED_ONCE: set[tuple[str, ...]] = set()
+
+
+def _first_sighting(*key: str) -> bool:
+    """Return True the first time ``key`` is seen in this process."""
+    if key in _REPORTED_ONCE:
+        return False
+    _REPORTED_ONCE.add(key)
+    return True
 
 # BLS API endpoint
 _BLS_API_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
@@ -97,6 +120,25 @@ class BLSPuller(BasePuller):
             return None
         return date(int(year), month, 1)
 
+    def pull_all(self, start_year: int | None = None) -> dict[str, Any]:
+        """SmartScheduler entry point: the default BLS series, one bounded request.
+
+        Pulls :data:`BLS_SERIES_LIST` from ``start_year`` (default: two years
+        before the current one) through the current year. That window is a
+        single BLS query per 50-series chunk -- well under the 20-year span
+        a keyed request allows -- and wide enough to pick up any monthly
+        observation first published since the previous weekly run. Dates
+        already stored as SUCCESS are skipped, so raw_series is only ever
+        appended to (see :meth:`_fetch_and_store`).
+
+        Returns:
+            The :meth:`pull_series` result (``rows_inserted``, ``status``,
+            ``errors``).
+        """
+        if start_year is None:
+            start_year = date.today().year - 2
+        return self.pull_series(start_year=start_year)
+
     def pull_series(
         self,
         series_ids: list[str] | None = None,
@@ -151,6 +193,8 @@ class BLSPuller(BasePuller):
             series_chunks.append(series_ids[i : i + _MAX_SERIES_PER_QUERY])
 
         total_inserted = 0
+        requests_attempted = 0
+        requests_succeeded = 0
 
         for chunk in series_chunks:
             for yr_start, yr_end in year_ranges:
@@ -163,12 +207,21 @@ class BLSPuller(BasePuller):
                     result["errors"].append(msg)
                     result["status"] = "PARTIAL"
                     result["rows_inserted"] = total_inserted
+                    if requests_attempted and not requests_succeeded:
+                        result["status"] = "FAILED"
                     return result
 
                 inserted = self._fetch_and_store(chunk, yr_start, yr_end, result)
-                total_inserted += inserted
+                requests_attempted += 1
+                if inserted is not None:
+                    # A successful empty or duplicate-only response still
+                    # counts as request success, independently of stored rows.
+                    requests_succeeded += 1
+                    total_inserted += inserted
 
         result["rows_inserted"] = total_inserted
+        if requests_attempted and not requests_succeeded:
+            result["status"] = "FAILED"
         log.info("BLS pull complete — {n} rows inserted", n=total_inserted)
         return result
 
@@ -178,7 +231,7 @@ class BLSPuller(BasePuller):
         start_year: int,
         end_year: int,
         result: dict[str, Any],
-    ) -> int:
+    ) -> int | None:
         """Make a single BLS API request and store the results.
 
         Parameters:
@@ -188,7 +241,8 @@ class BLSPuller(BasePuller):
             result: Mutable result dict to append errors to.
 
         Returns:
-            int: Number of rows inserted.
+            Number of rows inserted (including zero on a successful response),
+            or None when the request fails. Database errors still propagate.
         """
         payload: dict[str, Any] = {
             "seriesid": series_ids,
@@ -214,17 +268,29 @@ class BLSPuller(BasePuller):
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as exc:
-            log.error("BLS API request failed: {err}", err=str(exc))
+            # Transport/HTTP failure: operational, not a code bug.
+            log.warning("BLS API request failed: {err}", err=str(exc))
             result["errors"].append(str(exc))
             result["status"] = "PARTIAL"
-            return 0
+            return None
 
         if data.get("status") != "REQUEST_SUCCEEDED":
             msg = f"BLS API error: {data.get('message', 'Unknown error')}"
-            log.error(msg)
+            # e.g. REQUEST_NOT_PROCESSED "daily threshold ... reached":
+            # an operational refusal, not a code bug.
+            log.warning(msg)
             result["errors"].append(msg)
             result["status"] = "PARTIAL"
-            return 0
+            return None
+
+        # A succeeded request can still carry per-series messages, e.g.
+        # "Series does not exist for Series X". They were ignored silently.
+        for message in data.get("message") or []:
+            text_msg = str(message)
+            if _first_sighting("message", text_msg):
+                log.warning("BLS API message: {m}", m=text_msg)
+            else:
+                log.debug("BLS API message (repeat): {m}", m=text_msg)
 
         inserted = 0
         with self.engine.begin() as conn:
@@ -239,9 +305,20 @@ class BLSPuller(BasePuller):
                     if obs_date_val is None:
                         continue
 
+                    raw_value = obs.get("value", "0")
+                    if isinstance(raw_value, str) and raw_value.strip() in _BLS_NO_DATA_MARKERS:
+                        # Known permanent gap: skip quietly, once per
+                        # (series, period) per process at INFO.
+                        key = ("no_data", sid, str(obs.get("year")), str(obs.get("period")))
+                        emit = log.info if _first_sighting(*key) else log.debug
+                        emit(
+                            "BLS {sid} {yr}/{p}: no data published ({v!r}); skipped",
+                            sid=sid, yr=obs.get("year"), p=obs.get("period"), v=raw_value,
+                        )
+                        continue
                     try:
-                        value = float(obs.get("value", "0").replace(",", ""))
-                    except (ValueError, TypeError):
+                        value = float(raw_value.replace(",", ""))
+                    except (ValueError, TypeError, AttributeError):
                         log.warning(
                             "Invalid BLS value for {sid} {yr}/{p}: {v}",
                             sid=sid,

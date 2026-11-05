@@ -1,8 +1,9 @@
 """Tests for store/people_events.py.
 
 The `PeopleEvent` validation tests need no database. The upsert/read tests
-run against real PostgreSQL in a throwaway schema built from this PR's own
-migration (migrations/versions/people_events_20260927.py) and skip cleanly
+run against real PostgreSQL in a throwaway schema built from the people_events
+migration chain (people_events_20260927 -> security_master_20260927 ->
+people_events_v2_20261001) and skip cleanly
 when no PostgreSQL is reachable, following
 tests/test_raw_series_quarantined_migration_pg.py's `pg_engine` pattern.
 """
@@ -19,7 +20,14 @@ from sqlalchemy.engine import Engine
 
 from store.people_events import PeopleEvent, read_events, upsert_event
 
-_MIGRATION_MODULE = "migrations.versions.people_events_20260927"
+# people_events_v2_20261001 changed the conflict target (partial unique index
+# over current versions) and needs security_master for its foreign key, so
+# the scratch schema is built from the whole chain the store now targets.
+_MIGRATION_MODULES = (
+    "migrations.versions.people_events_20260927",
+    "migrations.versions.security_master_20260927",
+    "migrations.versions.people_events_v2_20261001",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -91,18 +99,19 @@ def scratch(pg_engine: Engine):
         conn.execute(text(f'CREATE SCHEMA "{schema}"'))
     engine = create_engine(pg_engine.url, connect_args={"options": f"-csearch_path={schema}"})
     try:
-        migration = importlib.import_module(_MIGRATION_MODULE)
         from alembic.migration import MigrationContext
         from alembic.operations import Operations
 
         with engine.connect() as conn:
             trans = conn.begin()
-            real_op = migration.op
-            migration.op = Operations(MigrationContext.configure(conn))
-            try:
-                migration.upgrade()
-            finally:
-                migration.op = real_op
+            for name in _MIGRATION_MODULES:
+                migration = importlib.import_module(name)
+                real_op = migration.op
+                migration.op = Operations(MigrationContext.configure(conn))
+                try:
+                    migration.upgrade()
+                finally:
+                    migration.op = real_op
             trans.commit()
         yield engine
     finally:

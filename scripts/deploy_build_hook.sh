@@ -45,6 +45,17 @@ cd "$CANDIDATE_DIR"
 
 pip install -r requirements.txt
 
+# 2026-11-04: the GRID units run the Python 3.14 venv (deploy/python314/cutover.sh writes a py314.conf drop-in per
+# unit), so the same requirements go into it as well, under the 3.14 lock that CI's "Python 3.14" job tests. The
+# 3.10 install above stays current so `cutover.sh rollback` keeps working. Like that install, this updates an
+# environment the running services use. Skipped when the venv is absent (hosts that never ran build_venv.sh).
+GRID_VENV_314="${GRID_VENV_314:-/data/grid_v4/grid_venv-314}"
+if [ -x "${GRID_VENV_314}/bin/python" ]; then
+  "${GRID_VENV_314}/bin/pip" install -r requirements.txt \
+    -r deploy/python314/requirements-runtime.txt -c deploy/python314/constraints-3.14.txt
+  "${GRID_VENV_314}/bin/pip" check
+fi
+
 # npm/node version pinning is handled by the caller (deploy.yml's "Set up
 # Node" step, run once per job before this hook is invoked) via $PATH -- this
 # hook does not repeat that setup.

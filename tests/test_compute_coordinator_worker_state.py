@@ -238,14 +238,12 @@ def test_boogerbots_dry_run_rejects_ocmri_escalation_and_missing_audit():
 
 def test_boogerbots_live_submit_is_blocked_until_w1_enabled():
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(
-            coordinator.create_job(
-                coordinator.JobCreate(
-                    job_type=coordinator.JobType.LLM_INFERENCE,
-                    name="boogerbots live submit should fail closed",
-                    tenant="boogerbots",
-                    priority={"class": "boogerbots-background", "value": 10},
-                )
+        coordinator.create_job(
+            coordinator.JobCreate(
+                job_type=coordinator.JobType.LLM_INFERENCE,
+                name="boogerbots live submit should fail closed",
+                tenant="boogerbots",
+                priority={"class": "boogerbots-background", "value": 10},
             )
         )
 

@@ -1,6 +1,6 @@
 ---
 name: hermes-operations
-description: Operate the Hermes autonomous daemon — the 24/7 self-healing scheduler for all GRID background tasks. Use when adding scheduled tasks, debugging why a puller or pipeline step isn't running, understanding the Hermes cycle structure, or diagnosing stale data and failed cycles.
+description: Operate the Hermes autonomous daemon — the 24/7 self-healing scheduler for background tasks. Use when adding scheduled steps or debugging why a scheduled step or puller did not run (cycle structure, time gates, timeouts); for source freshness thresholds, API keys, or NaN quality use data-health.
 ---
 
 # hermes-operations
@@ -12,36 +12,57 @@ Operating the Hermes autonomous daemon — the 24/7 self-healing system that run
 - Adding new scheduled tasks to Hermes
 - Debugging why a puller or pipeline step isn't running
 - Understanding the Hermes cycle structure
-- Monitoring system health and freshness
-- Diagnosing stale data or failed cycles
+- Reading the health and hermes-status endpoints (freshness thresholds and key presence are data-health)
+- Diagnosing failed or starved cycles (a step that never ran, a cycle that hit its budget)
 
 ## Cycle Structure
 
 Every 5 minutes, Hermes runs one cycle:
 
 ```
-1. Health check (DB, data freshness, LLM availability)
-2. Pull fixer (retry failed ingestion with diagnosis)
-3. Pipeline runner (full pipeline on 6h schedule)
-4. Data gatherer (fill historical gaps)
-5. Autoresearch (hypothesis generation when healthy)
-6. Self-diagnostics (read own error logs, propose fixes)
-7. Specialized tasks:
-   7a-7d. Scheduled pullers (FRED, yfinance, BLS, altdata)
-   7e.    Alpha research heartbeat + signal publishing
-   7f.    Intelligence modules (trust scoring, forensics, etc.)
-   7g.    Rotation paper trading (daily 17:00-17:30 UTC)
-   7h.    Tiingo bulk data pull (overnight 02:00-06:00 UTC)
-   7i.    AstroGrid celestial cycle (hourly; sky snapshot + interpretation)
+0. Git pull (sync latest code/config)
+1. Health check (DB, connection pool, Hermes health, alert thresholds)
+1b. Obsidian vault sync + agent cycle
+2. Fix broken pulls (diagnose_and_fix_pulls with cooldown + smart retry)
+2b. Proactively re-pull stale sources (up to 15 per cycle)
+3. Smart ingestion (SmartScheduler runs due/stale pullers)
+3b. Conflict resolution (raw_series → resolved_series via canonical resolver)
+4. Data gaps (skipped; handled by SmartScheduler)
+5. Self-diagnostics (every 6th cycle / 30 min)
+6. Autoresearch (every 12th cycle / 1 hour, bounded and fenced)
+7. Specialized periodic tasks:
+   7.      UX Audit (every 72nd cycle / ~6 hours)
+   7b.     Daily digest email (once per day)
+   7c.     100x Digest (every 4 hours)
+   7c-ii.  Solana top-volume snapshot (every 4 hours)
+   7c-iii. Supply Chain Pulse watchdog (every 6 hours)
+   7c-iv.  News contagion listener (every 15 minutes)
+   7c2.    AstroGrid celestial cycle (hourly, ahead of oracle; sky snapshot + interpretation)
+   7d.     Oracle prediction cycle (every 6 hours)
+   7d-ii.  TimesFM forecast cycle (every 6 hours)
+   7d-iii. AutoBNN changepoint detection (every 12 hours)
+   7d-iv - 7d-vi. Gemma micro classification, narration, knowledge mapping
+   7e.     Alpha research heartbeat + signal publishing (every cycle)
+   7f.     Sector health snapshot & intelligence modules (trust scoring, cross-reference, etc.)
+   7g.     Rotation paper trading (daily after 17:00 UTC)
+   7h.     Tiingo bulk data pull (overnight 02:00-06:00 UTC)
 8. Git push (commit analytical outputs)
-9. Save cycle snapshot
+8b. LLM Task Queue status
+9. Save cycle snapshot & Obsidian cycle report
 ```
+
+The AstroGrid step first shipped as 7i, last in the cycle, and starved: every
+grid-hermes restart rebuilds `OperatorState`, which resets `last_oracle_cycle` and
+reopens the 6-hour oracle gate, so each post-restart cycle ran a full oracle pass
+and never reached the steps behind it. It now runs ahead of the oracle because it
+has no dependency on it. Steps 7e-7h still sit behind the oracle gate, which lives
+only in memory (source comment at step 7c2 in `run_cycle()`).
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `scripts/hermes_operator.py` | Main daemon (~1800 lines) |
+| `scripts/hermes_operator.py` | Main daemon (~4700 lines) |
 | `ingestion/scheduler.py` | Pull schedule definitions |
 | `scripts/hermes_operator.py:run_cycle()` | One cycle logic |
 | `scripts/hermes_operator.py:OperatorState` | Persistent state across cycles |
@@ -75,12 +96,11 @@ Every 5 minutes, Hermes runs one cycle:
    if CYCLE_TIMEOUT_SECONDS - elapsed < MY_TASK_TIMEOUT_SECONDS:
        # defer; leave the marker alone so the next cycle retries
    ```
-
-   The budgeted steps ahead of 7i already total more than
-   `CYCLE_TIMEOUT_SECONDS`, so a slow cycle can reach a late step with nothing
-   left — and a budgeted step that starts there takes the whole cycle down
-   rather than just itself. Cycles run every 5 minutes, so deferring costs one
-   cycle, not the slot. See step 7i for a worked example.
+   The budgeted steps ahead of a task can consume cycle budget, so a slow
+   cycle can reach a step with insufficient time left — and a budgeted step
+   that starts without enough budget takes the whole cycle down rather than
+   just itself. Cycles run every 5 minutes, so deferring costs one cycle, not
+   the slot. See step 7c2 (AstroGrid celestial cycle) for a worked example.
 
 ## Service Management
 
@@ -108,17 +128,17 @@ python3 scripts/hermes_operator.py --once --dry-run
 | Puller returns 0 rows | API key expired or rate limited | Check .env, test API manually |
 | Cycle takes >15 min | Resolver scanning full raw_series | Use lookback_days=7 |
 | Git push fails | Merge conflict or auth | Manual git pull/push |
-| LLM unavailable | llama.cpp crashed | `sudo systemctl restart grid-llamacpp` |
+| LLM unavailable | local LLM node down (`llm.router` Tier.LOCAL) | `grid-llamacpp` was retired 2026-09-10; see `docs/SERVER-SERVICES.md` for the current LLM nodes |
 | Stale data (>26h) | Puller blacklisted | Check source_catalog, clear blacklist |
 
 ## Monitoring
 
-Health endpoint: `GET http://localhost:8000/api/v1/system/health`
+Health endpoint: `GET http://localhost:8000/api/v1/system/health` (fields live under `checks`); per-task Hermes state: `GET /api/v1/system/hermes-status`
 
 Key fields:
 - `recent_data: true` — data pulled within 26h
 - `pool_healthy: true` — DB connection pool OK
-- `llm_available: true` — llama.cpp responding
-- `thread_ingestion: true` — background ingestion running
+- `llm_available: true` — `llm.router` local tier reachable
+- `database: true` — `SELECT 1` succeeded
 
 Cycle snapshots stored in `analytical_snapshots` table — query for history.

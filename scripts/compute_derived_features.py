@@ -115,7 +115,7 @@ COMPUTATIONS = [
     },
     {
         "name": "yc_butterfly_2_5_10",
-        "inputs": ["yc_2y", "yc_10y", "yc_5y"],
+        "inputs": ["yc_2y", "treasury_10y", "yc_5y"],
         "op": "butterfly",
         "params": {},
         "family": "rates",
@@ -123,7 +123,7 @@ COMPUTATIONS = [
     },
     {
         "name": "yc_term_premium",
-        "inputs": ["yc_10y", "yc_2y"],
+        "inputs": ["treasury_10y", "yc_2y"],
         "op": "term_premium",
         "params": {"window": 252},
         "family": "rates",

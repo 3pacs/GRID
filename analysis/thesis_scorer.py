@@ -50,7 +50,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
 
 
 # ── Constants ───────────────────────────────────────────────────────────
@@ -113,11 +113,8 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
     """Fed net liquidity: balance sheet minus TGA minus reverse repo.
 
     Logic: 30-day change in net liquidity.
-    - Change > +$100B → strong bullish (+60 to +80)
-    - Change > +$50B  → moderate bullish (+30 to +50)
-    - Change -$50B to +$50B → neutral (-20 to +20)
-    - Change < -$50B  → moderate bearish (-30 to -50)
-    - Change < -$100B → strong bearish (-60 to -80)
+    Existing arithmetic compares millions to 50/100, i.e. $50M/$100M.
+    These bands are preserved here; recalibration requires a separate review.
 
     Score scales linearly within bands.  Confidence from data freshness
     and historical accuracy.
@@ -172,7 +169,7 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
 
             if not bs_30:
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 20, f"${net_liq:,.0f}B current",
+                    0, 20, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
                     "need 30d history", "Current net liquidity known but no 30-day baseline.",
                     data_age_hours=age_hours, historical_accuracy=accuracy, status="stale")
 
@@ -201,11 +198,12 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
             return _verdict(
                 "fed_liquidity", "Fed Net Liquidity",
                 score, confidence,
-                data_point=f"${change:+,.0f}B 30d change (current ${net_liq:,.0f}B)",
-                threshold="bearish < -$50B, bullish > +$50B, strong at ±$100B",
+                data_point=(f"{format_liquidity_usd(change, unit='millions_usd', signed=True)} "
+                            f"30d change (current {format_liquidity_usd(net_liq, unit='millions_usd')})"),
+                threshold="current scoring bands: bearish < -$50M, bullish > +$50M, strong at ±$100M",
                 reasoning=(
-                    f"Net liquidity {'rose' if change > 0 else 'fell'} "
-                    f"${abs(change):,.0f}B over 30 days. "
+                    f"Net liquidity {'rose' if change > 0 else 'fell' if change < 0 else 'was unchanged by'} "
+                    f"{format_liquidity_usd(abs(change), unit='millions_usd')} over 30 days. "
                     f"{'Expanding liquidity supports risk assets.' if change > 50 else 'Contracting liquidity pressures risk assets.' if change < -50 else 'Liquidity roughly flat — no strong directional signal.'}"
                 ),
                 data_age_hours=age_hours,
@@ -829,6 +827,8 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
         total = len(rows)
         bull_count = len(bullish)
         bear_count = len(bearish)
+        neutral_count = sum(r[0] == "neutral" for r in rows)
+        other_count = total - bull_count - bear_count - neutral_count
 
         # Average confidence across all signals (0-1 scale)
         avg_conf = sum(float(r[1]) for r in rows) / total
@@ -857,14 +857,19 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             except Exception as exc:
                 log.warning("Failed to compute regime changepoints age: {e}", e=exc)
 
-        return _verdict(
+        result = _verdict(
             "regime_changepoints", "Regime Changepoints",
             score, confidence,
-            data_point=f"{bull_count} bullish, {bear_count} bearish, {total - bull_count - bear_count} neutral (48h, avg conf {avg_conf:.0%})",
+            data_point=(
+                f"{bull_count} bullish, {bear_count} bearish, "
+                f"{neutral_count} neutral, {other_count} other/unknown "
+                f"(48h, avg conf {avg_conf:.0%})"
+            ),
             threshold="each changepoint ~ +/-12 pts scaled by confidence; net direction determines signal",
             reasoning=(
                 f"{total} regime changepoints in 48h: "
                 f"{bull_count} bullish, {bear_count} bearish. "
+                f"{neutral_count} explicitly neutral; {other_count} other/unknown. "
                 f"Average confidence {avg_conf:.0%}, magnitude {avg_mag:.2f}. "
                 + ("Net bullish regime shifts suggest improving conditions. "
                    if net > 0
@@ -876,6 +881,12 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
         )
+        result["category_counts"] = {
+            "total": total, "bullish": bull_count, "bearish": bear_count,
+            "neutral": neutral_count, "other_unknown": other_count,
+            "known_categories_exhaustive": other_count == 0,
+        }
+        return result
     except Exception as exc:
         log.debug("Regime changepoints scorer error: {e}", e=str(exc))
         return _verdict(
@@ -2595,6 +2606,15 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
     Returns the snapshot ID, or None on failure.
     """
     try:
+        from intelligence.thesis_tracker import _ensure_tables, _snapshot_conviction_fraction
+        # This scorer's declared output is percent; normalize before any effect.
+        if thesis.get("conviction_unit", "percent") != "percent":
+            raise ValueError("scored thesis conviction_unit must be percent")
+        conviction = _snapshot_conviction_fraction({
+            "conviction": thesis["conviction"], "conviction_unit": "percent"})
+        if conviction is None:
+            return None
+        schema = _ensure_tables(engine)
         model_states = {}
         for m in thesis.get("models", []):
             model_states[m["key"]] = {
@@ -2621,15 +2641,17 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
         ]
 
         with engine.begin() as conn:
+            from intelligence.thesis_schema import require_thesis_connection
+            require_thesis_connection(conn, expected_schema=schema)
             row = conn.execute(text(
                 "INSERT INTO thesis_snapshots "
-                "(overall_direction, conviction, key_drivers, risk_factors, "
+                "(overall_direction, conviction, conviction_unit, key_drivers, risk_factors, "
                 "model_states, narrative) "
-                "VALUES (:dir, :conv, :kd, :rf, :ms, :narr) "
+                "VALUES (:dir, :conv, 'fraction', :kd, :rf, :ms, :narr) "
                 "RETURNING id"
             ), {
                 "dir": thesis["direction"].lower(),
-                "conv": thesis["conviction"] / 100,
+                "conv": conviction,
                 "kd": json.dumps(key_drivers),
                 "rf": json.dumps(risk_factors),
                 "ms": json.dumps(model_states),

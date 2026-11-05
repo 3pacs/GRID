@@ -1,62 +1,47 @@
+"""ingestion/price_fallback.py is fetch-only: its resolved_series writer is retired (E1-V7, DFa)."""
+
 from __future__ import annotations
 
+from pathlib import Path
 
-class _Result:
-    def __init__(self, row=None):
-        self._row = row
+import pytest
 
-    def fetchone(self):
-        return self._row
-
-
-class _Conn:
-    def __init__(self):
-        self.source_row = None
-        self.executed = []
-        self.resolved_params = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        return False
-
-    def execute(self, clause, params=None):
-        sql = str(clause)
-        params = dict(params or {})
-        self.executed.append((sql, params))
-
-        if "SELECT id FROM source_catalog" in sql:
-            return _Result(self.source_row)
-        if "INSERT INTO source_catalog" in sql:
-            self.source_row = (321,)
-            return _Result(self.source_row)
-        if "SELECT id FROM feature_registry" in sql:
-            return _Result((676,))
-        if "INSERT INTO resolved_series" in sql:
-            self.resolved_params.append(params)
-            return _Result()
-        return _Result()
+REPO = Path(__file__).resolve().parents[1]
 
 
 class _Engine:
+    """Records any use; the retired writer must never touch the database."""
+
     def __init__(self):
-        self.conn = _Conn()
+        self.used = False
 
     def begin(self):
-        return self.conn
+        self.used = True
+        raise AssertionError("save_to_db opened a transaction")
+
+    connect = begin
 
 
-def test_price_fallback_records_integer_source_priority():
-    from ingestion.price_fallback import PriceFallbackPuller
+def test_save_to_db_refuses_and_writes_nothing():
+    from ingestion.price_fallback import RETIRED_REASON, PriceFallbackPuller, PriceFallbackRetired
 
     engine = _Engine()
     puller = PriceFallbackPuller(db_engine=engine)
+    with pytest.raises(PriceFallbackRetired) as exc:
+        puller.save_to_db([{"ticker": "SPY", "price": 501.25, "date": "2026-05-27", "source": "stooq"}])
+    assert str(exc.value) == RETIRED_REASON
+    assert not engine.used
 
-    saved = puller.save_to_db([
-        {"ticker": "SPY", "price": 501.25, "date": "2026-05-27", "source": "stooq"}
-    ])
 
-    assert saved == 1
-    assert engine.conn.resolved_params[0]["src"] == 321
-    assert isinstance(engine.conn.resolved_params[0]["src"], int)
+def test_module_holds_no_resolved_series_or_source_catalog_write():
+    source = (REPO / "ingestion" / "price_fallback.py").read_text(encoding="utf-8").lower()
+    assert "insert into" not in source
+    assert ".execute(" not in source
+
+
+@pytest.mark.parametrize("rel", ["ingestion/scheduler.py", "intelligence/scheduler.py"])
+def test_schedulers_no_longer_run_the_fallback_writer(rel):
+    source = (REPO / rel).read_text(encoding="utf-8")
+    assert "PriceFallbackPuller" not in source
+    assert "pfp.save_to_db" not in source
+    assert ".do(_price_fallback)" not in source

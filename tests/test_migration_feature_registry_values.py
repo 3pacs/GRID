@@ -56,11 +56,18 @@ _ROW = re.compile(
 )
 
 
+# ingestion/seed_v2.py carries the same multi-row INSERT shape. Ten of its
+# rows used family='liquidity', so the whole statement was rejected and none
+# of its rows (the Fed liquidity block, 33 ETF flow proxies, ...) were ever
+# registered -- found 2026-11-04 as 47 ghost mappings. Guard it too.
+SEEDS = [Path(__file__).resolve().parents[1] / "ingestion" / "seed_v2.py"]
+
+
 def _files_inserting_into_feature_registry() -> list[Path]:
     out = []
     candidates = sorted(MIGRATIONS.glob("*.sql")) + sorted(
         (MIGRATIONS / "versions").glob("*.py")
-    )
+    ) + SEEDS
     for p in candidates:
         text = p.read_text(errors="replace")
         if re.search(r"INSERT\s+INTO\s+feature_registry", text, re.IGNORECASE):

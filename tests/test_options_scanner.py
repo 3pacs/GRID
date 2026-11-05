@@ -569,3 +569,69 @@ class TestNullableFloat:
 
     def test_garbage_becomes_none(self) -> None:
         assert _nullable_float("N/A") is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: signal-row freshness (2026-11-04)
+#
+# _get_current_signals took the latest quality row at or before scan_date
+# with no lower bound. CLDX's chain stopped on 2026-10-01 and that row was
+# re-scored and emailed as a fresh CALL on 21 scan days through 2026-11-03.
+# ---------------------------------------------------------------------------
+
+def _read_engine(row: tuple | None) -> tuple[MagicMock, list]:
+    seen: list = []
+    conn = MagicMock()
+
+    def _execute(stmt, params):
+        seen.append((str(stmt), params))
+        return MagicMock(fetchone=MagicMock(return_value=row))
+
+    conn.execute.side_effect = _execute
+    engine = MagicMock()
+    engine.connect.return_value.__enter__ = MagicMock(return_value=conn)
+    engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+    return engine, seen
+
+
+class TestSignalFreshness:
+    def test_read_is_bounded_below_by_max_age(self) -> None:
+        engine, seen = _read_engine(None)
+        scanner = _make_scanner(engine)
+
+        assert scanner._get_current_signals("CLDX", date(2026, 11, 3)) is None
+
+        sql, params = seen[0]
+        assert "signal_date >= :oldest" in sql and "signal_date <= :sd" in sql
+        assert params["oldest"] == date(2026, 11, 3) - pd.Timedelta(
+            days=OptionsScanner.MAX_SIGNAL_AGE_DAYS).to_pytimedelta()
+        assert OptionsScanner.MAX_SIGNAL_AGE_DAYS == 4
+
+    def test_row_carries_its_signal_date(self) -> None:
+        from datetime import datetime, timezone
+
+        captured = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
+        row = (2.4, 80.0, 1.9, 250_000, 40_000, date(2026, 11, 20), 100.0, 0.42,
+               0.51, 0.38, -0.2, 0.3, date(2026, 11, 3), captured)
+        engine, _ = _read_engine(row)
+
+        current = _make_scanner(engine)._get_current_signals("OMER", date(2026, 11, 3))
+
+        assert current["signal_date"] == date(2026, 11, 3)
+        assert current["created_at"] == captured
+
+    def test_opportunity_exposes_signal_date(self) -> None:
+        scanner = _scanner_with_row(_signal_row(signal_date=date(2026, 11, 2), created_at="ts"))
+        opp = scanner._scan_ticker("OMER", date(2026, 11, 3))[0]
+        assert opp.signal_date == date(2026, 11, 2)
+        assert opp.signal_captured_at == "ts"
+
+    def test_persisted_signals_keep_their_direction_vote(self) -> None:
+        import json
+
+        engine, conn = _write_engine()
+        opp = _make_opportunity(signals={"pcr": {"score": 7.0, "direction": "CALL", "value": 2.4}})
+        OptionsScanner(engine).persist_scan([opp])
+
+        signals = json.loads(_insert_params(conn)[0]["signals"])
+        assert signals["pcr"] == {"score": 7.0, "value": "2.4", "direction": "CALL"}

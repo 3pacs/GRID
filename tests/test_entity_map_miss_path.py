@@ -24,7 +24,15 @@ from unittest.mock import MagicMock
 import pytest
 from loguru import logger as log
 
+from normalization import entity_map as entity_map_module
 from normalization.entity_map import SEED_MAPPINGS, EntityMap
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_warning_memory(monkeypatch):
+    """The "Mapping exists" warning is once per *process* (the resolver
+    builds a new EntityMap per cycle); each test here models a fresh one."""
+    monkeypatch.setattr(entity_map_module, "_WARNED_MAPPED_MISSES", set())
 
 
 # A real mapping whose target is deliberately absent from the fixture

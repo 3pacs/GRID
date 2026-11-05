@@ -1,5 +1,14 @@
 """Materialize `people_events` rows from existing people-linked channels (GD2).
 
+SUPERSEDED (2026-10-01): `intelligence/people_events_pipeline/` replaces this
+module (design: wha/outputs/GRID-PEOPLE-EVENTS-PIPELINE-DESIGN-20261001.md).
+Its Form 4 dedup key (``TICKER|NAME|...``, order-sensitive name, no key
+version) and its known_at convention (next-session 14:30Z) differ from the
+pipeline's (``f4v2|...`` token-sorted names; 22:00 ET Section 16 cutoff, as
+VS1), and it reads `quiverquant:insider` rows whose ``created_at`` the
+pipeline proves is not a valid known_at bound. Do not activate this module;
+it is kept only until the pipeline's writer ships with its migration.
+
 Scope of this file -- read this before adding a channel
 ----------------------------------------------------------
 GD2 (wha/outputs/GRID-GRANULAR-DISCOVERY-PLAN-20260927.md, section 2.1 /

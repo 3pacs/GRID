@@ -59,6 +59,16 @@ BALTIC_SERIES: dict[str, dict[str, str]] = {
     },
 }
 
+# The public snapshot repo stopped updating on 2026-05-20 (last gh-pages
+# commit "Update latest.json" 2026-05-20T15:03Z, checked 2026-11-04). A
+# snapshot older than this is reported as a dead upstream, not as data.
+_SNAPSHOT_MAX_AGE_DAYS: int = 10
+
+# Process-scoped memory so a dead upstream is reported once per process,
+# not once per series per cycle (35 warnings/day before 2026-11-04).
+_KNOWN_DEAD_FRED_IDS: set[str] = set()
+_STALE_SNAPSHOT_REPORTED: set[date] = set()
+
 # Minimum delay between FRED API calls (seconds)
 _RATE_LIMIT_DELAY: float = 0.25
 _HTTP_TIMEOUT_SECONDS: float = 15.0
@@ -242,6 +252,14 @@ class BalticDryPuller(BasePuller):
             "errors": [],
         }
 
+        if fred_id in _KNOWN_DEAD_FRED_IDS:
+            return self._pull_public_snapshot_series(
+                grid_series_id,
+                start_date=start_date,
+                end_date=end_date,
+                fred_error=f"FRED series {fred_id} does not exist",
+            )
+
         try:
             obs_kwargs: dict[str, Any] = {
                 "observation_start": str(start_date),
@@ -309,10 +327,13 @@ class BalticDryPuller(BasePuller):
 
         except Exception as exc:
             if _fred_series_is_known_dead(exc):
-                log.warning(
-                    "Legacy FRED Baltic series {fid} is unavailable; using public snapshot fallback",
-                    fid=fred_id,
-                )
+                if fred_id not in _KNOWN_DEAD_FRED_IDS:
+                    _KNOWN_DEAD_FRED_IDS.add(fred_id)
+                    log.info(
+                        "Legacy FRED Baltic series {fid} no longer exists; using the "
+                        "public snapshot for the rest of this process",
+                        fid=fred_id,
+                    )
                 return self._pull_public_snapshot_series(
                     grid_series_id,
                     start_date=start_date,
@@ -375,6 +396,19 @@ class BalticDryPuller(BasePuller):
         try:
             snapshot = self._get_public_snapshot()
             obs_date = snapshot["date"]
+            age_days = (date.today() - obs_date).days
+            if age_days > _SNAPSHOT_MAX_AGE_DAYS:
+                reason = (
+                    f"Baltic source dead: FRED Baltic IDs no longer exist and the public "
+                    f"snapshot has been frozen at {obs_date} ({age_days} days old); no free "
+                    f"live Baltic index source is configured"
+                )
+                if obs_date not in _STALE_SNAPSHOT_REPORTED:
+                    _STALE_SNAPSHOT_REPORTED.add(obs_date)
+                    log.warning("{r}", r=reason)
+                result["status"] = "FAILED"
+                result["errors"].append(reason)
+                return result
             if not _date_in_requested_range(obs_date, start_date, end_date):
                 result["status"] = "PARTIAL"
                 result["errors"].append(
@@ -416,7 +450,7 @@ class BalticDryPuller(BasePuller):
             result["rows_inserted"] = inserted
             return result
         except Exception as exc:
-            log.error(
+            log.warning(
                 "Baltic public snapshot fallback failed for {gsid}: {err}",
                 gsid=grid_series_id,
                 err=str(exc),

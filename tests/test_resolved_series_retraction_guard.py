@@ -117,7 +117,8 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     # anti-join is now a plain report-only COUNT. Lowered 11 -> 8 to lock
     # in the improvement; this file is not yet migrated onto store.pit.
     "intelligence/resolution_audit.py": 8,
-    "intelligence/scheduler.py": 1,
+    # intelligence/scheduler.py: 1 -> 0 (DATA-FIX DFa): its one blind read fed the
+    # retired PriceFallback writer and was removed with the job.
     "intelligence/sleuth.py": 5,
     "intelligence/trend_tracker.py": 2,
     "ollama/celestial_briefing.py": 3,

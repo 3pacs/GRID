@@ -1,0 +1,33 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) needs an
+# explicit operator decision, and only AFTER migration
+# yf_latest_daily_vintage_20261019 is applied AND the first population was run
+# by hand (python3 scripts/refresh_yf_latest_vintage.py, ~10 minutes; this
+# unit's 20min timeout also covers it, but do the first run interactively).
+# Install (on grid-svr):
+#   sudo cp deploy/systemd/grid-yf-latest-vintage.service.template /etc/systemd/system/grid-yf-latest-vintage.service
+#   sudo cp deploy/systemd/grid-yf-latest-vintage.timer.template   /etc/systemd/system/grid-yf-latest-vintage.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-yf-latest-vintage.timer
+# WorkingDirectory follows grid-causal-links.service.template (the deployed
+# release tree), not the stale /home/grid/grid_v4/grid_repo checkout.
+[Unit]
+Description=GRID refresh of public.yf_latest_daily_vintage (latest Yahoo daily vintage per day; convenience cache, not PIT)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+# The deployed release tree (same tree grid-api runs from; .github/workflows/
+# deploy.yml resets it to main).
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-scheduler, grid-hermes and the godview writers use
+# (GRID DB settings) — this file itself still lives in the repo checkout.
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# REFRESH ... CONCURRENTLY under a 1200 s statement_timeout set by the script;
+# the unit timeout is only a backstop. flock keeps two refreshes from overlapping.
+ExecStart=/usr/bin/flock -n /tmp/grid-yf-latest-vintage.lock /usr/bin/python3 scripts/refresh_yf_latest_vintage.py
+TimeoutStartSec=25min
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal

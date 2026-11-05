@@ -171,6 +171,11 @@ def _text_hash(text_content: str) -> str:
     return hashlib.sha256(text_content.encode("utf-8", errors="replace")).hexdigest()[:8]
 
 
+# Missing Reddit credentials are a standing operator state; say so once per
+# process instead of on every 10-minute run.
+_reddit_unconfigured_warned = False
+
+
 class SmartMoneyPuller(BasePuller):
     """Tracks social smart money signals from Reddit and Finviz.
 
@@ -447,133 +452,7 @@ class SmartMoneyPuller(BasePuller):
         ),
     )
     def _fetch_finviz_insiders(self) -> list[dict[str, Any]]:
-        """Fetch insider trading data from Finviz.
-
-        Scrapes the Finviz insider trading page for recent transactions.
-        Falls back gracefully if the page structure changes.
-
-        Returns:
-            List of insider trade dicts.
-        """
-        self._finviz_source_unavailable = False
-        self._finviz_source_unavailable_reason = None
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml",
-        }
-
-        resp = requests.get(
-            _FINVIZ_INSIDER_URL,
-            headers=headers,
-            timeout=_REQUEST_TIMEOUT,
-        )
-        unavailable_reason = self._is_finviz_source_unavailable(resp)
-        if unavailable_reason is not None:
-            self._finviz_source_unavailable = True
-            self._finviz_source_unavailable_reason = unavailable_reason
-            log.warning(
-                "SmartMoney: Finviz insider source unavailable "
-                "({reason}); skipping source",
-                reason=unavailable_reason,
-            )
-            return []
-        resp.raise_for_status()
-        html = resp.text
-
-        # Parse insider trades from the HTML table
-        # Finviz uses a table with class "body-table"
-        trades: list[dict[str, Any]] = []
-
-        try:
-            # Simple regex-based parsing (avoids BeautifulSoup dependency)
-            # Table rows contain: Ticker, Owner, Relationship, Date,
-            # Transaction, Cost, #Shares, Value($), #Shares Total, SEC Form 4
-            row_pattern = re.compile(
-                r'<tr[^>]*class="cursor-pointer[^"]*"[^>]*>.*?</tr>',
-                re.DOTALL,
-            )
-            cell_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL)
-            link_text_pattern = re.compile(r'<a[^>]*>(.*?)</a>', re.DOTALL)
-
-            rows = row_pattern.findall(html)
-
-            for row_html in rows[:100]:  # Limit to 100 trades
-                cells = cell_pattern.findall(row_html)
-                if len(cells) < 9:
-                    continue
-
-                # Extract text from cells (strip HTML tags)
-                clean_cells = []
-                for cell in cells:
-                    link_match = link_text_pattern.search(cell)
-                    text_val = link_match.group(1) if link_match else cell
-                    text_val = re.sub(r'<[^>]+>', '', text_val).strip()
-                    clean_cells.append(text_val)
-
-                ticker = clean_cells[0].upper().strip()
-                owner = clean_cells[1].strip()
-                relationship = clean_cells[2].strip()
-                trade_date_str = clean_cells[3].strip()
-                transaction = clean_cells[4].strip()
-                cost = clean_cells[5].strip()
-                shares = clean_cells[6].strip()
-                value_str = clean_cells[7].strip()
-
-                if not ticker or ticker not in _KNOWN_TICKERS:
-                    continue
-
-                # Parse transaction type
-                direction = "NEUTRAL"
-                tx_lower = transaction.lower()
-                if "buy" in tx_lower or "purchase" in tx_lower:
-                    direction = "BULLISH"
-                elif "sale" in tx_lower or "sell" in tx_lower:
-                    direction = "BEARISH"
-
-                if direction == "NEUTRAL":
-                    continue
-
-                # Parse value
-                try:
-                    value_clean = value_str.replace(",", "").replace("$", "")
-                    trade_value = float(value_clean)
-                except (ValueError, TypeError):
-                    trade_value = 0.0
-
-                trades.append({
-                    "platform": "finviz_insider",
-                    "username": owner[:50],
-                    "ticker": ticker,
-                    "direction": direction,
-                    "relationship": relationship,
-                    "transaction": transaction,
-                    "trade_date": trade_date_str,
-                    "cost": cost,
-                    "shares": shares,
-                    "trade_value": trade_value,
-                    "trust_score": 0.7,  # Insiders get higher default trust
-                })
-
-        except Exception as exc:
-            log.warning(
-                "SmartMoney: Finviz insider parsing failed: {e}",
-                e=str(exc),
-            )
-
-        log.info(
-            "SmartMoney: parsed {n} insider trades from Finviz",
-            n=len(trades),
-        )
-        return trades
-
-    # ------------------------------------------------------------------ #
-    # Storage
-    # ------------------------------------------------------------------ #
+        raise RuntimeError("Finviz retired; use the separate SEC Form-4 source")
 
     def _store_signal(
         self,
@@ -629,7 +508,14 @@ class SmartMoneyPuller(BasePuller):
         # Emit signal_sources rows AFTER the raw_series write so the
         # raw ingest is never dropped due to a signal-source write fault.
         try:
-            self._emit_signal_sources(conn, signal, obs_date)
+            # Own savepoint, so a signal_sources fault cannot abort the
+            # enclosing transaction and take the raw_series row with it.
+            begin_nested = getattr(conn, "begin_nested", None)
+            if callable(begin_nested):
+                with begin_nested():
+                    self._emit_signal_sources(conn, signal, obs_date)
+            else:
+                self._emit_signal_sources(conn, signal, obs_date)
         except Exception as exc:
             log.warning(
                 "SmartMoney: signal_sources emission failed for "
@@ -781,13 +667,25 @@ class SmartMoneyPuller(BasePuller):
         if subreddits is None:
             subreddits = TARGET_SUBREDDITS
 
+        from ingestion.altdata.reddit_oauth import (
+            RedditNotConfigured,
+            reddit_credentials_configured,
+        )
+
+        # An unconfigured optional sub-source is SKIPPED (an operator
+        # choice), not FAILED: it must not drive failure cooldowns or the
+        # "failed sources" list. Checked before any fetch or DB read.
+        if getattr(self, "_reddit_client", None) is None and not reddit_credentials_configured():
+            return self._reddit_not_configured(
+                "REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET are not set; Reddit's Data "
+                "API requires a registered OAuth app (see ingestion/altdata/reddit_oauth.py)"
+            )
+
         today = date.today()
         self._load_trust_scores()
 
         all_signals: list[dict[str, Any]] = []
         failed_subs: list[str] = []
-
-        from ingestion.altdata.reddit_oauth import RedditNotConfigured
 
         for sub in subreddits:
             try:
@@ -803,14 +701,7 @@ class SmartMoneyPuller(BasePuller):
                     all_signals.extend(signals)
 
             except RedditNotConfigured as exc:
-                log.warning("SmartMoney: Reddit skipped: {e}", e=str(exc))
-                return {
-                    "source": "reddit",
-                    "status": "FAILED",
-                    "error": "reddit not configured",
-                    "signals_found": 0,
-                    "rows_inserted": 0,
-                }
+                return self._reddit_not_configured(str(exc))
             except Exception as exc:
                 failed_subs.append(sub)
                 log.warning(
@@ -831,22 +722,37 @@ class SmartMoneyPuller(BasePuller):
                 "rows_inserted": 0,
             }
 
+        # Some subreddits failed: committed rows are kept but coverage is
+        # incomplete, so the run cannot claim the source fresh.
+        status = "PARTIAL" if failed_subs else "SUCCESS"
+        partial_note = (
+            {"error": f"{len(failed_subs)} of {len(subreddits)} subreddit fetches failed"}
+            if failed_subs else {}
+        )
+
         if not all_signals:
             log.info("SmartMoney: no Reddit signals found")
             return {
                 "source": "reddit",
-                "status": "SUCCESS",
+                "status": status,
                 "signals_found": 0,
                 "rows_inserted": 0,
+                **partial_note,
             }
 
         inserted = 0
+        store_failures = 0
         with self.engine.begin() as conn:
             for signal in all_signals:
                 try:
-                    if self._store_signal(conn, signal, today):
-                        inserted += 1
+                    # A savepoint per signal: on PostgreSQL a failed statement
+                    # aborts the whole transaction, so swallowing it without
+                    # one would silently roll back every row counted so far.
+                    with conn.begin_nested():
+                        if self._store_signal(conn, signal, today):
+                            inserted += 1
                 except Exception as exc:
+                    store_failures += 1
                     log.debug(
                         "SmartMoney: failed to store Reddit signal: {e}",
                         e=str(exc),
@@ -858,90 +764,49 @@ class SmartMoneyPuller(BasePuller):
             i=inserted,
         )
 
+        if store_failures:
+            status = "PARTIAL"
+            partial_note = {"error": f"{store_failures} of {len(all_signals)} signals failed to store"}
         return {
             "source": "reddit",
-            "status": "SUCCESS",
+            "status": status,
             "signals_found": len(all_signals),
             "rows_inserted": inserted,
+            **partial_note,
+        }
+
+    def _reddit_not_configured(self, detail: str) -> dict[str, Any]:
+        """SKIPPED result for missing Reddit credentials; warns once per process."""
+        global _reddit_unconfigured_warned
+        if not _reddit_unconfigured_warned:
+            log.warning("SmartMoney: Reddit skipped: {e}", e=detail)
+            _reddit_unconfigured_warned = True
+        return {
+            "source": "reddit",
+            "status": "SKIPPED",
+            "reason": "reddit not configured",
+            "skipped_reason": "reddit not configured: set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET",
+            "signals_found": 0,
+            "rows_inserted": 0,
         }
 
     def pull_finviz_insiders(self) -> dict[str, Any]:
-        """Pull insider trading signals from Finviz.
-
-        Returns:
-            Dict with status, signals_found, rows_inserted.
-        """
-        today = date.today()
-
-        try:
-            trades = self._fetch_finviz_insiders()
-        except Exception as exc:
-            log.error(
-                "SmartMoney: Finviz insider pull failed: {e}",
-                e=str(exc),
-            )
-            return {
-                "source": "finviz_insider",
-                "status": "FAILED",
-                "signals_found": 0,
-                "rows_inserted": 0,
-                "error": str(exc),
-            }
-
-        if self._finviz_source_unavailable:
-            return {
-                "source": "finviz_insider",
-                "status": "SKIPPED",
-                "signals_found": 0,
-                "rows_inserted": 0,
-                "reason": (
-                    self._finviz_source_unavailable_reason
-                    or "finviz source unavailable"
-                ),
-            }
-
-        if not trades:
-            return {
-                "source": "finviz_insider",
-                "status": "SUCCESS",
-                "signals_found": 0,
-                "rows_inserted": 0,
-            }
-
-        inserted = 0
-        with self.engine.begin() as conn:
-            for trade in trades:
-                try:
-                    if self._store_signal(conn, trade, today):
-                        inserted += 1
-                except Exception as exc:
-                    log.debug(
-                        "SmartMoney: failed to store insider signal: {e}",
-                        e=str(exc),
-                    )
-
-        log.info(
-            "SmartMoney Finviz: {n} insider trades found, {i} stored",
-            n=len(trades),
-            i=inserted,
-        )
-
+        """Compatibility entry point: Finviz retired; existing SEC Form-4 remains."""
         return {
-            "source": "finviz_insider",
-            "status": "SUCCESS",
-            "signals_found": len(trades),
-            "rows_inserted": inserted,
+            "source": "finviz_insider", "status": "SKIPPED",
+            "signals_found": 0, "rows_inserted": 0,
+            "reason": "Finviz retired; insider filings use the separate SEC Form-4 source",
         }
 
     def pull_all(self) -> list[dict[str, Any]]:
-        """Pull all smart money signals (Reddit + Finviz insiders).
+        """Pull Reddit signals; Finviz is retired and SEC Form-4 is separate.
 
         Never stops on a single-source failure -- logs and continues.
 
         Returns:
             List of per-source result dicts.
         """
-        log.info("Starting smart money pull — Reddit + Finviz insiders")
+        log.info("Starting smart money pull — Reddit; Finviz retired")
 
         results: list[dict[str, Any]] = []
 

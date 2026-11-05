@@ -11,7 +11,7 @@ from ingestion import options
 from scripts import pull_options_gem_tickers as gem
 
 EXPECTED_TICKERS = [
-    "OPCH", "SPGI", "FLUT", "GEHC", "GLND", "BHRB",
+    "OPCH", "SPGI", "FLUT", "GEHC", "GLND",
     "SPY", "QQQ", "IWM",
 ]
 
@@ -33,7 +33,7 @@ def _mock_writer(monkeypatch: pytest.MonkeyPatch, results: list[dict]) -> list:
     return calls
 
 
-def test_gem_entrypoint_preserves_nine_tickers_and_six_expiries(
+def test_gem_entrypoint_preserves_eight_tickers_and_six_expiries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert list(gem.GEM_TICKERS) == EXPECTED_TICKERS
@@ -47,6 +47,7 @@ def test_gem_entrypoint_preserves_nine_tickers_and_six_expiries(
         "tickers": EXPECTED_TICKERS,
         "include_catalyst_universe": False,
         "max_expirations": 6,
+        "capture_source": "gem",
     })
     assert len(calls) == 2
 

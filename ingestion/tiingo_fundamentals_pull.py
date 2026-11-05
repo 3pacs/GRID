@@ -22,8 +22,10 @@ All tickers on commercial tier.
 from __future__ import annotations
 
 import os
+import math
 import time
-from datetime import date
+from collections.abc import Callable
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
@@ -37,6 +39,13 @@ _TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "")
 _BASE_URL = "https://api.tiingo.com"
 _RATE_LIMIT_DELAY = 0.3
 
+# Full-history start for a ticker with nothing stored yet.
+_BACKFILL_START = date(2020, 1, 1)
+# Incremental pulls re-request this many days before the latest stored date
+# so holidays, late prints and a missed day are still covered; existing rows
+# are skipped by the insert's NOT EXISTS guard.
+_INCREMENTAL_LOOKBACK_DAYS = 7
+
 # Fields from Tiingo daily fundamentals → GRID feature suffix
 _FIELD_MAP: dict[str, str] = {
     "marketCap": "market_cap",
@@ -45,6 +54,33 @@ _FIELD_MAP: dict[str, str] = {
     "pbRatio": "pb_ratio",
     "trailingPEG1Y": "peg_ratio",
 }
+
+
+# Only these locally authored diagnostics may cross the persistence boundary.
+_SAFE_LOCAL_ERRORS = (
+    "Tiingo daily response must be a list",
+    "Malformed Tiingo daily record",
+    "Invalid Tiingo fundamental value",
+    "Unknown affected row count",
+)
+
+
+def _safe_failure_message(exc: Exception) -> str:
+    """Exclude URLs, headers, bodies and nested exception text from results."""
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            return f"Tiingo HTTP request failed (status {status})"
+        return "Tiingo HTTP request failed"
+    if (
+        type(exc) is ValueError
+        and len(exc.args) == 1
+        and type(exc.args[0]) is str
+        and exc.args[0] in _SAFE_LOCAL_ERRORS
+    ):
+        return exc.args[0]
+    return "Tiingo fundamentals pull failed"
 
 
 class TiingoFundamentalsPuller(BasePuller):
@@ -81,32 +117,40 @@ class TiingoFundamentalsPuller(BasePuller):
             "errors": [],
         }
 
+        transaction_started = False
         try:
             url = f"{_BASE_URL}/tiingo/fundamentals/{ticker}/daily"
             params = {
-                "token": _TIINGO_API_KEY,
                 "startDate": str(start_date),
                 "endDate": str(end_date),
             }
 
-            r = requests.get(url, params=params, timeout=30)
+            headers = {"Authorization": f"Token {_TIINGO_API_KEY}"}
+            r = requests.get(url, params=params, headers=headers, timeout=30)
             r.raise_for_status()
             data = r.json()
 
-            if not data:
-                result["status"] = "NO_DATA"
+            if type(data) is not list:
+                raise ValueError("Tiingo daily response must be a list")
+            if data == []:
+                result["status"] = "NO_NEW_DATA"
                 return result
 
             rows_inserted = 0
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 for row in data:
+                    if not isinstance(row, dict) or "date" not in row or not any(k in row and row[k] is not None for k in _FIELD_MAP):
+                        raise ValueError("Malformed Tiingo daily record")
                     obs_date = pd.to_datetime(row["date"]).date()
 
                     for tiingo_field, grid_suffix in _FIELD_MAP.items():
                         value = row.get(tiingo_field)
                         if value is None:
                             continue
+                        if isinstance(value, bool) or not math.isfinite(float(value)):
+                            raise ValueError("Invalid Tiingo fundamental value")
 
                         series_id = f"TIINGO_FUND:{ticker}:{grid_suffix}"
                         f"{ticker.lower()}_{grid_suffix}"
@@ -130,30 +174,70 @@ class TiingoFundamentalsPuller(BasePuller):
                                 "val": float(value),
                             },
                         )
-                        rows_inserted += max(0, int(res.rowcount or 0))
+                        if type(res.rowcount) is not int or res.rowcount < 0:
+                            raise ValueError("Unknown affected row count")
+                        rows_inserted += res.rowcount
 
             result["rows_inserted"] = rows_inserted
             log.info("Tiingo fundamentals {t}: {n} rows", t=ticker, n=rows_inserted)
 
         except requests.exceptions.HTTPError as e:
+            result["rows_inserted"] = None if transaction_started else 0
             if "400" in str(e) and "Free" in str(e):
                 result["status"] = "PAYWALLED"
                 result["errors"].append("Free tier: DOW 30 only")
             else:
                 result["status"] = "FAILED"
-                result["errors"].append(str(e))
+                result["errors"].append(_safe_failure_message(e))
         except Exception as e:
+            result["rows_inserted"] = None if transaction_started else 0
             result["status"] = "FAILED"
-            result["errors"].append(str(e))
+            result["errors"].append(_safe_failure_message(e))
 
         return result
+
+    def _incremental_start(self, ticker: str) -> date:
+        """Start date for an incremental pull of one ticker.
+
+        Before 2026-11-04 every scheduled run re-requested the full history
+        from 2020-01-01 and ran ~7,500 per-row NOT EXISTS inserts per ticker
+        that all wrote 0 rows (5-13 s per ticker), so the DOW-30 universe
+        overran SmartScheduler's 120 s timeout every day. Resume from the
+        latest stored market_cap date minus a short lookback instead; a
+        ticker with nothing stored still backfills from 2020-01-01. One
+        point lookup per ticker (``MAX(obs_date)`` on the series' index).
+        """
+        latest = self._get_latest_date(f"TIINGO_FUND:{ticker}:market_cap")
+        if latest is None:
+            return _BACKFILL_START
+        return max(_BACKFILL_START, latest - timedelta(days=_INCREMENTAL_LOOKBACK_DAYS))
 
     def pull_all(
         self,
         ticker_list: list[str] | None = None,
-        start_date: str | date = "2020-01-01",
-    ) -> list[dict[str, Any]]:
-        """Pull fundamentals for multiple tickers."""
+        start_date: str | date | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Pull fundamentals for multiple tickers.
+
+        Parameters:
+            ticker_list: Override list; defaults to DOW 30 + ``*_full`` tickers.
+            start_date: Explicit start for every ticker (hermes repair passes a
+                bounded window). None (the scheduled default) pulls each
+                ticker incrementally from its latest stored date — see
+                ``_incremental_start``.
+            should_continue: Optional cooperative-budget check polled between
+                tickers (SmartScheduler wires one automatically). When it
+                returns False the pull stops before the next ticker instead
+                of being orphaned by the scheduler's hard join timeout.
+
+        Returns:
+            should_continue is None: list[dict], one result per ticker
+            (legacy shape). should_continue given: {"status": "SUCCESS" |
+            "PARTIAL", "stopped_by_budget": bool, "results": [...],
+            "tickers_not_attempted": [...]}; the row count is carried by the
+            per-ticker results, so an unknown leaf count stays unknown.
+        """
         if ticker_list is None:
             # Default: DOW 30 + any ticker with _full data
             with self.engine.connect() as conn:
@@ -169,9 +253,19 @@ class TiingoFundamentalsPuller(BasePuller):
         results = []
         succeeded = 0
         paywalled = 0
+        stopped_by_budget = False
 
         for ticker in ticker_list:
-            res = self.pull_ticker(ticker, start_date=start_date)
+            if should_continue is not None and not should_continue():
+                stopped_by_budget = True
+                log.warning(
+                    "Tiingo fundamentals bulk: time budget reached after {n}/{t} "
+                    "tickers — returning PARTIAL",
+                    n=len(results), t=len(ticker_list),
+                )
+                break
+            ticker_start = start_date if start_date is not None else self._incremental_start(ticker)
+            res = self.pull_ticker(ticker, start_date=ticker_start)
             results.append(res)
             if res["status"] == "SUCCESS":
                 succeeded += 1
@@ -180,9 +274,16 @@ class TiingoFundamentalsPuller(BasePuller):
             time.sleep(_RATE_LIMIT_DELAY)
 
         log.info(
-            "Tiingo fundamentals bulk: {s} ok, {p} paywalled, {f} failed out of {t}",
+            "Tiingo fundamentals bulk: {s} ok, {p} paywalled, {f} failed/no-new-data out of {t}",
             s=succeeded, p=paywalled,
-            f=len(ticker_list) - succeeded - paywalled,
+            f=len(results) - succeeded - paywalled,
             t=len(ticker_list),
         )
-        return results
+        if should_continue is None:
+            return results
+        return {
+            "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+            "stopped_by_budget": stopped_by_budget,
+            "results": results,
+            "tickers_not_attempted": list(ticker_list[len(results):]),
+        }

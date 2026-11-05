@@ -33,8 +33,12 @@ Identity, catalog and anchor (review of #663)
   labels and direction. The window registry is keyed on its sha256, which is
   S10's ``identity_sha256``.
 * The catalog (families, features, classes, self_lag pairs) is frozen at
-  genesis by hash; an allocation with any other catalog is refused, so
-  classes cannot be relabelled to re-open a window.
+  genesis by hash; it may only be extended via owner-approved, add-only
+  catalog extensions (exact prefixes preserved, no mutations or reclassifications).
+  An allocation with any catalog other than the ledger's effective catalog
+  is refused. Recorded approval_ref and approved_by are supplied audit evidence,
+  not authenticated owner authority; extension execution requires explicit
+  owner authorization.
 * A file ledger cannot be opened, created or appended without its external
   anchor: a second append-only, hash-chained JSONL file that records the
   ledger id and the ledger's (seq, head sha256) after every append. Loading
@@ -176,6 +180,19 @@ FORWARD_OUTCOME_FIELDS = (
     "evaluated_through",  # tz-aware ISO timestamp of the last forward outcome
     "prereg_sha256",  # the forward log's pre-registration hash
 )
+EXTENSION_FIELDS = {
+    "kind",
+    "seq",
+    "prev_sha256",
+    "prior_catalog_sha256",
+    "catalog",
+    "catalog_sha256",
+    "approved_by",
+    "approval_ref",
+    "promotion_allowed",
+    "recorded_at",
+}
+CATALOG_SCHEMA_FIELDS = {"families", "features", "classes", "self_lag"}
 # Feature class of a real-panel series: its publication source (research_real_panel).
 SOURCE_CLASSES = {
     "FRB_H15": "rates",
@@ -242,6 +259,158 @@ def scientific_identity(family: str, feature: str) -> dict:
 def identity(family: str, feature: str) -> str:
     """The registry key: sha256 of :func:`scientific_identity` (S10's identity_sha256)."""
     return digest(scientific_identity(family, feature))
+
+
+def catalog_from_dict(payload: dict) -> Catalog:
+    """Reconstitute a frozen Catalog instance from a dict payload with strict schema validation."""
+    if not isinstance(payload, dict):
+        raise ValueError("catalog payload must be a dict")
+    if set(payload.keys()) != CATALOG_SCHEMA_FIELDS:
+        raise ValueError(
+            f"catalog payload keys must be exactly {sorted(CATALOG_SCHEMA_FIELDS)}; got {sorted(payload.keys())}"
+        )
+    families = payload["families"]
+    features = payload["features"]
+    classes = payload["classes"]
+    self_lag = payload["self_lag"]
+    if not isinstance(families, (list, tuple)) or not all(isinstance(x, str) and x for x in families):
+        raise ValueError("families must be a list/tuple of non-empty strings")
+    if not isinstance(features, (list, tuple)) or not all(isinstance(x, str) and x for x in features):
+        raise ValueError("features must be a list/tuple of non-empty strings")
+    if not isinstance(classes, (list, tuple)):
+        raise ValueError("classes must be a list/tuple of (feature, class) pairs")
+    norm_classes = []
+    for pair in classes:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(x, str) and x for x in pair):
+            raise ValueError("each class entry must be a 2-tuple of non-empty strings")
+        norm_classes.append((pair[0], pair[1]))
+    if not isinstance(self_lag, (list, tuple)):
+        raise ValueError("self_lag must be a list/tuple of (family, feature) pairs")
+    norm_self_lag = []
+    for pair in self_lag:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(x, str) and x for x in pair):
+            raise ValueError("each self_lag entry must be a 2-tuple of non-empty strings")
+        norm_self_lag.append((pair[0], pair[1]))
+    cat = Catalog(
+        families=tuple(families),
+        features=tuple(features),
+        classes=tuple(norm_classes),
+        self_lag=tuple(norm_self_lag),
+    )
+    cat.validate()
+    return cat
+
+
+def validate_catalog_extension(prior: Catalog, new_cat: Catalog) -> None:
+    """Validate that new_cat is a strict, valid add-only extension of prior.
+
+    Enforces:
+    1. Exact prefix preservation for families, features, classes, and self_lag.
+    2. At least one new family or feature (no-ops rejected).
+    3. New self_lag pairs only reference at least one newly introduced family or feature.
+    4. Newly introduced pairs cannot collide with prior scientific identities or each other.
+    """
+    prior.validate()
+    new_cat.validate()
+
+    if (
+        new_cat.families[: len(prior.families)] != prior.families
+        or new_cat.features[: len(prior.features)] != prior.features
+        or new_cat.classes[: len(prior.classes)] != prior.classes
+        or new_cat.self_lag[: len(prior.self_lag)] != prior.self_lag
+    ):
+        raise ValueError(
+            "catalog extension must preserve prior families, features, classes, and self_lag as exact prefixes"
+        )
+
+    if len(new_cat.families) == len(prior.families) and len(new_cat.features) == len(prior.features):
+        raise ValueError("catalog extension must add at least one new family or feature")
+
+    new_families_set = set(new_cat.families[len(prior.families) :])
+    new_features_set = set(new_cat.features[len(prior.features) :])
+    for pair in new_cat.self_lag[len(prior.self_lag) :]:
+        if pair[0] not in new_families_set and pair[1] not in new_features_set:
+            raise ValueError(
+                f"new self_lag pair {pair} only references existing families and features; "
+                "cannot reclassify existing catalog entries"
+            )
+
+    prior_pairs = {(fam, feat) for fam in prior.families for feat in prior.features}
+    prior_identities = {identity(fam, feat) for fam, feat in prior_pairs}
+
+    new_identities: dict[str, tuple[str, str]] = {}
+    for fam in new_cat.families:
+        for feat in new_cat.features:
+            if (fam, feat) not in prior_pairs:
+                sci_id = identity(fam, feat)
+                if sci_id in prior_identities:
+                    raise ValueError(
+                        f"newly introduced pair {(fam, feat)} aliases existing scientific identity"
+                    )
+                if sci_id in new_identities:
+                    raise ValueError(
+                        f"newly introduced pair {(fam, feat)} collides with new pair {new_identities[sci_id]}"
+                    )
+                new_identities[sci_id] = (fam, feat)
+
+
+def validate_extension_record(
+    record: dict,
+    current_catalog: Catalog | None,
+    current_catalog_sha: str | None,
+    has_open_allocation: bool,
+    *,
+    is_appended_line: bool = True,
+) -> tuple[Catalog, str]:
+    """Shared semantic validation for catalog_extension records across _append and verify_chain."""
+    if current_catalog is None or current_catalog_sha is None:
+        raise ValueError("cannot extend catalog: ledger genesis has no catalog")
+    if has_open_allocation:
+        raise ValueError("cannot extend catalog with open allocation")
+
+    expected_fields = EXTENSION_FIELDS if is_appended_line else (EXTENSION_FIELDS - {"seq", "prev_sha256"})
+    if set(record.keys()) != expected_fields:
+        unexpected = set(record.keys()) - expected_fields
+        missing = expected_fields - set(record.keys())
+        raise ValueError(
+            f"catalog_extension record keys invalid: unexpected={sorted(unexpected)}, missing={sorted(missing)}"
+        )
+
+    if record.get("kind") != "catalog_extension":
+        raise ValueError(f"expected kind catalog_extension, got {record.get('kind')}")
+    if record.get("promotion_allowed") is not False:
+        raise ValueError("catalog_extension promotion_allowed must be False")
+
+    for field in ("approved_by", "approval_ref"):
+        val = record.get(field)
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(f"catalog_extension requires non-empty string for {field}")
+
+    rec_at = record.get("recorded_at")
+    if not isinstance(rec_at, str) or not rec_at.strip():
+        raise ValueError("catalog_extension requires non-empty string for recorded_at")
+    try:
+        stamp(rec_at)
+    except Exception as exc:
+        raise ValueError(
+            f"catalog_extension recorded_at must be valid timezone-aware ISO timestamp: {exc}"
+        ) from exc
+
+    if record.get("prior_catalog_sha256") != current_catalog_sha:
+        raise ValueError(
+            f"catalog_extension prior_catalog_sha256 {record.get('prior_catalog_sha256')} "
+            f"does not match current catalog digest {current_catalog_sha}"
+        )
+
+    ext_cat = catalog_from_dict(record["catalog"])
+    if ext_cat.sha256() != record.get("catalog_sha256"):
+        raise ValueError(
+            f"catalog_extension catalog_sha256 {record.get('catalog_sha256')} "
+            f"does not match payload hash {ext_cat.sha256()}"
+        )
+
+    validate_catalog_extension(current_catalog, ext_cat)
+    return ext_cat, ext_cat.sha256()
 
 
 # --- catalog ------------------------------------------------------------------------
@@ -522,9 +691,28 @@ class Ledger:
     def q(self) -> float:
         return self.genesis["q"]
 
+    def _effective_catalog_record(self) -> dict:
+        for line in reversed(self._lines):
+            record = json.loads(line)
+            if record.get("kind") in ("catalog_extension", "genesis") and "catalog" in record:
+                return record
+        return self.genesis
+
+    @property
+    def catalog_payload(self) -> dict:
+        rec = self._effective_catalog_record()
+        if "catalog" in rec:
+            return json.loads(canonical(rec["catalog"]))
+        raise ValueError("ledger has no catalog")
+
+    @property
+    def effective_catalog(self) -> Catalog:
+        return catalog_from_dict(self.catalog_payload)
+
     @property
     def catalog_sha256(self) -> str:
-        return self.genesis["catalog_sha256"]
+        rec = self._effective_catalog_record()
+        return rec.get("catalog_sha256", self.genesis.get("catalog_sha256", ""))
 
     def line_sha(self, seq: int) -> str:
         return sha256_bytes(self._lines[seq])
@@ -548,6 +736,33 @@ class Ledger:
 
     def _append(self, record: dict) -> tuple[dict, str]:
         self.verify()
+        if record.get("promotion_allowed", False) is not False:
+            raise ValueError("the ledger never allows promotion")
+        kind = record.get("kind")
+        if kind == "catalog_extension":
+            has_open = self.open_allocation() is not None
+            current_cat = self.effective_catalog if "catalog" in self.genesis else None
+            current_sha = self.catalog_sha256 if "catalog" in self.genesis else None
+            validate_extension_record(
+                record, current_cat, current_sha, has_open, is_appended_line=False
+            )
+        elif "catalog" in self.genesis:
+            if kind == "allocation":
+                if self.open_allocation() is not None:
+                    raise ValueError("the previous allocation is still open: record or abandon it")
+                if record.get("catalog_sha256") != self.catalog_sha256:
+                    raise ValueError(
+                        f"allocation pins stale or invalid catalog_sha256 {record.get('catalog_sha256')}, "
+                        f"expected {self.catalog_sha256}"
+                    )
+            elif kind in ("run_result", "abandoned"):
+                open_alloc = self.open_allocation()
+                if open_alloc is None or record.get("allocation_sha256") != open_alloc[1]:
+                    raise ValueError(
+                        f"{kind} references {record.get('allocation_sha256')}, but open allocation is "
+                        f"{open_alloc[1] if open_alloc else None}"
+                    )
+
         record = {**record, "seq": len(self._lines), "prev_sha256": self.head}
         record.setdefault("promotion_allowed", False)
         if record["promotion_allowed"] is not False:
@@ -640,6 +855,10 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     if not lines:
         raise ValueError("empty ledger")
     records, previous = [], None
+    current_catalog: Catalog | None = None
+    current_catalog_sha: str | None = None
+    open_allocation_sha: str | None = None
+
     for seq, line in enumerate(lines):
         record = json.loads(line)
         if canonical(record) != line:
@@ -650,6 +869,44 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
             raise ValueError(f"record {seq}: genesis must be first and only first")
         if record.get("promotion_allowed") is not False:
             raise ValueError(f"record {seq}: promotion is never allowed")
+
+        kind = record.get("kind")
+        if kind == "genesis":
+            if "catalog" in record:
+                current_catalog = catalog_from_dict(record["catalog"])
+                current_catalog.validate()
+                current_catalog_sha = record.get("catalog_sha256")
+                if current_catalog.sha256() != current_catalog_sha:
+                    raise ValueError(f"record {seq}: genesis catalog sha256 mismatch")
+        elif kind == "allocation":
+            if current_catalog_sha is not None:
+                if open_allocation_sha is not None:
+                    raise ValueError(
+                        f"record {seq}: second allocation opened while allocation {open_allocation_sha} is still open"
+                    )
+                if record.get("catalog_sha256") != current_catalog_sha:
+                    raise ValueError(
+                        f"record {seq}: allocation catalog_sha256 {record.get('catalog_sha256')} "
+                        f"does not match effective catalog {current_catalog_sha}"
+                    )
+            open_allocation_sha = sha256_bytes(line)
+        elif kind in ("run_result", "abandoned"):
+            if current_catalog_sha is not None:
+                alloc_ref = record.get("allocation_sha256")
+                if open_allocation_sha is None or alloc_ref != open_allocation_sha:
+                    raise ValueError(
+                        f"record {seq}: {kind} references {alloc_ref}, but open allocation is {open_allocation_sha}"
+                    )
+            open_allocation_sha = None
+        elif kind == "catalog_extension":
+            current_catalog, current_catalog_sha = validate_extension_record(
+                record,
+                current_catalog,
+                current_catalog_sha,
+                has_open_allocation=(open_allocation_sha is not None),
+                is_appended_line=True,
+            )
+
         records.append(record)
         previous = sha256_bytes(line)
     return records
@@ -758,6 +1015,48 @@ def split_budget(
     return {k: counts[k] + extra[k] for k in keys}
 
 
+def extend_catalog(
+    ledger: Ledger,
+    catalog: Catalog,
+    *,
+    approved_by: str,
+    approval_ref: str,
+    recorded_at: str | None = None,
+) -> dict:
+    """Extend the ledger's catalog with new families or features.
+
+    Requires non-empty evidence strings bound to the new catalog digest.
+    Recorded approved_by and approval_ref are supplied audit evidence,
+    not authenticated cryptographic authority; extension execution requires
+    explicit owner authorization.
+    Prior families, features, classes, and self_lag pairs must be preserved
+    as exact prefixes.
+    """
+    ledger.verify()
+    catalog.validate()
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        raise ValueError("extend_catalog requires non-empty string for approved_by")
+    if not isinstance(approval_ref, str) or not approval_ref.strip():
+        raise ValueError("extend_catalog requires non-empty string for approval_ref")
+    if ledger.open_allocation() is not None:
+        raise ValueError("cannot extend catalog while an allocation is open: record or abandon it")
+    if "catalog" not in ledger.genesis:
+        raise ValueError("cannot extend catalog: ledger genesis has no catalog")
+
+    record = {
+        "kind": "catalog_extension",
+        "prior_catalog_sha256": ledger.catalog_sha256,
+        "catalog": json.loads(canonical(asdict(catalog))),
+        "catalog_sha256": catalog.sha256(),
+        "approved_by": approved_by.strip(),
+        "approval_ref": approval_ref.strip(),
+        "promotion_allowed": False,
+        "recorded_at": now_iso() if recorded_at is None else recorded_at,
+    }
+    rec, sha = ledger._append(record)
+    return {"record": json.loads(canonical(rec)), "sha256": sha}
+
+
 def allocate(
     ledger: Ledger,
     catalog: Catalog,
@@ -775,7 +1074,9 @@ def allocate(
     ledger.verify()
     catalog.validate()
     if catalog.sha256() != ledger.catalog_sha256:
-        raise ValueError("catalog differs from the one frozen at the ledger's genesis")
+        if not ledger.of_kind("catalog_extension"):
+            raise ValueError("catalog differs from the one frozen at the ledger's genesis")
+        raise ValueError("catalog differs from the effective catalog of the ledger")
     policy.validate()
     windows = validate_windows(windows)
     if ledger.open_allocation() is not None:
@@ -876,8 +1177,8 @@ def allocate(
         "recorded_at": recorded_at or now_iso(),
     }
     record, sha = ledger._append(record)
-    # the catalog lives in the genesis record (frozen); handed on for the protocol
-    return {"record": record, "sha256": sha, "catalog": ledger.genesis["catalog"]}
+    # the catalog snapshot reflects the effective catalog at allocation time; handed on for the protocol
+    return {"record": record, "sha256": sha, "catalog": ledger.catalog_payload}
 
 
 def abandon(ledger: Ledger, reason: str, recorded_at: str | None = None) -> dict:

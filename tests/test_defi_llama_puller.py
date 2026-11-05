@@ -594,11 +594,34 @@ class TestPullAll:
         ):
             results = p.pull_all()
 
-        assert len(results) == 4
+        # Bridges are paid-API only (bridges.llama.fi answers 402): not
+        # pulled by default, so they cannot turn every run PARTIAL.
+        assert len(results) == 3
         mock_proto.assert_called_once()
         mock_chain.assert_called_once()
         mock_stable.assert_called_once()
+        mock_bridge.assert_not_called()
+
+    @patch("ingestion.altdata.defi_llama_puller.time.sleep")
+    def test_pull_all_include_bridges_opt_in(self, mock_sleep, puller):
+        p, engine, conn = puller
+
+        with (
+            patch.object(p, "pull_protocols", return_value={"status": "SUCCESS", "rows_inserted": 10}),
+            patch.object(p, "pull_chain_tvl", return_value={"status": "SUCCESS", "rows_inserted": 20}),
+            patch.object(p, "pull_stablecoins", return_value={"status": "SUCCESS", "rows_inserted": 5}),
+            patch.object(p, "pull_bridges", return_value={"status": "SUCCESS", "rows_inserted": 3}) as mock_bridge,
+        ):
+            results = p.pull_all(include_bridges=True)
+
+        assert len(results) == 4
+        assert results[-1]["source"] == "bridges"
         mock_bridge.assert_called_once()
+
+    def test_bridges_url_is_not_the_dead_api_host(self):
+        from ingestion.altdata import defi_llama_puller as mod
+
+        assert mod._BRIDGES_URL == "https://bridges.llama.fi/bridges"
 
     @patch("ingestion.altdata.defi_llama_puller.time.sleep")
     def test_pull_all_continues_on_failure(self, mock_sleep, puller):
@@ -612,7 +635,7 @@ class TestPullAll:
         ):
             results = p.pull_all()
 
-        assert len(results) == 4
+        assert len(results) == 3
         statuses = [r["status"] for r in results]
         assert statuses[0] == "FAILED"
         assert statuses[1] == "SUCCESS"
@@ -640,6 +663,65 @@ class TestPullAll:
 
 
 class TestFetchJson:
+    @patch("ingestion.altdata.defi_llama_puller.ingest_actors_batch", return_value=0)
+    def test_stablecoins_uses_public_operation_server_and_preserves_lineage(self, _, puller):
+        """Exercise HTTP routing through committed-row reporting, offline."""
+        p, engine, conn = puller
+        conn.execute.return_value.fetchone.return_value = None
+        response = MagicMock()
+        response.json.return_value = {"peggedAssets": [{
+            "name": "Synthetic USD", "symbol": "TESTUSD",
+            "circulating": {"peggedUSD": 123.5},
+        }]}
+
+        def get(url, **kwargs):
+            # The old TVL-host route must fail this behavioral regression.
+            if url != "https://stablecoins.llama.fi/stablecoins":
+                raise AssertionError("stablecoins routed to the wrong service")
+            return response
+
+        with patch("ingestion.altdata.defi_llama_puller.requests.get", side_effect=get) as http, \
+                patch.object(p, "_insert_raw") as insert:
+            result = p.pull_stablecoins()
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 1
+        http.assert_called_once()
+        response.raise_for_status.assert_called_once()
+        row = insert.call_args.kwargs
+        assert row["series_id"] == "defillama.stablecoin_mcap.testusd"
+        assert row["value"] == 123.5
+        assert row["raw_payload"]["source_url"] == "https://stablecoins.llama.fi/stablecoins"
+        assert row["conn"] is conn
+
+    def test_stablecoins_http_failure_never_reports_committed_rows(self, puller):
+        import requests
+
+        p, engine, _ = puller
+        response = MagicMock(status_code=404)
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
+        with patch("ingestion.altdata.defi_llama_puller.requests.get", return_value=response) as http, \
+                patch.object(p, "_insert_raw") as insert:
+            result = p.pull_stablecoins()
+        assert result["status"] == "FAILED"
+        assert result["rows_inserted"] == 0
+        http.assert_called_once()  # permanent 404 must not retry
+        insert.assert_not_called()
+        engine.begin.assert_not_called()
+
+    def test_stablecoins_commit_failure_is_not_success(self, puller):
+        p, engine, conn = puller
+        conn.execute.return_value.fetchone.return_value = None
+        response = MagicMock()
+        response.json.return_value = {"peggedAssets": [{
+            "symbol": "TESTUSD", "circulating": {"peggedUSD": 123.5},
+        }]}
+        engine.begin.return_value.__exit__.side_effect = RuntimeError("synthetic commit failure")
+        with patch("ingestion.altdata.defi_llama_puller.requests.get", return_value=response), \
+                patch.object(p, "_insert_raw"), \
+                pytest.raises(RuntimeError, match="synthetic commit failure"):
+            p.pull_stablecoins()
+
     def test_fetch_json_success(self, puller):
         p, _, _ = puller
         mock_resp = MagicMock()

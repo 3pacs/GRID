@@ -8,6 +8,7 @@ outputs/insight_reviews/
 outputs/capital_flow_research/
 outputs/hermes/
 outputs/storage_maintenance/
+outputs/briefings/
 log/
 *.egg-info/
 dist/

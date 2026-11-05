@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("v7 admission command required")
     command = args[0]
     if command in {"fetch-twelvedata", "fetch-tiingo-meta", "probe"}:
+        v1.refuse_superseded(7, v7.SUPERSEDED_BY)  # v7 is stopped: no further admission work
         v7.check_prereg()
         _registered(Path(_option(args, "--log-dir")), Path(_option(args, "--vault-repo")))
         args = _drop_pairs(args, "--log-dir", "--vault-repo")

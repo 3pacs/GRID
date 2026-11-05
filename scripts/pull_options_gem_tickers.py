@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entrypoint for the nine-ticker GEM options timer.
+"""Compatibility entrypoint for the eight-ticker GEM options timer.
 
 The separately installed legacy script writes options_snapshots directly,
 without capture metadata. Retire or repoint that timer before activating this
@@ -17,10 +17,11 @@ from loguru import logger as log
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 GEM_TICKERS = (
-    "OPCH", "SPGI", "FLUT", "GEHC", "GLND", "BHRB",
+    "OPCH", "SPGI", "FLUT", "GEHC", "GLND",
     "SPY", "QQQ", "IWM",
 )
 GEM_MAX_EXPIRATIONS = 6
+GEM_CAPTURE_SOURCE = "gem"
 
 
 def main() -> int:
@@ -33,6 +34,7 @@ def main() -> int:
             tickers=list(GEM_TICKERS),
             include_catalyst_universe=False,
             max_expirations=GEM_MAX_EXPIRATIONS,
+            capture_source=GEM_CAPTURE_SOURCE,
         )
     except Exception as exc:  # noqa: BLE001 - process boundary, no secret-bearing error text
         log.error("GEM options pull failed during {kind}", kind=type(exc).__name__)

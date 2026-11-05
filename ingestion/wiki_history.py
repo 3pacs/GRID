@@ -178,55 +178,90 @@ class WikiHistoryPuller:
 
         return items
 
+    def pull_all(self, target_date: date | None = None) -> dict[str, Any]:
+        """SmartScheduler entry point: pull today's context and store it.
+
+        Returns ``{"status", "rows_inserted", ...}``. A day on which
+        Wikipedia returned no events is FAILED with nothing written -- an
+        empty pull is not an observation of "0 events" -- and a day already
+        stored is ``rows_inserted = 0`` (raw_series is append-only).
+        """
+        data = self.pull_today(target_date)
+        if not data.get("wiki_events"):
+            return {"status": "FAILED", "rows_inserted": 0, "date": data["date"],
+                    "error": "Wikipedia on-this-day returned no events"}
+        inserted = self._store(data)
+        return {"status": "SUCCESS", "rows_inserted": inserted, "date": data["date"]}
+
     def save_to_db(self, data: dict) -> bool:
-        """Save historical context to raw_series for LLM consumption."""
-        if not self.engine:
+        """Save historical context to raw_series for LLM consumption.
+
+        True when the day's row is stored (now or by an earlier run), False
+        when there is no engine, no Wikipedia events, or the write failed.
+        """
+        if not self.engine or not data.get("wiki_events"):
             return False
-
-        import json
-        from sqlalchemy import text
-
         try:
-            with self.engine.begin() as conn:
-                # Ensure source exists
-                conn.execute(text(
-                    "INSERT INTO source_catalog "
-                    "(name, base_url, cost_tier, latency_class, pit_available, "
-                    "revision_behavior, trust_score, priority_rank) "
-                    "VALUES (:name, :url, :cost, :latency, :pit, :rev, :trust, :rank) "
-                    "ON CONFLICT (name) DO NOTHING"
-                ), {
-                    "name": "WikiHistory",
-                    "url": "https://api.wikimedia.org",
-                    "cost": "FREE",
-                    "latency": "EOD",
-                    "pit": False,
-                    "rev": "NEVER",
-                    "trust": "MED",
-                    "rank": 80,
-                })
-                src = conn.execute(
-                    text("SELECT id FROM source_catalog WHERE name = 'WikiHistory'")
-                ).fetchone()
-                if not src:
-                    return False
-
-                conn.execute(
-                    text(
-                        "INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload) "
-                        "VALUES (:sid, :src, :d, NOW(), :v, :payload) "
-                        "ON CONFLICT DO NOTHING"
-                    ),
-                    {
-                        "sid": f"wiki_today_{data['date']}",
-                        "src": src[0],
-                        "d": data["date"],
-                        "v": len(data.get("wiki_events", [])),
-                        "payload": json.dumps(data),
-                    },
-                )
-            log.info("Saved wiki history for {d}", d=data["date"])
+            self._store(data)
             return True
         except Exception as exc:
             log.warning("Failed to save wiki history: {e}", e=str(exc))
             return False
+
+    def _store(self, data: dict) -> int:
+        """Append the day's row to raw_series unless a SUCCESS row exists. Returns rows written."""
+        import json
+        from sqlalchemy import text
+
+        series_id = f"wiki_today_{data['date']}"
+        with self.engine.begin() as conn:
+            # Ensure source exists
+            conn.execute(text(
+                "INSERT INTO source_catalog "
+                "(name, base_url, cost_tier, latency_class, pit_available, "
+                "revision_behavior, trust_score, priority_rank) "
+                "VALUES (:name, :url, :cost, :latency, :pit, :rev, :trust, :rank) "
+                "ON CONFLICT (name) DO NOTHING"
+            ), {
+                "name": "WikiHistory",
+                "url": "https://api.wikimedia.org",
+                "cost": "FREE",
+                "latency": "EOD",
+                "pit": False,
+                "rev": "NEVER",
+                "trust": "MED",
+                "rank": 80,
+            })
+            src = conn.execute(
+                text("SELECT id FROM source_catalog WHERE name = 'WikiHistory'")
+            ).fetchone()
+            if not src:
+                raise RuntimeError("WikiHistory source_catalog row unavailable")
+
+            exists = conn.execute(
+                text(
+                    "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src "
+                    "AND obs_date = :d AND pull_status = 'SUCCESS' LIMIT 1"
+                ),
+                {"sid": series_id, "src": src[0], "d": data["date"]},
+            ).fetchone()
+            if exists:
+                return 0
+
+            # pull_timestamp: schema DEFAULT NOW().
+            conn.execute(
+                text(
+                    "INSERT INTO raw_series "
+                    "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                    "VALUES (:sid, :src, :d, :v, :payload, 'SUCCESS')"
+                ),
+                {
+                    "sid": series_id,
+                    "src": src[0],
+                    "d": data["date"],
+                    "v": len(data.get("wiki_events", [])),
+                    "payload": json.dumps(data),
+                },
+            )
+        log.info("Saved wiki history for {d}", d=data["date"])
+        return 1

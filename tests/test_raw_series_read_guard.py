@@ -58,7 +58,6 @@ _FROM_RAW = re.compile(r"from\s+raw_series\b", re.I)
 # number changed here; this note exists only so the next reader does not
 # mistake "count stayed 2" for "nothing changed".
 LEGACY_UNFILTERED_READS: dict[str, int] = {
-    "alerts/email.py": 1,
     "analysis/money_flow.py": 1,
     "analysis/thesis_scorer.py": 2,
     "api/routers/dad.py": 1,

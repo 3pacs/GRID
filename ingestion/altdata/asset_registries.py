@@ -37,6 +37,14 @@ from ingestion.base import BasePuller, retry_on_failure
 
 # ── Configuration ────────────────────────────────────────────────────────
 
+# Input dependency: officers come from ICIJ_OFFSHORE rows in raw_series,
+# written by ingestion/altdata/offshore_leaks.py (currently held SKIPPED for
+# match-quality review, so it writes none).
+_NO_OFFICERS_REASON: str = (
+    "no ICIJ_OFFSHORE officer rows to cross-reference "
+    "(the offshore_leaks puller writes them; it is held for match-quality review)"
+)
+
 # Rate limiting: 1 request per 3 seconds
 _REQUEST_DELAY: float = 3.0
 _REQUEST_TIMEOUT: int = 30
@@ -115,6 +123,14 @@ def _extract_tables_from_html(html: str) -> list[list[list[str]]]:
     return tables
 
 
+def _inserted(result: Any) -> int:
+    """Committed-row contribution of one INSERT; unknown counts fail closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
+
+
 def _clean_name(name: str) -> str:
     """Normalize a name for comparison: lowercase, strip punctuation."""
     name = name.strip().lower()
@@ -145,7 +161,7 @@ class AssetRegistryPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://registry.faa.gov",
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "WEEKLY",  # was DAILY (not in constraint); GRID polls weekly (smart_scheduler freq_h 168)
         "pit_available": False,
         "revision_behavior": "RARE",
         "trust_score": "HIGH",
@@ -461,9 +477,13 @@ class AssetRegistryPuller(BasePuller):
             officers = []
 
         if not officers:
+            # Nothing to cross-reference is not a completed check of the
+            # registries: SKIPPED with the reason, never an opaque status.
             log.info("No ICIJ officers found for asset cross-reference")
             return {
-                "status": "NO_OFFICERS",
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "skipped_reason": _NO_OFFICERS_REASON,
                 "aircraft_found": 0,
                 "vessels_found": 0,
             }
@@ -514,7 +534,8 @@ class AssetRegistryPuller(BasePuller):
         stored = self._store_asset_results(total_aircraft, total_vessels)
 
         result = {
-            "status": "SUCCESS",
+            # Searches that raised are lost coverage, so the run is partial.
+            "status": "PARTIAL" if errors else "SUCCESS",
             "officers_searched": len(officers),
             "aircraft_found": len(total_aircraft),
             "vessels_found": len(total_vessels),
@@ -567,29 +588,30 @@ class AssetRegistryPuller(BasePuller):
                     continue
 
                 try:
-                    self._insert_raw(
-                        conn=conn,
-                        series_id=series_id,
-                        obs_date=today,
-                        value=1.0,
-                        raw_payload={
-                            "asset_type": "aircraft",
-                            "n_number": registration,
-                            "serial_number": ac.get("serial_number", ""),
-                            "manufacturer": ac.get("manufacturer", ""),
-                            "model": ac.get("model", ""),
-                            "year_mfr": ac.get("year_mfr", ""),
-                            "registrant_name": ac.get("registrant_name", ""),
-                            "city": ac.get("city", ""),
-                            "state": ac.get("state", ""),
-                            "status": ac.get("status", ""),
-                            "icij_actor_name": ac.get("icij_actor_name", ""),
-                            "icij_actor_id": ac.get("icij_actor_id", ""),
-                            "search_name": ac.get("search_name", ""),
-                            "confidence": "confirmed",
-                        },
-                    )
-                    raw_count += 1
+                    with conn.begin_nested():
+                        raw_count += _inserted(self._insert_raw(
+                            conn=conn,
+                            series_id=series_id,
+                            obs_date=today,
+                            value=1.0,
+                            raw_payload={
+                                "asset_type": "aircraft",
+                                "n_number": registration,
+                                "serial_number": ac.get("serial_number", ""),
+                                "manufacturer": ac.get("manufacturer", ""),
+                                "model": ac.get("model", ""),
+                                "year_mfr": ac.get("year_mfr", ""),
+                                "registrant_name": ac.get("registrant_name", ""),
+                                "city": ac.get("city", ""),
+                                "state": ac.get("state", ""),
+                                "status": ac.get("status", ""),
+                                "icij_actor_name": ac.get("icij_actor_name", ""),
+                                "icij_actor_id": ac.get("icij_actor_id", ""),
+                                "search_name": ac.get("search_name", ""),
+                                "confidence": "confirmed",
+                            },
+                            return_result=True,
+                        ))
                 except Exception as exc:
                     log.debug(
                         "Failed to insert aircraft raw_series: {e}",
@@ -618,28 +640,29 @@ class AssetRegistryPuller(BasePuller):
                     continue
 
                 try:
-                    self._insert_raw(
-                        conn=conn,
-                        series_id=series_id,
-                        obs_date=today,
-                        value=1.0,
-                        raw_payload={
-                            "asset_type": "vessel",
-                            "vessel_name": v.get("vessel_name", ""),
-                            "hin": v.get("hin", ""),
-                            "hull_id": v.get("hull_id", ""),
-                            "doc_number": v.get("doc_number", ""),
-                            "owner_name": v.get("owner_name", ""),
-                            "service": v.get("service", ""),
-                            "gross_tons": v.get("gross_tons", ""),
-                            "hailing_port": v.get("hailing_port", ""),
-                            "icij_actor_name": v.get("icij_actor_name", ""),
-                            "icij_actor_id": v.get("icij_actor_id", ""),
-                            "search_name": v.get("search_name", ""),
-                            "confidence": "confirmed",
-                        },
-                    )
-                    raw_count += 1
+                    with conn.begin_nested():
+                        raw_count += _inserted(self._insert_raw(
+                            conn=conn,
+                            series_id=series_id,
+                            obs_date=today,
+                            value=1.0,
+                            raw_payload={
+                                "asset_type": "vessel",
+                                "vessel_name": v.get("vessel_name", ""),
+                                "hin": v.get("hin", ""),
+                                "hull_id": v.get("hull_id", ""),
+                                "doc_number": v.get("doc_number", ""),
+                                "owner_name": v.get("owner_name", ""),
+                                "service": v.get("service", ""),
+                                "gross_tons": v.get("gross_tons", ""),
+                                "hailing_port": v.get("hailing_port", ""),
+                                "icij_actor_name": v.get("icij_actor_name", ""),
+                                "icij_actor_id": v.get("icij_actor_id", ""),
+                                "search_name": v.get("search_name", ""),
+                                "confidence": "confirmed",
+                            },
+                            return_result=True,
+                        ))
                 except Exception as exc:
                     log.debug(
                         "Failed to insert vessel raw_series: {e}",
@@ -692,35 +715,36 @@ class AssetRegistryPuller(BasePuller):
         series_id = self._build_series_id(asset_type.upper(), registration, "owner")
 
         try:
-            conn.execute(text("""
-                INSERT INTO signal_sources
-                    (source_type, source_id, ticker, signal_type,
-                     signal_date, signal_value, metadata)
-                VALUES
-                    (:stype, :sid, :ticker, :signal_type,
-                     :sdate, :sval, :meta)
-            """), {
-                "stype": "asset_registry",
-                "sid": series_id,
-                "ticker": actor_id,
-                "signal_type": "ASSET_OFFSHORE_LINK",
-                "sdate": signal_date,
-                "sval": 1.0,
-                "meta": json.dumps({
-                    "asset_type": asset_type,
-                    "registration": registration,
-                    "owner_name": owner_name,
-                    "actor_name": actor_name,
-                    "actor_id": actor_id,
-                    "confidence": "confirmed",
-                    "description": (
-                        f"ICIJ offshore officer '{actor_name}' owns "
-                        f"{asset_type} (reg: {registration}) under name "
-                        f"'{owner_name}'"
-                    ),
-                }, default=str, ensure_ascii=False),
-            })
-            return 1
+            with conn.begin_nested():
+                conn.execute(text("""
+                    INSERT INTO signal_sources
+                        (source_type, source_id, ticker, signal_type,
+                         signal_date, signal_value, metadata)
+                    VALUES
+                        (:stype, :sid, :ticker, :signal_type,
+                         :sdate, :sval, :meta)
+                """), {
+                    "stype": "asset_registry",
+                    "sid": series_id,
+                    "ticker": actor_id,
+                    "signal_type": "ASSET_OFFSHORE_LINK",
+                    "sdate": signal_date,
+                    "sval": 1.0,
+                    "meta": json.dumps({
+                        "asset_type": asset_type,
+                        "registration": registration,
+                        "owner_name": owner_name,
+                        "actor_name": actor_name,
+                        "actor_id": actor_id,
+                        "confidence": "confirmed",
+                        "description": (
+                            f"ICIJ offshore officer '{actor_name}' owns "
+                            f"{asset_type} (reg: {registration}) under name "
+                            f"'{owner_name}'"
+                        ),
+                    }, default=str, ensure_ascii=False),
+                })
+                return 1
         except Exception as exc:
             log.debug(
                 "Failed to emit asset signal for {name}: {e}",

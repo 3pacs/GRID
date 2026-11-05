@@ -29,7 +29,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -350,11 +349,16 @@ def _store_fundamentals(engine, ticker: str, overview: dict) -> None:
         )).fetchone()
 
         if not row:
+            # source_catalog has no config column; register with its real
+            # NOT NULL columns (schema.sql).
             conn.execute(text("""
-                INSERT INTO source_catalog (name, config)
-                VALUES ('ALPHAVANTAGE_FUND', :cfg)
+                INSERT INTO source_catalog
+                    (name, base_url, cost_tier, latency_class, pit_available,
+                     revision_behavior, trust_score, priority_rank)
+                VALUES ('ALPHAVANTAGE_FUND', 'https://www.alphavantage.co', 'FREE',
+                        'EOD', FALSE, 'FREQUENT', 'MED', 60)
                 ON CONFLICT (name) DO NOTHING
-            """), {"cfg": json.dumps({"type": "fundamentals", "provider": "alphavantage"})})
+            """))
             row = conn.execute(text(
                 "SELECT id FROM source_catalog WHERE name = 'ALPHAVANTAGE_FUND'"
             )).fetchone()
@@ -372,16 +376,25 @@ def _store_fundamentals(engine, ticker: str, overview: dict) -> None:
 
             series_id = f"AV_FUND:{ticker}:{grid_suffix}"
 
+            # raw_series is append-only: today's snapshot is stored once and
+            # never rewritten (a later same-day run is skipped, not merged).
+            if conn.execute(text("""
+                SELECT 1 FROM raw_series
+                WHERE series_id = :series AND source_id = :sid
+                  AND obs_date = :obs AND pull_status = 'SUCCESS'
+                LIMIT 1
+            """), {"series": series_id, "sid": source_id, "obs": today}).fetchone():
+                continue
+
+            # pull_timestamp: schema DEFAULT NOW().
             conn.execute(text("""
-                INSERT INTO raw_series (source_id, series_id, obs_date, value, release_date)
-                VALUES (:sid, :series, :obs, :val, :rel)
-                ON CONFLICT (source_id, series_id, obs_date) DO UPDATE SET value = :val
+                INSERT INTO raw_series (source_id, series_id, obs_date, value, pull_status)
+                VALUES (:sid, :series, :obs, :val, 'SUCCESS')
             """), {
                 "sid": source_id,
                 "series": series_id,
                 "obs": today,
                 "val": val,
-                "rel": today,
             })
 
 

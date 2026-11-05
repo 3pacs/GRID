@@ -1,0 +1,1298 @@
+{
+  "code": {
+    "e0_manifest_sha256": "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
+    "generator_sha256": "eba73859fb5aeb0ab3712a4f714789f94340d2dc4fb8d9de82351075a7fc7b34",
+    "git_dirty_calibration_paths": false,
+    "git_head": "4eb6cffcad1807717a6ed2ad373fba6553e587ff",
+    "script": "scripts/e0_calibrate_outcome_model.py",
+    "script_sha256": "024bdbca381d7e34024622c0b3be89e303542fdf6f2bed0e36a366ee0e17b9c4"
+  },
+  "conservative_pick": {
+    "a_share_at_fit": 0.05155111704,
+    "admissibility_excess_J_q90": 22.1767227,
+    "corner_fits": {
+      "df12_p0.9050_a0.0402": {
+        "J": 440.0444995,
+        "admissible": false,
+        "delta_J": 422.6382512,
+        "params": {
+          "beta_sd": 0.3303235022,
+          "factor_ar1": -0.1047099481,
+          "factor_vol": 0.003141543631,
+          "garch_alpha": 0.04017051322,
+          "garch_beta": 0.8648461139,
+          "idio_vol": 0.01935299661,
+          "idio_vol_dispersion": 0.4445859904,
+          "market_vol": 0.007656559447,
+          "tail_df": 12.0
+        }
+      },
+      "df12_p0.9050_a0.2419": {
+        "J": 30.02841212,
+        "admissible": true,
+        "delta_J": 12.6221638,
+        "params": {
+          "beta_sd": 0.334276453,
+          "factor_ar1": -0.2422757918,
+          "factor_vol": 0.003553946401,
+          "garch_alpha": 0.2419099265,
+          "garch_beta": 0.6631067007,
+          "idio_vol": 0.01860473282,
+          "idio_vol_dispersion": 0.4309267611,
+          "market_vol": 0.008089261858,
+          "tail_df": 12.0
+        }
+      },
+      "df12_p0.9701_a0.0431": {
+        "J": 276.3033475,
+        "admissible": false,
+        "delta_J": 258.8970992,
+        "params": {
+          "beta_sd": 0.3332649186,
+          "factor_ar1": -0.1246429808,
+          "factor_vol": 0.003179858236,
+          "garch_alpha": 0.04305939492,
+          "garch_beta": 0.9270419364,
+          "idio_vol": 0.01949083672,
+          "idio_vol_dispersion": 0.4464865394,
+          "market_vol": 0.007547375466,
+          "tail_df": 12.0
+        }
+      },
+      "df12_p0.9701_a0.2593": {
+        "J": 560.2360689,
+        "admissible": false,
+        "delta_J": 542.8298205,
+        "params": {
+          "beta_sd": 0.261632303,
+          "factor_ar1": 0.2928791455,
+          "factor_vol": 0.00309362899,
+          "garch_alpha": 0.2593069947,
+          "garch_beta": 0.7107943366,
+          "idio_vol": 0.02020450718,
+          "idio_vol_dispersion": 0.3196767199,
+          "market_vol": 0.006972639376,
+          "tail_df": 12.0
+        }
+      },
+      "df3_p0.9050_a0.0402": {
+        "J": 85.35768415,
+        "admissible": false,
+        "delta_J": 67.95143583,
+        "params": {
+          "beta_sd": 0.3273397337,
+          "factor_ar1": -0.07852221434,
+          "factor_vol": 0.003316677539,
+          "garch_alpha": 0.04017051322,
+          "garch_beta": 0.8648461139,
+          "idio_vol": 0.01943156604,
+          "idio_vol_dispersion": 0.419475501,
+          "market_vol": 0.007941679167,
+          "tail_df": 3.0
+        }
+      },
+      "df3_p0.9050_a0.2419": {
+        "J": 516.1813085,
+        "admissible": false,
+        "delta_J": 498.7750602,
+        "params": {
+          "beta_sd": 0.3001744339,
+          "factor_ar1": 0.1406650001,
+          "factor_vol": 0.00353212343,
+          "garch_alpha": 0.2419099265,
+          "garch_beta": 0.6631067007,
+          "idio_vol": 0.02060293594,
+          "idio_vol_dispersion": 0.2580354338,
+          "market_vol": 0.007076503516,
+          "tail_df": 3.0
+        }
+      },
+      "df3_p0.9701_a0.0431": {
+        "J": 50.66557532,
+        "admissible": false,
+        "delta_J": 33.259327,
+        "params": {
+          "beta_sd": 0.2996430074,
+          "factor_ar1": -0.07587540556,
+          "factor_vol": 0.003602694395,
+          "garch_alpha": 0.04305939492,
+          "garch_beta": 0.9270419364,
+          "idio_vol": 0.0200754704,
+          "idio_vol_dispersion": 0.3736204201,
+          "market_vol": 0.006387914095,
+          "tail_df": 3.0
+        }
+      },
+      "df3_p0.9701_a0.2593": {
+        "J": 1127.291828,
+        "admissible": false,
+        "delta_J": 1109.885579,
+        "params": {
+          "beta_sd": 0.171980028,
+          "factor_ar1": 0.1907102917,
+          "factor_vol": 0.004434189919,
+          "garch_alpha": 0.2593069947,
+          "garch_beta": 0.7107943366,
+          "idio_vol": 0.02542157008,
+          "idio_vol_dispersion": 0.1540217181,
+          "market_vol": 0.01050485513,
+          "tail_df": 3.0
+        }
+      }
+    },
+    "label_missing_rate_rule": "max(interior missing rate of the survivor panel, e0-v1 0.002)",
+    "mean_power_by_candidate": {
+      "corner:df12_p0.9050_a0.2419": 0.465,
+      "fitted": 0.42
+    },
+    "params": {
+      "beta_sd": 0.3144304651,
+      "factor_ar1": -0.09024512705,
+      "factor_vol": 0.003444607047,
+      "garch_alpha": 0.04880397209,
+      "garch_beta": 0.8979063009,
+      "idio_vol": 0.01953776853,
+      "idio_vol_dispersion": 0.400174697,
+      "label_missing_rate": 0.002,
+      "market_vol": 0.007466449907,
+      "tail_df": 3.0
+    },
+    "persistence_at_fit": 0.946710273,
+    "picked": "fitted",
+    "rule": "among the fitted point and the admissible 90%-CI corners of the weakly identified parameters ['tail_df', 'garch_persistence', 'garch_alpha_share'] (tail_df snapped to the grid; strong parameters refit at each corner; admissible = excess J within the bootstrap q90), the set with the lowest mean synthetic E0 Holm power at planted IC 0.01 over exposure 0 and 0.3",
+    "worst_power_sector": "sector:Consumer Discretionary"
+  },
+  "df_profile": [
+    {
+      "J": 164.1497306,
+      "delta_J": 146.7434823,
+      "params": {
+        "beta_sd": 0.3151822324,
+        "factor_ar1": -0.1591468423,
+        "factor_vol": 0.004758355457,
+        "garch_alpha": 0.01163997054,
+        "garch_beta": 0.9861461231,
+        "idio_vol": 0.02466593596,
+        "idio_vol_dispersion": 0.2373913807,
+        "market_vol": 0.01523835105,
+        "tail_df": 2.5
+      },
+      "tail_df": 2.5
+    },
+    {
+      "J": 17.40624832,
+      "delta_J": 0.0,
+      "params": {
+        "beta_sd": 0.3144304651,
+        "factor_ar1": -0.09024512705,
+        "factor_vol": 0.003444607047,
+        "garch_alpha": 0.04880397209,
+        "garch_beta": 0.8979063009,
+        "idio_vol": 0.01953776853,
+        "idio_vol_dispersion": 0.400174697,
+        "market_vol": 0.007466449907,
+        "tail_df": 3.0
+      },
+      "tail_df": 3.0
+    },
+    {
+      "J": 20.23142877,
+      "delta_J": 2.82518045,
+      "params": {
+        "beta_sd": 0.3252942782,
+        "factor_ar1": -0.6572978714,
+        "factor_vol": 0.00524767611,
+        "garch_alpha": 0.06461539989,
+        "garch_beta": 0.8871561352,
+        "idio_vol": 0.01910970562,
+        "idio_vol_dispersion": 0.4283825192,
+        "market_vol": 0.008215471962,
+        "tail_df": 3.5
+      },
+      "tail_df": 3.5
+    },
+    {
+      "J": 22.64275475,
+      "delta_J": 5.236506427,
+      "params": {
+        "beta_sd": 0.328628006,
+        "factor_ar1": 0.04505143957,
+        "factor_vol": 0.002836763721,
+        "garch_alpha": 0.09143306011,
+        "garch_beta": 0.8527153077,
+        "idio_vol": 0.01881647103,
+        "idio_vol_dispersion": 0.431406055,
+        "market_vol": 0.008163898638,
+        "tail_df": 4.0
+      },
+      "tail_df": 4.0
+    },
+    {
+      "J": 21.35404633,
+      "delta_J": 3.947798012,
+      "params": {
+        "beta_sd": 0.3334017702,
+        "factor_ar1": 0.08112894641,
+        "factor_vol": 0.002800010909,
+        "garch_alpha": 0.1410552699,
+        "garch_beta": 0.7920073459,
+        "idio_vol": 0.01919139669,
+        "idio_vol_dispersion": 0.4333604167,
+        "market_vol": 0.008867939627,
+        "tail_df": 5.0
+      },
+      "tail_df": 5.0
+    },
+    {
+      "J": 42.97592548,
+      "delta_J": 25.56967716,
+      "params": {
+        "beta_sd": 0.3299766069,
+        "factor_ar1": 0.03298313907,
+        "factor_vol": 0.003002448556,
+        "garch_alpha": 0.1639878312,
+        "garch_beta": 0.7562536867,
+        "idio_vol": 0.0191626317,
+        "idio_vol_dispersion": 0.4363825513,
+        "market_vol": 0.008309136614,
+        "tail_df": 6.0
+      },
+      "tail_df": 6.0
+    },
+    {
+      "J": 33.81796345,
+      "delta_J": 16.41171513,
+      "params": {
+        "beta_sd": 0.3271654466,
+        "factor_ar1": -0.2702195556,
+        "factor_vol": 0.003708371917,
+        "garch_alpha": 0.2073747269,
+        "garch_beta": 0.7160641935,
+        "idio_vol": 0.01877374724,
+        "idio_vol_dispersion": 0.4270177537,
+        "market_vol": 0.008698080163,
+        "tail_df": 8.0
+      },
+      "tail_df": 8.0
+    },
+    {
+      "J": 25.13879742,
+      "delta_J": 7.732549096,
+      "params": {
+        "beta_sd": 0.3271406406,
+        "factor_ar1": -0.370030555,
+        "factor_vol": 0.004012406311,
+        "garch_alpha": 0.2287638421,
+        "garch_beta": 0.6893623519,
+        "idio_vol": 0.01875822115,
+        "idio_vol_dispersion": 0.4269730629,
+        "market_vol": 0.008116701818,
+        "tail_df": 12.0
+      },
+      "tail_df": 12.0
+    }
+  ],
+  "e0_v1": {
+    "beta_sd": 0.3,
+    "exposure_headline": 0.3,
+    "factor_ar1": 0.05,
+    "factor_vol": 0.006,
+    "garch_alpha": 0.08,
+    "garch_beta": 0.9,
+    "idio_vol": 0.02,
+    "idio_vol_dispersion": 0.4,
+    "label_missing_rate": 0.002,
+    "market_vol": 0.01,
+    "n_factors": 3,
+    "tail_df": 4.0
+  },
+  "environment": {
+    "numpy": "2.5.2",
+    "python": "3.13.15",
+    "scipy": "1.18.1"
+  },
+  "fit": {
+    "J": 17.40624832,
+    "moment_fit": [
+      {
+        "bootstrap_sd": 0.01639322346,
+        "moment": "m1_mean_pairwise_corr",
+        "real": 0.1673581196,
+        "simulated": 0.1600499844,
+        "z": 0.4458022075
+      },
+      {
+        "bootstrap_sd": 0.004138012872,
+        "moment": "m2_resid_eig1_share",
+        "real": 0.03975468255,
+        "simulated": 0.04050506408,
+        "z": -0.1813386173
+      },
+      {
+        "bootstrap_sd": 0.002897467481,
+        "moment": "m3_resid_eig2_share",
+        "real": 0.03854501008,
+        "simulated": 0.03581313739,
+        "z": 0.9428484386
+      },
+      {
+        "bootstrap_sd": 0.002166396612,
+        "moment": "m4_resid_eig3_share",
+        "real": 0.02647902201,
+        "simulated": 0.02862992515,
+        "z": -0.9928482769
+      },
+      {
+        "bootstrap_sd": 0.002670127027,
+        "moment": "m5_median_vol",
+        "real": 0.04471597797,
+        "simulated": 0.04468665807,
+        "z": 0.01098071233
+      },
+      {
+        "bootstrap_sd": 0.02428589864,
+        "moment": "m6_idio_vol_cv",
+        "real": 0.4433165707,
+        "simulated": 0.4388184615,
+        "z": 0.1852148529
+      },
+      {
+        "bootstrap_sd": 0.03551760897,
+        "moment": "m7_beta_sd",
+        "real": 0.3566852593,
+        "simulated": 0.3472104405,
+        "z": 0.2667639801
+      },
+      {
+        "bootstrap_sd": 0.3378697681,
+        "moment": "m8_excess_kurtosis_winsorized",
+        "real": 4.531863258,
+        "simulated": 5.535080337,
+        "z": -2.969241921
+      },
+      {
+        "bootstrap_sd": 0.00879514271,
+        "moment": "m9_sq_acf_lag1",
+        "real": 0.1218896602,
+        "simulated": 0.1046791155,
+        "z": 1.956823808
+      },
+      {
+        "bootstrap_sd": 0.00869779014,
+        "moment": "m10_sq_acf_lag2",
+        "real": 0.08192411973,
+        "simulated": 0.08731619393,
+        "z": -0.6199361112
+      },
+      {
+        "bootstrap_sd": 0.008864760179,
+        "moment": "m11_sq_acf_lag3",
+        "real": 0.0653504962,
+        "simulated": 0.05238897131,
+        "z": 1.462140501
+      },
+      {
+        "bootstrap_sd": 0.009042138924,
+        "moment": "m12_sq_acf_lag4",
+        "real": 0.06196407289,
+        "simulated": 0.06252164051,
+        "z": -0.06166324385
+      },
+      {
+        "bootstrap_sd": 0.0738385725,
+        "moment": "m13_factor1_acf_lag1",
+        "real": -0.02264823527,
+        "simulated": -0.01150105088,
+        "z": -0.1509669541
+      }
+    ],
+    "params": {
+      "beta_sd": 0.3144304651,
+      "factor_ar1": -0.09024512705,
+      "factor_vol": 0.003444607047,
+      "garch_alpha": 0.04880397209,
+      "garch_beta": 0.8979063009,
+      "idio_vol": 0.01953776853,
+      "idio_vol_dispersion": 0.400174697,
+      "label_missing_rate": 6.508827597e-06,
+      "market_vol": 0.007466449907,
+      "tail_df": 3.0
+    },
+    "start_values": {
+      "beta_sd": 0.3566852593,
+      "factor_ar1": 0.02,
+      "factor_vol": 0.003611336351,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.9,
+      "idio_vol": 0.01699795429,
+      "idio_vol_dispersion": 0.4433165707,
+      "market_vol": 0.008405618239,
+      "tail_df": 4.0
+    }
+  },
+  "input": {
+    "cutoff_exclusive": "2007-11-01",
+    "denylist_sha256": "1dc58fb0a1c027529af4b67211f2c8c7097ca0b19dbdbb5017d3d550bae72a94",
+    "denylist_size": 908,
+    "first_date": "1993-06-01",
+    "grid_steps": 726,
+    "last_date": "2007-10-26",
+    "min_coverage": 0.8,
+    "panel": "evals/e0/data/replication_pre2011_nontech_grid5.npz",
+    "pinned": true,
+    "rows_dropped_at_or_after_cutoff": 160,
+    "rows_in_file": 887,
+    "sha256": "d0b6968c46aa69c75c8c72be90fda53ff1bd9677009371875712a4ed5aa1a399",
+    "tickers_in_file": 710,
+    "tickers_used": 431,
+    "tickers_used_sha256": "b46c5b6ee971f92be26ce721a25cb831d3a462fab5294bf6ddb35f5c826ebb0a"
+  },
+  "moments": {
+    "bootstrap_sd": [
+      0.01639322346,
+      0.004138012872,
+      0.002897467481,
+      0.002166396612,
+      0.002670127027,
+      0.02428589864,
+      0.03551760897,
+      0.3378697681,
+      0.00879514271,
+      0.00869779014,
+      0.008864760179,
+      0.009042138924,
+      0.0738385725
+    ],
+    "m14_interior_missing_rate": 6.508827597e-06,
+    "names": [
+      "m1_mean_pairwise_corr",
+      "m2_resid_eig1_share",
+      "m3_resid_eig2_share",
+      "m4_resid_eig3_share",
+      "m5_median_vol",
+      "m6_idio_vol_cv",
+      "m7_beta_sd",
+      "m8_excess_kurtosis_winsorized",
+      "m9_sq_acf_lag1",
+      "m10_sq_acf_lag2",
+      "m11_sq_acf_lag3",
+      "m12_sq_acf_lag4",
+      "m13_factor1_acf_lag1"
+    ],
+    "real": [
+      0.1673581196,
+      0.03975468255,
+      0.03854501008,
+      0.02647902201,
+      0.04471597797,
+      0.4433165707,
+      0.3566852593,
+      4.531863258,
+      0.1218896602,
+      0.08192411973,
+      0.0653504962,
+      0.06196407289,
+      -0.02264823527
+    ]
+  },
+  "power": {
+    "corner:df12_p0.9050_a0.2419@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.01079206917,
+      "power_bh": 0.61,
+      "power_holm_run_alpha": 0.45,
+      "power_holm_se": 0.05,
+      "realized_mean_ic": 0.00984306238,
+      "sims": 100
+    },
+    "corner:df12_p0.9050_a0.2419@exposure0.3": {
+      "exposure": 0.3,
+      "perms": 999,
+      "planted_scale": 0.0108202936,
+      "power_bh": 0.59,
+      "power_holm_run_alpha": 0.48,
+      "power_holm_se": 0.05021167316,
+      "realized_mean_ic": 0.009872974728,
+      "sims": 100
+    },
+    "e0_v1@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.01144458438,
+      "power_bh": 0.55,
+      "power_holm_run_alpha": 0.45,
+      "power_holm_se": 0.05,
+      "realized_mean_ic": 0.009637288932,
+      "sims": 100
+    },
+    "e0_v1@exposure0.3": {
+      "exposure": 0.3,
+      "perms": 999,
+      "planted_scale": 0.01158482701,
+      "power_bh": 0.46,
+      "power_holm_run_alpha": 0.35,
+      "power_holm_se": 0.04793724854,
+      "realized_mean_ic": 0.00906861729,
+      "sims": 100
+    },
+    "fitted@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.009446109482,
+      "power_bh": 0.59,
+      "power_holm_run_alpha": 0.49,
+      "power_holm_se": 0.05024183938,
+      "realized_mean_ic": 0.00995356311,
+      "sims": 100
+    },
+    "fitted@exposure0.3": {
+      "exposure": 0.3,
+      "perms": 999,
+      "planted_scale": 0.009495708615,
+      "power_bh": 0.52,
+      "power_holm_run_alpha": 0.35,
+      "power_holm_se": 0.04793724854,
+      "realized_mean_ic": 0.009281378365,
+      "sims": 100
+    },
+    "sector:Consumer Discretionary@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.00969994289,
+      "power_bh": 0.59,
+      "power_holm_run_alpha": 0.47,
+      "power_holm_se": 0.0501613558,
+      "realized_mean_ic": 0.009922806461,
+      "sims": 100
+    },
+    "sector:Consumer Discretionary@exposure0.3": {
+      "exposure": 0.3,
+      "perms": 999,
+      "planted_scale": 0.009773209653,
+      "power_bh": 0.53,
+      "power_holm_run_alpha": 0.36,
+      "power_holm_se": 0.04824181513,
+      "realized_mean_ic": 0.009290249033,
+      "sims": 100
+    },
+    "sector:Consumer Staples@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.009452126835,
+      "power_bh": 0.6,
+      "power_holm_run_alpha": 0.5,
+      "power_holm_se": 0.05025189076,
+      "realized_mean_ic": 0.009937433524,
+      "sims": 100
+    },
+    "sector:Financials@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.01011048288,
+      "power_bh": 0.64,
+      "power_holm_run_alpha": 0.53,
+      "power_holm_se": 0.0501613558,
+      "realized_mean_ic": 0.00994242946,
+      "sims": 100
+    },
+    "sector:Healthcare@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.009794246829,
+      "power_bh": 0.59,
+      "power_holm_run_alpha": 0.47,
+      "power_holm_se": 0.0501613558,
+      "realized_mean_ic": 0.009912091584,
+      "sims": 100
+    },
+    "sector:Industrials@exposure0": {
+      "exposure": 0.0,
+      "perms": 999,
+      "planted_scale": 0.009332309423,
+      "power_bh": 0.59,
+      "power_holm_run_alpha": 0.51,
+      "power_holm_se": 0.05024183938,
+      "realized_mean_ic": 0.00992346519,
+      "sims": 100
+    }
+  },
+  "recommendation": {
+    "exposure_note": "style exposure is not identifiable from prices; it needs pre-2008 non-Technology Form 4 propensity vs fitted factor loadings (a separate optional study)",
+    "exposure_sensitivity_grid": [
+      0.0,
+      0.15,
+      0.3,
+      0.45
+    ],
+    "label_missing_rate_note": "the panel is today's survivors, so delisting-like missingness is not observable here; the interior rate is a lower bound"
+  },
+  "ridge_profile": [
+    {
+      "J": 136.7430067,
+      "delta_J": 119.3367584,
+      "garch_alpha": 0.03,
+      "garch_beta": 0.87,
+      "garch_persistence": 0.9,
+      "linear_params": {
+        "beta_sd": 0.3283551432,
+        "factor_ar1": -0.1003239551,
+        "factor_vol": 0.003343851908,
+        "idio_vol": 0.01937001745,
+        "idio_vol_dispersion": 0.4226757309,
+        "market_vol": 0.00792377978
+      }
+    },
+    {
+      "J": 66.33169084,
+      "delta_J": 48.92544252,
+      "garch_alpha": 0.05,
+      "garch_beta": 0.85,
+      "garch_persistence": 0.9,
+      "linear_params": {
+        "beta_sd": 0.3257064461,
+        "factor_ar1": -0.05340805769,
+        "factor_vol": 0.003221204429,
+        "idio_vol": 0.01918284709,
+        "idio_vol_dispersion": 0.415497332,
+        "market_vol": 0.007821101246
+      }
+    },
+    {
+      "J": 50.23708144,
+      "delta_J": 32.83083312,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.82,
+      "garch_persistence": 0.9,
+      "linear_params": {
+        "beta_sd": 0.3148049408,
+        "factor_ar1": -0.0526006193,
+        "factor_vol": 0.003361742127,
+        "idio_vol": 0.01950532677,
+        "idio_vol_dispersion": 0.4025231297,
+        "market_vol": 0.007723764322
+      }
+    },
+    {
+      "J": 111.6366513,
+      "delta_J": 94.23040298,
+      "garch_alpha": 0.12,
+      "garch_beta": 0.78,
+      "garch_persistence": 0.9,
+      "linear_params": {
+        "beta_sd": 0.3022321711,
+        "factor_ar1": 0.03007157265,
+        "factor_vol": 0.003297214485,
+        "idio_vol": 0.0197447107,
+        "idio_vol_dispersion": 0.3774991861,
+        "market_vol": 0.007440286345
+      }
+    },
+    {
+      "J": 52.68698873,
+      "delta_J": 35.28074041,
+      "garch_alpha": 0.03,
+      "garch_beta": 0.92,
+      "garch_persistence": 0.95,
+      "linear_params": {
+        "beta_sd": 0.3219841145,
+        "factor_ar1": -0.1180467382,
+        "factor_vol": 0.003414293927,
+        "idio_vol": 0.01935541096,
+        "idio_vol_dispersion": 0.4155034753,
+        "market_vol": 0.007589691276
+      }
+    },
+    {
+      "J": 18.77382268,
+      "delta_J": 1.367574362,
+      "garch_alpha": 0.05,
+      "garch_beta": 0.9,
+      "garch_persistence": 0.95,
+      "linear_params": {
+        "beta_sd": 0.3118110313,
+        "factor_ar1": -0.07753430063,
+        "factor_vol": 0.003447258892,
+        "idio_vol": 0.01965559453,
+        "idio_vol_dispersion": 0.3959499054,
+        "market_vol": 0.007365770869
+      }
+    },
+    {
+      "J": 91.18631477,
+      "delta_J": 73.78006645,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.87,
+      "garch_persistence": 0.95,
+      "linear_params": {
+        "beta_sd": 0.2891121167,
+        "factor_ar1": 0.008752531679,
+        "factor_vol": 0.003453625946,
+        "idio_vol": 0.01991888363,
+        "idio_vol_dispersion": 0.3421476415,
+        "market_vol": 0.007098283569
+      }
+    },
+    {
+      "J": 238.6610932,
+      "delta_J": 221.2548449,
+      "garch_alpha": 0.12,
+      "garch_beta": 0.83,
+      "garch_persistence": 0.95,
+      "linear_params": {
+        "beta_sd": 0.2689824567,
+        "factor_ar1": 0.1713339861,
+        "factor_vol": 0.003328768908,
+        "idio_vol": 0.01936787139,
+        "idio_vol_dispersion": 0.1111217989,
+        "market_vol": 0.007288159125
+      }
+    },
+    {
+      "J": 34.8669044,
+      "delta_J": 17.46065608,
+      "garch_alpha": 0.03,
+      "garch_beta": 0.94,
+      "garch_persistence": 0.97,
+      "linear_params": {
+        "beta_sd": 0.3135589269,
+        "factor_ar1": -0.07595664329,
+        "factor_vol": 0.003406791507,
+        "idio_vol": 0.01960935255,
+        "idio_vol_dispersion": 0.3993400677,
+        "market_vol": 0.006863246179
+      }
+    },
+    {
+      "J": 78.95572695,
+      "delta_J": 61.54947863,
+      "garch_alpha": 0.05,
+      "garch_beta": 0.92,
+      "garch_persistence": 0.97,
+      "linear_params": {
+        "beta_sd": 0.2947619087,
+        "factor_ar1": -0.06602276359,
+        "factor_vol": 0.003692043792,
+        "idio_vol": 0.02038967447,
+        "idio_vol_dispersion": 0.3583161937,
+        "market_vol": 0.006168679955
+      }
+    },
+    {
+      "J": 255.1484119,
+      "delta_J": 237.7421636,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.89,
+      "garch_persistence": 0.97,
+      "linear_params": {
+        "beta_sd": 0.2691218212,
+        "factor_ar1": 0.3233247049,
+        "factor_vol": 0.003084684402,
+        "idio_vol": 0.01964528571,
+        "idio_vol_dispersion": 0.05773626325,
+        "market_vol": 0.005844432103
+      }
+    },
+    {
+      "J": 511.8899522,
+      "delta_J": 494.4837039,
+      "garch_alpha": 0.12,
+      "garch_beta": 0.85,
+      "garch_persistence": 0.97,
+      "linear_params": {
+        "beta_sd": 0.1537338783,
+        "factor_ar1": 0.3453762357,
+        "factor_vol": 0.003363982332,
+        "idio_vol": 0.02189717188,
+        "idio_vol_dispersion": 0.08349426007,
+        "market_vol": 0.006224211875
+      }
+    },
+    {
+      "J": 48.17790204,
+      "delta_J": 30.77165372,
+      "garch_alpha": 0.03,
+      "garch_beta": 0.95,
+      "garch_persistence": 0.98,
+      "linear_params": {
+        "beta_sd": 0.3009547651,
+        "factor_ar1": -0.08639770354,
+        "factor_vol": 0.003621385482,
+        "idio_vol": 0.0202040372,
+        "idio_vol_dispersion": 0.380973531,
+        "market_vol": 0.006165383507
+      }
+    },
+    {
+      "J": 160.3283249,
+      "delta_J": 142.9220766,
+      "garch_alpha": 0.05,
+      "garch_beta": 0.93,
+      "garch_persistence": 0.98,
+      "linear_params": {
+        "beta_sd": 0.2931305985,
+        "factor_ar1": 0.2370957483,
+        "factor_vol": 0.003137391282,
+        "idio_vol": 0.02082789262,
+        "idio_vol_dispersion": 0.2918101834,
+        "market_vol": 0.005322334845
+      }
+    },
+    {
+      "J": 432.6187321,
+      "delta_J": 415.2124838,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.9,
+      "garch_persistence": 0.98,
+      "linear_params": {
+        "beta_sd": 0.1619505008,
+        "factor_ar1": 0.4971917696,
+        "factor_vol": 0.002898917611,
+        "idio_vol": 0.02206962803,
+        "idio_vol_dispersion": 0.1845604641,
+        "market_vol": 0.005048405609
+      }
+    },
+    {
+      "J": 814.2369643,
+      "delta_J": 796.8307159,
+      "garch_alpha": 0.12,
+      "garch_beta": 0.86,
+      "garch_persistence": 0.98,
+      "linear_params": {
+        "beta_sd": 0.1278054953,
+        "factor_ar1": 0.433489272,
+        "factor_vol": 0.003648891108,
+        "idio_vol": 0.02680496346,
+        "idio_vol_dispersion": 0.2598131755,
+        "market_vol": 0.006379530619
+      }
+    },
+    {
+      "J": 88.24828637,
+      "delta_J": 70.84203805,
+      "garch_alpha": 0.03,
+      "garch_beta": 0.96,
+      "garch_persistence": 0.99,
+      "linear_params": {
+        "beta_sd": 0.2983138581,
+        "factor_ar1": 0.07364198346,
+        "factor_vol": 0.003497874026,
+        "idio_vol": 0.02079933955,
+        "idio_vol_dispersion": 0.3057656171,
+        "market_vol": 0.005627717491
+      }
+    },
+    {
+      "J": 300.1102893,
+      "delta_J": 282.704041,
+      "garch_alpha": 0.05,
+      "garch_beta": 0.94,
+      "garch_persistence": 0.99,
+      "linear_params": {
+        "beta_sd": 0.2427372602,
+        "factor_ar1": 0.3355781221,
+        "factor_vol": 0.003576494904,
+        "idio_vol": 0.0230126908,
+        "idio_vol_dispersion": 0.06947618768,
+        "market_vol": 0.005209384425
+      }
+    },
+    {
+      "J": 757.6619937,
+      "delta_J": 740.2557453,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.91,
+      "garch_persistence": 0.99,
+      "linear_params": {
+        "beta_sd": 0.1894747227,
+        "factor_ar1": 0.5400789437,
+        "factor_vol": 0.003137939852,
+        "idio_vol": 0.02546906025,
+        "idio_vol_dispersion": 0.2680178101,
+        "market_vol": 0.005050699318
+      }
+    },
+    {
+      "J": 1271.385508,
+      "delta_J": 1253.97926,
+      "garch_alpha": 0.12,
+      "garch_beta": 0.87,
+      "garch_persistence": 0.99,
+      "linear_params": {
+        "beta_sd": 0.06086213335,
+        "factor_ar1": 0.486846849,
+        "factor_vol": 0.003829380648,
+        "idio_vol": 0.02915416483,
+        "idio_vol_dispersion": 0.284751783,
+        "market_vol": 0.006553441729
+      }
+    },
+    {
+      "J": 130.4702258,
+      "delta_J": 113.0639775,
+      "garch_alpha": 0.03,
+      "garch_beta": 0.965,
+      "garch_persistence": 0.995,
+      "linear_params": {
+        "beta_sd": 0.2849928014,
+        "factor_ar1": -0.1096588975,
+        "factor_vol": 0.004375964455,
+        "idio_vol": 0.02130681757,
+        "idio_vol_dispersion": 0.1703544175,
+        "market_vol": 0.006012565896
+      }
+    },
+    {
+      "J": 447.7739763,
+      "delta_J": 430.367728,
+      "garch_alpha": 0.05,
+      "garch_beta": 0.945,
+      "garch_persistence": 0.995,
+      "linear_params": {
+        "beta_sd": 0.2501467421,
+        "factor_ar1": 0.399690684,
+        "factor_vol": 0.003612395324,
+        "idio_vol": 0.0261814755,
+        "idio_vol_dispersion": 0.1413519505,
+        "market_vol": 0.00599501805
+      }
+    },
+    {
+      "J": 1004.148527,
+      "delta_J": 986.7422786,
+      "garch_alpha": 0.08,
+      "garch_beta": 0.915,
+      "garch_persistence": 0.995,
+      "linear_params": {
+        "beta_sd": 0.07920534879,
+        "factor_ar1": 0.5330153369,
+        "factor_vol": 0.00349688777,
+        "idio_vol": 0.02849727868,
+        "idio_vol_dispersion": 0.2407322463,
+        "market_vol": 0.005735395594
+      }
+    },
+    {
+      "J": 1603.954485,
+      "delta_J": 1586.548236,
+      "garch_alpha": 0.12,
+      "garch_beta": 0.875,
+      "garch_persistence": 0.995,
+      "linear_params": {
+        "beta_sd": 0.02658514818,
+        "factor_ar1": 0.6056492585,
+        "factor_vol": 0.003949871045,
+        "idio_vol": 0.0345294701,
+        "idio_vol_dispersion": 0.3075577088,
+        "market_vol": 0.007489255197
+      }
+    }
+  ],
+  "sectors": {
+    "fits": {
+      "Consumer Discretionary": {
+        "J": 3.108994008,
+        "n_tickers": 58,
+        "params": {
+          "beta_sd": 0.3044958907,
+          "factor_ar1": -0.267887893,
+          "factor_vol": 0.004455356915,
+          "garch_alpha": 0.0486081168,
+          "garch_beta": 0.9136360405,
+          "idio_vol": 0.01937154105,
+          "idio_vol_dispersion": 0.3645683865,
+          "market_vol": 0.01312297663,
+          "tail_df": 3.0
+        },
+        "real_moments": {
+          "m10_sq_acf_lag2": 0.06177608024,
+          "m11_sq_acf_lag3": 0.0543813436,
+          "m12_sq_acf_lag4": 0.063541139,
+          "m13_factor1_acf_lag1": -0.08163165532,
+          "m1_mean_pairwise_corr": 0.2174683526,
+          "m2_resid_eig1_share": 0.06334696009,
+          "m3_resid_eig2_share": 0.04313182269,
+          "m4_resid_eig3_share": 0.03658961406,
+          "m5_median_vol": 0.05179202804,
+          "m6_idio_vol_cv": 0.3865266383,
+          "m7_beta_sd": 0.2843933455,
+          "m8_excess_kurtosis_winsorized": 4.036252967,
+          "m9_sq_acf_lag1": 0.1068345516
+        },
+        "tail_df_fixed": 3.0
+      },
+      "Consumer Staples": {
+        "J": 9.860719348,
+        "n_tickers": 51,
+        "params": {
+          "beta_sd": 0.2948651897,
+          "factor_ar1": -0.2978112879,
+          "factor_vol": 0.003376259256,
+          "garch_alpha": 0.03177582504,
+          "garch_beta": 0.9447133314,
+          "idio_vol": 0.01712229445,
+          "idio_vol_dispersion": 0.3582444017,
+          "market_vol": 0.007902002301,
+          "tail_df": 3.0
+        },
+        "real_moments": {
+          "m10_sq_acf_lag2": 0.07417906005,
+          "m11_sq_acf_lag3": 0.06321578647,
+          "m12_sq_acf_lag4": 0.06414929609,
+          "m13_factor1_acf_lag1": 0.002605871429,
+          "m1_mean_pairwise_corr": 0.1332185063,
+          "m2_resid_eig1_share": 0.07010677007,
+          "m3_resid_eig2_share": 0.04119761848,
+          "m4_resid_eig3_share": 0.03917155394,
+          "m5_median_vol": 0.0422625685,
+          "m6_idio_vol_cv": 0.378409469,
+          "m7_beta_sd": 0.3152758182,
+          "m8_excess_kurtosis_winsorized": 5.122049639,
+          "m9_sq_acf_lag1": 0.1199057574
+        },
+        "tail_df_fixed": 3.0
+      },
+      "Financials": {
+        "J": 7.860459655,
+        "n_tickers": 51,
+        "params": {
+          "beta_sd": 0.2688962849,
+          "factor_ar1": 0.5714092662,
+          "factor_vol": 0.001420179898,
+          "garch_alpha": 0.05533199432,
+          "garch_beta": 0.9088111478,
+          "idio_vol": 0.01377288532,
+          "idio_vol_dispersion": 0.6499910035,
+          "market_vol": 0.01196453991,
+          "tail_df": 3.0
+        },
+        "real_moments": {
+          "m10_sq_acf_lag2": 0.1155457029,
+          "m11_sq_acf_lag3": 0.07222339912,
+          "m12_sq_acf_lag4": 0.08737977462,
+          "m13_factor1_acf_lag1": 0.07593714393,
+          "m1_mean_pairwise_corr": 0.3363583631,
+          "m2_resid_eig1_share": 0.08337929655,
+          "m3_resid_eig2_share": 0.07573879029,
+          "m4_resid_eig3_share": 0.04833128732,
+          "m5_median_vol": 0.03948422539,
+          "m6_idio_vol_cv": 0.634038976,
+          "m7_beta_sd": 0.324629798,
+          "m8_excess_kurtosis_winsorized": 4.903935619,
+          "m9_sq_acf_lag1": 0.1528123748
+        },
+        "tail_df_fixed": 3.0
+      },
+      "Healthcare": {
+        "J": 7.292234879,
+        "n_tickers": 48,
+        "params": {
+          "beta_sd": 0.4317909453,
+          "factor_ar1": -0.3325145767,
+          "factor_vol": 0.004919611885,
+          "garch_alpha": 0.03259152371,
+          "garch_beta": 0.9331118717,
+          "idio_vol": 0.01798189162,
+          "idio_vol_dispersion": 0.315821757,
+          "market_vol": 0.008846535185,
+          "tail_df": 3.0
+        },
+        "real_moments": {
+          "m10_sq_acf_lag2": 0.07754974362,
+          "m11_sq_acf_lag3": 0.06997883495,
+          "m12_sq_acf_lag4": 0.05373662659,
+          "m13_factor1_acf_lag1": -0.005151753168,
+          "m1_mean_pairwise_corr": 0.1679545977,
+          "m2_resid_eig1_share": 0.0874125855,
+          "m3_resid_eig2_share": 0.06123742957,
+          "m4_resid_eig3_share": 0.03848154881,
+          "m5_median_vol": 0.04884309749,
+          "m6_idio_vol_cv": 0.3529643281,
+          "m7_beta_sd": 0.429319088,
+          "m8_excess_kurtosis_winsorized": 5.640675201,
+          "m9_sq_acf_lag1": 0.08251093805
+        },
+        "tail_df_fixed": 3.0
+      },
+      "Industrials": {
+        "J": 10.59164234,
+        "n_tickers": 65,
+        "params": {
+          "beta_sd": 0.2156104907,
+          "factor_ar1": -0.3284090402,
+          "factor_vol": 0.003338683083,
+          "garch_alpha": 0.03681720637,
+          "garch_beta": 0.9245673828,
+          "idio_vol": 0.01767456938,
+          "idio_vol_dispersion": 0.3491888613,
+          "market_vol": 0.01068301114,
+          "tail_df": 3.0
+        },
+        "real_moments": {
+          "m10_sq_acf_lag2": 0.06393437828,
+          "m11_sq_acf_lag3": 0.04359077988,
+          "m12_sq_acf_lag4": 0.04889392105,
+          "m13_factor1_acf_lag1": -0.08958874263,
+          "m1_mean_pairwise_corr": 0.2374722883,
+          "m2_resid_eig1_share": 0.05108650874,
+          "m3_resid_eig2_share": 0.03489228151,
+          "m4_resid_eig3_share": 0.03231761157,
+          "m5_median_vol": 0.04676958008,
+          "m6_idio_vol_cv": 0.3727710508,
+          "m7_beta_sd": 0.2177235049,
+          "m8_excess_kurtosis_winsorized": 3.948522101,
+          "m9_sq_acf_lag1": 0.0945677648
+        },
+        "tail_df_fixed": 3.0
+      }
+    },
+    "rule": "sector-map groups folded to GICS-like sectors, tickers with >= 80% coverage, N >= 40; tail_df fixed at the pooled fit",
+    "spread": {
+      "beta_sd": [
+        0.2156104907,
+        0.4317909453
+      ],
+      "factor_ar1": [
+        -0.3325145767,
+        0.5714092662
+      ],
+      "factor_vol": [
+        0.001420179898,
+        0.004919611885
+      ],
+      "garch_alpha": [
+        0.03177582504,
+        0.05533199432
+      ],
+      "garch_beta": [
+        0.9088111478,
+        0.9447133314
+      ],
+      "idio_vol": [
+        0.01377288532,
+        0.01937154105
+      ],
+      "idio_vol_dispersion": [
+        0.315821757,
+        0.6499910035
+      ],
+      "market_vol": [
+        0.007902002301,
+        0.01312297663
+      ]
+    }
+  },
+  "settings": {
+    "aux_maxfev": 133,
+    "block_steps": 52,
+    "bootstrap": 200,
+    "df_grid": [
+      2.5,
+      3.0,
+      3.5,
+      4.0,
+      5.0,
+      6.0,
+      8.0,
+      12.0
+    ],
+    "grid_sessions": 5,
+    "maxfev": 400,
+    "n_factors": 3,
+    "power_pilot_sims": 24,
+    "power_sims": 100,
+    "reps": 3,
+    "ridge": true,
+    "sectors": true,
+    "seed": 20261001,
+    "winsor_z": 8.0
+  },
+  "slice": "EVAL-E0C2",
+  "statement": "Indirect-inference calibration of the E0 outcome model on pre-2007-11-01 non-Technology prices outside every VS1 universe and window. Informs the E0 benchmark only; not a VS1 design input, not a trading signal, not an effect-size estimate.",
+  "uncertainty": {
+    "ci90": {
+      "beta_sd": [
+        0.2655311781,
+        0.4004271679
+      ],
+      "factor_ar1": [
+        -0.7753976864,
+        0.4021819049
+      ],
+      "factor_vol": [
+        0.002143908265,
+        0.006958814383
+      ],
+      "garch_alpha": [
+        0.0420211479,
+        0.2530545911
+      ],
+      "garch_beta": [
+        0.6622693641,
+        0.921033917
+      ],
+      "garch_persistence": [
+        0.9050166272,
+        0.9701013313
+      ],
+      "idio_vol": [
+        0.01735690384,
+        0.02160885368
+      ],
+      "idio_vol_dispersion": [
+        0.3697081883,
+        0.4641627547
+      ],
+      "market_vol": [
+        0.00659737704,
+        0.009811144377
+      ],
+      "tail_df": [
+        3.0,
+        12.0
+      ]
+    },
+    "corner_admissibility_excess_J_q90": 22.1767227,
+    "information_condition": 316.4960163,
+    "information_eigenvalues": [
+      7.972500314,
+      26.77069698,
+      76.42188575,
+      102.3204096,
+      236.4211781,
+      308.9991112,
+      444.4428172,
+      2523.264589
+    ],
+    "method": "circular moving-block bootstrap of the real moments (blocks of 52 grid steps, resamples recentred on the real moments), each resample mapped to parameters by one Gauss-Newton step at every grid df's optimum with df re-selected per resample; steps inflated by sqrt(1 + 1/reps) for simulated-moment noise. market_vol and factor_vol scale single time series: their CIs include the real path's sampling noise, and the simulated paths' realised scales are recorded below",
+    "resamples": 200,
+    "simulated_market_scale_by_rep": [
+      1.00533284,
+      1.154225706,
+      1.121495387
+    ],
+    "simulation_noise_inflation": 1.154700538,
+    "tail_df_choice_freq": {
+      "12": 0.08,
+      "2.5": 0.0,
+      "3": 0.515,
+      "3.5": 0.245,
+      "4": 0.1,
+      "5": 0.06,
+      "6": 0.0,
+      "8": 0.0
+    },
+    "weakest_direction": {
+      "beta_sd": 0.003431957541,
+      "factor_ar1": 0.7795451455,
+      "factor_vol": -0.6256427226,
+      "garch_alpha_share": 0.01179546083,
+      "garch_persistence": -0.01589999858,
+      "idio_vol": -0.01558465217,
+      "idio_vol_dispersion": 0.004603268922,
+      "market_vol": -0.01458619473
+    }
+  },
+  "version": "e0c2-calibration-v1"
+}

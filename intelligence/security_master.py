@@ -247,9 +247,12 @@ def resolve_entity(
     ``actor_connections`` writers — GD1 gap G1) should use instead of writing
     its own ticker/CIK string directly. When more than one entity claims the
     same ``(id_scheme, id_value)`` as of ``as_of`` — a genuine identifier
-    conflict, not a bug in this function — the primary row wins, and ties
-    break on the most recently opened ``valid_from``. Returns ``None`` when
-    nothing matches; never guesses.
+    conflict, not a bug in this function — the primary row wins, ties
+    break on the most recently opened ``valid_from``, and any remaining tie on
+    the smallest ``entity_id`` (the same order as
+    ``intelligence.people_events_pipeline.security``), so the answer never
+    depends on physical row order. Returns ``None`` when nothing matches;
+    never guesses.
     """
     as_of = as_of or date.today()
     with engine.connect() as conn:
@@ -259,7 +262,7 @@ def resolve_entity(
                 "WHERE id_scheme = :scheme AND id_value = :value "
                 "AND valid_from <= :as_of "
                 "AND (valid_to IS NULL OR valid_to >= :as_of) "
-                "ORDER BY is_primary DESC, valid_from DESC "
+                "ORDER BY is_primary DESC, valid_from DESC, entity_id ASC "
                 "LIMIT 1"
             ),
             {"scheme": id_scheme, "value": id_value, "as_of": as_of},

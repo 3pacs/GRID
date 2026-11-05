@@ -55,6 +55,10 @@ _SESSION_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "tg_sess
 # Max messages to scan per channel in batch mode
 _BATCH_LIMIT: int = 100
 
+# "No users configured" is a permanent config state; pull_recent() warns about
+# it once per process (19 times a day on grid-hermes before 2026-11-04).
+_WARNED_NO_USERS: bool = False
+
 # Rate limit between channel reads (seconds)
 _CHANNEL_DELAY: float = 1.0
 
@@ -433,7 +437,16 @@ class TelegramScanner(BasePuller):
             Summary dict.
         """
         if not self.users:
-            log.warning("TelegramScanner: no users configured — skipping")
+            # Permanent config state: warn once per process, keep SKIPPED.
+            global _WARNED_NO_USERS
+            if not _WARNED_NO_USERS:
+                _WARNED_NO_USERS = True
+                log.warning(
+                    "TelegramScanner: no users configured — skipping "
+                    "(logged once per process; set TELEGRAM_USERS)"
+                )
+            else:
+                log.debug("TelegramScanner: no users configured — skipping")
             return {
                 "source": "telegram",
                 "status": "SKIPPED",

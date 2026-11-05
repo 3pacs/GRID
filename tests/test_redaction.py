@@ -1,0 +1,228 @@
+"""utils.redaction: credentials must not reach logs, alert emails or LLM prompts.
+
+2026-11-04: the Polygon key appeared in 60 grid-scheduler journal lines in
+7 days, via ingestion.base.retry_on_failure logging str(exc) with the
+request URL in it.
+"""
+
+from __future__ import annotations
+
+import pytest
+import requests
+
+from utils.redaction import redact_secrets
+
+
+@pytest.mark.parametrize(
+    "text, secret",
+    [
+        ("403 for url: https://api.polygon.io/v3/snapshot/options/SPY?apiKey=PolyKey123456", "PolyKey123456"),
+        ("https://api.stlouisfed.org/fred/series/observations?series_id=X&api_key=fredkey999", "fredkey999"),
+        ("400 for url: https://firms.modaps.eosdis.nasa.gov/api/area/csv/" + "ab" * 16 + "/VIIRS_SNPP_NRT/world/1",
+         "ab" * 16),
+        ("postgresql://grid:p@ss@db:5432/griddb", "p@ss"),
+        ('{"api_key": "json secret"}', "json secret"),
+        ("Authorization: Bearer abcdefghijkl", "abcdefghijkl"),
+    ],
+)
+def test_secret_is_removed(text: str, secret: str) -> None:
+    assert secret not in redact_secrets(text)
+
+
+def test_plain_text_is_unchanged() -> None:
+    msg = "SOMA par value missing for 2026-10-28"
+    assert redact_secrets(msg) == msg
+    assert redact_secrets(None) is None
+
+
+def test_retry_wrapper_never_logs_the_url_key(monkeypatch) -> None:
+    from ingestion import base
+
+    logged: list[str] = []
+    monkeypatch.setattr(base.log, "warning", lambda msg, **kw: logged.append(msg.format(**kw)))
+    monkeypatch.setattr(base.time, "sleep", lambda s: None)
+
+    @base.retry_on_failure(max_attempts=2, backoff=0.0)
+    def fetch() -> None:
+        raise requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: https://api.polygon.io/v3/x?apiKey=PolyKey123456"
+        )
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        fetch()
+    assert logged and all("PolyKey123456" not in line for line in logged)
+
+
+def test_log_pull_failure_redacts(monkeypatch) -> None:
+    from ingestion import base
+
+    logged: list[str] = []
+    monkeypatch.setattr(base.log, "warning", lambda msg, **kw: logged.append(msg.format(**kw)))
+    base.log_pull_failure("polygon", "SPY", requests.exceptions.HTTPError(
+        "403 Client Error for url: https://api.polygon.io/v3/x?apiKey=PolyKey123456"))
+    assert logged and "PolyKey123456" not in logged[0]
+
+
+def test_nasa_fire_pull_failure_redacts_map_key(monkeypatch) -> None:
+    from ingestion.physical import nasa_fire
+
+    key = "ab" * 16  # built at runtime: not a literal secret
+    cls = next(v for v in vars(nasa_fire).values() if isinstance(v, type) and hasattr(v, "_fetch_csv"))
+    puller = object.__new__(cls)
+
+    def boom(days: int = 1):
+        raise requests.exceptions.HTTPError(
+            f"400 Client Error for url: https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/VIIRS_SNPP_NRT/x/1"
+        )
+
+    logged: list[str] = []
+    monkeypatch.setattr(puller, "_fetch_csv", boom, raising=False)
+    monkeypatch.setattr(nasa_fire.log, "warning", lambda msg, **kw: logged.append(msg.format(**kw)))
+    out = puller.pull()
+    assert out["status"] == "FAILED" and key not in out["error"]
+    assert logged and key not in logged[0]
+
+
+@pytest.mark.parametrize(
+    "text, secret",
+    [
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+        ("headers={'Authorization': 'Token abc123def456 extra'}", "abc123def456"),
+        ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlX3Zh", "eyJzdWIiOiIxMjM0In0"),
+        ("aws_access_key=AKIAABCDEFGH", "AKIAABCDEFGH"),
+        ("private_key: -----BEGINKEY", "BEGINKEY"),
+        ("client_secret=zzz123", "zzz123"),
+        ("redis://default:pa/ss@cache:6379/0", "pa/ss"),
+        ("wss://feed.example/stream?token=abc123xyz", "abc123xyz"),
+        ("ftp://u:p@ss/word@files.example/x", "ss/word"),
+    ],
+)
+def test_more_credential_forms_are_removed(text: str, secret: str) -> None:
+    assert secret not in redact_secrets(text)
+
+
+def test_reason_words_survive() -> None:
+    # Plain prose naming a credential kind must stay readable in alerts.
+    for msg in ("SKIPPED: ['no CF Radar token configured']", "PullerReportedFailure: no_api_key",
+                "Data unavailable due to the 2025 lapse in appropriations"):
+        assert redact_secrets(msg) == msg
+
+
+def test_central_loguru_config_redacts_messages_and_disables_diagnose() -> None:
+    import io
+
+    import config  # noqa: F401  (installs the patcher)
+    from loguru import logger
+
+    buf = io.StringIO()
+    sink = logger.add(buf, level="DEBUG", format="{message}", diagnose=False)
+    try:
+        logger.warning("failed: {e}", e="for url: https://api.polygon.io/v3/x?apiKey=PolyKey123456")
+    finally:
+        logger.remove(sink)
+    out = buf.getvalue()
+    assert "PolyKey123456" not in out
+    assert "failed: for url: https://api.polygon.io/v3/x?apiKey=[REDACTED]" in out
+    src = open(config.__file__, encoding="utf-8").read()
+    assert src.count("diagnose=LOG_DIAGNOSE") >= 2  # console sink and GitSink
+
+
+def test_stderr_sink_redacts_exception_tracebacks(capsys) -> None:
+    import config
+    from loguru import logger
+
+    sink = logger.add(config.scrubbed_stderr, level="DEBUG", format="{message}", diagnose=False)
+    try:
+        try:
+            raise requests.exceptions.HTTPError(
+                "403 Client Error for url: https://api.polygon.io/v3/x?apiKey=PolyKey123456"
+            )
+        except requests.exceptions.HTTPError:
+            logger.bind(url="https://api.polygon.io/v3/y?apiKey=PolyKey123456").exception("pull failed")
+    finally:
+        logger.remove(sink)
+    err = capsys.readouterr().err
+    assert "pull failed" in err and "HTTPError" in err
+    assert "PolyKey123456" not in err
+
+
+def test_git_sink_output_is_redacted(tmp_path, monkeypatch) -> None:
+    from server_log import git_sink as gs
+
+    sink = object.__new__(gs.GitSink)
+    sink.__dict__.update(
+        _buffer_lock=__import__("threading").Lock(), _dedup={}, _pending_count=0,
+        _errors_path=tmp_path / "errors.jsonl",
+        _sanitizer=type("S", (), {"scrub": staticmethod(lambda t: t)})(),
+    )
+    monkeypatch.setattr(sink, "_format_entry",
+                        lambda record: {"message": "for url: https://api.x.io/v1?api_key=PolyKey123456"}, raising=False)
+    monkeypatch.setattr(sink, "_rotate_locked", lambda: None, raising=False)
+    msg = type("M", (str,), {})("x")
+    msg.record = {"message": "x", "name": "n", "function": "f", "line": 1}
+    sink.write(msg)
+    assert "PolyKey123456" not in (tmp_path / "errors.jsonl").read_text()
+
+
+def test_git_sink_redacts_fields_before_json_escaping(tmp_path, monkeypatch) -> None:
+    from server_log import git_sink as gs
+
+    sink = object.__new__(gs.GitSink)
+    sink.__dict__.update(
+        _buffer_lock=__import__("threading").Lock(), _dedup={}, _pending_count=0,
+        _errors_path=tmp_path / "errors.jsonl",
+        _sanitizer=type("S", (), {"scrub": staticmethod(lambda t: t)})(),
+    )
+    monkeypatch.setattr(sink, "_format_entry", lambda record: {
+        "message": "bad payload",
+        "exception": 'ValueError: {"api_key": "JsonKey998877"} token="TokKey665544"',
+    }, raising=False)
+    monkeypatch.setattr(sink, "_rotate_locked", lambda: None, raising=False)
+    msg = type("M", (str,), {})("x")
+    msg.record = {"message": "x", "name": "n", "function": "f", "line": 2}
+    sink.write(msg)
+    out = (tmp_path / "errors.jsonl").read_text()
+    assert "JsonKey998877" not in out and "TokKey665544" not in out
+
+
+def test_logging_survives_patched_import() -> None:
+    from unittest.mock import patch
+
+    import config  # noqa: F401
+    from loguru import logger
+
+    with patch("builtins.__import__", side_effect=ImportError("blocked")):
+        logger.info("still logs with imports blocked")
+
+
+def test_config_fallback_redactor_fails_closed(tmp_path) -> None:
+    """config.py loaded without utils/ still redacts, and warns."""
+    import shutil
+    import subprocess
+    import sys
+
+    shutil.copy("config.py", tmp_path / "config.py")
+    key, tok = "Fb" * 8, "Tk" * 6  # built at runtime: not literal secrets
+    code = (
+        "import io, sys; sys.path.insert(0, '.');\n"
+        "import config\n"
+        "from loguru import logger\n"
+        "buf = io.StringIO(); logger.add(buf, format='{message}')\n"
+        f"logger.warning('x https://api.polygon.io/v3/a?apiKey={key} token={tok}')\n"
+        "print(buf.getvalue())\n"
+    )
+    env = {"DB_PASSWORD": "testpass", "GRID_JWT_SECRET": "test-secret-ci", "GRID_GIT_SINK_DISABLED": "1",
+           "PATH": "/usr/bin:/bin"}
+    proc = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert key not in proc.stdout and tok not in proc.stdout
+    assert "fallback log redactor" in proc.stderr
+
+
+def test_log_location_and_prose_stay_readable() -> None:
+    # The rendered loguru line carries "module:function:line"; a module named
+    # *auth*/*secret*/*token* must not lose its location.
+    for msg in ("api.auth:login:42 — token refreshed", "tests.test_log_secret_scrubbing:test_x:9 — ok",
+                "token refresh scheduled", "no CF Radar token configured"):
+        assert redact_secrets(msg) == msg
+    assert "v4lue" not in redact_secrets("token: v4lue") and "v5lue" not in redact_secrets('{"secret": "v5lue"}')

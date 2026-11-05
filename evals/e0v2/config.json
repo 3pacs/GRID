@@ -1,0 +1,317 @@
+{
+  "version": "e0-v2",
+  "benchmark": "E0 machinery calibration v2: the v1 benchmark (same structure, machinery, seeds, selection) with the E0-C2 calibrated outcome model and an exposure sensitivity grid",
+  "builds_on": {
+    "version": "e0-v1",
+    "path": "evals/e0",
+    "manifest_sha256": "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
+    "reused": "evals.e0 generator, machinery, runners, scorer, structure, replication helpers and its committed data files (structure npz, replication npz, deny-list); v2 verifies the v1 manifest before every run"
+  },
+  "calibration": {
+    "receipt": "data/calibration_receipt.json",
+    "receipt_sha256": "3b2b30cafc91c336e7707a51e333b2d416afefb1be02bafa88f5408ee5292914",
+    "cutoff_exclusive": "2007-11-01",
+    "source": "EVAL-E0C2, PR #791 (merge 248d055a); report GRID-E0-CALIBRATION-20261001.md",
+    "rounding": "scenario values are the receipt's pooled fit rounded to 2-3 significant figures; factor_ar1 is 0 (not identified: 90% CI -0.78..0.40; owner decision 2026-10-01); label_missing_rate keeps e0-v1's 0.002 floor (the survivor panel cannot observe delisting)"
+  },
+  "structure": {
+    "name": "vs1_v7_technology_structure",
+    "file": "data/vs1_v7_technology_structure.npz",
+    "trials": [
+      "A90|fwd5",
+      "A30|fwd5",
+      "A90|fwd20",
+      "A30|fwd20"
+    ],
+    "primary_trial": "A90|fwd5",
+    "propensity_trial": "A90|fwd5"
+  },
+  "selection": {
+    "ledger_q": 0.1,
+    "run_k": 1,
+    "bh_q": 0.1,
+    "direction": 1,
+    "raw_threshold_note": "v1 Stage-0 power counts raw two-sided p <= run_alpha / trials (the smallest Holm threshold)"
+  },
+  "machinery": {
+    "perms": 999,
+    "seed": "analysis.panel_insider_density.SEED",
+    "min_n": "analysis.panel_insider_density.MIN_N",
+    "min_entities": "analysis.panel_insider_density.MIN_ENTITIES"
+  },
+  "scenarios": {
+    "gaussian_idio": {
+      "note": "v1 Stage-0 equivalent: constant-variance Gaussian idiosyncratic noise, no factors",
+      "market": false,
+      "n_factors": 0,
+      "tail_df": null,
+      "garch": null,
+      "factor_ar1": 0.0,
+      "exposure": 0.0,
+      "idio_vol": 0.02,
+      "idio_vol_dispersion": 0.0,
+      "label_missing_rate": 0.0
+    },
+    "factor_t_garch": {
+      "note": "market + 3 industry/style factors, GARCH(1,1) volatility clustering, Student-t(4) tails, dispersed idiosyncratic vol, loadings independent of the feature",
+      "market": true,
+      "market_vol": 0.01,
+      "beta_mean": 1.0,
+      "beta_sd": 0.3,
+      "n_factors": 3,
+      "factor_vol": 0.006,
+      "factor_ar1": 0.05,
+      "tail_df": 4,
+      "garch": {
+        "alpha": 0.08,
+        "beta": 0.9
+      },
+      "exposure": 0.0,
+      "idio_vol": 0.02,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    },
+    "factor_t_garch_exposed": {
+      "note": "factor_t_garch plus a style exposure: entity loading on factor 1 correlated 0.3 with the entity's insider-buy propensity (insider buying clusters in small/value/beaten-down names)",
+      "market": true,
+      "market_vol": 0.01,
+      "beta_mean": 1.0,
+      "beta_sd": 0.3,
+      "n_factors": 3,
+      "factor_vol": 0.006,
+      "factor_ar1": 0.05,
+      "tail_df": 4,
+      "garch": {
+        "alpha": 0.08,
+        "beta": 0.9
+      },
+      "exposure": 0.3,
+      "idio_vol": 0.02,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    },
+    "factor_t_garch_calibrated": {
+      "note": "E0-C2 calibrated outcome model (pre-2007-11-01 non-Technology prices), no style exposure",
+      "market": true,
+      "market_vol": 0.0075,
+      "beta_mean": 1.0,
+      "beta_sd": 0.314,
+      "n_factors": 3,
+      "factor_vol": 0.0034,
+      "factor_ar1": 0.0,
+      "tail_df": 3,
+      "garch": {
+        "alpha": 0.049,
+        "beta": 0.898
+      },
+      "exposure": 0.0,
+      "idio_vol": 0.0195,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    },
+    "factor_t_garch_calibrated_exposed_015": {
+      "note": "calibrated model plus style exposure 0.15: factor-1 loading correlated 0.15 with insider-buy propensity (exposure is not identifiable from prices: a sensitivity grid)",
+      "market": true,
+      "market_vol": 0.0075,
+      "beta_mean": 1.0,
+      "beta_sd": 0.314,
+      "n_factors": 3,
+      "factor_vol": 0.0034,
+      "factor_ar1": 0.0,
+      "tail_df": 3,
+      "garch": {
+        "alpha": 0.049,
+        "beta": 0.898
+      },
+      "exposure": 0.15,
+      "idio_vol": 0.0195,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    },
+    "factor_t_garch_calibrated_exposed_030": {
+      "note": "calibrated model plus style exposure 0.3: factor-1 loading correlated 0.3 with insider-buy propensity (exposure is not identifiable from prices: a sensitivity grid)",
+      "market": true,
+      "market_vol": 0.0075,
+      "beta_mean": 1.0,
+      "beta_sd": 0.314,
+      "n_factors": 3,
+      "factor_vol": 0.0034,
+      "factor_ar1": 0.0,
+      "tail_df": 3,
+      "garch": {
+        "alpha": 0.049,
+        "beta": 0.898
+      },
+      "exposure": 0.3,
+      "idio_vol": 0.0195,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    },
+    "factor_t_garch_calibrated_exposed_045": {
+      "note": "calibrated model plus style exposure 0.45: factor-1 loading correlated 0.45 with insider-buy propensity (exposure is not identifiable from prices: a sensitivity grid)",
+      "market": true,
+      "market_vol": 0.0075,
+      "beta_mean": 1.0,
+      "beta_sd": 0.314,
+      "n_factors": 3,
+      "factor_vol": 0.0034,
+      "factor_ar1": 0.0,
+      "tail_df": 3,
+      "garch": {
+        "alpha": 0.049,
+        "beta": 0.898
+      },
+      "exposure": 0.45,
+      "idio_vol": 0.0195,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    }
+  },
+  "headline_scenario": "factor_t_garch_calibrated_exposed_030",
+  "calibrated_scenarios": [
+    "factor_t_garch_calibrated",
+    "factor_t_garch_calibrated_exposed_015",
+    "factor_t_garch_calibrated_exposed_030",
+    "factor_t_garch_calibrated_exposed_045"
+  ],
+  "planted": {
+    "ic_grid": [
+      0.0,
+      0.005,
+      0.01,
+      0.02,
+      0.03,
+      0.05
+    ],
+    "planted_trials": [
+      "A90|fwd5"
+    ],
+    "pilot_sims": 24,
+    "pilot_scale": 0.1
+  },
+  "profiles": {
+    "full": {
+      "sims": 500,
+      "perms": 999,
+      "scenarios": [
+        "factor_t_garch_calibrated",
+        "factor_t_garch_calibrated_exposed_015",
+        "factor_t_garch_calibrated_exposed_030",
+        "factor_t_garch_calibrated_exposed_045"
+      ],
+      "note": "v1's three scenarios are unchanged and their published e0-v1 scorecard (same machinery hash, seeds and structure) is the v1 column of the v2 report; run them with --scenarios to recompute"
+    },
+    "ci": {
+      "sims": 24,
+      "null_sims": 48,
+      "perms": 199,
+      "pilot_sims": 12,
+      "ic_grid": [
+        0.0,
+        0.05
+      ],
+      "scenarios": [
+        "factor_t_garch_calibrated_exposed_030"
+      ]
+    },
+    "smoke": {
+      "sims": 3,
+      "perms": 99,
+      "pilot_sims": 3,
+      "ic_grid": [
+        0.0,
+        0.05
+      ],
+      "scenarios": [
+        "factor_t_garch_calibrated"
+      ]
+    },
+    "ic01": {
+      "sims": 60,
+      "null_sims": 60,
+      "perms": 199,
+      "ic_grid": [
+        0.0,
+        0.01
+      ],
+      "scenarios": [
+        "factor_t_garch_calibrated_exposed_030",
+        "factor_t_garch_calibrated"
+      ]
+    }
+  },
+  "seeds": {
+    "base": 20260930,
+    "pilot": 20260931
+  },
+  "vs1_design_crosscheck": {
+    "status": "information, not a gate: VS1 v8's binding Stage-0 is the one its registered body names (E0 v1 factor_t_garch_exposed + the v1 Gaussian simulator)",
+    "rule": "v8 body section 1.2: A90|fwd5 alone, one-sided positive block sign-flip p <= 0.05 (v8 e0_power)",
+    "target_ic": 0.01,
+    "alpha_one_sided": 0.05,
+    "sims": 500,
+    "perms": 999,
+    "gate": 0.5,
+    "design_target": 0.8,
+    "geometry": "the committed v7 Technology structure (414 A90|fwd5 dates, 202 issuers) = v8's registered 2011-10-01 screen row; the selected 2008-01-01 geometry (603 dates) is not committed here",
+    "v8_registered_2011_10_01": {
+      "gaussian": 0.818,
+      "factor": 0.78,
+      "tilted": 0.73,
+      "dates": 414
+    },
+    "v8_registered_2008_01_01": {
+      "gaussian": 0.886,
+      "factor": 0.85,
+      "tilted": 0.85,
+      "dates": 603
+    },
+    "source": "analysis/panel_insider_density_v8.py DESIGN (PR #769, merge ecaa7e01; prereg body sha256 74679d00...)",
+    "reproduce_v1": {
+      "factor_t_garch": 0.78,
+      "factor_t_garch_exposed": 0.73
+    },
+    "scenarios": [
+      "factor_t_garch",
+      "factor_t_garch_exposed",
+      "factor_t_garch_calibrated",
+      "factor_t_garch_calibrated_exposed_015",
+      "factor_t_garch_calibrated_exposed_030",
+      "factor_t_garch_calibrated_exposed_045"
+    ]
+  },
+  "replication": {
+    "file": "data/replication_pre2011_nontech_grid5.npz",
+    "denylist": "data/vs1_technology_denylist.json",
+    "cutoff_exclusive": "2007-11-01",
+    "decision_start": "1995-01-01",
+    "grid_sessions": 5,
+    "perms": 999,
+    "bh_q": 0.1,
+    "trials": {
+      "REV5|fwd5": {
+        "lookback_steps": 1,
+        "skip_steps": 0,
+        "horizon_steps": 1,
+        "expected_sign": -1,
+        "prior": "weekly reversal (Lehmann 1990; Lo and MacKinlay 1990)"
+      },
+      "REV20|fwd20": {
+        "lookback_steps": 4,
+        "skip_steps": 0,
+        "horizon_steps": 4,
+        "expected_sign": -1,
+        "prior": "one-month reversal (Jegadeesh 1990)"
+      },
+      "MOM12_1|fwd20": {
+        "lookback_steps": 52,
+        "skip_steps": 4,
+        "horizon_steps": 4,
+        "expected_sign": 1,
+        "prior": "12-1 momentum (Jegadeesh and Titman 1993)"
+      }
+    },
+    "file_sha256": "d0b6968c46aa69c75c8c72be90fda53ff1bd9677009371875712a4ed5aa1a399",
+    "note": "v1's replication (same panel file, deny-list and declared trials) restricted to dates < 2007-11-01: VS1 v8 / sectors-v6 make non-Technology 2008-2010 a registered window, so v2 reads none of it. v1's own replication (through 2010-12-30) is unchanged in evals/e0."
+  }
+}
