@@ -236,3 +236,52 @@ class TestCadenceAwareStaleSources:
 
         assert result["healthy"] is True
         assert "error" not in result
+
+
+class TestStaleSourceLastAttempt:
+    """Each stale entry carries its latest pull_log attempt, so the alert
+    can say why a source is stale instead of only that it is."""
+
+    _PULL_LOG_DDL = (
+        "CREATE TABLE pull_log ("
+        "  id BIGSERIAL PRIMARY KEY, puller_name TEXT, source_id INTEGER,"
+        "  started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ,"
+        "  status TEXT NOT NULL, rows_inserted INTEGER, error_message TEXT,"
+        "  node_name TEXT)"
+    )
+
+    def _log(self, conn, source_id, started_at, status, error):
+        conn.execute(
+            text(
+                "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, status, error_message) "
+                "VALUES ('smart:x', :sid, :st, :st, :status, :err)"
+            ),
+            {"sid": source_id, "st": started_at, "status": status, "err": error},
+        )
+
+    def test_latest_attempt_reason_and_not_configured_flag(self, health_engine):
+        from scripts.hermes_health import check_db_health
+
+        now = datetime.now(timezone.utc)
+        with health_engine.begin() as conn:
+            conn.execute(text(self._PULL_LOG_DDL))
+            broken = _add_source(conn, "broken_contract_source", last_pull_at=None)
+            off = _add_source(conn, "unconfigured_source", last_pull_at=None)
+            _add_source(conn, "never_attempted_source", last_pull_at=None)
+            self._log(conn, broken, now - timedelta(hours=5), "SUCCESS", None)
+            self._log(conn, broken, now - timedelta(hours=1), "FAILED",
+                      "PullerReportedFailure: puller did not report committed write count")
+            self._log(conn, off, now - timedelta(hours=2), "FAILED", "PullerReportedFailure: no_api_key")
+
+        result = check_db_health(health_engine)
+
+        by_name = {s["source"]: s for s in result["stale_sources"]}
+        b = by_name["broken_contract_source"]
+        assert b["last_attempt_status"] == "FAILED"
+        assert "committed write count" in b["last_attempt_reason"]
+        assert b["not_configured"] is False
+        assert by_name["unconfigured_source"]["not_configured"] is True
+        n = by_name["never_attempted_source"]
+        assert n["last_attempt_status"] is None and n["not_configured"] is False
+        # The health transaction survived the lookup: later keys still populated.
+        assert result["healthy"] is True

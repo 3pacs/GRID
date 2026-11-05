@@ -43,7 +43,7 @@ Related: [[Frontend-Views]], [[All-Scripts]], [[Config-Map]]
 | 21 | `api/routers/system.py` | 1,656 | CRITICAL |
 | 22 | `intelligence/institutional_map.py` | 1,509 | CRITICAL |
 | 23 | `subnet/distributed_compute.py` | 1,445 | CRITICAL |
-| 24 | `.claude/skills/.../instinct-cli.py` | 1,426 | Tool file, acceptable |
+| 24 | ~~`.claude/skills/.../instinct-cli.py`~~ | 1,426 | Removed 2026-10-08 (continuous-learning-v2 pruned) |
 | 25 | `intelligence/swf_network.py` | 1,421 | CRITICAL |
 | 26 | `intelligence/entity_resolver.py` | 1,410 | CRITICAL |
 | 27 | `intelligence/lever_pullers.py` | 1,376 | CRITICAL |

@@ -10,7 +10,7 @@ Each class maps to one error pattern seen in the grid-svr journal:
   ``/complete`` read timeouts followed by 400 "Invalid transition" retries.
 * ``TestBtpBund`` — ECB BTP-Bund uq_raw_series_composite violations.
 * ``TestRedundancyNoScan`` — source_audit redundancy map DB scan timeouts.
-* ``TestImfOutage`` — imfdatapy pointing at the retired IMF SDMX host.
+* ``TestImfOutage`` — IMF host outages (imfdatapy replaced by api.imf.org SDMX 3.0).
 """
 
 from __future__ import annotations
@@ -352,10 +352,10 @@ class TestCoordinatorIdempotent:
 
     def test_blocking_handlers_run_off_the_event_loop(self):
         for fn in (coord.complete_job, coord.claim_job, coord.start_job,
-                   coord.worker_heartbeat, coord.get_job, coord.coordinator_stats):
+                   coord.worker_heartbeat, coord.get_job, coord.coordinator_stats,
+                   coord.coordinator_queue_stats, coord.create_job):
             assert not inspect.iscoroutinefunction(fn), fn.__name__
-        # contract handlers driven with asyncio.run elsewhere stay async
-        assert inspect.iscoroutinefunction(coord.create_job)
+        # dry-run never touches the database, so it may stay async
         assert inspect.iscoroutinefunction(coord.dry_run_job)
 
 
@@ -473,26 +473,25 @@ class TestImfOutage:
         failed = sum(1 for s, _ in imf.IMF_WEO_TARGETS if s == "PCPIPCH")
         assert res["rows_inserted"] == len(imf.IMF_WEO_TARGETS) - failed
 
-    def test_pull_ifs_skips_on_retired_host(self, monkeypatch):
-        pkg = types.ModuleType("imfdatapy")
-        mod = types.ModuleType("imfdatapy.imf")
+    def test_pull_ifs_skips_on_unreachable_imf_host(self, monkeypatch):
+        """Former IFS series now come from api.imf.org SDMX 3.0; a dead host is SKIPPED."""
 
-        class IFS:
-            def __init__(self, **kwargs):
-                pass
+        def fake_fetch(flow, key, start=None):
+            raise imf.requests.ConnectionError("Max retries exceeded with url: /external/sdmx/3.0")
 
-            def download_data(self):
-                raise ConnectionError("Failed to resolve 'dataservices.imf.org'")
-
-        mod.IFS = IFS
-        pkg.imf = mod
-        monkeypatch.setitem(sys.modules, "imfdatapy", pkg)
-        monkeypatch.setitem(sys.modules, "imfdatapy.imf", mod)
+        monkeypatch.setattr(imf.sdmx_json, "fetch_imf_series", fake_fetch)
         monkeypatch.setattr(imf.time, "sleep", lambda s: None)
 
         puller = imf.IMFPuller.__new__(imf.IMFPuller)
         puller.engine = None
         puller.source_id = 1
-        res = puller.pull_ifs("gross domestic product, real", "Q", "US")
+        res = puller.pull_ifs("us_gdp_real_imf")
         assert res["status"] == "SKIPPED"
         assert res["rows_inserted"] == 0
+
+    def test_imfdatapy_is_not_imported(self):
+        """imfdatapy targeted the retired dataservices.imf.org host and wrote
+        ./log/imfdatapy_*.log files on every call; it must stay unused."""
+        import inspect
+
+        assert "from imfdatapy" not in inspect.getsource(imf)

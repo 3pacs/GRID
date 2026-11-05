@@ -37,20 +37,42 @@ from ingestion.base import BasePuller, retry_on_failure
 _REQUEST_TIMEOUT: int = 45
 _USER_AGENT: str = "GRID-Ingestion/1.0 (research; +https://grid.local)"
 
-# NY Fed Nowcast spreadsheet (updated weekly, history back to 2002)
+# NY Fed Staff Nowcast workbook (updated each Friday, history from 2022-12).
+# The 2002-present xlsx under /medialibrary/research/policy/nowcast/ now
+# redirects to /errors/404; the interactive's downloads.json
+# (/medialibrary/Research/Interactives/Data/NowCast/data/downloads.json)
+# points at this file, probed from grid-svr 2026-11-04: sheets
+# "New York Fed Nowcast" (notes), "Forecasts By Quarter",
+# "Forecasts By Horizon".
 _NOWCAST_URL: str = (
-    "https://www.newyorkfed.org/medialibrary/research/policy/nowcast/"
-    "new-york-fed-staff-nowcast_data_2002-present.xlsx"
+    "https://www.newyorkfed.org/medialibrary/Research/Interactives/Data/"
+    "NowCast/downloads/New-York-Fed-Staff-Nowcast_download_data.xlsx"
 )
+_NOWCAST_HORIZON_SHEET: str = "Forecasts By Horizon"
 
 # SOMA endpoints (Markets API, JSON, no key)
 _SOMA_ASOF_URL: str = "https://markets.newyorkfed.org/api/soma/asofdates/latest.json"
 _SOMA_SUMMARY_URL: str = "https://markets.newyorkfed.org/api/soma/summary.json"
 
-# Treasury operations (last two weeks of results)
+# Treasury operations (last two weeks of results). The include segment
+# (summary|details) is now required: .../results/lastTwoWeeks.json answers 400
+# (probed from grid-svr 2026-11-04); .../results/summary/lastTwoWeeks.json
+# answers {"treasury": {"auctions": [...]}} with totalParAmtAccepted.
 _TSY_OPS_URL: str = (
-    "https://markets.newyorkfed.org/api/tsy/all/results/lastTwoWeeks.json"
+    "https://markets.newyorkfed.org/api/tsy/all/results/summary/lastTwoWeeks.json"
 )
+
+# SOMA summary (current Markets API shape, probed 2026-11-04): one weekly
+# snapshot per entry, {"asOfDate", "mbs", "cmbs", "tips", "frn",
+# "tipsInflationCompensation", "notesbonds", "bills", "agencies", "total"},
+# all USD strings, "" = none held. "total" is the sum of every component except
+# tipsInflationCompensation.
+_SOMA_TREASURY_KEYS: tuple[str, ...] = ("bills", "notesbonds", "frn", "tips")
+_SOMA_TOTAL_KEYS: tuple[str, ...] = (
+    "bills", "notesbonds", "frn", "tips", "mbs", "cmbs", "agencies",
+)
+# Snapshots older than this before the latest as-of date are not (re)stored.
+_SOMA_BACKFILL_DAYS: int = 91
 
 # Series ID prefix
 _PFX: str = "nyfed"
@@ -190,8 +212,156 @@ def _extract_nowcast_series(
     return rows
 
 
+def _nowcast_number(value: Any) -> float | None:
+    """Parse one supplied Nowcast cell: blank -> None, else a finite float."""
+    import pandas as pd
+
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Unsupported supplied nowcast forecast")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Nonfinite supplied nowcast forecast")
+    return number
+
+
+def _extract_nowcast_horizon(
+    raw: Any,
+) -> list[tuple[Any, float | None, float | None, str, str]]:
+    """Extract vintage rows from the "Forecasts By Horizon" sheet.
+
+    ``raw`` is the sheet read with ``header=None``: a banner block, then a
+    header row starting "Forecast date" with columns "Reference quarter",
+    "Backcast (previous quarter)", "Nowcast (current quarter)", "Forecast
+    (next quarter)", then one row per Friday vintage. Returns the same tuple
+    shape as :func:`_extract_nowcast_series`: (vintage date, current-quarter
+    nowcast, next-quarter forecast, q1 label, q2 label). Blank cells are
+    absent forecasts; a supplied non-numeric/non-finite value or an unparseable
+    vintage date with values raises ``ValueError`` before any write.
+    """
+    import pandas as pd
+
+    header_row: int | None = None
+    for i in range(len(raw)):
+        first = raw.iat[i, 0]
+        if isinstance(first, str) and first.strip().lower().startswith("forecast date"):
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError("Nowcast horizon sheet header missing")
+
+    headers = [
+        "" if (not isinstance(h, str) and pd.isna(h)) else str(h).strip().lower()
+        for h in raw.iloc[header_row].tolist()
+    ]
+
+    def _find(*needles: str) -> int | None:
+        for j, h in enumerate(headers):
+            if all(n in h for n in needles):
+                return j
+        return None
+
+    ref_j = _find("reference", "quarter")
+    now_j = _find("nowcast", "current")
+    next_j = _find("forecast", "next")
+    if now_j is None or next_j is None:
+        raise ValueError("Nowcast horizon columns missing")
+
+    rows: list[tuple[Any, float | None, float | None, str, str]] = []
+    for i in range(header_row + 1, len(raw)):
+        cells = (raw.iat[i, now_j], raw.iat[i, next_j])
+        supplied = [c for c in cells if not (not isinstance(c, str) and pd.isna(c))]
+        stamp = pd.to_datetime(raw.iat[i, 0], errors="coerce")
+        if pd.isna(stamp):
+            if not supplied:
+                continue  # blank or note row after the data block
+            raise ValueError("Invalid supplied nowcast vintage date")
+        v1 = _nowcast_number(cells[0])
+        v2 = _nowcast_number(cells[1])
+        if v1 is None and v2 is None:
+            continue
+        ref = ""
+        if ref_j is not None:
+            ref_cell = raw.iat[i, ref_j]
+            if isinstance(ref_cell, str):
+                ref = ref_cell.strip()
+        rows.append((
+            stamp.date(),
+            v1,
+            v2,
+            f"nowcast_current:{ref}" if v1 is not None else "",
+            f"forecast_next:{ref}" if v2 is not None else "",
+        ))
+    return rows
+
+
+def _soma_usd(entry: dict[str, Any], key: str) -> float:
+    """One SOMA component in USD: "" -> 0.0 (none held); else finite, >= 0."""
+    raw = entry.get(key)
+    if raw is None or isinstance(raw, bool):
+        raise ValueError(f"SOMA {key} missing")
+    if isinstance(raw, str) and raw.strip() == "":
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid SOMA {key}")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"Invalid SOMA {key}")
+    return value
+
+
+def _soma_snapshots(
+    summary_list: list[Any], asof: date,
+) -> list[tuple[date, float, float, float, dict[str, float]]]:
+    """Parse the current SOMA summary time series (one entry per as-of week).
+
+    Returns (as_of, total_bn, treasury_bn, mbs_bn, components_usd) for every
+    snapshot in [asof - _SOMA_BACKFILL_DAYS, asof], oldest first. The snapshot
+    for ``asof`` itself must be present, and each snapshot's components must
+    sum to its published total; anything else is a shape change and raises.
+    """
+    snapshots: list[tuple[date, float, float, float, dict[str, float]]] = []
+    seen_asof = False
+    for entry in summary_list:
+        if not isinstance(entry, dict):
+            raise ValueError("Malformed SOMA holding")
+        try:
+            snap_date = datetime.strptime(str(entry.get("asOfDate"))[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("Malformed SOMA as-of date")
+        if snap_date > asof or (asof - snap_date).days > _SOMA_BACKFILL_DAYS:
+            continue
+        components = {k: _soma_usd(entry, k) for k in _SOMA_TOTAL_KEYS}
+        total = _soma_usd(entry, "total")
+        if abs(sum(components.values()) - total) > max(1_000_000.0, total * 1e-6):
+            raise ValueError("SOMA components do not sum to the published total")
+        treasury = sum(components[k] for k in _SOMA_TREASURY_KEYS)
+        snapshots.append((
+            snap_date,
+            total / 1_000_000_000,
+            treasury / 1_000_000_000,
+            components["mbs"] / 1_000_000_000,
+            components,
+        ))
+        seen_asof = seen_asof or snap_date == asof
+    if not seen_asof:
+        raise ValueError("SOMA summary lacks the latest as-of snapshot")
+    snapshots.sort(key=lambda snap: snap[0])
+    return snapshots
+
+
 class NYFedPermanentError(RuntimeError):
-    """Raised when an NY Fed endpoint returns a permanent 4xx."""
+    """Raised when an NY Fed endpoint returns a permanent 4xx.
+
+    ``repeat`` is True when the URL was already blacklisted earlier in this
+    process: the first failure is logged at WARNING, repeats at DEBUG.
+    """
+
+    def __init__(self, message: str, *, repeat: bool = False) -> None:
+        super().__init__(message)
+        self.repeat = repeat
 
 
 class NYFedPuller(BasePuller):
@@ -258,7 +428,9 @@ class NYFedPuller(BasePuller):
             requests.exceptions.HTTPError: On other non-2xx response.
         """
         if url in _DEAD_ENDPOINTS:
-            raise NYFedPermanentError(f"{url} previously blacklisted this session")
+            raise NYFedPermanentError(
+                f"{url} previously blacklisted this session", repeat=True
+            )
         resp = self._session.get(url, timeout=_REQUEST_TIMEOUT)
         if resp.status_code in _HTTP_PERMANENT_CODES:
             _DEAD_ENDPOINTS.add(url)
@@ -292,7 +464,9 @@ class NYFedPuller(BasePuller):
             requests.exceptions.HTTPError: On other non-2xx response.
         """
         if url in _DEAD_ENDPOINTS:
-            raise NYFedPermanentError(f"{url} previously blacklisted this session")
+            raise NYFedPermanentError(
+                f"{url} previously blacklisted this session", repeat=True
+            )
         resp = self._session.get(url, timeout=_REQUEST_TIMEOUT)
         if resp.status_code in _HTTP_PERMANENT_CODES:
             _DEAD_ENDPOINTS.add(url)
@@ -329,59 +503,85 @@ class NYFedPuller(BasePuller):
         q1_sid = f"{_PFX}.nowcast_gdp_q1"
         q2_sid = f"{_PFX}.nowcast_gdp_q2"
 
+        transaction_started = False
         try:
             raw_bytes = self._fetch_bytes(_NOWCAST_URL)
             xls = pd.ExcelFile(io.BytesIO(raw_bytes))
 
-            # The spreadsheet has a "Forecast" sheet with dated nowcast rows
-            # Try common sheet names
-            sheet_name: str | None = None
-            for candidate in ("Forecast", "Forecasts", "Nowcast", xls.sheet_names[0]):
-                if candidate in xls.sheet_names:
-                    sheet_name = candidate
-                    break
-            if sheet_name is None:
-                sheet_name = xls.sheet_names[0]
+            if _NOWCAST_HORIZON_SHEET in xls.sheet_names:
+                # Current workbook: one row per weekly vintage with the
+                # current-quarter nowcast and next-quarter forecast as
+                # explicit columns -- no quarter inference needed.
+                # Only truly empty cells are missing: pandas' default NA
+                # strings ("n/a", "NA", ...) would silently erase a supplied
+                # non-numeric forecast instead of failing closed.
+                extracted = _extract_nowcast_horizon(
+                    pd.read_excel(
+                        xls, sheet_name=_NOWCAST_HORIZON_SHEET, header=None,
+                        keep_default_na=False, na_values=[""],
+                    )
+                )
+            else:
+                # The spreadsheet has a "Forecast" sheet with dated nowcast rows
+                # Try common sheet names
+                sheet_name: str | None = None
+                for candidate in ("Forecast", "Forecasts", "Nowcast", xls.sheet_names[0]):
+                    if candidate in xls.sheet_names:
+                        sheet_name = candidate
+                        break
+                if sheet_name is None:
+                    sheet_name = xls.sheet_names[0]
 
-            df = pd.read_excel(xls, sheet_name=sheet_name)
-            log.debug(
-                "Nowcast sheet '{s}' — {r} rows, columns: {c}",
-                s=sheet_name,
-                r=len(df),
-                c=list(df.columns),
-            )
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                log.debug(
+                    "Nowcast sheet '{s}' — {r} rows, columns: {c}",
+                    s=sheet_name,
+                    r=len(df),
+                    c=list(df.columns),
+                )
 
-            # Normalise column names to lowercase for easier matching
-            df.columns = [str(c).strip().lower() for c in df.columns]
+                # Normalise column names to lowercase for easier matching
+                df.columns = [str(c).strip().lower() for c in df.columns]
 
-            # Identify date column
-            date_col: str | None = None
-            for col in ("date", "forecast date", "forecastdate", "release date"):
-                if col in df.columns:
-                    date_col = col
-                    break
-            if date_col is None:
-                # Fall back to first column
-                date_col = df.columns[0]
+                # Identify date column
+                date_col: str | None = None
+                for col in ("date", "forecast date", "forecastdate", "release date"):
+                    if col in df.columns:
+                        date_col = col
+                        break
+                if date_col is None:
+                    # Fall back to first column
+                    date_col = df.columns[0]
 
-            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-            df = df.dropna(subset=[date_col])
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                if any(pd.isna(value) for value in df[date_col]):
+                    raise ValueError("Invalid supplied nowcast vintage date")
+                # Blank forecasts are genuinely absent; supplied invalid values
+                # must not be erased by the unchanged quarter parser.
+                for col in df.columns:
+                    if col == date_col:
+                        continue
+                    numeric = pd.api.types.is_numeric_dtype(df[col])
+                    if _quarter_sort_key(str(col)) is None and not numeric:
+                        continue
+                    supplied = [value for value in df[col] if not pd.isna(value)]
+                    if supplied and not numeric:
+                        raise ValueError("Unsupported supplied nowcast forecast")
+                    if any(not math.isfinite(float(value)) for value in supplied):
+                        raise ValueError("Nonfinite supplied nowcast forecast")
+                df = df.dropna(subset=[date_col])
 
-            # Extract (date, q1, q2, q1_col, q2_col) per vintage row. This
-            # correctly picks the latest populated reference-quarter column
-            # as the current-quarter nowcast (instead of the oldest 2002
-            # column the old first/second-numeric heuristic always grabbed).
-            extracted = _extract_nowcast_series(df, date_col)
+                # Extract (date, q1, q2, q1_col, q2_col) per vintage row. This
+                # correctly picks the latest populated reference-quarter column
+                # as the current-quarter nowcast (instead of the oldest 2002
+                # column the old first/second-numeric heuristic always grabbed).
+                extracted = _extract_nowcast_series(df, date_col)
             if not extracted:
-                log.warning("Nowcast: no usable forecast columns found")
-                for sid in (q1_sid, q2_sid):
-                    results.append({
-                        "feature": sid, "status": "NO_DATA", "rows_inserted": 0,
-                    })
-                return results
+                raise ValueError("No usable nowcast forecast columns")
 
             any_q2 = any(q2v is not None for _, _, q2v, _, _ in extracted)
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 existing_q1 = self._get_existing_dates(q1_sid, conn)
                 existing_q2 = self._get_existing_dates(q2_sid, conn)
@@ -391,24 +591,32 @@ class NYFedPuller(BasePuller):
 
                 for obs_date, v1, v2, q1_col, q2_col in extracted:
                     if v1 is not None and obs_date not in existing_q1:
-                        self._insert_raw(
+                        insert_result = self._insert_raw(
                             conn=conn,
                             series_id=q1_sid,
                             obs_date=obs_date,
                             value=v1,
                             raw_payload={"source_col": q1_col},
+                            return_result=True,
                         )
-                        q1_inserted += 1
+                        affected = getattr(insert_result, "rowcount", None)
+                        if type(affected) is not int or affected < 0:
+                            raise ValueError("Unknown affected row count")
+                        q1_inserted += affected
 
                     if v2 is not None and obs_date not in existing_q2:
-                        self._insert_raw(
+                        insert_result = self._insert_raw(
                             conn=conn,
                             series_id=q2_sid,
                             obs_date=obs_date,
                             value=v2,
                             raw_payload={"source_col": q2_col},
+                            return_result=True,
                         )
-                        q2_inserted += 1
+                        affected = getattr(insert_result, "rowcount", None)
+                        if type(affected) is not int or affected < 0:
+                            raise ValueError("Unknown affected row count")
+                        q2_inserted += affected
 
             log.info(
                 "Nowcast GDP -- Q1: {q1} rows, Q2: {q2} rows",
@@ -420,29 +628,33 @@ class NYFedPuller(BasePuller):
             })
             results.append({
                 "feature": q2_sid,
-                "status": "SUCCESS" if any_q2 else "NO_DATA",
+                "status": "SUCCESS" if any_q2 else "NO_NEW_DATA",
                 "rows_inserted": q2_inserted,
             })
 
         except NYFedPermanentError as exc:
-            log.warning(
+            # First failure WARNING; the same dead URL again this process is
+            # DEBUG (was one identical WARNING per run).
+            (log.debug if getattr(exc, "repeat", False) else log.warning)(
                 "Nowcast skipped (permanent endpoint failure): {e}",
                 e=str(exc),
             )
+            results = []
             for sid in (q1_sid, q2_sid):
                 results.append({
                     "feature": sid,
                     "status": "SKIPPED",
-                    "rows_inserted": 0,
+                    "rows_inserted": None if transaction_started else 0,
                     "error": str(exc),
                 })
         except Exception as exc:
             log.error("Nowcast pull failed: {e}", e=str(exc))
+            results = []
             for sid in (q1_sid, q2_sid):
                 results.append({
                     "feature": sid,
                     "status": "FAILED",
-                    "rows_inserted": 0,
+                    "rows_inserted": None if transaction_started else 0,
                     "error": str(exc),
                 })
 
@@ -466,6 +678,7 @@ class NYFedPuller(BasePuller):
         mbs_sid = f"{_PFX}.soma_mbs_par_bn"
         results: list[dict[str, Any]] = []
 
+        transaction_started = False
         try:
             # Get the as-of date for the latest SOMA snapshot
             asof_data = self._fetch_json(_SOMA_ASOF_URL)
@@ -487,8 +700,7 @@ class NYFedPuller(BasePuller):
                         break
 
             if asof_date_str is None:
-                log.warning("SOMA: could not determine as-of date from response")
-                asof_date_obj = date.today()
+                raise ValueError("SOMA as-of date missing")
             else:
                 asof_date_obj = datetime.strptime(
                     asof_date_str[:10], "%Y-%m-%d"
@@ -511,14 +723,39 @@ class NYFedPuller(BasePuller):
             elif isinstance(summary_data, list):
                 summary_list = summary_data
 
+            if not isinstance(summary_list, list) or not summary_list:
+                raise ValueError("SOMA summary missing")
+
+            # Current Markets API shape: a weekly time series of snapshots
+            # with per-security-type columns and a "total" (no parValue /
+            # securityType). The legacy per-holding parser below raised "SOMA
+            # par value missing" on it every run (grid-hermes 2026-11-03,
+            # last stored snapshot 2026-10-14).
+            if all(
+                isinstance(entry, dict) and "asOfDate" in entry and "total" in entry
+                for entry in summary_list
+            ):
+                snapshots = _soma_snapshots(summary_list, asof_date_obj)
+                transaction_started = True
+                return self._store_soma_snapshots(
+                    snapshots, (total_sid, tsy_sid, mbs_sid),
+                )
+
+            seen_treasury = seen_mbs = False
             total_par: float = 0.0
             treasury_par: float = 0.0
             mbs_par: float = 0.0
 
             for entry in summary_list:
-                par_raw = entry.get("parValue", entry.get("par_value", 0))
+                if not isinstance(entry, dict):
+                    raise ValueError("Malformed SOMA holding")
+                par_raw = entry.get("parValue", entry.get("par_value"))
+                if par_raw is None or isinstance(par_raw, bool):
+                    raise ValueError("SOMA par value missing")
                 par_val = float(par_raw) / 1_000_000_000  # Convert to billions
 
+                if not math.isfinite(par_val) or par_val < 0:
+                    raise ValueError("Invalid SOMA par value")
                 sec_type = str(
                     entry.get("securityType", entry.get("security_type", ""))
                 ).upper()
@@ -526,8 +763,10 @@ class NYFedPuller(BasePuller):
                 total_par += par_val
 
                 if "TREASURY" in sec_type or "NOTE" in sec_type or "BOND" in sec_type:
+                    seen_treasury = True
                     treasury_par += par_val
                 elif "MBS" in sec_type or "MORTGAGE" in sec_type:
+                    seen_mbs = True
                     mbs_par += par_val
 
             # If no breakdown found but total is available, try top-level keys
@@ -538,6 +777,12 @@ class NYFedPuller(BasePuller):
                             total_par = float(entry[key]) / 1_000_000_000
                             break
 
+            if not math.isfinite(total_par) or total_par < 0:
+                raise ValueError("Invalid selected SOMA total")
+            if not seen_treasury or not seen_mbs:
+                raise ValueError("Incomplete SOMA security breakdown")
+
+            transaction_started = True
             with self.engine.begin() as conn:
                 existing_total = self._get_existing_dates(total_sid, conn)
                 existing_tsy = self._get_existing_dates(tsy_sid, conn)
@@ -550,7 +795,7 @@ class NYFedPuller(BasePuller):
                 ):
                     inserted = 0
                     if val > 0 and asof_date_obj not in existing:
-                        self._insert_raw(
+                        insert_result = self._insert_raw(
                             conn=conn,
                             series_id=sid,
                             obs_date=asof_date_obj,
@@ -559,11 +804,15 @@ class NYFedPuller(BasePuller):
                                 "asof_date": str(asof_date_obj),
                                 "raw_value_usd": val * 1_000_000_000,
                             },
+                            return_result=True,
                         )
-                        inserted = 1
+                        affected = getattr(insert_result, "rowcount", None)
+                        if type(affected) is not int or affected < 0:
+                            raise ValueError("Unknown affected row count")
+                        inserted = affected
                     results.append({
                         "feature": sid,
-                        "status": "SUCCESS" if val > 0 else "NO_DATA",
+                        "status": "SUCCESS" if val > 0 else "NO_NEW_DATA",
                         "rows_inserted": inserted,
                     })
 
@@ -577,15 +826,69 @@ class NYFedPuller(BasePuller):
 
         except Exception as exc:
             log.error("SOMA pull failed: {e}", e=str(exc))
+            results = []
             for sid in (total_sid, tsy_sid, mbs_sid):
                 results.append({
                     "feature": sid,
                     "status": "FAILED",
-                    "rows_inserted": 0,
+                    "rows_inserted": None if transaction_started else 0,
                     "error": str(exc),
                 })
 
         return results
+
+    def _store_soma_snapshots(
+        self,
+        snapshots: list[tuple[date, float, float, float, dict[str, float]]],
+        sids: tuple[str, str, str],
+    ) -> list[dict[str, Any]]:
+        """Store parsed SOMA snapshots (one row per as-of date per series).
+
+        Rows already stored for an as-of date are skipped. A non-positive
+        value is observed, not stored (same rule as the legacy parser). The
+        caller's handler turns any exception into FAILED results with
+        ``rows_inserted=None`` once the transaction has started.
+        """
+        total_sid, tsy_sid, mbs_sid = sids
+        inserted = {sid: 0 for sid in sids}
+        latest = snapshots[-1]
+        with self.engine.begin() as conn:
+            existing = {sid: self._get_existing_dates(sid, conn) for sid in sids}
+            for snap_date, total_bn, tsy_bn, mbs_bn, components in snapshots:
+                for sid, val in ((total_sid, total_bn), (tsy_sid, tsy_bn), (mbs_sid, mbs_bn)):
+                    if val <= 0 or snap_date in existing[sid]:
+                        continue
+                    insert_result = self._insert_raw(
+                        conn=conn,
+                        series_id=sid,
+                        obs_date=snap_date,
+                        value=val,
+                        raw_payload={
+                            "asof_date": str(snap_date),
+                            "raw_value_usd": val * 1_000_000_000,
+                            "components_usd": components,
+                        },
+                        return_result=True,
+                    )
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    inserted[sid] += affected
+                    existing[sid].add(snap_date)
+        log.info(
+            "SOMA -- total={t:.1f}B, treasury={tr:.1f}B, mbs={m:.1f}B (as of {d}; "
+            "{n} snapshots checked)",
+            t=latest[1], tr=latest[2], m=latest[3], d=latest[0], n=len(snapshots),
+        )
+        latest_vals = {total_sid: latest[1], tsy_sid: latest[2], mbs_sid: latest[3]}
+        return [
+            {
+                "feature": sid,
+                "status": "SUCCESS" if latest_vals[sid] > 0 else "NO_NEW_DATA",
+                "rows_inserted": inserted[sid],
+            }
+            for sid in sids
+        ]
 
     # ------------------------------------------------------------------
     # Treasury Operations
@@ -602,11 +905,12 @@ class NYFedPuller(BasePuller):
         sid = f"{_PFX}.tsy_ops_total_bn"
         rows_inserted = 0
 
+        transaction_started = False
         try:
             data = self._fetch_json(_TSY_OPS_URL)
 
             # Parse operations list
-            ops_list: list[dict[str, Any]] = []
+            ops_list: list[dict[str, Any]] | None = None
             if "treasury" in data and "auctions" in data["treasury"]:
                 ops_list = data["treasury"]["auctions"]
             elif "treasury" in data:
@@ -618,29 +922,37 @@ class NYFedPuller(BasePuller):
             elif isinstance(data, list):
                 ops_list = data
 
+            if not isinstance(ops_list, list):
+                raise ValueError("Unsupported Treasury operations response")
+
             # Aggregate total accepted amount per operation date
             daily_totals: dict[date, float] = {}
             for op in ops_list:
+                if not isinstance(op, dict):
+                    raise ValueError("Malformed Treasury operation")
                 # Extract date
                 op_date_str = str(
                     op.get("operationDate", op.get("operation_date", op.get("date", "")))
                 )
                 if not op_date_str or op_date_str == "":
-                    continue
+                    raise ValueError("Treasury operation date missing")
                 try:
                     op_date = datetime.strptime(op_date_str[:10], "%Y-%m-%d").date()
                 except (ValueError, TypeError):
-                    continue
+                    raise ValueError("Malformed Treasury operation date")
 
                 # Extract accepted amount
                 amt_raw = op.get(
-                    "totalAmtAccepted",
-                    op.get("total_amt_accepted", op.get("accepted", 0)),
+                    "totalParAmtAccepted",
+                    op.get(
+                        "totalAmtAccepted",
+                        op.get("total_amt_accepted", op.get("accepted")),
+                    ),
                 )
                 try:
                     amt = float(amt_raw) / 1_000_000_000  # Convert to billions
                 except (ValueError, TypeError):
-                    continue
+                    raise ValueError("Malformed Treasury operation amount")
 
                 if math.isnan(amt) or math.isinf(amt):
                     log.warning(
@@ -648,24 +960,29 @@ class NYFedPuller(BasePuller):
                         d=op_date,
                         a=amt_raw,
                     )
-                    continue
+                    raise ValueError("Nonfinite Treasury operation amount")
 
                 daily_totals[op_date] = daily_totals.get(op_date, 0.0) + amt
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 existing = self._get_existing_dates(sid, conn)
 
                 for op_date, total_bn in sorted(daily_totals.items()):
                     if op_date in existing:
                         continue
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id=sid,
                         obs_date=op_date,
                         value=total_bn,
                         raw_payload={"raw_total_usd": total_bn * 1_000_000_000},
+                        return_result=True,
                     )
-                    rows_inserted += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    rows_inserted += affected
 
             log.info(
                 "TSY ops -- {n} days, {r} new rows inserted",
@@ -674,14 +991,16 @@ class NYFedPuller(BasePuller):
             )
 
         except NYFedPermanentError as exc:
-            log.warning(
+            # First failure WARNING; the same dead URL again this process is
+            # DEBUG (was one identical WARNING per run).
+            (log.debug if getattr(exc, "repeat", False) else log.warning)(
                 "Treasury ops skipped (permanent endpoint failure): {e}",
                 e=str(exc),
             )
             return [{
                 "feature": sid,
                 "status": "SKIPPED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": str(exc),
             }]
         except Exception as exc:
@@ -689,7 +1008,7 @@ class NYFedPuller(BasePuller):
             return [{
                 "feature": sid,
                 "status": "FAILED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": str(exc),
             }]
 
@@ -724,7 +1043,7 @@ class NYFedPuller(BasePuller):
         results.extend(self._pull_treasury_ops())
 
         # Summary
-        total_rows = sum(r.get("rows_inserted", 0) for r in results)
+        total_rows = (None if any(r.get("rows_inserted") is None for r in results) else sum(r["rows_inserted"] for r in results))
         succeeded = sum(1 for r in results if r.get("status") == "SUCCESS")
         log.info(
             "NYFed pull_all -- {ok}/{total} series, {rows} total rows inserted",

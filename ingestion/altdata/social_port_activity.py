@@ -617,7 +617,7 @@ class SocialPortActivityPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://www.reddit.com",
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "EOD",  # was DAILY: not in source_catalog_latency_class_check
         "pit_available": False,
         "revision_behavior": "NEVER",
         "trust_score": "MED",

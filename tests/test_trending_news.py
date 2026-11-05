@@ -37,6 +37,8 @@ def mock_engine():
     # Default: source_catalog row exists, but no duplicate items found
     conn.execute.return_value.fetchone.return_value = (1,)
     conn.execute.return_value.fetchall.return_value = []
+    # Committed-row counts come from the INSERT's rowcount (2026-11-04).
+    conn.execute.return_value.rowcount = 1
     # Store a reference to the mock conn for test access
     engine._mock_conn = conn
     return engine
@@ -353,28 +355,73 @@ class TestDeduplication:
 class TestPullAll:
 
     def test_pull_all_when_unavailable(self, puller):
-        """When last30days is unavailable, pull_all returns empty results."""
+        """Without the vendored engine the run is SKIPPED with the reason.
+
+        2026-11-04: vendor/ is gitignored and absent on grid-svr; the old
+        summary had no committed count, so every daily run was FAILED
+        "puller did not report committed write count".
+        """
+        from ingestion.smart_scheduler import _classify_outcome
+
         puller._last30days_available = False
         result = puller.pull_all()
         assert result["total_items"] == 0
         assert result["topics_researched"] == 1
+        assert result["status"] == "SKIPPED"
+        assert "last30days-skill" in result["skipped_reason"]
+        assert _classify_outcome(result)[0] == "SKIPPED"
 
     @patch.object(TrendingNewsPuller, "pull_topic")
-    def test_pull_all_aggregates(self, mock_pull, puller):
+    def test_pull_all_aggregates(self, mock_pull, puller, mock_engine):
         """pull_all should aggregate results from all topics."""
+        from ingestion.smart_scheduler import _classify_outcome
+
+        puller._last30days_available = True
+        mock_engine._mock_conn.execute.return_value.fetchone.return_value = None  # no dup rows
         mock_pull.return_value = {"reddit": 5, "hackernews": 3}
         result = puller.pull_all()
         assert result["total_stored"] == 8
         assert "test topic" in result["topic_results"]
+        # 8 items + 3 aggregate rows (2 platforms + total), mock rowcount 1.
+        assert result["rows_inserted"] == 11
+        assert _classify_outcome(result) == ("SUCCESS", 11, None)
 
     @patch.object(TrendingNewsPuller, "pull_topic")
     def test_pull_all_handles_errors(self, mock_pull, puller):
         """pull_all should handle topic failures gracefully."""
+        from ingestion.smart_scheduler import _classify_outcome
+
+        puller._last30days_available = True
         mock_pull.side_effect = RuntimeError("API down")
         result = puller.pull_all()
         assert result["total_items"] == 0
         assert result["topic_results"]["test topic"]["platforms"] == {}
         assert result["topic_results"]["test topic"]["total"] == 0
+        assert result["status"] == "FAILED"
+        assert _classify_outcome(result)[0] == "FAILED"
+
+    def test_research_failure_is_not_a_clean_empty_topic(self, puller):
+        """A raised research run makes the topic failed, not '0 items'."""
+        puller._last30days_available = True
+
+        def boom(*_a, **_k):
+            raise RuntimeError("engine crashed")
+
+        with patch("ingestion.altdata.trending_news.time.sleep"), \
+             patch.dict("sys.modules", {"lib": MagicMock(pipeline=MagicMock(run=boom))}):
+            result = puller.pull_all()
+        assert result["status"] == "FAILED"
+        assert result["succeeded"] == 0
+
+    def test_store_items_counts_only_new_rows(self, puller, mock_engine):
+        """ON CONFLICT DO NOTHING duplicates (rowcount 0) are not counted."""
+        mock_engine._mock_conn.execute.return_value.rowcount = 0
+        item = TrendingItem(
+            platform="reddit", item_id="R9", topic="t", title="dup", url="",
+            content="", author="", published=None, engagement_total=1,
+            relevance=0.1, score=0, raw_engagement={}, dedup_hash="dup1",
+        )
+        assert puller._store_items([item]) == 0
 
 
 # ── Unit Tests: get_recent ──────────────────────────────────────────────

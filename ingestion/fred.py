@@ -187,7 +187,6 @@ FRED_SERIES_LIST: list[str] = [
     # ── Money market / liquidity ──
     "MMMFFAQ027S",         # Money market fund total assets (quarterly)
     "WRMFNS",              # Retail money market funds (weekly)
-    "RRPONTSYD",           # Overnight reverse repo (daily)
 ]
 
 # Minimum delay between FRED API calls (seconds)
@@ -1081,12 +1080,23 @@ class FREDPuller(BasePuller):
                 continue
             effective_start = start_date
             if latest is not None:
+                # Always re-read from just before the latest stored
+                # observation, even when the caller's start_date is later.
+                # Hermes repairs pass start_date = today - 21d; for a
+                # monthly/quarterly series whose newest observation is older
+                # than that (CPIAUCSL last=2026-09-01 on 2026-11-03) the
+                # caller's window held no observations at all, fedfred raised
+                # KeyError('date'), the series reported PARTIAL "No data
+                # returned" and every FRED repair "did not recover"
+                # (grid-hermes 2026-11-03: 596 such series-pulls/day). A window
+                # that contains the latest stored observation turns that into
+                # an honest completed check: FRED returns it, the dedup skips
+                # it, the series reports SUCCESS with 0 rows. Windows stay
+                # bounded by what is already stored -- never a full-history
+                # re-pull for a known series.
                 incremental = latest - timedelta(days=7)
-                # Use whichever is more recent
-                start_as_date = date.fromisoformat(str(start_date)) if isinstance(start_date, str) else start_date
-                if incremental > start_as_date:
-                    effective_start = incremental.isoformat()
-                    log.info("FRED {sid}: incremental from {d} (last={l})", sid=sid, d=effective_start, l=latest)
+                effective_start = incremental.isoformat()
+                log.info("FRED {sid}: incremental from {d} (last={l})", sid=sid, d=effective_start, l=latest)
             res = self.pull_series(sid, effective_start, end_date)
             results.append(res)
             aborted = bool(res.get("aborted"))

@@ -42,6 +42,7 @@ from typing import Any
 
 import requests
 from loguru import logger as log
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
@@ -186,6 +187,18 @@ class ECBLtroPuller(BasePuller):
                     )
                     existing.add(obs_date)
                     inserted += 1
+                # This writer runs from intelligence.scheduler, not the
+                # SmartScheduler, so nothing else records its successful
+                # check: last_pull_at stayed NULL while weekly rows landed
+                # (407 rows, last 2026-11-02), and the source counted as
+                # stale. Bump it in the same transaction as new writes.
+                # Same rule as the schedulers: only committed new rows count as
+                # freshness (a zero-write check is NO_NEW_DATA, never fresh).
+                if inserted:
+                    conn.execute(
+                        text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
+                        {"sid": self.source_id},
+                    )
         except Exception as exc:  # noqa: BLE001
             log.warning("ecb_ilm_ltro: save failed: {e}", e=str(exc))
             return {"status": "FAILED", "rows_inserted": 0, "error": str(exc)[:300]}

@@ -5,7 +5,7 @@
 
 # Database
 psycopg2-binary>=2.9.12
-asyncpg>=0.29.0  # LISTEN only: cross-process contract events → SSE (events/bus.py); the sync engine stays psycopg2
+asyncpg>=0.32.0  # LISTEN only: cross-process contract events → SSE (events/bus.py); the sync engine stays psycopg2
 # 2.1 changes postgresql:// to psycopg v3; GRID uses psycopg2 throughout.
 sqlalchemy>=2.0.0,<2.1
 alembic>=1.20.0
@@ -17,7 +17,7 @@ numpy>=1.26.0
 duckdb>=1.5.5
 fedfred>=1.2.9
 yfinance>=1.5.1
-requests>=2.31.0
+requests>=2.34.2
 beautifulsoup4>=4.14.3
 edgartools>=4.6.3
 # strategy.portfolio_workbook_plan imports openpyxl at module load (Workbook,
@@ -29,19 +29,20 @@ openpyxl>=3.1.0
 # Analysis
 scikit-learn>=1.4.0
 scipy>=1.12.0
-statsmodels>=0.14.6
-tsfresh>=0.20.0
+statsmodels>=0.15.0
+tsfresh>=0.21.2
 
 # Graph analytics
 networkx>=3.2.0
 python-louvain>=0.16
 
 # Visualization (for orthogonality audit outputs)
-matplotlib>=3.8.0
+matplotlib>=3.8.0,<3.11; python_version < "3.11"
+matplotlib>=3.11.2; python_version >= "3.11"
 seaborn>=0.13.2
 
 # Utilities
-python-dotenv>=1.0.0
+python-dotenv>=1.2.4
 schedule>=1.2.0
 pytz>=2024.1  # schedule.at(..., "UTC") timezone support
 pydantic>=2.13.4
@@ -59,7 +60,6 @@ langfuse>=4.15.2
 
 # International data
 akshare>=1.14.0
-imfdatapy>=0.1.1
 dbnomics>=0.2.6
 eurostat>=1.1.1
 requests-cache>=1.1.0
@@ -72,7 +72,7 @@ comtradeapicall>=0.1.4
 # It is not used by the current runtime code, and its hishel dependency range
 # is incompatible with edgartools, which is used by SEC ingestion.
 # If patent-client is needed later, install it in an isolated environment.
-boto3>=1.43.93
+boto3>=1.43.118
 
 # Utilities (extended)
 tqdm>=4.70.1
@@ -82,7 +82,10 @@ pyarrow>=25.0.1
 polars>=1.40.1
 
 # ML model training
-xgboost>=3.2.0
+# XGBoost 3.4.1 requires Python >=3.12; retain the compatible baseline
+# for GRID's Python 3.11 CI without changing the interpreter baseline.
+xgboost>=3.2.0; python_version < "3.12"
+xgboost>=3.4.1; python_version >= "3.12"
 
 # TradingAgents multi-agent framework (optional)
 # Install separately when the private TradingAgents package is available.

@@ -32,11 +32,14 @@ from intelligence.supply_chokepoints import (
 )
 
 
-DEFAULT_DB_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
 
 
 def _db_url() -> str:
-    return os.environ.get("GRID_DB_URL") or DEFAULT_DB_URL
+    if os.environ.get("GRID_DB_URL"):
+        return os.environ["GRID_DB_URL"]
+    from config import settings
+
+    return settings.DB_URL
 
 
 def _counts(conn) -> dict[str, int]:

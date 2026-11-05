@@ -8,7 +8,7 @@ from the Bank for International Settlements SDMX REST API.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import requests
@@ -16,89 +16,74 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
-from tenacity import retry, stop_after_attempt, wait_exponential
+from ingestion.international import sdmx_json
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-# BIS series: dataset_ref -> feature name
+# BIS series: "<dataflow>/<SDMX key>" -> feature name.
+#
+# 2026-11-04: the old keys ("total_credit/Q/5J/P/N/I/B/770", ...) were never
+# valid SDMX data queries -- stats.bis.org answered every one with HTTP 400
+# ("Invalid Data Query syntax ... unexpected 5th path parameter"), which
+# tenacity retried and wrapped as RetryError[HTTPError], 40 ERROR lines/day.
+# These are the real BIS dataflows, each verified by a probe from grid-svr:
+#   WS_CREDIT_GAP  FREQ.BORROWERS_CTY.TC_BORROWERS.TC_LENDERS.CG_DTYPE
+#                  (P = private non-financial sector, A = all lenders,
+#                   C = credit-to-GDP gap, actual minus trend)
+#   WS_LBS_D_PUB   locational banking statistics; F = FX- and break-adjusted
+#                  change (flow), C = claims, all instruments/currencies,
+#                  all reporting countries (5J) vs all counterparties (5J), USD mn
+#   WS_SPP         selected residential property prices; XW = world
+#                  aggregate, R = real, 628 = index 2010=100
 BIS_SERIES_LIST: dict[str, str] = {
-    "total_credit/Q/5J/P/N/I/B/770": "bis_credit_gdp_gap_us",
-    "total_credit/Q/5J/P/N/I/B/156": "bis_credit_gdp_gap_cn",
-    "total_credit/Q/5J/P/N/I/B/276": "bis_credit_gdp_gap_de",
-    "lbs/Q/A/F/USD/A/5J": "bis_global_cbflow_usd",
-    "pp_ss/Q/5J": "bis_property_prices_g20",
+    "WS_CREDIT_GAP/Q.US.P.A.C": "bis_credit_gdp_gap_us",
+    "WS_CREDIT_GAP/Q.CN.P.A.C": "bis_credit_gdp_gap_cn",
+    "WS_CREDIT_GAP/Q.DE.P.A.C": "bis_credit_gdp_gap_de",
+    "WS_LBS_D_PUB/Q.F.C.A.TO1.A.5J.A.5A.A.5J.N": "bis_global_cbflow_usd",
+    "WS_SPP/Q.XW.R.628": "bis_property_prices_g20",
 }
 
-_BIS_BASE_URL = "https://stats.bis.org/api/v1/data"
+_BIS_BASE_URL = sdmx_json.BIS_DATA_URL
 _RATE_LIMIT_DELAY: float = 2.0
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transport failures and 5xx/429 only; a 4xx query error is final."""
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(exc.response, "status_code", None)
+        return status is None or status >= 500 or status == 429
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
+
+def _split_ref(dataset_ref: str) -> tuple[str, str]:
+    flow, _, key = dataset_ref.partition("/")
+    if not flow or not key:
+        raise ValueError(f"BIS dataset_ref must be '<flow>/<key>', got {dataset_ref!r}")
+    return flow, key
 
 
 class BISPuller(BasePuller):
     """Pulls statistics from the Bank for International Settlements API."""
 
     SOURCE_NAME = "BIS"
-    SOURCE_CONFIG = {"base_url": "https://stats.bis.org/api/v1", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 12}
+    SOURCE_CONFIG = {"base_url": "https://stats.bis.org/api/v2", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 12}
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         log.info("BISPuller initialised — source_id={sid}", sid=self.source_id)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
-    def _fetch_bis_json(self, dataset_ref: str, start_period: str | None) -> dict:
-        url = f"{_BIS_BASE_URL}/{dataset_ref}"
-        params: dict[str, str] = {}
-        if start_period:
-            params["startPeriod"] = start_period
-        headers = {"Accept": "application/json"}
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-
-    def _parse_observations(self, data: dict) -> list[tuple[date, float]]:
-        """Parse BIS SDMX-JSON observations."""
-        observations: list[tuple[date, float]] = []
-        try:
-            datasets = data.get("dataSets", [])
-            if not datasets:
-                return observations
-
-            structure = data.get("structure", {})
-            dimensions = structure.get("dimensions", {})
-            obs_dims = dimensions.get("observation", [])
-
-            time_values = []
-            for dim in obs_dims:
-                if dim.get("id") in ("TIME_PERIOD", "TIME"):
-                    time_values = [v.get("id", "") for v in dim.get("values", [])]
-                    break
-
-            series_data = datasets[0].get("series", {})
-            for _key, series_obj in series_data.items():
-                obs_map = series_obj.get("observations", {})
-                for idx_str, val_list in obs_map.items():
-                    idx = int(idx_str)
-                    if idx < len(time_values) and val_list and val_list[0] is not None:
-                        period_str = time_values[idx]
-                        obs_dt = self._parse_period(period_str)
-                        if obs_dt:
-                            observations.append((obs_dt, float(val_list[0])))
-        except (KeyError, IndexError, TypeError) as exc:
-            log.warning("Failed to parse BIS observations: {err}", err=str(exc))
-        return observations
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    def _fetch_observations(self, dataset_ref: str, start_period: str | None) -> list[tuple[date, float]]:
+        flow, key = _split_ref(dataset_ref)
+        return sdmx_json.fetch_bis_series(flow, key, start_period)
 
     @staticmethod
     def _parse_period(period_str: str) -> date | None:
-        try:
-            if "-Q" in period_str:
-                year, q = period_str.split("-Q")
-                return date(int(year), (int(q) - 1) * 3 + 1, 1)
-            elif len(period_str) == 7:
-                return datetime.strptime(period_str, "%Y-%m").date()
-            elif len(period_str) == 4:
-                return date(int(period_str), 1, 1)
-            elif len(period_str) == 10:
-                return datetime.strptime(period_str, "%Y-%m-%d").date()
-        except (ValueError, TypeError):
-            pass
-        return None
+        return sdmx_json.parse_period(period_str)
 
     def pull_series(
         self,
@@ -118,9 +103,7 @@ class BISPuller(BasePuller):
         }
 
         try:
-            start_str = str(start_date)[:7] if len(str(start_date)) > 7 else None
-            data = self._fetch_bis_json(dataset_ref, start_str)
-            observations = self._parse_observations(data)
+            observations = self._fetch_observations(dataset_ref, sdmx_json.lookback_start_year(start_date))
 
             if not observations:
                 result["status"] = "PARTIAL"
@@ -146,7 +129,9 @@ class BISPuller(BasePuller):
             log.info("BIS {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("BIS pull failed for {dr}: {err}", dr=dataset_ref, err=str(exc))
+            # Upstream/network failures are operational, not code bugs.
+            level = log.error if isinstance(exc, (KeyError, AttributeError, TypeError)) else log.warning
+            level("BIS pull failed for {dr}: {err}", dr=dataset_ref, err=str(exc)[:300])
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

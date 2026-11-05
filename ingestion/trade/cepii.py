@@ -49,7 +49,7 @@ class CEPIIPuller(BasePuller):
         BACI data is distributed as CSV files. This method attempts to
         download from the CEPII public data repository.
         """
-        filename = f"BACI_HS17_Y{year}_V202401.csv"
+        filename = self._baci_filename(year)
         local_path = os.path.join(_CEPII_DATA_DIR, filename)
 
         if os.path.exists(local_path):
@@ -119,16 +119,53 @@ class CEPIIPuller(BasePuller):
             log.info("BACI {y}: inserted {n} rows", y=year, n=inserted)
 
         except Exception as exc:
-            log.error("BACI pull failed for {y}: {err}", y=year, err=str(exc))
+            log.warning("BACI pull failed for {y}: {err}", y=year, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
         return result
 
+    @staticmethod
+    def _baci_filename(year: int) -> str:
+        return f"BACI_HS17_Y{year}_V202401.csv"
+
     def pull_all(self, start_year: int = 1996) -> dict[str, Any]:
-        """Pull all available BACI years."""
-        log.info("Starting BACI bulk pull from {sy}", sy=start_year)
-        results = [self.pull_year(y) for y in range(start_year, date.today().year)]
+        """Pull all BACI years whose files have been provisioned locally.
+
+        BACI is a bulk, annual dataset that CEPII distributes as a large
+        archive; this puller only reads files an operator has placed in
+        ``data/cepii``. It used to "pull" every year 1996..last year anyway,
+        logging one "not found locally" warning per missing year (30 per
+        run) and reporting FAILED ("0 of 30 items completed") on every run,
+        which Hermes then retried dozens of times a day. With nothing
+        provisioned the run is now SKIPPED with one operator-actionable
+        reason; provisioned years are processed as before.
+        """
+        years = list(range(start_year, date.today().year))
+        available = [
+            y for y in years
+            if os.path.exists(os.path.join(_CEPII_DATA_DIR, self._baci_filename(y)))
+        ]
+        missing = len(years) - len(available)
+        if not available:
+            reason = (
+                f"no BACI files provisioned in {os.path.normpath(_CEPII_DATA_DIR)} (expected e.g. "
+                f"{self._baci_filename(years[-1] if years else start_year)}); BACI is a "
+                "manual bulk download from https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37"
+            )
+            log.warning("CEPII BACI skipped: {r}", r=reason)
+            return {
+                "source": "CEPII_BACI",
+                "status": "SKIPPED",
+                "skipped_reason": reason,
+                "total_rows": 0,
+            }
+
+        log.info(
+            "Starting BACI pull for {n} provisioned years ({m} years not provisioned)",
+            n=len(available), m=missing,
+        )
+        results = [self.pull_year(y) for y in available]
 
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
@@ -141,4 +178,5 @@ class CEPIIPuller(BasePuller):
             "total_rows": total_rows,
             "succeeded": succeeded,
             "total": len(results),
+            "years_not_provisioned": missing,
         }
