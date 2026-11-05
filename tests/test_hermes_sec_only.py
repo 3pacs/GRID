@@ -550,7 +550,10 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # SCHED re-pinned 805ae5d9 -> 9c456151 (2026-11-05): supply_chain gains
         # "api_key_mode": "keyword" (the default 'first' passed the FRED key as
         # db_engine). Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','9c4561510578d1c0d8840e998cbd87f169346f958924c9dce74fa0af76c1ccd4')]:
+        # SCHED re-pinned 9c456151 -> cb33fac5 (2026-11-05): smart_money and
+        # social_sentiment timeout_s 60 -> 240, because their Reddit RSS reads
+        # can wait up to 150s for the shared request slot (reddit_rss.py).
+        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','cb33fac536a62173de36652a7fe0678af8c16d5f70fed5ae2af3d094232599a4')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

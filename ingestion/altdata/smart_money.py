@@ -12,7 +12,8 @@ per username that decays over time and is boosted by accurate calls.
 Series stored:
 - SOCIAL:{platform}:{username}:{ticker}:{direction}
 
-Source: Reddit JSON API (public, no key needed), Finviz insider page
+Source: Reddit hot-post RSS feed (no credentials; see
+ingestion/altdata/reddit_rss.py). Finviz is retired.
 Schedule: Daily
 """
 
@@ -21,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import time
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -30,12 +30,12 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata import reddit_rss
 from ingestion.base import BasePuller, retry_on_failure
 
 # ── Configuration ────────────────────────────────────────────────────
 
 _REQUEST_TIMEOUT: int = 30
-_RATE_LIMIT_DELAY: float = 2.0  # Reddit is strict on rate limits
 
 # Target subreddits for financial discussion
 TARGET_SUBREDDITS: list[str] = [
@@ -46,11 +46,10 @@ TARGET_SUBREDDITS: list[str] = [
     "thetagang",
 ]
 
-# Reddit is read through the official Data API with an owner-registered
-# OAuth app (ingestion/altdata/reddit_oauth.py). The old unauthenticated
-# www.reddit.com/<sub>/hot.json path returns "403 Blocked" from grid-svr
-# and is disallowed by robots.txt, so it is no longer used.
-_REDDIT_BASE: str = "https://oauth.reddit.com"
+# Reddit is read from one combined hot-post RSS feed for every target board
+# (ingestion/altdata/reddit_rss.py). The .json listings return "403 Blocked"
+# from grid-svr and no Data API app was registered, so the OAuth path
+# (reddit_oauth.py) left this source dead from 2026-05-28 to 2026-11-05.
 
 # Minimum trust score to track a user (0-1 scale)
 _MIN_TRUST_SCORE: float = 0.3
@@ -61,11 +60,12 @@ _DEFAULT_TRUST_SCORE: float = 0.5
 # Minimum account age in days to consider
 _MIN_ACCOUNT_AGE_DAYS: int = 90
 
-# Minimum post score (upvotes - downvotes) to consider
+# Minimum post score (upvotes - downvotes) to consider, when a score is known.
+# RSS carries no score; there the hot listing itself is the traction filter.
 _MIN_POST_SCORE: int = 10
 
-# Maximum posts to scan per subreddit
-_MAX_POSTS_PER_SUB: int = 50
+# Posts in the combined hot feed, across all target boards
+_MAX_HOT_POSTS: int = 100
 
 # Finviz insider trading page
 _FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrading.ashx"
@@ -171,11 +171,6 @@ def _text_hash(text_content: str) -> str:
     return hashlib.sha256(text_content.encode("utf-8", errors="replace")).hexdigest()[:8]
 
 
-# Missing Reddit credentials are a standing operator state; say so once per
-# process instead of on every 10-minute run.
-_reddit_unconfigured_warned = False
-
-
 class SmartMoneyPuller(BasePuller):
     """Tracks social smart money signals from Reddit and Finviz.
 
@@ -271,20 +266,20 @@ class SmartMoneyPuller(BasePuller):
         self,
         username: str,
         account_age_days: int | None,
-        post_score: int,
+        post_score: int | None,
     ) -> bool:
         """Check if a user passes the trust filter.
 
         Parameters:
             username: Reddit username.
             account_age_days: Account age in days (None if unknown).
-            post_score: Post upvote score.
+            post_score: Post upvote score (None when the feed carries none).
 
         Returns:
             True if the user should be tracked.
         """
-        # Minimum post quality
-        if post_score < _MIN_POST_SCORE:
+        # Minimum post quality, when the score is known
+        if post_score is not None and post_score < _MIN_POST_SCORE:
             return False
 
         # Account age check (if available)
@@ -302,51 +297,33 @@ class SmartMoneyPuller(BasePuller):
     # Reddit API interaction
     # ------------------------------------------------------------------ #
 
-    @retry_on_failure(
-        max_attempts=3,
-        backoff=3.0,
-        retryable_exceptions=(
-            ConnectionError,
-            TimeoutError,
-            OSError,
-            requests.RequestException,
-        ),
-    )
-    def _fetch_subreddit_posts(
-        self,
-        subreddit: str,
-        sort: str = "hot",
-        limit: int = _MAX_POSTS_PER_SUB,
-    ) -> list[dict[str, Any]]:
-        """Fetch posts from a subreddit using Reddit's JSON API.
+    def _fetch_hot_posts(self, subreddits: list[str]) -> list[dict[str, Any]]:
+        """Hot posts for every target board from one combined RSS feed.
 
-        Parameters:
-            subreddit: Subreddit name (without r/).
-            sort: Sort order ('hot', 'new', 'top', 'rising').
-            limit: Maximum posts to fetch (max 100 per Reddit API).
-
-        Returns:
-            List of post data dicts.
+        Shaped like the Data API post fields ``_parse_reddit_post`` reads.
+        RSS carries no score, comment count or upvote ratio, so those are None.
 
         Raises:
-            requests.RequestException: On HTTP errors after retries.
+            reddit_rss.RedditRateLimited, requests.RequestException: no feed.
         """
-        from ingestion.altdata.reddit_oauth import RedditAppClient
-
-        if getattr(self, "_reddit_client", None) is None:
-            # Raises RedditNotConfigured when the credential names are unset.
-            self._reddit_client = RedditAppClient()
-        data = self._reddit_client.get_json(
-            f"/r/{subreddit}/{sort}", params={"limit": min(limit, 100)},
+        entries = reddit_rss.fetch_feed(
+            f"/r/{'+'.join(subreddits)}/hot.rss", {"limit": _MAX_HOT_POSTS},
         )
-
+        canonical = {s.lower(): s for s in subreddits}
         posts = []
-        children = data.get("data", {}).get("children", [])
-        for child in children:
-            post_data = child.get("data", {})
-            if post_data:
-                posts.append(post_data)
-
+        for entry in entries:
+            if entry.kind != "t3":
+                continue
+            posts.append({
+                "title": entry.title,
+                "selftext": entry.body,
+                "author": entry.author,
+                "subreddit": canonical.get(entry.subreddit.lower(), entry.subreddit),
+                "created_utc": entry.published.timestamp() if entry.published else None,
+                "score": None,
+                "num_comments": None,
+                "upvote_ratio": None,
+            })
         return posts
 
     def _parse_reddit_post(
@@ -370,7 +347,8 @@ class SmartMoneyPuller(BasePuller):
         body = post.get("selftext", "")
         full_text = f"{title} {body}"
         username = post.get("author", "")
-        post_score = int(post.get("score", 0))
+        raw_score = post.get("score")
+        post_score = int(raw_score) if raw_score is not None else None
 
         if not username or username in ("[deleted]", "AutoModerator"):
             return []
@@ -419,8 +397,8 @@ class SmartMoneyPuller(BasePuller):
                 "post_score": post_score,
                 "post_timestamp": post_timestamp,
                 "trust_score": self._get_trust_score(username),
-                "num_comments": post.get("num_comments", 0),
-                "upvote_ratio": post.get("upvote_ratio", 0),
+                "num_comments": post.get("num_comments"),
+                "upvote_ratio": post.get("upvote_ratio"),
             })
 
         return signals
@@ -667,68 +645,29 @@ class SmartMoneyPuller(BasePuller):
         if subreddits is None:
             subreddits = TARGET_SUBREDDITS
 
-        from ingestion.altdata.reddit_oauth import (
-            RedditNotConfigured,
-            reddit_credentials_configured,
-        )
-
-        # An unconfigured optional sub-source is SKIPPED (an operator
-        # choice), not FAILED: it must not drive failure cooldowns or the
-        # "failed sources" list. Checked before any fetch or DB read.
-        if getattr(self, "_reddit_client", None) is None and not reddit_credentials_configured():
-            return self._reddit_not_configured(
-                "REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET are not set; Reddit's Data "
-                "API requires a registered OAuth app (see ingestion/altdata/reddit_oauth.py)"
-            )
-
         today = date.today()
         self._load_trust_scores()
 
-        all_signals: list[dict[str, Any]] = []
-        failed_subs: list[str] = []
-
-        for sub in subreddits:
-            try:
-                posts = self._fetch_subreddit_posts(sub)
-                log.debug(
-                    "SmartMoney: fetched {n} posts from r/{s}",
-                    n=len(posts),
-                    s=sub,
-                )
-
-                for post in posts:
-                    signals = self._parse_reddit_post(post, sub)
-                    all_signals.extend(signals)
-
-            except RedditNotConfigured as exc:
-                return self._reddit_not_configured(str(exc))
-            except Exception as exc:
-                failed_subs.append(sub)
-                log.warning(
-                    "SmartMoney: Reddit pull failed for r/{s}: {e}",
-                    s=sub,
-                    e=str(exc),
-                )
-
-            time.sleep(_RATE_LIMIT_DELAY)
-
-        if subreddits and len(failed_subs) == len(subreddits):
-            # Every subreddit failed: not a "0 signals" success.
+        try:
+            posts = self._fetch_hot_posts(subreddits)
+        except Exception as exc:
+            log.warning("SmartMoney: Reddit RSS pull failed: {e}", e=str(exc))
             return {
                 "source": "reddit",
                 "status": "FAILED",
-                "error": f"all {len(failed_subs)} subreddit fetches failed",
+                "error": f"reddit rss fetch failed: {exc}",
                 "signals_found": 0,
                 "rows_inserted": 0,
             }
+        log.debug("SmartMoney: fetched {n} hot posts from {k} boards",
+                  n=len(posts), k=len(subreddits))
 
-        # Some subreddits failed: committed rows are kept but coverage is
-        # incomplete, so the run cannot claim the source fresh.
-        status = "PARTIAL" if failed_subs else "SUCCESS"
-        partial_note = (
-            {"error": f"{len(failed_subs)} of {len(subreddits)} subreddit fetches failed"}
-            if failed_subs else {}
-        )
+        all_signals: list[dict[str, Any]] = []
+        for post in posts:
+            all_signals.extend(self._parse_reddit_post(post, post["subreddit"]))
+
+        status = "SUCCESS"
+        partial_note: dict[str, str] = {}
 
         if not all_signals:
             log.info("SmartMoney: no Reddit signals found")
@@ -773,21 +712,6 @@ class SmartMoneyPuller(BasePuller):
             "signals_found": len(all_signals),
             "rows_inserted": inserted,
             **partial_note,
-        }
-
-    def _reddit_not_configured(self, detail: str) -> dict[str, Any]:
-        """SKIPPED result for missing Reddit credentials; warns once per process."""
-        global _reddit_unconfigured_warned
-        if not _reddit_unconfigured_warned:
-            log.warning("SmartMoney: Reddit skipped: {e}", e=detail)
-            _reddit_unconfigured_warned = True
-        return {
-            "source": "reddit",
-            "status": "SKIPPED",
-            "reason": "reddit not configured",
-            "skipped_reason": "reddit not configured: set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET",
-            "signals_found": 0,
-            "rows_inserted": 0,
         }
 
     def pull_finviz_insiders(self) -> dict[str, Any]:

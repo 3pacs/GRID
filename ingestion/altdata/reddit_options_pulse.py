@@ -1,9 +1,9 @@
 """
-Reddit /r/options daily-discussion pulse — retail options positioning signal.
+Reddit daily-discussion pulse — retail options positioning signal.
 
-The /r/options daily discussion thread is auto-posted by Reddit every morning
-and is the single highest-density retail-options positioning dataset publicly
-available.  It is NOT in the original CAT data catalog and is complementary
+r/wallstreetbets' pinned "Daily Discussion Thread" (morning) and "What Are
+Your Moves Tomorrow" (after the close) are the highest-density retail-options
+positioning chatter publicly available.  It is NOT in the original CAT data catalog and is complementary
 to the existing unusual_whales / smart_money pullers (which lean on whale or
 insider flow).  This puller is therefore a novel Tier-A source.
 
@@ -19,30 +19,28 @@ Why it matters:
     * The 0DTE reference count is itself a leading indicator of intraday
       gamma squeezes and pin risk.
 
-Data source:
+Data source (2026-11-05):
 
-    Reddit Data API via application-only OAuth (free tier, see
-    ingestion/altdata/reddit_oauth.py). 2026-09-29: the old unauthenticated
-    ``www.reddit.com/...search.json`` path returns ``403 Blocked`` from
-    grid-svr on every run, and Reddit's robots.txt disallows it, so it was
-    removed. Requires the owner-registered app credentials
-    ``REDDIT_CLIENT_ID`` / ``REDDIT_CLIENT_SECRET`` (+ ``REDDIT_USERNAME``
-    for the User-Agent) in the environment; without them the run reports
-    FAILED ("not configured") and sends nothing to Reddit.
+    Reddit RSS feeds, no credentials (ingestion/altdata/reddit_rss.py, which
+    also spaces requests to Reddit's ~1/minute unauthenticated limit).
 
-    * GET https://oauth.reddit.com/r/options/search
-        ?q=title:"daily discussion"&restrict_sr=1&sort=new&limit=10
-      -> finds the daily discussion threads by title match.
+    * GET https://www.reddit.com/r/wallstreetbets/hot.rss?limit=10
+      -> the pinned daily threads lead the hot listing.
+    * GET https://www.reddit.com/r/wallstreetbets/comments/<id>.rss?limit=500
+      -> the thread post plus up to ~500 comments (author + body).
 
-    * GET https://oauth.reddit.com/r/options/comments/<id>?limit=500
-      -> returns the thread post + the comment tree.
+    Until 2026-11-05 this read r/options through the OAuth Data API. It never
+    stored a row: no app credentials were set, and r/options has no daily
+    discussion thread (its pinned post is a periodic "Safe Haven" megathread).
+    The series keep their ``reddit_options:`` names; each row's payload names
+    the thread it came from. Search feeds lag by weeks, so the thread is taken
+    from the hot listing, not search.
 
 Failure modes — never crash, never write on failure:
 
-    * credentials absent -> status FAILED "not configured", zero rows.
     * 429 / 403 / other HTTP error -> log warning, status FAILED, zero rows.
     * Empty / malformed JSON -> log warning, zero rows.
-    * Search returns no daily-discussion match -> log info, zero rows.
+    * No pinned daily thread in the hot listing -> log info, zero rows.
 
 Series stored in raw_series:
 
@@ -60,27 +58,23 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata.reddit_oauth import (
-    RedditAPIError,
-    RedditAppClient,
-    RedditNotConfigured,
-)
+from ingestion.altdata import reddit_rss
 from ingestion.base import BasePuller
 
 # ── Configuration constants ──────────────────────────────────────────
 
-REDDIT_SUBREDDIT: str = "options"
+REDDIT_SUBREDDIT: str = "wallstreetbets"
 
+# Title fragments of the pinned daily threads, in order of preference.
 DAILY_THREAD_QUERIES: tuple[str, ...] = (
     "daily discussion",
-    "daily options discussion",
-    "what are your moves tomorrow",
+    "moves tomorrow",
 )
 
 REDDIT_USER_AGENT: str = "grid-intelligence/0.1 (intelligence platform research)"
@@ -145,6 +139,14 @@ TICKER_FALSE_POSITIVES: frozenset[str] = frozenset(
         "I", "ME", "MY", "A", "AN", "THE", "IT", "IS", "US", "EU", "UK",
         "IRS", "SEC", "FED", "ETC", "ETF", "IV", "HV", "OP", "PM", "AM",
         "PE", "EPS", "PS", "PR", "FDA", "GDP", "CPI", "YTD",
+        # r/wallstreetbets shouts in caps (2026-11-05 thread: FOR, MORE, DOWN
+        # ranked beside SPY/QQQ). Plain words and slang only; real one-letter
+        # tickers (V, F, T) stay.
+        "AI", "ALL", "AND", "ARE", "BUT", "CAN", "DOWN", "FOR", "GET", "GO",
+        "HOLD", "IF", "IN", "JUST", "LIKE", "MORE", "NO", "NOT", "NOW", "OF",
+        "OK", "ON", "OR", "OUT", "SO", "THAT", "THIS", "TO", "UP", "WE", "WHAT",
+        "WHY", "YOU", "ATH", "ATM", "CEO", "DD", "EOD", "IMO", "ITM", "LOL",
+        "OTM", "USA", "WSB", "WTF", "YOLO",
     }
 )
 
@@ -175,7 +177,7 @@ def _word_boundary_regex(token: str) -> re.Pattern[str]:
 
 @dataclass(frozen=True)
 class RedditOptionsPulse:
-    """A single day's snapshot of /r/options retail positioning.
+    """A single day's snapshot of retail options positioning (one daily thread).
 
     All counts are computed across the full comment tree of one daily
     discussion thread.  ``bull_bear_ratio`` is Laplace-smoothed and is
@@ -372,91 +374,52 @@ def _flatten_comments(thread_json: dict[str, Any]) -> list[dict[str, Any]]:
 # ── Network helpers ──────────────────────────────────────────────────
 
 
-def _http_get_json(
-    client: RedditAppClient,
-    path: str,
-    params: dict[str, Any] | None = None,
-) -> dict[str, Any] | list[Any] | None:
-    """GET one Reddit Data API path through the OAuth client.
+def _fetch_daily_thread(
+    fetch: Callable[..., list[reddit_rss.RssEntry]] | None = None,
+) -> dict[str, Any] | None:
+    """Find and fetch the newest pinned daily thread on REDDIT_SUBREDDIT.
 
-    Returns ``None`` on an HTTP error or decode failure (logged). A missing
-    credential (``RedditNotConfigured``) propagates to the caller.
+    Two feeds: the hot listing (pinned posts first), then the chosen thread's
+    comment feed. Returns ``{"post": <post fields>, "thread": [<comment>...]}``
+    in the shapes ``_aggregate_pulse`` / ``_flatten_comments`` read, or
+    ``None`` on any failure path.
     """
+    fetch = fetch or reddit_rss.fetch_feed
     try:
-        return client.get_json(path, params=params)
-    except RedditNotConfigured:
-        raise
-    except RedditAPIError as exc:
-        if exc.status == 429:
-            log.warning("reddit_options_pulse: rate-limited (429) on {p}", p=path)
-        elif exc.status == 403:
-            log.warning("reddit_options_pulse: forbidden (403) on {p}", p=path)
-        else:
-            log.warning("reddit_options_pulse: HTTP {s} on {p}", s=exc.status, p=path)
-        return None
-    except (requests.RequestException, ValueError) as exc:
-        log.warning("reddit_options_pulse: request to {p} failed: {e}", p=path, e=str(exc))
+        listing = fetch(f"/r/{REDDIT_SUBREDDIT}/hot.rss", {"limit": 10})
+    except (reddit_rss.RedditRateLimited, requests.RequestException, ValueError) as exc:
+        log.warning("reddit_options_pulse: hot listing failed: {e}", e=str(exc))
         return None
 
+    thread = None
+    for fragment in DAILY_THREAD_QUERIES:
+        matches = [e for e in listing
+                   if e.kind == "t3" and fragment in e.title.lower() and e.published]
+        if matches:
+            thread = max(matches, key=lambda e: e.published)
+            break
+    if thread is None:
+        log.info("reddit_options_pulse: no pinned daily thread on r/{s}", s=REDDIT_SUBREDDIT)
+        return None
 
-def _fetch_daily_thread(client: RedditAppClient) -> dict[str, Any] | None:
-    """Find and fetch the latest /r/options daily discussion thread.
-
-    Two-step process:
-
-        1. Search the subreddit with each query in DAILY_THREAD_QUERIES
-           until we find a post whose title contains "daily discussion".
-        2. Fetch that post's comment tree via
-           ``/r/options/comments/<id>?limit=500``.
-
-    Returns ``{"post": <link_data>, "thread": <raw_thread_json>}`` on
-    success, or ``None`` on any failure path.
-    """
-    for query in DAILY_THREAD_QUERIES:
-        params = {
-            "q": f'title:"{query}"',
-            "restrict_sr": 1,
-            "sort": "new",
-            "limit": 10,
-        }
-        search_payload = _http_get_json(
-            client, f"/r/{REDDIT_SUBREDDIT}/search", params=params
+    try:
+        entries = fetch(
+            f"/r/{REDDIT_SUBREDDIT}/comments/{thread.short_id}.rss", {"limit": 500},
         )
-        if not isinstance(search_payload, dict):
-            continue
+    except (reddit_rss.RedditRateLimited, requests.RequestException, ValueError) as exc:
+        log.warning("reddit_options_pulse: thread {t} failed: {e}", t=thread.short_id, e=str(exc))
+        return None
 
-        children = (
-            search_payload.get("data", {}).get("children", [])
-            if isinstance(search_payload.get("data"), dict)
-            else []
-        )
-
-        for child in children:
-            if not isinstance(child, dict):
-                continue
-            data = child.get("data")
-            if not isinstance(data, dict):
-                continue
-            title = (data.get("title") or "").lower()
-            if "daily discussion" not in title and "moves tomorrow" not in title:
-                continue
-
-            post_id = data.get("id")
-            if not post_id:
-                continue
-
-            thread_payload = _http_get_json(
-                client,
-                f"/r/{REDDIT_SUBREDDIT}/comments/{post_id}",
-                params={"limit": 500},
-            )
-            if thread_payload is None:
-                continue
-
-            return {"post": data, "thread": thread_payload}
-
-    log.info("reddit_options_pulse: no daily-discussion thread found")
-    return None
+    post = {
+        "id": thread.short_id,
+        "title": thread.title,
+        "selftext": thread.body,
+        "created_utc": thread.published.timestamp(),
+        "permalink": thread.link.removeprefix(REDDIT_BASE_URL),
+    }
+    comments = [{"id": e.short_id, "body": e.body, "author": e.author}
+                for e in entries if e.kind == "t1" and e.body]
+    return {"post": post, "thread": comments}
 
 
 # ── Aggregation ──────────────────────────────────────────────────────
@@ -531,11 +494,11 @@ def _aggregate_pulse(
 
 
 class RedditOptionsPulsePuller(BasePuller):
-    """Daily puller for the /r/options daily-discussion pulse signal."""
+    """Daily puller for the r/wallstreetbets daily-thread pulse signal."""
 
     SOURCE_NAME = "reddit_options_pulse"
     SOURCE_CONFIG = {
-        "base_url": "https://www.reddit.com/r/options/",
+        "base_url": "https://www.reddit.com/r/wallstreetbets/",
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": True,
@@ -544,16 +507,15 @@ class RedditOptionsPulsePuller(BasePuller):
         "priority_rank": 55,
     }
 
-    def __init__(self, db_engine: Engine, client: RedditAppClient | None = None) -> None:
+    def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         self._user_agent = REDDIT_USER_AGENT
-        self._client = client
         self.last_error: str | None = None
 
     # ── Public API ───────────────────────────────────────────────────
 
     def pull(self) -> list[RedditOptionsPulse]:
-        """Fetch the latest /r/options daily-discussion pulse(s).
+        """Fetch the latest daily-thread pulse(s).
 
         Returns:
             List of ``RedditOptionsPulse`` snapshots, newest first.  Empty
@@ -561,14 +523,7 @@ class RedditOptionsPulsePuller(BasePuller):
         """
         self.last_error = None
         try:
-            client = self._client or RedditAppClient()
-        except RedditNotConfigured as exc:
-            self.last_error = f"not configured: {exc}"
-            log.warning("reddit_options_pulse: {e}", e=str(exc))
-            return []
-
-        try:
-            payload = _fetch_daily_thread(client)
+            payload = _fetch_daily_thread()
         except Exception as exc:  # never crash the scheduler
             self.last_error = f"fetch raised: {exc}"
             log.warning("reddit_options_pulse: fetch raised {e}", e=str(exc))
