@@ -490,6 +490,13 @@ SEED_MAPPINGS: dict[str, str] = {
     "finra.ats_dark_pct": "finra_ats_dark_pct",
     "finra.short_interest_total": "finra_short_interest_total",
 
+    # ── FINRA Reg SHO daily short-volume aggregates (finra_short_volume_agg.py)
+    # Per-symbol finra:short_volume:<SYM> series stay unmapped by design.
+    "finra:short_volume_agg:market_ratio": "finra_short_volume_ratio_market",
+    "finra:short_volume_agg:spy_ratio": "finra_short_volume_ratio_spy",
+    "finra:short_volume_agg:qqq_ratio": "finra_short_volume_ratio_qqq",
+    "finra:short_volume_agg:iwm_ratio": "finra_short_volume_ratio_iwm",
+
     # ── WorldNews series (wn_*) ──────────────────────────────────────────
     "wn_geopolitical_article_count": "wn_geopolitical_article_count",
     "wn_geopolitical_sentiment_avg": "wn_geopolitical_sentiment_avg",

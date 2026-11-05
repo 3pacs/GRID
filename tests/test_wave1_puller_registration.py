@@ -103,8 +103,10 @@ def test_eia_cadence_and_api_key_wiring() -> None:
 
 def test_finra_short_volume_cadence_and_catchup_wiring() -> None:
     entry = _registry_entry("finra_short_volume")
-    assert entry["mod"] == "ingestion.altdata.finra_short_volume"
-    assert entry["cls"] == "FINRAShortVolumePuller"
+    # The aggregating subclass (2026-11-05): same per-symbol pull, plus the
+    # finra:short_volume_agg:* ratios -- see ingestion/altdata/finra_short_volume_agg.py.
+    assert entry["mod"] == "ingestion.altdata.finra_short_volume_agg"
+    assert entry["cls"] == "FINRAShortVolumeAggPuller"
     # Registered against pull_recent (catch-up), NOT the single-date pull
     # -- see FINRAShortVolumePuller.pull_recent's docstring for why a
     # scheduler that only ever tries "today" silently loses missed dates.

@@ -1479,7 +1479,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # _LMEWarehouseSchedulerAdapter's docstring (both LME URLs 403 from
     # grid-svr).
     {"name": "eia",                "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
-    {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume", "cls": "FINRAShortVolumePuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
+    {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume_agg", "cls": "FINRAShortVolumeAggPuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
     {"name": "sec_ftd",            "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
 ]
 
