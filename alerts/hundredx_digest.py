@@ -10,7 +10,7 @@ Pipeline:
   2. For each opportunity, pull live verification:
      - Current spot price (yfinance)
      - Live options chain (verify strikes exist, IV is real)
-     - Cross-check P/C ratio from multiple sources
+     - Report P/C measures with their basis and expiration scope
   3. If verification fails → flag, scrape correct data, note source
   4. While scraping, grab any useful bonus data (volume spikes, unusual OI)
   5. Bundle everything into a beautifully formatted email
@@ -382,6 +382,13 @@ def _float_or_none(value: Any) -> float | None:
     return None if out != out else out
 
 
+def _count_or_none(value: Any) -> int | None:
+    number = _float_or_none(value)
+    if number is None or not math.isfinite(number) or number < 0 or number != int(number):
+        return None
+    return int(number)
+
+
 def _pick_contract(side: pd.DataFrame, spot: float, direction: str) -> dict | None:
     """The one contract the call names: strike nearest 2% OTM inside the band.
 
@@ -404,25 +411,48 @@ def _pick_contract(side: pd.DataFrame, spot: float, direction: str) -> dict | No
             continue
         if not (spot * lo <= strike <= spot * hi):
             continue
-        oi = int(_float_or_none(row.get("openInterest")) or 0)
+        oi = _count_or_none(row.get("openInterest"))
         last_trade = row.get("lastTradeDate")
         cand = {
             "strike": strike, "bid": bid, "ask": ask,
             "iv": _float_or_none(row.get("impliedVolatility")),
-            "oi": oi, "volume": int(_float_or_none(row.get("volume")) or 0),
+            "oi": oi, "volume": _count_or_none(row.get("volume")),
             "last_trade": str(last_trade) if last_trade is not None and str(last_trade) != "NaT" else None,
         }
-        key = (abs(strike - target), -oi, cand)
+        key = (abs(strike - target), -(oi or 0), cand)
         if best is None or key[:2] < best[:2]:
             best = key
     return best[2] if best else None
+
+
+def _chain_total(side: pd.DataFrame, field: str) -> int | None:
+    """Sum reported counts without turning absent/partial data into zero."""
+    if field not in side:
+        return None
+    values = [_count_or_none(v) for v in side[field]]
+    if any(v is None for v in values):
+        return None
+    return sum(values)
+
+
+def _chain_measures(chain: Any, expiry: str, retrieved_at: datetime) -> dict:
+    """Counts/ratios for this retrieved expiry only; not the stored PCR scope."""
+    out = {"expiry": expiry, "scope": "single_expiry", "retrieved_at": retrieved_at,
+           "call_count": len(chain.calls), "put_count": len(chain.puts)}
+    for field, basis in (("volume", "volume"), ("openInterest", "open_interest")):
+        calls = _chain_total(chain.calls, field)
+        puts = _chain_total(chain.puts, field)
+        out[f"total_call_{basis}"] = calls
+        out[f"total_put_{basis}"] = puts
+        out[f"{basis}_put_call_ratio"] = puts / calls if calls and puts is not None else None
+    return out
 
 
 def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
     """Price the call against the live chain and name one contract.
 
     Returns the verification dict: live spot (with which yfinance field it
-    came from), the chosen contract with its quote time, and any issues.
+    came from), the chosen contract with its local retrieval time, and any issues.
     ``contract`` is None when no contract >= MIN_DTE_DAYS has a two-sided
     quote — the caller withholds such a call.
     """
@@ -439,6 +469,14 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
         "live_chain": None,
         "contract": None,
         "recommended_strikes": [],
+        # ingestion.options aggregates OI across selected captured expiries.
+        # The scanner exposes neither those expiry IDs nor matching totals.
+        # Even a retrieved single-expiry OI ratio cannot validate that aggregate.
+        "pcr_comparison": {
+            "status": "unavailable",
+            "reason": "stored open-interest ratio has no exact captured-expiry coverage; "
+                      "retrieved ratios cover one expiry only",
+        },
     }
 
     try:
@@ -482,17 +520,7 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
                 chain = stock.option_chain(expiry)
                 quote_at = datetime.now(timezone.utc)
 
-                live_call_vol = chain.calls["volume"].sum() if "volume" in chain.calls else 0
-                live_put_vol = chain.puts["volume"].sum() if "volume" in chain.puts else 0
-                live_pcr = live_put_vol / live_call_vol if live_call_vol > 0 else 0
-
-                # Scanner rows carry the raw value under "value" (the old
-                # "raw_value" key never existed, so this check never ran).
-                stored_pcr = _float_or_none(((opp.get("signals") or {}).get("pcr") or {}).get("value"))
-                if stored_pcr and abs(live_pcr - stored_pcr) > 0.5:
-                    verification["issues"].append(
-                        f"PCR diverged: stored={stored_pcr:.2f}, live={live_pcr:.2f} ({expiry} chain)"
-                    )
+                verification["live_chain"] = _chain_measures(chain, expiry, quote_at)
 
                 direction = opp.get("direction", "PUT")
                 if live_spot:
@@ -512,6 +540,7 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
                         contract = _pick_contract(side, live_spot, direction)
                         if contract:
                             contract.update(expiry=exp_str, quote_at=exp_quote_at,
+                                            quote_at_kind="local_retrieval_time",
                                             quote_source="yfinance option_chain")
                             verification["contract"] = contract
                             verification["recommended_strikes"] = [contract]
@@ -527,8 +556,9 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
                 # Unusual volume (>5x mean OI) is stored for later study; it
                 # is not shown on the card.
                 import numpy as np
-                oi_arr = [x for x in chain.calls["openInterest"].tolist()
-                          + chain.puts["openInterest"].tolist() if x and x > 0]
+                oi_arr = [x for frame in (chain.calls, chain.puts)
+                          for x in frame.get("openInterest", pd.Series(dtype=float)).tolist()
+                          if pd.notna(x) and x > 0]
                 if oi_arr:
                     mean_oi = np.mean(oi_arr)
                     for kind, frame in (("unusual_call_volume", chain.calls),
@@ -543,15 +573,6 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
                                 })
                 if verification["bonus_data"]:
                     _store_bonus_data(engine, ticker, verification["bonus_data"])
-
-                verification["live_chain"] = {
-                    "expiry": expiry,
-                    "call_count": len(chain.calls),
-                    "put_count": len(chain.puts),
-                    "total_call_oi": int(chain.calls["openInterest"].sum()),
-                    "total_put_oi": int(chain.puts["openInterest"].sum()),
-                    "pcr": round(live_pcr, 3),
-                }
 
         except Exception as e:
             verification["issues"].append(f"Chain verification failed: {str(e)[:100]}")
@@ -603,7 +624,8 @@ def _signal_text(name: str, sig: dict, spot: float | None) -> str | None:
     v = sig.get("value")
     num = _float_or_none(v)
     if name == "pcr" and num is not None:
-        return f"put/call volume ratio {num:.2f} (rule: >=1.80 votes CALL, <=0.40 votes PUT)"
+        return (f"put/call open-interest ratio {num:.2f} across captured expiries "
+                "(exact expiry coverage unavailable; rule: >=1.80 votes CALL, <=0.40 votes PUT)")
     if name == "iv_skew" and num is not None:
         return f"OTM-put/ATM IV skew {num:.2f} (rule: >=1.60 votes CALL, <=0.85 votes PUT)"
     if name == "max_pain_div" and num is not None:
@@ -807,11 +829,12 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
                      f"{direction} @ ${contract['ask']:.2f} (ask)")
         rows.append(("Quote", f"bid ${contract['bid']:.2f} / ask ${contract['ask']:.2f} / "
                               f"mid ${econ['mid']:.2f} (spread {econ['spread_pct']:.0%} of mid)"))
-        rows.append(("Quote time", f"{_ts(contract.get('quote_at'))} via {_esc(contract.get('quote_source'))}; "
-                                   f"last trade {_esc(contract.get('last_trade') or MISSING)}"))
+        rows.append(("Quote retrieved at", f"{_ts(contract.get('quote_at'))} via {_esc(contract.get('quote_source'))}; "
+                                           "local retrieval time, provider bid/ask timestamp unavailable; "
+                                           f"last trade {_esc(contract.get('last_trade') or MISSING)}"))
         rows.append(("Contract IV / OI", f"{_fmt(contract.get('iv'), '.1%')} / "
-                                         f"{_fmt(contract.get('oi'), ',')} open, "
-                                         f"{_fmt(contract.get('volume'), ',')} traded today"))
+                                         f"{_fmt(contract.get('oi'), ',')} reported OI, "
+                                         f"{_fmt(contract.get('volume'), ',')} reported volume"))
         rows.append(("Breakeven at expiry",
                      f"${econ['breakeven']:,.2f} — needs {_fmt(econ['required_move'], '+.1%')} "
                      f"from spot in {econ['dte']} days"))
@@ -826,11 +849,24 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
                       f"at contract IV — a rule, not a backtested level)")
                      if econ.get("invalidation") else MISSING))
     else:
-        call_line = f"{ticker} {direction} — no executable contract quoted"
+        call_line = f"{ticker} {direction} - no qualifying two-sided quote retrieved"
         rows.append(("Contract", MISSING))
 
     rows.append(("Underlying", f"${_fmt(spot, ',.2f')} ({_esc(spot_source or MISSING)}, "
-                               f"{_ts(verification.get('spot_at'))})"))
+                               f"retrieved {_ts(verification.get('spot_at'))}; local retrieval time)"))
+
+    stored_pcr = ((opp.get("signals") or {}).get("pcr") or {}).get("value")
+    rows.append(("Stored put/call", f"open-interest ratio {_fmt(stored_pcr, '.2f')} across captured expiries "
+                                   "(exact expiry coverage unavailable)"))
+    chain = verification.get("live_chain")
+    if chain:
+        rows.append(("Retrieved put/call", f"volume ratio {_fmt(chain.get('volume_put_call_ratio'), '.2f')}; "
+                    f"open-interest ratio {_fmt(chain.get('open_interest_put_call_ratio'), '.2f')}; "
+                    f"single expiry {_esc(chain.get('expiry'))}, retrieved {_ts(chain.get('retrieved_at'))}"))
+    else:
+        rows.append(("Retrieved put/call", "N/A (chain data unavailable)"))
+    rows.append(("Put/call comparison", "unavailable: no like-for-like captured-expiry coverage; "
+                 "volume and open interest are different measures"))
 
     cat = opp.get("catalyst") or {}
     if cat.get("status") == "found":
@@ -913,7 +949,9 @@ def _format_track_record(record: dict | None, error: str | None = None) -> dict:
 def _format_summary_section(opportunities: list[dict], verifications: list[dict],
                             gated: dict[str, list[str]] | None = None) -> dict:
     """What was sent, and what was withheld and why."""
-    lines = [f"{len(opportunities)} call(s) below, each with an executable quote."]
+    lines = [f"{len(opportunities)} call(s) below, each with a retrieved two-sided quote "
+             f"within the {MAX_SPREAD_PCT:.0%}-of-mid spread limit. "
+             "Quotes do not establish available size or a fill; retrieval time does not establish quote freshness."]
     for reason, tickers in (gated or {}).items():
         if tickers:
             lines.append(f"Withheld {len(tickers)} — {_GATE_TEXT.get(reason, reason)}: "
@@ -1099,6 +1137,11 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
                 "signal_source": "options_daily_signals",
                 "signal_captured_at": opp.get("signal_captured_at"),
                 "spot_at": v.get("spot_at"),
+                "spot_at_kind": "local_retrieval_time",
+                "quote_at_kind": "local_retrieval_time",
+                "provider_bid_ask_timestamp": None,
+                "put_call_comparison": v.get("pcr_comparison"),
+                "retrieved_chain_measures": v.get("live_chain"),
                 "gates": {"min_dte": MIN_DTE_DAYS, "suppressed": sorted(SUPPRESSED_DIRECTIONS),
                           "suppress_100x": SUPPRESS_100X},
             },

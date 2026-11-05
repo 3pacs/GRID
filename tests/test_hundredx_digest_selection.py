@@ -424,6 +424,9 @@ def test_every_call_is_persisted_before_the_email_is_sent(monkeypatch):
     assert row["contract"]["ask"] == 2.20 and row["contract"]["strike"] == 98.0
     assert row["economics"]["breakeven"] == pytest.approx(98.0 - 2.20)
     assert row["provenance"]["gates"]["min_dte"] == hx.MIN_DTE_DAYS
+    assert row["provenance"]["quote_at_kind"] == "local_retrieval_time"
+    assert row["provenance"]["spot_at_kind"] == "local_retrieval_time"
+    assert row["provenance"]["provider_bid_ask_timestamp"] is None
 
 
 def test_unreadable_ledger_sends_nothing(monkeypatch):
