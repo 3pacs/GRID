@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     # API Keys — international / trade / physical
     KOSIS_API_KEY: str = ""
     COMTRADE_API_KEY: str = ""
+    # J-Quants API V2 key (x-api-key header), issued from the J-Quants dashboard.
+    JQUANTS_API_KEY: str = ""
+    # DEPRECATED: J-Quants V1 email/password token auth was discontinued on
+    # 2026-06-01 and the puller no longer reads these. Kept only for the
+    # settings-response redaction and log scrubbing.
     JQUANTS_EMAIL: str = ""
     JQUANTS_PASSWORD: str = ""
     USDA_NASS_API_KEY: str = ""
@@ -941,7 +946,7 @@ class Settings(BaseSettings):
             "FRED_API_KEY": self.FRED_API_KEY,
             "KOSIS_API_KEY": self.KOSIS_API_KEY,
             "COMTRADE_API_KEY": self.COMTRADE_API_KEY,
-            "JQUANTS_EMAIL": self.JQUANTS_EMAIL,
+            "JQUANTS_API_KEY": self.JQUANTS_API_KEY,
             "USDA_NASS_API_KEY": self.USDA_NASS_API_KEY,
             "NOAA_TOKEN": self.NOAA_TOKEN,
             "EIA_API_KEY": self.EIA_API_KEY,
