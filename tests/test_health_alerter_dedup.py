@@ -142,3 +142,78 @@ class TestChangeDetection:
         t2 = t0 + timedelta(hours=7)  # past the 6h default cooldown
         fired = ha.check_and_alert(health, now=t2)
         assert "db.failed_pulls" in fired
+
+
+class TestAdditionsOnlyAndExplanations:
+    """2026-11-04: emails re-sent at 33 -> 34 -> 35 stale sources and said
+    only "N sources past freshness window". Now: re-fire only when a source
+    newly goes stale, exclude switched-off sources from the count, and say
+    why each source is stale."""
+
+    def test_recovery_alone_does_not_refire_but_rebreak_does(self, _isolated_state):
+        t0 = datetime(2026, 11, 4, 0, 0, tzinfo=timezone.utc)
+        ha.check_and_alert(_health(_STALE_21 + ["flappy"]), now=t0)
+        assert len(_isolated_state) == 1
+
+        t1 = t0 + timedelta(hours=1)  # flappy recovers: no email
+        assert "db.stale_sources" not in ha.check_and_alert(_health(_STALE_21), now=t1)
+        assert len(_isolated_state) == 1
+
+        t2 = t1 + timedelta(hours=1)  # flappy breaks again: newly stale, email
+        assert "db.stale_sources" in ha.check_and_alert(_health(_STALE_21 + ["flappy"]), now=t2)
+        subject = _isolated_state[-1][0]
+        assert "newly stale: flappy" in subject
+
+    def test_not_configured_sources_are_listed_but_not_counted(self, _isolated_state):
+        health = _health(_STALE_21[:20])
+        health["db"]["stale_sources"].append({
+            "source": "Cloudflare_Radar", "last_pull": "never", "cadence": "DAILY",
+            "age_hours": None, "not_configured": True, "last_attempt_status": "SUCCESS",
+            "last_attempt_reason": "SKIPPED: ['no CF Radar token configured']",
+        })
+        # 20 counted (threshold is "> 20"), so no alert despite 21 entries.
+        assert ha.check_and_alert(health, now=datetime(2026, 11, 4, tzinfo=timezone.utc)) == []
+        assert ha._stale_sources_dedupe_key(health) == sorted(_STALE_21[:20])
+
+    def test_body_groups_failures_by_reason_and_escapes_nothing_away(self):
+        health = _health([])
+        rows = health["db"]["stale_sources"]
+        for name in ("polygon", "fmp"):
+            rows.append({"source": name, "last_pull": "2026-09-30T21:05:00+00:00", "cadence": "DAILY",
+                         "age_hours": 826.0, "last_attempt_status": "FAILED",
+                         "last_attempt_at": "2026-11-03T21:05:33+00:00", "not_configured": False,
+                         "last_attempt_reason": "PullerReportedFailure: puller did not report committed write count"})
+        rows.append({"source": "BIS", "last_pull": "2026-09-27T00:00:00+00:00", "cadence": "WEEKLY",
+                     "age_hours": 914.0, "last_attempt_status": "FAILED", "not_configured": False,
+                     "last_attempt_at": "2026-11-04T01:33:10+00:00",
+                     "last_attempt_reason": "RetryError[<Future at 0x7c raised HTTPError>]"})
+        rows.append({"source": "NYFED_GSCPI", "last_pull": "2026-10-06T00:00:00+00:00", "cadence": "DAILY",
+                     "age_hours": 686.0, "last_attempt_status": "SUCCESS", "not_configured": False,
+                     "last_attempt_at": "2026-11-03T21:07:57+00:00",
+                     "last_attempt_reason": "NO_NEW_DATA: run completed, 0 rows written"})
+        rows.append({"source": "jodi_oil", "last_pull": "never", "cadence": "MONTHLY", "age_hours": None,
+                     "last_attempt_status": None, "not_configured": False})
+        subject, body = ha._stale_sources_render(health)
+
+        assert subject == "GRID: 5 sources past freshness window"
+        assert "[2] puller did not report committed write count" in body
+        assert "polygon: last success 2026-09-30 21:05Z (34.4d ago, cadence DAILY); last attempt FAILED 2026-11-03 21:05Z" in body
+        assert "<Future at 0x7c raised HTTPError>" in body
+        assert "QUIET" in body and "NYFED_GSCPI" in body
+        assert "NO ATTEMPT ON RECORD" in body and "jodi_oil: last success never (never succeeded" in body
+
+
+def test_send_alert_html_escapes_and_keeps_plain_text(monkeypatch):
+    from alerts import email as em
+
+    captured = {}
+
+    class _Cfg:
+        ALERT_EMAIL_ENABLED = True
+
+    monkeypatch.setattr(em, "_get_settings", lambda: _Cfg())
+    monkeypatch.setattr(em, "_send", lambda subject, sections: captured.update(subject=subject, sections=sections))
+    assert em.send_alert("subj", "line1\nRetryError[<Future x>]", severity="warning") is True
+    section = captured["sections"][0]
+    assert "&lt;Future x&gt;" in section["body"] and "pre-wrap" in section["body"]
+    assert section["plain"] == "line1\nRetryError[<Future x>]"

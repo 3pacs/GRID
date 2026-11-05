@@ -171,6 +171,11 @@ def _text_hash(text_content: str) -> str:
     return hashlib.sha256(text_content.encode("utf-8", errors="replace")).hexdigest()[:8]
 
 
+# Missing Reddit credentials are a standing operator state; say so once per
+# process instead of on every 10-minute run.
+_reddit_unconfigured_warned = False
+
+
 class SmartMoneyPuller(BasePuller):
     """Tracks social smart money signals from Reddit and Finviz.
 
@@ -503,7 +508,14 @@ class SmartMoneyPuller(BasePuller):
         # Emit signal_sources rows AFTER the raw_series write so the
         # raw ingest is never dropped due to a signal-source write fault.
         try:
-            self._emit_signal_sources(conn, signal, obs_date)
+            # Own savepoint, so a signal_sources fault cannot abort the
+            # enclosing transaction and take the raw_series row with it.
+            begin_nested = getattr(conn, "begin_nested", None)
+            if callable(begin_nested):
+                with begin_nested():
+                    self._emit_signal_sources(conn, signal, obs_date)
+            else:
+                self._emit_signal_sources(conn, signal, obs_date)
         except Exception as exc:
             log.warning(
                 "SmartMoney: signal_sources emission failed for "
@@ -655,13 +667,25 @@ class SmartMoneyPuller(BasePuller):
         if subreddits is None:
             subreddits = TARGET_SUBREDDITS
 
+        from ingestion.altdata.reddit_oauth import (
+            RedditNotConfigured,
+            reddit_credentials_configured,
+        )
+
+        # An unconfigured optional sub-source is SKIPPED (an operator
+        # choice), not FAILED: it must not drive failure cooldowns or the
+        # "failed sources" list. Checked before any fetch or DB read.
+        if getattr(self, "_reddit_client", None) is None and not reddit_credentials_configured():
+            return self._reddit_not_configured(
+                "REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET are not set; Reddit's Data "
+                "API requires a registered OAuth app (see ingestion/altdata/reddit_oauth.py)"
+            )
+
         today = date.today()
         self._load_trust_scores()
 
         all_signals: list[dict[str, Any]] = []
         failed_subs: list[str] = []
-
-        from ingestion.altdata.reddit_oauth import RedditNotConfigured
 
         for sub in subreddits:
             try:
@@ -677,14 +701,7 @@ class SmartMoneyPuller(BasePuller):
                     all_signals.extend(signals)
 
             except RedditNotConfigured as exc:
-                log.warning("SmartMoney: Reddit skipped: {e}", e=str(exc))
-                return {
-                    "source": "reddit",
-                    "status": "FAILED",
-                    "error": "reddit not configured",
-                    "signals_found": 0,
-                    "rows_inserted": 0,
-                }
+                return self._reddit_not_configured(str(exc))
             except Exception as exc:
                 failed_subs.append(sub)
                 log.warning(
@@ -705,22 +722,37 @@ class SmartMoneyPuller(BasePuller):
                 "rows_inserted": 0,
             }
 
+        # Some subreddits failed: committed rows are kept but coverage is
+        # incomplete, so the run cannot claim the source fresh.
+        status = "PARTIAL" if failed_subs else "SUCCESS"
+        partial_note = (
+            {"error": f"{len(failed_subs)} of {len(subreddits)} subreddit fetches failed"}
+            if failed_subs else {}
+        )
+
         if not all_signals:
             log.info("SmartMoney: no Reddit signals found")
             return {
                 "source": "reddit",
-                "status": "SUCCESS",
+                "status": status,
                 "signals_found": 0,
                 "rows_inserted": 0,
+                **partial_note,
             }
 
         inserted = 0
+        store_failures = 0
         with self.engine.begin() as conn:
             for signal in all_signals:
                 try:
-                    if self._store_signal(conn, signal, today):
-                        inserted += 1
+                    # A savepoint per signal: on PostgreSQL a failed statement
+                    # aborts the whole transaction, so swallowing it without
+                    # one would silently roll back every row counted so far.
+                    with conn.begin_nested():
+                        if self._store_signal(conn, signal, today):
+                            inserted += 1
                 except Exception as exc:
+                    store_failures += 1
                     log.debug(
                         "SmartMoney: failed to store Reddit signal: {e}",
                         e=str(exc),
@@ -732,11 +764,30 @@ class SmartMoneyPuller(BasePuller):
             i=inserted,
         )
 
+        if store_failures:
+            status = "PARTIAL"
+            partial_note = {"error": f"{store_failures} of {len(all_signals)} signals failed to store"}
         return {
             "source": "reddit",
-            "status": "SUCCESS",
+            "status": status,
             "signals_found": len(all_signals),
             "rows_inserted": inserted,
+            **partial_note,
+        }
+
+    def _reddit_not_configured(self, detail: str) -> dict[str, Any]:
+        """SKIPPED result for missing Reddit credentials; warns once per process."""
+        global _reddit_unconfigured_warned
+        if not _reddit_unconfigured_warned:
+            log.warning("SmartMoney: Reddit skipped: {e}", e=detail)
+            _reddit_unconfigured_warned = True
+        return {
+            "source": "reddit",
+            "status": "SKIPPED",
+            "reason": "reddit not configured",
+            "skipped_reason": "reddit not configured: set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET",
+            "signals_found": 0,
+            "rows_inserted": 0,
         }
 
     def pull_finviz_insiders(self) -> dict[str, Any]:

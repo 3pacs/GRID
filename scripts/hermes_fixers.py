@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
 import threading
 import time
@@ -174,6 +175,264 @@ def _diagnostics_abandoned(token: int, deadline: float) -> tuple[bool, str]:
     if time.monotonic() >= deadline:
         return True, "repair deadline passed"
     return False, ""
+
+
+# ─── Progress-per-cycle repair scheduling (hermes-selfheal-llm, 2026-11-04) ──
+#
+# Production evidence (grid-hermes journal, 24h to 2026-11-04 05:28Z): the
+# diagnose_and_fix_pulls step timed out 16x/day ("blacklisting for 24h") and
+# skipped every remaining source 55x/day ("46 remaining action(s) skipped —
+# repair deadline passed"). Three causes, all inside this budget:
+#   1. The REASON-tier diagnosis call (Qwen3.8-27B, `--reasoning-effort
+#      xhigh` on a single llama-server slot) ran 2-3 minutes and then
+#      returned None after thinking through its whole max_tokens — it alone
+#      spent the 180s REPAIR_BUDGET_SECONDS before the first retry.
+#   2. Pullers that do not accept should_continue (INSTITUTIONAL_FLOWS,
+#      AKShare, ...) ran uninterruptibly past the step's 240s timeout.
+#   3. Every cycle walked the same list in the same order (fail_count DESC),
+#      so the same slow source at the head ate the budget each time, and
+#      deterministic code/config failures ("'GDELTPuller' object has no
+#      attribute 'pull_all'", "unexpected keyword argument 'api_key'", no
+#      handler) were re-tried and re-logged every 30 minutes.
+# The bounds below keep each pass inside its budget and make it progress:
+#   - the diagnosis LLM call runs on a worker thread joined for at most
+#     DIAGNOSIS_LLM_BUDGET_SECONDS, asks only about sources that will
+#     actually be retried this pass, and its per-source answers are cached;
+#   - each source repair runs on a worker thread joined for at most
+#     PER_SOURCE_REPAIR_SECONDS (and never past the pass deadline). Its
+#     should_continue carries the same per-source deadline, so a worker
+#     that overruns publishes nothing when it does return (_retry_source's
+#     abandonment rule) and the in-flight guard keeps the next pass from
+#     starting an overlapping repair of that source;
+#   - sources are ordered least-recently-started first, so a pass resumes
+#     with the sources the previous pass did not reach;
+#   - deterministic failures get a DETERMINISTIC_FAILURE_COOLDOWN_SECONDS
+#     skip, recorded once with one warning.
+# The pass therefore returns by REPAIR_BUDGET_SECONDS (plus bookkeeping),
+# well inside DIAGNOSE_PULLS_TIMEOUT_SECONDS, so _run_with_timeout no longer
+# blacklists the step.
+DIAGNOSIS_LLM_BUDGET_SECONDS = 45.0
+PER_SOURCE_REPAIR_SECONDS = 60.0
+MAX_DIAGNOSIS_SOURCES = 12
+DIAGNOSIS_CACHE_TTL_SECONDS = 3600.0
+DETERMINISTIC_FAILURE_COOLDOWN_SECONDS = 12 * 3600.0
+# Re-emit a throttled operational warning at most this often.
+REPAIR_WARNING_INTERVAL_SECONDS = 3600.0
+# A source whose repair fails this many times in a row with the same
+# (digit-normalized) reason is treated as dead/retired, not transient: it
+# gets a long skip that doubles per repeat (Baltic_Exchange "5 of 5 items
+# failed" was retried 30-56x/day under the ordinary 30-min/6h backoff).
+REPEATED_FAILURE_THRESHOLD = 3
+REPEATED_FAILURE_COOLDOWN_SECONDS = 24 * 3600.0
+REPEATED_FAILURE_MAX_COOLDOWN_SECONDS = 7 * 24 * 3600.0
+
+_REPAIR_SCHEDULE_LOCK = threading.Lock()
+# source_key -> monotonic time the last repair attempt for it started.
+_REPAIR_LAST_STARTED: dict[str, float] = {}
+# source_key -> (monotonic expiry, reason) for deterministic failures.
+_DETERMINISTIC_SKIPS: dict[str, tuple[float, str]] = {}
+# source_key -> (monotonic time cached, error fingerprint, action).
+_DIAGNOSIS_CACHE: dict[str, tuple[float, str, str]] = {}
+# throttle key -> monotonic time the warning was last emitted.
+_THROTTLED_WARNINGS: dict[str, float] = {}
+# source_key -> [normalized reason, consecutive count, long skips so far].
+_REPEATED_FAILURES: dict[str, list[Any]] = {}
+
+# Exception classes that mean "this retry will fail the same way next time"
+# (a code or wiring defect, not a transient provider condition). TypeError
+# only counts when it is a call-signature mismatch: a TypeError raised on a
+# malformed provider payload ("'NoneType' object is not subscriptable") can
+# be transient and keeps the ordinary cooldown.
+_DETERMINISTIC_RETRY_ERRORS: tuple[type[BaseException], ...] = (
+    AttributeError, ImportError, NotImplementedError,
+)
+_SIGNATURE_TYPEERROR_MARKERS = (
+    "unexpected keyword argument", "positional argument", "required positional",
+    "required keyword-only", "takes no arguments",
+)
+
+
+def _warn_throttled(key: str, template: str, **kwargs: Any) -> bool:
+    """log.warning at most once per REPAIR_WARNING_INTERVAL_SECONDS per key.
+
+    Suppressed repeats go to log.debug so they stay visible at debug level
+    instead of being dropped. Returns True when the warning was emitted.
+    """
+    now = time.monotonic()
+    with _REPAIR_SCHEDULE_LOCK:
+        last = _THROTTLED_WARNINGS.get(key)
+        emit = last is None or now - last >= REPAIR_WARNING_INTERVAL_SECONDS
+        if emit:
+            _THROTTLED_WARNINGS[key] = now
+    (log.warning if emit else log.debug)(template, **kwargs)
+    return emit
+
+
+def _run_bounded(
+    fn: Callable[[], Any], timeout_s: float, thread_name: str,
+) -> tuple[bool, Any, BaseException | None]:
+    """Run fn() on a daemon worker thread and wait at most timeout_s.
+
+    Returns (finished, result, exception). When finished is False the
+    worker is left running (Python threads cannot be killed); callers must
+    give fn a cooperative stop (should_continue) and must not publish
+    anything on its behalf.
+    """
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # handed back to the caller verbatim
+            box["exc"] = exc
+
+    worker = threading.Thread(target=_target, name=thread_name, daemon=True)
+    worker.start()
+    worker.join(max(0.0, timeout_s))
+    if worker.is_alive():
+        return False, None, None
+    return True, box.get("result"), box.get("exc")
+
+
+def _order_repair_candidates(failed_info: list[dict[str, Any]]) -> list[str]:
+    """Least-recently-started first, then most failures, then input order.
+
+    A source never attempted by this process sorts first, so a pass that
+    stopped at its deadline resumes next cycle with the sources it did not
+    reach instead of re-running the same head of the list.
+    """
+    with _REPAIR_SCHEDULE_LOCK:
+        started = dict(_REPAIR_LAST_STARTED)
+    indexed = list(enumerate(failed_info))
+    indexed.sort(key=lambda pair: (
+        started.get(_normalize_source_key(pair[1]["source"]), 0.0),
+        -int(pair[1].get("fail_count") or 0),
+        pair[0],
+    ))
+    return [info["source"] for _idx, info in indexed]
+
+
+def _note_repair_started(source_key: str) -> None:
+    with _REPAIR_SCHEDULE_LOCK:
+        _REPAIR_LAST_STARTED[source_key] = time.monotonic()
+
+
+def _deterministic_skip_reason(source_name: str) -> str | None:
+    """The recorded deterministic-failure reason while its skip is active."""
+    key = _normalize_source_key(source_name)
+    now = time.monotonic()
+    with _REPAIR_SCHEDULE_LOCK:
+        entry = _DETERMINISTIC_SKIPS.get(key)
+        if entry is None:
+            return None
+        if now >= entry[0]:
+            del _DETERMINISTIC_SKIPS[key]
+            return None
+        return entry[1]
+
+
+def _record_deterministic_failure(
+    source_name: str, reason: str, cooldown_s: float | None = None,
+) -> None:
+    """Skip this source's repairs for DETERMINISTIC_FAILURE_COOLDOWN_SECONDS.
+
+    One warning per recording; the skip itself is silent (debug) until it
+    expires. A deploy restarts the daemon and clears the table, so a fixed
+    defect is retried on the first pass after the fix lands.
+    """
+    key = _normalize_source_key(source_name)
+    duration = DETERMINISTIC_FAILURE_COOLDOWN_SECONDS if cooldown_s is None else cooldown_s
+    with _REPAIR_SCHEDULE_LOCK:
+        _DETERMINISTIC_SKIPS[key] = (time.monotonic() + duration, reason[:300])
+    log.warning(
+        "Repair for {s} fails deterministically ({r}) — not retrying for {h:.0f}h",
+        s=source_name, r=reason[:200], h=duration / 3600,
+    )
+
+
+def note_repair_failure(source_name: str, reason: str) -> bool:
+    """Count a failed (not-recovered) repair; True if it triggered a long skip.
+
+    REPEATED_FAILURE_THRESHOLD consecutive failures with the same reason
+    (digits normalized, so "5 of 5 items" == "4 of 4 items") put the source
+    on a deterministic skip of REPEATED_FAILURE_COOLDOWN_SECONDS, doubling
+    for each further long skip up to REPEATED_FAILURE_MAX_COOLDOWN_SECONDS.
+    A different reason restarts the count; note_repair_recovered clears it.
+    """
+    key = _normalize_source_key(source_name)
+    fingerprint = re.sub(r"\d+", "N", str(reason or ""))[:200]
+    with _REPAIR_SCHEDULE_LOCK:
+        entry = _REPEATED_FAILURES.get(key)
+        if entry is None or entry[0] != fingerprint:
+            strikes = entry[2] if entry is not None else 0
+            entry = _REPEATED_FAILURES[key] = [fingerprint, 0, strikes]
+        entry[1] += 1
+        if entry[1] < REPEATED_FAILURE_THRESHOLD:
+            return False
+        cooldown = min(
+            REPEATED_FAILURE_COOLDOWN_SECONDS * (2 ** entry[2]),
+            REPEATED_FAILURE_MAX_COOLDOWN_SECONDS,
+        )
+        count = entry[1]
+        entry[1] = 0
+        entry[2] += 1
+    _record_deterministic_failure(
+        source_name,
+        f"same failure {count}x in a row: {str(reason or '')[:160]}",
+        cooldown_s=cooldown,
+    )
+    return True
+
+
+def note_repair_recovered(source_name: str) -> None:
+    with _REPAIR_SCHEDULE_LOCK:
+        _REPEATED_FAILURES.pop(_normalize_source_key(source_name), None)
+
+
+def repair_deterministically_blocked(source_name: str) -> str | None:
+    """Public read of the deterministic skip, for other repair entry points."""
+    return _deterministic_skip_reason(source_name)
+
+
+def _is_deterministic_retry_error(exc: BaseException) -> bool:
+    if isinstance(exc, _DETERMINISTIC_RETRY_ERRORS):
+        return True
+    if isinstance(exc, TypeError):
+        message = str(exc)
+        return any(marker in message for marker in _SIGNATURE_TYPEERROR_MARKERS)
+    return False
+
+
+def _cached_diagnosis(source_key: str, fingerprint: str) -> str | None:
+    now = time.monotonic()
+    with _REPAIR_SCHEDULE_LOCK:
+        entry = _DIAGNOSIS_CACHE.get(source_key)
+    if entry is None:
+        return None
+    cached_at, cached_fp, action = entry
+    if cached_fp != fingerprint or now - cached_at >= DIAGNOSIS_CACHE_TTL_SECONDS:
+        return None
+    return action
+
+
+def _store_diagnosis(source_key: str, fingerprint: str, action: str) -> None:
+    with _REPAIR_SCHEDULE_LOCK:
+        _DIAGNOSIS_CACHE[source_key] = (time.monotonic(), fingerprint, action)
+
+
+def _chat_kwargs_without_thinking(client: Any) -> dict[str, Any]:
+    """{"enable_thinking": False} when this client's chat() accepts it.
+
+    Structured one-line-per-source answers do not need chain-of-thought,
+    and on the single-slot REASON server thinking consumed the whole
+    max_tokens without producing content. Clients that do not know the
+    keyword (Ollama, cloud, test doubles) get nothing extra.
+    """
+    try:
+        params = inspect.signature(client.chat).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"enable_thinking": False} if "enable_thinking" in params else {}
 
 
 _PULL_ACTIONS: dict[str, str] = {
@@ -1297,25 +1556,23 @@ def _parse_hermes_action_commands(response: str, limit: int = 5) -> list[str]:
 
 
 # Map source_catalog names to hermes registry keys
-# Covers naming mismatches between DB catalog and puller registry
+# Covers naming mismatches between DB catalog and puller registry.
+#
+# 2026-11-04: every entry must name a registry class whose SOURCE_NAME is
+# this catalog name (pinned by tests/test_hermes_repair_progress.py). 33
+# legacy guesses were removed -- e.g. polygon->yfinance, fmp->
+# earnings_calendar, nasa_firms->noaa_swpc, AKShare->yfinance, world_bank/
+# Eurostat/BCB_BR->fred. _retry_target_matches already refused each of them
+# before construction (no wrong puller ever ran), but the stale-refresh loop
+# swallowed that ValueError after logging "Retrying X", so each one silently
+# used a refresh slot every cycle (polygon/fmp 49x/day, USDA_NASS/ecb_tltro
+# 55x/day). Sources with a real puller now resolve through their own
+# registry entry (direct key, hermes_operator._SOURCE_EXTRAS, or the
+# PULLER_REGISTRY catalog-name aliases); the rest are "no handler".
 _CATALOG_TO_REGISTRY: dict[str, str] = {
-    "coingecko": "yfinance",  # CoinGecko data pulled via yfinance crypto
-    "DexScreener": "yfinance",
     "DeFi_Llama": "defillama",
-    "polygon": "yfinance",
-    "nasa_firms": "noaa_swpc",
-    "VIIRS": "noaa_swpc",
-    "etherscan": "yfinance",
-    "fmp": "earnings_calendar",
-    "wikipedia_pageviews": "social_attention",
     "FINRA_MARGIN": "margin_debt",
-    "TIINGO_FUNDAMENTALS": "tiingo",
     "TIINGO": "tiingo",
-    "TIINGO_NEWS": "tiingo",
-    "opensecrets": "lobbying",
-    "Cloudflare_Radar": "gdelt_news",
-    "cryptoquant": "yfinance",
-    "OFR": "fed_liquidity",
     "LUNAR_EPHEMERIS": "lunar_ephemeris",
     "PLANETARY_EPHEMERIS": "planetary_ephemeris",
     "VEDIC_JYOTISH": "vedic_jyotish",
@@ -1325,22 +1582,12 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "FedSpeeches": "fedspeeches",
     "WorldNewsAPI": "world_news",
     "Crucix": "crucix",
-    "TradingView": "yfinance",
-    "EPHEMERIS_ENGINE": "planetary_ephemeris",
-    "open_meteo": "noaa_swpc",
-    "binance": "yfinance",
     "yfinance_options": "yfinance_options",
     "alphavantage_news_sentiment": "alphavantage_sentiment",
     "hf_financial_news": "hf_financial_news",
     "NYFED_GSCPI": "nyfed_gscpi",
-    "GDELT_NEWS": "gdelt_news",
     "Social_Smart_Money": "smart_money",
-    "Discord_Solana_Scanner": "yfinance",
-    "BCB_BR": "fred",
-    "EDINET": "fred",
-    "KAGGLE_BULK": "fred",
     "NY_Fed": "ny_fed",
-    "Telegram_Solana_Scanner": "yfinance",
     "SEC_INSIDER": "insider_filings",
     "INSTITUTIONAL_FLOWS": "institutional_flows",
     "Supply_Chain": "supply_chain",
@@ -1348,31 +1595,25 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "USASPENDING_GOV": "gov_contracts",
     "BIS_EXPORT_CONTROLS": "export_controls",
     "STOCKTWITS": "stocktwits",
-    "OppInsights": "fred",
     "yfinance_earnings": "earnings_calendar",
-    "Analyst_Ratings": "earnings_calendar",
     "Fear_Greed": "fear_greed",
     "Kalshi": "kalshi",
     "POLYMARKET": "polymarket",
     "FOIA_CABLES": "foia_cables",
-    "AKShare": "yfinance",
-    "Eurostat": "fred",
     "CFTC_COT": "cftc_cot",
-    "OpenCorporates": "offshore_leaks",
     "GDELT": "gdelt",
     "AAII_Sentiment": "aaii_sentiment",
-    "USPTO_PV": "fred",
-    "USDA_NASS": "fred",
-    "nowcast": "fred",
-    "world_bank": "fred",
+    # 2026-11-04: was "fred" -- the FRED writer cannot represent USDA_NASS
+    # (the catalog identity check refused it every time). USDA_NASS now
+    # resolves to its own "usda_nass" registry entry
+    # (hermes_operator._SOURCE_EXTRAS, USDAPuller, bounded start_year).
+    "USDA_NASS": "usda_nass",
     # 2026-09-27 Wave 1 review: was "fred", which is wrong now that "eia"
     # has its own class-based PULLER_REGISTRY entry (source_catalog's
     # real row is named "EIA" -- confirmed read-only on grid-svr). Mapping
     # a REPULL/retry for "EIA" to the FRED puller silently pulled the
-    # wrong source's data under EIA's name; "computed" below is a
-    # separate, pre-existing, unrelated mapping.
+    # wrong source's data under EIA's name.
     "EIA": "eia",
-    "computed": "fred",
     "FRED": "fred",
     "BLS": "bls",
     "CBOE": "cboe",
@@ -1419,6 +1660,69 @@ def _retry_target_matches(source_name: str, puller: Any) -> bool:
     return requested == target or (requested == "options" and target == "yfinance_options")
 
 
+class NoRetryHandler(ValueError):
+    """No retry handler can serve the requested source (routing/identity).
+
+    A ValueError subclass so every existing ``except ValueError`` caller
+    keeps treating it as "no handler"; callers that must tell it apart from
+    other ValueErrors (the stale-refresh loop's slot accounting) catch this.
+    """
+
+
+class MissingRetryApiKey(Exception):
+    """A retry handler's declared API key is unset (operator configuration).
+
+    Deliberately NOT a ValueError: callers treat ValueError from
+    _resolve_puller as "no handler registered", which this is not.
+    """
+
+    def __init__(self, key_name: str) -> None:
+        self.key_name = key_name
+        super().__init__(f"Missing API key: {key_name}")
+
+
+def _lookup_retry_api_key(key_name: str) -> str:
+    """Settings field if declared, else the process environment, else ''.
+
+    getattr with a default so an API key the registry names but
+    config.Settings does not declare (QUIVERQUANT_API_KEY was one, 6x/day
+    "'Settings' object has no attribute ...") reads as missing instead of
+    crashing the retry.
+    """
+    from config import settings
+
+    value = getattr(settings, key_name, "") or os.environ.get(key_name, "")
+    return value if isinstance(value, str) else str(value or "")
+
+
+def _construct_retry_puller(entry: dict[str, Any], cls: Any, engine: Any) -> Any:
+    """Instantiate a retry puller with the scheduler's constructor convention.
+
+    Mirrors ingestion/smart_scheduler.py::SmartScheduler._build_puller_instance
+    (``api_key_mode``): "env" -> cls(db_engine=engine) after checking the key
+    is set (the puller reads it itself); "first" -> cls(key, engine);
+    "keyword" -> cls(db_engine=engine, api_key=key). Entries derived from
+    PULLER_REGISTRY carry the scheduler's mode (default "first");
+    hand-written extras without a mode keep the historic retry convention
+    ("keyword"). An unset key raises MissingRetryApiKey, which _retry_source
+    turns into a SKIPPED result instead of a crash.
+    """
+    key_name = entry.get("api_key")
+    if not key_name:
+        return cls(db_engine=engine)
+    mode = entry.get("api_key_mode", "keyword")
+    if mode not in {"env", "first", "keyword"}:
+        raise ValueError(f"Unknown api_key_mode for retry handler: {mode}")
+    key_value = _lookup_retry_api_key(key_name)
+    if not key_value:
+        raise MissingRetryApiKey(key_name)
+    if mode == "first":
+        return cls(key_value, engine)
+    if mode == "keyword":
+        return cls(db_engine=engine, api_key=key_value)
+    return cls(db_engine=engine)
+
+
 def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
     """Resolve a source name to a puller instance using the registry.
 
@@ -1443,33 +1747,27 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
         if mapped:
             entry = _SOURCE_REGISTRY.get(mapped)
     if entry is None:
-        raise ValueError("No explicit dataset handler registered for requested source")
+        raise NoRetryHandler("No explicit dataset handler registered for requested source")
 
     # Honor registry-level skip flag — entries that are catalogued for the
     # wiring audit but not yet wrapped for the standard _resolve_puller calling
     # convention (e.g. ctors with positional `engine` instead of `db_engine`).
     if entry.get("skip_runtime"):
-        raise ValueError(
+        raise NoRetryHandler(
             f"Source {source_name} registered but skipped at runtime: {entry['skip_runtime']}"
         )
 
     # Function-only entries lack a declared catalog contract in this registry.
     # Refuse before importing/invoking them; do not invent a target argument.
     if "cls" not in entry:
-        raise ValueError("Retry handler has no explicit catalog identity contract")
+        raise NoRetryHandler("Retry handler has no explicit catalog identity contract")
 
     mod = importlib.import_module(entry["mod"])
     cls = getattr(mod, entry["cls"])
     if not _retry_target_matches(source_name, cls):
-        raise ValueError("Retry handler catalog identity does not match requested source")
+        raise NoRetryHandler("Retry handler catalog identity does not match requested source")
 
-    # Build constructor kwargs
-    ctor_kwargs: dict[str, Any] = {"db_engine": engine}
-    if "api_key" in entry:
-        from config import settings
-        ctor_kwargs["api_key"] = getattr(settings, entry["api_key"])
-
-    puller = cls(**ctor_kwargs)
+    puller = _construct_retry_puller(entry, cls, engine)
     method = entry.get("pull_method", "pull_all")
     kwargs = entry.get("pull_kwargs", {})
 
@@ -1662,7 +1960,21 @@ def _retry_source(
                 return guarded
         log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
 
-        puller, method, kwargs = _resolve_puller(source_name, engine)
+        try:
+            puller, method, kwargs = _resolve_puller(source_name, engine)
+        except MissingRetryApiKey as exc:
+            # Operator configuration, not a provider failure: report a
+            # SKIPPED (not-fresh) outcome before any construction or
+            # provider call, and never advance freshness.
+            log.info(
+                "Retry for {s} skipped — {k} is not configured",
+                s=source_name, k=exc.key_name,
+            )
+            return {
+                "status": "SKIPPED", "outcome": "SKIPPED", "rows_inserted": 0,
+                "reason": "missing_api_key", "missing_api_key": exc.key_name,
+                "outcome_note": str(exc),
+            }
         kwargs = dict(kwargs)
         pull_fn = getattr(puller, method)
         expected_catalog = getattr(puller, "SOURCE_NAME", None)
@@ -2106,33 +2418,84 @@ def diagnose_and_fix_pulls(
             result["skipped_actions"] = failed_sources
             return result
 
+        # Progress per pass: resume with the sources the previous pass did
+        # not reach, and only ask the LLM about sources this pass can
+        # actually retry (not cooling down, not deterministically failing,
+        # no fresh cached answer for the same error), capped so the prompt
+        # and the one-line-per-source answer stay small.
+        failed_sources = _order_repair_candidates(failed_info)
+        order = {name: idx for idx, name in enumerate(failed_sources)}
+        retryable_info = []
+        for info in sorted(diagnosis_info, key=lambda f: order[f["source"]]):
+            key = _normalize_source_key(info["source"])
+            if _deterministic_skip_reason(info["source"]) is not None:
+                continue
+            if not state.cooldowns.can_retry(info["source"]):
+                continue
+            cached = _cached_diagnosis(key, info.get("last_error") or "")
+            if cached is not None:
+                fix_actions[key] = cached
+                continue
+            retryable_info.append(info)
+        diagnosis_info = retryable_info[:MAX_DIAGNOSIS_SOURCES]
+
+    def _ask_hermes() -> str | None:
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.REASON)
+        return client.chat(
+            messages=[
+                {"role": "system", "content": (
+                    "You are GRID's operations agent. Diagnose data pull failures and "
+                    "recommend specific actions. For EACH source, output one line:\n"
+                    "SOURCE_NAME: ACTION - reason\n\n"
+                    "ACTION must be one of:\n"
+                    f"{_format_pull_action_catalog()}\n\n"
+                    "Be specific and concise. No preamble."
+                )},
+                {"role": "user", "content": (
+                    "Failed sources with details:\n"
+                    + json.dumps(diagnosis_info, default=str, indent=2)
+                    + f"\nCurrent date: {date.today()}"
+                )},
+            ],
+            temperature=HERMES_TEMPERATURE,
+            **_chat_kwargs_without_thinking(client),
+        )
+
     if hermes_available and diagnosis_info:
         try:
-            from llm.router import get_llm, Tier
-            client = get_llm(Tier.REASON)
-            diagnosis_text = client.chat(
-                messages=[
-                    {"role": "system", "content": (
-                        "You are GRID's operations agent. Diagnose data pull failures and "
-                        "recommend specific actions. For EACH source, output one line:\n"
-                        "SOURCE_NAME: ACTION - reason\n\n"
-                        "ACTION must be one of:\n"
-                        f"{_format_pull_action_catalog()}\n\n"
-                        "Be specific and concise. No preamble."
-                    )},
-                    {"role": "user", "content": (
-                        "Failed sources with details:\n"
-                        + json.dumps(diagnosis_info, default=str, indent=2)
-                        + f"\nCurrent date: {date.today()}"
-                    )},
-                ],
-                temperature=HERMES_TEMPERATURE,
-            )
+            if dry_run:
+                diagnosis_text = _ask_hermes()
+            else:
+                # The diagnosis is advisory (RETRY is the default action), so
+                # it gets a hard slice of the pass budget instead of all of it.
+                llm_timeout = min(
+                    DIAGNOSIS_LLM_BUDGET_SECONDS, max(0.0, deadline - time.monotonic()),
+                )
+                finished, diagnosis_text, diag_exc = _run_bounded(
+                    _ask_hermes, llm_timeout, "hermes-pull-diagnosis",
+                )
+                if diag_exc is not None:
+                    raise diag_exc
+                if not finished:
+                    diagnosis_text = None
+                    _warn_throttled(
+                        "diagnosis_timeout",
+                        "Hermes diagnosis gave no answer within {t:.0f}s — "
+                        "repairing with the default RETRY action",
+                        t=llm_timeout,
+                    )
             if diagnosis_text:
                 log.info("Hermes diagnosis:\n{d}", d=diagnosis_text[:800])
                 result["diagnosis"] = diagnosis_text
                 result["diagnosed"] = len(diagnosis_info)
-                fix_actions = _parse_pull_diagnosis_actions(diagnosis_text)
+                parsed = _parse_pull_diagnosis_actions(diagnosis_text)
+                if not dry_run:
+                    for info in diagnosis_info:
+                        key = _normalize_source_key(info["source"])
+                        if key in parsed:
+                            _store_diagnosis(key, info.get("last_error") or "", parsed[key])
+                fix_actions.update(parsed)
 
         except Exception as exc:
             log.warning("Hermes diagnosis failed: {e}", e=str(exc))
@@ -2152,16 +2515,23 @@ def diagnose_and_fix_pulls(
 
     # Retry each failed source with cooldown awareness and strategy variation,
     # under one shared cooperative budget for the whole call (see
-    # REPAIR_BUDGET_SECONDS / _retry_source's docstring).
+    # REPAIR_BUDGET_SECONDS / _retry_source's docstring) and a per-source cap
+    # (PER_SOURCE_REPAIR_SECONDS) so one slow source cannot spend all of it.
     def should_continue() -> bool:
         return not _diagnostics_abandoned(my_token, deadline)[0]
 
+    result.setdefault("skipped_deterministic", 0)
+    result.setdefault("per_source_timeouts", 0)
     for idx, source_name in enumerate(failed_sources):
         abandoned, reason = _diagnostics_abandoned(my_token, deadline)
         if abandoned:
             remaining = failed_sources[idx:]
-            log.warning(
-                "diagnostics actions: {n} remaining action(s) skipped — {r}",
+            # A spent budget is now ordinary operation: the next pass starts
+            # with these (least recently started first). A superseded worker
+            # is still worth a warning.
+            (log.info if reason == "repair deadline passed" else log.warning)(
+                "diagnostics actions: {n} remaining action(s) skipped — {r}"
+                " (next pass resumes with them)",
                 n=len(remaining), r=reason,
             )
             result["skipped_actions"] = remaining
@@ -2213,6 +2583,15 @@ def diagnose_and_fix_pulls(
             )
             continue
 
+        # A deterministic failure (code/wiring defect, unset key, no handler)
+        # recorded by an earlier pass: retrying changes nothing until a fix
+        # is deployed (which restarts the daemon and clears the skip).
+        deterministic = _deterministic_skip_reason(source_name)
+        if deterministic is not None:
+            log.debug("Skipping {s} — deterministic failure: {r}", s=source_name, r=deterministic)
+            result["skipped_deterministic"] += 1
+            continue
+
         # Check cooldown
         if not state.cooldowns.can_retry(source_name):
             cooldown_info = state.cooldowns.get_status(source_name)
@@ -2234,10 +2613,43 @@ def diagnose_and_fix_pulls(
             if action == "BACKFILL":
                 attempt = MAX_PULL_RETRIES  # force extended lookback
 
-            pull_result = _retry_source(
-                source_name, engine, attempt=attempt,
-                state=state, should_continue=should_continue,
+            source_budget = min(PER_SOURCE_REPAIR_SECONDS, max(0.0, deadline - time.monotonic()))
+            source_deadline = time.monotonic() + source_budget
+
+            def source_should_continue(_until: float = source_deadline) -> bool:
+                return should_continue() and time.monotonic() < _until
+
+            _note_repair_started(source_key)
+            finished, pull_result, retry_exc = _run_bounded(
+                lambda _name=source_name, _attempt=attempt, _cont=source_should_continue: _retry_source(
+                    _name, engine, attempt=_attempt,
+                    state=state, should_continue=_cont,
+                ),
+                source_budget,
+                f"hermes-repair-{source_key}"[:60],
             )
+            if retry_exc is not None:
+                raise retry_exc
+            if not finished:
+                # The worker keeps running until its should_continue goes
+                # False (cooperative pullers) or its provider call returns;
+                # either way _retry_source sees the per-source deadline
+                # passed and publishes nothing, and its in-flight entry
+                # stops the next pass from starting an overlapping repair.
+                # Record the overrun as a failed attempt so the ordinary
+                # cooldown (escalating to 6h) applies to a source that is
+                # too slow for a repair pass.
+                result["per_source_timeouts"] += 1
+                state.cooldowns.record_attempt(
+                    source_name, success=False,
+                    error=f"repair exceeded the {source_budget:.0f}s per-source cap",
+                )
+                _warn_throttled(
+                    f"per_source_cap:{source_key}",
+                    "Repair for {s} exceeded the {t:.0f}s per-source cap — moving on",
+                    s=source_name, t=source_budget,
+                )
+                continue
             if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
                 log.info("Skipping {s} — repair already in flight", s=source_name)
                 result["skipped_cooldown"] += 1
@@ -2245,12 +2657,22 @@ def diagnose_and_fix_pulls(
             if pull_result.get("status") == "abandoned":
                 # See _retry_source's docstring (Check 2c) — a result marked
                 # abandoned must not be published: no cooldown outcome, no
-                # log_issue "recovered" entry.
+                # log_issue "recovered" entry. _note_repair_started above
+                # already moved it to the back of the next pass's order.
                 log.warning(
                     "Repair for {s} abandoned — not recording a cooldown outcome",
                     s=source_name,
                 )
                 result["abandoned"] += 1
+                continue
+            if pull_result.get("reason") == "missing_api_key":
+                _record_deterministic_failure(
+                    source_name, f"{pull_result.get('missing_api_key')} is not configured",
+                )
+                state.cooldowns.record_attempt(
+                    source_name, success=False, error=pull_result.get("outcome_note"),
+                )
+                result["retried"] += 1
                 continue
             if pull_result.get("stopped_by_budget"):
                 state.cooldowns.record_attempt(source_name, success=False, error="budget")
@@ -2259,6 +2681,7 @@ def diagnose_and_fix_pulls(
                 continue
             if pull_result.get("outcome") == "NO_NEW_DATA":
                 state.cooldowns.record_attempt(source_name, success=True)
+                note_repair_recovered(source_name)
                 result["retried"] += 1
                 continue
             not_fresh = retry_not_fresh_reason(pull_result)
@@ -2266,11 +2689,13 @@ def diagnose_and_fix_pulls(
                 state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
                 result["retried"] += 1
                 log.warning("Repair for {s} did not recover: {r}", s=source_name, r=not_fresh)
+                note_repair_failure(source_name, not_fresh)
                 continue
 
             result["retried"] += 1
             result["fixed"] += 1
             state.cooldowns.record_attempt(source_name, success=True)
+            note_repair_recovered(source_name)
             resolved_count = resolve_source_issues(
                 engine,
                 source_name,
@@ -2290,9 +2715,11 @@ def diagnose_and_fix_pulls(
                 cycle_number=state.cycle_count,
             )
         except ValueError as exc:
-            # No handler registered for this source
+            # No handler registered for this source — deterministic until a
+            # handler is added, so record it once instead of every pass.
             log.info("No handler for {s}: {e}", s=source_name, e=str(exc))
             result["skipped_no_handler"] += 1
+            _record_deterministic_failure(source_name, f"no retry handler: {exc}")
             log_issue(
                 engine, category="ingestion", severity="WARNING",
                 source=source_name,
@@ -2306,12 +2733,18 @@ def diagnose_and_fix_pulls(
             log.warning("Retry for {s} failed: {e}", s=source_name, e=str(exc))
             state.cooldowns.record_attempt(source_name, success=False, error=str(exc))
             result["retried"] += 1
+            if _is_deterministic_retry_error(exc):
+                _record_deterministic_failure(
+                    source_name, f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                note_repair_failure(source_name, f"{type(exc).__name__}: {exc}")
             log_issue(
                 engine, category="ingestion", severity="ERROR",
                 source=source_name,
                 title=f"Pull retry failed — {source_name} (attempt {attempt})",
                 detail=str(exc),
-                stack_trace=traceback.format_exc(),
+                stack_trace="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
                 hermes_diagnosis=diagnosis_text,
                 fix_applied=f"Retried with strategy={action}, attempt={attempt}",
                 fix_result="FAILED",
@@ -2544,7 +2977,12 @@ def run_self_diagnostics(
                 "pulls_retried": state.pulls_retried,
                 "consecutive_failures": state.consecutive_failures,
             },
-        }, default=str, indent=2)
+        # Compact JSON: indented JSON tokenizes at ~2.4 chars/token, and this
+        # report plus the injected knowledge docs reached 9.2-9.9k tokens
+        # against the REASON server's 8192-token slot (HTTP 400
+        # exceed_context_size_error 9x/day). The client also fits whatever
+        # remains to the server's n_ctx.
+        }, default=str, separators=(",", ":"))
 
         response = client.chat(
             messages=[
@@ -2574,6 +3012,9 @@ def run_self_diagnostics(
                 "07_regime", "08_options", "09_journal", "10_governance",
                 "11_autoresearch",
             ],
+            # Structured SEVERITY/ACTION/SUMMARY lines: no thinking phase
+            # (it consumed the whole max_tokens on the single REASON slot).
+            **_chat_kwargs_without_thinking(client),
         )
 
         if not response:

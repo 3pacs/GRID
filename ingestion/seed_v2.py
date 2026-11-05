@@ -215,7 +215,7 @@ VALUES
   ('oi_spend_high_income',  'alternative', 'High income quintile consumer spend index',
    'OppInsights income Q4', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
   ('oi_k_shape_ratio',      'alternative', 'K-shape divergence: high minus low income spend',
-   'oi_spend_high minus oi_spend_low', 34, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
+   'oi_spend_high minus oi_spend_low', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
 
   -- NOAA AIS
   ('ais_port_arrivals_la',  'alternative', 'Monthly vessel arrivals at Port of LA/LB',
@@ -231,26 +231,32 @@ VALUES
   ('gdelt_conflict_global', 'sentiment',   'GDELT global conflict event count rolling 30d',
    'GDELT CAMEO event codes 14-20', 36, 0, 'ZSCORE', 'FORWARD_FILL', '1979-01-01', FALSE),
 
-  -- Fed liquidity equation components
-  ('overnight_reverse_repo',        'liquidity', 'Fed ON RRP facility daily usage (billions)',
+  -- Fed liquidity equation components. These used family 'liquidity', which
+  -- feature_registry_family_check rejects, so this whole multi-row INSERT
+  -- failed and registered nothing (found 2026-11-04). The families now match
+  -- the registered neighbours (reverse_repo_usage / treasury_tga_balance are
+  -- 'rates', fed_balance_sheet is 'macro'). The rows the resolver was
+  -- dropping are registered by migrations/versions/ghost_features_20261104.py,
+  -- which is what deploy runs; this seed is a manual script only.
+  ('overnight_reverse_repo',        'rates', 'Fed ON RRP facility daily usage (billions)',
    'FRED RRPONTSYD', 1, 0, 'RAW', 'FORWARD_FILL', '2013-09-23', TRUE),
-  ('fed_treasury_holdings',         'liquidity', 'Fed holdings of Treasury securities (weekly)',
+  ('fed_treasury_holdings',         'macro', 'Fed holdings of Treasury securities (weekly)',
    'FRED WSHOSHO', 1, 0, 'RAW', 'FORWARD_FILL', '2002-12-18', TRUE),
-  ('central_bank_liq_swaps',        'liquidity', 'Central bank liquidity swaps outstanding',
+  ('central_bank_liq_swaps',        'macro', 'Central bank liquidity swaps outstanding',
    'FRED SWPT', 1, 0, 'RAW', 'FORWARD_FILL', '2002-12-18', TRUE),
-  ('bank_reserves_at_fed',          'liquidity', 'Bank reserves at Federal Reserve Banks',
+  ('bank_reserves_at_fed',          'rates', 'Bank reserves at Federal Reserve Banks',
    'FRED H8B1023NCBCMG', 1, 0, 'RAW', 'FORWARD_FILL', '1973-01-03', TRUE),
-  ('total_reserves',                'liquidity', 'Total reserves of depository institutions (monthly)',
+  ('total_reserves',                'rates', 'Total reserves of depository institutions (monthly)',
    'FRED TOTRESNS', 1, 0, 'RAW', 'FORWARD_FILL', '1959-01-01', TRUE),
-  ('fed_net_liquidity',             'liquidity', 'Net liquidity = Fed BS - TGA - RRP (THE macro signal)',
+  ('fed_net_liquidity',             'macro', 'Net liquidity = Fed BS - TGA - RRP (THE macro signal)',
    'COMPUTED: WALCL - WTREGEN - RRPONTSYD', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2013-09-23', TRUE),
-  ('fed_net_liquidity_change_1w',   'liquidity', 'Week-over-week change in net liquidity',
+  ('fed_net_liquidity_change_1w',   'macro', 'Week-over-week change in net liquidity',
    'COMPUTED: 7-day delta of fed_net_liquidity', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2013-10-01', TRUE),
-  ('fed_net_liquidity_change_1m',   'liquidity', 'Month-over-month change in net liquidity',
+  ('fed_net_liquidity_change_1m',   'macro', 'Month-over-month change in net liquidity',
    'COMPUTED: 30-day delta of fed_net_liquidity', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2013-11-01', TRUE),
-  ('reverse_repo_pct_of_peak',      'liquidity', 'Current RRP as pct of historical peak (drain gauge)',
+  ('reverse_repo_pct_of_peak',      'rates', 'Current RRP as pct of historical peak (drain gauge)',
    'COMPUTED: RRPONTSYD / max(RRPONTSYD)', 1, 0, 'RAW', 'FORWARD_FILL', '2013-09-23', TRUE),
-  ('tga_drawdown',                  'liquidity', '30-day TGA change (neg = Treasury spending = liq injection)',
+  ('tga_drawdown',                  'rates', '30-day TGA change (neg = Treasury spending = liq injection)',
    'COMPUTED: 30-day delta of WTREGEN', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2013-10-01', TRUE),
 
   -- ETF flow proxies

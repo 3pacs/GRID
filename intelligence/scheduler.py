@@ -787,45 +787,6 @@ def run_intelligence_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("buyback quarterly failed: {e}", e=str(exc))
 
-    def _semi_book_to_bill_monthly() -> None:
-        """CAT-89: SEMI North American equipment book-to-bill ratio."""
-        try:
-            from db import get_engine as _ge
-            from ingestion.altdata.semi_book_to_bill import run_semi_book_to_bill_puller
-            result = run_semi_book_to_bill_puller(_ge())
-            log.info(
-                "SEMI book-to-bill: {f} fetched, {i} new (source={s})",
-                f=result.get("fetched", 0),
-                i=result.get("inserted", 0),
-                s=result.get("source", "none"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("SEMI book-to-bill monthly failed: {e}", e=str(exc))
-
-    def _ecb_tltro_weekly() -> None:
-        """CAT-12: Eurosystem LTRO outstanding (ECB Data Portal, ILM weekly).
-
-        2026-09-29: ingestion.altdata.ecb_tltro never wrote a row (its ECB
-        key 404s, its FRED path was skipped, and TLTRO-III fully matured in
-        Dec 2024). This job now runs ecb_ltro, which stores the official
-        weekly "Longer-term refinancing operations" line under its own
-        source_catalog row ``ecb_ilm_ltro``.
-        """
-        try:
-            from db import get_engine as _ge
-            from ingestion.altdata.ecb_ltro import run_ecb_ltro_puller
-            result = run_ecb_ltro_puller(_ge())
-            log.info(
-                "ECB LTRO: status={s}, latest={d} = {o} EUR bn, {f} fetched, {i} new",
-                s=result.get("status"),
-                d=result.get("latest_obs_date"),
-                o=result.get("ltro_outstanding_eur_bn"),
-                f=result.get("fetched", 0),
-                i=result.get("rows_inserted", 0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("ECB LTRO weekly failed: {e}", e=str(exc))
-
     # Cadence:
     #   Refinery cracks → Thu 16:00 UTC (EIA Wed 10:30 ET release)
     #   Credit card → Fri 18:00 UTC (FRED weekly update)
@@ -856,21 +817,6 @@ def run_intelligence_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("PBoC OMO announcements daily failed: {e}", e=str(exc))
 
-    def _taiwan_exports_monthly() -> None:
-        """CAT-9: Taiwan export orders + foundry utilization monthly."""
-        try:
-            from db import get_engine as _ge
-            from ingestion.altdata.taiwan_exports import run_taiwan_exports_puller
-            result = run_taiwan_exports_puller(_ge())
-            log.info(
-                "Taiwan exports: {f} fetched, {i} new (source={s})",
-                f=result.get("fetched", 0),
-                i=result.get("inserted", 0),
-                s=result.get("source", "none"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Taiwan exports monthly failed: {e}", e=str(exc))
-
     def _container_freight_weekly() -> None:
         """CAT-82: Drewry WCI + SCFI weekly container freight rates."""
         try:
@@ -889,8 +835,10 @@ def run_intelligence_loop() -> None:
     _sched.every().thursday.at("16:00").do(_refinery_cracks_weekly)
     _sched.every().friday.at("18:00").do(_credit_card_spending_weekly)
     _sched.every().day.at("13:00").do(_buyback_execution_quarterly)
-    _sched.every().day.at("11:00").do(_semi_book_to_bill_monthly)
-    _sched.every().monday.at("09:00").do(_ecb_tltro_weekly)
+    # Retired 2026-11-04 (owner): semi_book_to_bill (SEMI ended the report;
+    # FRED ids never existed), ecb_tltro (TLTRO-III matured Dec 2024;
+    # ecb_ilm_ltro covers it), taiwan_exports (FRED ids and data.gov.tw
+    # endpoint gone). Catalog rows set active=FALSE the same day.
     # Cadence:
     #   PBoC OMO → daily 01:30 UTC (PBoC publishes after Beijing market close)
     #   Taiwan exports → daily 10:30 UTC (MOEA monthly ~3-week lag; poll daily
@@ -898,7 +846,6 @@ def run_intelligence_loop() -> None:
     #   Container freight → Fridays 17:00 UTC (Drewry Thu release, SCFI Fri
     #     release)
     _sched.every().day.at("01:30").do(_pboc_omo_daily)
-    _sched.every().day.at("10:30").do(_taiwan_exports_monthly)
     _sched.every().friday.at("17:00").do(_container_freight_weekly)
 
     def _lme_warehouse_daily() -> None:

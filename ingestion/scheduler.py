@@ -1512,12 +1512,8 @@ def _get_pullers_for_group(
             pullers.append(("FinDKG", FinDKGPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("FinDKG puller init failed: {err}", err=str(exc))
-        # OpenSecrets — political donations/lobbying (monthly)
-        try:
-            from ingestion.altdata.opensecrets_puller import OpenSecretsPuller
-            pullers.append(("OpenSecrets", OpenSecretsPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("OpenSecrets puller init failed: {err}", err=str(exc))
+        # OpenSecrets: retired 2026-11-04 (owner). Its API now returns an HTML
+        # page and no key is configured; catalog row set active=FALSE.
 
     elif group_name == "annual":
         try:

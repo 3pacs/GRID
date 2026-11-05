@@ -8,7 +8,7 @@ Management System) API. Covers SELIC rate, IPCA inflation, credit, FX, and trade
 from __future__ import annotations
 
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
@@ -16,21 +16,56 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller, log_pull_failure
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 # BCB SGS series: series_code -> feature name
 BCB_SERIES: dict[int, str] = {
     11: "brazil_selic_rate",
     13522: "brazil_ipca_yoy",
     20539: "brazil_credit_growth",
-    1: "brazil_discount_rate",
-    3545: "brazil_usd_brl",
+    # Owner decision 2026-11-04: written under new raw ids so the old,
+    # mislabeled rows (code 1 stored as "brazil_discount_rate", code 3545 as
+    # "brazil_usd_brl") never mix with correctly labeled data. Neither old
+    # name was ever registered, so no resolved history is affected.
+    1: "brazil_usd_brl_fx",      # USD/BRL commercial rate (sell), daily
+    3545: "brazil_fx_reserves",  # international reserves, annual
     7454: "brazil_trade_balance",
     13761: "brazil_primary_balance_gdp",
 }
 
 _BCB_BASE_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
 _RATE_LIMIT_DELAY: float = 1.0
+
+# SGS caps every query on a DAILY series at a 10-year window: a request from
+# 1994 answers HTTP 406 ("... período de consulta ... até 10 anos ..."),
+# which is why codes 1 and 11 failed on every bulk pull (verified from
+# grid-svr 2026-11-04). Daily series are fetched in <=10-year windows.
+_DAILY_SERIES: frozenset[int] = frozenset({1, 11})
+_REVISION_LOOKBACK_DAYS: int = 400
+_MAX_DAILY_WINDOW_YEARS: int = 10
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transport failures and 5xx/429 only; a 4xx query error is final."""
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(exc.response, "status_code", None)
+        return status is None or status >= 500 or status == 429
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
+
+def _date_windows(start: date, end: date, years: int = _MAX_DAILY_WINDOW_YEARS) -> list[tuple[date, date]]:
+    """Split [start, end] into consecutive windows spanning < ``years`` years."""
+    windows: list[tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        try:
+            nxt = cur.replace(year=cur.year + years)
+        except ValueError:  # Feb 29
+            nxt = cur.replace(year=cur.year + years, day=28)
+        win_end = min(end, nxt - timedelta(days=1))
+        windows.append((cur, win_end))
+        cur = win_end + timedelta(days=1)
+    return windows
 
 
 class BCBPuller(BasePuller):
@@ -43,7 +78,12 @@ class BCBPuller(BasePuller):
         super().__init__(db_engine)
         log.info("BCBPuller initialised — source_id={sid}", sid=self.source_id)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
     def _fetch_series_data(self, series_code: int, start_date: str, end_date: str | None) -> list[dict]:
         """Fetch JSON array from BCB SGS API."""
         url = _BCB_BASE_URL.format(code=series_code)
@@ -56,6 +96,26 @@ class BCBPuller(BasePuller):
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()
+
+    def _fetch_windowed(
+        self,
+        series_code: int,
+        start_date: str | date,
+        end_date: str | date | None,
+    ) -> list[dict] | Any:
+        """Fetch a series, splitting daily series into <=10-year windows."""
+        if series_code not in _DAILY_SERIES:
+            return self._fetch_series_data(series_code, str(start_date), str(end_date) if end_date else None)
+        start = date.fromisoformat(str(start_date)[:10])
+        end = date.fromisoformat(str(end_date)[:10]) if end_date else date.today()
+        records: list[dict] = []
+        for win_start, win_end in _date_windows(start, end):
+            chunk = self._fetch_series_data(series_code, win_start.isoformat(), win_end.isoformat())
+            if not isinstance(chunk, list):
+                return chunk  # error envelope: let the caller report it
+            records.extend(chunk)
+            time.sleep(_RATE_LIMIT_DELAY)
+        return records
 
     @staticmethod
     def _format_date_br(date_str: str) -> str:
@@ -83,7 +143,7 @@ class BCBPuller(BasePuller):
         }
 
         try:
-            data = self._fetch_series_data(series_code, str(start_date), str(end_date) if end_date else None)
+            data = self._fetch_windowed(series_code, start_date, end_date)
 
             if not data:
                 result["status"] = "PARTIAL"
@@ -151,10 +211,29 @@ class BCBPuller(BasePuller):
         time.sleep(_RATE_LIMIT_DELAY)
         return result
 
+    def _incremental_start(self, series_code: int, start_date: str | date) -> str:
+        """Start from the latest stored obs minus a revision lookback.
+
+        Re-pulling every series from 1994 on each 48h run re-inserted the
+        full history each time (raw_series dedup only spans one hour).
+        """
+        requested = date.fromisoformat(str(start_date)[:10])
+        try:
+            latest = self._get_latest_date(BCB_SERIES.get(series_code, f"bcb_{series_code}"))
+        except Exception as exc:  # noqa: BLE001 — a lookup failure falls back to the full pull
+            log.debug("BCB latest-date lookup failed for {c}: {e}", c=series_code, e=exc)
+            latest = None
+        if latest is None:
+            return requested.isoformat()
+        return max(requested, latest - timedelta(days=_REVISION_LOOKBACK_DAYS)).isoformat()
+
     def pull_all(self, start_date: str | date = "1994-01-01") -> dict[str, Any]:
         """Pull all BCB series."""
         log.info("Starting BCB bulk pull from {sd}", sd=start_date)
-        results = [self.pull_series(code, start_date) for code in BCB_SERIES]
+        results = [
+            self.pull_series(code, self._incremental_start(code, start_date))
+            for code in BCB_SERIES
+        ]
 
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")

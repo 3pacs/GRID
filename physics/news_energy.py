@@ -34,7 +34,7 @@ _MARKET_FEATURES = [
     "sp500",
     "vix",
     "treasury_10y",
-    "treasury_2y",
+    "yc_2y",  # FRED DGS2; treasury_2y stopped updating 2026-03
     "dxy_index",
 ]
 

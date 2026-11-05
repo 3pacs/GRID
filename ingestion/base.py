@@ -18,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.sanity_ranges import get_range_for_series, MAX_PCT_CHANGE
+from utils.redaction import redact_secrets
 
 # Retry configuration (used by pullers that opt in)
 DEFAULT_RETRY_ATTEMPTS = 3
@@ -212,7 +213,7 @@ def log_pull_failure(
         "{src} pull failed for {what}: {err}",
         src=source,
         what=series_or_topic,
-        err=str(exc),
+        err=redact_secrets(str(exc)),
     )
 
 
@@ -295,7 +296,7 @@ def retry_on_failure(
                             "{f}: HTTP {s} (non-retryable) — {e}",
                             f=func.__name__,
                             s=status,
-                            e=str(exc),
+                            e=redact_secrets(str(exc)),
                         )
                         raise
 
@@ -318,7 +319,7 @@ def retry_on_failure(
                             f=func.__name__,
                             a=attempt,
                             m=max_attempts,
-                            e=str(exc),
+                            e=redact_secrets(str(exc)),
                             d=delay,
                         )
                         time.sleep(delay)
@@ -336,7 +337,7 @@ def retry_on_failure(
                             "{f} failed after {m} attempts: {e}",
                             f=func.__name__,
                             m=max_attempts,
-                            e=str(exc),
+                            e=redact_secrets(str(exc)),
                         )
             raise last_exc  # type: ignore[misc]
         return wrapper

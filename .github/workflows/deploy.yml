@@ -860,6 +860,16 @@ jobs:
           done
           echo "**grid-scheduler activated successfully** (effective pool config and clean initialization verified)." | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # The swap's runtime-preservation gate requires grid-scheduler to run from the record's scheduler= release.
+      # Activation just moved it, so without this every later deploy failed closed (exit 5) until the record was
+      # rewritten by hand (2026-11-04). Runs only after the two verify steps above pass; recovery= is kept as is.
+      # On any identity mismatch it exits before writing, and later deploys keep failing closed.
+      - name: Refresh runtime preservation record (activate_scheduler only)
+        if: ${{ inputs.activate_scheduler == true }}
+        run: |
+          set -euo pipefail
+          bash "$DEPLOY_PATH/scripts/deploy_refresh_runtime_preservation.sh" "$DEPLOY_PATH" "${{ github.sha }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # Opt-in diagnostic ONLY -- gated separately from activation itself and
       # reported separately (see the summary lines below). A FAIL or TIMEOUT
       # here does not mean grid-scheduler failed to activate (that was

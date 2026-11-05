@@ -75,9 +75,9 @@ def test_build_findings_detects_queue_starvation_and_failed_service():
 
 def test_build_findings_detects_idle_gpu_when_queue_has_work():
     snapshot = fleet_audit.HostSnapshot(
-        host="p9d",
+        host="forge",
         ok=True,
-        hostname="p9d",
+        hostname="forge",
         gpus=[
             fleet_audit.GPUState(
                 index=1,
@@ -100,7 +100,7 @@ def test_build_findings_detects_idle_gpu_when_queue_has_work():
     )
     coordinator = {
         "ok": True,
-        "workers": [{"hostname": "p9d", "state": "IDLE", "max_concurrent": 2, "active_jobs": 0}],
+        "workers": [{"hostname": "forge", "state": "IDLE", "max_concurrent": 2, "active_jobs": 0}],
         "stats": {"job_states": {"QUEUED": 5}},
     }
 
@@ -108,7 +108,7 @@ def test_build_findings_detects_idle_gpu_when_queue_has_work():
     codes = {finding.code for finding in findings}
 
     assert "idle_gpu_with_queue" in codes
-    assert "p9d_no_ollama" in codes
+    assert "forge_no_ollama" in codes
 
 
 def test_report_markdown_is_read_only_and_actionable():

@@ -1,79 +1,103 @@
 """
 GRID Reserve Bank of India (RBI) ingestion module.
 
-Pulls Indian monetary and economic data from the RBI data releases API.
-Covers repo rate, industrial production index, and FX reserves.
+Pulls Indian monetary and economic data: policy repo rate, industrial
+production growth, and FX reserves.
+
+2026-11-04 rebuild. The old module fetched one generic URL
+(``dbie.rbi.org.in/DBIE/dbie.rbi?site=data&actionVal=CSVDATA``) for every
+series and expected a JSON list of ``{"date", "value"}`` records -- it never
+returned data. Since 2026-08 that host also serves a certificate issued only
+for ``data.rbi.org.in`` (SAN: ``DNS:data.rbi.org.in``), so every request
+failed TLS hostname verification (``SSLError ... Hostname mismatch``), 24
+ERROR lines/day. It is not a missing intermediate: the chain verifies; the
+name does not match. The replacement RBI portal (data.rbi.org.in) has no
+documented public API, so the series now come from the official
+re-publications of RBI data by the BIS and the IMF, which carry stable SDMX
+keys (each verified by a probe from grid-svr on 2026-11-04):
+
+* ``india_repo_rate``   BIS WS_CBPOL ``M.IN`` -- central bank policy rate
+  (RBI repo rate), monthly, percent.
+* ``india_iip_yoy``     IMF PI ``IND.IND.YOY_PCH_PT.Q`` -- industrial
+  production, % change year over year. Quarterly: the IMF's monthly India
+  IIP series stops at 2017-11, the quarterly one is current.
+* ``india_fx_reserves`` IMF IL ``IND.TRGMV_REVS.USD.M`` -- total reserves
+  including gold at market value, USD (not millions), monthly.
+
+TLS verification stays on everywhere.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import date, datetime
-from typing import Any
+from datetime import date
+from typing import Any, Callable
 
 import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
-from tenacity import retry, stop_after_attempt, wait_exponential
+from ingestion.international import sdmx_json
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-# RBI series definitions
+# RBI series definitions: key -> upstream provider, SDMX flow/key, feature.
 RBI_SERIES: dict[str, dict[str, str]] = {
     "repo_rate": {
-        "url": "https://rbi.org.in/Scripts/BS_WAMDataReporting.aspx",
+        "provider": "bis",
+        "flow": "WS_CBPOL",
+        "key": "M.IN",
         "feature": "india_repo_rate",
     },
     "iip_yoy": {
-        "url": "https://rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx",
+        "provider": "imf",
+        "flow": "PI",
+        "key": "IND.IND.YOY_PCH_PT.Q",
         "feature": "india_iip_yoy",
     },
     "fx_reserves": {
-        "url": "https://rbi.org.in/Scripts/WSSViewDetail.aspx",
+        "provider": "imf",
+        "flow": "IL",
+        "key": "IND.TRGMV_REVS.USD.M",
         "feature": "india_fx_reserves",
     },
 }
 
 _RATE_LIMIT_DELAY: float = 2.0
 
+_FETCHERS: dict[str, Callable[[str, str, str | None], list[tuple[date, float]]]] = {
+    "bis": sdmx_json.fetch_bis_series,
+    "imf": sdmx_json.fetch_imf_series,
+}
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transport failures and 5xx/429 only; a 4xx is final."""
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(exc.response, "status_code", None)
+        return status is None or status >= 500 or status == 429
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
 
 class RBIPuller(BasePuller):
-    """Pulls Indian economic data from RBI data releases.
-
-    Note: RBI does not have a formal REST API. This module scrapes
-    publicly available data pages. For production use, consider
-    supplementing with FRED series for India (INDPRO, etc.) or
-    DBnomics RBI mirror.
-    """
+    """Pulls Indian economic data (RBI series via BIS / IMF SDMX)."""
 
     SOURCE_NAME = "RBI"
-    SOURCE_CONFIG = {"base_url": "https://dbie.rbi.org.in", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": False, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 31}
+    SOURCE_CONFIG = {"base_url": "https://stats.bis.org/api/v2", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": False, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 31}
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         log.info("RBIPuller initialised — source_id={sid}", sid=self.source_id)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
-    def _fetch_rbi_data(self, series_key: str) -> list[dict]:
-        """Fetch data from RBI.
-
-        Uses the RBI DBIE (Database on Indian Economy) JSON endpoint
-        where available, falling back to HTML scraping for legacy pages.
-        """
-        # RBI DBIE JSON endpoint for programmatic access
-        dbie_url = "https://dbie.rbi.org.in/DBIE/dbie.rbi"
-        params = {"site": "data", "actionVal": "CSVDATA"}
-
-        resp = requests.get(dbie_url, params=params, timeout=30)
-        if resp.status_code == 200:
-            try:
-                return resp.json()
-            except Exception as exc:
-                log.warning("RBI DBIE JSON parse failed for {k}: {e}", k=series_key, e=exc)
-
-        # Fallback: return empty (data will be supplemented via DBnomics)
-        log.warning("RBI DBIE endpoint unavailable for {key}, will use DBnomics fallback", key=series_key)
-        return []
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    def _fetch_series(self, config: dict[str, str], start_period: str | None) -> list[tuple[date, float]]:
+        fetcher = _FETCHERS[config["provider"]]
+        return fetcher(config["flow"], config["key"], start_period)
 
     def _insert_observations(self, feature_name: str, observations: list[tuple[date, float]]) -> int:
         """Insert a list of (obs_date, value) tuples into raw_series."""
@@ -94,11 +118,7 @@ class RBIPuller(BasePuller):
         return inserted
 
     def pull_all(self, start_date: str | date = "2000-01-01") -> dict[str, Any]:
-        """Pull all RBI series.
-
-        Note: RBI data access is best-effort. Missing data should be
-        supplemented via the DBnomics puller which mirrors RBI releases.
-        """
+        """Pull all RBI series (BIS/IMF SDMX re-publications of RBI data)."""
         log.info("Starting RBI pull from {sd}", sd=start_date)
         results: list[dict[str, Any]] = []
 
@@ -112,26 +132,19 @@ class RBIPuller(BasePuller):
             }
 
             try:
-                data = self._fetch_rbi_data(key)
-                if not data:
+                observations = self._fetch_series(config, sdmx_json.lookback_start_year(start_date))
+                if not observations:
                     result["status"] = "PARTIAL"
-                    result["errors"].append("No data available — use DBnomics fallback")
+                    result["errors"].append(
+                        f"{config['provider'].upper()} {config['flow']}/{config['key']} returned no observations"
+                    )
                 else:
-                    observations: list[tuple[date, float]] = []
-                    for record in data:
-                        try:
-                            obs_dt = datetime.strptime(
-                                str(record.get("date", "")), "%Y-%m-%d"
-                            ).date()
-                            value = float(record.get("value", 0))
-                            observations.append((obs_dt, value))
-                        except (ValueError, TypeError):
-                            continue
-
                     result["rows_inserted"] = self._insert_observations(feature_name, observations)
+                    result["latest_obs_date"] = observations[-1][0].isoformat()
 
             except Exception as exc:
-                log.error("RBI pull failed for {key}: {err}", key=key, err=str(exc))
+                level = log.error if isinstance(exc, (KeyError, AttributeError, TypeError)) else log.warning
+                level("RBI pull failed for {key}: {err}", key=key, err=str(exc)[:300])
                 result["status"] = "FAILED"
                 result["errors"].append(str(exc))
 

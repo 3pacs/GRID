@@ -72,3 +72,54 @@ def test_log_issue_deduplicates_recent_unresolved_noise() -> None:
     assert "OPERATOR_ISSUE_DEDUPE_HOURS" in source
     assert "IS NOT DISTINCT FROM :src" in source
     assert "duplicate issue suppressed" in source
+
+
+def test_not_configured_reason_markers():
+    from scripts.hermes_health import is_not_configured_reason
+
+    assert is_not_configured_reason("PullerReportedFailure: no_api_key")
+    assert is_not_configured_reason("SKIPPED: all 3 items skipped: not_configured")
+    assert is_not_configured_reason("SKIPPED: ['no CF Radar token configured']")
+    assert is_not_configured_reason("pmxt SDK not installed")
+    assert not is_not_configured_reason("PullerReportedFailure: puller did not report committed write count")
+    assert not is_not_configured_reason("NO_NEW_DATA: run completed, 0 rows written")
+    assert not is_not_configured_reason(None)
+
+
+def test_redact_reason_strips_credentials():
+    from scripts.hermes_health import redact_reason
+
+    r = redact_reason(
+        "429 Client Error: Too Many Requests for url: "
+        "https://api.stlouisfed.org/fred/series/observations?series_id=SOFR&api_key=abcd1234efgh&file_type=json"
+    )
+    assert "abcd1234efgh" not in r and "SOFR" not in r
+    assert ("https://api.stlouisfed.org/fred/series/observations?series_id=[REDACTED]"
+            "&api_key=[REDACTED]&file_type=[REDACTED]") in r
+    assert "hunter2" not in redact_reason("connect https://grid:hunter2@db.example/x failed")
+    assert "s3cr3tvalue" not in redact_reason("bad config token=s3cr3tvalue retry")
+    assert "abcdefghijkl" not in redact_reason("Authorization: Bearer abcdefghijkl")
+    assert redact_reason("puller did not report committed write count") == (
+        "puller did not report committed write count"
+    )
+    assert redact_reason(None) is None
+
+
+def test_redact_reason_dsn_and_json_forms():
+    from scripts.hermes_health import redact_reason
+
+    r = redact_reason("could not connect to postgresql://grid:p@ss@word@db.internal:5432/griddb")
+    assert "p@ss" not in r and "word@db" not in r
+    assert "postgresql://[REDACTED]@db.internal:5432/griddb" in r
+    r = redact_reason('payload {"api_key": "abc def 123", "series": "SOFR"}')
+    assert "abc def 123" not in r and '"series": "SOFR"' in r
+    assert "zzz999" not in redact_reason("{'token': 'zzz999'}")
+    assert "qqq777" not in redact_reason("access_token=qqq777&x=1")
+
+
+def test_redact_reason_unterminated_quote():
+    from scripts.hermes_health import redact_reason
+
+    assert "hunter2" not in redact_reason('bad login password="hunter2')
+    assert "hunter2 and more" not in redact_reason("cfg {'api_key': 'hunter2 and more")
+    assert redact_reason('password="x" ok').endswith(" ok")

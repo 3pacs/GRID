@@ -15,7 +15,7 @@ Raw FRED series pulled (only those NOT already in FRED_SERIES_LIST):
 - RRPONTSYD — Overnight reverse repo (daily)
 - WSHOSHO — Fed holdings of Treasury securities (weekly)
 - SWPT — Central bank liquidity swaps (weekly)
-- H8B1023NCBCMG — Bank reserves at Fed (weekly)
+- H8B1023NCBCMG — C&I loans, all commercial banks (monthly % chg.; FRED metadata)
 - TOTRESNS — Total reserves (monthly)
 
 Already pulled by fred.py (reused here from raw_series):
@@ -92,6 +92,16 @@ def net_liquidity_millions(
     return walcl_millions - wtregen_millions - rrpontsyd_billions * RRPONTSYD_TO_MILLIONS
 
 
+# Days of overlap before a series' latest stored observation for an
+# incremental window, by FRED_LIQUIDITY_SERIES frequency. Any value >= 0
+# keeps the latest stored observation inside the window.
+_INCREMENTAL_OVERLAP_DAYS: dict[str, int] = {"daily": 7, "weekly": 14, "monthly": 35}
+
+# Share of unusable rows in one window above which skipped FRED observations
+# are logged at WARNING instead of DEBUG (holiday "." markers are ~4%).
+_MISSING_WARN_SHARE: float = 0.25
+
+
 # FRED series this puller is responsible for fetching directly.
 # WALCL and WTREGEN are already in fred.py's FRED_SERIES_LIST,
 # so we only read their stored values — we do NOT re-pull them.
@@ -109,8 +119,12 @@ FED_LIQUIDITY_SERIES: dict[str, dict[str, str]] = {
         "frequency": "weekly",
     },
     "H8B1023NCBCMG": {
-        "description": "Bank reserves at Federal Reserve Banks (weekly, billions)",
-        "frequency": "weekly",
+        # FRED metadata (probed 2026-11-04): "Commercial and Industrial
+        # Loans, All Commercial Banks", monthly, % chg. at annual rate -- not
+        # bank reserves. Kept under its existing id (analysis/ reads it as the
+        # H.8 C&I-loan growth fallback); description corrected.
+        "description": "C&I loans, all commercial banks (monthly, % chg. at annual rate)",
+        "frequency": "monthly",
     },
     "TOTRESNS": {
         "description": "Total reserves of depository institutions (monthly, billions)",
@@ -251,19 +265,50 @@ class FedLiquidityPuller(BasePuller):
                 )
                 raise ValueError("Missing required FRED date/value column")
 
-            # Log coerced values (ATTENTION.md #13)
-            nan_count = result["value"].isna().sum()
-            if nan_count > 0:
-                log.warning(
-                    "FRED {sid}: {n} values coerced to NaN",
-                    sid=series_id,
-                    n=nan_count,
-                )
+            # Row-level filtering. FRED publishes "." for a date with no
+            # observation (market holiday on daily RRPONTSYD); fedfred has
+            # already coerced it to NaN. Those rows are skipped -- never
+            # stored, never fatal -- so a series whose latest observation is
+            # "." still stores the valid ones. The previous rule raised
+            # "Invalid FRED observation date or value" whenever any row was
+            # missing. Only a non-empty window with no usable row fails
+            # (docs/puller_outcome_contracts.md).
+            total = len(result)
+            kept_dates: list[Any] = []
+            kept_values: list[float] = []
+            missing = 0
+            non_finite = 0
+            for obs_date, value in zip(result["date"], result["value"]):
+                if pd.isna(obs_date) or pd.isna(value):
+                    missing += 1
+                    continue
+                if not math.isfinite(float(value)):
+                    non_finite += 1
+                    continue
+                kept_dates.append(obs_date)
+                kept_values.append(float(value))
 
-            normalized = result.dropna(subset=["date", "value"])
-            if len(normalized) != len(df) or any(not math.isfinite(float(v)) for v in normalized["value"]):
-                raise ValueError("Invalid FRED observation date or value")
-            return normalized
+            # ATTENTION.md #13: holiday markers are expected (DEBUG);
+            # non-finite values or a large missing share are not (WARNING).
+            if missing or non_finite:
+                skipped = missing + non_finite
+                emit = (
+                    log.warning
+                    if non_finite or skipped > total * _MISSING_WARN_SHARE
+                    else log.debug
+                )
+                emit(
+                    "FRED {sid}: skipped {m} missing ('.') and {nf} non-finite "
+                    "observations; kept {k}/{t}",
+                    sid=series_id, m=missing, nf=non_finite,
+                    k=len(kept_dates), t=total,
+                )
+            if total > 0 and not kept_dates:
+                raise ValueError(
+                    "Invalid FRED observation date or value: all "
+                    f"{total} observations for {series_id} unusable"
+                )
+            return pd.DataFrame({"date": kept_dates, "value": kept_values})
 
         raise ValueError("Unsupported FRED response")
 
@@ -675,19 +720,39 @@ class FedLiquidityPuller(BasePuller):
         )
         end = date.today()
 
-        # Use incremental start if we already have data
-        for sid in FED_LIQUIDITY_SERIES:
+        # Incremental start PER SERIES. The previous loop took the first
+        # series' (daily RRPONTSYD) latest date and applied it to every
+        # series ("all series share roughly the same date range"); for the
+        # monthly/weekly series that left a 7-day window with no
+        # observation, fedfred raised KeyError('date'), and
+        # H8B1023NCBCMG/TOTRESNS reported "could not pull series cleanly:
+        # 'date'" on every run (fed_liquidity "failed 5x, cooldown 480min",
+        # overdue 830h on 2026-11-03). Each window now starts just before
+        # that series' own latest stored observation, so FRED always returns
+        # at least that observation and an off-cycle run is an honest
+        # completed check (dedup -> 0 rows).
+        series_start: dict[str, date] = {}
+        derived_start: date | None = None
+        for sid, meta in FED_LIQUIDITY_SERIES.items():
             latest = self._get_latest_date(sid)
+            sid_start = start
             if latest is not None:
-                incremental = latest - timedelta(days=7)
+                overlap = _INCREMENTAL_OVERLAP_DAYS.get(meta.get("frequency", ""), 7)
+                incremental = latest - timedelta(days=overlap)
                 if incremental > start:
-                    start = incremental
+                    sid_start = incremental
                     log.info(
-                        "FedLiquidity: incremental from {d} (last={l})",
-                        d=start,
+                        "FedLiquidity {sid}: incremental from {d} (last={l})",
+                        sid=sid,
+                        d=sid_start,
                         l=latest,
                     )
-                break  # All series share roughly the same date range
+            series_start[sid] = sid_start
+            if derived_start is None:
+                # Derived features keep the daily (first) series' window.
+                derived_start = sid_start
+        if derived_start is not None:
+            start = derived_start
 
         results: list[dict[str, Any]] = []
 
@@ -711,7 +776,7 @@ class FedLiquidityPuller(BasePuller):
 
         # Step 1: Pull raw FRED series that we own
         for series_id in FED_LIQUIDITY_SERIES:
-            res = self._pull_raw_series(series_id, start, end)
+            res = self._pull_raw_series(series_id, series_start.get(series_id, start), end)
             results.append(res)
             time.sleep(_RATE_LIMIT_DELAY)
 

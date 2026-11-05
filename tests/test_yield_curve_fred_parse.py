@@ -154,7 +154,9 @@ def test_all_missing_is_failure_not_clean(monkeypatch):
 
     with pytest.raises(ValueError, match="Invalid FRED observation date or value"):
         puller._fetch_fred_series("DGS1", date(2026, 10, 9), date(2026, 10, 14))
-    assert calls.count == 3, "retry wrapper still exhausts attempts on a bad payload"
+    # A deterministic parse failure is not retried (retry is for transport
+    # errors); the old wrapper re-fetched the same bad payload 3 times.
+    assert calls.count == 1, "bad payload must not be re-fetched"
 
     result = puller._pull_raw_series(
         "yc_1y", "DGS1", date(2026, 10, 9), date(2026, 10, 14)
