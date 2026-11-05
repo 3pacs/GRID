@@ -59,8 +59,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     if args.verbose:
-        log.remove()
         from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+        log.remove()  # after the config import: importing config adds its own console sink
         log.add(scrubbed_stderr, level="DEBUG", diagnose=LOG_DIAGNOSE)
 
     engine = get_engine()
