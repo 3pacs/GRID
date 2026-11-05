@@ -116,39 +116,69 @@ def _require_prediction_payload_shapes(payload: Mapping[str, Any]) -> None:
             raise TypeError(f"{field} must be a mapping, got {type(value).__name__}")
 
 
-def _decode_legacy_target_symbols(value: Any) -> tuple[Any, bool]:
+# Legacy crypto rows: ``generate_crypto_predictions.py`` passed
+# ``json.dumps([symbol])`` until PR #968 and ``save_prediction`` stored
+# ``list()`` of that string, so rows hold ``['[', '"', 'B', 'T', 'C', '"', ']']``
+# and jsonb *strings* in the payload columns. The last such row on grid-svr was
+# written 2026-11-05T16:29:45Z; from 17:31Z the old script crashed before any
+# write, and the fixed script plus the ``save_prediction`` shape guard cannot
+# produce the shape again. A cutoff at the start of 2026-11-06 therefore covers
+# every legacy row however late #968 deploys. ``created_at`` is set by the
+# database (callers cannot supply it), so later rows cannot opt into decoding.
+LEGACY_CRYPTO_MODEL_VERSION = "grid-crypto-v1"
+LEGACY_CRYPTO_PAYLOAD_CUTOFF = datetime(2026, 11, 6, tzinfo=timezone.utc)
+_LEGACY_SYMBOL_RE = re.compile(r"[A-Z0-9.^-]{1,10}")
+_LEGACY_SYMBOLS_MAX_JOINED = 512
+
+
+def _is_legacy_crypto_row(model_version: Any, created_at: Any) -> bool:
+    """True only for grid-crypto-v1 rows created before the fix cutoff."""
+    return (
+        model_version == LEGACY_CRYPTO_MODEL_VERSION
+        and isinstance(created_at, datetime)
+        and created_at.tzinfo is not None
+        and created_at < LEGACY_CRYPTO_PAYLOAD_CUTOFF
+    )
+
+
+def _decode_legacy_target_symbols(value: Any, *, legacy_row: bool) -> tuple[Any, bool]:
     """Read ``target_symbols``, undoing the char-list corruption of legacy rows.
 
-    ``generate_crypto_predictions.py`` passed ``json.dumps([symbol])`` until
-    2026-11-05 and ``save_prediction`` stored ``list()`` of that string, so
-    the row holds ``['[', '"', 'B', 'T', 'C', '"', ']']``. Only a list of
-    single characters that joins into a JSON list of strings is decoded, so
-    real one-letter tickers (``["F", "T"]``) are left alone. The stored bytes
-    are never changed; the caller flags the record as decoded.
+    Decodes only when ``legacy_row`` (see ``_is_legacy_crypto_row``), the
+    stored value is a list of single characters joining to at most
+    ``_LEGACY_SYMBOLS_MAX_JOINED`` chars, and the join parses to a non-empty
+    list of ticker-shaped strings. Anything else is returned as stored and
+    not flagged. The stored bytes are never changed.
     """
     symbols = _json_loads(value, [])
-    if not isinstance(symbols, list) or not symbols:
+    if not legacy_row or not isinstance(symbols, list) or not symbols:
+        return symbols, False
+    if len(symbols) > _LEGACY_SYMBOLS_MAX_JOINED:
         return symbols, False
     if not all(isinstance(item, str) and len(item) == 1 for item in symbols):
         return symbols, False
     try:
         decoded = json.loads("".join(symbols))
-    except json.JSONDecodeError:
+    except (ValueError, TypeError, RecursionError):
         return symbols, False
-    if isinstance(decoded, list) and decoded and all(isinstance(item, str) and item for item in decoded):
+    if (
+        isinstance(decoded, list)
+        and decoded
+        and all(isinstance(item, str) and _LEGACY_SYMBOL_RE.fullmatch(item) for item in decoded)
+    ):
         return decoded, True
     return symbols, False
 
 
-def _decode_legacy_json_object(value: Any) -> tuple[Any, bool]:
-    """Read a jsonb payload column; flag rows stored as a JSON *string*.
+def _decode_legacy_json_object(value: Any, *, legacy_row: bool) -> tuple[Any, bool]:
+    """Read a jsonb payload column; flag legacy rows stored as a JSON *string*.
 
     psycopg2 returns a jsonb object as a dict and a jsonb string as ``str``.
-    The legacy crypto rows hold the latter, which ``_json_loads`` already
-    parsed before this helper existed; the helper only adds the flag.
+    ``_json_loads`` parsed such strings before this helper existed, so the
+    returned value is unchanged; only legacy rows get the provenance flag.
     """
     decoded = _json_loads(value, {})
-    return decoded, isinstance(value, str) and isinstance(decoded, dict)
+    return decoded, legacy_row and isinstance(value, str) and isinstance(decoded, dict)
 
 
 def _json_loads(value: Any, default: Any) -> Any:
@@ -2515,7 +2545,8 @@ class AstroGridStore:
                 pp.dominant_grid_drivers,
                 pp.dominant_mystical_drivers,
                 pp.invalidation_rule,
-                pp.feature_family_summary
+                pp.feature_family_summary,
+                pr.model_version
             FROM {self.schema}.prediction_postmortem pp
             JOIN {self.schema}.prediction_run pr
                 ON pr.id = pp.prediction_run_id
@@ -2577,7 +2608,8 @@ class AstroGridStore:
 
     def _prediction_row_to_dict(self, row: Any, detailed: bool = False) -> dict[str, Any]:
         feature_family_summary = _json_loads(row[29 if detailed else 26], {})
-        target_symbols, symbols_decoded = _decode_legacy_target_symbols(row[6])
+        legacy_row = _is_legacy_crypto_row(row[18 if detailed else 15], row[1])
+        target_symbols, symbols_decoded = _decode_legacy_target_symbols(row[6], legacy_row=legacy_row)
         legacy_fields = ["target_symbols"] if symbols_decoded else []
         data = {
             "prediction_id": row[0],
@@ -2619,7 +2651,7 @@ class AstroGridStore:
                 ("mystical_feature_payload", 15),
                 ("grid_feature_payload", 16),
             ):
-                data[field], decoded = _decode_legacy_json_object(row[index])
+                data[field], decoded = _decode_legacy_json_object(row[index], legacy_row=legacy_row)
                 if decoded:
                     legacy_fields.append(field)
             data["postmortem"]["raw_payload"] = _json_loads(row[30], {})
@@ -2630,7 +2662,9 @@ class AstroGridStore:
 
     def _postmortem_row_to_dict(self, row: Any) -> dict[str, Any]:
         feature_family_summary = _json_loads(row[14], {})
-        target_symbols, symbols_decoded = _decode_legacy_target_symbols(row[4])
+        target_symbols, symbols_decoded = _decode_legacy_target_symbols(
+            row[4], legacy_row=_is_legacy_crypto_row(row[15], row[1])
+        )
         return {
             "prediction_id": row[0],
             "created_at": row[1].isoformat() if row[1] else None,
