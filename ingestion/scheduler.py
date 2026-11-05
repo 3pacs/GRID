@@ -1560,9 +1560,10 @@ def _get_pullers_for_group(
 
         # ICIJ full dataset — 814K entities (monthly re-download + actor discovery).
         # Same offshore_leaks hold: its _discover_actors inserts ICIJ officer and
-        # entity names straight into `actors`, and its relationships load has no
-        # conflict key, so each run re-appended ~3.3M rows (2026-11-05: 99,117
-        # actors added while the hold said every automated path honoured it).
+        # entity names straight into `actors` (2026-11-05: 99,117 actors added
+        # while the hold said every automated path honoured it). Its
+        # relationships load had no conflict key and re-appended ~3.3M rows per
+        # run; since 2026-11-05 it skips an identical stored edge instead.
         try:
             from ingestion.smart_scheduler import hold_reason_for
             _icij_hold = hold_reason_for("offshore_leaks")
