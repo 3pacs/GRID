@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import base64
 import struct
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from loguru import logger as log
@@ -37,6 +38,11 @@ from loguru import logger as log
 MAINNET_URL = "https://api.mainnet-beta.solana.com"
 _SPL_MINT_SIZE = 82
 _DEFAULT_TIMEOUT = 10.0
+# Public mainnet RPC answers bursts with 429. Retry a bounded number of
+# times, honouring Retry-After when given, and never sleep longer than the cap.
+_RATE_LIMIT_RETRIES = 2
+_RATE_LIMIT_BACKOFF_S = 1.0
+_RATE_LIMIT_MAX_SLEEP_S = 5.0
 
 
 class SolanaRPCError(RuntimeError):
@@ -89,11 +95,15 @@ class SolanaRPC:
         url: str = MAINNET_URL,
         timeout: float = _DEFAULT_TIMEOUT,
         client: httpx.Client | None = None,
+        rate_limit_retries: int = _RATE_LIMIT_RETRIES,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._url = url
         self._timeout = timeout
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout)
+        self._rate_limit_retries = max(0, rate_limit_retries)
+        self._sleep = sleep
 
     # ------------------------------------------------------------------
     # Resource management
@@ -118,13 +128,7 @@ class SolanaRPC:
             "method": method,
             "params": params,
         }
-        try:
-            resp = self._client.post(self._url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPError as exc:
-            log.error("Solana RPC HTTP error for {m}: {e}", m=method, e=str(exc))
-            raise SolanaRPCError(f"{method} failed: {exc}") from exc
+        data = self._post_with_rate_limit_retry(method, payload)
 
         if "error" in data:
             raise SolanaRPCError(
@@ -133,6 +137,52 @@ class SolanaRPC:
         if "result" not in data:
             raise SolanaRPCError(f"{method} missing 'result' field")
         return data["result"]
+
+    def _post_with_rate_limit_retry(
+        self, method: str, payload: dict[str, Any]
+    ) -> Any:
+        """POST ``payload``; retry HTTP 429 up to ``rate_limit_retries`` times.
+
+        Log levels (errors.jsonl must stay signal-rich, see CLAUDE.md): a 429
+        that survives the retries and transport failures are transient and
+        log at warning; any other HTTP failure stays at error. Every failure
+        raises :class:`SolanaRPCError`, exactly as before.
+        """
+        attempt = 0
+        while True:
+            try:
+                resp = self._client.post(self._url, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429:
+                    if attempt < self._rate_limit_retries:
+                        delay = _rate_limit_delay(exc.response, attempt)
+                        attempt += 1
+                        log.debug(
+                            "Solana RPC 429 for {m}; retry {a}/{n} in {d:.1f}s",
+                            m=method, a=attempt, n=self._rate_limit_retries, d=delay,
+                        )
+                        self._sleep(delay)
+                        continue
+                    log.warning(
+                        "Solana RPC rate limited (HTTP 429) for {m} after {n} retries",
+                        m=method, n=attempt,
+                    )
+                else:
+                    log.error(
+                        "Solana RPC HTTP error for {m}: {e}", m=method, e=str(exc),
+                    )
+                raise SolanaRPCError(f"{method} failed: {exc}") from exc
+            except httpx.TransportError as exc:
+                log.warning(
+                    "Solana RPC transport error for {m}: {e}", m=method, e=str(exc),
+                )
+                raise SolanaRPCError(f"{method} failed: {exc}") from exc
+            except httpx.HTTPError as exc:
+                log.error("Solana RPC HTTP error for {m}: {e}", m=method, e=str(exc))
+                raise SolanaRPCError(f"{method} failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Mint info
@@ -205,6 +255,23 @@ class SolanaRPC:
             except (KeyError, TypeError, ValueError) as exc:
                 log.warning("Malformed holder row {r}: {e}", r=row, e=str(exc))
         return holders
+
+
+def _rate_limit_delay(resp: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retry ``attempt`` (0-based) after a 429.
+
+    Uses a numeric ``Retry-After`` header when present, otherwise
+    exponential backoff from ``_RATE_LIMIT_BACKOFF_S``; capped at
+    ``_RATE_LIMIT_MAX_SLEEP_S`` either way.
+    """
+    delay = _RATE_LIMIT_BACKOFF_S * (2 ** attempt)
+    raw = resp.headers.get("Retry-After") if resp is not None else None
+    if raw:
+        try:
+            delay = max(0.0, float(raw))
+        except ValueError:
+            pass
+    return min(delay, _RATE_LIMIT_MAX_SLEEP_S)
 
 
 # ----------------------------------------------------------------------

@@ -12,6 +12,13 @@ import pytest
 import requests
 
 import ingestion.social_sentiment as mod
+from ingestion.altdata import reddit_rss
+
+
+@pytest.fixture(autouse=True)
+def _isolated_reddit_slot(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(reddit_rss.LOCK_PATH_ENV, str(tmp_path / "reddit.lock"))
+    monkeypatch.setattr(reddit_rss, "MIN_INTERVAL_S", 0.0)
 
 _RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -42,6 +49,7 @@ _APE = {"count": 2, "pages": 1, "current_page": 1, "results": [
 
 def _resp(*, content: bytes = b"", payload: Any = None, status: int = 200) -> MagicMock:
     resp = MagicMock()
+    resp.status_code = status
     resp.content = content
     resp.json.return_value = payload
     if status >= 400:
@@ -77,8 +85,8 @@ class TestRedditRss:
         # Link posts carry only the footer, which is not post text.
         assert posts["bitcoin"][0]["text"] == ""
 
-    def test_rate_limited_raises(self) -> None:
-        puller = _puller([_resp(status=429)])
+    def test_second_429_raises(self) -> None:
+        puller = _puller([_resp(status=429), _resp(status=429)])
         with pytest.raises(requests.exceptions.HTTPError):
             puller._reddit_hot_all(["stocks"])
 

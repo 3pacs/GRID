@@ -1,5 +1,9 @@
 """Reddit Data API access via application-only OAuth (free tier).
 
+Unused since 2026-11-05: smart_money, reddit_options_pulse and social_sentiment
+read Reddit's RSS feeds without credentials (ingestion/altdata/reddit_rss.py).
+Kept for an owner-registered app, which would add vote and comment counts.
+
 Why
 ---
 Every unauthenticated ``https://www.reddit.com/...json`` request from

@@ -383,16 +383,45 @@ class TestADS:
 # ── Social_Smart_Money ──────────────────────────────────────────────────
 
 
-def test_smart_money_all_unconfigured_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_smart_money_reddit_feed_failure_is_failed() -> None:
     import ingestion.altdata.smart_money as sm
 
-    monkeypatch.setattr("ingestion.altdata.reddit_oauth.reddit_credentials_configured", lambda: False)
     p = _bare(sm.SmartMoneyPuller)
     p._load_trust_scores = lambda: None
+
+    def blocked(subs: list[str]) -> list:
+        raise sm.reddit_rss.RedditRateLimited("slot past budget")
+
+    p._fetch_hot_posts = blocked
     out = p.pull_all()
-    assert [r["status"] for r in out] == ["SKIPPED", "SKIPPED"]
-    outcome, rows, note = _classify_outcome(out)
-    assert outcome == "SKIPPED" and rows == 0 and "reddit not configured" in note
+    assert [r["status"] for r in out] == ["FAILED"]
+    assert "reddit rss fetch failed" in out[0]["error"]
+    assert _classify_outcome(out)[:2] == ("FAILED", 0)
+
+
+def test_smart_money_reddit_without_signals_is_success_no_rows() -> None:
+    import ingestion.altdata.smart_money as sm
+
+    p = _bare(sm.SmartMoneyPuller, _trust_cache={})
+    p._load_trust_scores = lambda: None
+    p._fetch_hot_posts = lambda subs: [{"title": "weekend thread", "selftext": "",
+                                        "author": "x", "subreddit": "stocks", "score": None}]
+    out = p.pull_all()
+    assert out[0]["status"] == "SUCCESS" and out[0]["rows_inserted"] == 0
+
+
+def test_smart_money_reddit_success_classifies_success_not_partial() -> None:
+    # 2026-11-05: 19 signals stored, but the retired Finviz SKIPPED entry made
+    # the run PARTIAL and the scheduler put it on a 240-minute failure cooldown.
+    import ingestion.altdata.smart_money as sm
+
+    p = _bare(sm.SmartMoneyPuller, _trust_cache={})
+    p._load_trust_scores = lambda: None
+    p.pull_reddit = lambda: {"source": "reddit", "status": "SUCCESS",
+                             "signals_found": 19, "rows_inserted": 19}
+    out = p.pull_all()
+    assert [r["source"] for r in out] == ["reddit"]
+    assert _classify_outcome(out) == ("SUCCESS", 19, None)
 
 
 # ── Asset_Registries / OpenCorporates ───────────────────────────────────

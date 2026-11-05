@@ -947,6 +947,36 @@ def _stale_refresh_not_actionable(stale: dict[str, Any]) -> bool:
     return True
 
 
+# Set once the Solana universe pass has warned that HELIUS_API_KEY is unset
+# (once per process: the key only appears with an .env change + restart).
+_HELIUS_UNCONFIGURED_LOGGED = False
+
+
+def _solana_deploy_sources(engine: Any, settings: Any) -> tuple[Any, Any]:
+    """Return ``(helius_client, deployer_registry)`` for a Solana universe pass.
+
+    Both are ``None`` when ``HELIUS_API_KEY`` is unset: Helius answers every
+    keyless call with 401, and building a keyless client made one doomed
+    request per new mint each pass (66% of errors.jsonl on 2026-11-05). The
+    pass then runs safety-only enrichment, which ``TopVolumeIngestor``
+    already supports, and leaves deployer columns empty, as the 401s did.
+    """
+    global _HELIUS_UNCONFIGURED_LOGGED
+    from trading.solana import DeployerRegistry, HeliusClient
+
+    api_key = str(getattr(settings, "HELIUS_API_KEY", "") or "").strip()
+    if not api_key:
+        if not _HELIUS_UNCONFIGURED_LOGGED:
+            _HELIUS_UNCONFIGURED_LOGGED = True
+            log.warning(
+                "Helius not configured (HELIUS_API_KEY unset) — Solana universe "
+                "passes skip deployer resolution"
+            )
+        return None, None
+    helius = HeliusClient(api_key=api_key)
+    return helius, DeployerRegistry(engine=engine, provider=helius)
+
+
 # ─── Intelligence task runner (remains in this file) ────────────────────
 
 
@@ -3989,17 +4019,12 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     TopVolumeIngestor,
                 )
                 from trading.solana import (
-                    DeployerRegistry,
-                    HeliusClient,
                     SafetyConfig,
                     SolanaSafetyChecker,
                     parse_mint_blocklist,
                 )
 
-                helius = HeliusClient(
-                    api_key=getattr(_settings, "HELIUS_API_KEY", "") or None
-                )
-                deployer_registry = DeployerRegistry(engine=engine, provider=helius)
+                helius, deployer_registry = _solana_deploy_sources(engine, _settings)
                 safety_config = SafetyConfig(
                     blocked_mints=parse_mint_blocklist(
                         getattr(_settings, "SOLANA_MINT_BLOCKLIST", "") or ""
@@ -4032,7 +4057,8 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     )
                 finally:
                     provider.close()
-                    helius.close()
+                    if helius is not None:
+                        helius.close()
                 state.last_solana_universe = now
             else:
                 log.info("[DRY RUN] Would run Solana universe snapshot")

@@ -30,6 +30,28 @@ def test_normalize_buckets_volatile_error_details():
     assert "<HEX>" in normalized
 
 
+def test_normalize_buckets_future_reprs_and_solana_addresses():
+    # 2026-11-05: these two shapes escaped bucketing, so a 331/day Helius
+    # flood (one base58 mint per line) never reached the top-N.
+    a = _normalize(
+        "Helius GET /v0/addresses/WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk/"
+        "transactions failed: Client error '401 Unauthorized'"
+    )
+    b = _normalize(
+        "Helius GET /v0/addresses/ARMbSB1MBRQrY6PNMao1HdQ431VafC6JRJCsGZ2Yv3iJ/"
+        "transactions failed: Client error '401 Unauthorized'"
+    )
+    assert a == b and "<B58>" in a
+
+    f1 = _normalize("Task exception: <Future at 0x7f3a2b1c4d50 state=finished raised TimeoutError>")
+    f2 = _normalize("Task exception: <Future at 0x7f99e00a1b20 state=finished raised TimeoutError>")
+    assert f1 == f2 and "<ADDR>" in f1
+
+    # Ordinary identifiers and words are left alone.
+    plain = "refresh_materialized_view_concurrently_for_all failed on supercalifragilisticexpialidocious"
+    assert _normalize(plain) == plain
+
+
 def test_audit_groups_recent_patterns(tmp_path, capsys):
     log_path = tmp_path / "errors.jsonl"
     cutoff = datetime(2026, 5, 7, tzinfo=timezone.utc)
