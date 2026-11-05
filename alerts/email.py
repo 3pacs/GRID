@@ -12,7 +12,9 @@ TLS is forced for external SMTP to protect signal data in transit.
 from __future__ import annotations
 
 import smtplib
+import re
 import threading
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -119,7 +121,52 @@ def _section_regime(state: str, confidence: float, action: str) -> dict:
     }
 
 
-def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff: float = 0) -> dict:
+def _section_100x(
+    ticker: str, direction: str, score: float, thesis: str, payoff: float = 0,
+    confidence: str | None = None,
+) -> dict:
+    # options_mispricing_scans.confidence (LOW/MEDIUM/HIGH) must survive
+    # into the rendered alert — without it, a LOW-confidence flagged row is
+    # visually identical to a HIGH-confidence one.
+    #
+    # What this label actually is, made visible in the email itself (not
+    # only here) per docs/reference/CONFIDENCE_POLICY.md (#544, adopted
+    # 2026-09-17): discovery/options_scanner.py sets it from a fixed
+    # threshold on the composite score (>=8.0/>=6.0), not from a scored
+    # track record (hit rate, calibration, verified-vs-flagged count) —
+    # the bar that policy sets for a field named "confidence". It doesn't
+    # clear that bar, so every rendering below says "heuristic confidence"
+    # and never the bare word, in every branch including MEDIUM/HIGH — a
+    # HIGH bucket is still just a threshold on the same composite score,
+    # not a calibrated high-confidence signal, and saying so only for LOW
+    # would misleadingly imply the other two are measured. Renaming the
+    # underlying field belongs to whoever next revises
+    # discovery/options_scanner.py (#539's lane), not this fix.
+    #
+    # The column is `confidence TEXT NOT NULL` — verified against
+    # schema.sql, which puts no CHECK constraint on this column (contrast
+    # decision_journal.operator_confidence, which does constrain its values
+    # to LOW/MEDIUM/HIGH). NOT NULL rules out None; it does NOT rule out an
+    # unexpected non-LOW/MEDIUM/HIGH string reaching here — nothing in the
+    # schema stops one being written, so the "unknown" branch below is a
+    # real, reachable case (a typo, a future code path, a direct edit),
+    # not purely defensive for a hypothetical legacy row.
+    label = (confidence or "").strip().upper()
+    if label == "LOW":
+        conf_note = (
+            ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: LOW</span>'
+        )
+        accent = "amber"
+    elif label in ("MEDIUM", "HIGH"):
+        conf_note = (
+            f' &nbsp; <span class="badge badge-regime">heuristic confidence: {label}</span>'
+        )
+        accent = "purple"
+    else:
+        conf_note = (
+            ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: UNKNOWN</span>'
+        )
+        accent = "amber"
     return {
         "title": f"100x Opportunity — {ticker}",
         "body": (
@@ -127,9 +174,13 @@ def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff
             f'{ticker} {direction}S</span> &nbsp; '
             f'Score: <strong>{score:.1f}/10</strong>'
             f'{f" &nbsp; Est. Payoff: <strong>{payoff:.0f}x</strong>" if payoff else ""}'
+            f'{conf_note}'
             f'<br><br>{thesis}'
+            f'<br><br><span style="font-size:11px;color:#5A7A96;">Confidence is a '
+            f'scanner heuristic (a threshold on the composite score) — not a '
+            f'calibrated or track-record-scored confidence.</span>'
         ),
-        "accent": "purple",
+        "accent": accent,
     }
 
 
@@ -210,16 +261,80 @@ def _send_in_thread(subject: str, html: str, plain: str) -> None:
     t.start()
 
 
-def _do_send(subject: str, html: str, plain: str) -> bool:
+def _validated_research_recipients(value: tuple[str, ...]) -> tuple[str, str]:
+    """Two unique ASCII mailbox addresses, never a comma-joined envelope.
+
+    This deliberately accepts simple addr-specs rather than display names,
+    groups or quoted local parts. Normalize case/outer spaces and deduplicate
+    before requiring exactly two. Never fall back to the global audience.
+    """
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("research audience must be an address sequence")
+    unique: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or any(ord(c) < 32 or ord(c) >= 127 for c in raw):
+            raise ValueError("research audience contains invalid characters")
+        address = raw.strip().lower()
+        if len(address) > 254 or not re.fullmatch(
+            r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", address,
+        ):
+            raise ValueError("research audience contains an invalid mailbox")
+        local, domain = address.rsplit("@", 1)
+        if len(local) > 64 or local.startswith(".") or local.endswith(".") or ".." in local:
+            raise ValueError("research audience contains an invalid local part")
+        if any(len(label) > 63 or label.startswith("-") or label.endswith("-") for label in domain.split(".")):
+            raise ValueError("research audience contains an invalid domain")
+        if address not in unique:
+            unique.append(address)
+    if len(unique) != 2:
+        raise ValueError("research audience must contain exactly two unique mailboxes")
+    return unique[0], unique[1]
+
+
+def _do_send(
+    subject: str, html: str, plain: str, *,
+    research_recipients: tuple[str, ...] | None = None,
+    delivery: dict[str, Any] | None = None,
+) -> str:
+    """Send over SMTP, returning one of three outcomes — not a bool.
+
+    "sent": the relay accepted the message (for research, every envelope
+        recipient). A partial research refusal is instead "uncertain";
+        callers must not retry the whole audience. A later failure in
+        ``quit()`` does not change a confirmed acceptance:
+        QUIT is connection cleanup, not part of the accept decision, and
+        treating its failure as "the send failed" was the exact bug this
+        fixes — an accepted message could be reported as a failure and
+        retried, risking a duplicate.
+    "failed": a clean, pre-acceptance failure — mail disabled, or the
+        connection/auth/HELO never completed, or the relay explicitly
+        rejected the sender/recipients before any message data went
+        out. Nothing was transmitted; safe to retry.
+    "uncertain": the connection was lost, timed out, or otherwise
+        interrupted during or after the DATA phase, so whether the relay
+        actually received the message cannot be determined from here.
+        Callers must not treat this as either success or a safe-to-retry
+        failure.
+    """
+    audience: tuple[str, ...] = ()
+    def outcome(label: str, accepted: Iterable[str] = (), refused: Iterable[str] = ()) -> None:
+        if research_recipients is not None and delivery is not None:
+            delivery.update({"outcome": label, "audience": list(audience),
+                             "relay_accepted": list(accepted), "refused": list(refused)})
     try:
+        if research_recipients is not None:
+            if delivery is not None:
+                delivery.clear()
+            audience = _validated_research_recipients(research_recipients)
         cfg = _get_settings()
         if not cfg.ALERT_EMAIL_ENABLED:
-            return False
+            outcome("disabled")
+            return "failed"
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = cfg.ALERT_EMAIL_FROM
-        msg["To"] = cfg.ALERT_EMAIL_TO
+        msg["To"] = ", ".join(audience) if research_recipients is not None else cfg.ALERT_EMAIL_TO
         msg.attach(MIMEText(plain, "plain"))
         msg.attach(MIMEText(html, "html"))
 
@@ -230,24 +345,74 @@ def _do_send(subject: str, html: str, plain: str) -> bool:
         if is_external and not use_tls:
             use_tls = True
 
+        smtp = smtplib.SMTP(host, port, timeout=30)
         if use_tls:
-            smtp = smtplib.SMTP(host, port, timeout=30)
             smtp.ehlo()
             smtp.starttls()
             smtp.ehlo()
-        else:
-            smtp = smtplib.SMTP(host, port, timeout=30)
-
         if cfg.ALERT_SMTP_USER and cfg.ALERT_SMTP_PASSWORD:
             smtp.login(cfg.ALERT_SMTP_USER, cfg.ALERT_SMTP_PASSWORD)
-
-        smtp.sendmail(cfg.ALERT_EMAIL_FROM, [cfg.ALERT_EMAIL_TO], msg.as_string())
-        smtp.quit()
-        log.info("Newsletter sent — {s}", s=subject)
-        return True
     except Exception as exc:
-        log.warning("Newsletter send failed — {s}: {e}", s=subject, e=str(exc))
-        return False
+        outcome("failed")
+        log.warning("Newsletter send failed before relay acceptance — {s}: {e}", s=subject, e=str(exc))
+        return "failed"
+
+    try:
+        refused = smtp.sendmail(
+            cfg.ALERT_EMAIL_FROM,
+            list(audience) if research_recipients is not None else [cfg.ALERT_EMAIL_TO],
+            msg.as_string(),
+        )
+    except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPResponseException) as exc:
+        outcome("failed", refused=audience if isinstance(exc, smtplib.SMTPRecipientsRefused) else ())
+        # An explicit rejection response — the relay told us no before
+        # accepting the body. Clean, safe to retry.
+        log.warning("Newsletter send rejected by relay — {s}: {e}", s=subject, e=str(exc))
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+        return "failed"
+    except Exception as exc:
+        outcome("uncertain")
+        # Connection lost, timed out, or otherwise interrupted while
+        # transmitting — genuinely unknown whether the relay got it.
+        log.warning("Newsletter send outcome unknown — {s}: {e}", s=subject, e=str(exc))
+        return "uncertain"
+
+    status = "sent"
+    if research_recipients is not None:
+        # sendmail may accept one recipient while returning refusals for the
+        # other. That is neither all-sent nor safely retryable for the pair.
+        # Unknown result shapes/recipient keys are conservatively uncertain.
+        if not isinstance(refused, dict) or any(
+            not isinstance(key, str) or key not in audience
+            or not isinstance(value, tuple) or len(value) != 2
+            or not isinstance(value[0], int) or not 400 <= value[0] <= 599
+            for key, value in refused.items()
+        ):
+            status = "uncertain"
+            outcome("uncertain")
+        elif refused:
+            accepted = [address for address in audience if address not in refused]
+            status = "uncertain" if accepted else "failed"
+            outcome("partial" if accepted else "failed", accepted, refused.keys())
+        else:
+            outcome("accepted", audience)
+
+    try:
+        smtp.quit()
+    except Exception as exc:
+        log.debug(
+            "SMTP quit() failed after a successful sendmail — message was already "
+            "accepted, this does not change the outcome: {e}", e=str(exc),
+        )
+
+    if research_recipients is None:
+        log.info("Newsletter sent — {s}", s=subject)
+    else:
+        log.info("Research newsletter relay outcome={status} — {s}", status=status, s=subject)
+    return status
 
 
 def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
@@ -255,6 +420,29 @@ def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
     html = _render_html(subject, sections, footer_note)
     plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
     _send_in_thread(subject, html, plain)
+
+
+def _send_sync(
+    subject: str, sections: list[dict], footer_note: str = "", *,
+    research_recipients: tuple[str, ...] | None = None,
+    delivery: dict[str, Any] | None = None,
+) -> str:
+    """Render and send synchronously, returning "sent"/"failed"/"uncertain".
+
+    ``_send`` exists to keep request handlers non-blocking; it fires a
+    background thread and returns before ``_do_send`` even runs, so a
+    caller can never learn whether the message was actually accepted —
+    "sent" there means "handed to a thread," not "delivered." A caller
+    running on its own background thread already (not a request path —
+    e.g. the daily digest scheduler) should call this instead, so it can
+    record a successful send only once one has actually happened, and
+    treat an "uncertain" outcome as neither success nor a safe retry.
+    """
+    html = _render_html(subject, sections, footer_note)
+    plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
+    if research_recipients is None:
+        return _do_send(subject, html, plain)
+    return _do_send(subject, html, plain, research_recipients=research_recipients, delivery=delivery)
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +482,12 @@ def alert_on_regime_change(from_regime: str, to_regime: str, confidence: float) 
     )
 
 
-def alert_on_100x_opportunity(ticker: str, score: float, direction: str, thesis: str) -> None:
+def alert_on_100x_opportunity(
+    ticker: str, score: float, direction: str, thesis: str, confidence: str | None = None,
+) -> None:
     _send(
         f"GRID Intelligence — 100x Alert: {ticker} {direction}S",
-        [_section_100x(ticker, direction, score, thesis)],
+        [_section_100x(ticker, direction, score, thesis, confidence=confidence)],
     )
 
 
@@ -333,61 +523,151 @@ def send_weekly_review(review_content: str) -> None:
     )
 
 
-def daily_digest() -> None:
-    """Compile and send a daily digest newsletter with live data."""
+_STALE_REGIME_HOURS = 24
+
+
+def daily_digest(
+    dry_run: bool = False, *, research_recipients: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Compile and send a daily digest newsletter with live data.
+
+    Parameters:
+        dry_run: If True, build the digest content but never call ``_send``.
+            Use this to preview a section count/titles/degraded-collector
+            list against real data before relying on a live send — e.g.
+            after a period where this function wasn't being invoked at all.
+        research_recipients: Optional explicit research-only audience for
+            controlled callers. Otherwise RESEARCH_DIGEST_EMAIL_TO is used.
+            Exactly two validated unique mailboxes are required; empty or
+            invalid values fail closed, never falling back to ALERT_EMAIL_TO.
+
+    Returns:
+        dict summarizing what was built: ``sections``, ``section_titles``,
+        ``degraded`` (collector names whose query raised), and either
+        ``dry_run`` or ``sent``/``error``. A truthy return does not mean
+        every section built successfully — check ``degraded``.
+    """
+    # One UTC cutoff for this build, including its existing 24-hour and
+    # three-calendar-day windows. This excludes future-dated records;
+    # it does not reconstruct historical vintages or prove PIT completeness.
+    as_of = datetime.now(timezone.utc)
+    result: dict[str, Any] = {"timestamp": as_of.isoformat()}
     try:
+        audience = _validated_research_recipients(
+            getattr(_get_settings(), "RESEARCH_DIGEST_EMAIL_TO", ())
+            if research_recipients is None else research_recipients
+        )
+        result["research_recipients"] = list(audience)
         from sqlalchemy import text as sa_text
         from db import get_engine
 
         engine = get_engine()
         sections: list[dict] = []
+        degraded: list[str] = []
 
         with engine.connect() as conn:
-            # Regime
+            # Regime — a missing, stale, or future-dated decision_journal
+            # timestamp must never render through the normal "current
+            # regime" branch. Age is unverifiable in the first two cases
+            # (worse than merely stale) and untrustworthy in the third
+            # (clock skew or bad data) — none of them are "current."
             try:
                 row = conn.execute(sa_text(
-                    "SELECT inferred_state, state_confidence, grid_recommendation "
-                    "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
-                )).fetchone()
+                    "SELECT inferred_state, state_confidence, grid_recommendation, "
+                    "decision_timestamp FROM decision_journal "
+                    "WHERE decision_timestamp <= :as_of OR decision_timestamp IS NULL "
+                    "ORDER BY decision_timestamp DESC LIMIT 1"
+                ), {"as_of": as_of}).fetchone()
                 if row:
-                    sections.append(_section_regime(row[0], row[1], row[2]))
-            except Exception:
-                pass
+                    ts = row[3]
+                    ts = ts if (ts is None or ts.tzinfo) else ts.replace(tzinfo=timezone.utc)
+                    age_hours = (
+                        (as_of - ts).total_seconds() / 3600
+                        if ts is not None else None
+                    )
+                    if ts is None:
+                        sections.append(_section_text(
+                            "Regime State — unverified",
+                            f"decision_journal's latest row has no timestamp; age "
+                            f"cannot be verified. Last known state: {row[0]}, "
+                            f"suggested action was: {row[2]}.",
+                            accent="amber",
+                        ))
+                    elif age_hours < 0:
+                        sections.append(_section_text(
+                            "Regime State — unverified",
+                            f"decision_journal's latest timestamp ({ts}) is in the "
+                            f"future — rejecting it rather than treating it as "
+                            f"current. Last known state: {row[0]}, suggested "
+                            f"action was: {row[2]}.",
+                            accent="red",
+                        ))
+                    elif age_hours >= _STALE_REGIME_HOURS:
+                        sections.append(_section_text(
+                            "Regime State — stale",
+                            f"last decision_journal entry {age_hours:.0f}h ago "
+                            f"({ts}). Last known state: {row[0]}, "
+                            f"suggested action was: {row[2]}.",
+                            accent="amber",
+                        ))
+                    else:
+                        sections.append(_section_regime(row[0], row[1], row[2]))
+            except Exception as exc:
+                degraded.append("regime")
+                log.debug("Daily digest regime section failed: {e}", e=str(exc))
 
             # Journal count
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(*) FROM decision_journal "
-                    "WHERE decision_timestamp >= NOW() - INTERVAL '24 hours'"
-                )).fetchone()
+                    "WHERE decision_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours' "
+                    "AND decision_timestamp <= :as_of"
+                ), {"as_of": as_of}).fetchone()
                 sections.append(_section_kpi("Decisions (24h)", str(row[0]) if row else "0"))
-            except Exception:
-                pass
+            except Exception as exc:
+                degraded.append("journal_count")
+                log.debug("Daily digest journal-count section failed: {e}", e=str(exc))
 
             # 100x opportunities
             try:
                 rows = conn.execute(sa_text(
-                    "SELECT ticker, direction, score, payoff_multiple, thesis "
+                    "SELECT ticker, direction, score, payoff_multiple, thesis, confidence "
                     "FROM options_mispricing_scans "
-                    "WHERE is_100x = TRUE AND scan_date >= CURRENT_DATE - 3 "
+                    "WHERE is_100x = TRUE AND scan_date >= :as_of_date - 3 "
+                    "AND scan_date <= :as_of_date "
                     "ORDER BY score DESC LIMIT 5"
-                )).fetchall()
+                ), {"as_of_date": as_of.date()}).fetchall()
                 for r in rows:
-                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3]))
-            except Exception:
-                pass
+                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3], confidence=r[5]))
+            except Exception as exc:
+                degraded.append("100x_opportunities")
+                log.debug("Daily digest 100x section failed: {e}", e=str(exc))
 
-            # Data freshness
+            # Data freshness — pull_status = 'SUCCESS' only. raw_series also
+            # gets a row on a FAILED pull (value=0, a real pull_timestamp),
+            # so counting every row regardless of status reports a source as
+            # "active" off pulls that never actually produced an
+            # observation. analysis/flow_thesis_data.py's raw_series reads
+            # already filter to SUCCESS — this KPI didn't. That is NOT true
+            # of most raw_series readers: the 2026-09-17 fake-data audit's
+            # root cause #1 is that 22 analytical modules read raw_series by
+            # obs_date alone, and #535 has migrated 7 of them so far,
+            # leaving 18 legacy unfiltered readers as documented, open
+            # follow-up work (see grid-fake-data-LEDGER.md). This fix covers
+            # only this one KPI in this file, not that broader gap.
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(DISTINCT source_id), MAX(pull_timestamp) FROM raw_series "
-                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours'"
-                )).fetchone()
+                    "WHERE pull_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours' "
+                    "AND pull_timestamp <= :as_of "
+                    "AND pull_status = 'SUCCESS'"
+                ), {"as_of": as_of}).fetchone()
                 if row and row[0]:
                     sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
                                                  f"latest: {str(row[1])[:16]}"))
-            except Exception:
-                pass
+            except Exception as exc:
+                degraded.append("data_freshness")
+                log.debug("Daily digest freshness section failed: {e}", e=str(exc))
 
         # Long plays (multi-year board; every multiple is a labelled proxy)
         try:
@@ -430,16 +710,67 @@ def daily_digest() -> None:
                     ))
                 elif board.get("stand_down_reason"):
                     sections.append(_section_text("Long plays", str(board["stand_down_reason"])))
-        except Exception:
-            pass
+        except Exception as exc:
+            degraded.append("long_plays")
+            log.debug("Daily digest long-plays section failed: {e}", e=str(exc))
 
-        if not sections:
-            sections.append(_section_text("Status", "All systems operational. No notable events in the last 24 hours."))
+        # A collector failure must never be silently indistinguishable from
+        # "nothing to report" — that's how a digest ends up claiming
+        # "All systems operational" while its own queries were failing.
+        if degraded:
+            sections.append(_section_text(
+                "Data collection issues",
+                f"{len(degraded)} section(s) failed to build and are omitted "
+                f"above: {', '.join(degraded)}. This digest is incomplete.",
+                accent="red",
+            ))
+        elif not sections:
+            sections.append(_section_text(
+                "Status",
+                "All systems operational. No notable events in the last 24 hours.",
+            ))
 
-        _send("GRID Intelligence — Daily Digest", sections)
-        log.info("Daily digest sent")
+        subject = "GRID Intelligence — Daily Digest"
+        result.update({
+            "sections": len(sections),
+            "section_titles": [s["title"] for s in sections],
+            "degraded": degraded,
+        })
+
+        if dry_run:
+            result["dry_run"] = True
+            # Full content, not just titles — this is what a live check
+            # verifying timestamps/staleness/missing-data behavior needs
+            # to actually inspect; titles alone can't show a regime's
+            # rendered age or a degraded section's message text.
+            result["section_bodies"] = [
+                {"title": s["title"], "body": s.get("body", ""), "accent": s.get("accent", "")}
+                for s in sections
+            ]
+            log.info("Daily digest built (dry run) — {n} sections, {d} degraded",
+                      n=len(sections), d=len(degraded))
+            return result
+
+        # Synchronous send: daily_digest() already runs on the scheduler's
+        # own background thread (alerts/scheduler.py), never a request
+        # handler, so blocking here on real SMTP I/O is safe — and it's
+        # what lets the caller record a claim only after an actual
+        # confirmed outcome instead of after merely dispatching one.
+        delivery: dict[str, Any] = {}
+        send_status = _send_sync(subject, sections, research_recipients=audience, delivery=delivery)
+        result["delivery"] = delivery
+        result["send_status"] = send_status
+        result["sent"] = send_status == "sent"
+        if send_status != "sent":
+            result["error"] = f"send status: {send_status}"
+        log.info("Daily digest send status={status} — {n} sections, {d} degraded",
+                  status=send_status, n=len(sections), d=len(degraded))
     except Exception as exc:
+        result["send_status"] = "failed"
+        result["sent"] = False
+        result["error"] = str(exc)
         log.warning("Daily digest failed: {e}", e=str(exc))
+    return result
 
 
 def _section_code_block(title: str, code: str) -> dict:

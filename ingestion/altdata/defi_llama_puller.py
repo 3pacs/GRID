@@ -36,7 +36,9 @@ _BASE_URL: str = "https://api.llama.fi"
 _PROTOCOLS_URL: str = f"{_BASE_URL}/v2/protocols"
 _CHAINS_URL: str = f"{_BASE_URL}/v2/chains"
 _HISTORICAL_CHAIN_TVL_URL: str = f"{_BASE_URL}/v2/historicalChainTvl"
-_STABLECOINS_URL: str = f"{_BASE_URL}/stablecoins"
+# The free OpenAPI operation overrides the TVL server for stablecoins.
+# api.llama.fi/stablecoins returns 404; this is a separate public service.
+_STABLECOINS_URL: str = "https://stablecoins.llama.fi/stablecoins"
 _BRIDGES_URL: str = f"{_BASE_URL}/bridges"
 _YIELDS_URL: str = f"{_BASE_URL}/yields/pools"
 

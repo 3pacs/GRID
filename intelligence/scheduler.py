@@ -314,6 +314,43 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("06:45").do(_journal_verdicts_daily)
 
+    def _sentiment_outcomes_daily() -> None:
+        """Close the sentiment-prediction loop on a schedule (2026-10-23).
+
+        ``_hourly_briefing`` logs one ``sentiment_predictions`` row per UTC
+        day (``intelligence/sentiment_scorer.py::log_prediction``), but
+        ``score_past_predictions`` -- the step that fills ``realized_return``
+        / ``outcome`` / ``scored_at`` -- had no live caller. The only one in
+        the tree is ``scripts/grid_cron.sh sentiment``, and the crontab never
+        installed it (docs/planning/LEVER-PACKAGE.md, T3). Measured on
+        griddb 2026-10-23: 205 rows since 2026-04-02, every one ``PENDING``.
+
+        Outcome-only. It does not compute or log a prediction -- the hourly
+        briefing already did that -- and it passes ``update_weights=False``,
+        so recording outcomes never inserts a ``sentiment_weights`` version.
+        Learned-weight promotion for this closer is an operator decision:
+        ``config.GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION`` (default off, same
+        held-writer semantics as the Wave 3 flags). Runs 06:50 UTC: after
+        the 22:02Z close pull the scorer reads, after the 06:45
+        journal-verdicts closer, before the 07:00 options job.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.sentiment_scorer import score_past_predictions
+            promote = bool(getattr(_s, "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION", False))
+            summary = score_past_predictions(_ge(), update_weights=promote)
+            log.info(
+                "sentiment outcomes daily: scored={s} correct={c} accuracy={a} "
+                "weight_promotion={w}{m}",
+                s=summary.get("scored", 0), c=summary.get("correct", 0),
+                a=summary.get("accuracy"), w=summary.get("weight_promotion"),
+                m=(" " + str(summary.get("message") or summary.get("error") or "")).rstrip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sentiment outcomes daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:50").do(_sentiment_outcomes_daily)
+
     def _trial_outcomes_daily() -> None:
         """Score what each trial readout actually did (2026-09-10).
 
@@ -796,19 +833,28 @@ def run_intelligence_loop() -> None:
     #   SEMI book-to-bill → 21st 11:00 UTC (monthly ~3-week lag)
     #   ECB TLTRO → Mon 09:00 UTC (ECB publishes weekly balance-sheet updates)
     def _pboc_omo_daily() -> None:
-        """CAT-3: PBoC 7-day reverse repo + MLF daily pull."""
+        """CAT-3: PBoC open-market-operation announcements (official pbc.gov.cn).
+
+        2026-09-29: switched from ingestion.altdata.pboc_omo (akshare; the
+        preferred functions do not exist and its fallbacks wrote mislabeled
+        FR007/LPR data frozen in 2020) to pboc_omo_official, which writes
+        under its own source_catalog row ``pboc_omo_announcements``.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.pboc_omo import run_pboc_omo_puller
-            result = run_pboc_omo_puller(_ge())
+            from ingestion.altdata.pboc_omo_official import (
+                run_pboc_omo_announcements_puller,
+            )
+            result = run_pboc_omo_announcements_puller(_ge())
             log.info(
-                "PBoC OMO: {o} OMO rows, {m} MLF rows, {i} inserted",
-                o=result.get("omo_rows", 0),
-                m=result.get("mlf_rows", 0),
-                i=result.get("inserted", 0),
+                "PBoC OMO announcements: status={s}, {a} parsed, {i} inserted, latest={d}",
+                s=result.get("status"),
+                a=result.get("announcements", 0),
+                i=result.get("rows_inserted", 0),
+                d=result.get("latest_op_date"),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("PBoC OMO daily failed: {e}", e=str(exc))
+            log.warning("PBoC OMO announcements daily failed: {e}", e=str(exc))
 
     def _taiwan_exports_monthly() -> None:
         """CAT-9: Taiwan export orders + foundry utilization monthly."""

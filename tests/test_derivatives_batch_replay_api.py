@@ -16,6 +16,12 @@ class _Engine:
                 "chain_snap_date": "2026-10-01", "chain_batch_id": kwargs.get("capture_batch_id"),
                 "chain_capture_ordinal": 7}
 
+    def compute_latest_completed_gex_profile(self, ticker):
+        self.calls.append((ticker, "latest_completed"))
+        return {"ticker": ticker, "put_wall": 95.0, "call_wall": 105.0,
+                "chain_snap_date": "2026-10-01", "chain_batch_id": "b-latest",
+                "chain_capture_ordinal": 7}
+
 
 def _patched(monkeypatch) -> _Engine:
     engine = _Engine()
@@ -23,11 +29,11 @@ def _patched(monkeypatch) -> _Engine:
     return engine
 
 
-def test_default_reads_latest_batch_with_unchanged_call_shape(monkeypatch) -> None:
+def test_default_reads_latest_completed_batch_via_opt_in(monkeypatch) -> None:
     engine = _patched(monkeypatch)
     asyncio.run(derivatives.get_gex("spy", snap_date=None, capture_batch_id=None))
     asyncio.run(derivatives.get_walls("spy", snap_date=None, capture_batch_id=None))
-    assert engine.calls == [("SPY", {}), ("SPY", {})]
+    assert engine.calls == [("SPY", "latest_completed"), ("SPY", "latest_completed")]
 
 
 def test_explicit_batch_replay_passes_day_and_batch(monkeypatch) -> None:

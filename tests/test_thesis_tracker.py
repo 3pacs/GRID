@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 
 from intelligence.thesis_tracker import (
     ThesisSnapshot,
@@ -29,6 +31,29 @@ from intelligence.thesis_tracker import (
 
 # ── Data Class Tests ─────────────────────────────────────────────────────
 
+
+
+@pytest.fixture
+def ready_mock_boundary(monkeypatch, mock_engine):
+    """Only tests explicitly requesting this fixture replace catalog I/O.
+
+    Each operation must still validate its actual connection before business SQL.
+    Functional catalog/default/key validation lives in readiness/native tests.
+    """
+    import intelligence.thesis_tracker as tt
+    ensure = MagicMock(return_value="synthetic_thesis")
+    allowed = (mock_engine.begin.return_value.__enter__.return_value,
+               mock_engine.connect.return_value.__enter__.return_value)
+    def check(actual, *, expected_schema):
+        assert any(actual is item for item in allowed)
+        assert expected_schema == "synthetic_thesis"
+        assert not actual.execute.called
+    readiness = MagicMock(side_effect=check)
+    monkeypatch.setattr(tt, "_ensure_tables", ensure)
+    monkeypatch.setattr(tt, "require_thesis_connection", readiness)
+    yield readiness
+    ensure.assert_called_once_with(mock_engine)
+    readiness.assert_called_once()
 
 class TestThesisSnapshot:
     def test_defaults(self):
@@ -192,7 +217,7 @@ class TestClassifyRootCause:
 
 
 class TestSnapshotThesis:
-    def test_snapshot_returns_id(self, mock_engine):
+    def test_snapshot_returns_id(self, mock_engine, ready_mock_boundary):
         mock_conn = mock_engine.begin.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.fetchone.return_value = (42,)
@@ -210,7 +235,7 @@ class TestSnapshotThesis:
         snap_id = snapshot_thesis(mock_engine, thesis_data)
         assert snap_id == 42
 
-    def test_snapshot_defaults(self, mock_engine):
+    def test_snapshot_defaults(self, mock_engine, ready_mock_boundary):
         mock_conn = mock_engine.begin.return_value.__enter__.return_value
         mock_result = MagicMock()
         mock_result.fetchone.return_value = (1,)
@@ -252,7 +277,7 @@ class TestScoreOldTheses:
         mock_engine.begin.assert_not_called()
         mock_engine.connect.assert_not_called()
 
-    def test_unheld_via_monkeypatch_runs_the_real_query(self, monkeypatch, mock_engine):
+    def test_unheld_via_monkeypatch_runs_the_real_query(self, monkeypatch, mock_engine, ready_mock_boundary):
         """Sanity check that the hold is a real gate, not dead code: with it
         patched off, the pre-existing query path still runs."""
         import intelligence.thesis_tracker as tt
@@ -263,7 +288,9 @@ class TestScoreOldTheses:
         results = tt.score_old_theses(mock_engine, lookback_days=7)
 
         assert "held" not in results
-        mock_engine.begin.assert_called()  # _ensure_tables + the scoring query both use begin()
+        mock_engine.begin.assert_called_once()  # Only the scoring query opens a transaction.
+        sql = str(mock_conn_begin.execute.call_args.args[0])
+        assert "thesis_snapshots" in sql and "outcome IS NULL" in sql
 
 
 class TestRunThesisCycleHoldsPostmortems:
@@ -303,7 +330,7 @@ class TestRunThesisCycleHoldsPostmortems:
 
 
 class TestGetThesisHistory:
-    def test_empty_history(self, mock_engine):
+    def test_empty_history(self, mock_engine, ready_mock_boundary):
         mock_conn = mock_engine.connect.return_value.__enter__.return_value
         mock_conn.execute.return_value = MagicMock(fetchall=MagicMock(return_value=[]))
 
@@ -315,9 +342,27 @@ class TestGetThesisHistory:
 
 
 class TestLoadThesisPostmortems:
-    def test_empty(self, mock_engine):
+    def test_empty(self, mock_engine, ready_mock_boundary):
         mock_conn = mock_engine.connect.return_value.__enter__.return_value
         mock_conn.execute.return_value = MagicMock(fetchall=MagicMock(return_value=[]))
 
         result = load_thesis_postmortems(mock_engine, days=30)
         assert result == []
+
+
+@pytest.mark.parametrize("operation", [snapshot_thesis, get_thesis_history, load_thesis_postmortems])
+def test_actual_connection_refusal_prevents_business_sql(monkeypatch, mock_engine, operation):
+    import intelligence.thesis_tracker as tt
+    from intelligence.schema_readiness import SchemaNotReady
+    monkeypatch.setattr(tt, "_ensure_tables", lambda engine: "synthetic_thesis")
+    def refuse(actual, *, expected_schema):
+        assert expected_schema == "synthetic_thesis"
+        raise SchemaNotReady("synthetic incompatible operation connection")
+    monkeypatch.setattr(tt, "require_thesis_connection", refuse)
+    with pytest.raises(SchemaNotReady):
+        if operation is snapshot_thesis:
+            operation(mock_engine, {"conviction": 0.5})
+        else:
+            operation(mock_engine)
+    mock_engine.begin.return_value.__enter__.return_value.execute.assert_not_called()
+    mock_engine.connect.return_value.__enter__.return_value.execute.assert_not_called()

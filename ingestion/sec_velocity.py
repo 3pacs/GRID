@@ -143,30 +143,19 @@ class SECVelocityPuller(BasePuller):
         Parameters:
             sector: Broad sector label (e.g., 'FIRE', 'MANUFACTURING').
         """
-        feature_name = f"SEC_VELOCITY:{sector}"
-        with self.engine.begin() as conn:
-            exists = conn.execute(
-                text("SELECT 1 FROM feature_registry WHERE name = :name"),
-                {"name": feature_name},
-            ).fetchone()
-            if exists is None:
-                conn.execute(
-                    text(
-                        "INSERT INTO feature_registry "
-                        "(name, family, source_series_id, normalization, "
-                        "lag_days, model_eligible) "
-                        "VALUES (:name, :family, :ssid, :norm, :lag, :elig)"
-                    ),
-                    {
-                        "name": feature_name,
-                        "family": "sec_velocity",
-                        "ssid": feature_name,
-                        "norm": "ZSCORE",
-                        "lag": 0,
-                        "elig": True,
-                    },
-                )
-                log.info("Registered feature: {f}", f=feature_name)
+        from normalization.entity_map import EntityMap
+
+        # Use the canonical ingestion registration contract. Its metadata
+        # defaults and name normalization are shared with other auto-writers.
+        # Existing registry rows are never updated, including eligibility.
+        mapper = getattr(self, "_feature_mapper", None)
+        if mapper is None:
+            mapper = self._feature_mapper = EntityMap(db_engine=self.engine)
+        mapper.ensure_canonical_feature(
+            f"SEC_VELOCITY:{sector}",
+            family="alternative",
+            model_eligible=True,  # preserve this producer's existing intent
+        )
 
     def pull_weekly_velocity(
         self,

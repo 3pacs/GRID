@@ -56,6 +56,23 @@ class Settings(BaseSettings):
     BLS_API_KEY: str = ""
     TIINGO_API_KEY: str = ""
 
+    # Schwab Trader API app "GRID" (Market Data Production, OAuth scope
+    # readonly). Both keys default empty: ingestion/schwab_market.py logs a
+    # warning and stays disabled when they are missing. When the env fields
+    # are blank the client falls back to SCHWAB_CREDENTIALS_FILE (the local
+    # helper's file, mode 0600). Tokens are never stored in .env; the token
+    # file is rewritten by the client on refresh (0600). Read-only market
+    # data only -- no account, position or order endpoints exist in GRID.
+    SCHWAB_APP_KEY: str = ""
+    SCHWAB_APP_SECRET: str = ""
+    SCHWAB_TOKEN_FILE: str = "~/.config/grid/schwab/tokens.json"
+    SCHWAB_CREDENTIALS_FILE: str = "~/.config/grid/schwab/credentials.env"
+    # Private admin-only quote endpoint (api/routers/schwab_private.py). Off by
+    # default: while False the router answers 503 and never touches the reader,
+    # credentials or the network. Turning it on is an operator decision made in a
+    # reviewed change; Schwab data is private and may not be redistributed.
+    SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
+
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
 
@@ -514,6 +531,18 @@ class Settings(BaseSettings):
     # in a reviewed change.
     GRID_ENABLE_LME_WAREHOUSE_JOB: bool = False
 
+    # Sentiment learned-weight promotion (source review on PR #903,
+    # 2026-10-23). The daily `_sentiment_outcomes_daily` closer in
+    # intelligence/scheduler.py records outcomes on sentiment_predictions
+    # through `score_past_predictions(update_weights=False)`; the Bayesian
+    # `_update_weights` step, which inserts a new sentiment_weights version
+    # that every later compute_sentiment() consumes, is a model/weight-
+    # registry write in the same held category as the Wave 3 flags above.
+    # It stays off for the scheduled closer until this flag is set in a
+    # reviewed change. The historical run_sentiment_cycle / grid_cron.sh
+    # contract (scoring followed by promotion) is unchanged by this flag.
+    GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -530,6 +559,8 @@ class Settings(BaseSettings):
         "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
+        "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
+        "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )
     @classmethod
@@ -795,6 +826,10 @@ class Settings(BaseSettings):
 
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
+    # Research newsletter only. Supply a JSON array of two approved addresses
+    # at deployment; an empty/invalid audience fails closed without falling
+    # back to ALERT_EMAIL_TO. Other alert categories retain their own routing.
+    RESEARCH_DIGEST_EMAIL_TO: tuple[str, ...] = ()
     ALERT_EMAIL_TO: str = "stepdadfinance@gmail.com"
     # 2026-09-10: GRID sends as the Hermes mailbox (ROADMAP Phase 15). A bare
     # "@grid-svr" sender through local Postfix is what Gmail dropped silently.
@@ -908,6 +943,7 @@ class Settings(BaseSettings):
             "EIA_API_KEY": self.EIA_API_KEY,
             "GDELT_API_KEY": self.GDELT_API_KEY,
             "WORLDNEWS_API_KEY": self.WORLDNEWS_API_KEY,
+            "SCHWAB_APP_KEY": self.SCHWAB_APP_KEY,
         }
         return {k: bool(v) for k, v in keys.items()}
 
@@ -924,10 +960,59 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Configure loguru
+#
+# Credentials are scrubbed from log output. Pullers log exception text, and a requests HTTPError carries the full
+# request URL, query-string API key included. Two layers:
+#   - a patcher scrubs each record's message and string extras before any sink sees it; it lives on the logger
+#     core, so it also covers sinks that scripts add after log.remove();
+#   - scrubbed_stderr, the console sink, scrubs the fully rendered line, which is the only place the formatted
+#     traceback of log.exception()/log.opt(exception=...) exists as text. Scripts that replace the console sink
+#     must add scrubbed_stderr, not sys.stderr (tests/test_log_secret_scrubbing.py enforces it). A plain file sink
+#     still gets scrubbed messages and extras but an unscrubbed traceback; the git sink scrubs its own entries.
+try:
+    from server_log.sanitizer import Sanitizer, secret_values_from_settings
+
+    _log_scrubber: Sanitizer | None = Sanitizer(
+        secret_values_from_settings(settings), generic=False, min_secret_len=8,
+    )
+except Exception:
+    _log_scrubber = None
+
+
+def _scrub_log_text(text: str) -> str:
+    if _log_scrubber is None:
+        return text
+    try:
+        return _log_scrubber.scrub(text)
+    except Exception:
+        return text  # never let scrubbing drop a log line
+
+
+def _scrub_log_record(record: dict) -> None:
+    record["message"] = _scrub_log_text(record["message"])
+    for key, value in record["extra"].items():
+        if isinstance(value, str):
+            record["extra"][key] = _scrub_log_text(value)
+
+
+def scrubbed_stderr(message: str) -> None:
+    """Console sink: writes the scrubbed rendered line to stderr."""
+    # sys.stderr looked up per call, so redirected/captured stderr keeps working
+    sys.stderr.write(_scrub_log_text(str(message)))
+
+
+# loguru's diagnose mode prints the value of every local variable under each traceback line. Those bare values
+# (an API key, an OAuth access token fetched at runtime) carry no key= prefix for the patterns to find, so it is
+# off unless GRID_LOG_DIAGNOSE=1 is set for a debugging session.
+LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+
 log.remove()  # Remove default handler
+log.configure(patcher=_scrub_log_record)
 log.add(
-    sys.stderr,
+    scrubbed_stderr,
     level=settings.LOG_LEVEL,
+    diagnose=LOG_DIAGNOSE,
+    colorize=sys.stderr.isatty(),
     format=(
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
@@ -935,6 +1020,8 @@ log.add(
         "<level>{message}</level>"
     ),
 )
+if _log_scrubber is None:
+    log.warning("log secret scrubbing not installed: sanitizer could not be built")
 
 # Git-backed error sink. Writes ERROR+ records to .server-logs/errors.jsonl
 # locally; the background push-to-remote is env-gated off by default

@@ -100,15 +100,40 @@ def realtime_candles_schema():
             PRIMARY KEY (symbol, interval, ts)
         );
     """
-    with pg_engine.begin() as conn:
-        conn.execute(text(ddl))
+    # IF NOT EXISTS does not serialize concurrent PostgreSQL catalog creation.
+    # Give each case its own namespace; retain the production table/query shape.
+    from sqlalchemy import create_engine
 
-    symbol = f"TEST_{uuid.uuid4().hex[:8]}"
-    yield pg_engine, symbol
-
-    with pg_engine.begin() as conn:
-        conn.execute(text("DELETE FROM realtime_candles WHERE symbol = :s"), {"s": symbol})
-    pg_engine.dispose()
+    schema = f"freshness_probe_{uuid.uuid4().hex}"
+    isolated_engine = None
+    schema_created = False
+    try:
+        with pg_engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+        # Ownership starts only after the CREATE transaction acknowledged commit.
+        schema_created = True
+        isolated_engine = create_engine(
+            pg_engine.url,
+            pool_pre_ping=True,
+            connect_args={"options": f"-csearch_path={schema}"},
+        )
+        with isolated_engine.begin() as conn:
+            conn.execute(text(ddl))
+        symbol = f"TEST_{uuid.uuid4().hex[:8]}"
+        yield isolated_engine, symbol
+    finally:
+        # Nested finally blocks attempt every owned cleanup even if disposal or
+        # DROP raises. Python's exception chain retains setup/cleanup failures.
+        try:
+            if isolated_engine is not None:
+                isolated_engine.dispose()
+        finally:
+            try:
+                if schema_created:
+                    with pg_engine.begin() as conn:
+                        conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            finally:
+                pg_engine.dispose()
 
 
 def _insert_row(engine, symbol, ts, created_at, source="yahoo"):

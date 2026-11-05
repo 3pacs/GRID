@@ -29,12 +29,16 @@ env:
   # provide the persistent PostgreSQL 15 + TimescaleDB the reset step expects
   # (see docs/SERVER-SERVICES.md, "Alien Runner" / "Threadripper Runner").
   # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
-  ON_SELF_HOSTED: ${{ vars.TEST_RUNNER != '' }}
+  # PR543's existing research-digest branch uses hosted CI and ephemeral DB only.
+  # PR932's stacked Schwab integration branch (claude/schwab-integration-r6-20261031)
+  # likewise: hosted CI and ephemeral DB only, once it targets main; same-repo
+  # head only. See tests/test_ci_test_workflow_pr932_routing.py.
+  ON_SELF_HOSTED: ${{ !((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
     # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
     # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
@@ -827,7 +831,7 @@ jobs:
 
   frontend-build:
     name: Frontend Build
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -868,7 +872,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -926,6 +930,9 @@ jobs:
 
       - name: Deploy pipeline — immutable runtime preservation
         run: bash tests/deploy/test_runtime_preservation.sh
+
+      - name: Deploy pipeline — runtime preservation refresh after scheduler activation
+        run: bash tests/deploy/test_refresh_runtime_preservation.sh
 
       # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
       # the resolved-cwd + independent-SHA check every "verify running the

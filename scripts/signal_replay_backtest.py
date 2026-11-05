@@ -35,6 +35,8 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 
+from ingestion.altdata.quiverquant_identity import feed_source_id_sql
+
 
 _QUERY_BY_TYPE = text("""
     SELECT
@@ -55,7 +57,7 @@ _QUERY_BY_TYPE = text("""
 _QUERY_BY_ID = text("""
     SELECT
         source_type AS group_key1,
-        source_id   AS group_key2,
+        {feed_id}   AS group_key2,
         signal_type,
         COUNT(*) AS n,
         AVG(outcome_return)::float AS avg_return,
@@ -65,8 +67,8 @@ _QUERY_BY_ID = text("""
     WHERE outcome IN ('CORRECT', 'WRONG')
       AND outcome_return IS NOT NULL
       AND signal_date >= NOW() - (:days || ' days')::interval
-    GROUP BY source_type, source_id, signal_type
-""")
+    GROUP BY source_type, {feed_id}, signal_type
+""".replace("{feed_id}", feed_source_id_sql("source_id")))
 
 
 # signal_registry has no pre-computed outcome_return — we join to raw_series

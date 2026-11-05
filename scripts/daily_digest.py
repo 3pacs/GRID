@@ -110,7 +110,7 @@ def _collect_long_plays(engine: Any) -> dict[str, Any] | None:
         return None
 
 
-def _collect_issues(engine: Any) -> list[dict[str, Any]]:
+def _collect_issues(engine: Any) -> list[dict[str, Any]] | None:
     """Collect all issues from the past 24 hours."""
     try:
         with engine.connect() as conn:
@@ -127,7 +127,7 @@ def _collect_issues(engine: Any) -> list[dict[str, Any]]:
             ]
     except Exception as exc:
         log.debug("Could not collect issues: {e}", e=str(exc))
-        return []
+        return None
 
 
 def _collect_ux_audit(engine: Any) -> dict[str, Any] | None:
@@ -335,7 +335,7 @@ def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _build_digest_sections(
-    issues: list[dict[str, Any]],
+    issues: list[dict[str, Any]] | None,
     ux_audit: dict[str, Any] | None,
     system_stats: dict[str, Any],
     long_plays: dict[str, Any] | None = None,
@@ -343,6 +343,10 @@ def _build_digest_sections(
     """Build email sections for the daily digest."""
     sections: list[dict[str, Any]] = []
     datetime.now(timezone.utc)
+
+    # A failed collector cannot establish a zero-issue interval.
+    issues_available = issues is not None
+    issues = issues or []
 
     # ── Error Summary ──
     critical = [i for i in issues if i["severity"] == "CRITICAL"]
@@ -357,9 +361,12 @@ def _build_digest_sections(
     if warnings:
         error_body += f"<br><span style='color:#5A7A96'>WARNING: {len(warnings)}</span>"
 
-    if not issues:
-        error_body = "<span style='color:#22C55E'>No issues in the past 24 hours</span>"
-        accent = "green"
+    if not issues_available:
+        error_body = "Operator issue history unavailable; health status is unknown."
+        accent = "amber"
+    elif not issues:
+        error_body = "No operator issues recorded in the past 24 hours. Health alert emails are tracked separately."
+        accent = ""
     elif critical:
         accent = "red"
     elif errors:
@@ -526,7 +533,7 @@ def send_daily_digest(engine: Any, dry_run: bool = False) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "issues_count": len(issues),
+        "issues_count": len(issues) if issues is not None else None,
         "ux_score": ux_audit.get("score") if ux_audit else None,
         "has_ux_audit": ux_audit is not None,
         "long_plays_entry_candidates": (
@@ -539,7 +546,7 @@ def send_daily_digest(engine: Any, dry_run: bool = False) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     subject = (
         f"GRID Daily Digest — {now.strftime('%b %d')} | "
-        f"{len(issues)} issues"
+        + (f"{len(issues)} operator issues" if issues is not None else "issue history unavailable")
     )
     if ux_audit and ux_audit.get("score"):
         subject += f" | UX: {ux_audit['score']}/10"

@@ -30,6 +30,12 @@ UTC=timezone.utc
 DAY=date(2026,10,15)
 EARLY=datetime(2026,10,15,13,33,tzinfo=UTC)
 LATE=datetime(2026,10,16,5,30,tzinfo=UTC)
+NY_CLASSES=[(contract.US_LISTED_DAILY_TICKERS,'us_listed_ny_label_day_2026'),
+            (contract.CBOE_VOL_INDEX_DAILY_TICKERS,'cboe_vol_index_ny_label_day_2026'),
+            (contract.ICE_DXY_DAILY_TICKERS,'ice_dxy_ny_label_day_2026'),
+            (contract.CME_GLOBEX_DAILY_TICKERS,'cme_globex_ny_label_day_2026'),
+            (contract.YAHOO_FX_DAILY_TICKERS,'yahoo_fx_ny_close_label_day_2026')]
+EXTENDED_CLASSES=NY_CLASSES[1:]
 class Result:
     def __init__(self,rows=()):self.rows=list(rows)
     def fetchall(self):return self.rows
@@ -90,10 +96,17 @@ class FinalityTests(unittest.TestCase):
 
 class PolicyTests(unittest.TestCase):
     def test_default_universe_is_partitioned_without_suffix_inference(self):
-        supported=contract.US_LISTED_DAILY_TICKERS|contract.UTC_DAILY_TICKERS
+        supported=contract.NY_LABEL_DAY_DAILY_TICKERS|contract.UTC_DAILY_TICKERS
         self.assertEqual(len(yf.YF_TICKER_LIST),70)
         self.assertEqual(set(yf.YF_TICKER_LIST),supported|contract.UNKNOWN_DAILY_TICKERS)
         self.assertFalse(supported & contract.UNKNOWN_DAILY_TICKERS)
+        # Deliberate 2026-10-19 owner decision: every default has a convention.
+        self.assertEqual(contract.UNKNOWN_DAILY_TICKERS,frozenset())
+        self.assertFalse(contract.NY_LABEL_DAY_DAILY_TICKERS & contract.UTC_DAILY_TICKERS)
+        classes=[tickers for tickers,_ in NY_CLASSES]
+        self.assertEqual(sum(len(c) for c in classes),len(contract.NY_LABEL_DAY_DAILY_TICKERS))
+        self.assertEqual(frozenset().union(*classes),contract.NY_LABEL_DAY_DAILY_TICKERS)
+        self.assertEqual(len(contract.NY_LABEL_DAY_DAILY_TICKERS-contract.US_LISTED_DAILY_TICKERS),16)
         self.assertIsNone(contract.daily_capture_boundary("AAPL",DAY))
 
     def test_dst_and_exact_offset_boundaries(self):
@@ -121,12 +134,13 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNone(contract.daily_capture_payload("ETH-USD",field,day,end-timedelta(microseconds=1)))
             self.assertIsNotNone(contract.daily_capture_payload("ETH-USD",field,day,end))
 
-    def test_fx_futures_vix_and_unknown_refuse_all_fields(self):
-        for ticker in contract.UNKNOWN_DAILY_TICKERS|{"AAPL","NEW-USD","OTHER=X",""}:
+    def test_unsupported_tickers_and_intervals_refuse_all_fields(self):
+        for ticker in contract.UNKNOWN_DAILY_TICKERS|{"AAPL","NEW-USD","OTHER=X","ES=F","^VIX1D","DX-Y",""}:
             for field in contract.DAILY_FIELDS:
                 self.assertIsNone(contract.daily_capture_payload(ticker,field,DAY,LATE))
         for interval in ['1wk','1mo','1h']:
             self.assertIsNone(contract.daily_capture_payload("^GSPC","close",DAY,LATE,interval))
+            self.assertIsNone(contract.daily_capture_payload("^VIX","close",DAY,LATE,interval))
             db=MemoryDB();r=pull(db,interval=interval)
             self.assertEqual(r['outcome'],'inserted');self.assertEqual(r['qualified_rows_inserted'],0)
             self.assertEqual(db.rows[0]['payload']['capture_state'],'UNKNOWN')
@@ -153,6 +167,89 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(pull(db,'SPY',now=end)['rows_inserted'],1)
         self.assertEqual(pull(db,'SPY',now=end+timedelta(hours=1))['rows_inserted'],0)
 
+class ExtendedSessionClassTests(unittest.TestCase):
+    """VIX/DXY/futures/FX share the elapsed NY-label-day boundary, each with its own label."""
+    def test_class_membership_is_exact(self):
+        self.assertEqual(contract.CBOE_VOL_INDEX_DAILY_TICKERS,{"^VIX","^VIX9D","^VIX3M","^VIX6M"})
+        self.assertEqual(contract.ICE_DXY_DAILY_TICKERS,{"DX-Y.NYB"})
+        self.assertEqual(contract.CME_GLOBEX_DAILY_TICKERS,{"HG=F","GC=F","SI=F","CL=F"})
+        self.assertEqual(contract.YAHOO_FX_DAILY_TICKERS,{"EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCHF=X","USDCAD=X","NZDUSD=X"})
+
+    def test_each_class_eligible_after_boundary_incomplete_before(self):
+        for day,end in [(DAY,datetime(2026,10,16,4,tzinfo=UTC)),(date(2026,11,2),datetime(2026,11,3,5,tzinfo=UTC))]:
+            for tickers,convention in EXTENDED_CLASSES:
+                for ticker in tickers:
+                    with self.subTest(ticker=ticker,day=day):
+                        self.assertEqual(contract.daily_capture_boundary(ticker,day),end)
+                        for field in contract.DAILY_FIELDS:
+                            before=end-timedelta(microseconds=1)
+                            self.assertIsNone(contract.daily_capture_payload(ticker,field,day,before))
+                            raw=contract.raw_capture_payload(ticker,field,day,before,'1d')
+                            self.assertEqual((raw['capture_state'],raw['capture_reason']),('INCOMPLETE','supported_label_day_not_elapsed'))
+                            self.assertFalse(contract.is_daily_policy_capture(raw,f'YF:{ticker}:{field}',day,before))
+                            p=contract.daily_capture_payload(ticker,field,day,end)
+                            self.assertEqual(p,{
+                                'price_contract_version':'yf_daily_capture_v1','capture_policy':'post_label_day_end_v1',
+                                'price_basis':f'YF:{ticker}:{field}','interval':'1d','obs_date':day.isoformat(),
+                                'session_convention':convention,'eligible_after':end.isoformat(),
+                                'provider_certified_final':False})
+                            raw=contract.raw_capture_payload(ticker,field,day,end,'1d')
+                            self.assertEqual(raw['capture_state'],'POLICY_ELIGIBLE')
+
+    def test_nyse_closed_labels_and_other_years_stay_unknown(self):
+        # Good Friday, MLK, July 3 observed, Thanksgiving, Christmas, Saturday,
+        # Sunday: FX/futures may trade, but NYSE-closed labels never qualify.
+        days=[date(2026,4,3),date(2026,1,19),date(2026,7,3),date(2026,11,26),date(2026,12,25),
+              date(2026,10,17),date(2026,10,18),date(2025,10,15),date(2027,1,4)]
+        for tickers,_ in EXTENDED_CLASSES:
+            for ticker in tickers:
+                for day in days:
+                    with self.subTest(ticker=ticker,day=day):
+                        later=datetime.combine(day+timedelta(days=3),datetime.min.time(),UTC)
+                        self.assertIsNone(contract.daily_capture_boundary(ticker,day))
+                        self.assertIsNone(contract.daily_capture_payload(ticker,'close',day,later))
+                        raw=contract.raw_capture_payload(ticker,'close',day,later,'1d')
+                        self.assertEqual((raw['capture_state'],raw['capture_reason']),('UNKNOWN','daily_session_policy_unknown'))
+                        self.assertIs(raw['provider_certified_final'],False)
+
+    def test_marker_round_trip_and_cross_class_provenance_rejected(self):
+        for tickers,convention in EXTENDED_CLASSES:
+            for ticker in tickers:
+                sid=f'YF:{ticker}:close'
+                with self.subTest(ticker=ticker):
+                    p=contract.daily_capture_payload(ticker,'close',DAY,LATE)
+                    self.assertTrue(contract.is_daily_policy_capture(p,sid,DAY,LATE))
+                    raw=contract.raw_capture_payload(ticker,'close',DAY,LATE,'1d')
+                    self.assertTrue(contract.is_daily_policy_capture(json.loads(json.dumps(raw)),sid,DAY,LATE))
+                    for key,value in [('session_convention','us_listed_ny_label_day_2026'),('session_convention','utc_24h'),
+                                      ('price_basis','YF:^GSPC:close'),('interval','1wk'),('obs_date','2026-10-14'),
+                                      ('eligible_after',contract.observation_end_utc(DAY).isoformat()),
+                                      ('provider_certified_final',True),('capture_state','UNKNOWN'),('capture_state','INCOMPLETE')]:
+                        bad=dict(p);bad[key]=value
+                        self.assertFalse(contract.is_daily_policy_capture(bad,sid,DAY,LATE),(key,value))
+                    self.assertFalse(contract.is_daily_policy_capture(p,sid,DAY,EARLY))
+                    self.assertFalse(contract.is_daily_policy_capture(p,'YF:^GSPC:close',DAY,LATE))
+                    self.assertFalse(contract.is_daily_policy_capture(p,f'{sid}:1wk',DAY,LATE))
+
+    def test_puller_raw_incomplete_then_qualified_and_reader_selects_it(self):
+        for tickers,convention in EXTENDED_CLASSES:
+            for ticker in tickers:
+                with self.subTest(ticker=ticker):
+                    sid=f'YF:{ticker}:close';db=MemoryDB()
+                    first=pull(db,ticker,now=EARLY,value=20.)
+                    self.assertEqual((first['rows_inserted'],first['qualified_rows_inserted']),(1,0))
+                    self.assertEqual(db.rows[0]['payload']['capture_state'],'INCOMPLETE')
+                    self.assertEqual(observations.read_daily_policy_n(db,sid,1,start=DAY),[])
+                    second=pull(db,ticker,value=21.)
+                    self.assertEqual((second['rows_inserted'],second['qualified_rows_inserted']),(1,1))
+                    self.assertEqual(db.rows[1]['payload']['session_convention'],convention)
+                    self.assertEqual(observations.read_daily_policy_n(db,sid,1,start=DAY,as_of_ts=LATE-timedelta(microseconds=1)),[])
+                    self.assertEqual([o.value for o in observations.read_daily_policy_n(db,sid,1,start=DAY)],[21.])
+                    weekly=pull(db,ticker,interval='1wk',now=LATE+timedelta(seconds=1),value=22.)
+                    self.assertEqual(weekly['qualified_rows_inserted'],0)
+                    self.assertEqual(db.rows[-1]['sid'],f'{sid}:1wk')
+                    self.assertEqual([o.value for o in observations.read_daily_policy_n(db,sid,1,start=DAY)],[21.])
+
 class PersistenceTests(unittest.TestCase):
     def test_append_preserves_unmarked_history_and_idempotency(self):
         db=MemoryDB();old={'sid':'YF:^GSPC:close','src':2,'od':DAY,'val':680.,'pulled_at':EARLY,'payload':None}
@@ -177,9 +274,9 @@ class PersistenceTests(unittest.TestCase):
         for row in db.rows[6:]:self.assertTrue(contract.is_daily_policy_capture(row['payload'],row['sid'],DAY,LATE))
 
     def test_supported_default_groups_execute_actual_puller(self):
-        for ticker in contract.US_LISTED_DAILY_TICKERS|contract.UTC_DAILY_TICKERS:
+        for ticker in contract.NY_LABEL_DAY_DAILY_TICKERS|contract.UTC_DAILY_TICKERS:
             db=MemoryDB();r=pull(db,ticker)
-            self.assertEqual(r['rows_inserted'],1,(ticker,r))
+            self.assertEqual(r['rows_inserted'],1,(ticker,r));self.assertEqual(r['qualified_rows_inserted'],1,(ticker,r))
         for ticker in contract.UNKNOWN_DAILY_TICKERS|{'AAPL'}:
             db=MemoryDB();r=pull(db,ticker)
             self.assertEqual(r['rows_inserted'],1,(ticker,r));self.assertEqual(r['qualified_rows_inserted'],0)
@@ -203,6 +300,17 @@ class PersistenceTests(unittest.TestCase):
         chosen=observations.read_daily_policy_n(db,'YF:^GSPC:close',1,start=DAY)
         self.assertEqual([o.value for o in chosen],[685.])
         self.assertEqual([o.value for o in observations.read_latest_n(db,'YF:^GSPC:close',1,source='yfinance')],[999.])
+
+    def test_diary_selects_qualified_vix_pair_after_policy_extension(self):
+        from intelligence import market_diary
+        db=MemoryDB();prior=DAY-timedelta(days=1)
+        # EARLY is after the prior label's NY midnight but inside DAY itself.
+        self.assertEqual(pull(db,'^VIX',day=prior,now=EARLY,value=17.)['qualified_rows_inserted'],1)
+        self.assertEqual(pull(db,'^VIX',now=EARLY,value=18.)['qualified_rows_inserted'],0)
+        self.assertIsNone(market_diary._fresh_pair(db,'YF:^VIX:close',DAY))
+        pull(db,'^VIX',value=18.5)
+        pair=market_diary._fresh_pair(db,'YF:^VIX:close',DAY)
+        self.assertIsNotNone(pair);self.assertEqual([o.value for o in pair],[18.5,17.])
 
     def test_diary_refuses_unmarked_current_day_and_selects_qualified_pair(self):
         from intelligence import market_diary
@@ -241,6 +349,9 @@ class RawCompatibilityTests(unittest.TestCase):
                     if ticker in contract.UNKNOWN_DAILY_TICKERS or ticker in {'AAPL','AAA','BBB'}:
                         self.assertEqual(row['payload']['capture_state'],'UNKNOWN')
                         self.assertFalse(contract.is_daily_policy_capture(row['payload'],row['sid'],DAY,LATE))
+                    elif row['sid']!=contract.SPY_CLOSE_SERIES:
+                        self.assertEqual(row['payload']['capture_state'],'POLICY_ELIGIBLE')
+                        self.assertTrue(contract.is_daily_policy_capture(row['payload'],row['sid'],DAY,LATE))
 
     def test_future_year_and_non_session_raw_available_qualification_unknown(self):
         from intelligence import market_diary

@@ -40,7 +40,7 @@ class NASAFirePuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": _FIRMS_BASE,
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "EOD",  # was DAILY: not in source_catalog_latency_class_check
         "pit_available": True,
         "revision_behavior": "NEVER",
         "trust_score": "HIGH",

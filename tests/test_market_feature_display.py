@@ -329,7 +329,9 @@ class MarketFeatureDisplayTests(unittest.TestCase):
 
     def test_integer_digit_boundaries_and_signed_fraction_default_limit(self):
         self.assertEqual(sys.get_int_max_str_digits(), 4300)
-        self.assertEqual(sysconfig.get_python_version(), "3.11")
+        # the integer-display limits above are CPython's defaults on every runtime GRID qualifies (3.11 in CI today,
+        # 3.14 for the 2026-11 upgrade); a runtime outside this set must be qualified before it is admitted here
+        self.assertIn(sysconfig.get_python_version(), ("3.11", "3.14"))
         supplied = result(N.PriceFeatureMethod.TRADE_NOTIONAL_VOLUME_VWAP)
         for exponent in (0, 4298, 4299, 4300, 5000, 10000):
             digits = "1" + "0" * exponent

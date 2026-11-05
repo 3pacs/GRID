@@ -7,6 +7,7 @@ import useRealtimeStore from './stores/realtimeStore.js';
 
 const DEFAULT_GET_CACHE_TTL_MS = 60_000;
 const PRELOAD_CONCURRENCY = 4;
+const SURFACER_TIMEOUT_MS = 30_000;
 
 // Transport snapshot only: selector/date/freshness policy validation remains
 // owned by the stored-only backend. Never infer a source binding or a cutoff.
@@ -104,8 +105,8 @@ class GRIDApi {
     }
 
     /** Public GET helper — delegates to _fetch. */
-    async get(path) {
-        return this._fetch(path);
+    async get(path, options) {
+        return this._fetch(path, options);
     }
 
     /** Public POST helper — delegates to _fetch. */
@@ -123,6 +124,7 @@ class GRIDApi {
         if (
             path.startsWith('/api/v1/auth/')
             || path.startsWith('/api/v1/gamma-watch/')
+            || path.startsWith('/api/v1/schwab/private/')
             || path.startsWith('/api/v1/realtime/')
             || path.startsWith('/api/v1/chat/')
             || path.startsWith('/api/v1/alerts')
@@ -184,6 +186,9 @@ class GRIDApi {
     }
 
     async _fetch(path, options = {}) {
+        const gammaState = path === '/api/v1/gamma-watch/state';
+        const callerAborted = () => options.signal?.aborted;
+        const cancelled = () => ({ error: true, status: 0, code: 'request_aborted' });
         const {
             gridTtlMs = DEFAULT_GET_CACHE_TTL_MS,
             gridForce = false,
@@ -211,30 +216,49 @@ class GRIDApi {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const request = (async () => {
+        // Apply to every candidates caller, including preloads, so a shared
+        // in-flight request cannot leave Surfacer waiting indefinitely.
+        const bounded = method === 'GET' && path.split('?')[0] === '/api/v1/surfacer/candidates';
+        const controller = bounded ? new AbortController() : null;
+        const callerSignal = fetchOptions.signal;
+        const forwardAbort = () => controller.abort(callerSignal.reason);
+        if (controller && callerSignal) {
+            if (callerSignal.aborted) forwardAbort();
+            else callerSignal.addEventListener('abort', forwardAbort, { once: true });
+        }
+        let timedOut = false;
+        let timer;
+        const work = (async () => {
             let response;
             try {
                 response = await fetch(`${this.baseUrl}${path}`, {
                     ...fetchOptions,
                     headers,
+                    ...(controller ? { signal: controller.signal } : {}),
                 });
             } catch (networkErr) {
                 // Network error (offline, CORS, DNS) — return error object, don't throw
                 return { error: true, status: 0, message: networkErr.message || 'Network error' };
             }
 
+            if (gammaState && callerAborted()) return cancelled();
+
             if (!response.ok) {
                 const body = await response.text().catch(() => '');
+                if (gammaState && callerAborted()) return cancelled();
                 let message = response.statusText;
+                let collectorUnavailable = false;
                 try {
                     const parsed = JSON.parse(body);
                     message = parsed.detail || parsed.message || message;
+                    collectorUnavailable = gammaState && response.status === 503
+                        && parsed.status === 'unavailable' && parsed.data === null;
                 } catch (_) {
                     if (body) message = body;
                 }
 
                 // Only treat 401 as session expiry for non-auth endpoints
-                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                if (!timedOut && response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                     this.token = null;
                     if (typeof window.dispatchEvent === 'function') {
                         window.dispatchEvent(new Event('grid:auth-expired'));
@@ -242,14 +266,16 @@ class GRIDApi {
                     window.location.hash = '#/login';
                 }
 
-                return { error: true, status: response.status, message };
+                return { error: true, status: response.status, message,
+                    ...(collectorUnavailable ? { code: 'collector_unavailable' } : {}) };
             }
 
             try {
                 const data = await response.json();
+                if (gammaState && callerAborted()) return cancelled();
                 if (method !== 'GET') {
                     this.clearCache();
-                } else if (cacheable && !data?.error) {
+                } else if (cacheable && !timedOut && !data?.error) {
                     this._cache.set(cacheKey, {
                         value: data,
                         expiresAt: Date.now() + gridTtlMs,
@@ -261,14 +287,29 @@ class GRIDApi {
             }
         })();
 
-        if (cacheable && !gridForce && !gridPreload) {
+        // Race the entire operation, including text/json consumption. An
+        // aborted transport may settle late; it must never populate the cache.
+        const request = bounded ? Promise.race([
+            work,
+            new Promise(resolve => {
+                timer = setTimeout(() => {
+                    timedOut = true;
+                    resolve({ error: true, status: 0, code: 'request_timeout', message: 'Surfacer took too long to load. Please retry.' });
+                    controller.abort();
+                }, SURFACER_TIMEOUT_MS);
+            }),
+        ]) : work;
+
+        if (cacheable && !gridForce && (!gridPreload || bounded)) {
             this._inflight.set(cacheKey, request);
         }
 
         try {
             return await request;
         } finally {
-            if (cacheable) {
+            clearTimeout(timer);
+            callerSignal?.removeEventListener('abort', forwardAbort);
+            if (cacheable && this._inflight.get(cacheKey) === request) {
                 this._inflight.delete(cacheKey);
             }
         }
@@ -357,6 +398,19 @@ class GRIDApi {
         return this._fetch('/api/v1/strategy/assign', {
             method: 'POST', body: JSON.stringify(data),
         });
+    }
+
+    // Schwab private quotes (admin role + server flag; private data, never cached here)
+    async getSchwabPrivateStatus() {
+        return this._fetch('/api/v1/schwab/private/status', { gridForce: true, gridTtlMs: 0 });
+    }
+
+    async getSchwabPrivateQuotes(symbols = ['SPY']) {
+        const list = (Array.isArray(symbols) ? symbols : [symbols])
+            .map(s => String(s ?? '').trim().toUpperCase())
+            .filter(Boolean);
+        const params = new URLSearchParams({ symbols: list.join(',') });
+        return this._fetch(`/api/v1/schwab/private/quotes?${params.toString()}`, { gridForce: true, gridTtlMs: 0 });
     }
 
     // Ten-year portfolio query

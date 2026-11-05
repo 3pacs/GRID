@@ -297,6 +297,48 @@ Not a separate service. Five pullers run inside the scheduler (started by GRID A
 
 All compute deterministic features from pure math — no external APIs needed.
 
+## yfinance captures (grid-scheduler)
+
+The yfinance-only slot is registered every day at **05:15 UTC**. It runs only
+when the previous UTC calendar day was a US trading session (Friday is
+captured on Saturday; Sunday and the day after a closed session skip). The
+domestic slots remain 13:30, 16:00, 20:00 and 22:00 UTC. Fixed **13:30 UTC is
+09:30 EDT or 08:30 EST**. These slots retain raw snapshots; none promises an
+exchange-opening print. The provider's daily-bar Open seen next morning is
+a later observation of that field, not an observation made at market open.
+
+For generic supported US-listed 2026 daily series, policy eligibility waits
+until the next New York midnight (04:00 UTC in EDT, 05:00 UTC in EST). SPY
+close preserves `spy_close_v1` / `post_utc_day_end_v1`, which waits until the
+next **UTC midnight**. Crypto's explicit UTC-day policy includes weekends;
+unsupported session policies remain UNKNOWN. Eligibility under any of these
+policies does not certify provider finality. Raw snapshots can remain
+INCOMPLETE or UNKNOWN and are distinct from qualified-close selection.
+
+Scheduled yfinance windows are computed at call time from the last completed
+session minus three calendar days. The separate SPY close-only fallback is
+bounded by the existing four-calendar-day lookback and runs only when that
+completed session is omitted from the requested window. Window inclusion
+and an aggregate SUCCESS do not attest that a qualified target close exists.
+The `YFinance_Daily` receipt preserves classification detail and appends
+`slot_utc`, `purpose`, and intended `target_session`. A separate
+`YFinance_Completed_SPY_Close` receipt reports the fallback's own outcome
+(or SKIPPED when no fallback is requested); its rows and outcome do not alter
+the main classification or freshness decision. These receipts add attribution,
+not a repair for writer refusal classification; the #853 writer counter
+repair remains a separate dependency.
+
+The **05:15 UTC slot overlaps the documented 03:30–10:30 UTC backup window**.
+Its impact requires operator assessment before activation. No schedule change
+is implied here. A release exactly 90 minutes late is allowed; a release more
+than 90 minutes late skips. This is a pre-start lateness guard, not a runtime
+budget. The scheduler does not replay every missed firing; the next eligible
+slot uses its call-time window, with no guarantee beyond the bounded lookback.
+
+## Flow Materialization (grid-scheduler)
+
+`ingestion/flow_materializer.py::sync_all` (insider_trades, congressional_trades, dark_pool_weekly, etf_flows, junction_point_readings, which the flows API reads) has other callers in source: grid-hermes's daily-intel `flow_materialize` task (held, and not running while grid-hermes is off) and a host systemd unit, `grid-flow-materializer.timer` (every 30 min, oneshot from the old checkout `/home/grid/grid_v4/grid_repo` at `5facbdf0`; documented in `docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md`, not tracked under `server_setup/`). Historical operator receipt **2026-10-19T06:53Z** reported it **LIVE** (enabled and active, last run 06:30:56Z SUCCESS). That is a dated observation, not a current-state verification; if still enabled, it keeps writing old-code, old-semantics rows every 30 minutes. `grid-scheduler` now also registers `run_flow_materialize_daily` weekdays at 23:15 UTC (after the 22:00Z domestic slot, outside the 03:30-10:30Z backup window). It has the same lateness guard as `run_daily_pulls`, a 60 s wait budget (the Hermes SQL-task budget) on a worker thread; timeout records FAILED and lets the scheduler loop continue, but does not cancel the worker or its writes. The worker retains its advisory lock until it finishes. Timeout and worker-exception receipts record unknown (`NULL`) rows because earlier per-table transactions may already have committed and a timed-out worker can keep writing. Deployed `pull_log.rows_inserted` nullability remains a schema verification gate. Uncertain advisory-lock acquisition or failed release invalidates the backend before closing its SQLAlchemy wrapper; if invalidation fails, cleanup attempts pool detachment and logs any unconfirmed discard. Normal pool return alone does not release a session advisory lock. The job also has a session-level Postgres advisory lock (`FLOW_MATERIALIZE_ADVISORY_LOCK_KEY`) held for the whole run (another holder means a "SKIPPED" receipt), and a `pull_log` receipt (`puller_name = 'FlowMaterialize_Daily'`; status, total rows, per-table counts and per-table errors in `error_message`). The lock only coordinates callers that take the same key; the old-checkout timer takes none, so **activation precondition: disable `grid-flow-materializer.timer` (`sudo systemctl disable --now grid-flow-materializer.timer`) in the same change window as the scheduler release**, (an operator step, not part of the scheduler release itself) or the two code versions will keep writing the same tables. Activation needs a grid-scheduler release/restart.
+
 ## Cron Jobs
 
 Installed via `bash scripts/setup_cron.sh`:

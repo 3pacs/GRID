@@ -67,7 +67,7 @@ class OwnedWorker:
     delegated-cgroup route; absence yields a specific pre-launch error.
     """
 
-    def __init__(self, handle, owner, clock, wait, work_end, stop_end):
+    def __init__(self, handle, owner, clock, wait, work_end, stop_end, *, stop_request=None):
         require(finite(work_end) and finite(stop_end) and work_end < stop_end, "WORKER_DEADLINES")
         require(handle.owner is owner, "WORKER_OWNER")
         self.handle, self.owner = handle, owner
@@ -77,6 +77,7 @@ class OwnedWorker:
         self.identity = handle.identity
         self.last = None
         self.stopped = False
+        self.stop_request = stop_request
 
     def check(self):
         require(self.handle is self._original_handle and self.owner is self._original_owner and self.identity==self._original_identity and self._original_handle.owner is self._original_owner and self._original_handle.identity==self._original_identity,
@@ -99,23 +100,36 @@ class OwnedWorker:
         def close_clock():require(self.check()<self.stop_end,"WORKER_CLOSE_DEADLINE")
         kill_at = self.work_end + (self.stop_end - self.work_end) / 2
         term_sent = kill_sent = False
+        cancelled = False
         code = None;primary=None
         try:
             now=self.check()
             while now < self.stop_end:
+                request=self.stop_request() if self.stop_request is not None else "NONE"
+                require(request in ("NONE","TERM","KILL"),"WORKER_STOP_REQUEST")
+                now=self.check()
+                require(now < self.stop_end,"WORKER_STOP_REQUEST_DEADLINE")
+                if request in ("TERM","KILL"):cancelled=True
+                if cancelled:
+                    # F8-2: delivery suppression precedes any close callback or
+                    # ordinary poll (LiveHandle.poll can otherwise send input).
+                    suppress=getattr(original_handle,"cancel_packet",None)
+                    if callable(suppress):require(suppress() is True,"WORKER_PACKET_CANCEL_UNVERIFIED")
+                    else:require(getattr(original_handle,"packet",None) is None,"WORKER_PACKET_CANCEL_INTERFACE")
+                    require(self.check()<self.stop_end,"WORKER_PACKET_CANCEL_DEADLINE")
                 code = self.handle.poll()
                 now = self.check()
                 require(now < self.stop_end, "WORKER_POLL_DEADLINE")
                 if code is not None:
                     require(type(code) is int, "WORKER_EXIT_TYPE")
                     break
-                if now >= self.work_end and not term_sent:
+                if (now >= self.work_end or request in ("TERM","KILL")) and not term_sent:
                     require(self.check() < self.stop_end, "WORKER_TERM_DEADLINE")
                     require(self.handle.signal("TERM") is True, "WORKER_TERM_UNVERIFIED")
                     now = self.check()
                     require(now < self.stop_end, "WORKER_TERM_CALLBACK_DEADLINE")
                     term_sent = True
-                if now >= kill_at and not kill_sent:
+                if (now >= kill_at or request == "KILL") and not kill_sent:
                     require(self.check() < self.stop_end, "WORKER_KILL_DEADLINE")
                     require(self.handle.signal("KILL") is True, "WORKER_KILL_UNVERIFIED")
                     now = self.check()
@@ -270,6 +284,7 @@ class LiveHandle(NativeOwnedHandle):
         self._capture_streams=self.streams;self._capture_selector=None;self._capture_eof=[False,False]
         self._capture_pins=[];self._capture_closers=tuple(stream.close for stream in self._capture_streams)
         self.packet=None;self.packet_offset=0;self.packet_stdin=None;self.packet_stdin_closed=False
+        self.packet_cancelled=False
         try:
             self.selector=(native_ops.selector() if native_ops is not None else selectors.DefaultSelector())
             self._capture_selector=self.selector
@@ -283,7 +298,7 @@ class LiveHandle(NativeOwnedHandle):
             finalize_owned(actions,exc);raise
 
     def queue_packet(self,data,deadline):
-        require(self.packet is None and type(data) is bytes and len(data)<=65536,
+        require(not self.packet_cancelled and self.packet is None and type(data) is bytes and len(data)<=65536,
                 "PACKET_QUEUE_SCOPE")
         require(finite(deadline) and self.clock()<deadline<=self.stop_end,"PACKET_QUEUE_DEADLINE")
         self.packet=data+b"\n";self.packet_deadline=deadline
@@ -295,6 +310,7 @@ class LiveHandle(NativeOwnedHandle):
         self._os.set_blocking(self.packet_fd,False)
 
     def deliver_packet(self):
+        if self.packet_cancelled:return  # sticky even when input close refused
         if self.packet is None or self.packet_offset==len(self.packet):return
         now=self.clock()
         require(finite(now) and now>=self.packet_last and now<self.packet_deadline,"PACKET_DELIVERY_DEADLINE")
@@ -310,6 +326,11 @@ class LiveHandle(NativeOwnedHandle):
         self.packet_offset+=written
         require(self.clock()<self.packet_deadline,"PACKET_WRITE_CALLBACK_DEADLINE")
         if self.packet_offset==len(self.packet):self.close_packet_stdin()
+
+    def cancel_packet(self):
+        self.packet_cancelled=True  # MUST precede fallible identity/close checks
+        self.close_packet_stdin()
+        return True
 
     def close_packet_stdin(self):
         if self.packet_stdin is None or self.packet_stdin_closed:return
@@ -378,6 +399,189 @@ class LiveHandle(NativeOwnedHandle):
                        ([("stdin",self.close_packet_stdin)] if self.packet_stdin is not None else []),primary)
         if primary is not None:raise primary
         return True
+
+
+def require_guardian_exports(os_api,poll_factory,libc):
+    """Availability only, not a syscall probe or native qualification flag."""
+    require(all(callable(getattr(os_api,name,None)) for name in
+                ('pidfd_open','pipe2','set_blocking','scandir','read','write','fstat')) and
+            callable(poll_factory) and callable(getattr(libc,'prctl',None)),
+            'GUARDIAN_NATIVE_EXPORTS_UNAVAILABLE')
+    return True
+
+
+class ParentDeathArm:
+    """Guardian-only latch. PIDFD/pipe ownership is established before any worker.
+
+    Only the original caller's death is observed; no caller PID is signalled.
+    The private pipe also reports orderly cancellation or caller FD loss.
+    Native construction is dormant in the offline source tests.
+    """
+    def __init__(self, parent_fd, control_fd, parent_pid, *, ops, clock, end):
+        self.ops,self.clock,self.end=ops,clock,end
+        self.parent_fd,self.control_fd=parent_fd,control_fd
+        self._original_ops,self._original_clock=ops,clock
+        self._original_binding=(parent_fd,control_fd,end)
+        self.parent_pin=ops.pin(parent_fd);self.control_pin=ops.pin(control_fd)
+        require(ops.parent_pid()==parent_pid and ops.pidfd_pid(parent_fd)==parent_pid,
+                "GUARDIAN_ORIGINAL_PARENT")
+        require(ops.is_pipe(control_fd),"GUARDIAN_CONTROL_PIPE")
+        self.last=None;self.latched="NONE";self.armed=False
+        self.check()
+        require(self.latched=="NONE","GUARDIAN_PARENT_LOST_BEFORE_ARM")
+        self.armed=True
+
+    def check(self):
+        require(self.ops is self._original_ops and same_reader(self.clock,self._original_clock) and
+                (self.parent_fd,self.control_fd,self.end)==self._original_binding,'GUARDIAN_BINDING_REBOUND')
+        now=self.clock()
+        require(finite(now) and (self.last is None or now>=self.last) and now<self.end,
+                "GUARDIAN_ORIGINAL_DEADLINE")
+        self.last=now
+        require(self.ops.pin(self.parent_fd)==self.parent_pin and
+                self.ops.pin(self.control_fd)==self.control_pin,"GUARDIAN_CHANNEL_REUSED")
+        dead,control=self.ops.events(self.parent_fd,self.control_fd)
+        require(type(dead) is bool and type(control) is bytes and len(control)<=3,
+                "GUARDIAN_EVENT_BOUND")
+        require(control in (b"",b"T",b"K",b"TK",b"EOF"),"GUARDIAN_CONTROL_VALUE")
+        if dead or control in (b"T",b"TK",b"EOF"):
+            if self.latched=="NONE":self.latched="TERM"
+        if control in (b"K",b"TK"):self.latched="KILL"
+        later=self.clock()
+        require(finite(later) and later>=now and later<self.end,"GUARDIAN_EVENT_DEADLINE")
+        self.last=later
+        require(self.ops is self._original_ops and same_reader(self.clock,self._original_clock) and
+                (self.parent_fd,self.control_fd,self.end)==self._original_binding,'GUARDIAN_BINDING_REBOUND')
+        require(self.ops.pin(self.parent_fd)==self.parent_pin and
+                self.ops.pin(self.control_fd)==self.control_pin,"GUARDIAN_CHANNEL_REUSED")
+        return self.latched
+
+
+class NativeArmIO:
+    """Read-only original-parent PIDFD plus nonblocking owned control pipe."""
+    def __init__(self):
+        import os,select,stat
+        self.os,self.select,self.stat=os,select,stat
+
+    def pin(self,fd):
+        require(type(fd) is int and fd>2,"GUARDIAN_DESCRIPTOR")
+        st=self.os.fstat(fd);return st.st_dev,st.st_ino,st.st_mode
+
+    def parent_pid(self):return self.os.getppid()
+
+    def is_pipe(self,fd):return self.stat.S_ISFIFO(self.os.fstat(fd).st_mode)
+
+    def pidfd_pid(self,fd):
+        source=self.os.open('/proc/self/fdinfo/'+str(fd),self.os.O_RDONLY|self.os.O_NOFOLLOW)
+        try:data=self.os.read(source,4097)
+        finally:self.os.close(source)
+        require(len(data)<=4096,"GUARDIAN_PIDFD_INFO_BOUND")
+        lines=[line[4:].strip() for line in data.splitlines() if line.startswith(b'Pid:')]
+        require(len(lines)==1 and lines[0].isdigit(),"GUARDIAN_PIDFD_INFO")
+        return int(lines[0])
+
+    def events(self,parent_fd,control_fd):
+        poll=self.select.poll()
+        poll.register(parent_fd,self.select.POLLIN)
+        poll.register(control_fd,self.select.POLLIN|self.select.POLLHUP)
+        events=poll.poll(0);require(len(events)<=2,"GUARDIAN_EVENT_COUNT")
+        dead=False;control=b''
+        for fd,bits in events:
+            require(fd in (parent_fd,control_fd) and not bits & (self.select.POLLERR|self.select.POLLNVAL),"GUARDIAN_EVENT_IDENTITY")
+            if fd==parent_fd:dead=True
+            else:
+                value=self.os.read(control_fd,3)
+                require(len(value)<=2,"GUARDIAN_CONTROL_BOUND")
+                control=value if value else b'EOF'
+        return dead,control
+
+
+class GuardianHandle(LiveHandle):
+    """Caller owns guardian only. TERM/KILL request worker stop; never kill guard.
+
+    The independently sessioned guardian remains alive to reap its worker when
+    this caller dies. PIDFD, both capture streams and control FD stay distinct.
+    """
+    def __init__(self,*args,control_fd,**kwargs):
+        self.control_fd=control_fd;self.control_closed=False;self.requests=set()
+        super().__init__(*args,**kwargs)
+        st=self._os.fstat(control_fd);self.control_pin=(st.st_dev,st.st_ino,st.st_mode)
+
+    def control_check(self):
+        require(not self.control_closed,"GUARDIAN_CONTROL_CLOSED")
+        st=self._os.fstat(self.control_fd)
+        require((st.st_dev,st.st_ino,st.st_mode)==self.control_pin,"GUARDIAN_CONTROL_REUSED")
+
+    def signal(self,kind):
+        self.check_fd();self.control_check()
+        require(kind in ("TERM","KILL") and self.clock()<self.stop_end,"GUARDIAN_REQUEST_SCOPE")
+        if kind not in self.requests:
+            require(self._os.write(self.control_fd,b'T' if kind=='TERM' else b'K')==1,
+                    "GUARDIAN_REQUEST_WRITE")
+            self.requests.add(kind)
+        return True
+
+    def close(self):
+        primary=None
+        try:
+            if self.child.poll() is None:
+                self.signal('TERM')
+                raise Refused('GUARDIAN_STILL_RUNNING_CLOSURE_UNKNOWN')
+        except BaseException as exc:primary=exc
+        def control_close():
+            self.control_check();self._os.close(self.control_fd);self.control_closed=True
+        def stream_close(index):
+            stream=self._capture_streams[index];fd=stream.fileno();st=self._os.fstat(fd)
+            require((fd,st.st_dev,st.st_ino,st.st_mode)==self._capture_pins[index],"CAPTURE_FD_REUSED")
+            require((self.child.stdout if index==0 else self.child.stderr) is stream,"CAPTURE_STREAM_REBOUND")
+            original=self._capture_closers[index];current=stream.close
+            require(same_reader(current,original),"CAPTURE_CLOSE_REBOUND");original()
+        def selector_close():
+            require(self.selector is self._capture_selector,"CAPTURE_SELECTOR_REBOUND")
+            self._capture_selector.close()
+        finalize_owned([("guardian control",control_close),("guardian PIDFD",lambda:NativeOwnedHandle.close(self)),
+                        ("guardian selector",selector_close),("guardian stdout",lambda:stream_close(0)),
+                        ("guardian stderr",lambda:stream_close(1))]+
+                       ([("guardian stdin",self.close_packet_stdin)] if self.packet_stdin is not None else []),primary)
+        if primary is not None:raise primary
+        return True
+
+
+def supervise_guarded_worker(runtime,context,packet_bytes,arm):
+    """Guard owns spawn→PIDFD→TERM/KILL→reap→both EOF→close, original clock.
+
+    No accounting is exported without the whole owned cleanup proof. Missing
+    evidence is terminal UNKNOWN; guardian death is not promoted to success.
+    """
+    original_clock=runtime.clock;end=None
+    handle=None;stop=None;primary=None
+    try:
+        packet=json.loads(packet_bytes);call=Call(**packet['call']);caps=Caps(**packet['caps'])
+        call.validate();caps.validate();end=call.t0+150
+        if packet.get('schema')==ATTEMPT_SCHEMA:
+            require(end<=packet['selected_workflow']['frame']['end'],"GUARDIAN_OUTER_BOUND")
+        require(arm.armed is True and arm.end==end and same_reader(arm.clock,original_clock),"GUARDIAN_ARM_REQUIRED")
+        require(arm.check()=="NONE" and original_clock()<call.t0+120,"GUARDIAN_PRESPAWN_ARM")
+        handle=runtime._spawn_worker(context,packet_bytes,arm=arm)
+        stop=OwnedWorker(handle,context,original_clock,runtime.wait,call.t0+120,end,stop_request=arm.check).finish()
+        require(original_clock()<end and stop['reaped'] is True and
+                stop['stdout_eof'] is True and stop['stderr_eof'] is True,"GUARDIAN_FINAL_PROOF")
+        require(stop['exit_code']==0 and not stop['term_sent'] and not stop['kill_sent'] and arm.check()=="NONE",
+                "GUARDIAN_CANCELLED_OR_FAILED")
+        child=json.loads(bytes(handle.output))
+        require(type(child) is dict and canonical(child.get('binding'))==canonical(packet['call']),"GUARDIAN_CHILD_BINDING")
+        return {'schema':'finra-independent-guardian-v1','attempt_packet_sha256':hashlib.sha256(packet_bytes).hexdigest(),
+                'binding':packet['call'],'stop':stop,'child_receipt':child,'native_qualified':False}
+    except BaseException as exc:
+        primary=exc
+        if handle is not None and not getattr(handle,'closed',False):
+            try:OwnedWorker(handle,context,original_clock,runtime.wait,call.t0+120,end,stop_request=lambda:'TERM').finish()
+            except BaseException:pass
+        raise
+    finally:
+        # Worker owns no context-finalization authority; guardian closes its copy.
+        def final_clock():require(finite(end) and same_reader(runtime.clock,original_clock) and original_clock()<end,"GUARDIAN_FINAL_CLOSE_DEADLINE")
+        finalize_owned([('guardian context',lambda:runtime.close(context)),('guardian final clock',final_clock)],primary)
 
 
 def verify_driver_package(package):
@@ -834,7 +1038,7 @@ def execute_worker(packet,*,producer,backend,exchange,clock,utc,synthetic=True):
     return receipt
 
 
-def bind_live(admission,expected_sha,now):
+def _bind_live_structure(admission,expected_sha,now):
     require(type(admission) is bytes and len(admission)<=65536 and type(expected_sha) is str and hashlib.sha256(admission).hexdigest()==expected_sha,"ADMISSION_BYTES_PIN")
     packet=json.loads(admission)
     require(type(packet) is dict,"FINRA_ADMISSION_SCHEMA")
@@ -843,13 +1047,30 @@ def bind_live(admission,expected_sha,now):
     require(set(packet)==keys and packet["schema"] in ("finra-occurrence-admission-v1",ATTEMPT_SCHEMA) and packet["status"]=="ADMITTED","FINRA_ADMISSION_SCHEMA")
     if selected:validate_attempt_packet(packet,now,None)
     call=Call(**packet["call"]);caps=Caps(**packet["caps"]);call.validate();caps.validate();validate_db_plan(packet["db_plan"])
-    require(finite(now) and call.t0<=now<call.t0+5,"FRESH_ACTUAL_T0")
     runtime=packet["runtime"]
     require(type(runtime) is dict and set(runtime)=={"python","python_sha256","driver","driver_sha256","producer","driver_package","cgroup","receipt_root"},"RUNTIME_BINDINGS_REQUIRED")
     require(all(type(runtime[k]) is str and runtime[k].startswith("/") for k in ("python","driver","producer")),"RUNTIME_PATHS")
     require(all(type(runtime[k]) is str and re.fullmatch(r"[0-9a-f]{64}",runtime[k]) is not None for k in ("python_sha256","driver_sha256")),"RUNTIME_HASHES")
     # Canonical immutable packet, typed dataclass binding checked again in child.
     bound=canonical(packet).encode();require(len(bound)<=65536,"PACKET_CAP")
+    return bound,call,caps
+
+
+def bind_live(admission,expected_sha,now):
+    bound,call,caps=_bind_live_structure(admission,expected_sha,now)
+    require(finite(now) and call.t0<=now<call.t0+5,"FRESH_ACTUAL_T0")
+    return bound,call,caps
+
+
+def bind_guardian_packet(admission,expected_sha,now,*,origin,arm):
+    """Continuation of an already consumed original entry, never a new t0."""
+    bound,call,caps=_bind_live_structure(admission,expected_sha,now)
+    require(type(origin) is float and finite(origin) and call.t0==origin and
+            type(arm) is ParentDeathArm and arm.armed is True and arm.end==origin+150,
+            "GUARDIAN_CONTINUATION_BOUNDARY")
+    require(arm.check()=="NONE" and finite(now) and origin<=now<=arm.last<origin+120,
+            "GUARDIAN_CONTINUATION_DEADLINE")
+    require(bound==admission,"GUARDIAN_CONTINUATION_CANONICAL")
     return bound,call,caps
 
 
@@ -872,6 +1093,7 @@ class NativeRuntime:
 
     def preflight(self,packet):
         import os,sys
+        import ctypes,select
         from pathlib import Path
         r=packet["runtime"]
         require(bool(os.environ.get(WRITE_ENV)) and bool(os.environ.get(READ_ENV)),"DEPENDENCY_NAMED_DSN_ENV_MISSING")
@@ -884,6 +1106,9 @@ class NativeRuntime:
         require(callable(getattr(os,"pidfd_open",None)),"DEPENDENCY_OS_PIDFD_OPEN")
         import signal
         require(callable(getattr(signal,"pidfd_send_signal",None)),"DEPENDENCY_SIGNAL_PIDFD_SEND")
+        # Actual default dependency preparation precedes every marker/spawn.
+        # This loads process libc but does not exercise prctl or infer support.
+        require_guardian_exports(os,select.poll,ctypes.CDLL(None,use_errno=True))
         verify_driver_package(r["driver_package"])
         cg=DelegatedCgroup(r["cgroup"])
         try:
@@ -920,22 +1145,132 @@ class NativeRuntime:
         return True
 
     def launch(self,context,packet_bytes):
+        """Caller launches only its independent guard, never the external worker.
+
+        Full packet delivery is deferred until the guard PIDFD/capture/control
+        handle is installed. Guard observes original parent death independently.
+        """
         api=self.native();os=api.os
         packet=json.loads(packet_bytes);r=packet["runtime"]
         self.verify_receipt_fd(context)
         # Consumption is exclusive and occurs once; never retry this call ID.
-        marker=os.open(packet["call"]["call_id"]+".spent",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,
-                       0o600,dir_fd=context["receipt_fd"])
-        os.close(marker)
+        marker_data=canonical({'schema':'finra-guardian-attempt-marker-v1',
+                              'packet_sha256':hashlib.sha256(packet_bytes).hexdigest(),
+                              'call_id':packet['call']['call_id'],'original_parent':os.getpid()}).encode()
+        self._exclusive_guard_marker(context,packet['call']['call_id']+'.spent',marker_data)
+        parent_fd=read_fd=write_fd=None;child=None;handle=None;primary=None
+        pins={}
+        def close_own(fd):
+            st=os.fstat(fd)
+            require((st.st_dev,st.st_ino,st.st_mode)==pins[fd],"GUARDIAN_ALLOCATION_REUSED")
+            os.close(fd)
+        try:
+            parent_fd=os.pidfd_open(os.getpid(),0)
+            st=os.fstat(parent_fd);pins[parent_fd]=(st.st_dev,st.st_ino,st.st_mode)
+            read_fd,write_fd=os.pipe2(os.O_CLOEXEC|os.O_NONBLOCK)
+            for fd in (read_fd,write_fd):
+                st=os.fstat(fd);pins[fd]=(st.st_dev,st.st_ino,st.st_mode)
+            argv=(r['python'],'-I','-S','-B',r['driver'],'--guardian',
+                  '--packet-sha256',hashlib.sha256(packet_bytes).hexdigest(),
+                  '--parent-pidfd',str(parent_fd),'--control-fd',str(read_fd),
+                  '--parent-pid',str(os.getpid()),'--guardian-t0',repr(packet['call']['t0']))
+            env=self.worker_environment()
+            require(packet['call']['t0']<=self.clock()<packet['call']['t0']+120,'GUARDIAN_LAUNCH_ORIGINAL_DEADLINE')
+            child=api.Popen(argv,stdin=-1,stdout=-1,stderr=-1,env=env,
+                            close_fds=True,pass_fds=(parent_fd,read_fd),start_new_session=True)
+            # Guardian is OUTSIDE pids.max=1 worker leaf. No worker can exist
+            # before this handle is acquired and the full hash-bound packet sent.
+            handle=GuardianHandle(child,context,Caps().receipt,self.clock,packet['call']['t0']+150,
+                                  control_fd=write_fd)
+            write_fd=None
+            close_own(parent_fd);parent_fd=None
+            close_own(read_fd);read_fd=None
+            handle.queue_packet(packet_bytes,packet['call']['t0']+120)
+            return handle
+        except BaseException as exc:
+            primary=exc
+            if handle is not None:
+                finalize_owned([('unreturned guardian',handle.close)],primary)
+            elif child is not None:
+                # No packet was queued: closing stdin leaves guard unable to
+                # create a worker. Never raw-PID signal a possibly armed guard.
+                finalize_owned([('unreturned guardian stdin',child.stdin.close)],primary)
+                try:child.wait(timeout=max(0.001,packet['call']['t0']+150-self.clock()))
+                except BaseException:pass  # cleanup remains UNKNOWN, not reaped proof
+                finalize_owned([('unreturned guardian stdout',child.stdout.close),
+                                ('unreturned guardian stderr',child.stderr.close)],primary)
+            raise
+        finally:
+            finalize_owned([('guardian allocation',lambda fd=fd:close_own(fd))
+                            for fd in (parent_fd,read_fd,write_fd) if fd is not None],primary)
+
+    def worker_environment(self):
+        os=self.native().os
         env={"LANG":"C.UTF-8","TZ":"UTC","GRID_GIT_SINK_DISABLED":"1","PYTHONDONTWRITEBYTECODE":"1"}
         for name in ("GRID_FINRA_OCCURRENCE_WRITE_DSN","GRID_FINRA_OCCURRENCE_READ_DSN"):
             require(bool(os.environ.get(name)),"DEPENDENCY_NAMED_DSN_ENV_MISSING")
             env[name]=os.environ[name]
+        return env
+
+    def _exclusive_guard_marker(self,context,name,data):
+        """No overwrite/reissue: failed/partial marker remains consumed."""
+        require(type(name) is str and re.fullmatch(r'[0-9a-f-]{36}\.(?:guardian\.)?spent',name) is not None and
+                type(data) is bytes and 0<len(data)<=4096,'GUARDIAN_MARKER_SCOPE')
+        self.verify_receipt_fd(context);os=self.native().os
+        fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=context['receipt_fd'])
+        try:
+            offset=0
+            while offset<len(data):
+                count=os.write(fd,data[offset:]);require(type(count) is int and 0<count<=len(data)-offset,'GUARDIAN_MARKER_PROGRESS')
+                offset+=count
+            os.fsync(fd)
+        finally:os.close(fd)
+
+    def _claim_guardian(self,context,packet_bytes,parent_pid):
+        """Bind to consumed caller marker, then exclusively consume guard entry."""
+        import stat
+        os=self.native().os;packet=json.loads(packet_bytes);name=packet['call']['call_id']
+        expected=canonical({'schema':'finra-guardian-attempt-marker-v1',
+                            'packet_sha256':hashlib.sha256(packet_bytes).hexdigest(),
+                            'call_id':name,'original_parent':parent_pid}).encode()
+        self.verify_receipt_fd(context)
+        fd=os.open(name+'.spent',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=context['receipt_fd'])
+        try:
+            st=os.fstat(fd)
+            require(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1 and
+                    st.st_mode & 0o777==0o600 and st.st_size==len(expected),'GUARDIAN_CALLER_MARKER_METADATA')
+            data=os.read(fd,4097)
+            later=os.fstat(fd)
+            require(data==expected and (st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns)==
+                    (later.st_dev,later.st_ino,later.st_size,later.st_mtime_ns,later.st_ctime_ns),'GUARDIAN_CALLER_MARKER_BINDING')
+        finally:os.close(fd)
+        self.verify_receipt_fd(context)
+        self._exclusive_guard_marker(context,name+'.guardian.spent',expected)
+
+    def _spawn_worker(self,context,packet_bytes,*,arm):
+        """Guardian-private route; no marker or new timer is created here."""
+        api=self.native();os=api.os
+        packet=json.loads(packet_bytes);r=packet['runtime']
+        require(type(arm) is ParentDeathArm and arm.armed and arm.check()=='NONE',"WORKER_REQUIRES_ARMED_GUARDIAN")
+        require(same_reader(arm.clock,self.clock) and arm.end==packet['call']['t0']+150,
+                "WORKER_GUARDIAN_ORIGINAL_BOUND")
+        self.verify_receipt_fd(context)
+        guardian_pid=os.getpid()
         def limits_and_join():
+            # Secondary failsafe if GUARDIAN itself dies. It cannot establish
+            # reap/EOF after such death, which remains UNKNOWN to the caller.
+            import ctypes,signal
+            require(os.getppid()==guardian_pid,"WORKER_GUARDIAN_PARENT_BEFORE_ARM")
+            libc=ctypes.CDLL(None,use_errno=True)
+            require(libc.prctl(1,signal.SIGKILL,0,0,0)==0,"WORKER_PDEATHSIG_UNSUPPORTED")
+            require(os.getppid()==guardian_pid,"WORKER_GUARDIAN_PARENT_AFTER_ARM")
             context["cgroup"].child_join()
             api.setrlimit(api.RLIMIT_AS,(512*1024*1024,)*2)
             api.setrlimit(api.RLIMIT_CPU,(30,30));api.setrlimit(api.RLIMIT_CORE,(0,0))
         argv=(r["python"],"-I","-S","-B",r["driver"],"--worker","--packet-sha256",hashlib.sha256(packet_bytes).hexdigest())
+        env=self.worker_environment()
+        require(arm.check()=='NONE' and same_reader(arm.clock,self.clock) and self.clock()<packet['call']['t0']+120,
+                'WORKER_GUARDIAN_FINAL_ARM')
         child=api.Popen(argv,stdin=-1,stdout=-1,stderr=-1,
                                env=env,close_fds=True,pass_fds=(context["cgroup"].fd,),
                                preexec_fn=limits_and_join,start_new_session=True)
@@ -1036,6 +1371,17 @@ def run_live(admission=None,expected_sha=None,*,runtime=None,**unsupported):
         require(stop["exit_code"]==0,"WORKER_EXIT_NOT_ZERO")
         if stop["exit_code"]==0:
             child=json.loads(bytes(handle.output))
+            if type(handle) is GuardianHandle:
+                require(type(child) is dict and set(child)=={'schema','attempt_packet_sha256','binding','stop','child_receipt','native_qualified'} and
+                        child['schema']=='finra-independent-guardian-v1' and child['attempt_packet_sha256']==expected_sha and
+                        canonical(child['binding'])==canonical(asdict(call)) and child['native_qualified'] is False,
+                        'GUARDIAN_RECEIPT_IDENTITY')
+                guardian_stop=child['stop']
+                require(type(guardian_stop) is dict and type(guardian_stop.get('exit_code')) is int and guardian_stop['exit_code']==0 and
+                        guardian_stop.get('reaped') is True and guardian_stop.get('stdout_eof') is True and guardian_stop.get('stderr_eof') is True and
+                        guardian_stop.get('term_sent') is False and guardian_stop.get('kill_sent') is False,'GUARDIAN_WORKER_CLOSURE')
+                receipt['guardian_stop']=guardian_stop
+                child=child['child_receipt']
             require(type(child) is dict and child.get("schema")==("finra-occurrence-worker-v2" if selected else "finra-occurrence-worker-v1") and
                     type(child.get("binding")) is dict and child.get("base_tree")==BASE_TREE,
                     "CHILD_RECEIPT_BINDING")
@@ -1098,6 +1444,75 @@ def run_live(admission=None,expected_sha=None,*,runtime=None,**unsupported):
     return receipt
 
 
+def guardian_main(expected_sha,parent_fd,control_fd,parent_pid,origin):
+    """Independent process entry. No worker until parent/channel/packet arm.
+
+    Admission semantics and cgroup remain unchanged. Reads and event polling
+    are nonblocking; original attempt times cover guardian bootstrap as well.
+    Native code is supplied but NOT exercised/qualified by offline source work.
+    """
+    import os,sys,time,signal
+    runtime=NativeRuntime();ops=NativeArmIO()
+    require(type(origin) is float and finite(origin) and origin<=runtime.clock()<origin+120,
+            'GUARDIAN_BOOTSTRAP_ORIGINAL_TIME')
+    arm=ParentDeathArm(parent_fd,control_fd,parent_pid,ops=ops,clock=runtime.clock,end=origin+150)
+    def cancel(_number,_frame):
+        if arm.latched=='NONE':arm.latched='TERM'
+    signal.signal(signal.SIGINT,cancel);signal.signal(signal.SIGTERM,cancel)
+    signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+    api=runtime.native()
+    api.setrlimit(api.RLIMIT_AS,(512*1024*1024,)*2)
+    api.setrlimit(api.RLIMIT_CPU,(30,30));api.setrlimit(api.RLIMIT_CORE,(0,0))
+    require(arm.check()=='NONE','GUARDIAN_LOST_DURING_OWN_LIMITS')
+    # Real task list is bounded and single-threaded; preexec is not used from
+    # an arbitrary multithreaded caller. This new guardian is the sole spawner.
+    with os.scandir('/proc/self/task') as entries:
+        first=next(entries,None);second=next(entries,None)
+    require(first is not None and second is None,'GUARDIAN_SINGLE_THREAD')
+    os.set_blocking(0,False);data=bytearray();context=None
+    try:
+        while True:
+            require(arm.check()=='NONE' and runtime.clock()<origin+120,'GUARDIAN_PACKET_CANCELLED_OR_LATE')
+            try:chunk=os.read(0,min(4096,65538-len(data)))
+            except BlockingIOError:runtime.wait(0.01);continue
+            require(type(chunk) is bytes and len(chunk)>0,'GUARDIAN_PACKET_EOF')
+            data.extend(chunk);require(len(data)<=65537,'GUARDIAN_PACKET_BOUND')
+            if b'\n' in chunk:break
+        require(data.endswith(b'\n') and data.count(b'\n')==1 and hashlib.sha256(data[:-1]).hexdigest()==expected_sha,
+                'GUARDIAN_PACKET_PIN')
+        raw=bytes(data[:-1]);bound,call,caps=bind_guardian_packet(raw,expected_sha,runtime.clock(),origin=origin,arm=arm)
+        require(call.t0==origin and canonical(json.loads(bound)).encode()==raw,'GUARDIAN_ORIGINAL_PACKET')
+        require(arm.check()=='NONE','GUARDIAN_PARENT_LOST_BEFORE_PREFLIGHT')
+        context=runtime.preflight(json.loads(bound))
+        require(arm.check()=='NONE','GUARDIAN_PARENT_LOST_DURING_PREFLIGHT')
+        runtime._claim_guardian(context,bound,parent_pid)
+        require(arm.check()=='NONE','GUARDIAN_PARENT_LOST_DURING_CLAIM')
+        worker_context=context;context=None  # transfer exactly one context owner
+        frame=supervise_guarded_worker(runtime,worker_context,bound,arm)
+        output=canonical(exported(frame)).encode()+b'\n'
+        require(len(output)<=caps.receipt and runtime.clock()<origin+150,'GUARDIAN_OUTPUT_BOUND')
+        os.set_blocking(1,False);offset=0
+        while offset<len(output):
+            require(runtime.clock()<origin+150,'GUARDIAN_OUTPUT_DEADLINE')
+            try:written=os.write(1,output[offset:offset+4096])
+            except BlockingIOError:runtime.wait(0.01);continue
+            require(type(written) is int and written>0,'GUARDIAN_OUTPUT_PROGRESS');offset+=written
+            require(runtime.clock()<origin+150,'GUARDIAN_OUTPUT_FINAL_DEADLINE')
+        return 0
+    except BaseException:
+        # No raw exception/DSN/body string and no synthetic zero-write receipt.
+        return 1
+    finally:
+        actions=[]
+        if context is not None:actions.append(('guardian preworker context',lambda:runtime.close(context)))
+        for fd,pin in ((parent_fd,arm.parent_pin),(control_fd,arm.control_pin)):
+            def close(fd=fd,pin=pin):
+                require(ops.pin(fd)==pin,'GUARDIAN_FINAL_CHANNEL_REUSED');os.close(fd)
+            actions.append(('guardian channel',close))
+        try:finalize_owned(actions)
+        except BaseException:pass  # no qualified closure is exported on this path
+
+
 def worker_main(expected_sha):
     import os,sys,time,importlib
     from pathlib import Path
@@ -1127,7 +1542,18 @@ def cli(argv=None,*,read_bytes=None,runtime=None,emit=print,worker_entry=None):
     parser.add_argument("--selected-workflow",action="store_true")
     parser.add_argument("--admission");parser.add_argument("--admission-sha256")
     parser.add_argument("--worker",action="store_true");parser.add_argument("--packet-sha256")
+    parser.add_argument('--guardian',action='store_true')
+    parser.add_argument('--parent-pidfd',type=int);parser.add_argument('--control-fd',type=int)
+    parser.add_argument('--parent-pid',type=int);parser.add_argument('--guardian-t0',type=float)
     args=parser.parse_args(argv)
+    guardian_fields=(args.parent_pidfd,args.control_fd,args.parent_pid,args.guardian_t0)
+    if args.guardian:
+        require(not args.worker and not args.selected_workflow and args.admission is None and args.admission_sha256 is None and
+                type(args.packet_sha256) is str and re.fullmatch(r'[a-f0-9]{64}',args.packet_sha256) is not None and
+                all(type(v) is int and v>2 for v in guardian_fields[:3]) and
+                len({args.parent_pidfd,args.control_fd})==2 and finite(args.guardian_t0),'GUARDIAN_ARGV')
+        return guardian_main(args.packet_sha256,*guardian_fields)
+    require(all(v is None for v in guardian_fields),'UNEXPECTED_GUARDIAN_FIELDS')
     if args.worker:
         require(not args.selected_workflow and args.admission is None and args.admission_sha256 is None and type(args.packet_sha256) is str and re.fullmatch(r"[a-f0-9]{64}",args.packet_sha256) is not None,"WORKER_ARGV")
         (worker_entry or worker_main)(args.packet_sha256);return 0

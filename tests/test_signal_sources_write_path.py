@@ -34,7 +34,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-import requests
 
 
 # ---------------------------------------------------------------------------
@@ -204,48 +203,40 @@ def test_smart_money_write_path_does_not_drop_raw_on_signal_failure(
     assert inserted is True
 
 
-def test_smart_money_finviz_gone_returns_empty_without_error(
+def test_smart_money_finviz_retired_fetch_refuses_before_network(
     smart_money_puller,
     monkeypatch,
 ):
-    """A removed Finviz page should be marked unavailable and return zero rows."""
-
-    class _Resp:
-        status_code = 404
-        text = ""
-        reason = "Not Found"
-
-        def raise_for_status(self):
-            raise requests.HTTPError("not found", response=self)
-
+    """The retired private fetch must refuse without an HTTP probe or DB write."""
+    network = MagicMock(side_effect=AssertionError("retired Finviz HTTP reached"))
     monkeypatch.setattr(
-        "ingestion.altdata.smart_money.requests.get",
-        lambda *args, **kwargs: _Resp(),
+        "ingestion.altdata.smart_money.requests.get", network,
     )
+    monkeypatch.setattr("requests.sessions.Session.request", network)
 
-    assert smart_money_puller._fetch_finviz_insiders() == []
-    assert smart_money_puller._finviz_source_unavailable is True
-    assert smart_money_puller._finviz_source_unavailable_reason == "HTTP 404"
+    with pytest.raises(RuntimeError, match="Finviz retired.*SEC Form-4"):
+        smart_money_puller._fetch_finviz_insiders()
+    network.assert_not_called()
+    assert smart_money_puller.engine.mock_calls == []
 
 
-def test_smart_money_finviz_gone_status_is_skipped(
+def test_smart_money_finviz_retired_compatibility_is_skipped_without_work(
     smart_money_puller,
     monkeypatch,
 ):
-    """A gone Finviz endpoint should return SKIPPED rather than FAILED."""
-
-    class _Resp:
-        status_code = 200
-        text = "<html><title>410 Gone</title><body>page not found</body></html>"
-        reason = "OK"
-
-        def raise_for_status(self):
-            return None
-
+    """Old callers get honest SKIPPED without fetching or persisting any source."""
+    network = MagicMock(side_effect=AssertionError("retired Finviz HTTP reached"))
     monkeypatch.setattr(
-        "ingestion.altdata.smart_money.requests.get",
-        lambda *args, **kwargs: _Resp(),
+        "ingestion.altdata.smart_money.requests.get", network,
     )
+    monkeypatch.setattr("requests.sessions.Session.request", network)
+    fetch = MagicMock(side_effect=AssertionError("retired provider fetch reached"))
+    monkeypatch.setattr(smart_money_puller, "_fetch_finviz_insiders", fetch)
+    writers = []
+    for name in ("_store_signal", "_insert_raw", "_emit_signal_sources"):
+        writer = MagicMock(side_effect=AssertionError("retired source write reached"))
+        monkeypatch.setattr(smart_money_puller, name, writer)
+        writers.append(writer)
 
     result = smart_money_puller.pull_finviz_insiders()
 
@@ -253,7 +244,13 @@ def test_smart_money_finviz_gone_status_is_skipped(
     assert result["status"] == "SKIPPED"
     assert result["signals_found"] == 0
     assert result["rows_inserted"] == 0
-    assert "gone" in result["reason"]
+    assert "Finviz retired" in result["reason"]
+    assert "separate SEC Form-4 source" in result["reason"]
+    fetch.assert_not_called()
+    network.assert_not_called()
+    for writer in writers:
+        writer.assert_not_called()
+    assert smart_money_puller.engine.mock_calls == []
 
 
 # ---------------------------------------------------------------------------
