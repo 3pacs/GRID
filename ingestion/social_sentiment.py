@@ -5,10 +5,9 @@ Reads public social media for sentiment signals around tracked
 tickers, themes, and product launches. No API keys or logins:
 
 - Reddit hot posts: one combined RSS feed (``/r/a+b+c/hot.rss``) for every
-  tracked board. The ``.json`` listing GRID used to read returns 403 from
-  grid-svr; RSS answers, but unauthenticated RSS is limited to about one
-  request per minute per IP (measured 2026-11-05: ``x-ratelimit-remaining:
-  0.0`` after a single call, 429 until reset), so all boards go in one call.
+  tracked board, through ``ingestion/altdata/reddit_rss.py`` (the ``.json``
+  listing returns 403 from grid-svr; RSS allows about one request per minute
+  per IP, which that module shares across pullers).
 - Reddit-wide ticker mention counts from ApeWisdom's free public API
   (https://apewisdom.io/api/): mentions, upvotes and rank now vs 24h ago,
   aggregated across the stock and crypto subreddits.
@@ -40,12 +39,13 @@ import html
 import json
 import re
 import time
-import xml.etree.ElementTree as ET  # stdlib expat caps entity expansion (3.14)
 from datetime import date
 from typing import Any
 
 import requests
 from loguru import logger as log
+
+from ingestion.altdata import reddit_rss
 
 
 # Tracked subreddits by theme
@@ -56,12 +56,10 @@ SUBREDDITS = {
     "macro": ["economics", "finance", "personalfinance"],
 }
 
-REDDIT_RSS_URL = "https://www.reddit.com/r/{subs}/hot.rss"
 REDDIT_RSS_LIMIT = 100  # posts in the combined feed, across all boards
 BLUESKY_SEARCH_URL = "https://api.bsky.app/xrpc/app.bsky.feed.searchPosts"
 APEWISDOM_URL = "https://apewisdom.io/api/v1.0/filter/{filter}/page/1"
 APEWISDOM_FILTERS = {"stocks": "all-stocks", "crypto": "all-crypto"}
-_ATOM = "{http://www.w3.org/2005/Atom}"
 
 # Bluesky search terms
 BLUESKY_TERMS = [
@@ -93,23 +91,6 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-_MD_BODY = re.compile(r'<div class="md">(.*?)</div>', re.DOTALL)
-_TAG = re.compile(r"<[^>]+>")
-
-
-def _reddit_body_text(content_html: str, max_chars: int = 2000) -> str:
-    """Self-post body from an RSS entry; link posts and the footer give ''.
-
-    Reddit wraps the body in ``<div class="md">``; the rest of the entry is the
-    "submitted by /u/... [link] [comments]" footer, which is not post text.
-    """
-    match = _MD_BODY.search(content_html or "")
-    if not match:
-        return ""
-    text = html.unescape(_TAG.sub(" ", match.group(1)))
-    return " ".join(text.split())[:max_chars]
 
 
 class SocialSentimentPuller:
@@ -278,23 +259,20 @@ class SocialSentimentPuller:
         RSS carries title, body and publish time but no vote or comment counts;
         ApeWisdom's per-ticker upvotes cover engagement instead.
         """
-        url = REDDIT_RSS_URL.format(subs="+".join(subreddits))
-        resp = self._session.get(url, params={"limit": REDDIT_RSS_LIMIT}, timeout=15)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
+        entries = reddit_rss.fetch_feed(
+            f"/r/{'+'.join(subreddits)}/hot.rss", {"limit": REDDIT_RSS_LIMIT},
+            session=self._session,
+        )
         canonical = {s.lower(): s for s in subreddits}
-
         posts: dict[str, list[dict]] = {}
-        for entry in root.iter(f"{_ATOM}entry"):
-            category = entry.find(f"{_ATOM}category")
-            term = category.get("term", "") if category is not None else ""
-            sub = canonical.get(term.lower(), term)
+        for entry in entries:
+            sub = canonical.get(entry.subreddit.lower(), entry.subreddit)
             posts.setdefault(sub, []).append({
-                "title": entry.findtext(f"{_ATOM}title", ""),
-                "text": _reddit_body_text(entry.findtext(f"{_ATOM}content", "")),
-                "created": entry.findtext(f"{_ATOM}published", ""),
+                "title": entry.title,
+                "text": entry.body[:2000],
+                "created": entry.published.isoformat() if entry.published else "",
                 "subreddit": sub,
-                "id": entry.findtext(f"{_ATOM}id", ""),
+                "id": entry.id,
             })
         return posts
 
