@@ -543,7 +543,11 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # scheduler edits are gdelt freq_h 0.083 -> 1, earnings_calendar
         # timeout_s 120 -> 300, and retirement hold_reasons on
         # baltic_exchange and dune. Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','01f537c327b5bf6a401b694c82057ece0dde9e61c7a810ea9e547c80ad98dc51')]:
+        # SCHED re-pinned 01f537c3 -> 805ae5d9 (2026-11-05): the only scheduler
+        # edit is the finra_short_volume registry entry's mod/cls, now the
+        # aggregating subclass ingestion.altdata.finra_short_volume_agg.
+        # FINRAShortVolumeAggPuller. The pinned producer is unchanged.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','805ae5d9c1ff2a7c4b970a0358c2c71038301339aed862bac7d66724913bcf8b')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
