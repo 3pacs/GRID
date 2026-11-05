@@ -44,6 +44,27 @@ def _verified_gex_profile(profile: dict[str, Any]) -> bool:
     return valid_spy_gex_profile(profile, _utc_day())
 
 
+def _chain_age_fields(profile: dict[str, Any]) -> dict[str, Any]:
+    """Read cutoff, age and marker the opt-in latest-completed read attaches."""
+    return {
+        "chain_age_seconds": profile.get("chain_age_seconds"),
+        "chain_read_cutoff": profile.get("chain_read_cutoff"),
+        "default_resolution": profile.get("default_resolution"),
+    }
+
+
+def _read_profile(engine_gex: Any, ticker: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only /gex and /walls: no day and no batch -> latest completed capture.
+
+    Only these two read surfaces opt in. Every other caller of
+    ``compute_gex_profile`` (regime, vanna-charm, flow narrative, chat, risk,
+    recommendations, briefing) keeps the unchanged UTC-day default.
+    """
+    if not args:
+        return engine_gex.compute_latest_completed_gex_profile(ticker)
+    return engine_gex.compute_gex_profile(ticker, **args)
+
+
 def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
     return {key: profile[key] for key in (
         "estimated", "basis", "spot_source", "spot_basis", "spot_obs_date",
@@ -102,7 +123,7 @@ def get_overview() -> dict[str, Any]:
 # ── GET /gex/{ticker} ───────────────────────────────────────────────
 
 def _replay_args(snap_date: date | None, capture_batch_id: str | None) -> dict[str, Any] | None:
-    """Default: latest complete batch today. Replay needs an explicit day+batch."""
+    """Default ({}): latest completed capture (read routes only). Replay needs an explicit day+batch."""
     if capture_batch_id is None:
         return {"snap_date": snap_date} if snap_date is not None else {}
     if snap_date is None:
@@ -113,7 +134,12 @@ def _replay_args(snap_date: date | None, capture_batch_id: str | None) -> dict[s
 @router.get("/gex/{ticker}")
 async def get_gex(
     ticker: str,
-    snap_date: date | None = Query(None, description="Chain day (default: today UTC)"),
+    snap_date: date | None = Query(
+        None,
+        description=("Chain day (default: latest completed capture on or before the "
+                     "last NYSE trading day; the response then carries "
+                     "default_resolution and chain_age_seconds)"),
+    ),
     capture_batch_id: str | None = Query(
         None, min_length=1, max_length=64,
         description="Replay this registered capture batch instead of the day's latest",
@@ -123,15 +149,18 @@ async def get_gex(
 
     Returns gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall,
     dealer_delta, vanna_exposure, charm_exposure, regime, profile curve,
-    and per_strike breakdown. By default the latest complete capture batch is
-    used; ``snap_date`` + ``capture_batch_id`` replay an earlier batch.
+    and per_strike breakdown. By default the latest completed capture on or
+    before the last NYSE trading day is used (never the bare UTC calendar day,
+    which has no chain until ~22:20Z) and the response carries
+    ``default_resolution: "last_completed_capture"`` plus ``chain_age_seconds``;
+    ``snap_date`` + ``capture_batch_id`` replay an earlier batch.
     """
     args = _replay_args(snap_date, capture_batch_id)
     if args is None:
         return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper(), **args)
+        result = _read_profile(engine_gex, ticker.upper(), args)
         if capture_batch_id is not None and isinstance(result, dict):
             result = {**result, "replayed_batch": True}
         return result
@@ -238,7 +267,12 @@ async def get_regime() -> dict[str, Any]:
 @router.get("/walls/{ticker}")
 async def get_walls(
     ticker: str,
-    snap_date: date | None = Query(None, description="Chain day (default: today UTC)"),
+    snap_date: date | None = Query(
+        None,
+        description=("Chain day (default: latest completed capture on or before the "
+                     "last NYSE trading day; the response then carries "
+                     "default_resolution and chain_age_seconds)"),
+    ),
     capture_batch_id: str | None = Query(
         None, min_length=1, max_length=64,
         description="Replay this registered capture batch instead of the day's latest",
@@ -247,18 +281,29 @@ async def get_walls(
     """Support/resistance levels derived from gamma walls.
 
     Returns put_wall (support), call_wall (resistance), gamma_flip,
-    and current spot price, from the latest complete capture batch unless
-    ``snap_date`` + ``capture_batch_id`` name an earlier one to replay.
+    and current spot price, from the latest completed capture on or before the
+    last NYSE trading day unless ``snap_date`` + ``capture_batch_id`` name an
+    earlier one to replay. A profile the engine could not build keeps its
+    ``error``/``reason`` instead of reading as all-``None`` walls.
     """
     args = _replay_args(snap_date, capture_batch_id)
     if args is None:
         return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper(), **args)
+        result = _read_profile(engine_gex, ticker.upper(), args)
+        if result.get("error"):
+            return {
+                **{k: result[k] for k in ("available", "status", "reason", "source")
+                   if k in result},
+                "error": result["error"],
+                "ticker": ticker.upper(),
+                **_chain_age_fields(result),
+            }
         return {
             "ticker": ticker.upper(),
             "replayed_batch": capture_batch_id is not None,
+            **_chain_age_fields(result),
             "chain_snap_date": result.get("chain_snap_date"),
             "chain_batch_id": result.get("chain_batch_id"),
             "chain_capture_ordinal": result.get("chain_capture_ordinal"),

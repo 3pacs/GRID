@@ -162,6 +162,16 @@ class PullContext:
                     p=self._puller_name, r=self._rows_inserted,
                 )
 
+        # pull_log.error_message is durable and readable from the API: keep credentials out of it (a requests
+        # HTTPError message carries the full request URL, query-string API key included).
+        if error_msg:
+            try:
+                from server_log.sanitizer import scrub_secrets
+
+                error_msg = scrub_secrets(str(error_msg))
+            except Exception:
+                pass  # scrubbing must never block the pull_log write
+
         # ── Sanity checks on row counts ───────────────────────────────
         self._sanity_check_row_counts(status)
 

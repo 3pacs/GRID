@@ -36,7 +36,7 @@ class ICIJPuller(BasePuller):
     SOURCE_CONFIG = {
         "base_url": "https://offshoreleaks.icij.org",
         "cost_tier": "FREE",
-        "latency_class": "BATCH",
+        "latency_class": "MONTHLY",  # was BATCH (not in source_catalog_latency_class_check); monthly re-download
         "pit_available": False,
         "revision_behavior": "NEVER",
         "trust_score": "HIGH",

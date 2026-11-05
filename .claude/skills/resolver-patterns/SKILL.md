@@ -1,6 +1,6 @@
 ---
 name: resolver-patterns
-description: Resolve raw_series into resolved_series in GRID. Use when adding new data sources or tickers, debugging why data isn't appearing in resolved_series, adding entity mappings (SEED_MAPPINGS), optimizing resolver performance for bulk loads, or understanding the PIT data pipeline.
+description: Resolve raw_series into resolved_series in GRID. Use when resolving data into resolved_series, mapping new tickers or sources (SEED_MAPPINGS), or optimizing resolver throughput; for Tiingo API calls, news, and backfills use tiingo-integration.
 ---
 
 # resolver-patterns

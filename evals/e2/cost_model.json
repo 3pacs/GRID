@@ -1,0 +1,37 @@
+{
+  "version": "e2-costs-v1",
+  "units": "basis points of notional, charged on EACH side of a round trip (entry and exit)",
+  "formula": "net_return = side * (exit_price / entry_price - 1) - 2 * (half_spread_bps + commission_bps + slippage_bps) / 10000",
+  "principle": "Conservative by construction: every component is set at or above what a small account would pay at the touch on a normal day. A rule that only works under a cheaper model does not count as working.",
+  "classes": {
+    "us_equity_etf_large": {
+      "half_spread_bps": 0.5,
+      "commission_bps": 0.5,
+      "slippage_bps": 2.0,
+      "examples": ["SPY", "QQQ", "IWM", "DIA", "sector SPDRs"],
+      "basis": "SPY trades at a 1-cent spread on a ~$700 price (~0.14 bp, half ~0.07 bp); 0.5 bp is ~7x that. Commission 0.5 bp stands in for zero-commission broker fees plus SEC/FINRA TAF sell-side fees. Slippage 2 bp covers market-on-trigger fills off 5-minute bar closes and level touches, which a resting order would not get at the printed level."
+    },
+    "us_equity_large_cap": {
+      "half_spread_bps": 2.5,
+      "commission_bps": 0.5,
+      "slippage_bps": 5.0,
+      "examples": ["S&P 500 single names"],
+      "basis": "Typical large-cap quoted spreads are 1-5 bp; half-spread taken at the top of that range. Slippage 5 bp for close-to-close execution through MOC/near-close orders."
+    },
+    "us_equity_small_cap": {
+      "half_spread_bps": 15.0,
+      "commission_bps": 0.5,
+      "slippage_bps": 15.0,
+      "examples": ["Russell 2000 / sub-$2B names, including most VS1 sector-panel issuers"],
+      "basis": "Small caps routinely quote 10-50 bp spreads; 15 bp half-spread plus 15 bp impact is a deliberate penalty so thin-name edges must clear ~60 bp round trip."
+    },
+    "crypto_major_spot": {
+      "half_spread_bps": 10.0,
+      "commission_bps": 25.0,
+      "slippage_bps": 5.0,
+      "examples": ["BTC", "ETH spot on a retail venue"],
+      "basis": "Retail crypto venues charge 10-60 bp taker fees or an equivalent embedded spread markup; 25 bp commission plus a 10 bp half-spread is the conservative middle of that band for an account of GRID's size."
+    },
+    "not_tradable": null
+  }
+}

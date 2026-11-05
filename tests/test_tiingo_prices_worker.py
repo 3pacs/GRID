@@ -231,9 +231,12 @@ def test_insert_rows_is_one_set_based_statement_with_the_same_dedupe_rule() -> N
         {"sid": "YF:AAPL:open", "src": 524, "od": date(2026, 9, 29), "val": 3.0},
     ]
     assert puller._insert_rows(rows) == 2
-    conn.execute.assert_called_once()
-    sql = " ".join(str(conn.execute.call_args[0][0]).split())
-    params = conn.execute.call_args[0][1]
+    # One per-ticker advisory lock (both AAPL fields share it), then the one INSERT.
+    assert conn.execute.call_count == 2
+    lock_call, insert_call = conn.execute.call_args_list
+    assert "pg_advisory_xact_lock" in str(lock_call[0][0])
+    sql = " ".join(str(insert_call[0][0]).split())
+    params = insert_call[0][1]
     assert "unnest(" in sql and "DISTINCT ON (u.sid, u.od)" in sql
     assert ("WHERE NOT EXISTS ( SELECT 1 FROM raw_series r WHERE r.series_id = v.sid "
             "AND r.source_id = :src AND r.obs_date = v.od AND r.pull_status = 'SUCCESS')") in sql
@@ -250,8 +253,65 @@ def test_insert_rows_chunks_large_histories(monkeypatch) -> None:
     conn.execute.return_value.rowcount = 1
     rows = [{"sid": "YF:X:close", "od": date(2026, 9, d), "val": float(d)} for d in range(1, 6)]
     assert puller._insert_rows(rows) == 3
-    assert conn.execute.call_count == 3
+    assert conn.execute.call_count == 4  # 1 lock + 3 chunks
     puller.engine.begin.assert_called_once()  # one transaction
+
+
+# ── per-ticker write lock (duplicate prevention, 2026-10-01) ─────────────
+
+
+def test_insert_rows_takes_the_ticker_lock_inside_the_txn_before_any_insert() -> None:
+    from ingestion.base import _stable_lock_key
+
+    puller = _bare_puller()
+    begin_cm = puller.engine.begin.return_value
+    conn = begin_cm.__enter__.return_value
+    conn.execute.return_value.rowcount = 1
+    events: list[str] = []
+    begin_cm.__enter__.side_effect = lambda: events.append("begin") or conn
+    begin_cm.__exit__.side_effect = lambda *a: events.append("commit") or False
+
+    def _execute(stmt, params=None):
+        events.append("lock" if "pg_advisory_xact_lock" in str(stmt) else "insert")
+        return MagicMock(rowcount=1)
+
+    conn.execute.side_effect = _execute
+    rows = [{"sid": f"YF:AAPL:{f}", "od": date(2026, 9, 29), "val": 1.0}
+            for f in ("open", "close", "adj_close")]
+    puller._insert_rows(rows)
+    assert events == ["begin", "lock", "insert", "commit"]
+    lock_params = conn.execute.call_args_list[0][0][1]
+    assert lock_params == {"k": _stable_lock_key("TIINGO", "prices", "YF:AAPL")}
+
+
+def test_ticker_lock_keys_are_per_ticker_and_taken_in_sorted_order() -> None:
+    from ingestion.base import _stable_lock_key
+
+    puller = _bare_puller()
+    conn = MagicMock()
+    puller._lock_tickers(conn, ["YF:MSFT:close", "YF:AAPL:open", "YF:MSFT:open",
+                                "YF:BRK-B:close", "YF:AAPL:close"])
+    keys = [c[0][1]["k"] for c in conn.execute.call_args_list]
+    # One lock per ticker, sorted by ticker so overlapping batches can't deadlock.
+    assert keys == [_stable_lock_key("TIINGO", "prices", t)
+                    for t in ("YF:AAPL", "YF:BRK-B", "YF:MSFT")]
+
+
+def test_pull_all_and_pull_ticker_paths_also_go_through_the_locked_insert(monkeypatch) -> None:
+    # The run-level lock only covers pull_incremental; the per-ticker lock
+    # lives in _insert_rows so the unlocked explicit paths get it too.
+    resp = MagicMock(status_code=200, headers={})
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = [{"date": "2026-09-29T00:00:00.000Z", "close": 1.5}]
+    monkeypatch.setattr(tp.requests, "get", MagicMock(return_value=resp))
+    monkeypatch.setattr(tp.time, "sleep", lambda _s: None)
+    puller = _bare_puller()
+    locked: list[list[str]] = []
+    puller._lock_tickers = lambda conn, sids: locked.append(sorted(set(sids)))
+    conn = puller.engine.begin.return_value.__enter__.return_value
+    conn.execute.return_value.rowcount = 1
+    puller.pull_all(["AAPL", "MSFT"], start_date="2026-09-20")
+    assert locked == [["YF:AAPL:close"], ["YF:MSFT:close"]]
 
 
 # ── grid-scheduler wiring ────────────────────────────────────────────────

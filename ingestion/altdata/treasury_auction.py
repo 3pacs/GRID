@@ -45,6 +45,36 @@ TD_BASE = "https://www.treasurydirect.gov/TA_WS/securities/auctioned"
 _LOOKBACK_DAYS = 60
 _AUCTION_TYPES = {"Bill", "Note", "Bond", "TIPS", "FRN"}
 
+# The feed dropped ``auctionDate`` and ``term`` around 2026-10-16 (last rows
+# stored for auctions on 2026-10-15; every run since logged "0 auctions").
+# Probed from grid-svr 2026-11-04: the auction day is now
+# ``competitiveAuctionCloseDate`` (it matches the stored obs_date of every
+# pre-change auction, e.g. 912797WF0 2026-08-12 and 2026-10-15) and the term
+# is ``securityTerm``. Legacy keys are still read first.
+_AUCTION_DATE_KEYS: tuple[str, ...] = ("auctionDate", "competitiveAuctionCloseDate")
+
+
+def _auction_date_str(row: dict[str, Any]) -> str:
+    """Return the auction-day string from either feed shape ("" if absent)."""
+    for key in _AUCTION_DATE_KEYS:
+        value = row.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _share_pct(part: Any, parts: list[Any]) -> float | None:
+    """``part`` as a percentage of ``sum(parts)``; None when not computable."""
+    try:
+        values = [float(v) for v in parts]
+        numerator = float(part)
+    except (TypeError, ValueError):
+        return None
+    total = sum(values)
+    if total <= 0:
+        return None
+    return 100.0 * numerator / total
+
 
 @dataclass
 class AuctionRow:
@@ -97,7 +127,7 @@ class TreasuryAuctionPuller(BasePuller):
                 continue
             if row.get("type") not in _AUCTION_TYPES:
                 continue
-            auction_date_str = row.get("auctionDate") or ""
+            auction_date_str = _auction_date_str(row)
             try:
                 auction_date = date.fromisoformat(auction_date_str[:10])
             except ValueError:
@@ -115,10 +145,10 @@ class TreasuryAuctionPuller(BasePuller):
         if not cusip:
             return []
         try:
-            auction_date = date.fromisoformat(row.get("auctionDate", "")[:10])
+            auction_date = date.fromisoformat(_auction_date_str(row)[:10])
         except ValueError:
             return []
-        term = str(row.get("term") or "")
+        term = str(row.get("term") or row.get("securityTerm") or "")
 
         results: list[AuctionRow] = []
 
@@ -138,10 +168,30 @@ class TreasuryAuctionPuller(BasePuller):
             ))
 
         _add("bid_to_cover", row.get("bidToCoverRatio"))
-        _add("stop_yield", row.get("highYield") or row.get("highDiscountRate"))
-        _add("indirect_pct", row.get("indirectBidderAcceptedPct"))
-        _add("direct_pct", row.get("directBidderAcceptedPct"))
-        _add("primary_dealer_pct", row.get("primaryDealerAcceptedPct"))
+        # Coupons publish highYield; bills now publish highRate (the stored
+        # bill stop_yield values equal it, e.g. 912797WF0 4.05 on 2026-10-15).
+        # FRN highDiscountMargin is a spread, not a yield -- not mapped.
+        _add(
+            "stop_yield",
+            row.get("highYield") or row.get("highDiscountRate") or row.get("highRate"),
+        )
+
+        # Bidder shares: legacy pre-computed percentages when present,
+        # otherwise each class's competitive par awarded as a percentage of
+        # all three classes' competitive awards (indirect + direct + primary
+        # dealers == subtotalCompetitiveParAwardedInsideOfOfferingAmount).
+        awarded = [
+            row.get("indirectBiddersCompetitiveParAwarded"),
+            row.get("directBiddersCompetitiveParAwarded"),
+            row.get("primaryDealersCompetitiveParAwarded"),
+        ]
+        for metric, legacy_key, part in (
+            ("indirect_pct", "indirectBidderAcceptedPct", awarded[0]),
+            ("direct_pct", "directBidderAcceptedPct", awarded[1]),
+            ("primary_dealer_pct", "primaryDealerAcceptedPct", awarded[2]),
+        ):
+            legacy = row.get(legacy_key)
+            _add(metric, legacy if legacy not in (None, "") else _share_pct(part, awarded))
 
         # Tail computation: stop_yield - when_issued (not directly in feed)
         # so we leave it as None here; it's computed downstream by joining

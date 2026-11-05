@@ -63,6 +63,17 @@ _BACKGROUND_BATCH_SIZE = BACKGROUND_BATCH_SIZE
 _BACKGROUND_REFILL_COOLDOWN = BACKGROUND_REFILL_COOLDOWN
 _MAX_HISTORY = MAX_HISTORY
 
+# Task types that keep the model's thinking phase. Every other task asks the
+# llama.cpp client for enable_thinking=False: the REASON/ORACLE server on
+# grid-svr is Qwen3.8-27B with --reasoning-effort xhigh on ONE 8192-token
+# slot, and on 2026-11-03/04 its thinking consumed the whole max_tokens
+# (finish=length, ~20k reasoning chars, no content) on 203 queue tasks/day —
+# earnings_preview, deep_forensic, sp500_deep_profile and company_analysis
+# all ended "LLM returned None" — while holding the slot ~100s per task.
+# Interactive, high-stakes reviews keep thinking; the client still clamps
+# them to the context. Clients without the keyword are unaffected.
+THINKING_TASK_TYPES: frozenset[str] = frozenset({"trade_review", "user_chat"})
+
 
 class LLMTaskQueue:
     """Priority queue that keeps the onboard LLM busy around the clock.
@@ -230,10 +241,16 @@ class LLMTaskQueue:
                 messages.append({"role": "system", "content": system_msg})
             messages.append({"role": "user", "content": task.prompt})
 
+            from llm.router import supported_chat_kwargs
+
             result = client.chat(
                 messages,
                 temperature=0.3 if task.priority <= 2 else 0.5,
                 num_predict=2000,
+                **supported_chat_kwargs(
+                    client,
+                    enable_thinking=task.task_type in THINKING_TASK_TYPES,
+                ),
             )
             if result is not None:
                 task.result = result

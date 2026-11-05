@@ -10,12 +10,149 @@ from __future__ import annotations
 
 import difflib
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+SELECTED_SOURCE_NAMES = {
+    "fx_rates": "yfinance",
+    "ag_commodity_futures": "YFINANCE_COMMODITY_FUTURES",
+    "finra_short_volume": "FINRA_SHORT_VOLUME",
+    "sec_ftd": "SEC_FTD",
+    "nyfed_gscpi": "NYFED_GSCPI",
+    "baltic_exchange": "Baltic_Exchange",
+    "quiverquant": "quiverquant",
+}
+SELECTED_ROW_CAP = 4096
+SELECTED_QUERY_TIMEOUT_MS = 5000
+
+
+def validate_selected_request(
+    selections: list[dict] | None, *, as_of: datetime, start_date: date,
+    vintage_policy: str = "LATEST_AS_OF",
+) -> dict:
+    """Validate a finite caller-declared selection without reading or registering.
+
+    Names and IDs are expectations, not evidence that a registry row exists.
+    The selected mapper verifies them against separately supplied registry rows.
+    """
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be an aware datetime")
+    cutoff = as_of.astimezone(timezone.utc)
+    if type(start_date) is not date or not 0 <= (cutoff.date() - start_date).days <= 251:
+        raise ValueError("observation range must contain 1..252 UTC dates")
+    if type(vintage_policy) is not str or vintage_policy not in ("FIRST_RELEASE", "LATEST_AS_OF"):
+        raise ValueError("invalid vintage_policy")
+    if selections is None:
+        selections = []
+    if type(selections) is not list or len(selections) > 7:
+        raise ValueError("at most seven selections are allowed")
+    allowed = {"source_key", "scope", "ticker_or_cusip", "series_id",
+               "expected_source_name", "feature_name", "feature_id", "freshness_policy"}
+    scopes = {"ticker", "cusip", "global", "currency", "contract", "index"}
+    selected = {}
+    feature_ids = set()
+    for original in selections:
+        if type(original) is not dict or set(original) - allowed:
+            raise ValueError("invalid selection fields")
+        row = dict(original)
+        key = row.get("source_key")
+        if type(key) is not str or key not in SELECTED_SOURCE_NAMES or key in selected:
+            raise ValueError("source_key must be unique and closed")
+        for field in ("scope", "ticker_or_cusip", "series_id", "expected_source_name", "feature_name"):
+            value = row.get(field)
+            if value is not None and (type(value) is not str or not value or
+                                      value != value.strip() or len(value) > 128 or
+                                      any(ord(c) < 32 for c in value)):
+                raise ValueError("invalid selection string")
+        if row.get("scope") is not None and row["scope"] not in scopes:
+            raise ValueError("invalid selection scope")
+        if row.get("expected_source_name") not in (None, SELECTED_SOURCE_NAMES[key]):
+            raise ValueError("source name does not match source_key")
+        fid = row.get("feature_id")
+        if fid is not None and (type(fid) is not int or not 0 < fid <= 2**63 - 1):
+            raise ValueError("feature_id must be a positive integer")
+        if (fid is None) != (row.get("feature_name") is None):
+            raise ValueError("feature name and ID must be supplied together")
+        if fid is not None:
+            if fid in feature_ids:
+                raise ValueError("selected feature bindings must be distinct")
+            feature_ids.add(fid)
+        if all(row.get(f) is not None for f in
+               ("series_id", "expected_source_name", "feature_name", "feature_id")):
+            if row.get("scope") not in scopes:
+                raise ValueError("bound selection needs an explicit scope")
+            if row["scope"] != "global" and row.get("ticker_or_cusip") is None:
+                raise ValueError("bound scope needs an explicit identity")
+        sid = row.get("series_id")
+        patterns = {
+            "fx_rates": r"FX:[A-Z]{3}:close",
+            "ag_commodity_futures": r"YF:[A-Z0-9^=._-]{1,32}:close",
+            "finra_short_volume": r"finra:short_volume:[A-Z0-9.-]{1,32}",
+            "sec_ftd": r"sec:ftd_balance:[A-Z0-9]{9}",
+            "nyfed_gscpi": r"NYFED:gscpi",
+            "baltic_exchange": r"baltic\.(?:bdi|capesize|panamax|supramax|handysize)",
+        }
+        if sid is not None and key in patterns and not re.fullmatch(patterns[key], sid):
+            raise ValueError("series namespace does not match source_key")
+        expected_scopes = {"fx_rates": "currency", "ag_commodity_futures": "contract",
+                           "finra_short_volume": "ticker", "sec_ftd": "cusip",
+                           "nyfed_gscpi": "global", "baltic_exchange": "index",
+                           "quiverquant": "ticker"}
+        if row.get("scope") is not None and row["scope"] != expected_scopes[key]:
+            raise ValueError("scope does not match source family")
+        if sid is not None and row.get("ticker_or_cusip") is not None:
+            identities = {"fx_rates": sid.split(":")[1] if key == "fx_rates" else None,
+                          "ag_commodity_futures": sid.split(":")[1] if key == "ag_commodity_futures" else None,
+                          "finra_short_volume": sid.rsplit(":", 1)[-1],
+                          "sec_ftd": sid.rsplit(":", 1)[-1],
+                          "baltic_exchange": sid.rsplit(".", 1)[-1].upper()}
+            if key in identities and identities[key] != row["ticker_or_cusip"]:
+                raise ValueError("declared identity does not match selected series")
+        policy = row.get("freshness_policy")
+        if policy is not None:
+            if (type(policy) is not dict or set(policy) != {"max_age_days"} or
+                    type(policy["max_age_days"]) is not int or
+                    not 0 <= policy["max_age_days"] <= 252):
+                raise ValueError("invalid declared freshness policy")
+            row["freshness_policy"] = dict(policy)
+        selected[key] = row
+    return {"selections": [selected.get(k, {"source_key": k}) for k in SELECTED_SOURCE_NAMES],
+            "as_of": cutoff, "start_date": start_date, "vintage_policy": vintage_policy}
+
+
+def series_family(series_id: str) -> str:
+    """Prefix a raw series_id is grouped under in miss reports.
+
+    The text before the first ``:`` or ``.`` (``YF:SPY:close`` -> ``YF``,
+    ``hf_news.bloomberg`` -> ``hf_news``). A feature-shaped id with neither
+    separator groups by its first underscore segment (``gdelt_opec_tone`` ->
+    ``gdelt``) so producer output stays visible in the report; an id with no
+    separator at all (FRED-style ``T10Y2Y``) is ``bare``. Grouping only;
+    never used for resolution.
+    """
+    sid = series_id.strip()
+    cut = min((i for i in (sid.find(":"), sid.find(".")) if i > 0), default=-1)
+    if cut > 0:
+        return sid[:cut]
+    under = sid.find("_")
+    return sid[:under] if under > 0 else "bare"
+
+
+def is_feature_shaped(series_id: str) -> bool:
+    """True for ids written with a feature name rather than a feed separator.
+
+    Producers such as the scheduled GDELT theme queries write
+    ``series_id = feature`` (``gdelt_opec_tone``); such an id without an
+    entity_map entry is producer output the feature channel cannot carry,
+    not evidence of an entity-grained raw feed with its own readers.
+    """
+    sid = series_id.strip()
+    return ":" not in sid and "." not in sid
 
 
 def canonical_feature_name(series_id: str) -> str:
@@ -80,7 +217,9 @@ SEED_MAPPINGS: dict[str, str] = {
     "DGS1": "yc_1y",
     "DGS2": "yc_2y",
     "DGS5": "yc_5y",
-    "DGS10": "yc_10y",
+    # Live 10Y feeds the registered treasury_10y (owner decision 2026-11-04);
+    # yc_10y was never registered, so its live rows were dropped.
+    "DGS10": "treasury_10y",
     "DGS30": "yc_30y",
     "DFII10": "yc_real_10y",
     "UMCSENT": "umich_sentiment",
@@ -117,6 +256,9 @@ SEED_MAPPINGS: dict[str, str] = {
     # ── Yield curve series (stored with feature name as series_id) ──────────
     "yc_1y": "yc_1y",
     "yc_5y": "yc_5y",
+    # yield_curve_full writes the 10Y as raw "yc_10y" (live); it resolves into
+    # treasury_10y, which the dashboard/canvas/regime/thesis code reads.
+    "yc_10y": "treasury_10y",
     "yc_30y": "yc_30y",
     "yc_real_10y": "yc_real_10y",
     "yc_breakeven_10y": "yc_breakeven_10y",
@@ -387,11 +529,22 @@ SEED_MAPPINGS: dict[str, str] = {
 # V2 mappings for international, trade, physical, and alternative data
 NEW_MAPPINGS_V2: dict[str, str] = {
     # BLS (raw BLS series IDs from bls.py)
-    "CES0000000001": "bls_nonfarm_payrolls",
-    "LNS14000000": "bls_unemployment_rate",
+    # Same series as FRED PAYEMS / UNRATE (2026-09: 159044 / 4.2 from both),
+    # so they resolve into the existing features as a second source with
+    # conflict checking (owner decision 2026-11-04), not as duplicate
+    # bls_* features.
+    "CES0000000001": "nonfarm_payrolls",
+    "LNS14000000": "unemployment_rate",
     "CUUR0000SA0": "bls_cpi_u_all",
     "PRS85006092": "bls_nonfarm_productivity",
     "JTS00000000JOL": "bls_jolts_openings",
+    # The id above is not a BLS series ("Series does not exist"), so JOLTS was
+    # never stored. ingestion/bls.py now pulls the real one (2026-11-04):
+    # total nonfarm job openings, SA level -- 2026 M09 = 7523. The old key is
+    # kept; it is harmless.
+    "JTS000000000000000JOL": "bls_jolts_openings",
+    # FRED republishes the same JOLTS level (thousands, SA).
+    "JTSJOL": "bls_jolts_openings",
 
     # ECB
     "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
@@ -580,15 +733,20 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # "ANALYST:sol_analyst_hold": "sol_analyst_hold",      # DEAD: no matching feature in registry
 
     # ── Fed liquidity equation (fed_liquidity.py) ────────────────────────
-    "RRPONTSYD": "overnight_reverse_repo",
+    # Owner decision 2026-11-04: the live series feed the registered names
+    # that stopped updating on 2026-04-02, instead of new duplicate names.
+    "RRPONTSYD": "reverse_repo_usage",
     "WSHOSHO": "fed_treasury_holdings",
     "SWPT": "central_bank_liq_swaps",
-    "H8B1023NCBCMG": "bank_reserves_at_fed",
-    "TOTRESNS": "total_reserves",
+    # H8B1023NCBCMG is monthly C&I-loan growth, not bank reserves (FRED
+    # metadata); TOTRESNS is total reserves. Owner decision 2026-11-04.
+    "H8B1023NCBCMG": "ci_loans_growth",
+    "TOTRESNS": "bank_reserves_at_fed",
     "COMPUTED:fed_net_liquidity": "fed_net_liquidity",
     "COMPUTED:fed_net_liquidity_change_1w": "fed_net_liquidity_change_1w",
     "COMPUTED:fed_net_liquidity_change_1m": "fed_net_liquidity_change_1m",
-    "COMPUTED:reverse_repo_pct_of_peak": "reverse_repo_pct_of_peak",
+    # All-history peak; repo_market's window-peak copy was dropped.
+    "COMPUTED:reverse_repo_pct_of_peak": "rrp_as_pct_of_peak",
     "COMPUTED:tga_drawdown": "tga_drawdown",
 
     # ── ETF flow proxies (institutional_flows.py) ──────────────────────
@@ -691,6 +849,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CBOE:VIX": "vix_spot",
     "CBOE:VIX3M": "vix3m_spot",
     "CBOE:VIX9D": "vix9d_spot",
+    # COR3M replaces Cboe's discontinued ICJ (correlation_index, last obs
+    # 2021-11-19); registered by migrations/versions/ghost_features_20261104.py.
+    "CBOE:COR3M": "implied_correlation_3m",
     "CBOE:SKEW": "skew_index",
 
     # Binance crypto (bulk ZIP)
@@ -722,6 +883,29 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CG:solana:volume": "sol_total_volume",
     "CG:bittensor:close": "tao_chain_market_cap",
     "CG:bittensor:volume": "tao_chain_total_volume",
+
+    # CoinGecko live USD spot quotes (ingestion/coingecko.py writes
+    # CG:<coingecko id>:usd to raw_series; E1-V6). These are the *_usd_full
+    # features the puller used to write into resolved_series directly, now
+    # reached through the resolver. The value is the FIRST spot quote GRID
+    # stored for that UTC quote day -- not a daily close, whatever the legacy
+    # feature_registry description says. BTC, ETH and SOL are deliberately
+    # NOT mapped: btc_usd_full / eth_usd_full / sol_usd_full are fed by the
+    # yfinance daily close (YF:BTC-USD:close, YF:ETH-USD:close,
+    # YF:SOL-USD:close above), and a spot quote from a second series would race
+    # it for the same (feature, obs_date, vintage_date) key (the resolver
+    # inserts ON CONFLICT DO NOTHING, so first writer wins).
+    # tests/test_e1_registry_writer_fixes.py keeps every CG target single-fed.
+    # CG:bitcoin:usd stays in raw_series (thesis_scorer reads it directly).
+    **{f"CG:{cg_id}:usd": f"{ticker}_usd_full" for ticker, cg_id in (
+        ("bnb", "binancecoin"), ("xrp", "ripple"),
+        ("tao", "bittensor"), ("doge", "dogecoin"), ("ada", "cardano"),
+        ("avax", "avalanche-2"), ("link", "chainlink"), ("dot", "polkadot"),
+        ("matic", "matic-network"), ("uni", "uniswap"), ("aave", "aave"),
+        ("mkr", "maker"), ("snx", "havven"), ("crv", "curve-dao-token"),
+        ("shib", "shiba-inu"), ("ltc", "litecoin"), ("atom", "cosmos"),
+        ("near", "near"),
+    )},
 
     # DeFi (DeFiLlama + DexScreener)
     "DEFILLAMA:solana_dex_volume": "dex_sol_volume_24h",
@@ -766,6 +950,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # BCB Brazil (puller writes feature name as series_id)
     "brazil_selic_rate": "brazil_selic_rate",
+    # BCB code 1 / 3545 under their correct names (owner decision 2026-11-04).
+    "brazil_usd_brl_fx": "brazil_usd_brl",
+    "brazil_fx_reserves": "brazil_fx_reserves",
     "brazil_ipca_yoy": "brazil_ipca_yoy",
     "brazil_credit_growth": "brazil_credit_growth",
 
@@ -811,7 +998,7 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # Yield curve puller (stores as treasury_Xy, sofr, reverse_repo)
     "sofr": "sofr_rate",
     "reverse_repo": "reverse_repo_usage",
-    "treasury_10y": "yc_10y",
+    "treasury_10y": "treasury_10y",
     "treasury_2y": "yc_2y",
     "treasury_30y": "yc_30y",
 
@@ -934,6 +1121,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 # that migrations 0062/0063 had to clean up: a mapping that looks resolved
 # while silently dropping every row.
 
+# (series_id, feature_name) pairs already warned about as "Mapping exists but
+# feature not in registry" in this process. Module-level because the resolver
+# constructs a new EntityMap per cycle; see EntityMap.get_feature_id.
+_WARNED_MAPPED_MISSES: set[tuple[str, str]] = set()
+
 # Sentinel for the pattern cache.  A cached *miss* is stored as None, so
 # "absent from the cache" needs a value None cannot collide with.
 _PATTERN_CACHE_MISS: object = object()
@@ -1044,6 +1236,38 @@ class EntityMap:
             including misses (None), so a repeated miss costs no lookup.
     """
 
+    @classmethod
+    def for_selected_bindings(cls, selections: list[dict], registry_rows: list[dict]) -> EntityMap:
+        """An inert mapper over at most seven independently read registry rows.
+
+        No constructor, database, static-map mutation, fuzzy fallback, registration
+        or freshness query runs here. A caller expectation earns a mapping only
+        when both its name and ID match an actual supplied registry row.
+        """
+        if type(selections) is not list or len(selections) > 7:
+            raise ValueError("selected mapping exceeds seven selectors")
+        if type(registry_rows) is not list or len(registry_rows) > 7:
+            raise ValueError("selected registry exceeds seven rows")
+        registry = {}
+        names = set()
+        for row in registry_rows:
+            if (type(row) is not dict or type(row.get("id")) is not int or
+                    row["id"] <= 0 or type(row.get("name")) is not str or
+                    row["id"] in registry or row["name"] in names):
+                raise ValueError("ambiguous selected registry")
+            registry[row["id"]] = row["name"]
+            names.add(row["name"])
+        obj = cls.__new__(cls)
+        obj._selected_bindings = {}
+        for row in selections:
+            sid = row.get("series_id")
+            fid = row.get("feature_id")
+            if sid is not None and fid is not None and registry.get(fid) == row.get("feature_name"):
+                if sid in obj._selected_bindings and obj._selected_bindings[sid] != fid:
+                    raise ValueError("one series cannot bind two features")
+                obj._selected_bindings[sid] = fid
+        return obj
+
     def __init__(self, db_engine: Engine) -> None:
         """Initialise the entity mapper.
 
@@ -1060,6 +1284,12 @@ class EntityMap:
         # series_ids already warned about, and how many lookups each one
         # swallowed. Reported in bulk by missing_feature_report().
         self._miss_counts: dict[str, int] = {}
+        # series_id -> mapped feature name, for the misses whose static
+        # mapping targets a name absent from feature_registry. Those are the
+        # only misses that drop feature-channel rows; a series_id with no
+        # mapping at all is, in the bulk, an entity-grained feed whose
+        # consumers read raw_series directly (see missing_feature_report).
+        self._mapped_misses: dict[str, str] = {}
         # series_id -> resolved id, or None for a confirmed miss.  Misses are
         # cached too: this path misses constantly by design.
         self._pattern_cache: dict[str, int | None] = {}
@@ -1120,6 +1350,8 @@ class EntityMap:
         Returns:
             int: The feature_registry.id if a mapping exists, None otherwise.
         """
+        if hasattr(self, "_selected_bindings"):
+            return self._selected_bindings.get(series_id)
         feature_name = SEED_MAPPINGS.get(series_id)
         if feature_name is None:
             pattern_id = self._resolve_by_pattern(series_id)
@@ -1140,14 +1372,31 @@ class EntityMap:
                 self._unregistered_features.add(feature_name)
 
         if feature_id is None:
+            self._mapped_misses[series_id] = feature_name
             if self._record_miss(series_id) == 1:
-                log.warning(
-                    "Mapping exists ({sid} -> {fn}) but feature not in "
-                    "registry — further misses for this series_id are "
-                    "counted, not logged",
-                    sid=series_id,
-                    fn=feature_name,
-                )
+                # The resolver builds a fresh EntityMap every cycle, so a
+                # per-instance "once" was once per cycle: 498 identical lines
+                # a day on grid-hermes (2026-11-04) for 47 names that stay
+                # unregistered until a migration lands. Warn once per process
+                # per (series_id, name); the resolver's per-run summary still
+                # names every missing feature, so nothing goes silent.
+                key = (series_id, feature_name)
+                if key in _WARNED_MAPPED_MISSES:
+                    log.debug(
+                        "Mapping exists ({sid} -> {fn}) but feature not in "
+                        "registry (already warned this process)",
+                        sid=series_id, fn=feature_name,
+                    )
+                else:
+                    _WARNED_MAPPED_MISSES.add(key)
+                    log.warning(
+                        "Mapping exists ({sid} -> {fn}) but feature not in "
+                        "registry — further misses for this series_id are "
+                        "counted, not logged (once per process; the resolver "
+                        "summary names it every run)",
+                        sid=series_id,
+                        fn=feature_name,
+                    )
             return feature_id
 
         # Warn if the resolved feature has no recent data (cached check)
@@ -1237,21 +1486,86 @@ class EntityMap:
         Callers that run a bulk pass (the resolver) log this once at the end
         instead of one warning per group.
 
+        Two populations hide inside one count. A series_id whose static
+        mapping targets a name absent from feature_registry is pulled and then
+        dropped at resolution until the feature is registered. A series_id
+        with no mapping at all is reported in two shapes: ids with a feed
+        separator (``YF:<ticker>:<field>``, ``LEGISLATION:*``, ``edgar:8k:*``,
+        ``EARNINGS:*`` ...), whose traced consumers read raw_series directly,
+        which is not proof for untraced consumers or of freshness; and
+        feature-shaped ids (``gdelt_opec_tone``), which are producer output
+        with no mapping, so their resolution, consumers and materialization
+        are unknown and need a mapping or registration decision. Absence of a
+        mapping is not evidence of harmlessness. grid-hermes 2026-10-22/23
+        logged "7211 unmapped series_id(s)" per cycle: 1
+        mapped-but-unregistered, 7,210 without a mapping.
+
         Returns:
             dict with ``lookups_missed`` (total failed lookups),
             ``series_ids`` (how many distinct series_ids missed),
             ``unregistered_features`` (mapped names absent from
-            feature_registry) and ``top_series`` (the 10 worst offenders as
-            ``[series_id, count]`` pairs).
+            feature_registry as of the last registry read), ``top_series``
+            (the 10 worst offenders as ``[series_id, count]`` pairs),
+            ``mapped_unregistered_count`` and ``mapped_unregistered_series``
+            (``[series_id, feature_name, count]``, worst 10) for the mapped
+            series whose target is still absent at that read, which is the
+            population that drops rows and whose distinct targets are
+            ``unregistered_features``; ``mapped_resolved_count`` and
+            ``mapped_resolved_series`` for mapped series that missed earlier
+            but whose target has since been registered (historical, not
+            actionable; their earlier misses stay in the cumulative
+            ``lookups_missed``, ``series_ids`` and ``top_series``); and
+            ``no_mapping_series_ids`` with ``by_family`` (``[family,
+            series_ids, lookups]``, 12 largest by lookups) for the rest, and
+            ``no_mapping_feature_named`` (how many of those are feature-shaped
+            ids, i.e. producer output without a mapping).
         """
         ranked = sorted(
             self._miss_counts.items(), key=lambda kv: kv[1], reverse=True
         )
+        # _mapped_misses is history; whether a target is missing *now* is
+        # judged against the last registry read (_feature_cache), so the
+        # per-series rows and the deduplicated names share one snapshot. The
+        # negative cache (_unregistered_features) is cleared on every refresh
+        # and cannot be that snapshot on its own.
+        current: list[list] = []
+        resolved: list[list] = []
+        for sid, name in self._mapped_misses.items():
+            row = [sid, name, self._miss_counts.get(sid, 0)]
+            (resolved if name in self._feature_cache else current).append(row)
+        mapped = sorted(current, key=lambda row: (-row[2], row[0]))
+        resolved.sort(key=lambda row: (-row[2], row[0]))
+        unregistered = {name for _, name, _ in current} | (
+            self._unregistered_features - self._feature_cache.keys()
+        )
+        families: dict[str, list[int]] = {}
+        no_mapping = 0
+        feature_named = 0
+        for sid, count in self._miss_counts.items():
+            if sid in self._mapped_misses:
+                continue
+            no_mapping += 1
+            if is_feature_shaped(sid):
+                feature_named += 1
+            bucket = families.setdefault(series_family(sid), [0, 0])
+            bucket[0] += 1
+            bucket[1] += count
+        by_family = sorted(
+            ([family, ids, lookups] for family, (ids, lookups) in families.items()),
+            key=lambda row: (-row[2], -row[1], row[0]),
+        )
         return {
             "lookups_missed": sum(self._miss_counts.values()),
             "series_ids": len(self._miss_counts),
-            "unregistered_features": sorted(self._unregistered_features),
+            "unregistered_features": sorted(unregistered),
             "top_series": [[sid, n] for sid, n in ranked[:10]],
+            "mapped_unregistered_count": len(mapped),
+            "mapped_unregistered_series": mapped[:10],
+            "mapped_resolved_count": len(resolved),
+            "mapped_resolved_series": resolved[:10],
+            "no_mapping_series_ids": no_mapping,
+            "no_mapping_feature_named": feature_named,
+            "by_family": by_family[:12],
         }
 
     def _resolve_by_pattern(self, series_id: str) -> int | None:

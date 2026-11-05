@@ -474,7 +474,7 @@ consistent with `frontend.md`'s "don't introduce new frameworks" rule.
   transiently.
 - **Secrets:** `WHISPER_BASE_URL` is an internal-fleet hostname already in
   `config.py`, not a secret — same category as `OLLAMA_KOALA_BASE_URL`
-  (`config.py:218`) and `KOKORO_TTS_BASE_URL` (`config.py:240`). No new
+  (`config.py:218`) and `GRID_KOKORO_URL` (local Kokoro TTS, gridz4:8880). No new
   secret-handling is introduced by proxying to it.
 
 ## 7. Risks, effort, operator decisions

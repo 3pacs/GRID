@@ -5,6 +5,8 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
 
+import pytest
+
 from scripts import hermes_fixers
 
 
@@ -393,13 +395,13 @@ def test_retry_source_handles_function_based_registry_entries(monkeypatch) -> No
     engine.begin.return_value.__enter__ = MagicMock(return_value=MagicMock())
     engine.begin.return_value.__exit__ = MagicMock(return_value=False)
 
-    result = hermes_fixers._retry_source("regulatory_events", engine)
+    # This registry shape has no explicit catalog identity contract. The
+    # strict retry boundary refuses before the function or DB is invoked.
+    with pytest.raises(ValueError, match="no explicit catalog identity contract"):
+        hermes_fixers._retry_source("regulatory_events", engine)
 
-    assert result["status"] == "ok"
-    assert result["source"] == "fn"
-    assert result["outcome"] == "FAILED"
-    assert result["rows_inserted"] is None
-    assert calls == [{"db_engine": engine, "days_back": 7}]
+    assert calls == []
+    engine.begin.assert_not_called()
 
 
 def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None:
@@ -415,6 +417,8 @@ def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None
     fake_module = ModuleType(module_name)
 
     class _Puller:
+        SOURCE_NAME = 'finra_short_volume'
+
         def __init__(self, db_engine=None):
             self.db_engine = db_engine
 
@@ -467,6 +471,8 @@ def test_retry_source_never_resolves_should_continue_kwarg(monkeypatch) -> None:
     captured: dict = {}
 
     class _Puller:
+        SOURCE_NAME = 'should_continue_source'
+
         def __init__(self, db_engine=None):
             pass
 
@@ -538,6 +544,8 @@ def test_resolve_puller_for_eia_does_not_pass_api_key_kwarg(monkeypatch) -> None
     captured: dict = {}
 
     class _FakeEIAPullerCls:
+        SOURCE_NAME = 'EIA'
+
         def __init__(self, **kwargs):
             captured.update(kwargs)
 

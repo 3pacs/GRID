@@ -27,10 +27,20 @@ from intelligence import earnings_intel as ei
 # hands them back on Postgres. SQLite's driver returns the raw stored
 # string unless PARSE_DECLTYPES is on with a registered converter — wire
 # that up so these fixtures behave like the real deployment.
-sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
-sqlite3.register_converter(
-    "TIMESTAMP", lambda b: datetime.fromisoformat(b.decode())
-)
+def _register_sqlite_converters():
+    sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
+    sqlite3.register_converter(
+        "TIMESTAMP", lambda b: datetime.fromisoformat(b.decode())
+    )
+
+
+@pytest.fixture(autouse=True)
+def _sqlite_converters():
+    # sqlite3 converters are process-global and keyed case-insensitively. On Python >= 3.12 importing peewee (any
+    # test that does, earlier in the same worker) re-registers "timestamp" with a converter that cannot parse a
+    # date-only value, so these must be (re)registered when each test runs, not once at import time.
+    _register_sqlite_converters()
+    yield
 
 
 @pytest.fixture(autouse=True)

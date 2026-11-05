@@ -1,6 +1,6 @@
 ---
 name: grid-orient
-description: Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale or CLAUDE.md module counts drift from real file counts.
+description: Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale; for 'does module X exist' use grid-check-exists.
 ---
 
 # grid-orient
@@ -58,8 +58,11 @@ ls ingestion/*.py ingestion/altdata/*.py ingestion/international/*.py 2>/dev/nul
 echo " total puller files"
 
 echo ""
+# psql auth comes from ~/.pgpass on grid-svr (present, mode 600). If it is ever
+# missing there, export PGPASSWORD="$GRID_DB_PASSWORD" on grid-svr first.
+# Never inline the password in this file.
 echo "## DB Schema..."
-ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -c \"
+ssh grid-svr "psql -U grid -d griddb -h localhost -t -c \"
     SELECT table_name, array_to_string(array_agg(column_name ORDER BY ordinal_position), ', ')
     FROM information_schema.columns
     WHERE table_schema = 'public'
@@ -69,7 +72,7 @@ ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -
 
 echo ""
 echo "## DB Row Counts..."
-ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -c \"
+ssh grid-svr "psql -U grid -d griddb -h localhost -t -c \"
     SELECT schemaname || '.' || relname AS table, n_live_tup AS rows
     FROM pg_stat_user_tables
     ORDER BY n_live_tup DESC

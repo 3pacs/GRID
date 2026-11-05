@@ -739,3 +739,29 @@ def test_single_asof_batch_then_mask_is_not_equivalent_to_per_day_fetch():
     # was never returned to mask in the first place.
     assert naive_batch.loc[pd.Timestamp(day(5)), 1] == 111.0
     assert naive_batch.loc[pd.Timestamp(day(5)), 1] != correct.loc[pd.Timestamp(day(5)), 1]
+
+
+def test_baseline_metrics_do_not_pad_missing_closes_into_zero_returns():
+    """A gap in the target series yields no return observation at all.
+
+    pandas < 3 pads a missing close forward by default, which turns the gap
+    into a fabricated 0.0 return and inflates the observation count that the
+    annualisation and volatility are built on. Pinning ``fill_method=None``
+    makes the baseline identical under pandas 2 and 3.
+    """
+    bt = _bt()
+    dates = pd.DatetimeIndex(
+        [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)],
+        name="obs_date",
+    )
+    matrix = pd.DataFrame({1: [100.0, 100.0, np.nan, 100.0, 105.0]}, index=dates)
+
+    result = bt._compute_baseline_metrics(matrix, None)
+
+    # Exactly two real returns survive: 0.0 (day 2) and 0.05 (day 5).
+    real = pd.Series([0.0, 0.05])
+    ann_vol = float(real.std() * np.sqrt(252))
+    ann_return = float((1 + 0.05) ** (252 / 2) - 1)
+    assert result["return"] == pytest.approx(0.05)
+    # The engine rounds to 4 dp; padding would give ~52 here (four returns), not ~831.
+    assert result["sharpe"] == pytest.approx(ann_return / ann_vol, abs=1e-3)

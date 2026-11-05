@@ -119,9 +119,11 @@ def capture(monkeypatch):
 
     controls = dict(engine=engine, obj=obj, bridge=bridge, universe=universe,
                     lookup=lookup, calls=[], updates=catalog_updates, case="full",
-                    completion_rows=completion_rows)
+                    completion_rows=completion_rows, capture_source="options_puller")
 
-    def ticker(ticker, _today, *, max_expirations, should_continue):
+    def ticker(ticker, _today, *, max_expirations, should_continue,
+               capture_source="options_puller"):
+        assert capture_source == controls["capture_source"]
         assert max_expirations in (6, 12)
         assert should_continue is None or callable(should_continue)
         controls["calls"].append((ticker, max_expirations))
@@ -161,12 +163,13 @@ def _smart(monkeypatch, capture, kwargs):
                  method="pull", freq_h=6, timeout_s=900, stop_margin_s=60, kwargs={})
     adapter = ss._OptionsSchedulerAdapter.__new__(ss._OptionsSchedulerAdapter)
     adapter._puller = capture["obj"]
-    # The real adapter passes only should_continue; explicit smaller scopes
+    # The real adapter passes its budget and provenance; explicit smaller scopes
     # are exercised through the actual pull method with the same job name.
     if kwargs:
         instance, entry["method"], entry["kwargs"] = capture["obj"], "pull_all", kwargs
     else:
         instance = adapter
+        capture["capture_source"] = "smart_scheduler"
     monkeypatch.setattr(ss, "PULLER_REGISTRY", [entry])
     monkeypatch.setattr(ss.SmartScheduler, "_warn_registry_divergence", lambda _self: None)
     smart = ss.SmartScheduler(capture["engine"])
@@ -268,13 +271,13 @@ def test_composed_options_callers(capture, monkeypatch, caller, case, expected, 
         assert emitted.call_args.args[2:4] == (expected, rows)
     else:
         monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (capture["obj"], "pull_all", kwargs))
-        # Use an alias so SOURCE_NAME, rather than a name-only guard, proves
-        # that the options puller owns the catalog even through repair.
-        observed = hf._retry_source("Options_Alias", engine)
+        # Repair requires an explicit requested catalog contract. The actual
+        # options target retains its writer-owned publication/accounting.
+        observed = hf._retry_source("options", engine)
         status = observed["outcome"]
         assert observed["rows_inserted"] == rows
         assert (hf.retry_not_fresh_reason(observed) is None) == (expected == "SUCCESS")
-        assert "options_alias" not in hf._REPAIRS_IN_FLIGHT
+        assert "options" not in hf._REPAIRS_IN_FLIGHT
         assert _logs(engine) == []  # repair itself has no pull_log contract
     assert status == expected
     assert len(capture["calls"]) == n_calls
@@ -346,7 +349,7 @@ def test_unchanged_owned_options_cadence_without_publication(capture, monkeypatc
         assert (result["status"], result["rows_inserted"]) == ("NO_NEW_DATA", 0)
     else:
         monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (obj, "pull_all", {}))
-        result = hf._retry_source("Options_Alias", engine)
+        result = hf._retry_source("options", engine)
         assert (result["outcome"], result["rows_inserted"]) == ("NO_NEW_DATA", 0)
         assert hf.retry_not_fresh_reason(result)
     assert capture["bridge"].started == len(capture["updates"]) == 0
@@ -354,3 +357,16 @@ def test_unchanged_owned_options_cadence_without_publication(capture, monkeypatc
     if caller != "retry":
         assert tuple(_logs(engine)[0][:2]) == ("SUCCESS", 0)
         assert _logs(engine)[0][2].startswith("NO_NEW_DATA:")
+
+
+def test_retry_refuses_undeclared_options_alias(capture, monkeypatch):
+    """A writer declaration does not authorize an arbitrary requested alias."""
+    engine = MagicMock()
+    provider = MagicMock()
+    monkeypatch.setattr(capture["obj"], "pull_all", provider)
+    monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (capture["obj"], "pull_all", {}))
+    with pytest.raises(ValueError, match="catalog identity changed before dispatch"):
+        hf._retry_source("Options_Alias", engine)
+    provider.assert_not_called()
+    engine.begin.assert_not_called()
+    assert "options_alias" not in hf._REPAIRS_IN_FLIGHT

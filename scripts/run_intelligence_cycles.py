@@ -8,18 +8,46 @@ Targets:
   4. Pattern detection (event_patterns has 0 rows)
 """
 
+import importlib.util
 import sys
 import json
 import traceback
 from loguru import logger as log
 
-# Ensure project root is on the path
-sys.path.insert(0, "/data/grid_v4/grid_repo")
+# Fallback for direct execution (``python scripts/run_intelligence_cycles.py``)
+# on a host where this repo's root is not already on sys.path, so the
+# first-party imports just below (``config``, and later the lazily-imported
+# ``intelligence.*`` modules) would otherwise fail. Two guards, both
+# required, and this MUST run before any first-party import is attempted --
+# a guard placed after ``from config import settings`` can never fire: if
+# config were not already importable, that import would already have raised
+# before reaching the guard.
+#
+# * ``find_spec("config") is None`` -- checked without importing anything,
+#   so it reflects whether the repo root is on sys.path *before* we commit
+#   to the hardcoded, potentially-stale fallback path. If it's already
+#   importable (the normal case -- every current invocation already has the
+#   repo root on sys.path), this is false and sys.path is left untouched.
+# * ``__name__ == "__main__"`` -- never mutate sys.path just because this
+#   module was merely imported (e.g. by a test, or by anything re-exporting
+#   its helpers). Combined with the check above, importing this module can
+#   never mutate process-global sys.path, regardless of host.
+#
+# See tests/test_run_intelligence_cycles_stale_repo_shadow.py (mirrors
+# tests/test_score_oracle_trades_stale_repo_shadow.py, written for the
+# identical defect in scripts/score_oracle_trades.py) for the regression
+# proof: unconditionally inserting a hardcoded checkout path here used to
+# mean every mere import of this module, on any host where that directory
+# exists -- including a stale legacy checkout -- mutated sys.path for the
+# rest of the process's lifetime.
+if __name__ == "__main__" and importlib.util.find_spec("config") is None:
+    sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 from sqlalchemy import create_engine
 
-ENGINE_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
-engine = create_engine(ENGINE_URL)
+from config import settings
+
+engine = create_engine(settings.DB_URL)
 
 SEPARATOR = "=" * 70
 
@@ -100,7 +128,13 @@ def step_patterns():
 
 if __name__ == "__main__":
     log.info("GRID Intelligence Cycle Runner")
-    log.info("Database: {}", ENGINE_URL.replace('gridmaster2026', '***'))
+    log.info(
+        "Database: {}@{}:{}/{}",
+        settings.DB_USER,
+        settings.DB_HOST,
+        settings.DB_PORT,
+        settings.DB_NAME,
+    )
 
     run_step("1. THESIS SCORING — run_thesis_cycle()", step_thesis)
     run_step("2. TRUST SCORER — run_trust_cycle()", step_trust)

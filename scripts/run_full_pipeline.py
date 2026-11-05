@@ -102,7 +102,7 @@ def _safe_run(label: str, fn, *args, **kwargs) -> Any:
         return None
 
 
-def run_pipeline(historical: bool = False) -> dict:
+def run_pipeline(historical: bool = False, *, send_digest: bool = True) -> dict:
     """Execute the full GRID pipeline.
 
     Steps:
@@ -117,6 +117,8 @@ def run_pipeline(historical: bool = False) -> dict:
 
     Parameters:
         historical: If True, pull from 1990-01-01. Otherwise incremental.
+        send_digest: Include the research digest for standalone callers.
+            Hermes passes False because its scheduled digest owns delivery.
 
     Returns:
         Summary dict with step results.
@@ -163,13 +165,9 @@ def run_pipeline(historical: bool = False) -> dict:
             log.info("DexScreener — {r}", r=result)
         except Exception as exc:
             log.warning("DexScreener failed: {e}", e=str(exc))
-        try:
-            from ingestion.pumpfun import PumpFunPuller
-            puller = PumpFunPuller(db_engine=engine)
-            result = puller.pull_all()
-            log.info("PumpFun — {r}", r=result)
-        except Exception as exc:
-            log.warning("PumpFun failed: {e}", e=str(exc))
+        # PumpFun is not pulled: PumpFunPuller has no pull_all (this call
+        # raised every run) and the source is dead as designed -- see the
+        # note above "dexscreener" in ingestion/smart_scheduler.PULLER_REGISTRY.
     summary["steps"]["crypto_ingest"] = _safe_run("Crypto Ingestion", _crypto_ingest)
 
     # -----------------------------------------------------------------------
@@ -391,10 +389,13 @@ def run_pipeline(historical: bool = False) -> dict:
     # -----------------------------------------------------------------------
     # STEP 11: Daily digest email
     # -----------------------------------------------------------------------
-    def _digest():
-        from alerts.email import daily_digest
-        daily_digest()
-    summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
+    if send_digest is True:
+        def _digest():
+            from alerts.email import daily_digest
+            daily_digest()
+        summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
+    else:
+        summary["steps"]["digest"] = {"skipped": "disabled_by_caller"}
 
     # -----------------------------------------------------------------------
     # STEP 12: Retention is held in hermes_operator until its deletion policy

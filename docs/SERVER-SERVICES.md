@@ -284,7 +284,7 @@ No port forwarding needed. Traffic flows: User → Cloudflare → tunnel → loc
 | API logs | `/data/grid/logs/api.log` |
 | Cron logs | `~/grid_v4/logs/cron/` |
 | .env | `~/grid_v4/grid_repo/grid/.env` |
-| DB credentials | `grid` / `gridmaster2026` / `griddb` on localhost:5432 |
+| DB credentials | `grid` / `$GRID_DB_PASSWORD` (see ~/.pgpass / .env on grid-svr) / `griddb` on localhost:5432 |
 
 ## Celestial/Astro Ingestion
 
@@ -296,6 +296,48 @@ Not a separate service. Five pullers run inside the scheduler (started by GRID A
 - `ingestion/celestial/chinese.py` — Chinese calendar cycles
 
 All compute deterministic features from pure math — no external APIs needed.
+
+## yfinance captures (grid-scheduler)
+
+The yfinance-only slot is registered every day at **05:15 UTC**. It runs only
+when the previous UTC calendar day was a US trading session (Friday is
+captured on Saturday; Sunday and the day after a closed session skip). The
+domestic slots remain 13:30, 16:00, 20:00 and 22:00 UTC. Fixed **13:30 UTC is
+09:30 EDT or 08:30 EST**. These slots retain raw snapshots; none promises an
+exchange-opening print. The provider's daily-bar Open seen next morning is
+a later observation of that field, not an observation made at market open.
+
+For generic supported US-listed 2026 daily series, policy eligibility waits
+until the next New York midnight (04:00 UTC in EDT, 05:00 UTC in EST). SPY
+close preserves `spy_close_v1` / `post_utc_day_end_v1`, which waits until the
+next **UTC midnight**. Crypto's explicit UTC-day policy includes weekends;
+unsupported session policies remain UNKNOWN. Eligibility under any of these
+policies does not certify provider finality. Raw snapshots can remain
+INCOMPLETE or UNKNOWN and are distinct from qualified-close selection.
+
+Scheduled yfinance windows are computed at call time from the last completed
+session minus three calendar days. The separate SPY close-only fallback is
+bounded by the existing four-calendar-day lookback and runs only when that
+completed session is omitted from the requested window. Window inclusion
+and an aggregate SUCCESS do not attest that a qualified target close exists.
+The `YFinance_Daily` receipt preserves classification detail and appends
+`slot_utc`, `purpose`, and intended `target_session`. A separate
+`YFinance_Completed_SPY_Close` receipt reports the fallback's own outcome
+(or SKIPPED when no fallback is requested); its rows and outcome do not alter
+the main classification or freshness decision. These receipts add attribution,
+not a repair for writer refusal classification; the #853 writer counter
+repair remains a separate dependency.
+
+The **05:15 UTC slot overlaps the documented 03:30–10:30 UTC backup window**.
+Its impact requires operator assessment before activation. No schedule change
+is implied here. A release exactly 90 minutes late is allowed; a release more
+than 90 minutes late skips. This is a pre-start lateness guard, not a runtime
+budget. The scheduler does not replay every missed firing; the next eligible
+slot uses its call-time window, with no guarantee beyond the bounded lookback.
+
+## Flow Materialization (grid-scheduler)
+
+`ingestion/flow_materializer.py::sync_all` (insider_trades, congressional_trades, dark_pool_weekly, etf_flows, junction_point_readings, which the flows API reads) has other callers in source: grid-hermes's daily-intel `flow_materialize` task (held, and not running while grid-hermes is off) and a host systemd unit, `grid-flow-materializer.timer` (every 30 min, oneshot from the old checkout `/home/grid/grid_v4/grid_repo` at `5facbdf0`; documented in `docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md`, not tracked under `server_setup/`). Historical operator receipt **2026-10-19T06:53Z** reported it **LIVE** (enabled and active, last run 06:30:56Z SUCCESS). That is a dated observation, not a current-state verification; if still enabled, it keeps writing old-code, old-semantics rows every 30 minutes. `grid-scheduler` now also registers `run_flow_materialize_daily` weekdays at 23:15 UTC (after the 22:00Z domestic slot, outside the 03:30-10:30Z backup window). It has the same lateness guard as `run_daily_pulls`, a 60 s wait budget (the Hermes SQL-task budget) on a worker thread; timeout records FAILED and lets the scheduler loop continue, but does not cancel the worker or its writes. The worker retains its advisory lock until it finishes. Timeout and worker-exception receipts record unknown (`NULL`) rows because earlier per-table transactions may already have committed and a timed-out worker can keep writing. Deployed `pull_log.rows_inserted` nullability remains a schema verification gate. Uncertain advisory-lock acquisition or failed release invalidates the backend before closing its SQLAlchemy wrapper; if invalidation fails, cleanup attempts pool detachment and logs any unconfirmed discard. Normal pool return alone does not release a session advisory lock. The job also has a session-level Postgres advisory lock (`FLOW_MATERIALIZE_ADVISORY_LOCK_KEY`) held for the whole run (another holder means a "SKIPPED" receipt), and a `pull_log` receipt (`puller_name = 'FlowMaterialize_Daily'`; status, total rows, per-table counts and per-table errors in `error_message`). The lock only coordinates callers that take the same key; the old-checkout timer takes none, so **activation precondition: disable `grid-flow-materializer.timer` (`sudo systemctl disable --now grid-flow-materializer.timer`) in the same change window as the scheduler release**, (an operator step, not part of the scheduler release itself) or the two code versions will keep writing the same tables. Activation needs a grid-scheduler release/restart.
 
 ## Cron Jobs
 
@@ -318,8 +360,11 @@ on every PR, and so a `grid-svr` runner stall (it has stalled before — see
 
 Workflow jobs opt in via the `TEST_RUNNER` repository variable (Settings →
 Secrets and variables → Actions → Variables): when set to any non-empty value,
-`test.yml` targets `[self-hosted, alien, tests]`; when unset, jobs fall back to
-`ubuntu-latest` so CI never blocks on the Dell being offline.
+`test.yml` targets `[self-hosted, tests]` — any runner carrying the `tests`
+label (alien ×3, threadripper; see "Threadripper Runner" below); when unset,
+jobs fall back to `ubuntu-latest` so CI never blocks on a runner host being
+offline. Every `tests` runner must provide the same persistent Postgres
+contract (PostgreSQL 15 + TimescaleDB, `grid`/`testpass`, `griddb_test`, UTC).
 
 
 ### Where it actually lives (verified 2026-09-11)
@@ -534,3 +579,51 @@ Frontend Build; Backend Tests will not get there on this CPU without
 parallelising the suite (`pytest-xdist -n auto` across 24 cores, which needs
 per-worker DB isolation first), so treat alien as a resilience/second-runner
 win for the test lane, not a speed win, until that lands.
+
+## Threadripper Runner (Self-Hosted CI, bare-metal Linux)
+
+`threadripper` is a third test-lane host, added 2026-10-07. Unlike alien it is
+plain Ubuntu 24.04 on bare metal (no WSL boot contract), so it does not go
+offline when an SSH session closes. Same deal as alien: test lane only, no
+deploy credentials, never targeted by `deploy.yml` / `ops-exec.yml` /
+`gemini-task.yml`.
+
+| | |
+|---|---|
+| Host | tailnet `threadripper` / `100.78.68.72`, LAN `192.168.0.227`; SSH as `grid` (passwordless sudo) |
+| Hardware | Ryzen Threadripper 1950X (16c/32t), 62 GB RAM, 2× RTX A2000 12GB |
+| Runner | `threadripper`, labels `self-hosted, Linux, X64, threadripper, tests, gpu` |
+| Install | `/opt/github-actions/GRID/threadripper` (user `runner`), unit `actions.runner.3pacs-GRID.threadripper.service` |
+| Work dir | `/work/actions/GRID-threadripper` (`/work` is a separate 469 GB LV; keep CI off the root disk) |
+| Test DB | PostgreSQL 15.19 + TimescaleDB (PGDG + packagecloud apt repos, `timescaledb-tune` applied), `grid`/`testpass` owns `griddb_test` and its `public` schema, localhost scram-sha-256, `Etc/UTC` |
+| Python | 3.11 from deadsnakes, plus `build-essential`, `libpq-dev` (setup-python still provisions its own tool-cache copy) |
+
+**Thermal limits (2026-10-07).** At its BIOS 4.0 GHz all-core P0 with only two
+fans, threadripper hard-froze twice ~3 min into a full 32-way suite (Tdie 85 °C,
+board AUXTIN0 75 °C and climbing; journal just stops). `cpu-freq-cap.service`
+caps every core at 2.8 GHz (P1, lower voltage) — at that cap the full suite ran
+in 5m30s with Tdie peaking at 54 °C and the box stayed up. Keep the cap until
+the BIOS overclock is reverted and case airflow is added. Safety nets: the
+`sp5100_tco` hardware watchdog (systemd `RuntimeWatchdogSec=60`) resets the
+board after a freeze (verified: frozen 07:23Z, back 07:26Z unattended),
+`net-selfheal.timer` recovers the NIC/tailnet, and a USB NIC (`enx*`) is a DHCP
+fallback.
+
+Validated 2026-10-07 by running the backend suite exactly as `test.yml` does
+against the persistent DB: 13,477 passed, 571 skipped; the only 2 failures need
+`git ls-files` and came from validating a `git archive` copy (no `.git`).
+
+The host also runs an OCMRI render-farm worker (user `grid`, `UMask=0077`,
+staging on `/work/render-farm`) and holds the parked OCMRI backup replica on
+`/archive` — neither is readable by `runner`; do not loosen those permissions
+for CI.
+
+```bash
+ssh grid@100.78.68.72 'systemctl status actions.runner.3pacs-GRID.threadripper --no-pager'
+ssh grid@100.78.68.72 'pg_isready -h localhost -U grid -d griddb_test'
+gh api repos/3pacs/GRID/actions/runners --jq '.runners[] | "\(.name) \(.status) busy=\(.busy)"'
+```
+
+To take threadripper out of rotation without touching the workflow, stop its
+runner service (`sudo systemctl stop actions.runner.3pacs-GRID.threadripper`);
+queued `tests` jobs then go to alien.

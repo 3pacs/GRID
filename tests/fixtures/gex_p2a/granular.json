@@ -1,0 +1,186 @@
+{
+  "schema": "gex-p2a-v1",
+  "packet_id": "8c2a2d9f-b3be-40f2-8676-173a68a2f87a",
+  "source": "synthetic-fixture-not-market-data",
+  "basis": "unadjusted",
+  "calendar_version": "synthetic-explicit-UTC-expiries-v1",
+  "availability_basis": "grid_svr_pull_receipt",
+  "available_at": "2026-09-28T15:00:00Z",
+  "valuation_at": "2026-09-28T15:00:00Z",
+  "r": 0.04,
+  "q": 0.012,
+  "spots": [760, 765, 770],
+  "granular": {
+    "version": "gex-granular-input-v1",
+    "spot_clocks": {
+      "source_at": "2026-09-28T14:59:55Z",
+      "received_at": "2026-09-28T15:00:00Z",
+      "source": "grid_svr_pull"
+    },
+    "expected_contract_ids": [
+      "SPY-20260928-765-C",
+      "SPY-20260928-765-P",
+      "SPY-20261016-765-C",
+      "SPY-20261016-760-P",
+      "SPY-20260928-750-C",
+      "SPY-20261016-770-C",
+      "SPY-20261016-750-P"
+    ],
+    "scenarios": [
+      {
+        "name": "all_short",
+        "kind": "hypothetical_signed_inventory",
+        "fractions": {
+          "SPY-20260928-765-C": -1.0,
+          "SPY-20260928-765-P": -1.0,
+          "SPY-20261016-765-C": -1.0,
+          "SPY-20261016-760-P": -1.0,
+          "SPY-20260928-750-C": -1.0,
+          "SPY-20261016-770-C": -1.0,
+          "SPY-20261016-750-P": -1.0
+        }
+      },
+      {
+        "name": "partial_neutral",
+        "kind": "hypothetical_signed_inventory",
+        "fractions": {
+          "SPY-20260928-765-C": 0.5,
+          "SPY-20260928-765-P": -0.5,
+          "SPY-20261016-765-C": 0.0,
+          "SPY-20261016-760-P": 0.0,
+          "SPY-20260928-750-C": 0.0,
+          "SPY-20261016-770-C": -0.25,
+          "SPY-20261016-750-P": 0.25
+        }
+      }
+    ]
+  },
+  "rows": [
+    {
+      "contract_id": "SPY-20260928-765-C",
+      "underlying": "SPY",
+      "expiry": "2026-09-28T20:00:00Z",
+      "strike": 765,
+      "side": "call",
+      "iv": 0.2,
+      "iv_origin": "direct",
+      "oi": 1234,
+      "oi_as_of": null,
+      "multiplier": 100,
+      "deliverable": "standard_shares",
+      "bid": 1.45,
+      "ask": 1.55,
+      "provider_gamma": 0.0123,
+      "clocks": {
+        "quote": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "greek": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "oi": {"source_at": null, "received_at": "2026-09-28T09:00:00Z", "source": "grid_svr_pull"}
+      }
+    },
+    {
+      "contract_id": "SPY-20260928-765-P",
+      "underlying": "SPY",
+      "expiry": "2026-09-28T20:00:00Z",
+      "strike": 765,
+      "side": "put",
+      "iv": 0.23,
+      "iv_origin": "direct",
+      "oi": 1400,
+      "oi_as_of": null,
+      "multiplier": 100,
+      "deliverable": "standard_shares",
+      "bid": 1.60,
+      "ask": 1.70,
+      "provider_gamma": 0.0141,
+      "clocks": {
+        "quote": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "greek": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "oi": {"source_at": null, "received_at": "2026-09-28T09:00:00Z", "source": "grid_svr_pull"}
+      }
+    },
+    {
+      "contract_id": "SPY-20261016-765-C",
+      "underlying": "SPY",
+      "expiry": "2026-10-16T20:00:00Z",
+      "strike": 765,
+      "side": "call",
+      "iv": 0.3,
+      "iv_origin": "direct",
+      "oi": 2100,
+      "oi_as_of": null,
+      "multiplier": 100,
+      "deliverable": "standard_shares",
+      "bid": 12.10,
+      "ask": 12.30,
+      "provider_gamma": 0.0055,
+      "clocks": {
+        "quote": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "greek": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "oi": {"source_at": null, "received_at": "2026-09-28T09:00:00Z", "source": "grid_svr_pull"}
+      }
+    },
+    {
+      "contract_id": "SPY-20261016-760-P",
+      "underlying": "SPY",
+      "expiry": "2026-10-16T20:00:00Z",
+      "strike": 760,
+      "side": "put",
+      "iv": 0.19,
+      "iv_origin": "direct",
+      "oi": 0,
+      "oi_as_of": null,
+      "multiplier": 100,
+      "deliverable": "standard_shares",
+      "bid": 7.80,
+      "ask": 8.00,
+      "provider_gamma": 0.0048,
+      "clocks": {
+        "quote": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "greek": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "oi": {"source_at": null, "received_at": "2026-09-28T09:00:00Z", "source": "grid_svr_pull"}
+      }
+    },
+    {
+      "contract_id": "SPY-20260928-750-C",
+      "underlying": "SPY",
+      "expiry": "2026-09-28T14:00:00Z",
+      "strike": 750,
+      "side": "call",
+      "iv": 0.18,
+      "iv_origin": "direct",
+      "oi": 500,
+      "oi_as_of": null,
+      "multiplier": 100,
+      "deliverable": "standard_shares",
+      "bid": 15.00,
+      "ask": 15.20,
+      "provider_gamma": 0.0010,
+      "clocks": {
+        "quote": {"source_at": "2026-09-28T13:59:50Z", "received_at": "2026-09-28T14:00:00Z", "source": "grid_svr_pull"},
+        "greek": {"source_at": "2026-09-28T13:59:50Z", "received_at": "2026-09-28T14:00:00Z", "source": "grid_svr_pull"},
+        "oi": {"source_at": null, "received_at": "2026-09-28T09:00:00Z", "source": "grid_svr_pull"}
+      }
+    },
+    {
+      "contract_id": "SPY-20261016-770-C",
+      "underlying": "SPY",
+      "expiry": "2026-10-16T20:00:00Z",
+      "strike": 770,
+      "side": "call",
+      "iv": 0.28,
+      "iv_origin": "direct",
+      "oi": 300,
+      "oi_as_of": null,
+      "multiplier": 100,
+      "deliverable": "standard_shares",
+      "bid": 8.90,
+      "ask": 9.10,
+      "provider_gamma": 0.0042,
+      "clocks": {
+        "quote": {"source_at": "2026-09-28T15:04:50Z", "received_at": "2026-09-28T15:05:00Z", "source": "grid_svr_pull"},
+        "greek": {"source_at": "2026-09-28T14:59:50Z", "received_at": "2026-09-28T15:00:00Z", "source": "grid_svr_pull"},
+        "oi": {"source_at": null, "received_at": "2026-09-28T09:00:00Z", "source": "grid_svr_pull"}
+      }
+    }
+  ]
+}

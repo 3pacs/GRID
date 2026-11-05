@@ -454,3 +454,49 @@ def test_is_due_dispatches_cftc_cot_through_the_release_gate() -> None:
         assert sched._is_due(puller) is False
     finally:
         ss.datetime = real_datetime
+
+
+def test_materializer_receives_actual_cooperative_deadline(monkeypatch):
+    import importlib
+    import ingestion.smart_scheduler as ss
+    calls = {}
+    class Puller:
+        def __init__(self, db_engine):
+            pass
+        def pull_all(self, should_continue=None, deadline_at=None):
+            calls.update(callback=should_continue, deadline=deadline_at,
+                         allowed=should_continue())
+            return {"status": "NO_NEW_DATA", "rows": 0}
+    class Lock:
+        def acquire(self, **_kwargs):
+            return True
+        def release(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+    class Thread:
+        def __init__(self, target, **_):
+            self.target = target
+        def start(self):
+            self.target()
+        def join(self, **_):
+            pass
+        def is_alive(self):
+            return False
+    monkeypatch.setattr(importlib, "import_module", lambda _: types.SimpleNamespace(Puller=Puller))
+    monkeypatch.setattr(ss, "threading", types.SimpleNamespace(Thread=Thread))
+    monkeypatch.setattr(ss.time, "monotonic", lambda: 100)
+    scheduler = _scheduler()
+    scheduler._thread_semaphore = Lock()
+    scheduler._threads_lock = Lock()
+    scheduler._active_threads = set()
+    scheduler._orphan_thread_count = 0
+    scheduler.MAX_CONCURRENT_THREADS = 1
+    scheduler._update_last_pull = lambda _: (_ for _ in ()).throw(AssertionError("zero not fresh"))
+    out = scheduler._run_puller({"name": "sec_xbrl_shares", "mod": "fake", "cls": "Puller",
+                                 "method": "pull_all", "timeout_s": 120, "kwargs": {}})
+    assert out["status"] == "NO_NEW_DATA"
+    assert calls["deadline"] == 205 and calls["allowed"] is True
+    assert callable(calls["callback"])

@@ -772,3 +772,181 @@ def _get_llm_improvement_analysis(
     except Exception as exc:
         log.debug("LLM improvement analysis failed: {e}", e=str(exc))
         return None
+
+
+# ── 6. Digest call track record (options_digest_calls) ────────────────
+#
+# The 100x digest (alerts/hundredx_digest.py) writes every emailed call to
+# the insert-only ``options_digest_calls`` ledger. These helpers score those
+# calls on read; nothing is written back. Every price read is bounded above
+# by ``as_of`` so a track record built for date D only uses data dated <= D.
+
+# A settlement spot further than this before expiry is not used: a ticker
+# whose data stopped would otherwise "settle" at a weeks-old price.
+_SETTLE_MAX_GAP_DAYS = 4
+
+# Unique contracts scored for the running stats; the email shows fewer.
+TRACK_RECORD_WINDOW = 50
+
+
+def score_contract_outcome(
+    direction: str,
+    strike: float,
+    entry: float,
+    *,
+    expiry: date,
+    as_of: date,
+    settle_spot: float | None = None,
+    mark_mid: float | None = None,
+) -> dict[str, Any]:
+    """Score one long option bought at ``entry`` (per share).
+
+    * ``SETTLED`` — expiry is before ``as_of``; value is intrinsic at the
+      settlement spot.
+    * ``OPEN`` — not expired; value is the latest quoted mid.
+    * ``UNPRICED`` — the price needed for either is missing. No value is
+      invented for it.
+
+    ``return`` is value / entry - 1 (−1.0 = the premium is gone).
+    """
+    if entry is None or entry <= 0:
+        return {"status": "UNPRICED", "return": None, "value": None,
+                "detail": "entry premium missing"}
+    if expiry < as_of:
+        if settle_spot is None or settle_spot <= 0:
+            return {"status": "UNPRICED", "return": None, "value": None,
+                    "detail": "no underlying price near expiry"}
+        if direction == "CALL":
+            value = max(0.0, settle_spot - strike)
+        else:
+            value = max(0.0, strike - settle_spot)
+        return {"status": "SETTLED", "return": value / entry - 1.0, "value": value,
+                "detail": f"intrinsic at spot {settle_spot:.2f}"}
+    if mark_mid is None or mark_mid < 0:
+        return {"status": "UNPRICED", "return": None, "value": None,
+                "detail": "no quote for the contract since the call"}
+    return {"status": "OPEN", "return": mark_mid / entry - 1.0, "value": mark_mid,
+            "detail": f"mid {mark_mid:.2f}"}
+
+
+def _settlement_spot(
+    engine: Engine, ticker: str, expiry: date, as_of: date,
+) -> tuple[float, date] | None:
+    """Underlying spot on or shortly before ``expiry`` (never after ``as_of``).
+
+    Same primary source as ``_get_price_at_date`` (options_daily_signals),
+    but bounded on both sides; no live-network fallback in the email path.
+    The capture is intraday, not the official close — callers label it.
+    """
+    upper = min(expiry, as_of)
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT spot_price, signal_date FROM options_daily_signals
+            WHERE ticker = :t AND signal_date <= :hi AND signal_date >= :lo
+              AND spot_price > 0
+            ORDER BY signal_date DESC LIMIT 1
+        """), {"t": ticker, "hi": upper,
+               "lo": expiry - timedelta(days=_SETTLE_MAX_GAP_DAYS)}).fetchone()
+    if row is None:
+        return None
+    return float(row[0]), row[1]
+
+
+def _contract_mark(
+    engine: Engine, ticker: str, direction: str, expiry: date, strike: float,
+    since: date, as_of: date,
+) -> tuple[float, date] | None:
+    """Latest bid/ask mid for the exact contract between ``since`` and ``as_of``."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT bid, ask, snap_date FROM options_snapshots
+            WHERE ticker = :t AND expiry = :e AND opt_type = :o AND strike = :k
+              AND snap_date >= :since AND snap_date <= :as_of
+              AND bid IS NOT NULL AND ask IS NOT NULL AND ask > 0
+            ORDER BY snap_date DESC LIMIT 1
+        """), {"t": ticker, "e": expiry, "o": direction.lower(), "k": float(strike),
+               "since": since, "as_of": as_of}).fetchone()
+    if row is None:
+        return None
+    return (float(row[0]) + float(row[1])) / 2.0, row[2]
+
+
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def load_digest_track_record(
+    engine: Engine,
+    *,
+    as_of: date | None = None,
+    window: int = TRACK_RECORD_WINDOW,
+    emailed_before: datetime | None = None,
+) -> dict[str, Any]:
+    """Score the last ``window`` unique contracts the digest emailed.
+
+    ``as_of`` (a UTC calendar date) bounds every price read. Ledger rows are
+    those emailed before ``emailed_before`` — by default the end of ``as_of``
+    in UTC; the digest passes its own run time. Both are timezone-aware so a
+    DATE is never compared against the TIMESTAMPTZ column in the session's
+    timezone.
+
+    A contract re-emailed later counts once, at its first emailed quote.
+    Raises if the ledger cannot be read — the caller decides how to label it.
+    """
+    as_of = as_of or datetime.now(timezone.utc).date()
+    if emailed_before is None:
+        emailed_before = datetime.combine(as_of + timedelta(days=1), datetime.min.time(),
+                                          tzinfo=timezone.utc)
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT ticker, direction, expiry, strike, ask, emailed_at, score
+            FROM options_digest_calls
+            WHERE emailed_at < :before
+            ORDER BY emailed_at DESC
+            LIMIT :lim
+        """), {"before": emailed_before, "lim": window * 4}).fetchall()
+
+    first: dict[tuple, Any] = {}
+    for r in rows:  # newest first; keep overwriting so the earliest wins
+        first[(r[0], r[1], r[2], float(r[3]))] = r
+    calls = sorted(first.values(), key=lambda r: r[5], reverse=True)[:window]
+
+    scored: list[dict[str, Any]] = []
+    for ticker, direction, expiry, strike, ask, emailed_at, score in calls:
+        emailed_on = emailed_at.date() if hasattr(emailed_at, "date") else emailed_at
+        settle = mark = None
+        if expiry < as_of:
+            settle = _settlement_spot(engine, ticker, expiry, as_of)
+        else:
+            mark = _contract_mark(engine, ticker, direction, expiry, float(strike),
+                                  emailed_on, as_of)
+        out = score_contract_outcome(
+            direction, float(strike), float(ask) if ask is not None else None,
+            expiry=expiry, as_of=as_of,
+            settle_spot=settle[0] if settle else None,
+            mark_mid=mark[0] if mark else None,
+        )
+        out.update(
+            ticker=ticker, direction=direction, expiry=expiry, strike=float(strike),
+            entry=float(ask) if ask is not None else None, emailed_at=emailed_at,
+            score=score, priced_on=(settle or mark or (None, None))[1],
+        )
+        scored.append(out)
+
+    settled = [c["return"] for c in scored if c["status"] == "SETTLED"]
+    opened = [c["return"] for c in scored if c["status"] == "OPEN"]
+    return {
+        "as_of": as_of,
+        "calls": scored,
+        "settled": len(settled),
+        "settled_wins": sum(1 for r in settled if r > 0),
+        "settled_hit_rate": (sum(1 for r in settled if r > 0) / len(settled)) if settled else None,
+        "settled_median_return": _median(settled),
+        "open": len(opened),
+        "open_median_return": _median(opened),
+        "unpriced": sum(1 for c in scored if c["status"] == "UNPRICED"),
+    }

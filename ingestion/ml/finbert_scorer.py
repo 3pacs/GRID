@@ -141,7 +141,10 @@ class FinBERTScorer:
                     "INSERT INTO source_catalog "
                     "(name, base_url, cost_tier, latency_class, pit_available, "
                     "revision_behavior, trust_score, priority_rank, active) "
-                    "VALUES ('FinBERT', 'local://finbert', 'FREE', 'BATCH', "
+                    # EOD, was BATCH: not in source_catalog_latency_class_check, so the insert always failed
+                    # and every scoring run errored once the model could load (first seen on 3.14, 2026-11-04).
+                    # FinBERT scores in the daily pull slots, so EOD gives it the same daily staleness tier.
+                    "VALUES ('FinBERT', 'local://finbert', 'FREE', 'EOD', "
                     "FALSE, 'NEVER', 'MED', 60, TRUE) "
                     "ON CONFLICT (name) DO NOTHING "
                     "RETURNING id"

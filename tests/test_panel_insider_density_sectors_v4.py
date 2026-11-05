@@ -26,8 +26,8 @@ def historical_v6_terminal(monkeypatch):
     """Replay the recorded sectors-v4 checks before v7 source was present."""
     assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
     modules = s4._technology_modules()
-    assert modules[-1].VERSION == "vs1-v7"
-    monkeypatch.setattr(s4, "_technology_modules", lambda: modules[:-1])
+    assert [m.VERSION for m in modules[6:]] == ["vs1-v7", "vs1-v8"]
+    monkeypatch.setattr(s4, "_technology_modules", lambda: modules[:6])
     monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
 
 
@@ -72,7 +72,8 @@ def test_the_historical_technology_run_was_v6(historical_v6_terminal):
 def test_v7_stopped_or_superseded_blocks_sectors_v4_without_an_anchor(tmp_path):
     assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
     # v7 is itself superseded (terminal STOP) until its successor's module exists: still refused.
-    refused = "supersession pin does not name the terminal|no single terminal member"
+    refused = ("supersession pin does not name the terminal|no single terminal member"
+               "|terminal Technology version vs1-v8 is not registered")
     with pytest.raises(PermissionError, match=refused):
         s4.check_technology_run()
     with pytest.raises(PermissionError, match=refused):
@@ -85,7 +86,7 @@ def test_a_later_technology_registration_requires_a_new_sectors_registration(mon
                                REGISTERED_RECORD_SHA256=("a" * 64, "b" * 64),
                                WITNESS_PATH=v1.canonical_witness_path("vs1-v7"))
     pin7 = {"version": "vs1-v7", "prereg_sha256": "7" * 64, "registry_head_sha256": "b" * 64}
-    chain = s4._technology_modules()[:-1]  # historical v1-v6 chain, before the real v7 scaffold
+    chain = s4._technology_modules()[:6]  # historical v1-v6 chain, before the real v7/v8 modules
     fakes = [types.SimpleNamespace(**{**vars(m), "SUPERSEDED_BY": pin7}) for m in chain]
     monkeypatch.setattr(s4, "_technology_modules", lambda: [*fakes, v7])
     assert s4.technology_terminal()["version"] == "vs1-v7"

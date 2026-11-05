@@ -429,7 +429,7 @@ class CapitalFlowResearchEngine:
             feature_map = {
                 "fed_funds_rate": "fed_funds_rate",
                 "treasury_10y": "treasury_10y",
-                "treasury_2y": "treasury_2y",
+                "treasury_2y": "yc_2y",  # live DGS2 feature (owner decision 2026-11-04)
                 "yield_curve": "yield_curve_10y2y",
                 "hy_spread": "hy_spread",
                 "breakeven_10y": "breakeven_10y",

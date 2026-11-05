@@ -21,6 +21,7 @@ from sqlalchemy.engine import Engine
 from intelligence.actors.db import _ensure_tables, _load_actors_from_db
 from intelligence.actors.graph import build_actor_graph
 from intelligence.actors.models import Actor
+from intelligence.lever_pullers import puller_identity
 
 
 def get_actor_context_for_ticker(
@@ -70,7 +71,8 @@ def get_actor_context_for_ticker(
 
             for r in rows:
                 source_type = str(r[0])
-                source_id = str(r[1])
+                # The actor behind the row: QuiverQuant source_ids are per act.
+                source_id = str(puller_identity(source_type, str(r[1]), r[4]))
                 direction = str(r[2])
                 sig_date = str(r[3])
                 trust = float(r[5]) if r[5] else 0.5

@@ -3,8 +3,10 @@ itself must be the one released for its version.
 
 Changing anything under ``evals/e0/`` (code, config, seeds, structure, cached
 data) is a new benchmark version: bump ``evals.e0.VERSION`` and ``config.json``,
-run ``python -m evals.e0 manifest --write --version e0-vN`` and ADD the new
-manifest's sha256 below (never edit a released entry). See evals/e0/README.md.
+run ``python -m evals.e0 manifest --write --version e0-vN`` and APPEND a new
+released entry to ``evals/RELEASED.json`` (never edit a released entry; the
+``evals-freeze-guard`` workflow enforces that against the base revision). See
+evals/README.md and evals/e0/README.md.
 """
 
 from __future__ import annotations
@@ -15,12 +17,10 @@ from pathlib import Path
 
 import pytest
 
+from evals import released
 from evals.e0 import VERSION, manifest
 
-#: version -> sha256 of evals/e0/MANIFEST.sha256 (LF). Append-only.
-RELEASED_MANIFESTS = {
-    "e0-v1": "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
-}
+E0_PATH = "evals/e0"
 
 
 def test_every_pinned_file_matches_the_manifest():
@@ -31,10 +31,12 @@ def test_every_pinned_file_matches_the_manifest():
 def test_manifest_is_the_released_one_for_its_version():
     version, _ = manifest.parse(manifest.MANIFEST.read_text(encoding="utf-8"))
     assert version == VERSION, "evals.e0.VERSION and the manifest header differ"
-    assert version in RELEASED_MANIFESTS, (
-        f"{version} is not a released E0 version: add it to RELEASED_MANIFESTS (append-only)"
+    entry = released.latest_entry("e0", path=E0_PATH)
+    assert entry["version"] == version, (
+        f"{version} is not the latest released E0 version at {E0_PATH} ({entry['version']}): "
+        "append a released entry to evals/RELEASED.json"
     )
-    assert manifest.manifest_sha256() == RELEASED_MANIFESTS[version], (
+    assert manifest.manifest_sha256() == entry["manifest_sha256"], (
         f"MANIFEST.sha256 changed without a version bump: {version} was released with a different "
         "manifest. Bump evals.e0.VERSION/config.json and register the new version instead."
     )

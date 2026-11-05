@@ -24,16 +24,28 @@ def _dt(y, m, d, h=0):
 
 
 class TestCadenceForSource:
+    def test_placeholder_daily_update_frequency_defers_to_latency_class(self):
+        # Live catalog 2026-11-04: update_frequency='DAILY' on 106/107 active
+        # rows; latency_class holds the real cadence (NYFED_GSCPI = MONTHLY).
+        got = cadence.cadence_for_source(
+            "some_new_source", update_frequency="DAILY", latency_class="MONTHLY",
+        )
+        assert got == cadence.MONTHLY
+
+    def test_daily_update_frequency_without_latency_class_stays_daily(self):
+        got = cadence.cadence_for_source("some_new_source", update_frequency="DAILY")
+        assert got == cadence.DAILY
+
     def test_override_map_hit_is_case_and_whitespace_insensitive(self):
-        assert cadence.cadence_for_source("BLS") == cadence.WEEKLY
-        assert cadence.cadence_for_source(" bls ") == cadence.WEEKLY
-        assert cadence.cadence_for_source("Bls") == cadence.WEEKLY
+        assert cadence.cadence_for_source("BLS") == cadence.MONTHLY
+        assert cadence.cadence_for_source(" bls ") == cadence.MONTHLY
+        assert cadence.cadence_for_source("Bls") == cadence.MONTHLY
 
     def test_override_map_wins_over_catalog_metadata(self):
         # BLS's catalog update_frequency famously says DAILY (the audit's
         # "110 of 111" finding) — the override must win regardless.
         got = cadence.cadence_for_source("BLS", update_frequency="DAILY")
-        assert got == cadence.WEEKLY
+        assert got == cadence.MONTHLY
 
     def test_sec_ftd_gets_the_semimonthly_tier(self):
         assert cadence.cadence_for_source("sec_ftd") == cadence.SEMIMONTHLY
@@ -48,6 +60,14 @@ class TestCadenceForSource:
     def test_unmapped_source_falls_back_to_latency_class_when_no_update_frequency(self):
         got = cadence.cadence_for_source("some_new_source", latency_class="WEEKLY")
         assert got == cadence.WEEKLY
+
+    def test_intraday_latency_class_is_an_explicit_daily_key(self):
+        # INTRADAY is in the live source_catalog_latency_class_check (8 live
+        # rows on 2026-10-20) but had no _METADATA_CADENCE key, so it reached
+        # DAILY only through the DEFAULT_CADENCE fallback. Pin it as explicit.
+        assert cadence._METADATA_CADENCE["INTRADAY"] is cadence.DAILY
+        got = cadence.cadence_for_source("some_new_source", latency_class="intraday")
+        assert got is cadence.DAILY
 
     def test_update_frequency_takes_priority_over_latency_class(self):
         got = cadence.cadence_for_source(
@@ -203,3 +223,23 @@ class TestDailyBusinessDayAwareGrace:
     def test_computed_holiday_set_matches_known_dates(self, year, expected):
         holidays = cadence._us_market_holidays(year)
         assert {d.isoformat() for d in holidays} == expected
+
+
+def test_annual_latency_class_maps_to_quarterly_not_default_daily():
+    """ANNUAL is in the live source_catalog CHECK (pushshift_reddit declares it);
+    without a key it fell to DEFAULT_CADENCE (DAILY) and would flag a yearly
+    archive stale after 30 h."""
+    from alerts.cadence import QUARTERLY, cadence_for_source
+
+    assert cadence_for_source("pushshift_reddit", latency_class="ANNUAL") is QUARTERLY
+
+
+def test_world_bank_is_annual_data_on_the_coarsest_tier():
+    assert cadence.cadence_for_source("world_bank", update_frequency="DAILY", latency_class="EOD") is cadence.QUARTERLY
+
+
+def test_live_catalog_monthly_and_weekly_rows_resolve_from_latency_class():
+    # Comtrade (MONTHLY) and ecb_ilm_ltro (WEEKLY) were stale-flagged on
+    # 2026-11-04 although healthy: update_frequency='DAILY' masked them.
+    assert cadence.cadence_for_source("Comtrade", update_frequency="DAILY", latency_class="MONTHLY") is cadence.MONTHLY
+    assert cadence.cadence_for_source("ecb_ilm_ltro", update_frequency="DAILY", latency_class="WEEKLY") is cadence.WEEKLY

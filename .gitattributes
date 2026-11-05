@@ -1,2 +1,3 @@
 *.sh text eol=lf
 docs/paper_log/vs1-v7-stop-e0-scorecard.json -text
+tests/fixtures/e2/*.jsonl -text

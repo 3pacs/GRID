@@ -89,6 +89,21 @@ V7_CODE_FILES = CODE_FILES + (
     "scripts/run_vs1_v7_insider_density.py",
     "scripts/run_vs1_v7_price_admission_probe.py",
 )
+# v8 additionally pins its harness/wrappers and the E0 code and manifest its Stage-0 runs.
+V8_CODE_FILES = V7_CODE_FILES + (
+    "analysis/panel_insider_density_v8.py",
+    "scripts/run_vs1_v8_insider_density.py",
+    "scripts/run_vs1_v8_price_admission_probe.py",
+    "evals/e0/__init__.py",
+    "evals/e0/benchmark.py",
+    "evals/e0/config.json",
+    "evals/e0/generator.py",
+    "evals/e0/machinery.py",
+    "evals/e0/manifest.py",
+    "evals/e0/runners.py",
+    "evals/e0/structure.py",
+    "evals/e0/MANIFEST.sha256",
+)
 
 
 def _now() -> datetime:
@@ -113,7 +128,7 @@ def _events(args, universe):
 
 
 def _code_files(h=v2) -> dict:
-    files = V7_CODE_FILES if h.VERSION == "vs1-v7" else CODE_FILES
+    files = {"vs1-v7": V7_CODE_FILES, "vs1-v8": V8_CODE_FILES}.get(h.VERSION, CODE_FILES)
     return {f: v1.file_sha256(REPO / f) for f in files}
 
 
