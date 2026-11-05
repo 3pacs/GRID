@@ -1461,37 +1461,56 @@ class NumericSessionTests(unittest.TestCase):
         )
 
 
+def _canonical_ast(node):
+    """A version-independent rendering of an AST: every field in order, except fields whose value is None or []."""
+    if isinstance(node, ast.AST):
+        parts = []
+        for field in node._fields:
+            value = getattr(node, field, None)
+            if value is None or value == []:
+                continue
+            parts.append(field + "=" + _canonical_ast(value))
+        return type(node).__name__ + "(" + ", ".join(parts) + ")"
+    if isinstance(node, list):
+        return "[" + ", ".join(_canonical_ast(x) for x in node) + "]"
+    return repr(node)
+
+
+# sha256 of _canonical_ast(definition): the AST with None / empty-list fields dropped, so the hash is the same on every
+# supported Python (3.12 added `type_params`, 3.13 stopped printing empty fields in ast.dump). Re-baselined 2026-11-04 for
+# Python 3.14: the previous ast.dump hashes still matched this exact source on CPython 3.11.15, and these canonical
+# hashes are identical on 3.11.15 and 3.14.4.
 ACCEPTED_DEFINITION_AST_HASHES = {
-    "Adjustment": "c80b95fa0f63d2c0e62c474123b60d4cfbefd00ef0d2b80eb3106ac00447009e",
-    "NotionalBasis": "6f711867dd946be1f7443785f130314050adbabd7a50628568733b538c75e7b8",
-    "TimestampConvention": "aa6f566017f0a4f25e1b188c74af49c4340db1a3f2e00de84f57cf686bdf5f01",
-    "SessionConvention": "3d7f718b6cdbb43e778fa01e733c7c476ec93f43faaf140edfe824a02d09a970",
-    "_text": "229c58e455d9548918cda3b9db087a53eb873f33819f1ab362d6ece5d3bd4c51",
-    "_typed": "ed75934d0d949690390f892f39e0f85629aa8f485574001a8ac7a3e53748af39",
-    "_utc": "4ef72e555086bb52fa6b06013d0ff529aeffa65747a00bb09eddfbd06abd13f9",
-    "_clock": "fa815085f5799bafcc59a9c5f20dc77952275bc46a1eecc2dba0a9f7a2f7b55b",
-    "_interval": "a739a46aef2e0592e157a49009075d1a30eefea18ed87ac3cf6c16be9ceced96",
-    "_decimal": "3f74b3325192878fb4c9e62af86e616abc18dc035a45b1aca65acaaa120057ef",
-    "BarInterval": "ab72815bfbb29faa8bf4b9a2b985dce95d6ae6d1dcbf90cc98887c6c4d9f58f9",
-    "PriceBasis": "052d4f146dcc2626e5ebea67f11b66409ce478627a51d625c415249f46ced706",
-    "SessionWindow": "add399e470743d9e6dcdb471594a38479fae162b0653b20fa21dabd284a970da",
-    "NumericBar": "050767ab56dec660aea47804f056aa6563e4825ff43e1de2866e5e28f1a7eda5",
-    "ExpectedBarGrid": "d1e1af030f6351e9e9a5463679fa30e6701d93f6966cfec2a8aa9013ca36fe6a",
-    "StructuralResult": "1586a12a5a8a54b36078cae827a0c7d0cf7464be187624c903ae8f11b42f3fb3",
-    "_result": "9a5370e4780da8defc8f764f9120fd16e0cb1917fd0a1e85689090d2b580bbf3",
-    "_reference_known": "d73a0fb64702ec3f7a721cfe2d457f86483469c2faf520188112d723850fe6f3",
-    "_clock_key": "7e7338d4f3710d2c0ac98c663cbe73c1a17dcca023e869051dda0328e244366c",
-    "_reference_key": "eb440b53516ff01465760ba648fd70fdde1a2534182af6293cf2684f1c70e997",
-    "_basis_unknown": "904822250e9e6ca58a3cac424d46881e27dfd7e709aadf4789677044bc3f301e",
-    "compare_price_basis": "a15909dc3315926e05e216b8ec7bc3122864d2043c0b67679e7ea22c4da7bbd9",
-    "_session_key": "a032c504d5b8d928e4bc31ff0603c9625b88c5ce385966d613b40370befe102d",
-    "_session_unknown": "64d187feb53cdc822f04bfdd913238f283af62454815d836a2d2708bdade72f7",
-    "_inside": "4f79d6379490fb5ac60b23569f64b73ed98781d75bde8a5682a4c0fcc3f7ea62",
-    "_observation_duration": "c5ae615b1508bbac61c790a7f21725bba5941710946da2a793e5f11ae20341f7",
-    "validate_numeric_bar": "cce962c80c0808f80a3ee57d216438c61e3a5168ed0eeb1b596e70f57889ccaa",
-    "_interval_key": "cfdcb634e15e3a68834ffc8110c1b83bf5d69270b46ea463469fdf7df66b8be7",
-    "_sequence_checks": "0404cc32459f6b881e5e2602ff037ea98d017dbd311330fc72dcf660a4b304b8",
-    "validate_bar_grid": "2a03ec00e1de9d8218ac14cd720706762c17a8ad37b4da4931bc81c794769018",
+    "Adjustment": "53c9b97c31d147746e80d5fe5672b598b8c6f4c7878e565af6eb87e339645190",
+    "BarInterval": "e404b28d251608bea4bd72e84b1ab7732ad1c427dd5a02ff157c43bb0b474d09",
+    "ExpectedBarGrid": "cfcc0f3c7ed4ff8d2457f6964872f45b371aa27198f0c9326e10db069107ef4d",
+    "NotionalBasis": "4905d162ec0c0a4eba6eade11faec7c0d51e346df339cf5d8621caa998f0c13d",
+    "NumericBar": "2f325afad7adf727aaa8670eb113c50f225672a2be339231d4199a1350ba9a81",
+    "PriceBasis": "9486fbb24faf7f54fed58ab3ab62ae62f6a3da5e090a2c3e66e3005cae8a17de",
+    "SessionConvention": "073a8202e0166f616092162c59eafa7c3a7771194e5a3df7b92de335ce36e74c",
+    "SessionWindow": "4f6e40f823b9ebd24ad21302f38651d5116544df6fe646929ef3f0f1f6967032",
+    "StructuralResult": "00eaf463472584c7e566e4b4c8ad17692e21e741b9deb4dfe1fe84e1a76c3ce9",
+    "TimestampConvention": "7bc4c4abcf85ca97c11658cd169e54935f2b8718464463bfdaae781558c7821b",
+    "_basis_unknown": "656499b16c6bf7ba7acd021acf8c1ce5bb751c0bd3d623f323f0ffdfe04e5029",
+    "_clock": "b1d6dbc4f7d6609e4afc78a7c5d238351608f14dd99e1225a6566ae90b182d87",
+    "_clock_key": "bd9522419db2dc785071286175beed4f9ba343ec0b22dac9d6df1d1d4924e565",
+    "_decimal": "fb3a223d7a9ee23e74ce0db067fe43db14d30fd1232ef820ad8e70c8ac14463d",
+    "_inside": "218ff1d67108a713225bab1edc7c01317a4d0c1c2eb4b27e9b200e3f746936c3",
+    "_interval": "687a8b8ca1deceacf7c7d134fdb96c8915b974c6f3871dc07b40c88fb4433d58",
+    "_interval_key": "03b8b558cd9ca4efa1710ccb4b1fb2fdd2e68e9b248a4522c115b981b1d7f67e",
+    "_observation_duration": "76b1cb4f334af4795d0ceab09d02a0d28c724881d8f8b741761cec4c5211c609",
+    "_reference_key": "5aefd8de88d6281ebbb4843b09cf08c43bb1dde42de6497a4b114c86816e5eef",
+    "_reference_known": "137b4cc446072a68275235ad1aa5a1c4056a4e209927edff21fbda453d0508e1",
+    "_result": "1a536db84703ff73a32ad0bb98c70d1801f478e9f96c79f62a632a14c3bb7165",
+    "_sequence_checks": "5124a8d9f4da2b19e60244b5d0ccce4a90928eb102ea17d7137ed07700adfe36",
+    "_session_key": "37d36e911b0533595f90d36480d36d4ebbe2b6e8ef574713e88b2df8e19f3640",
+    "_session_unknown": "d04a965abc665ec5007a28b6789cdab0351b1622b641b7786906e02eceaeba94",
+    "_text": "e43f7416c4a9deaff1f29b2a82c4af33143688298ef846e19061f21e201f3efe",
+    "_typed": "daab88b5a67d74d401a4e3c83406317c77dde7aa5127bf3034c2127ba339a2e3",
+    "_utc": "3c83c41253605e10c2d95b65a793d0a7fac152f61a061067b79b1c28713b8ee9",
+    "compare_price_basis": "37a520260684ea90af8dc1345a8c5e8ebf0a02f23c83c0233fa735af4089a766",
+    "validate_bar_grid": "3eda95ee4bb643c6fd27fafe8f7f14889b7e293dc244c7d239a849dd6c24a82b",
+    "validate_numeric_bar": "053c55fcd19fdd6c20cfdce201f9e11a05e41f221c752e6272f7fbe49063bfd0",
 }
 
 
@@ -2113,9 +2132,7 @@ class FeatureMathTests(unittest.TestCase):
         tree = ast.parse(SOURCE.read_text())
         expected = ACCEPTED_DEFINITION_AST_HASHES
         actual = {
-            n.name: hashlib.sha256(
-                ast.dump(n, include_attributes=False).encode()
-            ).hexdigest()
+            n.name: hashlib.sha256(_canonical_ast(n).encode()).hexdigest()
             for n in tree.body
             if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in expected
         }

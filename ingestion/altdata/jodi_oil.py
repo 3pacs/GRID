@@ -48,6 +48,7 @@ from typing import Any, Iterable
 
 import requests
 from loguru import logger as log
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
@@ -102,9 +103,38 @@ TRACKED_FLOWS: tuple[str, ...] = (
 #: Bulk CSV download URL.  JODI publishes this from the public downloads
 #: page; the file name is regenerated each release but the canonical "world"
 #: bundle is served from this path.  If the URL drifts we fall back to SDMX.
-JODI_CSV_URL: str = (
-    "https://www.jodidata.org/_resources/files/downloads/oil-data/world_Primary_CSV.csv"
-)
+#:
+#: 2026-11-04: the old ``world_Primary_CSV.csv`` path and the SDMX endpoint
+#: both answer 404 (probed from grid-svr), so this puller had written no row
+#: since it was scheduled. JODI now publishes per-year files from the
+#: downloads page: ``annual-csv/primary/primaryyear<YYYY>.csv`` (crude oil,
+#: current year) and ``annual-csv/secondary/secondaryyear<YYYY>.csv``
+#: (refined products), with closed years as ``.../<YYYY>.csv``. Those files
+#: use ISO-2 ``REF_AREA`` codes, ``INDPROD``/``REFGROUT``/``TOTIMPSB``/
+#: ``TOTEXPSB``/``CLOSTLV`` flow codes, ``GASDIES`` for gas/diesel oil, and
+#: repeat each observation in five units -- normalised below.
+JODI_DOWNLOAD_BASE: str = "https://www.jodidata.org/_resources/files/downloads/oil-data/annual-csv"
+JODI_CSV_URL: str = f"{JODI_DOWNLOAD_BASE}/primary/primaryyear{{year}}.csv"
+
+
+def jodi_csv_urls(today: date | None = None) -> list[str]:
+    """Per-year JODI CSV files to fetch: current-year primary + secondary.
+
+    In Q1 the current-year files hold only a month or two (or do not exist
+    yet), so the closed previous-year files are fetched too.
+    """
+    today = today or date.today()
+    y = today.year
+    urls = [
+        f"{JODI_DOWNLOAD_BASE}/primary/primaryyear{y}.csv",
+        f"{JODI_DOWNLOAD_BASE}/secondary/secondaryyear{y}.csv",
+    ]
+    if today.month <= 3:
+        urls += [
+            f"{JODI_DOWNLOAD_BASE}/primary/{y - 1}.csv",
+            f"{JODI_DOWNLOAD_BASE}/secondary/{y - 1}.csv",
+        ]
+    return urls
 
 #: SDMX-JSON endpoint — used as the resilient fallback.
 JODI_SDMX_URL: str = "https://www.jodidata.org/api/sdmx/data/JODI,OIL"
@@ -112,9 +142,44 @@ JODI_SDMX_URL: str = "https://www.jodidata.org/api/sdmx/data/JODI,OIL"
 _REQUEST_TIMEOUT: int = 60
 _USER_AGENT: str = "GRID/1.0 (+https://grid.stepdad.finance) jodi-oil-puller"
 
+#: Current JODI files use ISO-2 country codes; the series ids stay ISO-3.
+_ISO2_TO_ISO3: dict[str, str] = {
+    "SA": "SAU", "AE": "ARE", "KW": "KWT", "IQ": "IRQ", "RU": "RUS",
+    "IR": "IRN", "VE": "VEN", "NG": "NGA", "DZ": "DZA", "AO": "AGO",
+    "US": "USA", "CN": "CHN", "ID": "IDN", "MY": "MYS", "BR": "BRA",
+}
+
+#: Current JODI flow / product codes -> the canonical codes in series ids.
+_FLOW_ALIASES: dict[str, str] = {
+    "INDPROD": "PRODUCTION",   # crude: indigenous production
+    "REFGROUT": "PRODUCTION",  # products: refinery gross output
+    "TOTIMPSB": "IMPORTS",
+    "TOTEXPSB": "EXPORTS",
+    "CLOSTLV": "CLOSSTLV",
+}
+_PRODUCT_ALIASES: dict[str, str] = {"GASDIES": "GASDIESEL"}
+
+#: Each observation is published in several units; keep one per flow kind
+#: (thousand barrels for stock levels, thousand barrels/day for flows).
+_MULTI_UNITS: frozenset[str] = frozenset({"KTONS", "KL", "KBD", "KBBL", "CONVBBL"})
+
+
+def _preferred_unit(flow: str) -> str:
+    return "KBBL" if flow == "CLOSSTLV" else "KBD"
+
+
+def _normalise_codes(country: str, product: str, flow: str) -> tuple[str, str, str]:
+    """Map current-release JODI codes onto the canonical tracked codes."""
+    return (
+        _ISO2_TO_ISO3.get(country, country),
+        _PRODUCT_ALIASES.get(product, product),
+        _FLOW_ALIASES.get(flow, flow),
+    )
+
+
 #: JODI sentinel values that mean "no observation" — these must be filtered out
 #: before insertion (they are not zero, they mean "missing").
-_MISSING_SENTINELS: frozenset[str] = frozenset({"", "..", "...", "x", "X", "n/a", "N/A", "NA"})
+_MISSING_SENTINELS: frozenset[str] = frozenset({"", "-", "..", "...", "x", "X", "n/a", "N/A", "NA"})
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +351,15 @@ def _parse_jodi_csv(csv_text: str) -> list[JODIObservation]:
     out: list[JODIObservation] = []
     for row in reader:
         try:
-            country = (row.get(cols["country"]) or "").strip().upper()
-            product = (row.get(cols["product"]) or "").strip().upper()
-            flow = (row.get(cols["flow"]) or "").strip().upper()
+            country, product, flow = _normalise_codes(
+                (row.get(cols["country"]) or "").strip().upper(),
+                (row.get(cols["product"]) or "").strip().upper(),
+                (row.get(cols["flow"]) or "").strip().upper(),
+            )
             if not _is_tracked(country, product, flow):
+                continue
+            unit = (row.get(cols["unit"]) or "").strip().upper()
+            if unit in _MULTI_UNITS and unit != _preferred_unit(flow):
                 continue
 
             month = _parse_month_period(row.get(cols["period"]) or "")
@@ -467,10 +537,10 @@ class JODIOilPuller(BasePuller):
             ConnectionError, TimeoutError, OSError, requests.RequestException,
         ),
     )
-    def _fetch_csv(self) -> str:
-        """GET the bulk CSV.  Raises on HTTP error."""
+    def _fetch_csv(self, url: str | None = None) -> str:
+        """GET one JODI CSV file.  Raises on HTTP error."""
         resp = requests.get(
-            JODI_CSV_URL,
+            url or JODI_CSV_URL.format(year=date.today().year),
             timeout=_REQUEST_TIMEOUT,
             headers={"User-Agent": _USER_AGENT, "Accept": "text/csv,*/*"},
         )
@@ -507,17 +577,24 @@ class JODIOilPuller(BasePuller):
         Returns an empty list if both upstream sources fail.  The chosen
         source is recorded on ``self._last_source_used``.
         """
-        # ---- CSV ----
-        try:
-            csv_text = self._fetch_csv()
-            obs = _parse_jodi_csv(csv_text)
-            if obs:
-                self._last_source_used = "csv"
-                log.info("JODI CSV: {n} observations parsed", n=len(obs))
-                return obs
+        # ---- CSV (per-year files) ----
+        csv_obs: list[JODIObservation] = []
+        csv_errors: list[str] = []
+        for url in jodi_csv_urls():
+            try:
+                csv_obs.extend(_parse_jodi_csv(self._fetch_csv(url)))
+            except Exception as exc:
+                csv_errors.append(f"{url.rsplit('/', 2)[-2]}/{url.rsplit('/', 1)[-1]}: {exc}")
+        if csv_obs:
+            self._last_source_used = "csv"
+            if csv_errors:
+                log.warning("JODI CSV: some files failed: {e}", e="; ".join(csv_errors)[:300])
+            log.info("JODI CSV: {n} observations parsed", n=len(csv_obs))
+            return csv_obs
+        if csv_errors:
+            log.warning("JODI CSV fetch failed: {e}", e="; ".join(csv_errors)[:300])
+        else:
             log.warning("JODI CSV returned 0 tracked observations -- trying SDMX")
-        except Exception as exc:
-            log.warning("JODI CSV fetch failed: {e}", e=str(exc))
 
         # ---- SDMX fallback ----
         try:
@@ -582,6 +659,16 @@ class JODIOilPuller(BasePuller):
                         },
                     )
                     inserted += 1
+            # Runs from intelligence.scheduler, which records no pull
+            # outcome: bump last_pull_at with new writes so they are
+            # visible to the freshness alert.
+            # Same rule as the schedulers: only committed new rows count as
+            # freshness (a zero-write check is NO_NEW_DATA, never fresh).
+            if inserted:
+                conn.execute(
+                    text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
+                    {"sid": self.source_id},
+                )
         return inserted
 
 

@@ -60,8 +60,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     if args.verbose:
-        log.remove()
-        log.add(sys.stderr, level="DEBUG")
+        from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+        log.remove()  # after the config import: importing config adds its own console sink
+        log.add(scrubbed_stderr, level="DEBUG", diagnose=LOG_DIAGNOSE)
 
     as_of: date | None = None
     if args.as_of:

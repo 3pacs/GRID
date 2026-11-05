@@ -110,7 +110,9 @@ SOURCE_CADENCE_OVERRIDES: dict[str, Cadence] = {
     "cboe": DAILY,
     "tiingo": DAILY,
     # 2B -- within real cadence; the old 26h rule was too tight
-    "bls": WEEKLY,
+    # BLS publishes monthly (CPI, Employment Situation); WEEKLY flagged it
+    # stale for ~3 weeks of every month (2026-11-04: 20d since last release).
+    "bls": MONTHLY,
     "aaii_sentiment": WEEKLY,
     "eia": WEEKLY,
     "nowcast": WEEKLY,
@@ -133,6 +135,9 @@ SOURCE_CADENCE_OVERRIDES: dict[str, Cadence] = {
     "foia_cables": WEEKLY,
     "buyback_execution": QUARTERLY,
     "atlanta_fed_wage_tracker": MONTHLY,
+    # World Bank indicators are annual; zero-row runs never refresh it
+    # (2026-11-04 investigation). QUARTERLY is the coarsest tier.
+    "world_bank": QUARTERLY,
     # 2D -- genuinely stale or broken writers (real cadence recorded so
     # they still trip the alert, honestly, instead of via the wrong reason)
     "open_meteo": DAILY,
@@ -176,13 +181,22 @@ def cadence_for_source(
 
     Precedence: the audit-derived override map, then catalog metadata
     (``update_frequency`` first, then ``latency_class``) if it has a
-    recognized value, then the conservative DAILY default.
+    recognized value, then the conservative DAILY default. A placeholder
+    ``update_frequency='DAILY'`` defers to a recognized ``latency_class``.
     """
     override = SOURCE_CADENCE_OVERRIDES.get(name.strip().lower())
     if override is not None:
         return override
+    latency = _METADATA_CADENCE.get(latency_class.strip().upper()) if latency_class else None
     if update_frequency:
         meta = _METADATA_CADENCE.get(update_frequency.strip().upper())
+        # update_frequency='DAILY' is the catalog's placeholder (106 of 107
+        # active rows on 2026-11-04, while latency_class carried WEEKLY x16,
+        # MONTHLY x14, QUARTERLY x2). It must not mask a coarser latency_class:
+        # that misread made monthly sources (NYFED_GSCPI, CEPII_BACI, Comtrade)
+        # "stale" 30h after every release.
+        if meta is DAILY and latency is not None:
+            return latency
         if meta is not None:
             return meta
     if latency_class:

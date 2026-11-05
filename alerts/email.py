@@ -11,6 +11,7 @@ TLS is forced for external SMTP to protect signal data in transit.
 
 from __future__ import annotations
 
+import html
 import smtplib
 import re
 import threading
@@ -418,7 +419,7 @@ def _do_send(
 def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
     """Render and send a newsletter email (non-blocking)."""
     html = _render_html(subject, sections, footer_note)
-    plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
+    plain = "\n\n".join(f"[{s['title']}]\n{s.get('plain', s.get('body', ''))}" for s in sections)
     _send_in_thread(subject, html, plain)
 
 
@@ -439,7 +440,7 @@ def _send_sync(
     treat an "uncertain" outcome as neither success nor a safe retry.
     """
     html = _render_html(subject, sections, footer_note)
-    plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
+    plain = "\n\n".join(f"[{s['title']}]\n{s.get('plain', s.get('body', ''))}" for s in sections)
     if research_recipients is None:
         return _do_send(subject, html, plain)
     return _do_send(subject, html, plain, research_recipients=research_recipients, delivery=delivery)
@@ -455,7 +456,16 @@ def send_alert(subject: str, body: str, severity: str = "info") -> bool:
         cfg = _get_settings()
         if not cfg.ALERT_EMAIL_ENABLED:
             return False
-        _send(f"[GRID {severity.upper()}] {subject}", [_section_text("Alert", body)])
+        # Callers pass plain text. Escape it for the HTML part (reasons like
+        # "RetryError[<Future ...>]" were parsed as tags and vanished) and
+        # keep its line structure; the plain part carries it verbatim.
+        section = _section_text(
+            "Alert",
+            '<div style="white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;'
+            f'font-size:12px;line-height:1.45;">{html.escape(body)}</div>',
+        )
+        section["plain"] = body
+        _send(f"[GRID {severity.upper()}] {subject}", [section])
         return True
     except Exception:
         return False

@@ -154,7 +154,7 @@ def _find_relevant_features(
 
     # Always check core signals that every query benefits from
     core_signals = [
-        "vix_spot", "move_index", "spy_full", "treasury_10y", "treasury_2y",
+        "vix_spot", "move_index", "spy_full", "treasury_10y", "yc_2y",
         "hyg_full", "dxy", "gold_spot", "wti_crude", "btc",
     ]
     # Security: use SQLAlchemy bindparams for the IN clause instead of

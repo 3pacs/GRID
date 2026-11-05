@@ -1305,7 +1305,9 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         "mod": "ingestion.altdata.gdelt",
         "cls": "GDELTPuller",
         "method": "pull_recent",
-        "freq_h": 0.083,
+        # GDELT answers grid-svr with 429 even for single requests at a
+        # 5-minute cadence (2026-11-04); hourly is within its tolerance.
+        "freq_h": 1,
         "timeout_s": 60,
         "kwargs": {
             "days_back": 1,
@@ -1440,10 +1442,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "nyfed_gscpi",           "mod": "ingestion.altdata.nyfed_gscpi",        "cls": "NYFedGSCPIPuller",           "method": "pull_all",  "freq_h": 24,  "timeout_s": 60},
     {"name": "stocktwits",            "mod": "ingestion.altdata.stocktwits",         "cls": "StockTwitsPuller",           "method": "pull_all",  "freq_h": 12,  "timeout_s": 60},
     {"name": "defillama",             "mod": "ingestion.altdata.defi_llama_puller",  "cls": "DefiLlamaPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
-    {"name": "dune",                  "mod": "ingestion.altdata.dune_puller",        "cls": "DunePuller",                 "method": "pull_all",  "freq_h": 6,   "timeout_s": 180, "api_key": "DUNE_API_KEY", "api_key_mode": "keyword"},
+    {"name": "dune",                  "mod": "ingestion.altdata.dune_puller",        "cls": "DunePuller",                 "method": "pull_all",  "freq_h": 6,   "timeout_s": 180, "api_key": "DUNE_API_KEY", "api_key_mode": "keyword",
+     "hold_reason": "Retired 2026-11-04 (owner): the three saved Dune queries (DUNE_QUERY_*) were never created; revisit when on-chain data is wanted"},
     {"name": "repo_market",           "mod": "ingestion.altdata.repo_market",        "cls": "RepoMarketPuller",           "method": "pull_all",  "freq_h": 168, "timeout_s": 120, "api_key": "FRED_API_KEY", "api_key_mode": "first"},
     {"name": "legislation",           "mod": "ingestion.altdata.legislation",        "cls": "LegislationPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
-    {"name": "earnings_calendar",     "mod": "ingestion.altdata.earnings_calendar",  "cls": "EarningsCalendarPuller",     "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
+    {"name": "earnings_calendar",     "mod": "ingestion.altdata.earnings_calendar",  "cls": "EarningsCalendarPuller",     "method": "pull_all",  "freq_h": 24,  "timeout_s": 300},
     {"name": "social_attention",      "mod": "ingestion.altdata.social_attention",   "cls": "WikipediaAttentionPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800,  "kwargs": {"max_tickers": 100}},
     {"name": "yield_curve_full",      "mod": "ingestion.altdata.yield_curve_full",   "cls": "FullYieldCurvePuller",       "method": "pull_all",  "freq_h": 24,  "timeout_s": 120, "api_key": "FRED_API_KEY", "api_key_mode": "first"},
     {"name": "sec_xbrl_financials",   "mod": "ingestion.altdata.sec_xbrl_financials","cls": "SECXBRLFinancialsPuller",    "method": "pull_all",  "freq_h": 168, "timeout_s": 1800, "kwargs": {"limit": 200}},
@@ -1452,7 +1455,8 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "ag_commodity_futures",  "mod": "ingestion.altdata.ag_commodity_futures","cls": "AgCommodityFuturesPuller",  "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
     {"name": "alphavantage_sentiment","mod": "ingestion.altdata.alphavantage_sentiment","cls": "AlphaVantageSentimentPuller","method": "pull_all","freq_h": 24,  "timeout_s": 180},
     {"name": "ads_index",             "mod": "ingestion.altdata.ads_index",          "cls": "ADSIndexPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
-    {"name": "baltic_exchange",       "mod": "ingestion.altdata.baltic_dry",         "cls": "BalticDryPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 60,  "api_key": "FRED_API_KEY", "api_key_mode": "first"},
+    {"name": "baltic_exchange",       "mod": "ingestion.altdata.baltic_dry",         "cls": "BalticDryPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 60,  "api_key": "FRED_API_KEY", "api_key_mode": "first",
+     "hold_reason": "Retired 2026-11-04 (owner): public snapshot frozen at 2026-05-20 and the FRED Baltic ids no longer exist; no free replacement found"},
     {"name": "finra_ats",             "mod": "ingestion.altdata.finra_ats",          "cls": "FINRAATSPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 120},
     # Held 2026-10-02: name matching is too loose to publish (71,903 matches against 204 actors,
     # mostly "partial" substring hits such as GTC MANAGEMENT LTD. -> Oaktree). See

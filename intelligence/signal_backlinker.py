@@ -481,8 +481,9 @@ if __name__ == "__main__":
     parser.add_argument("--trust-every", type=int, default=12, help="Trust update cadence in cycles; 0 disables.")
     args = parser.parse_args()
 
-    log.remove()
-    log.add(sys.stderr, level="INFO")
+    from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.remove()  # after the config import: importing config adds its own console sink
+    log.add(scrubbed_stderr, level="INFO", diagnose=LOG_DIAGNOSE)
     run_backlinker(
         interval=args.interval,
         lookback_minutes=args.lookback_minutes,
