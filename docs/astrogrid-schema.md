@@ -50,7 +50,9 @@ Allowed shared inputs are declared in:
 ## Migration
 Fresh install:
 1. apply [`/Users/anikdang/dev/GRID-astrogrid/schema.sql`](/Users/anikdang/dev/GRID-astrogrid/schema.sql)
-2. run `alembic stamp head`
+2. run `alembic stamp 7e4dfecce247` (the baseline — not `head`, which would
+   skip every later revision)
+3. run `alembic upgrade head`
 
 Existing install:
 1. run `alembic upgrade head`

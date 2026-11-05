@@ -24,7 +24,77 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+# ── Fresh-database bootstrap of the two runtime-owned tables ─────────────
+#
+# Neither ``discovered_hypotheses`` nor ``analytical_snapshots`` is created by
+# ``schema.sql`` or by any earlier revision: both come from runtime DDL
+# (``intelligence/hypothesis_engine.py::_SCHEMA_SQL`` and
+# ``store/snapshots.py::ANALYTICAL_SNAPSHOTS_DDL``). On a database that has
+# been running GRID they already exist, so these are no-ops there. On a
+# genuinely fresh database (schema.sql -> stamp 7e4dfecce247 -> upgrade head)
+# the ALTERs below would otherwise fail with UndefinedTable (issue #523).
+#
+# These are frozen copies of the runtime DDL at the time of writing.
+# ``tests/test_migration_runtime_ddl_parity.py`` checks that the columns the
+# migration chain gives each table stay a superset of the runtime DDL's, so a
+# runtime column added later fails CI until a migration adds it too.
+_BOOTSTRAP_DISCOVERED_HYPOTHESES = """
+    CREATE TABLE IF NOT EXISTS discovered_hypotheses (
+        id               TEXT PRIMARY KEY,
+        thesis           TEXT NOT NULL,
+        pattern_type     TEXT,
+        evidence         JSONB,
+        test_criteria    JSONB,
+        invalidation     TEXT,
+        confidence       DOUBLE PRECISION DEFAULT 0.5,
+        status           TEXT DEFAULT 'active',
+        times_tested     INTEGER DEFAULT 0,
+        times_correct    INTEGER DEFAULT 0,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        last_tested      TIMESTAMPTZ,
+        role             TEXT DEFAULT 'thesis',
+        pair_id          TEXT,
+        kill_reason      TEXT,
+        killed_at        TIMESTAMPTZ
+    )
+"""
+
+_BOOTSTRAP_ANALYTICAL_SNAPSHOTS = """
+    CREATE TABLE IF NOT EXISTS analytical_snapshots (
+        id            BIGSERIAL PRIMARY KEY,
+        snapshot_date DATE NOT NULL,
+        category      TEXT NOT NULL,
+        subcategory   TEXT,
+        as_of_date    DATE NOT NULL,
+        payload       JSONB NOT NULL,
+        actor_name    TEXT,
+        metrics       JSONB,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+"""
+
+
 def upgrade() -> None:
+    # ── Bootstrap runtime-owned tables on a fresh database ───────
+    op.execute(sa.text(_BOOTSTRAP_DISCOVERED_HYPOTHESES))
+    op.execute(sa.text(_BOOTSTRAP_ANALYTICAL_SNAPSHOTS))
+
+    # GRANT footer (migrations/_TEMPLATE.sql). Re-granting on a table that
+    # already exists is a no-op; guarded on the role so a developer database
+    # without a `grid` role still migrates.
+    op.execute(sa.text("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grid') THEN
+                EXECUTE 'GRANT ALL ON discovered_hypotheses TO grid';
+                EXECUTE 'GRANT ALL ON analytical_snapshots TO grid';
+                IF to_regclass('analytical_snapshots_id_seq') IS NOT NULL THEN
+                    EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE analytical_snapshots_id_seq TO grid';
+                END IF;
+            END IF;
+        END $$
+    """))
+
     # ── Add tsvector columns ─────────────────────────────────────
 
     # actors.search_vector

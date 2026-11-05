@@ -112,7 +112,45 @@ CREATE INDEX idx_intelligence_search_tsv ON intelligence_search USING GIN(tsv);
 """
 
 
+# ``news_articles`` is created at runtime by
+# ``ingestion/altdata/news_scraper.py::_ensure_news_table``, not by schema.sql
+# or any earlier revision, so a genuinely fresh database (schema.sql -> stamp
+# 7e4dfecce247 -> upgrade head) reaches this revision without it and the view
+# below fails with UndefinedTable (issue #523). No-op wherever the scraper has
+# already run. Frozen copy of the runtime DDL; column parity is checked by
+# ``tests/test_migration_runtime_ddl_parity.py``.
+_BOOTSTRAP_NEWS_ARTICLES = """
+    CREATE TABLE IF NOT EXISTS news_articles (
+        id SERIAL PRIMARY KEY,
+        dedup_hash TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        source TEXT NOT NULL,
+        url TEXT,
+        published_at TIMESTAMPTZ,
+        summary TEXT,
+        tickers TEXT[],
+        sentiment TEXT DEFAULT 'NEUTRAL',
+        confidence DOUBLE PRECISION DEFAULT 0.5,
+        llm_summary TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+"""
+
+
 def upgrade() -> None:
+    op.execute(sa.text(_BOOTSTRAP_NEWS_ARTICLES))
+    # GRANT footer (migrations/_TEMPLATE.sql); re-granting is a no-op.
+    op.execute(sa.text("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grid') THEN
+                EXECUTE 'GRANT ALL ON news_articles TO grid';
+                IF to_regclass('news_articles_id_seq') IS NOT NULL THEN
+                    EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE news_articles_id_seq TO grid';
+                END IF;
+            END IF;
+        END $$
+    """))
     op.execute(sa.text(_REBUILD_SQL))
 
 

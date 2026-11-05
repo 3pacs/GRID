@@ -284,6 +284,13 @@ def test_analytical_snapshots_has_exactly_one_ddl() -> None:
             continue
         if rel == Path("store/snapshots.py"):
             continue
+        # phase4_fts_001 bootstraps the table on a fresh database (issue
+        # #523) with a frozen copy of the canonical DDL. That copy is held to
+        # the canonical columns, in both directions, by
+        # tests/test_migration_runtime_ddl_parity.py, so it cannot become a
+        # rival definition.
+        if rel == Path("migrations/versions/phase4_fts_intelligence_search.py"):
+            continue
         try:
             if pattern.search(path.read_text(errors="ignore")):
                 offenders.append(str(rel))
