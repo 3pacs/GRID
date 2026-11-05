@@ -384,7 +384,7 @@ def run_extractor(interval: int = 300) -> None:
 
 
 if __name__ == "__main__":
-    log.remove()
     from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.remove()  # after the config import: importing config adds its own console sink
     log.add(scrubbed_stderr, level="INFO", diagnose=LOG_DIAGNOSE)
     run_extractor()
