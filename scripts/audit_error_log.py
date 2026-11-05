@@ -40,6 +40,11 @@ _NORMALIZERS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "<DATE>"),
     (re.compile(r"\bapiKey=[A-Za-z0-9]+"), "apiKey=<REDACTED>"),
     (re.compile(r"\b(0x)?[0-9a-fA-F]{32,}\b"), "<HEX>"),
+    # Object reprs: "<Future at 0x7f3a2b1c4d50 state=...>" (short 0x addresses).
+    (re.compile(r"\b0x[0-9a-fA-F]{6,}\b"), "<ADDR>"),
+    # Base58 Solana addresses (32-44 chars). Requiring a digit keeps long
+    # plain words out; snake_case names never match (no "_" in base58).
+    (re.compile(r"(?<![A-Za-z0-9])(?=[1-9A-HJ-NP-Za-km-z]*[1-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![A-Za-z0-9])"), "<B58>"),
     (re.compile(r"\b\d+\.\d+\.\d+\.\d+\b"), "<IP>"),
     (re.compile(r"\b[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}\b", re.I), "<UUID>"),
     (re.compile(r"FRED pull failed for [A-Z0-9_]+:"), "FRED pull failed for <SID>:"),

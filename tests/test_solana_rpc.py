@@ -207,3 +207,91 @@ def test_context_manager_does_not_close_external_client(mock_http):
     with rpc:
         pass
     mock_http.close.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# HTTP 429 — bounded retry, warning not error (2026-11-05: public RPC 429s
+# were logged at ERROR with no retry)
+# ----------------------------------------------------------------------
+@pytest.fixture()
+def log_records():
+    from loguru import logger
+
+    records: list = []
+    handler_id = logger.add(lambda m: records.append(m.record), level="DEBUG")
+    yield records
+    logger.remove(handler_id)
+
+
+def _http_status(status: int, headers: dict | None = None) -> httpx.Response:
+    request = httpx.Request("POST", "https://api.mainnet-beta.solana.com")
+    return httpx.Response(status, request=request, headers=headers or {}, json={})
+
+
+def _rpc_levels(records) -> list[str]:
+    return [
+        r["level"].name for r in records
+        if r["name"] == "trading.solana.solana_rpc" and r["level"].name != "DEBUG"
+    ]
+
+
+def test_429_retries_then_succeeds(mock_http, log_records):
+    ok = _make_response({"jsonrpc": "2.0", "id": 1, "result": {"value": []}})
+    mock_http.post.side_effect = [_http_status(429), ok]
+    sleeps: list[float] = []
+    rpc = SolanaRPC(client=mock_http, sleep=sleeps.append)
+    assert rpc.get_token_largest_accounts("MINT1") == []
+    assert mock_http.post.call_count == 2
+    assert sleeps == [1.0]
+    assert _rpc_levels(log_records) == []
+
+
+def test_429_exhausted_raises_with_warning(mock_http, log_records):
+    mock_http.post.return_value = _http_status(429)
+    sleeps: list[float] = []
+    rpc = SolanaRPC(client=mock_http, sleep=sleeps.append)
+    with pytest.raises(SolanaRPCError, match="429"):
+        rpc.get_token_largest_accounts("MINT1")
+    assert mock_http.post.call_count == 3  # 1 + 2 bounded retries
+    assert sleeps == [1.0, 2.0]
+    assert _rpc_levels(log_records) == ["WARNING"]
+
+
+def test_429_honours_retry_after_with_cap(mock_http):
+    mock_http.post.side_effect = [
+        _http_status(429, {"Retry-After": "0.5"}),
+        _http_status(429, {"Retry-After": "120"}),
+        _http_status(429),
+    ]
+    sleeps: list[float] = []
+    rpc = SolanaRPC(client=mock_http, sleep=sleeps.append)
+    with pytest.raises(SolanaRPCError):
+        rpc.get_mint_info("MINT1")
+    assert sleeps == [0.5, 5.0]
+
+
+def test_429_retries_can_be_disabled(mock_http):
+    mock_http.post.return_value = _http_status(429)
+    sleeps: list[float] = []
+    rpc = SolanaRPC(client=mock_http, rate_limit_retries=0, sleep=sleeps.append)
+    with pytest.raises(SolanaRPCError):
+        rpc.get_mint_info("MINT1")
+    assert mock_http.post.call_count == 1 and sleeps == []
+
+
+def test_non_429_http_error_still_logs_error_without_retry(mock_http, log_records):
+    mock_http.post.return_value = _http_status(500)
+    sleeps: list[float] = []
+    rpc = SolanaRPC(client=mock_http, sleep=sleeps.append)
+    with pytest.raises(SolanaRPCError):
+        rpc.get_mint_info("MINT1")
+    assert mock_http.post.call_count == 1 and sleeps == []
+    assert _rpc_levels(log_records) == ["ERROR"]
+
+
+def test_transport_error_logs_warning(mock_http, log_records):
+    mock_http.post.side_effect = httpx.ConnectError("down")
+    rpc = SolanaRPC(client=mock_http, sleep=lambda _s: None)
+    with pytest.raises(SolanaRPCError):
+        rpc.get_mint_info("MINT1")
+    assert _rpc_levels(log_records) == ["WARNING"]
