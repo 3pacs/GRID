@@ -26,7 +26,7 @@ import requests
 
 
 DEFAULT_COORDINATOR = os.getenv("GRID_COORDINATOR_URL", "http://100.75.185.36:8100")
-DEFAULT_HOSTS = ("grid-svr", "gridz4", "koala", "redbox", "ocr-node", "p9d", "z400", "panda")
+DEFAULT_HOSTS = ("grid-svr", "gridz4", "koala", "redbox", "ocr-node", "forge", "z400", "panda")
 SERVICE_NEEDLES = ("grid-", "storymill-", "llama", "ollama", "comfyui", "topaz", "surya")
 REMOTE_PROBE = r"""
 import json
@@ -433,14 +433,14 @@ def build_findings(
                 )
             )
 
-        if snapshot.host == "p9d" and snapshot.gpus and not _has_service(snapshot, "ollama"):
+        if snapshot.host == "forge" and snapshot.gpus and not _has_service(snapshot, "ollama"):
             findings.append(
                 Finding(
                     severity="info",
-                    code="p9d_no_ollama",
+                    code="forge_no_ollama",
                     host=snapshot.host,
-                    summary="p9d has GPUs but no Ollama service detected.",
-                    proposed_action="Keep p9d as Graphics/ComfyUI unless it is explicitly promoted to an LLM lane.",
+                    summary="forge has GPUs but no Ollama service detected.",
+                    proposed_action="Keep forge as Graphics/ComfyUI unless it is explicitly promoted to an LLM lane.",
                     details={"gpu_count": len(snapshot.gpus)},
                 )
             )
