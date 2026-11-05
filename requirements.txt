@@ -33,7 +33,7 @@ statsmodels>=0.15.0
 tsfresh>=0.21.2
 
 # Graph analytics
-networkx>=3.2.0
+networkx>=3.7
 python-louvain>=0.16
 
 # Visualization (for orthogonality audit outputs)
