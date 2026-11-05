@@ -116,6 +116,41 @@ def _require_prediction_payload_shapes(payload: Mapping[str, Any]) -> None:
             raise TypeError(f"{field} must be a mapping, got {type(value).__name__}")
 
 
+def _decode_legacy_target_symbols(value: Any) -> tuple[Any, bool]:
+    """Read ``target_symbols``, undoing the char-list corruption of legacy rows.
+
+    ``generate_crypto_predictions.py`` passed ``json.dumps([symbol])`` until
+    2026-11-05 and ``save_prediction`` stored ``list()`` of that string, so
+    the row holds ``['[', '"', 'B', 'T', 'C', '"', ']']``. Only a list of
+    single characters that joins into a JSON list of strings is decoded, so
+    real one-letter tickers (``["F", "T"]``) are left alone. The stored bytes
+    are never changed; the caller flags the record as decoded.
+    """
+    symbols = _json_loads(value, [])
+    if not isinstance(symbols, list) or not symbols:
+        return symbols, False
+    if not all(isinstance(item, str) and len(item) == 1 for item in symbols):
+        return symbols, False
+    try:
+        decoded = json.loads("".join(symbols))
+    except json.JSONDecodeError:
+        return symbols, False
+    if isinstance(decoded, list) and decoded and all(isinstance(item, str) and item for item in decoded):
+        return decoded, True
+    return symbols, False
+
+
+def _decode_legacy_json_object(value: Any) -> tuple[Any, bool]:
+    """Read a jsonb payload column; flag rows stored as a JSON *string*.
+
+    psycopg2 returns a jsonb object as a dict and a jsonb string as ``str``.
+    The legacy crypto rows hold the latter, which ``_json_loads`` already
+    parsed before this helper existed; the helper only adds the flag.
+    """
+    decoded = _json_loads(value, {})
+    return decoded, isinstance(value, str) and isinstance(decoded, dict)
+
+
 def _json_loads(value: Any, default: Any) -> Any:
     if value is None:
         return default
@@ -2542,6 +2577,8 @@ class AstroGridStore:
 
     def _prediction_row_to_dict(self, row: Any, detailed: bool = False) -> dict[str, Any]:
         feature_family_summary = _json_loads(row[29 if detailed else 26], {})
+        target_symbols, symbols_decoded = _decode_legacy_target_symbols(row[6])
+        legacy_fields = ["target_symbols"] if symbols_decoded else []
         data = {
             "prediction_id": row[0],
             "created_at": row[1].isoformat() if row[1] else None,
@@ -2551,7 +2588,7 @@ class AstroGridStore:
             "question_intent": feature_family_summary.get("question_intent"),
             "target_group": feature_family_summary.get("target_group"),
             "scoring_class": row[5],
-            "target_symbols": _json_loads(row[6], []),
+            "target_symbols": target_symbols,
             "question": row[7],
             "call": row[8],
             "timing": row[9],
@@ -2577,14 +2614,23 @@ class AstroGridStore:
             },
         }
         if detailed:
-            data["market_overlay_snapshot"] = _json_loads(row[14], {})
-            data["mystical_feature_payload"] = _json_loads(row[15], {})
-            data["grid_feature_payload"] = _json_loads(row[16], {})
+            for field, index in (
+                ("market_overlay_snapshot", 14),
+                ("mystical_feature_payload", 15),
+                ("grid_feature_payload", 16),
+            ):
+                data[field], decoded = _decode_legacy_json_object(row[index])
+                if decoded:
+                    legacy_fields.append(field)
             data["postmortem"]["raw_payload"] = _json_loads(row[30], {})
+        # Provenance: the stored row is untouched; these fields were decoded on read.
+        data["legacy_payload_decoded"] = bool(legacy_fields)
+        data["legacy_decoded_fields"] = legacy_fields
         return data
 
     def _postmortem_row_to_dict(self, row: Any) -> dict[str, Any]:
         feature_family_summary = _json_loads(row[14], {})
+        target_symbols, symbols_decoded = _decode_legacy_target_symbols(row[4])
         return {
             "prediction_id": row[0],
             "created_at": row[1].isoformat() if row[1] else None,
@@ -2592,7 +2638,9 @@ class AstroGridStore:
             "question_intent": feature_family_summary.get("question_intent"),
             "target_group": feature_family_summary.get("target_group"),
             "scoring_class": row[3],
-            "target_symbols": _json_loads(row[4], []),
+            "target_symbols": target_symbols,
+            "legacy_payload_decoded": symbols_decoded,
+            "legacy_decoded_fields": ["target_symbols"] if symbols_decoded else [],
             "call": row[5],
             "timing": row[6],
             "invalidation": row[7],

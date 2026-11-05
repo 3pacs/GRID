@@ -19,7 +19,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from store.astrogrid import AstroGridStore
+from store.astrogrid import (
+    AstroGridStore,
+    _decode_legacy_json_object,
+    _decode_legacy_target_symbols,
+)
 
 NOW = datetime(2026, 11, 5, 16, 29, 44, 719091, tzinfo=timezone.utc)
 PRICES = {"BTC": 77453.86, "ETH": 2274.77, "SOL": 92.83}
@@ -163,3 +167,81 @@ def test_main_exits_nonzero_when_some_predictions_are_not_stored(gen, monkeypatc
 
 def test_main_exits_nonzero_when_nothing_is_stored(gen, monkeypatch) -> None:
     assert _run_main(gen, monkeypatch, lambda p: None) == 1
+
+
+# --- Read-side normalizer for the legacy rows (42,488 grid-crypto-v1 rows on
+# grid-svr written 2026-03-29..2026-11-05). Stored bytes stay untouched.
+
+LEGACY_BTC = list(json.dumps(["BTC"]))  # ['[', '"', 'B', 'T', 'C', '"', ']']
+
+
+@pytest.mark.parametrize(
+    "stored, expected, decoded",
+    [
+        (LEGACY_BTC, ["BTC"], True),
+        (list(json.dumps(["ETH", "SOL"])), ["ETH", "SOL"], True),
+        (["BTC"], ["BTC"], False),
+        (["F", "T"], ["F", "T"], False),  # real one-letter tickers stay as-is
+        (["[", "]"], ["[", "]"], False),  # joins to an empty list: not decoded
+        (list(json.dumps([1])), list(json.dumps([1])), False),  # non-string symbols
+        ([], [], False),
+        (None, [], False),
+        (json.dumps(LEGACY_BTC), ["BTC"], True),  # driver handed back JSON text
+    ],
+)
+def test_decode_legacy_target_symbols(stored, expected, decoded) -> None:
+    assert _decode_legacy_target_symbols(stored) == (expected, decoded)
+
+
+def test_decode_legacy_json_object_flags_jsonb_strings_only() -> None:
+    # psycopg2 hands back a jsonb string as str and a jsonb object as dict.
+    assert _decode_legacy_json_object(json.dumps({"prices": PRICES})) == ({"prices": PRICES}, True)
+    assert _decode_legacy_json_object({"prices": PRICES}) == ({"prices": PRICES}, False)
+    assert _decode_legacy_json_object(None) == ({}, False)
+
+
+def _detailed_row(target_symbols, overlay, mystical, grid) -> tuple:
+    row = [None] * 31
+    row[0] = "legacy-1"
+    row[1] = row[2] = NOW
+    row[3], row[4], row[5] = "swing", "hybrid", "liquid_market"
+    row[6] = target_symbols
+    row[7:14] = ["q", "call", "timing", "setup", "inv", "note", ""]
+    row[14], row[15], row[16] = overlay, mystical, grid
+    row[17], row[18], row[19], row[20] = "astrogrid-v1", "grid-crypto-v1", "live", "pending"
+    row[26] = row[27] = []
+    row[29] = row[30] = {}
+    return tuple(row)
+
+
+def test_prediction_detail_decodes_legacy_row_and_flags_it() -> None:
+    store = AstroGridStore(MagicMock())
+    row = _detailed_row(LEGACY_BTC, json.dumps({"prices": PRICES}), json.dumps({}),
+                        json.dumps({"thesis": "neutral", "conviction": 0.4}))
+    data = store._prediction_row_to_dict(row, detailed=True)
+    assert data["target_symbols"] == ["BTC"]
+    assert data["market_overlay_snapshot"] == {"prices": PRICES}
+    assert data["grid_feature_payload"] == {"thesis": "neutral", "conviction": 0.4}
+    assert data["legacy_payload_decoded"] is True
+    assert data["legacy_decoded_fields"] == [
+        "target_symbols", "market_overlay_snapshot", "mystical_feature_payload", "grid_feature_payload",
+    ]
+
+
+def test_prediction_detail_for_clean_row_is_not_flagged() -> None:
+    store = AstroGridStore(MagicMock())
+    row = _detailed_row(["BTC"], {"prices": PRICES}, {}, {"thesis": "neutral"})
+    data = store._prediction_row_to_dict(row, detailed=True)
+    assert data["target_symbols"] == ["BTC"]
+    assert data["legacy_payload_decoded"] is False
+    assert data["legacy_decoded_fields"] == []
+
+
+def test_postmortem_list_decodes_legacy_symbols() -> None:
+    store = AstroGridStore(MagicMock())
+    row = ["legacy-1", NOW, "swing", "liquid_market", LEGACY_BTC, "call", "t", "inv", "pending",
+           "pending", "summary", [], [], "inv", {}]
+    data = store._postmortem_row_to_dict(row)
+    assert data["target_symbols"] == ["BTC"]
+    assert data["legacy_payload_decoded"] is True
+    assert data["legacy_decoded_fields"] == ["target_symbols"]
