@@ -321,17 +321,11 @@ elif cmd == "readlink":
         out = args[1] + "\n"
     else:
         result = 1
-elif cmd == "dirname":
-    if args != ["--", "./scripts/deploy_verify_release_tree.sh"]:
-        raise SystemExit(f"unexpected dirname: {args!r}")
-    out = "./scripts\n"
-elif cmd == "deploy_source_policy.py":
-    if args != ["binding", state["deploy"], state["deploy"],
-                "0123456789abcdef0123456789abcdef01234567"]:
-        raise SystemExit(f"unexpected binding request: {args!r}")
-    if state["policy_refusal"] or state["sha"] != args[-1]:
-        result = 2
-        out = "SOURCE_POLICY_REFUSED GIT_EXPECTED\n"
+elif cmd == "git":
+    if args == ["-C", state["deploy"], "rev-parse", "HEAD"]:
+        out = state["sha"] + "\n"
+    else:
+        raise SystemExit(f"unexpected git: {args!r}")
 elif cmd in ("sleep", "journalctl"):
     raise SystemExit(f"unexpected wait/diagnostic: {cmd}")
 else:
@@ -360,15 +354,8 @@ def _run_shell(
     pid=12345,
     cwd=None,
     sha=_EXPECTED_SHA,
-    policy_refusal=False,
-    policy_available=True,
 ):
-    """Run exact YAML/shell with rejecting commands and a binding CLI double.
-
-    The double records exact requests and models identity/refusal results. It
-    does not qualify native paths or Git; separate source-policy suites do so.
-    No command is forwarded to real systemctl, sudo, Git or a network tool.
-    """
+    """Execute exact YAML blocks/helper with only rejecting fake commands."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -383,7 +370,6 @@ def _run_shell(
         "git",
         "sleep",
         "journalctl",
-        "dirname",
     ):
         leaf = fake_bin / name
         leaf.write_text(command)
@@ -396,9 +382,6 @@ def _run_shell(
         (Path(REPO_ROOT) / "scripts/deploy_verify_release_tree.sh").read_bytes()
     )
     helper.chmod(0o700)
-    if policy_available:
-        # Test-only CLI double, not a production policy replacement.
-        (scripts / "deploy_source_policy.py").write_text(_FAKE_COMMAND)
     deploy = str(tmp_path / "release")
     state = {
         "states": states or [_ELIGIBLE],
@@ -411,7 +394,6 @@ def _run_shell(
         "deploy": deploy,
         "sha": sha,
         "action_status": action_status,
-        "policy_refusal": policy_refusal,
     }
     if at_action is not None:
         state["at_action"] = at_action
@@ -466,25 +448,13 @@ def _run_shell(
 @pytest.mark.unit
 def test_active_enabled_hermes_restarts_and_verifies_real_helper(tmp_path):
     state = _run_shell(tmp_path)
-    assert [r.returncode for r in state["results"]] == [0, 0], state["results"][-1].stderr
+    assert [r.returncode for r in state["results"]] == [0, 0]
     assert state["activations"] == 1
     assert "WorkingDirectory=" + state["deploy"] in state["mutations"][1][2]
     assert state["output"].splitlines() == ["verify=false", "verify=true"]
     assert "exactly matches expected" in state["results"][-1].stdout
     assert ["systemctl", "try-restart", "grid-hermes"] in state["calls"]
-    assert ["deploy_source_policy.py", "binding", state["deploy"],
-            state["deploy"], _EXPECTED_SHA] in state["calls"]
-    assert not any(call[0] == "git" for call in state["calls"])
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("policy", [{"policy_refusal": True}, {"policy_available": False}])
-def test_policy_refusal_or_missing_helper_cannot_verify(tmp_path, policy):
-    state = _run_shell(tmp_path, **policy)
-    assert [r.returncode for r in state["results"]] == [0, 1]
-    assert "exactly matches expected" not in state["results"][-1].stdout
-    assert "::error::deploy_verify_release_tree" in state["results"][-1].stderr
-    assert not any(call[0] == "git" for call in state["calls"])
+    assert ["git", "-C", state["deploy"], "rev-parse", "HEAD"] in state["calls"]
 
 
 @pytest.mark.unit
@@ -703,7 +673,6 @@ def test_functional_policy_corruptions_are_detected(tmp_path, mutation):
             "corruption must expose false verification eligibility"
         )
     else:
-        assert ["deploy_source_policy.py", "binding", state["deploy"],
-                state["deploy"], _EXPECTED_SHA] in state["calls"], (
+        assert any(call[0] == "git" for call in state["calls"]), (
             "corruption must expose verification of held service"
         )

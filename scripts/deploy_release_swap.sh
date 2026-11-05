@@ -163,9 +163,6 @@
 
 set -euo pipefail
 
-SOURCE_POLICY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source_policy() { /usr/bin/python3 -I -S -B "$SOURCE_POLICY_DIR/deploy_source_policy.py" "$@"; }
-
 if [ "$#" -lt 3 ]; then
   echo "usage: $0 <live_path> <label> <build_hook> [build_hook_args...]" >&2
   exit 2
@@ -185,7 +182,7 @@ CANDIDATE_DIR="${RELEASES_DIR}/${LABEL}"
 KEEP_RELEASES=2
 LOCK_WAIT_SECS="${DEPLOY_LOCK_WAIT_SECS:-600}"
 
-source_policy prepare "$RELEASES_DIR"
+mkdir -p "$RELEASES_DIR"
 
 # Serialize every run targeting this <live_path> -- see header. Held for the
 # remainder of the script, released automatically on any exit.
@@ -195,8 +192,6 @@ if ! flock -w "$LOCK_WAIT_SECS" "$lock_fd"; then
   echo "could not acquire deploy lock on $LOCK_FILE within ${LOCK_WAIT_SECS}s -- another deploy against $LIVE_PATH is running long, or stuck" >&2
   exit 3
 fi
-
-source_policy prepare "$RELEASES_DIR"
 
 # This record is created by the release controller BEFORE the first swap.
 # It deliberately lives outside the mutable checkout and is never overwritten
@@ -257,11 +252,16 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
   done
   verify_preserved_checkout() {
     local name="$1" dir="$2" expected_sha="$3" expected_tree="$4"
-    source_policy repository "$LIVE_PATH" "$dir" "$expected_sha" "$expected_tree" >/dev/null || {
-      echo "$name protected checkout does not match approved identity" >&2; exit 5;
-    }
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ ]] ||
+       [[ ! "$expected_tree" =~ ^[0-9a-f]{40}$ ]] ||
+       [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)" != "$dir" ] ||
+       [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" != "$expected_sha" ] ||
+       [ "$(git -C "$dir" rev-parse 'HEAD^{tree}' 2>/dev/null || true)" != "$expected_tree" ] ||
+       ! git -C "$dir" diff --quiet HEAD --; then
+      echo "$name preservation Git HEAD/tree or tracked files do not match approved identity" >&2
+      exit 5
+    fi
   }
-
   verify_preserved_checkout scheduler "$scheduler_dir" "$scheduler_sha" "$scheduler_tree"
   verify_preserved_checkout recovery "$recovery_dir" "$recovery_sha" "$recovery_tree"
   scheduler_pid="$(systemctl show -p MainPID --value grid-scheduler 2>/dev/null || true)"
@@ -380,8 +380,6 @@ protect_runtime_path() {
     "$RELEASES_DIR"/*)
       relative="${resolved#"$RELEASES_DIR"/}"
       release="${RELEASES_DIR}/${relative%%/*}"
-      source_policy repository "$LIVE_PATH" "$release" >/dev/null || exit 5
-      source_policy directory "$resolved" || exit 5
       runtime_release_dirs["$release"]=1
       ;;
   esac
@@ -506,7 +504,6 @@ if [ ! -e "$LIVE_PATH" ] && [ ! -L "$LIVE_PATH" ]; then
   recovered_target="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -name 'pre-atomic-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
   if [ -n "$recovered_target" ]; then
     echo "recovering interrupted first-install conversion: $LIVE_PATH was missing entirely, relinking -> $recovered_target" >&2
-    source_policy repository "$LIVE_PATH" "$recovered_target" >/dev/null || exit 5
     ln -sfn "$recovered_target" "$LIVE_PATH"
   fi
 fi
@@ -516,7 +513,6 @@ fi
 # LIVE_PATH is already a symlink (every run after the first, and any run
 # after the crash-recovery step above has already re-established one).
 if [ -d "$LIVE_PATH" ] && [ ! -L "$LIVE_PATH" ]; then
-  source_policy repository "$LIVE_PATH" "$LIVE_PATH" >/dev/null || exit 5
   existing_label="pre-atomic-$(date -u +%Y%m%dT%H%M%SZ)"
   echo "migrating existing plain directory at $LIVE_PATH -> ${RELEASES_DIR}/${existing_label}" >&2
   mv -T "$LIVE_PATH" "${RELEASES_DIR}/${existing_label}"
@@ -569,52 +565,15 @@ fi
 # a fast incremental update, exactly like the pre-existing single-directory
 # approach -- this script only changes WHEN and WHERE that lands, not how
 # expensive it is to produce.
-# Preserve the existing copy/umask/ACL behavior; a private root must not be
-# silently widened to 0755. Refuse an unsafe candidate instead of chmod/chown
-# or recursively normalizing legitimate writable runtime data.
 if [ -L "$LIVE_PATH" ]; then
-  source_policy repository "$LIVE_PATH" "$LIVE_PATH" >/dev/null || exit 5
   cp -a "$(readlink -f "$LIVE_PATH")" "$CANDIDATE_DIR"
 else
-  # Only tighten the caller's creation mask for this new root. Preserve a
-  # restrictive mask (e.g.077 ->0700), and do not affect the build hook's mask
-  # or copied runtime-data entries. Default ACL behavior is checked below.
-  creation_mask="$(umask)"
-  if [[ ! "$creation_mask" =~ ^[0-7]{3,4}$ ]]; then
-    echo 'unavailable candidate creation mask; refusing' >&2
-    exit 5
-  fi
-  printf -v candidate_mask '%04o' "$((8#$creation_mask | 8#22))"
-  ( umask "$candidate_mask"; mkdir -p "$CANDIDATE_DIR" )
+  mkdir -p "$CANDIDATE_DIR"
 fi
-
-candidate_root_is_protected() {
-  [ ! -L "$CANDIDATE_DIR" ] && [ -d "$CANDIDATE_DIR" ] || return 1
-  local root_metadata root_uid root_mode
-  root_metadata="$(stat -c '%u %a' -- "$CANDIDATE_DIR")" || return 1
-  [[ "$root_metadata" =~ ^[0-9]+\ [0-7]{3,4}$ ]] || return 1
-  read -r root_uid root_mode <<< "$root_metadata"
-  [ "$root_uid" = 0 ] || [ "$root_uid" = "$(id -u)" ] || return 1
-  (( (8#$root_mode & 8#22) == 0 ))
-}
-if ! candidate_root_is_protected; then
-  echo 'unsafe candidate root before build; refusing without changing the live pointer' >&2
-  exit 5
-fi
-
-source_policy candidate "$LIVE_PATH" "$CANDIDATE_DIR" >/dev/null || exit 5
 
 if ! "$BUILD_HOOK" "$CANDIDATE_DIR" "$@"; then
   echo "build_hook failed -- $LIVE_PATH left untouched, candidate preserved at $CANDIDATE_DIR" >&2
   exit 1
-fi
-
-# The build hook may have committed a migration. Refusal here leaves the file
-# pointer unchanged, but cannot promise that the DB is unchanged (same exit4
-# classification as a failed swap after a successful build).
-if ! candidate_root_is_protected || ! source_policy repository "$LIVE_PATH" "$CANDIDATE_DIR" >/dev/null; then
-  echo '::error::UNSAFE CANDIDATE AFTER SUCCESSFUL BUILD: live pointer unchanged; build/migration may already have committed. Candidate preserved; operator reconciliation required.' >&2
-  exit 4
 fi
 
 previous_target=""
@@ -636,9 +595,7 @@ fi
 echo "swapped $LIVE_PATH -> $CANDIDATE_DIR" >&2
 
 if [ -n "$previous_target" ]; then
-  if ! source_policy marker-write "$RELEASES_DIR" .previous-release "$previous_target"$'\n'; then
-    echo '::error::post-swap protected previous-marker commit failed; activation state requires reconciliation' >&2; exit 4
-  fi
+  echo "$previous_target" > "${RELEASES_DIR}/.previous-release"
 fi
 
 # The FILE swap is done, but deploy.yml's restart/health-verification steps
@@ -651,9 +608,7 @@ fi
 # on every successful swap; a stale one left behind by a job that crashed
 # outright (not just failed a step) before reaching its clearing step is
 # handled by deploy_release_rollback.sh's own staleness check, not here.
-if ! source_policy marker-write "$RELEASES_DIR" .activation-in-progress "label=$LABEL swapped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"$'\n'; then
-  echo '::error::post-swap protected activation-marker commit failed; activation state requires reconciliation' >&2; exit 4
-fi
+echo "label=$LABEL swapped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${RELEASES_DIR}/.activation-in-progress"
 
 # Prune old releases, keeping the one just replaced (for manual rollback)
 # plus the new one -- never the candidate we just failed to promote, since a

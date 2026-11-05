@@ -33,9 +33,6 @@
 
 set -euo pipefail
 
-SOURCE_POLICY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source_policy() { /usr/bin/python3 -I -S -B "$SOURCE_POLICY_DIR/deploy_source_policy.py" "$@"; }
-
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 <live_path> <label>" >&2
   exit 2
@@ -48,23 +45,21 @@ MARKER="${RELEASES_DIR}/.activation-in-progress"
 LOCK_FILE="${RELEASES_DIR}/.lock"
 LOCK_WAIT_SECS="${DEPLOY_LOCK_WAIT_SECS:-600}"
 
-source_policy prepare "$RELEASES_DIR"
+mkdir -p "$RELEASES_DIR"
 exec {lock_fd}>"$LOCK_FILE"
 if ! flock -w "$LOCK_WAIT_SECS" "$lock_fd"; then
   echo "could not acquire deploy lock on $LOCK_FILE within ${LOCK_WAIT_SECS}s -- leaving $MARKER untouched" >&2
   exit 3
 fi
 
-source_policy prepare "$RELEASES_DIR"
-
 if [ ! -f "$MARKER" ]; then
   echo "$MARKER does not exist -- nothing to clear" >&2
   exit 0
 fi
 
-clear_result="$(source_policy marker-clear "$RELEASES_DIR" "$LABEL")"
-case "$clear_result" in
-  '{"cleared": true}') echo 'cleared protected activation marker for this deploy' >&2 ;;
-  '{"cleared": false}') echo 'activation marker belongs to a different deploy; left unchanged' >&2 ;;
-  *) echo 'protected marker cleanup returned malformed result; reconciliation required' >&2; exit 5 ;;
-esac
+if grep -q "^label=${LABEL} " "$MARKER" 2>/dev/null; then
+  rm -f "$MARKER"
+  echo "cleared $MARKER (label=$LABEL)" >&2
+else
+  echo "not clearing $MARKER -- it belongs to a different deploy (this one is label=$LABEL): $(cat "$MARKER" 2>/dev/null)" >&2
+fi
