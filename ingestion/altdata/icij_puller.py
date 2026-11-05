@@ -75,14 +75,22 @@ class ICIJPuller(BasePuller):
 
         return extracted
 
-    def pull(self) -> dict[str, int]:
+    def pull(self) -> dict[str, Any]:
         """Download and ingest all ICIJ datasets.
 
         Returns:
-            Dict with counts per table.
+            The scheduler write contract (``smart_scheduler._classify_outcome``):
+            ``status`` and ``rows_inserted`` — rows the INSERTs actually
+            added, counted after each file's transaction committed. Node
+            tables conflict on ``node_id`` and relationships skip an
+            identical stored edge, so re-loading an unchanged dump is
+            NO_NEW_DATA. ``by_table`` has the per-table committed counts.
+            A missing file or a failed load is PARTIAL with the committed
+            rows (FAILED when nothing loaded at all).
         """
         csv_dir = self.download_data()
         counts: dict[str, int] = {}
+        errors: list[str] = []
 
         # Map CSV filenames to table names and columns
         file_map = {
@@ -97,24 +105,54 @@ class ICIJPuller(BasePuller):
             csv_files = list(csv_dir.rglob(f"*{pattern}*"))
             if not csv_files:
                 log.warning("No CSV found for pattern {p}", p=pattern)
+                errors.append(f"no CSV found for {pattern}")
                 continue
 
             for csv_file in csv_files:
-                n = inserter(csv_file)
+                try:
+                    n = inserter(csv_file)
+                except Exception as exc:
+                    log.warning("ICIJ load of {f} into {t} failed: {e}",
+                                f=csv_file.name, t=table, e=str(exc))
+                    errors.append(f"{csv_file.name}: {exc}")
+                    continue
                 counts[table] = counts.get(table, 0) + n
-                log.info("Loaded {n} rows into {t} from {f}", n=n, t=table, f=csv_file.name)
+                log.info("Loaded {n} new rows into {t} from {f}", n=n, t=table, f=csv_file.name)
 
         total = sum(counts.values())
-        log.info("ICIJ ingestion complete: {t} total rows across {n} tables",
-                 t=total, n=len(counts))
+        log.info("ICIJ ingestion complete: {t} new rows across {n} tables, {e} load errors",
+                 t=total, n=len(counts), e=len(errors))
 
         # Auto-discover actors from all loaded entities and officers
-        self._discover_actors()
+        actors_added = self._discover_actors()
 
-        return counts
+        if errors:
+            status = "PARTIAL" if total > 0 else "FAILED"
+        else:
+            status = "SUCCESS"
+        result: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": total,
+            "by_table": counts,
+            "actors_added": actors_added,
+        }
+        if errors:
+            result["error"] = f"{len(errors)} ICIJ loads failed: " + "; ".join(errors[:5])
+        return result
 
-    def _discover_actors(self) -> None:
-        """Scan loaded ICIJ data and auto-add actors to the network."""
+    @staticmethod
+    def _affected(result: Any) -> int:
+        """Rows one INSERT added (0 for ON CONFLICT DO NOTHING / NOT EXISTS skips)."""
+        rowcount = getattr(result, "rowcount", None)
+        return rowcount if isinstance(rowcount, int) and rowcount > 0 else 0
+
+    def _discover_actors(self) -> int:
+        """Scan loaded ICIJ data and auto-add actors to the network.
+
+        Returns:
+            Actors added (0 when discovery failed; it never fails the pull).
+        """
+        added = 0
         try:
             from intelligence.actor_ingest import ingest_actor
 
@@ -123,7 +161,6 @@ class ICIJPuller(BasePuller):
                 officers = conn.execute(
                     text("SELECT name, country_codes FROM icij_officers WHERE name != '' LIMIT 100000")
                 ).fetchall()
-            added = 0
             for row in officers:
                 if ingest_actor(self.engine, row[0], "person", source="icij",
                                country=row[1] or None,
@@ -165,6 +202,7 @@ class ICIJPuller(BasePuller):
             log.info("ICIJ actor discovery: {n} new actors auto-added", n=added)
         except Exception as exc:
             log.debug("ICIJ actor discovery failed: {e}", e=str(exc))
+        return added
 
     def _insert_entities(self, csv_path: Path) -> int:
         """Bulk insert entities from CSV."""
@@ -187,19 +225,19 @@ class ICIJPuller(BasePuller):
                     "note": row.get("note", ""),
                 })
                 if len(batch) >= 5000:
-                    self._batch_insert_entities(conn, batch)
-                    count += len(batch)
+                    count += self._batch_insert_entities(conn, batch)
                     batch.clear()
 
             if batch:
-                self._batch_insert_entities(conn, batch)
-                count += len(batch)
+                count += self._batch_insert_entities(conn, batch)
 
+        # Counted only once the transaction has committed.
         return count
 
-    def _batch_insert_entities(self, conn: Any, batch: list[dict[str, Any]]) -> None:
+    def _batch_insert_entities(self, conn: Any, batch: list[dict[str, Any]]) -> int:
+        inserted = 0
         for row in batch:
-            conn.execute(
+            inserted += self._affected(conn.execute(
                 text(
                     "INSERT INTO icij_entities "
                     "(node_id, name, jurisdiction, country_codes, incorporation_date, "
@@ -209,14 +247,15 @@ class ICIJPuller(BasePuller):
                     "ON CONFLICT (node_id) DO NOTHING"
                 ),
                 row,
-            )
+            ))
+        return inserted
 
     def _insert_officers(self, csv_path: Path) -> int:
         count = 0
         with self.engine.begin() as conn, open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                conn.execute(
+                count += self._affected(conn.execute(
                     text(
                         "INSERT INTO icij_officers "
                         "(node_id, name, country_codes, source_dataset, valid_until, note) "
@@ -231,8 +270,7 @@ class ICIJPuller(BasePuller):
                         "vu": row.get("valid_until", ""),
                         "note": row.get("note", ""),
                     },
-                )
-                count += 1
+                ))
         return count
 
     def _insert_intermediaries(self, csv_path: Path) -> int:
@@ -240,7 +278,7 @@ class ICIJPuller(BasePuller):
         with self.engine.begin() as conn, open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                conn.execute(
+                count += self._affected(conn.execute(
                     text(
                         "INSERT INTO icij_intermediaries "
                         "(node_id, name, country_codes, source_dataset, status, address) "
@@ -255,8 +293,7 @@ class ICIJPuller(BasePuller):
                         "status": row.get("status", ""),
                         "addr": row.get("address", ""),
                     },
-                )
-                count += 1
+                ))
         return count
 
     def _insert_addresses(self, csv_path: Path) -> int:
@@ -264,7 +301,7 @@ class ICIJPuller(BasePuller):
         with self.engine.begin() as conn, open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                conn.execute(
+                count += self._affected(conn.execute(
                     text(
                         "INSERT INTO icij_addresses "
                         "(node_id, address, country_codes, source_dataset) "
@@ -277,8 +314,7 @@ class ICIJPuller(BasePuller):
                         "cc": row.get("country_codes", row.get("countries", "")),
                         "src": row.get("sourceID", row.get("source_id", "unknown")),
                     },
-                )
-                count += 1
+                ))
         return count
 
     def _insert_relationships(self, csv_path: Path) -> int:
@@ -286,11 +322,17 @@ class ICIJPuller(BasePuller):
         with self.engine.begin() as conn, open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                conn.execute(
+                count += self._affected(conn.execute(
                     text(
+                        # No conflict key on this table: skip an identical
+                        # stored edge (probes idx_icij_rel_from) so a re-run
+                        # of an unchanged dump appends nothing.
                         "INSERT INTO icij_relationships "
                         "(from_node, to_node, rel_type, source_dataset, start_date, end_date) "
-                        "VALUES (:from_n, :to_n, :rel, :src, :start, :end_d)"
+                        "SELECT :from_n, :to_n, :rel, :src, :start, :end_d "
+                        "WHERE NOT EXISTS (SELECT 1 FROM icij_relationships "
+                        "WHERE from_node = :from_n AND to_node = :to_n "
+                        "AND rel_type = :rel AND source_dataset = :src)"
                     ),
                     {
                         "from_n": int(row.get("node_id_start", row.get("START_ID", 0))),
@@ -300,6 +342,5 @@ class ICIJPuller(BasePuller):
                         "start": row.get("start_date", ""),
                         "end_d": row.get("end_date", ""),
                     },
-                )
-                count += 1
+                ))
         return count

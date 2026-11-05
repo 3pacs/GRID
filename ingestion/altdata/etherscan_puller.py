@@ -215,109 +215,155 @@ class EtherscanPuller(BasePuller):
     # Main pull
     # ------------------------------------------------------------------
 
+    def _write_raw(self, conn: Any, series_id: str, obs_date: date, value: float,
+                   raw_payload: dict[str, Any] | None = None) -> int:
+        """Insert one raw_series row; return the rows the statement affected."""
+        result = self._insert_raw(conn, series_id, obs_date, value,
+                                  raw_payload=raw_payload, return_result=True)
+        rowcount = getattr(result, "rowcount", None)
+        return rowcount if isinstance(rowcount, int) and rowcount > 0 else 0
+
     def pull(self) -> dict[str, Any]:
         """Pull all on-chain data: prices, gas, whale balances, token supplies.
 
         Returns:
-            Summary with counts and anomalies.
+            The scheduler write contract (``smart_scheduler._classify_outcome``):
+            ``status`` and ``rows_inserted`` — raw_series rows counted only
+            after their transaction committed — plus ``lookups``,
+            ``lookups_failed``, whale data and large-transfer anomalies.
+            Every lookup failing is FAILED; some failing is PARTIAL with the
+            committed rows; a missing API key is SKIPPED.
         """
         if not self.api_key:
-            return {"error": "ETHERSCAN_API_KEY not configured"}
+            return {
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "skipped_reason": "ETHERSCAN_API_KEY not configured",
+            }
 
         today = date.today()
         api_calls = 0
+        rows_inserted = 0
+        lookups = 0
+        failures: list[str] = []
         anomalies: list[dict[str, Any]] = []
 
+        def failed(label: str, reason: str) -> None:
+            failures.append(f"{label}: {reason}")
+            log.debug("Etherscan {l} failed: {e}", l=label, e=reason)
+
         # 1. ETH price
+        lookups += 1
         try:
             price = self.pull_eth_price()
             api_calls += 1
             time.sleep(0.25)
             if price:
                 with self.engine.begin() as conn:
-                    self._insert_raw(conn, "eth:price_usd", today, price["eth_usd"],
-                                     raw_payload=price)
-                    self._insert_raw(conn, "eth:price_btc", today, price["eth_btc"])
+                    n = self._write_raw(conn, "eth:price_usd", today, price["eth_usd"],
+                                        raw_payload=price)
+                    n += self._write_raw(conn, "eth:price_btc", today, price["eth_btc"])
+                rows_inserted += n
+            else:
+                failed("eth price", "empty result")
         except Exception as exc:
-            log.debug("ETH price failed: {e}", e=str(exc))
+            failed("eth price", str(exc))
 
         # 2. Gas prices
+        lookups += 1
         try:
             gas = self.pull_gas_oracle()
             api_calls += 1
             time.sleep(0.25)
             if gas:
                 with self.engine.begin() as conn:
-                    self._insert_raw(conn, "eth:gas_low", today, gas["low"], raw_payload=gas)
-                    self._insert_raw(conn, "eth:gas_avg", today, gas["average"])
-                    self._insert_raw(conn, "eth:gas_high", today, gas["high"])
-                    self._insert_raw(conn, "eth:gas_base_fee", today, gas["base_fee"])
+                    n = self._write_raw(conn, "eth:gas_low", today, gas["low"], raw_payload=gas)
+                    n += self._write_raw(conn, "eth:gas_avg", today, gas["average"])
+                    n += self._write_raw(conn, "eth:gas_high", today, gas["high"])
+                    n += self._write_raw(conn, "eth:gas_base_fee", today, gas["base_fee"])
+                rows_inserted += n
+            else:
+                failed("gas oracle", "empty result")
         except Exception as exc:
-            log.debug("Gas oracle failed: {e}", e=str(exc))
+            failed("gas oracle", str(exc))
 
         # 3. ETH supply
+        lookups += 1
         try:
             supply = self.pull_eth_supply()
             api_calls += 1
             time.sleep(0.25)
             if supply:
                 with self.engine.begin() as conn:
-                    self._insert_raw(conn, "eth:total_supply", today, supply["total_supply"],
-                                     raw_payload=supply)
-                    self._insert_raw(conn, "eth:staked", today, supply["staked"])
-                    self._insert_raw(conn, "eth:burned", today, supply["burned"])
+                    n = self._write_raw(conn, "eth:total_supply", today, supply["total_supply"],
+                                        raw_payload=supply)
+                    n += self._write_raw(conn, "eth:staked", today, supply["staked"])
+                    n += self._write_raw(conn, "eth:burned", today, supply["burned"])
+                rows_inserted += n
+            else:
+                failed("eth supply", "empty result")
         except Exception as exc:
-            log.debug("ETH supply failed: {e}", e=str(exc))
+            failed("eth supply", str(exc))
 
         # 4. Whale wallet balances
         whale_balances: dict[str, float] = {}
         for name, address in WHALE_WALLETS.items():
+            lookups += 1
             try:
                 balance = self.pull_wallet_balance(address)
                 api_calls += 1
                 time.sleep(0.25)
-                if balance is not None:
-                    safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "")
-                    with self.engine.begin() as conn:
-                        self._insert_raw(conn,
-                            series_id=f"eth:whale:{safe_name}",
-                            obs_date=today,
-                            value=balance,
-                            raw_payload={"wallet": name, "address": address},
-                        )
-                    whale_balances[name] = balance
+                if balance is None:
+                    failed(f"whale balance {name}", "empty result")
+                    continue
+                safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+                with self.engine.begin() as conn:
+                    n = self._write_raw(conn,
+                        series_id=f"eth:whale:{safe_name}",
+                        obs_date=today,
+                        value=balance,
+                        raw_payload={"wallet": name, "address": address},
+                    )
+                rows_inserted += n
+                whale_balances[name] = balance
 
-                    # Auto-discover actors
-                    try:
-                        from intelligence.actor_ingest import ingest_actor
-                        ingest_actor(self.engine, name,
-                                    "company" if any(x in name.lower() for x in ["binance", "coinbase", "kraken", "bitfinex", "aave", "lido", "uniswap", "maker", "circle", "tether"]) else "person",
-                                    source="etherscan",
-                                    metadata={"eth_balance": balance, "address": address})
-                    except Exception:
-                        pass
+                # Auto-discover actors
+                try:
+                    from intelligence.actor_ingest import ingest_actor
+                    ingest_actor(self.engine, name,
+                                "company" if any(x in name.lower() for x in ["binance", "coinbase", "kraken", "bitfinex", "aave", "lido", "uniswap", "maker", "circle", "tether"]) else "person",
+                                source="etherscan",
+                                metadata={"eth_balance": balance, "address": address})
+                except Exception:
+                    pass
             except Exception as exc:
-                log.debug("Whale balance failed for {n}: {e}", n=name, e=str(exc))
+                failed(f"whale balance {name}", str(exc))
 
-        # 5. Stablecoin supplies (USDT, USDC, DAI)
+        # 5. Token supplies
         for token_name, contract in TOKENS.items():
+            lookups += 1
             try:
                 supply = self.pull_token_supply(contract)
                 api_calls += 1
                 time.sleep(0.25)
-                if supply is not None:
-                    with self.engine.begin() as conn:
-                        self._insert_raw(conn,
-                            series_id=f"eth:token_supply:{token_name.lower()}",
-                            obs_date=today,
-                            value=supply,
-                            raw_payload={"token": token_name, "contract": contract},
-                        )
+                if supply is None:
+                    failed(f"token supply {token_name}", "empty result")
+                    continue
+                with self.engine.begin() as conn:
+                    n = self._write_raw(conn,
+                        series_id=f"eth:token_supply:{token_name.lower()}",
+                        obs_date=today,
+                        value=supply,
+                        raw_payload={"token": token_name, "contract": contract},
+                    )
+                rows_inserted += n
             except Exception as exc:
-                log.debug("Token supply failed for {t}: {e}", t=token_name, e=str(exc))
+                failed(f"token supply {token_name}", str(exc))
 
-        # 6. Check for large recent transfers on exchange wallets
+        # 6. Check for large recent transfers on exchange wallets (no writes;
+        # a failed check is still missing coverage).
         for name, address in list(WHALE_WALLETS.items())[:5]:  # Top 5 wallets only (rate limit)
+            lookups += 1
             try:
                 txns = self.pull_recent_transactions(address, limit=10)
                 api_calls += 1
@@ -335,14 +381,31 @@ class EtherscanPuller(BasePuller):
                             "timestamp": tx.get("timeStamp", ""),
                         })
             except Exception as exc:
-                log.debug("Transaction fetch failed for {n}: {e}", n=name, e=str(exc))
+                failed(f"transactions {name}", str(exc))
 
-        log.info("Etherscan pull: {api} API calls, {w} whale balances, {a} large transfers",
-                 api=api_calls, w=len(whale_balances), a=len(anomalies))
+        if len(failures) >= lookups:
+            status = "FAILED"
+        elif failures:
+            status = "PARTIAL"
+        else:
+            status = "SUCCESS"
+        log_fn = log.warning if failures else log.info
+        log_fn("Etherscan pull {s}: {r} rows committed, {api} API calls, {f}/{n} lookups failed, "
+               "{w} whale balances, {a} large transfers",
+               s=status, r=rows_inserted, api=api_calls, f=len(failures), n=lookups,
+               w=len(whale_balances), a=len(anomalies))
 
-        return {
+        result: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": rows_inserted,
             "api_calls": api_calls,
+            "lookups": lookups,
+            "lookups_failed": len(failures),
             "whale_balances": len(whale_balances),
             "anomalies": anomalies,
             "whale_data": whale_balances,
         }
+        if failures:
+            result["error"] = (f"{len(failures)} of {lookups} lookups failed: "
+                               + "; ".join(failures[:5]))
+        return result

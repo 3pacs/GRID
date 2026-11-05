@@ -696,8 +696,11 @@ class OffshoreLeaksPuller(BasePuller):
             Dict with match counts and details.
         """
         if not self.ensure_data():
+            # Missing source files are a failed pull, not an empty check.
             return {
-                "status": "NO_DATA",
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "error": "ICIJ CSVs not available. Manual download required.",
                 "message": "ICIJ CSVs not available. Manual download required.",
             }
 

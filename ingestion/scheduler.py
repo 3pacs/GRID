@@ -1560,9 +1560,10 @@ def _get_pullers_for_group(
 
         # ICIJ full dataset — 814K entities (monthly re-download + actor discovery).
         # Same offshore_leaks hold: its _discover_actors inserts ICIJ officer and
-        # entity names straight into `actors`, and its relationships load has no
-        # conflict key, so each run re-appended ~3.3M rows (2026-11-05: 99,117
-        # actors added while the hold said every automated path honoured it).
+        # entity names straight into `actors` (2026-11-05: 99,117 actors added
+        # while the hold said every automated path honoured it). Its
+        # relationships load had no conflict key and re-appended ~3.3M rows per
+        # run; since 2026-11-05 it skips an identical stored edge instead.
         try:
             from ingestion.smart_scheduler import hold_reason_for
             _icij_hold = hold_reason_for("offshore_leaks")
@@ -1994,7 +1995,27 @@ def _normalize_expected_spy_refusal(results: Any) -> Any:
     expected error and nothing else, no raw-value refusals); any other error on
     any item keeps the run PARTIAL. A refusal that wrote nothing becomes
     ``duplicate_only`` (a checked ticker with no new rows), not ``no_data``.
+
+    Accepts the plain ``pull_all`` list or its ``should_continue`` envelope
+    (the SmartScheduler path): the envelope's ``results`` are normalized and
+    its per-outcome ``counts`` follow any ``no_data`` -> ``duplicate_only``.
     """
+    if isinstance(results, dict) and isinstance(results.get("results"), list):
+        items = results["results"]
+        normalized = _normalize_expected_spy_refusal(items)
+        moved = sum(
+            1 for before, after in zip(items, normalized)
+            if isinstance(before, dict) and before.get("outcome") == "no_data"
+            and after.get("outcome") == "duplicate_only"
+        )
+        envelope = {**results, "results": normalized}
+        counts = results.get("counts")
+        if moved and isinstance(counts, dict) and all(
+            isinstance(counts.get(k), int) for k in ("no_data", "duplicate_only")
+        ):
+            envelope["counts"] = {**counts, "no_data": counts["no_data"] - moved,
+                                  "duplicate_only": counts["duplicate_only"] + moved}
+        return envelope
     if not isinstance(results, list):
         return results
     return [
