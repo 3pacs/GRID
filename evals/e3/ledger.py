@@ -290,10 +290,10 @@ def _timestamp(value, seq: int, what: str) -> None:
         raise _fail(seq, f"{what} must be a tz-aware ISO timestamp") from error
 
 
-def candidate_core(record: dict) -> dict:
+def candidate_core(record: dict, e3_version: str = VERSION) -> dict:
     """The fields ``candidate_id`` is the sha256 of (canonical JSON)."""
     return {
-        "e3_version": VERSION,
+        "e3_version": e3_version,
         "family": record["family"],
         "candidate_kind": record["candidate_kind"],
         "identity_sha256": record["identity_sha256"],
@@ -325,6 +325,7 @@ def _apply(state: State | None, record: dict) -> State:
             or not _name(record["ledger_id"])
             or not _name(record["s11_ledger_id"])
             or not isinstance(record["e3_version"], str)
+            or record["e3_version"] not in ("e3-v1", "e3-v2")
             or list(record["stages"]) != list(STAGES)
         ):
             raise _fail(seq, "malformed genesis")
@@ -449,7 +450,9 @@ def _check_proposed(state: State, record: dict, seq: int, actor: str, by_propose
     retest_of = record["retest_of"]
     if retest_of is not None and retest_of not in state.candidates:
         raise _fail(seq, "retest_of must name an earlier candidate")
-    if record["candidate_id"] != sha256_bytes(canonical(candidate_core(record))):
+    if record["candidate_id"] != sha256_bytes(
+        canonical(candidate_core(record, e3_version=state.genesis["e3_version"]))
+    ):
         raise _fail(seq, "candidate_id is not the sha256 of the canonical proposal")
     if record["candidate_id"] in state.candidates:
         raise _fail(seq, "candidate already proposed: a re-test is a new candidate (retest_of)")
@@ -621,7 +624,9 @@ def _write(
         if record["kind"] == "proposed":
             record["proposed_at"] = when
             if record["candidate_id"] is None:
-                record["candidate_id"] = sha256_bytes(canonical(candidate_core(record)))
+                record["candidate_id"] = sha256_bytes(
+                    canonical(candidate_core(record, e3_version=state.genesis["e3_version"]))
+                )
         full = {**record, "seq": len(storage.records), "prev_sha256": storage.head}
         _apply(state, full)  # the same invariants a later open replays
         appended, sha = storage._append(record)

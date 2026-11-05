@@ -1,4 +1,4 @@
-"""E3: hill-climb harness. Slice E3A: the candidate (trial) ledger.
+"""E3: hill-climb harness. E3A candidate ledger and E3B staged adapters.
 
 Every candidate a hill-climber generates is recorded from the moment it is
 proposed, before any data is read, through every stage transition, including
@@ -11,4 +11,4 @@ Every file here is hash-pinned in ``MANIFEST.sha256``; a change is a new
 suite version.
 """
 
-VERSION = "e3-v1"
+VERSION = "e3-v2"
