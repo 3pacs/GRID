@@ -135,7 +135,7 @@ export default function CDSDashboard() {
                 <td style={sty.td}>
                   {s.is_stressed
                     ? <span style={{ color: colors.red, fontWeight: 700 }}>STRESS</span>
-                    : <FreshnessIndicator confidence={s.confidence} />
+                    : <FreshnessIndicator confidence={s.confidence} asOf={s.as_of} unavailable={s.available === false} reason={s.reason} />
                   }
                 </td>
               </tr>
