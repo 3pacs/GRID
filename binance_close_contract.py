@@ -1,18 +1,51 @@
-"""Evidence contract for completed Binance spot UTC daily closes."""
+"""Evidence contract for completed Binance spot UTC daily closes.
+
+Crypto daily close convention (``binance_utc_close_v1``)
+--------------------------------------------------------
+Crypto trades 24/7, so GRID's daily crypto "close" is defined by the clock,
+not by an exchange session:
+
+* **Bar**: Binance spot ``{COIN}USDT`` 1d kline requested with
+  ``timeZone=0``, i.e. the bar covering ``[obs_date 00:00:00.000 UTC,
+  obs_date 23:59:59.999 UTC]``. The close is that bar's last trade price.
+* **obs_date**: the UTC calendar day the bar covers (its open time).
+* **available_at**: ``obs_date + 1 day 00:00 UTC`` (``bar_available_at``).
+  A bar is never stored, resolved or read before that instant; the open
+  bar of the current UTC day is rejected.
+* **release / vintage**: ``raw_series.pull_timestamp`` (the capture time,
+  always ``>= available_at``) and, after resolution, its UTC date as
+  ``resolved_series.release_date``. A bar captured late (catch-up or
+  backfill) is released when GRID captured it, never back-dated, so a
+  point-in-time read as of an earlier date does not see it.
+* **Basis**: USDT, not USD. The BTC/ETH/SOL canonical features
+  (``btc_full``/``eth_full``/``sol_full``) resolve from these series.
+"""
 
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 CONTRACT_VERSION = "binance_utc_close_v1"
 PUBLIC_DATA_HOST = "data-api.binance.vision"
 DAY_MS = 86_400_000
 CANONICAL_CLOSE_SERIES = frozenset({
-    "binance.BTCUSDT.close", "binance.ETHUSDT.close",
-    "BINANCE:BTCUSDT:close", "BINANCE:ETHUSDT:close",
+    "binance.BTCUSDT.close", "binance.ETHUSDT.close", "binance.SOLUSDT.close",
+    "BINANCE:BTCUSDT:close", "BINANCE:ETHUSDT:close", "BINANCE:SOLUSDT:close",
 })
+
+
+def bar_available_at(obs_date: date) -> datetime:
+    """The first instant the UTC daily bar for ``obs_date`` is complete."""
+    return datetime.combine(obs_date + timedelta(days=1), time.min, timezone.utc)
+
+
+def last_completed_obs_date(now: datetime) -> date:
+    """The latest UTC day whose daily bar has closed at ``now``."""
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(timezone.utc).date() - timedelta(days=1)
 
 
 def completed_kline_payload(kline: list[Any], captured_at: datetime) -> tuple[date, dict[str, Any]] | None:
