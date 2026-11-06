@@ -549,3 +549,155 @@ def test_scheduler_registration_is_unchanged():
     src = (ROOT / "intelligence" / "scheduler.py").read_text(encoding="utf-8")
     assert "from scripts.backfill_journal_verdicts import run as _score_journal" in src
     assert '_sched.every().day.at("06:45").do(_journal_verdicts_daily)' in src
+
+
+# ── v2: additive rescore of the frozen legacy INSUFFICIENT_DATA verdicts ─────
+#
+# griddb 2026-11-06: 2,361 decisions (2026-03..10) carry the stale-sp500
+# annotation and stay INSUFFICIENT_DATA forever in decision_journal. Their
+# SPY closes were pulled after the label day ended but before the capture
+# marker existed, so the live rule (marker + pulled before the decision)
+# cannot price them. v2 applies the marker's own predicate to pull_timestamp
+# and appends to decision_journal_verdicts; decision_journal is never written.
+
+LEGACY_ANNOTATION = "No forward SPY data available for scoring window"
+APRIL = {  # Wed 04-15 .. Mon 04-20 (weekend 04-18/19)
+    date(2026, 4, 14): 690.0, date(2026, 4, 15): 700.0, date(2026, 4, 16): 702.0,
+    date(2026, 4, 17): 706.0, date(2026, 4, 20): 693.0, date(2026, 4, 21): 695.0,
+}
+UNMARKED = {"price_basis": contract.SPY_CLOSE_SERIES, "interval": "1d", "provider_certified_final": False}
+
+
+class V2DB(MemoryDB):
+    """MemoryDB that also answers the legacy-row select and records v2 inserts."""
+
+    def __init__(self, legacy_rows=()):
+        super().__init__()
+        self.legacy_rows = list(legacy_rows)
+        self.inserts: list[dict] = []
+        self.statements: list[str] = []
+
+    def rollback(self):
+        return None
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        self.statements.append(sql)
+        if "FROM decision_journal d" in sql:
+            return Result(self.legacy_rows)
+        if "INSERT INTO decision_journal_verdicts" in sql:
+            self.inserts.extend(params if isinstance(params, list) else [params])
+            return Result()
+        return super().execute(stmt, params)
+
+
+def add_unmarked(db, series_id, closes, pulled):
+    for d, v in closes.items():
+        db.add(series_id, d, v, pulled(d), payload=dict(UNMARKED, obs_date=d.isoformat()))
+
+
+@pytest.fixture()
+def rescorer(monkeypatch):
+    def _run(db, evaluated_at, *, apply=False):
+        monkeypatch.setattr(bjv, "get_engine", lambda: db)
+        return bjv.rescore_legacy(apply=apply, evaluated_at=evaluated_at)
+    return _run
+
+
+def legacy(id_, ts, state=("GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")):
+    return (id_, ts, *state, "INSUFFICIENT_DATA")
+
+
+def test_v2_prices_an_unmarked_but_completed_capture_known_at_the_decision(rescorer):
+    db = V2DB([legacy(1, at(date(2026, 4, 15), 14))])
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, APRIL, next_morning)
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, {d: v + 3 for d, v in APRIL.items()}, same_evening)
+
+    counts = rescorer(db, at(date(2026, 11, 6), 1), apply=True)
+
+    # Anchor = 04-14 (its close was capturable by 04-15 00:00Z); exit 3 sessions later = 04-17.
+    assert counts["HELPED"] == 1 and counts["entry_known_at_decision"] == 1
+    row = db.inserts[0]
+    assert row["scorer_version"] == bjv.SCORER_V2 and row["legacy_verdict"] == "INSUFFICIENT_DATA"
+    assert (row["entry_obs_date"], row["entry_value"]) == (date(2026, 4, 14), 690.0)   # not the same-evening 693
+    assert (row["exit_obs_date"], row["exit_value"]) == (date(2026, 4, 17), 706.0)
+    assert row["forward_return"] == pytest.approx(ret(690.0, 706.0))
+    assert row["entry_known_at_decision"] is True
+    assert "known at decision" in row["annotation"] and "basis YF:SPY:close" in row["annotation"]
+
+
+def test_v2_post_hoc_vintage_of_a_pre_decision_close_is_labelled(rescorer):
+    # The only SPY capture of every label landed weeks later (2026-04-09-style re-pull).
+    db = V2DB([legacy(2, at(date(2026, 4, 15), 14))])
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, APRIL, lambda d: at(date(2026, 5, 1), 10))
+
+    counts = rescorer(db, at(date(2026, 11, 6), 1), apply=True)
+
+    assert counts["entry_captured_after_decision"] == 1
+    row = db.inserts[0]
+    assert row["entry_known_at_decision"] is False
+    assert row["entry_obs_date"] == date(2026, 4, 14)
+    assert "first capture after the decision of a close final before it" in row["annotation"]
+
+
+def test_v2_never_uses_a_close_pulled_before_its_label_day_ended(rescorer):
+    db = V2DB([legacy(3, at(date(2026, 4, 15), 14))])
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, APRIL, same_evening)   # all pre-boundary
+
+    counts = rescorer(db, at(date(2026, 11, 6), 1), apply=True)
+
+    assert counts["INSUFFICIENT_DATA"] == 1 and counts["HELPED"] == 0
+    assert db.inserts[0]["entry_value"] is None
+    assert "not captured" in db.inserts[0]["annotation"]
+
+
+def test_v2_falls_back_to_gspc_with_both_legs_from_that_series(rescorer):
+    db = V2DB([legacy(4, at(date(2026, 4, 15), 14))])
+    gspc = {d: v * 10 for d, v in APRIL.items()}
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, {date(2026, 4, 14): 690.0}, next_morning)  # no SPY exit
+    for d, v in gspc.items():
+        db.add("YF:^GSPC:close", d, v, next_morning(d) + timedelta(hours=1),
+               payload={"price_basis": "YF:^GSPC:close", "interval": "1d"})
+
+    counts = rescorer(db, at(date(2026, 11, 6), 1), apply=True)
+
+    assert counts["by_series"] == {"YF:^GSPC:close": 1}
+    row = db.inserts[0]
+    assert row["benchmark_series"] == "YF:^GSPC:close"
+    assert (row["entry_value"], row["exit_value"]) == (6900.0, 7060.0)
+    assert "SPY" not in row["annotation"].split(" | ")[0]
+
+
+def test_v2_unknown_posture_is_a_terminal_insufficient_verdict_and_pending_is_not_written(rescorer):
+    db = V2DB([
+        legacy(5, at(date(2026, 4, 15), 14), ("CONTAGION_PRICE_INCREASE", "SHORT PUT AAPL 250.0", "SHORT PUT AAPL 250.0")),
+        legacy(6, at(date(2026, 11, 4), 14)),   # exit session not captured yet, inside grace
+    ])
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, APRIL, next_morning)
+
+    counts = rescorer(db, at(date(2026, 11, 6), 1), apply=True)
+
+    assert counts["INSUFFICIENT_DATA"] == 1 and counts["pending"] == 1
+    assert [r["decision_id"] for r in db.inserts] == [5]
+    assert "Unknown posture" in db.inserts[0]["annotation"]
+
+
+def test_v2_dry_run_writes_nothing_and_never_touches_decision_journal(rescorer, monkeypatch):
+    db = V2DB([legacy(7, at(date(2026, 4, 15), 14))])
+    add_unmarked(db, contract.SPY_CLOSE_SERIES, APRIL, next_morning)
+    monkeypatch.setattr(bjv, "DecisionJournal", lambda *a, **k: pytest.fail("journal must not be used"))
+
+    counts = rescorer(db, at(date(2026, 11, 6), 1))
+
+    assert counts["dry_run"] is True and counts["HELPED"] == 1 and db.inserts == []
+    assert not any(re.search(r"\b(UPDATE|DELETE)\b", s, re.I) for s in db.statements)
+    # Without --apply the unscored-only select (which needs the new table) is not used.
+    assert not any("decision_journal_verdicts" in s for s in db.statements)
+
+
+def test_v2_source_selects_only_legacy_annotations_and_inserts_append_only():
+    assert bjv.LEGACY_ANNOTATION_PREFIXES[0] == LEGACY_ANNOTATION
+    assert "ON CONFLICT (decision_id, scorer_version) DO NOTHING" in bjv._INSERT_V2_SQL
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert not re.search(r"UPDATE\s+decision_journal", src, re.I)
+    assert not re.search(r"DELETE\s+FROM\s+decision_journal", src, re.I)

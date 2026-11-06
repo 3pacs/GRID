@@ -87,6 +87,7 @@ from price_close_contract import (
     observation_end_utc,
 )
 from store.observations import Observation, read_daily_policy_n
+from store.observations import CompletedClose, read_completed_closes
 
 # Thresholds for scoring
 FLAT_THRESHOLD = 0.001       # < 0.1% = flat
@@ -514,12 +515,284 @@ def run(dry_run: bool = False, evaluated_at: datetime | None = None) -> dict:
     return counts
 
 
+# ── Additive rescore of legacy INSUFFICIENT_DATA verdicts (scorer v2) ──────
+#
+# The verdicts written before the 2026-10-23 fix (above, "History") are
+# permanent in ``decision_journal``: ``record_outcome`` refuses a second
+# write and the table's triggers refuse UPDATE. Measured on griddb
+# 2026-11-06: 2,361 of 2,373 INSUFFICIENT_DATA rows carry the stale-``sp500``
+# annotation and 12 the old "per-ticker scoring not implemented" one. They
+# are rescored here into ``decision_journal_verdicts`` (append-only, one row
+# per decision and ``SCORER_V2``); the journal row is never touched.
+#
+# Why a second rule instead of rerunning ``_forward_outcome``: the live rule
+# needs a capture-marked close *pulled before the decision*. Markers exist
+# from 2026-09-23 (SPY) plus a 2026-10-19 backfill back to May, so for March
+# to September the live rule finds no entry and would write the same
+# INSUFFICIENT_DATA again. ``read_completed_closes`` applies the marker's own
+# predicate (pulled at or after the label's capture boundary) to the row's
+# pull_timestamp, so unmarked captures qualify by the identical rule. The
+# entry is the close of the anchor session -- the last session whose close
+# had become capturable at the decision instant, i.e. a market fact that was
+# final before the decision. The vintage known at the decision is used when
+# one exists (``entry_known_at_decision``); otherwise the first-available
+# later vintage of that same pre-decision close, recorded as such. The exit
+# is the close ``SCORING_WINDOW_DAYS`` sessions after the anchor. Nothing
+# after the exit session, and nothing about the decision window that was not
+# a completed close, enters the verdict.
+
+SCORER_V2 = "journal-verdict-v2-anchor-close"
+LEGACY_ANNOTATION_PREFIXES = (
+    "No forward SPY data available for scoring window",   # stale sp500 read
+    "Individual pick (",                                  # pre-benchmark individual picks
+)
+# Benchmarks tried in order for a decision; both legs always come from the
+# one series that scores. ^GSPC is the M0 / sp500_full lineage.
+V2_BENCHMARKS: dict[str, tuple[Benchmark, ...]] = {
+    "sp500": (
+        BENCHMARKS["sp500"],
+        Benchmark("YF:^GSPC:close", "yfinance", DAILY_CAPTURE_CONTRACT, US_LISTED_SESSIONS),
+    ),
+    "iwm": (BENCHMARKS["iwm"],),
+    "hyg": (BENCHMARKS["hyg"],),
+    "btc": (BENCHMARKS["btc"],),
+}
+V2_HISTORY_START = date(2026, 2, 15)
+
+_SELECT_LEGACY_SQL = """
+    SELECT d.id, d.decision_timestamp, d.inferred_state, d.grid_recommendation,
+           d.action_taken, d.verdict
+      FROM decision_journal d
+     WHERE d.verdict = 'INSUFFICIENT_DATA'
+       AND (d.annotation LIKE :stale_prefix OR d.annotation LIKE :pick_prefix)
+     ORDER BY d.decision_timestamp, d.id
+"""
+
+_SELECT_LEGACY_UNSCORED_SQL = """
+    SELECT d.id, d.decision_timestamp, d.inferred_state, d.grid_recommendation,
+           d.action_taken, d.verdict
+      FROM decision_journal d
+     WHERE d.verdict = 'INSUFFICIENT_DATA'
+       AND (d.annotation LIKE :stale_prefix OR d.annotation LIKE :pick_prefix)
+       AND NOT EXISTS (SELECT 1 FROM decision_journal_verdicts v
+                        WHERE v.decision_id = d.id AND v.scorer_version = :version)
+     ORDER BY d.decision_timestamp, d.id
+"""
+
+_INSERT_V2_SQL = """
+    INSERT INTO decision_journal_verdicts (
+        decision_id, scorer_version, verdict, outcome_value, forward_return,
+        benchmark_series, entry_obs_date, entry_value, entry_pull_timestamp,
+        entry_known_at_decision, exit_obs_date, exit_value, exit_pull_timestamp,
+        legacy_verdict, annotation, evaluated_at
+    ) VALUES (
+        :decision_id, :scorer_version, :verdict, :outcome_value, :forward_return,
+        :benchmark_series, :entry_obs_date, :entry_value, :entry_pull_timestamp,
+        :entry_known_at_decision, :exit_obs_date, :exit_value, :exit_pull_timestamp,
+        :legacy_verdict, :annotation, :evaluated_at
+    )
+    ON CONFLICT (decision_id, scorer_version) DO NOTHING
+"""
+
+
+@dataclass(frozen=True)
+class V2Outcome:
+    """The v2 forward outcome of one decision against one benchmark series."""
+
+    status: str                      # "scored" | "pending" | "missing"
+    bench: Benchmark
+    forward_return: float | None
+    anchor: date | None
+    exit_session: date | None
+    entry: Observation | None
+    entry_known_at_decision: bool | None
+    exit: Observation | None
+    reason: str
+
+
+def _v2_forward_outcome(
+    closes: dict[date, CompletedClose], bench: Benchmark,
+    decision_ts: datetime, evaluated_at: datetime,
+    window_days: int = SCORING_WINDOW_DAYS,
+) -> V2Outcome:
+    """Apply the v2 entry/exit/deferral rules to one series' completed closes."""
+    anchor = _anchor_session(bench, decision_ts)
+    if anchor is None:
+        return V2Outcome("missing", bench, None, None, None, None, None, None,
+                         f"no capturable {bench.series_id} session before {decision_ts.isoformat()}")
+    exit_session = _sessions_after(anchor, window_days, bench.sessions)[-1]
+    grace_over = evaluated_at.date() > exit_session + timedelta(days=GAP_GRACE_DAYS)
+    entry_cc = closes.get(anchor)
+    if entry_cc is None or entry_cc.ambiguous:
+        why = "vintages disagree" if entry_cc is not None else "not captured"
+        status = "missing" if grace_over else "pending"
+        return V2Outcome(status, bench, None, anchor, exit_session, None, None, None,
+                         f"completed {bench.series_id} close for anchor session {anchor} {why}")
+    known = entry_cc.known_at(decision_ts)
+    entry = known if known is not None else entry_cc.first
+    exit_cc = closes.get(exit_session)
+    if exit_cc is not None and not exit_cc.ambiguous:
+        exit_obs = exit_cc.latest
+        fwd = (exit_obs.value - entry.value) / entry.value
+        return V2Outcome("scored", bench, fwd, anchor, exit_session, entry, known is not None, exit_obs, "")
+    if exit_cc is not None:
+        return V2Outcome("missing", bench, None, anchor, exit_session, entry, known is not None, None,
+                         f"completed {bench.series_id} vintages disagree for exit session {exit_session}")
+    if not grace_over:
+        return V2Outcome("pending", bench, None, anchor, exit_session, entry, known is not None, None,
+                         f"completed close for session {exit_session} not captured yet")
+    if any(d > exit_session for d in closes):
+        return V2Outcome("missing", bench, None, anchor, exit_session, entry, known is not None, None,
+                         f"no completed {bench.series_id} close for session {exit_session}; feed resumed later")
+    return V2Outcome("pending", bench, None, anchor, exit_session, entry, known is not None, None,
+                     f"feed has no completed {bench.series_id} close after session {exit_session} (stalled)")
+
+
+def _v2_best(outcomes: list[V2Outcome]) -> V2Outcome:
+    """First scored series wins; else pending if any series may still score."""
+    for o in outcomes:
+        if o.status == "scored":
+            return o
+    for o in outcomes:
+        if o.status == "pending":
+            return o
+    return outcomes[0]
+
+
+def _v2_basis(o: V2Outcome, decision_ts: datetime, evaluated_at: datetime) -> str:
+    assert o.entry is not None and o.exit is not None
+    entry_when = ("known at decision" if o.entry_known_at_decision
+                  else "first capture after the decision of a close final before it")
+    return (
+        f"basis {o.bench.series_id} (completed close: pulled at/after the label-day boundary; "
+        f"source {o.bench.source}; {SCORER_V2}): "
+        f"anchor session {o.anchor} close {o.entry.value!r} pulled {_iso(o.entry.pull_timestamp)} "
+        f"({entry_when}; decision {_iso(decision_ts)}); "
+        f"exit session {o.exit.obs_date} close {o.exit.value!r} pulled {_iso(o.exit.pull_timestamp)}; "
+        f"evaluated_at {_iso(evaluated_at)}"
+    )
+
+
+def _fetch_legacy_insufficient(conn, *, skip_scored: bool) -> list:
+    params = {
+        "stale_prefix": LEGACY_ANNOTATION_PREFIXES[0] + "%",
+        "pick_prefix": LEGACY_ANNOTATION_PREFIXES[1] + "%",
+        "version": SCORER_V2,
+    }
+    sql = _SELECT_LEGACY_UNSCORED_SQL if skip_scored else _SELECT_LEGACY_SQL
+    return conn.execute(text(sql), params).fetchall()
+
+
+def _begin_read_only(conn) -> None:
+    if getattr(getattr(conn, "dialect", None), "name", None) == "postgresql":
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        conn.execute(text("SELECT set_config('statement_timeout', '120000', true)"))
+
+
+def rescore_legacy(apply: bool = False, evaluated_at: datetime | None = None) -> dict:
+    """Rescore the frozen legacy INSUFFICIENT_DATA verdicts under ``SCORER_V2``.
+
+    Dry run unless ``apply``: reads in a read-only transaction and returns
+    the projected counts. With ``apply`` the terminal results (pending rows
+    are skipped and picked up by a later run) are appended to
+    ``decision_journal_verdicts``; ``decision_journal`` is never written.
+    """
+    evaluated_at = _as_utc(evaluated_at) if evaluated_at else datetime.now(timezone.utc)
+    engine = get_engine()
+    counts: dict = {
+        "rows": 0, "HELPED": 0, "HARMED": 0, "NEUTRAL": 0, "INSUFFICIENT_DATA": 0,
+        "pending": 0, "written": 0, "entry_known_at_decision": 0,
+        "entry_captured_after_decision": 0, "by_series": {}, "by_reason": {},
+        "by_state_verdict": {},
+    }
+    writes: list[dict] = []
+    series_cache: dict[str, dict[date, CompletedClose]] = {}
+    with engine.connect() as conn:
+        _begin_read_only(conn)
+        rows = _fetch_legacy_insufficient(conn, skip_scored=apply)
+        counts["rows"] = len(rows)
+        for row in rows:
+            entry_id, decision_ts = row[0], _as_utc(row[1])
+            inferred_state, grid_rec, action_taken, legacy_verdict = row[2], row[3] or "", row[4] or "", row[5]
+            benchmark_name = INDIVIDUAL_STATE_BENCHMARKS.get(inferred_state, REGIME_BENCHMARK)
+            candidates: list[V2Outcome] = []
+            for bench in V2_BENCHMARKS.get(benchmark_name, ()):
+                if bench.series_id not in series_cache:
+                    series_cache[bench.series_id] = read_completed_closes(
+                        conn, bench.series_id, start=V2_HISTORY_START, end=evaluated_at.date(),
+                        boundary=lambda d, b=bench: _capture_boundary(b, d),
+                        source=bench.source, as_of_ts=evaluated_at,
+                    )
+                candidates.append(_v2_forward_outcome(series_cache[bench.series_id], bench, decision_ts, evaluated_at))
+            if not candidates:
+                counts["by_reason"]["no series mapped"] = counts["by_reason"].get("no series mapped", 0) + 1
+                outcome = None
+            else:
+                outcome = _v2_best(candidates)
+            if outcome is not None and outcome.status == "pending":
+                counts["pending"] += 1
+                continue
+            fwd = outcome.forward_return if outcome is not None and outcome.status == "scored" else None
+            verdict, outcome_value, annotation = _score_decision(
+                inferred_state, grid_rec, action_taken, fwd, benchmark_name=benchmark_name,
+            )
+            if outcome is not None and outcome.status == "scored":
+                if outcome.bench.series_id != BENCHMARKS.get(benchmark_name, outcome.bench).series_id:
+                    annotation = annotation.replace("SPY", outcome.bench.series_id)
+                annotation = f"{annotation} | {_v2_basis(outcome, decision_ts, evaluated_at)}"
+                counts["by_series"][outcome.bench.series_id] = counts["by_series"].get(outcome.bench.series_id, 0) + 1
+                key = "entry_known_at_decision" if outcome.entry_known_at_decision else "entry_captured_after_decision"
+                counts[key] += 1
+            else:
+                reason = outcome.reason if outcome is not None else "no series mapped"
+                annotation = f"{annotation} ({reason}; {SCORER_V2})"
+                bucket = reason.split(";")[0][:80]
+                counts["by_reason"][bucket] = counts["by_reason"].get(bucket, 0) + 1
+            counts[verdict] += 1
+            sv = f"{inferred_state}/{verdict}"
+            counts["by_state_verdict"][sv] = counts["by_state_verdict"].get(sv, 0) + 1
+            scored = outcome is not None and outcome.status == "scored"
+            writes.append({
+                "decision_id": entry_id, "scorer_version": SCORER_V2, "verdict": verdict,
+                "outcome_value": float(outcome_value), "forward_return": fwd,
+                "benchmark_series": outcome.bench.series_id if outcome is not None else None,
+                "entry_obs_date": outcome.entry.obs_date if scored else None,
+                "entry_value": outcome.entry.value if scored else None,
+                "entry_pull_timestamp": outcome.entry.pull_timestamp if scored else None,
+                "entry_known_at_decision": outcome.entry_known_at_decision if scored else None,
+                "exit_obs_date": outcome.exit.obs_date if scored else None,
+                "exit_value": outcome.exit.value if scored else None,
+                "exit_pull_timestamp": outcome.exit.pull_timestamp if scored else None,
+                "legacy_verdict": legacy_verdict, "annotation": annotation,
+                "evaluated_at": evaluated_at,
+            })
+        conn.rollback()
+    if apply and writes:
+        with engine.begin() as wconn:
+            result = wconn.execute(text(_INSERT_V2_SQL), writes)
+        rc = getattr(result, "rowcount", None)
+        counts["written"] = int(rc) if isinstance(rc, int) and rc >= 0 else len(writes)
+    counts.update({"scorer_version": SCORER_V2, "dry_run": not apply, "evaluated_at": evaluated_at.isoformat()})
+    log.info("v2 rescore of legacy INSUFFICIENT_DATA verdicts: {c}", c=counts)
+    return counts
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Backfill decision_journal verdicts")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    parser.add_argument(
+        "--rescore-legacy", action="store_true",
+        help=f"rescore frozen legacy INSUFFICIENT_DATA verdicts into decision_journal_verdicts "
+             f"({SCORER_V2}); dry run unless --apply",
+    )
+    parser.add_argument("--apply", action="store_true", help="with --rescore-legacy: append the rows")
     args = parser.parse_args()
 
-    result = run(dry_run=args.dry_run)
-    print(f"\nResults: {result}")
+    if args.rescore_legacy:
+        import json
+        print(json.dumps(rescore_legacy(apply=args.apply), indent=2, default=str))
+    else:
+        result = run(dry_run=args.dry_run)
+        print(f"\nResults: {result}")

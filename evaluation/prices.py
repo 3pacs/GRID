@@ -168,3 +168,92 @@ prove the close field after multiple raw fields merge into one feature.
         if not isfinite(value) or value <= 0:
             raise UnsupportedInstrumentError("raw close is not a positive finite price")
         return PricePoint(_bar_date(obs_date), value, f"yfinance:{series_id}")
+
+
+# ── Completed-close accessor (replay + forward scoring) ─────────────────────
+#
+# PITPriceAccessor refuses every row until someone supplies a verified
+# raw-close cutover, and its distinct-value check counts intraday pulls of
+# the same label (12 different SPY values on 2026-04-15 alone), so it can
+# never price history. This accessor reads through
+# ``store.observations.read_completed_closes``: only captures pulled after
+# the session closed count (yfinance and TIINGO raw closes, pooled), and a
+# label whose completed vintages disagree -- across pulls or across the two
+# sources, e.g. an adjusted-close writer sharing the series id -- is refused.
+
+_US_TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{0,5}(-[A-Z]{1,3})?$")  # trust_scorer._YF_SYMBOL_RE
+
+
+# One hour after the latest regular NYSE close (16:00 ET; early closes are
+# earlier). Measured on griddb 2026-11-06: single-stock closes exist only as
+# TIINGO EOD pulls at ~17:30-19:30 ET on the session day (yfinance does not
+# pull them), so the contract's next-NY-midnight boundary would refuse every
+# single-stock close ever stored. A later vintage that disagrees still makes
+# the label ambiguous.
+US_CLOSE_COMPLETE_AFTER = time(17, 0)
+COMPLETED_CLOSE_SOURCES: tuple[str, ...] = ("yfinance", "TIINGO")
+
+
+def us_listed_close_boundary(obs_date: date) -> Optional[datetime]:
+    """UTC instant after which a US-listed daily close for ``obs_date`` is complete.
+
+    17:00 America/New_York on the session day (DST-aware), only for NYSE
+    sessions; ``None`` otherwise.
+    """
+    from ingestion.market_calendar import is_market_open
+
+    if not is_market_open(obs_date):
+        return None
+    return datetime.combine(obs_date, US_CLOSE_COMPLETE_AFTER,
+                            ZoneInfo("America/New_York")).astimezone(timezone.utc)
+
+
+class CompletedCloseAccessor:
+    """``(instrument, as_of) -> PricePoint | None`` over completed yfinance closes.
+
+    Each instrument's history is read once (one bounded series read over
+    ``[start, evaluated_at]``, vintages known at ``evaluated_at``) and cached;
+    call :meth:`evict` when an instrument is finished to bound memory.
+    """
+
+    def __init__(self, conn, *, start: date, evaluated_at: datetime) -> None:
+        if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+            raise ValueError("evaluated_at must be timezone-aware")
+        self._conn = conn
+        self._start = start
+        self._evaluated_at = evaluated_at
+        self._cache: dict[str, tuple[list[date], list[float], list[bool]]] = {}
+        self.reads = 0
+
+    def _load(self, instrument: str) -> tuple[list[date], list[float], list[bool]]:
+        from store.observations import read_completed_closes
+
+        closes = read_completed_closes(
+            self._conn, f"YF:{instrument}:close",
+            start=self._start, end=self._evaluated_at.astimezone(ZoneInfo("America/New_York")).date(),
+            boundary=us_listed_close_boundary, source=COMPLETED_CLOSE_SOURCES,
+            as_of_ts=self._evaluated_at,
+        )
+        self.reads += 1
+        dates = sorted(closes)
+        return dates, [closes[d].latest.value for d in dates], [closes[d].ambiguous for d in dates]
+
+    def evict(self, instrument: str) -> None:
+        self._cache.pop(instrument, None)
+
+    def __call__(self, instrument: str, as_of: date) -> Optional[PricePoint]:
+        from bisect import bisect_right
+
+        if not instrument or _CRYPTO_TICKER_PATTERN.match(instrument) or not _US_TICKER_PATTERN.match(instrument):
+            raise UnsupportedInstrumentError(f"not a US-listed ticker: {instrument!r}")
+        if isinstance(as_of, datetime) or not isinstance(as_of, date):
+            raise TypeError("as_of must be a DATE")
+        if instrument not in self._cache:
+            self._cache[instrument] = self._load(instrument)
+        dates, values, ambiguous = self._cache[instrument]
+        i = bisect_right(dates, as_of) - 1
+        if i < 0:
+            return None
+        if ambiguous[i]:
+            raise AmbiguousPriceError(f"completed YF:{instrument}:close vintages disagree on {dates[i]}")
+        return PricePoint(dates[i], values[i], f"completed:YF:{instrument}:close")
