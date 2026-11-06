@@ -77,6 +77,8 @@ class IntegrationTests(unittest.TestCase):
             'DEFAULT_CAPTURE_SOURCE': 'options_puller', 'EQUITY_TICKERS': ['SPY', 'QQQ'],
             'catalyst_options_universe': lambda *a, **k: [], 'is_market_open': lambda day: True,
             'YahooOptionsClient': MagicMock(return_value=SimpleNamespace(is_available=True)),
+            # pull_all's Cboe-first default is covered in test_options_cboe_provider.py.
+            'options_primary_provider': lambda: 'yahoo',
             'time': SimpleNamespace(sleep=lambda seconds: None),
         })
         self.guard = self.g['automatic_options_capture_guard']
