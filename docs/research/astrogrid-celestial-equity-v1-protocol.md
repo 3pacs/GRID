@@ -96,3 +96,8 @@ in the production snapshot, whose label is 12:00 UTC. Record this approximation
 and source hashes. Fixed-star astrometry and measured historical solar weather
 remain outside this implemented-input test. No model outcomes have been read
 when making these coverage repairs.
+
+Implementation details frozen before fitting: include month, turn-of-month,
+quarter-end and linear calendar-time controls to distinguish solar/calendar
+proxies. Every mystical augmentation includes its raw feature and interactions
+with past trend and volatility states. No thresholds or inference gates changed.
