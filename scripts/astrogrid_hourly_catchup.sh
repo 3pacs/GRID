@@ -31,6 +31,8 @@ cd "${ASTROGRID_ROOT}" || exit 1
 # stop here if it is missing: every step needs DB settings.
 grid_cron_load_env || exit $?
 
+failures=0
+
 run_step() {
     local name="$1"
     shift
@@ -45,6 +47,7 @@ run_step() {
         echo "[$end_ts] OK ${name}"
     else
         echo "[$end_ts] FAIL ${name} rc=${rc}"
+        failures=$((failures + 1))
     fi
     return 0
 }
@@ -64,3 +67,6 @@ run_step "astrogrid_learning_loop_macro" \
     --score-limit "${ASTROGRID_SCORE_LIMIT:-500}" \
     --backtest-limit "${ASTROGRID_BACKTEST_LIMIT:-500}" \
     --backtest-window-days "${ASTROGRID_BACKTEST_WINDOW_DAYS:-365}"
+
+# A failed step must be visible to systemd.
+[[ ${failures} -eq 0 ]]

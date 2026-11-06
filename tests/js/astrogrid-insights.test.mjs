@@ -1,0 +1,32 @@
+import { readFileSync } from 'node:fs';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+const source = readFileSync(new URL('../../astrogrid_web/lib/insights.js', import.meta.url), 'utf8');
+const { insightsMarkup } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+test('missing or failed evidence never shows fabricated accuracy or a live call', () => {
+    const text = insightsMarkup({ items: [], performance: { scored: 0, accuracy: null } });
+    assert.match(text, /No validated forecast track record/);
+    assert.doesNotMatch(text, /0\.00%|100\.00%/);
+    assert.match(insightsMarkup(null, 'Service unavailable'), /Service unavailable/);
+});
+test('observations, stale source time, and unvalidated celestial context stay explicit', () => {
+    const text = insightsMarkup({ items: [{ prediction_id: 'one', call: '<script>unsafe</script>',
+        setup: 'No actor-backed trigger', stale: true, evidence: {
+            symbol: 'BTC', as_of: '2026-11-06T01:00:00Z', coverage: .98,
+            change_24h: .03, validation: 'unvalidated', entry: {instrument: 'BTCUSDT'},
+        } }] });
+    assert.match(text, /STALE/);
+    assert.match(text, /No directional forecast/);
+    assert.match(text, /Binance BTCUSDT/);
+    assert.match(text, /98\.00%/);
+    assert.doesNotMatch(text, /<script>/);
+    assert.match(text, /symbolic context/);
+});
+test('a scored forecast shows the declared outcome and signed return', () => {
+    const text = insightsMarkup({ items: [{prediction_id: 'two', status: 'miss',
+        evidence: {symbol: 'ETH', forecast: {target_price: 90, due_at: '2026-11-07T01:00:00Z'}},
+        score: {signed_return: -.05}}], performance: {scored: 1, accuracy: 0}});
+    assert.match(text, /Result: miss/);
+    assert.match(text, /-5\.00%/);
+    assert.match(text, /1 prospective forecasts scored/);
+});

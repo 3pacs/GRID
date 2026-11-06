@@ -1,3 +1,4 @@
+import { insightsMarkup } from './lib/insights.js';
 import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
 import {
     getAstrogridDefaultApiBaseUrl,
@@ -102,6 +103,8 @@ const state = {
     personaId: 'seer',
     personaResponse: null,
     guruThinking: false,
+    insights: null,
+    insightsError: '',
     predictionFeedOpen: false,
     predictionFeedLoading: false,
     predictionFeedError: '',
@@ -772,31 +775,13 @@ async function refreshBackend() {
     state.backend.prophecy = null;
     state.backend.prophecyKey = '';
     state.backend.polling.lastAttemptAt = new Date().toISOString();
-    if (!readToken()) {
-        state.backend.connected = false;
-        state.backend.summary = sameOriginApiBase()
-            ? 'Shared session missing. Sign in to unlock the live layer.'
-            : 'Local sky only. Paste a session token. This origin cannot read remote storage.';
-        reportRuntimeEvent('info', 'shared_session_missing', {
-            sameOrigin: sameOriginApiBase(),
-        });
-        state.backend.overview = null;
-        state.backend.timeline = [];
-        state.backend.correlations = [];
-        state.backend.briefing = null;
-        state.backend.prophecy = null;
-        state.backend.marketOverlay = emptyMarketOverlay(
-            sameOriginApiBase() ? 'Market overlay locked. Shared session missing.' : 'Market overlay locked. Paste a session token.',
-        );
-        return;
-    }
 
     try {
         const snapshotPath = buildAstrogridSnapshotPath(state.selectedDateTime);
         const [snapshotResult, correlationsResult, briefingResult] = await Promise.allSettled([
             fetchJson(snapshotPath),
-            fetchFirstJson(buildAstrogridCorrelationsCandidates()),
-            fetchFirstJson(buildAstrogridBriefingCandidates()),
+            readToken() ? fetchFirstJson(buildAstrogridCorrelationsCandidates()) : Promise.resolve(null),
+            readToken() ? fetchFirstJson(buildAstrogridBriefingCandidates()) : Promise.resolve(null),
         ]);
 
         if (snapshotResult.status !== 'fulfilled') {
@@ -814,7 +799,7 @@ async function refreshBackend() {
             ? normalizeAstrogridCorrelations(correlationsResult.value)
             : [];
         state.backend.briefing = briefingResult.status === 'fulfilled' ? briefingResult.value : null;
-        await refreshSharedMarketOverlay();
+        if (readToken()) await refreshSharedMarketOverlay();
     } catch (error) {
         state.backend.connected = false;
         const detail = String(error?.message || '');
@@ -924,7 +909,16 @@ async function refreshProphecyOverlay() {
 async function recompute() {
     const localSnapshot = buildSnapshot();
     state.archive = await loadLocalArchiveSnapshot(localSnapshot);
-    await refreshBackend();
+    await Promise.all([
+        refreshBackend(),
+        fetchJson('/api/v1/astrogrid/insights').then((payload) => {
+            state.insights = payload;
+            state.insightsError = '';
+        }).catch(() => {
+            state.insights = null;
+            state.insightsError = 'Market evidence unavailable. No live claim can be made.';
+        }),
+    ]);
     state.snapshot = mergeSnapshotSources(localSnapshot, state.archive, state.backend.snapshot);
     state.vectorSample = null;
     ensureTrajectoryState();
@@ -1039,10 +1033,11 @@ async function handlePersonaSubmit() {
                 guruResponse.answer.setup,
                 `Invalidation: ${guruResponse.answer.invalidation}`,
             ].filter(Boolean).join(' | '),
-            allowed_lenses: ['grid', 'mystical', guruResponse.answer.target_group].filter(Boolean),
+            allowed_lenses: ['market evidence'],
         };
     } else {
-        await submitPredictionRecord(directive);
+        state.personaResponse = { ...response, persona_name: 'Guru', allowed_lenses: ['market evidence'],
+            answer: 'Market evidence unavailable. No forecast issued.' };
     }
     state.guruThinking = false;
     render();
@@ -1245,7 +1240,6 @@ function parseDateMs(value) {
 }
 
 function shouldPollRemote() {
-    if (!readToken()) return false;
     const selectedMs = parseDateMs(state.selectedDateTime);
     if (selectedMs == null) return true;
     return Math.abs(Date.now() - selectedMs) <= REMOTE_POLL_LIVE_WINDOW_MS;
@@ -2324,10 +2318,11 @@ function render() {
         </div>
     `;
     const oraclePage = `
+        ${insightsMarkup(state.insights, state.insightsError)}
         <div class="oracle-grid">
             <div class="panel hero-panel oracle-hero-panel">
                 <div class="split-header">
-                    <h2>Guru</h2>
+                    <h2>Symbolic reading</h2>
                     <div class="subtle">${state.seer ? `${state.seer.confidence_band || 'unrated'} / ${state.seer.horizon}` : 'Awaiting brief.'}</div>
                 </div>
                 ${state.seer ? `
@@ -2814,7 +2809,7 @@ async function main() {
         scheduleRecompute('session');
     });
     render();
-    await scheduleRecompute();
+    await Promise.all([scheduleRecompute(), refreshPredictionFeed()]);
 }
 
 main().catch((error) => {

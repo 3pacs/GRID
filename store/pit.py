@@ -120,6 +120,57 @@ class PITStore:
         self.engine = db_engine
         log.info("PITStore initialised")
 
+    def get_closed_crypto_candles(self, symbol: str, *, as_of: datetime) -> list[dict]:
+        """Timestamp-bounded, observed Binance 5m buckets for live research.
+
+        The daily resolved store cannot express these intraday observations.
+        A bar is eligible only after its end AND its local availability time.
+        This is not a provider-certified-final completeness assertion.
+        """
+        from datetime import timedelta
+
+        if symbol not in {"BTC", "ETH", "SOL"} or as_of.tzinfo is None:
+            raise ValueError("Unsupported crypto symbol or naive cutoff")
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT ts, close, volume, created_at
+                FROM realtime_candles
+                WHERE source = :source AND symbol = :instrument AND interval = :interval
+                  AND ts >= :since AND ts + INTERVAL '5 minutes' <= :as_of
+                  AND created_at <= :as_of
+                ORDER BY ts
+            """), {"source": "binance", "instrument": symbol + "USDT", "interval": "5m",
+                   "since": as_of - timedelta(hours=25), "as_of": as_of}).fetchall()
+        return [{"ts": r[0], "close": r[1], "volume": r[2], "available_at": r[3]} for r in rows]
+
+    def get_crypto_actor_actions(self, *, as_of: datetime) -> list[dict]:
+        """Actor-action candidates known at decision time, with their source ids.
+
+        Eligibility is not validation: consumers still require a named actor,
+        measured flow, valve and direction. Sentiment is not a liquidity action.
+        """
+        from datetime import timedelta
+
+        if as_of.tzinfo is None:
+            raise ValueError("Actor-action cutoff must be timezone-aware")
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, ticker, source_type, source_id, signal_date, signal_type,
+                       signal_value, created_at
+                FROM signal_sources
+                WHERE ticker = ANY(:symbols) AND created_at <= :as_of
+                  AND created_at >= :since
+                  AND signal_date BETWEEN :first_day AND :last_day
+                  AND source_type = ANY(:types)
+                ORDER BY created_at DESC, id DESC LIMIT 100
+            """), {"symbols": ["BTC", "ETH", "SOL"], "as_of": as_of,
+                   "since": as_of - timedelta(hours=24),
+                   "first_day": (as_of - timedelta(hours=24)).date(), "last_day": as_of.date(),
+                   "types": ["institutional", "whale", "exchange_flow"]}).fetchall()
+        return [{"id": r[0], "symbol": r[1], "source": r[2], "source_id": r[3],
+                 "event_date": r[4].isoformat(), "signal_type": r[5], "details": r[6],
+                 "available_at": r[7].isoformat()} for r in rows]
+
     def get_source_snapshot(
         self, selections: list[dict] | None, *, as_of: datetime, start_date: date,
         vintage_policy: str = "LATEST_AS_OF",
