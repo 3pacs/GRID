@@ -16,11 +16,19 @@ test('observations, stale source time, and unvalidated celestial context stay ex
             change_24h: .03, validation: 'unvalidated', entry: {instrument: 'BTCUSDT'},
         } }] });
     assert.match(text, /STALE/);
-    assert.match(text, /No directional forecast/);
+    assert.match(text, /Measured observation/);
     assert.match(text, /Binance BTCUSDT/);
     assert.match(text, /98\.00%/);
     assert.doesNotMatch(text, /<script>/);
     assert.match(text, /symbolic context/);
+});
+test('an observation does not claim that separate qualified forecasts are absent', () => {
+    const text = insightsMarkup({items:[{setup:'No verified actor-driven liquidity trigger. No directional forecast issued.',
+        evidence:{symbol:'BTC',kind:'observation',available:true}}]});
+    assert.match(text,/Qualified directional forecasts appear as separate research contracts/);
+    assert.doesNotMatch(text,/No verified actor|No directional forecast issued/);
+    assert.match(insightsMarkup({items:[{setup:'No usable market evidence has been published for this asset.',
+        evidence:{symbol:'BTC',available:false}}]}),/No usable market evidence/);
 });
 test('a scored forecast shows the declared outcome and signed return', () => {
     const text = insightsMarkup({ items: [{prediction_id: 'two', status: 'miss',
