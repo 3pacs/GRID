@@ -47,11 +47,15 @@ class Tier(str, Enum):
     """LLM task tier — determines which provider to use.
 
     LOCAL  — formatting, extraction, tagging, transforms, health checks
+    QUICK  — short, latency-sensitive classification/extraction calls
+             (news sentiment, tagging) on a small fast model; primary is
+             threadripper's 8–14B llama-server (``llamacpp_threadripper``)
     REASON — analysis, synthesis, regime detection, postmortems
     ORACLE — debates, high-stakes signals, sleuth investigations
     DEFAULT — alias for REASON (backwards compat during migration)
     """
     LOCAL = "local"
+    QUICK = "quick"
     REASON = "reason"
     ORACLE = "oracle"
     BATCH = "batch"
@@ -106,8 +110,21 @@ _DEFAULT_PROVIDER_COOLDOWN_S = 120.0
 _UNREACHABLE_WARNED: set[str] = set()
 
 
-def _connect_timeout(settings: Any) -> float:
-    """TCP connect timeout for local-node clients, clamped to (0, 30] s."""
+def _connect_timeout(settings: Any, key: str = "LLM_CONNECT_TIMEOUT_SECONDS") -> float:
+    """TCP connect timeout for local-node clients, clamped to (0, 30] s.
+
+    ``key`` lets a node behind Tailscale's DERP relay (1.4–2 s RTT from
+    grid-svr: threadripper, x99-hex) use its own, longer connect timeout; a
+    blank/invalid per-node value falls back to the global one.
+    """
+    if key != "LLM_CONNECT_TIMEOUT_SECONDS":
+        raw = getattr(settings, key, None)
+        try:
+            if raw is not None and raw != "" and float(raw) > 0:
+                return min(float(raw), 30.0)
+        except (TypeError, ValueError):
+            pass
+        return _connect_timeout(settings)
     try:
         value = float(getattr(settings, "LLM_CONNECT_TIMEOUT_SECONDS", _DEFAULT_CONNECT_TIMEOUT_S))
     except (TypeError, ValueError):
@@ -260,16 +277,32 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     * ``llamacpp``        100.75.185.36:8086, a socket proxy to gridz4:8086 —
       same box as ``llamacpp_z4``, so it only helps if one gridz4 port dies.
     * ``ollama``          grid-svr's own Ollama (shares the 3090).
+    * ``llamacpp_threadripper`` threadripper's RTX A2000 llama-server, a
+      small fast model (W2-9, 2026-11-06) — QUICK's primary and LOCAL's
+      first fallback after gridz4. Off unless LLAMACPP_THREADRIPPER_ENABLED.
+    * ``llamacpp_x99``    x99-hex :8086, Qwen3.8-27B (S5, 2026-11-06) — a
+      third independent 27B, but across the DERP relay, so it sits after
+      ``llamacpp`` in REASON/ORACLE: the live .env has LLAMACPP_Z4_ENABLED=
+      false, which makes the gridz4 :8086 proxy the real gridz4 path, and an
+      on-site gridz4 should answer before a relayed node. Off unless
+      LLAMACPP_X99_ENABLED.
     """
-    if tier == Tier.LOCAL:
-        chain = ["llamacpp_z4", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
+    if tier == Tier.QUICK:
+        chain = ["llamacpp_threadripper", "llamacpp_z4", "llamacpp", "ollama",
+                 "gemini", "openrouter", "openai"]
+    elif tier == Tier.LOCAL:
+        chain = ["llamacpp_z4", "llamacpp_threadripper", "llamacpp", "ollama",
+                 "gemini", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
-        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemini", "openrouter", "openai"]
+        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "llamacpp_x99",
+                 "gemini", "openrouter", "openai"]
     elif tier == Tier.BATCH:
         chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "gemini", "openrouter", "openai"]
     else:
-        # REASON / DEFAULT — gridz4 first, the 3090 second.
-        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
+        # REASON / DEFAULT — gridz4 first, the 3090 second, x99-hex (relayed)
+        # after the gridz4 proxy.
+        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "llamacpp_x99", "ollama",
+                 "gemini", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
 
 
@@ -301,6 +334,9 @@ def get_llm(
     if provider is None:
         if tier == Tier.LOCAL:
             provider = _gemma_or_default(settings, "LLM_LOCAL_PROVIDER", "LLM_QUICK_PROVIDER", "llamacpp")
+        elif tier == Tier.QUICK:
+            # Not LLM_QUICK_PROVIDER: that legacy key is LOCAL's fallback.
+            provider = getattr(settings, "LLM_QUICK_TIER_PROVIDER", None) or "llamacpp_threadripper"
         elif tier == Tier.ORACLE:
             provider = getattr(settings, "LLM_ORACLE_PROVIDER", None) \
                 or getattr(settings, "LLM_DEEP_PROVIDER", "openrouter")
@@ -503,6 +539,10 @@ def _create_client(provider: str) -> Any:
         return _create_llamacpp_quick_client(settings)
     elif provider == "llamacpp_z4":
         return _create_llamacpp_z4_client(settings)
+    elif provider == "llamacpp_threadripper":
+        return _create_llamacpp_threadripper_client(settings)
+    elif provider == "llamacpp_x99":
+        return _create_llamacpp_x99_client(settings)
     elif provider == "gemini":
         return _create_gemini_client(settings)
     elif provider == "gemma":
@@ -833,6 +873,74 @@ def _create_llamacpp_z4_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("llama.cpp z4 client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_llamacpp_threadripper_client(settings: Any) -> Any:
+    """llama.cpp client for threadripper's RTX A2000 fast model (QUICK tier).
+
+    threadripper serves a small model (8–14B) for short classification and
+    extraction calls, bound to its tailnet IP like the fleet's other
+    llama-servers. Reasoning is off server-side and the client adds no
+    reasoning headroom, so a QUICK call stays a few hundred tokens.
+
+    Off by default: a disabled flag or a blank URL returns ``None`` without
+    opening a socket. When enabled, ``_build_client`` applies the usual
+    refusal cooldown, so a dark threadripper costs one connect timeout per
+    LLM_PROVIDER_COOLDOWN_SECONDS, not one per call.
+    """
+    if not getattr(settings, "LLAMACPP_THREADRIPPER_ENABLED", False):
+        return None
+    base_url = getattr(settings, "LLAMACPP_THREADRIPPER_BASE_URL", "") or ""
+    if not base_url.strip():
+        return None
+    try:
+        from llamacpp.client import LlamaCppClient
+        return LlamaCppClient(
+            base_url=base_url,
+            model=getattr(settings, "LLAMACPP_THREADRIPPER_CHAT_MODEL", "quick"),
+            timeout=getattr(settings, "LLAMACPP_THREADRIPPER_TIMEOUT_SECONDS", 60),
+            default_num_predict=getattr(settings, "LLAMACPP_THREADRIPPER_NUM_PREDICT", 512),
+            min_num_predict=0,
+            reasoning_headroom=0,
+            connect_timeout=_connect_timeout(settings, "LLAMACPP_THREADRIPPER_CONNECT_TIMEOUT_SECONDS"),
+        )
+    except Exception as exc:
+        log.debug("llama.cpp threadripper client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_llamacpp_x99_client(settings: Any) -> Any:
+    """llama.cpp client for x99-hex's Qwen3.8-27B (S5, 2026-11-06).
+
+    x99-hex (site B) serves the same model, build family and flags as gridz4
+    (alias ``Qwen3.8-27B-Q4_K_M``, 2 slots, 32k ctx, reasoning off, ~22 tok/s)
+    on :8086. It is independent of both gridz4 and the 3090, but calls from
+    grid-svr cross Tailscale's relay (1.4–2 s RTT, ~3 MB/s), so it is a
+    fallback only — after the gridz4 proxy in REASON/ORACLE — with a longer
+    request and connect timeout than the on-site nodes.
+
+    Off by default; a disabled flag or blank URL returns ``None`` without a
+    socket, and ``_build_client`` cools it down on a failed probe.
+    """
+    if not getattr(settings, "LLAMACPP_X99_ENABLED", False):
+        return None
+    base_url = getattr(settings, "LLAMACPP_X99_BASE_URL", "") or ""
+    if not base_url.strip():
+        return None
+    try:
+        from llamacpp.client import LlamaCppClient
+        return LlamaCppClient(
+            base_url=base_url,
+            model=getattr(settings, "LLAMACPP_X99_CHAT_MODEL", "Qwen3.8-27B-Q4_K_M"),
+            timeout=getattr(settings, "LLAMACPP_X99_TIMEOUT_SECONDS", 360),
+            default_num_predict=getattr(settings, "LLAMACPP_X99_NUM_PREDICT", 512),
+            min_num_predict=0,
+            reasoning_headroom=0,
+            connect_timeout=_connect_timeout(settings, "LLAMACPP_X99_CONNECT_TIMEOUT_SECONDS"),
+        )
+    except Exception as exc:
+        log.debug("llama.cpp x99-hex client init failed: {e}", e=str(exc))
         return None
 
 

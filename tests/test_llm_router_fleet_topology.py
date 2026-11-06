@@ -22,7 +22,7 @@ import pytest
 import config
 from llm import router
 
-ALL_TIERS = [router.Tier.LOCAL, router.Tier.REASON, router.Tier.ORACLE, router.Tier.BATCH]
+ALL_TIERS = [router.Tier.LOCAL, router.Tier.QUICK, router.Tier.REASON, router.Tier.ORACLE, router.Tier.BATCH]
 DEAD = ("ollama_koala", "ollama_ocr", "ollama_z400", "ollama_panda", "llamacpp_quick")
 
 

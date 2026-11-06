@@ -94,15 +94,17 @@ class TestGemmaRouter:
     def test_tier_enum_values(self):
         from llm.router import Tier
         assert Tier.LOCAL.value == "local"
+        assert Tier.QUICK.value == "quick"
         assert Tier.REASON.value == "reason"
         assert Tier.ORACLE.value == "oracle"
 
     def test_fallback_chain_puts_remote_nodes_on_matching_tiers(self):
         from llm.router import Tier, _fallback_chain
 
-        # LOCAL leads with gridz4 then its :8086 proxy (koala/ocr/z400/quick
-        # were dropped 2026-11-06 — none answers).
-        assert _fallback_chain(Tier.LOCAL, "gemma")[:2] == ["llamacpp_z4", "llamacpp"]
+        # LOCAL leads with gridz4, then threadripper's fast model (W2-9), then
+        # gridz4's :8086 proxy (koala/ocr/z400/quick were dropped 2026-11-06).
+        assert _fallback_chain(Tier.LOCAL, "gemma")[:3] == [
+            "llamacpp_z4", "llamacpp_threadripper", "llamacpp"]
         # ORACLE was reshaped 2026-05-09: gridz4 (Blackwell + Qwen3.6-35B-A3B) is
         # the new primary; grid-svr's llamacpp_oracle is fallback 2.
         assert _fallback_chain(Tier.ORACLE, "gemma")[0] == "llamacpp_z4"
