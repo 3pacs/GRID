@@ -48,6 +48,26 @@ function resultTime(result) {
     return timestamp ? `Result time: ${timestamp}` : 'Result time unknown';
 }
 
+// A missing measurement renders as "unavailable", never NaN, "undefined" or 0
+// (docs/reference/AVAILABILITY_CONTRACT.md: render it honestly).
+const UNAVAILABLE = 'unavailable';
+
+export function finiteOrNull(value) {
+    if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+export function fmtCount(value) {
+    const n = finiteOrNull(value);
+    return n === null ? UNAVAILABLE : String(n);
+}
+
+export function fmtFractionPct(value) {
+    const n = finiteOrNull(value);
+    return n === null ? UNAVAILABLE : `${(n * 100).toFixed(1)}%`;
+}
+
 const researchRunStatusColors = {
     started: { bg: '#1A6EBF22', color: '#1A6EBF' },
     running: { bg: '#1A6EBF22', color: '#1A6EBF' },
@@ -393,9 +413,9 @@ export default function Discovery({ focusHypothesis = '' }) {
                 {orthoStatus === 'available' && orthoResult && <>
                 <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>{resultTime(orthoResult)}</div>
                     {[
-                        { label: 'Features analyzed', value: orthoResult.n_features_analyzed },
-                        { label: 'True dimensionality', value: orthoResult.true_dimensionality, accent: true },
-                        { label: 'Correlated pairs', value: orthoResult.highly_correlated_pairs?.length || 0 },
+                        { label: 'Features analyzed', value: fmtCount(orthoResult.n_features_analyzed) },
+                        { label: 'True dimensionality', value: fmtCount(orthoResult.true_dimensionality), accent: true },
+                        { label: 'Correlated pairs', value: Array.isArray(orthoResult.highly_correlated_pairs) ? orthoResult.highly_correlated_pairs.length : UNAVAILABLE },
                     ].map((m, i) => (
                         <div key={i} style={{
                             display: 'flex', justifyContent: 'space-between',
@@ -425,9 +445,9 @@ export default function Discovery({ focusHypothesis = '' }) {
                 {clusterStatus === 'available' && clusterResult && <>
                 <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>{resultTime(clusterResult)}</div>
                     {[
-                        { label: 'Best k', value: clusterResult.best_k, accent: true },
-                        { label: 'PCA components', value: clusterResult.pca_components_used },
-                        { label: 'Variance explained', value: `${(clusterResult.variance_explained * 100).toFixed(1)}%` },
+                        { label: 'Best k', value: fmtCount(clusterResult.best_k), accent: true },
+                        { label: 'PCA components', value: fmtCount(clusterResult.pca_components_used) },
+                        { label: 'Variance explained', value: fmtFractionPct(clusterResult.variance_explained) },
                     ].map((m, i) => (
                         <div key={i} style={{
                             display: 'flex', justifyContent: 'space-between',

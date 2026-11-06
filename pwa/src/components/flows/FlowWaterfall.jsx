@@ -207,6 +207,17 @@ export default function FlowWaterfall() {
         </div>
       )}
 
+      {Array.isArray(data?.chain) && data.chain.length > 0 && (
+        <div data-testid="waterfall-step-confidence" style={{ padding: '4px 12px 0', display: 'flex', gap: 10, flexWrap: 'wrap', fontSize: '9px', fontFamily: colors.mono, color: colors.textDim }}>
+          {data.chain.map((step, i) => (
+            <span key={`${step.layer}-${step.node}-${i}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ color: LAYER_COLORS[step.layer] || colors.textDim }}>{(step.label || step.layer || '--').slice(0, 18)}</span>
+              <FreshnessIndicator confidence={step.confidence} asOf={step.as_of} unavailable={step.available === false} reason={step.reason} />
+            </span>
+          ))}
+        </div>
+      )}
+
       {data && (
         <div style={{ padding: '4px 12px 8px', fontSize: '9px', fontFamily: colors.mono, color: colors.textDim, display: 'flex', gap: 16 }}>
           <span>Source: {data.source}</span>

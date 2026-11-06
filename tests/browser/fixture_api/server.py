@@ -117,6 +117,15 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/godview/pillars/(?P<pillar>[A-Za-z0-9_]+)$"),
      lambda m, q, s: fx.godview_pillar_unbuilt(m.group("pillar"))),
 
+    # God View (G9) on main: `#/god-view` -> GodView.jsx -> /godview/latest.
+    ("GET", re.compile(r"^/api/v1/godview/latest$"), lambda m, q, s: fx.godview_latest(s)),
+
+    # Money Flow -> Dashboard tab (JunctionDashboard / FreshnessIndicator).
+    ("GET", re.compile(r"^/api/v1/flows/junction-points$"), lambda m, q, s: fx.junction_points(s)),
+
+    # Options -> Gamma Watch tab (GammaWatch.jsx polls this every 5 s).
+    ("GET", re.compile(r"^/api/v1/gamma-watch/state$"), lambda m, q, s: fx.gamma_watch_state(s)),
+
     # (e) data health / source drill-down — Operator.jsx's actual six calls.
     ("GET", re.compile(r"^/api/v1/system/status$"), lambda m, q, s: fx.system_status(s)),
     ("GET", re.compile(r"^/api/v1/system/health$"), lambda m, q, s: fx.system_health(s)),

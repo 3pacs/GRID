@@ -44,7 +44,12 @@ export default function JunctionCard({ point, onClick }) {
         <div style={{ fontSize: '11px', fontWeight: 700, color: colors.text, fontFamily: colors.mono, lineHeight: '1.3', flex: 1, minWidth: 0 }}>
           {point.label || point.id}
         </div>
-        <FreshnessIndicator confidence={point.confidence} />
+        <FreshnessIndicator
+          confidence={point.confidence}
+          asOf={point.as_of}
+          unavailable={point.available === false}
+          reason={point.reason}
+        />
       </div>
 
       {/* Value */}

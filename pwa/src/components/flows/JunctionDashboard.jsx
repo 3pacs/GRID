@@ -15,6 +15,43 @@ const LAYER_COLORS = {
   retail: '#EC4899', crypto: '#F97316',
 };
 
+/**
+ * Table-level freshness of junction_point_readings from the flows provenance
+ * envelope (docs/flows_provenance_contract.md). It describes the readings
+ * table, not each card, so it is shown once above the grid.
+ */
+export function ReadingsProvenance({ provenance }) {
+  const p = provenance?.junction_point_readings;
+  const textStyle = { fontSize: '9px', fontFamily: colors.mono, color: colors.textDim };
+  if (!p) {
+    return (
+      <div data-testid="readings-provenance" style={{ ...textStyle, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+        <FreshnessIndicator confidence={null} />
+        <span>junction_point_readings freshness not reported</span>
+      </div>
+    );
+  }
+  const ageParts = [];
+  if (p.age_days != null) ageParts.push(`${p.age_days}d old`);
+  if (p.stale_after_days != null) ageParts.push(`threshold ${p.stale_after_days}d`);
+  const newest = p.max_obs_date
+    ? `newest obs ${p.max_obs_date}${ageParts.length ? ` (${ageParts.join(', ')})` : ''}`
+    : 'newest obs date unknown';
+  const isStale = p.unavailable === true && p.reason === 'stale';
+  return (
+    <div data-testid="readings-provenance" style={{ ...textStyle, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+      <FreshnessIndicator
+        confidence={p.unavailable === true ? null : 'confirmed'}
+        asOf={p.max_obs_date}
+        stale={isStale}
+        unavailable={p.unavailable === true && !isStale}
+        reason={p.reason}
+      />
+      <span>junction_point_readings: {newest}{p.unavailable === true && p.reason ? ` — ${p.reason}` : ''}</span>
+    </div>
+  );
+}
+
 export default function JunctionDashboard() {
   const { data, loading, error, refetch } = useJunctionPoints();
   const [filterLayer, setFilterLayer] = useState(null);
@@ -87,6 +124,8 @@ export default function JunctionDashboard() {
         ))}
       </div>
 
+      <ReadingsProvenance provenance={data?.provenance} />
+
       {/* Search */}
       <input
         type="text" placeholder="Search junctions..." value={search}
@@ -117,11 +156,11 @@ export default function JunctionDashboard() {
                 {fmtDollar(s.aggregate_value)}
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '9px', fontFamily: colors.mono, marginTop: 4 }}>
-                <span style={{ color: (s.aggregate_change_1m || 0) >= 0 ? colors.green : colors.red }}>
+                <span style={{ color: s.aggregate_change_1m == null ? colors.textDim : s.aggregate_change_1m >= 0 ? colors.green : colors.red }}>
                   1M: {fmtDollar(s.aggregate_change_1m)}
                 </span>
                 <span style={{ color: colors.textDim, textTransform: 'uppercase' }}>
-                  {s.regime || 'neutral'}
+                  {s.regime || 'regime unknown'}
                 </span>
               </div>
               {s.stress_z != null && (
