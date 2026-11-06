@@ -1142,6 +1142,20 @@ def _generate_narrative(checks: list[CrossRefCheck], red_flags: list[CrossRefChe
 
     Falls back to a structured summary if LLM is unavailable.
     """
+    narrative, _source = generate_narrative_with_source(checks, red_flags)
+    return narrative
+
+
+def generate_narrative_with_source(
+    checks: list[CrossRefCheck], red_flags: list[CrossRefCheck],
+) -> tuple[str, str]:
+    """Like :func:`_generate_narrative`, but also say where the text came from.
+
+    Returns ``(narrative, source)`` with ``source`` ``"llm"`` when the REASON
+    tier answered and ``"fallback"`` for the structured summary. The
+    background narrative job caches an ``"llm"`` narrative per input hash and
+    retries a ``"fallback"`` one on its next run.
+    """
     # Build a structured summary for the LLM
     flag_summaries = []
     for rf in red_flags:
@@ -1188,7 +1202,7 @@ def _generate_narrative(checks: list[CrossRefCheck], red_flags: list[CrossRefChe
                 num_predict=300,
             )
             if narrative:
-                return narrative
+                return narrative, "llm"
     except Exception as exc:
         log.debug("LLM narrative generation failed: {e}", e=str(exc))
 
@@ -1215,7 +1229,7 @@ def _generate_narrative(checks: list[CrossRefCheck], red_flags: list[CrossRefChe
             "broadly consistent with physical reality indicators."
         )
 
-    return "\n".join(parts)
+    return "\n".join(parts), "fallback"
 
 
 # ── Persistence ───────────────────────────────────────────────────────────

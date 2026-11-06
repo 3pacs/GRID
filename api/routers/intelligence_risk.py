@@ -6,10 +6,12 @@ from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.precompute_serving import serve_precomputed
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
@@ -806,34 +808,31 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
     return snapshot
 
 
-_GLOBE_TTL = 600  # 10 minutes
-_globe_cache: TTLCache = TTLCache(ttl=_GLOBE_TTL, max_size=1)
-_GLOBE_CACHE_KEY = "default"
-
-
 @router.get("/globe")
-async def get_globe_data(
+def get_globe_data(
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """Return global economic activity data for the 3D globe visualization.
 
     Aggregates country-level GDP signals, FX changes, VIIRS night lights,
     trade flows (Comtrade bilateral), capital flows, cross-reference hotspots,
     and FX pair data from resolved_series and raw_series.
-    Cached for 10 minutes. Heavy computation runs in a thread pool.
+
+    Served from ``api_precomputed_results`` (job ``globe`` in
+    ``intelligence/api_precompute.py``, hourly); the build (>125 s before
+    W3-2: it re-ran every cross-reference check *with* the LLM narrative)
+    never runs in the request.
     """
-    import asyncio
+    return serve_precomputed("intelligence.globe", {})
 
-    cached = _globe_cache.get(_GLOBE_CACHE_KEY)
-    if cached is not None:
-        return cached
 
-    def _build_globe():
-        return _build_globe_data()
+# source_catalog names of the pullers that write bilateral trade series
+# (ingestion/trade/comtrade.py, ingestion/trade/cepii.py).
+GLOBE_TRADE_SOURCES = ("Comtrade", "CEPII_BACI")
 
-    result = await asyncio.to_thread(_build_globe)
-    _globe_cache.set(_GLOBE_CACHE_KEY, result)
-    return result
+# Hotspots come from the cross-reference checks Hermes persists every 4 h.
+# Older than this, the globe recomputes the checks (without the narrative).
+GLOBE_XREF_MAX_AGE_S = 8 * 3600
 
 
 def _build_globe_data() -> dict[str, Any]:
@@ -906,19 +905,22 @@ def _build_globe_data() -> dict[str, Any]:
     # Batch fetch: latest value + month-ago value for all series in 2 queries
     latest_vals: dict[str, float] = {}
     month_ago_vals: dict[str, float] = {}
+    latest_obs_date: dt_date | None = None
     try:
         from sqlalchemy import text as sqla_text
         ids_list = list(all_series_ids)
         with engine.connect() as conn:
             # Latest values (as of today)
             rows = conn.execute(sqla_text(
-                "SELECT DISTINCT ON (series_id) series_id, value "
+                "SELECT DISTINCT ON (series_id) series_id, value, obs_date "
                 "FROM raw_series "
                 "WHERE series_id = ANY(:ids) AND obs_date <= :d AND pull_status = 'SUCCESS' "
                 "ORDER BY series_id, obs_date DESC"
             ), {"ids": ids_list, "d": today}).fetchall()
             for r in rows:
                 latest_vals[r[0]] = float(r[1])
+                if r[2] is not None and (latest_obs_date is None or r[2] > latest_obs_date):
+                    latest_obs_date = r[2]
 
             # Month-ago values
             rows = conn.execute(sqla_text(
@@ -1007,11 +1009,23 @@ def _build_globe_data() -> dict[str, Any]:
     try:
         from sqlalchemy import text as sqla_text
         with engine.connect() as conn:
+            # Bilateral *trade* series only, found through their sources.
+            # ``series_id LIKE '%bilateral%'`` over all of raw_series was a
+            # parallel seq scan (>90 s on grid-svr, 2026-11-06) and also
+            # matched non-trade series (GDELT bilateral tension). Two indexed
+            # reads instead: the trade sources' series ids, then their rows.
+            src_ids = [r[0] for r in conn.execute(sqla_text(
+                "SELECT id FROM source_catalog WHERE name = ANY(:names)"
+            ), {"names": list(GLOBE_TRADE_SOURCES)}).fetchall()]
+            trade_ids = [r[0] for r in conn.execute(sqla_text(
+                "SELECT DISTINCT series_id FROM raw_series "
+                "WHERE source_id = ANY(:src) AND series_id LIKE :pattern"
+            ), {"src": src_ids, "pattern": "%bilateral%"}).fetchall()] if src_ids else []
             trade_rows = conn.execute(sqla_text(
                 "SELECT series_id, value, obs_date FROM raw_series "
-                "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS' "
+                "WHERE series_id = ANY(:ids) AND pull_status = 'SUCCESS' "
                 "AND obs_date >= :d ORDER BY obs_date DESC"
-            ), {"pattern": "%bilateral%", "d": one_year_ago}).fetchall()
+            ), {"ids": trade_ids, "d": one_year_ago}).fetchall() if trade_ids else []
 
             series_vals: dict[str, list] = {}
             for row in trade_rows:
@@ -1071,8 +1085,12 @@ def _build_globe_data() -> dict[str, Any]:
 
     # ── Cross-reference hotspots ──
     try:
-        from intelligence.cross_reference import run_all_checks
-        report = run_all_checks(engine)
+        # The persisted batch (Hermes, every 4 h) instead of re-running every
+        # check plus the LLM narrative here -- that was most of the >125 s.
+        from intelligence.cross_reference import load_recent_report, run_all_checks
+        report = load_recent_report(engine, max_age_seconds=GLOBE_XREF_MAX_AGE_S)
+        if report is None:
+            report = run_all_checks(engine, skip_narrative=True)
         country_flags = {}
         for check in report.red_flags:
             d = asdict(check)
@@ -1113,6 +1131,8 @@ def _build_globe_data() -> dict[str, Any]:
         "hotspots": hotspots,
         "fx_map": fx_map,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # Newest observation behind the country / FX values (data date).
+        "as_of": latest_obs_date.isoformat() if latest_obs_date is not None else None,
     }
 
 

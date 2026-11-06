@@ -6,18 +6,19 @@ lag analysis, cluster assignments, regime fingerprints, and anomalies.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_pit_store
+from api.precompute_serving import serve_precomputed
 
 router = APIRouter(prefix="/api/v1/associations", tags=["associations"])
 
@@ -158,6 +159,7 @@ def _build_feature_matrix(
     days: int = 252,
     max_missing_pct: float = 0.5,
     max_staleness_days: int | None = ASSOCIATIONS_MAX_STALENESS_DAYS,
+    raw: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a PIT-correct feature matrix for the last N days.
 
@@ -173,19 +175,29 @@ def _build_feature_matrix(
         feature_ids: List of feature IDs.
         days: Lookback window in calendar days.
         max_missing_pct: Maximum fraction of missing values per column (0-1).
+        raw: Optional wide PIT matrix from :func:`load_raw_feature_matrix`
+            covering at least ``days``. The precompute job reads it once and
+            builds every window from it instead of one PIT read per view;
+            ``obs_date >= start`` slicing returns the same rows the bounded
+            read would (the vintage pick is per obs_date).
 
     Returns:
         Wide DataFrame indexed by obs_date with feature columns.
     """
     today = date.today()
     start = today - timedelta(days=days)
-    matrix = pit_store.get_feature_matrix(
-        feature_ids=feature_ids,
-        start_date=start,
-        end_date=today,
-        as_of_date=today,
-        vintage_policy="LATEST_AS_OF",
-    )
+    if raw is not None:
+        cols = [c for c in raw.columns if c in set(feature_ids)]
+        matrix = raw.loc[pd.to_datetime(raw.index) >= pd.Timestamp(start), cols]
+        matrix = matrix.dropna(how="all")
+    else:
+        matrix = pit_store.get_feature_matrix(
+            feature_ids=feature_ids,
+            start_date=start,
+            end_date=today,
+            as_of_date=today,
+            vintage_policy="LATEST_AS_OF",
+        )
     if matrix.empty:
         return matrix
 
@@ -222,13 +234,29 @@ def _build_feature_matrix(
     return matrix
 
 
+def load_raw_feature_matrix(pit_store, feature_ids: list[int], days: int) -> pd.DataFrame:
+    """The unfiltered PIT read ``_build_feature_matrix`` would make for ``days``.
+
+    LATEST_AS_OF, ``as_of_date = end_date = today``. Pass the result as
+    ``raw=`` to build any window of at most ``days`` without another read.
+    """
+    today = date.today()
+    return pit_store.get_feature_matrix(
+        feature_ids=feature_ids,
+        start_date=today - timedelta(days=days),
+        end_date=today,
+        as_of_date=today,
+        vintage_policy="LATEST_AS_OF",
+    )
+
+
 @router.get("/correlation-matrix")
-async def get_correlation_matrix(
+def get_correlation_matrix(
     days: int = Query(default=252, ge=30, le=1000),
     min_corr: float = Query(default=0.3, ge=0.0, le=1.0),
     show_trivial: bool = Query(default=False, description="Include trivial/duplicate pairs"),
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """Return feature correlation matrix with intelligently classified pairs.
 
     Pairs are classified as:
@@ -236,30 +264,33 @@ async def get_correlation_matrix(
     - **expected**: Same family, different semantic group
     - **trivial**: Same semantic group or one derived from the other (hidden by default)
 
-    The whole build (DB connection, PIT feature matrix, correlation) is
-    synchronous and takes tens of seconds on the full feature set, so it runs
-    in a worker thread: done inline it held the single uvicorn event loop (and
-    a DB connection, "acquired_by=MainThread") for the duration and stalled
-    every other route.
+    Served from ``api_precomputed_results`` (job ``associations`` in
+    ``intelligence/api_precompute.py``); the 15-37 s build never runs in the
+    request. The response carries a ``precompute`` freshness block; a
+    parameter set that was never computed returns 503 ``unavailable``.
 
     Parameters:
         days: Lookback period in calendar days.
         min_corr: Minimum |correlation| for strong_pairs.
         show_trivial: Include trivial/duplicate pairs in the response.
     """
-    return await asyncio.to_thread(
-        _compute_correlation_matrix, days, min_corr, show_trivial,
+    return serve_precomputed(
+        "associations.correlation_matrix",
+        {"days": days, "min_corr": min_corr, "show_trivial": show_trivial},
     )
 
 
 def _compute_correlation_matrix(
     days: int, min_corr: float, show_trivial: bool,
+    raw: pd.DataFrame | None = None,
+    registry: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """Blocking body of ``get_correlation_matrix`` (runs in a worker thread)."""
+    """Body of the correlation-matrix view (runs in the precompute job)."""
     engine = get_db_engine()
     pit_store = get_pit_store()
 
-    registry = _get_feature_registry(engine)
+    if registry is None:
+        registry = _get_feature_registry(engine)
     if registry.empty:
         return {"features": [], "matrix": [], "strong_pairs": []}
 
@@ -268,7 +299,7 @@ def _compute_correlation_matrix(
     dict(zip(registry["id"], registry["family"]))
     name_to_family = dict(zip(registry["name"], registry["family"]))
 
-    matrix = _build_feature_matrix(pit_store, feature_ids, days)
+    matrix = _build_feature_matrix(pit_store, feature_ids, days, raw=raw)
     excluded_stale = {
         id_to_name.get(fid, str(fid)): last
         for fid, last in (matrix.attrs.get("excluded_stale") or {}).items()
@@ -294,27 +325,27 @@ def _compute_correlation_matrix(
     all_pairs: list[dict[str, Any]] = []
     classification_counts = {"interesting": 0, "expected": 0, "trivial": 0}
 
-    for i in range(len(features)):
-        for j in range(i + 1, len(features)):
-            c = corr.iloc[i, j]
-            if c != c:  # NaN
-                continue
-            if abs(c) < min_corr:
-                continue
+    # Upper triangle, row-major (the order the nested loop visited), keeping
+    # only finite pairs at or above min_corr. Indexing ``corr.iloc[i, j]``
+    # once per pair was ~200K pandas lookups (6 s of a 15 s build).
+    corr_np = corr.to_numpy()
+    iu, ju = np.triu_indices(len(features), k=1)
+    upper = corr_np[iu, ju]
+    keep = np.isfinite(upper) & (np.abs(upper) >= min_corr)
+    for i, j, c in zip(iu[keep].tolist(), ju[keep].tolist(), upper[keep].tolist()):
+        fa = name_to_family.get(features[i], "")
+        fb = name_to_family.get(features[j], "")
+        kind = _classify_pair(features[i], features[j], fa, fb, float(c))
+        classification_counts[kind] += 1
 
-            fa = name_to_family.get(features[i], "")
-            fb = name_to_family.get(features[j], "")
-            kind = _classify_pair(features[i], features[j], fa, fb, float(c))
-            classification_counts[kind] += 1
-
-            all_pairs.append({
-                "a": features[i],
-                "b": features[j],
-                "corr": round(float(c), 4),
-                "kind": kind,
-                "family_a": fa,
-                "family_b": fb,
-            })
+        all_pairs.append({
+            "a": features[i],
+            "b": features[j],
+            "corr": round(float(c), 4),
+            "kind": kind,
+            "family_a": fa,
+            "family_b": fb,
+        })
 
     # Filter: show interesting first, then expected, then trivial only if requested
     strong_pairs = [p for p in all_pairs if p["kind"] == "interesting"]
@@ -534,11 +565,21 @@ def get_clusters(
 def get_regime_features(
     days: int = Query(default=504, ge=60, le=2000),
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """For each regime, return which features are most characteristic.
 
     Computes mean z-score of each feature during each regime period.
+    Served from the ``associations`` precompute job; never computed inline.
     """
+    return serve_precomputed("associations.regime_features", {"days": days})
+
+
+def _compute_regime_features(
+    days: int,
+    raw: pd.DataFrame | None = None,
+    registry: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Body of the regime-features view (runs in the precompute job)."""
     engine = get_db_engine()
     pit_store = get_pit_store()
 
@@ -564,14 +605,15 @@ def get_regime_features(
     regime_df = regime_df.set_index("date")
 
     # Build feature matrix
-    registry = _get_feature_registry(engine)
+    if registry is None:
+        registry = _get_feature_registry(engine)
     if registry.empty:
         return {"regimes": {}, "message": "No eligible features"}
 
     feature_ids = registry["id"].tolist()
     id_to_name = dict(zip(registry["id"], registry["name"]))
 
-    matrix = _build_feature_matrix(pit_store, feature_ids, days)
+    matrix = _build_feature_matrix(pit_store, feature_ids, days, raw=raw)
     if matrix.empty:
         return {"regimes": {}, "message": "Empty feature matrix"}
 
@@ -611,36 +653,46 @@ def get_regime_features(
 
 
 @router.get("/anomalies")
-async def get_anomalies(
+def get_anomalies(
     sigma_threshold: float = Query(default=2.5, ge=1.0, le=5.0),
     days: int = Query(default=252, ge=30, le=1000),
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """Detect features currently behaving anomalously.
 
     Flags features with current z-score > threshold or breaking
-    historical correlation with partner features.
-
-    Like the correlation matrix, the build is synchronous DB/PIT work (plus a
-    possible alert e-mail), so it runs in a worker thread rather than on the
-    event loop.
+    historical correlation with partner features. Served from the
+    ``associations`` precompute job; never computed inline.
     """
-    return await asyncio.to_thread(_compute_anomalies, sigma_threshold, days)
+    return serve_precomputed(
+        "associations.anomalies", {"sigma_threshold": sigma_threshold, "days": days},
+    )
 
 
-def _compute_anomalies(sigma_threshold: float, days: int) -> dict[str, Any]:
-    """Blocking body of ``get_anomalies`` (runs in a worker thread)."""
+def _compute_anomalies(
+    sigma_threshold: float,
+    days: int,
+    raw: pd.DataFrame | None = None,
+    registry: pd.DataFrame | None = None,
+    alert: bool = True,
+) -> dict[str, Any]:
+    """Body of the anomalies view (runs in the precompute job).
+
+    ``alert=False`` skips the extreme-anomaly e-mail; the precompute job
+    sends it itself, only when the extreme set changes between runs.
+    """
     engine = get_db_engine()
     pit_store = get_pit_store()
 
-    registry = _get_feature_registry(engine)
+    if registry is None:
+        registry = _get_feature_registry(engine)
     if registry.empty:
         return {"anomalies": []}
 
     feature_ids = registry["id"].tolist()
     id_to_name = dict(zip(registry["id"], registry["name"]))
 
-    matrix = _build_feature_matrix(pit_store, feature_ids, days)
+    matrix = _build_feature_matrix(pit_store, feature_ids, days, raw=raw)
     if matrix.empty or matrix.shape[0] < 30:
         return {"anomalies": [], "message": "Insufficient data"}
 
@@ -653,10 +705,15 @@ def _compute_anomalies(sigma_threshold: float, days: int) -> dict[str, Any]:
 
     z_scores = (latest - means) / (stds + 1e-12)
 
-    # Compute correlation matrix for breaking-correlation detection
-    matrix.corr()
-
     anomalies: list[dict[str, Any]] = []
+
+    # Recent (30-day) vs historical correlation matrices, computed once and
+    # only if some feature is anomalous. Per-pair ``Series.corr`` calls were
+    # ~24K pandas aligns per scan (13 s of 27 s on grid-svr, 2026-11-06);
+    # ``DataFrame.corr`` gives the same pairwise Pearson values (the matrix
+    # has no NaN after ``dropna``; a constant column is NaN both ways).
+    hist_corr_m: pd.DataFrame | None = None
+    recent_corr_m: pd.DataFrame | None = None
 
     for feat in matrix.columns:
         z = float(z_scores[feat])
@@ -670,14 +727,17 @@ def _compute_anomalies(sigma_threshold: float, days: int) -> dict[str, Any]:
         broken_correlations: list[dict[str, Any]] = []
         if matrix.shape[0] > 60:
             # Compare recent (30-day) correlation with historical
-            recent = matrix.tail(30)
-            historical = matrix.head(len(matrix) - 30)
+            if hist_corr_m is None or recent_corr_m is None:
+                hist_corr_m = matrix.head(len(matrix) - 30).corr()
+                recent_corr_m = matrix.tail(30).corr()
+            hist_row = hist_corr_m[feat]
+            recent_row = recent_corr_m[feat]
 
             for other in matrix.columns:
                 if other == feat:
                     continue
-                hist_corr = float(historical[feat].corr(historical[other]))
-                recent_corr = float(recent[feat].corr(recent[other]))
+                hist_corr = float(hist_row[other])
+                recent_corr = float(recent_row[other])
 
                 if hist_corr != hist_corr or recent_corr != recent_corr:
                     continue
@@ -710,19 +770,32 @@ def _compute_anomalies(sigma_threshold: float, days: int) -> dict[str, Any]:
 
     log.info("Anomaly scan: {n} anomalous features detected", n=len(anomalies))
 
-    # Alert on extreme anomalies (|z| > 3.5)
-    extreme = [a for a in anomalies if abs(a["zscore"]) > 3.5]
-    if extreme:
-        try:
-            from alerts.email import alert_on_discovery_insight
-            features_text = ", ".join(f"{a['feature']} (z={a['zscore']:.1f})" for a in extreme[:5])
-            alert_on_discovery_insight(
-                f"Extreme Anomalies Detected ({len(extreme)})",
-                f"The following features are behaving anomalously:<br><br>"
-                f"<strong>{features_text}</strong><br><br>"
-                f"Review the Associations feed for details.",
-            )
-        except Exception as e:
-            log.warning("Associations: anomaly alert dispatch failed: {e}", e=str(e))
+    if alert:
+        send_extreme_anomaly_alert(extreme_anomalies(anomalies))
 
     return {"anomalies": anomalies, "threshold": sigma_threshold}
+
+
+EXTREME_ANOMALY_Z = 3.5
+
+
+def extreme_anomalies(anomalies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The anomalies that warrant an e-mail (|z| > 3.5)."""
+    return [a for a in anomalies if abs(a["zscore"]) > EXTREME_ANOMALY_Z]
+
+
+def send_extreme_anomaly_alert(extreme: list[dict[str, Any]]) -> None:
+    """E-mail the extreme anomalies (no-op when there are none)."""
+    if not extreme:
+        return
+    try:
+        from alerts.email import alert_on_discovery_insight
+        features_text = ", ".join(f"{a['feature']} (z={a['zscore']:.1f})" for a in extreme[:5])
+        alert_on_discovery_insight(
+            f"Extreme Anomalies Detected ({len(extreme)})",
+            f"The following features are behaving anomalously:<br><br>"
+            f"<strong>{features_text}</strong><br><br>"
+            f"Review the Associations feed for details.",
+        )
+    except Exception as e:
+        log.warning("Associations: anomaly alert dispatch failed: {e}", e=str(e))

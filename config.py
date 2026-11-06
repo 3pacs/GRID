@@ -627,6 +627,13 @@ class Settings(BaseSettings):
     GRID_TRUST_PRUNE_NO_EDGE: bool = False
     GRID_TRUST_PRUNE_LIST_PATH: str = ""
 
+    # W3-2 (2026-11-06): the intelligence scheduler's 5-minute tick that
+    # precomputes the slowest API read endpoints into api_precomputed_results
+    # (intelligence/api_precompute.py). Those endpoints only read the table,
+    # so turning this off freezes them at their last result (served with
+    # its real age, labelled stale). Kill switch; on by default.
+    GRID_API_PRECOMPUTE_ENABLED: bool = True
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -647,6 +654,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING",
         "GRID_TRUST_USE_CORRECTED_OUTCOMES",
         "GRID_TRUST_PRUNE_NO_EDGE",
+        "GRID_API_PRECOMPUTE_ENABLED",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )
