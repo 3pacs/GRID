@@ -117,6 +117,27 @@ class TestSdmxJson:
         assert sdmx_json.lookback_start_year(date(2000, 1, 1)) == "1998"
         assert sdmx_json.lookback_start_year(None) is None
 
+    @pytest.mark.parametrize("start,key,expected", [
+        ("2024", "USA.B1GQ.Q.SA.XDC.Q", "2024-Q1"),
+        ("2024", "SGP.TRGMV_REVS.USD.M", "2024-M01"),
+        ("2024", "USA.NGDP_RPCH.A", "2024-A1"),
+        ("2024-Q3", "USA.B1GQ.Q.SA.XDC.Q", "2024-Q3"),
+        ("2024", "USA.X.Q+M", "2024"),
+        (None, "USA.B1GQ.Q.SA.XDC.Q", None),
+    ])
+    def test_imf_period_bound_matches_series_frequency(self, start, key, expected):
+        """IMF ignores ge:YYYY and returns full history (730 dup rows per run)."""
+        assert sdmx_json.imf_period_bound(start, key) == expected
+
+    def test_imf_fetch_sends_frequency_correct_time_filter(self):
+        resp = MagicMock()
+        resp.json.return_value = IMF_PAYLOAD
+        with patch.object(sdmx_json.requests, "get", return_value=resp) as get:
+            obs = sdmx_json.fetch_imf_series("QNEA", "USA.B1GQ.Q.SA.XDC.Q", "2024")
+        assert get.call_args.kwargs["params"] == {"c[TIME_PERIOD]": "ge:2024-Q1"}
+        assert get.call_args.args[0].endswith("/IMF.STA/QNEA/+/USA.B1GQ.Q.SA.XDC.Q")
+        assert len(obs) == 2
+
     def test_bis_fetch_sends_sdmx_accept_header(self):
         resp = MagicMock()
         resp.json.return_value = BIS_PAYLOAD

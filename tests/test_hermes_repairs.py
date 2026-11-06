@@ -410,28 +410,54 @@ class TestImfOutage:
         assert imf.is_upstream_outage(err)
         assert not imf.is_upstream_outage(ValueError("bad shape"))
 
-    def test_fetch_datamapper_parses_values(self, monkeypatch):
-        payload = {"values": {"NGDP_RPCH": {
-            "USA": {"2024": 2.8, "2025": "1.9", "2027": None, "bad": 1},
-            "CHN": {"2024": 5.0},
-        }}}
-
-        class R:
-            status_code = 200
-            content = b"{}"
-
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return payload
-
+    def test_weo_request_is_one_sdmx_key_on_imf_res(self, monkeypatch):
+        """WEO moved off DataMapper (403 behind Akamai) to IMF.RES/WEO SDMX 3.0."""
         seen = []
-        monkeypatch.setattr(imf.requests, "get", lambda url, timeout: seen.append(url) or R())
-        out = imf.fetch_datamapper("NGDP_RPCH", ["USA", "CHN"])
-        assert out["USA"] == {2024: 2.8, 2025: 1.9}
-        assert out["CHN"] == {2024: 5.0}
-        assert seen == [f"{imf.DATAMAPPER_BASE_URL}/NGDP_RPCH/USA/CHN"]
+
+        def fake_multi(flow, key, start=None, agency="IMF.STA"):
+            seen.append((agency, flow, key, start))
+            return {}
+
+        monkeypatch.setattr(imf.sdmx_json, "fetch_imf_multi", fake_multi)
+        imf.fetch_weo()
+        assert len(seen) == 1
+        agency, flow, key, _ = seen[0]
+        assert (agency, flow) == ("IMF.RES", "WEO")
+        countries, subjects, freq = key.split(".")
+        assert freq == "A"
+        assert set(countries.split("+")) == {imf.ISO2_TO_ISO3[c] for _, c in imf.IMF_WEO_TARGETS}
+        assert set(subjects.split("+")) == {s for s, _ in imf.IMF_WEO_TARGETS}
+        assert imf.weo_series_key("NGDP_RPCH", "US") == "USA.NGDP_RPCH.A"
+        assert "datamapper" not in imf.IMFPuller.SOURCE_CONFIG["base_url"]
+
+    def test_weo_parses_live_shaped_sdmx_payload(self, monkeypatch):
+        payload = {"data": {
+            "dataSets": [{"series": {
+                "0:0:0": {"observations": {"0": ["2.43"], "1": ["2.92"], "2": [None]}},
+            }}],
+            "structures": [{"dimensions": {
+                "series": [
+                    {"id": "COUNTRY", "values": [{"id": "USA"}]},
+                    {"id": "INDICATOR", "values": [{"id": "NGDP_RPCH"}]},
+                    {"id": "FREQUENCY", "values": [{"id": "A"}]},
+                ],
+                "observation": [{"id": "TIME_PERIOD", "values": [
+                    {"value": "2022"}, {"value": "2023"}, {"value": "2031"},
+                ]}],
+            }}],
+        }}
+        captured = {}
+
+        def fake_fetch(url, params=None, accept=None, timeout=None):
+            captured["url"], captured["params"] = url, params
+            return payload
+
+        monkeypatch.setattr(imf.sdmx_json, "fetch_sdmx_json", fake_fetch)
+        out = imf.fetch_weo({("NGDP_RPCH", "US"): "weo_gdp_growth_us"}, start_year="2020")
+        assert out == {"USA.NGDP_RPCH.A": [(date(2022, 1, 1), 2.43), (date(2023, 1, 1), 2.92)]}
+        assert captured["url"].endswith("/IMF.RES/WEO/+/USA.NGDP_RPCH.A")
+        # a bare year is ignored by IMF; the bound must be in annual period format
+        assert captured["params"] == {"c[TIME_PERIOD]": "ge:2020-A1"}
 
     def _weo_puller(self, conn):
         puller = imf.IMFPuller.__new__(imf.IMFPuller)
@@ -439,14 +465,18 @@ class TestImfOutage:
         puller.source_id = 11
         return puller
 
+    @staticmethod
+    def _weo_data(points):
+        return {imf.weo_series_key(s, c): list(points) for s, c in imf.IMF_WEO_TARGETS}
+
     def test_pull_weo_skips_future_years_and_dedupes(self, monkeypatch):
         calls = []
 
-        def fake_fetch(indicator, codes, timeout=30):
-            calls.append(indicator)
-            return {c: {2023: 1.0, 2024: 2.0, 2099: 9.0} for c in codes}
+        def fake_fetch(targets=None, start_year=None):
+            calls.append(1)
+            return self._weo_data([(date(2023, 1, 1), 1.0), (date(2024, 1, 1), 2.0), (date(2099, 1, 1), 9.0)])
 
-        monkeypatch.setattr(imf, "fetch_datamapper", fake_fetch)
+        monkeypatch.setattr(imf, "fetch_weo", fake_fetch)
         conn = _RecordingConn([("SELECT DISTINCT obs_date", [(date(2023, 1, 1),)])])
         res = self._weo_puller(conn).pull_weo(max_year=2026)
 
@@ -454,24 +484,39 @@ class TestImfOutage:
         assert res["status"] == "SUCCESS"
         assert res["rows_inserted"] == n_targets  # 2023 exists, 2099 is a projection
         assert res["skipped_future"] == n_targets
-        assert sorted(calls) == sorted({s for s, _ in imf.IMF_WEO_TARGETS})  # one call per indicator
+        assert calls == [1]  # one request for every target
         inserts = [(s, p) for s, p in conn.calls if s.startswith("INSERT INTO raw_series")]
         assert len(inserts) == n_targets
         assert all("ON CONFLICT DO NOTHING" in s and p["od"] == date(2024, 1, 1) for s, p in inserts)
+        assert {p["sid"] for _, p in inserts} == set(imf.IMF_WEO_TARGETS.values())
 
-    def test_pull_weo_partial_when_one_indicator_fails(self, monkeypatch):
-        def fake_fetch(indicator, codes, timeout=30):
-            if indicator == "PCPIPCH":
-                raise imf.requests.HTTPError("503 Server Error")
-            return {c: {2024: 2.0} for c in codes}
-
-        monkeypatch.setattr(imf, "fetch_datamapper", fake_fetch)
+    def test_pull_weo_partial_when_a_target_series_is_missing(self, monkeypatch):
+        data = self._weo_data([(date(2024, 1, 1), 2.0)])
+        data.pop(imf.weo_series_key("PCPIPCH", "CN"))
+        monkeypatch.setattr(imf, "fetch_weo", lambda targets=None, start_year=None: data)
         conn = _RecordingConn([])
         res = self._weo_puller(conn).pull_weo(max_year=2026)
         assert res["status"] == "PARTIAL"
-        assert any("PCPIPCH" in e for e in res["errors"])
-        failed = sum(1 for s, _ in imf.IMF_WEO_TARGETS if s == "PCPIPCH")
-        assert res["rows_inserted"] == len(imf.IMF_WEO_TARGETS) - failed
+        assert any("weo_inflation_cn" in e for e in res["errors"])
+        assert res["rows_inserted"] == len(imf.IMF_WEO_TARGETS) - 1
+
+    def test_pull_weo_connection_reset_is_skipped_not_error(self, monkeypatch):
+        def boom(targets=None, start_year=None):
+            raise imf.requests.ConnectionError(
+                "('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))"
+            )
+
+        monkeypatch.setattr(imf, "fetch_weo", boom)
+        res = self._weo_puller(_RecordingConn([])).pull_weo(max_year=2026)
+        assert res["status"] == "SKIPPED" and res["rows_inserted"] == 0
+
+    def test_pull_weo_http_403_is_failed(self, monkeypatch):
+        def forbidden(targets=None, start_year=None):
+            raise imf.requests.HTTPError("403 Client Error: Forbidden")
+
+        monkeypatch.setattr(imf, "fetch_weo", forbidden)
+        res = self._weo_puller(_RecordingConn([])).pull_weo(max_year=2026)
+        assert res["status"] == "FAILED"
 
     def test_pull_ifs_skips_on_unreachable_imf_host(self, monkeypatch):
         """Former IFS series now come from api.imf.org SDMX 3.0; a dead host is SKIPPED."""

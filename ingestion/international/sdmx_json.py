@@ -17,6 +17,13 @@ Observation values arrive as strings (``"-4.9524"``) and are converted to
 float; null / non-numeric observations are dropped, never coerced to 0.
 
 Endpoints and keys were verified by probes from grid-svr on 2026-11-04.
+
+IMF time filters (verified 2026-11-06): ``c[TIME_PERIOD]=ge:<period>`` is
+only honoured when the bound uses the series' own period format
+(``2024-Q1``, ``2024-M01``, ``2024-A1``). A bare year (``ge:2024``) is
+silently ignored and the full history comes back, so every incremental IMF
+pull re-inserted every observation since 1970 (730 raw_series rows per IMF
+run). :func:`imf_period_bound` builds the frequency-correct bound.
 """
 
 from __future__ import annotations
@@ -28,7 +35,9 @@ from typing import Any
 import requests
 
 BIS_DATA_URL: str = "https://stats.bis.org/api/v2/data/dataflow/BIS"
-IMF_DATA_URL: str = "https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA"
+IMF_DATAFLOW_URL: str = "https://api.imf.org/external/sdmx/3.0/data/dataflow"
+IMF_STA_AGENCY: str = "IMF.STA"
+IMF_DATA_URL: str = f"{IMF_DATAFLOW_URL}/{IMF_STA_AGENCY}"
 
 # BIS answers 406 without an explicit SDMX-JSON Accept header.
 BIS_ACCEPT: str = "application/vnd.sdmx.data+json;version=1.0.0"
@@ -175,9 +184,52 @@ def bis_series_url(flow: str, key: str, version: str = "1.0") -> str:
     return f"{BIS_DATA_URL}/{flow}/{version}/{key}"
 
 
-def imf_series_url(flow: str, key: str) -> str:
-    """Return the IMF SDMX 3.0 data URL for one dataflow key (latest version)."""
-    return f"{IMF_DATA_URL}/{flow}/+/{key}"
+def imf_series_url(flow: str, key: str, agency: str = IMF_STA_AGENCY) -> str:
+    """Return the IMF SDMX 3.0 data URL for one dataflow key (latest version).
+
+    ``agency`` is the owning IMF department: ``IMF.STA`` (statistics: QNEA,
+    BOP, IL, CPI, ...) or e.g. ``IMF.RES`` (research: WEO).
+    """
+    return f"{IMF_DATAFLOW_URL}/{agency}/{flow}/+/{key}"
+
+
+# Last key token (FREQUENCY dimension) -> suffix of the first period of a year.
+_IMF_YEAR_START_SUFFIX: dict[str, str] = {"A": "-A1", "Q": "-Q1", "M": "-M01"}
+
+
+def imf_period_bound(start_period: str | None, key: str) -> str | None:
+    """Return a ``c[TIME_PERIOD]`` lower bound IMF will actually honour.
+
+    A bare year is expanded to the first period of that year in the key's
+    frequency (``FREQUENCY`` is the last key dimension in every IMF flow
+    GRID reads). A bound that already carries a period suffix, or a key
+    whose frequency is unknown or wildcarded, is returned unchanged.
+    """
+    if not start_period:
+        return None
+    s = str(start_period).strip()
+    if not (len(s) == 4 and s.isdigit()):
+        return s
+    freq = key.rsplit(".", 1)[-1] if key else ""
+    suffix = _IMF_YEAR_START_SUFFIX.get(freq)
+    return f"{s}{suffix}" if suffix else s
+
+
+def fetch_imf_multi(
+    flow: str,
+    key: str,
+    start_period: str | None = None,
+    agency: str = IMF_STA_AGENCY,
+) -> dict[str, list[tuple[date, float]]]:
+    """Fetch every series matching an IMF key (``+`` for several codes).
+
+    Returns ``{dotted_series_key: observations}``; a series IMF does not
+    publish is simply absent.
+    """
+    bound = imf_period_bound(start_period, key)
+    params = {"c[TIME_PERIOD]": f"ge:{bound}"} if bound else {}
+    payload = fetch_sdmx_json(imf_series_url(flow, key, agency), params, accept=IMF_ACCEPT)
+    return parse_sdmx_json(payload)
 
 
 def fetch_bis_series(flow: str, key: str, start_period: str | None = None) -> list[tuple[date, float]]:
@@ -188,9 +240,12 @@ def fetch_bis_series(flow: str, key: str, start_period: str | None = None) -> li
     return series.get(key) or (next(iter(series.values())) if len(series) == 1 else [])
 
 
-def fetch_imf_series(flow: str, key: str, start_period: str | None = None) -> list[tuple[date, float]]:
+def fetch_imf_series(
+    flow: str,
+    key: str,
+    start_period: str | None = None,
+    agency: str = IMF_STA_AGENCY,
+) -> list[tuple[date, float]]:
     """Fetch one IMF series; returns its observations (empty when IMF has none)."""
-    params = {"c[TIME_PERIOD]": f"ge:{start_period}"} if start_period else {}
-    payload = fetch_sdmx_json(imf_series_url(flow, key), params, accept=IMF_ACCEPT)
-    series = parse_sdmx_json(payload)
+    series = fetch_imf_multi(flow, key, start_period, agency)
     return series.get(key) or (next(iter(series.values())) if len(series) == 1 else [])
