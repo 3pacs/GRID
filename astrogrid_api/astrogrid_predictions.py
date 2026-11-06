@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger as log
 from price_close_contract import SPY_CLOSE_CONTRACT
 
-from astrogrid_api.auth import require_auth, verify_token
+from astrogrid_api.auth import require_auth
 from astrogrid_api.dependencies import get_astrogrid_store, get_db_engine
 from astrogrid_api.astrogrid_helpers import (
     AstrogridBacktestRequest,
@@ -434,6 +434,8 @@ async def create_prediction(
     request: Request,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
+    if req.model_version == "astrogrid-evidence-v2":
+        raise HTTPException(status_code=422, detail="The evidence model is reserved for the scheduled producer.")
     actor_context = _build_actor_context(
         actor_type="authenticated_user",
         token_present=True,
@@ -448,36 +450,27 @@ async def ask_guru(
     req: AstrogridGuruRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Answer a plain Guru question and persist it into the AstroGrid ledger."""
-    prediction_req, answer = _build_guru_directive(req)
-    auth_header = request.headers.get("authorization") or ""
-    token = auth_header.removeprefix("Bearer").strip() if auth_header.lower().startswith("bearer") else ""
-    if not token:
-        token = request.query_params.get("token") or ""
-    token_valid = bool(token and verify_token(token))
-    actor_context = _build_actor_context(
-        actor_type="authenticated_user" if token_valid else "anonymous_public",
-        token_present=bool(token),
-        token_valid=token_valid,
-        request=request,
-    )
-    record = _persist_prediction(prediction_req, actor_context=actor_context)
-    if record.get("error"):
-        return {
-            "answer": answer,
-            "prediction": None,
-            "postmortem": None,
-            "disclaimer": answer["disclaimer"],
-            "persistence_status": "failed",
-            "error": record["error"],
-        }
-    return {
-        "answer": answer,
-        "prediction": record,
-        "postmortem": record.get("postmortem"),
-        "disclaimer": answer["disclaimer"],
-        "persistence_status": record.get("persistence_status", "persisted"),
-    }
+    """Answer from the published server ledger, without manufacturing a call."""
+    from oracle.astrogrid_insights import answer_from_insights, public_insights
+
+    seed = AstrogridPredictionRequest(question=req.question, call="", timing="", setup="",
+                                     invalidation="", target_symbols=req.target_symbols)
+    requested = _infer_target_symbols(seed)
+    if not requested:
+        # Unknown requested assets must not silently turn into a BTC answer.
+        requested = ["UNSUPPORTED"]
+    answer = answer_from_insights(public_insights(get_db_engine()), requested)
+    return {"answer": answer, "prediction": None, "postmortem": None,
+            "disclaimer": answer["disclaimer"], "persistence_status": "not_attempted",
+            "reason": "Answers reference published evidence; only the scheduled producer issues forecasts."}
+
+
+@router.get("/insights")
+async def get_insights() -> dict[str, Any]:
+    """Public, bounded evidence cards from the scheduled producer; read-only."""
+    from oracle.astrogrid_insights import public_insights
+
+    return public_insights(get_db_engine())
 
 
 @router.get("/predictions/latest")
