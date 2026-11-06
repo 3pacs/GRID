@@ -685,19 +685,33 @@ class OracleEngine:
                     null_write_policy TEXT
                 )
             """))
-            conn.execute(text("""
-                ALTER TABLE oracle_predictions
-                ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
-            """))
+            # ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on the table even
+            # when the column is already there, so it waits behind any open
+            # reader of oracle_predictions. 2026-11-06 03:51Z it hit
+            # statement_timeout and took the whole cycle down before a single
+            # ticker ran. Each ALTER below runs only when its column is missing.
+            existing_columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'oracle_predictions'
+                """))
+            }
+            if "dedup_keep" not in existing_columns:
+                conn.execute(text("""
+                    ALTER TABLE oracle_predictions
+                    ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
+                """))
             # Historical-NULL provenance boundary (oracle_pred_nullable_0918):
             # NULL here means "predates the policy, or provenance unknown";
             # oracle.entry_price_policy.NULL_WRITE_POLICY means "this row's
             # entry_price/confidence NULL is the honest-measurement policy's
             # NULL." Both writers stamp it at INSERT, never on UPDATE.
-            conn.execute(text("""
-                ALTER TABLE oracle_predictions
-                ADD COLUMN IF NOT EXISTS null_write_policy TEXT
-            """))
+            if "null_write_policy" not in existing_columns:
+                conn.execute(text("""
+                    ALTER TABLE oracle_predictions
+                    ADD COLUMN IF NOT EXISTS null_write_policy TEXT
+                """))
             # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
             # nothing measured them. Both writers already bind None
             # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
@@ -707,10 +721,11 @@ class OracleEngine:
             # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
             # the table every time this bootstrap runs.
             # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
-            conn.execute(text("""
-                ALTER TABLE oracle_predictions
-                ADD COLUMN IF NOT EXISTS horizon_days INTEGER
-            """))
+            if "horizon_days" not in existing_columns:
+                conn.execute(text("""
+                    ALTER TABLE oracle_predictions
+                    ADD COLUMN IF NOT EXISTS horizon_days INTEGER
+                """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oracle_models (
                     name TEXT PRIMARY KEY,
@@ -929,7 +944,9 @@ class OracleEngine:
         try:
             from oracle.model_factory import ModelFactory
             factory = ModelFactory(self.engine)
-            raw = factory.get_signals_for_model(model.name, datetime.now(timezone.utc))
+            raw = factory.get_signals_for_model(
+                model.name, datetime.now(timezone.utc), ticker=ticker,
+            )
             if not raw:
                 return []
 
@@ -1398,6 +1415,12 @@ class OracleEngine:
         journal_bias = self._get_journal_feedback(ticker)
         log.info("Oracle {ticker}: journal feedback={feedback}", ticker=ticker, feedback=journal_bias)
 
+        # Per-ticker lookups the model loop below reads once per model (~400
+        # times a ticker): fetch each once. 2026-11-06 profile of one ticker:
+        # detect_convergence ran 239 times at ~70 ms (16.6 s) and the actor
+        # bridge 400 times (3.4 s), every call returning the same rows.
+        per_ticker: dict[str, Any] = {}
+
         for model in self.models:
             try:
                 # ── TimesFM model: use forecaster_adapter ──────────
@@ -1490,7 +1513,11 @@ class OracleEngine:
                     from intelligence.actor_signal_bridge import (
                         get_actor_signals_for_ticker,
                     )
-                    actor_sigs = get_actor_signals_for_ticker(self.engine, ticker, days=30)
+                    if "actor_sigs" not in per_ticker:
+                        per_ticker["actor_sigs"] = get_actor_signals_for_ticker(
+                            self.engine, ticker, days=30,
+                        )
+                    actor_sigs = per_ticker["actor_sigs"]
                     if actor_sigs:
                         # Build actor trust lookup
                         actor_trust_by_type: dict[str, float] = {}
@@ -1651,7 +1678,9 @@ class OracleEngine:
                 # agreeing on this ticker+direction, boost confidence
                 convergence_boost = 1.0
                 try:
-                    convergence_events = self._get_convergence_for_ticker(ticker)
+                    if "convergence" not in per_ticker:
+                        per_ticker["convergence"] = self._get_convergence_for_ticker(ticker)
+                    convergence_events = per_ticker["convergence"]
                     pred_dir = "BUY" if direction in ("CALL", "LONG") else "SELL"
                     for evt in convergence_events:
                         if evt.get("signal_type") == pred_dir:
@@ -2722,7 +2751,7 @@ class EnsemblePredictor:
 
         for model in self.factory.list_active_models():
             try:
-                signals = self.factory.get_signals_for_model(model.name, as_of)
+                signals = self.factory.get_signals_for_model(model.name, as_of, ticker=ticker)
                 if len(signals) < getattr(model, "min_signals", 0):
                     continue
                 agg = self.aggregator.aggregate(
