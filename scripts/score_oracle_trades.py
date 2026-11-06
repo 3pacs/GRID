@@ -55,7 +55,13 @@ from oracle.entry_price_policy import (
     SCORE_NOTE_ENTRY_NULL,
     entry_price_score_note,
 )
-from store.observations import Observation, read_window
+from store.observations import (
+    Observation,
+    SplitEvent,
+    price_in_basis,
+    read_splits,
+    read_window,
+)
 
 # Compute-node fallback for a genuinely standalone
 # `python scripts/score_oracle_trades.py` invocation whose CWD/PYTHONPATH
@@ -153,6 +159,20 @@ _CRYPTO_SYMBOLS = frozenset({"BTC-USD", "ETH-USD", "SOL-USD"})
 _MAX_SESSION_LOOKBACK_DAYS = 7
 
 PriceBook = dict[str, dict[date, Observation]]
+SplitBook = dict[str, list[SplitEvent]]
+
+# ── Stock splits (W2-10) ────────────────────────────────────────────────────
+#
+# entry_price is the as-traded spot when the prediction was made; the expiry
+# close is the as-traded print on the session date. A split between the two
+# (NVDA 10-for-1 on 2024-06-10) made a flat stock score as -90% and a 1-for-10
+# reverse split as +900%. The expiry close is therefore put on the entry's
+# share basis with store.observations.price_in_basis before the verdict: only
+# splits dated after the creation date and on/before the session date are
+# applied (never a split that had not happened by the expiry), and a yfinance
+# vintage pulled after a later split is first restored to as-traded.
+# SPLIT_RULE is stamped into score_notes whenever a factor != 1 was applied.
+SPLIT_RULE = "split_adjusted_v1"
 
 
 def close_series_id(ticker: str) -> str:
@@ -245,6 +265,47 @@ def load_expiry_closes(
     return book
 
 
+def load_split_book(
+    conn: Any, tickers: list[str], *, as_of_ts: datetime | None = None,
+) -> SplitBook:
+    """Recorded splits per ticker (``YF:{symbol}:split_factor``), as known at ``as_of_ts``."""
+    book: SplitBook = {}
+    for ticker in sorted(set(tickers)):
+        if _is_crypto(ticker):
+            continue
+        events = read_splits(conn, get_yf_symbol(ticker), as_of_ts=as_of_ts)
+        if events:
+            book[ticker] = events
+    return book
+
+
+def _created_date(created_at: Any) -> date | None:
+    created = _as_utc(created_at)
+    if created is None:
+        return None
+    return created.astimezone(_NY).date()
+
+
+def split_adjusted_close(
+    splits: SplitBook | None, ticker: str, price: float, session: date, *,
+    created_at: Any, source: str | None = None, pull_timestamp: Any = None,
+) -> tuple[float, float]:
+    """``(price on the entry's share basis, factor applied)`` for one expiry close.
+
+    ``factor`` is ``adjusted / price`` (1.0 when no recorded split falls in
+    ``(creation date, session]`` and the vintage needs no basis repair).
+    """
+    events = (splits or {}).get(ticker)
+    entry_day = _created_date(created_at)
+    if not events or entry_day is None or price <= 0:
+        return price, 1.0
+    adjusted = price_in_basis(
+        price, session, basis_date=entry_day, splits=events,
+        source=source, pull_timestamp=_as_utc(pull_timestamp),
+    )
+    return adjusted, adjusted / price
+
+
 @dataclass(frozen=True)
 class ExpiryClose:
     """Outcome of the expiry-close lookup for one prediction.
@@ -308,7 +369,14 @@ def classify_outcome(
     return "miss", actual_move, pnl
 
 
-def _score_note(entry: float, res: ExpiryClose, actual_move: float) -> str:
+def _score_note(entry: float, res: ExpiryClose, actual_move: float, factor: float = 1.0) -> str:
+    if abs(factor - 1.0) > 1e-9:
+        actual = res.price * factor
+        return (
+            f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%) "
+            f"[close {res.session_date} {res.source} ${res.price:.2f} x{factor:g} split, "
+            f"{EXPIRY_CLOSE_RULE}, {SPLIT_RULE}]"
+        )
     return (
         f"Entry ${entry:.2f} → Actual ${res.price:.2f} ({actual_move:+.1f}%) "
         f"[close {res.session_date} {res.source}, {EXPIRY_CLOSE_RULE}]"
@@ -417,6 +485,7 @@ def score_one_chunk(
     chunk_size: int,
     now: datetime | None = None,
     after: tuple[Any, str] | None = None,
+    splits: SplitBook | None = None,
 ) -> dict[str, Any]:
     """Score one chunk of expired-and-scoreable pending predictions.
 
@@ -425,6 +494,8 @@ def score_one_chunk(
     across chunks and passes ``cursor`` back as ``after``.
 
     ``prices`` is a :data:`PriceBook` from :func:`load_expiry_closes`;
+    ``splits`` (from :func:`load_split_book`) puts the expiry close on the
+    entry's share basis when a split falls between creation and expiry;
     ``now`` (default: midnight UTC starting ``today``) is the instant the
     grace window in :func:`resolve_expiry_close` is measured against.
 
@@ -513,13 +584,18 @@ def score_one_chunk(
             counters["no_data"] += 1
             continue
 
-        actual = res.price
+        actual, factor = split_adjusted_close(
+            splits, ticker, res.price, res.session_date, created_at=created_at,
+            source=res.source, pull_timestamp=res.pull_timestamp,
+        )
         outcome = classify_outcome(direction, entry, actual, expected)
         if outcome is None:
             counters["skipped"] += 1
             continue
         verdict, actual_move, pnl = outcome
         counters[{"hit": "hits", "partial": "partials", "miss": "misses"}[verdict]] += 1
+        if abs(factor - 1.0) > 1e-9:
+            counters["split_adjusted"] = counters.get("split_adjusted", 0) + 1
 
         conn.execute(text("""
             UPDATE oracle_predictions
@@ -530,7 +606,7 @@ def score_one_chunk(
         """), {
             "v": verdict, "ap": actual, "am": round(actual_move, 2),
             "pnl": round(pnl, 2), "id": pred_id,
-            "notes": _score_note(entry, res, actual_move),
+            "notes": _score_note(entry, res, actual_move, factor),
         })
         counters["scored"] += 1
 
@@ -755,6 +831,170 @@ def rescore_no_data(engine: Engine, *, apply: bool, now: datetime | None = None)
     return projection
 
 
+# ── Split rescore (W2-10) ───────────────────────────────────────────────────
+#
+# Verdicts written before SPLIT_RULE compared a pre-split entry with a
+# post-split close. They stay exactly as they are; the corrected score is an
+# additive oracle_prediction_rescores row under SPLIT_RESCORE_SCORING_VERSION
+# (exploratory hindsight, official = FALSE, same CHECK constraints). Covered:
+# official verdicts (hit/partial/miss) and oracle_rescore_hindsight_v1 rows
+# whose (creation date, expiry] window contains a recorded split. The close is
+# re-read under EXPIRY_CLOSE_RULE and put on the entry's share basis. When the
+# rule finds no settled close (older verdicts were priced from
+# options_daily_signals spot, e.g. IWF/VGT in April 2026), the price the
+# verdict itself recorded (actual_price, as-traded at expiry) is re-based
+# instead and labelled price_source = STORED_PRICE_SOURCE.
+
+SPLIT_RESCORE_SCORING_VERSION = "oracle_rescore_split_adjusted_v1"
+STORED_PRICE_SOURCE = "stored_actual_price"
+
+_SPLIT_OFFICIAL_CANDIDATES = """
+SELECT p.id, p.direction, p.entry_price, p.expiry, p.expected_move_pct,
+       p.created_at, p.dedup_keep, p.verdict, p.score_notes, p.actual_price
+FROM oracle_predictions p
+WHERE p.ticker = :ticker
+  AND p.verdict IN ('hit', 'partial', 'miss')
+  AND p.direction IN ('CALL', 'PUT')
+  AND p.entry_price > 0
+  AND p.created_at < :split_start
+  AND p.expiry >= :split_date
+"""
+
+_SPLIT_RESCORED_CANDIDATES = """
+SELECT p.id, p.direction, r.entry_price, p.expiry, p.expected_move_pct,
+       p.created_at, p.dedup_keep, r.verdict, r.notes, r.actual_price
+FROM oracle_prediction_rescores r
+JOIN oracle_predictions p ON p.id = r.prediction_id
+WHERE r.scoring_version = :prior_version
+  AND p.ticker = :ticker
+  AND p.direction IN ('CALL', 'PUT')
+  AND r.entry_price > 0
+  AND p.created_at < :split_start
+  AND p.expiry >= :split_date
+"""
+
+
+def rescore_splits(
+    engine: Engine, *, apply: bool, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Re-score verdicts whose window spans a recorded split; project or append.
+
+    Dry run (``apply=False``) runs READ ONLY on PostgreSQL and writes nothing.
+    ``apply=True`` appends one ``SPLIT_RESCORE_SCORING_VERSION`` row per
+    affected prediction (ON CONFLICT DO NOTHING); oracle_predictions and
+    oracle_models are never written.
+    """
+    now = now or datetime.now(timezone.utc)
+    pg = engine.dialect.name == "postgresql"
+    candidates: dict[str, dict[str, Any]] = {}
+    books: dict[str, PriceBook] = {}
+    with engine.connect() as conn:
+        if pg:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            conn.execute(text("SET LOCAL statement_timeout = '600s'"))
+        tickers = [r[0] for r in conn.execute(text(
+            "SELECT DISTINCT ticker FROM oracle_predictions WHERE ticker IS NOT NULL"
+        )).fetchall()]
+        splits = load_split_book(conn, tickers, as_of_ts=now)
+        has_rescores = _rescore_table_exists(conn)
+        already: set[str] = set()
+        if has_rescores:
+            already = {r[0] for r in conn.execute(text(
+                "SELECT prediction_id FROM oracle_prediction_rescores WHERE scoring_version = :v"
+            ), {"v": SPLIT_RESCORE_SCORING_VERSION}).fetchall()}
+        for ticker, events in sorted(splits.items()):
+            for ev in events:
+                params = {
+                    "ticker": ticker, "split_date": ev.effective_date,
+                    "split_start": datetime.combine(ev.effective_date, time.min, _NY).astimezone(timezone.utc),
+                }
+                queries = [("official", _SPLIT_OFFICIAL_CANDIDATES, params)]
+                if has_rescores:
+                    queries.append(("rescore_v1", _SPLIT_RESCORED_CANDIDATES,
+                                    {**params, "prior_version": RESCORE_SCORING_VERSION}))
+                for kind, sql, bound in queries:
+                    for row in conn.execute(text(sql), bound).fetchall():
+                        candidates.setdefault(row[0], {"ticker": ticker, "kind": kind, "row": row})
+        by_ticker: dict[str, list[date]] = {}
+        for c in candidates.values():
+            by_ticker.setdefault(c["ticker"], []).append(_as_date(c["row"][3]))
+        for ticker, expiries in by_ticker.items():
+            books[ticker] = load_expiry_closes(
+                conn, [ticker], min(expiries) - timedelta(days=_MAX_SESSION_LOOKBACK_DAYS),
+                max(expiries), as_of_ts=now,
+            ).get(ticker, {})
+        conn.rollback()
+
+    tally: dict[str, dict[str, int]] = {}
+    inserts: list[dict[str, Any]] = []
+    for pred_id, c in sorted(candidates.items()):
+        ticker, kind = c["ticker"], c["kind"]
+        (_id, direction, entry, expiry, expected, created_at, keep, prior, prior_notes,
+         stored_actual) = c["row"]
+        bucket = tally.setdefault(f"{kind}:{'dedup_keep' if keep else 'other'}", {})
+        bucket["spanning_split"] = bucket.get("spanning_split", 0) + 1
+        if pred_id in already:
+            bucket["already_rescored"] = bucket.get("already_rescored", 0) + 1
+            continue
+        res = resolve_expiry_close({ticker: books.get(ticker, {})}, ticker, expiry,
+                                   created_at=created_at, now=now)
+        if res.status != "priced" and stored_actual is not None and float(stored_actual) > 0:
+            res = ExpiryClose(
+                "priced", price=float(stored_actual),
+                session_date=expiry_session_date(ticker, _as_date(expiry)) or _as_date(expiry),
+                source=STORED_PRICE_SOURCE,
+            )
+            bucket["stored_price"] = bucket.get("stored_price", 0) + 1
+        if res.status != "priced":
+            bucket["no_close"] = bucket.get("no_close", 0) + 1
+            continue
+        actual, factor = split_adjusted_close(
+            splits, ticker, res.price, res.session_date, created_at=created_at,
+            source=res.source, pull_timestamp=res.pull_timestamp,
+        )
+        if abs(factor - 1.0) <= 1e-9:
+            bucket["factor_one"] = bucket.get("factor_one", 0) + 1
+            continue
+        outcome = classify_outcome(direction, float(entry), actual, expected)
+        if outcome is None:
+            continue
+        verdict, move, pnl = outcome
+        change = f"{prior}->{verdict}"
+        bucket[change] = bucket.get(change, 0) + 1
+        inserts.append({
+            "prediction_id": pred_id, "scoring_version": SPLIT_RESCORE_SCORING_VERSION,
+            "score_class": RESCORE_SCORE_CLASS, "prior_verdict": prior,
+            "prior_score_notes": prior_notes, "verdict": verdict,
+            "entry_price": float(entry), "actual_price": actual,
+            "actual_move_pct": round(move, 4), "pnl_pct": round(pnl, 4),
+            "price_session_date": res.session_date, "price_source": res.source,
+            "price_pull_timestamp": res.pull_timestamp,
+            "expiry_rule": f"{EXPIRY_CLOSE_RULE}+{SPLIT_RULE}",
+            "notes": _score_note(float(entry), res, move, factor), "rescored_at": now,
+        })
+
+    projection: dict[str, Any] = {
+        "mode": "apply" if apply else "dry_run",
+        "scoring_version": SPLIT_RESCORE_SCORING_VERSION,
+        "score_class": RESCORE_SCORE_CLASS,
+        "expiry_rule": f"{EXPIRY_CLOSE_RULE}+{SPLIT_RULE}",
+        "as_of": now.isoformat(),
+        "tickers_with_recorded_splits": len(splits),
+        "split_events": sum(len(v) for v in splits.values()),
+        "candidates_spanning_split": len(candidates),
+        "tally": tally,
+        "rows_to_append": len(inserts),
+        "rows_appended": 0,
+    }
+    if apply and inserts:
+        with engine.begin() as conn:
+            conn.execute(text(_RESCORE_DDL))
+            projection["rows_appended"] = sum(
+                conn.execute(text(_RESCORE_INSERT), row).rowcount or 0 for row in inserts
+            )
+    return projection
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -779,14 +1019,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "only) unless --apply. Skips the normal scoring steps.",
     )
     ap.add_argument(
+        "--rescore-splits", action="store_true",
+        help="Re-score official verdicts and hindsight-v1 rescores whose "
+             "window spans a recorded split (YF:{T}:split_factor) under "
+             f"{SPLIT_RULE}; print the projection. Dry run unless --apply.",
+    )
+    ap.add_argument(
         "--apply", action="store_true",
-        help=f"With --rescore-no-data: append the results to {RESCORE_TABLE} "
-             "(exploratory hindsight, never official). Never updates "
-             "oracle_predictions.",
+        help=f"With --rescore-no-data / --rescore-splits: append the results to "
+             f"{RESCORE_TABLE} (exploratory hindsight, never official). Never "
+             "updates oracle_predictions.",
     )
     args = ap.parse_args(argv)
-    if args.apply and not args.rescore_no_data:
-        ap.error("--apply only applies to --rescore-no-data")
+    if args.rescore_no_data and args.rescore_splits:
+        ap.error("choose one of --rescore-no-data / --rescore-splits")
+    if args.apply and not (args.rescore_no_data or args.rescore_splits):
+        ap.error("--apply only applies to --rescore-no-data or --rescore-splits")
     return args
 
 
@@ -796,6 +1044,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.rescore_no_data:
         projection = rescore_no_data(engine, apply=args.apply)
+        print(json.dumps(projection, indent=2, default=str))
+        return
+    if args.rescore_splits:
+        projection = rescore_splits(engine, apply=args.apply)
         print(json.dumps(projection, indent=2, default=str))
         return
 
@@ -844,6 +1096,10 @@ def main(argv: list[str] | None = None) -> None:
             )
         log.info("  closes loaded for {} of {} tickers", len(prices),
                  len({r[1] for r in scoreable}))
+        splits: SplitBook = load_split_book(
+            conn, sorted({r[1] for r in scoreable}), as_of_ts=now,
+        ) if scoreable else {}
+        log.info("  recorded splits for {} tickers ({})", len(splits), SPLIT_RULE)
 
         # ── Step 2: Backfill entry prices ──
         # HISTORICAL-WRITE HOLD: this step used to backfill a missing/zero
@@ -1007,6 +1263,7 @@ def main(argv: list[str] | None = None) -> None:
                 chunk_size=chunk_size,
                 now=now,
                 after=cursor,
+                splits=splits,
             )
 
         chunk_idx += 1

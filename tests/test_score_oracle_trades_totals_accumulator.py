@@ -103,10 +103,11 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
 
     monkeypatch.setattr(sot, "create_engine", lambda *a, **kw: fake_engine)
     monkeypatch.setattr(sot, "load_expiry_closes", lambda *a, **kw: {})
+    monkeypatch.setattr(sot, "load_split_book", lambda *a, **kw: {})
 
     calls: list[int] = []
 
-    def _fake_score_one_chunk(_conn, *, engine, prices, today, chunk_size, now, after):
+    def _fake_score_one_chunk(_conn, *, engine, prices, today, chunk_size, now, after, splits=None):
         calls.append(1)
         if len(calls) == 1:
             # Every key score_one_chunk's real counters dict can carry,

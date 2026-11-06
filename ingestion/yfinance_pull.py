@@ -35,6 +35,7 @@ from price_close_contract import (
     raw_capture_payload,
     series_id_for_interval,
 )
+from store.observations import split_series_id
 
 
 def _utc_now() -> datetime:
@@ -225,6 +226,62 @@ class YFinancePuller(BasePuller):
         """
         super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
+
+    def pull_split_history(self, ticker: str, *, apply: bool = False) -> dict[str, Any]:
+        """Record ``ticker``'s split history as ``YF:{T}:split_factor`` rows.
+
+        Reads ``yf.Ticker(t).splits`` (effective date -> new shares per old
+        share, e.g. NVDA 2024-06-10 -> 10.0; 1-for-10 reverse -> 0.1) and
+        appends one SUCCESS row per split not already recorded by this source
+        for that date. Additive only: existing rows are never updated. With
+        ``apply=False`` (default) nothing is written and the would-be rows are
+        returned, so a backfill can be reviewed before it lands.
+        """
+        yf_ticker = _normalize_yahoo_ticker(ticker)
+        result: dict[str, Any] = {
+            "ticker": ticker, "splits": [], "rows_inserted": 0, "status": "SUCCESS",
+        }
+        if yf_ticker is None:
+            result["status"] = "SKIPPED"
+            return result
+        try:
+            raw = yf.Ticker(yf_ticker).splits
+        except Exception as exc:  # noqa: BLE001 - any provider error: report, never crash
+            log.warning("yfinance {t}: split history unavailable: {e}", t=yf_ticker, e=str(exc))
+            result["status"] = "FAILED"
+            result["error"] = str(exc)[:200]
+            return result
+        events: list[tuple[date, float]] = []
+        for idx, value in (raw.items() if raw is not None else []):
+            parsed = pd.to_datetime(idx, errors="coerce")
+            try:
+                factor = float(value)
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(parsed) or not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 1e-9:
+                continue
+            events.append((parsed.date(), factor))
+        result["splits"] = [(d.isoformat(), f) for d, f in sorted(events)]
+        if not apply or not events:
+            return result
+        sid = split_series_id(yf_ticker)
+        exists = text(
+            "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND obs_date = :od AND pull_status = 'SUCCESS' LIMIT 1"
+        )
+        insert = text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
+            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+        )
+        with self.engine.begin() as conn:
+            for d, factor in sorted(events):
+                params = {"sid": sid, "src": self.source_id, "od": d}
+                if conn.execute(exists, params).fetchone() is not None:
+                    continue
+                conn.execute(insert, {**params, "val": factor})
+                result["rows_inserted"] += 1
+        log.info("yfinance {t}: recorded {n} split row(s)", t=yf_ticker, n=result["rows_inserted"])
+        return result
 
     def _try_acquire_pg_advisory_lock(self) -> Any | None:
         """Try to take the cross-process advisory lock for pull_all.
@@ -980,10 +1037,53 @@ class YFinancePuller(BasePuller):
             _PULL_ALL_LOCK.release()
 
 
-if __name__ == "__main__":
+def oracle_and_chart_tickers(engine: Engine) -> list[str]:
+    """Equity tickers whose returns GRID scores or charts (split-history backfill universe)."""
+    from strategy.ten_year_portfolio import (
+        DEFAULT_CHART_UNIVERSE,
+        FRONTIER_THEMATIC_UNIVERSE,
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT DISTINCT ticker FROM oracle_predictions")).fetchall()
+    tickers = {str(r[0]).upper() for r in rows if r[0]}
+    tickers |= set(DEFAULT_CHART_UNIVERSE) | set(FRONTIER_THEMATIC_UNIVERSE)
+    return sorted(t for t in tickers if not t.endswith("-USD") and t not in {"BTC", "ETH", "SOL"})
+
+
+def _main(argv: list[str] | None = None) -> None:
+    import argparse
+
     from db import get_engine
 
-    puller = YFinancePuller(db_engine=get_engine())
+    ap = argparse.ArgumentParser(description="yfinance OHLCV pull (default) or split-history backfill.")
+    ap.add_argument("--split-history", action="store_true",
+                    help="Record split events (YF:{T}:split_factor). Dry run unless --apply.")
+    ap.add_argument("--tickers", nargs="*", default=None,
+                    help="With --split-history: tickers (default: oracle + chart universes).")
+    ap.add_argument("--apply", action="store_true", help="With --split-history: write the rows.")
+    args = ap.parse_args(argv)
+    if args.apply and not args.split_history:
+        ap.error("--apply only applies to --split-history")
+
+    engine = get_engine()
+    puller = YFinancePuller(db_engine=engine)
+    if args.split_history:
+        tickers = args.tickers or oracle_and_chart_tickers(engine)
+        total = with_splits = 0
+        for t in tickers:
+            r = puller.pull_split_history(t, apply=args.apply)
+            total += r["rows_inserted"]
+            if r["splits"]:
+                with_splits += 1
+                print(f"  {t}: {r['status']} splits={r['splits']} inserted={r['rows_inserted']}")
+        mode = "apply" if args.apply else "dry_run"
+        print(f"{mode}: {len(tickers)} tickers, {with_splits} with splits, {total} rows inserted")
+        return
     results = puller.pull_all(start_date="2020-01-01")
     for r in results:
         print(f"  {r['ticker']}: {r['status']} ({r['rows_inserted']} rows)")
+
+
+if __name__ == "__main__":
+    _main()

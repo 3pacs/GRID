@@ -10,6 +10,7 @@ Requires TIINGO_API_KEY in environment (free at https://www.tiingo.com).
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import threading
 import time
@@ -26,6 +27,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
 from ingestion.base import BasePuller
+from store.observations import split_series_id
 
 # Process-scoped circuit breaker for catastrophic DB index corruption.
 # Once a single ticker raises psycopg2.errors.IndexCorrupted on
@@ -268,6 +270,7 @@ class TiingoPuller(BasePuller):
                         "val": float(row[tiingo_field]),
                     })
 
+            rows_batch.extend(self._split_rows(ticker, df))
             if dry_run:
                 result["rows_would_insert"] = self._count_new_rows(rows_batch)
                 result["close_obs"] = [
@@ -335,6 +338,33 @@ class TiingoPuller(BasePuller):
             result["errors"].append(err_str)
 
         return result
+
+    def _split_rows(self, ticker: str, df: pd.DataFrame) -> list[dict[str, Any]]:
+        """``YF:{ticker}:split_factor`` rows for the non-unit ``splitFactor`` days in ``df``.
+
+        Tiingo's EOD rows carry ``splitFactor`` (new shares per old share on
+        the ex-date: 10.0 for NVDA on 2024-06-10, 0.1 for a 1-for-10 reverse
+        split, 1.0 otherwise). Only the split days are stored -- one row per
+        corporate action, read by ``store.observations.read_splits``.
+        """
+        if "splitFactor" not in df.columns:
+            return []
+        rows: list[dict[str, Any]] = []
+        for _, row in df[["date", "splitFactor"]].dropna().iterrows():
+            try:
+                factor = float(row["splitFactor"])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 1e-9:
+                continue
+            rows.append({
+                "sid": split_series_id(ticker),
+                "src": self.source_id,
+                "od": row["date"],
+                "val": factor,
+            })
+            log.info("Tiingo {t}: split factor {f} effective {d}", t=ticker, f=factor, d=row["date"])
+        return rows
 
     def _insert_rows(self, rows_batch: list[dict[str, Any]]) -> int:
         """Insert (series, obs_date, value) rows in set-based statements.

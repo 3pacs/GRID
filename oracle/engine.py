@@ -1904,7 +1904,8 @@ class OracleEngine:
             # Get pending predictions past expiry
             rows = conn.execute(text("""
                 SELECT id, ticker, direction, target_price, entry_price, expiry,
-                       confidence, expected_move_pct, model_name, null_write_policy
+                       confidence, expected_move_pct, model_name, null_write_policy,
+                       created_at
                 FROM oracle_predictions
                 WHERE verdict = 'pending' AND expiry <= :today
                 ORDER BY expiry
@@ -1912,8 +1913,13 @@ class OracleEngine:
 
             # no_data rows are already final - exclude from scoring loop
             rows = [r for r in rows if r[2] != "NONE"]
+            # Recorded splits (YF:{T}:split_factor) for the tickers being
+            # scored: an expiry price after a split is put on the entry's
+            # share basis before the verdict (W2-10, split_adjusted_v1).
+            split_book = self._load_split_book(sorted({r[1] for r in rows}))
             for r in rows:
-                pred_id, ticker, direction, target, entry, expiry, conf, expected, model, policy = r
+                (pred_id, ticker, direction, target, entry, expiry, conf, expected,
+                 model, policy, created_at) = r
 
                 # An entry price that cannot be divided by is settled here,
                 # BEFORE the division below. NULL is not a zero entry and a
@@ -1970,6 +1976,12 @@ class OracleEngine:
                 actual = self._get_price_at_date(ticker, expiry)
                 if actual is None:
                     continue
+                raw_actual = actual
+                actual = self._split_adjust_exit(split_book, ticker, actual, expiry, created_at)
+                split_note = (
+                    f" [raw ${raw_actual:.2f} x{actual / raw_actual:g} split, split_adjusted_v1]"
+                    if raw_actual > 0 and abs(actual / raw_actual - 1.0) > 1e-9 else ""
+                )
 
                 actual_move = (actual - entry) / entry * 100
 
@@ -2004,7 +2016,7 @@ class OracleEngine:
                 """), {
                     "v": verdict, "ap": actual, "am": round(actual_move, 2),
                     "pnl": round(pnl, 2), "id": pred_id,
-                    "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%)",
+                    "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%){split_note}",
                 })
 
                 # Update model stats
@@ -2308,6 +2320,61 @@ class OracleEngine:
             if row:
                 return float(row[0])
             return None
+
+    def _load_split_book(self, tickers: list[str]) -> dict[str, list[Any]]:
+        """Recorded splits per ticker; ``{}`` (no adjustment) if the read fails.
+
+        Own read-only connection, so a failed read can never abort the
+        scoring transaction.
+        """
+        from store.observations import read_splits
+
+        book: dict[str, list[Any]] = {}
+        if not tickers:
+            return book
+        try:
+            with self.engine.connect() as sconn:
+                for t in tickers:
+                    events = read_splits(sconn, t)
+                    if events:
+                        book[t] = events
+        except Exception as exc:  # noqa: BLE001 - degrade to unadjusted rather than block scoring
+            log.warning("score_expired_predictions: split read failed: {e}", e=str(exc))
+            return {}
+        return book
+
+    @staticmethod
+    def _split_adjust_exit(
+        split_book: dict[str, list[Any]], ticker: str, price: float,
+        expiry: date, created_at: Any,
+    ) -> float:
+        """Put an as-traded expiry price on the share basis of the creation date.
+
+        Only splits dated after the creation date and on/before ``expiry``
+        apply. ``_get_price_at_date`` returns no provenance, so its price is
+        treated as as-traded on ``expiry`` (spot / a vintage pulled at the
+        session); a lookup that returns source + pull time should pass them
+        to ``store.observations.price_in_basis`` instead.
+        """
+        from store.observations import price_in_basis
+
+        events = split_book.get(ticker)
+        if not events or created_at is None or not price or price <= 0:
+            return price
+        if isinstance(created_at, datetime):
+            from zoneinfo import ZoneInfo
+
+            created = (created_at.astimezone(ZoneInfo("America/New_York")).date()
+                       if created_at.tzinfo is not None else created_at.date())
+        else:
+            created = created_at
+        if not isinstance(created, date):
+            try:
+                created = date.fromisoformat(str(created_at)[:10])
+            except ValueError:
+                return price
+        exit_day = expiry.date() if isinstance(expiry, datetime) else expiry
+        return price_in_basis(price, exit_day, basis_date=created, splits=events)
 
     def _get_price_at_date(self, ticker: str, target_date: date) -> float | None:
         """Get price at or near a specific date for scoring.

@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from store.observations import adjust_history_for_splits, read_splits
 from strategy.ten_year_portfolio import (
     DEFAULT_CHART_UNIVERSE,
     FRONTIER_RAW_HISTORY_TICKERS,
@@ -218,7 +219,47 @@ def _load_price_history(engine: Engine, *, years: int) -> dict[str, list[tuple[d
     history: dict[str, list[tuple[date, float]]] = defaultdict(list)
     for (ticker, obs_date), (_, value) in sorted(by_ticker_date.items()):
         history[ticker].append((obs_date, value))
-    return dict(history)
+    return _apply_recorded_splits(engine, dict(history))
+
+
+SPLIT_BASIS = "recorded_splits_back_adjusted_when_jump_present"
+
+
+def _apply_recorded_splits(
+    engine: Engine, history: dict[str, list[tuple[date, float]]],
+) -> dict[str, list[tuple[date, float]]]:
+    """Back-adjust each ticker's chart for its recorded splits (W2-10).
+
+    ``<ticker>_full`` follows the latest raw_series vintage, which for most
+    history is TIINGO's as-traded close: NVDA's 10-for-1 on 2024-06-10 read
+    as a 1224.40 -> 121.79 crash and the board showed NVDA "down 92%" (max
+    drawdown 0.922; AMZN 0.977, GOOGL 0.971, TSLA 0.949 the same way). A
+    recorded split (``YF:{T}:split_factor``) is applied only when the stored
+    series actually shows its jump, so a history that is already adjusted is
+    never divided twice. Prices stay split-adjusted, not dividend-adjusted.
+    A failed split read leaves the history unadjusted (logged).
+    """
+    if not history:
+        return history
+    try:
+        with engine.connect() as conn:
+            splits = {ticker: read_splits(conn, ticker) for ticker in history}
+    except Exception as exc:  # noqa: BLE001 - charts degrade to unadjusted, never fail
+        log.warning("Ten-year portfolio: split read failed, charts unadjusted: {e}", e=str(exc))
+        return history
+    out = dict(history)
+    for ticker, events in splits.items():
+        if not events:
+            continue
+        adjusted, applied = adjust_history_for_splits(out[ticker], events, verify=True)
+        if applied:
+            out[ticker] = adjusted
+            log.info(
+                "Ten-year portfolio: {t} back-adjusted for {n} split(s): {s}",
+                t=ticker, n=len(applied),
+                s=", ".join(f"{e.effective_date}x{e.ratio:g}" for e in applied),
+            )
+    return out
 
 
 def _history_source_metadata(history: dict[str, list[tuple[date, float]]]) -> dict[str, Any]:
@@ -265,6 +306,7 @@ def _history_source_metadata(history: dict[str, list[tuple[date, float]]]) -> di
 
     return {
         "source": label(history),
+        "split_basis": SPLIT_BASIS,
         "frontier_source": label(FRONTIER_THEMATIC_UNIVERSE),
         "price_basis": "unknown" if any(
             item["price_basis"] == "unknown" for item in by_ticker.values()
