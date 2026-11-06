@@ -654,3 +654,244 @@ def read_completed_closes(
             ambiguous=(hi - lo) / lo > rel_tolerance,
         )
     return out
+
+
+# ── Stock splits (dated corporate actions) ──────────────────────────────────
+#
+# Why: GRID's ``YF:{T}:close`` history is not on one share basis. TIINGO's
+# ``close`` is the as-traded (unadjusted) print; Yahoo's ``Close`` (yfinance
+# ``auto_adjust=False``) is split-adjusted for every split up to the moment
+# it was pulled. The April 2026 TIINGO backfill (pulled 2026-04-01..04-20)
+# appended raw vintages over the 2026-03-29 yfinance backfill, so "latest
+# vintage wins" now hands readers as-traded prices for history: NVDA
+# 2024-06-07 reads 1208.88 (raw) while 2024-06-10 reads 121.79. A max
+# drawdown over that window (1224.40 -> 94.31) reports NVDA "down 92%"
+# (measured on griddb 2026-11-06 via /api/v1/ten-year-portfolio/weekly:
+# NVDA max_drawdown 0.922, AMZN 0.977, GOOGL 0.971, TSLA 0.949).
+#
+# Split events are stored additively in ``raw_series`` under
+# ``YF:{symbol}:split_factor`` with ``obs_date`` = the effective (ex) date and
+# ``value`` = new shares per old share (10.0 = NVDA 10-for-1 on 2024-06-10;
+# 0.1 = a 1-for-10 reverse split). Both TIINGO's ``splitFactor`` and
+# yfinance's ``Ticker.splits`` use this convention. Only non-unit factors are
+# stored: absence of a row means "no split recorded", not "checked, none".
+#
+# Semantics chosen here (document any change):
+# * Price returns are SPLIT-adjusted only, never dividend-adjusted. Splits
+#   change the share count, not the holder's wealth; dividends are a cash
+#   return and belong in a total-return calculation that asks for it
+#   (``adj_close``) explicitly.
+# * Point-in-time: a split dated ``s`` multiplies a price only when the
+#   price being converted is dated on or after ``s`` (``after < s <=
+#   through``); ``as_of_ts`` also hides split rows pulled after that instant.
+#   Nothing here reads a price dated after the caller's bound.
+# * A yfinance close pulled at ``p`` already carries every split dated in
+#   ``(obs_date, p]``; :func:`price_in_basis` undoes that before re-basing,
+#   so mixed TIINGO/yfinance vintages land on one basis.
+
+SPLIT_FIELD = "split_factor"
+# Sources whose stored ``close`` is split-adjusted as of the pull.
+SPLIT_ADJUSTED_AT_PULL_SOURCES: frozenset[str] = frozenset({"yfinance"})
+SPLIT_RATIO_EPS = 1e-9
+
+
+def split_series_id(symbol: str) -> str:
+    """``YF:{symbol}:split_factor`` -- same symbol namespace as the closes."""
+    return f"YF:{symbol}:{SPLIT_FIELD}"
+
+
+@dataclass(frozen=True)
+class SplitEvent:
+    """One recorded split: ``ratio`` new shares per old share, effective ``effective_date``."""
+
+    symbol: str
+    effective_date: date
+    ratio: float
+    source: str | None = None
+    pull_timestamp: datetime | None = None
+
+
+_SPLITS_SQL = (
+    "SELECT r.obs_date, r.value, r.pull_timestamp, sc.name FROM raw_series r "
+    "JOIN source_catalog sc ON sc.id = r.source_id "
+    "WHERE r.series_id = :sid AND r.pull_status = :ok "
+    "  AND (:start IS NULL OR r.obs_date >= :start) "
+    "  AND (:end IS NULL OR r.obs_date <= :end) "
+    "  AND (:as_of_ts IS NULL OR r.pull_timestamp <= :as_of_ts) "
+    "ORDER BY r.obs_date ASC, r.pull_timestamp DESC"
+)
+
+
+def read_splits(
+    conn: Any,
+    symbol: str,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    as_of_ts: datetime | None = None,
+) -> list[SplitEvent]:
+    """Recorded splits for ``symbol`` with effective dates in ``[start, end]``, oldest first.
+
+    SUCCESS rows only, one event per effective date (latest vintage). A split
+    is a fact several providers report, so rows from more than one source are
+    expected and do not raise :class:`MixedSourceError`; the latest pull wins.
+    Unit or non-positive factors are dropped.
+    """
+    import math
+
+    rows = conn.execute(
+        text(_SPLITS_SQL),
+        {"sid": split_series_id(symbol), "ok": SUCCESS, "start": start, "end": end,
+         "as_of_ts": as_of_ts},
+    ).fetchall()
+    out: list[SplitEvent] = []
+    for obs in _dedup_latest_vintage(rows, split_series_id(symbol)):
+        r = obs.value
+        if not math.isfinite(r) or r <= 0 or abs(r - 1.0) < SPLIT_RATIO_EPS:
+            continue
+        out.append(SplitEvent(symbol, obs.obs_date, r, obs.source, obs.pull_timestamp))
+    return out
+
+
+def cumulative_split_factor(splits: Iterable[SplitEvent], after: date, through: date) -> float:
+    """Product of split ratios with ``after < effective_date <= through`` (1.0 if none).
+
+    A price dated ``through`` times this factor is expressed in the share
+    basis of ``after``. Splits dated after ``through`` are never applied.
+    """
+    factor = 1.0
+    if through <= after:
+        return factor
+    for s in splits:
+        if after < s.effective_date <= through:
+            factor *= s.ratio
+    return factor
+
+
+def _ts_date(ts: datetime | None) -> date | None:
+    if ts is None:
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc)
+    return ts.date()
+
+
+def price_in_basis(
+    value: float,
+    obs_date: date,
+    *,
+    basis_date: date,
+    splits: Iterable[SplitEvent],
+    source: str | None = None,
+    pull_timestamp: datetime | None = None,
+) -> float:
+    """Express a stored close dated ``obs_date`` in the share basis of ``basis_date``.
+
+    1. To as-traded: a close from a source in
+       :data:`SPLIT_ADJUSTED_AT_PULL_SOURCES` pulled at ``p`` is multiplied
+       back by the splits dated in ``(obs_date, p]`` (Yahoo had already divided
+       them out). Other sources (TIINGO) are already as-traded.
+    2. Re-base: an earlier ``basis_date`` multiplies by splits in
+       ``(basis_date, obs_date]``; a later one divides by splits in
+       ``(obs_date, basis_date]``.
+
+    NVDA example: entry 2024-06-05 at 1224.40, exit 2024-06-12 TIINGO 125.20,
+    10:1 on 2024-06-10 -> 1252.00 in entry shares (+2.3%, not -89.8%).
+    """
+    split_list = list(splits)
+    as_traded = float(value)
+    if source is not None and source.lower() in {s.lower() for s in SPLIT_ADJUSTED_AT_PULL_SOURCES}:
+        pulled = _ts_date(pull_timestamp)
+        if pulled is not None:
+            as_traded *= cumulative_split_factor(split_list, obs_date, pulled)
+    if basis_date < obs_date:
+        return as_traded * cumulative_split_factor(split_list, basis_date, obs_date)
+    if basis_date > obs_date:
+        return as_traded / cumulative_split_factor(split_list, obs_date, basis_date)
+    return as_traded
+
+
+def split_adjusted_return(
+    conn: Any,
+    symbol: str,
+    start_date: date,
+    end_date: date,
+    *,
+    source: str,
+    as_of_ts: datetime | None = None,
+) -> float | None:
+    """Split-adjusted (not dividend-adjusted) price return of ``symbol`` from ``start_date`` to ``end_date``.
+
+    Reads the latest accepted ``YF:{symbol}:close`` at or before each date
+    from one ``source`` and the recorded splits, puts both prices on the
+    share basis of the start close, and returns ``end / start - 1`` as a
+    fraction. ``None`` when either close is missing.
+    """
+    sid = f"YF:{symbol}:close"
+    p0 = read_latest(conn, sid, source=source, as_of=start_date, as_of_ts=as_of_ts)
+    p1 = read_latest(conn, sid, source=source, as_of=end_date, as_of_ts=as_of_ts)
+    if p0 is None or p1 is None or p0.value <= 0 or p1.obs_date < p0.obs_date:
+        return None
+    splits = read_splits(conn, symbol, as_of_ts=as_of_ts)
+    base = p0.obs_date
+    v0 = price_in_basis(p0.value, p0.obs_date, basis_date=base, splits=splits,
+                        source=p0.source, pull_timestamp=p0.pull_timestamp)
+    v1 = price_in_basis(p1.value, p1.obs_date, basis_date=base, splits=splits,
+                        source=p1.source, pull_timestamp=p1.pull_timestamp)
+    return v1 / v0 - 1.0 if v0 > 0 else None
+
+
+def split_jump_confirmed(
+    points: list[tuple[date, float]], split: SplitEvent, *, tolerance: float = 0.5,
+) -> bool:
+    """True when ``points`` show the price discontinuity ``split`` implies.
+
+    Compares the last close before the effective date with the first on or
+    after it: the observed ratio ``prev / post`` must be within
+    ``ratio ** (1 +- tolerance)``. A series some upstream already adjusted
+    (ratio ~1 across the date) is left alone, so a split is never applied
+    twice. Used for stored histories whose per-row source is unknown
+    (``resolved_series``).
+    """
+    import math
+
+    prev = post = None
+    for d, v in points:
+        if d < split.effective_date:
+            prev = v
+        elif post is None:
+            post = v
+            break
+    if prev is None or post is None or prev <= 0 or post <= 0:
+        return False
+    want = math.log(split.ratio)
+    seen = math.log(prev / post)
+    return abs(seen - want) <= tolerance * abs(want)
+
+
+def adjust_history_for_splits(
+    points: list[tuple[date, float]],
+    splits: Iterable[SplitEvent],
+    *,
+    verify: bool = True,
+) -> tuple[list[tuple[date, float]], list[SplitEvent]]:
+    """Back-adjust a ``[(date, close), ...]`` history to the share basis of its last point.
+
+    Every close dated before a split's effective date is divided by that
+    split's ratio; splits dated after the last point are never applied (they
+    had not happened yet). With ``verify`` (default) a split is applied only
+    when :func:`split_jump_confirmed` sees its discontinuity in ``points``.
+    Returns the adjusted points and the splits actually applied.
+    """
+    pts = sorted(points)
+    if not pts:
+        return [], []
+    last = pts[-1][0]
+    applied = [
+        s for s in sorted(splits, key=lambda e: e.effective_date)
+        if pts[0][0] < s.effective_date <= last and (not verify or split_jump_confirmed(pts, s))
+    ]
+    if not applied:
+        return pts, []
+    out = [(d, v / cumulative_split_factor(applied, d, last)) for d, v in pts]
+    return out, applied
