@@ -430,3 +430,11 @@ starts `astrogrid_insight_e2e_`. It inserts only synthetic fixtures and covers
 producer → ledger → immature/missing/wrong-asset outcome → score → postmortem →
 public API, idempotency, and original-forecast byte preservation. Its synthetic
 outcomes demonstrate software correctness, not trading performance.
+
+Install `server_setup/grid-predict-crypto.timer.d/zz-astrogrid-evidence.conf`
+as the matching drop-in for the existing timer and reload/restart that timer
+after release verification. Its five-minute calendar replaces the hourly
+monotonic trigger; the existing service/user/environment remain unchanged.
+Without this cadence the 20-minute stale limit would correctly mark evidence
+stale for most of each hour even while fresh source candles were available.
+Verify the loaded calendar, next deadline, and a subsequent scheduled run.
