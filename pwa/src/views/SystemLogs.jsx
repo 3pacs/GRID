@@ -5,19 +5,23 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { optionalApi, requireApi } from '../utils/apiResult.js';
 
 export default function SystemLogs({ focusSource = '' }) {
     const [source, setSource] = useState('api');
     const [autoRefresh, setAutoRefresh] = useState(false);
     const [config, setConfig] = useState(null);
     const [sources, setSources] = useState([]);
+    const [configLoading, setConfigLoading] = useState(false);
+    const [configLoaded, setConfigLoaded] = useState(false);
+    const [configError, setConfigError] = useState(null);
+    const [sourcesError, setSourcesError] = useState(null);
     const [activeTab, setActiveTab] = useState('logs');
     const [sourceFilter, setSourceFilter] = useState(focusSource || '');
     const intervalRef = useRef(null);
 
     const { data: logs, loading, error, refetch: loadLogs } = useAsyncData(async () => {
-        const result = await api.getLogs(source, 100);
-        if (result?.error) throw new Error(result.message || 'Failed to load logs');
+        const result = await requireApi(api.getLogs(source, 100), { label: `${source} logs` });
         return result.logs || result || [];
     }, { fallback: [], deps: [source] });
 
@@ -40,16 +44,21 @@ export default function SystemLogs({ focusSource = '' }) {
         }
     }, [focusSource]);
 
+    // Failures used to be swallowed: the Config tab stayed blank (config
+    // null) and Sources said "No sources found". Track both explicitly.
     const loadConfig = async () => {
-        try {
-            const [cfg, src] = await Promise.all([
-                api.getConfig().catch(() => null),
-                api.getSources().catch(() => []),
-            ]);
-            if (cfg) setConfig(cfg);
-            if (Array.isArray(src)) setSources(src);
-            else if (src?.sources) setSources(src.sources);
-        } catch (e) { console.warn('[GRID] System:', e.message); }
+        setConfigLoading(true);
+        const [cfg, src] = await Promise.all([
+            optionalApi(api.getConfig(), { label: 'Config' }),
+            optionalApi(api.getSources(), { label: 'Sources' }),
+        ]);
+        setConfigError(cfg.error);
+        if (cfg.value && typeof cfg.value === 'object') setConfig(cfg.value);
+        setSourcesError(src.error);
+        if (Array.isArray(src.value)) setSources(src.value);
+        else if (Array.isArray(src.value?.sources)) setSources(src.value.sources);
+        setConfigLoaded(true);
+        setConfigLoading(false);
     };
 
     const toggleSource = async (id, active) => {
@@ -152,6 +161,16 @@ export default function SystemLogs({ focusSource = '' }) {
                 </>
             )}
 
+            {activeTab === 'config' && !config && (
+                configError ? (
+                    <ErrorState error={configError} onRetry={loadConfig} title="Config unavailable" />
+                ) : (
+                    <div style={{ ...shared.card, color: colors.textMuted, fontSize: '13px' }}>
+                        {configLoading || !configLoaded ? 'Loading config...' : 'Config returned no entries.'}
+                    </div>
+                )
+            )}
+
             {activeTab === 'config' && config && (
                 <div style={shared.card}>
                     {Object.entries(config).map(([key, value]) => (
@@ -196,7 +215,11 @@ export default function SystemLogs({ focusSource = '' }) {
                             </button>
                         ) : null}
                     </div>
-                    {visibleSources.length === 0 ? (
+                    {sourcesError ? (
+                        <ErrorState error={sourcesError} onRetry={loadConfig} title="Sources unavailable" />
+                    ) : configLoading && sources.length === 0 ? (
+                        <div style={{ color: colors.textMuted, fontSize: '13px' }}>Loading sources...</div>
+                    ) : visibleSources.length === 0 ? (
                         <div style={{ color: colors.textMuted, fontSize: '13px' }}>No sources found</div>
                     ) : (
                         visibleSources.map((s, i) => (

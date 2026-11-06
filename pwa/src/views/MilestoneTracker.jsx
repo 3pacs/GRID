@@ -5,6 +5,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import { upperOr, lowerText, textOr } from '../utils/text.js';
 
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -587,7 +588,7 @@ function TimelineView({ ticker, milestones, score, onBack }) {
                                         color: colors.accent, letterSpacing: '0.8px',
                                         marginTop: '2px', display: 'block',
                                     }}>
-                                        {m.category.toUpperCase()}
+                                        {upperOr(m.category)}
                                     </span>
                                 )}
                                 {m.description && (
@@ -668,11 +669,11 @@ export default function MilestoneTracker() {
     }, [sortCol]);
 
     const sorted = [...companies]
-        .filter((c) => !search || c.ticker.toLowerCase().includes(search.toLowerCase()))
+        .filter((c) => !search || lowerText(c.ticker).includes(search.toLowerCase()))
         .sort((a, b) => {
             const dir = sortDir === 'asc' ? 1 : -1;
             if (sortCol === 'grade') return dir * (gradeRank(a.grade) - gradeRank(b.grade));
-            if (sortCol === 'ticker') return dir * a.ticker.localeCompare(b.ticker);
+            if (sortCol === 'ticker') return dir * textOr(a.ticker, '').localeCompare(textOr(b.ticker, ''));
             if (sortCol === 'trend') {
                 const tv = (t) => t === 'improving' ? 0 : t === 'declining' ? 2 : 1;
                 return dir * (tv(a.trend) - tv(b.trend));

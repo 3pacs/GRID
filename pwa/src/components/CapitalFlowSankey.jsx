@@ -13,6 +13,7 @@ import * as d3 from 'd3';
 import { sankey as d3Sankey, sankeyLinkHorizontal } from 'd3-sankey';
 import { api } from '../api.js';
 import { colors } from '../styles/shared.js';
+import { textOr } from '../utils/text.js';
 
 const LEVEL_COLORS = {
     root: '#1A6EBF',
@@ -231,7 +232,8 @@ export default function CapitalFlowSankey() {
             .attr('font-family', "'JetBrains Mono', monospace")
             .attr('fill', '#C8D8E8')
             .text(d => {
-                const name = d.name.includes('/') ? d.name.split('/').pop() : d.name;
+                const full = textOr(d.name, 'unnamed');
+                const name = full.includes('/') ? full.split('/').pop() : full;
                 return name.length > 20 ? name.substring(0, 18) + '..' : name;
             });
 

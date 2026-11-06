@@ -7,6 +7,7 @@ import GEXProfile from '../components/GEXProfile.jsx';
 import VannaCharmViz from '../components/VannaCharmViz.jsx';
 import FlowTimeline from '../components/FlowTimeline.jsx';
 import GammaWatch from '../components/GammaWatch.jsx';
+import { routeTicker } from '../utils/text.js';
 
 const tabs = ['Signals', 'Scanner', '100x', 'Dealer Flow', 'Gamma Watch', 'Trades'];
 
@@ -948,8 +949,7 @@ export default function Options({ selectedTicker = '' }) {
     }, [activeTab]);
 
     useEffect(() => {
-        if (typeof selectedTicker !== 'string') return;
-        const nextTicker = selectedTicker.trim().toUpperCase();
+        const nextTicker = routeTicker(selectedTicker);
         if (!nextTicker) return;
         setActiveTab('Dealer Flow');
         setGexTicker(nextTicker);

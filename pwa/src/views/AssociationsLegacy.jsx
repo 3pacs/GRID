@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
+import { upperOr } from '../utils/text.js';
 
 // ---------- shared local styles ----------
 const s = {
@@ -854,7 +855,7 @@ function AnomaliesTab() {
                                 {a.feature}
                             </span>
                             <span style={s.badge(severityBg, severityColor)}>
-                                {a.severity.toUpperCase()}
+                                {upperOr(a.severity)}
                             </span>
                         </div>
 

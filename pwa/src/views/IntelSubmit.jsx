@@ -12,6 +12,7 @@ import React, { useState, useMemo } from 'react';
 import { api } from '../api.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import ErrorState from '../components/ErrorState.jsx';
+import { lowerText } from '../utils/text.js';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 
@@ -142,8 +143,8 @@ export default function IntelSubmit() {
         if (!q || q.length < 2) return [];
         return actorList
             .filter(a => (
-                a.id.toLowerCase().includes(q) ||
-                a.label.toLowerCase().includes(q)
+                lowerText(a.id).includes(q) ||
+                lowerText(a.label).includes(q)
             ))
             .slice(0, 12);
     }, [actorInput, actorList]);

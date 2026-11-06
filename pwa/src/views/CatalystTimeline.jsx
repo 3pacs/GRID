@@ -18,6 +18,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors } from '../styles/shared.js';
+import { routeTicker, upperOr } from '../utils/text.js';
 
 const MONO = "'JetBrains Mono', monospace";
 
@@ -122,7 +123,7 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
     };
 
     useEffect(() => {
-        const nextTicker = (selectedTicker ?? '').trim().toUpperCase();
+        const nextTicker = routeTicker(selectedTicker);
         if (!nextTicker) return;
         setSearchInput(nextTicker);
         loadTimeline(nextTicker);
@@ -265,7 +266,7 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
             }
 
             // Icon/label inside dot
-            const icon = SUBTYPE_ICONS[ev.subtype] || ev.type[0].toUpperCase();
+            const icon = SUBTYPE_ICONS[ev.subtype] || upperOr(ev.type, '?')[0];
             if (ev.r > 8) {
                 parent.append('text')
                     .attr('x', ev.x).attr('y', ev.y + 3)
@@ -294,7 +295,7 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
                     .style('top', `${event.clientY - 16}px`)
                     .html(`
                         <div style="font-weight:700;font-size:12px;color:${color};margin-bottom:4px">
-                            ${escapeHtml(ev.type.toUpperCase())} · ${escapeHtml(ev.subtype || '')}
+                            ${escapeHtml(upperOr(ev.type))} · ${escapeHtml(ev.subtype || '')}
                         </div>
                         <div style="font-size:11px;margin-bottom:6px">${escapeHtml(ev.label)}</div>
                         <div style="font-size:9px;color:${colors.textMuted}">
@@ -459,7 +460,7 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
                             <span style={{
                                 fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
                                 color: TYPE_COLORS[selectedEvent.type], fontFamily: MONO,
-                            }}>{selectedEvent.type.toUpperCase()}</span>
+                            }}>{upperOr(selectedEvent.type)}</span>
                             <button onClick={() => setSelectedEvent(null)} style={{
                                 background: 'none', border: 'none', color: colors.textMuted,
                                 cursor: 'pointer', fontSize: '14px',

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
+import { textOr } from '../utils/text.js';
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -311,7 +312,7 @@ function sortSources(sources, sortKey, sortDir) {
         if (sortKey === 'status') {
             cmp = (STATUS_ORDER[a.status] ?? 3) - (STATUS_ORDER[b.status] ?? 3);
         } else if (sortKey === 'name') {
-            cmp = a.name.localeCompare(b.name);
+            cmp = textOr(a.name, '').localeCompare(textOr(b.name, ''));
         } else if (sortKey === 'freshness') {
             const f = { red: 0, yellow: 1, green: 2 };
             cmp = (f[a.freshness] ?? 0) - (f[b.freshness] ?? 0);
