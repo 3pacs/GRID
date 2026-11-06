@@ -34,13 +34,17 @@ def test_fallback_is_warned_once_per_outage(monkeypatch):
     from config import settings
 
     monkeypatch.setattr(settings, "LLM_LOCAL_PROVIDER", "llamacpp_quick", raising=False)
+    # This test is about fallback-warning dedupe, not the refusal cooldown
+    # (covered in test_llm_router_fleet_topology.py) — turn the cooldown off
+    # so the primary is re-probed on every call.
+    monkeypatch.setattr(settings, "LLM_PROVIDER_COOLDOWN_SECONDS", 0.0, raising=False)
     primary = {"available": False}
     fallback = _Client(True)
 
     def create(provider):
         if provider == "llamacpp_quick":
             return _Client(primary["available"])
-        if provider == "ollama_koala":
+        if provider == "llamacpp_z4":
             return fallback
         return None
 
@@ -50,7 +54,7 @@ def test_fallback_is_warned_once_per_outage(monkeypatch):
                         lambda template, **k: warnings.append(template.format(**k)))
     for _ in range(5):
         assert router.get_llm(router.Tier.LOCAL) is fallback
-    assert len(warnings) == 1 and "falling back to ollama_koala" in warnings[0]
+    assert len(warnings) == 1 and "falling back to llamacpp_z4" in warnings[0]
 
     primary["available"] = True
     assert router.get_llm(router.Tier.LOCAL).is_available
