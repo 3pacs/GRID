@@ -6,6 +6,15 @@ Pulls macroeconomic indicators for 30 key economies from the World Bank API
 
 Indicators cover GDP, inflation, unemployment, trade, reserves, debt, FDI,
 and exchange rates — the core macro picture for every major market.
+
+Outcome semantics (2026-11-06): the API answers a country/indicator it does
+not cover with ``[{"total": 0, ...}, null]``. That is a legitimate empty
+answer and is reported as ``NO_DATA`` (counted as completed), not as a
+failure. Taiwan is not a World Bank economy, so all 11 of its items came
+back empty on every run and the source logged "319 of 330 items completed"
+(PARTIAL, counted as a failed source by Hermes ~14x/day). A World Bank error
+envelope (``[{"message": [...]}]`` — invalid or archived code) or a
+transport error is a real failure: FAILED, with a FAILED raw_series row.
 """
 
 from __future__ import annotations
@@ -79,6 +88,15 @@ COUNTRIES: dict[str, str] = {
     "VN": "Vietnam",
     "PH": "Philippines",
 }
+
+# Tracked economies the World Bank API does not cover at all (every
+# indicator returns total=0). They stay in COUNTRIES for actor ingestion but
+# are not pulled. Taiwan data has to come from a national source.
+WB_UNCOVERED_COUNTRIES: dict[str, str] = {
+    "TW": "not a World Bank economy; api.worldbank.org returns total=0 for every indicator",
+}
+
+STATUS_NO_DATA = "NO_DATA"
 
 
 class WorldBankPuller(BasePuller):
@@ -154,13 +172,16 @@ class WorldBankPuller(BasePuller):
             resp.raise_for_status()
             payload = resp.json()
 
-            # World Bank returns [metadata, data] or [metadata, None]
+            # World Bank returns [metadata, data] or [metadata, None]; an
+            # invalid/archived code returns [{"message": [{"id", "key",
+            # "value"}]}]. Anything but the data envelope is a real failure.
             if not isinstance(payload, list) or len(payload) < 2:
-                log.warning(
-                    "Unexpected WB response for {c}/{i}: {t}",
-                    c=country, i=indicator, t=type(payload).__name__,
+                detail: Any = payload
+                if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    detail = payload[0].get("message") or payload[0]
+                raise ValueError(
+                    f"World Bank error response for {country}/{indicator}: {str(detail)[:300]}"
                 )
-                break
 
             meta, data = payload[0], payload[1]
             if data is None:
@@ -217,9 +238,12 @@ class WorldBankPuller(BasePuller):
         try:
             records = self._fetch_indicator(country, indicator, start_year, end_year)
 
-            if not records:
-                result["status"] = "PARTIAL"
-                result["errors"].append("No data returned")
+            if not any(rec.get("value") is not None for rec in records):
+                # Legitimately empty: the World Bank publishes nothing for
+                # this country/indicator in the window. Not a failure.
+                result["status"] = STATUS_NO_DATA
+                log.info("WB {sid}: no observations published", sid=series_id)
+                time.sleep(_RATE_LIMIT_DELAY)
                 return result
 
             inserted = 0
@@ -406,8 +430,9 @@ class WorldBankPuller(BasePuller):
         self._ingest_country_actors()
 
         results: list[dict[str, Any]] = []
+        countries = [c for c in COUNTRIES if c not in WB_UNCOVERED_COUNTRIES]
         for indicator in INDICATORS:
-            for country in COUNTRIES:
+            for country in countries:
                 res = self.pull_indicator(country, indicator, years=years)
                 results.append(res)
 
@@ -415,14 +440,19 @@ class WorldBankPuller(BasePuller):
         anomalies = self.detect_gdp_anomalies()
 
         total_rows = sum(r["rows_inserted"] for r in results)
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        # An item is completed when the API answered it: with data, or with a
+        # legitimate empty series. Only FAILED items count against coverage.
+        empty = [r["series_id"] for r in results if r["status"] == STATUS_NO_DATA]
+        succeeded = sum(1 for r in results if r["status"] in ("SUCCESS", STATUS_NO_DATA))
         failed = sum(1 for r in results if r["status"] == "FAILED")
 
         log.info(
-            "World Bank bulk pull complete — {ok}/{total} succeeded, "
-            "{fail} failed, {rows} rows inserted, {anom} GDP anomalies",
+            "World Bank bulk pull complete — {ok}/{total} succeeded "
+            "({empty} with no published data), {fail} failed, {rows} rows inserted, "
+            "{anom} GDP anomalies",
             ok=succeeded,
             total=len(results),
+            empty=len(empty),
             fail=failed,
             rows=total_rows,
             anom=len(anomalies),
@@ -434,6 +464,7 @@ class WorldBankPuller(BasePuller):
             "succeeded": succeeded,
             "failed": failed,
             "total": len(results),
+            "empty_series": empty,
             "anomalies": anomalies,
         }
 
