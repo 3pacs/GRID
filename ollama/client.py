@@ -32,7 +32,10 @@ class OllamaClient:
         base_url: Base URL of the Ollama API (default http://localhost:11434).
         model: Default model to use for chat/generate.
         embed_model: Model to use for embeddings.
-        timeout: HTTP request timeout in seconds.
+        timeout: HTTP read timeout in seconds.
+        connect_timeout: TCP connect timeout in seconds for every call, so a
+            black-holed host fails fast instead of holding the caller for the
+            full read timeout (llm/router.py passes LLM_CONNECT_TIMEOUT_SECONDS).
         is_available: Whether Ollama responded to the initial health check.
     """
 
@@ -42,17 +45,21 @@ class OllamaClient:
         model: str = "llama3.1:8b",
         embed_model: str = "nomic-embed-text",
         timeout: int = 300,
+        connect_timeout: float = 2.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.embed_model = embed_model
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.is_available: bool = False
         self._knowledge_cache: dict[str, str] = {}
 
         # Health check
         try:
-            resp = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            resp = requests.get(
+                f"{self.base_url}/api/tags", timeout=(self.connect_timeout, 5)
+            )
             self.is_available = resp.status_code == 200
         except Exception:
             self.is_available = False
@@ -134,7 +141,7 @@ class OllamaClient:
             resp = requests.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
-                timeout=self.timeout,
+                timeout=(self.connect_timeout, self.timeout),
             )
             latency_ms = (time.monotonic() - start) * 1000
             resp.raise_for_status()
@@ -228,7 +235,7 @@ class OllamaClient:
             resp = requests.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
-                timeout=self.timeout,
+                timeout=(self.connect_timeout, self.timeout),
             )
             latency_ms = (time.monotonic() - start) * 1000
             resp.raise_for_status()
@@ -296,7 +303,7 @@ class OllamaClient:
                 resp = requests.post(
                     f"{self.base_url}/api/embeddings",
                     json={"model": model_name, "prompt": text},
-                    timeout=self.timeout,
+                    timeout=(self.connect_timeout, self.timeout),
                 )
                 resp.raise_for_status()
                 data = resp.json()

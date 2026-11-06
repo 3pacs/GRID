@@ -79,7 +79,10 @@ class LlamaCppClient:
         base_url: Base URL of llama-server (e.g. http://localhost:8080).
         model: Model alias reported by llama-server.
         embed_model: Embedding model alias (same server, or separate).
-        timeout: HTTP request timeout in seconds.
+        timeout: HTTP read timeout in seconds.
+        connect_timeout: TCP connect timeout in seconds for every call, so a
+            black-holed host fails fast instead of holding the caller for the
+            full read timeout (llm/router.py passes LLM_CONNECT_TIMEOUT_SECONDS).
         is_available: Whether the server responded at init.
     """
 
@@ -92,11 +95,13 @@ class LlamaCppClient:
         default_num_predict: int = 2000,
         min_num_predict: int = 0,
         reasoning_headroom: int = 4096,
+        connect_timeout: float = 2.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.embed_model = embed_model
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.default_num_predict = default_num_predict
         self.min_num_predict = min_num_predict
         # llama-server's --reasoning-budget lets reasoning models burn this
@@ -149,7 +154,9 @@ class LlamaCppClient:
         logs the recovery at info.
         """
         try:
-            resp = requests.get(f"{self.base_url}/health", timeout=timeout)
+            resp = requests.get(
+                f"{self.base_url}/health", timeout=(self.connect_timeout, timeout)
+            )
             self.is_available = resp.status_code == 200
         except Exception:
             self.is_available = False
@@ -308,7 +315,7 @@ class LlamaCppClient:
                 resp = requests.post(
                     f"{self.base_url}/v1/chat/completions",
                     json=payload,
-                    timeout=self.timeout,
+                    timeout=(self.connect_timeout, self.timeout),
                 )
                 if attempt == 0 and resp.status_code == 400:
                     retry_prompt_tokens = self._note_context_overflow(resp)
@@ -617,7 +624,7 @@ class LlamaCppClient:
             resp = requests.post(
                 f"{self.base_url}/v1/embeddings",
                 json=payload,
-                timeout=self.timeout,
+                timeout=(self.connect_timeout, self.timeout),
             )
             resp.raise_for_status()
             data = resp.json()

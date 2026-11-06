@@ -27,10 +27,12 @@ def _clean_router_state():
     router._client_cache.clear()
     router._PROVIDER_BACKOFF_UNTIL.clear()
     router._PROVIDER_BACKOFF_REASONS.clear()
+    router._UNREACHABLE_WARNED.clear()
     yield
     router._client_cache.clear()
     router._PROVIDER_BACKOFF_UNTIL.clear()
     router._PROVIDER_BACKOFF_REASONS.clear()
+    router._UNREACHABLE_WARNED.clear()
 
 
 class _FakeEmbedProvider:
@@ -69,10 +71,10 @@ class TestEmbedChainConfig:
     def test_setting_is_declared_with_gpu_node_order(self) -> None:
         assert "EMBED_PROVIDER_CHAIN" in config.Settings.model_fields
         default = config.Settings.model_fields["EMBED_PROVIDER_CHAIN"].default
-        # gridz4 is the only separate tailnet box verified serving
-        # nomic-embed-text, so it leads. grid-svr's Ollama shares the 3090
-        # with the REASON/ORACLE llama-server, so it must come last.
-        assert default == "ollama_z4,ollama_koala,ollama_z400,ollama"
+        # gridz4 leads, i7gen10 (RTX 2060) is second since 2026-11-06.
+        # grid-svr's Ollama shares the 3090 with the ORACLE llama-server, so
+        # it must come last.
+        assert default == "ollama_z4,ollama_i7gen10,ollama"
 
     def test_grid_svr_ollama_is_last_resort(self) -> None:
         """Embedding batches must not evict the 27B chat model on the 3090."""
@@ -82,15 +84,13 @@ class TestEmbedChainConfig:
 
     def test_chain_parses_to_provider_names(self, monkeypatch) -> None:
         monkeypatch.setattr(
-            config.settings, "EMBED_PROVIDER_CHAIN", "ollama_z4, ollama_koala ,ollama"
+            config.settings, "EMBED_PROVIDER_CHAIN", "ollama_z4, ollama_i7gen10 ,ollama"
         )
-        assert router._embed_chain() == ["ollama_z4", "ollama_koala", "ollama"]
+        assert router._embed_chain() == ["ollama_z4", "ollama_i7gen10", "ollama"]
 
     def test_empty_chain_falls_back_to_defaults(self, monkeypatch) -> None:
         monkeypatch.setattr(config.settings, "EMBED_PROVIDER_CHAIN", "")
-        assert router._embed_chain() == [
-            "ollama_z4", "ollama_koala", "ollama_z400", "ollama"
-        ]
+        assert router._embed_chain() == ["ollama_z4", "ollama_i7gen10", "ollama"]
 
     def test_gridz4_ollama_is_distinct_from_gridz4_llamacpp(self) -> None:
         """ollama_z4 (:11434) and llamacpp_z4 (:8080) are different daemons."""
@@ -115,33 +115,33 @@ class TestEmbedChainConfig:
 class TestEmbed:
     def test_first_healthy_provider_wins(self, monkeypatch) -> None:
         z4 = _FakeEmbedProvider(vectors=[[0.1, 0.2]])
-        koala = _FakeEmbedProvider(vectors=[[9.9, 9.9]])
-        _install(monkeypatch, {"ollama_z4": z4, "ollama_koala": koala})
+        i7 = _FakeEmbedProvider(vectors=[[9.9, 9.9]])
+        _install(monkeypatch, {"ollama_z4": z4, "ollama_i7gen10": i7})
 
         assert router.embed(["hello"]) == [[0.1, 0.2]]
         assert z4.calls == [["hello"]]
-        assert koala.calls == []  # never reached
+        assert i7.calls == []  # never reached
 
-    def test_falls_through_to_z400_when_koala_offline(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(available=False)
-        z400 = _FakeEmbedProvider(vectors=[[0.5]])
-        _install(monkeypatch, {"ollama_koala": koala, "ollama_z400": z400})
+    def test_falls_through_to_grid_svr_when_i7gen10_offline(self, monkeypatch) -> None:
+        i7 = _FakeEmbedProvider(available=False)
+        svr = _FakeEmbedProvider(vectors=[[0.5]])
+        _install(monkeypatch, {"ollama_i7gen10": i7, "ollama": svr})
 
         assert router.embed(["hi"]) == [[0.5]]
-        assert koala.calls == []
-        assert z400.calls == [["hi"]]
+        assert i7.calls == []
+        assert svr.calls == [["hi"]]
 
     def test_falls_through_when_provider_returns_none(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(vectors=None)
-        z400 = _FakeEmbedProvider(vectors=[[1.0]])
-        _install(monkeypatch, {"ollama_koala": koala, "ollama_z400": z400})
+        i7 = _FakeEmbedProvider(vectors=None)
+        svr = _FakeEmbedProvider(vectors=[[1.0]])
+        _install(monkeypatch, {"ollama_i7gen10": i7, "ollama": svr})
 
         assert router.embed(["x"]) == [[1.0]]
 
     def test_provider_exception_does_not_sink_the_chain(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(raises=True)
-        z400 = _FakeEmbedProvider(vectors=[[2.0]])
-        _install(monkeypatch, {"ollama_koala": koala, "ollama_z400": z400})
+        i7 = _FakeEmbedProvider(raises=True)
+        svr = _FakeEmbedProvider(vectors=[[2.0]])
+        _install(monkeypatch, {"ollama_i7gen10": i7, "ollama": svr})
 
         assert router.embed(["x"]) == [[2.0]]
 
@@ -154,44 +154,44 @@ class TestEmbed:
         _install(
             monkeypatch,
             {
-                "ollama_koala": _FakeEmbedProvider(available=False),
-                "ollama_z400": _FakeEmbedProvider(available=False),
+                "ollama_z4": _FakeEmbedProvider(available=False),
+                "ollama_i7gen10": _FakeEmbedProvider(available=False),
                 "ollama": _FakeEmbedProvider(available=False),
             },
         )
         assert router.embed(["a", "b"]) is None
 
     def test_empty_input_short_circuits(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(vectors=[[1.0]])
-        _install(monkeypatch, {"ollama_koala": koala})
+        i7 = _FakeEmbedProvider(vectors=[[1.0]])
+        _install(monkeypatch, {"ollama_i7gen10": i7})
 
         assert router.embed([]) == []
-        assert koala.calls == []
+        assert i7.calls == []
 
     def test_provider_in_backoff_is_skipped(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(vectors=[[1.0]])
-        z400 = _FakeEmbedProvider(vectors=[[3.0]])
-        _install(monkeypatch, {"ollama_koala": koala, "ollama_z400": z400})
-        router._mark_provider_unavailable("ollama_koala", "test", 600.0)
+        i7 = _FakeEmbedProvider(vectors=[[1.0]])
+        svr = _FakeEmbedProvider(vectors=[[3.0]])
+        _install(monkeypatch, {"ollama_i7gen10": i7, "ollama": svr})
+        router._mark_provider_unavailable("ollama_i7gen10", "test", 600.0)
 
         assert router.embed(["x"]) == [[3.0]]
-        assert koala.calls == []
+        assert i7.calls == []
 
     def test_model_override_is_forwarded(self, monkeypatch) -> None:
-        koala = MagicMock()
-        koala.is_available = True
-        koala.embed.return_value = [[1.0]]
-        _install(monkeypatch, {"ollama_koala": koala})
+        i7 = MagicMock()
+        i7.is_available = True
+        i7.embed.return_value = [[1.0]]
+        _install(monkeypatch, {"ollama_i7gen10": i7})
 
         router.embed(["x"], model="custom-embed")
-        koala.embed.assert_called_once_with(["x"], model="custom-embed")
+        i7.embed.assert_called_once_with(["x"], model="custom-embed")
 
     def test_batch_of_texts_returns_batch_of_vectors(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(vectors=[[0.1], [0.2], [0.3]])
-        _install(monkeypatch, {"ollama_koala": koala})
+        i7 = _FakeEmbedProvider(vectors=[[0.1], [0.2], [0.3]])
+        _install(monkeypatch, {"ollama_i7gen10": i7})
 
         assert router.embed(["a", "b", "c"]) == [[0.1], [0.2], [0.3]]
-        assert koala.calls == [["a", "b", "c"]]
+        assert i7.calls == [["a", "b", "c"]]
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +215,9 @@ class TestFallbackChains:
         assert chain.index("gemini") < chain.index("openrouter")
 
     def test_healthy_gpu_providers_are_retained(self) -> None:
-        """`llamacpp` is the :8081 shim to the RTX 3090 — not the :8080 unit."""
+        """gridz4, the 3090 (`llamacpp_oracle`) and the gridz4 proxy stay."""
         reason = router._fallback_chain(router.Tier.REASON, "none")
-        for keeper in ("llamacpp_quick", "llamacpp_z4", "llamacpp", "ollama_koala"):
+        for keeper in ("llamacpp_z4", "llamacpp_oracle", "llamacpp"):
             assert keeper in reason
         oracle = router._fallback_chain(router.Tier.ORACLE, "none")
         assert "llamacpp_oracle" in oracle
