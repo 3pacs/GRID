@@ -156,24 +156,28 @@ class TestMetrics:
 class TestGauntlet:
     def test_permutation_test(self, synthetic_prices, forward_returns):
         signal = vol_regime_adaptive_momentum(synthetic_prices)
-        p_val, observed = permutation_test(
+        result = permutation_test(
             signal, forward_returns, n_shuffles=50, top_n=3
         )
-        assert 0 <= p_val <= 1
-        assert isinstance(observed, float)
+        assert 1 / 51 <= result.p_value <= 1
+        assert result.min_attainable_p == 1 / 51
+        assert isinstance(result.observed_sharpe, float)
 
     def test_deflated_sharpe(self):
-        passed, threshold = deflated_sharpe_ratio(
-            observed_sharpe=2.0, n_models_tested=96, n_observations=500
+        result = deflated_sharpe_ratio(
+            sharpe=2.0 / np.sqrt(252), n_trials=96, n_observations=500,
+            trial_sharpe_variance=1 / 500,
         )
-        assert bool(passed) in (True, False)
-        assert threshold > 0
+        assert result.passed in (True, False)
+        assert result.sr0 > 0
 
     def test_deflated_sharpe_single_model(self):
-        passed, threshold = deflated_sharpe_ratio(
-            observed_sharpe=1.0, n_models_tested=1, n_observations=500
+        result = deflated_sharpe_ratio(
+            sharpe=2.0 / np.sqrt(252), n_trials=1, n_observations=500,
+            trial_sharpe_variance=0.0,
         )
-        assert passed is True
+        assert result.sr0 == 0.0
+        assert result.passed is True
 
     def test_run_gauntlet(self, synthetic_prices, forward_returns):
         signal = vol_regime_adaptive_momentum(synthetic_prices)
