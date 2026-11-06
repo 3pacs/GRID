@@ -140,7 +140,11 @@ def produce_insights(engine: Any, store: Any, *, as_of: datetime | None = None,
     now = as_of or datetime.now(timezone.utc)
     triggers = read_triggers(engine, now)
     result: dict[str, Any] = {"observations": [], "persisted": 0, "unchanged": 0, "errors": []}
-    observations = [observe(symbol, read_candles(engine, symbol, now), now) for symbol in SYMBOLS]
+    recorded = {symbol: read_candles(engine, symbol, now) for symbol in SYMBOLS}
+    # Forward issuance happens after the inputs were actually read. An explicit
+    # clock is only for deterministic/disposable tests, never a replay claim.
+    issued_at = as_of or datetime.now(timezone.utc)
+    observations = [observe(symbol, recorded[symbol], issued_at) for symbol in SYMBOLS]
     btc = observations[0]
     for observation in observations:
         symbol = observation["symbol"]
@@ -153,10 +157,10 @@ def produce_insights(engine: Any, store: Any, *, as_of: datetime | None = None,
         result["observations"].append(observation)
         if not observation["available"]:
             continue
-        payloads = [build_payload(observation, None, now)]
+        payloads = [build_payload(observation, None, issued_at)]
         trigger = causal_trigger(triggers, symbol)
         if trigger is not None and observation["change_24h"] is not None:
-            payloads.append(build_payload(observation, trigger, now))
+            payloads.append(build_payload(observation, trigger, issued_at))
         for payload in payloads:
             if persist:
                 if store.get_prediction(payload["prediction_id"]):
