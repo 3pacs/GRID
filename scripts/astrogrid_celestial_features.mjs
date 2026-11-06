@@ -28,6 +28,9 @@ const records = dates.map((day) => {
         raw[`${name}_sin`] = Math.sin(rad(p.geocentric_longitude));
         raw[`${name}_cos`] = Math.cos(rad(p.geocentric_longitude));
         raw[`${name}_retrograde`] = Number(p.is_retrograde);
+        const signs = ['Aries','Taurus','Gemini','Cancer','Leo','Virgo','Libra','Scorpio','Sagittarius','Capricorn','Aquarius','Pisces'];
+        if (!signs.includes(p.zodiac_sign)) throw new Error('Missing zodiac state');
+        for (const sign of signs) raw[`${name}_zodiac_${sign}`] = Number(p.zodiac_sign === sign);
     }
     raw.lunar_sin = Math.sin(phase * 2 * Math.PI);
     raw.lunar_cos = Math.cos(phase * 2 * Math.PI);

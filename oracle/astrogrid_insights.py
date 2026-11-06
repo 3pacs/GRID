@@ -327,6 +327,16 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
         edge_report = json.loads(report_path.read_text())
     except (OSError, ValueError):
         edge_report = None
+    try:
+        full_celestial = json.loads(report_path.with_name("celestial-equity-v1.json").read_text())
+        celestial = {key: full_celestial[key] for key in (
+            "version", "generated_at", "historical_candidates", "eligible_tests", "declared_tests",
+            "corrected_incremental_tests", "protocol_path", "forecast_model", "primary_cost", "inference", "sky_feature_count")}
+        celestial["cases"] = [r for r in full_celestial["cases"] if r["augmentation"] == "all_engines"]
+        celestial["sky_cases"] = [r for r in full_celestial["cases"] if r["augmentation"] == "all_sky"]
+        celestial["input_limitations"] = full_celestial["input_limitations"]
+    except (OSError, ValueError, KeyError, TypeError):
+        celestial = None
     live_costs = {"scored": flow_scores[0], "utc_dates": flow_scores[3],
                   "first_issued_at": flow_scores[4].isoformat() if flow_scores[4] else None,
                   "mean_gross_bps": float(flow_scores[5]) * 10000 if flow_scores[5] is not None else None,
@@ -339,7 +349,8 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
                 CONTRACT_VERSION: {"label": "24h actor-flow research · 1% threshold", **performance},
                 flow.CONTRACT_VERSION: {"label": "30m spot taker-flow research · 0.10% threshold", **flow_performance}},
             "flow_diagnostics": {symbol: flow.qualification(latest.get(symbol), now) for symbol in SYMBOLS},
-            "edge_assessment": edge_report, "prospective_cost_diagnostic": live_costs}
+            "edge_assessment": edge_report, "prospective_cost_diagnostic": live_costs,
+            "celestial_assessment": celestial}
 
 
 def answer_from_insights(feed: dict[str, Any], requested: list[str], *,

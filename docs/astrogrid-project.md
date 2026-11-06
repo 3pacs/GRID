@@ -500,3 +500,17 @@ The rule shows no net predictive edge in 10,854 nonoverlapping August–October
 slippage assumptions produce a negative mean. Keep the model as unvalidated
 research; never promote weights or claim profitable trading from target hits.
 Historical replay and actual live forecasts remain separate and immutable.
+
+## Mystical oracle scope and controlled equity research (2026-11-06)
+
+Astrogrid is the multi-mysticism reader. A measured-flow ledger lookup must not
+overwrite the chosen mystical interpretation or its lens permissions. The
+reader remains first; evidence and research stay available below it.
+
+The separate [controlled celestial/equity evaluation](research/astrogrid-celestial-equity-v1-results.md)
+uses the actual twelve engines,245 computed sky inputs, equity indexes and
+market/regime/calendar controls, with temporal evaluation, costs and full-search
+correction. Positive paper slices exist; no corrected net-return increment was
+validated in this finite test. This is not a universal rejection of celestial
+relationships and not a historical replay of LLM answers. No weight promotion
+or original-history change follows automatically.

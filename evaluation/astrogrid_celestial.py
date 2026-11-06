@@ -26,7 +26,7 @@ def ridge_predict(train_x, train_y, test_x):
     """Train-only scale and intercept; fixed regularization, no tuning."""
     mean, scale = train_x.mean(axis=0), train_x.std(axis=0)
     scale[scale < 1e-10] = 1
-    x = np.clip((train_x - mean) / scale, -8, 8)
+    x = (train_x - mean) / scale
     future = np.clip((test_x - mean) / scale, -8, 8)
     target_mean = train_y.mean()
     weight = np.linalg.solve(x.T @ x + LAMBDA * np.eye(x.shape[1]), x.T @ (train_y - target_mean))
@@ -161,7 +161,7 @@ def case_stats(frame, labels, predictions, horizon, name, *, start="2024-01-01",
                 "events": int(mask.sum()), "net_bps": float(current_net[mask].mean() * 10000) if mask.any() else None,
                 "advantage_bps": float(delta[mask].mean() * 10000) if mask.any() else None}
     return {"events": len(idx), "first_decision": frame["dates"][idx[0]], "last_decision": frame["dates"][idx[-1]],
-            "eligible": len(idx) >= 100 and len(idx) >= 30,
+            "eligible": len(idx) >= 100 and len({frame["dates"][i] for i in idx}) >= 30,
             "mean_gross_bps": float(np.mean(direction * target) * 10000),
             "mean_net_bps": float(current_net.mean() * 10000),
             "net_95ci_bps": intervals[:, 0].tolist(),
@@ -175,6 +175,7 @@ def case_stats(frame, labels, predictions, horizon, name, *, start="2024-01-01",
                                   "always_long": float(net_returns(np.ones(len(idx)), target).mean() * 10000),
                                   "price_momentum": float(net_returns(frame["momentum"][idx], target).mean() * 10000),
                                   "random_expected": float((-.00025 * (2 + target)).mean() * 10000),
+                                  "mystical_only_ridge": float(net_returns(np.sign(predictions["mystical_only"][idx]), target).mean() * 10000),
                                   "unmixed_seer": float(net_returns(frame["seer"][idx], target).mean() * 10000)},
             "regimes_descriptive": regimes,
             "cost_sensitivity": {str(c): float(net_returns(direction, target, c).mean() * 10000) for c in (0, 5, 10, 20)}}
