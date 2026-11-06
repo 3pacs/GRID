@@ -266,6 +266,21 @@ class TestFARA:
         assert http.urls == [mod._FARA_ACTIVE_REGISTRANTS_URL]
         assert _classify_outcome(out) == ("NO_NEW_DATA", 0, "run completed, 0 rows written")
 
+    def test_already_stored_registrations_explain_a_zero_row_run(self) -> None:
+        # grid-hermes 2026-11-05 14:23Z .. 2026-11-06 07:48Z: 13 runs, 14
+        # recent registrants, 0 lookups failed, rows_inserted=0 every time.
+        # The same live fetch into an empty store inserts 14 rows, so the
+        # zeros were the 37-day dedup window: registrations already stored.
+        engine = FakeEngine(FakeConn(selects={"FROM raw_series": FakeResult(one=(1,))}))
+        http = FaraHTTP(
+            Resp(200, _fara_active((7792, "Vernick, Victor", _TODAY - timedelta(days=1)))),
+            {"7792": Resp(200, _fara_principals(("Ministry A", "QATAR"), ("Firm B", "CHINA")))},
+        )
+        out = _run_fara(http, engine)
+        assert out["rows_inserted"] == 0 and engine.conn.inserts() == []
+        assert out["registrants"]["already_stored"] == 2
+        assert _classify_outcome(out) == ("NO_NEW_DATA", 0, "run completed, 0 rows written")
+
     def test_lookup_cap_reports_unattempted_as_partial(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import ingestion.altdata.fara as mod
 

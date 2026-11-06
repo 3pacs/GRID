@@ -718,6 +718,11 @@ class FARAPuller(BasePuller):
             obs_date = registrant["registration_date"]
 
             if self._row_exists(series_id, obs_date, conn, dedup_hours=dedup_hours):
+                # Already stored by an earlier run inside the window. Counted
+                # so a zero-row run says why (grid-hermes 2026-11-05..06: 13
+                # runs logged rows_inserted=0 for 14 recent registrants with
+                # no failures, which read as "FARA not producing").
+                self._already_stored = getattr(self, "_already_stored", 0) + 1
                 continue
 
             payload = {
@@ -851,6 +856,7 @@ class FARAPuller(BasePuller):
         registrants = fetched["registrants"]
         stored = 0
         store_failed = 0
+        self._already_stored = 0
         # A row from an earlier run inside the lookback window is the same
         # registration, not a new observation.
         dedup_hours = (days_back + 7) * 24
@@ -888,6 +894,9 @@ class FARAPuller(BasePuller):
             "principal_lookups_failed": fetched["lookups_failed"],
             "principal_lookups_unattempted": unattempted,
             "store_failed": store_failed,
+            # Principal rows skipped because this registration is already in
+            # raw_series: the "checked, nothing new" half of a zero-row run.
+            "already_stored": self._already_stored,
         }
         if failed or unattempted:
             summary["error"] = (
