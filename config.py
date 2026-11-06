@@ -590,6 +590,21 @@ class Settings(BaseSettings):
     # every consumer of it are untouched. Off until an operator turns it on.
     GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING: bool = False
 
+    # S16 learning loop (docs/research/prune-rule-v1-preregistration.md).
+    # GRID_TRUST_USE_CORRECTED_OUTCOMES: trust_scorer.update_trust_scores /
+    # get_trusted_sources / detect_convergence read signal_source_outcomes
+    # (sig-eval-4-sessions) instead of the legacy signal_sources.outcome.
+    # CORRECT = hit, WRONG = miss; NO_MOVE, INELIGIBLE and unscored count as
+    # neither. Off until Anik decides to flip it.
+    GRID_TRUST_USE_CORRECTED_OUTCOMES: bool = False
+    # GRID_TRUST_PRUNE_NO_EDGE: units an operator-approved prune list
+    # (GRID_TRUST_PRUNE_LIST_PATH, written by scripts/edge_report.py as a
+    # candidate and copied into place by hand) marks NO_EDGE / ANTI_EDGE get
+    # weight 0 in the convergence conviction layer, detect_convergence and
+    # get_trusted_sources. Never up-weights; never automatic.
+    GRID_TRUST_PRUNE_NO_EDGE: bool = False
+    GRID_TRUST_PRUNE_LIST_PATH: str = ""
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -608,6 +623,8 @@ class Settings(BaseSettings):
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
         "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
         "GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING",
+        "GRID_TRUST_USE_CORRECTED_OUTCOMES",
+        "GRID_TRUST_PRUNE_NO_EDGE",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )

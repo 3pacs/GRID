@@ -583,6 +583,39 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("02:15").do(_calibration_snapshot_and_drift)
 
+    def _oracle_recalibration_exploratory_daily() -> None:
+        """S10 (2026-11-06): exploratory recalibration + conformal intervals.
+
+        Reads official forward oracle scores and #976's hindsight rescores
+        (``oracle_prediction_rescores``, official = FALSE), refreshes
+        expiry-clustered reliability curves per horizon / model family, and
+        evaluates split and adaptive conformal intervals on a held-out time
+        block. Writes ONLY to ``oracle_calibration_exploratory`` (append-only,
+        official = FALSE by CHECK). It never touches ``oracle_predictions``,
+        ``oracle_models`` (running metrics, weights, promotion state),
+        ``oracle_calibration_history`` or E2 outputs, and nothing live reads
+        its output. Runs 02:35 UTC, after the 02:15 live calibration
+        snapshot; a second run on the same UTC date inserts nothing.
+        """
+        try:
+            from db import get_engine as _ge
+            from oracle.calibration import run_exploratory_recalibration
+            summary = run_exploratory_recalibration(_ge())
+            holdout = summary.get("holdout") or {}
+            aci = holdout.get("aci") or {}
+            log.info(
+                "oracle recalibration (exploratory): {n} rows, status={s}, "
+                "aci_coverage={c}, abstain={a}, inserted={i}",
+                n=summary.get("n_rows", 0), s=summary.get("status"),
+                c=(aci.get("coverage") or {}).get("mean"),
+                a=(aci.get("abstention_rate") or {}).get("mean"),
+                i=summary.get("inserted", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("oracle recalibration (exploratory) failed: {e}", e=str(exc))
+
+    _sched.every().day.at("02:35").do(_oracle_recalibration_exploratory_daily)
+
     def _realized_alpha_daily() -> None:
         """GRID-4 §8.1 truth gate: rolling realized alpha vs SPY, net of
         5 bp/side, for every paper trade and scored oracle prediction.

@@ -79,6 +79,19 @@ _ET = ZoneInfo("America/New_York")
 # the lock must be module-level.
 _INCREMENTAL_LOCK = threading.Lock()
 
+# Oracle tickers Tiingo's daily equity endpoint cannot serve (crypto, the
+# dollar index); see TiingoPuller.oracle_tickers.
+_ORACLE_NON_TIINGO: frozenset[str] = frozenset({"BTC", "ETH", "SOL", "DXY"})
+
+
+def is_tiingo_equity(ticker: str) -> bool:
+    """False for symbols Tiingo's daily equity endpoint cannot serve."""
+    return (
+        ticker not in _ORACLE_NON_TIINGO
+        and not ticker.endswith("-USD")
+        and not ticker.startswith("^")
+    )
+
 
 def _stable_advisory_lock_key(name: str) -> int:
     """Deterministic signed 64-bit key (same scheme as yfinance_pull)."""
@@ -169,11 +182,18 @@ class TiingoPuller(BasePuller):
         start_date: str | date = "2020-01-01",
         end_date: str | date | None = None,
         limiter: _RateLimiter | None = None,
+        *,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Download OHLCV for a single ticker from Tiingo.
 
         ``limiter`` (shared across pull_incremental's workers) spaces request
         starts; HTTP 429 is retried with backoff up to _MAX_RATE_LIMIT_RETRIES.
+
+        ``dry_run=True`` fetches exactly as a real pull would but writes
+        nothing: ``rows_would_insert`` counts the rows the insert would add
+        (read-only check, same dedupe contract as _insert_rows) and
+        ``close_obs`` lists the fetched ``(obs_date, close)`` pairs.
         """
         result: dict[str, Any] = {
             "ticker": ticker,
@@ -247,6 +267,16 @@ class TiingoPuller(BasePuller):
                         "od": row["date"],
                         "val": float(row[tiingo_field]),
                     })
+
+            if dry_run:
+                result["rows_would_insert"] = self._count_new_rows(rows_batch)
+                result["close_obs"] = [
+                    (r["od"], r["val"]) for r in rows_batch
+                    if r["sid"] == f"YF:{ticker}:close"
+                ]
+                log.info("Tiingo {t} (dry run): would insert {n} rows",
+                         t=ticker, n=result["rows_would_insert"])
+                return result
 
             if rows_batch:
                 inserted = self._insert_rows(rows_batch)
@@ -361,6 +391,35 @@ class TiingoPuller(BasePuller):
                 inserted += max(0, int(res.rowcount or 0))
         return inserted
 
+    def _count_new_rows(self, rows_batch: list[dict[str, Any]]) -> int:
+        """Rows of ``rows_batch`` that _insert_rows would add. Read only.
+
+        Same contract: a (series_id, obs_date) pair counts once, and only when
+        this source holds no SUCCESS row for it. One bounded, indexed read per
+        series (uq_raw_series_composite prefix), never a write.
+        """
+        wanted: dict[str, set[date]] = {}
+        for r in rows_batch:
+            wanted.setdefault(r["sid"], set()).add(r["od"])
+        new = 0
+        with self.engine.connect() as conn:
+            for sid, dates in wanted.items():
+                held = {
+                    (row[0].date() if isinstance(row[0], datetime) else
+                     date.fromisoformat(str(row[0])[:10]) if isinstance(row[0], str) else row[0])
+                    for row in conn.execute(
+                        text(
+                            "SELECT obs_date FROM raw_series "
+                            "WHERE series_id = :sid AND source_id = :src "
+                            "AND pull_status = 'SUCCESS' "
+                            "AND obs_date BETWEEN :lo AND :hi"
+                        ),
+                        {"sid": sid, "src": self.source_id, "lo": min(dates), "hi": max(dates)},
+                    ).fetchall()
+                }
+                new += len(dates - held)
+        return new
+
     def _lock_tickers(self, conn: Any, series_ids: list[str]) -> None:
         """Take the per-ticker write lock for every ticker in ``series_ids``.
 
@@ -439,11 +498,38 @@ class TiingoPuller(BasePuller):
             conn.close()
 
     @staticmethod
-    def default_tickers() -> list[str]:
-        """YF_TICKER_LIST merged with every sector-map ETF/actor ticker."""
+    def oracle_tickers(db_engine: Engine) -> list[str]:
+        """The oracle's close universe (active ∪ pending), equities only.
+
+        Source of truth: ``oracle.engine.oracle_close_universe``. Crypto and
+        index symbols are left out: Tiingo's daily equity endpoint does not
+        serve them (crypto closes come from the crypto pullers). Never
+        raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from oracle.engine import oracle_close_universe
+
+            with db_engine.connect() as conn:
+                tickers = oracle_close_universe(conn)
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: oracle close universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for t in tickers if is_tiingo_equity(t)]
+
+    @staticmethod
+    def default_tickers(db_engine: Engine | None = None) -> list[str]:
+        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle universe.
+
+        With ``db_engine`` the oracle's close universe
+        (:meth:`oracle_tickers`) is added, so every ticker the oracle predicts
+        on gets a routine close (S15, 2026-11-06: ~45 biotech tickers had no
+        close since 2026-09-09 because neither static list held them).
+        """
         from ingestion.yfinance_pull import YF_TICKER_LIST
 
         all_tickers = set(YF_TICKER_LIST)
+        if db_engine is not None:
+            all_tickers.update(TiingoPuller.oracle_tickers(db_engine))
         try:
             from analysis.sector_map import SECTOR_MAP
             for sector in SECTOR_MAP.values():
@@ -477,7 +563,7 @@ class TiingoPuller(BasePuller):
         fetches failed) or SKIPPED (another run holds the lock -- callers
         must not treat that as a completed pull).
         """
-        tickers = list(ticker_list) if ticker_list is not None else self.default_tickers()
+        tickers = list(ticker_list) if ticker_list is not None else self.default_tickers(self.engine)
 
         def _skip(reason: str) -> dict[str, Any]:
             log.info("Tiingo incremental pull skipped: {r}", r=reason)
@@ -583,7 +669,7 @@ class TiingoPuller(BasePuller):
         Merges YF_TICKER_LIST with all tickers from the sector map
         so that every actor with a ticker gets daily price data.
         """
-        tickers = ticker_list if ticker_list is not None else self.default_tickers()
+        tickers = ticker_list if ticker_list is not None else self.default_tickers(self.engine)
         results = []
         succeeded = 0
 

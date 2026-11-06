@@ -116,7 +116,7 @@ the CLI prints a ready-to-paste retry line per failure. Because every insert is
 | # | Service | Port | Process | Location |
 |---|---------|------|---------|----------|
 | 1 | **PostgreSQL + TimescaleDB** | 5432 | Docker container `grid_db` | `~/grid_v4/grid_repo/grid/docker-compose.yml` |
-| 2 | **llama.cpp (Qwen3.8-27B, RTX 3090)** | 8086 (shim on 8081) | `llama-server` (CUDA) | `/data/vendor/llama.cpp/build/bin/llama-server` |
+| 2 | **llama.cpp (Qwen3.8-27B, RTX 3090)** | 127.0.0.1:18081 | `grid-hermes-3090-oracle.service` (`llama-server`, CUDA) | `/data/fleet-software/llama.cpp/v0.4.0/build/bin/llama-server` (`100.75.185.36:8086` is `grid-oracle-forward-z4.socket`, a proxy to gridz4, not this GPU) |
 | 3 | **Crucix** | 3117 | Node.js app | `~/grid_v4/Crucix/` (has own `.env`) |
 | 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `/data/grid_v4/grid_release` (deployed tree — see [Deploy Pipeline](#deploy-pipeline-grid-api) below) |
 | 5 | **Hermes Operator** | — | `python3 scripts/hermes_operator.py` | `/home/grid/grid_v4/grid_repo` → `/data/grid_v4/grid_repo` (see [Deploy Path (grid-hermes)](#deploy-path-grid-hermes)) |
@@ -129,8 +129,10 @@ the CLI prints a ready-to-paste retry line per failure. Because every insert is
 # 1. Database (auto-restarts via Docker)
 cd ~/grid_v4/grid_repo/grid && docker compose up -d
 
-# 2. llama.cpp
-cd ~/grid_v4/grid_repo/grid && bash scripts/start_llamacpp.sh &
+# 2. llama.cpp (RTX 3090) is a systemd unit, not a manual script. Do not run
+#    scripts/start_llamacpp.sh: it starts the retired :8080 server (see
+#    "Retired: grid-llamacpp on :8080" below).
+sudo systemctl start grid-hermes-3090-oracle
 
 # 3. Crucix
 cd ~/grid_v4/Crucix && node server.mjs &
@@ -147,7 +149,7 @@ cd ~/grid_v4/grid_repo/grid && python3 scripts/hermes_operator.py &
 
 ```bash
 pg_isready -U grid -d griddb                           # PostgreSQL
-curl -s localhost:8081/health                           # llama.cpp shim -> :8086 (RTX 3090)
+curl -s localhost:18081/health                          # llama.cpp, RTX 3090 (grid-hermes-3090-oracle)
 curl -s localhost:3117                                  # Crucix
 curl -s localhost:8000/api/v1/system/health             # GRID API
 ps aux | grep hermes_operator                           # Hermes Operator
@@ -157,7 +159,7 @@ ps aux | grep hermes_operator                           # Hermes Operator
 
 ```bash
 kill $(pgrep -f uvicorn)                  # GRID API
-kill $(pgrep -f llama-server)             # llama.cpp
+sudo systemctl stop grid-hermes-3090-oracle  # llama.cpp (RTX 3090)
 kill $(pgrep -f hermes_operator)          # Hermes Operator
 kill $(pgrep -f "node.*Crucix")           # Crucix
 cd ~/grid_v4/grid_repo/grid && docker compose down  # PostgreSQL
@@ -166,10 +168,10 @@ cd ~/grid_v4/grid_repo/grid && docker compose down  # PostgreSQL
 ## Restart All
 
 ```bash
-kill $(pgrep -f uvicorn) $(pgrep -f llama-server) $(pgrep -f hermes_operator) 2>/dev/null
+kill $(pgrep -f uvicorn) $(pgrep -f hermes_operator) 2>/dev/null
 cd ~/grid_v4/grid_repo/grid && docker compose up -d
 sleep 2
-bash scripts/start_llamacpp.sh &
+sudo systemctl restart grid-hermes-3090-oracle   # llama.cpp (RTX 3090); never start_llamacpp.sh
 sleep 5
 cd /data/grid_v4/grid_release && python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 &
 sleep 3
@@ -286,8 +288,8 @@ No port forwarding needed. Traffic flows: User → Cloudflare → tunnel → loc
 | Repo (live `grid-api` tree, see [Deploy Pipeline](#deploy-pipeline-grid-api)) | `/data/grid_v4/grid_release` |
 | Crucix | `~/grid_v4/Crucix/` |
 | Crucix latest.json | `/data/grid_v4/Crucix/runs/latest.json` |
-| GGUF Model | `~/grid_v4/grid_repo/grid/models/Hermes-3-Llama-3.1-8B.Q4_K_M.gguf` |
-| llama-server binary | `~/grid_v4/grid_repo/grid/vendor/llama.cpp/build/bin/llama-server` |
+| GGUF Model (RTX 3090) | Qwen3.8-27B Ollama blob named in `grid-hermes-3090-oracle.service` (`--model`) |
+| llama-server binary | `/data/fleet-software/llama.cpp/v0.4.0/build/bin/llama-server` |
 | API logs | `/data/grid/logs/api.log` |
 | Cron logs | `~/grid_v4/logs/cron/` |
 | .env | `~/grid_v4/grid_repo/grid/.env` |

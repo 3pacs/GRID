@@ -21,6 +21,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from binance_close_contract import CONTRACT_VERSION as CRYPTO_CLOSE_CONTRACT
+from binance_close_contract import bar_available_at
 from config import settings
 from oracle.astrogrid_universe import scoreable_universe_by_symbol
 from price_close_contract import (
@@ -67,6 +69,17 @@ _PRICE_FEATURE_BY_SYMBOL = {
     for symbol, item in _UNIVERSE_BY_SYMBOL.items()
 }
 _PRICE_FEATURE_BY_SYMBOL["GOOG"] = _PRICE_FEATURE_BY_SYMBOL["GOOGL"]
+# Crypto predictions are measured at the horizon end on the 24/7 UTC daily
+# close series (binance_close_contract.py), never at the scoring run date.
+CRYPTO_EVALUATION_RULE = "horizon_end_utc_close_v1"
+
+
+def _is_crypto_target(symbols: list[str]) -> bool:
+    """True when every target symbol is a crypto asset in the scoring universe."""
+    return bool(symbols) and all(
+        _UNIVERSE_BY_SYMBOL.get(symbol, {}).get("asset_class") == "crypto"
+        for symbol in symbols
+    )
 
 
 def _utc_today() -> date:
@@ -1946,6 +1959,13 @@ class AstroGridStore:
         maturity, and written to the rescore table. A clean symbol list in
         the legacy window (the fixed generator ran at 23:38Z on 2026-11-05,
         before the cutoff) is scored like any other prediction.
+
+        Crypto targets (legacy or not) are measured at the horizon end too:
+        entry is the ``start_date`` UTC daily close, exit the close of
+        ``start_date + 7/30``. That exit bar is complete only at
+        ``bar_available_at(maturity)``; before that the prediction is
+        ``not_mature`` (pending), never scored from an open bar or a later
+        price. Reads are bounded to releases on or before the score cutoff.
         """
         if len(row) > 15 and row[15] == "astrogrid-evidence-v2":
             from oracle.astrogrid_insights import score_contract
@@ -1984,7 +2004,13 @@ class AstroGridStore:
         if evaluation_date < maturity_date:
             result["state"] = "not_mature"
             return result
-        row_evaluation_date = maturity_date if legacy else evaluation_date
+        crypto = _is_crypto_target(target_symbols)
+        horizon_end = legacy or crypto
+        if horizon_end and score_cutoff < bar_available_at(maturity_date):
+            # The horizon-end UTC bar is still open at the cutoff.
+            result["state"] = "not_mature"
+            return result
+        row_evaluation_date = maturity_date if horizon_end else evaluation_date
         score = self._build_prediction_score(
             conn=conn,
             prediction_id=row[1],
@@ -2001,6 +2027,7 @@ class AstroGridStore:
             prediction_created_at=created_at,
             declared_horizon=row[3],
             score_cutoff=score_cutoff,
+            release_cutoff=score_cutoff.date() if horizon_end else None,
         )
         if score.get("unscored"):
             result["state"] = "unscored"
@@ -2014,6 +2041,14 @@ class AstroGridStore:
                 "legacy_target_symbols_decoded": decoded,
                 "superseded_score_id": row[13],
                 "evaluation_rule": "horizon_end",
+            }
+        elif crypto:
+            score["raw_payload"] = {
+                **score["raw_payload"],
+                "evaluation_rule": CRYPTO_EVALUATION_RULE,
+                "close_contract": CRYPTO_CLOSE_CONTRACT,
+                "maturity_date": maturity_date.isoformat(),
+                "score_cutoff": score_cutoff.isoformat(),
             }
         result["state"] = "scored"
         result["score"] = score
@@ -3236,6 +3271,7 @@ class AstroGridStore:
         prediction_created_at: datetime | None = None,
         declared_horizon: str | None = None,
         score_cutoff: datetime | None = None,
+        release_cutoff: date | None = None,
     ) -> dict[str, Any]:
         symbols = [symbol for symbol in target_symbols if symbol in _PRICE_FEATURE_BY_SYMBOL]
         if not symbols or len(symbols) != len(target_symbols):
@@ -3318,8 +3354,10 @@ class AstroGridStore:
             benchmark_symbol, benchmark_return = "SPY", None
         else:
             for symbol in symbols:
-                entry = self._lookup_symbol_price(symbol, start_date)
-                exit_observation = self._lookup_symbol_price(symbol, evaluation_date)
+                entry = self._lookup_symbol_price(
+                    symbol, start_date, release_cutoff=release_cutoff)
+                exit_observation = self._lookup_symbol_price(
+                    symbol, evaluation_date, release_cutoff=release_cutoff)
                 for phase, observation in (("entry", entry), ("outcome", exit_observation)):
                     if observation["status"] != "ok":
                         return {"unscored": {
@@ -3336,12 +3374,14 @@ class AstroGridStore:
                 exit_price = exit_observation["price"]
                 realized = (float(exit_price) - float(entry_price)) / float(entry_price)
                 realized_returns.append(realized)
-                path = self._load_price_path(symbol, start_date, evaluation_date)
+                path = self._load_price_path(
+                    symbol, start_date, evaluation_date, release_cutoff=release_cutoff)
                 if path:
                     rel_path = [((price - float(entry_price)) / float(entry_price)) for _, price in path]
                     mfe_values.append(max(rel_path))
                     mae_values.append(min(rel_path))
-            benchmark_symbol, benchmark_return = self._benchmark_return(symbols, start_date, evaluation_date)
+            benchmark_symbol, benchmark_return = self._benchmark_return(
+                symbols, start_date, evaluation_date, release_cutoff=release_cutoff)
         realized_return = sum(realized_returns) / len(realized_returns)
         alpha = realized_return - benchmark_return if benchmark_return is not None else None
         direction = _prediction_direction(" ".join([call, setup]))
@@ -3389,17 +3429,23 @@ class AstroGridStore:
             },
         }
 
-    def _load_price_path(self, symbol: str, start_date: date, evaluation_date: date) -> list[tuple[date, float]]:
+    def _load_price_path(
+        self, symbol: str, start_date: date, evaluation_date: date,
+        *, release_cutoff: date | None = None,
+    ) -> list[tuple[date, float]]:
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol.upper())
         if feature_name:
             sql = text(
                 """
-                SELECT rs.obs_date, rs.value
+                SELECT DISTINCT ON (rs.obs_date) rs.obs_date, rs.value
                 FROM feature_registry fr
                 JOIN resolved_series rs ON rs.feature_id = fr.id
                 WHERE fr.name = :feature_name
                   AND rs.obs_date BETWEEN :start_date AND :evaluation_date
-                ORDER BY rs.obs_date
+                  AND (CAST(:release_cutoff AS date) IS NULL
+                       OR rs.release_date <= CAST(:release_cutoff AS date))
+                -- One value per day: the latest vintage, as _lookup_symbol_price reads.
+                ORDER BY rs.obs_date, rs.release_date DESC, rs.vintage_date DESC
                 """
             )
             try:
@@ -3410,6 +3456,7 @@ class AstroGridStore:
                             "feature_name": feature_name,
                             "start_date": start_date,
                             "evaluation_date": evaluation_date,
+                            "release_cutoff": release_cutoff,
                         },
                     ).fetchall()
                 path = []
@@ -3427,7 +3474,10 @@ class AstroGridStore:
                 return []
         return []
 
-    def _benchmark_return(self, symbols: list[str], start_date: date, evaluation_date: date) -> tuple[str, float | None]:
+    def _benchmark_return(
+        self, symbols: list[str], start_date: date, evaluation_date: date,
+        *, release_cutoff: date | None = None,
+    ) -> tuple[str, float | None]:
         resolved_symbols = [symbol for symbol in symbols if symbol in _UNIVERSE_BY_SYMBOL]
         benchmark_candidates = {
             str(_UNIVERSE_BY_SYMBOL[symbol].get("benchmark_symbol") or "")
@@ -3442,8 +3492,9 @@ class AstroGridStore:
             benchmark_members = ["BTC", "SPY"]
         returns = []
         for symbol in benchmark_members:
-            entry = self._get_symbol_price_at_date(symbol, start_date)
-            exit_price = self._get_symbol_price_at_date(symbol, evaluation_date)
+            entry = self._get_symbol_price_at_date(symbol, start_date, release_cutoff=release_cutoff)
+            exit_price = self._get_symbol_price_at_date(
+                symbol, evaluation_date, release_cutoff=release_cutoff)
             if entry is None or exit_price is None or entry == 0:
                 continue
             returns.append((float(exit_price) - float(entry)) / float(entry))
@@ -3526,11 +3577,15 @@ class AstroGridStore:
             rows = []
         return _build_historical_regime_lookup(valid_dates, rows)
 
-    def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
-        observation = self._lookup_symbol_price(symbol, target_date)
+    def _get_symbol_price_at_date(
+        self, symbol: str, target_date: date, *, release_cutoff: date | None = None,
+    ) -> float | None:
+        observation = self._lookup_symbol_price(symbol, target_date, release_cutoff=release_cutoff)
         return observation["price"] if observation["status"] == "ok" else None
 
-    def _lookup_symbol_price(self, symbol: str, target_date: date) -> dict[str, Any]:
+    def _lookup_symbol_price(
+        self, symbol: str, target_date: date, *, release_cutoff: date | None = None,
+    ) -> dict[str, Any]:
         """Use only the canonical feature and report why a price cannot be scored.
 
         Crypto trades every day, so the observation must match the target day.
@@ -3541,6 +3596,10 @@ class AstroGridStore:
         not prove that older rows were final closes; that requires provenance
         from the producer. The universe contract's 14-day *history coverage*
         limit is too loose for a return.
+
+        ``release_cutoff`` (optional) restricts the read to rows released on
+        or before that UTC date (day precision, like ``release_date``), so a
+        score computed as of a past cutoff ignores later vintages.
         """
         symbol = str(symbol or "").upper()
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
@@ -3569,13 +3628,18 @@ class AstroGridStore:
             JOIN resolved_series rs ON rs.feature_id = fr.id
             WHERE fr.name = :feature_name
               AND rs.obs_date <= :target_date
+              AND (CAST(:release_cutoff AS date) IS NULL
+                   OR rs.release_date <= CAST(:release_cutoff AS date))
             ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
             LIMIT 1
             """
         )
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(sql, {"feature_name": feature_name, "target_date": target_date}).fetchone()
+                row = conn.execute(sql, {
+                    "feature_name": feature_name, "target_date": target_date,
+                    "release_cutoff": release_cutoff,
+                }).fetchone()
         except SQLAlchemyError:
             result["status"] = "canonical_price_lookup_failed"
             return result

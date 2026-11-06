@@ -414,15 +414,17 @@ def test_clean_symbols_in_legacy_window_score_normally(pg_engine) -> None:
     assert backfill["candidates"] == 3  # the char-list rows only
     assert clean not in {r["prediction_run_id"] for r in _rescores(pg_engine)}
 
-    # The base-table scorer measures at the run date (unchanged rule), so it
-    # needs that day's close.
+    # The base-table scorer measures crypto at the horizon end too
+    # (2026-11-06, CRYPTO_EVALUATION_RULE): a later run-date close is ignored.
     yesterday = today - timedelta(days=1)
     _price(pg_engine, 1, yesterday, 120.0)
     summary = store.score_predictions(as_of_date=yesterday, limit=50)
     assert summary["scored"] == 1 and summary["rescored_legacy"] == 0
     with pg_engine.connect() as conn:
-        base = {r[0] for r in conn.execute(text("SELECT prediction_run_id FROM astrogrid.prediction_score"))}
-    assert base == {ids["spy_graded"], clean}  # clean row scored in the base table
+        base = {r[0]: r[1] for r in conn.execute(text(
+            "SELECT prediction_run_id, realized_return FROM astrogrid.prediction_score"))}
+    assert set(base) == {ids["spy_graded"], clean}  # clean row scored in the base table
+    assert base[clean] == pytest.approx(0.10)  # 100 -> 110 at start + 7, not 120
 
 
 def test_permanent_skip_is_not_retried(pg_engine) -> None:
