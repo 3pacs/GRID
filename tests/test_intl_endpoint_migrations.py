@@ -1,6 +1,8 @@
 """Endpoint-migration tests for international pullers (2026-11-06).
 
 * OECD: stats.oecd.org/SDMX-JSON retired -> sdmx.oecd.org csvfile.
+* ECB: empty-window HTTP 200 bodies were filed as upstream outages.
+* ABS: api.data.abs.gov.au gone -> data.api.abs.gov.au/rest csvfile.
 
 All HTTP is mocked; fixture rows are trimmed from live responses probed
 2026-11-06.
@@ -266,3 +268,74 @@ class TestECB:
         assert out["succeeded"] == out["total"]
         outcome, rows, _note = _classify_outcome(out)
         assert outcome == "NO_NEW_DATA" and rows == 0
+
+
+# ---------------------------------------------------------------------------
+# ABS — api.data.abs.gov.au no longer resolves; data.api.abs.gov.au/rest
+# ---------------------------------------------------------------------------
+
+ABS_CPI_CSV = (
+    "DATAFLOW,MEASURE,INDEX,TSEST,REGION,FREQ,TIME_PERIOD,OBS_VALUE,UNIT_MEASURE,"
+    "OBS_STATUS,DECIMALS,OBS_COMMENT,BASE_PERIOD\n"
+    "ABS:CPI(2.0.0),2,10001,10,50,Q,2026-Q1,1.4,PCT,,,,25\n"
+    "ABS:CPI(2.0.0),2,10001,10,50,Q,2026-Q2,0.6,PCT,,,,25\n"
+    "ABS:CPI(2.0.0),2,10001,10,50,Q,2026-Q3,1.3,PCT,,,,25\n"
+    "ABS:CPI(2.0.0),2,10001,10,50,Q,2026-Q4,,PCT,,,,25\n"
+)
+
+
+class TestABS:
+    def _puller(self, monkeypatch):
+        from ingestion.international import abs_au
+
+        engine, conn = _mock_engine()
+        puller = abs_au.ABSPuller(engine)
+        puller._row_exists = lambda *a, **k: False
+        monkeypatch.setattr(abs_au.time, "sleep", lambda s: None)
+        return abs_au, puller, conn
+
+    def test_every_series_maps_to_current_host(self):
+        from ingestion.international import abs_au
+
+        assert set(abs_au.ABS_DATAFLOW_KEYS) == set(abs_au.ABS_SERIES)
+        assert abs_au.abs_series_url("CPI/1.50.10001.10.Q") == (
+            "https://data.api.abs.gov.au/rest/data/ABS,CPI,2.0.0/2.10001.10.50.Q"
+        )
+        for legacy in abs_au.ABS_SERIES:
+            assert abs_au.abs_series_url(legacy).startswith("https://data.api.abs.gov.au/rest/data/ABS,")
+
+    def test_parse_csv_quarters_and_blank_values(self):
+        from ingestion.international.abs_au import parse_abs_csv
+
+        assert parse_abs_csv(ABS_CPI_CSV) == [
+            (date(2026, 1, 1), 1.4), (date(2026, 4, 1), 0.6), (date(2026, 7, 1), 1.3),
+        ]
+        with pytest.raises(ValueError):
+            parse_abs_csv("<html>gone</html>\n")
+
+    def test_pull_series_inserts_under_legacy_series_id(self, monkeypatch):
+        abs_au, puller, conn = self._puller(monkeypatch)
+        get = MagicMock(return_value=_text_resp(ABS_CPI_CSV))
+        monkeypatch.setattr(abs_au.requests, "get", get)
+        res = puller.pull_series("CPI/1.50.10001.10.Q", "2024")
+        assert res["status"] == "SUCCESS" and res["rows_inserted"] == 3
+        assert get.call_args.kwargs["params"] == {"format": "csvfile", "startPeriod": "2024"}
+        assert {p["sid"] for p in _inserts(conn)} == {"australia_cpi_qoq"}
+
+    def test_pull_all_backs_off_start_and_handles_no_records(self, monkeypatch):
+        abs_au, puller, conn = self._puller(monkeypatch)
+        get = MagicMock(return_value=_text_resp("NoRecordsFound", status=404))
+        monkeypatch.setattr(abs_au.requests, "get", get)
+        out = puller.pull_all("2026-10-01")
+        assert get.call_count == 4
+        assert {c.kwargs["params"]["startPeriod"] for c in get.call_args_list} == {"2024"}
+        assert all(r["status"] == "UNCHANGED" for r in out["results"])
+        assert out["succeeded"] == out["total"] == 4
+        assert _inserts(conn) == []
+
+    def test_4xx_not_retried(self, monkeypatch):
+        abs_au, puller, _conn = self._puller(monkeypatch)
+        get = MagicMock(return_value=_text_resp("Semantic error", status=422))
+        monkeypatch.setattr(abs_au.requests, "get", get)
+        res = puller.pull_series("GDP_EXP/1..1..Q")
+        assert res["status"] == "FAILED" and get.call_count == 1
