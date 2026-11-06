@@ -134,6 +134,31 @@ still touches the forward window. A verdict whose forward window overlaps a
 window a later run already declared for the same identity is recorded with
 ``scored: false`` (that data was used twice; neither use may count twice).
 The file's sha256 is recorded with each verdict.
+
+Overfitting gate (W2-3, mandatory before any research promotion)
+----------------------------------------------------------------
+:func:`record_overfit_gate` runs CPCV, PBO (CSCV) and #979's deflated Sharpe
+(:mod:`alpha_research.validation.overfitting`) on a *trial matrix* of
+per-period returns and appends an ``overfit_gate`` record for every outcome:
+``pass``, ``fail`` (with the numbers) or ``refused`` (with the reasons), so
+negatives are kept. The trial matrix comes only from this ledger:
+
+* its columns must be **exactly** the ``tested`` trials of every recorded
+  run (a column outside the ledger, or a ledgered trial missing, is refused:
+  PBO over a hand-picked subset of the trials is meaningless);
+* every candidate trial must be one of those ledgered trials;
+* no allocation may be open (its trials are declared but not yet measured);
+* the DSR's trial count is every trial ever declared (abandoned runs and
+  untestable trials included), not the matrix width.
+
+Pre-registered thresholds (``OverfitGateConfig``, pinned by
+:data:`OVERFIT_GATE_PREREG_SHA256`): PBO < 0.5 and DSR > 0.95 for every
+candidate trial; they may be made stricter, never looser.
+:func:`require_overfit_gate` is the check every promoting caller makes: it
+refuses unless the latest gate record for exactly those trials passed *and*
+the ledger has declared no new trial since (a gate passed against 50 trials
+says nothing once there are 200). The gate itself never promotes; its record
+carries ``promotion_allowed: false`` like every other.
 """
 
 from __future__ import annotations
@@ -1687,6 +1712,234 @@ def ingest_forward_log(
     }
 
 
+# --- overfitting gate (W2-3) --------------------------------------------------------
+
+OVERFIT_GATE_KIND = "overfit_gate"
+OVERFIT_GATE_RESULTS = ("pass", "fail", "refused")
+# The pre-registration the gate runs under; its digest is pinned below and
+# written into every gate record. Changing a value is a new gate version.
+OVERFIT_GATE_PREREG = {
+    "version": "s11-overfit-gate-v1",
+    "pbo": "CSCV (Bailey et al. 2017), S=16, per-period Sharpe; pass iff PBO < 0.5",
+    "dsr": (
+        "Bailey & Lopez de Prado (2014) via alpha_research.validation.gauntlet; "
+        "pass iff DSR > 0.95 for every candidate trial"
+    ),
+    "cpcv": "N=10 groups, k=2 test groups (45 splits, 9 paths), purge + embargo; reported",
+    "embargo": "max(ceil(0.01 T), autocorrelation_block(mean trial return) - 1) rows",
+    "matrix": "columns = exactly the tested trials of every recorded S11 run",
+    "n_trials": "every trial declared by every S11 allocation (abandoned, untestable included)",
+    "stale": "a gate is void once the ledger declares a trial after it",
+}
+OVERFIT_GATE_PREREG_SHA256 = "5136002920646dfdaf84fc9125e27d753b55650ec801b52cd4ee82aab4dfdcc7"
+
+
+class OverfitGateRefused(ValueError):
+    """No passing, current overfitting gate for these trials."""
+
+
+def overfit_gate_prereg_sha256() -> str:
+    """The gate's pre-registration digest; refuses a pre-registration edited in place."""
+    sha = digest(OVERFIT_GATE_PREREG)
+    if sha != OVERFIT_GATE_PREREG_SHA256:
+        raise ValueError("OVERFIT_GATE_PREREG changed without a new pinned sha256")
+    return sha
+
+
+def declared_trial_count(ledger: Ledger) -> int:
+    """Every trial every allocation ever declared (abandoned and untestable included)."""
+    return int(sum(a["trial_count"] for a in ledger.allocations()))
+
+
+def ledgered_tested_trials(ledger: Ledger) -> dict[str, dict]:
+    """``trial_id -> trial`` for every ``tested`` trial of every recorded run."""
+    return {t["trial_id"]: t for t in ledger.trial_results() if t["status"] == "tested"}
+
+
+def _finite(value):
+    """JSON-safe copy (the ledger's canonical JSON refuses NaN/inf and numpy scalars)."""
+    if isinstance(value, dict):
+        return {str(k): _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value) if math.isfinite(value) else None
+    return value
+
+
+def evaluate_overfit_gate(
+    ledger: Ledger,
+    candidate_trial_ids,
+    trial_returns: pd.DataFrame,
+    *,
+    overlap_depth: int = 0,
+    config=None,
+    as_of: str | None = None,
+) -> dict:
+    """The gate's verdict, without writing: ``pass``, ``fail`` or ``refused``.
+
+    ``trial_returns``: per-period returns, one column per ledgered trial id,
+    on a common tz-aware index whose last row is not after ``as_of`` (default
+    now). ``overlap_depth``: rows each label overlaps the next ones by (0 for
+    horizon-spaced rows). ``config``: an ``OverfitGateConfig`` (default the
+    pre-registered one). See the module docstring for the refusal rules.
+    """
+    from alpha_research.validation import overfitting as ovf
+
+    config = config or ovf.OverfitGateConfig()
+    config.validate()
+    if int(overlap_depth) != overlap_depth or overlap_depth < 0:
+        raise ValueError("overlap_depth must be a non-negative integer")
+    ledger.verify()
+    candidates = sorted({str(c) for c in candidate_trial_ids})
+    tested = ledgered_tested_trials(ledger)
+    declared = declared_trial_count(ledger)
+    reasons: list[str] = []
+    if not candidates:
+        reasons.append("no candidate trials")
+    if ledger.open_allocation() is not None:
+        reasons.append("an allocation is open: its declared trials are not measured yet")
+    outside = [c for c in candidates if c not in tested]
+    if outside:
+        reasons.append(
+            f"{len(outside)} candidate trial(s) are not tested trials of a recorded S11 run"
+        )
+    matrix_info: dict = {}
+    if not isinstance(trial_returns, pd.DataFrame):
+        reasons.append("the trial matrix is not a DataFrame")
+    else:
+        columns = {str(c) for c in trial_returns.columns}
+        extra = sorted(columns - set(tested))
+        missing = sorted(set(tested) - columns)
+        if extra:
+            reasons.append(f"trial matrix has {len(extra)} column(s) outside the S11 ledger")
+        if missing:
+            reasons.append(
+                f"trial matrix is missing {len(missing)} of {len(tested)} ledgered trials: "
+                "PBO over a subset of the trials is meaningless"
+            )
+        try:
+            ovf.validate_matrix(trial_returns)
+            if len(trial_returns) == 0:
+                raise ovf.OverfitInputError("no rows")
+            matrix_info = {
+                "rows": len(trial_returns),
+                "columns": int(trial_returns.shape[1]),
+                "first": trial_returns.index[0].isoformat(),
+                "last": trial_returns.index[-1].isoformat(),
+                "sha256": ovf.matrix_sha256(trial_returns),
+            }
+            if trial_returns.index[-1] > stamp(as_of or now_iso()):
+                reasons.append("trial matrix has rows after the gate's as-of time (look-ahead)")
+        except ovf.OverfitInputError as exc:
+            reasons.append(f"trial matrix invalid: {exc}")
+    result = {
+        "gate_version": ovf.GATE_VERSION,
+        "prereg_sha256": overfit_gate_prereg_sha256(),
+        "config": config.as_dict(),
+        "candidate_trial_ids": candidates,
+        "candidates": [
+            {
+                "trial_id": c,
+                "family": tested[c]["family"],
+                "feature": tested[c]["feature"],
+                "holdout_outcome": tested[c]["holdout_outcome"],
+                "candidate_sha256": tested[c].get("candidate_sha256"),
+            }
+            for c in candidates
+            if c in tested
+        ],
+        "n_trials_declared": declared,
+        "n_trials_tested": len(tested),
+        "tested_trials_sha256": digest(sorted(tested)),
+        "ledger_head_sha256": ledger.head,
+        "overlap_depth": int(overlap_depth),
+        "matrix": matrix_info,
+    }
+    if not reasons:
+        try:
+            numbers = ovf.evaluate_trial_matrix(
+                trial_returns[sorted(tested)],
+                candidates,
+                n_trials=declared,
+                overlap_depth=int(overlap_depth),
+                config=config,
+            )
+        except ovf.OverfitInputError as exc:
+            reasons.append(f"trial matrix cannot support the checks: {exc}")
+        else:
+            return _finite(
+                {
+                    **result,
+                    "result": "pass" if numbers["passed"] else "fail",
+                    **numbers,
+                }
+            )
+    return _finite({**result, "result": "refused", "passed": False, "reasons": reasons})
+
+
+def record_overfit_gate(
+    ledger: Ledger,
+    candidate_trial_ids,
+    trial_returns: pd.DataFrame,
+    *,
+    overlap_depth: int = 0,
+    config=None,
+    recorded_at: str | None = None,
+) -> dict:
+    """Evaluate the gate and append its ``overfit_gate`` record, whatever the result.
+
+    Returns ``{"record": ..., "sha256": ...}``; ``record["passed"]`` is the verdict.
+    """
+    recorded_at = recorded_at or now_iso()
+    verdict = evaluate_overfit_gate(
+        ledger,
+        candidate_trial_ids,
+        trial_returns,
+        overlap_depth=overlap_depth,
+        config=config,
+        as_of=recorded_at,
+    )
+    record, sha = ledger._append(
+        {"kind": OVERFIT_GATE_KIND, **verdict, "recorded_at": recorded_at}
+    )
+    return {"record": record, "sha256": sha}
+
+
+def require_overfit_gate(ledger: Ledger, candidate_trial_ids) -> dict:
+    """The latest gate record for exactly these trials, if it passed and is current.
+
+    Raises :class:`OverfitGateRefused` when there is none, when it did not
+    pass, when it ran under another pre-registration, or when the ledger has
+    declared or measured trials since (the trial count it deflated by is stale).
+    """
+    ledger.verify()
+    wanted = sorted({str(c) for c in candidate_trial_ids})
+    gates = [
+        r for r in ledger.of_kind(OVERFIT_GATE_KIND) if r.get("candidate_trial_ids") == wanted
+    ]
+    if not wanted or not gates:
+        raise OverfitGateRefused("no overfitting gate on record for these trials")
+    gate = gates[-1]
+    if gate["result"] != "pass":
+        raise OverfitGateRefused(
+            f"latest overfitting gate is {gate['result']}: {'; '.join(gate.get('reasons', []))}"
+        )
+    if gate.get("prereg_sha256") != overfit_gate_prereg_sha256():
+        raise OverfitGateRefused("latest overfitting gate ran under another pre-registration")
+    if gate["n_trials_declared"] != declared_trial_count(ledger) or gate[
+        "tested_trials_sha256"
+    ] != digest(sorted(ledgered_tested_trials(ledger))):
+        raise OverfitGateRefused(
+            "overfitting gate is stale: the ledger has new trials since it ran"
+        )
+    return gate
+
+
 def summarize(ledger: Ledger) -> dict:
     """Files-only status: runs, trials, alpha spent, discoveries, family yields."""
     ledger.verify()
@@ -1713,6 +1966,10 @@ def summarize(ledger: Ledger) -> dict:
         "forward_unscored": sum(
             not v["scored"] for v in ledger.of_kind("forward_outcome")
         ),
+        "overfit_gates": {
+            r: sum(g["result"] == r for g in ledger.of_kind(OVERFIT_GATE_KIND))
+            for r in OVERFIT_GATE_RESULTS
+        },
         "families": {
             key: {**stats, "trials": stats["successes"] + stats["failures"]}
             for key, stats in sorted(outcomes.items())
