@@ -246,6 +246,7 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
     """A bounded read of the published evidence ledger, not a generator on GET."""
     from config import settings
     from store.astrogrid import _safe_schema_name
+    from oracle import astrogrid_order_flow as flow
 
     now = now or datetime.now(timezone.utc)
     with engine.connect() as conn:
@@ -261,21 +262,33 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
               AND pr.grid_feature_payload->'insight'->>'kind' = 'observation'
             ORDER BY pr.target_symbols->>0, pr.created_at DESC, pr.id DESC
         """), {"model": MODEL_VERSION}).fetchall()
-        forecasts = conn.execute(text("""
-            SELECT pr.prediction_id, pr.as_of_ts, pr.call, pr.setup, pr.grid_feature_payload,
-                   ps.verdict, ps.raw_payload, ps.scored_at
-            FROM prediction_run pr
-            LEFT JOIN prediction_score ps ON ps.prediction_run_id = pr.id
-            WHERE pr.model_version = :model
-              AND pr.grid_feature_payload->'insight'->>'kind' = 'forecast'
-            ORDER BY pr.created_at DESC LIMIT 12
-        """), {"model": MODEL_VERSION}).fetchall()
+        forecasts = []
+        # Keep completed research results visible even as newer pending calls
+        # arrive. Each bounded slice uses the same two explicit model identities.
+        for completed, limit in ((False, 12), (True, 6)):
+            forecasts.extend(conn.execute(text("""
+                SELECT pr.prediction_id, pr.as_of_ts, pr.call, pr.setup, pr.grid_feature_payload,
+                       ps.verdict, ps.raw_payload, ps.scored_at
+                FROM prediction_run pr
+                LEFT JOIN prediction_score ps ON ps.prediction_run_id = pr.id
+                WHERE pr.model_version = ANY(:models)
+                  AND pr.grid_feature_payload->'insight'->>'kind' = 'forecast'
+                  AND (ps.id IS NOT NULL) = :completed
+                ORDER BY CASE WHEN :completed THEN ps.scored_at ELSE pr.created_at END DESC, pr.id DESC
+                LIMIT :limit
+            """), {"models": [MODEL_VERSION, flow.MODEL_VERSION],
+                   "completed": completed, "limit": limit}).fetchall())
         scores = conn.execute(text("""
             SELECT count(*), count(*) FILTER (WHERE ps.verdict = 'hit'), max(ps.scored_at)
             FROM prediction_score ps
             JOIN prediction_run pr ON pr.id = ps.prediction_run_id
             WHERE pr.model_version = :model AND ps.raw_payload->>'contract_version' = :contract
         """), {"model": MODEL_VERSION, "contract": CONTRACT_VERSION}).fetchone()
+        flow_scores = conn.execute(text("""
+            SELECT count(*), count(*) FILTER (WHERE ps.verdict = 'hit'), max(ps.scored_at)
+            FROM prediction_score ps JOIN prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.model_version=:model AND ps.raw_payload->>'contract_version'=:contract
+        """), {"model": flow.MODEL_VERSION, "contract": flow.CONTRACT_VERSION}).fetchone()
     items = []
     for row in [*rows, *forecasts]:
         data = row[4].get("insight", {}) if isinstance(row[4], dict) else {}
@@ -292,11 +305,21 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
                           "setup": "No usable market evidence has been published for this asset.",
                           "evidence": {"symbol": symbol, "available": False, "as_of": None},
                           "stale": True, "status": "unavailable", "score": None, "scored_at": None})
+    performance = {"scored": scores[0], "hits": scores[1],
+                   "accuracy": scores[1] / scores[0] if scores[0] else None,
+                   "last_scored_at": scores[2].isoformat() if scores[2] else None,
+                   "basis": "prospective 24h actor-flow forecasts only; observations and legacy templates excluded"}
+    flow_performance = {"scored": flow_scores[0], "hits": flow_scores[1],
+                        "accuracy": flow_scores[1] / flow_scores[0] if flow_scores[0] else None,
+                        "last_scored_at": flow_scores[2].isoformat() if flow_scores[2] else None,
+                        "basis": "prospective 30m spot taker-flow forecasts only; fees excluded"}
+    latest = flow.latest_receipts(engine, now)
     return {"model_version": MODEL_VERSION, "checked_at": now.isoformat(), "items": items,
-            "performance": {"scored": scores[0], "hits": scores[1],
-                            "accuracy": scores[1] / scores[0] if scores[0] else None,
-                            "last_scored_at": scores[2].isoformat() if scores[2] else None,
-                            "basis": "prospective actor-flow forecasts only; observations and legacy templates excluded"}}
+            "performance": performance,
+            "performance_by_contract": {
+                CONTRACT_VERSION: {"label": "24h actor-flow research · 1% threshold", **performance},
+                flow.CONTRACT_VERSION: {"label": "30m spot taker-flow research · 0.10% threshold", **flow_performance}},
+            "flow_diagnostics": {symbol: flow.qualification(latest.get(symbol), now) for symbol in SYMBOLS}}
 
 
 def answer_from_insights(feed: dict[str, Any], requested: list[str], *,
@@ -306,16 +329,24 @@ def answer_from_insights(feed: dict[str, Any], requested: list[str], *,
     matches = [i for i in feed.get("items", [])
                if not requested or i.get("evidence", {}).get("symbol") in requested]
     observations = [i for i in matches if i.get("status") == "observation" and not i.get("stale")]
-    forecasts = [i for i in matches if i.get("status") == "pending"
-                 and i.get("evidence", {}).get("forecast")
-                 and datetime.fromisoformat(i["evidence"]["forecast"]["due_at"]) > now]
+    forecasts = []
+    seen = set()
+    for item in sorted(matches, key=lambda i: i.get("issued_at") or "", reverse=True):
+        c = item.get("evidence", {}).get("forecast")
+        if item.get("status") != "pending" or not c or datetime.fromisoformat(c["due_at"]) <= now:
+            continue
+        key = (c["symbol"], c["version"])
+        if key not in seen:
+            seen.add(key)
+            forecasts.append(item)
+    horizons = sorted({"30m" if i["evidence"]["forecast"].get("horizon_minutes") == 30 else "24h" for i in forecasts})
     return {"call": "; ".join(i["call"] for i in forecasts) or "No qualified directional forecast",
-            "timing": "24h prospective outcome" if forecasts else "Latest measured market conditions",
+            "timing": " / ".join(horizons) + " prospective outcome" if forecasts else "Latest measured market conditions",
             "setup": "; ".join(i["call"] for i in observations)
                      or "No fresh published observations for the requested asset.",
-            "invalidation": "Grade the declared 1% directional move at the 24h outcome" if forecasts
+            "invalidation": "Grade each contract's declared threshold at its stated outcome; fees excluded" if forecasts
             else "Observation only; no trade call or win/loss grade",
-            "horizon": "24h" if forecasts else "observation", "target_group": "crypto" if observations or forecasts else None,
+            "horizon": " / ".join(horizons) if forecasts else "observation", "target_group": "crypto" if observations or forecasts else None,
             "target_symbols": sorted({i["evidence"]["symbol"] for i in observations + forecasts}),
             "evidence_ids": [i["prediction_id"] for i in observations + forecasts],
             "confidence": None, "disclaimer": "Research hypotheses; no demonstrated trading edge."}

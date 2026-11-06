@@ -30,3 +30,19 @@ test('a scored forecast shows the declared outcome and signed return', () => {
     assert.match(text, /-5\.00%/);
     assert.match(text, /1 prospective forecasts scored/);
 });
+test('30m measured-flow rules and results remain separate from the 24h cohort', () => {
+    const text = insightsMarkup({items:[{prediction_id:'flow', status:'miss', stale:true,
+        evidence:{symbol:'BTC', entry:{source:'binance_spot_rest',instrument:'BTCUSDT'},
+            forecast:{label:'30m spot taker-flow research', threshold:.001,target_price:100.1,
+                due_at:'2026-11-06T06:00:10Z'}},score:{signed_return:-.0005}}],
+        performance:{scored:0,accuracy:null}, performance_by_contract:{
+            old:{label:'24h actor-flow research',scored:0,accuracy:null},
+            short:{label:'30m spot taker-flow research',scored:1,accuracy:0}}});
+    assert.match(text,/30m spot taker-flow research/);
+    assert.match(text,/0\.10% directional move/);
+    assert.match(text,/24h actor-flow research: 0 prospective forecasts scored/);
+    assert.match(text,/30m spot taker-flow research: 1 prospective forecasts scored · 0\.00% hit rate/);
+    assert.match(text,/global spot REST/);
+    assert.match(text,/Result: miss/);
+    assert.doesNotMatch(text,/STALE|24h candle coverage|1\.00% directional move/);
+});

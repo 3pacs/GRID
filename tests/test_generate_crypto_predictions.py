@@ -40,6 +40,10 @@ def test_generator_reports_evidence_and_persistence_failure(monkeypatch, availab
     import db
     monkeypatch.setattr(db, "get_engine", lambda: MagicMock())
     monkeypatch.setattr(gen, "AstroGridStore", MagicMock())
+    bridge = MagicMock()
+    bridge.bridge_binance_order_flow.return_value = {"errors": [], "receipts_inserted": 3}
+    monkeypatch.setattr(gen, "CryptoSignalBridge", lambda *args: bridge)
+    monkeypatch.setattr(gen, "produce_forecasts", lambda *args: {"errors": [], "persisted": 1})
     monkeypatch.setattr(gen, "produce_insights", lambda *args: {
         "observations": [{"available": available}], "errors": errors,
     })

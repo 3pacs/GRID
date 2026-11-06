@@ -65,6 +65,45 @@ class CryptoSignalBridge:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
 
+    def bridge_binance_order_flow(self) -> dict[str, Any]:
+        """Persist actual completed taker-side flow receipts, including neutral bars.
+
+        Called by the existing five-minute Astrogrid producer. Keep first-seen
+        payloads unchanged on duplicate reads; created_at is the database clock.
+        A balanced bar is still retained as a possible future price outcome.
+        """
+        from binance_close_contract import completed_spot_flow_payload
+        from ingestion.altdata.binance_puller import BinancePuller
+
+        result: dict[str, Any] = {"receipts_inserted": 0, "unchanged": 0, "errors": []}
+        for symbol in ("BTC", "ETH", "SOL"):
+            try:
+                requested_at = datetime.now(timezone.utc)
+                rows = BinancePuller.fetch_spot_flow_klines(symbol + "USDT", as_of=requested_at)
+                captured = datetime.now(timezone.utc)
+                payloads = [completed_spot_flow_payload(row, symbol + "USDT", captured) for row in rows]
+                payloads = [p for p in payloads if p is not None]
+                if not payloads or any(datetime.fromisoformat(p["bar_end"]) > requested_at for p in payloads):
+                    raise ValueError("Missing completed flow window")
+                with self.engine.begin() as conn:
+                    for p in payloads:
+                        inserted = conn.execute(text("""
+                            INSERT INTO signal_sources
+                                (source_type, source_id, ticker, signal_date, signal_type, signal_value, trust_score)
+                            VALUES ('exchange_flow', :source_id, :symbol, :day, 'spot_taker_flow',
+                                    CAST(:payload AS jsonb), 0.5)
+                            ON CONFLICT (source_type, source_id, ticker, signal_date, signal_type) DO NOTHING
+                            RETURNING id
+                        """), {"source_id": f"binance_spot:5m:{symbol}:{p['kline'][0]}",
+                               "symbol": symbol, "day": datetime.fromisoformat(p["bar_end"]).date(),
+                               "payload": json.dumps(p, allow_nan=False)}).scalar()
+                        result["receipts_inserted" if inserted is not None else "unchanged"] += 1
+            except Exception as exc:
+                # Exception class only: provider URLs may contain credentials in
+                # other bridges; keep operational errors structured and bounded.
+                result["errors"].append({"symbol": symbol, "reason": type(exc).__name__})
+        return result
+
     def bridge_all(self) -> dict[str, Any]:
         """Run all bridges. Returns summary."""
         results = {}

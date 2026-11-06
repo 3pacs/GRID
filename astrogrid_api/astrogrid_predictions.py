@@ -434,7 +434,7 @@ async def create_prediction(
     request: Request,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    if req.model_version.strip() == "astrogrid-evidence-v2":
+    if req.model_version.strip() in {"astrogrid-evidence-v2", "astrogrid-spot-flow-v1"}:
         raise HTTPException(status_code=422, detail="The evidence model is reserved for the scheduled producer.")
     actor_context = _build_actor_context(
         actor_type="authenticated_user",
