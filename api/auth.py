@@ -466,43 +466,42 @@ def _update_last_login(username: str) -> None:
 
 # ── Rate Limiting ─────────────────────────────────────────────
 
-def _check_rate_limit_db(client_ip: str) -> bool:
-    """Return True if the IP is within rate limit using DB storage.
+_LOGIN_RATE_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('grid_login_rate'), hashtext(%s))"
 
-    Counts attempts in the current window and prunes stale rows.
-    Returns False if the IP has exceeded _RATE_LIMIT_MAX attempts.
-    Raises on unexpected DB errors so the caller can fall back.
+
+def _consume_login_attempt_db(client_ip: str) -> bool:
+    """Atomically check the window and record this attempt; True if allowed.
+
+    One transaction under a per-IP advisory lock: prune, sum the window, and
+    only if under ``_RATE_LIMIT_MAX`` record the attempt. Concurrent requests
+    from one IP (the login route runs in the threadpool, and grid-api may
+    run several workers) are serialized, so exactly ``_RATE_LIMIT_MAX`` get
+    through per window -- the old separate check-then-record let a burst all
+    pass the check before any of them recorded. A blocked attempt is not
+    recorded (as before). Raises on unexpected DB errors so the caller can
+    fall back.
     """
     _lazy_init()
     conn = _get_db_conn()
     try:
         with conn:
             cur = conn.cursor()
+            cur.execute(_LOGIN_RATE_LOCK_SQL, (client_ip,))
             # Prune rows older than the window across all IPs (best-effort cleanup).
             cur.execute(
                 "DELETE FROM grid_rate_limits "
-                "WHERE window_start < NOW() - INTERVAL '%s seconds'",
+                "WHERE window_start < NOW() - make_interval(secs => %s)",
                 (_RATE_LIMIT_WINDOW,),
             )
             cur.execute(
                 "SELECT COALESCE(SUM(count), 0) FROM grid_rate_limits "
                 "WHERE ip = %s AND endpoint = 'login' "
-                "  AND window_start >= NOW() - INTERVAL '%s seconds'",
+                "  AND window_start >= NOW() - make_interval(secs => %s)",
                 (client_ip, _RATE_LIMIT_WINDOW),
             )
             row = cur.fetchone()
-            total = int(row[0]) if row else 0
-            return total < _RATE_LIMIT_MAX
-    finally:
-        conn.close()
-
-
-def _record_login_attempt_db(client_ip: str) -> None:
-    """Increment the attempt counter for this IP in the DB."""
-    conn = _get_db_conn()
-    try:
-        with conn:
-            cur = conn.cursor()
+            if (int(row[0]) if row else 0) >= _RATE_LIMIT_MAX:
+                return False
             # Round window_start to the current minute to keep row count bounded.
             cur.execute(
                 """
@@ -513,76 +512,57 @@ def _record_login_attempt_db(client_ip: str) -> None:
                 """,
                 (client_ip,),
             )
+            return True
     finally:
         conn.close()
 
 
-def _check_rate_limit(client_ip: str) -> None:
-    """Raise 429 if too many login attempts.
+# Serializes the shelve fallback's read-modify-write (shelve is not
+# thread-safe and the check + append must be one step).
+_shelve_rate_lock = threading.Lock()
+
+
+def _consume_login_attempt_shelve(client_ip: str) -> bool:
+    now = time.time()
+    with _shelve_rate_lock, shelve.open(_rate_limit_path) as db:
+        attempts: list[float] = [t for t in db.get(client_ip, []) if now - t < _RATE_LIMIT_WINDOW]
+        if len(attempts) >= _RATE_LIMIT_MAX:
+            db[client_ip] = attempts
+            return False
+        attempts.append(now)
+        db[client_ip] = attempts
+        return True
+
+
+def _consume_login_attempt(client_ip: str) -> None:
+    """Raise 429 if *client_ip* is over the login limit, else record the attempt.
 
     Uses DB storage so state survives restarts. Falls back to the
     shelve-based store if the DB is unavailable (graceful degradation).
     """
+    allowed: bool | None = None
     try:
-        allowed = _check_rate_limit_db(client_ip)
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many login attempts. Try again later.",
-            )
-        return
-    except HTTPException:
-        raise
+        allowed = _consume_login_attempt_db(client_ip)
     except Exception as exc:
-        log.warning("DB rate limit check failed, falling back to shelve: {e}", e=str(exc))
-
-    # Shelve fallback
-    now = time.time()
-    try:
-        with shelve.open(_rate_limit_path) as db:
-            attempts: list[float] = db.get(client_ip, [])
-            attempts = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
-            db[client_ip] = attempts
-            if len(attempts) >= _RATE_LIMIT_MAX:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Too many login attempts. Try again later.",
-                )
-    except HTTPException:
-        raise
-    except Exception as exc2:
-        log.warning("Shelve rate limit store also unavailable: {e}", e=str(exc2))
-
-
-def _record_login_attempt(client_ip: str) -> None:
-    """Record a login attempt for rate limiting.
-
-    Uses DB storage. Falls back to shelve if the DB is unavailable.
-    """
-    try:
-        _record_login_attempt_db(client_ip)
-        return
-    except Exception as exc:
-        log.warning("DB rate limit record failed, falling back to shelve: {e}", e=str(exc))
-
-    # Shelve fallback
-    try:
-        with shelve.open(_rate_limit_path) as db:
-            attempts: list[float] = db.get(client_ip, [])
-            attempts.append(time.time())
-            db[client_ip] = attempts
-    except Exception as exc2:
-        log.warning("Failed to record login attempt in shelve: {e}", e=str(exc2))
+        log.warning("DB rate limit failed, falling back to shelve: {e}", e=str(exc))
+        try:
+            allowed = _consume_login_attempt_shelve(client_ip)
+        except Exception as exc2:
+            log.warning("Shelve rate limit store also unavailable: {e}", e=str(exc2))
+    if allowed is False:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again later.",
+        )
 
 
 # ── Routes ────────────────────────────────────────────────────
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest, request: Request) -> LoginResponse:
+def login(body: LoginRequest, request: Request) -> LoginResponse:
     """Authenticate with master password or user credentials."""
     client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
-    _record_login_attempt(client_ip)
+    _consume_login_attempt(client_ip)
 
     # User login (username + password)
     if body.username:
@@ -645,11 +625,10 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
 
 
 @router.post("/register", response_model=LoginResponse)
-async def register(body: RegisterRequest, request: Request) -> LoginResponse:
+def register(body: RegisterRequest, request: Request) -> LoginResponse:
     """Self-registration for new contributor accounts."""
     client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
-    _record_login_attempt(client_ip)
+    _consume_login_attempt(client_ip)
 
     # Validate input
     if len(body.username) < 3 or len(body.username) > 50:
@@ -696,13 +675,13 @@ async def register(body: RegisterRequest, request: Request) -> LoginResponse:
 
 
 @router.post("/logout")
-async def logout(_token: str = Depends(require_auth)) -> dict:
+def logout(_token: str = Depends(require_auth)) -> dict:
     """Log out (token expiry handles invalidation)."""
     return {"status": "ok"}
 
 
 @router.post("/stream-ticket", response_model=StreamTicketResponse)
-async def create_stream_ticket(
+def create_stream_ticket(
     body: StreamTicketRequest,
     token: str = Depends(require_auth),
 ) -> StreamTicketResponse:
@@ -711,7 +690,7 @@ async def create_stream_ticket(
 
 
 @router.get("/verify", response_model=TokenVerifyResponse)
-async def verify(token: str = Depends(require_auth)) -> TokenVerifyResponse:
+def verify(token: str = Depends(require_auth)) -> TokenVerifyResponse:
     """Verify current token is valid."""
     expires_at = get_token_expiry(token) or ""
     payload = decode_token(token) or {}
@@ -726,7 +705,7 @@ async def verify(token: str = Depends(require_auth)) -> TokenVerifyResponse:
 # ── User Management (admin-only) ─────────────────────────────
 
 @router.post("/users", response_model=UserResponse)
-async def create_user(
+def create_user(
     body: CreateUserRequest,
     _token: str = Depends(require_role("admin")),
 ) -> UserResponse:
@@ -769,7 +748,7 @@ async def create_user(
 
 
 @router.get("/users")
-async def list_users(
+def list_users(
     _token: str = Depends(require_role("admin")),
 ) -> list[UserResponse]:
     """List all user accounts (admin only)."""
@@ -800,7 +779,7 @@ async def list_users(
 
 
 @router.delete("/users/{username}")
-async def delete_user(
+def delete_user(
     username: str,
     _token: str = Depends(require_role("admin")),
 ) -> dict:

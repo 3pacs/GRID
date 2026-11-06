@@ -49,7 +49,7 @@ class ForecastResponse(BaseModel):
 # ── GET /health ───────────────────────────────────────────────────────────
 
 @router.get("/health")
-async def forecast_health(
+def forecast_health(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Check TimesFM forecaster availability."""
@@ -67,7 +67,7 @@ async def forecast_health(
 # ── POST /generate ────────────────────────────────────────────────────────
 
 @router.post("/generate", response_model=ForecastResponse)
-async def generate_forecast(
+def generate_forecast(
     req: ForecastRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -126,7 +126,7 @@ async def generate_forecast(
 # ── POST /batch ───────────────────────────────────────────────────────────
 
 @router.post("/batch")
-async def batch_forecast(
+def batch_forecast(
     req: BatchForecastRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

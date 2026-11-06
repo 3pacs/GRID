@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/v1/actors", tags=["attributions"])
 
 
 @router.get("/{actor_id}/attributions")
-async def get_actor_attributions(
+def get_actor_attributions(
     actor_id: str,
     lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=1, le=3650),
     _token: str = Depends(require_auth),

@@ -127,7 +127,7 @@ async def get_unified_thesis(
 
 
 @router.get("/thesis/history")
-async def get_thesis_history_endpoint(
+def get_thesis_history_endpoint(
     days: int = Query(90, ge=1, le=365, description="Lookback days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -152,7 +152,7 @@ async def get_thesis_history_endpoint(
 
 
 @router.get("/thesis/accuracy")
-async def get_thesis_accuracy_endpoint(
+def get_thesis_accuracy_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return thesis accuracy statistics.
@@ -177,7 +177,7 @@ async def get_thesis_accuracy_endpoint(
 
 
 @router.get("/thesis/postmortems")
-async def get_thesis_postmortems_endpoint(
+def get_thesis_postmortems_endpoint(
     days: int = Query(90, ge=1, le=365, description="Lookback days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -213,7 +213,7 @@ async def get_thesis_postmortems_endpoint(
 
 
 @router.get("/deep-dives")
-async def get_deep_dives_endpoint(
+def get_deep_dives_endpoint(
     days: int = Query(90, ge=1, le=365, description="Lookback days"),
     limit: int = Query(50, ge=1, le=200),
     _token: str = Depends(require_auth),
@@ -236,7 +236,7 @@ async def get_deep_dives_endpoint(
 
 
 @router.get("/deep-dives/{dive_id}")
-async def get_deep_dive_endpoint(
+def get_deep_dive_endpoint(
     dive_id: int,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -256,7 +256,7 @@ async def get_deep_dive_endpoint(
 
 @router.post("/deep-dives/generate")
 @_lf_observe(name="intelligence-deepdive-trigger", capture_input=False)
-async def trigger_deep_dive(
+def trigger_deep_dive(
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Manually trigger a deep dive on the current thesis.
@@ -295,7 +295,7 @@ async def trigger_deep_dive(
 
 
 @router.get("/archive")
-async def get_research_archive(
+def get_research_archive(
     days: int = Query(365, ge=1, le=3650, description="Lookback days"),
     limit: int = Query(100, ge=1, le=500),
     _token: str = Depends(require_auth),
@@ -372,7 +372,7 @@ async def get_research_archive(
 
 
 @router.get("/leads")
-async def get_investigation_leads(
+def get_investigation_leads(
     status: str | None = Query(None, description="Filter by status: new, investigating, resolved, dead_end"),
     category: str | None = Query(None, description="Filter by category"),
     limit: int = Query(20, ge=1, le=100),
@@ -401,7 +401,7 @@ async def get_investigation_leads(
 
 
 @router.get("/leads/{lead_id}")
-async def get_investigation_lead(
+def get_investigation_lead(
     lead_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -425,7 +425,7 @@ async def get_investigation_lead(
 
 @router.post("/leads/investigate")
 @_lf_observe(name="intelligence-sleuth-investigate", capture_input=False)
-async def investigate_lead(
+def investigate_lead(
     lead_id: str = Query(..., description="ID of the lead to investigate"),
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -457,7 +457,7 @@ async def investigate_lead(
 
 
 @router.post("/leads/generate")
-async def generate_leads(
+def generate_leads(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Trigger lead generation across all intelligence sources."""
@@ -480,7 +480,7 @@ async def generate_leads(
 
 
 @router.post("/leads/daily-investigation")
-async def run_daily_investigation(
+def run_daily_investigation(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Run a full daily investigation cycle (generate + investigate + rabbit holes)."""
@@ -501,7 +501,7 @@ async def run_daily_investigation(
 
 
 @router.get("/diary")
-async def get_diary(
+def get_diary(
     date: str | None = Query(None, description="Date in YYYY-MM-DD format"),
     reference_overlay: bool = Query(False, description="Review original diary alongside fixed historical S&P reference evidence"),
     reference_as_of: str | None = Query(None, description="Required offset-aware ISO timestamp for the opt-in reference review"),
@@ -550,7 +550,7 @@ async def get_diary(
 
 
 @router.get("/diary/list")
-async def list_diaries(
+def list_diaries(
     limit: int = Query(30, ge=1, le=365),
     offset: int = Query(0, ge=0),
     _token: str = Depends(require_auth),
@@ -567,7 +567,7 @@ async def list_diaries(
 
 
 @router.get("/diary/search")
-async def search_diaries(
+def search_diaries(
     q: str = Query(..., min_length=2, description="Search term"),
     limit: int = Query(20, ge=1, le=100),
     _token: str = Depends(require_auth),
@@ -585,7 +585,7 @@ async def search_diaries(
 
 
 @router.post("/diary/generate")
-async def generate_diary(
+def generate_diary(
     date: str | None = Query(None, description="Date in YYYY-MM-DD format"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

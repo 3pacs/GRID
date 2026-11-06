@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -67,7 +66,7 @@ def test_missing_or_nonfinite_sensitivity_is_unavailable(
     monkeypatch: pytest.MonkeyPatch, change: dict,
 ) -> None:
     _engine(monkeypatch, {**_profile(), **change})
-    result = asyncio.run(derivatives.get_vanna_charm("SPY"))
+    result = derivatives.get_vanna_charm("SPY")
     assert result == {"error": "Vanna/charm exposure unavailable", "ticker": "SPY"}
 
 
@@ -75,7 +74,7 @@ def test_modeled_zero_is_retained_without_trade_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _engine(monkeypatch, _profile())
-    result = asyncio.run(derivatives.get_vanna_charm("SPY"))
+    result = derivatives.get_vanna_charm("SPY")
     assert result["vanna_exposure"] == 0
     assert result["charm_exposure"] == 0
     assert result["net_dealer_delta_change"] is None
@@ -91,7 +90,7 @@ def test_regime_interpretation_is_conditional_and_source_labeled(
     monkeypatch: pytest.MonkeyPatch, regime: str,
 ) -> None:
     _engine(monkeypatch, {**_profile(), "regime": regime})
-    result = asyncio.run(derivatives.get_regime())
+    result = derivatives.get_regime()
     assert result["estimated"] is True
     assert result["chain_capture_completed_at"] == _profile()["chain_capture_completed_at"]
     assert result["spot_source"] == "spy_close_receipt"
@@ -102,8 +101,8 @@ def test_regime_interpretation_is_conditional_and_source_labeled(
 
 def test_both_routes_reject_unverified_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     _engine(monkeypatch, {**_profile(), "chain_batch_id": None})
-    regime = asyncio.run(derivatives.get_regime())
-    vanna = asyncio.run(derivatives.get_vanna_charm("SPY"))
+    regime = derivatives.get_regime()
+    vanna = derivatives.get_vanna_charm("SPY")
     assert regime["available"] is False
     assert regime["gex_aggregate"] is None
     assert "error" in vanna

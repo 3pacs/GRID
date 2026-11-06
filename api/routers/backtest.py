@@ -62,7 +62,7 @@ def _results_generated_at(bt: Any) -> str | None:
 
 
 @router.post("/run")
-async def run_backtest(req: BacktestRequest) -> dict[str, Any]:
+def run_backtest(req: BacktestRequest) -> dict[str, Any]:
     """Run the full pitch backtest."""
     from backtest.engine import PitchBacktester
 
@@ -97,7 +97,7 @@ async def run_backtest(req: BacktestRequest) -> dict[str, Any]:
 
 
 @router.get("/results")
-async def get_results() -> dict[str, Any]:
+def get_results() -> dict[str, Any]:
     """Get latest full backtest results (includes equity curve data).
 
     Wave 3 #7: labels the response with the results file's mtime as
@@ -117,7 +117,7 @@ async def get_results() -> dict[str, Any]:
 
 
 @router.get("/summary")
-async def get_summary() -> dict[str, Any]:
+def get_summary() -> dict[str, Any]:
     """Get pitch-ready summary of latest backtest.
 
     Wave 3 #7: same ``generated_at``/``note`` labeling as ``/results``.
@@ -135,7 +135,7 @@ async def get_summary() -> dict[str, Any]:
 
 
 @router.post("/charts")
-async def generate_charts() -> dict[str, Any]:
+def generate_charts() -> dict[str, Any]:
     """Generate all pitch charts from latest backtest results."""
     from backtest.charts import generate_all_charts
 
@@ -146,7 +146,7 @@ async def generate_charts() -> dict[str, Any]:
 
 
 @router.get("/charts/{name}")
-async def get_chart(name: str) -> FileResponse:
+def get_chart(name: str) -> FileResponse:
     """Serve a generated chart image."""
     import re as _re
 
@@ -168,7 +168,7 @@ async def get_chart(name: str) -> FileResponse:
 
 
 @router.post("/paper-trade")
-async def create_paper_trade() -> dict[str, Any]:
+def create_paper_trade() -> dict[str, Any]:
     """Create a timestamped paper trade snapshot."""
     from backtest.paper_trade import PaperTradeTracker
 
@@ -180,7 +180,7 @@ async def create_paper_trade() -> dict[str, Any]:
 
 
 @router.get("/paper-trades")
-async def list_paper_trades() -> dict[str, Any]:
+def list_paper_trades() -> dict[str, Any]:
     """List all paper trade snapshots."""
     from backtest.paper_trade import PaperTradeTracker
 
@@ -190,7 +190,7 @@ async def list_paper_trades() -> dict[str, Any]:
 
 
 @router.get("/paper-trades/{filename}")
-async def get_paper_trade(filename: str) -> dict[str, Any]:
+def get_paper_trade(filename: str) -> dict[str, Any]:
     """Get a specific paper trade snapshot."""
     from backtest.paper_trade import PaperTradeTracker
 
@@ -202,7 +202,7 @@ async def get_paper_trade(filename: str) -> dict[str, Any]:
 
 
 @router.post("/paper-trade/score")
-async def score_predictions() -> dict[str, Any]:
+def score_predictions() -> dict[str, Any]:
     """Score all expired paper trade predictions."""
     from backtest.paper_trade import PaperTradeTracker
 

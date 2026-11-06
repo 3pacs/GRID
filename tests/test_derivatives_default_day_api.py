@@ -10,7 +10,6 @@ other derivatives tests.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -100,7 +99,7 @@ def _patched(monkeypatch: pytest.MonkeyPatch, **kw) -> _Engine:
 
 def test_gex_without_day_opts_into_latest_completed(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _patched(monkeypatch, latest=_latest())
-    result = asyncio.run(derivatives.get_gex("spy", snap_date=None, capture_batch_id=None))
+    result = derivatives.get_gex("spy", snap_date=None, capture_batch_id=None)
 
     assert engine.calls == [("latest", "SPY")]
     assert result["default_resolution"] == "last_completed_capture"
@@ -110,7 +109,7 @@ def test_gex_without_day_opts_into_latest_completed(monkeypatch: pytest.MonkeyPa
 
 def test_gex_with_explicit_day_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _patched(monkeypatch, dated=_profile())
-    result = asyncio.run(derivatives.get_gex("spy", snap_date=CHAIN_DAY, capture_batch_id=None))
+    result = derivatives.get_gex("spy", snap_date=CHAIN_DAY, capture_batch_id=None)
 
     assert engine.calls == [("profile", "SPY", {"snap_date": CHAIN_DAY})]
     assert "default_resolution" not in result and "chain_age_seconds" not in result
@@ -118,7 +117,7 @@ def test_gex_with_explicit_day_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_gex_without_any_capture_keeps_the_unavailable_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
     _patched(monkeypatch, latest=_no_capture())
-    result = asyncio.run(derivatives.get_gex("spy", snap_date=None, capture_batch_id=None))
+    result = derivatives.get_gex("spy", snap_date=None, capture_batch_id=None)
 
     assert result["available"] is False and result["status"] == "unavailable"
     assert "on or before 2026-09-25" in result["reason"] and result["error"] == result["reason"]
@@ -126,16 +125,16 @@ def test_gex_without_any_capture_keeps_the_unavailable_envelope(monkeypatch: pyt
 
 def test_walls_default_explicit_and_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _patched(monkeypatch, latest=_latest(), dated=_profile())
-    walls = asyncio.run(derivatives.get_walls("spy", snap_date=None, capture_batch_id=None))
+    walls = derivatives.get_walls("spy", snap_date=None, capture_batch_id=None)
     assert walls["chain_age_seconds"] == AGE and walls["put_wall"] == 750.0
     assert walls["default_resolution"] == "last_completed_capture"
 
-    walls = asyncio.run(derivatives.get_walls("spy", snap_date=CHAIN_DAY, capture_batch_id=None))
+    walls = derivatives.get_walls("spy", snap_date=CHAIN_DAY, capture_batch_id=None)
     assert engine.calls[-1] == ("profile", "SPY", {"snap_date": CHAIN_DAY})
     assert walls["default_resolution"] is None and walls["chain_age_seconds"] is None
 
     engine.latest = _no_capture()
-    walls = asyncio.run(derivatives.get_walls("spy", snap_date=None, capture_batch_id=None))
+    walls = derivatives.get_walls("spy", snap_date=None, capture_batch_id=None)
     assert walls["available"] is False and walls["error"] == walls["reason"]
     assert walls["source"] == "options_capture_batches"
     assert "put_wall" not in walls
@@ -144,7 +143,7 @@ def test_walls_default_explicit_and_unavailable(monkeypatch: pytest.MonkeyPatch)
 def test_regime_keeps_the_utc_day_default_and_same_day_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     # A valid prior-session pair is still refused by /regime (held-current boundary).
     engine = _patched(monkeypatch, latest=_latest(), dated=_profile())
-    result = asyncio.run(derivatives.get_regime())
+    result = derivatives.get_regime()
 
     assert engine.calls == [("profile", "SPY", {})]
     assert result["available"] is False and result["regime"] is None
@@ -153,7 +152,7 @@ def test_regime_keeps_the_utc_day_default_and_same_day_gate(monkeypatch: pytest.
 
 def test_vanna_charm_keeps_the_utc_day_default_and_same_day_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _patched(monkeypatch, latest=_latest(), dated=_profile())
-    result = asyncio.run(derivatives.get_vanna_charm("SPY"))
+    result = derivatives.get_vanna_charm("SPY")
 
     assert engine.calls == [("profile", "SPY", {})]
     assert "error" in result
@@ -163,7 +162,7 @@ def test_regime_still_serves_a_same_day_pair(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(derivatives, "_utc_day", lambda: CHAIN_DAY)
     monkeypatch.setattr(flow, "_utc_day", lambda: CHAIN_DAY)
     _patched(monkeypatch, dated=_profile())
-    result = asyncio.run(derivatives.get_regime())
+    result = derivatives.get_regime()
 
     assert result["regime"] == "SHORT_GAMMA" and result.get("available") is not False
 

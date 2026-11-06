@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api/v1/earnings", tags=["earnings"])
 # ── GET /calendar ────────────────────────────────────────────────────────
 
 @router.get("/calendar")
-async def get_earnings_calendar(
+def get_earnings_calendar(
     days_ahead: int = Query(30, ge=1, le=90),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -34,7 +34,7 @@ async def get_earnings_calendar(
 # ── GET /recent ──────────────────────────────────────────────────────────
 
 @router.get("/recent")
-async def get_recent_earnings(
+def get_recent_earnings(
     days_back: int = Query(30, ge=1, le=180),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -52,7 +52,7 @@ async def get_recent_earnings(
 # ── GET /surprise/{ticker} ──────────────────────────────────────────────
 
 @router.get("/surprise/{ticker}")
-async def get_earnings_surprise(
+def get_earnings_surprise(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -69,7 +69,7 @@ async def get_earnings_surprise(
 # ── POST /predict/{ticker} ──────────────────────────────────────────────
 
 @router.post("/predict/{ticker}")
-async def predict_earnings(
+def predict_earnings(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -86,7 +86,7 @@ async def predict_earnings(
 # ── GET /scorecard ───────────────────────────────────────────────────────
 
 @router.get("/scorecard")
-async def get_earnings_scorecard(
+def get_earnings_scorecard(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Prediction scorecard: accuracy, calibration, recent outcomes."""
@@ -102,7 +102,7 @@ async def get_earnings_scorecard(
 # ── GET /history/{ticker} ───────────────────────────────────────────────
 
 @router.get("/history/{ticker}")
-async def get_earnings_history(
+def get_earnings_history(
     ticker: str,
     limit: int = Query(20, ge=1, le=100),
     _token: str = Depends(require_auth),
@@ -121,7 +121,7 @@ async def get_earnings_history(
 # ── POST /cycle ──────────────────────────────────────────────────────────
 
 @router.post("/cycle")
-async def run_earnings_cycle(
+def run_earnings_cycle(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Run a full earnings intelligence cycle: score + predict."""

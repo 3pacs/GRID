@@ -101,7 +101,7 @@ def get_ephemeris(
 
 
 @router.get("/correlations")
-async def get_correlations(
+def get_correlations(
     market_feature: str | None = Query(default=None),
     celestial_category: str | None = Query(default=None),
     lookback_days: int = Query(default=504),
@@ -351,7 +351,7 @@ def get_briefing(
 
 
 @router.post("/compare")
-async def compare_dates(
+def compare_dates(
     body: CompareDatesRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -414,7 +414,7 @@ async def compare_dates(
 
 
 @router.get("/retrograde")
-async def get_retrogrades(
+def get_retrogrades(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Active and upcoming retrograde periods."""
@@ -602,7 +602,7 @@ def get_nakshatra(
 
 
 @router.get("/lunar/calendar")
-async def get_lunar_calendar(
+def get_lunar_calendar(
     month: int = Query(default=None, ge=1, le=12),
     year: int = Query(default=None, ge=2000, le=2040),
     _token: str = Depends(require_auth),
@@ -630,7 +630,7 @@ async def get_lunar_calendar(
 
 
 @router.get("/solar/activity")
-async def get_solar_activity(
+def get_solar_activity(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current solar weather from resolved_series."""

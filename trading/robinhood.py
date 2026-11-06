@@ -68,14 +68,16 @@ Account set-up (see docs/ROBINHOOD_SETUP.md):
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -277,6 +279,16 @@ def _parse_quote_timestamp(value: Any) -> datetime | None:
 #: uuid.NAMESPACE_DNS) so deterministic_client_order_id() below always
 #: derives the same key from the same inputs, in any process, forever.
 _ORDER_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "grid.robinhood.order-idempotency")
+
+
+_VENUE_LOCKS: dict[str, threading.Lock] = {}
+_VENUE_LOCKS_GUARD = threading.Lock()
+
+
+def _venue_lock(venue: str) -> threading.Lock:
+    """One process-wide lock per venue for the order check -> submit -> record."""
+    with _VENUE_LOCKS_GUARD:
+        return _VENUE_LOCKS.setdefault(venue, threading.Lock())
 
 
 def deterministic_client_order_id(source: str, decision_id: str, asset: str, side: str, decision_date: Any) -> str:
@@ -836,6 +848,22 @@ class RobinhoodCryptoTrader:
     # Trade methods
     # ------------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _claim(self, key: str, force_dry_run: bool) -> Iterator[bool]:
+        """Serialize check -> submit -> record; yields True if *key* is already done.
+
+        Two layers: an in-process per-venue lock (defence in depth -- grid-api
+        runs these routes in its threadpool) and the risk store's per-key
+        claim, which also covers other processes (signal_executor,
+        live_rotation_trader). A dry run has no idempotency side effects and
+        takes neither.
+        """
+        if force_dry_run:
+            yield False
+            return
+        with _venue_lock(self.venue), self.risk_store.claim_order(self.venue, key) as done:
+            yield done
+
     def _submit(self, order: dict[str, Any], context: dict[str, Any], force_dry_run: bool = False) -> dict[str, Any]:
         """Send *order* when live; otherwise return it as a dry run.
 
@@ -995,11 +1023,20 @@ class RobinhoodCryptoTrader:
 
         side = "buy" if direction == "LONG" else "sell"
         key = client_order_id or str(uuid.uuid4())
-        if not force_dry_run and self.risk_store.is_duplicate(self.venue, key):
-            log.info("Robinhood order {k} for {s} is a duplicate — not resubmitted", k=key, s=symbol)
-            return {"status": "duplicate", "client_order_id": key, "symbol": symbol, "direction": direction,
-                    "note": "An order with this idempotency key already completed (dry-run or submitted)."}
+        with self._claim(key, force_dry_run) as already_done:
+            if already_done:
+                log.info("Robinhood order {k} for {s} is a duplicate — not resubmitted", k=key, s=symbol)
+                return {"status": "duplicate", "client_order_id": key, "symbol": symbol, "direction": direction,
+                        "note": "An order with this idempotency key already completed (dry-run or submitted)."}
+            return self._open_claimed(
+                symbol=symbol, side=side, direction=direction, size_usd=size_usd, key=key,
+                wallet=wallet, risk=risk, force_dry_run=force_dry_run,
+            )
 
+    def _open_claimed(self, *, symbol: str, side: str, direction: str, size_usd: float, key: str,
+                      wallet: dict[str, Any] | None, risk: dict[str, Any],
+                      force_dry_run: bool) -> dict[str, Any]:
+        """open_position from the quote on, run while the idempotency key is claimed."""
         quote = self._quote_for(symbol, side)
         if "error" in quote:
             return quote
@@ -1032,7 +1069,19 @@ class RobinhoodCryptoTrader:
                  d=direction, s=symbol, u=size_usd, q=context["quantity"], p=quote["reference_price"], m=self.mode)
 
         if not force_dry_run:
-            self.risk_store.touch(self.venue, risk["equity_usd"], utc_today(), increment_order=True)
+            if direction == "LONG":
+                # Atomic check-and-count: the order-rate check above read a
+                # snapshot; concurrent buys could all pass it. Only this
+                # conditional increment decides who gets the last slot.
+                if not self.risk_store.reserve_order_slot(
+                    self.venue, risk["equity_usd"], utc_today(), self.max_orders_per_day,
+                ):
+                    msg = (f"Order-rate cap reached: {self.max_orders_per_day}/"
+                           f"{self.max_orders_per_day} orders placed today.")
+                    self._alert_guard_trip("order_rate", msg)
+                    return {"error": msg, "status": "blocked", "guard": "order_rate"}
+            else:
+                self.risk_store.touch(self.venue, risk["equity_usd"], utc_today(), increment_order=True)
 
         result = self._submit(order, context, force_dry_run=force_dry_run)
 
@@ -1084,10 +1133,19 @@ class RobinhoodCryptoTrader:
             return {"error": f"No open position for {symbol}."}
 
         key = client_order_id or str(uuid.uuid4())
-        if not force_dry_run and self.risk_store.is_duplicate(self.venue, key):
-            log.info("Robinhood close {k} for {s} is a duplicate — not resubmitted", k=key, s=symbol)
-            return {"status": "duplicate", "client_order_id": key, "symbol": symbol, "direction": "CLOSE",
-                    "note": "An order with this idempotency key already completed (dry-run or submitted)."}
+        with self._claim(key, force_dry_run) as already_done:
+            if already_done:
+                log.info("Robinhood close {k} for {s} is a duplicate — not resubmitted", k=key, s=symbol)
+                return {"status": "duplicate", "client_order_id": key, "symbol": symbol, "direction": "CLOSE",
+                        "note": "An order with this idempotency key already completed (dry-run or submitted)."}
+            return self._close_claimed(symbol=symbol, key=key, wallet=wallet, force_dry_run=force_dry_run)
+
+    def _close_claimed(self, *, symbol: str, key: str, wallet: dict[str, Any] | None,
+                       force_dry_run: bool) -> dict[str, Any]:
+        """close_position from the holding read on, run while the key is claimed."""
+        held = next((p for p in self.get_positions() if p["symbol"] == symbol), None)
+        if not held or held["available"] <= 0:
+            return {"error": f"No open position for {symbol}."}
 
         quote = self._quote_for(symbol, "sell")
         if "error" in quote:

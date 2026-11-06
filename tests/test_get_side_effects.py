@@ -153,8 +153,8 @@ class TestCausationPersistFlag:
              patch("intelligence.causation.trace_causal_chain", return_value=[]) as trace, \
              patch("intelligence.causation.find_longest_chains", return_value=[]) as longest:
             out = f.get_causation(ticker=None, days=30, _token="t")
-            asyncio.run(f.get_causal_chains(ticker="AAA", hops=5, days=180, _token="t"))
-            asyncio.run(f.get_causal_chains(ticker=None, hops=5, days=180, _token="t"))
+            f.get_causal_chains(ticker="AAA", hops=5, days=180, _token="t")
+            f.get_causal_chains(ticker=None, hops=5, days=180, _token="t")
         # The causation GET reads persisted rows; it never computes or writes.
         read.assert_called_once()
         run.assert_not_called()
@@ -302,7 +302,7 @@ class TestRegimeReadOnly:
              patch.object(sv_mod, "_ensure_cache_table") as ensure, \
              patch.object(sv_mod, "cache_state_vector") as cache_spy, \
              patch("intelligence.regime.classifier.classify_regime", return_value=fake_regime):
-            body = asyncio.run(ir.get_regime(_token="t"))
+            body = ir.get_regime(_token="t")
 
         assert body["available"] is True
         assert body["cached"] is False
@@ -322,7 +322,7 @@ class TestRegimeReadOnly:
              patch.object(sv_mod, "compute_state_vector", return_value=thin), \
              patch.object(sv_mod, "_read_cached_row", return_value=None), \
              patch.object(sv_mod, "cache_state_vector") as cache_spy:
-            body = asyncio.run(ir.get_regime(_token="t"))
+            body = ir.get_regime(_token="t")
 
         assert body["available"] is False
         assert "reason" in body and "state_vector" not in body
@@ -351,9 +351,7 @@ class TestRegimeReadOnly:
              patch("intelligence.regime.classifier.classify_regime", return_value=fake_regime), \
              patch("intelligence.regime.episode_matcher.find_analogous_episodes", return_value=fake_matches), \
              patch("intelligence.regime.forecast.generate_conditional_forecast", return_value=fake_forecast):
-            body = asyncio.run(
-                ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
-            )
+            body = ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
 
         assert body["available"] is True
         cache_spy.assert_not_called()
@@ -371,9 +369,7 @@ class TestRegimeReadOnly:
              patch.object(sv_mod, "compute_state_vector", return_value=thin), \
              patch.object(sv_mod, "_read_cached_row", return_value=None), \
              patch.object(sv_mod, "cache_state_vector") as cache_spy:
-            body = asyncio.run(
-                ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
-            )
+            body = ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
 
         assert body["available"] is False
         assert "reason" in body

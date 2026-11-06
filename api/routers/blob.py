@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from api.auth import require_auth
@@ -12,7 +13,7 @@ router = APIRouter(prefix="/api/v1/blob", tags=["blob"])
 
 
 @router.get("/health")
-async def blob_health(_=Depends(require_auth)):
+def blob_health(_=Depends(require_auth)):
     """Check blob store health."""
     return blob_store.health_check()
 
@@ -32,8 +33,10 @@ async def upload_blob(
     if len(data) > 100 * 1024 * 1024:  # 100MB limit
         raise HTTPException(413, "File too large (max 100MB)")
 
-    success = blob_store.put(
-        bucket, key, data, content_type=file.content_type or "application/octet-stream"
+    # blob_store.put is blocking network/disk I/O: keep it off the event loop.
+    success = await run_in_threadpool(
+        blob_store.put,
+        bucket, key, data, content_type=file.content_type or "application/octet-stream",
     )
     if not success:
         raise HTTPException(503, "Blob store unavailable")
@@ -42,7 +45,7 @@ async def upload_blob(
 
 
 @router.get("/{bucket}/{key:path}/url")
-async def get_presigned_url(
+def get_presigned_url(
     bucket: str,
     key: str,
     expires: int = Query(3600, ge=60, le=86400),
@@ -60,7 +63,7 @@ async def get_presigned_url(
 
 
 @router.get("/{bucket}/")
-async def list_blobs(
+def list_blobs(
     bucket: str,
     prefix: str = Query("", description="Key prefix filter"),
     _=Depends(require_auth),
@@ -74,7 +77,7 @@ async def list_blobs(
 
 
 @router.get("/{bucket}/{key:path}")
-async def download_blob(
+def download_blob(
     bucket: str,
     key: str,
     _=Depends(require_auth),
@@ -91,7 +94,7 @@ async def download_blob(
 
 
 @router.delete("/{bucket}/{key:path}")
-async def delete_blob(
+def delete_blob(
     bucket: str,
     key: str,
     _=Depends(require_auth),

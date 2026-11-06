@@ -17,7 +17,6 @@ the function body, and the real module pulls in pandas via journal.log.
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from types import ModuleType
 
@@ -123,7 +122,7 @@ def _compose(monkeypatch, question, *, current_price_fn=None, create_alert_fn=No
         monkeypatch, current_price_fn=current_price_fn, create_alert_fn=create_alert_fn
     )
     req = ChatComposeRequest(question=question)
-    resp = asyncio.run(chat_module.compose_layout(req, token="test-token"))
+    resp = chat_module.compose_layout(req, token="test-token")
     return resp, calls
 
 

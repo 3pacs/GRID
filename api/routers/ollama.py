@@ -99,7 +99,7 @@ def _backend_name(client: Any) -> str:
 
 
 @router.get("/status")
-async def ollama_status() -> dict[str, Any]:
+def ollama_status() -> dict[str, Any]:
     """Check LLM server availability and model info."""
     try:
         from config import settings
@@ -125,7 +125,7 @@ async def ollama_status() -> dict[str, Any]:
 
 
 @router.post("/briefing")
-async def generate_briefing(req: BriefingRequest) -> dict[str, Any]:
+def generate_briefing(req: BriefingRequest) -> dict[str, Any]:
     """Generate a market briefing (hourly/daily/weekly)."""
     if req.briefing_type not in ("hourly", "daily", "weekly"):
         raise HTTPException(status_code=400, detail="Type must be hourly, daily, or weekly")
@@ -140,7 +140,7 @@ async def generate_briefing(req: BriefingRequest) -> dict[str, Any]:
 
 
 @router.get("/briefing/latest")
-async def get_latest_briefing(
+def get_latest_briefing(
     briefing_type: str = Query(default="hourly"),
 ) -> dict[str, Any]:
     """Get the most recent saved briefing of the given type."""
@@ -152,7 +152,7 @@ async def get_latest_briefing(
 
 
 @router.get("/briefings")
-async def list_briefings(
+def list_briefings(
     briefing_type: str = Query(default=""),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
@@ -176,7 +176,7 @@ async def list_briefings(
 
 
 @router.get("/briefings/{filename}")
-async def read_briefing(filename: str) -> dict[str, Any]:
+def read_briefing(filename: str) -> dict[str, Any]:
     """Read a specific saved briefing file."""
     filepath = _get_briefing_dir() / filename
     if not filepath.exists() or not filepath.is_file():
@@ -186,7 +186,7 @@ async def read_briefing(filename: str) -> dict[str, Any]:
 
 
 @router.post("/ask")
-async def ask_ollama(req: AskRequest) -> dict[str, Any]:
+def ask_ollama(req: AskRequest) -> dict[str, Any]:
     """Ask a free-form question with optional context.
 
     Injects relevant past Q&As as institutional memory, stores the new
@@ -262,7 +262,7 @@ async def ask_ollama(req: AskRequest) -> dict[str, Any]:
 
 
 @router.post("/explain")
-async def explain_relationship(req: ExplainRequest) -> dict[str, Any]:
+def explain_relationship(req: ExplainRequest) -> dict[str, Any]:
     """Explain the economic mechanism behind a feature relationship."""
     reasoner = _get_reasoner()
     result = reasoner.explain_relationship(
@@ -274,7 +274,7 @@ async def explain_relationship(req: ExplainRequest) -> dict[str, Any]:
 
 
 @router.post("/hypotheses")
-async def generate_hypotheses(req: HypothesisRequest) -> dict[str, Any]:
+def generate_hypotheses(req: HypothesisRequest) -> dict[str, Any]:
     """Generate falsifiable hypothesis candidates from a pattern."""
     reasoner = _get_reasoner()
     result = reasoner.generate_hypothesis_candidates(
@@ -286,7 +286,7 @@ async def generate_hypotheses(req: HypothesisRequest) -> dict[str, Any]:
 
 
 @router.post("/regime-analysis")
-async def analyze_regime(req: RegimeAnalysisRequest) -> dict[str, Any]:
+def analyze_regime(req: RegimeAnalysisRequest) -> dict[str, Any]:
     """Analyze a regime transition with economic context."""
     reasoner = _get_reasoner()
     result = reasoner.analyze_regime_transition(
@@ -308,7 +308,7 @@ class CapitalFlowRequest(BaseModel):
 
 
 @router.post("/capital-flows")
-async def capital_flow_research(req: CapitalFlowRequest) -> dict[str, Any]:
+def capital_flow_research(req: CapitalFlowRequest) -> dict[str, Any]:
     """Trigger a deep capital flow research sweep.
 
     Pulls data from all available sources (ETF prices, FRED monetary,

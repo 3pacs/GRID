@@ -34,6 +34,7 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 from utils.fx import convert_to_usd
 from utils.ttl_cache import TTLCache
+from utils.single_flight import single_flight
 
 router = APIRouter(prefix="/api/v1/actors", tags=["capital_flow"])
 
@@ -1001,7 +1002,8 @@ def _fallback_payload(actor_meta: dict[str, Any], period_type: str) -> dict[str,
 
 
 @router.get("/{actor_id}/capital_flow")
-async def get_capital_flow(
+@single_flight
+def get_capital_flow(
     actor_id: str,
     periods: int = Query(4, ge=1, le=12),
     period_type: str = Query("annual", pattern="^(annual|quarter|ttm)$"),

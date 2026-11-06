@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "source-
 
 
 @router.get("/source-audit")
-async def get_source_audit(
+def get_source_audit(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the latest source audit results.
@@ -40,7 +40,7 @@ async def get_source_audit(
 
 
 @router.post("/source-audit/run")
-async def trigger_source_audit(
+def trigger_source_audit(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Trigger a full source accuracy audit.
@@ -63,7 +63,7 @@ async def trigger_source_audit(
 
 
 @router.get("/source-audit/redundancy-map")
-async def get_redundancy_map(
+def get_redundancy_map(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the current redundancy map showing features with 2+ sources."""
@@ -82,7 +82,7 @@ async def get_redundancy_map(
 
 
 @router.get("/source-audit/compare/{feature_name}")
-async def compare_feature_sources(
+def compare_feature_sources(
     feature_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -100,7 +100,7 @@ async def compare_feature_sources(
 
 
 @router.get("/source-audit/discrepancies")
-async def get_discrepancies(
+def get_discrepancies(
     threshold: float = Query(0.02, ge=0.001, le=0.5, description="Deviation threshold"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

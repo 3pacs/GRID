@@ -17,7 +17,7 @@ router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/news")
-async def get_news_feed_endpoint(
+def get_news_feed_endpoint(
     ticker: str | None = Query(None, description="Filter by ticker symbol"),
     hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
     _token: str = Depends(require_auth),
@@ -44,7 +44,7 @@ async def get_news_feed_endpoint(
 
 
 @router.get("/news/stats")
-async def get_news_stats_endpoint(
+def get_news_stats_endpoint(
     hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -60,7 +60,7 @@ async def get_news_stats_endpoint(
 
 
 @router.get("/news/narrative-shift/{ticker}")
-async def get_narrative_shift_endpoint(
+def get_narrative_shift_endpoint(
     ticker: str,
     days: int = Query(7, ge=2, le=30, description="Lookback days"),
     _token: str = Depends(require_auth),
@@ -81,7 +81,7 @@ async def get_narrative_shift_endpoint(
 
 
 @router.get("/news/before-move/{ticker}")
-async def get_news_before_move_endpoint(
+def get_news_before_move_endpoint(
     ticker: str,
     move_date: str = Query(..., description="Date of the price move (YYYY-MM-DD)"),
     _token: str = Depends(require_auth),
@@ -107,7 +107,7 @@ async def get_news_before_move_endpoint(
 
 
 @router.get("/news/briefing")
-async def get_news_briefing_endpoint(
+def get_news_briefing_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """LLM-generated briefing from today's news flow.
@@ -130,7 +130,7 @@ async def get_news_briefing_endpoint(
 
 
 @router.get("/events")
-async def get_event_sequence(
+def get_event_sequence(
     ticker: str | None = Query(None, description="Ticker symbol"),
     sector: str | None = Query(None, description="Sector name or ETF (e.g., Technology, XLK)"),
     days: int = Query(90, ge=1, le=365, description="Lookback days"),
@@ -192,7 +192,7 @@ async def get_event_sequence(
 
 
 @router.get("/events/patterns")
-async def get_recurring_patterns(
+def get_recurring_patterns(
     min_occurrences: int = Query(3, ge=2, le=50, description="Minimum pattern occurrences"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -228,7 +228,7 @@ _PATTERN_ACTIONABLE_NOTE = (
 
 
 @router.get("/patterns")
-async def get_discovered_patterns(
+def get_discovered_patterns(
     min_occurrences: int = Query(3, ge=2, le=50, description="Minimum pattern occurrences"),
     max_sequence_length: int = Query(4, ge=2, le=4, description="Max sequence length"),
     _token: str = Depends(require_auth),
@@ -271,7 +271,7 @@ async def get_discovered_patterns(
 
 
 @router.get("/patterns/active")
-async def get_active_patterns(
+def get_active_patterns(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Currently in-progress patterns — the prediction engine.
@@ -296,7 +296,7 @@ async def get_active_patterns(
 
 
 @router.get("/patterns/{ticker}")
-async def get_patterns_for_ticker_endpoint(
+def get_patterns_for_ticker_endpoint(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -326,7 +326,7 @@ async def get_patterns_for_ticker_endpoint(
 
 
 @router.get("/news/momentum")
-async def get_news_momentum(
+def get_news_momentum(
     ticker: str | None = Query(None, description="Filter by ticker"),
     signal_type: str | None = Query(None, description="Filter: ACCELERATING, DECELERATING, DIVERGENCE, STEADY"),
     hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
@@ -357,7 +357,7 @@ async def get_news_momentum(
 
 
 @router.get("/news/momentum/divergences")
-async def get_momentum_divergences(
+def get_momentum_divergences(
     hours: int = Query(48, ge=1, le=168, description="Hours to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -382,7 +382,7 @@ async def get_momentum_divergences(
 
 
 @router.post("/news/momentum/scan")
-async def run_momentum_scan(
+def run_momentum_scan(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Trigger a full news momentum scan across all active tickers.
@@ -405,7 +405,7 @@ async def run_momentum_scan(
 
 
 @router.get("/deals")
-async def get_active_deals(
+def get_active_deals(
     deal_type: str | None = Query(None, description="Filter by deal type (MERGER, ACQUISITION, etc.)"),
     ticker: str | None = Query(None, description="Filter by ticker"),
     _token: str = Depends(require_auth),
@@ -432,7 +432,7 @@ async def get_active_deals(
 
 
 @router.get("/deals/pipeline")
-async def get_deal_pipeline_summary(
+def get_deal_pipeline_summary(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Get summary of the entire deal pipeline — counts by type and stage."""
@@ -448,7 +448,7 @@ async def get_deal_pipeline_summary(
 
 
 @router.get("/deals/history/{ticker}")
-async def get_deal_history(
+def get_deal_history(
     ticker: str,
     days: int = Query(90, ge=1, le=365, description="Lookback days"),
     _token: str = Depends(require_auth),
@@ -472,7 +472,7 @@ async def get_deal_history(
 
 
 @router.post("/deals/scan")
-async def run_deal_scan(
+def run_deal_scan(
     hours: int = Query(12, ge=1, le=48, description="Hours to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -492,7 +492,7 @@ async def run_deal_scan(
 
 
 @router.get("/news/business-events")
-async def get_business_events(
+def get_business_events(
     category: str | None = Query(None, description="Filter by category"),
     ticker: str | None = Query(None, description="Filter by ticker"),
     direction: str | None = Query(None, description="Filter: bullish, bearish, neutral"),
@@ -529,7 +529,7 @@ async def get_business_events(
 
 
 @router.get("/news/business-events/summary")
-async def get_business_event_summary(
+def get_business_event_summary(
     hours: int = Query(24, ge=1, le=168, description="Hours to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -546,7 +546,7 @@ async def get_business_event_summary(
 
 
 @router.post("/news/business-events/scan")
-async def run_business_event_scan(
+def run_business_event_scan(
     hours: int = Query(12, ge=1, le=48, description="Hours to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -566,7 +566,7 @@ async def run_business_event_scan(
 
 
 @router.get("/earnings/transcript/{ticker}")
-async def get_earnings_transcript_analysis(
+def get_earnings_transcript_analysis(
     ticker: str,
     limit: int = Query(5, ge=1, le=20, description="Max results"),
     _token: str = Depends(require_auth),
@@ -594,7 +594,7 @@ async def get_earnings_transcript_analysis(
 
 
 @router.get("/earnings/tone-shifts")
-async def get_earnings_tone_shifts(
+def get_earnings_tone_shifts(
     min_shift: float = Query(0.2, ge=0.05, le=1.0, description="Minimum absolute tone shift"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -620,7 +620,7 @@ async def get_earnings_tone_shifts(
 
 
 @router.post("/earnings/transcript/analyze")
-async def run_earnings_transcript_analysis(
+def run_earnings_transcript_analysis(
     days_back: int = Query(90, ge=1, le=365, description="Days to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -640,7 +640,7 @@ async def run_earnings_transcript_analysis(
 
 
 @router.get("/sec/facts")
-async def get_sec_material_facts(
+def get_sec_material_facts(
     ticker: str | None = Query(None, description="Filter by ticker"),
     item_number: str | None = Query(None, description="Filter by 8-K item number (e.g. '2.01')"),
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
@@ -671,7 +671,7 @@ async def get_sec_material_facts(
 
 
 @router.get("/sec/facts/high-impact")
-async def get_high_impact_facts(
+def get_high_impact_facts(
     days: int = Query(7, ge=1, le=90, description="Lookback days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -696,7 +696,7 @@ async def get_high_impact_facts(
 
 
 @router.post("/sec/facts/extract")
-async def run_sec_fact_extraction(
+def run_sec_fact_extraction(
     days_back: int = Query(90, ge=1, le=365, description="Days to look back"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

@@ -119,7 +119,7 @@ async def event_stream(
 
 
 @router.get("/channels")
-async def list_channels(
+def list_channels(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """List all available event channels."""
@@ -133,7 +133,7 @@ async def list_channels(
 
 
 @router.get("/topics")
-async def list_topics(
+def list_topics(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """List all Redpanda topics with availability status."""

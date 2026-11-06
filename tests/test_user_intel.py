@@ -214,7 +214,7 @@ def test_submission_shape(fake_engine):
         note="Ally of 3G Capital on KHC board",
         confidence="medium",
     )
-    result = asyncio.run(submit_intel("nelson_peltz", body, "alice"))
+    result = submit_intel("nelson_peltz", body, "alice")
     assert result["id"] == 1
     assert result["actor_id"] == "nelson_peltz"
     assert result["intel_type"] == "loyalty"
@@ -234,31 +234,27 @@ def test_validate_rejects_bad_type():
 
 def test_vote_dedup(fake_engine):
     """Same user voting twice updates, doesn't double-count."""
-    asyncio.run(
-        submit_intel(
+    submit_intel(
             "tim_cook",
             IntelSubmission(intel_type="fact", note="CEO of Apple"),
             "alice",
         )
-    )
-    r1 = asyncio.run(vote_intel(1, 1, "bob"))
+    r1 = vote_intel(1, 1, "bob")
     assert r1["upvotes"] == 1 and r1["downvotes"] == 0
-    r2 = asyncio.run(vote_intel(1, 1, "bob"))  # same user, same vote
+    r2 = vote_intel(1, 1, "bob")  # same user, same vote
     assert r2["upvotes"] == 1, "duplicate vote should not double-count"
-    r3 = asyncio.run(vote_intel(1, -1, "bob"))  # flip
+    r3 = vote_intel(1, -1, "bob")  # flip
     assert r3["upvotes"] == 0 and r3["downvotes"] == 1
 
 
 def test_verify_permission_path(fake_engine):
     """verify_intel marks status = 'verified'."""
-    asyncio.run(
-        submit_intel(
+    submit_intel(
             "jane_fraser",
             IntelSubmission(intel_type="biography", note="Citi CEO since 2021"),
             "alice",
         )
-    )
-    result = asyncio.run(verify_intel(1, "verified", "admin_user"))
+    result = verify_intel(1, "verified", "admin_user")
     assert result["verification_status"] == "verified"
     assert result["verified_by"] == "admin_user"
 
@@ -266,20 +262,18 @@ def test_verify_permission_path(fake_engine):
 def test_sort_order_by_score(fake_engine):
     """get_actor_intel returns highest-score first."""
     for i in range(3):
-        asyncio.run(
-            submit_intel(
+        submit_intel(
                 "larry_fink",
                 IntelSubmission(intel_type="tip", note=f"note {i}"),
                 f"user{i}",
             )
-        )
     # Upvote id=2 heavily
-    asyncio.run(vote_intel(2, 1, "voter1"))
-    asyncio.run(vote_intel(2, 1, "voter2"))
+    vote_intel(2, 1, "voter1")
+    vote_intel(2, 1, "voter2")
     # Downvote id=3
-    asyncio.run(vote_intel(3, -1, "voter1"))
+    vote_intel(3, -1, "voter1")
 
-    items = asyncio.run(get_actor_intel("larry_fink", 10, "alice"))
+    items = get_actor_intel("larry_fink", 10, "alice")
     assert len(items) == 3
     # Highest score first
     assert items[0]["id"] == 2
@@ -294,9 +288,9 @@ def test_rate_limit_enforced(fake_engine):
     body = IntelSubmission(intel_type="fact", note="x")
     limit = user_intel.RATE_LIMIT_PER_HOUR
     for _ in range(limit):
-        asyncio.run(submit_intel("ray_dalio", body, "spammer"))
+        submit_intel("ray_dalio", body, "spammer")
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(submit_intel("ray_dalio", body, "spammer"))
+        submit_intel("ray_dalio", body, "spammer")
     assert exc.value.status_code == 429
 
 
@@ -304,28 +298,26 @@ def test_sql_injection_guard(fake_engine):
     """Injection attempts in actor_id/note are passed as bind params, not interpolated."""
     payload = "'; DROP TABLE user_intel; --"
     body = IntelSubmission(intel_type="rumor", note=payload)
-    result = asyncio.run(submit_intel(payload, body, "mallory"))
+    result = submit_intel(payload, body, "mallory")
     # The actor_id and note are stored verbatim — no execution, no truncation.
     assert result["actor_id"] == payload
     assert result["note"] == payload
     # Fetching back the actor should still return that item.
-    items = asyncio.run(get_actor_intel(payload, 10, "mallory"))
+    items = get_actor_intel(payload, 10, "mallory")
     assert len(items) == 1
     assert items[0]["note"] == payload
 
 
 def test_flag_increments(fake_engine):
     """Flagging increments the flags counter."""
-    asyncio.run(
-        submit_intel(
+    submit_intel(
             "warren_buffett",
             IntelSubmission(intel_type="rumor", note="owns X"),
             "alice",
         )
-    )
-    r1 = asyncio.run(flag_intel(1, "bob"))
+    r1 = flag_intel(1, "bob")
     assert r1["flags"] == 1
-    r2 = asyncio.run(flag_intel(1, "carol"))
+    r2 = flag_intel(1, "carol")
     assert r2["flags"] == 2
 
 

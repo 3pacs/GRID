@@ -134,7 +134,7 @@ def get_celestial_signals(
 
 
 @router.get("/briefing")
-async def get_celestial_briefing(
+def get_celestial_briefing(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the latest celestial narrative briefing.
@@ -159,7 +159,7 @@ async def get_celestial_briefing(
 
 
 @router.post("/briefing/generate")
-async def generate_celestial_briefing(
+def generate_celestial_briefing(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Trigger on-demand generation of a celestial briefing.

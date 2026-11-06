@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 from datetime import date, timedelta
 
@@ -243,9 +242,9 @@ def test_weekly_route_describes_mixed_storage_basis_and_vintage_without_common_a
         return history
 
     monkeypatch.setattr(ten_year_router, "_load_price_history", fake_history)
-    result = asyncio.run(ten_year_router.weekly_ten_year_portfolio(
+    result = ten_year_router.weekly_ten_year_portfolio(
         capital=1_000_000, years=3, profile="dad_chartist", engine=object(),
-    ))
+    )
 
     assert requested_years == [3]
     assert result["status"] == "ok"

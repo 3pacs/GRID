@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import MagicMock, patch
 
 from api.routers.intelligence_edges import get_market_edges, router
@@ -32,7 +31,7 @@ def test_get_market_edges_returns_scanner_payload():
         "api.routers.intelligence_edges.build_market_edge_snapshot",
         return_value=payload,
     ) as mock_build:
-        result = asyncio.run(get_market_edges(limit=3, _token="token"))
+        result = get_market_edges(limit=3, _token="token")
 
     assert result == payload
     assert result["opportunities"][0]["targets"] == ["NVDA"]
@@ -55,7 +54,7 @@ def test_get_market_edges_falls_back_to_stable_shape_on_error():
         "api.routers.intelligence_edges.build_market_edge_snapshot",
         return_value=fallback,
     ):
-        result = asyncio.run(get_market_edges(limit=2, _token="token"))
+        result = get_market_edges(limit=2, _token="token")
 
     assert result["as_of"] == fallback["as_of"]
     assert result["generated_at"] == fallback["generated_at"]

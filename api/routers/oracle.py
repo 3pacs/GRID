@@ -209,7 +209,7 @@ def get_predictions(
 # ── GET /scoreboard ────────────────────────────────────────────────────────
 
 @router.get("/scoreboard")
-async def get_scoreboard(
+def get_scoreboard(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Model tournament: overall accuracy, by-model, by-ticker, calibration."""
@@ -307,7 +307,7 @@ def get_latest(
 
 
 @router.get("/predict-live/{ticker}")
-async def predict_live(
+def predict_live(
     ticker: str,
     horizon: int = Query(7, ge=1, le=365, description="Prediction horizon in days"),
     _token: str = Depends(require_auth),
@@ -359,7 +359,7 @@ def _compute_streak(engine) -> dict:
 
 
 @router.post("/publish")
-async def publish_prediction(
+def publish_prediction(
     req: OraclePublishRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -377,7 +377,7 @@ async def publish_prediction(
 # ── POST /evolve ──────────────────────────────────────────────────────
 
 @router.post("/evolve")
-async def trigger_evolve(
+def trigger_evolve(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Manually trigger weight evolution based on scored predictions."""
@@ -452,7 +452,7 @@ def get_scorecard(
 # ── GET /guard — hallucination guard verdicts from last cycle ─────────
 
 @router.get("/guard")
-async def get_guard_verdicts(
+def get_guard_verdicts(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return hallucination guard verdicts from the most recent oracle cycle.

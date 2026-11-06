@@ -54,7 +54,7 @@ def shadow_vs_production(
 
 
 @router.get("/drift-report/{model_id}")
-async def drift_report(
+def drift_report(
     model_id: int,
     _token: str = Depends(require_auth),
 ) -> dict:

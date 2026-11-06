@@ -144,7 +144,7 @@ async def trigger_clustering(
 
 
 @router.get("/jobs")
-async def get_jobs(
+def get_jobs(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return list of recent jobs."""
@@ -433,7 +433,7 @@ def get_hypotheses(
 
 
 @router.get("/backtest-results")
-async def get_backtest_results(
+def get_backtest_results(
     min_sharpe: float = Query(default=1.0, ge=0.0),
     min_win_rate: float = Query(default=0.55, ge=0.0, le=1.0),
     family: str | None = Query(default=None, description="Filter by leader family"),
@@ -472,7 +472,7 @@ async def get_backtest_results(
 
 
 @router.post("/backtest-scan")
-async def run_backtest_scan(
+def run_backtest_scan(
     min_sharpe: float = Query(default=1.0, ge=0.5),
     min_win_rate: float = Query(default=0.55, ge=0.4, le=1.0),
     _token: str = Depends(require_auth),
@@ -484,7 +484,7 @@ async def run_backtest_scan(
 
 
 @router.post("/hypotheses/review")
-async def run_hypothesis_review(
+def run_hypothesis_review(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Run LLM-based review of all PASSED/TESTING hypotheses.

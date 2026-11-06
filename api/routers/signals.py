@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api/v1/signals", tags=["signals"])
 
 
 @router.get("")
-async def get_signals(_token: str = Depends(require_auth)) -> dict:
+def get_signals(_token: str = Depends(require_auth)) -> dict:
     """Return live signals from the inference engine."""
     try:
         from inference.live import LiveInference
@@ -190,7 +190,7 @@ def get_timeseries(
 
 
 @router.get("/conviction")
-async def get_conviction_scores(
+def get_conviction_scores(
     min_score: int = Query(default=20, ge=0, le=100, description="Minimum score threshold"),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -219,7 +219,7 @@ async def get_conviction_scores(
 
 
 @router.get("/conviction/{ticker}")
-async def get_conviction_ticker(
+def get_conviction_ticker(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict:

@@ -32,7 +32,7 @@ router = APIRouter(
 
 
 @router.get("")
-async def list_workflows() -> dict[str, Any]:
+def list_workflows() -> dict[str, Any]:
     """List all available workflows with enabled/disabled status."""
     from workflows.loader import load_all_available
 
@@ -45,7 +45,7 @@ async def list_workflows() -> dict[str, Any]:
 
 
 @router.get("/enabled")
-async def list_enabled() -> dict[str, Any]:
+def list_enabled() -> dict[str, Any]:
     """List only enabled workflows."""
     from workflows.loader import load_enabled
 
@@ -54,7 +54,7 @@ async def list_enabled() -> dict[str, Any]:
 
 
 @router.post("/{name}/enable", dependencies=[Depends(require_role("admin"))])
-async def enable(name: str) -> dict[str, Any]:
+def enable(name: str) -> dict[str, Any]:
     """Enable a workflow by name."""
     from workflows.loader import enable_workflow
 
@@ -65,7 +65,7 @@ async def enable(name: str) -> dict[str, Any]:
 
 
 @router.post("/{name}/disable", dependencies=[Depends(require_role("admin"))])
-async def disable(name: str) -> dict[str, Any]:
+def disable(name: str) -> dict[str, Any]:
     """Disable a workflow by name."""
     from workflows.loader import disable_workflow
 
@@ -76,7 +76,7 @@ async def disable(name: str) -> dict[str, Any]:
 
 
 @router.post("/{name}/run", dependencies=[Depends(require_role("admin"))])
-async def run_workflow(name: str) -> dict[str, Any]:
+def run_workflow(name: str) -> dict[str, Any]:
     """Execute a workflow by name (synchronous — may take a while)."""
     from workflows.loader import load_all_available
 
@@ -100,7 +100,7 @@ async def run_workflow(name: str) -> dict[str, Any]:
 
 
 @router.get("/{name}/validate")
-async def validate(name: str) -> dict[str, Any]:
+def validate(name: str) -> dict[str, Any]:
     """Validate a workflow file for correctness."""
     from workflows.loader import validate_workflow
 
@@ -119,7 +119,7 @@ async def validate(name: str) -> dict[str, Any]:
 
 
 @router.get("/waves")
-async def get_waves() -> dict[str, Any]:
+def get_waves() -> dict[str, Any]:
     """Show the wave execution plan for enabled workflows."""
     from physics.waves import WaveTask, build_execution_waves
     from workflows.loader import load_enabled
@@ -158,7 +158,7 @@ async def get_waves() -> dict[str, Any]:
 
 
 @router.get("/schedule")
-async def get_schedule() -> dict[str, Any]:
+def get_schedule() -> dict[str, Any]:
     """Show scheduled workflows and their timing."""
     from workflows.loader import load_enabled, parse_schedule
 

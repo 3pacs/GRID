@@ -74,6 +74,13 @@ def get_today(
     engine = get_db_engine()
     today = date.today()
 
+    # Layers with data = truthy values in the ``coverage`` object (JSON
+    # false/null/0/""/[]/{} don't count), the same rule the Python loop
+    # below applies. Computed inline: the
+    # coverage_layer_count(jsonb) helper this query used to call was never
+    # created by any migration, and its failure aborted the transaction so
+    # the "fallback" query on the same connection failed too (500 on
+    # 2026-11-06: UndefinedFunction coverage_layer_count(jsonb)).
     sql = text(
         """
         SELECT ticker, as_of_date, score, coverage, evidence,
@@ -83,20 +90,13 @@ def get_today(
             SELECT MAX(as_of_date) FROM tps_snapshots
         )
           AND score IS NOT NULL
-          AND coverage_layer_count(coverage) >= :min_layers
-        ORDER BY score DESC NULLS LAST, ticker ASC
-        LIMIT :limit OFFSET :offset
-        """
-    )
-    fallback_sql = text(
-        """
-        SELECT ticker, as_of_date, score, coverage, evidence,
-               layer_scores, generated_at
-        FROM tps_snapshots
-        WHERE as_of_date = (
-            SELECT MAX(as_of_date) FROM tps_snapshots
-        )
-          AND score IS NOT NULL
+          AND (
+              CASE WHEN jsonb_typeof(coverage) = 'object' THEN (
+                  SELECT COUNT(*) FROM jsonb_each(coverage) AS layer(key, value)
+                  WHERE layer.value NOT IN ('false'::jsonb, 'null'::jsonb, '0'::jsonb,
+                                            '""'::jsonb, '[]'::jsonb, '{}'::jsonb)
+              ) ELSE 0 END
+          ) >= :min_layers
         ORDER BY score DESC NULLS LAST, ticker ASC
         LIMIT :limit OFFSET :offset
         """
@@ -106,24 +106,20 @@ def get_today(
         SELECT COUNT(*) FROM tps_snapshots
         WHERE as_of_date = (SELECT MAX(as_of_date) FROM tps_snapshots)
           AND score IS NOT NULL
+          AND (
+              CASE WHEN jsonb_typeof(coverage) = 'object' THEN (
+                  SELECT COUNT(*) FROM jsonb_each(coverage) AS layer(key, value)
+                  WHERE layer.value NOT IN ('false'::jsonb, 'null'::jsonb, '0'::jsonb,
+                                            '""'::jsonb, '[]'::jsonb, '{}'::jsonb)
+              ) ELSE 0 END
+          ) >= :min_layers
         """
     )
 
+    params = {"limit": limit, "offset": offset, "min_layers": min_coverage_layers}
     with engine.connect() as conn:
-        try:
-            rows = conn.execute(
-                sql, {"limit": limit, "offset": offset, "min_layers": min_coverage_layers}
-            ).fetchall()
-        except Exception:
-            # coverage_layer_count() helper not present — fall back to
-            # the simpler ordering and filter coverage in Python.
-            rows = conn.execute(
-                fallback_sql, {"limit": limit, "offset": offset}
-            ).fetchall()
-        try:
-            total = conn.execute(count_sql).fetchone()[0]
-        except Exception:
-            total = len(rows)
+        rows = conn.execute(sql, params).fetchall()
+        total = conn.execute(count_sql, {"min_layers": min_coverage_layers}).scalar() or 0
 
     entries: list[dict[str, Any]] = []
     for row in rows:

@@ -29,6 +29,7 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
+from utils.single_flight import single_flight
 
 router = APIRouter(prefix="/api/v1/actors", tags=["explain"])
 
@@ -789,7 +790,8 @@ def _build_explain(
 
 
 @router.get("/{actor_id}/explain")
-async def get_actor_explain(
+@single_flight
+def get_actor_explain(
     actor_id: str,
     date: str | None = Query(None, description="Pivot date YYYY-MM-DD, default today"),
     window_days: int = Query(5, ge=1, le=30, description="± window in days"),

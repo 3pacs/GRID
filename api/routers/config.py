@@ -45,7 +45,7 @@ _SENSITIVE_FIELDS = {
 
 
 @router.get("")
-async def get_config(_token: str = Depends(require_auth)) -> dict:
+def get_config(_token: str = Depends(require_auth)) -> dict:
     """Return current system configuration (non-sensitive fields only)."""
     config_dict: dict[str, Any] = {}
     for key, value in settings.model_dump().items():
@@ -55,7 +55,7 @@ async def get_config(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.put("")
-async def update_config(
+def update_config(
     body: dict[str, Any],
     _token: str = Depends(require_role("admin")),
 ) -> dict:

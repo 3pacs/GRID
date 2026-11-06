@@ -7,7 +7,6 @@ writer, and directs the route's unqualified table read to that schema.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
@@ -72,7 +71,7 @@ def test_persisted_sentiment_route_uses_real_writer_payload_and_select_only(monk
         event.listen(route_engine, "before_cursor_execute", _capture_sql)
         monkeypatch.setattr(briefing, "get_engine", lambda: route_engine)
 
-        payload = asyncio.run(briefing.get_current_sentiment())
+        payload = briefing.get_current_sentiment()
 
         assert payload["available"] is True
         assert payload["score"] == pytest.approx(0.42)
@@ -93,7 +92,7 @@ def test_persisted_sentiment_route_uses_real_writer_payload_and_select_only(monk
             conn.execute(text("DELETE FROM sentiment_predictions"))
         statements.clear()
 
-        absent = asyncio.run(briefing.get_current_sentiment())
+        absent = briefing.get_current_sentiment()
 
         assert absent == {
             "error": "No persisted sentiment prediction found",

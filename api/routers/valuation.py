@@ -86,7 +86,7 @@ def _get_derivatives_engine():
 # ── GET /analyze/{ticker} ──────────────────────────────────────────
 
 @router.get("/analyze/{ticker}")
-async def analyze_ticker(ticker: str) -> dict[str, Any]:
+def analyze_ticker(ticker: str) -> dict[str, Any]:
     """Run full composite valuation analysis for a ticker.
 
     Returns intrinsic values, milestone scorecard, derivatives support,
@@ -104,7 +104,7 @@ async def analyze_ticker(ticker: str) -> dict[str, Any]:
 # ── GET /prompt/{ticker} ───────────────────────────────────────────
 
 @router.get("/prompt/{ticker}")
-async def generate_prompt(ticker: str) -> dict[str, Any]:
+def generate_prompt(ticker: str) -> dict[str, Any]:
     """Generate a Claude Max prompt with all quantified valuation data.
 
     Returns the prompt text, raw data, and an analysis_id for tracking.
@@ -123,7 +123,7 @@ async def generate_prompt(ticker: str) -> dict[str, Any]:
 # ── POST /response ─────────────────────────────────────────────────
 
 @router.post("/response")
-async def log_analysis_response(body: AnalysisResponse) -> dict[str, Any]:
+def log_analysis_response(body: AnalysisResponse) -> dict[str, Any]:
     """Log a Claude Max analysis response with date-stamped predictions.
 
     Send the analysis_id from the prompt, the full response text, and
@@ -152,7 +152,7 @@ async def log_analysis_response(body: AnalysisResponse) -> dict[str, Any]:
 # ── GET /history/{ticker} ──────────────────────────────────────────
 
 @router.get("/history/{ticker}")
-async def valuation_history(
+def valuation_history(
     ticker: str,
     days: int = Query(default=365, ge=7, le=3650),
 ) -> dict[str, Any]:
@@ -170,7 +170,7 @@ async def valuation_history(
 # ── GET /predictions/{ticker} ──────────────────────────────────────
 
 @router.get("/predictions/{ticker}")
-async def prediction_history(
+def prediction_history(
     ticker: str,
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
@@ -187,7 +187,7 @@ async def prediction_history(
 # ── GET /milestones/{ticker} ───────────────────────────────────────
 
 @router.get("/milestones/{ticker}")
-async def get_milestones(
+def get_milestones(
     ticker: str,
     status: str | None = Query(default=None),
 ) -> dict[str, Any]:
@@ -211,7 +211,7 @@ async def get_milestones(
 # ── POST /milestones ───────────────────────────────────────────────
 
 @router.post("/milestones")
-async def add_milestone(body: MilestoneCreate) -> dict[str, Any]:
+def add_milestone(body: MilestoneCreate) -> dict[str, Any]:
     """Add a new company milestone / goal / guidance item."""
     try:
         from valuation.milestones import Milestone
@@ -245,7 +245,7 @@ async def add_milestone(body: MilestoneCreate) -> dict[str, Any]:
 # ── PUT /milestones/{id}/status ────────────────────────────────────
 
 @router.put("/milestones/{milestone_id}/status")
-async def update_milestone_status(
+def update_milestone_status(
     milestone_id: int, body: MilestoneStatusUpdate,
 ) -> dict[str, Any]:
     """Update a milestone's status and optionally record actual values."""
@@ -269,7 +269,7 @@ async def update_milestone_status(
 # ── GET /derivatives/{ticker} ──────────────────────────────────────
 
 @router.get("/derivatives/{ticker}")
-async def derivatives_support(ticker: str) -> dict[str, Any]:
+def derivatives_support(ticker: str) -> dict[str, Any]:
     """Get derivatives support analysis for a ticker.
 
     Shows how short interest, dealer gamma, and options flow

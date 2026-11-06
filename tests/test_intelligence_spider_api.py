@@ -1,4 +1,3 @@
-import asyncio
 
 import pytest
 
@@ -26,9 +25,7 @@ def test_spider_stats_lazily_loads_graph_from_db(monkeypatch) -> None:
 
     monkeypatch.setattr(intelligence_spider, "_load_stats_graph_from_db", fake_load)
 
-    result = asyncio.run(
-        intelligence_spider.get_spider_stats(engine=object(), _token="token")
-    )
+    result = intelligence_spider.get_spider_stats(engine=object(), _token="token")
 
     assert len(loaded_with) == 1
     assert result["status"] == "ready"
@@ -43,9 +40,7 @@ def test_spider_stats_reports_degraded_state_when_bootstrap_fails(monkeypatch) -
 
     monkeypatch.setattr(intelligence_spider, "_load_stats_graph_from_db", fake_load)
 
-    result = asyncio.run(
-        intelligence_spider.get_spider_stats(engine=object(), _token="token")
-    )
+    result = intelligence_spider.get_spider_stats(engine=object(), _token="token")
 
     assert result["status"] == "unavailable"
     assert result["total_actors"] == 0
@@ -62,9 +57,7 @@ def test_spider_stats_marks_actor_only_graph_as_degraded(monkeypatch) -> None:
 
     monkeypatch.setattr(intelligence_spider, "_load_stats_graph_from_db", fake_load)
 
-    result = asyncio.run(
-        intelligence_spider.get_spider_stats(engine=object(), _token="token")
-    )
+    result = intelligence_spider.get_spider_stats(engine=object(), _token="token")
 
     assert result["status"] == "degraded"
     assert result["total_actors"] == 1
@@ -181,11 +174,9 @@ def test_neighborhood_endpoint_uses_graph_engine(monkeypatch) -> None:
         intelligence_spider, "_load_full_graph_from_db",
         lambda _e: _build_two_actor_graph(),
     )
-    result = asyncio.run(
-        intelligence_spider.get_neighborhood(
+    result = intelligence_spider.get_neighborhood(
             "powell", depth=2, max_nodes=100, engine=object(), _token="token"
         )
-    )
     assert result["center"] == "powell"
     assert result["via"] == "spider_graph_engine"
     assert result["node_count"] == 2
@@ -197,9 +188,7 @@ def test_graph_reload_endpoint_returns_status(monkeypatch) -> None:
         intelligence_spider, "_load_full_graph_from_db",
         lambda _e: _build_two_actor_graph(),
     )
-    result = asyncio.run(
-        intelligence_spider.graph_reload(engine=object(), _token="token")
-    )
+    result = intelligence_spider.graph_reload(engine=object(), _token="token")
     assert result["status"] == "ok"
     assert result["actors"] == 2
     assert result["connections"] == 1

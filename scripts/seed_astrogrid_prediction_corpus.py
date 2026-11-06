@@ -338,7 +338,7 @@ def _coerce_model_dict(value: Any) -> dict[str, Any]:
 
 
 async def _build_snapshot(as_of_date: date) -> dict[str, Any]:
-    snapshot = await astro.get_snapshot(date_str=as_of_date.isoformat())
+    snapshot = astro.get_snapshot(date_str=as_of_date.isoformat())
     snapshot["canonical_ephemeris"] = _load_canonical_ephemeris(as_of_date)
     return snapshot
 
@@ -565,7 +565,7 @@ async def seed_prediction_corpus(
                     "target_symbols": req.target_symbols,
                 }
             else:
-                record = await astro.create_prediction(req)
+                record = astro.create_prediction(req)
                 record["as_of_date"] = current.isoformat()
             results.append(record)
         current += timedelta(days=step_days)

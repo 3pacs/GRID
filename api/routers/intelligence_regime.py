@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "regime"
 
 
 @router.get("/regime")
-async def get_regime(
+def get_regime(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current regime classification and state vector.
@@ -57,7 +57,7 @@ async def get_regime(
 
 
 @router.get("/regime/analogs")
-async def get_regime_analogs(
+def get_regime_analogs(
     n: int = Query(20, ge=5, le=50, description="Number of matches"),
     min_quality: float = Query(0.4, ge=0.1, le=0.9, description="Min match quality"),
     include_timesfm: bool = Query(True, description="Include TimesFM comparison"),
@@ -228,7 +228,7 @@ def _get_timesfm_comparison(engine: object) -> dict[str, Any]:
 
 
 @router.get("/regime/history")
-async def get_regime_history(
+def get_regime_history(
     days: int = Query(365, ge=30, le=3650, description="Lookback days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

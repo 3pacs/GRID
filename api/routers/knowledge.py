@@ -27,7 +27,7 @@ router = APIRouter(
 
 
 @router.get("")
-async def search_knowledge_endpoint(
+def search_knowledge_endpoint(
     q: str = Query(default="", description="Search query"),
     category: str = Query(default="", description="Filter by category"),
     limit: int = Query(default=20, ge=1, le=100),
@@ -44,7 +44,7 @@ async def search_knowledge_endpoint(
 
 
 @router.get("/summary")
-async def knowledge_summary() -> dict[str, Any]:
+def knowledge_summary() -> dict[str, Any]:
     """Get knowledge tree statistics and recent topics."""
     from knowledge.tree import get_knowledge_summary
 
@@ -52,7 +52,7 @@ async def knowledge_summary() -> dict[str, Any]:
 
 
 @router.get("/{entry_id}")
-async def get_knowledge_entry(entry_id: int) -> dict[str, Any]:
+def get_knowledge_entry(entry_id: int) -> dict[str, Any]:
     """Get a specific knowledge tree entry with related entries."""
     from knowledge.tree import get_entry_by_id, get_related
 
@@ -76,7 +76,7 @@ async def get_knowledge_entry(entry_id: int) -> dict[str, Any]:
 
 
 @router.delete("/{entry_id}")
-async def delete_knowledge_entry(entry_id: int) -> dict[str, Any]:
+def delete_knowledge_entry(entry_id: int) -> dict[str, Any]:
     """Delete a knowledge tree entry (admin only)."""
     from knowledge.tree import delete_entry
 

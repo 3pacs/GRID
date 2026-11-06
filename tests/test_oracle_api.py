@@ -50,7 +50,9 @@ class _DummyPrediction:
 
 
 def _run(coro):
-    """Run an async coroutine synchronously."""
+    """Run a handler result synchronously (routes may be sync or async)."""
+    if not asyncio.iscoroutine(coro):
+        return coro
     return asyncio.new_event_loop().run_until_complete(coro)
 
 

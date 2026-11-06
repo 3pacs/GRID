@@ -73,7 +73,7 @@ def get_all(
 
 
 @router.get("/production")
-async def get_production(
+def get_production(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return current production model for each layer."""
@@ -151,7 +151,7 @@ def get_one(
 
 
 @router.post("/{model_id}/transition")
-async def transition_model(
+def transition_model(
     model_id: int,
     body: ModelTransitionRequest,
     _token: str = Depends(require_auth),
@@ -172,7 +172,7 @@ async def transition_model(
 
 
 @router.post("/{model_id}/rollback")
-async def rollback_model(
+def rollback_model(
     model_id: int,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -287,7 +287,7 @@ def create_from_hypothesis(
 
 
 @router.get("/{model_id}/feature-importance")
-async def get_feature_importance(
+def get_feature_importance(
     model_id: int,
     _token: str = Depends(require_auth),
 ) -> dict:

@@ -78,7 +78,7 @@ def guard_engine():
             "CREATE TABLE resolved_series (feature_id INTEGER, obs_date DATE, value DOUBLE PRECISION)"
         ))
         conn.execute(text(
-            "CREATE TABLE wealth_flows (from_actor TEXT, to_entity TEXT, "
+            "CREATE TABLE wealth_flows (id SERIAL PRIMARY KEY, from_actor TEXT, to_entity TEXT, "
             "amount_estimate DOUBLE PRECISION, confidence TEXT, evidence TEXT, flow_date DATE)"
         ))
         conn.execute(text(

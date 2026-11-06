@@ -15,6 +15,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -106,6 +107,16 @@ async def receive_webhook(
         # TradingView sometimes sends plain text
         body = {"message": raw.decode("utf-8", errors="replace")}
 
+    if not isinstance(body, dict):
+        body = {"message": str(body)}
+
+    # The insert below is synchronous DB work: run it in the threadpool so a
+    # slow write never freezes the event loop (and every other request).
+    return await run_in_threadpool(_ingest_webhook_body, body)
+
+
+def _ingest_webhook_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one webhook payload and append it to raw_series."""
     ticker = body.get("ticker", body.get("symbol", "UNKNOWN"))
     action = body.get("action", body.get("order_action", "alert")).lower()
     price = body.get("price", body.get("close"))

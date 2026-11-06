@@ -229,8 +229,8 @@ def test_cache_hits_second_call_is_same_object():
             exp_mod._explain_cache.clear()
             # Use a ticker-shaped id so the 404 unknown-actor branch
             # doesn't fire (atype becomes "ticker" via the heuristic).
-            r1 = await get_actor_explain("aapl", "2026-04-05", 5, "testtoken")
-            r2 = await get_actor_explain("aapl", "2026-04-05", 5, "testtoken")
+            r1 = get_actor_explain("aapl", "2026-04-05", 5, "testtoken")
+            r2 = get_actor_explain("aapl", "2026-04-05", 5, "testtoken")
         finally:
             deps.get_db_engine = orig
         return r1, r2
@@ -251,7 +251,7 @@ def test_unknown_actor_returns_404_when_no_evidence():
         deps.get_db_engine = lambda: engine  # type: ignore[assignment]
         try:
             exp_mod._explain_cache.clear()
-            return await get_actor_explain(
+            return get_actor_explain(
                 "zzz_nonexistent_slug_12345", "2026-04-05", 5, "testtoken"
             )
         finally:

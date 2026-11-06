@@ -19,6 +19,7 @@ from api.lf_helpers import (
 )
 from intelligence.actors.provenance import SOURCE_SECTOR_MAP, stamp_actor_node
 from utils.ttl_cache import TTLCache
+from utils.single_flight import single_flight
 
 router = APIRouter(tags=["intelligence"])
 
@@ -572,6 +573,7 @@ def _load_community_list(engine: Any) -> tuple[list[dict[str, Any]], str]:
 
 
 @router.get("/analytics/communities")
+@single_flight
 def get_communities_endpoint(
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
     limit: int = Query(200, ge=1, le=2000, description="Max communities (curated scope)"),

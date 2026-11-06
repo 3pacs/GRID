@@ -306,7 +306,7 @@ class InjectActorRequest(BaseModel):
 
 
 @router.get("/actor/{actor_id}/neighborhood")
-async def get_neighborhood(
+def get_neighborhood(
     actor_id: str,
     depth: int = Query(3, ge=1, le=11),
     max_nodes: int = Query(2000, ge=10, le=10000),
@@ -331,7 +331,7 @@ async def get_neighborhood(
 
 
 @router.get("/actor/{actor_id}/path/{target_id}")
-async def get_shortest_path(
+def get_shortest_path(
     actor_id: str,
     target_id: str,
     engine=Depends(get_db_engine),
@@ -366,7 +366,7 @@ async def get_shortest_path(
 
 
 @router.get("/actor/{actor_id}/connections")
-async def get_actor_connections(
+def get_actor_connections(
     actor_id: str,
     engine=Depends(get_db_engine),
     _token: str = Depends(require_auth),
@@ -395,7 +395,7 @@ async def get_actor_connections(
 
 
 @router.get("/spider/stats")
-async def get_spider_stats(
+def get_spider_stats(
     engine=Depends(get_db_engine),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -428,7 +428,7 @@ async def get_spider_stats(
 
 
 @router.get("/spider/graph/health")
-async def graph_health(
+def graph_health(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Diagnostic — report load timestamp, age, and counts for the bridge."""
@@ -436,7 +436,7 @@ async def graph_health(
 
 
 @router.post("/spider/graph/reload")
-async def graph_reload(
+def graph_reload(
     engine=Depends(get_db_engine),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -450,7 +450,7 @@ async def graph_reload(
 
 
 @router.post("/spider/inject")
-async def inject_actor(
+def inject_actor(
     body: InjectActorRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

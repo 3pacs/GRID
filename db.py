@@ -8,11 +8,13 @@ All connection events are logged via loguru.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Generator
 
@@ -182,12 +184,56 @@ def _acquirer_group(thread_name: str) -> str:
 _MAX_REPORTED_OPEN_CHECKOUTS = 200
 
 
+# Frames from these paths are noise in a call-site summary.
+_CALL_SITE_SKIP = ("sqlalchemy", "site-packages", "/asyncio/", "/starlette/",
+                   "/fastapi/", "/anyio/", "/uvicorn/", "contextlib.py", "threading.py")
+_CALL_SITE_MAX_FRAMES = 6
+_DB_MODULE_FILE = os.path.abspath(__file__)
+
+
+def _on_event_loop_thread() -> bool:
+    """True when this thread is running an asyncio event loop.
+
+    A DB checkout here blocks every coroutine (in grid-api: every request).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return threading.current_thread().name.startswith("asyncio")
+    return True
+
+
+def _compact_call_site(max_frames: int = _CALL_SITE_MAX_FRAMES) -> str:
+    """The innermost application frames of the current stack, innermost last.
+
+    ``api/routers/x.py:58 get_actor_network > intelligence/actors/graph.py:223
+    build_actor_graph`` -- paths relative to the repo, library frames dropped.
+    """
+    repo_root = os.path.dirname(_DB_MODULE_FILE) + os.sep
+    frames: list[str] = []
+    for fs in traceback.extract_stack(limit=40)[:-1]:
+        filename = fs.filename
+        if filename == _DB_MODULE_FILE or any(m in filename for m in _CALL_SITE_SKIP):
+            continue
+        if filename.startswith(repo_root):
+            filename = filename[len(repo_root):]
+        frames.append(f"{filename}:{fs.lineno} {fs.name}")
+    return " > ".join(frames[-max_frames:]) or "?"
+
+
 def _record_checkout_open(connection_rec: object) -> None:
-    """Record that a connection was just checked out, by whichever thread did it."""
+    """Record that a connection was just checked out, by whichever thread did it.
+
+    On an event-loop thread the acquiring call site is captured too, so a
+    long hold there names the blocker instead of just "MainThread".
+    """
     thread_name = threading.current_thread().name
     expected = float(getattr(_expected_hold, "seconds", 0.0) or 0.0)
+    call_site = _compact_call_site() if _on_event_loop_thread() else None
     with _checkout_lock:
-        _open_checkouts[id(connection_rec)] = (thread_name, time.monotonic(), expected)
+        _open_checkouts[id(connection_rec)] = (
+            thread_name, time.monotonic(), expected, call_site,
+        )
 
 
 def _record_checkout_closed(connection_rec: object) -> str | None:
@@ -207,17 +253,31 @@ def _record_checkout_closed(connection_rec: object) -> str | None:
         return None
     acquired_by, opened_at = entry[0], entry[1]
     expected_s = entry[2] if len(entry) > 2 else 0.0
+    call_site = entry[3] if len(entry) > 3 else None
     lifetime_s = time.monotonic() - opened_at
     released_by = threading.current_thread().name
     if lifetime_s > _LIFETIME_WARN_SECONDS:
-        _report_long_hold(lifetime_s, acquired_by, released_by, expected_s)
+        _report_long_hold(lifetime_s, acquired_by, released_by, expected_s, call_site)
     return acquired_by
 
 
 def _report_long_hold(
     lifetime_s: float, acquired_by: str, released_by: str, expected_s: float,
+    call_site: str | None = None,
 ) -> None:
-    """Warn on a long hold: always when severe, else summarised per group."""
+    """Warn on a long hold: always when severe, else summarised per group.
+
+    ``call_site`` is set when the connection was acquired on an event-loop
+    thread: such a hold froze the loop for its whole duration, so it always
+    warns individually, with the acquiring stack.
+    """
+    if call_site:
+        log.warning(
+            "DB connection held {s:.1f}s ON THE EVENT LOOP — acquired_by={a}, "
+            "released_by={r}, call_site={c}",
+            s=lifetime_s, a=acquired_by, r=released_by, c=call_site,
+        )
+        return
     if expected_s and lifetime_s <= expected_s:
         log.debug(
             "DB connection held {s:.1f}s (declared batch hold <= {e:.0f}s) — acquired_by={a}",

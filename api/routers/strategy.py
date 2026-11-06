@@ -52,7 +52,7 @@ def _get_strategy_engine() -> Any:
 
 
 @router.get("/active", response_model=list[StrategyResponse])
-async def get_active_strategies(
+def get_active_strategies(
     _token: str = Depends(require_auth),
 ) -> list[dict[str, Any]]:
     """Return all active strategies (DB overrides + defaults for missing regimes)."""
@@ -61,7 +61,7 @@ async def get_active_strategies(
 
 
 @router.get("/for-regime/{regime_state}", response_model=Optional[StrategyResponse])
-async def get_strategy_for_regime(
+def get_strategy_for_regime(
     regime_state: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any] | None:
@@ -78,7 +78,7 @@ async def get_strategy_for_regime(
 
 
 @router.post("/assign", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)
-async def assign_strategy(
+def assign_strategy(
     body: StrategyAssignRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
