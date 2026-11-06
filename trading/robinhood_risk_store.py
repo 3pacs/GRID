@@ -330,6 +330,11 @@ def _json_or_none(value: Any) -> str | None:
     return json.dumps(value) if value is not None else None
 
 
+# Consumed keys whose order-log row could not be written (see log_order).
+_CONSUMED_FALLBACK: set[tuple[str, str]] = set()
+_CONSUMED_FALLBACK_LOCK = threading.Lock()
+
+
 class PostgresRiskStore:
     """Postgres-backed :class:`RiskStore`.
 
@@ -361,6 +366,9 @@ class PostgresRiskStore:
         return RiskState(venue, row[0], row[1], row[2], row[3])
 
     def is_duplicate(self, venue: str, client_order_id: str) -> bool:
+        with _CONSUMED_FALLBACK_LOCK:
+            if (venue, client_order_id) in _CONSUMED_FALLBACK:
+                return True
         with self.engine.connect() as conn:
             row = conn.execute(text(_IS_DUPLICATE_SQL), {
                 "venue": venue, "client_order_id": client_order_id,
@@ -410,6 +418,19 @@ class PostgresRiskStore:
             # already-decided order.
             log.warning("Robinhood order-log insert failed (venue={v}, key={k}): {e}",
                         v=venue, k=client_order_id, e=str(exc))
+            if fields.get("status") in _CONSUMED_STATUSES:
+                # The order-log row IS the idempotency marker. Without it the
+                # next attempt on this key would pass is_duplicate() and
+                # submit again, so remember the key in-process (stores are
+                # rebuilt per call, hence module-level) and say so loudly.
+                with _CONSUMED_FALLBACK_LOCK:
+                    _CONSUMED_FALLBACK.add((venue, client_order_id))
+                log.error(
+                    "Robinhood idempotency marker for a {s} order NOT persisted "
+                    "(venue={v}, key={k}); this process will refuse the key, other "
+                    "processes cannot see it",
+                    s=fields.get("status"), v=venue, k=client_order_id,
+                )
 
     def get_state(self, venue: str) -> RiskState | None:
         with self.engine.connect() as conn:

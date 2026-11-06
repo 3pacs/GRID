@@ -291,7 +291,8 @@ class TestAtomicOrderPrimitives:
                 outcomes.append(done)
                 if not done:
                     _t.sleep(0.05)
-                    store.log_order(venue, "k-1", status="submitted", ticker="BTC-USD", side="buy")
+                    store.log_order(venue, "k-1", status="submitted", ticker="BTC-USD", side="buy",
+                                    direction="LONG", size_usd=10.0, order_type="market")
 
         threads = [threading.Thread(target=attempt) for _ in range(6)]
         for t in threads:
@@ -299,3 +300,52 @@ class TestAtomicOrderPrimitives:
         for t in threads:
             t.join(10)
         assert outcomes.count(False) == 1 and outcomes.count(True) == 5
+
+
+    def test_open_position_submits_once_per_key_against_real_postgres(self, pg_engine, store, monkeypatch):
+        """The production path: RobinhoodCryptoTrader.open_position with a
+        PostgresRiskStore, the in-process venue lock disabled (as for two
+        separate processes) -- only the advisory-lock claim stands between
+        concurrent attempts and a double submit."""
+        import contextlib
+        import threading
+
+        pytest.importorskip("cryptography")
+        from tests.test_robinhood import FakeSession, TestConcurrentOrders, _trader
+        from trading import robinhood as rh
+
+        monkeypatch.setattr(rh, "_venue_lock", lambda venue: contextlib.nullcontext())
+        venue = _venue("open-race")
+        session = FakeSession(TestConcurrentOrders._slow_routes())
+        traders = [_trader(live=True, session=session, venue=venue, risk_store=PostgresRiskStore(pg_engine))
+                   for _ in range(6)]
+        barrier = threading.Barrier(6)
+        results: list[dict] = []
+
+        def go(t):
+            barrier.wait()
+            results.append(t.open_position("BTC", "LONG", 10, client_order_id="same-key"))
+
+        threads = [threading.Thread(target=go, args=(t,)) for t in traders]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(15)
+
+        posts = [c for c in session.calls if c["method"] == "POST" and c["path"] == rh.PATH_ORDERS]
+        assert len(posts) == 1, [r.get("status") for r in results]
+        assert sorted(r["status"] for r in results) == ["duplicate"] * 5 + ["submitted"]
+
+
+class TestLostMarkerFailsClosed:
+    def test_failed_order_log_insert_still_refuses_the_key(self, store, monkeypatch):
+        import trading.robinhood_risk_store as rrs
+
+        venue = _venue("lost-marker")
+        # NOT NULL violation (no direction/size/order_type) -> insert fails.
+        store.log_order(venue, "k-lost", status="submitted", ticker="BTC-USD", side="buy")
+        try:
+            assert store.is_duplicate(venue, "k-lost") is True
+            assert store.is_duplicate(venue, "k-other") is False
+        finally:
+            rrs._CONSUMED_FALLBACK.discard((venue, "k-lost"))
