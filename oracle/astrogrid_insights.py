@@ -245,8 +245,8 @@ def score_contract(engine: Any, *, symbols: list[str], evidence: dict[str, Any],
 def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
     """A bounded read of the published evidence ledger, not a generator on GET."""
     from config import settings
-    from store.astrogrid import _safe_schema_name
     from oracle import astrogrid_order_flow as flow
+    from store.astrogrid import _safe_schema_name
 
     now = now or datetime.now(timezone.utc)
     with engine.connect() as conn:
@@ -285,7 +285,10 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
             WHERE pr.model_version = :model AND ps.raw_payload->>'contract_version' = :contract
         """), {"model": MODEL_VERSION, "contract": CONTRACT_VERSION}).fetchone()
         flow_scores = conn.execute(text("""
-            SELECT count(*), count(*) FILTER (WHERE ps.verdict = 'hit'), max(ps.scored_at)
+            SELECT count(*), count(*) FILTER (WHERE ps.verdict = 'hit'), max(ps.scored_at),
+                   count(DISTINCT (pr.as_of_ts AT TIME ZONE 'UTC')::date), min(pr.as_of_ts),
+                   avg(ps.alpha_vs_benchmark),
+                   avg(ps.alpha_vs_benchmark - .0012 * (2 + ps.realized_return))
             FROM prediction_score ps JOIN prediction_run pr ON pr.id = ps.prediction_run_id
             WHERE pr.model_version=:model AND ps.raw_payload->>'contract_version'=:contract
         """), {"model": flow.MODEL_VERSION, "contract": flow.CONTRACT_VERSION}).fetchone()
@@ -314,12 +317,29 @@ def public_insights(engine: Any, now: datetime | None = None) -> dict[str, Any]:
                         "last_scored_at": flow_scores[2].isoformat() if flow_scores[2] else None,
                         "basis": "prospective 30m spot taker-flow forecasts only; fees excluded"}
     latest = flow.latest_receipts(engine, now)
+    # Research report is an immutable release artifact. Never mix archive replay
+    # outcomes into the prospective ledger or its performance counters.
+    import json
+    from pathlib import Path
+
+    report_path = Path(__file__).resolve().parents[1] / "astrogrid_web/research/spot-flow-edge-v1.json"
+    try:
+        edge_report = json.loads(report_path.read_text())
+    except (OSError, ValueError):
+        edge_report = None
+    live_costs = {"scored": flow_scores[0], "utc_dates": flow_scores[3],
+                  "first_issued_at": flow_scores[4].isoformat() if flow_scores[4] else None,
+                  "mean_gross_bps": float(flow_scores[5]) * 10000 if flow_scores[5] is not None else None,
+                  "mean_scenario_net_bps": float(flow_scores[6]) * 10000 if flow_scores[6] is not None else None,
+                  "basis": "Signal-close paper returns; 10bp fee + 2bp slippage per side; overlapping calls",
+                  "verdict": "INSUFFICIENT_INDEPENDENT_SAMPLE"}
     return {"model_version": MODEL_VERSION, "checked_at": now.isoformat(), "items": items,
             "performance": performance,
             "performance_by_contract": {
                 CONTRACT_VERSION: {"label": "24h actor-flow research · 1% threshold", **performance},
                 flow.CONTRACT_VERSION: {"label": "30m spot taker-flow research · 0.10% threshold", **flow_performance}},
-            "flow_diagnostics": {symbol: flow.qualification(latest.get(symbol), now) for symbol in SYMBOLS}}
+            "flow_diagnostics": {symbol: flow.qualification(latest.get(symbol), now) for symbol in SYMBOLS},
+            "edge_assessment": edge_report, "prospective_cost_diagnostic": live_costs}
 
 
 def answer_from_insights(feed: dict[str, Any], requested: list[str], *,

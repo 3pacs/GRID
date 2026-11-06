@@ -1,4 +1,4 @@
-import { insightsMarkup } from './lib/insights.js?v=20261105-spotflow2';
+import { insightsMarkup } from './lib/insights.js?v=20261105-edge1';
 import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
 import {
     getAstrogridDefaultApiBaseUrl,
