@@ -34,11 +34,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, existsSync, read
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveBrowserExecutable, sourceIdentity } from './harness_config.mjs';
+import { resolveBrowserExecutable, sourceIdentity, classifyApiFailures } from './harness_config.mjs';
 import { runSpyJourney } from './spy_journey.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..'); // this harness worktree root
+const PRELOAD_COVERAGE = JSON.parse(readFileSync(path.join(__dirname, 'fixture_api', 'preload_coverage.json'), 'utf8'));
+const OMITTED_PRELOAD_PATHS = new Set(PRELOAD_COVERAGE.map(row => row.path));
 
 // ── CLI args ──────────────────────────────────────────────────────────
 
@@ -326,8 +328,11 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
     // Fail closed on external requests, including links/providers accidentally
     // introduced by a view. Only the two runner-owned loopback servers are allowed.
     const blockedRequests = [];
+    let activeJourney = 'bootstrap';
+    const requestJourneys = new WeakMap();
     await page.setRequestInterception(true);
     page.on('request', request => {
+        requestJourneys.set(request, activeJourney);
         const url = new URL(request.url());
         if (['data:', 'blob:', 'about:'].includes(url.protocol) ||
             [PWA_BASE, FIXTURE_BASE].includes(url.origin)) request.continue();
@@ -352,8 +357,9 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
             }).catch(() => ({ url, error: 'body unavailable' })));
         }
         if (url.includes('/api/')) {
-            if (/\/gamma-watch\/state|\/derivatives\/(?:gex|vanna-charm|flow-timeline)\/SPY/.test(url)) {
-                fixtureResponses.push(res.json().then(body => ({ url, status: res.status(), body })).catch(() => ({ url, status: res.status(), error: 'body unavailable' })));
+            if (res.status() >= 300 || /\/gamma-watch\/state|\/derivatives\/(?:gex|vanna-charm|flow-timeline)\/SPY/.test(url)) {
+                const journey = requestJourneys.get(res.request()) || 'bootstrap';
+                fixtureResponses.push(res.json().then(body => ({ url, status: res.status(), journey, body })).catch(() => ({ url, status: res.status(), journey, error: 'body unavailable' })));
             }
             appendFileSync(networkLogPath, JSON.stringify({
                 ts: new Date().toISOString(), role, scenario,
@@ -371,6 +377,7 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
         (j) => !JOURNEY_FILTER || JOURNEY_FILTER.has(j.name)
     );
     for (const journey of journeyList) {
+        activeJourney = journey.name;
         const journeyErrorCountBefore = countJsonlLines(consoleLogPath, (l) => l.type === 'error');
         const apiCallsBefore = readJsonl(networkLogPath).length;
 
@@ -437,6 +444,11 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
 
     summary.served_modules = await Promise.all(moduleResponses);
     summary.fixture_responses = await Promise.all(fixtureResponses);
+    summary.api_failures = classifyApiFailures(summary.fixture_responses, scenario, OMITTED_PRELOAD_PATHS);
+    summary.unexpected_api_failures = summary.api_failures.filter(r => r.classification === 'unexpected_api_failure');
+    summary.preload_fixture_coverage = PRELOAD_COVERAGE;
+    summary.spy_network_gate_passed = !summary.journeys['spy-options'] ||
+        !summary.unexpected_api_failures.some(r => ['bootstrap', 'spy-options'].includes(r.journey));
     summary.transport_evidence_complete = !summary.journeys['spy-options'] ||
         summary.fixture_responses.some(r => r.url.endsWith('/gamma-watch/state') && r.body);
     summary.blocked_requests = blockedRequests;
@@ -530,7 +542,7 @@ async function main() {
     }, null, 2));
 
     console.log(`\nDone. Evidence written under ${OUT_ROOT}`);
-    if (results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.checks?.some(c => !c.passed)))) {
+    if (results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !r.spy_network_gate_passed || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.checks?.some(c => !c.passed)))) {
         process.exitCode = 1;
     }
 }

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { adaptGammaWatch } from '../../pwa/src/components/gammaWatchPublicAdapter.js';
-import { resolveBrowserExecutable, sourceIdentity } from './harness_config.mjs';
+import { resolveBrowserExecutable, sourceIdentity, classifyApiFailures } from './harness_config.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const now = 1793908800;
@@ -68,4 +68,20 @@ test('portable browser override fails closed and source manifest includes fixtur
         assert.match(identity.commit, /^[a-f0-9]{40}$/);
         assert.match(identity.files['tests/browser/fixture_api/spy.py'], /^[a-f0-9]{64}$/);
     } finally { rmSync(dir, { recursive: true }); }
+});
+
+test('network gate distinguishes declared fixture limits from unexpected API failures', () => {
+    const path = '/api/v1/signals';
+    const omission = { url: `http://127.0.0.1:5174${path}`, status: 501,
+        body: { error: true, path, code: 'fixture_preload_unavailable', fixture_scope: 'outside-spy-journey' } };
+    const classify = (r, scenario = 'healthy') => classifyApiFailures([r], scenario, new Set([path]))[0].classification;
+    assert.equal(classify(omission), 'fixture_preload_unavailable');
+    assert.equal(classify({ ...omission, status: 404 }), 'unexpected_api_failure');
+    assert.equal(classify({ ...omission, body: {} }), 'unexpected_api_failure');
+    assert.equal(classify({ ...omission, url: 'http://127.0.0.1:5174/api/v1/unknown' }), 'unexpected_api_failure');
+    const down = { url: 'http://127.0.0.1:5174/api/v1/gamma-watch/state', status: 503, body: { status: 'unavailable', data: null } };
+    assert.equal(classify(down, 'unavailable'), 'expected_gamma_collector_unavailable');
+    assert.equal(classify(down), 'unexpected_api_failure');
+    assert.equal(classify({ ...down, status: 502, body: { error: 'synthetic upstream transport failure' } }, 'error'), 'expected_gamma_transport_error');
+    assert.equal(classify({ ...down, status: 502, body: {} }, 'error'), 'unexpected_api_failure');
 });

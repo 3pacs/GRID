@@ -1,8 +1,10 @@
 # M1 local SPY Options / Gamma Watch evidence
 
 Prepared for issue #959 on main `5b16185b397cef60ef8a1827ec1fed9e268eecbd`
-(#964). Tests/evidence lane only; no product/persona code changes. Muse keeps
-J1 recovery and UI-G1 ownership. No M0 capture, production probe, collector,
+(#964). Tests/evidence lane only; no product/persona code changes. The finite
+Muse J1 recovery and granular UI successor slices were already accepted; their
+existing owners are retained (see [ownership reconciliation](MUSE-OWNERSHIP.json)).
+No M0 capture, production probe, collector,
 service, notification, release, or publication is performed by this harness.
 
 ## Reproduce
@@ -13,6 +15,7 @@ From the repository root:
 
 ```sh
 node --test tests/browser/spy_contract.test.mjs
+python -m unittest discover -s tests/browser/fixture_api -p test_preload_coverage.py
 node tests/browser/run_evidence.mjs --tree-label m1-spy --roles admin --journeys spy-options --scenarios healthy,partial,empty,unavailable,error --out /path/to/local/evidence
 ```
 
@@ -64,23 +67,51 @@ and PWA commits, dirty paths, per-file SHA256 manifests before/after, actual
 served Vite-module hashes, relevant synthetic API response bodies/statuses,
 assertion results, final URL, blocked external requests and console/network
 logs. Nonzero exit means a runner/assertion/readiness failure, changed source,
-missing Gamma transport receipt, or empty journey selection. A completed
+missing Gamma transport receipt, unexpected bootstrap/SPY API failure, or empty journey selection. A completed
 capture is evidence to review, not an independent reviewer verdict.
 
 The service worker is bypassed so API requests and payloads are observable;
 offline caching/PWA lifecycle are **not** qualified. All page requests outside
 the two local server origins are aborted (including the Google Fonts import).
-Chrome's own background networking is not a tested product surface. Unmodeled
-app-shell/preload endpoints can return 404; these remain in logs and must not
-be reported as product outages or a fully green application network trace.
+Chrome's own background networking is not a tested product surface.
+
+### Preload reconciliation (2026-11-06)
+
+All 14 earlier 404 paths are real source-defined GET routes. They originate in
+`OPERATOR_PRELOAD_API_PATHS` (`pwa/src/app.jsx:120`), called by
+`warmVisualizations` through `api.preload` after authentication. The standalone
+fixture server had no handlers for them. [The inventory](fixture_api/preload_coverage.json)
+binds every path to its handler, optional facade prefix, and main router registry.
+Tests inspect those actual source definitions without importing the backend,
+and check that every current preload is either modeled or explicitly omitted.
+This is source registration evidence, not a claim that optional routers loaded
+successfully in any running deployment.
+
+These unvisited surfaces remain **outside the SPY fixture contract**. The server
+now returns explicit HTTP **501**, with `fixture_preload_unavailable`, the path,
+source handler and reason. It does not fabricate successful data or silently
+cache an empty market snapshot. 501 is a harness-only coverage marker, not the
+status/schema promised by the real product route. Existing real fixture routes
+take precedence. Unknown paths and unsupported methods still return 404.
+
+Every failure body/status remains captured in `summary.json` and the network
+log; console errors are retained. Classification accepts only the exact
+allowlisted 501 marker and the scenario's intended Gamma 503/502 response.
+Unknown/malformed markers or any other bootstrap/SPY API failure fail the M1
+network gate. Other legacy journeys retain their separate, unqualified status.
+Thus a passing SPY journey still does **not** claim a fully green app network
+or coverage of the 14 omitted product surfaces.
 
 The ten September evidence directories are historical supporting runs with
 different source compositions. Their screenshots do not qualify this source.
 The obsolete `#/godview` path is replaced by `#/god-view`; the current
 `/api/v1/godview/latest` fixture deliberately supplies unavailable pillars.
 
-Current-owner availability, the original failing deployed URL, J1/UI-G1
-source adoption, source coverage/exclusions/OI vintage on the SPY inventory,
+Current-owner availability, the original failing deployed URL, any required Muse
+source-adoption mapping, source coverage/exclusions/OI vintage on the SPY inventory,
 actual served release/bundle identity, operator-run production evidence and
 independent acceptance remain controller/owner gates in #959. The existing
 [production runbook](PRODUCTION-PROBE-RUNBOOK.md) is unchanged and still applies.
+The existing [PR2 acceptance receipt](https://github.com/3pacs/muse/pull/2#issuecomment-6005299300)
+and MAIN Amendment 2 supersede the old PR3 status shorthand: do not reopen the
+completed finite J1/UI slices or assign a replacement hosted frontend owner.

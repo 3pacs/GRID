@@ -34,6 +34,7 @@ from urllib.parse import urlsplit, parse_qs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixtures as fx  # noqa: E402
 import spy  # noqa: E402
+import preload  # noqa: E402
 
 VALID_SCENARIOS = ("healthy", "partial", "empty", "unavailable", "error")
 
@@ -185,6 +186,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": True, "message": f"fixture handler failed: {exc}"}, status=500)
                     return
                 self._send_json(result)
+                return
+        if method == 'GET':
+            omitted_preload = preload.unavailable(path)
+            if omitted_preload is not None:
+                self._send_json(omitted_preload, status=501)
                 return
         self._send_json(
             {"error": True, "status": 404, "message": f"no fixture route for {method} {path}"},

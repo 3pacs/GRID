@@ -42,3 +42,20 @@ export function sourceIdentity(root, dirs) {
     return { commit: git('rev-parse', 'HEAD'), dirty: git('status', '--porcelain', '--', ...dirs),
         sha256: createHash('sha256').update(JSON.stringify(sorted)).digest('hex'), files: sorted };
 }
+
+// Classification is deliberately narrow: an unknown path/status/marker fails
+// the SPY network gate rather than disappearing behind a blanket error ignore.
+export function classifyApiFailures(responses, scenario, omittedPaths) {
+    return responses.filter(r => r.status >= 300).map(r => {
+        const pathname = new URL(r.url).pathname;
+        let classification = 'unexpected_api_failure';
+        if (r.status === 501 && omittedPaths.has(pathname) && r.body?.error === true &&
+            r.body?.code === 'fixture_preload_unavailable' && r.body?.path === pathname &&
+            r.body?.fixture_scope === 'outside-spy-journey') classification = 'fixture_preload_unavailable';
+        else if (pathname === '/api/v1/gamma-watch/state' && scenario === 'unavailable' &&
+            r.status === 503 && r.body?.status === 'unavailable' && r.body?.data === null) classification = 'expected_gamma_collector_unavailable';
+        else if (pathname === '/api/v1/gamma-watch/state' && scenario === 'error' &&
+            r.status === 502 && r.body?.error === 'synthetic upstream transport failure') classification = 'expected_gamma_transport_error';
+        return { ...r, classification };
+    });
+}
