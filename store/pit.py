@@ -655,7 +655,9 @@ PIT_WINDOW_SELECT_SQL = """
     ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date
 """
 
-_NO_RETRACTION_US = np.iinfo(np.int64).max
+# == np.iinfo(np.int64).max, written as a literal: tests exec this module with
+# its imports stripped, so module-level code must not need numpy.
+_NO_RETRACTION_US = 2**63 - 1
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
