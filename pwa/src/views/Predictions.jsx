@@ -4,6 +4,7 @@ import { shared, colors, tokens } from '../styles/shared.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { humanizeOr } from '../utils/text.js';
 
 // ── Styles ────────────────────────────────────────────────────────────────
 
@@ -661,7 +662,7 @@ export default function Predictions() {
                                     {i === 0 ? '\u{1F947}' : i === 1 ? '\u{1F948}' : i === 2 ? '\u{1F949}' : `#${i + 1}`}
                                 </span>
                                 <span style={s.modelName} title={m.description}>
-                                    {m.name.replace(/_/g, ' ')}
+                                    {humanizeOr(m.name, 'unnamed model')}
                                 </span>
                                 <div style={s.modelBarOuter}>
                                     <div style={s.modelBarInner(pct, barColor)} />
@@ -703,7 +704,7 @@ export default function Predictions() {
                             <option value="">All Models</option>
                             {models.map(m => (
                                 <option key={m.name} value={m.name}>
-                                    {m.name.replace(/_/g, ' ')}
+                                    {humanizeOr(m.name, 'unnamed model')}
                                 </option>
                             ))}
                         </select>

@@ -16,6 +16,7 @@ import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 import { formatDate, formatShortDate, formatDateTime } from '../utils/formatTime.js';
+import { routeTicker, textOr, upperOr, humanizeOr } from '../utils/text.js';
 
 // ── Security helper ──────────────────────────────────────────────────────────
 // Event fields (description, direction, actor, etc.) come from the database and
@@ -140,7 +141,7 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
     }, []);
 
     useEffect(() => {
-        const nextTicker = selectedTicker.trim().toUpperCase();
+        const nextTicker = routeTicker(selectedTicker);
         if (!nextTicker) return;
         setTicker(nextTicker);
         setTickerInput(nextTicker);
@@ -441,8 +442,8 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                     <span style="color:${colors.text};font-weight:600;font-size:11px">PRECEDING EVENT</span>
                                     <span style="color:${colors.textMuted};font-size:10px">score ${escapeHtml(scoreTxt)} (heuristic, not a probability)</span>
                                 </div>
-                                <div style="color:${colors.yellow};font-size:10px;margin-bottom:2px">EVENT: ${escapeHtml(link.cause_description)}</div>
-                                <div style="color:${colors.textDim};font-size:10px;margin-bottom:2px">THEN TRADE: ${escapeHtml(link.effect_description)} on ${escapeHtml(String(link.effect_date || '--'))}</div>
+                                <div style="color:${colors.yellow};font-size:10px;margin-bottom:2px">EVENT: ${escapeHtml(textOr(link.cause_description, 'description unknown'))}</div>
+                                <div style="color:${colors.textDim};font-size:10px;margin-bottom:2px">THEN TRADE: ${escapeHtml(textOr(link.effect_description, 'description unknown'))} on ${escapeHtml(String(link.effect_date || '--'))}</div>
                                 <div style="color:${colors.textMuted};font-size:9px">Event public ${escapeHtml(String(leadDays))}d before the trade | Link known ${escapeHtml(knownAt)} UTC | Timing, not proof of cause</div>
                             `;
                             const rect = event.target.getBoundingClientRect();
@@ -536,9 +537,9 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                     <span style="width:8px;height:8px;border-radius:2px;background:${fill};display:inline-block"></span>
                                     <span style="color:${colors.text};font-weight:600;font-size:11px">${escapeHtml(cfg.label)}</span>
                                     <span style="color:${colors.textMuted};font-size:10px">${escapeHtml(dateStr)}</span>
-                                    <span style="color:${dirColor(ev.direction)};font-size:10px;font-weight:600">${escapeHtml(ev.direction).toUpperCase()}</span>
+                                    <span style="color:${dirColor(ev.direction)};font-size:10px;font-weight:600">${escapeHtml(upperOr(ev.direction))}</span>
                                 </div>
-                                <div style="color:${colors.textDim};font-size:10px;line-height:1.4;max-width:400px">${escapeHtml(ev.description)}</div>
+                                <div style="color:${colors.textDim};font-size:10px;line-height:1.4;max-width:400px">${escapeHtml(textOr(ev.description, 'description unknown'))}</div>
                                 ${ev.amount_usd ? `<div style="color:${colors.yellow};font-size:10px;margin-top:2px">${formatUSD(ev.amount_usd)}</div>` : ''}
                                 ${ev.lead_time_to_next_move != null ? `<div style="color:${colors.textMuted};font-size:9px;margin-top:2px">Lead time: ${formatLeadTime(ev.lead_time_to_next_move)}</div>` : ''}
                             `;
@@ -1026,7 +1027,7 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                         {e.direction}
                                     </span>
                                     <span style={{ color: colors.textDim, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                        {e.description?.slice(0, 80)}
+                                        {textOr(e.description, 'description unknown').slice(0, 80)}
                                     </span>
                                     {e.amount_usd && (
                                         <span style={{ color: colors.yellow, flexShrink: 0 }}>{formatUSD(e.amount_usd)}</span>
@@ -1067,7 +1068,7 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                             fontSize: '11px', color: dirColor(selectedEvent.direction),
                                             fontWeight: 600, fontFamily: MONO,
                                         }}>
-                                            {selectedEvent.direction?.toUpperCase()}
+                                            {upperOr(selectedEvent.direction)}
                                         </span>
                                     </div>
                                     <div style={{
@@ -1136,7 +1137,7 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                 padding: '8px 0',
                                 borderTop: `1px solid ${colors.borderSubtle}`,
                             }}>
-                                {selectedEvent.description}
+                                {textOr(selectedEvent.description, 'description unknown')}
                             </div>
 
                             {/* Causal connection hint */}
@@ -1146,7 +1147,7 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                     fontFamily: MONO, padding: '6px 0',
                                     borderTop: `1px solid ${colors.borderSubtle}`,
                                 }}>
-                                    This {selectedEvent.event_type.replace('_', ' ')} ({selectedEvent.direction}) preceded the next significant price move by {formatLeadTime(selectedEvent.lead_time_to_next_move)}.
+                                    This {humanizeOr(selectedEvent.event_type, 'event of unknown type')} ({textOr(selectedEvent.direction, 'direction unknown')}) preceded the next significant price move by {formatLeadTime(selectedEvent.lead_time_to_next_move)}.
                                 </div>
                             )}
 
@@ -1182,7 +1183,7 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                                                 {re.direction}
                                             </span>
                                             <span style={{ color: colors.textDim, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                {re.description?.slice(0, 60)}
+                                                {textOr(re.description, 'description unknown').slice(0, 60)}
                                             </span>
                                         </div>
                                     ))}

@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { formatDateTime } from '../utils/formatTime.js';
+import { apiErrorMessage, isApiError, withRequestTimeout } from '../utils/apiResult.js';
+import { upperOr, humanizeOr } from '../utils/text.js';
 
 // ── Styles ─────────────────────────────────────────────────────────────
 
@@ -411,9 +413,9 @@ export default function Thesis() {
         setLoading(true);
         setError(null);
         try {
-            const result = await api.getThesis();
-            if (result.error) {
-                setError(result.message || 'Failed to load thesis');
+            const result = await withRequestTimeout(api.getThesis(), { label: 'Unified thesis' });
+            if (isApiError(result)) {
+                setError(apiErrorMessage(result, 'Failed to load thesis'));
             } else {
                 setData(result);
             }
@@ -434,11 +436,19 @@ export default function Thesis() {
             <div style={s.container}>
                 <div style={s.header}>Thesis</div>
                 <div style={s.errorBox}>{error}</div>
+                <button onClick={fetchThesis} style={{ ...shared.buttonSmall, marginTop: '12px' }}>Retry</button>
             </div>
         );
     }
 
-    if (!data) return null;
+    if (!data) {
+        return (
+            <div style={s.container}>
+                <div style={s.header}>Thesis</div>
+                <div style={s.errorBox}>Unified thesis returned no data.</div>
+            </div>
+        );
+    }
 
     const dir = (data.overall_direction || 'NEUTRAL').toUpperCase();
 
@@ -553,7 +563,7 @@ export default function Thesis() {
                             <div key={i} style={s.agreementGroup}>
                                 <span style={s.agreementDir(a.direction)}>
                                     {a.direction === 'bullish' ? '\u2191' : a.direction === 'bearish' ? '\u2193' : '\u2194'}
-                                    {' '}{a.direction.toUpperCase()}
+                                    {' '}{upperOr(a.direction)}
                                 </span>
                                 {a.members.map((m, j) => (
                                     <span key={j} style={s.memberChip}>
@@ -586,11 +596,11 @@ export default function Thesis() {
                         {data.contradictions.map((c, i) => (
                             <div key={i} style={s.contradictionRow}>
                                 <span style={s.driverPill(true)}>
-                                    {'\u2191'} {c.bullish.replace(/_/g, ' ')}
+                                    {'\u2191'} {humanizeOr(c.bullish)}
                                 </span>
                                 <span style={s.vsLabel}>VS</span>
                                 <span style={s.driverPill(false)}>
-                                    {'\u2193'} {c.bearish.replace(/_/g, ' ')}
+                                    {'\u2193'} {humanizeOr(c.bearish)}
                                 </span>
                             </div>
                         ))}

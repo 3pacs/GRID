@@ -5,6 +5,8 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { apiErrorMessage, isApiError, optionalApi, requireApi, withRequestTimeout } from '../utils/apiResult.js';
+import { textOr } from '../utils/text.js';
 
 // Energy level color coding
 const energyColor = (level) => {
@@ -74,7 +76,7 @@ function ForceArrow({ item, maxEnergy }) {
                 {arrow}
             </span>
             <span style={{ flex: 1, fontSize: '12px', color: colors.text, fontFamily: colors.mono }}>
-                {item.feature.replace('crucix_', '').replace('gdelt_', '')}
+                {textOr(item.feature, 'feature unknown').replace('crucix_', '').replace('gdelt_', '')}
             </span>
             <div style={{ width: '120px' }}>
                 <div style={{ background: colors.bg, borderRadius: '3px', height: '6px', overflow: 'hidden' }}>
@@ -321,7 +323,7 @@ function NewsEnergyTab({ data, loading, error, onLoad }) {
                         value={src.total_energy}
                         max={maxEnergy}
                         level={src.energy_level}
-                        label={src.feature.replace('crucix_', '').replace('gdelt_', '')}
+                        label={textOr(src.feature, 'feature unknown').replace('crucix_', '').replace('gdelt_', '')}
                     />
                 ))}
                 {(!energy_by_source || energy_by_source.length === 0) && (
@@ -365,6 +367,7 @@ export default function Physics() {
     const [verification, setVerification] = useState(null);
     const [verifying, setVerifying] = useState(false);
     const [conventions, setConventions] = useState(null);
+    const [conventionsError, setConventionsError] = useState(null);
     const [featureInput, setFeatureInput] = useState('');
     const [featureAnalysis, setFeatureAnalysis] = useState(null);
     const [analysing, setAnalysing] = useState(false);
@@ -373,8 +376,8 @@ export default function Physics() {
     const runVerify = async () => {
         setVerifying(true);
         try {
-            const result = await api.runPhysicsVerification();
-            setVerification(result);
+            const result = await withRequestTimeout(api.runPhysicsVerification(), { label: 'Physics verification', ms: 120000 });
+            setVerification(isApiError(result) ? { error: apiErrorMessage(result, 'Physics verification failed') } : result);
         } catch (e) {
             setVerification({ error: e.message });
         }
@@ -382,10 +385,14 @@ export default function Physics() {
     };
 
     const loadConventions = async () => {
+        setConventionsError(null);
         try {
-            const result = await api.getConventions();
-            setConventions(result.conventions || []);
-        } catch (e) { console.warn('[GRID] Physics:', e.message); }
+            const result = await requireApi(api.getConventions(), { label: 'Conventions' });
+            setConventions(Array.isArray(result?.conventions) ? result.conventions : []);
+        } catch (e) {
+            // Previously only logged, leaving "Loading..." on screen forever.
+            setConventionsError(apiErrorMessage(e, 'Conventions unavailable'));
+        }
     };
 
     const analyseFeature = async () => {
@@ -394,22 +401,25 @@ export default function Physics() {
         setFeatureAnalysis(null);
         try {
             const [ou, hurst, energy] = await Promise.all([
-                api.getOUParams(featureInput).catch(() => null),
-                api.getHurst(featureInput).catch(() => null),
-                api.getEnergy(featureInput).catch(() => null),
+                optionalApi(api.getOUParams(featureInput), { label: 'OU parameters' }),
+                optionalApi(api.getHurst(featureInput), { label: 'Hurst exponent' }),
+                optionalApi(api.getEnergy(featureInput), { label: 'Energy' }),
             ]);
-            setFeatureAnalysis({ ou, hurst, energy, feature: featureInput });
+            setFeatureAnalysis({
+                ou: ou.value, hurst: hurst.value, energy: energy.value, feature: featureInput,
+                errors: [ou.error, hurst.error, energy.error].filter(Boolean),
+            });
         } catch (e) { console.warn('[GRID] Physics:', e.message); }
         setAnalysing(false);
     };
 
     const {
         data: dashboard, loading: dashboardLoading, error: dashboardError, refetch: loadDashboard,
-    } = useAsyncData(() => api.getPhysicsDashboard(), { fallback: null, skip: true });
+    } = useAsyncData(() => requireApi(api.getPhysicsDashboard(), { label: 'Physics dashboard' }), { fallback: null, skip: true });
 
     const {
         data: newsEnergy, loading: newsEnergyLoading, error: newsEnergyError, refetch: loadNewsEnergy,
-    } = useAsyncData(() => api.getNewsEnergy(30), { fallback: null, skip: true });
+    } = useAsyncData(() => requireApi(api.getNewsEnergy(30), { label: 'News energy' }), { fallback: null, skip: true });
 
     return (
         <div style={shared.container}>
@@ -616,7 +626,13 @@ export default function Physics() {
                                 )}
                             </div>
 
-                            {!featureAnalysis.hurst && !featureAnalysis.ou && !featureAnalysis.energy && (
+                            {featureAnalysis.errors?.length > 0 && (
+                                <div style={{ ...shared.error, marginTop: '8px' }}>
+                                    Unavailable: {featureAnalysis.errors.join(' | ')}
+                                </div>
+                            )}
+
+                            {!featureAnalysis.hurst && !featureAnalysis.ou && !featureAnalysis.energy && !featureAnalysis.errors?.length && (
                                 <div style={{ color: colors.textMuted, fontSize: '13px', textAlign: 'center', padding: '20px' }}>
                                     No data found for this feature. Check the feature name.
                                 </div>
@@ -628,7 +644,9 @@ export default function Physics() {
 
             {activeTab === 'conventions' && (
                 <div style={shared.card}>
-                    {!conventions ? (
+                    {conventionsError ? (
+                        <ErrorState error={conventionsError} onRetry={loadConventions} title="Conventions unavailable" />
+                    ) : !conventions ? (
                         <div style={{ color: colors.textMuted, fontSize: '13px' }}>Loading...</div>
                     ) : conventions.length === 0 ? (
                         <div style={{ color: colors.textMuted, fontSize: '13px' }}>No conventions found</div>

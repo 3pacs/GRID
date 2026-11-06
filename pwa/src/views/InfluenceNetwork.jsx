@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { routeTicker, textOr } from '../utils/text.js';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -404,7 +405,7 @@ function NodeDetail({ node, influenceData, onClose }) {
       </div>
 
       <div style={{ fontFamily: SANS, fontSize: 12, color: COLORS.textDim, marginBottom: 12 }}>
-        {node.label} ({node.type})
+        {textOr(node.label, 'unnamed node')} ({textOr(node.type, 'type unknown')})
       </div>
 
       {influenceData && (
@@ -554,7 +555,7 @@ export default function InfluenceNetwork({ selectedTicker = '' }) {
   }, []);
 
   useEffect(() => {
-    const targetTicker = selectedTicker.trim().toUpperCase();
+    const targetTicker = routeTicker(selectedTicker);
     if (!targetTicker || !graphData.nodes?.length) return;
     const targetNode = graphData.nodes.find(
       (node) => node.type === 'company' && String(node.ticker || '').toUpperCase() === targetTicker

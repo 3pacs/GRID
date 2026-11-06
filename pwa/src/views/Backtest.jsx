@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { formatFullDateTime } from '../utils/formatTime.js';
+import { textOr } from '../utils/text.js';
 
 const REGIME_COLORS = {
     GROWTH: '#22C55E', NEUTRAL: '#F59E0B', FRAGILE: '#F97316', CRISIS: '#EF4444',
@@ -369,7 +370,7 @@ export default function Backtest() {
                                             {p.asset}
                                         </span>
                                         <span style={{
-                                            ...shared.badge(p.direction.includes('UP') ? '#1A7A4A' : p.direction.includes('DOWN') ? '#8B1F1F' : '#5A3A00'),
+                                            ...shared.badge(textOr(p.direction, '').includes('UP') ? '#1A7A4A' : textOr(p.direction, '').includes('DOWN') ? '#8B1F1F' : '#5A3A00'),
                                             marginLeft: '8px',
                                         }}>
                                             {p.direction}

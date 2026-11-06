@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { api } from '../api.js';
 import { normalizeNavigableRouteId } from '../routes.js';
+import { upperOr } from '../utils/text.js';
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -450,7 +451,7 @@ export default function CommandPalette({ open, onClose, onNavigate }) {
                     {grouped.map(group => (
                         <div key={group.type}>
                             <div style={s.groupLabel}>
-                                {TYPE_LABELS[group.type] || group.type.toUpperCase()}
+                                {TYPE_LABELS[group.type] || upperOr(group.type)}
                             </div>
                             {group.items.map((item, itemIdx) => {
                                 const globalIdx = flatIdx++;

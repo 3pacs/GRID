@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import { routes } from '../routes.js';
 import { colors, shared, tokens } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
+import { upperOr } from '../utils/text.js';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const STATUS_ORDER = ['active', 'arming', 'watch', 'background'];
@@ -1071,7 +1072,7 @@ function OpportunityCard({ item, routeLabel, routeLabels, isMobile, onNavigate }
                     lineHeight: 1.5,
                     overflowWrap: 'anywhere',
                 }}>
-                    <div>{item.data_mode.toUpperCase()} | {item.horizon} | {(item.source_tags?.length ? item.source_tags.join(' | ') : 'Public data')}</div>
+                    <div>{upperOr(item.data_mode, 'MODE UNKNOWN')} | {item.horizon} | {(item.source_tags?.length ? item.source_tags.join(' | ') : 'Public data')}</div>
                     {item.supporting_source_types?.length ? (
                         <div style={{ marginTop: '4px' }}>
                             Sources: {item.supporting_source_types.join(' | ')}

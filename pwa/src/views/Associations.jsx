@@ -14,6 +14,8 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { optionalApi, requireApi } from '../utils/apiResult.js';
+import { asText } from '../utils/text.js';
 
 // ── Local push notifications for extreme findings ───────────────────
 async function notifyIfExtreme(cards) {
@@ -138,8 +140,8 @@ function interpretFeature(card) {
         why += `Most correlated with ${top.name} (${top.corr > 0 ? '+' : ''}${top.corr.toFixed(2)}) — moves in one tend to follow the other. `;
     }
 
-    if (card.regime_behavior) {
-        why += `Regime behavior: ${card.regime_behavior.trim()}.`;
+    if (asText(card.regime_behavior)) {
+        why += `Regime behavior: ${asText(card.regime_behavior)}.`;
     }
 
     return why;
@@ -656,13 +658,21 @@ export default function Associations({ onNavigate }) {
     const [filter, setFilter] = useState('all');
     const { isMobile } = useDevice();
 
+    const [partialSources, setPartialSources] = useState([]);
+
     const { loading, error, refetch: loadAll } = useAsyncData(async () => {
-        const [anomalies, correlations, regimeFeatures, smartHeatmap] = await Promise.all([
-            api.getAnomalies(),
-            api.getCorrelationMatrix().catch(() => null),
-            api.getRegimeFeatures().catch(() => null),
-            api.getSmartHeatmap(null, true).catch(() => null),
+        // api.js resolves failures as markers, so the old `.catch(() => null)`
+        // never fired: a failed anomaly feed rendered as "No insights", and
+        // missing secondary inputs silently thinned the feed. Anomalies are
+        // required (error state); the other inputs are optional but reported.
+        const [anomalies, ...optional] = await Promise.all([
+            requireApi(api.getAnomalies(), { label: 'Anomalies' }),
+            optionalApi(api.getCorrelationMatrix(), { label: 'Correlation matrix' }),
+            optionalApi(api.getRegimeFeatures(), { label: 'Regime features' }),
+            optionalApi(api.getSmartHeatmap(null, true), { label: 'Smart heatmap' }),
         ]);
+        setPartialSources(optional.filter(r => r.error).map(r => r.error));
+        const [correlations, regimeFeatures, smartHeatmap] = optional.map(r => r.value);
         const builtCards = buildCards(anomalies, correlations, regimeFeatures, smartHeatmap);
         setCards(builtCards);
         notifyIfExtreme(builtCards);
@@ -740,6 +750,16 @@ export default function Associations({ onNavigate }) {
             {/* Error */}
             {error && (
                 <ErrorState error={error} onRetry={loadAll} title="Associations data unavailable" />
+            )}
+
+            {/* Partial inputs: say which ones are missing instead of a thinner feed */}
+            {!loading && !error && partialSources.length > 0 && (
+                <div role="status" style={{
+                    ...shared.card, borderLeft: `3px solid ${colors.yellow}`,
+                    fontSize: tokens.fontSize.sm, color: colors.textMuted,
+                }}>
+                    Partial feed — unavailable inputs: {partialSources.join(' | ')}
+                </div>
             )}
 
             {/* Feed */}

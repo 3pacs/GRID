@@ -24,6 +24,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRe
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import useFullScreen from '../hooks/useFullScreen.js';
+import { lowerText } from '../utils/text.js';
 
 // ── Constants ──
 const TIER_COLORS = {
@@ -440,9 +441,9 @@ export default function ActorUniverse() {
         if (categoryFilter !== 'all') nodes = nodes.filter(n => n.category === categoryFilter);
         if (q) {
             nodes = nodes.filter(n =>
-                n.label.toLowerCase().includes(q)
+                lowerText(n.label).includes(q)
                 || (n.title || '').toLowerCase().includes(q)
-                || n.id.toLowerCase().includes(q)
+                || lowerText(n.id).includes(q)
             );
         }
 
@@ -985,7 +986,7 @@ export default function ActorUniverse() {
 
         const nodes = nodeDataRef.current;
         const found = nodes.find(n =>
-            n.label.toLowerCase().includes(q)
+            lowerText(n.label).includes(q)
             || (n.title || '').toLowerCase().includes(q)
         );
         if (!found) return;

@@ -9,6 +9,7 @@ import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 import { formatDate } from '../utils/formatTime.js';
+import { upperOr } from '../utils/text.js';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -419,7 +420,7 @@ function RiskTreemap({ data, selectedCategory, onSelect }) {
             .attr('y', d => d.y1 - 12)
             .text(d => {
                 const cellW = d.x1 - d.x0;
-                return cellW > 80 ? d.data.level.toUpperCase() : '';
+                return cellW > 80 ? upperOr(d.data.level, 'UNAVAILABLE') : '';
             })
             .attr('font-size', '9px')
             .attr('font-weight', 700)

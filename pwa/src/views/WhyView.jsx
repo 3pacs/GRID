@@ -25,6 +25,7 @@ import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { formatShortDate } from '../utils/formatTime.js';
+import { humanizeOr } from '../utils/text.js';
 
 // ── Security helper ───────────────────────────────────────────────────────────
 // Event fields (actor, description) come from the database and are interpolated
@@ -1027,7 +1028,7 @@ export default function WhyView({ onNavigate }) {
                                             background: SOURCE_TYPE_COLORS[fb.source] || '#6B7280',
                                         }} />
                                         <span style={{ fontSize: '10px', color: colors.textDim, textTransform: 'capitalize' }}>
-                                            {fb.source.replace(/_/g, ' ')}
+                                            {humanizeOr(fb.source, 'source unknown')}
                                         </span>
                                         <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>
                                             {formatUSD(fb.amount)}

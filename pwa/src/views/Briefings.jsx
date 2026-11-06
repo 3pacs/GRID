@@ -4,6 +4,8 @@ import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { formatFullDateTime, formatRelative } from '../utils/formatTime.js';
+import { apiErrorMessage, isApiError, requireApi } from '../utils/apiResult.js';
+import { textOr, upperOr } from '../utils/text.js';
 
 /**
  * Sanitize HTML produced by the markdown renderer before injecting via
@@ -220,6 +222,74 @@ function formatTimestamp(ts) {
     return { formatted: formatFullDateTime(d), relative: formatRelative(d) };
 }
 
+/**
+ * Long briefings are paged instead of dumped: the live view put ~504k
+ * characters into the DOM at once. Nothing is dropped; every page is
+ * reachable and the total size is shown.
+ */
+export const BRIEFING_PAGE_CHARS = 20000;
+
+/** Split text into pages of at most `pageChars`, breaking at line ends. */
+export function paginateText(text, pageChars = BRIEFING_PAGE_CHARS) {
+    if (typeof text !== 'string' || text === '') return [];
+    if (text.length <= pageChars) return [text];
+    // Lossless: pages.join('\n') === text (blank lines included).
+    const pages = [];
+    let current = null; // null = no line on this page yet ('' is a blank line)
+    for (const rawLine of text.split('\n')) {
+        let line = rawLine;
+        // A single over-long line is hard-split so no page exceeds the budget.
+        while (line.length > pageChars) {
+            if (current !== null) { pages.push(current); current = null; }
+            pages.push(line.slice(0, pageChars));
+            line = line.slice(pageChars);
+        }
+        if (current === null) {
+            current = line;
+        } else if (current.length + 1 + line.length > pageChars) {
+            pages.push(current);
+            current = line;
+        } else {
+            current = `${current}\n${line}`;
+        }
+    }
+    if (current !== null) pages.push(current);
+    return pages;
+}
+
+/** Markdown content, paged when longer than one page. */
+function PagedContent({ content }) {
+    const pages = useMemo(() => paginateText(content), [content]);
+    const [page, setPage] = useState(0);
+    useEffect(() => { setPage(0); }, [content]);
+    if (pages.length <= 1) return <RenderedContent content={content} />;
+    const current = Math.min(page, pages.length - 1);
+    return (
+        <div>
+            <div style={localStyles.pager} data-testid="briefing-pager">
+                <button
+                    style={{ ...shared.buttonSmall, ...(current === 0 ? shared.buttonDisabled : {}) }}
+                    onClick={() => setPage(current - 1)}
+                    disabled={current === 0}
+                >
+                    Prev
+                </button>
+                <span style={localStyles.pagerLabel}>
+                    Page {current + 1} of {pages.length} · {content.length.toLocaleString('en-US')} characters
+                </span>
+                <button
+                    style={{ ...shared.buttonSmall, ...(current === pages.length - 1 ? shared.buttonDisabled : {}) }}
+                    onClick={() => setPage(current + 1)}
+                    disabled={current === pages.length - 1}
+                >
+                    Next
+                </button>
+            </div>
+            <RenderedContent content={pages[current]} />
+        </div>
+    );
+}
+
 /** Rendered markdown content block. */
 function RenderedContent({ content }) {
     const html = useMemo(() => sanitizeHtml(parseMarkdown(content)), [content]);
@@ -267,6 +337,10 @@ export default function Briefings() {
     const [askResult, setAskResult] = useState(null);
     const [asking, setAsking] = useState(false);
     const [error, setError] = useState(null);
+    const [briefingLoading, setBriefingLoading] = useState(true);
+    const [briefingError, setBriefingError] = useState(null);
+    const [listLoading, setListLoading] = useState(true);
+    const [listError, setListError] = useState(null);
 
     useEffect(() => {
         api.getOllamaStatus().then(setOllamaStatus).catch(() => {});
@@ -274,18 +348,31 @@ export default function Briefings() {
         loadBriefingList();
     }, []);
 
+    // Failures used to read as "No hourly briefing available" / "No saved
+    // briefings", and so did the time before the first response arrived.
     const loadBriefing = async (type) => {
+        setBriefingLoading(true);
+        setBriefingError(null);
         try {
-            const result = await api.getLatestBriefing(type);
+            const result = await requireApi(api.getLatestBriefing(type), { label: `Latest ${type} briefing` });
             setBriefing(result);
-        } catch { setBriefing(null); }
+        } catch (e) {
+            setBriefing(null);
+            setBriefingError(e.message);
+        }
+        setBriefingLoading(false);
     };
 
     const loadBriefingList = async () => {
+        setListLoading(true);
+        setListError(null);
         try {
-            const result = await api.listBriefings('', 30);
-            setBriefingList(result.briefings || []);
-        } catch (e) { console.warn('[GRID] Briefings:', e.message); }
+            const result = await requireApi(api.listBriefings('', 30), { label: 'Briefing archive' });
+            setBriefingList(Array.isArray(result?.briefings) ? result.briefings : []);
+        } catch (e) {
+            setListError(e.message);
+        }
+        setListLoading(false);
     };
 
     const generate = async (type) => {
@@ -293,8 +380,13 @@ export default function Briefings() {
         setError(null);
         try {
             const result = await api.generateBriefing(type);
-            setBriefing(result);
-            loadBriefingList();
+            if (isApiError(result)) {
+                setError(apiErrorMessage(result, 'Generation failed'));
+            } else {
+                setBriefing(result);
+                setBriefingError(null);
+                loadBriefingList();
+            }
         } catch (e) {
             setError(e.message || 'Generation failed');
         }
@@ -307,10 +399,15 @@ export default function Briefings() {
     };
 
     const readSaved = async (filename) => {
+        setBriefingLoading(true);
+        setBriefingError(null);
         try {
-            const result = await api.readBriefing(filename);
-            setBriefing({ content: result.content, type: filename.split('_')[0] });
-        } catch (e) { console.warn('[GRID] Briefings:', e.message); }
+            const result = await requireApi(api.readBriefing(filename), { label: `Briefing ${filename}` });
+            setBriefing({ content: result.content, type: textOr(filename, '').split('_')[0] || null });
+        } catch (e) {
+            setBriefingError(e.message);
+        }
+        setBriefingLoading(false);
     };
 
     const askQuestion = async () => {
@@ -327,9 +424,10 @@ export default function Briefings() {
 
     const available = ollamaStatus?.available;
     const ts = formatTimestamp(briefing?.timestamp);
+    const isLong = typeof briefing?.content === 'string' && briefing.content.length > BRIEFING_PAGE_CHARS;
     const sections = useMemo(
-        () => briefing?.content ? detectSections(briefing.content) : null,
-        [briefing?.content]
+        () => (briefing?.content && !isLong) ? detectSections(briefing.content) : null,
+        [briefing?.content, isLong]
     );
 
     return (
@@ -387,12 +485,24 @@ export default function Briefings() {
             </div>
 
             {/* Current Briefing */}
-            {briefing?.content ? (
+            {briefingLoading && !briefing?.content ? (
+                <div style={{
+                    ...shared.card, textAlign: 'center', color: colors.textMuted,
+                    padding: '40px', fontSize: '13px',
+                }}>
+                    Loading {activeTab} briefing...
+                </div>
+            ) : briefingError ? (
+                <div style={shared.card}>
+                    <div style={shared.error}>Briefing unavailable: {briefingError}</div>
+                    <button style={{ ...shared.buttonSmall, marginTop: '8px' }} onClick={() => loadBriefing(activeTab)}>Retry</button>
+                </div>
+            ) : briefing?.content ? (
                 <div style={shared.card}>
                     {/* Briefing header with type badge and timestamp */}
                     <div style={localStyles.briefingHeader}>
                         <span style={shared.badge('#1A2840')}>
-                            {briefing.type?.toUpperCase()}
+                            {upperOr(briefing.type)}
                         </span>
                         {ts && (
                             <div style={localStyles.timestampWrap}>
@@ -412,7 +522,7 @@ export default function Briefings() {
                             ))}
                         </div>
                     ) : (
-                        <RenderedContent content={briefing.content} />
+                        <PagedContent content={briefing.content} />
                     )}
                 </div>
             ) : (
@@ -427,7 +537,14 @@ export default function Briefings() {
             {/* Saved Briefings Archive */}
             <div style={shared.sectionTitle}>Archive</div>
             <div style={shared.card}>
-                {briefingList.length === 0 ? (
+                {listLoading && briefingList.length === 0 ? (
+                    <div style={{ color: colors.textMuted, fontSize: '13px' }}>Loading saved briefings...</div>
+                ) : listError ? (
+                    <div>
+                        <div style={shared.error}>Briefing archive unavailable: {listError}</div>
+                        <button style={{ ...shared.buttonSmall, marginTop: '8px' }} onClick={loadBriefingList}>Retry</button>
+                    </div>
+                ) : briefingList.length === 0 ? (
                     <div style={{ color: colors.textMuted, fontSize: '13px' }}>No saved briefings</div>
                 ) : (
                     briefingList.map((b, i) => (
@@ -442,14 +559,14 @@ export default function Briefings() {
                                         : b.type === 'daily' ? '#1A6EBF'
                                         : '#1A2840'
                                 )}>
-                                    {b.type?.toUpperCase()}
+                                    {upperOr(b.type)}
                                 </span>
                                 <span style={{ fontSize: '12px', color: colors.textMuted, marginLeft: '10px' }}>
                                     {b.filename}
                                 </span>
                             </div>
                             <span style={{ fontSize: '11px', color: colors.textMuted }}>
-                                {(b.size_bytes / 1024).toFixed(1)}kb
+                                {Number.isFinite(b.size_bytes) ? `${(b.size_bytes / 1024).toFixed(1)}kb` : 'size unknown'}
                             </span>
                         </div>
                     ))
@@ -480,7 +597,7 @@ export default function Briefings() {
                 {askResult?.response && (
                     <div style={localStyles.askResultWrap}>
                         <div style={localStyles.askResultLabel}>GRID Analyst</div>
-                        <RenderedContent content={askResult.response} />
+                        <PagedContent content={askResult.response} />
                     </div>
                 )}
             </div>
@@ -545,6 +662,18 @@ const localStyles = {
         fontWeight: 600,
         color: '#E8F0F8',
         fontFamily: colors.sans,
+    },
+    pager: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: '8px',
+        marginBottom: '8px',
+    },
+    pagerLabel: {
+        fontSize: '11px',
+        color: colors.textMuted,
+        fontFamily: colors.mono,
     },
     askResultWrap: {
         marginTop: '12px',
