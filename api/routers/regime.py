@@ -78,7 +78,7 @@ def get_weights(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.put("/weights")
-async def update_weights(
+def update_weights(
     req: WeightUpdateRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -98,7 +98,7 @@ async def update_weights(
 
 
 @router.post("/simulate")
-async def simulate_weights(
+def simulate_weights(
     req: WeightUpdateRequest,
     _token: str = Depends(require_auth),
 ) -> dict:

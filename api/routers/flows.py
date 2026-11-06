@@ -1047,12 +1047,12 @@ def get_sector_detail(
 
 
 @router.get("/sector/{sector_name}")
-async def get_sector_dive(
+def get_sector_dive(
     sector_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Alias for sector detail — used by the SectorDive frontend view."""
-    return await get_sector_detail(sector_name, _token)
+    return get_sector_detail(sector_name, _token)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2144,7 +2144,7 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
 
 
 @router.get("/gaps")
-async def get_gaps(_token: str = Depends(require_auth)) -> dict[str, Any]:
+def get_gaps(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Return data gap analysis across the sector map."""
     from analysis.research_agent import analyze_gaps
     engine = get_db_engine()
@@ -2152,7 +2152,7 @@ async def get_gaps(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.post("/research")
-async def run_research(_token: str = Depends(require_auth)) -> dict[str, Any]:
+def run_research(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Run a full research sweep — gaps, hypotheses, LLM actor analysis."""
     from analysis.research_agent import run_full_research
     engine = get_db_engine()
@@ -2160,7 +2160,7 @@ async def run_research(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.post("/fill-gaps")
-async def fill_gaps(_token: str = Depends(require_auth)) -> dict[str, Any]:
+def fill_gaps(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Fill missing stock data from the sector map."""
     from analysis.research_agent import fill_missing_stocks
     engine = get_db_engine()
@@ -2168,7 +2168,7 @@ async def fill_gaps(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.post("/test-hypotheses")
-async def test_hypotheses(_token: str = Depends(require_auth)) -> dict[str, Any]:
+def test_hypotheses(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Run backtesting on all CANDIDATE hypotheses.
 
     Tests lead/lag relationships using lagged cross-correlation
@@ -2214,7 +2214,7 @@ def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.get("/company/{ticker}")
-async def get_company_drill(
+def get_company_drill(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2225,14 +2225,13 @@ async def get_company_drill(
     """
     from analysis.money_flow import get_company_drill as _get_company_drill
 
-    from starlette.concurrency import run_in_threadpool
-
+    # Plain ``def``: FastAPI runs this in the threadpool, so both the drill
+    # query and the blocking provenance probes stay off the event loop.
     engine = get_db_engine()
     result = _get_company_drill(engine, ticker)
     if not isinstance(result, dict):
         return result
-    # The probes are blocking (<= 5 s each): keep them off the event loop.
-    return await run_in_threadpool(_with_provenance, result, _PROV_COMPANY)
+    return _with_provenance(result, _PROV_COMPANY)
 
 
 # ── Aggregated dollar flow endpoint ─────────────────────────────────────
@@ -2282,7 +2281,7 @@ async def get_aggregated_flows(
 
 
 @router.get("/momentum/{ticker}")
-async def get_flow_momentum(
+def get_flow_momentum(
     ticker: str,
     days: int = 30,
     _token: str = Depends(require_auth),
@@ -2694,7 +2693,7 @@ def _simple_kmeans(data, k=3, max_iter=50):
 # ══════════════════════════════════════════════════════════════════
 
 @router.post("/generate-image/custom")
-async def generate_custom_image(
+def generate_custom_image(
     prompt: str,
     style: str = "dark",
     model_tier: str = "fast",
@@ -2722,7 +2721,7 @@ async def generate_custom_image(
 
 
 @router.post("/generate-image/{image_type}")
-async def generate_flow_image(
+def generate_flow_image(
     image_type: str,
     style: str = "dark",
     model_tier: str = "fast",
@@ -2790,7 +2789,7 @@ async def generate_flow_image(
 # ── CDS / Credit Risk ─────────────────────────────────────────────────
 
 @router.get("/cds")
-async def get_cds_dashboard(_token: str = Depends(require_auth)) -> dict:
+def get_cds_dashboard(_token: str = Depends(require_auth)) -> dict:
     """CDS-equivalent credit risk dashboard from FRED OAS + ETF spreads."""
     from intelligence.cds_tracker import build_cds_dashboard, cds_to_dict
 
@@ -2800,7 +2799,7 @@ async def get_cds_dashboard(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/cds/history/{series_key}")
-async def get_cds_history(
+def get_cds_history(
     series_key: str,
     days: int = 365,
     _token: str = Depends(require_auth),
@@ -2829,7 +2828,7 @@ async def get_cds_history(
 
 
 @router.get("/briefing")
-async def get_briefing(
+def get_briefing(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return the latest saved audio briefing. Read-only.
@@ -2890,7 +2889,7 @@ async def generate_briefing(
 
 
 @router.get("/briefing/audio")
-async def get_briefing_audio(_token: str = Depends(require_auth)):
+def get_briefing_audio(_token: str = Depends(require_auth)):
     """Stream the latest briefing audio file.
 
     Returns the most recent MP3 briefing as a streaming response.
@@ -2919,7 +2918,7 @@ async def get_briefing_audio(_token: str = Depends(require_auth)):
 
 
 @router.get("/briefing/list")
-async def list_briefings(_token: str = Depends(require_auth)) -> dict:
+def list_briefings(_token: str = Depends(require_auth)) -> dict:
     """List all saved audio briefings, newest first.
 
     Returns filename, date, size, and whether a script transcript exists.
@@ -2930,7 +2929,7 @@ async def list_briefings(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/briefing/audio/{filename}")
-async def get_briefing_audio_by_name(
+def get_briefing_audio_by_name(
     filename: str,
     _token: str = Depends(require_auth),
 ):
@@ -2957,7 +2956,7 @@ async def get_briefing_audio_by_name(
 
 
 @router.get("/briefing/detail/{filename}")
-async def get_briefing_detail(
+def get_briefing_detail(
     filename: str,
     _token: str = Depends(require_auth),
 ) -> dict:

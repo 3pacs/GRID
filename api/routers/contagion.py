@@ -213,7 +213,7 @@ def _persist_prediction(
 
 
 @router.get("/simulate")
-async def simulate(
+def simulate(
     shock_node: str = Query(..., min_length=1, max_length=80),
     shock_type: str = Query("price_increase"),
     magnitude: float = Query(0.30, ge=-1.0, le=5.0),
@@ -452,7 +452,7 @@ def backtest(
 # ─── Sub-feature 3: Scenarios endpoint ──────────────────────────────────────
 
 @router.get("/scenarios")
-async def get_scenarios(
+def get_scenarios(
     _token: str = Depends(require_auth),
 ) -> list[dict[str, Any]]:
     """Return the curated preset contagion scenario catalog.
@@ -537,7 +537,7 @@ def _run_scenario_sim(engine: Any, scenario: dict[str, Any]) -> dict[str, Any]:
 
 
 @sector_router.get("/{sector_name}/contagion-matrix")
-async def get_contagion_matrix(
+def get_contagion_matrix(
     sector_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

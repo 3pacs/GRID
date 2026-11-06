@@ -407,7 +407,6 @@ class TestAPIEndpoints:
 
     def test_actor_analytics_endpoint(self):
         """GET /actor/{id}/analytics should return analytics dict."""
-        import asyncio
         from api.routers.intelligence_actors import get_actor_analytics_endpoint
 
         mock_analytics = {
@@ -424,16 +423,13 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_actor_analytics", return_value=mock_analytics):
-                result = asyncio.new_event_loop().run_until_complete(
-                    get_actor_analytics_endpoint("test-1", _token="test")
-                )
+                result = get_actor_analytics_endpoint("test-1", _token="test")
 
         assert "analytics" in result
         assert result["analytics"]["pagerank"] == 0.05
 
     def test_top_actors_endpoint(self):
         """GET /analytics/top should return actors list."""
-        import asyncio
         from api.routers.intelligence_actors import get_top_actors_endpoint
 
         mock_actors = [
@@ -442,16 +438,13 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_top_actors", return_value=mock_actors):
-                result = asyncio.new_event_loop().run_until_complete(
-                    get_top_actors_endpoint(metric="pagerank", limit=20, _token="test")
-                )
+                result = get_top_actors_endpoint(metric="pagerank", limit=20, _token="test")
 
         assert "actors" in result
         assert result["count"] == 1
 
     def test_communities_endpoint(self):
         """GET /analytics/communities should return community list."""
-        import asyncio
         from api.routers import intelligence_actors as router
         from api.routers.intelligence_actors import get_communities_endpoint
 
@@ -464,16 +457,13 @@ class TestAPIEndpoints:
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("api.routers.intelligence_actors._read_community_summary", return_value=None):
                 with patch("store.graph.get_community_list", return_value=mock_communities):
-                    result = asyncio.new_event_loop().run_until_complete(
-                        get_communities_endpoint(_token="test")
-                    )
+                    result = get_communities_endpoint(_token="test")
 
         assert "communities" in result
         assert result["count"] == 1
 
     def test_community_members_endpoint(self):
         """GET /analytics/community/{id} should return members list."""
-        import asyncio
         from api.routers.intelligence_actors import get_community_members_endpoint
 
         mock_members = [
@@ -484,9 +474,7 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_community_members", return_value=mock_members):
-                result = asyncio.new_event_loop().run_until_complete(
-                    get_community_members_endpoint(community_id=0, limit=50, _token="test")
-                )
+                result = get_community_members_endpoint(community_id=0, limit=50, _token="test")
 
         assert "members" in result
         assert result["community_id"] == 0
@@ -494,14 +482,11 @@ class TestAPIEndpoints:
 
     def test_top_actors_invalid_metric(self):
         """GET /analytics/top with invalid metric should return error."""
-        import asyncio
         from api.routers.intelligence_actors import get_top_actors_endpoint
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_top_actors", side_effect=ValueError("Invalid metric 'bad'")):
-                result = asyncio.new_event_loop().run_until_complete(
-                    get_top_actors_endpoint(metric="bad", limit=20, _token="test")
-                )
+                result = get_top_actors_endpoint(metric="bad", limit=20, _token="test")
 
         assert result["count"] == 0
         assert "error" in result

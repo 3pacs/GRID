@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import types
 from datetime import date, datetime, timedelta, timezone
@@ -81,7 +80,7 @@ def test_missing_spot_returns_unavailable_without_false_narrative(
         }),
     )
 
-    result = asyncio.run(derivatives.get_flow_narrative())
+    result = derivatives.get_flow_narrative()
 
     assert result["available"] is False
     assert result["status"] == "unavailable"
@@ -114,7 +113,7 @@ def test_measured_spot_still_builds_inline_narrative(
         }),
     )
 
-    result = asyncio.run(derivatives.get_flow_narrative())
+    result = derivatives.get_flow_narrative()
 
     assert "SPY prior verified close was $767.12" in result["content"]
     assert "LONG GAMMA" in result["content"]
@@ -132,7 +131,7 @@ def test_legacy_error_profile_without_availability_fields_stays_unavailable(
         lambda: _GEX({"error": "No options chain for SPY", "ticker": "SPY"}),
     )
 
-    result = asyncio.run(derivatives.get_flow_narrative())
+    result = derivatives.get_flow_narrative()
 
     assert result["content"] is None
     assert result["status"] == "unavailable"
@@ -162,7 +161,7 @@ def test_unverified_saved_briefing_cannot_bypass_missing_spot(
         lambda: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
     )
 
-    result = asyncio.run(derivatives.get_flow_narrative())
+    result = derivatives.get_flow_narrative()
 
     assert result["content"] is None
     assert result["status"] == "unavailable"
@@ -189,7 +188,7 @@ def test_source_guarded_saved_briefing_is_retained(
         lambda: pytest.fail("source-guarded saved briefing should not recompute GEX"),
     )
 
-    assert asyncio.run(derivatives.get_flow_narrative()) is saved
+    assert derivatives.get_flow_narrative() is saved
 
 
 def test_stale_saved_briefing_falls_back_to_current_unavailable_state(
@@ -211,7 +210,7 @@ def test_stale_saved_briefing_falls_back_to_current_unavailable_state(
         lambda: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
     )
 
-    result = asyncio.run(derivatives.get_flow_narrative())
+    result = derivatives.get_flow_narrative()
 
     assert result["content"] is None
     assert result["status"] == "unavailable"

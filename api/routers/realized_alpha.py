@@ -22,7 +22,7 @@ router = APIRouter(prefix="/api/v1/alpha", tags=["realized_alpha"])
 
 
 @router.get("/realized")
-async def get_realized_alpha(
+def get_realized_alpha(
     source: str | None = Query(
         default=None, pattern=r"^(paper_trades|oracle_predictions)$",
     ),

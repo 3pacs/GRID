@@ -232,7 +232,7 @@ def _load_saved_recommendations(
 
 
 @router.get("/recommendations")
-async def get_recommendations(
+def get_recommendations(
     ticker: str | None = Query(None, description="Filter to a single ticker"),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -257,7 +257,7 @@ async def get_recommendations(
 
 
 @router.post("/recommendations/refresh")
-async def refresh_recommendations(
+def refresh_recommendations(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Force a fresh recommendation scan, bypassing any cache."""
@@ -415,7 +415,7 @@ def get_options_signals(
 
 
 @router.get("/scan")
-async def scan_mispricing(
+def scan_mispricing(
     min_score: float = Query(5.0, ge=0, le=10, description="Minimum score"),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -456,7 +456,7 @@ async def scan_mispricing(
 
 
 @router.get("/100x")
-async def get_100x_opportunities(
+def get_100x_opportunities(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return only 100x+ flagged mispricing opportunities."""

@@ -21,7 +21,6 @@ tests run without a live PostgreSQL.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
@@ -422,7 +421,7 @@ def test_scenario_catalog_shape_and_ids():
 
 
 def test_get_scenarios_endpoint_returns_catalog_copy():
-    scns = asyncio.run(get_scenarios(_token="test"))
+    scns = get_scenarios(_token="test")
     assert len(scns) == len(SCENARIO_CATALOG)
     assert {s["id"] for s in scns} == {s["id"] for s in SCENARIO_CATALOG}
     # Mutating the response must not mutate the module constant
@@ -472,9 +471,7 @@ def test_contagion_matrix_shape_and_cache(monkeypatch):
         lambda name: ["hsy", "mdlz", "ko"] if name == "Consumer Staples" else [],
     )
 
-    result = asyncio.run(
-        get_contagion_matrix("Consumer Staples", _token="test")
-    )
+    result = get_contagion_matrix("Consumer Staples", _token="test")
 
     assert result["sector"] == "Consumer Staples"
     assert result["tickers"] == ["hsy", "mdlz", "ko"]
@@ -521,13 +518,9 @@ def test_contagion_matrix_cache_hit_path(monkeypatch):
         lambda name: ["hsy"] if name == "Consumer Staples" else [],
     )
 
-    first = asyncio.run(
-        get_contagion_matrix("Consumer Staples", _token="test")
-    )
+    first = get_contagion_matrix("Consumer Staples", _token="test")
     engine_calls_after_first = calls["n"]
-    second = asyncio.run(
-        get_contagion_matrix("Consumer Staples", _token="test")
-    )
+    second = get_contagion_matrix("Consumer Staples", _token="test")
     # Matrix cache short-circuits — no further engine lookups required.
     assert calls["n"] == engine_calls_after_first
     assert first["tickers"] == second["tickers"]
@@ -549,7 +542,7 @@ def test_contagion_matrix_unknown_sector_returns_empty(monkeypatch):
     )
     monkeypatch.setattr(contagion_router, "_sector_tickers", lambda name: [])
 
-    result = asyncio.run(get_contagion_matrix("Nonexistent", _token="test"))
+    result = get_contagion_matrix("Nonexistent", _token="test")
     assert result["tickers"] == []
     assert result["cells"] == []
 
@@ -580,8 +573,7 @@ def test_simulate_persist_false_skips_prediction_write(monkeypatch):
     )
 
     with persist_mock as mocked:
-        result = asyncio.run(
-            simulate(
+        result = simulate(
                 "cocoa_beans",
                 "price_increase",
                 0.5,
@@ -590,7 +582,6 @@ def test_simulate_persist_false_skips_prediction_write(monkeypatch):
                 persist=False,
                 _token="test",
             )
-        )
 
     mocked.assert_not_called()
     assert "prediction_id" not in result

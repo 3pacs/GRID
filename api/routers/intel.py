@@ -812,7 +812,7 @@ def intel_ticker(
 # ── 5. Cross-Reference Lie Detector ──────────────────────────────────────
 
 @router.get("/cross-reference/{indicator}")
-async def intel_cross_reference(
+def intel_cross_reference(
     indicator: str = Path(..., description="Indicator name (e.g. 'cpi', 'jobs', 'gdp')"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -883,7 +883,7 @@ async def intel_cross_reference(
 # ── 6. Deep Dive — Forensic Price Decomposition ─────────────────────────
 
 @router.get("/deep-dive/{ticker}")
-async def intel_deep_dive(
+def intel_deep_dive(
     ticker: str = Path(..., description="Ticker symbol"),
     days: int = Query(90, ge=7, le=365, description="Lookback window"),
     _token: str = Depends(require_auth),

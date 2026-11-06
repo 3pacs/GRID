@@ -9,6 +9,7 @@ from typing import Any
 
 import psycopg2
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from loguru import logger as log
 from sqlalchemy import bindparam, text
@@ -333,7 +334,7 @@ def _excel_response(content: bytes, filename: str) -> Response:
 
 
 @router.get("/profiles")
-async def list_profiles() -> dict[str, Any]:
+def list_profiles() -> dict[str, Any]:
     """Return configured investor profiles."""
     return {
         "status": "ok",
@@ -354,7 +355,7 @@ async def list_profiles() -> dict[str, Any]:
 
 
 @router.get("/weekly")
-async def weekly_ten_year_portfolio(
+def weekly_ten_year_portfolio(
     capital: float = Query(default=1_000_000.0, ge=10_000.0, le=100_000_000.0),
     years: int = Query(default=10, ge=3, le=20),
     profile: str | None = Query(default=None),
@@ -401,10 +402,17 @@ async def analyze_private_workbook(
     """Analyze a workbook in memory and return only sanitized planning metadata."""
     try:
         content = await _read_private_upload(file)
-        scan = scan_workbook_bytes(file.filename or "uploaded-workbook", content)
-        history = _load_price_history(engine, years=years)
-        recommendation = build_weekly_recommendation(history, capital=capital, years=years)
-        return build_sanitized_master_plan(scan, recommendation)
+        filename = file.filename or "uploaded-workbook"
+
+        def _analyze() -> dict[str, Any]:
+            scan = scan_workbook_bytes(filename, content)
+            history = _load_price_history(engine, years=years)
+            recommendation = build_weekly_recommendation(history, capital=capital, years=years)
+            return build_sanitized_master_plan(scan, recommendation)
+
+        # Workbook parsing + price-history reads are blocking: keep them off
+        # the event loop.
+        return await run_in_threadpool(_analyze)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -415,7 +423,7 @@ async def analyze_private_workbook(
 
 
 @router.get("/export.xlsx", dependencies=[Depends(require_auth)])
-async def export_current_model_workbook(
+def export_current_model_workbook(
     capital: float = Query(default=1_000_000.0, ge=10_000.0, le=100_000_000.0),
     years: int = Query(default=10, ge=3, le=20),
     engine: Engine = Depends(get_db_engine),
@@ -488,11 +496,16 @@ async def export_private_workbook_plan(
     """Analyze a private workbook in memory and export a sanitized Excel plan."""
     try:
         content = await _read_private_upload(file)
-        scan = scan_workbook_bytes(file.filename or "uploaded-workbook", content)
-        history = _load_price_history(engine, years=years)
-        recommendation = build_weekly_recommendation(history, capital=capital, years=years)
-        plan = build_sanitized_master_plan(scan, recommendation)
-        export = build_plan_export_workbook(plan, recommendation)
+        filename = file.filename or "uploaded-workbook"
+
+        def _export() -> bytes:
+            scan = scan_workbook_bytes(filename, content)
+            history = _load_price_history(engine, years=years)
+            recommendation = build_weekly_recommendation(history, capital=capital, years=years)
+            plan = build_sanitized_master_plan(scan, recommendation)
+            return build_plan_export_workbook(plan, recommendation)
+
+        export = await run_in_threadpool(_export)
         return _excel_response(export, "sanitized-dad-method-master-plan.xlsx")
     except HTTPException:
         raise

@@ -260,7 +260,7 @@ def _search_sources(engine, q: str) -> list[dict]:
 
 
 @router.get("")
-async def search_everything(
+def search_everything(
     q: str = Query(..., min_length=1, max_length=200, description="Search query"),
     _user: dict = Depends(require_auth),
     engine=Depends(get_db_engine),

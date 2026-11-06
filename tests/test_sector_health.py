@@ -302,7 +302,6 @@ def test_snapshot_all_sectors_counts_upsert_failures(monkeypatch):
 
 
 def test_endpoint_does_not_cache_unavailable(monkeypatch):
-    import asyncio
 
     from api.routers import sector_health as router_mod
 
@@ -315,7 +314,7 @@ def test_endpoint_does_not_cache_unavailable(monkeypatch):
         "api.routers.sector_health.get_db_engine", lambda: MagicMock(),
     )
 
-    result = asyncio.run(router_mod.get_sector_health("Technology", "test-token"))
+    result = router_mod.get_sector_health("Technology", "test-token")
     assert result["status"] == "unavailable"
     assert result["score"] is None
     assert router_mod._CACHE.get("Technology") is None
@@ -383,7 +382,6 @@ def test_narrative_template_mentions_score_and_trend_and_levers():
 def test_endpoint_shape_and_unknown_sector(monkeypatch):
     """Endpoint returns the documented dict for known sectors and
     raises 404 for unknown ones."""
-    import asyncio
 
     from fastapi import HTTPException
 
@@ -415,7 +413,7 @@ def test_endpoint_shape_and_unknown_sector(monkeypatch):
         "api.routers.sector_health.get_db_engine", lambda: MagicMock(),
     )
 
-    result = asyncio.run(router_mod.get_sector_health("Technology", "test-token"))
+    result = router_mod.get_sector_health("Technology", "test-token")
     assert result["sector"] == "Technology"
     assert 0.0 <= result["score"] <= 100.0
     assert result["trend_30d"] in {"improving", "stable", "deteriorating"}
@@ -424,7 +422,5 @@ def test_endpoint_shape_and_unknown_sector(monkeypatch):
     assert "as_of" in result
 
     with pytest.raises(HTTPException) as excinfo:
-        asyncio.run(
-            router_mod.get_sector_health("Atlantis", "test-token"),
-        )
+        router_mod.get_sector_health("Atlantis", "test-token")
     assert excinfo.value.status_code == 404

@@ -166,7 +166,7 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
 
 
 @router.post("/predictions")
-async def create_prediction(
+def create_prediction(
     req: AstrogridPredictionRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -288,7 +288,7 @@ async def create_prediction(
 
 
 @router.post("/guru/ask")
-async def ask_guru(
+def ask_guru(
     req: AstrogridGuruRequest,
     request: Request,
 ) -> dict[str, Any]:
@@ -308,7 +308,7 @@ async def ask_guru(
 
 
 @router.get("/insights")
-async def get_insights() -> dict[str, Any]:
+def get_insights() -> dict[str, Any]:
     """Public evidence cards, identical to the standalone AstroGrid surface."""
     from oracle.astrogrid_insights import public_insights
 
@@ -316,7 +316,7 @@ async def get_insights() -> dict[str, Any]:
 
 
 @router.get("/predictions/latest")
-async def get_latest_predictions(
+def get_latest_predictions(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
@@ -328,7 +328,7 @@ async def get_latest_predictions(
 
 
 @router.get("/postmortems")
-async def get_postmortems(
+def get_postmortems(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
@@ -340,7 +340,7 @@ async def get_postmortems(
 
 
 @router.post("/predictions/score")
-async def score_predictions(
+def score_predictions(
     req: AstrogridScoreRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -358,7 +358,7 @@ async def score_predictions(
 
 
 @router.get("/predictions/scoreboard")
-async def get_prediction_scoreboard(
+def get_prediction_scoreboard(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     store = get_astrogrid_store()
@@ -369,7 +369,7 @@ async def get_prediction_scoreboard(
 
 
 @router.post("/backtest/run")
-async def run_backtest(
+def run_backtest(
     req: AstrogridBacktestRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -388,7 +388,7 @@ async def run_backtest(
 
 
 @router.get("/backtest/summary")
-async def get_backtest_summary(
+def get_backtest_summary(
     limit: int = Query(default=12, ge=1, le=100),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -396,7 +396,7 @@ async def get_backtest_summary(
 
 
 @router.get("/backtest/results")
-async def get_backtest_results(
+def get_backtest_results(
     strategy_variant: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     _token: str = Depends(require_auth),
@@ -411,14 +411,14 @@ async def get_backtest_results(
 
 
 @router.get("/weights/current")
-async def get_current_weights(
+def get_current_weights(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     return get_astrogrid_store().ensure_active_weight_version()
 
 
 @router.post("/review/generate")
-async def generate_review_run(
+def generate_review_run(
     req: AstrogridReviewRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -430,7 +430,7 @@ async def generate_review_run(
 
 
 @router.post("/learning-loop/run")
-async def run_learning_loop(
+def run_learning_loop(
     req: AstrogridLearningLoopRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -449,7 +449,7 @@ async def run_learning_loop(
 
 
 @router.get("/review/latest")
-async def get_latest_review(
+def get_latest_review(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     review = get_astrogrid_store().get_latest_review()
@@ -459,7 +459,7 @@ async def get_latest_review(
 
 
 @router.get("/weights/proposals")
-async def get_weight_proposals(
+def get_weight_proposals(
     status: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     _token: str = Depends(require_auth),
@@ -473,7 +473,7 @@ async def get_weight_proposals(
 
 
 @router.post("/weights/proposals/{weight_proposal_id}/approve")
-async def approve_weight_proposal(
+def approve_weight_proposal(
     weight_proposal_id: str,
     req: AstrogridWeightDecisionRequest,
     _token: str = Depends(require_auth),
@@ -489,7 +489,7 @@ async def approve_weight_proposal(
 
 
 @router.post("/weights/proposals/{weight_proposal_id}/reject")
-async def reject_weight_proposal(
+def reject_weight_proposal(
     weight_proposal_id: str,
     req: AstrogridWeightDecisionRequest,
     _token: str = Depends(require_auth),
@@ -505,7 +505,7 @@ async def reject_weight_proposal(
 
 
 @router.get("/predictions/{prediction_id}")
-async def get_prediction_detail(
+def get_prediction_detail(
     prediction_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

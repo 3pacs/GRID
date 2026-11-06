@@ -69,14 +69,13 @@ def _raise_sentinel(*_args, **_kwargs):
 
 
 def _call(handler, **kwargs):
-    """Invoke an async router handler synchronously."""
-    return asyncio.get_event_loop().run_until_complete(
-        handler(**kwargs)
-    ) if not asyncio.iscoroutine(handler) else asyncio.get_event_loop().run_until_complete(handler)
+    """Invoke a router handler (sync or async) synchronously."""
+    result = handler if asyncio.iscoroutine(handler) else handler(**kwargs)
+    return asyncio.new_event_loop().run_until_complete(result) if asyncio.iscoroutine(result) else result
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro) if asyncio.iscoroutine(coro) else coro
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ Key entry points:
 
 from __future__ import annotations
 
+import threading
 import time as _time
 from collections import defaultdict
 from datetime import date, timedelta
@@ -62,6 +63,10 @@ _REGIONAL_PREFIXES: list[str] = [
 ]
 
 
+_SOVEREIGN_PREFIXES_UPPER: tuple[str, ...] = tuple(p.upper() for p in _SOVEREIGN_PREFIXES)
+_REGIONAL_PREFIXES_UPPER: tuple[str, ...] = tuple(p.upper() for p in _REGIONAL_PREFIXES)
+
+
 def _classify_actor_tier(source_type: str, actor_name: str | None) -> str:
     """Classify an actor into sovereign/regional/institutional/individual tier.
 
@@ -75,17 +80,16 @@ def _classify_actor_tier(source_type: str, actor_name: str | None) -> str:
     Returns:
         One of 'sovereign', 'regional', 'institutional', 'individual'.
     """
-    name = (actor_name or "").strip()
+    name = (actor_name or "").strip().upper()
 
-    # Check sovereign actors first (overrides source_type)
-    for prefix in _SOVEREIGN_PREFIXES:
-        if name.upper().startswith(prefix.upper()):
-            return "sovereign"
+    # Check sovereign actors first (overrides source_type). str.startswith
+    # with a tuple: one C call instead of ~20 upper()+startswith per row.
+    if name.startswith(_SOVEREIGN_PREFIXES_UPPER):
+        return "sovereign"
 
     # Check regional actors
-    for prefix in _REGIONAL_PREFIXES:
-        if name.upper().startswith(prefix.upper()):
-            return "regional"
+    if name.startswith(_REGIONAL_PREFIXES_UPPER):
+        return "regional"
 
     return _SOURCE_TIER_MAP.get(source_type, "individual")
 
@@ -122,8 +126,13 @@ def _get_sector(ticker: str | None) -> str:
 
 # ── SQL helpers ──────────────────────────────────────────────────────────
 
-_flow_cache: dict[str, Any] = {"data": None, "ts": 0.0, "key": ""}
+# One entry per lookback window: get_full_aggregation reads days=30 and
+# compute_flow_velocity days=60, so a single-slot cache evicted on every
+# alternation and re-fetched ~70K rows each time.
+_flow_cache: dict[int, tuple[float, list[dict]]] = {}
+_flow_cache_lock = threading.Lock()
 _FLOW_CACHE_TTL = 60.0  # seconds
+_FLOW_CACHE_MAX_WINDOWS = 8
 
 
 def _fetch_flows(engine: Engine, days: int) -> list[dict]:
@@ -134,16 +143,17 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
         days: Lookback window in days.
 
     Returns:
-        List of flow dicts with all columns including evidence JSONB.
+        List of flow dicts (source_type, actor_name, ticker, amount_usd,
+        direction, confidence, flow_date, evidence). ``evidence`` is always
+        ``{}``: no aggregation reads it, and decoding the JSONB column for
+        every row was ~2.7 s of a ~8 s /flows/aggregated build (143K
+        json.loads on grid-svr, 2026-11-06).
     """
-    cache_key = str(days)
     now = _time.time()
-    if (
-        _flow_cache["data"] is not None
-        and _flow_cache["key"] == cache_key
-        and (now - _flow_cache["ts"]) < _FLOW_CACHE_TTL
-    ):
-        return _flow_cache["data"]
+    with _flow_cache_lock:
+        hit = _flow_cache.get(days)
+    if hit is not None and (now - hit[0]) < _FLOW_CACHE_TTL:
+        return hit[1]
 
     cutoff = date.today() - timedelta(days=days)
     try:
@@ -151,7 +161,7 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
             rows = conn.execute(
                 text(
                     "SELECT source_type, actor_name, ticker, amount_usd, "
-                    "direction, confidence, flow_date, evidence "
+                    "direction, confidence, flow_date "
                     "FROM dollar_flows "
                     "WHERE flow_date >= :cutoff AND flow_date <= CURRENT_DATE "
                     "ORDER BY flow_date DESC"
@@ -162,20 +172,8 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
         log.warning("Failed to fetch dollar_flows: {e}", e=str(exc))
         return []
 
-    import json as _json
-
-    result = []
-    for r in rows:
-        ev = r[7]
-        if ev and isinstance(ev, str):
-            try:
-                ev = _json.loads(ev)
-            except Exception:
-                ev = {}
-        elif not isinstance(ev, dict):
-            ev = {}
-
-        result.append({
+    result = [
+        {
             "source_type": r[0],
             "actor_name": r[1],
             "ticker": r[2],
@@ -183,12 +181,15 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
             "direction": r[4],
             "confidence": r[5] or "estimated",
             "flow_date": r[6],
-            "evidence": ev or {},
-        })
+            "evidence": {},
+        }
+        for r in rows
+    ]
 
-    _flow_cache["data"] = result
-    _flow_cache["ts"] = _time.time()
-    _flow_cache["key"] = cache_key
+    with _flow_cache_lock:
+        if len(_flow_cache) >= _FLOW_CACHE_MAX_WINDOWS and days not in _flow_cache:
+            _flow_cache.pop(min(_flow_cache, key=lambda k: _flow_cache[k][0]))
+        _flow_cache[days] = (_time.time(), result)
     return result
 
 

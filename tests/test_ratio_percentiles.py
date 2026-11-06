@@ -260,8 +260,7 @@ def test_capital_flow_endpoint_exposes_percentiles(monkeypatch):
         "MSFT": _fake_amounts(revenue=100, cogs=30),
     })
 
-    import asyncio
-    result = asyncio.run(cf.get_capital_flow("aapl", 1, "annual", _token="test"))
+    result = cf.get_capital_flow("aapl", 1, "annual", _token="test")
 
     assert result["periods"], "endpoint returned no periods"
     ratios = result["periods"][0]["ratios"]

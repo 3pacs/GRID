@@ -189,7 +189,7 @@ def _error(status_code: int, stage: str, exc: Exception) -> HTTPException:
 
 
 @router.get("/sweeps/latest")
-async def get_latest_sweep(
+def get_latest_sweep(
     horizon_days: int | None = Query(
         None,
         ge=1,
@@ -220,7 +220,7 @@ async def get_latest_sweep(
 
 
 @router.get("/sweeps")
-async def list_sweeps(
+def list_sweeps(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     horizon_days: int | None = Query(None, ge=1, le=365),
@@ -242,7 +242,7 @@ async def list_sweeps(
 
 
 @router.get("/long-plays")
-async def get_long_plays(
+def get_long_plays(
     engine: Engine = Depends(get_db_engine),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -260,7 +260,7 @@ async def get_long_plays(
 
 
 @router.post("/long-plays/refresh")
-async def refresh_long_plays(
+def refresh_long_plays(
     top_k: int = Query(25, ge=1, le=100, description="Candidates kept on the board."),
     engine: Engine = Depends(get_db_engine),
     _token: str = Depends(_require_admin),
@@ -278,7 +278,7 @@ async def refresh_long_plays(
 
 
 @router.get("/ticker/{ticker}")
-async def get_ticker_conviction(
+def get_ticker_conviction(
     ticker: str,
     account_size_usd: float = Query(
         _DEFAULT_ACCOUNT_SIZE_USD,
@@ -346,7 +346,7 @@ async def get_ticker_conviction(
 
 
 @router.get("/top")
-async def get_top_conviction(
+def get_top_conviction(
     universe: str = Query(
         "SP500",
         description="Named universe: 'SP500' or 'NASDAQ100'.",
@@ -408,7 +408,7 @@ async def get_top_conviction(
 
 
 @router.get("/pair/candidates")
-async def get_pair_candidates(
+def get_pair_candidates(
     account_size_usd: float = Query(
         _DEFAULT_ACCOUNT_SIZE_USD,
         gt=0,
@@ -453,7 +453,7 @@ async def get_pair_candidates(
 
 
 @router.get("/pair/{long_ticker}/{short_ticker}")
-async def get_pair_ticket(
+def get_pair_ticket(
     long_ticker: str,
     short_ticker: str,
     account_size_usd: float = Query(
@@ -507,7 +507,7 @@ async def get_pair_ticket(
 
 
 @router.get("/health")
-async def get_signal_health(
+def get_signal_health(
     engine: Engine = Depends(get_db_engine),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -530,7 +530,7 @@ async def get_signal_health(
 
 
 @router.get("/narrative/{ticker}")
-async def get_ticker_narrative(
+def get_ticker_narrative(
     ticker: str,
     account_size_usd: float = Query(
         _DEFAULT_ACCOUNT_SIZE_USD,

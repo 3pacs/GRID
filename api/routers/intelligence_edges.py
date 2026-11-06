@@ -15,7 +15,7 @@ router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/edges")
-async def get_market_edges(
+def get_market_edges(
     limit: int = Query(10, ge=1, le=25, description="Maximum number of ranked levers to return"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

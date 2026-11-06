@@ -80,7 +80,7 @@ class PreferencesQuery(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.get("/vapid-key")
-async def get_vapid_key():
+def get_vapid_key():
     """Return the public VAPID key for push subscription."""
     from config import settings
 
@@ -94,7 +94,7 @@ async def get_vapid_key():
 
 
 @router.post("/subscribe")
-async def subscribe(req: SubscribeRequest):
+def subscribe(req: SubscribeRequest):
     """Register a push notification subscription."""
     from alerts.push_notify import save_subscription
 
@@ -112,7 +112,7 @@ async def subscribe(req: SubscribeRequest):
 
 
 @router.delete("/unsubscribe")
-async def unsubscribe(req: UnsubscribeRequest):
+def unsubscribe(req: UnsubscribeRequest):
     """Remove a push notification subscription."""
     from alerts.push_notify import remove_subscription
 
@@ -125,7 +125,7 @@ async def unsubscribe(req: UnsubscribeRequest):
 
 
 @router.get("/preferences")
-async def get_preferences(endpoint: str):
+def get_preferences(endpoint: str):
     """Get notification preferences for a subscription endpoint."""
     from alerts.push_notify import get_preferences as _get_prefs
 
@@ -137,7 +137,7 @@ async def get_preferences(endpoint: str):
 
 
 @router.put("/preferences")
-async def update_preferences(req: PreferencesUpdate):
+def update_preferences(req: PreferencesUpdate):
     """Update notification preferences for a subscription endpoint."""
     from alerts.push_notify import update_preferences as _update_prefs
 
@@ -156,7 +156,7 @@ async def update_preferences(req: PreferencesUpdate):
 
 
 @router.post("/test")
-async def test_push(req: SubscribeRequest):
+def test_push(req: SubscribeRequest):
     """Send a test push notification to verify the subscription works."""
     from alerts.push_notify import send_push
 

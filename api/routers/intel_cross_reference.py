@@ -59,7 +59,7 @@ def _cached(key: str, fn):
 
 
 @router.get("/cross-reference")
-async def get_cross_reference(
+def get_cross_reference(
     fast: bool = Query(
         True,
         description=(
@@ -133,7 +133,7 @@ async def get_cross_reference(
 
 
 @router.get("/cross-reference/narrative")
-async def get_cross_reference_narrative(
+def get_cross_reference_narrative(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return only the LLM-generated narrative.
@@ -162,7 +162,7 @@ async def get_cross_reference_narrative(
 
 
 @router.get("/cross-reference/category/{category}")
-async def get_cross_reference_by_category(
+def get_cross_reference_by_category(
     category: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -235,7 +235,7 @@ async def get_cross_reference_by_category(
 
 
 @router.get("/cross-reference/ticker/{ticker}")
-async def get_cross_reference_for_ticker(
+def get_cross_reference_for_ticker(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -255,7 +255,7 @@ async def get_cross_reference_for_ticker(
 
 
 @router.get("/cross-reference/history")
-async def get_cross_reference_history(
+def get_cross_reference_history(
     category: str | None = Query(None, description="Filter by category"),
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     assessment: str | None = Query(None, description="Filter by assessment level"),

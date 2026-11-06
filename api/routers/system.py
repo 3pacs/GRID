@@ -1008,7 +1008,7 @@ def pipeline_health(
 
 
 @router.get("/logs", response_model=LogsResponse)
-async def get_logs(
+def get_logs(
     source: str = "api",
     lines: int = 50,
     _token: str = Depends(require_auth),
@@ -1036,7 +1036,7 @@ async def get_logs(
 
 
 @router.get("/alerts")
-async def alerts(_token: str = Depends(require_auth)) -> dict:
+def alerts(_token: str = Depends(require_auth)) -> dict:
     """Return active server alerts for critical conditions."""
     import shutil
     import os
@@ -1134,7 +1134,7 @@ async def alerts(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.post("/restart-hyperspace", response_model=RestartResponse)
-async def restart_hyperspace(
+def restart_hyperspace(
     _token: str = Depends(require_role("admin")),
 ) -> RestartResponse:
     """Restart the Hyperspace node."""
@@ -1158,7 +1158,7 @@ async def restart_hyperspace(
 # ── UX Audit endpoints ─────────────────────────────────────────
 
 @router.post("/ux-audit")
-async def trigger_ux_audit(
+def trigger_ux_audit(
     _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Trigger an immediate UX audit (admin only)."""
@@ -1213,7 +1213,7 @@ def list_ux_audits(
 
 
 @router.post("/send-digest")
-async def trigger_daily_digest(
+def trigger_daily_digest(
     _token: str = Depends(require_role("admin")),
 ) -> dict:
     """Trigger an immediate daily digest email (admin only)."""
@@ -1227,7 +1227,7 @@ async def trigger_daily_digest(
 
 
 @router.post("/taxonomy-audit")
-async def run_taxonomy_audit_endpoint(
+def run_taxonomy_audit_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Run taxonomy audit — detects misclassifications, stale data, missing features, impossible values."""
@@ -1429,7 +1429,7 @@ _SECRET_FIELDS = {
 
 
 @router.get("/settings")
-async def get_settings(
+def get_settings(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return current configuration with secrets redacted."""
@@ -1446,7 +1446,7 @@ async def get_settings(
 
 
 @router.post("/settings")
-async def update_settings(
+def update_settings(
     payload: dict,
     _token: str = Depends(require_role("admin")),
 ) -> dict:
@@ -1501,7 +1501,7 @@ async def update_settings(
 
 
 @router.get("/api-keys")
-async def get_api_keys(
+def get_api_keys(
     _token: str = Depends(require_auth),
 ) -> dict:
     """List all API keys with configured/missing status."""
@@ -1674,7 +1674,7 @@ def get_services(
 
 
 @router.get("/hermes-history")
-async def get_hermes_history(
+def get_hermes_history(
     limit: int = 20,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -1856,7 +1856,7 @@ def _get_raw_count(engine) -> int:
 
 
 @router.get("/architecture")
-async def architecture(_token: str = Depends(require_auth)) -> dict:
+def architecture(_token: str = Depends(require_auth)) -> dict:
     """System architecture introspection.
 
     Returns a complete map of all GRID modules, data flows, connections,
@@ -2043,7 +2043,7 @@ async def architecture(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/resolution-audit")
-async def get_resolution_audit(_token: str = Depends(require_auth)) -> dict:
+def get_resolution_audit(_token: str = Depends(require_auth)) -> dict:
     """Return the latest resolution audit findings from the database."""
     engine = get_db_engine()
     try:
@@ -2055,7 +2055,7 @@ async def get_resolution_audit(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.post("/resolution-audit/run")
-async def run_resolution_audit(_token: str = Depends(require_auth)) -> dict:
+def run_resolution_audit(_token: str = Depends(require_auth)) -> dict:
     """Trigger a full resolution audit and return results."""
     engine = get_db_engine()
     try:

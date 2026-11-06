@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -26,6 +27,9 @@ router = APIRouter(tags=["intelligence"])
 _LEVER_CACHE_TTL = 600  # 10 minutes
 _lever_cache: TTLCache = TTLCache(ttl=_LEVER_CACHE_TTL, max_size=1)
 _LEVER_CACHE_KEY = "hierarchy"
+# Single-flight: concurrent cold requests wait for one build instead of each
+# starting their own lever scan.
+_lever_build_lock = threading.Lock()
 
 
 @router.get("/levers")
@@ -47,18 +51,21 @@ async def get_levers(
             find_cross_domain_actors,
         )
 
-        engine = get_db_engine()
-        hierarchy = get_lever_hierarchy(engine)
-        cross_domain = find_cross_domain_actors(engine)
-        return {**hierarchy, "cross_domain_actors": cross_domain[:20]}
+        with _lever_build_lock:
+            hit = _lever_cache.get(_LEVER_CACHE_KEY)
+            if hit is not None:
+                return hit
+            engine = get_db_engine()
+            hierarchy = get_lever_hierarchy(engine)
+            cross_domain = find_cross_domain_actors(engine)
+            built = {**hierarchy, "cross_domain_actors": cross_domain[:20]}
+            _lever_cache.set(_LEVER_CACHE_KEY, built)
+            return built
 
     try:
         # Sync DB work: run it off the event loop so a slow cache miss cannot
         # stall every other route.
-        result = await asyncio.to_thread(_compute)
-
-        _lever_cache.set(_LEVER_CACHE_KEY, result)
-        return result
+        return await asyncio.to_thread(_compute)
 
     except Exception as exc:
         log.warning("Global lever map failed: {e}", e=str(exc))
@@ -66,7 +73,7 @@ async def get_levers(
 
 
 @router.get("/levers/chain/{event}")
-async def trace_lever_chain_endpoint(
+def trace_lever_chain_endpoint(
     event: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -86,7 +93,7 @@ async def trace_lever_chain_endpoint(
 
 
 @router.get("/levers/cross-domain")
-async def get_cross_domain_actors_endpoint(
+def get_cross_domain_actors_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Find actors appearing in 2+ lever domains — the most powerful players."""
@@ -103,7 +110,7 @@ async def get_cross_domain_actors_endpoint(
 
 
 @router.get("/levers/report")
-async def get_lever_report_endpoint(
+def get_lever_report_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Generate a narrative report: who's pulling what lever right now."""
@@ -120,7 +127,7 @@ async def get_lever_report_endpoint(
 
 
 @router.get("/levers/{domain}")
-async def get_lever_domain_endpoint(
+def get_lever_domain_endpoint(
     domain: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -140,7 +147,7 @@ async def get_lever_domain_endpoint(
 
 @router.get("/deep-dive/{ticker}")
 @_lf_observe(name="intelligence-deepdive", capture_input=False)
-async def get_deep_dive(
+def get_deep_dive(
     ticker: str,
     days: int = Query(90, ge=7, le=365),
     token: str = Depends(require_auth),
@@ -229,7 +236,7 @@ async def get_deep_dive(
 
 
 @router.post("/deep-dive/mag7")
-async def run_mag7_deep_dives(
+def run_mag7_deep_dives(
     days: int = Query(90, ge=7, le=365),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -260,7 +267,7 @@ async def run_mag7_deep_dives(
 
 
 @router.get("/expectations/{ticker}")
-async def get_expectations(
+def get_expectations(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

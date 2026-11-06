@@ -122,7 +122,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
 # ── Core functions (callable directly for scripts/tests) ──────────────────
 
 
-async def submit_intel(
+def submit_intel(
     actor_id: str,
     body: dict[str, Any] | IntelSubmission,
     submitted_by: str,
@@ -171,7 +171,7 @@ async def submit_intel(
     return _row_to_dict(row)
 
 
-async def get_actor_intel(
+def get_actor_intel(
     actor_id: str,
     limit: int = 50,
     viewer_id: str = "",
@@ -199,7 +199,7 @@ async def get_actor_intel(
     return [_row_to_dict(r) for r in rows]
 
 
-async def vote_intel(intel_id: int, vote: int, user_id: str) -> dict[str, Any]:
+def vote_intel(intel_id: int, vote: int, user_id: str) -> dict[str, Any]:
     """Cast or update a vote. UNIQUE constraint dedups one vote per user."""
     if vote not in (-1, 1):
         raise HTTPException(400, "vote must be -1 or 1")
@@ -255,7 +255,7 @@ async def vote_intel(intel_id: int, vote: int, user_id: str) -> dict[str, Any]:
     }
 
 
-async def flag_intel(intel_id: int, user_id: str) -> dict[str, Any]:
+def flag_intel(intel_id: int, user_id: str) -> dict[str, Any]:
     """Increment flag counter. (No ledger — flagging is lightweight.)"""
     if not user_id:
         raise HTTPException(401, "user_id required")
@@ -272,7 +272,7 @@ async def flag_intel(intel_id: int, user_id: str) -> dict[str, Any]:
     return {"intel_id": row.id, "flags": int(row.flags), "status": "flagged"}
 
 
-async def verify_intel(
+def verify_intel(
     intel_id: int,
     action: str,
     verifier: str,
@@ -308,7 +308,7 @@ async def verify_intel(
     }
 
 
-async def list_pending_intel(limit: int = 100) -> list[dict[str, Any]]:
+def list_pending_intel(limit: int = 100) -> list[dict[str, Any]]:
     """Admin: list pending intel for moderation queue."""
     limit = max(1, min(int(limit or 100), 500))
     engine = get_db_engine()
@@ -333,57 +333,57 @@ async def list_pending_intel(limit: int = 100) -> list[dict[str, Any]]:
 
 
 @router.post("/actors/{actor_id}/intel")
-async def http_submit_intel(
+def http_submit_intel(
     actor_id: str = Path(...),
     body: IntelSubmission = Body(...),
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     submitter = _submitter_from_token(token)
-    return await submit_intel(actor_id, body, submitter)
+    return submit_intel(actor_id, body, submitter)
 
 
 @router.get("/actors/{actor_id}/intel")
-async def http_get_actor_intel(
+def http_get_actor_intel(
     actor_id: str = Path(...),
     limit: int = Query(50, ge=1, le=200),
     token: str = Depends(require_auth),
 ) -> list[dict[str, Any]]:
     viewer = _submitter_from_token(token)
-    return await get_actor_intel(actor_id, limit=limit, viewer_id=viewer)
+    return get_actor_intel(actor_id, limit=limit, viewer_id=viewer)
 
 
 @router.post("/intel/{intel_id}/vote")
-async def http_vote_intel(
+def http_vote_intel(
     intel_id: int = Path(..., ge=1),
     body: VotePayload = Body(...),
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     user_id = _submitter_from_token(token)
-    return await vote_intel(intel_id, body.vote, user_id)
+    return vote_intel(intel_id, body.vote, user_id)
 
 
 @router.post("/intel/{intel_id}/flag")
-async def http_flag_intel(
+def http_flag_intel(
     intel_id: int = Path(..., ge=1),
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     user_id = _submitter_from_token(token)
-    return await flag_intel(intel_id, user_id)
+    return flag_intel(intel_id, user_id)
 
 
 @router.post("/intel/{intel_id}/verify")
-async def http_verify_intel(
+def http_verify_intel(
     intel_id: int = Path(..., ge=1),
     body: VerifyPayload = Body(...),
     _token: str = Depends(require_role("admin")),
 ) -> dict[str, Any]:
     verifier = _submitter_from_token(_token)
-    return await verify_intel(intel_id, body.action, verifier)
+    return verify_intel(intel_id, body.action, verifier)
 
 
 @router.get("/intel/pending")
-async def http_list_pending(
+def http_list_pending(
     limit: int = Query(100, ge=1, le=500),
     _token: str = Depends(require_role("admin")),
 ) -> list[dict[str, Any]]:
-    return await list_pending_intel(limit=limit)
+    return list_pending_intel(limit=limit)

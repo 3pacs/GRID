@@ -494,7 +494,6 @@ class TestFetchAndRouter:
             ra.fetch_realized_alpha(MagicMock(), source="decision_journal")
 
     def test_router_delegates_and_maps_errors(self, monkeypatch) -> None:
-        import asyncio
 
         from fastapi import HTTPException
 
@@ -503,7 +502,7 @@ class TestFetchAndRouter:
         monkeypatch.setattr("api.routers.realized_alpha.get_db_engine", lambda: MagicMock())
         payload = {"entries": [], "total": 0, "limit": 50, "offset": 0, "has_more": False}
         monkeypatch.setattr(ra, "fetch_realized_alpha", lambda *a, **k: payload)
-        out = asyncio.run(router_mod.get_realized_alpha(None, None, 90, 50, 0, "tok"))
+        out = router_mod.get_realized_alpha(None, None, 90, 50, 0, "tok")
         assert out == payload
 
         def boom(*a, **k):
@@ -511,7 +510,7 @@ class TestFetchAndRouter:
 
         monkeypatch.setattr(ra, "fetch_realized_alpha", boom)
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(router_mod.get_realized_alpha(None, None, 90, 50, 0, "tok"))
+            router_mod.get_realized_alpha(None, None, 90, 50, 0, "tok")
         assert exc.value.status_code == 500
 
     def test_router_is_registered_in_main(self) -> None:

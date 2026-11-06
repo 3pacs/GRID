@@ -436,7 +436,6 @@ class TestFlowsImageRouterIsPostOnly:
         assert default is not inspect.Parameter.empty  # a Depends(...) marker
 
     def test_generate_flow_image_returns_403_when_gate_off(self, monkeypatch):
-        import asyncio
 
         from api.routers import flows as flows_router
 
@@ -447,11 +446,9 @@ class TestFlowsImageRouterIsPostOnly:
         from fastapi import HTTPException
 
         with pytest.raises(HTTPException) as excinfo:
-            asyncio.run(
-                flows_router.generate_flow_image(
+            flows_router.generate_flow_image(
                     "flow_infographic", style="dark", model_tier="fast", _token="test-token",
                 )
-            )
         assert excinfo.value.status_code == 403
 
 

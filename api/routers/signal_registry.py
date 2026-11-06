@@ -45,7 +45,7 @@ def _spec_dict(s: Any) -> dict:
 # ── Signal Registry ──────────────────────────────────────────────────────
 
 @router.get("/signals/registry")
-async def list_signals(
+def list_signals(
     ticker: str | None = Query(None),
     source_module: str | None = Query(None),
     signal_type: str | None = Query(None),
@@ -63,14 +63,14 @@ async def list_signals(
 
 
 @router.get("/signals/registry/stats")
-async def signal_stats():
+def signal_stats():
     from intelligence.signal_registry import SignalRegistry
     counts = SignalRegistry.get_signal_count(get_db_engine())
     return {"total": sum(counts.values()), "by_source": counts, "as_of": datetime.now(timezone.utc).isoformat()}
 
 
 @router.get("/signals/registry/ticker/{ticker}")
-async def signals_for_ticker(ticker: str, limit: int = Query(100, ge=1, le=500)):
+def signals_for_ticker(ticker: str, limit: int = Query(100, ge=1, le=500)):
     from intelligence.signal_registry import SignalRegistry
     t = ticker.strip().upper()
     rows = SignalRegistry.query_for_ticker(t, get_db_engine(), limit=limit)
@@ -78,7 +78,7 @@ async def signals_for_ticker(ticker: str, limit: int = Query(100, ge=1, le=500))
 
 
 @router.post("/signals/registry/refresh")
-async def refresh_registry(_token: str = Depends(require_auth)):
+def refresh_registry(_token: str = Depends(require_auth)):
     from intelligence.adapters import ALL_ADAPTERS
     from intelligence.adapters.base import AdapterRegistry
     from intelligence.signal_registry import SignalRegistry
@@ -91,7 +91,7 @@ async def refresh_registry(_token: str = Depends(require_auth)):
 # ── Model Factory ────────────────────────────────────────────────────────
 
 @router.get("/oracle/factory")
-async def list_models():
+def list_models():
     from oracle.model_factory import ModelFactory
     f = ModelFactory(get_db_engine())
     specs = f.list_active_models()
@@ -99,7 +99,7 @@ async def list_models():
 
 
 @router.get("/oracle/factory/{model_name}")
-async def get_model(model_name: str):
+def get_model(model_name: str):
     from oracle.model_factory import ModelFactory
     f = ModelFactory(get_db_engine())
     try:
@@ -118,7 +118,7 @@ async def get_model(model_name: str):
 # ── Ensemble ─────────────────────────────────────────────────────────────
 
 @router.post("/ensemble/predict")
-async def ensemble_predict(body: EnsemblePredictRequest, _token: str = Depends(require_auth)):
+def ensemble_predict(body: EnsemblePredictRequest, _token: str = Depends(require_auth)):
     from oracle.model_factory import ModelFactory
     from oracle.signal_aggregator import SignalAggregator
 

@@ -28,7 +28,7 @@ router = APIRouter(prefix="/api/v1/briefing", tags=["briefing"])
 
 
 @router.get("/sentiment")
-async def get_current_sentiment(_token: str = Depends(require_auth)) -> dict:
+def get_current_sentiment(_token: str = Depends(require_auth)) -> dict:
     """Return the latest persisted sentiment prediction without mutating state.
 
     Sentiment computation and prediction logging belong to the scheduled scorer.
@@ -240,7 +240,7 @@ def get_sentiment_accuracy(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.post("/generate")
-async def trigger_briefing(
+def trigger_briefing(
     briefing_type: str = Query("daily", pattern="^(hourly|daily|weekly)$"),
     _token: str = Depends(require_role("admin")),
 ) -> dict:

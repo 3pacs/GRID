@@ -18,7 +18,7 @@ router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/forensics/{ticker}")
-async def get_forensic_reports(
+def get_forensic_reports(
     ticker: str,
     days: int = Query(90, ge=1, le=365, description="Lookback window in days"),
     _token: str = Depends(require_auth),
@@ -54,7 +54,7 @@ async def get_forensic_reports(
 
 
 @router.post("/forensics/{ticker}/analyze")
-async def analyze_forensic_move(
+def analyze_forensic_move(
     ticker: str,
     date: str = Query(..., description="Move date in YYYY-MM-DD format"),
     lookback: int = Query(14, ge=1, le=60, description="Lookback days before the move"),
@@ -154,7 +154,7 @@ def refresh_causation(
 
 
 @router.get("/causation/suspicious")
-async def get_suspicious_trades_endpoint(
+def get_suspicious_trades_endpoint(
     days: int = Query(90, ge=1, le=365, description="Look-back window in days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -183,7 +183,7 @@ async def get_suspicious_trades_endpoint(
 
 
 @router.get("/causation/narrative/{ticker}")
-async def get_causal_narrative_endpoint(
+def get_causal_narrative_endpoint(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -212,7 +212,7 @@ async def get_causal_narrative_endpoint(
 
 
 @router.get("/causal-chains")
-async def get_causal_chains(
+def get_causal_chains(
     ticker: str | None = Query(None, description="Filter by ticker"),
     hops: int = Query(5, ge=2, le=10, description="Max hops for chain tracing"),
     days: int = Query(180, ge=1, le=730, description="Look-back window for longest chains"),
@@ -287,7 +287,7 @@ def refresh_causal_chains(
 
 
 @router.get("/causal-chains/active")
-async def get_active_causal_chains(
+def get_active_causal_chains(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Detect causal chains currently in progress.
@@ -321,7 +321,7 @@ _INFLUENCE_GRAPH_CACHE_KEY = "default"
 
 
 @router.get("/influence")
-async def get_influence_network(
+def get_influence_network(
     ticker: str | None = Query(None, description="Filter by ticker symbol"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -352,7 +352,7 @@ async def get_influence_network(
 
 
 @router.get("/influence/circular-flows")
-async def get_circular_flows(
+def get_circular_flows(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Detect circular flows: Company -> lobbies -> Member -> votes -> Bill -> funds -> Company."""
@@ -373,7 +373,7 @@ async def get_circular_flows(
 
 
 @router.get("/influence/hypocrisy")
-async def get_vote_trade_hypocrisy(
+def get_vote_trade_hypocrisy(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Detect vote/trade hypocrisy — members who vote one way but trade another."""
@@ -397,7 +397,7 @@ async def get_vote_trade_hypocrisy(
 
 
 @router.get("/export-controls")
-async def get_export_controls(
+def get_export_controls(
     ticker: str | None = Query(None, description="Filter by stock ticker (e.g. NVDA, ASML)"),
     days: int = Query(90, ge=1, le=730, description="Lookback days"),
     _token: str = Depends(require_auth),
@@ -453,7 +453,7 @@ async def get_export_controls(
 
 
 @router.get("/export-controls/impact")
-async def get_export_control_impact(
+def get_export_control_impact(
     ticker: str = Query(..., description="Stock ticker (e.g. NVDA, ASML, LRCX)"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

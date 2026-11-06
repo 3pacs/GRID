@@ -132,7 +132,7 @@ def _replay_args(snap_date: date | None, capture_batch_id: str | None) -> dict[s
 
 
 @router.get("/gex/{ticker}")
-async def get_gex(
+def get_gex(
     ticker: str,
     snap_date: date | None = Query(
         None,
@@ -172,7 +172,7 @@ async def get_gex(
 # ── GET /options-batches/{ticker} ─────────────────────────────────────
 
 @router.get("/options-batches/{ticker}")
-async def get_options_batches(
+def get_options_batches(
     ticker: str,
     snap_date: date = Query(..., description="Chain day to list capture batches for"),
 ) -> dict[str, Any]:
@@ -209,7 +209,7 @@ async def get_options_batches(
 # ── GET /regime ──────────────────────────────────────────────────────
 
 @router.get("/regime")
-async def get_regime() -> dict[str, Any]:
+def get_regime() -> dict[str, Any]:
     """Estimated SPY gamma regime with source and model provenance.
 
     Computes SPY GEX and returns regime classification plus explanation
@@ -265,7 +265,7 @@ async def get_regime() -> dict[str, Any]:
 # ── GET /walls/{ticker} ─────────────────────────────────────────────
 
 @router.get("/walls/{ticker}")
-async def get_walls(
+def get_walls(
     ticker: str,
     snap_date: date | None = Query(
         None,
@@ -322,7 +322,7 @@ async def get_walls(
 # ── GET /vanna-charm/{ticker} ───────────────────────────────────────
 
 @router.get("/vanna-charm/{ticker}")
-async def get_vanna_charm(ticker: str) -> dict[str, Any]:
+def get_vanna_charm(ticker: str) -> dict[str, Any]:
     """Estimated vanna and charm with dated chain/spot provenance.
 
     Returns modeled sensitivities and per-strike decomposition. It does not
@@ -695,7 +695,7 @@ def get_oi_heatmap(ticker: str) -> dict[str, Any]:
 # ── GET /flow-narrative ──────────────────────────────────────────────
 
 @router.get("/flow-narrative")
-async def get_flow_narrative() -> dict[str, Any]:
+def get_flow_narrative() -> dict[str, Any]:
     """Latest dealer flow narrative briefing (LLM-powered).
 
     Returns the most recent Cem-Karsan-style briefing covering gamma
@@ -826,7 +826,7 @@ async def get_flow_narrative() -> dict[str, Any]:
 
 
 @router.post("/flow-narrative/generate")
-async def generate_flow_narrative() -> dict[str, Any]:
+def generate_flow_narrative() -> dict[str, Any]:
     """Trigger on-demand generation of a dealer flow narrative briefing.
 
     Computes GEX for SPY/QQQ/IWM, gathers market context, and calls
@@ -882,7 +882,7 @@ def get_signals(
 # ── GET /scan ────────────────────────────────────────────────────────
 
 @router.get("/scan")
-async def get_scan(
+def get_scan(
     min_score: float = Query(5.0, ge=0, le=10),
 ) -> dict[str, Any]:
     """Run options scanner with dealer context."""

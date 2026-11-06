@@ -12,7 +12,6 @@ docs/flows_provenance_contract.md.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import os
 import sys
@@ -346,7 +345,7 @@ def test_company_drill_unchanged_plus_provenance(api_engine, monkeypatch):
     drill = {"ticker": "AAPL", "actors": [], "insider_summary": None}
     monkeypatch.setitem(sys.modules, "analysis.money_flow",
                         types.SimpleNamespace(get_company_drill=lambda engine, ticker: dict(drill)))
-    out = asyncio.run(flows.get_company_drill("AAPL", "t"))
+    out = flows.get_company_drill("AAPL", "t")
     assert {k: v for k, v in out.items() if k != "provenance"} == drill
     _assert_envelope(out, flows._PROV_COMPANY)
 

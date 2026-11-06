@@ -58,7 +58,8 @@ class TestBacktestNoteConstant:
 
 class TestEndpointsCarryGeneratedAtAndNote:
     def _run(self, coro):
-        return asyncio.run(coro)
+        # Routes are plain ``def`` now (threadpool); accept either shape.
+        return asyncio.run(coro) if asyncio.iscoroutine(coro) else coro
 
     def test_get_results_adds_generated_at_and_note(self, tmp_path, monkeypatch):
         json_path = tmp_path / "backtest_results.json"

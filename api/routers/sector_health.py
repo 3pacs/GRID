@@ -28,7 +28,7 @@ _CACHE: TTLCache = TTLCache(ttl=600.0, max_size=64)
 
 
 @router.get("/{sector_name}/health")
-async def get_sector_health(
+def get_sector_health(
     sector_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

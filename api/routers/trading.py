@@ -97,20 +97,20 @@ def _get_wallet_manager():
 
 
 @router.get("/dashboard")
-async def trading_dashboard(_token: str = Depends(require_auth)) -> dict:
+def trading_dashboard(_token: str = Depends(require_auth)) -> dict:
     """Paper trading dashboard — all strategies, recent trades, P&L."""
     return _get_engine().get_dashboard()
 
 
 @router.post("/register-all")
-async def register_all_strategies(_token: str = Depends(require_auth)) -> dict:
+def register_all_strategies(_token: str = Depends(require_auth)) -> dict:
     """Register paper strategies for all PASSED TACTICAL hypotheses."""
     count = _get_engine().register_all_passed()
     return {"registered": count}
 
 
 @router.post("/trade")
-async def open_trade(
+def open_trade(
     req: TradeRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -129,7 +129,7 @@ async def open_trade(
 
 
 @router.post("/trade/{trade_id}/close")
-async def close_trade(
+def close_trade(
     trade_id: int,
     req: CloseTradeRequest,
     _token: str = Depends(require_auth),
@@ -233,7 +233,7 @@ class PromoteToStrategyRequest(BaseModel):
 
 
 @router.post("/strategies/promote")
-async def promote_to_strategy(
+def promote_to_strategy(
     req: PromoteToStrategyRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -258,7 +258,7 @@ async def promote_to_strategy(
 
 
 @router.post("/execute-signals")
-async def execute_signals_now(
+def execute_signals_now(
     venue: str | None = Query(
         None, description="Optional exchange venue to mirror BUY signals to (e.g. robinhood)"
     ),
@@ -305,13 +305,13 @@ def kill_strategy(
 # ------------------------------------------------------------------
 
 @router.get("/wallets/dashboard")
-async def wallet_dashboard(_token: str = Depends(require_auth)) -> dict:
+def wallet_dashboard(_token: str = Depends(require_auth)) -> dict:
     """Aggregated wallet dashboard — total capital, P&L, per-exchange breakdown."""
     return _get_wallet_manager().get_dashboard()
 
 
 @router.get("/wallets")
-async def list_wallets(
+def list_wallets(
     exchange: str | None = Query(None),
     status: str | None = Query(None),
     _token: str = Depends(require_auth),
@@ -322,7 +322,7 @@ async def list_wallets(
 
 
 @router.post("/wallets")
-async def create_wallet(
+def create_wallet(
     req: CreateWalletRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -339,7 +339,7 @@ async def create_wallet(
 
 
 @router.get("/wallets/{wallet_id}")
-async def get_wallet(
+def get_wallet(
     wallet_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -351,7 +351,7 @@ async def get_wallet(
 
 
 @router.get("/wallets/{wallet_id}/risk")
-async def wallet_risk_check(
+def wallet_risk_check(
     wallet_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -363,7 +363,7 @@ async def wallet_risk_check(
 
 
 @router.post("/wallets/{wallet_id}/kill")
-async def kill_wallet(
+def kill_wallet(
     wallet_id: str,
     req: KillWalletRequest,
     _token: str = Depends(require_auth),
@@ -373,7 +373,7 @@ async def kill_wallet(
 
 
 @router.post("/wallets/{wallet_id}/pause")
-async def pause_wallet(
+def pause_wallet(
     wallet_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -382,7 +382,7 @@ async def pause_wallet(
 
 
 @router.post("/wallets/{wallet_id}/resume")
-async def resume_wallet(
+def resume_wallet(
     wallet_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -400,7 +400,7 @@ def _get_hyperliquid():
 
 
 @router.get("/hyperliquid/balance")
-async def hyperliquid_balance(
+def hyperliquid_balance(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Hyperliquid wallet state — equity, margin, open position count."""
@@ -408,7 +408,7 @@ async def hyperliquid_balance(
 
 
 @router.get("/hyperliquid/positions")
-async def hyperliquid_positions(
+def hyperliquid_positions(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Open Hyperliquid perp positions with unrealized P&L."""
@@ -417,7 +417,7 @@ async def hyperliquid_positions(
 
 
 @router.post("/hyperliquid/trade")
-async def hyperliquid_trade(
+def hyperliquid_trade(
     req: HyperliquidTradeRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -433,7 +433,7 @@ async def hyperliquid_trade(
 
 
 @router.post("/hyperliquid/close")
-async def hyperliquid_close(
+def hyperliquid_close(
     req: HyperliquidCloseRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -454,7 +454,7 @@ def _get_robinhood():
 
 
 @router.get("/robinhood/status")
-async def robinhood_status(
+def robinhood_status(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Connector mode (UNCONFIGURED / DRY_RUN / LIVE), caps, and the account when keys are set."""
@@ -462,7 +462,7 @@ async def robinhood_status(
 
 
 @router.get("/robinhood/balance")
-async def robinhood_balance(
+def robinhood_balance(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Buying power, holdings value, equity and high-water mark."""
@@ -473,7 +473,7 @@ async def robinhood_balance(
 
 
 @router.get("/robinhood/positions")
-async def robinhood_positions(
+def robinhood_positions(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Crypto holdings valued at the current mid."""
@@ -482,7 +482,7 @@ async def robinhood_positions(
 
 
 @router.get("/robinhood/orders")
-async def robinhood_orders(
+def robinhood_orders(
     limit: int = Query(50, ge=1, le=200),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -498,7 +498,7 @@ _NON_ERROR_STATUSES = ("rejected", "blocked", "duplicate")
 
 
 @router.post("/robinhood/trade")
-async def robinhood_trade(
+def robinhood_trade(
     req: RobinhoodTradeRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -517,7 +517,7 @@ async def robinhood_trade(
 
 
 @router.post("/robinhood/close")
-async def robinhood_close(
+def robinhood_close(
     req: RobinhoodCloseRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -529,7 +529,7 @@ async def robinhood_close(
 
 
 @router.post("/robinhood/orders/{order_id}/cancel")
-async def robinhood_cancel(
+def robinhood_cancel(
     order_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -552,7 +552,7 @@ def _get_kalshi():
 
 
 @router.get("/polymarket/markets")
-async def polymarket_markets(
+def polymarket_markets(
     q: str | None = Query(None, description="Search query"),
     limit: int = Query(20, ge=1, le=100),
     _token: str = Depends(require_auth),
@@ -563,7 +563,7 @@ async def polymarket_markets(
 
 
 @router.get("/polymarket/portfolio")
-async def polymarket_portfolio(
+def polymarket_portfolio(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Get Polymarket positions and portfolio value."""
@@ -571,7 +571,7 @@ async def polymarket_portfolio(
 
 
 @router.post("/polymarket/buy")
-async def polymarket_buy(
+def polymarket_buy(
     req: PolymarketBuyRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -591,7 +591,7 @@ async def polymarket_buy(
 # ------------------------------------------------------------------
 
 @router.get("/kalshi/events")
-async def kalshi_events(
+def kalshi_events(
     category: str | None = Query(None, description="Filter by series/category"),
     limit: int = Query(20, ge=1, le=100),
     _token: str = Depends(require_auth),
@@ -602,7 +602,7 @@ async def kalshi_events(
 
 
 @router.get("/kalshi/portfolio")
-async def kalshi_portfolio(
+def kalshi_portfolio(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Get Kalshi positions."""
@@ -610,7 +610,7 @@ async def kalshi_portfolio(
 
 
 @router.post("/kalshi/buy")
-async def kalshi_buy(
+def kalshi_buy(
     req: KalshiBuyRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -631,7 +631,7 @@ async def kalshi_buy(
 # ------------------------------------------------------------------
 
 @router.post("/options-recommendations")
-async def options_recommendations(
+def options_recommendations(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Run the options recommendation engine and return actionable trade tickets."""
@@ -649,7 +649,7 @@ async def options_recommendations(
 # ------------------------------------------------------------------
 
 @router.post("/options-tracker/score")
-async def options_tracker_score(
+def options_tracker_score(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Run the options outcome tracking and self-improvement cycle."""

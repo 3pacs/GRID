@@ -21,7 +21,7 @@ router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/companies")
-async def get_all_company_profiles(
+def get_all_company_profiles(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return all analyzed company influence profiles, sorted by suspicion score.
@@ -45,7 +45,7 @@ async def get_all_company_profiles(
 
 
 @router.get("/companies/patterns")
-async def get_cross_company_patterns(
+def get_cross_company_patterns(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Detect cross-company influence patterns.
@@ -70,7 +70,7 @@ async def get_cross_company_patterns(
 
 
 @router.get("/companies/sector-report")
-async def get_sector_influence_report(
+def get_sector_influence_report(
     sector: str = Query(..., description="Sector name (e.g. Technology, Semiconductors)"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -96,7 +96,7 @@ async def get_sector_influence_report(
 
 
 @router.post("/companies/analyze")
-async def trigger_company_analysis(
+def trigger_company_analysis(
     ticker: str = Query(..., description="Stock ticker to analyze (e.g. AAPL, NVDA)"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -122,7 +122,7 @@ async def trigger_company_analysis(
 
 
 @router.get("/companies/{ticker}")
-async def get_company_profile(
+def get_company_profile(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -156,7 +156,7 @@ _deep_graph_cache: TTLCache = TTLCache(ttl=_DEEP_GRAPH_TTL, max_size=50)
 
 
 @router.get("/deep-graph/{ticker}")
-async def get_deep_graph(
+def get_deep_graph(
     ticker: str,
     depth: int = Query(default=10, ge=1, le=10, description="Traversal depth (1-10)"),
     _token: str = Depends(require_auth),
@@ -200,7 +200,7 @@ async def get_deep_graph(
 
 
 @router.get("/overlaps")
-async def get_overlaps(
+def get_overlaps(
     ticker_a: str = Query(..., description="First ticker"),
     ticker_b: str = Query(..., description="Second ticker"),
     _token: str = Depends(require_auth),
@@ -237,7 +237,7 @@ async def get_overlaps(
 
 
 @router.get("/overlaps/all")
-async def get_all_overlaps(
+def get_all_overlaps(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Find all hidden connections across the entire watchlist.
@@ -267,7 +267,7 @@ async def get_all_overlaps(
 
 
 @router.get("/deep-graph/{ticker}/map")
-async def get_connection_map(
+def get_connection_map(
     ticker: str,
     depth: int = Query(default=5, ge=1, le=10, description="Map depth (1-10)"),
     _token: str = Depends(require_auth),
@@ -290,7 +290,7 @@ async def get_connection_map(
 
 
 @router.get("/institutional-map")
-async def get_institutional_map(
+def get_institutional_map(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the full institutional map: private credit funds, hedge funds,
@@ -325,7 +325,7 @@ async def get_institutional_map(
 
 
 @router.get("/institutional-map/trace/{pension_name}")
-async def trace_pension(
+def trace_pension(
     pension_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -346,7 +346,7 @@ async def trace_pension(
 
 
 @router.get("/institutional-map/fees/{fund_name}")
-async def get_fund_fees(
+def get_fund_fees(
     fund_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -367,7 +367,7 @@ async def get_fund_fees(
 
 
 @router.get("/institutional-map/conflicts")
-async def get_institutional_conflicts(
+def get_institutional_conflicts(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return all detected conflicts of interest in the institutional map.
@@ -396,7 +396,7 @@ async def get_institutional_conflicts(
 
 
 @router.get("/hidden-influence")
-async def get_hidden_influence(
+def get_hidden_influence(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Discover hidden influence patterns across the watchlist.

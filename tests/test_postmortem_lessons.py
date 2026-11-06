@@ -9,10 +9,8 @@ opens a real database connection or calls a real LLM.
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import MagicMock
 
-import pytest
 
 from api.routers import postmortem_lessons as pml
 
@@ -106,7 +104,7 @@ class TestEndpointEmptyWindowGuard:
     needed — it's a plain async function) with every collaborator mocked."""
 
     def _run(self, **kwargs):
-        return asyncio.run(pml.get_postmortem_lessons(_token="test", **kwargs))
+        return pml.get_postmortem_lessons(_token="test", **kwargs)
 
     def test_empty_window_with_no_prior_cache_returns_honest_empty_state(self, monkeypatch):
         monkeypatch.setattr(pml, "get_db_engine", lambda: MagicMock())

@@ -789,7 +789,7 @@ def _build_explain(
 
 
 @router.get("/{actor_id}/explain")
-async def get_actor_explain(
+def get_actor_explain(
     actor_id: str,
     date: str | None = Query(None, description="Pivot date YYYY-MM-DD, default today"),
     window_days: int = Query(5, ge=1, le=30, description="± window in days"),

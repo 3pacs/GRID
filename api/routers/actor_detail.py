@@ -379,7 +379,7 @@ def _connections_for(actor_id: str, sector_name: str | None) -> list[dict[str, A
 
 
 @router.get("/{actor_id}/trust-cog")
-async def get_actor_trust_cog_endpoint(
+def get_actor_trust_cog_endpoint(
     actor_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -409,7 +409,7 @@ async def get_actor_trust_cog_endpoint(
 
 
 @router.get("/{actor_id}/detail")
-async def get_actor_detail_for_drawer(
+def get_actor_detail_for_drawer(
     actor_id: str,
     sector: str | None = Query(None, description="Sector context for edges"),
     _token: str = Depends(require_auth),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -27,6 +29,24 @@ _ACTOR_GRAPH_TTL = 1800  # 30 minutes
 _actor_graph_cache: TTLCache = TTLCache(ttl=_ACTOR_GRAPH_TTL, max_size=1)
 _ACTOR_GRAPH_CACHE_KEY = "full"
 
+# Stale-while-revalidate + single-flight for the full actor graph.
+#
+# 2026-11-06: a TTL miss rebuilt the graph synchronously inside the request
+# (then on the event loop, ``async def``), freezing grid-api for minutes
+# ("DB connection held 114.0s — acquired_by=MainThread"), and every request
+# that arrived during the build started its own. Now:
+#   * fresh (TTL) hit  -> served from RAM;
+#   * expired, but a previous graph exists -> served stale while ONE
+#     background thread rebuilds;
+#   * cold (nothing built yet) -> a fast ``status="building"`` payload while
+#     the background build runs (the startup hook warms it, so this is only
+#     the first seconds after a restart).
+_actor_graph_build_lock = threading.Lock()  # held for the whole build
+_actor_graph_state_lock = threading.Lock()
+_actor_graph_last: dict[str, Any] | None = None
+_actor_graph_last_built_at: float | None = None  # time.time() of last success
+_ACTOR_GRAPH_RETRY_SECONDS = 10
+
 
 _DEFAULT_SECTORS = [
     "AI", "Crypto", "Robotics", "Gene Therapy & Pharma", "Nuclear",
@@ -35,7 +55,7 @@ _DEFAULT_SECTORS = [
 
 
 @router.get("/actor-network")
-async def get_actor_network(
+def get_actor_network(
     limit: int = Query(500, ge=10, le=50000, description="Max nodes for browser display"),
     sector: str | None = Query(None, description="Filter to a single sector"),
     _token: str = Depends(require_auth),
@@ -47,25 +67,10 @@ async def get_actor_network(
     on user-priority sectors (AI, Crypto, Semiconductors, etc.).
     Use ``?sector=AI`` to drill into a single sector.
     """
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-
-    # Build/refresh graph (ICIJ excluded, ~5K actors instead of 1.6M)
-    full = _actor_graph_cache.get(_ACTOR_GRAPH_CACHE_KEY)
+    # Never builds inline: fresh or stale graph from RAM, else "building".
+    full = get_full_actor_graph(wait=False)
     if full is None:
-        try:
-            full = _build_full_actor_cache(now)
-        except Exception as exc:
-            log.warning("Actor network build failed: {e}", e=str(exc))
-            return {
-                "nodes": [], "links": [], "metadata": {},
-                "wealth_flows": [], "pocket_lining_alerts": [],
-                "flows": [], "circular_flows": [],
-                "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
-                "sectors": [],
-                "error": str(exc),
-            }
+        return _actor_graph_building_payload()
 
     nodes = full.get("nodes", [])
 
@@ -113,6 +118,98 @@ async def get_actor_network(
         "circular_flows": full.get("circular_flows", []),
         "flow_summary": full.get("flow_summary", {}),
     }
+
+
+def _empty_actor_network_payload() -> dict[str, Any]:
+    return {
+        "nodes": [], "links": [], "metadata": {},
+        "wealth_flows": [], "pocket_lining_alerts": [],
+        "flows": [], "circular_flows": [],
+        "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
+        "sectors": [],
+    }
+
+
+def _actor_graph_building_payload() -> dict[str, Any]:
+    """Cold-start answer: the graph is being built in the background."""
+    return {
+        **_empty_actor_network_payload(),
+        "status": "building",
+        "building": True,
+        "retry_after_seconds": _ACTOR_GRAPH_RETRY_SECONDS,
+        "message": "Actor network is being built; retry shortly.",
+    }
+
+
+def _actor_graph_rebuild_worker() -> None:
+    """Background rebuild; the caller already holds the build lock."""
+    try:
+        _build_full_actor_cache()
+    except Exception as exc:
+        log.warning("Actor network background build failed: {e}", e=str(exc))
+    finally:
+        _actor_graph_build_lock.release()
+
+
+def start_actor_graph_rebuild() -> bool:
+    """Start one background rebuild unless one is already running.
+
+    Returns True when this call started the rebuild.
+    """
+    if not _actor_graph_build_lock.acquire(blocking=False):
+        return False
+    try:
+        threading.Thread(
+            target=_actor_graph_rebuild_worker,
+            name="actor-graph-builder",
+            daemon=True,
+        ).start()
+    except Exception:
+        _actor_graph_build_lock.release()
+        raise
+    return True
+
+
+def get_full_actor_graph(*, wait: bool) -> dict[str, Any] | None:
+    """Return the full actor graph without ever stacking duplicate builds.
+
+    Fresh cache hit -> that. Expired with a previous graph -> the previous
+    graph, and one background rebuild is started. Nothing built yet ->
+    ``None`` (and a background build) when ``wait`` is False; with ``wait``
+    True the caller blocks on the single in-flight build (never a second
+    one). Must not be called on the event loop with ``wait=True``.
+    """
+    fresh = _actor_graph_cache.get(_ACTOR_GRAPH_CACHE_KEY)
+    if fresh is not None:
+        return fresh
+    with _actor_graph_state_lock:
+        stale = _actor_graph_last
+    if stale is not None or not wait:
+        start_actor_graph_rebuild()
+        return stale
+    with _actor_graph_build_lock:
+        fresh = _actor_graph_cache.get(_ACTOR_GRAPH_CACHE_KEY)
+        if fresh is not None:
+            return fresh
+        try:
+            return _build_full_actor_cache()
+        except Exception as exc:
+            log.warning("Actor network build failed: {e}", e=str(exc))
+            return None
+
+
+def clear_actor_graph() -> None:
+    """Drop the fresh and the stale graph (tests / operator reset)."""
+    global _actor_graph_last, _actor_graph_last_built_at
+    _actor_graph_cache.clear()
+    with _actor_graph_state_lock:
+        _actor_graph_last = None
+        _actor_graph_last_built_at = None
+
+
+def warm_actor_graph_async() -> bool:
+    """Startup hook: build the graph in a background thread."""
+    return start_actor_graph_rebuild()
 
 
 def _build_full_actor_cache(now=None) -> dict[str, Any]:
@@ -262,13 +359,17 @@ def _build_full_actor_cache(now=None) -> dict[str, Any]:
         "flow_summary": flow_summary,
     }
     _actor_graph_cache.set(_ACTOR_GRAPH_CACHE_KEY, result)
-    log.info("Actor network cached: {s:.1f}MB in RAM",
-             s=len(str(result)) / 1_000_000)
+    global _actor_graph_last, _actor_graph_last_built_at
+    with _actor_graph_state_lock:
+        _actor_graph_last = result
+        _actor_graph_last_built_at = time.time()
+    log.info("Actor network cached: {n} nodes, {l} links",
+             n=len(result.get("nodes", [])), l=len(result.get("links", [])))
     return result
 
 
 @router.get("/actor/{actor_id}")
-async def get_actor_detail(
+def get_actor_detail(
     actor_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -279,13 +380,16 @@ async def get_actor_detail(
     """
     try:
         from intelligence.actor_network import (
-            build_actor_graph,
             find_connected_actions,
             assess_pocket_lining,
         )
 
         engine = get_db_engine()
-        graph = build_actor_graph(engine)
+        # Shared single-flight graph (this handler runs in the threadpool, so
+        # waiting on a cold build is safe); never a private rebuild per call.
+        graph = get_full_actor_graph(wait=True)
+        if graph is None:
+            return {"error": "Actor network unavailable", "actor": None}
 
         # Find the actor node
         actor_node = None
@@ -341,7 +445,7 @@ async def get_actor_detail(
 
 
 @router.get("/actor/{actor_id}/analytics")
-async def get_actor_analytics_endpoint(
+def get_actor_analytics_endpoint(
     actor_id: str,
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
     _token: str = Depends(require_auth),
@@ -365,7 +469,7 @@ async def get_actor_analytics_endpoint(
 
 
 @router.get("/analytics/top")
-async def get_top_actors_endpoint(
+def get_top_actors_endpoint(
     metric: str = Query("pagerank", description="Metric to rank by"),
     limit: int = Query(20, ge=1, le=200, description="Number of actors to return"),
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
@@ -468,7 +572,7 @@ def _load_community_list(engine: Any) -> tuple[list[dict[str, Any]], str]:
 
 
 @router.get("/analytics/communities")
-async def get_communities_endpoint(
+def get_communities_endpoint(
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
     limit: int = Query(200, ge=1, le=2000, description="Max communities (curated scope)"),
     _token: str = Depends(require_auth),
@@ -495,7 +599,7 @@ async def get_communities_endpoint(
 
 
 @router.get("/analytics/community/{community_id}")
-async def get_community_members_endpoint(
+def get_community_members_endpoint(
     community_id: int,
     limit: int = Query(50, ge=1, le=500, description="Max members to return"),
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
@@ -517,7 +621,7 @@ async def get_community_members_endpoint(
 
 
 @router.get("/postmortems")
-async def get_postmortems(
+def get_postmortems(
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     ticker: str | None = Query(None, description="Filter by ticker"),
     category: str | None = Query(None, description="Filter by failure_category"),
@@ -553,7 +657,7 @@ async def get_postmortems(
 
 @router.post("/postmortems/generate")
 @_lf_observe(name="intelligence-postmortem-batch", capture_input=False)
-async def trigger_batch_postmortem(
+def trigger_batch_postmortem(
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -587,7 +691,7 @@ async def trigger_batch_postmortem(
 
 
 @router.get("/postmortems/lessons")
-async def get_lessons_learned(
+def get_lessons_learned(
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -675,7 +779,7 @@ def _av_earnings_income_freshness_note(engine: Any) -> str:
 
 
 @router.get("/milestones/scorecard")
-async def get_milestone_scorecard(
+def get_milestone_scorecard(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return execution scorecard for all tracked companies.
@@ -700,7 +804,7 @@ async def get_milestone_scorecard(
 
 
 @router.get("/milestones/{ticker}")
-async def get_ticker_milestones(
+def get_ticker_milestones(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -732,7 +836,7 @@ async def get_ticker_milestones(
 # ── Attention Anomaly Endpoints ────────────────────────────────────────
 
 @router.get("/attention/alerts")
-async def get_attention_alerts(
+def get_attention_alerts(
     threshold: float = Query(50.0, description="Minimum attention score"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -919,7 +1023,7 @@ def get_actor_enriched_profile(
 
 
 @router.get("/trends")
-async def get_trends(
+def get_trends(
     days: int = Query(90, ge=1, le=365, description="Lookback days for trend analysis"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

@@ -17,7 +17,7 @@ router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/gov-contracts")
-async def get_gov_contracts(
+def get_gov_contracts(
     ticker: str | None = Query(None, description="Filter by stock ticker"),
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     _token: str = Depends(require_auth),
@@ -75,7 +75,7 @@ async def get_gov_contracts(
 
 
 @router.get("/gov-contracts/overlaps")
-async def get_contract_insider_overlaps(
+def get_contract_insider_overlaps(
     days: int = Query(90, ge=1, le=365, description="Lookback days for contracts"),
     window: int = Query(30, ge=1, le=90, description="Pre-contract trade window in days"),
     _token: str = Depends(require_auth),
@@ -116,7 +116,7 @@ async def get_contract_insider_overlaps(
 
 
 @router.get("/dollar-flows")
-async def get_dollar_flows(
+def get_dollar_flows(
     ticker: str | None = Query(None, description="Filter by ticker"),
     sector: str | None = Query(None, description="Filter by sector"),
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
@@ -176,7 +176,7 @@ async def get_dollar_flows(
 
 
 @router.post("/dollar-flows/normalize")
-async def trigger_dollar_flow_normalization(
+def trigger_dollar_flow_normalization(
     days: int = Query(90, ge=1, le=365, description="Lookback days"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -207,7 +207,7 @@ async def trigger_dollar_flow_normalization(
 
 
 @router.get("/legislation")
-async def get_legislation_overview(
+def get_legislation_overview(
     ticker: str | None = Query(None, description="Filter by affected ticker"),
     committee: str | None = Query(None, description="Filter by committee name"),
     _token: str = Depends(require_auth),
@@ -277,7 +277,7 @@ async def get_legislation_overview(
 
 
 @router.get("/legislation/hearings")
-async def get_legislation_hearings(
+def get_legislation_hearings(
     days: int = Query(14, ge=1, le=60, description="Days ahead to search"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -294,7 +294,7 @@ async def get_legislation_hearings(
 
 
 @router.get("/legislation/trading-alerts")
-async def get_legislation_trading_alerts(
+def get_legislation_trading_alerts(
     days: int = Query(30, ge=1, le=90, description="Days back to search"),
     severity: str | None = Query(None, description="Filter by severity: HIGH, MEDIUM"),
     _token: str = Depends(require_auth),

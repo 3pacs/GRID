@@ -41,7 +41,7 @@ class TaskResponse(BaseModel):
 # ── GET /.well-known/agent.json ───────────────────────────────────────────
 
 @router.get("/.well-known/agent.json")
-async def get_agent_card() -> dict[str, Any]:
+def get_agent_card() -> dict[str, Any]:
     """Serve the GRID A2A Agent Card for agent discovery.
 
     This is the standard A2A discovery endpoint. External agents
@@ -62,7 +62,7 @@ async def get_agent_card() -> dict[str, Any]:
 # ── POST /a2a/tasks ───────────────────────────────────────────────────────
 
 @router.post("/a2a/tasks", response_model=TaskResponse)
-async def submit_task(
+def submit_task(
     req: TaskSubmitRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -97,7 +97,7 @@ async def submit_task(
 # ── GET /a2a/tasks/{task_id} ─────────────────────────────────────────────
 
 @router.get("/a2a/tasks/{task_id}", response_model=TaskResponse)
-async def get_task(
+def get_task(
     task_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -121,7 +121,7 @@ async def get_task(
 # ── DELETE /a2a/tasks/{task_id} ──────────────────────────────────────────
 
 @router.delete("/a2a/tasks/{task_id}")
-async def cancel_task(
+def cancel_task(
     task_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -141,7 +141,7 @@ async def cancel_task(
 # ── GET /a2a/tasks ────────────────────────────────────────────────────────
 
 @router.get("/a2a/tasks")
-async def list_tasks(
+def list_tasks(
     state: str | None = None,
     limit: int = 50,
     _token: str = Depends(require_auth),

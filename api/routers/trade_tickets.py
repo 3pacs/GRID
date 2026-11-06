@@ -34,7 +34,7 @@ router = APIRouter(tags=["trade-tickets"])
 
 
 @router.get("/api/v1/trade-tickets/recent")
-async def recent_tickets(
+def recent_tickets(
     since_hours: int = Query(24, ge=1, le=720),
     limit: int | None = Query(None, ge=1, le=500),
     write_journal: bool = Query(False),
@@ -68,7 +68,7 @@ async def recent_tickets(
 
 
 @router.get("/api/v1/contagion/{prediction_id}/tickets")
-async def tickets_for_prediction(
+def tickets_for_prediction(
     prediction_id: int = Path(..., ge=1),
     write_journal: bool = Query(False),
     _token: str = Depends(require_auth),

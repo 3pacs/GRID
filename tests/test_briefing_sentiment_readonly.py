@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from datetime import date, datetime, timezone
@@ -58,7 +57,7 @@ def test_current_sentiment_reads_latest_prediction_without_bootstrap(monkeypatch
     ))
     monkeypatch.setattr(briefing, "get_engine", lambda: engine)
 
-    payload = asyncio.run(briefing.get_current_sentiment())
+    payload = briefing.get_current_sentiment()
 
     assert payload | {"served_at": "ignored"} == {
         "score": 0.42,
@@ -87,7 +86,7 @@ def test_current_sentiment_reports_absent_prediction_without_writing(monkeypatch
     engine = _Engine(None)
     monkeypatch.setattr(briefing, "get_engine", lambda: engine)
 
-    payload = asyncio.run(briefing.get_current_sentiment())
+    payload = briefing.get_current_sentiment()
 
     assert payload == {
         "error": "No persisted sentiment prediction found",
@@ -104,7 +103,7 @@ def test_current_sentiment_sanitizes_engine_initialization_failure(monkeypatch):
         lambda: (_ for _ in ()).throw(RuntimeError("database password=not-for-clients")),
     )
 
-    payload = asyncio.run(briefing.get_current_sentiment())
+    payload = briefing.get_current_sentiment()
 
     assert payload == {
         "error": "Persisted sentiment is temporarily unavailable",

@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/v1/viz", tags=["visualization"])
 
 
 @router.get("/recommend")
-async def recommend_visualization(
+def recommend_visualization(
     description: str = Query(..., description="What data you want to visualize"),
     features: str = Query("", description="Comma-separated feature names"),
     relation: str = Query("", description="Relationship type: flow, correlation, causation, etc."),
@@ -54,7 +54,7 @@ async def recommend_visualization(
 
 
 @router.get("/rules")
-async def list_visualization_rules() -> list[dict]:
+def list_visualization_rules() -> list[dict]:
     """Return all visualization intelligence rules.
 
     Each rule explains: when to use this chart type, and WHY
@@ -64,7 +64,7 @@ async def list_visualization_rules() -> list[dict]:
 
 
 @router.get("/weights")
-async def get_source_weights(
+def get_source_weights(
     families: str = Query("", description="Comma-separated family names (empty = all)"),
 ) -> dict[str, Any]:
     """Get current visual weights for data families.
@@ -91,7 +91,7 @@ async def get_source_weights(
 
 
 @router.get("/spec/capital-flows")
-async def capital_flow_viz_spec() -> dict:
+def capital_flow_viz_spec() -> dict:
     """Pre-built VizSpec for the capital flow living graph."""
     spec = VizSpec(
         chart_type=ChartType.SANKEY_TEMPORAL,
@@ -120,7 +120,7 @@ async def capital_flow_viz_spec() -> dict:
 
 
 @router.get("/spec/regime-phase")
-async def regime_phase_viz_spec() -> dict:
+def regime_phase_viz_spec() -> dict:
     """Pre-built VizSpec for the regime phase space trajectory."""
     spec = VizSpec(
         chart_type=ChartType.PHASE_SPACE,
@@ -146,7 +146,7 @@ async def regime_phase_viz_spec() -> dict:
 
 
 @router.get("/spec/feature-network")
-async def feature_network_viz_spec() -> dict:
+def feature_network_viz_spec() -> dict:
     """Pre-built VizSpec for the feature correlation/importance network."""
     spec = VizSpec(
         chart_type=ChartType.FORCE_NETWORK,
@@ -170,7 +170,7 @@ async def feature_network_viz_spec() -> dict:
 
 
 @router.get("/spec/energy-particle")
-async def energy_particle_viz_spec() -> dict:
+def energy_particle_viz_spec() -> dict:
     """Pre-built VizSpec for the market energy particle system."""
     spec = VizSpec(
         chart_type=ChartType.PARTICLE_SYSTEM,
@@ -196,7 +196,7 @@ async def energy_particle_viz_spec() -> dict:
 
 
 @router.get("/spec/sector-orbital")
-async def sector_orbital_viz_spec() -> dict:
+def sector_orbital_viz_spec() -> dict:
     """Pre-built VizSpec for the sector rotation orbital diagram."""
     spec = VizSpec(
         chart_type=ChartType.ORBITAL,
@@ -223,7 +223,7 @@ async def sector_orbital_viz_spec() -> dict:
 
 
 @router.get("/spec/lead-lag-river")
-async def lead_lag_river_viz_spec() -> dict:
+def lead_lag_river_viz_spec() -> dict:
     """Pre-built VizSpec for lead/lag causal river flow."""
     spec = VizSpec(
         chart_type=ChartType.RIVER_FLOW,

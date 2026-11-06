@@ -354,14 +354,12 @@ class TestEndpointShape:
             # raises on Python 3.9 when a prior test closed the global loop.
             loop = asyncio.new_event_loop()
             try:
-                result = loop.run_until_complete(
-                    tt_router.recent_tickets(
+                result = tt_router.recent_tickets(
                         since_hours=24,
                         limit=7,
                         write_journal=False,
                         _token="tok",
                     )
-                )
             finally:
                 loop.close()
         assert result["count"] == 1

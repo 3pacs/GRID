@@ -31,7 +31,7 @@ router = APIRouter(
 
 
 @router.get("/verify")
-async def verify(as_of: str | None = Query(default=None)) -> dict[str, Any]:
+def verify(as_of: str | None = Query(default=None)) -> dict[str, Any]:
     """Run full market physics verification suite."""
     from db import get_engine
     from physics.verify import MarketPhysicsVerifier
@@ -60,7 +60,7 @@ async def verify(as_of: str | None = Query(default=None)) -> dict[str, Any]:
 
 
 @router.get("/momentum")
-async def momentum(
+def momentum(
     as_of: str | None = Query(default=None),
     lookback_days: int = Query(default=90, ge=7, le=365),
 ) -> dict[str, Any]:
@@ -97,7 +97,7 @@ async def momentum(
 
 
 @router.get("/conventions")
-async def list_conventions() -> dict[str, Any]:
+def list_conventions() -> dict[str, Any]:
     """List all financial conventions."""
     from physics.conventions import list_conventions
 
@@ -105,7 +105,7 @@ async def list_conventions() -> dict[str, Any]:
 
 
 @router.get("/conventions/{domain}")
-async def get_convention(domain: str) -> dict[str, Any]:
+def get_convention(domain: str) -> dict[str, Any]:
     """Get convention for a specific domain."""
     from physics.conventions import get_convention as _get
 
@@ -126,7 +126,7 @@ async def get_convention(domain: str) -> dict[str, Any]:
 
 
 @router.get("/ou/{feature}")
-async def ou_parameters(
+def ou_parameters(
     feature: str,
     window: int = Query(default=252, ge=30, le=2520),
 ) -> dict[str, Any]:
@@ -159,7 +159,7 @@ async def ou_parameters(
 
 
 @router.get("/hurst/{feature}")
-async def hurst(
+def hurst(
     feature: str,
     max_lag: int = Query(default=100, ge=10, le=500),
 ) -> dict[str, Any]:
@@ -199,7 +199,7 @@ async def hurst(
 
 
 @router.get("/energy/{feature}")
-async def energy_decomposition(
+def energy_decomposition(
     feature: str,
     short_window: int = Query(default=21),
     long_window: int = Query(default=252),
@@ -241,7 +241,7 @@ async def energy_decomposition(
 
 
 @router.get("/news-energy")
-async def news_energy(
+def news_energy(
     lookback_days: int = Query(default=30, ge=7, le=365),
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
@@ -271,7 +271,7 @@ async def news_energy(
 
 
 @router.get("/dashboard")
-async def physics_dashboard(
+def physics_dashboard(
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """Comprehensive physics dashboard for the frontend.

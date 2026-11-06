@@ -170,13 +170,13 @@ class AlertCreate(BaseModel):
 
 
 @router.post("")
-async def create_alert(req: AlertCreate, token: str = Depends(require_auth)) -> dict:
+def create_alert(req: AlertCreate, token: str = Depends(require_auth)) -> dict:
     owner = _user_id_from_token(token) or "dad"
     return create_alert_record(owner, req.ticker, req.direction, req.threshold, req.note)
 
 
 @router.get("")
-async def list_alerts(token: str = Depends(require_auth)) -> dict:
+def list_alerts(token: str = Depends(require_auth)) -> dict:
     """Active alerts + recently triggered ones for the current user."""
     owner = _user_id_from_token(token) or "dad"
     cols = ["id", "ticker", "direction", "threshold", "note", "active",
@@ -196,7 +196,7 @@ async def list_alerts(token: str = Depends(require_auth)) -> dict:
 
 
 @router.delete("/{alert_id}")
-async def cancel_alert(alert_id: int, token: str = Depends(require_auth)) -> dict:
+def cancel_alert(alert_id: int, token: str = Depends(require_auth)) -> dict:
     owner = _user_id_from_token(token) or "dad"
     try:
         engine = get_db_engine()

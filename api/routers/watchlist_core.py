@@ -152,7 +152,7 @@ def refresh_watchlist_prices(
 
 
 @router.get("/prices")
-async def get_watchlist_prices(
+def get_watchlist_prices(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Return cached batch prices without triggering refresh or broadcast side effects."""
@@ -407,6 +407,7 @@ def list_watchlist_enriched(
     # ── Price changes + z-scores ──────────────────────────────
     price_data: dict[str, dict] = {}
     cached_prices = _get_cached_prices()
+    needs_live: list[str] = []
     try:
         today = date.today()
         with engine.connect() as conn:
@@ -457,19 +458,32 @@ def list_watchlist_enriched(
 
                     price_data[tk] = {"price": latest, "pct_1m": pct_1m, "source": "grid"}
                 else:
-                    # Fallback: live price from yfinance
-                    live = _fetch_live_price(tk)
-                    if live:
-                        price_data[tk] = {
-                            "price": live["price"],
-                            "pct_1d": live["pct_1d"],
-                            "pct_1m": None,
-                            "source": "live",
-                        }
-                        # No write-back on this GET; POST /refresh-prices owns
-                        # persisting fetched prices.
+                    # Fallback: live price from yfinance, fetched below --
+                    # in parallel and after this DB connection is returned
+                    # (it used to hold the connection across one serial HTTP
+                    # round trip per stale ticker, ~0.5 s each).
+                    needs_live.append(tk)
     except Exception as exc:
         log.debug("Watchlist: price data enrichment failed: {e}", e=str(exc))
+
+    if needs_live:
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(8, len(needs_live))) as pool:
+                lives = list(pool.map(_fetch_live_price, needs_live))
+            for tk, live in zip(needs_live, lives):
+                if live:
+                    price_data[tk] = {
+                        "price": live["price"],
+                        "pct_1d": live["pct_1d"],
+                        "pct_1m": None,
+                        "source": "live",
+                    }
+                    # No write-back on this GET; POST /refresh-prices owns
+                    # persisting fetched prices.
+        except Exception as exc:
+            log.debug("Watchlist: live price fallback failed: {e}", e=str(exc))
 
     # ── Regime context ────────────────────────────────────────
     regime_state = None

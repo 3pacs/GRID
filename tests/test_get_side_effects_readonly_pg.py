@@ -131,9 +131,9 @@ def test_causation_and_causal_chain_gets_are_select_only():
              patch("intelligence.causation_graph._try_chain_llm_narrative", return_value=None):
             batch = f.get_causation(ticker=None, days=30, _token="t")
             single = f.get_causation(ticker="AAA", days=30, _token="t")
-            chains = asyncio.run(f.get_causal_chains(ticker="AAA", hops=3, days=30, _token="t"))
-            longest = asyncio.run(f.get_causal_chains(ticker=None, hops=3, days=30, _token="t"))
-            active = asyncio.run(f.get_active_causal_chains(_token="t"))
+            chains = f.get_causal_chains(ticker="AAA", hops=3, days=30, _token="t")
+            longest = f.get_causal_chains(ticker=None, hops=3, days=30, _token="t")
+            active = f.get_active_causal_chains(_token="t")
         for payload in (batch, single, chains, longest, active):
             assert isinstance(payload, dict)
         _assert_select_only(statements)
@@ -179,7 +179,7 @@ def test_forensics_get_does_not_create_or_store_reports():
              patch.object(f, "get_db_engine", return_value=engine), \
              patch("intelligence.forensics._get_llm_narrative", return_value=None), \
              patch("intelligence.forensics._get_llm_summary", return_value=None):
-            body = asyncio.run(f.get_forensic_reports(ticker="AAA", days=30, _token="t"))
+            body = f.get_forensic_reports(ticker="AAA", days=30, _token="t")
         assert body["count"] == 1
         _assert_select_only(statements)
         with engine.connect() as conn:
@@ -264,10 +264,8 @@ def test_regime_gets_are_select_only():
         _seed_observations_tables(engine)
         with _recording(engine) as statements, \
              patch.object(ir, "get_db_engine", return_value=engine):
-            regime_body = asyncio.run(ir.get_regime(_token="t"))
-            analogs_body = asyncio.run(
-                ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
-            )
+            regime_body = ir.get_regime(_token="t")
+            analogs_body = ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
 
         # Empty raw_series -> every dimension is missing -> below the
         # completeness floor -> both routes report "available: false"

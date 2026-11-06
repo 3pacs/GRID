@@ -5,7 +5,6 @@ pinned POST-REPAIR-READONLY.jsonl receipt. Publication fixtures are projections,
 NOT recomputed full-record attestations. FakeEngine models the trusted native
 PostgreSQL full-record SHA result; it does not prove PostgreSQL serialization.
 """
-import asyncio
 import copy
 import json
 from datetime import date
@@ -210,12 +209,12 @@ def test_existing_route_default_and_opt_in_are_separate(monkeypatch):
     sentinel = {"content": "original", "market_moves": {"unchanged": True}}
     monkeypatch.setattr(router, "get_db_engine", lambda: engine)
     monkeypatch.setattr(diary, "get_diary_entry", lambda *args: sentinel)
-    original = asyncio.run(router.get_diary(date="2026-10-15", reference_overlay=False, reference_as_of=None, _token="fixture"))
+    original = router.get_diary(date="2026-10-15", reference_overlay=False, reference_as_of=None, _token="fixture")
     assert original is sentinel and not engine.calls
     def forbidden(*args):
         raise AssertionError("overlay must bypass original ensure_table path")
     monkeypatch.setattr(diary, "get_diary_entry", forbidden)
-    result = asyncio.run(router.get_diary(date="2026-10-15", reference_overlay=True, reference_as_of=_AS_OF, _token="fixture"))
+    result = router.get_diary(date="2026-10-15", reference_overlay=True, reference_as_of=_AS_OF, _token="fixture")
     assert result["reference"]["status"] == "available"
 
 
@@ -226,7 +225,7 @@ def test_route_requires_explicit_date_and_aware_cutoff(monkeypatch, day, cutoff)
     from api.routers import intelligence_thesis as router
     monkeypatch.setattr(router, "get_db_engine", lambda: FakeEngine())
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(router.get_diary(date=day, reference_overlay=True, reference_as_of=cutoff, _token="fixture"))
+        router.get_diary(date=day, reference_overlay=True, reference_as_of=cutoff, _token="fixture")
     assert exc.value.status_code == 400
 
 

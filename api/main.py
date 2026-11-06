@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -30,6 +32,20 @@ from api.auth import require_auth, router as auth_router, verify_token
 
 _environment = os.getenv("ENVIRONMENT", "development")
 _start_time = time.time()
+
+# Per-statement timeout for this process's DB sessions. db.get_engine()
+# reads GRID_DB_STATEMENT_TIMEOUT_MS (default 120 s, sized for Hermes batch
+# jobs); an API statement past 60 s has already outlived Cloudflare's patience
+# for the request and only holds a pool connection. An explicit
+# GRID_DB_STATEMENT_TIMEOUT_MS still wins; GRID_API_DB_STATEMENT_TIMEOUT_MS
+# tunes just the API. The engine is created lazily, after this import. Only
+# when served by uvicorn: other processes import this module for helpers
+# (e.g. broadcast_event) and must keep their own batch-sized timeout.
+if "uvicorn" in sys.modules:
+    os.environ.setdefault(
+        "GRID_DB_STATEMENT_TIMEOUT_MS",
+        os.getenv("GRID_API_DB_STATEMENT_TIMEOUT_MS", "60000"),
+    )
 
 
 def _load_router(module_path: str, *, label: str, required: bool = False):
@@ -56,6 +72,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     loop = asyncio.get_event_loop()
 
     # ── Fast, non-blocking setup (must complete before yield) ─────────
+
+    # Event-loop lag watchdog: if anything synchronous ever runs on the loop
+    # for > 2 s again, the loop thread's stack lands in the journal.
+    try:
+        from api.loop_watchdog import EventLoopWatchdog
+        app.state.loop_watchdog = EventLoopWatchdog.for_running_loop()
+        app.state.loop_watchdog.start()
+    except Exception as exc:
+        log.warning("Event-loop watchdog not started: {e}", e=str(exc))
 
     asyncio.create_task(_ws_broadcast_loop())
 
@@ -89,7 +114,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log.debug("Alert scheduler start skipped: {e}", e=str(exc))
 
     # ── Schedule slow startup work in a separate thread so it NEVER blocks requests ──
-    import threading
 
     def _run_deferred_sync():
         """Run all deferred startup synchronously in a daemon thread."""
@@ -144,6 +168,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     log.info("GRID API shutting down")
+    if hasattr(app.state, "loop_watchdog"):
+        app.state.loop_watchdog.stop()
     try:
         from alerts.scheduler import stop_alerts
         stop_alerts()
@@ -197,25 +223,23 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("Spider graph engine warmup skipped: {e}", e=str(exc))
 
-    # Pre-warm the intelligence dashboard cache so first user request is instant
+    # Actor network graph (/intelligence/actor-network, preloaded by the PWA
+    # shell): build it now in its own thread so the endpoint, which never
+    # builds inline, has a graph to serve.
     try:
-        from api.routers.intelligence_risk import _build_dashboard_snapshot, _dashboard_cache
-        log.info("Pre-warming intelligence dashboard cache...")
-        snapshot = _build_dashboard_snapshot()
-        _dashboard_cache.set("intel_dashboard", snapshot)
-        log.info("Dashboard cache warmed — confidence={c}", c=snapshot.get("overall_confidence"))
+        from api.routers.intelligence_actors import warm_actor_graph_async
+        warm_actor_graph_async()
+        log.info("Actor network graph: background build started")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor network warmup skipped: {e}", e=str(exc))
 
-        # Periodic re-warm: rebuild cache every 9 min so it never goes cold (TTL is 10 min)
-        while True:
-            time.sleep(540)  # 9 minutes
-            try:
-                snapshot = _build_dashboard_snapshot()
-                _dashboard_cache.set("intel_dashboard", snapshot)
-                log.debug("Dashboard cache re-warmed — confidence={c}", c=snapshot.get("overall_confidence"))
-            except Exception as rewarm_exc:
-                log.warning("Dashboard re-warm failed: {e}", e=str(rewarm_exc))
-    except Exception as exc:
-        log.warning("Dashboard pre-warm failed (will build on first request): {e}", e=str(exc))
+    # Pre-warm the intelligence dashboard cache (and keep it warm) in its own
+    # thread. It used to run here as an endless ``while True`` loop, so
+    # nothing after it in this function ever ran (the sector-flow warm
+    # thread below only started lazily on a first request).
+    threading.Thread(
+        target=_dashboard_warm_loop, name="dashboard-warm", daemon=True,
+    ).start()
 
     # Pre-warm the sector flow cache so a freshly restarted process serves
     # the persisted payload instead of the empty/unavailable placeholder
@@ -228,6 +252,30 @@ def _sync_deferred_startup(app: FastAPI) -> None:
         log.warning("Sector flow warm thread startup skipped: {e}", e=str(exc))
 
     log.info("GRID API ready — serving requests")
+
+
+def _dashboard_warm_loop() -> None:
+    """Warm the intelligence dashboard cache, then re-warm every 9 min (TTL 10)."""
+    try:
+        from api.routers.intelligence_risk import _build_dashboard_snapshot, _dashboard_cache
+    except Exception as exc:
+        log.warning("Dashboard pre-warm unavailable: {e}", e=str(exc))
+        return
+    log.info("Pre-warming intelligence dashboard cache...")
+    try:
+        snapshot = _build_dashboard_snapshot()
+        _dashboard_cache.set("intel_dashboard", snapshot)
+        log.info("Dashboard cache warmed — confidence={c}", c=snapshot.get("overall_confidence"))
+    except Exception as exc:
+        log.warning("Dashboard pre-warm failed (will build on first request): {e}", e=str(exc))
+    while True:
+        time.sleep(540)  # 9 minutes
+        try:
+            snapshot = _build_dashboard_snapshot()
+            _dashboard_cache.set("intel_dashboard", snapshot)
+            log.debug("Dashboard cache re-warmed — confidence={c}", c=snapshot.get("overall_confidence"))
+        except Exception as rewarm_exc:
+            log.warning("Dashboard re-warm failed: {e}", e=str(rewarm_exc))
 
 
 app = FastAPI(
@@ -622,7 +670,7 @@ def _log_broadcast_failure(future: "asyncio.Future[None]") -> None:
 
 
 @app.get("/api/v1/realtime/recent")
-async def recent_realtime_events(
+def recent_realtime_events(
     since: str | None = Query(None, description="Only return events strictly newer than this ISO8601 timestamp"),
     before: str | None = Query(None, description="Only return events at or before this ISO8601 timestamp"),
     limit: int = Query(100, ge=1, le=200),
@@ -765,7 +813,7 @@ if _pwa_dist.exists():
         return FileResponse(str(path), headers=headers)
 
     @app.get("/visualizer")
-    async def serve_visualizer() -> FileResponse:
+    def serve_visualizer() -> FileResponse:
         """Serve the standalone data visualizer."""
         viz_path = _pwa_dist / "visualizer.html"
         if viz_path.exists():
@@ -773,7 +821,7 @@ if _pwa_dist.exists():
         return _pwa_file_response(_pwa_dist / "index.html")
 
     @app.get("/{full_path:path}")
-    async def serve_pwa(full_path: str) -> Response:
+    def serve_pwa(full_path: str) -> Response:
         """Serve PWA — return index.html for all non-API paths (SPA routing)."""
         if full_path.startswith("api/"):
             return JSONResponse({"detail": "Not found"}, status_code=404)
@@ -784,7 +832,7 @@ if _pwa_dist.exists():
 
 elif _pwa_src.exists():
     @app.get("/{full_path:path}")
-    async def serve_pwa_dev(full_path: str) -> Response:
+    def serve_pwa_dev(full_path: str) -> Response:
         """Serve PWA source in development."""
         if full_path.startswith("api/"):
             return JSONResponse({"detail": "Not found"}, status_code=404)

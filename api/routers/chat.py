@@ -1753,7 +1753,7 @@ def _maybe_trigger_timesfm(ticker: str) -> None:
 
 @router.post("/ask", response_model=ChatAskResponse)
 @_lf_observe(name="chat-ask", capture_input=False)
-async def ask_grid(
+def ask_grid(
     req: ChatAskRequest,
     token: str = Depends(require_auth),
 ) -> ChatAskResponse:
@@ -1786,7 +1786,7 @@ async def ask_grid(
     )
 
     with propagate_ctx:
-        return await _ask_grid_impl(
+        return _ask_grid_impl(
             req=req,
             question=question,
             ticker=ticker,
@@ -1795,7 +1795,7 @@ async def ask_grid(
         )
 
 
-async def _ask_grid_impl(
+def _ask_grid_impl(
     *,
     req: ChatAskRequest,
     question: str,
@@ -2183,7 +2183,7 @@ def _validate_compose_layout(raw: dict[str, Any], question: str) -> tuple[
 
 
 @router.post("/compose", response_model=ChatComposeResponse)
-async def compose_layout(
+def compose_layout(
     req: ChatComposeRequest,
     token: str = Depends(require_auth),
 ) -> ChatComposeResponse:
@@ -2583,7 +2583,7 @@ class CapabilityPingRequest(BaseModel):
 
 
 @router.post("/capability/{request_id}/ping")
-async def set_capability_ping(
+def set_capability_ping(
     request_id: int,
     req: CapabilityPingRequest,
     token: str = Depends(require_auth),
@@ -2605,7 +2605,7 @@ async def set_capability_ping(
 
 
 @router.post("/capability/{request_id}/ready")
-async def mark_capability_ready(request_id: int, token: str = Depends(require_auth)) -> dict:
+def mark_capability_ready(request_id: int, token: str = Depends(require_auth)) -> dict:
     """Operator marks a 'TODO for dad' request built. The owner then sees the
     in-app 'it's ready' banner next time they load (via /capability/ready)."""
     from sqlalchemy import text
@@ -2626,7 +2626,7 @@ async def mark_capability_ready(request_id: int, token: str = Depends(require_au
 
 
 @router.get("/capability")
-async def list_capability_requests(token: str = Depends(require_auth)) -> dict:
+def list_capability_requests(token: str = Depends(require_auth)) -> dict:
     """Operator view of the 'TODO for dad' build queue."""
     from sqlalchemy import text
     cols = ["id", "owner", "request_text", "want", "reason", "status", "dad_wants_ping", "created_at", "built_at"]
@@ -2643,7 +2643,7 @@ async def list_capability_requests(token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/capability/ready")
-async def capability_ready_for_me(token: str = Depends(require_auth)) -> dict:
+def capability_ready_for_me(token: str = Depends(require_auth)) -> dict:
     """Requests this user opted into that are now built — shown once as a banner."""
     from sqlalchemy import text
     owner = _user_id_from_token(token) or "dad"
@@ -2796,7 +2796,7 @@ def _stream_verdict(messages):
 
 
 @router.post("/ask/stream")
-async def ask_grid_stream(
+def ask_grid_stream(
     req: ChatAskRequest,
     token: str = Depends(require_auth),
 ):

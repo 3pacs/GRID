@@ -578,7 +578,7 @@ def _record_login_attempt(client_ip: str) -> None:
 # ── Routes ────────────────────────────────────────────────────
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest, request: Request) -> LoginResponse:
+def login(body: LoginRequest, request: Request) -> LoginResponse:
     """Authenticate with master password or user credentials."""
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
@@ -645,7 +645,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
 
 
 @router.post("/register", response_model=LoginResponse)
-async def register(body: RegisterRequest, request: Request) -> LoginResponse:
+def register(body: RegisterRequest, request: Request) -> LoginResponse:
     """Self-registration for new contributor accounts."""
     client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
@@ -696,13 +696,13 @@ async def register(body: RegisterRequest, request: Request) -> LoginResponse:
 
 
 @router.post("/logout")
-async def logout(_token: str = Depends(require_auth)) -> dict:
+def logout(_token: str = Depends(require_auth)) -> dict:
     """Log out (token expiry handles invalidation)."""
     return {"status": "ok"}
 
 
 @router.post("/stream-ticket", response_model=StreamTicketResponse)
-async def create_stream_ticket(
+def create_stream_ticket(
     body: StreamTicketRequest,
     token: str = Depends(require_auth),
 ) -> StreamTicketResponse:
@@ -711,7 +711,7 @@ async def create_stream_ticket(
 
 
 @router.get("/verify", response_model=TokenVerifyResponse)
-async def verify(token: str = Depends(require_auth)) -> TokenVerifyResponse:
+def verify(token: str = Depends(require_auth)) -> TokenVerifyResponse:
     """Verify current token is valid."""
     expires_at = get_token_expiry(token) or ""
     payload = decode_token(token) or {}
@@ -726,7 +726,7 @@ async def verify(token: str = Depends(require_auth)) -> TokenVerifyResponse:
 # ── User Management (admin-only) ─────────────────────────────
 
 @router.post("/users", response_model=UserResponse)
-async def create_user(
+def create_user(
     body: CreateUserRequest,
     _token: str = Depends(require_role("admin")),
 ) -> UserResponse:
@@ -769,7 +769,7 @@ async def create_user(
 
 
 @router.get("/users")
-async def list_users(
+def list_users(
     _token: str = Depends(require_role("admin")),
 ) -> list[UserResponse]:
     """List all user accounts (admin only)."""
@@ -800,7 +800,7 @@ async def list_users(
 
 
 @router.delete("/users/{username}")
-async def delete_user(
+def delete_user(
     username: str,
     _token: str = Depends(require_role("admin")),
 ) -> dict:

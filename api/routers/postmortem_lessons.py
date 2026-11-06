@@ -209,7 +209,7 @@ def _generate(engine, n: int, days: int) -> Any:
 
 
 @router.get("/postmortem-lessons")
-async def get_postmortem_lessons(
+def get_postmortem_lessons(
     n: int = Query(5, ge=1, le=200, description="Top-N postmortems to synthesize from"),
     days: int = Query(30, ge=1, le=365, description="Lookback days"),
     refresh: int = Query(0, ge=0, le=1, description="Set 1 to force regenerate"),

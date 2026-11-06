@@ -35,7 +35,7 @@ router = APIRouter(tags=["astrogrid"])
 
 
 @router.get("/overview")
-async def get_overview(
+def get_overview(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current state of all celestial systems with interpretations."""
@@ -151,7 +151,7 @@ async def get_overview(
 
 
 @router.get("/snapshot")
-async def get_snapshot(
+def get_snapshot(
     date_str: str | None = Query(
         alias="date", default=None, description="YYYY-MM-DD or ISO datetime"
     ),
@@ -289,7 +289,7 @@ def get_scoreable_universe(
 
 
 @router.post("/interpret")
-async def interpret_snapshot(
+def interpret_snapshot(
     req: AstrogridInterpretRequest,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

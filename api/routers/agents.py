@@ -54,7 +54,7 @@ def _run_in_background(ticker: str | None, as_of_date: date | None) -> None:
 
 
 @router.get("/status")
-async def agent_status() -> dict[str, Any]:
+def agent_status() -> dict[str, Any]:
     """Check whether agents are enabled and which LLM is configured."""
     tradingagents_installed = False
     try:
@@ -82,7 +82,7 @@ async def agent_status() -> dict[str, Any]:
 
 
 @router.post("/run")
-async def trigger_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+def trigger_run(req: RunRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     """Trigger a new TradingAgents deliberation run.
 
     The run executes in a background thread so the API responds immediately.
@@ -106,7 +106,7 @@ async def trigger_run(req: RunRequest, background_tasks: BackgroundTasks) -> dic
 
 
 @router.post("/run/sync")
-async def trigger_run_sync(req: RunRequest) -> dict[str, Any]:
+def trigger_run_sync(req: RunRequest) -> dict[str, Any]:
     """Trigger and wait for a TradingAgents run (blocking)."""
     if not settings.AGENTS_ENABLED:
         raise HTTPException(
@@ -124,7 +124,7 @@ async def trigger_run_sync(req: RunRequest) -> dict[str, Any]:
 
 
 @router.get("/runs")
-async def list_runs(
+def list_runs(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[dict[str, Any]]:
     """List recent agent runs."""
@@ -133,7 +133,7 @@ async def list_runs(
 
 
 @router.get("/runs/{run_id}")
-async def get_run(run_id: int) -> dict[str, Any]:
+def get_run(run_id: int) -> dict[str, Any]:
     """Get full details of a specific agent run."""
     runner = _get_runner()
     result = runner.get_run(run_id)
@@ -145,14 +145,14 @@ async def get_run(run_id: int) -> dict[str, Any]:
 # --- Backtesting ---
 
 @router.post("/backtest")
-async def run_backtest(req: BacktestRequest) -> dict[str, Any]:
+def run_backtest(req: BacktestRequest) -> dict[str, Any]:
     """Backtest agent decisions against journal outcomes."""
     bt = _get_backtester()
     return bt.run_backtest(ticker=req.ticker, days_back=req.days_back)
 
 
 @router.get("/backtest/summary")
-async def backtest_summary(
+def backtest_summary(
     days_back: int = Query(default=90, ge=1, le=365),
 ) -> dict[str, Any]:
     """Quick summary comparing agent vs GRID performance."""
@@ -163,7 +163,7 @@ async def backtest_summary(
 # --- Schedule ---
 
 @router.get("/schedule")
-async def get_schedule() -> dict[str, Any]:
+def get_schedule() -> dict[str, Any]:
     """Get agent schedule status."""
     try:
         from agents.scheduler import get_schedule_status
@@ -173,7 +173,7 @@ async def get_schedule() -> dict[str, Any]:
 
 
 @router.post("/schedule/start")
-async def start_schedule() -> dict[str, Any]:
+def start_schedule() -> dict[str, Any]:
     """Start the agent scheduler."""
     if not settings.AGENTS_ENABLED:
         raise HTTPException(status_code=503, detail="Agents disabled")
@@ -184,7 +184,7 @@ async def start_schedule() -> dict[str, Any]:
 
 
 @router.post("/schedule/stop")
-async def stop_schedule() -> dict[str, Any]:
+def stop_schedule() -> dict[str, Any]:
     """Stop the agent scheduler."""
     from agents.scheduler import stop_agent_scheduler, get_schedule_status
     stop_agent_scheduler()
