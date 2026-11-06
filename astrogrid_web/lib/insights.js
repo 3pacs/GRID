@@ -5,6 +5,46 @@ export function escapeHtml(value) {
     }[c]));
 }
 
+export function composeReaderResponse(reading, evidenceResponse) {
+    // A measured-flow lookup is context for the reader, never its replacement.
+    return {...reading, market_evidence:evidenceResponse?.answer || null};
+}
+
+export function readerAnswerMarkup(response) {
+    if (!response) return '';
+    const e = response.market_evidence;
+    return `<p>${escapeHtml(response.answer)}</p><div class="seer-support">Computed mystical interpretation · research and calibration below</div>
+        ${e ? `<details><summary>Measured market context</summary><p>${escapeHtml([e.call,e.timing,e.setup,e.invalidation].filter(Boolean).join(' · '))}</p></details>` : ''}`;
+}
+
+export function celestialMarkup(report) {
+    if (!report || report.version !== 'astrogrid-celestial-equity-v1') return '';
+    const bp = (v) => Number.isFinite(v) ? `${v.toFixed(2)} bp` : 'unavailable';
+    const interval = (v) => Array.isArray(v) ? `${bp(v[0])} to ${bp(v[1])}` : 'unavailable';
+    const assets = {SP500:'S&P 500',NASDAQCOM:'Nasdaq Composite',DJIA:'Dow'};
+    const row = (r) => `<tr><th scope="row">${assets[r.asset] || escapeHtml(r.asset)} · ${r.horizon_sessions} ${r.horizon_sessions === 1 ? 'session' : 'sessions'}</th><td>${r.events}</td><td>${bp(r.mean_net_bps)}</td><td>${bp(r.market_only_net_bps)}</td><td>${bp(r.baselines_net_bps.always_long)}</td><td>${bp(r.paired_advantage_bps)}<br><small>${interval(r.paired_95ci_bps)}</small></td><td>${r.eligible ? 'Unproven' : 'Insufficient sample'}</td></tr>`;
+    return `<section class="panel edge-panel" aria-label="Mystical equity research">
+        <div class="split-header"><h2>Mystical equity research</h2><span>twelve engines + sky</span></div>
+        <h3>Positive slices exist; incremental edge remains unproven in this test</h3>
+        <p>We tested the implemented twelve mystical engines and ${report.sky_feature_count} computed sky features against equity-index forecasts with market, volatility, interest-rate, credit and calendar controls. Annual past-data-only refits; final evaluation January 2024–October 2026. These are historical feature ablations, not historical LLM answers or live trades.</p>
+        <p>${report.declared_tests} declared comparisons: ${report.eligible_tests} met the sample floor, ${report.declared_tests - report.eligible_tests} had too few observations. ${report.corrected_incremental_tests} showed a net-return improvement after correction for the full search; ${report.historical_candidates} passed the combined net-return gate. This does not establish that celestial relationships are impossible.</p>
+        <div style="overflow-x:auto"><table><caption>All twelve engine features added to the market model · net basis points per event</caption><thead><tr><th scope="col">Equity index / horizon</th><th scope="col">Events</th><th scope="col">With mystical inputs</th><th scope="col">Market controls only</th><th scope="col">Always long</th><th scope="col">Added value / 95% interval</th><th scope="col">Evidence</th></tr></thead><tbody>${report.cases.map(row).join('')}</tbody></table></div>
+        <p>Some paper returns and improvements are positive; the intervals also admit losses or no improvement. Positive returns alone can reflect a rising market. Costs: illustrative 1bp commission + 1.5bp spread/slippage per side; 1bp = 0.01%. Index exposures and shorts are hypothetical, with no borrow/funding or executed-fill evidence.</p>
+        <details data-research-detail="celestial-methods"><summary>Sky features, regimes and full methodology</summary>
+            <p>The same model was tested with each engine separately, all twelve together, and the ${report.sky_feature_count} computed sky features including Sun/Moon/planet angles, retrogrades, aspects, lunar phase, nakshatra and tithi. Effects may interact with past trend and volatility states. The 20-session horizon has only about 35 nonoverlapping events per asset and fails the 100-event floor.</p>
+            <p>Initial training 2017–2020, reference evaluation 2021–2023, final test 2024–October 2026. Refit each January using only completed past labels. The market model controls past returns, volatility, trend, VIX, Treasury rates, yield curve, credit spreads, weekdays, months and annual seasonality. Source releases are lagged conservatively; current historical vintages remain retrospective evidence.</p>
+            <p>Entry is the next session close, exit 1/5/20 actual sessions later; exposure does not overlap within each case. Fixed ridge regularization, no parameter search. Twenty-session moving-block bootstrap, 1,999 replicates; Benjamini–Hochberg correction across all 126 declared tests. Regime breakdowns are descriptive, not selected winners.</p>
+            <table><caption>All computed sky features added to market controls</caption><thead><tr><th>Equity index / horizon</th><th>Events</th><th>With sky inputs</th><th>Market controls only</th><th>Always long</th><th>Added value / 95% interval</th><th>Evidence</th></tr></thead><tbody>${report.sky_cases.map(row).join('')}</tbody></table>
+            ${report.input_limitations.map((s) => `<p>${escapeHtml(s)}</p>`).join('')}
+            <p>This finite test does not cover every equity, every nonlinear model, every divination practice or all possible external factors. Rare events and missing inputs remain unvalidated. The reader and its original ledgers remain intact.</p>
+        </details>
+        <details data-research-detail="celestial-sources"><summary>Celestial research sources and reproducible results</summary>
+            <p>Generated ${escapeHtml(report.generated_at)}. <a href="./research/celestial-equity-v1.json">All 126 results, regime slices, baseline/cost comparisons and source hashes</a> · <a href="https://github.com/3pacs/GRID/blob/main/${encodeURI(report.protocol_path)}">Frozen celestial protocol</a></p>
+            <p><a href="https://fred.stlouisfed.org/series/SP500">S&P 500</a> · <a href="https://fred.stlouisfed.org/series/NASDAQCOM">Nasdaq Composite</a> · <a href="https://fred.stlouisfed.org/series/DJIA">Dow</a> · <a href="https://github.com/3pacs/GRID/blob/main/astrogrid_shared/prophecy.js">Implemented mystical engines</a></p>
+        </details>
+    </section>`;
+}
+
 export function edgeMarkup(report, live) {
     if (!report || report.version !== 'astrogrid-spot-flow-edge-v1') {
         return '<section class="panel" aria-label="Predictive edge"><h2>Predictive edge</h2><p>Evaluation unavailable. No demonstrated edge.</p></section>';
@@ -35,7 +75,7 @@ export function edgeMarkup(report, live) {
         ${Object.entries(test.strategies).map(([name, s]) => `<tr><th scope="row">${escapeHtml(names[name] || name)}</th><td>${bp(s.mean_net_bps)}</td><td>${ci(s.mean_net_95ci_bps)}</td></tr>`).join('')}
         </tbody></table></div>
         <p>Flow advantage over random direction: ${bp(test.paired_advantages.random_expected.mean_advantage_bps)} (paired 95% interval ${ci(test.paired_advantages.random_expected.advantage_95ci_bps)}). An interval spanning zero does not establish directional skill.</p>
-        <details><summary>Trading costs, sample and methodology</summary>
+        <details data-research-detail="flow-methods"><summary>Trading costs, sample and methodology</summary>
             <p>One year of checksum-verified Binance global spot archives, November 2025–October 2026; ${rows.toLocaleString()} validated bars, ${missing} missing bars and ${duplicates} duplicate timestamps. November–July is a separate reference period; August–October is the temporal test. No parameter tuning. Archives are current vintages, without historical receipt or fill evidence.</p>
             <p>Qualification: 100,000 USDT turnover, 100 trades, 10% absolute taker imbalance. Overlapping exposure removed separately for each asset. Seven-day moving-block bootstrap samples all assets together; 1,999 replicates. Positive historical support requires simultaneous improvement over cash and four matched baselines. Original 0.10% target hit rate is ${(test.forecast_close_basis.hit_rate * 100).toFixed(2)}%; target hits are not profitable fills.</p>
             <p>Costs are scenarios using current regular-user spot fees, not historical or account-specific rates. Paper shorts exclude borrowing, funding and availability. The long-only/cash restriction is shown separately; no live trades were executed.</p>
@@ -43,13 +83,13 @@ export function edgeMarkup(report, live) {
             <p>${Object.entries(report.per_month).map(([m, r]) => `${escapeHtml(m)}: ${r.sample.events.toLocaleString()} events, ${bp(r.strategies.flow.mean_net_bps)}`).join(' · ')}</p>
             <p>Per asset (descriptive): ${Object.entries(report.per_asset).map(([s, r]) => `${escapeHtml(s)} ${bp(r.strategies.flow.mean_net_bps)}`).join(' · ')}. Reference period: ${report.reference.sample.events.toLocaleString()} events, ${bp(report.reference.strategies.flow.mean_net_bps)} after the same costs.</p>
         </details>
-        <details><summary>Sources and reproducible results</summary>
+        <details data-research-detail="flow-sources"><summary>Sources and reproducible results</summary>
             <p>Analysis generated ${escapeHtml(report.generated_at)}. <a href="./research/spot-flow-edge-v1.json">Full results, per-asset comparisons and archive SHA256 checksums</a> · <a href="https://github.com/3pacs/GRID/blob/main/${encodeURI(report.protocol_path)}">Frozen protocol</a></p>
             ${report.sources.map((s) => `<p><a href="${escapeHtml(s.url)}">${escapeHtml(s.title)}</a></p>`).join('')}
         </details>
         <h3>Live prospective cohort — separate evidence</h3>
         <p>${live?.scored || 0} scored forecasts across ${live?.utc_dates || 0} UTC dates. ${live?.scored ? `Signal-close gross mean ${bp(live.mean_gross_bps)}; same cost scenario ${bp(live.mean_scenario_net_bps)}.` : ''} Overlapping calls and signal-close prices make this a diagnostic, not independent trading performance. Insufficient independent prospective evidence.</p>
-        <p>Current evidence does not justify trading or promoting this rule. The live rule and original forecast history remain unchanged.</p>
+        <p>This result concerns the taker-flow component only. The live rule and original forecast history remain unchanged.</p>
     </section>`;
 }
 
@@ -83,7 +123,7 @@ export function insightsMarkup(payload, error = '') {
             <div class="seer-support">${escapeHtml(evidence.validation)} · ${item.prediction_id ? `<a href="/api/v1/astrogrid/predictions/${encodeURIComponent(item.prediction_id)}">Evidence record</a>` : ''}</div>
         </article>`;
     }).join('');
-    return `${edgeMarkup(payload?.edge_assessment, payload?.prospective_cost_diagnostic)}<section class="panel insights-panel" aria-label="Market evidence">
+    return `${celestialMarkup(payload?.celestial_assessment)}<details class="panel" data-research-detail="flow-component"><summary>Taker-flow component: baselines and costs</summary>${edgeMarkup(payload?.edge_assessment, payload?.prospective_cost_diagnostic)}</details><section class="panel insights-panel" aria-label="Market evidence">
         <div class="split-header"><h2>Market evidence</h2><span>source-backed research</span></div>
         ${error ? `<p role="alert">${escapeHtml(error)}</p>` : ''}
         ${cards || `<p>${payload ? 'No fresh market evidence has been published yet.' : 'Loading market evidence…'}</p>`}

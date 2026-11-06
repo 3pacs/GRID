@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('../../astrogrid_web/lib/insights.js', import.meta.url), 'utf8');
-const { insightsMarkup } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { insightsMarkup, composeReaderResponse, readerAnswerMarkup } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 test('missing or failed evidence never shows fabricated accuracy or a live call', () => {
     const text = insightsMarkup({ items: [], performance: { scored: 0, accuracy: null } });
     assert.match(text, /No validated forecast track record/);
@@ -68,4 +68,36 @@ test('edge assessment distinguishes cost-aware historical replay from prospectiv
     assert.match(text,/Insufficient independent prospective evidence/);
     assert.match(text,/Full results, per-asset comparisons and archive SHA256 checksums/);
     assert.doesNotMatch(text,/positive trading edge|validated alpha/);
+});
+
+test('mystical research exposes conditional results without universal claims or hidden sample failures', () => {
+    const full = JSON.parse(readFileSync(new URL('../../astrogrid_web/research/celestial-equity-v1.json', import.meta.url)));
+    const report = {...full,cases:full.cases.filter((r) => r.augmentation==='all_engines'),
+        sky_cases:full.cases.filter((r) => r.augmentation==='all_sky')};
+    const text = insightsMarkup({items:[],celestial_assessment:report});
+    assert.match(text,/Mystical equity research/);
+    assert.match(text,/126 declared comparisons: 84 met the sample floor, 42 had too few observations/);
+    assert.match(text,/does not establish that celestial relationships are impossible/);
+    assert.match(text,/Nasdaq Composite/);
+    assert.match(text,/Always long/);
+    assert.match(text,/Insufficient sample/);
+    assert.match(text,/historical feature ablations, not historical LLM answers or live trades/);
+    assert.match(text,/245 computed sky features/);
+    assert.match(text,/All 126 results, regime slices, baseline\/cost comparisons and source hashes/);
+    assert.doesNotMatch(text,/proved astrology|no celestial relationship exists|validated trading edge/);
+});
+
+test('a flow lookup cannot erase the chosen mystical reading or its lens permissions', () => {
+    const reading={answer:'The lunar knot points to patience <script>unsafe</script>',
+        persona_name:'Lunar Knot',allowed_lenses:['vedic'],excluded_lenses:['western']};
+    const result=composeReaderResponse(reading,{answer:{call:'No qualified directional forecast',setup:'BTC only'}});
+    assert.equal(result.answer,reading.answer);
+    assert.deepEqual(result.allowed_lenses,['vedic']);
+    assert.deepEqual(result.excluded_lenses,['western']);
+    const markup=readerAnswerMarkup(result);
+    assert.match(markup,/The lunar knot points to patience/);
+    assert.match(markup,/Measured market context/);
+    assert.match(markup,/No qualified directional forecast/);
+    assert.doesNotMatch(markup,/<script>/);
+    assert.equal(composeReaderResponse(reading,null).answer,reading.answer);
 });

@@ -1,4 +1,4 @@
-import { insightsMarkup } from './lib/insights.js?v=20261105-edge1';
+import { insightsMarkup, composeReaderResponse, readerAnswerMarkup } from './lib/insights.js?v=20261105-celestial1';
 import { computePosition, getFullEphemeris } from './lib/ephemeris.js';
 import {
     getAstrogridDefaultApiBaseUrl,
@@ -106,6 +106,8 @@ const state = {
     insights: null,
     insightsError: '',
     predictionFeedOpen: false,
+    researchOpen: false,
+    researchDetailsOpen: {},
     predictionFeedLoading: false,
     predictionFeedError: '',
     predictionFeed: [],
@@ -1016,29 +1018,9 @@ async function handlePersonaSubmit() {
         answer: response.answer,
     });
 
-    const directive = buildOracleDirective();
-    state.personaResponse = directive
-        ? buildLocalGuruResponse(response, directive)
-        : response;
+    state.personaResponse = response;
     const guruResponse = await submitGuruQuestion();
-    state.guruThinking = false;
-    if (guruResponse?.answer) {
-        state.personaResponse = {
-            ...response,
-            persona_name: 'Guru',
-            mode: guruResponse.answer.horizon || response.mode,
-            answer: [
-                guruResponse.answer.call,
-                guruResponse.answer.timing,
-                guruResponse.answer.setup,
-                `Invalidation: ${guruResponse.answer.invalidation}`,
-            ].filter(Boolean).join(' | '),
-            allowed_lenses: ['market evidence'],
-        };
-    } else {
-        state.personaResponse = { ...response, persona_name: 'Guru', allowed_lenses: ['market evidence'],
-            answer: 'Market evidence unavailable. No forecast issued.' };
-    }
+    state.personaResponse = composeReaderResponse(response, guruResponse);
     state.guruThinking = false;
     render();
 }
@@ -2311,18 +2293,17 @@ function render() {
                     </div>
                     <div class="seer-support">lens: ${formatLensList(state.personaResponse.allowed_lenses || []) || state.personaResponse.declared_lens || 'none'}</div>
                     ${(state.personaResponse.excluded_lenses || []).length ? `<div class="seer-conflicts">excludes: ${formatLensList(state.personaResponse.excluded_lenses || [])}</div>` : ''}
-                    <div>${compactDirectiveLine(state.personaResponse.answer, 220)}</div>
+                    ${readerAnswerMarkup(state.personaResponse)}
                 </div>
             ` : '<div class="empty">Ask for a read.</div>'}
             ${predictionPostmortemMarkup(state.latestPrediction)}
         </div>
     `;
     const oraclePage = `
-        ${insightsMarkup(state.insights, state.insightsError)}
         <div class="oracle-grid">
             <div class="panel hero-panel oracle-hero-panel">
                 <div class="split-header">
-                    <h2>Symbolic reading</h2>
+                    <h2>Oracle reading</h2>
                     <div class="subtle">${state.seer ? `${state.seer.confidence_band || 'unrated'} / ${state.seer.horizon}` : 'Awaiting brief.'}</div>
                 </div>
                 ${state.seer ? `
@@ -2342,6 +2323,9 @@ function render() {
                 </div>
             </div>
         </div>
+        <details class="panel" id="oracle-research" ${state.researchOpen ? 'open' : ''}><summary>Prediction research and track record</summary>
+            ${insightsMarkup(state.insights, state.insightsError)}
+        </details>
     `;
     const observatoryPage = `
         <div class="stage-grid">
@@ -2710,6 +2694,14 @@ function render() {
     });
 
     document.getElementById('persona-ask')?.addEventListener('click', handlePersonaSubmit);
+    document.getElementById('oracle-research')?.addEventListener('toggle', (event) => {
+        state.researchOpen = Boolean(event.target.open);
+    });
+    document.querySelectorAll('#oracle-research details[data-research-detail]').forEach((detail) => {
+        const key = detail.dataset.researchDetail;
+        detail.open = Boolean(state.researchDetailsOpen[key]);
+        detail.addEventListener('toggle', () => { state.researchDetailsOpen[key] = detail.open; });
+    });
 
     document.querySelector('.prediction-feed-drawer')?.addEventListener('toggle', (event) => {
         state.predictionFeedOpen = Boolean(event.target.open);
