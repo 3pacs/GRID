@@ -1,0 +1,1356 @@
+{
+  "version": "astrogrid-spot-flow-edge-v1",
+  "model_version": "astrogrid-spot-flow-v1",
+  "contract_version": "binance_spot_taker_30m_v1",
+  "origin": "historical_archive_replay_not_prospective",
+  "protocol_path": "docs/research/astrogrid-spot-flow-edge-v1-protocol.md",
+  "verdict": "NO_POSITIVE_NET_RETURN",
+  "test": {
+    "sample": {
+      "start": "2026-08-01T00:00:00+00:00",
+      "end_exclusive": "2026-11-01T00:00:00+00:00",
+      "events": 10854,
+      "utc_dates": 92,
+      "per_asset": {
+        "BTC": 3637,
+        "ETH": 3621,
+        "SOL": 3596
+      },
+      "minimum_sample_met": true
+    },
+    "strategies": {
+      "flow": {
+        "mean_net_bps": -23.940951939568635,
+        "mean_net_95ci_bps": [
+          -24.749001098703545,
+          -23.0757426275078
+        ],
+        "net_positive_share": 0.15579509858116825
+      },
+      "cash": {
+        "mean_net_bps": 0.0,
+        "mean_net_95ci_bps": [
+          0.0,
+          0.0
+        ],
+        "net_positive_share": 0.0
+      },
+      "always_long": {
+        "mean_net_bps": -23.417118032789972,
+        "mean_net_95ci_bps": [
+          -24.57331409929743,
+          -22.023224269722604
+        ],
+        "net_positive_share": 0.16058595909342177
+      },
+      "always_short": {
+        "mean_net_bps": -24.584282564648397,
+        "mean_net_95ci_bps": [
+          -25.9815256919841,
+          -23.42530829373589
+        ],
+        "net_positive_share": 0.15459738345310484
+      },
+      "price_momentum": {
+        "mean_net_bps": -23.46896926204527,
+        "mean_net_95ci_bps": [
+          -24.217997453652238,
+          -22.64511035619639
+        ],
+        "net_positive_share": 0.15376819605675326
+      },
+      "random_expected": {
+        "mean_net_bps": -24.000700298719135,
+        "mean_net_95ci_bps": [
+          -24.00237498085335,
+          -23.99931119651667
+        ],
+        "net_positive_share": 0.0
+      },
+      "reverse_flow": {
+        "mean_net_bps": -24.060448657869724,
+        "mean_net_95ci_bps": [
+          -24.92814978829083,
+          -23.250982660014365
+        ],
+        "net_positive_share": 0.1593882439653584
+      },
+      "long_only_flow": {
+        "mean_net_bps": -11.722944013640559,
+        "mean_net_95ci_bps": [
+          -12.555104544033417,
+          -10.817153976162434
+        ],
+        "net_positive_share": 0.08135249677538235
+      }
+    },
+    "paired_advantages": {
+      "cash": {
+        "mean_advantage_bps": -23.94095193956854,
+        "advantage_95ci_bps": [
+          -24.749001098703545,
+          -23.0757426275078
+        ],
+        "simultaneous_lower_bps": -24.9010634895487
+      },
+      "always_long": {
+        "mean_advantage_bps": -0.5238339067785602,
+        "advantage_95ci_bps": [
+          -1.7731247157875187,
+          0.7006125687622867
+        ],
+        "simultaneous_lower_bps": -1.973168107163609
+      },
+      "always_short": {
+        "mean_advantage_bps": 0.643330625079709,
+        "advantage_95ci_bps": [
+          -0.9166794620004055,
+          2.5326683187944767
+        ],
+        "simultaneous_lower_bps": -1.1361598089477287
+      },
+      "price_momentum": {
+        "mean_advantage_bps": -0.47198267752332673,
+        "advantage_95ci_bps": [
+          -1.0875231323589958,
+          0.11108046950915379
+        ],
+        "simultaneous_lower_bps": -1.222749469428345
+      },
+      "random_expected": {
+        "mean_advantage_bps": 0.05974835915057435,
+        "advantage_95ci_bps": [
+          -0.7489809088700771,
+          0.9254934408149224
+        ],
+        "simultaneous_lower_bps": -0.9000807037726996
+      }
+    },
+    "flow_gross_mean_bps": 0.05974835915057435,
+    "flow_fees_only_mean_bps": -19.940835223115357,
+    "forecast_close_basis": {
+      "hit_rate": 0.3073521282476506,
+      "hits": 3336,
+      "direction_accuracy": 0.482494932743689,
+      "mean_signed_bps": -0.08021941961043634,
+      "naive_hit_wilson_95": [
+        0.2987413979294209,
+        0.31609917458578873
+      ],
+      "basis": "Original signal close to +35m outcome; no fill/cost credit"
+    },
+    "cost_sensitivity": [
+      {
+        "roundtrip_bps": 0,
+        "flow_mean_net_bps": 0.05974835915057435
+      },
+      {
+        "roundtrip_bps": 8,
+        "flow_mean_net_bps": -7.940485073755798
+      },
+      {
+        "roundtrip_bps": 20,
+        "flow_mean_net_bps": -19.940835223115357
+      },
+      {
+        "roundtrip_bps": 24,
+        "flow_mean_net_bps": -23.94095193956854
+      },
+      {
+        "roundtrip_bps": 40,
+        "flow_mean_net_bps": -39.94141880538128
+      }
+    ]
+  },
+  "reference": {
+    "sample": {
+      "start": "2025-11-01T00:00:00+00:00",
+      "end_exclusive": "2026-08-01T00:00:00+00:00",
+      "events": 32151,
+      "utc_dates": 273,
+      "per_asset": {
+        "BTC": 10762,
+        "ETH": 10719,
+        "SOL": 10670
+      },
+      "minimum_sample_met": true
+    },
+    "strategies": {
+      "flow": {
+        "mean_net_bps": -24.06511722152522,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.19946502441603683
+      },
+      "cash": {
+        "mean_net_bps": 0.0,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.0
+      },
+      "always_long": {
+        "mean_net_bps": -24.446378853304143,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.19750552082361358
+      },
+      "always_short": {
+        "mean_net_bps": -23.55254855033219,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.20549905135143542
+      },
+      "price_momentum": {
+        "mean_net_bps": -24.280835489052425,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.19268451992161986
+      },
+      "random_expected": {
+        "mean_net_bps": -23.9994637018182,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.0
+      },
+      "reverse_flow": {
+        "mean_net_bps": -23.93381018211108,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.20353954775901217
+      },
+      "long_only_flow": {
+        "mean_net_bps": -11.790548036345932,
+        "mean_net_95ci_bps": null,
+        "net_positive_share": 0.09343410780380082
+      }
+    },
+    "paired_advantages": {
+      "cash": {
+        "mean_advantage_bps": -24.06511722152528,
+        "advantage_95ci_bps": null,
+        "simultaneous_lower_bps": null
+      },
+      "always_long": {
+        "mean_advantage_bps": 0.3812616317790635,
+        "advantage_95ci_bps": null,
+        "simultaneous_lower_bps": null
+      },
+      "always_short": {
+        "mean_advantage_bps": -0.5125686711931905,
+        "advantage_95ci_bps": null,
+        "simultaneous_lower_bps": null
+      },
+      "price_momentum": {
+        "mean_advantage_bps": 0.21571826752695927,
+        "advantage_95ci_bps": null,
+        "simultaneous_lower_bps": null
+      },
+      "random_expected": {
+        "mean_advantage_bps": -0.06565351970706347,
+        "advantage_95ci_bps": null,
+        "simultaneous_lower_bps": null
+      }
+    },
+    "flow_gross_mean_bps": -0.06565351970706347,
+    "flow_fees_only_mean_bps": -20.065206604555577,
+    "forecast_close_basis": {
+      "hit_rate": 0.3457746259836397,
+      "hits": 11117,
+      "direction_accuracy": 0.48315760007464775,
+      "mean_signed_bps": -0.037117782602898414,
+      "naive_hit_wilson_95": [
+        0.3405944331635621,
+        0.35099166864632336
+      ],
+      "basis": "Original signal close to +35m outcome; no fill/cost credit"
+    },
+    "cost_sensitivity": [
+      {
+        "roundtrip_bps": 0,
+        "flow_mean_net_bps": -0.06565351970706347
+      },
+      {
+        "roundtrip_bps": 8,
+        "flow_mean_net_bps": -8.06547475364647
+      },
+      {
+        "roundtrip_bps": 20,
+        "flow_mean_net_bps": -20.065206604555577
+      },
+      {
+        "roundtrip_bps": 24,
+        "flow_mean_net_bps": -24.06511722152528
+      },
+      {
+        "roundtrip_bps": 40,
+        "flow_mean_net_bps": -40.06475968940409
+      }
+    ]
+  },
+  "selection": {
+    "test": {
+      "qualified_bars": 60752,
+      "overlapping_skipped": 49896,
+      "boundary_purged": 2,
+      "retained": 10854
+    },
+    "reference": {
+      "qualified_bars": 178239,
+      "overlapping_skipped": 146085,
+      "boundary_purged": 3,
+      "retained": 32151
+    }
+  },
+  "data_quality": {
+    "BTC": {
+      "rows": 105120,
+      "expected_rows": 105120,
+      "missing_bars": 0,
+      "duplicates": 0,
+      "first_bar_end": "2025-11-01T00:05:00+00:00",
+      "last_bar_end": "2026-11-01T00:00:00+00:00"
+    },
+    "ETH": {
+      "rows": 105120,
+      "expected_rows": 105120,
+      "missing_bars": 0,
+      "duplicates": 0,
+      "first_bar_end": "2025-11-01T00:05:00+00:00",
+      "last_bar_end": "2026-11-01T00:00:00+00:00"
+    },
+    "SOL": {
+      "rows": 105120,
+      "expected_rows": 105120,
+      "missing_bars": 0,
+      "duplicates": 0,
+      "first_bar_end": "2025-11-01T00:05:00+00:00",
+      "last_bar_end": "2026-11-01T00:00:00+00:00"
+    }
+  },
+  "per_asset": {
+    "BTC": {
+      "sample": {
+        "start": "2026-08-01T00:00:00+00:00",
+        "end_exclusive": "2026-11-01T00:00:00+00:00",
+        "events": 3637,
+        "utc_dates": 92,
+        "per_asset": {
+          "BTC": 3637,
+          "ETH": 0,
+          "SOL": 0
+        },
+        "minimum_sample_met": false
+      },
+      "strategies": {
+        "flow": {
+          "mean_net_bps": -23.762718300197246,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.11053065713500138
+        },
+        "cash": {
+          "mean_net_bps": 0.0,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "always_long": {
+          "mean_net_bps": -23.577371671272566,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.11135551278526258
+        },
+        "always_short": {
+          "mean_net_bps": -24.42364385534826,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.10365686004949135
+        },
+        "price_momentum": {
+          "mean_net_bps": -23.7827897111896,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.10613142700027495
+        },
+        "random_expected": {
+          "mean_net_bps": -24.00050776331045,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "reverse_flow": {
+          "mean_net_bps": -24.238297226423583,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.10448171569975254
+        },
+        "long_only_flow": {
+          "mean_net_bps": -12.253931578142518,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.056365136101182295
+        }
+      },
+      "paired_advantages": {
+        "cash": {
+          "mean_advantage_bps": -23.762718300197285,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_long": {
+          "mean_advantage_bps": -0.18534662892468345,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_short": {
+          "mean_advantage_bps": 0.6609255551510075,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "price_momentum": {
+          "mean_advantage_bps": 0.020071410992359772,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "random_expected": {
+          "mean_advantage_bps": 0.23778946311316196,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        }
+      },
+      "flow_gross_mean_bps": 0.23778946311316196,
+      "flow_fees_only_mean_bps": -19.762633672978875,
+      "forecast_close_basis": {
+        "hit_rate": 0.26560351938410776,
+        "hits": 966,
+        "direction_accuracy": 0.4847401704701677,
+        "mean_signed_bps": -0.06851379646226793,
+        "naive_hit_wilson_95": [
+          0.25150274667686456,
+          0.28019891644574035
+        ],
+        "basis": "Original signal close to +35m outcome; no fill/cost credit"
+      },
+      "cost_sensitivity": [
+        {
+          "roundtrip_bps": 0,
+          "flow_mean_net_bps": 0.23778946311316196
+        },
+        {
+          "roundtrip_bps": 8,
+          "flow_mean_net_bps": -7.762379791323654
+        },
+        {
+          "roundtrip_bps": 20,
+          "flow_mean_net_bps": -19.762633672978875
+        },
+        {
+          "roundtrip_bps": 24,
+          "flow_mean_net_bps": -23.762718300197285
+        },
+        {
+          "roundtrip_bps": 40,
+          "flow_mean_net_bps": -39.76305680907092
+        }
+      ]
+    },
+    "ETH": {
+      "sample": {
+        "start": "2026-08-01T00:00:00+00:00",
+        "end_exclusive": "2026-11-01T00:00:00+00:00",
+        "events": 3621,
+        "utc_dates": 92,
+        "per_asset": {
+          "BTC": 0,
+          "ETH": 3621,
+          "SOL": 0
+        },
+        "minimum_sample_met": false
+      },
+      "strategies": {
+        "flow": {
+          "mean_net_bps": -24.298006667987213,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.1516155758077879
+        },
+        "cash": {
+          "mean_net_bps": 0.0,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "always_long": {
+          "mean_net_bps": -23.529651860919525,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.15990057995028997
+        },
+        "always_short": {
+          "mean_net_bps": -24.471478330844366,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.1543772438552886
+        },
+        "price_momentum": {
+          "mean_net_bps": -23.240524286566103,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.15603424468378901
+        },
+        "random_expected": {
+          "mean_net_bps": -24.00056509588199,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "reverse_flow": {
+          "mean_net_bps": -23.703123523776682,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.16266224799779067
+        },
+        "long_only_flow": {
+          "mean_net_bps": -11.194229891999955,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0767743717205192
+        }
+      },
+      "paired_advantages": {
+        "cash": {
+          "mean_advantage_bps": -24.29800666798723,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_long": {
+          "mean_advantage_bps": -0.7683548070676988,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_short": {
+          "mean_advantage_bps": 0.17347166285713878,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "price_momentum": {
+          "mean_advantage_bps": -1.057482381421146,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "random_expected": {
+          "mean_advantage_bps": -0.29744157210528,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        }
+      },
+      "flow_gross_mean_bps": -0.29744157210528,
+      "flow_fees_only_mean_bps": -20.29791248534024,
+      "forecast_close_basis": {
+        "hit_rate": 0.2990886495443248,
+        "hits": 1083,
+        "direction_accuracy": 0.47832090582711956,
+        "mean_signed_bps": -0.674373199976193,
+        "naive_hit_wilson_95": [
+          0.28439493960682405,
+          0.31420819475663875
+        ],
+        "basis": "Original signal close to +35m outcome; no fill/cost credit"
+      },
+      "cost_sensitivity": [
+        {
+          "roundtrip_bps": 0,
+          "flow_mean_net_bps": -0.29744157210528
+        },
+        {
+          "roundtrip_bps": 8,
+          "flow_mean_net_bps": -8.297629937399265
+        },
+        {
+          "roundtrip_bps": 20,
+          "flow_mean_net_bps": -20.29791248534024
+        },
+        {
+          "roundtrip_bps": 24,
+          "flow_mean_net_bps": -24.29800666798723
+        },
+        {
+          "roundtrip_bps": 40,
+          "flow_mean_net_bps": -40.298383398575204
+        }
+      ]
+    },
+    "SOL": {
+      "sample": {
+        "start": "2026-08-01T00:00:00+00:00",
+        "end_exclusive": "2026-11-01T00:00:00+00:00",
+        "events": 3596,
+        "utc_dates": 92,
+        "per_asset": {
+          "BTC": 0,
+          "ETH": 0,
+          "SOL": 3596
+        },
+        "minimum_sample_met": false
+      },
+      "strategies": {
+        "flow": {
+          "mean_net_bps": -23.761680686728972,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.20578420467185762
+        },
+        "cash": {
+          "mean_net_bps": 0.0,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "always_long": {
+          "mean_net_bps": -23.141721070938292,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.2110678531701891
+        },
+        "always_short": {
+          "mean_net_bps": -24.86034127330438,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.20634037819799778
+        },
+        "price_momentum": {
+          "mean_net_bps": -23.38160393464571,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.19966629588431592
+        },
+        "random_expected": {
+          "mean_net_bps": -24.0010311721214,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "reverse_flow": {
+          "mean_net_bps": -24.2403816575137,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.21162402669632926
+        },
+        "long_only_flow": {
+          "mean_net_bps": -11.71829219561151,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.11123470522803114
+        }
+      },
+      "paired_advantages": {
+        "cash": {
+          "mean_advantage_bps": -23.76168068672904,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_long": {
+          "mean_advantage_bps": -0.619959615790679,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_short": {
+          "mean_advantage_bps": 1.0986605865754304,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "price_momentum": {
+          "mean_advantage_bps": -0.38007675208326797,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "random_expected": {
+          "mean_advantage_bps": 0.23935048539237563,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        }
+      },
+      "flow_gross_mean_bps": 0.23935048539237563,
+      "flow_fees_only_mean_bps": -19.761508824708805,
+      "forecast_close_basis": {
+        "hit_rate": 0.3578976640711902,
+        "hits": 1287,
+        "direction_accuracy": 0.4844271412680756,
+        "mean_signed_bps": 0.5062259328129554,
+        "naive_hit_wilson_95": [
+          0.34238870689716455,
+          0.37370990141910093
+        ],
+        "basis": "Original signal close to +35m outcome; no fill/cost credit"
+      },
+      "cost_sensitivity": [
+        {
+          "roundtrip_bps": 0,
+          "flow_mean_net_bps": 0.23935048539237563
+        },
+        {
+          "roundtrip_bps": 8,
+          "flow_mean_net_bps": -7.760993238648099
+        },
+        {
+          "roundtrip_bps": 20,
+          "flow_mean_net_bps": -19.761508824708805
+        },
+        {
+          "roundtrip_bps": 24,
+          "flow_mean_net_bps": -23.76168068672904
+        },
+        {
+          "roundtrip_bps": 40,
+          "flow_mean_net_bps": -39.762368134809996
+        }
+      ]
+    }
+  },
+  "per_month": {
+    "2026-08": {
+      "sample": {
+        "start": "2026-08-01T00:00:00+00:00",
+        "end_exclusive": "2026-11-01T00:00:00+00:00",
+        "events": 3641,
+        "utc_dates": 31,
+        "per_asset": {
+          "BTC": 1228,
+          "ETH": 1219,
+          "SOL": 1194
+        },
+        "minimum_sample_met": false
+      },
+      "strategies": {
+        "flow": {
+          "mean_net_bps": -23.38498692759114,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.14446580609722603
+        },
+        "cash": {
+          "mean_net_bps": 0.0,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "always_long": {
+          "mean_net_bps": -21.864280859223168,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.15133205163416644
+        },
+        "always_short": {
+          "mean_net_bps": -26.140851024975767,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.12963471573743476
+        },
+        "price_momentum": {
+          "mean_net_bps": -22.969724291262185,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.14117000823949463
+        },
+        "random_expected": {
+          "mean_net_bps": -24.002565942099423,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "reverse_flow": {
+          "mean_net_bps": -24.620144956607792,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.13650096127437517
+        },
+        "long_only_flow": {
+          "mean_net_bps": -10.43586099187544,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.08129634715737435
+        }
+      },
+      "paired_advantages": {
+        "cash": {
+          "mean_advantage_bps": -23.384986927591136,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_long": {
+          "mean_advantage_bps": -1.520706068367986,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_short": {
+          "mean_advantage_bps": 2.755864097384616,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "price_momentum": {
+          "mean_advantage_bps": -0.4152626363289563,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "random_expected": {
+          "mean_advantage_bps": 0.6175790145083148,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        }
+      },
+      "flow_gross_mean_bps": 0.6175790145083148,
+      "flow_fees_only_mean_bps": -19.384559270574563,
+      "forecast_close_basis": {
+        "hit_rate": 0.2892062620159297,
+        "hits": 1053,
+        "direction_accuracy": 0.48228508651469376,
+        "mean_signed_bps": 0.6412144762048553,
+        "naive_hit_wilson_95": [
+          0.2747075432983949,
+          0.3041493103281942
+        ],
+        "basis": "Original signal close to +35m outcome; no fill/cost credit"
+      },
+      "cost_sensitivity": [
+        {
+          "roundtrip_bps": 0,
+          "flow_mean_net_bps": 0.6175790145083148
+        },
+        {
+          "roundtrip_bps": 8,
+          "flow_mean_net_bps": -7.383276299524836
+        },
+        {
+          "roundtrip_bps": 20,
+          "flow_mean_net_bps": -19.384559270574563
+        },
+        {
+          "roundtrip_bps": 24,
+          "flow_mean_net_bps": -23.384986927591136
+        },
+        {
+          "roundtrip_bps": 40,
+          "flow_mean_net_bps": -39.38669755565744
+        }
+      ]
+    },
+    "2026-09": {
+      "sample": {
+        "start": "2026-08-01T00:00:00+00:00",
+        "end_exclusive": "2026-11-01T00:00:00+00:00",
+        "events": 3542,
+        "utc_dates": 30,
+        "per_asset": {
+          "BTC": 1183,
+          "ETH": 1177,
+          "SOL": 1182
+        },
+        "minimum_sample_met": false
+      },
+      "strategies": {
+        "flow": {
+          "mean_net_bps": -24.38387869774424,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.16854884246188595
+        },
+        "cash": {
+          "mean_net_bps": 0.0,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "always_long": {
+          "mean_net_bps": -23.368980133301594,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.1821005081874647
+        },
+        "always_short": {
+          "mean_net_bps": -24.63253613389905,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.17447769621682666
+        },
+        "price_momentum": {
+          "mean_net_bps": -23.918932282306,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.16883116883116883
+        },
+        "random_expected": {
+          "mean_net_bps": -24.000758133600407,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "reverse_flow": {
+          "mean_net_bps": -23.617637569456427,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.1880293619424054
+        },
+        "long_only_flow": {
+          "mean_net_bps": -11.713200487677335,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.08723884810841333
+        }
+      },
+      "paired_advantages": {
+        "cash": {
+          "mean_advantage_bps": -24.383878697744258,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_long": {
+          "mean_advantage_bps": -1.0148985644426285,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_short": {
+          "mean_advantage_bps": 0.24865743615482783,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "price_momentum": {
+          "mean_advantage_bps": -0.4649464154382152,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "random_expected": {
+          "mean_advantage_bps": -0.3831205641439004,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        }
+      },
+      "flow_gross_mean_bps": -0.3831205641439004,
+      "flow_fees_only_mean_bps": -20.3837523421442,
+      "forecast_close_basis": {
+        "hit_rate": 0.32495765104460755,
+        "hits": 1151,
+        "direction_accuracy": 0.47656691134952006,
+        "mean_signed_bps": -0.6185269907006582,
+        "naive_hit_wilson_95": [
+          0.30973027563469135,
+          0.3405642977689345
+        ],
+        "basis": "Original signal close to +35m outcome; no fill/cost credit"
+      },
+      "cost_sensitivity": [
+        {
+          "roundtrip_bps": 0,
+          "flow_mean_net_bps": -0.3831205641439004
+        },
+        {
+          "roundtrip_bps": 8,
+          "flow_mean_net_bps": -8.383373275344022
+        },
+        {
+          "roundtrip_bps": 20,
+          "flow_mean_net_bps": -20.3837523421442
+        },
+        {
+          "roundtrip_bps": 24,
+          "flow_mean_net_bps": -24.383878697744258
+        },
+        {
+          "roundtrip_bps": 40,
+          "flow_mean_net_bps": -40.384384120144496
+        }
+      ]
+    },
+    "2026-10": {
+      "sample": {
+        "start": "2026-08-01T00:00:00+00:00",
+        "end_exclusive": "2026-11-01T00:00:00+00:00",
+        "events": 3671,
+        "utc_dates": 31,
+        "per_asset": {
+          "BTC": 1226,
+          "ETH": 1225,
+          "SOL": 1220
+        },
+        "minimum_sample_met": false
+      },
+      "strategies": {
+        "flow": {
+          "mean_net_bps": -24.065011332418248,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.15472623263415963
+        },
+        "cash": {
+          "mean_net_bps": 0.0,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "always_long": {
+          "mean_net_bps": -25.003711492050275,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.14900572051212205
+        },
+        "always_short": {
+          "mean_net_bps": -22.993876706206617,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.16017433941705259
+        },
+        "price_momentum": {
+          "mean_net_bps": -23.529983133158574,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.1517297739035685
+        },
+        "random_expected": {
+          "mean_net_bps": -23.998794099128443,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.0
+        },
+        "reverse_flow": {
+          "mean_net_bps": -23.93257686583862,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.15445382729501497
+        },
+        "long_only_flow": {
+          "mean_net_bps": -13.008909922441717,
+          "mean_net_95ci_bps": null,
+          "net_positive_share": 0.07572868428221192
+        }
+      },
+      "paired_advantages": {
+        "cash": {
+          "mean_advantage_bps": -24.065011332418262,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_long": {
+          "mean_advantage_bps": 0.9387001596320173,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "always_short": {
+          "mean_advantage_bps": -1.0711346262115566,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "price_momentum": {
+          "mean_advantage_bps": -0.535028199259684,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        },
+        "random_expected": {
+          "mean_advantage_bps": -0.06621723328976974,
+          "advantage_95ci_bps": null,
+          "simultaneous_lower_bps": null
+        }
+      },
+      "flow_gross_mean_bps": -0.06621723328976974,
+      "flow_fees_only_mean_bps": -20.065212315896847,
+      "forecast_close_basis": {
+        "hit_rate": 0.3083628439117407,
+        "hits": 1132,
+        "direction_accuracy": 0.4884227730863525,
+        "mean_signed_bps": -0.276366354467944,
+        "naive_hit_wilson_95": [
+          0.29363047987340685,
+          0.3234958599247937
+        ],
+        "basis": "Original signal close to +35m outcome; no fill/cost credit"
+      },
+      "cost_sensitivity": [
+        {
+          "roundtrip_bps": 0,
+          "flow_mean_net_bps": -0.06621723328976974
+        },
+        {
+          "roundtrip_bps": 8,
+          "flow_mean_net_bps": -8.065815266332603
+        },
+        {
+          "roundtrip_bps": 20,
+          "flow_mean_net_bps": -20.065212315896847
+        },
+        {
+          "roundtrip_bps": 24,
+          "flow_mean_net_bps": -24.065011332418262
+        },
+        {
+          "roundtrip_bps": 40,
+          "flow_mean_net_bps": -40.06420739850393
+        }
+      ]
+    }
+  },
+  "costs": {
+    "fee_bps_per_side": 10,
+    "slippage_bps_per_side": 2,
+    "basis": "Scenario; current regular-user spot rate, not historical/account-specific fees",
+    "shorts": "Hypothetical; borrowing/funding/short availability excluded",
+    "entry": "Next completed 5m close after signal",
+    "exit": "First completed close after due (+35m)"
+  },
+  "inference": {
+    "bootstrap": "Joint UTC-day circular moving blocks",
+    "block_days": 7,
+    "replicates": 1999,
+    "seed": 20261106,
+    "paired_comparisons": 5,
+    "simultaneous_alpha": 0.05,
+    "minimum_events": 500,
+    "minimum_dates": 60,
+    "minimum_events_per_asset": 100
+  },
+  "sources": [
+    {
+      "title": "Binance public data schema and checksums",
+      "url": "https://github.com/binance/binance-public-data"
+    },
+    {
+      "title": "Binance spot trading fee schedule",
+      "url": "https://www.binance.com/en/fee/trading"
+    }
+  ],
+  "archive_manifest": [
+    {
+      "symbol": "BTC",
+      "month": "2025-11",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2025-11.zip",
+      "sha256": "470e5eecf5c2fb18390f5234897f71d9cec61e2bf31d0152948ce985e0ae583d",
+      "bytes": 463951,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2025-12",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2025-12.zip",
+      "sha256": "5f1f3ad19c8f79fe1f5f8e009bf55fcef306c60990a18d0a75d3b568628c2083",
+      "bytes": 467107,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-01",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-01.zip",
+      "sha256": "0b95c0dd7a22e374604527581a896930058e6d5426e55d34c9ec3e118a6b979e",
+      "bytes": 463510,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-02",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-02.zip",
+      "sha256": "329314be85423f40b4ddcc77bde1c78c71bd8a7ff5915f342bf972b949e71e34",
+      "bytes": 431551,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-03",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-03.zip",
+      "sha256": "e4a615e1558cd80acff53593a4659d3addc933bdbed1149ed252b8588aaccb3c",
+      "bytes": 475234,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-04",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-04.zip",
+      "sha256": "396a694802d5ce56b78e770d534182ba2b0931932fdd0ced5d5ebbf18fa6398a",
+      "bytes": 451938,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-05",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-05.zip",
+      "sha256": "06525e8a806eb976d9a9e1e71ccd324033e7cb95f69c8c9b8adf8265ac1e0194",
+      "bytes": 461377,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-06",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-06.zip",
+      "sha256": "963dd95de6dc9c49727d1c3fb8c4746a22709b2f2abc014f088cdf4571be3b3b",
+      "bytes": 449138,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-07",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-07.zip",
+      "sha256": "425f6e1a0de85dc99d8a7f17924bcb210c8f92100fb71e5993e1d197577b7053",
+      "bytes": 457771,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-08",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-08.zip",
+      "sha256": "85b174d0c091ab904341f1cce2f31fd88ebd0f10631678238756aa72d5d9897a",
+      "bytes": 454643,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-09",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-09.zip",
+      "sha256": "4106fc73698fd1851b1821cd0293adc6304f86f0c2e72244e15c41f63c2bde08",
+      "bytes": 444933,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "BTC",
+      "month": "2026-10",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-10.zip",
+      "sha256": "c7f1aaa8f8b709eab248d447c8f54e60dfc2134909db6fe9ec31408fd8d63490",
+      "bytes": 458437,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2025-11",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2025-11.zip",
+      "sha256": "4cb8b830731e3baff6d671e328953af4143ae91ea0cc9a6e79592fe101d3c897",
+      "bytes": 442119,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2025-12",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2025-12.zip",
+      "sha256": "fc28fa37b6e1be77e0a71e6a5759843a9023b9e4c54f0cce89c3bf491451db91",
+      "bytes": 447215,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-01",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-01.zip",
+      "sha256": "f2d482d2611be21f38d0d835b0a5628bc3d5787a10876dd36908529ed19fdb41",
+      "bytes": 445889,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-02",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-02.zip",
+      "sha256": "1f583084182d61558324da9e1fc9ee86ab3d76038391197ddc3d7a05bcdae96e",
+      "bytes": 410066,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-03",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-03.zip",
+      "sha256": "e6576396f0d01b93142b60cd0a2eecc226c78af0ab8cdadaa322b0653354dd13",
+      "bytes": 447276,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-04",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-04.zip",
+      "sha256": "0f46e600fe25093063277f570bce8839eaf8fb0adbc0c852aaa90b8b523e7cbc",
+      "bytes": 426654,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-05",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-05.zip",
+      "sha256": "d736dcbba5693765ab28580eb29f534206c74a59e13d1dfdb8235827bc8ba924",
+      "bytes": 437370,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-06",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-06.zip",
+      "sha256": "a1ab99b4c178c3a86d4c6dbd234fb52e0ad6f7082440b3ef3223073de9f9b689",
+      "bytes": 428170,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-07",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-07.zip",
+      "sha256": "b451892abab0f301b31e7c9288bf2c03d7c25cff5e887258e7a721596ed5c0d8",
+      "bytes": 437073,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-08",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-08.zip",
+      "sha256": "4c19bc7ba07f0f57c2bfcf3ee465d874e630095cf3afadb9d31275d572d20a0a",
+      "bytes": 434227,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-09",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-09.zip",
+      "sha256": "83cf3f7302d0d252898b9fc3175123c7337c796662a58ef24a452024164da92c",
+      "bytes": 428290,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "ETH",
+      "month": "2026-10",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/5m/ETHUSDT-5m-2026-10.zip",
+      "sha256": "d41c17e9464974ad210de911edc273ae95c3c9fe45104bb0dedd8d2e358040e8",
+      "bytes": 438559,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2025-11",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2025-11.zip",
+      "sha256": "093706d10c8bbe0a2bab54ffeb95c5b52e350aa9cbc9947736197871c625779e",
+      "bytes": 403020,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2025-12",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2025-12.zip",
+      "sha256": "f3d45e4b2cf4cd249486e69f24b36d1d000e7490f57ff9d64a1ca6f35a4a8e7e",
+      "bytes": 406545,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-01",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-01.zip",
+      "sha256": "0c37d6eeb084b22133d33903112af8b443e2c9d0666140b83120792be15f1cc4",
+      "bytes": 404003,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-02",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-02.zip",
+      "sha256": "64b7592581b03c639db20a700d7c645116fc1c619c97dd03c3ad8688e25d2311",
+      "bytes": 368476,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-03",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-03.zip",
+      "sha256": "0ee1dbc2a6796135aa909170449a22175efa966f1dc86032a05126b3c78a97b4",
+      "bytes": 401631,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-04",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-04.zip",
+      "sha256": "cf20c1273d19f3260b1a92d106cecee3a476e0c68f8ca5e934c5d2d641767eea",
+      "bytes": 381618,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-05",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-05.zip",
+      "sha256": "d911b9b195da3856e5ab8058693042d4fdf3051e9b7a38a2930a3effbde33918",
+      "bytes": 392873,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-06",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-06.zip",
+      "sha256": "02b7706d523dd0d49b084115ddfcd76c97b2a30461405bc81a8ce4b063b719d9",
+      "bytes": 386640,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-07",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-07.zip",
+      "sha256": "6f57eaac549d9e9863bc9996d4afe264f8ee54b3dc793c64970e3f859c347a71",
+      "bytes": 388082,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-08",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-08.zip",
+      "sha256": "7e083bd0b42c856b9738c08e65ce7dce44f1f352c3956973abb57e4c4459484c",
+      "bytes": 390738,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-09",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-09.zip",
+      "sha256": "86d292e044ca51263556af81246124b6ea11cc95dcb8f12347fc9860fd335683",
+      "bytes": 389812,
+      "checksum_verified": true
+    },
+    {
+      "symbol": "SOL",
+      "month": "2026-10",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/SOLUSDT/5m/SOLUSDT-5m-2026-10.zip",
+      "sha256": "7d7eb524d95ba05cffd8715cecc93bdf6216cb80478720c896fbfda3f87d2e00",
+      "bytes": 396550,
+      "checksum_verified": true
+    }
+  ],
+  "generated_at": "2026-11-06T06:47:07.771997+00:00",
+  "protocol_sha256": "fb4c5ed2eb3abce391b33102efb688245dae3cc66025600a9c06612028e88f7f"
+}

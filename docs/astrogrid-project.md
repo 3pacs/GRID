@@ -488,3 +488,15 @@ monotonic trigger; the existing service/user/environment remain unchanged.
 Without this cadence the 20-minute stale limit would correctly mark evidence
 stale for most of each hour even while fresh source candles were available.
 Verify the loaded calendar, next deadline, and a subsequent scheduled run.
+
+## Frozen spot-flow economic evaluation (2026-11-06)
+
+The existing evidence panel now distinguishes prospective contract hit counts
+from a fee-aware historical edge assessment. See
+[results](research/astrogrid-spot-flow-edge-v1-results.md) and the
+[pre-data protocol](research/astrogrid-spot-flow-edge-v1-protocol.md).
+The rule shows no net predictive edge in 10,854 nonoverlapping August–October
+2026 test events. Gross mean is essentially zero; current regular-user fee and
+slippage assumptions produce a negative mean. Keep the model as unvalidated
+research; never promote weights or claim profitable trading from target hits.
+Historical replay and actual live forecasts remain separate and immutable.

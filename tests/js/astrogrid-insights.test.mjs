@@ -54,3 +54,17 @@ test('30m measured-flow rules and results remain separate from the 24h cohort', 
     assert.match(text,/Result: miss/);
     assert.doesNotMatch(text,/STALE|24h candle coverage|1\.00% directional move/);
 });
+test('edge assessment distinguishes cost-aware historical replay from prospective forecasts', () => {
+    const report = JSON.parse(readFileSync(new URL('../../astrogrid_web/research/spot-flow-edge-v1.json', import.meta.url)));
+    const text = insightsMarkup({items:[], edge_assessment:report,
+        prospective_cost_diagnostic:{scored:40,utc_dates:1,mean_gross_bps:5,mean_scenario_net_bps:-19}});
+    assert.match(text,/No predictive edge after costs/);
+    assert.match(text,/10,854 nonoverlapping events across 92 UTC days/);
+    assert.match(text,/-23\.94 bp/);
+    assert.match(text,/Always long/);
+    assert.match(text,/Random direction \(expected\)/);
+    assert.match(text,/40 scored forecasts across 1 UTC dates/);
+    assert.match(text,/Insufficient independent prospective evidence/);
+    assert.match(text,/Full results, per-asset comparisons and archive SHA256 checksums/);
+    assert.doesNotMatch(text,/positive trading edge|validated alpha/);
+});

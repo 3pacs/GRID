@@ -1770,3 +1770,14 @@ th {
 .insight-card h3 { font-size: 1.1rem; line-height: 1.5; }
 .insight-card p { line-height: 1.6; }
 .insight-card a { color: inherit; text-decoration: underline; }
+/* Cost-aware research uses the existing evidence panel and table semantics. */
+.edge-panel table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .9rem;
+}
+.edge-panel caption { text-align: left; padding: .6rem 0; color: var(--muted, #a6a7ac); }
+.edge-panel th, .edge-panel td { padding: .5rem .6rem; border-bottom: 1px solid #ffffff18; }
+.edge-panel th { text-align: left; font-weight: 500; }
+.edge-panel td { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.edge-panel details { padding: .6rem 0; }
