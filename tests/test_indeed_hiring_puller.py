@@ -449,3 +449,110 @@ class TestSeriesIdFormat:
         sector = _normalise_sector("Retail & Food Service")
         series_id = f"indeed:us:sector:{sector}"
         assert series_id == "indeed:us:sector:retail_and_food_service"
+
+
+# ---------------------------------------------------------------------------
+# Current Hiring Lab layout (job_postings_tracker, long format) -- 2026-11-06
+# ---------------------------------------------------------------------------
+#
+# The hiring-lab-data-library paths 404 and the tracker files are LONG
+# format. Rows below are copied from the live files on 2026-11-06.
+
+_TRACKER_AGGREGATE_CSV = """date,jobcountry,indeed_job_postings_index_SA,indeed_job_postings_index_NSA,variable
+2026-10-29,US,103.79,109.18,total postings
+2026-10-30,US,103.79,109.16,total postings
+2026-10-29,US,99.54,97.92,new postings
+2026-10-30,US,99.03,97.29,new postings
+"""
+
+_TRACKER_SECTOR_CSV = """date,jobcountry,indeed_job_postings_index,variable,display_name
+2026-10-29,US,106.76,total postings,Accounting
+2026-10-29,US,75.15,new postings,Accounting
+2026-10-29,US,81.49,total postings,Software Development
+2026-10-29,US,87.85,new postings,Software Development
+2026-10-30,US,106.77,total postings,Accounting
+2026-10-30,US,74.67,new postings,Accounting
+2026-10-30,US,81.58,total postings,Software Development
+2026-10-30,US,87.61,new postings,Software Development
+"""
+
+
+def _tracker_df(text: str) -> pd.DataFrame:
+    import io
+
+    return pd.read_csv(io.StringIO(text))
+
+
+def _tracker_fetch(url: str) -> pd.DataFrame:
+    return _tracker_df(_TRACKER_AGGREGATE_CSV if "aggregate" in url else _TRACKER_SECTOR_CSV)
+
+
+class TestTrackerLayout:
+    def test_urls_point_at_the_live_tracker_repo(self):
+        from ingestion.altdata import indeed_hiring_puller as mod
+
+        assert mod._AGGREGATE_URL == (
+            "https://raw.githubusercontent.com/hiring-lab/job_postings_tracker/master/US/"
+            "aggregate_job_postings_US.csv"
+        )
+        assert mod._SECTOR_URL.endswith("/job_postings_tracker/master/US/job_postings_by_sector_US.csv")
+
+    def test_aggregate_long_format_keeps_sa_total_postings(self):
+        from ingestion.altdata.indeed_hiring_puller import _to_wide_aggregate
+
+        wide = _to_wide_aggregate(_tracker_df(_TRACKER_AGGREGATE_CSV))
+        assert list(wide.columns) == ["date", "indeed_job_postings_index"]
+        assert wide["indeed_job_postings_index"].tolist() == [103.79, 103.79]  # SA, total only
+
+    def test_sector_long_format_pivots_display_names(self):
+        from ingestion.altdata.indeed_hiring_puller import _to_wide_sectors
+
+        wide = _to_wide_sectors(_tracker_df(_TRACKER_SECTOR_CSV))
+        assert set(wide.columns) == {"date", "Accounting", "Software Development"}
+        assert wide["Accounting"].tolist() == [106.76, 106.77]  # total postings only
+
+    def test_legacy_wide_frames_pass_through(self):
+        from ingestion.altdata.indeed_hiring_puller import _to_wide_aggregate, _to_wide_sectors
+
+        agg, sec = _sample_aggregate_df(), _sample_sector_df()
+        assert _to_wide_aggregate(agg) is agg
+        assert _to_wide_sectors(sec) is sec
+
+    @patch("ingestion.altdata.indeed_hiring_puller.ingest_actor")
+    @patch.object(IndeedHiringPuller, "_fetch_csv")
+    def test_pull_all_on_tracker_files(self, mock_fetch, mock_ingest):
+        from ingestion.smart_scheduler import _classify_outcome
+
+        engine = _make_mock_engine()
+        puller = IndeedHiringPuller(db_engine=engine)
+        mock_fetch.side_effect = _tracker_fetch
+        results = puller.pull_all(start_date="2026-10-01")
+        by_source = {r["source"]: r for r in results}
+        assert by_source["indeed_aggregate"]["status"] == "SUCCESS"
+        assert by_source["indeed_aggregate"]["rows_inserted"] == 2
+        assert by_source["indeed_sectors"]["status"] == "SUCCESS"
+        assert by_source["indeed_sectors"]["rows_inserted"] == 4
+        assert sorted(by_source["indeed_sectors"]["sectors"]) == ["accounting", "software development"]
+        assert _classify_outcome(results)[:2] == ("SUCCESS", 6)
+
+    @patch("ingestion.altdata.indeed_hiring_puller.ingest_actor")
+    @patch.object(IndeedHiringPuller, "_fetch_csv")
+    def test_everything_already_stored_is_no_new_data(self, mock_fetch, mock_ingest):
+        from ingestion.smart_scheduler import _classify_outcome
+
+        engine = _make_mock_engine()
+        puller = IndeedHiringPuller(db_engine=engine)
+        mock_fetch.side_effect = _tracker_fetch
+        with patch.object(IndeedHiringPuller, "_get_existing_dates",
+                          return_value={date(2026, 10, 29), date(2026, 10, 30)}):
+            results = puller.pull_all(start_date="2026-10-01")
+        assert {r["status"] for r in results} == {"NO_NEW_DATA"}
+        assert _classify_outcome(results)[0] == "NO_NEW_DATA"
+
+    @patch.object(IndeedHiringPuller, "_fetch_csv")
+    def test_unreadable_values_fail_instead_of_no_new_data(self, mock_fetch):
+        engine = _make_mock_engine()
+        puller = IndeedHiringPuller(db_engine=engine)
+        mock_fetch.return_value = pd.DataFrame({"date": ["2026-10-30"], "jobcountry": ["US"]})
+        result = puller._pull_aggregate(date(2026, 10, 1))
+        assert result["status"] == "FAILED"
