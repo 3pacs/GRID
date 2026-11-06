@@ -35,7 +35,7 @@ export default function FlowTooltip({ node, edge, x, y, visible }) {
         <div style={sty.label}>{edge.source_layer} → {edge.target_layer}</div>
         <div style={sty.row}><span style={sty.dim}>Flow</span><span style={sty.val}>{fmtDollar(edge.value_usd)}</span></div>
         <div style={sty.row}><span style={sty.dim}>Channel</span><span style={sty.val}>{edge.channel || '--'}</span></div>
-        <div style={sty.row}><span style={sty.dim}>Confidence</span><FreshnessIndicator confidence={edge.confidence} /></div>
+        <div style={sty.row}><span style={sty.dim}>Confidence</span><FreshnessIndicator confidence={edge.confidence} asOf={edge.as_of} unavailable={edge.available === false} reason={edge.reason} /></div>
       </div>
     );
   }
@@ -44,7 +44,7 @@ export default function FlowTooltip({ node, edge, x, y, visible }) {
     <div style={{ ...sty.wrap, left, top }}>
       <div style={sty.label}>
         {node.label || node.id}
-        <FreshnessIndicator confidence={node.confidence} />
+        <FreshnessIndicator confidence={node.confidence} asOf={node.as_of} unavailable={node.available === false} reason={node.reason} />
       </div>
       <div style={sty.divider} />
       <div style={sty.row}><span style={sty.dim}>Value</span><span style={sty.val}>{fmtDollar(node.value)}</span></div>

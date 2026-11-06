@@ -19,19 +19,22 @@ export function hasCompleteResultMatrix(results, roles, scenarios) {
 }
 
 export function resolveBrowserExecutable(explicit, env = process.env, platform = process.platform) {
-    const override = explicit || env.GRID_BROWSER_EXECUTABLE;
+    const override = explicit || env.GRID_BROWSER_EXECUTABLE || env.CHROME_PATH;
     if (override) {
         if (!existsSync(override)) throw new Error(`Browser executable not found: ${override}`);
         return override;
     }
     const candidates = platform === 'win32' ? [
         path.join(env.PROGRAMFILES || 'C:/Program Files', 'Google/Chrome/Application/chrome.exe'),
+        path.join(env['PROGRAMFILES(X86)'] || 'C:/Program Files (x86)', 'Google/Chrome/Application/chrome.exe'),
+        path.join(env.PROGRAMFILES || 'C:/Program Files', 'Microsoft/Edge/Application/msedge.exe'),
         path.join(env['PROGRAMFILES(X86)'] || 'C:/Program Files (x86)', 'Microsoft/Edge/Application/msedge.exe'),
         path.join(env.LOCALAPPDATA || '', 'Google/Chrome/Application/chrome.exe'),
     ] : platform === 'darwin' ? [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
         '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-    ] : ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+    ] : ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/opt/google/chrome/chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium', '/usr/bin/microsoft-edge'];
     const found = candidates.find(p => existsSync(p));
     if (!found) throw new Error('No browser found. Set --browser-executable or GRID_BROWSER_EXECUTABLE; no browser is downloaded.');
     return found;

@@ -2108,3 +2108,224 @@ def ten_year_portfolio_weekly(scenario: str) -> dict:
         "profiles": [profile],
         "candidate_boards": [],
     }
+
+
+# ── God View (G9) — GET /api/v1/godview/latest ───────────────────────
+# Main's route is `#/god-view` -> pwa/src/views/GodView.jsx, which reads
+# only /api/v1/godview/latest (api.getGodViewLatest). The older
+# `/godview/pillars/*` fixtures above belong to the W6 draft view and are
+# kept for its receipts. Shapes mirror pwa/src/__tests__/godView.test.jsx
+# (the same payloads the view's own vitest suite asserts against).
+
+_GODVIEW_RUN = {
+    "run_id": "fixture-run-1", "status": "complete",
+    "started_at": "2026-09-15T21:30:00+00:00", "finished_at": "2026-09-15T21:31:00+00:00",
+    "rows_written": 1, "rows_skipped": 0, "reasons": {}, "code_sha": "fixture",
+}
+_GODVIEW_GEX_NOTE = ("Modeled estimate: dealer side assumed (long calls / short puts); "
+                     "not measured positioning.")
+
+
+def _godview_unavailable(pillar: str, reason: str, **extra) -> dict:
+    out = {
+        "pillar": pillar, "status": "unavailable", "available": False, "reason": reason,
+        "as_of": None, "release_at": None, "available_at": None, "availability_basis": None,
+        "provenance": None, "estimated": pillar == "dealer_gex", "last_run": None, "data": None,
+    }
+    out.update(extra)
+    return out
+
+
+def godview_latest(scenario: str) -> dict:
+    """healthy: fed available, CFTC partial (1 of 2 markets), GEX modeled but
+    unavailable (no completed chain capture). partial: fed stale. empty:
+    schema not migrated, every pillar unavailable with its reason."""
+    if scenario == "empty":
+        return {
+            "as_of": "2026-09-18T09:00:00+00:00", "as_of_source": "server_now",
+            "schema": {"migrated": False, "missing": ["godview_runs"]},
+            "pillars": {
+                "fed_liquidity": _godview_unavailable("fed_liquidity", "schema_not_migrated"),
+                "cftc": _godview_unavailable("cftc", "schema_not_migrated"),
+                "dealer_gex": _godview_unavailable("dealer_gex", "schema_not_migrated",
+                                                   ticker="SPY", model_note=_GODVIEW_GEX_NOTE),
+            },
+        }
+    fed = {
+        "pillar": "fed_liquidity", "status": "stale" if scenario == "partial" else "available",
+        "available": True, "reason": "stale" if scenario == "partial" else None,
+        "as_of": "2026-09-03" if scenario == "partial" else "2026-09-10",
+        "release_at": "2026-09-11T20:30:00+00:00", "available_at": "2026-09-11T21:02:00+00:00",
+        "availability_basis": "observed_acquisition", "provenance": "measured", "estimated": False,
+        "stale_after_days": 9, "last_run": _GODVIEW_RUN,
+        "data": {
+            "obs_date": "2026-09-03" if scenario == "partial" else "2026-09-10",
+            "net_liquidity_usd_m": 5_800_000, "walcl_usd_m": 6_700_000, "tga_usd_m": 880_000,
+            "rrp_usd_m": 20_000, "delta_1w_m": 0, "delta_4w_m": None, "rrp_as_pct_of_peak": None,
+            "liquidity_regime": "insufficient_history", "unit": "USD millions",
+        },
+    }
+    cftc = {
+        "pillar": "cftc", "status": "partial", "available": True, "reason": "partial_coverage",
+        "as_of": "2026-09-08", "release_at": "2026-09-11T19:30:00+00:00",
+        "available_at": "2026-09-11T20:30:00+00:00", "availability_basis": "observed_acquisition",
+        "provenance": "measured", "estimated": False,
+        "coverage": {"tracked": 2, "available": 1, "stale": 0, "unavailable": 1},
+        "last_run": _GODVIEW_RUN,
+        "data": {"markets": [
+            {"market": "ES", "cftc_market_code": "X", "market_name": "ES market", "status": "available",
+             "available": True, "reason": None, "report_date": "2026-09-08", "noncommercial_net": 200,
+             "spec_net_pct_oi": 20, "z_score_1y": 0.5, "z_score_3y": 1.5, "percentile_3y": 88,
+             "crowding_regime": "ELEVATED_LONG"},
+            {"market": "ZN", "cftc_market_code": "Y", "market_name": "ZN market", "status": "unavailable",
+             "available": False, "reason": "no_row_for_market", "report_date": None},
+        ]},
+    }
+    gex = _godview_unavailable("dealer_gex", "no_completed_capture", ticker="SPY",
+                               model_note=_GODVIEW_GEX_NOTE)
+    return {
+        "as_of": "2026-09-18T09:00:00+00:00", "as_of_source": "server_now",
+        "schema": {"migrated": True, "missing": []},
+        "pillars": {"fed_liquidity": fed, "cftc": cftc, "dealer_gex": gex},
+    }
+
+
+# ── Options / Gamma Watch — GET /api/v1/gamma-watch/state ────────────
+# pwa/src/components/GammaWatch.jsx + gammaWatchPublicAdapter.js. The
+# adapter withholds the display unless `served_at` is within 15 s (public
+# schema) / 20 s (legacy) of the browser clock, so every clock here is
+# computed from the request time, not a fixed date. Shapes follow
+# pwa/src/__tests__/gammaWatchPublicContract.test.jsx.
+#
+#   healthy - public schema `gex-screen/2`: delayed ZeroGEX levels, frozen
+#             research grid, hypothetical rebalancing; no RTD price (the
+#             public schema never carries one; "Private RTD ... unavailable").
+#   partial - legacy unversioned collector frame with an `is_rtd` quote, so
+#             the "Legacy RTD receipt-only price" line renders beside the
+#             delayed levels.
+#   empty   - collector unavailable envelope (no cached substitute).
+
+def _gamma_watch_public_frame(now: float) -> dict:
+    return {
+        "schema": "gex-screen/2", "symbol": "SPY", "served_at": now, "evaluation_clock": "ok",
+        "public_price": {
+            "status": "unverified-public-latency", "source": "Yahoo chart · public, latency not guaranteed",
+            "source_time": now - 5, "receipt_time": now - 1, "values_available": True,
+            "current_interpretation": False, "max_context_age_seconds": 120, "price": 600,
+        },
+        "delayed_gex": {
+            "status": "unverified-delayed", "source": "ZeroGEX · delayed ~15 minutes",
+            "source_time": now - 900, "receipt_time": now - 1, "values_available": True,
+            "current_interpretation": False, "max_context_age_seconds": 1800, "spot": 599,
+            "provider_market_phase": "regular",
+            "levels": {"call_wall": 605, "put_wall": 590, "gamma_flip": 597, "max_pain": None},
+        },
+        "research_model": {
+            "status": "frozen-research", "current_interpretation": False,
+            "chain_as_of": now - 900, "computed_at": now - 1, "grid": [580, 600, 620],
+            "variants": [{"name": "paired OTM IV", "iv_shock": 0, "values": [-1, 0, 1]}],
+        },
+        "sectors": {
+            "status": "delayed-unqualified", "computed_at": now - 1,
+            "rows": [{"symbol": "SPY", "status": "delayed-unqualified", "received_at": now - 1, "price": 600,
+                      "today_volume": 0, "session_date": "2026-09-15", "nearest_expiry": "2026-09-18"}],
+        },
+        "structural": {
+            "official": [{"name": "repo", "status": "published-history-unqualified", "received_at": now - 1,
+                          "rows": [{"operationDate": "2026-09-15", "totalAmtAccepted": 1000}]}],
+            "rebalance": {"status": "modeled-history-unqualified", "computed_at": now - 1,
+                          "rows": [{"period": "month", "baseline": "2026-08-29", "as_of_date": "2026-09-15",
+                                    "equity_return": 0.01, "bond_return": -0.002,
+                                    "scenarios": [{"equity_weight": 0.6,
+                                                   "equity_purchase_per_initial_billion": 10000}]}]},
+        },
+    }
+
+
+def _gamma_watch_legacy_frame(now: float) -> dict:
+    from datetime import datetime, timezone
+
+    def iso(seconds: float) -> str:
+        return datetime.fromtimestamp(int(seconds), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    clock = iso(now)
+    return {
+        "served_at": clock,
+        "quote": {"source": "Yahoo chart · public, latency not guaranteed", "price": 600.5,
+                  "as_of": clock, "received_at": clock, "is_rtd": True},
+        "gex": {"source": "ZeroGEX · delayed ~15 minutes", "as_of": iso(now - 900), "received_at": clock,
+                "call_wall": 605, "put_wall": 590, "gamma_flip": 597, "max_pain": 600, "spot": 599,
+                "market_phase": "regular"},
+        "structural_rebalance": {"status": "modeled_daily_proxy", "computed_at": clock,
+                                 "rows": [{"period": "quarter", "baseline": "2026-06-30",
+                                           "as_of_date": "2026-09-15", "equity_return": 0.03,
+                                           "bond_return": 0.004,
+                                           "scenarios": [{"equity_weight": 0.6,
+                                                          "equity_purchase_per_initial_billion": -5000}]}]},
+        "model_error": "fixture: research model not supplied in the legacy frame",
+        "sectors_error": "fixture: sectors not supplied",
+        "structural_official_error": "fixture: official history not supplied",
+    }
+
+
+def gamma_watch_state(scenario: str) -> dict:
+    import time
+
+    now = time.time()
+    if scenario == "empty":
+        return {"status": "unavailable", "code": "collector_unavailable"}
+    if scenario == "partial":
+        return {"status": "available", "data": _gamma_watch_legacy_frame(now)}
+    return {"status": "available", "data": _gamma_watch_public_frame(now)}
+
+
+# ── Money Flow -> Dashboard tab — GET /api/v1/flows/junction-points ───
+# api/routers/flows.py::get_junction_points + the provenance envelope
+# (docs/flows_provenance_contract.md). Exercises
+# components/flows/FreshnessIndicator.jsx: a `confirmed` node renders
+# OBSERVED (never "LIVE"), a node with no confidence renders UNKNOWN (never
+# "EST"), and the readings-table envelope renders above the grid.
+
+def _junction_provenance(scenario: str) -> dict:
+    base = {"table": "junction_point_readings", "stale_after_days": 3,
+            "source_last_ingested": None, "future_dated_rows": None}
+    if scenario == "empty":
+        base.update({"row_count": 0, "max_obs_date": None, "materialized_at": None, "age_days": None,
+                     "unavailable": True, "reason": "empty"})
+    elif scenario == "partial":
+        base.update({"row_count": 4210, "max_obs_date": "2026-09-09",
+                     "materialized_at": "2026-09-09T21:30:07+00:00", "age_days": 6,
+                     "unavailable": True, "reason": "stale"})
+    else:
+        base.update({"row_count": 4210, "max_obs_date": AS_OF_DATE,
+                     "materialized_at": "2026-09-15T21:30:07+00:00", "age_days": 0,
+                     "unavailable": False, "reason": None})
+    return {"junction_point_readings": base, "generated_at": GENERATED_AT}
+
+
+def junction_points(scenario: str) -> dict:
+    points = [] if scenario == "empty" else [
+        {"id": "fed_balance_sheet", "layer": "monetary", "label": "Fed Balance Sheet", "value": 6.7e12,
+         "change_1w": 0.0, "change_1m": -0.004, "confidence": "confirmed", "stress_z": 0.4,
+         "trend": "contracting", "updated_at": "2026-09-15T21:30:07+00:00", "source": "FRED:WALCL"},
+        {"id": "bank_credit", "layer": "credit", "label": "Bank Credit", "value": 1.75e13,
+         "change_1w": None, "change_1m": None, "confidence": None, "stress_z": None,
+         "trend": "unknown", "updated_at": None, "source": None},
+        {"id": "etf_flows", "layer": "institutional", "label": "ETF Net Flows", "value": 2.0e9,
+         "change_1w": 0.01, "change_1m": 0.03, "confidence": "estimated", "stress_z": None,
+         "trend": "expanding", "updated_at": None, "source": "model"},
+    ]
+    summaries = [] if scenario == "empty" else [
+        {"id": "monetary", "label": "Monetary", "order": 1, "aggregate_value": 6.7e12,
+         "aggregate_change_1m": -2.7e10, "dominant_confidence": "confirmed", "stress_z": 0.4,
+         "regime": None, "node_count": 1},
+        {"id": "credit", "label": "Credit", "order": 2, "aggregate_value": 1.75e13,
+         "aggregate_change_1m": None, "dominant_confidence": None, "stress_z": None,
+         "regime": None, "node_count": 1},
+        {"id": "institutional", "label": "Institutional", "order": 3, "aggregate_value": 2.0e9,
+         "aggregate_change_1m": 6.0e7, "dominant_confidence": "estimated", "stress_z": None,
+         "regime": "inflow", "node_count": 1},
+    ]
+    return {"junction_points": points, "layer_summaries": summaries,
+            "total_layers": len(summaries), "total_junction_points": len(points),
+            "provenance": _junction_provenance(scenario)}

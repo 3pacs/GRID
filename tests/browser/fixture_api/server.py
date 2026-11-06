@@ -45,12 +45,6 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/derivatives/vanna-charm/SPY$"), lambda m, q, s: {"ticker": "SPY", "error": "synthetic: vanna/charm unavailable"}),
     ("GET", re.compile(r"^/api/v1/derivatives/flow-timeline/SPY$"), lambda m, q, s: {"ticker": "SPY", "history": [], "gamma_flip_crossings": []}),
     ("GET", re.compile(r"^/api/v1/derivatives/gex/SPY$"), lambda m, q, s: spy.dealer_gex(s)),
-    ("GET", re.compile(r"^/api/v1/godview/latest$"), lambda m, q, s: {
-        "as_of": fx.GENERATED_AT, "as_of_source": "synthetic_fixture",
-        "schema": {"migrated": True}, "pillars": {name: {
-            "status": "unavailable", "reason": "no_completed_capture" if name == "dealer_gex" else "inputs_missing", "data": None,
-        } for name in ("fed_liquidity", "cftc", "dealer_gex")},
-    }),
     ("GET", re.compile(r"^/api/v1/options/signals$"), lambda m, q, s: spy.options_signals()),
     ("GET", re.compile(r"^/api/v1/options/(?:scan|100x)$"), lambda m, q, s: {"opportunities": []}),
     ("POST", re.compile(r"^/api/v1/auth/login$"), lambda m, q, s: fx.login_response()),
@@ -131,6 +125,15 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/godview/pillars/(?P<pillar>[A-Za-z0-9_]+)$"),
      lambda m, q, s: fx.godview_pillar_unbuilt(m.group("pillar"))),
 
+    # God View (G9) on main: `#/god-view` -> GodView.jsx -> /godview/latest.
+    ("GET", re.compile(r"^/api/v1/godview/latest$"), lambda m, q, s: fx.godview_latest(s)),
+
+    # Money Flow -> Dashboard tab (JunctionDashboard / FreshnessIndicator).
+    ("GET", re.compile(r"^/api/v1/flows/junction-points$"), lambda m, q, s: fx.junction_points(s)),
+
+    # Options -> Gamma Watch tab (GammaWatch.jsx polls this every 5 s).
+    ("GET", re.compile(r"^/api/v1/gamma-watch/state$"), lambda m, q, s: fx.gamma_watch_state(s)),
+
     # (e) data health / source drill-down — Operator.jsx's actual six calls.
     ("GET", re.compile(r"^/api/v1/system/status$"), lambda m, q, s: fx.system_status(s)),
     ("GET", re.compile(r"^/api/v1/system/health$"), lambda m, q, s: fx.system_health(s)),
@@ -160,7 +163,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         # Permissive CORS: this only ever serves synthetic fixtures on
         # localhost during development, never real data.
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Grid-Fixture-Journey")
         self.end_headers()
         self.wfile.write(body)
 
@@ -168,7 +171,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         path = parts.path
         query = parse_qs(parts.query)
-        if method == 'GET' and path == '/api/v1/gamma-watch/state':
+        if (method == 'GET' and path == '/api/v1/gamma-watch/state'
+                and self.headers.get('X-Grid-Fixture-Journey') == 'spy-options'):
             # Deliberately slow only this request, so the browser must prove
             # its loading state before receiving data (including on polls).
             time.sleep(1.5)
@@ -233,7 +237,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Grid-Fixture-Journey")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
 

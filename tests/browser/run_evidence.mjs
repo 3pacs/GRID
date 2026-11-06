@@ -21,6 +21,16 @@
  *     [--roles admin,contributor] [--journeys home,ticker-lookup,...] \
  *     [--out tests/browser/evidence/<tree-label>/]
  *
+ * --pwa-dir defaults to this checkout's own pwa/ directory.
+ *
+ * Browser: set CHROME_PATH to a Chrome/Chromium/Edge executable, or let the
+ * runner auto-detect a system install (Linux: google-chrome[-stable],
+ * chromium[-browser]; macOS: /Applications; Windows: Program Files). No
+ * browser is ever downloaded.
+ *
+ * Python: set PYTHON to the interpreter for the fixture server; defaults to
+ * `python3` on Linux/macOS and `python` on Windows.
+ *
  * --journeys filters to journey ids already used as keys in summary.json
  * (e.g. `home`, `ticker-lookup`, `catalyst-timeline-ACME`) — useful for
  * re-verifying one journey (e.g. after a fix) without a full re-run.
@@ -95,6 +105,8 @@ const PWA_BASE = `http://127.0.0.1:${PWA_PORT}`;
 // ── Browser executable ──────────────────────────────────────────────
 // No browser download: point puppeteer-core at the system install.
 
+const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+
 // ── Journeys per role ─────────────────────────────────────────────────
 // Hashes confirmed against pwa/src/routing.js / routes.js / app.jsx:
 //   'watchlist' + segment -> view 'watchlist-analysis' (the #/watchlist/TEST1 shortcut)
@@ -115,7 +127,69 @@ const JOURNEYS = {
         { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH|Pipeline health unavailable/ },
         { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
         { name: 'snapshots', hash: '#/snapshots', ready: /LATEST SNAPSHOT|No snapshots|Snapshots unavailable|unexpected response/ },
-        { name: 'god-view', hash: '#/god-view', ready: /Fed net liquidity|UNAVAILABLE|God View/ },
+        // Main's route id is 'god-view' -> views/GodView.jsx (routes.js),
+        // which reads GET /api/v1/godview/latest. The old '#/godview' route
+        // (W6 draft GodViewPillars.jsx) does not exist on main.
+        {
+            name: 'god-view', hash: '#/god-view', ready: /Point in time|God view unavailable/,
+            checks: {
+                healthy: { expect: [/FED NET LIQUIDITY/, /CFTC POSITIONING/, /DEALER GAMMA \(SPY, MODELED\)/, /no data/] },
+                partial: { expect: [/STALE/] },
+                empty: { expect: [/schema not migrated/i, /UNAVAILABLE/] },
+            },
+        },
+        // Money Flow -> Dashboard tab: components/flows/FreshnessIndicator.jsx.
+        // A confirmed node reads OBSERVED and a missing confidence UNKNOWN —
+        // never the retired "LIVE" / "EST" labels.
+        {
+            name: 'money-flow-dashboard', hash: '#/money-flow', clickText: 'Dashboard',
+            ready: /junction_point_readings/,
+            checks: {
+                healthy: {
+                    expect: [/OBSERVED/, /UNKNOWN/, /ESTIMATED/, /newest obs 2026-09-15/],
+                    forbid: [/\bEST\b/],
+                },
+                partial: { expect: [/STALE/, /newest obs 2026-09-09 \(6d old, threshold 3d\)/], forbid: [/\bEST\b/] },
+                empty: { expect: [/UNAVAILABLE/, /No junction points found/], forbid: [/\bEST\b/] },
+            },
+        },
+        // Options -> Gamma Watch tab (components/GammaWatch.jsx). Delayed
+        // provider levels, frozen research, hypothetical rebalancing and the
+        // RTD receipt must stay separately labelled; the public schema
+        // (healthy) carries no RTD price, the legacy frame (partial) does.
+        {
+            name: 'options-gamma-watch', hash: '#/options', clickText: 'Gamma Watch',
+            ready: /Gamma Watch · experimental public context|Collector unavailable|Request failed|Request timed out/,
+            checks: {
+                healthy: {
+                    expect: [
+                        /GRID connection recent/,
+                        /ZeroGEX delayed context · unverified-delayed/,
+                        /Delayed levels: put wall 590 · call wall 605/,
+                        /Frozen historical research · not current GEX/,
+                        /frozen-research/,
+                        /Rebalancing sensitivity · hypothetical demand/,
+                        /modeled-history-unqualified/,
+                        /Private RTD, current GEX, journal and contracts unavailable on the public schema/,
+                    ],
+                    forbid: [/Legacy RTD receipt-only price/, /Display withheld/],
+                },
+                partial: {
+                    expect: [
+                        /GRID connection recent/,
+                        /ZeroGEX delayed context · unverified-delayed/,
+                        /Legacy RTD receipt-only price 600\.5/,
+                        /Rebalancing sensitivity · hypothetical demand/,
+                        /Frozen historical research · not current GEX/,
+                    ],
+                    forbid: [/Display withheld/],
+                },
+                empty: {
+                    expect: [/Collector unavailable; no cached substitute\./],
+                    forbid: [/Delayed levels/, /RTD receipt-only price/],
+                },
+            },
+        },
         // Operator (admin) can reach catalyst-timeline normally, unlike the
         // contributor gate below — added so the earlier owner-fix on this
         // view can be re-verified from the admin side too.
@@ -137,7 +211,11 @@ function killTree(child) {
         if (process.platform === 'win32') {
             spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
         } else {
-            child.kill('SIGKILL');
+            // Children are spawned detached (own process group), so the
+            // negative pid reaps `npm run dev` *and* the vite grandchild that
+            // actually holds the port; killing npm alone leaves vite on 5174
+            // and the next pair's assertPortsFree refuses to start.
+            try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
         }
     } catch {
         // best-effort — a leaked dev server is a smaller problem than a
@@ -176,28 +254,43 @@ function gitRevParse(cwd) {
  * A pair that starts on a half-dead port produces 502s from the proxy that
  * look like view failures; fail loudly instead and record it.
  */
-async function assertPortsFree(ports) {
+async function portBusy(port) {
     const net = await import('node:net');
+    return new Promise((resolve) => {
+        const srv = net.createServer();
+        srv.once('error', () => resolve(true));
+        srv.once('listening', () => srv.close(() => resolve(false)));
+        srv.listen(port, '127.0.0.1');
+    });
+}
+
+async function assertPortsFree(ports) {
     for (const port of ports) {
-        const busy = await new Promise((resolve) => {
-            const srv = net.createServer();
-            srv.once('error', () => resolve(true));
-            srv.once('listening', () => srv.close(() => resolve(false)));
-            srv.listen(port, '127.0.0.1');
-        });
-        if (busy) throw new Error(`port ${port} is still in use; refusing to start this pair (stale server from a previous run?)`);
+        if (await portBusy(port)) throw new Error(`port ${port} is still in use; refusing to start this pair (stale server from a previous run?)`);
+    }
+}
+
+/** After killTree, wait (bounded) for the OS to release this pair's ports. */
+async function waitPortsReleased(ports, timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    for (const port of ports) {
+        while (await portBusy(port)) {
+            if (Date.now() > deadline) return;
+            await new Promise((r) => setTimeout(r, 250));
+        }
     }
 }
 
 function startFixtureServer(scenario, role) {
     const serverPath = path.join(__dirname, 'fixture_api', 'server.py');
     const child = spawn(
-        'python',
+        PYTHON,
         [serverPath, '--port', String(FIXTURE_PORT), '--scenario', scenario],
         {
             cwd: REPO_ROOT,
             env: { ...process.env, FIXTURE_ROLE: role },
             stdio: ['ignore', 'pipe', 'pipe'],
+            detached: process.platform !== 'win32',
         }
     );
     return child;
@@ -215,6 +308,7 @@ function startPwaDevServer() {
                 GRID_WS_PROXY_TARGET: `ws://127.0.0.1:${FIXTURE_PORT}`,
             },
             stdio: ['ignore', 'pipe', 'pipe'],
+            detached: process.platform !== 'win32',
         }
     );
     return child;
@@ -291,6 +385,19 @@ async function waitForReady(page, journey, timeoutMs = 10000) {
     return { ready: 'timeout', ready_wait_ms: Date.now() - start };
 }
 
+/**
+ * Scenario-specific label assertions: every `expect` regex must match the
+ * settled body text and no `forbid` regex may. Recorded per journey in
+ * summary.json as `label_checks`; a failure is evidence, not a runner error.
+ */
+function evaluateChecks(journey, scenario, bodyText) {
+    const spec = journey.checks && journey.checks[scenario];
+    if (!spec) return null;
+    const missing = (spec.expect || []).filter((re) => !re.test(bodyText)).map(String);
+    const forbiddenPresent = (spec.forbid || []).filter((re) => re.test(bodyText)).map(String);
+    return { pass: missing.length === 0 && forbiddenPresent.length === 0, missing, forbidden_present: forbiddenPresent };
+}
+
 function detectCrash(bodyText) {
     // ViewErrorBoundary.jsx renders "<ViewName> Error" as an <h3>, with
     // "An unexpected error occurred" (or the real error message) below it,
@@ -339,7 +446,13 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
         const controlFailure = requestFailureControl?.(url);
         if (controlFailure) { request.abort(controlFailure); return; }
         if (['data:', 'blob:', 'about:'].includes(url.protocol) ||
-            [PWA_BASE, FIXTURE_BASE].includes(url.origin)) request.continue();
+            [PWA_BASE, FIXTURE_BASE].includes(url.origin)) {
+            // Select the SPY matrix contract without changing #977's public/
+            // legacy Gamma fixtures used by its separate existing journey.
+            request.continue(url.pathname.startsWith('/api/') ? {
+                headers: { ...request.headers(), 'x-grid-fixture-journey': activeJourney },
+            } : undefined);
+        }
         else { blockedRequests.push(request.url()); request.abort(); }
     });
     const moduleResponses = [];
@@ -443,6 +556,7 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 final_url: page.url(),
                 ready: readiness.ready,
                 ready_wait_ms: readiness.ready_wait_ms,
+                label_checks: evaluateChecks(journey, scenario, bodyText),
                 evidence: readiness.ready === 'timeout' ? 'INCOMPLETE (ready condition not met within 10 s)' : 'complete',
             };
         } catch (err) {
@@ -551,6 +665,7 @@ export async function main({ requestFailureControl = null } = {}) {
                 if (browserInstance) await browserInstance.close().catch(() => {});
                 killTree(fixtureChild);
                 killTree(pwaChild);
+                await waitPortsReleased([FIXTURE_PORT, PWA_PORT]);
             }
         }
     }
@@ -565,7 +680,7 @@ export async function main({ requestFailureControl = null } = {}) {
     }, null, 2));
 
     console.log(`\nDone. Evidence written under ${OUT_ROOT}`);
-    if (!matrixComplete || results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !r.spy_network_gate_passed || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.checks?.some(c => !c.passed)))) {
+    if (!matrixComplete || results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !r.spy_network_gate_passed || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.label_checks?.pass === false || j.checks?.some(c => !c.passed)))) {
         process.exitCode = 1;
     }
 }

@@ -2,8 +2,9 @@
 
 **2026-11-06 M1 update:** start with [M1-SPY-JOURNEY.md](M1-SPY-JOURNEY.md)
 for the current portable runner and source-bound SPY Options/Gamma Watch matrix.
-The sections below describe the September baseline and supporting receipts;
-they do not establish current-main or deployed-build acceptance. The runner
+Historical sections below describe the September baseline; the Linux
+re-baseline records the preserved #977 work. Neither establishes deployed-build
+acceptance for this candidate. The runner
 now defaults to this worktree's `pwa/`, uses `#/god-view`, and records the
 actual source and served development-module identities.
 
@@ -123,6 +124,9 @@ to be restarted.
 | (d) Research status | **No dedicated page exists.** The real operator-only surfaces are Discovery (`#/discovery` → `pwa/src/views/Discovery.jsx`) and Pipeline Health (`#/pipeline-health` → `pwa/src/views/PipelineHealth.jsx`) | `GET /api/v1/discovery/{jobs,hypotheses,hypotheses/results,results/orthogonality,results/clustering}`; `GET /api/v1/system/pipeline-health`; `GET /api/v1/snapshots/research/latest` (new — draft #566) | `discovery_jobs`, `discovery_hypotheses`, `discovery_hypotheses_results`, `discovery_results`, `pipeline_health`, `research_status` |
 | (e) Data health / source drill-down | `#/operator` → `pwa/src/views/Operator.jsx` (loads all six below on mount); sector drill-down via `GET /api/v1/sectors/{sector}/health` | `GET /api/v1/system/status`, `GET /api/v1/system/hermes-status?limit=20`, `GET /api/v1/snapshots/issues?...`, `GET /api/v1/snapshots/latest/pipeline_summary?n=10`, `GET /api/v1/system/health`, `GET /api/v1/system/freshness`, `GET /api/v1/sectors/Technology/health` | `system_status`, `hermes_status`, `snapshots_issues`, `snapshots_latest`, `system_health`, `system_freshness`, `sector_health` |
 | God View pillars (W6, draft, not yet a first-release journey) | `#/godview` → `pwa/src/views/GodViewPillars.jsx` (route id **`godview`**, not `godview-pillars` — see note below) | `GET /api/v1/godview/pillars/cftc?as_of=YYYY-MM-DD`; `GET /api/v1/godview/pillars/{finra_short_volume,sec_regsho_ftd,commodity_warehouses,fed_net_liquidity,buyback_blackouts,dealer_gex}` (six known-unbuilt pillars, not five) | `godview_pillar_cftc`, `godview_pillar_unbuilt` |
+| God View (G9, main) | `#/god-view` → `pwa/src/views/GodView.jsx` (main's route id is **`god-view`**; `#/godview` has no route on main) | `GET /api/v1/godview/latest` | `godview_latest` |
+| Money Flow → Dashboard tab (flow provenance badges) | `#/money-flow`, click **Dashboard** → `pwa/src/components/flows/JunctionDashboard.jsx` / `FreshnessIndicator.jsx` | `GET /api/v1/flows/junction-points` (other Money Flow tabs' endpoints are not fixtured and 404) | `junction_points` |
+| Options → Gamma Watch tab | `#/options`, click **Gamma Watch** → `pwa/src/components/GammaWatch.jsx` | `GET /api/v1/gamma-watch/state` (polled every 5 s; clocks are generated per request so the adapter's 15 s / 20 s freshness gates pass) | `gamma_watch_state` |
 
 All fixtures live in `tests/browser/fixture_api/fixtures.py`, routed by
 `tests/browser/fixture_api/server.py`. Data is entirely synthetic: ticker
@@ -161,6 +165,10 @@ pass guessed and shipped fixtures that 200'd but broke the view (see
   `git show d197c9a3 -- pwa/src/routes.js`, which adds exactly
   `{id: 'godview', label: 'God View', component: './views/GodViewPillars.jsx', ...}`.
   The fixture, journey, and README all use `#/godview`.
+  **Superseded on main (2026-11-05):** main never shipped `GodViewPillars.jsx`;
+  its route is `god-view` → `GodView.jsx` reading `/api/v1/godview/latest`.
+  The runner's journey is now `god-view` (`#/god-view`, fixture
+  `godview_latest`); the `/godview/pillars/*` fixtures stay for the draft.
 - There are **six** known-unbuilt pillar names in
   `_KNOWN_UNBUILT_PILLARS` (`api/routers/godview_pillars.py:46-53`):
   `finra_short_volume`, `sec_regsho_ftd`, `commodity_warehouses`,
@@ -533,6 +541,20 @@ post-recovery baseline SHA before any of them count as release evidence.
 
 ## Evidence runner (`run_evidence.mjs`)
 
+**Linux re-baseline (2026-11-05, #959):** the runner now auto-detects a Linux
+Chrome (or takes `CHROME_PATH`), defaults `--pwa-dir` to this checkout's
+`pwa/`, spawns its servers in their own process group so teardown reaps the
+Vite grandchild, and waits for ports 8001/5174 to be released between pairs.
+Journeys may carry per-scenario `checks` (`expect` / `forbid` regexes over the
+settled page text), reported in `summary.json` as `label_checks`. New
+journeys: `god-view`, `money-flow-dashboard` (OBSERVED / UNKNOWN / ESTIMATED,
+never "LIVE" / "EST") and `options-gamma-watch` (delayed ZeroGEX levels,
+frozen research, hypothetical rebalancing and the RTD receipt each labelled
+separately; healthy = public schema with no RTD price, partial = legacy frame
+with an RTD receipt, empty = collector unavailable). These were run headless
+on Linux (admin × healthy/partial/empty); that output was kept outside the
+repo and is **not** committed — fixture runs are development evidence only.
+
 `tests/browser/run_evidence.mjs` + `tests/browser/package.json` (a
 `puppeteer-core` devDependency, isolated in this directory — `pwa/package.json`
 was not touched) automate what a human driving the browser does by hand:
@@ -550,8 +572,12 @@ timestamps, per-journey crashed/console_errors/api_non_2xx).
 cd tests/browser
 npm ci
 node run_evidence.mjs --tree-label <sha-or-label>
-# defaults: --pwa-dir C:/Users/owner/dev/GRID-fable-wt-composed-g/pwa,
+# defaults: --pwa-dir <this checkout>/pwa,
 # --scenarios healthy,partial,empty, --roles admin,contributor
+# browser: $CHROME_PATH, else auto-detected (Linux /usr/bin/google-chrome,
+#   google-chrome-stable, chromium[-browser]; macOS /Applications; Windows
+#   Program Files Chrome/Edge). Never downloads one.
+# fixture server interpreter: $PYTHON, else python3 (python on Windows)
 # --journeys <comma-separated journey ids> restricts to a subset (e.g. after
 #   fixing one view, re-verify just `--journeys catalyst-timeline-ACME`)
 # --out tests/browser/evidence/<tree-label>/

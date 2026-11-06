@@ -21,6 +21,34 @@ class QuietFixture(FixtureHandler):
 
 
 class PreloadCoverage(unittest.TestCase):
+    def test_spy_contract_selection_preserves_main_legacy_and_godview_fixtures(self):
+        class PartialFixture(QuietFixture):
+            scenario = 'partial'
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), PartialFixture)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        opener = build_opener(ProxyHandler({}))
+        base = f'http://127.0.0.1:{server.server_port}'
+        try:
+            with opener.open(base + '/api/v1/gamma-watch/state', timeout=3) as r:
+                legacy = json.load(r)['data']
+            self.assertNotIn('schema', legacy)
+            self.assertTrue(legacy['quote']['is_rtd'])
+            request = Request(base + '/api/v1/gamma-watch/state', headers={'X-Grid-Fixture-Journey': 'spy-options'})
+            with opener.open(request, timeout=3) as r:
+                spy = json.load(r)['data']
+            self.assertEqual(spy['schema'], 'gex-screen/2')
+            self.assertGreater(spy['served_at'] - spy['public_price']['source_time'], 7000)
+            with opener.open(base + '/api/v1/godview/latest', timeout=3) as r:
+                godview = json.load(r)
+            self.assertEqual(godview['pillars']['fed_liquidity']['status'], 'stale')
+            self.assertEqual(sum(method == 'GET' and bool(pattern.fullmatch('/api/v1/godview/latest')) for method, pattern, _ in ROUTES), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
     def test_inventory_binds_to_real_preload_paths_and_registered_source_handlers(self):
         source = (ROOT / 'pwa/src/app.jsx').read_text(encoding='utf8')
         block = re.search(r'const OPERATOR_PRELOAD_API_PATHS = \[(.*?)\];', source, re.S).group(1)

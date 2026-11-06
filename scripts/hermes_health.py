@@ -29,6 +29,9 @@ OPERATOR_ISSUE_DEDUPE_HOURS = 20
 # check_db_health counts QUARANTINED raw_series rows only up to this many, so a
 # large quarantine cannot turn the health check into a table-sized count.
 QUARANTINED_COUNT_CAP = 100_000
+# Today's astrogrid.sky_snapshot row is expected by this UTC hour (issue #500).
+SKY_SNAPSHOT_DUE_HOUR_UTC = 2
+SKY_SNAPSHOT_RELATION = "astrogrid.sky_snapshot"
 
 
 def _ensure_issues_table(engine: Any) -> None:
@@ -1043,6 +1046,66 @@ def check_hermes_health() -> dict[str, Any]:
         return {"healthy": False, "error": str(exc)}
 
 
+def check_sky_snapshot_freshness(engine: Any, now: datetime | None = None) -> dict[str, Any]:
+    """Whether today's (UTC) ``astrogrid.sky_snapshot`` row exists.
+
+    Hermes step 7c2 (``oracle/astrogrid_cycle.py``) writes one row per UTC
+    day, hourly and idempotently, so a row for today should exist shortly
+    after 00:00Z. ``due`` turns True at ``SKY_SNAPSHOT_DUE_HOUR_UTC``; the
+    ``astrogrid.sky_snapshot_missing`` condition in
+    ``alerts/health_alerter.py`` fires when ``checked and due and not
+    present_today`` (issue #500, forward-only decision 2026-11-05: gaps are
+    alerted on, never backfilled).
+
+    The table name is fixed: ``store.astrogrid`` defaults
+    ``ASTROGRID_DB_SCHEMA`` to ``astrogrid`` and SQL is never built from
+    strings here. If the relation is absent, ``checked`` stays False and no
+    alert fires (db.unhealthy covers connectivity). Read-only; never raises.
+    """
+    from sqlalchemy import text
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    today = now.date()
+    result: dict[str, Any] = {
+        "table": SKY_SNAPSHOT_RELATION,
+        "checked": False,
+        "today": today.isoformat(),
+        "due": now.hour >= SKY_SNAPSHOT_DUE_HOUR_UTC,
+        "due_hour_utc": SKY_SNAPSHOT_DUE_HOUR_UTC,
+        "present_today": None,
+        "latest_snapshot_date": None,
+        "latest_created_at": None,
+    }
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SET LOCAL statement_timeout = '10s'"))
+            if not _relation_exists(conn, SKY_SNAPSHOT_RELATION):
+                result["error"] = "relation missing"
+                return result
+            # Index-backed by idx on (snapshot_date DESC).
+            row = conn.execute(
+                text(
+                    "SELECT snapshot_date, created_at FROM astrogrid.sky_snapshot "
+                    "WHERE snapshot_date <= :today "
+                    "ORDER BY snapshot_date DESC, created_at DESC LIMIT 1"
+                ),
+                {"today": today},
+            ).fetchone()
+        latest_date = row[0] if row else None
+        latest_created = row[1] if row else None
+        result["checked"] = True
+        result["present_today"] = latest_date == today
+        result["latest_snapshot_date"] = latest_date.isoformat() if latest_date else None
+        result["latest_created_at"] = latest_created.isoformat() if latest_created else None
+    except Exception as exc:  # noqa: BLE001 — health probe must never raise
+        log.warning("sky_snapshot freshness check failed: {e}", e=str(exc))
+        result["error"] = str(exc)
+    return result
+
+
 def check_system_health(engine: Any) -> dict[str, Any]:
     """Full system health check."""
     db = check_db_health(engine)
@@ -1051,5 +1114,6 @@ def check_system_health(engine: Any) -> dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "db": db,
         "hermes": hermes,
+        "astrogrid": {"sky_snapshot": check_sky_snapshot_freshness(engine)},
         "overall_healthy": db["healthy"],  # hermes is optional
     }

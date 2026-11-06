@@ -1,0 +1,11 @@
+# Shared cgroup for every grid-worker@N on a CPU worker node (slice S4, 2026-11-06).
+# Caps for shared machines go in a drop-in, e.g. /etc/systemd/system/grid-worker.slice.d/cap.conf:
+#   [Slice]
+#   CPUQuota=800%
+#   MemoryMax=16G
+[Unit]
+Description=GRID CPU compute workers
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes

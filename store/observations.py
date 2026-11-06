@@ -521,3 +521,136 @@ def read_daily_policy_n(
         if is_daily_policy_capture(payload, series_id, _coerce_date(d), _coerce_ts(ts)):
             qualified.append((d, value, ts, name))
     return list(reversed(_dedup_latest_vintage(qualified, series_id)))[:max(0, int(n))]
+
+
+# ── Completed closes derived from the capture boundary ─────────────────────
+#
+# ``read_daily_policy_n`` only accepts rows whose payload carries a capture
+# marker. The yfinance puller started writing markers in the autumn of 2026
+# (``spy_close_v1`` from 2026-09-23, a backfill at 2026-10-19 back to May),
+# so every earlier close -- although pulled after its label day had ended --
+# is invisible to it. The marker records exactly one fact: the pull happened
+# at or after the series' capture boundary. ``read_completed_closes`` applies
+# that same predicate to the row's own ``pull_timestamp``, so older captures
+# qualify by the identical rule, and it refuses (``ambiguous``) a label whose
+# post-boundary vintages disagree, which is how an adjusted-close writer
+# sharing the series id shows up.
+
+COMPLETED_CLOSE_REL_TOLERANCE = 5e-4  # 0.05 %; float32 noise is ~1e-8
+_COMPLETED_CLOSE_SOURCES = frozenset({"yfinance", "tiingo"})
+
+
+@dataclass(frozen=True)
+class CompletedClose:
+    """Every post-boundary vintage of one label, oldest pull first."""
+
+    series_id: str
+    obs_date: date
+    vintages: tuple[tuple[datetime, float], ...]
+    source: str | None
+    ambiguous: bool
+
+    @property
+    def latest(self) -> Observation:
+        ts, value = self.vintages[-1]
+        return Observation(self.series_id, self.obs_date, value, ts, self.source)
+
+    @property
+    def first(self) -> Observation:
+        """The earliest completed vintage (closest to the label's end)."""
+        ts, value = self.vintages[0]
+        return Observation(self.series_id, self.obs_date, value, ts, self.source)
+
+    @property
+    def first_completed_pull(self) -> datetime:
+        return self.vintages[0][0]
+
+    def known_at(self, ts: datetime) -> Observation | None:
+        """Newest vintage pulled at or before ``ts`` (``None`` if none was)."""
+        known = [(t, v) for t, v in self.vintages if t <= ts]
+        if not known:
+            return None
+        t, v = known[-1]
+        return Observation(self.series_id, self.obs_date, v, t, self.source)
+
+
+def read_completed_closes(
+    conn: Any,
+    series_id: str,
+    *,
+    start: date,
+    end: date,
+    boundary: Any,
+    source: str | tuple[str, ...] = "yfinance",
+    as_of_ts: datetime | None = None,
+    rel_tolerance: float = COMPLETED_CLOSE_REL_TOLERANCE,
+) -> dict[date, CompletedClose]:
+    """Completed closes of ``series_id`` labelled in ``[start, end]``.
+
+    ``boundary(obs_date)`` returns the aware UTC instant after which a capture
+    of that label is a completed close, or ``None`` when the label is not a
+    session the caller's calendar knows (it is then skipped). A row qualifies
+    when it is ``SUCCESS``, from ``source``, pulled at or after the boundary
+    (and at or before ``as_of_ts``), positive and finite, and its payload --
+    if it has one -- does not label it otherwise (a ``capture_state`` other
+    than ``POLICY_ELIGIBLE`` or a different ``price_basis``).
+
+    ``source`` may name several raw-close writers of the same ``YF:*`` id --
+    only ``yfinance`` and ``TIINGO`` (whose ``close`` field is the raw,
+    unadjusted EOD close; ``adjClose`` goes to ``:adj_close``) are accepted.
+    Their vintages of one label are pooled, so a cross-source disagreement
+    beyond ``rel_tolerance`` makes the label ``ambiguous`` rather than
+    letting one source win silently.
+    """
+    import json
+    from math import isfinite
+
+    sources = (source,) if isinstance(source, str) else tuple(source)
+    if (not sources or not series_id.startswith("YF:")
+            or any(s.lower() not in _COMPLETED_CLOSE_SOURCES for s in sources)):
+        raise ValueError("completed-close selection requires a YF series and yfinance/TIINGO sources")
+    sql = _WINDOW_SQL.replace("r.pull_timestamp, sc.name", "r.pull_timestamp, sc.name, r.raw_payload")
+    rows: list = []
+    for src in sources:
+        rows.extend(conn.execute(text(sql), {
+            "sid": series_id, "ok": SUCCESS, "source": src,
+            "start": start, "as_of": end, "as_of_ts": as_of_ts,
+        }).fetchall())
+    grouped: dict[date, list[tuple[datetime, float]]] = {}
+    names: dict[date, set[str]] = {}
+    for d, value, ts, name, payload in rows:
+        obs = _coerce_date(d)
+        pulled = _coerce_ts(ts)
+        edge = boundary(obs)
+        if edge is None or pulled is None or pulled.tzinfo is None or pulled < edge:
+            continue
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = None
+        if isinstance(payload, dict):
+            state = payload.get("capture_state")
+            if state is not None and state != "POLICY_ELIGIBLE":
+                continue
+            basis = payload.get("price_basis")
+            if basis is not None and basis != series_id:
+                continue
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not isfinite(v) or v <= 0:
+            continue
+        grouped.setdefault(obs, []).append((pulled, v))
+        names.setdefault(obs, set()).add(str(name))
+    out: dict[date, CompletedClose] = {}
+    for obs, vintages in grouped.items():
+        vintages.sort(key=lambda tv: tv[0])
+        lo = min(v for _, v in vintages)
+        hi = max(v for _, v in vintages)
+        out[obs] = CompletedClose(
+            series_id, obs, tuple(vintages), "+".join(sorted(names.get(obs, ()))) or None,
+            ambiguous=(hi - lo) / lo > rel_tolerance,
+        )
+    return out

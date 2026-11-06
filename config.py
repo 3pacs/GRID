@@ -243,8 +243,13 @@ class Settings(BaseSettings):
 
     # Remote Ollama nodes — added 2026-05-09. Each has its own URL +
     # default model so the LLM router can fan out across the cluster.
-    # panda is offline for the foreseeable future; keep this provider
-    # disabled by default and out of automatic fallback chains.
+    #
+    # Retired 2026-11-06 (fleet audit 2026-11-05 ~23:55Z): panda, ocr-node,
+    # koala and z400 no longer answer from grid-svr — koala times out after
+    # 5 s, z400 is not a tailnet peer, ocr-node and panda are offline. They
+    # are disabled by default and absent from every automatic chain in
+    # llm/router.py; the factories stay so an operator can opt one back in
+    # explicitly (ENABLED=true plus an explicit provider= or chain entry).
     OLLAMA_PANDA_BASE_URL: str = ""
     OLLAMA_PANDA_ENABLED: bool = False
     OLLAMA_PANDA_TIMEOUT_SECONDS: int = 240
@@ -255,7 +260,7 @@ class Settings(BaseSettings):
     OLLAMA_PANDA_CHAT_MODEL: str = "qwen3.6:27b-q4_K_M"
 
     OLLAMA_OCR_BASE_URL: str = "http://ocr-node:11434"
-    OLLAMA_OCR_ENABLED: bool = True
+    OLLAMA_OCR_ENABLED: bool = False  # retired 2026-11-06 — offline
     OLLAMA_OCR_TIMEOUT_SECONDS: int = 120
     # ocr-node has 2× 8GB Ampere — gemma3:12b-it-q4_K_M (~7GB) replaces
     # gemma2:9b after the 2026-05-09 cluster refresh. Vision models on
@@ -268,7 +273,7 @@ class Settings(BaseSettings):
     # flash-attn or NVFP4, but excels at small dense inference and
     # embedding generation.
     OLLAMA_KOALA_BASE_URL: str = "http://koala:11434"
-    OLLAMA_KOALA_ENABLED: bool = True
+    OLLAMA_KOALA_ENABLED: bool = False  # retired 2026-11-06 — 5 s timeouts
     OLLAMA_KOALA_TIMEOUT_SECONDS: int = 120
     OLLAMA_KOALA_CHAT_MODEL: str = "gemma3:12b-it-q4_K_M"
     OLLAMA_KOALA_EMBED_MODEL: str = "nomic-embed-text"
@@ -281,7 +286,7 @@ class Settings(BaseSettings):
     # (minicpm-v:8b, qwen2.5vl:7b) also present but not routed through
     # the standard chain — callers override ``model=`` for vision.
     OLLAMA_Z400_BASE_URL: str = "http://z400:11434"
-    OLLAMA_Z400_ENABLED: bool = True
+    OLLAMA_Z400_ENABLED: bool = False  # retired 2026-11-06 — not a tailnet peer
     OLLAMA_Z400_TIMEOUT_SECONDS: int = 120
     OLLAMA_Z400_CHAT_MODEL: str = "qwen2.5:7b-instruct-q4_K_M"
     OLLAMA_Z400_EMBED_MODEL: str = "nomic-embed-text"
@@ -300,6 +305,18 @@ class Settings(BaseSettings):
     OLLAMA_Z4_TIMEOUT_SECONDS: int = 120
     OLLAMA_Z4_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_Z4_EMBED_MODEL: str = "nomic-embed-text"
+
+    # Ollama on i7gen10 (RTX 2060 6 GB) — the second embedding node, added
+    # 2026-11-06. Verified from grid-svr 2026-11-05: Ollama answers on the
+    # tailnet IP below (OLLAMA_HOST is bound to it, not to localhost) with
+    # qwen2.5:7b-instruct; nomic-embed-text must be pulled there before it can
+    # embed (ops-s2-llm-env.sh does that). Until then embed() gets a miss from
+    # it and moves on to the next node.
+    OLLAMA_I7GEN10_BASE_URL: str = "http://100.98.109.92:11434"
+    OLLAMA_I7GEN10_ENABLED: bool = True
+    OLLAMA_I7GEN10_TIMEOUT_SECONDS: int = 120
+    OLLAMA_I7GEN10_CHAT_MODEL: str = "qwen2.5:7b-instruct"
+    OLLAMA_I7GEN10_EMBED_MODEL: str = "nomic-embed-text"
 
     # Local Kokoro TTS for the on-demand audio briefing
     # (intelligence/audio_briefing.py). Kokoro-FastAPI, OpenAI-compatible
@@ -346,10 +363,11 @@ class Settings(BaseSettings):
     WHISPER_BASE_URL: str = "http://koala:8092"
     WHISPER_ENABLED: bool = True
 
-    # llama.cpp on grid-svr (RTX 3090 24 GB): Qwen3.8-27B Q4_K_M + mmproj,
-    # llama-server on 100.75.185.36:8086 fronted by the :8081 shim. Verified
-    # 2026-09-10 — every GPU tier (this box, gridz4, redbox) serves Qwen 3.8;
-    # only the CPU-only :8080 unit still loads the Qwen3.6 GGUF.
+    # Generic llama.cpp provider (``llamacpp``). Despite the grid-svr IP this
+    # is NOT the 3090: 100.75.185.36:8086 is a socket proxy to gridz4:8086,
+    # i.e. the same gridz4 Qwen3.8-27B box as LLAMACPP_Z4_BASE_URL (fleet
+    # audit 2026-11-05). The old :8081 shim is gone — nothing listens there.
+    # grid-svr's own RTX 3090 is LLAMACPP_ORACLE_BASE_URL (127.0.0.1:18081).
     # Timeout MUST be < HERMES cycle timeout (600s in scripts/hermes_operator.py)
     # so that when Hermes blacklists a slow cycle, the in-flight HTTP call
     # also unwinds and the thread exits — otherwise we leak one stuck
@@ -358,17 +376,23 @@ class Settings(BaseSettings):
     # bombarded, every fresh cycle blocked. 300s is plenty for normal
     # generation; queue depth >300s means the LLM is overloaded and
     # backing off is the right call.
-    LLAMACPP_BASE_URL: str = "http://localhost:8081"
+    LLAMACPP_BASE_URL: str = "http://100.75.185.36:8086"
     LLAMACPP_ENABLED: bool = True
     LLAMACPP_TIMEOUT_SECONDS: int = 300
     LLAMACPP_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
     LLAMACPP_EMBED_MODEL: str = "Qwen3.8-27B-Q4_K_M"
 
-    # llama.cpp ORACLE server on grid-svr (same Qwen3.8-27B llama-server).
-    LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
+    # grid-svr's RTX 3090 (``llamacpp_oracle``): Qwen3.8-27B Q4_K_M served by
+    # grid-hermes-3090-oracle.service on 127.0.0.1:18081 (OpenAI-compatible
+    # llama-server, model alias "oracle", 1 slot, n_ctx 8192 — verified
+    # 2026-11-05 via /health + /v1/models + /props). Loopback only, so only
+    # processes on grid-svr can reach it; elsewhere it refuses fast and the
+    # router cools it down. It is the independent fallback for ORACLE (after
+    # gridz4) and the second choice for REASON. Hermes shares the slot.
+    LLAMACPP_ORACLE_BASE_URL: str = "http://127.0.0.1:18081"
     LLAMACPP_ORACLE_ENABLED: bool = True
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
+    LLAMACPP_ORACLE_CHAT_MODEL: str = "oracle"
     # Must fit inside LLAMACPP_ORACLE_TIMEOUT_SECONDS at the server's real
     # throughput (~27 tok/s) or every full-length call orphans mid-generation
     # and holds the single llama slot, bombarding the server. 6000 tok ~= 220s.
@@ -376,9 +400,12 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_NUM_PREDICT: int = 6000
     LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 0
 
-    # llama.cpp QUICK-tier remote server (redbox node — qwen3.8-27b, Tailscale-reachable)
-    LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
-    LLAMACPP_QUICK_ENABLED: bool = True
+    # llama.cpp QUICK-tier provider (``llamacpp_quick``). Its old redbox
+    # default (100.126.129.45:8080) is dead, so there is no default host any
+    # more: blank URL or ENABLED=false means the factory returns None. The live
+    # .env points it at gridz4:8080 explicitly. Not in any automatic chain.
+    LLAMACPP_QUICK_BASE_URL: str = ""
+    LLAMACPP_QUICK_ENABLED: bool = False
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
     LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3.8-27b"
 
@@ -424,26 +451,31 @@ class Settings(BaseSettings):
     #
     # Order is by verified reachability, then by GPU contention.
     #
-    # Probed from grid-svr 2026-09-10 (`tailscale status` + /api/tags):
-    #   ollama_z4     gridz4:11434  ACTIVE, direct, nomic-embed-text  <- primary
-    #   ollama_koala  koala:11434   offline, last seen 48 days ago
-    #   ollama_z400   z400:11434    not a tailnet peer at all
-    #   ollama        localhost     ACTIVE, nomic-embed-text        <- last resort
+    # Probed from grid-svr 2026-11-05 (/api/tags):
+    #   ollama_z4       gridz4:11434          ACTIVE, nomic-embed-text  <- primary
+    #   ollama_i7gen10  100.98.109.92:11434   ACTIVE (RTX 2060), needs the
+    #                                         nomic-embed-text pull     <- second
+    #   ollama          localhost             ACTIVE, nomic-embed-text  <- last resort
+    # koala (5 s timeouts) and z400 (not a peer) were dropped 2026-11-06.
     #
-    # gridz4 is what satisfies the operator's "use another machine on the
-    # tailnet" — it is the only *separate* box currently serving an embedding
-    # model. koala and z400 stay in the chain ahead of grid-svr so they resume
-    # duty automatically if they come back; both are ENABLED=false in the live
-    # .env, so a dead entry costs nothing (the factory returns None before any
-    # socket is opened). grid-svr is last because its Ollama shares the RTX
-    # 3090 with the REASON/ORACLE llama-server, and embedding batches there
-    # would evict the 27B chat model.
+    # grid-svr is last because its Ollama shares the RTX 3090 with the
+    # ORACLE llama-server, and embedding batches there would evict the 27B
+    # chat model.
     #
     # ``llm.router.embed()`` walks this list and returns None when no node
     # answers (graceful degradation — never raises). Per-node embed models are
     # declared with their nodes above (OLLAMA_Z4_EMBED_MODEL, etc.).
-    EMBED_PROVIDER_CHAIN: str = "ollama_z4,ollama_koala,ollama_z400,ollama"
+    EMBED_PROVIDER_CHAIN: str = "ollama_z4,ollama_i7gen10,ollama"
     EMBED_MODEL: str = "nomic-embed-text"
+
+    # Provider health policy (llm/router.py). Every local-node HTTP call uses
+    # this TCP connect timeout, so a black-holed host (koala answered nothing
+    # for 5 s per call) costs at most this long. A provider whose last call was
+    # refused — health probe failed, embed raised or came back empty — is then
+    # skipped for LLM_PROVIDER_COOLDOWN_SECONDS before it is tried again, so a
+    # dead node cannot stall every call in the chain.
+    LLM_CONNECT_TIMEOUT_SECONDS: float = 2.0  # clamped to (0, 30] by the router
+    LLM_PROVIDER_COOLDOWN_SECONDS: float = 120.0  # clamped to [0, 3600] by the router
 
     # Google Gemini (paid frontier — gated by GRID_ALLOW_PAID_LLM like every
     # other paid provider). Placed ahead of openrouter in the chat fallback
@@ -552,6 +584,12 @@ class Settings(BaseSettings):
     # contract (scoring followed by promotion) is unchanged by this flag.
     GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION: bool = False
 
+    # evaluation.signal_outcomes.score_forward: each trust cycle appends the
+    # corrected (sig-eval-4-sessions) outcome of recent signal_sources rows to
+    # the additive signal_source_outcomes table. signal_sources.outcome and
+    # every consumer of it are untouched. Off until an operator turns it on.
+    GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -569,6 +607,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
         "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
+        "GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )
@@ -651,9 +690,11 @@ class Settings(BaseSettings):
 
     # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | llamacpp_quick | llamacpp_z4 | openrouter | bitnet
     LLM_ROUTER_ENABLED: bool = True
-    LLM_LOCAL_PROVIDER: str = "llamacpp_quick"  # LOCAL tier — redbox qwen3.8-27b
-    LLM_REASON_PROVIDER: str = "llamacpp_quick"  # REASON tier — redbox until z4 is tuned
-    LLM_ORACLE_PROVIDER: str = "llamacpp_oracle"  # ORACLE tier — heavier oracle path
+    # All three tiers lead with gridz4; the router's fallback chains then try
+    # grid-svr's RTX 3090 (llamacpp_oracle) for ORACLE and REASON.
+    LLM_LOCAL_PROVIDER: str = "llamacpp_z4"  # LOCAL tier — gridz4 Qwen3.8-27B
+    LLM_REASON_PROVIDER: str = "llamacpp_z4"  # REASON tier — gridz4, then the 3090
+    LLM_ORACLE_PROVIDER: str = "llamacpp_z4"  # ORACLE tier — gridz4, then the 3090
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
     LLM_DEFAULT_PROVIDER: str = "llamacpp"
     LLM_QUICK_PROVIDER: str = "llamacpp"

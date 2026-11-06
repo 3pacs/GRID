@@ -241,6 +241,36 @@ def _flush_batch(engine: Engine, batch: list[dict]) -> int | None:
     return count
 
 
+def _vintage_of(pull_timestamp: Any) -> Any:
+    """The vintage/release date the bulk path stores for a raw row.
+
+    Unchanged from the inline expression it replaced: the pull timestamp's
+    own calendar date (timestamptz arrives in the session time zone).
+    """
+    return pull_timestamp.date() if hasattr(pull_timestamp, "date") else pull_timestamp
+
+
+def _split_by_vintage(sources: list[dict]) -> list[list[dict]]:
+    """Group one (series_id, obs_date)'s raw candidates by vintage date.
+
+    Each group is ordered newest pull first (then highest raw id), so
+    ``Resolver._select_source_winner``'s stable priority sort breaks ties
+    between equal-priority rows deterministically: the latest observation
+    known on that vintage day wins, rather than whatever row order the
+    database returned. Groups are returned oldest vintage first.
+    """
+    groups: dict[Any, list[dict]] = {}
+    for source in sources:
+        groups.setdefault(_vintage_of(source["pull_timestamp"]), []).append(source)
+    ordered: list[list[dict]] = []
+    for vintage in sorted(groups):
+        group = groups[vintage]
+        group.sort(key=lambda s: s.get("raw_id") or 0, reverse=True)
+        group.sort(key=lambda s: s["pull_timestamp"], reverse=True)
+        ordered.append(group)
+    return ordered
+
+
 def _resolve_spy_close_receipt(
     engine: Engine, feature_id: int, obs_date: date, sources: list[dict]
 ) -> int:
@@ -967,24 +997,34 @@ class Resolver:
                             continue
 
                     family = feature_families.get(feature_id, "")
-                    winner, conflict_flag, conflict_detail = self._select_source_winner(sources, family)
-                    if conflict_flag:
-                        local["conflicts_found"] += 1
+                    # One candidate per pull-date vintage, as resolve_selected_rows
+                    # already does. A window holding several vintages of one
+                    # (series, obs_date) used to collapse them into a single
+                    # winner, tie-broken arbitrarily among equal-priority rows;
+                    # when that winner's vintage already existed the insert hit
+                    # ON CONFLICT DO NOTHING and the newer vintage was dropped,
+                    # then never revisited once the watermark moved past it.
+                    # 2026-10-27 sp500_full lost its POLICY_ELIGIBLE close
+                    # (pulled 10-28 13:31Z) this way, as did ~1/3 of that batch.
+                    for vintage_sources in _split_by_vintage(sources):
+                        winner, conflict_flag, conflict_detail = self._select_source_winner(
+                            vintage_sources, family
+                        )
+                        if conflict_flag:
+                            local["conflicts_found"] += 1
 
-                    release_dt = (winner["pull_timestamp"].date()
-                                  if hasattr(winner["pull_timestamp"], "date")
-                                  else winner["pull_timestamp"])
+                        release_dt = _vintage_of(winner["pull_timestamp"])
 
-                    insert_batch.append({
-                        "fid": feature_id, "od": obs_date_val,
-                        "rd": release_dt, "vd": release_dt,
-                        "val": winner["value"], "src": winner["source_id"],
-                        "cf": conflict_flag, "cd": conflict_detail,
-                    })
+                        insert_batch.append({
+                            "fid": feature_id, "od": obs_date_val,
+                            "rd": release_dt, "vd": release_dt,
+                            "val": winner["value"], "src": winner["source_id"],
+                            "cf": conflict_flag, "cd": conflict_detail,
+                        })
 
-                    if len(insert_batch) >= INSERT_BATCH:
-                        _add_resolved(_flush(insert_batch))
-                        insert_batch = []
+                        if len(insert_batch) >= INSERT_BATCH:
+                            _add_resolved(_flush(insert_batch))
+                            insert_batch = []
 
                 # Flush remaining
                 if insert_batch:

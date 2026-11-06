@@ -224,6 +224,13 @@ sudo systemctl disable --now grid-llamacpp
 `cp server_setup/grid-*.service` cannot resurrect it. **Do not recreate it.**
 GPU inference is unaffected — it lives on :8086 behind the :8081 shim.
 
+The host copy was not removed. Checked read-only on 2026-11-06:
+`/etc/systemd/system/grid-llamacpp.service` (dated Jul 13) is still installed,
+`UnitFileState=disabled`, `ActiveState=inactive`. The same holds for
+`grid-llamacpp-batch.service` and `grid-llamacpp-oracle.service`. "Deleted"
+above means the repo copy only. Removing the host files is an operator
+decision; until then, keep them out of every `systemctl restart` line.
+
 Where its traffic went:
 
 | Old consumer of :8080 | Now |

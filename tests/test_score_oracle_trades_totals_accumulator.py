@@ -102,11 +102,11 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
     fake_engine = _Engine(pending_rows)
 
     monkeypatch.setattr(sot, "create_engine", lambda *a, **kw: fake_engine)
-    monkeypatch.setattr(sot, "fetch_prices", lambda tickers, start, end: {})
+    monkeypatch.setattr(sot, "load_expiry_closes", lambda *a, **kw: {})
 
     calls: list[int] = []
 
-    def _fake_score_one_chunk(_conn, *, engine, prices, today, chunk_size):
+    def _fake_score_one_chunk(_conn, *, engine, prices, today, chunk_size, now, after):
         calls.append(1)
         if len(calls) == 1:
             # Every key score_one_chunk's real counters dict can carry,
@@ -118,6 +118,7 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
                 "skipped": 0, "no_data": 1, "unscorable_entry_price": 1,
                 "a_future_counter": 3,
                 "fetched": 1,
+                "cursor": (date(2026, 9, 20), "p-1"),
             }
         # Second call: nothing left -- terminates main()'s while loop.
         return {
@@ -125,6 +126,7 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
             "skipped": 0, "no_data": 0, "unscorable_entry_price": 0,
             "a_future_counter": 0,
             "fetched": 0,
+            "cursor": None,
         }
 
     monkeypatch.setattr(sot, "score_one_chunk", _fake_score_one_chunk)

@@ -62,6 +62,7 @@ test('portable browser override fails closed and source manifest includes fixtur
         writeFileSync(executable, 'fixture');
         assert.equal(resolveBrowserExecutable(executable), executable);
         assert.equal(resolveBrowserExecutable(null, { GRID_BROWSER_EXECUTABLE: executable }, 'linux'), executable);
+        assert.equal(resolveBrowserExecutable(null, { CHROME_PATH: executable }, 'linux'), executable);
         assert.throws(() => resolveBrowserExecutable(path.join(dir, 'missing')), /not found/);
         const root = path.resolve(here, '../..');
         const identity = sourceIdentity(root, ['tests/browser/fixture_api']);

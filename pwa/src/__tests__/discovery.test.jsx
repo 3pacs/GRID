@@ -1,7 +1,7 @@
 import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import Discovery, { ResearchRunPanel } from '../views/Discovery.jsx';
+import Discovery, { ResearchRunPanel, fmtFractionPct, fmtCount } from '../views/Discovery.jsx';
 import { api } from '../api.js';
 
 const storeState = {
@@ -152,6 +152,36 @@ describe('Discovery view async data', () => {
         expect(await screen.findByText('Orthogonality result unavailable.')).toBeInTheDocument();
         expect(screen.getByText('Best k')).toBeInTheDocument();
         expect(screen.getByText('Result time unknown')).toBeInTheDocument();
+    });
+
+    it('renders a missing variance_explained as unavailable, never NaN or 0', async () => {
+        api.getJobs.mockResolvedValue({ jobs: [] });
+        api.getResults.mockImplementation((type) => Promise.resolve(type === 'orthogonality'
+            ? { result: null }
+            : { result: { best_k: 4, pca_components_used: null, variance_explained: null } }));
+
+        render(<Discovery />);
+
+        const label = await screen.findByText('Variance explained');
+        const row = label.parentElement;
+        expect(row).toHaveTextContent('unavailable');
+        expect(row).not.toHaveTextContent('NaN');
+        expect(row).not.toHaveTextContent('0.0%');
+        expect(screen.getByText('PCA components').parentElement).toHaveTextContent('unavailable');
+        expect(screen.getByText('Best k').parentElement).toHaveTextContent('4');
+        expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
+    });
+
+    it('formats measured fractions and rejects non-finite values', () => {
+        expect(fmtFractionPct(0.8)).toBe('80.0%');
+        expect(fmtFractionPct(0)).toBe('0.0%');
+        expect(fmtFractionPct(undefined)).toBe('unavailable');
+        expect(fmtFractionPct(null)).toBe('unavailable');
+        expect(fmtFractionPct('abc')).toBe('unavailable');
+        expect(fmtFractionPct(Number.NaN)).toBe('unavailable');
+        expect(fmtFractionPct(Infinity)).toBe('unavailable');
+        expect(fmtCount(undefined)).toBe('unavailable');
+        expect(fmtCount(3)).toBe('3');
     });
 
     it('shows checked-empty only for explicit null results and unavailable for invalid responses', async () => {

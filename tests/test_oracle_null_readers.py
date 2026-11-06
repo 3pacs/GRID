@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -53,6 +53,23 @@ import scripts.score_oracle_trades as sot
 from intelligence import source_quality_ablation as sqa
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _book(closes: dict[str, dict[date, float]]) -> dict:
+    """A settled expiry-close PriceBook (pulled the morning after each close)."""
+    from store.observations import Observation
+
+    return {
+        t: {
+            d: Observation(
+                sot.close_series_id(t), d, v,
+                datetime.combine(d + timedelta(days=1), time(6), timezone.utc),
+                "TIINGO",
+            )
+            for d, v in by_date.items()
+        }
+        for t, by_date in closes.items()
+    }
 
 
 # ── In-memory fixture ──────────────────────────────────────────────────────
@@ -181,11 +198,11 @@ class TestScorerNullEntry:
         # The scorable row loses, which keeps the success-lesson writer (it
         # opens its own connection, which SQLite shares with ours) out of the
         # way. What is under test here is the entry-price gate, not lessons.
-        prices = {
+        prices = _book({
             "AAA": {today - timedelta(days=1): 110.0},
             "BBB": {today - timedelta(days=1): 110.0},
             "CCC": {today - timedelta(days=1): 90.0},
-        }
+        })
         with engine.begin() as conn:
             counters = sot.score_one_chunk(
                 conn, engine=engine, prices=prices, today=today,
@@ -234,16 +251,20 @@ class TestScorerNullEntry:
             counters = sot.score_one_chunk(
                 conn, engine=engine, prices={}, today=today, chunk_size=100,
             )
-        # No price data at all -> the one scorable row goes to no_data; the
-        # NULL and zero rows were never candidates in the first place.
-        assert counters["no_data"] == 1
+        # No price data at all -> the one scorable row is still inside the
+        # expiry-close grace window, so it stays pending (it used to be
+        # closed to no_data here, which is the S1 bug: see
+        # tests/test_score_oracle_trades_expiry_close.py). The NULL and zero
+        # rows were never candidates in the first place.
+        assert counters["no_data"] == 0
+        assert counters["pending_price"] == 1
         assert counters["skipped"] == 0
         with engine.connect() as conn:
             verdicts = dict(conn.execute(text(
                 "SELECT id, verdict FROM oracle_predictions"
             )).fetchall())
         assert verdicts["null-entry"] == "pending"
-        assert verdicts["normal"] == "no_data"
+        assert verdicts["normal"] == "pending"
 
 
 def test_no_data_sweep_names_null_explicitly() -> None:

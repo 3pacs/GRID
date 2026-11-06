@@ -71,27 +71,38 @@ This enforces grep-before-create discipline and prevents the duplication documen
 
 - **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
 - **Frontend:** React 18, Vite, [[Zustand]], served as PWA from [[FastAPI]]
-- **LLM:** Local Qwen 3.8 27B on GPU everywhere (verified 2026-09-10): grid-svr
-  RTX 3090 llama-server (Qwen3.8-27B Q4_K_M + mmproj on 100.75.185.36:8086, fronted by the
-  :8081 shim — REASON + ORACLE tiers), redbox `qwen3.8-27b` (LOCAL tier), gridz4
-  `Qwen3.8-27B-Q4_K_M`, Ollama `qwen3.8:27b` on :11434.
-  **No CPU-only inference** — the operator retired the `grid-llamacpp` unit on :8080
+- **LLM:** Local Qwen 3.8 27B on GPU (topology from the 2026-11-05 fleet audit; routing
+  changed 2026-11-06). **gridz4** llama-server `Qwen3.8-27B-Q4_K_M` on `gridz4:8080`
+  (`llamacpp_z4`) is the primary for LOCAL, REASON and ORACLE. **grid-svr's RTX 3090**
+  (`llamacpp_oracle`, Qwen3.8-27B, alias `oracle`, 1 slot, n_ctx 8192) serves on
+  **127.0.0.1:18081** via `grid-hermes-3090-oracle.service`. It is the only GPU that is
+  independent of gridz4: ORACLE's fallback and REASON's second choice. It shares its
+  slot with Hermes and is reachable only from grid-svr. `llamacpp` (100.75.185.36:8086)
+  is a socket proxy to gridz4, not a separate GPU. The old :8081 shim is gone; nothing
+  listens there. grid-svr Ollama on :11434 is the last local fallback.
+  koala, z400, ocr-node, panda and the redbox :8080 default are retired from every
+  chain and disabled by default (`_RETIRED_PROVIDERS` in `llm/router.py`).
+  **Fail-fast:** local-node calls use a 2 s connect timeout
+  (`LLM_CONNECT_TIMEOUT_SECONDS`). A provider that refused its last call is skipped
+  for `LLM_PROVIDER_COOLDOWN_SECONDS` (120 s).
+  **No CPU-only inference**: the operator retired the `grid-llamacpp` unit on :8080
   (Qwen3.6 GGUF, `NGL=0`, 17.9 GB RAM, answered every embedding call 501) on 2026-09-10.
   Don't recreate it; `server_setup/grid-llamacpp.service` is deleted on purpose.
   **Embeddings** go through `llm.router.embed()` → `EMBED_PROVIDER_CHAIN`
-  (gridz4 → koala → z400 → grid-svr Ollama, all `nomic-embed-text`), returning `None`
-  when no node answers. Only gridz4:11434 and grid-svr:11434 actually answered on
-  2026-09-10 — koala has been offline 48 days and z400 is no longer a tailnet peer. Paid providers — now including `gemini`, which sits ahead of
-  `openrouter` in every chat chain — stay gated off behind `GRID_ALLOW_PAID_LLM`.
-  See `llm/router.py` for the 3-tier taxonomy (LOCAL/REASON/ORACLE).
+  (gridz4 → i7gen10 RTX 2060 at 100.98.109.92:11434 → grid-svr Ollama, all
+  `nomic-embed-text`) and return `None` when no node answers. Paid providers, including
+  `gemini` (ahead of `openrouter` in every chat chain), stay gated off behind
+  `GRID_ALLOW_PAID_LLM`. See `llm/router.py` for the 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
 ## Server Deployment
 
 - Repo on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
-- **Systemd services**: grid-api, grid-llamacpp, grid-crucix, grid-hermes, grid-coordinator,
-  grid-worker, cloudflared. Restart core: `sudo systemctl restart grid-api grid-llamacpp
-  grid-crucix grid-hermes`
+- **Systemd services** (core, active on 2026-11-06): grid-api, grid-crucix, grid-hermes,
+  grid-scheduler, grid-coordinator, grid-worker, cloudflared. Restart core:
+  `sudo systemctl restart grid-api grid-crucix grid-hermes`. `grid-llamacpp` (and
+  `grid-llamacpp-batch`, `grid-llamacpp-oracle`) still have unit files in
+  `/etc/systemd/system` but are disabled and inactive; don't start or restart them.
 - **Public URL**: `https://grid.stepdad.finance` (Cloudflare Tunnel)
 - **Role-based auth**: admin (master password) and contributor (user accounts)
 - Full reference: `docs/SERVER-SERVICES.md`

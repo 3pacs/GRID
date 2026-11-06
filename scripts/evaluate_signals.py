@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Manual, read-only, provisional signal evaluation. Never scheduled or persisted."""
+"""Manual signal evaluation.
+
+Default mode: read-only, provisional, bounded evaluation of one source type
+(never persisted). ``replay`` mode: the offline replay of every
+``signal_sources`` row under the session evaluator -- dry run unless
+``--apply`` (see ``evaluation.signal_outcomes.replay_signal_sources``).
+"""
 
 from __future__ import annotations
 
@@ -153,46 +159,20 @@ def select_signal_sources(engine, *, source_type: str, date_from: date, date_to:
     return selected
 
 
-# known_at resolution is source_type-specific and explicit: only congressional
-# rows have a proven publication field wired here (disclosure_date, captured
-# in signal_value JSONB by ingestion/altdata/congressional.py). Every other
-# source_type falls back to created_at inside evaluate_signal() itself -- that
-# fallback is the existing, already-tested behaviour; this function's job is
-# only to populate known_at where a real publication timestamp is provably
-# available, and to label why it did not for everything else, rather than
-# leaving the reason implicit.
-KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE = "congressional_disclosure_date"
-KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE = "created_at_fallback_missing_disclosure_date"
-KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE = "created_at_fallback_unparseable_disclosure_date"
-KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE = "created_at_fallback_unverified_source_type"
-
+# known_at resolution lives in evaluation.signal_outcomes.resolve_known_at
+# (shared with the replay and the forward scorer); these names stay importable
+# from this script for existing callers.
+from evaluation.signal_outcomes import (  # noqa: E402,F401
+    KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE,
+    KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE,
+    KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE,
+    KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE,
+    resolve_known_at,
+)
 
 def _resolve_known_at(row: SelectedRow) -> Tuple[Optional[datetime], str]:
-    """Return (known_at, known_at_source) for one selected row.
-
-    Congressional trade disclosures publish a `disclosure_date` (the date the
-    STOCK Act filing became public), captured verbatim in `signal_value`
-    (`ingestion/altdata/congressional.py`). That date has no time component,
-    so the conservative, PIT-safe reading is "known no earlier than the end
-    of that trading day" -- using `time.max` here reuses evaluate_signal()'s
-    own after-16:00-ET rollover rule to push entry to the next session,
-    rather than assuming (and possibly leaking) an earlier intraday time.
-
-    Every other source_type has no verified publication field wired here
-    yet, so known_at stays None and evaluate_signal() falls back to
-    created_at -- explicitly labelled below, not silently assumed safe.
-    """
-    if "congress" not in row.source_type.lower():
-        return None, KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE
-    raw = (row.signal_value or {}).get("disclosure_date")
-    if not isinstance(raw, str):
-        return None, KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE
-    try:
-        disclosure_date = date.fromisoformat(raw)
-    except ValueError:
-        return None, KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE
-    known_at = datetime.combine(disclosure_date, time.max, MARKET_TZ)
-    return known_at, KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE
+    """Return (known_at, known_at_source) for one selected row (see resolve_known_at)."""
+    return resolve_known_at(row.source_type, row.signal_value)
 
 
 def to_signal_record(row: SelectedRow, *, horizon_days: int) -> SignalRecord:
@@ -248,7 +228,54 @@ def run(engine, args: argparse.Namespace, *, out=None, today: Optional[date] = N
     return result
 
 
+def build_replay_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="evaluate_signals.py replay",
+        description=(
+            "Recompute signal_sources outcomes under the session evaluator "
+            "(evaluation.signal_outcomes.SESSION_EVALUATION_VERSION). Dry run by "
+            "default: read-only transactions, prints the projected distribution "
+            "against the legacy outcome. --apply appends final outcomes to "
+            "signal_source_outcomes; signal_sources is never written."
+        ),
+    )
+    p.add_argument("--apply", action="store_true", help="append final outcomes (default: dry run)")
+    p.add_argument("--sample-mod", type=int, default=1, help="evaluate only rows with id %% N = 0")
+    p.add_argument("--ticker", action="append", dest="tickers", help="restrict to ticker (repeatable)")
+    p.add_argument("--max-tickers", type=int, default=None)
+    p.add_argument("--since", type=date.fromisoformat, default=None, help="signal_date lower bound")
+    p.add_argument("--evaluated-at", type=datetime.fromisoformat, default=None,
+                   help="evaluation instant (aware ISO timestamp; default now)")
+    p.add_argument("--out", default=None, help="also write the JSON summary to this new file")
+    return p
+
+
+def main_replay(argv: list[str], *, engine=None, out=None) -> int:
+    from evaluation.signal_outcomes import replay_signal_sources
+
+    args = build_replay_parser().parse_args(argv)
+    if args.evaluated_at is not None and (args.evaluated_at.tzinfo is None or args.evaluated_at.utcoffset() is None):
+        print("REFUSED: --evaluated-at must carry a timezone", file=sys.stderr)
+        return 2
+    if engine is None:
+        from db import get_engine
+        engine = get_engine()
+    result = replay_signal_sources(
+        engine, apply=args.apply, evaluated_at=args.evaluated_at, sample_mod=args.sample_mod,
+        tickers=args.tickers, max_tickers=args.max_tickers, since=args.since,
+    )
+    text_out = json.dumps(result, indent=2, default=str)
+    print(text_out, file=out or sys.stdout)
+    if args.out:
+        with open(args.out, "x", encoding="utf-8") as fh:
+            fh.write(text_out + "\n")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["replay"]:
+        return main_replay(argv[1:])
     args = build_arg_parser().parse_args(argv)
     try:
         engine = _build_engine(args.db_url)

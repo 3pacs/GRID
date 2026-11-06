@@ -88,6 +88,94 @@ def _provider_in_backoff(provider: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Provider health policy (2026-11-06).
+#
+# A provider whose last call was refused — its health probe failed at client
+# construction, or an embed() call raised / came back empty — is skipped for
+# LLM_PROVIDER_COOLDOWN_SECONDS. Every local-node client is also built with a
+# LLM_CONNECT_TIMEOUT_SECONDS TCP connect timeout. Together these keep a dead
+# node from stalling every call: before this, a black-holed koala cost 5 s per
+# get_llm()/embed() call because the router rebuilt (and re-probed) every
+# unavailable Ollama client on each pass through the chain.
+# ---------------------------------------------------------------------------
+_DEFAULT_CONNECT_TIMEOUT_S = 2.0
+_DEFAULT_PROVIDER_COOLDOWN_S = 120.0
+# Providers already warned as unreachable in this process; cleared when the
+# provider answers again so the next outage warns once more.
+_UNREACHABLE_WARNED: set[str] = set()
+
+
+def _connect_timeout(settings: Any) -> float:
+    """TCP connect timeout for local-node clients, clamped to (0, 30] s."""
+    try:
+        value = float(getattr(settings, "LLM_CONNECT_TIMEOUT_SECONDS", _DEFAULT_CONNECT_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return _DEFAULT_CONNECT_TIMEOUT_S
+    if not value > 0:  # also rejects NaN
+        return _DEFAULT_CONNECT_TIMEOUT_S
+    return min(value, 30.0)
+
+
+def _provider_cooldown_s() -> float:
+    """Seconds a refused provider is skipped, clamped to [0, 3600]."""
+    from config import settings
+
+    try:
+        value = float(getattr(settings, "LLM_PROVIDER_COOLDOWN_SECONDS", _DEFAULT_PROVIDER_COOLDOWN_S))
+    except (TypeError, ValueError):
+        return _DEFAULT_PROVIDER_COOLDOWN_S
+    if not value >= 0:  # also rejects NaN
+        return _DEFAULT_PROVIDER_COOLDOWN_S
+    return min(value, 3600.0)
+
+
+def _mark_provider_refused(provider: str, reason: str) -> None:
+    """Cool down a provider whose last call was refused.
+
+    Warns once per outage (repeats go to debug) — a node that stays down must
+    not refill errors.jsonl, and it is an operational condition, not a bug.
+    """
+    cooldown_s = _provider_cooldown_s()
+    if cooldown_s <= 0:
+        return
+    _PROVIDER_BACKOFF_UNTIL[provider] = time.time() + cooldown_s
+    _PROVIDER_BACKOFF_REASONS[provider] = reason
+    if provider in _UNREACHABLE_WARNED:
+        log.debug("LLM provider {p} still refusing ({r})", p=provider, r=reason)
+        return
+    _UNREACHABLE_WARNED.add(provider)
+    log.warning(
+        "LLM provider {p} refused its last call ({r}) — skipped for {s:.0f}s "
+        "(further refusals logged at debug until it answers)",
+        p=provider, r=reason, s=cooldown_s,
+    )
+
+
+def _mark_provider_answered(provider: str) -> None:
+    """Re-arm the once-per-outage warning after a provider answers."""
+    if provider in _UNREACHABLE_WARNED:
+        _UNREACHABLE_WARNED.discard(provider)
+        log.info("LLM provider {p} answering again", p=provider)
+
+
+def _build_client(provider: str) -> Any:
+    """``_create_client`` plus the refusal cooldown.
+
+    A factory that returns ``None`` is disabled/unconfigured (no socket was
+    opened), so it is not cooled down. A client object whose health probe
+    failed (``is_available`` false) is a refusal and is.
+    """
+    client = _create_client(provider)
+    if client is None:
+        return None
+    if getattr(client, "is_available", False):
+        _mark_provider_answered(provider)
+    else:
+        _mark_provider_refused(provider, "health probe failed")
+    return client
+
+
 # (provider, fallback) pairs already warned in this process. A dead primary
 # (LLM_LOCAL_PROVIDER=llamacpp_quick pointing at a retired host) made every
 # get_llm() call log "LLM provider ... unavailable, falling back to ..."
@@ -155,33 +243,42 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     NOTE: ``gemma`` was dropped from every chain on 2026-09-10. Its only
     endpoint was ``GEMMA_BASE_URL=http://localhost:8080`` — the CPU-only
     llama.cpp unit that the operator retired ("there should be no CPU-only
-    Qwens"). It had been ``GEMMA_ENABLED=False`` and therefore dead weight in
-    the chain for some time; keeping it would only re-point traffic at a
-    decommissioned port.
+    Qwens").
 
-    ``llamacpp`` stays: despite its name it resolves to
-    ``LLAMACPP_BASE_URL=http://localhost:8081``, the shim in front of the
-    healthy RTX 3090 llama-server on :8086 — not the retired :8080 unit.
+    NOTE (2026-11-06 fleet audit): ``ollama_koala``, ``ollama_ocr``,
+    ``ollama_z400`` and ``ollama_panda`` are gone from every chain — none of
+    those nodes answers (koala and ocr-node cost 5 s timeouts per call).
+    ``llamacpp_quick`` is gone too: its default host (redbox :8080) is dead
+    and the live .env points it at gridz4:8080, which ``llamacpp_z4`` already
+    covers. See :data:`_RETIRED_PROVIDERS`.
+
+    Real topology behind the remaining names:
+
+    * ``llamacpp_z4``     gridz4:8080 llama-server, Qwen3.8-27B — primary.
+    * ``llamacpp_oracle`` grid-svr RTX 3090, 127.0.0.1:18081 — the only
+      independent GPU: ORACLE's fallback and REASON's second choice.
+    * ``llamacpp``        100.75.185.36:8086, a socket proxy to gridz4:8086 —
+      same box as ``llamacpp_z4``, so it only helps if one gridz4 port dies.
+    * ``ollama``          grid-svr's own Ollama (shares the 3090).
     """
     if tier == Tier.LOCAL:
-        # Lightweight tier — koala and ocr-node host the cheap small models;
-        # z400 (RTX A2000 12GB / GTX 1660S 6GB, qwen2.5:7b-instruct) is
-        # another cluster ollama node, added as a load-spreading fallback
-        # 2026-05-13; gridz4 is overkill for LOCAL but still a fast fallback.
-        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
+        chain = ["llamacpp_z4", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
-        # gridz4 (Qwen3.8-27B Q4_K_M) is the primary ORACLE node; grid-svr's
-        # RTX 3090 Qwen3.8-27B (`llamacpp_oracle`, :8081 shim → :8086) is the
-        # first fallback. panda is offline for the foreseeable future, so
-        # ORACLE fallback stays on live llama.cpp/cloud providers.
         chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemini", "openrouter", "openai"]
     elif tier == Tier.BATCH:
         chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "gemini", "openrouter", "openai"]
     else:
-        # REASON / DEFAULT — z400's qwen2.5:7b is a capable analysis-grade
-        # fallback after the redbox/gridz4/koala/ocr nodes (added 2026-05-13).
-        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
+        # REASON / DEFAULT — gridz4 first, the 3090 second.
+        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
+
+
+# Nodes that no longer answer (fleet audit 2026-11-05). Kept as names so tests
+# and reviewers can assert they never creep back into an automatic chain; the
+# factories still exist for an explicit, opted-in ``provider=`` call.
+_RETIRED_PROVIDERS = frozenset(
+    {"ollama_koala", "ollama_ocr", "ollama_z400", "ollama_panda", "llamacpp_quick", "gemma"}
+)
 
 
 def get_llm(
@@ -221,7 +318,7 @@ def get_llm(
 
     client = None
     if not _provider_in_backoff(provider):
-        client = _create_client(provider)
+        client = _build_client(provider)
         if client is not None and getattr(client, "is_available", True):
             _client_cache[provider] = client
             _fallback_warning(provider, None)
@@ -233,7 +330,7 @@ def get_llm(
         if fallback in _client_cache:
             fb_client = _client_cache[fallback]
         else:
-            fb_client = _create_client(fallback)
+            fb_client = _build_client(fallback)
         if fb_client is not None and getattr(fb_client, "is_available", False):
             _fallback_warning(provider, fallback)
             _client_cache[fallback] = fb_client
@@ -272,7 +369,7 @@ def _embed_chain() -> list[str]:
 
     raw = getattr(settings, "EMBED_PROVIDER_CHAIN", "") or ""
     chain = [name.strip() for name in raw.split(",") if name.strip()]
-    return chain or ["ollama_z4", "ollama_koala", "ollama_z400", "ollama"]
+    return chain or ["ollama_z4", "ollama_i7gen10", "ollama"]
 
 
 def embed(
@@ -281,11 +378,13 @@ def embed(
 ) -> list[list[float]] | None:
     """Embed ``texts`` on the first tailnet GPU node that answers.
 
-    Walks ``EMBED_PROVIDER_CHAIN`` (default gridz4 → koala → z400 → grid-svr
-    Ollama). gridz4 leads because it is the only separate tailnet machine
-    verified to serve ``nomic-embed-text``; grid-svr is deliberately last
-    because its Ollama shares the RTX 3090 with the REASON/ORACLE
-    llama-server, so embedding batches there would evict the 27B chat model.
+    Walks ``EMBED_PROVIDER_CHAIN`` (default gridz4 → i7gen10 → grid-svr
+    Ollama). gridz4 leads; i7gen10's RTX 2060 is the second separate tailnet
+    node (added 2026-11-06, replacing the dead koala/z400 entries); grid-svr
+    is deliberately last because its Ollama shares the RTX 3090 with the
+    ORACLE llama-server, so embedding batches there would evict the 27B chat
+    model. A node that refuses (probe fails, embed raises or returns nothing)
+    is cooled down for ``LLM_PROVIDER_COOLDOWN_SECONDS``.
 
     Before 2026-09-10 embeddings went to the CPU-only llama.cpp unit on
     grid-svr :8080, which was never started with ``--embeddings`` and answered
@@ -309,7 +408,7 @@ def embed(
         if _provider_in_backoff(provider):
             continue
         try:
-            client = _client_cache.get(provider) or _create_client(provider)
+            client = _client_cache.get(provider) or _build_client(provider)
         except Exception as exc:  # a broken provider must not sink the chain
             log.debug("Embed provider {p} init failed: {e}", p=provider, e=str(exc))
             continue
@@ -322,14 +421,21 @@ def embed(
             vectors = client.embed(texts, model=model)
         except Exception as exc:
             log.warning("Embed via {p} raised: {e}", p=provider, e=str(exc))
+            _client_cache.pop(provider, None)
+            _mark_provider_refused(provider, "embed raised")
             continue
-        if vectors:
-            log.debug(
-                "Embedded {n} texts via {p} — dim={d}",
-                n=len(texts), p=provider,
-                d=len(vectors[0]) if vectors[0] else 0,
-            )
-            return vectors
+        if not vectors:
+            # e.g. the node is up but the embed model is not pulled (404).
+            _client_cache.pop(provider, None)
+            _mark_provider_refused(provider, "embed returned nothing")
+            continue
+        _mark_provider_answered(provider)
+        log.debug(
+            "Embedded {n} texts via {p} — dim={d}",
+            n=len(texts), p=provider,
+            d=len(vectors[0]) if vectors[0] else 0,
+        )
+        return vectors
 
     # Graceful degradation: warning, not error — an offline embed node is an
     # operational condition, not an application bug (CLAUDE.md log-level rule).
@@ -381,6 +487,8 @@ def _create_client(provider: str) -> Any:
         return _create_ollama_z400_client(settings)
     elif provider == "ollama_z4":
         return _create_ollama_z4_client(settings)
+    elif provider == "ollama_i7gen10":
+        return _create_ollama_i7gen10_client(settings)
     elif provider == "llamacpp":
         return _create_llamacpp_client(settings)
     elif provider == "openai":
@@ -448,6 +556,7 @@ def _create_ollama_client(settings: Any) -> Any:
         return OllamaClient(
             base_url=settings.OLLAMA_BASE_URL,
             model=settings.OLLAMA_CHAT_MODEL,
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("Ollama client init failed: {e}", e=str(exc))
@@ -467,6 +576,7 @@ def _create_ollama_panda_client(settings: Any) -> Any:
             base_url=base_url,
             model=getattr(settings, "OLLAMA_PANDA_CHAT_MODEL", "qwen2.5:32b"),
             timeout=getattr(settings, "OLLAMA_PANDA_TIMEOUT_SECONDS", 240),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("Ollama panda client init failed: {e}", e=str(exc))
@@ -489,6 +599,7 @@ def _create_ollama_koala_client(settings: Any) -> Any:
             model=getattr(settings, "OLLAMA_KOALA_CHAT_MODEL", "gemma2:9b"),
             embed_model=getattr(settings, "OLLAMA_KOALA_EMBED_MODEL", "nomic-embed-text"),
             timeout=getattr(settings, "OLLAMA_KOALA_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("Ollama koala client init failed: {e}", e=str(exc))
@@ -511,6 +622,7 @@ def _create_ollama_ocr_client(settings: Any) -> Any:
             base_url=getattr(settings, "OLLAMA_OCR_BASE_URL", "http://ocr-node:11434"),
             model=getattr(settings, "OLLAMA_OCR_CHAT_MODEL", "gemma2:9b"),
             timeout=getattr(settings, "OLLAMA_OCR_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("Ollama ocr client init failed: {e}", e=str(exc))
@@ -536,6 +648,7 @@ def _create_ollama_z400_client(settings: Any) -> Any:
             model=getattr(settings, "OLLAMA_Z400_CHAT_MODEL", "qwen2.5:7b-instruct-q4_K_M"),
             embed_model=getattr(settings, "OLLAMA_Z400_EMBED_MODEL", "nomic-embed-text"),
             timeout=getattr(settings, "OLLAMA_Z400_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("Ollama z400 client init failed: {e}", e=str(exc))
@@ -550,9 +663,8 @@ def _create_ollama_z4_client(settings: Any) -> Any:
     ``nomic-embed-text`` (verified from grid-svr 2026-09-10: peer active on a
     direct connection).
 
-    It heads ``EMBED_PROVIDER_CHAIN`` because it is the only separate tailnet
-    machine currently answering with an embedding model — koala went offline
-    48 days ago and z400 is no longer a peer.
+    It heads ``EMBED_PROVIDER_CHAIN``; i7gen10 (``ollama_i7gen10``) is the
+    second node and grid-svr's own Ollama the last resort.
     """
     if not getattr(settings, "OLLAMA_Z4_ENABLED", False):
         return None
@@ -563,9 +675,38 @@ def _create_ollama_z4_client(settings: Any) -> Any:
             model=getattr(settings, "OLLAMA_Z4_CHAT_MODEL", "qwen3:8b"),
             embed_model=getattr(settings, "OLLAMA_Z4_EMBED_MODEL", "nomic-embed-text"),
             timeout=getattr(settings, "OLLAMA_Z4_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("Ollama gridz4 client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_i7gen10_client(settings: Any) -> Any:
+    """Ollama on i7gen10 (RTX 2060 6 GB) — the second embedding node.
+
+    Added 2026-11-06 in place of the dead koala/z400 embed entries. Its
+    Ollama binds the tailnet IP (OLLAMA_HOST=100.98.109.92:11434), not
+    localhost, and serves qwen2.5:7b-instruct; ``nomic-embed-text`` has to be
+    pulled there before embeds succeed — until then an embed returns nothing
+    and :func:`embed` cools the node down and moves on.
+    """
+    if not getattr(settings, "OLLAMA_I7GEN10_ENABLED", False):
+        return None
+    base_url = getattr(settings, "OLLAMA_I7GEN10_BASE_URL", "") or ""
+    if not base_url.strip():
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=base_url,
+            model=getattr(settings, "OLLAMA_I7GEN10_CHAT_MODEL", "qwen2.5:7b-instruct"),
+            embed_model=getattr(settings, "OLLAMA_I7GEN10_EMBED_MODEL", "nomic-embed-text"),
+            timeout=getattr(settings, "OLLAMA_I7GEN10_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
+        )
+    except Exception as exc:
+        log.debug("Ollama i7gen10 client init failed: {e}", e=str(exc))
         return None
 
 
@@ -582,6 +723,7 @@ def _create_llamacpp_client(settings: Any) -> Any:
             base_url=settings.LLAMACPP_BASE_URL,
             model=settings.LLAMACPP_CHAT_MODEL,
             timeout=getattr(settings, "LLAMACPP_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("llama.cpp client init failed: {e}", e=str(exc))
@@ -589,17 +731,25 @@ def _create_llamacpp_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_oracle_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the ORACLE Blackwell server (port 8081)."""
+    """llama.cpp client for grid-svr's RTX 3090 (127.0.0.1:18081, alias "oracle").
+
+    Served by grid-hermes-3090-oracle.service: OpenAI-compatible
+    llama-server, Qwen3.8-27B Q4_K_M, one slot, n_ctx 8192, loopback only.
+    The previous :8081 shim is gone. This is the only GPU in the router that
+    is independent of gridz4, so it is ORACLE's fallback and REASON's second
+    choice (see :func:`_fallback_chain`).
+    """
     if not getattr(settings, "LLAMACPP_ORACLE_ENABLED", False):
         return None
     try:
         from llamacpp.client import LlamaCppClient
         return LlamaCppClient(
-            base_url=getattr(settings, "LLAMACPP_ORACLE_BASE_URL", "http://localhost:8081"),
-            model=getattr(settings, "LLAMACPP_ORACLE_CHAT_MODEL", "gemma-4-31B-it-Q4_K_M"),
+            base_url=getattr(settings, "LLAMACPP_ORACLE_BASE_URL", "http://127.0.0.1:18081"),
+            model=getattr(settings, "LLAMACPP_ORACLE_CHAT_MODEL", "oracle"),
             timeout=getattr(settings, "LLAMACPP_ORACLE_TIMEOUT_SECONDS", 300),
-            default_num_predict=getattr(settings, "LLAMACPP_ORACLE_NUM_PREDICT", 10000),
-            min_num_predict=getattr(settings, "LLAMACPP_ORACLE_MIN_NUM_PREDICT", 10000),
+            default_num_predict=getattr(settings, "LLAMACPP_ORACLE_NUM_PREDICT", 6000),
+            min_num_predict=getattr(settings, "LLAMACPP_ORACLE_MIN_NUM_PREDICT", 0),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("llama.cpp oracle client init failed: {e}", e=str(exc))
@@ -623,6 +773,7 @@ def _create_llamacpp_batch_client(settings: Any) -> Any:
             base_url=getattr(settings, "LLAMACPP_BATCH_BASE_URL", "http://localhost:8082"),
             model=getattr(settings, "LLAMACPP_BATCH_CHAT_MODEL", "DeepSeekV4-Flash-158B-Q4_K_M"),
             timeout=getattr(settings, "LLAMACPP_BATCH_TIMEOUT_SECONDS", 600),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("llama.cpp batch client init failed: {e}", e=str(exc))
@@ -630,20 +781,25 @@ def _create_llamacpp_batch_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_quick_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the QUICK-tier remote server (redbox, qwen3.8-27b).
+    """Create a llama.cpp client for the QUICK-tier provider.
 
-    Opt-in via provider="llamacpp_quick" on get_llm() — not added to the automatic
-    fallback chain, so enabling LLAMACPP_QUICK_ENABLED alone does not re-route
-    existing traffic.
+    Opt-in via provider="llamacpp_quick" on get_llm() (or LLM_LOCAL_PROVIDER)
+    — not in any automatic fallback chain. Its old redbox default
+    (100.126.129.45:8080) is dead, so there is no default host: a blank
+    LLAMACPP_QUICK_BASE_URL returns None without opening a socket.
     """
     if not getattr(settings, "LLAMACPP_QUICK_ENABLED", False):
+        return None
+    base_url = getattr(settings, "LLAMACPP_QUICK_BASE_URL", "") or ""
+    if not base_url.strip():
         return None
     try:
         from llamacpp.client import LlamaCppClient
         return LlamaCppClient(
-            base_url=getattr(settings, "LLAMACPP_QUICK_BASE_URL", "http://100.126.129.45:8080"),
+            base_url=base_url,
             model=getattr(settings, "LLAMACPP_QUICK_CHAT_MODEL", "qwen3.8-27b"),
             timeout=getattr(settings, "LLAMACPP_QUICK_TIMEOUT_SECONDS", 120),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("llama.cpp quick client init failed: {e}", e=str(exc))
@@ -673,6 +829,7 @@ def _create_llamacpp_z4_client(settings: Any) -> Any:
             default_num_predict=getattr(settings, "LLAMACPP_Z4_NUM_PREDICT", 512),
             min_num_predict=getattr(settings, "LLAMACPP_Z4_MIN_NUM_PREDICT", 0),
             reasoning_headroom=getattr(settings, "LLAMACPP_Z4_REASONING_HEADROOM", 0),
+            connect_timeout=_connect_timeout(settings),
         )
     except Exception as exc:
         log.debug("llama.cpp z4 client init failed: {e}", e=str(exc))

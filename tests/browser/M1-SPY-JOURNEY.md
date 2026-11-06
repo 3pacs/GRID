@@ -7,6 +7,16 @@ existing owners are retained (see [ownership reconciliation](MUSE-OWNERSHIP.json
 No M0 capture, production probe, collector,
 service, notification, release, or publication is performed by this harness.
 
+Reconciled with [#977](https://github.com/3pacs/GRID/pull/977) and main
+`e88079f4b2cb62d132f5219d7086ff4dc564e476` before draft publication. Preserve
+its God View, Money Flow Dashboard, public/legacy Gamma journeys, fixtures,
+`CHROME_PATH`/`PYTHON` support and process-group/port-release handling.
+The separate `spy-options` journey adds real drawer navigation, loading and
+the five-state public-source matrix plus the independently reviewed failure
+gates. Only that journey sends the loopback fixture selector header
+`X-Grid-Fixture-Journey: spy-options`; other Gamma requests keep #977's
+healthy-public / partial-legacy / empty-unavailable fixture semantics.
+
 ## Reproduce
 
 Install locked dependencies with `npm ci` in `pwa/` and `tests/browser/`.
@@ -124,8 +134,8 @@ during teardown; a Signals abort never receives the Gamma unmount exception.
 
 The ten September evidence directories are historical supporting runs with
 different source compositions. Their screenshots do not qualify this source.
-The obsolete `#/godview` path is replaced by `#/god-view`; the current
-`/api/v1/godview/latest` fixture deliberately supplies unavailable pillars.
+The obsolete `#/godview` path is replaced by `#/god-view`; retain #977's
+`/api/v1/godview/latest` available/stale/partial/unavailable pillar fixtures.
 
 Current-owner availability, the original failing deployed URL, any required Muse
 source-adoption mapping, source coverage/exclusions/OI vintage on the SPY inventory,

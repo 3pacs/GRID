@@ -54,6 +54,22 @@ def _has_ollama_worker(workers: list[dict]) -> bool:
     return any(worker.get("state") != "OFFLINE" and worker.get("has_ollama") for worker in workers)
 
 
+LLM_JOBS_ENV = "GRID_PRODUCER_LLM_JOBS"
+
+
+def llm_filler_jobs_enabled() -> bool:
+    """Opt-in for the producer's generic LLM_INFERENCE filler jobs.
+
+    Every filler job carries the same canned prompt and nothing reads its
+    output (no consumer of LLM_INFERENCE results exists). They ran 462,652
+    times until 2026-10-10, when has_ollama went false fleet-wide and 79 were
+    left QUEUED. Fixing the Ollama probe would restart that stream on the
+    27-32B models now installed, so it stays off unless
+    GRID_PRODUCER_LLM_JOBS=1.
+    """
+    return os.environ.get(LLM_JOBS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _simulation_job(index: int, stamp: str, feature_ids: list[int]) -> dict:
     return {
         "job_type": "SIMULATION",
@@ -150,7 +166,7 @@ def build_job_plan(
         builders.append(lambda i: _regime_job(i, stamp or "run", usable_feature_ids))
     if model_ids:
         builders.append(lambda i: _backtest_job(i, stamp or "run", model_ids))
-    if _has_ollama_worker(workers):
+    if llm_filler_jobs_enabled() and _has_ollama_worker(workers):
         builders.append(lambda i: _llm_job(i, stamp or "run"))
 
     if not builders:
