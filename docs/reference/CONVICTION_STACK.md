@@ -54,3 +54,13 @@ signal_cooccurrence=410, regime_brier=0 (blocked on oracle enrichment), meta_lea
   called only by `scripts/bootstrap_per_signal_brier.py`. `per_signal_brier_history`
   was last updated 2026-05-16 (183 rows). The calibrators stay frozen until the scorer
   (`score_expired_predictions`) or a scheduled replay feeds them.
+
+**Trust inputs and pruning (S16, 2026-11-06, both flags default off).** The convergence
+layer's per-stream trust comes from `signal_sources.trust_score`, which
+`trust_scorer.update_trust_scores` writes. With `GRID_TRUST_USE_CORRECTED_OUTCOMES=true`
+it scores from `signal_source_outcomes` (`sig-eval-4-sessions`): CORRECT is a hit, WRONG a
+miss, and NO_MOVE / INELIGIBLE count as neither. With `GRID_TRUST_PRUNE_NO_EDGE=true` and an
+operator-approved `GRID_TRUST_PRUNE_LIST_PATH`, streams that the pre-registered `prune_rule_v1`
+(`docs/research/prune-rule-v1-preregistration.md`) marks NO_EDGE / ANTI_EDGE get weight 0
+here and in `detect_convergence`. `scripts/edge_report.py report --candidate-out` writes the
+candidate list, and an operator copies it into place.

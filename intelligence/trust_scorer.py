@@ -909,36 +909,120 @@ def rescore_source_type(
 
 # ── 2. Update Trust Scores ────────────────────────────────────────────────
 
-def update_trust_scores(engine: Engine) -> dict[str, Any]:
-    """Recompute trust scores for every unique (source_type, source_id).
+# S16 (docs/research/prune-rule-v1-preregistration.md). Under
+# GRID_TRUST_USE_CORRECTED_OUTCOMES the trust inputs come from the additive
+# signal_source_outcomes table instead of the legacy signal_sources.outcome
+# (which counts every non-CORRECT case, sub-threshold moves and unpriced rows
+# included, as WRONG). CORRECT is a hit and WRONG a miss; NO_MOVE (inside the
+# dead band), INELIGIBLE and not-yet-scored rows count as neither.
+OUTCOME_BASIS_LEGACY = "legacy:signal_sources.outcome"
 
-    For each source:
-      - Count hits/misses with recency-weighted exponential decay (half-life 90 days).
-      - Bayesian trust: (weighted_hits + 1) / (weighted_hits + weighted_misses + 2)
-      - Compute average lead time and average return on correct signals.
-      - Find best ticker (highest hit rate per ticker).
-      - Update aggregates in signal_sources rows.
-
-    Returns ranked list of source dicts.
-    """
-    _ensure_tables(engine)
-    datetime.now(timezone.utc)
-    today = date.today()
-    decay_lambda = math.log(2) / RECENCY_HALF_LIFE_DAYS
-
-    sources_updated: list[dict[str, Any]] = []
-
-    with engine.connect() as conn:
-        scored_rows = conn.execute(text("""
+_LEGACY_SCORED_ROWS_SQL = """
             SELECT source_type, source_id, outcome, outcome_return, signal_date, ticker
             FROM signal_sources
             WHERE outcome IN ('CORRECT', 'WRONG')
             ORDER BY source_type, source_id, signal_date DESC
-        """)).fetchall()
+        """
 
-    if not scored_rows:
+_CORRECTED_SCORED_ROWS_SQL = """
+            SELECT s.source_type, s.source_id, o.outcome, o.raw_return, o.signal_date, s.ticker
+            FROM signal_source_outcomes o
+            JOIN signal_sources s ON s.id = o.signal_source_id
+            WHERE o.evaluation_version = :version
+              AND o.outcome IN ('CORRECT', 'WRONG')
+            ORDER BY s.source_type, s.source_id, o.signal_date DESC
+        """
+
+# Neither-hit-nor-miss outcomes, per raw source_id: a source with only these
+# still gets a (prior) trust score instead of keeping a stale legacy one.
+_CORRECTED_NEUTRAL_COUNTS_SQL = """
+            SELECT s.source_type, s.source_id, o.outcome, COUNT(*), MAX(o.signal_date)
+            FROM signal_source_outcomes o
+            JOIN signal_sources s ON s.id = o.signal_source_id
+            WHERE o.evaluation_version = :version
+              AND o.outcome IN ('NO_MOVE', 'INELIGIBLE')
+            GROUP BY s.source_type, s.source_id, o.outcome
+        """
+
+
+def corrected_outcome_version() -> str:
+    """The ``signal_source_outcomes.evaluation_version`` trust reads when switched."""
+    from evaluation.signal_outcomes import SESSION_EVALUATION_VERSION
+
+    return SESSION_EVALUATION_VERSION
+
+
+def use_corrected_outcomes() -> bool:
+    """``GRID_TRUST_USE_CORRECTED_OUTCOMES`` (default off; any failure reads as off)."""
+    try:
+        from config import settings as _settings
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(getattr(_settings, "GRID_TRUST_USE_CORRECTED_OUTCOMES", False))
+
+
+def _source_prior(src_type: str) -> float:
+    try:
+        from intelligence.source_trust_config import get_trust as _get_source_trust
+        return float(_get_source_trust(src_type).get("base_trust", 0.5))
+    except Exception:
+        return 0.5
+
+
+def _load_trust_inputs(
+    conn: Any, use_corrected: bool,
+) -> tuple[list[Any], dict[tuple[str, str], dict[str, Any]]]:
+    """Scored rows plus (corrected mode only) per-feed NO_MOVE/INELIGIBLE counts."""
+    if not use_corrected:
+        return conn.execute(text(_LEGACY_SCORED_ROWS_SQL)).fetchall(), {}
+    params = {"version": corrected_outcome_version()}
+    rows = conn.execute(text(_CORRECTED_SCORED_ROWS_SQL), params).fetchall()
+    neutral: dict[tuple[str, str], dict[str, Any]] = {}
+    for src_type, src_id, outcome, count, last_date in conn.execute(
+        text(_CORRECTED_NEUTRAL_COUNTS_SQL), params,
+    ).fetchall():
+        entry = neutral.setdefault(
+            (src_type, feed_source_id(src_id)),
+            {"NO_MOVE": 0, "INELIGIBLE": 0, "last_signal_date": None},
+        )
+        entry[outcome] = entry.get(outcome, 0) + int(count or 0)
+        if last_date is not None:
+            last = last_date if isinstance(last_date, date) else last_date.date()
+            if entry["last_signal_date"] is None or last > entry["last_signal_date"]:
+                entry["last_signal_date"] = last
+    return rows, neutral
+
+
+def compute_trust_scores(
+    engine: Engine,
+    *,
+    use_corrected: bool | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Compute trust for every (source_type, feed source_id); read-only.
+
+    For each source:
+      - Count hits/misses with recency-weighted exponential decay (half-life 90 days).
+      - Bayesian trust with the ``source_trust_config`` prior (5 pseudo-observations).
+      - Compute average lead time and average return on correct signals.
+      - Find best ticker (highest hit rate per ticker).
+
+    ``use_corrected`` (default: the ``GRID_TRUST_USE_CORRECTED_OUTCOMES``
+    flag) picks the outcome basis. Writes nothing; ``update_trust_scores``
+    propagates the result and the edge-report CLI diffs both bases.
+    """
+    if use_corrected is None:
+        use_corrected = use_corrected_outcomes()
+    today = today or date.today()
+    decay_lambda = math.log(2) / RECENCY_HALF_LIFE_DAYS
+    basis = f"corrected:{corrected_outcome_version()}" if use_corrected else OUTCOME_BASIS_LEGACY
+
+    with engine.connect() as conn:
+        scored_rows, neutral_counts = _load_trust_inputs(conn, use_corrected)
+
+    if not scored_rows and not neutral_counts:
         log.info("No scored sources to update trust for")
-        return {"sources": [], "total": 0}
+        return {"sources": [], "total": 0, "outcome_basis": basis}
 
     rows_by_source: dict[tuple[str, str], list[tuple[Any, Any, Any, Any]]] = {}
     source_keys: list[tuple[str, str]] = []
@@ -951,14 +1035,17 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
             rows_by_source[key] = []
             source_keys.append(key)
         rows_by_source[key].append((outcome, ret, sig_date, ticker))
+    for key in neutral_counts:
+        if key not in rows_by_source:
+            rows_by_source[key] = []
+            source_keys.append(key)
 
-    log.info("Updating trust scores for {n} sources", n=len(source_keys))
+    log.info("Computing trust scores for {n} sources ({b})", n=len(source_keys), b=basis)
 
+    sources: list[dict[str, Any]] = []
     for src_type, src_id in source_keys:
         rows = rows_by_source.get((src_type, src_id), [])
-
-        if not rows:
-            continue
+        neutral = neutral_counts.get((src_type, src_id), {})
 
         weighted_hits = 0.0
         weighted_misses = 0.0
@@ -967,7 +1054,7 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
         hit_returns: list[float] = []
         ticker_hits: dict[str, int] = {}
         ticker_totals: dict[str, int] = {}
-        last_signal_date = None
+        last_signal_date = neutral.get("last_signal_date")
 
         for outcome, ret, sig_date, ticker in rows:
             sig_dt = sig_date if isinstance(sig_date, date) else sig_date.date()
@@ -997,11 +1084,7 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
         # Instead of flat Beta(1,1), use the source's base_trust as prior.
         # Prior strength of 5 pseudo-observations: enough to bias new sources
         # toward their tier, but quickly overridden by real data.
-        try:
-            from intelligence.source_trust_config import get_trust as _get_source_trust
-            base_trust = _get_source_trust(src_type).get("base_trust", 0.5)
-        except Exception:
-            base_trust = 0.5
+        base_trust = _source_prior(src_type)
         prior_strength = 5.0
         alpha_prior = base_trust * prior_strength
         beta_prior = (1.0 - base_trust) * prior_strength
@@ -1029,7 +1112,7 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
         eval_window = EVALUATION_WINDOWS.get(src_type, 7)
         avg_lead = eval_window * 24.0 / 2.0
 
-        sources_updated.append({
+        entry = {
             "source_type": src_type,
             "source_id": src_id,
             "trust_score": round(trust, 4),
@@ -1041,69 +1124,107 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
             "avg_return_on_hits": round(avg_return, 4),
             "best_ticker": best_ticker,
             "last_signal_date": str(last_signal_date) if last_signal_date else "",
-        })
-
-        # Propagate unchanged aggregates to explicit pages. One UPDATE per
-        # short transaction changes at most 50 rows for every source.
-        params = {
-            "keyed_prefix": f"{src_id}:" if src_id.startswith("qq_") else None,
-            "keyed_len": len(src_id) + 1,
-            "ts": round(trust, 4), "hc": raw_hits, "mc": raw_misses,
-            "alt": round(avg_lead, 1), "st": src_type, "si": src_id,
         }
-        after_id = 0
-        propagated = 0
-        while True:
-            changed = 0
-            try:
-                with tx.write_transaction(engine) as (conn, check):
-                    ids = [row[0] for row in conn.execute(text("""
-                        SELECT id FROM signal_sources
-                        WHERE id > :after_id AND source_type = :st
+        if use_corrected:
+            entry["no_move_count"] = int(neutral.get("NO_MOVE", 0))
+            entry["ineligible_count"] = int(neutral.get("INELIGIBLE", 0))
+            entry["outcome_basis"] = basis
+        sources.append(entry)
+
+    # Rank by trust score descending
+    sources.sort(key=lambda s: -s["trust_score"])
+    for rank, s in enumerate(sources, 1):
+        s["rank"] = rank
+    return {"sources": sources, "total": len(sources), "outcome_basis": basis}
+
+
+def _propagate_trust(engine: Engine, entry: dict[str, Any]) -> int:
+    """Write one source's aggregates to its signal_sources rows (50-row pages).
+
+    One UPDATE per short transaction changes at most 50 rows for every
+    source. On failure the exception carries ``trust_rows_propagated`` (rows
+    of this source already committed).
+    """
+    src_type, src_id = entry["source_type"], entry["source_id"]
+    params = {
+        "keyed_prefix": f"{src_id}:" if src_id.startswith("qq_") else None,
+        "keyed_len": len(src_id) + 1,
+        "ts": entry["trust_score"], "hc": entry["hit_count"], "mc": entry["miss_count"],
+        "alt": entry["avg_lead_time_hours"], "st": src_type, "si": src_id,
+    }
+    after_id = 0
+    propagated = 0
+    while True:
+        changed = 0
+        try:
+            with tx.write_transaction(engine) as (conn, check):
+                ids = [row[0] for row in conn.execute(text("""
+                    SELECT id FROM signal_sources
+                    WHERE id > :after_id AND source_type = :st
+                      AND (source_id = :si
+                           OR (CAST(:keyed_prefix AS TEXT) IS NOT NULL
+                               AND substr(source_id, 1, :keyed_len) = :keyed_prefix))
+                    ORDER BY id LIMIT 50
+                """), {**params, "after_id": after_id}).fetchall()]
+                if ids:
+                    check()
+                    changed = conn.execute(text("""
+                        UPDATE signal_sources
+                        SET trust_score = :ts, hit_count = :hc, miss_count = :mc,
+                            avg_lead_time_hours = :alt
+                        WHERE id IN :target_ids AND source_type = :st
                           AND (source_id = :si
                                OR (CAST(:keyed_prefix AS TEXT) IS NOT NULL
                                    AND substr(source_id, 1, :keyed_len) = :keyed_prefix))
-                        ORDER BY id LIMIT 50
-                    """), {**params, "after_id": after_id}).fetchall()]
-                    if ids:
-                        check()
-                        changed = conn.execute(text("""
-                            UPDATE signal_sources
-                            SET trust_score = :ts, hit_count = :hc, miss_count = :mc,
-                                avg_lead_time_hours = :alt
-                            WHERE id IN :target_ids AND source_type = :st
-                              AND (source_id = :si
-                                   OR (CAST(:keyed_prefix AS TEXT) IS NOT NULL
-                                       AND substr(source_id, 1, :keyed_len) = :keyed_prefix))
-                        """).bindparams(bindparam("target_ids", expanding=True)),
-                            {**params, "target_ids": ids}).rowcount
-            except Exception as exc:
-                if isinstance(exc, tx.CommitAcknowledgedCleanupError):
-                    propagated += int(changed)
-                exc.trust_rows_updated = sum(s.get("propagated_rows", 0) for s in sources_updated) + propagated
-                raise
-            if not ids:
-                break
-            propagated += int(changed)
-            after_id = max(ids)
-        sources_updated[-1]["propagated_rows"] = propagated
+                    """).bindparams(bindparam("target_ids", expanding=True)),
+                        {**params, "target_ids": ids}).rowcount
+        except Exception as exc:
+            if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                propagated += int(changed)
+            exc.trust_rows_propagated = propagated
+            raise
+        if not ids:
+            break
+        propagated += int(changed)
+        after_id = max(ids)
+    return propagated
 
-    # Rank by trust score descending
-    sources_updated.sort(key=lambda s: -s["trust_score"])
-    for rank, s in enumerate(sources_updated, 1):
-        s["rank"] = rank
+
+def update_trust_scores(engine: Engine) -> dict[str, Any]:
+    """Recompute trust scores (``compute_trust_scores``) and propagate them.
+
+    Updates the trust aggregates (``trust_score``, ``hit_count``,
+    ``miss_count``, ``avg_lead_time_hours``) on every ``signal_sources`` row
+    of each source. The outcome basis follows
+    ``GRID_TRUST_USE_CORRECTED_OUTCOMES``.
+
+    Returns ranked list of source dicts.
+    """
+    _ensure_tables(engine)
+    result = compute_trust_scores(engine)
+    sources_updated: list[dict[str, Any]] = []
+    for entry in result["sources"]:
+        try:
+            entry["propagated_rows"] = _propagate_trust(engine, entry)
+        except Exception as exc:
+            exc.trust_rows_updated = (
+                sum(s.get("propagated_rows", 0) for s in sources_updated)
+                + int(getattr(exc, "trust_rows_propagated", 0))
+            )
+            raise
+        sources_updated.append(entry)
 
     log.info(
-        "Trust scores updated for {n} sources. "
+        "Trust scores updated for {n} sources ({b}). "
         "Top: {top_id} ({top_ts:.3f}), Bottom: {bot_id} ({bot_ts:.3f})",
-        n=len(sources_updated),
+        n=len(sources_updated), b=result["outcome_basis"],
         top_id=sources_updated[0]["source_id"] if sources_updated else "N/A",
         top_ts=sources_updated[0]["trust_score"] if sources_updated else 0,
         bot_id=sources_updated[-1]["source_id"] if sources_updated else "N/A",
         bot_ts=sources_updated[-1]["trust_score"] if sources_updated else 0,
     )
 
-    return {"sources": sources_updated, "total": len(sources_updated)}
+    return {"sources": sources_updated, "total": len(sources_updated), "outcome_basis": result["outcome_basis"]}
 
 
 # ── 2b. Cached Trust Score Read Path (perf 2026-05-16) ─────────────────────
@@ -1210,6 +1331,114 @@ def load_trust_scores_cached(
     return {"sources": sources, "total": len(sources)}
 
 
+# ── 2c. Pre-registered prune list (S16, prune_rule_v1) ───────────────────
+
+PRUNE_RULE_VERSION = "prune_rule_v1"
+PRUNE_VERDICTS = frozenset({"NO_EDGE", "ANTI_EDGE"})
+
+
+@dataclass(frozen=True)
+class PruneSet:
+    """Units an operator-approved ``prune_rule_v1`` list gives weight 0."""
+
+    source_types: frozenset[str]
+    feeds: frozenset[tuple[str, str]]
+    oracle_models: frozenset[str]
+    astrogrid_models: frozenset[str]
+    path: str = ""
+
+    def is_source_pruned(self, source_type: str | None, source_id: str | None = None) -> bool:
+        """True if the source type, or its (source_type, feed id), is pruned."""
+        if not source_type:
+            return False
+        if source_type in self.source_types:
+            return True
+        if source_id is None:
+            return False
+        return (source_type, feed_source_id(source_id)) in self.feeds
+
+
+_PRUNE_CACHE: dict[tuple[str, float], PruneSet | None] = {}
+
+
+def parse_prune_list(payload: Any, path: str = "") -> PruneSet:
+    """Build a ``PruneSet`` from a prune-list document.
+
+    Raises ``TypeError`` for a malformed document and ``ValueError`` for a
+    different rule version.
+
+    Only ``NO_EDGE`` / ``ANTI_EDGE`` units are kept; ``EDGE`` and
+    ``INSUFFICIENT`` entries (if present) never change a weight.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError("prune list must be a JSON object")
+    if payload.get("rule_version") != PRUNE_RULE_VERSION:
+        raise ValueError(f"prune list rule_version must be {PRUNE_RULE_VERSION!r}")
+    units = payload.get("units")
+    if not isinstance(units, list):
+        raise TypeError("prune list 'units' must be a list")
+    source_types: set[str] = set()
+    feeds: set[tuple[str, str]] = set()
+    oracle_models: set[str] = set()
+    astrogrid_models: set[str] = set()
+    for unit in units:
+        if not isinstance(unit, dict) or unit.get("verdict") not in PRUNE_VERDICTS:
+            continue
+        family = unit.get("family")
+        if family == "signal_source_type" and isinstance(unit.get("source_type"), str):
+            source_types.add(unit["source_type"])
+        elif (family == "signal_feed" and isinstance(unit.get("source_type"), str)
+              and isinstance(unit.get("source_id"), str)):
+            feeds.add((unit["source_type"], feed_source_id(unit["source_id"])))
+        elif family == "oracle_model" and isinstance(unit.get("unit"), str):
+            oracle_models.add(unit["unit"])
+        elif family == "astrogrid_model" and isinstance(unit.get("unit"), str):
+            astrogrid_models.add(unit["unit"])
+    return PruneSet(
+        frozenset(source_types), frozenset(feeds),
+        frozenset(oracle_models), frozenset(astrogrid_models), path,
+    )
+
+
+def active_prune_set() -> PruneSet | None:
+    """The operator-approved prune set, or ``None`` when pruning is off.
+
+    Off unless ``GRID_TRUST_PRUNE_NO_EDGE`` is true and
+    ``GRID_TRUST_PRUNE_LIST_PATH`` names a readable ``prune_rule_v1`` list.
+    Any problem with the file fails open (no pruning) with a warning: a broken
+    list must not silently zero sources.
+    """
+    try:
+        from config import settings as _settings
+    except Exception:  # noqa: BLE001
+        return None
+    if not bool(getattr(_settings, "GRID_TRUST_PRUNE_NO_EDGE", False)):
+        return None
+    path = str(getattr(_settings, "GRID_TRUST_PRUNE_LIST_PATH", "") or "").strip()
+    if not path:
+        log.warning("GRID_TRUST_PRUNE_NO_EDGE is on but GRID_TRUST_PRUNE_LIST_PATH is empty; not pruning")
+        return None
+    import os
+
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError as exc:
+        log.warning("Prune list {p} unreadable ({e}); not pruning", p=path, e=str(exc))
+        return None
+    key = (path, mtime)
+    if key in _PRUNE_CACHE:
+        return _PRUNE_CACHE[key]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            prune = parse_prune_list(json.load(fh), path)
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("Prune list {p} rejected ({e}); not pruning", p=path, e=str(exc))
+        prune = None
+    _PRUNE_CACHE.clear()
+    _PRUNE_CACHE[key] = prune
+    return prune
+
+
 # ── 3. Get Trusted Sources ────────────────────────────────────────────────
 
 def get_trusted_sources(
@@ -1232,6 +1461,19 @@ def get_trusted_sources(
     """
     _ensure_tables(engine)
 
+    params: dict[str, Any] = {"min_sig": min_signals, "min_trust": min_trust}
+    if use_corrected_outcomes():
+        # Same aggregates (written by update_trust_scores from the corrected
+        # basis); a row counts when its corrected outcome is CORRECT/WRONG.
+        scored_filter = (
+            "EXISTS (SELECT 1 FROM signal_source_outcomes o "
+            "WHERE o.signal_source_id = signal_sources.id "
+            "AND o.evaluation_version = :version "
+            "AND o.outcome IN ('CORRECT', 'WRONG'))"
+        )
+        params["version"] = corrected_outcome_version()
+    else:
+        scored_filter = "outcome IN ('CORRECT', 'WRONG')"
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT source_type, {feed_id} AS source_id,
@@ -1240,14 +1482,22 @@ def get_trusted_sources(
                    MAX(signal_date) AS last_signal,
                    COUNT(*) AS total_signals
             FROM signal_sources
-            WHERE outcome IN ('CORRECT', 'WRONG')
+            WHERE {scored_filter}
             GROUP BY source_type, {feed_id}, trust_score, hit_count,
                      miss_count, avg_lead_time_hours
             HAVING (hit_count + miss_count) >= :min_sig
                AND trust_score >= :min_trust
             ORDER BY trust_score DESC
-        """.replace("{feed_id}", feed_source_id_sql("source_id"))),
-            {"min_sig": min_signals, "min_trust": min_trust}).fetchall()
+        """.replace("{feed_id}", feed_source_id_sql("source_id"))
+           .replace("{scored_filter}", scored_filter)),
+            params).fetchall()
+
+    prune = active_prune_set()
+    if prune is not None:
+        kept = [r for r in rows if not prune.is_source_pruned(r[0], r[1])]
+        if len(kept) != len(rows):
+            log.info("Trusted sources: {n} pruned by {p}", n=len(rows) - len(kept), p=PRUNE_RULE_VERSION)
+        rows = kept
 
     results: list[SourceScore] = []
     for rank, r in enumerate(rows, 1):
@@ -1432,7 +1682,25 @@ def detect_convergence(
 
     # Look at recent signals (last 14 days) that are still relevant
     params: dict[str, Any] = {"lookback": date.today() - timedelta(days=14)}
-    if ticker:
+    if use_corrected_outcomes():
+        # Corrected basis: drop only signals already graded WRONG; a legacy
+        # "WRONG" that was really a dead-band move or unpriced stays live.
+        params["version"] = corrected_outcome_version()
+        query = text(
+            "SELECT s.ticker, s.source_type, s.source_id, s.signal_type, "
+            "       s.signal_date, s.trust_score "
+            "FROM signal_sources s "
+            "WHERE s.signal_date >= :lookback "
+            "  AND NOT EXISTS (SELECT 1 FROM signal_source_outcomes o "
+            "                  WHERE o.signal_source_id = s.id "
+            "                    AND o.evaluation_version = :version "
+            "                    AND o.outcome = 'WRONG') "
+            + ("  AND s.ticker = :ticker " if ticker else "")
+            + "ORDER BY s.ticker, s.signal_date DESC"
+        )
+        if ticker:
+            params["ticker"] = ticker
+    elif ticker:
         params["ticker"] = ticker
         query = text(
             "SELECT ticker, source_type, source_id, signal_type, "
@@ -1458,6 +1726,12 @@ def detect_convergence(
 
     if not rows:
         return events
+
+    # prune_rule_v1: NO_EDGE / ANTI_EDGE units carry weight 0 -- they neither
+    # count towards the source threshold nor the combined confidence.
+    prune = active_prune_set()
+    if prune is not None:
+        rows = [r for r in rows if not prune.is_source_pruned(r[1], r[2])]
 
     # Group by ticker
     ticker_signals: dict[str, list[dict]] = {}
