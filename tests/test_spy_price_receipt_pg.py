@@ -501,9 +501,13 @@ def _scoreable_btc_prediction(engine: Engine, today: date) -> str:
                 (feature_id, obs_date, release_date, vintage_date, value, source_priority_used)
             VALUES (2792, :prior_day, :prior_day, :prior_day, 69000, 1),
                    (2792, :entry_day, :entry_day, :entry_day, 70000, 1),
+                   (2792, :horizon_day, :horizon_day, :horizon_day, 70500, 1),
                    (2792, :outcome_day, :outcome_day, :outcome_day, 71000, 1)
         """), {"prior_day": created_at.date() - timedelta(days=1),
-                "entry_day": created_at.date(), "outcome_day": today - timedelta(days=1)})
+                "entry_day": created_at.date(),
+                # 2026-11-06: crypto is measured at the horizon end (entry + 7).
+                "horizon_day": created_at.date() + timedelta(days=7),
+                "outcome_day": today - timedelta(days=1)})
         conn.execute(text("""
             INSERT INTO astrogrid.prediction_run (
                 prediction_id, created_at, as_of_ts, horizon_label, target_universe,
