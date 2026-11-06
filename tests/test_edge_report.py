@@ -161,7 +161,7 @@ def test_build_signal_families_splits_forward_and_feeds():
     assert cong.horizon_days == 30.0
     assert sum(c.n for c in cong.cells.values()) == 7
     assert sum(c.no_move for c in cong.cells.values()) == 3
-    assert "congressional" in by_type.exploratory
+    assert "congressional [not forward]" in by_type.exploratory
     feed = by_feed.forward[er.feed_unit_key("congressional", "Pelosi")]
     assert feed.meta == {"source_type": "congressional", "source_id": "Pelosi"}
 
@@ -173,8 +173,8 @@ def test_build_oracle_family_routes_rescores_to_exploratory():
     fam = er.build_oracle_family(rows, rescore)
     assert set(fam.forward) == {"m1"}
     assert fam.forward["m1"].horizon_days == pytest.approx(5.0)
-    assert set(fam.exploratory) == {"m1", "m1 [rescore:hindsight]"}
-    assert fam.exploratory["m1"].meta["reason"] == "recorded_or_scored_after_expiry_close"
+    assert set(fam.exploratory) == {"m1 [not forward]", "m1 [rescore:hindsight]"}
+    assert fam.exploratory["m1 [not forward]"].meta["reason"] == "recorded_or_scored_after_expiry_close"
 
 
 def test_build_astrogrid_family_routes_legacy_rescores_to_exploratory():

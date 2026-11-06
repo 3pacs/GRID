@@ -176,7 +176,7 @@ def test_load_all_forward_and_exploratory_columns(scratch):
     (cell,) = insider.cells.values()
     assert (cell.hits, cell.n, cell.no_move, cell.long_calls, cell.live) == (1, 2, 1, 2, 1)
     assert insider.horizon_days == 14.0  # EVALUATION_WINDOWS["insider"]
-    late = loaded["signal_source_type"].exploratory["insider"]
+    late = loaded["signal_source_type"].exploratory["insider [not forward]"]
     assert sum(c.hits for c in late.cells.values()) == 1
     assert set(loaded["signal_feed"].forward) == {"insider / a", "insider / b"}
 
@@ -186,7 +186,7 @@ def test_load_all_forward_and_exploratory_columns(scratch):
         agg.add(c)
     assert (agg.hits, agg.n, agg.target_hits, agg.long_calls, agg.prob_n, agg.prob_y) == (2, 3, 1, 2, 2, 2)
     assert agg.prob_sq == pytest.approx(0.2 ** 2 + 0.4 ** 2)
-    assert set(loaded["oracle_model"].exploratory) == {"m1", "m2 [rescore:hindsight]"}
+    assert set(loaded["oracle_model"].exploratory) == {"m1 [not forward]", "m2 [rescore:hindsight]"}
 
     ag = loaded["astrogrid_model"]
     crypto = ag.forward["grid-crypto-v1"]

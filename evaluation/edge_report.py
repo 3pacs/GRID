@@ -49,7 +49,8 @@ MIN_EFFECTIVE_N = 30
 MIN_DATES = 20
 ALPHA = 0.05
 N_BOOT = 1999
-LIVE_SCORED_GRACE_DAYS = 9  # evaluation.signal_outcomes.FINAL_GRACE_DAYS (7) + 2
+LIVE_SCORED_GRACE_DAYS = 9
+NOT_FORWARD_SUFFIX = " [not forward]"  # evaluation.signal_outcomes.FINAL_GRACE_DAYS (7) + 2
 
 FAMILIES = ("signal_source_type", "signal_feed", "oracle_model", "astrogrid_model")
 VERDICTS = ("EDGE", "NO_EDGE", "ANTI_EDGE", "INSUFFICIENT")
@@ -398,7 +399,9 @@ _ASTROGRID_CELLS_SQL = """
            SUM(CASE WHEN ps.verdict = 'hit'
                      AND CAST(ps.raw_payload->>'signed_return' AS DOUBLE PRECISION) <> 0
                     THEN 1 ELSE 0 END) AS target_hits,
-           SUM(CASE WHEN ps.raw_payload->>'direction' = 'bullish' THEN 1 ELSE 0 END) AS long_calls,
+           SUM(CASE WHEN ps.raw_payload->>'direction' = 'bullish'
+                     AND CAST(ps.raw_payload->>'signed_return' AS DOUBLE PRECISION) <> 0
+                    THEN 1 ELSE 0 END) AS long_calls,
            AVG(CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END) AS horizon
       FROM {ag}.prediction_score ps
       JOIN {ag}.prediction_run pr ON pr.id = ps.prediction_run_id
@@ -416,7 +419,9 @@ _ASTROGRID_RESCORE_CELLS_SQL = """
            SUM(CASE WHEN lr.verdict = 'hit'
                      AND CAST(lr.raw_payload->>'signed_return' AS DOUBLE PRECISION) <> 0
                     THEN 1 ELSE 0 END) AS target_hits,
-           SUM(CASE WHEN lr.raw_payload->>'direction' = 'bullish' THEN 1 ELSE 0 END) AS long_calls,
+           SUM(CASE WHEN lr.raw_payload->>'direction' = 'bullish'
+                     AND CAST(lr.raw_payload->>'signed_return' AS DOUBLE PRECISION) <> 0
+                    THEN 1 ELSE 0 END) AS long_calls,
            AVG(CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END) AS horizon
       FROM {ag}.prediction_score_legacy_rescore lr
       JOIN {ag}.prediction_run pr ON pr.id = lr.prediction_run_id
@@ -477,11 +482,12 @@ def build_signal_families(rows: Iterable[Sequence[Any]]) -> tuple[FamilyColumns,
     by_type, by_feed = FamilyColumns(), FamilyColumns()
     for src_type, feed_id, sig_date, forward, hits, n, no_move, long_calls, live in rows:
         column = "forward" if forward else "exploratory"
+        suffix = "" if forward else NOT_FORWARD_SUFFIX
         horizon = float(EVALUATION_WINDOWS.get(src_type, 7))
         cell = DateCell(hits=_i(hits), n=_i(n), no_move=_i(no_move), long_calls=_i(long_calls), live=_i(live))
         d = _to_date(sig_date)
-        by_type.unit(column, "signal_source_type", src_type, horizon).cell(d).add(cell)
-        feed = by_feed.unit(column, "signal_feed", feed_unit_key(src_type, feed_id), horizon)
+        by_type.unit(column, "signal_source_type", src_type + suffix, horizon).cell(d).add(cell)
+        feed = by_feed.unit(column, "signal_feed", feed_unit_key(src_type, feed_id) + suffix, horizon)
         feed.meta.setdefault("source_type", src_type)
         feed.meta.setdefault("source_id", feed_id)
         feed.cell(d).add(cell)
@@ -500,7 +506,7 @@ def build_oracle_family(rows: Iterable[Sequence[Any]], rescore_rows: Iterable[Se
     for (model, cdate, forward, hits, n, target_hits, long_calls,
          prob_n, prob_sq, prob_y, horizon) in rows:
         column = "forward" if forward else "exploratory"
-        unit = fam.unit(column, "oracle_model", model, 1.0)
+        unit = fam.unit(column, "oracle_model", model if forward else model + NOT_FORWARD_SUFFIX, 1.0)
         _weighted_horizon(unit, horizon, _i(n))
         unit.cell(_to_date(cdate)).add(DateCell(
             hits=_i(hits), n=_i(n), target_hits=_i(target_hits), long_calls=_i(long_calls),
@@ -524,7 +530,7 @@ def build_astrogrid_family(rows: Iterable[Sequence[Any]], rescore_rows: Iterable
     fam = FamilyColumns()
     for model, cdate, forward, hits, n, target_hits, long_calls, horizon in rows:
         column = "forward" if forward else "exploratory"
-        unit = fam.unit(column, "astrogrid_model", model, 7.0)
+        unit = fam.unit(column, "astrogrid_model", model if forward else model + NOT_FORWARD_SUFFIX, 7.0)
         _weighted_horizon(unit, horizon, _i(n))
         unit.cell(_to_date(cdate)).add(DateCell(
             hits=_i(hits), n=_i(n), target_hits=_i(target_hits), long_calls=_i(long_calls),
