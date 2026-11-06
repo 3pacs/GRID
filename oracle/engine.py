@@ -2242,8 +2242,8 @@ class OracleEngine:
         new ``OraclePrediction`` rows, which must stay on the same raw basis
         as ``options_daily_signals.spot_price`` (this method's primary
         source) and as the actual/exit price ``scripts/score_oracle_trades.py``
-        scores it against (``fetch_prices()``, ``auto_adjust=False`` as of
-        PR #516). The fallback below used to prefer ``adj_close`` over
+        scores it against (raw ``YF:{ticker}:close`` via
+        ``load_expiry_closes()``, oracle_expiry_close_v2). The fallback below used to prefer ``adj_close`` over
         ``close`` -- silently mixing an adjusted entry price against a raw
         exit price, the same dividend/split-driven spurious-return bug
         PR #503 fixed for intelligence/trust_scorer.py and
