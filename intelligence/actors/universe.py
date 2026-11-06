@@ -76,8 +76,12 @@ GROUP_PEP = "pep"
 GROUP_SANCTIONED = "sanctioned"
 GROUP_DONOR = "donor"
 GROUP_WATCHLIST = "watchlist"
+# Rows an operator cleanup re-categorized as ``<category>_quarantined_<date>``
+# (e.g. the 2026-09-28 junk-corporation quarantine): opt-in, never "market".
+GROUP_QUARANTINED = "quarantined"
 CATEGORY_GROUPS: tuple[str, ...] = (
     GROUP_MARKET, GROUP_ICIJ, GROUP_PEP, GROUP_SANCTIONED, GROUP_DONOR, GROUP_WATCHLIST,
+    GROUP_QUARANTINED,
 )
 BULK_GROUPS: tuple[str, ...] = tuple(g for g in CATEGORY_GROUPS if g != GROUP_MARKET)
 _GROUP_BY_CATEGORY: dict[str, str] = {
@@ -96,6 +100,8 @@ def category_group(category: Any, source: Any = None) -> str:
     src = source.strip().lower() if isinstance(source, str) else ""
     if cat.startswith("icij") or src == "icij":
         return GROUP_ICIJ
+    if "_quarantined" in cat:
+        return GROUP_QUARANTINED
     return _GROUP_BY_CATEGORY.get(cat, GROUP_MARKET)
 
 

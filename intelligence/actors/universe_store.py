@@ -620,6 +620,67 @@ def search_actors(
     }
 
 
+# ── Top actors ─────────────────────────────────────────────────────────────
+
+# Legacy ``/analytics/top`` metric names -> actor_graph_metrics columns. The
+# universe job does not compute eigenvector or HITS scores; those stay on the
+# legacy ``actor_analytics`` path.
+TOP_METRIC_COLUMNS: dict[str, str] = {
+    "pagerank": "pagerank",
+    "betweenness": "betweenness",
+    "degree_centrality": "degree",
+    "importance": "importance",
+    "coreness": "coreness",
+}
+
+
+def top_actors(
+    engine: Engine,
+    *,
+    metric: str = "pagerank",
+    limit: int = 20,
+    groups: list[str] | str | None = None,
+    run: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Top actors of the latest version by ``metric``, ``market`` group by default.
+
+    Bulk groups are opt-in via ``groups`` as in :func:`overview`, so the
+    leak/screening lists do not crowd out named market actors.
+    """
+    column = TOP_METRIC_COLUMNS.get(metric)
+    if column is None:
+        raise ValueError(f"Invalid metric '{metric}'. Must be one of: {sorted(TOP_METRIC_COLUMNS)}")
+    limit = max(1, min(int(limit), 1000))
+    group_list = normalize_groups(groups)
+    if run is None:
+        run = latest_run(engine)
+    if run is None:
+        return {"status": "pending_first_run", "entries": [], "groups": group_list, **_freshness(None)}
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL statement_timeout = '15s'"))
+        # column comes from the TOP_METRIC_COLUMNS whitelist, so it is safe as an identifier
+        rows = conn.execute(text(
+            f"SELECT actor_id, category, category_group, {column}, community_id, pagerank "
+            "FROM actor_graph_metrics "
+            "WHERE graph_version = :v AND category_group = ANY(CAST(:groups AS text[])) "
+            f"ORDER BY {column} DESC NULLS LAST, actor_id LIMIT :lim"
+        ), {"v": run["graph_version"], "groups": group_list, "lim": limit}).fetchall()
+        details = _actor_details(conn, [r[0] for r in rows])
+    entries = [
+        {
+            "actor_id": r[0],
+            "name": (details.get(r[0]) or {}).get("name", r[0]),
+            "category": r[1],
+            "category_group": r[2],
+            "score": float(r[3] or 0.0),
+            "community_id": r[4],
+            "pagerank": float(r[5] or 0.0),
+        }
+        for r in rows
+    ]
+    return {"entries": entries, "groups": group_list, **_freshness(run)}
+
+
 # ── Communities ────────────────────────────────────────────────────────────
 
 def community_summaries(

@@ -12,6 +12,7 @@ export const BULK_GROUPS = [
     { id: 'donor', label: 'Donors' },
     { id: 'icij', label: 'ICIJ' },
     { id: 'watchlist', label: 'Watchlists' },
+    { id: 'quarantined', label: 'Quarantined' },
 ];
 
 /** Query params for GET /intelligence/actor-network; {} keeps the default URL. */

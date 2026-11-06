@@ -67,6 +67,8 @@ def test_category_groups() -> None:
     assert uni.category_group("donor") == "donor"
     assert uni.category_group("person_of_interest") == "watchlist"
     assert uni.category_group("insider") == "market"
+    assert uni.category_group("corporation_quarantined_20260928") == "quarantined"
+    assert "quarantined" in uni.BULK_GROUPS
     assert uni.category_group(float("nan"), float("nan")) == "market"
 
 
