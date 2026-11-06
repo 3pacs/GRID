@@ -918,6 +918,21 @@ def run_feature_compute(params):
     }
 
 
+def run_null_calibration(params: dict) -> dict:
+    """One null-calibration shard (S7): synthetic worlds through GRID's real tests, no DB."""
+    from alpha_research.validation.null_farm import rate, run_shard
+
+    shard = params.get("shard")
+    if not isinstance(shard, dict) or "cell" not in shard:
+        return {"error": "null_calibration needs a shard spec (scripts/null_farm.py plan)"}
+    records = run_shard(shard)
+    rejected = rate([r["reject"] for r in records])
+    return {
+        "output": {"shard_id": shard["shard_id"], "records": records},
+        "metrics": {"reps": rejected["n"], "reject_rate": rejected["rate"]},
+    }
+
+
 def run_simulation(params):
     """Run Monte Carlo simulation of portfolio paths under current regime.
 
@@ -925,7 +940,13 @@ def run_simulation(params):
         n_paths: Number of simulation paths (default 1000).
         horizon_days: Forward horizon in trading days (default 63).
         feature_ids: Features to use for volatility estimation.
+
+    ``params["kind"] == "null_calibration"`` instead runs one self-contained
+    null-farm shard (``params["shard"]``, see ``scripts/null_farm.py``): no DB
+    reads, the per-replicate records come back in ``output``.
     """
+    if params.get("kind") == "null_calibration":
+        return run_null_calibration(params)
     from datetime import date, timedelta
     from db import get_engine
     from store.pit import PITStore
