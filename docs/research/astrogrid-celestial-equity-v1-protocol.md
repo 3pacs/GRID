@@ -79,3 +79,20 @@ before reading the equity return sample. No tuning to obtain a positive result.
 
 No trading, provider privileges, paid inference, historical ledger rewrites,
 global eligibility changes or automatic model promotion.
+
+## Availability amendment before any model fitting or return comparison
+
+The official FRED multi-series ZIP includes only about three years of the
+ICE high-yield series, although the declared sample is longer. Recover that
+same control from the existing `hy_oas_spread` resolved series through bounded
+`PITStore.get_pit`, with database-enforced read-only connections. All 779 common
+dates match the official download exactly (maximum difference zero). Retain
+reader/provenance/source-content hashes and latest-vintage caveat. This changes
+no target, test boundary, model, hypothesis or inference rule.
+
+Shared JS ephemeris omits Sun; supply Sun using the existing production Python
+Earth-longitude +180 degree formula. All date-only positions use 00:00 UTC as
+in the production snapshot, whose label is 12:00 UTC. Record this approximation
+and source hashes. Fixed-star astrometry and measured historical solar weather
+remain outside this implemented-input test. No model outcomes have been read
+when making these coverage repairs.
