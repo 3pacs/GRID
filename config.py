@@ -584,6 +584,12 @@ class Settings(BaseSettings):
     # contract (scoring followed by promotion) is unchanged by this flag.
     GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION: bool = False
 
+    # evaluation.signal_outcomes.score_forward: each trust cycle appends the
+    # corrected (sig-eval-4-sessions) outcome of recent signal_sources rows to
+    # the additive signal_source_outcomes table. signal_sources.outcome and
+    # every consumer of it are untouched. Off until an operator turns it on.
+    GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -601,6 +607,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
         "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
+        "GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )

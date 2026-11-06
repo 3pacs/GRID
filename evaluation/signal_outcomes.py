@@ -1,27 +1,26 @@
-"""Versioned, honest per-signal outcome evaluator (workstream W3b).
+"""Versioned, honest per-signal outcome evaluator (workstream W3b, wired S8).
 
-This module is a **from-scratch replacement candidate** for the "signal win
-rate" numbers produced by ``intelligence/trust_scorer.py``. It does not
-import, call, or modify that module, ``intelligence/postmortem.py``, or any
-Hermes/scheduler code. It is not wired into anything production-facing.
+The legacy meter (``intelligence/trust_scorer.py::score_pending_signals``)
+collapses every non-CORRECT case into ``WRONG`` -- including moves the right
+way that fell short of its 1% threshold, signals it never had a price for,
+and signals priced off a close from before the signal was known. This module
+has a dedicated, never-a-guess ``INELIGIBLE`` outcome with an explicit
+reason, an inconclusive ``UNRESOLVED`` outcome for signals still inside
+their horizon, and a dead-band ``NO_MOVE`` outcome that is NOT counted as
+WRONG.
 
-Why this exists (see module docstring in the PR/report for the full list):
-the old meter (`intelligence/trust_scorer.py::score_prediction_signals` /
-its `_price`-based scoring loop around ``MOVE_THRESHOLD_PCT``) collapses
-every non-CORRECT case into ``WRONG`` — including signals it never had a
-price for, signals whose direction it could not classify, and signals whose
-underlying instrument later delisted. This module instead has a dedicated,
-never-a-guess ``INELIGIBLE`` outcome with an explicit reason, a genuinely
-inconclusive ``UNRESOLVED`` outcome for signals still inside their horizon,
-and a dead-band ``NO_MOVE`` outcome that is explicitly NOT counted as WRONG.
-
-Everything here is versioned via ``EVALUATION_VERSION``. This branch only
-evaluates in memory; it has no persistence entry point.
+Everything is versioned. ``EVALUATION_VERSION`` is the original in-memory
+rule set (exact calendar-day bars); ``SESSION_EVALUATION_VERSION`` adds
+NYSE-session rolling and is what ``replay_signal_sources`` (offline, dry run
+by default; CLI ``scripts/evaluate_signals.py replay``) and ``score_forward``
+(the trust cycle, behind ``GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING``)
+append to ``signal_source_outcomes``. ``signal_sources.outcome`` is never
+written here; consumers still read it until they are switched deliberately.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from math import isfinite
 from zoneinfo import ZoneInfo
@@ -32,6 +31,12 @@ from typing import Callable, Iterable, Optional
 # ---------------------------------------------------------------------------
 
 EVALUATION_VERSION: str = "sig-eval-3-dryrun"
+# Same rules plus NYSE-session rolling of the entry and exit dates (see
+# ``evaluate_signal(session_calendar=...)``). This is the version persisted
+# to ``signal_source_outcomes`` by the replay and the forward scorer.
+SESSION_EVALUATION_VERSION: str = "sig-eval-4-sessions"
+# A session is searched for at most this many calendar days forward.
+MAX_SESSION_ROLL_DAYS: int = 7
 MARKET_TZ = ZoneInfo("America/New_York")
 
 # ---------------------------------------------------------------------------
@@ -258,6 +263,15 @@ def _classify_direction(direction: str, raw_return: float, band_pct: float) -> s
     raise ValueError(f"_classify_direction called with non-directional value: {direction!r}")
 
 
+def _roll_to_session(d: date, session_calendar: Callable[[date], bool]) -> Optional[date]:
+    """First session on or after ``d`` within ``MAX_SESSION_ROLL_DAYS``."""
+    for k in range(MAX_SESSION_ROLL_DAYS + 1):
+        candidate = d + timedelta(days=k)
+        if session_calendar(candidate):
+            return candidate
+    return None
+
+
 def evaluate_signal(
     record: SignalRecord,
     price_accessor: PriceAccessor,
@@ -266,6 +280,36 @@ def evaluate_signal(
     cost_bps: float = 0.0,
     today: Optional[date] = None,
     sanity_bounds: tuple[float, float] = (0.0, 1_000_000.0),
+    session_calendar: Optional[Callable[[date], bool]] = None,
+) -> SignalOutcomeRecord:
+    """Evaluate a single signal into a versioned outcome record.
+
+    Without ``session_calendar`` this is ``EVALUATION_VERSION``: the entry
+    and exit must be bars dated exactly on the (calendar-day) entry date and
+    entry + ``horizon_days``. With it (``SESSION_EVALUATION_VERSION``), the
+    entry date rolls forward to the first session on or after the date the
+    signal became known, and the exit to the first session on or after entry
+    + ``horizon_days``; both bars must still be dated exactly on those
+    sessions. See ``_evaluate_signal`` for the rest of the contract.
+    """
+    out = _evaluate_signal(
+        record, price_accessor, dead_band_pct=dead_band_pct, cost_bps=cost_bps,
+        today=today, sanity_bounds=sanity_bounds, session_calendar=session_calendar,
+    )
+    if session_calendar is not None:
+        out = replace(out, evaluation_version=SESSION_EVALUATION_VERSION)
+    return out
+
+
+def _evaluate_signal(
+    record: SignalRecord,
+    price_accessor: PriceAccessor,
+    *,
+    dead_band_pct: float = 1.0,
+    cost_bps: float = 0.0,
+    today: Optional[date] = None,
+    sanity_bounds: tuple[float, float] = (0.0, 1_000_000.0),
+    session_calendar: Optional[Callable[[date], bool]] = None,
 ) -> SignalOutcomeRecord:
     """Evaluate a single signal into a versioned outcome record.
 
@@ -323,6 +367,11 @@ def evaluate_signal(
     if stamp.astimezone(MARKET_TZ).time() >= time(16, 0):
         known_date += timedelta(days=1)
     entry_as_of = max(record.signal_date, known_date)
+    if session_calendar is not None:
+        rolled = _roll_to_session(entry_as_of, session_calendar)
+        if rolled is None:
+            return _ineligible(record, REASON_STALE_ENTRY, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
+        entry_as_of = rolled
     if entry_as_of > today:
         return _ineligible(record, REASON_UNVERIFIED_KNOWN_AT, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
 
@@ -354,6 +403,11 @@ def evaluate_signal(
         return _ineligible(record, REASON_PRICE_OUT_OF_BOUNDS, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
 
     exit_as_of = entry_as_of + timedelta(days=record.horizon_days)
+    if session_calendar is not None:
+        rolled_exit = _roll_to_session(exit_as_of, session_calendar)
+        if rolled_exit is None:
+            return _ineligible(record, REASON_STALE_EXIT, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
+        exit_as_of = rolled_exit
 
     # A bar at the nominal horizon is not an outcome until that horizon has
     # elapsed. Do not fetch or grade an immature signal even if backfilled data
@@ -553,3 +607,430 @@ def summarize_outcomes(outcomes: Iterable[SignalOutcomeRecord]) -> CohortSummary
         baseline_by_horizon=baseline_by_horizon,
         origin_tag_counts=origin_tag_counts,
     )
+
+
+# ---------------------------------------------------------------------------
+# known_at resolution (shared with scripts/evaluate_signals.py)
+# ---------------------------------------------------------------------------
+
+KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE = "congressional_disclosure_date"
+KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE = "created_at_fallback_missing_disclosure_date"
+KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE = "created_at_fallback_unparseable_disclosure_date"
+KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE = "created_at_fallback_unverified_source_type"
+
+
+def resolve_known_at(source_type: str, signal_value: Optional[dict]) -> tuple[Optional[datetime], str]:
+    """Return ``(known_at, known_at_source)`` for one signal row.
+
+    Only congressional rows carry a proven publication field
+    (``disclosure_date`` in ``signal_value``, written by
+    ``ingestion/altdata/congressional.py``). It has no time of day, so it is
+    read as the end of that New York day, which ``evaluate_signal``'s
+    after-16:00 rule pushes to the next session. Every other source type
+    returns ``None`` and ``evaluate_signal`` falls back to ``created_at``.
+    """
+    if "congress" not in (source_type or "").lower():
+        return None, KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE
+    raw = (signal_value or {}).get("disclosure_date")
+    if not isinstance(raw, str):
+        return None, KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE
+    try:
+        disclosure_date = date.fromisoformat(raw)
+    except ValueError:
+        return None, KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE
+    return datetime.combine(disclosure_date, time.max, MARKET_TZ), KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE
+
+
+# ---------------------------------------------------------------------------
+# Persistence: offline replay and forward scoring of signal_sources
+# ---------------------------------------------------------------------------
+#
+# ``intelligence/trust_scorer.py::score_pending_signals`` writes the legacy
+# ``signal_sources.outcome``: CORRECT when the move beat 1% in the signal's
+# direction, WRONG for everything else -- a 0.2% drift, a missing exit, a
+# move the right way that fell short. Those rows are never rewritten here.
+# The corrected outcome goes to ``signal_source_outcomes`` (append-only, one
+# row per ``(signal_source_id, evaluation_version)``), so legacy readers are
+# untouched and a later rule change is a new version, not an overwrite.
+
+OUTCOMES_TABLE = "signal_source_outcomes"
+# A price-dependent refusal is only final once the puller has had this long
+# past the nominal exit to catch up; until then the row is not written.
+FINAL_GRACE_DAYS = 7
+PRICE_HISTORY_PAD_DAYS = 10
+_WAIT_REASONS = frozenset({
+    REASON_MISSING_ENTRY, REASON_MISSING_EXIT, REASON_STALE_ENTRY,
+    REASON_STALE_EXIT, REASON_UNVERIFIED_KNOWN_AT,
+})
+_LEGACY_DIRECTION = {"bullish": "BUY", "bearish": "SELL"}
+
+
+@dataclass(frozen=True)
+class SignalSourceRow:
+    """The ``signal_sources`` columns the evaluator needs."""
+
+    id: int
+    source_type: str
+    ticker: Optional[str]
+    signal_date: date
+    signal_type: Optional[str]
+    signal_value: object
+    created_at: Optional[datetime]
+    legacy_outcome: Optional[str] = None
+
+
+def parse_signal_payload(value: object) -> Optional[dict]:
+    """JSONB ``signal_value`` as a dict (drivers return dicts or JSON text)."""
+    import json
+
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def record_from_row(row: SignalSourceRow) -> SignalRecord:
+    """A ``SignalRecord`` with the legacy scorer's direction and horizon.
+
+    Direction comes from ``trust_scorer._infer_signal_direction`` and the
+    horizon from ``trust_scorer.EVALUATION_WINDOWS`` so the replay differs
+    from the legacy outcome only in how a priced move is classified and in
+    which prices are admissible.
+    """
+    from intelligence.trust_scorer import EVALUATION_WINDOWS, _infer_signal_direction, yf_symbol
+
+    payload = parse_signal_payload(row.signal_value)
+    inferred = _infer_signal_direction(row.signal_type, payload if payload is not None else row.signal_value)
+    known_at, known_at_source = resolve_known_at(row.source_type, payload)
+    signal_date = row.signal_date.date() if isinstance(row.signal_date, datetime) else row.signal_date
+    return SignalRecord(
+        source_type=row.source_type,
+        instrument=yf_symbol(row.ticker or ""),
+        signal_date=signal_date,
+        direction=_LEGACY_DIRECTION.get(inferred, "UNKNOWN"),
+        horizon_days=int(EVALUATION_WINDOWS.get(row.source_type, 7)),
+        signal_source_id=row.id,
+        metadata={"known_at_source": known_at_source, "legacy_outcome": row.legacy_outcome},
+        known_at=known_at,
+        created_at=row.created_at,
+    )
+
+
+def _available_date(record: SignalRecord) -> date:
+    stamps = [s for s in (record.known_at, record.created_at) if s is not None and s.tzinfo is not None]
+    known = max(stamps).astimezone(MARKET_TZ).date() if stamps else record.signal_date
+    return max(record.signal_date, known)
+
+
+def is_final(outcome: SignalOutcomeRecord, record: SignalRecord, today: date) -> bool:
+    """Whether ``outcome`` may be persisted (the table is append-only).
+
+    UNRESOLVED never is. A refusal that a later pull could cure (missing or
+    off-session bar, signal not yet known) is final only ``FINAL_GRACE_DAYS``
+    after the nominal exit; every other outcome is final at once.
+    """
+    if outcome.outcome == "UNRESOLVED":
+        return False
+    if outcome.outcome == "INELIGIBLE" and outcome.eligibility_reason in _WAIT_REASONS:
+        return today >= _available_date(record) + timedelta(days=record.horizon_days + FINAL_GRACE_DAYS)
+    return True
+
+
+_SELECT_TICKER_ROWS_SQL = """
+    SELECT s.id, s.source_type, s.ticker, s.signal_date, s.signal_type,
+           s.signal_value, s.created_at, s.outcome
+      FROM signal_sources s
+     WHERE s.ticker = :ticker
+       AND (:since IS NULL OR s.signal_date >= :since)
+       AND MOD(s.id, :mod) = 0
+     ORDER BY s.id
+"""
+
+_SELECT_TICKER_ROWS_UNSCORED_SQL = """
+    SELECT s.id, s.source_type, s.ticker, s.signal_date, s.signal_type,
+           s.signal_value, s.created_at, s.outcome
+      FROM signal_sources s
+     WHERE s.ticker = :ticker
+       AND (:since IS NULL OR s.signal_date >= :since)
+       AND MOD(s.id, :mod) = 0
+       AND NOT EXISTS (SELECT 1 FROM signal_source_outcomes o
+                        WHERE o.signal_source_id = s.id
+                          AND o.evaluation_version = :version)
+     ORDER BY s.id
+"""
+
+_SELECT_TICKERS_SQL = """
+    SELECT DISTINCT ticker FROM signal_sources
+     WHERE ticker IS NOT NULL AND (:since IS NULL OR signal_date >= :since)
+     ORDER BY ticker
+"""
+
+_SELECT_FORWARD_ROWS_SQL = """
+    SELECT s.id, s.source_type, s.ticker, s.signal_date, s.signal_type,
+           s.signal_value, s.created_at, s.outcome
+      FROM signal_sources s
+     WHERE s.signal_date >= :since
+       AND s.ticker IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM signal_source_outcomes o
+                        WHERE o.signal_source_id = s.id
+                          AND o.evaluation_version = :version)
+     ORDER BY s.id
+     LIMIT :n
+"""
+
+_INSERT_OUTCOME_SQL = """
+    INSERT INTO signal_source_outcomes (
+        signal_source_id, evaluation_version, source_type, ticker, signal_date,
+        direction, horizon_days, outcome, eligibility_reason, dead_band_pct,
+        cost_bps, entry_price, entry_price_date, exit_price, exit_price_date,
+        raw_return, cost_adjusted_return, price_basis, known_at_source,
+        legacy_outcome, evaluated_at
+    ) VALUES (
+        :signal_source_id, :evaluation_version, :source_type, :ticker, :signal_date,
+        :direction, :horizon_days, :outcome, :eligibility_reason, :dead_band_pct,
+        :cost_bps, :entry_price, :entry_price_date, :exit_price, :exit_price_date,
+        :raw_return, :cost_adjusted_return, :price_basis, :known_at_source,
+        :legacy_outcome, :evaluated_at
+    )
+    ON CONFLICT (signal_source_id, evaluation_version) DO NOTHING
+"""
+
+
+def outcome_params(outcome: SignalOutcomeRecord, record: SignalRecord, evaluated_at: datetime) -> dict:
+    """Bind parameters for one ``signal_source_outcomes`` insert."""
+    return {
+        "signal_source_id": outcome.signal_source_id,
+        "evaluation_version": outcome.evaluation_version,
+        "source_type": outcome.source_type,
+        "ticker": outcome.instrument,
+        "signal_date": outcome.signal_date,
+        "direction": outcome.direction,
+        "horizon_days": outcome.horizon_days,
+        "outcome": outcome.outcome,
+        "eligibility_reason": outcome.eligibility_reason,
+        "dead_band_pct": outcome.dead_band_pct,
+        "cost_bps": outcome.cost_bps,
+        "entry_price": outcome.entry_price,
+        "entry_price_date": outcome.entry_price_date,
+        "exit_price": outcome.exit_price,
+        "exit_price_date": outcome.exit_price_date,
+        "raw_return": outcome.raw_return,
+        "cost_adjusted_return": outcome.cost_adjusted_return,
+        "price_basis": f"YF:{outcome.instrument}:close yfinance+TIINGO raw close pulled >= 17:00 ET",
+        "known_at_source": record.metadata.get("known_at_source"),
+        "legacy_outcome": record.metadata.get("legacy_outcome"),
+        "evaluated_at": evaluated_at,
+    }
+
+
+@dataclass
+class OutcomeTally:
+    """Projection counters for a replay or forward pass."""
+
+    rows: int = 0
+    final: int = 0
+    written: int = 0
+    tickers: int = 0
+    price_reads: int = 0
+    by_outcome: dict = field(default_factory=dict)
+    by_reason: dict = field(default_factory=dict)
+    legacy_vs_new: dict = field(default_factory=dict)
+    by_source_type: dict = field(default_factory=dict)
+
+    def add(self, outcome: SignalOutcomeRecord, legacy: Optional[str], final: bool) -> None:
+        self.rows += 1
+        self.final += int(final)
+        self.by_outcome[outcome.outcome] = self.by_outcome.get(outcome.outcome, 0) + 1
+        if outcome.outcome == "INELIGIBLE":
+            reason = outcome.eligibility_reason or "unspecified"
+            self.by_reason[reason] = self.by_reason.get(reason, 0) + 1
+        key = f"{legacy or 'PENDING'}->{outcome.outcome}"
+        self.legacy_vs_new[key] = self.legacy_vs_new.get(key, 0) + 1
+        per = self.by_source_type.setdefault(outcome.source_type, {})
+        per[outcome.outcome] = per.get(outcome.outcome, 0) + 1
+
+    def as_dict(self) -> dict:
+        def _sorted(d: dict) -> dict:
+            return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+        return {
+            "rows": self.rows, "final": self.final, "written": self.written,
+            "tickers": self.tickers, "price_reads": self.price_reads,
+            "by_outcome": _sorted(self.by_outcome), "by_reason": _sorted(self.by_reason),
+            "legacy_vs_new": _sorted(self.legacy_vs_new),
+            "by_source_type": {k: _sorted(v) for k, v in sorted(self.by_source_type.items())},
+        }
+
+
+def _begin_read(conn, *, read_only: bool, timeout_ms: int) -> None:
+    """Open a (read-only, time-bounded) transaction on PostgreSQL connections."""
+    from sqlalchemy import text
+
+    if getattr(getattr(conn, "dialect", None), "name", None) != "postgresql":
+        return
+    if read_only:
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+    conn.execute(text("SELECT set_config('statement_timeout', :t, true)"), {"t": str(int(timeout_ms))})
+
+
+def _rows(raw_rows) -> list[SignalSourceRow]:
+    return [SignalSourceRow(*tuple(r)[:8]) for r in raw_rows]
+
+
+def evaluate_ticker_rows(
+    conn,
+    rows: list[SignalSourceRow],
+    *,
+    evaluated_at: datetime,
+    tally: OutcomeTally,
+) -> list[dict]:
+    """Evaluate one ticker's rows; return insert params for the final ones."""
+    from evaluation.prices import CompletedCloseAccessor
+    from ingestion.market_calendar import is_market_open
+    from intelligence.trust_scorer import MOVE_THRESHOLD_PCT
+
+    if not rows:
+        return []
+    today = evaluated_at.astimezone(MARKET_TZ).date()
+    records = [record_from_row(r) for r in rows]
+    start = min(_available_date(rec) for rec in records) - timedelta(days=PRICE_HISTORY_PAD_DAYS)
+    accessor = CompletedCloseAccessor(conn, start=start, evaluated_at=evaluated_at)
+    writes: list[dict] = []
+    for row, rec in zip(rows, records):
+        out = evaluate_signal(
+            rec, accessor, dead_band_pct=MOVE_THRESHOLD_PCT, cost_bps=0.0,
+            today=today, session_calendar=is_market_open,
+        )
+        final = is_final(out, rec, today)
+        tally.add(out, row.legacy_outcome, final)
+        if final:
+            writes.append(outcome_params(out, rec, evaluated_at))
+    tally.tickers += 1
+    tally.price_reads += accessor.reads
+    return writes
+
+
+def write_outcomes(engine, params: list[dict]) -> int:
+    """Append final outcomes; an existing ``(id, version)`` row is left alone."""
+    from sqlalchemy import text
+
+    if not params:
+        return 0
+    with engine.begin() as conn:
+        result = conn.execute(text(_INSERT_OUTCOME_SQL), params)
+    count = getattr(result, "rowcount", None)
+    return int(count) if isinstance(count, int) and count >= 0 else len(params)
+
+
+def outcomes_table_exists(engine) -> bool:
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT to_regclass('public.signal_source_outcomes')")).scalar() is not None
+    except Exception:  # noqa: BLE001 -- SQLite / missing function: treat as absent
+        return False
+
+
+def replay_signal_sources(
+    engine,
+    *,
+    apply: bool = False,
+    evaluated_at: Optional[datetime] = None,
+    sample_mod: int = 1,
+    tickers: Optional[list[str]] = None,
+    max_tickers: Optional[int] = None,
+    since: Optional[date] = None,
+    timeout_ms: int = 120_000,
+    progress_every: int = 250,
+) -> dict:
+    """Recompute ``SESSION_EVALUATION_VERSION`` outcomes for existing rows.
+
+    Dry run by default: reads in read-only transactions and writes nothing.
+    ``apply=True`` appends the final outcomes to ``signal_source_outcomes``
+    (rows already present for this version are skipped, so a rerun resumes).
+    Work is done one ticker at a time -- one bounded price-series read and
+    one ``signal_sources`` read per ticker -- so memory stays flat.
+    ``sample_mod=k`` evaluates only rows with ``id % k = 0``.
+    """
+    from sqlalchemy import text
+
+    from config import log
+
+    if sample_mod < 1:
+        raise ValueError("sample_mod must be >= 1")
+    if apply and not outcomes_table_exists(engine):
+        raise RuntimeError("signal_source_outcomes does not exist; run the alembic migration first")
+    evaluated_at = evaluated_at or datetime.now(MARKET_TZ)
+    tally = OutcomeTally()
+    with engine.connect() as conn:
+        if tickers is None:
+            _begin_read(conn, read_only=True, timeout_ms=timeout_ms)
+            tickers = [r[0] for r in conn.execute(text(_SELECT_TICKERS_SQL), {"since": since}).fetchall()]
+            conn.rollback()
+        if max_tickers is not None:
+            tickers = tickers[:max_tickers]
+        skip_existing = apply
+        for i, ticker in enumerate(tickers, 1):
+            _begin_read(conn, read_only=True, timeout_ms=timeout_ms)
+            sql = _SELECT_TICKER_ROWS_UNSCORED_SQL if skip_existing else _SELECT_TICKER_ROWS_SQL
+            rows = _rows(conn.execute(text(sql), {
+                "ticker": ticker, "since": since, "mod": int(sample_mod),
+                "version": SESSION_EVALUATION_VERSION,
+            }).fetchall())
+            writes = evaluate_ticker_rows(conn, rows, evaluated_at=evaluated_at, tally=tally)
+            conn.rollback()
+            if apply and writes:
+                tally.written += write_outcomes(engine, writes)
+            if progress_every and i % progress_every == 0:
+                log.info("signal outcome replay: {i}/{n} tickers, {r} rows", i=i, n=len(tickers), r=tally.rows)
+    result = tally.as_dict()
+    result.update({
+        "evaluation_version": SESSION_EVALUATION_VERSION, "dry_run": not apply,
+        "evaluated_at": evaluated_at.isoformat(), "sample_mod": sample_mod,
+        "since": since.isoformat() if since else None,
+    })
+    return result
+
+
+def score_forward(
+    engine,
+    *,
+    lookback_days: int = 60,
+    max_rows: int = 20_000,
+    evaluated_at: Optional[datetime] = None,
+    timeout_ms: int = 120_000,
+) -> dict:
+    """Append ``SESSION_EVALUATION_VERSION`` outcomes for recent unscored rows.
+
+    Called from ``trust_scorer.run_trust_cycle`` when
+    ``GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING`` is set. Selects up to
+    ``max_rows`` rows dated within ``lookback_days`` with no outcome row for
+    this version, oldest first, and writes the ones whose outcome is final.
+    Returns ``{"skipped": reason}`` when the table is absent.
+    """
+    from sqlalchemy import text
+
+    if not outcomes_table_exists(engine):
+        return {"skipped": "signal_source_outcomes missing"}
+    evaluated_at = evaluated_at or datetime.now(MARKET_TZ)
+    since = evaluated_at.astimezone(MARKET_TZ).date() - timedelta(days=lookback_days)
+    tally = OutcomeTally()
+    with engine.connect() as conn:
+        _begin_read(conn, read_only=True, timeout_ms=timeout_ms)
+        rows = _rows(conn.execute(text(_SELECT_FORWARD_ROWS_SQL), {"since": since, "version": SESSION_EVALUATION_VERSION, "n": int(max_rows)}).fetchall())
+        by_ticker: dict[str, list[SignalSourceRow]] = {}
+        for r in rows:
+            by_ticker.setdefault(r.ticker or "", []).append(r)
+        writes: list[dict] = []
+        for ticker_rows in by_ticker.values():
+            writes.extend(evaluate_ticker_rows(conn, ticker_rows, evaluated_at=evaluated_at, tally=tally))
+        conn.rollback()
+    tally.written = write_outcomes(engine, writes)
+    result = tally.as_dict()
+    result.update({"evaluation_version": SESSION_EVALUATION_VERSION, "since": since.isoformat()})
+    return result

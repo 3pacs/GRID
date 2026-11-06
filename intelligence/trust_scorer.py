@@ -1705,6 +1705,33 @@ def _get_llm_trust_narrative(
 
 # ── 7. Run Trust Cycle ────────────────────────────────────────────────────
 
+def _score_forward_outcomes(engine: Engine) -> dict[str, Any]:
+    """Append corrected outcomes when the operator flag is on; never raises.
+
+    ``evaluation.signal_outcomes.score_forward`` writes only to
+    ``signal_source_outcomes`` (versioned, append-only). It does not change
+    ``signal_sources.outcome`` or any trust score computed from it.
+    """
+    try:
+        from config import settings as _settings
+    except Exception:  # noqa: BLE001
+        return {"skipped": "settings unavailable"}
+    if not bool(getattr(_settings, "GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING", False)):
+        return {"skipped": "GRID_ENABLE_SIGNAL_OUTCOME_FORWARD_SCORING off"}
+    try:
+        from evaluation.signal_outcomes import score_forward
+
+        result = score_forward(engine)
+        log.info(
+            "Forward signal outcomes: {w} written of {r} evaluated ({o})",
+            w=result.get("written", 0), r=result.get("rows", 0), o=result.get("by_outcome", {}),
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001 -- a side table must not stop the cycle
+        log.warning("Forward signal outcome scoring failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
 def run_trust_cycle(engine: Engine) -> dict[str, Any]:
     """Orchestrate the full trust scoring cycle.
 
@@ -1723,6 +1750,9 @@ def run_trust_cycle(engine: Engine) -> dict[str, Any]:
 
     # 1. Score pending signals
     scoring = score_pending_signals(engine)
+
+    # 1b. Corrected outcomes (additive table; legacy column untouched).
+    forward_outcomes = _score_forward_outcomes(engine)
 
     # 2. Update trust scores
     trust_update = update_trust_scores(engine)
@@ -1743,6 +1773,7 @@ def run_trust_cycle(engine: Engine) -> dict[str, Any]:
 
     result = {
         "scoring": scoring,
+        "forward_outcomes": forward_outcomes,
         "trust_update": trust_update,
         "convergence": convergence,
         "convergence_count": len(convergence),
