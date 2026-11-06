@@ -110,6 +110,28 @@ class BinancePuller(BasePuller):
         resp.raise_for_status()
         return resp.json()
 
+    @staticmethod
+    def fetch_spot_flow_klines(symbol: str, *, as_of: datetime) -> list[list]:
+        """Read the last hour of completed public 5m spot bars, no credentials.
+
+        Separate from the daily resolved series: intraday receipts preserve
+        taker volumes and exact availability in the existing signal bridge.
+        """
+        if symbol not in {"BTCUSDT", "ETHUSDT", "SOLUSDT"} or as_of.tzinfo is None:
+            raise ValueError("Unsupported spot flow instrument or naive clock")
+        end_ms = int(as_of.timestamp() * 1000) // 300_000 * 300_000 - 1
+        resp = requests.get(_KLINE_URL,
+                            params={"symbol": symbol, "interval": "5m", "timeZone": "0",
+                                    "endTime": end_ms, "limit": 12},
+                            headers=_HEADERS, timeout=15)
+        if resp.status_code in _ACCESS_BLOCKED_STATUSES:
+            raise BinanceAccessBlocked(f"Spot flow access status {resp.status_code}")
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("Missing spot flow klines")
+        return rows
+
     @retry_on_failure(
         max_attempts=3, backoff=2.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),

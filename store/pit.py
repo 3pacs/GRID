@@ -172,6 +172,7 @@ class PITStore:
                   AND created_at >= :since
                   AND signal_date BETWEEN :first_day AND :last_day
                   AND source_type = ANY(:types)
+                  AND signal_type <> 'spot_taker_flow'
                 ORDER BY created_at DESC, id DESC LIMIT 100
             """), {"symbols": ["BTC", "ETH", "SOL"], "as_of": as_of,
                    "since": as_of - timedelta(hours=24),
@@ -180,6 +181,24 @@ class PITStore:
         return [{"id": r[0], "symbol": r[1], "source": r[2], "source_id": r[3],
                  "event_date": r[4].isoformat(), "signal_type": r[5], "details": r[6],
                  "available_at": r[7].isoformat()} for r in rows]
+
+    def get_spot_order_flow_receipts(self, *, as_of: datetime) -> list[dict]:
+        """Actual Binance spot 5m taker measurements known by this clock."""
+        if as_of.tzinfo is None:
+            raise ValueError("Spot flow cutoff must be timezone-aware")
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, ticker, signal_value, created_at, source_id
+                FROM signal_sources
+                WHERE source_type = 'exchange_flow' AND signal_type = 'spot_taker_flow'
+                  AND source_id LIKE 'binance_spot:5m:%'
+                  AND ticker = ANY(:symbols) AND created_at <= :as_of
+                  AND signal_date BETWEEN :since AND :day
+                ORDER BY id DESC LIMIT 300
+            """), {"symbols": ["BTC", "ETH", "SOL"], "as_of": as_of,
+                   "since": (as_of - timedelta(days=1)).date(), "day": as_of.date()}).fetchall()
+        return [{"id": r[0], "symbol": r[1], "payload": r[2],
+                 "available_at": r[3], "source_id": r[4]} for r in rows]
 
     def get_source_snapshot(
         self, selections: list[dict] | None, *, as_of: datetime, start_date: date,

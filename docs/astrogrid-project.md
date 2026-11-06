@@ -1,5 +1,55 @@
 # AstroGrid Project
 
+## 2026-11-05 actor-flow follow-up
+
+Live audit found no BTC/ETH/SOL `signal_sources` rows in seven days. The
+`CryptoSignalBridge` had no production caller; Whale Alert had no configured
+key and was a `skip_runtime` stub; CryptoQuant's recent pulls failed auth.
+The crypto ETF puller reports price/volume proxies, not measured creations or
+redemptions, and does not meet the actor-flow contract. These observations do
+not authorize paid subscriptions or relabeling proxies as measured flow.
+
+Anik explicitly selected a **separate 30-minute research contract** for a live
+forward generation-and-scoring verification. The original 24h/1% contract stays
+separate. The existing five-minute producer now:
+
+1. Uses `BinancePuller.fetch_spot_flow_klines` and
+   `CryptoSignalBridge.bridge_binance_order_flow` to capture completed UTC 5m
+   global spot REST klines into `signal_sources`. First-seen receipts use the
+   real DB availability clock; duplicate reads never overwrite them. Balanced
+   bars are retained too, so price outcomes do not depend on a future flow gate.
+2. Issues model `astrogrid-spot-flow-v1`, contract
+   `binance_spot_taker_30m_v1`, only from the latest valid receipt per asset:
+   at least 100,000 USDT quote turnover, 100 trades and 10% absolute signed
+   taker imbalance, no more than 10 minutes old. The direction is measured
+   taker-buy quote volume minus taker-sell quote volume, divided by total quote
+   turnover. Actors are anonymous exchange buyer/seller cohorts, not named
+   whales, institutions or proven new capital entering the market.
+3. Freezes that receipt ID, content hash, exact spot venue/instrument, price,
+   availability, issue time, 30m due time and 0.10% directional threshold. The
+   outcome is the first recorded completed 5m close at/after due, within 15m.
+   Fees are excluded. The hypothesis and thresholds are declared research rules,
+   not calibrated odds or evidence of trading edge.
+4. Scores only this model on the five-minute cadence. Missing, future,
+   mismatched-asset/venue and altered-source outcomes remain unscored. Original
+   forecast and postmortem logs remain unchanged; results derive from scores.
+
+The public feed retains bounded pending and completed slices and separate
+performance counters for the two contracts. It also exposes the measured
+qualification gates, and Guru answers use the latest pending contract per
+asset/cohort. Neither research cohort enters the legacy mystical backtests.
+
+Primary source contract:
+[Binance Spot klines fields](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market)
+and [public market-data-only host](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md).
+The global REST receipts are separate from the pre-existing observed trade
+stream candles: no overwrite or cross-venue substitution.
+
+Verification: focused gate/scorer/renderer regressions, opt-in production-schema
+synthetic E2E and legacy compatibility, then a separately recorded live forward
+forecast and its naturally matured real price outcome. Synthetic tests never
+count as production performance. Deployment receipts belong in the fleet report.
+
 ## Project Metadata
 
 - Project: [[AstroGrid]]

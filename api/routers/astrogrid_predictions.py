@@ -171,7 +171,7 @@ async def create_prediction(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Persist an AstroGrid prediction and immediate postmortem stub."""
-    if req.model_version.strip() == "astrogrid-evidence-v2":
+    if req.model_version.strip() in {"astrogrid-evidence-v2", "astrogrid-spot-flow-v1"}:
         raise HTTPException(status_code=422, detail="The evidence model is reserved for the scheduled producer.")
     store = get_astrogrid_store()
     stub = _build_postmortem_stub(req)

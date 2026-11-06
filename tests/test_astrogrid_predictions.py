@@ -991,7 +991,8 @@ def test_create_prediction_downgrades_degraded_targets(
     assert saved_payload["market_overlay_snapshot"]["scorecard"]["target_statuses"][0]["status"] == "degraded"
 
 
-@pytest.mark.parametrize("model_version", ["astrogrid-evidence-v2", " astrogrid-evidence-v2 ", "astrogrid-evidence-v2\n"])
+@pytest.mark.parametrize("model_version", ["astrogrid-evidence-v2", " astrogrid-evidence-v2 ", "astrogrid-evidence-v2\n",
+                                         "astrogrid-spot-flow-v1", " astrogrid-spot-flow-v1\n"])
 def test_client_cannot_impersonate_scheduled_evidence_producer(model_version):
     response = client.post("/api/v1/astrogrid/predictions", headers=_auth_header(), json={
         "question": "Synthetic injected question", "call": "buy BTC", "timing": "now",
