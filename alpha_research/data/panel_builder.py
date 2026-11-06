@@ -62,12 +62,25 @@ def _resolve_feature_ids(engine: Engine, names: list[str]) -> dict[int, str]:
     return {int(r[0]): r[1] for r in rows}
 
 
+def _ids_for_names(engine: Engine, names: list[str], pit: PITStore | None) -> dict[int, str]:
+    """``{feature_id: name}`` for registered *names*, via *pit* when given.
+
+    A ``PITWindowCache`` answers from the name map it recorded at build time,
+    so a snapshot-backed backtest needs no feature_registry read.
+    """
+    if pit is None:
+        return _resolve_feature_ids(engine, names)
+    return {fid: name for name, fid in pit.feature_ids_by_name(names).items()}
+
+
 def build_price_panel(
     engine: Engine,
     tickers: Sequence[str] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     as_of_date: date | None = None,
+    *,
+    pit: PITStore | None = None,
 ) -> pd.DataFrame:
     """
     Build a dates x tickers close-price panel from resolved_series.
@@ -80,6 +93,10 @@ def build_price_panel(
     both 679.52 and a later 683.39 revision — the old code picked whichever
     row Postgres happened to return first, non-reproducibly).
     Returns DataFrame with DatetimeIndex and uppercase ticker columns.
+
+    ``pit`` (optional) is the PIT reader to use; default ``PITStore(engine)``.
+    A ``store.pit.PITWindowCache`` answers repeated reads over one window
+    from memory with identical results (rotation backtests, W2-7).
     """
     if as_of_date is None:
         as_of_date = date.today()
@@ -90,7 +107,7 @@ def build_price_panel(
 
     if tickers:
         names = [f"{t.lower()}_full" for t in tickers]
-        id_to_ticker = _resolve_feature_ids(engine, names)
+        id_to_ticker = _ids_for_names(engine, names, pit)
     else:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -103,7 +120,7 @@ def build_price_panel(
 
     id_to_ticker = {fid: _feature_name_to_ticker(name) for fid, name in id_to_ticker.items()}
 
-    matrix = PITStore(engine).get_feature_matrix(
+    matrix = (pit or PITStore(engine)).get_feature_matrix(
         list(id_to_ticker),
         start_date,
         end_date,
@@ -207,6 +224,8 @@ def get_vix_series(
     start_date: date | None = None,
     end_date: date | None = None,
     as_of_date: date | None = None,
+    *,
+    pit: PITStore | None = None,
 ) -> pd.Series:
     """
     Get the PIT-correct VIX time series from resolved_series.
@@ -217,7 +236,9 @@ def get_vix_series(
     ~80-100 scale) and the dead `vix` feature (id 105, no data since
     2026-04-02). One value per obs_date: the latest vintage with
     release_date <= as_of_date (store/pit.py's LATEST_AS_OF policy), so
-    repeated calls are deterministic.
+    repeated calls are deterministic. The read is bounded to
+    ``[start_date, end_date]`` in SQL (it used to read the whole history and
+    filter here). ``pit`` as in ``build_price_panel``.
     """
     if as_of_date is None:
         as_of_date = date.today()
@@ -226,12 +247,21 @@ def get_vix_series(
     if start_date is None:
         start_date = end_date - timedelta(days=365 * 5)
 
-    fid = _resolve_feature_id(engine, VIX_FEATURE_NAME)
+    if pit is None:
+        fid = _resolve_feature_id(engine, VIX_FEATURE_NAME)
+    else:
+        fid = pit.feature_ids_by_name([VIX_FEATURE_NAME]).get(VIX_FEATURE_NAME)
     if fid is None:
         log.warning("Feature '{n}' not found in feature_registry", n=VIX_FEATURE_NAME)
         return pd.Series(dtype=float, name="VIX")
 
-    pit_df = PITStore(engine).get_pit([fid], as_of_date, vintage_policy="LATEST_AS_OF")
+    pit_df = (pit or PITStore(engine)).get_pit(
+        [fid],
+        as_of_date,
+        vintage_policy="LATEST_AS_OF",
+        start_date=start_date,
+        end_date=end_date,
+    )
     if pit_df.empty:
         return pd.Series(dtype=float, name="VIX")
 

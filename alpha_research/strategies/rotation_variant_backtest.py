@@ -30,11 +30,14 @@ Returns:
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -43,8 +46,9 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from alpha_research.data.panel_builder import build_price_panel
+from alpha_research.data.panel_builder import VIX_FEATURE_NAME, build_price_panel
 from alpha_research.strategies import adaptive_rotation as ar
+from store.pit import PITStore, PITWindowCache, PITWindowMiss
 
 
 # ── Config ─────────────────────────────────────────────────────────────
@@ -97,6 +101,162 @@ def patched_constants(config: RotationConfig):
             setattr(ar, f, v)
 
 
+# ── PIT data window (W2-7, 2026-11-06) ─────────────────────────────────
+#
+# Each rebalance calls run_rotation, which reads a 1-year price panel and a
+# 60-day VIX series. Since build_price_panel moved onto store/pit.py those
+# reads were unbounded below (every obs_date since inception, every
+# rebalance): 751 s and ~1 GB per job on gridz4 against 157 s before. The
+# backtest now reads every vintage of the window it needs once
+# (PITWindowCache) and answers all ~117 rebalances from memory, with the
+# same PIT filters and vintage pick, or loads that window from a
+# hash-receipted snapshot file (GRID_PIT_SNAPSHOT_DIR on the worker).
+
+#: Set to "0" to make every rebalance read the database again.
+PIT_CACHE_ENV = "GRID_ROTATION_PIT_CACHE"
+
+#: Price history the backtest reads before window_start (prices_full).
+PRICE_LOOKBACK_DAYS = 400
+
+
+def _local_today() -> date:
+    """Today as build_price_panel's ``as_of_date`` default computes it."""
+    return date.today()  # noqa: DTZ011 - same clock as panel_builder's default
+
+
+def rotation_pit_cache_enabled() -> bool:
+    return os.environ.get(PIT_CACHE_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def rotation_universe() -> list[str]:
+    """Every ticker run_rotation and the backtest read."""
+    tickers: set[str] = set()
+    for g in ar.ASSET_GROUPS.values():
+        tickers.update(g["tickers"])
+    tickers.update(["SPY", "QQQ"])
+    tickers.update(ar.FALLBACK_TICKERS)
+    return sorted(tickers)
+
+
+def rotation_feature_names() -> list[str]:
+    """feature_registry names behind rotation_universe() plus the VIX feature."""
+    return sorted({f"{t.lower()}_full" for t in rotation_universe()} | {VIX_FEATURE_NAME})
+
+
+def rotation_window_bounds(window_start: date, window_end: date) -> tuple[date, date]:
+    """obs_date window a backtest over [window_start, window_end] reads."""
+    return window_start - timedelta(days=PRICE_LOOKBACK_DAYS), window_end
+
+
+def load_rotation_pit_window(
+    engine: Engine,
+    window_start: date,
+    window_end: date,
+    data_as_of: date,
+    *,
+    allow_db_fallback: bool = True,
+) -> PITWindowCache:
+    """Read the backtest's whole PIT window from the database in two statements."""
+    names = rotation_feature_names()
+    found = PITStore(engine).feature_ids_by_name(names)
+    obs_start, obs_end = rotation_window_bounds(window_start, window_end)
+    return PITWindowCache.load(
+        engine,
+        list(found.values()),
+        obs_start,
+        obs_end,
+        max(data_as_of, window_end),
+        feature_names={n: found.get(n) for n in names},
+        allow_db_fallback=allow_db_fallback,
+    )
+
+
+def snapshot_covers(cache: PITWindowCache, window_start: date, window_end: date) -> bool:
+    """True when *cache* holds every read a backtest over the window makes."""
+    obs_start, obs_end = rotation_window_bounds(window_start, window_end)
+    if not set(rotation_feature_names()) <= set(cache.feature_names):
+        return False
+    if cache.start_date is not None and cache.start_date > obs_start:
+        return False
+    return cache.end_date >= obs_end and cache.max_as_of >= window_end
+
+
+def build_rotation_snapshot(
+    engine: Engine,
+    directory: str | Path,
+    window_start: date,
+    window_end: date,
+    data_as_of: date | None = None,
+    *,
+    built_by: str = "",
+) -> Path:
+    """Write a snapshot covering backtests inside [window_start, window_end].
+
+    Built once on grid-svr or gridz4 (DB-local), copied to remote workers'
+    ``GRID_PIT_SNAPSHOT_DIR``. The file name carries the content sha256.
+    """
+    as_of = data_as_of or _local_today()
+    cache = load_rotation_pit_window(engine, window_start, window_end, as_of, allow_db_fallback=False)
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    return cache.write_snapshot(directory, built_by=built_by)
+
+
+def find_rotation_snapshot(
+    directory: str | Path,
+    window_start: date,
+    window_end: date,
+    *,
+    sha256: str | None = None,
+) -> PITWindowCache | None:
+    """Newest verified snapshot in *directory* that covers the window, or None.
+
+    With *sha256* only that snapshot is considered. A file whose digest does
+    not verify is skipped with a warning, never used.
+    """
+    root = Path(directory)
+    if not root.is_dir():
+        log.warning("PIT snapshot dir {d} does not exist", d=root)
+        return None
+    pattern = f"pit-window-{sha256}.json.gz" if sha256 else "pit-window-*.json.gz"
+    best: PITWindowCache | None = None
+    for path in sorted(root.glob(pattern)):
+        cache = _read_snapshot_cached(path, sha256)
+        if cache is None or not snapshot_covers(cache, window_start, window_end):
+            continue
+        if best is None or cache.max_as_of > best.max_as_of:
+            best = cache
+    if best is None:
+        return None
+    # Per-job view: shares the (read-only) arrays, fresh read counters.
+    view = copy.copy(best)
+    view.reads = 0
+    view.db_fallbacks = 0
+    return view
+
+
+#: Parsed snapshots kept for the life of the worker process, keyed by
+#: (path, size, mtime): verified once, then reused by every job.
+_SNAPSHOT_MEMO: dict[tuple[str, int, int], PITWindowCache | None] = {}
+
+
+def _read_snapshot_cached(path: Path, sha256: str | None) -> PITWindowCache | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    if key not in _SNAPSHOT_MEMO:
+        try:
+            cache = PITWindowCache.read_snapshot(path, expected_sha256=sha256)
+            if path.name != f"pit-window-{cache.receipt['sha256']}.json.gz":
+                raise ValueError("file name does not carry its content sha256")
+            _SNAPSHOT_MEMO[key] = cache
+        except Exception as exc:  # noqa: BLE001 - a bad file is skipped, not fatal
+            log.warning("PIT snapshot {p} rejected: {e}", p=path.name, e=exc)
+            _SNAPSHOT_MEMO[key] = None
+    return _SNAPSHOT_MEMO[key]
+
+
 # ── Walk-forward backtest ──────────────────────────────────────────────
 
 def backtest_rotation_variant(
@@ -107,9 +267,21 @@ def backtest_rotation_variant(
     rebalance_every_days: int = 7,
     benchmark_ticker: str = "QQQ",
     persist: bool = True,
+    *,
+    pit: PITStore | None = None,
+    data_as_of: date | None = None,
 ) -> dict[str, Any]:
     """Walk through (window_start..window_end), call run_rotation at each rebalance,
-    track an equal-weight-by-target paper portfolio, return metrics."""
+    track an equal-weight-by-target paper portfolio, return metrics.
+
+    ``pit``: the PIT reader for every read. ``None`` loads one
+    ``PITWindowCache`` for the window from *engine* (unless
+    ``GRID_ROTATION_PIT_CACHE=0``); a snapshot-backed cache from
+    ``find_rotation_snapshot`` makes the run read no database rows at all.
+    ``data_as_of``: the vintage cutoff of the price reads; default today, or
+    the snapshot's ``max_as_of`` so a snapshot run equals the DB run made
+    the day the snapshot was built.
+    """
     config_id = config.fingerprint()
     rebalance_dates = []
     d = window_start
@@ -122,18 +294,37 @@ def backtest_rotation_variant(
     if len(rebalance_dates) < 4:
         return {"error": f"window too short: only {len(rebalance_dates)} rebalances"}
 
+    data_source: dict[str, Any] = {"mode": "db"}
+    if pit is None and rotation_pit_cache_enabled():
+        data_as_of = data_as_of or _local_today()
+        try:
+            pit = load_rotation_pit_window(engine, window_start, window_end, data_as_of)
+            data_source = {"mode": "pit_window"}
+        except Exception as exc:  # noqa: BLE001 - the uncached path still works
+            log.warning(
+                "rotation_variant_backtest: PIT window load failed, reading per rebalance: {e}",
+                e=exc,
+            )
+    elif isinstance(pit, PITWindowCache) and pit.receipt:
+        data_as_of = data_as_of or pit.max_as_of
+        data_source = {"mode": "snapshot", "pit_snapshot_sha256": pit.receipt["sha256"]}
+    elif pit is not None:
+        data_source = {"mode": "pit_window"}
+    if pit is not None:
+        data_as_of = data_as_of or _local_today()
+    if data_as_of is not None:
+        data_source["data_as_of"] = data_as_of.isoformat()
+
     # Pull the price panel ONCE for the whole window (efficient)
-    all_tickers: set[str] = set()
-    for g in ar.ASSET_GROUPS.values():
-        all_tickers.update(g["tickers"])
-    all_tickers.update(["SPY", "QQQ"])
-    all_tickers.update(ar.FALLBACK_TICKERS)
+    all_tickers = rotation_universe()
 
     prices_full = build_price_panel(
         engine,
         tickers=list(all_tickers),
-        start_date=window_start - timedelta(days=400),
+        start_date=window_start - timedelta(days=PRICE_LOOKBACK_DAYS),
         end_date=window_end,
+        as_of_date=data_as_of,
+        pit=pit,
     ).ffill(limit=5)
 
     if prices_full.empty or benchmark_ticker not in prices_full.columns:
@@ -150,7 +341,16 @@ def backtest_rotation_variant(
     with patched_constants(config):
         for i, asof in enumerate(rebalance_dates):
             try:
-                result = ar.run_rotation(engine, as_of_date=asof, positions={})
+                if pit is None and data_as_of is None:
+                    result = ar.run_rotation(engine, as_of_date=asof, positions={})
+                else:
+                    result = ar.run_rotation(
+                        engine, as_of_date=asof, positions={}, pit=pit, data_as_of=data_as_of,
+                    )
+            except PITWindowMiss:
+                # A snapshot that cannot answer a read must not silently
+                # drop rebalances: fail the job instead.
+                raise
             except Exception as exc:
                 log.warning(
                     "rotation_variant_backtest: run_rotation failed asof={asof}: {err}",
@@ -250,6 +450,10 @@ def backtest_rotation_variant(
         "avg_holding_days": avg_hold,
         "n_trades": n_trades,
     }
+    if isinstance(pit, PITWindowCache):
+        data_source["pit_reads"] = pit.reads
+        data_source["db_fallbacks"] = pit.db_fallbacks
+    metrics["data_source"] = data_source
 
     if persist:
         try:
@@ -325,10 +529,26 @@ if __name__ == "__main__":
     parser.add_argument("--ranking-weeks", type=int, default=12)
     parser.add_argument("--vix-z", type=float, default=3.0)
     parser.add_argument("--cash-floor", type=float, default=0.50)
+    parser.add_argument(
+        "--build-snapshot", metavar="DIR",
+        help="write a PIT snapshot covering --start..--end into DIR and exit",
+    )
+    parser.add_argument("--data-as-of", default=None, help="vintage cutoff for --build-snapshot (default today)")
     args = parser.parse_args()
 
     from db import get_engine
     eng = get_engine()
+    if args.build_snapshot:
+        import socket
+
+        out = build_rotation_snapshot(
+            eng, args.build_snapshot,
+            date.fromisoformat(args.start), date.fromisoformat(args.end),
+            date.fromisoformat(args.data_as_of) if args.data_as_of else None,
+            built_by=socket.gethostname(),
+        )
+        print(out)
+        raise SystemExit(0)
     cfg = RotationConfig(
         TREND_WEEKS=args.trend_weeks,
         RANKING_WEEKS=args.ranking_weeks,
