@@ -174,3 +174,95 @@ class TestOECD:
         assert puller.pull_cli("OECD")["status"] == "SKIPPED"
         assert puller.pull_mei("MEI.PRINTO01.CHN.ST.M")["status"] == "SKIPPED"
         get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# ECB — empty-window 200 responses were filed as "upstream unavailable"
+# ---------------------------------------------------------------------------
+
+ECB_MONTHLY_JSON = {
+    "dataSets": [{"series": {"0:0:0:0:0:0:0:0:0:0:0:0": {"observations": {
+        "0": [3.1], "1": [3.4], "2": [None],
+    }}}}],
+    "structure": {"dimensions": {"observation": [{"id": "TIME_PERIOD", "values": [
+        {"id": "2026-07"}, {"id": "2026-08"}, {"id": "2026-09"},
+    ]}]}},
+}
+
+
+def _ecb_resp(body: bytes | dict, status: int = 200) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status
+    if isinstance(body, dict):
+        resp.content = b"{...}"
+        resp.json.return_value = body
+    else:
+        resp.content = body
+        resp.json.side_effect = requests.exceptions.JSONDecodeError("Expecting value", "", 0)
+    if status >= 400:
+        resp.raise_for_status.side_effect = _http_error(status)
+    else:
+        resp.raise_for_status = MagicMock()
+    return resp
+
+
+class TestECB:
+    def _puller(self, monkeypatch):
+        from ingestion.international import ecb
+
+        engine, conn = _mock_engine()
+        puller = ecb.ECBPuller(engine)
+        puller._row_exists = lambda *a, **k: False
+        monkeypatch.setattr(ecb.time, "sleep", lambda s: None)
+        return ecb, puller, conn
+
+    def test_monthly_series_window_backs_off_past_publication_lag(self):
+        from ingestion.international.ecb import _series_start_period
+
+        assert _series_start_period("BSI.M.U2.Y.V.M30.X.I.U2.2300.Z01.A", "2026-10-30") == "2026-04"
+        assert _series_start_period("EXR.D.USD.EUR.SP00.A", "2026-10-30") == "2026-10"
+        assert _series_start_period("XYZ.Q.U2", "2026-02-01") == "2025-02"
+        assert _series_start_period("EXR.D.USD.EUR.SP00.A", "1999-01-01") == "1999-01"
+
+    def test_empty_200_body_is_unchanged_not_skipped(self, monkeypatch):
+        ecb, puller, conn = self._puller(monkeypatch)
+        get = MagicMock(return_value=_ecb_resp(b""))
+        monkeypatch.setattr(ecb.requests, "get", get)
+        res = puller.pull_series("BSI.M.U2.Y.V.M30.X.I.U2.2300.Z01.A", "2026-10-30")
+        assert res["status"] == "UNCHANGED"
+        assert get.call_count == 1  # no retry storm on an empty window
+        assert get.call_args.kwargs["params"]["startPeriod"] == "2026-04"
+        assert _inserts(conn) == []
+
+    def test_monthly_series_inserts_after_backoff(self, monkeypatch):
+        ecb, puller, conn = self._puller(monkeypatch)
+        monkeypatch.setattr(ecb.requests, "get", MagicMock(return_value=_ecb_resp(ECB_MONTHLY_JSON)))
+        res = puller.pull_series("BSI.M.U2.Y.V.M30.X.I.U2.2300.Z01.A", "2026-10-30")
+        assert res["status"] == "SUCCESS" and res["rows_inserted"] == 2
+        assert [(p["sid"], p["od"], p["val"]) for p in _inserts(conn)] == [
+            ("ecb_m3_yoy", date(2026, 7, 1), 3.1), ("ecb_m3_yoy", date(2026, 8, 1), 3.4),
+        ]
+
+    def test_404_no_results_is_unchanged(self, monkeypatch):
+        ecb, puller, _conn = self._puller(monkeypatch)
+        monkeypatch.setattr(ecb.requests, "get", MagicMock(return_value=_ecb_resp(b"No results found", 404)))
+        assert puller.pull_series("EXR.D.USD.EUR.SP00.A", "2026-11-01")["status"] == "UNCHANGED"
+
+    def test_4xx_is_not_retried(self, monkeypatch):
+        ecb, puller, _conn = self._puller(monkeypatch)
+        get = MagicMock(return_value=_ecb_resp(b"bad key", 400))
+        monkeypatch.setattr(ecb.requests, "get", get)
+        res = puller.pull_series("EXR.D.USD.EUR.SP00.A", "2026-11-01")
+        assert get.call_count == 1
+        assert res["status"] == "SKIPPED"  # existing soft-skip policy for HTTP errors
+
+    def test_pull_all_counts_unchanged_as_checked(self, monkeypatch):
+        from ingestion.smart_scheduler import _classify_outcome
+
+        ecb, puller, _conn = self._puller(monkeypatch)
+        monkeypatch.setattr(ecb.requests, "get", MagicMock(return_value=_ecb_resp(b"")))
+        puller._compute_btp_bund_spread = lambda: {"rows_inserted": 0, "status": "SUCCESS", "errors": []}
+        out = puller.pull_all("2026-10-30")
+        assert out["succeeded"] == out["total"]
+        outcome, rows, _note = _classify_outcome(out)
+        assert outcome == "NO_NEW_DATA" and rows == 0

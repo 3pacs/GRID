@@ -17,7 +17,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
-from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 # ECB SDW series mapping: SDMX flow_ref -> canonical feature name
 ECB_SERIES_LIST: dict[str, str] = {
@@ -39,6 +39,46 @@ _ECB_BASE_URL = "https://data-api.ecb.europa.eu/service/data"
 # Rate limit: 1 request per second
 _RATE_LIMIT_DELAY: float = 1.0
 
+#: Months to back the request window off by, per SDMX frequency code.
+#:
+#: 2026-11-06 root cause: the scheduler's incremental start date is the
+#: source-wide MAX(obs_date) minus 30 days. The daily EXR series keeps that
+#: max at "last week", so every monthly series (BSI, GFS, IRS: published one
+#: to two months after the period) was requested with a window that holds no
+#: published period yet. The ECB API answers such a window with HTTP 200 and
+#: an EMPTY body; ``resp.json()`` raised JSONDecodeError (a requests
+#: RequestException), tenacity retried it three times, and the puller then
+#: filed it as "upstream unavailable" -> SKIPPED. Five of six series were
+#: skipped on every incremental run and the run was reported PARTIAL
+#: (hermes "Failed sources" list).
+_FREQ_LOOKBACK_MONTHS: dict[str, int] = {"D": 0, "B": 0, "W": 1, "M": 6, "Q": 12, "S": 18, "A": 24}
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transport errors and 429/5xx only (never 4xx or decode errors)."""
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else 0
+        return status == 429 or status >= 500
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
+
+def _series_start_period(flow_ref: str, start_date: str | date) -> str:
+    """SDMX ``startPeriod`` for one series, backed off by its frequency's lag."""
+    s = str(start_date)
+    if len(s) < 7:
+        return s
+    try:
+        year, month = int(s[:4]), int(s[5:7])
+    except ValueError:
+        return s[:7]
+    parts = flow_ref.split(".")
+    freq = parts[1] if len(parts) > 1 else ""
+    month -= _FREQ_LOOKBACK_MONTHS.get(freq, 0)
+    while month < 1:
+        month += 12
+        year -= 1
+    return f"{year:04d}-{month:02d}"
+
 
 class ECBPuller(BasePuller):
     """Pulls Euro area time series from the ECB Statistical Data Warehouse.
@@ -55,9 +95,18 @@ class ECBPuller(BasePuller):
         super().__init__(db_engine)
         log.info("ECBPuller initialised — source_id={sid}", sid=self.source_id)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
     def _fetch_sdmx_json(self, flow_ref: str, start_period: str, end_period: str | None) -> dict:
-        """Fetch SDMX-JSON data from ECB SDW with retry logic."""
+        """Fetch SDMX-JSON data from the ECB Data Portal API.
+
+        Returns ``{}`` when the window holds no observations: the API answers
+        that with HTTP 200 and an empty body (or 404 "No results found").
+        """
         # Split flow_ref into dataset key components
         parts = flow_ref.split(".")
         dataset = parts[0]
@@ -74,7 +123,11 @@ class ECBPuller(BasePuller):
 
         headers = {"Accept": "application/json"}
         resp = requests.get(url, params=params, headers=headers, timeout=30)
+        if resp.status_code == 404:
+            return {}
         resp.raise_for_status()
+        if not (resp.content or b"").strip():
+            return {}
         return resp.json()
 
     @staticmethod
@@ -198,10 +251,18 @@ class ECBPuller(BasePuller):
         }
 
         try:
-            start_str = str(start_date)[:7] if len(str(start_date)) > 7 else str(start_date)
+            start_str = _series_start_period(flow_ref, start_date)
             end_str = str(end_date)[:7] if end_date else None
 
             data = self._fetch_sdmx_json(flow_ref, start_str, end_str)
+            if data == {}:
+                log.info(
+                    "ECB {fr}: no observations since {sp} (not yet published)",
+                    fr=flow_ref, sp=start_str,
+                )
+                result["status"] = "UNCHANGED"
+                time.sleep(_RATE_LIMIT_DELAY)
+                return result
             observations = self._parse_sdmx_observations(data)
 
             if not observations:
@@ -343,7 +404,8 @@ class ECBPuller(BasePuller):
         results.append(spread_result)
 
         total_rows = sum(r["rows_inserted"] for r in results)
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        # UNCHANGED = checked, nothing published in the window (not a failure).
+        succeeded = sum(1 for r in results if r["status"] in ("SUCCESS", "UNCHANGED"))
         log.info(
             "ECB bulk pull complete — {ok}/{total} succeeded, {rows} total rows",
             ok=succeeded, total=len(results), rows=total_rows,
