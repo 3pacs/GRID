@@ -46,6 +46,26 @@ def test_generator_reports_evidence_and_persistence_failure(monkeypatch, availab
     assert gen.main() == expected
 
 
+@pytest.mark.parametrize("field,value", [
+    ("market_overlay_snapshot", json.dumps({"prices": PRICES})),
+    ("mystical_feature_payload", "{}"),
+    ("grid_feature_payload", json.dumps({"thesis": "neutral"})),
+    ("target_symbols", json.dumps(["BTC"])),
+    ("target_symbols", "BTC"),
+])
+def test_save_prediction_rejects_pre_serialized_json_before_writing(field, value):
+    # This original persistence safeguard still applies to the new producer.
+    engine = MagicMock()
+    store = AstroGridStore(engine)
+    store.ensure_lens_set = MagicMock()
+    store.save_snapshot = MagicMock()
+    with pytest.raises(TypeError, match=field):
+        store.save_prediction({"prediction_id": "synthetic", "target_symbols": ["BTC"], field: value})
+    engine.begin.assert_not_called()
+    store.ensure_lens_set.assert_not_called()
+    store.save_snapshot.assert_not_called()
+
+
 # --- Read-side normalizer for the legacy rows (42,488 grid-crypto-v1 rows on
 # grid-svr written 2026-03-29..2026-11-05). Stored bytes stay untouched, and
 # only grid-crypto-v1 rows created before LEGACY_CRYPTO_PAYLOAD_CUTOFF decode.
