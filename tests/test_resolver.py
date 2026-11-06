@@ -2092,3 +2092,89 @@ class TestAdaptiveChunkNarrowing:
         assert _is_statement_timeout(Exception("(psycopg2.errors.QueryCanceled)"))
         assert not _is_statement_timeout(ValueError("column does not exist"))
         assert not _is_statement_timeout(Exception("connection refused"))
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — one candidate per vintage (2026-10-27 sp500_full gap, S9a)
+# ---------------------------------------------------------------------------
+
+
+class TestPerVintageResolution:
+    """A window holding several pull-date vintages of one (series, obs_date)
+    must resolve each vintage, not collapse them into one arbitrary winner.
+
+    Production 2026-10-28: a wide catch-up window held the 10-27 intraday
+    yfinance rows (vintage 10-27, already resolved) and the POLICY_ELIGIBLE
+    10-27 close pulled 10-28 13:31Z (vintage 10-28). The resolver picked
+    one equal-priority row; when it was a 10-27 row the insert hit ON
+    CONFLICT DO NOTHING and the 7722.60 close was never materialized.
+    """
+
+    @staticmethod
+    def _inserted(write_conn) -> list[dict]:
+        out: list[dict] = []
+        for call in write_conn.execute.call_args_list:
+            if "INSERT" in str(call[0][0]).upper():
+                out.extend(call[0][1])
+        return out
+
+    @patch("normalization.resolver.EntityMap")
+    def test_later_vintage_is_not_dropped_by_an_earlier_one(self, MockEntityMap):
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 686
+        MockEntityMap.return_value = mock_map
+        utc = timezone.utc
+        sid, od = "YF:^GSPC:close", date(2026, 10, 27)
+        # Same source/priority; the earlier vintage is listed first, which is
+        # the order that used to win the priority-only sort.
+        pending = [
+            FakeRow((sid, od, 7701.57, 2, datetime(2026, 10, 27, 13, 31, tzinfo=utc), 1, "yfinance")),
+            FakeRow((sid, od, 7722.60, 2, datetime(2026, 10, 27, 22, 2, tzinfo=utc), 1, "yfinance")),
+            FakeRow((sid, od, 7722.60, 2, datetime(2026, 10, 28, 13, 31, tzinfo=utc), 1, "yfinance")),
+        ]
+        engine, write_conn = _mock_engine(pending_rows=pending, feature_families=[(686, "equity")])
+
+        Resolver(db_engine=engine).resolve_pending()
+
+        rows = {r["vd"]: r for r in self._inserted(write_conn)}
+        assert set(rows) == {date(2026, 10, 27), date(2026, 10, 28)}
+        assert rows[date(2026, 10, 28)]["val"] == 7722.60
+        assert rows[date(2026, 10, 28)]["rd"] == date(2026, 10, 28)
+        assert all(r["od"] == od and r["fid"] == 686 for r in rows.values())
+
+    @patch("normalization.resolver.EntityMap")
+    def test_equal_priority_tie_within_a_vintage_takes_latest_pull(self, MockEntityMap):
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 686
+        MockEntityMap.return_value = mock_map
+        utc = timezone.utc
+        sid, od = "YF:^GSPC:close", date(2026, 10, 28)
+        pending = [
+            FakeRow((sid, od, 7741.57, 2, datetime(2026, 10, 28, 13, 31, tzinfo=utc), 1, "yfinance")),
+            FakeRow((sid, od, 7744.36, 2, datetime(2026, 10, 28, 20, 1, tzinfo=utc), 1, "yfinance")),
+            FakeRow((sid, od, 7740.53, 2, datetime(2026, 10, 28, 16, 2, tzinfo=utc), 1, "yfinance")),
+        ]
+        engine, write_conn = _mock_engine(pending_rows=pending, feature_families=[(686, "equity")])
+
+        Resolver(db_engine=engine).resolve_pending()
+
+        rows = self._inserted(write_conn)
+        assert len(rows) == 1
+        assert rows[0]["val"] == 7744.36
+
+    @patch("normalization.resolver.EntityMap")
+    def test_priority_still_beats_recency_within_a_vintage(self, MockEntityMap):
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 10
+        MockEntityMap.return_value = mock_map
+        pending = [
+            FakeRow(("CPI", date(2026, 3, 1), 101.0, "s2", datetime(2026, 3, 5, 18, 0, tzinfo=timezone.utc), 2, "FRED")),
+            FakeRow(("CPI", date(2026, 3, 1), 100.0, "s1", datetime(2026, 3, 5, 9, 0, tzinfo=timezone.utc), 1, "BLS")),
+        ]
+        engine, write_conn = _mock_engine(pending_rows=pending, feature_families=[(10, "")])
+
+        summary = Resolver(db_engine=engine).resolve_pending()
+
+        rows = self._inserted(write_conn)
+        assert len(rows) == 1 and rows[0]["val"] == 100.0 and rows[0]["src"] == "s1"
+        assert summary["conflicts_found"] == 1

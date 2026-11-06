@@ -33,6 +33,7 @@ DB shape must never break the prediction write path. Defaults are:
 
 from __future__ import annotations
 
+import math
 from dataclasses import is_dataclass, asdict
 from datetime import date, timedelta
 from typing import Any, Iterable, Mapping
@@ -314,6 +315,46 @@ def fetch_fci_regime(engine: Engine, as_of: date) -> str:
 
 
 # ── Signal contribution extraction ───────────────────────────────────────────
+
+# Stamped next to ``signal_contributions`` on rows written by the summed,
+# normalized aggregation below (2026-11-06). Rows without this key were written
+# by the earlier ``{s.name: s.weight}`` comprehension, which kept only the last
+# weight when several signals shared a name and stored unnormalized weights.
+SIGNAL_CONTRIBUTIONS_BASIS = "signal_weight_share_v2"
+
+
+def aggregate_signal_weights(signals: Iterable[Any]) -> dict[str, float]:
+    """Return ``{signal_name: share}`` for one prediction's signals.
+
+    Weights of signals that share a name are summed (the oracle routinely emits
+    several ``sector_network`` or ``feature:equity`` items per prediction), and
+    the result is normalized to sum to 1.0, which is the shape
+    ``features.per_signal_brier.record_scored_prediction`` documents.
+    Non-finite, non-positive and unnamed entries are dropped. Accepts
+    ``Signal`` dataclasses or dicts with ``name``/``weight``. Returns ``{}``
+    when nothing usable remains.
+    """
+    totals: dict[str, float] = {}
+    for sig in signals or ():
+        if isinstance(sig, Mapping):
+            name, weight = sig.get("name"), sig.get("weight")
+        else:
+            name, weight = getattr(sig, "name", None), getattr(sig, "weight", None)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(w) or w <= 0:
+            continue
+        key = name.strip()
+        totals[key] = totals.get(key, 0.0) + w
+    total = sum(totals.values())
+    if total <= 0:
+        return {}
+    return {k: v / total for k, v in totals.items()}
+
 
 def extract_signal_contributions(
     *,

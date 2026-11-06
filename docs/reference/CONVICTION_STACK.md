@@ -37,7 +37,20 @@ oracle doesn't yet write Shapley contributions), confidence_bucket=3,
 signal_cooccurrence=410, regime_brier=0 (blocked on oracle enrichment), meta_learning=0
 (same block).
 
-**Known gap:** `oracle/engine.py` write path doesn't populate
-`signals.{regime,fci_regime,vix_level,signal_contributions}` JSONB keys, which blocks the
-per-signal / per-regime / meta-learning calibrators from learning anything beyond the
-aggregate.
+**Status (checked 2026-11-06, superseding the old "known gap"):** since 2026-04-14
+(`923c019f`) `OracleEngine._store_predictions` writes
+`signals.{regime,fci_regime,vix_level,signal_contributions}` on every row. Production:
+100% of rows written 10-21 → 11-02 carry a non-empty `signal_contributions`, as do
+2,283,710 of 2,314,508 scored rows. Two real defects remained:
+
+- **Lossy contributions (fixed 2026-11-06).** The dict was `{s.name: s.weight}`, so ten
+  `sector_network` items collapsed to the last weight, and values were not normalized.
+  New rows now sum duplicate names and normalize to 1.0
+  (`oracle.prediction_context.aggregate_signal_weights`), stamped
+  `signals.signal_contributions_basis = "signal_weight_share_v2"`. Stored rows are not
+  rewritten. Readers (`bootstrap_per_signal_brier`, `regime_conditional_brier`)
+  already renormalize, so old rows stay readable.
+- **No live consumer (open).** `features.per_signal_brier.record_scored_prediction` is
+  called only by `scripts/bootstrap_per_signal_brier.py`. `per_signal_brier_history`
+  was last updated 2026-05-16 (183 rows). The calibrators stay frozen until the scorer
+  (`score_expired_predictions`) or a scheduled replay feeds them.

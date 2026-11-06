@@ -123,3 +123,93 @@ def test_redact_reason_unterminated_quote():
     assert "hunter2" not in redact_reason('bad login password="hunter2')
     assert "hunter2 and more" not in redact_reason("cfg {'api_key': 'hunter2 and more")
     assert redact_reason('password="x" ok').endswith(" ok")
+
+
+# ── check_sky_snapshot_freshness (issue #500) ────────────────────────────────
+
+
+class _SkyConn:
+    def __init__(self, *, exists: bool, row, raise_on_select: bool = False) -> None:
+        self.exists, self.row, self.raise_on_select = exists, row, raise_on_select
+        self.params: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, query, params=None):
+        from unittest.mock import MagicMock
+
+        sql = str(query)
+        self.params.append((sql, params))
+        res = MagicMock()
+        if "to_regclass" in sql:
+            res.scalar.return_value = self.exists
+        elif "FROM astrogrid.sky_snapshot" in sql:
+            if self.raise_on_select:
+                raise RuntimeError("statement timeout")
+            res.fetchone.return_value = self.row
+        return res
+
+
+class _SkyEngine:
+    def __init__(self, conn: _SkyConn) -> None:
+        self.conn = conn
+
+    def connect(self):
+        return self.conn
+
+
+def test_sky_snapshot_present_today() -> None:
+    from datetime import date, datetime, timezone
+
+    created = datetime(2026, 11, 6, 0, 4, tzinfo=timezone.utc)
+    conn = _SkyConn(exists=True, row=(date(2026, 11, 6), created))
+    out = hermes_health.check_sky_snapshot_freshness(
+        _SkyEngine(conn), now=datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+    )
+    assert out["checked"] is True and out["present_today"] is True and out["due"] is True
+    assert out["latest_snapshot_date"] == "2026-11-06"
+    # Bound parameter, no lookahead past today's UTC date.
+    select = [p for s, p in conn.params if "FROM astrogrid.sky_snapshot" in s]
+    assert select == [{"today": date(2026, 11, 6)}]
+
+
+def test_sky_snapshot_missing_today_after_due_hour() -> None:
+    from datetime import date, datetime, timezone
+
+    conn = _SkyConn(exists=True, row=(date(2026, 11, 5), datetime(2026, 11, 5, 0, 4, tzinfo=timezone.utc)))
+    out = hermes_health.check_sky_snapshot_freshness(
+        _SkyEngine(conn), now=datetime(2026, 11, 6, 2, 0, tzinfo=timezone.utc)
+    )
+    assert out["checked"] is True and out["present_today"] is False and out["due"] is True
+    assert out["latest_snapshot_date"] == "2026-11-05"
+
+
+def test_sky_snapshot_not_due_before_0200z() -> None:
+    from datetime import datetime, timezone
+
+    conn = _SkyConn(exists=True, row=None)
+    out = hermes_health.check_sky_snapshot_freshness(
+        _SkyEngine(conn), now=datetime(2026, 11, 6, 1, 59, tzinfo=timezone.utc)
+    )
+    assert out["due"] is False and out["present_today"] is False
+
+
+def test_sky_snapshot_relation_missing_or_error_is_unchecked() -> None:
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+    out = hermes_health.check_sky_snapshot_freshness(_SkyEngine(_SkyConn(exists=False, row=None)), now=now)
+    assert out["checked"] is False and out["error"] == "relation missing"
+    out = hermes_health.check_sky_snapshot_freshness(
+        _SkyEngine(_SkyConn(exists=True, row=None, raise_on_select=True)), now=now
+    )
+    assert out["checked"] is False and "timeout" in out["error"]
+
+
+def test_check_system_health_carries_sky_snapshot_block() -> None:
+    src = inspect.getsource(hermes_health.check_system_health)
+    assert '"astrogrid": {"sky_snapshot": check_sky_snapshot_freshness(engine)}' in src
