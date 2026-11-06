@@ -25,9 +25,13 @@ is *not* on the original CAT catalog.  Specific edges it unlocks:
 
 Data strategy
 =============
-* **Primary**: bulk CSV download from
-  ``https://www.jodidata.org/oil/database/data-downloads.aspx``.  Free, no
-  API key required.  Format documented in the JODI Oil Data Manual.
+* **Primary**: the full-history "world primary" bulk zip
+  (``world_primary_csv.zip`` -> ``NewProcedure_Primary_CSV.csv``, crude oil
+  and other primary products, 2002 to date), streamed to a spooled temp file
+  and parsed row by row so the ~290 MB CSV is never held in memory.  Refined
+  products come from the current-year ``secondaryyear<YYYY>.csv`` file.  If
+  the zip fails, the current-year ``primaryyear<YYYY>.csv`` is used instead.
+  Free, no API key required.  Format documented in the JODI Oil Data Manual.
 * **Backup**: SDMX-JSON endpoint ``https://www.jodidata.org/api/sdmx/data/JODI,OIL``
   used if the CSV path fails (the bulk download URL occasionally changes
   between releases, and the SDMX endpoint is more stable).
@@ -42,9 +46,11 @@ from __future__ import annotations
 
 import csv
 import io
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Iterable
+from typing import IO, Any, Iterable
 
 import requests
 from loguru import logger as log
@@ -135,6 +141,21 @@ def jodi_csv_urls(today: date | None = None) -> list[str]:
             f"{JODI_DOWNLOAD_BASE}/secondary/{y - 1}.csv",
         ]
     return urls
+
+#: 2026-11-06: full-history "world primary" bundle (23.6 MB zip containing
+#: ``NewProcedure_Primary_CSV.csv``, ~290 MB uncompressed, same columns and
+#: codes as the per-year files).  This is now the primary crude-oil path; the
+#: per-year primary file is the fallback when the zip fails.
+JODI_PRIMARY_ZIP_URL: str = (
+    "https://www.jodidata.org/_resources/files/downloads/oil-data/world_primary_csv.zip"
+)
+#: Member we expect inside the zip; any single ``.csv`` member is accepted if
+#: JODI renames it.
+JODI_PRIMARY_ZIP_MEMBER: str = "NewProcedure_Primary_CSV.csv"
+#: Download guard (bytes) — the zip is ~24 MB; refuse anything absurd.
+_ZIP_MAX_DOWNLOAD_BYTES: int = 200 * 1024 * 1024
+#: Keep up to this many bytes of the download in memory, spill the rest to disk.
+_ZIP_SPOOL_MEMORY_BYTES: int = 8 * 1024 * 1024
 
 #: SDMX-JSON endpoint — used as the resilient fallback.
 JODI_SDMX_URL: str = "https://www.jodidata.org/api/sdmx/data/JODI,OIL"
@@ -333,9 +354,33 @@ def _parse_jodi_csv(csv_text: str) -> list[JODIObservation]:
     """
     if not csv_text or not csv_text.strip():
         return []
+    return _parse_jodi_lines(io.StringIO(csv_text))
 
+
+def _parse_jodi_zip(fileobj: IO[bytes]) -> list[JODIObservation]:
+    """Parse the JODI "world primary" zip, streaming the CSV member row by row.
+
+    The member is never decompressed into memory as a whole; only tracked
+    observations are kept.  Raises ``zipfile.BadZipFile`` / ``ValueError`` on
+    a payload that is not a JODI zip so the caller can fall back.
+    """
+    with zipfile.ZipFile(fileobj) as zf:
+        names = zf.namelist()
+        member = JODI_PRIMARY_ZIP_MEMBER if JODI_PRIMARY_ZIP_MEMBER in names else None
+        if member is None:
+            csvs = [n for n in names if n.lower().endswith(".csv")]
+            if len(csvs) != 1:
+                raise ValueError(f"JODI zip: expected one CSV member, got {names[:5]}")
+            member = csvs[0]
+        with zf.open(member) as raw:
+            text_stream = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+            return _parse_jodi_lines(text_stream)
+
+
+def _parse_jodi_lines(lines: Iterable[str]) -> list[JODIObservation]:
+    """Shared row parser for an iterable of CSV text lines (string or stream)."""
     try:
-        reader = csv.DictReader(io.StringIO(csv_text))
+        reader = csv.DictReader(lines)
         cols = _resolve_columns(reader.fieldnames)
     except (csv.Error, ValueError) as exc:
         log.warning("JODI CSV header parse failed: {e}", e=str(exc))
@@ -370,7 +415,6 @@ def _parse_jodi_csv(csv_text: str) -> list[JODIObservation]:
             if value is None:
                 continue
 
-            unit = (row.get(cols["unit"]) or "").strip().upper()
             assessment = (
                 (row.get(cols["assessment"]) or "").strip()
                 if "assessment" in cols
@@ -554,6 +598,44 @@ class JODIOilPuller(BasePuller):
             ConnectionError, TimeoutError, OSError, requests.RequestException,
         ),
     )
+    def _fetch_primary_zip(self) -> IO[bytes]:
+        """Stream the world-primary zip into a spooled temp file (rewound).
+
+        Memory stays bounded: at most ``_ZIP_SPOOL_MEMORY_BYTES`` in RAM, the
+        remainder on disk.  Raises on HTTP error or an oversize download.
+        """
+        resp = requests.get(
+            JODI_PRIMARY_ZIP_URL,
+            timeout=_REQUEST_TIMEOUT,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/zip,*/*"},
+            stream=True,
+        )
+        try:
+            resp.raise_for_status()
+            buf = tempfile.SpooledTemporaryFile(max_size=_ZIP_SPOOL_MEMORY_BYTES)
+            total = 0
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > _ZIP_MAX_DOWNLOAD_BYTES:
+                    buf.close()
+                    raise ValueError(
+                        f"JODI zip exceeds {_ZIP_MAX_DOWNLOAD_BYTES} bytes; refusing"
+                    )
+                buf.write(chunk)
+            buf.seek(0)
+            return buf
+        finally:
+            resp.close()
+
+    @retry_on_failure(
+        max_attempts=3,
+        backoff=2.0,
+        retryable_exceptions=(
+            ConnectionError, TimeoutError, OSError, requests.RequestException,
+        ),
+    )
     def _fetch_sdmx(self) -> dict[str, Any]:
         """GET the SDMX-JSON endpoint.  Raises on HTTP error."""
         resp = requests.get(
@@ -577,16 +659,35 @@ class JODIOilPuller(BasePuller):
         Returns an empty list if both upstream sources fail.  The chosen
         source is recorded on ``self._last_source_used``.
         """
-        # ---- CSV (per-year files) ----
+        # ---- Primary: full-history world zip (crude & primary products) ----
         csv_obs: list[JODIObservation] = []
         csv_errors: list[str] = []
+        zip_ok = False
+        try:
+            buf = self._fetch_primary_zip()
+            try:
+                zip_obs = _parse_jodi_zip(buf)
+            finally:
+                buf.close()
+            if zip_obs:
+                csv_obs.extend(zip_obs)
+                zip_ok = True
+                log.info("JODI zip: {n} primary observations parsed", n=len(zip_obs))
+            else:
+                csv_errors.append("world_primary_csv.zip: 0 tracked observations")
+        except Exception as exc:
+            csv_errors.append(f"world_primary_csv.zip: {exc}")
+
+        # ---- CSV (per-year files): secondary always, primary only as fallback ----
         for url in jodi_csv_urls():
+            if zip_ok and "/primary/" in url:
+                continue
             try:
                 csv_obs.extend(_parse_jodi_csv(self._fetch_csv(url)))
             except Exception as exc:
                 csv_errors.append(f"{url.rsplit('/', 2)[-2]}/{url.rsplit('/', 1)[-1]}: {exc}")
         if csv_obs:
-            self._last_source_used = "csv"
+            self._last_source_used = "zip" if zip_ok else "csv"
             if csv_errors:
                 log.warning("JODI CSV: some files failed: {e}", e="; ".join(csv_errors)[:300])
             log.info("JODI CSV: {n} observations parsed", n=len(csv_obs))
@@ -687,7 +788,7 @@ def run_jodi_oil_puller(engine: Engine) -> dict[str, Any]:
         {
             "fetched": 12345,
             "inserted": 678,
-            "source": "csv" | "sdmx" | "none",
+            "source": "zip" | "csv" | "sdmx" | "none",
             "countries_seen": ["SAU", "RUS", ...],
             "observations_by_flow": {"PRODUCTION": 4321, ...},
         }

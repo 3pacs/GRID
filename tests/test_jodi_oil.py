@@ -309,12 +309,23 @@ class TestParseSDMX:
 
 
 
+import ingestion.altdata.jodi_oil as _jodi_mod_for_zip
+
+_REAL_FETCH_ZIP = _jodi_mod_for_zip.JODIOilPuller._fetch_primary_zip
+
+
 @pytest.fixture(autouse=True)
 def _single_csv_file(monkeypatch):
     """Pin the per-year file list to one URL so request counts are date-independent."""
     import ingestion.altdata.jodi_oil as jodi_mod
 
     monkeypatch.setattr(jodi_mod, "jodi_csv_urls", lambda today=None: [JODI_CSV_URL])
+    # The legacy CSV/SDMX tests exercise the per-year fallback, so the
+    # world-zip primary is disabled here; TestWorldPrimaryZip re-enables it.
+    def _zip_unavailable(self):
+        raise ConnectionError("zip disabled for per-year CSV tests")
+
+    monkeypatch.setattr(jodi_mod.JODIOilPuller, "_fetch_primary_zip", _zip_unavailable)
 
 # ---------------------------------------------------------------------------
 # run_jodi_oil_puller — top-level entry point
@@ -439,3 +450,134 @@ class TestIdempotentRerun:
         assert result["fetched"] == 3
         # All 3 observations are for 2026-01, all marked as already-existing
         assert result["inserted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# World-primary zip (2026-11-06 primary path)
+# ---------------------------------------------------------------------------
+
+import io as _io
+import zipfile as _zipfile
+
+# Same layout as the live NewProcedure_Primary_CSV.csv: ISO-2 areas, current
+# flow codes, every observation repeated in five units.
+_ZIP_CSV = (
+    "REF_AREA,TIME_PERIOD,ENERGY_PRODUCT,FLOW_BREAKDOWN,UNIT_MEASURE,OBS_VALUE,ASSESSMENT_CODE\n"
+    "SA,2026-08,CRUDEOIL,INDPROD,KBD,9800.0000,1\n"
+    "SA,2026-08,CRUDEOIL,INDPROD,KBBL,303800.0000,1\n"
+    "SA,2026-08,CRUDEOIL,INDPROD,KTONS,41000.0000,1\n"
+    "SA,2026-08,CRUDEOIL,CLOSTLV,KBBL,145000.0000,2\n"
+    "SA,2026-08,CRUDEOIL,CLOSTLV,KBD,x,2\n"
+    "RU,2026-08,CRUDEOIL,TOTEXPSB,KBD,4700.0000,2\n"
+    "RU,2026-08,CRUDEOIL,DIRECUSE,KBD,N/A,3\n"
+    "FR,2026-08,CRUDEOIL,INDPROD,KBD,10.0000,1\n"
+)
+
+
+def _zip_bytes(csv_text: str = _ZIP_CSV, member: str = "NewProcedure_Primary_CSV.csv") -> bytes:
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(member, csv_text)
+    return buf.getvalue()
+
+
+def _resp_for(url, zip_payload: bytes, csv_text: str):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    if url.endswith(".zip"):
+        data = zip_payload
+        resp.iter_content = lambda chunk_size=1: (
+            data[i:i + chunk_size] for i in range(0, len(data), chunk_size)
+        )
+    else:
+        resp.text = csv_text
+    return resp
+
+
+class TestWorldPrimaryZip:
+    @pytest.fixture(autouse=True)
+    def _enable_zip(self, monkeypatch):
+        import ingestion.altdata.jodi_oil as jodi_mod
+
+        # Undo the module-level zip stub; restore the real fetcher.
+        monkeypatch.setattr(jodi_mod.JODIOilPuller, "_fetch_primary_zip", _REAL_FETCH_ZIP)
+        primary = "https://example.invalid/annual-csv/primary/primaryyear2026.csv"
+        secondary = "https://example.invalid/annual-csv/secondary/secondaryyear2026.csv"
+        monkeypatch.setattr(jodi_mod, "jodi_csv_urls", lambda today=None: [primary, secondary])
+        self.primary, self.secondary = primary, secondary
+
+    def test_parse_zip_streams_and_normalises(self):
+        from ingestion.altdata.jodi_oil import _parse_jodi_zip
+
+        obs = {(o.country, o.product, o.flow, o.unit): o for o in _parse_jodi_zip(_io.BytesIO(_zip_bytes()))}
+        assert set(obs) == {
+            ("SAU", "CRUDEOIL", "PRODUCTION", "KBD"),
+            ("SAU", "CRUDEOIL", "CLOSSTLV", "KBBL"),
+            ("RUS", "CRUDEOIL", "EXPORTS", "KBD"),
+        }
+        assert obs[("SAU", "CRUDEOIL", "PRODUCTION", "KBD")].value == 9800.0
+        assert obs[("SAU", "CRUDEOIL", "CLOSSTLV", "KBBL")].month_end == date(2026, 8, 1)
+
+    def test_parse_zip_accepts_renamed_single_member(self):
+        from ingestion.altdata.jodi_oil import _parse_jodi_zip
+
+        assert len(_parse_jodi_zip(_io.BytesIO(_zip_bytes(member="Primary_2026.csv")))) == 3
+
+    def test_parse_zip_rejects_non_zip(self):
+        from ingestion.altdata.jodi_oil import _parse_jodi_zip
+
+        with pytest.raises(_zipfile.BadZipFile):
+            _parse_jodi_zip(_io.BytesIO(b"<html>404</html>"))
+
+    def test_pull_uses_zip_and_skips_per_year_primary(self):
+        engine, conn = _mock_engine(source_id=7)
+        calls: list[str] = []
+        secondary_csv = (
+            "REF_AREA,TIME_PERIOD,ENERGY_PRODUCT,FLOW_BREAKDOWN,UNIT_MEASURE,OBS_VALUE,ASSESSMENT_CODE\n"
+            "US,2026-08,GASOLINE,TOTIMPSB,KBD,650,1\n"
+        )
+        zip_payload = _zip_bytes()
+
+        def fake_get(url, *args, **kwargs):
+            calls.append(url)
+            return _resp_for(url, zip_payload, secondary_csv)
+
+        with patch("ingestion.altdata.jodi_oil.requests.get", side_effect=fake_get):
+            result = run_jodi_oil_puller(engine)
+
+        assert result["source"] == "zip"
+        assert result["fetched"] == 4
+        assert result["inserted"] == 4
+        assert calls[0].endswith("world_primary_csv.zip")
+        assert self.secondary in calls
+        assert self.primary not in calls  # zip covered primary products
+
+    def test_zip_failure_falls_back_to_per_year_primary(self):
+        engine, conn = _mock_engine(source_id=7)
+        calls: list[str] = []
+
+        def fake_get(url, *args, **kwargs):
+            calls.append(url)
+            if url.endswith(".zip"):
+                raise ConnectionError("zip unreachable")
+            return _resp_for(url, b"", _HAPPY_CSV)
+
+        with patch("ingestion.altdata.jodi_oil.requests.get", side_effect=fake_get), \
+                patch("ingestion.base.time.sleep", lambda *_: None):
+            result = run_jodi_oil_puller(engine)
+
+        assert result["source"] == "csv"
+        assert self.primary in calls and self.secondary in calls
+        assert result["fetched"] == 6  # _HAPPY_CSV served for both per-year files
+
+    def test_zip_download_size_guard(self, monkeypatch):
+        import ingestion.altdata.jodi_oil as jodi_mod
+
+        monkeypatch.setattr(jodi_mod, "_ZIP_MAX_DOWNLOAD_BYTES", 10)
+        engine, _ = _mock_engine(source_id=7)
+        puller = jodi_mod.JODIOilPuller(engine)
+        resp = _resp_for("x.zip", b"0123456789ABCDEF", "")
+        with patch("ingestion.altdata.jodi_oil.requests.get", return_value=resp), \
+                patch("ingestion.base.time.sleep", lambda *_: None):
+            with pytest.raises(ValueError):
+                puller._fetch_primary_zip()
