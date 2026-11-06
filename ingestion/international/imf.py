@@ -1,10 +1,13 @@
 """
 GRID IMF IFS and WEO ingestion module.
 
-WEO indicators come from the IMF DataMapper JSON API (annual actuals and
-projections; future years are not stored). The former IFS series come from
-the IMF SDMX 3.0 data API (api.imf.org), which replaced IFS with topical
-dataflows: quarterly national accounts (QNEA) and balance of payments (BOP).
+Everything comes from the IMF SDMX 3.0 data API (api.imf.org):
+
+* WEO indicators from the IMF.RES/WEO dataflow (annual actuals and
+  projections; future years are not stored). Until 2026-11-06 these came
+  from the DataMapper JSON API, which now answers 403 behind Akamai.
+* The former IFS series from the IMF.STA topical dataflows that replaced
+  IFS: quarterly national accounts (QNEA) and balance of payments (BOP).
 
 2026-11-04: the imfdatapy client this module used targeted the retired
 dataservices.imf.org host (NXDOMAIN), so every IFS pull was SKIPPED with a
@@ -18,7 +21,6 @@ import time
 from datetime import date
 from typing import Any
 
-import pandas as pd
 import requests
 from loguru import logger as log
 from sqlalchemy import text
@@ -67,6 +69,8 @@ _UPSTREAM_OUTAGE_MARKERS: tuple[str, ...] = (
     "Failed to resolve",
     "Max retries exceeded",
     "Connection refused",
+    "Connection aborted",
+    "Connection reset by peer",
 )
 
 
@@ -76,13 +80,16 @@ def is_upstream_outage(exc: BaseException) -> bool:
     return any(marker in msg for marker in _UPSTREAM_OUTAGE_MARKERS)
 
 
-# IMF DataMapper — the public JSON API behind imf.org/external/datamapper.
-# It serves the WEO indicators directly (annual, actuals + projections) and
-# replaces the imfdatapy WEO class that disappeared before 2026-05.
-DATAMAPPER_BASE_URL: str = "https://www.imf.org/external/datamapper/api/v1"
-_DATAMAPPER_TIMEOUT: int = 30
+# WEO — the IMF Research Department's World Economic Outlook dataflow on the
+# same SDMX 3.0 service (IMF.RES/WEO, key COUNTRY.INDICATOR.FREQUENCY).
+# 2026-11-06: replaces the DataMapper JSON API (www.imf.org/external/
+# datamapper/api/v1), which sits behind Akamai and answered 403 / reset
+# connections ("Connection reset by peer" on GGXCNL_NGDP, 2026-11-05 16:03Z).
+# The WEO indicator codes are unchanged, so IMF_WEO_TARGETS maps 1:1.
+WEO_AGENCY: str = "IMF.RES"
+WEO_FLOW: str = "WEO"
 
-# WEO targets are keyed by ISO-2; DataMapper speaks ISO-3.
+# WEO targets are keyed by ISO-2; IMF SDMX speaks ISO-3.
 ISO2_TO_ISO3: dict[str, str] = {
     "US": "USA", "CN": "CHN", "DE": "DEU", "JP": "JPN", "GB": "GBR",
     "FR": "FRA", "IT": "ITA", "CA": "CAN", "IN": "IND", "BR": "BRA",
@@ -90,44 +97,40 @@ ISO2_TO_ISO3: dict[str, str] = {
 }
 
 
-def fetch_datamapper(
-    indicator: str,
-    iso3_codes: list[str],
-    timeout: int = _DATAMAPPER_TIMEOUT,
-) -> dict[str, dict[int, float]]:
-    """Return ``{iso3: {year: value}}`` for *indicator* from IMF DataMapper.
+def weo_series_key(subject: str, country: str) -> str:
+    """Dotted IMF.RES/WEO series key for one (WEO subject, ISO-2 country)."""
+    return f"{ISO2_TO_ISO3.get(country, country)}.{subject}.A"
 
-    Raises ``requests.HTTPError`` on a non-2xx response so callers can decide
-    between skip and fail.
+
+def weo_request_key(targets: dict[tuple[str, str], str]) -> str:
+    """One SDMX key that selects every WEO target in a single request."""
+    countries = sorted({ISO2_TO_ISO3.get(c, c) for _, c in targets})
+    subjects = sorted({s for s, _ in targets})
+    return f"{'+'.join(countries)}.{'+'.join(subjects)}.A"
+
+
+def fetch_weo(
+    targets: dict[tuple[str, str], str] | None = None,
+    start_year: str | None = None,
+) -> dict[str, list[tuple[date, float]]]:
+    """Return ``{series_key: [(Jan-1 of year, value)]}`` for the WEO targets.
+
+    Raises ``requests.RequestException`` / ``ValueError`` on transport or
+    payload failure so the caller can decide between skip and fail.
     """
-    if not iso3_codes:
+    targets = targets if targets is not None else IMF_WEO_TARGETS
+    if not targets:
         return {}
-    url = f"{DATAMAPPER_BASE_URL}/{indicator}/{'/'.join(iso3_codes)}"
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json() if resp.content else {}
-    values = ((payload or {}).get("values") or {}).get(indicator) or {}
-    out: dict[str, dict[int, float]] = {}
-    for code in iso3_codes:
-        series: dict[int, float] = {}
-        for year_str, raw in (values.get(code) or {}).items():
-            try:
-                year = int(year_str)
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if pd.isna(value):
-                continue
-            series[year] = value
-        out[code] = series
-    return out
+    return sdmx_json.fetch_imf_multi(
+        WEO_FLOW, weo_request_key(targets), start_year, agency=WEO_AGENCY,
+    )
 
 
 class IMFPuller(BasePuller):
     """Pulls macroeconomic data from IMF IFS and WEO datasets."""
 
     SOURCE_NAME = "IMF_IFS"
-    SOURCE_CONFIG = {"base_url": "https://www.imf.org/external/datamapper/api/v1", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 11}
+    SOURCE_CONFIG = {"base_url": "https://api.imf.org/external/sdmx/3.0", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 11}
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
@@ -199,14 +202,14 @@ class IMFPuller(BasePuller):
         return sdmx_json.parse_period(period_str)
 
     def pull_weo(self, max_year: int | None = None) -> dict[str, Any]:
-        """Pull the WEO targets from the IMF DataMapper API.
+        """Pull the WEO targets from the IMF SDMX 3.0 WEO dataflow.
 
-        DataMapper returns actuals and projections in one series. Only years
-        up to *max_year* (default: the current year) are stored — a
-        projection for a future year would carry a future ``obs_date`` and
-        break point-in-time reads.
+        The WEO series mixes actuals and projections. Only years up to
+        *max_year* (default: the current year) are stored — a projection for
+        a future year would carry a future ``obs_date`` and break
+        point-in-time reads. All targets come back in one request.
         """
-        log.info("Pulling IMF WEO data (DataMapper)")
+        log.info("Pulling IMF WEO data ({ag}/{fl})", ag=WEO_AGENCY, fl=WEO_FLOW)
         result: dict[str, Any] = {
             "series_id": "weo_all",
             "rows_inserted": 0,
@@ -216,51 +219,52 @@ class IMFPuller(BasePuller):
         }
         cutoff_year = max_year if max_year is not None else date.today().year
 
-        # Group targets by indicator so each indicator is one HTTP call.
-        by_indicator: dict[str, list[tuple[str, str]]] = {}
-        for (subject, country), feature_name in IMF_WEO_TARGETS.items():
-            by_indicator.setdefault(subject, []).append((country, feature_name))
+        try:
+            data = fetch_weo()
+        except Exception as exc:  # noqa: BLE001 — classified below
+            outage = is_upstream_outage(exc)
+            if outage or isinstance(exc, (requests.RequestException, ValueError)):
+                log.warning("IMF WEO fetch failed: {err}", err=str(exc)[:200])
+                result["status"] = "SKIPPED" if outage else "FAILED"
+            else:
+                log.error("IMF WEO fetch failed: {err}", err=str(exc))
+                result["status"] = "FAILED"
+            result["errors"].append(str(exc))
+            return result
 
+        missing: list[str] = []
         inserted = 0
         try:
             with self.engine.begin() as conn:
-                for indicator, targets in by_indicator.items():
-                    codes = [ISO2_TO_ISO3.get(c, c) for c, _ in targets]
-                    try:
-                        data = fetch_datamapper(indicator, codes)
-                    except Exception as exc:  # noqa: BLE001 — one indicator must not sink the rest
-                        level = log.warning if is_upstream_outage(exc) else log.error
-                        level("IMF WEO {ind} fetch failed: {err}", ind=indicator, err=str(exc)[:200])
-                        result["errors"].append(f"{indicator}: {exc}")
-                        result["status"] = "PARTIAL"
+                for (subject, country), feature_name in IMF_WEO_TARGETS.items():
+                    series = data.get(weo_series_key(subject, country)) or []
+                    if not series:
+                        missing.append(feature_name)
                         continue
-
-                    for country, feature_name in targets:
-                        series = data.get(ISO2_TO_ISO3.get(country, country)) or {}
-                        if not series:
-                            log.debug("IMF WEO {fn}: no values returned", fn=feature_name)
+                    existing = self._get_existing_dates(feature_name, conn)
+                    for obs_dt, value in series:
+                        if obs_dt.year > cutoff_year:
+                            result["skipped_future"] += 1
                             continue
-                        existing = self._get_existing_dates(feature_name, conn)
-                        for year, value in sorted(series.items()):
-                            if year > cutoff_year:
-                                result["skipped_future"] += 1
-                                continue
-                            obs_dt = date(year, 1, 1)
-                            if obs_dt in existing:
-                                continue
-                            conn.execute(
-                                text(
-                                    "INSERT INTO raw_series "
-                                    "(series_id, source_id, obs_date, value, pull_status) "
-                                    "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
-                                    "ON CONFLICT DO NOTHING"
-                                ),
-                                {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
-                            )
-                            existing.add(obs_dt)
-                            inserted += 1
+                        if obs_dt in existing:
+                            continue
+                        conn.execute(
+                            text(
+                                "INSERT INTO raw_series "
+                                "(series_id, source_id, obs_date, value, pull_status) "
+                                "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
+                                "ON CONFLICT DO NOTHING"
+                            ),
+                            {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
+                        )
+                        existing.add(obs_dt)
+                        inserted += 1
 
             result["rows_inserted"] = inserted
+            if missing:
+                result["status"] = "PARTIAL"
+                result["errors"].append(f"IMF WEO returned no series for: {', '.join(sorted(missing))}")
+                log.warning("IMF WEO: no series for {m}", m=sorted(missing))
             log.info(
                 "IMF WEO: inserted {n} rows ({f} future-year projections skipped)",
                 n=inserted, f=result["skipped_future"],
