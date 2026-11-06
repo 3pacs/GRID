@@ -22,14 +22,16 @@ export function insightsMarkup(payload, error = '') {
             <div class="engine-head"><strong>${escapeHtml(evidence.symbol)}</strong>
                 <span>${forecast ? escapeHtml(item.status) : item.stale ? 'STALE' : 'OBSERVATION'}</span></div>
             <h3>${escapeHtml(item.call)}</h3>
-            <p>${escapeHtml(item.setup)}</p>
+            <p>${escapeHtml(!forecast && evidence.kind === 'observation' && evidence.available
+                ? 'Measured market conditions. Qualified directional forecasts appear as separate research contracts.'
+                : item.setup)}</p>
             <div class="seer-support">Observed ${escapeHtml(time(evidence.as_of))} · Binance ${escapeHtml(evidence.entry?.instrument || evidence.symbol + 'USDT')} · ${evidence.entry?.source === 'binance_spot_rest' ? 'global spot REST · ' : 'observed trade stream · '}USDT</div>
             ${forecast ? `<div class="seer-support">${escapeHtml(forecast.label || '24h actor-flow research')} · declared threshold ${pct(forecast.threshold ?? .01)}</div>`
                 : `<div class="seer-support">24h candle coverage: ${pct(evidence.coverage)} · ${evidence.change_24h == null ? '24h change unavailable' : 'measured 24h change'}</div>`}
             ${forecast ? `<p>Target ${Number(forecast.target_price).toFixed(2)} USDT by ${escapeHtml(time(forecast.due_at))}.
                 Miss if the declared ${pct(forecast.threshold ?? .01)} directional move is absent at that outcome. First recorded completed 5m close at or after due, within 15m.</p>
                 <div>Result: ${escapeHtml(item.status)}${item.score ? ` · signed return ${pct(item.score.signed_return)}` : ' · awaiting the future outcome'}</div>`
-                : '<div>No directional forecast. An observation receives no win/loss grade.</div>'}
+                : '<div>Measured observation; no win/loss grade. See separate research contracts.</div>'}
             <div class="seer-support">${escapeHtml(evidence.validation)} · ${item.prediction_id ? `<a href="/api/v1/astrogrid/predictions/${encodeURIComponent(item.prediction_id)}">Evidence record</a>` : ''}</div>
         </article>`;
     }).join('');
