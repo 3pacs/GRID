@@ -423,7 +423,10 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_actor_analytics", return_value=mock_analytics):
-                result = get_actor_analytics_endpoint("test-1", _token="test")
+                result = (  # plain def handler since #995 (runs in the threadpool)
+
+                    get_actor_analytics_endpoint("test-1", _token="test")
+                )
 
         assert "analytics" in result
         assert result["analytics"]["pagerank"] == 0.05
@@ -438,7 +441,10 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_top_actors", return_value=mock_actors):
-                result = get_top_actors_endpoint(metric="pagerank", limit=20, _token="test")
+                result = (  # plain def handler since #995 (runs in the threadpool)
+
+                    get_top_actors_endpoint(metric="pagerank", limit=20, _token="test")
+                )
 
         assert "actors" in result
         assert result["count"] == 1
@@ -457,7 +463,10 @@ class TestAPIEndpoints:
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("api.routers.intelligence_actors._read_community_summary", return_value=None):
                 with patch("store.graph.get_community_list", return_value=mock_communities):
-                    result = get_communities_endpoint(_token="test")
+                    result = (  # plain def handler since #995 (runs in the threadpool)
+
+                        get_communities_endpoint(_token="test")
+                    )
 
         assert "communities" in result
         assert result["count"] == 1
@@ -474,7 +483,10 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_community_members", return_value=mock_members):
-                result = get_community_members_endpoint(community_id=0, limit=50, _token="test")
+                result = (  # plain def handler since #995 (runs in the threadpool)
+
+                    get_community_members_endpoint(community_id=0, limit=50, _token="test")
+                )
 
         assert "members" in result
         assert result["community_id"] == 0
@@ -486,7 +498,10 @@ class TestAPIEndpoints:
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
             with patch("store.graph.get_top_actors", side_effect=ValueError("Invalid metric 'bad'")):
-                result = get_top_actors_endpoint(metric="bad", limit=20, _token="test")
+                result = (  # plain def handler since #995 (runs in the threadpool)
+
+                    get_top_actors_endpoint(metric="bad", limit=20, _token="test")
+                )
 
         assert result["count"] == 0
         assert "error" in result

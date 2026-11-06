@@ -1671,6 +1671,7 @@ class AstroGridStore:
         as_of_date: date | None = None,
         limit: int = 100,
         prediction_ids: list[str] | None = None,
+        model_versions: list[str] | None = None,
     ) -> dict[str, Any]:
         evaluation_date = as_of_date or _utc_today()
         filters = []
@@ -1678,6 +1679,9 @@ class AstroGridStore:
         if prediction_ids:
             filters.append("pr.prediction_id = ANY(:prediction_ids)")
             params["prediction_ids"] = prediction_ids
+        if model_versions is not None:
+            filters.append("pr.model_version = ANY(:model_versions)")
+            params["model_versions"] = model_versions
         params["evaluation_date"] = evaluation_date
         score_cutoff = min(
             _utc_now(),
@@ -1694,6 +1698,7 @@ class AstroGridStore:
         params["spy_outcome_grace_days"] = SPY_OUTCOME_GRACE_DAYS
         params["skip_max_attempts"] = SCORE_SKIP_MAX_ATTEMPTS
         params["insight_model"] = "astrogrid-evidence-v2"
+        params["flow_model"] = "astrogrid-spot-flow-v1"
         params.update(_legacy_score_params())
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
@@ -1724,18 +1729,20 @@ class AstroGridStore:
               AND pr.scoring_class = 'liquid_market'
               -- Bounded skip: one attempt per evaluation day, at most
               -- SCORE_SKIP_MAX_ATTEMPTS days, none after a permanent reason.
-              AND (pr.model_version = :insight_model OR NOT EXISTS (
+              AND (pr.model_version IN (:insight_model, :flow_model) OR NOT EXISTS (
                   SELECT 1 FROM {self.schema}.prediction_score_skip sk
                   WHERE sk.prediction_run_id = pr.id
                     AND (sk.permanent OR sk.attempt_date >= :evaluation_date)
               ))
-              AND (pr.model_version = :insight_model OR (
+              AND (pr.model_version IN (:insight_model, :flow_model) OR (
                   SELECT COUNT(*) FROM {self.schema}.prediction_score_skip sk
                   WHERE sk.prediction_run_id = pr.id
               ) < :skip_max_attempts)
               AND ((pr.model_version = :insight_model
                     AND pr.as_of_ts + INTERVAL '24 hours' <= :score_cutoff)
-                OR (pr.model_version <> :insight_model AND (
+                OR (pr.model_version = :flow_model
+                    AND pr.as_of_ts + INTERVAL '30 minutes' <= :score_cutoff)
+                OR (pr.model_version NOT IN (:insight_model, :flow_model) AND (
                   CASE WHEN jsonb_typeof(pr.target_symbols) = 'array'
                                  AND jsonb_array_length(pr.target_symbols) = 1
                                  AND upper(pr.target_symbols->>0) = 'SPY'
@@ -1751,7 +1758,7 @@ class AstroGridStore:
             -- predictions with an available receipt so old gaps cannot fill
             -- every bounded batch ahead of scoreable predictions. The scorer
             -- still verifies complete lineage before writing a score.
-            ORDER BY CASE WHEN pr.model_version = :insight_model THEN -1
+            ORDER BY CASE WHEN pr.model_version IN (:insight_model, :flow_model) THEN -1
                           WHEN jsonb_typeof(pr.target_symbols) = 'array'
                             AND jsonb_array_length(pr.target_symbols) = 1
                             AND upper(pr.target_symbols->>0) = 'SPY'
@@ -1903,7 +1910,7 @@ class AstroGridStore:
                         "status": "unscored",
                         **result["unscored"],
                     })
-                    if len(row) <= 15 or row[15] != "astrogrid-evidence-v2":
+                    if len(row) <= 15 or row[15] not in {"astrogrid-evidence-v2", "astrogrid-spot-flow-v1"}:
                         self._record_score_skip(conn, row, result, attempt_date=evaluation_date)
                     continue
                 if self._insert_score(conn, row, result):
@@ -1967,8 +1974,11 @@ class AstroGridStore:
         ``not_mature`` (pending), never scored from an open bar or a later
         price. Reads are bounded to releases on or before the score cutoff.
         """
-        if len(row) > 15 and row[15] == "astrogrid-evidence-v2":
-            from oracle.astrogrid_insights import score_contract
+        if len(row) > 15 and row[15] in {"astrogrid-evidence-v2", "astrogrid-spot-flow-v1"}:
+            if row[15] == "astrogrid-spot-flow-v1":
+                from oracle.astrogrid_order_flow import score_contract
+            else:
+                from oracle.astrogrid_insights import score_contract
 
             score = score_contract(
                 self.engine, symbols=_json_loads(row[5], []),
@@ -2418,8 +2428,9 @@ class AstroGridStore:
         valid_variants = [v for v in strategy_variants if v in {"grid_only", "grid_plus_mystical", "mystical_only"}]
         if not valid_variants:
             valid_variants = ["grid_only", "grid_plus_mystical", "mystical_only"]
-        filters = ["pr.model_version <> :insight_model"]
-        params: dict[str, Any] = {"limit": limit, "insight_model": "astrogrid-evidence-v2", **_legacy_score_params()}
+        filters = ["pr.model_version <> :insight_model", "pr.model_version <> :flow_model"]
+        params: dict[str, Any] = {"limit": limit, "insight_model": "astrogrid-evidence-v2",
+                                  "flow_model": "astrogrid-spot-flow-v1", **_legacy_score_params()}
         if horizon_label in {"macro", "swing"}:
             filters.append("pr.horizon_label = :horizon_label")
             params["horizon_label"] = horizon_label
@@ -3113,7 +3124,7 @@ class AstroGridStore:
             data["postmortem"]["raw_payload"] = _json_loads(row[30], {})
         # Postmortem logs are append-only too. Project the completed result
         # from the score instead of mutating the original pending stub.
-        if data["model_version"] == "astrogrid-evidence-v2":
+        if data["model_version"] in {"astrogrid-evidence-v2", "astrogrid-spot-flow-v1"}:
             score_index = 31 if detailed else 27
             score = _json_loads(row[score_index], {}) if len(row) > score_index else {}
             if score and isinstance(score.get("signed_return"), (int, float)):
@@ -3121,7 +3132,7 @@ class AstroGridStore:
                 data["postmortem"]["original_summary"] = data["postmortem"]["summary"]
                 data["postmortem"]["summary"] = (
                     f"{data['status']}: {score['signed_return']:+.2%} signed return on the declared asset "
-                    "at the 24h outcome; fees excluded."
+                    "at its declared outcome; fees excluded."
                 )
                 data["postmortem"]["projection"] = "derived_from_score; original log unchanged"
                 data["postmortem"]["raw_payload"] = score
