@@ -89,9 +89,11 @@ This enforces grep-before-create discipline and prevents the duplication documen
 ## Server Deployment
 
 - Repo on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
-- **Systemd services**: grid-api, grid-llamacpp, grid-crucix, grid-hermes, grid-coordinator,
-  grid-worker, cloudflared. Restart core: `sudo systemctl restart grid-api grid-llamacpp
-  grid-crucix grid-hermes`
+- **Systemd services** (core, active on 2026-11-06): grid-api, grid-crucix, grid-hermes,
+  grid-scheduler, grid-coordinator, grid-worker, cloudflared. Restart core:
+  `sudo systemctl restart grid-api grid-crucix grid-hermes`. `grid-llamacpp` (and
+  `grid-llamacpp-batch`, `grid-llamacpp-oracle`) still have unit files in
+  `/etc/systemd/system` but are disabled and inactive; don't start or restart them.
 - **Public URL**: `https://grid.stepdad.finance` (Cloudflare Tunnel)
 - **Role-based auth**: admin (master password) and contributor (user accounts)
 - Full reference: `docs/SERVER-SERVICES.md`

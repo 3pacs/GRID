@@ -284,3 +284,165 @@ def test_enrich_accepts_dataclass_signals():
         {"name": "momentum", "weight": 0.5},
         {"name": "flow", "weight": 0.25},
     ]
+
+
+# ── aggregate_signal_weights + engine write path (S9a, 2026-11-06) ───────────
+#
+# Production rows on 2026-11-02 showed ten ``sector_network`` items collapsed
+# to ``{"sector_network": 1.0}`` (last weight wins) and unnormalized weights
+# such as ``{"timesfm_direction_7d": 1.5, ...}``. The write path now sums
+# duplicate names and normalizes to 1.0, the shape per_signal_brier expects.
+
+from oracle.prediction_context import (
+    SIGNAL_CONTRIBUTIONS_BASIS,
+    aggregate_signal_weights,
+)
+
+
+def test_aggregate_signal_weights_sums_duplicates_and_normalizes():
+    out = aggregate_signal_weights(
+        [
+            {"name": "sector_network", "weight": 0.5},
+            {"name": "sector_network", "weight": 1.0},
+            {"name": "feature:equity", "weight": 1.5},
+        ]
+    )
+    assert out == pytest.approx({"sector_network": 0.5, "feature:equity": 0.5})
+    assert sum(out.values()) == pytest.approx(1.0)
+
+
+def test_aggregate_signal_weights_drops_unusable_entries():
+    out = aggregate_signal_weights(
+        [
+            {"name": "", "weight": 1.0},
+            {"name": "nan_sig", "weight": float("nan")},
+            {"name": "inf_sig", "weight": float("inf")},
+            {"name": "zero", "weight": 0.0},
+            {"name": "neg", "weight": -2.0},
+            {"name": "junk", "weight": "x"},
+            {"name": "ok", "weight": 0.2},
+        ]
+    )
+    assert out == {"ok": 1.0}
+    assert aggregate_signal_weights([]) == {}
+    assert aggregate_signal_weights(None) == {}  # type: ignore[arg-type]
+
+
+class _RecordingConn:
+    def __init__(self, sink: list[dict[str, Any]]) -> None:
+        self.sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def execute(self, query: Any, params: dict[str, Any] | None = None) -> Any:
+        if params is not None:
+            self.sink.append(dict(params))
+        res = MagicMock()
+        res.fetchone.return_value = None
+        return res
+
+
+class _RecordingEngine:
+    def __init__(self) -> None:
+        self.params: list[dict[str, Any]] = []
+
+    def begin(self) -> _RecordingConn:
+        return _RecordingConn(self.params)
+
+    connect = begin
+
+
+def _store_one_fixture_prediction(monkeypatch) -> dict[str, Any]:
+    """Run OracleEngine._store_predictions on one fixture prediction and
+    return the bound INSERT parameters (no DB)."""
+    from datetime import datetime, timezone
+
+    import oracle.prediction_context as pc
+    from oracle.engine import OracleEngine, OraclePrediction, PredictionType, Signal
+
+    monkeypatch.setattr(pc, "fetch_liquidity_regime", lambda *a, **k: "NEUTRAL")
+    monkeypatch.setattr(pc, "fetch_fci_regime", lambda *a, **k: "NEUTRAL")
+    monkeypatch.setattr(pc, "fetch_vix_level", lambda *a, **k: 18.0)
+
+    eng = object.__new__(OracleEngine)
+    rec = _RecordingEngine()
+    eng.engine = rec  # type: ignore[attr-defined]
+
+    pred = OraclePrediction(
+        id="fixture-1",
+        timestamp=datetime(2026, 11, 6, 14, 0, tzinfo=timezone.utc),
+        ticker="SPY",
+        prediction_type=PredictionType.DIRECTION,
+        direction="CALL",
+        target_price=None,
+        current_price=600.0,
+        expiry=date(2026, 11, 13),
+        confidence=0.7,
+        expected_move_pct=1.0,
+        signals=[
+            Signal("sector_network", "network", 1.0, 0.5, "bullish", 0.5, 0),
+            Signal("sector_network", "network", 1.0, 0.5, "bullish", 1.0, 0),
+            Signal("timesfm_direction_7d", "ts", 1.0, 1.0, "bullish", 1.5, 0),
+        ],
+        model_name="fixture_model",
+        model_version="v1",
+        model_weights={"fixture_model": 1.2, "other_model": 0.9},
+        horizon_days=7,
+    )
+    eng._store_predictions([pred])
+    inserts = [p for p in rec.params if p.get("id") == "fixture-1"]
+    assert len(inserts) == 1
+    return inserts[0]
+
+
+def test_engine_store_writes_normalized_signal_contributions(monkeypatch):
+    import json
+
+    params = _store_one_fixture_prediction(monkeypatch)
+    signals = json.loads(params["sig"])
+    assert signals["signal_contributions"] == pytest.approx(
+        {"sector_network": 0.5, "timesfm_direction_7d": 0.5}
+    )
+    assert signals["signal_contributions_basis"] == SIGNAL_CONTRIBUTIONS_BASIS
+    assert len(signals["items"]) == 3
+    assert signals["regime"] == "NEUTRAL"
+    assert signals["vix_level"] == 18.0
+
+
+def test_per_signal_brier_consumes_engine_written_contributions(monkeypatch):
+    """The row the engine writes feeds the per-signal Brier path unchanged:
+    the bootstrap's Layer 1 picks the nested dict (not the family/aggregate
+    fallbacks) and record_scored_prediction attributes error by share."""
+    from features import per_signal_brier
+    from scripts import bootstrap_per_signal_brier as boot
+
+    params = _store_one_fixture_prediction(monkeypatch)
+    row = {
+        "id": params["id"],
+        "model_name": params["mn"],
+        "signals": params["sig"],  # JSON text, as psycopg returns for ::text
+        "signal_contributions": None,
+    }
+    contributions = boot.extract_signal_contributions(
+        row, oracle_models_lookup={"fixture_model": ["family_a", "family_b"]}
+    )
+    assert contributions == pytest.approx(
+        {"sector_network": 0.5, "timesfm_direction_7d": 0.5}
+    )
+
+    updates = per_signal_brier.record_scored_prediction(
+        _RecordingEngine(),
+        horizon_days=7,
+        confidence=0.7,
+        outcome=1.0,
+        signal_contributions=contributions,
+    )
+    assert set(updates) == {"sector_network", "timesfm_direction_7d"}
+    # (0.7 - 1.0)^2 = 0.09, attributed by a 0.5 share each.
+    for source in updates:
+        assert updates[source]["scored_count"] == 1
+        assert updates[source]["running_brier"] == pytest.approx(0.045)

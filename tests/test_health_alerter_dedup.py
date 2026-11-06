@@ -217,3 +217,67 @@ def test_send_alert_html_escapes_and_keeps_plain_text(monkeypatch):
     section = captured["sections"][0]
     assert "&lt;Future x&gt;" in section["body"] and "pre-wrap" in section["body"]
     assert section["plain"] == "line1\nRetryError[<Future x>]"
+
+
+# ── astrogrid.sky_snapshot_missing (issue #500, forward-only) ────────────────
+
+
+def _sky_health(*, checked=True, due=True, present=False, today="2026-11-06") -> dict:
+    return {
+        "timestamp": f"{today}T03:00:00+00:00",
+        "db": {"healthy": True, "stale_sources": []},
+        "astrogrid": {
+            "sky_snapshot": {
+                "table": "astrogrid.sky_snapshot",
+                "checked": checked,
+                "today": today,
+                "due": due,
+                "due_hour_utc": 2,
+                "present_today": present if checked else None,
+                "latest_snapshot_date": "2026-11-05",
+                "latest_created_at": "2026-11-05T00:04:00+00:00",
+            }
+        },
+    }
+
+
+class TestSkySnapshotMissing:
+    KEY = "astrogrid.sky_snapshot_missing"
+
+    def test_fires_when_due_and_missing(self, _isolated_state):
+        now = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+        assert ha.check_and_alert(_sky_health(), now=now) == [self.KEY]
+        subject, body, severity = _isolated_state[-1]
+        assert "2026-11-06" in subject and "latest 2026-11-05" in subject
+        assert "forward-only" in body and severity == "warning"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"present": True},           # today's row exists
+            {"due": False},              # before 02:00Z
+            {"checked": False},          # relation missing / query error
+        ],
+    )
+    def test_silent_when_present_not_due_or_unchecked(self, _isolated_state, kwargs):
+        now = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+        assert self.KEY not in ha.check_and_alert(_sky_health(**kwargs), now=now)
+
+    def test_silent_for_older_producer_without_block(self, _isolated_state):
+        now = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+        assert self.KEY not in ha.check_and_alert(_health([]), now=now)
+
+    def test_once_per_missing_day_then_again_next_day(self, _isolated_state):
+        t0 = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+        assert ha.check_and_alert(_sky_health(), now=t0) == [self.KEY]
+        # Later Hermes cycles the same day: no repeat.
+        assert ha.check_and_alert(_sky_health(), now=t0 + timedelta(hours=8)) == []
+        # Next day still missing: new content, fires again.
+        t1 = datetime(2026, 11, 7, 2, 5, tzinfo=timezone.utc)
+        assert ha.check_and_alert(_sky_health(today="2026-11-07"), now=t1) == [self.KEY]
+
+    def test_recovery_clears_state(self, _isolated_state):
+        t0 = datetime(2026, 11, 6, 3, 0, tzinfo=timezone.utc)
+        ha.check_and_alert(_sky_health(), now=t0)
+        ha.check_and_alert(_sky_health(present=True), now=t0 + timedelta(hours=1))
+        assert ha.check_and_alert(_sky_health(), now=t0 + timedelta(hours=2)) == [self.KEY]

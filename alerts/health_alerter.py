@@ -22,6 +22,8 @@ Conditions covered today:
     - db.stale_sources:    >20 sources past freshness threshold
     - hermes.unhealthy:    Hermes process not responsive
     - pool.exhausted:      Active connections > 80% of (pool_size + max_overflow)
+    - astrogrid.sky_snapshot_missing: no astrogrid.sky_snapshot row for
+                           today (UTC) after 02:00Z (issue #500)
 
 New conditions slot in by adding a row to the CHECKS table and a
 threshold constant — no code restructuring needed.
@@ -65,6 +67,11 @@ email every DEFAULT_COOLDOWN_HOURS (6h) with no check that the list had
 changed. Now it only re-fires when a source newly goes stale (a source
 recovering is not news), with this as a "daily reminder, at most" ceiling
 for when nothing new has broken."""
+
+SKY_SNAPSHOT_MAX_REMINDER_HOURS = 24.0
+"""A missing sky_snapshot day alerts once; it re-fires only when the UTC
+day rolls over with the row still missing (new dedupe content) or, at
+most, once per this many hours."""
 
 POOL_EXHAUSTION_THRESHOLD = 0.8
 """Fraction of (pool_size + max_overflow) at which pool is considered
@@ -351,6 +358,40 @@ def _pool_exhausted_render(h: dict) -> tuple[str, str]:
     )
 
 
+def _sky_snapshot(h: dict) -> dict[str, Any]:
+    return (h.get("astrogrid") or {}).get("sky_snapshot") or {}
+
+
+def _sky_snapshot_missing(h: dict) -> bool:
+    """Today's row is due (after SKY_SNAPSHOT_DUE_HOUR_UTC) and absent.
+    An unchecked result (relation missing, query error, older producer)
+    never fires: absence of evidence is not a missing snapshot."""
+    s = _sky_snapshot(h)
+    return bool(s.get("checked")) and bool(s.get("due")) and s.get("present_today") is False
+
+
+def _sky_snapshot_missing_render(h: dict) -> tuple[str, str]:
+    s = _sky_snapshot(h)
+    today = s.get("today", "?")
+    latest = s.get("latest_snapshot_date") or "none"
+    subject = f"GRID: astrogrid.sky_snapshot missing for {today} (latest {latest})"
+    body = (
+        f"No astrogrid.sky_snapshot row for {today} (UTC) after "
+        f"{s.get('due_hour_utc', 2):02d}:00Z. Latest snapshot_date: {latest} "
+        f"(created_at {s.get('latest_created_at') or 'n/a'}).\n\n"
+        "The writer is Hermes step 7c2 (oracle/astrogrid_cycle.py), hourly and "
+        "idempotent. Check the grid-hermes journal for 'astrogrid' errors.\n\n"
+        "Issue #500 decision (2026-11-05): forward-only. Do not backfill the "
+        "missed day; it stays recorded as known-missing."
+    )
+    return subject, body
+
+
+def _sky_snapshot_dedupe_key(h: dict) -> str | None:
+    """One alert per missing day; a new UTC day is new content."""
+    return _sky_snapshot(h).get("today")
+
+
 CHECKS: tuple[_Check, ...] = (
     _Check("db.unhealthy", "critical", _db_unhealthy, _db_unhealthy_render),
     _Check("db.failed_pulls", "warning", _failed_pulls, _failed_pulls_render),
@@ -362,6 +403,12 @@ CHECKS: tuple[_Check, ...] = (
     ),
     _Check("hermes.unhealthy", "warning", _hermes_unhealthy, _hermes_unhealthy_render),
     _Check("pool.exhausted", "critical", _pool_exhausted, _pool_exhausted_render),
+    _Check(
+        "astrogrid.sky_snapshot_missing", "warning",
+        _sky_snapshot_missing, _sky_snapshot_missing_render,
+        dedupe_key=_sky_snapshot_dedupe_key,
+        max_reminder_hours=SKY_SNAPSHOT_MAX_REMINDER_HOURS,
+    ),
 )
 
 

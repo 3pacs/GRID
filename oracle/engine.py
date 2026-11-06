@@ -2362,6 +2362,8 @@ class OracleEngine:
         from oracle.prediction_context import (
             DEFAULT_FCI_REGIME,
             DEFAULT_REGIME,
+            SIGNAL_CONTRIBUTIONS_BASIS,
+            aggregate_signal_weights,
             canonical_regime,
             enrich_signals_payload,
             extract_signal_contributions,
@@ -2409,12 +2411,13 @@ class OracleEngine:
         updated = 0    # rows that collided with a kept row and were upserted
         with self.engine.begin() as conn:
             for p in predictions:
+                # Per-signal shares: duplicate names are summed and the dict
+                # sums to 1.0 (the per_signal_brier contract). The earlier
+                # ``{s.name: s.weight}`` comprehension kept only the last of
+                # e.g. ten ``sector_network`` items. New rows only; stored
+                # rows are never rewritten.
                 try:
-                    model_votes = {
-                        s.name: float(s.weight)
-                        for s in p.signals
-                        if getattr(s, "weight", None) is not None
-                    }
+                    model_votes = aggregate_signal_weights(p.signals)
                 except Exception:
                     model_votes = {}
 
@@ -2432,6 +2435,8 @@ class OracleEngine:
                     "vix_level": cached_vix,
                     "signal_contributions": contributions,
                 }
+                if model_votes and contributions == model_votes:
+                    context["signal_contributions_basis"] = SIGNAL_CONTRIBUTIONS_BASIS
 
                 raw_signals = [asdict(s) for s in p.signals]
                 enriched_signals = enrich_signals_payload(raw_signals, context)
