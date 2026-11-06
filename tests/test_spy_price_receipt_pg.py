@@ -120,6 +120,14 @@ def receipt_pg_engine() -> Engine:
                 migration.upgrade()
             finally:
                 migration.op = original_op
+            # Every score reader now reads the effective score set, which
+            # includes the legacy rescore and skip tables (2026-11-05).
+            rescore_migration = importlib.import_module("migrations.versions.ag_legacy_rescore_20261105")
+            rescore_migration.op = ops
+            try:
+                rescore_migration.upgrade()
+            finally:
+                rescore_migration.op = original_op
         yield engine
     finally:
         engine.dispose()

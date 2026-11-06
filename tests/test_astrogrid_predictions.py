@@ -460,16 +460,26 @@ def test_score_predictions_reports_unscored_without_price_write(
         "{}", "{}", "{}", "question", None,
     )
 
+    skips: list[dict] = []
+
     def execute_score(statement, params=None):
         if "FROM astrogrid.prediction_run pr" in str(statement):
             result = MagicMock()
             result.fetchall.return_value = [prediction]
             return result
+        # The only write allowed is the bounded-skip record (2026-11-05).
+        if "INSERT INTO astrogrid.prediction_score_skip" in str(statement):
+            skips.append(dict(params))
+            return MagicMock()
         raise AssertionError(f"Unexpected score write: {statement}")
 
     score_conn.execute.side_effect = execute_score
 
     summary = store.score_predictions(as_of_date=date(2026, 9, 22))
+
+    assert [(s["reason"], s["permanent"], s["attempt_date"]) for s in skips] == [
+        (expected_reason, False, date(2026, 9, 22))
+    ]
 
     assert summary["scored"] == 0
     assert summary["skipped_no_price"] == 1
