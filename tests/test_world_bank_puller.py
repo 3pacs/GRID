@@ -11,8 +11,11 @@ from ingestion.international.world_bank_puller import (
     WorldBankPuller,
     INDICATORS,
     COUNTRIES,
+    WB_UNCOVERED_COUNTRIES,
     _PER_PAGE,
 )
+
+PULLED_COUNTRIES = [c for c in COUNTRIES if c not in WB_UNCOVERED_COUNTRIES]
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +153,43 @@ class TestFetchIndicator:
     @patch("ingestion.international.world_bank_puller.requests.get")
     @patch("ingestion.international.world_bank_puller.time.sleep")
     def test_unexpected_response_format(self, mock_sleep, mock_get, puller):
+        """A non-envelope payload is a real failure, not an empty series."""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"error": "bad request"}
         mock_resp.raise_for_status = MagicMock()
         mock_get.return_value = mock_resp
 
-        result = puller._fetch_indicator("US", "NY.GDP.MKTP.CD", 2020, 2023)
-        assert result == []
+        with pytest.raises(ValueError, match="World Bank error response"):
+            puller._fetch_indicator("US", "NY.GDP.MKTP.CD", 2020, 2023)
+
+    @patch("ingestion.international.world_bank_puller.requests.get")
+    @patch("ingestion.international.world_bank_puller.time.sleep")
+    def test_error_envelope_for_invalid_code_raises(self, mock_sleep, mock_get, puller):
+        """Live shape for an invalid/archived indicator code (2026-11-06)."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [{"message": [{
+            "id": "120", "key": "Invalid value", "value": "The provided parameter value is not valid",
+        }]}]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        with pytest.raises(ValueError, match="Invalid value"):
+            puller._fetch_indicator("US", "NOT.A.CODE", 2020, 2023)
+        assert mock_get.call_count == 1  # not retried
+
+    @patch("ingestion.international.world_bank_puller.requests.get")
+    @patch("ingestion.international.world_bank_puller.time.sleep")
+    def test_uncovered_country_live_shape_is_empty(self, mock_sleep, mock_get, puller):
+        """Live shape for TW: total=0 and a null data page."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {"page": 0, "pages": 0, "per_page": 0, "total": 0, "sourceid": None, "lastupdated": None},
+            None,
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        assert puller._fetch_indicator("TW", "NY.GDP.MKTP.CD", 2016, 2026) == []
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +240,30 @@ class TestPullIndicator:
 
         result = puller.pull_indicator("US", "NY.GDP.MKTP.CD")
         assert result["rows_inserted"] == 0
+        assert result["status"] == "NO_DATA"
 
+    @patch.object(WorldBankPuller, "_record_failure")
     @patch.object(WorldBankPuller, "_fetch_indicator")
     @patch("ingestion.international.world_bank_puller.time.sleep")
-    def test_handles_no_data(self, mock_sleep, mock_fetch, puller):
+    def test_handles_no_data(self, mock_sleep, mock_fetch, mock_record, puller):
+        """A legitimately empty series is NO_DATA: no error, no FAILED row."""
         mock_fetch.return_value = []
 
         result = puller.pull_indicator("US", "NY.GDP.MKTP.CD")
-        assert result["status"] == "PARTIAL"
+        assert result["status"] == "NO_DATA"
         assert result["rows_inserted"] == 0
+        assert result["errors"] == []
+        mock_record.assert_not_called()
+
+    @patch.object(WorldBankPuller, "_record_failure")
+    @patch.object(WorldBankPuller, "_fetch_indicator")
+    @patch("ingestion.international.world_bank_puller.time.sleep")
+    def test_error_envelope_is_failed_and_recorded(self, mock_sleep, mock_fetch, mock_record, puller):
+        mock_fetch.side_effect = ValueError("World Bank error response for US/X: Invalid value")
+
+        result = puller.pull_indicator("US", "X")
+        assert result["status"] == "FAILED"
+        mock_record.assert_called_once()
 
     @patch.object(WorldBankPuller, "_fetch_indicator")
     @patch("ingestion.international.world_bank_puller.time.sleep")
@@ -371,8 +419,9 @@ class TestPullAll:
 
         result = puller.pull_all(years=5)
 
-        expected_calls = len(INDICATORS) * len(COUNTRIES)
+        expected_calls = len(INDICATORS) * len(PULLED_COUNTRIES)
         assert mock_pull.call_count == expected_calls
+        assert all(c.args[0] not in WB_UNCOVERED_COUNTRIES for c in mock_pull.call_args_list)
         assert result["source"] == "world_bank"
         assert result["total"] == expected_calls
         assert result["total_rows"] == expected_calls  # 1 row each
@@ -391,8 +440,42 @@ class TestPullAll:
 
         result = puller.pull_all()
 
-        assert result["failed"] == len(INDICATORS) * len(COUNTRIES)
+        assert result["failed"] == len(INDICATORS) * len(PULLED_COUNTRIES)
         assert result["succeeded"] == 0
+
+    @patch.object(WorldBankPuller, "detect_gdp_anomalies", return_value=[])
+    @patch.object(WorldBankPuller, "_ingest_country_actors", return_value=0)
+    @patch.object(WorldBankPuller, "pull_indicator")
+    def test_empty_series_count_as_completed(self, mock_pull, mock_actors, mock_anomaly, puller):
+        """NO_DATA items are completed; the scheduler must see full coverage."""
+        from ingestion.smart_scheduler import OUTCOME_FAILED, OUTCOME_PARTIAL, _classify_outcome
+
+        def fake(country, indicator, years=10):
+            status = "NO_DATA" if country == "AR" else "SUCCESS"
+            return {"series_id": f"wb:{country.lower()}:{indicator}", "rows_inserted": 0,
+                    "status": status, "errors": []}
+
+        mock_pull.side_effect = fake
+        result = puller.pull_all()
+        assert result["succeeded"] == result["total"]
+        assert result["failed"] == 0
+        assert len(result["empty_series"]) == len(INDICATORS)
+        assert _classify_outcome(result)[0] not in {OUTCOME_FAILED, OUTCOME_PARTIAL}
+
+    @patch.object(WorldBankPuller, "detect_gdp_anomalies", return_value=[])
+    @patch.object(WorldBankPuller, "_ingest_country_actors", return_value=0)
+    @patch.object(WorldBankPuller, "pull_indicator")
+    def test_real_failure_still_surfaces_as_partial(self, mock_pull, mock_actors, mock_anomaly, puller):
+        from ingestion.smart_scheduler import OUTCOME_PARTIAL, _classify_outcome
+
+        def fake(country, indicator, years=10):
+            status = "FAILED" if (country, indicator) == ("US", "PA.NUS.FCRF") else "SUCCESS"
+            return {"series_id": "x", "rows_inserted": 1, "status": status, "errors": []}
+
+        mock_pull.side_effect = fake
+        result = puller.pull_all()
+        assert result["failed"] == 1
+        assert _classify_outcome(result)[0] == OUTCOME_PARTIAL
 
     @patch.object(WorldBankPuller, "detect_gdp_anomalies")
     @patch.object(WorldBankPuller, "_ingest_country_actors", return_value=0)
