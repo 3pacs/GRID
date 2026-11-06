@@ -461,7 +461,8 @@ class TestAPIEndpoints:
         ]
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
-            with patch("api.routers.intelligence_actors._read_community_summary", return_value=None):
+            with patch("api.routers.intelligence_actors._read_community_summary", return_value=None), \
+                    patch("api.routers.intelligence_actors.latest_universe_run", return_value=None):
                 with patch("store.graph.get_community_list", return_value=mock_communities):
                     result = (  # plain def handler since #995 (runs in the threadpool)
 
