@@ -415,7 +415,7 @@ def test_no_code_path_rewrites_legacy_outcomes_or_journal_rows():
 
 def test_migration_is_additive_append_only_and_granted():
     src = (ROOT / "migrations" / "versions" / "outcome_rescore_tables_20261106.py").read_text(encoding="utf-8")
-    assert 'down_revision = "finra_short_volume_agg_20261105"' in src
+    assert 'down_revision = "ag_legacy_rescore_20261105"' in src
     for table in ("signal_source_outcomes", "decision_journal_verdicts"):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in src
         assert f"BEFORE UPDATE OR DELETE ON {table}" in src

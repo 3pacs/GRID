@@ -1,7 +1,7 @@
 """Additive, append-only corrected outcomes for signal_sources and decision_journal.
 
 Revision ID: outcome_rescore_tables_20261106
-Revises: finra_short_volume_agg_20261105
+Revises: ag_legacy_rescore_20261105
 
 Neither source table is touched. ``signal_sources.outcome`` (the legacy
 everything-not-CORRECT-is-WRONG rule) and ``decision_journal.verdict`` (2,361
@@ -23,7 +23,7 @@ trigger): a correction is a new version, never an edit. GRANT footer per
 from alembic import op
 
 revision = "outcome_rescore_tables_20261106"
-down_revision = "finra_short_volume_agg_20261105"
+down_revision = "ag_legacy_rescore_20261105"
 branch_labels = None
 depends_on = None
 
