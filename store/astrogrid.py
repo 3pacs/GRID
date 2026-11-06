@@ -2384,7 +2384,7 @@ class AstroGridStore:
         if not valid_variants:
             valid_variants = ["grid_only", "grid_plus_mystical", "mystical_only"]
         filters = ["pr.model_version <> :insight_model"]
-        params: dict[str, Any] = {"limit": limit, **_legacy_score_params()}
+        params: dict[str, Any] = {"limit": limit, "insight_model": "astrogrid-evidence-v2", **_legacy_score_params()}
         if horizon_label in {"macro", "swing"}:
             filters.append("pr.horizon_label = :horizon_label")
             params["horizon_label"] = horizon_label

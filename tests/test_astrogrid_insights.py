@@ -219,3 +219,23 @@ def test_pit_queries_bind_availability_and_exact_source_before_inference():
         PITStore(engine).get_closed_crypto_candles("SPY", as_of=NOW)
     with pytest.raises(ValueError):
         PITStore(engine).get_crypto_actor_actions(as_of=NOW.replace(tzinfo=None))
+
+
+def test_legacy_backtest_exclusion_supplies_every_required_sql_parameter():
+    engine = MagicMock()
+    conn = engine.begin.return_value.__enter__.return_value
+    seen = []
+    def execute(statement, params=None):
+        compiled = statement.compile()
+        required = {name for name, bind in compiled.binds.items() if bind.required}
+        assert required <= set(params or {}), "SQL has an unbound required parameter"
+        result = MagicMock()
+        result.fetchall.return_value = []
+        result.fetchone.return_value = (1,)
+        if "pr.model_version <> :insight_model" in str(statement):
+            seen.append(params["insight_model"])
+        return result
+    conn.execute.side_effect = execute
+    result = AstroGridStore(engine).run_backtests(strategy_variants=["grid_only"])
+    assert result["count"] == 1
+    assert seen == [insights.MODEL_VERSION]
