@@ -23,7 +23,7 @@ OUTCOME_GRACE = timedelta(minutes=15)
 
 
 def _positive(value: Any) -> bool:
-    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
 
 def read_candles(engine: Any, symbol: str, as_of: datetime) -> list[dict[str, Any]]:
@@ -80,7 +80,7 @@ def observe(symbol: str, candles: list[dict[str, Any]], as_of: datetime) -> dict
     volume_known = all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in volumes)
     result.update(available=True, as_of=ended.isoformat(), reason=None, price=latest["close"],
                   change_24h=latest["close"] / baseline["close"] - 1 if complete else None,
-                  volume_24h=sum(volumes) if complete and volume_known else None,
+                  recorded_volume_24h=sum(volumes) if complete and volume_known else None,
                   coverage=round(min(coverage, 1), 4),
                   entry={"source": "binance", "instrument": symbol + "USDT", "interval": "5m",
                          "ts": latest["ts"].isoformat(), "price": latest["close"],

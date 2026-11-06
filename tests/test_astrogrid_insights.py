@@ -53,6 +53,7 @@ def test_observation_has_real_window_and_no_invented_prediction():
     assert obs["as_of"] == NOW.isoformat()
     assert obs["change_24h"] == pytest.approx(102.89 / 100.01 - 1)
     assert obs["recorded_volume_24h"] == 2880
+    assert "volume_24h" not in obs
     assert obs["coverage"] == 1
     p = insights.build_payload(obs, None, NOW)
     assert p["scoring_class"] == "unscored_experimental"
@@ -82,7 +83,7 @@ def test_incomplete_history_is_not_a_zero_return_or_directional_forecast():
 
 
 @pytest.mark.parametrize("field,value", [("actor", ""), ("flow_amount", 0),
-    ("flow_amount", float("nan")), ("flow_direction", "BUY"), ("liquidity_valve", None)])
+    ("flow_amount", float("nan")), ("flow_amount", True), ("flow_direction", "BUY"), ("liquidity_valve", None)])
 def test_conditions_or_malformed_levers_cannot_create_forecast(field, value):
     row = trigger()
     row["details"][field] = value
