@@ -3,8 +3,11 @@
 2026-10-19: the single uvicorn process logged "DB connection held 29.7s --
 acquired_by=MainThread" while GET /api/v1/associations/correlation-matrix (an
 ``async def`` that built a 757x2599 PIT matrix inline) ran, stalling every other
-route. The handler (and /intelligence/levers, same shape) now offload the sync
-body to a worker thread. Offline: every DB / PIT / builder call is a fake.
+route. /intelligence/levers offloads its sync body to a worker thread. Since
+W3-2 (2026-11-06) the association views do not compute in the request at all:
+the precompute job builds them and the GETs read the stored result; the tests
+below pin the unchanged body shapes and that the routes never compute.
+Offline: every DB / PIT / builder call is a fake.
 """
 
 from __future__ import annotations
@@ -69,36 +72,14 @@ def assoc(monkeypatch):
     return threads, started, monkeypatch
 
 
-def test_correlation_matrix_build_runs_off_the_event_loop_and_loop_stays_responsive(assoc) -> None:
-    threads, started, monkeypatch = assoc
-    app, ping_before_release, release = _app(associations.router)
+def test_correlation_matrix_body_shape_is_unchanged(assoc) -> None:
+    """The build moved to the precompute job (W3-2); its body is unchanged."""
+    _threads, _started, monkeypatch = assoc
+    monkeypatch.setattr(associations, "_build_feature_matrix",
+                        lambda *_a, **_k: _fixture_matrix())
 
-    def build(_pit, _ids, _days):
-        threads["build"] = threading.get_ident()
-        started.set()
-        release.wait(5)
-        return _fixture_matrix()
+    body = associations._compute_correlation_matrix(252, 0.3, False)
 
-    monkeypatch.setattr(associations, "_build_feature_matrix", build)
-
-    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
-        loop_thread = client.portal.call(threading.get_ident)
-        request = pool.submit(client.get, "/api/v1/associations/correlation-matrix?days=252")
-        assert started.wait(2)
-        fallback = threading.Timer(3, release.set)
-        fallback.start()
-        try:
-            assert client.get("/ping").json() == {"ok": True}
-            assert ping_before_release == [True]  # served while the build was still blocked
-        finally:
-            release.set()
-            fallback.cancel()
-        response = request.result(timeout=5)
-
-    assert response.status_code == 200
-    assert {threads["engine"], threads["pit"], threads["build"]}.isdisjoint({loop_thread})
-    body = response.json()
-    # Response shape is unchanged.
     assert set(body) == {
         "features", "matrix", "strong_pairs", "pair_counts", "as_of_date",
         "window_start", "window_end", "excluded_stale_features",
@@ -113,11 +94,7 @@ def test_correlation_matrix_empty_registry_shape_is_unchanged(assoc) -> None:
         associations, "_get_feature_registry",
         lambda _e: pd.DataFrame(columns=["id", "name", "family", "description"]),
     )
-    app, _ping, _release = _app(associations.router)
-
-    with TestClient(app) as client:
-        body = client.get("/api/v1/associations/correlation-matrix").json()
-
+    body = associations._compute_correlation_matrix(252, 0.3, False)
     assert body == {"features": [], "matrix": [], "strong_pairs": []}
 
 
@@ -131,42 +108,16 @@ def _anomaly_matrix() -> pd.DataFrame:
     return matrix
 
 
-def test_anomalies_build_runs_off_the_event_loop_and_loop_stays_responsive(assoc) -> None:
-    threads, started, monkeypatch = assoc
-    app, ping_before_release, release = _app(associations.router)
-    alerts: list[tuple[str, int]] = []
-
-    def build(_pit, _ids, _days):
-        threads["build"] = threading.get_ident()
-        started.set()
-        release.wait(5)
-        return _anomaly_matrix()
-
-    def alert(title, _body):
-        alerts.append((title, threading.get_ident()))
-
-    monkeypatch.setattr(associations, "_build_feature_matrix", build)
+def test_anomalies_body_shape_and_alert_switch(assoc) -> None:
+    _threads, _started, monkeypatch = assoc
+    alerts: list[str] = []
+    monkeypatch.setattr(associations, "_build_feature_matrix",
+                        lambda *_a, **_k: _anomaly_matrix())
     monkeypatch.setitem(sys.modules, "alerts.email", types.SimpleNamespace(
-        alert_on_discovery_insight=alert))
+        alert_on_discovery_insight=lambda title, _body: alerts.append(title)))
 
-    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
-        loop_thread = client.portal.call(threading.get_ident)
-        request = pool.submit(client.get, "/api/v1/associations/anomalies?sigma_threshold=2.5")
-        assert started.wait(2)
-        fallback = threading.Timer(3, release.set)
-        fallback.start()
-        try:
-            assert client.get("/ping").json() == {"ok": True}
-            assert ping_before_release == [True]  # served while the build was still blocked
-        finally:
-            release.set()
-            fallback.cancel()
-        response = request.result(timeout=5)
+    body = associations._compute_anomalies(2.5, 252, alert=False)
 
-    assert response.status_code == 200
-    assert {threads["engine"], threads["pit"], threads["build"]}.isdisjoint({loop_thread})
-    body = response.json()
-    # Response shape is unchanged.
     assert set(body) == {"anomalies", "threshold"} and body["threshold"] == 2.5
     [anomaly] = body["anomalies"]
     assert anomaly["feature"] == "feat_a" and anomaly["severity"] == "extreme"
@@ -174,27 +125,32 @@ def test_anomalies_build_runs_off_the_event_loop_and_loop_stays_responsive(assoc
         "feature", "current_value", "zscore", "historical_mean", "historical_std",
         "severity", "broken_correlations",
     }
-    # The alert e-mail (blocking SMTP) also left the event loop.
-    assert [t for t, _ in alerts] == ["Extreme Anomalies Detected (1)"]
-    assert loop_thread not in {ident for _, ident in alerts}
+    assert alerts == []  # the job alerts itself, only on a changed extreme set
+    associations._compute_anomalies(2.5, 252, alert=True)
+    assert alerts == ["Extreme Anomalies Detected (1)"]
 
 
-def test_anomalies_short_circuit_shapes_are_unchanged(assoc) -> None:
-    _threads, _started, monkeypatch = assoc
+def test_association_routes_never_compute(assoc, monkeypatch) -> None:
+    """GETs read api_precomputed_results; the builders must not run."""
+    _threads, _started, _mp = assoc
+
+    def boom(*_a, **_k):
+        raise AssertionError("route computed inline")
+
+    for name in ("_build_feature_matrix", "_compute_correlation_matrix",
+                 "_compute_anomalies", "_compute_regime_features"):
+        monkeypatch.setattr(associations, name, boom)
+    from api import precompute_serving
+
+    monkeypatch.setattr(precompute_serving.store, "read_result", lambda *_a, **_k: None)
     app, _ping, _release = _app(associations.router)
-
     with TestClient(app) as client:
-        monkeypatch.setattr(
-            associations, "_build_feature_matrix",
-            lambda *_a: _fixture_matrix().iloc[:10],  # < 30 rows
-        )
-        assert client.get("/api/v1/associations/anomalies").json() == {
-            "anomalies": [], "message": "Insufficient data"}
-        monkeypatch.setattr(
-            associations, "_get_feature_registry",
-            lambda _e: pd.DataFrame(columns=["id", "name", "family", "description"]),
-        )
-        assert client.get("/api/v1/associations/anomalies").json() == {"anomalies": []}
+        for url in ("/api/v1/associations/correlation-matrix?days=252",
+                    "/api/v1/associations/anomalies?sigma_threshold=2.5",
+                    "/api/v1/associations/regime-features"):
+            r = client.get(url)
+            assert r.status_code == 503, url
+            assert r.json()["available"] is False
 
 
 def test_levers_build_runs_off_the_event_loop_and_loop_stays_responsive(monkeypatch) -> None:

@@ -198,14 +198,16 @@ def _fetch_pac_contributions(engine: Engine, ticker: str, days: int = 730) -> tu
     return total, recipients
 
 
-def _fetch_member_votes(engine: Engine, member_name: str, ticker: str) -> list[dict]:
-    """Fetch votes by a specific member on bills affecting a ticker.
+def _load_recent_legislation(engine: Engine) -> list[tuple[Any, dict[str, Any]]]:
+    """The latest 200 LEGISLATION payloads from the last year, parsed once.
 
-    Searches LEGISLATION entries affecting the ticker, then cross-references
-    with the member name in sponsors/cosponsors.
+    ``_fetch_member_votes`` used to run this exact query (it does not depend
+    on the member or the ticker; both are filtered in Python) once per
+    (member, ticker) pair -- hundreds of identical ``raw_series`` scans per
+    ``vote_trade_hypocrisy`` call. Callers now load it once and pass it in.
 
     Returns:
-        List of {bill_id, title, vote, status, date}
+        ``[(obs_date, payload), ...]`` newest first, unparseable rows dropped.
     """
     cutoff = date.today() - timedelta(days=365)
     with engine.connect() as conn:
@@ -221,13 +223,35 @@ def _fetch_member_votes(engine: Engine, member_name: str, ticker: str) -> list[d
             ),
             {"pattern": "LEGISLATION:%", "cutoff": cutoff},
         ).fetchall()
+    out: list[tuple[Any, dict[str, Any]]] = []
+    for row in rows:
+        payload = _parse_json(row[2])
+        if payload:
+            out.append((row[1], payload))
+    return out
+
+
+def _fetch_member_votes(
+    engine: Engine,
+    member_name: str,
+    ticker: str,
+    legislation: list[tuple[Any, dict[str, Any]]] | None = None,
+) -> list[dict]:
+    """Fetch votes by a specific member on bills affecting a ticker.
+
+    Searches LEGISLATION entries affecting the ticker, then cross-references
+    with the member name in sponsors/cosponsors. Pass ``legislation`` (from
+    :func:`_load_recent_legislation`) to reuse one read across many calls.
+
+    Returns:
+        List of {bill_id, title, vote, status, date}
+    """
+    if legislation is None:
+        legislation = _load_recent_legislation(engine)
 
     votes: list[dict] = []
     member_lower = member_name.lower()
-    for row in rows:
-        payload = _parse_json(row[2])
-        if not payload:
-            continue
+    for obs_date, payload in legislation:
         affected = payload.get("affected_tickers", [])
         if ticker not in affected:
             continue
@@ -247,7 +271,7 @@ def _fetch_member_votes(engine: Engine, member_name: str, ticker: str) -> list[d
                 "title": payload.get("title", ""),
                 "vote": member_voted or ("SPONSOR" if member_lower in sponsor else "COSPONSOR"),
                 "status": payload.get("status", ""),
-                "date": str(row[1]),
+                "date": str(obs_date),
             })
     return votes
 
@@ -591,6 +615,7 @@ def detect_circular_flows(engine: Engine) -> list[InfluenceLoop]:
 
     ticker_to_name = _get_unique_tickers()
     loops: list[InfluenceLoop] = []
+    legislation: list[tuple[Any, dict[str, Any]]] | None = None
 
     for ticker, company_name in ticker_to_name.items():
         lobby_total, lobby_details = _fetch_lobbying(engine, ticker)
@@ -615,7 +640,9 @@ def detect_circular_flows(engine: Engine) -> list[InfluenceLoop]:
         legislation_affected: list[dict] = []
         for member_lower, recip_info in recipient_members.items():
             member_name = recip_info.get("member", "")
-            votes = _fetch_member_votes(engine, member_name, ticker)
+            if legislation is None:
+                legislation = _load_recent_legislation(engine)
+            votes = _fetch_member_votes(engine, member_name, ticker, legislation)
             for v in votes:
                 legislation_affected.append({
                     "bill": v.get("bill_id", ""),
@@ -702,6 +729,7 @@ def get_influence_for_ticker(engine: Engine, ticker: str) -> dict[str, Any]:
 
     # Vote lookups for overlapping members
     hypocrisy_flags: list[dict] = []
+    ticker_legislation: list[tuple[Any, dict[str, Any]]] | None = None
     for member_lower in overlap_members:
         # Find the member's full name from recipients
         full_name = ""
@@ -710,7 +738,9 @@ def get_influence_for_ticker(engine: Engine, ticker: str) -> dict[str, Any]:
                 full_name = r.get("member", "")
                 break
         if full_name:
-            votes = _fetch_member_votes(engine, full_name, ticker)
+            if ticker_legislation is None:
+                ticker_legislation = _load_recent_legislation(engine)
+            votes = _fetch_member_votes(engine, full_name, ticker, ticker_legislation)
             member_trade_list = [t for t in member_trades if t.get("member", "").lower() == member_lower]
             for trade in member_trade_list:
                 for vote in votes:
@@ -804,11 +834,12 @@ def vote_trade_hypocrisy(engine: Engine) -> list[dict[str, Any]]:
         })
 
     # Step 2: For each member, find votes on legislation affecting their traded tickers
+    legislation = _load_recent_legislation(engine)
     for member_name, trades in member_trades.items():
         traded_tickers = {t["ticker"] for t in trades if t.get("ticker")}
 
         for ticker in traded_tickers:
-            votes = _fetch_member_votes(engine, member_name, ticker)
+            votes = _fetch_member_votes(engine, member_name, ticker, legislation)
             if not votes:
                 continue
 

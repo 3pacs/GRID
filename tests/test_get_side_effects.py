@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -329,7 +329,11 @@ class TestRegimeReadOnly:
         cache_spy.assert_not_called()
 
     def test_get_regime_analogs_never_persists(self):
+        # Since W3-2 the analogs are built by the precompute job (the route
+        # only reads api_precomputed_results); the builder keeps the
+        # persist=False contract.
         from api.routers import intelligence_regime as ir
+        from intelligence import api_precompute as ap
         from intelligence.regime import state_vector as sv_mod
 
         full = sv_mod.StateVector(
@@ -350,27 +354,29 @@ class TestRegimeReadOnly:
              patch.object(sv_mod, "cache_state_vector") as cache_spy, \
              patch("intelligence.regime.classifier.classify_regime", return_value=fake_regime), \
              patch("intelligence.regime.episode_matcher.find_analogous_episodes", return_value=fake_matches), \
-             patch("intelligence.regime.forecast.generate_conditional_forecast", return_value=fake_forecast):
-            body = ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
+             patch("intelligence.regime.forecast.generate_conditional_forecast", return_value=fake_forecast), \
+             patch.object(ir, "_get_timesfm_comparison", return_value={"available": False, "reason": "test"}):
+            [out] = ap.build_regime_analogs(ap.BuildContext(engine=MagicMock(), now=datetime.now(timezone.utc)))
 
-        assert body["available"] is True
+        assert out.payload is not None and out.payload["available"] is True
+        assert out.as_of == date(2026, 9, 27)
         cache_spy.assert_not_called()
         ensure.assert_not_called()
 
     def test_get_regime_analogs_below_floor_reports_unavailable(self):
-        from api.routers import intelligence_regime as ir
+        from intelligence import api_precompute as ap
         from intelligence.regime import state_vector as sv_mod
 
         thin = sv_mod.StateVector(
             as_of_date=date(2026, 9, 27), values=tuple([None] * len(sv_mod.DIM_NAMES)),
             completeness=0.1, stale_dimensions=(),
         )
-        with patch.object(ir, "get_db_engine", return_value=MagicMock()), \
-             patch.object(sv_mod, "compute_state_vector", return_value=thin), \
+        with patch.object(sv_mod, "compute_state_vector", return_value=thin), \
              patch.object(sv_mod, "_read_cached_row", return_value=None), \
              patch.object(sv_mod, "cache_state_vector") as cache_spy:
-            body = ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
+            [out] = ap.build_regime_analogs(ap.BuildContext(engine=MagicMock(), now=datetime.now(timezone.utc)))
 
-        assert body["available"] is False
-        assert "reason" in body
+        # Recorded as an unavailable attempt (never persisted as a result).
+        assert out.payload is None
+        assert out.unavailable_reason and "complete" in out.unavailable_reason
         cache_spy.assert_not_called()

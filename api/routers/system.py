@@ -1855,20 +1855,51 @@ def _get_raw_count(engine) -> int:
         return 0
 
 
+def _compute_architecture_db_stats(engine) -> dict:
+    """The database half of ``/system/architecture`` (precompute job body).
+
+    ``_get_puller_stats`` scans ``raw_series`` per source (~9-20 s); the
+    ``architecture`` route reads this result from the ``architecture``
+    precompute job instead of running it per request.
+    """
+    return {
+        "puller_nodes": _get_puller_stats(engine),
+        "feature_count": _get_feature_count(engine),
+        "resolved_count": _get_resolved_count(engine),
+        "raw_count": _get_raw_count(engine),
+    }
+
+
+def _count_status(n: int | None) -> str:
+    if n is None:
+        return "unknown"
+    return "healthy" if n > 0 else "new"
+
+
+def _fmt_count(n: int | None) -> str:
+    return f"{n:,}" if n is not None else "count unknown"
+
+
 @router.get("/architecture")
 def architecture(_token: str = Depends(require_auth)) -> dict:
     """System architecture introspection.
 
     Returns a complete map of all GRID modules, data flows, connections,
     and health status -- a meta-view of the running system.
-    """
-    engine = get_db_engine()
 
-    # Gather puller stats from DB
-    puller_nodes = _get_puller_stats(engine)
-    feature_count = _get_feature_count(engine)
-    resolved_count = _get_resolved_count(engine)
-    raw_count = _get_raw_count(engine)
+    The database stats (puller activity, table counts) come from the
+    ``architecture`` precompute job (every 30 min; ``precompute`` block
+    says how old). Before the first run they are ``null`` / ``unknown``,
+    never 0. Route and file counts are read live (cheap).
+    """
+    from api.precompute_serving import read_precomputed
+
+    db_stats, precompute_meta = read_precomputed("system.architecture_db", {})
+    db_stats = db_stats or {}
+    puller_nodes = db_stats.get("puller_nodes") or []
+    feature_count = db_stats.get("feature_count")
+    resolved_count = db_stats.get("resolved_count")
+    raw_count = db_stats.get("raw_count")
 
     # Count routes from the running app
     try:
@@ -1913,7 +1944,7 @@ def architecture(_token: str = Depends(require_auth)) -> dict:
             "type": "layer",
             "children": [
                 {"id": "resolver", "label": "Conflict Resolver", "type": "processor",
-                 "status": "healthy" if resolved_count > 0 else "new"},
+                 "status": _count_status(resolved_count)},
                 {"id": "entity_map", "label": "Entity Map", "type": "processor",
                  "status": "healthy"},
             ],
@@ -1923,14 +1954,14 @@ def architecture(_token: str = Depends(require_auth)) -> dict:
             "label": "PIT Store",
             "type": "layer",
             "children": [
-                {"id": "pit_engine", "label": f"PIT Query Engine ({resolved_count:,} rows)", "type": "engine",
-                 "status": "healthy" if resolved_count > 0 else "new",
+                {"id": "pit_engine", "label": f"PIT Query Engine ({_fmt_count(resolved_count)} rows)", "type": "engine",
+                 "status": _count_status(resolved_count),
                  "rows": resolved_count},
-                {"id": "feature_registry", "label": f"Feature Registry ({feature_count:,} features)", "type": "engine",
-                 "status": "healthy" if feature_count > 0 else "new",
+                {"id": "feature_registry", "label": f"Feature Registry ({_fmt_count(feature_count)} features)", "type": "engine",
+                 "status": _count_status(feature_count),
                  "rows": feature_count},
-                {"id": "raw_store", "label": f"Raw Series ({raw_count:,} rows)", "type": "engine",
-                 "status": "healthy" if raw_count > 0 else "new",
+                {"id": "raw_store", "label": f"Raw Series ({_fmt_count(raw_count)} rows)", "type": "engine",
+                 "status": _count_status(raw_count),
                  "rows": raw_count},
             ],
         },
@@ -2034,6 +2065,7 @@ def architecture(_token: str = Depends(require_auth)) -> dict:
         "data_flows": data_flows,
         "stats": stats,
         "gaps": gaps,
+        "precompute": precompute_meta,
     }
 
 

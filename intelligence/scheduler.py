@@ -616,6 +616,25 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("02:35").do(_oracle_recalibration_exploratory_daily)
 
+    def _api_precompute_tick() -> None:
+        """W3-2 (2026-11-06): precompute the slowest API read endpoints.
+
+        Starts at most one background worker (``intelligence/api_precompute.py``)
+        that runs every due job -- regime analogs, globe, influence, signals
+        snapshot, smart heatmap, cross-reference narrative, associations,
+        architecture stats, 100x options scan -- and writes
+        ``api_precomputed_results``, which those endpoints now only read.
+        The worker thread keeps a minutes-long job off this loop.
+        Kill switch: ``GRID_API_PRECOMPUTE_ENABLED=0``.
+        """
+        try:
+            from intelligence.api_precompute import start_background_tick
+            start_background_tick()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("api precompute tick failed to start: {e}", e=str(exc))
+
+    _sched.every(5).minutes.do(_api_precompute_tick)
+
     def _realized_alpha_daily() -> None:
         """GRID-4 §8.1 truth gate: rolling realized alpha vs SPY, net of
         5 bp/side, for every paper trade and scored oracle prediction.

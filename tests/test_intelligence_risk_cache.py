@@ -1,4 +1,4 @@
-"""Regression tests for the thread-safe TTLCache wiring on /risk-map and /globe.
+"""Regression tests for the thread-safe TTLCache wiring on /risk-map (and /globe, retired).
 
 The risk router previously held two plain dicts (``_risk_map_cache`` and
 ``_globe_cache``) for cached payload + timestamp. Under the multi-threaded
@@ -48,29 +48,13 @@ def test_risk_map_cache_returns_none_when_missing():
     assert cache.get(intelligence_risk._RISK_MAP_CACHE_KEY) is None
 
 
-# ── /globe cache ────────────────────────────────────────────────────────
+# ── /globe ──────────────────────────────────────────────────────────────
+# The /globe TTLCache is gone (W3-2, 2026-11-06): the globe is built by the
+# ``globe`` precompute job and the route reads api_precomputed_results.
 
 
-def test_globe_cache_is_ttlcache_instance():
-    assert isinstance(intelligence_risk._globe_cache, TTLCache)
-
-
-def test_globe_cache_ttl_matches_constant():
-    assert intelligence_risk._globe_cache._ttl == intelligence_risk._GLOBE_TTL
-
-
-def test_globe_cache_set_then_get_roundtrip():
-    cache = intelligence_risk._globe_cache
-    cache.clear()
-    payload = {"countries": [{"iso": "US", "score": 1.0}]}
-    cache.set(intelligence_risk._GLOBE_CACHE_KEY, payload)
-    assert cache.get(intelligence_risk._GLOBE_CACHE_KEY) == payload
-
-
-def test_globe_cache_returns_none_when_missing():
-    cache = intelligence_risk._globe_cache
-    cache.clear()
-    assert cache.get(intelligence_risk._GLOBE_CACHE_KEY) is None
+def test_globe_route_has_no_in_process_cache():
+    assert not hasattr(intelligence_risk, "_globe_cache")
 
 
 # ── Shared TTL / concurrency behaviour ──────────────────────────────────
@@ -124,4 +108,3 @@ def test_ttl_cache_concurrent_set_and_get_is_safe():
 def _clear_after_each():
     yield
     intelligence_risk._risk_map_cache.clear()
-    intelligence_risk._globe_cache.clear()

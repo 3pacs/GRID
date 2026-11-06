@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from loguru import logger as log
 
 from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
+from api.precompute_serving import serve_precomputed
 from utils.ttl_cache import TTLCache
 from utils.single_flight import single_flight
 
@@ -356,43 +358,25 @@ def get_influence_network(
 @router.get("/influence/circular-flows")
 def get_circular_flows(
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    """Detect circular flows: Company -> lobbies -> Member -> votes -> Bill -> funds -> Company."""
-    try:
-        from intelligence.influence_network import detect_circular_flows
+) -> Response:
+    """Detect circular flows: Company -> lobbies -> Member -> votes -> Bill -> funds -> Company.
 
-        engine = get_db_engine()
-        loops = detect_circular_flows(engine)
-        return {
-            "loops": [l.to_dict() for l in loops],
-            "total": len(loops),
-            "circular_count": sum(1 for l in loops if l.circular_flow_detected),
-        }
-
-    except Exception as exc:
-        log.warning("Circular flows endpoint failed: {e}", e=str(exc))
-        return {"loops": [], "total": 0, "circular_count": 0, "error": str(exc)}
+    Served from the ``influence`` precompute job (every 6 h), which also
+    persists the loops to ``influence_loops`` -- a write this GET used to make.
+    """
+    return serve_precomputed("intelligence.influence_circular_flows", {})
 
 
 @router.get("/influence/hypocrisy")
 def get_vote_trade_hypocrisy(
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    """Detect vote/trade hypocrisy — members who vote one way but trade another."""
-    try:
-        from intelligence.influence_network import vote_trade_hypocrisy
+) -> Response:
+    """Detect vote/trade hypocrisy — members who vote one way but trade another.
 
-        engine = get_db_engine()
-        flags = vote_trade_hypocrisy(engine)
-        return {
-            "flags": flags,
-            "total": len(flags),
-            "members_flagged": len({f["member"] for f in flags}),
-        }
-
-    except Exception as exc:
-        log.warning("Vote-trade hypocrisy endpoint failed: {e}", e=str(exc))
-        return {"flags": [], "total": 0, "members_flagged": 0, "error": str(exc)}
+    Served from the ``influence`` precompute job (every 6 h); the >125 s
+    scan never runs in the request.
+    """
+    return serve_precomputed("intelligence.influence_hypocrisy", {})
 
 
 # ── Export Controls Endpoints ──────────────────────────────────────────────
