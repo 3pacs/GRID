@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.precompute_serving import serve_precomputed
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "regime"])
 
@@ -62,63 +64,28 @@ def get_regime_analogs(
     min_quality: float = Query(0.4, ge=0.1, le=0.9, description="Min match quality"),
     include_timesfm: bool = Query(True, description="Include TimesFM comparison"),
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """Find analogous historical episodes and generate conditional forecast.
 
     Optionally includes TimesFM foundation model forecast for side-by-side
     comparison. The analog forecast is the primary signal; TimesFM is a
     second opinion from a different methodology.
 
-    Read-only: never persists a state vector (see ``get_regime``'s docstring
-    for the same contract). If the query vector's completeness is below the
-    analog threshold, returns ``available: false`` with a reason instead of
-    matching against a partial/misleading vector.
+    Served from ``api_precomputed_results`` (job ``regime_analogs`` in
+    ``intelligence/api_precompute.py``, every 6 h); the >125 s build never
+    runs in the request. ``include_timesfm=false`` drops the stored TimesFM
+    section. A state vector below the completeness threshold is recorded as
+    ``unavailable`` by the job and served as a 503 with its reason.
     """
-    try:
-        from intelligence.regime.state_vector import MIN_CACHE_COMPLETENESS, get_or_compute_state_vector
-        from intelligence.regime.episode_matcher import find_analogous_episodes
-        from intelligence.regime.forecast import generate_conditional_forecast
-        from intelligence.regime.classifier import classify_regime
+    def _drop_timesfm(body: dict[str, Any]) -> dict[str, Any]:
+        body.pop("timesfm", None)
+        return body
 
-        engine = get_db_engine()
-        sv = get_or_compute_state_vector(engine, persist=False)
-
-        if sv.completeness < MIN_CACHE_COMPLETENESS:
-            return {
-                "available": False,
-                "reason": (
-                    f"state vector for {sv.as_of_date.isoformat()} is only "
-                    f"{sv.completeness:.0%} complete (need >= {MIN_CACHE_COMPLETENESS:.0%}) "
-                    "— too thin to match against historical episodes"
-                ),
-                "as_of_date": sv.as_of_date.isoformat(),
-                "cached": sv.cached,
-            }
-
-        regime = classify_regime(sv)
-        matches = find_analogous_episodes(engine, sv, n=n, min_quality=min_quality)
-        forecast = generate_conditional_forecast(engine, matches)
-
-        result: dict[str, Any] = {
-            "available": True,
-            "regime": regime.to_dict(),
-            "matches": matches.to_dict(),
-            "forecast": forecast.to_dict(),
-            "cached": sv.cached,
-        }
-
-        # TimesFM comparison (non-blocking — failure doesn't break the response)
-        if include_timesfm:
-            try:
-                result["timesfm"] = _get_timesfm_comparison(engine)
-            except Exception as tfm_exc:
-                log.debug("TimesFM comparison skipped: {e}", e=str(tfm_exc))
-                result["timesfm"] = {"available": False, "reason": str(tfm_exc)}
-
-        return result
-    except Exception as exc:
-        log.warning("Regime analogs failed: {e}", e=str(exc))
-        return {"error": str(exc)}
+    return serve_precomputed(
+        "intelligence.regime_analogs",
+        {"n": n, "min_quality": min_quality},
+        transform=None if include_timesfm else _drop_timesfm,
+    )
 
 
 def _get_timesfm_comparison(engine: object) -> dict[str, Any]:

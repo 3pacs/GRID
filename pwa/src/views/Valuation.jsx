@@ -6,6 +6,7 @@ import {
     Send, Clock, BarChart3, AlertTriangle, ChevronDown, ChevronUp,
     Clipboard, FileText, Target, Activity,
 } from 'lucide-react';
+import { apiErrorMessage, isApiError, optionalApi, withRequestTimeout } from '../utils/apiResult.js';
 
 /* ─────────────── Helpers ─────────────── */
 
@@ -438,6 +439,7 @@ export default function Valuation() {
     const [promptData, setPromptData] = useState(null);
     const [predictions, setPredictions] = useState([]);
     const [error, setError] = useState(null);
+    const [predictionsError, setPredictionsError] = useState(null);
 
     const handleAnalyze = useCallback(async () => {
         if (!ticker.trim()) return;
@@ -445,18 +447,25 @@ export default function Valuation() {
         setError(null);
         setPromptData(null);
         setPredictions([]);
+        setPredictionsError(null);
 
         try {
+            const symbol = ticker.trim().toUpperCase();
             const [promptResult, predResult] = await Promise.all([
-                api.get(`/api/v1/valuation/prompt/${ticker.trim().toUpperCase()}`),
-                api.get(`/api/v1/valuation/predictions/${ticker.trim().toUpperCase()}`).catch(() => ({ predictions: [] })),
+                withRequestTimeout(api.get(`/api/v1/valuation/prompt/${encodeURIComponent(symbol)}`), { label: `Valuation for ${symbol}` }),
+                optionalApi(api.get(`/api/v1/valuation/predictions/${encodeURIComponent(symbol)}`), { label: 'Prediction history' }),
             ]);
 
-            if (promptResult.status === 'error') {
-                setError(promptResult.error);
+            // api.js resolves failures as { error: true, message } markers; the
+            // old `status === 'error'` check missed them and rendered nothing.
+            if (promptResult?.status === 'error' || isApiError(promptResult)) {
+                setError(apiErrorMessage(promptResult, `Valuation for ${symbol} unavailable`));
+            } else if (!promptResult?.data) {
+                setError(`Valuation for ${symbol} returned no data`);
             } else {
                 setPromptData(promptResult);
-                setPredictions(predResult.predictions || []);
+                setPredictions(Array.isArray(predResult.value?.predictions) ? predResult.value.predictions : []);
+                setPredictionsError(predResult.error);
             }
         } catch (err) {
             setError(err.message || 'Analysis failed');
@@ -644,6 +653,11 @@ export default function Valuation() {
                     )}
 
                     {/* Prediction history */}
+                    {predictionsError && (
+                        <div role="status" style={{ fontSize: '12px', color: colors.textMuted }}>
+                            Prediction history unavailable: {predictionsError}
+                        </div>
+                    )}
                     <PredictionHistory predictions={predictions} />
                 </div>
             )}

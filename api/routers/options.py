@@ -7,10 +7,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.precompute_serving import serve_precomputed
 
 router = APIRouter(prefix="/api/v1/options", tags=["options"])
 SAVED_RECOMMENDATION_MAX_AGE = timedelta(hours=24)
@@ -458,36 +460,16 @@ def scan_mispricing(
 @router.get("/100x")
 def get_100x_opportunities(
     _token: str = Depends(require_auth),
-) -> dict:
-    """Return only 100x+ flagged mispricing opportunities."""
-    try:
-        from discovery.options_scanner import OptionsScanner
+) -> Response:
+    """Return only 100x+ flagged mispricing opportunities.
 
-        engine = get_db_engine()
-        scanner = OptionsScanner(engine)
-        opps = scanner.get_100x_opportunities()
-
-        results = [
-            {
-                "ticker": o.ticker,
-                "scan_date": str(o.scan_date),
-                "score": o.score,
-                "estimated_payoff_multiple": o.estimated_payoff_multiple,
-                "direction": o.direction,
-                "thesis": o.thesis,
-                "strikes": o.strikes,
-                "expiry": o.expiry,
-                "spot_price": o.spot_price,
-                "iv_atm": o.iv_atm,
-                "confidence": o.confidence,
-            }
-            for o in opps
-        ]
-
-        return {"opportunities": results, "count": len(results)}
-    except Exception as exc:
-        log.warning("100x scan failed: {e}", e=str(exc))
-        return {"opportunities": [], "count": 0, "error": str(exc)}
+    Served from ``api_precomputed_results`` (job ``options_100x``): the
+    full ``OptionsScanner`` pass with SVI vol-surface fits (~160 s on
+    grid-svr) reruns in the background after each options pull (when
+    ``options_daily_signals`` changes, at least every 12 h), never in the
+    request. Each opportunity carries the ``signal_date`` it was scored from.
+    """
+    return serve_precomputed("options.100x", {})
 
 
 @router.get("/history")

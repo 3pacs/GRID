@@ -8,6 +8,8 @@
  */
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Map as MapLibreMap } from 'maplibre-gl';
+import { ensureMaplibreWorker } from '../utils/maplibreWorker.js';
+import { optionalApi, requireApi } from '../utils/apiResult.js';
 import DeckGL from '@deck.gl/react';
 import { ArcLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { HeatmapLayer } from '@deck.gl/aggregation-layers';
@@ -93,6 +95,8 @@ function GeoFlows() {
     const [showHeatmap, setShowHeatmap] = useState(false);
     const [hoveredItem, setHoveredItem] = useState(null);
     const [webglSupported, setWebglSupported] = useState(true);
+    const [basemapError, setBasemapError] = useState(null);
+    const [layerErrors, setLayerErrors] = useState([]);
     const mapContainer = useRef(null);
     const mapRef = useRef(null);
 
@@ -113,15 +117,31 @@ function GeoFlows() {
     useEffect(() => {
         if (!webglSupported || !mapContainer.current || mapRef.current) return;
 
-        const map = new MapLibreMap({
-            container: mapContainer.current,
-            style: MAP_STYLE,
-            center: [INITIAL_VIEW.longitude, INITIAL_VIEW.latitude],
-            zoom: INITIAL_VIEW.zoom,
-            pitch: INITIAL_VIEW.pitch,
-            bearing: INITIAL_VIEW.bearing,
-            interactive: false, // deck.gl handles interaction
-            attributionControl: false,
+        let map;
+        try {
+            ensureMaplibreWorker();
+            map = new MapLibreMap({
+                container: mapContainer.current,
+                style: MAP_STYLE,
+                center: [INITIAL_VIEW.longitude, INITIAL_VIEW.latitude],
+                zoom: INITIAL_VIEW.zoom,
+                pitch: INITIAL_VIEW.pitch,
+                bearing: INITIAL_VIEW.bearing,
+                interactive: false, // deck.gl handles interaction
+                attributionControl: false,
+            });
+        } catch (err) {
+            // The deck.gl overlay still renders without the basemap; say so
+            // instead of leaving a silent black background.
+            setBasemapError(err?.message || 'map could not be created');
+            return undefined;
+        }
+
+        // Worker, style and tile failures arrive as 'error' events rather
+        // than exceptions. Surface the first one; deck.gl layers keep working.
+        map.on('error', (event) => {
+            const message = event?.error?.message || 'basemap request failed';
+            setBasemapError(prev => prev || message);
         });
 
         mapRef.current = map;
@@ -149,15 +169,20 @@ function GeoFlows() {
     // Fetch data
     const { data: geoData, loading, error, refetch: reloadGeoData } = useAsyncData(async () => {
         const params = `flow_type=${flowType}&days=${days}`;
+        // api.js resolves failures as markers; they used to read as
+        // "0 flows · 0 actors · 0 signals" on an empty map.
+        // Flows are the primary layer (error state); the other two are
+        // optional overlays whose failure is listed in the panel.
         const [flowRes, actorRes, densityRes] = await Promise.all([
-            api.get(`/api/v1/geo/flows?${params}`),
-            api.get(`/api/v1/geo/actors?min_influence=0.3&limit=300`),
-            api.get(`/api/v1/geo/signals/density?days=${days}`),
+            requireApi(api.get(`/api/v1/geo/flows?${params}`), { label: 'Geo flows' }),
+            optionalApi(api.get(`/api/v1/geo/actors?min_influence=0.3&limit=300`), { label: 'Actor locations' }),
+            optionalApi(api.get(`/api/v1/geo/signals/density?days=${days}`), { label: 'Signal density' }),
         ]);
-        setFlows(flowRes?.flows || []);
-        setActors(actorRes?.actors || []);
-        setDensity(densityRes?.density || []);
-        return { flowRes, actorRes, densityRes };
+        setFlows(Array.isArray(flowRes?.flows) ? flowRes.flows : []);
+        setActors(Array.isArray(actorRes.value?.actors) ? actorRes.value.actors : []);
+        setDensity(Array.isArray(densityRes.value?.density) ? densityRes.value.density : []);
+        setLayerErrors([actorRes.error, densityRes.error].filter(Boolean));
+        return { flowRes, actorRes: actorRes.value, densityRes: densityRes.value };
     }, { fallback: null, deps: [flowType, days, webglSupported], skip: !webglSupported });
 
     // Arc layer -- capital flows between locations
@@ -332,6 +357,11 @@ function GeoFlows() {
                     <div style={{ fontSize: 11, color: '#5A7080' }}>
                         {flows.length} flows &middot; {actors.length} actors &middot; {density.length} signals
                     </div>
+                    {!error && layerErrors.length > 0 && (
+                        <div data-testid="geo-layer-errors" style={{ fontSize: 11, color: '#E0B050', marginTop: 4, maxWidth: 260 }}>
+                            Unavailable: {layerErrors.join(' | ')}
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -368,6 +398,18 @@ function GeoFlows() {
                             Influence: {(hoveredItem.influence * 100).toFixed(0)}%
                         </div>
                     )}
+                </div>
+            )}
+
+            {/* Basemap failure: arcs/points still render, but say the map is missing */}
+            {basemapError && (
+                <div role="status" data-testid="geo-basemap-error" style={{
+                    position: 'absolute', bottom: 16, left: 16, zIndex: 10,
+                    background: 'rgba(13,17,23,0.92)', border: '1px solid #8A6000',
+                    borderRadius: 6, padding: '6px 10px', fontSize: 11, color: '#E0B050',
+                    maxWidth: 420, fontFamily: "'IBM Plex Sans', sans-serif",
+                }}>
+                    Basemap unavailable: {basemapError}
                 </div>
             )}
 

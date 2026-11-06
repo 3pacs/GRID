@@ -10,6 +10,7 @@ import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 import { formatDateTime } from '../utils/formatTime.js';
+import { apiErrorMessage, isApiError, requireApi, withRequestTimeout } from '../utils/apiResult.js';
 
 // Inline TopoJSON feature extraction (avoids topojson-client dependency).
 // Converts a TopoJSON topology + object into a GeoJSON FeatureCollection.
@@ -125,6 +126,7 @@ export default function Globe() {
     const [world, setWorld] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [reloadKey, setReloadKey] = useState(0);
     const [layers, setLayers] = useState({ trade: true, capital: true, fx: false, gdp: true, lights: false });
     const [selectedCountry, setSelectedCountry] = useState(null);
     const [hoveredCountry, setHoveredCountry] = useState(null);
@@ -140,9 +142,18 @@ export default function Globe() {
             setError(null);
             try {
                 const [globeData, topoResp] = await Promise.all([
-                    api.getGlobeData(),
-                    fetch(WORLD_TOPO_URL).then(r => r.json()),
+                    // A failure marker used to be stored as data: the map drew
+                    // with every country blank and no error.
+                    requireApi(api.getGlobeData(), { label: 'Globe data' }),
+                    withRequestTimeout(
+                        fetch(WORLD_TOPO_URL).then((r) => {
+                            if (!r.ok) throw new Error(`World map outline HTTP ${r.status}`);
+                            return r.json();
+                        }).catch(err => ({ error: true, message: `World map outline unavailable: ${err.message}` })),
+                        { label: 'World map outline', ms: 20000 },
+                    ),
                 ]);
+                if (isApiError(topoResp)) throw new Error(apiErrorMessage(topoResp, 'World map outline unavailable'));
                 setData(globeData);
                 setWorld(topoResp);
             } catch (err) {
@@ -151,7 +162,7 @@ export default function Globe() {
             setLoading(false);
         };
         load();
-    }, []);
+    }, [reloadKey]);
 
     // Responsive sizing
     useEffect(() => {
@@ -471,7 +482,12 @@ export default function Globe() {
                             Loading globe data...
                         </div>
                     ) : error ? (
-                        <div style={{ padding: '20px', color: colors.red, fontSize: '12px' }}>{error}</div>
+                        <div style={{ padding: '20px', color: colors.red, fontSize: '12px' }}>
+                            {error}
+                            <div>
+                                <button onClick={() => setReloadKey(k => k + 1)} style={{ ...shared.buttonSmall, marginTop: '12px' }}>Retry</button>
+                            </div>
+                        </div>
                     ) : (
                         <>
                             <ChartControls

@@ -106,7 +106,7 @@ export default function PriceChart({ data, ticker, period, onPeriodChange, keyLe
             .attr('transform', `translate(${MARGIN.left},${MARGIN.top})`);
 
         // ── Regime bands ──
-        if (regime && regime.state) {
+        if (regime && typeof regime.state === 'string') {
             const bandColor = REGIME_COLORS[regime.state.toUpperCase()] || REGIME_COLORS.FRAGILE;
             g.append('rect')
                 .attr('x', 0).attr('y', 0)

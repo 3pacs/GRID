@@ -8,6 +8,8 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import { upperOr } from '../utils/text.js';
+import { apiErrorMessage, isApiError, withRequestTimeout } from '../utils/apiResult.js';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 
@@ -159,10 +161,12 @@ export default function RegimeAnalog({ onNavigate }) {
 
     async function loadData() {
         setLoading(true);
+        setError(null);
         try {
-            const result = await api.getRegimeAnalogs(20);
-            if (result?.error) {
-                setError(result.error);
+            const result = await withRequestTimeout(api.getRegimeAnalogs(20), { label: 'Regime analogs' });
+            if (isApiError(result)) {
+                // api.js markers carry `error: true`; rendering that boolean showed "Error: ".
+                setError(apiErrorMessage(result, 'Regime analogs unavailable'));
             } else {
                 setData(result);
             }
@@ -189,6 +193,7 @@ export default function RegimeAnalog({ onNavigate }) {
                 <div style={s.title}>REGIME ANALOG ENGINE</div>
                 <div style={{ ...shared.card, borderLeft: `3px solid ${colors.red}`, marginTop: '16px', padding: '16px' }}>
                     <div style={{ color: colors.red, fontFamily: mono, fontSize: '13px' }}>Error: {error}</div>
+                    <button onClick={loadData} style={{ ...shared.buttonSmall, marginTop: '12px' }}>Retry</button>
                 </div>
             </div>
         );
@@ -462,7 +467,7 @@ export default function RegimeAnalog({ onNavigate }) {
                                         fontSize: '14px', fontWeight: 700, fontFamily: mono, marginTop: '2px',
                                         color: (AXIS_COLORS[ax.axis] || {})[ax.label] || colors.text,
                                     }}>
-                                        {ax.label.toUpperCase()}
+                                        {upperOr(ax.label)}
                                     </div>
                                 </div>
                                 <div style={{

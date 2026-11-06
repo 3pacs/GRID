@@ -8,10 +8,12 @@ from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.precompute_serving import serve_precomputed
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "cross-reference"])
 
@@ -135,30 +137,17 @@ def get_cross_reference(
 @router.get("/cross-reference/narrative")
 def get_cross_reference_narrative(
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """Return only the LLM-generated narrative.
 
     Split from the main ``/cross-reference`` endpoint so the data layer
-    can load fast (~1s) and the prose layer can load lazily (~20s).
-    The narrative is cached separately so a hit on this endpoint doesn't
-    re-run the checks.
+    can load fast and the prose layer separately. The narrative is
+    generated in the background (job ``cross_reference_narrative``, every
+    30 min) over the latest persisted checks and cached per input hash: the
+    REASON tier is called only when the checks change. Never generated in
+    the request (45 s before W3-2).
     """
-    try:
-        from intelligence.cross_reference import run_all_checks
-
-        engine = get_db_engine()
-
-        def _compute_narrative():
-            report = run_all_checks(engine, skip_narrative=False)
-            return {
-                "narrative": report.narrative,
-                "generated_at": report.generated_at,
-            }
-
-        return _cached("cross_ref_narrative", _compute_narrative)
-    except Exception as exc:
-        log.warning("Cross-reference narrative failed: {e}", e=str(exc))
-        return {"narrative": "", "error": str(exc)}
+    return serve_precomputed("intelligence.cross_reference_narrative", {})
 
 
 @router.get("/cross-reference/category/{category}")

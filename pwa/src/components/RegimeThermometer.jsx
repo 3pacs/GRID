@@ -11,7 +11,7 @@ const regimeStages = [
  * Map regime state string to a 0-1 position on the thermometer.
  */
 function regimeToPosition(regime) {
-    if (!regime?.state) return 0.5;
+    if (typeof regime?.state !== 'string') return 0.5;
     const state = regime.state.toLowerCase();
     const confidence = regime.confidence ?? 0.5;
 

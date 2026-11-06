@@ -4,6 +4,9 @@ import { shared, colors } from '../styles/shared.js';
 import SignalCard from '../components/SignalCard.jsx';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { Moon, Sun, Star, Globe, Sparkles } from 'lucide-react';
+import ErrorState from '../components/ErrorState.jsx';
+import { humanizeOr, routeText } from '../utils/text.js';
+import { requireApi } from '../utils/apiResult.js';
 
 const styles = {
     container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)', maxWidth: '900px', margin: '0 auto' },
@@ -120,13 +123,13 @@ function CelestialFeatureCard({ feature, category }) {
             background: colors.bg, borderRadius: '10px', padding: '12px 14px',
             border: `1px solid ${colors.border}`,
         }}>
-            <div title={feature.name.replace(/_/g, ' ')} style={{
+            <div title={humanizeOr(feature.name, 'feature unknown')} style={{
                 fontSize: '11px', color: colors.textMuted, marginBottom: '6px',
                 fontFamily: colors.sans,
                 whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                 lineHeight: '1.3',
             }}>
-                {feature.name.replace(/_/g, ' ')}
+                {humanizeOr(feature.name, 'feature unknown')}
             </div>
             <div style={{
                 fontFamily: colors.mono,
@@ -154,7 +157,7 @@ function CelestialPanel() {
 
     useEffect(() => {
         setLoading(true);
-        api.getCelestialSignals()
+        requireApi(api.getCelestialSignals(), { label: 'Celestial signals' })
             .then(d => { setData(d); setError(null); })
             .catch(e => { setError(e.message); setData(null); })
             .finally(() => setLoading(false));
@@ -223,18 +226,24 @@ function CelestialPanel() {
 function SnapshotPanel({ featureFilter = '' }) {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
 
-    useEffect(() => {
-        api.getSignalSnapshot()
+    const load = () => {
+        setLoading(true);
+        setError(null);
+        requireApi(api.getSignalSnapshot(), { label: 'Signal snapshot' })
             .then(d => setData(d))
-            .catch(() => {})
+            .catch(e => { setError(e.message); setData(null); })
             .finally(() => setLoading(false));
-    }, []);
+    };
+    useEffect(load, []);
 
     if (loading) return <div style={styles.empty}>Loading snapshot...</div>;
+    // A failed request used to read as "No features available".
+    if (error) return <ErrorState error={error} onRetry={load} title="Signal snapshot unavailable" />;
     if (!data?.features?.length) return <div style={styles.empty}>No features available</div>;
 
-    const normalizedFilter = featureFilter.trim().toLowerCase();
+    const normalizedFilter = routeText(featureFilter).toLowerCase();
     const visibleFeatures = normalizedFilter
         ? data.features.filter((f) => (
             (f.name || '').toLowerCase().includes(normalizedFilter)
@@ -330,12 +339,20 @@ function SnapshotPanel({ featureFilter = '' }) {
 
 export default function Signals({ focusFeature = '' }) {
     const [signals, setSignals] = useState(null);
+    const [signalsLoading, setSignalsLoading] = useState(true);
+    const [signalsError, setSignalsError] = useState(null);
     const [activeTab, setActiveTab] = useState('snapshot');
     const [featureFilter, setFeatureFilter] = useState(focusFeature || '');
 
-    useEffect(() => {
-        api.getCurrent().then(setSignals).catch(() => {});
-    }, []);
+    const loadSignals = () => {
+        setSignalsLoading(true);
+        setSignalsError(null);
+        requireApi(api.getCurrent(), { label: 'Live drivers' })
+            .then(setSignals)
+            .catch(e => setSignalsError(e.message))
+            .finally(() => setSignalsLoading(false));
+    };
+    useEffect(loadSignals, []);
 
     useEffect(() => {
         setFeatureFilter(focusFeature || '');
@@ -344,7 +361,7 @@ export default function Signals({ focusFeature = '' }) {
         }
     }, [focusFeature]);
 
-    const normalizedFilter = featureFilter.trim().toLowerCase();
+    const normalizedFilter = routeText(featureFilter).toLowerCase();
     const visibleDrivers = normalizedFilter
         ? (signals?.top_drivers || []).filter((d) => (
             (d.feature || '').toLowerCase().includes(normalizedFilter)
@@ -401,7 +418,11 @@ export default function Signals({ focusFeature = '' }) {
 
             {activeTab === 'live' && (
                 <>
-                    {visibleDrivers.length > 0 ? (
+                    {signalsLoading && !signals ? (
+                        <div style={styles.empty}>Loading live drivers...</div>
+                    ) : signalsError ? (
+                        <ErrorState error={signalsError} onRetry={loadSignals} title="Live drivers unavailable" />
+                    ) : visibleDrivers.length > 0 ? (
                         <div style={styles.grid}>
                             {visibleDrivers.map((d, i) => (
                                 <SignalCard

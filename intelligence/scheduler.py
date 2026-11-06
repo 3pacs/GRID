@@ -484,6 +484,34 @@ def run_intelligence_loop() -> None:
 
     _sched.every().sunday.at("04:30").do(_curated_graph_analytics_weekly)
 
+    def _actor_universe_daily() -> None:
+        """Full actor-universe graph analytics (~3.5M actors, ~11M edges).
+
+        ``intelligence/actors/universe.py`` runs as a niced child process
+        (its igraph work would hold this loop's GIL for minutes) and writes
+        a new ``actor_graph_*`` version that /actor-network and
+        /actor-universe/* read. ``GRID_ACTOR_UNIVERSE_JOB=0`` disables it.
+        """
+        try:
+            from intelligence.actors.universe import maybe_launch
+
+            maybe_launch(max_age_hours=20.0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("actor universe daily launch failed: {e}", e=str(exc))
+
+    def _actor_universe_catch_up():  # returns schedule.CancelJob
+        """Once after start: run now if the newest version is >26h old or missing."""
+        try:
+            from intelligence.actors.universe import maybe_launch
+
+            maybe_launch(max_age_hours=26.0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("actor universe catch-up failed: {e}", e=str(exc))
+        return _sched.CancelJob
+
+    _sched.every().day.at("03:40").do(_actor_universe_daily)
+    _sched.every(3).minutes.do(_actor_universe_catch_up)
+
     # ── Trial gems → enriched small caps → board (daily chain, 2026-09-10) ──
     # Hermes' _SOURCE_REGISTRY carries interval_h for these but nothing runs
     # fn-based entries on that interval, and the 06:00 cron for the ingestor
@@ -615,6 +643,25 @@ def run_intelligence_loop() -> None:
             log.warning("oracle recalibration (exploratory) failed: {e}", e=str(exc))
 
     _sched.every().day.at("02:35").do(_oracle_recalibration_exploratory_daily)
+
+    def _api_precompute_tick() -> None:
+        """W3-2 (2026-11-06): precompute the slowest API read endpoints.
+
+        Starts at most one background worker (``intelligence/api_precompute.py``)
+        that runs every due job -- regime analogs, globe, influence, signals
+        snapshot, smart heatmap, cross-reference narrative, associations,
+        architecture stats, 100x options scan -- and writes
+        ``api_precomputed_results``, which those endpoints now only read.
+        The worker thread keeps a minutes-long job off this loop.
+        Kill switch: ``GRID_API_PRECOMPUTE_ENABLED=0``.
+        """
+        try:
+            from intelligence.api_precompute import start_background_tick
+            start_background_tick()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("api precompute tick failed to start: {e}", e=str(exc))
+
+    _sched.every(5).minutes.do(_api_precompute_tick)
 
     def _realized_alpha_daily() -> None:
         """GRID-4 §8.1 truth gate: rolling realized alpha vs SPY, net of

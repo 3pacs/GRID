@@ -475,8 +475,14 @@ class PITStore:
                 },
             ).fetchall()
 
+        # Plain tuples, not SQLAlchemy ``Row`` objects: handed Rows, pandas
+        # probes each one with ``hasattr`` and every probe raises and
+        # swallows a KeyError inside SQLAlchemy. Measured read-only on
+        # grid-svr 2026-11-06: 37 s of the 53 s ``/signals/snapshot`` build
+        # (3.2M probes for ~800K rows) was this construction. Same values,
+        # same column order, same dtypes.
         df = pd.DataFrame(
-            rows,
+            [tuple(r) for r in rows],
             columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"],
         )
 

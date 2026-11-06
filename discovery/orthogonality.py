@@ -28,6 +28,9 @@ from sqlalchemy.engine import Engine
 
 from store.pit import PITStore
 
+# Lookback of ``get_orthogonal_features``'s correlation read (calendar days).
+ORTHOGONALITY_WINDOW_DAYS = 756
+
 
 def _group_by_family(feature_ids: list[int], families: dict[int, str]) -> dict[str, list[int]]:
     """Group feature IDs by their family."""
@@ -507,7 +510,9 @@ class OrthogonalityAudit:
         plt.close(fig)
         log.info("Heatmap saved to {p}", p=filepath)
 
-    def get_orthogonal_features(self, corr_threshold: float = 0.8) -> dict:
+    def get_orthogonal_features(
+        self, corr_threshold: float = 0.8, matrix: Any | None = None,
+    ) -> dict:
         """Return features filtered by orthogonality — removes redundant pairs.
 
         Computes the correlation matrix for all model-eligible features,
@@ -541,15 +546,22 @@ class OrthogonalityAudit:
         feature_names = {r[0]: r[1] for r in rows}
         feature_families = {r[0]: r[2] for r in rows}
 
-        # Build feature matrix via PIT store
-        from datetime import date as _date, timedelta as _td
-        _today = _date.today()
-        df = self.pit_store.get_feature_matrix(
-            feature_ids=feature_ids,
-            start_date=_today - _td(days=756),
-            end_date=_today,
-            as_of_date=_today,
-        )
+        # Build feature matrix via PIT store. ``matrix`` lets a caller that
+        # already holds this exact read (the smart-heatmap precompute job,
+        # which needs the same 756-day window for its own matrix) pass it in
+        # instead of reading it twice: :data:`ORTHOGONALITY_WINDOW_DAYS`,
+        # ending and as of today, the store's default FIRST_RELEASE vintages.
+        if matrix is not None:
+            df = matrix
+        else:
+            from datetime import date as _date, timedelta as _td
+            _today = _date.today()
+            df = self.pit_store.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=_today - _td(days=ORTHOGONALITY_WINDOW_DAYS),
+                end_date=_today,
+                as_of_date=_today,
+            )
 
         if df is None or df.empty or len(df.columns) < 2:
             return {

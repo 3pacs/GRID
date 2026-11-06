@@ -24,6 +24,9 @@ import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRe
 import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import useFullScreen from '../hooks/useFullScreen.js';
+import { lowerText } from '../utils/text.js';
+import ActorUniverseControls from '../components/ActorUniverseControls.jsx';
+import { DEFAULT_NODE_COUNT, buildActorNetworkParams, mergeEgoIntoGraph } from '../utils/actorUniverse.js';
 
 // ── Constants ──
 const TIER_COLORS = {
@@ -379,6 +382,11 @@ export default function ActorUniverse() {
     const [tierFilter, setTierFilter] = useState('all');
     const [categoryFilter, setCategoryFilter] = useState('all');
     const [searchQuery, setSearchQuery] = useState('');
+    // Overview request: N actors by precomputed importance + opt-in bulk lists
+    const [nodeCount, setNodeCount] = useState(DEFAULT_NODE_COUNT);
+    const [bulkGroups, setBulkGroups] = useState([]);
+    const [expanding, setExpanding] = useState(false);
+    const [expandError, setExpandError] = useState(null);
 
     // Selection
     const [selectedNode, setSelectedNode] = useState(null);
@@ -390,18 +398,33 @@ export default function ActorUniverse() {
     const [isPlaying, setIsPlaying] = useState(true);
 
     // ── Load data ──
-    useEffect(() => { loadData(); }, []);
+    useEffect(() => { loadData(); }, [nodeCount, bulkGroups]);
 
     const loadData = async () => {
         setLoading(true);
         setError(null);
         try {
-            const d = await api.getActorNetwork();
+            const d = await api.getActorNetwork(buildActorNetworkParams({ n: nodeCount, groups: bulkGroups }));
             setData(d);
         } catch (err) {
             setError(err.message || 'Failed to load actor network');
         }
         setLoading(false);
+    };
+
+    // ── Expand a node's neighbourhood (bounded ego network) ──
+    const handleExpand = async (node) => {
+        if (!node?.id) return;
+        setExpanding(true);
+        setExpandError(null);
+        try {
+            const ego = await api.getActorUniverseEgo(node.id, { depth: 1, fanout: 25, maxNodes: 150 });
+            if (ego?.error) setExpandError(ego.error);
+            else setData(prev => mergeEgoIntoGraph(prev, ego, node.id));
+        } catch (err) {
+            setExpandError(err.message || 'Expansion failed');
+        }
+        setExpanding(false);
     };
 
     // ── Load actor detail on selection ──
@@ -440,9 +463,9 @@ export default function ActorUniverse() {
         if (categoryFilter !== 'all') nodes = nodes.filter(n => n.category === categoryFilter);
         if (q) {
             nodes = nodes.filter(n =>
-                n.label.toLowerCase().includes(q)
+                lowerText(n.label).includes(q)
                 || (n.title || '').toLowerCase().includes(q)
-                || n.id.toLowerCase().includes(q)
+                || lowerText(n.id).includes(q)
             );
         }
 
@@ -985,7 +1008,7 @@ export default function ActorUniverse() {
 
         const nodes = nodeDataRef.current;
         const found = nodes.find(n =>
-            n.label.toLowerCase().includes(q)
+            lowerText(n.label).includes(q)
             || (n.title || '').toLowerCase().includes(q)
         );
         if (!found) return;
@@ -1074,6 +1097,14 @@ export default function ActorUniverse() {
                     style={S.searchInput}
                 />
 
+                <ActorUniverseControls
+                    nodeCount={nodeCount}
+                    onNodeCount={setNodeCount}
+                    groups={bulkGroups}
+                    onGroups={setBulkGroups}
+                    metadata={data?.metadata}
+                />
+
                 {/* Stats */}
                 <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO, whiteSpace: 'nowrap' }}>
                     {filteredData.nodes.length} actors / {filteredData.links.length} links
@@ -1160,6 +1191,18 @@ export default function ActorUniverse() {
                             <span style={{ ...S.badge(TIER_HEX[selectedNode.tier] || '#5A7080'), flexShrink: 0 }}>
                                 {(selectedNode.tier || '').toUpperCase()}
                             </span>
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                            <button
+                                type="button"
+                                onClick={() => handleExpand(selectedNode)}
+                                disabled={expanding || selectedNode.external}
+                                style={{ ...S.filterBtn(false), fontSize: '10px' }}
+                            >
+                                {expanding ? 'Expanding…' : 'Expand neighborhood'}
+                            </button>
+                            {expandError && <span style={{ fontSize: '10px', color: colors.red }}>{expandError}</span>}
                         </div>
 
                         {/* Key metrics */}

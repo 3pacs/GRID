@@ -20,6 +20,7 @@ import useFullScreen from '../hooks/useFullScreen.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { upperOr } from '../utils/text.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -1598,7 +1599,7 @@ export default function CrossReference({ onNavigate }) {
                                             gap.status === 'computed' ? colors.accent : colors.yellow,
                                         marginLeft: 0,
                                     }}>
-                                        {gap.status.toUpperCase()}
+                                        {upperOr(gap.status)}
                                     </span>
                                 </div>
                             </div>

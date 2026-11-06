@@ -9,12 +9,14 @@ from typing import Any
 import pandas as pd
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_pit_store
+from api.precompute_serving import serve_precomputed
 
 router = APIRouter(prefix="/api/v1/signals", tags=["signals"])
 
@@ -38,66 +40,70 @@ def get_signals(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/snapshot")
-def get_snapshot(_token: str = Depends(require_auth)) -> dict:
-    """Return current feature snapshot with z-scores."""
+def get_snapshot(_token: str = Depends(require_auth)) -> Response:
+    """Return current feature snapshot with z-scores.
+
+    Served from ``api_precomputed_results`` (job ``signals_snapshot`` in
+    ``intelligence/api_precompute.py``, every 30 min); the 53-77 s build
+    never runs in the request.
+    """
+    return serve_precomputed("signals.snapshot", {})
+
+
+def _compute_feature_snapshot() -> dict:
+    """Current feature snapshot with 504-day z-scores (precompute job body)."""
+    from inference.live import LiveInference
+
+    engine = get_db_engine()
+    pit = get_pit_store()
+    li = LiveInference(engine, pit)
+    df = li.get_feature_snapshot()
+    if df.empty:
+        return {"features": [], "count": 0}
+
+    records = df.to_dict("records")
+
+    # Compute z-scores from historical data (504-calendar-day lookback)
     try:
-        from inference.live import LiveInference
+        with engine.connect() as conn:
+            feat_rows = conn.execute(text(
+                "SELECT id, name FROM feature_registry "
+                "WHERE model_eligible = TRUE"
+            )).fetchall()
+        name_to_id = {r[1]: r[0] for r in feat_rows}
+        feature_ids = [name_to_id[r["name"]] for r in records if r["name"] in name_to_id]
 
-        engine = get_db_engine()
-        pit = get_pit_store()
-        li = LiveInference(engine, pit)
-        df = li.get_feature_snapshot()
-        if df.empty:
-            return {"features": [], "count": 0}
+        if feature_ids:
+            today = date.today()
+            hist = pit.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=today - timedelta(days=504),
+                end_date=today,
+                as_of_date=today,
+                vintage_policy="LATEST_AS_OF",
+            )
+            if hist is not None and len(hist) > 20:
+                means = hist.mean()
+                stds = hist.std().replace(0, 1)
+                last = hist.ffill().iloc[-1]
+                z_map = ((last - means) / stds).to_dict()
 
-        records = df.to_dict("records")
+                # Map feature_id columns back to names
+                id_to_name = {r[0]: r[1] for r in feat_rows}
+                z_by_name = {}
+                for col, z in z_map.items():
+                    name = id_to_name.get(col)
+                    if name is not None:
+                        z_by_name[name] = round(z, 4) if not math.isnan(z) else None
 
-        # Compute z-scores from historical data (252-day lookback)
-        try:
-            with engine.connect() as conn:
-                feat_rows = conn.execute(text(
-                    "SELECT id, name FROM feature_registry "
-                    "WHERE model_eligible = TRUE"
-                )).fetchall()
-            name_to_id = {r[1]: r[0] for r in feat_rows}
-            feature_ids = [name_to_id[r["name"]] for r in records if r["name"] in name_to_id]
+                for rec in records:
+                    z = z_by_name.get(rec["name"])
+                    if z is not None:
+                        rec["z_score"] = z
+    except Exception as zex:
+        log.warning("Z-score computation failed: {e}", e=str(zex))
 
-            if feature_ids:
-                today = date.today()
-                hist = pit.get_feature_matrix(
-                    feature_ids=feature_ids,
-                    start_date=today - timedelta(days=504),
-                    end_date=today,
-                    as_of_date=today,
-                    vintage_policy="LATEST_AS_OF",
-                )
-                if hist is not None and len(hist) > 20:
-                    means = hist.mean()
-                    stds = hist.std().replace(0, 1)
-                    last = hist.ffill().iloc[-1]
-                    z_map = ((last - means) / stds).to_dict()
-
-                    # Map feature_id columns back to names
-                    id_to_name = {r[0]: r[1] for r in feat_rows}
-                    z_by_name = {}
-                    for col, z in z_map.items():
-                        name = id_to_name.get(col)
-                        if name is not None:
-                            z_by_name[name] = round(z, 4) if not math.isnan(z) else None
-
-                    for rec in records:
-                        z = z_by_name.get(rec["name"])
-                        if z is not None:
-                            rec["z_score"] = z
-        except Exception as zex:
-            log.warning("Z-score computation failed: {e}", e=str(zex))
-
-        return {"features": records, "count": len(records)}
-    except ImportError as exc:
-        raise HTTPException(status_code=500, detail=f"Inference engine not available: {exc}") from exc
-    except Exception as exc:
-        log.warning("Feature snapshot failed: {e}", e=str(exc))
-        raise HTTPException(status_code=500, detail=f"Feature snapshot failed: {exc}") from exc
+    return {"features": records, "count": len(records)}
 
 
 @router.get("/crucix")

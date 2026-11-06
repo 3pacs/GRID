@@ -13,6 +13,7 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import * as d3 from 'd3';
 import { api } from '../api.js';
 import { colors, tokens } from '../styles/shared.js';
+import { humanizeOr } from '../utils/text.js';
 
 // ── Domain colors ───────────────────────────────────────────────────────
 const DOMAIN_COLORS = {
@@ -742,7 +743,7 @@ export default function LeverMap() {
               }}>
                 <span style={{ fontSize: '14px' }}>{DOMAIN_ICONS[app.domain] || ''}</span>
                 <span style={{ color: DOMAIN_COLORS[app.domain] || '#8AA0B8' }}>
-                  {app.domain.replace(/_/g, ' ')}
+                  {humanizeOr(app.domain, 'domain unknown')}
                 </span>
                 <span style={{ color: '#5A7080' }}>({app.tier})</span>
               </div>

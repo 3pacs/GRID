@@ -14,6 +14,7 @@ import * as d3 from 'd3';
 import { api } from '../api.js';
 import { shared, colors, tokens, confidence as confColors } from '../styles/shared.js';
 import { formatDateTime } from '../utils/formatTime.js';
+import { textOr } from '../utils/text.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -503,7 +504,7 @@ function BubbleChart({ alerts }) {
 
         // Label
         bubbles.append('text')
-            .text(d => d.r > 20 ? (d.ticker || d.entity.split(' ')[0]) : '')
+            .text(d => d.r > 20 ? (d.ticker || textOr(d.entity, '?').split(' ')[0]) : '')
             .attr('text-anchor', 'middle')
             .attr('dy', '0.35em')
             .attr('fill', colors.text)

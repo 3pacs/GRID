@@ -15,6 +15,7 @@ import os
 import re
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -259,21 +260,25 @@ def test_regime_gets_are_select_only():
     ``regime_state_vectors`` — the table the old code created and filled
     on every GET — is never created."""
     from api.routers import intelligence_regime as ir
+    from intelligence import api_precompute as ap
 
     with _schema() as engine:
         _seed_observations_tables(engine)
         with _recording(engine) as statements, \
              patch.object(ir, "get_db_engine", return_value=engine):
             regime_body = ir.get_regime(_token="t")
-            analogs_body = ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
+            # Since W3-2 the analogs are computed by the precompute job's
+            # builder (the GET only reads api_precomputed_results); the
+            # builder is held to the same no-write contract.
+            [analogs_out] = ap.build_regime_analogs(
+                ap.BuildContext(engine=engine, now=datetime.now(timezone.utc)))
 
         # Empty raw_series -> every dimension is missing -> below the
-        # completeness floor -> both routes report "available: false"
-        # rather than computing/serving a partial vector.
+        # completeness floor -> "unavailable" rather than a partial vector.
         assert regime_body["available"] is False
         assert "reason" in regime_body
-        assert analogs_body["available"] is False
-        assert "reason" in analogs_body
+        assert analogs_out.payload is None
+        assert analogs_out.unavailable_reason
 
         _assert_select_only(statements)
         assert _regclass(engine, "regime_state_vectors") is None

@@ -14,6 +14,7 @@ import useStore from '../store.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { optionalApi } from '../utils/apiResult.js';
 
 /* ── colour helpers ─────────────────────────────────────────────── */
 
@@ -321,6 +322,7 @@ export default function Heatmap() {
     const [error, setError] = useState(null);
     const [loading, setLocalLoading] = useState(true);
     const [stats, setStats] = useState({});
+    const [sourceErrors, setSourceErrors] = useState({ snapshot: null, heatmap: null });
 
     useEffect(() => { loadData(); }, []);
 
@@ -329,12 +331,18 @@ export default function Heatmap() {
         setLoading('heatmap', true);
         setError(null);
         try {
-            const [snapshot, heatmap] = await Promise.all([
-                api.getSignalSnapshot().catch(() => ({ features: [] })),
-                api.getSmartHeatmap(familyFilter, true).catch(() => ({
-                    features: [], matrix: [], z_scores: [], families: [],
-                })),
+            // Failures used to become empty payloads, which rendered as
+            // "No feature data. Run inference..." during an outage.
+            const [snapRes, heatRes] = await Promise.all([
+                optionalApi(api.getSignalSnapshot(), { label: 'Signal snapshot' }),
+                optionalApi(api.getSmartHeatmap(familyFilter, true), { label: 'Correlation heatmap' }),
             ]);
+            setSourceErrors({ snapshot: snapRes.error, heatmap: heatRes.error });
+            if (snapRes.error && heatRes.error) {
+                throw new Error(`${snapRes.error} | ${heatRes.error}`);
+            }
+            const snapshot = snapRes.value || {};
+            const heatmap = heatRes.value || {};
 
             const feats = snapshot.features || [];
             setFeatures(feats);
@@ -466,7 +474,9 @@ export default function Heatmap() {
             ) : error ? (
                 <div style={shared.error}>{error}</div>
             ) : mode === 'zscore' ? (
-                features.length > 0 ? (
+                sourceErrors.snapshot ? (
+                    <div style={shared.error}>Z-score data unavailable: {sourceErrors.snapshot}</div>
+                ) : features.length > 0 ? (
                     <ZScoreGrid features={features} isMobile={isMobile} />
                 ) : (
                     <div style={{ color: colors.textMuted, textAlign: 'center', padding: '40px' }}>
@@ -474,7 +484,9 @@ export default function Heatmap() {
                     </div>
                 )
             ) : (
-                matrix.length > 0 ? (
+                sourceErrors.heatmap ? (
+                    <div style={shared.error}>Correlation data unavailable: {sourceErrors.heatmap}</div>
+                ) : matrix.length > 0 ? (
                     <CorrelationMatrix features={corrFeatures} matrix={matrix} isMobile={isMobile} />
                 ) : (
                     <div style={{ color: colors.textMuted, textAlign: 'center', padding: '40px' }}>

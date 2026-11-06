@@ -17,6 +17,7 @@ function onRequestLabel(generatedAt, extra) {
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { requireApi } from '../utils/apiResult.js';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -348,9 +349,7 @@ export default function Archive() {
     const [days, setDays] = useState(90);
 
     const { data: archive, loading, error, refetch: loadArchive } = useAsyncData(async () => {
-        const r = await api.getResearchArchive(days);
-        if (r?.error) throw new Error(r.message || 'Failed to load research archive');
-        return r;
+        return requireApi(api.getResearchArchive(days), { label: 'Research archive' });
     }, { fallback: null, deps: [days] });
 
     const triggerDeepDive = async () => {

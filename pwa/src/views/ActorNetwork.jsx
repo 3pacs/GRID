@@ -21,6 +21,9 @@ import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
 import PowerMap from '../components/PowerMap.jsx';
 import EgoGraph from '../components/EgoGraph.jsx';
+import { routeText, lowerText } from '../utils/text.js';
+import ActorUniverseControls from '../components/ActorUniverseControls.jsx';
+import { DEFAULT_NODE_COUNT, buildActorNetworkParams, mergeEgoIntoGraph } from '../utils/actorUniverse.js';
 
 // ── Security helper ──
 // Actor labels, titles, and other DB-sourced strings are interpolated into
@@ -303,6 +306,11 @@ function ActorNetworkLegacy({ focusActor = '' }) {
     const [categoryFilter, setCategoryFilter] = useState('all');
     const [activityFilter, setActivityFilter] = useState('all');
     const [searchQuery, setSearchQuery] = useState('');
+    // Overview request: N actors by precomputed importance + opt-in bulk lists
+    const [nodeCount, setNodeCount] = useState(DEFAULT_NODE_COUNT);
+    const [bulkGroups, setBulkGroups] = useState([]);
+    const [expanding, setExpanding] = useState(false);
+    const [expandError, setExpandError] = useState(null);
 
     // Selection
     const [selectedNode, setSelectedNode] = useState(null);
@@ -335,7 +343,7 @@ function ActorNetworkLegacy({ focusActor = '' }) {
     const [evidenceLoading, setEvidenceLoading] = useState(false);
 
     // ── Load data ──
-    useEffect(() => { loadData(); }, []);
+    useEffect(() => { loadData(); }, [nodeCount, bulkGroups]);
 
     useEffect(() => {
         setSearchQuery(focusActor || '');
@@ -350,7 +358,7 @@ function ActorNetworkLegacy({ focusActor = '' }) {
         setLoading(true);
         setError(null);
         try {
-            const d = await api.getActorNetwork();
+            const d = await api.getActorNetwork(buildActorNetworkParams({ n: nodeCount, groups: bulkGroups }));
             setData(d);
         } catch (err) {
             setError(err.message || 'Failed to load actor network');
@@ -358,11 +366,26 @@ function ActorNetworkLegacy({ focusActor = '' }) {
         setLoading(false);
     };
 
+    // ── Expand a node's neighbourhood (bounded ego network) ──
+    const handleExpand = async (node) => {
+        if (!node?.id) return;
+        setExpanding(true);
+        setExpandError(null);
+        try {
+            const ego = await api.getActorUniverseEgo(node.id, { depth: 1, fanout: 25, maxNodes: 150 });
+            if (ego?.error) setExpandError(ego.error);
+            else setData(prev => mergeEgoIntoGraph(prev, ego, node.id));
+        } catch (err) {
+            setExpandError(err.message || 'Expansion failed');
+        }
+        setExpanding(false);
+    };
+
     // ── Path finder ──
     const handleFindPath = async () => {
         if (!pathFrom || !pathTo || !data?.nodes) return;
-        const fromNode = data.nodes.find(n => n.label.toLowerCase().includes(pathFrom.toLowerCase()));
-        const toNode = data.nodes.find(n => n.label.toLowerCase().includes(pathTo.toLowerCase()));
+        const fromNode = data.nodes.find(n => lowerText(n.label).includes(pathFrom.toLowerCase()));
+        const toNode = data.nodes.find(n => lowerText(n.label).includes(pathTo.toLowerCase()));
         if (!fromNode || !toNode) { setPathResult({ error: 'Actor not found in graph' }); return; }
         setPathLoading(true);
         try {
@@ -463,9 +486,9 @@ function ActorNetworkLegacy({ focusActor = '' }) {
         }
         if (q) {
             nodes = nodes.filter(n =>
-                n.label.toLowerCase().includes(q)
+                lowerText(n.label).includes(q)
                 || (n.title || '').toLowerCase().includes(q)
-                || n.id.toLowerCase().includes(q)
+                || lowerText(n.id).includes(q)
             );
         }
 
@@ -489,7 +512,7 @@ function ActorNetworkLegacy({ focusActor = '' }) {
     }, [data, tierFilter, categoryFilter, activityFilter, searchQuery, timelineFilteredFlows]);
 
     useEffect(() => {
-        const q = focusActor.trim().toLowerCase();
+        const q = routeText(focusActor).toLowerCase();
         if (!q || !data?.nodes?.length) return;
         const match = data.nodes.find((node) => (
             (node.label || '').toLowerCase().includes(q)
@@ -559,11 +582,11 @@ function ActorNetworkLegacy({ focusActor = '' }) {
         if (highlightedLoop.ticker) nodes.add(`company:${highlightedLoop.ticker}`);
         // Add recipient members
         (highlightedLoop.recipients || []).forEach(r => {
-            if (r.member) nodes.add(`member:${r.member.toLowerCase().replace(/ /g, '_')}`);
+            if (r.member) nodes.add(`member:${lowerText(r.member).replace(/ /g, '_')}`);
         });
         // Add trading members
         (highlightedLoop.member_trades || []).forEach(t => {
-            if (t.member) nodes.add(`member:${t.member.toLowerCase().replace(/ /g, '_')}`);
+            if (t.member) nodes.add(`member:${lowerText(t.member).replace(/ /g, '_')}`);
         });
         return nodes;
     }, [highlightedLoop]);
@@ -1295,6 +1318,14 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                     style={S.searchInput}
                 />
 
+                <ActorUniverseControls
+                    nodeCount={nodeCount}
+                    onNodeCount={setNodeCount}
+                    groups={bulkGroups}
+                    onGroups={setBulkGroups}
+                    metadata={data?.metadata}
+                />
+
                 {/* Stats */}
                 <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO, whiteSpace: 'nowrap' }}>
                     {filteredData.nodes.length} nodes / {filteredData.links.length} links
@@ -1376,12 +1407,12 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                                 list="path-to-list"
                                 style={{ ...S.searchInput, width: '100%', marginBottom: '8px', boxSizing: 'border-box' }} />
                             <datalist id="path-from-list">
-                                {(data?.nodes || []).filter(n => pathFrom && n.label.toLowerCase().includes(pathFrom.toLowerCase())).slice(0, 8).map(n => (
+                                {(data?.nodes || []).filter(n => pathFrom && lowerText(n.label).includes(pathFrom.toLowerCase())).slice(0, 8).map(n => (
                                     <option key={n.id} value={n.label} />
                                 ))}
                             </datalist>
                             <datalist id="path-to-list">
-                                {(data?.nodes || []).filter(n => pathTo && n.label.toLowerCase().includes(pathTo.toLowerCase())).slice(0, 8).map(n => (
+                                {(data?.nodes || []).filter(n => pathTo && lowerText(n.label).includes(pathTo.toLowerCase())).slice(0, 8).map(n => (
                                     <option key={n.id} value={n.label} />
                                 ))}
                             </datalist>
@@ -1710,6 +1741,18 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                             <span style={{ ...S.badge(TIER_COLORS[selectedNode.tier] || '#5A7080'), flexShrink: 0 }}>
                                 {(selectedNode.tier || '').toUpperCase()}
                             </span>
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                            <button
+                                type="button"
+                                onClick={() => handleExpand(selectedNode)}
+                                disabled={expanding || selectedNode.external}
+                                style={{ ...S.filterBtn(false), fontSize: '10px' }}
+                            >
+                                {expanding ? 'Expanding…' : 'Expand neighborhood'}
+                            </button>
+                            {expandError && <span style={{ fontSize: '10px', color: colors.red }}>{expandError}</span>}
                         </div>
 
                         {/* Key metrics */}
