@@ -2702,18 +2702,9 @@ def start_scheduler() -> None:
 
     schedule.every().sunday.at("02:00").do(_cleanup_realtime_candles)
 
-    # Weekly cleanup of old/dead hypotheses
-    def _cleanup_hypotheses() -> None:
-        try:
-            from db import get_engine
-            from intelligence.hypothesis_engine import cleanup_hypotheses
-            result = cleanup_hypotheses(get_engine())
-            if any(v > 0 for v in result.values()):
-                log.info("Hypothesis cleanup: {r}", r=result)
-        except Exception as exc:
-            log.warning("Hypothesis cleanup failed: {e}", e=str(exc))
-
-    schedule.every().sunday.at("02:30").do(_cleanup_hypotheses)
+    # Dead hypotheses are retained as the trial ledger (2026-11-06): the
+    # weekly prune that deleted them is gone. ``python -m
+    # intelligence.hypothesis_engine cleanup`` reports what it would have hit.
 
     # Daily Trump-Proximity Score refresh — 06:00 ET (10:00 UTC EDT,
     # 11:00 UTC EST). We register both so the watchlist is on the
