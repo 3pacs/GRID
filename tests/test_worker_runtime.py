@@ -234,3 +234,53 @@ def test_route_source_ip_skips_loopback_coordinator():
     assert worker._route_source_ip("http://localhost:8100") is None
     assert worker._route_source_ip("http://127.0.0.1:8100") is None
     assert worker._route_source_ip(None) is None
+
+
+# ── Rotation jobs from a PIT snapshot (W2-7) ────────────────────────────
+
+
+def test_rotation_snapshot_is_off_without_the_env(monkeypatch):
+    monkeypatch.delenv(worker.PIT_SNAPSHOT_DIR_ENV, raising=False)
+    from datetime import date
+
+    assert worker.rotation_snapshot_for({}, date(2024, 1, 1), date(2026, 3, 25)) is None
+
+
+def test_rotation_snapshot_passes_dir_and_pinned_sha(monkeypatch, tmp_path):
+    from datetime import date
+
+    from alpha_research.strategies import rotation_variant_backtest as rvb
+
+    seen = {}
+    sentinel = object()
+
+    def fake_find(directory, ws, we, *, sha256=None):
+        seen.update(directory=directory, ws=ws, we=we, sha256=sha256)
+        return sentinel
+
+    monkeypatch.setenv(worker.PIT_SNAPSHOT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(rvb, "find_rotation_snapshot", fake_find)
+    got = worker.rotation_snapshot_for(
+        {"pit_snapshot_sha256": "ab" * 32}, date(2024, 1, 1), date(2026, 3, 25)
+    )
+    assert got is sentinel
+    assert seen == {"directory": str(tmp_path), "ws": date(2024, 1, 1),
+                    "we": date(2026, 3, 25), "sha256": "ab" * 32}
+
+
+def test_rotation_job_hands_the_snapshot_to_the_backtest(monkeypatch):
+    from alpha_research.strategies import rotation_variant_backtest as rvb
+
+    calls = {}
+    snapshot = object()
+    monkeypatch.setattr(worker, "rotation_snapshot_for", lambda params, ws, we: snapshot)
+    monkeypatch.setattr("db.get_engine", lambda: "engine")
+
+    def fake_backtest(engine, cfg, ws, we, *, pit=None):
+        calls.update(engine=engine, pit=pit)
+        return {"total_return": 0.1, "data_source": {"mode": "snapshot"}}
+
+    monkeypatch.setattr(rvb, "backtest_rotation_variant", fake_backtest)
+    out = worker.run_backtest({"kind": "rotation_variant", "TREND_WEEKS": 20})
+    assert calls == {"engine": "engine", "pit": snapshot}
+    assert out["metrics"]["data_source"] == "snapshot"

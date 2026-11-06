@@ -74,7 +74,7 @@ def test_run_rotation_failure_logs_warning_and_continues(
     successful_dates = {date(2025, 1, 20), date(2025, 1, 27), date(2025, 2, 3)}
     rotation_calls: list[date] = []
 
-    def fake_run_rotation(_engine: Any, as_of_date: date, positions: dict) -> Any:
+    def fake_run_rotation(_engine: Any, as_of_date: date, positions: dict, **_kw: Any) -> Any:
         rotation_calls.append(as_of_date)
         if as_of_date not in successful_dates:
             raise RuntimeError(f"db hiccup on {as_of_date}")

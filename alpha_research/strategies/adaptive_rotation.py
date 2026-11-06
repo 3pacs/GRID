@@ -25,6 +25,7 @@ from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from alpha_research.data.panel_builder import build_price_panel, get_vix_series
+from store.pit import PITStore
 
 # ── Asset Groups (tickers GRID has data for) ──────────────────────────
 
@@ -301,11 +302,20 @@ def run_rotation(
     engine: Engine,
     as_of_date: date | None = None,
     positions: dict[str, PositionState] | None = None,
+    *,
+    pit: PITStore | None = None,
+    data_as_of: date | None = None,
 ) -> RotationResult:
     """
     Run one iteration of the Adaptive Rotation Strategy.
 
     Returns target weights and metadata.
+
+    ``pit``: PIT reader for both reads (default ``PITStore(engine)``); a
+    backtest passes one ``store.pit.PITWindowCache`` for all its rebalances.
+    ``data_as_of``: the vintage cutoff of the price panel read. ``None``
+    keeps the historical behaviour (today, i.e. latest vintages); a backtest
+    pins it once so every rebalance reads the same vintages.
     """
     if as_of_date is None:
         as_of_date = date.today()
@@ -327,6 +337,8 @@ def run_rotation(
         tickers=list(all_tickers),
         start_date=start,
         end_date=as_of_date,
+        as_of_date=data_as_of,
+        pit=pit,
     )
 
     if prices.empty or "SPY" not in prices.columns:
@@ -369,6 +381,7 @@ def run_rotation(
         start_date=as_of_date - timedelta(days=60),
         end_date=as_of_date,
         as_of_date=as_of_date,
+        pit=pit,
     )
 
     # 1. Detect regime

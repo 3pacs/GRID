@@ -255,7 +255,7 @@ class TestRunRotationDeterministicVix:
 
         captured_vix_calls = []
 
-        def fake_get_vix_series(engine, start_date=None, end_date=None, as_of_date=None):
+        def fake_get_vix_series(engine, start_date=None, end_date=None, as_of_date=None, **_kw):
             captured_vix_calls.append({
                 "start_date": start_date,
                 "end_date": end_date,
@@ -265,7 +265,7 @@ class TestRunRotationDeterministicVix:
             idx = pd.bdate_range(end=as_of_date, periods=30)
             return pd.Series(np.linspace(18.0, 22.0, 30), index=idx, name="VIX")
 
-        def fake_build_price_panel(engine, tickers=None, start_date=None, end_date=None):
+        def fake_build_price_panel(engine, tickers=None, start_date=None, end_date=None, **_kw):
             return multi_ticker_prices.loc[:pd.Timestamp(end_date)]
 
         monkeypatch.setattr(adaptive_rotation, "get_vix_series", fake_get_vix_series)

@@ -715,6 +715,33 @@ def run_backtest(params):
     return _run_model_walkforward(params)
 
 
+#: Directory of hash-receipted PIT window snapshots (``pit-window-<sha>.json.gz``,
+#: built with ``python -m alpha_research.strategies.rotation_variant_backtest
+#: --build-snapshot DIR``). Unset = off: every job reads its window from the
+#: database. Set on remote workers so a rotation job reads no resolved_series
+#: rows over the relay (W2-7). A job may pin one with ``pit_snapshot_sha256``.
+PIT_SNAPSHOT_DIR_ENV = "GRID_PIT_SNAPSHOT_DIR"
+
+
+def rotation_snapshot_for(params, window_start, window_end):
+    """The verified snapshot to run *params* from, or None for the DB path."""
+    snapshot_dir = os.environ.get(PIT_SNAPSHOT_DIR_ENV, "").strip()
+    if not snapshot_dir:
+        return None
+    from alpha_research.strategies.rotation_variant_backtest import (
+        find_rotation_snapshot,
+    )
+
+    sha = params.get("pit_snapshot_sha256") or None
+    cache = find_rotation_snapshot(snapshot_dir, window_start, window_end, sha256=sha)
+    if cache is None:
+        log.warning(
+            "No PIT snapshot in {d} covers {s}..{e} (sha={h}); reading the database",
+            d=snapshot_dir, s=window_start, e=window_end, h=sha,
+        )
+    return cache
+
+
 def _run_rotation_variant(params):
     from datetime import date as _date
     from db import get_engine
@@ -731,7 +758,8 @@ def _run_rotation_variant(params):
     cfg = RotationConfig(**cfg_kwargs)
     ws = _date.fromisoformat(params.get("window_start", "2024-01-01"))
     we = _date.fromisoformat(params.get("window_end", "2026-03-25"))
-    metrics = backtest_rotation_variant(get_engine(), cfg, ws, we)
+    pit = rotation_snapshot_for(params, ws, we)
+    metrics = backtest_rotation_variant(get_engine(), cfg, ws, we, pit=pit)
     if "error" in metrics:
         return {"error": metrics["error"]}
     return {"output": metrics, "metrics": {
@@ -742,6 +770,7 @@ def _run_rotation_variant(params):
         "rebalance_count": metrics.get("rebalance_count"),
         "config_id": metrics.get("config_id"),
         "backtest_run_id": metrics.get("backtest_run_id"),
+        "data_source": (metrics.get("data_source") or {}).get("mode"),
     }}
 
 

@@ -741,7 +741,13 @@ async def health():
 
 
 def worker_register_upsert_sql() -> str:
-    """Upsert a worker row; re-registering always clears OFFLINE to IDLE."""
+    """Upsert a worker row; re-registering always clears OFFLINE to IDLE.
+
+    ``registered_at`` is restamped on every registration: a worker registers
+    once per process start, so it marks when the current process began and
+    lets compute_job_reaper requeue jobs claimed by the process before it
+    (W2-7: restarted workers left jobs IN_PROGRESS forever).
+    """
     return (
         "INSERT INTO compute_workers (hostname,tailscale_ip,cpu_cores,ram_gb,gpu_model,"
         "gpu_vram_gb,has_ollama,ollama_models,has_docker,max_concurrent) "
@@ -751,7 +757,7 @@ def worker_register_upsert_sql() -> str:
         "gpu_vram_gb=EXCLUDED.gpu_vram_gb, has_ollama=EXCLUDED.has_ollama, "
         "ollama_models=EXCLUDED.ollama_models, "
         "has_docker=EXCLUDED.has_docker, max_concurrent=EXCLUDED.max_concurrent, "
-        "active_jobs=0, last_heartbeat=NOW(), state='IDLE' "
+        "active_jobs=0, last_heartbeat=NOW(), registered_at=NOW(), state='IDLE' "
         "RETURNING *"
     )
 

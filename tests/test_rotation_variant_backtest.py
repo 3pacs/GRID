@@ -48,7 +48,7 @@ def test_backtest_rotation_variant_persists_summary_payload(monkeypatch):
 
     panel_calls = []
 
-    def fake_build_price_panel(engine_arg, tickers, start_date, end_date):
+    def fake_build_price_panel(engine_arg, tickers, start_date, end_date, **_kw):
         panel_calls.append(
             {
                 "engine": engine_arg,
@@ -68,7 +68,7 @@ def test_backtest_rotation_variant_persists_summary_payload(monkeypatch):
     }
     rotation_calls = []
 
-    def fake_run_rotation(engine_arg, as_of_date, positions):
+    def fake_run_rotation(engine_arg, as_of_date, positions, **_kw):
         rotation_calls.append(
             {
                 "engine": engine_arg,
@@ -80,6 +80,8 @@ def test_backtest_rotation_variant_persists_summary_payload(monkeypatch):
 
     monkeypatch.setattr(rvb, "build_price_panel", fake_build_price_panel)
     monkeypatch.setattr(rvb.ar, "run_rotation", fake_run_rotation)
+    # The legacy per-rebalance path; the PIT window path has its own tests.
+    monkeypatch.setenv(rvb.PIT_CACHE_ENV, "0")
 
     metrics = rvb.backtest_rotation_variant(
         engine=engine,
@@ -105,8 +107,10 @@ def test_backtest_rotation_variant_persists_summary_payload(monkeypatch):
         "win_rate_per_rebalance",
         "avg_holding_days",
         "n_trades",
+        "data_source",
     }
     assert set(metrics) == expected_metric_keys | {"backtest_run_id"}
+    assert metrics["data_source"] == {"mode": "db"}
     assert metrics["backtest_run_id"] == 1234
     assert metrics["config_id"] == config.fingerprint()
     assert metrics["config"] == {

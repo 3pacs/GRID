@@ -24,14 +24,19 @@ left returns no row -- never a zero and never another feature's value.
 
 from __future__ import annotations
 
-import os
+import gzip
+import hashlib
+import json
 import math
+import os
 import time as monotonic_time
 from contextlib import contextmanager
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Generator
 
+import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
@@ -47,6 +52,11 @@ def validate_source_snapshot_request(
     """Pure pre-connection validation shared with the explicit stored-only API."""
     return validate_selected_request(selections, as_of=as_of, start_date=start_date,
                                      vintage_policy=vintage_policy)
+
+
+#: Open bounds for ``get_pit``'s obs_date window (PostgreSQL accepts both).
+OBS_DATE_MIN = date(1, 1, 1)
+OBS_DATE_MAX = date(9999, 12, 31)
 
 
 def retraction_cutoff(as_of: date | datetime) -> datetime:
@@ -281,6 +291,9 @@ class PITStore:
         feature_ids: list[int],
         as_of_date: date,
         vintage_policy: str = "LATEST_AS_OF",
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> pd.DataFrame:
         """Return point-in-time correct data for the given features and date.
 
@@ -302,6 +315,14 @@ class PITStore:
             as_of_date: Decision date. No data released after this date is
                         included.
             vintage_policy: Either 'FIRST_RELEASE' or 'LATEST_AS_OF'.
+            start_date: Optional first obs_date to return (inclusive).
+            end_date: Optional last obs_date to return (inclusive).
+                The bounds are applied in SQL before ``DISTINCT ON``. The
+                vintage policy picks per ``(feature_id, obs_date)``, so a
+                bounded read returns exactly the rows of the unbounded read
+                that fall inside the window; it only reads fewer of them.
+                Without bounds every obs_date since inception is read
+                (rotation backtests read ~1 GB per job that way, W2-7).
 
         Returns:
             pd.DataFrame: Columns [feature_id, obs_date, value, release_date,
@@ -340,6 +361,7 @@ class PITStore:
                 FROM resolved_series rs
                 WHERE rs.feature_id = ANY(:fids)
                   AND rs.obs_date <= :aod
+                  AND rs.obs_date BETWEEN :obs_start AND :obs_end
                   AND rs.release_date <= :aod
                   AND NOT EXISTS (
                       SELECT 1 FROM resolved_series_retractions rr
@@ -359,6 +381,7 @@ class PITStore:
                 FROM resolved_series rs
                 WHERE rs.feature_id = ANY(:fids)
                   AND rs.obs_date <= :aod
+                  AND rs.obs_date BETWEEN :obs_start AND :obs_end
                   AND rs.release_date <= :aod
                   AND NOT EXISTS (
                       SELECT 1 FROM resolved_series_retractions rr
@@ -376,6 +399,8 @@ class PITStore:
                 {
                     "fids": feature_ids,
                     "aod": as_of_date,
+                    "obs_start": start_date or OBS_DATE_MIN,
+                    "obs_end": end_date or OBS_DATE_MAX,
                     "retraction_cutoff": retraction_cutoff(as_of_date),
                 },
             ).fetchall()
@@ -439,9 +464,16 @@ class PITStore:
             )
             start_date = capped_start
 
-        pit_df = self.get_pit(feature_ids, as_of_date, vintage_policy)
+        pit_df = self.get_pit(
+            feature_ids,
+            as_of_date,
+            vintage_policy,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
-        # Filter to date range
+        # Filter to date range (the read is already bounded; this keeps the
+        # contract for readers that ignore the bounds)
         pit_df = pit_df[
             (pit_df["obs_date"] >= start_date) & (pit_df["obs_date"] <= end_date)
         ]
@@ -544,6 +576,17 @@ class PITStore:
                 # because engine.begin() rolls back on exception
                 raise
 
+    def feature_ids_by_name(self, names: list[str]) -> dict[str, int]:
+        """Exact ``feature_registry`` name -> id for the registered *names*."""
+        if not names:
+            return {}
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT id, name FROM feature_registry WHERE name = ANY(:names)"),
+                {"names": list(names)},
+            ).fetchall()
+        return {r[1]: int(r[0]) for r in rows}
+
     def get_latest_values(self, feature_ids: list[int]) -> pd.DataFrame:
         """Return the single most recent value for each feature.
 
@@ -574,6 +617,403 @@ class PITStore:
 
         log.info("Returning latest values for {n} features", n=len(latest))
         return latest
+
+
+# ── Bounded in-memory PIT window (W2-7, 2026-11-06) ─────────────────────
+#
+# A rotation backtest asks the same PIT question ~117 times, once per weekly
+# rebalance, each time over a window that overlaps the last one by 51 weeks.
+# ``PITWindowCache`` reads every candidate vintage of a bounded window ONCE
+# (one SQL statement) and then answers ``get_pit`` for any ``as_of`` inside
+# it in memory, applying the same three filters and the same vintage pick as
+# the SQL above. The same object serialises to a hash-receipted snapshot file
+# so a remote worker can run the job without reading the database at all.
+
+PIT_WINDOW_FORMAT = "grid.pit_window.v1"
+
+PIT_WINDOW_COLUMNS = (
+    "feature_id", "obs_date", "value", "release_date", "vintage_date", "retracted_at",
+)
+
+#: Every vintage that could answer a PIT read inside the window, with the
+#: retraction time of its key (keys are unique in both tables). Retractions
+#: after the window's last ``as_of`` can never hide a row from a read the
+#: window answers, so they are left out and the content (and its hash) is
+#: fixed by the window.
+PIT_WINDOW_SELECT_SQL = """
+    SELECT rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date,
+           rr.retracted_at
+    FROM resolved_series rs
+    LEFT JOIN resolved_series_retractions rr
+      ON rr.feature_id = rs.feature_id
+     AND rr.obs_date = rs.obs_date
+     AND rr.vintage_date = rs.vintage_date
+     AND rr.retracted_at <= :retraction_cutoff
+    WHERE rs.feature_id = ANY(:fids)
+      AND rs.obs_date BETWEEN :obs_start AND :obs_end
+      AND rs.release_date <= :max_as_of
+    ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date
+"""
+
+_NO_RETRACTION_US = np.iinfo(np.int64).max
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class PITWindowMiss(ValueError):
+    """A read asked for features, dates or an ``as_of`` the window does not hold."""
+
+
+def _to_date(value: date | datetime | str | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def _to_utc(value: datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _utc_us(value: datetime) -> int:
+    delta = value - _EPOCH
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+class PITWindowCache(PITStore):
+    """``PITStore`` over an in-memory window of ``resolved_series`` vintages.
+
+    Holds every vintage of ``feature_ids`` with ``obs_date`` in
+    ``[start_date, end_date]`` and ``release_date <= max_as_of``, plus each
+    row's retraction time. ``get_pit`` then reproduces the SQL read for any
+    ``as_of <= max_as_of`` whose obs_date window lies inside the held one:
+    same three filters (obs_date and release_date <= as_of, retraction by the
+    end of as_of), same vintage pick, same columns and row order, and the
+    same ``assert_no_lookahead`` safety net. A read outside the window
+    raises ``PITWindowMiss`` or, when ``allow_db_fallback`` is set and an
+    engine is attached, is answered by the database with a warning.
+
+    ``feature_names`` records the ``feature_registry`` name lookups made at
+    build time (``None`` = name not registered), so callers that resolve
+    names first need no database either.
+    """
+
+    def __init__(
+        self,
+        rows: pd.DataFrame,
+        *,
+        feature_ids: list[int],
+        start_date: date | None,
+        end_date: date,
+        max_as_of: date,
+        feature_names: dict[str, int | None] | None = None,
+        engine: Engine | None = None,
+        allow_db_fallback: bool = False,
+        receipt: dict | None = None,
+    ) -> None:
+        super().__init__(engine)  # type: ignore[arg-type]
+        if start_date is not None and start_date > end_date:
+            raise ValueError(f"window start {start_date} is after its end {end_date}")
+        self.feature_ids = frozenset(int(f) for f in feature_ids)
+        self.start_date = start_date
+        self.end_date = end_date
+        self.max_as_of = max_as_of
+        self.feature_names = dict(feature_names or {})
+        self.allow_db_fallback = allow_db_fallback
+        self.receipt = receipt
+        self.db_fallbacks = 0
+        self.reads = 0
+
+        frame = pd.DataFrame(rows, columns=list(PIT_WINDOW_COLUMNS))
+        frame = frame.sort_values(["feature_id", "obs_date", "vintage_date"], kind="mergesort")
+        frame = frame.reset_index(drop=True)
+        self._rows = frame[["feature_id", "obs_date", "value", "release_date", "vintage_date"]]
+        self._fid = frame["feature_id"].to_numpy(dtype=np.int64)
+        self._obs = np.fromiter((d.toordinal() for d in frame["obs_date"]), np.int64, len(frame))
+        self._release = np.fromiter((d.toordinal() for d in frame["release_date"]), np.int64, len(frame))
+        self._vintage = np.fromiter((d.toordinal() for d in frame["vintage_date"]), np.int64, len(frame))
+        self._retracted = np.fromiter(
+            (
+                _NO_RETRACTION_US if (v is None or v is pd.NaT or (isinstance(v, float) and math.isnan(v)))
+                else _utc_us(_to_utc(v))
+                for v in frame["retracted_at"]
+            ),
+            np.int64,
+            len(frame),
+        )
+        self._retracted_at = [
+            None if r == _NO_RETRACTION_US else _EPOCH + timedelta(microseconds=int(r))
+            for r in self._retracted
+        ]
+
+    # -- construction ------------------------------------------------------
+
+    @classmethod
+    def load(
+        cls,
+        engine: Engine,
+        feature_ids: list[int],
+        start_date: date | None,
+        end_date: date,
+        max_as_of: date,
+        *,
+        feature_names: dict[str, int | None] | None = None,
+        allow_db_fallback: bool = True,
+    ) -> PITWindowCache:
+        """Read the window with ONE bounded statement (parameterised)."""
+        fids = sorted({int(f) for f in feature_ids})
+        rows: list = []
+        if fids:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(PIT_WINDOW_SELECT_SQL),
+                    {
+                        "fids": fids,
+                        "obs_start": start_date or OBS_DATE_MIN,
+                        "obs_end": end_date,
+                        "max_as_of": max_as_of,
+                        "retraction_cutoff": retraction_cutoff(max_as_of),
+                    },
+                ).fetchall()
+        log.info(
+            "PIT window loaded — {n} vintages, {f} features, obs {s}..{e}, as_of <= {a}",
+            n=len(rows), f=len(fids), s=start_date, e=end_date, a=max_as_of,
+        )
+        return cls(
+            pd.DataFrame([tuple(r) for r in rows], columns=list(PIT_WINDOW_COLUMNS)),
+            feature_ids=fids,
+            start_date=start_date,
+            end_date=end_date,
+            max_as_of=max_as_of,
+            feature_names=feature_names,
+            engine=engine,
+            allow_db_fallback=allow_db_fallback,
+        )
+
+    # -- reads -------------------------------------------------------------
+
+    def covers(
+        self,
+        feature_ids: list[int],
+        as_of_date: date,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> bool:
+        """True when ``get_pit`` with these arguments can be answered in memory."""
+        if isinstance(as_of_date, datetime) or as_of_date > self.max_as_of:
+            return False
+        if not {int(f) for f in feature_ids} <= self.feature_ids:
+            return False
+        hi = as_of_date if end_date is None else min(end_date, as_of_date)
+        if start_date is not None and hi < start_date:
+            return True  # empty window: nothing to miss
+        if self.start_date is not None and (start_date is None or start_date < self.start_date):
+            return False
+        return hi <= self.end_date
+
+    def get_pit(
+        self,
+        feature_ids: list[int],
+        as_of_date: date,
+        vintage_policy: str = "LATEST_AS_OF",
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        if vintage_policy not in ("FIRST_RELEASE", "LATEST_AS_OF"):
+            raise ValueError(
+                f"Invalid vintage_policy '{vintage_policy}'. "
+                "Must be 'FIRST_RELEASE' or 'LATEST_AS_OF'."
+            )
+        if not feature_ids:
+            return pd.DataFrame(
+                columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"]
+            )
+        if not self.covers(feature_ids, as_of_date, start_date, end_date):
+            if self.allow_db_fallback and self.engine is not None:
+                self.db_fallbacks += 1
+                log.warning(
+                    "PIT window miss (as_of={a}, obs {s}..{e}) — reading the database",
+                    a=as_of_date, s=start_date, e=end_date,
+                )
+                return super().get_pit(
+                    feature_ids, as_of_date, vintage_policy,
+                    start_date=start_date, end_date=end_date,
+                )
+            raise PITWindowMiss(
+                f"PIT window (features={len(self.feature_ids)}, obs {self.start_date}.."
+                f"{self.end_date}, as_of <= {self.max_as_of}) cannot answer as_of="
+                f"{as_of_date}, obs {start_date}..{end_date}"
+            )
+
+        self.reads += 1
+        aod = as_of_date.toordinal()
+        mask = np.isin(self._fid, np.fromiter((int(f) for f in feature_ids), np.int64))
+        mask &= self._obs <= aod
+        mask &= self._release <= aod
+        if start_date is not None:
+            mask &= self._obs >= start_date.toordinal()
+        if end_date is not None:
+            mask &= self._obs <= end_date.toordinal()
+        mask &= self._retracted > _utc_us(retraction_cutoff(as_of_date))
+        idx = np.flatnonzero(mask)
+        if vintage_policy == "LATEST_AS_OF":
+            # Rows are sorted by (feature, obs, vintage): the last of each
+            # (feature, obs) run is the latest vintage.
+            keep = np.ones(len(idx), dtype=bool)
+            if len(idx) > 1:
+                same_next = (self._fid[idx[1:]] == self._fid[idx[:-1]]) & (
+                    self._obs[idx[1:]] == self._obs[idx[:-1]]
+                )
+                keep[:-1] = ~same_next
+        else:
+            keep = np.ones(len(idx), dtype=bool)
+            if len(idx) > 1:
+                same_prev = (self._fid[idx[1:]] == self._fid[idx[:-1]]) & (
+                    self._obs[idx[1:]] == self._obs[idx[:-1]]
+                )
+                keep[1:] = ~same_prev
+        df = self._rows.iloc[idx[keep]].reset_index(drop=True)
+        self.assert_no_lookahead(df, as_of_date)
+        return df
+
+    def feature_ids_by_name(self, names: list[str]) -> dict[str, int]:
+        missing = [n for n in names if n not in self.feature_names]
+        if missing:
+            if self.allow_db_fallback and self.engine is not None:
+                self.db_fallbacks += 1
+                self.feature_names.update(
+                    {n: None for n in missing} | PITStore.feature_ids_by_name(self, missing)
+                )
+            else:
+                raise PITWindowMiss(f"feature names not in the PIT window: {sorted(missing)[:5]}")
+        return {n: self.feature_names[n] for n in names if self.feature_names.get(n) is not None}
+
+    # -- snapshot files ----------------------------------------------------
+
+    def _content(self) -> dict:
+        rows = [
+            list(r)
+            for r in zip(
+                self._fid.tolist(),
+                [d.isoformat() for d in self._rows["obs_date"]],
+                [float(v) for v in self._rows["value"]],
+                [d.isoformat() for d in self._rows["release_date"]],
+                [d.isoformat() for d in self._rows["vintage_date"]],
+                [None if t is None else t.isoformat() for t in self._retracted_at],
+            )
+        ]
+        return {
+            "format": PIT_WINDOW_FORMAT,
+            "window": {
+                "feature_ids": sorted(self.feature_ids),
+                "start_date": None if self.start_date is None else self.start_date.isoformat(),
+                "end_date": self.end_date.isoformat(),
+                "max_as_of": self.max_as_of.isoformat(),
+                "retraction_cutoff": retraction_cutoff(self.max_as_of).isoformat(),
+            },
+            "feature_names": dict(sorted(self.feature_names.items())),
+            "columns": list(PIT_WINDOW_COLUMNS),
+            "rows": rows,
+        }
+
+    def content_sha256(self) -> str:
+        """sha256 over the canonical JSON of window, name map and every row."""
+        return _canonical_sha256(self._content())
+
+    def write_snapshot(self, directory: str | Path, *, built_by: str = "") -> Path:
+        """Write ``pit-window-<sha256>.json.gz`` into *directory* (never overwrites).
+
+        The digest covers only the content, so the same window built twice
+        (or on two hosts) has the same name; ``built_at``/``built_by`` sit
+        outside it.
+        """
+        content = self._content()
+        sha = _canonical_sha256(content)
+        path = Path(directory) / f"pit-window-{sha}.json.gz"
+        if path.exists():
+            if PITWindowCache.read_snapshot(path).content_sha256() != sha:
+                raise ValueError(f"existing snapshot {path} does not match its name")
+            return path
+        envelope = {
+            "content": content,
+            "sha256": sha,
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "built_by": built_by,
+            "n_rows": len(content["rows"]),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "xb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) as gz:
+            gz.write(json.dumps(envelope, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
+        os.replace(tmp, path)
+        return path
+
+    @classmethod
+    def read_snapshot(
+        cls,
+        path: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        engine: Engine | None = None,
+        allow_db_fallback: bool = False,
+    ) -> PITWindowCache:
+        """Load a snapshot file, recomputing its digest; refuse on any mismatch."""
+        with gzip.open(path, "rb") as gz:
+            envelope = json.loads(gz.read())
+        content = envelope["content"]
+        if content.get("format") != PIT_WINDOW_FORMAT:
+            raise ValueError(f"{path}: unknown snapshot format {content.get('format')!r}")
+        sha = _canonical_sha256(content)
+        if sha != envelope.get("sha256"):
+            raise ValueError(f"{path}: content digest {sha} does not match its receipt")
+        if expected_sha256 is not None and sha != expected_sha256:
+            raise ValueError(f"{path}: digest {sha} is not the expected {expected_sha256}")
+        window = content["window"]
+        frame = pd.DataFrame(
+            [
+                (
+                    int(r[0]), date.fromisoformat(r[1]), float(r[2]),
+                    date.fromisoformat(r[3]), date.fromisoformat(r[4]),
+                    None if r[5] is None else datetime.fromisoformat(r[5]),
+                )
+                for r in content["rows"]
+            ],
+            columns=list(PIT_WINDOW_COLUMNS),
+        )
+        cache = cls(
+            frame,
+            feature_ids=window["feature_ids"],
+            start_date=_to_date(window["start_date"]),
+            end_date=_to_date(window["end_date"]),
+            max_as_of=_to_date(window["max_as_of"]),
+            feature_names=content.get("feature_names") or {},
+            engine=engine,
+            allow_db_fallback=allow_db_fallback,
+            receipt={
+                "sha256": sha,
+                "path": str(path),
+                "built_at": envelope.get("built_at"),
+                "built_by": envelope.get("built_by"),
+                "n_rows": len(content["rows"]),
+            },
+        )
+        if cache.content_sha256() != sha:  # round-trip guard (types, ordering)
+            raise ValueError(f"{path}: snapshot does not round-trip to its digest")
+        return cache
 
 
 if __name__ == "__main__":
