@@ -991,10 +991,11 @@ def test_create_prediction_downgrades_degraded_targets(
     assert saved_payload["market_overlay_snapshot"]["scorecard"]["target_statuses"][0]["status"] == "degraded"
 
 
-def test_client_cannot_impersonate_scheduled_evidence_producer():
+@pytest.mark.parametrize("model_version", ["astrogrid-evidence-v2", " astrogrid-evidence-v2 ", "astrogrid-evidence-v2\n"])
+def test_client_cannot_impersonate_scheduled_evidence_producer(model_version):
     response = client.post("/api/v1/astrogrid/predictions", headers=_auth_header(), json={
         "question": "Synthetic injected question", "call": "buy BTC", "timing": "now",
-        "setup": "synthetic", "invalidation": "synthetic", "model_version": "astrogrid-evidence-v2",
+        "setup": "synthetic", "invalidation": "synthetic", "model_version": model_version,
     })
     assert response.status_code == 422
     assert "reserved" in response.json()["detail"]
