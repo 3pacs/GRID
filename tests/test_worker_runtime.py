@@ -1,3 +1,5 @@
+import pytest
+
 from scripts import worker
 
 
@@ -61,41 +63,174 @@ def test_requested_feature_ids_are_deduped_ints():
     assert worker.requested_feature_ids({}) == []
 
 
-def test_detect_ollama_requires_generate_probe(monkeypatch):
-    class Response:
-        def __init__(self, payload=None, status_code=200):
-            self._payload = payload or {}
-            self.status_code = status_code
+class _Resp:
+    def __init__(self, payload=None, status_code=200):
+        self._payload = payload or {}
+        self.status_code = status_code
 
-        def json(self):
-            return self._payload
+    def json(self):
+        return self._payload
 
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise RuntimeError("bad status")
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError("bad status")
 
-    def fake_get(*_args, **_kwargs):
-        return Response({"models": [{"name": "llama3.2:latest"}]})
+
+def _tags(*names):
+    return lambda *_a, **_k: _Resp({"models": [{"name": n} for n in names]})
+
+
+def _no_generate(*_a, **_k):
+    raise AssertionError("generate probe must be opt-in")
+
+
+@pytest.fixture
+def ollama_env(monkeypatch):
+    for name in (
+        worker.OLLAMA_PROBE_MODEL_ENV,
+        worker.OLLAMA_GENERATE_PROBE_ENV,
+        worker.OLLAMA_PROBE_TIMEOUT_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+# Regression for 2026-11-06: has_ollama was false on every node while Ollama
+# served. The probe asked for llama3.2 (installed nowhere), fell back to the
+# first model (qwen3.8:27b / qwen3-vl:32b), and gave its cold load 20 s; the
+# load alone took 25 s on grid-svr.
+
+
+def test_probe_reports_available_with_any_installed_chat_model(ollama_env):
+    ollama_env.setattr(worker.requests, "get", _tags("qwen3.8:27b", "nomic-embed-text:latest"))
+    ollama_env.setattr(worker.requests, "post", _no_generate)
+
+    probe = worker.probe_ollama()
+
+    assert probe["available"] is True
+    assert probe["reachable"] is True
+    assert probe["probe_model"] == "qwen3.8:27b"
+    assert probe["models"] == ["qwen3.8:27b", "nomic-embed-text:latest"]
+    assert worker.detect_ollama() is True
+
+
+def test_probe_rejects_embedding_only_server(ollama_env):
+    ollama_env.setattr(worker.requests, "get", _tags("nomic-embed-text:latest"))
+    ollama_env.setattr(worker.requests, "post", _no_generate)
+
+    probe = worker.probe_ollama()
+
+    assert probe["available"] is False
+    assert probe["reachable"] is True
+    assert probe["models"] == ["nomic-embed-text:latest"]
+
+
+def test_probe_reports_unreachable_server(ollama_env):
+    def refuse(*_a, **_k):
+        raise ConnectionError("refused")
+
+    ollama_env.setattr(worker.requests, "get", refuse)
+
+    probe = worker.probe_ollama()
+
+    assert probe == {
+        "available": False,
+        "reachable": False,
+        "models": [],
+        "probe_model": None,
+        "reason": "unreachable: ConnectionError",
+    }
+    assert worker.detect_ollama() is False
+
+
+def test_probe_honours_configured_model_list(ollama_env):
+    ollama_env.setattr(worker.requests, "get", _tags("qwen3-vl:32b-instruct", "qwen3:8b"))
+    ollama_env.setattr(worker.requests, "post", _no_generate)
+
+    ollama_env.setenv(worker.OLLAMA_PROBE_MODEL_ENV, "llama3.2")
+    assert worker.probe_ollama()["available"] is False
+
+    ollama_env.setenv(worker.OLLAMA_PROBE_MODEL_ENV, "llama3.2, qwen3")
+    probe = worker.probe_ollama()
+    assert probe["available"] is True
+    assert probe["probe_model"] == "qwen3:8b"
+
+
+def test_opt_in_generate_probe_uses_long_timeout(ollama_env):
+    seen = {}
 
     def fake_post(url, **kwargs):
-        assert url == "http://localhost:11434/api/generate"
-        assert kwargs["json"]["model"] == "llama3.2:latest"
-        return Response({"done": True})
+        seen["url"] = url
+        seen.update(kwargs)
+        return _Resp({"done": True})
 
-    monkeypatch.setattr(worker.requests, "get", fake_get)
-    monkeypatch.setattr(worker.requests, "post", fake_post)
+    ollama_env.setattr(worker.requests, "get", _tags("qwen3.8:27b"))
+    ollama_env.setattr(worker.requests, "post", fake_post)
+    ollama_env.setenv(worker.OLLAMA_GENERATE_PROBE_ENV, "1")
 
-    assert worker.detect_ollama()
+    assert worker.probe_ollama()["available"] is True
+    assert seen["url"] == "http://localhost:11434/api/generate"
+    assert seen["json"]["model"] == "qwen3.8:27b"
+    assert seen["timeout"] == worker.DEFAULT_OLLAMA_GENERATE_TIMEOUT_S >= 60
 
 
-def test_detect_ollama_rejects_tags_only_server(monkeypatch):
-    class Response:
-        status_code = 200
+def test_opt_in_generate_probe_failure_marks_unavailable(ollama_env):
+    def fail(*_a, **_k):
+        raise TimeoutError("read timed out")
 
-        def json(self):
-            return {"models": [{"name": "llama3.2:latest"}]}
+    ollama_env.setattr(worker.requests, "get", _tags("qwen3.8:27b"))
+    ollama_env.setattr(worker.requests, "post", fail)
+    ollama_env.setenv(worker.OLLAMA_GENERATE_PROBE_ENV, "1")
+    ollama_env.setenv(worker.OLLAMA_PROBE_TIMEOUT_ENV, "5")
 
-    monkeypatch.setattr(worker.requests, "get", lambda *_args, **_kwargs: Response())
-    monkeypatch.setattr(worker.requests, "post", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("generate failed")))
+    probe = worker.probe_ollama()
 
-    assert not worker.detect_ollama()
+    assert probe["available"] is False
+    assert "TimeoutError" in probe["reason"]
+
+
+def test_resolve_model_falls_back_past_embedding_models(monkeypatch):
+    monkeypatch.setattr(worker.requests, "get", _tags("nomic-embed-text:latest", "qwen3:8b"))
+
+    assert worker._resolve_ollama_model("llama3.2") == "qwen3:8b"
+    assert worker._resolve_ollama_model("qwen3") == "qwen3:8b"
+
+
+# Regression for 2026-11-06: forge registered as 127.0.1.1 (Debian maps the
+# hostname to that address) because `tailscale` was not on its PATH.
+
+
+def _no_tailscale(*_a, **_k):
+    raise FileNotFoundError("tailscale")
+
+
+def test_tailscale_ip_never_falls_back_to_loopback(monkeypatch):
+    monkeypatch.delenv(worker.TAILSCALE_IP_ENV, raising=False)
+    monkeypatch.setattr(worker.subprocess, "run", _no_tailscale)
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "forge")
+    monkeypatch.setattr(worker.socket, "gethostbyname", lambda _h: "127.0.1.1")
+    monkeypatch.setattr(worker, "_route_source_ip", lambda _url: "100.70.1.2")
+
+    assert worker.get_tailscale_ip("http://100.75.185.36:8100") == "100.70.1.2"
+
+    monkeypatch.setattr(worker, "_route_source_ip", lambda _url: None)
+    assert worker.get_tailscale_ip("http://localhost:8100") == "forge"
+
+
+def test_tailscale_ip_prefers_override_then_cli(monkeypatch):
+    class Done:
+        returncode = 0
+        stdout = "100.68.9.27\n"
+
+    monkeypatch.setattr(worker.subprocess, "run", lambda *_a, **_k: Done())
+    monkeypatch.setenv(worker.TAILSCALE_IP_ENV, "100.99.0.1")
+    assert worker.get_tailscale_ip() == "100.99.0.1"
+
+    monkeypatch.delenv(worker.TAILSCALE_IP_ENV)
+    assert worker.get_tailscale_ip() == "100.68.9.27"
+
+
+def test_route_source_ip_skips_loopback_coordinator():
+    assert worker._route_source_ip("http://localhost:8100") is None
+    assert worker._route_source_ip("http://127.0.0.1:8100") is None
+    assert worker._route_source_ip(None) is None

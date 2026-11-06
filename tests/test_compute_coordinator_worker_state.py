@@ -352,3 +352,101 @@ def test_w1_readiness_no_longer_depends_on_yielding_to_ocmri():
     assert proof["scheduler"]["ocmri_defers"] is True
     assert proof["scheduler"]["ocmri_priority_wins"] is False
     assert proof["ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# Worker liveness and capabilities (2026-11-06). The reaper marks silent
+# workers OFFLINE; every path a live worker takes writes IDLE/BUSY again, so
+# a reconnecting worker flips back without operator action.
+# ---------------------------------------------------------------------------
+
+
+def test_reconnect_paths_overwrite_offline_state():
+    for sql in (
+        coordinator.worker_heartbeat_update_sql(),
+        coordinator.worker_heartbeat_with_active_jobs_update_sql(),
+        coordinator.worker_claim_update_sql(),
+        coordinator.worker_complete_update_sql(),
+    ):
+        assert "OFFLINE" not in sql
+        assert "state=" in sql
+    assert "state='IDLE'" in coordinator.worker_register_upsert_sql()
+
+
+def test_register_upsert_stores_ollama_models():
+    sql = coordinator.worker_register_upsert_sql()
+
+    assert "ollama_models" in sql
+    assert "%s::jsonb" in sql
+    assert "ollama_models=EXCLUDED.ollama_models" in sql
+    assert sql.count("%s") == 10
+
+
+class _RecordingCursor:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, params=None):
+        self.conn.calls.append((sql, params))
+
+    def fetchone(self):
+        return {"id": 7, "hostname": "gridz4"}
+
+
+class _RecordingConn:
+    def __init__(self):
+        self.calls = []
+        self.autocommit = False
+
+    def cursor(self, cursor_factory=None):
+        return _RecordingCursor(self)
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_register_endpoint_persists_reported_models(monkeypatch):
+    conn = _RecordingConn()
+    monkeypatch.setattr(coordinator, "get_conn", lambda: conn)
+
+    coordinator.register_worker(
+        coordinator.WorkerRegister(
+            hostname="gridz4",
+            tailscale_ip="100.68.9.27",
+            has_ollama=True,
+            ollama_models=["qwen3:8b", "nomic-embed-text:latest"],
+        )
+    )
+
+    sql, params = conn.calls[-1]
+    assert sql == coordinator.worker_register_upsert_sql()
+    assert params[6] is True
+    assert params[7] == '["qwen3:8b", "nomic-embed-text:latest"]'
+
+
+def test_register_accepts_older_workers_without_models():
+    worker = coordinator.WorkerRegister(hostname="old", tailscale_ip="100.1.2.3")
+    assert worker.ollama_models == []
+
+
+def test_create_tables_adds_ollama_models_column_to_existing_table():
+    conn = _RecordingConn()
+    coordinator._create_tables(conn)
+
+    executed = [sql for sql, _ in conn.calls]
+    assert coordinator.COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL in executed
+    assert "ADD COLUMN IF NOT EXISTS ollama_models" in coordinator.COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL
+    assert executed.index("SET lock_timeout = '5s'") < executed.index(
+        coordinator.COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL
+    )
+
+
+def test_cancel_reason_is_recorded_and_bounded():
+    assert coordinator.cancel_reason(None) == "cancelled by operator"
+    assert coordinator.cancel_reason("  ") == "cancelled by operator"
+    assert coordinator.cancel_reason("stale filler") == "cancelled by operator: stale filler"
+    long = coordinator.cancel_reason("x" * 5000)
+    assert len(long) == len("cancelled by operator: ") + coordinator.CANCEL_REASON_MAX_CHARS
