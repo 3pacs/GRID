@@ -85,6 +85,15 @@ block-permutation null is itself anti-conservative in small samples (about
 ``offline_research_proof.CAPPED_BLOCK_CALIBRATION``), so the realised
 cross-run error can exceed ``q`` by the same factor there.
 
+Permutation resolution (S6): a block-permutation p-value is at least
+``1 / (perms + 1)``, so a run whose Holm first step ``alpha_k / m`` sits below
+that can never select (run 5 with 50 trials needs ~6.7e-5; 10000 perms reach
+only ~1e-4). :func:`default_perms` derives the count so the minimum attainable
+p is ``PERMS_MARGIN`` (10x) below ``alpha_k / m`` and raises
+:class:`PermutationBudgetError` when ``PERMS_CAP`` cannot reach it (the
+synthetic runner abandons the allocation first). Every ``run_result`` records
+``min_attainable_p`` and ``first_step_threshold``.
+
 Why not LORD / SAFFRON / alpha-investing or a cumulative global BH: the
 p-values here are dependent inside a run (every feature of a family shares
 the same target labels, features are correlated) and across runs (shared
@@ -168,6 +177,9 @@ FORWARD_LOG_SOURCE = "hypothesis_forward_v1"
 REPO = Path(__file__).resolve().parent.parent
 MAX_Q = 0.10
 PERMS_CAP = 20000
+# The minimum attainable permutation p must sit this many times below the
+# smallest threshold a run can need (Holm's first step, alpha_k / m).
+PERMS_MARGIN = 10.0
 STATUSES = ("tested", "untestable", SELF_LAG)
 HOLDOUT_OUTCOMES = ("survived", "failed", "not_selected")
 FORWARD_OUTCOMES = ("pass", "fail", "inconclusive")
@@ -205,6 +217,56 @@ SOURCE_CLASSES = {
     "FREDDIE_PMMS": "housing",
     "AAII": "sentiment",
 }
+
+
+class PermutationBudgetError(ValueError):
+    """The permutation cap cannot resolve the smallest threshold a run can need."""
+
+
+def min_attainable_p(perms: int) -> float:
+    """Smallest value of a ``(1 + extreme) / (perms + 1)`` permutation p-value."""
+    if int(perms) != perms or perms < 1:
+        raise ValueError("perms must be a positive integer")
+    return 1.0 / (int(perms) + 1)
+
+
+def perms_for_threshold(
+    threshold: float,
+    *,
+    margin: float = PERMS_MARGIN,
+    floor: int = 0,
+    cap: int = PERMS_CAP,
+) -> int:
+    """Fewest permutations whose minimum attainable p is <= ``threshold / margin``.
+
+    At least ``floor`` (but never above ``cap`` because of it). Raises
+    :class:`PermutationBudgetError` when the count needed exceeds ``cap``.
+    """
+    if not (math.isfinite(threshold) and 0 < threshold < 1):
+        raise ValueError("threshold must be in (0, 1)")
+    if not (math.isfinite(margin) and margin >= 1):
+        raise ValueError("margin must be >= 1")
+    target = threshold / margin
+    needed = max(1, math.ceil(1 / target) - 1)
+    while min_attainable_p(needed) > target:  # guard float rounding
+        needed += 1
+    if needed > cap:
+        raise PermutationBudgetError(
+            f"threshold {threshold:.3g} needs a minimum attainable p <= {target:.3g} "
+            f"({margin:g}x margin), i.e. >= {needed} permutations, above the cap "
+            f"{cap}: declare fewer trials or raise the cap"
+        )
+    return max(needed, min(floor, cap))
+
+
+def first_step_threshold(record: dict) -> float:
+    """Holm's first (smallest) threshold in a run: ``alpha_k / m``.
+
+    The holdout's Bonferroni threshold ``alpha / selections`` is no smaller
+    whenever the protocol's holdout alpha >= ``alpha_k`` (the 0.05 default
+    always is, since ``alpha_k <= q / 2 <= 0.05``).
+    """
+    return record["alpha"] / max(1, record["trial_count"])
 
 
 def run_alpha(k: int, q: float) -> float:
@@ -1237,9 +1299,21 @@ def protocol_for_allocation(allocation: dict, **settings) -> Protocol:
     return protocol
 
 
-def default_perms(allocation: dict, floor: int = 999, cap: int = PERMS_CAP) -> int:
-    """Enough permutations for Holm's first step (x2), within [floor, cap]."""
-    return int(min(cap, max(floor, 2 * allocation["record"]["min_perms_for_first_step"])))
+def default_perms(
+    allocation: dict,
+    floor: int = 999,
+    cap: int = PERMS_CAP,
+    *,
+    margin: float = PERMS_MARGIN,
+) -> int:
+    """Permutations whose minimum attainable p is ``margin`` x below Holm's first step.
+
+    At least ``floor``. Raises :class:`PermutationBudgetError` when ``cap``
+    cannot reach it: a derived count is never silently resolution-limited.
+    """
+    return perms_for_threshold(
+        first_step_threshold(allocation["record"]), margin=margin, floor=floor, cap=cap
+    )
 
 
 # --- results ------------------------------------------------------------------------
@@ -1333,6 +1407,8 @@ def record_run(
             "holdout_sha256": holdout_result["holdout_sha256"],
             "state": holdout_result["state"],
             "perms": protocol.perms,
+            "min_attainable_p": min_attainable_p(protocol.perms),
+            "first_step_threshold": allocation["alpha"] / max(1, len(trials)),
             "resolution_limited": 1 / (protocol.perms + 1)
             > allocation["alpha"] / max(1, len(trials)),
             "method": payload["method"],
@@ -1741,24 +1817,36 @@ def run_synthetic_step(
     output: str | Path,
     *,
     run_id: str,
-    perms_cap: int = PERMS_CAP,
+    perms_cap: int | None = None,
     seed: int = 20260926,
     recorded_at: str | None = None,
 ) -> dict:
     """allocate -> protocol -> rows -> contract run (files) -> ledger result.
 
-    Permutations follow the run's Holm first step (:func:`default_perms`) up to
-    ``perms_cap``; a capped run is recorded as ``resolution_limited``.
+    Permutations follow the run's Holm first step (:func:`default_perms`, 10x
+    margin). With ``perms_cap=None`` a run the cap cannot resolve is abandoned
+    (its alpha stays spent) and :class:`PermutationBudgetError` is raised. An
+    explicit ``perms_cap`` opts into a cheaper, possibly resolution-limited
+    synthetic run: the count is clipped to it and the run is recorded with its
+    ``min_attainable_p`` (and ``resolution_limited`` when it cannot reach
+    ``alpha_k / m``).
     """
     allocation = allocate(
         ledger, catalog, policy, run_id=run_id, windows=epoch.windows, recorded_at=recorded_at
     )
+    try:
+        perms = default_perms(allocation, cap=PERMS_CAP if perms_cap is None else perms_cap)
+    except PermutationBudgetError as exc:
+        if perms_cap is None:
+            abandon(ledger, f"permutation budget: {exc}", recorded_at=recorded_at)
+            raise
+        perms = perms_cap
     protocol = protocol_for_allocation(
         allocation,
         origin="synthetic_fixture",
         sampling="horizon_spaced",
         step=1,
-        perms=default_perms(allocation, cap=perms_cap),
+        perms=perms,
         seed=seed,
         statistic="pearson",
     )
@@ -1791,9 +1879,12 @@ def run_synthetic_dry_runs(
     policy: Policy | None = None,
     q: float = MAX_Q,
     seed: int = 20260926,
-    perms_cap: int = PERMS_CAP,
+    perms_cap: int | None = None,
 ) -> dict:
-    """Consecutive synthetic dry runs on one new ledger in a new directory."""
+    """Consecutive synthetic dry runs on one new ledger in a new directory.
+
+    ``perms_cap`` as in :func:`run_synthetic_step` (None: strict, 10x margin).
+    """
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     catalog = synthetic_catalog()
@@ -1830,6 +1921,7 @@ def run_synthetic_dry_runs(
                 "selected": step["result"]["record"]["selected"],
                 "survived": step["result"]["record"]["survived"],
                 "resolution_limited": step["result"]["record"]["resolution_limited"],
+                "min_attainable_p": step["result"]["record"]["min_attainable_p"],
             }
         )
     summary = {"steps": steps, "ledger": summarize(ledger), "planted": planted}

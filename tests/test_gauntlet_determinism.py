@@ -52,24 +52,24 @@ class TestPermutationTestSeed:
     def test_same_seed_produces_identical_p_value(
         self, signal_panel, forward_returns_panel
     ):
-        p1, sr1 = permutation_test(
+        r1 = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=25, top_n=3, seed=42
         )
-        p2, sr2 = permutation_test(
+        r2 = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=25, top_n=3, seed=42
         )
-        assert p1 == p2
-        assert sr1 == sr2
+        assert r1.p_value == r2.p_value
+        assert r1.observed_sharpe == r2.observed_sharpe
 
     def test_different_seeds_produce_different_p_value(
         self, signal_panel, forward_returns_panel
     ):
-        p1, _ = permutation_test(
+        p1 = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=25, top_n=3, seed=1
-        )
-        p2, _ = permutation_test(
+        ).p_value
+        p2 = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=25, top_n=3, seed=2
-        )
+        ).p_value
         # Different RNG seeds should sample different null distributions;
         # 25 shuffles on a noisy panel is more than enough to separate them.
         assert p1 != p2
@@ -82,15 +82,15 @@ class TestPermutationTestSeed:
         # so the bracketed call must match an un-bracketed call.
         np.random.seed(123)
         np.random.normal(size=10_000)  # advance the legacy global RNG
-        p_bracketed, _ = permutation_test(
+        p_bracketed = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=20, top_n=3
-        )
+        ).p_value
 
         np.random.seed(999)
         np.random.normal(size=42)  # different global state
-        p_unbracketed, _ = permutation_test(
+        p_unbracketed = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=20, top_n=3
-        )
+        ).p_value
 
         assert p_bracketed == p_unbracketed
 
@@ -169,9 +169,9 @@ class TestRunGauntletSeed:
             n_subsample_splits=10,
             seed=99,
         )
-        direct_p, _ = permutation_test(
+        direct_p = permutation_test(
             signal_panel, forward_returns_panel, n_shuffles=20, top_n=3, seed=99
-        )
+        ).p_value
         direct_s = subsample_stability(
             signal_panel, forward_returns_panel, n_splits=10, top_n=3, seed=99
         )

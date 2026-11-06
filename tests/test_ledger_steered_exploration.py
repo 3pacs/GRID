@@ -987,3 +987,84 @@ def test_split_budget_properties():
         )
     best = lse.probability_best({"a": (10, 1), "b": (1, 10)}, 2048)
     assert best["a"] > 0.99
+
+
+# --- S6: permutation counts follow the alpha budget ---------------------------------
+
+
+def allocation_stub(alpha, m):
+    return {"record": {"alpha": alpha, "trial_count": m}}
+
+
+def test_run5_with_50_trials_needs_more_than_the_old_10000_perms():
+    """Run 5 at q = 0.10 with 50 trials: Holm's first step is ~6.7e-5.
+
+    The old ``perms=10000`` default reaches only 1/10001 ~ 1e-4, so no trial of
+    that run could ever be selected; the derived count reaches threshold / 10.
+    """
+    threshold = lse.first_step_threshold(
+        {"alpha": lse.run_alpha(5, 0.10), "trial_count": 50}
+    )
+    assert threshold == pytest.approx(6.667e-5, rel=1e-3)
+    assert lse.min_attainable_p(10000) > threshold
+    perms = lse.perms_for_threshold(threshold, cap=10**6)
+    assert lse.min_attainable_p(perms) <= threshold / lse.PERMS_MARGIN
+    assert lse.min_attainable_p(perms - 1) > threshold / lse.PERMS_MARGIN  # fewest
+    with pytest.raises(lse.PermutationBudgetError, match="above the cap 20000"):
+        lse.perms_for_threshold(threshold)  # the default cap cannot reach it
+
+
+def test_default_perms_keeps_a_10x_margin_below_holms_first_step():
+    """Regression: the old default gave only a 2x margin (run 2, 21 trials: 2520
+    perms, minimum p 4.0e-4 against a first step of 7.9e-4)."""
+    for k, m in ((1, 7), (1, 21), (2, 21), (2, 7)):
+        allocation = allocation_stub(lse.run_alpha(k, 0.10), m)
+        threshold = lse.first_step_threshold(allocation["record"])
+        perms = lse.default_perms(allocation)
+        assert perms >= 999
+        assert lse.min_attainable_p(perms) <= threshold / 10
+    with pytest.raises(lse.PermutationBudgetError):
+        lse.default_perms(allocation_stub(lse.run_alpha(3, 0.10), 21))  # needs 25199
+
+
+def test_perms_for_threshold_validates_and_respects_floor_and_cap():
+    assert lse.perms_for_threshold(0.05) == 199
+    assert lse.perms_for_threshold(0.05, floor=999) == 999
+    assert lse.perms_for_threshold(0.05, floor=999, cap=500) == 500
+    for bad in (0.0, 1.0, float("nan"), -0.1):
+        with pytest.raises(ValueError):
+            lse.perms_for_threshold(bad)
+    with pytest.raises(ValueError):
+        lse.perms_for_threshold(0.05, margin=0.5)
+    with pytest.raises(ValueError):
+        lse.min_attainable_p(0)
+
+
+def test_strict_synthetic_step_abandons_a_run_the_cap_cannot_resolve(tmp_path, monkeypatch):
+    ledger = new_ledger(tmp_path)
+    catalog = lse.synthetic_catalog()
+    monkeypatch.setattr(lse, "PERMS_CAP", 500)
+    with pytest.raises(lse.PermutationBudgetError):
+        lse.run_synthetic_step(
+            ledger, catalog, lse.Policy(budget=7), lse.synthetic_epoch(catalog, 1),
+            tmp_path / "run", run_id="r1", recorded_at=FIXED,
+        )
+    assert ledger.records[-1]["kind"] == "abandoned"
+    assert "permutation budget" in ledger.records[-1]["reason"]
+    assert ledger.open_allocation() is None
+    assert ledger.alpha_spent() == pytest.approx(lse.run_alpha(1, 0.10))  # stays spent
+
+
+def test_run_result_reports_min_attainable_p(tmp_path):
+    ledger = new_ledger(tmp_path)
+    catalog = lse.synthetic_catalog()
+    step = lse.run_synthetic_step(
+        ledger, catalog, lse.Policy(budget=7), lse.synthetic_epoch(catalog, 1),
+        tmp_path / "run", run_id="r1", recorded_at=FIXED,
+    )
+    record = step["result"]["record"]
+    m = len(record["trials"])
+    assert record["first_step_threshold"] == pytest.approx(record["alpha"] / m)
+    assert record["min_attainable_p"] == pytest.approx(1 / (record["perms"] + 1))
+    assert record["min_attainable_p"] <= record["first_step_threshold"] / 10
+    assert record["resolution_limited"] is False
