@@ -484,6 +484,34 @@ def run_intelligence_loop() -> None:
 
     _sched.every().sunday.at("04:30").do(_curated_graph_analytics_weekly)
 
+    def _actor_universe_daily() -> None:
+        """Full actor-universe graph analytics (~3.5M actors, ~11M edges).
+
+        ``intelligence/actors/universe.py`` runs as a niced child process
+        (its igraph work would hold this loop's GIL for minutes) and writes
+        a new ``actor_graph_*`` version that /actor-network and
+        /actor-universe/* read. ``GRID_ACTOR_UNIVERSE_JOB=0`` disables it.
+        """
+        try:
+            from intelligence.actors.universe import maybe_launch
+
+            maybe_launch(max_age_hours=20.0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("actor universe daily launch failed: {e}", e=str(exc))
+
+    def _actor_universe_catch_up():  # returns schedule.CancelJob
+        """Once after start: run now if the newest version is >26h old or missing."""
+        try:
+            from intelligence.actors.universe import maybe_launch
+
+            maybe_launch(max_age_hours=26.0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("actor universe catch-up failed: {e}", e=str(exc))
+        return _sched.CancelJob
+
+    _sched.every().day.at("03:40").do(_actor_universe_daily)
+    _sched.every(3).minutes.do(_actor_universe_catch_up)
+
     # ── Trial gems → enriched small caps → board (daily chain, 2026-09-10) ──
     # Hermes' _SOURCE_REGISTRY carries interval_h for these but nothing runs
     # fn-based entries on that interval, and the 06:00 cron for the ingestor
