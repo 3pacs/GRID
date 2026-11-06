@@ -29,6 +29,7 @@ from intelligence.chain_contagion import (
     simulate_contagion,
 )
 from utils.ttl_cache import TTLCache
+from utils.single_flight import single_flight
 
 router = APIRouter(prefix="/api/v1/contagion", tags=["contagion"])
 sector_router = APIRouter(prefix="/api/v1/sectors", tags=["contagion"])
@@ -213,6 +214,7 @@ def _persist_prediction(
 
 
 @router.get("/simulate")
+@single_flight
 def simulate(
     shock_node: str = Query(..., min_length=1, max_length=80),
     shock_type: str = Query("price_increase"),
@@ -537,6 +539,7 @@ def _run_scenario_sim(engine: Any, scenario: dict[str, Any]) -> dict[str, Any]:
 
 
 @sector_router.get("/{sector_name}/contagion-matrix")
+@single_flight
 def get_contagion_matrix(
     sector_name: str,
     _token: str = Depends(require_auth),

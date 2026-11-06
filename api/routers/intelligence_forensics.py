@@ -10,6 +10,7 @@ from loguru import logger as log
 from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
+from utils.single_flight import single_flight
 
 router = APIRouter(tags=["intelligence"])
 
@@ -321,6 +322,7 @@ _INFLUENCE_GRAPH_CACHE_KEY = "default"
 
 
 @router.get("/influence")
+@single_flight
 def get_influence_network(
     ticker: str | None = Query(None, description="Filter by ticker symbol"),
     _token: str = Depends(require_auth),

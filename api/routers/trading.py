@@ -2,14 +2,49 @@
 
 from __future__ import annotations
 
+import functools
+import threading
+from typing import Any, Callable, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.single_flight import preserve_signature
 
 router = APIRouter(prefix="/api/v1/trading", tags=["trading"])
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+# ── Order/state-mutation serialization ───────────────────────────────────
+#
+# These routes used to be ``async def`` with no await, so grid-api's single
+# event loop ran them one at a time. As plain ``def`` they run concurrently
+# in the threadpool, which would open check -> submit -> record races (a
+# duplicate or over-cap order). One lock per venue restores the old
+# serialization in-process; the venue connectors' own atomic DB guards
+# (e.g. Robinhood's per-key claim and conditional order-slot reservation)
+# cover other processes.
+_ROUTE_LOCKS: dict[str, threading.Lock] = {}
+_ROUTE_LOCKS_GUARD = threading.Lock()
+
+
+def _serialized(venue: str) -> Callable[[F], F]:
+    """Run the decorated route under the process-wide lock for *venue*."""
+    with _ROUTE_LOCKS_GUARD:
+        lock = _ROUTE_LOCKS.setdefault(venue, threading.Lock())
+
+    def decorate(fn: F) -> F:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                return fn(*args, **kwargs)
+        preserve_signature(wrapper, fn)
+        return wrapper  # type: ignore[return-value]
+
+    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +138,7 @@ def trading_dashboard(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.post("/register-all")
+@_serialized("paper")
 def register_all_strategies(_token: str = Depends(require_auth)) -> dict:
     """Register paper strategies for all PASSED TACTICAL hypotheses."""
     count = _get_engine().register_all_passed()
@@ -110,6 +146,7 @@ def register_all_strategies(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.post("/trade")
+@_serialized("paper")
 def open_trade(
     req: TradeRequest,
     _token: str = Depends(require_auth),
@@ -129,6 +166,7 @@ def open_trade(
 
 
 @router.post("/trade/{trade_id}/close")
+@_serialized("paper")
 def close_trade(
     trade_id: int,
     req: CloseTradeRequest,
@@ -233,6 +271,7 @@ class PromoteToStrategyRequest(BaseModel):
 
 
 @router.post("/strategies/promote")
+@_serialized("paper")
 def promote_to_strategy(
     req: PromoteToStrategyRequest,
     _token: str = Depends(require_auth),
@@ -258,6 +297,7 @@ def promote_to_strategy(
 
 
 @router.post("/execute-signals")
+@_serialized("signals")
 def execute_signals_now(
     venue: str | None = Query(
         None, description="Optional exchange venue to mirror BUY signals to (e.g. robinhood)"
@@ -284,6 +324,7 @@ def execute_signals_now(
 
 
 @router.post("/strategies/{strategy_id}/kill")
+@_serialized("paper")
 def kill_strategy(
     strategy_id: str,
     _token: str = Depends(require_auth),
@@ -322,6 +363,7 @@ def list_wallets(
 
 
 @router.post("/wallets")
+@_serialized("wallets")
 def create_wallet(
     req: CreateWalletRequest,
     _token: str = Depends(require_auth),
@@ -363,6 +405,7 @@ def wallet_risk_check(
 
 
 @router.post("/wallets/{wallet_id}/kill")
+@_serialized("wallets")
 def kill_wallet(
     wallet_id: str,
     req: KillWalletRequest,
@@ -373,6 +416,7 @@ def kill_wallet(
 
 
 @router.post("/wallets/{wallet_id}/pause")
+@_serialized("wallets")
 def pause_wallet(
     wallet_id: str,
     _token: str = Depends(require_auth),
@@ -382,6 +426,7 @@ def pause_wallet(
 
 
 @router.post("/wallets/{wallet_id}/resume")
+@_serialized("wallets")
 def resume_wallet(
     wallet_id: str,
     _token: str = Depends(require_auth),
@@ -417,6 +462,7 @@ def hyperliquid_positions(
 
 
 @router.post("/hyperliquid/trade")
+@_serialized("hyperliquid")
 def hyperliquid_trade(
     req: HyperliquidTradeRequest,
     _token: str = Depends(require_auth),
@@ -433,6 +479,7 @@ def hyperliquid_trade(
 
 
 @router.post("/hyperliquid/close")
+@_serialized("hyperliquid")
 def hyperliquid_close(
     req: HyperliquidCloseRequest,
     _token: str = Depends(require_auth),
@@ -498,6 +545,7 @@ _NON_ERROR_STATUSES = ("rejected", "blocked", "duplicate")
 
 
 @router.post("/robinhood/trade")
+@_serialized("robinhood")
 def robinhood_trade(
     req: RobinhoodTradeRequest,
     _token: str = Depends(require_auth),
@@ -517,6 +565,7 @@ def robinhood_trade(
 
 
 @router.post("/robinhood/close")
+@_serialized("robinhood")
 def robinhood_close(
     req: RobinhoodCloseRequest,
     _token: str = Depends(require_auth),
@@ -529,6 +578,7 @@ def robinhood_close(
 
 
 @router.post("/robinhood/orders/{order_id}/cancel")
+@_serialized("robinhood")
 def robinhood_cancel(
     order_id: str,
     _token: str = Depends(require_auth),
@@ -571,6 +621,7 @@ def polymarket_portfolio(
 
 
 @router.post("/polymarket/buy")
+@_serialized("polymarket")
 def polymarket_buy(
     req: PolymarketBuyRequest,
     _token: str = Depends(require_auth),
@@ -610,6 +661,7 @@ def kalshi_portfolio(
 
 
 @router.post("/kalshi/buy")
+@_serialized("kalshi")
 def kalshi_buy(
     req: KalshiBuyRequest,
     _token: str = Depends(require_auth),

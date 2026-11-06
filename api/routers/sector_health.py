@@ -21,6 +21,7 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
+from utils.single_flight import single_flight
 
 router = APIRouter(prefix="/api/v1/sectors", tags=["sector_health"])
 
@@ -28,6 +29,7 @@ _CACHE: TTLCache = TTLCache(ttl=600.0, max_size=64)
 
 
 @router.get("/{sector_name}/health")
+@single_flight
 def get_sector_health(
     sector_name: str,
     _token: str = Depends(require_auth),

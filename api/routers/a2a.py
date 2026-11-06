@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -182,12 +183,17 @@ def list_tasks(
 # ── Singleton task manager ────────────────────────────────────────────────
 
 _task_manager: A2ATaskManager | None = None
+# Routes run in the threadpool: without the lock two first requests could
+# each build a manager, and tasks registered on the losing one would vanish.
+_task_manager_lock = threading.Lock()
 
 
 def _get_task_manager() -> A2ATaskManager:
     """Return a cached A2ATaskManager singleton."""
     global _task_manager
     if _task_manager is None:
-        from a2a.server import A2ATaskManager
-        _task_manager = A2ATaskManager()
+        with _task_manager_lock:
+            if _task_manager is None:
+                from a2a.server import A2ATaskManager
+                _task_manager = A2ATaskManager()
     return _task_manager

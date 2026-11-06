@@ -414,3 +414,90 @@ def test_canvas_wealth_flows_single_query_same_selection(monkeypatch):
         ("a:a", "a:x"),
         ("a:b", "a:z"),   # (a, x) already seen via actor a
     ]
+
+
+# ── Threadpool concurrency: state that the event loop used to serialize ─────
+
+def _concurrently(fn, n: int = 8) -> list:
+    barrier = threading.Barrier(n)
+    out: list = []
+
+    def run() -> None:
+        barrier.wait()
+        out.append(fn())
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    return out
+
+
+def test_single_flight_builds_a_cold_cache_once():
+    from utils.single_flight import single_flight
+
+    cache: dict = {}
+    builds = {"n": 0}
+
+    @single_flight
+    def handler(key: str, _token: str = "t") -> str:
+        if key in cache:
+            return cache[key]
+        builds["n"] += 1
+        time.sleep(0.05)
+        cache[key] = f"value-{key}"
+        return cache[key]
+
+    out = _concurrently(lambda: handler("a", _token=str(threading.get_ident())))
+    assert out == ["value-a"] * 8 and builds["n"] == 1
+
+
+def test_single_flight_keeps_the_route_signature():
+    import inspect
+
+    from api.routers import sector_health
+
+    params = inspect.signature(sector_health.get_sector_health).parameters
+    assert "sector_name" in params
+
+
+def test_trading_mutations_are_serialized_per_venue(monkeypatch):
+    from api.routers import trading
+
+    active = {"now": 0, "max": 0}
+    lock = threading.Lock()
+
+    class _Trader:
+        def open_position(self, **kwargs):
+            with lock:
+                active["now"] += 1
+                active["max"] = max(active["max"], active["now"])
+            time.sleep(0.02)
+            with lock:
+                active["now"] -= 1
+            return {"status": "ok"}
+
+    monkeypatch.setattr(trading, "_get_hyperliquid", lambda: _Trader())
+    req = trading.HyperliquidTradeRequest(ticker="BTC", direction="LONG", size_usd=10)
+    _concurrently(lambda: trading.hyperliquid_trade(req, _token="t"), n=6)
+    assert active["max"] == 1
+
+
+def test_a2a_task_manager_is_a_true_singleton(monkeypatch):
+    import sys
+    import types
+
+    from api.routers import a2a
+
+    made = []
+
+    class _Mgr:
+        def __init__(self) -> None:
+            time.sleep(0.02)
+            made.append(self)
+
+    monkeypatch.setitem(sys.modules, "a2a.server", types.SimpleNamespace(A2ATaskManager=_Mgr))
+    monkeypatch.setattr(a2a, "_task_manager", None)
+    out = _concurrently(a2a._get_task_manager)
+    assert len(made) == 1 and all(m is made[0] for m in out)

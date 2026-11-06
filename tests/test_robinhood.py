@@ -312,9 +312,9 @@ class TestFactory:
     def test_factory_reads_settings_and_defaults_to_dry_run(self, monkeypatch):
         from config import settings
 
-        monkeypatch.setattr(settings, "ROBINHOOD_API_KEY", "", raising=False)
-        monkeypatch.setattr(settings, "ROBINHOOD_PRIVATE_KEY_B64", "", raising=False)
-        monkeypatch.setattr(settings, "ROBINHOOD_LIVE_TRADING", False, raising=False)
+        monkeypatch.setattr(settings, "ROBINHOOD_API_KEY", "")
+        monkeypatch.setattr(settings, "ROBINHOOD_PRIVATE_KEY_B64", "")
+        monkeypatch.setattr(settings, "ROBINHOOD_LIVE_TRADING", False)
         trader = rh.get_robinhood_trader()
         assert trader.mode == "UNCONFIGURED" and trader.live is False
         assert trader.max_position_usd == 100.0
@@ -855,3 +855,85 @@ class TestReconcileWiredIntoOrders:
         assert trader.simulate_order("BTC", "LONG", 10)["status"] == "dry_run"
         assert trader.simulate_close("BTC-USD")["status"] == "dry_run"
         trader.reconcile_stale_orders.assert_not_called()
+
+
+# ── concurrency: routes now run in grid-api's threadpool ───────────────────
+
+
+class TestConcurrentOrders:
+    """These routes ran one at a time on grid-api's event loop while they
+    were ``async def``; in the threadpool they run concurrently, and other
+    processes (signal_executor, live_rotation_trader) share the same venue.
+    The in-process venue lock is disabled here so the risk store's own
+    atomic primitives are what's being proven -- the cross-process case."""
+
+    @staticmethod
+    def _race(fn, n=8):
+        import threading
+
+        barrier = threading.Barrier(n)
+        results: list = []
+
+        def run():
+            barrier.wait()
+            results.append(fn())
+
+        threads = [threading.Thread(target=run) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        return results
+
+    @staticmethod
+    def _slow_routes():
+        import time as _t
+
+        routes = _routes()
+        post = routes[("POST", rh.PATH_ORDERS)]
+
+        def slow_post(q, body):
+            _t.sleep(0.05)  # widen the check -> submit window
+            return post(q, body)
+
+        routes[("POST", rh.PATH_ORDERS)] = slow_post
+        return routes
+
+    def test_same_idempotency_key_submits_exactly_once(self, monkeypatch):
+        import contextlib
+
+        monkeypatch.setattr(rh, "_venue_lock", lambda venue: contextlib.nullcontext())
+        session = FakeSession(self._slow_routes())
+        trader = _trader(live=True, session=session)
+
+        results = self._race(lambda: trader.open_position("BTC", "LONG", 10, client_order_id="same-key"))
+
+        posts = [c for c in session.calls if c["method"] == "POST" and c["path"] == rh.PATH_ORDERS]
+        assert len(posts) == 1
+        statuses = sorted(r["status"] for r in results)
+        assert statuses.count("submitted") == 1 and statuses.count("duplicate") == len(results) - 1
+
+    def test_only_one_order_takes_the_last_slot(self, monkeypatch):
+        import contextlib
+        import itertools
+
+        monkeypatch.setattr(rh, "_venue_lock", lambda venue: contextlib.nullcontext())
+        session = FakeSession(self._slow_routes())
+        trader = _trader(live=True, session=session, max_orders_per_day=5)
+        for _ in range(4):  # cap - 1 already used today
+            trader.risk_store.touch(trader.venue, 31000.0, utc_today(), increment_order=True)
+        keys = itertools.count()
+
+        results = self._race(lambda: trader.open_position("BTC", "LONG", 10, client_order_id=f"k{next(keys)}"))
+
+        assert sum(r.get("status") == "submitted" for r in results) == 1
+        blocked = [r for r in results if r.get("status") == "blocked"]
+        assert len(blocked) == len(results) - 1 and all(b["guard"] == "order_rate" for b in blocked)
+        assert trader.risk_store.get_state(trader.venue).orders_today == 5
+
+    def test_reserve_order_slot_is_atomic(self):
+        store = InMemoryRiskStore()
+        store.touch("v", 100.0, utc_today())
+        results = self._race(lambda: store.reserve_order_slot("v", 100.0, utc_today(), 3), n=16)
+        assert sum(results) == 3
+        assert store.get_state("v").orders_today == 3

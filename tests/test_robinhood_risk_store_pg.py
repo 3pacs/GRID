@@ -251,3 +251,51 @@ class TestFailsClosedWithoutMigration:
         store = PostgresRiskStore(dropped)
         with pytest.raises(ProgrammingError):
             store.get_state(_venue("no-migration-state"))
+
+
+class TestAtomicOrderPrimitives:
+    """The cross-process guarantees grid-api's threadpool (and other
+    processes) rely on, against real Postgres."""
+
+    def test_reserve_order_slot_never_exceeds_the_cap(self, store):
+        import threading
+
+        venue = _venue("slot-race")
+        store.touch(venue, 100.0, utc_today())
+        barrier = threading.Barrier(12)
+        got: list[bool] = []
+
+        def take():
+            barrier.wait()
+            got.append(store.reserve_order_slot(venue, 100.0, utc_today(), 4))
+
+        threads = [threading.Thread(target=take) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert sum(got) == 4
+        assert store.get_state(venue).orders_today == 4
+
+    def test_claim_order_serializes_one_key(self, store):
+        import threading
+        import time as _t
+
+        venue = _venue("claim-race")
+        barrier = threading.Barrier(6)
+        outcomes: list[bool] = []
+
+        def attempt():
+            barrier.wait()
+            with store.claim_order(venue, "k-1") as done:
+                outcomes.append(done)
+                if not done:
+                    _t.sleep(0.05)
+                    store.log_order(venue, "k-1", status="submitted", ticker="BTC-USD", side="buy")
+
+        threads = [threading.Thread(target=attempt) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert outcomes.count(False) == 1 and outcomes.count(True) == 5

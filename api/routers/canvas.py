@@ -20,6 +20,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import threading
+
 import json
 import math
 import uuid
@@ -39,6 +41,7 @@ from api.routers.canvas_board_store import (
     delete_legacy_canvas_board,
     sync_legacy_canvas_from_board,
 )
+from utils.single_flight import single_flight
 
 router = APIRouter(prefix="/api/v1/canvas", tags=["canvas"])
 
@@ -105,17 +108,23 @@ def _strip_canvas_graph_id(node_type: str, node_id: str) -> str:
     return nid
 
 
+_boards_ensure_lock = threading.Lock()
+
+
 def _ensure_boards_table(engine: Engine) -> None:
     """Create investigation_boards table if it does not exist."""
     global _boards_ensured
     if _boards_ensured:
         return
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(_BOARDS_DDL))
-        _boards_ensured = True
-    except Exception as exc:
-        log.warning("Failed to ensure investigation_boards table: {e}", e=str(exc))
+    with _boards_ensure_lock:  # one DDL run even when first requests arrive together
+        if _boards_ensured:
+            return
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(_BOARDS_DDL))
+            _boards_ensured = True
+        except Exception as exc:
+            log.warning("Failed to ensure investigation_boards table: {e}", e=str(exc))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -945,6 +954,7 @@ class BoardUpdate(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════
 
 @router.get("/graph")
+@single_flight
 def get_canvas_graph(
     center: str = Query(..., description="Actor ID or ticker symbol"),
     depth: int = Query(2, ge=1, le=7, description="BFS depth (1-7 hops)"),

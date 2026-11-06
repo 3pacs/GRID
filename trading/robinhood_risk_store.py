@@ -31,10 +31,12 @@ the store and the connector code never branches on which one it has.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -86,6 +88,19 @@ class RiskStore(Protocol):
 
     def is_duplicate(self, venue: str, client_order_id: str) -> bool: ...
 
+    def claim_order(self, venue: str, client_order_id: str) -> contextlib.AbstractContextManager[bool]:
+        """Serialize every attempt on one idempotency key; yields "already done".
+
+        Held from the duplicate check through submit and ``log_order``, so a
+        concurrent second attempt on the same key waits, then sees the first
+        one's consumed row and reports a duplicate -- never a second submit.
+        """
+        ...
+
+    def reserve_order_slot(self, venue: str, equity: float, today: date, cap: int) -> bool:
+        """Atomically count one more order today iff fewer than *cap* so far."""
+        ...
+
     def log_order(self, venue: str, client_order_id: str, **fields: Any) -> None: ...
 
     def get_state(self, venue: str) -> RiskState | None: ...
@@ -114,6 +129,8 @@ class InMemoryRiskStore:
         #: average_cost() the same way a `created_at`-ordered SQL scan does
         #: for PostgresRiskStore.
         self._log: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
+        self._key_locks: dict[str, threading.Lock] = {}
 
     def _roll(self, state: RiskState, equity: float, today: date) -> None:
         if today > state.day_start_date:
@@ -123,6 +140,12 @@ class InMemoryRiskStore:
 
     def touch(
         self, venue: str, equity: float, today: date, increment_order: bool = False,
+    ) -> RiskState:
+        with self._lock:
+            return self._touch_locked(venue, equity, today, increment_order)
+
+    def _touch_locked(
+        self, venue: str, equity: float, today: date, increment_order: bool,
     ) -> RiskState:
         state = self._state.get(venue)
         if state is None:
@@ -141,11 +164,32 @@ class InMemoryRiskStore:
         rows = self._orders.get(f"{venue}:{client_order_id}", [])
         return any(r.get("status") in _CONSUMED_STATUSES for r in rows)
 
+    @contextlib.contextmanager
+    def claim_order(self, venue: str, client_order_id: str) -> Iterator[bool]:
+        key = f"{venue}:{client_order_id}"
+        with self._lock:
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            yield self.is_duplicate(venue, client_order_id)
+
+    def reserve_order_slot(self, venue: str, equity: float, today: date, cap: int) -> bool:
+        with self._lock:
+            state = self._state.get(venue)
+            if state is None:
+                state = RiskState(venue, equity, equity, today, 0)
+                self._state[venue] = state
+            self._roll(state, equity, today)
+            if state.orders_today >= cap:
+                return False
+            state.orders_today += 1
+            return True
+
     def log_order(self, venue: str, client_order_id: str, **fields: Any) -> None:
         key = f"{venue}:{client_order_id}"
         row = {"venue": venue, "client_order_id": client_order_id, **fields}
-        self._orders.setdefault(key, []).append(row)
-        self._log.append(row)
+        with self._lock:
+            self._orders.setdefault(key, []).append(row)
+            self._log.append(row)
 
     def get_state(self, venue: str) -> RiskState | None:
         state = self._state.get(venue)
@@ -209,6 +253,30 @@ _TOUCH_SQL = """
                                THEN :today ELSE trading_risk_state.day_start_date END,
         updated_at = NOW()
     RETURNING peak_equity, day_start_equity, day_start_date, orders_today
+"""
+
+# Conditional order-slot reservation: one statement, so concurrent callers
+# (threads or processes) can never both take the last slot. Rolls the day the
+# same way _TOUCH_SQL does. No row back = cap reached (or no state row yet --
+# check_risk_limits() always creates it first; absent, we fail closed).
+_RESERVE_ORDER_SLOT_SQL = """
+    UPDATE trading_risk_state SET
+        orders_today = CASE WHEN day_start_date < :today THEN 1 ELSE orders_today + 1 END,
+        day_start_equity = CASE WHEN day_start_date < :today
+                                THEN :equity ELSE day_start_equity END,
+        day_start_date = GREATEST(day_start_date, :today),
+        peak_equity = GREATEST(peak_equity, :equity),
+        updated_at = NOW()
+    WHERE venue = :venue
+      AND (day_start_date < :today OR orders_today < :cap)
+    RETURNING orders_today
+"""
+
+# Transaction-scoped advisory lock on (venue, client_order_id): serializes
+# every attempt on one idempotency key across threads AND processes (API,
+# signal_executor, live_rotation_trader) until the holder's transaction ends.
+_CLAIM_ORDER_LOCK_SQL = """
+    SELECT pg_advisory_xact_lock(hashtext(:venue), hashtext(:client_order_id))
 """
 
 _IS_DUPLICATE_SQL = """
@@ -297,6 +365,28 @@ class PostgresRiskStore:
             row = conn.execute(text(_IS_DUPLICATE_SQL), {
                 "venue": venue, "client_order_id": client_order_id,
                 "statuses": list(_CONSUMED_STATUSES),
+            }).fetchone()
+        return row is not None
+
+    @contextlib.contextmanager
+    def claim_order(self, venue: str, client_order_id: str) -> Iterator[bool]:
+        """Hold the key's advisory lock while the caller checks, submits and logs.
+
+        ``log_order`` commits on its own connection before this transaction
+        ends, so the next waiter's duplicate check (run after it acquires the
+        lock) sees that row. A rejected/errored attempt writes no consumed
+        row, so a retry on the same key still goes through -- the existing
+        semantics, now race-free.
+        """
+        with self.engine.begin() as conn:
+            conn.execute(text(_CLAIM_ORDER_LOCK_SQL),
+                         {"venue": venue, "client_order_id": client_order_id})
+            yield self.is_duplicate(venue, client_order_id)
+
+    def reserve_order_slot(self, venue: str, equity: float, today: date, cap: int) -> bool:
+        with self.engine.begin() as conn:
+            row = conn.execute(text(_RESERVE_ORDER_SLOT_SQL), {
+                "venue": venue, "equity": float(equity), "today": today, "cap": int(cap),
             }).fetchone()
         return row is not None
 
