@@ -1693,6 +1693,7 @@ class AstroGridStore:
         params["spy_entry_max_age_days"] = SPY_ENTRY_MAX_AGE_DAYS
         params["spy_outcome_grace_days"] = SPY_OUTCOME_GRACE_DAYS
         params["skip_max_attempts"] = SCORE_SKIP_MAX_ATTEMPTS
+        params["insight_model"] = "astrogrid-evidence-v2"
         params.update(_legacy_score_params())
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
@@ -1723,16 +1724,18 @@ class AstroGridStore:
               AND pr.scoring_class = 'liquid_market'
               -- Bounded skip: one attempt per evaluation day, at most
               -- SCORE_SKIP_MAX_ATTEMPTS days, none after a permanent reason.
-              AND NOT EXISTS (
+              AND (pr.model_version = :insight_model OR NOT EXISTS (
                   SELECT 1 FROM {self.schema}.prediction_score_skip sk
                   WHERE sk.prediction_run_id = pr.id
                     AND (sk.permanent OR sk.attempt_date >= :evaluation_date)
-              )
-              AND (
+              ))
+              AND (pr.model_version = :insight_model OR (
                   SELECT COUNT(*) FROM {self.schema}.prediction_score_skip sk
                   WHERE sk.prediction_run_id = pr.id
-              ) < :skip_max_attempts
-              AND (
+              ) < :skip_max_attempts)
+              AND ((pr.model_version = :insight_model
+                    AND pr.as_of_ts + INTERVAL '24 hours' <= :score_cutoff)
+                OR (pr.model_version <> :insight_model AND (
                   CASE WHEN jsonb_typeof(pr.target_symbols) = 'array'
                                  AND jsonb_array_length(pr.target_symbols) = 1
                                  AND upper(pr.target_symbols->>0) = 'SPY'
@@ -1742,13 +1745,14 @@ class AstroGridStore:
                         WHEN pr.horizon_label = 'macro' THEN 30
                         ELSE 7
                     END
-              ) <= :evaluation_date
+              ) <= :evaluation_date))
             {where_sql}
             -- A missing outcome leaves the prediction pending. Prefer SPY
             -- predictions with an available receipt so old gaps cannot fill
             -- every bounded batch ahead of scoreable predictions. The scorer
             -- still verifies complete lineage before writing a score.
-            ORDER BY CASE WHEN jsonb_typeof(pr.target_symbols) = 'array'
+            ORDER BY CASE WHEN pr.model_version = :insight_model THEN -1
+                          WHEN jsonb_typeof(pr.target_symbols) = 'array'
                             AND jsonb_array_length(pr.target_symbols) = 1
                             AND upper(pr.target_symbols->>0) = 'SPY'
                             AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
@@ -1899,7 +1903,8 @@ class AstroGridStore:
                         "status": "unscored",
                         **result["unscored"],
                     })
-                    self._record_score_skip(conn, row, result, attempt_date=evaluation_date)
+                    if len(row) <= 15 or row[15] != "astrogrid-evidence-v2":
+                        self._record_score_skip(conn, row, result, attempt_date=evaluation_date)
                     continue
                 if self._insert_score(conn, row, result):
                     score = result["score"]
@@ -1962,6 +1967,20 @@ class AstroGridStore:
         ``not_mature`` (pending), never scored from an open bar or a later
         price. Reads are bounded to releases on or before the score cutoff.
         """
+        if len(row) > 15 and row[15] == "astrogrid-evidence-v2":
+            from oracle.astrogrid_insights import score_contract
+
+            score = score_contract(
+                self.engine, symbols=_json_loads(row[5], []),
+                evidence=_json_loads(row[11], {}).get("insight", {}),
+                issued_at=row[2], created_at=row[14], cutoff=score_cutoff,
+            )
+            result = {"legacy": False, "decoded": False, "target_symbols": _json_loads(row[5], [])}
+            if score.get("not_mature"):
+                return {**result, "state": "not_mature"}
+            if score.get("unscored"):
+                return {**result, "state": "unscored", "unscored": score["unscored"]}
+            return {**result, "state": "scored", "score": score}
         maturity_days = 30 if row[3] == "macro" else 7
         created_at = row[14] if len(row) > 14 else None
         model_version = row[15] if len(row) > 15 else None
@@ -2399,8 +2418,8 @@ class AstroGridStore:
         valid_variants = [v for v in strategy_variants if v in {"grid_only", "grid_plus_mystical", "mystical_only"}]
         if not valid_variants:
             valid_variants = ["grid_only", "grid_plus_mystical", "mystical_only"]
-        filters = ["1=1"]
-        params: dict[str, Any] = {"limit": limit, **_legacy_score_params()}
+        filters = ["pr.model_version <> :insight_model"]
+        params: dict[str, Any] = {"limit": limit, "insight_model": "astrogrid-evidence-v2", **_legacy_score_params()}
         if horizon_label in {"macro", "swing"}:
             filters.append("pr.horizon_label = :horizon_label")
             params["horizon_label"] = horizon_label
@@ -2944,7 +2963,9 @@ class AstroGridStore:
                 pp.dominant_grid_drivers,
                 pp.dominant_mystical_drivers,
                 pp.invalidation_rule,
-                pp.feature_family_summary
+                pp.feature_family_summary,
+                ps.raw_payload,
+                ps.scored_at
             FROM {self.schema}.prediction_run pr
             LEFT JOIN {self.schema}.prediction_postmortem pp
                 ON pp.prediction_run_id = pr.id
@@ -3025,7 +3046,9 @@ class AstroGridStore:
                 pp.dominant_mystical_drivers,
                 pp.invalidation_rule,
                 pp.feature_family_summary,
-                pp.raw_payload
+                pp.raw_payload,
+                ps.raw_payload,
+                ps.scored_at
             FROM {self.schema}.prediction_run pr
             LEFT JOIN {self.schema}.prediction_postmortem pp
                 ON pp.prediction_run_id = pr.id
@@ -3088,6 +3111,24 @@ class AstroGridStore:
                 if decoded:
                     legacy_fields.append(field)
             data["postmortem"]["raw_payload"] = _json_loads(row[30], {})
+        # Postmortem logs are append-only too. Project the completed result
+        # from the score instead of mutating the original pending stub.
+        if data["model_version"] == "astrogrid-evidence-v2":
+            score_index = 31 if detailed else 27
+            score = _json_loads(row[score_index], {}) if len(row) > score_index else {}
+            if score and isinstance(score.get("signed_return"), (int, float)):
+                data["score"] = score
+                data["postmortem"]["original_summary"] = data["postmortem"]["summary"]
+                data["postmortem"]["summary"] = (
+                    f"{data['status']}: {score['signed_return']:+.2%} signed return on the declared asset "
+                    "at the 24h outcome; fees excluded."
+                )
+                data["postmortem"]["projection"] = "derived_from_score; original log unchanged"
+                data["postmortem"]["raw_payload"] = score
+            elif data["scoring_class"] == "unscored_experimental":
+                data["status"] = "observation"
+                data["postmortem"]["state"] = "observation"
+                data["postmortem"]["summary"] = "Measured observation only; no win/loss grade."
         # Provenance: the stored row is untouched; these fields were decoded on read.
         data["legacy_payload_decoded"] = bool(legacy_fields)
         data["legacy_decoded_fields"] = legacy_fields

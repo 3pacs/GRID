@@ -387,3 +387,54 @@ Track decisions such as:
 - What is the minimum sample size required before group-aware weighting changes are actionable?
 - Which additional asset groups are worth scoring next?
 - When should question intent be first-class in the schema?
+
+
+## 2026-11-05 — evidence-backed insights
+
+The scheduled `scripts/generate_crypto_predictions.py` producer now extends the
+AstroGrid ledger with `astrogrid-evidence-v2` observations from recorded Binance
+BTCUSDT/ETHUSDT/SOLUSDT 5m candles. PITStore bounds both market time and local
+availability time; incomplete 24h windows and stale sources remain explicit.
+Relative performance uses matching windows, not an inferred causal story.
+
+A directional research forecast additionally requires a named actor, liquidity
+valve, action, measured flow, unit and direction from a recent source record.
+Absent that evidence the producer abstains. No calibrated probability or proven
+market edge is claimed. One source event creates at most one forecast.
+
+Forecasts freeze an observed entry, exact asset, 24h due time and declared 1%
+directional threshold. Scoring verifies that entry and uses the first completed
+same-asset bucket at/after the due time within 15 minutes. Missing outcomes stay
+pending, never substitute SPY or another coin, and are retried independently of
+the legacy skip budget. The cash-relative signed return excludes fees. Source
+forecasts and postmortem logs are immutable; new scores are recorded and the
+completed postmortem display is projected from those scores.
+Legacy seven-/thirty-day contracts and the separate legacy rescore work retain
+their existing rules. New contracts are excluded from incompatible legacy
+strategy-comparison backtests and headline performance is separately scoped.
+
+`GET /api/v1/astrogrid/insights` reads the published ledger without generating
+forecasts. The public site loads this evidence automatically, flags stale data,
+and keeps symbolic celestial readings separate. Guru answers use server-side
+published evidence rather than caller-supplied overlays and do not create more
+forecast rows. Uncovered requested assets produce an explicit abstention.
+
+Focused verification:
+
+- `python -m pytest tests/test_astrogrid_insights.py tests/test_astrogrid_predictions.py tests/test_generate_crypto_predictions.py tests/test_legacy_crypto_rescore.py`
+- `node --test tests/js/astrogrid-insights.test.mjs`
+- `ASTROGRID_INSIGHT_TEST_DB_URL=<disposable database URL> python -m pytest tests/test_astrogrid_insights_native.py`
+
+The native test requires an empty production-schema clone whose database name
+starts `astrogrid_insight_e2e_`. It inserts only synthetic fixtures and covers
+producer → ledger → immature/missing/wrong-asset outcome → score → postmortem →
+public API, idempotency, and original-forecast byte preservation. Its synthetic
+outcomes demonstrate software correctness, not trading performance.
+
+Install `server_setup/grid-predict-crypto.timer.d/zz-astrogrid-evidence.conf`
+as the matching drop-in for the existing timer and reload/restart that timer
+after release verification. Its five-minute calendar replaces the hourly
+monotonic trigger; the existing service/user/environment remain unchanged.
+Without this cadence the 20-minute stale limit would correctly mark evidence
+stale for most of each hour even while fresh source candles were available.
+Verify the loaded calendar, next deadline, and a subsequent scheduled run.
