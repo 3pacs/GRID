@@ -419,6 +419,10 @@ def test_migration_is_additive_append_only_and_granted():
     for table in ("signal_source_outcomes", "decision_journal_verdicts"):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in src
         assert f"BEFORE UPDATE OR DELETE ON {table}" in src
-        assert f"GRANT ALL ON {table} TO grid" in src
+        assert f"BEFORE TRUNCATE ON {table}" in src
+        assert f"GRANT SELECT, INSERT ON {table} TO grid" in src
         assert f"GRANT USAGE, SELECT ON SEQUENCE {table}_id_seq TO grid" in src
+    # Append-only is also a privilege: grid never gets UPDATE/DELETE/TRUNCATE.
+    assert not re.search(r"GRANT\s+ALL\b", src, re.I)
+    assert not re.search(r"GRANT[^;']*\b(UPDATE|DELETE|TRUNCATE)\b", src, re.I)
     assert not re.search(r"ALTER\s+TABLE\s+(signal_sources|decision_journal)\b", src, re.I)

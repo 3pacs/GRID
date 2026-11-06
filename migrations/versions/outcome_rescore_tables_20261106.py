@@ -15,8 +15,9 @@ exactly as written. Corrected results are new rows keyed by a version:
   scorer_version)``, written by ``scripts/backfill_journal_verdicts.py
   --rescore-legacy --apply``.
 
-Both tables reject UPDATE and DELETE with a trigger: a correction is a new
-version, never an edit. GRANT footer per ``migrations/_TEMPLATE.sql``.
+Both tables reject UPDATE, DELETE (row triggers) and TRUNCATE (statement
+trigger): a correction is a new version, never an edit. GRANT footer per
+``migrations/_TEMPLATE.sql``, narrowed to SELECT, INSERT for ``grid``.
 """
 
 from alembic import op
@@ -102,7 +103,7 @@ def upgrade() -> None:
         LANGUAGE plpgsql AS $$
         BEGIN
             RAISE EXCEPTION '% is append-only: % refused (add a new version instead)',
-                TG_TABLE_NAME, TG_OP;
+                TG_TABLE_NAME, TG_OP USING ERRCODE = 'restrict_violation';
         END
         $$
     """)
@@ -112,22 +113,36 @@ def upgrade() -> None:
         BEFORE UPDATE OR DELETE ON signal_source_outcomes
         FOR EACH ROW EXECUTE FUNCTION grid_reject_outcome_mutation()
     """)
+    op.execute("DROP TRIGGER IF EXISTS trg_signal_source_outcomes_no_truncate ON signal_source_outcomes")
+    op.execute("""
+        CREATE TRIGGER trg_signal_source_outcomes_no_truncate
+        BEFORE TRUNCATE ON signal_source_outcomes
+        FOR EACH STATEMENT EXECUTE FUNCTION grid_reject_outcome_mutation()
+    """)
     op.execute("DROP TRIGGER IF EXISTS trg_decision_journal_verdicts_append_only ON decision_journal_verdicts")
     op.execute("""
         CREATE TRIGGER trg_decision_journal_verdicts_append_only
         BEFORE UPDATE OR DELETE ON decision_journal_verdicts
         FOR EACH ROW EXECUTE FUNCTION grid_reject_outcome_mutation()
     """)
+    op.execute("DROP TRIGGER IF EXISTS trg_decision_journal_verdicts_no_truncate ON decision_journal_verdicts")
+    op.execute("""
+        CREATE TRIGGER trg_decision_journal_verdicts_no_truncate
+        BEFORE TRUNCATE ON decision_journal_verdicts
+        FOR EACH STATEMENT EXECUTE FUNCTION grid_reject_outcome_mutation()
+    """)
 
     # GRANT footer (migrations/_TEMPLATE.sql): alembic runs as the owner role;
     # the `grid` application role needs the tables and their sequences.
+    # Append-only is also a privilege (options_digest_calls_20261104 pattern):
+    # grid gets SELECT and INSERT only -- no UPDATE / DELETE / TRUNCATE.
     op.execute("""
         DO $$
         BEGIN
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grid') THEN
-                EXECUTE 'GRANT ALL ON signal_source_outcomes TO grid';
+                EXECUTE 'GRANT SELECT, INSERT ON signal_source_outcomes TO grid';
                 EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE signal_source_outcomes_id_seq TO grid';
-                EXECUTE 'GRANT ALL ON decision_journal_verdicts TO grid';
+                EXECUTE 'GRANT SELECT, INSERT ON decision_journal_verdicts TO grid';
                 EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE decision_journal_verdicts_id_seq TO grid';
             END IF;
         END
