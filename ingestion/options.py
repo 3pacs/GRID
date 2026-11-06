@@ -1,17 +1,21 @@
-"""GRID — Options chain ingestion via Yahoo Finance API.
+"""GRID — Options chain ingestion (Cboe delayed quotes, Yahoo fallback).
 
 Pulls options chains for equity tickers, computes daily signals
 (put/call ratio, max pain, IV skew, total OI, vol surface metrics),
 and pushes to resolved_series for PIT-correct access.
 
-Uses the Yahoo Finance crumb+cookie auth method for reliable access.
-Falls back to yfinance if the direct API fails.
+Primary provider since 2026-11-06: Cboe's delayed-quotes JSON (one request
+per ticker, ~15 min delayed, full OPRA chain). Yahoo Finance's crumb+cookie
+API is the per-ticker fallback when Cboe fails in transport. The
+source_catalog row is still named YFINANCE_OPTIONS (id wired through the
+smart scheduler and Hermes); the per-ticker provider is logged.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -343,7 +347,10 @@ def catalyst_options_universe(
 class YahooOptionsClient:
     """Fetch options chains directly from Yahoo Finance API with crumb auth."""
 
-    _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    provider = "yahoo"
+    remote_expiry_pages = True
+
+    _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"  # = _BROWSER_UA
 
     def __init__(self) -> None:
         self.session = requests.Session()
@@ -456,6 +463,250 @@ class YahooOptionsClient:
         except Exception as exc:
             log.warning("Yahoo options {t} failed: {e}", t=ticker, e=str(exc))
             return None
+
+
+# ── Cboe delayed-quotes client (primary since 2026-11-06) ──────
+#
+# Yahoo's /v7/finance/options has answered HTTP 429 to grid-svr since
+# 2026-09-29, so source_catalog YFINANCE_OPTIONS went 30+ days without a
+# complete capture. Cboe publishes the full OPRA chain per underlying as one
+# delayed (~15 min) JSON document with bid/ask/iv/OI/volume and greeks; the
+# gamma-watch sector collector (collectors/gamma_watch/sectors.py) and the
+# GEX P2-B harness already read it. One request per ticker per run replaces
+# Yahoo's one request per expiry.
+#
+# The client below presents the Yahoo page shape (``expirations``, ``calls``,
+# ``puts``, ``quote.regularMarketPrice``/``regularMarketTime``) so every
+# guard in ``OptionsPuller._pull_ticker`` -- session dating, empty pages,
+# capture budget, append-only publication -- applies unchanged.
+
+_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+CBOE_OPTIONS_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol}.json"
+CBOE_TIMEOUT_SECONDS = 30  # SPY is ~6 MB; the CDN 307-redirects to cdn-api.cboe.com
+# Cash-settled indices are addressed with a leading underscore (``_SPX``).
+CBOE_INDEX_SYMBOLS: frozenset[str] = frozenset({
+    "SPX", "XSP", "NDX", "RUT", "VIX", "DJX", "OEX", "XEO", "MRUT",
+})
+# OCC/OSI option symbol: root, YYMMDD, C/P, strike * 1000 (8 digits).
+_OCC_SYMBOL = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+
+
+def cboe_symbol(ticker: str) -> str:
+    """GRID ticker -> Cboe document symbol (``BRK-B`` -> ``BRK.B``, ``SPX`` -> ``_SPX``)."""
+    sym = ticker.strip().upper().replace("-", ".")
+    return f"_{sym}" if sym in CBOE_INDEX_SYMBOLS else sym
+
+
+def parse_occ_symbol(option: Any) -> tuple[str, date, str, float] | None:
+    """Parse ``KO261224C00099000`` into (root, expiry, 'C'|'P', strike)."""
+    if not isinstance(option, str):
+        return None
+    match = _OCC_SYMBOL.fullmatch(option)
+    if match is None:
+        return None
+    try:
+        expiry = datetime.strptime(match[2], "%y%m%d").date()
+    except ValueError:
+        return None
+    return match[1], expiry, match[3], int(match[4]) / 1000.0
+
+
+def _finite(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _count(value: Any) -> int | None:
+    number = _finite(value)
+    return int(number) if number is not None and number >= 0 else None
+
+
+def _expiry_ts(day: date) -> int:
+    """Expiry key in Yahoo's convention: midnight UTC of the expiry date."""
+    return int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+
+
+def cboe_chain_pages(doc: Any, ticker: str, today: date) -> dict[str, Any] | None:
+    """Turn one Cboe delayed-quotes document into Yahoo-shaped expiry pages.
+
+    Returns ``{"expirations", "pages", "quote"}`` or None when the document
+    is not a chain for ``ticker``. Only standard contracts are kept: the OCC
+    root must equal the underlying (``BRKB`` for ``BRK.B``). Adjusted roots
+    (``KO1``) carry non-standard deliverables and would corrupt OI/max-pain;
+    index weeklies (``SPXW``) are a separate root and are not merged.
+    Expiries before ``today`` (ET session date) are dropped. A non-positive
+    or missing IV is stored as missing, never as zero volatility.
+    """
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
+        return None
+    data = doc["data"]
+    sym = cboe_symbol(ticker)
+    reported = doc.get("symbol") or data.get("symbol")
+    if not isinstance(reported, str) or reported.lstrip("_^") != sym.lstrip("_"):
+        return None
+    options_list = data.get("options")
+    if not isinstance(options_list, list):
+        return None
+    root = sym.lstrip("_").replace(".", "")
+
+    spot = _finite(data.get("current_price"))
+    quote: dict[str, Any] = {"regularMarketPrice": spot, "regularMarketTime": None,
+                             "iv30": _finite(data.get("iv30"))}
+    trade_time = data.get("last_trade_time")
+    if isinstance(trade_time, str):
+        try:
+            local = datetime.fromisoformat(trade_time)
+        except ValueError:
+            local = None
+        # Cboe's naive underlying trade time is America/New_York wall clock
+        # (same reading as scripts/gex_p2b/harness.py). An offset-bearing value
+        # is unexpected and left undated rather than reinterpreted.
+        if local is not None and local.tzinfo is None:
+            quote["regularMarketTime"] = int(local.replace(tzinfo=_EQUITY_TZ).timestamp())
+
+    pages: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for item in options_list:
+        if not isinstance(item, dict):
+            continue
+        parsed = parse_occ_symbol(item.get("option"))
+        if parsed is None or parsed[0] != root or parsed[1] < today:
+            continue
+        _, expiry, side, strike = parsed
+        iv = _finite(item.get("iv"))
+        page = pages.setdefault(_expiry_ts(expiry), {"calls": [], "puts": []})
+        is_call = side == "C"
+        page["calls" if is_call else "puts"].append({
+            "contractSymbol": item.get("option"),
+            "strike": strike,
+            "lastPrice": _finite(item.get("last_trade_price")),
+            "bid": _finite(item.get("bid")),
+            "ask": _finite(item.get("ask")),
+            "volume": _count(item.get("volume")),
+            "openInterest": _count(item.get("open_interest")),
+            "impliedVolatility": iv if iv is not None and iv > 0 else None,
+            "inTheMoney": bool(spot is not None and (strike < spot if is_call else strike > spot)),
+        })
+    return {"expirations": sorted(pages), "pages": pages, "quote": quote}
+
+
+class CboeOptionsClient:
+    """Cboe delayed chains behind the ``YahooOptionsClient.get_options`` contract.
+
+    ``get_options(ticker)`` downloads the ticker's whole chain once and
+    returns the nearest expiry page; ``get_options(ticker, expiry_ts)`` is
+    served from that download without another request.
+    """
+
+    provider = "cboe"
+    is_available = True  # no auth handshake
+    remote_expiry_pages = False
+
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+        self.session.headers.update({"User-Agent": _BROWSER_UA,
+                                     "Accept": "application/json"})
+        self.last_no_chain = False
+        self._ticker: str | None = None
+        self._chain: dict[str, Any] | None = None
+
+    def _page(self, chain: dict[str, Any], expiry_ts: int) -> dict[str, Any] | None:
+        page = chain["pages"].get(expiry_ts)
+        if page is None:
+            return None
+        return {"expirations": list(chain["expirations"]),
+                "strikes": sorted({o["strike"] for o in page["calls"] + page["puts"]}),
+                "calls": list(page["calls"]), "puts": list(page["puts"]),
+                "quote": dict(chain["quote"])}
+
+    def get_options(self, ticker: str, expiry_ts: int | None = None) -> Any:
+        self.last_no_chain = False
+        if expiry_ts is not None:
+            if self._ticker != ticker or self._chain is None:
+                return None
+            return self._page(self._chain, expiry_ts)
+
+        self._ticker, self._chain = ticker, None
+        url = CBOE_OPTIONS_URL.format(symbol=cboe_symbol(ticker))
+        try:
+            resp = self.session.get(url, timeout=CBOE_TIMEOUT_SECONDS, allow_redirects=True)
+        except Exception as exc:  # noqa: BLE001 -- transport failure, caller may fall back
+            log.warning("Cboe options {t}: {kind}", t=ticker, kind=type(exc).__name__)
+            return None
+        if resp.status_code in (403, 404):
+            # The CDN answers S3 AccessDenied for symbols with no listed
+            # options (verified 2026-11-06 for ZZZZQ, BRK-B, BRKB).
+            log.debug("Cboe options {t}: HTTP {s} (no chain)", t=ticker, s=resp.status_code)
+            return NO_CHAIN
+        if resp.status_code != 200:
+            log.warning("Cboe options {t}: HTTP {s}", t=ticker, s=resp.status_code)
+            return None
+        try:
+            doc = resp.json()
+        except ValueError:
+            log.warning("Cboe options {t}: response is not JSON", t=ticker)
+            return None
+        today = _utc_now().astimezone(_EQUITY_TZ).date()
+        chain = cboe_chain_pages(doc, ticker, today)
+        if chain is None:
+            log.warning("Cboe options {t}: malformed chain document", t=ticker)
+            return None
+        if not chain["expirations"]:
+            return NO_CHAIN
+        self._chain = chain
+        return self._page(chain, chain["expirations"][0])
+
+
+def options_primary_provider() -> str:
+    """``cboe`` (default) or ``yahoo``, from GRID_OPTIONS_PRIMARY_PROVIDER."""
+    value = os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "cboe").strip().lower()
+    return "yahoo" if value == "yahoo" else "cboe"
+
+
+class CboeFirstOptionsClient:
+    """Cboe primary, Yahoo fallback, one provider per ticker capture.
+
+    The provider that served a ticker's first page serves all its expiry
+    pages, so a batch never mixes vendors. Yahoo is initialised lazily (its
+    crumb handshake costs two requests) and only when Cboe fails in transport
+    for a ticker; a Cboe "no listed options" answer is authoritative (Cboe
+    carries the consolidated OPRA chain) and is not retried on Yahoo.
+    """
+
+    is_available = True
+
+    def __init__(self) -> None:
+        self.cboe = CboeOptionsClient()
+        self._yahoo: Any = None
+        self._active: Any = self.cboe
+        self.provider_by_ticker: dict[str, str] = {}
+
+    @property
+    def last_no_chain(self) -> bool:
+        return getattr(self._active, "last_no_chain", False) is True
+
+    @property
+    def remote_expiry_pages(self) -> bool:
+        return getattr(self._active, "remote_expiry_pages", True)
+
+    def _fallback(self) -> Any:
+        if self._yahoo is None:
+            self._yahoo = YahooOptionsClient()
+        return self._yahoo if self._yahoo.is_available else None
+
+    def get_options(self, ticker: str, expiry_ts: int | None = None) -> Any:
+        if expiry_ts is not None:
+            return self._active.get_options(ticker, expiry_ts)
+        self._active = self.cboe
+        first = self.cboe.get_options(ticker)
+        if first is None:
+            yahoo = self._fallback()
+            if yahoo is not None:
+                log.info("{t}: Cboe chain unavailable, falling back to Yahoo", t=ticker)
+                self._active = yahoo
+                first = yahoo.get_options(ticker)
+        self.provider_by_ticker[ticker] = getattr(self._active, "provider", "yahoo")
+        return first
 
 
 class OptionsPuller(BasePuller):
@@ -575,7 +826,15 @@ class OptionsPuller(BasePuller):
                  "reason": "pre-session"} for ticker in tickers
             ], full_universe=full_universe)
 
-        self._yahoo = YahooOptionsClient()
+        # Cboe delayed chains first, Yahoo only as a per-ticker fallback.
+        # GRID_OPTIONS_PRIMARY_PROVIDER=yahoo restores the Yahoo-only path
+        # (operator rollback knob; the test suite pins it so no test reaches
+        # Cboe unless it opts in). ``_yahoo`` keeps its historical attribute
+        # name: callers and tests inject any ``get_options`` client there.
+        if options_primary_provider() == "yahoo":
+            self._yahoo = YahooOptionsClient()
+        else:
+            self._yahoo = CboeFirstOptionsClient()
         if not self._yahoo.is_available:
             log.error("Yahoo options client unavailable — cannot pull options")
             return OptionsPullResults([
@@ -715,7 +974,7 @@ class OptionsPuller(BasePuller):
                 if getattr(self._yahoo, "last_no_chain", False) is True:
                     return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                             "reason": "no chain listed"}
-                return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0, "error": "no data from Yahoo"}
+                return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0, "error": "no data from options provider"}
 
             quote = first.get("quote", {})
             spot_price = quote.get("regularMarketPrice")
@@ -763,7 +1022,8 @@ class OptionsPuller(BasePuller):
                     chain_data = first
                 else:
                     chain_data = self._yahoo.get_options(ticker, exp_ts)
-                    time.sleep(0.2)
+                    if getattr(self._yahoo, "remote_expiry_pages", True):
+                        time.sleep(0.2)  # per-expiry request pacing (Yahoo)
                     if chain_data is NO_CHAIN:
                         # Listed expiry, no chain page: a failed fetch, as before.
                         log.warning("Yahoo options {t}: no chain result", t=ticker)
@@ -1054,9 +1314,11 @@ class OptionsPuller(BasePuller):
                 )
 
             log.info(
-                "{t}: {n} snaps, capture={capture:.1f}s, publish={publish:.1f}s, "
+                "{t}: {n} snaps via {provider}, capture={capture:.1f}s, publish={publish:.1f}s, "
                 "PCR={pcr}, MaxPain={mp}, OI={oi}, IV_ATM={iv}",
                 t=ticker, n=snap_count,
+                provider=getattr(self._yahoo, "provider_by_ticker", {}).get(
+                    ticker, getattr(self._yahoo, "provider", "provider")),
                 capture=publish_clock - capture_clock,
                 publish=time.monotonic() - publish_clock,
                 pcr=f"{put_call_ratio:.2f}" if put_call_ratio else "N/A",

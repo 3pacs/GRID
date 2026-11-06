@@ -190,3 +190,13 @@ def mock_pit_store():
 def _isolated_scheduler_run_dates(tmp_path, monkeypatch):
     """Keep ingestion.scheduler's persisted run dates out of the real home dir."""
     monkeypatch.setenv("GRID_SCHEDULER_LAST_RUN_PATH", str(tmp_path / "scheduler_last_run.json"))
+
+
+@pytest.fixture(autouse=True)
+def _options_provider_offline_default(monkeypatch):
+    """Pin OptionsPuller.pull_all to its Yahoo client, which tests replace.
+
+    Production defaults to Cboe delayed chains (ingestion/options.py); tests
+    that exercise the Cboe path opt in by deleting this variable.
+    """
+    monkeypatch.setenv("GRID_OPTIONS_PRIMARY_PROVIDER", "yahoo")
