@@ -409,6 +409,28 @@ class Settings(BaseSettings):
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
     LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3.8-27b"
 
+    # threadripper RTX A2000 fast model (``llamacpp_threadripper``, W2-9):
+    # primary of Tier.QUICK and LOCAL's first fallback after gridz4. Off until
+    # the ops script enables it; the URL is threadripper's tailnet IP. It sits
+    # behind Tailscale's relay from grid-svr, hence its own connect timeout.
+    LLAMACPP_THREADRIPPER_ENABLED: bool = False
+    LLAMACPP_THREADRIPPER_BASE_URL: str = "http://100.78.68.72:8088"
+    LLAMACPP_THREADRIPPER_CHAT_MODEL: str = "quick"
+    LLAMACPP_THREADRIPPER_TIMEOUT_SECONDS: int = 60
+    LLAMACPP_THREADRIPPER_NUM_PREDICT: int = 512
+    LLAMACPP_THREADRIPPER_CONNECT_TIMEOUT_SECONDS: float = 6.0
+
+    # x99-hex Qwen3.8-27B (``llamacpp_x99``, S5): independent REASON/ORACLE
+    # fallback after the gridz4 proxy. Site B — relayed from grid-svr (1.4–2 s
+    # RTT, ~3 MB/s) — so longer request and connect timeouts. Off until the
+    # ops script enables it.
+    LLAMACPP_X99_ENABLED: bool = False
+    LLAMACPP_X99_BASE_URL: str = "http://100.99.56.77:8086"
+    LLAMACPP_X99_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
+    LLAMACPP_X99_TIMEOUT_SECONDS: int = 360
+    LLAMACPP_X99_NUM_PREDICT: int = 512
+    LLAMACPP_X99_CONNECT_TIMEOUT_SECONDS: float = 6.0
+
     # Total wall-clock budget (seconds) for one /chat/compose request's whole
     # LLM attempt (local card + any paid failover) — api/routers/chat.py's
     # _resilient_chat. Defaults to 18s, unchanged from the pre-fail-fast
@@ -695,6 +717,9 @@ class Settings(BaseSettings):
     LLM_LOCAL_PROVIDER: str = "llamacpp_z4"  # LOCAL tier — gridz4 Qwen3.8-27B
     LLM_REASON_PROVIDER: str = "llamacpp_z4"  # REASON tier — gridz4, then the 3090
     LLM_ORACLE_PROVIDER: str = "llamacpp_z4"  # ORACLE tier — gridz4, then the 3090
+    # Tier.QUICK primary (short classification/extraction). Distinct from the
+    # legacy LLM_QUICK_PROVIDER below, which is LOCAL's fallback key.
+    LLM_QUICK_TIER_PROVIDER: str = "llamacpp_threadripper"
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
     LLM_DEFAULT_PROVIDER: str = "llamacpp"
     LLM_QUICK_PROVIDER: str = "llamacpp"
