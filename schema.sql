@@ -1604,6 +1604,46 @@ CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_score_scored
 CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_score_verdict
     ON astrogrid.prediction_score (verdict, scored_at DESC);
 
+-- Legacy grid-crypto-v1 rescores and bounded scorer skips
+-- (migrations/versions/ag_legacy_rescore_20261105.py).
+CREATE TABLE IF NOT EXISTS astrogrid.prediction_score_legacy_rescore (
+    id                          BIGSERIAL PRIMARY KEY,
+    prediction_run_id           BIGINT NOT NULL UNIQUE REFERENCES astrogrid.prediction_run(id),
+    score_version               TEXT NOT NULL,
+    superseded_score_id         BIGINT REFERENCES astrogrid.prediction_score(id),
+    target_symbols              JSONB NOT NULL,
+    scored_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    benchmark_symbol            TEXT,
+    realized_return             DOUBLE PRECISION,
+    benchmark_return            DOUBLE PRECISION,
+    alpha_vs_benchmark          DOUBLE PRECISION,
+    verdict                     TEXT CHECK (verdict IN ('hit', 'miss', 'partial', 'invalidated', 'expired')),
+    invalidation_status         TEXT CHECK (invalidation_status IN ('respected', 'violated', 'not_triggered', 'unknown')),
+    max_favorable_excursion     DOUBLE PRECISION,
+    max_adverse_excursion       DOUBLE PRECISION,
+    regime_context              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    attribution_grid            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    attribution_mystical        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    attribution_noise           JSONB NOT NULL DEFAULT '[]'::jsonb,
+    raw_payload                 JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS astrogrid.prediction_score_skip (
+    id                          BIGSERIAL PRIMARY KEY,
+    prediction_run_id           BIGINT NOT NULL REFERENCES astrogrid.prediction_run(id),
+    attempt_date                DATE NOT NULL,
+    reason                      TEXT NOT NULL,
+    permanent                   BOOLEAN NOT NULL DEFAULT FALSE,
+    detail                      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (prediction_run_id, attempt_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_score_legacy_rescore_scored
+    ON astrogrid.prediction_score_legacy_rescore (scored_at DESC);
+CREATE INDEX IF NOT EXISTS idx_astrogrid_prediction_score_skip_run
+    ON astrogrid.prediction_score_skip (prediction_run_id, attempt_date DESC);
+
 CREATE TABLE IF NOT EXISTS astrogrid.backtest_run (
     id                          BIGSERIAL PRIMARY KEY,
     run_key                     TEXT NOT NULL UNIQUE,
@@ -1761,6 +1801,16 @@ CREATE TRIGGER trg_astrogrid_prediction_postmortem_no_mutation
 DROP TRIGGER IF EXISTS trg_astrogrid_prediction_score_no_mutation ON astrogrid.prediction_score;
 CREATE TRIGGER trg_astrogrid_prediction_score_no_mutation
     BEFORE UPDATE OR DELETE ON astrogrid.prediction_score
+    FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
+
+DROP TRIGGER IF EXISTS trg_astrogrid_prediction_score_legacy_rescore_no_mutation ON astrogrid.prediction_score_legacy_rescore;
+CREATE TRIGGER trg_astrogrid_prediction_score_legacy_rescore_no_mutation
+    BEFORE UPDATE OR DELETE ON astrogrid.prediction_score_legacy_rescore
+    FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
+
+DROP TRIGGER IF EXISTS trg_astrogrid_prediction_score_skip_no_mutation ON astrogrid.prediction_score_skip;
+CREATE TRIGGER trg_astrogrid_prediction_score_skip_no_mutation
+    BEFORE UPDATE OR DELETE ON astrogrid.prediction_score_skip
     FOR EACH ROW EXECUTE FUNCTION astrogrid.prevent_log_mutation();
 
 DROP TRIGGER IF EXISTS trg_astrogrid_backtest_run_no_mutation ON astrogrid.backtest_run;
