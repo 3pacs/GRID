@@ -7,15 +7,8 @@
  * logs as files under `--out`, because the browser tool available to the
  * lead cannot save images.
  *
- * IMPORTANT — not run by the harness build itself:
- *   This script was written to spec but has NOT been executed in this
- *   session. The task that built this harness (tests/browser/fixture_api/*)
- *   was explicitly told not to install or drive a browser itself, because
- *   only one browser is available on this machine and it is driven live by
- *   the lead — the same constraint applies to launching Chrome/Edge via
- *   puppeteer-core, so this script was authored but never run, `npm ci`
- *   was never run in this directory, and no tests/browser/evidence/ output
- *   was generated or committed by that session. Run it yourself:
+ * Local synthetic source acceptance only; not production/deploy acceptance.
+ * See M1-SPY-JOURNEY.md for the current scope and legacy receipt limitations.
  *
  *     cd tests/browser
  *     npm ci
@@ -23,7 +16,8 @@
  *
  * Usage:
  *   node run_evidence.mjs --tree-label <sha-or-label> \
- *     [--pwa-dir <path>] [--scenarios healthy,partial,empty] \
+ *     [--pwa-dir <path>] [--browser-executable <path>] \
+ *     [--scenarios healthy,partial,empty,unavailable,error] \
  *     [--roles admin,contributor] [--journeys home,ticker-lookup,...] \
  *     [--out tests/browser/evidence/<tree-label>/]
  *
@@ -40,6 +34,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, existsSync, read
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveBrowserExecutable, sourceIdentity } from './harness_config.mjs';
+import { runSpyJourney } from './spy_journey.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..'); // this harness worktree root
@@ -48,7 +44,8 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..'); // this harness worktree 
 
 function parseArgs(argv) {
     const args = {
-        'pwa-dir': 'C:/Users/owner/dev/GRID-fable-wt-composed-g/pwa',
+        'pwa-dir': path.join(REPO_ROOT, 'pwa'),
+        'browser-executable': null,
         scenarios: 'healthy,partial,empty',
         roles: 'admin,contributor',
         journeys: null, // null = all journeys for the role (default)
@@ -75,7 +72,7 @@ function parseArgs(argv) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-const PWA_DIR = args['pwa-dir'];
+const PWA_DIR = path.resolve(args['pwa-dir']);
 const TREE_LABEL = args['tree-label'];
 const SCENARIOS = args.scenarios.split(',').map((s) => s.trim()).filter(Boolean);
 const ROLES = args.roles.split(',').map((s) => s.trim()).filter(Boolean);
@@ -91,22 +88,10 @@ const OUT_ROOT = path.join(path.resolve(args.out), `run-${RUN_STAMP}`);
 const FIXTURE_PORT = 8001;
 const PWA_PORT = 5174;
 const FIXTURE_BASE = `http://127.0.0.1:${FIXTURE_PORT}`;
-const PWA_BASE = `http://localhost:${PWA_PORT}`;
+const PWA_BASE = `http://127.0.0.1:${PWA_PORT}`;
 
 // ── Browser executable ──────────────────────────────────────────────
 // No browser download: point puppeteer-core at the system install.
-
-const CHROME_PATH = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const EDGE_PATH = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-
-function resolveBrowserExecutable() {
-    if (existsSync(CHROME_PATH)) return CHROME_PATH;
-    if (existsSync(EDGE_PATH)) return EDGE_PATH;
-    throw new Error(
-        `Neither Chrome (${CHROME_PATH}) nor Edge (${EDGE_PATH}) found. ` +
-        'This runner does not download a browser — install one of these or edit the paths.'
-    );
-}
 
 // ── Journeys per role ─────────────────────────────────────────────────
 // Hashes confirmed against pwa/src/routing.js / routes.js / app.jsx:
@@ -118,6 +103,7 @@ function resolveBrowserExecutable() {
 
 const JOURNEYS = {
     admin: [
+        { name: 'spy-options', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/, run: runSpyJourney },
         { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?', ready: /Your read|Start over|Here's (how|what)/ },
         { name: 'ticker-lookup', hash: '#/ticker-lookup', ready: /GOLD VERDICT/ },
         { name: 'watchlist-analysis', hash: '#/watchlist/TEST1', ready: /INSIDER EDGE|AI OVERVIEW/ },
@@ -127,10 +113,7 @@ const JOURNEYS = {
         { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH|Pipeline health unavailable/ },
         { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
         { name: 'snapshots', hash: '#/snapshots', ready: /LATEST SNAPSHOT|No snapshots|Snapshots unavailable|unexpected response/ },
-        // Route id is 'godview' (NOT 'godview-pillars') — confirmed via
-        // `git show d197c9a3 -- pwa/src/routes.js`: `{id: 'godview', ...,
-        // component: './views/GodViewPillars.jsx'}`.
-        { name: 'godview', hash: '#/godview', ready: /God View . Institutional Pillars|UNAVAILABLE/ },
+        { name: 'god-view', hash: '#/god-view', ready: /Fed net liquidity|UNAVAILABLE|God View/ },
         // Operator (admin) can reach catalyst-timeline normally, unlike the
         // contributor gate below — added so the earlier owner-fix on this
         // view can be re-verified from the admin side too.
@@ -219,10 +202,9 @@ function startFixtureServer(scenario, role) {
 }
 
 function startPwaDevServer() {
-    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     const child = spawn(
-        npmCmd,
-        ['run', 'dev', '--', '--port', String(PWA_PORT), '--strictPort'],
+        process.execPath,
+        [path.join(PWA_DIR, 'node_modules', 'vite', 'bin', 'vite.js'), '--host', '127.0.0.1', '--port', String(PWA_PORT), '--strictPort'],
         {
             cwd: PWA_DIR,
             env: {
@@ -231,9 +213,6 @@ function startPwaDevServer() {
                 GRID_WS_PROXY_TARGET: `ws://127.0.0.1:${FIXTURE_PORT}`,
             },
             stdio: ['ignore', 'pipe', 'pipe'],
-            // Node >= 20.12 refuses to spawn a .cmd shim without a shell (EINVAL);
-            // stopChild's taskkill /T reaps the whole shell tree on Windows.
-            shell: process.platform === 'win32',
         }
     );
     return child;
@@ -332,12 +311,30 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
         role,
         scenario,
         started_at: new Date().toISOString(),
+        mode: 'local synthetic fixtures / Vite development modules; no deployment identity',
+        source_before: sourceIdentity(REPO_ROOT, ['tests/browser']),
+        pwa_source_before: sourceIdentity(PWA_DIR, ['src']),
         journeys: {},
     };
 
     const userDataDir = mkdtempSync(path.join(tmpdir(), `grid-evidence-${role}-${scenario}-`));
     const page = await browser.newPage();
+    // Capture actual responses rather than service-worker-owned fetches. This
+    // is a source journey, not a service-worker/offline-cache qualification.
+    await page.setBypassServiceWorker(true);
     await page.setViewport({ width: 1280, height: 900 });
+    // Fail closed on external requests, including links/providers accidentally
+    // introduced by a view. Only the two runner-owned loopback servers are allowed.
+    const blockedRequests = [];
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+        const url = new URL(request.url());
+        if (['data:', 'blob:', 'about:'].includes(url.protocol) ||
+            [PWA_BASE, FIXTURE_BASE].includes(url.origin)) request.continue();
+        else { blockedRequests.push(request.url()); request.abort(); }
+    });
+    const moduleResponses = [];
+    const fixtureResponses = [];
 
     page.on('console', (msg) => {
         const type = msg.type();
@@ -349,7 +346,15 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
     });
     page.on('response', (res) => {
         const url = res.url();
+        if (url.startsWith(PWA_BASE) && /\/(src|@vite)\//.test(url)) {
+            moduleResponses.push(res.buffer().then(bytes => {
+                return import('node:crypto').then(({ createHash }) => ({ url, status: res.status(), sha256: createHash('sha256').update(bytes).digest('hex') }));
+            }).catch(() => ({ url, error: 'body unavailable' })));
+        }
         if (url.includes('/api/')) {
+            if (/\/gamma-watch\/state|\/derivatives\/(?:gex|vanna-charm|flow-timeline)\/SPY/.test(url)) {
+                fixtureResponses.push(res.json().then(body => ({ url, status: res.status(), body })).catch(() => ({ url, status: res.status(), error: 'body unavailable' })));
+            }
             appendFileSync(networkLogPath, JSON.stringify({
                 ts: new Date().toISOString(), role, scenario,
                 method: res.request().method(), url, status: res.status(),
@@ -380,6 +385,12 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 await waitSettled(page);
             }
             const readiness = await waitForReady(page, journey);
+            if (readiness.ready === 'timeout' && journey.run) throw new Error('Initial view not ready');
+            const capture = async name => {
+                await page.screenshot({ path: path.join(outDir, `${journey.name}.${name}.png`), fullPage: true });
+                writeFileSync(path.join(outDir, `${journey.name}.${name}.text.txt`), await page.evaluate(() => document.body.innerText));
+            };
+            const checks = journey.run ? await journey.run(page, scenario, capture) : [];
 
             // Desktop screenshot
             await page.setViewport({ width: 1280, height: 900 });
@@ -405,6 +416,8 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 console_errors: errorsAfter - journeyErrorCountBefore,
                 api_non_2xx: nonTwoXx,
                 allow_crash: !!journey.allowCrash,
+                checks,
+                final_url: page.url(),
                 ready: readiness.ready,
                 ready_wait_ms: readiness.ready_wait_ms,
                 evidence: readiness.ready === 'timeout' ? 'INCOMPLETE (ready condition not met within 10 s)' : 'complete',
@@ -415,10 +428,21 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 console_errors: null,
                 api_non_2xx: null,
                 runner_error: String(err && err.message || err),
+                checks: err.checks || [],
             };
+            await page.screenshot({ path: path.join(outDir, `${journey.name}.failure.png`), fullPage: true }).catch(() => {});
+            writeFileSync(path.join(outDir, `${journey.name}.failure.text.txt`), await page.evaluate(() => document.body.innerText).catch(() => ''));
         }
     }
 
+    summary.served_modules = await Promise.all(moduleResponses);
+    summary.fixture_responses = await Promise.all(fixtureResponses);
+    summary.transport_evidence_complete = !summary.journeys['spy-options'] ||
+        summary.fixture_responses.some(r => r.url.endsWith('/gamma-watch/state') && r.body);
+    summary.blocked_requests = blockedRequests;
+    summary.source_after = sourceIdentity(REPO_ROOT, ['tests/browser']);
+    summary.pwa_source_after = sourceIdentity(PWA_DIR, ['src']);
+    summary.source_unchanged = summary.source_before.sha256 === summary.source_after.sha256 && summary.pwa_source_before.sha256 === summary.pwa_source_after.sha256;
     await page.close();
     summary.finished_at = new Date().toISOString();
     writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2));
@@ -450,7 +474,11 @@ async function main() {
         process.exit(1);
     }
 
-    const executablePath = resolveBrowserExecutable();
+    const executablePath = resolveBrowserExecutable(args['browser-executable']);
+    for (const role of ROLES) {
+        if (!JOURNEYS[role]) throw new Error(`Unknown role: ${role}`);
+        if (JOURNEY_FILTER && !JOURNEYS[role].some(j => JOURNEY_FILTER.has(j.name))) throw new Error(`No requested journey for ${role}`);
+    }
     mkdirSync(OUT_ROOT, { recursive: true });
 
     const results = [];
@@ -460,6 +488,12 @@ async function main() {
             await assertPortsFree([FIXTURE_PORT, PWA_PORT]);
             const fixtureChild = startFixtureServer(scenario, role);
             const pwaChild = startPwaDevServer();
+            const serverLogDir = path.join(OUT_ROOT, `${role}-${scenario}`);
+            mkdirSync(serverLogDir, { recursive: true });
+            for (const [name, child] of [['fixture', fixtureChild], ['vite', pwaChild]]) {
+                for (const stream of ['stdout', 'stderr']) child[stream].on('data', chunk => appendFileSync(path.join(serverLogDir, `${name}.log`), chunk));
+                child.on('error', error => appendFileSync(path.join(serverLogDir, `${name}.log`), String(error)));
+            }
             let browserInstance = null;
             try {
                 const fixtureUp = await waitForHttp(`${FIXTURE_BASE}/api/v1/auth/verify`, { timeoutMs: 15000 });
@@ -496,6 +530,9 @@ async function main() {
     }, null, 2));
 
     console.log(`\nDone. Evidence written under ${OUT_ROOT}`);
+    if (results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.checks?.some(c => !c.passed)))) {
+        process.exitCode = 1;
+    }
 }
 
 main().catch((err) => {
