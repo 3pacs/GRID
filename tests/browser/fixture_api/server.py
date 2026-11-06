@@ -47,7 +47,7 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/godview/latest$"), lambda m, q, s: {
         "as_of": fx.GENERATED_AT, "as_of_source": "synthetic_fixture",
         "schema": {"migrated": True}, "pillars": {name: {
-            "status": "unavailable", "reason": "no_completed_capture", "data": None,
+            "status": "unavailable", "reason": "no_completed_capture" if name == "dealer_gex" else "inputs_missing", "data": None,
         } for name in ("fed_liquidity", "cftc", "dealer_gex")},
     }),
     ("GET", re.compile(r"^/api/v1/options/signals$"), lambda m, q, s: spy.options_signals()),
