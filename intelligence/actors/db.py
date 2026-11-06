@@ -197,10 +197,23 @@ def _seed_known_actors(engine: Engine) -> int:
 _ICIJ_CATEGORIES = frozenset({"icij_entity", "icij_officer", "icij_intermediary"})
 
 
+_ACTOR_SELECT_COLUMNS = """
+    SELECT id, name, tier, category, title,
+           net_worth_estimate, aum, influence_score,
+           trust_score, motivation_model,
+           connections, known_positions, board_seats,
+           political_affiliations, data_sources, credibility,
+           provenance, provenance_as_of
+    FROM actors
+"""
+
+
 def _load_actors_from_db(
     engine: Engine,
     *,
     exclude_categories: frozenset[str] | None = _ICIJ_CATEGORIES,
+    exclude_sources: frozenset[str] | None = None,
+    limit: int | None = None,
 ) -> dict[str, Actor]:
     """Load actors from the DB into Actor dataclass instances.
 
@@ -208,6 +221,10 @@ def _load_actors_from_db(
         engine: SQLAlchemy engine.
         exclude_categories: Categories to skip (default: ICIJ bulk data).
             Pass ``None`` or ``frozenset()`` to load everything.
+        exclude_sources: ``actors.source`` values to skip (NULL sources are
+            kept). ``None`` keeps every source.
+        limit: Cap on rows, highest ``influence_score`` first. ``None`` means
+            no cap.
 
     Returns:
         Dict mapping actor_id -> Actor.
@@ -215,7 +232,27 @@ def _load_actors_from_db(
     actors: dict[str, Actor] = {}
     try:
         with engine.connect() as conn:
-            if exclude_categories:
+            if exclude_sources or limit is not None:
+                rows = conn.execute(
+                    text(
+                        _ACTOR_SELECT_COLUMNS
+                        + """
+                    WHERE (CAST(:all_categories AS boolean) OR category != ALL(:excluded))
+                      AND (CAST(:all_sources AS boolean) OR source IS NULL
+                           OR source != ALL(:excluded_sources))
+                    ORDER BY influence_score DESC NULLS LAST
+                    LIMIT :row_limit
+                """
+                    ),
+                    {
+                        "all_categories": not exclude_categories,
+                        "excluded": list(exclude_categories or ()) or [""],
+                        "all_sources": not exclude_sources,
+                        "excluded_sources": list(exclude_sources or ()) or [""],
+                        "row_limit": limit,
+                    },
+                ).fetchall()
+            elif exclude_categories:
                 query = text("""
                     SELECT id, name, tier, category, title,
                            net_worth_estimate, aum, influence_score,
@@ -242,29 +279,48 @@ def _load_actors_from_db(
                     ORDER BY influence_score DESC
                 """)).fetchall()
             for r in rows:
-                actors[r[0]] = Actor(
-                    id=r[0],
-                    name=r[1],
-                    tier=r[2],
-                    category=r[3],
-                    title=r[4] or "",
-                    net_worth_estimate=float(r[5]) if r[5] is not None else None,
-                    aum=float(r[6]) if r[6] is not None else None,
-                    influence_score=float(r[7]) if r[7] is not None else 0.5,
-                    trust_score=float(r[8]) if r[8] is not None else 0.5,
-                    motivation_model=r[9] or "unknown",
-                    connections=_parse_jsonb(r[10]),
-                    known_positions=_parse_jsonb(r[11]),
-                    board_seats=_parse_jsonb(r[12]),
-                    political_affiliations=_parse_jsonb(r[13]),
-                    data_sources=_parse_jsonb(r[14]),
-                    credibility=r[15] or "inferred",
-                    provenance=r[16] or "unknown",
-                    provenance_as_of=str(r[17]) if r[17] else None,
-                )
+                actors[r[0]] = _actor_from_row(r)
     except Exception as exc:
         log.warning("Failed to load actors from DB: {e}", e=str(exc))
     return actors
+
+
+def _load_actor_by_id(engine: Engine, actor_id: str) -> Actor | None:
+    """Load one actor by primary key (a point lookup, not a table scan)."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(_ACTOR_SELECT_COLUMNS + " WHERE id = :aid"),
+                {"aid": actor_id},
+            ).fetchone()
+    except Exception as exc:
+        log.warning("Failed to load actor {a}: {e}", a=actor_id, e=str(exc))
+        return None
+    return _actor_from_row(row) if row is not None else None
+
+
+def _actor_from_row(r: Any) -> Actor:
+    """Map one ``_ACTOR_SELECT_COLUMNS`` row to an :class:`Actor`."""
+    return Actor(
+        id=r[0],
+        name=r[1],
+        tier=r[2],
+        category=r[3],
+        title=r[4] or "",
+        net_worth_estimate=float(r[5]) if r[5] is not None else None,
+        aum=float(r[6]) if r[6] is not None else None,
+        influence_score=float(r[7]) if r[7] is not None else 0.5,
+        trust_score=float(r[8]) if r[8] is not None else 0.5,
+        motivation_model=r[9] or "unknown",
+        connections=_parse_jsonb(r[10]),
+        known_positions=_parse_jsonb(r[11]),
+        board_seats=_parse_jsonb(r[12]),
+        political_affiliations=_parse_jsonb(r[13]),
+        data_sources=_parse_jsonb(r[14]),
+        credibility=r[15] or "inferred",
+        provenance=r[16] or "unknown",
+        provenance_as_of=str(r[17]) if r[17] else None,
+    )
 
 
 def _parse_jsonb(val: Any) -> list:
