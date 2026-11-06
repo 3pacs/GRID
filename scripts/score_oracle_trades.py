@@ -3,7 +3,9 @@
 Score Oracle Trades — fix directions, score expired predictions.
 
 Steps:
-1. Fetch historical prices via yfinance for all prediction tickers
+1. Load settled expiry closes from raw_series through store/observations.py
+   (EXPIRY_CLOSE_RULE: SUCCESS rows, latest vintage, raw close, nothing dated
+   after the expiry; weekend/holiday expiry = previous trading close)
 2. Count (never backfill) missing/invalid entry_price -- HISTORICAL-WRITE
    HOLD: a non-null 0/negative entry_price is a legacy row and is left
    exactly as it is; a NULL entry_price is a new-policy row and is never
@@ -17,19 +19,25 @@ Step 4 (the only one that touches large row counts) runs in chunks of
 prevents the single-transaction lock-and-OOM failure mode that would
 otherwise hit when scoring large expiry waves (e.g. the 2026-05-15
 window where ~2.27M predictions expire at once).
+
+``--rescore-no-data`` is a separate mode (Steps 1-5 do not run): it
+re-prices the rows the pre-2026-11 bug closed as "No price data at expiry"
+under EXPIRY_CLOSE_RULE and reports a projection. Dry run unless ``--apply``;
+with ``--apply`` it only appends to ``oracle_prediction_rescores`` (marked
+exploratory hindsight, never official) and never updates oracle_predictions.
 """
 
 import argparse
 import importlib.util
 import json
 import sys
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
-
-from datetime import date, timedelta
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
-import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
 # Every first-party (repo-root) import this module needs -- directly or,
@@ -41,11 +49,13 @@ from sqlalchemy.engine import Engine
 # does not import itself but which must be equally unaffected by anything
 # this import does to sys.path).
 from config import settings
+from ingestion.market_calendar import is_market_open
 from oracle.entry_price_policy import (
     NULL_WRITE_POLICY,
     SCORE_NOTE_ENTRY_NULL,
     entry_price_score_note,
 )
+from store.observations import Observation, read_window
 
 # Compute-node fallback for a genuinely standalone
 # `python scripts/score_oracle_trades.py` invocation whose CWD/PYTHONPATH
@@ -78,7 +88,7 @@ from oracle.entry_price_policy import (
 if __name__ == "__main__" and importlib.util.find_spec("config") is None:
     sys.path.insert(0, "/data/grid_v4/grid_repo")
 
-# Ticker → yfinance symbol mapping
+# Ticker → yfinance-style symbol used in the ``YF:{symbol}:close`` series id.
 YF_MAP = {
     "BTC": "BTC-USD",
     "ETH": "ETH-USD",
@@ -91,89 +101,218 @@ def get_yf_symbol(ticker: str) -> str:
     return YF_MAP.get(ticker, ticker)
 
 
-def fetch_prices(tickers: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
-    """Fetch daily close prices for all tickers from yfinance."""
-    import yfinance as yf  # heavy + optional; defer import to call time
+# ── Expiry close lookup ─────────────────────────────────────────────────────
+#
+# Root cause this replaces (measured on griddb 2026-11-06, read only): every
+# one of the 15,792 dedup_keep rows noted "No price data at expiry" was
+# stamped at 00:00-01:59 UTC *on its own expiry date* (scored_at::date -
+# expiry = 0 for all of them). The old get_price_for_date() returned None for
+# "the expiry-day close does not exist yet" (its same-day guard, added after
+# 2026-05-15) and score_one_chunk() treated that None as final and wrote
+# verdict='no_data'. So every row whose expiry fell after 05-15 was closed as
+# unscorable hours before the market even opened on its expiry day, and a
+# weekend expiry (no close ever exists on that date) could never price at all.
+# The closes were there: raw_series held TIINGO/yfinance closes for the same
+# tickers and dates (e.g. SPY 2026-11-03 754.35, pulled 23:35Z that day).
+#
+# The rule below (EXPIRY_CLOSE_RULE) is what both the live scorer and the
+# hindsight rescore use:
+#
+# * Prices come only from ``raw_series`` through ``store/observations.py``:
+#   SUCCESS rows, the latest vintage per obs_date, ``YF:{symbol}:close`` (raw,
+#   unadjusted -- the same basis as entry_price, which oracle/engine.py takes
+#   from options_daily_signals.spot_price), one source per price
+#   (PRICE_SOURCES order: TIINGO, then yfinance).
+# * A close counts only once its session is settled: the vintage must have
+#   been pulled at or after 17:00 America/New_York on its obs_date (crypto: the
+#   end of the UTC day). An intraday capture is never a close.
+# * Trading-day expiry: the close dated exactly on the expiry date. No
+#   earlier close stands in for it.
+# * Non-trading expiry (weekend / NYSE holiday): the close of the last trading
+#   day BEFORE the expiry -- the last price that existed at the expiry
+#   instant. Never the next trading day's close: that is data from after
+#   expiry (lookahead).
+# * Nothing dated after the expiry is ever read (``as_of=expiry`` bound).
+# * A prediction created at or after that session's 16:00 ET close (e.g.
+#   created Saturday, expiring Sunday) saw no session at all; it is no_data
+#   with NOTE_NO_SESSION rather than scored against a price it already knew.
+# * A missing close leaves the row 'pending' until EXPIRY_CLOSE_GRACE_DAYS
+#   after the session settled; only then is it closed as no_data.
 
-    yf_symbols = [get_yf_symbol(t) for t in tickers]
-    symbol_to_ticker = {get_yf_symbol(t): t for t in tickers}
+EXPIRY_CLOSE_RULE = "oracle_expiry_close_v2"
+PRICE_SOURCES: tuple[str, ...] = ("TIINGO", "yfinance")
+EXPIRY_CLOSE_GRACE_DAYS = 4
+NOTE_NO_PRICE = "No price data at expiry"
+NOTE_NO_SESSION = "No trading session closed between creation and expiry"
+_NY = ZoneInfo("America/New_York")
+_REGULAR_CLOSE_NY = time(16, 0)
+_SETTLED_NY = time(17, 0)
+_CRYPTO_SYMBOLS = frozenset({"BTC-USD", "ETH-USD", "SOL-USD"})
+# Longest US equity closure is 4 calendar days (e.g. Good Friday weekend
+# plus margin); a gap longer than this is missing data, not a holiday.
+_MAX_SESSION_LOOKBACK_DAYS = 7
 
-    log.info("Fetching prices for {} tickers from {} to {}...", len(tickers), start, end)
-
-    # auto_adjust=False is load-bearing, not cosmetic. Most rows scored by this
-    # script never touch Step 2's backfill below — their entry_price was set at
-    # prediction time by oracle/engine.py's _get_spot_price(), which reads the
-    # raw, unadjusted options_daily_signals.spot_price. yfinance flipped
-    # yf.download()'s default to True in 0.2.x, which silently back-adjusts
-    # Close for dividends/splits. Scoring that raw entry_price against a
-    # back-adjusted `actual` close here would manufacture a return equal to
-    # the cumulative adjustment factor between entry and expiry — the same
-    # mixed-basis bug PR #503 fixed in intelligence/trust_scorer.py.
-    #
-    # Batch download
-    data = yf.download(
-        yf_symbols, start=start, end=end, group_by="ticker", progress=False,
-        auto_adjust=False,
-    )
-
-    prices = {}  # ticker -> {date -> close_price}
-
-    if len(yf_symbols) == 1:
-        # Single ticker returns flat DataFrame
-        sym = yf_symbols[0]
-        ticker = symbol_to_ticker[sym]
-        if "Close" in data.columns:
-            prices[ticker] = data["Close"].dropna().to_dict()
-    else:
-        for sym in yf_symbols:
-            ticker = symbol_to_ticker[sym]
-            try:
-                if sym in data.columns.get_level_values(0):
-                    close = data[sym]["Close"].dropna()
-                    prices[ticker] = {d.date() if hasattr(d, 'date') else d: v for d, v in close.items()}
-            except Exception as e:
-                log.info("  Warning: failed to get {} ({}): {}", ticker, sym, e)
-
-    for t, p in prices.items():
-        log.info("  {}: {} days of prices", t, len(p))
-
-    return prices
+PriceBook = dict[str, dict[date, Observation]]
 
 
-def get_price_for_date(prices: dict, ticker: str, target_date: date) -> float | None:
-    """Get close price for a ticker on a date, with lookback for weekends/holidays.
+def close_series_id(ticker: str) -> str:
+    """The raw (unadjusted) close series for ``ticker``. Never ``adj_close``."""
+    return f"YF:{get_yf_symbol(ticker)}:close"
 
-    For ``target_date >= today`` we REFUSE to fall back to prior closes — if the
-    market hasn't closed on the expiry day, the prediction must remain pending
-    rather than be locked in against the wrong (earlier) close. Without this
-    guard, predictions expiring on day T get "scored" against day T-1 at hermes
-    cycles that fire before T's close, then frozen with verdict='hit/miss' so
-    the post-close rerun is skipped. (2026-05-15: caught after 2.27M predictions
-    expiring on Friday got scored Thursday night with Thursday's close.)
-    """
-    if ticker not in prices:
-        return None
 
-    ticker_prices = prices[ticker]
-    today = date.today()
+def _is_crypto(ticker: str) -> bool:
+    return get_yf_symbol(ticker) in _CRYPTO_SYMBOLS
 
-    if target_date >= today:
-        # Same-day-only: refuse to substitute an earlier close.
-        if target_date in ticker_prices:
-            val = ticker_prices[target_date]
-            if pd.notna(val) and val > 0:
-                return float(val)
-        return None
 
-    # Historical expiry — fall back up to 5 days for weekends/holidays.
-    for offset in range(6):
-        check_date = target_date - timedelta(days=offset)
-        if check_date in ticker_prices:
-            val = ticker_prices[check_date]
-            if pd.notna(val) and val > 0:
-                return float(val)
+def is_trading_day(ticker: str, d: date) -> bool:
+    return True if _is_crypto(ticker) else is_market_open(d)
 
+
+def expiry_session_date(ticker: str, expiry: date) -> date | None:
+    """The session whose close is the price at ``expiry`` (never after it)."""
+    for back in range(_MAX_SESSION_LOOKBACK_DAYS + 1):
+        d = expiry - timedelta(days=back)
+        if is_trading_day(ticker, d):
+            return d
     return None
+
+
+def session_close_utc(ticker: str, d: date) -> datetime:
+    """The instant session ``d`` stops trading (16:00 ET; crypto: UTC day end)."""
+    if _is_crypto(ticker):
+        return datetime.combine(d + timedelta(days=1), time.min, timezone.utc)
+    return datetime.combine(d, _REGULAR_CLOSE_NY, _NY).astimezone(timezone.utc)
+
+
+def session_settled_utc(ticker: str, d: date) -> datetime:
+    """Earliest pull time at which a vintage of ``d``'s close is accepted."""
+    if _is_crypto(ticker):
+        return session_close_utc(ticker, d)
+    return datetime.combine(d, _SETTLED_NY, _NY).astimezone(timezone.utc)
+
+
+def _as_utc(ts: Any) -> datetime | None:
+    """psycopg2 hands back aware datetimes; SQLite fixtures hand back text."""
+    if ts is None:
+        return None
+    if not isinstance(ts, datetime):
+        try:
+            ts = datetime.fromisoformat(str(ts))
+        except ValueError:
+            return None
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def _as_date(v: Any) -> date:
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
+
+
+def load_expiry_closes(
+    conn: Any,
+    tickers: list[str],
+    start: date,
+    end: date,
+    *,
+    as_of_ts: datetime | None = None,
+) -> PriceBook:
+    """Settled raw closes per ticker and obs_date in ``[start, end]``.
+
+    One bounded ``read_window`` per (ticker, source): SUCCESS only, latest
+    vintage per obs_date, never an obs_date after ``end``. For each date the
+    first source in PRICE_SOURCES whose latest vintage was pulled after the
+    session settled wins; sources are never blended within one price.
+    """
+    book: PriceBook = {}
+    for ticker in sorted(set(tickers)):
+        sid = close_series_id(ticker)
+        chosen: dict[date, Observation] = {}
+        for source in PRICE_SOURCES:
+            for obs in read_window(
+                conn, sid, source=source, start=start, as_of=end, as_of_ts=as_of_ts,
+            ):
+                if obs.obs_date in chosen or not (obs.value > 0):
+                    continue
+                pulled = _as_utc(obs.pull_timestamp)
+                if pulled is None or pulled < session_settled_utc(ticker, obs.obs_date):
+                    continue  # intraday/unsettled capture: not a close
+                chosen[obs.obs_date] = obs
+        if chosen:
+            book[ticker] = chosen
+    return book
+
+
+@dataclass(frozen=True)
+class ExpiryClose:
+    """Outcome of the expiry-close lookup for one prediction.
+
+    ``status`` is ``priced`` (price + provenance set), ``pending`` (the close
+    may still arrive: write nothing) or ``no_data`` (final, ``note`` says why).
+    """
+
+    status: str
+    price: float | None = None
+    session_date: date | None = None
+    source: str | None = None
+    pull_timestamp: datetime | None = None
+    note: str | None = None
+
+
+def resolve_expiry_close(
+    book: PriceBook,
+    ticker: str,
+    expiry: Any,
+    *,
+    created_at: Any,
+    now: datetime,
+) -> ExpiryClose:
+    """Apply EXPIRY_CLOSE_RULE (see the block comment above) to one prediction."""
+    expiry_d = _as_date(expiry)
+    session = expiry_session_date(ticker, expiry_d)
+    if session is None:
+        return ExpiryClose("no_data", note=NOTE_NO_PRICE)
+    created = _as_utc(created_at)
+    if created is not None and created >= session_close_utc(ticker, session):
+        return ExpiryClose("no_data", session_date=session, note=NOTE_NO_SESSION)
+    obs = book.get(ticker, {}).get(session)
+    if obs is not None:
+        return ExpiryClose(
+            "priced", price=float(obs.value), session_date=session,
+            source=obs.source, pull_timestamp=obs.pull_timestamp,
+        )
+    deadline = session_settled_utc(ticker, session) + timedelta(days=EXPIRY_CLOSE_GRACE_DAYS)
+    if now < deadline:
+        return ExpiryClose("pending", session_date=session)
+    return ExpiryClose("no_data", session_date=session, note=NOTE_NO_PRICE)
+
+
+def classify_outcome(
+    direction: str, entry: float, actual: float, expected: float | None,
+) -> tuple[str, float, float] | None:
+    """``(verdict, actual_move_pct, pnl_pct)`` or None for a non-directional row."""
+    actual_move = (actual - entry) / entry * 100
+    if direction == "CALL":
+        hit, pnl = actual > entry, actual_move
+    elif direction == "PUT":
+        hit, pnl = actual < entry, -actual_move
+    else:
+        return None
+    exp_move = expected if expected else 1.0
+    if hit and abs(actual_move) >= abs(exp_move) * 0.5:
+        return "hit", actual_move, pnl
+    if hit:
+        return "partial", actual_move, pnl
+    return "miss", actual_move, pnl
+
+
+def _score_note(entry: float, res: ExpiryClose, actual_move: float) -> str:
+    return (
+        f"Entry ${entry:.2f} → Actual ${res.price:.2f} ({actual_move:+.1f}%) "
+        f"[close {res.session_date} {res.source}, {EXPIRY_CLOSE_RULE}]"
+    )
 
 
 def _parse_signals_blob(blob: Any) -> dict[str, Any] | None:
@@ -273,19 +412,34 @@ def score_one_chunk(
     conn,
     *,
     engine: Engine,
-    prices: dict,
+    prices: PriceBook,
     today: date,
     chunk_size: int,
-) -> dict[str, int]:
+    now: datetime | None = None,
+    after: tuple[Any, str] | None = None,
+) -> dict[str, Any]:
     """Score one chunk of expired-and-scoreable pending predictions.
 
-    Returns counters {scored, hits, misses, partials, skipped, no_data}
-    for the chunk. The caller accumulates across chunks.
+    Returns counters {scored, hits, misses, partials, skipped, no_data,
+    pending_price, fetched, cursor} for the chunk. The caller accumulates
+    across chunks and passes ``cursor`` back as ``after``.
+
+    ``prices`` is a :data:`PriceBook` from :func:`load_expiry_closes`;
+    ``now`` (default: midnight UTC starting ``today``) is the instant the
+    grace window in :func:`resolve_expiry_close` is measured against.
+
+    Rows are walked in ``(expiry, id)`` order from ``after`` (keyset). A row
+    whose close has not arrived yet stays 'pending' and is not refetched by
+    a later chunk of the same run -- without the cursor such rows would sit at
+    the head of every chunk and the run would never finish.
 
     Each call must run inside its own ``engine.begin()`` block — that
     way the row-level locks released between chunks instead of being
     held for the entire 2.27M-row scoring run.
     """
+    if now is None:
+        now = datetime.combine(today, time.min, timezone.utc)
+    after_expiry, after_id = after if after is not None else (None, None)
     chunk = conn.execute(text("""
         SELECT id, ticker, direction, target_price, entry_price, expiry,
                confidence, expected_move_pct, model_name,
@@ -295,16 +449,28 @@ def score_one_chunk(
           AND expiry <= :today
           AND entry_price IS NOT NULL
           AND entry_price > 0
-        ORDER BY expiry
+          AND (:after_expiry IS NULL OR expiry > :after_expiry
+               OR (expiry = :after_expiry AND id > :after_id))
+        ORDER BY expiry, id
         LIMIT :chunk_size
-    """), {"today": today, "chunk_size": int(chunk_size)}).fetchall()
+    """), {
+        "today": today, "chunk_size": int(chunk_size),
+        "after_expiry": after_expiry, "after_id": after_id,
+    }).fetchall()
 
-    counters = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
-                "skipped": 0, "no_data": 0, "fetched": len(chunk),
-                # Rows the chunk WHERE should already have excluded. Counted
-                # separately from `skipped` so a non-zero value is visible as
-                # the defect it would be, rather than hiding in the noise.
-                "unscorable_entry_price": 0}
+    counters: dict[str, Any] = {
+        "scored": 0, "hits": 0, "misses": 0, "partials": 0,
+        "skipped": 0, "no_data": 0, "fetched": len(chunk),
+        # Rows the chunk WHERE should already have excluded. Counted
+        # separately from `skipped` so a non-zero value is visible as
+        # the defect it would be, rather than hiding in the noise.
+        "unscorable_entry_price": 0,
+        # Expired rows whose expiry close has not been captured yet and
+        # are still inside the grace window: left 'pending', nothing
+        # written (the bug this replaces wrote verdict='no_data' here).
+        "pending_price": 0,
+        "cursor": (chunk[-1][5], chunk[-1][0]) if chunk else None,
+    }
 
     for r in chunk:
         (
@@ -333,39 +499,27 @@ def score_one_chunk(
             counters["no_data"] += 1
             continue
 
-        actual = get_price_for_date(prices, ticker, expiry)
-        if actual is None:
+        res = resolve_expiry_close(prices, ticker, expiry, created_at=created_at, now=now)
+        if res.status == "pending":
+            counters["pending_price"] += 1
+            continue
+        if res.status != "priced":
             conn.execute(text("""
                 UPDATE oracle_predictions
                 SET verdict = 'no_data', scored_at = NOW(),
-                    score_notes = 'No price data at expiry'
+                    score_notes = :notes
                 WHERE id = :id
-            """), {"id": pred_id})
+            """), {"id": pred_id, "notes": res.note})
             counters["no_data"] += 1
             continue
 
-        actual_move = (actual - entry) / entry * 100
-
-        if direction == "CALL":
-            hit = actual > entry
-            pnl = actual_move
-        elif direction == "PUT":
-            hit = actual < entry
-            pnl = -actual_move
-        else:
+        actual = res.price
+        outcome = classify_outcome(direction, entry, actual, expected)
+        if outcome is None:
             counters["skipped"] += 1
             continue
-
-        exp_move = expected if expected else 1.0
-        if hit and abs(actual_move) >= abs(exp_move) * 0.5:
-            verdict = "hit"
-            counters["hits"] += 1
-        elif hit:
-            verdict = "partial"
-            counters["partials"] += 1
-        else:
-            verdict = "miss"
-            counters["misses"] += 1
+        verdict, actual_move, pnl = outcome
+        counters[{"hit": "hits", "partial": "partials", "miss": "misses"}[verdict]] += 1
 
         conn.execute(text("""
             UPDATE oracle_predictions
@@ -376,7 +530,7 @@ def score_one_chunk(
         """), {
             "v": verdict, "ap": actual, "am": round(actual_move, 2),
             "pnl": round(pnl, 2), "id": pred_id,
-            "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%)",
+            "notes": _score_note(entry, res, actual_move),
         })
         counters["scored"] += 1
 
@@ -414,6 +568,193 @@ def score_one_chunk(
     return counters
 
 
+# ── Hindsight rescore of the bug-closed no_data rows ───────────────────────
+#
+# The rows the old lookup closed as NOTE_NO_PRICE are final in
+# oracle_predictions and stay exactly as they are: prediction/score rows are
+# immutable. A rescore is an additive record in its own table, one row per
+# (prediction_id, scoring_version), written with ON CONFLICT DO NOTHING so a
+# second run inserts nothing new.
+#
+# It is exploratory hindsight, not a forward score: the rule was settled after
+# these outcomes were observable. Every row carries score_class =
+# 'exploratory_hindsight' and official = FALSE, both pinned by CHECK
+# constraints, so it can never be read as an official (E2) score. Readers of
+# oracle_predictions (scoreboard, calibration, model stats, success lessons)
+# never see these rows, and oracle_models is never touched by a rescore.
+
+RESCORE_TABLE = "oracle_prediction_rescores"
+RESCORE_SCORING_VERSION = "oracle_rescore_hindsight_v1"
+RESCORE_SCORE_CLASS = "exploratory_hindsight"
+
+_RESCORE_DDL = """
+CREATE TABLE IF NOT EXISTS oracle_prediction_rescores (
+    prediction_id TEXT NOT NULL,
+    scoring_version TEXT NOT NULL,
+    score_class TEXT NOT NULL CHECK (score_class = 'exploratory_hindsight'),
+    official BOOLEAN NOT NULL DEFAULT FALSE CHECK (official = FALSE),
+    prior_verdict TEXT NOT NULL,
+    prior_score_notes TEXT,
+    verdict TEXT NOT NULL CHECK (verdict IN ('hit', 'partial', 'miss')),
+    entry_price DOUBLE PRECISION NOT NULL,
+    actual_price DOUBLE PRECISION NOT NULL,
+    actual_move_pct DOUBLE PRECISION NOT NULL,
+    pnl_pct DOUBLE PRECISION NOT NULL,
+    price_session_date DATE NOT NULL,
+    price_source TEXT,
+    price_pull_timestamp TIMESTAMPTZ,
+    expiry_rule TEXT NOT NULL,
+    notes TEXT,
+    rescored_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (prediction_id, scoring_version)
+)
+"""
+
+_RESCORE_INSERT = """
+INSERT INTO oracle_prediction_rescores (
+    prediction_id, scoring_version, score_class, official,
+    prior_verdict, prior_score_notes, verdict,
+    entry_price, actual_price, actual_move_pct, pnl_pct,
+    price_session_date, price_source, price_pull_timestamp,
+    expiry_rule, notes, rescored_at
+) VALUES (
+    :prediction_id, :scoring_version, :score_class, FALSE,
+    :prior_verdict, :prior_score_notes, :verdict,
+    :entry_price, :actual_price, :actual_move_pct, :pnl_pct,
+    :price_session_date, :price_source, :price_pull_timestamp,
+    :expiry_rule, :notes, :rescored_at
+)
+ON CONFLICT (prediction_id, scoring_version) DO NOTHING
+"""
+
+# Only rows the price-lookup bug closed: a NEUTRAL row or a NULL/zero entry is
+# unscorable for its own reason and is not a candidate.
+_RESCORE_CANDIDATES = """
+SELECT p.id, p.ticker, p.direction, p.entry_price, p.expiry,
+       p.expected_move_pct, p.created_at, p.dedup_keep, p.verdict, p.score_notes
+FROM oracle_predictions p
+WHERE p.verdict = 'no_data'
+  AND p.score_notes = :note
+  AND p.entry_price > 0
+  AND p.direction IN ('CALL', 'PUT')
+ORDER BY p.expiry, p.id
+"""
+
+
+def _rescore_table_exists(conn: Any) -> bool:
+    return inspect(conn).has_table(RESCORE_TABLE)
+
+
+def rescore_no_data(engine: Engine, *, apply: bool, now: datetime | None = None) -> dict[str, Any]:
+    """Re-price bug-closed no_data rows under EXPIRY_CLOSE_RULE; project or append.
+
+    Dry run (``apply=False``) runs in a READ ONLY transaction on PostgreSQL and
+    writes nothing anywhere. ``apply=True`` creates the rescore table if needed
+    and appends one row per newly priced prediction; oracle_predictions and
+    oracle_models are never written. Returns the projection either way.
+    """
+    now = now or datetime.now(timezone.utc)
+    pg = engine.dialect.name == "postgresql"
+    with engine.connect() as conn:
+        if pg:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            conn.execute(text("SET LOCAL statement_timeout = '600s'"))
+        candidates = conn.execute(text(_RESCORE_CANDIDATES), {"note": NOTE_NO_PRICE}).fetchall()
+        already: set[str] = set()
+        if _rescore_table_exists(conn):
+            already = {
+                r[0] for r in conn.execute(text(
+                    "SELECT prediction_id FROM oracle_prediction_rescores "
+                    "WHERE scoring_version = :v"
+                ), {"v": RESCORE_SCORING_VERSION}).fetchall()
+            }
+        book: PriceBook = {}
+        if candidates:
+            start = min(_as_date(r[4]) for r in candidates) - timedelta(days=_MAX_SESSION_LOOKBACK_DAYS)
+            end = max(_as_date(r[4]) for r in candidates)
+            book = load_expiry_closes(
+                conn, sorted({r[1] for r in candidates}), start, end, as_of_ts=now,
+            )
+        dedup_verdicts = {
+            r[0]: int(r[1]) for r in conn.execute(text(
+                "SELECT verdict, COUNT(*) FROM oracle_predictions "
+                "WHERE dedup_keep GROUP BY verdict"
+            )).fetchall()
+        }
+        official_dates = {
+            _as_date(r[0]) for r in conn.execute(text(
+                "SELECT DISTINCT expiry FROM oracle_predictions "
+                "WHERE dedup_keep AND verdict IN ('hit', 'miss', 'partial')"
+            )).fetchall()
+        }
+        conn.rollback()
+
+    tally: dict[str, dict[str, int]] = {"dedup_keep": {}, "other": {}}
+    new_dates: set[date] = set()
+    inserts: list[dict[str, Any]] = []
+    for pred_id, ticker, direction, entry, expiry, expected, created_at, keep, prior, notes in candidates:
+        bucket = tally["dedup_keep" if keep else "other"]
+        bucket["candidates"] = bucket.get("candidates", 0) + 1
+        if pred_id in already:
+            bucket["already_rescored"] = bucket.get("already_rescored", 0) + 1
+            continue
+        res = resolve_expiry_close(book, ticker, expiry, created_at=created_at, now=now)
+        if res.status != "priced":
+            key = "still_pending_close" if res.status == "pending" else (
+                "no_session" if res.note == NOTE_NO_SESSION else "still_no_price")
+            bucket[key] = bucket.get(key, 0) + 1
+            continue
+        outcome = classify_outcome(direction, float(entry), res.price, expected)
+        if outcome is None:
+            continue
+        verdict, move, pnl = outcome
+        bucket[verdict] = bucket.get(verdict, 0) + 1
+        if keep:
+            new_dates.add(_as_date(expiry))
+        inserts.append({
+            "prediction_id": pred_id, "scoring_version": RESCORE_SCORING_VERSION,
+            "score_class": RESCORE_SCORE_CLASS, "prior_verdict": prior,
+            "prior_score_notes": notes, "verdict": verdict,
+            "entry_price": float(entry), "actual_price": res.price,
+            "actual_move_pct": round(move, 4), "pnl_pct": round(pnl, 4),
+            "price_session_date": res.session_date, "price_source": res.source,
+            "price_pull_timestamp": res.pull_timestamp,
+            "expiry_rule": EXPIRY_CLOSE_RULE,
+            "notes": _score_note(float(entry), res, move), "rescored_at": now,
+        })
+
+    keep_tally = tally["dedup_keep"]
+    newly_priced_keep = sum(keep_tally.get(v, 0) for v in ("hit", "miss", "partial"))
+    total_keep = sum(dedup_verdicts.values())
+    no_data_after = dedup_verdicts.get("no_data", 0) - newly_priced_keep
+    projection: dict[str, Any] = {
+        "mode": "apply" if apply else "dry_run",
+        "scoring_version": RESCORE_SCORING_VERSION,
+        "score_class": RESCORE_SCORE_CLASS,
+        "expiry_rule": EXPIRY_CLOSE_RULE,
+        "as_of": now.isoformat(),
+        "tickers_with_closes": len(book),
+        "tally": tally,
+        "dedup_keep_verdicts_before": dedup_verdicts,
+        "dedup_keep_no_data_share_before": round(dedup_verdicts.get("no_data", 0) / total_keep, 4) if total_keep else None,
+        "dedup_keep_no_data_share_after": round(no_data_after / total_keep, 4) if total_keep else None,
+        "official_scored_expiry_dates": len(official_dates),
+        "rescored_expiry_dates": len(new_dates),
+        "expiry_dates_scored_combined": len(official_dates | new_dates),
+        "rows_to_append": len(inserts),
+        "rows_appended": 0,
+    }
+
+    if apply and inserts:
+        with engine.begin() as conn:
+            conn.execute(text(_RESCORE_DDL))
+            appended = sum(
+                conn.execute(text(_RESCORE_INSERT), row).rowcount or 0 for row in inserts
+            )
+        projection["rows_appended"] = appended
+    return projection
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -431,12 +772,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--progress-every", type=int, default=10,
         help="Log progress every N chunks (default 10).",
     )
-    return ap.parse_args(argv)
+    ap.add_argument(
+        "--rescore-no-data", action="store_true",
+        help="Re-price rows closed as 'No price data at expiry' under "
+             f"{EXPIRY_CLOSE_RULE} and print the projection. Dry run (read "
+             "only) unless --apply. Skips the normal scoring steps.",
+    )
+    ap.add_argument(
+        "--apply", action="store_true",
+        help=f"With --rescore-no-data: append the results to {RESCORE_TABLE} "
+             "(exploratory hindsight, never official). Never updates "
+             "oracle_predictions.",
+    )
+    args = ap.parse_args(argv)
+    if args.apply and not args.rescore_no_data:
+        ap.error("--apply only applies to --rescore-no-data")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     engine = create_engine(settings.DB_URL)
+
+    if args.rescore_no_data:
+        projection = rescore_no_data(engine, apply=args.apply)
+        print(json.dumps(projection, indent=2, default=str))
+        return
 
     with engine.begin() as conn:
         # ── Step 0: Get all pending predictions ──
@@ -452,24 +813,37 @@ def main(argv: list[str] | None = None) -> None:
         log.info("ORACLE TRADE SCORER")
         log.info("{}", '='*60)
         log.info("Total pending predictions: {}", len(rows))
+        if not rows:
+            log.info("Nothing pending -- done.")
+            return
 
         # Get unique tickers and date range
         tickers = sorted(set(r[1] for r in rows))
         min_date = min(r[4] for r in rows)
         max_expiry = max(r[5] for r in rows)
-        today = date.today()
+        # griddb and the cron host run Etc/UTC; the grace window in
+        # resolve_expiry_close is measured against this instant.
+        now = datetime.now(timezone.utc)
+        today = now.date()
 
         log.info("Tickers: {}", len(tickers))
         log.info("Date range: {} to {}", min_date, max_expiry)
         log.info("Today: {}", today)
 
-        # ── Step 1: Fetch prices ──
-        log.info("\n--- STEP 1: Fetch Prices ---")
-        # Need prices from prediction creation dates through today (for scoring)
-        fetch_start = (min_date - timedelta(days=7)).strftime("%Y-%m-%d")
-        fetch_end = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        prices = fetch_prices(tickers, fetch_start, fetch_end)
+        # ── Step 1: Load expiry closes ──
+        # raw_series through store.observations (SUCCESS, latest vintage,
+        # settled sessions only, nothing dated after today). Bounded to the
+        # tickers and dates the expired pending rows can actually need.
+        log.info("\n--- STEP 1: Load Expiry Closes ({}) ---", EXPIRY_CLOSE_RULE)
+        scoreable = [r for r in rows if r[5] <= today]
+        prices: PriceBook = {}
+        if scoreable:
+            price_start = min(r[5] for r in scoreable) - timedelta(days=_MAX_SESSION_LOOKBACK_DAYS)
+            prices = load_expiry_closes(
+                conn, sorted({r[1] for r in scoreable}), price_start, today, as_of_ts=now,
+            )
+        log.info("  closes loaded for {} of {} tickers", len(prices),
+                 len({r[1] for r in scoreable}))
 
         # ── Step 2: Backfill entry prices ──
         # HISTORICAL-WRITE HOLD: this step used to backfill a missing/zero
@@ -611,9 +985,11 @@ def main(argv: list[str] | None = None) -> None:
     # the complete set: a chunk counters dict growing a new key must never
     # crash main() with a KeyError, it should just be accumulated.
     totals = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
-              "skipped": 0, "no_data": 0, "unscorable_entry_price": 0}
+              "skipped": 0, "no_data": 0, "unscorable_entry_price": 0,
+              "pending_price": 0}
     processed = 0
     chunk_idx = 0
+    cursor = None
     while True:
         chunk_size = args.chunk_size
         if args.max_rows is not None:
@@ -629,10 +1005,13 @@ def main(argv: list[str] | None = None) -> None:
                 prices=prices,
                 today=today,
                 chunk_size=chunk_size,
+                now=now,
+                after=cursor,
             )
 
         chunk_idx += 1
         fetched = chunk_counters.pop("fetched", 0)
+        cursor = chunk_counters.pop("cursor", None)
         # .get(k, 0) rather than totals[k]: score_one_chunk's counters dict
         # is not required to carry exactly the keys totals was seeded
         # with -- a chunk reporting a key totals does not already have
@@ -643,8 +1022,8 @@ def main(argv: list[str] | None = None) -> None:
             totals[k] = totals.get(k, 0) + v
         processed += fetched
 
-        # No more pending rows — done.
-        if fetched == 0:
+        # No more pending rows past the cursor — done.
+        if fetched == 0 or cursor is None:
             break
 
         if chunk_idx % args.progress_every == 0 or fetched < chunk_size:
@@ -660,9 +1039,9 @@ def main(argv: list[str] | None = None) -> None:
     total_scored = totals["hits"] + totals["misses"] + totals["partials"]
     log.info(
         "  Scored: {:,} (Hits: {:,}, Miss: {:,}, Partial: {:,}, "
-        "No-data: {:,}, Skipped: {:,}) across {} chunks",
+        "No-data: {:,}, Skipped: {:,}, Awaiting close: {:,}) across {} chunks",
         total_scored, totals["hits"], totals["misses"], totals["partials"],
-        totals["no_data"], totals["skipped"], chunk_idx,
+        totals["no_data"], totals["skipped"], totals["pending_price"], chunk_idx,
     )
 
     # Re-open a connection for the scorecard reads.

@@ -281,6 +281,18 @@ sqlite3.register_adapter(date, lambda d: d.isoformat())
 sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
 
 
+def _settled_book(ticker, expiry, price):
+    """A PriceBook holding ``ticker``'s settled close for ``expiry``'s session."""
+    from datetime import datetime, time, timezone
+
+    from scripts.score_oracle_trades import close_series_id, expiry_session_date
+    from store.observations import Observation
+
+    session = expiry_session_date(ticker, expiry)
+    pulled = datetime.combine(session + timedelta(days=1), time(6), timezone.utc)
+    return {ticker: {session: Observation(close_series_id(ticker), session, price, pulled, "TIINGO")}}
+
+
 def _scoring_db(rows):
     raw = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
     raw.execute(
@@ -318,13 +330,13 @@ class TestScorerExcludesNullEntry:
             ("null-entry", "AAPL", "CALL", None, None, yesterday,
              0.6, 2.0, "m", "{}", yesterday, "pending"),
             ("priced", "MSFT", "CALL", None, 100.0, yesterday,
-             0.6, 2.0, "m", "{}", yesterday, "pending"),
+             0.6, 2.0, "m", "{}", yesterday - timedelta(days=7), "pending"),
         ])
 
         counters = score_one_chunk(
             _SqliteConn(raw),
             engine=None,
-            prices={"MSFT": {yesterday: 110.0}},
+            prices=_settled_book("MSFT", yesterday, 110.0),
             today=date.today(),
             chunk_size=100,
         )
@@ -353,7 +365,7 @@ class TestScorerExcludesNullEntry:
         counters = score_one_chunk(
             _SqliteConn(raw),
             engine=None,
-            prices={"AAPL": {yesterday: 110.0}},
+            prices=_settled_book("AAPL", yesterday, 110.0),
             today=date.today(),
             chunk_size=100,
         )

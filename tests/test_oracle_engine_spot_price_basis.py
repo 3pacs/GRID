@@ -5,8 +5,8 @@ The value this method returns becomes ``entry_price`` on new
 ``YF:{ticker}:adj_close`` over ``YF:{ticker}:close`` -- silently returning a
 dividend/split-adjusted price where the primary source
 (``options_daily_signals.spot_price``) and the exit-side scorer
-(``scripts/score_oracle_trades.py``'s ``fetch_prices()``, ``auto_adjust=False``
-since PR #516) are both raw. Comparing a raw exit price against an adjusted
+(``scripts/score_oracle_trades.py``, which reads ``YF:{ticker}:close`` through
+``store/observations.py`` since S1 / oracle_expiry_close_v2) are both raw. Comparing a raw exit price against an adjusted
 entry price manufactures a spurious return equal to the cumulative
 adjustment factor -- the same mixed-basis bug PR #503 fixed for
 ``intelligence/trust_scorer.py`` and ``trading/options_tracker.py``.
@@ -14,13 +14,12 @@ adjustment factor -- the same mixed-basis bug PR #503 fixed for
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pandas as pd
 import pytest
 
 from oracle.engine import OracleEngine
-from scripts.score_oracle_trades import fetch_prices
+from scripts.score_oracle_trades import close_series_id
 
 
 class _FakeConn:
@@ -90,30 +89,22 @@ def test_get_spot_price_returns_none_without_raw_close(monkeypatch):
     assert engine._get_spot_price("AAPL") is None
 
 
-def _single_ticker_frame(dates, close):
-    return pd.DataFrame({"Close": list(close)}, index=pd.to_datetime(dates))
-
-
 def test_entry_and_exit_price_share_the_same_raw_basis(monkeypatch):
-    """Integration: the fixed entry-price fallback agrees with the fixed scorer.
+    """Integration: the entry-price fallback and the exit-side scorer agree.
 
-    entry_price (OracleEngine._get_spot_price, this fix) and the actual/exit
-    price (score_oracle_trades.fetch_prices, PR #516) must land on the same
-    raw close -- proving the two independently-fixed call sites are now on a
-    consistent basis, not just individually "raw" in isolation.
+    entry_price (OracleEngine._get_spot_price) and the actual/exit price
+    (score_oracle_trades.load_expiry_closes, which reads close_series_id())
+    must land on the same raw close series -- not just individually "raw"
+    in isolation.
     """
-    engine = _make_engine(monkeypatch, {
-        "YF:AAPL:close": 182.0,
-        "YF:AAPL:adj_close": 178.4,
-    })
+    series = {"YF:AAPL:close": 182.0, "YF:AAPL:adj_close": 178.4}
+    engine = _make_engine(monkeypatch, series)
     entry_price = engine._get_spot_price("AAPL")
 
-    frame = _single_ticker_frame(["2026-03-10", "2026-03-11"], [180.0, 182.0])
-    with patch("yfinance.download", return_value=frame):
-        prices = fetch_prices(["AAPL"], "2026-03-01", "2026-03-12")
-
-    assert any(v == pytest.approx(entry_price) for v in prices["AAPL"].values()), (
-        "entry price (OracleEngine._get_spot_price) must match a raw close "
-        "actually reachable via the exit-side scorer (fetch_prices) — both "
-        "must agree on 182.0, the raw close, not 178.4, the adjusted one"
+    exit_series = close_series_id("AAPL")
+    assert exit_series == "YF:AAPL:close"
+    assert series[exit_series] == pytest.approx(entry_price), (
+        "entry price (OracleEngine._get_spot_price) must match the raw close "
+        "the exit-side scorer reads — both must agree on 182.0, the raw close, "
+        "not 178.4, the adjusted one"
     )

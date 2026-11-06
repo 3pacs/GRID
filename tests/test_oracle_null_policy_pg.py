@@ -476,20 +476,23 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     for pid, row in before.items():
         assert row is not None, pid
 
-    # Stub: the real yfinance-backed fetch_prices is never called over the
-    # network. Any ticker this run asks about that we have no opinion on
-    # (i.e. every ticker except ours) resolves to "no price", which is a
-    # safe, honest outcome for those unrelated rows on a disposable test
-    # database -- not a claim this test makes about them.
-    def _stub_fetch_prices(tickers, start, end):
+    # Stub: the real raw_series-backed load_expiry_closes is not exercised
+    # here. Any ticker this run asks about that we have no opinion on
+    # (i.e. every ticker except ours) resolves to "no close", which leaves
+    # those unrelated rows pending (inside the grace window) or closes them
+    # honestly -- not a claim this test makes about them.
+    from store.observations import Observation
+
+    def _stub_load_expiry_closes(conn, tickers, start, end, *, as_of_ts=None):
+        pulled = datetime.now(timezone.utc)
         return {
             ticker: {
-                expiry_a: 999.0, expiry_b: 999.0, expiry_c: 999.0,
-                expiry_d: 999.0, date.today(): 999.0,
+                d: Observation(sot.close_series_id(ticker), d, 999.0, pulled, "TIINGO")
+                for d in (expiry_a, expiry_b, expiry_c, expiry_d, date.today())
             },
         }
 
-    monkeypatch.setattr(sot, "fetch_prices", _stub_fetch_prices)
+    monkeypatch.setattr(sot, "load_expiry_closes", _stub_load_expiry_closes)
     monkeypatch.setattr(sot, "create_engine", lambda *a, **kw: pg_engine)
 
     sot.main(["--chunk-size", "500"])

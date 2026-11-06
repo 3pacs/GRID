@@ -69,7 +69,7 @@ def _measured_entry_price(
     Source and basis: ``options_daily_signals.spot_price`` is the same raw
     (unadjusted) series ``oracle/engine.py:_get_spot_price`` writes as
     ``entry_price`` and that ``scripts/score_oracle_trades.py`` scores against
-    (``fetch_prices(..., auto_adjust=False)``, PR #516). Mixing an adjusted
+    (raw ``YF:{ticker}:close`` via ``load_expiry_closes()``). Mixing an adjusted
     entry against a raw exit manufactures a dividend/split-sized return out of
     nothing — see ``tests/test_oracle_engine_spot_price_basis.py``.
 
