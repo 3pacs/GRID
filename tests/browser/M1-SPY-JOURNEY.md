@@ -15,7 +15,9 @@ From the repository root:
 
 ```sh
 node --test tests/browser/spy_contract.test.mjs
+node --test tests/browser/acceptance_gates.test.mjs
 python -m unittest discover -s tests/browser/fixture_api -p test_preload_coverage.py
+node --test tests/browser/requestfailed.browser.test.mjs
 node tests/browser/run_evidence.mjs --tree-label m1-spy --roles admin --journeys spy-options --scenarios healthy,partial,empty,unavailable,error --out /path/to/local/evidence
 ```
 
@@ -26,6 +28,12 @@ discovered without downloads. Local servers bind loopback ports 8001/5174;
 occupied ports cause refusal. The runner launches Vite directly through Node
 and closes its browser/server children afterward. It does not read a real
 credential: it submits the fixture login form with a fixed synthetic password.
+Run browser commands serially: they use the same two loopback ports. The browser
+regression deliberately aborts only local Options Signals requests with
+`ERR_CONNECTION_FAILED`; it expects the ordinary runner to exit 1 while all
+nine healthy UI assertions still pass. Receipts are retained in a temporary
+directory (or `GRID_GATE_TEST_OUT`). Its injectable runner entry is test-only;
+the ordinary CLI does not enable request-failure injection.
 
 ## Journey and assertions
 
@@ -67,7 +75,10 @@ and PWA commits, dirty paths, per-file SHA256 manifests before/after, actual
 served Vite-module hashes, relevant synthetic API response bodies/statuses,
 assertion results, final URL, blocked external requests and console/network
 logs. Nonzero exit means a runner/assertion/readiness failure, changed source,
-missing Gamma transport receipt, unexpected bootstrap/SPY API failure, or empty journey selection. A completed
+missing Gamma transport receipt, unexpected bootstrap/SPY API/connection failure,
+incomplete role/scenario matrix, or empty journey selection. Nonempty supported
+role/scenario lists are validated before startup or output-directory creation.
+A completed
 capture is evidence to review, not an independent reviewer verdict.
 
 The service worker is bypassed so API requests and payloads are observable;
@@ -101,6 +112,15 @@ Unknown/malformed markers or any other bootstrap/SPY API failure fail the M1
 network gate. Other legacy journeys retain their separate, unqualified status.
 Thus a passing SPY journey still does **not** claim a fully green app network
 or coverage of the 14 omitted product surfaces.
+
+Local API `requestfailed` events are saved with method, originating/current
+journey and browser error in `requestfailed.jsonl`, including failures without
+an HTTP response. They never inherit the HTTP 501 exception. Unexpected
+bootstrap/SPY failures reject the gate. The only abort exceptions are exact
+`net::ERR_ABORTED` during explicit page teardown, or cancellation of the
+Gamma state GET when its originating view has been left (the component's
+documented unmount cleanup). A connection failure still rejects acceptance
+during teardown; a Signals abort never receives the Gamma unmount exception.
 
 The ten September evidence directories are historical supporting runs with
 different source compositions. Their screenshots do not qualify this source.

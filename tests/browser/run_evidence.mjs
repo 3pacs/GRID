@@ -34,7 +34,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, existsSync, read
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveBrowserExecutable, sourceIdentity, classifyApiFailures } from './harness_config.mjs';
+import { resolveBrowserExecutable, sourceIdentity, classifyApiFailures, classifyRequestFailures, parseChoiceList, hasCompleteResultMatrix } from './harness_config.mjs';
 import { runSpyJourney } from './spy_journey.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,8 +76,8 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const PWA_DIR = path.resolve(args['pwa-dir']);
 const TREE_LABEL = args['tree-label'];
-const SCENARIOS = args.scenarios.split(',').map((s) => s.trim()).filter(Boolean);
-const ROLES = args.roles.split(',').map((s) => s.trim()).filter(Boolean);
+const SCENARIOS = parseChoiceList(args.scenarios, 'scenarios', ['healthy', 'partial', 'empty', 'unavailable', 'error']);
+const ROLES = parseChoiceList(args.roles, 'roles', ['admin', 'contributor']);
 const JOURNEY_FILTER = args.journeys
     ? new Set(args.journeys.split(',').map((s) => s.trim()).filter(Boolean))
     : null;
@@ -301,7 +301,7 @@ function detectCrash(bodyText) {
 
 // ── Main per-(role, scenario) run ────────────────────────────────────
 
-async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode: null }) {
+async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode: null }, requestFailureControl = null) {
     mkdirSync(outDir, { recursive: true });
     const consoleLogPath = path.join(outDir, 'console.jsonl');
     const networkLogPath = path.join(outDir, 'network.jsonl');
@@ -328,18 +328,34 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
     // Fail closed on external requests, including links/providers accidentally
     // introduced by a view. Only the two runner-owned loopback servers are allowed.
     const blockedRequests = [];
+    const requestFailures = [];
+    let tearingDown = false;
     let activeJourney = 'bootstrap';
     const requestJourneys = new WeakMap();
     await page.setRequestInterception(true);
     page.on('request', request => {
         requestJourneys.set(request, activeJourney);
         const url = new URL(request.url());
+        const controlFailure = requestFailureControl?.(url);
+        if (controlFailure) { request.abort(controlFailure); return; }
         if (['data:', 'blob:', 'about:'].includes(url.protocol) ||
             [PWA_BASE, FIXTURE_BASE].includes(url.origin)) request.continue();
         else { blockedRequests.push(request.url()); request.abort(); }
     });
     const moduleResponses = [];
     const fixtureResponses = [];
+
+    page.on('requestfailed', request => {
+        const url = new URL(request.url());
+        if (![PWA_BASE, FIXTURE_BASE].includes(url.origin) || !url.pathname.startsWith('/api/')) return;
+        const failure = {
+            ts: new Date().toISOString(), method: request.method(), url: request.url(),
+            journey: requestJourneys.get(request) || 'bootstrap', active_journey: activeJourney,
+            error_text: request.failure()?.errorText || 'unknown request failure', teardown: tearingDown,
+        };
+        requestFailures.push(failure);
+        appendFileSync(path.join(outDir, 'requestfailed.jsonl'), JSON.stringify(failure) + '\n');
+    });
 
     page.on('console', (msg) => {
         const type = msg.type();
@@ -444,18 +460,23 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
 
     summary.served_modules = await Promise.all(moduleResponses);
     summary.fixture_responses = await Promise.all(fixtureResponses);
+    // Observe requestfailed through page closure before calculating verdicts.
+    // Only ERR_ABORTED during this explicit teardown is an expected abort.
+    tearingDown = true;
+    await page.close();
     summary.api_failures = classifyApiFailures(summary.fixture_responses, scenario, OMITTED_PRELOAD_PATHS);
     summary.unexpected_api_failures = summary.api_failures.filter(r => r.classification === 'unexpected_api_failure');
+    summary.request_failures = classifyRequestFailures(requestFailures);
+    summary.unexpected_request_failures = summary.request_failures.filter(r => r.classification === 'unexpected_request_failure');
     summary.preload_fixture_coverage = PRELOAD_COVERAGE;
     summary.spy_network_gate_passed = !summary.journeys['spy-options'] ||
-        !summary.unexpected_api_failures.some(r => ['bootstrap', 'spy-options'].includes(r.journey));
+        ![...summary.unexpected_api_failures, ...summary.unexpected_request_failures].some(r => ['bootstrap', 'spy-options'].includes(r.journey));
     summary.transport_evidence_complete = !summary.journeys['spy-options'] ||
         summary.fixture_responses.some(r => r.url.endsWith('/gamma-watch/state') && r.body);
     summary.blocked_requests = blockedRequests;
     summary.source_after = sourceIdentity(REPO_ROOT, ['tests/browser']);
     summary.pwa_source_after = sourceIdentity(PWA_DIR, ['src']);
     summary.source_unchanged = summary.source_before.sha256 === summary.source_after.sha256 && summary.pwa_source_before.sha256 === summary.pwa_source_after.sha256;
-    await page.close();
     summary.finished_at = new Date().toISOString();
     writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2));
     return summary;
@@ -475,7 +496,7 @@ function countJsonlLines(p, predicate) {
 
 // ── Entry point ───────────────────────────────────────────────────────
 
-async function main() {
+export async function main({ requestFailureControl = null } = {}) {
     let puppeteer;
     try {
         puppeteer = await import('puppeteer-core');
@@ -521,7 +542,7 @@ async function main() {
                 });
 
                 const outDir = path.join(OUT_ROOT, `${role}-${scenario}`);
-                const summary = await runOne(browserInstance, role, scenario, outDir, fixtureChild);
+                const summary = await runOne(browserInstance, role, scenario, outDir, fixtureChild, requestFailureControl);
                 results.push(summary);
             } catch (err) {
                 console.error(`role=${role} scenario=${scenario} failed: ${err}`);
@@ -534,20 +555,22 @@ async function main() {
         }
     }
 
+    const matrixComplete = hasCompleteResultMatrix(results, ROLES, SCENARIOS);
     writeFileSync(path.join(OUT_ROOT, 'run_index.json'), JSON.stringify({
         tree_label: TREE_LABEL,
         pwa_dir: PWA_DIR,
         generated_at: new Date().toISOString(),
+        matrix_complete: matrixComplete,
         results,
     }, null, 2));
 
     console.log(`\nDone. Evidence written under ${OUT_ROOT}`);
-    if (results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !r.spy_network_gate_passed || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.checks?.some(c => !c.passed)))) {
+    if (!matrixComplete || results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !r.spy_network_gate_passed || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.checks?.some(c => !c.passed)))) {
         process.exitCode = 1;
     }
 }
 
-main().catch((err) => {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((err) => {
     console.error(err);
     process.exit(1);
 });

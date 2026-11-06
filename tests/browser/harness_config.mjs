@@ -3,6 +3,21 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 
+export function parseChoiceList(value, flag, supported) {
+    if (typeof value !== 'string') throw new Error(`--${flag} requires a nonempty list`);
+    const values = [...new Set(value.split(',').map(v => v.trim()).filter(Boolean))];
+    if (values.length === 0) throw new Error(`--${flag} must select at least one value`);
+    for (const v of values) if (!supported.includes(v)) throw new Error(`--${flag}: unsupported value ${v}`);
+    return values;
+}
+
+export function hasCompleteResultMatrix(results, roles, scenarios) {
+    const expected = new Set(roles.flatMap(role => scenarios.map(scenario => JSON.stringify([role, scenario]))));
+    const actual = results.map(r => JSON.stringify([r.role, r.scenario]));
+    return expected.size > 0 && results.length === expected.size &&
+        new Set(actual).size === expected.size && actual.every(pair => expected.has(pair));
+}
+
 export function resolveBrowserExecutable(explicit, env = process.env, platform = process.platform) {
     const override = explicit || env.GRID_BROWSER_EXECUTABLE;
     if (override) {
@@ -56,6 +71,26 @@ export function classifyApiFailures(responses, scenario, omittedPaths) {
             r.status === 503 && r.body?.status === 'unavailable' && r.body?.data === null) classification = 'expected_gamma_collector_unavailable';
         else if (pathname === '/api/v1/gamma-watch/state' && scenario === 'error' &&
             r.status === 502 && r.body?.error === 'synthetic upstream transport failure') classification = 'expected_gamma_transport_error';
+        return { ...r, classification };
+    });
+}
+
+export function classifyRequestFailures(failures) {
+    return failures.map(r => {
+        let classification = 'unexpected_request_failure';
+        if (r.error_text === 'net::ERR_ABORTED' && r.teardown === true) {
+            classification = 'expected_browser_teardown_abort';
+        } else if (r.error_text === 'net::ERR_ABORTED' &&
+            new URL(r.url).pathname === '/api/v1/gamma-watch/state' &&
+            r.method === 'GET' && typeof r.journey === 'string' && r.journey.length > 0 &&
+            typeof r.active_journey === 'string' && r.active_journey.length > 0 &&
+            r.journey !== 'bootstrap' && r.active_journey !== 'bootstrap' &&
+            r.journey !== r.active_journey) {
+            // GammaWatch's effect cancels its state-only GET on unmount.
+            classification = 'expected_gamma_unmount_abort';
+        }
+        // A transport failure never inherits the HTTP 501 allowlist: no
+        // HTTP response/body was received to establish that fixture omission.
         return { ...r, classification };
     });
 }
