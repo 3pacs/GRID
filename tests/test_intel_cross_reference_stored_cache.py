@@ -21,7 +21,6 @@ Two layers of tests:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
@@ -216,7 +215,7 @@ def test_endpoint_serves_stored_result_without_compute(monkeypatch):
     monkeypatch.setattr(xref, "load_recent_report", lambda engine, max_age_seconds: stored)
     monkeypatch.setattr(xref, "run_all_checks", _run)
 
-    out = asyncio.run(router.get_cross_reference(fast=True, _token="t"))
+    out = router.get_cross_reference(fast=True, _token="t")
 
     assert run_calls["n"] == 0, "stored hit must not trigger full compute"
     assert out["checks"][0]["name"] == "STORED"
@@ -241,7 +240,7 @@ def test_endpoint_falls_back_to_compute_on_store_miss(monkeypatch):
     monkeypatch.setattr(xref, "load_recent_report", lambda engine, max_age_seconds: None)
     monkeypatch.setattr(xref, "run_all_checks", _run)
 
-    out = asyncio.run(router.get_cross_reference(fast=True, _token="t"))
+    out = router.get_cross_reference(fast=True, _token="t")
 
     assert run_calls["n"] == 1, "store miss must fall back to full compute"
     assert out["checks"][0]["name"] == "COMPUTED"
@@ -267,7 +266,7 @@ def test_endpoint_fast_false_always_computes_and_skips_store(monkeypatch):
     monkeypatch.setattr(xref, "load_recent_report", _load)
     monkeypatch.setattr(xref, "run_all_checks", _run)
 
-    out = asyncio.run(router.get_cross_reference(fast=False, _token="t"))
+    out = router.get_cross_reference(fast=False, _token="t")
 
     assert store_calls["n"] == 0, "fast=False must not consult the store"
     assert run_calls["n"] == 1
@@ -290,8 +289,8 @@ def test_endpoint_inmem_cache_short_circuits_second_call(monkeypatch):
     monkeypatch.setattr(xref, "run_all_checks",
                         lambda engine, skip_narrative=False: _report([]))
 
-    first = asyncio.run(router.get_cross_reference(fast=True, _token="t"))
-    second = asyncio.run(router.get_cross_reference(fast=True, _token="t"))
+    first = router.get_cross_reference(fast=True, _token="t")
+    second = router.get_cross_reference(fast=True, _token="t")
 
     assert store_calls["n"] == 1, "second call should hit in-memory cache"
     assert first == second
@@ -307,7 +306,7 @@ def test_endpoint_swallows_errors_and_returns_safe_shape(monkeypatch):
     monkeypatch.setattr(xref, "load_recent_report", _boom)
     monkeypatch.setattr(xref, "run_all_checks", _boom)
 
-    out = asyncio.run(router.get_cross_reference(fast=True, _token="t"))
+    out = router.get_cross_reference(fast=True, _token="t")
     assert out["checks"] == []
     assert out["red_flags"] == []
     assert "error" in out

@@ -10,6 +10,8 @@ Contains:
 
 from __future__ import annotations
 
+import os
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
@@ -18,7 +20,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from intelligence.actors.db import (
+    _ICIJ_CATEGORIES,
     _ensure_tables,
+    _load_actor_by_id,
     _load_actors_from_db,
     _seed_known_actors,
 )
@@ -72,6 +76,44 @@ _KEYWORD_SECTORS: list[tuple[list[str], str]] = [
 ]
 
 
+# One compiled alternation per sector, same (substring) semantics as the old
+# ``any(kw in searchable ...)`` loop, evaluated in C instead of ~80 Python
+# ``in`` checks per actor.
+_KEYWORD_SECTOR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile("|".join(re.escape(kw) for kw in keywords)), label)
+    for keywords, label in _KEYWORD_SECTORS
+]
+
+# Bulk-imported screening / leak lists. They hold ~3.4M rows on grid-svr
+# (2026-11-06: pep 549K, person_of_interest 543K, entity_of_interest 418K,
+# donor 145K, sanctioned 43K, ofac_sanctioned 19K, plus 1.6M ICIJ rows in
+# icij_* categories and ~99K more filed as institution/individual with
+# source='icij'). All sit at the 0.5 default influence with no inline
+# connections, so they add nothing to the influence graph -- but excluding
+# only the icij_* categories left 1.86M actors, and building that graph
+# (1.86M Actor objects, a keyword scan each, and a 1.86M-id ANY() join)
+# froze the single-process API for minutes. The curated graph is ~39K.
+GRAPH_EXCLUDED_CATEGORIES: frozenset[str] = _ICIJ_CATEGORIES | frozenset({
+    "icij_other",
+    "pep",
+    "person_of_interest",
+    "entity_of_interest",
+    "donor",
+    "sanctioned",
+    "ofac_sanctioned",
+})
+GRAPH_EXCLUDED_SOURCES: frozenset[str] = frozenset({"icij"})
+
+
+def _graph_max_actors() -> int:
+    """Hard cap on graph size so a future bulk import can't blow it up again."""
+    try:
+        value = int(os.environ.get("GRID_ACTOR_GRAPH_MAX_ACTORS", "60000"))
+    except ValueError:
+        value = 60000
+    return max(value, 100)
+
+
 def _infer_sector(actor: Actor) -> str:
     """Infer a sector label from an actor's category, title, and positions."""
     # Direct category match first
@@ -84,8 +126,8 @@ def _infer_sector(actor: Actor) -> str:
         " ".join(str(p) for p in actor.known_positions).lower(),
         " ".join(str(b) for b in actor.board_seats).lower(),
     ])
-    for keywords, label in _KEYWORD_SECTORS:
-        if any(kw in searchable for kw in keywords):
+    for pattern, label in _KEYWORD_SECTOR_PATTERNS:
+        if pattern.search(searchable):
             return label
 
     return sector or "Other"
@@ -170,8 +212,11 @@ def build_actor_graph(
 
     Parameters:
         engine: SQLAlchemy engine.
-        exclude_categories: Categories to skip (default uses db.py default
-            which excludes ICIJ bulk data).
+        exclude_categories: Categories to skip (default
+            :data:`GRAPH_EXCLUDED_CATEGORIES`: ICIJ + bulk screening lists;
+            the default also skips ``source='icij'`` rows). The graph is
+            always capped at ``GRID_ACTOR_GRAPH_MAX_ACTORS`` (highest
+            influence first).
 
     Returns:
         dict with keys: nodes, links, metadata.
@@ -182,13 +227,23 @@ def build_actor_graph(
     _ensure_tables(engine)
 
     # Load base actors from DB (fall back to _KNOWN_ACTORS if empty)
-    load_kwargs: dict = {}
-    if exclude_categories is not None:
+    max_actors = _graph_max_actors()
+    load_kwargs: dict = {"limit": max_actors}
+    if exclude_categories is None:
+        load_kwargs["exclude_categories"] = GRAPH_EXCLUDED_CATEGORIES
+        load_kwargs["exclude_sources"] = GRAPH_EXCLUDED_SOURCES
+    else:
         load_kwargs["exclude_categories"] = exclude_categories
     actors = _load_actors_from_db(engine, **load_kwargs)
     if not actors:
         _seed_known_actors(engine)
         actors = _load_actors_from_db(engine, **load_kwargs)
+    if len(actors) >= max_actors:
+        log.warning(
+            "Actor graph hit its {n}-actor cap — a new bulk category may need "
+            "adding to GRAPH_EXCLUDED_CATEGORIES (or raise GRID_ACTOR_GRAPH_MAX_ACTORS)",
+            n=max_actors,
+        )
 
     # Merge dynamic insiders
     dynamic_insiders = _resolve_dynamic_insiders(engine)
@@ -322,9 +377,8 @@ def find_connected_actions(
     _ensure_tables(engine)
     results: list[dict] = []
 
-    # Load the target actor
-    actors = _load_actors_from_db(engine)
-    target = actors.get(actor_id)
+    # Load the target actor (point lookup; the table holds millions of rows)
+    target = _load_actor_by_id(engine, actor_id)
     if not target:
         log.warning("Actor {a} not found", a=actor_id)
         return results

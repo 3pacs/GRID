@@ -534,12 +534,11 @@ def test_intel_network_caps_total_nodes_to_bound_runaway_traversal(pg_engine: En
 # closes.
 
 def test_get_actor_network_cached_endpoint_stamps_source_and_survives_cache_hit(pg_engine: Engine, test_ids, monkeypatch):
-    import asyncio
 
     from api.routers import intelligence_actors as router
 
     monkeypatch.setattr(router, "get_db_engine", lambda: pg_engine)
-    router._actor_graph_cache.clear()
+    router.clear_actor_graph()
 
     aid = f"prov_router_pg_{uuid.uuid4().hex[:10]}_cachedgraph"
     test_ids.append(aid)
@@ -549,15 +548,18 @@ def test_get_actor_network_cached_endpoint_stamps_source_and_survives_cache_hit(
         _insert_actor(conn, actor_id=aid, name="Cached Graph Actor", provenance=PROVENANCE_OBSERVED, influence_score=0.9)
 
     try:
-        result1 = asyncio.run(router.get_actor_network(limit=500, sector=None, _token="t"))
+        # The endpoint never builds inline (cold -> "building" payload);
+        # build once the way the startup warmer / background rebuild does.
+        assert router.get_full_actor_graph(wait=True) is not None
+        result1 = router.get_actor_network(limit=500, sector=None, _token="t")
         node1 = next(n for n in result1["nodes"] if n["id"] == aid)
         assert node1["source"] == SOURCE_OBSERVED
 
         # Second call within the 30-minute TTL window is a cache hit, not a
         # rebuild -- the cached payload must still carry the same stamped
         # provenance, not something stale or missing the field entirely.
-        result2 = asyncio.run(router.get_actor_network(limit=500, sector=None, _token="t"))
+        result2 = router.get_actor_network(limit=500, sector=None, _token="t")
         node2 = next(n for n in result2["nodes"] if n["id"] == aid)
         assert node2["source"] == SOURCE_OBSERVED
     finally:
-        router._actor_graph_cache.clear()
+        router.clear_actor_graph()

@@ -11,7 +11,6 @@ style fields instead of silence).
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -32,7 +31,7 @@ class TestMilestoneScorecardHonestyNote:
         engine = _engine_with_max_obs_date(date(2026, 4, 11))
         with patch.object(ia, "get_db_engine", return_value=engine), \
              patch("intelligence.milestone_tracker.scan_all_tickers", return_value=[]):
-            out = asyncio.run(ia.get_milestone_scorecard(_token="t"))
+            out = ia.get_milestone_scorecard(_token="t")
 
         assert out["note"] == "AlphaVantage inputs inactive as of 2026-04-11"
 
@@ -40,7 +39,7 @@ class TestMilestoneScorecardHonestyNote:
         engine = _engine_with_max_obs_date(None)
         with patch.object(ia, "get_db_engine", return_value=engine), \
              patch("intelligence.milestone_tracker.scan_all_tickers", return_value=[]):
-            out = asyncio.run(ia.get_milestone_scorecard(_token="t"))
+            out = ia.get_milestone_scorecard(_token="t")
 
         assert "no successful pull on record" in out["note"]
 
@@ -49,7 +48,7 @@ class TestMilestoneScorecardHonestyNote:
         engine.connect.side_effect = RuntimeError("db down")
         with patch.object(ia, "get_db_engine", return_value=engine), \
              patch("intelligence.milestone_tracker.scan_all_tickers", return_value=[]):
-            out = asyncio.run(ia.get_milestone_scorecard(_token="t"))
+            out = ia.get_milestone_scorecard(_token="t")
 
         assert "could not be determined" in out["note"]
         # The scorecard itself must still be served, not swallowed as an error.
@@ -61,7 +60,7 @@ class TestMilestoneScorecardHonestyNote:
         fake_companies = [{"ticker": "AAPL", "grade": "B"}]
         with patch.object(ia, "get_db_engine", return_value=engine), \
              patch("intelligence.milestone_tracker.scan_all_tickers", return_value=fake_companies):
-            out = asyncio.run(ia.get_milestone_scorecard(_token="t"))
+            out = ia.get_milestone_scorecard(_token="t")
 
         assert out["companies"] == fake_companies
         assert out["count"] == 1
