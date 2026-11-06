@@ -400,7 +400,8 @@ class TestServing:
         assert body["precompute"]["status"] == "not_computed"
         fake_store.put("system.architecture_db", {}, {
             "puller_nodes": [{"id": "fred", "label": "FRED", "type": "puller", "status": "healthy"}],
-            "feature_count": 10, "resolved_count": 5, "raw_count": 7})
+            "feature_count": 10, "resolved_count": 5, "raw_count": 7},
+            computed_at=datetime.now(timezone.utc) - timedelta(minutes=5))  # not NOW: the route ages it by wall clock
         body = _client("api.routers.system").get("/api/v1/system/architecture").json()
         assert body["stats"]["total_features"] == 10 and body["stats"]["total_pullers"] == 1
         assert body["precompute"]["status"] == "fresh"
