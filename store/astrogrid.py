@@ -1935,15 +1935,19 @@ class AstroGridStore:
     ) -> dict[str, Any]:
         """Score one candidate row (the ``score_predictions`` column layout).
 
-        Legacy grid-crypto-v1 rows are decoded with the legacy-only decoder
-        and measured at their horizon end (start + 7/30 days), not at the
-        run date, so a backfill months later reads the price as of maturity.
+        Legacy grid-crypto-v1 rows whose char-list symbols decode are
+        rescored: measured at their horizon end (start + 7/30 days), not at
+        the run date, so a backfill months later reads the price as of
+        maturity, and written to the rescore table. A clean symbol list in
+        the legacy window (the fixed generator ran at 23:38Z on 2026-11-05,
+        before the cutoff) is scored like any other prediction.
         """
         maturity_days = 30 if row[3] == "macro" else 7
         created_at = row[14] if len(row) > 14 else None
         model_version = row[15] if len(row) > 15 else None
-        legacy = _is_legacy_crypto_row(model_version, created_at)
-        symbols, decoded = _decode_legacy_target_symbols(row[5], legacy_row=legacy)
+        in_legacy_window = _is_legacy_crypto_row(model_version, created_at)
+        symbols, decoded = _decode_legacy_target_symbols(row[5], legacy_row=in_legacy_window)
+        legacy = in_legacy_window and decoded
         target_symbols = [str(symbol).upper() for symbol in (symbols if isinstance(symbols, list) else [])]
         start_date = (
             created_at.astimezone(timezone.utc).date()
@@ -2129,8 +2133,9 @@ class AstroGridStore:
     ) -> dict[str, Any]:
         """Score every legacy grid-crypto-v1 prediction against its coin (one-shot backfill).
 
-        Candidates: legacy rows (``_is_legacy_crypto_row``) with no effective
-        score, i.e. unscored or carrying only an excluded SPY score. The
+        Candidates: legacy rows (``_is_legacy_crypto_row`` and a char-list
+        ``target_symbols``) with no effective score, i.e. unscored or carrying
+        only an excluded SPY score. The
         bounded-skip table is ignored here, so a re-run retries them.
         ``apply=False`` (default) runs in a READ ONLY transaction and writes
         nothing. ``apply=True`` inserts rescores (``ON CONFLICT DO NOTHING``)
@@ -2181,6 +2186,7 @@ class AstroGridStore:
                 ON ps_base.prediction_run_id = pr.id
             WHERE pr.model_version = :legacy_model_version
               AND pr.created_at < :legacy_cutoff
+              AND pr.target_symbols->>0 = :legacy_char_symbol
               AND pr.scoring_class = 'liquid_market'
               AND pr.id > :after_id
               AND NOT EXISTS (
@@ -2195,7 +2201,12 @@ class AstroGridStore:
         remaining = limit
         while remaining is None or remaining > 0:
             batch_limit = batch_size if remaining is None else min(batch_size, remaining)
-            params = {**_legacy_score_params(), "after_id": after_id, "batch_limit": batch_limit}
+            params = {
+                **_legacy_score_params(),
+                "legacy_char_symbol": LEGACY_CHAR_LIST_TARGET_SYMBOL,
+                "after_id": after_id,
+                "batch_limit": batch_limit,
+            }
             context = self.engine.begin() if apply else self.engine.connect()
             with context as conn:
                 if not apply:
@@ -2210,7 +2221,10 @@ class AstroGridStore:
                         conn, row, evaluation_date=evaluation_date, score_cutoff=score_cutoff,
                     )
                     if not result["decoded"]:
+                        # Char-list shape that does not decode to tickers: stays
+                        # pending (the hourly scorer records a permanent skip).
                         summary["undecodable"] += 1
+                        continue
                     if result["state"] == "not_mature":
                         summary["not_mature"] += 1
                         continue

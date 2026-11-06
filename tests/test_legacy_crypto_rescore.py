@@ -400,6 +400,31 @@ def test_hourly_scorer_rescores_legacy_rows_and_bounds_skips(pg_engine) -> None:
     assert _count(pg_engine, "prediction_score_skip") == 3
 
 
+def test_clean_symbols_in_legacy_window_score_normally(pg_engine) -> None:
+    """The fixed generator wrote 16 clean rows at 23:38Z, before the cutoff."""
+    today = datetime.now(timezone.utc).date()
+    ids = _legacy_fixture(pg_engine, today)
+    start = today - timedelta(days=20)
+    clean = _run(pg_engine, model="grid-crypto-v1", created_at=LEGACY_CREATED, symbols_json='["BTC"]',
+                 as_of=datetime.combine(start, datetime.min.time(), timezone.utc),
+                 jsonb_string_payloads=False)
+    store = AstroGridStore(pg_engine)
+
+    backfill = store.rescore_legacy_crypto_predictions(apply=True, as_of_date=today)
+    assert backfill["candidates"] == 3  # the char-list rows only
+    assert clean not in {r["prediction_run_id"] for r in _rescores(pg_engine)}
+
+    # The base-table scorer measures at the run date (unchanged rule), so it
+    # needs that day's close.
+    yesterday = today - timedelta(days=1)
+    _price(pg_engine, 1, yesterday, 120.0)
+    summary = store.score_predictions(as_of_date=yesterday, limit=50)
+    assert summary["scored"] == 1 and summary["rescored_legacy"] == 0
+    with pg_engine.connect() as conn:
+        base = {r[0] for r in conn.execute(text("SELECT prediction_run_id FROM astrogrid.prediction_score"))}
+    assert base == {ids["spy_graded"], clean}  # clean row scored in the base table
+
+
 def test_permanent_skip_is_not_retried(pg_engine) -> None:
     today = datetime.now(timezone.utc).date()
     start = datetime.combine(today - timedelta(days=20), datetime.min.time(), timezone.utc)
