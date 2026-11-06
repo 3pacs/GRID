@@ -1166,6 +1166,28 @@ def _empty_report(
     )
 
 
+def _drop_pruned_streams(signals: list[StreamSignal]) -> tuple[list[StreamSignal], int]:
+    """Remove streams the active ``prune_rule_v1`` list gives weight 0.
+
+    Returns ``(kept, n_pruned)``. With pruning off (the default) or any
+    failure loading the list, every stream is kept.
+    """
+    try:
+        from intelligence.trust_scorer import active_prune_set
+
+        prune = active_prune_set()
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover — defensive
+        log.debug("prune list unavailable: {e}", e=str(exc))
+        return signals, 0
+    if prune is None:
+        return signals, 0
+    kept = [
+        s for s in signals
+        if not (prune.is_source_pruned(s.stream_name) or prune.is_source_pruned(s.source_type))
+    ]
+    return kept, len(signals) - len(kept)
+
+
 # ── Public API ────────────────────────────────────────────────────────────
 
 def scan_convergence(
@@ -1229,6 +1251,12 @@ def scan_convergence(
             missing += 1
             continue
         active.append(sig)
+
+    # prune_rule_v1 (S16): a stream an operator-approved prune list marks
+    # NO_EDGE / ANTI_EDGE gets weight 0 -- dropped from the math and the
+    # aligned/opposed counts, and counted as missing. Off by default.
+    active, pruned = _drop_pruned_streams(active)
+    missing += pruned
 
     if not active:
         return _empty_report(

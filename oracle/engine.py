@@ -594,6 +594,49 @@ class ModelRegistry:
             return result.rowcount or 0
 
 
+# ── Prediction universe (shared with the close pullers) ────────────────────
+#
+# The tickers the oracle predicts on when no explicit list is given. Defined
+# once here so the price pullers can collect a close for every one of them
+# (ingestion/tiingo_pull.py::TiingoPuller.default_tickers). Until 2026-11 no
+# routine puller derived its list from this: the biotech names the options
+# scanner surfaced only had closes as a side effect of
+# small_cap_enrichment.ensure_prices, whose sub-$2B cap gate dropped ~45 of
+# them after their first enrichment on 2026-09-10 -- their closes stopped on
+# 09-09 while the oracle kept predicting on them (S15).
+ORACLE_ACTIVE_TICKERS_SQL = """
+    SELECT DISTINCT ticker FROM options_daily_signals
+    WHERE signal_date >= CURRENT_DATE - 7
+    AND total_oi >= 1000
+    ORDER BY ticker
+"""
+
+# Pending rows still need their expiry close after the ticker leaves the
+# options universe. Served by the partial index idx_oracle_pred_expiry
+# (WHERE verdict = 'pending'): ~30 ms on griddb (2026-11-06).
+ORACLE_PENDING_TICKERS_SQL = """
+    SELECT DISTINCT ticker FROM oracle_predictions
+    WHERE verdict = 'pending'
+"""
+
+
+def oracle_close_universe(conn: Any) -> list[str]:
+    """Every ticker whose close the oracle needs: active ∪ pending.
+
+    Active = what ``OracleEngine.generate_predictions`` predicts on by default
+    (``ORACLE_ACTIVE_TICKERS_SQL``); pending = tickers with a prediction still
+    to be scored at expiry, whatever list produced it. Blank tickers are
+    dropped; the result is upper-cased, sorted and de-duplicated.
+    """
+    tickers: set[str] = set()
+    for sql in (ORACLE_ACTIVE_TICKERS_SQL, ORACLE_PENDING_TICKERS_SQL):
+        for row in conn.execute(text(sql)).fetchall():
+            t = str(row[0] or "").strip().upper()
+            if t:
+                tickers.add(t)
+    return sorted(tickers)
+
+
 # ── Oracle Engine ───────────────────────────────────────────────────────────
 
 class OracleEngine:
@@ -2239,12 +2282,7 @@ class OracleEngine:
     def _get_active_tickers(self) -> list[str]:
         """Get tickers with recent options + equity data."""
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT DISTINCT ticker FROM options_daily_signals
-                WHERE signal_date >= CURRENT_DATE - 7
-                AND total_oi >= 1000
-                ORDER BY ticker
-            """)).fetchall()
+            rows = conn.execute(text(ORACLE_ACTIVE_TICKERS_SQL)).fetchall()
         return [r[0] for r in rows]
 
     def _get_spot_price(self, ticker: str) -> float | None:
