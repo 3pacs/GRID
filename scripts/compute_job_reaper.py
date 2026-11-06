@@ -12,7 +12,27 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from loguru import logger as log
+
 ACTIVE_JOB_STATES = ("DISPATCHED", "IN_PROGRESS")
+
+# A worker heartbeats every 30 s (scripts/worker.py HEARTBEAT_INTERVAL), so 15
+# minutes of silence is ~30 missed beats: the process is gone, not slow.
+# Override with GRID_COMPUTE_WORKER_OFFLINE_MINUTES or --offline-after-minutes.
+DEFAULT_OFFLINE_AFTER_MINUTES = 15
+OFFLINE_AFTER_ENV = "GRID_COMPUTE_WORKER_OFFLINE_MINUTES"
+
+
+def default_offline_after_minutes() -> int:
+    """Minutes without a heartbeat before the reaper marks a worker OFFLINE."""
+    raw = os.environ.get(OFFLINE_AFTER_ENV, "").strip()
+    if not raw:
+        return DEFAULT_OFFLINE_AFTER_MINUTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_OFFLINE_AFTER_MINUTES
+    return value if value > 0 else DEFAULT_OFFLINE_AFTER_MINUTES
 
 STALE_JOB_SELECT_SQL = """
         SELECT j.id, j.state, j.assigned_worker, j.timeout_seconds,
@@ -88,13 +108,38 @@ def should_reap_job(job: dict, worker: dict | None, *, now: datetime, grace_seco
     return not worker_recently_active(worker, now=now, grace_seconds=grace_seconds)
 
 
-def reconciled_worker_states(workers: list[dict], active_jobs: list[dict]) -> dict[int, dict]:
+def worker_heartbeat_is_stale(
+    worker: dict, *, now: datetime, offline_after_seconds: int | None
+) -> bool:
+    """True when the worker has been silent longer than the OFFLINE threshold.
+
+    Mirrors the ``last_heartbeat`` test in :data:`RECONCILE_WORKERS_SQL`.
+    """
+    if offline_after_seconds is None:
+        return False
+    last_heartbeat = _as_utc(worker.get("last_heartbeat"))
+    if last_heartbeat is None:
+        return True
+    return (now - last_heartbeat).total_seconds() > max(offline_after_seconds, 0)
+
+
+def reconciled_worker_states(
+    workers: list[dict],
+    active_jobs: list[dict],
+    *,
+    now: datetime | None = None,
+    offline_after_seconds: int | None = None,
+) -> dict[int, dict]:
+    """Pure-Python twin of :data:`RECONCILE_WORKERS_SQL` (kept for tests)."""
+    now = now or datetime.now(timezone.utc)
     counts = Counter(job.get("assigned_worker") for job in active_jobs if job.get("assigned_worker"))
     result = {}
     for worker in workers:
         worker_id = int(worker["id"])
         active_count = int(counts.get(worker_id, 0))
-        if worker.get("state") == "OFFLINE":
+        if worker.get("state") == "OFFLINE" or worker_heartbeat_is_stale(
+            worker, now=now, offline_after_seconds=offline_after_seconds
+        ):
             state = "OFFLINE"
         else:
             state = "BUSY" if active_count > 0 else "IDLE"
@@ -139,9 +184,12 @@ def requeue_stale_jobs(cur, stale_jobs: list[dict], *, reason: str):
     return requeued
 
 
-def reconcile_workers(cur):
-    cur.execute(
-        """
+# A worker silent for longer than the threshold is OFFLINE; an OFFLINE row
+# stays OFFLINE until the worker itself comes back. The coordinator's
+# register, heartbeat and claim paths all write IDLE/BUSY, so a reconnecting
+# worker flips itself back without the reaper's help. ``prev`` is the
+# pre-update snapshot, so RETURNING reports what each row changed from.
+RECONCILE_WORKERS_SQL = """
         WITH counts AS (
             SELECT w.id,
                    COUNT(j.id) FILTER (WHERE j.state IN ('DISPATCHED', 'IN_PROGRESS')) AS active_count
@@ -153,18 +201,45 @@ def reconcile_workers(cur):
         SET active_jobs = counts.active_count,
             state = CASE
                 WHEN w.state = 'OFFLINE' THEN 'OFFLINE'
+                WHEN w.last_heartbeat IS NULL
+                     OR w.last_heartbeat < NOW() - (%s * INTERVAL '1 second') THEN 'OFFLINE'
                 WHEN counts.active_count > 0 THEN 'BUSY'
                 ELSE 'IDLE'
             END
-        FROM counts
-        WHERE w.id = counts.id
-        RETURNING w.id, w.hostname, w.active_jobs, w.state
+        FROM counts, compute_workers prev
+        WHERE w.id = counts.id AND prev.id = w.id
+        RETURNING w.id, w.hostname, w.active_jobs, w.state,
+                  prev.state AS previous_state, w.last_heartbeat
         """
-    )
-    return _dict_rows(cur.fetchall())
 
 
-def run_reaper(*, grace_seconds: int, limit: int, dry_run: bool):
+def reconcile_workers(cur, *, offline_after_seconds: int):
+    cur.execute(RECONCILE_WORKERS_SQL, (max(int(offline_after_seconds), 0),))
+    rows = _dict_rows(cur.fetchall())
+    for row in rows:
+        if row.get("state") == "OFFLINE" and row.get("previous_state") != "OFFLINE":
+            log.info(
+                "Worker {id} ({host}) marked OFFLINE: last heartbeat {hb}",
+                id=row.get("id"), host=row.get("hostname"), hb=row.get("last_heartbeat"),
+            )
+    return rows
+
+
+def newly_offline_workers(worker_updates: list[dict]) -> list[str]:
+    return [
+        str(row.get("hostname"))
+        for row in worker_updates
+        if row.get("state") == "OFFLINE" and row.get("previous_state") != "OFFLINE"
+    ]
+
+
+def run_reaper(
+    *,
+    grace_seconds: int,
+    limit: int,
+    dry_run: bool,
+    offline_after_minutes: int = DEFAULT_OFFLINE_AFTER_MINUTES,
+):
     import psycopg2.extras
     from scripts.compute_coordinator import get_conn
 
@@ -175,7 +250,7 @@ def run_reaper(*, grace_seconds: int, limit: int, dry_run: bool):
         stale_jobs = select_stale_jobs(cur, grace_seconds=grace_seconds, limit=limit)
         reason = f"requeued by compute_job_reaper after timeout plus {grace_seconds}s grace"
         requeued = [] if dry_run else requeue_stale_jobs(cur, stale_jobs, reason=reason)
-        worker_updates = reconcile_workers(cur)
+        worker_updates = reconcile_workers(cur, offline_after_seconds=offline_after_minutes * 60)
         if dry_run:
             conn.rollback()
         else:
@@ -185,6 +260,8 @@ def run_reaper(*, grace_seconds: int, limit: int, dry_run: bool):
             "stale_job_ids": [int(job["id"]) for job in stale_jobs],
             "requeued_job_ids": requeued,
             "worker_updates": worker_updates,
+            "offline_after_minutes": offline_after_minutes,
+            "newly_offline_workers": newly_offline_workers(worker_updates),
         }
     except Exception:
         conn.rollback()
@@ -197,6 +274,15 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Requeue stale GRID compute jobs and reconcile worker counts.")
     parser.add_argument("--grace-seconds", type=int, default=300, help="Seconds beyond job timeout before reaping")
     parser.add_argument("--limit", type=int, default=100, help="Maximum stale jobs to requeue per run")
+    parser.add_argument(
+        "--offline-after-minutes",
+        type=int,
+        default=default_offline_after_minutes(),
+        help=(
+            "Mark a worker OFFLINE after this many minutes without a heartbeat "
+            f"(default {DEFAULT_OFFLINE_AFTER_MINUTES}, env {OFFLINE_AFTER_ENV})"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Inspect without modifying DB")
     args = parser.parse_args(argv)
 
@@ -204,6 +290,7 @@ def main(argv=None) -> int:
         grace_seconds=max(args.grace_seconds, 0),
         limit=max(args.limit, 1),
         dry_run=args.dry_run,
+        offline_after_minutes=max(args.offline_after_minutes, 1),
     )
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
     print(json.dumps(result, indent=2, sort_keys=True, default=str))

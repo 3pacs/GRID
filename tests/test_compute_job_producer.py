@@ -11,7 +11,8 @@ def test_recommended_queue_target_scales_with_open_worker_capacity():
     assert producer.recommended_queue_target(workers, multiplier=4, floor=8, ceiling=64) == 12
 
 
-def test_build_job_plan_uses_valid_models_and_ollama_capability():
+def test_build_job_plan_uses_valid_models_and_ollama_capability(monkeypatch):
+    monkeypatch.setenv(producer.LLM_JOBS_ENV, "1")
     workers = [
         {"state": "IDLE", "max_concurrent": 2, "active_jobs": 0, "has_ollama": False},
         {"state": "IDLE", "max_concurrent": 1, "active_jobs": 0, "has_ollama": True},
@@ -65,3 +66,27 @@ def test_parse_compute_inputs_deduplicates_live_metadata():
 
     assert model_ids == [3, 4]
     assert feature_ids == [1, 2]
+
+
+def test_llm_filler_jobs_are_opt_in(monkeypatch):
+    """Fixing has_ollama must not restart the canned-prompt LLM stream."""
+    workers = [{"state": "IDLE", "max_concurrent": 2, "active_jobs": 0, "has_ollama": True}]
+    kwargs = {
+        "workers": workers, "existing_queued": 0, "target_queued": 8, "max_create": 8,
+        "valid_model_ids": [3], "feature_ids": [101], "stamp": "test",
+    }
+
+    monkeypatch.delenv(producer.LLM_JOBS_ENV, raising=False)
+    assert not any(j["job_type"] == "LLM_INFERENCE" for j in producer.build_job_plan(**kwargs))
+
+    monkeypatch.setenv(producer.LLM_JOBS_ENV, "1")
+    assert any(j["job_type"] == "LLM_INFERENCE" for j in producer.build_job_plan(**kwargs))
+
+
+def test_offline_workers_add_no_capacity_or_ollama():
+    workers = [
+        {"state": "OFFLINE", "max_concurrent": 4, "active_jobs": 0, "has_ollama": True},
+    ]
+
+    assert producer.recommended_queue_target(workers) == 0
+    assert producer._has_ollama_worker(workers) is False

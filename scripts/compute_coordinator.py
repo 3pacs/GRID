@@ -109,6 +109,9 @@ class WorkerRegister(BaseModel):
     gpu_model: Optional[str] = None
     gpu_vram_gb: Optional[float] = None
     has_ollama: bool = False
+    # Installed Ollama model names reported by the worker's probe. Older
+    # workers omit the field and register with an empty list.
+    ollama_models: list[str] = []
     has_docker: bool = False
     max_concurrent: int = 2
 
@@ -186,6 +189,7 @@ def _create_tables(conn: Any) -> None:
             gpu_model       TEXT,
             gpu_vram_gb     DOUBLE PRECISION,
             has_ollama      BOOLEAN DEFAULT FALSE,
+            ollama_models   JSONB DEFAULT '[]'::jsonb,
             has_docker      BOOLEAN DEFAULT FALSE,
             max_concurrent  INTEGER DEFAULT 2,
             active_jobs     INTEGER DEFAULT 0,
@@ -239,6 +243,18 @@ def _create_tables(conn: Any) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_compute_state_log_job ON compute_state_log (job_id);
     """)
+    # Additive column for tables created before 2026-11-06. A constant default
+    # makes ADD COLUMN catalog-only; lock_timeout bounds the wait behind a
+    # claim holding a worker row so startup fails fast and systemd retries.
+    cur.execute("SET lock_timeout = '5s'")
+    cur.execute(COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL)
+    cur.execute("RESET lock_timeout")
+
+
+COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL = (
+    "ALTER TABLE compute_workers "
+    "ADD COLUMN IF NOT EXISTS ollama_models JSONB DEFAULT '[]'::jsonb"
+)
 
 
 # ── State Machine ──────────────────────────────────────────────
@@ -724,25 +740,35 @@ async def health():
     return {"status": "ok", "service": "compute_coordinator", "timestamp": datetime.utcnow().isoformat()}
 
 
+def worker_register_upsert_sql() -> str:
+    """Upsert a worker row; re-registering always clears OFFLINE to IDLE."""
+    return (
+        "INSERT INTO compute_workers (hostname,tailscale_ip,cpu_cores,ram_gb,gpu_model,"
+        "gpu_vram_gb,has_ollama,ollama_models,has_docker,max_concurrent) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s) "
+        "ON CONFLICT (hostname) DO UPDATE SET tailscale_ip=EXCLUDED.tailscale_ip, "
+        "cpu_cores=EXCLUDED.cpu_cores, ram_gb=EXCLUDED.ram_gb, gpu_model=EXCLUDED.gpu_model, "
+        "gpu_vram_gb=EXCLUDED.gpu_vram_gb, has_ollama=EXCLUDED.has_ollama, "
+        "ollama_models=EXCLUDED.ollama_models, "
+        "has_docker=EXCLUDED.has_docker, max_concurrent=EXCLUDED.max_concurrent, "
+        "active_jobs=0, last_heartbeat=NOW(), state='IDLE' "
+        "RETURNING *"
+    )
+
+
 @app.post("/workers/register")
 def register_worker(w: WorkerRegister):
     with db_conn(autocommit=True) as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "INSERT INTO compute_workers (hostname,tailscale_ip,cpu_cores,ram_gb,gpu_model,"
-            "gpu_vram_gb,has_ollama,has_docker,max_concurrent) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT (hostname) DO UPDATE SET tailscale_ip=EXCLUDED.tailscale_ip, "
-            "cpu_cores=EXCLUDED.cpu_cores, ram_gb=EXCLUDED.ram_gb, gpu_model=EXCLUDED.gpu_model, "
-            "gpu_vram_gb=EXCLUDED.gpu_vram_gb, has_ollama=EXCLUDED.has_ollama, "
-            "has_docker=EXCLUDED.has_docker, max_concurrent=EXCLUDED.max_concurrent, "
-            "active_jobs=0, last_heartbeat=NOW(), state='IDLE' "
-            "RETURNING *",
+            worker_register_upsert_sql(),
             (w.hostname, w.tailscale_ip, w.cpu_cores, w.ram_gb, w.gpu_model,
-             w.gpu_vram_gb, w.has_ollama, w.has_docker, w.max_concurrent),
+             w.gpu_vram_gb, w.has_ollama, json.dumps(list(w.ollama_models)),
+             w.has_docker, w.max_concurrent),
         )
         worker = dict(cur.fetchone())
-    log.info("Worker registered: {h} ({ip})", h=w.hostname, ip=w.tailscale_ip)
+    log.info("Worker registered: {h} ({ip}) ollama={o} models={m}", h=w.hostname,
+             ip=w.tailscale_ip, o=w.has_ollama, m=len(w.ollama_models))
     return worker
 
 
@@ -865,10 +891,19 @@ def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
     return {"model_ids": model_ids, "feature_ids": feature_ids}
 
 
+CANCEL_REASON_MAX_CHARS = 500
+
+
+def cancel_reason(reason: str | None) -> str:
+    """Audit text for compute_state_log; operators may say why they cancelled."""
+    text = (reason or "").strip()[:CANCEL_REASON_MAX_CHARS]
+    return f"cancelled by operator: {text}" if text else "cancelled by operator"
+
+
 @app.post("/jobs/{job_id}/cancel")
-def cancel_job(job_id: int):
+def cancel_job(job_id: int, reason: str | None = None):
     with db_conn(autocommit=True) as conn:
-        transition_job(conn.cursor(), job_id, JobState.CANCELLED, "cancelled by operator")
+        transition_job(conn.cursor(), job_id, JobState.CANCELLED, cancel_reason(reason))
     return {"status": "cancelled", "job_id": job_id}
 
 
@@ -1089,7 +1124,8 @@ def _query_full_stats() -> dict[str, Any]:
             by_type[r["job_type"]] = by_type.get(r["job_type"], 0) + int(r["count"])
 
         cur.execute("SELECT count(*) as total, count(*) FILTER (WHERE state='IDLE') as idle, "
-                    "count(*) FILTER (WHERE state='BUSY') as busy FROM compute_workers")
+                    "count(*) FILTER (WHERE state='BUSY') as busy, "
+                    "count(*) FILTER (WHERE state='OFFLINE') as offline FROM compute_workers")
         workers = dict(cur.fetchone())
     return {
         "job_states": job_states,

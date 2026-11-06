@@ -10,6 +10,8 @@ Run: python3 worker.py
      python3 worker.py --coordinator http://10.254.111.80:8100
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import shutil
@@ -151,16 +153,109 @@ def detect_gpu():
     return None, None
 
 
-def detect_ollama():
-    """Check if Ollama can actually generate with an installed model."""
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_PROBE_MODEL_ENV = "GRID_WORKER_OLLAMA_PROBE_MODEL"
+OLLAMA_GENERATE_PROBE_ENV = "GRID_WORKER_OLLAMA_GENERATE_PROBE"
+OLLAMA_PROBE_TIMEOUT_ENV = "GRID_WORKER_OLLAMA_PROBE_TIMEOUT"
+#: A cold load of a 27-32B model takes ~25 s (qwen3.8:27b on grid-svr,
+#: 2026-11-06: load_duration 25.3 s, total 30.5 s). The old fixed 20 s
+#: generate timeout therefore failed on every node, and has_ollama read
+#: false fleet-wide while Ollama was serving.
+DEFAULT_OLLAMA_GENERATE_TIMEOUT_S = 120.0
+
+
+def _is_embedding_model(name: str) -> bool:
+    lowered = name.lower()
+    return "embed" in lowered
+
+
+def _configured_probe_models() -> list[str]:
+    """Models named in GRID_WORKER_OLLAMA_PROBE_MODEL (comma-separated)."""
+    raw = os.environ.get(OLLAMA_PROBE_MODEL_ENV, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _match_installed_model(requested: str, installed: list[str]) -> str | None:
+    """Exact name, then ``name:latest``, then the same base name with any tag."""
+    if requested in installed:
+        return requested
+    if f"{requested}:latest" in installed:
+        return f"{requested}:latest"
+    base = requested.split(":", 1)[0]
+    for name in installed:
+        if name.split(":", 1)[0] == base:
+            return name
+    return None
+
+
+def _ollama_probe_timeout() -> float:
     try:
-        model = _resolve_ollama_model(os.environ.get("GRID_WORKER_OLLAMA_PROBE_MODEL", "llama3.2"))
-        if os.environ.get("GRID_WORKER_SKIP_OLLAMA_GENERATE_PROBE") == "1":
-            return True
-        return _ollama_generation_probe(model)
-    except Exception as exc:
-        log.warning("Ollama generate probe failed: {e}", e=exc)
-        return False
+        value = float(os.environ.get(OLLAMA_PROBE_TIMEOUT_ENV, ""))
+    except ValueError:
+        return DEFAULT_OLLAMA_GENERATE_TIMEOUT_S
+    return value if value > 0 else DEFAULT_OLLAMA_GENERATE_TIMEOUT_S
+
+
+def probe_ollama() -> dict:
+    """Probe the local Ollama server; never raises.
+
+    ``available`` is true when the server answers ``/api/tags`` and has a
+    usable model: one of ``GRID_WORKER_OLLAMA_PROBE_MODEL`` (comma-separated)
+    when that is set, otherwise any installed non-embedding model (embedding
+    models cannot serve LLM_INFERENCE). A generation round-trip is opt-in
+    (``GRID_WORKER_OLLAMA_GENERATE_PROBE=1``) because it loads the model into
+    memory on every worker start; its timeout is
+    ``GRID_WORKER_OLLAMA_PROBE_TIMEOUT`` seconds (default 120).
+    """
+    result = {
+        "available": False,
+        "reachable": False,
+        "models": [],
+        "probe_model": None,
+        "reason": "",
+    }
+    try:
+        models = _ollama_model_catalog()
+    except (requests.RequestException, OSError, ValueError) as exc:
+        result["reason"] = f"unreachable: {type(exc).__name__}"
+        return result
+    result["reachable"] = True
+    result["models"] = models
+
+    wanted = _configured_probe_models()
+    if wanted:
+        matches = [m for m in (_match_installed_model(w, models) for w in wanted) if m]
+        probe_model = matches[0] if matches else None
+        if probe_model is None:
+            result["reason"] = f"none of {wanted} installed"
+            return result
+    else:
+        chat_models = [m for m in models if not _is_embedding_model(m)]
+        probe_model = chat_models[0] if chat_models else None
+        if probe_model is None:
+            result["reason"] = "no non-embedding model installed"
+            return result
+    result["probe_model"] = probe_model
+
+    if os.environ.get(OLLAMA_GENERATE_PROBE_ENV) == "1":
+        try:
+            if not _ollama_generation_probe(probe_model, timeout=_ollama_probe_timeout()):
+                result["reason"] = f"generate probe on {probe_model} returned no response"
+                return result
+        except (requests.RequestException, OSError, ValueError) as exc:
+            result["reason"] = f"generate probe on {probe_model} failed: {type(exc).__name__}"
+            return result
+
+    result["available"] = True
+    return result
+
+
+def detect_ollama():
+    """True when local Ollama is reachable and has a usable model."""
+    probe = probe_ollama()
+    if not probe["available"]:
+        log.warning("Ollama unavailable: {r}", r=probe["reason"])
+    return probe["available"]
 
 
 def detect_docker():
@@ -168,24 +263,74 @@ def detect_docker():
     return shutil.which("docker") is not None
 
 
-def get_tailscale_ip():
-    """Get Tailscale IP if available."""
+TAILSCALE_IP_ENV = "GRID_WORKER_TAILSCALE_IP"
+
+
+def _is_loopback(address: str) -> bool:
+    return address.startswith("127.") or address in {"::1", "localhost", ""}
+
+
+def _route_source_ip(coordinator_url: str | None) -> str | None:
+    """Local address the kernel would use to reach the coordinator.
+
+    ``connect`` on a UDP socket only selects a route; no packet is sent. When
+    the coordinator is a tailnet address this is the worker's tailnet IP.
+    """
+    if not coordinator_url:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(coordinator_url)
+    host = parsed.hostname
+    if not host or _is_loopback(host):
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((host, parsed.port or 80))
+            address = sock.getsockname()[0]
+    except OSError:
+        return None
+    return None if _is_loopback(address) else address
+
+
+def get_tailscale_ip(coordinator_url: str | None = None) -> str:
+    """Return a coordinator-reachable address for this node, never loopback.
+
+    Order: ``GRID_WORKER_TAILSCALE_IP``, ``tailscale ip -4``, the route source
+    address toward the coordinator, the hostname's resolved address, and
+    finally the bare hostname (tailnet MagicDNS resolves it). Debian maps the
+    hostname to 127.0.1.1, which is how forge registered as 127.0.1.1.
+    """
+    override = os.environ.get(TAILSCALE_IP_ENV, "").strip()
+    if override:
+        return override
     try:
         result = subprocess.run(
             ["tailscale", "ip", "-4"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+            address = result.stdout.strip().splitlines()[0].strip()
+            if not _is_loopback(address):
+                return address
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
-    # Fallback to hostname IP
-    return socket.gethostbyname(socket.gethostname())
+    routed = _route_source_ip(coordinator_url)
+    if routed:
+        return routed
+    hostname = socket.gethostname()
+    try:
+        address = socket.gethostbyname(hostname)
+    except OSError:
+        address = ""
+    if not _is_loopback(address):
+        return address
+    return hostname
 
 
 def _ollama_model_catalog():
     """Return installed Ollama model names on the local node."""
-    r = requests.get("http://localhost:11434/api/tags", timeout=10)
+    r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
     r.raise_for_status()
     payload = r.json()
     models = []
@@ -196,14 +341,14 @@ def _ollama_model_catalog():
     return models
 
 
-def _ollama_generation_probe(model: str) -> bool:
+def _ollama_generation_probe(model: str, timeout: float = DEFAULT_OLLAMA_GENERATE_TIMEOUT_S) -> bool:
     payload = {
         "model": model,
         "prompt": "OK",
         "stream": False,
         "options": {"num_predict": 1},
     }
-    r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=20)
+    r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     return bool(data.get("done") or data.get("response") is not None)
@@ -215,20 +360,12 @@ def _resolve_ollama_model(requested_model: str) -> str:
     if not models:
         raise RuntimeError("No Ollama models installed on local node")
 
-    if requested_model in models:
-        return requested_model
-
-    latest_alias = f"{requested_model}:latest"
-    if latest_alias in models:
-        return latest_alias
-
-    requested_base = requested_model.split(":", 1)[0]
-    for name in models:
-        if name.split(":", 1)[0] == requested_base:
-            return name
+    matched = _match_installed_model(requested_model, models)
+    if matched:
+        return matched
 
     for name in models:
-        if "embed" not in name and "embedding" not in name:
+        if not _is_embedding_model(name):
             return name
 
     return models[0]
@@ -889,10 +1026,13 @@ def main():
     cpu_cores = detect_cpu_cores()
     ram_gb = detect_ram_gb()
     gpu_model, gpu_vram = detect_gpu()
-    has_ollama = detect_ollama()
+    ollama_probe = probe_ollama()
+    has_ollama = ollama_probe["available"]
+    if not has_ollama:
+        log.warning("Ollama unavailable: {r}", r=ollama_probe["reason"])
     has_docker = detect_docker()
     hostname = args.hostname or socket.gethostname()
-    ts_ip = get_tailscale_ip()
+    ts_ip = get_tailscale_ip(coordinator)
 
     log.info("Hardware: {cores} cores, {ram}GB RAM, GPU={gpu}, Ollama={oll}, Docker={dock}",
              cores=cpu_cores, ram=ram_gb,
@@ -909,6 +1049,7 @@ def main():
             "gpu_model": gpu_model,
             "gpu_vram_gb": gpu_vram,
             "has_ollama": has_ollama,
+            "ollama_models": ollama_probe["models"],
             "has_docker": has_docker,
             "max_concurrent": args.max_concurrent,
         }, timeout=10)
