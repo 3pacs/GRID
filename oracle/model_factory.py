@@ -234,7 +234,18 @@ class ModelFactory:
             parent_model=row.get("parent_model"),
         )
 
-    def get_signals_for_model(self, model_name: str, as_of: datetime) -> list[dict[str, Any]]:
+    def get_signals_for_model(
+        self, model_name: str, as_of: datetime, ticker: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Active registry signals for a model's subscribed sources.
+
+        ``ticker`` scopes the rows to that ticker plus market-wide rows (no
+        ticker). The oracle passes it for every per-ticker prediction: without
+        it a model saw every ticker's signals (2026-11-06: 297k changepoint rows
+        across 47 tickers, 29k lever-puller rows across 215) as evidence about
+        whichever ticker it was predicting. ``None`` keeps the unscoped listing
+        the signal-registry API shows.
+        """
         if not _signal_registry_enabled():
             return []
         spec = self.get_model_spec(model_name)
@@ -244,6 +255,9 @@ class ModelFactory:
         as_of_utc = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
         params: dict[str, Any] = {"sources": spec.signal_sources, "as_of": as_of_utc}
         clauses = ["source_module = ANY(:sources)", "valid_from <= :as_of", "(valid_until IS NULL OR valid_until > :as_of)"]
+        if ticker:
+            params["ticker"] = ticker
+            clauses.append("(ticker = :ticker OR ticker IS NULL OR ticker = '')")
 
         filters = spec.signal_filters or {}
         if filters.get("min_confidence"):
