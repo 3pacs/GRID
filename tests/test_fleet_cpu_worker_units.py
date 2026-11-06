@@ -56,3 +56,20 @@ def test_template_never_inlines_credentials() -> None:
 
 def test_install_script_parses() -> None:
     subprocess.run(["bash", "-n", str(KIT / "install_release.sh")], check=True)
+
+
+def test_install_script_verifies_inputs_and_refuses_shared_staging() -> None:
+    text = (KIT / "install_release.sh").read_text()
+    for required in ("GRID_TARBALL_SHA256:?", "GRID_CONSTRAINTS_SHA256:?", "sha256sum -c", "get-tar-commit-id"):
+        assert required in text, required
+    assert "assert_private_path" in text
+    code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code if "/tmp" in ln]  # nothing staged or run from /tmp
+    assert any('mktemp -d -p "$STAGING_ROOT"' in ln for ln in code)
+
+
+def test_install_script_aborts_on_missing_hashes() -> None:
+    env = {"PATH": "/usr/bin:/bin", "GRID_SHA": "0" * 40, "GRID_TARBALL": "x", "GRID_CONSTRAINTS": "y", "GRID_USER": "u"}
+    r = subprocess.run(["bash", str(KIT / "install_release.sh")], env=env, capture_output=True, text=True, check=False)
+    assert r.returncode != 0
+    assert "GRID_TARBALL_SHA256" in r.stderr
