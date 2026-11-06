@@ -20,14 +20,15 @@ export function edgeMarkup(report, live) {
         always_short:'Always short (paper)', price_momentum:'Previous 5m price momentum',
         random_expected:'Random direction (expected)', reverse_flow:'Reverse flow (diagnostic)',
         long_only_flow:'Buy on bullish flow; otherwise cash'};
-    const verdicts = {NO_POSITIVE_NET_RETURN:'No predictive edge after costs',
+    const verdicts = {NO_POSITIVE_NET_RETURN:'Taker-flow rule: no net edge after costs',
         NO_DEMONSTRATED_EDGE:'No demonstrated advantage over simple baselines',
         INSUFFICIENT_SAMPLE:'Insufficient historical sample',
         HISTORICAL_SUPPORT_ONLY:'Historical support; prospective confirmation required'};
     return `<section class="panel edge-panel" aria-label="Predictive edge">
         <div class="split-header"><h2>Predictive edge</h2><span>frozen-rule evaluation</span></div>
         <h3>${escapeHtml(verdicts[report.verdict] || 'Evaluation unavailable')}</h3>
-        <p>Historical replay: ${test.sample.events.toLocaleString()} nonoverlapping events across ${test.sample.utc_dates} UTC days, August–October 2026. BTC ${test.sample.per_asset.BTC.toLocaleString()} · ETH ${test.sample.per_asset.ETH.toLocaleString()} · SOL ${test.sample.per_asset.SOL.toLocaleString()}. Historical replay is separate from live forecasts.</p>
+        <p>Scope: the 30m BTC/ETH/SOL spot taker-flow continuation rule only. This evaluation does not test celestial features, equities, or incremental effects after regime and macroeconomic controls.</p>
+        <p>Historical replay: ${test.sample.events.toLocaleString()} events across ${test.sample.utc_dates} UTC days, August–October 2026; exposure does not overlap within each asset. BTC ${test.sample.per_asset.BTC.toLocaleString()} · ETH ${test.sample.per_asset.ETH.toLocaleString()} · SOL ${test.sample.per_asset.SOL.toLocaleString()}. Historical replay is separate from live forecasts.</p>
         <p>Mean gross: <strong>${bp(test.flow_gross_mean_bps)}</strong>; after fees only: <strong>${bp(test.flow_fees_only_mean_bps)}</strong>; after fees and slippage: <strong>${bp(test.strategies.flow.mean_net_bps)}</strong> per event (95% interval ${ci(test.strategies.flow.mean_net_95ci_bps)}).</p>
         <p>Cost scenario: 0.10% fee + 0.02% slippage per side. Enter at the next completed 5m close; exit at the original forecast outcome. 1 bp = 0.01%. Fixed-notional event returns; no compounding.</p>
         <div style="overflow-x:auto"><table><caption>Matched test events · mean return after costs</caption><thead><tr><th scope="col">Rule / baseline</th><th scope="col">Net per event</th><th scope="col">95% interval</th></tr></thead><tbody>

@@ -58,9 +58,10 @@ test('edge assessment distinguishes cost-aware historical replay from prospectiv
     const report = JSON.parse(readFileSync(new URL('../../astrogrid_web/research/spot-flow-edge-v1.json', import.meta.url)));
     const text = insightsMarkup({items:[], edge_assessment:report,
         prospective_cost_diagnostic:{scored:40,utc_dates:1,mean_gross_bps:5,mean_scenario_net_bps:-19}});
-    assert.match(text,/No predictive edge after costs/);
-    assert.match(text,/10,854 nonoverlapping events across 92 UTC days/);
+    assert.match(text,/Taker-flow rule: no net edge after costs/);
+    assert.match(text,/10,854 events across 92 UTC days/);
     assert.match(text,/-23\.94 bp/);
+    assert.match(text,/does not test celestial features, equities/);
     assert.match(text,/Always long/);
     assert.match(text,/Random direction \(expected\)/);
     assert.match(text,/40 scored forecasts across 1 UTC dates/);
