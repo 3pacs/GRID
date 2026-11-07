@@ -16,6 +16,14 @@ Usage::
 
 Designed to be cheap to run from a systemd timer or `cron @hourly` so the
 next-most-frequent error pattern surfaces before it's a fire.
+
+Release trees: on grid-svr every deploy is its own directory under
+``grid_release.releases/<sha>``, and each process writes the errors.jsonl of
+the tree it runs from. grid-scheduler stays pinned to an older release until
+``activate_scheduler``, so the current tree's file alone misses its errors
+(2026-11-07: the audit read "clean" while FinBERT failed every 2 h there).
+Without ``--log``, the audit therefore reads every sibling release's file
+touched inside the window and drops lines duplicated across copies.
 """
 
 from __future__ import annotations
@@ -60,18 +68,45 @@ def _normalize(msg: str) -> str:
     return s[:240]
 
 
-def _iter_entries(path: Path) -> Iterable[dict]:
-    if not path.exists():
-        return
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+def _iter_entries(path: Path | list[Path]) -> Iterable[dict]:
+    paths = [path] if isinstance(path, Path) else path
+    seen: set[str] = set()
+    for p in paths:
+        if not p.exists():
+            continue
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if len(paths) > 1:
+                    # Release trees carry copies of the same file; count a line once.
+                    if line in seen:
+                        continue
+                    seen.add(line)
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+
+def release_logs(default: Path, since: datetime) -> list[Path]:
+    """``default`` plus sibling release trees' errors.jsonl modified since ``since``."""
+    # The live tree is a symlink (grid_release -> grid_release.releases/<sha>).
+    repo = default.resolve().parent.parent
+    releases = repo.parent
+    paths = [default]
+    if not releases.name.endswith(".releases"):
+        return paths
+    cutoff = since.timestamp()
+    for p in sorted(releases.glob("*/.server-logs/errors.jsonl")):
+        try:
+            if p.resolve() == default.resolve() or p.stat().st_mtime < cutoff:
                 continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        except OSError:
+            continue
+        paths.append(p)
+    return paths
 
 
 def _parse_ts(raw: str) -> datetime | None:
@@ -84,7 +119,7 @@ def _parse_ts(raw: str) -> datetime | None:
 
 
 def audit(
-    log_path: Path,
+    log_path: Path | list[Path],
     cutoff: datetime,
     top: int,
     new_only: bool = False,
@@ -92,8 +127,9 @@ def audit(
     fail_on_new: int | None = None,
     fail_on_total: int | None = None,
 ) -> int:
-    if not log_path.exists():
-        print(f"no error log at {log_path}")
+    paths = [log_path] if isinstance(log_path, Path) else log_path
+    if not any(p.exists() for p in paths):
+        print(f"no error log at {', '.join(str(p) for p in paths)}")
         return 0
 
     recent: Counter[tuple[str, str, str]] = Counter()
@@ -180,8 +216,9 @@ def audit(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--log", type=Path, default=_DEFAULT_LOG,
-        help=f"Path to errors.jsonl (default: {_DEFAULT_LOG})",
+        "--log", type=Path, default=None,
+        help=f"Path to one errors.jsonl (default: {_DEFAULT_LOG} plus sibling "
+             "release trees' files touched in the window)",
     )
     parser.add_argument(
         "--hours", type=float, default=24.0,
@@ -224,8 +261,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
 
+    if args.log is not None:
+        log_paths: Path | list[Path] = args.log
+    else:
+        log_paths = release_logs(_DEFAULT_LOG, cutoff)
+        if len(log_paths) > 1:
+            print("reading: " + ", ".join(str(p) for p in log_paths))
     return audit(
-        log_path=args.log,
+        log_path=log_paths,
         cutoff=cutoff,
         top=args.top,
         new_only=args.new_only,
