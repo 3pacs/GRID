@@ -46,6 +46,15 @@ async def get_levers(
         return cached
 
     def _compute() -> dict[str, Any]:
+        # Background job ``levers`` (intelligence/api_precompute.py) keeps a
+        # stored copy; the live build below only runs before its first result.
+        from api.precompute_serving import read_precomputed
+
+        stored, meta = read_precomputed("intelligence.levers")
+        if stored is not None:
+            stored["precompute"] = meta
+            return stored
+
         from intelligence.global_levers import (
             get_lever_hierarchy,
             find_cross_domain_actors,
