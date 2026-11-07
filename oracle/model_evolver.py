@@ -177,7 +177,9 @@ class ModelEvolver:
             with self.engine.connect() as conn:
                 rows = conn.execute(text("""
                     SELECT id, thesis, evidence, confidence FROM discovered_hypotheses
-                    WHERE status IN ('confirmed','active') AND confidence >= 0.65
+                    WHERE (status = 'active'
+                           OR (status = 'confirmed' AND scoring_version IS NOT NULL))
+                    AND confidence >= 0.65
                     AND created_at >= NOW() - INTERVAL '7 days' ORDER BY confidence DESC LIMIT 10
                 """)).fetchall()
         except Exception as e:

@@ -28,6 +28,8 @@ if _GRID_DIR not in sys.path:
 
 from loguru import logger as log
 
+from governance.hypothesis_labels import LEGACY_CUTOFF
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train GRID regime model")
@@ -243,7 +245,11 @@ def main():
                 "(name, layer, version, state, hypothesis_id, feature_set, "
                 " parameter_snapshot, model_type) "
                 "VALUES (:name, :layer, :version, 'CANDIDATE', "
-                " (SELECT id FROM hypothesis_registry WHERE state='PASSED' ORDER BY updated_at DESC LIMIT 1), "
+                " (SELECT h.id FROM hypothesis_registry h WHERE h.state = 'PASSED' "
+                "   AND h.created_at >= :legacy_cutoff "
+                "   AND NOT EXISTS (SELECT 1 FROM hypothesis_registry_labels l "
+                "                   WHERE l.registry_id = h.id) "
+                "   ORDER BY h.updated_at DESC LIMIT 1), "
                 " :fset, :params, :mtype) "
                 "RETURNING id"
             ), {
@@ -253,6 +259,7 @@ def main():
                 "fset": feature_ids,
                 "params": param_snapshot,
                 "mtype": model_type,
+                "legacy_cutoff": LEGACY_CUTOFF,
             }).fetchone()
 
             model_id = model_row[0]

@@ -322,13 +322,23 @@ class PaperTradingEngine:
         }
 
     def register_all_passed(self) -> int:
-        """Register paper strategies for all PASSED TACTICAL hypotheses."""
+        """Register paper strategies for validated PASSED TACTICAL hypotheses.
+
+        Legacy PASSED rows (created before ``LEGACY_CUTOFF`` or carrying a
+        ``hypothesis_registry_labels`` label) are not validated findings and
+        are skipped; see ``governance.hypothesis_labels``.
+        """
+        from governance.hypothesis_labels import LEGACY_CUTOFF
+
         count = 0
         with self.engine.connect() as conn:
             hypos = conn.execute(text(
-                "SELECT id, statement, lag_structure FROM hypothesis_registry "
-                "WHERE state = 'PASSED' AND layer = 'TACTICAL'"
-            )).fetchall()
+                "SELECT h.id, h.statement, h.lag_structure FROM hypothesis_registry h "
+                "WHERE h.state = 'PASSED' AND h.layer = 'TACTICAL' "
+                "AND h.created_at >= :legacy_cutoff "
+                "AND NOT EXISTS (SELECT 1 FROM hypothesis_registry_labels l "
+                "WHERE l.registry_id = h.id)"
+            ), {"legacy_cutoff": LEGACY_CUTOFF}).fetchall()
 
         for h in hypos:
             lag = json.loads(h[2]) if isinstance(h[2], str) else (h[2] or {})

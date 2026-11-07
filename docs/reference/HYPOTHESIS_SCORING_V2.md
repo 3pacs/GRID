@@ -54,40 +54,45 @@ Dry run (read-only, any time): `python -m intelligence.hypothesis_trials dry-run
 --trials-out trials.jsonl` — forces `default_transaction_read_only = on` on every
 pooled connection and checks it, records into an in-memory ledger only.
 
-## Legacy rows — proposed additive relabel (not executed)
+## Legacy rows — additive relabel
 
-Nothing below rewrites history; every proposal is a reader filter or an
-append-only side table.
+Nothing rewrites history: v1 verdicts are told apart by a reader rule, and
+registry verdicts by an append-only side table.
 
 **`discovered_hypotheses` v1 verdicts** (133,089 confirmed / 71,476 invalidated
 on 2026-11-06; 114,826 of the confirmed lead-lag rows involve `snap:*`, 97,717
-mention `llm_task`). Every v1 terminal row has `scoring_version IS NULL`. Readers
-that surface "confirmed" hypotheses should count only
-`scoring_version IS NOT NULL` as trial-confirmed and show v1 rows as
-`legacy_v1_unsound`. No UPDATE needed.
+mention `llm_task`). Every v1 terminal row has `scoring_version IS NULL`.
+`get_stats` counts only `scoring_version IS NOT NULL` as confirmed/invalidated
+and reports v1 rows under `legacy_v1_unsound`; display readers (canvas,
+surfacer, valuation) show them as `legacy_v1_unsound`; `oracle/model_evolver`
+seeds from active or trial-confirmed rows only.
 
-**`hypothesis_registry`** (separate producer chain; see the PR for the code trace):
+**`hypothesis_registry`** (separate producer chain):
 
 - `PASSED` 10,609 rows = **35 distinct statements**, all TACTICAL, all
   `backtest_scanner` ("When X moves >1%, Y follows within 1 day (Sharpe 9.3…)").
   In-sample 504-day Sharpe/win-rate pass, no holdout, no multiple-testing
   correction, re-inserted up to 10 per run without dedup.
-- `TESTING` 30,821 rows = 185 distinct statements; 30,814 are PASSED rows the
+- `TESTING` 30,821 rows = 185 distinct statements: 30,782 are PASSED rows the
   LLM reviewer flagged ("Unrealistic assumptions (Sharpe 9.6…)", "Duplicate",
-  "Self-correlation disguised as a signal"); `hypothesis_tester` only reads
-  `CANDIDATE`, so nothing ever revisits TESTING. 7 are tester-inconclusive.
+  "Self-correlation disguised as a signal"), 39 are tester inconclusives or
+  AutoAgent rows with no verdict. `hypothesis_tester` only reads `CANDIDATE`,
+  so nothing ever revisits TESTING.
 - `FAILED` 85 is shrunk: the weekly prune deleted FAILED rows > 180 days until
   #1005.
 
-Proposal: an append-only `hypothesis_registry_labels` table
-(`registry_id, prior_state, label, reason, decided_by, created_at`) with
-`LEGACY_UNVALIDATED` for every PASSED row and `LEGACY_LLM_FLAGGED` /
-`LEGACY_INCONCLUSIVE` for TESTING, and the PASSED consumers
-(`trading/paper_engine.register_all_passed`, `validation/gates.py` CANDIDATE→SHADOW,
-`api/routers/discovery.py` promote, `scripts/train_regime_model.py`,
-`scripts/notify.py`) reading through it. The 35 + 185 distinct statements can
-be re-declared as fresh v2-style trials with a forward holdout from the date of
-re-declaration.
+`hypothesis_registry_labels` (migration `hypothesis_registry_labels_20261107`,
+append-only, UPDATE/DELETE/TRUNCATE refused) holds one label per row and
+`label_version`: `LEGACY_UNVALIDATED` (PASSED), `LEGACY_LLM_FLAGGED` and
+`LEGACY_INCONCLUSIVE` (TESTING). `scripts/label_legacy_hypotheses.py` writes
+them (dry run by default; `--apply --decided-by ...`; idempotent).
+
+Every PASSED consumer reads a row as validated only when it is PASSED, created
+at or after `governance.hypothesis_labels.LEGACY_CUTOFF` (2026-11-07) and
+unlabelled — so legacy rows are excluded even before the labels are written:
+`trading/paper_engine.register_all_passed`, `validation/gates.py`
+CANDIDATE→SHADOW, `api/routers/discovery.py` promote,
+`scripts/train_regime_model.py` (unreachable stub), `scripts/notify.py`.
 
 ## Production dry run (2026-11-07 00:5xZ, read-only, release f5b0510e + this branch)
 

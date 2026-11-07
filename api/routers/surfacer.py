@@ -1917,7 +1917,10 @@ def _fetch_hypothesis_candidates(conn: Any, limit: int) -> list[dict[str, Any]]:
         text(
             """
             SELECT id, thesis, pattern_type, evidence, test_criteria, invalidation,
-                   confidence, status, times_tested, times_correct, created_at,
+                   confidence,
+                   CASE WHEN status IN ('confirmed', 'invalidated') AND scoring_version IS NULL
+                        THEN 'legacy_v1_unsound' ELSE status END AS status,
+                   times_tested, times_correct, created_at,
                    last_tested, role
             FROM discovered_hypotheses
             WHERE LOWER(COALESCE(status, 'active')) NOT IN

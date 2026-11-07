@@ -41,6 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger as log
 
+from governance.hypothesis_labels import LEGACY_CUTOFF
+
 
 # ---------------------------------------------------------------------------
 # SMTP helpers
@@ -317,12 +319,15 @@ def format_daily_digest(engine: Any) -> str:
         with engine.connect() as conn:
             passed = conn.execute(
                 sa_text(
-                    "SELECT id, statement, updated_at "
-                    "FROM hypothesis_registry "
-                    "WHERE state = 'PASSED' AND updated_at >= :since "
-                    "ORDER BY updated_at DESC"
+                    "SELECT h.id, h.statement, h.updated_at "
+                    "FROM hypothesis_registry h "
+                    "WHERE h.state = 'PASSED' AND h.updated_at >= :since "
+                    "AND h.created_at >= :legacy_cutoff "
+                    "AND NOT EXISTS (SELECT 1 FROM hypothesis_registry_labels l "
+                    "WHERE l.registry_id = h.id) "
+                    "ORDER BY h.updated_at DESC"
                 ),
-                {"since": since},
+                {"since": since, "legacy_cutoff": LEGACY_CUTOFF},
             ).fetchall()
 
         lines.append(f"\nPassed Hypotheses  ({len(passed)})")
