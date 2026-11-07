@@ -17,8 +17,9 @@ Runs as step 7b in the Hermes operator cycle, or standalone:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
+from html.parser import HTMLParser
 from typing import Any
 
 from loguru import logger as log
@@ -41,9 +42,13 @@ _DIGEST_ENTITY_ID = "daily"
 
 _ISSUES_SQL = text("""
     SELECT id, category, severity, source, title, detail,
-           hermes_diagnosis, fix_applied, fix_result, created_at
+           hermes_diagnosis, fix_applied, fix_result, created_at,
+           COUNT(*) OVER () AS total_count,
+           COUNT(*) FILTER (WHERE severity = 'CRITICAL') OVER () AS critical_count,
+           COUNT(*) FILTER (WHERE severity = 'ERROR') OVER () AS error_count,
+           COUNT(*) FILTER (WHERE severity = 'WARNING') OVER () AS warning_count
     FROM operator_issues
-    WHERE created_at >= NOW() - INTERVAL '24 hours'
+    WHERE created_at >= :window_start AND created_at <= :window_end
     ORDER BY
         CASE severity
             WHEN 'CRITICAL' THEN 1
@@ -51,7 +56,7 @@ _ISSUES_SQL = text("""
             WHEN 'WARNING' THEN 3
             ELSE 4
         END,
-        created_at DESC
+        created_at DESC, id DESC
     LIMIT 100
 """)
 
@@ -111,21 +116,35 @@ def _collect_long_plays(engine: Any) -> dict[str, Any] | None:
         return None
 
 
-def _collect_issues(engine: Any) -> list[dict[str, Any]] | None:
-    """Collect all issues from the past 24 hours."""
+def _collect_issues(engine: Any, *, now: datetime | None = None) -> dict[str, Any] | None:
+    """Full 24-hour counts plus up to 100 prioritized records from one snapshot.
+
+    Window aggregates run before LIMIT, so a truncated detail sample never
+    masquerades as the total. None means collection failed, not zero issues.
+    """
+    now = now or datetime.now(timezone.utc)
     try:
         with engine.connect() as conn:
-            rows = conn.execute(_ISSUES_SQL).fetchall()
-            return [
+            rows = conn.execute(_ISSUES_SQL, {
+                "window_start": now - timedelta(hours=24), "window_end": now,
+            }).fetchall()
+        counts = dict(zip(
+            ("total", "critical", "error", "warning"),
+            rows[0][10:14] if rows else (0, 0, 0, 0),
+        ))
+        return {
+            "counts": counts,
+            "items": [
                 {
                     "id": r[0], "category": r[1], "severity": r[2],
                     "source": r[3], "title": r[4], "detail": r[5],
                     "diagnosis": r[6], "fix_applied": r[7],
                     "fix_result": r[8],
-                    "time": r[9].isoformat() if r[9] else None,
+                    "time": r[9].isoformat() if isinstance(r[9], datetime) else r[9],
                 }
                 for r in rows
-            ]
+            ],
+        }
     except Exception as exc:
         log.debug("Could not collect issues: {e}", e=str(exc))
         return None
@@ -310,17 +329,111 @@ def _fmt_num(value: Any, fmt: str = "{:.2f}") -> str:
         v = float(value)
     except (TypeError, ValueError):
         return "&#8212;"
-    if v != v:
+    if v != v or v in (float("inf"), float("-inf")):
         return "&#8212;"
     return fmt.format(v)
 
 
-def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
+def _plain_digest_body(body: str) -> str:
+    """Readable multipart alternative, retaining list/table boundaries."""
+    class TextParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.parts: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag in {"br", "div", "p", "li", "tr"}:
+                self.parts.append("\n")
+            if tag == "li":
+                self.parts.append("- ")
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"div", "p", "li", "tr"}:
+                self.parts.append("\n")
+            elif tag in {"td", "th"}:
+                self.parts.append(" | ")
+            elif tag == "span":
+                self.parts.append(" ")
+
+        def handle_data(self, data: str) -> None:
+            self.parts.append(data)
+
+    parser = TextParser()
+    parser.feed(body)
+    parser.close()
+    return "\n".join(line.strip(" |") for line in "".join(parser.parts).splitlines() if line.strip(" |"))
+
+
+def _board_as_of(board: dict[str, Any], now: datetime) -> str:
+    """Date-level age, not an invented source-refresh SLA or live signal."""
+    try:
+        as_of = date.fromisoformat(str(board.get("as_of")))
+    except (TypeError, ValueError):
+        return "as-of date unavailable; age unknown"
+    days = (now.date() - as_of).days
+    if days < 0:
+        return f"as of {as_of} (future date; age unknown)"
+    return f"as of {as_of} ({days} calendar days old)"
+
+
+def _catalyst_date(value: Any, now: datetime) -> str:
+    try:
+        at = date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return "Date unknown" if not value else escape(str(value)) + " (date unverified)"
+    if at < now.date():
+        return f"{at} (past date; outcome unverified)"
+    if at == now.date():
+        return f"{at} (today; outcome unverified)"
+    return f"{at} (scheduled; unverified)"
+
+
+def _digest_recap(
+    ux_audit: dict[str, Any] | None,
+    system_stats: dict[str, Any],
+    long_plays: dict[str, Any] | None,
+    now: datetime,
+) -> str:
+    """Short cross-section recap before the detailed tables."""
+    coverage = (ux_audit or {}).get("coverage")
+    if coverage is not None:
+        ux = (
+            f"{coverage['endpoints_tested']}/{coverage['endpoints_total']} endpoints tested, "
+            f"{coverage['endpoints_failed']} failed, {coverage['endpoints_skipped']} skipped, "
+            f"{coverage['endpoints_untested']} untested"
+        )
+    else:
+        ux = "coverage unknown" if ux_audit else "no recent result; status unknown"
+    sources = system_stats.get("sources_pulled")
+    activity = f"{sources:,} sources pulled" if sources is not None else "source activity unavailable"
+    runs = system_stats.get("pipeline_runs")
+    if runs is not None:
+        activity += f", {runs:,} pipeline runs"
+    if long_plays:
+        entries = sum(
+            c.get("stance") == "entry_candidate"
+            for c in long_plays.get("candidates") or [] if isinstance(c, dict)
+        )
+        plays = f"{entries} recorded entry candidates; {_board_as_of(long_plays, now)}; not revalidated"
+    else:
+        plays = "board unavailable; candidate status unknown"
+    return (
+        "<br><br><strong>In brief</strong><ul>"
+        f"<li><strong>UX:</strong> {ux}.</li>"
+        f"<li><strong>Activity (24h):</strong> {activity}.</li>"
+        f"<li><strong>Long Plays:</strong> {plays}.</li></ul>"
+    )
+
+
+def _build_long_plays_section(
+    board: dict[str, Any] | None, *, now: datetime | None = None,
+) -> dict[str, Any]:
     """Long Plays section: entry candidates first, with the route that qualified them."""
+    now = now or datetime.now(timezone.utc)
     if not board:
         return {
             "title": "Long Plays",
-            "body": "<span style='color:#5A7A96'>No Long Plays board has been built yet</span>",
+            "body": "<span style='color:#5A7A96'>Long Plays board unavailable; candidate status unknown</span>",
         }
 
     from intelligence.long_plays import entry_first
@@ -331,14 +444,18 @@ def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
     route_tail = ", ".join(f"{route} {n}" for route, n in sorted(by_route.items()) if n)
 
     body = (
+        f"<strong>Recorded snapshot {_board_as_of(board, now)}</strong><br>"
+        f"Generated: {_format_event_time(board.get('generated_at'), now)}<br>"
+        "Candidate eligibility and underlying inputs are not revalidated for this email. "
+        "Past catalyst dates do not establish an event outcome.<br><br>"
         f"<div class='kpi-row'>"
         f"<span class='kpi-label'>Universe</span>"
-        f"<span class='kpi-value'>{board.get('universe_size', '?')}</span>"
+        f"<span class='kpi-value'>{escape(str(board.get('universe_size', '?')))}</span>"
         f"</div>"
         f"<div class='kpi-row'>"
-        f"<span class='kpi-label'>Entry Candidates</span>"
-        f"<span class='kpi-value' style='color:{'#22C55E' if entries else '#5A7A96'}'>"
-        f"{len(entries)}{f' ({route_tail})' if route_tail else ''}</span>"
+        f"<span class='kpi-label'>Recorded entry candidates</span>"
+        f"<span class='kpi-value' style='color:#5A7A96'>"
+        f"{len(entries)}{f' ({escape(route_tail)})' if route_tail else ''}</span>"
         f"</div>"
     )
 
@@ -347,17 +464,18 @@ def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
         gate = cand.get("gate") or {}
         stance = cand.get("stance") or ""
         stance_color = {
-            "entry_candidate": "#22C55E", "watch": "#5A7A96", "avoid": "#EF4444",
+            "entry_candidate": "#5A7A96", "watch": "#5A7A96", "avoid": "#EF4444",
         }.get(stance, "#5A7A96")
         proj_3y = ((cand.get("projection") or {}).get("3y") or {})
         rows_html += (
             f"<tr>"
-            f"<td style='font-size:13px;font-weight:700'>{cand.get('ticker', '')}</td>"
-            f"<td style='color:{stance_color};font-size:11px;font-weight:700'>{stance}</td>"
-            f"<td style='font-size:13px'>{cand.get('coverage_route') or '&#8212;'}</td>"
+            f"<td style='font-size:13px;font-weight:700'>{escape(str(cand.get('ticker') or ''))}</td>"
+            f"<td style='color:{stance_color};font-size:11px;font-weight:700'>{escape(str(stance))}</td>"
+            f"<td style='font-size:13px'>{escape(str(cand.get('coverage_route') or 'Unknown'))}</td>"
             f"<td style='font-size:13px'>{_fmt_usd_short(cand.get('market_cap_usd'))}</td>"
             f"<td style='font-size:13px'>{_fmt_num(gate.get('cash_runway_months'), '{:.0f} mo')}</td>"
-            f"<td style='font-size:13px'>{gate.get('next_catalyst_date') or '&#8212;'}</td>"
+            f"<td style='font-size:13px'>{_catalyst_date(gate.get('next_catalyst_date'), now)}</td>"
+            f"<td style='font-size:13px'>{escape(str(cand.get('price_as_of') or 'Unknown'))}</td>"
             f"<td style='font-size:13px'>"
             f"{_fmt_num(proj_3y.get('p50_multiple'), '{:.2f}x')} / "
             f"{_fmt_num(proj_3y.get('p90_multiple'), '{:.2f}x')}</td>"
@@ -366,9 +484,10 @@ def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
 
     if rows_html:
         body += (
+            f"<p>Showing {min(len(rows), 15)} of {len(rows)} saved board rows, entry candidates first.</p>"
             "<br><table class='data-table'>"
             "<tr><th>TICKER</th><th>STANCE</th><th>ROUTE</th><th>CAP</th>"
-            "<th>RUNWAY</th><th>CATALYST</th><th>3Y p50/p90</th></tr>"
+            "<th>RUNWAY</th><th>RECORDED CATALYST</th><th>PRICE AS OF</th><th>3Y p50/p90</th></tr>"
             f"{rows_html}</table>"
             "<br><em style='color:#5A7A96;font-size:12px'>Multiples are a seeded proxy "
             "from historical CAGR/vol &#8212; not a forecast.</em>"
@@ -377,13 +496,13 @@ def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
     if not entries and board.get("stand_down_reason"):
         body += (
             f"<br><strong style='color:#F59E0B'>Stand down:</strong> "
-            f"{board['stand_down_reason']}"
+            f"{escape(str(board['stand_down_reason']))}"
         )
 
     return {
         "title": "Long Plays",
         "body": body,
-        "accent": "green" if entries else "",
+        "accent": "amber",
     }
 
 
@@ -392,40 +511,57 @@ def _build_digest_sections(
     ux_audit: dict[str, Any] | None,
     system_stats: dict[str, Any],
     long_plays: dict[str, Any] | None = None,
+    *,
+    issue_counts: dict[str, int] | None = None,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Build email sections for the daily digest."""
     sections: list[dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
     # A failed collector cannot establish a zero-issue interval.
     issues_available = issues is not None
     issues = issues or []
 
     # ── Error Summary ──
-    critical = [i for i in issues if i["severity"] == "CRITICAL"]
-    errors = [i for i in issues if i["severity"] == "ERROR"]
-    warnings = [i for i in issues if i["severity"] == "WARNING"]
-
-    error_body = f"<strong>{len(issues)}</strong> issues in the past 24h"
-    if critical:
-        error_body += f"<br><span style='color:#EF4444'>CRITICAL: {len(critical)}</span>"
-    if errors:
-        error_body += f"<br><span style='color:#F59E0B'>ERROR: {len(errors)}</span>"
-    if warnings:
-        error_body += f"<br><span style='color:#5A7A96'>WARNING: {len(warnings)}</span>"
-
+    counts = issue_counts if issue_counts is not None else {
+        "total": len(issues),
+        **{severity.lower(): sum(i["severity"] == severity for i in issues)
+           for severity in ("CRITICAL", "ERROR", "WARNING")},
+    }
+    total = counts["total"]
+    critical, errors, warnings = (counts[key] for key in ("critical", "error", "warning"))
+    error_body = (
+        f"<strong style='font-size:32px'>{total:,}</strong> operator issue records in the past 24h"
+        f"<br><strong>{critical + errors:,} critical/error records</strong>: "
+        f"{critical:,} critical, {errors:,} errors; {warnings:,} warnings"
+    )
+    other = total - critical - errors - warnings
+    if other:
+        error_body += f"; {other:,} other"
+    error_body += (
+        ".<br>Recorded events, not a current open-issue count. "
+        "Health alert emails are tracked separately."
+    )
     if not issues_available:
         error_body = "Operator issue history unavailable; health status is unknown."
         accent = "amber"
-    elif not issues:
-        error_body = "No operator issues recorded in the past 24 hours. Health alert emails are tracked separately."
-        accent = ""
     elif critical:
         accent = "red"
     elif errors:
         accent = "amber"
     else:
         accent = ""
+    error_body += (
+        f"<br><strong>Issue window (UTC):</strong> {now - timedelta(hours=24):%Y-%m-%d %H:%M:%S}"
+        f" through {now:%Y-%m-%d %H:%M:%S}, inclusive."
+    )
+    if issues:
+        error_body += (
+            "<br><strong>Highest-priority recorded issue:</strong> "
+            + escape(str(issues[0].get("title") or "Untitled"))
+        )
+    error_body += _digest_recap(ux_audit, system_stats, long_plays, now)
 
     sections.append({"title": "Error Summary", "body": error_body, "accent": accent})
 
@@ -436,27 +572,34 @@ def _build_digest_sections(
             sev_color = {"CRITICAL": "#EF4444", "ERROR": "#F59E0B", "WARNING": "#5A7A96"}.get(
                 i["severity"], "#5A7A96"
             )
-            fix_icon = {
-                "FIXED": "&#10003;", "PENDING": "&#9711;", "FAILED": "&#10007;",
-            }.get(i.get("fix_result", ""), "&#8212;")
-
+            fix_result = str(i.get("fix_result") or "NOT RECORDED")
             rows_html += (
                 f"<tr>"
-                f"<td style='color:{sev_color};font-weight:700;font-size:11px'>{i['severity']}</td>"
+                f"<td style='color:{sev_color};font-weight:700;font-size:11px'>{escape(str(i['severity']))}</td>"
                 f"<td style='font-size:13px'>{_format_event_time(i.get('time'), now)}</td>"
-                f"<td style='font-size:13px'>{i['title'][:80]}</td>"
-                f"<td style='font-size:13px'>{i.get('source', '')}</td>"
-                f"<td style='font-size:13px;text-align:center'>{fix_icon}</td>"
+                f"<td style='font-size:13px'>{escape(str(i.get('title') or 'Untitled'))}</td>"
+                f"<td style='font-size:13px'>{escape(str(i.get('source') or 'Unknown'))}</td>"
+                f"<td style='font-size:13px'>{escape(fix_result)}</td>"
                 f"</tr>"
             )
+            detail = []
+            for key, label in (("detail", "Detail"), ("diagnosis", "Diagnosis"), ("fix_applied", "Fix applied")):
+                if i.get(key):
+                    value = escape(str(i[key])).replace("\n", "<br>")
+                    detail.append(f"<strong>{label}:</strong> {value}")
+            if detail:
+                rows_html += "<tr><td colspan='5' style='font-size:13px'>" + "<br>".join(detail) + "</td></tr>"
 
+        shown = min(len(issues), 15)
         table = (
+            f"<p>Showing {shown:,} of {total:,} records, ordered by severity then newest first. "
+            "Fix results are recorded outcomes, not a live health check.</p>"
             "<table class='data-table'>"
-            "<tr><th>SEV</th><th>RECORDED AT / AGE</th><th>ISSUE</th><th>SOURCE</th><th>FIX</th></tr>"
+            "<tr><th>SEV</th><th>RECORDED AT / AGE</th><th>ISSUE</th><th>SOURCE</th><th>FIX RESULT</th></tr>"
             f"{rows_html}</table>"
         )
-        if len(issues) > 15:
-            table += f"<br><em style='color:#5A7A96'>...and {len(issues) - 15} more</em>"
+        if total > shown:
+            table += f"<br><em style='color:#5A7A96'>{total - shown:,} additional records not shown.</em>"
 
         sections.append({"title": "Error Details", "body": table})
 
@@ -552,7 +695,7 @@ def _build_digest_sections(
 
     # ── System Health ──
     sys_body = ""
-    if system_stats.get("sources_pulled"):
+    if system_stats.get("sources_pulled") is not None:
         sys_body += (
             f"<div class='kpi-row'>"
             f"<span class='kpi-label'>Sources Pulled</span>"
@@ -595,8 +738,10 @@ def _build_digest_sections(
     sections.append({"title": "System Health (24h)", "body": sys_body})
 
     # ── Long Plays ──
-    sections.append(_build_long_plays_section(long_plays))
+    sections.append(_build_long_plays_section(long_plays, now=now))
 
+    for section in sections:
+        section["plain"] = _plain_digest_body(section["body"])
     return sections
 
 
@@ -617,14 +762,17 @@ def send_daily_digest(engine: Any, dry_run: bool = False) -> dict[str, Any]:
     log.info("Building daily digest")
 
     # Collect data
-    issues = _collect_issues(engine)
+    now = datetime.now(timezone.utc)
+    issue_report = _collect_issues(engine, now=now)
+    issues = issue_report["items"] if issue_report is not None else None
+    issue_counts = issue_report["counts"] if issue_report is not None else None
     ux_audit = _collect_ux_audit(engine)
     system_stats = _collect_system_stats(engine)
     long_plays = _collect_long_plays(engine)
 
     result: dict[str, Any] = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "issues_count": len(issues) if issues is not None else None,
+        "timestamp": now.isoformat(),
+        "issues_count": issue_counts["total"] if issue_counts is not None else None,
         "ux_score": ux_audit.get("score") if ux_audit else None,
         "has_ux_audit": ux_audit is not None,
         "long_plays_entry_candidates": (
@@ -633,19 +781,21 @@ def send_daily_digest(engine: Any, dry_run: bool = False) -> dict[str, Any]:
     }
 
     # Build email
-    sections = _build_digest_sections(issues, ux_audit, system_stats, long_plays)
-    now = datetime.now(timezone.utc)
+    sections = _build_digest_sections(
+        issues, ux_audit, system_stats, long_plays, issue_counts=issue_counts, now=now,
+    )
     subject = (
         f"GRID Daily Digest — {now.strftime('%b %d')} | "
-        + (f"{len(issues)} operator issues" if issues is not None else "issue history unavailable")
+        + (f"{issue_counts['total']:,} issue records (24h)" if issue_counts is not None else "issue history unavailable")
     )
-    if ux_audit and ux_audit.get("score"):
-        subject += f" | UX: {ux_audit['score']}/10"
+    if issue_counts and issue_counts["critical"]:
+        subject += f" | {issue_counts['critical']:,} critical"
 
     if dry_run:
         result["dry_run"] = True
         result["subject"] = subject
         result["sections"] = len(sections)
+        result["section_bodies"] = sections
         log.info("Daily digest built (dry run) — {n} sections", n=len(sections))
         return result
 

@@ -2240,6 +2240,9 @@ class OracleEngine:
         """
         log.info("═══ Oracle Cycle Starting ═══")
 
+        cycle_started_at = datetime.now(timezone.utc)
+        self._last_store_counts = {}
+
         # 1. Score expired predictions
         score_result = self.score_expired_predictions()
 
@@ -2288,6 +2291,8 @@ class OracleEngine:
 
         _counts = getattr(self, "_last_store_counts", {}) or {}
         result = {
+            "cycle_started_at": cycle_started_at.isoformat(),
+            "cycle_completed_at": datetime.now(timezone.utc).isoformat(),
             "scoring": score_result,
             "evolution": evolve_result,
             "trace_evolution": trace_evolve_result,

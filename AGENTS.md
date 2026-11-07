@@ -161,3 +161,34 @@ Broken or TBD:
 - Extend or replace the [[GDELT]] parser so it ingests the real `/data/gdelt` archive roots, then build a checksum/ingest manifest before active-disk cleanup.
 - Add a manifest-backed copy/remove executor after parser proof; the current subagent is intentionally inventory/plan only.
 - The live `/home/grid/grid_v4/grid_repo` checkout is on `fix/hermes-active-hypo-scoring-dedent-2026-05-17`, ahead of origin with many dirty files. Do not hard-reset it; reconcile as a separate server-worktree cleanup.
+
+## 2026-11-07 - summary-first Oracle and operator email reporting (source only)
+
+What was done:
+
+- Added a prominent Oracle activity headline and concise recap before the supplied
+  prediction detail. New prediction rows, model votes and update operations remain
+  separate; absent or incomplete store counts are unknown, never substituted.
+- Replaced the Oracle email's misleading P/L percentage with a labeled historical
+  signed-move sum in percentage points. It is an unreconciled diagnostic, not a
+  portfolio/option return. No scoring, historical data or model weights changed.
+- Added cycle timestamps, nullable/non-finite display handling, expiry status,
+  full supplied signal/anti-signal detail and readable plain text.
+- Operator issue totals now aggregate the full bounded 24-hour interval before
+  the 100-record detail limit. The recap and subject say historical issue records,
+  not current open incidents. Retained diagnosis, fix text and recorded statuses.
+- Long Plays displays the saved board/price dates and marks past catalysts as
+  outcome-unverified. Snapshot age never implies revalidated eligibility.
+
+Verification and limits:
+
+- 197 offline tests passed on Python 3.12 with outbound sockets blocked and
+  SQLAlchemy 2.0.57. Oracle report line coverage 100%; operator whole-module 76%;
+  combined 82%. Ruff, compilation and diff checks passed for changed reporting
+  code/tests. Synthetic Oracle/operator HTML previews inspected in Chromium.
+- Independent review's incomplete-update-count and malformed-candidate findings
+  were fixed and covered by regression tests.
+- Draft source change only: no SMTP send, production query, historical repair,
+  merge, deployment, schedule change or new external-agent communication.
+- PostgreSQL integration, full repository CI and deployed email/client acceptance
+  remain separate. This does not reconcile the historical prediction track record.
