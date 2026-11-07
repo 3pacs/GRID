@@ -867,9 +867,22 @@ def launch_job_subprocess(*, nice: int = 10) -> bool:
     return True
 
 
-def maybe_launch(engine: Any = None, *, max_age_hours: float = 26.0) -> bool:
-    """Launch the job when it is enabled and the newest run is stale/missing."""
+# The 03:40 daily run skips only when a run finished this recently (e.g. a
+# restart catch-up just before the slot). A wider window let a late catch-up
+# (22:30) silently cancel the next morning's run.
+DAILY_MIN_AGE_HOURS = 3.0
+CATCH_UP_MAX_AGE_HOURS = 26.0
+
+
+def maybe_launch(engine: Any = None, *, max_age_hours: float = CATCH_UP_MAX_AGE_HOURS,
+                 trigger: str = "catch-up") -> bool:
+    """Launch the job when it is enabled and the newest run is stale/missing.
+
+    Every skip is logged with its reason so a run that did not happen is
+    visible in the journal.
+    """
     if not job_enabled():
+        log.info("actor universe ({t}): GRID_ACTOR_UNIVERSE_JOB is off; not launching", t=trigger)
         return False
     if engine is None:
         from db import get_engine
@@ -881,6 +894,8 @@ def maybe_launch(engine: Any = None, *, max_age_hours: float = 26.0) -> bool:
         log.warning("actor universe: freshness check failed: {e}", e=str(exc))
         return False
     if age is not None and age < max_age_hours:
+        log.info("actor universe ({t}): newest run is {a:.1f}h old (< {m:g}h); not launching",
+                 t=trigger, a=age, m=max_age_hours)
         return False
     return launch_job_subprocess()
 

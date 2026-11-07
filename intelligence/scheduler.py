@@ -491,20 +491,21 @@ def run_intelligence_loop() -> None:
         (its igraph work would hold this loop's GIL for minutes) and writes
         a new ``actor_graph_*`` version that /actor-network and
         /actor-universe/* read. ``GRID_ACTOR_UNIVERSE_JOB=0`` disables it.
+        It skips only a run that finished within ``DAILY_MIN_AGE_HOURS``.
         """
         try:
-            from intelligence.actors.universe import maybe_launch
+            from intelligence.actors.universe import DAILY_MIN_AGE_HOURS, maybe_launch
 
-            maybe_launch(max_age_hours=20.0)
+            maybe_launch(max_age_hours=DAILY_MIN_AGE_HOURS, trigger="daily 03:40")
         except Exception as exc:  # noqa: BLE001
             log.warning("actor universe daily launch failed: {e}", e=str(exc))
 
     def _actor_universe_catch_up():  # returns schedule.CancelJob
         """Once after start: run now if the newest version is >26h old or missing."""
         try:
-            from intelligence.actors.universe import maybe_launch
+            from intelligence.actors.universe import CATCH_UP_MAX_AGE_HOURS, maybe_launch
 
-            maybe_launch(max_age_hours=26.0)
+            maybe_launch(max_age_hours=CATCH_UP_MAX_AGE_HOURS, trigger="startup catch-up")
         except Exception as exc:  # noqa: BLE001
             log.warning("actor universe catch-up failed: {e}", e=str(exc))
         return _sched.CancelJob
