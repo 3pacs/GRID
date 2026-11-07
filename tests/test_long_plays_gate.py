@@ -577,7 +577,7 @@ def test_both_digest_surfaces_list_entry_candidates_first() -> None:
     digest_src = _read("scripts/daily_digest.py")
     assert "def _build_long_plays_section" in digest_src
     assert "from intelligence.long_plays import entry_first" in digest_src
-    assert "_build_long_plays_section(long_plays)" in digest_src
+    assert "_build_long_plays_section(long_plays, now=now)" in digest_src
 
 
 def test_raw_series_reads_are_bounded_on_both_sides() -> None:

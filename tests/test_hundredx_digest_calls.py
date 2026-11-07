@@ -373,7 +373,7 @@ def test_card_states_the_exact_call():
     assert "exit if OMER trades above $20.39" in plain
     assert "earnings 2026-11-12 (earnings_calendar) FQ 3" in plain
     assert "OTM-put/ATM IV skew 0.73" in plain
-    assert "options_daily_signals row 2026-11-03 (0d old), captured 2026-11-03 15:00Z" in plain
+    assert "options_daily_signals row 2026-11-03 (0d old at idea date), captured 2026-11-03 15:00Z" in plain
     assert "SUSPECT: IV <b>high</b>" in plain          # escaped in HTML ...
     assert "<b>high</b>" not in card["body"]            # ... not injected
     # The fictional payoff multiple is gone.
@@ -518,3 +518,72 @@ def test_plain_text_keeps_table_cells_apart():
               "open_median_return": 0.1, "unpriced": 0}
     plain = hx._plain(hx._format_track_record(record)["body"])
     assert "Emailed  Contract  Entry  Status  Return" in plain
+
+
+
+def test_summary_does_not_invent_quote_coverage_or_risk():
+    data = [{"direction": "CALL", "economics": {"max_loss": float("inf")}}, {}]
+    card = hx._format_summary_section(data, [{"contract": {"bid": 1, "ask": float("nan")}}])
+    plain = hx._plain(card["body"])
+    assert "0/2 shown ideas have a retrieved two-sided quote" in plain
+    assert "1 direction unavailable" in plain
+    assert "coverage unavailable" in plain
+    assert "Premium at risk" not in plain
+    assert "UNPROVEN" in plain
+
+
+def test_summary_scanner_failure_is_not_zero_candidate_all_clear():
+    card = hx._format_summary_section([], [], scan_stats={
+        "scanner_failed": True, "sanity_rejected": 0, "llm_rejected": 0, "not_checked": 0})
+    assert "candidate coverage is unavailable" in card["body"]
+    assert "0 scanner candidates returned" not in card["body"]
+
+
+def test_card_keeps_full_thesis_and_flags_expired_stale_inputs():
+    opp, verification = _card_inputs()
+    today = datetime.now(timezone.utc).date()
+    old = today - timedelta(days=40)
+    opp.update(as_of=old, signal_date=old, thesis="Detailed <thesis> " * 50 + "THE END",
+               catalyst={"status": "found", "date": old.isoformat(), "type": "earnings", "source": "test"})
+    verification["contract"]["expiry"] = (today - timedelta(days=1)).isoformat()
+    html = hx._format_opportunity_card(opp, verification, 1)["body"]
+    assert "EXPIRED" in html and "Historical idea: BUY" in html
+    assert "PAST DATE, outcome unconfirmed" in html
+    assert "STALE at rendering" in html
+    assert "Detailed &lt;thesis&gt;" in html and "THE END" in html
+    assert "<thesis>" not in html
+
+
+def test_track_record_keeps_full_bounded_sample_and_price_dates():
+    row = {"ticker": "X", "direction": "PUT", "expiry": date(2026, 10, 1), "strike": 10,
+           "entry": 1, "status": "SETTLED", "return": .5, "priced_on": date(2026, 10, 1),
+           "emailed_at": datetime(2026, 9, 1, tzinfo=timezone.utc)}
+    calls = [dict(row, ticker=f"R{i:02}") for i in range(50)]
+    record = {"as_of": date(2026, 11, 1), "calls": calls, "settled": 50, "settled_wins": 50,
+              "settled_hit_rate": 1, "settled_median_return": .5, "open": 0, "open_median_return": None}
+    plain = hx._plain(hx._format_track_record(record)["body"])
+    assert "all 50 supplied rows shown" in plain
+    assert "R49" in plain and "Price date" in plain
+    assert "not a lifetime record" in plain and "not realized account P/L" in plain
+
+
+def test_card_escapes_provenance_dates_and_catalyst_text():
+    opp, verification = _card_inputs()
+    verification["contract"]["quote_at"] = "<quote>"
+    verification["spot_at"] = "<spot>"
+    opp["catalyst"]["date"] = "<event>"
+    html = hx._format_opportunity_card(opp, verification, 1)["body"]
+    for field in ("quote", "spot", "event"):
+        assert f"<{field}>" not in html
+        assert f"&lt;{field}&gt;" in html
+
+
+
+def test_card_expiring_today_and_future_signal_are_explicit():
+    opp, verification = _card_inputs()
+    now = datetime.now(timezone.utc)
+    opp.update(as_of=now, signal_date=now.date() + timedelta(days=1))
+    verification["contract"]["expiry"] = now.date().isoformat()
+    html = hx._format_opportunity_card(opp, verification, 1)["body"]
+    assert "Expires today; intraday expiry cutoff unverified" in html
+    assert "FUTURE date, freshness unverified" in html

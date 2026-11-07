@@ -50,10 +50,13 @@ Public API
 
 from __future__ import annotations
 
+import html
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -263,6 +266,7 @@ def detect_new_suppliers(
                         "input_type": input_type,
                         "annual_usd": _float_or_none(annual_usd),
                         "chokepoint_score": _float_or_none(score),
+                        "record_created_at": _created.isoformat() if _created else None,
                     },
                 ).as_dict()
             )
@@ -345,6 +349,7 @@ def detect_concentration_shifts(
                         "pct_downstream_cogs": cur,
                         "prev_pct_downstream_cogs": prev,
                         "delta_pp": delta,
+                        "baseline_at": str(e["snapshotted_at"]) if e.get("snapshotted_at") else None,
                     },
                 ).as_dict()
             )
@@ -389,6 +394,7 @@ def detect_chokepoint_degradation(
                         "edge_key": key,
                         "chokepoint_score": cur,
                         "prev_chokepoint_score": prev,
+                        "baseline_at": str(e["snapshotted_at"]) if e.get("snapshotted_at") else None,
                         "delta": delta,
                     },
                 ).as_dict()
@@ -435,6 +441,7 @@ def detect_new_high_chokepoints(
                         "edge_key": key,
                         "chokepoint_score": cur,
                         "prev_chokepoint_score": prev,
+                        "baseline_at": str(e["snapshotted_at"]) if e.get("snapshotted_at") else None,
                         "threshold": threshold,
                     },
                 ).as_dict()
@@ -521,6 +528,7 @@ def detect_geographic_spikes(
                         "country": country,
                         "country_upstream_count": total,
                         "chokepoint_score": _float_or_none(score),
+                        "record_created_at": _created.isoformat() if _created else None,
                     },
                 ).as_dict()
             )
@@ -583,6 +591,7 @@ def detect_large_acquisitions(
                         "amount_usd": amt,
                         "fiscal_period": period.isoformat() if period else None,
                         "source_filing": filing,
+                        "record_as_of": _as_of.isoformat() if _as_of else None,
                     },
                 ).as_dict()
             )
@@ -733,30 +742,35 @@ def run_all(
                 "snapshots_written": int}``.
     """
     findings: dict[str, list[dict[str, Any]]] = {}
+    failed_detectors: list[str] = []
 
     try:
         findings["new_suppliers"] = detect_new_suppliers(engine, since_hours)
     except Exception as exc:
         log.warning("new_suppliers detector failed: {e}", e=str(exc))
         findings["new_suppliers"] = []
+        failed_detectors.append("new_suppliers")
 
     try:
         findings["concentration_shifts"] = detect_concentration_shifts(engine)
     except Exception as exc:
         log.warning("concentration_shifts detector failed: {e}", e=str(exc))
         findings["concentration_shifts"] = []
+        failed_detectors.append("concentration_shifts")
 
     try:
         findings["chokepoint_degradation"] = detect_chokepoint_degradation(engine)
     except Exception as exc:
         log.warning("chokepoint_degradation detector failed: {e}", e=str(exc))
         findings["chokepoint_degradation"] = []
+        failed_detectors.append("chokepoint_degradation")
 
     try:
         findings["new_high_chokepoints"] = detect_new_high_chokepoints(engine)
     except Exception as exc:
         log.warning("new_high_chokepoints detector failed: {e}", e=str(exc))
         findings["new_high_chokepoints"] = []
+        failed_detectors.append("new_high_chokepoints")
 
     try:
         findings["geographic_spikes"] = detect_geographic_spikes(
@@ -765,6 +779,7 @@ def run_all(
     except Exception as exc:
         log.warning("geographic_spikes detector failed: {e}", e=str(exc))
         findings["geographic_spikes"] = []
+        failed_detectors.append("geographic_spikes")
 
     try:
         findings["large_acquisitions"] = detect_large_acquisitions(
@@ -773,18 +788,22 @@ def run_all(
     except Exception as exc:
         log.warning("large_acquisitions detector failed: {e}", e=str(exc))
         findings["large_acquisitions"] = []
+        failed_detectors.append("large_acquisitions")
 
     try:
         findings["contagion_risk"] = detect_contagion_risk(engine)
     except Exception as exc:
         log.warning("contagion_risk detector failed: {e}", e=str(exc))
         findings["contagion_risk"] = []
+        failed_detectors.append("contagion_risk")
 
+    scan_context = {"since_hours": since_hours, "failed_detectors": failed_detectors,
+                    "generated_at": datetime.now(timezone.utc).isoformat()}
     total = sum(len(v) for v in findings.values())
     sent = False
     if send_email and total > 0:
         try:
-            sent = send_digest(findings)
+            sent = send_digest(findings, scan_context=scan_context)
         except Exception as exc:
             log.warning("digest send failed: {e}", e=str(exc))
             sent = False
@@ -824,7 +843,8 @@ def run_all(
         "total": total,
         "sent": sent,
         "snapshots_written": snaps,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": scan_context["generated_at"],
+        "failed_detectors": failed_detectors,
     }
     log.info(
         "supply_chain_alerts.run_all: total={t} sent={s} snapshots={n}",
@@ -848,13 +868,8 @@ _SECTION_TITLES: dict[str, tuple[str, str]] = {
 }
 
 
-def _escape_html(s: str) -> str:
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+def _escape_html(s: Any) -> str:
+    return html.escape(str(s), quote=True)
 
 
 def _render_finding_row(f: dict[str, Any]) -> str:
@@ -862,7 +877,23 @@ def _render_finding_row(f: dict[str, Any]) -> str:
     delta = _escape_html(f.get("delta", ""))
     headline = _escape_html(f.get("headline", ""))
     context = _escape_html(f.get("context", ""))
-    link = f.get("deep_link", CANVAS_LINK_BASE)
+    link = str(f.get("deep_link") or CANVAS_LINK_BASE)
+    try:
+        safe_link = urlsplit(link).scheme.lower() in {"http", "https"}
+    except ValueError:
+        safe_link = False
+    link = _escape_html(link if safe_link else CANVAS_LINK_BASE)
+    payload = f.get("payload") or {}
+    dates = []
+    for key, label in (("record_created_at", "Record created"), ("record_as_of", "Record as of"),
+                       ("baseline_at", "Comparison baseline")):
+        if payload.get(key):
+            dates.append(f"{label}: {payload[key]}")
+    provenance = _escape_html("; ".join(dates)) if dates else "Source timestamps unavailable."
+    if payload.get("baseline_at"):
+        provenance += "; current edge source timestamp unavailable."
+    if f.get("alert_type") == "large_acquisition":
+        provenance += " Announcement record, not confirmation the transaction closed."
     return (
         f'<div style="padding:10px 0;border-bottom:1px solid #1A2A3A;">'
         f'<div style="font-size:14px;color:#E8F0F8;font-weight:700;">{headline}</div>'
@@ -870,6 +901,7 @@ def _render_finding_row(f: dict[str, Any]) -> str:
         f'&middot; <span style="color:#F59E0B;">{delta}</span></div>'
         f'<div style="font-size:13px;color:#C8D8E8;margin-top:6px;line-height:1.5;">'
         f'{context}</div>'
+        f'<div style="font-size:12px;color:#8AA0B5;margin-top:6px;">{provenance}</div>'
         f'<div style="font-size:12px;margin-top:6px;">'
         f'<a href="{link}" style="color:#1A6EBF;text-decoration:none;">Open in canvas &rarr;</a>'
         f'</div></div>'
@@ -886,71 +918,87 @@ def _render_section(group: str, items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def render_digest_html(findings: dict[str, list[dict[str, Any]]]) -> str:
-    """Render the aggregated findings into a dark-theme HTML digest string.
+def _digest_sections(
+    findings: dict[str, list[dict[str, Any]]], scan_context: dict[str, Any] | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """One shared preview/send presentation; counts refer only to supplied findings."""
+    groups = list(DETECTOR_ORDER) + [group for group in findings if group not in DETECTOR_ORDER]
+    present = [(group, findings.get(group) or []) for group in groups if findings.get(group)]
+    records = [finding for _, items in present for finding in items]
+    total = len(records)
+    lines = ["; ".join(f"{len(items)} {_SECTION_TITLES.get(group, (group.replace('_', ' '), ''))[0].lower()}"
+                       for group, items in present) + "."] if present else [
+        "No findings supplied. This is not an all-clear: missing inputs or suppressed repeats can produce no findings."
+    ]
+    lines.append("Counts are detector findings, not unique incidents; multiple findings may describe the same edge. "
+                 "All supplied findings are shown below.")
+    scores = [_float_or_none((f.get("payload") or {}).get("chokepoint_score")) for f in records]
+    scores = [value for value in scores if value is not None and math.isfinite(value) and 0 <= value <= 1]
+    if scores:
+        lines.append(f"Highest reported chokepoint score: {max(scores):.2f}/1 among {len(scores)} scored findings; "
+                     "a structural risk score, not a probability of disruption.")
+    deals = [_float_or_none((f.get("payload") or {}).get("amount_usd"))
+             for f in findings.get("large_acquisitions", [])]
+    deals = [value for value in deals if value is not None and math.isfinite(value) and value >= 0]
+    if deals:
+        lines.append(f"{_fmt_usd(max(deals))} largest reported acquisition among {len(deals)} findings with amounts; "
+                     "announcement values, not completed payments or portfolio exposure.")
+    shifts = [_float_or_none((f.get("payload") or {}).get("delta_pp"))
+              for f in findings.get("concentration_shifts", [])]
+    shifts = [value for value in shifts if value is not None and math.isfinite(value)]
+    if shifts:
+        largest = max(shifts, key=abs)
+        lines.append(f"Largest absolute COGS concentration change shown: {largest * 100:+.1f} percentage points "
+                     "versus its stored baseline, not a percentage return.")
+    focus = []
+    for group in ("contagion_risk", "new_high_chokepoints", "chokepoint_degradation", "large_acquisitions"):
+        for finding in findings.get(group, []):
+            if finding.get("headline") and len(focus) < 3:
+                focus.append(str(finding["headline"]))
+    if focus:
+        lines.append("Review first: " + "; ".join(focus))
+    if scan_context:
+        if scan_context.get("since_hours") is not None:
+            lines.append(f"{scan_context['since_hours']}-hour record window for new suppliers, geographic additions "
+                         "and acquisitions; concentration/chokepoint changes compare stored snapshots, "
+                         "not necessarily the same window.")
+        failed = scan_context.get("failed_detectors") or []
+        if failed:
+            lines.append("Incomplete scan: detector(s) failed: " + ", ".join(failed) + ".")
+        if scan_context.get("generated_at"):
+            lines.append(f"Digest assembled {scan_context['generated_at']}; this is not a source-data timestamp.")
+    else:
+        lines.append("Scan window and detector completion status unavailable for this supplied payload.")
+    lines.append("Source dates appear with findings when available. No findings does not prove every detector "
+                 "had usable data; previously alerted records are suppressed.")
+    summary = {"title": "At a glance", "accent": "amber",
+               "body": f'<div style="font-size:32px;font-weight:800;color:#E8F0F8;">{total} findings shown</div>'
+                       + "".join(f"<p>{_escape_html(line)}</p>" for line in lines)}
+    return total, [summary] + [_render_section(group, items) for group, items in present]
 
-    Sections with zero findings are skipped. Uses the same ``_render_html``
-    primitive as the rest of the alerts pipeline so the look matches every
-    other GRID newsletter.
-    """
+
+def render_digest_html(findings: dict[str, list[dict[str, Any]]], *,
+                       scan_context: dict[str, Any] | None = None) -> str:
+    """Render the same summary and complete finding detail used by ``send_digest``."""
     from alerts.email import _render_html
 
-    sections: list[dict[str, Any]] = []
-    total = 0
-    for group in DETECTOR_ORDER:
-        items = findings.get(group) or []
-        if not items:
-            continue
-        total += len(items)
-        sections.append(_render_section(group, items))
-
-    if not sections:
-        sections.append(
-            {
-                "title": "All Clear",
-                "body": (
-                    '<span style="color:#5A7A96;">No supply chain or capital '
-                    "flow alerts in this window.</span>"
-                ),
-                "accent": "",
-            }
-        )
-
-    subject = (
-        f"[GRID] Supply Chain Pulse — {total} findings "
-        f"({datetime.now(timezone.utc).strftime('%Y-%m-%d')})"
-    )
-    return _render_html(
-        subject,
-        sections,
-        footer_note="GRID Supply Chain Pulse watchdog",
-    )
+    total, sections = _digest_sections(findings, scan_context)
+    subject = (f"[GRID] Supply Chain Pulse - {total} findings "
+               f"({datetime.now(timezone.utc).strftime('%Y-%m-%d')})")
+    return _render_html(subject, sections, footer_note="GRID Supply Chain Pulse watchdog")
 
 
-def send_digest(findings: dict[str, list[dict[str, Any]]]) -> bool:
-    """Format and dispatch the digest via the shared alerts email pipeline.
-
-    Returns True if the email was queued for sending, False otherwise.
-    """
+def send_digest(findings: dict[str, list[dict[str, Any]]], *,
+                scan_context: dict[str, Any] | None = None) -> bool:
+    """Queue the digest; True means handed to the shared sender, not delivered."""
     from alerts.email import _send
 
-    sections: list[dict[str, Any]] = []
-    total = 0
-    for group in DETECTOR_ORDER:
-        items = findings.get(group) or []
-        if not items:
-            continue
-        total += len(items)
-        sections.append(_render_section(group, items))
-
-    if not sections:
+    total, sections = _digest_sections(findings, scan_context)
+    if not total:
         log.info("supply_chain_alerts.send_digest: nothing to send")
         return False
-
-    subject = (
-        f"[GRID] Supply Chain Pulse — {total} findings "
-        f"({datetime.now(timezone.utc).strftime('%Y-%m-%d')})"
-    )
+    subject = (f"[GRID] Supply Chain Pulse - {total} findings "
+               f"({datetime.now(timezone.utc).strftime('%Y-%m-%d')})")
     try:
         _send(subject, sections, footer_note="GRID Supply Chain Pulse watchdog")
         return True

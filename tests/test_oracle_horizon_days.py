@@ -16,7 +16,7 @@ fill and "long-horizon tailwinds" were unprovable. These tests pin:
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from oracle import engine as oe
@@ -138,5 +138,5 @@ class TestDistinctPositionCounts:
 
     def test_report_subject_prefers_distinct_positions(self) -> None:
         rsrc = (ROOT / "oracle" / "report.py").read_text(encoding="utf-8")
-        assert 'cycle_result.get("distinct_positions_written", n_votes)' in rsrc
-        assert "Positions (" in rsrc and "model votes" in rsrc
+        assert 'cycle_result.get("distinct_positions_written")' in rsrc
+        assert "New prediction rows" in rsrc and "model votes" in rsrc

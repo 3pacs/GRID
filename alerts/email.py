@@ -12,6 +12,7 @@ TLS is forced for external SMTP to protect signal data in transit.
 from __future__ import annotations
 
 import html
+import math
 import smtplib
 import re
 import threading
@@ -19,6 +20,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
 from typing import Any
 
 from loguru import logger as log
@@ -87,7 +89,7 @@ def _render_html(subject: str, sections: list[dict], footer_note: str = "") -> s
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{subject}</title><style>{_CSS}</style></head>
+<title>{html.escape(subject)}</title><style>{_CSS}</style></head>
 <body><div class="wrapper">
     <div class="header">
         <div class="logo">GRID</div>
@@ -108,15 +110,138 @@ def _render_html(subject: str, sections: list[dict], footer_note: str = "") -> s
 # Section builders
 # ---------------------------------------------------------------------------
 
+class _PlainHTMLParser(HTMLParser):
+    """Readable text with preformatted regions preserved for repair commands."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[tuple[str, bool]] = []
+        self.hidden = 0
+        self.format_stack: list[tuple[str, bool]] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in {"script", "style", "head"}:
+            self.hidden += 1
+        if self.hidden:
+            return
+        inherited = self.format_stack[-1][1] if self.format_stack else False
+        style = dict(attrs).get("style") or ""
+        preformatted = tag == "pre" or bool(re.search(
+            r"white-space\s*:\s*(?:pre-wrap|pre|break-spaces)(?:\s*[;!]|\s*$)", style, re.IGNORECASE,
+        ))
+        if tag not in {"br", "hr", "img", "input", "meta", "link", "wbr"}:
+            self.format_stack.append((tag, inherited or preformatted))
+        if tag in {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "hr", "pre"}:
+            self.parts.append(("\n", False))
+        if tag == "li":
+            self.parts.append(("- ", False))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "head"}:
+            self.hidden = max(0, self.hidden - 1)
+        elif not self.hidden:
+            if tag in {"td", "th"}:
+                self.parts.append((" | ", False))
+            elif tag in {"p", "div", "tr", "li", "h1", "h2", "h3", "pre"}:
+                self.parts.append(("\n", False))
+            for index in range(len(self.format_stack) - 1, -1, -1):
+                if self.format_stack[index][0] == tag:
+                    del self.format_stack[index:]
+                    break
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden:
+            preserve = self.format_stack[-1][1] if self.format_stack else False
+            self.parts.append((data, preserve))
+
+
+def _html_to_plain(markup: str) -> str:
+    """Strip HTML with readable boundaries, retaining pre/pre-wrap whitespace."""
+    parser = _PlainHTMLParser()
+    parser.feed(str(markup))
+    parser.close()
+    lines: list[str] = []
+    line_parts: list[str] = []
+    preserved = False
+    for text, preformatted in [*parser.parts, ("\n", False)]:
+        for fragment in text.splitlines(keepends=True):
+            line_parts.append(fragment.rstrip("\r\n"))
+            preserved = preserved or preformatted
+            if fragment.endswith(("\n", "\r")):
+                line = "".join(line_parts)
+                if not preserved:
+                    line = re.sub(r"[ \t\xa0]+", " ", line).strip().removesuffix(" |").rstrip()
+                if line or preserved:
+                    lines.append(line)
+                line_parts, preserved = [], False
+    return "\n".join(lines).strip("\n")
+
+
+def _summary_text(text: str, max_chars: int = 320) -> str:
+    """Extract at most two opening sentences/lines; never infer or invent facts.
+
+    Input is plain source text, not HTML. Long prose stays in its detail section.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return "No narrative provided."
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    excerpt = re.sub(r"\s+", " ", " ".join(sentences[:2])).strip()
+    if len(excerpt) <= max_chars:
+        return excerpt
+    clipped = excerpt[:max(0, max_chars - 3)]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.rstrip() + "..."
+
+
+def _text_html(text: Any) -> str:
+    """Keep complete plain-source text, escaped and with line breaks intact."""
+    return f'<div style="white-space:pre-wrap;">{html.escape(str(text or ""))}</div>'
+
+
+def _section_summary(headline: str, label: str, summary: str, accent: str = "") -> dict:
+    """Opt-in headline/summary card. All arguments are plain text, never HTML."""
+    return {
+        "title": "At a glance",
+        "body": (f'<div style="font-size:32px;font-weight:800;color:#E8F0F8;">'
+                 f'{html.escape(str(headline))}</div>'
+                 f'<div style="font-size:13px;color:#9AB2C8;">{html.escape(label)}</div>'
+                 f'<p>{html.escape(summary)}</p>'),
+        "plain": f"{headline} — {label}\n{summary}",
+        "accent": accent,
+    }
+
+
+def _confidence_text(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 1:
+        return f"{value:.0%}"
+    return "unavailable"
+
+
+def _score_text(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 10:
+        return f"{value:.1f}/10"
+    return "unavailable"
+
+
+def _render_plain(sections: list[dict]) -> str:
+    return "\n\n".join(
+        f"[{_html_to_plain(s['title'])}]\n"
+        + (s["plain"] if "plain" in s else _html_to_plain(s.get("body", "")))
+        for s in sections
+    )
+
+
 def _section_regime(state: str, confidence: float, action: str) -> dict:
     accent = "green" if "ON" in state.upper() or "BUY" in action.upper() else "red" if "OFF" in state.upper() or "SELL" in action.upper() else "amber"
     badge_cls = "badge-buy" if "BUY" in action.upper() else "badge-sell" if "SELL" in action.upper() else "badge-hold"
     return {
         "title": "Regime State",
         "body": (
-            f'<span class="badge badge-regime">{state}</span> '
-            f'&nbsp; Confidence: <strong>{confidence:.0%}</strong><br><br>'
-            f'Suggested Action: <span class="badge {badge_cls}">{action}</span>'
+            f'<span class="badge badge-regime">{html.escape(state)}</span> '
+            f'&nbsp; Reported state confidence: <strong>{_confidence_text(confidence)}</strong><br><br>'
+            f'Suggested Action: <span class="badge {badge_cls}">{html.escape(action)}</span>'
         ),
         "accent": accent,
     }
@@ -168,15 +293,19 @@ def _section_100x(
             ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: UNKNOWN</span>'
         )
         accent = "amber"
+    payoff_text = (
+        f" &nbsp; Estimated payoff (model, not return): <strong>{payoff:.0f}x</strong>"
+        if isinstance(payoff, (int, float)) and not isinstance(payoff, bool) and math.isfinite(payoff) and payoff > 0 else ""
+    )
     return {
-        "title": f"100x Opportunity — {ticker}",
+        "title": f"100x Opportunity — {html.escape(ticker)}",
         "body": (
             f'<span class="badge {"badge-buy" if direction == "CALL" else "badge-sell"}">'
-            f'{ticker} {direction}S</span> &nbsp; '
-            f'Score: <strong>{score:.1f}/10</strong>'
-            f'{f" &nbsp; Est. Payoff: <strong>{payoff:.0f}x</strong>" if payoff else ""}'
+            f'{html.escape(ticker)} {html.escape(direction)}S</span> &nbsp; '
+            f'Composite score: <strong>{_score_text(score)}</strong>'
+            f'{payoff_text}'
             f'{conf_note}'
-            f'<br><br>{thesis}'
+            f'<br><br>{_text_html(thesis)}'
             f'<br><br><span style="font-size:11px;color:#5A7A96;">Confidence is a '
             f'scanner heuristic (a threshold on the composite score) — not a '
             f'calibrated or track-record-scored confidence.</span>'
@@ -209,10 +338,10 @@ def _section_feature_movers(movers: list[dict]) -> dict:
 def _section_agent_decision(ticker: str, decision: str, reasoning: str) -> dict:
     badge_cls = "badge-buy" if decision == "BUY" else "badge-sell" if decision == "SELL" else "badge-hold"
     return {
-        "title": f"Agent Decision — {ticker}",
+        "title": f"Agent Decision — {html.escape(ticker)}",
         "body": (
-            f'<span class="badge {badge_cls}">{decision}</span><br><br>'
-            f'{reasoning[:500]}{"..." if len(reasoning) > 500 else ""}'
+            f'<span class="badge {badge_cls}">{html.escape(decision)}</span><br><br>'
+            f'{_text_html(reasoning)}'
         ),
         "accent": "green" if decision == "BUY" else "red" if decision == "SELL" else "amber",
     }
@@ -221,7 +350,7 @@ def _section_agent_decision(ticker: str, decision: str, reasoning: str) -> dict:
 def _section_hypothesis(statement: str, status: str) -> dict:
     return {
         "title": f"Hypothesis — {status.upper()}",
-        "body": statement,
+        "body": _text_html(statement),
         "accent": "green" if status == "PASSED" else "red" if status == "FAILED" else "",
     }
 
@@ -229,14 +358,14 @@ def _section_hypothesis(statement: str, status: str) -> dict:
 def _section_briefing(briefing_type: str, excerpt: str) -> dict:
     return {
         "title": f"{briefing_type.title()} Market Briefing",
-        "body": excerpt[:800] + ("..." if len(excerpt) > 800 else ""),
+        "body": _text_html(excerpt),
     }
 
 
 def _section_insight(title: str, content_preview: str) -> dict:
     return {
-        "title": title,
-        "body": content_preview[:600] + ("..." if len(content_preview) > 600 else ""),
+        "title": html.escape(title),
+        "body": _text_html(content_preview),
         "accent": "purple",
     }
 
@@ -419,7 +548,7 @@ def _do_send(
 def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
     """Render and send a newsletter email (non-blocking)."""
     html = _render_html(subject, sections, footer_note)
-    plain = "\n\n".join(f"[{s['title']}]\n{s.get('plain', s.get('body', ''))}" for s in sections)
+    plain = _render_plain(sections)
     _send_in_thread(subject, html, plain)
 
 
@@ -440,7 +569,7 @@ def _send_sync(
     treat an "uncertain" outcome as neither success nor a safe retry.
     """
     html = _render_html(subject, sections, footer_note)
-    plain = "\n\n".join(f"[{s['title']}]\n{s.get('plain', s.get('body', ''))}" for s in sections)
+    plain = _render_plain(sections)
     if research_recipients is None:
         return _do_send(subject, html, plain)
     return _do_send(subject, html, plain, research_recipients=research_recipients, delivery=delivery)
@@ -449,6 +578,23 @@ def _send_sync(
 # ---------------------------------------------------------------------------
 # Public API — Email types
 # ---------------------------------------------------------------------------
+
+def _alert_summary(subject: str, body: str, severity: str) -> dict:
+    """Recognize existing health/fleet metrics; unknown layouts use severity."""
+    headline, label, summary = severity.upper(), subject, _summary_text(body)
+    source_count = re.match(r"(\d+) sources are past their own freshness window\b", body)
+    failed_pulls = re.match(r"(\d+) pulls failed in the last hour\b", body)
+    fleet = re.search(r"^Currently not-up \((\d+) of (\d+)\),[^\n]*", body, re.MULTILINE)
+    if source_count:
+        headline, label = source_count[1], f"Sources past freshness window · {severity.upper()}"
+    elif failed_pulls:
+        headline, label = failed_pulls[1], f"Failed pulls (last hour) · {severity.upper()}"
+    elif fleet:
+        headline, label = f"{fleet[1]}/{fleet[2]}", f"Fleet entities currently not up · {severity.upper()}"
+        summary = fleet[0] + " " + summary
+    return _section_summary(headline, label, summary,
+                            "red" if severity.lower() in {"error", "critical"} else "amber")
+
 
 def send_alert(subject: str, body: str, severity: str = "info") -> bool:
     """Send a simple alert email (backward compatible)."""
@@ -465,28 +611,39 @@ def send_alert(subject: str, body: str, severity: str = "info") -> bool:
             f'font-size:12px;line-height:1.45;">{html.escape(body)}</div>',
         )
         section["plain"] = body
-        _send(f"[GRID {severity.upper()}] {subject}", [section])
+        _send(f"[GRID {severity.upper()}] {subject}", [
+            _alert_summary(subject, body, severity),
+            section,
+        ])
         return True
     except Exception:
         return False
 
 
+def _failure_sections(source: str, error: str, fix_note: str = "") -> list[dict]:
+    return [
+        _section_summary("FAILED", f"Data pull: {source}",
+                         _summary_text(error) + (f" {fix_note}" if fix_note else ""), "red"),
+        _section_text("Ingestion Failure", f"<strong>{html.escape(source)}</strong><br>Failure reported at "
+                      f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}<br><br>"
+                      f"{_text_html(error)}", accent="red"),
+    ]
+
+
 def alert_on_failure(source: str, error: str) -> None:
-    _send(
-        f"[GRID WARNING] Data pull failure — {source}",
-        [_section_text("Ingestion Failure", f"<strong>{source}</strong> failed at "
-         f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}<br><br>"
-         f"<code>{error[:500]}</code>", accent="red")],
-    )
+    _send(f"[GRID WARNING] Data pull failure — {source}", _failure_sections(source, error))
 
 
 def alert_on_regime_change(from_regime: str, to_regime: str, confidence: float) -> None:
     _send(
         f"GRID Intelligence — Regime Shift: {from_regime} → {to_regime}",
         [
+            _section_summary(to_regime, "New reported regime",
+                             f"{from_regime} → {to_regime}. Reported state confidence: "
+                             f"{_confidence_text(confidence)}. Review feature drivers before changing positioning.", "amber"),
             _section_regime(to_regime, confidence, "REVIEW"),
-            _section_text("Transition", f"Market regime changed from <strong>{from_regime}</strong> "
-                          f"to <strong>{to_regime}</strong> with {confidence:.0%} confidence.<br><br>"
+            _section_text("Transition", f"Market regime changed from <strong>{html.escape(from_regime)}</strong> "
+                          f"to <strong>{html.escape(to_regime)}</strong> with {_confidence_text(confidence)} reported state confidence.<br><br>"
                           "Review the dashboard for feature drivers and recommended positioning."),
         ],
     )
@@ -495,9 +652,14 @@ def alert_on_regime_change(from_regime: str, to_regime: str, confidence: float) 
 def alert_on_100x_opportunity(
     ticker: str, score: float, direction: str, thesis: str, confidence: str | None = None,
 ) -> None:
+    detail = _section_100x(ticker, direction, score, thesis, confidence=confidence)
+    label = (confidence or "").strip().upper()
+    heuristic = (f"heuristic confidence: {label}" if label in {"MEDIUM", "HIGH"}
+                 else f"HEURISTIC CONFIDENCE: {label if label == 'LOW' else 'UNKNOWN'}")
     _send(
         f"GRID Intelligence — 100x Alert: {ticker} {direction}S",
-        [_section_100x(ticker, direction, score, thesis, confidence=confidence)],
+        [_section_summary(_score_text(score), f"{ticker} {direction} composite score, not probability",
+                          f"{heuristic}. {_summary_text(thesis)}", detail["accent"]), detail],
     )
 
 
@@ -507,8 +669,9 @@ def send_insight(category: str, title: str, content: str, metadata: dict | None 
         return
     _send(
         f"GRID Intelligence — {title}",
-        [_section_insight(title, content)],
-        footer_note=f"Category: {category}",
+        [_section_summary(_summary_text(title, 100), f"{category} insight", _summary_text(content), "purple"),
+         _section_insight(title, content)],
+        footer_note=f"Category: {html.escape(category)}",
     )
 
 
@@ -518,6 +681,9 @@ def send_agent_report(ticker: str, decision: str, reasoning: str,
     _send(
         f"GRID Intelligence — {ticker}: Agent says {decision}",
         [
+            _section_summary(decision, f"{ticker} agent verdict",
+                             f"Regime: {regime_state}; reported state confidence: {_confidence_text(confidence)}. "
+                             + _summary_text(reasoning), "amber" if decision == "HOLD" else ""),
             _section_regime(regime_state, confidence, decision),
             _section_agent_decision(ticker, decision, reasoning),
             _section_kpi("Analysis Time", f"{duration:.1f}s"),
@@ -525,15 +691,69 @@ def send_agent_report(ticker: str, decision: str, reasoning: str,
     )
 
 
+def _weekly_review_summary(content: str) -> dict:
+    """Extract known review fields without turning text into invented metrics."""
+    total = re.search(r"^\*\*Total insights:\*\*\s*(\d+)\s*$", content, re.MULTILINE)
+    if not total:
+        return _section_summary("Weekly review", "Research summary", _summary_text(content))
+    period = re.search(r"^\*\*Period:\*\*\s*(.+)$", content, re.MULTILINE)
+    highlights = [period[1].strip()] if period else ["Review period not supplied."]
+    groups: dict[str, list[str]] = {}
+    current = ""
+    for raw in content.splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            current = line[3:]
+            groups[current] = []
+        elif current and line and not line.startswith("#"):
+            groups[current].append(line.replace("**", "").lstrip("- "))
+    for title in ("Longer-Term Patterns", "Regime Transitions", "Agent Decision Distribution", "Dominant Themes"):
+        findings = [line for line in groups.get(title, [])
+                    if not line.startswith(("Sufficient data for pattern analysis:", "---", "*Generated"))]
+        if findings:
+            highlights.append(f"{title}: {_summary_text(findings[0], 140)}")
+    return _section_summary(total[1], "Insights in review period", " ".join(highlights))
+
+
 def send_weekly_review(review_content: str) -> None:
     """Send the weekly insight review as a newsletter."""
     _send(
         "GRID Intelligence — Weekly Review",
-        [_section_briefing("Weekly", review_content)],
+        [_weekly_review_summary(review_content),
+         _section_briefing("Weekly", review_content)],
     )
 
 
 _STALE_REGIME_HOURS = 24
+
+
+def _saved_board_note(board: dict, now: datetime) -> str:
+    """Keep saved research provenance visible without claiming live eligibility."""
+    raw = board.get("generated_at")
+    generated = "generation time unknown; age unverified"
+    if raw:
+        try:
+            ts = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                generated = f"generated {raw}; timezone unknown, age unverified"
+            else:
+                hours = (now - ts).total_seconds() / 3600
+                generated = (f"generated {ts.astimezone(timezone.utc).isoformat()}; "
+                             + ("future timestamp, age unverified" if hours < 0 else f"{hours:.1f}h ago"))
+        except (TypeError, ValueError):
+            generated = "generation time invalid; age unverified"
+    data_date = board.get("as_of") or "unknown"
+    return f"Saved board, not live eligibility. Data as of {data_date}; {generated}."
+
+
+def _catalyst_date_label(raw: Any, now: datetime) -> str:
+    if not raw:
+        return "date unknown"
+    try:
+        day = datetime.fromisoformat(str(raw)).date()
+        return f"{raw} (past date; outcome unconfirmed)" if day < now.date() else str(raw)
+    except (TypeError, ValueError):
+        return f"{raw} (date unverified)"
 
 
 def daily_digest(
@@ -558,7 +778,7 @@ def daily_digest(
         every section built successfully — check ``degraded``.
     """
     # One UTC cutoff for this build, including its existing 24-hour and
-    # three-calendar-day windows. This excludes future-dated records;
+    # scan-date window (D-3 through D inclusive). This excludes future-dated records;
     # it does not reconstruct historical vintages or prove PIT completeness.
     as_of = datetime.now(timezone.utc)
     result: dict[str, Any] = {"timestamp": as_of.isoformat()}
@@ -574,6 +794,10 @@ def daily_digest(
         engine = get_engine()
         sections: list[dict] = []
         degraded: list[str] = []
+        decision_count: int | None = None
+        active_sources: int | None = None
+        option_rows: list | None = None
+        long_play_summary: str | None = None
 
         with engine.connect() as conn:
             # Regime — a missing, stale, or future-dated decision_journal
@@ -599,8 +823,8 @@ def daily_digest(
                         sections.append(_section_text(
                             "Regime State — unverified",
                             f"decision_journal's latest row has no timestamp; age "
-                            f"cannot be verified. Last known state: {row[0]}, "
-                            f"suggested action was: {row[2]}.",
+                            f"cannot be verified. Last known state: {html.escape(str(row[0]))}, "
+                            f"suggested action was: {html.escape(str(row[2]))}.",
                             accent="amber",
                         ))
                     elif age_hours < 0:
@@ -608,16 +832,16 @@ def daily_digest(
                             "Regime State — unverified",
                             f"decision_journal's latest timestamp ({ts}) is in the "
                             f"future — rejecting it rather than treating it as "
-                            f"current. Last known state: {row[0]}, suggested "
-                            f"action was: {row[2]}.",
+                            f"current. Last known state: {html.escape(str(row[0]))}, suggested "
+                            f"action was: {html.escape(str(row[2]))}.",
                             accent="red",
                         ))
                     elif age_hours >= _STALE_REGIME_HOURS:
                         sections.append(_section_text(
                             "Regime State — stale",
                             f"last decision_journal entry {age_hours:.0f}h ago "
-                            f"({ts}). Last known state: {row[0]}, "
-                            f"suggested action was: {row[2]}.",
+                            f"({ts}). Last known state: {html.escape(str(row[0]))}, "
+                            f"suggested action was: {html.escape(str(row[2]))}.",
                             accent="amber",
                         ))
                     else:
@@ -633,7 +857,8 @@ def daily_digest(
                     "WHERE decision_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours' "
                     "AND decision_timestamp <= :as_of"
                 ), {"as_of": as_of}).fetchone()
-                sections.append(_section_kpi("Decisions (24h)", str(row[0]) if row else "0"))
+                decision_count = row[0] if row else None
+                sections.append(_section_kpi("Decisions (24h)", str(decision_count) if decision_count is not None else "Unavailable"))
             except Exception as exc:
                 degraded.append("journal_count")
                 log.debug("Daily digest journal-count section failed: {e}", e=str(exc))
@@ -647,6 +872,7 @@ def daily_digest(
                     "AND scan_date <= :as_of_date "
                     "ORDER BY score DESC LIMIT 5"
                 ), {"as_of_date": as_of.date()}).fetchall()
+                option_rows = rows
                 for r in rows:
                     sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3], confidence=r[5]))
             except Exception as exc:
@@ -672,6 +898,7 @@ def daily_digest(
                     "AND pull_timestamp <= :as_of "
                     "AND pull_status = 'SUCCESS'"
                 ), {"as_of": as_of}).fetchone()
+                active_sources = row[0] if row else None
                 if row and row[0]:
                     sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
                                                  f"latest: {str(row[1])[:16]}"))
@@ -685,41 +912,45 @@ def daily_digest(
 
             board = load_latest_board(engine)
             if board:
+                board_note = _saved_board_note(board, as_of)
                 lines: list[str] = []
-                # Entry candidates first — a name that cleared the gate is
-                # what the operator can act on, whatever its asymmetry rank.
+                # Preserve the saved ordering: entry candidates first. These
+                # recorded stances do not establish current entry eligibility.
                 for cand in entry_first(board.get("candidates") or []):
                     if cand.get("stance") not in ("entry_candidate", "watch"):
                         continue
                     proj = ((cand.get("projection") or {}).get("3y") or {})
                     p50 = proj.get("p50_multiple")
-                    p50_txt = f"{p50:.2f}x" if isinstance(p50, (int, float)) else "n/a"
+                    p50_txt = f"{p50:.2f}x" if isinstance(p50, (int, float)) and math.isfinite(p50) else "n/a"
                     gate = cand.get("gate") or {}
                     cats = cand.get("catalysts") or []
                     first_cat = (
-                        f"{cats[0].get('event_type')} {cats[0].get('expected_date')}"
+                        f"{cats[0].get('event_type')} {_catalyst_date_label(cats[0].get('expected_date'), as_of)}"
                         if cats
                         else (
-                            f"catalyst {gate['next_catalyst_date']}"
+                            f"catalyst {_catalyst_date_label(gate['next_catalyst_date'], as_of)}"
                             if gate.get("next_catalyst_date") else "no catalyst"
                         )
                     )
                     route = cand.get("coverage_route")
                     route_txt = f" — via {route}" if route else ""
                     lines.append(
-                        f"{cand.get('ticker')} — {cand.get('stance')}{route_txt} — "
+                        f"{cand.get('ticker')} — saved stance: {cand.get('stance')}{route_txt} — "
                         f"p50 3y {p50_txt} (proxy) — {first_cat}"
                     )
                     if len(lines) >= 5:
                         break
                 if lines:
+                    long_play_summary = board_note + " First saved row: " + lines[0]
                     sections.append(_section_text(
                         "Long plays",
-                        "\n".join(lines) + "\n(proxy multiples from historical CAGR/vol; not forecasts)",
+                        _text_html(board_note + "\nShowing up to 5 saved candidates, entry candidates first.\n"
+                                   + "\n".join(lines) + "\n(proxy multiples from historical CAGR/vol; not forecasts)"),
                         accent="#7c5cff",
                     ))
                 elif board.get("stand_down_reason"):
-                    sections.append(_section_text("Long plays", str(board["stand_down_reason"])))
+                    long_play_summary = board_note + " " + _summary_text(str(board["stand_down_reason"]), 160)
+                    sections.append(_section_text("Long plays", _text_html(board_note + "\n" + str(board["stand_down_reason"]))))
         except Exception as exc:
             degraded.append("long_plays")
             log.debug("Daily digest long-plays section failed: {e}", e=str(exc))
@@ -737,8 +968,38 @@ def daily_digest(
         elif not sections:
             sections.append(_section_text(
                 "Status",
-                "All systems operational. No notable events in the last 24 hours.",
+                "No reportable records returned. This does not establish system health.",
             ))
+
+        # Summarize the already-gated evidence, never bypass freshness checks
+        # or invent totals from capped query rows. No extra database queries.
+        regime_section = next((s for s in sections if s["title"].startswith("Regime State")), None)
+        if regime_section:
+            regime_summary = f"{regime_section['title']}: {_summary_text(_html_to_plain(regime_section['body']), 250)}"
+        else:
+            regime_summary = "Regime unavailable; no current state can be established."
+        summary = [regime_summary]
+        summary.append(f"Decisions (24h): {decision_count if decision_count is not None else 'unavailable'}.")
+        summary.append(f"{active_sources} sources with successful pulls (24h)." if active_sources is not None
+                       else "Sources with successful pulls (24h): unavailable.")
+        if option_rows is not None:
+            summary.append(f"{len(option_rows)} sampled option rows (up to 5, not a total; scan dates D-3 through D inclusive).")
+            if option_rows:
+                top = option_rows[0]
+                confidence = str(top[5] or "").upper()
+                confidence = confidence if confidence in {"LOW", "MEDIUM", "HIGH"} else "UNKNOWN"
+                summary.append(f"Top sampled row: {top[0]} {top[1]}, {_score_text(top[2])} composite score (not probability); heuristic confidence: {confidence}.")
+        else:
+            summary.append("Option scan sample unavailable.")
+        if long_play_summary:
+            summary.append("Long plays: " + long_play_summary)
+        if degraded:
+            summary.insert(0, f"Incomplete collection: {', '.join(degraded)}.")
+        sections.insert(0, _section_summary(
+            "INCOMPLETE" if degraded else str(decision_count) if decision_count is not None else "RESEARCH UPDATE",
+            "Research digest; incomplete data" if degraded else "Decisions recorded (24h)" if decision_count is not None else "Research status",
+            " ".join(summary), "red" if degraded else "amber" if not regime_section or regime_section["title"] != "Regime State" else "",
+        ))
 
         subject = "GRID Intelligence — Daily Digest"
         result.update({
@@ -789,6 +1050,7 @@ def _section_code_block(title: str, code: str) -> dict:
     safe_code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return {
         "title": title,
+        "plain": code,
         "body": (
             '<div style="background:#080C10;border:1px solid #1A2A3A;border-radius:8px;'
             'padding:16px;font-family:monospace;font-size:13px;color:#22C55E;'
@@ -806,19 +1068,15 @@ def alert_on_failure_with_fix(source: str, error: str, fix_commands: dict | None
         error: Error message text.
         fix_commands: Optional dict with keys: diagnose, fix, retry, file.
     """
-    sections = [
-        _section_text(
-            "Ingestion Failure",
-            f"<strong>{source}</strong> failed at "
-            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}<br><br>"
-            f"<code>{error[:500]}</code>",
-            accent="red",
-        ),
-    ]
+    has_commands = bool(fix_commands and any(fix_commands.get(k) for k in ("diagnose", "fix", "retry", "file")))
+    sections = _failure_sections(
+        source, error,
+        "Suggested repair commands included below; not executed." if has_commands else "No fix commands supplied.",
+    )
 
     if fix_commands:
         claude_prompt = f"The {source} data pull failed with this error:\n\n"
-        claude_prompt += f"```\n{error[:300]}\n```\n\n"
+        claude_prompt += f"```\n{error}\n```\n\n"
         claude_prompt += "Please diagnose and fix this. Here are the relevant details:\n\n"
         if fix_commands.get("diagnose"):
             claude_prompt += f"Diagnose: `{fix_commands['diagnose']}`\n"
@@ -831,7 +1089,7 @@ def alert_on_failure_with_fix(source: str, error: str, fix_commands: dict | None
 
         sections.append(_section_code_block("Paste into Claude Code", claude_prompt))
 
-    _send(f"[GRID WARNING] {source} failed — fix commands included", sections)
+    _send(f"[GRID WARNING] {source} failed" + (" — fix commands included" if has_commands else ""), sections)
 
 
 def alert_on_transition_leaders(leaders: list[dict], cluster_result: dict) -> None:
@@ -839,21 +1097,27 @@ def alert_on_transition_leaders(leaders: list[dict], cluster_result: dict) -> No
     if not leaders:
         return
     rows = ""
-    for leader in leaders[:5]:
+    for leader in leaders:
+        t_stat = leader.get("t_stat")
+        t_stat_text = f"{t_stat:.2f}" if isinstance(t_stat, (int, float)) and not isinstance(t_stat, bool) and math.isfinite(t_stat) else "unavailable"
         rows += (
-            f"<tr><td>{leader.get('feature', '?')}</td>"
-            f"<td>{leader.get('lead_weeks', '?')}w</td>"
-            f"<td>{leader.get('direction', '?')}</td>"
-            f"<td>{leader.get('t_stat', 0):.2f}</td></tr>"
+            f"<tr><td>{html.escape(str(leader.get('feature', '?')))}</td>"
+            f"<td>{html.escape(str(leader.get('lead_weeks', '?')))}w</td>"
+            f"<td>{html.escape(str(leader.get('direction', '?')))}</td>"
+            f"<td>{t_stat_text}</td></tr>"
         )
 
     _send(
         "GRID Intelligence — Transition Leaders Detected",
         [
+            _section_summary(str(len(leaders)), "Supplied transition leaders",
+                             f"{len(leaders)} supplied transition leaders. First listed: {leaders[0].get('feature', '?')}, "
+                             f"{leaders[0].get('lead_weeks', '?')} weeks lead, direction {leaders[0].get('direction', '?')}. "
+                             "Historical associations, not guaranteed forecasts.", "purple"),
             _section_text(
                 "Cluster Transition Signals",
-                f"Best k={cluster_result.get('best_k', '?')} clusters detected. "
-                "These features predict regime transitions:",
+                f"Best k={html.escape(str(cluster_result.get('best_k', '?')))} clusters detected. "
+                "These features were associated with regime transitions:",
                 accent="purple",
             ),
             _section_text(
@@ -872,10 +1136,13 @@ def alert_on_discovery_insight(title: str, description: str, data: dict | None =
     Used for dimensionality shifts, redundancy warnings, and other
     structural changes in the feature space.
     """
-    sections = [_section_text("Discovery Insight", description, accent="amber")]
+    sections = [
+        _section_summary(_summary_text(title, 100), "Discovery finding", _summary_text(description), "amber"),
+        _section_text("Discovery Insight", _text_html(description), accent="amber"),
+    ]
     if data and data.get("by_family"):
         family_text = "<br>".join(
-            f"&bull; <strong>{k}</strong>: {len(v)} features"
+            f"&bull; <strong>{html.escape(str(k))}</strong>: {len(v)} features"
             for k, v in data["by_family"].items()
         )
         sections.append(_section_text("Feature Taxonomy", family_text))
@@ -885,6 +1152,9 @@ def alert_on_discovery_insight(title: str, description: str, data: dict | None =
 def send_test_email() -> bool:
     """Send a test newsletter showcasing the template and expansion plan."""
     sections = [
+        _section_summary("PREVIEW", "Synthetic demonstration, not live market data",
+                         "All market signals, scores, returns and pricing below are illustrative test content. "
+                         "This preview is not a trading recommendation or a live performance report.", "amber"),
         _section_regime("RISK_ON", 0.87, "BUY"),
         _section_100x("SPY", "CALL", 8.5, "IV at 2-year lows + extreme put/call ratio + max pain divergence. Gamma squeeze setup detected.", 185),
         _section_feature_movers([
