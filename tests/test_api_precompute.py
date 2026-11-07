@@ -317,6 +317,9 @@ ROUTES: list[tuple[str, str, str, dict]] = [
     ("api.routers.associations", "/api/v1/associations/regime-features?days=504",
      "associations.regime_features", {"days": 504}),
     ("api.routers.options", "/api/v1/options/100x", "options.100x", {}),
+    ("api.routers.options", "/api/v1/options/scan?min_score=5", "options.scan", {"min_score": 5.0}),
+    ("api.routers.intelligence", "/api/v1/intelligence/patterns?min_occurrences=3",
+     "intelligence.patterns", {"min_occurrences": 3, "max_sequence_length": 4}),
 ]
 
 
@@ -690,3 +693,84 @@ class TestGlobe:
         assert body["as_of"] == "2026-10-01"
         assert not any("LIKE" in s and "series_id = ANY" not in s and "source_id" not in s
                        for s in statements), statements
+
+
+class TestPatterns:
+    def test_builder_mines_read_only_with_the_pwa_parameters(self, monkeypatch):
+        import intelligence.pattern_engine as pe
+
+        calls: list[dict] = []
+
+        class _P:
+            actionable = True
+
+            def to_dict(self):
+                return {"id": "p1"}
+
+        def fake_discover(engine, **kw):
+            calls.append(kw)
+            return [_P()]
+
+        monkeypatch.setattr(pe, "discover_patterns", fake_discover)
+        now = datetime(2026, 11, 7, 6, 0, tzinfo=timezone.utc)
+        [out] = ap.build_patterns(ap.BuildContext(engine=object(), now=now))
+        assert calls == [{"min_occurrences": 3, "max_sequence_length": 4, "persist": False}]
+        assert out.key == "intelligence.patterns"
+        assert out.params == {"min_occurrences": 3, "max_sequence_length": 4}
+        assert out.payload["patterns"] == [{"id": "p1"}] and out.payload["actionable_count"] == 1
+        assert out.as_of == now
+
+    def test_route_never_mines_in_the_request(self, fake_store, monkeypatch):
+        import intelligence.pattern_engine as pe
+
+        def boom(*a, **kw):
+            raise AssertionError("discover_patterns ran in the request")
+
+        monkeypatch.setattr(pe, "discover_patterns", boom)
+        r = _client("api.routers.intelligence").get("/api/v1/intelligence/patterns?min_occurrences=5")
+        assert r.status_code == 503
+        assert r.json()["precomputed_params"] == [{"min_occurrences": 3, "max_sequence_length": 4}]
+
+
+class TestOptionsScan:
+    def test_one_scan_feeds_scan_and_its_100x_cut(self, monkeypatch):
+        import discovery.options_scanner as osc
+
+        def opp(t, score, is_100x):
+            return types.SimpleNamespace(
+                ticker=t, scan_date=date(2026, 11, 6), signal_date=date(2026, 11, 6), score=score,
+                estimated_payoff_multiple=120.0 if is_100x else 3.0, direction="CALL", thesis="",
+                strikes=[100.0], expiry="2026-12-18", spot_price=90.0, iv_atm=0.4,
+                confidence=0.5, is_100x=is_100x,
+            )
+
+        calls: list[float] = []
+
+        class FakeScanner:
+            def __init__(self, engine):  # noqa: ANN001
+                pass
+
+            def scan_all(self, min_score=5.0, **kw):  # noqa: ANN001
+                calls.append(min_score)
+                return [opp("AAA", 8.0, True), opp("BBB", 5.5, True), opp("CCC", 7.0, False)]
+
+        monkeypatch.setattr(osc, "OptionsScanner", FakeScanner)
+        now = datetime(2026, 11, 7, 6, 0, tzinfo=timezone.utc)
+        outs = {o.key: o for o in ap.build_options_100x(ap.BuildContext(engine=object(), now=now, signature="2026-11-06:3"))}
+        assert calls == [5.0], "one scan per build"
+        # 100x = score >= 6 and is_100x (get_100x_opportunities' rule)
+        assert [r["ticker"] for r in outs["options.100x"].payload["opportunities"]] == ["AAA"]
+        scan = outs["options.scan"]
+        assert scan.params == {"min_score": 5.0}
+        assert [r["ticker"] for r in scan.payload["opportunities"]] == ["AAA", "BBB", "CCC"]
+        assert scan.payload["count_100x"] == 2
+        assert "is_100x" in scan.payload["opportunities"][0] and "signal_date" not in scan.payload["opportunities"][0]
+        assert scan.as_of == date(2026, 11, 6)
+
+    def test_scan_route_never_scans_in_the_request(self, fake_store, monkeypatch):
+        import discovery.options_scanner as osc
+
+        monkeypatch.setattr(osc, "OptionsScanner", lambda *a, **k: (_ for _ in ()).throw(AssertionError("scanned inline")))
+        r = _client("api.routers.options").get("/api/v1/options/scan?min_score=7")
+        assert r.status_code == 503
+        assert r.json()["precomputed_params"] == [{"min_score": 5.0}]

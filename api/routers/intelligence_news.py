@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from api.precompute_serving import serve_precomputed
 
 router = APIRouter(tags=["intelligence"])
 
@@ -227,47 +229,54 @@ _PATTERN_ACTIONABLE_NOTE = (
 )
 
 
+def _compute_discovered_patterns(engine: Any, min_occurrences: int, max_sequence_length: int) -> dict[str, Any]:
+    """Body of ``/patterns`` (runs in the precompute job, ~2 min).
+
+    Read-only (``persist=False``): this used to upsert its findings into
+    ``event_patterns`` on every GET (item #23, Wave 3 triage report --
+    write-on-GET). Persisting mined patterns is not wired to any endpoint or
+    schedule -- see the triage report for the standing hold on this
+    noise-generator class.
+    """
+    from intelligence.pattern_engine import discover_patterns
+
+    patterns = discover_patterns(
+        engine,
+        min_occurrences=min_occurrences,
+        max_sequence_length=max_sequence_length,
+        persist=False,
+    )
+    return {
+        "patterns": [p.to_dict() for p in patterns],
+        "count": len(patterns),
+        "actionable_count": sum(1 for p in patterns if p.actionable),
+        "actionable_note": _PATTERN_ACTIONABLE_NOTE,
+        "min_occurrences": min_occurrences,
+        "max_sequence_length": max_sequence_length,
+    }
+
+
 @router.get("/patterns")
 def get_discovered_patterns(
     min_occurrences: int = Query(3, ge=2, le=50, description="Minimum pattern occurrences"),
     max_sequence_length: int = Query(4, ge=2, le=4, description="Max sequence length"),
     _token: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Response:
     """All discovered recurring event patterns.
 
     Scans historical event sequences across all watchlist tickers to find
     recurring 2-, 3-, and 4-event sequences.  Only returns patterns with a
     hit rate above 50%.  Sorted by confidence x actionable return.
 
-    Read-only (``persist=False``): this GET used to upsert its findings into
-    ``event_patterns`` on every call (item #23, Wave 3 triage report --
-    write-on-GET), matching the same bug class already fixed elsewhere via
-    ``persist=False`` (see ``intelligence_forensics.py``'s ``/causation`` GET
-    and 865194dd's fix to ``GET /flows/briefing``). Persisting mined
-    patterns is not currently wired to any endpoint or schedule -- see the
-    triage report for the standing hold on this noise-generator class.
+    Served from ``api_precomputed_results`` (job ``patterns`` in
+    ``intelligence/api_precompute.py``); the ~116 s mining pass never runs in
+    the request. The response carries a ``precompute`` freshness block; a
+    parameter set that is not precomputed returns 503 ``unavailable``.
     """
-    try:
-        from intelligence.pattern_engine import discover_patterns
-
-        engine = get_db_engine()
-        patterns = discover_patterns(
-            engine,
-            min_occurrences=min_occurrences,
-            max_sequence_length=max_sequence_length,
-            persist=False,
-        )
-        return {
-            "patterns": [p.to_dict() for p in patterns],
-            "count": len(patterns),
-            "actionable_count": sum(1 for p in patterns if p.actionable),
-            "actionable_note": _PATTERN_ACTIONABLE_NOTE,
-            "min_occurrences": min_occurrences,
-            "max_sequence_length": max_sequence_length,
-        }
-    except Exception as exc:
-        log.warning("Pattern discovery failed: {e}", e=str(exc))
-        return {"patterns": [], "count": 0, "error": str(exc)}
+    return serve_precomputed(
+        "intelligence.patterns",
+        {"min_occurrences": min_occurrences, "max_sequence_length": max_sequence_length},
+    )
 
 
 @router.get("/patterns/active")

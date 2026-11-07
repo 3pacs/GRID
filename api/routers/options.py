@@ -420,41 +420,15 @@ def get_options_signals(
 def scan_mispricing(
     min_score: float = Query(5.0, ge=0, le=10, description="Minimum score"),
     _token: str = Depends(require_auth),
-) -> dict:
-    """Run the mispricing scanner and return flagged opportunities."""
-    try:
-        from discovery.options_scanner import OptionsScanner
+) -> Response:
+    """Flagged mispricing opportunities (score >= ``min_score``).
 
-        engine = get_db_engine()
-        scanner = OptionsScanner(engine)
-        opps = scanner.scan_all(min_score=min_score)
-
-        results = [
-            {
-                "ticker": o.ticker,
-                "scan_date": str(o.scan_date),
-                "score": o.score,
-                "estimated_payoff_multiple": o.estimated_payoff_multiple,
-                "direction": o.direction,
-                "thesis": o.thesis,
-                "strikes": o.strikes,
-                "expiry": o.expiry,
-                "spot_price": o.spot_price,
-                "iv_atm": o.iv_atm,
-                "confidence": o.confidence,
-                "is_100x": o.is_100x,
-            }
-            for o in opps
-        ]
-
-        return {
-            "opportunities": results,
-            "count": len(results),
-            "count_100x": sum(1 for o in opps if o.is_100x),
-        }
-    except Exception as exc:
-        log.warning("Options scan failed: {e}", e=str(exc))
-        return {"opportunities": [], "count": 0, "error": str(exc)}
+    Served from ``api_precomputed_results`` (job ``options_100x``, the same
+    SVI scan that feeds /options/100x); the ~160 s scan never runs in the
+    request. ``min_score=5`` is precomputed; other values return 503
+    ``unavailable`` naming it.
+    """
+    return serve_precomputed("options.scan", {"min_score": min_score})
 
 
 @router.get("/100x")

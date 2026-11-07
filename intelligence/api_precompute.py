@@ -387,6 +387,18 @@ def build_architecture(ctx: BuildContext) -> list[Output]:
     return [Output("system.architecture_db", {}, payload, ctx.now)]
 
 
+PATTERNS_DEFAULT = {"min_occurrences": 3, "max_sequence_length": 4}
+
+
+def build_patterns(ctx: BuildContext) -> list[Output]:
+    """``/intelligence/patterns`` event-sequence mining (~116 s), the PWA's parameters."""
+    from api.routers.intelligence_news import _compute_discovered_patterns
+
+    payload = _compute_discovered_patterns(ctx.engine, **PATTERNS_DEFAULT)
+    # Mined over the event history up to the build: the data is "now".
+    return [Output("intelligence.patterns", dict(PATTERNS_DEFAULT), payload, ctx.now)]
+
+
 def _options_signature(engine: Engine) -> str | None:
     with engine.connect() as conn:
         r = conn.execute(text(
@@ -399,33 +411,55 @@ def _options_signature(engine: Engine) -> str | None:
     return f"{r[0]}:{r[1]}"
 
 
+OPTIONS_SCAN_DEFAULT = {"min_score": 5.0}
+OPTIONS_100X_MIN_SCORE = 6.0  # OptionsScanner.get_100x_opportunities' cut
+
+
+def _opportunity_dict(o: Any, *, with_signal_date: bool) -> dict[str, Any]:
+    out = {
+        "ticker": o.ticker,
+        "scan_date": str(o.scan_date),
+        "score": o.score,
+        "estimated_payoff_multiple": o.estimated_payoff_multiple,
+        "direction": o.direction,
+        "thesis": o.thesis,
+        "strikes": o.strikes,
+        "expiry": o.expiry,
+        "spot_price": o.spot_price,
+        "iv_atm": o.iv_atm,
+        "confidence": o.confidence,
+    }
+    if with_signal_date:
+        out["signal_date"] = str(o.signal_date) if o.signal_date else None
+    else:
+        out["is_100x"] = o.is_100x
+    return out
+
+
 def build_options_100x(ctx: BuildContext) -> list[Output]:
-    """``OptionsScanner.get_100x_opportunities`` (SVI fits; ~160 s)."""
+    """One SVI scan (~160 s) feeding ``/options/100x`` and ``/options/scan``.
+
+    ``scan_all``'s ``min_score`` only filters, so the 100x list is the
+    min_score=5 scan cut at 6 and filtered to ``is_100x`` -- exactly what
+    ``get_100x_opportunities`` returns.
+    """
     from discovery.options_scanner import OptionsScanner
 
     scanner = OptionsScanner(ctx.engine)
-    opps = scanner.get_100x_opportunities()
-    results = [
-        {
-            "ticker": o.ticker,
-            "scan_date": str(o.scan_date),
-            "signal_date": str(o.signal_date) if o.signal_date else None,
-            "score": o.score,
-            "estimated_payoff_multiple": o.estimated_payoff_multiple,
-            "direction": o.direction,
-            "thesis": o.thesis,
-            "strikes": o.strikes,
-            "expiry": o.expiry,
-            "spot_price": o.spot_price,
-            "iv_atm": o.iv_atm,
-            "confidence": o.confidence,
-        }
-        for o in opps
-    ]
+    opps = scanner.scan_all(min_score=OPTIONS_SCAN_DEFAULT["min_score"])
+    hundred_x = [o for o in opps if o.score >= OPTIONS_100X_MIN_SCORE and o.is_100x]
+    results = [_opportunity_dict(o, with_signal_date=True) for o in hundred_x]
     sig_date = (ctx.signature or "").split(":", 1)[0] or None
     as_of = _max_date([r["signal_date"] for r in results]) or _max_date([sig_date])
-    return [Output("options.100x", {}, {"opportunities": results, "count": len(results)}, as_of,
-                   inputs={"signature": ctx.signature})]
+    scan = [_opportunity_dict(o, with_signal_date=False) for o in opps]
+    scan_as_of = _max_date([o.signal_date for o in opps]) or _max_date([sig_date])
+    inputs = {"signature": ctx.signature}
+    return [
+        Output("options.100x", {}, {"opportunities": results, "count": len(results)}, as_of, inputs=inputs),
+        Output("options.scan", dict(OPTIONS_SCAN_DEFAULT),
+               {"opportunities": scan, "count": len(scan), "count_100x": sum(1 for o in opps if o.is_100x)},
+               scan_as_of, inputs=inputs),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +543,20 @@ JOBS: tuple[Job, ...] = (
         description="Analog episodes for today's state vector + conditional forecast + TimesFM.",
     ),
     Job(
-        name="options_100x", cadence_s=30 * MINUTE, stale_after_s=36 * HOUR, version="1",
+        name="patterns", cadence_s=6 * HOUR, stale_after_s=36 * HOUR, version="1",
+        build=build_patterns,
+        outputs=(("intelligence.patterns", _p(**PATTERNS_DEFAULT)),),
+        empty_fields={"intelligence.patterns": ("patterns", "count", "actionable_count")},
+        description="Recurring 2-4 event sequences across watchlist tickers (read-only mining).",
+    ),
+    Job(
+        name="options_100x", cadence_s=30 * MINUTE, stale_after_s=36 * HOUR, version="2",
         build=build_options_100x,
-        outputs=(("options.100x", _p()),),
-        empty_fields={"options.100x": ("opportunities", "count")},
+        outputs=(("options.100x", _p()), ("options.scan", _p(**OPTIONS_SCAN_DEFAULT))),
+        empty_fields={"options.100x": ("opportunities", "count"),
+                      "options.scan": ("opportunities", "count", "count_100x")},
         signature=_options_signature, max_age_s=12 * HOUR,
-        description="100x options mispricing scan; reruns when options_daily_signals changes.",
+        description="Options mispricing scan (/options/scan) and its 100x cut; reruns when options_daily_signals changes.",
     ),
 )
 
