@@ -67,7 +67,7 @@ OBSERVATION_SCHEMA = "daily-publication-packet-observation-v1"
 PRODUCER = "scripts/daily_publication_packet.py"
 
 DEFAULT_ROOT = Path(os.environ.get("GRID_PUBLICATION_PACKET_ROOT", "~/research/publication-packets"))
-DEFAULT_DUE_HOURS = float(os.environ.get("GRID_PUBLICATION_PACKET_DUE_HOURS", "8"))
+DEFAULT_DUE_HOURS = float(os.environ.get("GRID_PUBLICATION_PACKET_DUE_HOURS", "12"))
 DIARY_UNIT = os.environ.get("GRID_MARKET_DIARY_UNIT", "grid-market-diary.service")
 # The installed grid-market-diary.timer fires Tue..Sat 05:30Z for the previous US
 # session; on Sun/Mon UTC no diary generation is scheduled, so a missing in-window

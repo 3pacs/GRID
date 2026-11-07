@@ -219,7 +219,7 @@ def test_screen_hit_quarantines_whole_record_without_truncation(job, tmp_path):
 
 def test_screen_covers_source_record_and_diary_context_not_only_text(job, tmp_path):
     leaky = _briefing(1, 1)
-    leaky["snapshot_data"] = {"debug": "api_key=ABCDEFGHIJKLMNOP1234"}
+    leaky["snapshot_data"] = {"debug": "api_key=ABCDEFGHIJ1234"}
     data = _data(briefings=[leaky, _briefing(2, 2)])
     data["diary_context"] = [_diary(43, DAY, NOW - timedelta(minutes=50), content="ok"),
                              _diary(44, DAY - timedelta(days=1), NOW - timedelta(days=1), content="postgresql://u:p@h/db")]
@@ -228,7 +228,7 @@ def test_screen_covers_source_record_and_diary_context_not_only_text(job, tmp_pa
     assert [p["id"] for p in packet["publications"] if p["source"] == "market_briefings"] == ["market_briefings:5002"]
     assert [r["id"] for r in packet["existing_diary_context"]] == [43]
     assert packet["capture_receipt"]["quarantined_context_ids"] == ["market_diary:44:context"]
-    assert "ABCDEFGHIJKLMNOP1234" not in json.dumps(packet) and "postgresql://" not in json.dumps(packet)
+    assert "ABCDEFGHIJ1234" not in json.dumps(packet) and "postgresql://" not in json.dumps(packet)
     assert result["quarantined"] == 2
 
 
@@ -239,7 +239,7 @@ def test_screen_row_sees_raw_strings_that_json_escaping_would_hide(job):
     assert "hidden_or_control_characters" in job.screen_row({"zero\u200bwidth key": "v"})
     # Key/value split: the credential lives in a JSON pair, never in one string on its own.
     assert "credential_assignment" in job.screen_row({"content": "fine", "snapshot_data": {"password": "hunter2hunter2"}})
-    assert "credential_assignment" in job.screen_text('{"api_key":"ABCDEFGHIJKLMNOP1234"}')
+    assert "credential_assignment" in job.screen_text('{"api_key":"ABCDEFGHIJ1234"}')
     assert "credential_assignment" in job.screen_text("password=ab'c\"d1234567")  # quotes inside the secret
     assert "credential_assignment" in job.screen_text("secret: 'q1w2e3r4t5'")
     assert job.screen_row({"content": "fine", "sentiment_score": 0.12, "narrative_fallback": True}) == []

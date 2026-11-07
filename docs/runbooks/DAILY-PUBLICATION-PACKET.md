@@ -21,7 +21,7 @@ it does not register a second capture, cron, Hermes job or heartbeat for it.
   For example, a next-morning diary can describe a prior session. Preserve both
   clocks. Never infer diary execution from packet absence or an exit-zero claim.
 - Capture is `scripts/daily_publication_packet.py`, scheduled by
-  `grid-publication-packet.timer` on grid-svr (06:15Z daily, previous UTC day).
+  `grid-publication-packet.timer` on grid-svr (10:35Z daily, previous UTC day).
   It replaces the per-day external caller/admission/one-use-registry ceremony
   (r3–r13 lineage on precision5520) that required a fresh source bundle,
   independent review, sealed admission, reviewer runtime acceptance and
@@ -126,7 +126,7 @@ has exactly:
   "schema": "daily-publication-packet-observation-v1",
   "publication_day": "2026-11-05",
   "observed_at": "2026-11-06T07:00:00Z",
-  "due_at": "2026-11-06T08:00:00Z",
+  "due_at": "2026-11-06T12:00:00Z",
   "capture_attempt": "spent",
   "stages": {"diary_run": {"state": "passed", "publication_day": "2026-11-05",
                            "receipt_sha256": "<sha256 of receipts/diary_run.json>",
@@ -137,7 +137,7 @@ has exactly:
 ```
 
 These timestamps are illustrative. `due_at` is the window end plus
-`GRID_PUBLICATION_PACKET_DUE_HOURS` (8 by default: 08:00Z); the daily review
+`GRID_PUBLICATION_PACKET_DUE_HOURS` (12 by default: 12:00Z); the daily review
 uses its own fresh `observed_at`. No stage key means `missing`; a non-success stage has
 only `{"state":"unknown"}` (or `missing`, `failed`, `blocked`). A successful
 stage has exactly `state`, `publication_day`, `receipt_sha256` and
@@ -168,7 +168,8 @@ in the task result; do not put private receipts or publication text in GitHub.
 
 `scripts/daily_publication_packet.py` runs on grid-svr from the deployed
 release tree under `grid-publication-packet.timer` (templates in
-`deploy/systemd/`; 06:15Z daily, after the 05:30Z diary timer). For the previous
+`deploy/systemd/`; 10:35Z daily, after the 05:30Z diary timer and the 03:30-10:30Z
+backup window). For the previous
 UTC day it writes, under `GRID_PUBLICATION_PACKET_ROOT/<D>/`
 (`/home/grid/research/publication-packets/<D>/` on grid-svr):
 
@@ -218,7 +219,7 @@ Type=oneshot
 ExecStart=/usr/bin/rsync -rt --chmod=D0755,F0644 --include='*/' --include='packet.json' \
   --include='receipt.json' --include='observation.json' --include='FAILED-*.json' --include='receipts/**' --exclude='*' \
   grid-svr:research/publication-packets/ %h/Documents/Codex/_inbox-from-claude/grid-publication-packets/
-# grid-publication-packet-mirror.timer: OnCalendar=*-*-* 06:45:00 UTC, Persistent=true
+# grid-publication-packet-mirror.timer: OnCalendar=*-*-* 11:05:00 UTC, Persistent=true
 ```
 
 ## Consumer adoption and operational acceptance
@@ -227,7 +228,7 @@ The daily review owner adopts the packet in its existing job instructions.
 Runtime acceptance of the repaired pipeline is a retained run with these
 receipts, none of which the producer can supply alone:
 
-1. One naturally scheduled 06:15Z run produced `<D>/receipt.json` on grid-svr
+1. One naturally scheduled 10:35Z run produced `<D>/receipt.json` on grid-svr
    and the mirror delivered the screened files to the pickup directory.
 2. The daily review found the day under its own key, read `packet.json` back
    by hash, recorded `admission_review` and `custody`, and ran the status
