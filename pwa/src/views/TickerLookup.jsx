@@ -200,7 +200,7 @@ function FinvizPanel({ finviz, onRefresh, refreshing }) {
                 {stats.length ? stats.slice(0, 12).map(stat => (
                     <div key={stat.id}>
                         <span>{stat.label}</span>
-                        <strong>{stat.raw_value ?? 'unavailable'}</strong>
+                        <strong title={stat.raw_value ?? undefined}>{stat.display_value ?? stat.raw_value ?? 'unavailable'}</strong>
                         <span>Period {stat.period_start || 'instant'} to {stat.period_end || 'unknown'}</span>
                         <span>Filed {stat.filed || 'unknown'} · {stat.form || 'unknown'}</span>
                     </div>
