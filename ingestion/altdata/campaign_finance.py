@@ -203,6 +203,7 @@ class CampaignFinancePuller(BasePuller):
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 60))
             if retry_after > 30:
+                self._rate_limited_for = retry_after
                 log.warning(
                     "FEC rate limited (Retry-After={s}s) — skipping to avoid blocking",
                     s=retry_after,
@@ -651,6 +652,7 @@ class CampaignFinancePuller(BasePuller):
             "individual_contributions": {},
         }
 
+        self._rate_limited_for = None
         results["pac_contributions"] = self.pull_pac_contributions()
         results["individual_contributions"] = self.pull_individual_contributions()
 
@@ -661,6 +663,24 @@ class CampaignFinancePuller(BasePuller):
         ]
         if any(s == "FAILED" for s in statuses):
             results["status"] = "PARTIAL"
+
+        # The fetch helpers swallow a 429 and return nothing, so a run the API
+        # refused looked like "no new data" (2026-11-07: DEMO_KEY exhausted,
+        # Retry-After 57732s, every PAC refused, logged NO_NEW_DATA).
+        retry_after = getattr(self, "_rate_limited_for", None)
+        if retry_after is not None:
+            stored = sum(int(results[k].get("stored", 0) or 0)
+                         for k in ("pac_contributions", "individual_contributions"))
+            reason = f"FEC rate limited (Retry-After {retry_after}s)"
+            if self.api_key == "DEMO_KEY":
+                reason += f"; {_FEC_API_KEY_ENV} is not set and DEMO_KEY allows 40 calls/hour"
+            results["rows_inserted"] = stored
+            if stored == 0:
+                results["status"] = "FAILED"
+                results["error"] = reason
+            else:
+                results["status"] = "PARTIAL"
+                results["note"] = reason
 
         return results
 
