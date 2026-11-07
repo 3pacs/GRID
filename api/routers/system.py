@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
 from fastapi.routing import iter_route_contexts
@@ -36,12 +36,34 @@ from api.schemas.system import (
     StaleSource,
     SystemStatusResponse,
 )
+from ingestion.source_freshness import (
+    CATALOG_RUN_ERROR_CHARS,
+    CATALOG_RUN_LOOKBACK_DAYS,
+    CATALOG_RUN_SUMMARY_SQL,
+    PIPELINE_BROKEN_STATUSES,
+    PIPELINE_FAILING,
+    PIPELINE_HEALTHY,
+    PIPELINE_INACTIVE,
+    PIPELINE_QUIET,
+    PIPELINE_SKIPPED_CONFIG,
+    PIPELINE_STALE,
+    PIPELINE_STATUSES,
+    PIPELINE_STOPPED,
+    CatalogRunSummary,
+    catalog_freshness_hours,
+    classify_catalog_source,
+    error_class,
+    merge_catalog_runs,
+    newest_rows_at,
+    safe_last_error,
+)
 from store.availability_fields import (
     FIELD_AVAILABILITY_AVAILABLE,
     FIELD_AVAILABILITY_UNAVAILABLE,
     STALE_CONSUMER_QUERY_MISMATCH,
     STALE_FETCH_FAILED,
     STALE_NEVER_CONFIGURED,
+    STALE_NOT_PUBLISHED_YET,
     STALE_STALE,
     STALE_UNKNOWN,
     measured_field,
@@ -735,6 +757,114 @@ _SOURCE_SCHEDULE: dict[str, tuple[str, int]] = {
 }
 
 
+_PIPELINE_FRESHNESS: dict[str, str] = {
+    PIPELINE_HEALTHY: "green",
+    PIPELINE_QUIET: "green",
+    PIPELINE_STALE: "yellow",
+    PIPELINE_SKIPPED_CONFIG: "yellow",
+    PIPELINE_FAILING: "red",
+    PIPELINE_STOPPED: "red",
+    PIPELINE_INACTIVE: "grey",
+}
+
+# Contract stale_reason per status (store/availability_fields.py). With no
+# committed rows on record the field is `unavailable` with this reason; with
+# rows on record it stays `available`/measured, and the reason (if any)
+# explains why those rows are not current.
+_PIPELINE_STALE_REASON: dict[str, str | None] = {
+    PIPELINE_HEALTHY: None,
+    PIPELINE_STALE: STALE_STALE,
+    PIPELINE_QUIET: STALE_NOT_PUBLISHED_YET,
+    PIPELINE_SKIPPED_CONFIG: STALE_NEVER_CONFIGURED,
+    PIPELINE_FAILING: STALE_FETCH_FAILED,
+    PIPELINE_STOPPED: STALE_STALE,
+    PIPELINE_INACTIVE: STALE_NEVER_CONFIGURED,
+}
+
+_NEXT_SCHEDULED_DELTA: dict[str, timedelta] = {
+    "daily": timedelta(days=1),
+    "weekly": timedelta(weeks=1),
+    "monthly": timedelta(days=30),
+    "annual": timedelta(days=365),
+}
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def _pipeline_source_status(
+    *,
+    name: str,
+    last_pull: datetime | None,
+    recent_rows: int,
+    catalog_active: bool | None,
+    run: CatalogRunSummary | None,
+    now: datetime,
+) -> PipelineSourceStatus:
+    """One source_catalog row's status, using raw_series + pull_log facts.
+
+    ``last_pull`` is the newest raw_series write (or source_catalog's own
+    last_pull_at); ``run`` is the row's pull_log summary, if any. The status
+    vocabulary and its rules live in ingestion/source_freshness.py.
+    """
+    last_pull_utc = _as_utc(last_pull)
+    schedule_info = _SOURCE_SCHEDULE.get(name)
+    fresh_hours = catalog_freshness_hours(name, _SOURCE_SCHEDULE)
+    status = classify_catalog_source(
+        now=now, fresh_hours=fresh_hours, last_write_at=last_pull_utc, run=run,
+    )
+    rows_at = newest_rows_at(last_pull_utc, run)
+    last_error = safe_last_error(run.last_error) if run else None
+
+    # Contract record (store/availability_fields.py::FieldRecord). `value`
+    # stays the raw_series 48h row count (rows_last_pull), as before; a
+    # source whose rows land in its own tables reads 0 there, and its
+    # pull_log row count is carried in last_rows_inserted instead.
+    reason = _PIPELINE_STALE_REASON[status]
+    if rows_at is None:
+        field_record = unavailable_field(reason or STALE_UNKNOWN, source_catalog=name)
+    else:
+        field_record = measured_field(
+            recent_rows,
+            unit="rows",
+            source_catalog=name,
+            ingested_at=rows_at,
+            stale_reason=reason,
+        )
+
+    next_scheduled = None
+    if schedule_info and last_pull_utc:
+        delta = _NEXT_SCHEDULED_DELTA.get(schedule_info[0], timedelta(days=1))
+        next_scheduled = (last_pull_utc + delta).isoformat()
+
+    return PipelineSourceStatus(
+        name=name,
+        type=_SOURCE_TYPE_MAP.get(name, "unknown"),
+        status=status,
+        last_pull=last_pull.isoformat() if last_pull else None,
+        rows_last_pull=recent_rows,
+        next_scheduled=next_scheduled,
+        freshness=_PIPELINE_FRESHNESS[status],
+        # The sampled distinct count required up to 50,000 heap fetches per
+        # source, yet this view does not display it. Leave it unknown.
+        series_count=None,
+        error=last_error if status in (PIPELINE_FAILING, PIPELINE_SKIPPED_CONFIG) else None,
+        field_record=field_record.to_dict(),
+        catalog_active=catalog_active,
+        freshness_window_hours=fresh_hours,
+        last_run_at=run.last_run_at.isoformat() if run and run.last_run_at else None,
+        last_success_with_rows_at=rows_at.isoformat() if rows_at else None,
+        last_status=run.last_status if run else None,
+        last_rows_inserted=run.last_rows_inserted if run else None,
+        last_error=last_error,
+        last_error_class=error_class(run.last_error) if run and run.last_status != "SUCCESS" else None,
+        runs_7d=run.runs_7d if run else 0,
+    )
+
+
 @router.get("/pipeline-health", response_model=PipelineHealthResponse)
 def pipeline_health(
     _token: str = Depends(require_auth),
@@ -752,6 +882,7 @@ def pipeline_health(
     recent_errors: list[PipelineError] = []
     resolver = ResolverStatus()
     query_failed_reason: str | None = None
+    status_basis = "pull_log+raw_series"
 
     try:
         with engine.connect() as conn:
@@ -768,7 +899,8 @@ def pipeline_health(
                 text(
                     "SELECT sc.name, "
                     "  COALESCE(latest.last_pull, sc.last_pull_at) AS last_pull, "
-                    "  COALESCE(recent.recent_rows, 0) AS recent_rows "
+                    "  COALESCE(recent.recent_rows, 0) AS recent_rows, "
+                    "  sc.id AS source_id, sc.active AS catalog_active "
                     "FROM source_catalog sc "
                     "LEFT JOIN LATERAL ("
                     "  SELECT rs.pull_timestamp AS last_pull "
@@ -786,100 +918,45 @@ def pipeline_health(
                     "ORDER BY sc.name"
                 ),
             ).fetchall()
+            # ── Per-source run record (pull_log) ───────────────────────
+            # Still under the 5s bound. A failure here is isolated in a
+            # savepoint: statuses then fall back to raw_series alone and
+            # the response says so (status_basis + availability).
+            catalog_ids = {
+                str(row[0]).lower(): int(row[3])
+                for row in source_rows
+                if row[3] is not None
+            }
+            runs: dict[int, CatalogRunSummary] = {}
+            try:
+                with conn.begin_nested():
+                    run_rows = conn.execute(
+                        CATALOG_RUN_SUMMARY_SQL,
+                        {
+                            "lookback_days": CATALOG_RUN_LOOKBACK_DAYS,
+                            "error_chars": CATALOG_RUN_ERROR_CHARS,
+                        },
+                    ).fetchall()
+                runs = merge_catalog_runs(run_rows, catalog_ids)
+            except Exception as exc:
+                log.warning("Pipeline: pull_log summary query failed: {e}", e=str(exc))
+                status_basis = "raw_series_only"
+                query_failed_reason = query_failed_reason or _classify_query_failure(exc)
             conn.execute(
                 text("SELECT set_config('statement_timeout', :timeout, true)"),
                 {"timeout": prior_timeout},
             )
 
+            now = datetime.now(timezone.utc)
             for row in source_rows:
-                src_name = row[0]
-                last_pull = row[1]
-                recent_rows = row[2]
-
-                src_type = _SOURCE_TYPE_MAP.get(src_name, "unknown")
-                schedule_info = _SOURCE_SCHEDULE.get(src_name)
-                stale_hours = schedule_info[1] if schedule_info else 168  # default 7 days
-
-                # Determine status and freshness
-                last_pull_utc = None
-                if last_pull is None:
-                    status = "broken"
-                    freshness = "red"
-                else:
-                    last_pull_utc = (
-                        last_pull.replace(tzinfo=timezone.utc)
-                        if last_pull.tzinfo is None
-                        else last_pull
-                    )
-                    age = datetime.now(timezone.utc) - last_pull_utc
-                    age_hours = age.total_seconds() / 3600
-
-                    if age_hours <= stale_hours:
-                        status = "healthy"
-                        freshness = "green"
-                    elif age_hours <= stale_hours * 2:
-                        status = "stale"
-                        freshness = "yellow"
-                    else:
-                        status = "broken"
-                        freshness = "red"
-
-                # Contract record (store/availability_fields.py::FieldRecord).
-                # `last_pull` is the only real signal this query has: when
-                # it is None the source has never been pulled at all
-                # (unavailable / never_configured — not fetch_failed, which
-                # would claim we know an attempt was made and failed). When
-                # it exists, that pull timestamp is a genuine measurement
-                # even if it is old, so the field stays `available` and the
-                # degree of staleness is carried in `stale_reason`, not in
-                # `availability`. `rows_last_pull` counts rows written in
-                # the last 48h — a healthy source with rows=0 there is NOT
-                # relabelled empty_source; that would require knowing the
-                # most recent pull *attempt's own* row count, which this
-                # query does not carry (see report: not-measured).
-                if last_pull_utc is None:
-                    field_record = unavailable_field(STALE_NEVER_CONFIGURED, source_catalog=src_name)
-                else:
-                    field_record = measured_field(
-                        recent_rows,
-                        unit="rows",
-                        source_catalog=src_name,
-                        ingested_at=last_pull_utc,
-                        stale_reason=STALE_STALE if status in ("stale", "broken") else None,
-                    )
-
-                # Compute next_scheduled (approximate)
-                next_scheduled = None
-                if schedule_info and last_pull:
-                    freq = schedule_info[0]
-                    from datetime import timedelta
-
-                    delta_map = {
-                        "daily": timedelta(days=1),
-                        "weekly": timedelta(weeks=1),
-                        "monthly": timedelta(days=30),
-                        "annual": timedelta(days=365),
-                    }
-                    delta = delta_map.get(freq, timedelta(days=1))
-                    next_dt = last_pull + delta
-                    # Ensure tzinfo
-                    if next_dt.tzinfo is None:
-                        next_dt = next_dt.replace(tzinfo=timezone.utc)
-                    next_scheduled = next_dt.isoformat()
-
-                sources.append(PipelineSourceStatus(
-                    name=src_name,
-                    type=src_type,
-                    status=status,
-                    last_pull=last_pull.isoformat() if last_pull else None,
-                    rows_last_pull=recent_rows,
-                    next_scheduled=next_scheduled,
-                    freshness=freshness,
-                    # The sampled distinct count required up to 50,000 heap
-                    # fetches per source, yet this view does not display it.
-                    # Leave the nullable API field unknown, rather than 0.
-                    series_count=None,
-                    field_record=field_record.to_dict(),
+                source_id = row[3]
+                sources.append(_pipeline_source_status(
+                    name=row[0],
+                    last_pull=row[1],
+                    recent_rows=row[2],
+                    catalog_active=row[4],
+                    run=runs.get(int(source_id)) if source_id is not None else None,
+                    now=now,
                 ))
 
             # ── Coverage by family ─────────────────────────────────────
@@ -983,14 +1060,22 @@ def pipeline_health(
         query_failed_reason = _classify_query_failure(exc)
 
     # ── Build summary ──────────────────────────────────────────────
-    healthy = sum(1 for s in sources if s.status == "healthy")
-    stale = sum(1 for s in sources if s.status == "stale")
-    broken = sum(1 for s in sources if s.status == "broken")
+    by_status = {status: 0 for status in PIPELINE_STATUSES}
+    for src in sources:
+        by_status[src.status] = by_status.get(src.status, 0) + 1
     summary = PipelineSummary(
         total_sources=len(sources),
-        healthy=healthy,
-        stale=stale,
-        broken=broken,
+        healthy=by_status[PIPELINE_HEALTHY],
+        stale=by_status[PIPELINE_STALE],
+        # Kept for existing readers: "needs an operator" = failing + stopped.
+        broken=sum(by_status[s] for s in PIPELINE_BROKEN_STATUSES),
+        quiet=by_status[PIPELINE_QUIET],
+        skipped_config=by_status[PIPELINE_SKIPPED_CONFIG],
+        failing=by_status[PIPELINE_FAILING],
+        stopped=by_status[PIPELINE_STOPPED],
+        inactive=by_status[PIPELINE_INACTIVE],
+        active_sources=len(sources) - by_status[PIPELINE_INACTIVE],
+        by_status=by_status,
     )
 
     daily_audit = _read_daily_freshness_audit(engine)
@@ -1004,6 +1089,7 @@ def pipeline_health(
         availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
         stale_reason=query_failed_reason,
         daily_audit=daily_audit,
+        status_basis=status_basis if sources else None,
     )
 
 

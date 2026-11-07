@@ -17,11 +17,50 @@ function timeAgo(iso) {
     return `${days}d ago`;
 }
 
+// Per-source statuses (api/schemas/system.py PipelineSourceStatus; rules in
+// ingestion/source_freshness.py). `broken` is the pre-2026-11-07 value, kept
+// so an older backend still renders.
 const STATUS_COLORS = {
     healthy: colors.green,
+    quiet: colors.green,
     stale: colors.yellow,
+    skipped_config: colors.yellow,
+    failing: colors.red,
+    stopped: colors.red,
     broken: colors.red,
+    inactive: colors.textMuted,
 };
+
+const STATUS_LABELS = {
+    healthy: 'healthy',
+    quiet: 'quiet',
+    stale: 'stale',
+    skipped_config: 'skipped (config)',
+    failing: 'failing',
+    stopped: 'stopped',
+    broken: 'broken',
+    inactive: 'inactive',
+};
+
+function statusLabel(status) {
+    return STATUS_LABELS[status] || textOr(status, 'unknown');
+}
+
+function capitalize(text) {
+    return text ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+}
+
+// Filter buttons. The detailed set is used when the backend reports the
+// per-status counts; otherwise the legacy three.
+const DETAILED_FILTERS = ['healthy', 'quiet', 'stale', 'skipped_config', 'failing', 'stopped', 'inactive'];
+const LEGACY_FILTERS = ['healthy', 'stale', 'broken'];
+const BROKEN_STATUSES = new Set(['failing', 'stopped', 'broken']);
+
+export function matchesStatusFilter(src, filter) {
+    if (filter === 'all') return true;
+    if (filter === 'broken') return BROKEN_STATUSES.has(src.status);
+    return src.status === filter;
+}
 
 const FRESHNESS_BG = {
     green: colors.greenBg,
@@ -303,7 +342,9 @@ const s = {
 
 // ── Sort logic ─────────────────────────────────────────────────────
 
-const STATUS_ORDER = { broken: 0, stale: 1, healthy: 2 };
+const STATUS_ORDER = {
+    failing: 0, broken: 0, stopped: 1, skipped_config: 2, stale: 3, quiet: 4, healthy: 5, inactive: 6,
+};
 
 function sortSources(sources, sortKey, sortDir) {
     const sorted = [...sources];
@@ -316,9 +357,9 @@ function sortSources(sources, sortKey, sortDir) {
         } else if (sortKey === 'freshness') {
             const f = { red: 0, yellow: 1, green: 2 };
             cmp = (f[a.freshness] ?? 0) - (f[b.freshness] ?? 0);
-        } else if (sortKey === 'last_pull') {
-            const ta = a.last_pull ? new Date(a.last_pull).getTime() : 0;
-            const tb = b.last_pull ? new Date(b.last_pull).getTime() : 0;
+        } else if (sortKey === 'last_pull' || sortKey === 'last_run_at') {
+            const ta = a[sortKey] ? new Date(a[sortKey]).getTime() : 0;
+            const tb = b[sortKey] ? new Date(b[sortKey]).getTime() : 0;
             cmp = ta - tb;
         } else if (sortKey === 'rows') {
             cmp = (a.rows_last_pull || 0) - (b.rows_last_pull || 0);
@@ -374,7 +415,7 @@ export default function PipelineHealth() {
         if (!data) return [];
         let srcs = data.sources || [];
         if (statusFilter !== 'all') {
-            srcs = srcs.filter(s => s.status === statusFilter);
+            srcs = srcs.filter(s => matchesStatusFilter(s, statusFilter));
         }
         return sortSources(srcs, sortKey, sortDir);
     }, [data, sortKey, sortDir, statusFilter]);
@@ -398,6 +439,10 @@ export default function PipelineHealth() {
     const dailyAudit = daily_audit || {};
     const auditUnavailable = dailyAudit.availability === 'unavailable';
     const auditBuckets = dailyAudit.buckets || [];
+    // Backends from before 2026-11-07 send only healthy/stale/broken.
+    const detailed = summary.failing !== undefined;
+    const filters = detailed ? DETAILED_FILTERS : LEGACY_FILTERS;
+    const filterCount = (f) => summary[f] || 0;
 
     const freshnessPct = (src) => {
         if (src.freshness === 'green') return 100;
@@ -424,14 +469,37 @@ export default function PipelineHealth() {
                         <div style={{ ...s.summaryNum, color: colors.green }}>{summary.healthy || 0}</div>
                         <div style={s.summaryLabel}>Healthy</div>
                     </div>
+                    {detailed && (
+                        <div style={s.summaryTile(colors.green)}>
+                            <div style={{ ...s.summaryNum, color: colors.green }}>{summary.quiet || 0}</div>
+                            <div style={s.summaryLabel}>Quiet</div>
+                        </div>
+                    )}
                     <div style={s.summaryTile(colors.yellow)}>
                         <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.stale || 0}</div>
                         <div style={s.summaryLabel}>Stale</div>
                     </div>
+                    {detailed && (
+                        <div style={s.summaryTile(colors.yellow)}>
+                            <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.skipped_config || 0}</div>
+                            <div style={s.summaryLabel}>Skipped (config)</div>
+                        </div>
+                    )}
                     <div style={s.summaryTile(colors.red)}>
                         <div style={{ ...s.summaryNum, color: colors.red }}>{summary.broken || 0}</div>
                         <div style={s.summaryLabel}>Broken</div>
+                        {detailed && (
+                            <div style={{ ...s.summaryLabel, textTransform: 'none' }}>
+                                {summary.failing || 0} failing · {summary.stopped || 0} stopped
+                            </div>
+                        )}
                     </div>
+                    {detailed && (
+                        <div style={s.summaryTile(colors.textMuted)}>
+                            <div style={{ ...s.summaryNum, color: colors.textMuted }}>{summary.inactive || 0}</div>
+                            <div style={s.summaryLabel}>Inactive</div>
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -480,16 +548,15 @@ export default function PipelineHealth() {
             <div style={s.section}>
                 <div style={s.sectionTitle}>SOURCE STATUS</div>
                 <div style={s.filterRow}>
-                    {['all', 'healthy', 'stale', 'broken'].map(f => (
+                    {['all', ...filters].map(f => (
                         <button
                             key={f}
                             style={s.filterBtn(statusFilter === f)}
                             onClick={() => setStatusFilter(f)}
                         >
-                            {f === 'all' ? `All (${summary.total_sources || 0})` :
-                             f === 'healthy' ? `Healthy (${summary.healthy || 0})` :
-                             f === 'stale' ? `Stale (${summary.stale || 0})` :
-                             `Broken (${summary.broken || 0})`}
+                            {f === 'all'
+                                ? `All (${summary.total_sources || 0})`
+                                : `${capitalize(statusLabel(f))} (${filterCount(f)})`}
                         </button>
                     ))}
                 </div>
@@ -508,6 +575,12 @@ export default function PipelineHealth() {
                                     <th style={s.th} onClick={() => handleSort('last_pull')}>
                                         Last Pull{sortArrow('last_pull')}
                                     </th>
+                                    {detailed && (
+                                        <th style={s.th} onClick={() => handleSort('last_run_at')}>
+                                            Last Run{sortArrow('last_run_at')}
+                                        </th>
+                                    )}
+                                    {detailed && <th style={s.th}>Runs 7d</th>}
                                     <th style={s.th} onClick={() => handleSort('rows')}>
                                         Rows{sortArrow('rows')}
                                     </th>
@@ -523,7 +596,7 @@ export default function PipelineHealth() {
                                     <tr key={src.name}>
                                         <td style={s.td}>
                                             <span style={s.dot(STATUS_COLORS[src.status] || colors.textMuted)} />
-                                            {src.status}
+                                            {statusLabel(src.status)}
                                         </td>
                                         <td style={{ ...s.td, color: colors.text, fontWeight: 600 }}>
                                             {src.name}
@@ -539,6 +612,17 @@ export default function PipelineHealth() {
                                         <td style={{ ...s.td, color: colors.textDim }}>
                                             {timeAgo(src.last_pull)}
                                         </td>
+                                        {detailed && (
+                                            <td style={{ ...s.td, color: colors.textDim }}>
+                                                {timeAgo(src.last_run_at)}
+                                                {src.last_status ? ` · ${src.last_status}` : ''}
+                                            </td>
+                                        )}
+                                        {detailed && (
+                                            <td style={{ ...s.td, color: colors.textDim }}>
+                                                {src.runs_7d ?? 0}
+                                            </td>
+                                        )}
                                         <td style={{ ...s.td, color: colors.textDim }}>
                                             {src.rows_last_pull != null ? src.rows_last_pull.toLocaleString() : '-'}
                                         </td>
@@ -564,7 +648,7 @@ export default function PipelineHealth() {
                                 ))}
                                 {filteredSources.length === 0 && (
                                     <tr>
-                                        <td colSpan={8} style={{ ...s.td, textAlign: 'center', color: colors.textMuted }}>
+                                        <td colSpan={detailed ? 10 : 8} style={{ ...s.td, textAlign: 'center', color: colors.textMuted }}>
                                             No sources match filter
                                         </td>
                                     </tr>

@@ -135,3 +135,144 @@ def test_fetch_pull_history_reads_window_on_sqlite():
     catalog, rows = sf.fetch_pull_history(eng, lookback_days=45)
     assert catalog == {"fred": 7}
     assert len(rows) == 1 and rows[0].puller_name == "smart:fred"
+
+
+# ── Catalog-level pipeline status (pipeline-health) ────────────────────
+
+
+def summary(*, run_h=None, rows_h=None, status="SUCCESS", rows=0, err=None, runs_7d=1):
+    return sf.CatalogRunSummary(
+        last_run_at=NOW - timedelta(hours=run_h) if run_h is not None else None,
+        last_success_with_rows_at=NOW - timedelta(hours=rows_h) if rows_h is not None else None,
+        last_status=status,
+        last_rows_inserted=rows,
+        last_error=err,
+        runs_7d=runs_7d,
+    )
+
+
+def classify(run=None, write_h=None, fresh_h=48.0):
+    write = NOW - timedelta(hours=write_h) if write_h is not None else None
+    return sf.classify_catalog_source(now=NOW, fresh_hours=fresh_h, last_write_at=write, run=run)
+
+
+@pytest.mark.parametrize(
+    ("status", "rows", "err", "expected"),
+    [
+        ("SUCCESS", 12, None, sf.RUN_ROWS),
+        ("PARTIAL", 5, "source coverage incomplete or row count unknown", sf.RUN_ROWS),
+        ("SUCCESS", 0, "NO_NEW_DATA: run completed, 0 rows written", sf.RUN_NO_NEW_DATA),
+        ("SUCCESS", 0, None, sf.RUN_NO_NEW_DATA),
+        ("SUCCESS", 0, "SKIPPED: JQUANTS_API_KEY not configured", sf.RUN_SKIPPED),
+        ("FAILED", 0, "PullerReportedFailure: no_api_key", sf.RUN_SKIPPED),
+        ("FAILED", 0, "PullerReportedFailure: auth_failed", sf.RUN_SKIPPED),
+        ("PARTIAL", 0, "1 of 2 items failed or partial, 0 skipped, 0 rows written: reddit not configured", sf.RUN_SKIPPED),
+        ("FAILED", 0, "TIMEOUT: Exceeded 60s timeout", sf.RUN_FAILED),
+        ("FAILED", 0, "PullerReportedFailure: puller did not report committed write count", sf.RUN_FAILED),
+        ("PARTIAL", 0, "1 of 3 items failed or partial, 0 skipped, 0 rows written", sf.RUN_FAILED),
+        ("FAILED", 0, None, sf.RUN_FAILED),
+    ],
+)
+def test_run_outcome(status, rows, err, expected):
+    assert sf.run_outcome(status, rows, err) == expected
+
+
+def test_healthy_from_pull_log_rows_without_raw_series():
+    # yfinance_options-style: rows land in the options tables, not raw_series.
+    assert classify(summary(run_h=2, rows_h=2, rows=75994)) == sf.PIPELINE_HEALTHY
+
+
+def test_healthy_from_raw_series_without_pull_log():
+    assert classify(None, write_h=3) == sf.PIPELINE_HEALTHY
+
+
+def test_quiet_when_latest_recent_run_found_no_new_data():
+    run = summary(run_h=1, rows_h=60, err="NO_NEW_DATA: run completed, 0 rows written")
+    assert classify(run) == sf.PIPELINE_QUIET
+
+
+def test_quiet_without_any_rows_on_record():
+    assert classify(summary(run_h=1, err="NO_NEW_DATA: x")) == sf.PIPELINE_QUIET
+
+
+def test_skipped_config():
+    run = summary(run_h=5, err="SKIPPED: ['no CF Radar token configured']")
+    assert classify(run) == sf.PIPELINE_SKIPPED_CONFIG
+
+
+def test_failing_when_latest_recent_run_failed():
+    run = summary(run_h=1, rows_h=70, status="FAILED", err="TIMEOUT: Exceeded 60s timeout")
+    assert classify(run) == sf.PIPELINE_FAILING
+
+
+def test_failing_even_with_no_rows_ever():
+    assert classify(summary(run_h=1, status="FAILED", err="boom")) == sf.PIPELINE_FAILING
+
+
+def test_stopped_when_nothing_within_twice_the_window():
+    assert classify(summary(run_h=200, rows_h=200, rows=4)) == sf.PIPELINE_STOPPED
+    assert classify(None, write_h=200) == sf.PIPELINE_STOPPED
+    # A failure long ago is "stopped", not "failing": nothing is running now.
+    assert classify(summary(run_h=500, status="FAILED", err="boom")) == sf.PIPELINE_STOPPED
+
+
+def test_stale_band_between_one_and_two_windows():
+    assert classify(None, write_h=72) == sf.PIPELINE_STALE
+    assert classify(summary(run_h=72, rows_h=72, rows=4)) == sf.PIPELINE_STALE
+    # A raw write in the band with only an old run of record is still stale.
+    assert classify(summary(run_h=300, status="FAILED", err="x"), write_h=72) == sf.PIPELINE_STALE
+
+
+def test_inactive_when_never_ran_and_never_wrote():
+    assert classify(None) == sf.PIPELINE_INACTIVE
+
+
+def test_window_scales_with_cadence():
+    run = summary(run_h=700, rows_h=700, rows=3)
+    assert classify(run, fresh_h=1080) == sf.PIPELINE_HEALTHY  # monthly
+    assert classify(run, fresh_h=168) == sf.PIPELINE_STOPPED   # weekly
+
+
+def test_merge_catalog_runs_attributes_and_folds():
+    catalog = {"darkpool": 3, "fred": 7, "asset_registries": 9}
+
+    def t(hours):
+        return NOW - timedelta(hours=hours)
+
+    rows = [
+        # Two pullers under one catalog row: the newer run supplies status.
+        (7, "smart:fed_liquidity", t(1), None, 2, "FAILED", 0, "TIMEOUT: x"),
+        (7, "FRED", t(5), t(5), 3, "SUCCESS", 40, None),
+        # No source_id: smart:<entry> through the registry's catalog mapping.
+        (None, "smart:dark_pool", t(2), t(2), 1, "SUCCESS", 9, None),
+        # No source_id: plain name, case-insensitive.
+        (None, "Asset_Registries", t(4), None, 1, "SUCCESS", 0, "NO_NEW_DATA: x"),
+        # No source_id and no catalog row of that name: dropped.
+        (None, "YFinance_Daily", t(1), t(1), 1, "SUCCESS", 5, None),
+    ]
+    merged = sf.merge_catalog_runs(rows, catalog)
+    assert set(merged) == {3, 7, 9}
+    fred = merged[7]
+    assert (fred.last_status, fred.last_error, fred.runs_7d) == ("FAILED", "TIMEOUT: x", 5)
+    assert fred.last_run_at == t(1)
+    assert fred.last_success_with_rows_at == t(5)
+    assert merged[3].last_rows_inserted == 9
+    assert merged[9].last_status == "SUCCESS"
+
+
+def test_catalog_freshness_hours():
+    explicit = {"FRED": ("daily", 48)}
+    assert sf.catalog_freshness_hours("FRED", explicit) == 48.0
+    # dark_pool runs weekly (freq_h 168) under DARKPOOL: 2 cadences.
+    assert sf.catalog_freshness_hours("DARKPOOL", explicit) == 336.0
+    assert sf.catalog_freshness_hours("no_such_source", explicit) == 168.0
+
+
+def test_safe_last_error_redacts_then_truncates():
+    msg = "TIMEOUT: GET https://api.example.com/q?apikey=SECRET123&x=1 token=abc123 " + "y" * 900
+    out = sf.safe_last_error(msg)
+    assert "SECRET123" not in out and "abc123" not in out
+    assert len(out) <= sf.LAST_ERROR_MAX_CHARS
+    assert out.endswith("…")
+    assert sf.safe_last_error(None) is None
+    assert sf.safe_last_error("SKIPPED: short") == "SKIPPED: short"
