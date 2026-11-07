@@ -259,3 +259,43 @@ Verification and limits:
   reconciliation are explicit rollout gates in
   `docs/reference/SEC_FINANCIAL_PERIOD_INTEGRITY.md`. No provider calls, DB
   corrections, publication, merge or deployment.
+
+
+## 2026-11-07 - qualify SEC snapshots and historical reconciliation proposal
+
+- Continued the isolated period candidate with original archived SEC Company
+  Facts for NVDA, Apple and TSMC plus the NVDA filing. Real source bytes confirm
+  $96.221B quarter versus $177.837B six-month revenue, a 371-day Apple fiscal year,
+  a 98-day Apple quarter and explicitly limited IFRS annual coverage.
+- Added content-bound source snapshots, a separate current pointer, strict
+  admission and an actor-serialized transactional projection writer. Valid
+  empty/unsupported current projections remove only this producer's old marked
+  rows. Failed captures and older/regressed revisions cannot replace current data.
+  Original bytes, normalized outputs, FX inputs and receipt times are preserved.
+- Added proposed evidence/head tables without historical rewrites. Application
+  archive writes are append-only; actual deployment ownership/default/inherited
+  grants still require review. Downgrade deliberately retains evidence.
+- Distinguished attempted versus successful checkpoint progress, so a permanently
+  failing issuer cannot starve later tickers or freeze healthy revision refreshes.
+- Prepared a local-only, no-execution reconciliation manifest from a frozen
+  read-only export of 798 NVDA rows: 252 value differences, 338 provenance-only
+  review cases and 208 unavailable cases. These are review groups, not approved
+  corrections. Exact IDs and lossless before-image hashes guard a future repair.
+  Private operational artifacts remain outside git; public SEC fixtures are saved.
+
+Verification and limits:
+
+- 270 selected offline tests passed, 3 dependency-limited tests deselected; 14
+  real PostgreSQL tests passed on a new disposable native PostgreSQL 15.19 cluster.
+  Checked actual uniqueness, rollback, archive bytes, idempotency, empty updates,
+  concurrent capture ordering and clean-role evidence UPDATE/DELETE/TRUNCATE denial.
+- Private cluster was stopped and removed. No existing database/service or denied
+  WSL instance was accessed. No production writes, migration, checkpoint changes,
+  paid-provider calls, external-agent communication, push, PR, merge or deployment.
+- Independent review findings on malformed source admission, Decimal preservation
+  and failed-issuer liveness were fixed and regression-tested; final review found
+  no additional actionable source defect. Ruff, compilation and diff checks passed.
+- Full CI, deployment schema/permissions, legacy reconciliation, dependent rollup
+  invalidation and consumer acceptance remain required. Existing FX/concept/sign
+  and fiscal-label policies are not made authoritative by this duration fix.
+  See docs/reference/SEC_FINANCIAL_PERIOD_INTEGRITY.md for evidence and repair gates.

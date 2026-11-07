@@ -400,37 +400,39 @@ def _fetch_ticker_to_cik_map() -> dict[str, str]:
 # ── Company Facts fetch ─────────────────────────────────────────────────
 
 
-def _fetch_company_facts(cik_padded: str) -> dict[str, Any] | None:
-    """Fetch Company Facts JSON for a zero-padded CIK.
+def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
+    """Capture original successful response bytes and actual request boundaries."""
+    from ingestion.altdata.sec_financial_snapshots import MAX_SOURCE_BYTES
 
-    Returns:
-        Parsed JSON dict, or None on 404/403/parse failure (caller should
-        log and continue).
-    """
     url = _COMPANY_FACTS_URL.format(cik=cik_padded)
+    started = datetime.now(timezone.utc)
     try:
-        resp = requests.get(
-            url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS
-        )
+        resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
     except requests.RequestException as exc:
-        log.warning("SEC companyfacts CIK={c} network error: {e}",
-                    c=cik_padded, e=str(exc))
+        log.warning("SEC companyfacts CIK={c} network failure: {e}",
+                    c=cik_padded, e=type(exc).__name__)
         return None
-
-    if resp.status_code in (403, 404):
-        log.warning("SEC companyfacts CIK={c} HTTP {s}",
-                    c=cik_padded, s=resp.status_code)
-        return None
+    received = datetime.now(timezone.utc)
     if resp.status_code != 200:
-        log.warning("SEC companyfacts CIK={c} HTTP {s}",
-                    c=cik_padded, s=resp.status_code)
+        log.warning("SEC companyfacts CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
         return None
+    body = resp.content
+    if not isinstance(body, bytes) or not 0 < len(body) <= MAX_SOURCE_BYTES:
+        log.warning("SEC companyfacts CIK={c} invalid/oversized response body", c=cik_padded)
+        return None
+    return body, started, received
 
+
+def _fetch_company_facts(cik_padded: str) -> dict[str, Any] | None:
+    """Compatibility JSON reader shared with the independent shares puller."""
+    captured = _fetch_company_facts_response(cik_padded)
+    if captured is None:
+        return None
     try:
-        return resp.json()
-    except ValueError as exc:
-        log.warning("SEC companyfacts CIK={c} JSON parse: {e}",
-                    c=cik_padded, e=str(exc))
+        payload = json.loads(captured[0])
+        return payload if isinstance(payload, dict) else None
+    except (UnicodeError, ValueError):
+        log.warning("SEC companyfacts CIK={c} invalid JSON", c=cik_padded)
         return None
 
 
@@ -928,21 +930,6 @@ _INSERT_SQL = text(
     """
 )
 
-# Pre-0024 DBs don't have the ``currency`` column. Keep a legacy
-# insert statement available so the puller still works against a
-# schema that hasn't had migration 0024 applied yet.
-_LEGACY_INSERT_SQL = text(
-    """
-    INSERT INTO capital_flows (
-        actor_id, fiscal_period, period_type, flow_type, direction,
-        amount_usd, counterparty_id, source_filing, confidence, as_of
-    ) VALUES (
-        :actor_id, :fiscal_period, :period_type, :flow_type, :direction,
-        :amount_usd, NULL, :source_filing, :confidence, NOW()
-    )
-    """
-)
-
 
 def _write_rows(
     engine: Engine,
@@ -955,59 +942,33 @@ def _write_rows(
     callers, only the exact source key) with NULL counterparty, then INSERT. This is
     necessary because the original migration 0021 unique index treats
     NULLs as DISTINCT, so ON CONFLICT can't match NULL counterparties.
-    Migration 0024 rebuilds the index with NULLS NOT DISTINCT; once
-    that's applied we still run the DELETE (cheap) but ON CONFLICT also
-    kicks in as a safety net.
+    Current schema is required; any SQL failure rolls back the transaction.
+    Normal ingestion uses the immutable snapshot writer instead.
     """
     if not rows:
         return 0
-    written = 0
     with engine.begin() as conn:
         for r in rows:
             params = {
-                "actor_id": actor_id,
-                "fiscal_period": r["fiscal_period"],
-                "period_type": r["period_type"],
-                "flow_type": r["flow_type"],
-                "direction": r["direction"],
-                "amount_usd": r["amount_usd"],
+                "actor_id": actor_id, "fiscal_period": r["fiscal_period"],
+                "period_type": r["period_type"], "flow_type": r["flow_type"],
+                "direction": r["direction"], "amount_usd": r["amount_usd"],
                 "source_filing": r["source_filing"],
                 "confidence": r.get("confidence") or "confirmed",
                 "currency": r.get("currency") or "USD",
             }
-            try:
-                conn.execute(_DELETE_BEFORE_INSERT_SQL, {
-                    "actor_id": params["actor_id"],
-                    "fiscal_period": params["fiscal_period"],
-                    "period_type": params["period_type"],
-                    "flow_type": params["flow_type"],
-                    "source_filing": params["source_filing"],
-                    "replace_validated": (
-                        params["source_filing"].split(" ", 2)[:2]
-                        in [[form, _PERIOD_SOURCE_MARKER]
-                            for form in _ANNUAL_FORMS | _QUARTER_FORMS]
-                    ),
-                    "validated_marker": _PERIOD_SOURCE_MARKER,
-                })
-                try:
-                    conn.execute(_INSERT_SQL, params)
-                except Exception:
-                    # Column ``currency`` missing → pre-0024 schema.
-                    # Drop it and retry with the legacy insert.
-                    legacy_params = {
-                        k: v for k, v in params.items() if k != "currency"
-                    }
-                    conn.execute(_LEGACY_INSERT_SQL, legacy_params)
-                written += 1
-            except Exception as exc:
-                log.warning(
-                    "capital_flows upsert failed for {a} {f} {ft}: {e}",
-                    a=actor_id,
-                    f=r.get("fiscal_period"),
-                    ft=r.get("flow_type"),
-                    e=str(exc),
-                )
-    return written
+            parts = params["source_filing"].split(" ", 2)
+            conn.execute(_DELETE_BEFORE_INSERT_SQL, {
+                **params,
+                "replace_validated": (len(parts) >= 2 and parts[0] in _ANNUAL_FORMS | _QUARTER_FORMS
+                                      and parts[1] == _PERIOD_SOURCE_MARKER),
+                "validated_marker": _PERIOD_SOURCE_MARKER,
+            })
+            # Current schema is required. Do not catch SQL failures inside a
+            # transaction or retry on an already-aborted PostgreSQL connection.
+            conn.execute(_INSERT_SQL, params)
+    return len(rows)
+
 
 
 # ── Checkpoint ──────────────────────────────────────────────────────────
@@ -1025,12 +986,16 @@ def _load_checkpoint() -> dict[str, Any]:
 
 
 def _save_checkpoint(
-    completed: list[str], last_ticker: str, total_rows: int,
+    completed: list[str], last_ticker: str, total_rows: int, attempted: list[str],
 ) -> None:
     """Atomically write checkpoint to /tmp."""
+    from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION
+
     payload = {
+        "normalizer_version": NORMALIZER_VERSION,
         "last_ticker": last_ticker,
         "completed": completed,
+        "attempted": attempted,
         "total_rows": total_rows,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1072,8 +1037,9 @@ class SECXBRLFinancialsPuller:
 
         Parameters:
             limit: Maximum tickers to process this invocation (None = all).
-            resume: If True, skip tickers already recorded in the
-                checkpoint. Set False to force full re-run.
+            resume: If True, resume the current attempt sweep. Successful and
+                failed attempts are distinct; every issuer is retried on the
+                next sweep. Set False to force a new sweep.
             tickers: If provided, restrict the universe to these tickers
                 only (case-insensitive). Useful for targeted re-runs of
                 foreign-issuer IFRS filers.
@@ -1098,8 +1064,19 @@ class SECXBRLFinancialsPuller:
             extras = sorted(allowed - universe_set)
             universe = base + extras
 
+        from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION, prepare_snapshot
+        from store.sec_financial_snapshots import write_snapshot
+
         checkpoint = _load_checkpoint() if resume else {}
+        if checkpoint.get("normalizer_version") != NORMALIZER_VERSION:
+            checkpoint = {}
         already_done: set[str] = set(checkpoint.get("completed") or [])
+        already_attempted: set[str] = set(checkpoint.get("attempted") or already_done)
+        if set(universe).issubset(already_attempted):
+            # Failed issuers must not freeze successful issuers indefinitely.
+            # Start another sweep after every issuer was attempted, not only
+            # after every issuer succeeded. Failure never means completion.
+            checkpoint, already_done, already_attempted = {}, set(), set()
         total_rows_before: int = int(checkpoint.get("total_rows") or 0)
 
         # Pre-load FX rates once so every ticker's facts can convert
@@ -1122,7 +1099,15 @@ class SECXBRLFinancialsPuller:
         results: list[dict[str, Any]] = []
         processed = 0
         rows_this_run = 0
-        completed_list: list[str] = list(already_done)
+        completed_list: list[str] = sorted(already_done)
+        attempted_list: list[str] = sorted(already_attempted)
+
+        def record_attempt(ticker: str, *, success: bool = False) -> None:
+            attempted_list.append(ticker)
+            if success:
+                completed_list.append(ticker)
+            _save_checkpoint(completed_list.copy(), ticker, total_rows_before + rows_this_run,
+                             attempted_list.copy())
 
         for ticker in universe:
             if limit is not None and processed >= limit:
@@ -1132,7 +1117,7 @@ class SECXBRLFinancialsPuller:
                 log.warning("SEC_XBRL: runtime cap reached — stopping")
                 break
 
-            if ticker in already_done:
+            if ticker in already_attempted:
                 continue
 
             actor_id = ticker.lower()
@@ -1142,46 +1127,45 @@ class SECXBRLFinancialsPuller:
                 results.append({
                     "ticker": ticker, "status": "NO_CIK", "rows": 0,
                 })
-                completed_list.append(ticker)
                 processed += 1
-                _save_checkpoint(
-                    completed_list, ticker, total_rows_before + rows_this_run,
-                )
+                record_attempt(ticker)
                 continue
 
-            facts = _fetch_company_facts(cik_padded)
+            captured = _fetch_company_facts_response(cik_padded)
             time.sleep(_RATE_LIMIT_DELAY_SECS)
-            if facts is None:
-                results.append({
-                    "ticker": ticker, "status": "NO_FACTS", "rows": 0,
-                })
-                completed_list.append(ticker)
-                processed += 1
-                _save_checkpoint(
-                    completed_list, ticker, total_rows_before + rows_this_run,
-                )
-                continue
-
-            flow_rows = _collect_all_flows(facts, fx_rates)
-            written = _write_rows(self.engine, actor_id, flow_rows)
-            rows_this_run += written
-
-            log.info(
-                "SEC_XBRL: {t} CIK={c} → {w} rows ({f} flow records)",
-                t=ticker, c=cik_padded, w=written, f=len(flow_rows),
-            )
-            results.append({
-                "ticker": ticker,
-                "cik": cik_padded,
-                "status": "SUCCESS" if written > 0 else "NO_FLOWS",
-                "rows": written,
-                "candidates": len(flow_rows),
-            })
-            completed_list.append(ticker)
             processed += 1
-            _save_checkpoint(
-                completed_list, ticker, total_rows_before + rows_this_run,
-            )
+            if captured is None:
+                results.append({
+                    "ticker": ticker, "status": "FAILED", "rows": 0,
+                    "error": "No successful complete SEC response; prior projection retained",
+                })
+                record_attempt(ticker)
+                continue
+            try:
+                snapshot = prepare_snapshot(
+                    source_body=captured[0], actor_id=actor_id, cik=cik_padded,
+                    request_started_at=captured[1], received_at=captured[2], fx_rates=fx_rates,
+                )
+                outcome = write_snapshot(self.engine, snapshot)
+                if outcome["status"] == "rejected_revision_regression":
+                    raise ValueError("New capture regressed an existing filed revision; projection retained")
+            except Exception as exc:
+                # The transactional writer already rolled back any SQL failure.
+                # Never checkpoint failed admission as a completed ticker.
+                reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                log.warning("SEC_XBRL: {t} snapshot not admitted: {e}", t=ticker, e=reason)
+                results.append({"ticker": ticker, "status": "FAILED", "rows": 0,
+                                "error": reason})
+                record_attempt(ticker)
+                continue
+            written = outcome["rows_written"]
+            rows_this_run += written
+            results.append({
+                "ticker": ticker, "cik": cik_padded, "status": "SUCCESS", "rows": written,
+                "candidates": len(snapshot.rows), "snapshot_id": snapshot.snapshot_id,
+                "snapshot_status": outcome["status"], "rows_removed": outcome.get("rows_removed", 0),
+            })
+            record_attempt(ticker, success=True)
 
         elapsed = time.monotonic() - start_ts
         log.info(

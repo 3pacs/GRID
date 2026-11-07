@@ -1,0 +1,14 @@
+{
+  "kind": "fetched-current-companyfacts-snapshot",
+  "url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0001045810.json",
+  "retrieved_at_utc": "2026-11-07T21:07:18.747877+00:00",
+  "sha256": "19ef503a5770f5660964b3c3aea6937579d9b359da344afe6a9adf59c63d26ff",
+  "bytes": 4092966,
+  "filename": "nvda.companyfacts.json.gz",
+  "status": 200,
+  "response_date": "Sat, 07 Nov 2026 21:07:22 GMT",
+  "last_modified": null,
+  "user_agent": "GRID Intelligence ops@stepdad.finance",
+  "storage_encoding": "gzip",
+  "stored_bytes": 275663
+}
