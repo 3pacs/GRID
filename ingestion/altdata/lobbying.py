@@ -3,7 +3,7 @@ GRID lobbying disclosure tracker.
 
 Pulls lobbying registration and expenditure data from two sources:
   1. OpenSecrets API (api.opensecrets.org) — requires OPENSECRETS_API_KEY
-  2. Senate Lobbying Disclosure Act database (lda.senate.gov) — public, no key
+  2. Lobbying Disclosure Act database (lda.gov; formerly lda.senate.gov) — public, no key
 
 Tracks lobbying activity by company/organization, maps clients to stock
 tickers, and detects spending trend changes as a leading indicator of
@@ -16,7 +16,7 @@ Scheduled: weekly pull.
 
 Data sources:
   https://www.opensecrets.org/api/
-  https://lda.senate.gov/api/
+  https://lda.gov/api/redoc/v1/  (lda.senate.gov/api/ 301-redirects here since 2026)
 """
 
 from __future__ import annotations
@@ -39,11 +39,19 @@ from ingestion.base import BasePuller, retry_on_failure
 
 _OPENSECRETS_API_KEY_ENV: str = "OPENSECRETS_API_KEY"
 _OPENSECRETS_BASE_URL: str = "https://www.opensecrets.org/api/"
-_LDA_BASE_URL: str = "https://lda.senate.gov/api/v1/"
+# lda.senate.gov/api/v1/ answers 301 -> lda.gov/api/v1/ (verified 2026-11-06).
+_LDA_BASE_URL: str = "https://lda.gov/api/v1/"
 
 _REQUEST_TIMEOUT: int = 30
-_RATE_LIMIT_DELAY: float = 1.0
+# Anonymous LDA API access is throttled; pace requests politely. Throttle
+# answers (429) go through retry_on_failure, which honours Retry-After.
+_RATE_LIMIT_DELAY: float = 3.5
+# The API caps page_size at 25, so 20 pages = the newest 500 filings
+# (``ordering=-dt_posted``). A 30-day window holds ~25k filings; the cap keeps
+# the run (~90 s) inside the smart scheduler's 120 s timeout for "lobbying"
+# rather than claiming the whole window.
 _MAX_PAGES: int = 20
+_LDA_PAGE_SIZE: int = 25
 
 # ── Client-to-ticker mapping (imports from gov_contracts for consistency) ─
 
@@ -142,7 +150,7 @@ class LobbyingPuller(BasePuller):
     SOURCE_NAME: str = "LOBBYING_DISCLOSURE"
 
     SOURCE_CONFIG: dict[str, Any] = {
-        "base_url": "https://lda.senate.gov/api/v1/",
+        "base_url": "https://lda.gov/api/v1/",
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": True,
@@ -212,7 +220,7 @@ class LobbyingPuller(BasePuller):
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
     )
     def _lda_get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Make a GET request to Senate LDA API (no key required).
+        """Make a GET request to the LDA API (no key required).
 
         Parameters:
             endpoint: API path relative to base URL.
@@ -226,6 +234,7 @@ class LobbyingPuller(BasePuller):
             url,
             params=params or {},
             timeout=_REQUEST_TIMEOUT,
+            allow_redirects=True,  # host moves (senate -> lda.gov) must not break the pull
             headers={
                 "User-Agent": "GRID-DataPuller/1.0",
                 "Accept": "application/json",
@@ -249,17 +258,27 @@ class LobbyingPuller(BasePuller):
         cutoff = (date.today() - timedelta(days=days_back)).isoformat()
         all_filings: list[dict[str, Any]] = []
         page = 1
+        self._lda_fetch_error: str | None = None
+        self._lda_failed_page: int | None = None
 
         while page <= _MAX_PAGES:
             try:
+                # No ``filing_type`` filter: the old "REGISTRATION,REPORT" is
+                # not an LDA filing-type code (codes are RR, RA, Q1..Q4, 1A,
+                # ...), and the API rejected every request with HTTP 400, so
+                # every run since at least 2026-05 fetched 0 filings and still
+                # reported SUCCESS. Registrations and quarterly reports are
+                # both wanted.
                 data = self._lda_get("filings/", params={
                     "filing_dt_posted_after": cutoff,
-                    "filing_type": "REGISTRATION,REPORT",
+                    "ordering": "-dt_posted",
                     "page": page,
-                    "page_size": 100,
+                    "page_size": _LDA_PAGE_SIZE,
                 })
             except Exception as exc:
                 log.warning("LDA filing fetch page {p} failed: {e}", p=page, e=str(exc))
+                self._lda_fetch_error = f"page {page}: {type(exc).__name__}"
+                self._lda_failed_page = page
                 break
 
             results = data.get("results", [])
@@ -277,7 +296,7 @@ class LobbyingPuller(BasePuller):
 
             page += 1
 
-        log.info("Senate LDA: fetched {n} filings from last {d} days", n=len(all_filings), d=days_back)
+        log.info("LDA: fetched {n} filings from last {d} days", n=len(all_filings), d=days_back)
         return all_filings
 
     def _parse_lda_filing(self, filing: dict[str, Any]) -> dict[str, Any] | None:
@@ -588,8 +607,19 @@ class LobbyingPuller(BasePuller):
                         err=str(exc),
                     )
 
+        # A failed first page means nothing was observed: FAILED, not a
+        # zero-row SUCCESS. A later page failing leaves a partial window.
+        fetch_error = getattr(self, "_lda_fetch_error", None)
+        if fetch_error and getattr(self, "_lda_failed_page", 1) == 1:
+            status = "FAILED"
+        elif fetch_error:
+            status = "PARTIAL"
+        else:
+            status = "SUCCESS"
         summary = {
-            "status": "SUCCESS",
+            "status": status,
+            "error": fetch_error,
+            "rows_inserted": stored,
             "total_fetched": len(filings),
             "stored": stored,
             "mapped_to_ticker": mapped,

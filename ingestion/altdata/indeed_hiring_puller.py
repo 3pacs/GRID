@@ -34,15 +34,17 @@ from intelligence.actor_ingest import ingest_actor
 
 _REQUEST_TIMEOUT: int = 30
 
-_AGGREGATE_URL: str = (
-    "https://raw.githubusercontent.com/hiring-lab/"
-    "hiring-lab-data-library/main/US/aggregate_job_postings_US.csv"
-)
+# The hiring-lab-data-library repo paths now 404; the tracker repo is live
+# (verified 2026-11-06: aggregate last row 2026-10-30, sector last row
+# 2026-10-30). Both files are LONG format, one row per (date, variable[,
+# sector]) with ``variable`` in {"total postings", "new postings"}; see
+# _to_wide_aggregate / _to_wide_sectors.
+_REPO_BASE: str = "https://raw.githubusercontent.com/hiring-lab/job_postings_tracker/master/US/"
+_AGGREGATE_URL: str = _REPO_BASE + "aggregate_job_postings_US.csv"
+_SECTOR_URL: str = _REPO_BASE + "job_postings_by_sector_US.csv"
 
-_SECTOR_URL: str = (
-    "https://raw.githubusercontent.com/hiring-lab/"
-    "hiring-lab-data-library/main/US/job_postings_by_sector_US.csv"
-)
+# Headline series: the seasonally adjusted index of all postings.
+_TOTAL_POSTINGS: str = "total postings"
 
 # Anomaly threshold: >10% MoM drop in aggregate index
 _HIRING_FREEZE_THRESHOLD: float = -0.10
@@ -63,6 +65,52 @@ def _normalise_sector(sector: str) -> str:
     )
 
 
+def _lower_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip().lower() for c in out.columns]
+    return out
+
+
+def _to_wide_aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    """Tracker long format -> ``date, indeed_job_postings_index`` (SA, total postings).
+
+    ``aggregate_job_postings_US.csv`` columns: date, jobcountry,
+    indeed_job_postings_index_SA, indeed_job_postings_index_NSA, variable.
+    Without this, the first-two-columns fallback read ``jobcountry`` ("US")
+    as the value and every row was coerced to NaN. A frame already in the
+    legacy wide shape is returned unchanged.
+    """
+    low = _lower_columns(df)
+    if "variable" not in low.columns:
+        return df
+    value_col = next((c for c in ("indeed_job_postings_index_sa",
+                                  "indeed_job_postings_index",
+                                  "indeed_job_postings_index_nsa") if c in low.columns), None)
+    if value_col is None or "date" not in low.columns:
+        return df
+    rows = low[low["variable"].astype(str).str.strip().str.lower() == _TOTAL_POSTINGS]
+    return rows[["date", value_col]].rename(columns={value_col: "indeed_job_postings_index"})
+
+
+def _to_wide_sectors(df: pd.DataFrame) -> pd.DataFrame:
+    """Tracker long format -> one column per sector (total postings).
+
+    ``job_postings_by_sector_US.csv`` columns: date, jobcountry,
+    indeed_job_postings_index, variable, display_name. Without this, every
+    non-date column (jobcountry, variable, display_name, ...) was treated as
+    a "sector". A legacy wide frame is returned unchanged.
+    """
+    low = _lower_columns(df)
+    needed = {"date", "variable", "display_name", "indeed_job_postings_index"}
+    if not needed <= set(low.columns):
+        return df
+    rows = low[low["variable"].astype(str).str.strip().str.lower() == _TOTAL_POSTINGS]
+    wide = rows.pivot_table(index="date", columns="display_name",
+                            values="indeed_job_postings_index", aggfunc="last")
+    wide.columns = [str(c) for c in wide.columns]
+    return wide.reset_index()
+
+
 class IndeedHiringPuller(BasePuller):
     """Pulls Indeed Hiring Lab job postings data into raw_series.
 
@@ -78,7 +126,7 @@ class IndeedHiringPuller(BasePuller):
     SOURCE_NAME: str = "Indeed_Hiring_Lab"
 
     SOURCE_CONFIG: dict[str, Any] = {
-        "base_url": "https://github.com/hiring-lab/hiring-lab-data-library",
+        "base_url": "https://github.com/hiring-lab/job_postings_tracker",
         "cost_tier": "FREE",
         "latency_class": "WEEKLY",
         "pit_available": True,
@@ -155,7 +203,7 @@ class IndeedHiringPuller(BasePuller):
             Result dict with status and rows_inserted.
         """
         try:
-            df = self._fetch_csv(_AGGREGATE_URL)
+            df = _to_wide_aggregate(self._fetch_csv(_AGGREGATE_URL))
         except Exception as exc:
             log.error("Indeed aggregate CSV download failed: {e}", e=str(exc))
             return {
@@ -217,6 +265,14 @@ class IndeedHiringPuller(BasePuller):
                 n=int(coerced_count),
             )
         df = df.dropna(subset=[date_col, value_col])
+        if df.empty:
+            # Every value coerced away is a layout change, not "nothing new".
+            return {
+                "source": "indeed_aggregate",
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "error": f"no dated numeric rows in columns {date_col!r}/{value_col!r}",
+            }
 
         series_id = "indeed:us:aggregate_postings"
         inserted = 0
@@ -288,7 +344,8 @@ class IndeedHiringPuller(BasePuller):
         )
         return {
             "source": "indeed_aggregate",
-            "status": "SUCCESS" if inserted > 0 else "PARTIAL",
+            # Parsed and checked with nothing new is not a partial run.
+            "status": "SUCCESS" if inserted > 0 else "NO_NEW_DATA",
             "rows_inserted": inserted,
             "anomalies": anomalies,
         }
@@ -310,7 +367,7 @@ class IndeedHiringPuller(BasePuller):
             Result dict with status and rows_inserted.
         """
         try:
-            df = self._fetch_csv(_SECTOR_URL)
+            df = _to_wide_sectors(self._fetch_csv(_SECTOR_URL))
         except Exception as exc:
             log.error("Indeed sector CSV download failed: {e}", e=str(exc))
             return {
@@ -424,9 +481,16 @@ class IndeedHiringPuller(BasePuller):
             n=total_inserted,
             s=len(sectors_processed),
         )
+        if not sectors_processed:
+            return {
+                "source": "indeed_sectors",
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "error": "no sector column held numeric data",
+            }
         return {
             "source": "indeed_sectors",
-            "status": "SUCCESS" if total_inserted > 0 else "PARTIAL",
+            "status": "SUCCESS" if total_inserted > 0 else "NO_NEW_DATA",
             "rows_inserted": total_inserted,
             "sectors": sectors_processed,
         }
