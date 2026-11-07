@@ -212,6 +212,19 @@ def forecast_to_prediction(
         return None
 
     preds = forecast_result.predictions
+    if not current_price or current_price <= 0:
+        return None
+    # A one-step-ahead forecast far from today's price means the history fed
+    # to TimesFM ended somewhere else (2026-11-07: series ending in 2012 gave
+    # CORT $4.04 against $72.77). The clamp below would hide that as -30%.
+    anchor_gap_pct = abs(preds[0] - current_price) / current_price * 100
+    if anchor_gap_pct > MAX_ANCHOR_GAP_PCT:
+        log.warning(
+            "TimesFM forecast for {t} starts at {p0:.2f} vs price {px:.2f} ({g:.0f}% gap); "
+            "history does not end at today's price, no prediction",
+            t=ticker, p0=float(preds[0]), px=current_price, g=anchor_gap_pct,
+        )
+        return None
     target_price = preds[-1]
     expected_move_pct = (target_price - current_price) / current_price * 100
 
@@ -288,6 +301,56 @@ def forecast_to_prediction(
     )
 
 
+# Context for TimesFM: the newest ~4 years of daily adjusted closes. The old
+# reader took ``ORDER BY obs_date ASC LIMIT 2048`` over adj_close and close
+# together, i.e. the OLDEST 2048 rows: CORT's series ended 2012-05-30 at $4.02
+# and INTC's 1988 at $0.57, so every forecast was a years-old price compared
+# with today's (66 of 100 active predictions on 2026-11-07 implied -74% to
+# -99% or +310% in a week).
+HISTORY_POINTS = 1024
+# Tiingo is the canonical writer of YF:{ticker}:adj_close (analysis/panel_prices.py);
+# yfinance is the fallback. KAGGLE_BULK only holds 2004-2014 closes.
+HISTORY_SOURCES: tuple[str, ...] = ("TIINGO", "yfinance")
+MAX_HISTORY_STALENESS_DAYS = 7
+MIN_HISTORY_POINTS = 30
+# One step ahead, a daily close rarely moves this far; beyond it the forecast
+# was not anchored on the current price.
+MAX_ANCHOR_GAP_PCT = 25.0
+
+
+def recent_close_history(
+    conn: Any,
+    ticker: str,
+    *,
+    today: date | None = None,
+    n: int = HISTORY_POINTS,
+) -> tuple[np.ndarray | None, str]:
+    """Oldest-to-newest adjusted closes ending at the latest accepted date.
+
+    Reads through ``store.observations`` (SUCCESS rows, one vintage per date,
+    one source at a time). Returns ``(None, reason)`` when no source has at
+    least ``MIN_HISTORY_POINTS`` dates or the newest close is older than
+    ``MAX_HISTORY_STALENESS_DAYS``: a forecast from a stale series would be
+    compared with today's price.
+    """
+    from store import observations
+
+    today = today or date.today()
+    start = today - timedelta(days=int(n * 1.5) + 14)  # ~252 sessions a year
+    reasons: list[str] = []
+    for source in HISTORY_SOURCES:
+        obs = observations.read_latest_n(conn, f"YF:{ticker}:adj_close", n, source=source, start=start)
+        if len(obs) < MIN_HISTORY_POINTS:
+            reasons.append(f"{source}: {len(obs)} dates")
+            continue
+        age = (today - obs[0].obs_date).days
+        if age > MAX_HISTORY_STALENESS_DAYS:
+            reasons.append(f"{source}: newest close {obs[0].obs_date} ({age}d old)")
+            continue
+        return np.array([o.value for o in reversed(obs)], dtype=np.float32), source
+    return None, "; ".join(reasons) or "no source"
+
+
 def run_timesfm_forecast_cycle(
     engine: Engine,
     tickers: list[str] | None = None,
@@ -330,25 +393,19 @@ def run_timesfm_forecast_cycle(
     if not tickers:
         return {"error": "no active tickers", "forecasts": 0}
 
-    # Fetch historical data for all tickers
+    # Fetch the most recent close history for every ticker
     series_dict: dict[str, np.ndarray] = {}
-    for ticker in tickers:
-        with engine.connect() as conn:
-            # Prefer adj_close (accounts for splits/dividends), fall back to close
-            rows = conn.execute(text("""
-                SELECT obs_date, value FROM raw_series
-                WHERE series_id IN (:sid1, :sid2) AND pull_status = 'SUCCESS'
-                ORDER BY obs_date ASC
-                LIMIT 2048
-            """).bindparams(
-                sid1=f"YF:{ticker}:adj_close",
-                sid2=f"YF:{ticker}:close",
-            )).fetchall()
-
-        if rows and len(rows) >= 30:
-            series_dict[ticker] = np.array(
-                [float(r[1]) for r in rows], dtype=np.float32
-            )
+    skipped: dict[str, str] = {}
+    with engine.connect() as conn:
+        for ticker in tickers:
+            history, reason = recent_close_history(conn, ticker)
+            if history is None:
+                skipped[ticker] = reason
+            else:
+                series_dict[ticker] = history
+    if skipped:
+        log.info("TimesFM: {n} tickers skipped (e.g. {ex})", n=len(skipped),
+                 ex=dict(list(skipped.items())[:3]))
 
     if not series_dict:
         return {"error": "no historical data available", "forecasts": 0}
