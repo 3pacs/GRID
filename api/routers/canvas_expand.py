@@ -506,7 +506,10 @@ def expand_node(
         # ── 1c. Top hypothesis ───────────────────────────────────────
         hyp_row = conn.execute(
             text("""
-                SELECT id, thesis, confidence, status, role, pattern_type, kill_reason
+                SELECT id, thesis, confidence,
+                       CASE WHEN status = 'confirmed' AND scoring_version IS NULL
+                            THEN 'legacy_v1_unsound' ELSE status END AS status,
+                       role, pattern_type, kill_reason
                 FROM discovered_hypotheses
                 WHERE (thesis ILIKE :pn OR thesis ILIKE :pt) AND status IN ('active','confirmed')
                 ORDER BY confidence DESC NULLS LAST LIMIT 1
@@ -927,7 +930,10 @@ def expand_node(
             # ── 3d. More hypotheses (2 more) ─────────────────────────
             more_hyps = conn.execute(
                 text("""
-                    SELECT id, thesis, confidence, status, role, pattern_type
+                    SELECT id, thesis, confidence,
+                           CASE WHEN status = 'confirmed' AND scoring_version IS NULL
+                                THEN 'legacy_v1_unsound' ELSE status END AS status,
+                           role, pattern_type
                     FROM discovered_hypotheses
                     WHERE (thesis ILIKE :pn OR thesis ILIKE :pt) AND status IN ('active','confirmed')
                     ORDER BY confidence DESC NULLS LAST LIMIT 3 OFFSET 1

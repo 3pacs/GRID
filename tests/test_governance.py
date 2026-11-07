@@ -7,10 +7,15 @@ ModelRegistry lifecycle state machine and GateChecker promotion requirements.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch, call
+from datetime import timedelta
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from governance.hypothesis_labels import LEGACY_CUTOFF
+
+# Hypothesis rows are (state, created_at, label); validated = post-cutoff, unlabelled.
+_POST_CUTOFF = LEGACY_CUTOFF + timedelta(days=1)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,7 +63,7 @@ class TestGateCheckerCandidateToShadow:
         # Second query: hypothesis row (state='PASSED')
         conn.execute.return_value.fetchone.side_effect = [
             _row(42, 7),
-            _row("PASSED"),
+            _row("PASSED", _POST_CUTOFF, None),
         ]
 
         from validation.gates import GateChecker
@@ -78,7 +83,7 @@ class TestGateCheckerCandidateToShadow:
         # validation_run_id=None, hypothesis_id=7
         conn.execute.return_value.fetchone.side_effect = [
             _row(None, 7),
-            _row("PASSED"),
+            _row("PASSED", _POST_CUTOFF, None),
         ]
 
         from validation.gates import GateChecker
@@ -96,7 +101,7 @@ class TestGateCheckerCandidateToShadow:
 
         conn.execute.return_value.fetchone.side_effect = [
             _row(42, 7),
-            _row("FAILED"),
+            _row("FAILED", _POST_CUTOFF, None),
         ]
 
         from validation.gates import GateChecker

@@ -230,3 +230,14 @@ Verification and limits:
 - No production queries, SMTP delivery, merge, deployment or external-agent
   communication. Repository coverage is not proof of deployed email delivery,
   historical data reconciliation or actual investment performance.
+
+### Same-day integration with the updated main branch
+
+- Main advanced to `8fbed48c` while the expanded draft was being published.
+  Integrated it into the isolated draft branch, without merging the PR.
+- Resolved the sole `scripts/notify.py` overlap by retaining main's creation-date
+  cutoff and legacy-label exclusions together with the email's bounded update
+  window. The recap discloses this filtered PASSED-count scope.
+- Strengthened the SQLite regression with recently updated legacy, labeled and
+  future rows; only the current unlabelled row is counted. All 494 combined
+  offline tests passed again; Ruff and diff checks passed.

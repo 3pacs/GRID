@@ -57,7 +57,7 @@ readable plain text; explicit plain text and code blocks retain their source.
   explicitly simulation outputs, not a live investment track record.
 - `format_daily_digest`: bounded 24-hour historical journal, recorded-PASSED
   hypothesis and drift-record counts precede full detail. Unavailable collectors
-  stay unknown instead of becoming zero. Source timestamps are preserved.
+  stay unknown instead of becoming zero. Source timestamps are preserved. The PASSED count retains main's creation-date cutoff and legacy-label exclusions; it is not a count of all recorded historical PASSED rows.
 
 ## Existing dormant notification paths, deliberately not activated
 
@@ -81,4 +81,3 @@ text, escaping, exact repair-command plain text, stale saved boards, past dates,
 and unchanged notification gating. Synthetic local HTML previews supplement
 source tests; they do not prove production data quality, email-client rendering,
 or delivery. CI results and exact local test counts are recorded in the PR.
-

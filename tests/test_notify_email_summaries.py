@@ -87,8 +87,17 @@ def test_legacy_digest_uses_bounded_window_and_counts_before_detail():
         conn.execute(text('CREATE TABLE decision_journal(id INTEGER, inferred_state TEXT, state_confidence REAL, grid_recommendation TEXT, verdict TEXT, decision_timestamp TIMESTAMP)'))
         for i, at in enumerate(['2026-11-07 07:00:00+00:00', '2026-11-08 07:00:00+00:00']):
             conn.execute(text("INSERT INTO decision_journal VALUES(:i,'MIXED',NULL,'HOLD',NULL,:at)"), {'i':i,'at':at})
-        conn.execute(text('CREATE TABLE hypothesis_registry(id INTEGER, statement TEXT, updated_at TIMESTAMP, state TEXT)'))
-        conn.execute(text("INSERT INTO hypothesis_registry VALUES(1,'Full hypothesis','2026-11-07 07:00:00+00:00','PASSED')"))
+        conn.execute(text('CREATE TABLE hypothesis_registry(id INTEGER, statement TEXT, updated_at TIMESTAMP, state TEXT, created_at TIMESTAMP)'))
+        conn.execute(text("INSERT INTO hypothesis_registry VALUES(1,'Full hypothesis','2026-11-07 07:00:00+00:00','PASSED','2026-11-07 01:00:00+00:00')"))
+        conn.execute(text('CREATE TABLE hypothesis_registry_labels(registry_id INTEGER, label TEXT)'))
+        for i, statement, updated, created in [
+            (2, 'Old legacy row', '2026-11-07 07:00:00+00:00', '2026-11-06 01:00:00+00:00'),
+            (3, 'Labeled row', '2026-11-07 07:00:00+00:00', '2026-11-07 01:00:00+00:00'),
+            (4, 'Future update', '2026-11-08 07:00:00+00:00', '2026-11-07 01:00:00+00:00'),
+        ]:
+            conn.execute(text("INSERT INTO hypothesis_registry VALUES(:i,:statement,:updated,'PASSED',:created)"),
+                         dict(i=i, statement=statement, updated=updated, created=created))
+        conn.execute(text("INSERT INTO hypothesis_registry_labels VALUES(3,'LEGACY_UNVALIDATED')"))
         conn.execute(text('CREATE TABLE feature_registry(id INTEGER, name TEXT)'))
         conn.execute(text('CREATE TABLE feature_drift_log(feature_id INTEGER, drift_score REAL, checked_at TIMESTAMP)'))
     body = notify.format_daily_digest(engine, now=now)
@@ -97,6 +106,8 @@ def test_legacy_digest_uses_bounded_window_and_counts_before_detail():
     assert '0 drift records' in body
     assert 'n/a' in body and '2026-11-07 07:00:00 UTC' in body
     assert '2026-11-08' not in body
+    assert all(name not in body for name in ('Old legacy row', 'Labeled row', 'Future update'))
+    assert 'exclude pre-cutoff and labeled legacy rows' in body
     assert 'not a verified investment track record' in body
 
 

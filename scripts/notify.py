@@ -44,6 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger as log
 
+from governance.hypothesis_labels import LEGACY_CUTOFF
+
 
 # ---------------------------------------------------------------------------
 # SMTP helpers
@@ -301,12 +303,15 @@ def format_daily_digest(engine: Any, *, now: datetime | None = None) -> str:
         with engine.connect() as conn:
             passed = conn.execute(
                 sa_text(
-                    "SELECT id, statement, updated_at "
-                    "FROM hypothesis_registry "
-                    "WHERE state = 'PASSED' AND updated_at >= :since AND updated_at <= :now "
-                    "ORDER BY updated_at DESC"
+                    "SELECT h.id, h.statement, h.updated_at "
+                    "FROM hypothesis_registry h "
+                    "WHERE h.state = 'PASSED' AND h.updated_at >= :since AND h.updated_at <= :now "
+                    "AND h.created_at >= :legacy_cutoff "
+                    "AND NOT EXISTS (SELECT 1 FROM hypothesis_registry_labels l "
+                    "WHERE l.registry_id = h.id) "
+                    "ORDER BY h.updated_at DESC"
                 ),
-                {"since": since, "now": now},
+                {"since": since, "now": now, "legacy_cutoff": LEGACY_CUTOFF},
             ).fetchall()
 
         counts["recorded PASSED hypotheses"] = len(passed)
@@ -355,7 +360,7 @@ def format_daily_digest(engine: Any, *, now: datetime | None = None) -> str:
     )
     summary += (f"\nWindow: {_timestamp(since)} through {_timestamp(now)}, inclusive. "
                 "Historical records, not current open alerts. This is not a verified investment track record. "
-                "Query failures remain unknown.\n\n")
+                "PASSED counts exclude pre-cutoff and labeled legacy rows under the registry policy. Query failures remain unknown.\n\n")
     return summary + "\n".join(lines)
 
 

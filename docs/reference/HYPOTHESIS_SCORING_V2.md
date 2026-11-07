@@ -41,53 +41,134 @@ Rules:
   `scoring_version`, `trial_p_value`, `trial_q_value`, `trial_ledger_sha256`.
   NULL `scoring_version` = a v1 verdict.
 
+## Trial ledger — dedicated, not canonical (owner decision 2026-11-07)
+
+Scored hypothesis batches go to a **dedicated** S11 ledger, `grid-hypothesis-trials`.
+The canonical research ledger `grid-hypothesis-loop` has never had its genesis
+(no file on grid-svr or gridz4); its genesis waits until the research lane
+designs its catalog. Nothing in the scorer assumes `CANONICAL_LEDGER_ID`:
+`open_trial_ledger` opens whatever ledger the env names, and the id comes
+from that file's genesis.
+
+| | |
+|---|---|
+| ledger | `/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl` |
+| anchor | `/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl` |
+| owner / modes | dirs `grid:grid 0750` (the ledger dir must be writable: the scorer creates `grid-hypothesis-trials.jsonl.lock` beside the ledger); files `grid:grid 0640` |
+| q | 0.10 (frozen at genesis; the BH level of every batch) |
+| catalog frozen at genesis | `families=("HYPOTHESIS_BATCHES\|change\|fwd1",)`, `features=("none\|x",)`, `classes=(("none\|x", "hypothesis_batches_only"),)`, `self_lag=()` — a placeholder that satisfies `Catalog.validate()`. Hypothesis batches use only `q`; no S11 allocation should ever run on this ledger. |
+
+Run, in order (as Anik; the genesis refuses an existing anchor or ledger file, so a
+second run fails instead of resetting anything):
+
+```bash
+sudo install -d -m 0750 -o grid -g grid /data/grid_ledgers/hypotheses/ledger /data/grid_ledgers/hypotheses/anchor
+```
+
+```bash
+sudo -u grid bash -c 'cd /data/grid_v4/grid_release && umask 0027 && PYTHONPATH=. /data/grid_v4/grid_venv-314/bin/python -c "
+from analysis.ledger_steered_exploration import Catalog, Ledger
+cat = Catalog(families=(\"HYPOTHESIS_BATCHES|change|fwd1\",), features=(\"none|x\",), classes=((\"none|x\", \"hypothesis_batches_only\"),))
+led = Ledger.create(\"/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl\", anchor=\"/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl\", catalog=cat, ledger_id=\"grid-hypothesis-trials\", q=0.10)
+print(led.genesis[\"ledger_id\"], led.head)
+"'
+```
+
+Verify (read-only; re-walks the hash chain and the anchor):
+
+```bash
+sudo -u grid bash -c 'cd /data/grid_v4/grid_release && PYTHONPATH=. /data/grid_v4/grid_venv-314/bin/python -c "
+import json
+from analysis.ledger_steered_exploration import Ledger, summarize_hypothesis_batches
+led = Ledger(\"/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl\", anchor=\"/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl\")
+led.verify(full=True)
+g = led.genesis
+print(json.dumps({\"ledger_id\": g[\"ledger_id\"], \"q\": g[\"q\"], \"catalog_sha256\": g[\"catalog_sha256\"], \"records\": len(led.records), **summarize_hypothesis_batches(led)}, indent=1))
+"'
+```
+
+Expected: `ledger_id` `grid-hypothesis-trials`, `q` 0.1, `catalog_sha256`
+`4e097c95a2951bcd54a74affb6ed6a894d786505d81c2f9862b63f37c304a9ec`, 1 record,
+0 batches.
+
+Then point only grid-hermes at it (drop-in, not the shared `.env`) and restart:
+
+```bash
+printf '[Service]\nEnvironment=HYPOTHESIS_TRIAL_LEDGER_PATH=/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl\nEnvironment=HYPOTHESIS_TRIAL_LEDGER_ANCHOR_PATH=/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl\n' | sudo tee /etc/systemd/system/grid-hermes.service.d/zz-hypothesis-ledger.conf
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart grid-hermes
+```
+
+Optional hardening after genesis: `sudo chattr +a` on the two `.jsonl` files
+(appends still work; truncate/rewrite refused). Not on the directories — the
+lock file must be creatable. Keep an off-host copy of the anchor.
+
+While `ACTIVE_HYPOTHESIS_SCORING_HELD` is True the configured ledger is never
+written; without the env the scorer writes nothing (`TrialLedgerNotConfigured`).
+
+### Two ledgers, one trial count (open requirement)
+
+`declared_trial_count` (the DSR trial count the S11 overfit gate deflates by)
+counts only the ledger it is given. With hypothesis batches in the dedicated
+ledger, the canonical research ledger's gate would under-count. **Once
+`grid-hypothesis-loop` exists, the overfit gate (`evaluate_overfit_gate` /
+`require_overfit_gate`) must add this ledger's hypothesis trials**
+(`summarize_hypothesis_batches(...)["hypothesis_trials"]`, read from the
+anchored dedicated ledger) to its `n_trials_declared`, and its staleness check
+must also fail when this ledger has grown since the gate ran. Until then no
+research promotion is possible anyway (no canonical ledger, no gate record).
+
 ## Lifting the hold (owner)
 
-1. Create the S11 ledger file + anchor (anchor on a separate append-only
-   location) — a dedicated ledger, or the canonical research ledger if the
-   research lane creates one, so one DSR count covers both.
-2. Set `HYPOTHESIS_TRIAL_LEDGER_PATH` / `HYPOTHESIS_TRIAL_LEDGER_ANCHOR_PATH`
-   in the service env of grid-hermes (and anything else that runs the batch).
-3. Flip `ACTIVE_HYPOTHESIS_SCORING_HELD = False` (separate reviewed commit).
+1. Create the dedicated ledger and point grid-hermes at it (above).
+2. Flip `ACTIVE_HYPOTHESIS_SCORING_HELD = False` (separate reviewed commit;
+   branch `claude/hypothesis-lift-hold-20261106`).
 
 Dry run (read-only, any time): `python -m intelligence.hypothesis_trials dry-run
 --trials-out trials.jsonl` — forces `default_transaction_read_only = on` on every
 pooled connection and checks it, records into an in-memory ledger only.
 
-## Legacy rows — proposed additive relabel (not executed)
+## Legacy rows — additive relabel
 
-Nothing below rewrites history; every proposal is a reader filter or an
-append-only side table.
+Nothing rewrites history: v1 verdicts are told apart by a reader rule, and
+registry verdicts by an append-only side table.
 
 **`discovered_hypotheses` v1 verdicts** (133,089 confirmed / 71,476 invalidated
 on 2026-11-06; 114,826 of the confirmed lead-lag rows involve `snap:*`, 97,717
-mention `llm_task`). Every v1 terminal row has `scoring_version IS NULL`. Readers
-that surface "confirmed" hypotheses should count only
-`scoring_version IS NOT NULL` as trial-confirmed and show v1 rows as
-`legacy_v1_unsound`. No UPDATE needed.
+mention `llm_task`). Every v1 terminal row has `scoring_version IS NULL`.
+`get_stats` counts only `scoring_version IS NOT NULL` as confirmed/invalidated
+and reports v1 rows under `legacy_v1_unsound`; display readers (canvas,
+surfacer, valuation) show them as `legacy_v1_unsound`; `oracle/model_evolver`
+seeds from active or trial-confirmed rows only.
 
-**`hypothesis_registry`** (separate producer chain; see the PR for the code trace):
+**`hypothesis_registry`** (separate producer chain):
 
 - `PASSED` 10,609 rows = **35 distinct statements**, all TACTICAL, all
   `backtest_scanner` ("When X moves >1%, Y follows within 1 day (Sharpe 9.3…)").
   In-sample 504-day Sharpe/win-rate pass, no holdout, no multiple-testing
   correction, re-inserted up to 10 per run without dedup.
-- `TESTING` 30,821 rows = 185 distinct statements; 30,814 are PASSED rows the
+- `TESTING` 30,821 rows = 185 distinct statements: 30,782 are PASSED rows the
   LLM reviewer flagged ("Unrealistic assumptions (Sharpe 9.6…)", "Duplicate",
-  "Self-correlation disguised as a signal"); `hypothesis_tester` only reads
-  `CANDIDATE`, so nothing ever revisits TESTING. 7 are tester-inconclusive.
+  "Self-correlation disguised as a signal"), 39 are tester inconclusives or
+  AutoAgent rows with no verdict. `hypothesis_tester` only reads `CANDIDATE`,
+  so nothing ever revisits TESTING.
 - `FAILED` 85 is shrunk: the weekly prune deleted FAILED rows > 180 days until
   #1005.
 
-Proposal: an append-only `hypothesis_registry_labels` table
-(`registry_id, prior_state, label, reason, decided_by, created_at`) with
-`LEGACY_UNVALIDATED` for every PASSED row and `LEGACY_LLM_FLAGGED` /
-`LEGACY_INCONCLUSIVE` for TESTING, and the PASSED consumers
-(`trading/paper_engine.register_all_passed`, `validation/gates.py` CANDIDATE→SHADOW,
-`api/routers/discovery.py` promote, `scripts/train_regime_model.py`,
-`scripts/notify.py`) reading through it. The 35 + 185 distinct statements can
-be re-declared as fresh v2-style trials with a forward holdout from the date of
-re-declaration.
+`hypothesis_registry_labels` (migration `hyp_registry_labels_20261107`,
+append-only, UPDATE/DELETE/TRUNCATE refused) holds one label per row and
+`label_version`: `LEGACY_UNVALIDATED` (PASSED), `LEGACY_LLM_FLAGGED` and
+`LEGACY_INCONCLUSIVE` (TESTING). `scripts/label_legacy_hypotheses.py` writes
+them (dry run by default; `--apply --decided-by ...`; idempotent).
+
+Every PASSED consumer reads a row as validated only when it is PASSED, created
+at or after `governance.hypothesis_labels.LEGACY_CUTOFF` (2026-11-07) and
+unlabelled — so legacy rows are excluded even before the labels are written:
+`trading/paper_engine.register_all_passed`, `validation/gates.py`
+CANDIDATE→SHADOW, `api/routers/discovery.py` promote,
+`scripts/train_regime_model.py` (unreachable stub), `scripts/notify.py`.
 
 ## Production dry run (2026-11-07 00:5xZ, read-only, release f5b0510e + this branch)
 
