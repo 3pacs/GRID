@@ -246,10 +246,22 @@ def _create_tables(conn: Any) -> None:
     # Additive column for tables created before 2026-11-06. A constant default
     # makes ADD COLUMN catalog-only; lock_timeout bounds the wait behind a
     # claim holding a worker row so startup fails fast and systemd retries.
-    cur.execute("SET lock_timeout = '5s'")
-    cur.execute(COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL)
-    cur.execute("RESET lock_timeout")
+    # The ALTER runs only when the column is missing: ADD COLUMN IF NOT EXISTS
+    # takes ACCESS EXCLUSIVE even when the column exists, and on 2026-11-07
+    # the nightly pg_dump's ACCESS SHARE made every coordinator start time out
+    # (crash loop 03:32-04:34Z, deploys failing at "Restart grid-coordinator").
+    cur.execute(COMPUTE_WORKERS_HAS_OLLAMA_MODELS_SQL)
+    if not cur.fetchone():
+        cur.execute("SET lock_timeout = '5s'")
+        cur.execute(COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL)
+        cur.execute("RESET lock_timeout")
 
+
+COMPUTE_WORKERS_HAS_OLLAMA_MODELS_SQL = (
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_schema = current_schema() AND table_name = 'compute_workers' "
+    "AND column_name = 'ollama_models'"
+)
 
 COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL = (
     "ALTER TABLE compute_workers "
