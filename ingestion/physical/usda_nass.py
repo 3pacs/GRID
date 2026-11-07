@@ -58,6 +58,10 @@ NASS_QUERIES: list[dict[str, str]] = [
 
 _NASS_BASE_URL = "https://quickstats.nass.usda.gov/api/api_GET/"
 _RATE_LIMIT_DELAY: float = 2.0
+_NO_KEY_REASON = (
+    "USDA_NASS_API_KEY not set; QuickStats requires a key "
+    "(free at quickstats.nass.usda.gov/api)"
+)
 
 # Month name to number mapping for NASS reference_period_desc
 _MONTH_MAP: dict[str, int] = {
@@ -198,7 +202,19 @@ class USDAPuller(BasePuller):
         return result
 
     def pull_all(self, start_year: int = 1970) -> dict[str, Any]:
-        """Pull all NASS queries."""
+        """Pull all NASS queries.
+
+        Without ``USDA_NASS_API_KEY`` the run is SKIPPED with that reason (the
+        scheduler write contract), not a ``0 of 5 items completed`` FAILED:
+        every query would skip before any request, so nothing was attempted.
+        """
+        if not self.api_key:
+            return {
+                "source": "USDA_NASS",
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "skipped_reason": _NO_KEY_REASON,
+            }
         log.info("Starting USDA NASS bulk pull from {sy}", sy=start_year)
         results: list[dict[str, Any]] = []
 

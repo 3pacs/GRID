@@ -706,8 +706,13 @@ class OffshoreLeaksPuller(BasePuller):
 
         matches = self.match_actors()
         if not matches:
+            # A completed check that matched nobody wrote 0 rows. The old
+            # "NO_MATCHES" status carried no write count, so the scheduler
+            # write contract read it as FAILED ("puller did not report
+            # committed write count").
             return {
-                "status": "NO_MATCHES",
+                "status": "NO_NEW_DATA",
+                "rows_inserted": 0,
                 "total_matches": 0,
                 "actors_matched": 0,
             }

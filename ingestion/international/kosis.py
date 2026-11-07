@@ -30,6 +30,10 @@ KOSIS_SERIES: dict[str, str] = {
 
 _KOSIS_BASE_URL = "https://kosis.kr/openapi/statisticsData.do"
 _RATE_LIMIT_DELAY: float = 2.0
+_NO_KEY_REASON = (
+    "KOSIS_API_KEY not set; the KOSIS OpenAPI requires a key "
+    "(free registration at kosis.kr/openapi)"
+)
 
 
 class KOSISPuller(BasePuller):
@@ -156,7 +160,19 @@ class KOSISPuller(BasePuller):
         return result
 
     def pull_all(self, start_date: str | date = "1990-01-01") -> dict[str, Any]:
-        """Pull all KOSIS series."""
+        """Pull all KOSIS series.
+
+        Without ``KOSIS_API_KEY`` the run is SKIPPED with that reason (the
+        scheduler write contract), not a ``0 of 5 items completed`` FAILED:
+        every item would skip before any request, so nothing was attempted.
+        """
+        if not self.api_key:
+            return {
+                "source": "KOSIS",
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "skipped_reason": _NO_KEY_REASON,
+            }
         log.info("Starting KOSIS bulk pull")
         start_period = str(start_date)[:4] + str(start_date)[5:7] if len(str(start_date)) >= 7 else "199001"
         results = [self.pull_series(sid, start_period) for sid in KOSIS_SERIES]
