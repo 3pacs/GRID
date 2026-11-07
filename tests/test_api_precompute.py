@@ -317,6 +317,8 @@ ROUTES: list[tuple[str, str, str, dict]] = [
     ("api.routers.associations", "/api/v1/associations/regime-features?days=504",
      "associations.regime_features", {"days": 504}),
     ("api.routers.options", "/api/v1/options/100x", "options.100x", {}),
+    ("api.routers.intelligence", "/api/v1/intelligence/patterns?min_occurrences=3",
+     "intelligence.patterns", {"min_occurrences": 3, "max_sequence_length": 4}),
 ]
 
 
@@ -690,3 +692,40 @@ class TestGlobe:
         assert body["as_of"] == "2026-10-01"
         assert not any("LIKE" in s and "series_id = ANY" not in s and "source_id" not in s
                        for s in statements), statements
+
+
+class TestPatterns:
+    def test_builder_mines_read_only_with_the_pwa_parameters(self, monkeypatch):
+        import intelligence.pattern_engine as pe
+
+        calls: list[dict] = []
+
+        class _P:
+            actionable = True
+
+            def to_dict(self):
+                return {"id": "p1"}
+
+        def fake_discover(engine, **kw):
+            calls.append(kw)
+            return [_P()]
+
+        monkeypatch.setattr(pe, "discover_patterns", fake_discover)
+        now = datetime(2026, 11, 7, 6, 0, tzinfo=timezone.utc)
+        [out] = ap.build_patterns(ap.BuildContext(engine=object(), now=now))
+        assert calls == [{"min_occurrences": 3, "max_sequence_length": 4, "persist": False}]
+        assert out.key == "intelligence.patterns"
+        assert out.params == {"min_occurrences": 3, "max_sequence_length": 4}
+        assert out.payload["patterns"] == [{"id": "p1"}] and out.payload["actionable_count"] == 1
+        assert out.as_of == now
+
+    def test_route_never_mines_in_the_request(self, fake_store, monkeypatch):
+        import intelligence.pattern_engine as pe
+
+        def boom(*a, **kw):
+            raise AssertionError("discover_patterns ran in the request")
+
+        monkeypatch.setattr(pe, "discover_patterns", boom)
+        r = _client("api.routers.intelligence").get("/api/v1/intelligence/patterns?min_occurrences=5")
+        assert r.status_code == 503
+        assert r.json()["precomputed_params"] == [{"min_occurrences": 3, "max_sequence_length": 4}]

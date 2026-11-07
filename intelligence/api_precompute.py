@@ -387,6 +387,18 @@ def build_architecture(ctx: BuildContext) -> list[Output]:
     return [Output("system.architecture_db", {}, payload, ctx.now)]
 
 
+PATTERNS_DEFAULT = {"min_occurrences": 3, "max_sequence_length": 4}
+
+
+def build_patterns(ctx: BuildContext) -> list[Output]:
+    """``/intelligence/patterns`` event-sequence mining (~116 s), the PWA's parameters."""
+    from api.routers.intelligence_news import _compute_discovered_patterns
+
+    payload = _compute_discovered_patterns(ctx.engine, **PATTERNS_DEFAULT)
+    # Mined over the event history up to the build: the data is "now".
+    return [Output("intelligence.patterns", dict(PATTERNS_DEFAULT), payload, ctx.now)]
+
+
 def _options_signature(engine: Engine) -> str | None:
     with engine.connect() as conn:
         r = conn.execute(text(
@@ -507,6 +519,13 @@ JOBS: tuple[Job, ...] = (
         outputs=(("intelligence.regime_analogs", _p(n=20, min_quality=0.4)),),
         empty_fields={"intelligence.regime_analogs": ("regime", "matches", "forecast")},
         description="Analog episodes for today's state vector + conditional forecast + TimesFM.",
+    ),
+    Job(
+        name="patterns", cadence_s=6 * HOUR, stale_after_s=36 * HOUR, version="1",
+        build=build_patterns,
+        outputs=(("intelligence.patterns", _p(**PATTERNS_DEFAULT)),),
+        empty_fields={"intelligence.patterns": ("patterns", "count", "actionable_count")},
+        description="Recurring 2-4 event sequences across watchlist tickers (read-only mining).",
     ),
     Job(
         name="options_100x", cadence_s=30 * MINUTE, stale_after_s=36 * HOUR, version="1",
