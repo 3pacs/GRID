@@ -200,3 +200,82 @@ Next pick-up:
 - Follow the runbook's adoption/operational acceptance checklist in the existing
   automation. Retain one naturally scheduled run's two output statuses and
   failure notification before declaring the pipeline repaired.
+## 2026-11-07 - summary-first Oracle and operator email reporting (source only)
+
+What was done:
+
+- Added a prominent Oracle activity headline and concise recap before the supplied
+  prediction detail. New prediction rows, model votes and update operations remain
+  separate; absent or incomplete store counts are unknown, never substituted.
+- Replaced the Oracle email's misleading P/L percentage with a labeled historical
+  signed-move sum in percentage points. It is an unreconciled diagnostic, not a
+  portfolio/option return. No scoring, historical data or model weights changed.
+- Added cycle timestamps, nullable/non-finite display handling, expiry status,
+  full supplied signal/anti-signal detail and readable plain text.
+- Operator issue totals now aggregate the full bounded 24-hour interval before
+  the 100-record detail limit. The recap and subject say historical issue records,
+  not current open incidents. Retained diagnosis, fix text and recorded statuses.
+- Long Plays displays the saved board/price dates and marks past catalysts as
+  outcome-unverified. Snapshot age never implies revalidated eligibility.
+
+Verification and limits:
+
+- 197 offline tests passed on Python 3.12 with outbound sockets blocked and
+  SQLAlchemy 2.0.57. Oracle report line coverage 100%; operator whole-module 76%;
+  combined 82%. Ruff, compilation and diff checks passed for changed reporting
+  code/tests. Synthetic Oracle/operator HTML previews inspected in Chromium.
+- Independent review's incomplete-update-count and malformed-candidate findings
+  were fixed and covered by regression tests.
+- Draft source change only: no SMTP send, production query, historical repair,
+  merge, deployment, schedule change or new external-agent communication.
+- PostgreSQL integration, full repository CI and deployed email/client acceptance
+  remain separate. This does not reconcile the historical prediction track record.
+
+## 2026-11-07 - expand summary-first reporting to all email alert families
+
+What was done:
+
+- Inventoried both SMTP transports and every repository email template in
+  `docs/reference/EMAIL_ALERT_INVENTORY.md`. Extended the same draft change rather
+  than adding alternate senders or changing enablement, schedules or recipients.
+- Added source-specific headline counts, scores, states or verdicts and concise
+  recaps to all 12 shared public sender types, specialized options, supply-chain
+  and Waterfall reports, and legacy generic/backtest/daily notifications.
+- Kept full supplied narratives, commands, findings, calendar events and bounded
+  option ledger detail. Removed old presentation truncation without changing the
+  underlying scanner gates or historical scoring.
+- Clarified samples versus totals, overlapping findings, hypothetical results,
+  missing inputs, saved-board age, source dates and expired/unconfirmed catalysts.
+  Failed or unavailable sources never become a fabricated zero or all-clear.
+- Added readable multipart plain text, preserving exact code indentation and
+  repeated spaces in preformatted HTML and explicit plain text.
+- Left the pre-existing raw-attempt autoresearch notification gate and missing
+  circuit-breaker sender import dormant. Their wiring is documented separately;
+  this presentation update does not turn on extra notifications.
+
+Verification and limits:
+
+- 494 combined offline tests passed on Python 3.12, using SQLAlchemy 2.0.57,
+  mocked SMTP / SQLite and an outbound-socket block. The existing pure mock_engine
+  fixture was loaded without executing the repository's live-DB conftest setup.
+- Synthetic health, research, options, supply-chain, Waterfall and backtest HTML previews were inspected in Chromium; all led with a visible headline and recap.
+- Ruff (E/W/F, excluding E501), compilation and git diff --check passed for all
+  changed reporting code/tests. Independent review found no remaining blockers
+  after fixes for saved Long Plays freshness and plain-text command whitespace.
+- The first draft's GitHub checks passed, including backend tests on both Python
+  versions, frontend build, lint, migrations, Quiver and G3/G5 matrix checks.
+  The expanded source revision requires its own CI run.
+- No production queries, SMTP delivery, merge, deployment or external-agent
+  communication. Repository coverage is not proof of deployed email delivery,
+  historical data reconciliation or actual investment performance.
+
+### Same-day integration with the updated main branch
+
+- Main advanced to `8fbed48c` while the expanded draft was being published.
+  Integrated it into the isolated draft branch, without merging the PR.
+- Resolved the sole `scripts/notify.py` overlap by retaining main's creation-date
+  cutoff and legacy-label exclusions together with the email's bounded update
+  window. The recap discloses this filtered PASSED-count scope.
+- Strengthened the SQLite regression with recently updated legacy, labeled and
+  future rows; only the current unlabelled row is counted. All 494 combined
+  offline tests passed again; Ruff and diff checks passed.

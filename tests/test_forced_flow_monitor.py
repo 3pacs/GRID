@@ -478,7 +478,8 @@ def test_waterfall_alert_subject_contains_score():
         posture={"lever": "", "condition": "", "thesis": "", "invalidation": ""},
     )
     subject = build_alert_subject(briefing)
-    assert "3/5" in subject
+    assert "0/0 checked" in subject
+    assert "3 reported" in subject
     assert "SHORT_GAMMA" in subject
 
 
@@ -516,3 +517,100 @@ def test_waterfall_alert_send_handles_missing_email_layer():
         result = send_waterfall_alert(briefing)
     # Either False (graceful) or True if settings path short-circuits; must not raise
     assert result in (True, False)
+
+
+
+def _email_briefing(regime=None, events=None):
+    regime = regime or _make_regime(regime="SHORT_GAMMA")
+    return MorningBriefing(
+        generated_at="2026-04-14T06:30:00+00:00", regime=regime,
+        upcoming_events=events or [], thresholds=scan_thresholds(regime, events or []),
+        waterfall_risk_score=3,
+        posture={"lever": "hedge <risk>", "condition": "x", "thesis": "all detail", "invalidation": "y"},
+    )
+
+
+def test_waterfall_summary_distinguishes_missing_from_clear_conditions():
+    from alerts.waterfall_watch import _build_html_body
+    unknown = GammaRegimeSnapshot("UNKNOWN", 0, None, None, None, 0, "2026-04-14")
+    html = _build_html_body(_email_briefing(regime=unknown))
+    assert "0/1 checked conditions tripped" in html
+    assert "4 missing-input conditions" in html
+    assert "not a probability" in html
+    assert "Aggregate GEX:</strong> n/a" in html
+    assert "MISSING" in html
+    assert "hedge &lt;risk&gt;" in html
+
+
+def test_waterfall_keeps_all_events_and_labels_old_unconfirmed_dates():
+    from alerts.waterfall_watch import _build_html_body
+    events = [CalendarEvent(date(2026, 4, 14+i), "FOMC", f"Event <{i}>", i) for i in range(8)]
+    html = _build_html_body(_email_briefing(events=events))
+    assert "Event &lt;7&gt;" in html
+    assert "2026-04-21" in html
+    assert "past date; outcome unconfirmed" in html
+    assert "Snapshot age:" in html
+    assert "not rechecked" in html
+    assert "font-size:32px" in html
+
+
+def test_waterfall_send_uses_same_subject_as_public_builder():
+    from alerts.waterfall_watch import build_alert_subject, send_waterfall_alert
+    from types import SimpleNamespace
+    briefing = _email_briefing()
+    with patch("alerts.email._get_settings", return_value=SimpleNamespace(ALERT_EMAIL_ENABLED=True)), patch("alerts.email._send") as send:
+        assert send_waterfall_alert(briefing)
+    assert send.call_args.args[0] == build_alert_subject(briefing)
+    assert "checked conditions tripped" in send.call_args.args[1][0]["body"]
+
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, "bad"])
+def test_waterfall_nonfinite_measurement_is_missing_not_passed(value):
+    from alerts.waterfall_watch import _format_threshold_line
+    line = _format_threshold_line({"name": "test <name>", "description": "<detail>",
+                                   "current_value": value, "threshold_value": 1, "tripped": False})
+    assert "MISSING" in line
+    assert "&lt;name&gt;" in line and "&lt;detail&gt;" in line
+
+
+def test_waterfall_future_event_remains_scheduled_and_dated():
+    from alerts.waterfall_watch import _format_event_line
+    from datetime import timedelta
+    day = datetime.now(timezone.utc).date() + timedelta(days=3)
+    line = _format_event_line({"event_date": day.isoformat(), "label": "FOMC", "trading_days_out": 3})
+    assert day.isoformat() in line
+    assert "scheduled; occurrence unconfirmed" in line
+    assert "T+3 trading days from briefing" in line
+
+
+def test_waterfall_missing_event_date_does_not_become_today():
+    from alerts.waterfall_watch import _format_event_line
+    line = _format_event_line({"label": "<event>"})
+    assert "date unavailable" in line and "today" not in line
+    assert "&lt;event&gt;" in line
+
+
+def test_waterfall_disabled_does_not_send():
+    from alerts.waterfall_watch import send_waterfall_alert
+    from types import SimpleNamespace
+    with patch("alerts.email._get_settings", return_value=SimpleNamespace(ALERT_EMAIL_ENABLED=False)), patch("alerts.email._send") as send:
+        assert send_waterfall_alert(_email_briefing()) is False
+    send.assert_not_called()
+
+
+
+def test_waterfall_future_snapshot_and_upcoming_recap():
+    from alerts.waterfall_watch import _build_html_body, _date, _format_threshold_line
+    from dataclasses import replace
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    future = now.date() + timedelta(days=3)
+    assert _date(now) == now.date()
+    regime = replace(_make_regime(), snapshot_date=future.isoformat())
+    events = [CalendarEvent(future, "FOMC", "Next <event>", 3)]
+    html = _build_html_body(_email_briefing(regime=regime, events=events))
+    assert "Snapshot date is in the future" in html
+    assert f"Next listed date: Next &lt;event&gt; on {future}" in html
+    assert "MISSING" in _format_threshold_line({"name": "test", "current_value": 1,
+                                                "threshold_value": None, "tripped": True})

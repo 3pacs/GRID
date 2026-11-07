@@ -172,7 +172,7 @@ def _isolate(monkeypatch):
 
 def _run(monkeypatch, rows: list[_Opp], *, recent: list[dict] | None = None,
          no_contract: frozenset[str] = frozenset(), ledger_read_error: bool = False,
-         ledger_write_error: bool = False) -> _Run:
+         ledger_write_error: bool = False, force: bool = False, scanner_error: bool = False) -> _Run:
     """Drive ``run_100x_digest`` over ``rows`` and record what it selected."""
     scanner_mod = types.ModuleType("discovery.options_scanner")
 
@@ -181,6 +181,8 @@ def _run(monkeypatch, rows: list[_Opp], *, recent: list[dict] | None = None,
             assert isinstance(db_engine, _NoDbEngine)
 
         def scan_all(self) -> list[_Opp]:
+            if scanner_error:
+                raise RuntimeError("synthetic scanner failure")
             return list(rows)
 
     scanner_mod.OptionsScanner = OptionsScanner
@@ -229,7 +231,7 @@ def _run(monkeypatch, rows: list[_Opp], *, recent: list[dict] | None = None,
 
     monkeypatch.setattr(hx, "_send_in_thread", fake_send)
 
-    result = hx.run_100x_digest()
+    result = hx.run_100x_digest(force=force)
     cards = [(int(i), t) for i, t, _ in _CARD_TITLE.findall(sent.get("plain", ""))]
     return _Run(result=result, verified=verified, cards=cards, sent=sent,
                 persisted=persisted, events=events)
@@ -477,3 +479,34 @@ def test_llm_fail_drops_the_row(monkeypatch):
     assert run.verified == _r(0, 1, 2, 3)
     assert [t for _, t in run.cards] == _r(0, 2)
     assert "SUSPECT: check" in run.sent["plain"]
+
+
+# Summary-first presentation must describe the bounded selection funnel.
+def test_digest_summary_reports_candidate_and_quote_check_scope(monkeypatch):
+    run = _run(monkeypatch, _universe(40))
+    plain = run.sent["plain"]
+    assert "15 option ideas shown" in plain
+    assert "40 scanner candidates returned" in plain
+    assert "15 quote-checked" in plain
+    assert "25 not quote-checked due to the 15-candidate cap" in plain
+    assert "15 PUT / 0 CALL" in plain
+    assert "UNPROVEN directions shown: PUT" in plain
+    assert "not probabilities or expected returns" in plain
+    assert plain.index("15 option ideas shown") < plain.index("Track Record")
+    assert "font-size:32px" in run.sent["html"]
+
+
+def test_digest_summary_preserves_withheld_and_missing_quote_counts(monkeypatch):
+    run = _run(monkeypatch, _universe(5), no_contract=frozenset({"R00", "R03"}))
+    assert "3 option ideas shown" in run.sent["plain"]
+    assert "5 quote-checked" in run.sent["plain"]
+    assert "Withheld 2" in run.sent["plain"]
+    assert "3/3 shown ideas have a retrieved two-sided quote" in run.sent["plain"]
+
+
+
+def test_forced_digest_keeps_scanner_failure_visible(monkeypatch):
+    run = _run(monkeypatch, [], force=True, scanner_error=True)
+    assert run.result["sent"] is True
+    assert "Scanner failed: candidate coverage is unavailable" in run.sent["plain"]
+    assert "0 scanner candidates returned" not in run.sent["plain"]

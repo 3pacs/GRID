@@ -200,11 +200,14 @@ class TestRunGraphAnalytics:
     """Tests for the run_graph_analytics task."""
 
     def test_graph_analytics_success(self):
-        with patch("scripts.graph_analytics.run_analytics", return_value={"pagerank": 100}, create=True):
+        # No create=True: the task imported a run_analytics that never existed,
+        # and create=True made this test invent it.
+        with patch("scripts.graph_analytics.run_graph_analytics", return_value={"pagerank": 100}) as run:
             from orchestration.tasks import run_graph_analytics
             result = run_graph_analytics.fn() if hasattr(run_graph_analytics, "fn") else run_graph_analytics()
 
         assert result["status"] == "success"
+        run.assert_called_once_with(scope="curated")
 
 
 # ---------------------------------------------------------------------------

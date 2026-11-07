@@ -101,7 +101,10 @@ _ADIZ_DIRECTION = (
 _ADIZ_RE = re.compile(
     r"(?:All\s+(?P<all>\d+)|(?P<part>\d+)\s+(?:out\s+of|of)\s+"
     r"(?:the\s+)?(?P<total>\d+))\s+sorties?(?:\s+of\s+PLA\s+aircraft)?\s+"
-    r"(?:crossed\s+the\s+median\s+line\s+and\s+)?entered\s+"
+    # MND prints both "crossed the median line and entered" and (from late
+    # 2026) "crossed the median line of the Taiwan Strait and entered".
+    r"(?:crossed\s+the\s+median\s+line(?:\s+of\s+the\s+Taiwan\s+Strait)?\s+and\s+)?"
+    r"entered\s+"
     r"(?:(?:Taiwan['’]s|the)\s+)?"
     rf"(?:{_ADIZ_DIRECTION}(?:\s*,\s*{_ADIZ_DIRECTION})*"
     rf"(?:\s*,?\s+and\s+{_ADIZ_DIRECTION})?\s+)?ADIZ",

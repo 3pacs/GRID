@@ -120,6 +120,20 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`
 **Imported by:** `intelligence/actor_network.py`, `intelligence/actors/__init__.py`, `intelligence/actors/analysis.py`, `intelligence/actors/db.py`, `intelligence/actors/graph.py`
 
+#### `intelligence/actors/sectors.py`
+**Docstring:** Actor sector tagging: word-boundary keywords (precompiled), "<Sector> — <TICKER>" titles, category signals, neighbour vote.
+**Functions:** `tag_sector`, `tag_sectors_frame`, `propagate_sectors`, `sector_from_keywords`, `sector_from_title_prefix`
+
+#### `intelligence/actors/universe.py`
+**Docstring:** Offline full-graph analytics over all actors + actor_connections + entity_relationships + wealth_flows (igraph): PageRank, Leiden, components, k-core, sampled betweenness, sectors; writes versioned `actor_graph_*` tables. Launched by the intelligence scheduler as a niced subprocess.
+**Functions:** `run_actor_universe_job`, `load_universe`, `assemble_graph`, `compute_metrics`, `compute_universe`, `write_run`, `maybe_launch`, `launch_job_subprocess`
+**DB writes:** `actor_graph_runs`, `actor_graph_metrics`, `actor_graph_communities`, `actor_graph_edges`
+
+#### `intelligence/actors/universe_store.py`
+**Docstring:** Request-time reads of the precomputed actor universe: overview (top-N by importance), bounded ego network, trigram search, community summaries.
+**Functions:** `latest_run`, `overview`, `ego_network`, `search_actors`, `community_summaries`, `community_members`, `actor_metrics`
+**Imported by:** `api/routers/intelligence_actors.py`
+
 #### `intelligence/actors/seed_data.py` — 5618 LOC
 **Docstring:** GRID Intelligence — Actor Network seed data.
 **Functions:** `get_known_actors`

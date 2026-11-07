@@ -57,18 +57,50 @@ _DEFAULT_SECTORS = [
 
 @router.get("/actor-network")
 def get_actor_network(
-    limit: int = Query(500, ge=10, le=50000, description="Max nodes for browser display"),
+    limit: int = Query(2000, ge=10, le=50000, description="Max nodes for browser display (capped at 20,000)"),
     sector: str | None = Query(None, description="Filter to a single sector"),
+    groups: str | None = Query(
+        None,
+        description="Comma-separated category groups: market (default), icij, pep, sanctioned, donor, watchlist, or all",
+    ),
+    community: int | None = Query(None, ge=0, description="Filter to one community id"),
+    categories: str | None = Query(None, description="Comma-separated actor categories"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the actor network graph for D3 visualization.
 
-    ICIJ bulk data (1.6M offshore leak records) is excluded by default.
-    Nodes are tagged with a ``sector`` field and the initial view focuses
-    on user-priority sectors (AI, Crypto, Semiconductors, etc.).
-    Use ``?sector=AI`` to drill into a single sector.
+    Served from the offline full-graph analytics (``actor_graph_*`` tables,
+    ``intelligence/actors/universe.py``): the top ``limit`` actors by
+    precomputed importance plus the edges among them, filterable by sector,
+    community, category and category group. Bulk lists (ICIJ, PEPs,
+    sanctions, donors, watchlists) are opt-in ``groups``. Until the first
+    run completes, the legacy curated background build is served instead.
+    Money-flow side panels come from their own background cache.
     """
-    # Never builds inline: fresh or stale graph from RAM, else "building".
+    engine = get_db_engine()
+    run = latest_universe_run(engine)
+    if run is not None:
+        from intelligence.actors.universe_store import overview
+
+        try:
+            payload = overview(
+                engine, n=min(limit, 20000), groups=groups, categories=categories,
+                sector=sector, community=community, run=run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Actor universe overview failed, serving legacy graph: {e}", e=str(exc))
+        else:
+            extras = get_flow_extras(wait=False) or {}
+            payload["metadata"]["source"] = "actor_universe"
+            payload["metadata"]["total_actors"] = run.get("actor_count")
+            for key in ("wealth_flows", "pocket_lining_alerts", "flows", "circular_flows"):
+                payload[key] = extras.get(key, [])
+            payload["flow_summary"] = extras.get(
+                "flow_summary", {"total_tracked": "$0", "top_flow": None, "active_loops": 0})
+            return payload
+
+    # Legacy (no completed universe run yet): never builds inline; fresh or
+    # stale graph from RAM, else "building".
     full = get_full_actor_graph(wait=False)
     if full is None:
         return _actor_graph_building_payload()
@@ -87,7 +119,6 @@ def get_actor_network(
         ]
 
     # Limit by influence
-    len(nodes)
     if len(nodes) > limit:
         nodes = sorted(nodes, key=lambda n: n.get("influence", 0), reverse=True)[:limit]
 
@@ -108,6 +139,8 @@ def get_actor_network(
         "links": links,
         "metadata": {
             **full.get("metadata", {}),
+            "source": "legacy_curated",
+            "computed_at": full.get("metadata", {}).get("generated_at"),
             "total_actors": len(all_nodes),
             "returned": len(nodes),
             "sector_filter": sector,
@@ -119,6 +152,76 @@ def get_actor_network(
         "circular_flows": full.get("circular_flows", []),
         "flow_summary": full.get("flow_summary", {}),
     }
+
+
+# ── Precomputed actor universe: run lookup + money-flow side-panel cache ──
+
+_UNIVERSE_RUN_TTL = 60
+_universe_run_cache: TTLCache = TTLCache(ttl=_UNIVERSE_RUN_TTL, max_size=1)
+_UNIVERSE_RUN_KEY = "latest"
+_NO_RUN = {"graph_version": None}
+
+
+def latest_universe_run(engine: Any) -> dict[str, Any] | None:
+    """Newest complete ``actor_graph_runs`` row, cached for a minute.
+
+    Any failure (table absent, no DB in tests) reads as "no run" so callers
+    fall back to the legacy path. Failures are not cached.
+    """
+    cached = _universe_run_cache.get(_UNIVERSE_RUN_KEY)
+    if cached is not None:
+        return None if cached is _NO_RUN else cached
+    try:
+        from intelligence.actors.universe_store import latest_run
+
+        run = latest_run(engine)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("actor universe run lookup failed: {e}", e=str(exc))
+        return None
+    _universe_run_cache.set(_UNIVERSE_RUN_KEY, run if run is not None else _NO_RUN)
+    return run
+
+
+_FLOW_EXTRAS_TTL = 1800
+_flow_extras_cache: TTLCache = TTLCache(ttl=_FLOW_EXTRAS_TTL, max_size=1)
+_flow_extras_build_lock = threading.Lock()
+_flow_extras_state_lock = threading.Lock()
+_flow_extras_last: dict[str, Any] | None = None
+
+
+def _flow_extras_worker() -> None:
+    global _flow_extras_last
+    try:
+        extras = _build_flow_extras(get_db_engine())
+        _flow_extras_cache.set("extras", extras)
+        with _flow_extras_state_lock:
+            _flow_extras_last = extras
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor flow extras background build failed: {e}", e=str(exc))
+    finally:
+        _flow_extras_build_lock.release()
+
+
+def get_flow_extras(*, wait: bool = False) -> dict[str, Any] | None:
+    """Money-flow side panels (wealth flows, pocket lining, influence flows).
+
+    Stale-while-revalidate + single-flight like the legacy graph: fresh ->
+    served; stale -> served while one background rebuild runs; cold ->
+    ``None`` (and a background build). ``wait`` is accepted for symmetry.
+    """
+    del wait
+    fresh = _flow_extras_cache.get("extras")
+    if fresh is not None:
+        return fresh
+    with _flow_extras_state_lock:
+        stale = _flow_extras_last
+    if _flow_extras_build_lock.acquire(blocking=False):
+        try:
+            threading.Thread(target=_flow_extras_worker, name="actor-flow-extras", daemon=True).start()
+        except Exception:
+            _flow_extras_build_lock.release()
+            raise
+    return stale
 
 
 def _empty_actor_network_payload() -> dict[str, Any]:
@@ -222,16 +325,27 @@ def _build_full_actor_cache(now=None) -> dict[str, Any]:
     """
     del now  # unused; TTLCache handles expiry
 
-    from intelligence.actor_network import (
-        build_actor_graph,
-        track_wealth_migration,
-        assess_pocket_lining,
-    )
+    from intelligence.actor_network import build_actor_graph
 
     engine = get_db_engine()
     graph = build_actor_graph(engine)
     log.info("Actor network loaded: {n} nodes, {l} links",
              n=len(graph.get("nodes", [])), l=len(graph.get("links", [])))
+
+    result = {**graph, **_build_flow_extras(engine)}
+    _actor_graph_cache.set(_ACTOR_GRAPH_CACHE_KEY, result)
+    global _actor_graph_last, _actor_graph_last_built_at
+    with _actor_graph_state_lock:
+        _actor_graph_last = result
+        _actor_graph_last_built_at = time.time()
+    log.info("Actor network cached: {n} nodes, {l} links",
+             n=len(result.get("nodes", [])), l=len(result.get("links", [])))
+    return result
+
+
+def _build_flow_extras(engine: Any) -> dict[str, Any]:
+    """Wealth flows, pocket-lining alerts and influence/dollar money flows."""
+    from intelligence.actor_network import assess_pocket_lining, track_wealth_migration
 
     # Wealth flows
     wealth_flows: list[dict] = []
@@ -351,22 +465,13 @@ def _build_full_actor_cache(now=None) -> dict[str, Any]:
     except Exception as exc:
         log.debug("Money flow enrichment failed: {e}", e=str(exc))
 
-    result = {
-        **graph,
+    return {
         "wealth_flows": wealth_flows,
         "pocket_lining_alerts": pocket_lining_alerts,
         "flows": money_flows,
         "circular_flows": circular_flows_data,
         "flow_summary": flow_summary,
     }
-    _actor_graph_cache.set(_ACTOR_GRAPH_CACHE_KEY, result)
-    global _actor_graph_last, _actor_graph_last_built_at
-    with _actor_graph_state_lock:
-        _actor_graph_last = result
-        _actor_graph_last_built_at = time.time()
-    log.info("Actor network cached: {n} nodes, {l} links",
-             n=len(result.get("nodes", [])), l=len(result.get("links", [])))
-    return result
 
 
 @router.get("/actor/{actor_id}")
@@ -474,17 +579,32 @@ def get_top_actors_endpoint(
     metric: str = Query("pagerank", description="Metric to rank by"),
     limit: int = Query(20, ge=1, le=200, description="Number of actors to return"),
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
+    groups: str | None = Query(
+        None, max_length=200,
+        description="Comma-separated category groups (default market; bulk groups and 'all' are opt-in)",
+    ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return top actors ranked by any analytics metric.
 
     Allowed metrics: pagerank, betweenness, eigenvector,
-    degree_centrality, hub_score, authority_score.
+    degree_centrality, hub_score, authority_score. With ``scope=full`` and a
+    completed actor-universe run, pagerank/betweenness/degree_centrality are
+    served from that run, limited to ``groups`` (market actors by default).
     """
     try:
         from store.graph import get_top_actors
 
         engine = get_db_engine()
+        if scope == "full":
+            from intelligence.actors.universe_store import TOP_METRIC_COLUMNS, top_actors
+
+            run = latest_universe_run(engine) if metric in TOP_METRIC_COLUMNS else None
+            if run is not None:
+                res = top_actors(engine, metric=metric, limit=limit, groups=groups, run=run)
+                return {"actors": res["entries"], "metric": metric, "count": len(res["entries"]),
+                        "scope": scope, "groups": res["groups"], "source": "actor_universe",
+                        "graph_version": res["graph_version"], "computed_at": res["computed_at"]}
         actors = get_top_actors(metric=metric, limit=limit, engine=engine, scope=scope)
         return {"actors": actors, "metric": metric, "count": len(actors), "scope": scope}
     except ValueError as exc:
@@ -593,6 +713,14 @@ def get_communities_endpoint(
 
             communities = get_community_list(engine=engine, scope="curated", limit=limit)
             return {"communities": communities, "count": len(communities), "source": "live", "scope": scope}
+        run = latest_universe_run(engine)
+        if run is not None:
+            from intelligence.actors.universe_store import community_summaries
+
+            res = community_summaries(engine, limit=limit, run=run)
+            return {"communities": res["entries"], "count": len(res["entries"]),
+                    "total": res["total"], "source": "actor_universe", "scope": scope,
+                    "computed_at": res.get("computed_at"), "graph_version": res.get("graph_version")}
         communities, source = _load_community_list(engine)
         return {"communities": communities, "count": len(communities), "source": source, "scope": scope}
     except Exception as exc:
@@ -873,18 +1001,19 @@ def get_actor_network_db(
     try:
         with engine.connect() as conn:
             # Get top actors by degree
-            source_filter = "" if include_icij else "AND a.source NOT LIKE 'icij%%'"
-            actors = conn.execute(text(f"""
+            actors = conn.execute(text("""
                 SELECT a.id, a.name, a.tier, a.category, a.degree,
                        a.influence_score, a.title, a.source,
                        a.metadata->'llm_profile'->>'title' as llm_title,
                        a.metadata->'llm_profile'->>'confidence' as llm_confidence,
                        a.provenance, a.provenance_as_of
                 FROM actors a
-                WHERE a.degree >= :min_deg {source_filter}
+                WHERE a.degree >= :min_deg
+                  AND (CAST(:include_icij AS boolean) OR a.source IS NULL
+                       OR a.source NOT LIKE 'icij%')
                 ORDER BY a.degree DESC
                 LIMIT :lim
-            """), {"min_deg": min_degree, "lim": limit}).fetchall()
+            """), {"min_deg": min_degree, "lim": limit, "include_icij": include_icij}).fetchall()
 
             actor_ids = {a[0] for a in actors}
             nodes = [
@@ -903,17 +1032,18 @@ def get_actor_network_db(
                 for a in actors
             ]
 
-            # Get connections between these actors
-            id_list = ",".join(f"'{a[0]}'" for a in actors)
+            # Get connections between these actors (bound array, not an
+            # interpolated IN list).
+            id_list = [a[0] for a in actors]
             if not id_list:
                 return {"nodes": [], "links": [], "stats": {}}
 
-            links_raw = conn.execute(text(f"""
+            links_raw = conn.execute(text("""
                 SELECT actor_a, actor_b, relationship, strength
                 FROM actor_connections
-                WHERE actor_a IN ({id_list}) AND actor_b IN ({id_list})
+                WHERE actor_a = ANY(:ids) AND actor_b = ANY(:ids)
                 LIMIT 5000
-            """)).fetchall()
+            """), {"ids": id_list}).fetchall()
 
             links = [
                 {
@@ -1375,40 +1505,28 @@ def get_sector_power_map(
 
 @router.get("/ego-graph/search")
 def ego_graph_search(
-    q: str = Query(..., min_length=1, description="Search query (name or ticker)"),
+    q: str = Query(..., min_length=1, max_length=200, description="Search query (name or ticker)"),
     limit: int = Query(20, ge=1, le=100),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Search for actors by name or ticker for the ego-graph."""
-    from sqlalchemy import text
-    engine = get_db_engine()
+    """Search for actors by name or ticker for the ego-graph.
+
+    Searches every actor (trigram index), ranked by precomputed importance;
+    ICIJ leak rows are left out here as before (``/actor-universe/search``
+    covers every group).
+    """
+    from intelligence.actors.universe import CATEGORY_GROUPS, GROUP_ICIJ
+    from intelligence.actors.universe_store import search_actors
 
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT id, name, category, tier, influence_score, title,
-                       provenance, provenance_as_of
-                FROM actors
-                WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary')
-                AND (name ILIKE :pat OR name ILIKE :paren)
-                ORDER BY influence_score DESC NULLS LAST
-                LIMIT :lim
-            """), {"pat": f"%{q}%", "paren": f"%({q.upper()})%", "lim": limit}).fetchall()
-
-            return {
-                "results": [
-                    stamp_actor_node(
-                        {
-                            "id": r[0], "name": r[1], "category": r[2],
-                            "tier": r[3], "influence": float(r[4]) if r[4] else 0.5,
-                            "title": r[5],
-                        },
-                        r[0], stored=r[6], vintage=r[7],
-                    )
-                    for r in rows
-                ],
-            }
-    except Exception as exc:
+        groups = [g for g in CATEGORY_GROUPS if g != GROUP_ICIJ]
+        res = search_actors(get_db_engine(), q, limit=limit, offset=0, groups=groups)
+        if not res["entries"] and q.strip():
+            # "(NVDA)"-style ticker spellings in actor names.
+            res = search_actors(get_db_engine(), f"({q.strip().upper()})", limit=limit,
+                                offset=0, groups=groups)
+        return {"results": res["entries"], "total": res["total"]}
+    except Exception as exc:  # noqa: BLE001
         log.warning("Ego-graph search failed: {e}", e=str(exc))
         return {"results": [], "error": str(exc)}
 
@@ -1422,121 +1540,159 @@ def get_ego_graph(
 ) -> dict[str, Any]:
     """Return ego-graph centered on one actor with N-degree connections.
 
-    Degree 1: direct connections.
-    Degree 2: connections-of-connections.
-    Degree 3: 3-hop neighborhood.
-
-    Nodes are tagged with ``ring`` (0=center, 1=first hop, etc.)
-    for concentric layout in the frontend.
+    Nodes are tagged with ``ring`` (0=center, 1=first hop, etc.) for
+    concentric layout. Bounded fan-out per node (see
+    ``intelligence.actors.universe_store.ego_network``); ICIJ / offshore
+    relationships stay out of this legacy view (``/actor-universe/ego``
+    includes them).
     """
-    from sqlalchemy import text
-    engine = get_db_engine()
+    from intelligence.actors.universe_store import ego_network
 
     try:
-        with engine.connect() as conn:
-            # Verify center actor exists
-            center = conn.execute(text(
-                "SELECT id, name, category, tier, influence_score, trust_score, "
-                "net_worth_estimate, title, known_positions, "
-                "provenance, provenance_as_of "
-                "FROM actors WHERE id = :id"
-            ), {"id": actor_id}).fetchone()
-
-            if not center:
-                return {"nodes": [], "edges": [], "error": f"Actor '{actor_id}' not found"}
-
-            # BFS expansion ring by ring
-            actor_map: dict[str, dict] = {}
-            ring_map: dict[str, int] = {}
-            all_edges: list[dict] = []
-            edge_keys: set[str] = set()
-
-            def _add_actor(row, ring: int) -> None:
-                aid = row[0]
-                if aid in actor_map:
-                    return
-                node = {
-                    "id": aid, "name": row[1], "category": row[2],
-                    "tier": row[3],
-                    "influence": float(row[4]) if row[4] else 0.5,
-                    "trust": float(row[5]) if row[5] else 0.5,
-                    "net_worth": float(row[6]) if row[6] else None,
-                    "title": row[7],
-                    "ring": ring,
-                }
-                stamp_actor_node(node, aid, stored=row[9], vintage=row[10])
-                actor_map[aid] = node
-                ring_map[aid] = ring
-
-            _add_actor(center, 0)
-
-            frontier = {actor_id}
-            for ring in range(1, depth + 1):
-                if not frontier or len(actor_map) >= max_nodes:
-                    break
-
-                # Find connections from/to frontier
-                frontier_list = list(frontier)
-                rows = conn.execute(text("""
-                    SELECT actor_a, actor_b, relationship, strength
-                    FROM actor_connections
-                    WHERE (actor_a = ANY(:ids) OR actor_b = ANY(:ids))
-                    AND relationship NOT LIKE 'icij_%%'
-                    AND strength > 0.2
-                    ORDER BY strength DESC
-                    LIMIT :lim
-                """), {"ids": frontier_list, "lim": max_nodes * 3}).fetchall()
-
-                next_frontier: set[str] = set()
-                for r in rows:
-                    a, b, rel, strength = r[0], r[1], r[2], r[3]
-                    key = f"{a}:{b}:{rel}"
-                    rev = f"{b}:{a}:{rel}"
-                    if key in edge_keys or rev in edge_keys:
-                        continue
-                    edge_keys.add(key)
-                    all_edges.append({
-                        "source": a, "target": b,
-                        "relationship": rel,
-                        "strength": float(strength) if strength else 0.5,
-                        "color": _RELATIONSHIP_COLORS.get(rel, "#64748B"),
-                    })
-                    # Track new actor IDs for next ring
-                    for nid in (a, b):
-                        if nid not in actor_map:
-                            next_frontier.add(nid)
-
-                # Fetch details for new actors
-                if next_frontier and len(actor_map) < max_nodes:
-                    remaining = max_nodes - len(actor_map)
-                    new_ids = list(next_frontier)[:remaining]
-                    new_rows = conn.execute(text(
-                        "SELECT id, name, category, tier, influence_score, trust_score, "
-                        "net_worth_estimate, title, known_positions, "
-                        "provenance, provenance_as_of "
-                        "FROM actors WHERE id = ANY(:ids)"
-                    ), {"ids": new_ids}).fetchall()
-                    for nr in new_rows:
-                        _add_actor(nr, ring)
-
-                frontier = next_frontier & set(actor_map.keys())
-
-            # Filter edges to only include nodes we have
-            valid_ids = set(actor_map.keys())
-            edges = [e for e in all_edges if e["source"] in valid_ids and e["target"] in valid_ids]
-
-            nodes = list(actor_map.values())
-
-            return {
-                "nodes": nodes,
-                "edges": edges,
-                "center": actor_id,
-                "depth": depth,
-                "relationship_colors": _RELATIONSHIP_COLORS,
-            }
-    except Exception as exc:
+        fanout = max(5, min(40, max_nodes // max(depth, 1)))
+        res = ego_network(
+            get_db_engine(), actor_id, depth=depth, fanout=fanout, max_nodes=max_nodes,
+            include_offshore=False, include_external=False, min_strength=0.2,
+        )
+        for e in res.get("edges", []):
+            e["color"] = _RELATIONSHIP_COLORS.get(e["relationship"], e.get("color", "#64748B"))
+        res["relationship_colors"] = {**res.get("relationship_colors", {}), **_RELATIONSHIP_COLORS}
+        return res
+    except Exception as exc:  # noqa: BLE001
         log.warning("Ego-graph for {a} failed: {e}", a=actor_id, e=str(exc))
         return {"nodes": [], "edges": [], "error": str(exc)}
+
+
+# ── Actor universe (full scale, precomputed) ──────────────────────────────
+
+
+@router.get("/actor-universe/status")
+def get_actor_universe_status(_token: str = Depends(require_auth)) -> dict[str, Any]:
+    """Latest completed full-graph analytics run (freshness + graph size)."""
+    from intelligence.actors.universe_store import latest_run
+
+    try:
+        run = latest_run(get_db_engine())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe status failed: {e}", e=str(exc))
+        return {"run": None, "error": str(exc)}
+    return {"run": run, "status": "ready" if run else "pending_first_run"}
+
+
+@router.get("/actor-universe/overview")
+def get_actor_universe_overview(
+    n: int = Query(2000, ge=10, le=20000, description="Number of actors (browser default 2,000)"),
+    groups: str | None = Query(None, description="market (default), icij, pep, sanctioned, donor, watchlist, or all"),
+    categories: str | None = Query(None, description="Comma-separated actor categories"),
+    sector: str | None = Query(None, max_length=64),
+    community: int | None = Query(None, ge=0),
+    max_edges: int | None = Query(None, ge=0, le=200000),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Top-N actors by precomputed importance plus the edges among them."""
+    from intelligence.actors.universe_store import overview
+
+    try:
+        return overview(get_db_engine(), n=n, groups=groups, categories=categories,
+                        sector=sector, community=community, max_edges=max_edges)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe overview failed: {e}", e=str(exc))
+        return {"nodes": [], "links": [], "metadata": {}, "error": str(exc)}
+
+
+@router.get("/actor-universe/ego/{actor_id}")
+def get_actor_universe_ego(
+    actor_id: str,
+    depth: int = Query(1, ge=1, le=3),
+    fanout: int = Query(25, ge=1, le=200, description="Max neighbours kept per node"),
+    max_nodes: int = Query(300, ge=2, le=2000),
+    include_offshore: bool = Query(True, description="Include ICIJ / entity_relationships edges"),
+    include_external: bool = Query(True, description="Keep non-actor endpoints as leaf nodes"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """K-hop neighbourhood of one actor from the edge tables, bounded fan-out."""
+    from intelligence.actors.universe_store import ego_network
+
+    try:
+        return ego_network(get_db_engine(), actor_id, depth=depth, fanout=fanout,
+                           max_nodes=max_nodes, include_offshore=include_offshore,
+                           include_external=include_external)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe ego for {a} failed: {e}", a=actor_id, e=str(exc))
+        return {"nodes": [], "edges": [], "center": actor_id, "error": str(exc)}
+
+
+@router.get("/actor-universe/search")
+def search_actor_universe(
+    q: str = Query(..., min_length=3, max_length=200, description="Substring of the actor name (3+ chars)"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=100000),
+    groups: str | None = Query(None, description="Restrict to category groups (default: all)"),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Search all ~3.5M actors by name (pg_trgm), paginated."""
+    from intelligence.actors.universe_store import search_actors
+
+    try:
+        return search_actors(get_db_engine(), q, limit=limit, offset=offset, groups=groups)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe search failed: {e}", e=str(exc))
+        return {"entries": [], "total": 0, "limit": limit, "offset": offset,
+                "has_more": False, "error": str(exc)}
+
+
+@router.get("/actor-universe/communities")
+def get_actor_universe_communities(
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    min_size: int = Query(3, ge=1),
+    sector: str | None = Query(None, max_length=64),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Precomputed community summaries (largest first), paginated."""
+    from intelligence.actors.universe_store import community_summaries
+
+    try:
+        return community_summaries(get_db_engine(), limit=limit, offset=offset,
+                                   min_size=min_size, sector=sector)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe communities failed: {e}", e=str(exc))
+        return {"entries": [], "total": 0, "limit": limit, "offset": offset,
+                "has_more": False, "error": str(exc)}
+
+
+@router.get("/actor-universe/community/{community_id}")
+def get_actor_universe_community(
+    community_id: int,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Members of one community by importance, paginated."""
+    from intelligence.actors.universe_store import community_members
+
+    try:
+        return community_members(get_db_engine(), community_id, limit=limit, offset=offset)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe community {c} failed: {e}", c=community_id, e=str(exc))
+        return {"community_id": community_id, "entries": [], "total": 0, "limit": limit,
+                "offset": offset, "has_more": False, "error": str(exc)}
+
+
+@router.get("/actor-universe/actor/{actor_id}")
+def get_actor_universe_actor(
+    actor_id: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """One actor's metrics (importance, pagerank, community, sector ...)."""
+    from intelligence.actors.universe_store import actor_metrics
+
+    try:
+        m = actor_metrics(get_db_engine(), actor_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Actor universe metrics for {a} failed: {e}", a=actor_id, e=str(exc))
+        return {"metrics": None, "error": str(exc)}
+    return {"metrics": m}
 
 
 # ── Multi-domain Intel Expansion ───────────────────────────────────────────

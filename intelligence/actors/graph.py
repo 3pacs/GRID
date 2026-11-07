@@ -11,7 +11,6 @@ Contains:
 from __future__ import annotations
 
 import os
-import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
@@ -28,61 +27,13 @@ from intelligence.actors.db import (
 )
 from intelligence.actors.models import Actor
 from intelligence.actors.provenance import stamp_actor_node
+from intelligence.actors.sectors import tag_sector
 
 # ── Sector inference ───────────────────────────────────────────────────────
-# Maps actor categories and keywords to user-facing sector labels.
-
-_CATEGORY_SECTOR: dict[str, str] = {
-    "central_bank": "Macro",
-    "government": "Government",
-    "government_research": "Government",
-    "politician": "Government",
-    "swf": "Macro",
-    "fund": "Finance",
-    "institution": "Finance",
-    "dynasty": "Finance",
-    "kingmaker": "Finance",
-    "crypto": "Crypto",
-    "activist": "Other",
-    "cautionary": "Other",
-    "individual": "Other",
-    "insider": "Other",       # refined by title/positions below
-    "corporation": "Other",
-    "other": "Other",
-    "pharmaceutical_sponsor": "Gene Therapy & Pharma",
-    "clinical_sponsor": "Gene Therapy & Pharma",
-    "academic_research": "Research",
-}
-
-_KEYWORD_SECTORS: list[tuple[list[str], str]] = [
-    (["ai", "artificial intelligence", "machine learning", "deep learning",
-      "gpu", "llm", "neural", "openai", "anthropic", "deepmind"], "AI"),
-    (["crypto", "bitcoin", "ethereum", "blockchain", "defi", "token",
-      "binance", "coinbase", "stablecoin", "web3"], "Crypto"),
-    (["robot", "automation", "boston dynamics", "tesla bot", "drone",
-      "autonomous"], "Robotics"),
-    (["gene", "crispr", "mrna", "biotech", "pharma", "clinical trial",
-      "fda", "drug", "therapeutic"], "Gene Therapy & Pharma"),
-    (["nuclear", "uranium", "fission", "fusion", "reactor", "nrc",
-      "enrichment"], "Nuclear"),
-    (["energy", "solar", "wind", "oil", "gas", "lng", "opec", "eia",
-      "renewable", "battery", "grid"], "Energy"),
-    (["metal", "gold", "silver", "copper", "lithium", "platinum",
-      "mining", "steel", "aluminum", "cobalt", "rare earth"], "Metals"),
-    (["semiconductor", "chip", "wafer", "fab", "tsmc", "intel", "nvidia",
-      "amd", "asml", "qualcomm", "broadcom", "foundry"], "Semiconductors"),
-    (["tech", "software", "cloud", "saas", "microsoft", "apple", "google",
-      "amazon", "meta", "data center"], "Tech"),
-]
-
-
-# One compiled alternation per sector, same (substring) semantics as the old
-# ``any(kw in searchable ...)`` loop, evaluated in C instead of ~80 Python
-# ``in`` checks per actor.
-_KEYWORD_SECTOR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile("|".join(re.escape(kw) for kw in keywords)), label)
-    for keywords, label in _KEYWORD_SECTORS
-]
+# Word-boundary keywords + title / category signals live in
+# intelligence/actors/sectors.py (the old substring scan tagged "Craig" as
+# AI). The offline universe job precomputes sectors for every actor; this
+# legacy curated graph uses the same tagger per actor.
 
 # Bulk-imported screening / leak lists. They hold ~3.4M rows on grid-svr
 # (2026-11-06: pep 549K, person_of_interest 543K, entity_of_interest 418K,
@@ -115,22 +66,11 @@ def _graph_max_actors() -> int:
 
 
 def _infer_sector(actor: Actor) -> str:
-    """Infer a sector label from an actor's category, title, and positions."""
-    # Direct category match first
-    sector = _CATEGORY_SECTOR.get(actor.category)
-
-    # Keyword scan over title + known positions + board seats
-    searchable = " ".join([
-        actor.title.lower(),
-        actor.name.lower(),
-        " ".join(str(p) for p in actor.known_positions).lower(),
-        " ".join(str(b) for b in actor.board_seats).lower(),
-    ])
-    for pattern, label in _KEYWORD_SECTOR_PATTERNS:
-        if pattern.search(searchable):
-            return label
-
-    return sector or "Other"
+    """Sector label from an actor's category, title, positions and (orgs) name."""
+    sector, _basis = tag_sector(
+        actor.category, actor.name, actor.title, actor.known_positions, actor.board_seats,
+    )
+    return sector
 
 
 def _resolve_dynamic_insiders(engine: Engine) -> list[dict]:

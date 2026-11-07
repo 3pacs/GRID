@@ -267,26 +267,22 @@ def test_build_actor_graph_excludes_bulk_lists_and_caps(monkeypatch):
     assert seen["limit"] == 1234
 
 
-def test_infer_sector_matches_the_old_substring_rule():
-    def old_rule(actor: Actor) -> str:
-        sector = graph_mod._CATEGORY_SECTOR.get(actor.category)
-        searchable = " ".join([
-            actor.title.lower(), actor.name.lower(),
-            " ".join(str(p) for p in actor.known_positions).lower(),
-            " ".join(str(b) for b in actor.board_seats).lower(),
-        ])
-        for keywords, label in graph_mod._KEYWORD_SECTORS:
-            if any(kw in searchable for kw in keywords):
-                return label
-        return sector or "Other"
+def test_infer_sector_uses_word_boundary_tagger():
+    """Same labels as before for real matches; no more substring false hits.
 
+    The old rule scanned title + name + positions for substrings, so
+    "Craig" (contains "ai") was tagged AI. The tagger now lives in
+    intelligence/actors/sectors.py (tests/test_actor_sectors.py).
+    """
     samples = [
-        Actor(id="1", name="Jensen Huang", tier="individual", category="insider", title="CEO, NVIDIA"),
-        Actor(id="2", name="Fed", tier="sovereign", category="central_bank", title=""),
-        Actor(id="3", name="Barrick", tier="institution", category="corporation", title="Gold mining"),
-        Actor(id="4", name="Nobody", tier="individual", category="individual", title=""),
-        Actor(id="5", name="X", tier="individual", category="fund", title="", board_seats=["Coinbase"]),
-        Actor(id="6", name="Y", tier="individual", category="other", title="", known_positions=["Uranium Royalty"]),
+        (Actor(id="1", name="Jensen Huang", tier="individual", category="insider", title="CEO, NVIDIA"), "Semiconductors"),
+        (Actor(id="2", name="Fed", tier="sovereign", category="central_bank", title=""), "Macro"),
+        (Actor(id="3", name="Barrick", tier="institution", category="corporation", title="Gold mining"), "Metals"),
+        (Actor(id="4", name="Nobody", tier="individual", category="individual", title=""), "Other"),
+        (Actor(id="5", name="X", tier="individual", category="fund", title="", board_seats=["Coinbase"]), "Crypto"),
+        (Actor(id="6", name="Y", tier="individual", category="other", title="", known_positions=["Uranium Royalty"]), "Nuclear"),
+        (Actor(id="7", name="Craig Wright", tier="individual", category="individual", title=""), "Other"),
+        (Actor(id="8", name="Megan Smith", tier="individual", category="insider", title="Director"), "Other"),
     ]
-    for a in samples:
-        assert graph_mod._infer_sector(a) == old_rule(a), a.name
+    for actor, expected in samples:
+        assert graph_mod._infer_sector(actor) == expected, actor.name

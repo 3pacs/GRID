@@ -36,6 +36,28 @@ UNSUPPORTED_FIELDS = (
 )
 
 
+def _exact_text(number: float) -> str:
+    """The reported number without exponent notation (``228,984,000,000``).
+
+    ``f"{n:g}"`` printed 2.28984e+11 on the Ticker Lookup card.
+    """
+    if float(number).is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.4f}".rstrip("0").rstrip(".")
+
+
+def _display_text(number: float, unit: str) -> str:
+    """Short reading form: ``$228.98B`` for USD, ``$4.56`` per share."""
+    if unit != "USD":
+        return f"${number:,.2f}"
+    sign = "-" if number < 0 else ""
+    n = abs(number)
+    for scale, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= scale:
+            return f"{sign}${n / scale:,.2f}{suffix}"
+    return f"{sign}${n:,.0f}"
+
+
 def read_sec_profile(engine: Any, ticker: str, *, refresh: bool = False) -> dict[str, Any]:
     """Read only provenance-complete facts; unsupported fields stay unavailable.
 
@@ -99,7 +121,8 @@ def read_sec_profile(engine: Any, ticker: str, *, refresh: bool = False) -> dict
             continue
         item = {
             "field": field, "label": LABELS[field], "group": "reported",
-            "raw_value": f"{number:g} {expected_unit}", "parsed": number,
+            "raw_value": f"{_exact_text(number)} {expected_unit}", "parsed": number,
+            "display_value": _display_text(number, expected_unit),
             "numeric_value": number, "obs_date": end.isoformat(),
             "period_start": payload.get("period_start"), "period_end": end.isoformat(),
             "filed": filed.isoformat(), "known_at_precision": "date",

@@ -432,7 +432,10 @@ def test_register_accepts_older_workers_without_models():
     assert worker.ollama_models == []
 
 
-def test_create_tables_adds_ollama_models_column_to_existing_table():
+def test_create_tables_adds_ollama_models_column_to_existing_table(monkeypatch):
+    # The column is missing (information_schema returns no row), so the ALTER
+    # runs; tests/test_compute_coordinator_startup_lock.py covers the skip.
+    monkeypatch.setattr(_RecordingCursor, "fetchone", lambda self: None)
     conn = _RecordingConn()
     coordinator._create_tables(conn)
 

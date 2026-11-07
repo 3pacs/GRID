@@ -28,18 +28,23 @@ Usage:
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import smtplib
 import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger as log
+
+from governance.hypothesis_labels import LEGACY_CUTOFF
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +80,8 @@ def send_insight_email(
     body: str,
     to_email: str | None = None,
     html: bool = False,
+    *,
+    summary_ready: bool = False,
 ) -> bool:
     """Send an email notification.  Logs but never crashes on failure.
 
@@ -82,7 +89,8 @@ def send_insight_email(
         subject:  Email subject line.
         body:     Email body (plain text or HTML).
         to_email: Recipient address.  Falls back to GRID_NOTIFY_EMAIL.
-        html:     If True, send as text/html; otherwise text/plain.
+        html:     Whether the supplied body is HTML.
+        summary_ready: Internal formatters already include their substantive recap.
 
     Returns:
         True if the email was sent successfully, False otherwise.
@@ -101,18 +109,33 @@ def send_insight_email(
     msg["From"] = from_addr
     msg["To"] = recipient
 
-    if html:
-        # Attach both plain-text fallback and HTML
-        plain = body.replace("<br>", "\n")
-        plain = plain.replace("</tr>", "\n")
-        plain = plain.replace("</td>", "  ")
-        # Strip remaining tags for the plain-text part
-        import re
-        plain = re.sub(r"<[^>]+>", "", plain)
-        msg.attach(MIMEText(plain, "plain"))
-        msg.attach(MIMEText(body, "html"))
+    from alerts.email import _html_to_plain, _render_html, _section_summary, _summary_text
+
+    if summary_ready:
+        plain = _html_to_plain(body) if html else body
+        rendered = body if html else _render_html(subject, [{
+            "title": "Notification", "body": f'<div style="white-space:pre-wrap">{escape(body)}</div>',
+        }])
     else:
-        msg.attach(MIMEText(body, "plain"))
+        source = _html_to_plain(body) if html else body
+        summary = _section_summary(
+            subject, "Notification", _summary_text(source)
+            + " Source time was not supplied; report time is not source freshness.",
+        )
+        if html:
+            # Preserve a caller's complete HTML document while inserting the
+            # recap inside its body, rather than nesting one document in another.
+            card = f"<section><h2>At a glance</h2>{summary['body']}</section><h2>Full detail</h2>"
+            rendered, found = re.subn(r"(<body\b[^>]*>)", lambda match: match[0] + card, body, count=1, flags=re.I)
+            if not found:
+                rendered = _render_html(subject, [summary, {"title": "Full detail", "body": body}])
+        else:
+            rendered = _render_html(subject, [summary, {
+                "title": "Full detail", "body": f'<div style="white-space:pre-wrap">{escape(body)}</div>',
+            }])
+        plain = "[At a glance]\n" + summary["plain"] + "\n\n[Full detail]\n" + source
+    msg.attach(MIMEText(plain, "plain", "utf-8"))
+    msg.attach(MIMEText(rendered, "html", "utf-8"))
 
     try:
         if cfg["port"] == 465:
@@ -144,124 +167,85 @@ def send_insight_email(
 # Formatters
 # ---------------------------------------------------------------------------
 
+def _metric(value: Any, fmt: str = ".2f") -> str:
+    if value is None or isinstance(value, bool):
+        return "n/a"
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return "n/a"
+    return format(number, fmt) if math.isfinite(number) else "n/a"
+
+
+def _timestamp(value: Any) -> str:
+    try:
+        at = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return "unknown"
+    if at.tzinfo is None or at.utcoffset() is None:
+        return f"{at:%Y-%m-%d %H:%M:%S} (timezone unknown)"
+    return f"{at.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC"
+
+
 def format_backtest_summary(result: dict[str, Any]) -> str:
-    """Format an autoresearch result dict into an HTML email body.
+    """Summarize supplied simulation outputs without implying a live track record.
 
-    Expects the dict shape returned by ``autoresearch.run_autoresearch()``:
-        - best_result.statement, .sharpe, .baseline_sharpe, .verdict,
-          .feature_ids, .era_results / .era_summary
-        - all_attempts, passed, iterations_run
-
-    Parameters:
-        result: Autoresearch result dictionary.
-
-    Returns:
-        HTML string suitable for email body.
+    Supports the full run result and its raw attempt for preview. Notification
+    eligibility remains controlled separately by notify_on_pass's existing gate.
+    Return/drawdown inputs from validation.backtest are fractional values.
     """
-    best = result.get("best_result") or {}
-    result.get("passed", False)
-    iterations = result.get("iterations_run", 0)
+    from alerts.email import _render_html, _section_summary, _summary_text
 
-    statement = best.get("statement", "(no hypothesis)")
-    sharpe = best.get("sharpe", "N/A")
-    baseline_sharpe = best.get("baseline_sharpe", "N/A")
-    verdict = best.get("verdict", "N/A")
-    feature_ids = best.get("feature_ids", [])
-    era_summary = best.get("era_summary", "N/A")
-    era_results = best.get("era_results", [])
-    total_return = best.get("return", "N/A")
-    max_dd = best.get("max_drawdown", "N/A")
-
-    verdict_color = "#27ae60" if verdict == "PASS" else (
-        "#e67e22" if verdict == "CONDITIONAL" else "#e74c3c"
+    best = result.get("best_result") if "best_result" in result else result
+    best = best if isinstance(best, dict) else {}
+    statement = str(best.get("statement") or "No hypothesis supplied.")
+    verdict = str(best.get("verdict") or "unknown")
+    iterations = result.get("iterations_run", best.get("iteration"))
+    eras = [era for era in best.get("era_results") or [] if isinstance(era, dict)]
+    ok_eras = sum(era.get("status") == "OK" for era in eras)
+    feature_ids = best.get("feature_ids") or []
+    sharpe = _metric(best.get("sharpe"))
+    summary = (
+        f"Recorded verdict: {verdict}; reported iteration/run count: {_metric(iterations, ',.0f')}. "
+        f"Baseline Sharpe: {_metric(best.get('baseline_sharpe'))}. "
+        f"{ok_eras} of {len(eras)} supplied eras have status OK. "
+        + _summary_text(statement, max_chars=200)
+        + " These are backtest outputs, not live investment returns."
     )
-
-    # Build era breakdown rows
-    era_rows = ""
-    if era_results:
-        for e in era_results:
-            status = e.get("status", "?")
-            era_sharpe = e.get("sharpe", "N/A")
-            era_ret = e.get("return", "N/A")
-            era_rows += (
-                f"<tr><td>Era {e.get('era', '?')}</td>"
-                f"<td>{status}</td>"
-                f"<td>{era_sharpe}</td>"
-                f"<td>{era_ret}</td></tr>"
-            )
-    elif era_summary and era_summary != "N/A":
-        era_rows = f"<tr><td colspan='4'>{era_summary}</td></tr>"
-
-    html = f"""\
-<html>
-<body style="font-family: Arial, sans-serif; color: #333; max-width: 600px;">
-<h2 style="color: #2c3e50;">GRID Autoresearch Report</h2>
-
-<table style="border-collapse: collapse; width: 100%; margin-bottom: 16px;">
-  <tr>
-    <td style="padding: 6px 12px; font-weight: bold;">Verdict</td>
-    <td style="padding: 6px 12px;">
-      <span style="color: {verdict_color}; font-weight: bold; font-size: 1.1em;">
-        {verdict}
-      </span>
-    </td>
-  </tr>
-  <tr>
-    <td style="padding: 6px 12px; font-weight: bold;">Iterations</td>
-    <td style="padding: 6px 12px;">{iterations}</td>
-  </tr>
-</table>
-
-<h3>Hypothesis</h3>
-<p style="background: #f8f9fa; padding: 12px; border-left: 4px solid #3498db;">
-  {statement}
-</p>
-
-<h3>Performance</h3>
-<table style="border-collapse: collapse; width: 100%;">
-  <tr>
-    <td style="padding: 4px 12px; font-weight: bold;">Sharpe Ratio</td>
-    <td style="padding: 4px 12px;">{sharpe}</td>
-  </tr>
-  <tr>
-    <td style="padding: 4px 12px; font-weight: bold;">Baseline Sharpe</td>
-    <td style="padding: 4px 12px;">{baseline_sharpe}</td>
-  </tr>
-  <tr>
-    <td style="padding: 4px 12px; font-weight: bold;">Return</td>
-    <td style="padding: 4px 12px;">{total_return}</td>
-  </tr>
-  <tr>
-    <td style="padding: 4px 12px; font-weight: bold;">Max Drawdown</td>
-    <td style="padding: 4px 12px;">{max_dd}</td>
-  </tr>
-</table>
-
-<h3>Era Breakdown</h3>
-<table style="border-collapse: collapse; width: 100%; border: 1px solid #ddd;">
-  <tr style="background: #ecf0f1;">
-    <th style="padding: 6px 12px; text-align: left;">Era</th>
-    <th style="padding: 6px 12px; text-align: left;">Status</th>
-    <th style="padding: 6px 12px; text-align: left;">Sharpe</th>
-    <th style="padding: 6px 12px; text-align: left;">Return</th>
-  </tr>
-  {era_rows}
-</table>
-
-<h3>Features Used</h3>
-<p>{', '.join(str(f) for f in feature_ids) if feature_ids else 'None'}</p>
-
-<hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
-<p style="font-size: 0.85em; color: #999;">
-  Generated by GRID Autoresearch at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-</p>
-</body>
-</html>"""
-
-    return html
+    sections = [_section_summary(f"Simulated Sharpe: {sharpe}", "Autoresearch", summary)]
+    sections.append({"title": "Hypothesis", "body": f'<div style="white-space:pre-wrap">{escape(statement)}</div>'})
+    rows = [
+        ("Recorded verdict", escape(verdict)),
+        ("Simulated Sharpe", sharpe),
+        ("Baseline Sharpe", _metric(best.get("baseline_sharpe"))),
+        ("Simulated total return", _metric(best.get("return"), "+.1%")),
+        ("Simulated max drawdown", _metric(best.get("max_drawdown"), ".1%")),
+    ]
+    sections.append({"title": "Reported simulation metrics", "body":
+        '<table class="data-table">' + ''.join(f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows)
+        + '</table><p>Totals are not annualized. Return and drawdown inputs are fractions rendered as percentages. '
+          'Costs, test coverage and acceptance are not independently verified by this email.</p>'})
+    era_rows = "".join(
+        f"<tr><td>{escape(str(era.get('era', 'unknown')))}</td>"
+        f"<td>{escape(str(era.get('status', 'unknown')))}</td>"
+        f"<td>{escape(str(era.get('start') or era.get('test_start') or 'unknown'))} to "
+        f"{escape(str(era.get('end') or era.get('test_end') or 'unknown'))}</td>"
+        f"<td>{_metric(era.get('sharpe'))}</td><td>{_metric(era.get('return'), '+.1%')}</td></tr>"
+        for era in eras
+    )
+    sections.append({"title": "Era breakdown", "body": (
+        '<table class="data-table"><tr><th>Era</th><th>Recorded status</th><th>Test window</th><th>Sharpe</th><th>Total return</th></tr>'
+        + era_rows + '</table>' if eras else '<p>No era rows supplied; test coverage unknown.</p>'
+    ) + f"<p>{escape(str(best.get('era_summary') or ''))}</p>"})
+    sections.append({"title": "Features used", "body": escape(', '.join(str(f) for f in feature_ids)) or 'None supplied'})
+    sections.append({"title": "Source timing", "body":
+        f"Result timestamp: {escape(_timestamp(result.get('timestamp') or best.get('timestamp')))}<br>"
+        "Missing dates stay unknown. The generation time below does not establish when a backtest ran."})
+    return _render_html("GRID Autoresearch Report", sections,
+                        footer_note="Reported simulation outputs; not a verified investment track record.")
 
 
-def format_daily_digest(engine: Any) -> str:
+def format_daily_digest(engine: Any, *, now: datetime | None = None) -> str:
     """Build a daily digest summary from the decision journal and hypothesis registry.
 
     Queries:
@@ -277,9 +261,10 @@ def format_daily_digest(engine: Any) -> str:
     """
     from sqlalchemy import text as sa_text
 
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     since = now - timedelta(hours=24)
     lines: list[str] = []
+    counts: dict[str, int | None] = {"journal entries": None, "recorded PASSED hypotheses": None, "drift records": None}
 
     lines.append(f"GRID Daily Digest — {now.strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("=" * 60)
@@ -292,20 +277,21 @@ def format_daily_digest(engine: Any) -> str:
                     "SELECT id, inferred_state, state_confidence, "
                     "grid_recommendation, verdict, decision_timestamp "
                     "FROM decision_journal "
-                    "WHERE decision_timestamp >= :since "
+                    "WHERE decision_timestamp >= :since AND decision_timestamp <= :now "
                     "ORDER BY decision_timestamp DESC"
                 ),
-                {"since": since},
+                {"since": since, "now": now},
             ).fetchall()
 
+        counts["journal entries"] = len(rows)
         lines.append(f"\nDecision Journal  ({len(rows)} entries in last 24h)")
         lines.append("-" * 40)
         if rows:
             for r in rows:
-                ts = r[5].strftime("%H:%M") if r[5] else "?"
+                ts = _timestamp(r[5])
                 lines.append(
                     f"  [{ts}] id={r[0]}  state={r[1]}  "
-                    f"conf={r[2]:.2f}  rec={r[3]}  verdict={r[4] or 'pending'}"
+                    f"confidence score={_metric(r[2])}  rec={r[3]}  verdict={r[4] or 'pending'}"
                 )
         else:
             lines.append("  No new decisions.")
@@ -317,19 +303,23 @@ def format_daily_digest(engine: Any) -> str:
         with engine.connect() as conn:
             passed = conn.execute(
                 sa_text(
-                    "SELECT id, statement, updated_at "
-                    "FROM hypothesis_registry "
-                    "WHERE state = 'PASSED' AND updated_at >= :since "
-                    "ORDER BY updated_at DESC"
+                    "SELECT h.id, h.statement, h.updated_at "
+                    "FROM hypothesis_registry h "
+                    "WHERE h.state = 'PASSED' AND h.updated_at >= :since AND h.updated_at <= :now "
+                    "AND h.created_at >= :legacy_cutoff "
+                    "AND NOT EXISTS (SELECT 1 FROM hypothesis_registry_labels l "
+                    "WHERE l.registry_id = h.id) "
+                    "ORDER BY h.updated_at DESC"
                 ),
-                {"since": since},
+                {"since": since, "now": now, "legacy_cutoff": LEGACY_CUTOFF},
             ).fetchall()
 
-        lines.append(f"\nPassed Hypotheses  ({len(passed)})")
+        counts["recorded PASSED hypotheses"] = len(passed)
+        lines.append(f"\nPassed Hypotheses  ({len(passed)} recorded statuses)")
         lines.append("-" * 40)
         if passed:
             for r in passed:
-                lines.append(f"  id={r[0]}: {r[1]}")
+                lines.append(f"  id={r[0]} [{_timestamp(r[2])}]: {r[1]}")
         else:
             lines.append("  None in last 24h.")
     except Exception as exc:
@@ -343,18 +333,19 @@ def format_daily_digest(engine: Any) -> str:
                     "SELECT f.name, d.drift_score, d.checked_at "
                     "FROM feature_drift_log d "
                     "JOIN feature_registry f ON f.id = d.feature_id "
-                    "WHERE d.checked_at >= :since "
+                    "WHERE d.checked_at >= :since AND d.checked_at <= :now "
                     "AND d.drift_score > 0.15 "
                     "ORDER BY d.drift_score DESC"
                 ),
-                {"since": since},
+                {"since": since, "now": now},
             ).fetchall()
 
-        lines.append(f"\nFeature Drift Alerts  ({len(drift)})")
+        counts["drift records"] = len(drift)
+        lines.append(f"\nFeature Drift Alerts  ({len(drift)} records above 0.15)")
         lines.append("-" * 40)
         if drift:
             for r in drift:
-                lines.append(f"  {r[0]}: drift={r[1]:.3f}")
+                lines.append(f"  {r[0]}: drift={_metric(r[1], '.3f')} [{_timestamp(r[2])}]")
         else:
             lines.append("  No significant drift detected.")
     except Exception:
@@ -363,7 +354,14 @@ def format_daily_digest(engine: Any) -> str:
 
     lines.append("\n" + "=" * 60)
     lines.append("End of digest.")
-    return "\n".join(lines)
+    summary = "[At a glance]\n" + "; ".join(
+        f"{value:,} {label}" if value is not None else f"{label}: unknown"
+        for label, value in counts.items()
+    )
+    summary += (f"\nWindow: {_timestamp(since)} through {_timestamp(now)}, inclusive. "
+                "Historical records, not current open alerts. This is not a verified investment track record. "
+                "PASSED counts exclude pre-cutoff and labeled legacy rows under the registry policy. Query failures remain unknown.\n\n")
+    return summary + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -384,14 +382,14 @@ def notify_on_pass(result: dict[str, Any], to_email: str | None = None) -> bool:
         log.debug("Hypothesis did not pass — no notification sent")
         return False
 
-    best = result.get("best_result", {})
+    best = result.get("best_result") or {}
     subject = (
-        f"[GRID] Hypothesis PASSED — "
-        f"Sharpe {best.get('sharpe', '?')} "
+        f"[GRID] Autoresearch result — "
+        f"Reported verdict {best.get('verdict') or 'unknown'}; simulated Sharpe {_metric(best.get('sharpe'))} "
         f"(iter {result.get('iterations_run', '?')})"
     )
     body = format_backtest_summary(result)
-    return send_insight_email(subject, body, to_email=to_email, html=True)
+    return send_insight_email(subject, body, to_email=to_email, html=True, summary_ready=True)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +427,7 @@ if __name__ == "__main__":
             subject=f"[GRID] Daily Digest — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
             body=body,
             to_email=args.to,
+            summary_ready=True,
         )
         log.info("Digest sent." if ok else "Digest send failed — check logs.")
 

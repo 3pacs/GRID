@@ -36,6 +36,11 @@ from sqlalchemy.engine import Engine
 from oracle.entry_price_policy import entry_price_score_note
 
 
+# Lessons come from official verdicts (oracle.engine.score_expired_predictions),
+# not from postmortems; see intelligence/reasoning_bank.py "The rules".
+POSTMORTEM_WRITES_LESSONS = False
+
+
 # ── Data Classes ──────────────────────────────────────────────────────────
 
 FAILURE_CATEGORIES = [
@@ -787,9 +792,12 @@ def _store_postmortem(
             "generated_at": pm.generated_at,
         })
 
-    # ReasoningBank-style lesson emit (failure path). Defensive — never
-    # propagate exceptions to the caller, since lesson capture is an
-    # optional side-effect of post-mortem persistence.
+    # Postmortems no longer write ReasoningBank lessons (2026-11-07): lessons
+    # come from official verdicts, one per verdict and both sides
+    # (intelligence/reasoning_bank.py, "The rules"). A postmortem explains a
+    # miss; it does not count it a second time.
+    if not POSTMORTEM_WRITES_LESSONS:
+        return
     try:
         _emit_lesson_from_postmortem(
             engine, pm, trade_id=trade_id, prediction_id=prediction_id,

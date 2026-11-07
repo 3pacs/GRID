@@ -1862,6 +1862,31 @@ def _daily_intel_fundamental_divergence(
     )
 
 
+def _daily_intel_sleuth_dispatch(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Find Sleuth intersection leads and queue one investigation per lead.
+
+    SQL plus a bounded closes read (``intelligence.sleuth_intersections``):
+    saves at most ``MAX_NEW_LEADS`` new ``origin='intersection'`` leads and
+    enqueues a ``sleuth_investigate`` goal for each, which goal_worker runs
+    on its own budget. No LLM call in this step; the step is done once the
+    goals are queued (``reports_done_queued``).
+    """
+    from intelligence.goal_queue import enqueue_goal
+    from intelligence.sleuth_intersections import generate_intersection_leads
+
+    lead_ids = generate_intersection_leads(engine, as_of=now)
+    queued = 0
+    for rank, lead_id in enumerate(lead_ids):
+        if enqueue_goal(engine, goal_type="sleuth_investigate", target_id=lead_id,
+                        priority=50 + rank, hardware_tier="cpu", allow_cloud=False) is not None:
+            queued += 1
+    results["sleuth_dispatch"] = {"leads": len(lead_ids), "queued": queued}
+    log.info("Sleuth dispatch: {n} new leads, {q} investigations queued",
+             n=len(lead_ids), q=queued)
+
+
 def _daily_intel_holder_deal_overlap(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -1964,6 +1989,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("sleuth_dispatch", _daily_intel_sleuth_dispatch, DAILY_INTEL_SQL_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
@@ -2030,6 +2056,18 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # cross-reference of 13F institutional holdings against capital_flows
     # acquisition announcements. No LLM.
     "holder_deal_overlap",
+    # intelligence/sleuth_intersections.py::generate_intersection_leads +
+    # one sleuth_investigate goal per new lead (dispatch, done_queued).
+    # Owner-approved 2026-11-07 ("go on the sleuth rebuild"); its declared
+    # hypotheses are v2 one-look trials in the S11 ledger (#1008, #1012).
+    "sleuth_dispatch",
+    # intelligence/postmortem.py::batch_postmortem -- LLM-narrated
+    # (Tier.REASON) trade_postmortems rows for official misses and failed
+    # trades, POSTMORTEM_BATCH_LIMIT per source. Released 2026-11-07 (owner
+    # approval) once postmortems stopped writing ReasoningBank lessons: they
+    # explain a miss, they no longer feed learning (lessons now come from
+    # official verdicts, both sides; intelligence/reasoning_bank.py).
+    "postmortem_batch",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -2097,11 +2135,6 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "(analysis/backtest_scanner.py) is LLM-gated (llm.router "
         "Tier.ORACLE sanity-checks winners) and inserts into "
         "hypothesis_registry via generate_hypotheses_from_winners"
-    ),
-    "postmortem_batch": (
-        "postmortem write that feeds learning — batch_postmortem "
-        "(intelligence/postmortem.py) is LLM-narrated (llm.router "
-        "Tier.REASON) and inserts trade_postmortems rows"
     ),
     "options_improvement": (
         "model/weight registry write + scorer — run_improvement_cycle "

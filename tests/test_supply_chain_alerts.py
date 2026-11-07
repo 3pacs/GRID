@@ -245,9 +245,10 @@ def test_render_digest_html_contains_sections_and_subject():
     assert "canvas/MSFT/supply" in html
 
 
-def test_render_digest_html_all_clear_when_empty():
+def test_render_digest_html_does_not_claim_all_clear_when_empty():
     html = sca.render_digest_html({k: [] for k in sca.DETECTOR_ORDER})
-    assert "All Clear" in html
+    assert "No findings supplied" in html
+    assert "All Clear" not in html
 
 
 def test_run_all_aggregates_and_returns_counts():
@@ -268,3 +269,130 @@ def test_run_all_aggregates_and_returns_counts():
     assert result["sent"] is False
     assert result["snapshots_written"] == 42
     assert len(result["findings"]["new_suppliers"]) == 1
+
+
+
+def test_supply_summary_counts_findings_without_claiming_unique_incidents():
+    finding = {"entity": "A", "headline": "A risk", "delta": "0.90",
+               "context": "Full detail", "payload": {"edge_key": "A|B|r", "chokepoint_score": .9}}
+    findings = {"new_high_chokepoints": [finding], "contagion_risk": [finding],
+                "large_acquisitions": [{"headline": "Deal", "payload": {"amount_usd": 6e9}}]}
+    html = sca.render_digest_html(findings)
+    assert "3 findings shown" in html
+    assert "0.90" in html and "not a probability" in html
+    assert "$6.00B" in html and "largest reported acquisition" in html
+    assert "may describe the same edge" in html
+    assert html.index("At a glance") < html.index("New High Chokepoints")
+    assert "font-size:32px" in html
+
+
+def test_supply_send_and_preview_share_summary():
+    finding = {"headline": "Deal", "payload": {"amount_usd": 6e9}}
+    with patch("alerts.email._send") as send:
+        assert sca.send_digest({"large_acquisitions": [finding]})
+    assert send.call_args.args[1][0]["title"] == "At a glance"
+    assert "1 findings shown" in send.call_args.args[1][0]["body"]
+
+
+def test_supply_failure_coverage_is_not_all_clear():
+    html = sca.render_digest_html({}, scan_context={"failed_detectors": ["new_suppliers"],
+                                                  "since_hours": 48})
+    assert "new_suppliers" in html and "failed" in html
+    assert "48-hour" in html
+    assert "All Clear" not in html
+
+
+def test_supply_links_are_escaped_and_unsafe_schemes_rejected():
+    row = {"headline": '<img src=x onerror="x">', "deep_link": 'javascript:alert(1)'}
+    html = sca._render_finding_row(row)
+    assert "<img" not in html
+    assert "javascript:" not in html
+    html = sca._render_finding_row({"deep_link": 'https://example.test/?x="a"&b=c'})
+    assert '&quot;a&quot;&amp;b=c' in html
+
+
+
+def test_supply_summary_ignores_nonfinite_metrics_and_keeps_unknown_groups():
+    findings = {"new_high_chokepoints": [{"payload": {"chokepoint_score": float("nan")}}],
+                "large_acquisitions": [{"payload": {"amount_usd": float("inf")}}],
+                "custom_group": [{"headline": "Custom <finding>"}]}
+    html = sca.render_digest_html(findings)
+    assert "3 findings shown" in html
+    assert "Highest reported" not in html
+    assert "largest reported acquisition" not in html
+    assert "Custom &lt;finding&gt;" in html
+
+
+def test_supply_summary_concentration_uses_percentage_points():
+    html = sca.render_digest_html({"concentration_shifts": [{"payload": {"delta_pp": -.075}}]})
+    assert "-7.5 percentage points" in html
+    assert "not a percentage return" in html
+
+
+def test_supply_finding_keeps_full_detail_and_provenance():
+    row = {"context": "Detailed context " * 100 + "END DETAIL", "alert_type": "large_acquisition",
+           "payload": {"baseline_at": "<old>", "record_as_of": "2026-04-01"}}
+    html = sca._render_finding_row(row)
+    assert "END DETAIL" in html
+    assert "Comparison baseline: &lt;old&gt;" in html
+    assert "Record as of: 2026-04-01" in html
+    assert "not confirmation the transaction closed" in html
+
+
+def test_run_all_passes_failure_context_without_changing_detection(monkeypatch):
+    finding = {"alert_type": "large_acquisition", "key": "k", "entity": "A", "headline": "h",
+               "delta": "d", "context": "detail", "deep_link": "https://example.test", "payload": {}}
+    for name in sca.DETECTOR_ORDER:
+        monkeypatch.setattr(sca, f"detect_{name}", lambda *a, **kw: [])
+    monkeypatch.setattr(sca, "detect_large_acquisitions", lambda *a, **kw: [finding])
+    def fail(*a, **kw):
+        raise RuntimeError("synthetic source failure")
+    monkeypatch.setattr(sca, "detect_new_suppliers", fail)
+    monkeypatch.setattr(sca, "refresh_snapshots", lambda *a: 0)
+    with patch.object(sca, "send_digest", return_value=False) as send:
+        result = sca.run_all(MagicMock(), since_hours=48, send_email=True)
+    assert result["failed_detectors"] == ["new_suppliers"]
+    assert result["total"] == 1
+    assert send.call_args.kwargs["scan_context"]["since_hours"] == 48
+    assert send.call_args.kwargs["scan_context"]["failed_detectors"] == ["new_suppliers"]
+
+
+def test_acquisition_preserves_actual_record_timestamp():
+    from datetime import datetime, timezone
+    conn = MagicMock()
+    timestamp = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    conn.execute.return_value.fetchall.return_value = [("A", "B", 6e9, None, "filing", timestamp)]
+    with patch.object(sca, "_already_alerted", return_value=False):
+        finding = sca.detect_large_acquisitions(_fake_engine_with_conn(conn))[0]
+    assert finding["payload"]["record_as_of"] == timestamp.isoformat()
+
+
+def test_supply_empty_send_stays_suppressed():
+    with patch("alerts.email._send") as send:
+        assert sca.send_digest({}) is False
+    send.assert_not_called()
+
+
+
+@pytest.mark.parametrize("failed", sca.DETECTOR_ORDER)
+def test_each_detector_failure_is_visible_in_sent_summary(monkeypatch, failed):
+    finding = {"alert_type": "new_supplier", "key": "k", "entity": "A", "headline": "h",
+               "delta": "d", "context": "detail", "deep_link": "https://example.test", "payload": {}}
+    for name in sca.DETECTOR_ORDER:
+        monkeypatch.setattr(sca, f"detect_{name}", lambda *a, **kw: [finding])
+    def fail(*a, **kw):
+        raise RuntimeError("synthetic source failure")
+    monkeypatch.setattr(sca, f"detect_{failed}", fail)
+    monkeypatch.setattr(sca, "refresh_snapshots", lambda *a: 0)
+    with patch("alerts.email._send") as send:
+        result = sca.run_all(MagicMock(), send_email=True)
+    assert result["failed_detectors"] == [failed]
+    assert result["total"] == 6
+    summary = send.call_args.args[1][0]["body"]
+    assert f"detector(s) failed: {failed}" in summary
+    assert "not a source-data timestamp" in summary
+
+
+def test_supply_malformed_url_uses_canvas_fallback():
+    html = sca._render_finding_row({"deep_link": "https://[bad"})
+    assert 'href="https://grid.stepdad.finance/#/canvas"' in html

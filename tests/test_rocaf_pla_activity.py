@@ -72,6 +72,18 @@ def test_parse_report_median_line_wording_and_no_official_ships() -> None:
     assert rep.official_ships is None  # not stated -> not stored
 
 
+def test_parse_report_median_line_of_the_taiwan_strait_real_fixture() -> None:
+    """2026-11-07 live report (recorded from grid-svr): MND now writes
+    "crossed the median line of the Taiwan Strait and entered". The old
+    pattern only knew "crossed the median line and entered", so 2 of the 3
+    newest reports parsed to None and the run would have FAILED."""
+    html = (FIX / "air_activity_59374_20261107.html").read_text(encoding="utf-8")
+    rep = parse_report(html)
+    assert rep is not None
+    assert rep.report_date == date(2026, 11, 7)
+    assert (rep.aircraft_sorties, rep.plan_ships, rep.official_ships, rep.adiz_entries) == (11, 10, 3, 9)
+
+
 def test_parse_report_without_adiz_sentence_marks_it() -> None:
     html = (
         "<div>2026/08/02</div><p>2.PLA activities: 5 sorties of PLA aircraft, 7 PLAN ships "

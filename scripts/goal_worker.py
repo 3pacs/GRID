@@ -167,21 +167,13 @@ HandlerFn = Callable[[Engine, Goal], HandlerResult]
 
 
 def handle_score_active_hypothesis(engine: Engine, goal: Goal) -> HandlerResult:
-    """Score a single ``discovered_hypotheses`` row.
+    """Hand a single ``discovered_hypotheses`` row to the batch scorer.
 
-    Wraps :meth:`intelligence.hypothesis_engine.HypothesisGenerator.score_hypothesis`.
-    Idempotent: if the hypothesis row's ``last_tested`` advanced after
-    we claimed but before we ran (e.g. the hermes cron beat us to it),
-    we still call ``score_hypothesis``; the engine handles a fresh
-    Bayesian update and writes the latest result. The dedupe index on
-    ``goal_queue`` prevents two open goals for the same hypothesis, so
-    we don't double-write the queue, but the underlying scoring is
-    cheap and safe to re-run.
-
-    score_hypothesis is purely local (boost-log lookup + Bayesian math
-    + DB updates), so cloud-LLM refusal is automatic — there's nothing
-    to refuse. We still call ``_check_cloud_permission`` if the goal
-    row declares ``allow_cloud`` to keep the contract explicit.
+    Wraps :meth:`intelligence.hypothesis_engine.HypothesisGenerator.score_hypothesis`,
+    which never issues a verdict for one row: a v2 verdict is a declared
+    trial with BH over its batch, recorded in the S11 trial ledger by
+    ``score_due_active_hypotheses`` (Hermes, every 30 minutes). The handler
+    therefore reports ``held`` or ``deferred`` and writes nothing.
     """
     if goal.allow_cloud:
         # Defensive: the score path doesn't call cloud LLMs, but if
@@ -247,8 +239,26 @@ def handle_hermes_storage_maintenance(engine: Engine, goal: Goal) -> HandlerResu
     return _inspect_storage_maintenance(engine, goal.target_id, state)
 
 
+def handle_sleuth_investigate(engine: Engine, goal: Goal) -> HandlerResult:
+    """Review one Sleuth intersection lead and record its declared outcome.
+
+    Wraps :func:`intelligence.sleuth_intersections.investigate_intersection_lead`:
+    a ``hypothesis_declared`` outcome inserts a ``discovered_hypotheses`` row
+    with fixed test criteria for the v2 trial scorer; a ``dead_end`` keeps its
+    reason. An unavailable or off-format LLM raises, so the goal is retried
+    and the lead stays ``new``.
+    """
+    if goal.allow_cloud:
+        _check_cloud_permission(goal)
+
+    from intelligence.sleuth_intersections import investigate_intersection_lead
+
+    return investigate_intersection_lead(engine, goal.target_id)
+
+
 HANDLERS: dict[str, HandlerFn] = {
     "score_active_hypothesis": handle_score_active_hypothesis,
+    "sleuth_investigate": handle_sleuth_investigate,
     "hermes_diagnose_source": handle_hermes_diagnose_source,
     "hermes_scout_free_data": handle_hermes_scout_free_data,
     "hermes_wiring_audit": handle_hermes_wiring_audit,

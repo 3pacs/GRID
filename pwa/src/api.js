@@ -1185,7 +1185,17 @@ class GRIDApi {
     }
 
     // Actor Network
-    async getActorNetwork() { return this._fetch('/api/v1/intelligence/actor-network'); }
+    /** Overview graph; params {limit, groups, sector, community} (none -> the preloaded default URL). */
+    async getActorNetwork(params = {}) {
+        const qs = new URLSearchParams(
+            Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== null && v !== ''),
+        ).toString();
+        return this._fetch(`/api/v1/intelligence/actor-network${qs ? `?${qs}` : ''}`);
+    }
+    /** Bounded k-hop neighbourhood of one actor (expand on node click). */
+    async getActorUniverseEgo(actorId, { depth = 1, fanout = 25, maxNodes = 150 } = {}) {
+        return this._fetch(`/api/v1/intelligence/actor-universe/ego/${encodeURIComponent(actorId)}?depth=${depth}&fanout=${fanout}&max_nodes=${maxNodes}`);
+    }
     async getPowerMap(sectorName) { return this._fetch(`/api/v1/intelligence/power-map/${encodeURIComponent(sectorName)}`); }
     async getEgoGraphSearch(q) { return this._fetch(`/api/v1/intelligence/ego-graph/search?q=${encodeURIComponent(q)}`); }
     async getEgoGraph(actorId, depth = 2, maxNodes = 80) { return this._fetch(`/api/v1/intelligence/ego-graph/${encodeURIComponent(actorId)}?depth=${depth}&max_nodes=${maxNodes}`); }

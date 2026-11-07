@@ -566,7 +566,33 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # a 4-line comment), and _run_puller passes YFinancePuller output
         # through scheduler._normalize_expected_spy_refusal before classifying.
         # Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','994cf156b31a50e12be98b80a6c5f419de5fcf9284ae90f7e0f2743d74b5d7df'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
+        # OPER re-pinned 994cf156 -> b4d724c9 (2026-11-07,
+        # claude/sleuth-intersections-20261107): the only operator edits are
+        # the new _daily_intel_sleuth_dispatch function (inserted before
+        # _daily_intel_holder_deal_overlap), its DailyIntelTask row after
+        # holder_deal_overlap, and its DAILY_INTEL_HOLD_REASONS entry (held).
+        # Needs reviewer acceptance like the prior pins.
+        # OPER re-pinned b4d724c9 -> d7da3448 (2026-11-07,
+        # claude/sleuth-dispatch-enable-20261107): sleuth_dispatch moves from
+        # DAILY_INTEL_HOLD_REASONS to DAILY_INTEL_INITIAL_ALLOWLIST (owner
+        # approval). Needs reviewer acceptance like the prior pins.
+        # OPER re-pinned d7da3448 -> 59d5cee2 (2026-11-07,
+        # claude/honest-lessons-20261107): postmortem_batch moves from
+        # DAILY_INTEL_HOLD_REASONS to DAILY_INTEL_INITIAL_ALLOWLIST (owner
+        # approval; postmortems no longer write lessons). Needs reviewer
+        # acceptance like the prior pins.
+        # SCHED re-pinned ae8c0501 -> a1595b64 (2026-11-07,
+        # claude/darkpool-fetch-window-20261107): the only scheduler edit is
+        # the dark_pool registry entry's timeout_s 60 -> 120 with a 3-line
+        # comment (its bounded FINRA fetch window is 2-3 pages at ~6s each).
+        # Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned a1595b64 -> accdd222 (2026-11-07,
+        # claude/log-missing-key-skips-20261107): the only scheduler edits are
+        # MISSING_API_KEY_PREFIX (used by MissingPullerApiKey's message) and
+        # _log_run writing a missing-key SKIPPED as SUCCESS / 0 rows /
+        # "SKIPPED: Missing API key: X" (other skips stay unlogged). Needs
+        # reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','accdd222f8a71b7394bf14724ccbc8c18f8aa58e041a3a6a078033a1b5675835')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

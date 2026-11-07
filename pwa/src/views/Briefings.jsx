@@ -260,8 +260,12 @@ export function paginateText(text, pageChars = BRIEFING_PAGE_CHARS) {
 /** Markdown content, paged when longer than one page. */
 function PagedContent({ content }) {
     const pages = useMemo(() => paginateText(content), [content]);
-    const [page, setPage] = useState(0);
-    useEffect(() => { setPage(0); }, [content]);
+    // The page belongs to the content it was chosen for, so new content starts
+    // at page 1. Derived rather than reset in an effect: a reset effect still
+    // pending at the first click ran after it and snapped back to page 1.
+    const [selection, setSelection] = useState({ content, page: 0 });
+    const page = selection.content === content ? selection.page : 0;
+    const setPage = (next) => setSelection({ content, page: next });
     if (pages.length <= 1) return <RenderedContent content={content} />;
     const current = Math.min(page, pages.length - 1);
     return (

@@ -26,6 +26,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from intelligence.actor_identity import looks_like_identifier
+
 
 # ── Signal types that contain real actor names (not Reddit usernames) ──
 REAL_ACTOR_SIGNAL_TYPES = {
@@ -95,6 +97,8 @@ def is_real_actor(name: str, signal_type: str) -> bool:
     if signal_type in NOISE_SIGNAL_TYPES:
         return False
     if _NOISE_PATTERN.match(name):
+        return False
+    if looks_like_identifier(name):  # whale_aapl_100, gdelt:market, 2026-06851
         return False
     # Must contain at least one space or be a known org pattern
     # Single-word names are often tickers or handles

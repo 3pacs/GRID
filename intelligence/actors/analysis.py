@@ -10,6 +10,7 @@ Contains:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -22,6 +23,92 @@ from intelligence.actors.db import _ensure_tables, _load_actors_from_db
 from intelligence.actors.graph import build_actor_graph
 from intelligence.actors.models import Actor
 from intelligence.lever_pullers import puller_identity
+
+
+_TICKER_CONTEXT_EXCLUDED = ("icij_entity", "icij_officer", "icij_intermediary")
+_NAME_TOKEN = re.compile(r"[\w&.'-]+", re.UNICODE)
+_MIN_FRAGMENT_CHARS = 4
+_MAX_FRAGMENT_WORDS = 6
+
+
+def _name_fragments(names: set[str]) -> list[str]:
+    """Lower-cased names plus their contiguous word runs (>= 4 chars).
+
+    The old matcher kept actor X when ``X.name.lower()`` was a substring of a
+    signal-source name ("Nancy Pelosi" in "Hon. Nancy Pelosi (D-CA)"). Word
+    runs of each source name reproduce that at word granularity and turn it
+    into an indexed equality lookup.
+    """
+    out: set[str] = set()
+    for raw in names:
+        low = raw.strip().lower()
+        if not low:
+            continue
+        out.add(low)
+        tokens = _NAME_TOKEN.findall(re.sub(r"\([^)]*\)", " ", low))
+        for i in range(len(tokens)):
+            for j in range(i + 1, min(len(tokens), i + _MAX_FRAGMENT_WORDS) + 1):
+                frag = " ".join(tokens[i:j])
+                if len(frag) >= _MIN_FRAGMENT_CHARS:
+                    out.add(frag)
+    return sorted(out)
+
+
+def _match_actors_for_ticker(conn: Any, ticker: str, actor_names: set[str]) -> list[dict]:
+    """Actors behind a ticker's recent signals, plus its insider flows.
+
+    1. Name match: ``lower(actors.name) = ANY(fragments)`` (idx_actors_name_lower).
+    2. Positions: actors with ``wealth_flows`` into ``corp_<TICKER>`` (Form 4
+       insiders -> company; ``idx_wealth_flows_to_entity``). This replaces the
+       ``known_positions`` scan, which is empty for all ~3.49M actors on
+       griddb (2026-11-06) and cannot be indexed cheaply.
+    """
+    def _row(r: Any) -> dict:
+        return {
+            "id": r[0],
+            "name": r[1],
+            "tier": r[2],
+            "category": r[3],
+            "title": r[4] or "",
+            "influence": round(float(r[5]) if r[5] is not None else 0.5, 3),
+            "motivation": r[6] or "unknown",
+            "trust_score": round(float(r[7]) if r[7] is not None else 0.5, 3),
+        }
+
+    matched: dict[str, dict] = {}
+    fragments = _name_fragments(actor_names)
+    if fragments:
+        rows = conn.execute(text("""
+            SELECT id, name, tier, category, title, influence_score,
+                   motivation_model, trust_score
+            FROM actors
+            WHERE lower(name) = ANY(:names)
+              AND category <> ALL(:excluded)
+            ORDER BY influence_score DESC NULLS LAST
+            LIMIT 200
+        """), {"names": fragments, "excluded": list(_TICKER_CONTEXT_EXCLUDED)}).fetchall()
+        for r in rows:
+            matched.setdefault(r[0], _row(r))
+
+    t = ticker.strip()
+    corp_ids = sorted({f"corp_{t.upper()}", f"corp_{t.lower()}", f"corp_{t}"})
+    rows = conn.execute(text("""
+        SELECT a.id, a.name, a.tier, a.category, a.title, a.influence_score,
+               a.motivation_model, a.trust_score
+        FROM (
+            SELECT from_actor, MAX(amount_estimate) AS amt
+            FROM wealth_flows
+            WHERE to_entity = ANY(:corp)
+            GROUP BY from_actor
+            ORDER BY amt DESC NULLS LAST
+            LIMIT 50
+        ) w
+        JOIN actors a ON a.id = w.from_actor
+        WHERE a.category <> ALL(:excluded)
+    """), {"corp": corp_ids, "excluded": list(_TICKER_CONTEXT_EXCLUDED)}).fetchall()
+    for r in rows:
+        matched.setdefault(r[0], _row(r))
+    return list(matched.values())
 
 
 def get_actor_context_for_ticker(
@@ -91,44 +178,10 @@ def get_actor_context_for_ticker(
                     "trust_score": round(trust, 3),
                 })
 
-            # Cross-reference with known actors
-            actors_db = _load_actors_from_db(engine)
-            matched_actors: list[dict] = []
-
-            for actor_id, actor in actors_db.items():
-                # Match by name appearing in signal sources
-                if actor.name in actor_names or any(
-                    actor.name.lower() in name.lower() for name in actor_names
-                ):
-                    matched_actors.append({
-                        "id": actor_id,
-                        "name": actor.name,
-                        "tier": actor.tier,
-                        "category": actor.category,
-                        "title": actor.title,
-                        "influence": round(actor.influence_score, 3),
-                        "motivation": actor.motivation_model,
-                        "trust_score": round(actor.trust_score, 3),
-                    })
-
-            # Also include actors whose known_positions mention this ticker
-            matched_ids = {a["id"] for a in matched_actors}
-            for actor_id, actor in actors_db.items():
-                if any(
-                    pos.get("ticker", "").upper() == ticker.upper()
-                    for pos in actor.known_positions
-                ):
-                    if actor_id not in matched_ids:
-                        matched_actors.append({
-                            "id": actor_id,
-                            "name": actor.name,
-                            "tier": actor.tier,
-                            "category": actor.category,
-                            "title": actor.title,
-                            "influence": round(actor.influence_score, 3),
-                            "motivation": actor.motivation_model,
-                            "trust_score": round(actor.trust_score, 3),
-                        })
+            # Cross-reference with known actors through indexed lookups
+            # (lower(name) btree + wealth_flows.to_entity), never by loading
+            # the actor table: the old full scan pulled ~1.86M actors per call.
+            matched_actors = _match_actors_for_ticker(conn, ticker, actor_names)
 
             result["actors"] = sorted(
                 matched_actors,

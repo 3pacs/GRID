@@ -498,3 +498,129 @@ def test_thesis_invalidation_hourly_logs_real_monitor_run_fields(monkeypatch):
     assert kw["t"] == real_run.predictions_scanned == 7
     assert kw["i"] == real_run.triggered_count == 1
     assert kw["e"] == len(real_run.errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# Wage tracker / buyback execution: registered daily AND visible in pull_log
+# (2026-11-07 stopped-sources triage: both jobs ran every day per journald,
+# but wrote no pull_log row, so a pull_log-based audit called them stopped).
+# ---------------------------------------------------------------------------
+
+
+_PULL_LOG: list[tuple] = []
+
+
+class _RecordingPullContext:
+    """Stands in for ingestion.pull_context.PullContext and records the
+    pull_log row it would write (SQLite cannot run PullContext's real
+    ``UPDATE ... RETURNING`` with an unconsumed cursor; Postgres can)."""
+
+    def __init__(self, engine, puller_name, source_id=None, **_kw) -> None:
+        self.puller_name, self.source_id = puller_name, source_id
+        self.rows, self.status, self.note = 0, None, None
+
+    def record_rows(self, n):
+        self.rows += n
+
+    def set_status(self, status, note=None):
+        self.status, self.note = status, note
+
+    def set_note(self, note):
+        self.note = note
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        status = "FAILED" if exc_type else (self.status or "SUCCESS")
+        note = f"{exc_type.__name__}: {exc}" if exc_type else self.note
+        _PULL_LOG.append((self.puller_name, self.source_id, status, self.rows, note))
+        return False
+
+
+def _pull_log_engine(monkeypatch):
+    from sqlalchemy import create_engine, text
+
+    import ingestion.pull_context as pull_context
+
+    _PULL_LOG.clear()
+    monkeypatch.setattr(pull_context, "PullContext", _RecordingPullContext)
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE source_catalog (id INTEGER PRIMARY KEY, name TEXT UNIQUE)"
+        ))
+        conn.execute(text(
+            "INSERT INTO source_catalog (id, name) VALUES "
+            "(3474, 'atlanta_fed_wage_tracker'), (3475, 'buyback_execution')"
+        ))
+    return engine
+
+
+def _pull_log_rows(_engine):
+    return list(_PULL_LOG)
+
+
+def test_wage_tracker_and_buyback_jobs_stay_registered_daily(monkeypatch):
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    jobs_by_name = {job["func"]: job for job in fake_schedule.jobs}
+    assert jobs_by_name["_wage_tracker_monthly"]["unit"] == "day"
+    assert jobs_by_name["_wage_tracker_monthly"]["at"] == "12:05"
+    assert jobs_by_name["_buyback_execution_quarterly"]["unit"] == "day"
+    assert jobs_by_name["_buyback_execution_quarterly"]["at"] == "13:00"
+
+
+@pytest.mark.parametrize(("result", "status", "rows", "note"), [
+    ({"fetched": 58, "inserted": 4}, "SUCCESS", 4, None),
+    ({"fetched": 58, "inserted": 0}, "SUCCESS", 0, "NO_NEW_DATA: 58 fetched, 0 new"),
+    ({"fetched": 0, "inserted": 0}, "FAILED", 0, "fetched 0 rows"),
+])
+def test_run_logged_altdata_job_writes_pull_log(monkeypatch, result, status, rows, note):
+    engine = _pull_log_engine(monkeypatch)
+    out = scheduler._run_logged_altdata_job(
+        engine, "atlanta_fed_wage_tracker", "atlanta_fed_wage_tracker",
+        lambda _engine: result,
+    )
+    assert out == result
+    assert _pull_log_rows(engine) == [
+        ("atlanta_fed_wage_tracker", 3474, status, rows, note),
+    ]
+
+
+def test_run_logged_altdata_job_records_runner_exception_as_failed(monkeypatch):
+    engine = _pull_log_engine(monkeypatch)
+
+    def _boom(_engine):
+        raise RuntimeError("FRED down")
+
+    with pytest.raises(RuntimeError):
+        scheduler._run_logged_altdata_job(
+            engine, "buyback_execution", "buyback_execution", _boom,
+        )
+    (row,) = _pull_log_rows(engine)
+    assert row[:3] == ("buyback_execution", 3475, "FAILED")
+    assert "FRED down" in row[4]
+
+
+@pytest.mark.parametrize(("callback", "module_path", "func_name", "puller", "sid"), [
+    ("_wage_tracker_monthly", "ingestion.altdata.wage_tracker",
+     "run_wage_tracker_puller", "atlanta_fed_wage_tracker", 3474),
+    ("_buyback_execution_quarterly", "ingestion.altdata.buyback_execution",
+     "run_buyback_puller", "buyback_execution", 3475),
+])
+def test_scheduled_callbacks_write_pull_log(
+    monkeypatch, callback, module_path, func_name, puller, sid,
+):
+    import importlib
+
+    import db
+
+    engine = _pull_log_engine(monkeypatch)
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        importlib.import_module(module_path), func_name,
+        lambda _engine: {"fetched": 10, "inserted": 2},
+    )
+    fake_schedule.callbacks[callback]()
+    assert _pull_log_rows(engine) == [(puller, sid, "SUCCESS", 2, None)]

@@ -160,219 +160,115 @@ def test_antithesis_generated_for_convergence(engine):
     assert anti_criteria["expected_direction"] in ("bearish", "down")
 
 
-def test_score_all_uses_per_hypothesis_window(engine):
-    """score_all picks up hypotheses whose own test window has elapsed."""
-    gen = HypothesisGenerator(engine)
+def _ledgered(trials: list[dict]):
+    """Record ``trials`` as one S11 hypothesis batch in an in-memory ledger."""
+    import analysis.ledger_steered_exploration as lse
+    from intelligence import hypothesis_trials
 
-    # Hypothesis with 3-day window, created 5 days ago → should be scoreable
-    short_window = Hypothesis(
-        id="hyp_test_short_window",
-        thesis="Short window test hypothesis",
-        pattern_type="lead_lag",
-        evidence=[],
-        test_criteria={"watch_signal": "sig:x", "expect_signal": "sig:y",
-                       "lag_days": 3, "expected_direction": "increases"},
-        invalidation="test",
-        confidence=0.5,
-    )
-    # Hypothesis with 30-day window, created 5 days ago → should NOT be scoreable
-    long_window = Hypothesis(
-        id="hyp_test_long_window",
-        thesis="Long window test hypothesis",
-        pattern_type="volume_anomaly",
-        evidence=[],
-        test_criteria={"watch_category": "test_cat", "window_days": 30},
-        invalidation="test",
-        confidence=0.5,
-    )
-
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM discovered_hypotheses WHERE id LIKE 'hyp_test_%window%'"))
-
-    gen._store_hypothesis(short_window)
-    gen._store_hypothesis(long_window)
-
-    # Backdate both to 5 days ago
-    with engine.begin() as conn:
-        conn.execute(text(
-            "UPDATE discovered_hypotheses SET created_at = NOW() - INTERVAL '5 days' "
-            "WHERE id LIKE 'hyp_test_%_window'"
-        ))
-
-    results = gen.score_all()
-    scored_ids = {r["id"] for r in results if "id" in r}
-
-    assert "hyp_test_short_window" in scored_ids, "3-day window hypothesis should be scored after 5 days"
-    assert "hyp_test_long_window" not in scored_ids, "30-day window hypothesis should NOT be scored after 5 days"
+    ledger = hypothesis_trials.dry_run_ledger()
+    full = [{
+        "identity_sha256": t["hypothesis_id"], "pattern_type": "convergence",
+        "test_kind": "ticker_move", "created_at": "2026-09-01T00:00:00+00:00",
+        "effect_ok": t["status"] == "tested", "reason": t.get("reason"), **t,
+    } for t in trials]
+    return lse.record_hypothesis_batch(ledger, scorer_version="test", evaluated_at="x", trials=full)
 
 
-def test_expired_kill(engine):
-    """Hypothesis past 2x window with no resolution gets EXPIRED kill."""
-    gen = HypothesisGenerator(engine)
-    hyp = Hypothesis(
-        id="hyp_test_expired",
-        thesis="This should expire",
-        pattern_type="convergence",
-        evidence=[{"ticker": "TEST"}],
-        test_criteria={"ticker": "TEST", "expected_direction": "bullish",
-                       "window_days": 10, "min_move_pct": 2.0},
-        invalidation="test",
-        confidence=0.5,
-    )
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM discovered_hypotheses WHERE id = 'hyp_test_expired' OR pair_id = 'hyp_test_expired'"))
-        conn.execute(text("DELETE FROM hypothesis_postmortems WHERE hypothesis_id = 'hyp_test_expired'"))
-
-    gen._store_hypothesis(hyp)
-
-    # Backdate to 25 days ago (2x 10-day window = 20, so 25 > 20)
-    with engine.begin() as conn:
-        conn.execute(text(
-            "UPDATE discovered_hypotheses SET created_at = NOW() - INTERVAL '25 days' "
-            "WHERE id = 'hyp_test_expired'"
-        ))
-
-    gen.score_hypothesis("hyp_test_expired")
-
-    with engine.connect() as conn:
-        row = conn.execute(text(
-            "SELECT status, kill_reason, killed_at FROM discovered_hypotheses WHERE id = 'hyp_test_expired'"
-        )).fetchone()
-        pm = conn.execute(text(
-            "SELECT kill_reason, lifespan_days FROM hypothesis_postmortems "
-            "WHERE hypothesis_id = 'hyp_test_expired'"
-        )).fetchone()
-
-    assert row[0] == "invalidated"
-    assert row[1] == "EXPIRED"
-    assert row[2] is not None
-    assert pm is not None
-    assert pm[0] == "EXPIRED"
-    assert pm[1] >= 25
-
-
-def test_confidence_collapsed_kill(engine):
-    """Hypothesis with confidence < 0.10 after 3+ tests gets killed."""
-    gen = HypothesisGenerator(engine)
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM discovered_hypotheses WHERE id = 'hyp_test_conf_kill'"))
-        conn.execute(text("DELETE FROM hypothesis_postmortems WHERE hypothesis_id = 'hyp_test_conf_kill'"))
-        # times_tested=8 so after +1 → tested=9, new_conf = (0+1)/(9+2) = 0.0909 < 0.10
-        # lag_days=7 → 2x window = 14 days > 10 days since creation, so EXPIRED won't fire
-        conn.execute(text("""
-            INSERT INTO discovered_hypotheses
-                (id, thesis, pattern_type, evidence, test_criteria,
-                 invalidation, confidence, status, times_tested, times_correct,
-                 role, pair_id, created_at)
-            VALUES
-                ('hyp_test_conf_kill', 'Low confidence test', 'lead_lag',
-                 '[]'::jsonb, :criteria,
-                 'test', 0.05, 'active', 8, 0, 'thesis', 'hyp_test_conf_kill',
-                 NOW() - INTERVAL '10 days')
-        """), {"criteria": json.dumps({"watch_signal": "sig:x", "expect_signal": "sig:y",
-                                       "lag_days": 7, "expected_direction": "increases"})})
-
-    gen.score_hypothesis("hyp_test_conf_kill")
-
-    with engine.connect() as conn:
-        row = conn.execute(text(
-            "SELECT status, kill_reason FROM discovered_hypotheses WHERE id = 'hyp_test_conf_kill'"
-        )).fetchone()
-
-    assert row[0] == "invalidated"
-    assert row[1] == "CONFIDENCE_COLLAPSED"
-
-
-def test_antithesis_confirmed_kills_thesis(engine):
-    """When antithesis is confirmed, parent thesis gets ANTITHESIS_CONFIRMED kill."""
-    gen = HypothesisGenerator(engine)
-    thesis_id = "hyp_test_anti_kill_parent"
+def _insert_pair(engine, thesis_id: str, days_ago: int = 60) -> str:
     anti_id = thesis_id + "_anti"
-
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM discovered_hypotheses WHERE id IN (:t, :a)"),
                      {"t": thesis_id, "a": anti_id})
         conn.execute(text("DELETE FROM hypothesis_postmortems WHERE hypothesis_id IN (:t, :a)"),
                      {"t": thesis_id, "a": anti_id})
-        # Insert thesis
-        conn.execute(text("""
-            INSERT INTO discovered_hypotheses
-                (id, thesis, pattern_type, evidence, test_criteria,
-                 invalidation, confidence, status, role, pair_id, created_at)
-            VALUES
-                (:tid, 'Parent thesis', 'convergence', '[]'::jsonb,
-                 :criteria_bull,
-                 'test', 0.7, 'active', 'thesis', :tid, NOW() - INTERVAL '20 days')
-        """), {"tid": thesis_id,
-               "criteria_bull": json.dumps({"ticker": "TEST", "expected_direction": "bullish",
-                                            "window_days": 14, "min_move_pct": 2.0})})
-        # Insert antithesis — already confirmed
-        conn.execute(text("""
-            INSERT INTO discovered_hypotheses
-                (id, thesis, pattern_type, evidence, test_criteria,
-                 invalidation, confidence, status, role, pair_id, created_at)
-            VALUES
-                (:aid, 'Antithesis', 'convergence', '[]'::jsonb,
-                 :criteria_bear,
-                 'test', 0.8, 'confirmed', 'antithesis', :tid, NOW() - INTERVAL '20 days')
-        """), {"aid": anti_id, "tid": thesis_id,
-               "criteria_bear": json.dumps({"ticker": "TEST", "expected_direction": "bearish",
-                                            "window_days": 14, "min_move_pct": 2.0})})
+        for hid, role, thesis, direction in (
+            (thesis_id, "thesis", "Parent thesis", "bullish"),
+            (anti_id, "antithesis", "ANTITHESIS: misleading", "bearish"),
+        ):
+            conn.execute(text("""
+                INSERT INTO discovered_hypotheses
+                    (id, thesis, pattern_type, evidence, test_criteria,
+                     invalidation, confidence, status, role, pair_id, created_at)
+                VALUES
+                    (:id, :thesis, 'convergence', '[]'::jsonb, :criteria,
+                     'test', 0.5, 'active', :role, :pair, NOW() - make_interval(days => :days))
+            """), {"id": hid, "thesis": thesis, "role": role, "pair": thesis_id, "days": days_ago,
+                   "criteria": json.dumps({"ticker": "TEST", "expected_direction": direction,
+                                           "window_days": 14, "min_move_pct": 2.0})})
+    return anti_id
 
-    gen.score_hypothesis(thesis_id)
 
+def test_single_row_scoring_never_writes_a_verdict(engine):
+    """score_hypothesis defers to the ledgered batch: the row is untouched."""
+    thesis_id = "hyp_test_v2_defer"
+    _insert_pair(engine, thesis_id)
+    result = HypothesisGenerator(engine).score_hypothesis(thesis_id)
+    assert result["outcome"] == "deferred"
     with engine.connect() as conn:
         row = conn.execute(text(
-            "SELECT status, kill_reason FROM discovered_hypotheses WHERE id = :id"
+            "SELECT status, times_tested, kill_reason FROM discovered_hypotheses WHERE id = :id"
         ), {"id": thesis_id}).fetchone()
-
-    assert row[0] == "invalidated"
-    assert row[1] == "ANTITHESIS_CONFIRMED"
+    assert tuple(row) == ("active", 0, None)
 
 
-def test_postmortem_records_full_context(engine):
-    """Postmortem captures thesis text, antithesis text, lifespan, and evidence."""
-    gen = HypothesisGenerator(engine)
-    hyp = Hypothesis(
-        id="hyp_test_pm_context",
-        thesis="Postmortem context test thesis",
-        pattern_type="convergence",
-        evidence=[{"ticker": "PMT", "direction": "bullish"}],
-        test_criteria={"ticker": "PMT", "expected_direction": "bullish",
-                       "window_days": 5, "min_move_pct": 2.0},
-        invalidation="test",
-        confidence=0.6,
-    )
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM discovered_hypotheses WHERE id = 'hyp_test_pm_context' OR pair_id = 'hyp_test_pm_context'"))
-        conn.execute(text("DELETE FROM hypothesis_postmortems WHERE hypothesis_id = 'hyp_test_pm_context'"))
+def test_confirmed_thesis_kills_its_antithesis(engine):
+    from intelligence import hypothesis_trials
 
-    gen._store_hypothesis(hyp)
+    hypothesis_trials.ensure_trial_columns(engine)
+    thesis_id = "hyp_test_v2_anti_kill"
+    anti_id = _insert_pair(engine, thesis_id)
+    rec = _ledgered([{"hypothesis_id": thesis_id, "status": "tested", "p_value": 0.0001}])
+    counts = hypothesis_trials.apply_verdicts(engine, rec["record"], rec["sha256"])
+    assert counts["confirmed"] == 1
+    with engine.connect() as conn:
+        rows = dict(conn.execute(text(
+            "SELECT id, status || ':' || COALESCE(kill_reason, '') FROM discovered_hypotheses "
+            "WHERE id IN (:t, :a)"
+        ), {"t": thesis_id, "a": anti_id}).fetchall())
+        sha = conn.execute(text(
+            "SELECT trial_ledger_sha256 FROM discovered_hypotheses WHERE id = :t"
+        ), {"t": thesis_id}).scalar()
+    assert rows[thesis_id] == "confirmed:"
+    assert rows[anti_id] == "invalidated:ANTITHESIS_CONFIRMED"
+    assert sha == rec["sha256"]
 
-    # Backdate to 15 days ago (2x 5-day window = 10, so 15 > 10 → EXPIRED)
-    with engine.begin() as conn:
-        conn.execute(text(
-            "UPDATE discovered_hypotheses SET created_at = NOW() - INTERVAL '15 days' "
-            "WHERE id = 'hyp_test_pm_context'"
-        ))
 
-    gen.score_hypothesis("hyp_test_pm_context")
+def test_invalidated_trial_writes_postmortem_with_context(engine):
+    from intelligence import hypothesis_trials
 
+    hypothesis_trials.ensure_trial_columns(engine)
+    thesis_id = "hyp_test_v2_pm_context"
+    _insert_pair(engine, thesis_id, days_ago=30)
+    rec = _ledgered([{"hypothesis_id": thesis_id, "status": "tested", "p_value": 0.7}])
+    hypothesis_trials.apply_verdicts(engine, rec["record"], rec["sha256"])
     with engine.connect() as conn:
         pm = conn.execute(text(
-            "SELECT hypothesis_id, kill_reason, thesis_text, antithesis_text, "
-            "confidence_at_death, lifespan_days "
-            "FROM hypothesis_postmortems WHERE hypothesis_id = 'hyp_test_pm_context' "
-            "ORDER BY created_at DESC LIMIT 1"
-        )).fetchone()
+            "SELECT kill_reason, thesis_text, antithesis_text, lifespan_days "
+            "FROM hypothesis_postmortems WHERE hypothesis_id = :id"
+        ), {"id": thesis_id}).fetchone()
+    assert pm is not None
+    assert pm[0] == "NOT_SIGNIFICANT"
+    assert pm[1] == "Parent thesis"
+    assert "ANTITHESIS" in pm[2]
+    assert pm[3] >= 30
 
-    assert pm is not None, "Postmortem should have been created"
-    assert pm[0] == "hyp_test_pm_context"
-    assert pm[1] == "EXPIRED"
-    assert pm[2] is not None and len(pm[2]) > 0  # thesis_text
-    assert pm[3] is not None and "ANTITHESIS" in pm[3]  # antithesis_text
-    assert pm[4] is not None  # confidence_at_death
-    assert pm[5] >= 15  # lifespan_days
+
+def test_apply_verdicts_is_idempotent(engine):
+    from intelligence import hypothesis_trials
+
+    hypothesis_trials.ensure_trial_columns(engine)
+    thesis_id = "hyp_test_v2_idempotent"
+    _insert_pair(engine, thesis_id)
+    rec = _ledgered([{"hypothesis_id": thesis_id, "status": "untestable", "p_value": 1.0,
+                      "reason": "NO_DATA"}])
+    first = hypothesis_trials.apply_verdicts(engine, rec["record"], rec["sha256"])
+    second = hypothesis_trials.apply_verdicts(engine, rec["record"], rec["sha256"])
+    assert first["expired"] == 1 and second["unchanged"] == 1
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, kill_reason, times_tested FROM discovered_hypotheses WHERE id = :id"
+        ), {"id": thesis_id}).fetchone()
+    assert tuple(row) == ("expired", "NO_DATA", 1)
 
 
 def test_stats_include_kill_breakdown(engine):
@@ -419,8 +315,14 @@ def test_intelligence_kills_none_by_default(engine):
 
 
 def test_kill_taxonomy_complete():
-    """All 14 kill reasons have human-readable descriptions."""
-    assert len(KILL_REASONS) == 14
+    """All 21 kill reasons (14 v1 + 7 v2 trial reasons) have descriptions."""
+    from intelligence import hypothesis_trials as ht
+
+    assert len(KILL_REASONS) == 21
+    for reason in (ht.SELF_TELEMETRY, ht.NO_MARKET_OUTCOME, ht.NO_DIRECTION,
+                   ht.UNSUPPORTED_INSTRUMENT, ht.NO_DATA, ht.INSUFFICIENT_HISTORY,
+                   ht.NOT_SIGNIFICANT):
+        assert reason in KILL_REASONS
     for reason, desc in KILL_REASONS.items():
         assert isinstance(desc, str)
         assert len(desc) > 10, f"Kill reason {reason} has too-short description"

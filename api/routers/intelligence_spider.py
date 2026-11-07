@@ -74,12 +74,26 @@ def _full_load_limits() -> tuple[int | None, int | None]:
 
 
 def _refresh_interval_seconds() -> int:
-    """How often the background refresher reloads the graph from DB.
+    """Longest the in-memory graph may go without a reload (backstop).
 
-    Default 900s (15 min) keeps the in-memory graph fresh after each
-    bounded spider run without hammering Postgres.
+    The hourly spider oneshot already POSTs /spider/graph/reload after each
+    run, so this is only a backstop for writes made outside the spider. A
+    reload takes ~20 s of GIL-contended work inside grid-api (measured
+    2026-11-07: every other thread waits ~5 ms extra per wakeup, worst
+    ~0.7 s), so the old 15-minute default meant ~6 reloads an hour.
     """
-    return int(os.getenv("GRID_SPIDER_GRAPH_REFRESH_SEC", "900"))
+    return int(os.getenv("GRID_SPIDER_GRAPH_REFRESH_SEC", "3600"))
+
+
+def _seconds_until_refresh(now: float, loaded_at: float | None, interval: int) -> float:
+    """Wait before the next backstop reload, counted from the LAST reload.
+
+    A reload triggered by the spider (or the admin endpoint) pushes the
+    backstop out, so the timer never reloads a graph that was just loaded.
+    """
+    if loaded_at is None:
+        return 0.0
+    return max(0.0, loaded_at + interval - now)
 
 
 def _load_stats_graph_from_db(engine):
@@ -220,16 +234,21 @@ def warm_graph_async() -> threading.Thread:
             _get_or_load_graph(engine)
         except Exception as exc:  # noqa: BLE001
             log.warning("Spider bridge: warmup load raised: {e}", e=str(exc))
-        # Periodic refresh
+        # Backstop refresh, counted from the last reload of any kind.
         interval = _refresh_interval_seconds()
         if interval <= 0:
             return
         while True:
-            time.sleep(interval)
+            wait = _seconds_until_refresh(time.time(), _graph_loaded_at, interval)
+            if wait > 0:
+                time.sleep(wait)
+                continue  # a reload may have happened meanwhile: recompute
             try:
                 refresh_graph(engine)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Spider bridge: periodic refresh raised: {e}", e=str(exc))
+            if _graph_loaded_at is None or time.time() - _graph_loaded_at >= interval:
+                time.sleep(interval)  # failed reload: don't spin
 
     t = threading.Thread(target=_run, name="spider-graph-warmer", daemon=True)
     t.start()

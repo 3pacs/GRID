@@ -1591,6 +1591,7 @@ def _fire_background_investigation(question: str, ticker: str | None) -> None:
                     "ticker": ticker,
                     "question": _safe_question,
                 }],
+                origin="chat",  # a user question, never a queued lead
             )
             sleuth.investigate_lead(lead)
             log.debug("Background research investigation completed for: {q}", q=_safe_question[:80])
@@ -1654,6 +1655,7 @@ def _research_chain(question: str, ticker: str | None) -> tuple[str, str]:
                     "ticker": ticker,
                     "question": _safe_question,
                 }],
+                origin="chat",  # a user question, never a queued lead
             )
             investigated = sleuth.investigate_lead(lead)
             if (

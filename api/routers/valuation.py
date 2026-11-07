@@ -446,7 +446,9 @@ def catalyst_timeline(
         # ── 4. Active Hypotheses ──
         try:
             hyp_rows = conn.execute(text("""
-                SELECT id, thesis, role, confidence, invalidation, status,
+                SELECT id, thesis, role, confidence, invalidation,
+                       CASE WHEN status IN ('confirmed', 'invalidated') AND scoring_version IS NULL
+                            THEN 'legacy_v1_unsound' ELSE status END AS status,
                        kill_reason, pattern_type, times_tested, times_correct,
                        created_at
                 FROM discovered_hypotheses
