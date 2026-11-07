@@ -20,6 +20,12 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from api.dependencies import get_db_engine
+from intelligence.actor_identity import (
+    is_placeholder_ticker,
+    looks_like_identifier,
+    ticker_actor_id,
+    ticker_actor_name,
+)
 
 
 # These enrichment passes scan signal_data (152K+ rows) with DISTINCT
@@ -50,14 +56,78 @@ def _lift_statement_timeout(conn) -> None:
 
 
 def _ensure_actor(conn, actor_id: str, name: str, category: str, tier: str = "individual"):
-    """Upsert an actor into the actors table."""
+    """Upsert an actor into the actors table.
+
+    An existing actor keeps its name: this pass only knows a placeholder
+    (``"AAPL Corp"``) or the feed's spelling, and overwriting reverted every
+    curated or security-master name on the next daily run. A blank name, or one
+    that is just the id, is still filled in.
+    """
     conn.execute(text("""
         INSERT INTO actors (id, name, tier, category, influence_score, trust_score, source, updated_at)
         VALUES (:id, :name, :tier, :cat, 0.5, 0.5, 'signal_enrichment', NOW())
         ON CONFLICT (id) DO UPDATE SET
-            name = EXCLUDED.name,
+            name = CASE
+                WHEN actors.name IS NULL OR btrim(actors.name) = '' OR actors.name = actors.id
+                THEN EXCLUDED.name
+                ELSE actors.name
+            END,
             updated_at = NOW()
     """), {"id": actor_id, "name": name, "tier": tier, "cat": category})
+
+
+# ticker -> issuer name for tickers that exactly one security_master entity
+# holds today; loaded once per process (``None`` = not loaded yet).
+_company_names: dict[str, str] | None = None
+
+
+def _load_company_names(conn) -> dict[str, str]:
+    """Unambiguous current ticker -> issuer name from ``security_master``.
+
+    Empty when the security-master tables are absent, so the caller falls back
+    to the ``"<TICKER> Corp"`` placeholder. The existence check runs first so a
+    missing table never aborts the caller's transaction.
+    """
+    present = conn.execute(text(
+        "SELECT to_regclass('security_identifiers') IS NOT NULL "
+        "AND to_regclass('security_master') IS NOT NULL"
+    )).scalar()
+    if not present:
+        log.warning("enrich_connections: security_master tables absent, new corp actors keep placeholder names")
+        return {}
+    rows = conn.execute(text("""
+        SELECT upper(si.id_value), min(sm.name)
+        FROM security_identifiers si
+        JOIN security_master sm ON sm.entity_id = si.entity_id
+        WHERE si.id_scheme = 'ticker' AND si.valid_to IS NULL
+          AND sm.name IS NOT NULL AND btrim(sm.name) <> ''
+        GROUP BY upper(si.id_value)
+        HAVING count(DISTINCT si.entity_id) = 1
+    """)).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _company_name(conn, ticker: str) -> str:
+    """Issuer name for a new ``corp_<TICKER>`` actor, else the placeholder."""
+    global _company_names
+    if _company_names is None:
+        _company_names = _load_company_names(conn)
+    return _company_names.get(ticker.strip().upper()) or ticker_actor_name(ticker)
+
+
+def _ensure_corp(conn, ticker: str) -> str:
+    """Ensure the ``corp_<TICKER>`` actor exists; returns its id."""
+    corp_id = ticker_actor_id(ticker)
+    _ensure_actor(conn, corp_id, _company_name(conn, ticker), "corporation", "institutional")
+    return corp_id
+
+
+def _skip_row(stats: dict, *, names: tuple = (), tickers: tuple = ()) -> bool:
+    """True (and counted) when a row names a feed id or a null-ish ticker."""
+    if any(looks_like_identifier(n) for n in names) or any(is_placeholder_ticker(t) for t in tickers):
+        stats["skipped_non_actor"] = stats.get("skipped_non_actor", 0) + 1
+        return True
+    return False
 
 
 def _upsert_connection(conn, actor_a: str, actor_b: str, relationship: str, strength: float):
@@ -108,11 +178,11 @@ def enrich_insider_connections(engine) -> dict:
         for row in rows:
             actor_name, ticker, direction, magnitude, signal_date, confidence = row
             actor_id = f"ins_{actor_name.lower().replace(' ', '_').replace('.', '')[:40]}"
-            corp_id = f"corp_{ticker.upper()}"
-
+            if _skip_row(stats, names=(actor_name,), tickers=(ticker,)):
+                continue
             # Ensure both actors exist
             _ensure_actor(conn, actor_id, actor_name, "insider")
-            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            corp_id = _ensure_corp(conn, ticker)
             stats["actors_created"] += 2
 
             # Insider → Company connection
@@ -138,8 +208,8 @@ def enrich_insider_connections(engine) -> dict:
             for t2 in tickers[i+1:]:
                 shared = ticker_insiders[t1] & ticker_insiders[t2]
                 if len(shared) >= 2:
-                    c1 = f"corp_{t1.upper()}"
-                    c2 = f"corp_{t2.upper()}"
+                    c1 = ticker_actor_id(t1)
+                    c2 = ticker_actor_id(t2)
                     _upsert_connection(conn, c1, c2, "co_traded_insider",
                                        min(0.9, 0.3 + 0.1 * len(shared)))
                     co_traded += 1
@@ -176,10 +246,10 @@ def enrich_congressional_connections(engine) -> dict:
         for row in rows:
             actor_name, ticker, direction, magnitude, signal_date, confidence = row
             actor_id = f"pol_{actor_name.lower().replace(' ', '_').replace('.', '')[:40]}"
-            corp_id = f"corp_{ticker.upper()}"
-
+            if _skip_row(stats, names=(actor_name,), tickers=(ticker,)):
+                continue
             _ensure_actor(conn, actor_id, actor_name, "politician")
-            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            corp_id = _ensure_corp(conn, ticker)
             stats["actors_created"] += 2
 
             strength = min(0.9, 0.5 + (float(magnitude or 0) / 1_000_000))
@@ -202,8 +272,8 @@ def enrich_congressional_connections(engine) -> dict:
             tickers_list = list(tickers)
             for i, t1 in enumerate(tickers_list):
                 for t2 in tickers_list[i+1:]:
-                    c1 = f"corp_{t1.upper()}"
-                    c2 = f"corp_{t2.upper()}"
+                    c1 = ticker_actor_id(t1)
+                    c2 = ticker_actor_id(t2)
                     _upsert_connection(conn, c1, c2, "co_traded_congress",
                                        min(0.8, 0.3 + 0.05 * len(tickers)))
                     co_traded += 1
@@ -254,13 +324,14 @@ def enrich_gov_contracts(engine) -> dict:
 
         for row in rows:
             ticker, amount_str, agency, signal_date = row
-            corp_id = f"corp_{ticker.upper()}"
+            if _skip_row(stats, tickers=(ticker,)):
+                continue
             try:
                 amount = float(amount_str) if amount_str else 0
             except (ValueError, TypeError):
                 amount = 0
 
-            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            corp_id = _ensure_corp(conn, ticker)
 
             if agency and agency.strip():
                 agency_clean = agency.strip()[:60]
@@ -320,13 +391,12 @@ def enrich_lobbying(engine) -> dict:
 
         for row in rows:
             ticker, client, amount_str = row
-            if not client:
+            if not client or _skip_row(stats, names=(client,), tickers=(ticker,)):
                 continue
 
-            corp_id = f"corp_{ticker.upper()}"
             lobby_id = f"lobby_{client.lower().replace(' ', '_')[:40]}"
 
-            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            corp_id = _ensure_corp(conn, ticker)
             _ensure_actor(conn, lobby_id, client, "lobbying_firm", "institutional")
 
             amount = float(amount_str) if amount_str else 0
@@ -377,6 +447,8 @@ def enrich_insider_clusters(engine) -> dict:
         seen_pairs: set[str] = set()
         for row in rows:
             actor1, actor2, ticker, co_trades, min_gap = row
+            if _skip_row(stats, names=(actor1, actor2)):
+                continue
             a1_id = f"ins_{actor1.lower().replace(' ', '_').replace('.', '')[:40]}"
             a2_id = f"ins_{actor2.lower().replace(' ', '_').replace('.', '')[:40]}"
             pair_key = f"{a1_id}:{a2_id}"
@@ -419,6 +491,8 @@ def enrich_fara_foreign_lobbying(engine) -> dict:
 
         for row in rows:
             actor_name, ticker, principal, amount_str, signal_date = row
+            if _skip_row(stats, names=(actor_name,)):
+                continue
             lobby_id = f"fara_{actor_name.lower().replace(' ', '_').replace('.', '')[:40]}"
             _ensure_actor(conn, lobby_id, actor_name, "foreign_agent", "institutional")
 
@@ -429,9 +503,8 @@ def enrich_fara_foreign_lobbying(engine) -> dict:
                 _upsert_connection(conn, principal_id, lobby_id, "foreign_lobbying", 0.7)
                 stats["connections"] += 1
 
-            if ticker and ticker.strip():
-                corp_id = f"corp_{ticker.upper()}"
-                _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            if not is_placeholder_ticker(ticker):
+                corp_id = _ensure_corp(conn, ticker)
                 _upsert_connection(conn, lobby_id, corp_id, "lobbying_influence", 0.5)
                 stats["connections"] += 1
 
@@ -476,6 +549,8 @@ def enrich_darkpool_signals(engine) -> dict:
         ticker_activity: dict[str, float] = defaultdict(float)
         for row in rows:
             ticker, magnitude, _, _ = row
+            if _skip_row(stats, tickers=(ticker,)):
+                continue
             ticker_activity[ticker] += float(magnitude or 0)
 
         # Top dark pool tickers → connect to "dark pool" actor
@@ -483,8 +558,7 @@ def enrich_darkpool_signals(engine) -> dict:
         _ensure_actor(conn, dp_id, "Dark Pool Flow", "institutional", "institutional")
 
         for ticker, total_volume in sorted(ticker_activity.items(), key=lambda x: -x[1])[:200]:
-            corp_id = f"corp_{ticker.upper()}"
-            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            corp_id = _ensure_corp(conn, ticker)
             strength = min(0.8, 0.2 + total_volume / 1e10)
             _upsert_connection(conn, dp_id, corp_id, "darkpool_activity", strength)
             stats["connections"] += 1
@@ -521,10 +595,10 @@ def enrich_institutional_flows(engine) -> dict:
         for row in rows:
             actor_name, ticker, direction, magnitude, signal_date, confidence = row
             fund_id = f"fund_{actor_name.lower().replace(' ', '_').replace('.', '')[:40]}"
-            corp_id = f"corp_{ticker.upper()}"
-
+            if _skip_row(stats, names=(actor_name,), tickers=(ticker,)):
+                continue
             _ensure_actor(conn, fund_id, actor_name, "fund", "institutional")
-            _ensure_actor(conn, corp_id, f"{ticker.upper()} Corp", "corporation", "institutional")
+            corp_id = _ensure_corp(conn, ticker)
 
             amount = float(magnitude or 0)
             strength = min(0.8, 0.3 + amount / 1e9)
@@ -599,6 +673,8 @@ def enrich_congress_insider_overlap(engine) -> dict:
 
         for row in rows:
             congress_member, insider_name, ticker, co_trades = row
+            if _skip_row(stats, names=(congress_member, insider_name)):
+                continue
             pol_id = f"pol_{congress_member.lower().replace(' ', '_').replace('.', '')[:40]}"
             ins_id = f"ins_{insider_name.lower().replace(' ', '_').replace('.', '')[:40]}"
 
