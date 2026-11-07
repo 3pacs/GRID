@@ -723,6 +723,7 @@ def evaluate_batch(
     ledger: Any,
     evaluated_at: datetime | None = None,
     limit: int = 10000,
+    max_trials: int | None = None,
     max_runtime_s: float | None = None,
 ) -> dict:
     """Plan and run every matured active hypothesis's one look. Read-only.
@@ -730,6 +731,10 @@ def evaluate_batch(
     Returns ``{"trials": [...], "pending": n, ...}``; nothing is recorded.
     Hypotheses already tested in ``ledger`` are skipped, and so are testable
     ticker-move plans while ``TICKER_MOVE_HELD`` (counted, never declared).
+    ``limit`` caps the active rows scanned (oldest first); ``max_trials`` caps
+    the trials declared. Pending rows stay active and keep their place at the
+    head of the queue, so a batch capped by rows scanned would stall behind
+    them (2026-11-07: 132 lead-lag rows pending until 2027 held 124 of 200).
     """
     from analysis.ledger_steered_exploration import hypothesis_batch_trials
 
@@ -740,9 +745,12 @@ def evaluate_batch(
         rows = conn.execute(_ACTIVE_SQL, {"limit": limit}).fetchall()
         trials: list[dict] = []
         pending = skipped_seen = held_ticker_move = 0
-        timed_out = False
+        timed_out = capped = False
         cache: dict[str, Any] = {}
         for hid, ptype, criteria, created, tested, thesis_direction in rows:
+            if max_trials is not None and len(trials) >= max_trials:
+                capped = True
+                break
             if max_runtime_s is not None and time.monotonic() - started >= max_runtime_s:
                 timed_out = True
                 break
@@ -781,6 +789,7 @@ def evaluate_batch(
         "skipped_already_ledgered": skipped_seen,
         "held_ticker_move": held_ticker_move,
         "timed_out": timed_out,
+        "capped": capped,
     }
 
 
@@ -790,6 +799,7 @@ def score_batch(
     ledger: Any | None = None,
     evaluated_at: datetime | None = None,
     limit: int = 10000,
+    max_trials: int | None = None,
     max_runtime_s: float | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -810,7 +820,7 @@ def score_batch(
         ledger = dry_run_ledger()
     replayed = {} if dry_run else _replay_unapplied(engine, ledger)
     batch = evaluate_batch(engine, ledger=ledger, evaluated_at=evaluated_at,
-                           limit=limit, max_runtime_s=max_runtime_s)
+                           limit=limit, max_trials=max_trials, max_runtime_s=max_runtime_s)
     out = {k: v for k, v in batch.items() if k != "trials"}
     out.update({"scorer_version": SCORER_VERSION, "dry_run": dry_run, "replayed": replayed,
                 "declared": len(batch["trials"])})

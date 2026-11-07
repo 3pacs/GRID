@@ -1899,8 +1899,9 @@ def score_due_active_hypotheses(
     S11 trial ledger's file lock: each matured hypothesis gets one point-in-time
     holdout look, GRID telemetry is ineligible, BH runs over the batch, and the
     batch is appended to the ledger before any row changes. ``batch_size``
-    caps the active rows scanned (oldest first); ``max_runtime_s`` stops the
-    scan early, and the trials planned so far still form the batch.
+    caps the trials declared; every active row is scanned oldest first, so rows
+    still pending (they stay active) never use up the batch. ``max_runtime_s``
+    stops the scan early, and the trials planned so far still form the batch.
 
     Wired into the hermes operator at a 30-minute cadence (see
     ``scripts/hermes_operator.py``). Writes nothing while
@@ -1934,7 +1935,7 @@ def score_due_active_hypotheses(
     try:
         with hypothesis_trials.open_trial_ledger() as ledger:
             result = hypothesis_trials.score_batch(
-                engine, ledger=ledger, limit=batch_size, max_runtime_s=max_runtime_s,
+                engine, ledger=ledger, max_trials=batch_size, max_runtime_s=max_runtime_s,
             )
     except hypothesis_trials.TrialLedgerNotConfigured as exc:
         counts["errors"] += 1
@@ -1956,6 +1957,7 @@ def score_due_active_hypotheses(
         "expired": verdicts.get("expired", 0),
         "pending": result.get("pending", 0),
         "timed_out": bool(result.get("timed_out")),
+        "capped": bool(result.get("capped")),
         "scorer_version": result.get("scorer_version"),
         "record_sha256": result.get("record_sha256"),
         "applied": result.get("applied"),
