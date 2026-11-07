@@ -48,6 +48,12 @@ _FREIGHTOS_URL: str = "https://terminal.freightos.com/api/v1/indexes"
 _FREIGHTOS_HISTORICAL_URL: str = (
     "https://terminal.freightos.com/api/v1/indexes/history"
 )
+# Both Freightos URLs now 301 to a www.freightos.com sales page (checked from
+# grid-svr 2026-11-07), and neither has ever written a row to raw_series. Each
+# run made 6 historical calls, logged 6 "parse failed" warnings and marked the
+# whole supply-chain pull partial. Drewry's container_index (USD/FEU, weekly)
+# is the live container-freight series. Set False only for a working endpoint.
+_FREIGHTOS_RETIRED: bool = True
 
 # Drewry World Container Index — public page
 _DREWRY_URL: str = "https://www.drewry.co.uk/supply-chain-advisors/supply-chain-expertise/world-container-index-assessed-by-drewry"
@@ -142,7 +148,7 @@ class SupplyChainPuller(BasePuller):
         """
         self.fred_api_key = fred_api_key or api_key
         super().__init__(db_engine)
-        fred_status = "set" if fred_api_key else "missing"
+        fred_status = "set" if self.fred_api_key else "missing"
         log.info(
             "SupplyChainPuller initialised — source_id={sid}, fred_key={fk}",
             sid=self.source_id,
@@ -796,17 +802,20 @@ class SupplyChainPuller(BasePuller):
 
         results: list[dict[str, Any]] = []
 
-        # 1. Freightos Baltic Index
-        try:
-            fbx_result = self._pull_freightos(start_date)
-            results.append(fbx_result)
-        except Exception as exc:
-            log.error("SupplyChain: Freightos pull failed: {e}", e=str(exc))
-            results.append({
-                "source": "freightos",
-                "status": "FAILED",
-                "error": str(exc),
-            })
+        # 1. Freightos Baltic Index (retired: see _FREIGHTOS_RETIRED)
+        if _FREIGHTOS_RETIRED:
+            log.debug("SupplyChain: Freightos retired (public API gone) — not called")
+        else:
+            try:
+                fbx_result = self._pull_freightos(start_date)
+                results.append(fbx_result)
+            except Exception as exc:
+                log.error("SupplyChain: Freightos pull failed: {e}", e=str(exc))
+                results.append({
+                    "source": "freightos",
+                    "status": "FAILED",
+                    "error": str(exc),
+                })
 
         # 2. Drewry World Container Index
         try:
