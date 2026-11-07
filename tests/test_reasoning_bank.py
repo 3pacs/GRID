@@ -24,7 +24,6 @@ from intelligence.reasoning_bank import (
     write_reasoning_lesson,
 )
 
-
 # ── Fake engine plumbing ─────────────────────────────────────────────────
 
 
@@ -394,9 +393,12 @@ def test_default_overlap_keys_includes_required_fields() -> None:
 
 
 from intelligence.reasoning_bank import (  # noqa: E402  (intentional after fixture defs)
+    HONEST_LESSON_SOURCES,
+    HONEST_LESSONS_SINCE,
     MEMORY_LESSON_MULT_MAX,
     MEMORY_LESSON_MULT_MIN,
     memory_lesson_conviction_multiplier,
+    memory_lesson_evidence,
 )
 
 
@@ -426,28 +428,47 @@ def test_memory_lesson_multiplier_empty_bank_returns_neutral(monkeypatch: pytest
     assert mult == 1.0
 
 
-def test_memory_lesson_multiplier_all_success_caps_at_upper_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_retrieve(monkeypatch, [_mk_lesson("success") for _ in range(5)])
-    mult = memory_lesson_conviction_multiplier(
-        _FakeEngine(), fingerprint={"direction": "long"},
-    )
-    # Pure success ⇒ score = 1 ⇒ multiplier = 1 + 0.15 = 1.15 (upper bound)
-    assert mult == pytest.approx(MEMORY_LESSON_MULT_MAX, abs=1e-6)
+def test_memory_lesson_multiplier_one_sided_record_is_neutral(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Rule 2 (2026-11-07): no two-sided record, no adjustment. Before, a bank
+    # of only failures (1,019,551 of them in production) pinned every
+    # matching fingerprint at the 0.85 floor.
+    for outcome in ("success", "failure"):
+        _stub_retrieve(monkeypatch, [_mk_lesson(outcome) for _ in range(5)])
+        ev = memory_lesson_evidence(_FakeEngine(), fingerprint={"direction": "long"})
+        assert ev.multiplier == 1.0
+        assert ev.reason.startswith("one-sided record")
 
 
-def test_memory_lesson_multiplier_all_failure_caps_at_lower_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_retrieve(monkeypatch, [_mk_lesson("failure") for _ in range(5)])
-    mult = memory_lesson_conviction_multiplier(
-        _FakeEngine(), fingerprint={"direction": "long"},
-    )
-    # Pure failure ⇒ score = -1 ⇒ multiplier = 1 - 0.15 = 0.85 (lower bound)
-    assert mult == pytest.approx(MEMORY_LESSON_MULT_MIN, abs=1e-6)
+def test_memory_lesson_multiplier_mostly_wins_lifts_mostly_losses_cuts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_retrieve(monkeypatch, [_mk_lesson("success")] * 9 + [_mk_lesson("failure")] * 3)
+    up = memory_lesson_evidence(_FakeEngine(), fingerprint={"direction": "long"})
+    assert up.multiplier == pytest.approx(1.0 + 0.15 * 6 / 12, abs=1e-6)
+    assert up.reason == "record: 9 wins / 3 losses"
+    _stub_retrieve(monkeypatch, [_mk_lesson("success")] * 3 + [_mk_lesson("failure")] * 9)
+    down = memory_lesson_evidence(_FakeEngine(), fingerprint={"direction": "long"})
+    assert down.multiplier == pytest.approx(1.0 - 0.15 * 6 / 12, abs=1e-6)
+
+
+def test_memory_lesson_multiplier_counts_only_honest_lessons(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Rules 1 and 3: retrieval asks for lessons since HONEST_LESSONS_SINCE,
+    # written by the verdict scorer or the oracle's contrast distillation.
+    seen: dict[str, Any] = {}
+
+    def _capture(*_a: Any, **k: Any) -> list[ReasoningLesson]:
+        seen.update(k)
+        return []
+
+    monkeypatch.setattr("intelligence.reasoning_bank.retrieve_lessons", _capture)
+    ev = memory_lesson_evidence(_FakeEngine(), fingerprint={"direction": "long"})
+    assert seen["since"] == HONEST_LESSONS_SINCE
+    assert seen["source_types"] == HONEST_LESSON_SOURCES == ("oracle_verdict", "oracle_contrast")
+    assert (ev.multiplier, ev.reason) == (1.0, "no lessons since 2026-11-07")
 
 
 def test_memory_lesson_multiplier_balanced_returns_neutral(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_retrieve(
         monkeypatch,
-        [_mk_lesson("success"), _mk_lesson("failure")],
+        [_mk_lesson("success")] * 3 + [_mk_lesson("failure")] * 3,
     )
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(), fingerprint={"direction": "long"},
@@ -457,14 +478,18 @@ def test_memory_lesson_multiplier_balanced_returns_neutral(monkeypatch: pytest.M
 
 
 def test_memory_lesson_multiplier_neutral_lessons_apply_mild_haircut(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Neutral lessons alone are not a record (neutral); beside a two-sided
+    # one they are a mild haircut.
     _stub_retrieve(monkeypatch, [_mk_lesson("neutral") for _ in range(4)])
+    assert memory_lesson_conviction_multiplier(_FakeEngine(), fingerprint={"direction": "long"}) == 1.0
+    _stub_retrieve(monkeypatch, [_mk_lesson("success")] * 3 + [_mk_lesson("failure")] * 3
+                   + [_mk_lesson("neutral")] * 4)
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(), fingerprint={"direction": "long"},
     )
-    # All-neutral ⇒ score = -0.3 ⇒ multiplier = 1 - 0.045 = 0.955
-    assert mult < 1.0
-    assert mult > MEMORY_LESSON_MULT_MIN
-    assert mult == pytest.approx(1.0 - 0.15 * 0.3, abs=1e-6)
+    # score = (3 - 3 - 0.3 * 4) / 10 = -0.12 ⇒ multiplier = 1 - 0.018
+    assert MEMORY_LESSON_MULT_MIN < mult < 1.0
+    assert mult == pytest.approx(1.0 - 0.15 * 0.12, abs=1e-6)
 
 
 def test_memory_lesson_multiplier_filters_direction_when_required(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -483,14 +508,14 @@ def test_memory_lesson_multiplier_filters_direction_when_required(monkeypatch: p
 def test_memory_lesson_multiplier_includes_all_when_match_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_retrieve(
         monkeypatch,
-        [_mk_lesson("success", direction="short") for _ in range(3)],
+        [_mk_lesson("success", direction="short")] * 6 + [_mk_lesson("failure", direction="short")] * 3,
     )
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(),
         fingerprint={"direction": "long"},
         require_direction_match=False,
     )
-    assert mult == pytest.approx(MEMORY_LESSON_MULT_MAX, abs=1e-6)
+    assert mult == pytest.approx(1.0 + 0.15 * 3 / 9, abs=1e-6)
 
 
 def test_memory_lesson_multiplier_defensive_on_retrieve_exception(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -521,13 +546,12 @@ def test_memory_lesson_multiplier_no_direction_in_fingerprint_skips_filter(
 ) -> None:
     _stub_retrieve(
         monkeypatch,
-        [_mk_lesson("failure", direction="short") for _ in range(2)],
+        [_mk_lesson("failure", direction="short")] * 9 + [_mk_lesson("success", direction="long")] * 3,
     )
-    # No 'direction' in fingerprint ⇒ filter no-ops, both lessons counted.
-    mult = memory_lesson_conviction_multiplier(
-        _FakeEngine(), fingerprint={"ticker": "TSM"},
-    )
-    assert mult == pytest.approx(MEMORY_LESSON_MULT_MIN, abs=1e-6)
+    # No 'direction' in fingerprint ⇒ filter no-ops, every lesson counted.
+    ev = memory_lesson_evidence(_FakeEngine(), fingerprint={"ticker": "TSM"})
+    assert (ev.wins, ev.losses) == (3, 9)
+    assert ev.multiplier == pytest.approx(1.0 - 0.15 * 6 / 12, abs=1e-6)
 
 
 # ── Integration (skipped unless real PG is reachable) ────────────────────

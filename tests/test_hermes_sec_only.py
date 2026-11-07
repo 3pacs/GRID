@@ -576,7 +576,12 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # claude/sleuth-dispatch-enable-20261107): sleuth_dispatch moves from
         # DAILY_INTEL_HOLD_REASONS to DAILY_INTEL_INITIAL_ALLOWLIST (owner
         # approval). Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','d7da3448dbc2d8f55e9d665a032c689582dbfb89a6f5d29fc3eed00647f4fe9c'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
+        # OPER re-pinned d7da3448 -> 59d5cee2 (2026-11-07,
+        # claude/honest-lessons-20261107): postmortem_batch moves from
+        # DAILY_INTEL_HOLD_REASONS to DAILY_INTEL_INITIAL_ALLOWLIST (owner
+        # approval; postmortems no longer write lessons). Needs reviewer
+        # acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

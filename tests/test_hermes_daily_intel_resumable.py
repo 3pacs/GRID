@@ -810,7 +810,7 @@ class TestDailyIntelAllowlistClassification:
         # postmortems that feed learning).
         expected_holds = {
             "hypothesis_discovery", "hypothesis_review", "backtest_scan",
-            "postmortem_batch", "options_improvement",
+            "options_improvement",
             "actor_research", "edgar_transcripts",
             # coordinator's initial-subset holds: non-idempotent audit
             # appends + priority_rank rewrite; delete-then-rebuild index
@@ -845,6 +845,8 @@ class TestDailyIntelAllowlistClassification:
             "fundamental_divergence", "holder_deal_overlap",
             # owner-approved 2026-11-07: intersection leads, dispatch only
             "sleuth_dispatch",
+            # owner-approved 2026-11-07: explains misses, writes no lessons
+            "postmortem_batch",
         }
         assert ho.DAILY_INTEL_INITIAL_ALLOWLIST == expected_allow
 
@@ -1161,7 +1163,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
-        DAILY_INTEL_HOLD_REASONS (8 allowed, 13 held) with every allow-listed
+        DAILY_INTEL_HOLD_REASONS (9 allowed, 12 held) with every allow-listed
         task's fn replaced by a no-op so no real DB/network is touched.
         Held tasks keep their real (never-called) fn."""
         calls: list[str] = []
@@ -1188,8 +1190,8 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         results: dict[str, Any] = {}
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
-        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 8
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 13
+        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 9
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 12
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -1198,9 +1200,9 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             if msg.startswith("daily_intel: period=") and "outcome" in kw
         )
         assert summary["outcome"] == "complete_for_enabled_tasks"
-        assert summary["n"] == 8
-        assert summary["d"] == 6, (
-            "6 of the 8 allow-listed tasks report plain 'done' — "
+        assert summary["n"] == 9
+        assert summary["d"] == 7, (
+            "7 of the 9 allow-listed tasks report plain 'done' — "
             "storage_maintenance_subagent and sleuth_dispatch are the "
             "exceptions (see below)"
         )
@@ -1213,7 +1215,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 13, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 12, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []
