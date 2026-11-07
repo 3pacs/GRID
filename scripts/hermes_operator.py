@@ -2121,11 +2121,9 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
     ),
     "hypothesis_discovery": (
         "learning write — HypothesisGenerator.auto_discover() "
-        "(intelligence/hypothesis_engine.py) inserts discovered_hypotheses. "
-        "Since generator v2 (2026-11-07) the scheduled declaration runs in "
-        "sleuth_dispatch (an intersection_baseline per saved lead, with a "
-        "BASELINE_CATCHUP_DAYS catch-up); this task would only repeat that "
-        "catch-up, so it stays held"
+        "(intelligence/hypothesis_engine.py) inserts/updates "
+        "discovered_hypotheses, hypothesis_postmortems and "
+        "hypothesis_boost_log directly"
     ),
     "hypothesis_review": (
         "learning write — review_existing_hypotheses "
