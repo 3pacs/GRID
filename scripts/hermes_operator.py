@@ -2056,6 +2056,11 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # cross-reference of 13F institutional holdings against capital_flows
     # acquisition announcements. No LLM.
     "holder_deal_overlap",
+    # intelligence/sleuth_intersections.py::generate_intersection_leads +
+    # one sleuth_investigate goal per new lead (dispatch, done_queued).
+    # Owner-approved 2026-11-07 ("go on the sleuth rebuild"); its declared
+    # hypotheses are v2 one-look trials in the S11 ledger (#1008, #1012).
+    "sleuth_dispatch",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -2123,13 +2128,6 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "(analysis/backtest_scanner.py) is LLM-gated (llm.router "
         "Tier.ORACLE sanity-checks winners) and inserts into "
         "hypothesis_registry via generate_hypotheses_from_winners"
-    ),
-    "sleuth_dispatch": (
-        "research write + dispatch -- generate_intersection_leads "
-        "(intelligence/sleuth_intersections.py) inserts investigation_leads "
-        "and queues sleuth_investigate goals whose handler declares "
-        "discovered_hypotheses rows (LLM-reviewed, Tier.ORACLE). Rebuilt "
-        "2026-11-07; enabling it is its own reviewed change"
     ),
     "postmortem_batch": (
         "postmortem write that feeds learning — batch_postmortem "
