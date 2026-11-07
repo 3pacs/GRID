@@ -92,6 +92,13 @@ MARKET_TICKER = "SPY"
 BENCHMARK_TICKERS = (MARKET_TICKER, "IWM")  # the market and the small-cap crowd (v3)
 BETA_LOOKBACK_SESSIONS = 252          # daily returns before creation the betas are fitted on
 MIN_BETA_SESSIONS = 120
+# Ticker-move trials are held (left active, unscored, not ledgered) until the
+# test is calibrated against the same-window cross-section. Read 2026-11-07,
+# 336 random US stocks over 2026-09-14..10-01: 71% fell short of SPY+IWM at
+# their fitted betas, and a "down" call on any of them reached p <= 0.10 19%
+# of the time (10% if calibrated). The one look is final, so none is spent on
+# a test that a crowd-wide move can pass. Lead-lag trials are unaffected.
+TICKER_MOVE_HELD = True
 DEFAULT_WINDOW_DAYS = 14
 DEFAULT_MIN_MOVE_PCT = 2.0
 NULL_LOOKBACK_DAYS = 365 * 5 + 30     # calendar days of pre-creation closes read for the null
@@ -686,7 +693,8 @@ def evaluate_batch(
     """Plan and run every matured active hypothesis's one look. Read-only.
 
     Returns ``{"trials": [...], "pending": n, ...}``; nothing is recorded.
-    Hypotheses already tested in ``ledger`` are skipped.
+    Hypotheses already tested in ``ledger`` are skipped, and so are testable
+    ticker-move plans while ``TICKER_MOVE_HELD`` (counted, never declared).
     """
     from analysis.ledger_steered_exploration import hypothesis_batch_trials
 
@@ -696,7 +704,7 @@ def evaluate_batch(
     with engine.connect() as conn:
         rows = conn.execute(_ACTIVE_SQL, {"limit": limit}).fetchall()
         trials: list[dict] = []
-        pending = skipped_seen = 0
+        pending = skipped_seen = held_ticker_move = 0
         timed_out = False
         cache: dict[str, Any] = {}
         for hid, ptype, criteria, created, tested, thesis_direction in rows:
@@ -707,6 +715,9 @@ def evaluate_batch(
                 skipped_seen += 1
                 continue
             plan = plan_trial(hid, ptype, criteria, created, tested, thesis_direction)
+            if TICKER_MOVE_HELD and plan.test_kind == "ticker_move" and plan.status is None:
+                held_ticker_move += 1
+                continue
             result = run_trial(plan, conn, evaluated_at, cache)
             if result.status == "pending":
                 if evaluated_at < plan.expires_at() or plan.status is not None:
@@ -733,6 +744,7 @@ def evaluate_batch(
         "trials": trials,
         "pending": pending,
         "skipped_already_ledgered": skipped_seen,
+        "held_ticker_move": held_ticker_move,
         "timed_out": timed_out,
     }
 

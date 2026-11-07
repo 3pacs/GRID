@@ -435,7 +435,32 @@ def _row(hid: str, ptype: str, criteria: dict, days_ago: float, tested: int = 0,
 CONV = {"ticker": "AAPL", "expected_direction": "up", "window_days": 14, "min_move_pct": 2.0}
 
 
-def test_dry_run_writes_nothing_and_applies_bh() -> None:
+@pytest.fixture
+def released(monkeypatch) -> None:
+    """Batch machinery as it runs once ticker-move trials are released."""
+    monkeypatch.setattr(ht, "TICKER_MOVE_HELD", False)
+
+
+def test_held_ticker_moves_stay_active_and_unledgered() -> None:
+    lead = {"watch_signal": "sig:insider_buy", "expect_signal": "sig:congress_trade",
+            "lag_days": 3, "expected_direction": "increases"}
+    rows = [
+        _row("conv", "convergence", CONV, 60),           # testable ticker move: held
+        _row("sleuth", "sleuth_intersection", {**CONV, "expected_direction": "down"}, 30),
+        _row("nodir", "convergence", {**CONV, "expected_direction": "opposite"}, 60),
+        _row("lead", "lead_lag", lead, 120),
+    ]
+    engine = _engine(rows)
+    with patch.object(ht, "load_completed_closes", side_effect=AssertionError("no price read")), \
+            patch.object(ht, "load_signal_series", return_value={}):
+        out = ht.score_batch(engine, dry_run=True, evaluated_at=NOW)
+    assert ht.TICKER_MOVE_HELD is True
+    assert out["held_ticker_move"] == 2
+    declared = {t["hypothesis_id"] for t in out["record"]["trials"]}
+    assert declared == {"nodir", "lead"}      # needs no price test / unaffected test kind
+
+
+def test_dry_run_writes_nothing_and_applies_bh(released: None) -> None:
     rows = [_row(f"c{i}", "convergence", CONV, 60) for i in range(10)] + [
         _row("cat", "volume_anomaly", {"watch_category": "x"}, 60),
     ]
@@ -457,7 +482,7 @@ def test_dry_run_writes_nothing_and_applies_bh() -> None:
     assert summary["confirmed_with_no_v1_look"] == 2
 
 
-def test_pending_rows_are_not_declared_until_they_expire() -> None:
+def test_pending_rows_are_not_declared_until_they_expire(released: None) -> None:
     rows = [
         _row("young", "convergence", CONV, 5),          # window still open
         _row("waiting", "convergence", CONV, 20),       # matured, closes missing, < 2x window
@@ -480,7 +505,7 @@ def test_already_ledgered_hypotheses_are_skipped() -> None:
     assert out["declared"] == 0 and out["skipped_already_ledgered"] == 1
 
 
-def test_unsupported_instrument_is_untestable() -> None:
+def test_unsupported_instrument_is_untestable(released: None) -> None:
     from evaluation.prices import UnsupportedInstrumentError
 
     engine = _engine([_row("btc", "convergence", {**CONV, "ticker": "BTC-USD"}, 60)])
