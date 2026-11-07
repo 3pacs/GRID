@@ -85,6 +85,8 @@ _ACTORS = [
     ("pep_1", "A Minister", "pep", "", 0.5, None, None, None, "unknown"),
     ("pep_2", "Another Minister", "pep", "", 0.5, None, None, None, "unknown"),
     ("donor_1", "A Donor", "donor", "", 0.5, None, None, None, "unknown"),
+    # junk row from an operator quarantine: opt-in, never in the market default
+    ("junk_1", "Junk Holder", "corporation_quarantined_20260928", "", 0.6, None, None, None, "unknown"),
 ]
 
 
@@ -140,7 +142,8 @@ def _seed(engine: Engine) -> None:
             "('NVDA', 'corp_NVDA', 'signal_linked', 0.3), "
             "('pep_1', 'pep_2', 'connected', 0.5), "
             "('donor_1', 'pep_1', 'connected', 0.5), "
-            "('icij_77', 'icij_entity_151138', 'icij_officer_of', 0.5)"
+            "('icij_77', 'icij_entity_151138', 'icij_officer_of', 0.5), "
+            "('junk_1', 'fed', 'connected', 0.9)"
         ))
         conn.execute(text(
             "INSERT INTO entity_relationships (actor_a, actor_b, relationship, strength, source_id) VALUES "
@@ -241,6 +244,9 @@ def test_overview_defaults_to_market_and_bulk_groups_are_opt_in(universe) -> Non
     assert {"pep_1", "pep_2"} <= {n["id"] for n in with_pep["nodes"]}
     everything = overview(engine, n=50, groups="all")
     assert "icij_entity_151138" in {n["id"] for n in everything["nodes"]}
+    assert "junk_1" in {n["id"] for n in everything["nodes"]}
+    quarantined = overview(engine, n=50, groups="market,quarantined")
+    assert "junk_1" in {n["id"] for n in quarantined["nodes"]}
 
     top2 = overview(engine, n=2)
     assert len(top2["nodes"]) == 2
@@ -304,6 +310,34 @@ def test_search_is_paginated_and_ranked(universe) -> None:
     assert exact["entries"][0]["id"] == "pelosi" and exact["entries"][0]["importance"] is not None
 
 
+def test_top_actors_default_to_market_and_bulk_groups_are_opt_in(universe) -> None:
+    from intelligence.actors.universe_store import top_actors
+
+    engine, _ = universe
+    res = top_actors(engine, metric="pagerank", limit=50)
+    assert res["groups"] == ["market"] and res["graph_version"]
+    assert {e["category_group"] for e in res["entries"]} == {"market"}
+    ids = [e["actor_id"] for e in res["entries"]]
+    assert "junk_1" not in ids and "icij_entity_151138" not in ids
+    scores = [e["score"] for e in res["entries"]]
+    assert scores == sorted(scores, reverse=True)
+    assert next(e for e in res["entries"] if e["actor_id"] == "pelosi")["name"] == "Nancy Pelosi"
+
+    everything = top_actors(engine, metric="degree_centrality", limit=50, groups="all")
+    assert {"junk_1", "icij_entity_151138", "pep_1"} <= {e["actor_id"] for e in everything["entries"]}
+    assert len(top_actors(engine, limit=2)["entries"]) == 2
+    with pytest.raises(ValueError):
+        top_actors(engine, metric="pagerank; DROP TABLE actors")
+
+
+def test_top_actors_without_a_run_is_pending(scratch: Engine) -> None:
+    from intelligence.actors.universe_store import top_actors
+
+    _migrate(scratch)
+    res = top_actors(scratch)
+    assert res["status"] == "pending_first_run" and res["entries"] == []
+
+
 def test_community_summaries_and_members(universe) -> None:
     from intelligence.actors.universe_store import community_members, community_summaries
 
@@ -336,6 +370,10 @@ def test_actor_network_endpoint_reads_the_precomputed_universe(universe, monkeyp
         assert built == [], "no legacy graph build when a universe run exists"
         comm = router.get_communities_endpoint(scope="full", limit=10, _token="t")
         assert comm["source"] == "actor_universe" and comm["communities"]
+        top = router.get_top_actors_endpoint(metric="pagerank", limit=20, scope="full",
+                                             groups=None, _token="t")
+        assert top["source"] == "actor_universe" and top["groups"] == ["market"]
+        assert top["actors"] and "junk_1" not in {a["actor_id"] for a in top["actors"]}
         ego = router.get_actor_universe_ego(actor_id="corp_NVDA", depth=1, fanout=25, max_nodes=50,
                                             include_offshore=True, include_external=True, _token="t")
         assert ego["center"] == "corp_NVDA" and len(ego["nodes"]) > 1

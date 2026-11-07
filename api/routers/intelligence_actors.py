@@ -579,17 +579,32 @@ def get_top_actors_endpoint(
     metric: str = Query("pagerank", description="Metric to rank by"),
     limit: int = Query(20, ge=1, le=200, description="Number of actors to return"),
     scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
+    groups: str | None = Query(
+        None, max_length=200,
+        description="Comma-separated category groups (default market; bulk groups and 'all' are opt-in)",
+    ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return top actors ranked by any analytics metric.
 
     Allowed metrics: pagerank, betweenness, eigenvector,
-    degree_centrality, hub_score, authority_score.
+    degree_centrality, hub_score, authority_score. With ``scope=full`` and a
+    completed actor-universe run, pagerank/betweenness/degree_centrality are
+    served from that run, limited to ``groups`` (market actors by default).
     """
     try:
         from store.graph import get_top_actors
 
         engine = get_db_engine()
+        if scope == "full":
+            from intelligence.actors.universe_store import TOP_METRIC_COLUMNS, top_actors
+
+            run = latest_universe_run(engine) if metric in TOP_METRIC_COLUMNS else None
+            if run is not None:
+                res = top_actors(engine, metric=metric, limit=limit, groups=groups, run=run)
+                return {"actors": res["entries"], "metric": metric, "count": len(res["entries"]),
+                        "scope": scope, "groups": res["groups"], "source": "actor_universe",
+                        "graph_version": res["graph_version"], "computed_at": res["computed_at"]}
         actors = get_top_actors(metric=metric, limit=limit, engine=engine, scope=scope)
         return {"actors": actors, "metric": metric, "count": len(actors), "scope": scope}
     except ValueError as exc:
