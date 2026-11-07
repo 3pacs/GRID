@@ -8,7 +8,7 @@ Write the labels (idempotent; a re-run inserts nothing)::
 
     python3 scripts/label_legacy_hypotheses.py --apply --decided-by "anik 2026-11-07"
 
-Needs migration ``hypothesis_registry_labels_20261107``. Existing registry rows
+Needs migration ``hyp_registry_labels_20261107``. Existing registry rows
 are never updated or deleted; see ``governance.hypothesis_labels``.
 """
 

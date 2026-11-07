@@ -157,7 +157,7 @@ seeds from active or trial-confirmed rows only.
 - `FAILED` 85 is shrunk: the weekly prune deleted FAILED rows > 180 days until
   #1005.
 
-`hypothesis_registry_labels` (migration `hypothesis_registry_labels_20261107`,
+`hypothesis_registry_labels` (migration `hyp_registry_labels_20261107`,
 append-only, UPDATE/DELETE/TRUNCATE refused) holds one label per row and
 `label_version`: `LEGACY_UNVALIDATED` (PASSED), `LEGACY_LLM_FLAGGED` and
 `LEGACY_INCONCLUSIVE` (TESTING). `scripts/label_legacy_hypotheses.py` writes

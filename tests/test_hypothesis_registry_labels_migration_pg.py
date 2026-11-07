@@ -1,4 +1,4 @@
-"""Real-PostgreSQL proof for migrations/versions/hypothesis_registry_labels_20261107.py
+"""Real-PostgreSQL proof for migrations/versions/hyp_registry_labels_20261107.py
 and governance.hypothesis_labels.
 
 Runs in a throwaway schema (random name, dropped afterwards) with minimal
@@ -27,7 +27,7 @@ from sqlalchemy.exc import DBAPIError
 
 from governance import hypothesis_labels as hl
 
-_MIGRATION_MODULE = "migrations.versions.hypothesis_registry_labels_20261107"
+_MIGRATION_MODULE = "migrations.versions.hyp_registry_labels_20261107"
 OLD = hl.LEGACY_CUTOFF - timedelta(days=60)
 NEW = hl.LEGACY_CUTOFF + timedelta(hours=1)
 

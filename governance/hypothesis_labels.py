@@ -14,7 +14,7 @@ The registry's PASSED and TESTING states were never validated findings
   AutoAgent rows that never got a verdict. Nothing ever reads TESTING again.
 
 Rows are never rewritten. ``hypothesis_registry_labels`` (append-only,
-migration ``hypothesis_registry_labels_20261107``) records one label per row
+migration ``hyp_registry_labels_20261107``) records one label per row
 and label version; :func:`label_legacy_registry` writes them (dry run by
 default). Every consumer that treats PASSED as validated reads through
 :func:`passed_validation` or the same predicate inline:

@@ -1,6 +1,6 @@
 """Append-only labels for legacy hypothesis_registry verdicts; v2 verdict columns.
 
-Revision ID: hypothesis_registry_labels_20261107
+Revision ID: hyp_registry_labels_20261107
 Revises: actor_universe_20261106
 
 ``hypothesis_registry`` PASSED/TESTING rows were never validated findings
@@ -21,7 +21,7 @@ GRANT footer per ``migrations/_TEMPLATE.sql``: ``grid`` gets SELECT, INSERT.
 
 from alembic import op
 
-revision = "hypothesis_registry_labels_20261107"
+revision = "hyp_registry_labels_20261107"
 down_revision = "actor_universe_20261106"
 branch_labels = None
 depends_on = None

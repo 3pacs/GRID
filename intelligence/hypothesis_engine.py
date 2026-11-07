@@ -187,7 +187,7 @@ _ADD_PAIR_ID = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS 
 _ADD_KILL_REASON = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS kill_reason TEXT")
 _ADD_KILLED_AT = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS killed_at TIMESTAMPTZ")
 # v2 verdict columns (intelligence.hypothesis_trials; migration
-# hypothesis_registry_labels_20261107). NULL scoring_version = a v1 verdict.
+# hyp_registry_labels_20261107). NULL scoring_version = a v1 verdict.
 _ADD_SCORING_VERSION = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS scoring_version TEXT")
 _ADD_TRIAL_P = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS trial_p_value DOUBLE PRECISION")
 _ADD_TRIAL_Q = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS trial_q_value DOUBLE PRECISION")
