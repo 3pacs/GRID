@@ -130,3 +130,123 @@ review found a legacy-provenance deduplication issue; it was fixed and covered.
 No production queries, paid provider calls, real PostgreSQL integration, full
 repository test suite, remote CI, push, PR publication, merge or deployment were
 performed. Local tests establish the source contract, not live coverage.
+
+## Follow-on qualification, 2026-11-07
+
+The previous validation statement describes the initial commit only. Subsequent
+work added bounded **read-only** production metadata inspection and real
+PostgreSQL testing in a disposable local cluster. No production writes or paid
+provider requests were made.
+
+### Current source overlap check
+
+Rechecked open AV/transcript/fiscal/earnings PRs: none matched. Upstream main had
+advanced from `3958255` to `29281ac`, including daily-packet and Hermes work.
+No upstream changes affected earnings_events_puller.py, sec_edgar_company.py or
+av_bulk_download.py between those commits. The AV candidate stayed on its
+existing local branch; no daily-pipeline implementation was duplicated.
+
+### Stored-data readiness, not provider coverage
+
+Inspection scope: grid-svr/griddb, 2026-11-07 21:07:24–21:09:23 UTC. Queries used
+BEGIN READ ONLY and 15–20-second statement timeouts. Only schema and aggregate
+counts were returned; no transcript text or credentials were exported.
+
+- SEC_EDGAR_Fundamentals was registered and active (id 734), last pull recorded
+  2026-11-06 20:50:48 UTC. Overall source: 16,338 rows, 301 series. Its provenance-
+  preserving sec_filed_fundamentals subset contained 8,185 rows, 153 series and
+  21 parsed tickers. All those rows had SUCCESS status.
+- The candidate's 550-day, three-field, successful/nonfuture-observation filter
+  selected 373 rows across 59 series and 21 tickers. Every selected row had all
+  five required fiscal/date/accession metadata fields.
+- Matching exact ticker, accession, period end and filing date against stored
+  SEC 10-K/10-Q rows left 158 fact rows across 20 tickers and 56 distinct
+  ticker/end/accession tuples. All passed the fiscal/form/date checks. There
+  were no conflicting period labels in this bounded set.
+- Accession-only matching would have accepted another 108 rows whose period
+  ends did not match. These comparative facts demonstrate why accession alone
+  is insufficient for fiscal-quarter selection.
+- The newest two verified periods per eligible ticker produced 40 period pairs.
+  One overlapped a legacy AV record, leaving 39 potentially requestable pairs.
+  This is a **stored-table approximation**, not reconciliation with fresh SEC
+  submissions, verified provider availability, or full watchlist readiness.
+- All 240 stored AV EARNINGS_CALL rows (160 tickers) contained text but lacked
+  date-basis, matched-fiscal-accession and observed-at metadata. All used period
+  end as filing date, including three future-dated records on the inspection
+  date. None meets the new provenance test. Historical reconciliation remains
+  necessary; no rows were modified.
+
+### Real PostgreSQL contract test
+
+Added `tests/test_av_transcript_pg.py`. The fixture refuses arbitrary DB_URL/TCP
+targets and requires a disposable /tmp/grid-av-qualification.* cluster, a
+private Unix socket, the fixed av_coverage_test database, matching data_directory
+and no TCP listeners. It mirrors the production table columns and relevant
+constraints discovered read-only. No shared CI or production database is used.
+
+Five PostgreSQL integration tests cover JSONB/ANY parameter binding, source and
+availability filters, exact SEC joins, real upsert insert/update idempotency,
+verified/legacy separation, complete mocked-provider pull cycles, repeated-run
+deduplication and rotation after empty results. All five passed on PostgreSQL
+15.19, together with the 56 offline tests (61 total). Provider HTTP calls were
+blocked. This is not a full repository or production-service acceptance run.
+
+### Shared account-budget design (not implemented or activated)
+
+Source inventory found eight direct AV client modules/scripts. Their existence
+does not establish current runtime activity:
+
+- earnings_events_puller: transcript requests, currently local ledger only.
+- altdata/alphavantage_sentiment: NEWS_SENTIMENT; statically registered in the
+  scheduler and smart scheduler. Its 12-second delay is not a daily-call cap.
+- price_fallback: GLOBAL_QUOTE fallback; independent of transcript pacing.
+- av_bulk_download: statements, earnings, economic and commodity histories.
+- av_bulk_prices and fix_spy_data: daily-price download/repair tools.
+- full_universe_pull: overview, income, balance, insider and earnings functions.
+- load_wave2: RSI/MACD technical-indicator requests.
+
+Before raising the transcript allocation, choose one explicit account-wide
+control path:
+
+1. **Near-term allocation:** inventory which callers actually run, disable no
+   jobs implicitly, and assign conservative per-worker minute budgets whose sum
+   remains below the confirmed account rate with spare capacity. Bound retry
+   attempts and exclude unscheduled bulk jobs from overlapping runs. This is an
+   operating convention, not a technically enforced global guarantee.
+2. **Durable shared control:** extend the existing HTTP call sites to a common
+   AV request client backed by one PostgreSQL reservation ledger/coordinator
+   across hosts. Keep the existing statement parsers and destinations. Use a
+   configured account alias, never credentials, as the ledger identity. Every
+   attempt including retry consumes a reservation before HTTP. Do not merely
+   allocate future sleep slots: delayed workers can otherwise bunch requests.
+3. The shared gate must enforce a rolling request window, short-lived dispatch
+   authorization, worker quotas/fairness, shared provider-notice cooldown, and
+   fail-closed behavior if coordination is unavailable. Use separate priority
+   classes for current reports/quotes and historical backfill, plus per-run and
+   optional operator UTC-day caps. Do not infer a provider daily cap or reset
+   timezone from old source comments.
+4. Record reservation/dispatched/outcome/uncertain states without URLs containing
+   keys. HTTP 401/403/429 and Information/Note responses stop or cool down the
+   correct scope; an entitlement failure is not an empty dataset. Never refund
+   an uncertain dispatched request merely because its response was lost.
+5. Acceptance tests must include concurrent callers on multiple processes,
+   crashes before/after dispatch, late wakeups, clock changes, restart, rolling
+   boundaries, day rollover, retries and provider errors. A fake provider must
+   observe actual request-start timestamps and verify the rolling-window cap.
+   A source scan must prove every enabled call path uses the gate before it is
+   described as account-wide protection.
+
+No numerical production allocation is selected here: existing plan entitlements
+and active caller concurrency must be verified together. The candidate's local
+ledger remains explicitly scoped and is not represented as this shared gate.
+
+### Next work, in order
+
+1. Build a read-only, per-issuer missing-metadata and legacy-reconciliation
+   manifest. Expand SEC fiscal metadata through the existing approved feed.
+2. Define known-at and nullable actual call-date handling for every consumer.
+   The compatibility view currently maps period_end to earnings_date and
+   created_at to pull_timestamp; that mapping is not actual call timing.
+3. Implement/review the chosen shared-budget control across enabled callers.
+4. Only after those gates, seek the separate approval for a small paid-provider
+   canary and eventual deployment. No wider history download is authorized here.

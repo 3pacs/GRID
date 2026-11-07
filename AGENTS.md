@@ -258,3 +258,20 @@ Verification and limits:
   budget allocation, legacy reconciliation and date-aware consumers remain gates.
 - Local branch only. No provider requests, production writes, push, PR, merge or
   deployment. This does not establish live coverage or complete valuation inputs.
+
+### Follow-on qualification (2026-11-07, source still local)
+
+- Verified current upstream work and no overlapping open AV/fiscal PR. Continued
+  the existing branch without changing Claude's daily-packet/Hermes work.
+- Bounded production READ ONLY aggregates found 373 recent candidate SEC fact
+  rows across 21 tickers, reducing to 40 verified period pairs across 20 tickers
+  when matched to stored SEC filings. One legacy overlap leaves 39 potentially
+  requestable pairs; this is not fresh provider or full-universe qualification.
+- All 240 legacy AV transcript rows (160 tickers) lack new provenance fields;
+  all have filing_date=period_end, including three future-dated rows. No repairs.
+- Added five actual PostgreSQL 15.19 tests in a separate private Unix-socket
+  cluster. Together with 56 offline tests, 61 passed with provider calls blocked.
+- Documented eight independent AV client modules/scripts and requirements for
+  real account-wide budgeting. The current local ledger is not a global limiter.
+- No production writes, paid API calls, push, PR, merge, deployment, or scheduler
+  changes. Legacy date semantics, metadata breadth and shared budgets remain gates.
