@@ -2061,6 +2061,13 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # Owner-approved 2026-11-07 ("go on the sleuth rebuild"); its declared
     # hypotheses are v2 one-look trials in the S11 ledger (#1008, #1012).
     "sleuth_dispatch",
+    # intelligence/postmortem.py::batch_postmortem -- LLM-narrated
+    # (Tier.REASON) trade_postmortems rows for official misses and failed
+    # trades, POSTMORTEM_BATCH_LIMIT per source. Released 2026-11-07 (owner
+    # approval) once postmortems stopped writing ReasoningBank lessons: they
+    # explain a miss, they no longer feed learning (lessons now come from
+    # official verdicts, both sides; intelligence/reasoning_bank.py).
+    "postmortem_batch",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -2128,11 +2135,6 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "(analysis/backtest_scanner.py) is LLM-gated (llm.router "
         "Tier.ORACLE sanity-checks winners) and inserts into "
         "hypothesis_registry via generate_hypotheses_from_winners"
-    ),
-    "postmortem_batch": (
-        "postmortem write that feeds learning — batch_postmortem "
-        "(intelligence/postmortem.py) is LLM-narrated (llm.router "
-        "Tier.REASON) and inserts trade_postmortems rows"
     ),
     "options_improvement": (
         "model/weight registry write + scorer — run_improvement_cycle "

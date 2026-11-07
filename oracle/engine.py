@@ -1929,6 +1929,7 @@ class OracleEngine:
             "held_unmarked_null_entry_price": 0,
         }
 
+        verdict_lessons: list[dict[str, Any]] = []
         with self.engine.begin() as conn:
             # Get pending predictions past expiry
             rows = conn.execute(text("""
@@ -2047,6 +2048,11 @@ class OracleEngine:
                     "pnl": round(pnl, 2), "id": pred_id,
                     "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%){split_note}",
                 })
+                verdict_lessons.append({
+                    "prediction_id": pred_id, "ticker": ticker, "direction": direction,
+                    "verdict": verdict, "model": model, "created_at": created_at,
+                    "expiry": expiry, "actual_move": actual_move, "pnl": pnl,
+                })
 
                 # Update model stats
                 # verdict is from internal logic (hit/partial/miss) — map to safe column names
@@ -2073,8 +2079,57 @@ class OracleEngine:
         results["total"] = scored
         log.info("Scored {n} predictions: {h}H/{p}P/{m}M",
                  n=scored, h=results["hits"], p=results["partials"], m=results["misses"])
+        # After the commit: a lesson for a verdict that rolled back would be a lie.
+        results["lessons_written"] = self._write_verdict_lessons(verdict_lessons)
 
         return results
+
+    def _write_verdict_lessons(self, verdicts: list[dict[str, Any]]) -> int:
+        """One ReasoningBank lesson per official verdict, both sides.
+
+        hit or partial (the direction was right) is a ``success``, miss a
+        ``failure`` (intelligence/reasoning_bank.py, "The rules"). Defensive:
+        a failed write is logged and skipped, never raised.
+        """
+        if not verdicts:
+            return 0
+        try:
+            from intelligence.reasoning_bank import (
+                VERDICT_LESSON_SOURCE,
+                ReasoningLesson,
+                build_fingerprint_from_decision_data,
+                write_reasoning_lesson,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive; pragma: no cover
+            log.debug("verdict lessons: reasoning_bank import failed: {e}", e=str(exc))
+            return 0
+        written = 0
+        for v in verdicts:
+            created, expiry = v["created_at"], v["expiry"]
+            start = created.date() if isinstance(created, datetime) else created
+            horizon_days = (max(1, (expiry - start).days)
+                            if isinstance(expiry, date) and isinstance(start, date) else None)
+            outcome = "failure" if v["verdict"] == "miss" else "success"
+            lesson = ReasoningLesson(
+                title=f"{v['ticker']} {v['direction']} {v['verdict']}",
+                description=(f"Oracle {v['model'] or '?'} called {v['direction']} on "
+                             f"{v['ticker']}; official verdict {v['verdict']}"),
+                content=(f"realized {v['actual_move']:+.2f}%, pnl {v['pnl']:+.2f}%"
+                         + (f" over {horizon_days}d" if horizon_days else "")),
+                outcome_class=outcome,
+                condition_fingerprint=build_fingerprint_from_decision_data(
+                    ticker=v["ticker"], direction=v["direction"],
+                    data_at_decision=None, horizon_days=horizon_days,
+                ),
+                source_type=VERDICT_LESSON_SOURCE,
+                source_id=str(v["prediction_id"]),
+            )
+            try:
+                if write_reasoning_lesson(self.engine, lesson) is not None:
+                    written += 1
+            except Exception as exc:  # noqa: BLE001
+                log.debug("verdict lesson for {p} failed: {e}", p=v["prediction_id"], e=str(exc))
+        return written
 
     # ── Weight Evolution ────────────────────────────────────────────────
 

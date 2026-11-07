@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from loguru import logger as log
@@ -238,6 +239,8 @@ def retrieve_lessons(
         "vol_bucket",
         "horizon_bucket",
     ),
+    since: datetime | None = None,
+    source_types: tuple[str, ...] | None = None,
 ) -> list[ReasoningLesson]:
     """Hybrid retrieve — defensive; never raises.
 
@@ -248,6 +251,9 @@ def retrieve_lessons(
         ``fingerprint_overlap_keys`` (LATERAL ``jsonb_each_text`` filter).
       - Otherwise fall back to: most-fingerprint-keys-matching DESC,
         then ``created_at`` DESC.
+
+    ``since`` keeps only lessons written at or after that instant;
+    ``source_types`` only lessons from those writers.
 
     On any DB error returns ``[]``.
     """
@@ -289,6 +295,15 @@ def retrieve_lessons(
     if outcome_class != "any":
         where_parts.append("outcome_class = :outcome_class")
         params["outcome_class"] = outcome_class
+
+    if since is not None:
+        where_parts.append("created_at >= :since")
+        params["since"] = since
+
+    if source_types:
+        names = [f"st_{i}" for i in range(len(source_types))]
+        where_parts.append("source_type IN (" + ", ".join(f":{n}" for n in names) + ")")
+        params.update(zip(names, source_types))
 
     where_clause = ""
     if where_parts:
@@ -479,47 +494,74 @@ MEMORY_LESSON_MULT_MIN: float = 0.85
 MEMORY_LESSON_MULT_MAX: float = 1.15
 MEMORY_LESSON_SLOPE: float = 0.15  # so mult = 1 + slope * score, score ∈ [-1, 1]
 
+# The rules, in plain words (2026-11-07):
+#
+# 1. Old lessons don't count. Lessons written before HONEST_LESSONS_SINCE
+#    came from the pre-rebuild scorer and postmortems that recorded only
+#    failures (1,019,551 failure lessons, 0 successes, May-Sep 2026). They
+#    stay in the table; they no longer move conviction.
+# 2. No two-sided record, no adjustment. Conviction moves only when the
+#    matching lessons hold at least MIN_LESSONS_EACH_SIDE wins AND losses.
+#    A record of only failures cannot tell a bad setup from a busy one.
+# 3. One lesson per official verdict, written when it is scored
+#    (oracle.engine.score_expired_predictions: hit/partial = success,
+#    miss = failure; source_type VERDICT_LESSON_SOURCE). Postmortems explain
+#    misses; they no longer write lessons, so nothing is counted twice. Only
+#    verdict lessons and the oracle's neutral contrast distillations count.
+HONEST_LESSONS_SINCE: datetime = datetime(2026, 11, 7, tzinfo=timezone.utc)
+MIN_LESSONS_EACH_SIDE: int = 3
+VERDICT_LESSON_SOURCE: str = "oracle_verdict"
+HONEST_LESSON_SOURCES: tuple[str, ...] = (VERDICT_LESSON_SOURCE, "oracle_contrast")
 
-def memory_lesson_conviction_multiplier(
+
+@dataclass(frozen=True)
+class LessonEvidence:
+    """What the memory-lesson layer saw and why it moved (or did not)."""
+
+    wins: int
+    losses: int
+    neutral: int
+    multiplier: float
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def memory_lesson_evidence(
     engine: Engine,
     *,
     fingerprint: dict[str, Any],
     top_k: int = 20,
     require_direction_match: bool = True,
-) -> float:
-    """Return a conviction multiplier in [0.85, 1.15] driven by past
-    distilled lessons that match the live fingerprint.
+) -> LessonEvidence:
+    """The memory-lesson multiplier with its reason (see the rules above).
 
-    Counts the outcome classes of retrieved lessons:
+    With a two-sided record:
 
-        score = (n_success - n_failure - 0.3 * n_neutral) / total
+        score = (wins - losses - 0.3 * neutral) / (wins + losses + neutral)
         multiplier = clip(1 + 0.15 * score, 0.85, 1.15)
 
-    Where ``neutral`` lessons (e.g. ``oracle_contrast`` divergence
-    distillations) act as a mild haircut — they signal that this
-    fingerprint has historically produced model disagreement, which is
-    weak evidence against high conviction.
-
-    When ``require_direction_match=True`` (default) and the fingerprint
-    contains a ``direction``, only lessons whose stored fingerprint has
-    the same direction are counted. This prevents a failure-tagged
-    bullish lesson from haircut-ing a bearish trade in the same regime.
-
-    Defensive: returns 1.0 on any failure.
+    ``neutral`` lessons (``oracle_contrast`` divergence distillations) are a
+    mild haircut: that fingerprint has produced model disagreement before.
+    With ``require_direction_match`` (default) only lessons with the live
+    fingerprint's ``direction`` count. Defensive: any failure is neutral.
     """
+    def neutral(reason: str, wins: int = 0, losses: int = 0, n: int = 0) -> LessonEvidence:
+        return LessonEvidence(wins, losses, n, 1.0, reason)
+
     try:
         lessons = retrieve_lessons(
             engine,
             fingerprint=fingerprint,
             top_k=int(top_k) if top_k else 20,
             outcome_class="any",
+            since=HONEST_LESSONS_SINCE,
+            source_types=HONEST_LESSON_SOURCES,
         )
     except Exception as exc:  # noqa: BLE001 — defensive boundary
         log.debug("reasoning_bank: lesson retrieval failed: {e}", e=str(exc))
-        return 1.0
-
-    if not lessons:
-        return 1.0
+        return neutral("lesson lookup failed")
 
     if require_direction_match:
         live_dir = str(fingerprint.get("direction") or "").lower()
@@ -528,20 +570,37 @@ def memory_lesson_conviction_multiplier(
                 l for l in lessons
                 if str(l.condition_fingerprint.get("direction") or "").lower() == live_dir
             ]
-            if not lessons:
-                return 1.0
 
-    n_success = sum(1 for l in lessons if l.outcome_class == "success")
-    n_failure = sum(1 for l in lessons if l.outcome_class == "failure")
+    wins = sum(1 for l in lessons if l.outcome_class == "success")
+    losses = sum(1 for l in lessons if l.outcome_class == "failure")
     n_neutral = sum(1 for l in lessons if l.outcome_class == "neutral")
-    total = n_success + n_failure + n_neutral
-    if total <= 0:
-        return 1.0
+    if not lessons:
+        return neutral(f"no lessons since {HONEST_LESSONS_SINCE.date().isoformat()}")
+    if wins < MIN_LESSONS_EACH_SIDE or losses < MIN_LESSONS_EACH_SIDE:
+        return neutral(f"one-sided record: {wins} wins, {losses} losses "
+                       f"(needs {MIN_LESSONS_EACH_SIDE} of each)", wins, losses, n_neutral)
 
-    score = (n_success - n_failure - 0.3 * n_neutral) / float(total)
-    score = max(-1.0, min(1.0, score))
-    multiplier = 1.0 + MEMORY_LESSON_SLOPE * score
-    return max(MEMORY_LESSON_MULT_MIN, min(MEMORY_LESSON_MULT_MAX, multiplier))
+    total = wins + losses + n_neutral
+    score = max(-1.0, min(1.0, (wins - losses - 0.3 * n_neutral) / float(total)))
+    multiplier = max(MEMORY_LESSON_MULT_MIN,
+                     min(MEMORY_LESSON_MULT_MAX, 1.0 + MEMORY_LESSON_SLOPE * score))
+    return LessonEvidence(wins, losses, n_neutral, multiplier,
+                          f"record: {wins} wins / {losses} losses")
+
+
+def memory_lesson_conviction_multiplier(
+    engine: Engine,
+    *,
+    fingerprint: dict[str, Any],
+    top_k: int = 20,
+    require_direction_match: bool = True,
+) -> float:
+    """Conviction multiplier in [0.85, 1.15]; ``memory_lesson_evidence``
+    has the rules and the reason."""
+    return memory_lesson_evidence(
+        engine, fingerprint=fingerprint, top_k=top_k,
+        require_direction_match=require_direction_match,
+    ).multiplier
 
 
 __all__ = [
@@ -550,6 +609,12 @@ __all__ = [
     "MEMORY_LESSON_MULT_MIN",
     "MEMORY_LESSON_MULT_MAX",
     "MEMORY_LESSON_SLOPE",
+    "HONEST_LESSONS_SINCE",
+    "HONEST_LESSON_SOURCES",
+    "VERDICT_LESSON_SOURCE",
+    "MIN_LESSONS_EACH_SIDE",
+    "LessonEvidence",
+    "memory_lesson_evidence",
     "write_reasoning_lesson",
     "retrieve_lessons",
     "lesson_count",
