@@ -243,12 +243,24 @@ def _create_tables(conn: Any) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_compute_state_log_job ON compute_state_log (job_id);
     """)
-    # Additive column for tables created before 2026-11-06. A constant default
-    # makes ADD COLUMN catalog-only; lock_timeout bounds the wait behind a
-    # claim holding a worker row so startup fails fast and systemd retries.
-    cur.execute("SET lock_timeout = '5s'")
-    cur.execute(COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL)
-    cur.execute("RESET lock_timeout")
+    # Even ADD COLUMN IF NOT EXISTS takes an exclusive table lock when the
+    # column exists, so avoid that no-op ALTER while backups hold read locks.
+    # Resolve the same search_path table as the unqualified CREATE/ALTER above.
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_attribute
+            WHERE attrelid = pg_catalog.to_regclass(%s)
+              AND attname = %s
+              AND attnum > 0
+              AND NOT attisdropped
+        )
+    """, ("compute_workers", "ollama_models"))
+    if not cur.fetchone()[0]:
+        # Upgrade pre-2026-11-06 tables; IF NOT EXISTS also handles a concurrent
+        # initializer. Genuine migration failures still abort startup and retry.
+        cur.execute("SET lock_timeout = '5s'")
+        cur.execute(COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL)
+        cur.execute("RESET lock_timeout")
 
 
 COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL = (

@@ -432,8 +432,9 @@ def test_register_accepts_older_workers_without_models():
     assert worker.ollama_models == []
 
 
-def test_create_tables_adds_ollama_models_column_to_existing_table():
+def test_create_tables_adds_ollama_models_column_to_existing_table(monkeypatch):
     conn = _RecordingConn()
+    monkeypatch.setattr(_RecordingCursor, "fetchone", lambda self: (False,))
     coordinator._create_tables(conn)
 
     executed = [sql for sql, _ in conn.calls]

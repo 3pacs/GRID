@@ -476,3 +476,69 @@ def test_producer_does_not_mask_server_errors(monkeypatch):
     monkeypatch.setattr(producer.requests, "get", lambda url, timeout: FakeResponse(503, {}))
     with pytest.raises(requests.HTTPError):
         producer.existing_queued_jobs("http://c")
+
+
+# Startup must not request an exclusive table lock for an existing column.
+
+
+def test_init_tables_skips_existing_column_without_alter_lock(conns):
+    use(
+        conns,
+        rows=lambda sql, one: (True,),
+        fail=lambda sql, n: psycopg2.errors.LockNotAvailable("backup holds a read lock")
+        if sql.startswith("ALTER TABLE") else None,
+    )
+
+    coordinator.init_tables()
+
+    conn = conns[0]
+    assert conn.autocommit is True
+    assert conn.close_count == 1
+    assert len(conn.executed) == 2
+    create_sql, _ = conn.executed[0]
+    assert "CREATE TABLE IF NOT EXISTS compute_workers" in create_sql
+    assert "ollama_models   JSONB DEFAULT '[]'::jsonb" in create_sql
+    probe_sql, params = conn.executed[1]
+    assert "FROM pg_catalog.pg_attribute" in probe_sql
+    assert "attrelid = pg_catalog.to_regclass(%s)" in probe_sql
+    assert "attname = %s" in probe_sql
+    assert "attnum > 0" in probe_sql
+    assert "NOT attisdropped" in probe_sql
+    assert params == ("compute_workers", "ollama_models")
+    assert not any("ALTER TABLE" in sql or "lock_timeout" in sql for sql, _ in conn.executed)
+
+
+def test_init_tables_missing_column_retains_bounded_idempotent_alter(conns):
+    use(conns, rows=lambda sql, one: (False,))
+
+    coordinator.init_tables()
+
+    conn = conns[0]
+    assert conn.close_count == 1
+    assert conn.executed[-3:] == [
+        ("SET lock_timeout = '5s'", None),
+        (coordinator.COMPUTE_WORKERS_ADD_OLLAMA_MODELS_SQL, None),
+        ("RESET lock_timeout", None),
+    ]
+    # A concurrent initializer may add it between the catalog probe and ALTER.
+    assert "ADD COLUMN IF NOT EXISTS ollama_models" in conn.executed[-2][0]
+
+
+@pytest.mark.parametrize("statement", [
+    "CREATE TABLE", "SELECT EXISTS", "SET lock_timeout", "ALTER TABLE", "RESET lock_timeout",
+])
+def test_init_tables_preserves_startup_errors_and_closes_connection(conns, statement):
+    error = psycopg2.errors.LockNotAvailable("startup operation failed")
+    use(
+        conns,
+        rows=lambda sql, one: (False,),
+        fail=lambda sql, n: error if sql.strip().startswith(statement) else None,
+    )
+
+    with pytest.raises(psycopg2.errors.LockNotAvailable) as exc:
+        coordinator.init_tables()
+
+    assert exc.value is error
+    assert conns[0].close_count == 1
+    assert conns[0].rollback_count == 0
+    assert conns[0].executed[-1][0].strip().startswith(statement)

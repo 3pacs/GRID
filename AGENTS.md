@@ -241,3 +241,19 @@ Verification and limits:
 - Strengthened the SQLite regression with recently updated legacy, labeled and
   future rows; only the current unlabelled row is counted. All 494 combined
   offline tests passed again; Ruff and diff checks passed.
+
+## 2026-11-07 - avoid redundant coordinator startup ALTER locks (source only)
+
+- Guarded the existing ollama_models upgrade with a parameterized PostgreSQL
+  catalog lookup. to_regclass resolves the same search_path table as CREATE and
+  ALTER; dropped/system attributes do not count as an existing column.
+- Existing columns skip the no-op ALTER and its exclusive lock, which otherwise
+  conflicts with a long-running pg_dump read lock. Missing columns retain the
+  idempotent ADD COLUMN and 5-second lock timeout. Startup errors still propagate
+  and the connection always closes; no backup or production state was changed.
+- Regression reproduced the lock failure before the fix. All 117 focused offline
+  coordinator/job tests passed on Python 3.12 with FastAPI 0.139.2, synthetic DB
+  settings and test-time socket/DB connections blocked. Both startup functions
+  reached 100% line and branch coverage. Ruff, compilation and diff checks passed.
+- Isolated local source preparation only. No push, PR, merge or deployment.
+  Full repository CI and PostgreSQL concurrency integration remain unrun.
