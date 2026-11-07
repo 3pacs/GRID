@@ -239,8 +239,26 @@ def handle_hermes_storage_maintenance(engine: Engine, goal: Goal) -> HandlerResu
     return _inspect_storage_maintenance(engine, goal.target_id, state)
 
 
+def handle_sleuth_investigate(engine: Engine, goal: Goal) -> HandlerResult:
+    """Review one Sleuth intersection lead and record its declared outcome.
+
+    Wraps :func:`intelligence.sleuth_intersections.investigate_intersection_lead`:
+    a ``hypothesis_declared`` outcome inserts a ``discovered_hypotheses`` row
+    with fixed test criteria for the v2 trial scorer; a ``dead_end`` keeps its
+    reason. An unavailable or off-format LLM raises, so the goal is retried
+    and the lead stays ``new``.
+    """
+    if goal.allow_cloud:
+        _check_cloud_permission(goal)
+
+    from intelligence.sleuth_intersections import investigate_intersection_lead
+
+    return investigate_intersection_lead(engine, goal.target_id)
+
+
 HANDLERS: dict[str, HandlerFn] = {
     "score_active_hypothesis": handle_score_active_hypothesis,
+    "sleuth_investigate": handle_sleuth_investigate,
     "hermes_diagnose_source": handle_hermes_diagnose_source,
     "hermes_scout_free_data": handle_hermes_scout_free_data,
     "hermes_wiring_audit": handle_hermes_wiring_audit,

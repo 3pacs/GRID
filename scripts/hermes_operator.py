@@ -1862,6 +1862,31 @@ def _daily_intel_fundamental_divergence(
     )
 
 
+def _daily_intel_sleuth_dispatch(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Find Sleuth intersection leads and queue one investigation per lead.
+
+    SQL plus a bounded closes read (``intelligence.sleuth_intersections``):
+    saves at most ``MAX_NEW_LEADS`` new ``origin='intersection'`` leads and
+    enqueues a ``sleuth_investigate`` goal for each, which goal_worker runs
+    on its own budget. No LLM call in this step; the step is done once the
+    goals are queued (``reports_done_queued``).
+    """
+    from intelligence.goal_queue import enqueue_goal
+    from intelligence.sleuth_intersections import generate_intersection_leads
+
+    lead_ids = generate_intersection_leads(engine, as_of=now)
+    queued = 0
+    for rank, lead_id in enumerate(lead_ids):
+        if enqueue_goal(engine, goal_type="sleuth_investigate", target_id=lead_id,
+                        priority=50 + rank, hardware_tier="cpu", allow_cloud=False) is not None:
+            queued += 1
+    results["sleuth_dispatch"] = {"leads": len(lead_ids), "queued": queued}
+    log.info("Sleuth dispatch: {n} new leads, {q} investigations queued",
+             n=len(lead_ids), q=queued)
+
+
 def _daily_intel_holder_deal_overlap(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -1964,6 +1989,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("sleuth_dispatch", _daily_intel_sleuth_dispatch, DAILY_INTEL_SQL_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
@@ -2097,6 +2123,13 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "(analysis/backtest_scanner.py) is LLM-gated (llm.router "
         "Tier.ORACLE sanity-checks winners) and inserts into "
         "hypothesis_registry via generate_hypotheses_from_winners"
+    ),
+    "sleuth_dispatch": (
+        "research write + dispatch -- generate_intersection_leads "
+        "(intelligence/sleuth_intersections.py) inserts investigation_leads "
+        "and queues sleuth_investigate goals whose handler declares "
+        "discovered_hypotheses rows (LLM-reviewed, Tier.ORACLE). Rebuilt "
+        "2026-11-07; enabling it is its own reviewed change"
     ),
     "postmortem_batch": (
         "postmortem write that feeds learning — batch_postmortem "
