@@ -76,7 +76,17 @@ DIARY_TIMER_WEEKDAYS = frozenset({1, 2, 3, 4, 5})  # Monday == 0
 
 ROW_LIMIT_MAX = 500
 STATEMENT_TIMEOUT_MS = "8000"
-TEXT_FIELD_CAP_BYTES = 1_048_576          # per publication text; over = excluded whole, never truncated
+# Per publication text; over = excluded whole, never truncated. Reviewed 2026-11-07
+# after market_briefings id 5007 (hourly, 1,527,952 chars) was excluded: that row
+# was a 1.6 KB narrative plus a 1.5 MB "Feature evidence declarations" appendix
+# (961 zero-valued features equal-value-matched a "0%" mention). The writer now
+# bounds that appendix (ollama/market_briefing.py: match_list_cap=8 per mention,
+# 256 KiB appendix cap, whole-appendix withhold with a declared note), so a
+# legitimate briefing is a <=15 KB narrative plus <=256 KiB appendix. The cap
+# stays at 1 MiB: nothing legitimate reaches it, and raising it would admit the
+# runaway shape instead of the fixed one. Historical rows written before the
+# fix that exceed it stay EXCLUDED_TEXT_OVER_FIELD_CAP by id/hash, by design.
+TEXT_FIELD_CAP_BYTES = 1_048_576
 PUBLICATIONS_AGGREGATE_CAP_BYTES = 8_000_000
 ARTIFACT_READ_CAP_BYTES = 2_000_000
 AUDIO_DIR = Path("/data/grid_v4/briefings")
