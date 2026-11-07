@@ -17,12 +17,16 @@ Two concerns are covered offline (mocked HTTP):
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 from ingestion.altdata.dark_pool import (
     _ATS_AGG_SUMMARY_CODE,
     _ATS_FIRM_SUMMARY_CODE,
+    _FETCH_OVERLAP_WEEKS,
+    _FETCH_WINDOW_WEEKS,
+    _MAX_FETCH_WEEKS,
+    _MAX_PAGES,
     DarkPoolPuller,
 )
 
@@ -81,7 +85,7 @@ def test_fetch_weekly_page_handles_204_no_content():
         assert p._fetch_weekly_page(tickers=["SPY"]) == []
 
 
-def test_fetch_weekly_page_omits_domainfilters_without_tickers():
+def test_fetch_weekly_page_omits_ticker_filter_without_tickers():
     p = _puller()
     captured: dict = {}
 
@@ -93,7 +97,122 @@ def test_fetch_weekly_page_omits_domainfilters_without_tickers():
 
     with patch("ingestion.altdata.dark_pool.requests.post", side_effect=fake_post):
         p._fetch_weekly_page(tickers=None)
-    assert "domainFilters" not in captured["json"]
+    fields = [f["fieldName"] for f in captured["json"]["domainFilters"]]
+    assert fields == ["summaryTypeCode"]
+
+
+def test_fetch_weekly_page_requests_only_ats_partitions():
+    """OTC_* rows are dropped by the parser, so they are never requested."""
+    p = _puller()
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock(status_code=200)
+        resp.json = lambda: []
+        return resp
+
+    with patch("ingestion.altdata.dark_pool.requests.post", side_effect=fake_post):
+        p._fetch_weekly_page(tickers=["SPY"])
+    by_field = {f["fieldName"]: f["values"] for f in captured["json"]["domainFilters"]}
+    assert by_field["summaryTypeCode"] == [_ATS_AGG_SUMMARY_CODE, _ATS_FIRM_SUMMARY_CODE]
+
+
+# ── Fetch window (2026-11-07 TIMEOUT: every run asked for 2020-01-01..today) ──
+
+
+def _resp(records: list, total: int | None) -> MagicMock:
+    resp = MagicMock(status_code=200)
+    resp.json = lambda: records
+    resp.headers = {"Record-Total": str(total)} if total is not None else {}
+    return resp
+
+
+def _window_puller(latest: date | None) -> tuple[DarkPoolPuller, list[dict]]:
+    p = _puller()
+    p._latest_stored_week = lambda ticker: latest  # type: ignore[method-assign]
+    return p, []
+
+
+def _run(p: DarkPoolPuller, pages: list[MagicMock], **kwargs) -> tuple[dict, list[dict]]:
+    bodies: list[dict] = []
+    queue = list(pages)
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        bodies.append(json)
+        return queue.pop(0)
+
+    with patch("ingestion.altdata.dark_pool.requests.post", side_effect=fake_post), \
+            patch("ingestion.altdata.dark_pool.time.sleep"):
+        out = p.pull_weekly(**kwargs)
+    return out, bodies
+
+
+def test_scheduled_run_never_requests_full_history():
+    """The default call must not ask FINRA for 2020-01-01 (296,280 records)."""
+    today = date.today()
+    p, _ = _window_puller(latest=today - timedelta(weeks=6))
+    _, bodies = _run(p, [_resp([], 0)])
+    start = date.fromisoformat(bodies[0]["dateRangeFilters"][0]["startDate"])
+    assert start == today - timedelta(weeks=_FETCH_WINDOW_WEEKS)
+
+
+def test_scheduled_run_widens_window_to_cover_a_stored_gap():
+    today = date.today()
+    latest = today - timedelta(weeks=30)
+    p, _ = _window_puller(latest=latest)
+    _, bodies = _run(p, [_resp([], 0)])
+    start = date.fromisoformat(bodies[0]["dateRangeFilters"][0]["startDate"])
+    assert start == latest - timedelta(weeks=_FETCH_OVERLAP_WEEKS)
+
+
+def test_scheduled_run_window_is_capped_at_a_year():
+    today = date.today()
+    for latest in (None, today - timedelta(weeks=300)):
+        p, _ = _window_puller(latest=latest)
+        _, bodies = _run(p, [_resp([], 0)])
+        start = date.fromisoformat(bodies[0]["dateRangeFilters"][0]["startDate"])
+        assert start == today - timedelta(weeks=_MAX_FETCH_WEEKS)
+
+
+def test_explicit_start_date_is_a_manual_backfill():
+    p, _ = _window_puller(latest=date.today())
+    _, bodies = _run(p, [_resp([], 0)], start_date="2025-01-06")
+    assert bodies[0]["dateRangeFilters"][0]["startDate"] == "2025-01-06"
+
+
+def test_pagination_stops_at_record_total():
+    """A short page with more records left is not the end; Record-Total is."""
+    p, _ = _window_puller(latest=date.today() - timedelta(weeks=2))
+    rec = _firm("SPY", (date.today() - timedelta(weeks=1)).isoformat(), 10, 1, _ATS_AGG_SUMMARY_CODE)
+    pages = [_resp([rec] * 3, 5), _resp([rec] * 2, 5)]
+    with patch.object(DarkPoolPuller, "_get_existing_dates", return_value=set()), \
+            patch.object(DarkPoolPuller, "_insert_raw"), \
+            patch.object(DarkPoolPuller, "_emit_spike_signal"):
+        out, bodies = _run(p, pages)
+    assert [b["offset"] for b in bodies] == [0, 3]
+    assert out["status"] == "SUCCESS"
+
+
+def test_page_budget_exhaustion_is_partial_not_success():
+    p, _ = _window_puller(latest=date.today() - timedelta(weeks=2))
+    rec = _firm("SPY", (date.today() - timedelta(weeks=1)).isoformat(), 10, 1, _ATS_AGG_SUMMARY_CODE)
+    pages = [_resp([rec], 10_000) for _ in range(_MAX_PAGES)]
+    with patch.object(DarkPoolPuller, "_get_existing_dates", return_value=set()), \
+            patch.object(DarkPoolPuller, "_insert_raw"), \
+            patch.object(DarkPoolPuller, "_emit_spike_signal"):
+        out, bodies = _run(p, pages)
+    assert len(bodies) == _MAX_PAGES
+    assert out["status"] == "PARTIAL"
+    assert "page budget" in out["error"]
+
+
+def test_smart_scheduler_gives_dark_pool_headroom_over_its_window():
+    from ingestion.smart_scheduler import PULLER_REGISTRY
+
+    entry = next(p for p in PULLER_REGISTRY if p["name"] == "dark_pool")
+    assert entry["method"] == "pull_weekly"
+    assert entry["timeout_s"] >= 120
 
 
 # ── Record parsing (ATS-only, no double counting) ──
