@@ -212,7 +212,7 @@ def test_genuinely_quiet_day_is_not_marked_degraded(monkeypatch) -> None:
 
     assert result["degraded"] == []
     assert "Data collection issues" not in result["section_titles"]
-    assert result["section_titles"] == ["Decisions (24h)"]
+    assert result["section_titles"] == ["At a glance", "Decisions (24h)"]
 
 
 def _regime_result(monkeypatch, row_tuple):
@@ -681,3 +681,79 @@ def test_digest_latest_regime_keeps_missing_timestamp_unverified(monkeypatch) ->
     sections = _bounded_digest(monkeypatch, journals=[("SYNTHETIC", 0.8, "HOLD", None)])
     assert "Regime State — unverified" in sections
     assert "no timestamp" in sections["Regime State — unverified"]
+
+
+@pytest.mark.parametrize("age_hours,status", [(1, "RISK_ON"), (26, "stale"), (None, "unverified"), (-2, "unverified")])
+def test_digest_summary_preserves_regime_freshness_and_scopes_metrics(monkeypatch, age_hours, status):
+    ts = datetime.now(timezone.utc) - timedelta(hours=age_hours) if age_hours is not None else None
+    routes = dict(_QUIET_ROUTES)
+    routes.update({
+        "inferred_state": _FakeResult(one=("RISK_ON", .8, "BUY", ts)),
+        "COUNT(*)": _FakeResult(one=(17,)),
+        "raw_series": _FakeResult(one=(4, datetime.now(timezone.utc))),
+        "options_mispricing_scans": _FakeResult(many=[("SYN", "CALL", 8.2, 120, "Volatility is low.", "LOW")]),
+    })
+    _patch_engine(monkeypatch, routes)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = result["section_bodies"][0]
+    assert lead["title"] == "At a glance"
+    assert status in lead["body"]
+    assert "17" in lead["body"] and "Decisions recorded (24h)" in lead["body"]
+    assert "4 sources with successful pulls (24h)" in lead["body"]
+    assert "1 sampled option rows" in lead["body"]
+    assert "not a total" in lead["body"]
+    assert "8.2/10" in lead["body"] and "not probability" in lead["body"]
+    assert "LOW" in lead["body"]
+
+
+def test_digest_summary_distinguishes_absent_regime_and_zero_activity(monkeypatch):
+    _patch_engine(monkeypatch, _QUIET_ROUTES)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = result["section_bodies"][0]["body"]
+    assert "Regime unavailable" in lead
+    assert "0" in lead and "Decisions recorded (24h)" in lead
+    assert "0 sources with successful pulls (24h)" in lead
+    assert "All systems operational" not in lead
+
+
+def test_digest_summary_failed_collection_stays_unknown_not_zero(monkeypatch):
+    class Broken(_FakeConn):
+        def execute(self, clause, *args, **kwargs):
+            if "COUNT(*)" in str(clause) or "raw_series" in str(clause):
+                raise RuntimeError("synthetic unavailable")
+            return super().execute(clause, *args, **kwargs)
+    monkeypatch.setattr("db.get_engine", lambda: type("E", (), {"connect": lambda self: Broken({})})())
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", lambda engine: None)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = result["section_bodies"][0]["body"]
+    assert "INCOMPLETE" in lead
+    assert "journal_count" in lead and "data_freshness" in lead
+    assert "Decisions (24h): unavailable" in lead
+    assert "Sources with successful pulls (24h): unavailable" in lead
+    assert "0 sources" not in lead
+
+
+@pytest.mark.parametrize("generated,expected", [
+    (None, "generation time unknown"),
+    ("2026-01-01T00:00:00+00:00", "h ago"),
+    ("2099-01-01T00:00:00+00:00", "future timestamp"),
+    ("2026-01-01T00:00:00", "timezone unknown"),
+    ("not-a-date", "generation time invalid"),
+])
+def test_research_saved_board_age_and_past_catalysts_are_visible(monkeypatch, generated, expected):
+    _patch_engine(monkeypatch, _QUIET_ROUTES)
+    board = {"as_of": "2026-01-01", "generated_at": generated, "candidates": [
+        {"ticker": "SYN", "stance": "entry_candidate", "projection": {"3y": {"p50_multiple": 2.1}},
+         "catalysts": [{"event_type": "earnings", "expected_date": "2026-01-02"}]},
+    ]}
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", lambda engine: board)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = result["section_bodies"][0]["body"]
+    details = next(s["body"] for s in result["section_bodies"] if s["title"] == "Long plays")
+    for body in (lead, details):
+        assert "Saved board, not live eligibility" in body
+        assert "2026-01-01" in body and expected in body
+        assert "saved stance: entry_candidate" in body
+        assert "2026-01-02 (past date; outcome unconfirmed)" in body
+    assert result["degraded"] == []
+    assert "2.10x (proxy)" in details

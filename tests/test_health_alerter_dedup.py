@@ -214,7 +214,7 @@ def test_send_alert_html_escapes_and_keeps_plain_text(monkeypatch):
     monkeypatch.setattr(em, "_get_settings", lambda: _Cfg())
     monkeypatch.setattr(em, "_send", lambda subject, sections: captured.update(subject=subject, sections=sections))
     assert em.send_alert("subj", "line1\nRetryError[<Future x>]", severity="warning") is True
-    section = captured["sections"][0]
+    section = next(s for s in captured["sections"] if s["title"] == "Alert")
     assert "&lt;Future x&gt;" in section["body"] and "pre-wrap" in section["body"]
     assert section["plain"] == "line1\nRetryError[<Future x>]"
 

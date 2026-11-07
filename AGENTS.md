@@ -192,3 +192,41 @@ Verification and limits:
   merge, deployment, schedule change or new external-agent communication.
 - PostgreSQL integration, full repository CI and deployed email/client acceptance
   remain separate. This does not reconcile the historical prediction track record.
+
+## 2026-11-07 - expand summary-first reporting to all email alert families
+
+What was done:
+
+- Inventoried both SMTP transports and every repository email template in
+  `docs/reference/EMAIL_ALERT_INVENTORY.md`. Extended the same draft change rather
+  than adding alternate senders or changing enablement, schedules or recipients.
+- Added source-specific headline counts, scores, states or verdicts and concise
+  recaps to all 12 shared public sender types, specialized options, supply-chain
+  and Waterfall reports, and legacy generic/backtest/daily notifications.
+- Kept full supplied narratives, commands, findings, calendar events and bounded
+  option ledger detail. Removed old presentation truncation without changing the
+  underlying scanner gates or historical scoring.
+- Clarified samples versus totals, overlapping findings, hypothetical results,
+  missing inputs, saved-board age, source dates and expired/unconfirmed catalysts.
+  Failed or unavailable sources never become a fabricated zero or all-clear.
+- Added readable multipart plain text, preserving exact code indentation and
+  repeated spaces in preformatted HTML and explicit plain text.
+- Left the pre-existing raw-attempt autoresearch notification gate and missing
+  circuit-breaker sender import dormant. Their wiring is documented separately;
+  this presentation update does not turn on extra notifications.
+
+Verification and limits:
+
+- 494 combined offline tests passed on Python 3.12, using SQLAlchemy 2.0.57,
+  mocked SMTP / SQLite and an outbound-socket block. The existing pure mock_engine
+  fixture was loaded without executing the repository's live-DB conftest setup.
+- Synthetic health, research, options, supply-chain, Waterfall and backtest HTML previews were inspected in Chromium; all led with a visible headline and recap.
+- Ruff (E/W/F, excluding E501), compilation and git diff --check passed for all
+  changed reporting code/tests. Independent review found no remaining blockers
+  after fixes for saved Long Plays freshness and plain-text command whitespace.
+- The first draft's GitHub checks passed, including backend tests on both Python
+  versions, frontend build, lint, migrations, Quiver and G3/G5 matrix checks.
+  The expanded source revision requires its own CI run.
+- No production queries, SMTP delivery, merge, deployment or external-agent
+  communication. Repository coverage is not proof of deployed email delivery,
+  historical data reconciliation or actual investment performance.

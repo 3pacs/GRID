@@ -298,9 +298,6 @@ MAX_SIGNAL_AGE_DAYS = 4
 # inside this window; with nothing new, nothing is sent.
 RESEND_COOLDOWN_HOURS = 24
 
-# Rows of the track record shown in the email (stats use a wider window).
-TRACK_RECORD_ROWS = 10
-
 VERIFY_CAP = 15
 
 _GATE_TEXT = {
@@ -790,9 +787,20 @@ def _ts(value: Any) -> str:
     return MISSING if value is None else str(value)
 
 
+def _calendar_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
 def _plain(html_text: str) -> str:
     """Readable plain-text part from a card body (tags dropped, rows kept)."""
-    t = re.sub(r"</(tr|div|p|li)>|<br\s*/?>", "\n", html_text)
+    t = re.sub(r"</(tr|div|p|li|h[1-6])>|<br\s*/?>", "\n", html_text)
     t = re.sub(r"</t[dh]>\s*<t[dh][^>]*>", "  ", t)
     t = re.sub(r"<[^>]+>", "", t)
     t = _html.unescape(t)
@@ -812,7 +820,8 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     """
     ticker = opp["ticker"]
     direction = opp["direction"]
-    today = opp.get("as_of") or datetime.now(timezone.utc).date()
+    rendered_on = datetime.now(timezone.utc).date()
+    today = _calendar_date(opp.get("as_of")) or rendered_on
     spot = verification.get("live_spot") or opp.get("spot_price")
     spot_source = verification.get("spot_source") or (
         "options_daily_signals.spot_price" if opp.get("spot_price") else None)
@@ -829,7 +838,7 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
                      f"{direction} @ ${contract['ask']:.2f} (ask)")
         rows.append(("Quote", f"bid ${contract['bid']:.2f} / ask ${contract['ask']:.2f} / "
                               f"mid ${econ['mid']:.2f} (spread {econ['spread_pct']:.0%} of mid)"))
-        rows.append(("Quote retrieved at", f"{_ts(contract.get('quote_at'))} via {_esc(contract.get('quote_source'))}; "
+        rows.append(("Quote retrieved at", f"{_esc(_ts(contract.get('quote_at')))} via {_esc(contract.get('quote_source'))}; "
                                            "local retrieval time, provider bid/ask timestamp unavailable; "
                                            f"last trade {_esc(contract.get('last_trade') or MISSING)}"))
         rows.append(("Contract IV / OI", f"{_fmt(contract.get('iv'), '.1%')} / "
@@ -852,8 +861,17 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
         call_line = f"{ticker} {direction} - no qualifying two-sided quote retrieved"
         rows.append(("Contract", MISSING))
 
+    expiry_date = _calendar_date((contract or {}).get("expiry"))
+    if expiry_date is not None and expiry_date < rendered_on:
+        call_line = "Historical idea: " + call_line
+        rows.insert(0, ("Expiry status", f"EXPIRED {expiry_date}; historical quote, not a current contract offer."))
+    elif expiry_date == rendered_on:
+        rows.insert(0, ("Expiry status", "Expires today; intraday expiry cutoff unverified."))
+    if today < rendered_on:
+        rows.append(("Idea as of", f"{today}; historical snapshot, not rechecked as of {rendered_on}."))
+
     rows.append(("Underlying", f"${_fmt(spot, ',.2f')} ({_esc(spot_source or MISSING)}, "
-                               f"retrieved {_ts(verification.get('spot_at'))}; local retrieval time)"))
+                               f"retrieved {_esc(_ts(verification.get('spot_at')))}; local retrieval time)"))
 
     stored_pcr = ((opp.get("signals") or {}).get("pcr") or {}).get("value")
     rows.append(("Stored put/call", f"open-interest ratio {_fmt(stored_pcr, '.2f')} across captured expiries "
@@ -862,7 +880,7 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     if chain:
         rows.append(("Retrieved put/call", f"volume ratio {_fmt(chain.get('volume_put_call_ratio'), '.2f')}; "
                     f"open-interest ratio {_fmt(chain.get('open_interest_put_call_ratio'), '.2f')}; "
-                    f"single expiry {_esc(chain.get('expiry'))}, retrieved {_ts(chain.get('retrieved_at'))}"))
+                    f"single expiry {_esc(chain.get('expiry'))}, retrieved {_esc(_ts(chain.get('retrieved_at')))}"))
     else:
         rows.append(("Retrieved put/call", "N/A (chain data unavailable)"))
     rows.append(("Put/call comparison", "unavailable: no like-for-like captured-expiry coverage; "
@@ -870,12 +888,17 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
 
     cat = opp.get("catalyst") or {}
     if cat.get("status") == "found":
-        cat_txt = f"{_esc(cat['type'])} {cat['date']} ({_esc(cat.get('source'))}) {_esc(cat.get('notes') or '')}"
+        cat_txt = f"{_esc(cat['type'])} {_esc(cat['date'])} ({_esc(cat.get('source'))}) {_esc(cat.get('notes') or '')}; scheduled, occurrence unconfirmed"
     elif cat.get("status") == "none_on_file":
         cat_txt = f"none on file before expiry ({_esc(cat.get('detail'))})"
     else:
         cat_txt = f"{MISSING} (catalyst lookup unavailable)"
+    catalyst_date = _calendar_date(cat.get("date"))
+    if catalyst_date is not None and catalyst_date < rendered_on:
+        cat_txt += "; PAST DATE, outcome unconfirmed"
     rows.append(("Catalyst before expiry", cat_txt))
+    if opp.get("thesis"):
+        rows.append(("Scanner thesis", _esc(opp["thesis"])))
 
     support, against = _signal_lines(opp.get("signals") or {}, direction, spot)
     why = "<br>".join(_esc(s) for s in support) or MISSING
@@ -884,14 +907,19 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     rows.append(("Signals", why))
 
     sig_date = opp.get("signal_date")
-    if isinstance(sig_date, date):
+    sig_date = _calendar_date(sig_date)
+    if sig_date is not None:
         age = (today - sig_date).days
-        sig_txt = f"options_daily_signals row {sig_date.isoformat()} ({age}d old)"
+        sig_txt = f"options_daily_signals row {sig_date.isoformat()} ({age}d old at idea date)"
+        if (rendered_on - sig_date).days > MAX_SIGNAL_AGE_DAYS:
+            sig_txt += f"; STALE at rendering ({(rendered_on - sig_date).days}d old)"
+        elif sig_date > rendered_on:
+            sig_txt += "; FUTURE date, freshness unverified"
         if opp.get("signal_captured_at") is not None:
             sig_txt += f", captured {_ts(opp['signal_captured_at'])}"
     else:
         sig_txt = MISSING
-    rows.append(("Signal data as of", sig_txt))
+    rows.append(("Signal data as of", _esc(sig_txt)))
     rows.append(("Composite score", f"{_fmt(opp.get('score'), '.2f')}/10 "
                                     f"(no measured relation to outcome — see Track Record)"))
     caveat = DIRECTION_CAVEATS.get(direction)
@@ -932,31 +960,78 @@ def _format_track_record(record: dict | None, error: str | None = None) -> dict:
             + ". Settled = intrinsic at the options_daily_signals spot on or just before expiry "
               "(intraday capture); open = latest snapshot mid vs entry ask.")
     trs = ""
-    for c in calls[:TRACK_RECORD_ROWS]:
+    # The loader bounds this sample to 50 contracts; keep every supplied detail row.
+    for c in calls:
         ret = c.get("return")
         cls = "win" if ret is not None and ret > 0 else "loss" if ret is not None else ""
         emailed = c["emailed_at"].date().isoformat() if isinstance(c.get("emailed_at"), datetime) else str(c.get("emailed_at"))
         exp = c["expiry"].isoformat() if isinstance(c.get("expiry"), date) else str(c.get("expiry"))
-        trs += (f"<tr><td>{emailed}</td><td>{_esc(c['ticker'])} {exp} ${c['strike']:,.2f} "
-                f"{c['direction']}</td><td>${_fmt(c.get('entry'), '.2f')}</td>"
-                f"<td>{c['status']}</td><td class=\"{cls}\">{_fmt(ret, '+.0%')}</td></tr>")
-    body = (f"<div>{_esc(head)}</div><table class=\"tr-table\"><thead><tr><th>Emailed</th>"
-            f"<th>Contract</th><th>Entry</th><th>Status</th><th>Return</th></tr></thead>"
+        trs += (f"<tr><td>{_esc(emailed)}</td><td>{_esc(c['ticker'])} {_esc(exp)} ${c['strike']:,.2f} "
+                f"{_esc(c['direction'])}</td><td>${_fmt(c.get('entry'), '.2f')}</td>"
+                f"<td>{_esc(c['status'])}</td><td class=\"{cls}\">{_fmt(ret, '+.0%')}</td>"
+                f"<td>{_esc(c.get('priced_on') or MISSING)}</td></tr>")
+    scope = (f"Historical sample as of {record.get('as_of') or MISSING}; all {len(calls)} supplied rows shown. "
+             "This bounded ledger sample is not a lifetime record. Returns are marks/intrinsic versus entry ask, "
+             "not realized account P/L; price dates are shown when available.")
+    body = (f"<div>{_esc(head)}</div><p>{_esc(scope)}</p><table class=\"tr-table\"><thead><tr><th>Emailed</th>"
+            f"<th>Contract</th><th>Entry</th><th>Status</th><th>Return</th><th>Price date</th></tr></thead>"
             f"<tbody>{trs}</tbody></table>")
     return {"title": "Track Record", "body": body, "accent": "purple"}
 
 
 def _format_summary_section(opportunities: list[dict], verifications: list[dict],
-                            gated: dict[str, list[str]] | None = None) -> dict:
-    """What was sent, and what was withheld and why."""
-    lines = [f"{len(opportunities)} call(s) below, each with a retrieved two-sided quote "
+                            gated: dict[str, list[str]] | None = None, *,
+                            scan_stats: dict[str, Any] | None = None) -> dict:
+    """Summarize only the shown ideas and the measured selection funnel."""
+    count = len(opportunities)
+    puts = sum(o.get("direction") == "PUT" for o in opportunities)
+    calls = sum(o.get("direction") == "CALL" for o in opportunities)
+    quoted = 0
+    for verification in verifications[:count]:
+        contract = verification.get("contract") or {}
+        bid, ask = _float_or_none(contract.get("bid")), _float_or_none(contract.get("ask"))
+        if (bid is not None and ask is not None and math.isfinite(bid) and math.isfinite(ask)
+                and 0 < bid <= ask and (ask - bid) / ((ask + bid) / 2) <= MAX_SPREAD_PCT):
+            quoted += 1
+    lines = [f"{puts} PUT / {calls} CALL among the shown ideas"
+             + (f"; {count - puts - calls} direction unavailable." if count != puts + calls else "."),
+             f"{quoted}/{count} shown ideas have a retrieved two-sided quote "
              f"within the {MAX_SPREAD_PCT:.0%}-of-mid spread limit. "
              "Quotes do not establish available size or a fill; retrieval time does not establish quote freshness."]
+    if scan_stats is not None:
+        if scan_stats.get("scanner_failed"):
+            lines.append("Scanner failed: candidate coverage is unavailable, not a clean scan.")
+        else:
+            lines.append(f"{scan_stats['candidates']} scanner candidates returned; "
+                         f"{scan_stats['quote_checked']} quote-checked. "
+                         "This is not the number of tickers in the market or scanner universe.")
+        lines.append(f"{scan_stats['sanity_rejected']} rejected for data quality; "
+                     f"{scan_stats['llm_rejected']} rejected by LLM review; "
+                     f"{scan_stats['not_checked']} not quote-checked due to the {VERIFY_CAP}-candidate cap.")
+        if scan_stats.get("generated_at") is not None:
+            lines.append(f"Digest assembled {_ts(scan_stats['generated_at'])}; source dates are on each idea.")
+    else:
+        lines.append("Scanner candidate count and quote-check coverage unavailable for this supplied payload.")
+
+    losses = [_float_or_none((o.get("economics") or {}).get("max_loss")) for o in opportunities]
+    losses = [v for v in losses if v is not None and math.isfinite(v) and v >= 0]
+    if losses:
+        loss_range = f"${min(losses):,.0f}" if min(losses) == max(losses) else f"${min(losses):,.0f}-${max(losses):,.0f}"
+        lines.append(f"Premium at risk per contract: {loss_range} across {len(losses)}/{count} shown ideas "
+                     "with calculated max loss; not a portfolio allocation.")
+    unproven = sorted({o.get("direction") for o in opportunities if o.get("direction") in DIRECTION_CAVEATS})
+    if unproven:
+        lines.append(f"UNPROVEN directions shown: {', '.join(unproven)}; "
+                     "the measured direction-specific caveats are retained on each card.")
+    lines.append("Composite scores rank scanner signals, not probabilities or expected returns. "
+                 "Calendar catalysts are scheduled events, not confirmation they occurred.")
     for reason, tickers in (gated or {}).items():
         if tickers:
-            lines.append(f"Withheld {len(tickers)} — {_GATE_TEXT.get(reason, reason)}: "
+            lines.append(f"Withheld {len(tickers)} - {_GATE_TEXT.get(reason, reason)}: "
                          f"{', '.join(sorted(set(tickers)))}")
-    body = "<br>".join(_esc(x) for x in lines)
+    body = (f'<div style="font-size:32px;font-weight:800;color:#E8F0F8;">'
+            f'{count} option ideas shown</div>'
+            + "".join(f"<p>{_esc(line)}</p>" for line in lines))
     return {"title": "Scan Summary", "body": body}
 
 
@@ -997,10 +1072,12 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
     from discovery.options_scanner import OptionsScanner
     scanner = OptionsScanner(db_engine=engine)
 
+    scanner_failed = False
     try:
         opportunities = scanner.scan_all()
     except Exception as e:
         log.error("Scanner failed: {e}", e=str(e))
+        scanner_failed = True
         opportunities = []
 
     all_opps = sorted(opportunities, key=lambda o: -o.score)
@@ -1153,7 +1230,13 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
                    e=str(exc)[:200])
         return {"sent": False, "reason": "call_ledger_write_failed", "scanned": len(opportunities)}
 
-    sections = [_format_summary_section([o for o, _ in calls], [v for _, v in calls], gated),
+    sections = [_format_summary_section(
+                    [o for o, _ in calls], [v for _, v in calls], gated,
+                    scan_stats={"candidates": len(opportunities), "scanner_failed": scanner_failed,
+                                "quote_checked": min(len(selected), VERIFY_CAP),
+                                "not_checked": max(0, len(selected) - VERIFY_CAP),
+                                "sanity_rejected": len(rejected),
+                                "llm_rejected": len(verified_opps) - len(pairs), "generated_at": now}),
                 _format_track_record(track, track_error)]
 
     calls.sort(key=lambda x: -float(x[0].get("score") or 0))
