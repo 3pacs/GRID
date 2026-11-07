@@ -49,6 +49,14 @@ def test_plan_convergence_is_ticker_move() -> None:
     assert plan.params == {"ticker": "AAPL", "direction": "up", "window_days": 14, "min_move_pct": 2.0}
 
 
+def test_plan_opposite_antithesis_negates_its_thesis() -> None:
+    crit = {"ticker": "AAPL", "expected_direction": "opposite"}
+    plan = ht.plan_trial("h_anti", "convergence", crit, _created(), thesis_direction="PUT")
+    assert plan.status is None and plan.params["direction"] == "up"
+    orphan = ht.plan_trial("h_anti", "convergence", crit, _created(), thesis_direction=None)
+    assert (orphan.status, orphan.reason) == (ht.UNTESTABLE, ht.NO_DIRECTION)
+
+
 def test_plan_convergence_without_direction_is_untestable() -> None:
     plan = ht.plan_trial("h", "convergence", {"ticker": "AAPL", "expected_direction": "opposite"},
                          _created())
@@ -332,8 +340,9 @@ def _engine(rows: list[tuple]) -> MagicMock:
     return engine
 
 
-def _row(hid: str, ptype: str, criteria: dict, days_ago: float, tested: int = 0) -> tuple:
-    return (hid, ptype, criteria, NOW - timedelta(days=days_ago), tested, hid)
+def _row(hid: str, ptype: str, criteria: dict, days_ago: float, tested: int = 0,
+         thesis_direction: str | None = None) -> tuple:
+    return (hid, ptype, criteria, NOW - timedelta(days=days_ago), tested, thesis_direction)
 
 
 CONV = {"ticker": "AAPL", "expected_direction": "up", "window_days": 14, "min_move_pct": 2.0}

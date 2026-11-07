@@ -208,8 +208,14 @@ def plan_trial(
     test_criteria: Any,
     created_at: datetime,
     times_tested: int | None = 0,
+    thesis_direction: str | None = None,
 ) -> TrialPlan:
-    """Classify a hypothesis row into its declared test. Reads no data."""
+    """Classify a hypothesis row into its declared test. Reads no data.
+
+    ``thesis_direction``: for an antithesis, its thesis' ``expected_direction``.
+    ``_make_antithesis`` had no flip for CALL/PUT, so those antitheses carry
+    ``"opposite"``; their claim is the thesis' direction negated.
+    """
     criteria = _as_dict(test_criteria)
     created = _aware(created_at)
     ptype = pattern_type or ""
@@ -218,7 +224,11 @@ def plan_trial(
 
     ticker = criteria.get("ticker")
     if ticker and "expected_direction" in criteria:
-        direction = normalize_direction(criteria.get("expected_direction"))
+        raw = criteria.get("expected_direction")
+        direction = normalize_direction(raw)
+        if str(raw or "").strip().lower() == "opposite":
+            direction = {"up": "down", "down": "up"}.get(normalize_direction(thesis_direction),
+                                                         "ambiguous")
         params = {
             "ticker": str(ticker).upper(),
             "direction": direction,
@@ -510,10 +520,13 @@ def dry_run_ledger(q: float | None = None) -> Any:
 # ── Batch scorer ─────────────────────────────────────────────────────────────
 
 _ACTIVE_SQL = text("""
-    SELECT id, pattern_type, test_criteria, created_at, COALESCE(times_tested, 0), pair_id
-    FROM discovered_hypotheses
-    WHERE status = 'active'
-    ORDER BY created_at ASC, id ASC
+    SELECT d.id, d.pattern_type, d.test_criteria, d.created_at,
+           COALESCE(d.times_tested, 0), t.test_criteria->>'expected_direction'
+    FROM discovered_hypotheses d
+    LEFT JOIN discovered_hypotheses t
+      ON d.role = 'antithesis' AND t.id = d.pair_id AND t.id <> d.id
+    WHERE d.status = 'active'
+    ORDER BY d.created_at ASC, d.id ASC
     LIMIT :limit
 """)
 
@@ -646,14 +659,14 @@ def evaluate_batch(
         pending = skipped_seen = 0
         timed_out = False
         cache: dict[str, Any] = {}
-        for hid, ptype, criteria, created, tested, _pair in rows:
+        for hid, ptype, criteria, created, tested, thesis_direction in rows:
             if max_runtime_s is not None and time.monotonic() - started >= max_runtime_s:
                 timed_out = True
                 break
             if hid in seen:
                 skipped_seen += 1
                 continue
-            plan = plan_trial(hid, ptype, criteria, created, tested)
+            plan = plan_trial(hid, ptype, criteria, created, tested, thesis_direction)
             result = run_trial(plan, conn, evaluated_at, cache)
             if result.status == "pending":
                 if evaluated_at < plan.expires_at() or plan.status is not None:
@@ -754,7 +767,15 @@ def summarize_dry_run(result: dict) -> dict:
         if t["verdict"] == "confirmed" and not t.get("prior_looks"):
             survivors_fresh += 1
     tested = [t for t in trials if t["status"] == TESTED]
+    # Sensitivity: BH over the tested trials only (drops the p = 1 denominator).
+    from analysis.offline_research_proof import bh_adjusted
+
+    q = result.get("q") or 0.10
+    tested_q = bh_adjusted([t["p_value"] for t in tested])
+    tested_only = sum(1 for t, qv in zip(tested, tested_q) if qv <= q and t["effect_ok"])
     return {
+        "confirmed_bh_over_tested_only": tested_only,
+        "min_q_bh_over_tested_only": min(tested_q, default=None),
         "scanned_active": result.get("scanned"),
         "declared_trials": len(trials),
         "tested": len(tested),
