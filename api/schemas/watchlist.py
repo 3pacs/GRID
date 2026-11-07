@@ -8,7 +8,8 @@ from pydantic import BaseModel, ConfigDict, field_validator
 class WatchlistItemCreate(BaseModel):
     ticker: str
     display_name: str | None = None
-    asset_type: str = "stock"
+    # None: guessed from the ticker (BTC -> crypto, SPY -> etf).
+    asset_type: str | None = None
     notes: str | None = None
 
     @field_validator("ticker")
@@ -21,7 +22,9 @@ class WatchlistItemCreate(BaseModel):
 
     @field_validator("asset_type")
     @classmethod
-    def validate_asset_type(cls, v: str) -> str:
+    def validate_asset_type(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
         allowed = ("stock", "crypto", "commodity", "etf", "index", "forex")
         if v not in allowed:
             raise ValueError(f"asset_type must be one of: {', '.join(allowed)}")

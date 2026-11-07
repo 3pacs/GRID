@@ -206,7 +206,7 @@ def get_portfolio(
         items.append({
             "ticker": r[0],
             "display_name": r[1],
-            "asset_type": r[2] or "stock",
+            "asset_type": _wh.effective_asset_type(r[0], r[2]),
             "custom_weight": float(r[3]) if r[3] is not None else None,
         })
 
@@ -717,7 +717,7 @@ def add_to_watchlist(
             {
                 "ticker": body.ticker,
                 "display_name": body.display_name or body.ticker,
-                "asset_type": body.asset_type,
+                "asset_type": body.asset_type or _guess_asset_type(body.ticker),
                 "notes": body.notes,
             },
         ).fetchone()
