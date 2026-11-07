@@ -365,6 +365,35 @@ class TestBCB:
             puller._fetch_series_data(11, "1994-01-01", None)
         assert get.call_count == 1
 
+    def test_empty_window_404_is_no_new_data(self, monkeypatch):
+        # Hermes' repair pulls from a recent start; a monthly series has no
+        # observation in that window and SGS answers 404 "Value(s) not found".
+        from ingestion.international import bcb
+
+        engine, _conn = _mock_engine()
+        puller = bcb.BCBPuller(engine)
+        monkeypatch.setattr(bcb.time, "sleep", lambda s: None)
+        resp = MagicMock(status_code=404, text='{"erro":{"statusCode":404,"detail":'
+                         '"br.gov.bcb.pec.sgs.comum.excecoes.SGSNegocioException: Value(s) not found"}}')
+        get = MagicMock(return_value=resp)
+        monkeypatch.setattr(bcb.requests, "get", get)
+        res = puller.pull_series(13522, "2026-10-17")
+        assert res["status"] == "SUCCESS" and res["rows_inserted"] == 0 and res["errors"] == []
+        assert get.call_count == 1
+        resp.raise_for_status.assert_not_called()
+
+    def test_other_404_still_fails(self, monkeypatch):
+        from ingestion.international import bcb
+
+        engine, _conn = _mock_engine()
+        puller = bcb.BCBPuller(engine)
+        monkeypatch.setattr(bcb.time, "sleep", lambda s: None)
+        resp = MagicMock(status_code=404, text="<html>Not Found</html>")
+        resp.raise_for_status.side_effect = _http_error(404)
+        monkeypatch.setattr(bcb.requests, "get", MagicMock(return_value=resp))
+        res = puller.pull_series(99999, "2026-10-17")
+        assert res["status"] == "FAILED"
+
     def test_incremental_start_uses_latest_obs_minus_lookback(self, monkeypatch):
         from ingestion.international import bcb
 
