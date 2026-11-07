@@ -232,6 +232,13 @@ def test_screen_covers_source_record_and_diary_context_not_only_text(job, tmp_pa
     assert result["quarantined"] == 2
 
 
+def test_screen_row_sees_raw_strings_that_json_escaping_would_hide(job):
+    assert job.screen_row({"content": "fine", "snapshot_data": {"note": "tab\x01control"}}) == ["hidden_or_control_characters"]
+    assert job.screen_row({"content": "split\npassword = abcdefghij12"}) == ["credential_assignment"]
+    assert job.screen_row({"content": "clean", "k": ["also clean", {"n": 1}]}) == []
+    assert "hidden_or_control_characters" in job.screen_row({"zero\u200bwidth key": "v"})
+
+
 @pytest.mark.parametrize("text, hit", [
     ("postgresql://grid:pw@localhost/griddb", True),
     ("Bearer abcdefghijklmnopqrstuvwxyz0123", True),

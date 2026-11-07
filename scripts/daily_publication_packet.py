@@ -181,6 +181,27 @@ def screen_text(text: str) -> list[str]:
     return reasons
 
 
+def _strings(value: Any):
+    """Every raw string in a nested row: keys and values, so JSON escaping cannot hide a hit."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings(item)
+
+
+def screen_row(row: Any) -> list[str]:
+    """Screen a whole record: each raw string (control characters intact) and the canonical encoding."""
+    reasons: list[str] = []
+    for text in [*_strings(row), canonical(row).decode("utf-8")]:
+        reasons.extend(r for r in screen_text(text) if r not in reasons)
+    return reasons
+
+
 def bounded_read(path: Path) -> bytes:
     """No symlink following and a hard byte bound, even if the file grows."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -399,7 +420,7 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
     for row in bundle.get("existing_diary_context", []):
         identity, row_sha = f"market_diary:{row['id']}:context", sha256(canonical(row))
         # The whole row is screened, not only its text: a context row enters packet.json verbatim.
-        reasons = screen_text(canonical(row).decode("utf-8"))
+        reasons = screen_row(row)
         if reasons:
             exclusions.append({"publication_id": identity, "channel": "market_diary", "disposition": "QUARANTINED_SCREEN_HIT",
                                "reasons": reasons, "text_sha256": None, "text_utf8_bytes": None, "source_row_sha256": row_sha})
@@ -429,7 +450,7 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         text_bytes = content.encode("utf-8")
         text_sha = sha256(text_bytes)
         # Screen the WHOLE canonical row: source_record (snapshot_data, grounding, etc.) enters packet.json too.
-        reasons = screen_text(canonical(row).decode("utf-8"))
+        reasons = screen_row(row)
         disposition = None
         if reasons:
             disposition = "QUARANTINED_SCREEN_HIT"
