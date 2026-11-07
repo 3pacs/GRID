@@ -113,9 +113,11 @@ CREATED = datetime(2026, 9, 1, 14, 0, tzinfo=UTC)  # 10:00 ET, before the close
 
 
 def _market_and_ticker(jump: float = 0.0) -> tuple[dict, dict]:
+    """A market walk and a ticker that moves with it (beta 1) plus its own noise."""
     days = _sessions(date(2022, 1, 3), date(2026, 10, 30))
     market = _walk(days, 1)
-    ticker = _walk(days, 2)
+    own = _walk(days, 2)
+    ticker = {d: market[d] * own[d] / 100 for d in days}
     entry = min(d for d in days if d >= date(2026, 9, 1))
     for d in days:
         if d > entry:
@@ -123,20 +125,24 @@ def _market_and_ticker(jump: float = 0.0) -> tuple[dict, dict]:
     return market, ticker
 
 
+def _move(market: dict, ticker: dict, **kw) -> ht.TrialResult:
+    return ht.ticker_move_test(ticker, {"SPY": market}, **{
+        "created_at": CREATED, "direction": "up", "window_days": 14, "min_move_pct": 2.0, **kw})
+
+
 def test_ticker_move_large_excess_move_is_significant() -> None:
     market, ticker = _market_and_ticker(jump=0.40)
-    r = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
+    r = _move(market, ticker)
     assert r.status == ht.TESTED
     assert r.p_value < 0.01 and r.effect_ok
     assert r.details["entry"] == "2026-09-01"  # created before the close: that day's close
     assert r.details["n_null"] >= ht.MIN_NULL_SAMPLES
+    assert r.details["betas"]["SPY"] == pytest.approx(1.0, abs=0.15)
 
 
 def test_ticker_move_wrong_direction_is_not_significant() -> None:
     market, ticker = _market_and_ticker(jump=0.40)
-    r = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="down",
-                            window_days=14, min_move_pct=2.0)
+    r = _move(market, ticker, direction="down")
     assert r.status == ht.TESTED
     assert r.p_value > 0.5 and not r.effect_ok
 
@@ -149,8 +155,7 @@ def test_ticker_move_market_wide_rally_is_not_a_finding() -> None:
         for d in series:
             if d > entry:
                 series[d] *= 1.15
-    r = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
+    r = _move(market, ticker)
     assert r.status == ht.TESTED
     assert r.p_value > 0.05
 
@@ -158,35 +163,117 @@ def test_ticker_move_market_wide_rally_is_not_a_finding() -> None:
 def test_ticker_move_entry_after_close_is_next_session() -> None:
     market, ticker = _market_and_ticker()
     after_close = datetime(2026, 9, 1, 21, 30, tzinfo=UTC)  # 17:30 ET
-    r = ht.ticker_move_test(ticker, market, created_at=after_close, direction="up",
-                            window_days=14, min_move_pct=2.0)
-    assert r.details["entry"] == "2026-09-02"
+    assert _move(market, ticker, created_at=after_close).details["entry"] == "2026-09-02"
 
 
 def test_ticker_move_ignores_data_after_the_window() -> None:
     market, ticker = _market_and_ticker(jump=0.40)
-    base = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="up",
-                               window_days=14, min_move_pct=2.0)
+    base = _move(market, ticker)
     later = {d: (v * 3 if d > date(2026, 9, 15) else v) for d, v in ticker.items()}
-    moved = ht.ticker_move_test(later, market, created_at=CREATED, direction="up",
-                                window_days=14, min_move_pct=2.0)
+    moved = _move(market, later)
     assert (base.p_value, base.details) == (moved.p_value, moved.details)
 
 
 def test_ticker_move_pending_until_exit_close_exists() -> None:
     market, ticker = _market_and_ticker()
     cut = {d: v for d, v in ticker.items() if d <= date(2026, 9, 5)}
-    r = ht.ticker_move_test(cut, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
-    assert r is ht.PENDING
+    assert _move(market, cut) is ht.PENDING
 
 
 def test_ticker_move_short_history_is_untestable() -> None:
     market, ticker = _market_and_ticker()
     short = {d: v for d, v in ticker.items() if d >= date(2026, 6, 1)}
-    r = ht.ticker_move_test(short, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
+    r = _move(market, short)
     assert (r.status, r.reason) == (ht.UNTESTABLE, ht.INSUFFICIENT_HISTORY)
+
+
+# ── v3: the crowd's move is not the stock's ─────────────────────────────────
+
+
+def _crowd(drop: float) -> tuple[dict, dict, dict]:
+    """SPY flat-ish; IWM (the small-cap crowd) drops ``drop`` in the window; a
+    small cap that tracks IWM drops with it."""
+    days = _sessions(date(2022, 1, 3), date(2026, 10, 30))
+    spy, iwm, own = _walk(days, 1), _walk(days, 3, vol=0.012), _walk(days, 4)
+    entry = min(d for d in days if d >= date(2026, 9, 1))
+    for d in days:
+        if d > entry:
+            iwm[d] *= 1 - drop
+    small = {d: iwm[d] * own[d] / 100 for d in days}
+    return spy, iwm, small
+
+
+def test_a_crowd_wide_drop_is_not_a_down_call_win() -> None:
+    # 2026-09-14..10-01: ~77% of US stocks lagged SPY; v2 (SPY at beta 1) let
+    # every "down" call on a small cap share that move.
+    spy, iwm, small = _crowd(drop=0.12)
+    kw = {"created_at": CREATED, "direction": "down", "window_days": 14, "min_move_pct": 2.0}
+    spy_only = ht.ticker_move_test(small, {"SPY": spy}, **kw)
+    v3 = ht.ticker_move_test(small, {"SPY": spy, "IWM": iwm}, **kw)
+    assert spy_only.p_value < 0.05                 # the v2 failure: the crowd's drop, credited
+    assert v3.status == ht.TESTED and v3.p_value > 0.10
+    assert v3.details["betas"]["IWM"] == pytest.approx(1.0, abs=0.15)
+    assert v3.details["excess_log_return"] < -0.08 < v3.details["residual_log_return"]
+
+
+def test_a_stock_falling_past_its_crowd_still_counts() -> None:
+    spy, iwm, small = _crowd(drop=0.12)
+    entry = date(2026, 9, 1)
+    worse = {d: (v * 0.65 if d > entry else v) for d, v in small.items()}
+    r = ht.ticker_move_test(worse, {"SPY": spy, "IWM": iwm}, created_at=CREATED,
+                            direction="down", window_days=14, min_move_pct=2.0)
+    assert r.status == ht.TESTED and r.p_value < 0.01 and r.effect_ok
+
+
+def test_betas_are_fitted_before_creation_only() -> None:
+    spy, iwm, small = _crowd(drop=0.0)
+    kw = {"created_at": CREATED, "direction": "up", "window_days": 14, "min_move_pct": 2.0}
+    base = ht.ticker_move_test(small, {"SPY": spy, "IWM": iwm}, **kw)
+    # Rewrite every post-creation day of the ticker: the betas must not move.
+    after = {d: (v * (1.5 if d.day % 2 else 0.7) if d >= date(2026, 9, 1) else v)
+             for d, v in small.items()}
+    moved = ht.ticker_move_test(after, {"SPY": spy, "IWM": iwm}, **kw)
+    assert base.details["betas"] == moved.details["betas"]
+    assert base.details["n_beta"] == ht.BETA_LOOKBACK_SESSIONS
+
+
+def test_too_little_history_for_betas_is_untestable() -> None:
+    spy, iwm, small = _crowd(drop=0.0)
+    short = {d: v for d, v in small.items() if d >= date(2026, 5, 1)}
+    r = ht.ticker_move_test(short, {"SPY": spy, "IWM": iwm}, created_at=CREATED,
+                            direction="up", window_days=14, min_move_pct=2.0)
+    assert (r.status, r.reason) == (ht.UNTESTABLE, ht.INSUFFICIENT_HISTORY)
+
+
+def test_a_missing_benchmark_close_keeps_the_trial_pending() -> None:
+    spy, iwm, small = _crowd(drop=0.0)
+    iwm_cut = {d: v for d, v in iwm.items() if d <= date(2026, 9, 5)}
+    r = ht.ticker_move_test(small, {"SPY": spy, "IWM": iwm_cut}, created_at=CREATED,
+                            direction="up", window_days=14, min_move_pct=2.0)
+    assert r is ht.PENDING
+
+
+@pytest.mark.parametrize("ticker,expected", [("NVDA", ["SPY", "IWM"]), ("SPY", ["IWM"]),
+                                             ("IWM", ["SPY"])])
+def test_run_trial_nets_out_the_market_and_the_crowd(ticker: str, expected: list[str]) -> None:
+    plan = ht.plan_trial("h", "convergence", {"ticker": ticker, "expected_direction": "PUT"},
+                         CREATED)
+    seen: list[str] = []
+
+    def fake_closes(conn, t, start, end, evaluated_at):
+        seen.append(t)
+        return {}
+
+    with patch.object(ht, "load_completed_closes", side_effect=fake_closes), \
+            patch.object(ht, "ticker_move_test", return_value=ht.PENDING) as test:
+        ht.run_trial(plan, MagicMock(), datetime(2026, 11, 6, tzinfo=UTC))
+    assert list(test.call_args.args[1]) == expected
+    assert seen == [ticker, *expected]
+
+
+def test_scorer_version_names_v3() -> None:
+    assert ht.SCORER_VERSION == "hypothesis-trials/3"
+    assert ht.BENCHMARK_TICKERS == ("SPY", "IWM")
 
 
 # ── lead-lag holdout test ───────────────────────────────────────────────────
