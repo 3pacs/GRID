@@ -174,6 +174,33 @@ def test_maybe_launch_respects_flag_and_freshness(monkeypatch) -> None:
     assert launched == [True, True]
 
 
+def test_daily_slot_is_not_cancelled_by_a_late_catch_up(monkeypatch) -> None:
+    """2026-11-07: a restart catch-up finished 22:30, so the 03:40 run saw a
+    5.2h-old version, skipped under the old 20h window, and logged nothing."""
+    from loguru import logger
+
+    launched: list[bool] = []
+    monkeypatch.setattr(uni, "launch_job_subprocess", lambda **kw: launched.append(True) or True)
+    monkeypatch.setenv("GRID_ACTOR_UNIVERSE_JOB", "1")
+    lines: list[str] = []
+    sink = logger.add(lambda m: lines.append(str(m)), level="INFO", format="{message}")
+    try:
+        monkeypatch.setattr(uni, "latest_complete_age_hours", lambda engine: 5.2)
+        assert uni.maybe_launch(engine=object(), max_age_hours=uni.DAILY_MIN_AGE_HOURS, trigger="daily") is True
+
+        monkeypatch.setattr(uni, "latest_complete_age_hours", lambda engine: 1.0)
+        assert uni.maybe_launch(engine=object(), max_age_hours=uni.DAILY_MIN_AGE_HOURS, trigger="daily") is False
+        assert any("(daily): newest run is 1.0h old (< 3h); not launching" in ln for ln in lines)
+
+        monkeypatch.setenv("GRID_ACTOR_UNIVERSE_JOB", "0")
+        assert uni.maybe_launch(engine=object(), trigger="daily") is False
+        assert any("(daily): GRID_ACTOR_UNIVERSE_JOB is off" in ln for ln in lines)
+    finally:
+        logger.remove(sink)
+    assert launched == [True]
+    assert uni.DAILY_MIN_AGE_HOURS < 24 <= uni.CATCH_UP_MAX_AGE_HOURS
+
+
 def test_launch_runs_a_niced_child_and_never_stacks(monkeypatch) -> None:
     calls: list[list[str]] = []
 
