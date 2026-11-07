@@ -161,3 +161,42 @@ Broken or TBD:
 - Extend or replace the [[GDELT]] parser so it ingests the real `/data/gdelt` archive roots, then build a checksum/ingest manifest before active-disk cleanup.
 - Add a manifest-backed copy/remove executor after parser proof; the current subagent is intentionally inventory/plan only.
 - The live `/home/grid/grid_v4/grid_repo` checkout is on `fix/hermes-active-hypo-scoring-dedent-2026-05-17`, ahead of origin with many dirty files. Do not hard-reset it; reconcile as a separate server-worktree cleanup.
+
+## 2026-11-06 - explicit daily publication packet handoff job (source only)
+
+What was done:
+
+- Added `docs/runbooks/DAILY-PUBLICATION-PACKET.md`: Codex owns end-to-end daily
+  closure and Claude owns capture production. Named the UTC-day key, existing
+  scheduler, stage receipts, admission/A10 handoff, private custody/dedup,
+  privacy screening, local/Gemini review and visible failure/deadline handling.
+- Added a stdlib-only offline status reporter and operational regression tests.
+  It summarizes supplied metadata, never authorizes execution, and does not
+  replace the external producer, its one-use registry or the existing scheduler.
+- Reconciled scope with M0 issue #958 and research protocol issue #960; neither
+  is completed by this operational handoff. No `.agents/skills` directory was
+  present; inspected relevant `.claude/skills` and the module inventory instead.
+
+Non-obvious decisions:
+
+- A missing capture/admission record does not establish diary execution failure.
+  The status explicitly distinguishes diary evidence from packet preparation and
+  admission review. `COMPLETE_REPORTED` is a declaration, not custody verification
+  or scientific acceptance.
+- A10's existing conditions remain required. Spent/started/unknown capture
+  attempts require reconciliation and cannot be automatically replayed.
+
+Broken or TBD:
+
+- Existing external automation/producer owners must adopt the observation
+  contract and retain runtime receipts at the existing private ledger. This
+  source PR does not prove today's diary ran or repair historical packets.
+- No capture, production query, Gemini call, timer/schedule change, merge or
+  deployment is included. Full repository CI and native runtime acceptance
+  remain separate from the offline controls.
+
+Next pick-up:
+
+- Follow the runbook's adoption/operational acceptance checklist in the existing
+  automation. Retain one naturally scheduled run's two output statuses and
+  failure notification before declaring the pipeline repaired.
