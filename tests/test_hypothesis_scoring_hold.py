@@ -12,11 +12,13 @@ from intelligence import hypothesis_engine as he
 from scripts import goal_worker
 
 
-def test_scoring_is_held_by_default() -> None:
-    assert he.ACTIVE_HYPOTHESIS_SCORING_HELD is True
+def test_scoring_hold_is_lifted_for_the_v2_scorer() -> None:
+    # Lifted on owner approval once the v2 ledgered scorer (#1008) landed.
+    assert he.ACTIVE_HYPOTHESIS_SCORING_HELD is False
 
 
-def test_held_score_hypothesis_touches_no_database() -> None:
+def test_held_score_hypothesis_touches_no_database(monkeypatch) -> None:
+    monkeypatch.setattr(he, "ACTIVE_HYPOTHESIS_SCORING_HELD", True)
     engine = MagicMock()
     result = he.HypothesisGenerator(engine).score_hypothesis("h-1")
     assert result["held"] is True
@@ -25,7 +27,8 @@ def test_held_score_hypothesis_touches_no_database() -> None:
     engine.begin.assert_not_called()
 
 
-def test_held_batch_scorer_queries_nothing() -> None:
+def test_held_batch_scorer_queries_nothing(monkeypatch) -> None:
+    monkeypatch.setattr(he, "ACTIVE_HYPOTHESIS_SCORING_HELD", True)
     engine = MagicMock()
     counts = he.score_due_active_hypotheses(engine, batch_size=10, max_runtime_s=5)
     assert counts["held"] is True
@@ -34,7 +37,8 @@ def test_held_batch_scorer_queries_nothing() -> None:
     engine.begin.assert_not_called()
 
 
-def test_goal_worker_handler_is_held() -> None:
+def test_goal_worker_handler_is_held(monkeypatch) -> None:
+    monkeypatch.setattr(he, "ACTIVE_HYPOTHESIS_SCORING_HELD", True)
     engine = MagicMock()
     goal = MagicMock(target_id="h-2", allow_cloud=False)
     summary = goal_worker.handle_score_active_hypothesis(engine, goal)

@@ -97,7 +97,7 @@ MIN_TESTS_FOR_CONFIDENCE_KILL = 3
 # trial ledger before any row changes. Single-row callers defer to the batch.
 # Lifting this hold also needs HYPOTHESIS_TRIAL_LEDGER_PATH/_ANCHOR_PATH set;
 # without them the batch scorer writes nothing.
-ACTIVE_HYPOTHESIS_SCORING_HELD = True
+ACTIVE_HYPOTHESIS_SCORING_HELD = False  # lifted on owner approval: v2 ledgered scorer (PR #1008)
 
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
