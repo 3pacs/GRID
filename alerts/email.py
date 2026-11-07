@@ -993,7 +993,11 @@ def daily_digest(
         # or invent totals from capped query rows. No extra database queries.
         regime_section = next((s for s in sections if s["title"].startswith("Regime State")), None)
         if regime_section:
-            regime_summary = f"{regime_section['title']}: {_summary_text(_html_to_plain(regime_section['body']), 250)}"
+            regime_text = _html_to_plain(regime_section["body"])
+            if regime_section["title"] == "Regime State":
+                regime_text = regime_text.replace(" Reported state confidence:", "; Reported state confidence:")
+                regime_text = regime_text.replace("\nSuggested Action:", "; Suggested Action:")
+            regime_summary = f"{regime_section['title']}: {_summary_text(regime_text, 250)}"
         else:
             regime_summary = "Regime unavailable; no current state can be established."
         summary = [regime_summary]
@@ -1004,7 +1008,8 @@ def daily_digest(
         summary.append(f"{active_sources} sources with successful pulls (24h)." if active_sources is not None
                        else "Sources with successful pulls (24h): unavailable.")
         if option_rows is not None:
-            summary.append(f"{len(option_rows)} sampled option rows (up to 5, not a total; scan dates D-3 through D inclusive).")
+            row_label = "row" if len(option_rows) == 1 else "rows"
+            summary.append(f"{len(option_rows)} sampled option {row_label} (up to 5, not a total; scan dates D-3 through D inclusive).")
             if option_rows:
                 top = option_rows[0]
                 confidence = str(top[5] or "").upper()

@@ -267,3 +267,7 @@ Verification and limits:
   overflow and the computed purple accent. Preview files remain outside the
   repository. This is not live delivery or pixel-identical Gmail validation;
   full repository CI, publication, merge and deployment remain separate.
+- Visual-review follow-up: separated the current-regime recap fields with
+  semicolons and made a one-row sample singular. Stale/unverified recaps and
+  full regime cards are unchanged. All 508 offline tests and the same lint,
+  compile, diff and affected desktop/mobile preview checks passed again.

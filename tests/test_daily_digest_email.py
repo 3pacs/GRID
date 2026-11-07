@@ -700,10 +700,18 @@ def test_digest_summary_preserves_regime_freshness_and_scopes_metrics(monkeypatc
     assert status in lead["body"]
     assert "17" in lead["body"] and "Decisions recorded (24h)" in lead["body"]
     assert "4 sources with successful pulls (24h)" in lead["body"]
-    assert "1 sampled option rows" in lead["body"]
+    assert "1 sampled option row (up to 5" in lead["body"]
+    assert "1 sampled option rows" not in lead["body"]
     assert "not a total" in lead["body"]
     assert "8.2/10" in lead["body"] and "not probability" in lead["body"]
     assert "LOW" in lead["body"]
+    regime = next(s for s in result["section_bodies"] if s["title"].startswith("Regime State"))
+    if age_hours == 1:
+        assert "Regime State: RISK_ON; Reported state confidence: 80%; Suggested Action: BUY" in lead["body"]
+        assert regime["body"] == email_mod._section_regime("RISK_ON", .8, "BUY")["body"]
+    else:
+        expected_recap = email_mod._summary_text(email_mod._html_to_plain(regime["body"]), 250)
+        assert expected_recap in email_mod._html_to_plain(lead["body"])
 
 
 def test_digest_summary_distinguishes_absent_regime_and_zero_activity(monkeypatch):
@@ -828,6 +836,7 @@ def test_daily_recap_renders_bullets_with_scoped_samples_and_full_details(monkey
     recap = email_mod._html_to_plain(lead["body"])
     bullets = [line for line in recap.splitlines() if line.startswith("- ")]
     assert len(bullets) == 5
+    assert "- Regime State: RISK_ON; Reported state confidence: 80%; Suggested Action: HOLD" in bullets
     assert "Decisions (24h):" not in recap
     assert "17 \u2014 Decisions recorded (24h)" in lead["plain"]
     assert "5 sampled option rows (up to 5, not a total; scan dates D-3 through D inclusive)" in recap
