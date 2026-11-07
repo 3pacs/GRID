@@ -244,9 +244,11 @@ class TestFinDKG:
         assert "no valid triples" in out["error"]
         assert _classify_outcome(out)[:2] == ("FAILED", 0)
 
-    def test_grid_scheduler_wiring(self) -> None:
-        _wiring_grid_scheduler("FinDKG", "ingestion.altdata.findkg_puller",
-                               "FinDKGPuller", "pull", "findkg")
+    def test_retired_from_grid_scheduler(self) -> None:
+        """FinDKG and last30days Trending News were unscheduled 2026-11-07 (owner)."""
+        src = (Path(__file__).resolve().parent.parent / "ingestion" / "scheduler.py").read_text()
+        assert "FinDKGPuller(" not in src
+        assert "TrendingNewsPuller(" not in src
 
 
 # ── ICIJ_Full ───────────────────────────────────────────────────────────
