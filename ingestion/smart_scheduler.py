@@ -1971,6 +1971,13 @@ class SmartScheduler:
         # class pullers) live in _SOURCE_EXTRAS, and alias names alias onto
         # a canonical PULLER_REGISTRY entry — neither indicates a bug.
         intentional_cfg_only = set(_SOURCE_EXTRAS.keys()) | set(_SOURCE_ALIASES.keys())
+        # _build_source_registry also adds each entry's source_catalog name
+        # (REGISTRY_CATALOG_NAMES) as an alias; those 33 names were reported
+        # as orphans although every one aliases a registered puller.
+        intentional_cfg_only |= {
+            catalog.strip().lower().replace(" ", "_").replace("-", "_")
+            for name, catalog in REGISTRY_CATALOG_NAMES.items() if name in reg
+        }
         only_cfg = (cfg - reg) - intentional_cfg_only
         only_reg = reg - cfg
         if only_cfg:
