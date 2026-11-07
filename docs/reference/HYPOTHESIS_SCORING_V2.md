@@ -88,3 +88,20 @@ Proposal: an append-only `hypothesis_registry_labels` table
 `scripts/notify.py`) reading through it. The 35 + 185 distinct statements can
 be re-declared as fresh v2-style trials with a forward holdout from the date of
 re-declaration.
+
+## Production dry run (2026-11-07 00:5xZ, read-only, release f5b0510e + this branch)
+
+`python -m intelligence.hypothesis_trials dry-run` on griddb, every connection
+`default_transaction_read_only = on`, in-memory ledger:
+
+- 4,954 active rows scanned (all `times_tested = 0`: v1 never looked at them).
+- 4,750 declared trials, 204 pending (external lead-lag rows created
+  2026-09-19; their one look is due 2026-12-21).
+- 4,060 ineligible `SELF_TELEMETRY` (3,590 `snap:*` lead-lag, 470 category
+  watches), 16 `NO_MARKET_OUTCOME`, 20 `NO_DATA`, 4 `NO_DIRECTION`,
+  4 `INSUFFICIENT_HISTORY`.
+- 646 tested (323 convergence theses, all "down", created 2026-09-13..19, and
+  their 323 antitheses) over 150 tickers. Min p 0.0079; 31 raw p < 0.05
+  (25 theses, 6 antitheses: about chance for 646 one-sided tests).
+- **Confirmed: 0** at BH q = 0.10 over the batch (min q = 1.0), and 0 with BH
+  over the 646 tested trials alone (min q = 0.91).
