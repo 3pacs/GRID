@@ -1902,12 +1902,15 @@ SKIP_RETRY_MINUTES = 30
 TICK_TIME_BUDGET_S = 300  # 5 minutes
 
 
+MISSING_API_KEY_PREFIX = "Missing API key: "
+
+
 class MissingPullerApiKey(Exception):
     """Raised when a registry entry requires an unset API key."""
 
     def __init__(self, key_name: str) -> None:
         self.key_name = key_name
-        super().__init__(f"Missing API key: {key_name}")
+        super().__init__(f"{MISSING_API_KEY_PREFIX}{key_name}")
 
 
 class SmartScheduler:
@@ -2421,10 +2424,20 @@ class SmartScheduler:
         run, never a RUNNING row that a restart could orphan.
         """
         status = result.get("status")
-        if status == OUTCOME_SKIPPED:
-            return
         error = result.get("error")
-        if status == OUTCOME_NO_NEW_DATA:
+        if status == OUTCOME_SKIPPED:
+            reason = str(result.get("reason") or "")
+            if not reason.startswith(MISSING_API_KEY_PREFIX):
+                return
+            # A missing key is configuration, not a transient skip: record it
+            # the grid-scheduler way (SUCCESS, 0 rows, "SKIPPED: ...") so
+            # pipeline-health shows skipped_config instead of the last real
+            # failure forever. Restart state then waits freq_h before the
+            # next check, which is all a missing key warrants.
+            log_status = OUTCOME_SUCCESS
+            error = f"SKIPPED: {reason}"
+            result = {**result, "rows_inserted": 0}
+        elif status == OUTCOME_NO_NEW_DATA:
             # A completed check that wrote nothing. pull_log's CHECK
             # constraint has no such status, so it is stored as SUCCESS
             # with rows_inserted = 0 and the NO_NEW_DATA marker in

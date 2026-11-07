@@ -586,7 +586,13 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # the dark_pool registry entry's timeout_s 60 -> 120 with a 3-line
         # comment (its bounded FINRA fetch window is 2-3 pages at ~6s each).
         # Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','a1595b64099c5576ef94169a0c1200156e71ac48663b7022c60d50c418e689fe')]:
+        # SCHED re-pinned a1595b64 -> accdd222 (2026-11-07,
+        # claude/log-missing-key-skips-20261107): the only scheduler edits are
+        # MISSING_API_KEY_PREFIX (used by MissingPullerApiKey's message) and
+        # _log_run writing a missing-key SKIPPED as SUCCESS / 0 rows /
+        # "SKIPPED: Missing API key: X" (other skips stay unlogged). Needs
+        # reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','accdd222f8a71b7394bf14724ccbc8c18f8aa58e041a3a6a078033a1b5675835')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
