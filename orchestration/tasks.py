@@ -113,12 +113,17 @@ def check_alerts() -> dict:
 
 @task(retries=2, retry_delay_seconds=10, log_prints=True)
 def run_graph_analytics() -> dict:
-    """Run graph analytics batch (PageRank, communities)."""
+    """Run graph analytics batch (PageRank, communities) on the curated graph.
+
+    The full 3.5M-actor graph is the actor-universe job's
+    (``intelligence/actors/universe.py``, igraph, out of process); networkx on
+    it here would take hours.
+    """
     log.info("Running graph analytics")
 
     try:
-        from scripts.graph_analytics import run_analytics
-        result = run_analytics()
+        from scripts.graph_analytics import run_graph_analytics as _run
+        result = _run(scope="curated")
         return {"status": "success", "result": str(result)[:500]}
     except Exception as e:
         log.error(f"Graph analytics failed: {e}")
