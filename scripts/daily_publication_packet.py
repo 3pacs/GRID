@@ -393,13 +393,23 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
     for channel, receipt in bundle["channels"].items():
         if receipt.get("truncated"):
             packet["blockers"].append(f"{channel}: record cap reached; requested window truncated")
-    packet["existing_diary_context"] = bundle.get("existing_diary_context", [])
-    for row in packet["existing_diary_context"]:
+    exclusions: list[dict[str, Any]] = []
+    packet["existing_diary_context"] = []
+    packet["capture_receipt"]["quarantined_context_ids"] = []
+    for row in bundle.get("existing_diary_context", []):
+        identity, row_sha = f"market_diary:{row['id']}:context", sha256(canonical(row))
+        # The whole row is screened, not only its text: a context row enters packet.json verbatim.
+        reasons = screen_text(canonical(row).decode("utf-8"))
+        if reasons:
+            exclusions.append({"publication_id": identity, "channel": "market_diary", "disposition": "QUARANTINED_SCREEN_HIT",
+                               "reasons": reasons, "text_sha256": None, "text_utf8_bytes": None, "source_row_sha256": row_sha})
+            packet["capture_receipt"]["quarantined_context_ids"].append(identity)
+            continue
+        packet["existing_diary_context"].append(row)
         packet["evidence"].append({
-            "id": f"market_diary:{row['id']}:context", "sha256": sha256(canonical(row)), "role": "hindsight",
+            "id": identity, "sha256": row_sha, "role": "hindsight",
             "source": "market_diary existing retrospective output about the day; not a new forecast or validated outcome",
             "available_at": None, "captured_at": bundle["captured_at"]})
-    exclusions: list[dict[str, Any]] = []
     aggregate = 0
     for item in bundle["records"]:
         channel, row = item["channel"], item["record"]
@@ -418,7 +428,8 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
             continue
         text_bytes = content.encode("utf-8")
         text_sha = sha256(text_bytes)
-        reasons = screen_text(content)
+        # Screen the WHOLE canonical row: source_record (snapshot_data, grounding, etc.) enters packet.json too.
+        reasons = screen_text(canonical(row).decode("utf-8"))
         disposition = None
         if reasons:
             disposition = "QUARANTINED_SCREEN_HIT"

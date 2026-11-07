@@ -217,6 +217,21 @@ def test_screen_hit_quarantines_whole_record_without_truncation(job, tmp_path):
     assert result["quarantined"] == 1 and result["publications_projected"] == 3
 
 
+def test_screen_covers_source_record_and_diary_context_not_only_text(job, tmp_path):
+    leaky = _briefing(1, 1)
+    leaky["snapshot_data"] = {"debug": "api_key=ABCDEFGHIJKLMNOP1234"}
+    data = _data(briefings=[leaky, _briefing(2, 2)])
+    data["diary_context"] = [_diary(43, DAY, NOW - timedelta(minutes=50), content="ok"),
+                             _diary(44, DAY - timedelta(days=1), NOW - timedelta(days=1), content="postgresql://u:p@h/db")]
+    result = _run(job, tmp_path, FakeEngine(data))
+    packet = json.loads((tmp_path / "packets" / "2026-11-06" / "packet.json").read_bytes())
+    assert [p["id"] for p in packet["publications"] if p["source"] == "market_briefings"] == ["market_briefings:5002"]
+    assert [r["id"] for r in packet["existing_diary_context"]] == [43]
+    assert packet["capture_receipt"]["quarantined_context_ids"] == ["market_diary:44:context"]
+    assert "ABCDEFGHIJKLMNOP1234" not in json.dumps(packet) and "postgresql://" not in json.dumps(packet)
+    assert result["quarantined"] == 2
+
+
 @pytest.mark.parametrize("text, hit", [
     ("postgresql://grid:pw@localhost/griddb", True),
     ("Bearer abcdefghijklmnopqrstuvwxyz0123", True),
