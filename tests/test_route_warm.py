@@ -76,3 +76,17 @@ def test_warm_reports_but_survives_a_failing_router(monkeypatch) -> None:
 
     monkeypatch.setattr(fastapi_routing._IncludedRouter, "effective_candidates", boom)
     assert warm_route_contexts(app.router) == 0
+
+
+
+def test_prewarm_builds_route_contexts_and_openapi(monkeypatch) -> None:
+    """The deploy fetches /openapi.json right after restart; building it there stalled the loop ~5 s."""
+    from api.main import _prewarm_request_path
+
+    app = _app()
+    assert app.openapi_schema is None
+    _prewarm_request_path(app)
+    assert "/api/inner/leaf/{x}" in app.openapi_schema["paths"]
+    calls = _count_builds(monkeypatch)
+    assert TestClient(app).get("/api/top").json() == {"ok": True}
+    assert calls[0] == 0
