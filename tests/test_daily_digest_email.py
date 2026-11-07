@@ -739,6 +739,9 @@ def test_digest_summary_failed_collection_stays_unknown_not_zero(monkeypatch):
     ("2099-01-01T00:00:00+00:00", "future timestamp"),
     ("2026-01-01T00:00:00", "timezone unknown"),
     ("not-a-date", "generation time invalid"),
+    (datetime(2026, 1, 1), "timezone unknown"),
+    (datetime(2026, 1, 1, tzinfo=timezone.utc), "generated 2026-01-01T00:00:00+00:00"),
+    ("2026-01-01T02:00:00+02:00", "generated 2026-01-01T00:00:00+00:00"),
 ])
 def test_research_saved_board_age_and_past_catalysts_are_visible(monkeypatch, generated, expected):
     _patch_engine(monkeypatch, _QUIET_ROUTES)
@@ -750,10 +753,188 @@ def test_research_saved_board_age_and_past_catalysts_are_visible(monkeypatch, ge
     result = email_mod.daily_digest(dry_run=True)
     lead = result["section_bodies"][0]["body"]
     details = next(s["body"] for s in result["section_bodies"] if s["title"] == "Long plays")
-    for body in (lead, details):
-        assert "Saved board, not live eligibility" in body
-        assert "2026-01-01" in body and expected in body
-        assert "saved stance: entry_candidate" in body
-        assert "2026-01-02 (past date; outcome unconfirmed)" in body
+    assert "Weekly saved snapshot" in lead and "not live eligibility" in lead
+    assert "data as of 2026-01-01" in lead and "saved stance:" not in lead
+    assert "generated " not in lead
+    assert "Weekly saved snapshot, not live eligibility" in details
+    assert "2026-01-01" in details and expected in details
+    assert "saved stance: entry_candidate" in details
+    assert "2026-01-02 (past date; outcome unconfirmed)" in details
     assert result["degraded"] == []
     assert "2.10x (proxy)" in details
+    assert expected in email_mod._render_plain(result["section_bodies"])
+
+
+@pytest.mark.parametrize("summary", [
+    ["State <unknown> & unverified.", "5 sampled rows, not a total."],
+    ("State <unknown> & unverified.", "5 sampled rows, not a total."),
+])
+def test_structured_summary_keeps_escaped_html_and_separate_plain_bullets(summary):
+    section = email_mod._section_summary("17 < 20", "Decisions & records", summary)
+    markup = email_mod._render_html("Synthetic summary", [section])
+    plain = email_mod._render_plain([section])
+    assert section["body"].count("<li ") == 2
+    assert "<ul " in markup and "</ul>" in markup
+    assert "17 &lt; 20" in markup and "Decisions &amp; records" in markup
+    assert "State &lt;unknown&gt; &amp; unverified." in markup
+    assert "<unknown>" not in markup
+    for item in summary:
+        assert f"- {item}" in plain.splitlines()
+        assert f"- {item}" in email_mod._html_to_plain(markup).splitlines()
+
+
+def test_string_summary_retains_existing_paragraph_and_plain_contract():
+    summary = "First <sentence>.\nSecond & sentence."
+    section = email_mod._section_summary("7", "Records", summary, "amber")
+    assert section == {
+        "title": "At a glance",
+        "body": ('<div style="font-size:32px;font-weight:800;color:#E8F0F8;">7</div>'
+                 '<div style="font-size:13px;color:#9AB2C8;">Records</div>'
+                 '<p>First &lt;sentence&gt;.\nSecond &amp; sentence.</p>'),
+        "plain": f"7 \u2014 Records\n{summary}",
+        "accent": "amber",
+    }
+
+
+def test_daily_recap_renders_bullets_with_scoped_samples_and_full_details(monkeypatch):
+    now = datetime.now(timezone.utc)
+    thesis = "Synthetic thesis <not HTML> & evidence. " * 30 + "FULL THESIS END."
+    routes = dict(_QUIET_ROUTES)
+    routes.update({
+        "inferred_state": _FakeResult(one=("RISK_ON", .8, "HOLD", now)),
+        "COUNT(*)": _FakeResult(one=(17,)),
+        "raw_series": _FakeResult(one=(4, now)),
+        "options_mispricing_scans": _FakeResult(many=[
+            (f"OPT{i}", "CALL", 8.2, 120, thesis, "LOW") for i in range(5)
+        ]),
+    })
+    _patch_engine(monkeypatch, routes)
+    board = {
+        "as_of": "2026-01-01", "generated_at": "2026-01-01T06:10:00+00:00",
+        "candidates": [
+            {"ticker": "SKIP", "stance": "avoid"},
+            *[{"ticker": f"SYN{i}<tag>", "stance": "watch" if i == 0 else "entry_candidate",
+               "coverage_route": "route & detail", "projection": {"3y": {"p50_multiple": 2.1}},
+               "catalysts": [{"event_type": "earnings", "expected_date": "2026-01-02"}]}
+              for i in range(7)],
+        ],
+    }
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", lambda engine: board)
+    sends = _patch_send_sync(monkeypatch)
+    result = email_mod.daily_digest()
+    assert result["degraded"] == [] and len(sends) == 1
+    sections = sends[0][0][1]
+    lead = sections[0]
+    recap = email_mod._html_to_plain(lead["body"])
+    bullets = [line for line in recap.splitlines() if line.startswith("- ")]
+    assert len(bullets) == 5
+    assert "Decisions (24h):" not in recap
+    assert "17 \u2014 Decisions recorded (24h)" in lead["plain"]
+    assert "5 sampled option rows (up to 5, not a total; scan dates D-3 through D inclusive)" in recap
+    assert "Top sampled row: OPT0 CALL, 8.2/10 composite score (not probability); heuristic confidence: LOW" in recap
+    assert "Long plays: Weekly saved snapshot" in recap
+    assert "5 candidates shown (up to 5)" in recap
+    assert "not live eligibility" in recap
+    assert "data as of 2026-01-01" in recap
+    assert "2026-01-01T06:10" not in recap
+    assert "First saved row" not in recap and "saved stance:" not in recap
+    detail = next(s for s in sections if s["title"] == "Long plays")
+    assert detail["accent"] == "purple"
+    assert "Weekly saved snapshot, not live eligibility" in detail["body"]
+    assert "Data as of 2026-01-01; generated 2026-01-01T06:10:00+00:00" in detail["body"]
+    assert detail["body"].count("saved stance:") == 5
+    assert "SYN1&lt;tag&gt;" in detail["body"] and "SYN5&lt;tag&gt;" in detail["body"]
+    assert "SYN0" not in detail["body"] and "SYN6" not in detail["body"] and "SKIP" not in detail["body"]
+    assert "route &amp; detail" in detail["body"]
+    assert "2.10x (proxy)" in detail["body"]
+    assert "past date; outcome unconfirmed" in detail["body"]
+    markup = email_mod._render_html("Synthetic daily digest", sections)
+    plain = email_mod._render_plain(sections)
+    assert 'class="card card-accent-purple"' in markup
+    assert ".card-accent-purple { border-left-color:#A855F7; }" in markup
+    assert "card-accent-#" not in markup
+    assert "<tag>" not in markup and "<not HTML>" not in markup
+    assert markup.index("At a glance") < markup.index('class="card-title">Long plays')
+    assert plain.index("[At a glance]") < plain.index("[Long plays]")
+    assert plain.count(thesis) == 5
+    for line in bullets:
+        assert line in plain.splitlines()
+    assert "SYN1<tag> \u2014 saved stance: entry_candidate \u2014 via route & detail" in plain
+
+
+def test_daily_recap_keeps_stand_down_reason_below_weekly_snapshot_summary(monkeypatch):
+    _patch_engine(monkeypatch, _QUIET_ROUTES)
+    reason = "No entries <qualified> & evidence missing. " * 20 + "FULL REASON END."
+    board = {"as_of": "2026-01-01", "stand_down_reason": reason, "candidates": []}
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", lambda engine: board)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = result["section_bodies"][0]["body"]
+    detail = next(s["body"] for s in result["section_bodies"] if s["title"] == "Long plays")
+    assert "Weekly saved snapshot" in lead and "stand-down reason below" in lead
+    assert "not live eligibility" in lead and "FULL REASON END" not in lead
+    assert reason in email_mod._html_to_plain(detail)
+    assert "generation time unknown; age unverified" in detail
+    assert "<qualified>" not in detail
+
+
+def test_degraded_recap_retains_known_decision_count_when_headline_is_incomplete(monkeypatch):
+    _patch_engine(monkeypatch, {**_QUIET_ROUTES, "COUNT(*)": _FakeResult(one=(17,))})
+    def broken_board(engine):
+        raise RuntimeError("Synthetic board unavailable")
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", broken_board)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = email_mod._html_to_plain(result["section_bodies"][0]["body"])
+    assert "INCOMPLETE" in lead
+    assert "- Incomplete collection: long_plays." in lead.splitlines()
+    assert "- Decisions (24h): 17." in lead.splitlines()
+    assert "Weekly saved snapshot" not in lead
+
+
+@pytest.mark.parametrize("data_date,expected", [
+    (None, "unknown"), ("<unverified> & date", "<unverified> & date"),
+])
+def test_saved_snapshot_recap_keeps_missing_or_untrusted_data_date_honest(monkeypatch, data_date, expected):
+    _patch_engine(monkeypatch, _QUIET_ROUTES)
+    board = {"as_of": data_date, "stand_down_reason": "Synthetic stand-down."}
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", lambda engine: board)
+    result = email_mod.daily_digest(dry_run=True)
+    lead = result["section_bodies"][0]["body"]
+    assert f"data as of {expected}" in email_mod._html_to_plain(lead)
+    assert "<unverified>" not in lead
+    assert "not live eligibility" in lead
+
+
+def test_summary_accepts_single_use_iterable_without_losing_plain_bullets():
+    section = email_mod._section_summary("1", "Record", iter(["First.", "Second."]))
+    assert section["plain"].endswith("- First.\n- Second.")
+    assert email_mod._html_to_plain(section["body"]).endswith("- First.\n- Second.")
+
+
+
+def test_absent_decision_count_remains_unknown_in_bullet_recap(monkeypatch):
+    _patch_engine(monkeypatch, {**_QUIET_ROUTES, "COUNT(*)": _FakeResult(one=None)})
+    result = email_mod.daily_digest(dry_run=True)
+    lead = email_mod._html_to_plain(result["section_bodies"][0]["body"])
+    assert "RESEARCH UPDATE" in lead
+    assert "- Decisions (24h): unavailable." in lead.splitlines()
+    assert "Decisions recorded (24h)" not in lead
+    assert "Weekly saved snapshot" not in lead
+
+
+def test_failed_option_sample_stays_unavailable_not_zero_in_bullet_recap(monkeypatch):
+    class BrokenOptions(_FakeConn):
+        def execute(self, clause, *args, **kwargs):
+            if "options_mispricing_scans" in str(clause):
+                raise RuntimeError("Synthetic sample unavailable")
+            return super().execute(clause, *args, **kwargs)
+    _patch_engine(monkeypatch, _QUIET_ROUTES)
+    monkeypatch.setattr("db.get_engine", lambda: type("E", (), {
+        "connect": lambda self: BrokenOptions(_QUIET_ROUTES),
+    })())
+    result = email_mod.daily_digest(dry_run=True)
+    lead = email_mod._html_to_plain(result["section_bodies"][0]["body"])
+    assert result["degraded"] == ["100x_opportunities"]
+    assert "INCOMPLETE" in lead
+    assert "- Option scan sample unavailable." in lead.splitlines()
+    assert "0 sampled option rows" not in lead
+    assert "Top sampled row" not in lead
