@@ -119,7 +119,7 @@ DIARY_CONTEXT_QUERY = (
 # Screens (whole-record quarantine on hit). Patterns follow the retained daily
 # screened-projection lineage; only size caps were loosened (operator decision).
 SCREEN = {name: re.compile(pattern, re.MULTILINE) for name, pattern in {
-    "credential_assignment": r'(?i)(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|bearer)\s*[:=]\s*["\']?[^\s,}\]]{8,}',
+    "credential_assignment": r'(?i)(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|bearer)["\']?\s*[:=]\s*["\']?[^\s,}\]"\']{8,}',
     "credential_token": r'(?:\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|\bsk-[A-Za-z0-9_-]{20,}|\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[A-Za-z0-9]{30,})',
     "connection_string": r'(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s]+|[?&](?:token|key|sig|signature|password|secret|access_token)=',
     "private_key_block": r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----',
@@ -188,6 +188,8 @@ def _strings(value: Any):
     elif isinstance(value, dict):
         for key, item in value.items():
             yield str(key)
+            if isinstance(item, (str, int, float)) and not isinstance(item, bool):
+                yield f"{key}={item}"  # the assignment screens see the pair, not only the halves
             yield from _strings(item)
     elif isinstance(value, (list, tuple)):
         for item in value:

@@ -237,6 +237,10 @@ def test_screen_row_sees_raw_strings_that_json_escaping_would_hide(job):
     assert job.screen_row({"content": "split\npassword = abcdefghij12"}) == ["credential_assignment"]
     assert job.screen_row({"content": "clean", "k": ["also clean", {"n": 1}]}) == []
     assert "hidden_or_control_characters" in job.screen_row({"zero\u200bwidth key": "v"})
+    # Key/value split: the credential lives in a JSON pair, never in one string on its own.
+    assert "credential_assignment" in job.screen_row({"content": "fine", "snapshot_data": {"password": "hunter2hunter2"}})
+    assert "credential_assignment" in job.screen_text('{"api_key":"ABCDEFGHIJKLMNOP1234"}')
+    assert job.screen_row({"content": "fine", "sentiment_score": 0.12, "narrative_fallback": True}) == []
 
 
 @pytest.mark.parametrize("text, hit", [
