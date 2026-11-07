@@ -186,6 +186,12 @@ _ADD_ROLE = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS rol
 _ADD_PAIR_ID = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS pair_id TEXT")
 _ADD_KILL_REASON = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS kill_reason TEXT")
 _ADD_KILLED_AT = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS killed_at TIMESTAMPTZ")
+# v2 verdict columns (intelligence.hypothesis_trials; migration
+# hyp_registry_labels_20261107). NULL scoring_version = a v1 verdict.
+_ADD_SCORING_VERSION = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS scoring_version TEXT")
+_ADD_TRIAL_P = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS trial_p_value DOUBLE PRECISION")
+_ADD_TRIAL_Q = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS trial_q_value DOUBLE PRECISION")
+_ADD_TRIAL_SHA = text("ALTER TABLE discovered_hypotheses ADD COLUMN IF NOT EXISTS trial_ledger_sha256 TEXT")
 
 _IDX_PAIR = text("CREATE INDEX IF NOT EXISTS idx_discovered_hypotheses_pair ON discovered_hypotheses (pair_id)")
 _IDX_ROLE = text("CREATE INDEX IF NOT EXISTS idx_discovered_hypotheses_role ON discovered_hypotheses (role)")
@@ -236,6 +242,10 @@ def ensure_tables(engine: Engine) -> None:
         conn.execute(_ADD_PAIR_ID)
         conn.execute(_ADD_KILL_REASON)
         conn.execute(_ADD_KILLED_AT)
+        conn.execute(_ADD_SCORING_VERSION)
+        conn.execute(_ADD_TRIAL_P)
+        conn.execute(_ADD_TRIAL_Q)
+        conn.execute(_ADD_TRIAL_SHA)
         # Indexes
         conn.execute(_IDX_STATUS)
         conn.execute(_IDX_CONFIDENCE)
@@ -1965,20 +1975,27 @@ def score_due_active_hypotheses(
 # ── Stats ────────────────────────────────────────────────────────────────────
 
 def get_stats(engine: Engine) -> dict:
-    """Return summary statistics for the hypothesis engine."""
+    """Return summary statistics for the hypothesis engine.
+
+    ``confirmed`` / ``invalidated`` and the test totals count only ledgered v2
+    trial verdicts (``scoring_version IS NOT NULL``). v1 verdicts (no trial
+    ledger, FDR or holdout) are reported separately as ``legacy_v1_unsound``.
+    """
     q = text("""
         SELECT
             COUNT(*) AS total,
             COUNT(*) FILTER (WHERE status = 'active') AS active,
-            COUNT(*) FILTER (WHERE status = 'confirmed') AS confirmed,
-            COUNT(*) FILTER (WHERE status = 'invalidated') AS invalidated,
+            COUNT(*) FILTER (WHERE status = 'confirmed' AND scoring_version IS NOT NULL) AS confirmed,
+            COUNT(*) FILTER (WHERE status = 'invalidated' AND scoring_version IS NOT NULL) AS invalidated,
             COUNT(*) FILTER (WHERE status = 'expired') AS expired,
             AVG(confidence) AS avg_confidence,
             AVG(confidence) FILTER (WHERE status = 'active') AS avg_active_confidence,
-            SUM(times_tested) AS total_tests,
-            SUM(times_correct) AS total_correct,
+            SUM(times_tested) FILTER (WHERE scoring_version IS NOT NULL) AS total_tests,
+            SUM(times_correct) FILTER (WHERE scoring_version IS NOT NULL) AS total_correct,
             MAX(created_at) AS latest_created,
-            MAX(last_tested) AS latest_tested
+            MAX(last_tested) AS latest_tested,
+            COUNT(*) FILTER (WHERE status = 'confirmed' AND scoring_version IS NULL) AS legacy_confirmed,
+            COUNT(*) FILTER (WHERE status = 'invalidated' AND scoring_version IS NULL) AS legacy_invalidated
         FROM discovered_hypotheses
     """)
     with engine.connect() as conn:
@@ -2058,6 +2075,7 @@ def get_stats(engine: Engine) -> dict:
         "confirmed": row[2],
         "invalidated": row[3],
         "expired": row[4],
+        "legacy_v1_unsound": {"confirmed": row[11] or 0, "invalidated": row[12] or 0},
         "avg_confidence": round(float(row[5] or 0), 3),
         "avg_active_confidence": round(float(row[6] or 0), 3),
         "total_tests": total_tests,

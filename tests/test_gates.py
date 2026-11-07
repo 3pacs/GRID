@@ -7,9 +7,15 @@ requiring a live database connection.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import MagicMock
 
+from governance.hypothesis_labels import LEGACY_CUTOFF
 from validation.gates import GateChecker
+
+# Hypothesis rows are (state, created_at, label): a validated PASSED row is
+# created at or after the legacy cutoff and carries no label.
+_POST_CUTOFF = LEGACY_CUTOFF + timedelta(days=1)
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +73,7 @@ class TestCandidateToShadow:
         model_row.__getitem__ = lambda self, idx: {0: 1, 1: 1}[idx]  # validation_run_id=1, hypothesis_id=1
 
         hyp_row = MagicMock()
-        hyp_row.__getitem__ = lambda self, idx: {0: "PASSED"}[idx]
+        hyp_row.__getitem__ = lambda self, idx: {0: "PASSED", 1: _POST_CUTOFF, 2: None}[idx]
 
         result_model = MagicMock()
         result_model.fetchone.return_value = model_row
@@ -89,7 +95,7 @@ class TestCandidateToShadow:
         model_row.__getitem__ = lambda self, idx: {0: None, 1: 1}[idx]
 
         hyp_row = MagicMock()
-        hyp_row.__getitem__ = lambda self, idx: {0: "PASSED"}[idx]
+        hyp_row.__getitem__ = lambda self, idx: {0: "PASSED", 1: _POST_CUTOFF, 2: None}[idx]
 
         result_model = MagicMock()
         result_model.fetchone.return_value = model_row
@@ -111,7 +117,7 @@ class TestCandidateToShadow:
         model_row.__getitem__ = lambda self, idx: {0: 1, 1: 1}[idx]
 
         hyp_row = MagicMock()
-        hyp_row.__getitem__ = lambda self, idx: {0: "TESTING"}[idx]
+        hyp_row.__getitem__ = lambda self, idx: {0: "TESTING", 1: _POST_CUTOFF, 2: None}[idx]
 
         result_model = MagicMock()
         result_model.fetchone.return_value = model_row
@@ -165,7 +171,7 @@ class TestCandidateToShadow:
         model_row.__getitem__ = lambda self, idx: {0: 5, 1: 10}[idx]
 
         hyp_row = MagicMock()
-        hyp_row.__getitem__ = lambda self, idx: {0: "FAILED"}[idx]
+        hyp_row.__getitem__ = lambda self, idx: {0: "FAILED", 1: _POST_CUTOFF, 2: None}[idx]
 
         result_model = MagicMock()
         result_model.fetchone.return_value = model_row
@@ -189,7 +195,7 @@ class TestCandidateToShadow:
         result_model.fetchone.return_value = model_row
 
         hyp_row = MagicMock()
-        hyp_row.__getitem__ = lambda self, idx: {0: "DRAFT"}[idx]
+        hyp_row.__getitem__ = lambda self, idx: {0: "DRAFT", 1: _POST_CUTOFF, 2: None}[idx]
         result_hyp = MagicMock()
         result_hyp.fetchone.return_value = hyp_row
 
@@ -684,3 +690,29 @@ class TestCheckAllGates:
             result = gc.check_all_gates(1, state)
             assert "passed" in result, f"'passed' missing for state {state}"
             assert "details" in result, f"'details' missing for state {state}"
+
+
+class TestCandidateToShadowLegacyPassed:
+    """A PASSED hypothesis from before the v2 cutoff, or one carrying a legacy label, is not validated."""
+
+    def _check(self, mock_engine, hyp_values):
+        conn = _get_mock_conn(mock_engine)
+        model_row = MagicMock()
+        model_row.__getitem__ = lambda self, idx: {0: 1, 1: 1}[idx]
+        hyp_row = MagicMock()
+        hyp_row.__getitem__ = lambda self, idx: hyp_values[idx]
+        result_model, result_hyp = MagicMock(), MagicMock()
+        result_model.fetchone.return_value = model_row
+        result_hyp.fetchone.return_value = hyp_row
+        conn.execute.side_effect = [result_model, result_hyp]
+        return GateChecker(db_engine=mock_engine).check_candidate_to_shadow(42)
+
+    def test_pre_cutoff_passed_is_refused(self, mock_engine):
+        result = self._check(mock_engine, ("PASSED", LEGACY_CUTOFF - timedelta(days=30), None))
+        assert result["passed"] is False
+        assert any("legacy" in d for d in result["details"])
+
+    def test_labelled_passed_is_refused(self, mock_engine):
+        result = self._check(mock_engine, ("PASSED", _POST_CUTOFF, "LEGACY_UNVALIDATED"))
+        assert result["passed"] is False
+        assert any("LEGACY_UNVALIDATED" in d for d in result["details"])

@@ -66,17 +66,16 @@ class GateChecker:
             else:
                 details.append("validation_run_id is set")
 
-            # Gate 2: hypothesis must be PASSED
-            hyp = conn.execute(
-                text("SELECT state FROM hypothesis_registry WHERE id = :id"),
-                {"id": model[1]},
-            ).fetchone()
+            # Gate 2: hypothesis must be a validated PASSED (legacy PASSED
+            # rows are labelled unvalidated; governance.hypothesis_labels)
+            from governance.hypothesis_labels import passed_validation
 
-            if hyp is None:
+            hyp = passed_validation(conn, model[1])
+            if hyp["state"] is None:
                 details.append("Associated hypothesis not found")
                 passed = False
-            elif hyp[0] != "PASSED":
-                details.append(f"Hypothesis state is {hyp[0]}, must be PASSED")
+            elif not hyp["validated"]:
+                details.append(f"Hypothesis is not a validated PASSED: {hyp['reason']}")
                 passed = False
             else:
                 details.append("Hypothesis is in PASSED state")

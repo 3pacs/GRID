@@ -525,6 +525,16 @@ def promote_hypothesis_to_feature(
     if hypo[2] != 'PASSED':
         raise HTTPException(status_code=400, detail=f"Only PASSED hypotheses can be promoted (current: {hypo[2]})")
 
+    from governance.hypothesis_labels import passed_validation
+
+    with engine.connect() as conn:
+        validation = passed_validation(conn, hypothesis_id)
+    if not validation["validated"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only validated PASSED hypotheses can be promoted: {validation['reason']}",
+        )
+
     lag = json.loads(hypo[3]) if isinstance(hypo[3], str) else (hypo[3] or {})
     leader = (lag.get("leader_features") or [None])[0]
     follower = (lag.get("follower_features") or [None])[0]
