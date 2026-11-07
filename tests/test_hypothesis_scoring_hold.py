@@ -45,9 +45,19 @@ def test_goal_worker_handler_is_held() -> None:
 
 def test_batch_scorer_runs_when_unheld(monkeypatch) -> None:
     # Positive control: proves the hold is what suppresses the DB query.
+    from contextlib import contextmanager
+
+    from intelligence import hypothesis_trials
+
+    @contextmanager
+    def ledger():
+        yield hypothesis_trials.dry_run_ledger()
+
     monkeypatch.setattr(he, "ACTIVE_HYPOTHESIS_SCORING_HELD", False)
+    monkeypatch.setattr(hypothesis_trials, "open_trial_ledger", ledger)
     engine = MagicMock()
     engine.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = []
     counts = he.score_due_active_hypotheses(engine, batch_size=10, max_runtime_s=5)
     assert "held" not in counts
     engine.connect.assert_called_once()
+    engine.begin.assert_not_called()
