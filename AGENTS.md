@@ -318,3 +318,54 @@ Verification and limits:
 - Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
   own stages) is recorded in the runbook's consumer checklist; the producer cannot
   supply those receipts. Gemini/provider input remains the daily review's own gate.
+
+## 2026-11-07 - market_briefings 5007: 1.5 MB hourly briefing was an unbounded evidence appendix
+
+Cause:
+
+- `ollama/market_briefing.py::_publication_evidence_footer` (added 2026-10-26 in
+  54c1c6e9) appends a "Feature evidence declarations" JSON block to every briefing with
+  one ~1.5 KB declaration record per snapshot feature whose latest value equals a number
+  in the narrative. `_publication_stage_diagnostics` listed every equal-value match per
+  mention across three roles. With ~2,700 model-eligible features in the snapshot, a
+  value shared by many features fans out without bound.
+- Row 5007 (hourly, 2026-11-06 14:27:48Z): narrative 1,617 chars; `0%` matched 961
+  zero-valued features, `0.6` matched 40, `0.54` matched 12 (two mentions) -> 1,005
+  records, 1,527,952 chars of `content`, 30.8 MB `snapshot_data` text (1.5 MB TOASTed).
+  Not an LLM loop (num_predict=800), not a retry, not a grounding dump.
+- Same mechanism, smaller: 69 rows over 100 KB between ids 4731 and 5035 (2026-10-26 to the
+  2026-11-07 20:42Z read, only 5007 over 1 MiB); typical hourly 210-550 KB with 125-346 records, e.g. 4984 at 555 KB had `0.125`
+  matching 189 features). Before 2026-10-26 the daily max was 15 KB.
+
+Fix (writer, this branch):
+
+- `_publication_stage_diagnostics(..., match_list_cap=8)`: every match is still counted
+  (`snapshot_match_count`), at most 8 listed per mention, `snapshot_matches_complete`
+  flag. Cap is a keyword default, not a module constant, so the AST-loaded contract
+  tests still execute the function.
+- `_publication_evidence_footer`: an incomplete listing gets
+  `attribution: "ambiguity_overflow"`, its match count, and NO records (equal-value
+  coincidence with that many observations is not attribution). New `rendering`
+  metadata. Backstop `rendered_cap_bytes=262_144`: an appendix still over the cap is
+  withheld whole with a declared one-line note and a `log.warning`; records stay in the
+  stored payload. The narrative is never cut. Mentions with <=8 matches render exactly
+  as before.
+- Tests: `tests/test_market_briefing_evidence_footer_bound.py` (11, real module, no
+  network/DB/model; reproduces the 5007 shape: 961 zero features + `0%`, content <10 KB,
+  snapshot <150 KB). Related suites: 534 passed, 21 skipped; ruff E/W/F clean.
+
+Packet cap decision:
+
+- `scripts/daily_publication_packet.py::TEXT_FIELD_CAP_BYTES` stays 1 MiB (comment added
+  at the constant). A legitimate briefing is now <=15 KB narrative + <=256 KiB appendix;
+  raising the cap would admit the runaway shape, not a real briefing. Row 5007 and any
+  other pre-fix row over the cap remain EXCLUDED_TEXT_OVER_FIELD_CAP by id/hash.
+
+Not done here:
+
+- Row 5007 and the other oversized rows are untouched (read-only inspection via
+  `psql -d griddb` with `default_transaction_read_only=on`). Whether to compact or
+  re-render historical appendices is an owner decision; the data summary / narrative
+  in those rows is intact and small, only the appendix is large.
+- Not merged, not deployed. Takes effect for new briefings once the release tree is
+  updated and grid-intelligence restarts.
