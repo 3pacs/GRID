@@ -170,7 +170,7 @@ class HermesStatusResponse(BaseModel):
 class PipelineSourceStatus(BaseModel):
     name: str
     type: str = "unknown"
-    status: str  # healthy, stale, broken
+    status: str  # see PIPELINE_STATUSES below
     last_pull: str | None = None
     rows_last_pull: int | None = None
     next_scheduled: str | None = None
@@ -183,13 +183,35 @@ class PipelineSourceStatus(BaseModel):
     # last-pull timestamp), ingested_at, and stale_reason. None for
     # responses built before this field existed.
     field_record: dict[str, Any] | None = None
+    # pull_log-backed run state (2026-11-07). `status` is one of
+    # ingestion/source_freshness.py::PIPELINE_STATUSES: healthy, stale,
+    # quiet, skipped_config, failing, stopped, inactive. Before, it was
+    # healthy/stale/broken judged on raw_series alone; "broken" now lives only in
+    # PipelineSummary (= failing + stopped).
+    catalog_active: bool | None = None
+    freshness_window_hours: float | None = None
+    last_run_at: str | None = None
+    last_success_with_rows_at: str | None = None
+    last_status: str | None = None  # pull_log status of the latest run
+    last_rows_inserted: int | None = None
+    # Latest run's message, credentials redacted, truncated to 300 chars.
+    last_error: str | None = None
+    last_error_class: str | None = None  # CONFIG/TIMEOUT/CONTRACT/PARTIAL/OTHER
+    runs_7d: int = 0
 
 
 class PipelineSummary(BaseModel):
     total_sources: int = 0
     healthy: int = 0
     stale: int = 0
-    broken: int = 0
+    broken: int = 0  # failing + stopped, kept for existing readers
+    quiet: int = 0
+    skipped_config: int = 0
+    failing: int = 0
+    stopped: int = 0
+    inactive: int = 0
+    active_sources: int = 0  # total_sources - inactive
+    by_status: dict[str, int] = {}
 
 
 class FamilyCoverage(BaseModel):
@@ -228,3 +250,7 @@ class PipelineHealthResponse(BaseModel):
     # The daily data_freshness_audit snapshot (see DailyFreshnessAudit),
     # independent of the availability/stale_reason above.
     daily_audit: DailyFreshnessAudit = DailyFreshnessAudit()
+    # Which records drove `sources[].status`: "pull_log+raw_series", or
+    # "raw_series_only" when the pull_log read failed (availability is then
+    # also "unavailable"). None when no sources were read.
+    status_basis: str | None = None

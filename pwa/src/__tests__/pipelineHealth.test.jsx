@@ -1,7 +1,7 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import PipelineHealth from '../views/PipelineHealth.jsx';
+import PipelineHealth, { matchesStatusFilter } from '../views/PipelineHealth.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -116,6 +116,114 @@ describe('PipelineHealth availability contract', () => {
         // Each row's stale_reason is rendered as human text, not the raw enum.
         expect(screen.getAllByText('stale').length).toBeGreaterThan(0);
         expect(screen.getByText(/never configured/)).toBeTruthy();
+    });
+});
+
+// 2026-11-07: per-source status comes from pull_log as well as raw_series.
+// The summary keeps healthy/stale/broken (broken = failing + stopped) and
+// adds per-status counts; old backends without them still render.
+describe('PipelineHealth pull_log run states', () => {
+    const now = Date.now();
+    const row = (name, status, extra = {}) => ({
+        name,
+        type: 'unknown',
+        status,
+        last_pull: null,
+        rows_last_pull: 0,
+        next_scheduled: null,
+        freshness: 'red',
+        series_count: null,
+        field_record: { availability: 'unavailable', provenance: null, stale_reason: 'never_configured' },
+        last_run_at: null,
+        last_status: null,
+        runs_7d: 0,
+        ...extra,
+    });
+    const detailedResponse = {
+        summary: {
+            total_sources: 4, healthy: 1, stale: 0, broken: 2,
+            quiet: 0, skipped_config: 0, failing: 1, stopped: 1, inactive: 1,
+            active_sources: 3,
+        },
+        sources: [
+            row('yfinance_options', 'healthy', {
+                freshness: 'green',
+                last_run_at: new Date(now - 2 * 3600 * 1000).toISOString(),
+                last_status: 'SUCCESS',
+                runs_7d: 9,
+            }),
+            row('DARKPOOL', 'failing', {
+                last_run_at: new Date(now - 3600 * 1000).toISOString(),
+                last_status: 'FAILED',
+                runs_7d: 3,
+                error: 'TIMEOUT: Exceeded 60s timeout',
+                last_error: 'TIMEOUT: Exceeded 60s timeout',
+            }),
+            row('TradingView', 'stopped'),
+            row('ALPHA_VANTAGE', 'inactive', { freshness: 'grey' }),
+        ],
+        coverage: {},
+        recent_errors: [],
+        resolver_status: {},
+        availability: 'available',
+        stale_reason: null,
+        status_basis: 'pull_log+raw_series',
+    };
+
+    it('renders the per-status tiles and filters', async () => {
+        api.getPipelineHealth.mockResolvedValue(detailedResponse);
+        render(<PipelineHealth />);
+
+        await waitFor(() => {
+            expect(screen.getByText('Inactive')).toBeTruthy();
+        });
+        expect(screen.getByText('Quiet')).toBeTruthy();
+        expect(screen.getByText('Skipped (config)')).toBeTruthy();
+        expect(screen.getByText('1 failing · 1 stopped')).toBeTruthy();
+        expect(screen.getByText('Failing (1)')).toBeTruthy();
+        expect(screen.getByText('Stopped (1)')).toBeTruthy();
+        expect(screen.getByText('Inactive (1)')).toBeTruthy();
+        expect(screen.getByRole('columnheader', { name: /Last Run/ })).toBeTruthy();
+        expect(screen.getByText('Runs 7d')).toBeTruthy();
+        // The failing source's (backend-redacted) last error is shown.
+        expect(screen.getByText('TIMEOUT: Exceeded 60s timeout')).toBeTruthy();
+    });
+
+    it('filters to one status', async () => {
+        api.getPipelineHealth.mockResolvedValue(detailedResponse);
+        render(<PipelineHealth />);
+
+        await waitFor(() => {
+            expect(screen.getByText('DARKPOOL')).toBeTruthy();
+        });
+        fireEvent.click(screen.getByText('Failing (1)'));
+        expect(screen.getByText('DARKPOOL')).toBeTruthy();
+        expect(screen.queryByText('TradingView')).toBeNull();
+        expect(screen.queryByText('ALPHA_VANTAGE')).toBeNull();
+    });
+
+    it('keeps the legacy three filters for an older backend', async () => {
+        api.getPipelineHealth.mockResolvedValue({
+            ...detailedResponse,
+            summary: { total_sources: 1, healthy: 0, stale: 0, broken: 1 },
+            sources: [row('acme', 'broken')],
+        });
+        render(<PipelineHealth />);
+
+        await waitFor(() => {
+            expect(screen.getByText('Broken (1)')).toBeTruthy();
+        });
+        expect(screen.queryByText('Inactive')).toBeNull();
+        expect(screen.queryByRole('columnheader', { name: /Last Run/ })).toBeNull();
+    });
+
+    it('matches the legacy broken filter to failing and stopped', () => {
+        expect(matchesStatusFilter({ status: 'failing' }, 'broken')).toBe(true);
+        expect(matchesStatusFilter({ status: 'stopped' }, 'broken')).toBe(true);
+        expect(matchesStatusFilter({ status: 'broken' }, 'broken')).toBe(true);
+        expect(matchesStatusFilter({ status: 'inactive' }, 'broken')).toBe(false);
+        expect(matchesStatusFilter({ status: 'quiet' }, 'quiet')).toBe(true);
+        expect(matchesStatusFilter({ status: 'quiet' }, 'all')).toBe(true);
     });
 });
 
