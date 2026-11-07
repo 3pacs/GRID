@@ -192,6 +192,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 def _sync_deferred_startup(app: FastAPI) -> None:
     """Deferred startup — DB check + pre-warm dashboard cache."""
+    # First: FastAPI builds each router's route contexts lazily on the event
+    # loop, stalling every request for 2-6 s the first time a cold router is
+    # hit (35 of 36 watchdog stalls, 2026-11-07). Build them here instead.
+    try:
+        import time as _time
+
+        from api.route_warm import warm_route_contexts
+
+        _t0 = _time.perf_counter()
+        _n = warm_route_contexts(app.router)
+        log.info("Route contexts pre-built: {n} in {s:.1f}s", n=_n, s=_time.perf_counter() - _t0)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Route context warm-up skipped: {e}", e=str(exc))
+
     try:
         from db import health_check
         ok = health_check()
