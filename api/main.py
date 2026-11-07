@@ -324,6 +324,31 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
+
+# The OpenAPI schema (and the Swagger UI in development) maps every route.
+# Outside development it is not served to public traffic, but stays on
+# localhost for the deploy workflow's route check (deploy.yml curls
+# localhost:8000/openapi.json). Everything public arrives through the
+# Cloudflare tunnel, which always sets CF-Connecting-IP; the tunnel itself
+# connects from 127.0.0.1, so the client address cannot tell them apart.
+_SCHEMA_PATHS = frozenset({"/openapi.json", "/api/docs", "/docs", "/redoc"})
+
+
+class PublicSchemaGuardMiddleware(BaseHTTPMiddleware):
+    """404 the API schema for requests that came through Cloudflare."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if (
+            _environment != "development"
+            and request.url.path in _SCHEMA_PATHS
+            and request.headers.get("cf-connecting-ip")
+        ):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        return await call_next(request)
+
+
+app.add_middleware(PublicSchemaGuardMiddleware)
+
 # Rate limiting middleware for expensive endpoints
 _EXPENSIVE_PATHS = {
     "/api/v1/intel/deep-dive", "/api/v1/intel/network",
