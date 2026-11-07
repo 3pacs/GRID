@@ -23,10 +23,11 @@ Key entry points:
     Sleuth(engine).generate_leads()
     Sleuth(engine).investigate_lead(lead)
 
-Wired into hermes via:
-    - generate_leads() every 6 hours
-    - investigate_lead() as background LLM tasks (priority 3)
-    - High-priority leads (>0.8) investigated immediately (priority 2)
+Scheduling: Hermes never ran this pipeline (audit 2026-11-07); leads came
+only from chat. The scheduled path is ``intelligence.sleuth_intersections``
+(``origin='intersection'`` leads, each ending in a declared outcome). Chat
+questions are stored with ``origin='chat'`` and are never queued. The
+generators below stay reachable from the API.
 
 Storage: investigation_leads table (see ensure_tables()).
 """
@@ -128,6 +129,10 @@ class Lead:
     follow_up_leads: list[str] = field(default_factory=list)
     created_at: str = ""
     resolved_at: str | None = None
+    origin: str = "legacy"            # "intersection" | "chat" | "legacy"
+    outcome: str | None = None        # "hypothesis_declared" | "dead_end"
+    outcome_reason: str | None = None
+    declared_hypothesis_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.created_at:
@@ -157,7 +162,11 @@ def ensure_tables(engine: Engine) -> None:
                 follow_up_leads JSONB DEFAULT '[]',
                 hypotheses JSONB DEFAULT '[]',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                resolved_at TIMESTAMPTZ
+                resolved_at TIMESTAMPTZ,
+                origin TEXT,
+                outcome TEXT,
+                outcome_reason TEXT,
+                declared_hypothesis_id TEXT
             )
         """))
         conn.execute(text("""
@@ -353,10 +362,12 @@ class Sleuth:
             conn.execute(text("""
                 INSERT INTO investigation_leads
                     (id, question, category, priority, evidence, status,
-                     findings, follow_up_leads, hypotheses, created_at, resolved_at)
+                     findings, follow_up_leads, hypotheses, created_at, resolved_at,
+                     origin, outcome, outcome_reason, declared_hypothesis_id)
                 VALUES
                     (:id, :question, :category, :priority, :evidence, :status,
-                     :findings, :follow_up_leads, :hypotheses, :created_at, :resolved_at)
+                     :findings, :follow_up_leads, :hypotheses, :created_at, :resolved_at,
+                     :origin, :outcome, :outcome_reason, :declared_hypothesis_id)
                 ON CONFLICT (id) DO UPDATE SET
                     priority = EXCLUDED.priority,
                     evidence = EXCLUDED.evidence,
@@ -364,7 +375,10 @@ class Sleuth:
                     findings = EXCLUDED.findings,
                     follow_up_leads = EXCLUDED.follow_up_leads,
                     hypotheses = EXCLUDED.hypotheses,
-                    resolved_at = EXCLUDED.resolved_at
+                    resolved_at = EXCLUDED.resolved_at,
+                    outcome = EXCLUDED.outcome,
+                    outcome_reason = EXCLUDED.outcome_reason,
+                    declared_hypothesis_id = EXCLUDED.declared_hypothesis_id
             """), {
                 "id": lead.id,
                 "question": lead.question,
@@ -377,6 +391,10 @@ class Sleuth:
                 "hypotheses": json.dumps(lead.hypotheses),
                 "created_at": lead.created_at,
                 "resolved_at": lead.resolved_at,
+                "origin": lead.origin,
+                "outcome": lead.outcome,
+                "outcome_reason": lead.outcome_reason,
+                "declared_hypothesis_id": lead.declared_hypothesis_id,
             })
 
     def _load_lead(self, lead_id: str) -> Lead | None:
@@ -384,7 +402,8 @@ class Sleuth:
         with self.engine.connect() as conn:
             row = conn.execute(text(
                 "SELECT id, question, category, priority, evidence, status, "
-                "findings, follow_up_leads, hypotheses, created_at, resolved_at "
+                "findings, follow_up_leads, hypotheses, created_at, resolved_at, "
+                "origin, outcome, outcome_reason, declared_hypothesis_id "
                 "FROM investigation_leads WHERE id = :id"
             ), {"id": lead_id}).fetchone()
         if not row:
@@ -401,6 +420,10 @@ class Sleuth:
             follow_up_leads=row[7] if isinstance(row[7], (list, dict)) else (json.loads(row[7]) if row[7] else []),
             created_at=str(row[9]) if row[9] else "",
             resolved_at=str(row[10]) if row[10] else None,
+            origin=row[11] or "legacy",
+            outcome=row[12],
+            outcome_reason=row[13],
+            declared_hypothesis_id=row[14],
         )
 
     def get_leads(
@@ -421,7 +444,8 @@ class Sleuth:
         with self.engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT id, question, category, priority, evidence, status, "
-                "findings, follow_up_leads, hypotheses, created_at, resolved_at "
+                "findings, follow_up_leads, hypotheses, created_at, resolved_at, "
+                "origin, outcome, outcome_reason, declared_hypothesis_id "
                 "FROM investigation_leads "
                 "WHERE (:status IS NULL OR status = :status) "
                 "AND (:category IS NULL OR category = :category) "
@@ -440,6 +464,10 @@ class Sleuth:
                 follow_up_leads=r[7] if isinstance(r[7], (list, dict)) else (json.loads(r[7]) if r[7] else []),
                 created_at=str(r[9]) if r[9] else "",
                 resolved_at=str(r[10]) if r[10] else None,
+                origin=r[11] or "legacy",
+                outcome=r[12],
+                outcome_reason=r[13],
+                declared_hypothesis_id=r[14],
             )
             for r in rows
         ]

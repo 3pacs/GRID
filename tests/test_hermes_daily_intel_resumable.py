@@ -776,6 +776,7 @@ class TestRealTaskTableSanity:
             "capital_flow_rollups",
             "fundamental_divergence",
             "holder_deal_overlap",
+            "sleuth_dispatch",
             "insight_cleanup",
             "briefing_cleanup",
             "errors_jsonl_cleanup",
@@ -819,6 +820,9 @@ class TestDailyIntelAllowlistClassification:
             # live grid-flow-materializer.timer (separate process, every
             # 30 min, old checkout) writes the same keys
             "flow_materialize",
+            # rebuilt 2026-11-07 (intersection leads -> declared hypotheses);
+            # enabling it is its own reviewed change
+            "sleuth_dispatch",
         }
         assert set(ho.DAILY_INTEL_HOLD_REASONS) == expected_holds
 
@@ -1135,14 +1139,19 @@ class TestDoneQueuedOutcome:
             t for t in ho.DAILY_INTEL_TASKS if t.name == "storage_maintenance_subagent"
         )
         assert entry.reports_done_queued is True
+        # sleuth_dispatch (2026-11-07) also queues child work: one
+        # sleuth_investigate goal per new lead, run later by goal_worker.
+        dispatchers = {"storage_maintenance_subagent", "sleuth_dispatch"}
         for t in ho.DAILY_INTEL_TASKS:
-            if t.name != "storage_maintenance_subagent":
+            if t.name not in dispatchers:
                 assert t.reports_done_queued is False, (
-                    f"{t.name}: only storage_maintenance_subagent dispatches "
-                    "child work and finishes its OWN step before that work "
-                    "executes; every other task's own step performs its "
-                    "effects directly and should report plain 'done'"
+                    f"{t.name}: only the dispatch tasks queue child work "
+                    "and finish their OWN step before that work executes; "
+                    "every other task's own step performs its effects "
+                    "directly and should report plain 'done'"
                 )
+            else:
+                assert t.reports_done_queued is True, t.name
 
 
 # ─── Period-outcome wording (deliverable E) ──────────────────────────────
@@ -1153,7 +1162,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
-        DAILY_INTEL_HOLD_REASONS (7 allowed, 13 held) with every allow-listed
+        DAILY_INTEL_HOLD_REASONS (7 allowed, 14 held) with every allow-listed
         task's fn replaced by a no-op so no real DB/network is touched.
         Held tasks keep their real (never-called) fn."""
         calls: list[str] = []
@@ -1181,7 +1190,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
         assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 7
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 13
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 14
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -1204,7 +1213,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 13, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 14, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []
