@@ -79,14 +79,37 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
 
 
 def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
+    """Per-model rows on the same basis as ``overall`` (dedup_keep predictions).
+
+    ``oracle_models.predictions_made/hits/misses/partials/cumulative_pnl`` are
+    running counters the scorer increments over every raw prediction,
+    duplicates and pre-rescore labels included. On 2026-11-07 they showed
+    options_flow 55,964 predictions / +14,776 P&L beside an overall of 24,387
+    predictions / -558, so the table contradicted its own headline. Counts and
+    P&L now come from ``oracle_predictions`` with the ``overall`` filter;
+    ``weight``, ``sharpe`` and ``description`` still come from ``oracle_models``.
+    """
     with engine.connect() as conn:
         rows = conn.execute(
             text(
                 """
-                SELECT om.name, om.weight, om.predictions_made,
-                       om.hits, om.misses, om.partials,
-                       om.cumulative_pnl, om.sharpe, om.description
+                WITH stats AS (
+                    SELECT model_name,
+                           COUNT(*) AS made,
+                           SUM(CASE WHEN verdict = 'hit' THEN 1 ELSE 0 END) AS hits,
+                           SUM(CASE WHEN verdict = 'miss' THEN 1 ELSE 0 END) AS misses,
+                           SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
+                           SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
+                           SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS pnl
+                    FROM oracle_predictions
+                    WHERE dedup_keep = TRUE
+                    GROUP BY model_name
+                )
+                SELECT om.name, om.weight, COALESCE(s.made, 0),
+                       COALESCE(s.hits, 0), COALESCE(s.misses, 0), COALESCE(s.partials, 0),
+                       COALESCE(s.pnl, 0), om.sharpe, om.description, COALESCE(s.pending, 0)
                 FROM oracle_models om
+                LEFT JOIN stats s ON s.model_name = om.name
                 ORDER BY om.weight DESC
                 """
             )
@@ -106,11 +129,13 @@ def _fetch_model_rows(engine: Engine) -> list[dict[str, Any]]:
                 "hits": hits,
                 "misses": misses,
                 "partials": partials,
+                "pending": _coerce_int(row[9]),
                 "accuracy": _prediction_accuracy(hits, misses, partials),
                 "cumulative_pnl": round(float(row[6] or 0), 2),
                 "sharpe": round(float(row[7] or 0), 2),
                 "description": row[8] or "",
                 "total_scored": total_scored,
+                "basis": "oracle_predictions dedup_keep",
             }
         )
     return models
