@@ -16,11 +16,14 @@ from pathlib import Path
 import re
 
 
+# Producer-owned stages come first and are declared by scripts/daily_publication_packet.py
+# (one scheduled job per UTC day, under the standing daily-capture approval); the
+# daily-review owner appends its five stages to that observation.
 STAGES = {
     "diary_run": "claude_capture_producer",
     "candidate": "claude_capture_producer",
-    "admission_review": "codex_daily_review",
     "capture": "claude_capture_producer",
+    "admission_review": "codex_daily_review",
     "custody": "codex_daily_review",
     "privacy_screen": "codex_daily_review",
     "local_review": "codex_daily_review",
@@ -99,7 +102,7 @@ def evaluate(observation: dict) -> dict:
         state = "OVERDUE" if observed >= due else ("BLOCKED" if explicit_block else "PENDING")
         action, owner = f"reconcile_{first}_receipt", STAGES[first]
         if first == "capture":
-            action = ("producer_check_existing_a10_gate" if attempt == "not_started"
+            action = ("producer_run_daily_publication_packet" if attempt == "not_started"
                       else "reconcile_existing_capture_attempt")
     return {
         "schema": "daily-publication-packet-status-v1",

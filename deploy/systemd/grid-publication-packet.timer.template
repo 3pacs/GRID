@@ -1,0 +1,21 @@
+# TEMPLATE — NOT INSTALLED. See grid-publication-packet.service.template.
+#
+# Fires every day at 06:15Z for the PREVIOUS UTC day. Why 06:15Z: the market
+# diary timer runs Tue..Sat at 05:30Z (+ up to 5 min random delay, + up to the
+# 10 min service timeout), so by 06:15Z the diary row that documents the day's
+# last publication exists and the diary_run stage can be reported from evidence.
+# Publications (hourly briefings, thesis snapshots) are written seven days a
+# week, so the packet runs daily; Sun/Mon report the diary stage as a verified
+# non-session (no generation scheduled), not as a gap.
+# If grid-market-diary.timer moves, move this timer with it.
+[Unit]
+Description=Produce the GRID daily publication packet for the previous UTC day
+
+[Timer]
+OnCalendar=*-*-* 06:15:00 UTC
+RandomizedDelaySec=2min
+Persistent=true
+Unit=grid-publication-packet.service
+
+[Install]
+WantedBy=timers.target

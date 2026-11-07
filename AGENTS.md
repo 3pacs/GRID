@@ -279,3 +279,42 @@ Verification and limits:
 - Strengthened the SQLite regression with recently updated legacy, labeled and
   future rows; only the current unlabelled row is counted. All 494 combined
   offline tests passed again; Ruff and diff checks passed.
+
+## 2026-11-07 - daily publication packet: in-repo producer replaces the per-day capture ceremony
+
+What was done:
+
+- Merged current main into #1002 (AGENTS.md conflict: both appended sections kept).
+- Added `scripts/daily_publication_packet.py`: one scheduled run per completed UTC day
+  on grid-svr reads `market_briefings`, `thesis_snapshots` and `market_diary` rows
+  published in the window (plus diary context, audio metadata and grounding receipts)
+  in a single read-only `REPEATABLE READ` snapshot, screens texts (credentials,
+  connection strings, private keys, health identifiers, hidden characters; whole-record
+  quarantine, never truncation), and writes `capture.json` (0600), `packet.json`
+  (`publication-review-v1`, the shape the M0 checker reads), three chained stage
+  receipts, `observation.json` (producer stages declared) and `receipt.json`.
+  A produced day is never rewritten. Diary execution evidence comes from the rows the
+  writer produced plus `systemctl show` of its unit; Sun/Mon report a verified
+  non-session, a scheduled-but-missing diary reports `failed`.
+- Reordered the status reporter's stages so the producer's three come first
+  (`diary_run → candidate → capture`), then the daily-review owner's five; the
+  `not_started` capture action now names the producer job.
+- Added `deploy/systemd/grid-publication-packet.{service,timer}.template` (06:15Z daily,
+  previous UTC day) and documented the precision5520 pull mirror into the Codex pickup
+  directory (screened files only). Runbook rewritten accordingly; `.env.example` gained
+  the two optional settings.
+
+Why:
+
+- The r3–r13 lineage needed a fresh source bundle, independent review, sealed admission,
+  reviewer runtime acceptance and prior-day dispositions for every single day; nothing
+  completed after Nov 3 and even the completed Oct 31 candidate was never delivered.
+  The operator's standing instruction (A10, 2026-11-02) is that the daily capture class
+  runs automatically. The data was always in griddb; the job now reads it there.
+
+Verification and limits:
+
+- 35 offline tests (status + producer, fake engine) pass; ruff F-gates clean.
+- Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
+  own stages) is recorded in the runbook's consumer checklist; the producer cannot
+  supply those receipts. Gemini/provider input remains the daily review's own gate.

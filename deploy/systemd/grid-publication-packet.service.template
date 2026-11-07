@@ -1,0 +1,36 @@
+# TEMPLATE — NOT INSTALLED by any code path. Installing this unit (and its
+# .timer) activates the daily publication packet producer described in
+# docs/runbooks/DAILY-PUBLICATION-PACKET.md. Install (on grid-svr):
+#   sudo install -m 0644 deploy/systemd/grid-publication-packet.service.template \
+#       /etc/systemd/system/grid-publication-packet.service
+#   sudo install -m 0644 deploy/systemd/grid-publication-packet.timer.template \
+#       /etc/systemd/system/grid-publication-packet.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-publication-packet.timer
+#
+# The job reads the previous UTC day's publications (market_briefings,
+# thesis_snapshots, market_diary, audio metadata) in one read-only transaction
+# and writes a screened packet + chained receipts + observation.json under
+# $GRID_PUBLICATION_PACKET_ROOT/<YYYY-MM-DD>/. It never writes to the database.
+# A day that already has receipt.json is left untouched (safe re-run).
+[Unit]
+Description=GRID daily publication packet producer (screened capture of one UTC day's publications)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+# The deployed release tree (same tree grid-api and grid-market-diary run from).
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-market-diary uses (GRID DB settings).
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=GRID_PUBLICATION_PACKET_ROOT=/home/grid/research/publication-packets
+# Hours after the UTC window closes by which the daily review should have closed
+# the day (observation.json due_at). 8 => 08:00Z.
+Environment=GRID_PUBLICATION_PACKET_DUE_HOURS=8
+# Same interpreter grid-market-diary and grid-api run under (py314.conf drop-in).
+ExecStart=/usr/bin/flock -n /tmp/grid-publication-packet.lock /data/grid_v4/grid_venv-314/bin/python scripts/daily_publication_packet.py
+TimeoutStartSec=5min
+Nice=10
+StandardOutput=journal
+StandardError=journal

@@ -5,12 +5,13 @@ accountable for closing each day**, including a visible failure with an owner
 and next action. Claude is the existing capture producer. Waiting for Claude,
 reviewer acceptance, or a receipt does not transfer that accountability.
 
-This is the versioned handoff contract and an offline status reporter, not a new
-capture implementation or an activated integration. The existing daily research
-automation remains the sole scheduler for its two outputs (the daily brief and
-the retrospective). Its existing schedule and fresh dated-task policy stay in
-force. Run this job as a step of that automation; do not register a second
-automation, cron, systemd timer, Hermes job or heartbeat for it.
+This is the versioned handoff contract, the in-repo capture producer
+(`scripts/daily_publication_packet.py`, one scheduled run per UTC day on
+grid-svr; see "Producer job" below) and an offline status reporter. The existing
+daily research automation remains the sole scheduler for its two outputs (the
+daily brief and the retrospective). Its existing schedule and fresh dated-task
+policy stay in force. The daily review consumes the packet the producer wrote;
+it does not register a second capture, cron, Hermes job or heartbeat for it.
 
 ## Existing boundaries and coordination
 
@@ -19,14 +20,20 @@ automation, cron, systemd timer, Hermes job or heartbeat for it.
   uses a **UTC publication day**, not that session date: `[D 00:00Z, D+1 00:00Z)`.
   For example, a next-morning diary can describe a prior session. Preserve both
   clocks. Never infer diary execution from packet absence or an exit-zero claim.
-- Capture preparation, sealed admission, its one-use registry and capture
-  receipt remain with Claude's existing external adapter. That adapter and its
-  runtime ledger are not tracked in this repository; do not replace them here.
-- A10 already covers routine daily capture **when its existing conditions are
-  met**, including new reviewer acceptance and an unrun sealed admission. The
-  Codex owner must obtain that acceptance and make the handoff concrete, rather
-  than asking the user to reapprove routine in-scope work. A job state, deadline,
-  hash or this document cannot substitute for those conditions.
+- Capture is `scripts/daily_publication_packet.py`, scheduled by
+  `grid-publication-packet.timer` on grid-svr (06:15Z daily, previous UTC day).
+  It replaces the per-day external caller/admission/one-use-registry ceremony
+  (r3–r13 lineage on precision5520) that required a fresh source bundle,
+  independent review, sealed admission, reviewer runtime acceptance and
+  prior-day dispositions for every day, and which produced nothing after Nov 3.
+  The operator's standing approval for the daily capture class (A10, 2026-11-02:
+  "it should be automatic") is the authority for this scheduled job. Retained
+  bundles, admissions and receipts of the old lineage stay as history; nothing
+  replays them.
+- The producer reads the database only (one read-only `REPEATABLE READ`
+  snapshot through the repo engine), screens, hashes and writes files. It never
+  writes a table, calls a provider or model, delivers anything externally, or
+  authorizes a downstream stage.
 - Reuse [M0 acceptance](M0-ACCEPTANCE.md) and the existing capture verification
   for custody/byte checks. Issue [#958](https://github.com/3pacs/GRID/issues/958)
   tracks end-to-end scientific acceptance, not another capture lane; this job
@@ -57,10 +64,10 @@ public status summary uses only the fields below and opaque hashes.
 
 | Stage | Action owner | Evidence required before reporting `passed` |
 | --- | --- | --- |
-| `diary_run` | Claude capture producer | Existing diary execution receipt with actual target session, observed start/end, exit/outcome and output row IDs; an explicitly verified no-output/non-session result is recorded as such, never guessed. |
-| `candidate` | Claude capture producer | Exact D window, reviewed adapter/source identity, bounded corpus/coverage manifest and candidate artifact hashes. Empty or partial corpus is explicit. |
-| `admission_review` | Codex daily-review owner | Existing reviewer acceptance and matching sealed admission, exact window/source/limits/expiry/registry bindings and A10 conditions. Merely prepared is not admitted. |
-| `capture` | Claude capture producer | Actual terminal receipt for that admission/attempt, observed effect and cleanup outcome, captured artifacts/manifest and hashes; claim is spent. A missing receipt is unknown. |
+| `diary_run` | Claude capture producer (job) | `receipts/diary_run.json`: the `market_diary` rows whose `generated_at` falls in the window (row id, session date, generated_at, model/fallback, row sha256) plus `systemctl show grid-market-diary.service` when its last start lies in the window. `passed` with an explicit `non_session_verified` outcome on Sun/Mon UTC (no generation scheduled); `failed` when generation was scheduled and no row exists; `unknown` when the query failed. Never guessed from packet absence. |
+| `candidate` | Claude capture producer (job) | `receipts/candidate.json`: exact D window, snapshot `captured_at` and database receipt, per-channel counts/truncation/complete flags, and a body-free record manifest (publication id, published_at, canonical source-row sha256). Empty or truncated channels are explicit. |
+| `capture` | Claude capture producer (job) | `receipts/capture.json`: `capture.json` sha256 (= `packet.capture_receipt.export_sha256`), `packet.json` sha256, projected counts by channel, every quarantine/exclusion with its text sha256 and reasons, screens applied, caps, late-capture flag. `capture_attempt` is `spent` when this receipt exists. |
+| `admission_review` | Codex daily-review owner | Acceptance of the captured packet for review: `packet.json` sha256 read back equals the capture receipt, window and day identity match, the producer stages validate (`daily_publication_packet_status.py` on the producer's `observation.json`), no second owner for the day. Under the standing daily-capture approval this is the consumer's check, not a per-day operator question. |
 | `custody` | Codex daily-review owner | Exact capture/export/packet/receipt hash readback, coverage, day identity, private custody, unique owner and dedup reconciliation. Directory presence or positive count is insufficient. |
 | `privacy_screen` | Codex daily-review owner | Review of the exact proposed external payload and excerpts: exclude credentials, patient information, personal balances/positions and other standing exclusions. Bind the screened artifact hash. |
 | `local_review` | Codex daily-review owner | Exact claim extraction, source gaps and local review retained against the screened packet; outcome/performance stays unscorable without matched qualified lineage. |
@@ -108,22 +115,30 @@ existing workflow; do not silently exit or ask to pause the recurring job.
 
 ## Read-only status command
 
-The owner normalizes its private receipts to a JSON file with exactly:
+The producer writes `<root>/<D>/observation.json` with the three producer
+stages declared and chained (`diary_run → candidate → capture`). The
+daily-review owner copies it into its private ledger, appends its five stages
+as it completes them, refreshes `observed_at`, and runs the reporter. The file
+has exactly:
 
 ```json
 {
   "schema": "daily-publication-packet-observation-v1",
   "publication_day": "2026-11-05",
   "observed_at": "2026-11-06T07:00:00Z",
-  "due_at": "2026-11-06T06:00:00Z",
-  "capture_attempt": "unknown",
-  "stages": {}
+  "due_at": "2026-11-06T08:00:00Z",
+  "capture_attempt": "spent",
+  "stages": {"diary_run": {"state": "passed", "publication_day": "2026-11-05",
+                           "receipt_sha256": "<sha256 of receipts/diary_run.json>",
+                           "upstream_receipt_sha256": null},
+             "candidate": {"...": "chained to diary_run"},
+             "capture": {"...": "chained to candidate"}}
 }
 ```
 
-These timestamps are synthetic examples, **not a new schedule/deadline or a
-live Nov 5 observation**. Use the actual existing automation's deadline and a
-fresh observation time. No stage key means `missing`; a non-success stage has
+These timestamps are illustrative. `due_at` is the window end plus
+`GRID_PUBLICATION_PACKET_DUE_HOURS` (8 by default: 08:00Z); the daily review
+uses its own fresh `observed_at`. No stage key means `missing`; a non-success stage has
 only `{"state":"unknown"}` (or `missing`, `failed`, `blocked`). A successful
 stage has exactly `state`, `publication_day`, `receipt_sha256` and
 `upstream_receipt_sha256`: lowercase 64-hex receipt hashes, with null upstream
@@ -149,29 +164,82 @@ receipt verifier. A stale observation must not be presented as current. Retain
 JSON privately through the existing job ledger and include the concise status
 in the task result; do not put private receipts or publication text in GitHub.
 
-## Adoption and operational acceptance
+## Producer job (in-repo, scheduled)
 
-The PR supplies this contract, reporter and offline controls only. The external
-automation/producer owners must adopt it in their existing job instructions and
-receipt adapter before claiming the runtime stall is fixed. Bind the actual
-scheduler/run ID, current producer/reviewer/consumer task IDs, private ledger
-location and existing deadline there. Do not install or enable anything from
-this PR. Runtime adoption remains pending until these receipts exist:
+`scripts/daily_publication_packet.py` runs on grid-svr from the deployed
+release tree under `grid-publication-packet.timer` (templates in
+`deploy/systemd/`; 06:15Z daily, after the 05:30Z diary timer). For the previous
+UTC day it writes, under `GRID_PUBLICATION_PACKET_ROOT/<D>/`
+(`/home/grid/research/publication-packets/<D>/` on grid-svr):
 
-1. Same-day run has a single owner/key and observes the existing diary execution
-   separately from packet capture. Confirm UTC-day versus session-date handling,
-   including weekends, holidays and DST, without changing generation timers.
-2. The owner-normalized candidate-without-admission case visibly assigns Codex
-   `admission_review`; a missing whole day reports diary evidence as missing.
-3. An already spent or uncertain admission is reconciled without capture replay;
-   local resume keeps the same key and retained evidence. A concurrent owner and
-   a lost Gemini ACK block duplicate effects.
-4. Private custody and exclusions pass against exact bytes before the existing
-   authorized Gemini path. Reject wrong-day, changed hash, partial corpus and
-   missing dedup evidence; keep scientific acceptance separate.
-5. Retain one naturally scheduled run's start/transition/exit status, two output
-   statuses and failure notification, with no new schedule or production change.
+| file | mode | content |
+| --- | --- | --- |
+| `capture.json` | 0600 | raw rows as read (`publication-capture-v1`); its sha256 is the export sha |
+| `packet.json` | 0644 | screened publications (`publication-review-v1`, the shape the M0 checker and the daily review already read); quarantined and text-missing ids listed in `capture_receipt` |
+| `receipts/{diary_run,candidate,capture}.json` | 0644 | the three chained stage receipts (`upstream_receipt_sha256` = sha256 of the previous file) |
+| `observation.json` | 0644 | `daily-publication-packet-observation-v1` with the producer stages declared |
+| `receipt.json` | 0644 | summary (counts, hashes, next owner/stage); its presence means the day is produced and is never rewritten |
+| `FAILED-<stamp>.json` | 0644 | only when the database read failed; a later run may still produce the day |
 
-The local tests exercise declarations and CLI behavior, not these runtime
-acceptance steps. No capture, replay, provider/production DB read, external model
-call, timer change, merge or deployment is part of this delivery.
+Sources: `market_briefings` (`created_at`), `thesis_snapshots` (`timestamp`),
+`market_diary` (`generated_at`) rows inside the window, up to 500 per channel
+(truncation flagged); `market_diary` rows *about* `[D-7, D]` as retrospective
+context; audio briefing metadata files; briefing grounding receipts when the
+text association is exact. Screens: credential assignments and tokens,
+connection strings, private-key blocks, health identifiers, hidden/control
+characters. A hit quarantines the whole record (listed by hash, never
+truncated or edited). Size caps exclude whole records only (1 MiB per text,
+8,000,000 B aggregate) and are recorded as exclusions.
+
+```bash
+# on grid-svr, from the release tree
+/data/grid_v4/grid_venv-314/bin/python scripts/daily_publication_packet.py --day 2026-11-06
+python3 scripts/daily_publication_packet_status.py ~/research/publication-packets/2026-11-06/observation.json --day 2026-11-06
+```
+
+Exit 0 = produced (or already present); 1 = failed (FAILED receipt written);
+2 = refused (window still open, bad arguments). Tests:
+`tests/test_daily_publication_packet.py` (offline fake engine; no database).
+
+### Delivery to the daily review
+
+A pull mirror on precision5520 (`systemd --user` timer, documented below) copies
+`packet.json`, `receipts/`, `observation.json` and `receipt.json` — never
+`capture.json` — into the established Codex pickup directory
+`~/Documents/Codex/_inbox-from-claude/grid-publication-packets/<D>/`. The
+daily-review consumer reads the packet there (or directly on grid-svr over the
+fleet SSH route), performs `admission_review` by hash readback, and continues
+its own stages. Codex-owned stages do not change the producer's files.
+
+```ini
+# ~/.config/systemd/user/grid-publication-packet-mirror.service (precision5520)
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rsync -rt --chmod=D0755,F0644 --include='*/' --include='packet.json' \
+  --include='receipt.json' --include='observation.json' --include='FAILED-*.json' --include='receipts/**' --exclude='*' \
+  grid-svr:research/publication-packets/ %h/Documents/Codex/_inbox-from-claude/grid-publication-packets/
+# grid-publication-packet-mirror.timer: OnCalendar=*-*-* 06:45:00 UTC, Persistent=true
+```
+
+## Consumer adoption and operational acceptance
+
+The daily review owner adopts the packet in its existing job instructions.
+Runtime acceptance of the repaired pipeline is a retained run with these
+receipts, none of which the producer can supply alone:
+
+1. One naturally scheduled 06:15Z run produced `<D>/receipt.json` on grid-svr
+   and the mirror delivered the screened files to the pickup directory.
+2. The daily review found the day under its own key, read `packet.json` back
+   by hash, recorded `admission_review` and `custody`, and ran the status
+   reporter on the appended observation.
+3. `privacy_screen` reviewed the exact external payload before the existing
+   authorized Gemini path; `local_review` and `gemini_review` were retained
+   against the screened packet hash. Scientific acceptance (#958) stays
+   separate.
+4. Both outputs (brief, retrospective) reported their own status; a blocked
+   day showed the first blocked stage, owners and deadline in the task result.
+
+Historical days: Nov 4–6 packets are produced by hand from the same job (late
+captures, flagged `late_capture: true`). They are real captures of the retained
+rows, not manufactured success receipts; the old lineage's Nov 3 r13 candidate
+stays sealed and unadmitted.

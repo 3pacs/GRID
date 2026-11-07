@@ -56,13 +56,21 @@ class PacketStatusTests(unittest.TestCase):
         self.assertEqual(result["accountable_owner"], "codex_daily_review")
         self.assertFalse(result["authorizes_execution"])
 
-    def test_prepared_unadmitted_packet_names_reviewer(self):
+    def test_candidate_without_capture_names_producer(self):
         data = passed_through(observation(), "candidate")
         data["capture_attempt"] = "not_started"
+        result = job.evaluate(data)
+        self.assertEqual(result["first_blocked_stage"], "capture")
+        self.assertEqual(result["action_owner"], "claude_capture_producer")
+        self.assertEqual(result["next_action"], "producer_run_daily_publication_packet")
+
+    def test_captured_unadmitted_packet_names_reviewer(self):
+        data = passed_through(observation(), "capture")
         result = job.evaluate(data)
         self.assertEqual(result["first_blocked_stage"], "admission_review")
         self.assertEqual(result["action_owner"], "codex_daily_review")
         self.assertEqual(result["next_action"], "reconcile_admission_review_receipt")
+        self.assertEqual(list(job.STAGES)[:3], ["diary_run", "candidate", "capture"])
 
     def test_before_due_is_pending_at_due_is_overdue(self):
         data = observation()
@@ -102,18 +110,18 @@ class PacketStatusTests(unittest.TestCase):
 
     def test_capture_retry_never_suggested_for_spent_or_uncertain(self):
         for attempt in ("started", "spent", "unknown"):
-            data = passed_through(observation(), "admission_review")
+            data = passed_through(observation(), "candidate")
             data["capture_attempt"] = attempt
             result = job.evaluate(data)
             self.assertEqual(result["next_action"], "reconcile_existing_capture_attempt")
             self.assertEqual(result["action_owner"], "claude_capture_producer")
             self.assertFalse(result["authorizes_execution"])
 
-    def test_unstarted_capture_still_requires_existing_gate(self):
-        data = passed_through(observation(), "admission_review")
+    def test_unstarted_capture_points_at_the_producer_job(self):
+        data = passed_through(observation(), "candidate")
         data["capture_attempt"] = "not_started"
         result = job.evaluate(data)
-        self.assertEqual(result["next_action"], "producer_check_existing_a10_gate")
+        self.assertEqual(result["next_action"], "producer_run_daily_publication_packet")
         self.assertFalse(result["authorizes_execution"])
 
     def test_complete_is_reported_only_not_acceptance(self):
