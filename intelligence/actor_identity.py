@@ -53,6 +53,33 @@ def ticker_actor_name(ticker: str) -> str:
     return f"{ticker.strip().upper()} Corp"
 
 
+# ── Names and tickers that are not actors ────────────────────────────────
+# Null-ish values some feeds write into a ticker column; each one became a
+# ``corp_NONE`` / ``corp_NAN`` "company" (2026-11-07 actor junk audit).
+PLACEHOLDER_TICKERS = frozenset({"", "-", "NONE", "NULL", "NAN", "NA", "N/A", "UNKNOWN"})
+
+# Feed identifiers written into the actor column: ``whale_aapl_100`` (options
+# flow strikes), ``cluster_tsm`` / ``qq_insider_trading`` (insider feeds),
+# ``crucix_yield_curve_normalizing``, ``gdelt:market`` and Federal Register
+# document numbers such as ``2026-06851``. A real name has a space or none of
+# these shapes.
+_IDENTIFIER_NAME_RE = re.compile(
+    r"^(?:[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)+"   # snake_case ids
+    r"|[A-Za-z]+:[A-Za-z0-9_-]+"              # source:topic ids
+    r"|\d{4}-\d{4,6})$"                       # Federal Register doc numbers
+)
+
+
+def is_placeholder_ticker(ticker: str | None) -> bool:
+    """True for a missing or null-ish ticker (``None``, ``"N/A"``, ``"nan"``)."""
+    return ticker is None or ticker.strip().upper() in PLACEHOLDER_TICKERS
+
+
+def looks_like_identifier(name: str | None) -> bool:
+    """True when ``name`` is a feed identifier rather than an actor's name."""
+    return bool(name) and _IDENTIFIER_NAME_RE.match(name.strip()) is not None
+
+
 # ── Display-name parsing ──────────────────────────────────────────────────
 
 _PAREN_RE = re.compile(r"\(([^()]*)\)")
