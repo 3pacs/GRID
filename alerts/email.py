@@ -200,15 +200,26 @@ def _text_html(text: Any) -> str:
     return f'<div style="white-space:pre-wrap;">{html.escape(str(text or ""))}</div>'
 
 
-def _section_summary(headline: str, label: str, summary: str, accent: str = "") -> dict:
-    """Opt-in headline/summary card. All arguments are plain text, never HTML."""
+def _section_summary(
+    headline: str, label: str, summary: str | Iterable[str], accent: str = "",
+) -> dict:
+    """Plain-text recap: existing strings stay paragraphs; opt-in items are bullets."""
+    if isinstance(summary, str):
+        summary_html = f'<p>{html.escape(summary)}</p>'
+        summary_plain = summary
+    else:
+        items = list(summary)
+        summary_html = ('<ul style="margin:12px 0 0;padding-left:20px;">'
+                        + "".join(f'<li style="margin:0 0 6px;">{html.escape(item)}</li>' for item in items)
+                        + '</ul>')
+        summary_plain = "\n".join(f"- {item}" for item in items)
     return {
         "title": "At a glance",
         "body": (f'<div style="font-size:32px;font-weight:800;color:#E8F0F8;">'
                  f'{html.escape(str(headline))}</div>'
                  f'<div style="font-size:13px;color:#9AB2C8;">{html.escape(label)}</div>'
-                 f'<p>{html.escape(summary)}</p>'),
-        "plain": f"{headline} — {label}\n{summary}",
+                 f'{summary_html}'),
+        "plain": f"{headline} — {label}\n{summary_plain}",
         "accent": accent,
     }
 
@@ -743,7 +754,7 @@ def _saved_board_note(board: dict, now: datetime) -> str:
         except (TypeError, ValueError):
             generated = "generation time invalid; age unverified"
     data_date = board.get("as_of") or "unknown"
-    return f"Saved board, not live eligibility. Data as of {data_date}; {generated}."
+    return f"Weekly saved snapshot, not live eligibility. Data as of {data_date}; {generated}."
 
 
 def _catalyst_date_label(raw: Any, now: datetime) -> str:
@@ -913,6 +924,7 @@ def daily_digest(
             board = load_latest_board(engine)
             if board:
                 board_note = _saved_board_note(board, as_of)
+                snapshot_label = f"Weekly saved snapshot (data as of {board.get('as_of') or 'unknown'})"
                 lines: list[str] = []
                 # Preserve the saved ordering: entry candidates first. These
                 # recorded stances do not establish current entry eligibility.
@@ -941,15 +953,21 @@ def daily_digest(
                     if len(lines) >= 5:
                         break
                 if lines:
-                    long_play_summary = board_note + " First saved row: " + lines[0]
+                    long_play_summary = (
+                        f"{snapshot_label}: {len(lines)} candidates shown (up to 5); "
+                        "not live eligibility."
+                    )
                     sections.append(_section_text(
                         "Long plays",
                         _text_html(board_note + "\nShowing up to 5 saved candidates, entry candidates first.\n"
                                    + "\n".join(lines) + "\n(proxy multiples from historical CAGR/vol; not forecasts)"),
-                        accent="#7c5cff",
+                        accent="purple",
                     ))
                 elif board.get("stand_down_reason"):
-                    long_play_summary = board_note + " " + _summary_text(str(board["stand_down_reason"]), 160)
+                    long_play_summary = (
+                        f"{snapshot_label}; not live eligibility. "
+                        "Provenance and stand-down reason below."
+                    )
                     sections.append(_section_text("Long plays", _text_html(board_note + "\n" + str(board["stand_down_reason"]))))
         except Exception as exc:
             degraded.append("long_plays")
@@ -975,15 +993,23 @@ def daily_digest(
         # or invent totals from capped query rows. No extra database queries.
         regime_section = next((s for s in sections if s["title"].startswith("Regime State")), None)
         if regime_section:
-            regime_summary = f"{regime_section['title']}: {_summary_text(_html_to_plain(regime_section['body']), 250)}"
+            regime_text = _html_to_plain(regime_section["body"])
+            if regime_section["title"] == "Regime State":
+                regime_text = regime_text.replace(" Reported state confidence:", "; Reported state confidence:")
+                regime_text = regime_text.replace("\nSuggested Action:", "; Suggested Action:")
+            regime_summary = f"{regime_section['title']}: {_summary_text(regime_text, 250)}"
         else:
             regime_summary = "Regime unavailable; no current state can be established."
         summary = [regime_summary]
-        summary.append(f"Decisions (24h): {decision_count if decision_count is not None else 'unavailable'}.")
+        # The normal headline already carries the count. Keep it in the recap
+        # only when the headline is an incomplete/unknown status instead.
+        if degraded or decision_count is None:
+            summary.append(f"Decisions (24h): {decision_count if decision_count is not None else 'unavailable'}.")
         summary.append(f"{active_sources} sources with successful pulls (24h)." if active_sources is not None
                        else "Sources with successful pulls (24h): unavailable.")
         if option_rows is not None:
-            summary.append(f"{len(option_rows)} sampled option rows (up to 5, not a total; scan dates D-3 through D inclusive).")
+            row_label = "row" if len(option_rows) == 1 else "rows"
+            summary.append(f"{len(option_rows)} sampled option {row_label} (up to 5, not a total; scan dates D-3 through D inclusive).")
             if option_rows:
                 top = option_rows[0]
                 confidence = str(top[5] or "").upper()
@@ -998,7 +1024,7 @@ def daily_digest(
         sections.insert(0, _section_summary(
             "INCOMPLETE" if degraded else str(decision_count) if decision_count is not None else "RESEARCH UPDATE",
             "Research digest; incomplete data" if degraded else "Decisions recorded (24h)" if decision_count is not None else "Research status",
-            " ".join(summary), "red" if degraded else "amber" if not regime_section or regime_section["title"] != "Regime State" else "",
+            summary, "red" if degraded else "amber" if not regime_section or regime_section["title"] != "Regime State" else "",
         ))
 
         subject = "GRID Intelligence — Daily Digest"
