@@ -244,18 +244,22 @@ class CampaignFinancePuller(BasePuller):
             cycle = today.year if today.year % 2 == 0 else today.year + 1
 
         all_contributions: list[dict[str, Any]] = []
-        last_index = None
+        cursor: dict[str, Any] = {}
         page = 0
 
         while page < _MAX_PAGES:
+            # schedule_b filters on two_year_transaction_period ("cycle" is
+            # silently ignored) and sorts only on disbursement_date/amount:
+            # "-contribution_receipt_date" is schedule_a's and returned 422.
             params: dict[str, Any] = {
                 "committee_id": committee_id,
-                "cycle": cycle,
+                "two_year_transaction_period": cycle,
                 "per_page": 100,
-                "sort": "-contribution_receipt_date",
+                "sort": "-disbursement_date",
             }
-            if last_index:
-                params["last_index"] = last_index
+            # Keyset pagination needs every last_indexes value (last_index
+            # and last_disbursement_date), not last_index alone.
+            params.update(cursor)
 
             try:
                 data = self._fec_get(
@@ -279,9 +283,9 @@ class CampaignFinancePuller(BasePuller):
                     all_contributions.append(parsed)
 
             # FEC uses cursor-based pagination
-            pagination = data.get("pagination", {})
-            last_index = pagination.get("last_indexes", {}).get("last_index")
-            if not last_index or len(results) < 100:
+            pagination = data.get("pagination") or {}
+            cursor = {k: v for k, v in (pagination.get("last_indexes") or {}).items() if v is not None}
+            if not cursor.get("last_index") or len(results) < 100:
                 break
 
             page += 1
