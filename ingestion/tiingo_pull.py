@@ -547,19 +547,41 @@ class TiingoPuller(BasePuller):
         return [t for t in tickers if is_tiingo_equity(t)]
 
     @staticmethod
+    def hypothesis_tickers(db_engine: Engine) -> list[str]:
+        """Tickers active ticker-move hypotheses will be scored on, equities only.
+
+        Source of truth: ``intelligence.hypothesis_trials.ticker_move_close_universe``.
+        Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.hypothesis_trials import ticker_move_close_universe
+
+            with db_engine.connect() as conn:
+                tickers = ticker_move_close_universe(conn)
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: hypothesis close universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for t in tickers if is_tiingo_equity(t)]
+
+    @staticmethod
     def default_tickers(db_engine: Engine | None = None) -> list[str]:
-        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle universe.
+        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle and
+        active-hypothesis universes.
 
         With ``db_engine`` the oracle's close universe
         (:meth:`oracle_tickers`) is added, so every ticker the oracle predicts
         on gets a routine close (S15, 2026-11-06: ~45 biotech tickers had no
-        close since 2026-09-09 because neither static list held them).
+        close since 2026-09-09 because neither static list held them), and so
+        is every ticker an active hypothesis will be scored on
+        (:meth:`hypothesis_tickers`; 2026-11-07: 36 of 115 Sleuth lead tickers
+        had no routine close).
         """
         from ingestion.yfinance_pull import YF_TICKER_LIST
 
         all_tickers = set(YF_TICKER_LIST)
         if db_engine is not None:
             all_tickers.update(TiingoPuller.oracle_tickers(db_engine))
+            all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
         try:
             from analysis.sector_map import SECTOR_MAP
             for sector in SECTOR_MAP.values():
