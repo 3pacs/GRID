@@ -8,6 +8,7 @@ back (scorer stuck from 2026-11-06).
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import sys
 import types
@@ -15,13 +16,23 @@ from datetime import date
 
 import pytest
 
+def _missing(name: str) -> bool:
+    return name not in sys.modules and importlib.util.find_spec(name) is None
+
+
 # The aggregation helper is pure Python; stub the model libraries only while
 # importing where they are not installed (CI has no torch wheel), then remove
-# the stubs so other tests' importorskip("torch") still skips.
+# the stubs so other tests' importorskip("torch") still skips. Without torch a
+# real transformers import probes for it and fails, so transformers is
+# stubbed too whenever torch is.
+_torch_missing = _missing("torch")
 _stubbed: list[str] = []
 for _name in ("torch", "transformers"):
-    if _name not in sys.modules and importlib.util.find_spec(_name) is None:
+    if _name in sys.modules:
+        continue
+    if _torch_missing or _missing(_name):
         _stub = types.ModuleType(_name)
+        _stub.__spec__ = importlib.machinery.ModuleSpec(_name, None)
         _stub.AutoModelForSequenceClassification = object  # type: ignore[attr-defined]
         _stub.AutoTokenizer = object  # type: ignore[attr-defined]
         sys.modules[_name] = _stub
