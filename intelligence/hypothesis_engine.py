@@ -1926,20 +1926,21 @@ class HypothesisGenerator:
         )
 
 
-# ── Cleanup / Pruning ─────────────────────────────────────────────────────────
+# ── Retained-trial report (no pruning) ────────────────────────────────────────
 
 def cleanup_hypotheses(engine: Engine, dry_run: bool = False) -> dict:
-    """Prune old expired/invalidated hypotheses and failed registry entries.
+    """Report the dead hypotheses the old weekly prune would have deleted.
 
-    - discovered_hypotheses: delete rows with status 'expired' or 'invalidated'
-      older than 90 days.
-    - hypothesis_registry: delete rows with state 'FAILED' or 'KILLED'
-      older than 180 days.
+    Nothing is deleted. Until 2026-11-06 this removed expired/invalidated
+    ``discovered_hypotheses`` older than 90 days and FAILED/KILLED
+    ``hypothesis_registry`` rows older than 180 days. A dead hypothesis is
+    still a trial: deleting it shrinks the trial count the overfitting gate
+    (CPCV/PBO/deflated Sharpe) deflates by, so whatever survived looks more
+    significant than it is. Dead rows keep their terminal status and stay.
 
-    Returns a dict with counts of rows that were (or would be) deleted.
+    ``dry_run`` is accepted for the existing callers and changes nothing.
+    Returns the counts of dead rows past the old age cut-offs, retained.
     """
-    results: dict[str, int] = {}
-
     with engine.connect() as conn:
         expired = conn.execute(text(
             "SELECT count(*) FROM discovered_hypotheses "
@@ -1953,28 +1954,8 @@ def cleanup_hypotheses(engine: Engine, dry_run: bool = False) -> dict:
             "AND created_at < now() - INTERVAL '180 days'"
         )).scalar() or 0
 
-    results = {"discovered_expired": expired, "registry_failed": failed}
-
-    if dry_run:
-        log.info("Hypothesis cleanup (dry run): {r}", r=results)
-        return results
-
-    if expired or failed:
-        with engine.begin() as conn:
-            if expired:
-                conn.execute(text(
-                    "DELETE FROM discovered_hypotheses "
-                    "WHERE status IN ('expired', 'invalidated') "
-                    "AND created_at < now() - INTERVAL '90 days'"
-                ))
-            if failed:
-                conn.execute(text(
-                    "DELETE FROM hypothesis_registry "
-                    "WHERE state IN ('FAILED', 'KILLED') "
-                    "AND created_at < now() - INTERVAL '180 days'"
-                ))
-        log.info("Hypothesis cleanup: {r}", r=results)
-
+    results = {"discovered_expired": int(expired), "registry_failed": int(failed)}
+    log.info("Hypothesis trial ledger retained (nothing deleted): {r}", r=results)
     return results
 
 
@@ -2289,8 +2270,7 @@ def main() -> None:
     elif cmd == "cleanup":
         dry = "--dry-run" in sys.argv
         result = cleanup_hypotheses(engine, dry_run=dry)
-        label = "DRY RUN" if dry else "CLEANUP"
-        print(f"\n=== Hypothesis {label} ===\n")
+        print("\n=== Hypothesis trial ledger (retained, nothing deleted) ===\n")
         print(f"  discovered_hypotheses (expired/invalidated >90d): {result['discovered_expired']}")
         print(f"  hypothesis_registry   (FAILED/KILLED >180d):      {result['registry_failed']}")
         print()
