@@ -820,9 +820,6 @@ class TestDailyIntelAllowlistClassification:
             # live grid-flow-materializer.timer (separate process, every
             # 30 min, old checkout) writes the same keys
             "flow_materialize",
-            # rebuilt 2026-11-07 (intersection leads -> declared hypotheses);
-            # enabling it is its own reviewed change
-            "sleuth_dispatch",
         }
         assert set(ho.DAILY_INTEL_HOLD_REASONS) == expected_holds
 
@@ -846,6 +843,8 @@ class TestDailyIntelAllowlistClassification:
             "icij_linking", "attention_anomaly",
             "corporate_actions", "capital_flow_rollups",
             "fundamental_divergence", "holder_deal_overlap",
+            # owner-approved 2026-11-07: intersection leads, dispatch only
+            "sleuth_dispatch",
         }
         assert ho.DAILY_INTEL_INITIAL_ALLOWLIST == expected_allow
 
@@ -1162,7 +1161,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
-        DAILY_INTEL_HOLD_REASONS (7 allowed, 14 held) with every allow-listed
+        DAILY_INTEL_HOLD_REASONS (8 allowed, 13 held) with every allow-listed
         task's fn replaced by a no-op so no real DB/network is touched.
         Held tasks keep their real (never-called) fn."""
         calls: list[str] = []
@@ -1189,8 +1188,8 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         results: dict[str, Any] = {}
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
-        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 7
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 14
+        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 8
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 13
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -1199,13 +1198,14 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             if msg.startswith("daily_intel: period=") and "outcome" in kw
         )
         assert summary["outcome"] == "complete_for_enabled_tasks"
-        assert summary["n"] == 7
+        assert summary["n"] == 8
         assert summary["d"] == 6, (
-            "6 of the 7 allow-listed tasks report plain 'done' — "
-            "storage_maintenance_subagent is the one exception (see below)"
+            "6 of the 8 allow-listed tasks report plain 'done' — "
+            "storage_maintenance_subagent and sleuth_dispatch are the "
+            "exceptions (see below)"
         )
-        assert summary["dq"] == 1, (
-            "storage_maintenance_subagent's outcome is driven by "
+        assert summary["dq"] == 2, (
+            "storage_maintenance_subagent's and sleuth_dispatch's outcomes are driven by "
             "DailyIntelTask.reports_done_queued (preserved from the real "
             "task table even though this test replaces its fn with the "
             "same no-op as every other allow-listed task), so it reports "
@@ -1213,7 +1213,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 14, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 13, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []

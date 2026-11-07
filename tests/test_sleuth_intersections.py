@@ -322,12 +322,12 @@ def test_goal_worker_routes_sleuth_investigate(monkeypatch):
     assert seen == ["LEAD-INTX-1"]
 
 
-def test_hermes_sleuth_dispatch_is_held_and_queues_one_goal_per_lead(monkeypatch):
+def test_hermes_sleuth_dispatch_is_enabled_and_queues_one_goal_per_lead(monkeypatch):
     from intelligence import goal_queue
     from scripts import hermes_operator as ho
 
-    assert "sleuth_dispatch" in ho.DAILY_INTEL_HOLD_REASONS
-    assert "sleuth_dispatch" not in ho.DAILY_INTEL_INITIAL_ALLOWLIST
+    assert "sleuth_dispatch" in ho.DAILY_INTEL_INITIAL_ALLOWLIST
+    assert "sleuth_dispatch" not in ho.DAILY_INTEL_HOLD_REASONS
     monkeypatch.setattr(si, "generate_intersection_leads", lambda engine, as_of: ["L1", "L2"])
     queued = []
     monkeypatch.setattr(goal_queue, "enqueue_goal",

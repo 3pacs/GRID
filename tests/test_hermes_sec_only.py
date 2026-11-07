@@ -572,7 +572,11 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # _daily_intel_holder_deal_overlap), its DailyIntelTask row after
         # holder_deal_overlap, and its DAILY_INTEL_HOLD_REASONS entry (held).
         # Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','b4d724c917975f3ce6cc3d69af4ef11ba049cbe0a6a1c759bfedce80295bd1e1'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
+        # OPER re-pinned b4d724c9 -> d7da3448 (2026-11-07,
+        # claude/sleuth-dispatch-enable-20261107): sleuth_dispatch moves from
+        # DAILY_INTEL_HOLD_REASONS to DAILY_INTEL_INITIAL_ALLOWLIST (owner
+        # approval). Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','d7da3448dbc2d8f55e9d665a032c689582dbfb89a6f5d29fc3eed00647f4fe9c'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
