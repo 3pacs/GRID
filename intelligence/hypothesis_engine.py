@@ -70,19 +70,33 @@ KILL_REASONS = {
     "LEVER_DIVERGED":         "Lever pullers shifted direction opposite to hypothesis",
     "TRUST_COLLAPSED":        "Signal sources underlying hypothesis lost credibility",
     "CAUSATION_INVALIDATED":  "Root cause of hypothesis no longer holds",
+    # v2 one-look trials (intelligence.hypothesis_trials)
+    "NOT_SIGNIFICANT":        "Holdout test not significant after BH over its batch, or effect too small",
+    "SELF_TELEMETRY":         "Outcome or leading signal is GRID's own output (snap:*, llm_task_*, oracle...)",
+    "NO_MARKET_OUTCOME":      "Declares no market outcome that can be tested",
+    "NO_DIRECTION":           "Declared direction cannot be evaluated",
+    "UNSUPPORTED_INSTRUMENT": "No completed NYSE-session closes for the ticker",
+    "NO_DATA":                "Holdout data never arrived within twice the window",
+    "INSUFFICIENT_HISTORY":   "Too little pre-creation history for the null distribution",
 }
 
 CONFIDENCE_KILL_THRESHOLD = 0.10  # Below this after 3+ tests → dead
 MIN_TESTS_FOR_CONFIDENCE_KILL = 3
 
-# Owner-approved hold (2026-09-26). score_hypothesis() is the single write
-# path that flips discovered_hypotheses to confirmed/invalidated, reached from
-# Hermes' 30-minute batch, the goal_worker ``score_active_hypothesis`` handler
-# (Hermes DISPATCH_SUBAGENT:hypothesis_scorer, seed_goals_hypo_scoring.py) and
-# HypothesisGenerator's own batch scorer. That scoring has no trial ledger,
-# FDR or holdout, and 86% of confirmed rows correlate GRID's own snap:*
-# telemetry with the market. Re-enabling is its own reviewed change, not a
-# runtime flag.
+# Owner-approved hold (2026-09-26). The v1 scorer flipped discovered_hypotheses
+# to confirmed/invalidated from Hermes' 30-minute batch, the goal_worker
+# ``score_active_hypothesis`` handler (Hermes DISPATCH_SUBAGENT:hypothesis_scorer,
+# seed_goals_hypo_scoring.py) and HypothesisGenerator's own batch scorer. It had
+# no trial ledger, FDR or holdout, and 86% of confirmed rows correlate GRID's
+# own snap:* telemetry with the market. Re-enabling is its own reviewed change,
+# not a runtime flag.
+#
+# Since 2026-11-06 every one of those callers reaches only the v2 scorer
+# (intelligence.hypothesis_trials): one-look point-in-time holdout tests, GRID
+# telemetry ineligible, BH over each batch, every batch appended to the S11
+# trial ledger before any row changes. Single-row callers defer to the batch.
+# Lifting this hold also needs HYPOTHESIS_TRIAL_LEDGER_PATH/_ANCHOR_PATH set;
+# without them the batch scorer writes nothing.
 ACTIVE_HYPOTHESIS_SCORING_HELD = True
 
 
@@ -395,13 +409,17 @@ class TemporalPatternDetector:
             SELECT DISTINCT signal_type FROM signal_data
             ORDER BY signal_type
         """)
+        from intelligence.hypothesis_trials import is_self_generated
+
         types: set[str] = set()
         with self.engine.connect() as conn:
             for row in conn.execute(q_snap):
                 types.add(f"snap:{row[0]}")
             for row in conn.execute(q_sig):
                 types.add(f"sig:{row[0]}")
-        return sorted(types)
+        # GRID's own outputs (every snap:* category, llm_task_*, oracle...) can
+        # never confirm a hypothesis, so pairs built on them are not scanned.
+        return sorted(t for t in types if not is_self_generated(t))
 
     def _load_daily_counts(self, signal_key: str) -> dict[date, float]:
         """Load daily event counts or metric values for a signal type.
@@ -834,7 +852,12 @@ class HypothesisGenerator:
         return hypotheses
 
     def score_hypothesis(self, hypothesis_id: str) -> dict:
-        """Score a hypothesis against new data since it was created."""
+        """Single-row entry point (goal_worker): never issues a verdict.
+
+        A verdict is a declared trial whose FDR is controlled over its batch
+        and recorded in the S11 ledger; one row scored alone would be its own
+        batch of one. The row is left for :func:`score_due_active_hypotheses`.
+        """
         if ACTIVE_HYPOTHESIS_SCORING_HELD:
             return {
                 "hypothesis_id": hypothesis_id,
@@ -842,96 +865,12 @@ class HypothesisGenerator:
                 "held": True,
                 "message": "active hypothesis scoring is held (ACTIVE_HYPOTHESIS_SCORING_HELD)",
             }
-        q = text("""
-            SELECT id, thesis, pattern_type, evidence, test_criteria,
-                   invalidation, confidence, status, times_tested,
-                   times_correct, created_at
-            FROM discovered_hypotheses
-            WHERE id = :hid
-        """)
-        with self.engine.connect() as conn:
-            row = conn.execute(q, {"hid": hypothesis_id}).fetchone()
-
-        if row is None:
-            return {"error": f"hypothesis {hypothesis_id} not found"}
-
-        h_id, thesis, ptype, evidence, criteria, inv, conf, status, tested, correct, created = row
-        if status != "active":
-            return {"id": h_id, "status": status, "message": "not active, skipping"}
-
-        criteria = criteria if isinstance(criteria, dict) else json.loads(criteria or "{}")
-        outcome = self._evaluate_criteria(criteria, created)
-
-        # Bayesian update
-        tested += 1
-        if outcome == "confirmed":
-            correct += 1
-        new_conf = (correct + 1) / (tested + 2)  # Beta-distribution posterior
-
-        if outcome == "invalidated":
-            new_conf = max(new_conf * 0.5, 0.01)
-
-        # Intelligence-informed confidence adjustment (calibrated from historical data)
-        try:
-            intel_boost = self._get_intelligence_boost(h_id, criteria, ptype, outcome)
-            if intel_boost != 1.0:
-                new_conf = max(min(new_conf * intel_boost, 0.99), 0.01)
-                log.debug("hypothesis {}: intel boost={}", h_id[:12], intel_boost)
-        except Exception:
-            pass
-
-        # Backfill outcome on boost log entries for calibration
-        self._update_boost_outcomes(h_id, outcome)
-
-        # Check for kill conditions
-        kill_reason = self._check_kills(
-            h_id, ptype, criteria, created, new_conf, tested, outcome,
-        )
-
-        new_status = status
-        if kill_reason:
-            new_status = "invalidated"
-        elif outcome == "confirmed" and new_conf > 0.75:
-            new_status = "confirmed"
-
-        update = text("""
-            UPDATE discovered_hypotheses
-            SET confidence = :conf,
-                status = :status,
-                times_tested = :tested,
-                times_correct = :correct,
-                last_tested = NOW(),
-                kill_reason = :kill_reason,
-                killed_at = CASE WHEN :kill_reason IS NOT NULL THEN NOW() ELSE killed_at END
-            WHERE id = :hid
-        """)
-        with self.engine.begin() as conn:
-            conn.execute(update, {
-                "conf": round(new_conf, 4),
-                "status": new_status,
-                "tested": tested,
-                "correct": correct,
-                "hid": h_id,
-                "kill_reason": kill_reason,
-            })
-
-        # Write postmortem for killed hypotheses
-        if kill_reason:
-            self._write_postmortem(h_id, kill_reason)
-
-        # If thesis confirmed, kill the antithesis (and vice versa)
-        if new_status == "confirmed":
-            self._kill_counterpart(h_id)
-
         return {
-            "id": h_id,
-            "thesis": thesis,
-            "outcome": outcome,
-            "confidence": round(new_conf, 4),
-            "status": new_status,
-            "times_tested": tested,
-            "times_correct": correct,
-            "kill_reason": kill_reason,
+            "hypothesis_id": hypothesis_id,
+            "outcome": "deferred",
+            "deferred": True,
+            "message": "verdicts are issued only by the ledgered batch scorer "
+                       "(score_due_active_hypotheses)",
         }
 
     # ── Kill system ──────────────────────────────────────────────────────
@@ -1082,34 +1021,11 @@ class HypothesisGenerator:
             self._kill_hypothesis(counterpart[0], "ANTITHESIS_CONFIRMED")
             self._write_postmortem(counterpart[0], "ANTITHESIS_CONFIRMED")
 
-    def score_all(self) -> list[dict]:
-        """Score all active theses and antitheses whose test window has elapsed."""
-        q = text("""
-            SELECT id, test_criteria, created_at
-            FROM discovered_hypotheses
-            WHERE status = 'active'
-            ORDER BY created_at
-        """)
-        with self.engine.connect() as conn:
-            rows = conn.execute(q).fetchall()
-
-        results = []
-        now = datetime.now(timezone.utc)
-        for row in rows:
-            h_id = row[0]
-            criteria = row[1] if isinstance(row[1], dict) else json.loads(row[1] or "{}")
-            created = row[2]
-
-            # Derive test window from criteria
-            window_days = criteria.get("window_days") or criteria.get("lag_days") or 7
-            if created + timedelta(days=window_days) > now:
-                continue  # Not ready yet
-
-            result = self.score_hypothesis(h_id)
-            results.append(result)
-
-        log.info("hypothesis_engine: scored {} hypotheses", len(results))
-        return results
+    def score_all(self) -> dict:
+        """Score every matured active hypothesis as one ledgered batch."""
+        result = score_due_active_hypotheses(self.engine, batch_size=10000, max_runtime_s=3600)
+        log.info("hypothesis_engine: score_all {}", result.get("verdicts") or result)
+        return result
 
     def auto_discover(self) -> list[dict]:
         """Full pipeline: detect patterns, find anomalies, generate hypotheses, store.
@@ -1138,7 +1054,7 @@ class HypothesisGenerator:
             if self._store_hypothesis(hyp):
                 stored += 1
 
-        # Phase 5: score existing
+        # Phase 5: score existing (one ledgered batch; held/unconfigured = no-op)
         scored = self.score_all()
 
         log.info(
@@ -1147,7 +1063,7 @@ class HypothesisGenerator:
             len(patterns),
             len(all_anomalies),
             stored,
-            len(scored),
+            scored.get("declared", 0),
         )
 
         return [asdict(h) for h in hypotheses]
@@ -1967,39 +1883,32 @@ def score_due_active_hypotheses(
     batch_size: int = 200,
     max_runtime_s: int = 600,
 ) -> dict:
-    """Score active hypotheses whose evaluation window has closed.
+    """Score every matured active hypothesis as one ledgered batch (v2).
 
-    "Eval window closed" = ``created_at + (test_criteria->>'window_days')::int days < now()``.
-    Falls back to a 7-day window when the JSONB key is missing, matching the
-    default used by ``_check_kills`` and ``_evaluate_criteria``.
-
-    Iterates at most ``batch_size`` rows (oldest ``last_tested`` first, NULLs
-    first) and stops early if ``max_runtime_s`` elapses. Each row is scored
-    via ``HypothesisGenerator.score_hypothesis``, which handles boost-log
-    backfill, postmortem writes, Bayesian confidence updates, status
-    transitions, and kill criteria internally.
-
-    Returns a dict with per-batch counts so the caller (hermes_operator) can
-    log the distribution and surface it via the hermes-status endpoint.
+    Delegates to :func:`intelligence.hypothesis_trials.score_batch` under the
+    S11 trial ledger's file lock: each matured hypothesis gets one point-in-time
+    holdout look, GRID telemetry is ineligible, BH runs over the batch, and the
+    batch is appended to the ledger before any row changes. ``batch_size``
+    caps the active rows scanned (oldest first); ``max_runtime_s`` stops the
+    scan early, and the trials planned so far still form the batch.
 
     Wired into the hermes operator at a 30-minute cadence (see
-    ``scripts/hermes_operator.py``). The companion gap memo:
-    ``project-active-hypo-scoring-gap``.
+    ``scripts/hermes_operator.py``). Writes nothing while
+    ``ACTIVE_HYPOTHESIS_SCORING_HELD`` is set or the ledger is not configured.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if max_runtime_s <= 0:
         raise ValueError(f"max_runtime_s must be positive, got {max_runtime_s}")
 
-    start = time.monotonic()
-    counts = {
+    counts: dict[str, Any] = {
         "scanned": 0,
         "scored": 0,
         "confirmed": 0,
         "invalidated": 0,
-        "inconclusive": 0,
+        "expired": 0,
+        "pending": 0,
         "errors": 0,
-        "skipped_non_active": 0,
         "timed_out": False,
         "batch_size": batch_size,
         "max_runtime_s": max_runtime_s,
@@ -2009,77 +1918,46 @@ def score_due_active_hypotheses(
         log.info("score_due_active_hypotheses: held (ACTIVE_HYPOTHESIS_SCORING_HELD)")
         return counts
 
-    # Fetch overdue active hypos. We compute eval_window_end on the fly from
-    # the JSONB criteria because the schema doesn't carry a separate column.
-    due_q = text("""
-        SELECT id
-        FROM discovered_hypotheses
-        WHERE status = 'active'
-          AND (
-              created_at + make_interval(
-                  days => COALESCE((test_criteria->>'window_days')::int, 7)
-              ) < NOW()
-          )
-        ORDER BY last_tested ASC NULLS FIRST, created_at ASC
-        LIMIT :batch_size
-    """)
+    from intelligence import hypothesis_trials
 
+    start = time.monotonic()
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(due_q, {"batch_size": batch_size}).fetchall()
-    except Exception as exc:
-        log.warning("score_due_active_hypotheses: due-query failed: {e}", e=str(exc))
+        with hypothesis_trials.open_trial_ledger() as ledger:
+            result = hypothesis_trials.score_batch(
+                engine, ledger=ledger, limit=batch_size, max_runtime_s=max_runtime_s,
+            )
+    except hypothesis_trials.TrialLedgerNotConfigured as exc:
         counts["errors"] += 1
+        counts["error"] = str(exc)
+        log.warning("score_due_active_hypotheses: {e}", e=str(exc))
+        return counts
+    except Exception as exc:
+        counts["errors"] += 1
+        counts["error"] = str(exc)
+        log.warning("score_due_active_hypotheses: batch failed: {e}", e=str(exc))
         return counts
 
-    counts["scanned"] = len(rows)
-    if not rows:
-        log.info("score_due_active_hypotheses: no overdue active hypotheses")
-        return counts
-
-    generator = HypothesisGenerator(engine)
-    for (hid,) in rows:
-        elapsed = time.monotonic() - start
-        if elapsed >= max_runtime_s:
-            counts["timed_out"] = True
-            log.info(
-                "score_due_active_hypotheses: hit max_runtime_s={t}s after {n} rows",
-                t=max_runtime_s, n=counts["scored"],
-            )
-            break
-        try:
-            result = generator.score_hypothesis(hid)
-        except Exception as exc:
-            counts["errors"] += 1
-            log.warning(
-                "score_due_active_hypotheses: score_hypothesis({hid}) raised: {e}",
-                hid=hid, e=str(exc),
-            )
-            continue
-
-        if "error" in result:
-            counts["errors"] += 1
-            continue
-        if result.get("message") == "not active, skipping":
-            counts["skipped_non_active"] += 1
-            continue
-
-        outcome = (result.get("outcome") or "inconclusive").lower()
-        if outcome == "confirmed":
-            counts["confirmed"] += 1
-        elif outcome == "invalidated":
-            counts["invalidated"] += 1
-        else:
-            counts["inconclusive"] += 1
-        counts["scored"] += 1
-
-    counts["runtime_s"] = round(time.monotonic() - start, 2)
+    verdicts = result.get("verdicts") or {}
+    counts.update({
+        "scanned": result.get("scanned", 0),
+        "scored": result.get("declared", 0),
+        "confirmed": verdicts.get("confirmed", 0),
+        "invalidated": verdicts.get("invalidated", 0),
+        "expired": verdicts.get("expired", 0),
+        "pending": result.get("pending", 0),
+        "timed_out": bool(result.get("timed_out")),
+        "scorer_version": result.get("scorer_version"),
+        "record_sha256": result.get("record_sha256"),
+        "applied": result.get("applied"),
+        "replayed": result.get("replayed"),
+        "ledger": result.get("ledger"),
+        "runtime_s": round(time.monotonic() - start, 2),
+    })
     log.info(
-        "score_due_active_hypotheses: scored={s} confirmed={c} invalidated={i} "
-        "inconclusive={n} errors={e} runtime={r}s timed_out={t}",
+        "score_due_active_hypotheses: declared={s} confirmed={c} invalidated={i} "
+        "expired={x} pending={p} runtime={r}s",
         s=counts["scored"], c=counts["confirmed"], i=counts["invalidated"],
-        n=counts["inconclusive"], e=counts["errors"],
-        r=counts["runtime_s"], t=counts["timed_out"],
+        x=counts["expired"], p=counts["pending"], r=counts["runtime_s"],
     )
     return counts
 
@@ -2258,14 +2136,7 @@ def main() -> None:
 
     elif cmd == "score-all":
         gen = HypothesisGenerator(engine)
-        results = gen.score_all()
-        print(f"\n=== Scored {len(results)} Hypotheses ===\n")
-        for r in results:
-            print(
-                f"  {r.get('id', '?')[:20]}: {r.get('outcome', '?')} "
-                f"(conf={r.get('confidence', 0):.3f})"
-            )
-        print()
+        _print_json(gen.score_all())
 
     elif cmd == "cleanup":
         dry = "--dry-run" in sys.argv

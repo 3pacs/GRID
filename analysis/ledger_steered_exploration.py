@@ -159,6 +159,18 @@ refuses unless the latest gate record for exactly those trials passed *and*
 the ledger has declared no new trial since (a gate passed against 50 trials
 says nothing once there are 200). The gate itself never promotes; its record
 carries ``promotion_allowed: false`` like every other.
+
+Scored hypothesis batches (2026-11-06)
+--------------------------------------
+:func:`record_hypothesis_batch` appends a ``hypothesis_batch`` record for each
+batch of ``discovered_hypotheses`` that ``intelligence.hypothesis_trials``
+scores: every declared trial (tested, untestable and ineligible), its
+holdout p-value, the Benjamini-Hochberg q-value the ledger computes over the
+whole batch at its frozen ``q``, and the verdict that follows. A hypothesis is
+declared in one batch at most (its holdout is spent). The batches draw nothing
+from the alpha-spending schedule above (their error control is per-batch BH),
+but their trials count in :func:`declared_trial_count`, so a gate passed
+before a batch is stale after it.
 """
 
 from __future__ import annotations
@@ -179,6 +191,7 @@ from analysis.offline_research_proof import (
     LEDGER_SELECTION,
     SELF_LAG,
     Protocol,
+    bh_adjusted,
     build_family_rows,
     digest,
     excluded,
@@ -199,6 +212,10 @@ WINDOW_RULE = (
 )
 CANONICAL_LEDGER_ID = "grid-hypothesis-loop"
 FORWARD_LOG_SOURCE = "hypothesis_forward_v1"
+# Scored hypothesis batches (intelligence.hypothesis_trials; files only here).
+HYPOTHESIS_BATCH_KIND = "hypothesis_batch"
+HYPOTHESIS_TRIAL_STATUSES = ("tested", "untestable", "ineligible")
+HYPOTHESIS_VERDICTS = ("confirmed", "invalidated", "expired")
 REPO = Path(__file__).resolve().parent.parent
 MAX_Q = 0.10
 PERMS_CAP = 20000
@@ -826,6 +843,8 @@ class Ledger:
         if record.get("promotion_allowed", False) is not False:
             raise ValueError("the ledger never allows promotion")
         kind = record.get("kind")
+        if kind == HYPOTHESIS_BATCH_KIND:
+            validate_hypothesis_batch(record, self.q, hypothesis_batch_trials(self))
         if kind == "catalog_extension":
             has_open = self.open_allocation() is not None
             current_cat = self.effective_catalog if "catalog" in self.genesis else None
@@ -945,6 +964,7 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     current_catalog: Catalog | None = None
     current_catalog_sha: str | None = None
     open_allocation_sha: str | None = None
+    hypotheses_seen: set[str] = set()
 
     for seq, line in enumerate(lines):
         record = json.loads(line)
@@ -985,6 +1005,11 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
                         f"record {seq}: {kind} references {alloc_ref}, but open allocation is {open_allocation_sha}"
                     )
             open_allocation_sha = None
+        elif kind == HYPOTHESIS_BATCH_KIND:
+            ids = [t.get("hypothesis_id") for t in record.get("trials", [])]
+            if len(set(ids)) != len(ids) or hypotheses_seen & set(ids):
+                raise ValueError(f"record {seq}: a hypothesis is tested twice")
+            hypotheses_seen.update(ids)
         elif kind == "catalog_extension":
             current_catalog, current_catalog_sha = validate_extension_record(
                 record,
@@ -1747,8 +1772,15 @@ def overfit_gate_prereg_sha256() -> str:
 
 
 def declared_trial_count(ledger: Ledger) -> int:
-    """Every trial every allocation ever declared (abandoned and untestable included)."""
-    return int(sum(a["trial_count"] for a in ledger.allocations()))
+    """Every trial the ledger ever declared (abandoned and untestable included).
+
+    S11 allocations plus every scored hypothesis trial of every
+    ``hypothesis_batch``: the deflated Sharpe deflates by all of them.
+    """
+    return int(
+        sum(a["trial_count"] for a in ledger.allocations())
+        + sum(b["trial_count"] for b in ledger.of_kind(HYPOTHESIS_BATCH_KIND))
+    )
 
 
 def ledgered_tested_trials(ledger: Ledger) -> dict[str, dict]:
@@ -1938,6 +1970,122 @@ def require_overfit_gate(ledger: Ledger, candidate_trial_ids) -> dict:
             "overfitting gate is stale: the ledger has new trials since it ran"
         )
     return gate
+
+
+# --- scored hypothesis batches (intelligence.hypothesis_trials) -----------------------
+
+HYPOTHESIS_TRIAL_FIELDS = (
+    "hypothesis_id", "identity_sha256", "pattern_type", "test_kind", "created_at",
+    "status", "p_value", "effect_ok",
+)
+
+
+def hypothesis_batch_trials(ledger: Ledger) -> dict[str, dict]:
+    """``hypothesis_id -> trial`` for every hypothesis any batch has declared."""
+    return {
+        t["hypothesis_id"]: t
+        for record in ledger.of_kind(HYPOTHESIS_BATCH_KIND)
+        for t in record["trials"]
+    }
+
+
+def _hypothesis_verdicts(trials: list[dict], q: float) -> list[dict]:
+    """BH q-values over every declared trial and the verdict each implies."""
+    q_values = bh_adjusted([float(t["p_value"]) for t in trials])
+    out = []
+    for trial, q_value in zip(trials, q_values):
+        if trial["status"] != "tested":
+            verdict = "expired"
+        elif q_value <= q and trial["effect_ok"]:
+            verdict = "confirmed"
+        else:
+            verdict = "invalidated"
+        out.append({**trial, "q_value": float(q_value), "verdict": verdict})
+    return out
+
+
+def validate_hypothesis_batch(record: dict, q: float, seen: dict[str, dict]) -> None:
+    """Refuse a batch that is malformed, re-tests a hypothesis or misstates its BH verdicts."""
+    trials = record.get("trials")
+    if not isinstance(trials, list) or not trials:
+        raise ValueError("a hypothesis batch declares at least one trial")
+    if record.get("trial_count") != len(trials):
+        raise ValueError("hypothesis batch trial_count must equal its declared trials")
+    if record.get("q") != q or record.get("selection") != "bh_batch":
+        raise ValueError("hypothesis batch must use BH over the batch at the ledger's q")
+    ids = [t.get("hypothesis_id") for t in trials]
+    if len(set(ids)) != len(ids):
+        raise ValueError("a hypothesis appears twice in one batch")
+    again = sorted(set(ids) & set(seen))
+    if again:
+        raise ValueError(f"{len(again)} hypothesis(es) already tested: one look per hypothesis")
+    for t in trials:
+        missing = [f for f in HYPOTHESIS_TRIAL_FIELDS if f not in t]
+        if missing:
+            raise ValueError(f"hypothesis trial missing {missing}")
+        if t["status"] not in HYPOTHESIS_TRIAL_STATUSES:
+            raise ValueError(f"unknown hypothesis trial status {t['status']!r}")
+        p = t["p_value"]
+        if not isinstance(p, (int, float)) or not math.isfinite(p) or not 0 < p <= 1:
+            raise ValueError("hypothesis trial p-values must lie in (0, 1]")
+        if t["status"] != "tested" and (p != 1.0 or t["effect_ok"]):
+            raise ValueError("untestable and ineligible trials carry p = 1 and no effect")
+    if [
+        (t["q_value"], t["verdict"]) for t in trials
+    ] != [(v["q_value"], v["verdict"]) for v in _hypothesis_verdicts(trials, q)]:
+        raise ValueError("hypothesis batch q-values or verdicts do not follow from its p-values")
+
+
+def record_hypothesis_batch(
+    ledger: Ledger,
+    *,
+    scorer_version: str,
+    evaluated_at: str,
+    trials: list[dict],
+    recorded_at: str | None = None,
+) -> dict:
+    """Append one scored batch of hypothesis trials; returns ``{record, sha256}``.
+
+    The ledger, not the caller, computes Benjamini-Hochberg q-values over every
+    declared trial of the batch (``untestable``/``ineligible`` at p = 1 are in
+    the denominator) at its frozen level ``q``. A trial is ``confirmed`` when
+    it was tested, its q-value is <= q and its effect condition holds;
+    ``invalidated`` when tested otherwise; ``expired`` when not testable. Each
+    hypothesis may be declared in one batch only (single-use holdout). The
+    batch draws nothing from the S11 alpha-spending schedule; its trials do
+    count toward :func:`declared_trial_count`. ``promotion_allowed`` stays false.
+    """
+    declared = _hypothesis_verdicts([dict(t) for t in trials], ledger.q)
+    record = _finite({
+        "kind": HYPOTHESIS_BATCH_KIND,
+        "scorer_version": scorer_version,
+        "evaluated_at": evaluated_at,
+        "selection": "bh_batch",
+        "q": ledger.q,
+        "trial_count": len(declared),
+        "n_trials_declared_before": declared_trial_count(ledger),
+        "trials": declared,
+        "recorded_at": recorded_at or now_iso(),
+    })
+    appended, sha = ledger._append(record)
+    return {"record": appended, "sha256": sha}
+
+
+def summarize_hypothesis_batches(ledger: Ledger) -> dict:
+    """Counts over every recorded hypothesis batch (files only)."""
+    batches = ledger.of_kind(HYPOTHESIS_BATCH_KIND)
+    trials = [t for b in batches for t in b["trials"]]
+    return {
+        "ledger_id": ledger.genesis["ledger_id"],
+        "head_sha256": ledger.head,
+        "q": ledger.q,
+        "hypothesis_batches": len(batches),
+        "hypothesis_trials": len(trials),
+        "by_status": {s: sum(t["status"] == s for t in trials) for s in HYPOTHESIS_TRIAL_STATUSES},
+        "by_verdict": {v: sum(t["verdict"] == v for t in trials) for v in HYPOTHESIS_VERDICTS},
+        "n_trials_declared_total": declared_trial_count(ledger),
+        "promotion_allowed": False,
+    }
 
 
 def summarize(ledger: Ledger) -> dict:

@@ -781,6 +781,13 @@ class Settings(BaseSettings):
     AUTORESEARCH_MAX_ITER: int = 5
     AUTORESEARCH_LAYER: str = "REGIME"
 
+    # S11 trial ledger for scored discovered_hypotheses (intelligence.
+    # hypothesis_trials). An existing analysis.ledger_steered_exploration
+    # ledger file and its anchor (keep the anchor on a separate append-only
+    # location). Blank -> the batch scorer writes no verdicts.
+    HYPOTHESIS_TRIAL_LEDGER_PATH: str = ""
+    HYPOTHESIS_TRIAL_LEDGER_ANCHOR_PATH: str = ""
+
     # Hyperliquid perp trading
     HYPERLIQUID_PRIVATE_KEY: str = ""
     HYPERLIQUID_TESTNET: bool = True
