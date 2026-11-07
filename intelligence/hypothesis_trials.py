@@ -14,8 +14,8 @@ Replaces the v1 scorer that ``ACTIVE_HYPOTHESIS_SCORING_HELD`` has held since
   prediction rows, mostly ``no_data`` before #976) and took the first of five
   rows that moved 2%.
 
-v2 (this module; v3 since 2026-11-07 changes the ticker-move null) issues a
-verdict only as a declared trial, once:
+v2 (this module; v4 since 2026-11-07 ranks ticker moves against the crowd)
+issues a verdict only as a declared trial, once:
 
 1. **Eligibility.** A hypothesis whose outcome or leading signal is GRID's own
    output (``snap:*``, ``llm_task_*``, oracle/hypothesis/pipeline series — see
@@ -27,10 +27,10 @@ verdict only as a declared trial, once:
    convergence hypotheses on completed raw closes
    (:func:`store.observations.read_completed_closes`, the #980 reader; entry at
    the first close after creation, exit at the last close inside the declared
-   window, both known at ``evaluated_at``), net of the ticker's frozen
-   pre-creation betas to SPY and IWM, against its own pre-creation
-   distribution of same-horizon residuals (v3; v2 netted SPY at beta 1, which
-   let a crowd-wide move count for the stock -- see :func:`ticker_move_test`);
+   window, both known at ``evaluated_at``), ranked against up to 500 US stocks
+   over the same days, each in units of its own pre-creation volatility (v4;
+   v2 and v3 let a crowd-wide move count for the stock -- see
+   :func:`ticker_move_test`);
    lead-lag hypotheses at their *declared* lag and sign on the calendar days
    after creation, against a block-permutation null
    (:mod:`analysis.offline_research_proof`).
@@ -82,27 +82,22 @@ from analysis.offline_research_proof import (
     excluded as _research_excluded,
 )
 
-SCORER_VERSION = "hypothesis-trials/3"
+SCORER_VERSION = "hypothesis-trials/4"
 
 ET = ZoneInfo("America/New_York")
 US_CLOSE = dtime(16, 0)
 
-# Convergence (ticker-move) test.
-MARKET_TICKER = "SPY"
-BENCHMARK_TICKERS = (MARKET_TICKER, "IWM")  # the market and the small-cap crowd (v3)
-BETA_LOOKBACK_SESSIONS = 252          # daily returns before creation the betas are fitted on
-MIN_BETA_SESSIONS = 120
-# Ticker-move trials are held (left active, unscored, not ledgered) until the
-# test is calibrated against the same-window cross-section. Read 2026-11-07,
-# 336 random US stocks over 2026-09-14..10-01: 71% fell short of SPY+IWM at
-# their fitted betas, and a "down" call on any of them reached p <= 0.10 19%
-# of the time (10% if calibrated). The one look is final, so none is spent on
-# a test that a crowd-wide move can pass. Lead-lag trials are unaffected.
-TICKER_MOVE_HELD = True
+# Convergence (ticker-move) test (v4: ranked against the same-window crowd).
+CROSS_SECTION_SIZE = 500              # US stocks the call is ranked against (stable sha256 sample)
+MIN_CROSS_SECTION = 100               # fewer with both window closes captured -> still pending
+VOL_SESSIONS = 60                     # pre-creation daily returns that set each stock's scale
+VOL_LOOKBACK_DAYS = 120               # calendar days of pre-creation closes read for that scale
+VOL_STALE_DAYS = 7                    # the last pre-creation close may be this old
+# Switch to leave ticker-move trials active, unscored and unledgered. v3 (SPY+IWM
+# betas) set it after it failed calibration; v4 releases it.
+TICKER_MOVE_HELD = False
 DEFAULT_WINDOW_DAYS = 14
 DEFAULT_MIN_MOVE_PCT = 2.0
-NULL_LOOKBACK_DAYS = 365 * 5 + 30     # calendar days of pre-creation closes read for the null
-MIN_NULL_SAMPLES = 250                # same-horizon null returns needed for a p-value
 EDGE_TOLERANCE_DAYS = 4               # entry/exit close may sit this far inside the window edge
 
 # Lead-lag test.
@@ -301,94 +296,98 @@ def entry_session_floor(created_at: datetime) -> date:
     return local.date() if local.time() < US_CLOSE else local.date() + timedelta(days=1)
 
 
-def factor_betas(ticker_returns: np.ndarray, factor_returns: np.ndarray) -> np.ndarray:
-    """OLS slopes of daily log returns on the benchmarks' (intercept fitted, not returned)."""
-    x = np.column_stack([np.ones(len(ticker_returns)), factor_returns.T])
-    coef, *_ = np.linalg.lstsq(x, ticker_returns, rcond=None)
-    return coef[1:]
+def trial_window(closes: dict[date, float], *, created_at: datetime,
+                 window_days: int) -> tuple[date, date, int] | None:
+    """(entry, exit, sessions between) of a ticker-move trial, or None while
+    the first close after creation or the last close inside the window is
+    missing."""
+    floor = entry_session_floor(created_at)
+    ceiling = _aware(created_at).astimezone(ET).date() + timedelta(days=window_days)
+    after = sorted(d for d in closes if floor <= d <= ceiling)
+    if len(after) < 2:
+        return None
+    entry, exit_ = after[0], after[-1]
+    if (entry - floor).days > EDGE_TOLERANCE_DAYS or (ceiling - exit_).days > EDGE_TOLERANCE_DAYS:
+        return None
+    return entry, exit_, len(after) - 1
+
+
+def scaled_move(closes: dict[date, float], entry: date, exit_: date, *,
+                created_at: datetime, horizon: int) -> tuple[float, float] | None:
+    """(log return entry->exit, its scale) or None.
+
+    The scale is the sd of the ``VOL_SESSIONS`` daily log returns before
+    creation times sqrt(``horizon``): known when the call was made.
+    """
+    if entry not in closes or exit_ not in closes:
+        return None
+    created_day = _aware(created_at).astimezone(ET).date()
+    before = sorted(d for d in closes if d < created_day)[-(VOL_SESSIONS + 1):]
+    if len(before) < VOL_SESSIONS + 1 or (created_day - before[-1]).days > VOL_STALE_DAYS:
+        return None
+    sd = float(np.std(np.diff(np.log(np.array([closes[d] for d in before], dtype=float))), ddof=1))
+    if not (math.isfinite(sd) and sd > 0):
+        return None
+    return math.log(closes[exit_] / closes[entry]), sd * math.sqrt(horizon)
 
 
 def ticker_move_test(
     ticker_closes: dict[date, float],
-    benchmarks: dict[str, dict[date, float]] | None,
+    crowd: dict[str, dict[date, float]],
     *,
     created_at: datetime,
     direction: str,
     window_days: int,
     min_move_pct: float,
 ) -> TrialResult:
-    """One-sided test that the ticker beat (or lagged) the crowd as declared.
+    """One-sided test that the ticker beat (or lagged) the same-window crowd.
 
-    Statistic: the ticker's signed log return from the first close after
-    creation to the last close inside the window, net of its exposure to the
-    ``benchmarks`` (SPY and IWM: the market and the small-cap crowd). The
-    exposures are OLS betas of daily log returns over the
-    ``BETA_LOOKBACK_SESSIONS`` before creation, fitted once and frozen.
-    Null: every overlapping same-horizon residual of the ticker before
-    creation, with the same betas. ``p = (1 + #null >= observed) / (n + 1)``.
+    Entry is the first close after creation, exit the last close inside the
+    window. Every stock (the ticker and each ``crowd`` member with both
+    closes) gets ``z = (r - m) / scale``: its log return net of the crowd's
+    median return ``m`` over those same days, in units of its own
+    pre-creation volatility. ``p = (1 + #crowd z >= ticker z) / (n + 1)`` in
+    the declared direction: the chance a stock drawn from the crowd would
+    have done at least as well. A move the whole crowd made cancels out.
 
-    v2 netted out SPY at beta 1 only, so a move the whole crowd made counted
-    for the stock: from 2026-09-14 to 10-01, 74-79% of 1,634 US stocks lagged
-    SPY, and 296 "down" calls looked 72% right while ranking at the 51st
-    percentile of the same-window cross-section.
+    v2 compared the ticker with its own history net of SPY, and v3 net of
+    SPY+IWM betas; both let a crowd-wide move count for the stock. From
+    2026-09-14 to 10-01, 71% of 336 random US stocks fell short even of
+    SPY+IWM, and a "down" call on any of them reached p <= 0.10 19% of the
+    time.
 
     Confirmation also needs the raw move to reach ``min_move_pct`` in the
-    declared direction (the thesis' own size). Returns ``PENDING`` when the
-    entry or exit close is missing for the ticker or any benchmark.
+    declared direction and the ticker to beat the crowd median. Returns
+    ``PENDING`` while the ticker's window closes, or those of at least
+    ``MIN_CROSS_SECTION`` crowd stocks, are missing.
     """
     sign = 1.0 if direction == "up" else -1.0
-    bench = dict(benchmarks or {})
-    names = list(bench)
-    days = sorted(d for d in ticker_closes if all(d in bench[n] for n in names))
-    floor = entry_session_floor(created_at)
-    ceiling = _aware(created_at).astimezone(ET).date() + timedelta(days=window_days)
-    after = [d for d in days if floor <= d <= ceiling]
-    if len(after) < 2:
+    window = trial_window(ticker_closes, created_at=created_at, window_days=window_days)
+    if window is None:
         return PENDING
-    entry, exit_ = after[0], after[-1]
-    if (entry - floor).days > EDGE_TOLERANCE_DAYS or (ceiling - exit_).days > EDGE_TOLERANCE_DAYS:
-        return PENDING
-
-    def log_level(series: dict[date, float], ds: list[date]) -> np.ndarray:
-        return np.log(np.array([series[d] for d in ds], dtype=float))
-
+    entry, exit_, horizon = window
     raw = math.log(ticker_closes[exit_] / ticker_closes[entry])
-    horizon = after.index(exit_)  # sessions between entry and exit
-    created_day = _aware(created_at).astimezone(ET).date()
-    before = [d for d in days if d < created_day]
     details: dict[str, Any] = {
         "entry": entry.isoformat(), "exit": exit_.isoformat(), "horizon_sessions": horizon,
         "raw_move_pct": round((math.exp(raw) - 1) * 100, 4),
-        "benchmarks": names,
     }
-    if MARKET_TICKER in bench:
-        spy = bench[MARKET_TICKER]
-        details["excess_log_return"] = round(raw - math.log(spy[exit_] / spy[entry]), 6)
-    fit = before[-(BETA_LOOKBACK_SESSIONS + 1):]
-    if len(fit) - 1 < MIN_BETA_SESSIONS or len(before) <= horizon:
-        details["n_null"] = max(len(before) - horizon, 0)
+    own = scaled_move(ticker_closes, entry, exit_, created_at=created_at, horizon=horizon)
+    if own is None:
         return TrialResult(status=UNTESTABLE, reason=INSUFFICIENT_HISTORY, details=details)
-
-    t_before = log_level(ticker_closes, before)
-    f_before = np.array([log_level(bench[n], before) for n in names]).reshape(len(names), len(before))
-    if names:
-        k = len(fit)
-        betas = factor_betas(np.diff(t_before[-k:]), np.diff(f_before[:, -k:], axis=1))
-    else:
-        betas = np.zeros(0)
-    resid_before = t_before - betas @ f_before
-    f_move = np.array([math.log(bench[n][exit_] / bench[n][entry]) for n in names])
-    residual = raw - float(betas @ f_move)
-    observed = sign * residual
-    null = sign * (resid_before[horizon:] - resid_before[:-horizon])
+    moves = [m for c in crowd.values()
+             if (m := scaled_move(c, entry, exit_, created_at=created_at, horizon=horizon))]
+    if len(moves) < MIN_CROSS_SECTION:
+        return PENDING
+    r, scale = np.array(moves, dtype=float).T
+    median = float(np.median(r))
+    z = sign * (r - median) / scale
+    observed = sign * (own[0] - median) / own[1]
+    p = (1 + int((z >= observed - 1e-12).sum())) / (len(z) + 1)
     details.update({
-        "residual_log_return": round(residual, 6),
-        "betas": {n: round(float(b), 4) for n, b in zip(names, betas)},
-        "n_beta": len(fit) - 1, "n_null": len(null),
+        "crowd_median_log_return": round(median, 6),
+        "crowd_relative_log_return": round(own[0] - median, 6),
+        "z": round(float(observed), 4), "n_crowd": len(z),
     })
-    if len(null) < MIN_NULL_SAMPLES:
-        return TrialResult(status=UNTESTABLE, reason=INSUFFICIENT_HISTORY, details=details)
-    p = (1 + int((null >= observed - 1e-12).sum())) / (len(null) + 1)
     effect_ok = sign * (math.exp(raw) - 1) * 100 >= min_move_pct and observed > 0
     return TrialResult(status=TESTED, p_value=float(p), effect_ok=bool(effect_ok), details=details)
 
@@ -463,6 +462,29 @@ def load_completed_closes(conn: Any, ticker: str, start: date, end: date,
     return {d: c.latest.value for d, c in closes.items() if not c.ambiguous}
 
 
+_CROWD_SQL = text("""
+    SELECT DISTINCT series_id FROM raw_series
+    WHERE series_id LIKE :pattern AND obs_date = :day
+      AND pull_status = :ok AND pull_timestamp <= :as_of_ts
+""")
+
+
+def crowd_tickers(conn: Any, day: date, evaluated_at: datetime) -> list[str]:
+    """The ticker-move crowd: up to ``CROSS_SECTION_SIZE`` US-listed tickers
+    with a close captured for ``day`` (by ``evaluated_at``), the same stable
+    sample for every trial on that day (lowest sha256 of the series id)."""
+    from evaluation.prices import _CRYPTO_TICKER_PATTERN, _US_TICKER_PATTERN
+    from store.observations import SUCCESS
+
+    rows = conn.execute(_CROWD_SQL, {"pattern": "YF:%:close", "day": day, "ok": SUCCESS,
+                                     "as_of_ts": evaluated_at}).fetchall()
+    tickers = sorted({sid.split(":")[1] for (sid,) in rows if sid.count(":") == 2},
+                     key=lambda t: hashlib.sha256(f"YF:{t}:close".encode()).hexdigest())
+    tickers = [t for t in tickers
+               if _US_TICKER_PATTERN.match(t) and not _CRYPTO_TICKER_PATTERN.match(t)]
+    return tickers[:CROSS_SECTION_SIZE]
+
+
 _SIGNAL_SERIES_SQL = text("""
     SELECT signal_date, COALESCE(SUM(magnitude), COUNT(*)) AS val
     FROM signal_data
@@ -494,7 +516,7 @@ def run_trial(plan: TrialPlan, conn: Any, evaluated_at: datetime,
         from evaluation.prices import UnsupportedInstrumentError
 
         p = plan.params
-        start = plan.created_at.astimezone(ET).date() - timedelta(days=NULL_LOOKBACK_DAYS)
+        start = plan.created_at.astimezone(ET).date() - timedelta(days=VOL_LOOKBACK_DAYS)
         end = evaluated_at.astimezone(ET).date()
 
         def closes(t: str) -> dict[date, float]:
@@ -507,9 +529,22 @@ def run_trial(plan: TrialPlan, conn: Any, evaluated_at: datetime,
             ticker = closes(p["ticker"])
         except UnsupportedInstrumentError:
             return TrialResult(status=UNTESTABLE, reason=UNSUPPORTED_INSTRUMENT)
-        benchmarks = {b: closes(b) for b in BENCHMARK_TICKERS if b != p["ticker"]}
+        window = trial_window(ticker, created_at=plan.created_at, window_days=p["window_days"])
+        if window is None:
+            return PENDING
+        crowd: dict[str, dict[date, float]] = {}
+        listed_key = f"crowd|{window[0]}"
+        if listed_key not in cache:
+            cache[listed_key] = crowd_tickers(conn, window[0], evaluated_at)
+        for t in cache[listed_key]:
+            if t == p["ticker"]:
+                continue
+            try:
+                crowd[t] = closes(t)
+            except UnsupportedInstrumentError:
+                continue
         return ticker_move_test(
-            ticker, benchmarks, created_at=plan.created_at, direction=p["direction"],
+            ticker, crowd, created_at=plan.created_at, direction=p["direction"],
             window_days=p["window_days"], min_move_pct=p["min_move_pct"],
         )
     if plan.test_kind == "lead_lag":
