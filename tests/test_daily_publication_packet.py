@@ -240,6 +240,8 @@ def test_screen_row_sees_raw_strings_that_json_escaping_would_hide(job):
     # Key/value split: the credential lives in a JSON pair, never in one string on its own.
     assert "credential_assignment" in job.screen_row({"content": "fine", "snapshot_data": {"password": "hunter2hunter2"}})
     assert "credential_assignment" in job.screen_text('{"api_key":"ABCDEFGHIJKLMNOP1234"}')
+    assert "credential_assignment" in job.screen_text("password=ab'c\"d1234567")  # quotes inside the secret
+    assert "credential_assignment" in job.screen_text("secret: 'q1w2e3r4t5'")
     assert job.screen_row({"content": "fine", "sentiment_score": 0.12, "narrative_fallback": True}) == []
 
 
