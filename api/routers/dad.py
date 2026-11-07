@@ -716,6 +716,7 @@ def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]
             "label": item["label"],
             "group": item["group"],
             "raw_value": item.get("raw_value"),
+            "display_value": item.get("display_value"),
             "parsed": item.get("parsed"),
             "numeric_value": item.get("numeric_value"),
         })
@@ -1181,6 +1182,9 @@ def _num_field(finviz: dict[str, Any], field_id: str) -> float | None:
     return float(numeric) if isinstance(numeric, (int, float)) else None
 
 
+PUSH_ONLY_SOURCES: frozenset[str] = frozenset({"TradingView"})
+
+
 def _grid_decision_stack(
     summary: dict[str, Any] | None,
     gold: dict[str, Any],
@@ -1281,12 +1285,20 @@ def _grid_decision_stack(
         rec = str(regime.get("grid_recommendation") or "").lower()
         if any(word in rec for word in ("risk", "hedge", "cash", "defensive", "reduce")):
             score -= 4
-            blockers.append(f"Current GRID regime is cautious: {regime.get('grid_recommendation')}.")
+            blockers.append(
+                f"Current GRID regime is {regime.get('state') or 'unknown'} "
+                f"(recommendation: {regime.get('grid_recommendation')})."
+            )
         else:
             score += 2
 
     stale_sources = []
     for source in grid.get("source_freshness", []):
+        # TradingView is push-only: rows exist only when an alert is sent to
+        # the webhook, so "no recent rows" is not a stale feed and must not
+        # cost every ticker points (2026-11-07: no alerts since 2026-03-25).
+        if source.get("source") in PUSH_ONLY_SOURCES:
+            continue
         if source.get("state") in {"stale", "missing"}:
             stale_sources.append(source.get("source"))
     if stale_sources:
