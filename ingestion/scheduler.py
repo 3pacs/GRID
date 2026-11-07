@@ -1128,12 +1128,11 @@ def _get_pullers_for_group(
             pullers.append(("News_Scraper_RSS", NewsScraperPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("News Scraper RSS puller init failed: {err}", err=str(exc))
-        # Trending news — multi-platform research via last30days-skill (daily)
-        try:
-            from ingestion.altdata.trending_news import TrendingNewsPuller
-            pullers.append(("Trending_News", TrendingNewsPuller(db_engine), "pull_all", {}))
-        except Exception as exc:
-            log.warning("Trending News puller init failed: {err}", err=str(exc))
+        # Trending news (last30days-skill): retired 2026-11-07 (owner). The skill
+        # was never installed on grid-svr (every run SKIPPED); it is a desktop
+        # agent skill that reads browser cookie stores and keychains and would
+        # run in-process with this scheduler's credentials, and its import path
+        # moved upstream. Reddit/Bluesky come from the social sentiment pullers.
         # Analyst ratings — buy/hold/sell counts per ticker from yfinance (daily)
         try:
             from ingestion.altdata.analyst_ratings import AnalystRatingsPuller
@@ -1580,12 +1579,10 @@ def _get_pullers_for_group(
             pullers.append(("World_Bank", WorldBankPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("World Bank puller init failed: {err}", err=str(exc))
-        # FinDKG — financial knowledge graph (monthly, local files)
-        try:
-            from ingestion.altdata.findkg_puller import FinDKGPuller
-            pullers.append(("FinDKG", FinDKGPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("FinDKG puller init failed: {err}", err=str(exc))
+        # FinDKG: retired 2026-11-07 (owner). Its data files were never
+        # downloaded (every run SKIPPED); the dataset is a static 2018-2023 KG in
+        # tab-separated id form, not the JSON this puller reads. A one-time
+        # load would go through a converter, not a monthly schedule.
         # OpenSecrets: retired 2026-11-04 (owner). Its API now returns an HTML
         # page and no key is configured; catalog row set active=FALSE.
 
