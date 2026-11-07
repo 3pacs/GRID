@@ -21,11 +21,53 @@ and make the scheduler independently testable.
 from __future__ import annotations
 
 import time
+from typing import Any, Callable
 
 import schedule as _sched
 from loguru import logger as log
 
 _ACTOR_NEWS_BATCH_BUDGET_SECONDS = 30.0
+
+
+def _run_logged_altdata_job(
+    engine: Any,
+    puller_name: str,
+    source_name: str,
+    runner: Callable[[Any], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run a ``{"fetched", "inserted"}`` altdata job and record it in pull_log.
+
+    The wage-tracker and buyback jobs ran daily here but never wrote
+    pull_log, so a pull_log-based triage (2026-11-07) reported them as
+    "stopped" while journald showed every run. A run that fetched nothing
+    is FAILED; one that fetched rows but found none new is SUCCESS with a
+    ``NO_NEW_DATA`` note and 0 rows (the same marker SmartScheduler uses).
+    """
+    from sqlalchemy import text
+
+    from ingestion.pull_context import PullContext
+
+    source_id: int | None = None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id FROM source_catalog WHERE name = :n"),
+                {"n": source_name},
+            ).fetchone()
+            source_id = int(row[0]) if row else None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("source_catalog lookup failed for {s}: {e}", s=source_name, e=str(exc))
+
+    with PullContext(engine, puller_name, source_id=source_id) as ctx:
+        result = runner(engine)
+        fetched = int(result.get("fetched", 0) or 0)
+        inserted = int(result.get("inserted", 0) or 0)
+        ctx.record_rows(inserted)
+        if fetched == 0:
+            ctx.set_status("FAILED", "fetched 0 rows")
+        elif inserted == 0:
+            ctx.set_note(f"NO_NEW_DATA: {fetched} fetched, 0 new")
+    return result
 
 
 def run_intelligence_loop() -> None:
@@ -750,7 +792,10 @@ def run_intelligence_loop() -> None:
         try:
             from db import get_engine as _ge
             from ingestion.altdata.wage_tracker import run_wage_tracker_puller
-            result = run_wage_tracker_puller(_ge())
+            result = _run_logged_altdata_job(
+                _ge(), "atlanta_fed_wage_tracker", "atlanta_fed_wage_tracker",
+                run_wage_tracker_puller,
+            )
             log.info(
                 "wage tracker: {f} fetched, {i} new",
                 f=result.get("fetched", 0), i=result.get("inserted", 0),
@@ -860,7 +905,10 @@ def run_intelligence_loop() -> None:
         try:
             from db import get_engine as _ge
             from ingestion.altdata.buyback_execution import run_buyback_puller
-            result = run_buyback_puller(_ge())
+            result = _run_logged_altdata_job(
+                _ge(), "buyback_execution", "buyback_execution",
+                run_buyback_puller,
+            )
             log.info(
                 "buyback execution: {f} fetched, {i} new",
                 f=result.get("fetched", 0), i=result.get("inserted", 0),
