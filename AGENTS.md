@@ -241,3 +241,21 @@ Verification and limits:
 - Strengthened the SQLite regression with recently updated legacy, labeled and
   future rows; only the current unlabelled row is counted. All 494 combined
   offline tests passed again; Ruff and diff checks passed.
+
+## 2026-11-07 - SEC financial duration prevention (source-only candidate)
+
+- Reproduced the NVDA quarter/YTD collision: the old form-only classifier and
+  input-order tie breaker admitted a six-month amount as a quarter. Added
+  explicit duration admission and exact filing/period/tag provenance.
+- Quarterly/annual facts are selected deterministically; missing, unsupported
+  and conflicting contexts remain unavailable. Debt netting requires matching
+  reported contexts and resolves amendments before positive-inflow filtering.
+- Added a versioned source marker and bounded replacement of newly validated
+  economic keys, without sweeping unmarked legacy rows or changing schema.
+- Offline parser, provenance, writer and adjacent-reader tests use synthetic
+  inputs, in-memory SQLite or mocks with sockets and PostgreSQL blocked.
+- Production repair is not done. Legacy rows, omitted/withdrawn revisions,
+  structured revision identity, PostgreSQL validation and dependent rollup
+  reconciliation are explicit rollout gates in
+  `docs/reference/SEC_FINANCIAL_PERIOD_INTEGRITY.md`. No provider calls, DB
+  corrections, publication, merge or deployment.
