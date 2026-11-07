@@ -241,3 +241,20 @@ Verification and limits:
 - Strengthened the SQLite regression with recently updated legacy, labeled and
   future rows; only the current unlabelled row is counted. All 494 combined
   offline tests passed again; Ruff and diff checks passed.
+
+## 2026-11-07 - Alpha Vantage transcript coverage (isolated source only)
+
+- Extended the existing earnings-events puller with durable symbol/quarter
+  rotation, explicit local pacing and optional daily budgets, and provider-notice
+  stop behavior. Kept all live wrappers, schedules and account allocations unchanged.
+- Reused stored SEC fiscal metadata matched to exact filings rather than guessing
+  calendar quarters. Missing/ambiguous metadata and legacy transcript provenance
+  are reported as coverage gaps; no historical rows are repaired automatically.
+- Added `docs/reference/ALPHAVANTAGE_COVERAGE_ROLLOUT.md` with prerequisites,
+  milestones and minimum data contracts. AV bulk adapters remain unchanged/unrun.
+- 56 focused offline tests passed with socket access blocked; changed-file lint,
+  compilation and diff checks passed. Independent source review's legacy-date
+  finding was fixed and regression-tested. PostgreSQL integration, account-wide
+  budget allocation, legacy reconciliation and date-aware consumers remain gates.
+- Local branch only. No provider requests, production writes, push, PR, merge or
+  deployment. This does not establish live coverage or complete valuation inputs.

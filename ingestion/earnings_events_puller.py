@@ -9,7 +9,7 @@ Sources (in order of preference):
      https://data.sec.gov/submissions/CIK<10digit>.json
 2. SEC EDGAR company_tickers.json (one-shot ticker -> CIK map at startup)
      https://www.sec.gov/files/company_tickers.json
-3. AlphaVantage EARNINGS_CALL_TRANSCRIPT (free tier, 5 req/min)
+3. AlphaVantage EARNINGS_CALL_TRANSCRIPT (account entitlement required)
      https://www.alphavantage.co/query?function=EARNINGS_CALL_TRANSCRIPT&symbol=AAPL&quarter=2024Q1
 
 Why a separate puller instead of extending edgar_transcripts.py?
@@ -24,8 +24,9 @@ Why a separate puller instead of extending edgar_transcripts.py?
 Rate limits:
 - SEC EDGAR: 10 req/sec hard limit. We sleep 0.15s between requests
   AND set a stable, identifiable User-Agent per their fair-access policy.
-- AlphaVantage free tier: 5 req/min, 500 req/day. We cap to 25 transcript
-  requests per run by default and sleep 13s between calls.
+- AlphaVantage: explicit per-run cap and configurable pacing, with optional
+  shared-file UTC-day cap. Defaults do not imply any account entitlement.
+  State is persistent, so empty responses cannot starve later symbols.
 
 Author: GRID intelligence platform.
 """
@@ -33,10 +34,10 @@ Author: GRID intelligence platform.
 from __future__ import annotations
 
 import os
-import re
 import time
-from datetime import date, datetime, timedelta
-from typing import Any, Iterable
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 import requests
 from loguru import logger as log
@@ -44,6 +45,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+from ingestion.av_transcript_plan import TranscriptPeriod, TranscriptState, verified_periods
 
 # LLM-based sentiment classifier (Task #175). Imported lazily inside
 # _classify_transcript_sentiment so a misconfigured Ollama endpoint or a
@@ -83,7 +85,7 @@ def _normalize_form(form: str) -> str:
 
 
 def _quarter_label(period_end: date | None) -> str | None:
-    """Convert period_end date to fiscal-quarter label like '2024Q3'."""
+    """Legacy SEC calendar bucket; never use this as an AV fiscal request label."""
     if period_end is None:
         return None
     return f"{period_end.year}Q{((period_end.month - 1) // 3) + 1}"
@@ -116,11 +118,22 @@ class EarningsEventsPuller(BasePuller):
         user_agent: str | None = None,
         av_api_key: str | None = None,
         av_max_calls: int = 25,
+        av_requests_per_minute: float = 5.0,
+        av_daily_limit: int | None = None,
+        av_state_path: str | Path | None = None,
     ) -> None:
+        if av_max_calls < 0:
+            raise ValueError("AV max calls must be nonnegative")
         super().__init__(db_engine)
         self.user_agent = user_agent or os.getenv("SEC_EDGAR_UA", DEFAULT_UA)
         self.av_api_key = av_api_key or os.getenv("ALPHAVANTAGE_API_KEY", "")
         self.av_max_calls = av_max_calls
+        self.av_requests_per_minute = av_requests_per_minute
+        self.av_daily_limit = av_daily_limit
+        self.av_state_path = av_state_path or os.getenv(
+            "GRID_AV_TRANSCRIPT_STATE", str(Path.home() / ".local/state/grid/av_transcripts.sqlite3")
+        )
+        self._av_stop_reason: str | None = None
         self._headers_sec = {
             "User-Agent": self.user_agent,
             "Accept": "application/json",
@@ -248,25 +261,140 @@ class EarningsEventsPuller(BasePuller):
         }
         try:
             resp = requests.get(AV_URL, params=params, timeout=30)
-            time.sleep(13.0)  # AlphaVantage free tier 5 req/min
+            if resp.status_code in (401, 403, 429):
+                self._av_stop_reason = f"http_{resp.status_code}"
+                return None
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            log.debug("AV transcript {t} {q} failed: {e}", t=ticker, q=quarter, e=str(exc))
+            # Exception strings may include the request URL and API key.
+            log.warning("AV transcript {t} {q} failed ({kind})", t=ticker, q=quarter,
+                        kind=type(exc).__name__)
             return None
-
         if not isinstance(data, dict):
             return None
-        # AV returns {"Information": "..."} on quota exhaustion
-        if "Information" in data and "transcript" not in data:
-            log.warning("AV quota exhausted: {msg}", msg=data["Information"][:120])
+        if "Information" in data or "Note" in data:
+            # Notices also cover entitlement errors, not only quota exhaustion.
+            self._av_stop_reason = "provider_notice"
+            log.warning("AV provider notice; stopping this transcript run")
             return None
-        if "Note" in data and "transcript" not in data:
-            log.warning("AV throttled: {msg}", msg=str(data["Note"])[:120])
+        if data.get("symbol") != ticker or data.get("quarter") != quarter:
+            log.warning("AV transcript identity mismatch for {t} {q}", t=ticker, q=quarter)
             return None
-        if not data.get("transcript"):
+        entries = data.get("transcript")
+        if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
+            return None
+        if not any(isinstance(e.get("content"), str) and e["content"].strip() for e in entries):
             return None
         return data
+
+    def _load_verified_periods(self, ticker: str, filings: list[dict[str, Any]]) -> list[TranscriptPeriod]:
+        """Reuse SEC fundamentals already ingested; no extra provider calls.
+
+        Exact accession/report-date matching is essential: SEC fy/fp on an old
+        comparative fact describes its newer filing, not that historical period.
+        Missing metadata is reported as a coverage gap instead of guessed.
+        """
+        sid_ticker = ticker.replace("-", ".")
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT r.raw_payload FROM raw_series r "
+                    "JOIN source_catalog s ON s.id = r.source_id "
+                    "WHERE s.name = :source AND r.pull_status = 'SUCCESS' "
+                    "AND r.series_id = ANY(:series) AND r.obs_date >= :cutoff "
+                    "AND r.pull_timestamp <= :as_of"
+                ), {"source": "SEC_EDGAR_Fundamentals",
+                    "series": [f"sec_filed_fundamentals.{sid_ticker}.{field}" for field in
+                               ("total_assets", "net_income", "eps_diluted")],
+                    "cutoff": date.today() - timedelta(days=550),
+                    "as_of": datetime.now(timezone.utc)}).fetchall()
+            return verified_periods([r[0] for r in rows], filings, date.today())
+        except Exception as exc:
+            log.warning("AV fiscal-period lookup failed for {t} ({kind}); skipping", t=ticker,
+                        kind=type(exc).__name__)
+            return []
+
+    def _stored_transcript_periods(self, ticker: str, periods: list[TranscriptPeriod]) -> tuple[set[tuple[str, date]], set[tuple[str, date]]]:
+        """Separate verified coverage from legacy rows requiring reconciliation."""
+        import json
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT fiscal_quarter, period_end, filing_date, raw_payload FROM earnings_events "
+                "WHERE ticker = :ticker AND event_type = 'EARNINGS_CALL' "
+                "AND source = 'ALPHAVANTAGE' AND full_text IS NOT NULL "
+                "AND length(trim(full_text)) > 0"
+            ), {"ticker": ticker}).fetchall()
+        expected = {(p.quarter, p.period_end): p for p in periods}
+        verified, legacy = set(), set()
+        for quarter, end, filed, raw in rows:
+            key = (quarter, end)
+            period = expected.get(key)
+            try:
+                payload = json.loads(raw) if isinstance(raw, str) else raw
+                observed = datetime.fromisoformat(payload["observed_at"])
+                valid = (period is not None and filed == period.filed
+                         and payload.get("filing_date_basis") == "matched_sec_filing_not_call_date"
+                         and payload.get("fiscal_period_accession") == period.accession
+                         and observed.tzinfo is not None
+                         and observed <= datetime.now(timezone.utc))
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            (verified if valid else legacy).add(key)
+        return verified, legacy - verified
+
+    def _pull_planned_transcripts(self, plans, per_ticker, cik_map):
+        """Run bounded, resumable requests only after SEC collection completes."""
+        self._av_stop_reason = None
+        calls = inserted_count = 0
+        if not plans or not self.av_api_key or not self.av_max_calls:
+            return calls, inserted_count
+        try:
+            state = TranscriptState(self.av_state_path, self.av_requests_per_minute, self.av_daily_limit)
+            remaining = dict(plans)
+            while remaining and calls < self.av_max_calls and not self._av_stop_reason:
+                reservation = state.reserve(list(remaining))
+                if reservation is None:
+                    self._av_stop_reason = "local_daily_budget_or_day_boundary"
+                    break
+                key, wait = reservation
+                ticker, period = remaining.pop(key)
+                time.sleep(wait)
+                calls += 1
+                payload = self.fetch_av_transcript(ticker, period.quarter)
+                if not payload:
+                    continue
+                entries = payload["transcript"]
+                summary, full_text, sent_label = self._summarize_transcript(entries)
+                llm_label, llm_conf = self._classify_transcript_sentiment(full_text)
+                inserted = self._upsert_event(
+                    ticker=ticker, cik=cik_map.get(ticker), event_type="EARNINGS_CALL",
+                    # This is the matched SEC filing date, NOT an invented call date.
+                    # First-observed time is retained separately in the raw payload.
+                    filing_date=period.filed, period_end=period.period_end,
+                    fiscal_quarter=period.quarter, accession=None,
+                    url=f"{AV_URL}?function=EARNINGS_CALL_TRANSCRIPT&symbol={ticker}&quarter={period.quarter}",
+                    title=f"{ticker} Earnings Call Transcript {period.quarter}",
+                    summary=summary, full_text=full_text,
+                    sentiment=llm_label if llm_label is not None else sent_label,
+                    confidence=float(llm_conf) if llm_conf is not None else 0.8,
+                    raw_payload={"symbol": ticker, "quarter": period.quarter,
+                                 "entry_count": len(entries),
+                                 "fiscal_period_source": "SEC_EDGAR_Fundamentals",
+                                 "fiscal_period_accession": period.accession,
+                                 "filing_date_basis": "matched_sec_filing_not_call_date",
+                                 "observed_at": datetime.now(timezone.utc).isoformat(),
+                                 "sentiment_source": "llm" if llm_label is not None else "alphavantage_avg"},
+                    source="ALPHAVANTAGE",
+                )
+                if inserted:
+                    inserted_count += 1
+                    per_ticker[ticker]["transcripts_inserted"] += 1
+        except Exception as exc:
+            # State/DB failures must not fall back to an unbounded alphabetical run.
+            self._av_stop_reason = "state_or_storage_error"
+            log.warning("AV transcript run stopped ({kind})", kind=type(exc).__name__)
+        return calls, inserted_count
 
     @staticmethod
     def _summarize_transcript(transcript_entries: list[dict[str, Any]],
@@ -449,50 +577,9 @@ class EarningsEventsPuller(BasePuller):
     # Incremental-mode state (Task #182 followup, 2026-05-17)
     # ------------------------------------------------------------------
     #
-    # AlphaVantage's free-tier transcript budget is 500 req/day. With a
-    # ~580-ticker universe a "full" pass blows past the cap on day 1,
-    # then the rest of the universe never gets pulled. ``incremental``
-    # mode keeps a per-ticker freshness check (the max filing_date for
-    # ``EARNINGS_CALL`` rows already in ``earnings_events``) and only
-    # spends AV calls on tickers whose freshest transcript is older
-    # than ``incremental_max_age_days``. Daily call budget capped via
-    # ``av_max_calls`` (default 400 — leaves 100 budget for retries
-    # and the SEC sentiment LLM fallback).
+    # Legacy argument retained for old wrappers. Scheduling now deduplicates
+    # exact verified fiscal periods, not ticker-level calendar age.
     INCREMENTAL_DEFAULT_MAX_AGE_DAYS = 90
-
-    def _load_last_transcript_dates(
-        self,
-        tickers: list[str],
-    ) -> dict[str, date]:
-        """Return ``{ticker: max(filing_date)}`` for EARNINGS_CALL rows.
-
-        Used in incremental mode to skip tickers we've already pulled
-        recently. A ticker missing from the result has never had a
-        transcript stored and must be pulled.
-        """
-        if not tickers:
-            return {}
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        "SELECT ticker, MAX(filing_date) "
-                        "FROM earnings_events "
-                        "WHERE event_type = 'EARNINGS_CALL' "
-                        "  AND source = 'ALPHAVANTAGE' "
-                        "  AND ticker = ANY(:tk) "
-                        "GROUP BY ticker"
-                    ),
-                    {"tk": list(tickers)},
-                ).fetchall()
-            return {r[0]: r[1] for r in rows if r[0] and r[1]}
-        except Exception as exc:
-            log.warning(
-                "earnings_events: last-transcript lookup failed ({e}) — "
-                "treating all tickers as stale (full pull)",
-                e=str(exc),
-            )
-            return {}
 
     def pull(
         self,
@@ -519,18 +606,10 @@ class EarningsEventsPuller(BasePuller):
                 ``"watchlist"`` (legacy ~21 tickers).
             lookback_days, min_signals, max_tickers: tuning knobs for
                 signal_registry resolution.
-            mode: ``"incremental"`` (default) only spends AlphaVantage
-                transcript calls on tickers whose most recent stored
-                EARNINGS_CALL filing_date is older than
-                ``incremental_max_age_days`` (or absent). ``"full"``
-                attempts every ticker (subject to ``av_max_calls``).
-                SEC EDGAR filings ALWAYS run for every ticker regardless
-                of mode — they're idempotent and cheap.
-            incremental_max_age_days: A ticker is considered fresh (and
-                its transcript pull is skipped) when its newest stored
-                EARNINGS_CALL is within this many days of today.
-                Default 90 — one quarter, which lines up with the
-                cadence of new earnings calls.
+            mode: Legacy compatibility label ("incremental" or "full"). Both
+                request missing verified periods and preserve SEC collection.
+            incremental_max_age_days: Deprecated compatibility argument; a
+                recent transcript never suppresses a different fiscal quarter.
 
         Returns:
             Summary dict with per-ticker counts and totals.
@@ -554,27 +633,12 @@ class EarningsEventsPuller(BasePuller):
             )
             mode_norm = "incremental"
 
-        if include_transcripts and mode_norm == "incremental":
-            last_dates = self._load_last_transcript_dates(universe)
-            fresh_cutoff = date.today() - timedelta(days=incremental_max_age_days)
-            av_eligible: set[str] = {
-                t for t in universe
-                if last_dates.get(t) is None or last_dates[t] < fresh_cutoff
-            }
-            log.info(
-                "earnings_events incremental: {n}/{m} tickers stale "
-                "(>{d}d) — will spend up to {b} AV calls",
-                n=len(av_eligible), m=len(universe),
-                d=incremental_max_age_days, b=self.av_max_calls,
-            )
-        else:
-            av_eligible = set(universe)
-            if include_transcripts:
-                log.info(
-                    "earnings_events full mode: every ticker AV-eligible "
-                    "({n} tickers, cap {b} calls)",
-                    n=len(universe), b=self.av_max_calls,
-                )
+        # Keep legacy CLI arguments accepted, but freshness is per verified fiscal
+        # period. A recent transcript must not hide a newly filed quarter.
+        plans: dict[str, tuple[str, TranscriptPeriod]] = {}
+        av_skipped_period_unknown = 0
+        av_skipped_stored = 0
+        av_legacy_unverified = 0
 
         filings_seen = 0
         filings_inserted = 0
@@ -588,6 +652,7 @@ class EarningsEventsPuller(BasePuller):
             counts = {"filings_inserted": 0, "filings_seen": 0,
                       "transcripts_inserted": 0, "cik": cik or ""}
 
+            filings = []
             if cik:
                 subs = self.fetch_submissions(cik)
                 if subs:
@@ -650,92 +715,34 @@ class EarningsEventsPuller(BasePuller):
                             counts["filings_inserted"] += 1
                             filings_inserted += 1
 
-            # AlphaVantage transcripts (most-recent 2 quarters).
-            # In incremental mode we skip tickers whose freshest stored
-            # EARNINGS_CALL is within ``incremental_max_age_days``.
-            if include_transcripts and ticker not in av_eligible:
-                av_skipped_fresh += 1
-            if (
-                include_transcripts
-                and self.av_api_key
-                and ticker in av_eligible
-                and av_calls < self.av_max_calls
-            ):
-                today = date.today()
-                cur_q = (today.month - 1) // 3 + 1
-                cur_year = today.year
-                quarters = []
-                for back in range(2):
-                    q = cur_q - back
-                    y = cur_year
-                    if q <= 0:
-                        q += 4
-                        y -= 1
-                    quarters.append(f"{y}Q{q}")
-                for q in quarters:
-                    if av_calls >= self.av_max_calls:
-                        break
-                    av_calls += 1
-                    payload = self.fetch_av_transcript(ticker, q)
-                    if not payload:
+            if include_transcripts and self.av_api_key and self.av_max_calls:
+                # Parse the available recent filing index, not only the UI lookback.
+                recent_filings = self.extract_filings(subs, date.today() - timedelta(days=550)) if cik and subs else []
+                periods = self._load_verified_periods(ticker, recent_filings)
+                if not periods:
+                    av_skipped_period_unknown += 1
+                    counts["av_period_unknown"] = 1
+                try:
+                    stored, legacy = self._stored_transcript_periods(ticker, periods)
+                except Exception as exc:
+                    log.warning("AV stored-period lookup failed for {t} ({kind}); skipping", t=ticker,
+                                kind=type(exc).__name__)
+                    counts["av_storage_lookup_failed"] = 1
+                    periods = []
+                    stored, legacy = set(), set()
+                for period in periods:
+                    if (period.quarter, period.period_end) in legacy:
+                        # Changing filing_date changes the existing upsert identity.
+                        # Do not silently create a duplicate or rewrite historical rows.
+                        av_legacy_unverified += 1
+                        counts["av_legacy_unverified"] = counts.get("av_legacy_unverified", 0) + 1
                         continue
-                    entries = payload.get("transcript") or []
-                    if not entries:
+                    if (period.quarter, period.period_end) in stored:
+                        av_skipped_stored += 1
                         continue
-                    summary, full_text, sent_label = self._summarize_transcript(entries)
-                    # Task #175: replace coarse AV label with LLM classifier
-                    # output when reachable. Falls back to AV-derived label
-                    # at confidence 0.8 if the LLM call fails.
-                    llm_label, llm_conf = self._classify_transcript_sentiment(full_text)
-                    if llm_label is not None and llm_conf is not None:
-                        final_label = llm_label
-                        final_confidence = float(llm_conf)
-                        sentiment_source = "qwen2.5:14b"
-                    else:
-                        final_label = sent_label
-                        final_confidence = 0.8
-                        sentiment_source = "alphavantage_avg"
-                    try:
-                        # Quarter -> period_end approximation:
-                        # last day of fiscal quarter.
-                        y_str, q_str = q.split("Q")
-                        year = int(y_str)
-                        qi = int(q_str)
-                        month = qi * 3
-                        if month in (1, 3, 5, 7, 8, 10, 12):
-                            day = 31
-                        elif month == 2:
-                            day = 29 if year % 4 == 0 else 28
-                        else:
-                            day = 30
-                        period_end = date(year, month, day)
-                    except Exception:
-                        period_end = None
-                    inserted = self._upsert_event(
-                        ticker=ticker,
-                        cik=cik,
-                        event_type="EARNINGS_CALL",
-                        filing_date=period_end or date.today(),
-                        period_end=period_end,
-                        fiscal_quarter=q,
-                        accession=None,
-                        url=f"https://www.alphavantage.co/query?function=EARNINGS_CALL_TRANSCRIPT&symbol={ticker}&quarter={q}",
-                        title=f"{ticker} Earnings Call Transcript {q}",
-                        summary=summary,
-                        full_text=full_text,
-                        sentiment=final_label,
-                        confidence=final_confidence,
-                        raw_payload={
-                            "symbol": payload.get("symbol", ticker),
-                            "quarter": q,
-                            "entry_count": len(entries),
-                            "sentiment_source": sentiment_source,
-                        },
-                        source="ALPHAVANTAGE",
-                    )
-                    if inserted:
-                        counts["transcripts_inserted"] += 1
-                        transcripts_inserted += 1
+                    # Stable lexical order, with newest periods first per symbol.
+                    key = f"{ticker}|{9999 - int(period.quarter[:4]):04d}|{4 - int(period.quarter[-1])}"
+                    plans[key] = (ticker, period)
 
             per_ticker[ticker] = counts
             if (
@@ -751,6 +758,8 @@ class EarningsEventsPuller(BasePuller):
                     tr=counts["transcripts_inserted"],
                 )
 
+        av_calls, transcripts_inserted = self._pull_planned_transcripts(plans, per_ticker, cik_map)
+
         # Update last_pull_at in source_catalog
         try:
             with self.engine.begin() as conn:
@@ -765,10 +774,10 @@ class EarningsEventsPuller(BasePuller):
         log.info(
             "earnings_events: {fi} new filings, {tr} new transcripts "
             "across {n} tickers ({fs} filings seen, {av} AV calls, "
-            "{sk} AV-skipped-fresh, mode={mo})",
+            "{unknown} unknown fiscal periods, stop={stop}, mode={mo})",
             fi=filings_inserted, tr=transcripts_inserted,
             n=len(universe), fs=filings_seen, av=av_calls,
-            sk=av_skipped_fresh, mo=mode_norm,
+            unknown=av_skipped_period_unknown, stop=self._av_stop_reason, mo=mode_norm,
         )
         return {
             "tickers": len(universe),
@@ -777,6 +786,11 @@ class EarningsEventsPuller(BasePuller):
             "transcripts_inserted": transcripts_inserted,
             "av_calls": av_calls,
             "av_skipped_fresh": av_skipped_fresh,
+            "av_skipped_stored_periods": av_skipped_stored,
+            "av_legacy_unverified_periods": av_legacy_unverified,
+            "av_skipped_period_unknown": av_skipped_period_unknown,
+            "av_planned": len(plans),
+            "av_stop_reason": self._av_stop_reason,
             "mode": mode_norm,
             "per_ticker": per_ticker,
         }
@@ -808,28 +822,28 @@ def main() -> None:
     parser.add_argument("--no-transcripts", action="store_true",
                         help="Skip AlphaVantage transcripts (SEC EDGAR only)")
     parser.add_argument("--av-max-calls", type=int, default=400,
-                        help="Cap on AlphaVantage calls per run (default 400 — "
-                             "AV free tier is 500/day, leave 100 budget for "
-                             "retries + LLM sentiment fallback)")
-    parser.add_argument("--mode", choices=["full", "incremental"],
-                        default="incremental",
-                        help="incremental (default) only pulls AV transcripts "
-                             "for tickers whose freshest stored EARNINGS_CALL "
-                             "is older than --incremental-max-age-days (or "
-                             "missing). 'full' attempts every ticker subject "
-                             "to --av-max-calls. SEC EDGAR filings always "
-                             "run for every ticker regardless of mode.")
+                        help="Local per-run call cap (default 400); not an account entitlement")
+    parser.add_argument("--av-requests-per-minute", type=float, default=5.0,
+                        help="Pacing allocation for this worker; confirm shared-account budget before raising")
+    parser.add_argument("--av-daily-limit", type=int, default=None,
+                        help="Optional local UTC-day cap across runs sharing --av-state-path")
+    parser.add_argument("--av-state-path", default=None,
+                        help="Durable local SQLite ledger; defaults to GRID_AV_TRANSCRIPT_STATE or ~/.local/state/grid/av_transcripts.sqlite3")
+    parser.add_argument("--mode", choices=["full", "incremental"], default="incremental",
+                        help="Legacy mode label; both modes now deduplicate exact verified fiscal periods")
     parser.add_argument("--incremental-max-age-days", type=int, default=90,
-                        help="In incremental mode, a ticker is 'fresh' (and "
-                             "AV-skipped) when its newest EARNINGS_CALL is "
-                             "within this many days. Default 90 (one quarter).")
+                        help="Deprecated compatibility argument; exact fiscal-period coverage controls scheduling")
     args = parser.parse_args()
 
     # Defer import so this module can be reasoned about without DB config
     from db import get_engine
 
     engine = get_engine()
-    puller = EarningsEventsPuller(engine, av_max_calls=args.av_max_calls)
+    puller = EarningsEventsPuller(
+        engine, av_max_calls=args.av_max_calls,
+        av_requests_per_minute=args.av_requests_per_minute,
+        av_daily_limit=args.av_daily_limit, av_state_path=args.av_state_path,
+    )
 
     override = None
     if args.tickers:
