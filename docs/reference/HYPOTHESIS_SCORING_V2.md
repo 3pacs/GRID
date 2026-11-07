@@ -41,14 +41,90 @@ Rules:
   `scoring_version`, `trial_p_value`, `trial_q_value`, `trial_ledger_sha256`.
   NULL `scoring_version` = a v1 verdict.
 
+## Trial ledger — dedicated, not canonical (owner decision 2026-11-07)
+
+Scored hypothesis batches go to a **dedicated** S11 ledger, `grid-hypothesis-trials`.
+The canonical research ledger `grid-hypothesis-loop` has never had its genesis
+(no file on grid-svr or gridz4); its genesis waits until the research lane
+designs its catalog. Nothing in the scorer assumes `CANONICAL_LEDGER_ID`:
+`open_trial_ledger` opens whatever ledger the env names, and the id comes
+from that file's genesis.
+
+| | |
+|---|---|
+| ledger | `/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl` |
+| anchor | `/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl` |
+| owner / modes | dirs `grid:grid 0750` (the ledger dir must be writable: the scorer creates `grid-hypothesis-trials.jsonl.lock` beside the ledger); files `grid:grid 0640` |
+| q | 0.10 (frozen at genesis; the BH level of every batch) |
+| catalog frozen at genesis | `families=("HYPOTHESIS_BATCHES\|change\|fwd1",)`, `features=("none\|x",)`, `classes=(("none\|x", "hypothesis_batches_only"),)`, `self_lag=()` — a placeholder that satisfies `Catalog.validate()`. Hypothesis batches use only `q`; no S11 allocation should ever run on this ledger. |
+
+Run, in order (as Anik; the genesis refuses an existing anchor or ledger file, so a
+second run fails instead of resetting anything):
+
+```bash
+sudo install -d -m 0750 -o grid -g grid /data/grid_ledgers/hypotheses/ledger /data/grid_ledgers/hypotheses/anchor
+```
+
+```bash
+sudo -u grid bash -c 'cd /data/grid_v4/grid_release && umask 0027 && PYTHONPATH=. /data/grid_v4/grid_venv-314/bin/python -c "
+from analysis.ledger_steered_exploration import Catalog, Ledger
+cat = Catalog(families=(\"HYPOTHESIS_BATCHES|change|fwd1\",), features=(\"none|x\",), classes=((\"none|x\", \"hypothesis_batches_only\"),))
+led = Ledger.create(\"/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl\", anchor=\"/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl\", catalog=cat, ledger_id=\"grid-hypothesis-trials\", q=0.10)
+print(led.genesis[\"ledger_id\"], led.head)
+"'
+```
+
+Verify (read-only; re-walks the hash chain and the anchor):
+
+```bash
+sudo -u grid bash -c 'cd /data/grid_v4/grid_release && PYTHONPATH=. /data/grid_v4/grid_venv-314/bin/python -c "
+import json
+from analysis.ledger_steered_exploration import Ledger, summarize_hypothesis_batches
+led = Ledger(\"/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl\", anchor=\"/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl\")
+led.verify(full=True)
+g = led.genesis
+print(json.dumps({\"ledger_id\": g[\"ledger_id\"], \"q\": g[\"q\"], \"catalog_sha256\": g[\"catalog_sha256\"], \"records\": len(led.records), **summarize_hypothesis_batches(led)}, indent=1))
+"'
+```
+
+Expected: `ledger_id` `grid-hypothesis-trials`, `q` 0.1, `catalog_sha256`
+`4e097c95a2951bcd54a74affb6ed6a894d786505d81c2f9862b63f37c304a9ec`, 1 record,
+0 batches.
+
+Then point only grid-hermes at it (drop-in, not the shared `.env`) and restart:
+
+```bash
+printf '[Service]\nEnvironment=HYPOTHESIS_TRIAL_LEDGER_PATH=/data/grid_ledgers/hypotheses/ledger/grid-hypothesis-trials.jsonl\nEnvironment=HYPOTHESIS_TRIAL_LEDGER_ANCHOR_PATH=/data/grid_ledgers/hypotheses/anchor/grid-hypothesis-trials.anchors.jsonl\n' | sudo tee /etc/systemd/system/grid-hermes.service.d/zz-hypothesis-ledger.conf
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart grid-hermes
+```
+
+Optional hardening after genesis: `sudo chattr +a` on the two `.jsonl` files
+(appends still work; truncate/rewrite refused). Not on the directories — the
+lock file must be creatable. Keep an off-host copy of the anchor.
+
+While `ACTIVE_HYPOTHESIS_SCORING_HELD` is True the configured ledger is never
+written; without the env the scorer writes nothing (`TrialLedgerNotConfigured`).
+
+### Two ledgers, one trial count (open requirement)
+
+`declared_trial_count` (the DSR trial count the S11 overfit gate deflates by)
+counts only the ledger it is given. With hypothesis batches in the dedicated
+ledger, the canonical research ledger's gate would under-count. **Once
+`grid-hypothesis-loop` exists, the overfit gate (`evaluate_overfit_gate` /
+`require_overfit_gate`) must add this ledger's hypothesis trials**
+(`summarize_hypothesis_batches(...)["hypothesis_trials"]`, read from the
+anchored dedicated ledger) to its `n_trials_declared`, and its staleness check
+must also fail when this ledger has grown since the gate ran. Until then no
+research promotion is possible anyway (no canonical ledger, no gate record).
+
 ## Lifting the hold (owner)
 
-1. Create the S11 ledger file + anchor (anchor on a separate append-only
-   location) — a dedicated ledger, or the canonical research ledger if the
-   research lane creates one, so one DSR count covers both.
-2. Set `HYPOTHESIS_TRIAL_LEDGER_PATH` / `HYPOTHESIS_TRIAL_LEDGER_ANCHOR_PATH`
-   in the service env of grid-hermes (and anything else that runs the batch).
-3. Flip `ACTIVE_HYPOTHESIS_SCORING_HELD = False` (separate reviewed commit).
+1. Create the dedicated ledger and point grid-hermes at it (above).
+2. Flip `ACTIVE_HYPOTHESIS_SCORING_HELD = False` (separate reviewed commit;
+   branch `claude/hypothesis-lift-hold-20261106`).
 
 Dry run (read-only, any time): `python -m intelligence.hypothesis_trials dry-run
 --trials-out trials.jsonl` — forces `default_transaction_read_only = on` on every
