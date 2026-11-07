@@ -8,7 +8,7 @@ geomagnetic storms correlate with market returns in academic literature
 Data sources:
 - NOAA SWPC: https://services.swpc.noaa.gov/json/
 - Kp index: https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json
-- Solar wind: https://services.swpc.noaa.gov/products/solar-wind/plasma-7-day.json
+- Solar wind: https://services.swpc.noaa.gov/products/geospace/propagated-solar-wind.json
 - Sunspot: https://services.swpc.noaa.gov/json/solar-cycle/observed-solar-cycle-indices.json
 
 Features generated:
@@ -100,7 +100,9 @@ class SolarActivityPuller(BasePuller):
 
     # NOAA SWPC API endpoints
     _KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
-    _SOLAR_WIND_URL = "https://services.swpc.noaa.gov/products/solar-wind/plasma-7-day.json"
+    # products/solar-wind/plasma-7-day.json was retired (404 since ~2026-11);
+    # this is the same 7-day, 1-minute L1 plasma series with a header row.
+    _SOLAR_WIND_URL = "https://services.swpc.noaa.gov/products/geospace/propagated-solar-wind.json"
     _SUNSPOT_URL = "https://services.swpc.noaa.gov/json/solar-cycle/observed-solar-cycle-indices.json"
 
     def __init__(self, db_engine: Engine, lookback_days: int = 30) -> None:
@@ -175,12 +177,21 @@ class SolarActivityPuller(BasePuller):
             log.warning("Failed to fetch solar wind data: {e}", e=str(exc))
             return {}
 
-        # Data format: [[time_tag, density, speed, temperature], ...]
+        # Data format: [header, [time_tag, speed, density, ...], ...]. Columns
+        # are looked up by name: the retired plasma file put speed third.
+        if not data or not isinstance(data[0], list):
+            log.warning("Solar wind feed has no header row; skipping")
+            return {}
+        header = [str(h).strip().lower() for h in data[0]]
+        if "time_tag" not in header or "speed" not in header:
+            log.warning("Solar wind feed header lacks time_tag/speed: {h}", h=header)
+            return {}
+        i_time, i_speed = header.index("time_tag"), header.index("speed")
         wind_by_date: dict[date, list[float]] = {}
-        for row in data[1:]:  # skip header
+        for row in data[1:]:
             try:
-                time_tag = row[0]
-                speed = row[2]
+                time_tag = row[i_time]
+                speed = row[i_speed]
                 if speed is None or speed == "":
                     continue
                 speed_val = float(speed)
