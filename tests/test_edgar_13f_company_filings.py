@@ -36,6 +36,7 @@ def _puller(mock_engine) -> EDGARPuller:
     p.engine = mock_engine
     p.source_id = 61
     p._row_exists = lambda *_a, **_k: False  # type: ignore[method-assign]
+    p._stored_13f_dates = lambda _cik: set()  # type: ignore[method-assign]
     return p
 
 

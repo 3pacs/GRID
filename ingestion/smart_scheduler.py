@@ -1326,7 +1326,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         "timeout_s": 60,
         "kwargs": {"use_llm": False, "pause_seconds": 0.5},
     },
-    {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 60},
+    {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 120},
 
     # ── International (daily, but slower) ──
     {"name": "ecb",               "mod": "ingestion.international.ecb",         "cls": "ECBPuller",                "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
@@ -1398,7 +1398,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # BLSPuller(db_engine, api_key=None): keyword mode, never positional.
     # pull_all is one bounded request (see BLSPuller.pull_all).
     {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY", "api_key_mode": "keyword"},
-    {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
+    # edgar: a full pull took 4 min 38 s (13F re-parsed 300 infotables) and
+    # timed out at 180 s every day; 13F now skips stored filings. 600 s
+    # covers a 13F filing-deadline day when all 75 funds file at once.
+    {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 600},
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (holiday/DST-aware release window + 1-day retry), not freq_h — see the GRID task A1 note above _cftc_current_report_date
 
     # ── Sentiment / alt ──
@@ -1427,7 +1430,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # market_cap to ticker_metrics_daily. Was registered in hermes_operator
     # PULLER_CONFIG but missing from this registry, so it never ran from
     # 2026-04-12 onward — leaving blue-chip rows stuck at 03-31/04-08.
-    {"name": "sec_xbrl_shares",     "mod": "ingestion.altdata.sec_xbrl_shares",      "cls": "SECXBRLSharesPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800, "kwargs": {"limit": 400, "backfill_days": 90}},
+    # No ticker limit: limit=400 always took the first 400 of the 1,268
+    # sector-map tickers, so the other 868 (ISRG, ABT, MDT, ...) were last
+    # written 2026-05-17 and every run reported PARTIAL. 400 tickers took
+    # ~4 min, so the full universe fits the 1800 s budget.
+    {"name": "sec_xbrl_shares",     "mod": "ingestion.altdata.sec_xbrl_shares",      "cls": "SECXBRLSharesPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800, "kwargs": {"backfill_days": 90}},
 
     # ── Silent-orphan additions (task #170 fix, 2026-05-17) ──
     # Pullers that were registered in hermes_operator.py _SOURCE_REGISTRY but
