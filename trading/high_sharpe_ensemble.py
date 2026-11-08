@@ -59,13 +59,27 @@ from store.pit import PITStore
 
 # ── Registration ─────────────────────────────────────────────────────────────
 
-#: The pre-registration this module implements. Its LF-normalised sha256 is pinned
-#: here; :func:`registration_sha256` recomputes it and the tests compare the two.
-#: Re-pin only before the first look; afterwards a change is version 2.
-PREREG_PATH = "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md"
-PREREG_SHA256 = "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7"
+#: The pre-registrations this module implements, one per candidate set. Each file's
+#: LF-normalised sha256 is pinned here; :func:`registration_sha256` recomputes it and
+#: the tests compare the two. Re-pin only before that set's look; afterwards a change
+#: is a new set. v1's look was spent on 2026-11-08T07:26Z (FAIL).
+REGISTRATIONS: dict[str, tuple[str, str]] = {
+    "v1": (
+        "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md",
+        "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7",
+    ),
+    "v2": (
+        "docs/paper_log/high-sharpe-ensemble-v2-preregistration.md",
+        "2e805286f124d068d1f3571c0822e915856f02ddab9aeb196326e09935ea376e",
+    ),
+}
+PREREG_PATH, PREREG_SHA256 = REGISTRATIONS["v1"]
 
-ENSEMBLE_VERSION = "high-sharpe-ensemble/1"
+ENSEMBLE_VERSION = "high-sharpe-ensemble/2"
+
+#: Trials spent before each set's look: 240 rotation-sweep configs + v1's 7 candidates
+#: + v1's ensemble = 248; every later set adds its candidates and its ensemble.
+TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248}
 
 
 def lf_sha256(data: bytes) -> str:
@@ -73,10 +87,10 @@ def lf_sha256(data: bytes) -> str:
     return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
-def registration_sha256(repo_root: str | Path | None = None) -> str:
-    """sha256 of the registration file as it sits in *repo_root* (default: this repo)."""
+def registration_sha256(repo_root: str | Path | None = None, set_name: str = "v1") -> str:
+    """sha256 of a set's registration file as it sits in *repo_root* (default: this repo)."""
     root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent.parent
-    return lf_sha256((root / PREREG_PATH).read_bytes())
+    return lf_sha256((root / REGISTRATIONS[set_name][0]).read_bytes())
 
 
 # ── Universe and candidates ─────────────────────────────────────────────────
@@ -241,6 +255,161 @@ CANDIDATES: dict[str, CandidateFn] = {
 }
 
 
+# ── v2: trend and dual momentum (registered 2026-11-08, cumulative trials 248 before) ──
+
+#: Asset-class ETFs for time-series momentum and dual momentum.
+V2_ASSETS: tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "IEF", "GLD", "DBC")
+#: The eleven SPDR select sectors (XLC and XLRE are younger; the coverage rule decides).
+V2_SECTORS: tuple[str, ...] = ("XLE", "XLU", "XLV", "XLB", "XLI", "XLF", "XLK", "XLP", "XLY", "XLC", "XLRE")
+V2_TBILL = "SHY"   # absolute-momentum hurdle (T-bill proxy with history to 2014)
+V2_BOND = "IEF"    # dual momentum's defensive leg (AGG has no history before 2020)
+UNIVERSE_V2: tuple[str, ...] = tuple(dict.fromkeys(V2_ASSETS + V2_SECTORS + (V2_TBILL,)))
+
+MOM_FORMATION = 252   # 12 months of sessions
+MOM_SKIP = 21         # skip the most recent month
+MA_WINDOW_10M = 210   # 10-month simple moving average in sessions
+
+
+def momentum_12_1(prices: pd.DataFrame) -> pd.Series:
+    """Return from 252 sessions ago to 21 sessions ago (Jegadeesh–Titman 12-1), per column."""
+    if len(prices) < MOM_FORMATION + 1:
+        return pd.Series(dtype=float)
+    p_now = prices.iloc[-1 - MOM_SKIP]
+    p_past = prices.iloc[-1 - MOM_FORMATION]
+    return (p_now / p_past - 1.0).dropna()
+
+
+def above_10m_ma(prices: pd.DataFrame) -> pd.Series:
+    """True where the last close is above its 210-session simple moving average."""
+    if len(prices) < MA_WINDOW_10M:
+        return pd.Series(dtype=bool)
+    ma = prices.iloc[-MA_WINDOW_10M:].mean()
+    last = prices.iloc[-1]
+    return (last > ma).reindex(prices.columns).fillna(False)
+
+
+def _present(ctx: DecisionContext, names: Sequence[str]) -> list[str]:
+    return [t for t in names if t in ctx.prices.columns]
+
+
+def tsmom_assets_weights(ctx: DecisionContext, ma_filter: bool = False) -> dict[str, float]:
+    """Long each asset-class ETF whose 12-1 momentum is positive, 1/N of the full set each."""
+    cols = _present(ctx, V2_ASSETS)
+    mom = momentum_12_1(ctx.prices[cols])
+    if mom.empty:
+        return {}
+    keep = mom[mom > 0].index
+    if ma_filter:
+        ok = above_10m_ma(ctx.prices[cols])
+        keep = [t for t in keep if bool(ok.get(t, False))]
+    return {t: 1.0 / len(V2_ASSETS) for t in keep}
+
+
+def tsmom_sectors_top3_weights(ctx: DecisionContext, ma_filter: bool = False) -> dict[str, float]:
+    """Top 3 sectors by 12-1 momentum, equal weight, only those with positive momentum."""
+    cols = _present(ctx, V2_SECTORS)
+    mom = momentum_12_1(ctx.prices[cols])
+    if mom.empty:
+        return {}
+    top = mom.sort_values(ascending=False).head(3)
+    keep = list(top[top > 0].index)
+    if ma_filter:
+        ok = above_10m_ma(ctx.prices[cols])
+        keep = [t for t in keep if bool(ok.get(t, False))]
+    return {t: 1.0 / 3.0 for t in keep}
+
+
+def gem_dual_momentum_weights(ctx: DecisionContext) -> dict[str, float]:
+    """Antonacci GEM: SPY vs EFA by 12-month return; hold the winner if it beats SHY, else IEF."""
+    cols = _present(ctx, ("SPY", "EFA", V2_TBILL, V2_BOND))
+    if len(ctx.prices) < MOM_FORMATION + 1 or not {"SPY", V2_TBILL, V2_BOND} <= set(cols):
+        return {}
+    ret12 = (ctx.prices[cols].iloc[-1] / ctx.prices[cols].iloc[-1 - MOM_FORMATION] - 1.0).dropna()
+    equities = [t for t in ("SPY", "EFA") if t in ret12.index]
+    if not equities:
+        return {}
+    winner = max(equities, key=lambda t: float(ret12[t]))
+    if float(ret12[winner]) > float(ret12.get(V2_TBILL, 0.0)):
+        return {winner: 1.0}
+    return {V2_BOND: 1.0}
+
+
+def ma10_spy_weights(ctx: DecisionContext) -> dict[str, float]:
+    """Faber's rule: SPY when above its 10-month SMA, else cash."""
+    if BENCHMARK not in ctx.prices.columns:
+        return {}
+    ok = above_10m_ma(ctx.prices[[BENCHMARK]])
+    return {BENCHMARK: 1.0} if bool(ok.get(BENCHMARK, False)) else {}
+
+
+class Cadenced:
+    """Re-decide only on the first decision date of each new calendar period; hold otherwise.
+
+    ``period`` is a pandas period alias ("M" for calendar month). Stateful across the
+    walk-forward's date loop, so build a fresh instance per run (see :func:`candidate_set`).
+    """
+
+    def __init__(self, fn: CandidateFn, period: str = "M") -> None:
+        self.fn = fn
+        self.period = period
+        self._last_period: Any = None
+        self._weights: dict[str, float] = {}
+
+    def __call__(self, ctx: DecisionContext) -> dict[str, float]:
+        current = pd.Timestamp(ctx.as_of).to_period(self.period)
+        if current != self._last_period:
+            self._weights = dict(self.fn(ctx))
+            self._last_period = current
+        return dict(self._weights)
+
+
+def v2_candidates() -> dict[str, CandidateFn]:
+    """The twelve registered v2 arms: six rules × {monthly, weekly}; fresh state per call."""
+    rules: dict[str, CandidateFn] = {
+        "tsmom_12_1_assets": lambda ctx: tsmom_assets_weights(ctx, ma_filter=False),
+        "tsmom_12_1_assets_ma10": lambda ctx: tsmom_assets_weights(ctx, ma_filter=True),
+        "tsmom_12_1_sectors_top3": lambda ctx: tsmom_sectors_top3_weights(ctx, ma_filter=False),
+        "tsmom_12_1_sectors_top3_ma10": lambda ctx: tsmom_sectors_top3_weights(ctx, ma_filter=True),
+        "gem_dual_momentum": gem_dual_momentum_weights,
+        "ma10_spy": ma10_spy_weights,
+    }
+    out: dict[str, CandidateFn] = {}
+    for name, fn in rules.items():
+        out[f"{name}_M"] = Cadenced(fn, "M")
+        out[f"{name}_W"] = fn
+    return out
+
+
+@dataclass(frozen=True)
+class CandidateSet:
+    """One registered set: its universe, candidates, trial accounting and verdict rule."""
+
+    name: str
+    universe: tuple[str, ...]
+    factory: Callable[[], dict[str, CandidateFn]]
+    trials_before: int
+    criterion: str  # "v1_pass" or "watch"
+
+    def candidates(self) -> dict[str, CandidateFn]:
+        return self.factory()
+
+    @property
+    def n_trials_cumulative(self) -> int:
+        """Trials before this set + this set's candidates + this set's ensemble."""
+        return self.trials_before + len(self.factory()) + 1
+
+    def config(self, **overrides: Any) -> "EnsembleConfig":
+        return EnsembleConfig(n_trials_declared=self.n_trials_cumulative, criterion=self.criterion, **overrides)
+
+
+def candidate_set(name: str) -> CandidateSet:
+    if name == "v1":
+        return CandidateSet("v1", UNIVERSE, lambda: dict(CANDIDATES), TRIALS_BEFORE["v1"], "v1_pass")
+    if name == "v2":
+        return CandidateSet("v2", UNIVERSE_V2, v2_candidates, TRIALS_BEFORE["v2"], "watch")
+    raise KeyError(f"unknown candidate set {name!r}")
+
+
 # ── Point-in-time panel store ────────────────────────────────────────────────
 
 
@@ -345,6 +514,7 @@ class EnsembleConfig:
     n_trials_declared: int = 248  # 7 candidates + 1 ensemble + 240 rotation sweep configs
     dsr_min: float = 0.95
     max_abs_segment_return: float = 0.5  # a single-name segment return beyond this is a data fault
+    criterion: str = "v1_pass"  # "v1_pass" (v1 registration) or "watch" (v2 onward)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -718,7 +888,26 @@ def evaluate(run: EnsembleRun) -> dict[str, Any]:
     pbo = pbo_over_candidates(cand_oos)
     primary = bool(boot.get("lower_bound") is not None and boot["lower_bound"] > 0)
     dsr_ok = bool(dsr.get("passed", False))
-    verdict = "PASS" if (primary and dsr_ok) else "FAIL"
+    v1_verdict = "PASS" if (primary and dsr_ok) else "FAIL"
+    ens_summary = series_summary(ens, cfg.periods_per_year)
+    spy_summary = series_summary(bench, cfg.periods_per_year)
+    sharpe_beats_spy = bool(ens_summary.get("sharpe_annualised", -math.inf) > spy_summary.get("sharpe_annualised", math.inf))
+    dsr_above_half = bool((dsr.get("dsr") or 0.0) > 0.5)
+    dd_no_worse = bool(ens_summary.get("max_drawdown", -math.inf) >= spy_summary.get("max_drawdown", math.inf))
+    watch_pass = primary and sharpe_beats_spy and dsr_above_half and dd_no_worse
+    watch = {
+        "rule": "ensemble OOS Sharpe > SPY buy-and-hold on the same segments AND one-sided 95% block-bootstrap "
+                "lower bound of mean weekly net excess over SPY > 0 after costs AND deflated Sharpe > 0.5 "
+                "(observed per-period Sharpe above the expected maximum at the cumulative trial count) "
+                "AND ensemble max drawdown no worse than SPY's",
+        "sharpe_beats_spy": sharpe_beats_spy,
+        "excess_lower_bound_positive": primary,
+        "dsr_above_half": dsr_above_half,
+        "drawdown_no_worse_than_spy": dd_no_worse,
+        "n_trials_cumulative": cfg.n_trials_declared,
+        "verdict": "PASS" if watch_pass else "FAIL",
+    }
+    verdict = watch["verdict"] if cfg.criterion == "watch" else v1_verdict
     turnover_ann = float(run.ensemble_turnover.loc[oos].mean() * cfg.periods_per_year) if len(oos) else None
     time_in_cash = float((run.ensemble_weights.loc[oos].abs().sum(axis=1) == 0).mean()) if len(oos) else None
     selection_counts: dict[str, int] = {}
@@ -757,7 +946,10 @@ def evaluate(run: EnsembleRun) -> dict[str, Any]:
             "excess_lower_bound_positive": primary,
             "dsr_passed": dsr_ok,
             "verdict": verdict,
+            "v1_pass_verdict": v1_verdict,
+            "criterion": cfg.criterion,
         },
+        "watch_criterion": watch,
         "faults": run.faults,
     }
 
@@ -774,10 +966,17 @@ def report_markdown(report: dict[str, Any], *, title: str, data_basis: str) -> s
     def f(v: Any, nd: int = 3) -> str:
         return "—" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.{nd}f}"
 
+    watch = report.get("watch_criterion", {})
+    rule = watch["rule"] if pc.get("criterion") == "watch" else pc["rule"]
     lines = [
         f"# {title}",
         "",
-        f"Verdict: **{pc['verdict']}** — {pc['rule']}.",
+        f"Verdict: **{pc['verdict']}** — {rule}.",
+        "",
+        f"Cumulative trials counted in the deflated Sharpe: {report['config']['n_trials_declared']}. "
+        f"Watch criterion parts: Sharpe beats SPY {watch.get('sharpe_beats_spy')}, excess LB > 0 "
+        f"{watch.get('excess_lower_bound_positive')}, DSR > 0.5 {watch.get('dsr_above_half')}, "
+        f"drawdown no worse {watch.get('drawdown_no_worse_than_spy')}.",
         "",
         f"Out-of-sample segments: {report['oos_period']['n_segments']} weekly, "
         f"{report['oos_period']['first_segment']} → {report['oos_period']['last_segment']}. {data_basis}",
@@ -823,7 +1022,8 @@ def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 __all__ = [
-    "BENCHMARK", "CANDIDATES", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
+    "BENCHMARK", "CANDIDATES", "Cadenced", "CandidateSet", "REGISTRATIONS", "TRIALS_BEFORE", "UNIVERSE_V2",
+    "candidate_set", "v2_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
     "PREREG_SHA256", "PanelPITStore", "UNIVERSE", "annualised_sharpe", "block_bootstrap_mean",
     "compute_candidate_paths", "deflated_sharpe", "evaluate", "frame_to_records", "inverse_vol_weights",
     "path_returns", "pbo_over_candidates", "rebalance_dates", "registration_sha256", "report_markdown",

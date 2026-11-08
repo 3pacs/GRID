@@ -272,3 +272,87 @@ def test_pbo_over_candidates_handles_small_and_large_matrices():
 def test_frame_to_records_is_json_safe(run):
     recs = hse.frame_to_records(run.ensemble_weights.head(3))
     assert len(recs) == 3 and all(isinstance(r["date"], str) for r in recs)
+
+
+# ── v2: trend and dual momentum ─────────────────────────────────────────────
+
+
+def test_every_registered_set_is_pinned_and_counts_trials():
+    for name, (path, sha) in hse.REGISTRATIONS.items():
+        assert (REPO_ROOT / path).exists(), path
+        assert sha == hse.registration_sha256(REPO_ROOT, name), f"{name} registration changed after pinning"
+    v2 = hse.candidate_set("v2")
+    assert v2.n_trials_cumulative == 248 + 12 + 1 == 261
+    assert hse.candidate_set("v1").n_trials_cumulative == 248
+    text = (REPO_ROOT / hse.REGISTRATIONS["v2"][0]).read_text(encoding="utf-8")
+    for arm in v2.candidates():
+        assert f"`{arm.rsplit('_', 1)[0]}`" in text, arm
+    assert "261" in text
+
+
+def _trend_panel(up: bool) -> pd.DataFrame:
+    idx = pd.bdate_range("2019-01-01", periods=320)
+    base = np.linspace(100, 150 if up else 60, len(idx))
+    cols = list(hse.UNIVERSE_V2)
+    return pd.DataFrame({c: base * (1 + 0.001 * i) for i, c in enumerate(cols)}, index=idx)
+
+
+def _ctx(prices: pd.DataFrame) -> hse.DecisionContext:
+    d = prices.index[-1].date()
+    return hse.DecisionContext(as_of=d, prices=prices, vix=pd.Series(20.0, index=prices.index))
+
+
+def test_tsmom_and_ma_filter_follow_the_trend():
+    up, down = _trend_panel(True), _trend_panel(False)
+    w_up = hse.tsmom_assets_weights(_ctx(up))
+    assert set(w_up) == set(hse.V2_ASSETS) and sum(w_up.values()) == pytest.approx(1.0)
+    assert hse.tsmom_assets_weights(_ctx(down)) == {}
+    assert hse.tsmom_assets_weights(_ctx(up), ma_filter=True) == w_up
+    assert hse.ma10_spy_weights(_ctx(up)) == {"SPY": 1.0}
+    assert hse.ma10_spy_weights(_ctx(down)) == {}
+    top3 = hse.tsmom_sectors_top3_weights(_ctx(up))
+    assert len(top3) == 3 and all(v == pytest.approx(1 / 3) for v in top3.values())
+    assert hse.tsmom_sectors_top3_weights(_ctx(down)) == {}
+
+
+def test_gem_dual_momentum_picks_winner_or_bonds():
+    up = _trend_panel(True)
+    # make EFA the strongest equity, SHY flat
+    up["EFA"] = np.linspace(100, 200, len(up))
+    up["SHY"] = 100.0
+    assert hse.gem_dual_momentum_weights(_ctx(up)) == {"EFA": 1.0}
+    down = _trend_panel(False)
+    down["SHY"] = 100.0
+    assert hse.gem_dual_momentum_weights(_ctx(down)) == {hse.V2_BOND: 1.0}
+    short = up.iloc[-100:]
+    assert hse.gem_dual_momentum_weights(_ctx(short)) == {}
+
+
+def test_cadenced_wrapper_holds_within_a_month_and_resets_per_instance():
+    calls = []
+
+    def fn(ctx: hse.DecisionContext) -> dict[str, float]:
+        calls.append(ctx.as_of)
+        return {"SPY": float(len(calls))}
+
+    arm = hse.Cadenced(fn, "M")
+    prices = _trend_panel(True)
+    for d in (date(2020, 3, 6), date(2020, 3, 13), date(2020, 3, 27), date(2020, 4, 3), date(2020, 4, 10)):
+        ctx = hse.DecisionContext(as_of=d, prices=prices, vix=pd.Series(dtype=float))
+        w = arm(ctx)
+        assert w == {"SPY": 1.0} if d.month == 3 else {"SPY": 2.0}
+    assert calls == [date(2020, 3, 6), date(2020, 4, 3)]
+    fresh = hse.candidate_set("v2").candidates()
+    assert isinstance(fresh["gem_dual_momentum_M"], hse.Cadenced) and fresh["gem_dual_momentum_M"]._last_period is None
+    assert len(fresh) == 12 and all(k.endswith(("_M", "_W")) for k in fresh)
+
+
+def test_watch_criterion_is_reported_and_routes_the_verdict(run):
+    rep = hse.evaluate(run)
+    watch = rep["watch_criterion"]
+    for key in ("sharpe_beats_spy", "excess_lower_bound_positive", "dsr_above_half", "drawdown_no_worse_than_spy"):
+        assert isinstance(watch[key], bool)
+    expected = "PASS" if all(watch[k] for k in ("sharpe_beats_spy", "excess_lower_bound_positive", "dsr_above_half", "drawdown_no_worse_than_spy")) else "FAIL"
+    assert watch["verdict"] == expected
+    assert rep["pass_criterion"]["criterion"] == "v1_pass"
+    assert rep["pass_criterion"]["verdict"] == rep["pass_criterion"]["v1_pass_verdict"]

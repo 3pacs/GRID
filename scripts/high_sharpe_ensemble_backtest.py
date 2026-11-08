@@ -8,8 +8,8 @@ created with ``default_transaction_read_only=on``.
 
 Usage (on grid-svr, release tree on PYTHONPATH, service .env loaded):
 
-    python -m scripts.high_sharpe_ensemble_backtest --start 2016-01-04 --end 2026-11-06 \\
-        --source resolved --out docs/reports
+    python -m scripts.high_sharpe_ensemble_backtest --set v2 --start 2016-01-04 --end 2026-11-06 \\
+        --source raw-adj-close --out docs/reports
 
 ``--source`` picks the registered price basis: ``resolved`` reads ``{ticker}_full``
 from ``resolved_series`` through ``PITStore.get_feature_matrix`` (latest vintage as
@@ -163,12 +163,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--as-of", type=date.fromisoformat, default=None, help="vintage date (default: today)")
     ap.add_argument("--source", choices=("resolved", "raw-adj-close"), default="raw-adj-close")
     ap.add_argument("--out", default="docs/reports")
-    ap.add_argument("--tag", default="high-sharpe-ensemble-v1")
+    ap.add_argument("--set", dest="set_name", choices=("v1", "v2"), default="v2",
+                    help="registered candidate set; fixes universe, candidates, trial count and criterion")
+    ap.add_argument("--tag", default=None, help="report file prefix (default high-sharpe-ensemble-<set>)")
     ap.add_argument("--lookback-days", type=int, default=400, help="price history loaded before --start")
     args = ap.parse_args(argv)
 
     as_of = args.as_of or date.today()
-    tickers = list(hse.UNIVERSE)
+    cset = hse.candidate_set(args.set_name)
+    tag = args.tag or f"high-sharpe-ensemble-{cset.name}"
+    tickers = list(cset.universe)
     engine = read_only_engine()
     load_start = args.start - pd.Timedelta(days=args.lookback_days).to_pytimedelta()
     log.info("loading {n} tickers {s}..{e} as of {a} from {src}", n=len(tickers), s=load_start, e=args.end, a=as_of, src=args.source)
@@ -182,8 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     log.info("panel {shape}, vix {n}; excluded {m}", shape=panel.shape, n=len(vix), m=provenance.get("excluded") or provenance["missing"])
 
     pit = hse.PanelPITStore(panel, vix, data_as_of=as_of)
-    config = hse.EnsembleConfig()
-    run = hse.walk_forward(panel, vix, args.start, args.end, config, engine=None, pit=pit)
+    config = cset.config()
+    run = hse.walk_forward(panel, vix, args.start, args.end, config, cset.candidates(), engine=None, pit=pit)
     report = hse.evaluate(run)
     report["provenance"] = {
         **provenance,
@@ -194,9 +198,11 @@ def main(argv: list[str] | None = None) -> int:
         "panel_first": panel.index.min().date().isoformat(),
         "panel_last": panel.index.max().date().isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "registration": hse.PREREG_PATH,
-        "registration_sha256_pinned": hse.PREREG_SHA256,
-        "registration_sha256_observed": hse.registration_sha256(_GRID_DIR),
+        "candidate_set": cset.name,
+        "registration": hse.REGISTRATIONS[cset.name][0],
+        "registration_sha256_pinned": hse.REGISTRATIONS[cset.name][1],
+        "registration_sha256_observed": hse.registration_sha256(_GRID_DIR, cset.name),
+        "n_trials_cumulative": cset.n_trials_cumulative,
         "pit_reads": pit.reads,
         "host": os.uname().nodename,
     }
@@ -212,13 +218,13 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
-    json_path = out_dir / f"{args.tag}-look-{stamp}.json"
-    md_path = out_dir / f"{args.tag}-look-{stamp}.md"
+    json_path = out_dir / f"{tag}-look-{stamp}.json"
+    md_path = out_dir / f"{tag}-look-{stamp}.md"
     json_path.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
     md_path.write_text(
         hse.report_markdown(
             report,
-            title=f"High-Sharpe ensemble v1 — registered look {stamp}",
+            title=f"High-Sharpe ensemble {cset.name} — registered look {stamp}",
             data_basis=f"Prices: {provenance['source']}; vintages as of {as_of}; missing {provenance['missing'] or 'none'}.",
         ),
         encoding="utf-8",
