@@ -1,0 +1,274 @@
+"""Tests for trading/high_sharpe_ensemble.py — selection, costs, no-lookahead, evaluation."""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import trading.high_sharpe_ensemble as hse
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ── fixtures ────────────────────────────────────────────────────────────────
+
+
+def _panel(seed: int = 7, start: str = "2018-01-01", end: str = "2021-12-31") -> tuple[pd.DataFrame, pd.Series]:
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(start, end)
+    cols = list(hse.UNIVERSE)
+    rets = rng.normal(0.0003, 0.012, size=(len(idx), len(cols)))
+    prices = pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=idx, columns=cols)
+    vix = pd.Series(np.clip(20 + np.cumsum(rng.normal(0, 0.5, len(idx))) * 0.1, 10, 60), index=idx)
+    return prices, vix
+
+
+@pytest.fixture(scope="module")
+def panel() -> tuple[pd.DataFrame, pd.Series]:
+    return _panel()
+
+
+@pytest.fixture(scope="module")
+def small_config() -> hse.EnsembleConfig:
+    return hse.EnsembleConfig(trailing=26, selection_every=4, bootstrap_reps=500, k=3)
+
+
+# ── registration pin ────────────────────────────────────────────────────────
+
+
+def test_registration_file_exists_and_sha_is_pinned():
+    path = REPO_ROOT / hse.PREREG_PATH
+    assert path.exists(), "the pre-registration must be committed with the module"
+    assert hse.PREREG_SHA256 == hse.registration_sha256(REPO_ROOT), (
+        "PREREG_SHA256 does not match the registration file; a changed registration is a new version"
+    )
+
+
+def test_registration_names_every_candidate_and_knob():
+    text = (REPO_ROOT / hse.PREREG_PATH).read_text(encoding="utf-8")
+    for name in hse.CANDIDATES:
+        assert f"`{name}`" in text, name
+    cfg = hse.EnsembleConfig()
+    for token in (f"k = {cfg.k}", f"trailing {cfg.trailing} segments", f"every {cfg.selection_every} segments",
+                  f"n / (n + {cfg.shrink_n0})", f"{cfg.corr_penalty} × max correlation",
+                  f"{int(cfg.cost_bps_per_side)} bp", f"n_trials = {cfg.n_trials_declared}", f"seed {cfg.seed}",
+                  f"{cfg.bootstrap_reps:,} resamples", f"exceeds {cfg.dsr_min}"):
+        assert token in text, token
+
+
+# ── pure helpers ────────────────────────────────────────────────────────────
+
+
+def test_rebalance_dates_are_last_trading_day_of_week():
+    idx = pd.bdate_range("2020-01-01", "2020-02-28")
+    dates = hse.rebalance_dates(idx, date(2020, 1, 1), date(2020, 2, 28))
+    assert all(d.weekday() == 4 for d in dates)  # Fridays in a holiday-free bdate_range
+    assert dates == sorted(dates) and len(dates) == 9
+
+
+def test_segment_returns_nan_beyond_cap_not_clipped():
+    idx = pd.bdate_range("2020-01-06", "2020-01-17")
+    p = pd.DataFrame({"A": np.linspace(100, 110, len(idx)), "B": 100.0}, index=idx)
+    p.loc[idx[-1], "B"] = 300.0  # a 200 % week: data fault
+    dates = hse.rebalance_dates(idx, idx[0].date(), idx[-1].date())
+    seg = hse.segment_returns(p, dates, cap=0.5)
+    assert seg.shape[0] == len(dates) - 1
+    assert np.isnan(seg["B"].iloc[-1])
+    assert seg["A"].iloc[0] > 0
+
+
+def test_path_returns_costs_turnover_once_per_side():
+    idx = pd.DatetimeIndex(["2020-01-03", "2020-01-10", "2020-01-17"])
+    seg = pd.DataFrame({"A": [0.01, 0.02, 0.0], "B": [0.0, -0.01, 0.0]}, index=idx)
+    w = pd.DataFrame({"A": [1.0, 0.0, 0.0], "B": [0.0, 1.0, 1.0]}, index=idx)
+    gross, net, turn = hse.path_returns(w, seg, cost_bps_per_side=10.0)
+    assert gross.tolist() == pytest.approx([0.01, -0.01, 0.0])
+    assert turn.tolist() == pytest.approx([1.0, 2.0, 0.0])  # enter A; swap A→B (two sides); hold
+    assert net.tolist() == pytest.approx([0.01 - 0.001, -0.01 - 0.002, 0.0])
+
+
+def test_shrunk_sharpe_halves_at_n0():
+    r = pd.Series([0.01, 0.02, -0.005, 0.015] * 13)  # n = 52
+    raw = hse.annualised_sharpe(r, 52)
+    assert hse.shrunk_sharpe(r, n0=52, periods_per_year=52) == pytest.approx(raw / 2)
+    assert hse.shrunk_sharpe(pd.Series(dtype=float), 52, 52) == 0.0
+
+
+def test_select_top_k_prefers_decorrelated_and_skips_negative():
+    rng = np.random.default_rng(3)
+    base = rng.normal(0.004, 0.01, 104)
+    trailing = pd.DataFrame(
+        {
+            "a": base,
+            "a_clone": base + rng.normal(0, 0.0005, 104),  # near-perfect correlation with a
+            "b": rng.normal(0.003, 0.01, 104),
+            "loser": rng.normal(-0.01, 0.01, 104),
+        }
+    )
+    picked = hse.select_top_k(trailing, k=2, n0=52, corr_penalty=0.5, min_shrunk=0.0, periods_per_year=52)
+    assert len(picked) == 2 and "loser" not in picked
+    assert "a" in picked or "a_clone" in picked
+    assert not ({"a", "a_clone"} <= set(picked)), "the correlation penalty should keep the clone out"
+    assert hse.select_top_k(trailing[["loser"]], 2, 52, 0.5, 0.0, 52) == []
+
+
+def test_inverse_vol_weights_sum_to_one_and_favour_low_vol():
+    trailing = pd.DataFrame({"lo": np.tile([0.001, -0.001], 26), "hi": np.tile([0.01, -0.01], 26)})
+    w = hse.inverse_vol_weights(trailing, ["lo", "hi"])
+    assert sum(w.values()) == pytest.approx(1.0)
+    assert w["lo"] > w["hi"]
+    assert hse.inverse_vol_weights(trailing, []) == {}
+
+
+def test_clean_weights_caps_gross_at_one_and_drops_unknown():
+    w = hse._clean_weights({"SPY": 1.5, "QQQ": -1.5, "ZZZ": 1.0, "GLD": float("nan")}, ["SPY", "QQQ", "GLD"])
+    assert set(w) == {"SPY", "QQQ"}
+    assert sum(abs(v) for v in w.values()) == pytest.approx(1.0)
+
+
+def test_long_short_equal_leaves_cash_when_a_leg_is_missing():
+    assert hse._long_short_equal(["A", "B"], []) == {"A": 0.25, "B": 0.25}
+    w = hse._long_short_equal(["A"], ["B", "C"])
+    assert w == {"A": 0.5, "B": -0.25, "C": -0.25}
+
+
+# ── candidates and the point-in-time store ──────────────────────────────────
+
+
+def test_candidates_return_bounded_weights_in_universe(panel):
+    prices, vix = panel
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    d = date(2021, 6, 30)
+    pit.position(d)
+    ctx = hse.DecisionContext(as_of=d, prices=prices.loc[:str(d)], vix=vix.loc[:str(d)], engine=None, pit=pit)
+    for name, fn in hse.CANDIDATES.items():
+        w = hse._clean_weights(fn(ctx), list(prices.columns))
+        assert all(t in hse.UNIVERSE for t in w), name
+        assert sum(abs(v) for v in w.values()) <= 1.0 + 1e-9, name
+
+
+def test_panel_pit_store_refuses_forward_reads(panel):
+    prices, vix = panel
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    pit.position(date(2020, 6, 30))
+    ids = pit.feature_ids_by_name(["spy_full", "vix_spot", "not_a_feature"])
+    assert set(ids) == {"spy_full", "vix_spot"}
+    with pytest.raises(ValueError, match="LOOKAHEAD"):
+        pit.get_feature_matrix([ids["spy_full"]], date(2020, 1, 1), date(2020, 7, 1), date(2022, 1, 3))
+    frame = pit.get_feature_matrix([ids["spy_full"]], date(2020, 1, 1), date(2020, 6, 30), date(2022, 1, 3))
+    assert frame.index.max().date() <= date(2020, 6, 30)
+    with pytest.raises(ValueError, match="LOOKAHEAD"):
+        pit.get_pit([ids["vix_spot"]], date(2022, 1, 3), start_date=date(2020, 1, 1), end_date=date(2020, 7, 2))
+    v = pit.get_pit([ids["vix_spot"]], date(2022, 1, 3), start_date=date(2020, 1, 1), end_date=date(2020, 6, 30))
+    assert list(v.columns) == ["feature_id", "obs_date", "value", "release_date", "vintage_date"]
+    assert max(v["obs_date"]) <= date(2020, 6, 30)
+
+
+def test_weights_do_not_change_when_future_prices_change(panel):
+    """Every candidate's decision at d is a function of data ≤ d only."""
+    prices, vix = panel
+    d = date(2021, 3, 31)
+    dates = [d]
+    pit_a = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    w_a, _ = hse.compute_candidate_paths(prices, vix, dates, hse.CANDIDATES, pit=pit_a)
+    future = prices.copy()
+    future.loc[str(date(2021, 4, 1)):] *= np.random.default_rng(9).uniform(0.5, 1.5, future.shape[1])
+    vix_b = vix.copy()
+    vix_b.loc[str(date(2021, 4, 1)):] = 80.0
+    pit_b = hse.PanelPITStore(future, vix_b, data_as_of=date(2022, 1, 3))
+    w_b, _ = hse.compute_candidate_paths(future, vix_b, dates, hse.CANDIDATES, pit=pit_b)
+    for name in hse.CANDIDATES:
+        pd.testing.assert_frame_equal(w_a[name], w_b[name], check_exact=False, atol=1e-12)
+
+
+# ── walk-forward and evaluation ─────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def run(panel, small_config) -> hse.EnsembleRun:
+    prices, vix = panel
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    return hse.walk_forward(prices, vix, date(2019, 1, 2), date(2021, 12, 31), small_config, pit=pit)
+
+
+def test_walk_forward_shapes_and_warmup(run, small_config):
+    n_seg = len(run.seg_ret.index)
+    assert run.candidate_net.shape == (n_seg, len(hse.CANDIDATES))
+    assert run.ensemble_weights.iloc[: small_config.trailing].abs().sum().sum() == 0.0
+    assert len(run.oos_index) == n_seg - small_config.trailing
+    assert run.selections and run.selections[0]["date"] == run.oos_index[0].date().isoformat()
+    # allocations sum to one on every segment with a selection, never above
+    sums = run.ensemble_weights.abs().sum(axis=1)
+    assert ((sums < 1e-9) | (abs(sums - 1.0) < 1e-9)).all()
+    # the underlying book never exceeds unit gross exposure
+    assert (run.ensemble_underlying.abs().sum(axis=1) <= 1.0 + 1e-9).all()
+    assert (run.benchmark_net.loc[run.oos_index].index == run.oos_index).all()
+
+
+def test_selection_uses_only_prior_segments(panel, small_config):
+    """Changing candidate returns after a selection date cannot change that selection."""
+    prices, vix = panel
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    a = hse.walk_forward(prices, vix, date(2019, 1, 2), date(2021, 12, 31), small_config, pit=pit)
+    cut = date(2021, 1, 4)
+    prices_b = prices.copy()
+    prices_b.loc[str(cut):] *= 1.0 + np.random.default_rng(5).uniform(-0.3, 0.3, prices.shape[1])
+    pit_b = hse.PanelPITStore(prices_b, vix, data_as_of=date(2022, 1, 3))
+    b = hse.walk_forward(prices_b, vix, date(2019, 1, 2), date(2021, 12, 31), small_config, pit=pit_b)
+    before = [s for s in a.selections if s["date"] < cut.isoformat()]
+    before_b = [s for s in b.selections if s["date"] < cut.isoformat()]
+    assert before and before == before_b
+
+
+def test_evaluate_report_structure_and_verdict_logic(run):
+    rep = hse.evaluate(run)
+    for key in ("ensemble", "spy_buy_and_hold", "equal_weight_all_candidates", "best_single_in_hindsight",
+                "excess_vs_spy_bootstrap", "deflated_sharpe", "pbo_candidates", "pass_criterion", "candidates"):
+        assert key in rep
+    pc = rep["pass_criterion"]
+    assert pc["verdict"] == ("PASS" if pc["excess_lower_bound_positive"] and pc["dsr_passed"] else "FAIL")
+    assert rep["deflated_sharpe"].get("n_trials") == run.config.n_trials_declared
+    assert set(rep["selection_counts"]) <= set(hse.CANDIDATES)
+    md = hse.report_markdown(rep, title="t", data_basis="synthetic")
+    assert "Verdict" in md and "SPY buy-and-hold" in md
+
+
+def test_block_bootstrap_lower_bound_tracks_the_mean():
+    rng = np.random.default_rng(11)
+    pos = rng.normal(0.01, 0.01, 300)
+    neg = rng.normal(-0.01, 0.01, 300)
+    bp = hse.block_bootstrap_mean(pos, reps=2000, seed=1, alpha=0.05)
+    bn = hse.block_bootstrap_mean(neg, reps=2000, seed=1, alpha=0.05)
+    assert bp["lower_bound"] > 0 and bp["lower_bound"] < bp["mean"]
+    assert bn["lower_bound"] < 0 and bn["p_mean_le_zero"] > 0.99
+    assert hse.block_bootstrap_mean(np.array([0.1, 0.2]), reps=10, seed=1, alpha=0.05)["lower_bound"] is None
+
+
+def test_deflated_sharpe_is_near_one_for_a_strong_series_and_low_for_noise():
+    rng = np.random.default_rng(2)
+    idx = pd.bdate_range("2019-01-04", periods=400, freq="W-FRI")
+    cands = pd.DataFrame(rng.normal(0, 0.01, (400, 5)), index=idx, columns=list("abcde"))
+    strong = pd.Series(rng.normal(0.006, 0.01, 400), index=idx)
+    noise = pd.Series(rng.normal(0.0, 0.01, 400), index=idx)
+    assert hse.deflated_sharpe(strong, cands, 248, 0.95)["dsr"] > 0.95
+    assert hse.deflated_sharpe(noise, cands, 248, 0.95)["dsr"] < 0.5
+    assert "error" in hse.deflated_sharpe(strong.iloc[:10], cands, 248, 0.95)
+
+
+def test_pbo_over_candidates_handles_small_and_large_matrices():
+    rng = np.random.default_rng(4)
+    idx = pd.bdate_range("2019-01-04", periods=200, freq="W-FRI")
+    big = pd.DataFrame(rng.normal(0, 0.01, (200, 6)), index=idx, columns=list("abcdef"))
+    out = hse.pbo_over_candidates(big)
+    assert 0.0 <= out["pbo"] <= 1.0 and out["n_trials"] == 6
+    tiny = big.iloc[:20]
+    assert "error" in hse.pbo_over_candidates(tiny)
+
+
+def test_frame_to_records_is_json_safe(run):
+    recs = hse.frame_to_records(run.ensemble_weights.head(3))
+    assert len(recs) == 3 and all(isinstance(r["date"], str) for r in recs)

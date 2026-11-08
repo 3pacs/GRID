@@ -1,0 +1,831 @@
+"""High-Sharpe ensemble — walk-forward top-k selection over GRID's existing rule-based strategies.
+
+Paper only. Nothing here places an order, writes to the GRID database, or touches
+the decision journal. The module answers one pre-registered question
+(``docs/paper_log/high-sharpe-ensemble-v1-preregistration.md``): does picking the
+few best of GRID's existing strategies by their *trailing out-of-sample* Sharpe,
+shrunk toward zero and penalised for correlation, beat SPY buy-and-hold net of
+costs when evaluated strictly walk-forward?
+
+Design (all fixed in the registration before the first look):
+
+* **Candidates** are deterministic rules that already exist in GRID — the adaptive
+  rotation strategy, three of the ``151 Trading Strategies`` scans, two QuantaAlpha
+  rank signals and the VIX/MA exposure scalar — each turned into target weights
+  with a fixed, simple construction (:data:`CANDIDATES`). No parameter here is fit.
+* **Point in time.** Every candidate sees only prices and VIX observed on or before
+  the decision date (:class:`DecisionContext`, enforced by :class:`PanelPITStore`
+  for the rotation strategy's own reads). Realised returns use the prices that
+  followed. The price vintages are the ones GRID held on the run date, declared in
+  the registration: backfilled history carries its backfill date as
+  ``release_date``, so a strict release-date read would see nothing before 2025.
+* **Selection** every ``selection_every`` segments: trailing-window annualised
+  Sharpe of each candidate's realised net returns, shrunk by ``n / (n + n0)``,
+  greedy top-``k`` with a penalty of ``corr_penalty`` × max correlation to the
+  candidates already picked, only candidates with shrunk Sharpe above zero.
+* **Weighting** is inverse trailing volatility over the selected candidates,
+  summing to one. The ensemble's underlying weights are the weighted sum of the
+  selected candidates' weights, so costs are charged once, on the underlying
+  turnover, at ``cost_bps_per_side``.
+* **Evaluation**: mean net excess return over SPY with a circular block bootstrap
+  lower bound (the primary criterion), the deflated Sharpe ratio for the declared
+  number of trials (:func:`alpha_research.validation.gauntlet.deflated_sharpe_ratio`)
+  and the probability of backtest overfitting over the candidate matrix
+  (:func:`alpha_research.validation.overfitting.probability_of_backtest_overfitting`).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+import numpy as np
+import pandas as pd
+from loguru import logger as log
+from scipy import stats
+
+from alpha_research.validation.gauntlet import deflated_sharpe_ratio, trial_sharpe_variance
+from alpha_research.validation.metrics import max_drawdown
+from alpha_research.validation.overfitting import (
+    OverfitInputError,
+    probability_of_backtest_overfitting,
+)
+from analysis.offline_research_proof import autocorrelation_block
+from store.pit import PITStore
+
+# ── Registration ─────────────────────────────────────────────────────────────
+
+#: The pre-registration this module implements. Its LF-normalised sha256 is pinned
+#: here; :func:`registration_sha256` recomputes it and the tests compare the two.
+#: Re-pin only before the first look; afterwards a change is version 2.
+PREREG_PATH = "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md"
+PREREG_SHA256 = "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7"
+
+ENSEMBLE_VERSION = "high-sharpe-ensemble/1"
+
+
+def lf_sha256(data: bytes) -> str:
+    """sha256 of *data* with CRLF normalised to LF (house convention)."""
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def registration_sha256(repo_root: str | Path | None = None) -> str:
+    """sha256 of the registration file as it sits in *repo_root* (default: this repo)."""
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parent.parent
+    return lf_sha256((root / PREREG_PATH).read_bytes())
+
+
+# ── Universe and candidates ─────────────────────────────────────────────────
+
+#: Every ticker any candidate may hold. Fixed in the registration.
+UNIVERSE: tuple[str, ...] = (
+    # adaptive rotation groups + benchmark
+    "AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA",
+    "XOM", "CVX", "GLD", "SLV", "XLE",
+    "TLT", "XLU", "XLV", "XLB", "XLI",
+    "SPY", "QQQ",
+    # broad / sector / rates / credit ETFs with resolved_series history
+    "IWM", "DIA", "XLF", "XLK", "XLP", "XLY",
+    "IEF", "SHY", "HYG", "LQD", "USO",
+)
+
+#: Sector ETFs the sector-rotation candidate ranks (SPDR select sectors with history to 2016).
+SECTOR_ETFS: tuple[str, ...] = ("XLE", "XLU", "XLV", "XLB", "XLI", "XLF", "XLK", "XLP", "XLY")
+
+BENCHMARK = "SPY"
+VIX_NAME = "VIX"
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    """Everything a candidate may look at on a decision date.
+
+    ``prices`` and ``vix`` end at ``as_of`` (inclusive); nothing later is present.
+    ``engine`` and ``pit`` are only needed by :func:`adaptive_rotation_weights`.
+    """
+
+    as_of: date
+    prices: pd.DataFrame
+    vix: pd.Series
+    engine: Any = None
+    pit: PITStore | None = None
+
+
+CandidateFn = Callable[[DecisionContext], dict[str, float]]
+
+
+def _clean_weights(weights: dict[str, float], allowed: Sequence[str]) -> dict[str, float]:
+    """Drop unknown tickers and non-finite weights; cap gross exposure at 1."""
+    out = {
+        str(t): float(w)
+        for t, w in weights.items()
+        if t in allowed and w is not None and math.isfinite(float(w)) and abs(float(w)) > 1e-12
+    }
+    gross = sum(abs(w) for w in out.values())
+    if gross > 1.0 + 1e-9:
+        out = {t: w / gross for t, w in out.items()}
+    return out
+
+
+def _long_short_equal(longs: Sequence[str], shorts: Sequence[str]) -> dict[str, float]:
+    """0.5 gross per leg, equal weight within a leg; a missing leg leaves cash."""
+    weights: dict[str, float] = {}
+    if longs:
+        for t in longs:
+            weights[t] = weights.get(t, 0.0) + 0.5 / len(longs)
+    if shorts:
+        for t in shorts:
+            weights[t] = weights.get(t, 0.0) - 0.5 / len(shorts)
+    return weights
+
+
+def _signals_to_weights(signals: Sequence[Any]) -> dict[str, float]:
+    longs = [s.ticker for s in signals if s.direction == "LONG"]
+    shorts = [s.ticker for s in signals if s.direction == "SHORT"]
+    return _long_short_equal(longs, shorts)
+
+
+def s151_engine(ctx: DecisionContext) -> Any:
+    """A ``Strategy151Engine`` whose data loaders are never called (we pass panels)."""
+    from trading.strategy151 import Strategy151Engine
+
+    return Strategy151Engine(ctx.engine, ctx.pit)  # type: ignore[arg-type]
+
+
+def s151_xs_momentum_weights(ctx: DecisionContext) -> dict[str, float]:
+    """12-1 cross-sectional momentum, top 5 long / bottom 5 short (strategy151 §3.1)."""
+    prices = ctx.prices.drop(columns=[c for c in (VIX_NAME,) if c in ctx.prices.columns])
+    return _signals_to_weights(s151_engine(ctx).cross_sectional_momentum(prices, top_n=5))
+
+
+def s151_mean_reversion_weights(ctx: DecisionContext) -> dict[str, float]:
+    """20-day z-score mean reversion, entry |z| > 2 (strategy151 §3.9)."""
+    prices = ctx.prices.drop(columns=[c for c in (VIX_NAME,) if c in ctx.prices.columns])
+    return _signals_to_weights(s151_engine(ctx).mean_reversion_scan(prices))
+
+
+def s151_sector_rotation_weights(ctx: DecisionContext) -> dict[str, float]:
+    """Risk-adjusted multi-horizon sector momentum, top 3 long / bottom 3 short."""
+    cols = [t for t in SECTOR_ETFS if t in ctx.prices.columns]
+    return _signals_to_weights(s151_engine(ctx).sector_rotation(ctx.prices[cols], top_n=3))
+
+
+def _quintile_long_short(rank_signal: pd.DataFrame) -> dict[str, float]:
+    """Long the top quintile and short the bottom quintile of the last signal row."""
+    if rank_signal.empty:
+        return {}
+    row = rank_signal.iloc[-1].dropna()
+    if len(row) < 5:
+        return {}
+    n = max(1, len(row) // 5)
+    ordered = row.sort_values()
+    return _long_short_equal(list(ordered.index[-n:]), list(ordered.index[:n]))
+
+
+def qa_dual_horizon_weights(ctx: DecisionContext) -> dict[str, float]:
+    """QuantaAlpha dual-horizon momentum (equity-tuned), quintile long/short."""
+    from alpha_research.signals.quanta_alpha import dual_horizon_equity
+
+    prices = ctx.prices.drop(columns=[c for c in (VIX_NAME,) if c in ctx.prices.columns])
+    return _quintile_long_short(dual_horizon_equity(prices.tail(120)))
+
+
+def qa_vol_regime_weights(ctx: DecisionContext) -> dict[str, float]:
+    """QuantaAlpha vol-regime adaptive momentum (equity-tuned), quintile long/short."""
+    from alpha_research.signals.quanta_alpha import vol_regime_adaptive_equity
+
+    prices = ctx.prices.drop(columns=[c for c in (VIX_NAME,) if c in ctx.prices.columns])
+    return _quintile_long_short(vol_regime_adaptive_equity(prices.tail(160)))
+
+
+VIX_MA_WINDOW = 20  # alpha_research.signals.exposure_scaler.MA_WINDOW
+
+
+def vix_ma_exposure_spy_weights(ctx: DecisionContext) -> dict[str, float]:
+    """SPY scaled by the VIX/MA(20) exposure scalar ``clip(1 - (vix/ma - 1), 0, 1)``."""
+    vix = ctx.vix.dropna()
+    if len(vix) < VIX_MA_WINDOW:
+        return {}
+    ma = float(vix.tail(VIX_MA_WINDOW).mean())
+    if ma <= 0:
+        return {}
+    scalar = float(np.clip(1.0 - (float(vix.iloc[-1]) / ma - 1.0), 0.0, 1.0))
+    return {BENCHMARK: scalar} if scalar > 0 else {}
+
+
+def adaptive_rotation_weights(ctx: DecisionContext) -> dict[str, float]:
+    """``adaptive_rotation.run_rotation`` with default constants, reading through ``ctx.pit``."""
+    from alpha_research.strategies import adaptive_rotation as ar
+
+    if ctx.pit is None:
+        raise ValueError("adaptive_rotation needs a PanelPITStore in the decision context")
+    result = ar.run_rotation(
+        ctx.engine, as_of_date=ctx.as_of, positions={}, pit=ctx.pit, data_as_of=ctx.pit.data_as_of,
+    )
+    return dict(result.weights)
+
+
+#: The registered universe of candidate strategies, in registration order.
+CANDIDATES: dict[str, CandidateFn] = {
+    "adaptive_rotation": adaptive_rotation_weights,
+    "s151_xs_momentum": s151_xs_momentum_weights,
+    "s151_mean_reversion": s151_mean_reversion_weights,
+    "s151_sector_rotation": s151_sector_rotation_weights,
+    "qa_dual_horizon_equity": qa_dual_horizon_weights,
+    "qa_vol_regime_equity": qa_vol_regime_weights,
+    "vix_ma_exposure_spy": vix_ma_exposure_spy_weights,
+}
+
+
+# ── Point-in-time panel store ────────────────────────────────────────────────
+
+
+class PanelPITStore(PITStore):
+    """A ``PITStore`` that answers from an in-memory, already-loaded price panel.
+
+    ``run_rotation`` reads prices through ``build_price_panel(..., pit=...)`` and VIX
+    through ``get_vix_series(..., pit=...)``; both call ``feature_ids_by_name`` and
+    then ``get_feature_matrix`` / ``get_pit``. This store serves those calls from the
+    panel and refuses any read whose ``end_date`` lies after the decision date it
+    was positioned at (:meth:`position`), so the rotation strategy cannot see
+    forward prices even by accident. ``data_as_of`` is the vintage date of the
+    panel, recorded for provenance.
+    """
+
+    def __init__(self, panel: pd.DataFrame, vix: pd.Series, *, data_as_of: date) -> None:
+        super().__init__(None)  # type: ignore[arg-type]
+        self.panel = panel.sort_index()
+        self.vix = vix.sort_index()
+        self.data_as_of = data_as_of
+        self.decision_date: date | None = None
+        names = [f"{t.lower()}_full" for t in self.panel.columns] + ["vix_spot"]
+        self._name_to_id = {n: i + 1 for i, n in enumerate(names)}
+        self._id_to_col = {i + 1: t for i, t in enumerate(self.panel.columns)}
+        self._vix_id = self._name_to_id["vix_spot"]
+        self.reads = 0
+
+    def position(self, decision_date: date) -> None:
+        self.decision_date = decision_date
+
+    def _guard(self, end_date: date) -> None:
+        if self.decision_date is not None and end_date > self.decision_date:
+            raise ValueError(
+                f"LOOKAHEAD: read to {end_date} requested at decision date {self.decision_date}"
+            )
+
+    def feature_ids_by_name(self, names: list[str]) -> dict[str, int]:
+        return {n: self._name_to_id[n] for n in names if n in self._name_to_id}
+
+    def get_feature_matrix(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        as_of_date: date,
+        vintage_policy: str = "FIRST_RELEASE",
+    ) -> pd.DataFrame:
+        self._guard(end_date)
+        self.reads += 1
+        cols = [self._id_to_col[i] for i in feature_ids if i in self._id_to_col]
+        frame = self.panel.loc[str(start_date):str(end_date), cols]
+        frame = frame.rename(columns={t: self._name_to_id[f"{t.lower()}_full"] for t in cols})
+        frame.index.name = "obs_date"
+        return frame
+
+    def get_pit(
+        self,
+        feature_ids: list[int],
+        as_of_date: date,
+        vintage_policy: str = "LATEST_AS_OF",
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        end = end_date or as_of_date
+        self._guard(end)
+        self.reads += 1
+        if list(feature_ids) != [self._vix_id]:
+            raise ValueError("PanelPITStore.get_pit serves the VIX feature only")
+        s = self.vix.loc[str(start_date) if start_date else None : str(end)].dropna()
+        obs = [d.date() for d in s.index]
+        return pd.DataFrame(
+            {
+                "feature_id": self._vix_id,
+                "obs_date": obs,
+                "value": s.to_numpy(dtype=float),
+                "release_date": obs,
+                "vintage_date": obs,
+            }
+        )
+
+
+# ── Walk-forward engine ──────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class EnsembleConfig:
+    """Every knob, fixed by the registration. ``as_dict`` is written into the report."""
+
+    k: int = 3
+    trailing: int = 52  # segments in the selection window
+    selection_every: int = 4  # re-select every N segments
+    shrink_n0: int = 52
+    corr_penalty: float = 0.5
+    min_shrunk_sharpe: float = 0.0
+    cost_bps_per_side: float = 10.0
+    periods_per_year: int = 52
+    rebalance: str = "W-FRI"
+    bootstrap_reps: int = 10_000
+    seed: int = 20261108
+    alpha: float = 0.05
+    n_trials_declared: int = 248  # 7 candidates + 1 ensemble + 240 rotation sweep configs
+    dsr_min: float = 0.95
+    max_abs_segment_return: float = 0.5  # a single-name segment return beyond this is a data fault
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def rebalance_dates(index: pd.DatetimeIndex, start: date, end: date, rule: str = "W-FRI") -> list[date]:
+    """Last trading day of each ``rule`` period (pandas offset alias) inside ``[start, end]``."""
+    idx = index[(index >= pd.Timestamp(start)) & (index <= pd.Timestamp(end))]
+    if len(idx) == 0:
+        return []
+    marks = pd.Series(idx, index=idx).resample(rule).max().dropna()
+    return [pd.Timestamp(d).date() for d in marks.to_numpy()]
+
+
+def segment_returns(prices: pd.DataFrame, dates: Sequence[date], cap: float) -> pd.DataFrame:
+    """Per-ticker return over each segment ``[dates[i], dates[i+1]]``; rows = segment start.
+
+    Returns beyond ``±cap`` are set to NaN (a data fault, reported) rather than
+    clipped, so a bad print cannot manufacture a 50 % week.
+    """
+    stamps = pd.DatetimeIndex([pd.Timestamp(d) for d in dates])
+    p = prices.reindex(stamps)
+    r = p.shift(-1) / p - 1.0
+    r = r.iloc[:-1]
+    r = r.where(r.abs() <= cap)
+    return r
+
+
+def path_returns(
+    weights: pd.DataFrame, seg_ret: pd.DataFrame, cost_bps_per_side: float
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Gross, net and turnover series for a weight path (rows = segment start dates).
+
+    Gross = Σ w·r over the segment; turnover = Σ|w_t − w_{t−1}| (first row Σ|w_0|);
+    cost = turnover × bps / 1e4. Missing (NaN) returns on a held name count as zero
+    and are reported by the caller as faults.
+    """
+    w = weights.reindex(index=seg_ret.index, columns=seg_ret.columns).fillna(0.0)
+    r = seg_ret.reindex(columns=w.columns).fillna(0.0)
+    gross = (w * r).sum(axis=1)
+    prev = w.shift(1).fillna(0.0)
+    turnover = (w - prev).abs().sum(axis=1)
+    net = gross - turnover * cost_bps_per_side / 1e4
+    return gross, net, turnover
+
+
+def annualised_sharpe(returns: pd.Series, periods_per_year: int) -> float:
+    r = returns.dropna()
+    if len(r) < 2 or float(r.std(ddof=1)) == 0.0:
+        return 0.0
+    return float(r.mean() / r.std(ddof=1) * math.sqrt(periods_per_year))
+
+
+def shrunk_sharpe(returns: pd.Series, n0: int, periods_per_year: int) -> float:
+    """Annualised Sharpe times ``n / (n + n0)``: a fixed shrinkage toward zero."""
+    n = int(returns.dropna().shape[0])
+    if n == 0:
+        return 0.0
+    return annualised_sharpe(returns, periods_per_year) * n / (n + n0)
+
+
+def select_top_k(
+    trailing: pd.DataFrame, k: int, n0: int, corr_penalty: float, min_shrunk: float, periods_per_year: int
+) -> list[str]:
+    """Greedy top-k by shrunk Sharpe with a correlation penalty against the picks so far."""
+    scores = {c: shrunk_sharpe(trailing[c], n0, periods_per_year) for c in trailing.columns}
+    eligible = [c for c, s in scores.items() if s > min_shrunk]
+    if not eligible:
+        return []
+    corr = trailing[eligible].corr().fillna(0.0)
+    chosen: list[str] = []
+    while eligible and len(chosen) < k:
+        best, best_score = None, -math.inf
+        for c in eligible:
+            penalty = max((float(corr.loc[c, p]) for p in chosen), default=0.0)
+            adjusted = scores[c] - corr_penalty * max(penalty, 0.0)
+            if adjusted > best_score:
+                best, best_score = c, adjusted
+        if best is None or best_score <= min_shrunk:
+            break
+        chosen.append(best)
+        eligible.remove(best)
+    return chosen
+
+
+def inverse_vol_weights(trailing: pd.DataFrame, selected: Sequence[str]) -> dict[str, float]:
+    """Weights ∝ 1 / trailing std over the selected candidates, summing to one."""
+    if not selected:
+        return {}
+    vols = {c: float(trailing[c].dropna().std(ddof=1)) for c in selected}
+    inv = {c: (1.0 / v if v and math.isfinite(v) and v > 0 else 0.0) for c, v in vols.items()}
+    total = sum(inv.values())
+    if total <= 0:
+        return {c: 1.0 / len(selected) for c in selected}
+    return {c: v / total for c, v in inv.items()}
+
+
+@dataclass
+class EnsembleRun:
+    """Everything the walk-forward produced; ``report`` turns it into numbers."""
+
+    config: EnsembleConfig
+    dates: list[date]
+    seg_ret: pd.DataFrame
+    candidate_weights: dict[str, pd.DataFrame]
+    candidate_net: pd.DataFrame
+    candidate_gross: pd.DataFrame
+    candidate_turnover: pd.DataFrame
+    ensemble_weights: pd.DataFrame  # rows = segment start, cols = candidates (allocation a_c)
+    ensemble_underlying: pd.DataFrame
+    ensemble_net: pd.Series
+    ensemble_gross: pd.Series
+    ensemble_turnover: pd.Series
+    equal_weight_net: pd.Series
+    benchmark_net: pd.Series
+    selections: list[dict[str, Any]] = field(default_factory=list)
+    faults: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def oos_index(self) -> pd.DatetimeIndex:
+        """Every segment after the warm-up, cash segments included."""
+        return self.seg_ret.index[self.config.trailing :]
+
+
+def compute_candidate_paths(
+    prices: pd.DataFrame,
+    vix: pd.Series,
+    dates: Sequence[date],
+    candidates: dict[str, CandidateFn],
+    *,
+    engine: Any = None,
+    pit: PanelPITStore | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
+    """Target weights of every candidate on every decision date, each from data ≤ that date."""
+    paths: dict[str, list[pd.Series]] = {n: [] for n in candidates}
+    errors: dict[str, int] = {n: 0 for n in candidates}
+    cols = list(prices.columns)
+    for d in dates:
+        ts = pd.Timestamp(d)
+        ctx = DecisionContext(as_of=d, prices=prices.loc[:ts], vix=vix.loc[:ts], engine=engine, pit=pit)
+        if pit is not None:
+            pit.position(d)
+        for name, fn in candidates.items():
+            try:
+                w = _clean_weights(fn(ctx), cols)
+            except Exception as exc:  # noqa: BLE001 - one bad date must not kill the run
+                errors[name] += 1
+                log.warning("candidate {n} failed on {d}: {e}", n=name, d=d, e=str(exc)[:200])
+                w = {}
+            paths[name].append(pd.Series(w, name=ts, dtype=float))
+    frames = {
+        n: pd.DataFrame(rows).reindex(columns=cols).fillna(0.0) if rows else pd.DataFrame(columns=cols)
+        for n, rows in paths.items()
+    }
+    for n in frames:
+        frames[n].index = pd.DatetimeIndex([pd.Timestamp(d) for d in dates[: len(frames[n])]])
+    return frames, errors
+
+
+def walk_forward(
+    prices: pd.DataFrame,
+    vix: pd.Series,
+    start: date,
+    end: date,
+    config: EnsembleConfig,
+    candidates: dict[str, CandidateFn] | None = None,
+    *,
+    engine: Any = None,
+    pit: PanelPITStore | None = None,
+) -> EnsembleRun:
+    """Run candidates and the selector over ``[start, end]`` on the given panel."""
+    candidates = candidates or CANDIDATES
+    dates = rebalance_dates(prices.index, start, end, config.rebalance)
+    if len(dates) < config.trailing + 2:
+        raise ValueError(f"{len(dates)} rebalance dates cannot cover a {config.trailing}-segment window")
+    seg = segment_returns(prices, dates, config.max_abs_segment_return)
+    weights, errors = compute_candidate_paths(prices, vix, dates[:-1], candidates, engine=engine, pit=pit)
+
+    net, gross, turn = {}, {}, {}
+    for name, w in weights.items():
+        g, n, t = path_returns(w, seg, config.cost_bps_per_side)
+        gross[name], net[name], turn[name] = g, n, t
+    cand_net = pd.DataFrame(net)
+    cand_gross = pd.DataFrame(gross)
+    cand_turn = pd.DataFrame(turn)
+
+    # Selection loop: allocation decided at segment i from candidate net returns on segments < i.
+    alloc = pd.DataFrame(0.0, index=seg.index, columns=list(candidates))
+    selections: list[dict[str, Any]] = []
+    current: dict[str, float] = {}
+    for i in range(len(seg.index)):
+        if i < config.trailing:
+            continue
+        if (i - config.trailing) % config.selection_every == 0:
+            trailing = cand_net.iloc[i - config.trailing : i]
+            picked = select_top_k(
+                trailing, config.k, config.shrink_n0, config.corr_penalty,
+                config.min_shrunk_sharpe, config.periods_per_year,
+            )
+            current = inverse_vol_weights(trailing, picked)
+            selections.append(
+                {
+                    "date": seg.index[i].date().isoformat(),
+                    "selected": picked,
+                    "weights": {c: round(w, 6) for c, w in current.items()},
+                    "shrunk_sharpe": {
+                        c: round(shrunk_sharpe(trailing[c], config.shrink_n0, config.periods_per_year), 4)
+                        for c in trailing.columns
+                    },
+                }
+            )
+        for c, a in current.items():
+            alloc.iloc[i, alloc.columns.get_loc(c)] = a
+
+    underlying = pd.DataFrame(0.0, index=seg.index, columns=seg.columns)
+    for c in candidates:
+        underlying = underlying.add(weights[c].reindex(index=seg.index).fillna(0.0).mul(alloc[c], axis=0), fill_value=0.0)
+    ens_gross, ens_net, ens_turn = path_returns(underlying, seg, config.cost_bps_per_side)
+
+    # Controls: 1/N over all candidates from the same start; SPY buy-and-hold (one entry cost).
+    n_c = len(candidates)
+    live = pd.Series(False, index=seg.index)
+    live.iloc[config.trailing :] = True
+    ew_alloc = pd.DataFrame(0.0, index=seg.index, columns=list(candidates))
+    ew_alloc.loc[live, :] = 1.0 / n_c
+    ew_underlying = pd.DataFrame(0.0, index=seg.index, columns=seg.columns)
+    for c in candidates:
+        ew_underlying = ew_underlying.add(
+            weights[c].reindex(index=seg.index).fillna(0.0).mul(ew_alloc[c], axis=0), fill_value=0.0
+        )
+    _, ew_net, _ = path_returns(ew_underlying, seg, config.cost_bps_per_side)
+    bench_w = pd.DataFrame(0.0, index=seg.index, columns=seg.columns)
+    bench_w.loc[live, BENCHMARK] = 1.0
+    _, bench_net, _ = path_returns(bench_w, seg, config.cost_bps_per_side)
+
+    faults = {
+        "candidate_errors": errors,
+        "segment_returns_nan": int(seg.isna().sum().sum()),
+        "segment_returns_total": int(seg.size),
+        "segments": int(len(seg.index)),
+    }
+    return EnsembleRun(
+        config=config, dates=list(dates), seg_ret=seg, candidate_weights=weights,
+        candidate_net=cand_net, candidate_gross=cand_gross, candidate_turnover=cand_turn,
+        ensemble_weights=alloc, ensemble_underlying=underlying, ensemble_net=ens_net,
+        ensemble_gross=ens_gross, ensemble_turnover=ens_turn, equal_weight_net=ew_net,
+        benchmark_net=bench_net, selections=selections, faults=faults,
+    )
+
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+
+
+def block_bootstrap_mean(
+    x: np.ndarray, *, reps: int, seed: int, alpha: float, block: int | None = None
+) -> dict[str, Any]:
+    """Circular block bootstrap of the mean; one-sided ``1 - alpha`` lower bound.
+
+    The block comes from :func:`analysis.offline_research_proof.autocorrelation_block`
+    unless given. Returns the bound, the two-sided interval and the share of
+    resamples with a non-positive mean (a bootstrap p-value for ``mean <= 0``).
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 8:
+        return {"n": n, "mean": float(np.mean(x)) if n else None, "lower_bound": None, "error": "n < 8"}
+    basis: dict[str, Any] = {}
+    if block is None:
+        block, basis = autocorrelation_block(x)
+    block = max(1, int(block))
+    rng = np.random.default_rng(seed)
+    n_blocks = math.ceil(n / block)
+    starts = rng.integers(0, n, size=(reps, n_blocks))
+    offsets = np.arange(block)
+    idx = (starts[:, :, None] + offsets[None, None, :]).reshape(reps, -1)[:, :n] % n
+    means = x[idx].mean(axis=1)
+    return {
+        "n": n,
+        "mean": float(x.mean()),
+        "block": block,
+        "block_basis": basis,
+        "reps": reps,
+        "seed": seed,
+        "alpha": alpha,
+        "lower_bound": float(np.quantile(means, alpha)),
+        "ci_two_sided": [float(np.quantile(means, alpha / 2)), float(np.quantile(means, 1 - alpha / 2))],
+        "p_mean_le_zero": float(np.mean(means <= 0.0)),
+    }
+
+
+def series_summary(returns: pd.Series, periods_per_year: int) -> dict[str, Any]:
+    r = returns.dropna()
+    if r.empty:
+        return {"n": 0}
+    return {
+        "n": int(len(r)),
+        "mean_per_period": float(r.mean()),
+        "std_per_period": float(r.std(ddof=1)) if len(r) > 1 else None,
+        "sharpe_annualised": annualised_sharpe(r, periods_per_year),
+        "annualised_return": float((1 + r).prod() ** (periods_per_year / len(r)) - 1),
+        "total_return": float((1 + r).prod() - 1),
+        "max_drawdown": float(max_drawdown(r)),
+        "worst_period": float(r.min()),
+        "share_positive": float((r > 0).mean()),
+    }
+
+
+def deflated_sharpe(ens: pd.Series, candidates: pd.DataFrame, n_trials: int, confidence: float) -> dict[str, Any]:
+    """DSR of the ensemble's per-period returns against ``n_trials`` declared trials."""
+    r = ens.dropna().to_numpy(dtype=float)
+    if len(r) < 20:
+        return {"error": "n < 20"}
+    per_period = {c: annualised_sharpe(candidates[c], 1) for c in candidates.columns}
+    var = trial_sharpe_variance(list(per_period.values())) if len(per_period) > 1 else 0.0
+    sr = float(np.mean(r) / np.std(r, ddof=1)) if np.std(r, ddof=1) > 0 else 0.0
+    try:
+        result = deflated_sharpe_ratio(
+            sr, int(n_trials), int(len(r)), float(var),
+            float(stats.skew(r)), float(stats.kurtosis(r, fisher=False)), confidence,
+        )
+    except ValueError as exc:
+        return {"error": str(exc), "sharpe_per_period": sr, "trial_sharpe_variance": float(var)}
+    return {
+        "dsr": result.dsr,
+        "passed": result.passed,
+        "sharpe_per_period": result.sharpe,
+        "sr0_per_period": result.sr0,
+        "expected_max_z": result.expected_max_z,
+        "n_trials": result.n_trials,
+        "n_observations": result.n_observations,
+        "trial_sharpe_variance": result.trial_sharpe_variance,
+        "skewness": result.skewness,
+        "kurtosis": result.kurtosis,
+        "candidate_sharpe_per_period": per_period,
+    }
+
+
+def pbo_over_candidates(candidates: pd.DataFrame) -> dict[str, Any]:
+    """PBO (CSCV, 16 partitions) over the candidate return matrix, if it can be formed."""
+    m = candidates.dropna(how="any").copy()
+    if m.index.tz is None:
+        m.index = m.index.tz_localize("UTC")
+    m.columns = [str(c) for c in m.columns]
+    try:
+        return probability_of_backtest_overfitting(m, 16).as_dict()
+    except OverfitInputError as exc:
+        return {"error": str(exc)}
+
+
+def evaluate(run: EnsembleRun) -> dict[str, Any]:
+    """Numbers for the report, including the registration's single pass criterion."""
+    cfg = run.config
+    oos = run.oos_index
+    ens = run.ensemble_net.loc[oos]
+    bench = run.benchmark_net.loc[oos]
+    ew = run.equal_weight_net.loc[oos]
+    excess = (ens - bench).dropna()
+    boot = block_bootstrap_mean(excess.to_numpy(), reps=cfg.bootstrap_reps, seed=cfg.seed, alpha=cfg.alpha)
+    cand_oos = run.candidate_net.loc[oos]
+    cand_summary = {c: series_summary(cand_oos[c], cfg.periods_per_year) for c in cand_oos.columns}
+    cand_excess_boot = {
+        c: block_bootstrap_mean(
+            (cand_oos[c] - bench).dropna().to_numpy(), reps=cfg.bootstrap_reps, seed=cfg.seed,
+            alpha=cfg.alpha / max(1, len(cand_oos.columns)),
+        )
+        for c in cand_oos.columns
+    }
+    best_single = max(cand_summary, key=lambda c: cand_summary[c].get("sharpe_annualised", -math.inf)) if cand_summary else None
+    dsr = deflated_sharpe(ens, cand_oos, cfg.n_trials_declared, cfg.dsr_min)
+    pbo = pbo_over_candidates(cand_oos)
+    primary = bool(boot.get("lower_bound") is not None and boot["lower_bound"] > 0)
+    dsr_ok = bool(dsr.get("passed", False))
+    verdict = "PASS" if (primary and dsr_ok) else "FAIL"
+    turnover_ann = float(run.ensemble_turnover.loc[oos].mean() * cfg.periods_per_year) if len(oos) else None
+    time_in_cash = float((run.ensemble_weights.loc[oos].abs().sum(axis=1) == 0).mean()) if len(oos) else None
+    selection_counts: dict[str, int] = {}
+    for s in run.selections:
+        for c in s["selected"]:
+            selection_counts[c] = selection_counts.get(c, 0) + 1
+    return {
+        "version": ENSEMBLE_VERSION,
+        "config": cfg.as_dict(),
+        "oos_period": {
+            "first_segment": oos.min().date().isoformat() if len(oos) else None,
+            "last_segment": oos.max().date().isoformat() if len(oos) else None,
+            "n_segments": int(len(oos)),
+        },
+        "ensemble": series_summary(ens, cfg.periods_per_year),
+        "ensemble_gross": series_summary(run.ensemble_gross.loc[oos], cfg.periods_per_year),
+        "ensemble_turnover_annualised": turnover_ann,
+        "ensemble_share_in_cash": time_in_cash,
+        "spy_buy_and_hold": series_summary(bench, cfg.periods_per_year),
+        "equal_weight_all_candidates": series_summary(ew, cfg.periods_per_year),
+        "best_single_in_hindsight": {"name": best_single, **(cand_summary.get(best_single, {}) if best_single else {})},
+        "candidates": cand_summary,
+        "candidate_excess_vs_spy_bootstrap_bonferroni": cand_excess_boot,
+        "candidate_turnover_annualised": {
+            c: float(run.candidate_turnover.loc[oos, c].mean() * cfg.periods_per_year) for c in cand_oos.columns
+        },
+        "candidate_correlation_oos": cand_oos.corr().round(3).to_dict(),
+        "selection_counts": selection_counts,
+        "n_selections": len(run.selections),
+        "excess_vs_spy_bootstrap": boot,
+        "deflated_sharpe": dsr,
+        "pbo_candidates": pbo,
+        "pass_criterion": {
+            "rule": "block-bootstrap one-sided 95% lower bound of mean weekly net excess return vs SPY > 0 "
+                    "AND deflated Sharpe > 0.95 at the declared trial count",
+            "excess_lower_bound_positive": primary,
+            "dsr_passed": dsr_ok,
+            "verdict": verdict,
+        },
+        "faults": run.faults,
+    }
+
+
+def report_markdown(report: dict[str, Any], *, title: str, data_basis: str) -> str:
+    """A short human summary; the JSON is the record."""
+    e, b, ew = report["ensemble"], report["spy_buy_and_hold"], report["equal_weight_all_candidates"]
+    best = report["best_single_in_hindsight"]
+    boot = report["excess_vs_spy_bootstrap"]
+    dsr = report["deflated_sharpe"]
+    pbo = report["pbo_candidates"]
+    pc = report["pass_criterion"]
+
+    def f(v: Any, nd: int = 3) -> str:
+        return "—" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.{nd}f}"
+
+    lines = [
+        f"# {title}",
+        "",
+        f"Verdict: **{pc['verdict']}** — {pc['rule']}.",
+        "",
+        f"Out-of-sample segments: {report['oos_period']['n_segments']} weekly, "
+        f"{report['oos_period']['first_segment']} → {report['oos_period']['last_segment']}. {data_basis}",
+        "",
+        "| series | Sharpe (ann.) | ann. return | max DD | total | n |",
+        "|---|---|---|---|---|---|",
+        f"| ensemble (net) | {f(e.get('sharpe_annualised'))} | {f(e.get('annualised_return'))} | {f(e.get('max_drawdown'))} | {f(e.get('total_return'))} | {e.get('n')} |",
+        f"| SPY buy-and-hold | {f(b.get('sharpe_annualised'))} | {f(b.get('annualised_return'))} | {f(b.get('max_drawdown'))} | {f(b.get('total_return'))} | {b.get('n')} |",
+        f"| 1/N all candidates | {f(ew.get('sharpe_annualised'))} | {f(ew.get('annualised_return'))} | {f(ew.get('max_drawdown'))} | {f(ew.get('total_return'))} | {ew.get('n')} |",
+        f"| best single in hindsight ({best.get('name')}) | {f(best.get('sharpe_annualised'))} | {f(best.get('annualised_return'))} | {f(best.get('max_drawdown'))} | {f(best.get('total_return'))} | {best.get('n')} |",
+        "",
+        f"Mean weekly net excess vs SPY: {f(boot.get('mean'), 5)}; one-sided 95 % lower bound "
+        f"{f(boot.get('lower_bound'), 5)} (block {boot.get('block')}, {boot.get('reps')} resamples, seed {boot.get('seed')}); "
+        f"P(mean ≤ 0) = {f(boot.get('p_mean_le_zero'))}.",
+        f"Deflated Sharpe: {f(dsr.get('dsr'))} at n_trials = {dsr.get('n_trials')} (SR0 per period {f(dsr.get('sr0_per_period'), 4)}, "
+        f"observed per period {f(dsr.get('sharpe_per_period'), 4)}) → {'pass' if dsr.get('passed') else 'fail'}.",
+        f"PBO over the candidate matrix: {f(pbo.get('pbo'))} ({pbo.get('n_combinations')} CSCV splits); "
+        f"P(OOS loss of the in-sample best) = {f(pbo.get('prob_oos_loss'))}.",
+        f"Ensemble turnover {f(report['ensemble_turnover_annualised'], 2)}×/yr; in cash {f(report['ensemble_share_in_cash'])} of segments.",
+        "",
+        "## Candidates (same out-of-sample segments, net of 10 bp/side)",
+        "",
+        "| candidate | Sharpe | ann. return | max DD | turnover/yr | excess-vs-SPY LB (Bonferroni) | times selected |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for c, s in report["candidates"].items():
+        lb = report["candidate_excess_vs_spy_bootstrap_bonferroni"][c].get("lower_bound")
+        lines.append(
+            f"| {c} | {f(s.get('sharpe_annualised'))} | {f(s.get('annualised_return'))} | {f(s.get('max_drawdown'))} | "
+            f"{f(report['candidate_turnover_annualised'].get(c), 2)} | {f(lb, 5)} | {report['selection_counts'].get(c, 0)} |"
+        )
+    lines += ["", f"Faults: {report['faults']}", ""]
+    return "\n".join(lines)
+
+
+def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    """JSON-safe rows of a date-indexed frame (dates ISO, floats rounded)."""
+    out = []
+    for ts, row in frame.iterrows():
+        d = ts.date().isoformat() if isinstance(ts, (pd.Timestamp, datetime)) else str(ts)
+        out.append({"date": d, **{str(k): (None if pd.isna(v) else round(float(v), 8)) for k, v in row.items()}})
+    return out
+
+
+__all__ = [
+    "BENCHMARK", "CANDIDATES", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
+    "PREREG_SHA256", "PanelPITStore", "UNIVERSE", "annualised_sharpe", "block_bootstrap_mean",
+    "compute_candidate_paths", "deflated_sharpe", "evaluate", "frame_to_records", "inverse_vol_weights",
+    "path_returns", "pbo_over_candidates", "rebalance_dates", "registration_sha256", "report_markdown",
+    "segment_returns", "select_top_k", "shrunk_sharpe", "walk_forward",
+]
