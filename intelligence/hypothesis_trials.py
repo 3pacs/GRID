@@ -435,6 +435,26 @@ def lead_lag_test(
 
 # ── Data access (read-only) ──────────────────────────────────────────────────
 
+# Tickers an active hypothesis will be scored on as a ticker move (plan_trial's
+# rule: a ticker and an expected_direction). TiingoPuller.default_tickers adds
+# them so a declared trial's window gets routine closes. In the Jun-Oct 2026
+# intersection backtest 36 of the 115 lead tickers (GME, KWEB, RXRX, ...) had
+# only one-off backfills: none of their 72 trials had closes to score, and
+# live they would have expired untestable.
+ACTIVE_TICKER_MOVE_TICKERS_SQL = """
+    SELECT DISTINCT test_criteria->>'ticker' FROM discovered_hypotheses
+    WHERE status = 'active'
+      AND test_criteria->>'ticker' IS NOT NULL
+      AND test_criteria->>'expected_direction' IS NOT NULL
+"""
+
+
+def ticker_move_close_universe(conn: Any) -> list[str]:
+    """Every ticker an active ticker-move hypothesis needs closes for:
+    upper-cased, sorted and de-duplicated, blanks dropped."""
+    rows = conn.execute(text(ACTIVE_TICKER_MOVE_TICKERS_SQL)).fetchall()
+    return sorted({t for (raw,) in rows if (t := str(raw or "").strip().upper())})
+
 
 def load_completed_closes(conn: Any, ticker: str, start: date, end: date,
                           evaluated_at: datetime) -> dict[date, float]:
