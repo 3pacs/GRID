@@ -47,7 +47,8 @@ def _obs(family, ticker="NVDA", direction="up", d=END, **cite):
     ("quiverquant:insider", "insider_buy", {}, ("insider", "up")),
     ("congressional", "SELL", {}, ("congress", "down")),
     ("gov_contract", "CONTRACT_AWARD", {"amount": 1e6}, ("gov_contract", "up")),
-    ("quiverquant:wsb", "wsb_bearish", {}, ("retail_sentiment", "down")),
+    ("quiverquant:wsb", "wsb_bearish", {}, None),  # frozen snapshot: no vote
+    ("quiverquant:wsb", "wsb_bullish", {}, None),
     ("quiverquant:wsb", "wsb_neutral", {}, None),
     ("smart_money", "NET_POSITION_DELTA", {"direction": "BULLISH"}, ("retail_sentiment", "up")),
     ("quiverquant:lobbying", "lobbying", {}, None),
@@ -56,6 +57,11 @@ def _obs(family, ticker="NVDA", direction="up", d=END, **cite):
 ])
 def test_classify_signal(source, stype, value, expected):
     assert si.classify_signal(source, stype, value) == expected
+
+
+def test_frozen_sources_are_not_queried_or_classified():
+    assert "quiverquant:wsb" in si._FROZEN_SOURCES
+    assert not si._FROZEN_SOURCES & set(si._FAMILY_BY_SOURCE)
 
 
 # ── robust anomalies ────────────────────────────────────────────────────────
