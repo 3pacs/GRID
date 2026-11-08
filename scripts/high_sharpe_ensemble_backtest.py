@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--as-of", type=date.fromisoformat, default=None, help="vintage date (default: today)")
     ap.add_argument("--source", choices=("resolved", "raw-adj-close"), default="raw-adj-close")
     ap.add_argument("--out", default="docs/reports")
-    ap.add_argument("--set", dest="set_name", choices=("v1", "v2"), default="v2",
+    ap.add_argument("--set", dest="set_name", choices=("v1", "v2", "v3"), default="v3",
                     help="registered candidate set; fixes universe, candidates, trial count and criterion")
     ap.add_argument("--tag", default=None, help="report file prefix (default high-sharpe-ensemble-<set>)")
     ap.add_argument("--lookback-days", type=int, default=400, help="price history loaded before --start")

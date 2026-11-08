@@ -68,6 +68,10 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
         "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md",
         "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7",
     ),
+    "v3": (
+        "docs/paper_log/high-sharpe-ensemble-v3-preregistration.md",
+        "1670eae74e9c0f8bc9a538e81a250db3b38e8a856cab5d6863aedce592db29b5",
+    ),
     "v2": (
         "docs/paper_log/high-sharpe-ensemble-v2-preregistration.md",
         "2e805286f124d068d1f3571c0822e915856f02ddab9aeb196326e09935ea376e",
@@ -75,11 +79,11 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
 }
 PREREG_PATH, PREREG_SHA256 = REGISTRATIONS["v1"]
 
-ENSEMBLE_VERSION = "high-sharpe-ensemble/2"
+ENSEMBLE_VERSION = "high-sharpe-ensemble/3"
 
 #: Trials spent before each set's look: 240 rotation-sweep configs + v1's 7 candidates
 #: + v1's ensemble = 248; every later set adds its candidates and its ensemble.
-TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248}
+TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261}
 
 
 def lf_sha256(data: bytes) -> str:
@@ -380,6 +384,76 @@ def v2_candidates() -> dict[str, CandidateFn]:
     return out
 
 
+# ── v3: volatility-managed and risk parity (registered 2026-11-08, 261 trials before) ──
+
+V3_RISK_PARITY: tuple[str, ...] = ("SPY", "TLT", "GLD", "DBC")
+UNIVERSE_V3: tuple[str, ...] = ("SPY", "QQQ", "TLT", "IEF", "GLD", "DBC")
+VOL_TARGET_ANNUAL = 0.10      # Moreira–Muir style target, 10 % a year
+VOL_WINDOW = 20               # sessions of realised volatility for the target
+RP_VOL_WINDOW = 60            # sessions for inverse-volatility risk parity
+MAX_LEVERAGE = 1.0            # paper book never borrows
+
+
+def realised_vol(prices: pd.DataFrame, window: int) -> pd.Series:
+    """Annualised standard deviation of daily log returns over the last ``window`` sessions."""
+    if len(prices) < window + 1:
+        return pd.Series(dtype=float)
+    rets = np.log(prices.iloc[-(window + 1):]).diff().dropna()
+    return rets.std(ddof=1) * math.sqrt(252)
+
+
+def vol_target_weights(ctx: DecisionContext, ticker: str) -> dict[str, float]:
+    """``min(target / realised vol, 1)`` in ``ticker``, cash remainder."""
+    if ticker not in ctx.prices.columns:
+        return {}
+    vol = realised_vol(ctx.prices[[ticker]], VOL_WINDOW)
+    v = float(vol.get(ticker, float("nan")))
+    if not math.isfinite(v) or v <= 0:
+        return {}
+    return {ticker: float(min(VOL_TARGET_ANNUAL / v, MAX_LEVERAGE))}
+
+
+def risk_parity_weights(ctx: DecisionContext) -> dict[str, float]:
+    """Inverse 60-session volatility over SPY/TLT/GLD/DBC, fully invested (sums to one)."""
+    cols = _present(ctx, V3_RISK_PARITY)
+    vol = realised_vol(ctx.prices[cols], RP_VOL_WINDOW).dropna()
+    vol = vol[vol > 0]
+    if vol.empty:
+        return {}
+    inv = 1.0 / vol
+    return {t: float(w) for t, w in (inv / inv.sum()).items()}
+
+
+def sixty_forty_vol_scaled_weights(ctx: DecisionContext) -> dict[str, float]:
+    """60 % SPY / 40 % IEF, scaled by ``min(target / realised portfolio vol, 1)``."""
+    if not {"SPY", "IEF"} <= set(ctx.prices.columns):
+        return {}
+    if len(ctx.prices) < VOL_WINDOW + 1:
+        return {}
+    rets = np.log(ctx.prices[["SPY", "IEF"]].iloc[-(VOL_WINDOW + 1):]).diff().dropna()
+    port = 0.6 * rets["SPY"] + 0.4 * rets["IEF"]
+    v = float(port.std(ddof=1) * math.sqrt(252))
+    if not math.isfinite(v) or v <= 0:
+        return {}
+    scale = float(min(VOL_TARGET_ANNUAL / v, MAX_LEVERAGE))
+    return {"SPY": 0.6 * scale, "IEF": 0.4 * scale}
+
+
+def v3_candidates() -> dict[str, CandidateFn]:
+    """The eight registered v3 arms: four rules × {monthly, weekly}; fresh state per call."""
+    rules: dict[str, CandidateFn] = {
+        "vol_target_spy": lambda ctx: vol_target_weights(ctx, "SPY"),
+        "vol_target_qqq": lambda ctx: vol_target_weights(ctx, "QQQ"),
+        "risk_parity_4": risk_parity_weights,
+        "sixty_forty_vol_scaled": sixty_forty_vol_scaled_weights,
+    }
+    out: dict[str, CandidateFn] = {}
+    for name, fn in rules.items():
+        out[f"{name}_M"] = Cadenced(fn, "M")
+        out[f"{name}_W"] = fn
+    return out
+
+
 @dataclass(frozen=True)
 class CandidateSet:
     """One registered set: its universe, candidates, trial accounting and verdict rule."""
@@ -407,6 +481,8 @@ def candidate_set(name: str) -> CandidateSet:
         return CandidateSet("v1", UNIVERSE, lambda: dict(CANDIDATES), TRIALS_BEFORE["v1"], "v1_pass")
     if name == "v2":
         return CandidateSet("v2", UNIVERSE_V2, v2_candidates, TRIALS_BEFORE["v2"], "watch")
+    if name == "v3":
+        return CandidateSet("v3", UNIVERSE_V3, v3_candidates, TRIALS_BEFORE["v3"], "watch")
     raise KeyError(f"unknown candidate set {name!r}")
 
 
@@ -1023,7 +1099,7 @@ def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 __all__ = [
     "BENCHMARK", "CANDIDATES", "Cadenced", "CandidateSet", "REGISTRATIONS", "TRIALS_BEFORE", "UNIVERSE_V2",
-    "candidate_set", "v2_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
+    "UNIVERSE_V3", "candidate_set", "v2_candidates", "v3_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
     "PREREG_SHA256", "PanelPITStore", "UNIVERSE", "annualised_sharpe", "block_bootstrap_mean",
     "compute_candidate_paths", "deflated_sharpe", "evaluate", "frame_to_records", "inverse_vol_weights",
     "path_returns", "pbo_over_candidates", "rebalance_dates", "registration_sha256", "report_markdown",

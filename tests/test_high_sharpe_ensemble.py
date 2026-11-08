@@ -356,3 +356,43 @@ def test_watch_criterion_is_reported_and_routes_the_verdict(run):
     assert watch["verdict"] == expected
     assert rep["pass_criterion"]["criterion"] == "v1_pass"
     assert rep["pass_criterion"]["verdict"] == rep["pass_criterion"]["v1_pass_verdict"]
+
+
+# ── v3: volatility-managed and risk parity ──────────────────────────────────
+
+
+def _v3_panel(vol_daily: float, seed: int = 21) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2019-01-01", periods=120)
+    cols = list(hse.UNIVERSE_V3)
+    rets = rng.normal(0.0, vol_daily, (len(idx), len(cols)))
+    return pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=idx, columns=cols)
+
+
+def test_v3_set_counts_trials_and_names_rules():
+    v3 = hse.candidate_set("v3")
+    assert v3.n_trials_cumulative == 261 + 8 + 1 == 270
+    text = (REPO_ROOT / hse.REGISTRATIONS["v3"][0]).read_text(encoding="utf-8")
+    for arm in v3.candidates():
+        assert f"`{arm.rsplit('_', 1)[0]}`" in text, arm
+    assert "270" in text and len(v3.candidates()) == 8
+
+
+def test_vol_target_scales_down_in_high_vol_and_caps_at_one():
+    calm = hse.vol_target_weights(_ctx(_v3_panel(0.002)), "SPY")   # ~3 % annual vol → capped at 1
+    wild = hse.vol_target_weights(_ctx(_v3_panel(0.03)), "SPY")    # ~48 % annual vol → ~0.21
+    assert calm == {"SPY": 1.0}
+    assert 0.1 < wild["SPY"] < 0.35
+    assert hse.vol_target_weights(_ctx(_v3_panel(0.01).iloc[:5]), "SPY") == {}
+    sf = hse.sixty_forty_vol_scaled_weights(_ctx(_v3_panel(0.03)))
+    assert sf["SPY"] / sf["IEF"] == pytest.approx(1.5) and sf["SPY"] + sf["IEF"] < 1.0
+    assert hse.sixty_forty_vol_scaled_weights(_ctx(_v3_panel(0.002))) == {"SPY": pytest.approx(0.6), "IEF": pytest.approx(0.4)}
+
+
+def test_risk_parity_weights_sum_to_one_and_favour_low_vol():
+    panel = _v3_panel(0.01)
+    panel["TLT"] = 100.0 + np.arange(len(panel)) * 0.01  # nearly riskless
+    w = hse.risk_parity_weights(_ctx(panel))
+    assert set(w) == set(hse.V3_RISK_PARITY)
+    assert sum(w.values()) == pytest.approx(1.0)
+    assert w["TLT"] == max(w.values())
