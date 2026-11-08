@@ -23,6 +23,11 @@ import pytest
 from intelligence import fundamental_divergence as fd
 
 
+@pytest.fixture(autouse=True)
+def stable_source_generation(monkeypatch):
+    monkeypatch.setattr(fd, "get_financial_generation", lambda conn: "a" * 32)
+
+
 # ─────────────────────────────────────────────────────────────────
 # Mock engine helpers (mirrors test_sector_health.py)
 # ─────────────────────────────────────────────────────────────────
@@ -429,6 +434,7 @@ def _fake_divergence_rows(n: int, as_of):
             "divergence": 0.0,
             "classification": "aligned",
             "narrative": "n/a",
+            "sec_generation": "a" * 32,
         }
         for i in range(n)
     ]
@@ -452,7 +458,9 @@ def _run_snapshot_all_counting_statements(n: int):
         sql = str(getattr(stmt, "text", stmt))
         if "to_regclass" in sql.lower():
             return _res(one=_regclass("public.fundamental_divergence"))
-        return _res()
+        result = _res()
+        result.rowcount = len(stmt.compile().params) // len(fd._DIVERGENCE_UPSERT_COLUMNS)
+        return result
 
     conn.execute.side_effect = execute
     engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
@@ -518,8 +526,12 @@ def test_snapshot_all_chunk_failure_is_fail_soft_and_does_not_abort_run():
             calls["upserts"] += 1
             if calls["upserts"] == 1:
                 raise RuntimeError("simulated statement failure")
-            return _res()
-        return _res()
+            result = _res()
+            result.rowcount = len(stmt.compile().params) // len(fd._DIVERGENCE_UPSERT_COLUMNS)
+            return result
+        result = _res()
+        result.rowcount = len(stmt.compile().params) // len(fd._DIVERGENCE_UPSERT_COLUMNS)
+        return result
 
     conn.execute.side_effect = execute
     engine.begin.return_value.__enter__ = MagicMock(return_value=conn)

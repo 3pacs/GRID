@@ -468,7 +468,7 @@ class TestHolderOverlapEmit:
 
 
 class TestFundamentalDivergenceEmit:
-    def test_short_candidate_emits_negative_strength(self, monkeypatch):
+    def test_short_candidate_emission_is_suppressed(self, monkeypatch):
         from intelligence.fundamental_divergence import _emit_divergence_signal
 
         captured: list[SignalFired] = []
@@ -489,12 +489,9 @@ class TestFundamentalDivergenceEmit:
             "classification": "short_candidate",
         })
 
-        assert len(captured) == 1
-        c = captured[0]
-        assert c.signal_type == "fundamental_divergence"
-        assert c.ticker == "TSLA"
-        assert c.strength < 0
-        assert c.strength == pytest.approx(-0.55)
+        # The downstream signal/registry/journal paths do not yet invalidate
+        # financial generations. Do not create new unbound evidence.
+        assert captured == []
 
     def test_aligned_classification_does_not_emit(self, monkeypatch):
         from intelligence.fundamental_divergence import _emit_divergence_signal

@@ -26,12 +26,13 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.financial_cache import FinancialCacheUnavailable, get_cached_financial
 from utils.fx import convert_to_usd
 from utils.ttl_cache import TTLCache
 from utils.single_flight import single_flight
@@ -1021,17 +1022,22 @@ def get_capital_flow(
     # Strip canvas graph node-id prefixes (e.g. "a:corp_KO" → "KO").
     actor_id = _strip_canvas_prefix(actor_id)
 
+    engine = get_db_engine()
+    try:
+        return get_cached_financial(
+            _CACHE, f"{actor_id}|{periods}|{period_type}", engine,
+            lambda: _build_capital_flow(engine, actor_id, periods, period_type),
+        )
+    except FinancialCacheUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _build_capital_flow(engine: Any, actor_id: str, periods: int, period_type: str) -> dict:
+    """Build without a TTL lookup; the caller validates its source generation."""
     # Normalize id: seed data stores lowercase tickers; sector_map uses uppercase.
     id_variants = [actor_id, actor_id.lower(), actor_id.upper()]
     id_variants = list(dict.fromkeys(v for v in id_variants if v))
-
-    cache_key = f"{actor_id}|{periods}|{period_type}"
-    cached = _CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     actor_meta = _lookup_actor(actor_id)
-    engine = get_db_engine()
     rows: list[dict] = []
     for variant in id_variants:
         rows = _load_rows(engine, variant, period_type, periods)
@@ -1039,7 +1045,6 @@ def get_capital_flow(
             break
     if not rows:
         payload = _fallback_payload(actor_meta, period_type)
-        _CACHE.set(cache_key, payload)
         return payload
 
     grouped: dict[Any, list[dict[str, Any]]] = {}
@@ -1138,5 +1143,4 @@ def get_capital_flow(
         },
     }
 
-    _CACHE.set(cache_key, payload)
     return payload

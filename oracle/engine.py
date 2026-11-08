@@ -38,7 +38,6 @@ from sqlalchemy.engine import Engine
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 
-import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
 
@@ -1111,7 +1110,7 @@ class OracleEngine:
                 row = conn.execute(
                     text(
                         "SELECT score, snapshot_date "
-                        "FROM sector_health_snapshots "
+                        "FROM sector_health_snapshots_current "
                         "WHERE sector_name = :s "
                         "ORDER BY snapshot_date DESC LIMIT 1"
                     ).bindparams(s=sector),

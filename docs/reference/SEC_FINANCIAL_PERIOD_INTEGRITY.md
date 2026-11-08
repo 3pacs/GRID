@@ -221,11 +221,9 @@ executor or blanket correction of the 798-row proposal is included here.
 
 Missing-input guards now require every term used by composite financial ratios
 and scores; an explicit reported zero remains valid. Incomplete fundamental
-scores do not emit a new trading verdict. This does NOT erase prior persisted
-`fundamental_divergence` rows: its snapshot writer only upserts newly produced
-rows, and the existing actor-detail endpoint can still select its latest older
-record. Persisted derivative invalidation/source binding and API/percentile
-cache invalidation remain mandatory rollout gates, not solved by these guards.
+scores do not emit a new trading verdict. The later source-generation continuation below adds current-report views and
+cache invalidation. Prior rows remain retained evidence; signals derived from
+older reports remain a separate explicit rollout gate.
 
 A disposable full-NVDA fixture retained 587 qualified rows beside 587 synthetic
 legacy duplicates. The final relational evidence join returned exactly 587
@@ -253,3 +251,71 @@ A new disposable regression checks both the absent-table path and preservation
 of a populated ledger. All 25 private-PG tests pass. Test IDs are now sorted and
 collection order was verified under three different Python hash seeds. These
 corrections require fresh exact-head CI; earlier-head results do not qualify them.
+
+
+## Draft continuation: source-bound outputs and caches (2026-11-08)
+
+`sec_financial_outputs_20261108` adds a global SEC/TTM generation, nullable
+`sec_generation` on both report tables, and `fundamental_divergence_current` /
+`sector_health_snapshots_current`. Unbound historical rows and rows from a prior
+generation are excluded, never relabelled or deleted by the migration. Missing
+raw report tables are bootstrapped empty for clean Alembic replay; existing tables
+and values are preserved. The application role receives read access to views.
+
+The generation includes every snapshot head, observation request/receipt time,
+and TTM publication identity/fingerprint/time. Global scope is deliberate:
+sector ranks and peer-relative outputs depend on other actors. A same-content
+new observation also invalidates results, preventing a normal A-to-B-to-A
+source cycle from reviving old cache entries. UTC-normalized timestamp encoding
+keeps the token stable across session timezones. This is SEC/TTM binding, not
+versioning of prices, insider/news data, FX policy, or all legacy ledger writers.
+
+Report computation verifies the generation before and after its multiple reads.
+Writers accept only the captured current generation. Current-report views also
+hide a late old write that began before a newer head committed. Readers never
+fall back to raw historical reports. A missing qualified prior sector snapshot
+returns an unavailable 30-day trend, not a fabricated stable trend. With regular
+SEC reobservations, historical baselines generally will not share the current
+generation, so 30-day trends remain unavailable unless a current-source historical
+baseline is rebuilt. This is a functional limitation of the conservative binding,
+not an automatic recovery promised by the next ingestion. Oracle sector
+routing omits unavailable historical multipliers.
+
+Capital-flow, sector-health, divergence and percentile TTL caches verify the
+current generation before and after both hits and builds, isolate database
+engines, retry source churn once and then fail closed. API version-read failures
+return 503; percentile reads return unavailable values. These checks observe
+committed source state at verification time; they do not lock source updates
+until a response reaches a client. Old entries age out normally and cannot be
+served under a changed generation. This conservative global design requires
+representative latency and refresh-churn measurement before deployment.
+
+Divergence `SignalFired` fanout is disabled, including its compatibility helper.
+A verified report alone is not sufficient provenance for every handler and
+materialized derivative. This prevents new unbound signals but does not change
+existing canonical or sector-prefixed `signal_sources`, registry/signal_data
+derivatives, or provisional journal rows. Those historical consumers must gain
+end-to-end generation checks or undergo a separately approved quarantine/rebuild
+before rollout can be described as complete. No existing evidence is deleted.
+
+Remaining rollout gates:
+1. Exact-head full CI and independent review; coordinated migration-before-code
+   deployment and rollback, actual deployed schema ownership/grants validation.
+2. Representative query plans, generation-read overhead and global refresh/churn
+   checks. Any privileged archive/head/state mutation remains outside this guard.
+3. Historical signal/registry/materialized/journal invalidation, including both
+   divergence source families and their downstream persisted derivatives.
+4. Source-concept, sign, currency and fiscal-calendar review, plus the separately
+   reviewed historical repair and current-source recomputation acceptance.
+
+No production database access, migration, correction, rollup, deployment or merge
+is part of this continuation. No historical repair executor is introduced.
+
+
+Final local source validation: 398 offline tests passed, 9 optional tests skipped;
+35 fresh private-PostgreSQL tests passed. Independent review caught a liveness
+issue where generation rejection could mark a daily job complete. Explicit
+retryable source errors, current-generation replacement checks and postcommit
+verification now keep that work due; 22 dedicated regressions include the actual
+Hermes scheduling boundary. Changed-file lint, syntax and whitespace checks pass.
+Exact-head remote CI is a separate requirement after publishing this draft.

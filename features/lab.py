@@ -24,6 +24,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.pit import PITStore
+from utils.financial_cache import (
+    FinancialCacheUnavailable, get_cached_financial, read_financial_generation,
+)
 from utils.ttl_cache import TTLCache
 
 
@@ -1114,21 +1117,29 @@ def compute_all_percentiles(
     """Compute percentiles for every ratio in ``RATIO_NAMES``.
 
     Returns ``{ratio_name: {sector_name: {ticker: percentile}}}``. Cached
-    for 1 hour keyed on ``period_type`` — subsequent calls within the
-    cache window are O(1).
+    for 1 hour per period type and financial generation. Every call validates
+    the current generation, including peer changes and TTM readiness.
     """
-    cache_key = f"{_ALL_PCT_KEY_PREFIX}|{period_type}"
-    cached = _PCT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    try:
+        return get_cached_financial(
+            _PCT_CACHE, f"{_ALL_PCT_KEY_PREFIX}|{period_type}", engine,
+            lambda: _compute_all_percentiles(engine, period_type),
+        )
+    except FinancialCacheUnavailable as exc:
+        log.warning("features.lab: percentiles unavailable: {e}", e=str(exc))
+        return {}
 
+
+def _compute_all_percentiles(
+    engine: Any,
+    period_type: str,
+) -> dict[str, dict[str, dict[str, float]]]:
     # Single DB scan, reused for every ratio — this is the hot-path win.
     sector_map = _ticker_to_sector_subsector()
     amounts_by_ticker = _load_latest_amounts(engine, period_type)
 
     out: dict[str, dict[str, dict[str, float]]] = {}
     if not sector_map or not amounts_by_ticker:
-        _PCT_CACHE.set(cache_key, out)
         return out
 
     # Pre-compute ratios once per ticker so we're not dividing 14 times.
@@ -1157,7 +1168,6 @@ def compute_all_percentiles(
             for sector, vals in buckets.items()
         }
 
-    _PCT_CACHE.set(cache_key, out)
     return out
 
 
@@ -1198,36 +1208,44 @@ def get_percentile(
     if ratio_name not in _HIGHER_IS_BETTER or sector_name is None:
         return empty
 
-    all_pct = compute_all_percentiles(engine, period_type)
-    ratio_bucket = all_pct.get(ratio_name) or {}
-    sector_bucket = ratio_bucket.get(sector_name) or {}
-    pct = sector_bucket.get(tk)
+    try:
+        generation = read_financial_generation(engine)
+        all_pct = compute_all_percentiles(engine, period_type)
+        if not all_pct:
+            return empty
+        ratio_bucket = all_pct.get(ratio_name) or {}
+        sector_bucket = ratio_bucket.get(sector_name) or {}
+        pct = sector_bucket.get(tk)
 
-    # For the sector_median + top_decile we need the raw values, not just
-    # their ranks. Recompute from the cached amounts rather than hitting
-    # the DB again. ``compute_all_percentiles`` warmed the cache already.
-    amounts_by_ticker = _load_latest_amounts(engine, period_type)
-    raw_values: list[float] = []
-    for peer, amounts in amounts_by_ticker.items():
-        if sector_map.get(peer, (None, None))[0] != sector_name:
-            continue
-        r = _compute_ratios_from_amounts(amounts)
-        v = r.get(ratio_name)
-        if v is None:
-            continue
-        try:
-            raw_values.append(float(v))
-        except (TypeError, ValueError):
-            continue
-    median, top_decile = _sector_stats(raw_values, _HIGHER_IS_BETTER[ratio_name])
+        # The statistics use a second raw-value read. The surrounding source
+        # checks prevent combining a cached rank with a newer peer population.
+        amounts_by_ticker = _load_latest_amounts(engine, period_type)
+        raw_values: list[float] = []
+        for peer, amounts in amounts_by_ticker.items():
+            if sector_map.get(peer, (None, None))[0] != sector_name:
+                continue
+            r = _compute_ratios_from_amounts(amounts)
+            v = r.get(ratio_name)
+            if v is None:
+                continue
+            try:
+                raw_values.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        median, top_decile = _sector_stats(raw_values, _HIGHER_IS_BETTER[ratio_name])
 
-    return {
-        "percentile": pct,
-        "sector": sector_name,
-        "subsector": sub_name,
-        "sector_median": median,
-        "sector_top_decile": top_decile,
-    }
+        if read_financial_generation(engine) != generation:
+            return empty
+
+        return {
+            "percentile": pct,
+            "sector": sector_name,
+            "subsector": sub_name,
+            "sector_median": median,
+            "sector_top_decile": top_decile,
+        }
+    except FinancialCacheUnavailable:
+        return empty
 
 
 if __name__ == "__main__":

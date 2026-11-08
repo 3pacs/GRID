@@ -171,6 +171,7 @@ def test_incomplete_fundamentals_do_not_publish_trading_verdict(monkeypatch):
         "AAA": {"revenue_cagr": 0.5, "margin_trend": None, "shareholder_yield": 0.1},
     })
     monkeypatch.setattr(fd, "_load_batch_price_cagrs", lambda *args: {"AAA": -0.5})
+    monkeypatch.setattr(fd, "get_financial_generation", lambda conn: "a" * 32)
     assert fd.compute_divergence(MagicMock(), as_of=date(2026, 11, 8)) == []
 
 

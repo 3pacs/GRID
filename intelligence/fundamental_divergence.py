@@ -46,7 +46,25 @@ from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
+
+from store.financial_generation import get_financial_generation
 from sqlalchemy.engine import Engine
+
+class FinancialGenerationRetry(RuntimeError):
+    """Financial sources changed or could not be verified; retry this job."""
+
+
+def _verified_generation(conn: Any) -> str:
+    try:
+        return get_financial_generation(conn)
+    except Exception as exc:
+        raise FinancialGenerationRetry("Financial source generation unavailable") from exc
+
+
+def _require_generation(conn: Any, expected: str) -> None:
+    if _verified_generation(conn) != expected:
+        raise FinancialGenerationRetry("Financial sources changed during computation or publication")
+
 
 # ── Tunable constants ──────────────────────────────────────────────
 
@@ -645,7 +663,8 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
 
     Returns the in-memory list of result dicts WITHOUT writing to the
     database. Use ``snapshot_all`` to also upsert into
-    ``fundamental_divergence``.
+    ``fundamental_divergence``. Source-generation failures raise
+    ``FinancialGenerationRetry`` rather than masquerading as an empty universe.
     """
     as_of = as_of or date.today()
     universe = _load_universe()
@@ -661,6 +680,7 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
     out: list[dict[str, Any]] = []
 
     with engine.connect() as conn:
+        sec_generation = _verified_generation(conn)
         # Preload fundamentals + price cagr for the WHOLE universe in a
         # handful of batched queries (fable-daily-intel-sql-tasks,
         # 2026-09-20) rather than 1-4 queries PER TICKER — see the
@@ -737,7 +757,10 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
                     "divergence": divergence,
                     "classification": classification,
                     "narrative": narrative,
+                    "sec_generation": sec_generation,
                 })
+
+        _require_generation(conn, sec_generation)
 
     log.info(
         "fundamental_divergence: scored {n} tickers across {s} sectors",
@@ -778,7 +801,7 @@ _DIVERGENCE_UPSERT_CHUNK_SIZE: int = 500
 
 _DIVERGENCE_UPSERT_COLUMNS: tuple[str, ...] = (
     "ticker", "as_of", "sector", "fundamental_score",
-    "price_score", "divergence", "classification", "narrative",
+    "price_score", "divergence", "classification", "narrative", "sec_generation",
 )
 
 
@@ -795,25 +818,28 @@ def _build_divergence_upsert_sql(n_rows: int) -> str:
     values_sql = ", ".join(
         "(:ticker{i}, :as_of{i}, :sector{i}, :fundamental_score{i}, "
         ":price_score{i}, :divergence{i}, :classification{i}, "
-        ":narrative{i})".format(i=i)
+        ":narrative{i}, :sec_generation{i})".format(i=i)
         for i in range(n_rows)
     )
     return (
         "INSERT INTO fundamental_divergence "
         "(ticker, as_of, sector, fundamental_score, price_score, "
-        "divergence, classification, narrative) "
-        f"VALUES {values_sql} "
+        "divergence, classification, narrative, sec_generation) "
+        "SELECT * FROM (VALUES " + values_sql + ") AS candidate "
+        "(ticker, as_of, sector, fundamental_score, price_score, divergence, classification, narrative, sec_generation) "
+        "WHERE candidate.sec_generation = (SELECT generation FROM sec_financial_generation) "
         "ON CONFLICT (ticker, as_of) DO UPDATE SET "
         "sector = EXCLUDED.sector, "
         "fundamental_score = EXCLUDED.fundamental_score, "
         "price_score = EXCLUDED.price_score, "
         "divergence = EXCLUDED.divergence, "
         "classification = EXCLUDED.classification, "
-        "narrative = EXCLUDED.narrative"
+        "narrative = EXCLUDED.narrative, "
+        "sec_generation = EXCLUDED.sec_generation"
     )
 
 
-def _upsert_divergence_chunk(conn: Any, chunk: list[dict[str, Any]]) -> None:
+def _upsert_divergence_chunk(conn: Any, chunk: list[dict[str, Any]]) -> int:
     """Execute ONE multi-row upsert statement for ``chunk``. Raises on
     failure — caller decides fail-soft handling."""
     params: dict[str, Any] = {}
@@ -821,7 +847,7 @@ def _upsert_divergence_chunk(conn: Any, chunk: list[dict[str, Any]]) -> None:
         for col in _DIVERGENCE_UPSERT_COLUMNS:
             params[f"{col}{i}"] = r[col]
     sql = _build_divergence_upsert_sql(len(chunk))
-    conn.execute(text(sql).bindparams(**params))
+    return conn.execute(text(sql).bindparams(**params)).rowcount
 
 
 def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
@@ -831,7 +857,8 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
     daily from the hermes scheduler.
     """
     as_of = as_of or date.today()
-    rows = compute_divergence(engine, as_of=as_of)
+    rows = [r for r in compute_divergence(engine, as_of=as_of)
+            if isinstance(r.get("sec_generation"), str) and len(r["sec_generation"]) == 32]
     counts = {"long_candidate": 0, "short_candidate": 0, "aligned": 0}
     written = 0
     if not rows:
@@ -842,10 +869,15 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
             "counts": counts,
         }
 
+    sec_generation = rows[0]["sec_generation"]
+    if any(r["sec_generation"] != sec_generation for r in rows):
+        raise FinancialGenerationRetry("Divergence candidates contain mixed financial generations")
+
     for r in rows:
         counts[r["classification"]] = counts.get(r["classification"], 0) + 1
 
     with engine.begin() as conn:
+        _require_generation(conn, sec_generation)
         if not _table_exists(conn, "public.fundamental_divergence"):
             log.warning(
                 "fundamental_divergence: table missing, run migration 0033"
@@ -862,8 +894,12 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
         # no per-ticker SQL. See "Batched snapshot write" comment above.
         for chunk in _chunked(rows, _DIVERGENCE_UPSERT_CHUNK_SIZE):
             try:
-                _upsert_divergence_chunk(conn, chunk)
-                written += len(chunk)
+                chunk_written = _upsert_divergence_chunk(conn, chunk)
+                if chunk_written != len(chunk):
+                    raise FinancialGenerationRetry("Divergence write rejected stale financial generation")
+                written += chunk_written
+            except FinancialGenerationRetry:
+                raise
             except Exception as exc:
                 log.warning(
                     "fundamental_divergence: upsert chunk failed "
@@ -871,24 +907,18 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
                     n=len(chunk), t=chunk[0]["ticker"], e=str(exc),
                 )
 
-        # SYNTH-26: non-fatal SignalFired fanout. Only non-aligned
-        # classifications carry information — aligned rows are the
-        # "everything in line" null hypothesis. This is an audit-log +
-        # pub/sub emit against `contracts_audit` via its own engine
-        # (contracts/emit.py::_get_engine), NOT the fundamental_divergence
-        # table — each SignalFired event needs its own audit row and
-        # pg_notify so the SSE listener receives one notification per
-        # signal; collapsing these into a batch would change delivery
-        # semantics for downstream consumers. Left per-row on purpose.
-        for r in rows:
-            if r["classification"] in ("long_candidate", "short_candidate"):
-                try:
-                    _emit_divergence_signal(r)
-                except Exception as exc:  # pragma: no cover - defensive
-                    log.debug(
-                        "fundamental_divergence emit skipped for {t}: {e}",
-                        t=r["ticker"], e=str(exc),
-                    )
+        _require_generation(conn, sec_generation)
+
+        # Do not emit SignalFired contracts from these results. The signal
+        # handlers and their persisted derivatives do not enforce financial
+        # generations, so even a currently qualified row could become a stale
+        # trading signal after the next SEC head change. Keep this path closed
+        # until downstream generation-aware reads and invalidation exist.
+
+    # A head can advance after the INSERT's snapshot but before commit.
+    # Current views hide that output; the job must also remain retryable.
+    with engine.connect() as conn:
+        _require_generation(conn, sec_generation)
 
     summary = {
         "as_of": as_of.isoformat(),
@@ -910,45 +940,11 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
 # ── SYNTH-26 emit helper ───────────────────────────────────────────
 
 def _emit_divergence_signal(r: dict[str, Any]) -> None:
-    """Emit a ``SignalFired`` contract for one divergence row.
+    """Compatibility no-op until signal consumers enforce SEC generations.
 
-    Strength encoding:
-
-        long_candidate   →  +(|divergence| / 100) clamped ≤ 1.0
-        short_candidate  →  −(|divergence| / 100) clamped ≥ -1.0
-
-    The oracle handler's sign-to-BUY/SELL mapping converts this into a
-    directional entry in ``signal_sources``.
+    Suppress direct callers as well as ``snapshot_all``. Binding the source
+    row alone does not invalidate emitted ``signal_sources``, registry, or
+    provisional journal records when SEC heads change. Existing evidence is
+    left unchanged; historical-signal invalidation remains a rollout gate.
     """
-    from uuid import uuid4
-
-    from contracts.correlation import (
-        get_current_correlation_id,
-        new_correlation_id,
-    )
-    from contracts.emit import emit as _emit
-    from contracts.schemas import SignalFired
-
-    divergence = float(r.get("divergence") or 0.0)
-    classification = r.get("classification", "")
-    if classification == "long_candidate":
-        strength = min(1.0, abs(divergence) / 100.0)
-    elif classification == "short_candidate":
-        strength = -min(1.0, abs(divergence) / 100.0)
-    else:
-        return
-
-    corr_id = get_current_correlation_id() or new_correlation_id()
-    _emit(
-        SignalFired(
-            producer_module="intelligence.fundamental_divergence",
-            correlation_id=corr_id,
-            signal_id=uuid4(),
-            source=f"fundamental_divergence:{r.get('sector') or 'unknown'}",
-            signal_type="fundamental_divergence",
-            strength=strength,
-            ticker=r.get("ticker"),
-            actor_hint=None,
-            raw_row_ids=[],
-        )
-    )
+    return None

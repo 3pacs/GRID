@@ -38,7 +38,25 @@ from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
+
+from store.financial_generation import get_financial_generation
 from sqlalchemy.engine import Engine
+
+class FinancialGenerationRetry(RuntimeError):
+    """Financial sources changed or could not be verified; retry this job."""
+
+
+def _verified_generation(conn: Any) -> str:
+    try:
+        return get_financial_generation(conn)
+    except Exception as exc:
+        raise FinancialGenerationRetry("Financial source generation unavailable") from exc
+
+
+def _require_generation(conn: Any, expected: str) -> None:
+    if _verified_generation(conn) != expected:
+        raise FinancialGenerationRetry("Financial sources changed during computation or publication")
+
 
 # Public weight map. Kept at module level so tests can assert on it.
 WEIGHTS: dict[str, float] = {
@@ -394,19 +412,18 @@ def _dark_pool_score(conn: Any, tickers: list[str]) -> float | None:
 
 # ── Trend + narrative ──────────────────────────────────────────────
 
-def _trend_from_snapshots(conn: Any, sector_name: str, latest_score: float) -> str:
+def _trend_from_snapshots(conn: Any, sector_name: str, latest_score: float) -> str | None:
     """Return "improving" | "stable" | "deteriorating" based on the
-    nearest snapshot row ~30 days old. Defaults to "stable" when no
-    prior row exists.
+    nearest snapshot row ~30 days old. Returns None when no current-source prior row exists.
     """
-    if not _table_exists(conn, "public.sector_health_snapshots"):
-        return "stable"
+    if not _table_exists(conn, "public.sector_health_snapshots_current"):
+        return None
 
     row = conn.execute(
         text(
             """
             SELECT score
-            FROM sector_health_snapshots
+            FROM sector_health_snapshots_current
             WHERE sector_name = :s
               AND snapshot_date <= (CURRENT_DATE - INTERVAL '25 days')
             ORDER BY snapshot_date DESC
@@ -416,7 +433,7 @@ def _trend_from_snapshots(conn: Any, sector_name: str, latest_score: float) -> s
     ).fetchone()
 
     if row is None or row[0] is None:
-        return "stable"
+        return None
 
     prior = float(row[0])
     delta = latest_score - prior
@@ -428,7 +445,7 @@ def _trend_from_snapshots(conn: Any, sector_name: str, latest_score: float) -> s
 
 
 def _build_narrative(sector_name: str, score: float, components: dict[str, float],
-                     trend: str) -> str:
+                     trend: str | None) -> str:
     """Short deterministic template — no LLM."""
     strongest = max(components.items(), key=lambda kv: kv[1])
     weakest = min(components.items(), key=lambda kv: kv[1])
@@ -444,7 +461,8 @@ def _build_narrative(sector_name: str, score: float, components: dict[str, float
         "improving": "trending up",
         "stable": "stable",
         "deteriorating": "trending down",
-    }.get(trend, "stable")
+        None: "30-day trend unavailable",
+    }.get(trend, "30-day trend unavailable")
     return (
         f"{sector_name} health {score:.0f}/100 — {trend_phrase}. "
         f"Strongest lever: {pretty[strongest[0]]} ({strongest[1]:.2f}); "
@@ -485,8 +503,9 @@ _SCORERS = {
 def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
     """Return the sector health dict described in the module docstring.
 
-    Never raises for data errors, only for obviously wrong inputs
-    (unknown sector). A sub-score with no data is neutral-filled and
+    Source-generation failures raise ``FinancialGenerationRetry`` so a
+    scheduled attempt remains retryable. Unknown sectors raise ValueError.
+    A sub-score with no data is neutral-filled and
     listed in ``data_coverage.missing_neutral_filled``. When no
     component has data, or the query batch fails, the result is the
     explicit unavailable payload from :func:`_unavailable` instead of
@@ -503,6 +522,7 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
     missing: list[str] = []
     try:
         with engine.connect() as conn:
+            sec_generation = _verified_generation(conn)
             for key, scorer in _SCORERS.items():
                 raw = scorer(conn, tickers)
                 if raw is None:
@@ -511,6 +531,7 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
                 else:
                     components[key] = _clamp01(raw)
 
+            _require_generation(conn, sec_generation)
             if len(missing) == len(WEIGHTS):
                 return _unavailable(
                     sector_name, "no underlying data for any component",
@@ -519,6 +540,9 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
             score_01 = sum(WEIGHTS[k] * components[k] for k in WEIGHTS)
             score = round(100.0 * score_01, 2)
             trend = _trend_from_snapshots(conn, sector_name, score)
+            _require_generation(conn, sec_generation)
+    except FinancialGenerationRetry:
+        raise
     except Exception as exc:
         log.warning(
             "sector_health: computation failed for {s}: {e}",
@@ -539,6 +563,7 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
         "narrative": narrative,
         "as_of": datetime.now(timezone.utc).isoformat(),
         "status": "ok",
+        "sec_generation": sec_generation,
         "data_coverage": {
             "with_data": [k for k in WEIGHTS if k not in missing],
             "missing_neutral_filled": missing,
@@ -622,6 +647,8 @@ def snapshot_all_sectors(
     stale_skipped = 0
     aborted_stale = False
     out: dict[str, Any] = {"date": today.isoformat(), "sectors": {}}
+    with engine.connect() as conn:
+        attempt_generation = _verified_generation(conn)
 
     for sector_name in SECTOR_MAP.keys():
         if should_continue is not None and not should_continue():
@@ -635,6 +662,8 @@ def snapshot_all_sectors(
 
         try:
             result = compute_sector_health(engine, sector_name)
+        except FinancialGenerationRetry:
+            raise
         except Exception as exc:
             log.warning("snapshot_all_sectors: {s} failed: {e}",
                         s=sector_name, e=str(exc))
@@ -645,7 +674,7 @@ def snapshot_all_sectors(
             "trend_30d": result["trend_30d"],
         }
 
-        if result.get("score") is None:
+        if result.get("score") is None or not result.get("sec_generation"):
             # An unavailable sector must not be written as a 50.0 row:
             # the 30d trend and the oracle's sector routing both read
             # this table as measured history.
@@ -654,6 +683,9 @@ def snapshot_all_sectors(
             log.info("snapshot_all_sectors: {s} unavailable, not written ({r})",
                      s=sector_name, r=result.get("reason"))
             continue
+
+        if result["sec_generation"] != attempt_generation:
+            raise FinancialGenerationRetry("Sector snapshot attempt spans financial generations")
 
         if should_continue is not None and not should_continue():
             aborted_stale = True
@@ -667,16 +699,19 @@ def snapshot_all_sectors(
 
         try:
             with engine.begin() as conn:
+                _require_generation(conn, attempt_generation)
                 upsert_result = conn.execute(
                     text(
                         """
                         INSERT INTO sector_health_snapshots
-                            (sector_name, score, components, snapshot_date, as_of)
-                        VALUES (:s, :sc, CAST(:c AS JSONB), :d, :as_of)
+                            (sector_name, score, components, snapshot_date, as_of, sec_generation)
+                        SELECT :s, :sc, CAST(:c AS JSONB), :d, :as_of, :sec_generation
+                        WHERE :sec_generation = (SELECT generation FROM sec_financial_generation)
                         ON CONFLICT (sector_name, snapshot_date) DO UPDATE
                         SET score = EXCLUDED.score,
                             components = EXCLUDED.components,
-                            as_of = EXCLUDED.as_of
+                            as_of = EXCLUDED.as_of,
+                            sec_generation = EXCLUDED.sec_generation
                         WHERE sector_health_snapshots.as_of IS NULL
                            OR sector_health_snapshots.as_of < EXCLUDED.as_of
                         """
@@ -686,29 +721,38 @@ def snapshot_all_sectors(
                         c=json.dumps(result["components"]),
                         d=today,
                         as_of=computed_at,
+                        sec_generation=result["sec_generation"],
                     )
                 )
-                # rowcount is 1 when the INSERT landed or the DO UPDATE's
-                # WHERE guard matched (this attempt is STRICTLY newer than
-                # whatever as_of was already stored — strict `<`, not `<=`);
-                # 0 means the guard rejected the write because an
-                # already-stored row has an as-new-or-newer as_of — i.e. a
-                # LATER (or, on an exact as_of tie, an earlier-COMMITTED)
-                # attempt already wrote this sector, and this attempt's
-                # write must not overwrite it. First committed wins on
-                # equal as_of. That is not a failure: it is the
-                # cross-attempt protection working as intended, so it is
-                # counted separately from upsert_failed.
-                if upsert_result.rowcount == 1:
-                    written += 1
-                else:
-                    stale_skipped += 1
-                    log.info(
-                        "snapshot_all_sectors: {s} upsert skipped — an "
-                        "as-new-or-newer row already exists for this "
-                        "(sector, snapshot_date)",
-                        s=sector_name,
-                    )
+                _require_generation(conn, attempt_generation)
+                if upsert_result.rowcount == 0:
+                    # A generation rejection is not evidence that another job
+                    # completed the work. Only a current-source replacement
+                    # qualifies as an older/equal-attempt supersession.
+                    replacement = conn.execute(text(
+                        "SELECT sec_generation FROM sector_health_snapshots "
+                        "WHERE sector_name=:s AND snapshot_date=:d"
+                    ).bindparams(s=sector_name, d=today)).scalar_one_or_none()
+                    if replacement != attempt_generation:
+                        raise FinancialGenerationRetry(
+                            "Sector write rejected without a current-generation replacement"
+                        )
+                elif upsert_result.rowcount != 1:
+                    raise FinancialGenerationRetry("Sector write outcome could not be verified")
+
+            # Catch a source change between the statement snapshot and commit.
+            with engine.connect() as conn:
+                _require_generation(conn, attempt_generation)
+            if upsert_result.rowcount == 1:
+                written += 1
+            else:
+                stale_skipped += 1
+                log.info(
+                    "snapshot_all_sectors: {s} superseded by a current-generation row",
+                    s=sector_name,
+                )
+        except FinancialGenerationRetry:
+            raise
         except Exception as exc:
             upsert_failed += 1
             log.warning(
@@ -716,6 +760,9 @@ def snapshot_all_sectors(
                 s=sector_name, e=str(exc),
             )
 
+    if not aborted_stale:
+        with engine.connect() as conn:
+            _require_generation(conn, attempt_generation)
     out["snapshots_written"] = written
     out["snapshots_skipped_unavailable"] = skipped
     out["upsert_failed"] = upsert_failed

@@ -715,3 +715,325 @@ def test_pg_current_migration_bootstraps_missing_raw_ledger(private_pg):
                          'capital_flows_ttm_state','capital_flows'):
                 conn.execute(text('DROP TABLE IF EXISTS '+name))
             conn.execute(text('DROP ROLE IF EXISTS grid'))
+
+
+# Output-generation tests use only the same disposable database above. These
+# helpers deliberately neither discover a default engine nor call providers.
+def _apply_output_migration(engine):
+    import importlib.util
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    path = Path(__file__).resolve().parents[1] / "migrations/versions/sec_financial_outputs_20261108.py"
+    spec = importlib.util.spec_from_file_location("_sec_outputs_test_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    with engine.begin() as conn:
+        fake_alembic = SimpleNamespace(op=SimpleNamespace(execute=lambda sql: conn.execute(text(sql))))
+        with patch.dict(sys.modules, {"alembic": fake_alembic}):
+            spec.loader.exec_module(migration)
+            migration.upgrade()
+    return migration
+
+
+def _drop_test_outputs(engine):
+    with engine.begin() as conn:
+        for name in ("fundamental_divergence_current", "sector_health_snapshots_current", "sec_financial_generation"):
+            conn.execute(text("DROP VIEW IF EXISTS " + name))
+        for name in ("fundamental_divergence", "sector_health_snapshots"):
+            conn.execute(text("DROP TABLE IF EXISTS " + name))
+
+
+@pytest.fixture
+def output_db(snapshot_db):
+    try:
+        _apply_output_migration(snapshot_db)
+        yield snapshot_db
+    finally:
+        _drop_test_outputs(snapshot_db)
+
+
+def _generation(engine):
+    from store.financial_generation import get_financial_generation
+    with engine.connect() as conn:
+        return get_financial_generation(conn)
+
+
+def _divergence_candidate(generation, *, ticker="NVDA", score=70):
+    from datetime import date
+    return dict(ticker=ticker, as_of=date(2026, 11, 1), sector="Technology",
+                fundamental_score=score, price_score=50, divergence=score-50,
+                classification="long_candidate", narrative="Synthetic financial test",
+                sec_generation=generation)
+
+
+def test_pg_output_generation_tracks_heads_reobservations_and_peers(output_db):
+    from store.sec_financial_snapshots import write_snapshot
+    empty_generation = _generation(output_db)
+    assert len(empty_generation) == 32
+    assert _generation(output_db) == empty_generation
+    # A first empty/unsupported source still changes financial availability.
+    first = snapshot(empty=True)
+    write_snapshot(output_db, first)
+    first_generation = _generation(output_db)
+    assert first_generation != empty_generation
+    again = snapshot(second=10, empty=True)
+    assert again.snapshot_id == first.snapshot_id
+    write_snapshot(output_db, again)
+    repeated_generation = _generation(output_db)
+    assert repeated_generation != first_generation
+    # Ignored old observations must not perturb current cache/report identity.
+    assert write_snapshot(output_db, first)["status"] == "ignored_older_capture"
+    assert _generation(output_db) == repeated_generation
+    write_snapshot(output_db, snapshot(actor="aapl"))
+    assert _generation(output_db) != repeated_generation
+    # Session display timezone must not create a false generation change.
+    with output_db.begin() as conn:
+        from store.financial_generation import get_financial_generation
+        utc_generation = get_financial_generation(conn)
+        conn.execute(text("SET LOCAL TIME ZONE 'America/New_York'"))
+        assert get_financial_generation(conn) == utc_generation
+
+
+def test_pg_output_generation_tracks_same_values_new_identity(output_db):
+    import json
+    from datetime import timedelta
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+    from store.sec_financial_snapshots import write_snapshot
+    first = snapshot()
+    write_snapshot(output_db, first)
+    before = _generation(output_db)
+    body = json.loads(first.source_body)
+    body["entityName"] = "Same Values New Evidence"
+    newer = prepare_snapshot(
+        source_body=json.dumps(body).encode(), actor_id="nvda", cik="1045810",
+        request_started_at=first.request_started_at+timedelta(seconds=10),
+        received_at=first.received_at+timedelta(seconds=10), fx_rates={"USD": 1.0},
+    )
+    assert newer.normalized_json == first.normalized_json
+    assert newer.snapshot_id != first.snapshot_id
+    write_snapshot(output_db, newer)
+    assert _generation(output_db) != before
+
+
+def test_pg_output_generation_tracks_ttm_publication_without_head_change(output_db):
+    from store.sec_financial_snapshots import write_snapshot
+    from intelligence.company_financial_rollups import compute_ttm
+    write_snapshot(output_db, multi_quarter_snapshot())
+    before_head = current_head(output_db)
+    before_generation = _generation(output_db)
+    compute_ttm(output_db)
+    after_generation = _generation(output_db)
+    assert current_head(output_db) == before_head
+    assert after_generation != before_generation
+    compute_ttm(output_db)
+    assert _generation(output_db) == after_generation
+    # Every mutable readiness dimension participates, including old late work.
+    for assignment in (
+        "quarter_fingerprint='changed-test-fingerprint'",
+        "computed_at=computed_at + interval '1 second'",
+        "sec_snapshot_id=NULL",
+    ):
+        before_generation = _generation(output_db)
+        with output_db.begin() as conn:
+            conn.execute(text("UPDATE capital_flows_ttm_state SET " + assignment))
+        assert _generation(output_db) != before_generation
+
+
+def test_pg_output_views_hide_stale_and_unbound_rows_preserving_raw(output_db):
+    from store.sec_financial_snapshots import write_snapshot
+    current = _generation(output_db)
+    with output_db.begin() as conn:
+        for ticker, generation in (("UNBOUND", None), ("STALE", "f" * 32), ("CURRENT", current)):
+            conn.execute(text("""INSERT INTO fundamental_divergence
+                (ticker,as_of,fundamental_score,sec_generation)
+                VALUES (:ticker,'2026-11-01',70,:generation)"""),
+                {"ticker": ticker, "generation": generation})
+            conn.execute(text("""INSERT INTO sector_health_snapshots
+                (sector_name,snapshot_date,score,sec_generation)
+                VALUES (:ticker,'2026-11-01',70,:generation)"""),
+                {"ticker": ticker, "generation": generation})
+        assert conn.execute(text("SELECT ticker FROM fundamental_divergence_current")).scalars().all() == ["CURRENT"]
+        assert conn.execute(text("SELECT sector_name FROM sector_health_snapshots_current")).scalars().all() == ["CURRENT"]
+        before_div = conn.execute(text("SELECT * FROM fundamental_divergence ORDER BY id")).all()
+        before_sector = conn.execute(text("SELECT * FROM sector_health_snapshots ORDER BY id")).all()
+    write_snapshot(output_db, snapshot(empty=True))
+    with output_db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM fundamental_divergence_current")).scalar_one() == 0
+        assert conn.execute(text("SELECT count(*) FROM sector_health_snapshots_current")).scalar_one() == 0
+        assert conn.execute(text("SELECT * FROM fundamental_divergence ORDER BY id")).all() == before_div
+        assert conn.execute(text("SELECT * FROM sector_health_snapshots ORDER BY id")).all() == before_sector
+
+
+def test_pg_divergence_upsert_filters_stale_unbound_and_mixed_candidates(output_db):
+    from intelligence.fundamental_divergence import _upsert_divergence_chunk
+    from store.sec_financial_snapshots import write_snapshot
+    old_generation = _generation(output_db)
+    with output_db.begin() as conn:
+        assert _upsert_divergence_chunk(conn, [_divergence_candidate(old_generation)]) == 1
+    write_snapshot(output_db, snapshot(empty=True))
+    current = _generation(output_db)
+    with output_db.begin() as conn:
+        assert _upsert_divergence_chunk(conn, [_divergence_candidate(old_generation, score=99)]) == 0
+        assert _upsert_divergence_chunk(conn, [_divergence_candidate(None, ticker="UNBOUND")]) == 0
+        assert conn.execute(text("SELECT fundamental_score FROM fundamental_divergence WHERE ticker='NVDA'")).scalar_one() == 70
+        assert _upsert_divergence_chunk(conn, [
+            _divergence_candidate(old_generation, ticker="STALE"),
+            _divergence_candidate(current, score=80),
+        ]) == 1
+        rows = conn.execute(text("SELECT ticker,fundamental_score,sec_generation FROM fundamental_divergence_current")).all()
+        assert rows == [("NVDA", 80, current)]
+        assert conn.execute(text("SELECT count(*) FROM fundamental_divergence")).scalar_one() == 1
+
+
+def test_pg_output_migration_clean_bootstrap_role_grants(output_db):
+    from store.financial_generation import get_financial_generation
+    from intelligence.fundamental_divergence import _upsert_divergence_chunk
+    with output_db.begin() as conn:
+        conn.execute(text("SET LOCAL ROLE grid"))
+        generation = get_financial_generation(conn)
+        assert _upsert_divergence_chunk(conn, [_divergence_candidate(generation)]) == 1
+        conn.execute(text("""INSERT INTO sector_health_snapshots
+            (sector_name,snapshot_date,score,sec_generation)
+            VALUES ('Technology','2026-11-01',70,:g)"""), {"g": generation})
+        assert conn.execute(text("SELECT count(*) FROM fundamental_divergence_current")).scalar_one() == 1
+        assert conn.execute(text("SELECT count(*) FROM sector_health_snapshots_current")).scalar_one() == 1
+
+
+def test_pg_output_migration_preserves_preexisting_report_rows(snapshot_db):
+    root = Path(__file__).resolve().parents[1]
+    try:
+        with snapshot_db.begin() as conn:
+            for filename in ("0033_fundamental_divergence.sql", "0028_sector_health_snapshots.sql"):
+                conn.execute(text((root / "migrations" / filename).read_text(encoding="utf-8")))
+            conn.execute(text("""INSERT INTO fundamental_divergence
+                (ticker,as_of,fundamental_score) VALUES ('LEGACY','2026-11-01',70)"""))
+            conn.execute(text("""INSERT INTO sector_health_snapshots
+                (sector_name,snapshot_date,score) VALUES ('Technology','2026-11-01',70)"""))
+            before_div = conn.execute(text("SELECT row_to_json(d) FROM fundamental_divergence d")).scalar_one()
+            before_sector = conn.execute(text("SELECT row_to_json(s) FROM sector_health_snapshots s")).scalar_one()
+        _apply_output_migration(snapshot_db)
+        _apply_output_migration(snapshot_db)  # Re-run empty-schema guards safely.
+        with snapshot_db.connect() as conn:
+            after_div = conn.execute(text("SELECT row_to_json(d) FROM fundamental_divergence d")).scalar_one()
+            after_sector = conn.execute(text("SELECT row_to_json(s) FROM sector_health_snapshots s")).scalar_one()
+            assert after_div.pop("sec_generation") is None
+            assert after_sector.pop("sec_generation") is None
+            assert after_div == before_div
+            assert after_sector == before_sector
+            assert conn.execute(text("SELECT count(*) FROM fundamental_divergence_current")).scalar_one() == 0
+            assert conn.execute(text("SELECT count(*) FROM sector_health_snapshots_current")).scalar_one() == 0
+    finally:
+        _drop_test_outputs(snapshot_db)
+
+
+def test_pg_output_cache_tracks_real_peer_and_ttm_generation(output_db):
+    from utils.financial_cache import get_cached_financial, FinancialCacheUnavailable
+    from utils.ttl_cache import TTLCache
+    from store.sec_financial_snapshots import write_snapshot
+    from intelligence.company_financial_rollups import compute_ttm
+    write_snapshot(output_db, multi_quarter_snapshot())
+    cache = TTLCache()
+    calls = []
+
+    def build():
+        calls.append(len(calls))
+        return {"build": len(calls)}
+
+    assert get_cached_financial(cache, "ttm", output_db, build) == {"build": 1}
+    assert get_cached_financial(cache, "ttm", output_db, build) == {"build": 1}
+    compute_ttm(output_db)
+    assert get_cached_financial(cache, "ttm", output_db, build) == {"build": 2}
+    write_snapshot(output_db, snapshot(actor="aapl", empty=True))
+    assert get_cached_financial(cache, "ttm", output_db, build) == {"build": 3}
+    with output_db.begin() as conn:
+        conn.execute(text("ALTER VIEW sec_financial_generation RENAME TO sec_financial_generation_test_hidden"))
+    try:
+        with pytest.raises(FinancialCacheUnavailable):
+            get_cached_financial(cache, "ttm", output_db, build)
+        assert len(calls) == 3
+    finally:
+        with output_db.begin() as conn:
+            conn.execute(text("ALTER VIEW sec_financial_generation_test_hidden RENAME TO sec_financial_generation"))
+
+
+def test_pg_late_divergence_write_is_hidden_after_head_advance(output_db):
+    from concurrent.futures import ThreadPoolExecutor
+    import time
+    from intelligence.fundamental_divergence import _upsert_divergence_chunk
+    from store.sec_financial_snapshots import write_snapshot
+    old_generation = _generation(output_db)
+    with output_db.begin() as conn:
+        conn.execute(text("""CREATE FUNCTION sec_test_pause_report() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM pg_advisory_xact_lock(7363002); RETURN NEW; END $$"""))
+        conn.execute(text("""CREATE TRIGGER sec_test_pause_report BEFORE INSERT ON fundamental_divergence
+            FOR EACH ROW EXECUTE FUNCTION sec_test_pause_report()"""))
+
+    def late_write():
+        with output_db.begin() as conn:
+            return _upsert_divergence_chunk(conn, [_divergence_candidate(old_generation)])
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with output_db.connect() as lock:
+                lock.execute(text("SELECT pg_advisory_lock(7363002)"))
+                try:
+                    future = pool.submit(late_write)
+                    deadline = time.monotonic() + 10
+                    while True:
+                        waiting = lock.execute(text("""SELECT count(*) FROM pg_locks
+                            WHERE locktype='advisory' AND objid=7363002 AND NOT granted""")).scalar_one()
+                        if waiting:
+                            break
+                        assert time.monotonic() < deadline, "Report did not reach controlled insert barrier"
+                        time.sleep(0.02)
+                    write_snapshot(output_db, snapshot(empty=True))
+                finally:
+                    lock.execute(text("SELECT pg_advisory_unlock(7363002)"))
+                assert future.result(timeout=10) == 1
+        with output_db.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM fundamental_divergence")).scalar_one() == 1
+            assert conn.execute(text("SELECT count(*) FROM fundamental_divergence_current")).scalar_one() == 0
+    finally:
+        with output_db.begin() as conn:
+            conn.execute(text("DROP TRIGGER sec_test_pause_report ON fundamental_divergence"))
+            conn.execute(text("DROP FUNCTION sec_test_pause_report()"))
+
+
+def test_pg_sector_snapshot_writer_rejects_newer_time_with_stale_generation(output_db, monkeypatch):
+    from datetime import date, datetime, timedelta, timezone
+    from intelligence import sector_health
+    from store.sec_financial_snapshots import write_snapshot
+    monkeypatch.setattr("analysis.sector_map.SECTOR_MAP", {"Technology": {}})
+    old_generation = _generation(output_db)
+    result = {"score": 60, "trend_30d": "stable", "components": {"margin": 0.6},
+              "sec_generation": old_generation}
+    monkeypatch.setattr(sector_health, "compute_sector_health", lambda *_: dict(result))
+    started = datetime(2026, 11, 1, tzinfo=timezone.utc)
+
+    def save(seconds):
+        return sector_health.snapshot_all_sectors(
+            output_db, snapshot_date=date(2026, 11, 1),
+            computed_at=started+timedelta(seconds=seconds),
+        )
+
+    assert save(0)["snapshots_written"] == 1
+    with output_db.connect() as conn:
+        before_report = conn.execute(text("SELECT * FROM sector_health_snapshots")).one()
+    write_snapshot(output_db, snapshot(empty=True))
+    result["score"] = 99
+    # A later wall clock does not authorize an old-source result to overwrite.
+    # The scheduler must retry the due day, not mark this as superseded/done.
+    with pytest.raises(sector_health.FinancialGenerationRetry):
+        save(10)
+    with output_db.connect() as conn:
+        assert conn.execute(text("SELECT * FROM sector_health_snapshots")).one() == before_report
+        assert conn.execute(text("SELECT count(*) FROM sector_health_snapshots_current")).scalar_one() == 0
+    result.update(score=80, sec_generation=_generation(output_db))
+    assert save(20)["snapshots_written"] == 1
+    with output_db.connect() as conn:
+        assert conn.execute(text("SELECT score FROM sector_health_snapshots_current")).scalar_one() == 80
+    # Keep existing timestamp/first-commit ordering protection too.
+    result["score"] = 90
+    assert save(20)["snapshots_stale_skipped"] == 1
+    with output_db.connect() as conn:
+        assert conn.execute(text("SELECT score FROM sector_health_snapshots_current")).scalar_one() == 80

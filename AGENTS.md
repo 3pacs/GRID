@@ -413,3 +413,28 @@ Verification and limits:
 - 25 disposable PostgreSQL tests pass, including empty-schema initialization,
   grid-role view/insert access and populated-ledger preservation. Fresh head CI
   remains required; no production state changed.
+
+
+## 2026-11-08 - Source-bound report and cache continuation (draft only)
+
+- Added SEC/TTM global generation binding and current views for divergence and
+  sector-health reports. Legacy/stale report rows remain retained evidence.
+  Computations check before/after reads; gated writes and current views reject
+  stale publication, including a late writer after a newer source commits.
+- Capital-flow, sector-health, divergence and percentile TTL caches validate
+  generation on every hit/build, isolate engines and fail closed on source churn.
+- Disabled new divergence signal fanout. Existing signal source families,
+  registry/materialized outputs and journal rows still require end-to-end
+  provenance/invalidation before rollout is complete. No evidence was erased.
+- Missing current-generation historical baselines produce unavailable trends,
+  never a fabricated stable trend. Regular source reobservations make historical
+  trends generally unavailable until explicitly rebound/recomputed.
+- 398 offline financial/scheduler tests passed (9 optional skips); 35 isolated PostgreSQL tests
+  passed with role grants, raw preservation, peer/TTM invalidation and a real
+  late-writer race. Full exact-head CI remains required after the draft push.
+- No production access, mutation, historical repair executor, deployment or merge.
+  Remaining operational gates are documented in SEC_FINANCIAL_PERIOD_INTEGRITY.md.
+
+- Independent review caught retry-status ambiguity: source-version failures and
+  rejected writes now raise retryable errors rather than marking Hermes due work
+  done as empty/superseded. Postcommit checks and 22 dedicated regressions cover it.
