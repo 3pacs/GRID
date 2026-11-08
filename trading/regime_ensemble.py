@@ -269,8 +269,11 @@ def window_report(
             continue
         out["annualised_return"][c] = float((1 + r).prod() ** (12 / len(r)) - 1)
         out["sharpe"][c] = float(r.mean() / r.std(ddof=1) * math.sqrt(12)) if r.std(ddof=1) > 0 else None
-    if "Enrgy" in rets.columns and LS_BENCHMARK in rets.columns:
-        out["energy_minus_market_annualised"] = out["annualised_return"]["Enrgy"] - out["annualised_return"][LS_BENCHMARK]
+    ar = out["annualised_return"]
+    if "Enrgy" in ar and LS_BENCHMARK in ar:
+        out["energy_minus_market_annualised"] = ar["Enrgy"] - ar[LS_BENCHMARK]
+    else:
+        out["energy_minus_market_annualised"] = None
     cell_slice = cells.loc[start:end].dropna()
     out["cells_in_force"] = {str(k): int(v) for k, v in cell_slice.value_counts().items()}
     for name, s in (extra or {}).items():
