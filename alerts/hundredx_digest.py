@@ -812,15 +812,17 @@ def _kv_table(rows: list[tuple[str, str]]) -> str:
     return f'<table class="kv">{body}</table>'
 
 
-def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
+def _format_opportunity_card(opp: dict, verification: dict, index: int,
+                             rendered_on: date | None = None) -> dict:
     """One call: the exact contract, its quote, the math, and why — with dates.
 
     Every number is either measured (with its source and time) or rendered
-    as N/A. Nothing is filled in.
+    as N/A. Nothing is filled in. ``rendered_on`` (default: today, UTC) is the
+    date staleness is judged against.
     """
     ticker = opp["ticker"]
     direction = opp["direction"]
-    rendered_on = datetime.now(timezone.utc).date()
+    rendered_on = rendered_on or datetime.now(timezone.utc).date()
     today = _calendar_date(opp.get("as_of")) or rendered_on
     spot = verification.get("live_spot") or opp.get("spot_price")
     spot_source = verification.get("spot_source") or (

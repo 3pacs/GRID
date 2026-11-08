@@ -360,7 +360,9 @@ def _card_inputs():
 
 def test_card_states_the_exact_call():
     opp, v = _card_inputs()
-    card = hx._format_opportunity_card(opp, v, 1)
+    # Rendered on the idea date: from 2026-11-08 the real date is more than
+    # MAX_SIGNAL_AGE_DAYS past the fixture's signal and the card says STALE.
+    card = hx._format_opportunity_card(opp, v, 1, rendered_on=TODAY)
     plain = hx._plain(card["body"])
 
     assert card["title"] == "#1 — OMER PUTS (UNPROVEN)"
@@ -378,6 +380,13 @@ def test_card_states_the_exact_call():
     assert "<b>high</b>" not in card["body"]            # ... not injected
     # The fictional payoff multiple is gone.
     assert "Payoff" not in card["body"] and "x</div>" not in card["body"]
+
+
+def test_card_marks_a_signal_stale_at_rendering():
+    opp, v = _card_inputs()
+    plain = hx._plain(hx._format_opportunity_card(
+        opp, v, 1, rendered_on=TODAY + timedelta(days=hx.MAX_SIGNAL_AGE_DAYS + 1))["body"])
+    assert "(0d old at idea date); STALE at rendering (5d old)" in plain
 
 
 def test_card_labels_missing_catalyst_and_signal_date():
