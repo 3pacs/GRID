@@ -88,7 +88,11 @@ DATA_SECTION_MARKERS = ("\n## Market Data Snapshot", "\n## Equities\n", "\n## Eq
                         "\n## Credit\n", "\n## Volatility\n", "\n## Commodities\n", "\n## Fx\n",
                         "\n## Equity ETF Proxies", "\n## Macro\n", "\n## Retained Feature Evidence",
                         "\n## Latest Regime", "\n### Feature evidence declarations", "\n**Unverified figures:**")
-EXTRACTION_VERSION = "extract-v2"   # bump when EXTRACTION_SYSTEM or the claim schema changes: invalidates the cache
+EXTRACTION_VERSION = "extract-v3"   # bump when EXTRACTION_SYSTEM or the claim schema changes: invalidates the cache
+EXTRACTION_NUM_PREDICT = 1500
+#: Reply shapes that are a property of (model, prompt, text) at temperature 0: calling again
+#: gives the same answer, so they are cached like a result. Provider/transport faults are not.
+DETERMINISTIC_EXTRACTION_ERRORS = frozenset({"empty reply", "reply is not a JSON array", "reply is not valid JSON"})
 NY = ZoneInfo("America/New_York")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 PUBLICATION_ID = re.compile(r"(market_briefings|thesis_snapshots|market_diary):([0-9]{1,9})")
@@ -488,6 +492,15 @@ class Extraction:
     error: str | None = None
 
 
+def _thinking_off(client: Any) -> dict[str, Any]:
+    """``enable_thinking=False`` for clients whose chat() names it (llama.cpp); nothing for the rest."""
+    try:
+        from llm.router import supported_chat_kwargs
+        return supported_chat_kwargs(client, enable_thinking=False)
+    except Exception:
+        return {}
+
+
 def _client_label(client: Any) -> str:
     return f"{type(client).__name__}/{getattr(client, 'model', None) or 'unknown'}"
 
@@ -497,8 +510,12 @@ def extract_claims(client: Any, window: str) -> Extraction:
         return Extraction([], "none", "no LLM provider available")
     label = _client_label(client)
     try:
+        # A reasoning model otherwise spends the whole budget thinking and returns no content
+        # (grid-svr oracle, 2026-11-08: finish=length after 21,800 reasoning chars, 3 min, nothing
+        # to parse). Structured extraction wants the answer, not the deliberation.
         reply = client.chat([{"role": "system", "content": EXTRACTION_SYSTEM},
-                             {"role": "user", "content": window}], temperature=0.0, num_predict=2048)
+                             {"role": "user", "content": window}], temperature=0.0,
+                            num_predict=EXTRACTION_NUM_PREDICT, **_thinking_off(client))
     except Exception as exc:  # a provider fault is a grading reason, not a crash
         return Extraction([], label, f"provider error: {type(exc).__name__}")
     if not isinstance(reply, str) or not reply.strip():
@@ -571,14 +588,14 @@ def cached_extraction(folder: Path, pub: Publication, client_factory: Any, *, pe
     try:
         if cache.exists():
             stored = json.loads(read_regular_file(cache, 4_000_000).decode("utf-8"))
-            if isinstance(stored, dict) and stored.get("cache_key") == key and not stored.get("error") \
-                    and isinstance(stored.get("model"), str):
-                return Extraction(validate_items(stored.get("claims"), window), stored["model"])
+            if isinstance(stored, dict) and stored.get("cache_key") == key and isinstance(stored.get("model"), str) \
+                    and (not stored.get("error") or stored.get("error") in DETERMINISTIC_EXTRACTION_ERRORS):
+                return Extraction(validate_items(stored.get("claims"), window), stored["model"], stored.get("error") or None)
     except (OSError, Refused, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         pass
     extraction = extract_claims(client_factory(), window)
-    if not persist:
-        return extraction
+    if not persist or (extraction.error and extraction.error not in DETERMINISTIC_EXTRACTION_ERRORS):
+        return extraction   # transient faults (no provider, transport) are retried next run, never cached
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
         write_file(cache, json.dumps({"publication_id": pub.id, "publication_sha256": pub.sha256, "cache_key": key,
