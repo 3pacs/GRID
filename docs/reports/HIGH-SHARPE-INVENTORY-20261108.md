@@ -304,3 +304,63 @@ also at the descriptive 10 bp run.
 
 Per the registration: no shadow book, no governance row; v5 (combinations of arms that beat SPY on
 Sharpe in their own look) is registered with 278 + its ensemble configurations, before its look.
+
+## 8. Set v5 — combination of the thirteen arms that beat SPY's Sharpe (look 2026-11-08T08:16Z, code `1e53fb37`)
+
+Registration `docs/paper_log/high-sharpe-ensemble-v5-preregistration.md`; record
+`docs/reports/high-sharpe-ensemble-v5-look-20261108T0816Z.{json,md}`. Qualification rule (own-look
+Sharpe > SPY's) selected 13 weekly arms from v1–v3 (none from v4); primary combination =
+inverse-volatility over all 13 with no selection; secondary = the v1 top-3 selector; cumulative
+trials 280; no exclusions (33 tickers, all Tiingo).
+
+**Verdict: FAIL** — three of four parts pass (Sharpe > SPY **yes**, DSR 0.995 **yes**, drawdown no
+worse **yes**), the excess-return bound does not.
+
+| series | Sharpe | ann. return | max DD | total | excess vs SPY weekly, 95 % LB |
+|---|---|---|---|---|---|
+| **primary: inverse-vol over all 13 arms** | **1.08** | 8.9 % | **−11.9 %** | +133 % | mean −0.115 %, LB −0.217 % |
+| SPY buy-and-hold | 0.87 | 14.3 % | −31.8 % | +275 % | — |
+| 1/N over the 13 arms | 1.10 | 9.9 % | −13.2 % | +155 % | |
+| secondary: top-3 selector | 0.76 | 7.7 % | −20.9 % | +109 % | LB −0.253 % |
+| best arm in hindsight: `vol_target_qqq_W` | 1.07 | 11.2 % | −15.9 % | +185 % | −0.237 % (α/13) |
+
+- The combination is what the inputs promised: Sharpe 1.08 at a third of SPY's drawdown, turnover
+  3.2 round trips a year, DSR 0.995 at 280 trials (the per-week Sharpe 0.149 is far above the
+  280-trial threshold 0.027). It is the best risk-adjusted paper book this programme produced.
+- It still returns 5.4 points a year less than SPY, because every component holds less than 100 %
+  equity most of the time and nothing here may borrow. The mean pairwise correlation of the 13 arms
+  is 0.73: three return sources (SPY beta with a brake, trend, rotation), not thirteen.
+- The selector lost to no-selection a third time (0.76 vs 1.08). PBO 0.82 over these 13 arms says
+  trailing Sharpe is anti-informative for picking among them.
+
+Per the registration and Anik's 2026-11-08 instruction ("stop if v5 fails"): no shadow book, no
+governance row, the programme stops here.
+
+## 9. What the five sets say, together
+
+| set | arms | cumulative trials | ensemble Sharpe | SPY Sharpe | excess LB (weekly) | verdict |
+|---|---|---|---|---|---|---|
+| v1 GRID's existing rules | 7 | 248 | 0.78 | 0.87 | −0.249 % | FAIL |
+| v2 trend / dual momentum | 12 | 261 | 0.62 | 0.87 | −0.242 % | FAIL |
+| v3 vol-managed / risk parity | 8 | 270 | 0.82 | 0.87 | −0.260 % | FAIL |
+| v4 daily mean reversion (20 bp) | 6 | 278 | 0.22 | 0.84 | −0.085 % (daily) | FAIL |
+| v5 inverse-vol over 13 Sharpe-qualified arms | 13 | 280 | **1.08** | 0.87 | −0.217 % | FAIL |
+
+1. **Nothing beats SPY on excess return after costs** over 2017–2026, at 95 %, in any set. Every
+   rule that improves on SPY's Sharpe does it by holding less equity, and without leverage that
+   caps return below buy-and-hold in a decade that paid 14 % a year for holding the index.
+2. **Risk-adjusted, the picture is different**: twelve documented rules plus adaptive rotation
+   each beat SPY's Sharpe out of sample, and their inverse-vol combination reaches 1.08 with an
+   11.9 % drawdown. "Worth watching" as Anik defined it requires excess return, so this does not
+   qualify; a criterion of "alpha at equal volatility" (vol-targeting the combination to SPY's
+   realised volatility, i.e. 1.5–2× leverage) would be the honest way to ask whether that Sharpe is
+   money, and it is a new decision and a new registration, not something to be read off these runs.
+3. **The selection layer is harmful.** In every set with a 1/N control, trailing-Sharpe top-k lost
+   to holding all arms (v2 0.62 vs 0.77, v3 0.82 vs 1.07, v5 0.76 vs 1.10). An "amalgamation that
+   picks a few winners" should not pick; it should hold and risk-weight.
+4. **Costs decide the short horizon.** Daily mean reversion goes from Sharpe 0.67 at 10 bp to 0.22
+   at 20 bp per side; nothing at that horizon survives realistic friction on SPY/QQQ.
+5. **The data finding stands above all of this**: the `{ticker}_full` panel GRID's own strategies
+   read is corrupted (§3), the rotation sweep's Sharpe 4.6 is an artefact, and a fix is in flight in
+   a separate session (`claude/fix-full-panel-vintages-20261108`). Until it lands, every price
+   backtest should read Tiingo `adj_close` through `store.observations`, as these five did.
