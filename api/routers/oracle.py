@@ -23,6 +23,7 @@ from oracle.entry_price_policy import (
 )
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/oracle", tags=["oracle"])
 
@@ -215,6 +216,36 @@ def get_scoreboard(
     """Model tournament: overall accuracy, by-model, by-ticker, calibration."""
     engine = get_db_engine()
     return build_oracle_scoreboard(engine)
+
+
+# ── GET /evidence ──────────────────────────────────────────────────────────
+
+_evidence_cache: TTLCache = TTLCache(ttl=6 * 3600, max_size=1)
+
+
+@router.get("/evidence")
+def get_evidence(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Per-model evidence on corrected outcomes, clustered by expiry date.
+
+    Served from the ``oracle_evidence`` precompute job; until its first result
+    the route builds it here (a few seconds) and caches it for 6 h.
+    """
+    from api.precompute_serving import read_precomputed
+
+    stored, meta = read_precomputed("oracle.evidence")
+    if stored is not None:
+        stored["precompute"] = meta
+        return stored
+    cached = _evidence_cache.get("evidence")
+    if cached is not None:
+        return cached
+    from oracle.evidence import build_evidence, load_outcomes
+
+    built = build_evidence(load_outcomes(get_db_engine()))
+    _evidence_cache.set("evidence", built)
+    return built
 
 
 # ── GET /latest ────────────────────────────────────────────────────────────

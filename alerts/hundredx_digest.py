@@ -812,6 +812,11 @@ def _kv_table(rows: list[tuple[str, str]]) -> str:
     return f'<table class="kv">{body}</table>'
 
 
+def _utc_today() -> date:
+    """The rendering date; the card ages its inputs against it (tests pin it)."""
+    return datetime.now(timezone.utc).date()
+
+
 def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     """One call: the exact contract, its quote, the math, and why — with dates.
 
@@ -820,7 +825,7 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     """
     ticker = opp["ticker"]
     direction = opp["direction"]
-    rendered_on = datetime.now(timezone.utc).date()
+    rendered_on = _utc_today()
     today = _calendar_date(opp.get("as_of")) or rendered_on
     spot = verification.get("live_spot") or opp.get("spot_price")
     spot_source = verification.get("spot_source") or (

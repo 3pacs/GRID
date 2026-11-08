@@ -418,6 +418,14 @@ def build_levers(ctx: BuildContext) -> list[Output]:
     return [Output("intelligence.levers", {}, payload, ctx.now)]
 
 
+def build_oracle_evidence(ctx: BuildContext) -> list[Output]:
+    """``/oracle/evidence``: per-model evidence on corrected outcomes (see oracle/evidence.py)."""
+    from oracle.evidence import build_evidence, load_outcomes
+
+    payload = build_evidence(load_outcomes(ctx.engine))
+    return [Output("oracle.evidence", {}, payload, ctx.now)]
+
+
 def _options_signature(engine: Engine) -> str | None:
     with engine.connect() as conn:
         r = conn.execute(text(
@@ -581,6 +589,13 @@ JOBS: tuple[Job, ...] = (
         outputs=(("intelligence.levers", _p()),),
         empty_fields={"intelligence.levers": ("hierarchy", "summary", "cross_domain_actors")},
         description="Global lever hierarchy (/intelligence/levers); the route falls back to a live build until the first result.",
+    ),
+    Job(
+        name="oracle_evidence", cadence_s=6 * HOUR, stale_after_s=36 * HOUR, version="1",
+        build=build_oracle_evidence,
+        outputs=(("oracle.evidence", _p()),),
+        empty_fields={"oracle.evidence": ("summary", "models")},
+        description="Per-model oracle evidence on corrected outcomes, clustered by expiry (/oracle/evidence).",
     ),
     Job(
         name="options_100x", cadence_s=30 * MINUTE, stale_after_s=36 * HOUR, version="2",
