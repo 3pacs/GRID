@@ -79,17 +79,29 @@ def check_window(now: datetime, allow: bool = False) -> None:
 
 
 def mapped_series(feature: str, overrides: dict[str, list[str]] | None = None) -> list[str]:
-    """Raw series ids that resolve into ``feature`` (static mappings, no DB)."""
-    from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
+    """Raw series ids whose first pull bounds ``feature``'s honest vintages (static, no DB).
+
+    A ``{ticker}_full`` feature is fed by exactly one yfinance price field
+    under the PRICE BASIS POLICY (``normalization.entity_map``): ``adj_close``,
+    or ``close`` for the ``RAW_CLOSE_FULL_FEATURES`` allowlist (``spy_full`` by
+    the price-close receipt contract). Before 2026-11-08 ``close`` fed every
+    ``_full`` too, and those resolved rows are still in the table, so the legacy
+    ``close`` series is always included as well: the earliest SUCCESS pull of
+    either field is the floor below which a vintage cannot be honest.
+    """
+    from normalization.entity_map import (
+        FULL_PRICE_BASIS_FIELD,
+        NEW_MAPPINGS_V2,
+        RAW_CLOSE_FULL_FEATURES,
+        SEED_MAPPINGS,
+    )
 
     series = {sid for sid, name in {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}.items() if name == feature}
     if feature.endswith("_full"):
         ticker = feature[: -len("_full")].upper().replace("_", "-")
-        # Both price fields: adj_close is the basis of every equity ``_full``
-        # since 2026-11-08 (normalization.entity_map PRICE BASIS POLICY) and
-        # close fed them before that, so the first pull of either counts.
-        series.add(f"YF:{ticker}:close")
-        series.add(f"YF:{ticker}:adj_close")
+        basis = "close" if feature in RAW_CLOSE_FULL_FEATURES else FULL_PRICE_BASIS_FIELD
+        series.add(f"YF:{ticker}:{basis}")
+        series.add(f"YF:{ticker}:close")  # legacy feed of every _full before 2026-11-08
     series.update((overrides or {}).get(feature, []))
     return sorted(series)
 
