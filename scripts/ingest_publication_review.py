@@ -62,7 +62,10 @@ DEFAULT_REVIEW_ROOT = Path(os.environ.get("GRID_PUBLICATION_REVIEW_ROOT",
 DEFAULT_PACKET_ROOT = Path(os.environ.get("GRID_PUBLICATION_PACKET_ROOT",
                                           "~/research/publication-packets")).expanduser()
 DEFAULT_LOOKBACK_DAYS = 3
-MAX_FILE_BYTES = 8_000_000
+MAX_FILE_BYTES = 8_000_000       # review.jsonl, receipt.json
+# packet.json carries each publication's text twice (text + source_record) under the producer's
+# 8 MB aggregate text cap: real days measured 7-24 MB (2026-11-04..07). The 8 MB cap refused them all.
+MAX_PACKET_BYTES = 64_000_000
 MIN_SPAN_CHARS, MAX_SPAN_CHARS = 8, 300
 MAX_EVIDENCE_ITEMS = 20
 MAX_EVIDENCE_BYTES = 20_000
@@ -266,7 +269,7 @@ def load_packet(packet_root: Path, day: date) -> Packet:
     expected = receipt.get("packet_sha256") if isinstance(receipt, dict) else None
     if not isinstance(expected, str) or not HEX64.fullmatch(expected):
         raise Refused("receipt.json has no packet_sha256")
-    packet_bytes = read_regular_file(packet_path, MAX_FILE_BYTES)
+    packet_bytes = read_regular_file(packet_path, MAX_PACKET_BYTES)
     actual = sha256(packet_bytes)
     if actual != expected:
         raise Refused(f"packet.json sha256 {actual[:12]} != receipt packet_sha256 {expected[:12]}")
@@ -606,7 +609,7 @@ def ingest(engine, day: date, *, review_root: Path = DEFAULT_REVIEW_ROOT, packet
         receipt.update(state="REFUSED", reason=str(exc))
         _write_receipt(folder, receipt, now, dry_run)
         return receipt
-    except Exception as exc:  # noqa: BLE001 - a DB/IO failure must leave a receipt; the type is the public reason
+    except Exception as exc:  # a DB/IO failure must leave a receipt; the type is the public reason
         traceback.print_exc(file=sys.stderr)
         receipt.update(state="FAILED", reason=type(exc).__name__)
         _write_receipt(folder, receipt, now, dry_run)
