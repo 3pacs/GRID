@@ -186,20 +186,20 @@ SEED_MAPPINGS: dict[str, str] = {
     "YF:^VIX:close": "vix_spot",      # TYPO-FIX: vix_spot_yf not in registry, vix_spot exists
     "YF:HG=F:close": "copper",        # TYPO-FIX: copper_futures_close not in registry, copper exists
     "YF:GC=F:close": "gold_full",     # TYPO-FIX: gold_futures_close not in registry, gold_full exists
-    # CONFLICT-FIX: V2 maps these to *_full (which exists in registry with data).
-    # SEED previously mapped to *_close (not in registry). V2 is correct.
-    "YF:HYG:close": "hyg_full",     # was hyg_close (not in registry)
-    "YF:LQD:close": "lqd_full",     # was lqd_close (not in registry)
-    "YF:TLT:close": "tlt_full",     # was tlt_close (not in registry)
+    # HYG / LQD / TLT: ``*_full`` is fed by ``YF:<T>:adj_close`` only (the V2
+    # comprehensions below). Their raw ``close`` used to map here as well,
+    # which put two adjustment bases into one feature -- see
+    # PRICE BASIS POLICY further down and docs/reference/PRICE_PANEL_BASIS.md.
     "YF:UUP:close": "uup_etf_close",      # UUP ETF price (~$27), NOT DXY
     "YF:DX-Y.NYB:close": "dxy_index",     # Actual US Dollar Index (~104)
     # Sector-map proxy ETFs and tickers
-    "YF:TSM:close": "tsm_full",       # TYPO-FIX: tsm_close not in registry, tsm_full exists
+    # ``*_full`` = adj_close basis (PRICE BASIS POLICY below); ``*_close`` = raw close.
+    "YF:TSM:adj_close": "tsm_full",   # tsm_close not in registry, tsm_full exists
     "YF:SMH:close": "smh_close",
-    "YF:KRE:close": "kre_full",       # TYPO-FIX: kre_close not in registry, kre_full exists
+    "YF:KRE:adj_close": "kre_full",   # kre_close not in registry, kre_full exists
     "YF:ICLN:close": "icln_close",
     "YF:LIT:close": "lit_close",
-    "YF:XBI:close": "xbi_full",       # TYPO-FIX: xbi_close not in registry, xbi_full exists
+    "YF:XBI:adj_close": "xbi_full",   # xbi_close not in registry, xbi_full exists
     "YF:ITA:close": "ita",            # TYPO-FIX: ita_close not in registry, ita exists
 
     # ── Unmapped FRED macro series ──────────────────────────────────────────
@@ -838,19 +838,19 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # going nowhere. Their features already exist: btc_usd_full id=2787,
     # eth_usd_full id=2788, sol_usd_full id=2789 (verified on griddb), so
     # these are mappings only, no feature_registry insert needed.
+    # Crypto has no splits or dividends, so ``close`` is the basis and
+    # ``adj_close`` (numerically identical at Yahoo) is deliberately NOT
+    # mapped: one price field per feature (PRICE BASIS POLICY below).
     "YF:BTC-USD:close": "btc_usd_full",
-    "YF:BTC-USD:adj_close": "btc_usd_full",
     "YF:ETH-USD:close": "eth_usd_full",
-    "YF:ETH-USD:adj_close": "eth_usd_full",
     # SOL is pre-positioned, not a live win: sol_usd_full is registered but
     # YF:SOL-USD:close had 0 rows in the 30 d to 2026-09-11 — the puller is
     # not currently producing it. Mapping it now is inert and becomes correct
     # the moment it does, rather than being a second thing to remember.
     "YF:SOL-USD:close": "sol_usd_full",
-    "YF:SOL-USD:adj_close": "sol_usd_full",
     "YF:TAO-USD:close": "tao_chain_market_cap",
     "YF:TAO-USD:volume": "tao_chain_total_volume",
-    "YF:BRK-B:close": "brk-b_full",
+    "YF:BRK-B:adj_close": "brk-b_full",   # adj_close basis (PRICE BASIS POLICY)
 
     # CBOE indices (bulk CSV)
     "CBOE:VIX": "vix_spot",
@@ -1009,8 +1009,8 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "treasury_2y": "yc_2y",
     "treasury_30y": "yc_30y",
 
-    # AstroGrid scorecard universe — canonical close prices
-    "YF:QQQ:close": "qqq_full",
+    # AstroGrid scorecard universe — canonical close prices. qqq_full is fed
+    # by YF:QQQ:adj_close (V2 comprehension), never by the raw close.
     "YF:CL=F:close": "cl_close",
 
     # ── CBOE vol self-mappings (puller writes feature name as series_id) ──
@@ -1053,13 +1053,33 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "WEB:ism_pmi_new_orders": "ism_pmi_new_orders",
 
     # ── Tiingo/yfinance ticker → _full features ────────────────────
-    # PREFER adj_close (split-adjusted) over raw close.
-    # Both map to the same _full feature; resolver priority picks the winner.
-    # adj_close entries come first so they take precedence.
     #
-    # Mega caps — adj_close (split-adjusted, no manual split detection needed)
+    # PRICE BASIS POLICY (2026-11-08, docs/reference/PRICE_PANEL_BASIS.md):
+    # exactly ONE price field feeds a ``{ticker}_full`` feature.
+    #
+    #   * ``YF:<T>:adj_close`` (Tiingo ``adjClose`` and Yahoo ``Adj Close``:
+    #     split- AND dividend-adjusted as of the pull) is the basis of every
+    #     equity/ETF ``_full`` feature.
+    #   * ``YF:<T>:close`` never maps onto a ``_full`` feature except for the
+    #     instruments in RAW_CLOSE_FULL_FEATURES (no corporate actions, or
+    #     pinned by contract -- spy_full is the unadjusted SPY close receipt,
+    #     price_close_contract.SPY_CLOSE_FEATURE).
+    #
+    # Until this policy both fields mapped onto one feature. The resolver
+    # resolves per series_id, so ``close`` and ``adj_close`` each produced a
+    # candidate for the same (feature, obs_date, vintage) and whichever
+    # insert ran first won; on days only one field was pulled it won alone.
+    # Successive vintages of one obs_date therefore alternated between raw
+    # and adjusted closes (NVDA 2021-07-19: 751.19 vs 18.74), LATEST_AS_OF
+    # read the flips as -97 % "splits", and the universal split adjuster
+    # compounded them into first-to-last ratios of 10^201 for XLP
+    # (docs/reports/HIGH-SHARPE-INVENTORY-20261108.md §3).
+    # ``price_basis_conflicts()`` and tests/test_full_panel_basis.py keep
+    # this policy from regressing.
+    #
+    # Mega caps and index ETFs — adj_close basis (SPY excluded: see below)
     **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
-        "SPY", "QQQ", "IWM", "DIA",
+        "QQQ", "IWM", "DIA",
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
         "JPM", "V", "MA", "UNH", "JNJ", "PG", "HD", "BAC",
         "AVGO", "COST", "LLY", "MRK", "PFE", "ABBV", "TMO", "PEP", "KO",
@@ -1074,40 +1094,78 @@ NEW_MAPPINGS_V2: dict[str, str] = {
         "AMT", "PLD", "CCI", "SPG",
         "COIN", "MSTR",
     ]},
-    # Mega caps — raw close as FALLBACK (when adj_close is missing)
-    **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
-        "SPY", "QQQ", "IWM", "DIA",
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
-        "JPM", "V", "MA", "UNH", "JNJ", "PG", "HD", "BAC",
-        "AVGO", "COST", "LLY", "MRK", "PFE", "ABBV", "TMO", "PEP", "KO",
-        "CRM", "AMD", "INTC", "GS", "BLK", "LMT", "RTX", "GD",
-        "CVX", "XOM", "EOG", "DVN", "PYPL", "CMCSA", "SIRI",
-        "NFLX", "DIS", "CSCO", "ORCL", "ADBE", "ACN", "IBM", "TXN", "QCOM",
-        "WMT", "LOW", "TGT", "SBUX", "MCD", "NKE",
-        "CAT", "DE", "MMM", "HON", "GE", "BA",
-        "AXP", "C", "WFC", "MS", "SCHW",
-        "T", "VZ", "TMUS",
-        "NEE", "DUK", "SO", "D",
-        "AMT", "PLD", "CCI", "SPG",
-        "COIN", "MSTR",
-    ]},
-    # Sector ETFs — adj_close preferred
+    # SPY is the one equity ``_full`` on the raw close: spy_full is the
+    # receipted unadjusted SPY close (price_close_contract.py, written only
+    # by Resolver._resolve_spy_close_receipt). YF:SPY:adj_close is NOT
+    # mapped -- the resolver already refused to let it occupy a spy_full
+    # vintage, and an unmapped series cannot be mistaken for a feed.
+    "YF:SPY:close": "spy_full",
+    # Sector ETFs — adj_close basis
     **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",
     ]},
-    **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
-        "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLB", "XLC",
-    ]},
-    # Bond/commodity ETFs — adj_close preferred
+    # Bond/commodity ETFs — adj_close basis
     **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
-        "GLD", "SLV", "USO", "UNG",
-        "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
-    ]},
-    **{f"YF:{t}:close": f"{t.lower()}_full" for t in [
         "GLD", "SLV", "USO", "UNG",
         "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
     ]},
 }
+
+
+# ── Price basis policy for ``*_full`` features ─────────────────────────────
+
+#: The raw price field that feeds an equity/ETF ``{ticker}_full`` feature.
+FULL_PRICE_BASIS_FIELD = "adj_close"
+
+#: ``_full`` features whose basis is the as-traded ``close`` instead: instruments
+#: with no splits or dividends (indices, futures, crypto -- Yahoo's adj_close
+#: equals close for them) and spy_full, pinned to the unadjusted SPY close by
+#: price_close_contract.py. Everything else that ends in ``_full`` must be fed
+#: by ``adj_close`` alone; ``price_basis_conflicts()`` enforces it.
+RAW_CLOSE_FULL_FEATURES: frozenset[str] = frozenset({
+    "spy_full",      # price_close_contract.SPY_CLOSE_FEATURE (receipted raw close)
+    "sp500_full",    # YF:^GSPC:close -- index level
+    "gold_full",     # YF:GC=F:close -- futures
+    "btc_usd_full",  # crypto: no corporate actions
+    "eth_usd_full",
+    "sol_usd_full",
+})
+
+_YF_PRICE_FIELD_RE = re.compile(r"^YF:(?P<ticker>[^:]+):(?P<field>close|adj_close)$")
+
+
+def price_basis_conflicts(mappings: dict[str, str] | None = None) -> dict[str, dict[str, str]]:
+    """Features that would receive more than one price basis, or the wrong one.
+
+    Returns ``{feature_name: {series_id: field, ...}}`` for every mapped
+    feature that (a) is fed by both a ``close`` and an ``adj_close`` series,
+    or (b) ends in ``_full``, is fed by a ``close`` series and is not in
+    :data:`RAW_CLOSE_FULL_FEATURES`. An empty dict means the policy holds.
+
+    Pure: reads ``mappings`` (default: the merged static SEED_MAPPINGS and
+    NEW_MAPPINGS_V2) and touches no database. The resolver logs the result
+    once per run; tests/test_full_panel_basis.py asserts it is empty.
+    """
+    if mappings is None:
+        mappings = {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}
+    fields_by_feature: dict[str, dict[str, str]] = {}
+    for sid, feature in mappings.items():
+        m = _YF_PRICE_FIELD_RE.match(sid)
+        if m is None:
+            continue
+        fields_by_feature.setdefault(feature, {})[sid] = m.group("field")
+    conflicts: dict[str, dict[str, str]] = {}
+    for feature, by_sid in fields_by_feature.items():
+        fields = set(by_sid.values())
+        mixed = len(fields) > 1
+        wrong_full = (
+            feature.endswith("_full")
+            and "close" in fields
+            and feature not in RAW_CLOSE_FULL_FEATURES
+        )
+        if mixed or wrong_full:
+            conflicts[feature] = dict(sorted(by_sid.items()))
+    return conflicts
 
 
 # ── Dynamic pattern resolution for per-ticker yfinance OHLCV ──────────────
@@ -1143,14 +1201,18 @@ _YF_SERIES_RE = re.compile(
 
 # Candidate name suffixes per field, most-canonical first.  Every suffix here
 # is a convention already present in SEED_MAPPINGS / NEW_MAPPINGS_V2:
-#   *_full          — sp500_full, tlt_full, btc_usd_full, the *_full comprehensions
-#   *_close         — smh_close, icln_close, lit_close, cl_close, uup_etf_close
+#   *_full          — tlt_full, nvda_full, the *_full comprehensions (adj_close basis)
+#   *_close         — smh_close, icln_close, lit_close, cl_close, uup_etf_close (raw close)
 #   *_total_volume  — btc_total_volume, eth_total_volume, sol_total_volume
 # Price fields never list a volume suffix and vice versa, so a close can
-# never land on a volume feature.
+# never land on a volume feature.  Since 2026-11-08 the two price fields
+# also never share a suffix: ``adj_close`` is the only field that may reach
+# a ``_full`` feature and ``close`` the only one that may reach a ``_close``
+# feature (PRICE BASIS POLICY above).  Before that, ``close`` fell back onto
+# ``_full`` too and the same feature received both bases.
 _YF_FIELD_SUFFIXES: dict[str, tuple[str, ...]] = {
-    "adj_close": ("_full", "_close", "_adj_close"),
-    "close": ("_full", "_close"),
+    "adj_close": ("_full", "_adj_close"),
+    "close": ("_close",),
     "open": ("_open",),
     "high": ("_high",),
     "low": ("_low",),
@@ -1632,6 +1694,15 @@ class EntityMap:
         )
         self._check_feature_freshness(resolved_name, feature_id)
         return feature_id
+
+    def mixed_basis_features(self) -> dict[str, dict[str, str]]:
+        """Static mappings that feed one feature from two price bases.
+
+        See :func:`price_basis_conflicts`; evaluated over the merged
+        SEED_MAPPINGS (V2 already loaded). Empty when the policy holds. The
+        resolver logs a warning per run when it is not.
+        """
+        return price_basis_conflicts(SEED_MAPPINGS)
 
     def _detect_duplicate_mappings(self) -> None:
         """Log warnings for raw_ids that appear in both SEED and V2 with

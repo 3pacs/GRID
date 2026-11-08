@@ -10,7 +10,8 @@ series. Per feature this script reports, with bounded queries:
   ``vintage_date = obs_date`` too;
 * ``first_raw_pull``: the earliest SUCCESS ``raw_series.pull_timestamp`` over the
   feature's mapped series ids (``normalization.entity_map`` seeds, plus
-  ``YF:<TICKER>:close`` for ``<ticker>_full``, plus ``--series`` overrides).
+  ``YF:<TICKER>:close`` and ``YF:<TICKER>:adj_close`` for ``<ticker>_full``,
+  plus ``--series`` overrides).
   Every source is counted: Tiingo also writes ``YF:<TICKER>:close`` (under its
   own source id), so its pulls are included;
 * ``backdated_before_first_pull``: backdated rows whose ``obs_date`` precedes
@@ -83,7 +84,12 @@ def mapped_series(feature: str, overrides: dict[str, list[str]] | None = None) -
 
     series = {sid for sid, name in {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}.items() if name == feature}
     if feature.endswith("_full"):
-        series.add(f"YF:{feature[: -len('_full')].upper().replace('_', '-')}:close")
+        ticker = feature[: -len("_full")].upper().replace("_", "-")
+        # Both price fields: adj_close is the basis of every equity ``_full``
+        # since 2026-11-08 (normalization.entity_map PRICE BASIS POLICY) and
+        # close fed them before that, so the first pull of either counts.
+        series.add(f"YF:{ticker}:close")
+        series.add(f"YF:{ticker}:adj_close")
     series.update((overrides or {}).get(feature, []))
     return sorted(series)
 
