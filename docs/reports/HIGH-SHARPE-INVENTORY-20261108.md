@@ -364,3 +364,107 @@ governance row, the programme stops here.
    read is corrupted (§3), the rotation sweep's Sharpe 4.6 is an artefact, and a fix is in flight in
    a separate session (`claude/fix-full-panel-vintages-20261108`). Until it lands, every price
    backtest should read Tiingo `adj_close` through `store.observations`, as these five did.
+
+## 10. Set v6 — regime-conditional selection from external factors, with a long-sample check (look 2026-11-08T08:53Z, code `dc812665`; long-sample correction 08:57Z, code `f74733b0`)
+
+Registration `docs/paper_log/high-sharpe-ensemble-v6-preregistration.md`; records
+`docs/reports/high-sharpe-ensemble-v6-look-20261108T0853Z.{json,md}` and
+`high-sharpe-ensemble-v6-correction-20261108T0857Z.{json,md}`. Six external-factor cells (CPI,
+industrial production, Baa−Aaa, WTI; stress and oil-shock overrides; 50-day publication lag), the
+27 weekly arms of v1–v3 under regime-conditional top-3 selection, a monthly long-sample arm on
+Kenneth French portfolios 1926–2026 with bonds from Treasury yields and WTI, eight named analog
+windows, cumulative trials 492. Downloads recorded by sha256 (French 2026-09 CRSP build, FRED
+`fredgraph.csv`, GPR); downloaded INDPRO/FEDFUNDS agree with griddb's FRED rows from 1990 (98 %
+of INDPRO within 0.1 %, FEDFUNDS exact).
+
+**Defect, disclosed:** the first record's long-sample section benchmarked against `SPY`, which the
+French panel does not contain, so its "market" line reads zero. The ETF-era result and the raw
+analog-window asset returns are unaffected; the correction record re-runs the long-sample part
+against the market (`MKT`) with no other change and does not alter the verdict, because part (a)
+failed on its own.
+
+**Today's regime (as known 2026-11-07/08, observation month 2026-09): `expand_reflate`** — CPI
+3.7 % y/y against 3.0 % a year earlier, industrial production +2.2 %, Baa−Aaa 0.44 against a
+stress threshold of 1.04, WTI six-month change +6 % (the March–June 2026 `oil_shock` months have
+rolled off), GPR 137 above its ten-year 90th percentile of 128. Nearest analogs by cell: 1946–48
+(16 of 35 months `expand_disinflate`, 12 `expand_reflate`), 1973–82 (41 of 119 `expand_reflate`,
+53 `stress`), 2021–23 (10 of 33).
+
+**Verdict: FAIL** — part (a), the watch criterion inside today's cell in the ETF era, fails on three
+of four counts; part (b), no contradiction in the long sample, holds (corrected run).
+
+| ETF era, 513 weeks | Sharpe | ann. return | max DD | excess vs SPY, 95 % LB |
+|---|---|---|---|---|
+| regime-conditional ensemble (top-3 in cell) | 0.78 | 7.4 % | −16.1 % | −0.261 % |
+| unconditional selector, same 27 arms (control) | 0.67 | 6.9 % | −19.5 % | −0.287 % |
+| SPY buy-and-hold | 0.87 | 14.3 % | −31.8 % | — |
+| 1/N over the 27 arms | 0.82 | 6.7 % | −13.7 % | |
+| best arm in hindsight: `vol_target_qqq_W` | 1.07 | 11.2 % | −15.9 % | |
+
+| ETF era by cell | weeks | ensemble Sharpe | SPY Sharpe | ensemble ann | SPY ann | excess LB |
+|---|---|---|---|---|---|---|
+| **`expand_reflate` (today)** | **145** | **0.06** | **0.14** | **0.1 %** | **0.9 %** | **−0.209 %** |
+| `contract_disinfl` | 144 | 1.23 | 1.67 | 11.8 % | 24.6 % | −0.352 % |
+| `expand_disinflate` | 87 | 1.40 | 1.36 | 10.1 % | 22.9 % | −0.531 % |
+| `stress` | 56 | 0.67 | 1.27 | 6.3 % | 24.6 % | −0.814 % |
+| `oil_shock` | 53 | 1.51 | 1.55 | 18.0 % | 23.4 % | −0.228 % |
+| `contract_reflate` | 28 (too thin) | −0.02 | −0.35 | −1.0 % | −18.3 % | −1.12 % |
+
+- Conditioning helped the selector (0.78 vs 0.67 unconditional, drawdown −16 % vs −20 %), and the
+  1/N control (0.82) is no longer clearly better. It still trails SPY, DSR is 0.00 at 492 trials, and
+  22 % of selections fell back to the unconditional window because a cell had too little history.
+- **Today's cell is the worst cell for equities in the ETF era**: over the 145 weeks labelled
+  `expand_reflate` since 2017, SPY returned 0.9 % a year with a −29 % drawdown and the ensemble
+  0.1 %. The arms with a record in this cell: `tsmom_12_1_assets_ma10_W` Sharpe 0.83 (5.5 %/yr),
+  `s151_xs_momentum` 0.76 (9.0 %/yr), `tsmom_12_1_assets_ma10_M` 0.72, `adaptive_rotation` 0.58
+  (8.0 %/yr), `tsmom_12_1_sectors_top3_ma10_M` 0.56 (7.8 %/yr), `ma10_spy_M` 0.49. Everything
+  volatility-managed or risk-parity (the v3 arms that led overall) drops to 0.03–0.40 in this cell,
+  and `vix_ma_exposure_spy` to 0.06. The picker's live choice on 2026-10-30 was
+  `s151_xs_momentum` + `tsmom_12_1_assets_ma10_W`. None of these has a positive excess bound in
+  the cell; with 145 weeks and SPY near flat, the cell cannot deliver one.
+
+**Long sample (corrected, monthly, 1936-01 → 2026-08, 1,088 months, 20 bp, bills as cash):**
+regime-conditional ensemble Sharpe 1.33 vs market 0.74 (1/N over the eight arms 1.19, best arm
+`ls_6040` 0.89), ann. return 9.9 % vs 10.9 % for the market, excess LB −0.50 %/month → the same
+shape as every ETF-era result: higher Sharpe, lower return. By cell: `expand_reflate` 307 months,
+ensemble 1.51 vs market 0.64, mean excess −0.01 %/month (flat); `oil_shock` 40 months, 2.03 vs
+0.79, +0.26 %/month; `stress` 217 months, 1.30 vs 0.64, −0.25 %; `contract_disinfl` 82 months,
+1.26 vs 1.62, −0.86 %. Part (b) holds: non-negative excess in today's cell (−0.0001, rounds to
+flat) and in 1946–48 (+0.26 %/month).
+
+| analog window (long sample) | months | cells in force | market | bills | bonds | energy − market | momentum factor | value factor | oil | ensemble vs market |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1946–48 post-war disinflation | 35 | disinfl 16, reflate 12 | −2.5 % | 0.6 % | 1.5 % | **+13.5 pts** | **+10.8 %** | +6.0 % | +31 % | +1.9 % vs −2.4 % |
+| 1973–82 great inflation | 119 | stress 53, reflate 41 | 7.9 % | **8.5 %** | 6.1 % | +2.1 pts | **+22.8 %** | +16.3 % | +25 % | 13.6 % vs 8.3 % |
+| 1973–74 embargo, Fed accommodated | 14 | oil 6, reflate 5 | **−31.6 %** | 7.9 % | 3.5 % | +10.3 pts | +35.7 % | +25.8 % | +126 % | 10.6 % vs −22.0 % |
+| 1979–81 Iran / Volcker | 35 | stress 21, reflate 7 | 15.3 % | 12.2 % | **−0.8 %** | +12.6 pts | +28.4 % | +11.5 % | +34 % | 16.3 % vs 13.9 % |
+| 1990–91 Gulf War | 7 | oil 4 | 36.9 % | 6.9 % | 17.2 % | −34.6 pts | 2.8 % | −5.7 % | −42 % | 6.0 % vs 32.1 % |
+| 2021–23 post-shock inflation | 33 | reflate 10, stress 9 | 6.4 % | 2.3 % | **−3.4 %** | **+21.8 pts** | 3.4 % | 9.5 % | +5 % | 5.8 % vs 6.6 % |
+| 2022 Russia | 10 | stress 6 | −15.0 % | 1.7 % | **−10.9 %** | **+51.2 pts** | +28.1 % | +18.1 % | −20 % | 0.1 % vs −7.2 % |
+| 2025-06 Israel–Iran | 1 | — | too short to read | | | | | | | |
+
+What the analog cells say, as data, against the hypothesis the brief asked to check:
+
+- **Energy vs the market**: energy beat the market by 10–50 points a year in every inflation and
+  oil-shock window except 1990, when the spike reversed within months and energy lagged by 35
+  points. The 1990 pattern is the case for "outcome known fast, shock fades".
+- **Momentum and value**: the momentum factor is the most consistent winner in the inflationary
+  windows (+11 % in 1946–48, +23 % in 1973–82, +36 % in the embargo, +28 % in 1979–81 and 2022);
+  value is positive in all of them. Both are long-short factors with no cheap tradable proxy.
+- **Duration**: bonds earned 1.5 % in 1946–48 (real losses), −0.8 % in 1979–81, −3.4 % in
+  2021–23, −10.9 % in 2022: duration is hurt first and most in the reflation/oil cells, as the
+  hypothesis says. The exception is 1973–82 as a whole (6.1 %, from the coupon) and 1990 (17 %).
+- **Bills vs equities**: in 1973–82 bills (8.5 %) beat the market (7.9 %); in 1946–48 both were
+  near zero; the 1973 "accommodate" path (market −32 %, oil +126 %) and the 1979 "tighten" path
+  (market +15 %, bonds −1 %) differ exactly as the brief frames the fork.
+- **Dollar and gold**: no long dollar series before 1973 and FRED's gold series is discontinued;
+  within the ETF era (`DTWEXBGS`, GLD) the record is in the JSON but too short to split by cell.
+- **US as net exporter**: the data cannot test this directly (no foreign-market long series in the
+  panel); the long sample is US-only. It is stated as untested.
+
+**Conclusion for Anik's question ("something that works in the current regime"):** in today's
+cell, cross-sectional momentum and MA-filtered asset trend-following have the only positive
+records in the ETF era (Sharpe 0.76–0.83, 5–9 %/yr), and the long sample's analog cells point the
+same way (momentum, energy, short duration). None of it beats buy-and-hold at the registered
+confidence, and today's cell is one where buy-and-hold itself earned nothing since 2017. Per the
+registration: no shadow book, no governance row. Any v7 is a new registration at ≥ 493 trials.
