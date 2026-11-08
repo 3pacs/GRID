@@ -224,10 +224,20 @@ def snapshot_db(pg_table):
         with patch.dict(sys.modules, {"alembic": fake_alembic}):
             spec.loader.exec_module(migration)
             migration.upgrade()
+            conn.execute(text("""CREATE TABLE capital_flows_ttm_state (
+                actor_id TEXT PRIMARY KEY, quarter_fingerprint TEXT,
+                computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"""))
+            current_path = path.with_name('sec_financial_current_20261108.py')
+            current_spec = importlib.util.spec_from_file_location('_sec_current_migration', current_path)
+            current_migration = importlib.util.module_from_spec(current_spec)
+            current_spec.loader.exec_module(current_migration)
+            current_migration.upgrade()
     try:
         yield engine
     finally:
         with engine.begin() as conn:
+            conn.execute(text("DROP VIEW capital_flows_current"))
+            conn.execute(text("DROP TABLE capital_flows_ttm_state"))
             conn.execute(text("DROP TABLE sec_financial_snapshot_heads"))
             conn.execute(text("DROP TABLE sec_financial_snapshots"))
             conn.execute(text("DROP ROLE grid"))
@@ -445,3 +455,223 @@ def test_pg_migration_archive_privileges_are_append_only_for_application_role(sn
                 conn.execute(text(statement))
         assert caught.value.orig.pgcode == "42501"
     assert archive_rows(engine) == before
+
+
+# Current-projection acceptance: original ledger rows remain intact, but no
+# consumer may resurrect legacy/seed values missing from a qualified snapshot.
+def current_rows(engine, actor="nvda", period="quarter"):
+    with engine.connect() as conn:
+        return list(conn.execute(text("""SELECT amount_usd, source_filing FROM capital_flows_current
+            WHERE lower(actor_id)=:actor AND period_type=:period ORDER BY id"""),
+            {"actor": actor, "period": period}))
+
+
+def seed_legacy(engine, *, actor="nvda", value=177, period="quarter", source="10-Q Q2",
+                counterparty=None, flow="revenue"):
+    with engine.begin() as conn:
+        conn.execute(text("""INSERT INTO capital_flows (actor_id, fiscal_period, period_type,
+            flow_type, direction, amount_usd, counterparty_id, source_filing, confidence, currency)
+            VALUES (:actor, '2026-07-26', :period, :flow, 'in', :value, :counterparty,
+                    :source, 'confirmed', 'USD')"""),
+            dict(actor=actor, period=period, flow=flow, value=value,
+                 counterparty=counterparty, source=source))
+
+
+def test_pg_current_view_hides_legacy_seed_and_case_variant(snapshot_db):
+    from store.sec_financial_snapshots import write_snapshot
+    for actor, source in [('nvda', '10-Q Q2'), ('nvda', 'seed'), ('NVDA', '10-Q Q2')]:
+        seed_legacy(snapshot_db, actor=actor, source=source)
+    write_snapshot(snapshot_db, snapshot(96))
+    assert [r[0] for r in current_rows(snapshot_db)] == [96]
+    assert len(stored(snapshot_db)) == 4  # No destructive historical reconciliation.
+    write_snapshot(snapshot_db, snapshot(empty=True, second=10))
+    assert current_rows(snapshot_db) == []  # Unavailable, not legacy fallback/zero.
+    assert len(stored(snapshot_db)) == 3
+
+
+def test_pg_current_view_preserves_unrelated_scopes(snapshot_db):
+    from store.sec_financial_snapshots import write_snapshot
+    seed_legacy(snapshot_db, actor='aapl')
+    seed_legacy(snapshot_db, counterparty='supplier')
+    seed_legacy(snapshot_db, period='announcement')
+    seed_legacy(snapshot_db, flow='working_capital_delta')
+    write_snapshot(snapshot_db, snapshot(empty=True))
+    assert len(current_rows(snapshot_db, actor='aapl')) == 1
+    assert len(current_rows(snapshot_db)) == 2  # Counterparty and unmapped flow.
+    assert len(current_rows(snapshot_db, period='announcement')) == 1
+
+
+def test_pg_current_view_rejects_mutated_owned_amount(snapshot_db):
+    from store.sec_financial_snapshots import write_snapshot
+    write_snapshot(snapshot_db, snapshot(96))
+    with snapshot_db.begin() as conn:
+        conn.execute(text("UPDATE capital_flows SET amount_usd=999"))
+    assert current_rows(snapshot_db) == []
+
+
+def test_pg_current_view_dedups_unmanaged_annuals_before_sector_sum(snapshot_db):
+    seed_legacy(snapshot_db, period='annual', value=100, source='10-K FY')
+    seed_legacy(snapshot_db, period='annual', value=120, source='seed')
+    with snapshot_db.connect() as conn:
+        assert conn.execute(text("""SELECT SUM(amount_usd) FROM capital_flows_current
+            WHERE actor_id='nvda' AND period_type='annual'""")).scalar_one() == 100
+    assert len(stored(snapshot_db)) == 2
+
+
+def multi_quarter_snapshot(*, second=0, last=40):
+    from datetime import date, timedelta
+    import json
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+    original = snapshot(second=second)
+    body = json.loads(original.source_body)
+    entries = body['facts']['us-gaap']['RevenueFromContractWithCustomerExcludingAssessedTax']['units']['USD']
+    prototype = entries[0]
+    entries[:] = [dict(prototype, start=(date.fromisoformat(end)-timedelta(days=90)).isoformat(),
+                      end=end, val=value)
+                 for end, value in [('2025-10-26',10), ('2026-01-25',20),
+                                    ('2026-04-26',30), ('2026-07-26',last)]]
+    return prepare_snapshot(source_body=json.dumps(body).encode(), actor_id='nvda', cik='1045810',
+                            request_started_at=original.request_started_at,
+                            received_at=original.received_at, fx_rates={'USD':1.0})
+
+
+def test_pg_ttm_hidden_until_same_snapshot_recomputed(snapshot_db):
+    from store.sec_financial_snapshots import write_snapshot
+    from intelligence.company_financial_rollups import compute_ttm
+    seed_legacy(snapshot_db, period='ttm', source='ttm_rollup', value=999)
+    first = multi_quarter_snapshot()
+    write_snapshot(snapshot_db, first)
+    assert current_rows(snapshot_db, period='ttm') == []
+    compute_ttm(snapshot_db)
+    assert [r[0] for r in current_rows(snapshot_db, period='ttm')] == [100]
+    newer = multi_quarter_snapshot(second=10, last=50)
+    write_snapshot(snapshot_db, newer)
+    assert current_rows(snapshot_db, period='ttm') == []
+    compute_ttm(snapshot_db)
+    assert [r[0] for r in current_rows(snapshot_db, period='ttm')] == [110]
+    # Newer complete-but-unsupported capture immediately suppresses cached TTM.
+    write_snapshot(snapshot_db, snapshot(second=20, empty=True))
+    assert current_rows(snapshot_db, period='ttm') == []
+    compute_ttm(snapshot_db)
+    with snapshot_db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM capital_flows WHERE period_type='ttm'")).scalar_one() == 0
+    assert compute_ttm(snapshot_db).rows_written == 0
+
+
+def test_pg_first_empty_snapshot_reconciles_old_rollup_state(snapshot_db):
+    from store.sec_financial_snapshots import write_snapshot
+    from intelligence.company_financial_rollups import compute_ttm
+    seed_legacy(snapshot_db, period='ttm', source='ttm_rollup', value=999)
+    empty = snapshot(empty=True)
+    write_snapshot(snapshot_db, empty)
+    compute_ttm(snapshot_db)
+    with snapshot_db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM capital_flows WHERE period_type='ttm'")).scalar_one() == 0
+        assert conn.execute(text("SELECT sec_snapshot_id FROM capital_flows_ttm_state")).scalar_one() == empty.snapshot_id
+
+
+
+def test_pg_same_values_new_snapshot_still_rebinds_ttm(snapshot_db):
+    import json
+    from datetime import timedelta
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+    from store.sec_financial_snapshots import write_snapshot
+    from intelligence.company_financial_rollups import compute_ttm
+    first = multi_quarter_snapshot()
+    write_snapshot(snapshot_db, first)
+    compute_ttm(snapshot_db)
+    body = json.loads(first.source_body)
+    body['entityName'] = 'Same Financial Values New Capture'
+    second = prepare_snapshot(source_body=json.dumps(body).encode(), actor_id='nvda', cik='1045810',
+        request_started_at=first.request_started_at+timedelta(seconds=10),
+        received_at=first.received_at+timedelta(seconds=10), fx_rates={'USD':1.0})
+    assert second.normalized_json == first.normalized_json
+    write_snapshot(snapshot_db, second)
+    assert current_rows(snapshot_db, period='ttm') == []
+    compute_ttm(snapshot_db)
+    assert [r[0] for r in current_rows(snapshot_db, period='ttm')] == [100]
+    # An older racing rollup cannot publish against a newer snapshot head.
+    with snapshot_db.begin() as conn:
+        conn.execute(text("UPDATE capital_flows_ttm_state SET sec_snapshot_id=:old"),
+                     {'old':first.snapshot_id})
+    assert current_rows(snapshot_db, period='ttm') == []
+    compute_ttm(snapshot_db)
+    assert [r[0] for r in current_rows(snapshot_db, period='ttm')] == [100]
+
+
+def test_pg_current_view_is_readable_by_application_role(snapshot_db):
+    from store.sec_financial_snapshots import write_snapshot
+    write_snapshot(snapshot_db, snapshot())
+    with snapshot_db.begin() as conn:
+        conn.execute(text('SET LOCAL ROLE grid'))
+        assert conn.execute(text('SELECT count(*) FROM capital_flows_current')).scalar_one() == 1
+
+
+
+def test_pg_current_view_public_fixture_query_plan(snapshot_db):
+    import gzip
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+    from store.sec_financial_snapshots import write_snapshot
+    receipt = snapshot()
+    original = gzip.decompress((Path(__file__).parent / 'fixtures/sec_financial_periods/nvda.companyfacts.json.gz').read_bytes())
+    real = prepare_snapshot(source_body=original, actor_id='nvda', cik='1045810',
+        request_started_at=receipt.request_started_at, received_at=receipt.received_at, fx_rates={'USD':1.0})
+    write_snapshot(snapshot_db, real)
+    with snapshot_db.begin() as conn:
+        # Deliberately retain one competing historical value for every qualified key.
+        conn.execute(text("""INSERT INTO capital_flows (actor_id, fiscal_period, period_type,
+            flow_type, direction, amount_usd, counterparty_id, source_filing, confidence, currency)
+            SELECT actor_id, fiscal_period, period_type, flow_type, direction, amount_usd * 2,
+                   counterparty_id, '10-Q legacy', confidence, currency FROM capital_flows"""))
+        conn.execute(text('ANALYZE capital_flows'))
+        assert conn.execute(text("SELECT count(*) FROM capital_flows_current WHERE actor_id='nvda'")).scalar_one() == len(real.rows)
+        plan = conn.execute(text("""EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+            SELECT flow_type, SUM(amount_usd) FROM capital_flows_current
+            WHERE actor_id='nvda' AND period_type='annual' GROUP BY flow_type""")).scalar_one()
+        print('Current-view public NVDA fixture:', len(real.rows), 'qualified rows,',
+              2*len(real.rows), 'ledger rows; annual aggregate execution ms:', plan[0]['Execution Time'])
+
+
+
+def test_pg_overlapping_rollup_cannot_publish_after_head_advance(snapshot_db):
+    from concurrent.futures import ThreadPoolExecutor
+    import time
+    from store.sec_financial_snapshots import write_snapshot
+    from intelligence.company_financial_rollups import compute_ttm
+    first = multi_quarter_snapshot()
+    newer = multi_quarter_snapshot(second=10, last=50)
+    write_snapshot(snapshot_db, first)
+    with snapshot_db.begin() as conn:
+        conn.execute(text("""CREATE FUNCTION sec_test_pause_ttm() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM pg_advisory_xact_lock(7363001); RETURN NEW; END $$"""))
+        conn.execute(text("""CREATE TRIGGER sec_test_pause_ttm BEFORE INSERT ON capital_flows
+            FOR EACH ROW WHEN (NEW.period_type='ttm') EXECUTE FUNCTION sec_test_pause_ttm()"""))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with snapshot_db.connect() as lock:
+                lock.execute(text('SELECT pg_advisory_lock(7363001)'))
+                try:
+                    future = pool.submit(compute_ttm, snapshot_db)
+                    deadline = time.monotonic() + 10
+                    while True:
+                        blocked = lock.execute(text("""SELECT count(*) FROM pg_locks
+                            WHERE locktype='advisory' AND objid=7363001 AND NOT granted""")).scalar_one()
+                        if blocked:
+                            break
+                        assert time.monotonic() < deadline, 'Rollup did not reach the controlled insert barrier'
+                        time.sleep(0.02)
+                    # The real rollup statement has already read H1; commit H2
+                    # while its insert is blocked, then let H1 finish last.
+                    write_snapshot(snapshot_db, newer)
+                finally:
+                    lock.execute(text('SELECT pg_advisory_unlock(7363001)'))
+                future.result(timeout=10)
+        assert current_rows(snapshot_db, period='ttm') == []
+        with snapshot_db.connect() as conn:
+            assert conn.execute(text('SELECT sec_snapshot_id FROM capital_flows_ttm_state')).scalar_one() == first.snapshot_id
+        compute_ttm(snapshot_db)
+        assert [r[0] for r in current_rows(snapshot_db, period='ttm')] == [110]
+    finally:
+        with snapshot_db.begin() as conn:
+            conn.execute(text('DROP TRIGGER sec_test_pause_ttm ON capital_flows'))
+            conn.execute(text('DROP FUNCTION sec_test_pause_ttm()'))

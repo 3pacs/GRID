@@ -177,3 +177,68 @@ financial set is inconsistent, unqualified or missing required metrics.
 - Changed-file Ruff E/W/F (except E501), Python compilation and diff checks pass.
 - Full repository CI, production migrations, provider-wide coverage and deployed
   consumer acceptance have not run. Python 3.12 SQLite deprecation warnings remain.
+
+
+## Draft continuation: snapshot-aware consumers (2026-11-08)
+
+The additional `sec_financial_current_20261108` migration creates
+`capital_flows_current`. Ledger rows are retained unchanged. For actors with a
+snapshot head, this read projection admits supported direct annual/quarter
+financial rows only when every financial/provenance field matches that head's
+normalized evidence. Missing metrics cannot fall back to an unmarked SEC row,
+seed, announcement-folded estimate, or differently cased actor spelling. Other
+actors, explicit counterparties, announcement events, and unsupported flow types
+remain outside this snapshot authority. Supported direct annual/quarter facts
+are deduplicated before consumers aggregate them, also for legacy-only actors.
+
+Read-only financial consumers use the shared projection. Writers and explicit
+historical auditing still use `capital_flows`. This is a current-truth read
+contract, not a rewrite or a point-in-time history reconstruction. Existing
+materialized reports/caches still require explicit invalidation at rollout.
+
+TTM state adds `sec_snapshot_id`. A snapshot-managed TTM row is readable only
+when it is `ttm_rollup` output computed against the current head. The rollup SQL
+reads qualified quarters and records the observed snapshot identity in the same
+statement/transaction as its fingerprint and outputs. Head changes hide stale
+TTM immediately, even when normalized values are unchanged. First empty heads
+also enter the dirty-actor set so obsolete physical rollups can be removed. An
+old racing recompute is hidden until a current recompute succeeds. This does not
+make the raw ledger a safe read interface or coordinate unrelated external
+writers automatically.
+
+The new migration must precede the corresponding consumer code. There is no
+silent raw-ledger fallback if the view is missing. Downgrading this read-view
+migration does not remove archived snapshots, but requires reverting consumer
+code together; deployment/rollback must be coordinated. Privileged mutation of
+archive/head/state remains outside the application integrity guarantee.
+
+Before rollout, validate query plans and representative production-scale latency:
+the view checks membership against normalized JSON and ranks direct facts. The
+disposable fixture proves correctness, not acceptable production query costs.
+Historical repair remains a separate explicitly approved operation. No repair
+executor or blanket correction of the 798-row proposal is included here.
+
+
+Missing-input guards now require every term used by composite financial ratios
+and scores; an explicit reported zero remains valid. Incomplete fundamental
+scores do not emit a new trading verdict. This does NOT erase prior persisted
+`fundamental_divergence` rows: its snapshot writer only upserts newly produced
+rows, and the existing actor-detail endpoint can still select its latest older
+record. Persisted derivative invalidation/source binding and API/percentile
+cache invalidation remain mandatory rollout gates, not solved by these guards.
+
+A disposable full-NVDA fixture retained 587 qualified rows beside 587 synthetic
+legacy duplicates. The final relational evidence join returned exactly 587
+current rows; its annual aggregate took about 17 ms on the local private cluster
+(one illustrative run, not a production latency promise). The earlier correlated
+JSON membership variant took about 128 ms and was replaced. Production-scale
+query planning and concurrency remain separate acceptance checks.
+
+
+Continuation validation: 418 selected offline tests passed, 8 optional/integration
+cases skipped, and 2 subtests passed with external sockets and database discovery
+blocked. All 24 disposable PostgreSQL tests passed, including a real two-connection
+race: an H1 rollup was held at its insert, H2 committed, and H1 then finished last.
+The read projection hid that stale TTM until the next H2 recompute. Changed-file
+Ruff E/W/F (excluding E501), compilation and whitespace checks passed. Full CI on
+the newly published head and actual deployment acceptance are still separate gates.

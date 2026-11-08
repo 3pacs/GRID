@@ -141,7 +141,7 @@ def _margin_score(conn: Any, tickers: list[str]) -> float | None:
             text(
                 """
                 SELECT fiscal_period, flow_type, SUM(amount_usd) AS amt
-                FROM capital_flows
+                FROM capital_flows_current
                 WHERE actor_id = ANY(:ids)
                   AND period_type = 'annual'
                   AND flow_type IN ('revenue', 'cogs')
@@ -156,18 +156,21 @@ def _margin_score(conn: Any, tickers: list[str]) -> float | None:
         # Fold (period, flow_type) → amount into {period: {revenue, cogs}}
         by_period: dict[Any, dict[str, float]] = {}
         for fp, ft, amt in rows:
-            by_period.setdefault(fp, {})[ft] = float(amt or 0.0)
+            if amt is not None:
+                by_period.setdefault(fp, {})[ft] = float(amt)
 
         periods = sorted(by_period.keys(), reverse=True)
-        margins: list[float] = []
+        margins: list[float | None] = []
         for p in periods[:4]:
             rev = by_period[p].get("revenue")
             cogs = by_period[p].get("cogs")
-            gm = _safe_div((rev or 0.0) - (cogs or 0.0), rev)
-            if gm is not None:
-                margins.append(gm)
+            margins.append(
+                _safe_div(rev - cogs, rev)
+                if rev is not None and cogs is not None else None
+            )
 
-        if len(margins) < 2:
+        # Do not replace missing endpoints with older available margins.
+        if len(margins) < 2 or margins[0] is None or margins[-1] is None:
             continue
 
         delta = margins[0] - margins[-1]
@@ -231,7 +234,7 @@ def _capital_allocation_score(conn: Any, tickers: list[str]) -> float | None:
             text(
                 """
                 SELECT fiscal_period, flow_type, SUM(amount_usd) AS amt
-                FROM capital_flows
+                FROM capital_flows_current
                 WHERE actor_id = ANY(:ids)
                   AND period_type = 'annual'
                   AND flow_type IN (
@@ -248,7 +251,8 @@ def _capital_allocation_score(conn: Any, tickers: list[str]) -> float | None:
 
         by_period: dict[Any, dict[str, float]] = {}
         for fp, ft, amt in rows:
-            by_period.setdefault(fp, {})[ft] = float(amt or 0.0)
+            if amt is not None:
+                by_period.setdefault(fp, {})[ft] = float(amt)
         if not by_period:
             continue
 
@@ -257,12 +261,10 @@ def _capital_allocation_score(conn: Any, tickers: list[str]) -> float | None:
         rev = amts.get("revenue")
         if rev is None or rev <= 0:
             continue
-        cogs = amts.get("cogs", 0.0) or 0.0
-        opex = amts.get("opex", 0.0) or 0.0
-        capex = amts.get("capex", 0.0) or 0.0
-        div = amts.get("dividends", 0.0) or 0.0
-        buy = amts.get("buybacks", 0.0) or 0.0
-        debt = amts.get("debt_issuance", 0.0) or 0.0
+        required = ("cogs", "opex", "capex", "dividends", "buybacks", "debt_issuance")
+        if any(amts.get(metric) is None for metric in required):
+            continue
+        cogs, opex, capex, div, buy, debt = (amts[metric] for metric in required)
 
         # FCF conv ≈ (revenue - cogs - opex - capex) / revenue  (-inf .. 1)
         fcf_conv = _safe_div(rev - cogs - opex - capex, rev) or 0.0

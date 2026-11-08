@@ -817,7 +817,7 @@ def _ticker_to_sector_subsector() -> dict[str, tuple[str, str]]:
 _LATEST_PERIOD_SQL = """
 WITH latest AS (
     SELECT actor_id, MAX(fiscal_period) AS fp
-    FROM capital_flows
+    FROM capital_flows_current
     WHERE period_type = :pt
       AND fiscal_period IS NOT NULL
     GROUP BY actor_id
@@ -851,7 +851,7 @@ ranked AS (
                 END,
                 cf.as_of DESC NULLS LAST
         ) AS rk
-    FROM capital_flows cf
+    FROM capital_flows_current cf
     JOIN latest l
       ON l.actor_id = cf.actor_id
      AND l.fp       = cf.fiscal_period
@@ -943,25 +943,26 @@ def _compute_ratios_from_amounts(amounts: dict[str, float]) -> dict[str, float |
     )
 
     dividend_payout: float | None = None
-    if div is not None and rev is not None and cogs is not None:
-        ni_proxy = rev - cogs - (opex or 0.0) - (tax or 0.0)
+    # Every term must be reported. An omitted/withdrawn fact is not zero.
+    if all(value is not None for value in (div, rev, cogs, opex, tax)):
+        ni_proxy = rev - cogs - opex - tax
         dividend_payout = _safe_div(div, ni_proxy)
 
     fcf_conv: float | None = None
-    if rev is not None and cogs is not None:
-        fcf_conv = _safe_div(rev - cogs - (opex or 0.0) - (capex or 0.0), rev)
+    if all(value is not None for value in (rev, cogs, opex, capex)):
+        fcf_conv = _safe_div(rev - cogs - opex - capex, rev)
 
     rev_per_capex: float | None = None
     if rev is not None and capex is not None:
         rev_per_capex = _safe_div(rev, capex)
 
     shareholder_yield: float | None = None
-    if rev is not None and (div is not None or buy is not None):
-        shareholder_yield = _safe_div((div or 0.0) + (buy or 0.0), rev)
+    if rev is not None and div is not None and buy is not None:
+        shareholder_yield = _safe_div(div + buy, rev)
 
     reinvestment_ratio: float | None = None
-    if rev is not None and (capex is not None or rnd is not None):
-        reinvestment_ratio = _safe_div((capex or 0.0) + (rnd or 0.0), rev)
+    if rev is not None and capex is not None and rnd is not None:
+        reinvestment_ratio = _safe_div(capex + rnd, rev)
 
     # Percentile-time buyback_yield uses buybacks/revenue fallback only
     # (no market cap context here). capital_flow.py still prefers mcap at

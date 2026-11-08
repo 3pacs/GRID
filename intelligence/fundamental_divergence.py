@@ -200,7 +200,7 @@ def _load_ticker_fundamentals(conn: Any, ticker: str) -> dict[str, Any] | None:
                             END,
                             as_of DESC NULLS LAST
                     ) AS rk
-                FROM capital_flows
+                FROM capital_flows_current
                 WHERE actor_id = ANY(:ids)
                   AND period_type = 'annual'
                   AND flow_type IN (
@@ -220,63 +220,10 @@ def _load_ticker_fundamentals(conn: Any, ticker: str) -> dict[str, Any] | None:
 
     by_period: dict[Any, dict[str, float]] = {}
     for fp, ft, amt in rows:
-        by_period.setdefault(fp, {})[ft] = float(amt or 0.0)
+        if amt is not None:
+            by_period.setdefault(fp, {})[ft] = float(amt)
 
-    periods = sorted(by_period.keys(), reverse=True)
-    if len(periods) < MIN_PERIODS:
-        return None
-
-    # Revenue 3y CAGR: latest vs period 3 years back.
-    rev_latest = by_period[periods[0]].get("revenue")
-    rev_3y = by_period[periods[3]].get("revenue")
-    cagr: float | None = None
-    if rev_latest is not None and rev_3y is not None and rev_3y > 0:
-        try:
-            cagr = (rev_latest / rev_3y) ** (1.0 / 3.0) - 1.0
-        except (ValueError, ZeroDivisionError):
-            cagr = None
-
-    # Gross margin trichotomy over the 4-period window.
-    margins: list[float] = []
-    for p in periods[:4]:
-        rev = by_period[p].get("revenue")
-        cogs = by_period[p].get("cogs")
-        gm = _safe_div((rev or 0.0) - (cogs or 0.0), rev)
-        if gm is not None:
-            margins.append(gm)
-    margin_trend: str
-    if len(margins) >= 2:
-        delta = margins[0] - margins[-1]
-        if delta > 0.005:
-            margin_trend = "expanding"
-        elif delta < -0.005:
-            margin_trend = "contracting"
-        else:
-            margin_trend = "flat"
-    else:
-        margin_trend = "flat"
-
-    # Shareholder yield: (dividends + buybacks) / revenue averaged over window.
-    sy_window: list[float] = []
-    for p in periods[:4]:
-        rev = by_period[p].get("revenue")
-        if rev is None or rev <= 0:
-            continue
-        div = by_period[p].get("dividends", 0.0) or 0.0
-        buy = by_period[p].get("buybacks", 0.0) or 0.0
-        sy = _safe_div(div + buy, rev)
-        if sy is not None:
-            sy_window.append(sy)
-    shareholder_yield = (
-        sum(sy_window) / len(sy_window) if sy_window else None
-    )
-
-    return {
-        "revenue_cagr": cagr,
-        "margin_trend": margin_trend,
-        "shareholder_yield": shareholder_yield,
-        "periods": len(periods),
-    }
+    return _fundamentals_from_period_map(by_period)
 
 
 # ── Batched metric extraction (fable-daily-intel-sql-tasks, 2026-09-20) ─
@@ -360,7 +307,7 @@ def _load_batch_fundamentals(
                             END,
                             as_of DESC NULLS LAST
                     ) AS rk
-                FROM capital_flows
+                FROM capital_flows_current
                 WHERE UPPER(actor_id) = ANY(:tickers)
                   AND period_type = 'annual'
                   AND flow_type IN (
@@ -378,7 +325,8 @@ def _load_batch_fundamentals(
 
     by_ticker_period: dict[str, dict[Any, dict[str, float]]] = {}
     for tk, fp, ft, amt in rows:
-        by_ticker_period.setdefault(tk, {}).setdefault(fp, {})[ft] = float(amt or 0.0)
+        if amt is not None:
+            by_ticker_period.setdefault(tk, {}).setdefault(fp, {})[ft] = float(amt)
 
     for tk, by_period in by_ticker_period.items():
         out[tk] = _fundamentals_from_period_map(by_period)
@@ -405,15 +353,16 @@ def _fundamentals_from_period_map(
         except (ValueError, ZeroDivisionError):
             cagr = None
 
-    margins: list[float] = []
+    margins: list[float | None] = []
     for p in periods[:4]:
         rev = by_period[p].get("revenue")
         cogs = by_period[p].get("cogs")
-        gm = _safe_div((rev or 0.0) - (cogs or 0.0), rev)
-        if gm is not None:
-            margins.append(gm)
-    margin_trend: str
-    if len(margins) >= 2:
+        margins.append(
+            _safe_div(rev - cogs, rev)
+            if rev is not None and cogs is not None else None
+        )
+    margin_trend: str | None = None
+    if len(margins) >= 2 and margins[0] is not None and margins[-1] is not None:
         delta = margins[0] - margins[-1]
         if delta > 0.005:
             margin_trend = "expanding"
@@ -421,16 +370,16 @@ def _fundamentals_from_period_map(
             margin_trend = "contracting"
         else:
             margin_trend = "flat"
-    else:
-        margin_trend = "flat"
 
     sy_window: list[float] = []
     for p in periods[:4]:
         rev = by_period[p].get("revenue")
         if rev is None or rev <= 0:
             continue
-        div = by_period[p].get("dividends", 0.0) or 0.0
-        buy = by_period[p].get("buybacks", 0.0) or 0.0
+        div = by_period[p].get("dividends")
+        buy = by_period[p].get("buybacks")
+        if div is None or buy is None:
+            continue
         sy = _safe_div(div + buy, rev)
         if sy is not None:
             sy_window.append(sy)
@@ -616,18 +565,18 @@ def _build_fundamental_score(
     ticker_fund: dict[str, Any],
     sector_cagrs: list[float],
     sector_yields: list[float],
-) -> float:
+) -> float | None:
     """Compose the 0..100 fundamental score from per-ticker metrics
     and the sector-wide distributions used for percentile ranks.
     """
     cagr = ticker_fund.get("revenue_cagr")
-    cagr_pct = _percentile_rank(cagr, sector_cagrs) if cagr is not None else 50.0
-
-    trend = ticker_fund.get("margin_trend") or "flat"
-    margin_pts = MARGIN_POINTS.get(trend, 50.0)
-
+    trend = ticker_fund.get("margin_trend")
     sy = ticker_fund.get("shareholder_yield")
-    sy_pct = _percentile_rank(sy, sector_yields) if sy is not None else 50.0
+    if cagr is None or trend not in MARGIN_POINTS or sy is None:
+        return None
+    cagr_pct = _percentile_rank(cagr, sector_cagrs)
+    margin_pts = MARGIN_POINTS[trend]
+    sy_pct = _percentile_rank(sy, sector_yields)
 
     score = (
         W_REVENUE_CAGR * cagr_pct
@@ -668,7 +617,7 @@ def _narrative(
 ) -> str:
     """Deterministic template — no LLM."""
     cagr = fund.get("revenue_cagr")
-    trend = fund.get("margin_trend") or "flat"
+    trend = fund.get("margin_trend") or "unavailable"
     sy = fund.get("shareholder_yield")
     cagr_str = f"{cagr * 100:.1f}% 3y CAGR" if cagr is not None else "n/a CAGR"
     sy_str = f"{sy * 100:.1f}% yield" if sy is not None else "n/a yield"
@@ -767,6 +716,8 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
                 fundamental_score = _build_fundamental_score(
                     fund, sector_cagrs, sector_yields
                 )
+                if fundamental_score is None:
+                    continue  # unavailable components cannot support a trading verdict
                 price_score = _build_price_score(
                     price_cache.get(st.ticker), sector_price_cagrs
                 )

@@ -192,3 +192,12 @@ def test_reconciliation_cli_preserves_decimal_export_and_refuses_overwrite(tmp_p
     with pytest.raises(FileExistsError):
         main(args)
     assert not any('sql' in str(p) for p in Path(tmp_path).iterdir())
+
+
+
+def test_current_view_migration_covers_every_normalizer_flow():
+    from pathlib import Path
+    from ingestion.altdata.sec_xbrl_financials import _FLOW_MAPPINGS
+    migration = (Path(__file__).resolve().parents[1] / 'migrations/versions/sec_financial_current_20261108.py').read_text(encoding='utf-8')
+    for flow in {item['flow_type'] for item in _FLOW_MAPPINGS} | {'debt_issuance'}:
+        assert migration.count("'" + flow + "'") == 2, flow

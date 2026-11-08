@@ -348,7 +348,7 @@ def _load_latest_revenue(conn: Any, actor_ids: Iterable[str]) -> dict[str, float
             text(
                 """
                 SELECT DISTINCT ON (actor_id) actor_id, amount_usd
-                FROM capital_flows
+                FROM capital_flows_current
                 WHERE actor_id = ANY(:ids)
                   AND flow_type = 'revenue'
                   AND period_type IN ('annual', 'ttm')

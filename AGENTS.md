@@ -375,3 +375,29 @@ Verification and limits:
 - Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
   own stages) is recorded in the runbook's consumer checklist; the producer cannot
   supply those receipts. Gemini/provider input remains the daily review's own gate.
+
+
+## 2026-11-08 - SEC current-consumer integrity continuation (draft only)
+
+- Integrated main 3102e7b0, resolving the independent digest-clock test conflict
+  through main's clock seam while retaining fresh and stale coverage (49 tests).
+- Added a snapshot-aware read projection: supported direct financial facts must
+  match the current normalized evidence; missing facts cannot resurrect legacy,
+  seed or actor-case variants. Direct annual/quarter facts are deduplicated before
+  aggregation. Original ledger rows and evidence remain unchanged.
+- Bound TTM visibility and recompute state to the current SEC snapshot identity.
+  First empty heads and same-values/new-identity captures trigger reconciliation.
+  A controlled real PostgreSQL overlap proves a late old rollup is hidden until
+  the next current recompute, without relying on wall-clock timestamps.
+- Fixed downstream missing-as-zero ratios and financial scores. Incomplete
+  fundamental scores do not emit new trading verdicts; explicit zeros remain valid.
+- 418 selected offline tests passed, 8 optional/integration skips, 2 subtests;
+  24 tests passed in a fresh private PostgreSQL cluster that was stopped/removed.
+  Independent review, changed-file Ruff, compilation and diff checks passed.
+- Public NVDA fixture: 587 qualified rows beside 587 synthetic legacy duplicates;
+  final relational evidence join annual aggregate about 17 ms locally. This is
+  not production-scale qualification. No production database or provider access.
+- Remaining gates: exact-head full CI, deployed schema/ownership/grants and query
+  plans, persisted fundamental-divergence and report invalidation, TTL-cache
+  invalidation, reviewed historical repair. No repair executor, merge, deployment,
+  production migration, historical correction or production rollup was performed.

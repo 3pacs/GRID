@@ -539,7 +539,7 @@ _SQL_LARGE_ACQ = text(
     """
     SELECT actor_id, counterparty_id, amount_usd, fiscal_period,
            source_filing, as_of
-    FROM capital_flows
+    FROM capital_flows_current
     WHERE flow_type = 'acquisitions'
       AND period_type = 'announcement'
       AND amount_usd >= :min_usd
