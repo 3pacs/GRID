@@ -35,11 +35,14 @@ API: GET /api/v1/intelligence/levers
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from analysis.sec_valuation import trailing_pe
 
 # CFTC COT ids are keyed by cftc_contract_market_code (cftc.<code>.<metric>);
 # the legacy cftc.SP500/GOLD/CRUDE_OIL/NATGAS ids mixed several markets.
@@ -2020,23 +2023,15 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
             }
 
             # ── Technology & Regulation: PE ratios for tech giants ──
-            tech_pe = conn.execute(text(
-                "SELECT series_id, value FROM raw_series "
-                "WHERE series_id IN ('TIINGO_FUND:NVDA:pe_ratio', 'TIINGO_FUND:MSFT:pe_ratio', "
-                "                    'TIINGO_FUND:AAPL:pe_ratio', 'TIINGO_FUND:AMZN:pe_ratio') "
-                "AND pull_status = 'SUCCESS' "
-                "AND obs_date >= CURRENT_DATE - 3 "
-                "ORDER BY obs_date DESC"
-            )).fetchall()
-
+            # Trailing P/E from filed SEC EPS and Tiingo's raw close
+            # (Tiingo fundamentals was retired 2026-11-08).
             tech_metrics = []
-            seen_tickers = set()
-            for row in tech_pe:
-                ticker = row[0].split(":")[1]
-                if ticker not in seen_tickers:
-                    seen_tickers.add(ticker)
+            for ticker in ("NVDA", "MSFT", "AAPL", "AMZN"):
+                pe = trailing_pe(conn, ticker, date.today())
+                if pe is not None:
                     tech_metrics.append({
-                        "label": f"{ticker} P/E", "value": f"{float(row[1]):.1f}x",
+                        "label": f"{ticker} P/E", "value": f"{pe.pe:.1f}x",
+                        "date": str(pe.price_date),
                     })
 
             result["technology"] = {
