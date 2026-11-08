@@ -1037,3 +1037,172 @@ def test_pg_sector_snapshot_writer_rejects_newer_time_with_stale_generation(outp
     assert save(20)["snapshots_stale_skipped"] == 1
     with output_db.connect() as conn:
         assert conn.execute(text("SELECT score FROM sector_health_snapshots_current")).scalar_one() == 80
+
+
+@pytest.fixture
+def journal_db(private_pg):
+    """Use the actual journal column types/constraints in the private cluster."""
+    schema = (Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
+    start = schema.index("CREATE TABLE IF NOT EXISTS decision_journal (")
+    end = schema.index("\n);", start) + len("\n);")
+    with private_pg.begin() as conn:
+        # Only the journal's referenced primary key is needed by these reads.
+        conn.execute(text("CREATE TABLE model_registry (id INTEGER PRIMARY KEY)"))
+        conn.execute(text("INSERT INTO model_registry(id) VALUES (1)"))
+        conn.execute(text(schema[start:end]))
+        conn.execute(text("ALTER TABLE decision_journal ADD COLUMN source_contract_id UUID"))
+    try:
+        yield private_pg
+    finally:
+        with private_pg.begin() as conn:
+            conn.execute(text("DROP TABLE decision_journal"))
+            conn.execute(text("DROP TABLE model_registry"))
+
+
+def _insert_journal(engine, *, second=0, **overrides):
+    import json
+    from datetime import datetime, timedelta, timezone
+    fields = dict(
+        decision_timestamp=datetime(2026, 11, 8, tzinfo=timezone.utc)+timedelta(seconds=second),
+        inferred_state="EXPANSION", state_confidence=0.75, transition_probability=0.2,
+        contradiction_flags={}, grid_recommendation="HOLD", baseline_recommendation="HOLD",
+        action_taken="HOLD", counterfactual="S=0.25, dS/dt=0.01", operator_confidence="HIGH",
+        outcome_value=None, outcome_recorded_at=None, verdict=None, annotation="Synthetic evidence",
+        source_contract_id=None,
+    )
+    fields.update(overrides)
+    fields["contradiction_flags"] = json.dumps(fields["contradiction_flags"])
+    with engine.begin() as conn:
+        return conn.execute(text("""INSERT INTO decision_journal (
+            decision_timestamp, model_version_id, inferred_state, state_confidence,
+            transition_probability, contradiction_flags, grid_recommendation,
+            baseline_recommendation, action_taken, counterfactual, operator_confidence,
+            outcome_value, outcome_recorded_at, verdict, annotation, source_contract_id
+        ) VALUES (
+            :decision_timestamp, 1, :inferred_state, :state_confidence,
+            :transition_probability, CAST(:contradiction_flags AS JSONB), :grid_recommendation,
+            :baseline_recommendation, :action_taken, :counterfactual, :operator_confidence,
+            :outcome_value, :outcome_recorded_at, :verdict, :annotation, CAST(:source_contract_id AS UUID)
+        ) RETURNING id"""), fields).scalar_one()
+
+
+def _raw_journal_evidence(engine):
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT row_to_json(d)::text FROM decision_journal d ORDER BY id")).scalars().all()
+
+
+def _latest_qualified_journal(engine):
+    from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
+    # This is the actual shared SQL used by current-regime consumers. The
+    # predicate is static application code, never interpolated user content.
+    with engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT id, inferred_state, state_confidence FROM decision_journal WHERE "
+            + NON_PROVISIONAL_JOURNAL_PREDICATE
+            + " ORDER BY decision_timestamp DESC LIMIT 1"
+        )).first()
+
+
+def test_pg_provisional_journal_does_not_replace_latest_genuine_regime(journal_db):
+    _insert_journal(journal_db, second=0, inferred_state="EXPANSION")
+    genuine = _insert_journal(journal_db, second=10, inferred_state="CONTRACTION", state_confidence=0.65)
+    provisional = _insert_journal(
+        journal_db, second=20, inferred_state="PROVISIONAL_OPTIONS_FLOW", state_confidence=0.99,
+        action_taken="PROVISIONAL OPTIONS_FLOW NVDA",
+        counterfactual="provisional-from-contract:00000000-0000-0000-0000-000000000001",
+        contradiction_flags={"signal_type": "options_flow", "source": "options",
+                             "producer_module": "intelligence.options", "context": {}},
+        source_contract_id="00000000-0000-0000-0000-000000000001",
+    )
+    before = _raw_journal_evidence(journal_db)
+    with journal_db.connect() as conn:
+        assert conn.execute(text("SELECT id FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1")).scalar_one() == provisional
+    assert tuple(_latest_qualified_journal(journal_db)) == (genuine, "CONTRACTION", 0.65)
+    assert _raw_journal_evidence(journal_db) == before
+
+
+_JOURNAL_PROVISIONAL_MARKERS = [
+    pytest.param({"inferred_state": "PROVISIONAL_FUNDAMENTAL_DIVERGENCE"}, id="state-financial"),
+    pytest.param({"inferred_state": "provisional_options_flow"}, id="state-case-insensitive-unrelated"),
+    pytest.param({"inferred_state": "PROVISIONAL_"}, id="state-empty-suffix"),
+    pytest.param({"action_taken": "PROVISIONAL"}, id="action-exact"),
+    pytest.param({"action_taken": "PROVISIONAL INSIDER AAPL"}, id="action-prefix"),
+    pytest.param({"action_taken": "provisional options NVDA"}, id="action-case-insensitive"),
+    pytest.param({"counterfactual": "provisional-from-contract:abc"}, id="counterfactual-prefix"),
+    pytest.param({"counterfactual": "PROVISIONAL-FROM-CONTRACT:abc"}, id="counterfactual-case-insensitive"),
+]
+for _location in ("top-level", "context"):
+    for _key, _value, _label in (
+        ("signal_type", "fundamental_divergence", "signal-type"),
+        ("producer_module", "intelligence.fundamental_divergence", "producer"),
+        ("source", "fundamental_divergence", "source-exact"),
+        ("source", "fundamental_divergence:Technology", "source-sector"),
+    ):
+        _flags = {_key: _value}
+        if _location == "context":
+            _flags = {"context": _flags}
+        _JOURNAL_PROVISIONAL_MARKERS.append(pytest.param(
+            {"contradiction_flags": _flags}, id=f"{_location}-{_label}",
+        ))
+
+
+@pytest.mark.parametrize("marker", _JOURNAL_PROVISIONAL_MARKERS)
+def test_pg_each_provisional_signature_alone_is_ineligible(journal_db, marker):
+    _insert_journal(journal_db, **marker)
+    before = _raw_journal_evidence(journal_db)
+    assert _latest_qualified_journal(journal_db) is None
+    assert _raw_journal_evidence(journal_db) == before
+
+
+@pytest.mark.parametrize("flags", [
+    pytest.param(None, id="json-null"),
+    pytest.param({}, id="empty-object"),
+    pytest.param([], id="empty-array"),
+    pytest.param("fundamental_divergence", id="string"),
+    pytest.param(1, id="number"),
+    pytest.param(True, id="boolean"),
+    pytest.param([{"signal_type": "fundamental_divergence"}], id="object-in-array"),
+    pytest.param({"context": None}, id="null-context"),
+    pytest.param({"context": ["fundamental_divergence"]}, id="array-context"),
+    pytest.param({"context": "fundamental_divergence"}, id="string-context"),
+    pytest.param({"signal_type": ["fundamental_divergence"]}, id="wrong-type-signal"),
+    pytest.param({"producer_module": {"name": "intelligence.fundamental_divergence"}}, id="wrong-type-producer"),
+    pytest.param({"source": None}, id="null-source"),
+    pytest.param({"source": "fundamental_divergence_extra:Technology"}, id="source-prefix-boundary"),
+    pytest.param({"signal_type": "fundamental_divergence_extra"}, id="signal-boundary"),
+    pytest.param({"producer_module": "intelligence.fundamental_divergence_extra"}, id="producer-boundary"),
+    pytest.param({"source": "options", "signal_type": "insider"}, id="unrelated-source"),
+])
+def test_pg_nonmatching_json_shapes_are_eligible_without_evidence_guessing(journal_db, flags):
+    genuine = _insert_journal(journal_db, contradiction_flags=flags)
+    before = _raw_journal_evidence(journal_db)
+    assert _latest_qualified_journal(journal_db)[0] == genuine
+    assert _raw_journal_evidence(journal_db) == before
+
+
+def test_pg_ordinary_journal_and_contract_link_are_not_blanket_excluded(journal_db):
+    genuine = _insert_journal(
+        journal_db, inferred_state="NON_PROVISIONAL_EXPANSION",
+        action_taken="REVIEW PROVISIONAL signal", counterfactual="Consider provisional-from-contract:abc",
+        source_contract_id="00000000-0000-0000-0000-000000000002",
+        outcome_value=12.5, verdict="HELPED", annotation="Genuine decision and realized outcome",
+    )
+    before = _raw_journal_evidence(journal_db)
+    assert _latest_qualified_journal(journal_db)[0] == genuine
+    assert _raw_journal_evidence(journal_db) == before
+
+
+def test_pg_invalid_json_syntax_cannot_enter_journal_evidence(journal_db):
+    from sqlalchemy.exc import DataError
+    genuine = _insert_journal(journal_db)
+    before = _raw_journal_evidence(journal_db)
+    with pytest.raises(DataError):
+        with journal_db.begin() as conn:
+            conn.execute(text("""INSERT INTO decision_journal (
+                model_version_id,inferred_state,state_confidence,transition_probability,
+                contradiction_flags,grid_recommendation,baseline_recommendation,
+                action_taken,counterfactual,operator_confidence)
+                VALUES (1,'EXPANSION',0.7,0.1,CAST(:flags AS JSONB),
+                        'HOLD','HOLD','HOLD','synthetic','HIGH')"""), {"flags": "{not valid json"})
+    assert _latest_qualified_journal(journal_db)[0] == genuine
+    assert _raw_journal_evidence(journal_db) == before

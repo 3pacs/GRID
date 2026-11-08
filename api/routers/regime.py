@@ -19,6 +19,7 @@ from api.schemas.regime import (
     RegimeTransition,
     RegimeTransitionsResponse,
 )
+from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
 
 router = APIRouter(prefix="/api/v1/regime", tags=["regime"])
 
@@ -53,7 +54,9 @@ def get_weights(_token: str = Depends(require_auth)) -> dict:
         row = conn.execute(
             text(
                 "SELECT inferred_state, state_confidence, counterfactual "
-                "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+                "FROM decision_journal "
+                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
+                "ORDER BY decision_timestamp DESC LIMIT 1"
             )
         ).fetchone()
         if row:
@@ -189,6 +192,7 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
                     "decision_timestamp "
                     "FROM decision_journal "
                     "WHERE model_version_id = :mid "
+                    f"AND {NON_PROVISIONAL_JOURNAL_PREDICATE} "
                     "ORDER BY decision_timestamp DESC LIMIT 1"
                 ),
                 {"mid": prod[0]},
@@ -204,6 +208,7 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
                     "contradiction_flags, grid_recommendation, baseline_recommendation, "
                     "decision_timestamp "
                     "FROM decision_journal "
+                    f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
                     "ORDER BY decision_timestamp DESC LIMIT 1"
                 )
             ).fetchone()
@@ -277,6 +282,7 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
                 "inferred_state, state_confidence, transition_probability, "
                 "contradiction_flags, grid_recommendation, decision_timestamp "
                 "FROM decision_journal "
+                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
                 "ORDER BY inferred_state, decision_timestamp DESC"
             )
         ).fetchall()
@@ -375,9 +381,15 @@ def get_synthesis(_token: str = Depends(require_auth)) -> dict:
                 "SELECT DISTINCT ON (inferred_state) "
                 "inferred_state, state_confidence, grid_recommendation "
                 "FROM decision_journal "
+                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
                 "ORDER BY inferred_state, decision_timestamp DESC"
             )
         ).fetchall()
+        if not regime_rows:
+            raise HTTPException(
+                status_code=503,
+                detail="No non-provisional regime readings available",
+            )
 
         # Top movers
         mover_rows = conn.execute(

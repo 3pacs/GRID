@@ -25,6 +25,7 @@ from api.routers.watchlist_helpers import (
 # is how they drift. Module-level import is cheap: entity_resolver's own
 # imports are stdlib + loguru + sqlalchemy.
 from intelligence.entity_resolver import _log_query_failure
+from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
 
 router = APIRouter(tags=["watchlist"])
 
@@ -184,7 +185,9 @@ def get_ticker_overview(
         try:
             regime_row = conn.execute(text(
                 "SELECT inferred_state, state_confidence, grid_recommendation "
-                "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+                "FROM decision_journal "
+                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
+                "ORDER BY decision_timestamp DESC LIMIT 1"
             )).fetchone()
             if regime_row:
                 regime_info = {

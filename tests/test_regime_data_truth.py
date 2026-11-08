@@ -406,11 +406,12 @@ class TestRegimeCurrentEndpoint:
     def test_reports_the_data_date_beside_the_reading_date(self):
         from api.routers import regime as regime_router
 
-        today = date.today()
+        today = date(2026, 11, 8)
         reading_ts = datetime(today.year, today.month, today.day, 6, 0)
         engine = self._engine(reading_ts, DATA_CLIFF)
 
-        with patch.object(regime_router, "get_db_engine", return_value=engine):
+        with patch.object(regime_router, "get_db_engine", return_value=engine), \
+             patch.object(regime_router, "_utc_today", return_value=today):
             resp = regime_router.get_current(_token="t")
 
         # The row is from today; its data is five months old. Both are said.
@@ -422,10 +423,11 @@ class TestRegimeCurrentEndpoint:
     def test_a_row_without_a_data_date_reports_unknown(self):
         from api.routers import regime as regime_router
 
-        today = date.today()
+        today = date(2026, 11, 8)
         engine = self._engine(datetime(today.year, today.month, today.day, 6, 0), None)
 
-        with patch.object(regime_router, "get_db_engine", return_value=engine):
+        with patch.object(regime_router, "get_db_engine", return_value=engine), \
+             patch.object(regime_router, "_utc_today", return_value=today):
             resp = regime_router.get_current(_token="t")
 
         assert resp.data_as_of == ""

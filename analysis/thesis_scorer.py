@@ -51,6 +51,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
+from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
 
 
 # ── Constants ───────────────────────────────────────────────────────────
@@ -2423,7 +2424,9 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
         with engine.connect() as conn:
             row = conn.execute(text(
                 "SELECT inferred_state, state_confidence, counterfactual "
-                "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+                "FROM decision_journal "
+                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
+                "ORDER BY decision_timestamp DESC LIMIT 1"
             )).fetchone()
 
         if not row or not row[0]:

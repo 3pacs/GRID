@@ -38,6 +38,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
 from store.observations import read_latest, read_latest_n, read_window
 
 
@@ -307,6 +308,7 @@ def _score_regime(engine: Engine) -> SentimentComponent:
             row = conn.execute(text(
                 "SELECT inferred_state, state_confidence "
                 "FROM decision_journal "
+                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
                 "ORDER BY decision_timestamp DESC LIMIT 1"
             )).fetchone()
 

@@ -319,3 +319,10 @@ retryable source errors, current-generation replacement checks and postcommit
 verification now keep that work due; 22 dedicated regressions include the actual
 Hermes scheduling boundary. Changed-file lint, syntax and whitespace checks pass.
 Exact-head remote CI is a separate requirement after publishing this draft.
+
+
+A subsequent bounded containment slice adds financial-event replay barriers and
+nonprovisional-journal filters for reviewed current regime/feedback reads. Raw
+history is unchanged. See SEC_DERIVED_SIGNAL_INVALIDATION_PLAN.md and
+SEC_DERIVED_SIGNAL_INVENTORY.json for exact scope and unresolved transitive
+serving/learning dependencies. These guards do not close the broader rollout gate.

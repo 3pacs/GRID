@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
+
 
 # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -293,8 +295,9 @@ class TraceAnalyzer:
         """Get the current market regime from the latest decision journal entry."""
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(text("""
+                row = conn.execute(text(f"""
                     SELECT inferred_state FROM decision_journal
+                    WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE}
                     ORDER BY id DESC LIMIT 1
                 """)).fetchone()
             return row[0] if row else None

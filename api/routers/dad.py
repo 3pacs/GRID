@@ -25,6 +25,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth, require_stream_auth
 from api.dependencies import get_db_engine
+from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
 
 router = APIRouter(prefix="/api/v1/dad", tags=["dad"])
 
@@ -1149,6 +1150,7 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
                     "SELECT inferred_state, state_confidence, grid_recommendation, "
                     "operator_confidence, decision_timestamp "
                     "FROM decision_journal "
+                    f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
                     "ORDER BY decision_timestamp DESC LIMIT 1"
                 )
             ).fetchone()

@@ -438,3 +438,22 @@ Verification and limits:
 - Independent review caught retry-status ambiguity: source-version failures and
   rejected writes now raise retryable errors rather than marking Hermes due work
   done as empty/superseded. Postcommit checks and 22 dedicated regressions cover it.
+
+
+## 2026-11-08 - First derived-signal containment slice (draft only)
+
+- Added an explicitly incomplete source inventory and staged non-destructive
+  lineage/quarantine plan, including executable proof of lost ancestry.
+- Blocked financial event replay at all three SignalFired handlers before any
+  DB/provider effects. Existing producer suppression remains active.
+- Guarded 12 current regime/feedback reads against explicit provisional journal
+  records. Original history, operator actions and outcomes remain unchanged.
+  Empty synthesis returns 503 before LLM use, rather than inventing a regime.
+- 676 offline tests passed (9 optional skips); 71 private PostgreSQL tests passed,
+  including 36 actual-predicate and raw-evidence preservation cases. Lint,
+  compilation and diff checks passed. A date-sensitive test uses the existing
+  UTC seam; production clock behavior is unchanged.
+- Mixed historical registry/prediction/materialized/learned state still needs
+  qualified publications and clean learning epochs. This is not complete repair.
+  No production access, migration, deletion, merge or deployment. Remote
+  exact-head qualification remains required after any draft publication.
