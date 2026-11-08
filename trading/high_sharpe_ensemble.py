@@ -68,6 +68,10 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
         "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md",
         "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7",
     ),
+    "v6": (
+        "docs/paper_log/high-sharpe-ensemble-v6-preregistration.md",
+        "37bedb1a862f782d8efd99abc336492607ecd03ac3d0a2916a23187c5ff8cc1a",
+    ),
     "v5": (
         "docs/paper_log/high-sharpe-ensemble-v5-preregistration.md",
         "4c168b17317514aeec65298e28d8175bf04e1a17b68082e812d39a8459aab0de",
@@ -87,11 +91,11 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
 }
 PREREG_PATH, PREREG_SHA256 = REGISTRATIONS["v1"]
 
-ENSEMBLE_VERSION = "high-sharpe-ensemble/5"
+ENSEMBLE_VERSION = "high-sharpe-ensemble/6"
 
 #: Trials spent before each set's look: 240 rotation-sweep configs + v1's 7 candidates
 #: + v1's ensemble = 248; every later set adds its candidates and its ensemble.
-TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261, "v4": 270, "v5": 278}
+TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261, "v4": 270, "v5": 278, "v6": 280}
 
 
 def lf_sha256(data: bytes) -> str:
@@ -602,6 +606,27 @@ def v5_candidates() -> dict[str, CandidateFn]:
     return {name: pools[origin][name] for name, origin in V5_QUALIFIED.items()}
 
 
+# ── v6: regime-conditional selection over every weekly arm of v1–v3 (280 before) ──
+
+#: Regime cells of trading.regime_ensemble; each arm × cell is a trial for the deflated Sharpe.
+V6_CELLS = 6
+#: Long-sample arms (trading.regime_ensemble.long_sample_candidates) counted in the same set.
+V6_LONG_SAMPLE_ARMS = 8
+
+
+def v6_candidates() -> dict[str, CandidateFn]:
+    """Every weekly arm registered in v1, v2 and v3 (27), fresh state per call."""
+    out: dict[str, CandidateFn] = dict(CANDIDATES)
+    out.update(v2_candidates())
+    out.update(v3_candidates())
+    return out
+
+
+def v6_trials_added() -> int:
+    """27 ETF arms × 6 cells + 8 long-sample arms × 6 cells + 2 ensembles (ETF conditional, long-sample conditional)."""
+    return len(v6_candidates()) * V6_CELLS + V6_LONG_SAMPLE_ARMS * V6_CELLS + 2
+
+
 @dataclass(frozen=True)
 class CandidateSet:
     """One registered set: its universe, candidates, trial accounting and verdict rule."""
@@ -639,6 +664,12 @@ def candidate_set(name: str) -> CandidateSet:
         return CandidateSet("v2", UNIVERSE_V2, v2_candidates, TRIALS_BEFORE["v2"], "watch")
     if name == "v3":
         return CandidateSet("v3", UNIVERSE_V3, v3_candidates, TRIALS_BEFORE["v3"], "watch")
+    if name == "v6":
+        return CandidateSet(
+            "v6", UNIVERSE_V5, v6_candidates, TRIALS_BEFORE["v6"], "watch",
+            extra_ensembles=v6_trials_added(), count_candidates=False,
+            config_overrides={"regime_min_obs": 26},
+        )
     if name == "v5":
         return CandidateSet(
             "v5", UNIVERSE_V5, v5_candidates, TRIALS_BEFORE["v5"], "watch",
@@ -758,6 +789,7 @@ class EnsembleConfig:
     dsr_min: float = 0.95
     max_abs_segment_return: float = 0.5  # a single-name segment return beyond this is a data fault
     criterion: str = "v1_pass"  # "v1_pass" (v1 registration) or "watch" (v2 onward)
+    regime_min_obs: int = 26  # regime-conditional selection needs this many segments in the cell, else falls back
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -875,6 +907,7 @@ class EnsembleRun:
     benchmark_net: pd.Series
     selections: list[dict[str, Any]] = field(default_factory=list)
     faults: dict[str, Any] = field(default_factory=dict)
+    regime_path: pd.Series | None = None  # cell label in force at each segment start (as known then)
 
     @property
     def oos_index(self) -> pd.DatetimeIndex:
@@ -927,8 +960,16 @@ def walk_forward(
     *,
     engine: Any = None,
     pit: PanelPITStore | None = None,
+    regime: pd.Series | None = None,
 ) -> EnsembleRun:
-    """Run candidates and the selector over ``[start, end]`` on the given panel."""
+    """Run candidates and the selector over ``[start, end]`` on the given panel.
+
+    ``regime`` (optional): cell labels indexed by the date each label became *known*. When
+    given, the selector ranks candidates on their trailing returns inside the cell in force at
+    the selection date (the last ``config.trailing`` such segments); a cell with fewer than
+    ``config.regime_min_obs`` observed segments falls back to the unconditional trailing window
+    and the selection record says so.
+    """
     candidates = candidates or CANDIDATES
     dates = rebalance_dates(prices.index, start, end, config.rebalance)
     if len(dates) < config.trailing + 2:
@@ -944,6 +985,14 @@ def walk_forward(
     cand_gross = pd.DataFrame(gross)
     cand_turn = pd.DataFrame(turn)
 
+    # Regime in force at each segment start: the latest label known on or before that date.
+    regime_path: pd.Series | None = None
+    if regime is not None:
+        known = regime.dropna().sort_index()
+        regime_path = pd.Series(
+            [known.loc[: ts].iloc[-1] if len(known.loc[: ts]) else None for ts in seg.index], index=seg.index
+        )
+
     # Selection loop: allocation decided at segment i from candidate net returns on segments < i.
     alloc = pd.DataFrame(0.0, index=seg.index, columns=list(candidates))
     selections: list[dict[str, Any]] = []
@@ -953,6 +1002,15 @@ def walk_forward(
             continue
         if (i - config.trailing) % config.selection_every == 0:
             trailing = cand_net.iloc[i - config.trailing : i]
+            cell, cell_n, fallback = None, None, False
+            if regime_path is not None:
+                cell = regime_path.iloc[i]
+                in_cell = cand_net.iloc[:i][(regime_path.iloc[:i] == cell).to_numpy()]
+                cell_n = int(len(in_cell))
+                if cell is not None and cell_n >= config.regime_min_obs:
+                    trailing = in_cell.iloc[-config.trailing :]
+                else:
+                    fallback = True
             picked = select_top_k(
                 trailing, config.k, config.shrink_n0, config.corr_penalty,
                 config.min_shrunk_sharpe, config.periods_per_year,
@@ -961,6 +1019,9 @@ def walk_forward(
             selections.append(
                 {
                     "date": seg.index[i].date().isoformat(),
+                    "cell": cell,
+                    "cell_n": cell_n,
+                    "fallback": fallback,
                     "selected": picked,
                     "weights": {c: round(w, 6) for c, w in current.items()},
                     "shrunk_sharpe": {
@@ -1004,7 +1065,7 @@ def walk_forward(
         candidate_net=cand_net, candidate_gross=cand_gross, candidate_turnover=cand_turn,
         ensemble_weights=alloc, ensemble_underlying=underlying, ensemble_net=ens_net,
         ensemble_gross=ens_gross, ensemble_turnover=ens_turn, equal_weight_net=ew_net,
-        benchmark_net=bench_net, selections=selections, faults=faults,
+        benchmark_net=bench_net, selections=selections, faults=faults, regime_path=regime_path,
     )
 
 
@@ -1157,9 +1218,31 @@ def evaluate(run: EnsembleRun) -> dict[str, Any]:
     for s in run.selections:
         for c in s["selected"]:
             selection_counts[c] = selection_counts.get(c, 0) + 1
+    by_cell: dict[str, Any] = {}
+    if run.regime_path is not None:
+        cells = run.regime_path.loc[oos]
+        for cell in sorted({c for c in cells.dropna().unique()}):
+            mask = (cells == cell).to_numpy()
+            idx = oos[mask]
+            e_c, b_c = ens.loc[idx], bench.loc[idx]
+            ex_c = (e_c - b_c).dropna()
+            by_cell[str(cell)] = {
+                "n_segments": int(len(idx)),
+                "share": float(mask.mean()) if len(mask) else None,
+                "ensemble": series_summary(e_c, cfg.periods_per_year),
+                "spy": series_summary(b_c, cfg.periods_per_year),
+                "equal_weight": series_summary(ew.loc[idx], cfg.periods_per_year),
+                "excess_vs_spy_bootstrap": block_bootstrap_mean(
+                    ex_c.to_numpy(), reps=cfg.bootstrap_reps, seed=cfg.seed, alpha=cfg.alpha
+                ) if len(ex_c) >= 8 else {"n": int(len(ex_c)), "error": "n < 8"},
+                "candidates": {c: series_summary(cand_oos.loc[idx, c], cfg.periods_per_year) for c in cand_oos.columns},
+            }
+        fallbacks = [s for s in run.selections if s.get("fallback")]
+        by_cell["_selection_fallback_share"] = float(len(fallbacks) / len(run.selections)) if run.selections else None
     return {
         "version": ENSEMBLE_VERSION,
         "config": cfg.as_dict(),
+        "by_regime_cell": by_cell,
         "oos_period": {
             "first_segment": oos.min().date().isoformat() if len(oos) else None,
             "last_segment": oos.max().date().isoformat() if len(oos) else None,
@@ -1268,7 +1351,7 @@ def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
 __all__ = [
     "BENCHMARK", "CANDIDATES", "Cadenced", "CandidateSet", "REGISTRATIONS", "TRIALS_BEFORE", "UNIVERSE_V2",
     "UNIVERSE_V3", "UNIVERSE_V4", "UNIVERSE_V5", "V5_QUALIFIED", "candidate_set", "v2_candidates", "v3_candidates",
-    "v4_candidates", "v5_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
+    "v4_candidates", "v5_candidates", "v6_candidates", "v6_trials_added", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
     "PREREG_SHA256", "PanelPITStore", "UNIVERSE", "annualised_sharpe", "block_bootstrap_mean",
     "compute_candidate_paths", "deflated_sharpe", "evaluate", "frame_to_records", "inverse_vol_weights",
     "path_returns", "pbo_over_candidates", "rebalance_dates", "registration_sha256", "report_markdown",

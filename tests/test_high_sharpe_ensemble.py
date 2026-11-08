@@ -502,3 +502,109 @@ def test_v5_set_counts_only_its_two_ensembles_and_primary_holds_every_arm():
     text = (REPO_ROOT / hse.REGISTRATIONS["v5"][0]).read_text(encoding="utf-8")
     assert "280" in text and all(f"`{a}`" in text or f"`{a.rsplit('_', 1)[0]}_M` / `_W`" in text for a in arms)
     assert set(hse.UNIVERSE_V5) >= set(hse.UNIVERSE) | set(hse.V2_ASSETS) | set(hse.UNIVERSE_V3)
+
+
+# ── v6: regime-conditional selection, long sample ───────────────────────────
+
+from trading import regime_ensemble as rg  # noqa: E402
+
+
+def _macro(n: int = 200, seed: int = 5) -> rg.RegimeInputs:
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("1990-01-01", periods=n, freq="MS")
+    cpi = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.002, 0.002, n))), index=idx)
+    indpro = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.001, 0.005, n))), index=idx)
+    aaa = pd.Series(5.0 + rng.normal(0, 0.1, n), index=idx)
+    baa = aaa + 0.9 + rng.normal(0, 0.05, n)
+    wti = pd.Series(30 * np.exp(np.cumsum(rng.normal(0, 0.03, n))), index=idx)
+    return rg.RegimeInputs(cpi=cpi, indpro=indpro, baa=baa, aaa=aaa, wti=wti)
+
+
+def test_label_cells_quadrants_and_override_precedence():
+    inp = _macro()
+    f = rg.regime_factors(inp)
+    cells = rg.label_cells(f)
+    assert set(cells.dropna().unique()) <= set(rg.CELLS)
+    assert cells.iloc[:24].isna().all()  # needs 12 m of y/y plus 12 m of its lag
+    # force a stress month and an oil-shock month and check precedence
+    f2 = f.copy()
+    t = f2.dropna().index[-1]
+    f2.loc[t, "baa_aaa"] = f2.loc[t, "stress_threshold"] + 1.0
+    f2.loc[t, "oil_6m_log"] = 0.9
+    assert rg.label_cells(f2.loc[[t]]).iloc[0] == "stress"
+    f2.loc[t, "baa_aaa"] = f2.loc[t, "stress_threshold"] - 0.1
+    assert rg.label_cells(f2.loc[[t]]).iloc[0] == "oil_shock"
+    f2.loc[t, "oil_6m_log"] = 0.0
+    f2.loc[t, "indpro_yoy"], f2.loc[t, "cpi_yoy"], f2.loc[t, "cpi_yoy_12m_ago"] = 0.02, 0.04, 0.02
+    assert rg.label_cells(f2.loc[[t]]).iloc[0] == "expand_reflate"
+    f2.loc[t, "indpro_yoy"], f2.loc[t, "cpi_yoy"] = -0.02, 0.01
+    assert rg.label_cells(f2.loc[[t]]).iloc[0] == "contract_disinfl"
+
+
+def test_cells_known_at_applies_the_slowest_publication_lag_and_current_regime_reads_it():
+    inp = _macro()
+    f = rg.regime_factors(inp)
+    cells = rg.label_cells(f)
+    known = rg.cells_known_at(cells)
+    first = cells.dropna().index[0]
+    assert known.index[0] == first + pd.Timedelta(days=50)  # INDPRO 50 > CPI 45
+    cur = rg.current_regime(f, cells, (first + pd.Timedelta(days=55)).date())
+    assert cur["cell"] == cells.loc[first] and cur["observation_month"] == first.date().isoformat()
+    too_early = rg.current_regime(f, cells, (first + pd.Timedelta(days=10)).date())
+    assert too_early["cell"] is None
+
+
+def test_bond_index_from_yields_rises_when_yields_fall():
+    y = pd.Series([5.0, 4.5, 4.0, 3.5], index=pd.date_range("2000-01-01", periods=4, freq="MS"))
+    idx = rg.bond_index_from_yields(y, duration=7.0)
+    assert (idx.diff().dropna() > 0).all()
+    y_up = pd.Series([3.0, 3.5, 4.0], index=pd.date_range("2000-01-01", periods=3, freq="MS"))
+    assert rg.bond_index_from_yields(y_up, 7.0).iloc[-1] < 1.0
+
+
+def test_long_sample_arms_hold_cash_in_bills_and_respect_missing_bonds():
+    idx = pd.date_range("1930-01-31", periods=30, freq="ME")
+    down = pd.DataFrame({"MKT": np.linspace(100, 60, 30), "RF": np.linspace(1, 1.02, 30), "MOM": 1.0, "HML": 1.0,
+                         **{c: np.linspace(100, 60, 30) for c in rg.LS_INDUSTRIES}}, index=idx)
+    down["Enrgy"] = np.linspace(100, 120, 30)
+    ctx = hse.DecisionContext(as_of=idx[-1].date(), prices=down, vix=pd.Series(dtype=float))
+    assert rg.ls_mkt_tsmom(ctx) == {"RF": 1.0} and rg.ls_mkt_ma10(ctx) == {"RF": 1.0}
+    top = rg.ls_industry_mom_top3(ctx)
+    assert "Enrgy" in top and len(top) == 3
+    assert rg.ls_bonds(ctx) == {} and rg.ls_6040(ctx) == {}
+    down["BOND"] = 1.0
+    assert rg.ls_6040(hse.DecisionContext(as_of=idx[-1].date(), prices=down, vix=pd.Series(dtype=float))) == {"MKT": 0.6, "BOND": 0.4}
+    assert len(rg.long_sample_candidates()) == 8
+
+
+def test_engine_regime_conditional_selection_uses_in_cell_history_and_falls_back(panel):
+    prices, vix = panel
+    seg_dates = hse.rebalance_dates(prices.index, date(2019, 1, 2), date(2021, 12, 31))
+    # alternate two cells by calendar half-year, known immediately
+    labels = pd.Series(["A" if d.month <= 6 else "B" for d in seg_dates], index=pd.DatetimeIndex([pd.Timestamp(d) for d in seg_dates]))
+    cfg = hse.EnsembleConfig(trailing=26, selection_every=4, bootstrap_reps=200, regime_min_obs=20)
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    run = hse.walk_forward(prices, vix, date(2019, 1, 2), date(2021, 12, 31), cfg, pit=pit, regime=labels)
+    assert run.regime_path is not None and set(run.regime_path.dropna().unique()) == {"A", "B"}
+    sels = run.selections
+    assert all(s["cell"] in ("A", "B") for s in sels)
+    assert any(s["fallback"] for s in sels[:2]) and any(not s["fallback"] for s in sels[-4:])
+    rep = hse.evaluate(run)
+    cells = rep["by_regime_cell"]
+    assert set(cells) >= {"A", "B", "_selection_fallback_share"}
+    assert cells["A"]["n_segments"] + cells["B"]["n_segments"] == len(run.oos_index)
+    assert 0.0 <= cells["_selection_fallback_share"] <= 1.0
+
+
+def test_v6_set_counts_arm_times_cell_trials():
+    v6 = hse.candidate_set("v6")
+    assert len(v6.candidates()) == 27
+    assert hse.v6_trials_added() == 27 * 6 + 8 * 6 + 2 == 212
+    assert v6.n_trials_cumulative == 280 + 212 == 492
+    assert v6.config().regime_min_obs == 26 and v6.config().criterion == "watch"
+    text = (REPO_ROOT / hse.REGISTRATIONS["v6"][0]).read_text(encoding="utf-8")
+    for cell in rg.CELLS:
+        assert f"`{cell}`" in text, cell
+    for arm in rg.long_sample_candidates():
+        assert f"`{arm}`" in text, arm
+    assert "492" in text and "1946" in text and "1973" in text
