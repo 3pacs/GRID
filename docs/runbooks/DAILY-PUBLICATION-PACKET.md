@@ -222,6 +222,72 @@ ExecStart=/usr/bin/rsync -rt --chmod=D0755,F0644 --include='*/' --include='packe
 # grid-publication-packet-mirror.timer: OnCalendar=*-*-* 11:05:00 UTC, Persistent=true
 ```
 
+## Review ingest (machine-readable output, in-repo, scheduled)
+
+The deliverable of the daily review is a file, not a document (operator direction
+2026-11-07: "everything needs to be machine readable first"). The grader writes one
+`review.jsonl` per publication day, schema `publication-review-verdicts-v1`:
+
+- line 1, `review_header`: `publication_day`, `packet_sha256` (the producer's
+  `receipt.json.packet_sha256`, read back), `grader.model`, `adjudicator`, `graded_at`,
+  declared `claims_total` / `claims_graded` / `claims_unscorable`;
+- lines 2..n, one `claim_verdict` per claim: `publication_id` (`market_briefings:<id>` or
+  `thesis_snapshots:<id>`), `publication_sha256` (the packet text hash), `stated_at`
+  (= packet `published_at`), a verbatim `claim_span` (<= 300 chars) and its
+  `claim_sha256`, `claim_type` (direction|level|event|causal|data_quality), `instrument`,
+  `horizon_end`, `verdict` (confirmed|refuted|partially_confirmed|unresolved|unscorable),
+  `evidence[]` (`source`, `observed`, `as_of`, `url`), `knowable_at_stated_at`,
+  `root_cause`, `lesson`, `grader_confidence`; thesis rows add `thesis_direction` and
+  `actual_direction` (bullish|bearish|neutral).
+
+Rules the ingest enforces (a row that breaks one is rejected with a reason; the rest
+of the file still ingests): the span must be a verbatim substring of that publication's
+text, 8–300 chars; `causal` claims can only be `refuted`, `unresolved` or `unscorable`;
+`unscorable` requires `evidence=[]` and a one-line `root_cause`; `confirmed` / `refuted` /
+`partially_confirmed` require concrete evidence (each item: non-blank `source`, scalar
+`observed`, `as_of` no later than `graded_at`) and a `horizon_end` strictly after
+`stated_at` and no later than `graded_at` (no look-ahead grading); `direction` claims must
+agree with their verdict (`confirmed` ⇒ `thesis_direction == actual_direction`, `refuted`
+⇒ differ) and a thesis row's `thesis_direction` must match the snapshot's stored
+`overall_direction`; no duplicate `(publication_id, claim_sha256)` in one file; no NUL,
+NaN or lone-surrogate content anywhere. The file is treated as hostile input: a row the
+validator cannot process is rejected, never fatal. A header whose `packet_sha256` does not
+match the producer's receipt refuses the whole file: the grader read different bytes.
+Declared header counts are reconciled against the file and a mismatch is reported (exit 3).
+
+`scripts/ingest_publication_review.py` (unit templates
+`deploy/systemd/grid-publication-review-ingest.{service,timer}.template`, 13:05Z daily
+for the previous UTC day, `SuccessExitStatus=3`) reads
+`$GRID_PUBLICATION_REVIEW_ROOT/<D>/review.jsonl` and the packet under
+`$GRID_PUBLICATION_PACKET_ROOT/<D>/`, verifies the chain, and in one transaction writes:
+
+| table | rows | notes |
+|---|---|---|
+| `publication_review_runs` | one per ingested file | `review_sha256` UNIQUE: a re-run of the same bytes is a no-op (`PRESENT`). Grader identity, declared vs accepted counts, `supersedes_run_id` → the day's previous run when a corrected file is ingested (analytics take the latest run per day). |
+| `publication_claim_verdicts` | one per accepted claim | The single machine record, both channels; consumers join on `(channel, source_row_id)`. Append-only by trigger. |
+
+Nothing is written to `thesis_postmortems`: that table is `intelligence/thesis_tracker.py`'s
+wrong-thesis analysis (enum root causes, under its scoring hold), and a grader row there
+would both pollute it and block the tracker's own postmortem for the snapshot. Wiring review
+verdicts into the thesis learning loop is a separate decision for that hold's owner.
+
+It then writes `<D>/ingest-receipt.json` (`INGESTED` / `PRESENT`) or
+`ingest-REFUSED-<stamp>.json` / `ingest-FAILED-<stamp>.json`. Exit 0 ingested or present,
+1 refused/failed (nothing written), 3 ingested with rejected rows or a declared-count
+mismatch. Without `--day` the job scans the last 3 days (`--lookback`) for a `review.jsonl`
+with no `ingest-receipt.json`, so a late-delivered file is picked up next run. Migration:
+`migrations/versions/pub_review_ingest_20261108.py`.
+
+Delivery of `review.jsonl` to grid-svr: the grader writes it under its own daily-review
+folder on precision5520; the mirror timer there gains a reverse leg (12:35Z) that pushes
+`<D>/review.jsonl` to `grid-svr:research/publication-reviews/<D>/`. Nothing else in the
+review folder is pushed.
+
+Acceptance for a day, as a chain: `receipt.json` present -> `review.jsonl` present with
+`header.packet_sha256 == receipt.json.packet_sha256` -> every `claim_span` verifies ->
+`ingest-receipt.json` state `INGESTED` with `rejected_rows == 0`. Markdown or audio
+derivatives of the review are optional and never part of acceptance.
+
 ## Consumer adoption and operational acceptance
 
 The daily review owner adopts the packet in its existing job instructions.

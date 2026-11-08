@@ -318,3 +318,37 @@ Verification and limits:
 - Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
   own stages) is recorded in the runbook's consumer checklist; the producer cannot
   supply those receipts. Gemini/provider input remains the daily review's own gate.
+
+## 2026-11-08 — Daily review becomes machine-readable: `review.jsonl` ingest (Claude)
+
+Scope: `scripts/ingest_publication_review.py`, `migrations/versions/pub_review_ingest_20261108.py`
+(`publication_review_runs`, `publication_claim_verdicts`, append-only), unit templates
+`deploy/systemd/grid-publication-review-ingest.{service,timer}.template` (13:05Z),
+`tests/test_ingest_publication_review.py`, runbook section "Review ingest", `.env.example`
+(`GRID_PUBLICATION_REVIEW_ROOT`).
+
+Why: the Oct 5–22 daily reviews were documents in the grader's Library that the operator
+never saw and nothing in GRID consumed ("0 measured outcomes" every day). Operator
+direction 2026-11-07: "everything needs to be machine readable first … the machines will
+be doing the research." The deliverable is now one `review.jsonl` per day
+(`publication-review-verdicts-v1`), bound to the producer's packet by hash and to each
+publication by a verbatim span; this job verifies and ingests it. The file is treated as
+hostile input (another agent writes it): regular-file and size checks before reading,
+per-row isolation, no NUL/NaN/lone-surrogate content reaches the driver, receipts written
+through O_EXCL temp files, no look-ahead grading (evidence and horizons must predate
+`graded_at`).
+
+Decision: no projection into `thesis_postmortems`. An independent review of the first
+draft showed that table is the thesis tracker's wrong-thesis analysis (enum root causes,
+under `THESIS_SCORING_HELD`), and a grader row there would both pollute it and block the
+tracker's own postmortem for that snapshot. `publication_claim_verdicts` is the single
+record; wiring it into the thesis learning loop is the hold owner's decision.
+
+Verification and limits:
+
+- 101 offline tests (fake engine that enforces bind names, int4 range, jsonb validity, NUL,
+  span length and the UNIQUE review hash, with rollback on failure) + alembic single-head +
+  systemd invariants pass locally.
+- Not verified here: the grader's first `review.jsonl` (its owner adopts the schema), the
+  reverse mirror leg, the first scheduled ingest on grid-svr. Those are the runbook's
+  acceptance chain. No row is ever updated: a correction is a new review file.
