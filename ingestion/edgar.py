@@ -128,6 +128,32 @@ class EDGARPuller(BasePuller):
                 return str(hit)
         return None
 
+    @staticmethod
+    def _filing_date(filing: Any) -> date:
+        return (
+            filing.filing_date
+            if isinstance(filing.filing_date, date)
+            else pd.Timestamp(filing.filing_date).date()
+        )
+
+    def _stored_13f_dates(self, cik: str) -> set[date]:
+        """Filing dates whose 13F metrics this source already stored for ``cik``.
+
+        Every run used to re-download and re-parse each fund's 4 latest
+        infotables (75 funds: 4 min 38 s on 2026-11-08 against a 180 s
+        scheduler timeout) and, past the 1-hour ``_row_exists`` window,
+        re-insert ~830 identical rows (7,452 rows for 831 pairs).
+        """
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT DISTINCT obs_date FROM raw_series "
+                    "WHERE series_id = :sid AND source_id = :src AND pull_status = 'SUCCESS'"
+                ),
+                {"sid": f"13F:{cik}:TOTAL_VALUE", "src": self.source_id},
+            ).fetchall()
+        return {r[0] for r in rows}
+
     def pull_13f_holdings(
         self,
         cik_list: list[str] | None = None,
@@ -169,12 +195,19 @@ class EDGARPuller(BasePuller):
                 if filings is None:
                     continue
 
+                stored_dates = self._stored_13f_dates(cik)
                 processed = 0
                 for filing in filings:
                     if processed >= max_filings_per_fund:
                         break
 
                     try:
+                        if self._filing_date(filing) in stored_dates:
+                            # An original 13F-HR does not change once filed
+                            # (amendments are 13F-HR/A); skip the infotable
+                            # download and parse.
+                            processed += 1
+                            continue
                         thirteenf = filing.obj()
                         holdings = thirteenf.infotable
 
@@ -182,11 +215,7 @@ class EDGARPuller(BasePuller):
                             processed += 1
                             continue
 
-                        filing_date = (
-                            filing.filing_date
-                            if isinstance(filing.filing_date, date)
-                            else pd.Timestamp(filing.filing_date).date()
-                        )
+                        filing_date = self._filing_date(filing)
 
                         # Resolve the value column case-insensitively:
                         # edgartools 5.x (5.28.4 on grid-hermes, 5.61.1

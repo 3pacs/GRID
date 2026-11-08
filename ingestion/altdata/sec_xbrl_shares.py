@@ -628,7 +628,13 @@ class SECXBRLSharesPuller:
                 try:
                     cik_padded = cik_map.get(ticker)
                     if not cik_padded:
-                        raise RuntimeError("no_cik")
+                        # Not an SEC filer under this ticker (ETFs such as KRE
+                        # or XBI, foreign OTC lines, acquired or renamed
+                        # companies: 141 of 1,268 on 2026-11-08). Nothing to
+                        # materialize, like no_shares; not a failed ticker.
+                        results.append({"ticker": ticker, "status": "NO_NEW_DATA",
+                                        "rows": 0, "reason": "no_cik"})
+                        continue
                     facts = _fetch_company_facts(cik_padded)
                     if not permitted():
                         raise _MaterializationDeferred("cancelled after facts")
