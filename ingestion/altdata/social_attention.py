@@ -49,6 +49,18 @@ TICKER_SEARCH_TERMS: dict[str, dict[str, str]] = {
 
 _RATE_LIMIT = 1.5  # seconds between requests
 
+# Wikimedia's User-Agent policy asks for contact details; generic agents are
+# throttled first (HTTP 429 on search and Wikidata, 2026-11-08).
+_WIKIMEDIA_UA = "GRID-DataPuller/1.0 (anik@stepdad.finance)"
+
+
+class _LookupUnavailable(Exception):
+    """A Wikipedia/Wikidata lookup could not be answered (429, 5xx, network).
+
+    Distinct from "no matching article": the answer is unknown, so it is
+    neither cached nor reported as a skip.
+    """
+
 
 # ── Wikipedia Pageview Puller ────────────────────────────────────────────
 
@@ -160,7 +172,8 @@ class WikipediaAttentionPuller(BasePuller):
 
         Returns ``None`` if no SEC/DB name is available, in which case
         the ticker is skipped (better empty than wrong, per the
-        feedback_data_confidence_labels rule).
+        feedback_data_confidence_labels rule). Raises ``_LookupUnavailable``
+        when Wikipedia search could not answer.
         """
         # (1) static map
         info = TICKER_SEARCH_TERMS.get(ticker)
@@ -212,6 +225,8 @@ class WikipediaAttentionPuller(BasePuller):
             self._article_cache[ticker] = None
             return None
 
+        # _LookupUnavailable propagates uncached: a rate-limited search is
+        # not evidence that the company has no article.
         article = self._wiki_search(candidates, ticker)
         self._article_cache[ticker] = article
         return article
@@ -330,20 +345,19 @@ class WikipediaAttentionPuller(BasePuller):
                     "format": "json",
                     "languages": "en",
                 },
-                headers={
-                    "User-Agent": "GRID-DataPuller/1.0 (trading intelligence)"
-                },
+                headers={"User-Agent": _WIKIMEDIA_UA},
                 timeout=10,
             )
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            # Fail-open: don't let Wikidata flakiness kill the whole run.
+            # Fail-open: don't let Wikidata flakiness kill the whole run. The
+            # unverified answer is not cached: a 429 cached as True would
+            # wave a non-company title through for the process lifetime.
             log.debug(
-                "wikidata lookup failed for '{t}': {e} (fail-open)",
+                "wikidata lookup failed for '{t}': {e} (fail-open, not cached)",
                 t=title, e=str(exc),
             )
-            cls._wikidata_cache[title] = True
             return True
 
         entities = (data or {}).get("entities") or {}
@@ -474,11 +488,13 @@ class WikipediaAttentionPuller(BasePuller):
                         "srlimit": 3,
                         "format": "json",
                     },
-                    headers={
-                        "User-Agent": "GRID-DataPuller/1.0 (trading intelligence)"
-                    },
+                    headers={"User-Agent": _WIKIMEDIA_UA},
                     timeout=10,
                 )
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise _LookupUnavailable(
+                        f"Wikipedia search HTTP {resp.status_code}"
+                    )
                 resp.raise_for_status()
                 data = resp.json()
                 hits = data.get("query", {}).get("search", [])
@@ -510,6 +526,10 @@ class WikipediaAttentionPuller(BasePuller):
                         t=ticker, a=article, q=query,
                     )
                     return article
+            except _LookupUnavailable:
+                raise
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                raise _LookupUnavailable(f"Wikipedia search failed: {exc}") from exc
             except Exception as exc:
                 log.debug(
                     "wiki search '{q}' failed for {t}: {e}",
@@ -522,9 +542,15 @@ class WikipediaAttentionPuller(BasePuller):
 
     def pull_ticker(self, ticker: str, days: int = 90) -> dict[str, Any]:
         """Pull Wikipedia pageview data for a ticker."""
-        article = self._resolve_wiki_article(ticker)
+        try:
+            article = self._resolve_wiki_article(ticker)
+        except _LookupUnavailable as exc:
+            return {"status": "FAILED", "ticker": ticker, "rows": 0,
+                    "error": str(exc), "reason": "wiki_lookup_unavailable"}
         if not article:
-            return {"status": "SKIPPED", "ticker": ticker, "rows": 0,
+            # A checked ticker with no company article is a clean empty
+            # result (like a ticker with no CIK), not a skipped item.
+            return {"status": "NO_NEW_DATA", "ticker": ticker, "rows": 0,
                     "reason": "no_wiki_article"}
         end = date.today()
         start = end - timedelta(days=days)
@@ -544,7 +570,7 @@ class WikipediaAttentionPuller(BasePuller):
         try:
             resp = requests.get(
                 url,
-                headers={"User-Agent": "GRID-DataPuller/1.0 (trading intelligence)"},
+                headers={"User-Agent": _WIKIMEDIA_UA},
                 timeout=15,
             )
             resp.raise_for_status()
@@ -622,18 +648,21 @@ class WikipediaAttentionPuller(BasePuller):
         results = []
         total = 0
         skipped = 0
+        unavailable = 0
         for ticker in tickers:
             result = self.pull_ticker(ticker, days=days)
             results.append(result)
-            if result.get("status") == "SKIPPED":
+            if result.get("reason") == "no_wiki_article":
                 skipped += 1
+            elif result.get("reason") == "wiki_lookup_unavailable":
+                unavailable += 1
             total += result.get("rows", 0)
             time.sleep(_RATE_LIMIT)
 
         log.info(
             "Wikipedia attention: {n} total rows from {t} tickers "
-            "({sk} skipped — no wiki article)",
-            n=total, t=len(tickers), sk=skipped,
+            "({sk} without a wiki article, {u} lookups unavailable)",
+            n=total, t=len(tickers), sk=skipped, u=unavailable,
         )
         return {
             "status": "SUCCESS", "rows_inserted": total,
