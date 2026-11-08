@@ -242,3 +242,34 @@ drawdown no worse yes).
 
 Per the registration: no shadow book, no governance row; v3 (volatility-managed and risk parity)
 is registered next with the cumulative count 261 + its arms + 1.
+
+## 6. Set v3 — volatility-managed and risk parity (look 2026-11-08T07:58Z, code `bb4b3201`)
+
+Registration `docs/paper_log/high-sharpe-ensemble-v3-preregistration.md`; record
+`docs/reports/high-sharpe-ensemble-v3-look-20261108T0758Z.{json,md}`. Eight arms (10 % vol-target
+SPY and QQQ, inverse-vol risk parity SPY/TLT/GLD/DBC, vol-scaled 60/40 SPY/IEF; monthly and weekly),
+no leverage, cumulative trials 270, no exclusions.
+
+**Verdict: FAIL** (Sharpe > SPY no, excess LB > 0 no, DSR 0.97 yes, drawdown no worse yes).
+
+| series | Sharpe | ann. return | max DD | total | excess vs SPY weekly, 95 % LB |
+|---|---|---|---|---|---|
+| ensemble (top-3 of 8) | 0.82 | 7.1 % | −16.5 % | +97 % | mean −0.146 %, LB −0.260 % |
+| SPY buy-and-hold | 0.87 | 14.3 % | −31.8 % | +275 % | — |
+| 1/N over the 8 arms | **1.07** | 9.2 % | −14.9 % | +138 % | |
+| best arm in hindsight: `vol_target_qqq_W` | 1.07 | 11.2 % | −15.9 % | +185 % | −0.229 % (α/8) |
+| `vol_target_spy_W` | 0.93 | 9.3 % | −13.5 % | | −0.241 % |
+| `risk_parity_4_W` | 0.93 | 8.5 % | −18.7 % | | −0.312 % |
+| `sixty_forty_vol_scaled_W` | 0.90 | 7.4 % | −16.7 % | | −0.290 % |
+
+- Every v3 arm has a higher Sharpe than SPY and half its drawdown, and every one earns less: without
+  leverage, volatility management trades return for smoothness, and the excess-return bound stays
+  negative by 0.23 to 0.31 % a week. The deflated Sharpe passes easily (0.97) because the eight arms
+  are nearly identical in Sharpe and the ensemble's per-week Sharpe (0.114) is well above the
+  270-trial threshold (0.027).
+- The selector lost to 1/N again (0.82 vs 1.07), as in v2 (0.62 vs 0.77); PBO 0.65 says trailing
+  Sharpe ranks these arms no better than chance out of sample. Across three sets the "pick recent
+  winners" layer has subtracted 0.15 to 0.25 of Sharpe relative to holding all arms equally.
+
+Per the registration: no shadow book, no governance row; v4 (short-horizon mean reversion on
+SPY/QQQ, daily segments, 20 bp primary and 10 bp secondary) is registered with 270 + 6 + 2 = 278.
