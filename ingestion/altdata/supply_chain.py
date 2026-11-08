@@ -698,10 +698,20 @@ class SupplyChainPuller(BasePuller):
             fred_id = meta["fred_id"]
 
             try:
-                data: pd.DataFrame = fred.get_series_observations(
-                    fred_id,
-                    observation_start=str(start_date),
-                )
+                try:
+                    data: pd.DataFrame = fred.get_series_observations(
+                        fred_id,
+                        observation_start=str(start_date),
+                    )
+                except KeyError as exc:
+                    # fedfred 3.0's to_pd_df indexes df['date'] even when FRED
+                    # returns no observations, so an empty window (a monthly
+                    # series asked for the last few weeks) raises KeyError('date').
+                    # That is "no new data", not a failure (172 warnings/24h
+                    # on 2026-11-07, and Supply_Chain marked PARTIAL every run).
+                    if exc.args != ("date",):
+                        raise
+                    data = None
 
                 if data is None or data.empty:
                     log.debug("FRED {fid}: no data returned", fid=fred_id)
@@ -767,9 +777,11 @@ class SupplyChainPuller(BasePuller):
 
             time.sleep(0.25)  # FRED rate limit
 
+        # PARTIAL only when a series actually failed: no new rows in the window
+        # is the normal state for monthly data between releases.
         return {
             "source": "fred_ism",
-            "status": "SUCCESS" if total_inserted > 0 else "PARTIAL",
+            "status": "PARTIAL" if errors else "SUCCESS",
             "rows_inserted": total_inserted,
             "errors": errors,
         }

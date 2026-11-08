@@ -363,15 +363,8 @@ def _card_inputs():
     (8, "; STALE at rendering (5d old)"),
 ])
 def test_card_states_the_exact_call(monkeypatch, rendered_day, stale_note):
-    # The fixture is a Nov 3 snapshot; do not let the wall clock change its contract.
-    class FrozenDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2026, 11, rendered_day, 16, tzinfo=timezone.utc).astimezone(tz)
-
-    monkeypatch.setattr(hx, "datetime", FrozenDateTime)
-    # Fixture timestamps must retain datetime identity for the formatter's type checks.
-    monkeypatch.setattr(sys.modules[__name__], "datetime", FrozenDateTime)
+    # Pin main's clock seam while retaining both fresh and stale regressions.
+    monkeypatch.setattr(hx, "_utc_today", lambda: date(2026, 11, rendered_day))
     opp, v = _card_inputs()
     card = hx._format_opportunity_card(opp, v, 1)
     plain = hx._plain(card["body"])
