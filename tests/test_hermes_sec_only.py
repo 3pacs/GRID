@@ -592,7 +592,13 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # _log_run writing a missing-key SKIPPED as SUCCESS / 0 rows /
         # "SKIPPED: Missing API key: X" (other skips stay unlogged). Needs
         # reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','accdd222f8a71b7394bf14724ccbc8c18f8aa58e041a3a6a078033a1b5675835')]:
+        # SCHED re-pinned accdd222 -> 5716c158 (2026-11-07,
+        # claude/registry-divergence-aliases-20261107): the only scheduler
+        # edit is _warn_registry_divergence also exempting the source_catalog
+        # aliases _build_source_registry derives from REGISTRY_CATALOG_NAMES
+        # (all 33 reported "orphans" were those aliases). Needs reviewer
+        # acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','5716c1581b4e7998b4caba9b352423c5d4076ec89e041f88d0f53ad04663e2b9')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

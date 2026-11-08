@@ -162,6 +162,44 @@ Broken or TBD:
 - Add a manifest-backed copy/remove executor after parser proof; the current subagent is intentionally inventory/plan only.
 - The live `/home/grid/grid_v4/grid_repo` checkout is on `fix/hermes-active-hypo-scoring-dedent-2026-05-17`, ahead of origin with many dirty files. Do not hard-reset it; reconcile as a separate server-worktree cleanup.
 
+## 2026-11-06 - explicit daily publication packet handoff job (source only)
+
+What was done:
+
+- Added `docs/runbooks/DAILY-PUBLICATION-PACKET.md`: Codex owns end-to-end daily
+  closure and Claude owns capture production. Named the UTC-day key, existing
+  scheduler, stage receipts, admission/A10 handoff, private custody/dedup,
+  privacy screening, local/Gemini review and visible failure/deadline handling.
+- Added a stdlib-only offline status reporter and operational regression tests.
+  It summarizes supplied metadata, never authorizes execution, and does not
+  replace the external producer, its one-use registry or the existing scheduler.
+- Reconciled scope with M0 issue #958 and research protocol issue #960; neither
+  is completed by this operational handoff. No `.agents/skills` directory was
+  present; inspected relevant `.claude/skills` and the module inventory instead.
+
+Non-obvious decisions:
+
+- A missing capture/admission record does not establish diary execution failure.
+  The status explicitly distinguishes diary evidence from packet preparation and
+  admission review. `COMPLETE_REPORTED` is a declaration, not custody verification
+  or scientific acceptance.
+- A10's existing conditions remain required. Spent/started/unknown capture
+  attempts require reconciliation and cannot be automatically replayed.
+
+Broken or TBD:
+
+- Existing external automation/producer owners must adopt the observation
+  contract and retain runtime receipts at the existing private ledger. This
+  source PR does not prove today's diary ran or repair historical packets.
+- No capture, production query, Gemini call, timer/schedule change, merge or
+  deployment is included. Full repository CI and native runtime acceptance
+  remain separate from the offline controls.
+
+Next pick-up:
+
+- Follow the runbook's adoption/operational acceptance checklist in the existing
+  automation. Retain one naturally scheduled run's two output statuses and
+  failure notification before declaring the pipeline repaired.
 ## 2026-11-07 - summary-first Oracle and operator email reporting (source only)
 
 What was done:
@@ -275,3 +313,42 @@ Verification and limits:
   real account-wide budgeting. The current local ledger is not a global limiter.
 - No production writes, paid API calls, push, PR, merge, deployment, or scheduler
   changes. Legacy date semantics, metadata breadth and shared budgets remain gates.
+
+## 2026-11-07 - daily publication packet: in-repo producer replaces the per-day capture ceremony
+
+What was done:
+
+- Merged current main into #1002 (AGENTS.md conflict: both appended sections kept).
+- Added `scripts/daily_publication_packet.py`: one scheduled run per completed UTC day
+  on grid-svr reads `market_briefings`, `thesis_snapshots` and `market_diary` rows
+  published in the window (plus diary context, audio metadata and grounding receipts)
+  in a single read-only `REPEATABLE READ` snapshot, screens texts (credentials,
+  connection strings, private keys, health identifiers, hidden characters; whole-record
+  quarantine, never truncation), and writes `capture.json` (0600), `packet.json`
+  (`publication-review-v1`, the shape the M0 checker reads), three chained stage
+  receipts, `observation.json` (producer stages declared) and `receipt.json`.
+  A produced day is never rewritten. Diary execution evidence comes from the rows the
+  writer produced plus `systemctl show` of its unit; Sun/Mon report a verified
+  non-session, a scheduled-but-missing diary reports `failed`.
+- Reordered the status reporter's stages so the producer's three come first
+  (`diary_run → candidate → capture`), then the daily-review owner's five; the
+  `not_started` capture action now names the producer job.
+- Added `deploy/systemd/grid-publication-packet.{service,timer}.template` (06:15Z daily,
+  previous UTC day) and documented the precision5520 pull mirror into the Codex pickup
+  directory (screened files only). Runbook rewritten accordingly; `.env.example` gained
+  the two optional settings.
+
+Why:
+
+- The r3–r13 lineage needed a fresh source bundle, independent review, sealed admission,
+  reviewer runtime acceptance and prior-day dispositions for every single day; nothing
+  completed after Nov 3 and even the completed Oct 31 candidate was never delivered.
+  The operator's standing instruction (A10, 2026-11-02) is that the daily capture class
+  runs automatically. The data was always in griddb; the job now reads it there.
+
+Verification and limits:
+
+- 35 offline tests (status + producer, fake engine) pass; ruff F-gates clean.
+- Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
+  own stages) is recorded in the runbook's consumer checklist; the producer cannot
+  supply those receipts. Gemini/provider input remains the daily review's own gate.

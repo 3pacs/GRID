@@ -399,6 +399,25 @@ def build_patterns(ctx: BuildContext) -> list[Output]:
     return [Output("intelligence.patterns", dict(PATTERNS_DEFAULT), payload, ctx.now)]
 
 
+def build_money_map(ctx: BuildContext) -> list[Output]:
+    """``/flows/money-map`` (~18 s cold): the global money flow hierarchy."""
+    from analysis.money_flow import build_flow_map
+
+    payload = build_flow_map(ctx.engine)
+    # Latest-available market state at build time: the data is "now".
+    return [Output("flows.money_map", {}, payload, ctx.now)]
+
+
+def build_levers(ctx: BuildContext) -> list[Output]:
+    """``/intelligence/levers`` (~10 s cold): 8-domain lever hierarchy + cross-domain actors."""
+    from intelligence.global_levers import find_cross_domain_actors, get_lever_hierarchy
+
+    hierarchy = get_lever_hierarchy(ctx.engine)
+    cross_domain = find_cross_domain_actors(ctx.engine)
+    payload = {**hierarchy, "cross_domain_actors": cross_domain[:20]}
+    return [Output("intelligence.levers", {}, payload, ctx.now)]
+
+
 def _options_signature(engine: Engine) -> str | None:
     with engine.connect() as conn:
         r = conn.execute(text(
@@ -548,6 +567,20 @@ JOBS: tuple[Job, ...] = (
         outputs=(("intelligence.patterns", _p(**PATTERNS_DEFAULT)),),
         empty_fields={"intelligence.patterns": ("patterns", "count", "actionable_count")},
         description="Recurring 2-4 event sequences across watchlist tickers (read-only mining).",
+    ),
+    Job(
+        name="money_map", cadence_s=15 * MINUTE, stale_after_s=2 * HOUR, version="1",
+        build=build_money_map,
+        outputs=(("flows.money_map", _p()),),
+        empty_fields={"flows.money_map": ("layers", "flows", "levers")},
+        description="Global money flow map (/flows/money-map); the route falls back to a live build until the first result.",
+    ),
+    Job(
+        name="levers", cadence_s=15 * MINUTE, stale_after_s=2 * HOUR, version="1",
+        build=build_levers,
+        outputs=(("intelligence.levers", _p()),),
+        empty_fields={"intelligence.levers": ("hierarchy", "summary", "cross_domain_actors")},
+        description="Global lever hierarchy (/intelligence/levers); the route falls back to a live build until the first result.",
     ),
     Job(
         name="options_100x", cadence_s=30 * MINUTE, stale_after_s=36 * HOUR, version="2",

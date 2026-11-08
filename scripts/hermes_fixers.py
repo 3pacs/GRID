@@ -2570,7 +2570,8 @@ def diagnose_and_fix_pulls(
             result["skipped_cooldown"] += 1
             continue
         if action == "ESCALATE":
-            log.warning("Hermes says ESCALATE {s} — needs human attention", s=source_name)
+            _warn_throttled(f"escalate:{source_name}",
+                            "Hermes says ESCALATE {s} — needs human attention", s=source_name)
             result["escalated"] += 1
             log_issue(
                 engine, category="ingestion", severity="CRITICAL",
@@ -2582,7 +2583,11 @@ def diagnose_and_fix_pulls(
             )
             continue
         if action == "CHECK_KEY":
-            log.warning("Hermes says CHECK_KEY {s} — not retrying until credentials/quota are checked", s=source_name)
+            # The operator issue below is deduplicated; the log line is
+            # throttled per source (TIINGO_FUNDAMENTALS alone logged 131/day).
+            _warn_throttled(f"check_key:{source_name}",
+                            "Hermes says CHECK_KEY {s} — not retrying until credentials/quota are checked",
+                            s=source_name)
             result["skipped_key_check"] += 1
             log_issue(
                 engine, category="config", severity="CRITICAL",
@@ -2700,7 +2705,8 @@ def diagnose_and_fix_pulls(
             if not_fresh:
                 state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
                 result["retried"] += 1
-                log.warning("Repair for {s} did not recover: {r}", s=source_name, r=not_fresh)
+                _warn_throttled(f"not_recovered:{source_name}",
+                                "Repair for {s} did not recover: {r}", s=source_name, r=not_fresh)
                 note_repair_failure(source_name, not_fresh)
                 continue
 
