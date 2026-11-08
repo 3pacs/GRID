@@ -1705,10 +1705,14 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
 
             for ticker in TICKERS:
                 sid = f"TIINGO_FUND:{ticker}:pe_ratio"
+                # Tiingo fundamentals was retired 2026-11-08: only a recent
+                # P/E counts as current, so its last rows are not scored as
+                # today's valuation (this then reports insufficient data).
                 cur = conn.execute(text(
                     "SELECT value, obs_date FROM raw_series "
                     "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                     "AND value > 0 AND value < 500 "
+                    "AND obs_date >= CURRENT_DATE - 7 "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
 

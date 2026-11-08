@@ -30,6 +30,9 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# Oldest ticker_metrics_daily market cap the fallback accepts (calendar days).
+MARKET_CAP_MAX_AGE_DAYS = 10
+
 
 @dataclass(frozen=True)
 class FinancialInputs:
@@ -194,29 +197,25 @@ class IntrinsicValueEngine:
                     if row[1] < as_of - timedelta(days=120):
                         values["data_freshness"] = "STALE"
 
-            # Also try Tiingo fundamentals for market data
-            for tiingo_suffix, field_name in [
-                ("market_cap", "market_cap"),
-                ("pe_ratio", "pe_ratio"),
-                ("pb_ratio", "pb_ratio"),
-                ("peg_ratio", "peg_ratio"),
-                ("enterprise_value", "enterprise_value"),
-            ]:
-                if field_name in values and values[field_name] is not None:
-                    continue
-                series_id = f"TIINGO_FUND:{ticker}:{tiingo_suffix}"
+            # Market cap fallback: SEC XBRL shares x close (sec_xbrl_shares ->
+            # ticker_metrics_daily), which replaced Tiingo fundamentals
+            # (retired 2026-11-08; DOW-30-only plan). Bounded to recent rows so
+            # a ticker that stopped updating is not valued at an old cap.
+            if values.get("market_cap") is None:
                 row = conn.execute(
                     text("""
-                        SELECT value, obs_date
-                        FROM raw_series
-                        WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
-                        ORDER BY obs_date DESC, pull_timestamp DESC
+                        SELECT market_cap_usd
+                        FROM ticker_metrics_daily
+                        WHERE ticker = :ticker AND market_cap_usd > 0
+                          AND obs_date <= :as_of AND obs_date >= :since
+                        ORDER BY obs_date DESC
                         LIMIT 1
                     """),
-                    {"sid": series_id, "as_of": as_of},
+                    {"ticker": ticker, "as_of": as_of,
+                     "since": as_of - timedelta(days=MARKET_CAP_MAX_AGE_DAYS)},
                 ).fetchone()
                 if row is not None:
-                    values[field_name] = row[0]
+                    values["market_cap"] = float(row[0])
 
             # Derive shares outstanding from market cap / price
             if values.get("market_cap") and values.get("market_price") and values["market_price"] > 0:

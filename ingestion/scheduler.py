@@ -1216,10 +1216,16 @@ def _get_pullers_for_group(
             pullers.append(("Tiingo_News", TiingoNewsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Tiingo news puller init failed: {err}", err=str(exc))
-        # Tiingo fundamentals (daily, paid API)
+        # Tiingo fundamentals (daily, paid API). Honors the SmartScheduler
+        # registry hold (retired 2026-11-08: DOW-30-only plan).
         try:
-            from ingestion.tiingo_fundamentals_pull import TiingoFundamentalsPuller
-            pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _tiingo_fund_hold = hold_reason_for("tiingo_fundamentals")
+            if _tiingo_fund_hold:
+                log.info("Tiingo fundamentals held: {r}", r=_tiingo_fund_hold)
+            else:
+                from ingestion.tiingo_fundamentals_pull import TiingoFundamentalsPuller
+                pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Tiingo fundamentals puller init failed: {err}", err=str(exc))
         # BLS (daily check, monthly release). Pass the registration key:

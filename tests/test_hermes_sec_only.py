@@ -604,7 +604,11 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # timeout_s 180 -> 600 (with a 3-line comment), and sec_xbrl_shares
         # dropping kwargs limit=400 (with a 4-line comment). Needs reviewer
         # acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','d0e133db480b61e79a7b244d647bb30f9d9a086cdd61dd2f87c9a365d79caec0')]:
+        # SCHED re-pinned d0e133db -> 0ae04652 (2026-11-08,
+        # claude/retire-tiingo-fundamentals-20261108): the only scheduler
+        # edit is a hold_reason on the tiingo_fundamentals registry entry
+        # (owner retired it). Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','0ae04652dd9d5d49733184648b10bf5e7a9d20474fa963b2427e867d7254d03e')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
