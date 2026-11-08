@@ -9,6 +9,12 @@ options_daily_signals. Fix: TiingoPuller.default_tickers adds
 oracle.engine.oracle_close_universe (active ∪ pending), and
 scripts/backfill_oracle_closes.py fills the gap (dry run by default).
 
+Same gap for forward hypothesis trials (2026-11-07): 36 of the 115 tickers
+Sleuth intersection leads named from June to October had no routine close,
+so none of their 72 backtest trials could be scored. default_tickers also adds
+intelligence.hypothesis_trials.ticker_move_close_universe (every ticker an
+active ticker-move hypothesis will be scored on).
+
 All engines here are local SQLite or fakes and all HTTP is mocked.
 """
 
@@ -26,6 +32,11 @@ from sqlalchemy.pool import StaticPool
 
 import ingestion.tiingo_pull as tp
 from ingestion.tiingo_pull import TiingoPuller, is_tiingo_equity
+from intelligence.hypothesis_trials import (
+    ACTIVE_TICKER_MOVE_TICKERS_SQL,
+    plan_trial,
+    ticker_move_close_universe,
+)
 from oracle.engine import (
     ORACLE_ACTIVE_TICKERS_SQL,
     ORACLE_PENDING_TICKERS_SQL,
@@ -48,10 +59,12 @@ def _load_backfill() -> Any:
 
 
 class _FakeConn:
-    """Answers the two universe queries by SQL text."""
+    """Answers the universe queries by SQL text."""
 
-    def __init__(self, active: list[Any], pending: list[Any]) -> None:
-        self.by_sql = {ORACLE_ACTIVE_TICKERS_SQL: active, ORACLE_PENDING_TICKERS_SQL: pending}
+    def __init__(self, active: list[Any], pending: list[Any],
+                 hypotheses: list[Any] | None = None) -> None:
+        self.by_sql = {ORACLE_ACTIVE_TICKERS_SQL: active, ORACLE_PENDING_TICKERS_SQL: pending,
+                       ACTIVE_TICKER_MOVE_TICKERS_SQL: hypotheses or []}
 
     def execute(self, clause: Any, params: Any = None) -> Any:
         rows = self.by_sql[str(clause)]
@@ -157,6 +170,77 @@ def test_pull_incremental_default_list_includes_oracle_tickers(monkeypatch: pyte
                                      ("SOL-USD", False), ("^GSPC", False), ("DXY", False)])
 def test_is_tiingo_equity(sym: str, ok: bool) -> None:
     assert is_tiingo_equity(sym) is ok
+
+
+# ── active-hypothesis universe ───────────────────────────────────────────
+
+
+_HYPOTHESES = [
+    # (id, status, test_criteria): only active rows naming a ticker and a direction.
+    ("h_gme", "active", '{"ticker": " gme", "expected_direction": "down", "window_days": 14}'),
+    ("h_kweb", "active", '{"ticker": "KWEB", "expected_direction": "up"}'),
+    ("h_dup", "active", '{"ticker": "GME", "expected_direction": "up"}'),
+    ("h_crypto", "active", '{"ticker": "BTC-USD", "expected_direction": "up"}'),
+    ("h_nodir", "active", '{"ticker": "RXRX"}'),
+    ("h_closed", "invalidated", '{"ticker": "AI", "expected_direction": "up"}'),
+    ("h_leadlag", "active", '{"watch_signal": "sig:x", "expect_signal": "sig:y", "lag_days": 2}'),
+    ("h_blank", "active", '{"ticker": "", "expected_direction": "up"}'),
+]
+
+
+def _sqlite_hypotheses() -> Any:
+    eng = create_engine("sqlite://", poolclass=StaticPool,
+                        connect_args={"check_same_thread": False})
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE discovered_hypotheses (id TEXT, status TEXT, test_criteria TEXT)"))
+        for row in _HYPOTHESES:
+            c.execute(text("INSERT INTO discovered_hypotheses VALUES (:i, :s, :c)"),
+                      {"i": row[0], "s": row[1], "c": row[2]})
+    return eng
+
+
+def test_hypothesis_universe_is_active_ticker_move_rows() -> None:
+    with _sqlite_hypotheses().connect() as conn:
+        assert ticker_move_close_universe(conn) == ["BTC-USD", "GME", "KWEB"]
+
+
+def test_hypothesis_universe_matches_the_scorers_ticker_move_rule() -> None:
+    # Every active row the universe takes is one plan_trial scores as a ticker
+    # move, and every active ticker-move row is in the universe.
+    import json
+    from datetime import datetime, timezone
+
+    with _sqlite_hypotheses().connect() as conn:
+        universe = set(ticker_move_close_universe(conn))
+    created = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    for hid, status, crit in _HYPOTHESES:
+        if status != "active":
+            continue
+        plan = plan_trial(hid, "convergence", json.loads(crit), created)
+        ticker = (json.loads(crit).get("ticker") or "").strip().upper()
+        if plan.test_kind == "ticker_move" and ticker:
+            assert ticker in universe, hid
+        elif ticker:
+            assert hid == "h_nodir" and ticker not in universe
+
+
+def test_default_tickers_add_hypothesis_universe_without_crypto() -> None:
+    eng = _sqlite_hypotheses()
+    assert TiingoPuller.hypothesis_tickers(eng) == ["GME", "KWEB"]
+    tickers = set(TiingoPuller.default_tickers(eng))
+    assert {"GME", "KWEB", "SPY"} <= tickers
+    assert "RXRX" not in tickers and "AI" not in tickers
+
+
+def test_default_tickers_union_oracle_and_hypotheses() -> None:
+    eng = _FakeEngine(_FakeConn(active=["ERAS"], pending=["TGTX"], hypotheses=["GRRR"]))
+    assert {"ERAS", "TGTX", "GRRR"} <= set(TiingoPuller.default_tickers(eng))
+
+
+def test_hypothesis_tickers_degrade_when_db_unreachable() -> None:
+    eng = MagicMock()
+    eng.connect.side_effect = RuntimeError("db down")
+    assert TiingoPuller.hypothesis_tickers(eng) == []
 
 
 # ── pull_ticker dry run ──────────────────────────────────────────────────

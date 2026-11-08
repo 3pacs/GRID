@@ -29,6 +29,13 @@ Every investigation ends in a declared outcome (``investigate_intersection_lead`
   (``intelligence.hypothesis_trials``, #1008) on data after it was declared
 * ``dead_end``             with its reason
 
+Every saved lead also gets an ``intersection_baseline`` hypothesis the moment it
+is saved, whatever its investigation decides (:func:`declare_missing_baselines`;
+hypothesis generator v2, replacing the legacy detectors in
+``intelligence.hypothesis_engine``). Same test, same window, no review: the
+baseline is the control that shows whether the LLM's choice of leads to declare
+beats declaring them all.
+
 The LLM may veto a lead (dead end, with a reason) or write its narrative. It
 never chooses the ticker, direction, window or threshold of the test.
 """
@@ -48,6 +55,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 # ── Constants (pre-registered; change only in a reviewed commit) ────────────
 
@@ -68,6 +76,8 @@ MAX_PLAUSIBLE_DAILY_MOVE = 0.5  # |log return| above this is a data error, not a
 HYPOTHESIS_WINDOW_DAYS = 14   # the v2 ticker test's window (DEFAULT_WINDOW_DAYS)
 HYPOTHESIS_MIN_MOVE_PCT = 2.0  # the v2 ticker test's raw-move floor (DEFAULT_MIN_MOVE_PCT)
 HYPOTHESIS_PATTERN = "sleuth_intersection"
+BASELINE_PATTERN = "intersection_baseline"  # every lead, declared without review
+BASELINE_CATCHUP_DAYS = 3     # leads this recent get a missing baseline declared
 
 ORIGIN = "intersection"
 OUTCOME_DECLARED = "hypothesis_declared"
@@ -422,9 +432,83 @@ def generate_intersection_leads(engine: Engine, as_of: datetime | None = None,
         ))
         seen.add((lead.ticker, lead.direction))
         saved.append(lead.lead_id)
-    log.info("Sleuth intersections: {n} candidates, {s} new leads (as_of {d})",
-             n=len(leads), s=len(saved), d=window_end)
+    try:
+        baselines = declare_missing_baselines(
+            engine, since=as_of_ts - timedelta(days=BASELINE_CATCHUP_DAYS))
+    except SQLAlchemyError as exc:
+        # The leads are saved (and in cooldown): their investigations must still
+        # be queued. The next run declares the missing baselines.
+        log.warning("Sleuth intersections: baseline declaration failed: {e}", e=str(exc))
+        baselines = []
+    log.info("Sleuth intersections: {n} candidates, {s} new leads, {b} baselines declared "
+             "(as_of {d})", n=len(leads), s=len(saved), b=len(baselines), d=window_end)
     return saved
+
+
+# ── Baseline: every lead declared, no review (hypothesis generator v2) ──────
+
+_RECENT_LEADS_SQL = text("""
+    SELECT id, question, evidence FROM investigation_leads
+    WHERE origin = :origin AND created_at >= :since
+    ORDER BY created_at ASC, id ASC
+""")
+
+
+def evidence_direction(evidence: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """(ticker, direction) a lead's agreeing evidence names, or None."""
+    pairs = {(str(e.get("ticker")), str(e.get("direction")))
+             for e in evidence if isinstance(e, dict) and e.get("role") == "agrees"}
+    return next(iter(pairs)) if len(pairs) == 1 else None
+
+
+def baseline_id(lead_id: str) -> str:
+    return f"hyp_base_{lead_id.removeprefix('LEAD-INTX-')}"
+
+
+def declare_baseline(conn: Any, lead_id: str, question: str,
+                     evidence: list[dict[str, Any]]) -> str | None:
+    """Insert the lead's unreviewed forward test, or None when the lead names no
+    single testable (ticker, direction). Idempotent: the id comes from the lead.
+    The test is the one a Sleuth declaration gets (ticker, the lead's direction,
+    ``HYPOTHESIS_WINDOW_DAYS``, ``HYPOTHESIS_MIN_MOVE_PCT``); ``created_at`` is now."""
+    pair = evidence_direction(evidence)
+    if pair is None or not is_testable_ticker(pair[0]):
+        return None
+    ticker, direction = pair
+    hyp_id = baseline_id(lead_id)
+    criteria = {"ticker": ticker, "window_days": HYPOTHESIS_WINDOW_DAYS,
+                "min_move_pct": HYPOTHESIS_MIN_MOVE_PCT, "expected_direction": direction,
+                "source": BASELINE_PATTERN, "lead_id": lead_id}
+    thesis = (f"BASELINE: {ticker} moves {direction} at least {HYPOTHESIS_MIN_MOVE_PCT:g}% "
+              f"over {HYPOTHESIS_WINDOW_DAYS} days after independent sources agreed, "
+              f"declared without review ({question[:160]})")
+    result = conn.execute(text("""
+        INSERT INTO discovered_hypotheses
+            (id, thesis, pattern_type, evidence, test_criteria,
+             invalidation, confidence, status, role, pair_id)
+        VALUES
+            (:id, :thesis, :ptype, CAST(:evidence AS JSONB), CAST(:criteria AS JSONB),
+             :inv, 0.5, 'active', 'thesis', :id)
+        ON CONFLICT (id) DO NOTHING
+    """), {"id": hyp_id, "thesis": thesis, "ptype": BASELINE_PATTERN,
+           "evidence": json.dumps(evidence, default=str),
+           "criteria": json.dumps(criteria),
+           "inv": "No move in the declared direction against the same-window crowd."})
+    return hyp_id if result.rowcount > 0 else None
+
+
+def declare_missing_baselines(engine: Engine, since: datetime) -> list[str]:
+    """Declare the baseline of every intersection lead saved since ``since`` that
+    has none yet. Returns the ids inserted."""
+    out: list[str] = []
+    with engine.begin() as conn:
+        for lead_id, question, evidence in conn.execute(
+                _RECENT_LEADS_SQL, {"origin": ORIGIN, "since": since}).fetchall():
+            items = evidence if isinstance(evidence, list) else json.loads(evidence or "[]")
+            hyp_id = declare_baseline(conn, str(lead_id), str(question or ""), items)
+            if hyp_id:
+                out.append(hyp_id)
+    return out
 
 
 # ── Investigation: every lead ends in a declared outcome ────────────────────
@@ -462,9 +546,7 @@ def _parse_verdict(response: str | None) -> dict[str, str] | None:
 
 def _lead_direction(lead: Any) -> tuple[str, str] | None:
     """(ticker, direction) the lead's agreeing evidence names, or None."""
-    pairs = {(str(e.get("ticker")), str(e.get("direction")))
-             for e in lead.evidence if isinstance(e, dict) and e.get("role") == "agrees"}
-    return next(iter(pairs)) if len(pairs) == 1 else None
+    return evidence_direction(lead.evidence)
 
 
 def declare_hypothesis(conn: Any, lead: Any, ticker: str, direction: str,

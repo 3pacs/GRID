@@ -154,3 +154,22 @@ class TestFreightosJSONParse:
             out = SupplyChainPuller._fetch_freightos_current.__wrapped__(instance)
 
         assert out == []
+
+
+def test_retired_freightos_is_not_called_and_does_not_mark_the_run_partial():
+    """2026-11-07: both Freightos URLs 301 to a sales page and never wrote a
+    row; the supply-chain pull must not call them or report them."""
+    from unittest.mock import MagicMock, patch
+
+    from ingestion.altdata import supply_chain as sc
+
+    assert sc._FREIGHTOS_RETIRED is True
+    with patch.object(sc.SupplyChainPuller, "_resolve_source_id", return_value=1):
+        puller = sc.SupplyChainPuller(MagicMock(), api_key="k")
+    assert puller.fred_api_key == "k"
+    with patch.object(puller, "_pull_freightos") as fbx, \
+         patch.object(puller, "_pull_drewry", return_value={"source": "drewry", "status": "SUCCESS", "rows_inserted": 0}), \
+         patch.object(puller, "_pull_ism_fred", return_value={"source": "fred_ism", "status": "SUCCESS", "rows_inserted": 0}):
+        results = puller.pull_all("2026-10-17")
+    fbx.assert_not_called()
+    assert [r["source"] for r in results] == ["drewry", "fred_ism"]

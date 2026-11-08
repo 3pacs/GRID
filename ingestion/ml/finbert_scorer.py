@@ -45,6 +45,52 @@ _FINBERT_LOAD_BREAKER: bool = False
 _FINBERT_LOAD_BREAKER_REASON: str = ""
 
 
+def aggregate_daily_scores(
+    scoreable: list[tuple[Any, str, Any, str]],
+    scores: list[dict],
+    *,
+    truncated: bool = False,
+) -> list[dict[str, Any]]:
+    """Collapse per-text scores to one mean score per (series_id, obs_date).
+
+    ``scoreable`` is ordered newest first. When the fetch hit its LIMIT
+    (``truncated``) the oldest day may be cut off part-way; it is dropped so
+    the next run scores it whole, unless it is the only day fetched.
+    """
+    order: list[tuple[str, Any]] = []
+    buckets: dict[tuple[str, Any], list[tuple[str, dict]]] = {}
+    for (_row_id, series_id, obs_date, txt), sc in zip(scoreable, scores):
+        key = (series_id, obs_date)
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append((txt, sc))
+    if truncated and len(order) > 1:
+        oldest = min(order, key=lambda k: k[1])
+        order = [k for k in order if k[1] != oldest[1]]
+
+    out: list[dict[str, Any]] = []
+    for series_id, obs_date in order:
+        items = buckets[(series_id, obs_date)]
+        n = len(items)
+        pos = sum(sc["positive"] for _, sc in items) / n
+        neg = sum(sc["negative"] for _, sc in items) / n
+        neu = sum(sc["neutral"] for _, sc in items) / n
+        label = max((("positive", pos), ("negative", neg), ("neutral", neu)), key=lambda kv: kv[1])[0]
+        out.append({
+            "series_id": series_id,
+            "obs_date": obs_date,
+            "positive": round(pos, 6),
+            "negative": round(neg, 6),
+            "neutral": round(neu, 6),
+            "compound": round(pos - neg, 6),
+            "label": label,
+            "n_texts": n,
+            "text_snippet": items[0][0][:200],
+        })
+    return out
+
+
 class FinBERTScorer:
     """Batch FinBERT sentiment scorer for GRID raw_series text data.
 
@@ -303,7 +349,7 @@ class FinBERTScorer:
                     "FROM raw_series "
                     "WHERE source_id = :src AND pull_status = 'SUCCESS' "
                     "AND raw_payload IS NOT NULL "
-                    "ORDER BY obs_date DESC "
+                    "ORDER BY obs_date DESC, pull_timestamp DESC "
                     "LIMIT :lim"
                 )
                 params: dict[str, Any] = {"src": orig_source_id, "lim": limit}
@@ -321,7 +367,7 @@ class FinBERTScorer:
                     "  AND fb.obs_date = r.obs_date "
                     "  AND fb.pull_status = 'SUCCESS'"
                     ") "
-                    "ORDER BY r.obs_date DESC "
+                    "ORDER BY r.obs_date DESC, r.pull_timestamp DESC "
                     "LIMIT :lim"
                 )
                 params = {"src": orig_source_id, "fb_src": src_id, "lim": limit}
@@ -360,39 +406,46 @@ class FinBERTScorer:
                     s=source_name, n=batch_start, t=len(scoreable),
                 )
 
+        # One finbert row per (series_id, obs_date): several articles share a
+        # series_id and day, and every insert in this transaction gets the same
+        # pull_timestamp, so per-article rows collided on uq_raw_series_composite
+        # and rolled the whole batch back (stuck from 2026-11-06).
+        groups = aggregate_daily_scores(
+            scoreable, all_scores, truncated=len(rows) >= limit,
+        )
+
         # Write results to raw_series
         rows_written = 0
         with self.engine.begin() as conn:
-            for i, (row_id, series_id, obs_date, txt) in enumerate(scoreable):
-                score_data = all_scores[i]
-                compound = score_data["positive"] - score_data["negative"]
-
-                fb_series_id = f"finbert.{series_id}"
+            for g in groups:
+                obs_date = g["obs_date"]
                 fb_payload = {
-                    "label": score_data["label"],
-                    "positive": score_data["positive"],
-                    "negative": score_data["negative"],
-                    "neutral": score_data["neutral"],
-                    "original_series_id": series_id,
+                    "label": g["label"],
+                    "positive": g["positive"],
+                    "negative": g["negative"],
+                    "neutral": g["neutral"],
+                    "n_texts": g["n_texts"],
+                    "original_series_id": g["series_id"],
                     "original_obs_date": obs_date.isoformat() if isinstance(obs_date, date) else str(obs_date),
-                    "text_snippet": txt[:200],
+                    "text_snippet": g["text_snippet"],
                 }
 
-                conn.execute(
+                res = conn.execute(
                     text(
                         "INSERT INTO raw_series "
                         "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
-                        "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
+                        "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS') "
+                        "ON CONFLICT DO NOTHING"
                     ),
                     {
-                        "sid": fb_series_id,
+                        "sid": f"finbert.{g['series_id']}",
                         "src": src_id,
                         "od": obs_date,
-                        "val": round(compound, 6),
+                        "val": g["compound"],
                         "payload": json.dumps(fb_payload),
                     },
                 )
-                rows_written += 1
+                rows_written += res.rowcount or 0
 
         elapsed = time.time() - t0
         avg_sentiment = (
