@@ -790,6 +790,7 @@ class EnsembleConfig:
     max_abs_segment_return: float = 0.5  # a single-name segment return beyond this is a data fault
     criterion: str = "v1_pass"  # "v1_pass" (v1 registration) or "watch" (v2 onward)
     regime_min_obs: int = 26  # regime-conditional selection needs this many segments in the cell, else falls back
+    benchmark: str = BENCHMARK  # buy-and-hold control column ("SPY" in the ETF era, "MKT" in the long sample)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1051,7 +1052,9 @@ def walk_forward(
         )
     _, ew_net, _ = path_returns(ew_underlying, seg, config.cost_bps_per_side)
     bench_w = pd.DataFrame(0.0, index=seg.index, columns=seg.columns)
-    bench_w.loc[live, BENCHMARK] = 1.0
+    if config.benchmark not in bench_w.columns:
+        raise ValueError(f"benchmark {config.benchmark!r} is not a column of the price panel")
+    bench_w.loc[live, config.benchmark] = 1.0
     _, bench_net, _ = path_returns(bench_w, seg, config.cost_bps_per_side)
 
     faults = {

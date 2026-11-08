@@ -104,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="docs/reports")
     ap.add_argument("--cache-dir", default="outputs/long_sample_cache")
     ap.add_argument("--lookback-days", type=int, default=400)
+    ap.add_argument("--long-sample-only", action="store_true",
+                    help="skip the ETF era; write a correction record of the long-sample part only")
+    ap.add_argument("--correction-of", default=None, help="stamp of the look record this run corrects")
     args = ap.parse_args(argv)
 
     as_of = args.as_of or date.today()
@@ -114,20 +117,23 @@ def main(argv: list[str] | None = None) -> int:
     log.info("regime labels {n} months; current cell {c}", n=int(cells.notna().sum()), c=current.get("cell"))
 
     engine = read_only_engine()
-    load_start = args.start - pd.Timedelta(days=args.lookback_days).to_pytimedelta()
-    panel, provenance = load_raw_adj_close_panel(engine, list(cset.universe), load_start, args.end, as_of)
-    vix = load_vix(engine, load_start, args.end, as_of)
-    panel = panel.ffill(limit=5).dropna(how="all")
     cross = db_cross_check(engine, fred, as_of)
-
-    # ── ETF era: regime-conditional selection over the 27 weekly arms, plus the unconditional control
-    pit = hse.PanelPITStore(panel, vix, data_as_of=as_of)
-    cfg = cset.config()
-    run_rc = hse.walk_forward(panel, vix, args.start, args.end, cfg, cset.candidates(), pit=pit, regime=cells_known)
-    rep_rc = hse.evaluate(run_rc)
-    pit2 = hse.PanelPITStore(panel, vix, data_as_of=as_of)
-    run_uc = hse.walk_forward(panel, vix, args.start, args.end, cfg, cset.candidates(), pit=pit2)
-    rep_uc = hse.evaluate(run_uc)
+    if args.long_sample_only:
+        panel, provenance = pd.DataFrame(), {"source": "ETF era skipped (long-sample correction run)", "excluded": {}}
+        rep_rc = rep_uc = None
+    else:
+        load_start = args.start - pd.Timedelta(days=args.lookback_days).to_pytimedelta()
+        panel, provenance = load_raw_adj_close_panel(engine, list(cset.universe), load_start, args.end, as_of)
+        vix = load_vix(engine, load_start, args.end, as_of)
+        panel = panel.ffill(limit=5).dropna(how="all")
+        # ── ETF era: regime-conditional selection over the 27 weekly arms, plus the unconditional control
+        pit = hse.PanelPITStore(panel, vix, data_as_of=as_of)
+        cfg = cset.config()
+        run_rc = hse.walk_forward(panel, vix, args.start, args.end, cfg, cset.candidates(), pit=pit, regime=cells_known)
+        rep_rc = hse.evaluate(run_rc)
+        pit2 = hse.PanelPITStore(panel, vix, data_as_of=as_of)
+        run_uc = hse.walk_forward(panel, vix, args.start, args.end, cfg, cset.candidates(), pit=pit2)
+        rep_uc = hse.evaluate(run_uc)
 
     # ── Long sample: monthly French panel, same cells, regime-conditional selection
     lpanel = long_sample_panel(cache, fred)
@@ -157,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── verdict: watch criterion inside today's cell (ETF era) and no contradiction in the long sample
     cell = current.get("cell")
-    etf_cell = rep_rc["by_regime_cell"].get(str(cell), {}) if cell else {}
+    etf_cell = rep_rc["by_regime_cell"].get(str(cell), {}) if (cell and rep_rc) else {}
     ls_cell = rep_ls["by_regime_cell"].get(str(cell), {}) if cell else {}
     e_c, s_c = etf_cell.get("ensemble", {}), etf_cell.get("spy", {})
     boot_c = etf_cell.get("excess_vs_spy_bootstrap", {})
@@ -166,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         "etf_cell_n_segments": etf_cell.get("n_segments"),
         "sharpe_beats_spy_in_cell": bool(e_c.get("sharpe_annualised", -9) > s_c.get("sharpe_annualised", 9)),
         "excess_lb_positive_in_cell": bool((boot_c.get("lower_bound") or -1) > 0),
-        "dsr_above_half_overall": bool((rep_rc["deflated_sharpe"].get("dsr") or 0) > 0.5),
+        "dsr_above_half_overall": bool(rep_rc is not None and (rep_rc["deflated_sharpe"].get("dsr") or 0) > 0.5),
         "drawdown_no_worse_in_cell": bool(e_c.get("max_drawdown", -9) >= s_c.get("max_drawdown", 9)),
         "long_sample_cell_n_months": ls_cell.get("n_segments"),
         "long_sample_cell_excess_mean_nonneg": bool((ls_cell.get("excess_vs_spy_bootstrap", {}).get("mean") or -1) >= 0),
@@ -175,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
     parts["etf_cell_pass"] = all(parts[k] for k in ("sharpe_beats_spy_in_cell", "excess_lb_positive_in_cell", "dsr_above_half_overall", "drawdown_no_worse_in_cell"))
     parts["long_sample_not_contradicting"] = parts["long_sample_cell_excess_mean_nonneg"] and parts["analog_1946_48_excess_nonneg"]
     parts["verdict"] = "PASS" if parts["etf_cell_pass"] and parts["long_sample_not_contradicting"] else "FAIL"
-    thin = {k: v.get("n_segments") for k, v in rep_rc["by_regime_cell"].items() if isinstance(v, dict) and (v.get("n_segments") or 0) < 52}
+    if args.long_sample_only:
+        parts["verdict"] = f"CORRECTION of {args.correction_of}: long-sample part only; the verdict stays with the original record"
+    thin = {k: v.get("n_segments") for k, v in rep_rc["by_regime_cell"].items() if isinstance(v, dict) and (v.get("n_segments") or 0) < 52} if rep_rc else {}
 
     report: dict[str, Any] = {
         "version": hse.ENSEMBLE_VERSION, "candidate_set": "v6", "n_trials_cumulative": cset.n_trials_cumulative,
@@ -184,15 +192,17 @@ def main(argv: list[str] | None = None) -> int:
         "regime_cells_recent": {str(k.date()): v for k, v in cells.loc["2024-01-01":].dropna().items()},
         "verdict": parts,
         "thin_etf_cells_under_52_segments": thin,
-        "etf_regime_conditional": {k: rep_rc[k] for k in ("ensemble", "spy_buy_and_hold", "equal_weight_all_candidates", "best_single_in_hindsight", "excess_vs_spy_bootstrap", "deflated_sharpe", "pbo_candidates", "watch_criterion", "by_regime_cell", "candidates", "selection_counts", "ensemble_turnover_annualised", "oos_period", "faults", "config")},
-        "etf_unconditional_control": {k: rep_uc[k] for k in ("ensemble", "excess_vs_spy_bootstrap", "watch_criterion", "selection_counts")},
+        "etf_regime_conditional": {k: rep_rc[k] for k in ("ensemble", "spy_buy_and_hold", "equal_weight_all_candidates", "best_single_in_hindsight", "excess_vs_spy_bootstrap", "deflated_sharpe", "pbo_candidates", "watch_criterion", "by_regime_cell", "candidates", "selection_counts", "ensemble_turnover_annualised", "oos_period", "faults", "config")} if rep_rc else None,
+        "etf_unconditional_control": {k: rep_uc[k] for k in ("ensemble", "excess_vs_spy_bootstrap", "watch_criterion", "selection_counts")} if rep_uc else None,
+        "correction_of": args.correction_of,
         "long_sample_regime_conditional": {k: rep_ls[k] for k in ("ensemble", "spy_buy_and_hold", "equal_weight_all_candidates", "best_single_in_hindsight", "excess_vs_spy_bootstrap", "deflated_sharpe", "pbo_candidates", "by_regime_cell", "candidates", "selection_counts", "oos_period", "faults", "config")},
         "analog_windows": analogs,
-        "selections_etf": run_rc.selections,
+        "selections_etf": run_rc.selections if rep_rc else None,
         "selections_long_sample": run_ls.selections,
         "provenance": {
             **provenance, "as_of": as_of.isoformat(), "start": args.start.isoformat(), "end": args.end.isoformat(),
             "panel_shape": list(panel.shape), "long_sample_panel_shape": list(lpanel.shape),
+            "long_sample_benchmark": lcfg.benchmark,
             "long_sample_first": lpanel.index.min().date().isoformat(), "long_sample_last": lpanel.index.max().date().isoformat(),
             "downloads": cache.receipt(), "publication_lag_days": ls.PUBLICATION_LAG_DAYS,
             "db_cross_check_1990_plus": cross,
@@ -204,8 +214,9 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
-    json_path = out_dir / f"high-sharpe-ensemble-v6-look-{stamp}.json"
-    md_path = out_dir / f"high-sharpe-ensemble-v6-look-{stamp}.md"
+    kind = "correction" if args.long_sample_only else "look"
+    json_path = out_dir / f"high-sharpe-ensemble-v6-{kind}-{stamp}.json"
+    md_path = out_dir / f"high-sharpe-ensemble-v6-{kind}-{stamp}.md"
     json_path.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
     md_path.write_text(render(report), encoding="utf-8")
     log.info("wrote {j}; verdict {v}", j=json_path, v=parts["verdict"])
@@ -224,6 +235,10 @@ def _f(v: Any, nd: int = 3) -> str:
 def render(rep: dict[str, Any]) -> str:
     cur, v = rep["current_regime"], rep["verdict"]
     rc, uc, lsr = rep["etf_regime_conditional"], rep["etf_unconditional_control"], rep["long_sample_regime_conditional"]
+    if rc is None:
+        rc = {"ensemble": {}, "spy_buy_and_hold": {}, "equal_weight_all_candidates": {}, "best_single_in_hindsight": {}, "excess_vs_spy_bootstrap": {},
+              "deflated_sharpe": {}, "pbo_candidates": {}, "by_regime_cell": {}, "candidates": {}, "selection_counts": {}}
+        uc = {"ensemble": {}, "excess_vs_spy_bootstrap": {}}
     lines = [
         f"# High-Sharpe ensemble v6 — regime-conditional, registered look ({rep['provenance']['generated_at'][:16]}Z)",
         "",
@@ -282,7 +297,7 @@ def render(rep: dict[str, Any]) -> str:
                      f"oil {_f(ar.get('OIL'))}; regime-conditional ensemble {_f(w.get('long_sample_ensemble', {}).get('annualised_return'))} vs market "
                      f"{_f(w.get('market_same_months', {}).get('annualised_return'))} (mean monthly excess {_f(w.get('ensemble_minus_market_mean_monthly'),5)}).")
         lines.append("")
-    lines += [f"Provenance: {json.dumps({k: rep['provenance'][k] for k in ('as_of','panel_shape','long_sample_panel_shape','db_cross_check_1990_plus','excluded')}, default=str)}", ""]
+    lines += [f"Provenance: {json.dumps({k: rep['provenance'].get(k) for k in ('as_of','panel_shape','long_sample_panel_shape','long_sample_benchmark','db_cross_check_1990_plus','excluded','registration_sha256_observed')}, default=str)}", ""]
     return "\n".join(lines)
 
 

@@ -608,3 +608,17 @@ def test_v6_set_counts_arm_times_cell_trials():
     for arm in rg.long_sample_candidates():
         assert f"`{arm}`" in text, arm
     assert "492" in text and "1946" in text and "1973" in text
+
+
+def test_benchmark_column_is_configurable_and_must_exist(panel):
+    prices, vix = panel
+    cfg = hse.EnsembleConfig(trailing=26, selection_every=4, bootstrap_reps=100, benchmark="QQQ")
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    run = hse.walk_forward(prices, vix, date(2019, 1, 2), date(2020, 12, 31), cfg, pit=pit)
+    seg = hse.segment_returns(prices, run.dates, 0.5)
+    live = run.benchmark_net.index[run.config.trailing:]
+    expected = seg.loc[live, "QQQ"]
+    assert np.allclose(run.benchmark_net.loc[live].iloc[1:], expected.iloc[1:])  # after the entry cost
+    with pytest.raises(ValueError, match="benchmark"):
+        hse.walk_forward(prices, vix, date(2019, 1, 2), date(2020, 12, 31), hse.EnsembleConfig(trailing=26, benchmark="NOPE"), pit=pit)
+    assert hse.EnsembleConfig(**rg.LS_CONFIG).benchmark == "MKT"

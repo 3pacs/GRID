@@ -236,7 +236,7 @@ def long_sample_candidates() -> dict[str, CandidateFn]:
 #: every 3, 20 bp per side, cash = bills (the ``RF`` column is held when an arm is "in cash").
 LS_CONFIG: dict[str, Any] = {
     "rebalance": "ME", "periods_per_year": 12, "trailing": 60, "selection_every": 3,
-    "cost_bps_per_side": 20.0, "shrink_n0": 24, "regime_min_obs": 24,
+    "cost_bps_per_side": 20.0, "shrink_n0": 24, "regime_min_obs": 24, "benchmark": LS_BENCHMARK,
 }
 
 # ── Analog windows ──────────────────────────────────────────────────────────
