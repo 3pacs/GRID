@@ -280,6 +280,36 @@ Verification and limits:
   future rows; only the current unlabelled row is counted. All 494 combined
   offline tests passed again; Ruff and diff checks passed.
 
+## 2026-11-07 - make the daily research recap scannable (source only)
+
+- Daily research email now uses separate HTML/plain-text recap bullets, while
+  existing string callers retain their original paragraph/plain-text output.
+  Its normal decision-count headline is no longer repeated in the recap; an
+  incomplete/unknown headline still keeps the available count or unknown label.
+- Long Plays is explicitly a weekly saved snapshot, with a compact data-as-of
+  date in the recap and the exact generation time, age caveats, saved stances,
+  capped rows, catalyst caveats and proxy labels retained below. Reused the
+  existing purple accent class instead of an unsupported hex class name.
+- No data query, collection window, board refresh/cadence, research audience,
+  sending/dedup path, other email family, deployment or production setting changed.
+- Validation: 508 offline tests across 17 email-related suites passed on Python
+  3.12 with network, SMTP and PostgreSQL connections blocked. Coverage includes
+  HTML/plain rendering, capped samples, absent/degraded inputs, escaping, and
+  stale/missing/invalid/future/naive/offset board timestamps. Existing SQLite
+  datetime deprecation warnings remain.
+- Changed-file Ruff E/W/F (excluding E501), compilation and diff checks passed.
+  Repository-wide blocking Ruff rules passed with the supported Python 3.11
+  target; default-target Ruff reported two pre-existing BaseExceptionGroup
+  name warnings in tests/test_resolver_transaction_pg.py.
+- Synthetic local Chrome previews passed at 1000px and 390px, with no horizontal
+  overflow and the computed purple accent. Preview files remain outside the
+  repository. This is not live delivery or pixel-identical Gmail validation;
+  full repository CI, publication, merge and deployment remain separate.
+- Visual-review follow-up: separated the current-regime recap fields with
+  semicolons and made a one-row sample singular. Stale/unverified recaps and
+  full regime cards are unchanged. All 508 offline tests and the same lint,
+  compile, diff and affected desktop/mobile preview checks passed again.
+
 ## 2026-11-07 - daily publication packet: in-repo producer replaces the per-day capture ceremony
 
 What was done:
@@ -352,3 +382,14 @@ Verification and limits:
 - Not verified here: the grader's first `review.jsonl` (its owner adopts the schema), the
   reverse mirror leg, the first scheduled ingest on grid-svr. Those are the runbook's
   acceptance chain. No row is ever updated: a correction is a new review file.
+
+## 2026-11-08 - refresh daily recap draft against current main
+
+- Integrated main `1d0a84912` into draft #1032. The only conflict was this
+  append-only log; both complete sections were preserved. Email code and tests
+  are unchanged from reviewed head `e9f3d853`.
+- All 508 guarded offline email tests passed after integration. Changed-file
+  Ruff, compilation and diff checks passed. Synthetic quiet/active previews at
+  1000px and 390px retained recap bullets, purple accents and no overflow.
+- No production query, SMTP send, service restart, PR merge or deployment.
+  The new draft head requires its own hosted CI and later delivery validation.
