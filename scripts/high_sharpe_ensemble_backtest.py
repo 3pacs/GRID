@@ -163,10 +163,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--as-of", type=date.fromisoformat, default=None, help="vintage date (default: today)")
     ap.add_argument("--source", choices=("resolved", "raw-adj-close"), default="raw-adj-close")
     ap.add_argument("--out", default="docs/reports")
-    ap.add_argument("--set", dest="set_name", choices=("v1", "v2", "v3"), default="v3",
+    ap.add_argument("--set", dest="set_name", choices=("v1", "v2", "v3", "v4"), default="v4",
                     help="registered candidate set; fixes universe, candidates, trial count and criterion")
     ap.add_argument("--tag", default=None, help="report file prefix (default high-sharpe-ensemble-<set>)")
     ap.add_argument("--lookback-days", type=int, default=400, help="price history loaded before --start")
+    ap.add_argument("--secondary-cost-bps", type=float, default=None,
+                    help="also run the selector at this cost per side and attach it as a descriptive secondary (v4: 10)")
     args = ap.parse_args(argv)
 
     as_of = args.as_of or date.today()
@@ -189,6 +191,13 @@ def main(argv: list[str] | None = None) -> int:
     config = cset.config()
     run = hse.walk_forward(panel, vix, args.start, args.end, config, cset.candidates(), engine=None, pit=pit)
     report = hse.evaluate(run)
+    if args.secondary_cost_bps is not None:
+        run2 = hse.walk_forward(panel, vix, args.start, args.end, cset.config(cost_bps_per_side=args.secondary_cost_bps),
+                                cset.candidates(), engine=None, pit=pit)
+        rep2 = hse.evaluate(run2)
+        report["secondary_cost_run"] = {k: rep2[k] for k in ("config", "ensemble", "spy_buy_and_hold", "equal_weight_all_candidates",
+                                        "best_single_in_hindsight", "candidates", "excess_vs_spy_bootstrap",
+                                        "deflated_sharpe", "pbo_candidates", "watch_criterion", "pass_criterion")}
     report["provenance"] = {
         **provenance,
         "as_of": as_of.isoformat(),

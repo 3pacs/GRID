@@ -396,3 +396,67 @@ def test_risk_parity_weights_sum_to_one_and_favour_low_vol():
     assert set(w) == set(hse.V3_RISK_PARITY)
     assert sum(w.values()) == pytest.approx(1.0)
     assert w["TLT"] == max(w.values())
+
+
+# ── v4: daily mean reversion ────────────────────────────────────────────────
+
+
+def test_v4_set_is_daily_and_counts_two_ensembles():
+    v4 = hse.candidate_set("v4")
+    assert v4.n_trials_cumulative == 270 + 6 + 2 == 278
+    cfg = v4.config()
+    assert (cfg.rebalance, cfg.periods_per_year, cfg.trailing, cfg.selection_every, cfg.cost_bps_per_side) == ("B", 252, 252, 21, 20.0)
+    assert v4.config(cost_bps_per_side=10.0).cost_bps_per_side == 10.0
+    text = (REPO_ROOT / hse.REGISTRATIONS["v4"][0]).read_text(encoding="utf-8")
+    for arm in v4.candidates():
+        assert f"`{arm}`" in text, arm
+    assert "278" in text
+
+
+def test_daily_rebalance_dates_are_every_session():
+    idx = pd.bdate_range("2020-01-01", "2020-03-31")
+    dates = hse.rebalance_dates(idx, date(2020, 1, 1), date(2020, 3, 31), "B")
+    assert len(dates) == len(idx) and dates[0] == idx[0].date()
+
+
+def _mr_panel(tail: list[float]) -> pd.DataFrame:
+    """A gently rising SPY/QQQ history ending with the given closes (above the 200-day mean)."""
+    idx = pd.bdate_range("2019-01-01", periods=260 + len(tail))
+    base = list(np.linspace(100, 110, 260)) + tail
+    return pd.DataFrame({"SPY": base, "QQQ": base}, index=idx)
+
+
+def test_rsi2_enters_on_sharp_pullback_and_exits_after_rebound():
+    pulled = _mr_panel([112, 110, 109])          # two straight down closes → RSI(2) = 0, still above the 200-day mean
+    assert hse.rsi2_weights(_ctx(pulled), "SPY") == {"SPY": 1.0}
+    rebound = _mr_panel([112, 110, 109, 111, 114])  # RSI(2) now 100 > 60 → exited
+    assert hse.rsi2_weights(_ctx(rebound), "SPY") == {}
+    calm = _mr_panel([110.1, 110.2, 110.3])
+    assert hse.rsi2_weights(_ctx(calm), "SPY") == {}
+    assert hse.rsi(pd.Series([1.0, 2.0, 3.0])) == 100.0 and hse.rsi(pd.Series([3.0, 2.0, 1.0])) == 0.0
+
+
+def test_three_down_enters_after_three_lower_closes_and_flattens_on_up_close():
+    down3 = _mr_panel([112, 111, 110.5, 110.2])
+    assert hse.three_down_weights(_ctx(down3), "QQQ") == {"QQQ": 1.0}
+    up_after = _mr_panel([112, 111, 110.5, 110.2, 111.0])
+    assert hse.three_down_weights(_ctx(up_after), "QQQ") == {}
+    flat_after = _mr_panel([112, 111, 110.5, 110.2, 110.2])
+    assert hse.three_down_weights(_ctx(flat_after), "QQQ") == {"QQQ": 1.0}
+    assert hse.three_down_weights(_ctx(_mr_panel([112, 113, 114, 115])), "QQQ") == {}
+
+
+def test_turn_of_month_is_long_at_month_edges_only():
+    idx = pd.bdate_range("2019-06-01", "2020-03-31")
+    prices = pd.DataFrame({"SPY": 100.0, "QQQ": 100.0}, index=idx)
+
+    def w(d: str) -> dict:
+        ts = pd.Timestamp(d)
+        return hse.turn_of_month_weights(hse.DecisionContext(as_of=ts.date(), prices=prices.loc[:ts], vix=pd.Series(dtype=float)), "SPY")
+
+    assert w("2020-02-03") == {"SPY": 1.0}   # 1st session of February
+    assert w("2020-02-05") == {"SPY": 1.0}   # 3rd session
+    assert w("2020-02-06") == {}             # 4th session
+    assert w("2020-02-14") == {}             # mid-month
+    assert w("2020-02-25") == {"SPY": 1.0}   # 3 business days remain after it
+    assert w("2020-02-24") == {}             # 4 remain

@@ -68,6 +68,10 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
         "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md",
         "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7",
     ),
+    "v4": (
+        "docs/paper_log/high-sharpe-ensemble-v4-preregistration.md",
+        "53ecca3881596128813d46ef9d0738bcbc93e1426a87d67427546a7dccb5ef89",
+    ),
     "v3": (
         "docs/paper_log/high-sharpe-ensemble-v3-preregistration.md",
         "1670eae74e9c0f8bc9a538e81a250db3b38e8a856cab5d6863aedce592db29b5",
@@ -79,11 +83,11 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
 }
 PREREG_PATH, PREREG_SHA256 = REGISTRATIONS["v1"]
 
-ENSEMBLE_VERSION = "high-sharpe-ensemble/3"
+ENSEMBLE_VERSION = "high-sharpe-ensemble/4"
 
 #: Trials spent before each set's look: 240 rotation-sweep configs + v1's 7 candidates
 #: + v1's ensemble = 248; every later set adds its candidates and its ensemble.
-TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261}
+TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261, "v4": 270}
 
 
 def lf_sha256(data: bytes) -> str:
@@ -454,6 +458,112 @@ def v3_candidates() -> dict[str, CandidateFn]:
     return out
 
 
+# ── v4: short-horizon mean reversion on SPY / QQQ, daily segments (270 trials before) ──
+
+UNIVERSE_V4: tuple[str, ...] = ("SPY", "QQQ")
+RSI_PERIOD = 2
+RSI_ENTRY = 10.0
+RSI_EXIT = 60.0
+TREND_MA = 200
+DOWN_DAYS = 3
+TOM_DAYS_BEFORE = 4   # turn of month: last 4 sessions of a month ...
+TOM_DAYS_AFTER = 3    # ... and the first 3 of the next
+
+
+def rsi(prices: pd.Series, period: int = RSI_PERIOD) -> float:
+    """Wilder-free simple RSI over the last ``period`` changes (Connors' RSI(2) uses this form)."""
+    d = prices.diff().dropna().iloc[-period:]
+    if len(d) < period:
+        return float("nan")
+    up = float(d[d > 0].sum())
+    down = float(-d[d < 0].sum())
+    if up + down == 0:
+        return 50.0
+    return 100.0 * up / (up + down)
+
+
+def rsi2_weights(ctx: DecisionContext, ticker: str) -> dict[str, float]:
+    """Connors RSI(2): long when RSI(2) < 10 above the 200-day MA; stay long until RSI(2) > 60.
+
+    Stateless form: the position is on if the most recent entry (RSI below 10 above the MA) is
+    more recent than the most recent exit (RSI above 60), looking back 10 sessions.
+    """
+    if ticker not in ctx.prices.columns:
+        return {}
+    px = ctx.prices[ticker].dropna()
+    if len(px) < TREND_MA + 12:
+        return {}
+    ma = float(px.iloc[-TREND_MA:].mean())
+    last_entry = last_exit = None
+    for back in range(10, -1, -1):
+        window = px.iloc[: len(px) - back]
+        r = rsi(window)
+        above = float(window.iloc[-1]) > float(window.iloc[-TREND_MA:].mean()) if back else float(px.iloc[-1]) > ma
+        if r < RSI_ENTRY and above:
+            last_entry = back
+        if r > RSI_EXIT:
+            last_exit = back
+    if last_entry is not None and (last_exit is None or last_entry < last_exit):
+        return {ticker: 1.0}
+    return {}
+
+
+def three_down_weights(ctx: DecisionContext, ticker: str) -> dict[str, float]:
+    """Long after three consecutive lower closes above the 200-day MA; flat once the close exceeds the prior close."""
+    if ticker not in ctx.prices.columns:
+        return {}
+    px = ctx.prices[ticker].dropna()
+    if len(px) < TREND_MA + DOWN_DAYS + 2:
+        return {}
+    above = float(px.iloc[-1]) > float(px.iloc[-TREND_MA:].mean())
+    d = px.diff().dropna()
+    if above and bool((d.iloc[-DOWN_DAYS:] < 0).all()):
+        return {ticker: 1.0}
+    # still in: entered within the last 5 sessions and no up close since the entry
+    for back in range(1, 6):
+        seg = d.iloc[: len(d) - back]
+        if len(seg) >= DOWN_DAYS and bool((seg.iloc[-DOWN_DAYS:] < 0).all()) and bool((d.iloc[len(d) - back :] <= 0).all()):
+            return {ticker: 1.0}
+    return {}
+
+
+def turn_of_month_weights(ctx: DecisionContext, ticker: str) -> dict[str, float]:
+    """Long over the last 4 and first 3 sessions of each calendar month (Ariel / Lakonishok–Smidt)."""
+    if ticker not in ctx.prices.columns:
+        return {}
+    idx = ctx.prices.index
+    if len(idx) < 30:
+        return {}
+    today = idx[-1]
+    month_sessions = idx[(idx.year == today.year) & (idx.month == today.month)]
+    pos = int(month_sessions.get_loc(today)) + 1          # 1-based session number within the month
+    if pos <= TOM_DAYS_AFTER:
+        return {ticker: 1.0}
+    # last 4 sessions: count remaining business days in the month from the NYSE-ish bdate calendar
+    month_end = (today + pd.offsets.MonthEnd(0)).normalize()
+    remaining = len(pd.bdate_range(today, month_end)) - 1  # business days after today in this month
+    if remaining < TOM_DAYS_BEFORE:
+        return {ticker: 1.0}
+    return {}
+
+
+def v4_candidates() -> dict[str, CandidateFn]:
+    """The six registered v4 arms, all daily (no cadence wrapper)."""
+    return {
+        "rsi2_spy": lambda ctx: rsi2_weights(ctx, "SPY"),
+        "rsi2_qqq": lambda ctx: rsi2_weights(ctx, "QQQ"),
+        "three_down_spy": lambda ctx: three_down_weights(ctx, "SPY"),
+        "three_down_qqq": lambda ctx: three_down_weights(ctx, "QQQ"),
+        "turn_of_month_spy": lambda ctx: turn_of_month_weights(ctx, "SPY"),
+        "turn_of_month_qqq": lambda ctx: turn_of_month_weights(ctx, "QQQ"),
+    }
+
+
+#: v4 runs on daily segments: 252 per year, trailing 252, re-select every 21, and the look
+#: runs the selector at 20 bp (primary) and 10 bp (secondary) — two ensemble configurations.
+V4_CONFIG: dict[str, Any] = {"rebalance": "B", "periods_per_year": 252, "trailing": 252, "selection_every": 21}
+
+
 @dataclass(frozen=True)
 class CandidateSet:
     """One registered set: its universe, candidates, trial accounting and verdict rule."""
@@ -469,11 +579,15 @@ class CandidateSet:
 
     @property
     def n_trials_cumulative(self) -> int:
-        """Trials before this set + this set's candidates + this set's ensemble."""
-        return self.trials_before + len(self.factory()) + 1
+        """Trials before this set + this set's candidates + this set's ensemble configuration(s)."""
+        return self.trials_before + len(self.factory()) + self.extra_ensembles
+
+    extra_ensembles: int = 1
+    config_overrides: dict[str, Any] = field(default_factory=dict)
 
     def config(self, **overrides: Any) -> "EnsembleConfig":
-        return EnsembleConfig(n_trials_declared=self.n_trials_cumulative, criterion=self.criterion, **overrides)
+        merged = {**self.config_overrides, **overrides}
+        return EnsembleConfig(n_trials_declared=self.n_trials_cumulative, criterion=self.criterion, **merged)
 
 
 def candidate_set(name: str) -> CandidateSet:
@@ -483,6 +597,11 @@ def candidate_set(name: str) -> CandidateSet:
         return CandidateSet("v2", UNIVERSE_V2, v2_candidates, TRIALS_BEFORE["v2"], "watch")
     if name == "v3":
         return CandidateSet("v3", UNIVERSE_V3, v3_candidates, TRIALS_BEFORE["v3"], "watch")
+    if name == "v4":
+        return CandidateSet(
+            "v4", UNIVERSE_V4, v4_candidates, TRIALS_BEFORE["v4"], "watch",
+            extra_ensembles=2, config_overrides={**V4_CONFIG, "cost_bps_per_side": 20.0},
+        )
     raise KeyError(f"unknown candidate set {name!r}")
 
 
@@ -1099,7 +1218,7 @@ def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 __all__ = [
     "BENCHMARK", "CANDIDATES", "Cadenced", "CandidateSet", "REGISTRATIONS", "TRIALS_BEFORE", "UNIVERSE_V2",
-    "UNIVERSE_V3", "candidate_set", "v2_candidates", "v3_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
+    "UNIVERSE_V3", "UNIVERSE_V4", "candidate_set", "v2_candidates", "v3_candidates", "v4_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
     "PREREG_SHA256", "PanelPITStore", "UNIVERSE", "annualised_sharpe", "block_bootstrap_mean",
     "compute_candidate_paths", "deflated_sharpe", "evaluate", "frame_to_records", "inverse_vol_weights",
     "path_returns", "pbo_over_candidates", "rebalance_dates", "registration_sha256", "report_markdown",
