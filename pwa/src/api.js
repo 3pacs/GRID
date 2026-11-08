@@ -1451,6 +1451,7 @@ class GRIDApi {
 
     // Oracle
     async getOracleScoreboard() { return this._fetch('/api/v1/oracle/scoreboard'); }
+    async getOracleEvidence() { return this._fetch('/api/v1/oracle/evidence'); }
     async getOraclePredictions(params = {}) {
         const qs = new URLSearchParams(params).toString();
         return this._fetch(`/api/v1/oracle/predictions?${qs}`);

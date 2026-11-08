@@ -521,6 +521,78 @@ export function PredictionCard({ pred }) {
 }
 
 
+// ── Evidence by model ─────────────────────────────────────────────────────
+// Replaces the hit-rate "tournament": predictions that expire on the same
+// date are one market bet, so evidence is counted in independent expiry
+// windows and judged on return in excess of same-direction calls.
+
+const VERDICT_LABEL = {
+    edge: { text: 'EDGE', color: colors.green },
+    no_edge: { text: 'NO EDGE', color: colors.red },
+    insufficient_windows: { text: 'TOO FEW WINDOWS', color: colors.textMuted },
+};
+
+const pct = (v, digits = 2) => (v == null ? 'N/A' : `${v > 0 ? '+' : ''}${v.toFixed(digits)}%`);
+
+export function EvidencePanel({ evidence }) {
+    if (!evidence?.summary) return null;
+    const sm = evidence.summary;
+    const method = evidence.method || {};
+    const models = evidence.models || [];
+    const headline = sm.models_with_edge > 0
+        ? `${sm.models_with_edge} of ${sm.models_tested} testable model${sm.models_tested === 1 ? '' : 's'} show an edge.`
+        : `No model has shown an edge. ${sm.models_tested} model${sm.models_tested === 1 ? ' has' : 's have'} enough independent windows (${method.min_windows}+) to test.`;
+    return (
+        <div style={{ ...shared.card, padding: '14px 16px', marginBottom: '12px' }}>
+            <div style={s.sectionTitle}>EVIDENCE BY MODEL</div>
+            <div data-testid="evidence-headline" style={{ fontSize: '13px', fontWeight: 700, color: sm.models_with_edge > 0 ? colors.green : colors.text, marginBottom: '6px' }}>
+                {headline}
+            </div>
+            <div style={{ fontSize: '11px', color: colors.textDim, fontFamily: mono, lineHeight: 1.5, marginBottom: '10px' }}>
+                {sm.outcomes} outcomes over {sm.windows} expiry dates. Official verdicts end {sm.official_last_expiry || 'N/A'};
+                {' '}{sm.corrected_outcomes} more are corrected rescores (hindsight, through {sm.corrected_last_expiry || 'N/A'}).
+                {' '}Excess = return minus same-direction calls on the same expiry. Lower bound: expiry-clustered bootstrap.
+                {sm.excluded_implausible > 0 && ` ${sm.excluded_implausible} implausible outcomes (price/split errors) excluded.`}
+                {sm.models_hidden_small > 0 && ` ${sm.models_hidden_small} models with <${method.min_outcomes_shown} outcomes not listed.`}
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: mono, fontSize: '11px' }}>
+                    <thead>
+                        <tr style={{ color: colors.textMuted, textAlign: 'right' }}>
+                            <th style={{ textAlign: 'left', padding: '4px' }}>MODEL</th>
+                            <th style={{ padding: '4px' }}>CALLS</th>
+                            <th style={{ padding: '4px' }}>WINDOWS</th>
+                            <th style={{ padding: '4px' }}>RAW</th>
+                            <th style={{ padding: '4px' }}>EXCESS</th>
+                            <th style={{ padding: '4px' }}>LOWER BOUND</th>
+                            <th style={{ padding: '4px' }}>VERDICT</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {models.map(m => {
+                            const v = VERDICT_LABEL[m.verdict] || VERDICT_LABEL.insufficient_windows;
+                            return (
+                                <tr key={m.name} style={{ borderTop: `1px solid ${colors.borderSubtle}`, textAlign: 'right', color: colors.textDim }}>
+                                    <td style={{ textAlign: 'left', padding: '4px', color: colors.text }} title={`${m.first_created?.slice(0, 10)} to ${m.last_created?.slice(0, 10)}`}>
+                                        {humanizeOr(m.name, 'unnamed model')}
+                                    </td>
+                                    <td style={{ padding: '4px' }}>{m.outcomes}</td>
+                                    <td style={{ padding: '4px', color: m.windows >= method.min_windows ? colors.text : colors.textMuted }}>{m.windows}</td>
+                                    <td style={{ padding: '4px' }}>{pct(m.raw_mean_pct)}</td>
+                                    <td style={{ padding: '4px' }}>{pct(m.excess_mean_pct)}</td>
+                                    <td style={{ padding: '4px' }}>{pct(m.lower_bound_pct)}</td>
+                                    <td style={{ padding: '4px', color: v.color, fontWeight: 700 }}>{v.text}</td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
+}
+
+
 // ── Main View ─────────────────────────────────────────────────────────────
 
 export default function Predictions() {
@@ -541,6 +613,10 @@ export default function Predictions() {
     }, { fallback: { scoreboard: null, latest: null } });
     const scoreboard = scoreData.scoreboard;
     const latest = scoreData.latest;
+    const { data: evidenceRes } = useAsyncData(async () => {
+        const res = await api.getOracleEvidence();
+        return res?.error ? null : res;
+    }, { fallback: null });
 
     const fetchPredictions = useCallback(async (status) => {
         try {
@@ -574,9 +650,6 @@ export default function Predictions() {
     const scored = overall.scored || 0;
     const accColor = accuracy > 0.55 ? colors.green : accuracy > 0.45 ? colors.yellow : colors.red;
 
-    // Sort models by accuracy for tournament
-    const sortedModels = [...models].sort((a, b) => (b.accuracy || 0) - (a.accuracy || 0));
-
     return (
         <div style={s.container}>
             {/* Inject animation keyframes */}
@@ -608,8 +681,8 @@ export default function Predictions() {
             <div style={s.scoreboardRow}>
                 <div style={s.scoreCard}>
                     <RingChart value={accuracy} color={accColor} />
-                    <div style={{ ...s.bigLabel, marginTop: '4px' }}>ACCURACY</div>
-                    <div style={s.subStat}>{scored} scored predictions</div>
+                    <div style={{ ...s.bigLabel, marginTop: '4px' }}>HIT RATE (OFFICIAL)</div>
+                    <div style={s.subStat}>{scored} official verdicts, not independent</div>
                 </div>
                 <div style={s.scoreCard}>
                     <div style={{ ...s.bigNumber, color: overall.total_pnl > 0 ? colors.green : overall.total_pnl < 0 ? colors.red : colors.text }}>
@@ -649,33 +722,8 @@ export default function Predictions() {
                 ))}
             </div>
 
-            {/* ── Model Tournament ─────────────────────────────── */}
-            {sortedModels.length > 0 && (
-                <div style={{ ...shared.card, padding: '14px 16px', marginBottom: '12px' }}>
-                    <div style={s.sectionTitle}>MODEL TOURNAMENT</div>
-                    {sortedModels.map((m, i) => {
-                        const pct = (m.accuracy || 0) * 100;
-                        const barColor = i === 0 ? colors.green : i === sortedModels.length - 1 ? colors.red : colors.accent;
-                        return (
-                            <div key={m.name} style={s.modelBar}>
-                                <span style={{ fontSize: '12px', fontFamily: mono, color: colors.textMuted, width: '18px' }}>
-                                    {i === 0 ? '\u{1F947}' : i === 1 ? '\u{1F948}' : i === 2 ? '\u{1F949}' : `#${i + 1}`}
-                                </span>
-                                <span style={s.modelName} title={m.description}>
-                                    {humanizeOr(m.name, 'unnamed model')}
-                                </span>
-                                <div style={s.modelBarOuter}>
-                                    <div style={s.modelBarInner(pct, barColor)} />
-                                </div>
-                                <span style={s.modelStat}>{pct.toFixed(0)}%</span>
-                                <span style={{ ...s.modelStat, color: m.cumulative_pnl > 0 ? colors.green : colors.red }}>
-                                    {m.cumulative_pnl > 0 ? '+' : ''}{m.cumulative_pnl?.toFixed(1)}%
-                                </span>
-                            </div>
-                        );
-                    })}
-                </div>
-            )}
+            {/* ── Evidence by model (replaces the hit-rate tournament) ── */}
+            <EvidencePanel evidence={evidenceRes} />
 
             {/* ── Tabs ─────────────────────────────────────────── */}
             <div style={s.tabs}>

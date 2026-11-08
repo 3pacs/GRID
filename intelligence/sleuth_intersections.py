@@ -14,7 +14,8 @@ alone is never a lead. Families (``classify_signal``):
 * ``insider``           Form 4 buys / sells (``insider``, ``quiverquant:insider``)
 * ``congress``          congressional trades
 * ``gov_contract``      contract awards (up)
-* ``retail_sentiment``  WSB / reddit positioning
+* ``retail_sentiment``  reddit positioning (``smart_money``); QuiverQuant WSB
+  is left out while its snapshot is frozen (``_FROZEN_SOURCES``)
 * ``price_move``        a robust excess-return anomaly vs SPY (``robust_z``)
 
 Every observation carries its citation (table and row key) and was recorded
@@ -101,9 +102,15 @@ _FAMILY_BY_SOURCE = {
     "congressional": "congress",
     "gov_contract": "gov_contract",
     "quiverquant:gov_contracts": "gov_contract",
-    "quiverquant:wsb": "retail_sentiment",
     "smart_money": "retail_sentiment",
 }
+# Sources that cast no vote because they carry no information. QuiverQuant's
+# /live/wallstreetbets has returned the same 307 records on every pull since
+# 2026-04-03 (one distinct snapshot over 133 signal dates, 0 day-to-day
+# changes); each pull is stamped with that day's date, so a fixed April
+# ticker list looked like fresh retail sentiment. It made 324 of the 348 Jun-Oct
+# backtest leads. Restore it here once its snapshots change from day to day.
+_FROZEN_SOURCES = frozenset({"quiverquant:wsb"})
 
 
 # ── Pure parts ─────────────────────────────────────────────────────────────

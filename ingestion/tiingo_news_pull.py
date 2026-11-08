@@ -245,7 +245,11 @@ class TiingoNewsPuller(BasePuller):
             result["avg_sentiment"] = sum(sentiments) / len(sentiments) if sentiments else 0
 
         except Exception as exc:
-            log.error("Tiingo news pull failed for {t}: {e}", t=ticker, e=str(exc))
+            # A network timeout/connection drop is operational, not a GRID bug.
+            if isinstance(exc, requests.RequestException):
+                log.warning("Tiingo news pull failed for {t}: {e}", t=ticker, e=str(exc))
+            else:
+                log.error("Tiingo news pull failed for {t}: {e}", t=ticker, e=str(exc))
             result["status"] = "FAILED"
             result["error"] = str(exc)
 
