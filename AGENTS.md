@@ -352,3 +352,51 @@ Verification and limits:
 - Not verified here: the grader's first `review.jsonl` (its owner adopts the schema), the
   reverse mirror leg, the first scheduled ingest on grid-svr. Those are the runbook's
   acceptance chain. No row is ever updated: a correction is a new review file.
+
+## 2026-11-08 — Daily review grader moves in-repo; chain reports on itself (Claude)
+
+Anik, after the whole packet → ingest chain was live but idle waiting for the external
+daily-review agent to be nudged: "what are the weak link bottle necks that we can harden so i
+dont need to nudge anything" → "yeah do that". The only link that needed a nudge was the only
+one that was not a scheduled job.
+
+Changes:
+
+- `scripts/grade_publication_review.py` (+ `tests/test_grade_publication_review.py`): the
+  grader is a oneshot on grid-svr (11:35Z, `deploy/systemd/grid-publication-review-grader.*`).
+  Deterministic core: thesis direction calls graded against SPY split-adjusted closes with the
+  thesis tracker's own 3-day/±0.5 % rule; records whose narrative was withheld get one
+  `unscorable` `data_quality` row (the real Nov 4–7 packets are 100 % such records for
+  briefings and the diary — that is now measured, not hidden). Records with a narrative go
+  through claim extraction on `llm.router` (tier configurable; "better models until the
+  workflow is tight" is an env var, not an agent); extracted direction/level claims are graded
+  from closes, causal/event stay unresolved. Every row is built to the ingest's contract and the
+  tests push each produced file through the real ingest validators. Re-grades for 10 days so
+  every horizon up to a week resolves; a file is rewritten only when verdicts change; the grader hands the file to
+  the ingest in-process. Smoke-run on the real Nov 7 packet: 31 rows, 0 rejected.
+  An independent review (code-reviewer subagent) found and this PR fixed before merge: the
+  narrative window cut at the generator's own narrative headings; level claims on index aliases
+  compared against ETF prices; list-valued model JSON crashing a day; a failed re-ingest never
+  retried; neutral-vs-move not matching the tracker's "partial"; week horizons outside the
+  lookback; a stale baseline close silently accepted; the cache never invalidating on model change.
+- `scripts/ingest_publication_review.py`: `MAX_PACKET_BYTES` (64 MB) for packet.json. The 8 MB
+  review-file cap also applied to packets and would have refused every real day (7–24 MB);
+  found by the smoke run above, never by the 101 fixture tests.
+- `store/publication_review_status.py` + `api/routers/system.py::health`:
+  `checks.publication_review` with the latest packet day on disk and the latest ingested review
+  day; a named `degraded_reasons` entry when either is older than two days. Table-existence
+  probe first, never raises, missing tree/table = not configured.
+- `scripts/check_systemd_unit_drift.sh` + a push-deploy step (`--sync --strict`): installed
+  units whose template opts in with `# deploy-sync: managed` and differ from it are reinstalled and
+  daemon-reloaded; every other installed unit is compared and reported only (grid-e2-scoreboard's
+  deliberate dedicated-user deviation stays). Never installs a new unit, never touches drop-ins,
+  never restarts a running service, reports `name@.service` without syncing; remaining drift is a
+  workflow warning.
+  Closes the class behind the packet unit running a day without its public-tree env.
+
+Decisions and limits: the external agent's reverse mirror leg (`grid-publication-review-push`)
+is retired — two writers of `review.jsonl` would race; the pull mirror is retired with it
+(agents read the public tree on grid-svr). First install of the grader timer is the operator's
+`sudo install` (unchanged rule). Not verified here: the first scheduled run on grid-svr, the
+LLM extraction path against a live provider (no narrative exists in any current packet to
+extract from), and the deploy-time unit sync on the real host.

@@ -14,6 +14,7 @@
 # publication_review_runs + publication_claim_verdicts (+ thesis_postmortems
 # projections). Both review tables are append-only. A file already ingested
 # (same review_sha256) is a no-op, so the timer is safe to re-run.
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
 [Unit]
 Description=GRID daily review ingest (review.jsonl -> publication_claim_verdicts)
 After=network.target postgresql.service

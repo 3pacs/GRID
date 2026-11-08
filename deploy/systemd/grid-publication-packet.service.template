@@ -12,6 +12,7 @@
 # and writes a screened packet + chained receipts + observation.json under
 # $GRID_PUBLICATION_PACKET_ROOT/<YYYY-MM-DD>/. It never writes to the database.
 # A day that already has receipt.json is left untouched (safe re-run).
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
 [Unit]
 Description=GRID daily publication packet producer (screened capture of one UTC day's publications)
 After=network.target postgresql.service

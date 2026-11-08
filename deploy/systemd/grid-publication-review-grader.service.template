@@ -1,0 +1,42 @@
+# TEMPLATE -- first install is by hand (nothing installs a NEW unit); once installed,
+# deploys keep it in sync with this file (scripts/check_systemd_unit_drift.sh --sync).
+# Install (on grid-svr):
+#   sudo install -m 0644 deploy/systemd/grid-publication-review-grader.service.template \
+#       /etc/systemd/system/grid-publication-review-grader.service
+#   sudo install -m 0644 deploy/systemd/grid-publication-review-grader.timer.template \
+#       /etc/systemd/system/grid-publication-review-grader.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-publication-review-grader.timer
+#
+# The in-repo daily review grader (docs/runbooks/DAILY-PUBLICATION-PACKET.md, "Grader").
+# Reads the public screened packet tree, grades every publication of the last six
+# days (scripts/grade_publication_review.py --lookback; default 6 so horizons resolve), writes
+# $GRID_PUBLICATION_REVIEW_ROOT/<D>/review.jsonl when the verdicts changed and hands the
+# file to scripts/ingest_publication_review.py in-process. Claim extraction for records
+# that carry a narrative goes through llm.router (tier GRID_PUBLICATION_GRADER_TIER);
+# a record without a narrative or without a reachable model is still graded (unscorable
+# rows with the reason), so the day always produces a file.
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
+[Unit]
+Description=GRID daily review grader (publications -> review.jsonl -> publication_claim_verdicts)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+# The deployed release tree (same tree grid-api and grid-publication-packet run from).
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-publication-packet uses (GRID DB settings, LLM provider settings).
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=GRID_PUBLICATION_PACKET_PUBLIC_ROOT=/data/grid/outputs/publication-packets
+Environment=GRID_PUBLICATION_REVIEW_ROOT=/home/grid/research/publication-reviews
+Environment=GRID_PUBLICATION_GRADER_TIER=reason
+# Same interpreter grid-publication-packet runs under (py314.conf drop-in).
+ExecStart=/usr/bin/flock -n /tmp/grid-publication-review-grader.lock /data/grid_v4/grid_venv-314/bin/python scripts/grade_publication_review.py
+# Exit 3 = graded, but the ingest reported rejected rows (see ingest-receipt.json); not a unit failure.
+SuccessExitStatus=3
+# Up to 6 days x ~25 records; extraction calls only for records with a narrative, cached after the first run.
+TimeoutStartSec=40min
+Nice=10
+StandardOutput=journal
+StandardError=journal

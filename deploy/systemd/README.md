@@ -1,7 +1,27 @@
 # GRID systemd units
 
-This directory ships systemd unit templates. None of them is installed by
-any code path, CI job or deploy workflow.
+This directory ships systemd unit templates. None of them is INSTALLED by
+any code path, CI job or deploy workflow: the first install of a unit is always
+an operator's `sudo install` (each template's header has the lines). Once a
+unit is installed, a push deploy keeps it in sync with its template:
+`scripts/check_systemd_unit_drift.sh --sync --strict` (the "Sync installed
+systemd units" step of `.github/workflows/deploy.yml`) reinstalls any installed
+unit whose template carries the line `# deploy-sync: managed` and whose
+non-comment lines differ from the shipped file, then runs `daemon-reload`.
+Templates without that line are compared and reported only, so a deliberate
+local deviation (e.g. `grid-e2-scoreboard` running as a dedicated user) is
+never reverted by a deploy. It never installs a new unit, never touches
+`<unit>.d/` drop-ins, never restarts a running service (the deploy's own
+restart steps or the operator do that) and reports templated instance units
+(`name@.service`) without syncing them. Remaining drift is a workflow warning. Run it by hand to see drift without changing anything:
+
+```bash
+bash scripts/check_systemd_unit_drift.sh            # report (unit names + differing-line counts)
+bash scripts/check_systemd_unit_drift.sh --verbose  # also the differing lines, Environment= values redacted
+bash scripts/check_systemd_unit_drift.sh --sync     # reinstall drifted managed units
+```
+
+The deploy step never passes `--verbose`: unit contents must not land in CI logs.
 
 * `grid-goal-worker@.service`: the idle-fleet goal worker (Day 1 of
   `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
