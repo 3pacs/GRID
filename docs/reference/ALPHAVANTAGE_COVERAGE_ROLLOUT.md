@@ -250,3 +250,49 @@ ledger remains explicitly scoped and is not represented as this shared gate.
 3. Implement/review the chosen shared-budget control across enabled callers.
 4. Only after those gates, seek the separate approval for a small paid-provider
    canary and eventual deployment. No wider history download is authorized here.
+
+
+## Consumer contract implementation, 2026-11-08 (draft source only)
+
+Integrated main's `_utc_today` rendering helper while preserving both fresh and
+stale digest regressions. The forward `av_event_dates_20261108` migration changes
+the compatibility view's `earnings_date` to NULL and appends explicit `period_end`
+and `earnings_date_basis`. No current filing/transcript writer independently
+verifies an actual earnings event date. SEC filing dates remain filing dates;
+period ends are not promoted to event dates. The compatible sync function now
+returns zero inserts rather than making misleading calendar stubs. Its source
+bootstrap is aligned so a later setup cannot reinstall the unsafe mapping.
+
+This intentionally removes the unverified filing-to-calendar fallback. The
+separate actual/estimated earnings-calendar feeds are unchanged. Historical
+calendar rows remain untouched because this bridge did not preserve reliable
+origin attribution. Neither this migration nor the analyzer repairs old data.
+The view's legacy `pull_timestamp` is storage time, not a historical publication
+or point-in-time guarantee. Migration downgrade refuses to restore false dates.
+
+The transcript analyzer now includes AV read-through results separately from
+its existing EDGAR stored results. AV evidence requires nonempty matching fiscal
+provenance and aware retrieval/storage timestamps; availability is the later of
+`observed_at` and `created_at`. A historical `as_of` excludes later evidence.
+Actual `call_date` stays NULL. AV analysis IDs are source-specific, repeated
+period copies do not count twice, and the incompatible legacy ticker/date
+analysis table is not written. Historical output is explicitly recomputed from
+currently stored evidence, not an immutable historical snapshot; original
+analysis timestamps and revisions cannot be reconstructed from this schema.
+AV prior-tone shifts remain unknown rather than comparing against EDGAR rows.
+No AV analysis persistence or UI endpoint exposure is claimed by this change.
+
+Qualification: 155 offline AV/analyzer/digest tests passed with outbound socket
+connections forbidden. Six PostgreSQL 15 contract tests passed in the existing
+disposable private-socket cluster, including actual migration upgrade/grants and repeat execution, NULL event
+dates, unchanged legacy rows, repeated no-op sync and old-view replacement.
+The test cluster was stopped afterward. Changed-file Ruff and diff checks passed.
+This is not a full migration-chain or production acceptance run. New-head CI
+must finish after publication. No provider requests, production queries/writes,
+merge, deployment or scheduler changes were performed.
+
+Remaining rollout gates: historical reconciliation and metadata breadth;
+consumer/UI adoption beyond the analyzer; immutable revision-aware PIT storage;
+confirmed provider entitlements and shared-account budgeting; explicit canary
+approval. The SQLite pacing ledger remains local and can bunch delayed workers'
+actual dispatches; it is not an account-wide rolling-window guarantee.

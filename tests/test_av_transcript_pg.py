@@ -40,6 +40,7 @@ def engine():
         # Relevant schema mirrored from production information_schema/pg_constraint
         # read-only inspection, 2026-11-07. Only this disposable DB is modified.
         conn.execute(text("""
+            DROP VIEW IF EXISTS earnings_calendar_compat;
             DROP TABLE IF EXISTS raw_series, earnings_events, source_catalog;
             CREATE TABLE IF NOT EXISTS source_catalog (
                 id serial PRIMARY KEY, name text NOT NULL UNIQUE,
@@ -192,3 +193,51 @@ def test_empty_attempts_resume_across_real_pull_instances(puller, monkeypatch):
     assert puller.pull(days_back=550)["av_calls"] == 1
     assert resumed.pull(days_back=550)["av_calls"] == 1
     assert [t for t, _ in calls] == ["AAPL", "ZZZ"]
+
+
+def test_calendar_bridge_never_invents_event_dates(puller):
+    """Apply the exact forward SQL in the disposable DB, preserving legacy data."""
+    import ast
+    migration = Path(__file__).resolve().parents[1] / "migrations/versions/av_event_dates_20261108.py"
+    constants = {}
+    for node in ast.parse(migration.read_text()).body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {"VIEW_SQL", "SYNC_SQL"}:
+                    constants[target.id] = ast.literal_eval(node.value)
+    with puller.engine.begin() as conn:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS earnings_calendar "
+                          "(ticker text, earnings_date date, fiscal_quarter text, reported boolean, "
+                          "classification text, pull_timestamp timestamptz, UNIQUE(ticker, earnings_date))"))
+        conn.execute(text("TRUNCATE earnings_calendar"))
+        conn.execute(text("INSERT INTO earnings_calendar(ticker,earnings_date) VALUES ('LEGACY','2026-06-27')"))
+        conn.execute(text("INSERT INTO earnings_events(ticker,event_type,filing_date,period_end,source,raw_payload) "
+                          "VALUES ('AAPL','EARNINGS_CALL','2026-07-31','2026-06-27','ALPHAVANTAGE', "
+                          "'{\"observed_at\": \"malformed\"}'), "
+                          "('MSFT','10-Q','2026-07-30','2026-06-30','SEC_EDGAR',NULL)"))
+        # Original bridge shape, ensuring replacement preserves old column order/types.
+        legacy_view = constants["VIEW_SQL"].replace("NULL::date AS earnings_date", "period_end AS earnings_date")
+        legacy_view = legacy_view.replace(
+            ",\n       period_end,\n       'unknown_actual_event_date'::text AS earnings_date_basis", "")
+        conn.execute(text(legacy_view))
+        # Execute the actual upgrade, including guard, comment, grants and re-entry.
+        from types import SimpleNamespace
+        conn.execute(text("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='grid') "
+                          "THEN CREATE ROLE grid; END IF; END $$"))
+        tree = ast.parse(migration.read_text())
+        tree.body = [n for n in tree.body if not isinstance(n, ast.ImportFrom)]
+        scope = {"op": SimpleNamespace(execute=lambda sql: conn.execute(text(sql)),
+                                        get_bind=lambda: conn)}
+        exec(compile(tree, str(migration), "exec"), scope)
+        scope["upgrade"]()
+        scope["upgrade"]()
+        assert conn.execute(text("SELECT has_table_privilege('grid', 'earnings_calendar_compat', 'SELECT')")).scalar_one()
+        assert conn.execute(text("SELECT has_function_privilege('grid', 'sync_earnings_events_to_calendar()', 'EXECUTE')")).scalar_one()
+        for _ in range(2):
+            assert conn.execute(text("SELECT * FROM sync_earnings_events_to_calendar()")).one() == (0, 2)
+        rows = conn.execute(text("SELECT ticker,earnings_date,period_end,earnings_date_basis "
+                                 "FROM earnings_calendar_compat ORDER BY ticker")).all()
+        assert rows == [("AAPL", None, date(2026, 6, 27), "unknown_actual_event_date"),
+                        ("MSFT", None, date(2026, 6, 30), "unknown_actual_event_date")]
+        assert conn.execute(text("SELECT ticker,earnings_date FROM earnings_calendar")).all() == [
+            ("LEGACY", date(2026, 6, 27))]

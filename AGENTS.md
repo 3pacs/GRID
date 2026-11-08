@@ -352,3 +352,20 @@ Verification and limits:
 - Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
   own stages) is recorded in the runbook's consumer checklist; the producer cannot
   supply those receipts. Gemini/provider input remains the daily review's own gate.
+
+
+## 2026-11-08 - AV date-aware consumers and draft reconciliation
+
+- Integrated current main into draft #1051. Kept its rendering-date helper and
+  both fresh/stale digest tests; no main push, PR merge or deployment.
+- Added forward source migration removing fabricated period-end earnings dates
+  from the compatibility view and disabling unverified calendar stub insertion.
+  Historical rows remain untouched; unknown dates stay NULL.
+- Wired provenance/availability-gated AV read-through transcript analyses without
+  writing the incompatible legacy analysis table. Historical as-of output is
+  explicitly recomputed from current evidence, not an immutable PIT snapshot.
+- 155 offline tests passed with outbound sockets blocked; six real PostgreSQL
+  contracts passed in a disposable private-socket cluster, then it was stopped.
+  Changed-file Ruff and diff checks passed. New-head remote CI remains separate.
+- No provider calls or production access. Historical reconciliation, metadata
+  breadth, immutable revision history and shared-account quotas remain gates.
