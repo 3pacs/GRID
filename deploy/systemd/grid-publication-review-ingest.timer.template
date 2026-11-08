@@ -1,0 +1,22 @@
+# TEMPLATE — NOT INSTALLED. See grid-publication-review-ingest.service.template.
+#
+# Fires every day at 13:05Z for the PREVIOUS UTC day. Why 13:05Z: the packet
+# producer runs at 10:35Z, its mirror reaches the daily-review grader at 11:05Z,
+# and the grader's review.jsonl is pushed back to grid-svr by the 12:35Z reverse
+# mirror leg. 13:05Z is outside the nightly encrypted Postgres backup window
+# (03:30-10:30 UTC; tests/test_systemd_template_invariants.py). A day whose
+# review.jsonl has not arrived yet is REFUSED (receipt written, exit 1) and
+# picked up by the next day's run only if re-run by hand for that --day; the
+# ingest is idempotent per review file.
+# If grid-publication-packet.timer moves, move this timer with it.
+[Unit]
+Description=Ingest the GRID daily review (review.jsonl) for the previous UTC day
+
+[Timer]
+OnCalendar=*-*-* 13:05:00 UTC
+RandomizedDelaySec=2min
+Persistent=true
+Unit=grid-publication-review-ingest.service
+
+[Install]
+WantedBy=timers.target

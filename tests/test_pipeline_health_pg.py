@@ -51,7 +51,25 @@ def pipeline_pg():
     )
     try:
         with engine.begin() as conn:
-            conn.execute(text("CREATE TABLE source_catalog (id integer PRIMARY KEY, name text NOT NULL, last_pull_at timestamptz)"))
+            conn.execute(text("CREATE TABLE source_catalog (id integer PRIMARY KEY, name text NOT NULL, last_pull_at timestamptz, active boolean NOT NULL DEFAULT TRUE)"))
+            # Mirrors migrations/add_pull_log.sql (columns, CHECK, indexes).
+            conn.execute(text(
+                "CREATE TABLE pull_log ("
+                "  id serial PRIMARY KEY,"
+                "  puller_name text NOT NULL,"
+                "  source_id integer REFERENCES source_catalog(id),"
+                "  started_at timestamptz NOT NULL,"
+                "  completed_at timestamptz,"
+                "  status text NOT NULL CHECK (status IN ('RUNNING','SUCCESS','PARTIAL','FAILED')),"
+                "  rows_inserted integer DEFAULT 0,"
+                "  rows_expected integer,"
+                "  error_message text,"
+                "  features_affected integer[],"
+                "  node_name text DEFAULT 'grid-svr'"
+                ")"
+            ))
+            conn.execute(text("CREATE INDEX idx_pull_log_status ON pull_log(status, completed_at DESC)"))
+            conn.execute(text("CREATE INDEX idx_pull_log_puller ON pull_log(puller_name, started_at DESC)"))
             conn.execute(text("CREATE TABLE raw_series (id bigserial PRIMARY KEY, source_id integer, series_id text, pull_timestamp timestamptz, pull_status text)"))
             conn.execute(text("CREATE TABLE feature_registry (id integer PRIMARY KEY, name text, family text, model_eligible boolean)"))
             conn.execute(text("CREATE TABLE resolved_series (feature_id integer, vintage_date date)"))
@@ -253,8 +271,8 @@ def test_source_query_avoids_sample_and_preserves_health_values(pipeline_pg):
     assert "COUNT(DISTINCT sampled.series_id)" not in candidate_sql
 
     old_sql = candidate_sql.replace(
-        "COALESCE(recent.recent_rows, 0) AS recent_rows ",
-        "COALESCE(recent.recent_rows, 0) AS recent_rows, "
+        "sc.id AS source_id, sc.active AS catalog_active ",
+        "sc.id AS source_id, sc.active AS catalog_active, "
         "COALESCE(series.series_count, 0) AS series_count ",
     ).replace(
         "ORDER BY sc.name",
@@ -268,8 +286,8 @@ def test_source_query_avoids_sample_and_preserves_health_values(pipeline_pg):
     with pipeline_pg.connect() as conn:
         candidate_rows = conn.exec_driver_sql(candidate_sql, candidate_params).fetchall()
         original_rows = conn.exec_driver_sql(old_sql, {"series_limit": 50_000}).fetchall()
-        assert [tuple(row[:3]) for row in candidate_rows] == [tuple(row[:3]) for row in original_rows]
-        assert all(row[3] > 0 for row in original_rows)
+        assert [tuple(row[:5]) for row in candidate_rows] == [tuple(row[:5]) for row in original_rows]
+        assert all(row[5] > 0 for row in original_rows)
         candidate_plan = conn.exec_driver_sql(
             "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + candidate_sql, candidate_params
         ).scalar_one()[0]
@@ -287,3 +305,158 @@ def test_source_query_avoids_sample_and_preserves_health_values(pipeline_pg):
         f"candidate_shared_read={candidate_plan['Plan'].get('Shared Read Blocks', 0)} "
         f"original_shared_read={original_plan['Plan'].get('Shared Read Blocks', 0)}"
     )
+
+
+def _seed_run_states(engine):
+    """One catalog row per pipeline status, driven by real pull_log rows.
+
+    Names are outside _SOURCE_SCHEDULE and PULLER_REGISTRY, so every row
+    gets the 168 h default window (recent = 336 h).
+    """
+    long_tail = "x" * 2000
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO source_catalog (id, name, last_pull_at, active) VALUES "
+            "(10, 'pg_options', NULL, true), (11, 'pg_monthly', NULL, true), "
+            "(12, 'pg_nokey', NULL, true), (13, 'pg_authfail', NULL, false), "
+            "(14, 'pg_failing', NULL, true), (15, 'pg_stopped', NULL, true), "
+            "(16, 'pg_inactive', NULL, false), (17, 'pg_stale', NULL, true), "
+            "(18, 'pg_byname', NULL, true)"
+        ))
+        conn.execute(text(
+            "INSERT INTO raw_series (source_id, series_id, pull_timestamp, pull_status) "
+            "VALUES (17, 'PG:STALE', now() - interval '200 hours', 'SUCCESS')"
+        ))
+        conn.execute(
+            text(
+                "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, status, rows_inserted, error_message) VALUES "
+                # healthy: rows landed in its own tables, nothing in raw_series
+                "('YFinance_Options', 10, now() - interval '2 hours', now() - interval '2 hours', 'SUCCESS', 75994, NULL), "
+                # quiet: old release, latest run found nothing new
+                "('pg_monthly', 11, now() - interval '200 hours', now() - interval '200 hours', 'SUCCESS', 500, NULL), "
+                "('pg_monthly', 11, now() - interval '1 hour', now() - interval '1 hour', 'SUCCESS', 0, 'NO_NEW_DATA: run completed, 0 rows written'), "
+                # skipped_config (SKIPPED marker); a newer orphaned RUNNING row is ignored
+                "('pg_nokey', 12, now() - interval '3 hours', now() - interval '3 hours', 'SUCCESS', 0, 'SKIPPED: PG_API_KEY not configured'), "
+                "('pg_nokey', 12, now() - interval '1 hour', NULL, 'RUNNING', 0, NULL), "
+                # skipped_config (FAILED, CONFIG class)
+                "('pg_authfail', 13, now() - interval '1 hour', now() - interval '1 hour', 'FAILED', 0, 'PullerReportedFailure: no_api_key'), "
+                # failing: latest run timed out, with a credential in the URL
+                "('pg_failing', 14, now() - interval '400 hours', now() - interval '400 hours', 'SUCCESS', 12, NULL), "
+                "('pg_failing', 14, now() - interval '1 hour', now() - interval '1 hour', 'FAILED', 0, "
+                "  'TIMEOUT: GET https://api.example.com/v1/q?apikey=PGSECRET123&x=1 ' || :tail), "
+                # stopped: rows long ago, nothing since
+                "('pg_stopped', 15, now() - interval '1000 hours', now() - interval '1000 hours', 'SUCCESS', 7, NULL), "
+                # healthy, attributed by name (no source_id, different case)
+                "('PG_ByName', NULL, now() - interval '3 hours', now() - interval '3 hours', 'PARTIAL', 4, "
+                "  'source coverage incomplete or row count unknown')"
+            ),
+            {"tail": long_tail},
+        )
+
+
+def test_pull_log_drives_each_status(pipeline_pg):
+    _seed_run_states(pipeline_pg)
+    response = _response(pipeline_pg)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["availability"] == "available"
+    assert data["status_basis"] == "pull_log+raw_series"
+    by_name = {row["name"]: row for row in data["sources"]}
+    assert {name: row["status"] for name, row in by_name.items()} == {
+        "yfinance": "healthy",
+        "Fed_Liquidity": "inactive",
+        "pg_options": "healthy",
+        "pg_byname": "healthy",
+        "pg_monthly": "quiet",
+        "pg_nokey": "skipped_config",
+        "pg_authfail": "skipped_config",
+        "pg_failing": "failing",
+        "pg_stopped": "stopped",
+        "pg_inactive": "inactive",
+        "pg_stale": "stale",
+    }
+
+    summary = data["summary"]
+    assert summary["total_sources"] == 11
+    assert (summary["healthy"], summary["stale"], summary["quiet"], summary["skipped_config"]) == (3, 1, 1, 2)
+    assert (summary["failing"], summary["stopped"], summary["inactive"]) == (1, 1, 2)
+    assert summary["broken"] == summary["failing"] + summary["stopped"] == 2
+    assert summary["active_sources"] == 9
+    assert sum(summary["by_status"].values()) == 11
+
+    options = by_name["pg_options"]
+    assert options["rows_last_pull"] == 0  # nothing in raw_series ...
+    assert options["last_rows_inserted"] == 75994  # ... but pull_log saw the rows
+    assert options["last_success_with_rows_at"] is not None
+    assert options["field_record"]["availability"] == "available"
+    assert options["runs_7d"] == 1
+
+    nokey = by_name["pg_nokey"]
+    assert nokey["last_status"] == "SUCCESS"  # the RUNNING row is not the latest run
+    assert nokey["last_error"] == "SKIPPED: PG_API_KEY not configured"
+    assert nokey["error"] == nokey["last_error"]
+    assert nokey["field_record"]["stale_reason"] == "never_configured"
+
+    failing = by_name["pg_failing"]
+    assert failing["last_status"] == "FAILED"
+    assert "PGSECRET123" not in failing["last_error"]
+    assert len(failing["last_error"]) <= 300
+    assert failing["last_error_class"] == "TIMEOUT"
+    assert failing["runs_7d"] == 1  # the 400 h-old run is outside 7 days
+    assert failing["field_record"]["stale_reason"] == "fetch_failed"
+    assert "PGSECRET123" not in response.text
+
+    monthly = by_name["pg_monthly"]
+    assert monthly["field_record"]["stale_reason"] == "not_published_yet"
+    assert monthly["freshness"] == "green"
+    assert by_name["pg_stopped"]["freshness"] == "red"
+    assert by_name["pg_inactive"]["field_record"]["availability"] == "unavailable"
+    assert by_name["pg_authfail"]["catalog_active"] is False
+
+
+def test_missing_pull_log_falls_back_to_raw_series_visibly(pipeline_pg):
+    with pipeline_pg.begin() as conn:
+        conn.execute(text("DROP TABLE pull_log"))
+    response = _response(pipeline_pg)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["availability"] == "unavailable"
+    assert data["stale_reason"] == "consumer_query_mismatch"
+    assert data["status_basis"] == "raw_series_only"
+    by_name = {row["name"]: row for row in data["sources"]}
+    assert by_name["yfinance"]["status"] == "healthy"
+    # The rest of the response still reads: the savepoint kept the
+    # transaction usable after the failed pull_log read.
+    assert data["coverage"]["by_family"]["market"]["with_data"] == 1
+    assert len(data["recent_errors"]) == 1
+
+
+def test_pull_log_summary_plan_is_one_scan(pipeline_pg):
+    """The run summary reads pull_log once (CTE), not once per catalog row."""
+    from ingestion.source_freshness import (
+        CATALOG_RUN_ERROR_CHARS,
+        CATALOG_RUN_LOOKBACK_DAYS,
+        CATALOG_RUN_SUMMARY_SQL,
+    )
+
+    _seed_run_states(pipeline_pg)
+    with pipeline_pg.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, status, rows_inserted) "
+            "SELECT 'pg_bulk', 10 + (g % 9), now() - (g % 2000) * interval '1 hour', "
+            "       now() - (g % 2000) * interval '1 hour', 'SUCCESS', g % 3 "
+            "FROM generate_series(1, 20000) AS g"
+        ))
+        conn.execute(text("ANALYZE pull_log"))
+    with pipeline_pg.connect() as conn:
+        plan = conn.execute(
+            text("EXPLAIN (ANALYZE, FORMAT JSON) " + CATALOG_RUN_SUMMARY_SQL.text),
+            {"lookback_days": CATALOG_RUN_LOOKBACK_DAYS, "error_chars": CATALOG_RUN_ERROR_CHARS},
+        ).scalar_one()[0]
+
+    def scans(node):
+        found = 1 if node.get("Relation Name") == "pull_log" else 0
+        return found + sum(scans(child) for child in node.get("Plans", []))
+
+    assert scans(plan["Plan"]) == 1
+    print(f"pull_log_summary_pg_plan rows=20010 exec_ms={plan['Execution Time']:.3f}")

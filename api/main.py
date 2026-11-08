@@ -190,8 +190,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # Separate the slow startup work into a background coroutine that runs
 # after uvicorn is already serving requests.
 
+def _prewarm_request_path(app: FastAPI) -> None:
+    """Build what the first requests would otherwise build on the event loop.
+
+    FastAPI builds each router's route contexts lazily on the loop, stalling
+    every request for 2-6 s the first time a cold router is hit (35 of 36
+    watchdog stalls, 2026-11-07), and the deploy's route check fetches
+    /openapi.json right after restart (~5 s of pydantic JSON-schema work;
+    ``app.openapi()`` caches it on the app).
+    """
+    import time as _time
+
+    try:
+        from api.route_warm import warm_route_contexts
+
+        _t0 = _time.perf_counter()
+        _n = warm_route_contexts(app.router)
+        log.info("Route contexts pre-built: {n} in {s:.1f}s", n=_n, s=_time.perf_counter() - _t0)
+        _t0 = _time.perf_counter()
+        app.openapi()
+        log.info("OpenAPI schema pre-built in {s:.1f}s", s=_time.perf_counter() - _t0)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Route context warm-up skipped: {e}", e=str(exc))
+
+
 def _sync_deferred_startup(app: FastAPI) -> None:
     """Deferred startup — DB check + pre-warm dashboard cache."""
+    _prewarm_request_path(app)
+
     try:
         from db import health_check
         ok = health_check()

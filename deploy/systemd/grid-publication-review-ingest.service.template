@@ -1,0 +1,38 @@
+# TEMPLATE — NOT INSTALLED by any code path. Installing this unit (and its
+# .timer) activates the daily review INGEST described in
+# docs/runbooks/DAILY-PUBLICATION-PACKET.md ("Review ingest"). Install (on grid-svr):
+#   sudo install -m 0644 deploy/systemd/grid-publication-review-ingest.service.template \
+#       /etc/systemd/system/grid-publication-review-ingest.service
+#   sudo install -m 0644 deploy/systemd/grid-publication-review-ingest.timer.template \
+#       /etc/systemd/system/grid-publication-review-ingest.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-publication-review-ingest.timer
+#
+# The job reads the previous UTC day's review.jsonl (written by the daily-review
+# grader, delivered to $GRID_PUBLICATION_REVIEW_ROOT/<YYYY-MM-DD>/) and the
+# producer's packet under $GRID_PUBLICATION_PACKET_ROOT/<YYYY-MM-DD>/, verifies
+# the file against the packet (hashes, verbatim claim spans) and writes
+# publication_review_runs + publication_claim_verdicts (+ thesis_postmortems
+# projections). Both review tables are append-only. A file already ingested
+# (same review_sha256) is a no-op, so the timer is safe to re-run.
+[Unit]
+Description=GRID daily review ingest (review.jsonl -> publication_claim_verdicts)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+# The deployed release tree (same tree grid-api and grid-publication-packet run from).
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-publication-packet uses (GRID DB settings).
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=GRID_PUBLICATION_PACKET_ROOT=/home/grid/research/publication-packets
+Environment=GRID_PUBLICATION_REVIEW_ROOT=/home/grid/research/publication-reviews
+# Same interpreter grid-publication-packet runs under (py314.conf drop-in).
+ExecStart=/usr/bin/flock -n /tmp/grid-publication-review-ingest.lock /data/grid_v4/grid_venv-314/bin/python scripts/ingest_publication_review.py
+# Exit 3 = ingested with rejected rows (visible in ingest-receipt.json); not a unit failure.
+SuccessExitStatus=3
+TimeoutStartSec=5min
+Nice=10
+StandardOutput=journal
+StandardError=journal

@@ -18,17 +18,24 @@ from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
 
 # DBnomics series: provider/dataset/series -> feature name
+#
+# Checked against api.db.nomics.world 2026-11-07:
+# * The three Eurostat mirrors (prc_hicp_manr, une_rt_m, sts_inpr_m) are gone:
+#   ingestion/international/eurostat.py pulls them direct under the same
+#   feature names, and DBnomics still mirrors the retired prc_hicp_manr
+#   (frozen at 2025-12) while the other two 404. Writing the same series_id
+#   from two sources also makes store.observations raise MixedSourceError.
+# * france_10y_yield moved to ECB/IRS (same dataset as Italy); BDF/FM 404s.
+# * us_credit_gdp_bis moved to BIS/WS_TC (private non-financial sector,
+#   all lenders, % of GDP); BIS/total_credit 404s.
+# * OECD/KEI, BDF/BP and Bundesbank/BBDP1 404 with no DBnomics replacement,
+#   so germany_cli_dbnomics, france_current_account and germany_cpi_dbnomics
+#   are dropped. None of the five had ever stored a row.
 DBNOMICS_SERIES: dict[str, str] = {
     "ECB/IRS/M.IT.L.L40.CI.0000.EUR.N.Z": "italy_10y_ecb_dbnomics",
-    "BDF/FM/M.FR.EUR.FR.BB.GVT.YLD.10Y": "france_10y_yield",
-    "OECD/KEI/LORSGPNO.DEU.ST.M": "germany_cli_dbnomics",
+    "ECB/IRS/M.FR.L.L40.CI.0000.EUR.N.Z": "france_10y_yield",
     "IMF/IFS/M.US.FIMM_PA.USD": "us_mmkt_rate_imf",
-    "BIS/total_credit/Q.5J.P.N.I.B.770": "us_credit_gdp_bis",
-    "Eurostat/prc_hicp_manr/M.RCH_A.CP00.EA": "eurozone_hicp_yoy",
-    "Eurostat/une_rt_m/M.T.NSA.PC_ACT.T.EA19": "eurozone_unemployment",
-    "Eurostat/sts_inpr_m/M.I15.NS0.B.EU27_2020": "eu_industrial_output",
-    "BDF/BP/M.FR.1.B.S121.A21.T.Z.EUR.Z": "france_current_account",
-    "Bundesbank/BBDP1/M.DE.N.VPI.C.A00000.I15.R": "germany_cpi_dbnomics",
+    "BIS/WS_TC/Q.US.P.A.M.770.A": "us_credit_gdp_bis",
 }
 
 _RATE_LIMIT_DELAY: float = 2.0
@@ -43,6 +50,18 @@ class DBnomicsPuller(BasePuller):
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         log.info("DBnomicsPuller initialised — source_id={sid}", sid=self.source_id)
+
+    def _latest_stored_values(self, series_id: str, conn: Any) -> dict[date, float]:
+        """Latest SUCCESS value per obs_date this source stored for ``series_id``."""
+        rows = conn.execute(
+            text(
+                "SELECT DISTINCT ON (obs_date) obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date, pull_timestamp DESC"
+            ),
+            {"sid": series_id, "src": self.source_id},
+        ).fetchall()
+        return {r[0]: float(r[1]) for r in rows if r[1] is not None}
 
     def pull_series(
         self,
@@ -91,6 +110,11 @@ class DBnomicsPuller(BasePuller):
 
             inserted = 0
             with self.engine.begin() as conn:
+                # Compare against the latest stored vintage, not the 1-hour
+                # _row_exists window: the old check re-inserted the whole
+                # history on every pull (eurozone_hicp_yoy held 36,888 rows
+                # for 348 dates on 2026-11-07).
+                stored = self._latest_stored_values(feature_name, conn)
                 for _, row in df.iterrows():
                     try:
                         # DBnomics returns 'period' and 'value' columns
@@ -103,7 +127,7 @@ class DBnomicsPuller(BasePuller):
                         obs_dt = pd.Timestamp(str(period)).date()
                         value = float(value)
 
-                        if self._row_exists(feature_name, obs_dt, conn):
+                        if obs_dt in stored and stored[obs_dt] == value:
                             continue
 
                         conn.execute(
@@ -122,7 +146,8 @@ class DBnomicsPuller(BasePuller):
             log.info("DBnomics {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("DBnomics pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
+            # Provider/network failure, reported in the result: not a GRID bug.
+            log.warning("DBnomics pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

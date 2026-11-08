@@ -56,3 +56,41 @@ def test_short_page_or_missing_cursor_stops(monkeypatch) -> None:
     p, calls = _puller(monkeypatch, pages)
     assert len(p._fetch_pac_contributions("C00103697", cycle=2026)) == 100
     assert len(calls) == 1
+
+
+# ── a refused (rate-limited) run is not "no new data" ────────────────────
+
+
+def _rate_limited_puller(monkeypatch, *, stored_pac: int, api_key: str = "DEMO_KEY"):
+    p = object.__new__(CampaignFinancePuller)
+    p.api_key = api_key
+
+    def pac():
+        p._rate_limited_for = 57732  # what _fec_get records on a long 429
+        return {"status": "SUCCESS", "total_fetched": stored_pac, "stored": stored_pac}
+
+    monkeypatch.setattr(p, "pull_pac_contributions", pac, raising=False)
+    monkeypatch.setattr(p, "pull_individual_contributions",
+                        lambda: {"status": "SUCCESS", "total_fetched": 0, "stored": 0}, raising=False)
+    return p
+
+
+def test_fully_rate_limited_run_is_failed_with_the_reason(monkeypatch) -> None:
+    out = _rate_limited_puller(monkeypatch, stored_pac=0).pull_all()
+    assert out["status"] == "FAILED" and out["rows_inserted"] == 0
+    assert "rate limited" in out["error"] and "FEC_API_KEY" in out["error"]
+
+
+def test_partly_rate_limited_run_is_partial(monkeypatch) -> None:
+    out = _rate_limited_puller(monkeypatch, stored_pac=12, api_key="real").pull_all()
+    assert out["status"] == "PARTIAL" and out["rows_inserted"] == 12
+    assert "rate limited" in out["note"] and "FEC_API_KEY" not in out["note"]
+
+
+def test_unthrottled_run_keeps_its_status(monkeypatch) -> None:
+    p = object.__new__(CampaignFinancePuller)
+    p.api_key = "real"
+    monkeypatch.setattr(p, "pull_pac_contributions", lambda: {"status": "SUCCESS", "stored": 3}, raising=False)
+    monkeypatch.setattr(p, "pull_individual_contributions", lambda: {"status": "SUCCESS", "stored": 0}, raising=False)
+    out = p.pull_all()
+    assert out["status"] == "SUCCESS" and "error" not in out

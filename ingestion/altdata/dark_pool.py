@@ -18,6 +18,19 @@ Series stored with patterns:
 Source: FINRA ATS Transparency Data
 URL: https://api.finra.org/data/group/otcMarket/name/weeklySummary
 Schedule: Weekly (data published weekly with ~2-week lag)
+
+Fetch window (2026-11-07): ``pull_weekly`` used to send FINRA the range
+2020-01-01..today on every run, for all four summaryTypeCode partitions.
+weeklySummary answered that with ``record-total: 296280`` (60 pages of 5000
+at ~17 s each, measured 2026-11-07), so every scheduled run since 2026-10-20
+hit the smart scheduler's 60 s timeout and stored nothing. A scheduled run now
+asks only for the ATS partitions (the parser drops OTC rows anyway) over an
+incremental window: ``_FETCH_WINDOW_WEEKS`` back, widened to reach
+``_FETCH_OVERLAP_WEEKS`` before the latest stored week so a missed stretch
+back-fills itself, never further than ``_MAX_FETCH_WEEKS`` (FINRA's rolling
+year). That is ~10k records, 2-3 pages. Pagination stops at the server's
+``Record-Total`` and at ``_MAX_PAGES``. An explicit ``start_date`` still
+requests exactly that range (manual backfill).
 """
 
 from __future__ import annotations
@@ -43,6 +56,14 @@ _REQUEST_TIMEOUT: int = 45
 _RATE_LIMIT_DELAY: float = 2.0
 _PAGE_SIZE: int = 5000
 
+# Incremental fetch window for a scheduled run (see module docstring).
+_FETCH_WINDOW_WEEKS: int = 16
+_FETCH_OVERLAP_WEEKS: int = 4
+_MAX_FETCH_WEEKS: int = 52
+# Hard stop on pagination; a 52-week ATS-only pull is ~7 pages.
+_MAX_PAGES: int = 20
+_RECORD_TOTAL_HEADER: str = "Record-Total"
+
 # Tickers to track — major ETFs + liquid mega-caps
 TRACKED_TICKERS: list[str] = [
     "SPY", "QQQ", "IWM", "DIA", "HYG", "TLT", "XLF", "XLE", "XLK",
@@ -63,6 +84,7 @@ _VOLUME_SPIKE_THRESHOLD: float = 2.0  # 2x average
 # the per-firm rows against the aggregate — inflating volume by ~4x.
 _ATS_AGG_SUMMARY_CODE: str = "ATS_W_SMBL"        # one aggregate row / week
 _ATS_FIRM_SUMMARY_CODE: str = "ATS_W_SMBL_FIRM"  # per-firm rows (sum = agg)
+_ATS_SUMMARY_CODES: list[str] = [_ATS_AGG_SUMMARY_CODE, _ATS_FIRM_SUMMARY_CODE]
 
 
 def parse_ats_weekly_records(
@@ -141,6 +163,22 @@ def parse_ats_weekly_records(
             }
 
     return by_ticker
+
+
+def _record_total(resp: Any) -> int | None:
+    """FINRA's ``Record-Total`` response header as an int, else None."""
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        raw = headers.get(_RECORD_TOTAL_HEADER)
+    except Exception:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return None
+    try:
+        total = int(raw)
+    except ValueError:
+        return None
+    return total if total >= 0 else None
 
 
 class DarkPoolPuller(BasePuller):
@@ -249,13 +287,19 @@ class DarkPoolPuller(BasePuller):
             ],
         }
 
+        domain_filters: list[dict[str, Any]] = []
         if tickers:
-            query["domainFilters"] = [
-                {
-                    "fieldName": "issueSymbolIdentifier",
-                    "values": tickers,
-                }
-            ]
+            domain_filters.append({
+                "fieldName": "issueSymbolIdentifier",
+                "values": tickers,
+            })
+        # OTC_* partitions are discarded by the parser; not requesting them
+        # roughly halves the response.
+        domain_filters.append({
+            "fieldName": "summaryTypeCode",
+            "values": _ATS_SUMMARY_CODES,
+        })
+        query["domainFilters"] = domain_filters
 
         resp = requests.post(
             _WEEKLY_SUMMARY_URL,
@@ -266,10 +310,43 @@ class DarkPoolPuller(BasePuller):
 
         # 204 = No Content (valid response, just no data for this range)
         if resp.status_code == 204:
+            self._last_record_total = 0
             return []
 
         resp.raise_for_status()
+        self._last_record_total = _record_total(resp)
         return resp.json()
+
+    def _latest_stored_week(self, ticker: str) -> date | None:
+        """Latest stored week for one tracked ticker's volume series.
+
+        One point lookup (series_id equality), SUCCESS rows only. Any DB
+        error reads as "unknown" and the default window is used.
+        """
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT MAX(obs_date) FROM raw_series "
+                        "WHERE series_id = :sid AND source_id = :src "
+                        "AND pull_status = 'SUCCESS'"
+                    ),
+                    {"sid": f"DARKPOOL:{ticker}:volume", "src": self.source_id},
+                ).fetchone()
+        except Exception as exc:
+            log.warning("DarkPool: latest stored week lookup failed: {e}", e=str(exc))
+            return None
+        value = row[0] if row else None
+        return value if isinstance(value, date) else None
+
+    def _incremental_start(self, tickers: list[str], today: date) -> date:
+        """First week a scheduled run asks FINRA for (see module docstring)."""
+        start = today - timedelta(weeks=_FETCH_WINDOW_WEEKS)
+        floor = today - timedelta(weeks=_MAX_FETCH_WEEKS)
+        latest = self._latest_stored_week(tickers[0]) if tickers else None
+        if latest is None:
+            return floor
+        return max(floor, min(start, latest - timedelta(weeks=_FETCH_OVERLAP_WEEKS)))
 
     def _parse_weekly_records(
         self,
@@ -379,7 +456,7 @@ class DarkPoolPuller(BasePuller):
 
     def pull_weekly(
         self,
-        start_date: str | date = "2020-01-01",
+        start_date: str | date | None = None,
         weeks_back: int | None = None,
         tickers: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -389,32 +466,38 @@ class DarkPoolPuller(BasePuller):
         raw_series, detects volume spikes, and emits signals.
 
         Parameters:
-            start_date: Earliest observation date to store.
+            start_date: Earliest week to request and store. ``None`` (the
+                scheduled run) uses the incremental window; an explicit date
+                is a manual backfill of exactly that range.
             weeks_back: If set, only store data from this many weeks ago.
             tickers: Ticker symbols to track (default: TRACKED_TICKERS).
 
         Returns:
             dict with status, rows_inserted, tickers_with_data, spikes_detected.
         """
-        if isinstance(start_date, str):
-            start_date = date.fromisoformat(start_date)
-
-        if weeks_back is not None:
-            cutoff = date.today() - timedelta(weeks=weeks_back)
-            start_date = max(start_date, cutoff)
-
         if tickers is None:
             tickers = TRACKED_TICKERS
 
         end_date = date.today()
 
+        if start_date is None:
+            start_date = self._incremental_start(tickers, end_date)
+        elif isinstance(start_date, str):
+            start_date = date.fromisoformat(start_date)
+
+        if weeks_back is not None:
+            cutoff = end_date - timedelta(weeks=weeks_back)
+            start_date = max(start_date, cutoff)
+
         # Fetch all pages using dateRangeFilters (FINRA requires this
         # instead of sortFields which needs partition key CompareFilters)
         all_records: list[dict[str, Any]] = []
         offset = 0
+        page_budget_exhausted = False
 
         try:
-            while True:
+            for page_no in range(_MAX_PAGES):
+                self._last_record_total = None
                 page = self._fetch_weekly_page(
                     offset=offset,
                     limit=_PAGE_SIZE,
@@ -433,10 +516,16 @@ class DarkPoolPuller(BasePuller):
                     n=len(page),
                 )
 
-                if len(page) < _PAGE_SIZE:
+                total = self._last_record_total
+                if total is not None and offset + len(page) >= total:
+                    break
+                if total is None and len(page) < _PAGE_SIZE:
                     break
 
-                offset += _PAGE_SIZE
+                offset += len(page)
+                if page_no == _MAX_PAGES - 1:
+                    page_budget_exhausted = True
+                    break
                 time.sleep(_RATE_LIMIT_DELAY)
 
         except Exception as exc:
@@ -465,7 +554,8 @@ class DarkPoolPuller(BasePuller):
             return {"status": "SUCCESS", "rows_inserted": 0}
 
         log.info(
-            "DarkPool: fetched {n} total records", n=len(all_records)
+            "DarkPool: fetched {n} total records for weeks {s}..{e}",
+            n=len(all_records), s=start_date, e=end_date,
         )
 
         # Parse by ticker and date
@@ -556,16 +646,23 @@ class DarkPoolPuller(BasePuller):
             s=len(all_spikes),
         )
 
-        return {
+        result: dict[str, Any] = {
             "status": "SUCCESS",
             "rows_inserted": total_inserted,
             "tickers_with_data": tickers_with_data,
             "spikes_detected": len(all_spikes),
+            "fetch_start": start_date.isoformat(),
         }
+        if page_budget_exhausted:
+            result["status"] = "PARTIAL"
+            result["error"] = (
+                f"page budget of {_MAX_PAGES} pages exhausted at offset {offset}"
+            )
+        return result
 
     def pull_all(
         self,
-        start_date: str | date = "2020-01-01",
+        start_date: str | date | None = None,
         weeks_back: int | None = None,
         tickers: list[str] | None = None,
     ) -> dict[str, Any]:

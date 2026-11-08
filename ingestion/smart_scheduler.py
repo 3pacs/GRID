@@ -1326,7 +1326,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         "timeout_s": 60,
         "kwargs": {"use_llm": False, "pause_seconds": 0.5},
     },
-    {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 60},
+    {"name": "opportunity",       "mod": "ingestion.altdata.opportunity",       "cls": "OppInsightsPuller","method": "pull_all",      "freq_h": 24, "timeout_s": 120},
 
     # ── International (daily, but slower) ──
     {"name": "ecb",               "mod": "ingestion.international.ecb",         "cls": "ECBPuller",                "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
@@ -1339,7 +1339,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "oecd",              "mod": "ingestion.international.oecd",        "cls": "OECDPuller",               "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
     {"name": "bis",               "mod": "ingestion.international.bis",         "cls": "BISPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
     {"name": "imf",               "mod": "ingestion.international.imf",         "cls": "IMFPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
-    {"name": "dark_pool",         "mod": "ingestion.altdata.dark_pool",         "cls": "DarkPoolPuller",           "method": "pull_weekly",   "freq_h": 168, "timeout_s": 60},
+    # dark_pool: 120s, not 60s. Its incremental FINRA window is 2-3 pages at
+    # ~6s each plus 2s spacing (measured 2026-11-07), up to ~7 pages when it
+    # back-fills a year after an outage; 60s left no room for one retry.
+    {"name": "dark_pool",         "mod": "ingestion.altdata.dark_pool",         "cls": "DarkPoolPuller",           "method": "pull_weekly",   "freq_h": 168, "timeout_s": 120},
     {"name": "gov_contracts",     "mod": "ingestion.altdata.gov_contracts",     "cls": "GovContractsPuller",       "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
     {"name": "supply_chain",      "mod": "ingestion.altdata.supply_chain",      "cls": "SupplyChainPuller",        "method": "pull_all",      "freq_h": 168, "timeout_s": 60, "api_key": "FRED_API_KEY", "api_key_mode": "keyword"},
 
@@ -1377,7 +1380,8 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # grid-scheduler's daily Tiingo worker (SKIPPED while that holds it).
     {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_incremental", "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
-    {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
+    {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env",
+     "hold_reason": "Retired 2026-11-08 (owner): the Tiingo plan covers only the DOW 30 (89 of 138 tickers refused); market cap and shares come from sec_xbrl_shares (ticker_metrics_daily) for the full universe"},
     {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
 
     # ── Crypto (DexScreener) ──
@@ -1395,7 +1399,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # BLSPuller(db_engine, api_key=None): keyword mode, never positional.
     # pull_all is one bounded request (see BLSPuller.pull_all).
     {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY", "api_key_mode": "keyword"},
-    {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
+    # edgar: a full pull took 4 min 38 s (13F re-parsed 300 infotables) and
+    # timed out at 180 s every day; 13F now skips stored filings. 600 s
+    # covers a 13F filing-deadline day when all 75 funds file at once.
+    {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 600},
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (holiday/DST-aware release window + 1-day retry), not freq_h — see the GRID task A1 note above _cftc_current_report_date
 
     # ── Sentiment / alt ──
@@ -1424,7 +1431,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # market_cap to ticker_metrics_daily. Was registered in hermes_operator
     # PULLER_CONFIG but missing from this registry, so it never ran from
     # 2026-04-12 onward — leaving blue-chip rows stuck at 03-31/04-08.
-    {"name": "sec_xbrl_shares",     "mod": "ingestion.altdata.sec_xbrl_shares",      "cls": "SECXBRLSharesPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800, "kwargs": {"limit": 400, "backfill_days": 90}},
+    # No ticker limit: limit=400 always took the first 400 of the 1,268
+    # sector-map tickers, so the other 868 (ISRG, ABT, MDT, ...) were last
+    # written 2026-05-17 and every run reported PARTIAL. 400 tickers took
+    # ~4 min, so the full universe fits the 1800 s budget.
+    {"name": "sec_xbrl_shares",     "mod": "ingestion.altdata.sec_xbrl_shares",      "cls": "SECXBRLSharesPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800, "kwargs": {"backfill_days": 90}},
 
     # ── Silent-orphan additions (task #170 fix, 2026-05-17) ──
     # Pullers that were registered in hermes_operator.py _SOURCE_REGISTRY but
@@ -1899,12 +1910,15 @@ SKIP_RETRY_MINUTES = 30
 TICK_TIME_BUDGET_S = 300  # 5 minutes
 
 
+MISSING_API_KEY_PREFIX = "Missing API key: "
+
+
 class MissingPullerApiKey(Exception):
     """Raised when a registry entry requires an unset API key."""
 
     def __init__(self, key_name: str) -> None:
         self.key_name = key_name
-        super().__init__(f"Missing API key: {key_name}")
+        super().__init__(f"{MISSING_API_KEY_PREFIX}{key_name}")
 
 
 class SmartScheduler:
@@ -1965,6 +1979,13 @@ class SmartScheduler:
         # class pullers) live in _SOURCE_EXTRAS, and alias names alias onto
         # a canonical PULLER_REGISTRY entry — neither indicates a bug.
         intentional_cfg_only = set(_SOURCE_EXTRAS.keys()) | set(_SOURCE_ALIASES.keys())
+        # _build_source_registry also adds each entry's source_catalog name
+        # (REGISTRY_CATALOG_NAMES) as an alias; those 33 names were reported
+        # as orphans although every one aliases a registered puller.
+        intentional_cfg_only |= {
+            catalog.strip().lower().replace(" ", "_").replace("-", "_")
+            for name, catalog in REGISTRY_CATALOG_NAMES.items() if name in reg
+        }
         only_cfg = (cfg - reg) - intentional_cfg_only
         only_reg = reg - cfg
         if only_cfg:
@@ -2418,10 +2439,20 @@ class SmartScheduler:
         run, never a RUNNING row that a restart could orphan.
         """
         status = result.get("status")
-        if status == OUTCOME_SKIPPED:
-            return
         error = result.get("error")
-        if status == OUTCOME_NO_NEW_DATA:
+        if status == OUTCOME_SKIPPED:
+            reason = str(result.get("reason") or "")
+            if not reason.startswith(MISSING_API_KEY_PREFIX):
+                return
+            # A missing key is configuration, not a transient skip: record it
+            # the grid-scheduler way (SUCCESS, 0 rows, "SKIPPED: ...") so
+            # pipeline-health shows skipped_config instead of the last real
+            # failure forever. Restart state then waits freq_h before the
+            # next check, which is all a missing key warrants.
+            log_status = OUTCOME_SUCCESS
+            error = f"SKIPPED: {reason}"
+            result = {**result, "rows_inserted": 0}
+        elif status == OUTCOME_NO_NEW_DATA:
             # A completed check that wrote nothing. pull_log's CHECK
             # constraint has no such status, so it is stored as SUCCESS
             # with rows_inserted = 0 and the NO_NEW_DATA marker in

@@ -42,6 +42,11 @@ _RATE_LIMIT_DELAY: float = 1.0
 # grid-svr 2026-11-04). Daily series are fetched in <=10-year windows.
 _DAILY_SERIES: frozenset[int] = frozenset({1, 11})
 _REVISION_LOOKBACK_DAYS: int = 400
+# SGS answers HTTP 404 with this detail when the window simply holds no
+# observations (a monthly series asked for the last three weeks). Hermes'
+# repair pulls from a recent start, so this was logged as a failure for
+# every non-daily code on every retry (70 warnings/day, 2026-11-07).
+_NO_VALUES_MARKER = "Value(s) not found"
 _MAX_DAILY_WINDOW_YEARS: int = 10
 
 
@@ -94,6 +99,8 @@ class BCBPuller(BasePuller):
         if end_date:
             params["dataFinal"] = self._format_date_br(end_date)
         resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code == 404 and _NO_VALUES_MARKER in (resp.text or ""):
+            return []
         resp.raise_for_status()
         return resp.json()
 
@@ -145,6 +152,11 @@ class BCBPuller(BasePuller):
         try:
             data = self._fetch_windowed(series_code, start_date, end_date)
 
+            if isinstance(data, list) and not data:
+                # Nothing published in the window (SGS 404 "Value(s) not
+                # found", or an empty array): no new data, not a failure.
+                log.info("BCB {fn}: no observations since {sd}", fn=feature_name, sd=start_date)
+                return result
             if not data:
                 result["status"] = "PARTIAL"
                 result["errors"].append("No data returned")

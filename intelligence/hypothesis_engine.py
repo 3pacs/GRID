@@ -13,7 +13,8 @@ Pipeline:
   2. AnomalyHunter            — volume spikes, actor behaviour shifts, convergence
   3. HypothesisGenerator      — create testable hypotheses from patterns + anomalies
   4. score_hypothesis          — test hypotheses against incoming data
-  5. auto_discover             — full pipeline: detect → hunt → generate → store
+  5. auto_discover             — generator v2: the baseline of every Sleuth
+                                 intersection lead (steps 1-3 are CLI scans only)
 
 Storage: discovered_hypotheses table (see ensure_tables).
 
@@ -27,7 +28,7 @@ import hashlib
 import json
 import sys
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -1038,45 +1039,29 @@ class HypothesisGenerator:
         return result
 
     def auto_discover(self) -> list[dict]:
-        """Full pipeline: detect patterns, find anomalies, generate hypotheses, store.
+        """Generator v2: declare the baseline hypothesis of every recent Sleuth
+        intersection lead that has none (``intersection_baseline``).
 
-        Returns list of generated hypothesis dicts.
+        The v1 pipeline (detect -> hunt -> generate -> store, then a full
+        scoring batch) is retired from this path. Of its 3,624 ledgered trials
+        (2026-11-07), 2,988 were GRID telemetry (``snap:*`` lead-lags, volume
+        watches on ``analytical_snapshots``), 42 untestable, and all 594 tested
+        convergence trials failed; convergence counted signal types and oracle
+        model clones as independent sources. Lead-lag on ``sig:*`` activity
+        counts names no market outcome, so v2 writes only ticker-move tests,
+        scored by the crowd-ranked trial scorer. Scoring is Hermes' 30-minute
+        tick, not this call. The v1 detectors stay for the CLI scans.
         """
-        ensure_tables(self.engine)
-
-        log.info("hypothesis_engine: starting auto-discovery pipeline")
-
-        # Phase 1: temporal patterns
-        patterns = self.detector.discover_patterns()
-
-        # Phase 2: anomalies
-        vol_anomalies = self.hunter.scan_volume_anomalies()
-        actor_anomalies = self.hunter.scan_actor_anomalies()
-        convergence = self.hunter.scan_convergence()
-        all_anomalies = vol_anomalies + actor_anomalies + convergence
-
-        # Phase 3: generate
-        hypotheses = self.generate(patterns=patterns, anomalies=all_anomalies)
-
-        # Phase 4: store (deduplicate by thesis hash)
-        stored = 0
-        for hyp in hypotheses:
-            if self._store_hypothesis(hyp):
-                stored += 1
-
-        # Phase 5: score existing (one ledgered batch; held/unconfigured = no-op)
-        scored = self.score_all()
-
-        log.info(
-            "hypothesis_engine: discovery complete — "
-            "{} patterns, {} anomalies, {} new hypotheses stored, {} scored",
-            len(patterns),
-            len(all_anomalies),
-            stored,
-            scored.get("declared", 0),
+        from intelligence.sleuth_intersections import (
+            BASELINE_CATCHUP_DAYS,
+            declare_missing_baselines,
         )
 
-        return [asdict(h) for h in hypotheses]
+        ensure_tables(self.engine)
+        since = datetime.now(timezone.utc) - timedelta(days=BASELINE_CATCHUP_DAYS)
+        ids = declare_missing_baselines(self.engine, since=since)
+        log.info("hypothesis_engine: generator v2 declared {} baselines", len(ids))
+        return [{"id": i, "pattern_type": "intersection_baseline"} for i in ids]
 
     # ── private: hypothesis builders ─────────────────────────────────────
 
@@ -1899,8 +1884,9 @@ def score_due_active_hypotheses(
     S11 trial ledger's file lock: each matured hypothesis gets one point-in-time
     holdout look, GRID telemetry is ineligible, BH runs over the batch, and the
     batch is appended to the ledger before any row changes. ``batch_size``
-    caps the active rows scanned (oldest first); ``max_runtime_s`` stops the
-    scan early, and the trials planned so far still form the batch.
+    caps the trials declared; every active row is scanned oldest first, so rows
+    still pending (they stay active) never use up the batch. ``max_runtime_s``
+    stops the scan early, and the trials planned so far still form the batch.
 
     Wired into the hermes operator at a 30-minute cadence (see
     ``scripts/hermes_operator.py``). Writes nothing while
@@ -1934,7 +1920,7 @@ def score_due_active_hypotheses(
     try:
         with hypothesis_trials.open_trial_ledger() as ledger:
             result = hypothesis_trials.score_batch(
-                engine, ledger=ledger, limit=batch_size, max_runtime_s=max_runtime_s,
+                engine, ledger=ledger, max_trials=batch_size, max_runtime_s=max_runtime_s,
             )
     except hypothesis_trials.TrialLedgerNotConfigured as exc:
         counts["errors"] += 1
@@ -1956,6 +1942,7 @@ def score_due_active_hypotheses(
         "expired": verdicts.get("expired", 0),
         "pending": result.get("pending", 0),
         "timed_out": bool(result.get("timed_out")),
+        "capped": bool(result.get("capped")),
         "scorer_version": result.get("scorer_version"),
         "record_sha256": result.get("record_sha256"),
         "applied": result.get("applied"),
@@ -2122,9 +2109,7 @@ def main() -> None:
         print("\n=== Auto-Discovery Complete ===")
         print(f"Generated {len(results)} hypotheses\n")
         for h in results[:10]:
-            print(f"  [{h['pattern_type']}] {h['thesis'][:100]}...")
-            print(f"    confidence: {h['confidence']:.3f}")
-            print()
+            print(f"  [{h['pattern_type']}] {h['id']}")
 
     elif cmd == "scan-patterns":
         detector = TemporalPatternDetector(engine)

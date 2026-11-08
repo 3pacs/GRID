@@ -103,90 +103,156 @@ def _sessions(start: date, end: date) -> list[date]:
     return days
 
 
-def _walk(days: list[date], seed: int, vol: float = 0.01) -> dict[date, float]:
-    rng = np.random.default_rng(seed)
-    prices = 100 * np.exp(np.cumsum(rng.normal(0, vol, len(days))))
-    return dict(zip(days, prices.tolist()))
-
-
 CREATED = datetime(2026, 9, 1, 14, 0, tzinfo=UTC)  # 10:00 ET, before the close
 
 
-def _market_and_ticker(jump: float = 0.0) -> tuple[dict, dict]:
-    days = _sessions(date(2022, 1, 3), date(2026, 10, 30))
-    market = _walk(days, 1)
-    ticker = _walk(days, 2)
-    entry = min(d for d in days if d >= date(2026, 9, 1))
-    for d in days:
-        if d > entry:
-            ticker[d] *= 1 + jump
-    return market, ticker
+CROWD_DAYS = _sessions(date(2026, 3, 2), date(2026, 10, 30))
+ENTRY = date(2026, 9, 1)
 
 
-def test_ticker_move_large_excess_move_is_significant() -> None:
-    market, ticker = _market_and_ticker(jump=0.40)
-    r = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
+def _crowd(n: int = 300, shock: float = 0.0, seed: int = 10) -> dict[str, dict[date, float]]:
+    """``n`` stocks with vols from 1% to 4%; each moves ``shock`` (log) with the
+    crowd after the entry close."""
+    rng = np.random.default_rng(seed)
+    out = {}
+    for i in range(n):
+        vol = rng.uniform(0.01, 0.04)
+        lv = np.cumsum(rng.normal(0, vol, len(CROWD_DAYS)))
+        lv += np.array([shock if d > ENTRY else 0.0 for d in CROWD_DAYS])
+        out[f"S{i}"] = dict(zip(CROWD_DAYS, (100 * np.exp(lv)).tolist()))
+    return out
+
+
+def _stock(vol: float = 0.02, jump: float = 0.0, shock: float = 0.0, seed: int = 2) -> dict[date, float]:
+    rng = np.random.default_rng(seed)
+    lv = np.cumsum(rng.normal(0, vol, len(CROWD_DAYS)))
+    lv += np.array([(jump + shock) if d > ENTRY else 0.0 for d in CROWD_DAYS])
+    return dict(zip(CROWD_DAYS, (100 * np.exp(lv)).tolist()))
+
+
+def _move(ticker: dict, crowd: dict, **kw) -> ht.TrialResult:
+    return ht.ticker_move_test(ticker, crowd, **{
+        "created_at": CREATED, "direction": "up", "window_days": 14, "min_move_pct": 2.0, **kw})
+
+
+def test_ticker_move_large_move_past_the_crowd_is_significant() -> None:
+    r = _move(_stock(jump=0.40), _crowd())
     assert r.status == ht.TESTED
     assert r.p_value < 0.01 and r.effect_ok
     assert r.details["entry"] == "2026-09-01"  # created before the close: that day's close
-    assert r.details["n_null"] >= ht.MIN_NULL_SAMPLES
+    assert r.details["n_crowd"] == 300
 
 
 def test_ticker_move_wrong_direction_is_not_significant() -> None:
-    market, ticker = _market_and_ticker(jump=0.40)
-    r = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="down",
-                            window_days=14, min_move_pct=2.0)
+    r = _move(_stock(jump=0.40), _crowd(), direction="down")
     assert r.status == ht.TESTED
     assert r.p_value > 0.5 and not r.effect_ok
 
 
-def test_ticker_move_market_wide_rally_is_not_a_finding() -> None:
-    # The ticker rises 15% because the whole market does: no excess return.
-    market, ticker = _market_and_ticker()
-    entry = date(2026, 9, 1)
-    for series in (market, ticker):
-        for d in series:
-            if d > entry:
-                series[d] *= 1.15
-    r = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
-    assert r.status == ht.TESTED
-    assert r.p_value > 0.05
+@pytest.mark.parametrize("shock,direction", [(0.15, "up"), (-0.15, "down")])
+def test_a_crowd_wide_move_is_not_a_finding(shock: float, direction: str) -> None:
+    # 2026-09-14..10-01: ~77% of US stocks lagged SPY and v2/v3 credited every
+    # "down" call with it. Here the ticker moves 15% because everyone does.
+    r = _move(_stock(shock=shock), _crowd(shock=shock), direction=direction)
+    assert r.status == ht.TESTED and r.p_value > 0.10
+    assert abs(r.details["crowd_median_log_return"] - shock) < 0.03
+    assert not r.effect_ok or r.details["z"] > 0
+
+
+def test_ranks_in_units_of_each_stocks_own_volatility() -> None:
+    # An ordinary -8% fortnight for a 4%-a-day stock sits deep in the tail of a
+    # 1%-a-day crowd's raw returns, but not once each is in its own units.
+    calm = {}
+    rng = np.random.default_rng(5)
+    for i in range(300):
+        lv = np.cumsum(rng.normal(0, 0.01, len(CROWD_DAYS)))
+        calm[f"C{i}"] = dict(zip(CROWD_DAYS, (100 * np.exp(lv)).tolist()))
+    wild = _stock(vol=0.04, seed=7)
+    exit_ = max(d for d in CROWD_DAYS if d <= date(2026, 9, 15))
+    scale = wild[exit_] / wild[ENTRY]
+    wild = {d: (v * 0.92 / scale if d > ENTRY else v) for d, v in wild.items()}  # -8% over the window
+    r = _move(wild, calm, direction="down")
+    assert r.status == ht.TESTED and r.details["raw_move_pct"] == pytest.approx(-8.0, abs=0.01)
+    assert r.p_value > 0.15
+
+
+def test_leave_one_out_p_values_are_uniform_under_a_crowd_shock() -> None:
+    crowd = _crowd(n=400, shock=-0.10, seed=11)
+    ps = []
+    for name, closes in crowd.items():
+        others = {k: v for k, v in crowd.items() if k != name}
+        ps.append(_move(closes, others, direction="down").p_value)
+    assert 0.06 <= sum(p <= 0.10 for p in ps) / len(ps) <= 0.14
 
 
 def test_ticker_move_entry_after_close_is_next_session() -> None:
-    market, ticker = _market_and_ticker()
     after_close = datetime(2026, 9, 1, 21, 30, tzinfo=UTC)  # 17:30 ET
-    r = ht.ticker_move_test(ticker, market, created_at=after_close, direction="up",
-                            window_days=14, min_move_pct=2.0)
-    assert r.details["entry"] == "2026-09-02"
+    assert _move(_stock(), _crowd(), created_at=after_close).details["entry"] == "2026-09-02"
 
 
 def test_ticker_move_ignores_data_after_the_window() -> None:
-    market, ticker = _market_and_ticker(jump=0.40)
-    base = ht.ticker_move_test(ticker, market, created_at=CREATED, direction="up",
-                               window_days=14, min_move_pct=2.0)
+    crowd, ticker = _crowd(), _stock(jump=0.40)
+    base = _move(ticker, crowd)
     later = {d: (v * 3 if d > date(2026, 9, 15) else v) for d, v in ticker.items()}
-    moved = ht.ticker_move_test(later, market, created_at=CREATED, direction="up",
-                                window_days=14, min_move_pct=2.0)
+    moved = _move(later, crowd)
     assert (base.p_value, base.details) == (moved.p_value, moved.details)
 
 
 def test_ticker_move_pending_until_exit_close_exists() -> None:
-    market, ticker = _market_and_ticker()
-    cut = {d: v for d, v in ticker.items() if d <= date(2026, 9, 5)}
-    r = ht.ticker_move_test(cut, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
-    assert r is ht.PENDING
+    cut = {d: v for d, v in _stock().items() if d <= date(2026, 9, 5)}
+    assert _move(cut, _crowd()) is ht.PENDING
+
+
+def test_pending_until_enough_of_the_crowd_has_both_closes() -> None:
+    crowd = _crowd(n=ht.MIN_CROSS_SECTION + 20)
+    cut = {k: ({d: v for d, v in c.items() if d <= date(2026, 9, 5)} if i < 30 else c)
+           for i, (k, c) in enumerate(crowd.items())}
+    assert _move(_stock(), cut) is ht.PENDING
+    assert _move(_stock(), crowd).status == ht.TESTED
 
 
 def test_ticker_move_short_history_is_untestable() -> None:
-    market, ticker = _market_and_ticker()
-    short = {d: v for d, v in ticker.items() if d >= date(2026, 6, 1)}
-    r = ht.ticker_move_test(short, market, created_at=CREATED, direction="up",
-                            window_days=14, min_move_pct=2.0)
+    short = {d: v for d, v in _stock().items() if d >= date(2026, 8, 1)}
+    r = _move(short, _crowd())
     assert (r.status, r.reason) == (ht.UNTESTABLE, ht.INSUFFICIENT_HISTORY)
+
+
+def test_scale_uses_only_pre_creation_returns() -> None:
+    ticker = _stock()
+    entry, exit_, horizon = ht.trial_window(ticker, created_at=CREATED, window_days=14)
+    base = ht.scaled_move(ticker, entry, exit_, created_at=CREATED, horizon=horizon)
+    wild = {d: (v * (1.5 if d.day % 2 else 0.7) if entry < d < exit_ else v) for d, v in ticker.items()}
+    assert ht.scaled_move(wild, entry, exit_, created_at=CREATED, horizon=horizon) == base
+
+
+def test_crowd_is_a_stable_capped_us_sample() -> None:
+    conn = MagicMock()
+    sids = [f"YF:T{i}:close" for i in range(700)] + ["YF:BTC-USD:close", "YF:^VIX:close"]
+    conn.execute.return_value.fetchall.return_value = [(s,) for s in sids]
+    first = ht.crowd_tickers(conn, date(2026, 9, 14), NOW)
+    conn.execute.return_value.fetchall.return_value = [(s,) for s in reversed(sids)]
+    again = ht.crowd_tickers(conn, date(2026, 9, 14), NOW)
+    assert first == again and len(first) == ht.CROSS_SECTION_SIZE
+    assert "BTC-USD" not in first and "^VIX" not in first
+    params = conn.execute.call_args.args[1]
+    assert params["day"] == date(2026, 9, 14) and params["as_of_ts"] == NOW
+
+
+def test_run_trial_ranks_against_the_crowd_without_the_ticker() -> None:
+    plan = ht.plan_trial("h", "convergence", {"ticker": "S3", "expected_direction": "PUT"}, CREATED)
+    crowd = _crowd()
+    with patch.object(ht, "crowd_tickers", return_value=list(crowd)) as listed, \
+            patch.object(ht, "load_completed_closes", side_effect=lambda c, t, s, e, a: crowd[t]), \
+            patch.object(ht, "ticker_move_test", return_value=ht.PENDING) as test:
+        ht.run_trial(plan, MagicMock(), datetime(2026, 11, 6, tzinfo=UTC))
+    assert listed.call_args.args[1] == date(2026, 9, 1)
+    assert test.call_args.args[0] is crowd["S3"]
+    assert "S3" not in test.call_args.args[1] and len(test.call_args.args[1]) == 299
+
+
+def test_scorer_version_names_v4() -> None:
+    assert ht.SCORER_VERSION == "hypothesis-trials/4"
+    assert ht.TICKER_MOVE_HELD is False
 
 
 # ── lead-lag holdout test ───────────────────────────────────────────────────
@@ -348,7 +414,32 @@ def _row(hid: str, ptype: str, criteria: dict, days_ago: float, tested: int = 0,
 CONV = {"ticker": "AAPL", "expected_direction": "up", "window_days": 14, "min_move_pct": 2.0}
 
 
-def test_dry_run_writes_nothing_and_applies_bh() -> None:
+@pytest.fixture
+def released(monkeypatch) -> None:
+    """Batch machinery as it runs once ticker-move trials are released."""
+    monkeypatch.setattr(ht, "TICKER_MOVE_HELD", False)
+
+
+def test_held_ticker_moves_stay_active_and_unledgered(monkeypatch) -> None:
+    monkeypatch.setattr(ht, "TICKER_MOVE_HELD", True)
+    lead = {"watch_signal": "sig:insider_buy", "expect_signal": "sig:congress_trade",
+            "lag_days": 3, "expected_direction": "increases"}
+    rows = [
+        _row("conv", "convergence", CONV, 60),           # testable ticker move: held
+        _row("sleuth", "sleuth_intersection", {**CONV, "expected_direction": "down"}, 30),
+        _row("nodir", "convergence", {**CONV, "expected_direction": "opposite"}, 60),
+        _row("lead", "lead_lag", lead, 120),
+    ]
+    engine = _engine(rows)
+    with patch.object(ht, "load_completed_closes", side_effect=AssertionError("no price read")), \
+            patch.object(ht, "load_signal_series", return_value={}):
+        out = ht.score_batch(engine, dry_run=True, evaluated_at=NOW)
+    assert out["held_ticker_move"] == 2
+    declared = {t["hypothesis_id"] for t in out["record"]["trials"]}
+    assert declared == {"nodir", "lead"}      # needs no price test / unaffected test kind
+
+
+def test_dry_run_writes_nothing_and_applies_bh(released: None) -> None:
     rows = [_row(f"c{i}", "convergence", CONV, 60) for i in range(10)] + [
         _row("cat", "volume_anomaly", {"watch_category": "x"}, 60),
     ]
@@ -370,7 +461,7 @@ def test_dry_run_writes_nothing_and_applies_bh() -> None:
     assert summary["confirmed_with_no_v1_look"] == 2
 
 
-def test_pending_rows_are_not_declared_until_they_expire() -> None:
+def test_pending_rows_are_not_declared_until_they_expire(released: None) -> None:
     rows = [
         _row("young", "convergence", CONV, 5),          # window still open
         _row("waiting", "convergence", CONV, 20),       # matured, closes missing, < 2x window
@@ -385,6 +476,25 @@ def test_pending_rows_are_not_declared_until_they_expire() -> None:
     assert out["pending"] == 2
 
 
+def test_pending_rows_at_the_head_do_not_use_up_the_batch(released: None) -> None:
+    # 2026-11-07: rows still pending stay active at the head of the oldest-first
+    # queue; capping by rows scanned stalled the batch behind them.
+    rows = [_row(f"young{i}", "convergence", CONV, 5) for i in range(5)] + [
+        _row(f"cat{i}", "volume_anomaly", {"watch_category": "x"}, 4) for i in range(3)
+    ]
+    engine = _engine(rows)
+    with patch.object(ht, "load_completed_closes", return_value={}):
+        out = ht.score_batch(engine, dry_run=True, evaluated_at=NOW, max_trials=2)
+    assert [t["hypothesis_id"] for t in out["record"]["trials"]] == ["cat0", "cat1"]
+    assert out["pending"] == 5 and out["capped"] is True
+
+
+def test_uncapped_batch_reports_not_capped() -> None:
+    engine = _engine([_row("cat", "volume_anomaly", {"watch_category": "x"}, 60)])
+    out = ht.score_batch(engine, dry_run=True, evaluated_at=NOW, max_trials=2)
+    assert out["declared"] == 1 and out["capped"] is False
+
+
 def test_already_ledgered_hypotheses_are_skipped() -> None:
     ledger = ht.dry_run_ledger()
     lse.record_hypothesis_batch(ledger, scorer_version="t", evaluated_at="x", trials=[_trial("cat", 1.0, status=ht.INELIGIBLE)])
@@ -393,7 +503,7 @@ def test_already_ledgered_hypotheses_are_skipped() -> None:
     assert out["declared"] == 0 and out["skipped_already_ledgered"] == 1
 
 
-def test_unsupported_instrument_is_untestable() -> None:
+def test_unsupported_instrument_is_untestable(released: None) -> None:
     from evaluation.prices import UnsupportedInstrumentError
 
     engine = _engine([_row("btc", "convergence", {**CONV, "ticker": "BTC-USD"}, 60)])

@@ -14,7 +14,8 @@ Replaces the v1 scorer that ``ACTIVE_HYPOTHESIS_SCORING_HELD`` has held since
   prediction rows, mostly ``no_data`` before #976) and took the first of five
   rows that moved 2%.
 
-v2 (this module) issues a verdict only as a declared trial, once:
+v2 (this module; v4 since 2026-11-07 ranks ticker moves against the crowd)
+issues a verdict only as a declared trial, once:
 
 1. **Eligibility.** A hypothesis whose outcome or leading signal is GRID's own
    output (``snap:*``, ``llm_task_*``, oracle/hypothesis/pipeline series — see
@@ -26,8 +27,10 @@ v2 (this module) issues a verdict only as a declared trial, once:
    convergence hypotheses on completed raw closes
    (:func:`store.observations.read_completed_closes`, the #980 reader; entry at
    the first close after creation, exit at the last close inside the declared
-   window, both known at ``evaluated_at``) against the ticker's own
-   pre-creation distribution of same-horizon excess returns over SPY;
+   window, both known at ``evaluated_at``), ranked against up to 500 US stocks
+   over the same days, each in units of its own pre-creation volatility (v4;
+   v2 and v3 let a crowd-wide move count for the stock -- see
+   :func:`ticker_move_test`);
    lead-lag hypotheses at their *declared* lag and sign on the calendar days
    after creation, against a block-permutation null
    (:mod:`analysis.offline_research_proof`).
@@ -79,17 +82,22 @@ from analysis.offline_research_proof import (
     excluded as _research_excluded,
 )
 
-SCORER_VERSION = "hypothesis-trials/2"
+SCORER_VERSION = "hypothesis-trials/4"
 
 ET = ZoneInfo("America/New_York")
 US_CLOSE = dtime(16, 0)
 
-# Convergence (ticker-move) test.
-MARKET_TICKER = "SPY"
+# Convergence (ticker-move) test (v4: ranked against the same-window crowd).
+CROSS_SECTION_SIZE = 500              # US stocks the call is ranked against (stable sha256 sample)
+MIN_CROSS_SECTION = 100               # fewer with both window closes captured -> still pending
+VOL_SESSIONS = 60                     # pre-creation daily returns that set each stock's scale
+VOL_LOOKBACK_DAYS = 120               # calendar days of pre-creation closes read for that scale
+VOL_STALE_DAYS = 7                    # the last pre-creation close may be this old
+# Switch to leave ticker-move trials active, unscored and unledgered. v3 (SPY+IWM
+# betas) set it after it failed calibration; v4 releases it.
+TICKER_MOVE_HELD = False
 DEFAULT_WINDOW_DAYS = 14
 DEFAULT_MIN_MOVE_PCT = 2.0
-NULL_LOOKBACK_DAYS = 365 * 5 + 30     # calendar days of pre-creation closes read for the null
-MIN_NULL_SAMPLES = 250                # same-horizon null returns needed for a p-value
 EDGE_TOLERANCE_DAYS = 4               # entry/exit close may sit this far inside the window edge
 
 # Lead-lag test.
@@ -288,60 +296,98 @@ def entry_session_floor(created_at: datetime) -> date:
     return local.date() if local.time() < US_CLOSE else local.date() + timedelta(days=1)
 
 
+def trial_window(closes: dict[date, float], *, created_at: datetime,
+                 window_days: int) -> tuple[date, date, int] | None:
+    """(entry, exit, sessions between) of a ticker-move trial, or None while
+    the first close after creation or the last close inside the window is
+    missing."""
+    floor = entry_session_floor(created_at)
+    ceiling = _aware(created_at).astimezone(ET).date() + timedelta(days=window_days)
+    after = sorted(d for d in closes if floor <= d <= ceiling)
+    if len(after) < 2:
+        return None
+    entry, exit_ = after[0], after[-1]
+    if (entry - floor).days > EDGE_TOLERANCE_DAYS or (ceiling - exit_).days > EDGE_TOLERANCE_DAYS:
+        return None
+    return entry, exit_, len(after) - 1
+
+
+def scaled_move(closes: dict[date, float], entry: date, exit_: date, *,
+                created_at: datetime, horizon: int) -> tuple[float, float] | None:
+    """(log return entry->exit, its scale) or None.
+
+    The scale is the sd of the ``VOL_SESSIONS`` daily log returns before
+    creation times sqrt(``horizon``): known when the call was made.
+    """
+    if entry not in closes or exit_ not in closes:
+        return None
+    created_day = _aware(created_at).astimezone(ET).date()
+    before = sorted(d for d in closes if d < created_day)[-(VOL_SESSIONS + 1):]
+    if len(before) < VOL_SESSIONS + 1 or (created_day - before[-1]).days > VOL_STALE_DAYS:
+        return None
+    sd = float(np.std(np.diff(np.log(np.array([closes[d] for d in before], dtype=float))), ddof=1))
+    if not (math.isfinite(sd) and sd > 0):
+        return None
+    return math.log(closes[exit_] / closes[entry]), sd * math.sqrt(horizon)
+
+
 def ticker_move_test(
     ticker_closes: dict[date, float],
-    market_closes: dict[date, float] | None,
+    crowd: dict[str, dict[date, float]],
     *,
     created_at: datetime,
     direction: str,
     window_days: int,
     min_move_pct: float,
 ) -> TrialResult:
-    """One-sided test that the ticker beat (or lagged) the market as declared.
+    """One-sided test that the ticker beat (or lagged) the same-window crowd.
 
-    Statistic: signed log excess return over SPY from the first close after
-    creation to the last close inside the window. Null: every overlapping
-    same-horizon signed excess return of the ticker before creation.
-    ``p = (1 + #null >= observed) / (n + 1)``. Confirmation also needs the raw
-    move to reach ``min_move_pct`` in the declared direction (the thesis'
-    own size). Returns ``PENDING`` when the entry or exit close is missing.
+    Entry is the first close after creation, exit the last close inside the
+    window. Every stock (the ticker and each ``crowd`` member with both
+    closes) gets ``z = (r - m) / scale``: its log return net of the crowd's
+    median return ``m`` over those same days, in units of its own
+    pre-creation volatility. ``p = (1 + #crowd z >= ticker z) / (n + 1)`` in
+    the declared direction: the chance a stock drawn from the crowd would
+    have done at least as well. A move the whole crowd made cancels out.
+
+    v2 compared the ticker with its own history net of SPY, and v3 net of
+    SPY+IWM betas; both let a crowd-wide move count for the stock. From
+    2026-09-14 to 10-01, 71% of 336 random US stocks fell short even of
+    SPY+IWM, and a "down" call on any of them reached p <= 0.10 19% of the
+    time.
+
+    Confirmation also needs the raw move to reach ``min_move_pct`` in the
+    declared direction and the ticker to beat the crowd median. Returns
+    ``PENDING`` while the ticker's window closes, or those of at least
+    ``MIN_CROSS_SECTION`` crowd stocks, are missing.
     """
     sign = 1.0 if direction == "up" else -1.0
-    use_market = market_closes is not None
-    days = sorted(d for d in ticker_closes if not use_market or d in market_closes)
-    floor = entry_session_floor(created_at)
-    ceiling = _aware(created_at).astimezone(ET).date() + timedelta(days=window_days)
-    after = [d for d in days if floor <= d <= ceiling]
-    if len(after) < 2:
+    window = trial_window(ticker_closes, created_at=created_at, window_days=window_days)
+    if window is None:
         return PENDING
-    entry, exit_ = after[0], after[-1]
-    if (entry - floor).days > EDGE_TOLERANCE_DAYS or (ceiling - exit_).days > EDGE_TOLERANCE_DAYS:
-        return PENDING
-
-    def log_ret(series: dict[date, float], a: date, b: date) -> float:
-        return math.log(series[b] / series[a])
-
-    raw = log_ret(ticker_closes, entry, exit_)
-    excess = raw - (log_ret(market_closes, entry, exit_) if use_market else 0.0)
-    observed = sign * excess
-    horizon = after.index(exit_)  # sessions between entry and exit
-
-    before = [d for d in days if d < _aware(created_at).astimezone(ET).date()]
-    t = np.log(np.array([ticker_closes[d] for d in before], dtype=float))
-    null = t[horizon:] - t[:-horizon] if len(t) > horizon else np.array([])
-    if use_market and len(null):
-        m = np.log(np.array([market_closes[d] for d in before], dtype=float))
-        null = null - (m[horizon:] - m[:-horizon])
-    null = sign * null
-    details = {
+    entry, exit_, horizon = window
+    raw = math.log(ticker_closes[exit_] / ticker_closes[entry])
+    details: dict[str, Any] = {
         "entry": entry.isoformat(), "exit": exit_.isoformat(), "horizon_sessions": horizon,
         "raw_move_pct": round((math.exp(raw) - 1) * 100, 4),
-        "excess_log_return": round(excess, 6), "n_null": len(null),
-        "benchmark": MARKET_TICKER if use_market else None,
     }
-    if len(null) < MIN_NULL_SAMPLES:
+    own = scaled_move(ticker_closes, entry, exit_, created_at=created_at, horizon=horizon)
+    if own is None:
         return TrialResult(status=UNTESTABLE, reason=INSUFFICIENT_HISTORY, details=details)
-    p = (1 + int((null >= observed - 1e-12).sum())) / (len(null) + 1)
+    moves = [m for c in crowd.values()
+             if (m := scaled_move(c, entry, exit_, created_at=created_at, horizon=horizon))]
+    if len(moves) < MIN_CROSS_SECTION:
+        return PENDING
+    r, scale = np.array(moves, dtype=float).T
+    median = float(np.median(r))
+    z = sign * (r - median) / scale
+    observed = sign * (own[0] - median) / own[1]
+    p = (1 + int((z >= observed - 1e-12).sum())) / (len(z) + 1)
+    details.update({
+        "crowd_median_log_return": round(median, 6),
+        "crowd_relative_log_return": round(own[0] - median, 6),
+        "z": round(float(observed), 4), "n_crowd": len(z),
+    })
     effect_ok = sign * (math.exp(raw) - 1) * 100 >= min_move_pct and observed > 0
     return TrialResult(status=TESTED, p_value=float(p), effect_ok=bool(effect_ok), details=details)
 
@@ -389,6 +435,26 @@ def lead_lag_test(
 
 # ── Data access (read-only) ──────────────────────────────────────────────────
 
+# Tickers an active hypothesis will be scored on as a ticker move (plan_trial's
+# rule: a ticker and an expected_direction). TiingoPuller.default_tickers adds
+# them so a declared trial's window gets routine closes. In the Jun-Oct 2026
+# intersection backtest 36 of the 115 lead tickers (GME, KWEB, RXRX, ...) had
+# only one-off backfills: none of their 72 trials had closes to score, and
+# live they would have expired untestable.
+ACTIVE_TICKER_MOVE_TICKERS_SQL = """
+    SELECT DISTINCT test_criteria->>'ticker' FROM discovered_hypotheses
+    WHERE status = 'active'
+      AND test_criteria->>'ticker' IS NOT NULL
+      AND test_criteria->>'expected_direction' IS NOT NULL
+"""
+
+
+def ticker_move_close_universe(conn: Any) -> list[str]:
+    """Every ticker an active ticker-move hypothesis needs closes for:
+    upper-cased, sorted and de-duplicated, blanks dropped."""
+    rows = conn.execute(text(ACTIVE_TICKER_MOVE_TICKERS_SQL)).fetchall()
+    return sorted({t for (raw,) in rows if (t := str(raw or "").strip().upper())})
+
 
 def load_completed_closes(conn: Any, ticker: str, start: date, end: date,
                           evaluated_at: datetime) -> dict[date, float]:
@@ -414,6 +480,29 @@ def load_completed_closes(conn: Any, ticker: str, start: date, end: date,
         as_of_ts=evaluated_at,
     )
     return {d: c.latest.value for d, c in closes.items() if not c.ambiguous}
+
+
+_CROWD_SQL = text("""
+    SELECT DISTINCT series_id FROM raw_series
+    WHERE series_id LIKE :pattern AND obs_date = :day
+      AND pull_status = :ok AND pull_timestamp <= :as_of_ts
+""")
+
+
+def crowd_tickers(conn: Any, day: date, evaluated_at: datetime) -> list[str]:
+    """The ticker-move crowd: up to ``CROSS_SECTION_SIZE`` US-listed tickers
+    with a close captured for ``day`` (by ``evaluated_at``), the same stable
+    sample for every trial on that day (lowest sha256 of the series id)."""
+    from evaluation.prices import _CRYPTO_TICKER_PATTERN, _US_TICKER_PATTERN
+    from store.observations import SUCCESS
+
+    rows = conn.execute(_CROWD_SQL, {"pattern": "YF:%:close", "day": day, "ok": SUCCESS,
+                                     "as_of_ts": evaluated_at}).fetchall()
+    tickers = sorted({sid.split(":")[1] for (sid,) in rows if sid.count(":") == 2},
+                     key=lambda t: hashlib.sha256(f"YF:{t}:close".encode()).hexdigest())
+    tickers = [t for t in tickers
+               if _US_TICKER_PATTERN.match(t) and not _CRYPTO_TICKER_PATTERN.match(t)]
+    return tickers[:CROSS_SECTION_SIZE]
 
 
 _SIGNAL_SERIES_SQL = text("""
@@ -447,7 +536,7 @@ def run_trial(plan: TrialPlan, conn: Any, evaluated_at: datetime,
         from evaluation.prices import UnsupportedInstrumentError
 
         p = plan.params
-        start = plan.created_at.astimezone(ET).date() - timedelta(days=NULL_LOOKBACK_DAYS)
+        start = plan.created_at.astimezone(ET).date() - timedelta(days=VOL_LOOKBACK_DAYS)
         end = evaluated_at.astimezone(ET).date()
 
         def closes(t: str) -> dict[date, float]:
@@ -460,9 +549,22 @@ def run_trial(plan: TrialPlan, conn: Any, evaluated_at: datetime,
             ticker = closes(p["ticker"])
         except UnsupportedInstrumentError:
             return TrialResult(status=UNTESTABLE, reason=UNSUPPORTED_INSTRUMENT)
-        market = None if p["ticker"] == MARKET_TICKER else closes(MARKET_TICKER)
+        window = trial_window(ticker, created_at=plan.created_at, window_days=p["window_days"])
+        if window is None:
+            return PENDING
+        crowd: dict[str, dict[date, float]] = {}
+        listed_key = f"crowd|{window[0]}"
+        if listed_key not in cache:
+            cache[listed_key] = crowd_tickers(conn, window[0], evaluated_at)
+        for t in cache[listed_key]:
+            if t == p["ticker"]:
+                continue
+            try:
+                crowd[t] = closes(t)
+            except UnsupportedInstrumentError:
+                continue
         return ticker_move_test(
-            ticker, market, created_at=plan.created_at, direction=p["direction"],
+            ticker, crowd, created_at=plan.created_at, direction=p["direction"],
             window_days=p["window_days"], min_move_pct=p["min_move_pct"],
         )
     if plan.test_kind == "lead_lag":
@@ -641,12 +743,18 @@ def evaluate_batch(
     ledger: Any,
     evaluated_at: datetime | None = None,
     limit: int = 10000,
+    max_trials: int | None = None,
     max_runtime_s: float | None = None,
 ) -> dict:
     """Plan and run every matured active hypothesis's one look. Read-only.
 
     Returns ``{"trials": [...], "pending": n, ...}``; nothing is recorded.
-    Hypotheses already tested in ``ledger`` are skipped.
+    Hypotheses already tested in ``ledger`` are skipped, and so are testable
+    ticker-move plans while ``TICKER_MOVE_HELD`` (counted, never declared).
+    ``limit`` caps the active rows scanned (oldest first); ``max_trials`` caps
+    the trials declared. Pending rows stay active and keep their place at the
+    head of the queue, so a batch capped by rows scanned would stall behind
+    them (2026-11-07: 132 lead-lag rows pending until 2027 held 124 of 200).
     """
     from analysis.ledger_steered_exploration import hypothesis_batch_trials
 
@@ -656,10 +764,13 @@ def evaluate_batch(
     with engine.connect() as conn:
         rows = conn.execute(_ACTIVE_SQL, {"limit": limit}).fetchall()
         trials: list[dict] = []
-        pending = skipped_seen = 0
-        timed_out = False
+        pending = skipped_seen = held_ticker_move = 0
+        timed_out = capped = False
         cache: dict[str, Any] = {}
         for hid, ptype, criteria, created, tested, thesis_direction in rows:
+            if max_trials is not None and len(trials) >= max_trials:
+                capped = True
+                break
             if max_runtime_s is not None and time.monotonic() - started >= max_runtime_s:
                 timed_out = True
                 break
@@ -667,6 +778,9 @@ def evaluate_batch(
                 skipped_seen += 1
                 continue
             plan = plan_trial(hid, ptype, criteria, created, tested, thesis_direction)
+            if TICKER_MOVE_HELD and plan.test_kind == "ticker_move" and plan.status is None:
+                held_ticker_move += 1
+                continue
             result = run_trial(plan, conn, evaluated_at, cache)
             if result.status == "pending":
                 if evaluated_at < plan.expires_at() or plan.status is not None:
@@ -693,7 +807,9 @@ def evaluate_batch(
         "trials": trials,
         "pending": pending,
         "skipped_already_ledgered": skipped_seen,
+        "held_ticker_move": held_ticker_move,
         "timed_out": timed_out,
+        "capped": capped,
     }
 
 
@@ -703,6 +819,7 @@ def score_batch(
     ledger: Any | None = None,
     evaluated_at: datetime | None = None,
     limit: int = 10000,
+    max_trials: int | None = None,
     max_runtime_s: float | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -723,7 +840,7 @@ def score_batch(
         ledger = dry_run_ledger()
     replayed = {} if dry_run else _replay_unapplied(engine, ledger)
     batch = evaluate_batch(engine, ledger=ledger, evaluated_at=evaluated_at,
-                           limit=limit, max_runtime_s=max_runtime_s)
+                           limit=limit, max_trials=max_trials, max_runtime_s=max_runtime_s)
     out = {k: v for k, v in batch.items() if k != "trials"}
     out.update({"scorer_version": SCORER_VERSION, "dry_run": dry_run, "replayed": replayed,
                 "declared": len(batch["trials"])})

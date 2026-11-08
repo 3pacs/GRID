@@ -1,0 +1,22 @@
+# TEMPLATE — NOT INSTALLED. See grid-publication-packet.service.template.
+#
+# Fires every day at 10:35Z for the PREVIOUS UTC day. Why 10:35Z: the market
+# diary timer runs Tue..Sat at 05:30Z (+ up to 5 min random delay, + up to the
+# 10 min service timeout), so the diary row about the day exists and is captured
+# as context, and 10:35Z is the first slot after the nightly encrypted Postgres
+# backup window (03:30-10:30 UTC; tests/test_systemd_template_invariants.py).
+# Publications (hourly briefings, thesis snapshots) are written seven days a
+# week, so the packet runs daily; Sun/Mon report the diary stage as a verified
+# non-session (no generation scheduled), not as a gap.
+# If grid-market-diary.timer moves, move this timer with it.
+[Unit]
+Description=Produce the GRID daily publication packet for the previous UTC day
+
+[Timer]
+OnCalendar=*-*-* 10:35:00 UTC
+RandomizedDelaySec=2min
+Persistent=true
+Unit=grid-publication-packet.service
+
+[Install]
+WantedBy=timers.target

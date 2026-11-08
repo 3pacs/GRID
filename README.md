@@ -69,6 +69,10 @@ python -m outputs.insight_scanner --days 7              # Review accumulated LLM
 
 ## Architecture
 
+Daily packet operations: [ownership, per-day state, failure reporting and safe
+resume](docs/runbooks/DAILY-PUBLICATION-PACKET.md). This handoff uses the existing
+daily research automation; runtime adoption is tracked in that runbook.
+
 See [docs/architecture.md](docs/architecture.md) for detailed diagrams covering:
 - System overview and component relationships
 - Data flow pipeline (ingestion → resolution → PIT → features → inference)

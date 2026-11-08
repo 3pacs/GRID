@@ -202,11 +202,33 @@ def _init_table() -> None:
             log.warning("Watchlist table init failed: {e}", e=str(exc))
 
 
+# Bare tickers the watchlist prices as ``<T>-USD`` crypto pairs.
+CRYPTO_TICKERS: frozenset[str] = frozenset({
+    "BTC", "ETH", "SOL", "DOGE", "TAO", "ADA", "XRP",
+    "DOT", "AVAX", "MATIC", "LINK", "UNI",
+})
+
+
+def effective_asset_type(ticker: str, stored: str | None) -> str:
+    """The row's asset_type, guessing when it was left at the old default.
+
+    ``WatchlistItemCreate.asset_type`` defaulted to ``"stock"``, so rows added
+    without a type (BTC, ETH, LINK on 2026-03-30) were stored as stock while
+    the price path quoted them as crypto pairs. A stored ``"stock"`` is
+    therefore treated as unspecified.
+    """
+    if stored and stored != "stock":
+        return stored
+    return _guess_asset_type(ticker)
+
+
 def _row_to_dict(row: Any) -> dict:
     """Convert a DB row to a watchlist item dict."""
     d = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
     if d.get("added_at") is not None:
         d["added_at"] = str(d["added_at"])
+    if d.get("ticker"):
+        d["asset_type"] = effective_asset_type(str(d["ticker"]), d.get("asset_type"))
     return d
 
 
@@ -229,13 +251,9 @@ def _fetch_live_price(ticker: str) -> dict | None:
     try:
         import yfinance as yf
 
-        _CRYPTO_TICKERS = {
-            "BTC", "ETH", "SOL", "DOGE", "TAO", "ADA", "XRP",
-            "DOT", "AVAX", "MATIC", "LINK", "UNI",
-        }
         yf_ticker = ticker
         if (
-            ticker.upper() in _CRYPTO_TICKERS
+            ticker.upper() in CRYPTO_TICKERS
             and "-" not in ticker
             and "=" not in ticker
         ):
@@ -299,16 +317,12 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
     try:
         import yfinance as yf
 
-        _CRYPTO_TICKERS = {
-            "BTC", "ETH", "SOL", "DOGE", "TAO", "ADA", "XRP",
-            "DOT", "AVAX", "MATIC", "LINK", "UNI",
-        }
 
         # Map original ticker -> yfinance ticker (add -USD for crypto)
         yf_map: dict[str, str] = {}
         for tk in tickers:
             if (
-                tk.upper() in _CRYPTO_TICKERS
+                tk.upper() in CRYPTO_TICKERS
                 and "-" not in tk
                 and "=" not in tk
             ):
@@ -425,7 +439,7 @@ def _guess_asset_type(ticker: str) -> str:
     tk = ticker.upper()
     if tk.startswith("^"):
         return "index"
-    if tk.endswith("-USD") or (tk.endswith("USD") and len(tk) <= 7):
+    if tk.endswith("-USD") or (tk.endswith("USD") and len(tk) <= 7) or tk in CRYPTO_TICKERS:
         return "crypto"
     if tk in ("GLD", "SLV", "USO", "UNG", "DBA", "DBC"):
         return "commodity"

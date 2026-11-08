@@ -307,3 +307,18 @@ def test_state_load_failure_degrades_to_empty_state() -> None:
     sched._state = {}
     sched._load_state_from_db()  # must not raise
     assert sched._state == {}
+
+
+def test_missing_api_key_skips_are_logged_as_config_skips() -> None:
+    """2026-11-07: KOSIS showed its 11-01 failure forever because the honest
+    "Missing API key" skip was never written; pipeline-health reads pull_log."""
+    engine = _engine()
+    sched = SmartScheduler.__new__(SmartScheduler)
+    sched.engine = engine
+    sched._catalog_ids = {}
+    now = datetime.now(timezone.utc)
+    sched._log_run("kosis", now, {"status": "SKIPPED", "reason": "Missing API key: KOSIS_API_KEY"})
+    sched._log_run("other", now, {"status": "SKIPPED", "reason": "single-flight lock held"})
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT puller_name, status, rows_inserted, error_message FROM pull_log")).fetchall()
+    assert rows == [(SMART_PULL_LOG_PREFIX + "kosis", "SUCCESS", 0, "SKIPPED: Missing API key: KOSIS_API_KEY")]

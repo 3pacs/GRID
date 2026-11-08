@@ -47,7 +47,8 @@ def _obs(family, ticker="NVDA", direction="up", d=END, **cite):
     ("quiverquant:insider", "insider_buy", {}, ("insider", "up")),
     ("congressional", "SELL", {}, ("congress", "down")),
     ("gov_contract", "CONTRACT_AWARD", {"amount": 1e6}, ("gov_contract", "up")),
-    ("quiverquant:wsb", "wsb_bearish", {}, ("retail_sentiment", "down")),
+    ("quiverquant:wsb", "wsb_bearish", {}, None),  # frozen snapshot: no vote
+    ("quiverquant:wsb", "wsb_bullish", {}, None),
     ("quiverquant:wsb", "wsb_neutral", {}, None),
     ("smart_money", "NET_POSITION_DELTA", {"direction": "BULLISH"}, ("retail_sentiment", "up")),
     ("quiverquant:lobbying", "lobbying", {}, None),
@@ -56,6 +57,11 @@ def _obs(family, ticker="NVDA", direction="up", d=END, **cite):
 ])
 def test_classify_signal(source, stype, value, expected):
     assert si.classify_signal(source, stype, value) == expected
+
+
+def test_frozen_sources_are_not_queried_or_classified():
+    assert "quiverquant:wsb" in si._FROZEN_SOURCES
+    assert not si._FROZEN_SOURCES & set(si._FAMILY_BY_SOURCE)
 
 
 # ── robust anomalies ────────────────────────────────────────────────────────
@@ -210,6 +216,115 @@ def test_generate_saves_new_leads_once_per_cooldown_and_caps(monkeypatch, no_tab
     assert len(ids) == 1 and len(saved) == 1
     assert saved[0].origin == si.ORIGIN and saved[0].status == "new"
     assert "AAA" in saved[0].question  # BBB is in cooldown; the cap stops at one
+
+
+# ── baseline: every lead declared without review (generator v2) ─────────────
+
+
+def _baseline_db(leads):
+    from sqlalchemy import create_engine, event
+
+    engine = create_engine("sqlite://")
+
+    @event.listens_for(engine, "before_cursor_execute", retval=True)
+    def _jsonb_as_text(conn, cursor, statement, params, context, executemany):
+        # SQLite gives a JSONB cast numeric affinity; Postgres stores the JSON.
+        return statement.replace("AS JSONB", "AS TEXT"), params
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql("CREATE TABLE investigation_leads (id TEXT, question TEXT, "
+                             "evidence TEXT, origin TEXT, created_at TIMESTAMP)")
+        conn.exec_driver_sql("CREATE TABLE discovered_hypotheses (id TEXT PRIMARY KEY, thesis TEXT, "
+                             "pattern_type TEXT, evidence TEXT, test_criteria TEXT, invalidation TEXT, "
+                             "confidence REAL, status TEXT, role TEXT, pair_id TEXT)")
+        for lead_id, ticker, direction, origin, ts in leads:
+            ev = [{"role": "agrees", "ticker": ticker, "direction": direction, "family": f}
+                  for f in ("insider", "options_flow")]
+            conn.exec_driver_sql("INSERT INTO investigation_leads VALUES (?, ?, ?, ?, ?)",
+                                 (lead_id, f"sources point {direction} on {ticker}",
+                                  json.dumps(ev), origin, ts))
+    return engine
+
+
+def _hyps(engine):
+    with engine.connect() as conn:
+        return {r[0]: r for r in conn.exec_driver_sql(
+            "SELECT id, pattern_type, test_criteria, status, role FROM discovered_hypotheses")}
+
+
+def test_every_recent_lead_gets_the_sleuth_test_without_review():
+    since = "2026-11-06 00:00:00"
+    engine = _baseline_db([
+        ("LEAD-INTX-aaa", "NVDA", "up", si.ORIGIN, "2026-11-07 02:00:00"),
+        ("LEAD-INTX-bbb", "AAPL", "down", si.ORIGIN, "2026-11-06 12:00:00"),
+        ("LEAD-INTX-old", "MSFT", "up", si.ORIGIN, "2026-11-01 02:00:00"),     # before since
+        ("LEAD-INTX-btc", "BTC-USD", "up", si.ORIGIN, "2026-11-07 02:00:00"),  # not testable
+        ("LEAD-CHAT-1", "TSLA", "up", "chat", "2026-11-07 02:00:00"),          # not a lead
+    ])
+    ids = si.declare_missing_baselines(engine, since=since)
+    assert ids == ["hyp_base_bbb", "hyp_base_aaa"]
+    rows = _hyps(engine)
+    assert set(rows) == {"hyp_base_aaa", "hyp_base_bbb"}
+    _, ptype, criteria, status, role = rows["hyp_base_aaa"]
+    criteria = json.loads(criteria)
+    assert (ptype, status, role) == (si.BASELINE_PATTERN, "active", "thesis")
+    # The same test a Sleuth declaration gets; only the source differs.
+    assert criteria == {"ticker": "NVDA", "window_days": si.HYPOTHESIS_WINDOW_DAYS,
+                        "min_move_pct": si.HYPOTHESIS_MIN_MOVE_PCT, "expected_direction": "up",
+                        "source": si.BASELINE_PATTERN, "lead_id": "LEAD-INTX-aaa"}
+    plan = plan_trial("hyp_base_aaa", ptype, criteria, AS_OF)
+    assert plan.test_kind == "ticker_move" and plan.status is None
+    # One baseline per lead, however often it runs.
+    assert si.declare_missing_baselines(engine, since=since) == []
+    assert len(_hyps(engine)) == 2
+
+
+def test_ambiguous_evidence_declares_no_baseline():
+    conn = MagicMock()
+    ev = [{"role": "agrees", "ticker": "NVDA", "direction": "up"},
+          {"role": "agrees", "ticker": "NVDA", "direction": "down"}]
+    assert si.declare_baseline(conn, "LEAD-INTX-x", "q", ev) is None
+    conn.execute.assert_not_called()
+
+
+def test_a_failed_baseline_still_queues_the_investigations(monkeypatch, no_tables):
+    from sqlalchemy.exc import OperationalError
+
+    signals = [_obs("insider", "AAA", id=1), _obs("options_flow", "AAA", id=2)]
+    monkeypatch.setattr(si, "collect_signal_observations", lambda *a: signals)
+    monkeypatch.setattr(si, "collect_price_observations", lambda *a: [])
+    monkeypatch.setattr(sleuth_mod.Sleuth, "_save_lead", lambda self, lead: None)
+
+    def boom(engine, since):
+        raise OperationalError("INSERT", {}, Exception("db down"))
+
+    monkeypatch.setattr(si, "declare_missing_baselines", boom)
+    assert len(si.generate_intersection_leads(_engine_with_recent([]), AS_OF)) == 1
+
+
+def test_generate_declares_baselines_for_the_catchup_window(monkeypatch, no_tables):
+    monkeypatch.setattr(si, "collect_signal_observations", lambda *a: [])
+    monkeypatch.setattr(si, "collect_price_observations", lambda *a: [])
+    seen = []
+    monkeypatch.setattr(si, "declare_missing_baselines",
+                        lambda engine, since: seen.append(since) or ["hyp_base_x"])
+    si.generate_intersection_leads(_engine_with_recent([]), AS_OF)
+    assert seen == [AS_OF - timedelta(days=si.BASELINE_CATCHUP_DAYS)]
+
+
+def test_generator_v2_runs_no_legacy_detector(monkeypatch):
+    from intelligence import hypothesis_engine as he
+
+    def legacy(*a, **k):
+        raise AssertionError("legacy detector ran")
+
+    monkeypatch.setattr(he, "ensure_tables", lambda engine: None)
+    monkeypatch.setattr(he.TemporalPatternDetector, "discover_patterns", legacy)
+    monkeypatch.setattr(he.AnomalyHunter, "scan_convergence", legacy)
+    monkeypatch.setattr(he, "score_due_active_hypotheses", legacy)
+    monkeypatch.setattr(si, "declare_missing_baselines", lambda engine, since: ["hyp_base_x"])
+    out = he.HypothesisGenerator(MagicMock()).auto_discover()
+    assert out == [{"id": "hyp_base_x", "pattern_type": si.BASELINE_PATTERN}]
 
 
 # ── investigation: declared outcomes ────────────────────────────────────────

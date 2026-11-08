@@ -358,7 +358,10 @@ def _card_inputs():
     return opp, v
 
 
-def test_card_states_the_exact_call():
+def test_card_states_the_exact_call(monkeypatch):
+    # Rendered two days after the idea date: against the real clock the card
+    # adds "STALE at rendering" once 2026-11-03 is MAX_SIGNAL_AGE_DAYS old.
+    monkeypatch.setattr(hx, "_utc_today", lambda: date(2026, 11, 5))
     opp, v = _card_inputs()
     card = hx._format_opportunity_card(opp, v, 1)
     plain = hx._plain(card["body"])

@@ -581,7 +581,34 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # DAILY_INTEL_HOLD_REASONS to DAILY_INTEL_INITIAL_ALLOWLIST (owner
         # approval; postmortems no longer write lessons). Needs reviewer
         # acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
+        # SCHED re-pinned ae8c0501 -> a1595b64 (2026-11-07,
+        # claude/darkpool-fetch-window-20261107): the only scheduler edit is
+        # the dark_pool registry entry's timeout_s 60 -> 120 with a 3-line
+        # comment (its bounded FINRA fetch window is 2-3 pages at ~6s each).
+        # Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned a1595b64 -> accdd222 (2026-11-07,
+        # claude/log-missing-key-skips-20261107): the only scheduler edits are
+        # MISSING_API_KEY_PREFIX (used by MissingPullerApiKey's message) and
+        # _log_run writing a missing-key SKIPPED as SUCCESS / 0 rows /
+        # "SKIPPED: Missing API key: X" (other skips stay unlogged). Needs
+        # reviewer acceptance like the prior pins.
+        # SCHED re-pinned accdd222 -> 5716c158 (2026-11-07,
+        # claude/registry-divergence-aliases-20261107): the only scheduler
+        # edit is _warn_registry_divergence also exempting the source_catalog
+        # aliases _build_source_registry derives from REGISTRY_CATALOG_NAMES
+        # (all 33 reported "orphans" were those aliases). Needs reviewer
+        # acceptance like the prior pins.
+        # SCHED re-pinned 5716c158 -> d0e133db (2026-11-08,
+        # claude/hermes-gaps-20261108): the only scheduler edits are three
+        # PULLER_REGISTRY entries: opportunity timeout_s 60 -> 120, edgar
+        # timeout_s 180 -> 600 (with a 3-line comment), and sec_xbrl_shares
+        # dropping kwargs limit=400 (with a 4-line comment). Needs reviewer
+        # acceptance like the prior pins.
+        # SCHED re-pinned d0e133db -> 0ae04652 (2026-11-08,
+        # claude/retire-tiingo-fundamentals-20261108): the only scheduler
+        # edit is a hold_reason on the tiingo_fundamentals registry entry
+        # (owner retired it). Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','0ae04652dd9d5d49733184648b10bf5e7a9d20474fa963b2427e867d7254d03e')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
