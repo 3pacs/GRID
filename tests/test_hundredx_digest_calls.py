@@ -358,7 +358,20 @@ def _card_inputs():
     return opp, v
 
 
-def test_card_states_the_exact_call():
+@pytest.mark.parametrize("rendered_day, stale_note", [
+    (3, ""),
+    (8, "; STALE at rendering (5d old)"),
+])
+def test_card_states_the_exact_call(monkeypatch, rendered_day, stale_note):
+    # The fixture is a Nov 3 snapshot; do not let the wall clock change its contract.
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, rendered_day, 16, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(hx, "datetime", FrozenDateTime)
+    # Fixture timestamps must retain datetime identity for the formatter's type checks.
+    monkeypatch.setattr(sys.modules[__name__], "datetime", FrozenDateTime)
     opp, v = _card_inputs()
     card = hx._format_opportunity_card(opp, v, 1)
     plain = hx._plain(card["body"])
@@ -373,7 +386,9 @@ def test_card_states_the_exact_call():
     assert "exit if OMER trades above $20.39" in plain
     assert "earnings 2026-11-12 (earnings_calendar) FQ 3" in plain
     assert "OTM-put/ATM IV skew 0.73" in plain
-    assert "options_daily_signals row 2026-11-03 (0d old at idea date), captured 2026-11-03 15:00Z" in plain
+    assert ("options_daily_signals row 2026-11-03 (0d old at idea date)"
+            f"{stale_note}, captured 2026-11-03 15:00Z") in plain
+    assert ("STALE at rendering" in plain) == bool(stale_note)
     assert "SUSPECT: IV <b>high</b>" in plain          # escaped in HTML ...
     assert "<b>high</b>" not in card["body"]            # ... not injected
     # The fictional payoff multiple is gone.
