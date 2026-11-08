@@ -296,3 +296,14 @@ consumer/UI adoption beyond the analyzer; immutable revision-aware PIT storage;
 confirmed provider entitlements and shared-account budgeting; explicit canary
 approval. The SQLite pacing ledger remains local and can bunch delayed workers'
 actual dispatches; it is not an account-wide rolling-window guarantee.
+
+
+### CI guard reconciliation
+
+The first consumer-contract head failed only the raw-read allowlist ratchet on
+Python 3.11: 19,759 tests passed, 944 skipped and 3 xfailed. Inspection of both
+heads showed the removed match was prose saying "from raw_series", not an SQL
+query. The real EDGAR SELECT already required SUCCESS and remains unchanged.
+Removed that obsolete allowlist slot without altering the scanner or weakening
+the guard. All 157 focused tests (including both guard tests) passed together
+with outbound sockets blocked. A fresh full CI run is required for this fix.

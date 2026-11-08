@@ -369,3 +369,12 @@ Verification and limits:
   Changed-file Ruff and diff checks passed. New-head remote CI remains separate.
 - No provider calls or production access. Historical reconciliation, metadata
   breadth, immutable revision history and shared-account quotas remain gates.
+
+
+### AV draft CI follow-up
+
+- The raw-read guard exposed an obsolete allowance for analyzer docstring prose.
+  Verified both source heads: the actual EDGAR SQL already filters SUCCESS.
+  Removed only that allowlist entry; scanner/enforcement unchanged.
+- 157 focused offline tests including both repository-wide guard scans passed
+  with outbound sockets blocked. New full CI remains pending after draft push.
