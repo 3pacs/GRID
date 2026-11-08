@@ -1292,7 +1292,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Alt data (daily) ──
     {"name": "insider_filings",   "mod": "ingestion.altdata.insider_filings",   "cls": "InsiderFilingsPuller",     "method": "pull_all",      "freq_h": 12, "timeout_s": 120},
     {"name": "congressional",     "mod": "ingestion.altdata.congressional",     "cls": "CongressionalTradingPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
-    {"name": "unusual_whales",    "mod": "ingestion.altdata.unusual_whales",    "cls": "UnusualWhalesPuller",      "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
+    {"name": "unusual_whales",    "mod": "ingestion.altdata.unusual_whales",    "cls": "UnusualWhalesPuller",      "method": "pull_all",      "freq_h": 12, "timeout_s": 240},  # 30 tickers at ~4 s each; 60 s timed out every run (2026-11-08)
     {"name": "prediction_odds",   "mod": "ingestion.altdata.prediction_odds",   "cls": "PredictionOddsPuller",     "method": "pull_all",      "freq_h": 0.167, "timeout_s": 240},  # 10 min — critical for breaking events; Reddit RSS slot wait ≤150s
     {"name": "kalshi",            "mod": "ingestion.altdata.kalshi",            "cls": "KalshiPuller",             "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "prediction_pmxt",   "mod": "ingestion.altdata.prediction_pmxt",   "cls": "PmxtPredictionPuller",     "method": "pull",          "freq_h": 12, "timeout_s": 120},

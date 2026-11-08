@@ -760,3 +760,15 @@ def test_timer_template_is_outside_backup_window_and_after_producer():
     service = (ROOT / "deploy" / "systemd" / "grid-publication-review-ingest.service.template").read_text()
     assert "scripts/ingest_publication_review.py" in service and "SuccessExitStatus=3" in service
     assert "WorkingDirectory=/data/grid_v4/grid_release" in service
+
+
+def test_packet_json_may_exceed_the_review_file_cap(tmp_path, monkeypatch, job):
+    """Real packets are 7-24 MB (text + source_record): the review-file cap must not refuse them."""
+    packet_root, packet_sha = _packet(tmp_path)
+    monkeypatch.setattr(job, "MAX_FILE_BYTES", 500)       # smaller than packet.json (~735 bytes)
+    assert job.MAX_PACKET_BYTES > job.MAX_FILE_BYTES
+    packet = job.load_packet(packet_root, DAY)
+    assert packet.sha256 == packet_sha and len(packet.publications) == 2
+    monkeypatch.setattr(job, "MAX_PACKET_BYTES", 500)
+    with pytest.raises(job.Refused, match="bytes"):
+        job.load_packet(packet_root, DAY)

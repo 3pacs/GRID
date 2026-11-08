@@ -86,6 +86,33 @@ _INCREMENTAL_LOCK = threading.Lock()
 _ORACLE_NON_TIINGO: frozenset[str] = frozenset({"BTC", "ETH", "SOL", "DXY"})
 
 
+# Tickers where 2+ different insiders bought on the open market (Form 4 code
+# P) in the last INSIDER_BUYER_DAYS. Counted per feed, so one person spelled
+# two ways by SEC and QuiverQuant is not two buyers. QuiverQuant's
+# insider_buy also covers grants and option exercises (any "A" code), so only
+# its TransactionCode P rows count. 2026-11-08: 332 tickers, 287 of them with
+# no routine close, so Sleuth's insider-only control was 65% untestable.
+INSIDER_BUYER_DAYS = 90
+INSIDER_MIN_BUYERS = 2
+INSIDER_MAX_TICKERS = 1000
+INSIDER_BUYER_TICKERS_SQL = """
+    SELECT t FROM (
+        SELECT upper(trim(ticker)) AS t, source_type,
+               count(DISTINCT lower(coalesce(signal_value->>'Name', source_id))) AS n
+        FROM signal_sources
+        WHERE signal_date >= :since
+          AND ((source_type = 'insider' AND signal_type IN ('BUY', 'UNUSUAL_BUY'))
+            OR (source_type = 'quiverquant:insider'
+                AND signal_value->>'TransactionCode' = 'P'))
+        GROUP BY 1, 2
+    ) per_feed
+    WHERE n >= :min_buyers
+    GROUP BY t
+    ORDER BY max(n) DESC, t
+    LIMIT :cap
+"""
+
+
 def is_tiingo_equity(ticker: str) -> bool:
     """False for symbols Tiingo's daily equity endpoint cannot serve."""
     return (
@@ -564,9 +591,30 @@ class TiingoPuller(BasePuller):
         return [t for t in tickers if is_tiingo_equity(t)]
 
     @staticmethod
+    def insider_buyer_tickers(db_engine: Engine, today: date | None = None) -> list[str]:
+        """Listed equities with 2+ open-market insider buyers (see INSIDER_BUYER_TICKERS_SQL).
+
+        Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.actor_identity import is_placeholder_ticker
+            from intelligence.sleuth_intersections import is_testable_ticker
+
+            since = (today or date.today()) - timedelta(days=INSIDER_BUYER_DAYS)  # noqa: DTZ011
+            with db_engine.connect() as conn:
+                rows = conn.execute(text(INSIDER_BUYER_TICKERS_SQL), {
+                    "since": since, "min_buyers": INSIDER_MIN_BUYERS, "cap": INSIDER_MAX_TICKERS,
+                }).fetchall()
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: insider buyer universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for (t,) in rows
+                if t and not is_placeholder_ticker(t) and is_testable_ticker(t) and is_tiingo_equity(t)]
+
+    @staticmethod
     def default_tickers(db_engine: Engine | None = None) -> list[str]:
-        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle and
-        active-hypothesis universes.
+        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle,
+        active-hypothesis and insider-buyer universes.
 
         With ``db_engine`` the oracle's close universe
         (:meth:`oracle_tickers`) is added, so every ticker the oracle predicts
@@ -574,6 +622,8 @@ class TiingoPuller(BasePuller):
         close since 2026-09-09 because neither static list held them), and so
         is every ticker an active hypothesis will be scored on
         (:meth:`hypothesis_tickers`; 2026-11-07: 36 of 115 Sleuth lead tickers
+        had no routine close), and so is every ticker with 2+ open-market
+        insider buyers (:meth:`insider_buyer_tickers`; 2026-11-08: 287 of 332
         had no routine close).
         """
         from ingestion.yfinance_pull import YF_TICKER_LIST
@@ -582,6 +632,7 @@ class TiingoPuller(BasePuller):
         if db_engine is not None:
             all_tickers.update(TiingoPuller.oracle_tickers(db_engine))
             all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
+            all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
         try:
             from analysis.sector_map import SECTOR_MAP
             for sector in SECTOR_MAP.values():
