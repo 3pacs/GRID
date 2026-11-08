@@ -162,3 +162,50 @@ mechanical source rule (Tiingo `adj_close` when it covers ≥ 95 % of SPY's date
 and an exclusion screen (weekend dates, > 25 reversing jumps, < 90 % coverage, stale by > 10
 sessions), and reports the exclusions with the look. Better data existed all along; the
 `_full` features just never carried it cleanly.
+
+## 4. Part 2 result — the registered look (2026-11-08T07:26Z, grid-svr, code `f5491b13`)
+
+Record: `docs/reports/high-sharpe-ensemble-v1-look-20261108T0726Z.{json,md}` (registration
+`docs/paper_log/high-sharpe-ensemble-v1-preregistration.md`, sha pinned and matched). Prices:
+Tiingo `adj_close` for all 30 tickers (the §3 rule chose Tiingo everywhere; no exclusions, no
+candidate failures, 0 of 16,950 segment returns missing). 513 weekly out-of-sample segments,
+2017-01-06 → 2026-10-30, net of 10 bp per side.
+
+**Verdict: FAIL.** The ensemble does not beat SPY buy-and-hold, and nothing in the candidate set
+does either at the registered confidence.
+
+| series | Sharpe | ann. return | max DD | total return | excess vs SPY, mean weekly | 95 % LB |
+|---|---|---|---|---|---|---|
+| ensemble (top-3 shrunk-Sharpe, inverse vol) | 0.78 | 9.1 % | −23.1 % | +137 % | −0.104 % | −0.249 % |
+| SPY buy-and-hold | 0.87 | 14.3 % | −31.8 % | +275 % | — | — |
+| 1/N over the 7 candidates | 0.13 | 0.6 % | −10.2 % | +6 % | | |
+| best single in hindsight: `vix_ma_exposure_spy` | 0.94 | 14.0 % | −22.8 % | +264 % | | −0.080 % (α/7) |
+| `adaptive_rotation` | 0.94 | 16.3 % | −24.7 % | | | −0.195 % (α/7) |
+| `s151_xs_momentum` | 0.39 | 4.5 % | −26.5 % | | | −0.495 % |
+| `s151_sector_rotation` | −0.31 | −2.5 % | −29.3 % | | | −0.627 % |
+| `s151_mean_reversion` | −0.69 | −10.1 % | −70.0 % | | | −0.767 % |
+| `qa_vol_regime_equity` | −1.36 | −12.6 % | −73.6 % | | | −0.852 % |
+| `qa_dual_horizon_equity` | −1.40 | −13.0 % | −74.7 % | | | −0.863 % |
+
+- Criterion 1 fails: mean weekly net excess over SPY −0.10 %, one-sided 95 % block-bootstrap lower
+  bound −0.25 % (block 1, 10,000 resamples), P(mean ≤ 0) = 0.88.
+- Criterion 2 fails: deflated Sharpe 0.00 at n_trials = 248 (observed per-week Sharpe 0.108 against
+  an expected-maximum threshold of 0.393; the threshold is high because the seven candidates' Sharpes
+  are widely dispersed, which is exactly what the DSR penalises).
+- PBO over the candidate matrix is 0.00 (the in-sample best is also the out-of-sample best in every
+  CSCV split) with P(OOS loss) 0.035: selection is *stable*, it just does not produce excess return.
+  The selector picked `vix_ma_exposure_spy` 108 of 129 times and `adaptive_rotation` 90 times; the two
+  are 0.61 correlated, both are ways of holding SPY-like beta with a volatility brake, and together
+  they are a lower-beta SPY. The 1/N control shows the other five candidates are return drains.
+- Ensemble turnover 20.6×/yr (adaptive rotation alone 31.9×/yr); the two QuantaAlpha rank signals
+  turn over 83×/yr and lose 13 % a year after costs — at 10 bp per side that is their whole loss.
+
+What has edge, honestly: nothing in GRID beats holding SPY after costs on 2017–2026 at the 95 %
+level. Adaptive rotation (0.94) and the VIX/MA-scaled SPY (0.94) have the best risk-adjusted records
+of the seven and both roughly match SPY's Sharpe with a smaller drawdown; neither has a positive
+excess-return bound, and both are rules whose parameters were set with this history in view. Their
+forward record starts now. The weekly `W-FRI` grid and 10 bp costs are declared choices; a FAIL
+here is a FAIL of the registered design, not a proof that a daily or cheaper variant would also
+fail — that would be v2, registered first.
+
+Per §6 of the registration: no shadow book, no `model_registry` row, no flag flipped.
