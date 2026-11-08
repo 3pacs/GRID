@@ -17,9 +17,11 @@
 # restarted (the next deploy restart or the operator picks up the new file); timers and
 # oneshot/inactive services take effect on the next activation.
 #
-# Usage: check_systemd_unit_drift.sh [--sync] [--strict] [--templates DIR] [--system-dir DIR]
+# Usage: check_systemd_unit_drift.sh [--sync] [--strict] [--verbose] [--templates DIR] [--system-dir DIR]
 #   --sync        reinstall drifted MANAGED units (install -m 0644) and daemon-reload
 #   --strict      exit 2 when drift remains after the run (no --sync: any drift)
+#   --verbose     print the differing lines (Environment= values redacted). Off by default and
+#                 never passed from deploy.yml: unit contents must not land in CI logs.
 #   --templates   directory holding *.service.template / *.timer.template / *.service / *.timer
 #                 (default: deploy/systemd next to this script's repo root)
 #   --system-dir  where units are installed (default /etc/systemd/system)
@@ -32,10 +34,12 @@ TEMPLATES="$SCRIPT_DIR/../deploy/systemd"
 SYSTEM_DIR=/etc/systemd/system
 SYNC=0
 STRICT=0
+VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sync) SYNC=1 ;;
     --strict) STRICT=1 ;;
+    --verbose) VERBOSE=1 ;;
     --templates) TEMPLATES="$2"; shift ;;
     --system-dir) SYSTEM_DIR="$2"; shift ;;
     -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
@@ -50,6 +54,15 @@ fi
 [ -d "$SYSTEM_DIR" ] || { echo "::error::system dir not found: $SYSTEM_DIR" >&2; exit 64; }
 
 normalize() { grep -vE '^[[:space:]]*(#|$)' "$1" || true; }
+# Differing-line count only by default; with --verbose the lines, Environment= values redacted.
+show_drift() {
+  local n
+  n="$(diff <(normalize "$1") <(normalize "$2") | grep -cE '^[<>]' || true)"
+  echo "         $n differing line(s)"
+  if [ "$VERBOSE" -eq 1 ]; then
+    diff <(normalize "$1") <(normalize "$2") | sed -E 's/^([<>] *Environment=[^=]+=).*/\1<redacted>/' | sed 's/^/         /' || true
+  fi
+}
 managed() { grep -qE '^#[[:space:]]*deploy-sync:[[:space:]]*managed[[:space:]]*$' "$1"; }
 
 checked=0; drifted=0; synced=0; skipped=0; remaining=0; unmanaged=0
@@ -78,13 +91,13 @@ for template in "$TEMPLATES"/*; do
   esac
   if ! managed "$template"; then
     echo "DRIFT  $unit (unmanaged template: not synced; add '# deploy-sync: managed' to opt in)"
-    diff <(normalize "$installed") <(normalize "$template") | sed 's/^/         /' || true
+    show_drift "$installed" "$template"
     unmanaged=$((unmanaged + 1)); remaining=$((remaining + 1))
     continue
   fi
   if [ "$SYNC" -ne 1 ]; then
     echo "DRIFT  $unit"
-    diff <(normalize "$installed") <(normalize "$template") | sed 's/^/         /' || true
+    show_drift "$installed" "$template"
     remaining=$((remaining + 1))
     continue
   fi

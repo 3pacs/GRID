@@ -57,7 +57,8 @@ def test_report_only_lists_drift_and_changes_nothing(dirs):
     assert result.returncode == 0, result.stderr
     out = result.stdout
     assert "ok     grid-a.service" in out
-    assert "DRIFT  grid-b.service" in out and "> Environment=X=1" in out
+    assert "DRIFT  grid-b.service" in out and "1 differing line(s)" in out
+    assert "Environment=X=1" not in out and "X=1" not in out          # unit contents never reach CI logs by default
     assert "DRIFT  grid-c.timer" in out
     assert "DRIFT  grid-worker@.service (templated instance unit" in out
     assert "grid-new" not in out
@@ -66,6 +67,15 @@ def test_report_only_lists_drift_and_changes_nothing(dirs):
     assert (system / "grid-b.service").read_text() == SERVICE          # untouched
     assert not (system / "grid-new.service").exists()
     assert not (system.parent / "bin" / "systemctl.log").exists()      # no daemon-reload without --sync
+
+
+def test_verbose_prints_the_diff_with_environment_values_redacted(dirs):
+    templates, system = dirs
+    (templates / "grid-b.service.template").write_text(
+        MANAGED + SERVICE.replace("ExecStart", "Environment=TOKEN=s3cr3t-value\nExecStart"))
+    out = run(templates, system, "--verbose").stdout
+    assert "> Environment=TOKEN=<redacted>" in out and "s3cr3t" not in out
+    assert "> User=grid" in out                                         # non-Environment lines are shown as-is
 
 
 def test_strict_fails_on_remaining_drift_and_plain_mode_exits_zero(dirs):

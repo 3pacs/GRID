@@ -16,9 +16,12 @@ restart steps or the operator do that) and reports templated instance units
 (`name@.service`) without syncing them. Remaining drift is a workflow warning. Run it by hand to see drift without changing anything:
 
 ```bash
-bash scripts/check_systemd_unit_drift.sh            # report
-bash scripts/check_systemd_unit_drift.sh --sync     # reinstall drifted units
+bash scripts/check_systemd_unit_drift.sh            # report (unit names + differing-line counts)
+bash scripts/check_systemd_unit_drift.sh --verbose  # also the differing lines, Environment= values redacted
+bash scripts/check_systemd_unit_drift.sh --sync     # reinstall drifted managed units
 ```
+
+The deploy step never passes `--verbose`: unit contents must not land in CI logs.
 
 * `grid-goal-worker@.service`: the idle-fleet goal worker (Day 1 of
   `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
