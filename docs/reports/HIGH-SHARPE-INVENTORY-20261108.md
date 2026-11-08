@@ -209,3 +209,36 @@ here is a FAIL of the registered design, not a proof that a daily or cheaper var
 fail — that would be v2, registered first.
 
 Per §6 of the registration: no shadow book, no `model_registry` row, no flag flipped.
+
+## 5. Set v2 — trend and dual momentum (look 2026-11-08T07:52Z, code `7a0b7e14`)
+
+Registration `docs/paper_log/high-sharpe-ensemble-v2-preregistration.md`; record
+`docs/reports/high-sharpe-ensemble-v2-look-20261108T0752Z.{json,md}`. Twelve arms (six documented
+trend / dual-momentum rules × monthly and weekly cadence), same selector, costs and window as v1,
+cumulative trials 261. Exclusions by the declared rule: XLC (70 % coverage) and XLRE (Tiingo 93 %
+< the 95 % threshold, so the rule fell to yfinance, whose XLRE series is junk) — ten sectors ranked.
+
+**Verdict: FAIL** (watch criterion: Sharpe > SPY no, excess LB > 0 no, DSR 0.53 > 0.5 yes,
+drawdown no worse yes).
+
+| series | Sharpe | ann. return | max DD | total | excess vs SPY weekly, 95 % LB |
+|---|---|---|---|---|---|
+| ensemble (top-3 of 12) | 0.62 | 7.1 % | −22.5 % | +97 % | mean −0.140 %, LB −0.242 % |
+| SPY buy-and-hold | 0.87 | 14.3 % | −31.8 % | +275 % | — |
+| 1/N over the 12 arms | 0.77 | 8.4 % | −20.0 % | +121 % | |
+| best arm in hindsight: `tsmom_12_1_assets_ma10_W` | 1.06 | 7.2 % | −6.2 % | +98 % | −0.357 % (α/12) |
+| `ma10_spy_W` | 0.88 | 10.3 % | −15.8 % | | −0.265 % |
+| `tsmom_12_1_sectors_top3_W` | 0.79 | 13.4 % | −29.1 % | | −0.161 % |
+| `gem_dual_momentum_M` | 0.34 | 4.2 % | −31.8 % | | −0.340 % |
+
+- Trend following did what the literature says: lower drawdowns (asset TSMOM with the MA filter
+  −6 % vs SPY −32 %) at a Sharpe near or above SPY's, but with half the return, so no arm comes
+  near a positive excess bound over a decade that paid buy-and-hold 14 % a year.
+- The selector hurt: trailing-Sharpe top-3 over twelve correlated trend arms (0.62) lost to the
+  naive 1/N of the same arms (0.77) and to the best single arm (1.06). PBO 0.25 says in-sample
+  ranking of these arms is a weak guide to out-of-sample ranking.
+- Deflated Sharpe passed by a hair at 261 trials (observed 0.085 vs threshold 0.082 per week)
+  because the twelve arms' Sharpes are tightly bunched; it is the only part that passed.
+
+Per the registration: no shadow book, no governance row; v3 (volatility-managed and risk parity)
+is registered next with the cumulative count 261 + its arms + 1.
