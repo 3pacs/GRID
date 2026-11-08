@@ -1,28 +1,37 @@
 """
-Universal stock split adjuster for GRID price data.
+Heuristic stock split adjuster for price series that carry NO basis metadata.
 
-This is a TOP-LEVEL data layer concern. Every price series that flows
-through GRID must be split-adjusted before any downstream consumer
-touches it — signals, backtests, models, scanners, everything.
-
-GRID's resolved_series stores raw (unadjusted) prices from multiple
-sources. When a stock splits N:1, the price drops ~(1-1/N) in one day.
-This module detects those discontinuities and forward-adjusts ALL
-pre-split prices so the series is continuous.
+When a stock splits N:1, the as-traded price drops ~(1-1/N) in one day.
+This module detects such discontinuities from the prices alone and
+forward-adjusts ALL pre-split prices so the series is continuous.
 
 Forward adjustment (not backward):
   Pre-split price $200, 10:1 split → adjusted to $20.
   This preserves current-day prices as real market prices,
   and adjusts history to match the current share structure.
 
+Scope (narrowed 2026-11-08, docs/reference/PRICE_PANEL_BASIS.md):
+
+* ``alpha_research.data.panel_builder.build_price_panel`` NO LONGER runs
+  this module. The ``{ticker}_full`` features it reads are on the
+  ``adj_close`` basis (already split- and dividend-adjusted as of each
+  vintage's pull) and the panel re-bases each vintage with the *recorded*
+  split events (``store.observations.read_splits``), which is exact and
+  idempotent. Running a drop detector on top of that panel is what turned
+  raw/adjusted vintage flips and holiday junk prints into compounded
+  "splits" (XLP first-to-last ratio 8e201).
+* Callers that still have only an unlabelled price series
+  (``conviction_scorer``, ``compute_real_drawdown``) keep using
+  ``adjust_splits``. For them ``detect_splits`` now refuses a drop that
+  does not persist: a candidate whose price climbs back above the
+  threshold line within ``confirm_days`` is a data discontinuity, not a
+  corporate action, and is skipped with a warning instead of rescaling
+  the whole history. A real split's new level persists.
+
 Usage:
   from alpha_research.data.split_adjuster import adjust_splits
 
-  # Single series
   adjusted = adjust_splits(raw_prices)
-
-  # Full panel (called automatically by panel_builder)
-  panel = build_price_panel(engine)  # already adjusted
 """
 
 from __future__ import annotations
@@ -32,13 +41,56 @@ import numpy as np
 import pandas as pd
 from loguru import logger as log
 
+#: Calendar days after a candidate drop in which a price back above the
+#: threshold line disproves the split. Bars beyond this window carry no
+#: evidence either way (a stock may genuinely double in a year), so a
+#: candidate with no later bars inside the window is accepted as before.
+DEFAULT_CONFIRM_DAYS = 10
+#: Bar-count fallback for series without a DatetimeIndex.
+DEFAULT_CONFIRM_BARS = 5
+
+
+def _reverts(
+    prices: pd.Series,
+    idx: int,
+    pre: float,
+    threshold: float,
+    confirm_days: int,
+    confirm_bars: int,
+) -> bool:
+    """True if a later bar inside the confirmation window climbs back above
+    the threshold line ``pre * (1 + threshold)`` -- the drop did not persist."""
+    later = prices.iloc[idx + 1:]
+    if later.empty:
+        return False
+    if isinstance(prices.index, pd.DatetimeIndex):
+        cutoff = prices.index[idx] + pd.Timedelta(days=confirm_days)
+        later = later[later.index <= cutoff]
+    else:
+        later = later.iloc[:confirm_bars]
+    if later.empty:
+        return False
+    line = pre * (1.0 + threshold)
+    return bool((later.astype(float) > line).any())
+
 
 def detect_splits(
     prices: pd.Series,
     threshold: float = -0.40,
+    *,
+    confirm_days: int = DEFAULT_CONFIRM_DAYS,
+    confirm_bars: int = DEFAULT_CONFIRM_BARS,
 ) -> list[dict]:
     """
-    Detect stock splits by looking for single-day drops > threshold.
+    Detect stock splits by looking for single-day drops > threshold whose
+    new level persists.
+
+    A drop is a split only when the rounded pre/post ratio is >= 2 AND no
+    bar within ``confirm_days`` calendar days after it (``confirm_bars``
+    bars for a non-datetime index) climbs back above the threshold line.
+    A reverting drop is a glitch (a wrong-basis vintage, a holiday junk
+    print) and is logged and skipped; adjusting history for it would
+    multiply every earlier price by the glitch and never undo it.
 
     Returns list of {date, ratio, pre_price, post_price} sorted
     chronologically.
@@ -61,6 +113,15 @@ def detect_splits(
                 if post > 0:
                     ratio = round(pre / post)
                     if ratio >= 2:
+                        if _reverts(prices, idx, pre, threshold, confirm_days, confirm_bars):
+                            log.warning(
+                                "split_adjuster {t}: {d} drop {pre:.4g} -> {post:.4g} "
+                                "reverts within {w} days; data discontinuity, not a "
+                                "split -- history NOT adjusted",
+                                t=prices.name or "unknown", d=dt, pre=pre, post=post,
+                                w=confirm_days,
+                            )
+                            continue
                         splits.append({
                             "date": dt,
                             "ratio": ratio,
@@ -122,8 +183,9 @@ def adjust_panel(
     """
     Split-adjust every column in a price panel.
 
-    This is the main entry point for panel_builder integration.
-    Applies adjust_splits() to each ticker column independently.
+    Applies adjust_splits() to each ticker column independently. Not used
+    by ``panel_builder.build_price_panel`` since 2026-11-08 (see module
+    docstring); kept for callers with unlabelled panels.
     """
     if panel.empty:
         return panel.copy()

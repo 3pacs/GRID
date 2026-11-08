@@ -30,7 +30,7 @@ from tests.test_resolver import FakeRow, _mock_engine
 
 # Mapped via NEW_MAPPINGS_V2 (merged into SEED_MAPPINGS at construction); the
 # registry fixture below deliberately lacks its target, the live miss shape.
-MAPPED_BUT_UNREGISTERED = "YF:IEF:close"
+MAPPED_BUT_UNREGISTERED = "YF:IEF:adj_close"  # adj_close: the only field that feeds a _full since 2026-11-08
 NO_MAPPING = [
     ("LEGISLATION:29-hr235:reported", 3),   # from the 2026-10-22 journal (entity feed)
     ("EARNINGS:ZLAB:actual", 2),            # from the 2026-10-22 journal (entity feed)

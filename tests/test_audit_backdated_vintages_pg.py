@@ -154,7 +154,10 @@ def test_counts_are_exact(pg_engine):
 def test_feature_without_raw_mapping_reports_no_first_pull(pg_engine):
     _seed(pg_engine)
     other = audit.run(pg_engine, ["other_full"], clock=_OK_CLOCK)["features"][0]
-    assert other["series"] == ["YF:OTHER:close"]
+    # One basis per _full since 2026-11-08 (adj_close; spy_full stays on the
+    # receipted raw close), plus the legacy close feed whose earlier pulls
+    # still bound the vintages resolved before the policy: both series count.
+    assert other["series"] == ["YF:OTHER:adj_close", "YF:OTHER:close"]
     assert other["first_raw_pull"] is None
     assert other["backdated_rows"] == 1 and other["backdated_before_first_pull"] is None
     assert other["already_retracted"] == 0
