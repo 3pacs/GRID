@@ -242,3 +242,14 @@ race: an H1 rollup was held at its insert, H2 committed, and H1 then finished la
 The read projection hid that stale TTM until the next H2 recompute. Changed-file
 Ruff E/W/F (excluding E501), compilation and whitespace checks passed. Full CI on
 the newly published head and actual deployment acceptance are still separate gates.
+
+
+The first continuation CI run caught two clean-run-only issues: missing raw-SQL
+ledger bootstrap in schema.sql/Alembic replay, and unordered set parametrization
+under pytest-xdist. The migration now creates the canonical empty capital-flow
+ledger (including currency/indexes/minimum app grants) only when it is absent;
+it never replays raw 0024's data backfill/deduplication against an existing ledger.
+A new disposable regression checks both the absent-table path and preservation
+of a populated ledger. All 25 private-PG tests pass. Test IDs are now sorted and
+collection order was verified under three different Python hash seeds. These
+corrections require fresh exact-head CI; earlier-head results do not qualify them.

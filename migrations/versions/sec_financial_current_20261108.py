@@ -65,9 +65,39 @@ FROM ranked WHERE NOT direct_financial OR current_rank = 1
 """
 
 
+# schema.sql + Alembic clean replay predates the separate raw 0021/0024
+# capital-flow migrations. Create their final empty table shape ONLY if absent.
+# Never run raw 0024's historical UPDATE/dedup DELETE against existing data.
+EMPTY_LEDGER_SQL = """
+DO $$ BEGIN
+  IF to_regclass('public.capital_flows') IS NULL THEN
+    CREATE TABLE public.capital_flows (
+      id SERIAL PRIMARY KEY, actor_id TEXT NOT NULL, fiscal_period DATE NOT NULL,
+      period_type TEXT NOT NULL, flow_type TEXT NOT NULL, direction TEXT NOT NULL,
+      amount_usd NUMERIC NOT NULL, counterparty_id TEXT, source_filing TEXT,
+      confidence TEXT NOT NULL, as_of TIMESTAMPTZ DEFAULT NOW(),
+      currency TEXT DEFAULT 'USD',
+      UNIQUE (actor_id, fiscal_period, period_type, flow_type, counterparty_id, source_filing)
+    );
+    CREATE INDEX idx_capital_flows_actor ON public.capital_flows(actor_id, fiscal_period DESC);
+    CREATE INDEX idx_capital_flows_type ON public.capital_flows(flow_type);
+    CREATE INDEX idx_capital_flows_currency ON public.capital_flows(currency) WHERE currency <> 'USD';
+    CREATE UNIQUE INDEX capital_flows_dedup_nullable_cp_key ON public.capital_flows(
+      actor_id, fiscal_period, period_type, flow_type,
+      (COALESCE(NULLIF(counterparty_id, ''), '__none__')), source_filing);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='grid') THEN
+      GRANT SELECT, INSERT, UPDATE, DELETE ON public.capital_flows TO grid;
+      GRANT USAGE, SELECT ON SEQUENCE public.capital_flows_id_seq TO grid;
+    END IF;
+  END IF;
+END $$
+"""
+
+
 def upgrade():
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute("SET LOCAL statement_timeout = '60s'")
+    op.execute(EMPTY_LEDGER_SQL)
     op.execute("ALTER TABLE capital_flows_ttm_state ADD COLUMN sec_snapshot_id TEXT")
     op.execute(VIEW_SQL)
     op.execute("""DO $$ BEGIN
@@ -78,5 +108,6 @@ def upgrade():
 
 
 def downgrade():
+    # Retain ledger/evidence, including an empty-ledger bootstrap from upgrade.
     op.execute("DROP VIEW capital_flows_current")
     op.execute("ALTER TABLE capital_flows_ttm_state DROP COLUMN sec_snapshot_id")

@@ -401,3 +401,15 @@ Verification and limits:
   plans, persisted fundamental-divergence and report invalidation, TTL-cache
   invalidation, reviewed historical repair. No repair executor, merge, deployment,
   production migration, historical correction or production rollup was performed.
+
+
+### SEC continuation CI correction
+
+- Clean replay exposed the separate raw-SQL capital_flows dependency. The new
+  migration now creates that canonical empty ledger only if absent; it does not
+  run raw 0024's historical backfill or deduplication against existing data.
+- Parallel test collection exposed one unordered parameter set. Sorted it and
+  verified all 98 missing-value test IDs match across three Python hash seeds.
+- 25 disposable PostgreSQL tests pass, including empty-schema initialization,
+  grid-role view/insert access and populated-ledger preservation. Fresh head CI
+  remains required; no production state changed.

@@ -178,7 +178,7 @@ def sector_rows(amounts, year=2025):
     return [(date(year, 12, 31), metric, value) for metric, value in amounts.items()]
 
 
-@pytest.mark.parametrize("missing", list(COMPLETE.keys() - {"tax", "r_and_d", "acquisitions"}))
+@pytest.mark.parametrize("missing", sorted(COMPLETE.keys() - {"tax", "r_and_d", "acquisitions"}))
 def test_sector_capital_score_requires_all_components(monkeypatch, missing):
     monkeypatch.setattr(sh, "_table_exists", lambda *args: True)
     amounts = dict(COMPLETE)

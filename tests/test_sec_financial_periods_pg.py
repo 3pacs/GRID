@@ -675,3 +675,43 @@ def test_pg_overlapping_rollup_cannot_publish_after_head_advance(snapshot_db):
         with snapshot_db.begin() as conn:
             conn.execute(text('DROP TRIGGER sec_test_pause_ttm ON capital_flows'))
             conn.execute(text('DROP FUNCTION sec_test_pause_ttm()'))
+
+
+
+def test_pg_current_migration_bootstraps_missing_raw_ledger(private_pg):
+    import importlib.util
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    engine = private_pg
+    root = Path(__file__).resolve().parents[1] / 'migrations/versions'
+    try:
+        with engine.begin() as conn:
+            assert conn.execute(text("SELECT to_regclass('public.capital_flows')")).scalar_one() is None
+            conn.execute(text('CREATE ROLE grid NOLOGIN NOSUPERUSER NOINHERIT'))
+            conn.execute(text("""CREATE TABLE capital_flows_ttm_state (
+                actor_id TEXT PRIMARY KEY, quarter_fingerprint TEXT,
+                computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"""))
+            fake_alembic = SimpleNamespace(op=SimpleNamespace(execute=lambda sql: conn.execute(text(sql))))
+            with patch.dict(sys.modules, {'alembic':fake_alembic}):
+                for filename in ('sec_financial_snapshots_20261107.py', 'sec_financial_current_20261108.py'):
+                    spec = importlib.util.spec_from_file_location('_sec_clean_migration', root/filename)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    module.upgrade()
+            assert conn.execute(text('SELECT count(*) FROM capital_flows_current')).scalar_one() == 0
+            conn.execute(text('SET LOCAL ROLE grid'))
+            conn.execute(text("""INSERT INTO capital_flows (actor_id,fiscal_period,period_type,
+                flow_type,direction,amount_usd,source_filing,confidence)
+                VALUES ('clean','2026-07-26','quarter','revenue','in',10,'10-Q test','confirmed')"""))
+            assert conn.execute(text('SELECT amount_usd FROM capital_flows_current')).scalar_one() == 10
+        # Upgrade's empty-ledger helper is harmless when a populated ledger exists.
+        with engine.begin() as conn:
+            conn.execute(text(module.EMPTY_LEDGER_SQL))
+            assert conn.execute(text('SELECT count(*) FROM capital_flows')).scalar_one() == 1
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text('DROP VIEW IF EXISTS capital_flows_current'))
+            for name in ('sec_financial_snapshot_heads','sec_financial_snapshots',
+                         'capital_flows_ttm_state','capital_flows'):
+                conn.execute(text('DROP TABLE IF EXISTS '+name))
+            conn.execute(text('DROP ROLE IF EXISTS grid'))
