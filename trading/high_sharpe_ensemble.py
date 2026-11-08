@@ -68,6 +68,10 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
         "docs/paper_log/high-sharpe-ensemble-v1-preregistration.md",
         "4c84ba9d3c36d92c32ae7a7d7bf7590115c33b415e4c3b8e859ebf5264a0cbc7",
     ),
+    "v5": (
+        "docs/paper_log/high-sharpe-ensemble-v5-preregistration.md",
+        "4c168b17317514aeec65298e28d8175bf04e1a17b68082e812d39a8459aab0de",
+    ),
     "v4": (
         "docs/paper_log/high-sharpe-ensemble-v4-preregistration.md",
         "53ecca3881596128813d46ef9d0738bcbc93e1426a87d67427546a7dccb5ef89",
@@ -83,11 +87,11 @@ REGISTRATIONS: dict[str, tuple[str, str]] = {
 }
 PREREG_PATH, PREREG_SHA256 = REGISTRATIONS["v1"]
 
-ENSEMBLE_VERSION = "high-sharpe-ensemble/4"
+ENSEMBLE_VERSION = "high-sharpe-ensemble/5"
 
 #: Trials spent before each set's look: 240 rotation-sweep configs + v1's 7 candidates
 #: + v1's ensemble = 248; every later set adds its candidates and its ensemble.
-TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261, "v4": 270}
+TRIALS_BEFORE: dict[str, int] = {"v1": 240, "v2": 248, "v3": 261, "v4": 270, "v5": 278}
 
 
 def lf_sha256(data: bytes) -> str:
@@ -564,6 +568,40 @@ def v4_candidates() -> dict[str, CandidateFn]:
 V4_CONFIG: dict[str, Any] = {"rebalance": "B", "periods_per_year": 252, "trailing": 252, "selection_every": 21}
 
 
+# ── v5: combinations of the arms that beat SPY's Sharpe in their own look (278 before) ──
+
+#: Arms whose out-of-sample annualised Sharpe exceeded SPY buy-and-hold's on the same segments
+#: in their own registered look (weekly sets v1–v3; no v4 arm qualified). Fixed from the records
+#: in docs/reports/high-sharpe-ensemble-v{1,2,3}-look-*.json; a test re-derives this list.
+V5_QUALIFIED: dict[str, str] = {
+    "adaptive_rotation": "v1",
+    "vix_ma_exposure_spy": "v1",
+    "tsmom_12_1_assets_ma10_M": "v2",
+    "tsmom_12_1_assets_ma10_W": "v2",
+    "ma10_spy_W": "v2",
+    "vol_target_spy_M": "v3",
+    "vol_target_spy_W": "v3",
+    "vol_target_qqq_M": "v3",
+    "vol_target_qqq_W": "v3",
+    "risk_parity_4_M": "v3",
+    "risk_parity_4_W": "v3",
+    "sixty_forty_vol_scaled_M": "v3",
+    "sixty_forty_vol_scaled_W": "v3",
+}
+UNIVERSE_V5: tuple[str, ...] = tuple(dict.fromkeys(UNIVERSE + V2_ASSETS + UNIVERSE_V3))
+
+#: v5 primary: hold every qualified arm, inverse-volatility weighted, no selection
+#: (k = all, no Sharpe floor, no correlation penalty); secondary: the v1 selector unchanged.
+V5_PRIMARY: dict[str, Any] = {"k": len(V5_QUALIFIED), "min_shrunk_sharpe": -1e9, "corr_penalty": 0.0}
+V5_SECONDARY: dict[str, Any] = {}
+
+
+def v5_candidates() -> dict[str, CandidateFn]:
+    """The thirteen qualified arms, built from their own sets' factories (fresh state)."""
+    pools = {"v1": dict(CANDIDATES), "v2": v2_candidates(), "v3": v3_candidates()}
+    return {name: pools[origin][name] for name, origin in V5_QUALIFIED.items()}
+
+
 @dataclass(frozen=True)
 class CandidateSet:
     """One registered set: its universe, candidates, trial accounting and verdict rule."""
@@ -577,13 +615,17 @@ class CandidateSet:
     def candidates(self) -> dict[str, CandidateFn]:
         return self.factory()
 
+    count_candidates: bool = True  # False when every arm was already counted in an earlier set
+
     @property
     def n_trials_cumulative(self) -> int:
-        """Trials before this set + this set's candidates + this set's ensemble configuration(s)."""
-        return self.trials_before + len(self.factory()) + self.extra_ensembles
+        """Trials before this set + this set's new candidates + this set's ensemble configuration(s)."""
+        new_arms = len(self.factory()) if self.count_candidates else 0
+        return self.trials_before + new_arms + self.extra_ensembles
 
     extra_ensembles: int = 1
     config_overrides: dict[str, Any] = field(default_factory=dict)
+    secondary_overrides: dict[str, Any] | None = None  # a second, pre-stated ensemble configuration
 
     def config(self, **overrides: Any) -> "EnsembleConfig":
         merged = {**self.config_overrides, **overrides}
@@ -597,6 +639,12 @@ def candidate_set(name: str) -> CandidateSet:
         return CandidateSet("v2", UNIVERSE_V2, v2_candidates, TRIALS_BEFORE["v2"], "watch")
     if name == "v3":
         return CandidateSet("v3", UNIVERSE_V3, v3_candidates, TRIALS_BEFORE["v3"], "watch")
+    if name == "v5":
+        return CandidateSet(
+            "v5", UNIVERSE_V5, v5_candidates, TRIALS_BEFORE["v5"], "watch",
+            extra_ensembles=2, config_overrides=V5_PRIMARY, secondary_overrides=V5_SECONDARY,
+            count_candidates=False,
+        )
     if name == "v4":
         return CandidateSet(
             "v4", UNIVERSE_V4, v4_candidates, TRIALS_BEFORE["v4"], "watch",
@@ -1173,7 +1221,8 @@ def report_markdown(report: dict[str, Any], *, title: str, data_basis: str) -> s
         f"{watch.get('excess_lower_bound_positive')}, DSR > 0.5 {watch.get('dsr_above_half')}, "
         f"drawdown no worse {watch.get('drawdown_no_worse_than_spy')}.",
         "",
-        f"Out-of-sample segments: {report['oos_period']['n_segments']} weekly, "
+        f"Out-of-sample segments: {report['oos_period']['n_segments']} "
+        f"{'daily' if report['config']['periods_per_year'] == 252 else 'weekly'}, "
         f"{report['oos_period']['first_segment']} → {report['oos_period']['last_segment']}. {data_basis}",
         "",
         "| series | Sharpe (ann.) | ann. return | max DD | total | n |",
@@ -1192,7 +1241,7 @@ def report_markdown(report: dict[str, Any], *, title: str, data_basis: str) -> s
         f"P(OOS loss of the in-sample best) = {f(pbo.get('prob_oos_loss'))}.",
         f"Ensemble turnover {f(report['ensemble_turnover_annualised'], 2)}×/yr; in cash {f(report['ensemble_share_in_cash'])} of segments.",
         "",
-        "## Candidates (same out-of-sample segments, net of 10 bp/side)",
+        f"## Candidates (same out-of-sample segments, net of {report['config']['cost_bps_per_side']:g} bp/side)",
         "",
         "| candidate | Sharpe | ann. return | max DD | turnover/yr | excess-vs-SPY LB (Bonferroni) | times selected |",
         "|---|---|---|---|---|---|---|",
@@ -1218,7 +1267,8 @@ def frame_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
 
 __all__ = [
     "BENCHMARK", "CANDIDATES", "Cadenced", "CandidateSet", "REGISTRATIONS", "TRIALS_BEFORE", "UNIVERSE_V2",
-    "UNIVERSE_V3", "UNIVERSE_V4", "candidate_set", "v2_candidates", "v3_candidates", "v4_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
+    "UNIVERSE_V3", "UNIVERSE_V4", "UNIVERSE_V5", "V5_QUALIFIED", "candidate_set", "v2_candidates", "v3_candidates",
+    "v4_candidates", "v5_candidates", "DecisionContext", "EnsembleConfig", "EnsembleRun", "PREREG_PATH",
     "PREREG_SHA256", "PanelPITStore", "UNIVERSE", "annualised_sharpe", "block_bootstrap_mean",
     "compute_candidate_paths", "deflated_sharpe", "evaluate", "frame_to_records", "inverse_vol_weights",
     "path_returns", "pbo_over_candidates", "rebalance_dates", "registration_sha256", "report_markdown",

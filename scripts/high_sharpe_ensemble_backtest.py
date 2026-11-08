@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--as-of", type=date.fromisoformat, default=None, help="vintage date (default: today)")
     ap.add_argument("--source", choices=("resolved", "raw-adj-close"), default="raw-adj-close")
     ap.add_argument("--out", default="docs/reports")
-    ap.add_argument("--set", dest="set_name", choices=("v1", "v2", "v3", "v4"), default="v4",
+    ap.add_argument("--set", dest="set_name", choices=("v1", "v2", "v3", "v4", "v5"), default="v5",
                     help="registered candidate set; fixes universe, candidates, trial count and criterion")
     ap.add_argument("--tag", default=None, help="report file prefix (default high-sharpe-ensemble-<set>)")
     ap.add_argument("--lookback-days", type=int, default=400, help="price history loaded before --start")
@@ -191,13 +191,19 @@ def main(argv: list[str] | None = None) -> int:
     config = cset.config()
     run = hse.walk_forward(panel, vix, args.start, args.end, config, cset.candidates(), engine=None, pit=pit)
     report = hse.evaluate(run)
+    secondary_cfg = None
     if args.secondary_cost_bps is not None:
-        run2 = hse.walk_forward(panel, vix, args.start, args.end, cset.config(cost_bps_per_side=args.secondary_cost_bps),
-                                cset.candidates(), engine=None, pit=pit)
+        secondary_cfg = cset.config(cost_bps_per_side=args.secondary_cost_bps)
+    elif cset.secondary_overrides is not None:
+        secondary_cfg = hse.EnsembleConfig(n_trials_declared=cset.n_trials_cumulative, criterion=cset.criterion,
+                                           **cset.secondary_overrides)
+    if secondary_cfg is not None:
+        run2 = hse.walk_forward(panel, vix, args.start, args.end, secondary_cfg, cset.candidates(), engine=None, pit=pit)
         rep2 = hse.evaluate(run2)
-        report["secondary_cost_run"] = {k: rep2[k] for k in ("config", "ensemble", "spy_buy_and_hold", "equal_weight_all_candidates",
+        report["secondary_run"] = {k: rep2[k] for k in ("config", "ensemble", "spy_buy_and_hold", "equal_weight_all_candidates",
                                         "best_single_in_hindsight", "candidates", "excess_vs_spy_bootstrap",
-                                        "deflated_sharpe", "pbo_candidates", "watch_criterion", "pass_criterion")}
+                                        "deflated_sharpe", "pbo_candidates", "watch_criterion", "pass_criterion", "selection_counts")}
+        report["secondary_cost_run"] = report["secondary_run"]  # v4's record used this key
     report["provenance"] = {
         **provenance,
         "as_of": as_of.isoformat(),

@@ -460,3 +460,45 @@ def test_turn_of_month_is_long_at_month_edges_only():
     assert w("2020-02-14") == {}             # mid-month
     assert w("2020-02-25") == {"SPY": 1.0}   # 3 business days remain after it
     assert w("2020-02-24") == {}             # 4 remain
+
+
+# ── v5: combinations ────────────────────────────────────────────────────────
+
+
+def _own_look_sharpes(set_name: str) -> tuple[dict[str, float], float]:
+    import glob
+    import json
+
+    files = sorted(glob.glob(str(REPO_ROOT / "docs" / "reports" / f"high-sharpe-ensemble-{set_name}-look-*.json")))
+    assert files, f"no committed look record for {set_name}"
+    rec = json.loads(Path(files[-1]).read_text(encoding="utf-8"))
+    return {c: v["sharpe_annualised"] for c, v in rec["candidates"].items()}, rec["spy_buy_and_hold"]["sharpe_annualised"]
+
+
+def test_v5_qualified_arms_follow_the_rule_from_the_committed_records():
+    derived = {}
+    for set_name in ("v1", "v2", "v3", "v4"):
+        sharpes, spy = _own_look_sharpes(set_name)
+        for arm, sr in sharpes.items():
+            if sr > spy:
+                derived[arm] = set_name
+    assert derived == hse.V5_QUALIFIED
+    assert not any(v == "v4" for v in derived.values())
+
+
+def test_v5_set_counts_only_its_two_ensembles_and_primary_holds_every_arm():
+    v5 = hse.candidate_set("v5")
+    assert v5.n_trials_cumulative == 278 + 0 + 2 == 280
+    arms = v5.candidates()
+    assert set(arms) == set(hse.V5_QUALIFIED) and len(arms) == 13
+    assert isinstance(arms["vol_target_spy_M"], hse.Cadenced) and not isinstance(arms["vol_target_spy_W"], hse.Cadenced)
+    cfg = v5.config()
+    assert (cfg.k, cfg.corr_penalty) == (13, 0.0) and cfg.min_shrunk_sharpe < -1e6
+    rng = np.random.default_rng(8)
+    trailing = pd.DataFrame(rng.normal(-0.001, 0.01, (52, 13)), columns=list(arms))
+    picked = hse.select_top_k(trailing, cfg.k, cfg.shrink_n0, cfg.corr_penalty, cfg.min_shrunk_sharpe, cfg.periods_per_year)
+    assert set(picked) == set(arms), "the primary combination holds every arm, losers included"
+    assert v5.secondary_overrides == {} and hse.EnsembleConfig(**v5.secondary_overrides).k == 3
+    text = (REPO_ROOT / hse.REGISTRATIONS["v5"][0]).read_text(encoding="utf-8")
+    assert "280" in text and all(f"`{a}`" in text or f"`{a.rsplit('_', 1)[0]}_M` / `_W`" in text for a in arms)
+    assert set(hse.UNIVERSE_V5) >= set(hse.UNIVERSE) | set(hse.V2_ASSETS) | set(hse.UNIVERSE_V3)
