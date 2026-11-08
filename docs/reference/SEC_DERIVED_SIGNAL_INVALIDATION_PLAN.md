@@ -233,3 +233,15 @@ Local first-slice validation: 676 offline tests passed, 9 optional skips; 71
 private PostgreSQL tests passed, including 36 predicate/preservation cases.
 Replay, current-read fallback, empty synthesis and preserved history are covered.
 Lint, syntax and whitespace checks pass. Exact-head CI remains a separate gate.
+
+
+### Derived-signal qualification correction
+
+The first G3/G5 run correctly rejected an outdated forward thesis digest before
+executing tests. The 12 guarded reads now use fixed-column SQLAlchemy clauses and
+bound values, preserving predicate/history semantics. Only the forward thesis
+pin and new helper dependency are updated; all 14 HOLD seals, other forward
+seals, test counts, isolation and rollback checks stay unchanged. Expanded local
+validation passes 759 offline tests (9 optional skips) and 71 disposable PG tests.
+All 15 forward and 14 HOLD source blobs verify. Fresh exact-head CI is required;
+the failed predecessor is not accepted. No production access or deployment.

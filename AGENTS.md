@@ -457,3 +457,15 @@ Verification and limits:
   qualified publications and clean learning epochs. This is not complete repair.
   No production access, migration, deletion, merge or deployment. Remote
   exact-head qualification remains required after any draft publication.
+
+
+### Derived-signal qualification correction
+
+The first G3/G5 run correctly rejected an outdated forward thesis digest before
+executing tests. The 12 guarded reads now use fixed-column SQLAlchemy clauses and
+bound values, preserving predicate/history semantics. Only the forward thesis
+pin and new helper dependency are updated; all 14 HOLD seals, other forward
+seals, test counts, isolation and rollback checks stay unchanged. Expanded local
+validation passes 759 offline tests (9 optional skips) and 71 disposable PG tests.
+All 15 forward and 14 HOLD source blobs verify. Fresh exact-head CI is required;
+the failed predecessor is not accepted. No production access or deployment.

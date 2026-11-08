@@ -12,9 +12,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql import Select
 
-from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE as PREDICATE
+from store.journal_qualification import (
+    DECISION_JOURNAL,
+    NON_PROVISIONAL_JOURNAL_PREDICATE as PREDICATE,
+    non_provisional_journal_select,
+)
 
 
 NOW = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
@@ -26,7 +32,7 @@ def _engine(journal_rows=(), *, failure=False, production=None):
     queries = []
 
     def execute(statement, *_args, **_kwargs):
-        sql = str(statement)
+        sql = str(statement.compile(dialect=postgresql.dialect()))
         queries.append(sql)
         result = MagicMock()
         result.fetchone.return_value = None
@@ -44,7 +50,9 @@ def _engine(journal_rows=(), *, failure=False, production=None):
     return engine, queries
 
 
-def _assert_guarded(engine, queries, *, count=1, limit=True):
+def _assert_guarded(engine, queries, columns, *, count=1, limit=True,
+                    limit_value=1, order="decision_timestamp", distinct=False,
+                    feedback=False):
     reads = [q for q in queries if "FROM decision_journal" in q]
     assert len(reads) == count
     for sql in reads:
@@ -52,13 +60,40 @@ def _assert_guarded(engine, queries, *, count=1, limit=True):
         assert sql.index(PREDICATE) < sql.index("ORDER BY")
         if limit:
             assert sql.index(PREDICATE) < sql.index("LIMIT")
+        else:
+            assert "LIMIT" not in sql
         assert "WHERE" in sql[:sql.index(PREDICATE)]
+        if distinct:
+            assert "SELECT DISTINCT ON (decision_journal.inferred_state)" in sql
+            assert "ORDER BY decision_journal.inferred_state, decision_journal.decision_timestamp DESC" in sql
+        else:
+            assert "DISTINCT" not in sql
+            expected_order = ("ORDER BY decision_journal.id DESC" if order == "id"
+                              else "ORDER BY decision_journal.decision_timestamp DESC")
+            assert expected_order in sql
+        if feedback:
+            assert "decision_journal.decision_timestamp >= NOW() - INTERVAL '30 days'" in sql
+            assert "decision_journal.verdict IS NOT NULL" in sql
+        else:
+            assert "INTERVAL" not in sql
+    conn = engine.connect.return_value.__enter__.return_value
+    statements = [call for call in conn.execute.call_args_list
+                  if "FROM decision_journal" in str(call.args[0].compile(dialect=postgresql.dialect()))]
+    for call in statements:
+        statement = call.args[0]
+        assert isinstance(statement, Select)
+        assert tuple(statement.selected_columns.keys()) == tuple(columns)
+        params = dict(statement.compile(dialect=postgresql.dialect()).params)
+        if "mid" in params:
+            assert params.pop("mid") is None
+            assert call.args[1] == {"mid": 7}
+        assert list(params.values()) == ([limit_value] if limit else [])
     assert all(q.lstrip().upper().startswith("SELECT") for q in queries)
     engine.begin.assert_not_called()
 
 
 def test_predicate_is_static_parameter_free_and_narrow():
-    query = text("SELECT * FROM decision_journal WHERE " + PREDICATE)
+    query = non_provisional_journal_select("id")
     assert query.compile().params == {}
     assert "source_contract_id" not in PREDICATE
     assert "sec_generation" not in PREDICATE
@@ -109,7 +144,15 @@ def test_internal_current_readers_guard_before_limit_and_keep_no_data(consumer, 
         else:
             assert value.detail == "No regime data available"
             assert value.weight == 0
-    _assert_guarded(engine, queries)
+    _assert_guarded(engine, queries, {
+        "feedback": ("grid_recommendation", "verdict"),
+        "flow": ("inferred_state", "state_confidence", "transition_probability"),
+        "trace": ("inferred_state",),
+        "thesis": ("inferred_state", "state_confidence", "counterfactual"),
+        "sentiment": ("inferred_state", "state_confidence"),
+    }[consumer], limit_value=50 if consumer == "feedback" else 1,
+        order="id" if consumer == "trace" else "decision_timestamp",
+        feedback=consumer == "feedback")
 
 
 @pytest.mark.parametrize("has_production", [False, True])
@@ -126,7 +169,9 @@ def test_regime_current_guards_production_and_fallback(monkeypatch, has_producti
         assert value.model_version == "none"
         assert value.as_of_date == ""
         assert "No data" in value.baseline_comparison
-    _assert_guarded(engine, queries, count=2 if has_production and not has_row else 1)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "transition_probability",
+         "contradiction_flags", "grid_recommendation", "baseline_recommendation",
+         "decision_timestamp"), count=2 if has_production and not has_row else 1)
 
 
 def test_regime_production_miss_uses_only_guarded_fallback(monkeypatch):
@@ -138,15 +183,17 @@ def test_regime_production_miss_uses_only_guarded_fallback(monkeypatch):
 
     def fallback(statement, *args, **kwargs):
         result = execute(statement, *args, **kwargs)
-        sql = str(statement)
-        if "FROM decision_journal" in sql and ":mid" not in sql:
+        sql = str(statement.compile(dialect=postgresql.dialect()))
+        if "FROM decision_journal" in sql and "model_version_id =" not in sql:
             result.fetchone.return_value = ("GROWTH", 0.8, 0.1, {}, "HOLD", "HOLD", NOW)
         return result
 
     conn.execute.side_effect = fallback
     monkeypatch.setattr(regime, "get_db_engine", lambda: engine)
     assert regime.get_current(_token="fixture").state == "GROWTH"
-    _assert_guarded(engine, queries, count=2)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "transition_probability",
+         "contradiction_flags", "grid_recommendation", "baseline_recommendation",
+         "decision_timestamp"), count=2)
 
 
 def test_regime_query_failure_never_falls_back_to_raw_history(monkeypatch):
@@ -156,7 +203,9 @@ def test_regime_query_failure_never_falls_back_to_raw_history(monkeypatch):
     monkeypatch.setattr(regime, "get_db_engine", lambda: engine)
     with pytest.raises(RuntimeError, match="synthetic journal"):
         regime.get_current(_token="fixture")
-    _assert_guarded(engine, queries)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "transition_probability",
+         "contradiction_flags", "grid_recommendation", "baseline_recommendation",
+         "decision_timestamp"))
 
 
 @pytest.mark.parametrize("has_row", [False, True])
@@ -173,7 +222,7 @@ def test_current_weights_guard_and_empty_measurements(monkeypatch, has_row):
     assert value["regime"] == ("GROWTH" if has_row else None)
     assert value["confidence"] == (0.8 if has_row else None)
     assert value["stress_index"] == (0.125 if has_row else None)
-    _assert_guarded(engine, queries)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "counterfactual"))
 
 
 @pytest.mark.parametrize("mode", ["empty", "failure", "genuine"])
@@ -187,7 +236,8 @@ def test_dad_current_regime_guard_and_missing_context(mode):
         assert value["regime"]["state"] == "GROWTH"
     else:
         assert value["regime"] is None
-    _assert_guarded(engine, queries)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "grid_recommendation",
+         "operator_confidence", "decision_timestamp"))
 
 
 @pytest.mark.parametrize("mode", ["empty", "failure", "genuine"])
@@ -207,7 +257,7 @@ def test_watchlist_current_regime_does_not_invent_missing_context(monkeypatch, m
     assert ("macro regime is currently GROWTH" in value["overview"]) == (mode == "genuine")
     if mode != "genuine":
         assert "macro regime" not in value["overview"].lower()
-    _assert_guarded(engine, queries)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "grid_recommendation"))
 
 
 def test_historical_regime_apis_keep_provisional_evidence(monkeypatch):
@@ -239,7 +289,8 @@ def test_all_active_filters_before_distinct_on_and_preserves_empty(monkeypatch, 
     assert len(value["macro"]) == int(has_row)
     assert value["strategy"] == []
     assert value["total_journal_entries"] == int(has_row)
-    _assert_guarded(engine, queries, limit=False)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "transition_probability",
+         "contradiction_flags", "grid_recommendation", "decision_timestamp"), distinct=True, limit=False)
 
 
 @pytest.mark.parametrize("has_row", [False, True])
@@ -265,4 +316,65 @@ def test_synthesis_filters_and_does_not_invent_missing_regime(monkeypatch, has_r
         assert exc.value.status_code == 503
         assert "No non-provisional regime readings" in exc.value.detail
         get_llm.assert_not_called()
-    _assert_guarded(engine, queries, limit=False)
+    _assert_guarded(engine, queries, ("inferred_state", "state_confidence", "grid_recommendation"), distinct=True, limit=False)
+
+
+@pytest.mark.parametrize("name", ["*", "missing", "id, verdict", "id; DELETE FROM decision_journal"])
+def test_builder_rejects_unknown_or_sql_like_column_names(name):
+    with pytest.raises(KeyError):
+        non_provisional_journal_select(name)
+
+
+def test_builder_rejects_empty_projection():
+    with pytest.raises(ValueError, match="at least one"):
+        non_provisional_journal_select()
+
+
+def test_builder_preserves_column_order_and_binds_values():
+    model_id = "7 OR 1=1 --"
+    statement = (
+        non_provisional_journal_select("state_confidence", "id", "inferred_state")
+        .where(DECISION_JOURNAL.c.model_version_id == bindparam("mid"))
+        .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+        .limit(1)
+        .params(mid=model_id)
+    )
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert tuple(statement.selected_columns.keys()) == ("state_confidence", "id", "inferred_state")
+    assert statement.get_final_froms() == [DECISION_JOURNAL]
+    assert PREDICATE in sql
+    assert compiled.params == {"mid": model_id, "param_1": 1}
+    assert model_id not in sql
+    assert "model_version_id = %(mid)s" in sql
+    assert "LIMIT %(param_1)s" in sql
+
+
+def test_builder_distinct_on_is_postgresql_clause_not_plain_distinct():
+    statement = (
+        non_provisional_journal_select("inferred_state", "state_confidence")
+        .distinct(DECISION_JOURNAL.c.inferred_state)
+        .order_by(DECISION_JOURNAL.c.inferred_state, DECISION_JOURNAL.c.decision_timestamp.desc())
+    )
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "SELECT DISTINCT ON (decision_journal.inferred_state)" in sql
+    assert "ORDER BY decision_journal.inferred_state, decision_journal.decision_timestamp DESC" in sql
+    assert PREDICATE in sql
+    assert compiled.params == {}
+
+
+def test_builder_feedback_cutoff_and_verdict_remain_fixed_clauses():
+    statement = (
+        non_provisional_journal_select("grid_recommendation", "verdict")
+        .where(
+            DECISION_JOURNAL.c.decision_timestamp >= text("NOW() - INTERVAL '30 days'"),
+            DECISION_JOURNAL.c.verdict.is_not(None),
+        )
+        .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+        .limit(50)
+    )
+    compiled = statement.compile(dialect=postgresql.dialect())
+    assert "decision_journal.decision_timestamp >= NOW() - INTERVAL '30 days'" in str(compiled)
+    assert "decision_journal.verdict IS NOT NULL" in str(compiled)
+    assert compiled.params == {"param_1": 50}

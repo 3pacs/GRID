@@ -25,7 +25,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth, require_stream_auth
 from api.dependencies import get_db_engine
-from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 router = APIRouter(prefix="/api/v1/dad", tags=["dad"])
 
@@ -1146,13 +1146,12 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
                 })
 
             regime_row = conn.execute(
-                text(
-                    "SELECT inferred_state, state_confidence, grid_recommendation, "
-                    "operator_confidence, decision_timestamp "
-                    "FROM decision_journal "
-                    f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
-                    "ORDER BY decision_timestamp DESC LIMIT 1"
+                non_provisional_journal_select(
+                    "inferred_state", "state_confidence", "grid_recommendation",
+                    "operator_confidence", "decision_timestamp",
                 )
+                .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+                .limit(1)
             ).fetchone()
             if regime_row:
                 regime = {

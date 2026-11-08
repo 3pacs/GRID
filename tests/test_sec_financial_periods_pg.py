@@ -1092,15 +1092,17 @@ def _raw_journal_evidence(engine):
 
 
 def _latest_qualified_journal(engine):
-    from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
-    # This is the actual shared SQL used by current-regime consumers. The
-    # predicate is static application code, never interpolated user content.
+    from store.journal_qualification import (
+        DECISION_JOURNAL, non_provisional_journal_select,
+    )
+    # Exercise the shared clause builder used by current-regime consumers.
+    query = (
+        non_provisional_journal_select("id", "inferred_state", "state_confidence")
+        .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+        .limit(1)
+    )
     with engine.connect() as conn:
-        return conn.execute(text(
-            "SELECT id, inferred_state, state_confidence FROM decision_journal WHERE "
-            + NON_PROVISIONAL_JOURNAL_PREDICATE
-            + " ORDER BY decision_timestamp DESC LIMIT 1"
-        )).first()
+        return conn.execute(query).first()
 
 
 def test_pg_provisional_journal_does_not_replace_latest_genuine_regime(journal_db):

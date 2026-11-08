@@ -38,7 +38,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.journal_qualification import NON_PROVISIONAL_JOURNAL_PREDICATE
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 from store.observations import read_latest, read_latest_n, read_window
 
 
@@ -305,12 +305,13 @@ def _score_regime(engine: Engine) -> SentimentComponent:
     """Score from latest regime inference."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT inferred_state, state_confidence "
-                "FROM decision_journal "
-                f"WHERE {NON_PROVISIONAL_JOURNAL_PREDICATE} "
-                "ORDER BY decision_timestamp DESC LIMIT 1"
-            )).fetchone()
+            row = conn.execute(
+                non_provisional_journal_select(
+                    "inferred_state", "state_confidence",
+                )
+                .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+                .limit(1)
+            ).fetchone()
 
             if row:
                 state = row[0]
