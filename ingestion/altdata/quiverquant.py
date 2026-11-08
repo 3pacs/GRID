@@ -42,6 +42,7 @@ from ingestion.altdata.quiverquant_identity import (
 )
 from ingestion.base import BasePuller
 from ingestion.altdata import quiverquant_transactions as tx
+from intelligence.actor_identity import is_placeholder_ticker
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
@@ -333,7 +334,7 @@ def unchanged_snapshot_since(engine: Engine, records: list[dict], endpoint_key: 
     as fresh retail sentiment. Returns None when any record has its own date,
     when there is no previous date, or when the content differs.
     """
-    rows = [r for r in records if r.get("Ticker") or r.get("ticker")]
+    rows = [r for r in records if not is_placeholder_ticker(str(r.get("Ticker") or r.get("ticker") or ""))]
     if not rows or any(_resolve_signal_date(r, endpoint_key, today) != today for r in rows):
         return None
     with engine.connect() as conn:
@@ -377,7 +378,7 @@ def _store_signals(
     for rec in records:
         try:
             ticker = rec.get("Ticker") or rec.get("ticker") or ""
-            if not ticker:
+            if is_placeholder_ticker(str(ticker)):  # "N/A" insider funds, "NAN" off-exchange rows
                 continue
 
             # Parse date — many QQ endpoints return current-day data without

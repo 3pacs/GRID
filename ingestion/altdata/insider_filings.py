@@ -33,6 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+from intelligence.actor_identity import is_placeholder_ticker
 
 # ---- API URLs ----
 _EDGAR_SEARCH_URL: str = "https://efts.sec.gov/LATEST/search-index"
@@ -371,7 +372,10 @@ class InsiderFilingsPuller(BasePuller):
             if ticker_elem is not None and ticker_elem.text:
                 ticker = _normalize_ticker(ticker_elem.text)
 
-        if not ticker:
+        # Unlisted issuers (private credit funds, BDCs) file with the symbol
+        # "NONE"; storing it pooled unrelated filers into CLUSTER_BUY rows on
+        # a ticker that does not exist (21 of them, 2026-03-25..11-05).
+        if not ticker or is_placeholder_ticker(ticker):
             return []
 
         # Extract reporting owner info

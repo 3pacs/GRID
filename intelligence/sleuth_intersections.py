@@ -58,6 +58,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from intelligence.actor_identity import is_placeholder_ticker
+
 # ── Constants (pre-registered; change only in a reviewed commit) ────────────
 
 WINDOW_DAYS = 7               # observations must fall inside the 7 days to as_of
@@ -341,7 +343,7 @@ def collect_signal_observations(conn: Any, window_start: date, window_end: date,
     for rid, source_type, source_id, ticker, sdate, stype, svalue in rows:
         cls = classify_signal(source_type, stype, svalue)
         tick = (ticker or "").strip().upper()
-        if cls is None or not tick:
+        if cls is None or is_placeholder_ticker(tick):  # Form 4 "NONE" rows before the puller fix
             continue
         family, direction = cls
         obs_date = sdate.date() if isinstance(sdate, datetime) else sdate
