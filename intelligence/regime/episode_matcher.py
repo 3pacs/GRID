@@ -123,13 +123,13 @@ def _weighted_cosine_similarity(
 # ── Forward returns ──────────────────────────────────────────────────────
 
 _FORWARD_TICKERS = {
-    'SPY': 'YF:SPY:close',
-    'QQQ': 'YF:QQQ:close',
-    'IWM': 'YF:IWM:close',
-    'TLT': 'YF:TLT:close',
-    'GLD': 'YF:GLD:close',
-    'XLE': 'YF:XLE:close',
-    'XLF': 'YF:XLF:close',
+    'SPY': 'YF:SPY:adj_close',
+    'QQQ': 'YF:QQQ:adj_close',
+    'IWM': 'YF:IWM:adj_close',
+    'TLT': 'YF:TLT:adj_close',
+    'GLD': 'YF:GLD:adj_close',
+    'XLE': 'YF:XLE:adj_close',
+    'XLF': 'YF:XLF:adj_close',
     'VIX': 'VIXCLS',
     'HY_SPREAD': 'BAMLH0A0HYM2',
 }
@@ -142,20 +142,29 @@ _FORWARD_HORIZONS = [7, 14, 30, 60, 90, 128]
 # holds wrong-instrument SUCCESS rows around 2026-03-30 (GLD 40.41/105.77,
 # TLT 414.95 = GLD's price), so the best-matching analog episode showed
 # GLD +103% and TLT +88% in 7 days and flipped both forecasts BULLISH
-# (seen live 2026-11-08). TIINGO's closes for the same dates are clean.
-_FORWARD_SOURCES: dict[str, tuple[str, ...]] = {
-    "VIX": ("FRED",),
-    "HY_SPREAD": ("FRED",),
+# (seen live 2026-11-08). Returns need split-adjusted prices: TIINGO's raw
+# YF:*:close halves on a split day (XLE 92.22 -> 45.92 on 2025-12-05), so
+# ETFs read TIINGO's adj_close (canonical, 2006+), falling back to yfinance's
+# YF:*:close, which yfinance stores split-adjusted.
+_FORWARD_SOURCES: dict[str, tuple[tuple[str | None, str], ...]] = {
+    "VIX": ((None, "FRED"),),
+    "HY_SPREAD": ((None, "FRED"),),
 }
-_PRICE_SOURCES: tuple[str, ...] = ("TIINGO", "yfinance")
+
+
+def _price_reads(label: str, series_id: str) -> tuple[tuple[str, str], ...]:
+    """(series_id, source) pairs to try in order for one forward-return series."""
+    if label in _FORWARD_SOURCES:
+        return tuple((sid or series_id, src) for sid, src in _FORWARD_SOURCES[label])
+    return ((series_id, "TIINGO"), (series_id.replace(":adj_close", ":close"), "yfinance"))
 
 
 def _read_forward_prices(conn: Any, label: str, series_id: str, start: date, end: date) -> pd.Series:
-    """Closes for ``series_id`` in ``[start, end]`` from the first source that has any."""
+    """Prices for ``series_id`` in ``[start, end]`` from the first (series, source) that has any."""
     from store import observations
 
-    for source in _FORWARD_SOURCES.get(label, _PRICE_SOURCES):
-        obs = observations.read_window(conn, series_id, source=source, start=start, as_of=end)
+    for sid, source in _price_reads(label, series_id):
+        obs = observations.read_window(conn, sid, source=source, start=start, as_of=end)
         if obs:
             return pd.Series({o.obs_date: float(o.value) for o in obs}, dtype=float).sort_index()
     return pd.Series(dtype=float)
