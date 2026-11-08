@@ -273,3 +273,34 @@ no leverage, cumulative trials 270, no exclusions.
 
 Per the registration: no shadow book, no governance row; v4 (short-horizon mean reversion on
 SPY/QQQ, daily segments, 20 bp primary and 10 bp secondary) is registered with 270 + 6 + 2 = 278.
+
+## 7. Set v4 — daily short-horizon mean reversion on SPY/QQQ (look 2026-11-08T08:08Z, code `ff13dd1d`)
+
+Registration `docs/paper_log/high-sharpe-ensemble-v4-preregistration.md`; record
+`docs/reports/high-sharpe-ensemble-v4-look-20261108T0808Z.{json,md}`. Six daily arms (Connors
+RSI(2) pullback, three-lower-closes pullback, turn-of-month, each on SPY and QQQ), daily segments,
+20 bp per side primary with a 10 bp secondary run, cumulative trials 278. 2,475 out-of-sample
+sessions 2017-01-03 → 2026-11-05. (The record's Markdown labels the segments "weekly"; they are
+daily, as the JSON's `config.rebalance = "B"` and `periods_per_year = 252` show.)
+
+**Verdict: FAIL** at 20 bp (Sharpe > SPY no, excess LB > 0 no, DSR 0.01 no, drawdown yes) and
+also at the descriptive 10 bp run.
+
+| series | 20 bp Sharpe | 20 bp ann. return | 20 bp max DD | 10 bp Sharpe | 10 bp ann. return |
+|---|---|---|---|---|---|
+| ensemble (top-3 of 6) | 0.22 | 1.4 % | −13.4 % | 0.67 | 4.9 % |
+| SPY buy-and-hold | 0.84 | 14.5 % | −33.7 % | 0.84 | 14.5 % |
+| 1/N over the 6 arms | 0.11 | 0.5 % | −11.7 % | 0.56 | |
+| `three_down_qqq` (best arm) | 0.35 | 1.7 % | −9.7 % | 0.72 | |
+| `turn_of_month_qqq` | 0.25 | 2.5 % | −31.7 % | 0.44 | |
+| `rsi2_spy` | −0.55 | −4.8 % | −41.1 % | 0.03 | |
+
+- Mean daily excess over SPY −0.053 % with a 95 % lower bound of −0.085 % at 20 bp; −0.071 % lower
+  bound at 10 bp. Turnover 20–49 round trips a year per arm: at 20 bp per side the rules pay
+  roughly their whole gross edge in costs, and at 10 bp they keep a Sharpe of 0.5–0.7 while in the
+  market a fifth of the time, which is still far below buy-and-hold on return.
+- RSI(2) on SPY is negative at both cost levels; the three-down and turn-of-month rules are mildly
+  positive at 10 bp and flat at 20 bp. None approaches SPY.
+
+Per the registration: no shadow book, no governance row; v5 (combinations of arms that beat SPY on
+Sharpe in their own look) is registered with 278 + its ensemble configurations, before its look.
