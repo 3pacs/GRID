@@ -21,7 +21,9 @@ aggregate endpoints keep the constant ``qq_<endpoint>``.
 
 from __future__ import annotations
 
+import json
 import os
+from collections import Counter
 import time
 from datetime import date, datetime
 from typing import Any
@@ -293,6 +295,59 @@ def _resolve_signal_date(rec: dict, endpoint_key: str, today: date) -> date:
     return today
 
 
+_DATE_KEYS = ("Ticker", "ticker", "Date", "date", "ReportDate")
+
+
+def _signal_value(rec: dict) -> dict:
+    """What ``signal_value`` stores for one record: everything but its ticker and date."""
+    return {k: v for k, v in rec.items() if k not in _DATE_KEYS}
+
+
+def _snapshot(pairs: Any) -> Counter:
+    """(ticker, signal_value) pairs as a comparable multiset; values are dicts or JSON text."""
+    out: Counter = Counter()
+    for ticker, value in pairs:
+        if isinstance(value, str):
+            value = json.loads(value)
+        out[(str(ticker or "").upper(), json.dumps(value, sort_keys=True, default=str))] += 1
+    return out
+
+
+_PREVIOUS_SNAPSHOT_SQL = text("""
+    SELECT signal_date, ticker, signal_value FROM signal_sources
+    WHERE source_type = :source_type
+      AND signal_date = (SELECT max(signal_date) FROM signal_sources
+                         WHERE source_type = :source_type AND signal_date < :today)
+""")
+
+
+def unchanged_snapshot_since(engine: Engine, records: list[dict], endpoint_key: str,
+                             source_type: str, today: date) -> date | None:
+    """The previous signal date whose rows equal this pull, for an undated snapshot.
+
+    Endpoints whose records carry no date of their own (wsb, political_beta)
+    are stamped with the pull date. When one returns exactly what was stored for
+    its previous date, storing it again would re-date old content as observed
+    today: QuiverQuant's /live/wallstreetbets returned one snapshot on all 133
+    pulls from 2026-04-03 to 2026-11-07, and Sleuth read the April ticker list
+    as fresh retail sentiment. Returns None when any record has its own date,
+    when there is no previous date, or when the content differs.
+    """
+    rows = [r for r in records if r.get("Ticker") or r.get("ticker")]
+    if not rows or any(_resolve_signal_date(r, endpoint_key, today) != today for r in rows):
+        return None
+    with engine.connect() as conn:
+        prior = conn.execute(_PREVIOUS_SNAPSHOT_SQL, {"source_type": source_type,
+                                                      "today": today}).fetchall()
+    if not prior:
+        return None
+    incoming = _snapshot((r.get("Ticker") or r.get("ticker"), _signal_value(r)) for r in rows)
+    if incoming != _snapshot((t, v) for _, t, v in prior):
+        return None
+    d = prior[0][0]
+    return d if isinstance(d, date) else date.fromisoformat(str(d)[:10])
+
+
 def _store_signals(
     engine: Engine,
     records: list[dict],
@@ -332,8 +387,7 @@ def _store_signals(
             signal_date = _resolve_signal_date(rec, endpoint_key, today)
 
             # Build signal_value as proper JSON
-            signal_value = {k: v for k, v in rec.items()
-                           if k not in ("Ticker", "ticker", "Date", "date", "ReportDate")}
+            signal_value = _signal_value(rec)
 
             # Determine signal_type from endpoint
             signal_type = endpoint_key
@@ -448,6 +502,21 @@ def pull_endpoint(
 
     try:
         records = _fetch_endpoint(cfg["path"], api_key)
+        try:
+            # The date _store_signals stamps on undated records.
+            since = unchanged_snapshot_since(engine, records, endpoint_key, cfg["source_type"],
+                                             date.today())  # noqa: DTZ011
+        except Exception as exc:  # noqa: BLE001 -- the comparison never blocks a pull
+            log.warning("QuiverQuant {}: unchanged-snapshot check failed ({}); storing as before",
+                        endpoint_key, exc)
+            since = None
+        if since is not None:
+            log.warning("QuiverQuant {}: {} records identical to the {} snapshot; nothing stored "
+                        "(an undated snapshot is not re-dated as today's)",
+                        endpoint_key, len(records), since)
+            time.sleep(_RATE_LIMIT)
+            return {"endpoint": endpoint_key, "status": "SUCCESS", "fetched": len(records),
+                    "stored": 0, "unchanged_since": since.isoformat()}
         rows = _store_signals(engine, records, cfg["source_type"], endpoint_key)
         log.info("QuiverQuant {}: {} records fetched, {} stored", endpoint_key, len(records), rows)
         time.sleep(_RATE_LIMIT)
@@ -493,5 +562,7 @@ def pull_all(engine: Engine) -> list[dict[str, Any]]:
         results.append(result)
     total = sum(r.get("stored", 0) for r in results)
     ok = sum(1 for r in results if r["status"] == "SUCCESS")
-    log.info("QuiverQuant: {}/{} endpoints succeeded, {} total rows stored", ok, len(ENDPOINTS), total)
+    unchanged = sorted(r["endpoint"] for r in results if r.get("unchanged_since"))
+    log.info("QuiverQuant: {}/{} endpoints succeeded, {} total rows stored{}", ok, len(ENDPOINTS),
+             total, f"; unchanged snapshots not stored: {', '.join(unchanged)}" if unchanged else "")
     return results
