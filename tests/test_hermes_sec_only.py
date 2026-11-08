@@ -608,7 +608,12 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # claude/retire-tiingo-fundamentals-20261108): the only scheduler
         # edit is a hold_reason on the tiingo_fundamentals registry entry
         # (owner retired it). Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','0ae04652dd9d5d49733184648b10bf5e7a9d20474fa963b2427e867d7254d03e')]:
+        # SCHED re-pinned 0ae04652 -> 8add8ca5 (2026-11-08,
+        # claude/hermes-residuals-20261108): the only scheduler edit is the
+        # unusual_whales registry entry, timeout_s 60 -> 240 with a trailing
+        # comment (a 30-ticker scan takes ~126 s). Needs reviewer acceptance
+        # like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','8add8ca58cbe23eeb5a894a779aab2e2cc2b8bcea121c8aa073f1b4ff536b034')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
