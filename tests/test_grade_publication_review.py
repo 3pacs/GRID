@@ -13,6 +13,7 @@ import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -400,10 +401,10 @@ def test_extraction_failures_become_an_unscorable_row_not_a_crash(tmp_path, clos
     rows, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: FakeClient(reply))
     [row] = rows
     assert row["verdict"] == "unscorable" and reason in row["root_cause"]
-    # a failed extraction is not cached as a success: the next run calls the model again
+    # a reply-shaped failure is deterministic at temperature 0: cached, the next run does not pay for it again
     client = FakeClient("[]")
-    grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: client)
-    assert client.calls == 1
+    rows2, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: client)
+    assert client.calls == 0 and reason in rows2[0]["root_cause"]
 
 
 def test_no_provider_and_raising_provider(tmp_path, closes):
@@ -417,6 +418,28 @@ def test_no_provider_and_raising_provider(tmp_path, closes):
 
     rows, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: Boom("[]"))
     assert "provider error: TimeoutError" in rows[0]["root_cause"]
+    # transient faults are never cached: the next run with a working client extracts
+    client = FakeClient("[]")
+    grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: client)
+    assert client.calls == 1
+
+
+def test_extraction_asks_a_llama_client_to_skip_thinking_and_leaves_other_clients_alone():
+    class Llama:
+        is_available = True
+        model = "qwen"
+        seen: ClassVar[dict] = {}
+
+        def chat(self, messages, model=None, temperature=0.3, num_predict=None, system_knowledge=None,
+                 extra_metadata=None, enable_thinking=None):
+            Llama.seen.update(num_predict=num_predict, enable_thinking=enable_thinking, temperature=temperature)
+            return "[]"
+
+    out = grader.extract_claims(Llama(), "some narrative window text here")
+    assert out.error is None and Llama.seen == {"num_predict": grader.EXTRACTION_NUM_PREDICT, "enable_thinking": False,
+                                                "temperature": 0.0}
+    # FakeClient.chat takes **kwargs: the router forwards nothing provider-specific to it
+    assert grader._thinking_off(FakeClient("[]")) == {}
 
 
 def test_empty_extraction_on_a_narrative_is_reported(tmp_path, closes):
