@@ -33,7 +33,12 @@ from loguru import logger as log
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata.quiverquant_identity import feed_source_id, feed_source_id_sql
+from ingestion.altdata.quiverquant_identity import (
+    calendar_dated_leftover_sql,
+    feed_source_id,
+    feed_source_id_sql,
+    is_calendar_dated_leftover,
+)
 from ingestion.altdata import quiverquant_transactions as tx
 
 
@@ -674,7 +679,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "scored": 0, "correct": 0, "wrong": 0, "expired": 0,
         "skipped_no_price": 0, "skipped_unpriceable": 0,
-        "skipped_unknown_direction": 0,
+        "skipped_unknown_direction": 0, "skipped_qq_gov_leftover": 0,
     }
 
     # One price lookup per (ticker, date) per cycle, and once a ticker has
@@ -712,6 +717,13 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             # Determine evaluation window for this source type
             eval_days = EVALUATION_WINDOWS.get(src_type, 7)
             signal_dt = signal_date if isinstance(signal_date, date) else signal_date.date()
+
+            # A gov_contracts row the fiscal re-date could not move sits one
+            # quarter late (often in the future) and would be scored as the
+            # next quarter's award: never score it, never expire it.
+            if src_type == QQ_GOV_CONTRACTS and is_calendar_dated_leftover(signal_dt, signal_value):
+                summary["skipped_qq_gov_leftover"] += 1
+                continue
 
             # Not enough time has passed yet
             if (today - signal_dt).days < eval_days:
@@ -917,30 +929,45 @@ def rescore_source_type(
 # dead band), INELIGIBLE and not-yet-scored rows count as neither.
 OUTCOME_BASIS_LEGACY = "legacy:signal_sources.outcome"
 
-_LEGACY_SCORED_ROWS_SQL = """
+QQ_GOV_CONTRACTS = "quiverquant:gov_contracts"
+
+
+def _not_qq_gov_leftover(alias: str = "") -> str:
+    """``NOT (...)`` for the gov_contracts rows the fiscal re-date left one
+    quarter late (``is_calendar_dated_leftover``): duplicates of a quarter that
+    already has its fiscal row, or a quarter whose fiscal slot is held. Their
+    outcomes, scored at the wrong date, are not trust evidence."""
+    return (f"NOT ({alias}source_type = '{QQ_GOV_CONTRACTS}' AND "
+            f"{calendar_dated_leftover_sql(f'{alias}signal_date', f'{alias}signal_value')})")
+
+
+_LEGACY_SCORED_ROWS_SQL = f"""
             SELECT source_type, source_id, outcome, outcome_return, signal_date, ticker
             FROM signal_sources
             WHERE outcome IN ('CORRECT', 'WRONG')
+              AND {_not_qq_gov_leftover()}
             ORDER BY source_type, source_id, signal_date DESC
         """
 
-_CORRECTED_SCORED_ROWS_SQL = """
+_CORRECTED_SCORED_ROWS_SQL = f"""
             SELECT s.source_type, s.source_id, o.outcome, o.raw_return, o.signal_date, s.ticker
             FROM signal_source_outcomes o
             JOIN signal_sources s ON s.id = o.signal_source_id
             WHERE o.evaluation_version = :version
               AND o.outcome IN ('CORRECT', 'WRONG')
+              AND {_not_qq_gov_leftover("s.")}
             ORDER BY s.source_type, s.source_id, o.signal_date DESC
         """
 
 # Neither-hit-nor-miss outcomes, per raw source_id: a source with only these
 # still gets a (prior) trust score instead of keeping a stale legacy one.
-_CORRECTED_NEUTRAL_COUNTS_SQL = """
+_CORRECTED_NEUTRAL_COUNTS_SQL = f"""
             SELECT s.source_type, s.source_id, o.outcome, COUNT(*), MAX(o.signal_date)
             FROM signal_source_outcomes o
             JOIN signal_sources s ON s.id = o.signal_source_id
             WHERE o.evaluation_version = :version
               AND o.outcome IN ('NO_MOVE', 'INELIGIBLE')
+              AND {_not_qq_gov_leftover("s.")}
             GROUP BY s.source_type, s.source_id, o.outcome
         """
 

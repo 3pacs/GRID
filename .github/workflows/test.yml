@@ -229,6 +229,19 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
 
+      # QuiverQuant gov_contracts rows the 2026-11-07 fiscal re-date could not
+      # move: the SQL mirror must flag what the Python helper flags, and the
+      # trust inputs and the corporate money-flow layer must leave them out.
+      # REQUIRE_QQ_GOV_LEFTOVERS_PG turns a missing DB URL into a failure.
+      - name: QuiverQuant gov_contracts leftovers PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_QQ_GOV_LEFTOVERS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_qq_gov_calendar_leftovers_pg.py -q -rA
+
       # tests/test_get_side_effects_readonly_pg.py: the general "Run tests"
       # step above uses -n auto/--dist loadgroup and doesn't surface
       # per-file skip/pass results in its tail -300 log, so a silent skip
