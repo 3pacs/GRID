@@ -42,10 +42,14 @@ OI_FILES: list[dict[str, str]] = [
         "value_col": "spend_all_q4",
         "feature": "oi_spend_high_income",
     },
+    # The daily national employment file (emp_combined) was dropped upstream;
+    # the tracker now publishes weekly national employment, dated by
+    # year/month/day_endofweek (404 on the old name since at least 2026-11-06).
     {
-        "filename": "Employment - National - Daily.csv",
+        "filename": "Employment - National - Weekly.csv",
         "date_col": "date",
-        "value_col": "emp_combined",
+        "day_col": "day_endofweek",
+        "value_col": "emp",
         "feature": "oi_employment_overall",
     },
 ]
@@ -84,7 +88,24 @@ class OppInsightsPuller(BasePuller):
         from io import StringIO
         return pd.read_csv(StringIO(resp.text))
 
-    def _parse_oi_date(self, row: pd.Series, date_col: str) -> date | None:
+    def _latest_stored_values(self, series_id: str, conn: Any) -> dict[date, float]:
+        """Latest SUCCESS value per obs_date this source stored for ``series_id``.
+
+        Replaces the 1-hour ``_row_exists`` window: every pull more than an
+        hour after the last one re-inserted the whole frozen history, leaving
+        ~2.5M rows for 3,924 (series, date) pairs on source 347 (2026-11-08).
+        """
+        rows = conn.execute(
+            text(
+                "SELECT DISTINCT ON (obs_date) obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date, pull_timestamp DESC"
+            ),
+            {"sid": series_id, "src": self.source_id},
+        ).fetchall()
+        return {r[0]: float(r[1]) for r in rows if r[1] is not None}
+
+    def _parse_oi_date(self, row: pd.Series, date_col: str, day_col: str = "day") -> date | None:
         """Parse OI date format.
 
         Some OI files use year/month/day as separate columns, others use
@@ -100,7 +121,7 @@ class OppInsightsPuller(BasePuller):
         try:
             year = int(row.get("year", 0))
             month = int(row.get("month", 0))
-            day = int(row.get("day", 1))
+            day = int(row.get(day_col, 1))
             if year and month:
                 return date(year, month, day)
         except (ValueError, TypeError):
@@ -114,6 +135,7 @@ class OppInsightsPuller(BasePuller):
         date_col: str,
         value_col: str,
         feature_name: str,
+        day_col: str = "day",
     ) -> dict[str, Any]:
         """Pull a single OI file and extract the specified column."""
         log.info("Pulling OI {fn} from {f}", fn=feature_name, f=filename)
@@ -138,9 +160,10 @@ class OppInsightsPuller(BasePuller):
 
             inserted = 0
             with self.engine.begin() as conn:
+                stored = self._latest_stored_values(feature_name, conn)
                 for _, row in df.iterrows():
                     try:
-                        obs_dt = self._parse_oi_date(row, date_col)
+                        obs_dt = self._parse_oi_date(row, date_col, day_col)
                         if obs_dt is None:
                             continue
 
@@ -149,7 +172,7 @@ class OppInsightsPuller(BasePuller):
                             continue
                         value = float(val)
 
-                        if self._row_exists(feature_name, obs_dt, conn):
+                        if stored.get(obs_dt) == value:
                             continue
 
                         conn.execute(
@@ -160,6 +183,7 @@ class OppInsightsPuller(BasePuller):
                             ),
                             {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
                         )
+                        stored[obs_dt] = value
                         inserted += 1
                     except (ValueError, TypeError) as row_exc:
                         log.debug("Skipping OI row: {err}", err=str(row_exc))
@@ -180,33 +204,16 @@ class OppInsightsPuller(BasePuller):
 
         try:
             with self.engine.begin() as conn:
-                q4_rows = conn.execute(
-                    text(
-                        "SELECT obs_date, value FROM raw_series "
-                        "WHERE series_id = 'oi_spend_high_income' AND source_id = :src "
-                        "AND pull_status = 'SUCCESS' ORDER BY obs_date"
-                    ),
-                    {"src": self.source_id},
-                ).fetchall()
-
-                q1_rows = conn.execute(
-                    text(
-                        "SELECT obs_date, value FROM raw_series "
-                        "WHERE series_id = 'oi_spend_low_income' AND source_id = :src "
-                        "AND pull_status = 'SUCCESS' ORDER BY obs_date"
-                    ),
-                    {"src": self.source_id},
-                ).fetchall()
-
-                q4_dict = {r[0]: r[1] for r in q4_rows}
-                q1_dict = {r[0]: r[1] for r in q1_rows}
+                q4_dict = self._latest_stored_values("oi_spend_high_income", conn)
+                q1_dict = self._latest_stored_values("oi_spend_low_income", conn)
+                stored = self._latest_stored_values("oi_k_shape_ratio", conn)
 
                 common_dates = set(q4_dict.keys()) & set(q1_dict.keys())
                 inserted = 0
 
                 for obs_dt in sorted(common_dates):
                     k_shape = q4_dict[obs_dt] - q1_dict[obs_dt]
-                    if not self._row_exists("oi_k_shape_ratio", obs_dt, conn):
+                    if stored.get(obs_dt) != k_shape:
                         conn.execute(
                             text(
                                 "INSERT INTO raw_series "
@@ -240,6 +247,7 @@ class OppInsightsPuller(BasePuller):
                 file_def["date_col"],
                 file_def["value_col"],
                 file_def["feature"],
+                file_def.get("day_col", "day"),
             )
             results.append(res)
             time.sleep(_RATE_LIMIT_DELAY)

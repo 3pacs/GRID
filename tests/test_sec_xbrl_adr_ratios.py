@@ -453,12 +453,23 @@ def test_accounting_deadline_expiry_after_fact_stops_no_writer(monkeypatch):
     assert out[-1]["unknown"] == 1 and out[-1]["unattempted"] == 1
 
 
-def test_accounting_missing_cik_or_facts_are_not_clean_empty(monkeypatch):
+def test_accounting_missing_facts_are_not_clean_empty(monkeypatch):
     from ingestion.smart_scheduler import _classify_outcome
     puller = _setup_accounting_puller(monkeypatch)
     monkeypatch.setattr(mod, "_fetch_company_facts", lambda _: None)
     assert _classify_outcome(puller.pull_all(tickers=["A"]))[:2] == ("FAILED", 0)
-    assert _classify_outcome(puller.pull_all(tickers=["UNKNOWN"]))[:2] == ("FAILED", 0)
+
+
+def test_accounting_ticker_without_cik_is_clean_empty(monkeypatch):
+    # A ticker absent from SEC's full ticker map is not an SEC filer (ETFs,
+    # foreign OTC lines, acquired companies: 141 of the 1,268 sector-map
+    # tickers on 2026-11-08). Counting it FAILED kept every run PARTIAL.
+    # An empty map still raises ("cik map empty") before any ticker.
+    from ingestion.smart_scheduler import _classify_outcome
+    puller = _setup_accounting_puller(monkeypatch)
+    out = puller.pull_all(tickers=["UNKNOWN"])
+    assert out[0]["reason"] == "no_cik"
+    assert _classify_outcome(out)[:2] == ("NO_NEW_DATA", 0)
 
 
 def test_accounting_close_query_failure_propagates():

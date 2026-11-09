@@ -91,7 +91,7 @@ def test_gdelt_bounded_recent_skips_heavy_sections(monkeypatch) -> None:
 
     calls = {"themes": 0, "actors": 0, "tensions": 0, "signals": 0}
 
-    def fake_fetch(query, mode, timespan):
+    def fake_fetch(query, mode, timespan, run=None):
         calls["themes"] += 1
         assert timespan == "1d"
         return {"timeline": []}
@@ -100,7 +100,7 @@ def test_gdelt_bounded_recent_skips_heavy_sections(monkeypatch) -> None:
     monkeypatch.setattr(puller, "_pull_actor_tones", lambda: calls.__setitem__("actors", 1) or 0)
     monkeypatch.setattr(puller, "_pull_tension_scores", lambda: calls.__setitem__("tensions", 1) or 0)
     monkeypatch.setattr(puller, "_emit_tension_signals", lambda: calls.__setitem__("signals", 1) or 0)
-    monkeypatch.setattr(gdelt, "time", types.SimpleNamespace(sleep=lambda _seconds: None))
+    monkeypatch.setattr(gdelt, "time", types.SimpleNamespace(sleep=lambda _seconds: None, monotonic=lambda: 0.0))
 
     result = puller.pull_recent(
         days_back=1,
@@ -114,16 +114,23 @@ def test_gdelt_bounded_recent_skips_heavy_sections(monkeypatch) -> None:
     assert calls == {"themes": 2, "actors": 0, "tensions": 0, "signals": 0}
 
 
-def test_gdelt_rate_limit_is_clean_skip(monkeypatch) -> None:
+def test_gdelt_rate_limit_raises_for_the_run_to_stop(monkeypatch) -> None:
+    # 2026-11-09: a 429 no longer comes back as an empty SKIPPED timeline;
+    # the shared gate starts a host-wide cooldown and raises, so the run
+    # stops sending (see tests/test_gdelt_rate_limit_20261109.py).
     from ingestion.altdata import gdelt
+    from ingestion.altdata.gdelt_doc import GDELTRateLimited
 
-    response = types.SimpleNamespace(status_code=429, raise_for_status=lambda: None)
+    response = types.SimpleNamespace(status_code=429, headers={}, raise_for_status=lambda: None)
     monkeypatch.setattr(gdelt.requests, "get", lambda *args, **kwargs: response)
 
     puller = gdelt.GDELTPuller.__new__(gdelt.GDELTPuller)
-    result = puller._fetch_gdelt_api("economy recession", "timelineTone", "1d")
+    run = gdelt._DocRun.with_budget(60)  # 25 s slot wait < the 60 s cooldown
+    with pytest.raises(GDELTRateLimited) as caught:
+        puller._fetch_gdelt_api("economy recession", "timelineTone", "1d", run=run)
 
-    assert result == {"timeline": [], "status": "SKIPPED", "http_status": 429}
+    assert caught.value.sent is True
+    assert run.sent == 1 and run.answered == 0
 
 
 class _NullContext:

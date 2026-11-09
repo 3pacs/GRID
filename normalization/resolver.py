@@ -834,6 +834,19 @@ class Resolver:
         except Exception as exc:
             log.error("Failed to load entity map: {e}", e=str(exc))
             return _summary(errors=1)
+        # One price basis per feature. Candidates are resolved per series_id,
+        # so two price fields mapped onto one feature race for the same
+        # (feature, obs_date, vintage) and the feature's vintages alternate
+        # between raw and adjusted closes (the 2026-11-08 ``*_full`` panel
+        # corruption). The entity map forbids it statically; this is the
+        # run-time tripwire should a mapping regress.
+        mixed = getattr(entity_map, "mixed_basis_features", lambda: {})()
+        if mixed:
+            log.warning(
+                "Resolver: {n} feature(s) are fed by more than one price basis "
+                "(close + adj_close) -- their vintages will mix bases: {f}",
+                n=len(mixed), f=sorted(mixed),
+            )
         feature_families: dict[int, str] = {}
         try:
             with self.engine.connect() as conn:

@@ -47,9 +47,15 @@ _REQUEST_TIMEOUT: int = 30
 # 401 {"error":{"message":"Invalid Api Token..."}}. The token is read from
 # the environment (the hermes/scheduler units load the repo .env).
 _API_TOKEN_ENV: str = "OPENCORPORATES_API_TOKEN"
+# Starts with smart_scheduler.MISSING_API_KEY_PREFIX ("Missing API key: ") so
+# SmartScheduler._log_run records the skip in pull_log as SUCCESS / 0 rows /
+# "SKIPPED: Missing API key: ..." (pipeline-health: skipped_config). Any other
+# puller-reported skip is not logged, so pull_log kept showing the last
+# pre-fix FAILED "puller did not report committed write count" (2026-11-05)
+# while every run since skipped for the missing token (fixed 2026-11-09).
 _NO_TOKEN_REASON: str = (
-    f"{_API_TOKEN_ENV} not set; api.opencorporates.com requires an API token "
-    "(unauthenticated calls return 401 Invalid Api Token)"
+    f"Missing API key: {_API_TOKEN_ENV} (api.opencorporates.com requires an "
+    "API token; unauthenticated calls return 401 Invalid Api Token)"
 )
 _NO_INPUT_REASON: str = (
     "no ICIJ officer rows (OFFSHORE:*) to cross-reference "

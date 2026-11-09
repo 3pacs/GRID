@@ -307,3 +307,19 @@ query. The real EDGAR SELECT already required SUCCESS and remains unchanged.
 Removed that obsolete allowlist slot without altering the scanner or weakening
 the guard. All 157 focused tests (including both guard tests) passed together
 with outbound sockets blocked. A fresh full CI run is required for this fix.
+
+
+## 2026-11-09 - AV draft integration after publication-review landing
+
+- Integrated main cd55457 into existing draft #1051 and preserved both sides of
+  the append-only log conflict. No source consumer contract was changed.
+- Found sibling AV and publication-review migration heads. Added a no-op merge
+  revision preserving both parent histories and refusing unsafe downgrade.
+- 144 focused offline AV/analyzer/date/digest/raw-read and migration-graph tests
+  passed, with 2 subtests and outbound socket connections blocked. The new graph
+  test initially missed annotated metadata; corrected it before the passing run.
+- Changed-file Ruff and authored-diff checks passed. No actual PostgreSQL replay
+  or full repository suite was rerun locally; new-head hosted CI is still needed.
+- Shared-account budgeting, delayed-dispatch pacing, historical reconciliation,
+  metadata breadth and separate canary approval remain rollout gates. No provider
+  calls, production access, scheduler changes, merge to main or deployment.

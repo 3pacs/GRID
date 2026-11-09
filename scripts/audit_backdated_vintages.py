@@ -10,7 +10,8 @@ series. Per feature this script reports, with bounded queries:
   ``vintage_date = obs_date`` too;
 * ``first_raw_pull``: the earliest SUCCESS ``raw_series.pull_timestamp`` over the
   feature's mapped series ids (``normalization.entity_map`` seeds, plus
-  ``YF:<TICKER>:close`` for ``<ticker>_full``, plus ``--series`` overrides).
+  ``YF:<TICKER>:close`` and ``YF:<TICKER>:adj_close`` for ``<ticker>_full``,
+  plus ``--series`` overrides).
   Every source is counted: Tiingo also writes ``YF:<TICKER>:close`` (under its
   own source id), so its pulls are included;
 * ``backdated_before_first_pull``: backdated rows whose ``obs_date`` precedes
@@ -78,12 +79,29 @@ def check_window(now: datetime, allow: bool = False) -> None:
 
 
 def mapped_series(feature: str, overrides: dict[str, list[str]] | None = None) -> list[str]:
-    """Raw series ids that resolve into ``feature`` (static mappings, no DB)."""
-    from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
+    """Raw series ids whose first pull bounds ``feature``'s honest vintages (static, no DB).
+
+    A ``{ticker}_full`` feature is fed by exactly one yfinance price field
+    under the PRICE BASIS POLICY (``normalization.entity_map``): ``adj_close``,
+    or ``close`` for the ``RAW_CLOSE_FULL_FEATURES`` allowlist (``spy_full`` by
+    the price-close receipt contract). Before 2026-11-08 ``close`` fed every
+    ``_full`` too, and those resolved rows are still in the table, so the legacy
+    ``close`` series is always included as well: the earliest SUCCESS pull of
+    either field is the floor below which a vintage cannot be honest.
+    """
+    from normalization.entity_map import (
+        FULL_PRICE_BASIS_FIELD,
+        NEW_MAPPINGS_V2,
+        RAW_CLOSE_FULL_FEATURES,
+        SEED_MAPPINGS,
+    )
 
     series = {sid for sid, name in {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}.items() if name == feature}
     if feature.endswith("_full"):
-        series.add(f"YF:{feature[: -len('_full')].upper().replace('_', '-')}:close")
+        ticker = feature[: -len("_full")].upper().replace("_", "-")
+        basis = "close" if feature in RAW_CLOSE_FULL_FEATURES else FULL_PRICE_BASIS_FIELD
+        series.add(f"YF:{ticker}:{basis}")
+        series.add(f"YF:{ticker}:close")  # legacy feed of every _full before 2026-11-08
     series.update((overrides or {}).get(feature, []))
     return sorted(series)
 

@@ -31,6 +31,7 @@ def _fresh_schedule(monkeypatch):
     monkeypatch.setattr(hf, "_DIAGNOSIS_CACHE", {})
     monkeypatch.setattr(hf, "_THROTTLED_WARNINGS", {})
     monkeypatch.setattr(hf, "_REPEATED_FAILURES", {})
+    monkeypatch.setattr(hf, "_REPAIR_RECOVERED_AT", {})
     monkeypatch.setattr(hf, "_REPAIRS_IN_FLIGHT", {})
     monkeypatch.setattr(hf, "_relation_exists", lambda *_a: True)
     monkeypatch.setattr(hf, "log_issue", MagicMock())
@@ -518,5 +519,7 @@ def test_diagnose_escalates_a_dead_source_after_repeated_failures(monkeypatch):
     state = OperatorState()
     for _ in range(4):
         state.cooldowns = OperatorState().cooldowns  # ignore the ordinary backoff
-        hf.diagnose_and_fix_pulls(_engine(["Baltic_Exchange"]), False, state)
-    assert calls == ["Baltic_Exchange"] * 3, "the 4th pass skips the dead source"
+        # Not a real source name: Baltic_Exchange is held (retired 2026-11-04)
+        # and held sources never reach a repair.
+        hf.diagnose_and_fix_pulls(_engine(["SYNTH_DEAD"]), False, state)
+    assert calls == ["SYNTH_DEAD"] * 3, "the 4th pass skips the dead source"
