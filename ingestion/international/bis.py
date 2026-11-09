@@ -34,7 +34,14 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 #                  all reporting countries (5J) vs all counterparties (5J), USD mn
 #   WS_SPP         selected residential property prices; XW = world
 #                  aggregate, R = real, 628 = index 2010=100
+#   WS_TC          total credit; P = private non-financial sector, A = all
+#                  lenders, M = market value, 770 = % of GDP, A = adjusted
+#                  for breaks. 2026-11-09: moved here from the DBnomics
+#                  mirror, which stops at 2024-Q4 (143.0) while BIS itself
+#                  publishes to 2026-Q1 (139.7); us_credit_gdp_bis had never
+#                  stored a row, so no source mixing.
 BIS_SERIES_LIST: dict[str, str] = {
+    "WS_TC/Q.US.P.A.M.770.A": "us_credit_gdp_bis",
     "WS_CREDIT_GAP/Q.US.P.A.C": "bis_credit_gdp_gap_us",
     "WS_CREDIT_GAP/Q.CN.P.A.C": "bis_credit_gdp_gap_cn",
     "WS_CREDIT_GAP/Q.DE.P.A.C": "bis_credit_gdp_gap_de",
@@ -112,9 +119,17 @@ class BISPuller(BasePuller):
 
             inserted = 0
             with self.engine.begin() as conn:
+                # Insert a vintage only when the value is new or revised. The
+                # 1-hour _row_exists window re-inserted the whole 2-year
+                # lookback on every run (bis_credit_gdp_gap_us: 108 rows for
+                # 9 dates on 2026-11-09).
+                stored = self._latest_stored_values(
+                    feature_name, conn, start_date=min(d for d, _ in observations),
+                )
                 for obs_date_val, value in observations:
-                    if self._row_exists(feature_name, obs_date_val, conn):
+                    if stored.get(obs_date_val) == value:
                         continue
+                    stored[obs_date_val] = value
                     conn.execute(
                         text(
                             "INSERT INTO raw_series "

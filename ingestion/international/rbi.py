@@ -102,10 +102,19 @@ class RBIPuller(BasePuller):
     def _insert_observations(self, feature_name: str, observations: list[tuple[date, float]]) -> int:
         """Insert a list of (obs_date, value) tuples into raw_series."""
         inserted = 0
+        if not observations:
+            return 0
         with self.engine.begin() as conn:
+            # New or revised values only; the 1-hour _row_exists window
+            # re-inserted the 2-year lookback every run (india_iip_yoy:
+            # 2,626 rows for 218 dates on 2026-11-09).
+            stored = self._latest_stored_values(
+                feature_name, conn, start_date=min(d for d, _ in observations),
+            )
             for obs_dt, value in observations:
-                if self._row_exists(feature_name, obs_dt, conn):
+                if stored.get(obs_dt) == value:
                     continue
+                stored[obs_dt] = value
                 conn.execute(
                     text(
                         "INSERT INTO raw_series "

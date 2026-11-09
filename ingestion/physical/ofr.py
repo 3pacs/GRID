@@ -1,13 +1,38 @@
 """
-GRID OFR Financial Stability Monitor ingestion module.
+GRID OFR (Office of Financial Research) ingestion module.
 
-Pulls financial stability data from the Office of Financial Research (OFR).
-Covers FSM category scores (credit, funding, leverage), Financial Stress
-Index (FSI), and Short-Term Funding Monitor (STFM) data.
+Pulls the OFR Financial Stress Index (FSI) with its five category
+sub-indices, and the overnight repo rate / volume from the OFR
+Short-Term Funding Monitor (STFM) API.
+
+2026-11-09 rebuild (probed from precision5520, fetch only):
+
+* Financial Stability Monitor (FSM): retired upstream.
+  ``www.financialresearch.gov/financial-stability-monitor/`` and every
+  ``.../download/`` URL the puller tried answer HTTP 404, and the OFR data
+  API lists no FSM dataset (``/v1/series/dataset?dataset=fsm`` -> 400
+  "Available datasets are: ['all', 'nypd', 'mmf', 'repo', 'fnyr', 'tyld']").
+  ``ofr_fsm_*`` had never stored a row. The FSI file already carries the
+  OFR's own category decomposition (credit, equity valuation, safe assets,
+  funding, volatility), so those replace the FSM category scores.
+* STFM: the ``/short-term-funding-monitor/download/`` pages are 404 and
+  ``data.financialresearch.gov/v1/short-term-funding-monitor/download/`` is
+  403 "Missing Authentication Token" (not a route). The documented,
+  keyless STFM API serves each series by mnemonic:
+  ``/v1/series/timeseries?mnemonic=REPO-DVP_AR_OO-P`` -> ``[[date, value]]``.
+  The preliminary (``-P``) DVP overnight series are current to the previous
+  business day; the final (``-F``) ones lag by months (last 2026-06-30).
+  ``ofr_repo_volume`` / ``ofr_repo_rate_1d`` had never stored a row.
+* FSI: unchanged URL, but the 1-hour ``_row_exists`` window re-inserted the
+  full 2000-to-date history on every daily run (1,766,133 ofr_fsi rows for
+  6,795 dates on 2026-11-09). Rows are now written only when new or revised.
 """
 
 from __future__ import annotations
 
+import math
+from datetime import date, timedelta
+from io import StringIO
 from typing import Any
 
 import pandas as pd
@@ -15,17 +40,51 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
-from tenacity import retry, stop_after_attempt, wait_exponential  # noqa: F401
 
-# OFR dataset endpoints
+from ingestion.base import BasePuller
+
+# OFR datasets this puller covers -> primary feature
 OFR_DATASETS: dict[str, str] = {
-    "short-term-funding-monitor": "ofr_stfm_data",
+    "short-term-funding-monitor": "ofr_repo_rate_1d",
     "financial-stress-index": "ofr_fsi",
 }
 
-_OFR_BASE_URL = "https://financialresearch.gov/data"
-_RATE_LIMIT_DELAY: float = 2.0
+_OFR_BASE_URL = "https://www.financialresearch.gov"
+_FSI_URL = f"{_OFR_BASE_URL}/financial-stress-index/data/fsi.csv"
+_STFM_API_URL = "https://data.financialresearch.gov/v1/series/timeseries"
+_REQUEST_TIMEOUT: int = 30
+
+# FSI CSV column -> feature. The headline index keeps its historical id.
+FSI_COLUMNS: dict[str, str] = {
+    "OFR FSI": "ofr_fsi",
+    "Credit": "ofr_fsi_credit",
+    "Equity valuation": "ofr_fsi_equity_valuation",
+    "Safe assets": "ofr_fsi_safe_assets",
+    "Funding": "ofr_fsi_funding",
+    "Volatility": "ofr_fsi_volatility",
+}
+
+# STFM API mnemonic -> feature (DVP service, overnight/open, preliminary).
+STFM_SERIES: dict[str, str] = {
+    "REPO-DVP_AR_OO-P": "ofr_repo_rate_1d",   # average rate, percent
+    "REPO-DVP_TV_OO-P": "ofr_repo_volume",    # transaction volume, USD
+}
+
+# Incremental windows: once a feature has history, only observations this
+# close to its latest stored date are compared, so a daily run does not
+# re-read 26 years of FSI vintages. Late revisions inside the window are
+# still written (new or revised values only).
+_FSI_LOOKBACK_DAYS: int = 90
+_STFM_LOOKBACK_DAYS: int = 30
+
+
+def _finite(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or None."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) or math.isinf(f) else f
 
 
 class OFRPuller(BasePuller):
@@ -38,138 +97,74 @@ class OFRPuller(BasePuller):
         super().__init__(db_engine)
         log.info("OFRPuller initialised — source_id={sid}", sid=self.source_id)
 
-    def _fetch_csv(self, url: str) -> pd.DataFrame | None:
-        """Fetch CSV data from OFR website.
+    # ------------------------------------------------------------------
+    # HTTP
+    # ------------------------------------------------------------------
 
-        Handles endpoint changes gracefully: logs a warning on 400/403/404
-        instead of retrying indefinitely or crashing.  Retries up to 3 times
-        on transient network errors only.
-        """
-        try:
-            resp = requests.get(url, timeout=30)
-        except requests.RequestException as exc:
-            log.warning("OFR request failed for {u}: {e}", u=url, e=str(exc))
-            return None
-        if resp.status_code == 200:
-            from io import StringIO
-            return pd.read_csv(StringIO(resp.text))
-        if resp.status_code in (400, 403, 404):
-            log.warning(
-                "OFR endpoint returned {code} for {url} — endpoint may have changed. "
-                "Skipping gracefully.",
-                code=resp.status_code,
-                url=url,
+    def _fetch_csv(self, url: str) -> pd.DataFrame:
+        """Fetch a CSV; raises ``requests.RequestException`` on failure."""
+        resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return pd.read_csv(StringIO(resp.text))
+
+    def _fetch_stfm(self, mnemonic: str, start: date | None) -> list[tuple[date, float]]:
+        """Fetch one STFM series as sorted ``(date, value)`` pairs (nulls dropped)."""
+        params: dict[str, str] = {"mnemonic": mnemonic}
+        if start is not None:
+            params["start_date"] = start.isoformat()
+        resp = requests.get(_STFM_API_URL, params=params, timeout=_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list):
+            raise TypeError(f"OFR STFM {mnemonic}: expected a list, got {type(payload).__name__}")
+        out: list[tuple[date, float]] = []
+        for item in payload:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            value = _finite(item[1])
+            if value is None:
+                continue
+            try:
+                obs_dt = date.fromisoformat(str(item[0])[:10])
+            except ValueError:
+                continue
+            out.append((obs_dt, value))
+        out.sort()
+        return out
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    def _store(self, conn: Any, feature: str, observations: list[tuple[date, float]]) -> int:
+        """Insert new or revised observations of one feature; returns rows written."""
+        if not observations:
+            return 0
+        stored = self._latest_stored_values(
+            feature, conn, start_date=min(d for d, _ in observations),
+        )
+        inserted = 0
+        for obs_dt, value in observations:
+            if stored.get(obs_dt) == value:
+                continue
+            conn.execute(
+                text(
+                    "INSERT INTO raw_series "
+                    "(series_id, source_id, obs_date, value, pull_status) "
+                    "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                ),
+                {"sid": feature, "src": self.source_id, "od": obs_dt, "val": value},
             )
-            return None
-        log.warning("OFR unexpected status {code} for {url}", code=resp.status_code, url=url)
-        return None
+            stored[obs_dt] = value
+            inserted += 1
+        return inserted
 
-    def pull_fsm(self) -> dict[str, Any]:
-        """Pull OFR Financial Stability Monitor data.
-
-        Extracts category scores for Credit, Funding, Leverage, Risk Appetite,
-        and computes overall composite score.
-        """
-        log.info("Pulling OFR Financial Stability Monitor")
-        result: dict[str, Any] = {
-            "series_id": "ofr_fsm",
-            "rows_inserted": 0,
-            "status": "SUCCESS",
-            "errors": [],
-        }
-
-        try:
-            # OFR FSM data download endpoint — try current and legacy URLs
-            df = None
-            for url in [
-                "https://www.financialresearch.gov/financial-stability-monitor/download/",
-                "https://financialresearch.gov/financial-stability-monitor/download/",
-                "https://data.financialresearch.gov/v1/financial-stability-monitor/download/",
-            ]:
-                df = self._fetch_csv(url)
-                if df is not None and not df.empty:
-                    break
-
-            if df is None or df.empty:
-                result["status"] = "PARTIAL"
-                result["errors"].append("FSM data not available")
-                return result
-
-            # FSM categories to extract
-            category_map = {
-                "credit": "ofr_fsm_credit",
-                "funding": "ofr_fsm_funding",
-                "leverage": "ofr_fsm_leverage",
-            }
-
-            inserted = 0
-            with self.engine.begin() as conn:
-                for _, row in df.iterrows():
-                    try:
-                        # Find date column
-                        date_val = None
-                        for col in ["Date", "date", "DATE"]:
-                            if col in df.columns:
-                                date_val = pd.Timestamp(str(row[col])).date()
-                                break
-                        if date_val is None:
-                            continue
-
-                        # Extract category values
-                        category_values = {}
-                        for cat_key, feature in category_map.items():
-                            for col in df.columns:
-                                if cat_key.lower() in col.lower():
-                                    try:
-                                        val = float(row[col])
-                                        if not pd.isna(val):
-                                            category_values[feature] = val
-                                    except (ValueError, TypeError):
-                                        continue
-                                    break
-
-                        # Insert category values
-                        for feature, val in category_values.items():
-                            if not self._row_exists(feature, date_val, conn):
-                                conn.execute(
-                                    text(
-                                        "INSERT INTO raw_series "
-                                        "(series_id, source_id, obs_date, value, pull_status) "
-                                        "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                    ),
-                                    {"sid": feature, "src": self.source_id, "od": date_val, "val": val},
-                                )
-                                inserted += 1
-
-                        # Compute composite
-                        if category_values:
-                            composite = sum(category_values.values()) / len(category_values)
-                            if not self._row_exists("ofr_fsm_composite", date_val, conn):
-                                conn.execute(
-                                    text(
-                                        "INSERT INTO raw_series "
-                                        "(series_id, source_id, obs_date, value, pull_status) "
-                                        "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                    ),
-                                    {"sid": "ofr_fsm_composite", "src": self.source_id, "od": date_val, "val": composite},
-                                )
-                                inserted += 1
-
-                    except Exception as row_exc:
-                        log.debug("Skipping FSM row: {err}", err=str(row_exc))
-
-            result["rows_inserted"] = inserted
-            log.info("OFR FSM: inserted {n} rows", n=inserted)
-
-        except Exception as exc:
-            log.error("OFR FSM pull failed: {err}", err=str(exc))
-            result["status"] = "FAILED"
-            result["errors"].append(str(exc))
-
-        return result
+    # ------------------------------------------------------------------
+    # Pulls
+    # ------------------------------------------------------------------
 
     def pull_fsi(self) -> dict[str, Any]:
-        """Pull OFR Financial Stress Index data."""
+        """Pull the OFR Financial Stress Index and its category sub-indices."""
         log.info("Pulling OFR Financial Stress Index")
         result: dict[str, Any] = {
             "series_id": "ofr_fsi",
@@ -177,55 +172,45 @@ class OFRPuller(BasePuller):
             "status": "SUCCESS",
             "errors": [],
         }
-
         try:
-            df = None
-            for url in [
-                "https://www.financialresearch.gov/financial-stress-index/data/fsi.csv",
-                "https://www.financialresearch.gov/financial-stress-index/download/",
-                "https://financialresearch.gov/financial-stress-index/download/",
-            ]:
-                df = self._fetch_csv(url)
-                if df is not None and not df.empty:
-                    break
-
-            if df is None or df.empty:
-                result["status"] = "PARTIAL"
+            df = self._fetch_csv(_FSI_URL)
+            if "Date" not in df.columns or "OFR FSI" not in df.columns:
+                result["status"] = "FAILED"
+                result["errors"].append(f"FSI CSV columns changed: {list(df.columns)[:12]}")
+                log.warning("OFR FSI: unexpected columns {c}", c=list(df.columns)[:12])
                 return result
-
+            dates = pd.to_datetime(df["Date"], format="%Y-%m-%d", errors="coerce")
+            if dates.isna().any():
+                log.warning("OFR FSI: {n} unparseable Date cells skipped", n=int(dates.isna().sum()))
+            missing = [c for c in FSI_COLUMNS if c not in df.columns]
+            if missing:
+                result["status"] = "PARTIAL"
+                result["errors"].append(f"FSI CSV missing columns: {missing}")
             inserted = 0
             with self.engine.begin() as conn:
-                for _, row in df.iterrows():
-                    try:
-                        date_val = pd.Timestamp(str(row.iloc[0])).date()
-                        value = float(row.iloc[1])
-                        if pd.isna(value):
-                            continue
-                        if not self._row_exists("ofr_fsi", date_val, conn):
-                            conn.execute(
-                                text(
-                                    "INSERT INTO raw_series "
-                                    "(series_id, source_id, obs_date, value, pull_status) "
-                                    "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                ),
-                                {"sid": "ofr_fsi", "src": self.source_id, "od": date_val, "val": value},
-                            )
-                            inserted += 1
-                    except (ValueError, TypeError):
+                for col, feature in FSI_COLUMNS.items():
+                    if col not in df.columns:
                         continue
-
+                    latest = self._get_latest_date(feature)
+                    floor = latest - timedelta(days=_FSI_LOOKBACK_DAYS) if latest else date.min
+                    # _finite per raw cell: Series.map(_finite) would turn the
+                    # None for a blank cell back into NaN.
+                    obs = [
+                        (d.date(), v)
+                        for d, v in ((d, _finite(raw)) for d, raw in zip(dates, df[col]))
+                        if not pd.isna(d) and v is not None and d.date() >= floor
+                    ]
+                    inserted += self._store(conn, feature, obs)
             result["rows_inserted"] = inserted
             log.info("OFR FSI: inserted {n} rows", n=inserted)
-
-        except Exception as exc:
-            log.error("OFR FSI pull failed: {err}", err=str(exc))
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("OFR FSI pull failed: {err}", err=str(exc)[:300])
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
-
         return result
 
     def pull_stfm(self) -> dict[str, Any]:
-        """Pull OFR Short-Term Funding Monitor data."""
+        """Pull overnight DVP repo rate and volume from the OFR STFM API."""
         log.info("Pulling OFR Short-Term Funding Monitor")
         result: dict[str, Any] = {
             "series_id": "ofr_stfm",
@@ -233,66 +218,29 @@ class OFRPuller(BasePuller):
             "status": "SUCCESS",
             "errors": [],
         }
-
-        try:
-            df = None
-            for url in [
-                "https://www.financialresearch.gov/short-term-funding-monitor/download/",
-                "https://financialresearch.gov/short-term-funding-monitor/download/",
-                "https://data.financialresearch.gov/v1/short-term-funding-monitor/download/",
-            ]:
-                df = self._fetch_csv(url)
-                if df is not None and not df.empty:
-                    break
-
-            if df is None or df.empty:
-                result["status"] = "PARTIAL"
-                return result
-
-            inserted = 0
-            with self.engine.begin() as conn:
-                for _, row in df.iterrows():
-                    try:
-                        date_val = pd.Timestamp(str(row.iloc[0])).date()
-                        # Extract repo volume and rate columns
-                        for col in df.columns[1:]:
-                            col_lower = col.lower()
-                            if "volume" in col_lower:
-                                feature = "ofr_repo_volume"
-                            elif "rate" in col_lower:
-                                feature = "ofr_repo_rate_1d"
-                            else:
-                                continue
-                            value = float(row[col])
-                            if pd.isna(value):
-                                continue
-                            if not self._row_exists(feature, date_val, conn):
-                                conn.execute(
-                                    text(
-                                        "INSERT INTO raw_series "
-                                        "(series_id, source_id, obs_date, value, pull_status) "
-                                        "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                    ),
-                                    {"sid": feature, "src": self.source_id, "od": date_val, "val": value},
-                                )
-                                inserted += 1
-                    except (ValueError, TypeError):
-                        continue
-
-            result["rows_inserted"] = inserted
-            log.info("OFR STFM: inserted {n} rows", n=inserted)
-
-        except Exception as exc:
-            log.error("OFR STFM pull failed: {err}", err=str(exc))
-            result["status"] = "FAILED"
-            result["errors"].append(str(exc))
-
+        inserted = 0
+        failed: list[str] = []
+        for mnemonic, feature in STFM_SERIES.items():
+            try:
+                latest = self._get_latest_date(feature)
+                start = latest - timedelta(days=_STFM_LOOKBACK_DAYS) if latest else None
+                obs = self._fetch_stfm(mnemonic, start)
+                with self.engine.begin() as conn:
+                    inserted += self._store(conn, feature, obs)
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                log.warning("OFR STFM {m} failed: {err}", m=mnemonic, err=str(exc)[:300])
+                failed.append(mnemonic)
+                result["errors"].append(f"{mnemonic}: {exc}")
+        result["rows_inserted"] = inserted
+        if failed:
+            result["status"] = "FAILED" if len(failed) == len(STFM_SERIES) else "PARTIAL"
+        log.info("OFR STFM: inserted {n} rows", n=inserted)
         return result
 
     def pull_all(self) -> dict[str, Any]:
         """Pull all OFR data sources."""
         log.info("Starting OFR bulk pull")
-        results = [self.pull_fsm(), self.pull_fsi(), self.pull_stfm()]
+        results = [self.pull_fsi(), self.pull_stfm()]
 
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
