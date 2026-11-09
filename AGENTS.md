@@ -400,3 +400,25 @@ is retired — two writers of `review.jsonl` would race; the pull mirror is reti
 `sudo install` (unchanged rule). Not verified here: the first scheduled run on grid-svr, the
 LLM extraction path against a live provider (no narrative exists in any current packet to
 extract from), and the deploy-time unit sync on the real host.
+
+## 2026-11-09 - Offline company document intake
+
+Added ingestion/company_documents.py, a bounded no-network raw-document archive,
+plus scripts/ingest_company_document.py and an explicit consumer/runbook contract.
+This complements existing SEC financial and AV transcript work without modifying
+those collectors. Every snapshot binds raw bytes, metadata, parsed text and parser
+version; atomic no-replace publication preserves revisions and supports retries.
+Publication time remains distinct from retrieval and unknown timestamps stay unknown.
+Unsupported PDF/encoding and empty text are visible missingness, not usable evidence.
+
+Validation: 39 offline intake tests pass, including concurrent capture, corruption,
+PIT boundaries and CLI roundtrip; changed Python Ruff passes. No live downloads,
+paid providers, production DB, schedule, migration, repair, merge or deployment.
+Document authenticity, complete coverage and semantic fact extraction remain outside
+this primitive. Full repository CI has not been run for this local candidate.
+
+Integrated the separate evidence-quality gate and archive-verified reader wrapper.
+Combined final local validation: 62 tests and 9 subtests passed, including true
+archive-to-quality roundtrip, tamper rejection and high-precision numeric conflict
+regressions. Independent intake review found no critical defect under the documented
+trusted-archive assumption. Quality is not truth/authenticity or complete coverage.
