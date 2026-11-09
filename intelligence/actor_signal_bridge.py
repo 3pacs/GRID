@@ -226,8 +226,10 @@ def select_actor_evidence(
         provenance = {
             **selected, "grouping_basis": ACTOR_GROUPING_BASIS,
             "group_key": list(key),
-            "supporting_row_ids": [r["row_id"] for _, r in current],
-            "supporting_rows": [_source_ref(r) for _, r in current],
+            # Event date and canonical direction are shared by this group;
+            # do not repeat them in every supporting source reference.
+            "supporting_rows": [{k: r[k] for k in ("row_id", "source_id", "available_at", "raw_direction")}
+                                for _, r in current],
             "supporting_rows_complete": True,
             "observation_count": len(members),
             "superseded_count": len(members) - len(current),

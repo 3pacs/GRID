@@ -71,7 +71,9 @@ reported explicitly; this patch does not introduce an unknown-age penalty.
 The signal's provenance includes row/source identities, selected canonical and
 original direction, current actor trust/influence, grouping basis and candidate
 dispositions. The in-memory `flow_context.actor_evidence` retains all used groups and complete
-support references, exact counts/dispositions for the candidate window, sampled
+support references (each inherits its group's observation DATE and canonical
+direction, and carries its own row/source ID, ingestion time and raw direction),
+exact counts/dispositions for the candidate window, sampled
 withheld/superseded detail, direct-vote identities and source-weight changes.
 The writer persists this receipt under `signals.actor_evidence` in the enriched
 signals JSON, not in stored `flow_context`. The existing upsert replaces that

@@ -58,7 +58,7 @@ def test_latest_date_one_vote_across_event_source_ids_and_whitespace():
     selected = evidence["signals"][0]
     assert selected["id"] == 4
     assert selected["actor"] == "Example Actor"
-    assert selected["provenance"]["supporting_row_ids"] == [4]
+    assert [r["row_id"] for r in selected["provenance"]["supporting_rows"]] == [4]
     assert selected["provenance"]["observation_count"] == 5
     assert selected["provenance"]["superseded_count"] == 4
     assert [r["reason"] for r in evidence["observations"][:4]] == ["superseded_event_date"] * 4
@@ -86,7 +86,7 @@ def test_same_date_duplicates_keep_lineage_without_extra_votes():
     evidence = bridge.select_actor_evidence([row(2), row(1), row(3, direction="buy")], as_of=NOW)
     assert len(evidence["signals"]) == 1
     p = evidence["signals"][0]["provenance"]
-    assert p["supporting_row_ids"] == [1, 2, 3]
+    assert [r["row_id"] for r in p["supporting_rows"]] == [1, 2, 3]
     assert {r["source_id"] for r in p["supporting_rows"]} == {row(i)["source_id"] for i in (1, 2, 3)}
 
 
