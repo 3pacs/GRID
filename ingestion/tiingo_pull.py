@@ -116,12 +116,28 @@ INSIDER_BUYER_TICKERS_SQL = """
 
 
 def is_tiingo_equity(ticker: str) -> bool:
-    """False for symbols Tiingo's daily equity endpoint cannot serve."""
-    return (
-        ticker not in _ORACLE_NON_TIINGO
-        and not ticker.endswith("-USD")
-        and not ticker.startswith("^")
-    )
+    """False for symbols Tiingo's daily equity endpoint cannot serve.
+
+    Not just a missed fetch: pull_ticker strips ``=F``/``=X`` and Tiingo
+    answers for whatever equity holds the remainder. Verified 2026-11-09 on
+    grid-svr: TIINGO's ``YF:ZS=F:close`` is Zscaler (197.66 vs soybeans
+    1194.5), ``CL=F`` Colgate-Palmolive, ``HG=F`` Hamilton Insurance,
+    ``BRL=X`` Barr Pharmaceuticals (to 2008). Six-letter FX pairs
+    (``EURUSD=X``) are real FX on this endpoint (match yfinance to 1e-3), so
+    they stay. A dotted exchange suffix (``ATD.TO``, ``DX-Y.NYB``) is a
+    non-US or index listing; a one-letter share class (``MOG.A``) is left to
+    analysis/sector_map_ticker_status.yaml, since Tiingo's spelling varies
+    (``MOG-A``, ``KELYA``).
+    """
+    if ticker in _ORACLE_NON_TIINGO or ticker.endswith("-USD") or ticker.startswith("^"):
+        return False
+    if ticker.endswith("=X"):
+        base = ticker[:-2]
+        return len(base) == 6 and base.isalpha()
+    if "=" in ticker:
+        return False
+    _, dot, suffix = ticker.rpartition(".")
+    return not (dot and len(suffix) >= 2)
 
 
 def _stable_advisory_lock_key(name: str) -> int:
@@ -251,6 +267,12 @@ class TiingoPuller(BasePuller):
             "status": "SUCCESS",
             "errors": [],
         }
+
+        if not is_tiingo_equity(ticker):
+            # Never fetch: Tiingo would answer for an unrelated equity.
+            result["status"] = "PARTIAL"
+            result["errors"].append(f"{ticker} is not a Tiingo equity symbol")
+            return result
 
         # Clean ticker: Tiingo uses plain symbols, no ^ prefix
         clean_ticker = ticker.replace("^", "").replace("=F", "").replace("=X", "")
@@ -648,6 +670,12 @@ class TiingoPuller(BasePuller):
         had no routine close), and so is every ticker with 2+ open-market
         insider buyers (:meth:`insider_buyer_tickers`; 2026-11-08: 287 of 332
         had no routine close).
+
+        Sector-map tickers go through ``analysis.sector_map.price_tickers``:
+        renamed symbols are swapped for their successor and acquired,
+        delisted or foreign-listed ones are skipped (2026-11-08: 103 such
+        tickers were fetched for 0 rows). Everything is then filtered by
+        :func:`is_tiingo_equity`.
         """
         from ingestion.yfinance_pull import YF_TICKER_LIST
 
@@ -657,19 +685,11 @@ class TiingoPuller(BasePuller):
             all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
             all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
         try:
-            from analysis.sector_map import SECTOR_MAP
-            for sector in SECTOR_MAP.values():
-                etf = sector.get("etf")
-                if etf:
-                    all_tickers.add(etf)
-                for sub in sector.get("subsectors", {}).values():
-                    for actor in sub.get("actors", []):
-                        t = actor.get("ticker")
-                        if t:
-                            all_tickers.add(t)
-        except Exception:
-            pass  # Graceful degradation if sector_map has an issue
-        return sorted(all_tickers)
+            from analysis.sector_map import price_tickers
+            all_tickers.update(price_tickers())
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: sector map tickers unavailable: {e}", e=str(exc))
+        return sorted(t for t in all_tickers if is_tiingo_equity(t))
 
     def pull_incremental(
         self,
