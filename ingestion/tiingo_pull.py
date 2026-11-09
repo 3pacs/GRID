@@ -27,6 +27,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
 from ingestion.base import BasePuller
+from tiingo_symbol_contract import _ORACLE_NON_TIINGO, is_tiingo_equity  # noqa: F401 -- re-exported; readers share the rules
 from store.observations import split_series_id
 
 # Process-scoped circuit breaker for catastrophic DB index corruption.
@@ -83,10 +84,6 @@ _ET = ZoneInfo("America/New_York")
 # the lock must be module-level.
 _INCREMENTAL_LOCK = threading.Lock()
 
-# Oracle tickers Tiingo's daily equity endpoint cannot serve (crypto, the
-# dollar index); see TiingoPuller.oracle_tickers.
-_ORACLE_NON_TIINGO: frozenset[str] = frozenset({"BTC", "ETH", "SOL", "DXY"})
-
 
 # Tickers where 2+ different insiders bought on the open market (Form 4 code
 # P) in the last INSIDER_BUYER_DAYS. Counted per feed, so one person spelled
@@ -113,31 +110,6 @@ INSIDER_BUYER_TICKERS_SQL = """
     ORDER BY max(n) DESC, t
     LIMIT :cap
 """
-
-
-def is_tiingo_equity(ticker: str) -> bool:
-    """False for symbols Tiingo's daily equity endpoint cannot serve.
-
-    Not just a missed fetch: pull_ticker strips ``=F``/``=X`` and Tiingo
-    answers for whatever equity holds the remainder. Verified 2026-11-09 on
-    grid-svr: TIINGO's ``YF:ZS=F:close`` is Zscaler (197.66 vs soybeans
-    1194.5), ``CL=F`` Colgate-Palmolive, ``HG=F`` Hamilton Insurance,
-    ``BRL=X`` Barr Pharmaceuticals (to 2008). Six-letter FX pairs
-    (``EURUSD=X``) are real FX on this endpoint (match yfinance to 1e-3), so
-    they stay. A dotted exchange suffix (``ATD.TO``, ``DX-Y.NYB``) is a
-    non-US or index listing; a one-letter share class (``MOG.A``) is left to
-    analysis/sector_map_ticker_status.yaml, since Tiingo's spelling varies
-    (``MOG-A``, ``KELYA``).
-    """
-    if ticker in _ORACLE_NON_TIINGO or ticker.endswith("-USD") or ticker.startswith("^"):
-        return False
-    if ticker.endswith("=X"):
-        base = ticker[:-2]
-        return len(base) == 6 and base.isalpha()
-    if "=" in ticker:
-        return False
-    _, dot, suffix = ticker.rpartition(".")
-    return not (dot and len(suffix) >= 2)
 
 
 def _stable_advisory_lock_key(name: str) -> int:
