@@ -69,6 +69,8 @@ _REQUEST_TIMEOUT = 30
 # made (GRID-TIINGO-DUPLICATES-20260929). _insert_rows therefore also takes
 # a per-ticker pg_advisory_xact_lock before its INSERT, on every path.
 ROUTINE_OVERLAP_DAYS = 10          # re-check this many days behind the latest stored session
+LAPSED_WINDOW_DAYS = 10            # a close this recent before the expected session = the ticker was live
+MAX_NAMED_TICKERS = 50             # tickers named per bucket in the pull summary and log
 NEW_TICKER_START = "2020-01-01"    # routine first pull for a ticker with no TIINGO rows (pull_ticker's default)
 EOD_READY_ET = dtime(18, 0)        # a session's EOD bar is treated as published from 18:00 America/New_York
 DEFAULT_MAX_WORKERS = 3            # concurrent HTTP fetches
@@ -176,6 +178,25 @@ _FIELD_MAP: dict[str, str] = {
     "volume": "volume",
     "adjClose": "adj_close",
 }
+
+
+def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[str, date | None]]:
+    """(ticker, latest close before the run) for every fetched ticker that
+    still has no close for ``expected``: no data, a failed fetch, or data
+    that stops earlier. A ticker last seen inside ``LAPSED_WINDOW_DAYS`` was
+    trading, so missing it now is a failure, not a delisting; the pull
+    reports PARTIAL and names it. Long-dead and never-served symbols (renamed
+    companies, FX, crypto) are counted but do not fail the run.
+    """
+    out: list[tuple[str, date | None]] = []
+    for r in results:
+        if r.get("status") not in ("SUCCESS", "PARTIAL", "FAILED"):
+            continue
+        before, got = r.get("last_before"), r.get("latest_obs")
+        latest = max((d for d in (before, got) if d is not None), default=None)
+        if latest is None or latest < expected:
+            out.append((r["ticker"], before))
+    return out
 
 
 def _tiingo_headers() -> dict[str, str]:
@@ -308,6 +329,8 @@ class TiingoPuller(BasePuller):
                          t=ticker, n=result["rows_would_insert"])
                 return result
 
+            closes = [r["od"] for r in rows_batch if r["sid"] == f"YF:{ticker}:close"]
+            result["latest_obs"] = max(closes) if closes else None
             if rows_batch:
                 inserted = self._insert_rows(rows_batch)
 
@@ -662,7 +685,9 @@ class TiingoPuller(BasePuller):
 
         See the module comment above ROUTINE_OVERLAP_DAYS. Returns a summary
         dict whose ``status`` is SUCCESS, PARTIAL (stopped by
-        ``should_continue`` or the index-corruption breaker), FAILED (most
+        ``should_continue`` or the index-corruption breaker, or a ticker that
+        was trading inside ``LAPSED_WINDOW_DAYS`` got no close for the expected
+        session: see :func:`still_behind`), FAILED (most
         fetches failed) or SKIPPED (another run holds the lock -- callers
         must not treat that as a completed pull).
         """
@@ -709,7 +734,9 @@ class TiingoPuller(BasePuller):
                 if last is not None and last >= expected:
                     return {"ticker": ticker, "status": "CURRENT",
                             "rows_inserted": 0, "errors": []}
-                return self.pull_ticker(ticker, start_date=start, limiter=limiter)
+                res = self.pull_ticker(ticker, start_date=start, limiter=limiter)
+                res["last_before"] = last
+                return res
 
             log.info(
                 "Tiingo incremental pull: {n} tickers, expecting session {d}, "
@@ -727,9 +754,13 @@ class TiingoPuller(BasePuller):
             failed = by_status.get("FAILED", 0)
             unattempted = by_status.get("UNATTEMPTED", 0)
             rows = sum(int(r.get("rows_inserted") or 0) for r in results)
+            behind = still_behind(results, expected)
+            lapsed = [t for t, before in behind
+                      if before is not None
+                      and before >= expected - timedelta(days=LAPSED_WINDOW_DAYS)]
             if fetched >= 10 and failed * 2 > fetched:
                 status = "FAILED"
-            elif unattempted or _INDEX_CORRUPTED_BREAKER:
+            elif unattempted or _INDEX_CORRUPTED_BREAKER or lapsed:
                 status = "PARTIAL"
             else:
                 status = "SUCCESS"
@@ -745,15 +776,29 @@ class TiingoPuller(BasePuller):
                 "unattempted": unattempted,
                 "rows_inserted": rows,
                 "failed_tickers": [r["ticker"] for r in results if r["status"] == "FAILED"][:50],
+                "no_data_tickers": [r["ticker"] for r in results
+                                    if r["status"] == "PARTIAL"][:MAX_NAMED_TICKERS],
+                "behind": len(behind),
+                "lapsed_tickers": lapsed[:MAX_NAMED_TICKERS],
             }
             if status == "FAILED":
                 summary["error"] = f"{failed}/{fetched} Tiingo fetches failed"
+            elif lapsed:
+                summary["error"] = (
+                    f"{len(lapsed)} ticker(s) with a close in the {LAPSED_WINDOW_DAYS} days "
+                    f"before {expected.isoformat()} got none for it: "
+                    + ", ".join(lapsed[:MAX_NAMED_TICKERS]))
             log.info(
                 "Tiingo incremental pull {s}: {c} current, {f} fetched, {ok} ok, "
                 "{nd} no data, {fl} failed, {u} unattempted, {r} rows",
                 s=status, c=summary["current"], f=fetched, ok=summary["succeeded"],
                 nd=summary["no_data"], fl=failed, u=unattempted, r=rows,
             )
+            if summary["no_data_tickers"]:
+                log.info("Tiingo returned no data for: {t}",
+                         t=", ".join(summary["no_data_tickers"]))
+            if lapsed:
+                log.warning("Tiingo incremental pull: {e}", e=summary["error"])
             return summary
         finally:
             if lock_conn is not None:
