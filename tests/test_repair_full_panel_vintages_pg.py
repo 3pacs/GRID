@@ -168,9 +168,9 @@ def test_dry_run_plans_and_writes_nothing(pg_engine):
     assert hon["retract"] == 7 and hon["revintage"] == 2 and hon["cells_newly_dark"] == 5
     assert hon["newly_dark_range"] == {"obs_min": DAYS[0].isoformat(), "obs_max": DAYS[4].isoformat(), "n": 5}
     assert "backfill YF:HON:adj_close for obs_date" in hon["backfill_hint"]
-    assert gold["status"] == rep.SKIPPED_NO_BASIS_SPLIT and gold["ticker"] == "GC=F"
+    assert gold["status"] == rep.NO_BASIS_SPLIT and gold["ticker"] == "GC=F"
     assert gold["rows"] == 0 and gold["retract"] == 0 and gold["feature_id"] is None
-    assert report["by_status"] == {rep.IN_SCOPE: 1, rep.NEEDS_BACKFILL: 1, rep.SKIPPED_NO_BASIS_SPLIT: 1}
+    assert report["by_status"] == {rep.IN_SCOPE: 1, rep.NEEDS_BACKFILL: 1, rep.NO_BASIS_SPLIT: 1}
     assert report["applicable_totals"] == {"features": 1, "retract": 10, "revintage": 1, "newly_dark": 0}
     assert report["totals"]["phantom_cleared"] == 0 and report["totals"]["newly_dark"] == 5
     assert report["complete"] is True and report["errors"] == 0 and report["mode"] == "dry_run"

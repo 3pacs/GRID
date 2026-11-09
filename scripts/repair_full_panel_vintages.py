@@ -26,7 +26,7 @@ feature name. Everything else is reported with a status and never touched:
   field of another ticker (``btc_full`` <- BINANCE/CoinGecko; ``gold_full``'s
   name would have become Barrick's ticker GOLD, which turned every gold
   futures row into an "outlier" against a $30 stock).
-* SKIPPED_NO_BASIS_SPLIT -- RAW_CLOSE_FULL_FEATURES other than ``spy_full``
+* NO_BASIS_SPLIT -- RAW_CLOSE_FULL_FEATURES other than ``spy_full``
   (indices, futures, crypto): no corporate actions, so ``adj_close == close``
   and a value that matches one field only is pull-timing drift on a 24/7 or
   settlement bar, not a basis flip.
@@ -150,7 +150,7 @@ ALREADY_RETRACTED = "ALREADY_RETRACTED"
 # per-feature plan status
 IN_SCOPE = "IN_SCOPE"
 OUT_OF_SCOPE = "OUT_OF_SCOPE"
-SKIPPED_NO_BASIS_SPLIT = "SKIPPED_NO_BASIS_SPLIT"
+NO_BASIS_SPLIT = "NO_BASIS_SPLIT"
 EXCLUDED = "EXCLUDED"
 NEEDS_BACKFILL = "NEEDS_BACKFILL"
 APPLICABLE_STATUSES = frozenset({IN_SCOPE})
@@ -245,7 +245,7 @@ def feature_scope(feature: str, *, exclude: Iterable[str] = (),
     IN_SCOPE needs exactly one static feed that is ``YF:<T>:<policy field>``,
     or no static feed at all (the ``YF:<T>:adj_close -> <t>_full`` pattern
     fallback, where ``<T>`` is derived from the name). RAW_CLOSE_FULL_FEATURES
-    other than ``spy_full`` are SKIPPED_NO_BASIS_SPLIT; a feature whose static
+    other than ``spy_full`` are NO_BASIS_SPLIT; a feature whose static
     feed is another ticker or another source is OUT_OF_SCOPE.
     """
     target = target_field(feature)
@@ -267,7 +267,7 @@ def feature_scope(feature: str, *, exclude: Iterable[str] = (),
     if feature in set(exclude):
         return Scope(feature, EXCLUDED, ticker, target, feed, feeds, "named with --exclude")
     if feature in RAW_CLOSE_FULL_FEATURES and feature != SPY_CLOSE_FEATURE:
-        return Scope(feature, SKIPPED_NO_BASIS_SPLIT, ticker, target, feed, feeds,
+        return Scope(feature, NO_BASIS_SPLIT, ticker, target, feed, feeds,
                      "raw-close basis by allowlist and no corporate actions: adj_close == close, a value "
                      "matching one field only is pull-timing drift, not a basis flip")
     return Scope(feature, IN_SCOPE, ticker, target, feed, feeds)

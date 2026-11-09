@@ -832,7 +832,9 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests/test_repair_full_panel_vintages_pg.py -q -rA | tee /tmp/grid-full-panel-repair-pg.txt
-          if grep -q "SKIPPED" /tmp/grid-full-panel-repair-pg.txt; then
+          # pytest's own markers only: the script's per-feature summary lines
+          # (stderr, captured by tee) must never be able to trip this guard.
+          if grep -qE "^SKIPPED \[|[0-9]+ skipped" /tmp/grid-full-panel-repair-pg.txt; then
             echo "::error::Full-panel vintage repair PostgreSQL contract was skipped"
             exit 1
           fi

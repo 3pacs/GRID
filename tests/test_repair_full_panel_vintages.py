@@ -24,7 +24,7 @@ from scripts.repair_full_panel_vintages import (
     ON_BASIS,
     OUT_OF_SCOPE,
     OUTLIER,
-    SKIPPED_NO_BASIS_SPLIT,
+    NO_BASIS_SPLIT,
     UNMATCHED,
     RawCandidate,
     ResolvedRow,
@@ -207,7 +207,7 @@ class TestScope:
     def test_gold_futures_are_never_compared_against_barrick(self) -> None:
         sc = feature_scope("gold_full")
         assert sc.ticker == "GC=F" and sc.ticker != ticker_for_feature("gold_full")
-        assert sc.status == SKIPPED_NO_BASIS_SPLIT
+        assert sc.status == NO_BASIS_SPLIT
 
     def test_binance_and_coingecko_features_are_out_of_scope(self) -> None:
         for f in ("btc_full", "eth_full", "sol_full"):
@@ -218,7 +218,7 @@ class TestScope:
     def test_crypto_and_index_allowlist_features_are_skipped(self) -> None:
         for f in ("btc_usd_full", "eth_usd_full", "sol_usd_full", "sp500_full"):
             sc = feature_scope(f)
-            assert sc.status == SKIPPED_NO_BASIS_SPLIT, f
+            assert sc.status == NO_BASIS_SPLIT, f
             assert "pull-timing drift" in (sc.reason or "")
 
     def test_pattern_only_feature_is_in_scope_with_the_name_ticker(self) -> None:
@@ -240,8 +240,8 @@ class TestScope:
         from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
         feats = {n for n in {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}.values() if n.endswith("_full")}
         statuses = {f: feature_scope(f).status for f in feats}
-        assert set(statuses.values()) <= {IN_SCOPE, OUT_OF_SCOPE, SKIPPED_NO_BASIS_SPLIT}
-        assert statuses["gold_full"] == SKIPPED_NO_BASIS_SPLIT
+        assert set(statuses.values()) <= {IN_SCOPE, OUT_OF_SCOPE, NO_BASIS_SPLIT}
+        assert statuses["gold_full"] == NO_BASIS_SPLIT
         assert statuses["btc_full"] == OUT_OF_SCOPE
         assert sum(1 for v in statuses.values() if v == IN_SCOPE) >= 100
 
@@ -406,9 +406,9 @@ class TestRunScope:
         engine.connect.assert_not_called()
         engine.begin.assert_not_called()
         statuses = {p["feature"]: p["status"] for p in report["features"]}
-        assert statuses == {"gold_full": SKIPPED_NO_BASIS_SPLIT, "btc_full": OUT_OF_SCOPE,
-                            "eth_usd_full": SKIPPED_NO_BASIS_SPLIT, "xlp_full": EXCLUDED}
-        assert report["by_status"] == {SKIPPED_NO_BASIS_SPLIT: 2, OUT_OF_SCOPE: 1, EXCLUDED: 1}
+        assert statuses == {"gold_full": NO_BASIS_SPLIT, "btc_full": OUT_OF_SCOPE,
+                            "eth_usd_full": NO_BASIS_SPLIT, "xlp_full": EXCLUDED}
+        assert report["by_status"] == {NO_BASIS_SPLIT: 2, OUT_OF_SCOPE: 1, EXCLUDED: 1}
         assert report["applicable_totals"]["features"] == 0
         assert all(p["applied"] is None for p in report["features"])
         assert report["complete"] is True and report["errors"] == 0
