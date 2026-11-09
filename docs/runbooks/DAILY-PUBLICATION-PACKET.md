@@ -326,3 +326,30 @@ Historical days: Nov 4–6 packets are produced by hand from the same job (late
 captures, flagged `late_capture: true`). They are real captures of the retained
 rows, not manufactured success receipts; the old lineage's Nov 3 r13 candidate
 stays sealed and unadmitted.
+
+
+### Grader ingest confirmation and historical reconciliation
+
+A grader success binds the actual `review_sha256`, `packet_sha256` and positive database
+`run_id` returned by the ingest. It stores these as `ingest_confirmation` with schema
+`publication-review-ingest-confirmation-v1`. A successful status alone, a different file
+hash, rejected rows or missing count reconciliation is not a confirmation; the grader
+records `ingest_confirmation_error`, returns exit 3 and retries the hand-off on the next
+normal run. This catches replacement of `review.jsonl` between grading and ingest reading
+it. Each confirmation describes exact bytes, not an unlocked file's future contents.
+
+Older `ingested_review_sha256` fields without this bound confirmation are untrusted: the
+former unchanged `--no-ingest` path could invent that field even after a failed hand-off.
+The next naturally scheduled run within the existing lookback reconciles an unchanged
+review through the existing idempotent ingest. Its unique review hash yields `PRESENT`
+when that exact review already exists; a missing review is ingested normally. A
+`--no-ingest` run neither reconciles nor upgrades legacy claims. New genuine confirmations
+can be retained for the same review and packet without another database round trip.
+
+Do not delete old receipts or rewrite database history to make a day appear successful.
+Retain prior evidence through the existing custody process. Historical days outside the
+configured lookback remain unreconciled until the existing owner admits a bounded check;
+this fix does not expand the schedule, launch a backfill or certify historical acceptance.
+If overlapping writers are detected, retain both reported hash identities and resolve
+ownership before further manual work. A hash mismatch is a visible failure, not permission
+to launch another consumer.

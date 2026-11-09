@@ -400,3 +400,30 @@ is retired — two writers of `review.jsonl` would race; the pull mirror is reti
 `sudo install` (unchanged rule). Not verified here: the first scheduled run on grid-svr, the
 LLM extraction path against a live provider (no narrative exists in any current packet to
 extract from), and the deploy-time unit sync on the real host.
+
+## 2026-11-09 — Bind daily grader ingestion confirmations to actual bytes
+
+The unchanged `--no-ingest` path could invent `ingested_review_sha256`, causing the
+next normal grader run to skip a review that had never reached the database. The
+same path could suppress recovery after a failed hand-off. The grader also trusted
+an ingest status without retaining the hash of the bytes the ingest actually read.
+
+- Require an explicit confirmation containing the actual review hash, packet hash
+  and positive database run ID returned by a fully accepted ingest. Preserve those
+  hashes through the hand-off wrapper. Missing or mismatched evidence is visible
+  through `ingest_confirmation_error` and exit 3, with no certified ingestion.
+- Ignore legacy bare hash claims when deciding whether to skip ingestion. The next
+  normal run inside the existing lookback reconciles through the unique-hash,
+  idempotent ingest. Older days remain a separate historical reconciliation task.
+- Preserve genuine bound confirmations for unchanged reviews and retain the
+  producer, sole grader ownership, existing schedules and append-only DB history.
+- Add ten offline regression tests, including actual file replacement at hand-off,
+  seven malformed result cases, failed recovery, legacy claims and success reuse.
+  Update existing mocks to report the actual review and packet identities.
+
+Validation: 202 tests and 16 subtests pass across grader, receipt recovery, ingest,
+packet producer and packet status suites with socket connections blocked. Changed
+Python lint, compilation and diff checks pass. Independent synthetic review passed.
+Full backend/CI results are separate. No production access, service changes,
+scheduler changes, historical backfill, merge or deployment performed. Hash-bound
+receipts detect wrong-byte hand-off but do not serialize concurrent writers.

@@ -487,11 +487,18 @@ def _day_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     return packet_root, review_root, digest
 
 
+def successful_ingest(day, review_root, packet_root, **extra):
+    return {"state": "INGESTED", "run_id": 7, "accepted_rows": 4, "rejected_rows": 0,
+            "declared_mismatch": [],
+            "review_sha256": grader.sha256((review_root / day.isoformat() / "review.jsonl").read_bytes()),
+            "packet_sha256": grader.load_packet(packet_root, day).sha256, **extra}
+
+
 def test_grade_day_writes_a_file_the_ingest_accepts_and_hands_it_over(tmp_path, closes, monkeypatch):
     packet_root, review_root, digest = _day_fixture(tmp_path)
     handed = []
     monkeypatch.setattr(grader, "run_ingest", lambda engine, day, rr, pr: handed.append((day, rr, pr)) or
-                        {"state": "INGESTED", "run_id": 7, "accepted_rows": 4, "rejected_rows": 0, "declared_mismatch": []})
+                        successful_ingest(day, rr, pr))
     receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
                                client_factory=lambda: None)
     assert receipt["state"] == "WRITTEN" and receipt["rows"] == 4 and receipt["superseded_previous"] is False
@@ -514,7 +521,7 @@ def test_grade_day_writes_a_file_the_ingest_accepts_and_hands_it_over(tmp_path, 
 def test_grade_day_is_unchanged_when_verdicts_do_not_move_and_rewrites_when_they_do(tmp_path, closes, monkeypatch):
     packet_root, review_root, _ = _day_fixture(tmp_path)
     calls = []
-    monkeypatch.setattr(grader, "run_ingest", lambda *a: calls.append(a) or {"state": "INGESTED"})
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: calls.append(a) or successful_ingest(*a[1:]))
     first = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_EARLY,
                              client_factory=lambda: None)
     assert first["state"] == "WRITTEN" and first["verdicts"] == {"unresolved": 2, "unscorable": 2}
@@ -551,7 +558,7 @@ def test_failed_hand_off_is_retried_on_the_next_unchanged_run(tmp_path, closes, 
     def fake_ingest(*a):
         calls.append(a)
         nxt = next(outcomes)
-        return nxt() if callable(nxt) else nxt
+        return nxt() if callable(nxt) else (successful_ingest(*a[1:], **nxt) if nxt.get("state") == "INGESTED" else nxt)
 
     monkeypatch.setattr(grader, "run_ingest", fake_ingest)
     first = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
@@ -648,13 +655,15 @@ def test_run_ingest_loads_the_sibling_module_and_passes_roots_through(tmp_path, 
         def ingest(engine, day, *, review_root, packet_root):
             seen.update(day=day, review_root=review_root, packet_root=packet_root)
             return {"state": "INGESTED", "run_id": 3, "accepted_rows": 4, "rejected_rows": 0, "declared_mismatch": [],
-                    "receipt_file": "ingest-receipt.json", "extra": "dropped"}
+                    "receipt_file": "ingest-receipt.json", "extra": "dropped",
+                    "review_sha256": "b" * 64, "packet_sha256": "c" * 64}
 
     monkeypatch.setattr(grader, "_ingest_module", lambda: Module)
     out = grader.run_ingest(FakeEngine(), DAY, review_root, packet_root)
     assert seen == {"day": DAY, "review_root": review_root, "packet_root": packet_root}
     assert out == {"state": "INGESTED", "reason": None, "run_id": 3, "accepted_rows": 4, "rejected_rows": 0,
-                   "declared_mismatch": [], "receipt_file": "ingest-receipt.json"}
+                   "declared_mismatch": [], "receipt_file": "ingest-receipt.json",
+                   "review_sha256": "b" * 64, "packet_sha256": "c" * 64}
 
 
 def test_real_ingest_module_is_loadable_by_path():
@@ -680,7 +689,7 @@ def test_lookback_days_end_yesterday():
 
 def test_main_day_and_lookback(tmp_path, closes, monkeypatch, capsys):
     packet_root, review_root, _ = _day_fixture(tmp_path)
-    monkeypatch.setattr(grader, "run_ingest", lambda *a: {"state": "INGESTED", "rejected_rows": 0})
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: successful_ingest(*a[1:]))
     monkeypatch.setattr(grader, "default_client_factory", lambda: None)
     import types
     monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: FakeEngine()))
