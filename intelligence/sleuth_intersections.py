@@ -30,7 +30,9 @@ after the first night's ten leads; every lead records it in its evidence):
    behind BAH and KBR were $0 stock grants (code A).
 3. One insider vote per (insider, day, direction), whichever feed carries
    it and however many fills it has (one ADI sale was one SEC row and 20
-   QuiverQuant fills).
+   QuiverQuant fills). The SEC puller's ``CLUSTER_BUY`` rows are summaries
+   of buys already counted, so they cast no vote (amendment registered
+   2026-11-08 before the first v2 run).
 
 Every observation carries its citation (table and row key) and was recorded
 by ``as_of`` (``created_at <= as_of``): rows dated in the future or written
@@ -111,7 +113,7 @@ def is_testable_ticker(ticker: str) -> bool:
     """US-listed and not crypto: what the v2 ticker test can score."""
     return bool(_US_TICKER.match(ticker)) and not _CRYPTO_TICKER.match(ticker)
 
-_UP = {"BUY", "UNUSUAL_BUY", "CLUSTER_BUY", "INSIDER_BUY", "CONTRACT_AWARD", "WSB_BULLISH"}
+_UP = {"BUY", "UNUSUAL_BUY", "INSIDER_BUY", "CONTRACT_AWARD", "WSB_BULLISH"}
 _DOWN = {"SELL", "UNUSUAL_SELL", "INSIDER_SELL", "WSB_BEARISH"}
 _FAMILY_BY_SOURCE = {
     "options_flow": "options_flow",
@@ -237,6 +239,9 @@ def classify_signal(source_type: str | None, signal_type: str | None,
         except (TypeError, ValueError):
             value = None
     stype = (signal_type or "").strip().upper()
+    if stype == "CLUSTER_BUY":
+        # A summary of insider buys whose own rows already vote (v2 rule 3).
+        return None
     if (source_type or "").strip().lower() == "quiverquant:insider":
         # Only open-market trades, as in the SEC feed (construction v2 rule 2).
         code = (str(value.get("TransactionCode") or "").strip().upper()
