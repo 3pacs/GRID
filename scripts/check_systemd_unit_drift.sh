@@ -63,7 +63,8 @@ show_drift() {
     diff <(normalize "$1") <(normalize "$2") | sed -E 's/^([<>] *Environment=[^=]+=).*/\1<redacted>/' | sed 's/^/         /' || true
   fi
 }
-managed() { grep -qE '^#[[:space:]]*deploy-sync:[[:space:]]*managed[[:space:]]*$' "$1"; }
+# The marker may carry a trailing explanation: "# deploy-sync: managed  (why ...)".
+managed() { grep -qE '^#[[:space:]]*deploy-sync:[[:space:]]*managed([[:space:]]|$)' "$1"; }
 
 checked=0; drifted=0; synced=0; skipped=0; remaining=0; unmanaged=0
 reloaded=0
