@@ -173,7 +173,7 @@ def _get_llm():
     """Get the LLM client."""
     try:
         from llm.router import get_llm, Tier
-        client = get_llm(Tier.ORACLE)
+        client = get_llm(Tier.RESEARCH)
         return client if client.is_available else None
     except Exception:
         return None

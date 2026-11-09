@@ -742,6 +742,7 @@ class Settings(BaseSettings):
     LLM_LOCAL_PROVIDER: str = "llamacpp_z4"  # LOCAL tier — gridz4 Qwen3.8-27B
     LLM_REASON_PROVIDER: str = "llamacpp_z4"  # REASON tier — gridz4, then the 3090
     LLM_ORACLE_PROVIDER: str = "llamacpp_z4"  # ORACLE tier — gridz4, then the 3090
+    LLM_RESEARCH_PROVIDER: str = "llamacpp_x99"  # RESEARCH tier — x99-hex, then gridz4, the 3090 last
     # Tier.QUICK primary (short classification/extraction). Distinct from the
     # legacy LLM_QUICK_PROVIDER below, which is LOCAL's fallback key.
     LLM_QUICK_TIER_PROVIDER: str = "llamacpp_threadripper"

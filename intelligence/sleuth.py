@@ -183,7 +183,7 @@ def _get_llm():
     """Get the LLM client (llamacpp preferred, fallback to ollama)."""
     try:
         from llm.router import get_llm, Tier
-        client = get_llm(Tier.ORACLE)
+        client = get_llm(Tier.RESEARCH)
         if client.is_available:
             return client
     except Exception as exc:
