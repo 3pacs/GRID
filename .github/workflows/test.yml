@@ -816,6 +816,27 @@ jobs:
             exit 1
           fi
 
+      # scripts/repair_full_panel_vintages.py (PRICE BASIS POLICY repair):
+      # scope from the entity-map feed, dry run writes nothing, --apply appends
+      # retractions and re-vintages only, NEEDS_BACKFILL/skipped/excluded
+      # features are never written, raw reads are one short READ ONLY
+      # transaction per year chunk. A skip (PostgreSQL unreachable) must fail
+      # this step, not pass it.
+      - name: Full-panel vintage repair PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_FULL_PANEL_REPAIR_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_repair_full_panel_vintages_pg.py -q -rA | tee /tmp/grid-full-panel-repair-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-full-panel-repair-pg.txt; then
+            echo "::error::Full-panel vintage repair PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

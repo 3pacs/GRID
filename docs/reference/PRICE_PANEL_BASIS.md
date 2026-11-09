@@ -1,7 +1,9 @@
 # `{ticker}_full` price panel: one basis per feature
 
-Status: policy in code since 2026-11-08 (branch `claude/fix-full-panel-vintages-20261108`).
-Repair of the rows written before it: planned, **not run** (needs Anik's explicit word).
+Status: policy in code since 2026-11-08 (#1067, main `a4a4e284`). First repair dry run on
+grid-svr 2026-11-08 23:11Z (65 features) reviewed: **not applicable as produced**, the
+script's scope was wrong for three feature shapes (see "Scope of the repair"). Repair of
+the rows written before the policy: planned, **not run** (needs Anik's explicit word).
 
 ## The defect (measured read-only on grid-svr, 2026-11-08)
 
@@ -58,7 +60,12 @@ warning per run if an `EntityMap` reports a violation (`mixed_basis_features()`)
 
 The dynamic `YF:<ticker>:<field>` fallback follows the same rule: `adj_close` may derive
 `<t>_full` / `<t>_adj_close`, `close` may derive `<t>_close` only
-(`_YF_FIELD_SUFFIXES`). A ticker registered only as `<t>_full` that has no `adj_close`
+(`_YF_FIELD_SUFFIXES`). It also refuses a derived name whose feature already has a static
+feed from another ticker or another source (`pattern_collision()`): ticker `GOLD` is
+Barrick Gold and derives `gold_full`, the gold-futures feature fed by `YF:GC=F:close`;
+measured on griddb 2026-11-08, Barrick closes had resolved into `gold_full` since
+2025-12-02 (first `YF:GOLD:adj_close` row, Tiingo). Refused rows stay unresolved and are
+warned once per process. A ticker registered only as `<t>_full` that has no `adj_close`
 rows therefore receives nothing; that is the honest state, not a silent raw-basis feed.
 Tiingo's routine pull writes `adj_close` for the oracle close universe plus the
 hypothesis tickers; the yfinance full-history pulls write it for everything they cover.
@@ -74,6 +81,8 @@ each field exist, which is how to find a `_full` feature that now lacks a feed.
   `price_basis_conflicts()`, `EntityMap.mixed_basis_features()`.
 * `normalization/resolver.py`: run-time tripwire (warning) when the map feeds a feature
   from two bases.
+* `normalization/entity_map.py` (follow-up): `static_feeds()`, `pattern_collision()` and the
+  collision guard in `EntityMap._resolve_by_pattern` (same-named ticker, unrelated feature).
 * `alpha_research/data/panel_builder.py`: `build_price_panel` no longer calls the
   heuristic `adjust_panel`. It reads values **and vintage dates** through `get_pit` and
   re-bases each cell from its vintage's share basis to `as_of_date`'s with the recorded
@@ -100,6 +109,52 @@ each field exist, which is how to find a `_full` feature that now lacks a feed.
 * `spy_full` is a raw close next to 29 adjusted series in the rotation universe: SPY's
   dividend drag (~1.3 %/yr) is a small known bias in any SPY-relative number read from the
   panel. Keep it: the astrogrid receipt contract needs the unadjusted print.
+
+## Scope of the repair (what the first dry run taught, 2026-11-08)
+
+The script derived every ticker from the feature **name**. Three feature shapes made that
+wrong, and the follow-up takes the ticker from the entity-map feed instead
+(`feature_scope()` in the script; `static_feeds()` in the entity map). Per-feature
+`status` in the JSON, only `IN_SCOPE` plans are ever applied:
+
+| status | which features | why |
+|---|---|---|
+| `OUT_OF_SCOPE` | `btc_full`, `eth_full`, `sol_full` (Binance/CoinGecko), anything whose static feed is not one `YF:<T>:<basis field>` series | never fed by the two yfinance fields, so the alternating-basis defect cannot exist there; a same-named yfinance ticker (bare `BTC`/`ETH` pulled as equities 2025-11..2026-05) is unrelated. The r1 run planned 96-97 % retraction and left them dark |
+| `SKIPPED_NO_BASIS_SPLIT` | `RAW_CLOSE_FULL_FEATURES` except `spy_full`: `gold_full` (`GC=F`), `sp500_full`, `btc_usd_full`, `eth_usd_full`, `sol_usd_full` | no corporate actions, `adj_close == close`; a value matching one field only is pull-timing drift on a 24/7 or settlement bar, not a basis flip (r1 would have retracted 2,058 `eth_usd_full` rows for nothing). `gold_full` in r1 was compared against ticker `GOLD` = Barrick: 100 % retract, after-ratio 1.12 = Barrick, before-ratio 3.65 = gold |
+| `NEEDS_BACKFILL` | in scope, but more than `--coverage-floor` (1 %) of today's served cells would have no on-basis raw row to re-vintage from: `acn_full`, `hon_full` (Tiingo `adj_close` starts 2021-04-01, ~half of the 2010+ cells) | **backfill first, repair second.** A backfill writes `YF:<T>:adj_close` rows with the backfill day's pull date; re-running the plan then re-vintages every dark cell from them. Until then these features are internally consistent raw-close series (the panel no longer runs the heuristic adjuster, so the residual error is dividend-sized). The JSON carries `backfill_hint` with the obs_date range |
+| `EXCLUDED` | named with `--exclude` | operator's call, reported, never read or written |
+
+Dark-cell accounting, per feature: `cells_dark_before` (no visible row today: every row
+already retracted, typically the backdated fill rows retracted by
+`scripts/audit_backdated_vintages.py`; r1's `left_dark` for `jnk_full` 961, `btc_usd_full`
+1,228, `dia_full` 150 was entirely this), `cells_newly_dark` (served today **on a real
+trading day**, i.e. a SUCCESS raw close row exists for the date, dark after the plan; the
+number the floor judges), `cells_phantom_cleared` (served today on a date with no raw close
+at all, dark after the plan: the holiday junk cells disappearing, which is the repair
+working; r2 showed `xli_full` with 5,598 cells against ~4,250 trading days and 1,311 of them
+going dark), `cells_restored` (dark today, re-vintaged by the plan), `cells_left_dark` (dark
+after the plan, before + newly + phantom).
+
+Re-vintage guard (follow-up): the r1/r2 plans refilled a dark holiday cell from the 0.6
+junk print itself (it was the latest on-basis raw value for that date). A re-vintage now
+needs a raw close row for the date and a value within 50 % of the neighbouring on-basis
+cells; otherwise the latest sane candidate, or nothing, and `revintage_rejected` says why.
+The r2 JSON's `revintage` lists for XLP/XLB/XLRE/XLI contain such junk refills and must not
+be applied as written.
+
+r2 totals (all 139 `_full` features, 2026-11-08 23:37Z → 00:21Z, nothing written): in scope
+113 features, 6,114,750 rows, 1,784,025 retractions, 24,515 re-vintages, 9,354 cells left
+dark; out of scope 26 features. `gold_full` alone had 155,619 rows flagged OUTLIER against
+Barrick. In-scope after-ratios checked against real 2010 → 2026 adjusted prices: NVDA 440
+(≈ $0.46 split-adjusted → ~$200), TSLA 225 (IPO 2010-06-29 $1.59 split-adjusted → ~$360),
+GOOGL 18.3, AMZN 38.7, BRK-B 8.6, DUK 5.1, LOW 13.0, DIS 4.3, T 2.58 (dividends + WBD
+spin-off), LQD 1.81, EMB 1.96, VZ 3.45 all land; MSTR 13.4 (post 10:1 split $8.5 → ~$115)
+plausible; XOM 4.42, MRK 7.16, XLE 3.57 run 30-40 % above a rough dividend-adjusted
+estimate and want a look at `served_after.first/last` before anyone quotes them.
+
+The after-ratios r1 produced for in-scope equities with full `adj_close` coverage land on
+the real 2010 → 2026 total-return ratios (GOOGL 18.3, AMZN 38.7, BRK-B 8.6, DUK 5.1, LOW
+13.0, DIS 4.3); their before-ratios were the split/dividend artefact.
 
 ## Repair plan for rows already written
 
@@ -128,6 +183,12 @@ timeout, and refused inside the 03:30-10:30 UTC DB window unless `--allow-db-win
    the repair day with the latest on-basis raw value (`ON CONFLICT DO NOTHING`);
 3. nothing is UPDATEd or DELETEd; a cell with no on-basis raw row stays dark and is counted.
 
+Reads: resolved rows by `feature_id` in one READ ONLY transaction, raw rows per
+`(series_id, calendar-year)` chunk each in its own short READ ONLY transaction (r1 held one
+connection 60-70 s per large feature). `--exclude <feature>` is repeatable;
+`--coverage-floor` defaults to 0.01. A plan whose status is not `IN_SCOPE` is never
+applied, whatever flags are passed.
+
 After applying, re-run the dry run: `served_after` ratios should be plausible and
 `jumps_gt_10pct` near zero; then `build_price_panel` for the 30-ticker universe should
 match Tiingo `adj_close` read through `store.observations.read_window` to within the
@@ -143,3 +204,14 @@ first-pull dividend drift above.
 | `realized_alpha_daily` rows with `spy_feature = spy_full` | `alpha_research/realized_alpha.py::load_spy_path` | `spy_full` carried adjusted vintages (2026-04-24/29) beside the receipted raw close | re-score affected windows after the repair; keep old rows (the table is a log) |
 
 The same list is in the script's JSON output under `downstream`.
+
+## Open items (found by the dry-run review, 2026-11-08)
+
+| item | evidence | owner / next step |
+|---|---|---|
+| `YF:HON:adj_close` has no SUCCESS row since **2026-04-17** while `YF:HON:close` continues | grid-svr read 2026-11-08: 1,267 rows 2021-04-01..2026-04-17, source TIINGO | puller: find why Tiingo's adj_close for HON stopped; check `pull_log` for every ticker whose `adj_close` max(obs_date) lags its `close`. Under the one-basis policy `hon_full` gets no new vintages until fixed |
+| Barrick (`GOLD`) in the Tiingo daily list has fed `gold_full` since **2025-12-02** | `YF:GOLD:adj_close` 3,500 rows 2025-12-02..2026-11-06 (TIINGO); `YF:GOLD:close` 10,840 rows since 1985 (KAGGLE_BULK, TIINGO) | the fallback guard stops new rows; `gold_full` rows dated 2025-12 onward whose latest vintage is a Barrick value (~$20-40 against ~$4,000 futures) still need a targeted retraction (own run tag, `resolved_series_retractions`), not this script |
+| `acn_full`, `hon_full` and any other `NEEDS_BACKFILL` feature | Tiingo `adj_close` backfill starts 2021-04-01 | backfill `YF:<T>:adj_close` 2010-01-01..2021-03-31 (Tiingo `tiingo-backfill`), then re-run the plan |
+| the 150-cell dark group shared by `qqq_full`, `dia_full`, `xle_full`, `xlv_full`, `xlu_full` (r2) | one obs_date range with no `adj_close` raw row on every SPDR/QQQ | the follow-up script reports it as `cells_newly_dark` with the range (≈ 3 % of cells, above the 1 % floor → `NEEDS_BACKFILL`) or as `cells_dark_before`; backfill that range if the former |
+| bare `BTC` / `ETH` / `SOL` written under the `YF:` namespace (yfinance 2025-11..2026-05, Tiingo 2026-03..04) | 122 / 21 rows, equity prices | both pullers exclude them today; rows are unmapped and harmless, delete nothing |
+
