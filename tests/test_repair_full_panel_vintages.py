@@ -360,6 +360,26 @@ class TestDarkAccounting:
         assert len(got) == 1 and got[0]["value"] == 70.5 and got[0]["from_pull_date"] == V1.isoformat()
         assert plan.cells_newly_dark == 0
 
+    def test_xlp_shape_holiday_junk_first_cell_is_cleared_and_the_ratio_moves(self) -> None:
+        """r2 on grid-svr: xlp_full served 2010-01-01 (a holiday) = 0.7245 first and 90.08 last,
+        ratio 124, 301 jumps, before AND after -- the dark holiday cell was refilled from the
+        junk print. The repaired series must start on a trading day with a sane ratio."""
+        days, rows, raw = _fixture()
+        holidays = [date(2024, 1, 1), date(2024, 1, 6), date(2024, 1, 7), date(2024, 1, 14)]
+        for i, h in enumerate(holidays):
+            assert h not in raw["close"]
+            raw["adj_close"][h] = [RawCandidate(0.7245, V3, 2)]
+            rows.append(ResolvedRow(id=8000 + i, obs_date=h, vintage_date=V3, value=0.7245, source_id=2))
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert plan.served_before["first"][0] == "2024-01-01" and plan.served_before["ratio"] > 90
+        assert plan.served_after["first"][0] == days[0].isoformat()
+        assert plan.after_first_on_trading_day is True
+        assert 1.0 < plan.served_after["ratio"] < 1.1 and plan.served_after["jumps_gt_10pct"] == 0
+        assert plan.cells_phantom_cleared == 4 and plan.cells_newly_dark == 0
+        assert not plan.revintage or all(v["value"] != 0.7245 for v in plan.revintage)
+        assert plan.status == IN_SCOPE and plan.applicable
+        assert plan.summary()["after_first_on_trading_day"] is True
+
     def test_clean_fixture_has_no_newly_dark_cells(self) -> None:
         _, rows, raw = _fixture()
         plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)

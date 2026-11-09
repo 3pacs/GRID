@@ -425,6 +425,9 @@ class FeaturePlan:
     cells_restored: int = 0
     newly_dark_share: float | None = None
     newly_dark_range: dict[str, Any] | None = None
+    #: False when the first cell the repaired series would serve has no raw
+    #: close row (a holiday junk print survived); None when nothing is served.
+    after_first_on_trading_day: bool | None = None
     backfill_hint: str | None = None
     raw_rows_read: dict[str, int] = field(default_factory=dict)
     served_before: dict[str, Any] = field(default_factory=dict)
@@ -564,6 +567,8 @@ def plan_feature(
             f"({len(newly_dark)} cells), then re-run this plan"
         )
     plan.served_after = ratio_and_jumps({d: r.value for d, r in after.items()})
+    if after:
+        plan.after_first_on_trading_day = min(after) in raw.get("close", {})
 
     for r in to_retract[:6]:
         plan.examples.append({"obs_date": r.obs_date.isoformat(), "vintage_date": r.vintage_date.isoformat(),
@@ -770,6 +775,7 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
             f"{plan.served_after.get('ratio')!s:>12} jumps {plan.served_before.get('jumps_gt_10pct')} -> "
             f"{plan.served_after.get('jumps_gt_10pct')}"
             + (f"  {plan.scope_reason}" if plan.scope_reason and plan.status != IN_SCOPE else "")
+            + ("  WARNING first served cell is not a trading day" if plan.after_first_on_trading_day is False else "")
             + (f"  ERROR {plan.error}" if plan.error else "")
             + (f"  APPLIED {plan.applied}" if plan.applied else ""),
             file=sys.stderr,
@@ -787,6 +793,7 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
         "complete": stopped is None and len(plans) == len(features),
         "errors": sum(1 for p in plans if p["error"]),
         "by_status": by_status,
+        "after_first_not_trading_day": sorted(p["feature"] for p in plans if p["after_first_on_trading_day"] is False),
         "totals": {
             "rows": sum(p["rows"] for p in plans), "retract": sum(p["retract"] for p in plans),
             "revintage": sum(p["revintage"] for p in plans), "left_dark": sum(p["cells_left_dark"] for p in plans),
