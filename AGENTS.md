@@ -400,3 +400,20 @@ is retired — two writers of `review.jsonl` would race; the pull mirror is reti
 `sudo install` (unchanged rule). Not verified here: the first scheduled run on grid-svr, the
 LLM extraction path against a live provider (no narrative exists in any current packet to
 extract from), and the deploy-time unit sync on the real host.
+
+## 2026-11-09 — Review visible to every agent; briefing figures graded (Claude)
+
+Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/grade_publication_review.py`:
+
+- Visibility: the review root is under `/home/grid/research` (0700, home 0750), so Codex on
+  Alien could read the packets but never the review. The grader now copies `review.jsonl`,
+  `grader-receipt.json` and `ingest-receipt.json` (allow-list, bytes unchanged, 0644) to
+  `/data/grid/outputs/publication-reviews/<D>/` on every WRITTEN or UNCHANGED day. The 10-day
+  lookback re-publishes the backlog on the next scheduled run; no manual step.
+- Every briefing was unscorable: the narratives state current levels and never forecast
+  (gridz4 extraction returns `[]` correctly). Each stated level on a series the generator reads
+  is now a `data_quality` row graded against what GRID knew at the publication instant (the
+  generator's own Yahoo reader, `read_latest(as_of_ts=stated_at)` for FRED). Nov 4-7 narratives
+  carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
+  the wrong clock for grading a past publication.
+

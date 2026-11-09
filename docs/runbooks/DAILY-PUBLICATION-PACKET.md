@@ -278,11 +278,24 @@ ingest enforces; the grader constructs rows so they pass by construction):
   publication sha + extraction setup (prompt version, tier, provider) under `<D>/extractions/`,
   re-validated against the text on read, so re-grades never call a model twice and a better model
   re-extracts instead of inheriting a weaker one's answer.
+- `market_briefings` narratives are mostly descriptive ("The VIX stands at 28.18"): every
+  current-state figure on a series the generator reads (`ollama/market_briefing.py` key_series:
+  VIX, VIX9D, VIX3M, S&P 500, Nasdaq, Dow, Russell 2000, HYG/LQD/JNK/EMB, GLD, UUP, T10Y2Y,
+  T10Y3M, DFF, DGS2, DGS5) becomes a `data_quality` row graded against what GRID knew at the
+  publication instant: Yahoo series through the generator's own reader, FRED through
+  `store.observations.read_latest(as_of_ts=stated_at)`. `confirmed` when equal at the printed
+  precision, `refuted` with both numbers otherwise, `unscorable` when no value was known.
+  Derived quantities (z-scores, momentum, ratios, moves in %) are skipped. This measures how
+  often a briefing misstates its own data, which no other check does.
 - A day whose verdict rows and header (packet sha, models) did not change is left alone
   (`UNCHANGED`); a change rewrites the file and the ingest records a new run that supersedes the
   previous one. A hand-off that failed (database down) is retried on the next run until the
   grader receipt records the file's sha as ingested. Nothing writes to
   `thesis_postmortems`.
+
+Readable by any fleet agent: `grid-svr:/data/grid/outputs/publication-reviews/<D>/` holds
+`review.jsonl`, `grader-receipt.json` and `ingest-receipt.json` (bytes unchanged, 0644), next to
+the public packet tree. The review root itself is under the grid user's 0700 home.
 
 Receipts, per day, under `$GRID_PUBLICATION_REVIEW_ROOT/<D>/`: `grader-receipt.json`
 (state WRITTEN/UNCHANGED/REFUSED/FAILED, verdict counts, review sha, the ingest's result) and
