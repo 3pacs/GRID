@@ -174,14 +174,58 @@ many of them can be re-vintaged from an on-basis raw row. Reads are bounded (res
 `feature_id`; raw by `(series_id, obs_date)` yearly chunks), READ ONLY, with a statement
 timeout, and refused inside the 03:30-10:30 UTC DB window unless `--allow-db-window`.
 
-`--apply --run-tag <tag>` (only on Anik's explicit word; Root/Anik decide):
+**2026-11-09 safety boundary: apply is disabled.** CLI `--apply`, `run(apply=True)`
+and direct `apply_plan` all refuse before opening a connection. The previous
+unreviewed per-feature executor and `ON CONFLICT DO NOTHING` writes were removed.
+A run tag is not admission. No current manifest, including r1/r2, authorizes repair.
+No corrected production r3 or historical repair is verified by this code change.
 
-1. inserts one `resolved_series_retractions` row per OFF_BASIS/OUTLIER row (append-only;
-   the FK keeps the retracted row; reads with `as_of` before the retraction day are
-   unchanged, reads from that day on no longer see it);
-2. for a cell left without a visible vintage, inserts ONE new `resolved_series` row dated
-   the repair day with the latest on-basis raw value (`ON CONFLICT DO NOTHING`);
-3. nothing is UPDATEd or DELETEd; a cell with no on-basis raw row stays dark and is counted.
+The report keeps the existing `features` summaries and count fields. Its new
+`manifest` contains a canonical SHA-256 identity and a review-only payload with:
+
+- Every exact proposed retraction (resolved ID/key/value/class/reason), every
+  re-vintage (key/value/source/pull date), and rejected candidates, without truncation.
+- Feature identity and feed, requested feature scope, completion/stopped/error state,
+  repair day, run tag, start bound, policy settings and relevant source-file hashes.
+- A canonical fingerprint and row counts over the complete **observed planner
+  inputs**, including resolved retraction flags and raw source/value/pull timestamps.
+  Fingerprints preserve duplicates and ignore row arrival order. Full source tables
+  are not duplicated in the artifact. The hash is not a PostgreSQL snapshot ID.
+
+`validate_review_manifest` checks a separately supplied reviewed digest against the
+artifact and a freshly reconstructed manifest. It rejects changed inputs, actions,
+code, policy, day or requested scope, incomplete/error manifests, unsafe features,
+and duplicate action keys. This is **offline identity validation only**, not proof
+of operator approval or an execution capability. `applicable` remains a planning
+summary for compatibility; it never means execution is enabled.
+
+A first served cell without raw close evidence now has `UNSAFE_FIRST_CELL` status,
+not a warning. Missing/unknown first-cell evidence never makes a plan applicable.
+Non-finite inputs and duplicate resolved identities fail planning. Same-time raw
+candidate conflicts use deterministic ordering for reproducible review, are disclosed
+in `candidate_ties`, and make the plan non-applicable; the ordering is not authority
+for choosing a source. Repair-day key collisions are reported rather than overwritten.
+
+`--out` uses exclusive creation and refuses to overwrite an existing review file.
+Retain the exact artifact and its digest separately in an operator-private location.
+The artifact is content-addressed/tamper-evident, not filesystem-immutable or signed.
+Input fingerprinting also temporarily materializes one feature's observed input rows
+and canonical JSON; it is not a streaming or constant-memory implementation.
+It can be large because all proposed actions are retained; review bounded feature
+batches rather than printing a multi-million-action artifact into public logs.
+
+**Remaining executor gate:** qualify snapshot acquisition and atomic change detection
+against concurrent inserts/retractions (including previously absent keys), enforce
+reviewed repair day and identity, and roll back the entire approved unit on conflict.
+Require append-only preservation of every original row, exact inserted action counts,
+atomic rollback (never silent conflict skipping), replay/idempotency, repair-day
+collision handling and reproducible pre-retraction PIT reads. The former simple
+apply/idempotency test is replaced by refusal tests, not evidence for these gates.
+Exercise adversarial races and PIT semantics in disposable PostgreSQL first, then
+obtain operational review and explicit production authorization. Chunked read-only
+transactions do not establish one snapshot, a re-read followed by a write has a race,
+and ordinary row locks do not protect absent keys. This patch introduces no broad
+production table locks and makes no concurrency-safety claim for a future executor.
 
 Reads: resolved rows by `feature_id` in one READ ONLY transaction, raw rows per
 `(series_id, calendar-year)` chunk each in its own short READ ONLY transaction (r1 held one
@@ -189,7 +233,7 @@ connection 60-70 s per large feature). `--exclude <feature>` is repeatable;
 `--coverage-floor` defaults to 0.01. A plan whose status is not `IN_SCOPE` is never
 applied, whatever flags are passed.
 
-After applying, re-run the dry run: `served_after` ratios should be plausible and
+After a future qualified and separately authorized repair, re-run the dry run: `served_after` ratios should be plausible and
 `jumps_gt_10pct` near zero; then `build_price_panel` for the 30-ticker universe should
 match Tiingo `adj_close` read through `store.observations.read_window` to within the
 first-pull dividend drift above.

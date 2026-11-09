@@ -401,7 +401,7 @@ class TestRunScope:
         from unittest.mock import MagicMock
         engine = MagicMock()
         report = rep.run(engine, ["gold_full", "btc_full", "eth_usd_full", "xlp_full"], start=date(2010, 1, 1),
-                         apply=True, run_tag="t", exclude={"xlp_full"},
+                         apply=False, run_tag="t", exclude={"xlp_full"},
                          clock=lambda: datetime(2026, 11, 10, 15, 0, tzinfo=timezone.utc))
         engine.connect.assert_not_called()
         engine.begin.assert_not_called()
@@ -430,3 +430,214 @@ class TestCliScope:
     def test_exclude_is_repeatable(self) -> None:
         args = rep.build_parser().parse_args(["--feature", "a_full", "--exclude", "x_full", "--exclude", "y_full"])
         assert args.exclude == ["x_full", "y_full"] and args.coverage_floor == rep.DEFAULT_COVERAGE_FLOOR
+
+
+class TestReviewOnlySafety:
+    @staticmethod
+    def manifest(rows=None, raw=None):
+        if rows is None:
+            _, rows, raw = _fixture()
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY, feature_id=7)
+        return rep.build_manifest([plan], repair_day=REPAIR_DAY, start=date(2010, 1, 1), coverage_floor=0.01)
+
+    def test_all_apply_entrypoints_refuse_without_connection(self, monkeypatch, capsys):
+        from unittest.mock import MagicMock
+        engine = MagicMock()
+        clock = MagicMock(side_effect=AssertionError("clock must not run"))
+        with pytest.raises(RuntimeError, match="apply disabled"):
+            rep.run(engine, ["xlp_full"], start=V1, apply=True, run_tag="tag", clock=clock)
+        for status in (IN_SCOPE, NEEDS_BACKFILL, EXCLUDED):
+            with pytest.raises(RuntimeError, match="apply disabled"):
+                rep.apply_plan(engine, rep.FeaturePlan("xlp_full", "XLP", "adj_close", status=status),
+                               run_tag="tag", timeout_ms=1)
+        monkeypatch.setattr(rep, "list_full_features", lambda *a: pytest.fail("enumeration attempted"))
+        assert rep.main(["--all-full-features", "--apply", "--run-tag", "tag"], engine=engine) == 2
+        assert "apply disabled" in capsys.readouterr().err
+        assert not engine.mock_calls and not clock.mock_calls
+
+    def test_surviving_first_holiday_is_not_applicable(self):
+        _, rows, raw = _fixture()
+        holiday = date(2024, 1, 1)
+        rows.append(ResolvedRow(9999, holiday, V1, 70.0, 3))
+        raw["adj_close"][holiday] = [RawCandidate(70.0, V1, 3)]
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert plan.retract and plan.after_first_on_trading_day is False
+        assert plan.status == rep.UNSAFE_FIRST_CELL and not plan.applicable
+        plan.status = IN_SCOPE
+        plan.after_first_on_trading_day = None
+        assert not plan.applicable
+
+    def test_full_actions_and_canonical_order(self):
+        _, rows, raw = _fixture()
+        a = self.manifest(rows, raw)
+        for dates in raw.values():
+            for candidates in dates.values():
+                candidates.reverse()
+        b = self.manifest(list(reversed(rows)), raw)
+        assert a == b
+        assert len(a["payload"]["features"][0]["retract"]) == 45
+        assert a["payload"]["executor"] == "disabled"
+        rep.validate_review_manifest(a, reviewed_sha256=a["sha256"], current_manifest=b)
+
+    @pytest.mark.parametrize("mutation", ["raw_value", "raw_source", "raw_pull", "raw_timestamp", "retracted", "insert"])
+    def test_changed_inputs_are_not_admitted(self, mutation):
+        _, rows, raw = _fixture()
+        a = self.manifest(rows, raw)
+        c = next(iter(raw["adj_close"].values()))[0]
+        if mutation == "raw_value":
+            c.value += 0.01
+        if mutation == "raw_source":
+            c.source_id += 1
+        if mutation == "raw_pull":
+            c.pull_date += timedelta(days=1)
+        if mutation == "raw_timestamp":
+            c.pull_timestamp = "2026-04-24T12:00:00+00:00"
+        if mutation == "retracted":
+            rows[0].retracted = True
+        if mutation == "insert":
+            rows.append(ResolvedRow(9999, rows[0].obs_date, REPAIR_DAY, 70.0, 3))
+        b = self.manifest(rows, raw)
+        with pytest.raises(ValueError, match="changed"):
+            rep.validate_review_manifest(a, reviewed_sha256=a["sha256"], current_manifest=b)
+
+    def test_tamper_and_missing_review_identity_rejected(self):
+        import copy
+        a = self.manifest()
+        with pytest.raises(ValueError, match="required"):
+            rep.validate_review_manifest(a, reviewed_sha256="", current_manifest=a)
+        b = copy.deepcopy(a)
+        b["payload"]["features"][0]["retract"][0]["value"] += 1
+        with pytest.raises(ValueError, match="digest mismatch"):
+            rep.validate_review_manifest(b, reviewed_sha256=a["sha256"], current_manifest=a)
+        b["sha256"] = rep.digest(b["payload"])
+        with pytest.raises(ValueError, match="changed"):
+            rep.validate_review_manifest(b, reviewed_sha256=a["sha256"], current_manifest=b)
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_inputs_rejected(self, value):
+        _, rows, raw = _fixture()
+        rows[0].value = value
+        with pytest.raises(ValueError, match="non-finite"):
+            self.manifest(rows, raw)
+        with pytest.raises(ValueError):
+            rep.canonical_bytes({"value": value})
+
+    def test_duplicate_action_rejected_even_if_rehashed(self):
+        a = self.manifest()
+        actions = a["payload"]["features"][0]["retract"]
+        actions.append(actions[0].copy())
+        a["sha256"] = rep.digest(a["payload"])
+        with pytest.raises(ValueError, match="duplicate action"):
+            rep.validate_review_manifest(a, reviewed_sha256=a["sha256"], current_manifest=a)
+
+    def test_repair_day_collision_is_not_revintaged(self):
+        days, rows, raw = _fixture()
+        d = days[0]
+        rows = [r for r in rows if r.obs_date != d]
+        rows.append(ResolvedRow(9999, d, REPAIR_DAY, raw["close"][d][0].value, 3))
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert not any(r["obs_date"] == d.isoformat() for r in plan.revintage)
+        assert any("key already used" in r["why"] for r in plan.revintage_rejected)
+
+    def test_same_time_candidate_tie_is_deterministic_and_blocks_admission(self):
+        days, rows, raw = _fixture()
+        d = days[0]
+        rows = [r for r in rows if r.obs_date != d or r.vintage_date == V2]
+        raw["adj_close"][d] = [RawCandidate(70.0, V3, 3), RawCandidate(71.0, V3, 4)]
+        a = self.manifest(rows, raw)
+        raw["adj_close"][d].reverse()
+        b = self.manifest(rows, raw)
+        assert a == b
+        p = a["payload"]["features"][0]
+        assert p["candidate_ties"] and p["error"]
+
+
+    @pytest.mark.parametrize("field,value", [("repair_day", "2026-11-11"), ("start", "2011-01-01"),
+                                             ("run_tag", "changed")])
+    def test_review_context_changes_require_new_identity(self, field, value):
+        import copy
+        a = self.manifest()
+        b = copy.deepcopy(a)
+        b["payload"][field] = value
+        b["sha256"] = rep.digest(b["payload"])
+        with pytest.raises(ValueError, match="changed"):
+            rep.validate_review_manifest(a, reviewed_sha256=a["sha256"], current_manifest=b)
+
+    @pytest.mark.parametrize("mutation", ["schema", "executor", "snapshot", "incomplete", "duplicate_feature"])
+    def test_invalid_manifest_shapes_refused(self, mutation):
+        a = self.manifest()
+        p = a["payload"]
+        if mutation == "schema":
+            del p["policy"]
+        if mutation == "executor":
+            p["executor"] = "enabled"
+        if mutation == "snapshot":
+            p["snapshot_semantics"] = "trusted"
+        if mutation == "incomplete":
+            p["requested_features"].append("missing_full")
+        if mutation == "duplicate_feature":
+            p["features"].append(p["features"][0].copy())
+        a["sha256"] = rep.digest(p)
+        with pytest.raises(ValueError):
+            rep.validate_review_manifest(a, reviewed_sha256=a["sha256"], current_manifest=a)
+
+    def test_duplicate_resolved_identity_refused(self):
+        _, rows, raw = _fixture()
+        rows.append(rows[0])
+        with pytest.raises(ValueError, match="duplicate resolved"):
+            self.manifest(rows, raw)
+
+    def test_raw_nonfinite_input_refused(self):
+        _, rows, raw = _fixture()
+        next(iter(raw["adj_close"].values()))[0].value = float("nan")
+        with pytest.raises(ValueError, match="non-finite"):
+            self.manifest(rows, raw)
+
+    def test_timestamp_fractional_precision_order(self):
+        from unittest.mock import MagicMock
+        d = date(2024, 1, 2)
+        conn = MagicMock()
+        conn.execute.return_value = [(d, 70.0, datetime(2026, 5, 2, 6, tzinfo=timezone.utc), 3),
+                                     (d, 71.0, datetime(2026, 5, 2, 6, microsecond=1, tzinfo=timezone.utc), 3)]
+        into = {}
+        rep.read_raw_chunk(conn, "YF:XLP:adj_close", d, d, into)
+        assert max(into[d], key=rep.candidate_order).value == 71.0
+
+    def test_output_never_overwrites_review_file(self, monkeypatch, tmp_path):
+        output = tmp_path / "review.json"
+        output.write_text("reviewed original")
+        monkeypatch.setattr(rep, "run", lambda *a, **k: {"complete": True, "errors": 0})
+        with pytest.raises(FileExistsError):
+            rep.main(["--feature", "xlp_full", "--out", str(output)], engine=object())
+        assert output.read_text() == "reviewed original"
+
+
+    def test_cli_refuses_before_db_import_with_no_engine(self, monkeypatch):
+        import builtins
+        original = builtins.__import__
+
+        def guarded(name, *args, **kwargs):
+            if name == "db":
+                pytest.fail("database module imported for rejected apply")
+            return original(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded)
+        assert rep.main(["--all-full-features", "--apply", "--run-tag", "t"], engine=None) == 2
+
+    def test_incomplete_prefix_manifest_is_not_admitted(self):
+        _, rows, raw = _fixture()
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY, feature_id=7)
+        m = rep.build_manifest([plan], repair_day=REPAIR_DAY, start=V1, coverage_floor=0.01,
+                               requested_features=["xlp_full", "hon_full"], stopped="db_window")
+        assert not m["payload"]["complete"]
+        with pytest.raises(ValueError, match="incomplete"):
+            rep.validate_review_manifest(m, reviewed_sha256=m["sha256"], current_manifest=m)
+
+    def test_unsafe_first_cell_manifest_is_not_admitted(self):
+        _, rows, raw = _fixture()
+        holiday = date(2024, 1, 1)
+        rows.append(ResolvedRow(9999, holiday, V1, 70.0, 3))
+        raw["adj_close"][holiday] = [RawCandidate(70.0, V1, 3)]
+        m = self.manifest(rows, raw)
+        with pytest.raises(ValueError, match="unsafe feature"):
+            rep.validate_review_manifest(m, reviewed_sha256=m["sha256"], current_manifest=m)
