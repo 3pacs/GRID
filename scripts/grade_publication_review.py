@@ -738,6 +738,22 @@ def verdict_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def confirmed_ingest(receipt: dict[str, Any], review_sha: str, packet_sha: str) -> dict[str, Any] | None:
+    """Only v2 evidence copied from the ingest's actual byte identity can skip a hand-off.
+
+    Legacy ingested_review_sha256 alone was fabricated by --no-ingest in v1. It is
+    not evidence. The next normal run reconciles it through the idempotent ingest.
+    """
+    confirmation = receipt.get("ingest_confirmation")
+    if (isinstance(confirmation, dict)
+            and confirmation.get("schema") == "publication-review-ingest-confirmation-v1"
+            and confirmation.get("review_sha256") == review_sha
+            and confirmation.get("packet_sha256") == packet_sha
+            and type(confirmation.get("run_id")) is int and confirmation["run_id"] > 0):
+        return dict(confirmation)
+    return None
+
+
 def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT, review_root: Path = DEFAULT_REVIEW_ROOT,
               dry_run: bool = False, now: datetime | None = None, client_factory: Any = None,
               ingest: bool = True, force: bool = False) -> dict[str, Any]:
@@ -789,7 +805,8 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             receipt["review_sha256"] = sha256(before[0])
             # The file on disk is current; make sure the database agrees. A hand-off that failed
             # on an earlier run (database down, module error) is retried here, not forgotten.
-            if ingest and previous_receipt(folder).get("ingested_review_sha256") != receipt["review_sha256"]:
+            prior_confirmation = confirmed_ingest(previous_receipt(folder), receipt["review_sha256"], packet.sha256)
+            if ingest and prior_confirmation is None:
                 receipt["ingest"] = run_ingest(engine, day, review_root, packet_root)
         else:
             write_file(path, payload)
@@ -797,10 +814,26 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             receipt["superseded_previous"] = before is not None
             if ingest:
                 receipt["ingest"] = run_ingest(engine, day, review_root, packet_root)
-        if receipt.get("ingest", {}).get("state") in {"INGESTED", "PRESENT"}:
-            receipt["ingested_review_sha256"] = receipt["review_sha256"]
-        elif "ingest" not in receipt and receipt["state"] == "UNCHANGED":
-            receipt["ingested_review_sha256"] = receipt["review_sha256"]   # confirmed by the previous receipt
+        result = receipt.get("ingest", {})
+        if result.get("state") in {"INGESTED", "PRESENT"}:
+            # The ingest reopens the file. Another invocation could have replaced it
+            # after our write/read: certify its returned bytes, never just its status.
+            if (result.get("review_sha256") != receipt["review_sha256"]
+                    or result.get("packet_sha256") != packet.sha256
+                    or type(result.get("run_id")) is not int or result["run_id"] <= 0):
+                receipt["ingest_confirmation_error"] = "ingest result does not bind the expected review, packet and run"
+            elif result.get("rejected_rows") != 0 or result.get("declared_mismatch") != []:
+                receipt["ingest_confirmation_error"] = "ingest result is incomplete or has rejected rows"
+            else:
+                receipt["ingest_confirmation"] = {
+                    "schema": "publication-review-ingest-confirmation-v1",
+                    "review_sha256": result["review_sha256"], "packet_sha256": result["packet_sha256"],
+                    "run_id": result["run_id"],
+                }
+        elif "ingest" not in receipt and unchanged and prior_confirmation is not None:
+            receipt["ingest_confirmation"] = prior_confirmation
+        if "ingest_confirmation" in receipt:
+            receipt["ingested_review_sha256"] = receipt["ingest_confirmation"]["review_sha256"]
     except Refused as exc:
         receipt.update(state="REFUSED", reason=str(exc))
     except Exception as exc:  # the receipt must exist; the type is the public reason
@@ -826,7 +859,7 @@ def run_ingest(engine: Any, day: date, review_root: Path, packet_root: Path) -> 
         traceback.print_exc(file=sys.stderr)
         return {"state": "FAILED", "reason": f"hand-off: {type(exc).__name__}"}
     return {key: result.get(key) for key in ("state", "reason", "run_id", "accepted_rows", "rejected_rows",
-                                              "declared_mismatch", "receipt_file")}
+                                              "declared_mismatch", "receipt_file", "review_sha256", "packet_sha256")}
 
 
 def _ingest_module() -> Any:
@@ -855,7 +888,8 @@ def exit_code(receipts: list[dict[str, Any]]) -> int:
         return 1
     for r in receipts:
         ing = r.get("ingest") or {}
-        if ing.get("state") in {"REFUSED", "FAILED"} or ing.get("rejected_rows") or ing.get("declared_mismatch"):
+        if (r.get("ingest_confirmation_error") or ing.get("state") in {"REFUSED", "FAILED"}
+                or ing.get("rejected_rows") or ing.get("declared_mismatch")):
             return 3
     return 0
 
