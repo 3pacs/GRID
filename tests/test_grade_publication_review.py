@@ -883,7 +883,9 @@ def test_read_vintages_returns_every_accepted_vintage_bounded():
                 @staticmethod
                 def fetchall():
                     return [(FRI, 21.0, _z(FRI, 15), "yfinance"), (FRI, None, _z(FRI, 16), "yfinance"),
-                            (FRI, 26.9, _z(FRI, 21, 20), "TIINGO")]
+                            # A second source's vintage. Not TIINGO: Tiingo cannot serve
+                            # an index, so tiingo_symbol_contract drops its ^VIX rows.
+                            (FRI, 26.9, _z(FRI, 21, 20), "cboe")]
             return R()
 
     conn = Conn()
@@ -891,7 +893,7 @@ def test_read_vintages_returns_every_accepted_vintage_bounded():
     sql, params = conn.seen
     assert "pull_status = :ok" in sql and "obs_date >= :start" in sql and "LIMIT :limit" in sql
     assert params == {"sid": "YF:^VIX:close", "ok": "SUCCESS", "start": THU, "end": FRI, "limit": obs_mod.MAX_VINTAGES}
-    assert [(o.value, o.source) for o in out] == [(21.0, "yfinance"), (26.9, "TIINGO")]
+    assert [(o.value, o.source) for o in out] == [(21.0, "yfinance"), (26.9, "cboe")]
 
 
 # ── public copy of the review ───────────────────────────────────────────────────────────
