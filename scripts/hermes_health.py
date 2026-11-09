@@ -780,6 +780,11 @@ _NOT_CONFIGURED_MARKERS = (
     "missing api key",
     "token configured",
     "not installed",
+    # Owner-side key/plan limits reported as SKIPPED (2026-11-09):
+    # CryptoQuant 401/403, WorldNewsAPI 402.
+    "api_key rejected",
+    "plan not entitled",
+    "402 payment required",
 )
 
 
