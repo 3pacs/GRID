@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     # credentials or the network. Turning it on is an operator decision made in a
     # reviewed change; Schwab data is private and may not be redistributed.
     SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
+    # Existing GEX dashboard projections through GRID, admin-only and default-off.
+    # Enable only after private audience/entitlement and live parity review.
+    GAMMA_WATCH_PRIVATE_VIEWS_ENABLED: bool = False
 
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
@@ -656,6 +659,7 @@ class Settings(BaseSettings):
         "GRID_TRUST_PRUNE_NO_EDGE",
         "GRID_API_PRECOMPUTE_ENABLED",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
+        "GAMMA_WATCH_PRIVATE_VIEWS_ENABLED",
         mode="before",
     )
     @classmethod
