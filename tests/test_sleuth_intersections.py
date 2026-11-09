@@ -44,6 +44,7 @@ def _obs(family, ticker="NVDA", direction="up", d=END, **cite):
     ("options_flow", "UNUSUAL_OPTIONS", {"direction": "STRADDLE"}, None),
     ("insider", "BUY", {}, ("insider", "up")),
     ("insider", "UNUSUAL_SELL", {}, ("insider", "down")),
+    ("insider", "CLUSTER_BUY", {}, None),  # summary of buys that already vote
     ("quiverquant:insider", "insider_buy", {"TransactionCode": "P"}, ("insider", "up")),
     ("congressional", "SELL", {}, ("congress", "down")),
     ("gov_contract", "CONTRACT_AWARD", {"amount": 1e6}, ("gov_contract", "up")),

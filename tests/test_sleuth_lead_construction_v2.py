@@ -160,3 +160,14 @@ def test_other_families_and_nameless_rows_are_not_deduplicated():
 ])
 def test_insider_actor_normalises_both_feeds(source, source_id, value, expected):
     assert si.insider_actor(source, source_id, value) == expected
+
+
+def test_a_cluster_summary_row_adds_no_vote():
+    # One buy, one sale and the SEC puller's cluster row: still a split vote.
+    rows = [(1, "insider", "LOEB DANIEL S", "ADI", DAY, "BUY", {}),
+            (2, "insider", "STATA RAY", "ADI", DAY, "SELL", {}),
+            (3, "insider", "cluster_adi", "ADI", DAY, "CLUSTER_BUY", {"insiders": 2})]
+    obs = _collect(rows)
+    assert [o.citation["id"] for o in obs] == [1, 2]
+    (vote,) = si.family_votes(obs)
+    assert vote.direction is None
