@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Repair plan for ``{ticker}_full`` resolved vintages written on the wrong price basis.
 
-Dry run by default: reads only, reports counts, writes nothing. ``--apply``
-performs the repair and is refused without ``--run-tag`` and outside the
-operator's explicit go-ahead (this script cannot check that; the person
-running it can). Nothing here ever UPDATEs or DELETEs a row.
+Review-only: reads bounded chunks and emits a full, content-addressed manifest.
+All apply entry points are disabled pending a concurrency-qualified executor.
+A digest identifies reviewed bytes; it is not approval or proof of a DB snapshot.
 
 Background (docs/reference/PRICE_PANEL_BASIS.md, 2026-11-08). Until
 normalization/entity_map.py's PRICE BASIS POLICY both ``YF:<T>:adj_close``
@@ -13,8 +12,8 @@ dividend/split-adjusted and raw closes. ``build_price_panel`` read the
 latest vintage per date and the universal split adjuster compounded the
 flips (XLP first-to-last ratio 8e201, GLD 2,071x, NVDA 366x). The code fix
 stops new wrong-basis vintages; the rows already written are still served
-for every ``as_of`` that reaches them. This script plans and, on request,
-performs the repair of those rows.
+for every ``as_of`` that reaches them. This script only plans the repair;
+execution remains disabled pending independent concurrency qualification.
 
 Scope (added 2026-11-08 after the first dry run on grid-svr). A feature is
 planned only when the entity map feeds it from the policy's single yfinance
@@ -49,19 +48,12 @@ What the repair does, per IN_SCOPE feature:
    the median of its neighbouring on-basis cells is an OUTLIER (the
    ~0.6 holiday prints a yfinance writer stamped into XLP/XLB/XLRE
    adj_close).
-2. ``--apply`` retracts OFF_BASIS and OUTLIER rows through
-   ``resolved_series_retractions`` (append-only, PIT-safe: reads with
-   ``as_of`` before the retraction day still reproduce exactly what they
-   served; reads from today on no longer see the row). The row itself is
-   not touched.
-3. A cell left with no visible vintage gets ONE new vintage dated the
-   repair day, carrying the latest on-basis raw value (ON CONFLICT DO
-   NOTHING on the unique key) -- provided the date has a raw close row (a
-   real trading day) and the value is not itself an outlier against the
-   neighbouring cells; otherwise the latest sane candidate, or nothing
-   (``revintage_rejected`` lists why). The r1/r2 plans re-vintaged XLP's
-   0.6 holiday junk from the junk print itself; this rule is the fix. A
-   cell with no usable on-basis raw row stays dark and is counted.
+2. Lists exact proposed OFF_BASIS/OUTLIER retractions and replacement
+   vintages. No executor is enabled. The future executor must bind its
+   reviewed identity and protect the entire read/write scope against races.
+3. Rejects re-vintage candidates on dates without raw close evidence or
+   with outlier values. A surviving first cell without raw close evidence
+   makes the plan UNSAFE_FIRST_CELL, never applicable.
 
 Dark-cell accounting: ``cells_dark_before`` (no visible row today: every row
 already retracted, typically the backdated fill rows retracted by
@@ -88,11 +80,9 @@ Usage::
     python scripts/repair_full_panel_vintages.py --feature xlp_full --feature gld_full
     python scripts/repair_full_panel_vintages.py --all-full-features --max-features 40 --out plan.json
     python scripts/repair_full_panel_vintages.py --all-full-features --exclude lly_full --out plan.json
-    python scripts/repair_full_panel_vintages.py --feature xlp_full --apply --run-tag full-basis-20261108
 
-Exit status: 0 complete (dry run or apply); 1 any feature reported an error
-or the run stopped at the DB window; 2 usage refused (apply without run-tag,
-retractions table missing).
+Exit status: 0 complete dry run; 1 feature error or DB window stop;
+2 usage refused (including every --apply request). --out refuses overwrite.
 
 Output: JSON on stdout (machine-readable first), one summary line per
 feature on stderr. The ``downstream`` block names the records that read the
@@ -103,7 +93,9 @@ script does not touch them.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import re
 import statistics
 import sys
@@ -153,6 +145,8 @@ OUT_OF_SCOPE = "OUT_OF_SCOPE"
 NO_BASIS_SPLIT = "NO_BASIS_SPLIT"
 EXCLUDED = "EXCLUDED"
 NEEDS_BACKFILL = "NEEDS_BACKFILL"
+UNSAFE_FIRST_CELL = "UNSAFE_FIRST_CELL"
+APPLY_DISABLED = "apply disabled: no concurrency-qualified reviewed-manifest executor"
 APPLICABLE_STATUSES = frozenset({IN_SCOPE})
 
 _YF_PRICE_RE = re.compile(r"^YF:(?P<ticker>[^:]+):(?P<field>close|adj_close)$")
@@ -295,6 +289,7 @@ class RawCandidate:
     value: float
     pull_date: date
     source_id: int
+    pull_timestamp: str | None = None
 
 
 def classify_rows(
@@ -435,10 +430,14 @@ class FeaturePlan:
     examples: list[dict[str, Any]] = field(default_factory=list)
     applied: dict[str, int] | None = None
     error: str | None = None
+    candidate_ties: list[dict[str, Any]] = field(default_factory=list)
+    input_counts: dict[str, int] = field(default_factory=dict)
+    input_sha256: str | None = None
 
     @property
     def applicable(self) -> bool:
-        return self.status in APPLICABLE_STATUSES and self.error is None and bool(self.retract or self.revintage)
+        return (self.status in APPLICABLE_STATUSES and self.error is None
+                and self.after_first_on_trading_day is True and bool(self.retract or self.revintage))
 
     def summary(self) -> dict[str, Any]:
         d = asdict(self)
@@ -447,6 +446,111 @@ class FeaturePlan:
         d["revintage_rejected"] = len(self.revintage_rejected)
         d["applicable"] = self.applicable
         return d
+
+
+def canonical_bytes(value: Any) -> bytes:
+    """Stable UTF-8 JSON; non-finite numbers and unsupported types are refused."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def source_identity() -> dict[str, str]:
+    root = Path(__file__).resolve().parent.parent
+    return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in (
+        "scripts/repair_full_panel_vintages.py", "normalization/entity_map.py", "price_close_contract.py")}
+
+
+def build_manifest(plans: list[FeaturePlan], *, repair_day: date, start: date,
+                   coverage_floor: float, exclude: Iterable[str] = (), run_tag: str | None = None,
+                   requested_features: list[str] | None = None, stopped: str | None = None) -> dict[str, Any]:
+    """Full review artifact, separate from the backwards-compatible count summary.
+
+    Identity covers actions AND all observed planner inputs. Chunked reads are
+    not a coherent PostgreSQL snapshot, and cannot authorize a future write.
+    """
+    requested = sorted(requested_features if requested_features is not None else [p.feature for p in plans])
+    names = [p.feature for p in plans]
+    ids = [p.feature_id for p in plans if p.feature_id is not None]
+    if len(requested) != len(set(requested)) or len(names) != len(set(names)) or len(ids) != len(set(ids)):
+        raise ValueError("duplicate feature name or ID")
+    payload = {
+        "requested_features": requested, "complete": stopped is None and sorted(names) == requested,
+        "stopped": stopped, "errors": sum(p.error is not None for p in plans),
+        "schema": "full-panel-review-v1", "executor": "disabled",
+        "snapshot_semantics": "observed chunked reads; not a coherent database snapshot",
+        "repair_day": repair_day.isoformat(), "start": start.isoformat(), "run_tag": run_tag,
+        "code_sha256": source_identity(),
+        "policy": {"coverage_floor": coverage_floor, "exclude": sorted(set(exclude)),
+                   "value_tol_rel": VALUE_TOL_REL, "value_tol_abs": VALUE_TOL_ABS,
+                   "outlier_rel": OUTLIER_REL, "outlier_neighbours": OUTLIER_NEIGHBOURS,
+                   "raw_close_full_features": sorted(RAW_CLOSE_FULL_FEATURES)},
+        "features": [asdict(p) for p in sorted(plans, key=lambda p: p.feature)],
+    }
+    return {"sha256": digest(payload), "payload": payload}
+
+
+def validate_review_manifest(manifest: dict[str, Any], *, reviewed_sha256: str,
+                             current_manifest: dict[str, Any]) -> None:
+    """Offline identity admission only. Never executes or treats a hash as approval.
+
+    The caller supplies the separately reviewed digest and a freshly reconstructed
+    artifact. This detects changes in observed inputs, actions, code or policy;
+    it does NOT close the check/write race, so apply remains unconditionally off.
+    """
+    if not isinstance(reviewed_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", reviewed_sha256):
+        raise ValueError("a reviewed manifest SHA-256 identity is required")
+    required = {"schema", "executor", "snapshot_semantics", "repair_day", "start", "run_tag",
+                "code_sha256", "policy", "features", "requested_features", "complete", "stopped", "errors"}
+    for candidate in (manifest, current_manifest):
+        if set(candidate) != {"sha256", "payload"} or digest(candidate["payload"]) != candidate["sha256"]:
+            raise ValueError("manifest digest mismatch")
+        payload = candidate["payload"]
+        if set(payload) != required or payload["executor"] != "disabled" or payload["snapshot_semantics"] != (
+            "observed chunked reads; not a coherent database snapshot"
+        ):
+            raise ValueError("invalid review-only manifest schema")
+        names = [p["feature"] for p in payload["features"]]
+        ids = [p["feature_id"] for p in payload["features"] if p["feature_id"] is not None]
+        requested = payload["requested_features"]
+        if (len(names) != len(set(names)) or len(ids) != len(set(ids))
+                or len(requested) != len(set(requested))):
+            raise ValueError("duplicate feature identity")
+        if (payload["complete"] is not True or payload["stopped"] is not None or payload["errors"] != 0
+                or sorted(names) != sorted(requested)):
+            raise ValueError("incomplete or failed review manifest")
+        for plan in payload["features"]:
+            if plan["error"] or (plan["retract"] or plan["revintage"]) and (
+                plan["status"] != IN_SCOPE or plan["after_first_on_trading_day"] is not True
+            ):
+                raise ValueError("unsafe feature plan")
+            for action in ("retract", "revintage"):
+                keys = [(row["obs_date"], row["vintage_date"]) for row in plan[action]]
+                if len(keys) != len(set(keys)):
+                    raise ValueError("duplicate action key")
+        if candidate["payload"].get("schema") != "full-panel-review-v1":
+            raise ValueError("unsupported manifest schema")
+    if manifest["sha256"] != reviewed_sha256 or current_manifest["sha256"] != reviewed_sha256:
+        raise ValueError("reviewed identity or current inputs/code/policy changed")
+
+
+def capture_inputs(rows: list[ResolvedRow], raw: dict[str, dict[date, list[RawCandidate]]]) -> dict[str, Any]:
+    resolved = [{"id": r.id, "obs_date": r.obs_date.isoformat(), "vintage_date": r.vintage_date.isoformat(),
+                 "value": r.value, "source_id": r.source_id, "retracted": r.retracted} for r in rows]
+    candidates = [{"field": fld, "obs_date": day.isoformat(), "value": c.value,
+                   "pull_date": c.pull_date.isoformat(), "pull_timestamp": c.pull_timestamp,
+                   "source_id": c.source_id}
+                  for fld, dates in raw.items() for day, cs in dates.items() for c in cs]
+    return {"resolved": sorted(resolved, key=canonical_bytes), "raw": sorted(candidates, key=canonical_bytes)}
+
+
+def candidate_order(c: RawCandidate) -> tuple:
+    # Timestamp precision is retained from the DB. Same-time ties use a stable
+    # source/value ordering, never unspecified SQL arrival order.
+    return c.pull_date, c.pull_timestamp or "", c.source_id, c.value
 
 
 def plan_from_scope(scope: Scope, feature_id: int | None = None) -> FeaturePlan:
@@ -474,8 +578,22 @@ def plan_feature(
     """
     if scope is None:
         scope = feature_scope(feature)
+    if not math.isfinite(coverage_floor) or not 0 <= coverage_floor <= 1:
+        raise ValueError("coverage_floor must be a finite share")
+    if any(not math.isfinite(r.value) for r in rows) or any(
+        not math.isfinite(c.value) for dates in raw.values() for cs in dates.values() for c in cs
+    ):
+        raise ValueError("non-finite price input")
+    keys = [(r.obs_date, r.vintage_date) for r in rows]
+    if len(keys) != len(set(keys)) or len({r.id for r in rows}) != len(rows):
+        raise ValueError("duplicate resolved identity")
+    rows = sorted(rows, key=lambda r: (r.obs_date, r.vintage_date, r.id))
     target = scope.target_field
     plan = plan_from_scope(scope, feature_id)
+    observed = capture_inputs(rows, raw)
+    plan.input_sha256 = digest(observed)
+    plan.input_counts = {k: len(v) for k, v in observed.items()}
+    del observed
     plan.rows, plan.cells = len(rows), len({r.obs_date for r in rows})
     classify_rows(rows, raw, target)
     flag_outliers(rows)
@@ -518,13 +636,18 @@ def plan_feature(
             # only ever held a junk adj_close row. Nothing honest to serve.
             plan.revintage_rejected.append({"obs_date": d.isoformat(), "why": "no raw close row: not a trading day"})
             continue
-        best = max(cands, key=lambda c: c.pull_date)
+        best = max(cands, key=candidate_order)
+        tied = [c for c in cands if (c.pull_date, c.pull_timestamp) == (best.pull_date, best.pull_timestamp)]
+        if len({(c.source_id, c.value) for c in tied}) > 1:
+            plan.candidate_ties.append({"obs_date": d.isoformat(),
+                                        "why": "same-time candidates differ; deterministic ordering is not source authority"})
+            plan.error = "conflicting latest raw candidates require review"
         pct = reference.deviation(d, best.value)
         if pct is not None and abs(pct) > OUTLIER_REL:
             # The latest on-basis raw value is itself a junk print (the r2 plan
             # would have re-inserted XLP's 0.6 holiday prints under today's
             # vintage). Try the latest sane candidate instead.
-            sane = [c for c in sorted(cands, key=lambda c: c.pull_date, reverse=True)
+            sane = [c for c in sorted(cands, key=candidate_order, reverse=True)
                     if (p2 := reference.deviation(d, c.value)) is None or abs(p2) <= OUTLIER_REL]
             if not sane:
                 plan.revintage_rejected.append({"obs_date": d.isoformat(), "value": best.value,
@@ -568,7 +691,10 @@ def plan_feature(
         )
     plan.served_after = ratio_and_jumps({d: r.value for d, r in after.items()})
     if after:
-        plan.after_first_on_trading_day = min(after) in raw.get("close", {})
+        plan.after_first_on_trading_day = bool(raw.get("close", {}).get(min(after)))
+        if plan.after_first_on_trading_day is False:
+            plan.status = UNSAFE_FIRST_CELL
+            plan.scope_reason = "first served cell has no raw close trading-day evidence; review required"
 
     for r in to_retract[:6]:
         plan.examples.append({"obs_date": r.obs_date.isoformat(), "vintage_date": r.vintage_date.isoformat(),
@@ -639,7 +765,9 @@ def read_raw_chunk(conn: Connection, sid: str, lo: date, hi: date, into: dict[da
         if val is None:
             continue
         pulled = ts.astimezone(timezone.utc).date() if isinstance(ts, datetime) and ts.tzinfo else _as_date(ts)
-        into.setdefault(_as_date(od), []).append(RawCandidate(float(val), pulled, int(src)))
+        into.setdefault(_as_date(od), []).append(RawCandidate(
+            float(val), pulled, int(src),
+            ts.astimezone(timezone.utc).isoformat(timespec="microseconds") if isinstance(ts, datetime) and ts.tzinfo else str(ts)))
         n += 1
     return n
 
@@ -690,41 +818,9 @@ def plan_feature_db(engine: Engine, feature: str, *, start: date, repair_day: da
 # apply (explicit flag only)
 # ---------------------------------------------------------------------------
 
-_RETRACT_SQL = text("""
-    INSERT INTO resolved_series_retractions (feature_id, obs_date, vintage_date, reason, run_tag)
-    VALUES (:fid, :od, :vd, :reason, :tag)
-    ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING
-""")
-_REVINTAGE_SQL = text("""
-    INSERT INTO resolved_series
-        (feature_id, obs_date, release_date, vintage_date, value, source_priority_used, conflict_flag)
-    VALUES (:fid, :od, :vd, :vd, :val, :src, FALSE)
-    ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING
-""")
-
-
 def apply_plan(engine: Engine, plan: FeaturePlan, *, run_tag: str, timeout_ms: int) -> dict[str, int]:
-    """Write the plan's retractions and re-vintages in one transaction. Appends only."""
-    if plan.feature_id is None or plan.error:
-        raise RuntimeError(f"{plan.feature}: nothing to apply ({plan.error})")
-    if plan.status not in APPLICABLE_STATUSES:
-        raise RuntimeError(f"{plan.feature}: status {plan.status} is not applicable ({plan.scope_reason})")
-    done = {"retracted": 0, "revintaged": 0}
-    with engine.begin() as conn:
-        _timeout(conn, timeout_ms)
-        if not retractions_table_exists(conn):
-            raise RuntimeError("resolved_series_retractions does not exist; apply the migration first")
-        for r in plan.retract:
-            res = conn.execute(_RETRACT_SQL, {"fid": plan.feature_id, "od": date.fromisoformat(r["obs_date"]),
-                                              "vd": date.fromisoformat(r["vintage_date"]),
-                                              "reason": r["reason"], "tag": run_tag})
-            done["retracted"] += max(0, int(res.rowcount or 0))
-        for v in plan.revintage:
-            res = conn.execute(_REVINTAGE_SQL, {"fid": plan.feature_id, "od": date.fromisoformat(v["obs_date"]),
-                                                "vd": date.fromisoformat(v["vintage_date"]),
-                                                "val": v["value"], "src": v["source_id"]})
-            done["revintaged"] += max(0, int(res.rowcount or 0))
-    return done
+    """Fail before opening any connection, including direct callers."""
+    raise RuntimeError(f"{APPLY_DISABLED}; feature status={plan.status}")
 
 
 # ---------------------------------------------------------------------------
@@ -743,11 +839,16 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
         timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS, allow_db_window: bool = False,
         exclude: Iterable[str] = (), coverage_floor: float = DEFAULT_COVERAGE_FLOOR,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> dict[str, Any]:
+    if apply:
+        raise RuntimeError(APPLY_DISABLED)
+    if len(features) != len(set(features)):
+        raise ValueError("duplicate requested features")
     started = clock()
     check_window(started, allow_db_window)
     repair_day = started.astimezone(timezone.utc).date()
     exclude = frozenset(exclude)
     plans: list[dict[str, Any]] = []
+    full_plans: list[FeaturePlan] = []
     stopped = None
     for f in features:
         try:
@@ -762,11 +863,6 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
         else:
             plan = plan_feature_db(engine, f, start=start, repair_day=repair_day, timeout_ms=timeout_ms,
                                    scope=scope, coverage_floor=coverage_floor)
-        if apply and plan.applicable:
-            try:
-                plan.applied = apply_plan(engine, plan, run_tag=run_tag or "", timeout_ms=timeout_ms)
-            except Exception as exc:  # noqa: BLE001
-                plan.error = f"apply failed: {type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
         print(
             f"{plan.feature:>14} {plan.status:<22} rows={plan.rows:>7} cells={plan.cells:>6} "
             f"retract={len(plan.retract):>6} revintage={len(plan.revintage):>5} "
@@ -781,6 +877,7 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
             file=sys.stderr,
         )
         plans.append(plan.summary())
+        full_plans.append(plan)
     by_status: dict[str, int] = {}
     for p in plans:
         by_status[p["status"]] = by_status.get(p["status"], 0) + 1
@@ -790,6 +887,9 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
         "run_tag": run_tag, "repair_day": repair_day.isoformat(), "start": start.isoformat(),
         "statement_timeout_ms": timeout_ms, "coverage_floor": coverage_floor, "exclude": sorted(exclude),
         "features": plans, "stopped": stopped,
+        "manifest": build_manifest(full_plans, repair_day=repair_day, start=start,
+                                   coverage_floor=coverage_floor, exclude=exclude, run_tag=run_tag,
+                                   requested_features=features, stopped=stopped),
         "complete": stopped is None and len(plans) == len(features),
         "errors": sum(1 for p in plans if p["error"]),
         "by_status": by_status,
@@ -820,7 +920,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--coverage-floor", type=float, default=DEFAULT_COVERAGE_FLOOR,
                    help="largest newly-dark share of served cells an applicable plan may leave (default 0.01)")
     p.add_argument("--start", type=date.fromisoformat, default=DEFAULT_START, help="first obs_date (default 2010-01-01)")
-    p.add_argument("--apply", action="store_true", help="WRITE retractions and re-vintages (default: dry run)")
+    p.add_argument("--apply", action="store_true", help="disabled pending concurrency-qualified executor")
     p.add_argument("--run-tag", help="required with --apply; stored on every retraction")
     p.add_argument("--allow-db-window", action="store_true", help="run inside 03:30-10:30 UTC (non-production only)")
     p.add_argument("--statement-timeout-ms", type=int, default=DEFAULT_STATEMENT_TIMEOUT_MS)
@@ -832,6 +932,9 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.apply and not args.run_tag:
         print("--apply requires --run-tag", file=sys.stderr)
+        return 2
+    if args.apply:
+        print(APPLY_DISABLED, file=sys.stderr)
         return 2
     if not args.feature and not args.all_full_features:
         print("name at least one --feature or pass --all-full-features", file=sys.stderr)
@@ -854,10 +957,11 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
     except DbWindowRefused as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    payload = json.dumps(report, indent=1, default=str)
+    payload = json.dumps(report, indent=1, allow_nan=False)
     print(payload)
     if args.out:
-        args.out.write_text(payload)
+        with args.out.open("x", encoding="utf-8") as output:
+            output.write(payload)
     return 0 if report["complete"] and report["errors"] == 0 else 1
 
 
