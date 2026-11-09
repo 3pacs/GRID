@@ -145,7 +145,7 @@ class TestSdmxJson:
             obs = sdmx_json.fetch_bis_series("WS_CREDIT_GAP", "Q.US.P.A.C", "2024")
         assert obs[0] == (date(2024, 1, 1), -11.0108)
         url = get.call_args.args[0]
-        assert url == "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CREDIT_GAP/1.0/Q.US.P.A.C"
+        assert url == "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CREDIT_GAP/~/Q.US.P.A.C"  # latest version (2026-11-09)
         assert get.call_args.kwargs["headers"]["Accept"] == sdmx_json.BIS_ACCEPT
         assert get.call_args.kwargs["params"] == {"startPeriod": "2024"}
 

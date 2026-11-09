@@ -80,7 +80,10 @@ def test_no_feature_is_written_by_both_dbnomics_and_eurostat():
 def test_series_ids_are_the_live_ones():
     ids = {v: k for k, v in dbnomics.DBNOMICS_SERIES.items()}
     assert ids["france_10y_yield"] == "ECB/IRS/M.FR.L.L40.CI.0000.EUR.N.Z"
-    assert ids["us_credit_gdp_bis"] == "BIS/WS_TC/Q.US.P.A.M.770.A"
+    # 2026-11-09: us_credit_gdp_bis moved to the BIS puller (BIS direct is
+    # current, the DBnomics mirror stops at 2024-Q4); see
+    # tests/test_intl_pullers_20261109.py.
+    assert "us_credit_gdp_bis" not in ids
     dead = ("BDF/FM/", "OECD/KEI/", "BIS/total_credit/", "BDF/BP/", "Bundesbank/BBDP1/")
     assert not any(k.startswith(dead) for k in dbnomics.DBNOMICS_SERIES)
 
