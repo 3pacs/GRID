@@ -598,7 +598,27 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # aliases _build_source_registry derives from REGISTRY_CATALOG_NAMES
         # (all 33 reported "orphans" were those aliases). Needs reviewer
         # acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','5716c1581b4e7998b4caba9b352423c5d4076ec89e041f88d0f53ad04663e2b9')]:
+        # SCHED re-pinned 5716c158 -> d0e133db (2026-11-08,
+        # claude/hermes-gaps-20261108): the only scheduler edits are three
+        # PULLER_REGISTRY entries: opportunity timeout_s 60 -> 120, edgar
+        # timeout_s 180 -> 600 (with a 3-line comment), and sec_xbrl_shares
+        # dropping kwargs limit=400 (with a 4-line comment). Needs reviewer
+        # acceptance like the prior pins.
+        # SCHED re-pinned d0e133db -> 0ae04652 (2026-11-08,
+        # claude/retire-tiingo-fundamentals-20261108): the only scheduler
+        # edit is a hold_reason on the tiingo_fundamentals registry entry
+        # (owner retired it). Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned 0ae04652 -> 8add8ca5 (2026-11-08,
+        # claude/hermes-residuals-20261108): the only scheduler edit is the
+        # unusual_whales registry entry, timeout_s 60 -> 240 with a trailing
+        # comment (a 30-ticker scan takes ~126 s). Needs reviewer acceptance
+        # like the prior pins.
+        # SCHED re-pinned 8add8ca5 -> 3ca3c3f9 (2026-11-09,
+        # claude/gdelt-rate-limit-20261109): the only scheduler edit is the
+        # gdelt registry entry: timeout_s 60 -> 360 and its comments
+        # (requests wait for the shared GDELT DOC gate; pull_recent stops
+        # at deadline_at). Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','3ca3c3f9257ab076c23a5dea33937c749b509965b208121b2789aa0186e436a9')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

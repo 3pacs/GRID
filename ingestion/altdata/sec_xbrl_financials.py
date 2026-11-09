@@ -400,11 +400,20 @@ def _fetch_ticker_to_cik_map() -> dict[str, str]:
 # ── Company Facts fetch ─────────────────────────────────────────────────
 
 
+_COMPANY_FACTS_NOT_FOUND: set[str] = set()
+
+
+def company_facts_not_found(cik_padded: str) -> bool:
+    """Whether the latest fetch returned HTTP 404 (no XBRL facts)."""
+    return cik_padded in _COMPANY_FACTS_NOT_FOUND
+
+
 def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
     """Capture original successful response bytes and actual request boundaries."""
     from ingestion.altdata.sec_financial_snapshots import MAX_SOURCE_BYTES
 
     url = _COMPANY_FACTS_URL.format(cik=cik_padded)
+    _COMPANY_FACTS_NOT_FOUND.discard(cik_padded)
     started = datetime.now(timezone.utc)
     try:
         resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
@@ -413,6 +422,10 @@ def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, dat
                     c=cik_padded, e=type(exc).__name__)
         return None
     received = datetime.now(timezone.utc)
+    if resp.status_code == 404:
+        _COMPANY_FACTS_NOT_FOUND.add(cik_padded)
+        log.info("SEC companyfacts CIK={c} HTTP 404 (no XBRL facts filed)", c=cik_padded)
+        return None
     if resp.status_code != 200:
         log.warning("SEC companyfacts CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
         return None

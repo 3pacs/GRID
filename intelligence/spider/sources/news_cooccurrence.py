@@ -15,9 +15,13 @@ from typing import Any
 import requests
 from loguru import logger as log
 
+from ingestion.altdata import gdelt_doc
+from ingestion.altdata.gdelt_doc import GDELTRateLimited
 from intelligence.spider.models import DiscoveredConnection
 
-GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
+GDELT_DOC_API = gdelt_doc.DOC_API_URL
+# A spider round waits at most this long for a GDELT slot, then moves on.
+_GDELT_MAX_WAIT_S: float = 15.0
 
 # Pattern for capitalized multi-word phrases (simple NER heuristic)
 _ENTITY_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
@@ -42,16 +46,20 @@ class NewsCooccurrenceAdapter:
         self, actor_name: str, actor_hint: dict[str, Any]
     ) -> list[DiscoveredConnection]:
         try:
-            resp = requests.get(
-                GDELT_DOC_API,
-                params={
+            # Through the host-wide GDELT DOC gate at low priority: the spider
+            # shares grid-svr's IP with the scheduled GDELT puller and the
+            # breaking-news monitor, and must not send into a 429 cooldown.
+            resp = gdelt_doc.doc_get(
+                {
                     "query": f'"{actor_name}"',
                     "mode": "artlist",
                     "maxrecords": "50",
                     "format": "json",
                 },
-                headers={"User-Agent": "GRID-Spider/1.0"},
-                timeout=15,
+                max_wait_s=_GDELT_MAX_WAIT_S,
+                attempts=1,
+                priority="low",
+                caller="spider_news_cooccurrence",
             )
             if resp.status_code != 200:
                 log.debug("GDELT query failed for {a}: HTTP {s}", a=actor_name, s=resp.status_code)
@@ -108,6 +116,12 @@ class NewsCooccurrenceAdapter:
             log.debug("GDELT: {n} connections for {a}", n=len(connections), a=actor_name)
             return connections
 
+        except GDELTRateLimited as exc:
+            log.debug("GDELT throttled; skipping {a}: {e}", a=actor_name, e=str(exc))
+            return []
+        except requests.RequestException as exc:
+            log.debug("GDELT request failed for {a}: {e}", a=actor_name, e=str(exc))
+            return []
         except Exception as exc:
             log.debug("GDELT adapter error for {a}: {e}", a=actor_name, e=str(exc))
             return []

@@ -68,6 +68,13 @@ PRODUCER = "scripts/daily_publication_packet.py"
 
 DEFAULT_ROOT = Path(os.environ.get("GRID_PUBLICATION_PACKET_ROOT", "~/research/publication-packets"))
 DEFAULT_DUE_HOURS = float(os.environ.get("GRID_PUBLICATION_PACKET_DUE_HOURS", "12"))
+# World-readable copy of the SCREENED files (never capture.json) for any agent on the fleet.
+DEFAULT_PUBLIC_ROOT = Path(os.environ.get("GRID_PUBLICATION_PACKET_PUBLIC_ROOT",
+                                          "~/research/publication-packets-public")).expanduser()
+PUBLIC_FILES = ("packet.json", "receipt.json", "observation.json")
+PUBLIC_DIRS = ("receipts",)
+PUBLIC_GLOBS = ("FAILED-*.json",)
+NEVER_PUBLIC = ("capture.json",)
 DIARY_UNIT = os.environ.get("GRID_MARKET_DIARY_UNIT", "grid-market-diary.service")
 # The installed grid-market-diary.timer fires Tue..Sat 05:30Z for the previous US
 # session; on Sun/Mon UTC no diary generation is scheduled, so a missing in-window
@@ -527,6 +534,59 @@ def ensure_root(root: Path) -> Path:
     return root
 
 
+def publish_screened(day_dir: Path, public_dir: Path) -> dict[str, Any]:
+    """Copy the screened files of one day to a world-readable tree; never capture.json.
+
+    Allow-list, not deny-list: only PUBLIC_FILES, PUBLIC_DIRS/*.json and PUBLIC_GLOBS are
+    copied, so a new private file in day_dir can never leak by omission. Bytes are copied
+    unchanged (receipt hashes stay verifiable in both trees), dirs 0755, files 0644, and a
+    file already identical in the public tree is left alone. Idempotent; safe on re-run.
+    """
+    copied, unchanged = [], []
+    candidates: list[Path] = []
+    for name in PUBLIC_FILES:
+        if (day_dir / name).is_file():
+            candidates.append(day_dir / name)
+    for sub in PUBLIC_DIRS:
+        if (day_dir / sub).is_dir():
+            candidates.extend(sorted(path for path in (day_dir / sub).glob("*.json") if path.is_file()))
+    for pattern in PUBLIC_GLOBS:
+        candidates.extend(sorted(path for path in day_dir.glob(pattern) if path.is_file()))
+    for src in candidates:
+        rel = src.relative_to(day_dir)
+        if rel.parts in {(name,) for name in NEVER_PUBLIC}:  # top-level capture.json only; receipts/capture.json is a stage receipt
+            raise RuntimeError(f"refusing to publish private file {rel}")
+        data = src.read_bytes()
+        dst = public_dir / rel
+        if dst.is_file() and dst.read_bytes() == data:
+            unchanged.append(str(rel))
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(dst.parent, 0o755)
+        write_file(dst, data, 0o644)
+        copied.append(str(rel))
+    if public_dir.exists():
+        os.chmod(public_dir, 0o755)
+    return {"public_dir": str(public_dir), "copied": copied, "unchanged": unchanged}
+
+
+def publish_or_warn(day_dir: Path, public_root: Path | None, day: date) -> dict[str, Any] | None:
+    """Publishing never blocks production: a failure is logged and reported, not raised."""
+    if public_root is None:
+        return None
+    public_dir = public_root.expanduser() / day.isoformat()
+    try:
+        public_root.expanduser().mkdir(parents=True, exist_ok=True)
+        os.chmod(public_root.expanduser(), 0o755)
+        published = publish_screened(day_dir, public_dir)
+    except OSError as exc:
+        log.warning("publication-packet {}: public copy to {} failed: {}", day, public_dir, type(exc).__name__)
+        return {"public_dir": str(public_dir), "error": type(exc).__name__}
+    if published["copied"]:
+        log.info("publication-packet {}: published {} screened file(s) to {}", day, len(published["copied"]), public_dir)
+    return published
+
+
 def existing_summary(day_dir: Path) -> dict[str, Any] | None:
     receipt = day_dir / "receipt.json"
     if not receipt.is_file():
@@ -542,7 +602,8 @@ def existing_summary(day_dir: Path) -> dict[str, Any] | None:
 
 def produce(engine: Any, day: date, root: Path, *, limit: int, due_hours: float, dry_run: bool,
             now: datetime | None = None, unit_runner=subprocess.run,
-            audio_dir: Path = AUDIO_DIR, grounding_dir: Path = GROUNDING_DIR) -> dict[str, Any]:
+            audio_dir: Path = AUDIO_DIR, grounding_dir: Path = GROUNDING_DIR,
+            public_root: Path | None = None) -> dict[str, Any]:
     now = clock(now or datetime.now(timezone.utc))
     start, end = day_window(day)
     if now < end:
@@ -555,7 +616,8 @@ def produce(engine: Any, day: date, root: Path, *, limit: int, due_hours: float,
     if existing is not None:
         log.info("publication-packet {}: already produced (receipt sha256 {}); nothing rewritten",
                  day, existing.get("receipt_sha256", "?")[:12])
-        return dict(existing, already_present=True)
+        published = None if dry_run else publish_or_warn(day_dir, public_root, day)
+        return dict(existing, already_present=True, published=published)
 
     stages: dict[str, dict[str, Any]] = {}
     files: dict[str, tuple[bytes, int]] = {}
@@ -579,7 +641,8 @@ def produce(engine: Any, day: date, root: Path, *, limit: int, due_hours: float,
                 write_file(day_dir / name, data, mode)
             write_file(day_dir / f"FAILED-{now.strftime('%Y%m%dT%H%M%SZ')}.json", pretty(failure), 0o644)
             write_file(day_dir / "observation.json", pretty(obs), 0o644)
-        return dict(failure, observation=obs)
+        published = None if dry_run else publish_or_warn(day_dir, public_root, day)
+        return dict(failure, observation=obs, published=published)
 
     read_audio_artifacts(bundle, limit, audio_dir=audio_dir)
     attach_grounding(bundle, grounding_dir=grounding_dir)
@@ -656,10 +719,11 @@ def produce(engine: Any, day: date, root: Path, *, limit: int, due_hours: float,
         for name, (data, mode) in files.items():
             write_file(day_dir / name, data, mode)
         write_file(day_dir / "receipt.json", summary_raw, 0o644)
+    published = None if dry_run else publish_or_warn(day_dir, public_root, day)
     log.info("publication-packet {}: {} publications projected, {} quarantined, diary_run={}, packet {}{}",
              day, summary["publications_projected"], summary["quarantined"], diary_state, packet_sha[:12],
              " [dry-run]" if dry_run else "")
-    return dict(summary, observation=obs, day_dir=str(day_dir))
+    return dict(summary, observation=obs, day_dir=str(day_dir), published=published)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -670,6 +734,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=ROW_LIMIT_MAX, help="rows per channel, 1..500")
     p.add_argument("--due-hours", type=float, default=DEFAULT_DUE_HOURS,
                    help="hours after the window closes by which the day should be closed (observation due_at)")
+    p.add_argument("--public-root", type=Path, default=DEFAULT_PUBLIC_ROOT,
+                   help="world-readable tree for the screened files, never capture.json "
+                        "(default $GRID_PUBLICATION_PACKET_PUBLIC_ROOT or ~/research/publication-packets-public)")
+    p.add_argument("--no-publish", action="store_true", help="skip the public screened copy")
     p.add_argument("--dry-run", action="store_true", help="compute and report without writing")
     p.add_argument("--json", action="store_true", help="print the full result as JSON")
     return p
@@ -688,7 +756,7 @@ def main(argv: list[str] | None = None, engine: Any = None, now: datetime | None
         engine = get_engine()
     try:
         result = produce(engine, day, ensure_root(args.out_root), limit=args.limit, due_hours=args.due_hours,
-                         dry_run=args.dry_run, now=now)
+                         dry_run=args.dry_run, now=now, public_root=None if args.no_publish else args.public_root)
     except Refused as exc:
         print(json.dumps({"state": "REFUSED", "publication_day": day.isoformat(), "reason": str(exc)}))
         return 2

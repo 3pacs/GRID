@@ -23,7 +23,10 @@ from store.journal_qualification import (
 )
 
 
+PG_PREDICATE = str(text(PREDICATE).compile(dialect=postgresql.dialect()))
 NOW = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
+# Derive the reference from Python, rather than copying the SQL helper's list.
+PYTHON_STRIP_WHITESPACE = "".join(chr(i) for i in range(0x110000) if chr(i).isspace())
 
 
 def _engine(journal_rows=(), *, failure=False, production=None):
@@ -56,13 +59,13 @@ def _assert_guarded(engine, queries, columns, *, count=1, limit=True,
     reads = [q for q in queries if "FROM decision_journal" in q]
     assert len(reads) == count
     for sql in reads:
-        assert PREDICATE in sql
-        assert sql.index(PREDICATE) < sql.index("ORDER BY")
+        assert PG_PREDICATE in sql
+        assert sql.index(PG_PREDICATE) < sql.index("ORDER BY")
         if limit:
-            assert sql.index(PREDICATE) < sql.index("LIMIT")
+            assert sql.index(PG_PREDICATE) < sql.index("LIMIT")
         else:
             assert "LIMIT" not in sql
-        assert "WHERE" in sql[:sql.index(PREDICATE)]
+        assert "WHERE" in sql[:sql.index(PG_PREDICATE)]
         if distinct:
             assert "SELECT DISTINCT ON (decision_journal.inferred_state)" in sql
             assert "ORDER BY decision_journal.inferred_state, decision_journal.decision_timestamp DESC" in sql
@@ -84,6 +87,7 @@ def _assert_guarded(engine, queries, columns, *, count=1, limit=True,
         assert isinstance(statement, Select)
         assert tuple(statement.selected_columns.keys()) == tuple(columns)
         params = dict(statement.compile(dialect=postgresql.dialect()).params)
+        assert params.pop("journal_marker_whitespace") == PYTHON_STRIP_WHITESPACE
         if "mid" in params:
             assert params.pop("mid") is None
             assert call.args[1] == {"mid": 7}
@@ -92,9 +96,9 @@ def _assert_guarded(engine, queries, columns, *, count=1, limit=True,
     engine.begin.assert_not_called()
 
 
-def test_predicate_is_static_parameter_free_and_narrow():
+def test_predicate_is_static_with_bound_normalization_and_narrow():
     query = non_provisional_journal_select("id")
-    assert query.compile().params == {}
+    assert query.compile().params == {"journal_marker_whitespace": PYTHON_STRIP_WHITESPACE}
     assert "source_contract_id" not in PREDICATE
     assert "sec_generation" not in PREDICATE
     assert "LIKE" not in PREDICATE  # underscores must never act as wildcards
@@ -272,7 +276,7 @@ def test_historical_regime_apis_keep_provisional_evidence(monkeypatch):
     assert history.history[-1].state == "PROVISIONAL_FUNDAMENTAL_DIVERGENCE"
     assert transitions.transitions[-1].to_state == "PROVISIONAL_FUNDAMENTAL_DIVERGENCE"
     assert len(queries) == 2
-    assert all(PREDICATE not in sql for sql in queries)
+    assert all(PG_PREDICATE not in sql for sql in queries)
     engine.begin.assert_not_called()
 
 
@@ -343,8 +347,10 @@ def test_builder_preserves_column_order_and_binds_values():
     sql = str(compiled)
     assert tuple(statement.selected_columns.keys()) == ("state_confidence", "id", "inferred_state")
     assert statement.get_final_froms() == [DECISION_JOURNAL]
-    assert PREDICATE in sql
-    assert compiled.params == {"mid": model_id, "param_1": 1}
+    assert PG_PREDICATE in sql
+    assert compiled.params == {
+        "journal_marker_whitespace": PYTHON_STRIP_WHITESPACE, "mid": model_id, "param_1": 1,
+    }
     assert model_id not in sql
     assert "model_version_id = %(mid)s" in sql
     assert "LIMIT %(param_1)s" in sql
@@ -360,8 +366,8 @@ def test_builder_distinct_on_is_postgresql_clause_not_plain_distinct():
     sql = str(compiled)
     assert "SELECT DISTINCT ON (decision_journal.inferred_state)" in sql
     assert "ORDER BY decision_journal.inferred_state, decision_journal.decision_timestamp DESC" in sql
-    assert PREDICATE in sql
-    assert compiled.params == {}
+    assert PG_PREDICATE in sql
+    assert compiled.params == {"journal_marker_whitespace": PYTHON_STRIP_WHITESPACE}
 
 
 def test_builder_feedback_cutoff_and_verdict_remain_fixed_clauses():
@@ -377,4 +383,37 @@ def test_builder_feedback_cutoff_and_verdict_remain_fixed_clauses():
     compiled = statement.compile(dialect=postgresql.dialect())
     assert "decision_journal.decision_timestamp >= NOW() - INTERVAL '30 days'" in str(compiled)
     assert "decision_journal.verdict IS NOT NULL" in str(compiled)
-    assert compiled.params == {"param_1": 50}
+    assert compiled.params == {"journal_marker_whitespace": PYTHON_STRIP_WHITESPACE, "param_1": 50}
+
+
+@pytest.mark.parametrize("normalized_marker", [
+    """LOWER(BTRIM(COALESCE(contradiction_flags ->> 'signal_type', ''), :journal_marker_whitespace) COLLATE "C")""",
+    """LOWER(BTRIM(COALESCE(contradiction_flags #>> '{context,signal_type}', ''), :journal_marker_whitespace) COLLATE "C")""",
+    """LOWER(BTRIM(COALESCE(contradiction_flags ->> 'producer_module', ''), :journal_marker_whitespace) COLLATE "C")""",
+    """LOWER(BTRIM(COALESCE(contradiction_flags #>> '{context,producer_module}', ''), :journal_marker_whitespace) COLLATE "C")""",
+    """LOWER(BTRIM(COALESCE(contradiction_flags ->> 'source', ''), :journal_marker_whitespace) COLLATE "C")""",
+    """LOWER(BTRIM(COALESCE(contradiction_flags #>> '{context,source}', ''), :journal_marker_whitespace) COLLATE "C")""",
+])
+def test_every_structured_financial_marker_normalizes_case_and_outer_whitespace(normalized_marker):
+    assert normalized_marker in PREDICATE
+    # Fixed normalization is applied before exact equality or prefix slicing.
+    assert PREDICATE.count("LOWER(BTRIM(") == 8
+    compiled = non_provisional_journal_select("id").compile(dialect=postgresql.dialect())
+    assert compiled.params == {"journal_marker_whitespace": PYTHON_STRIP_WHITESPACE}
+    assert PYTHON_STRIP_WHITESPACE not in str(compiled)
+
+
+def test_normalization_preserves_exact_financial_family_boundaries():
+    assert PREDICATE.count("= 'fundamental_divergence'") == 4
+    assert PREDICATE.count("= 'intelligence.fundamental_divergence'") == 2
+    assert PREDICATE.count(", 23) = 'fundamental_divergence:'") == 2
+    assert "LIKE" not in PREDICATE
+    assert "REGEXP" not in PREDICATE
+    assert "REPLACE" not in PREDICATE  # Never strip whitespace from inside a marker.
+
+
+def test_legacy_provisional_marker_rules_remain_unchanged():
+    assert "LEFT(UPPER(COALESCE(inferred_state, '')), 12) = 'PROVISIONAL_'" in PREDICATE
+    assert "UPPER(COALESCE(action_taken, '')) = 'PROVISIONAL'" in PREDICATE
+    assert "LEFT(UPPER(COALESCE(action_taken, '')), 12) = 'PROVISIONAL '" in PREDICATE
+    assert "LEFT(LOWER(COALESCE(counterfactual, '')), 26) = 'provisional-from-contract:'" in PREDICATE

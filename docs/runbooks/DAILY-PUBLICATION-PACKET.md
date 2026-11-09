@@ -202,43 +202,125 @@ Exit 0 = produced (or already present); 1 = failed (FAILED receipt written);
 2 = refused (window still open, bad arguments). Tests:
 `tests/test_daily_publication_packet.py` (offline fake engine; no database).
 
-### Delivery to the daily review
+### Delivery: the public screened tree on grid-svr (canonical)
 
-A pull mirror on precision5520 (`systemd --user` timer, documented below) copies
-`packet.json`, `receipts/`, `observation.json` and `receipt.json` — never
-`capture.json` — into the established Codex pickup directory
-`~/Documents/Codex/_inbox-from-claude/grid-publication-packets/<D>/`. The
-daily-review consumer reads the packet there (or directly on grid-svr over the
-fleet SSH route), performs `admission_review` by hash readback, and continues
-its own stages. Codex-owned stages do not change the producer's files.
+The producer keeps the private day folder (`$GRID_PUBLICATION_PACKET_ROOT/<D>/`, mode
+0700, holds `capture.json` 0600) and, after every run, copies the SCREENED files to a
+world-readable tree: `$GRID_PUBLICATION_PACKET_PUBLIC_ROOT/<D>/` =
+`/data/grid/outputs/publication-packets/<D>/` on grid-svr (dirs 0755, files 0644). The copy
+is an allow-list — `packet.json`, `receipt.json`, `observation.json`, `receipts/*.json`,
+`FAILED-*.json` — so `capture.json` (raw rows) can never reach it by omission, and the bytes
+are unchanged so every receipt hash verifies in either tree. A re-run for an already
+produced day (`--day <D>`) publishes it without rewriting anything private, which is how
+the Nov 4–6 backlog was published. `--no-publish` skips the copy; publishing never blocks
+production (a copy failure is logged and reported in the result, the private tree is
+authoritative).
+
+Any agent on the fleet (Alien's daily-review owner included) reads from there over the
+fleet SSH route, for example:
+
+```bash
+rsync -rt grid-svr:/data/grid/outputs/publication-packets/2026-11-06/ ./2026-11-06/
+# or just the hashes:  ssh grid-svr cat /data/grid/outputs/publication-packets/2026-11-06/receipt.json
+```
+
+### Delivery: precision5520 mirror (convenience copy)
+
+**Retired 2026-11-08** with the in-repo grader: both precision5520 user timers
+(`grid-publication-packet-mirror`, `grid-publication-review-push`) are disabled. Agents read the
+public tree on grid-svr directly. The notes below describe the units as they were.
+
+A pull mirror on precision5520 (`systemd --user` timer) copies the public tree into the
+established Codex pickup directory `~/Documents/Codex/_inbox-from-claude/grid-publication-packets/<D>/`.
+Its source is the public tree, so even the mirror's rsync never sees `capture.json`.
 
 ```ini
 # ~/.config/systemd/user/grid-publication-packet-mirror.service (precision5520)
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/rsync -rt --chmod=D0755,F0644 --include='*/' --include='packet.json' \
-  --include='receipt.json' --include='observation.json' --include='FAILED-*.json' --include='receipts/**' --exclude='*' \
-  grid-svr:research/publication-packets/ %h/Documents/Codex/_inbox-from-claude/grid-publication-packets/
+ExecStart=/usr/bin/rsync -rt --chmod=D0755,F0644 \
+  grid-svr:/data/grid/outputs/publication-packets/ %h/Documents/Codex/_inbox-from-claude/grid-publication-packets/
 # grid-publication-packet-mirror.timer: OnCalendar=*-*-* 11:05:00 UTC, Persistent=true
 ```
 
+The daily-review consumer reads the packet in either place, performs `admission_review` by
+hash readback, and continues its own stages. Codex-owned stages do not change the
+producer's files.
+
+## Grader (in-repo, scheduled) — the daily review itself
+
+`scripts/grade_publication_review.py` is the daily review. It runs on grid-svr from the
+release tree at 11:35Z (`deploy/systemd/grid-publication-review-grader.{service,timer}.template`;
+first install by hand, then deploys keep the installed unit in sync), reads the public screened
+tree, and for each of the last ten publication days (`--lookback 10`, so every horizon up to a week
+resolves) writes `$GRID_PUBLICATION_REVIEW_ROOT/<D>/review.jsonl` and hands it
+to the ingest in-process. No agent, inbox or mirror is in the loop; nothing has to be nudged.
+
+What a day's rows look like (schema `publication-review-verdicts-v1`, the same contract the
+ingest enforces; the grader constructs rows so they pass by construction):
+
+- `thesis_snapshots` → one `direction` row per snapshot: the stored `overall_direction` against
+  SPY's split-adjusted close (`TIINGO`, `YF:SPY:adj_close`) from the last completed close before
+  the snapshot to the close of the first session on/after `stated_at` + 3 calendar days — the
+  rule `intelligence/thesis_tracker.py` already uses, ±0.5 % band and its matrix: same side
+  `confirmed`, opposite sides `refuted`, any flat leg `partially_confirmed`; `unresolved` (horizon
+  stated) until the horizon close exists; `unscorable` when the baseline session has no usable close.
+- `market_briefings`, `market_diary` → a record whose text says its AI narrative was withheld
+  or unavailable has nothing to grade and gets one `unscorable` `data_quality` row saying so.
+  That count, per day, is the machine-readable measure of how often the generators publish
+  data dumps instead of forecasts (every hourly briefing on 2026-11-04..07 did). A record with a
+  narrative goes through claim extraction on the LLM router (`GRID_PUBLICATION_GRADER_TIER`,
+  default `reason`; `GRID_PUBLICATION_GRADER_PROVIDER` to pin one, e.g. `gemini` behind
+  `GRID_ALLOW_PAID_LLM`); `direction` claims on priced instruments (index and commodity names map to
+  their ETF proxy) and `level` claims on the ticker itself are graded from closes; a level on an
+  alias ("SPX above 6800") is `unscorable` because the proxy's scale differs; `event`/`causal` stay
+  `unresolved` (a causal claim is never confirmed from co-movement). Extractions are cached per
+  publication sha + extraction setup (prompt version, tier, provider) under `<D>/extractions/`,
+  re-validated against the text on read, so re-grades never call a model twice and a better model
+  re-extracts instead of inheriting a weaker one's answer.
+- A day whose verdict rows and header (packet sha, models) did not change is left alone
+  (`UNCHANGED`); a change rewrites the file and the ingest records a new run that supersedes the
+  previous one. A hand-off that failed (database down) is retried on the next run until the
+  grader receipt records the file's sha as ingested. Nothing writes to
+  `thesis_postmortems`.
+
+Receipts, per day, under `$GRID_PUBLICATION_REVIEW_ROOT/<D>/`: `grader-receipt.json`
+(state WRITTEN/UNCHANGED/REFUSED/FAILED, verdict counts, review sha, the ingest's result) and
+the ingest's own `ingest-receipt.json`. Exit 3 = graded but the ingest rejected rows.
+
+```bash
+# on grid-svr, from the release tree, as grid (same env as the unit)
+GRID_PUBLICATION_PACKET_PUBLIC_ROOT=/data/grid/outputs/publication-packets \
+GRID_PUBLICATION_REVIEW_ROOT=/home/grid/research/publication-reviews \
+  /data/grid_v4/grid_venv-314/bin/python scripts/grade_publication_review.py --day 2026-11-07 --dry-run
+# the scheduled form (last 6 days, write + ingest):
+  /data/grid_v4/grid_venv-314/bin/python scripts/grade_publication_review.py
+```
+
+Health: `/api/v1/system/health` carries `checks.publication_review` (latest packet day in the
+public tree, latest ingested review day and timestamps) and degrades with a named reason when
+either is older than two days (`store/publication_review_status.py`). That is where a missing
+day shows up; nobody has to go and look in a directory.
+
+The external daily-review agent (Codex task-10 on Alien) is no longer a writer of
+`review.jsonl`: its reverse-mirror leg on precision5520 (`grid-publication-review-push`, 12:35Z)
+must stay disabled, otherwise two writers race for the same file. It may read the public tree
+and the ingested rows like any other agent.
+
 ## Consumer adoption and operational acceptance
 
-The daily review owner adopts the packet in its existing job instructions.
-Runtime acceptance of the repaired pipeline is a retained run with these
-receipts, none of which the producer can supply alone:
+Runtime acceptance of the chain is three receipts for one naturally scheduled day, none of
+which a person supplies:
 
-1. One naturally scheduled 10:35Z run produced `<D>/receipt.json` on grid-svr
-   and the mirror delivered the screened files to the pickup directory.
-2. The daily review found the day under its own key, read `packet.json` back
-   by hash, recorded `admission_review` and `custody`, and ran the status
-   reporter on the appended observation.
-3. `privacy_screen` reviewed the exact external payload before the existing
-   authorized Gemini path; `local_review` and `gemini_review` were retained
-   against the screened packet hash. Scientific acceptance (#958) stays
-   separate.
-4. Both outputs (brief, retrospective) reported their own status; a blocked
-   day showed the first blocked stage, owners and deadline in the task result.
+1. 10:35Z: `<D>/receipt.json` in the public tree on grid-svr (producer).
+2. 11:35Z: `<D>/grader-receipt.json` with `state: WRITTEN` (or `UNCHANGED` on a re-grade) and
+   `<D>/ingest-receipt.json` with `state: INGESTED` under the review root (grader + ingest).
+3. `/api/v1/system/health` shows `publication_review.latest_review_day = <D>` and no
+   `publication review` reason under `degraded_reasons`.
+
+The external daily-review agent's own stages (`admission_review`, `custody`, `privacy_screen`,
+`local_review`, `gemini_review`) are its business for its own brief and are not part of this
+acceptance; scientific acceptance (#958) stays separate.
 
 Historical days: Nov 4–6 packets are produced by hand from the same job (late
 captures, flagged `late_capture: true`). They are real captures of the retained

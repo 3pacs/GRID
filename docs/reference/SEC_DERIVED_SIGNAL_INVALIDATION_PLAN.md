@@ -245,3 +245,16 @@ seals, test counts, isolation and rollback checks stay unchanged. Expanded local
 validation passes 759 offline tests (9 optional skips) and 71 disposable PG tests.
 All 15 forward and 14 HOLD source blobs verify. Fresh exact-head CI is required;
 the failed predecessor is not accepted. No production access or deployment.
+
+
+## 2026-11-09 corrective pass (draft only)
+
+The reviewed journal marker guard now matches event-handler case and outer-whitespace normalization for the exact financial family names. PostgreSQL trims the full Python whitespace set as a bound value and lowercases ASCII markers with fixed C collation. Family equality and source-colon boundaries remain strict. Twelve selected current/feedback readers use a fixed SQLAlchemy select builder; no SQL interpolation, raw-row mutation or history suppression was introduced.
+
+Main was reconciled through cd55457a4d347fc2d296b590cac2346e0cdd1a31. Its shares-fetch HTTP404 classification is retained alongside original-response byte capture. The independent publication-review migration and SEC migrations are joined by a no-op merge revision without rewriting existing revision ancestry. Main's new SEC EPS valuation input uses its independent raw_series pathway and is not claimed to be covered by the financial snapshot lineage in this PR.
+
+Verification: 767 offline tests passed with 9 optional skips; 193 tests passed against a fresh, network-guarded private PostgreSQL cluster, including 122 new normalization/evidence-preservation cases. The migration graph has one head. Exact-head remote CI, full migration replay and G3/G5 remain publication gates; prior green heads do not qualify this correction. The immutable HOLD source pins and 72/35 compatibility case counts are unchanged. Forward source seals include the journal guard and newly imported SEC valuation module.
+
+All broader inventory/rebuild/product-decision gates above remain open. No production access, repair executor, deployment, merge to main, deletion, or historical evidence changes were performed.
+
+Separate valuation follow-up inherited from main: verify historical price vintage cutoffs (`as_of_ts`), finite EPS values (not only NaN rejection), matched prior/current ticker cohorts, and unavailable rather than fabricated zero change when prior PE coverage is absent. These do not alter the narrow journal guard's classification, but prevent claiming complete financially qualified thesis outputs.

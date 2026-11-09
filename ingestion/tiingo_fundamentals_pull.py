@@ -65,6 +65,33 @@ _SAFE_LOCAL_ERRORS = (
 )
 
 
+# Fixed phrase in Tiingo's 400 body when the plan does not cover a ticker
+# ("Error: Free and Power plans are limited to the DOW 30. ..."). The body is
+# matched against this literal only; it is never stored or logged.
+_PLAN_LIMIT_MARKER = "limited to the DOW 30"
+_PLAN_LIMIT_BODY_PREFIX = 512
+
+
+def _is_plan_limited(exc: Exception) -> bool:
+    """True when Tiingo refused a ticker because the plan does not cover it.
+
+    requests' HTTPError text never includes the response body, so the old
+    ``"Free" in str(e)`` check never matched: on 2026-11-07 89 of the 138
+    default tickers came back 400 with the DOW-30 plan notice and every run
+    was reported PARTIAL ("Tiingo HTTP request failed (status 400)").
+    """
+    if "400" in str(exc) and "Free" in str(exc):
+        return True
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    try:
+        body = response.text
+    except (AttributeError, UnicodeError, ValueError):
+        return False
+    return type(body) is str and _PLAN_LIMIT_MARKER in body[:_PLAN_LIMIT_BODY_PREFIX]
+
+
 def _safe_failure_message(exc: Exception) -> str:
     """Exclude URLs, headers, bodies and nested exception text from results."""
     if isinstance(exc, requests.exceptions.HTTPError):
@@ -183,7 +210,7 @@ class TiingoFundamentalsPuller(BasePuller):
 
         except requests.exceptions.HTTPError as e:
             result["rows_inserted"] = None if transaction_started else 0
-            if "400" in str(e) and "Free" in str(e):
+            if _is_plan_limited(e):
                 result["status"] = "PAYWALLED"
                 result["errors"].append("Free tier: DOW 30 only")
             else:
@@ -238,6 +265,7 @@ class TiingoFundamentalsPuller(BasePuller):
             "tickers_not_attempted": [...]}; the row count is carried by the
             per-ticker results, so an unknown leaf count stays unknown.
         """
+        default_universe = ticker_list is None
         if ticker_list is None:
             # Default: DOW 30 + any ticker with _full data
             with self.engine.connect() as conn:
@@ -279,11 +307,19 @@ class TiingoFundamentalsPuller(BasePuller):
             f=len(results) - succeeded - paywalled,
             t=len(ticker_list),
         )
+        not_attempted = list(ticker_list[len(results):])
+        if default_universe and paywalled:
+            # The default universe is every *_full ticker; the ones the plan
+            # does not cover are outside this pull's scope, not failed
+            # coverage. They are still requested each run, so a plan upgrade
+            # starts filling them with no code change. An explicit
+            # ticker_list keeps its PAYWALLED results (the caller asked).
+            results = [r for r in results if r["status"] != "PAYWALLED"]
         if should_continue is None:
             return results
         return {
             "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
             "stopped_by_budget": stopped_by_budget,
             "results": results,
-            "tickers_not_attempted": list(ticker_list[len(results):]),
+            "tickers_not_attempted": not_attempted,
         }

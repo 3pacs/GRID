@@ -1208,3 +1208,106 @@ def test_pg_invalid_json_syntax_cannot_enter_journal_evidence(journal_db):
                         'HOLD','HOLD','HOLD','synthetic','HIGH')"""), {"flags": "{not valid json"})
     assert _latest_qualified_journal(journal_db)[0] == genuine
     assert _raw_journal_evidence(journal_db) == before
+
+
+@pytest.mark.parametrize("location", ("top-level", "context"))
+@pytest.mark.parametrize("key,canonical", [
+    pytest.param("signal_type", "fundamental_divergence", id="signal-type"),
+    pytest.param("producer_module", "intelligence.fundamental_divergence", id="producer"),
+    pytest.param("source", "fundamental_divergence", id="source-exact"),
+    pytest.param("source", "fundamental_divergence:Technology", id="source-sector"),
+])
+@pytest.mark.parametrize("variant", (
+    "uppercase", "mixed-case", "outer-spaces", "outer-tabs", "outer-newlines",
+    "mixed-outer-whitespace", "unicode-outer-whitespace",
+))
+def test_pg_normalized_financial_markers_cannot_become_current(journal_db, location, key, canonical, variant):
+    from types import SimpleNamespace
+    from contracts.financial_signal_guard import is_financial_divergence_signal
+
+    # All 29 whitespace code points stripped by Python, including controls and
+    # Unicode separators. One untrimmed code point must fail this parity check.
+    whitespace = (
+        "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+        "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+        "\u2028\u2029\u202f\u205f\u3000"
+    )
+    assert len(whitespace) == 29 and whitespace.strip() == ""
+    value = {
+        "unicode-outer-whitespace": whitespace + canonical.upper() + whitespace,
+        "uppercase": canonical.upper(),
+        "mixed-case": canonical.title(),
+        "outer-spaces": "  " + canonical + "  ",
+        "outer-tabs": "\t" + canonical.upper() + "\t",
+        "outer-newlines": "\n" + canonical.upper() + "\r\n",
+        "mixed-outer-whitespace": " \t\r\n\v\f" + canonical.title() + "\f\v\n\r\t ",
+    }[variant]
+    markers = {key: value}
+    # The SQL read guard must recognize the same string marker as event replay.
+    assert is_financial_divergence_signal(SimpleNamespace(**markers))
+    flags = markers if location == "top-level" else {"context": markers}
+    _insert_journal(journal_db, second=20, contradiction_flags=flags, state_confidence=0.99)
+    before = _raw_journal_evidence(journal_db)
+    assert _latest_qualified_journal(journal_db) is None
+    assert _raw_journal_evidence(journal_db) == before
+
+    genuine = _insert_journal(journal_db, second=10, inferred_state="CONTRACTION", state_confidence=0.65)
+    before = _raw_journal_evidence(journal_db)
+    assert tuple(_latest_qualified_journal(journal_db)) == (genuine, "CONTRACTION", 0.65)
+    assert _raw_journal_evidence(journal_db) == before
+
+
+@pytest.mark.parametrize("location", ("top-level", "context"))
+@pytest.mark.parametrize("key,value", [
+    pytest.param("signal_type", "FUNDAMENTAL_DIVERGENCE_EXTRA", id="signal-suffix"),
+    pytest.param("signal_type", "FUNDAMENTAL_DIVERGENCE:Technology", id="signal-colon"),
+    pytest.param("producer_module", "INTELLIGENCE.FUNDAMENTAL_DIVERGENCE_EXTRA", id="producer-suffix"),
+    pytest.param("producer_module", "OTHER.INTELLIGENCE.FUNDAMENTAL_DIVERGENCE", id="producer-prefix"),
+    pytest.param("producer_module", "INTELLIGENCE.FUNDAMENTAL_DIVERGENCE.EXTRA", id="producer-child"),
+    pytest.param("source", "FUNDAMENTAL_DIVERGENCE_EXTRA:Technology", id="source-suffix"),
+    pytest.param("source", "OTHER:FUNDAMENTAL_DIVERGENCE", id="source-prefix"),
+    pytest.param("source", "FUNDAMENTAL_DIVERGENCE-NOTICE", id="source-hyphen"),
+    pytest.param("source", "FUNDAMENTAL_DIVERGENCE :Technology", id="source-inner-space"),
+    pytest.param("source", "FUNDAMENTAL_DIVERGENCE\t:Technology", id="source-inner-tab"),
+    pytest.param("source", "FUNDAMENTAL_DIVERGENCE\n:Technology", id="source-inner-newline"),
+    pytest.param("source", "PRE_FUNDAMENTAL_DIVERGENCE", id="source-other-family"),
+    pytest.param("signal_type", "FUNDAMENTAL_D\u0130VERGENCE", id="signal-dotted-i"),
+    pytest.param("signal_type", "fundamental_d\u0131vergence", id="signal-dotless-i"),
+    pytest.param("producer_module", "\u0130NTELLIGENCE.FUNDAMENTAL_DIVERGENCE", id="producer-dotted-i"),
+    pytest.param("source", "\uff26UNDAMENTAL_DIVERGENCE:Technology", id="source-fullwidth-f"),
+    pytest.param("source", "FUNDAMENTAL_DIVERGENCE\uff1aTechnology", id="source-fullwidth-colon"),
+    pytest.param("source", "\u200bFUNDAMENTAL_DIVERGENCE", id="source-zero-width-space"),
+])
+def test_pg_normalized_near_matches_remain_eligible(journal_db, location, key, value):
+    from types import SimpleNamespace
+    from contracts.financial_signal_guard import is_financial_divergence_signal
+
+    markers = {key: " \t\n" + value + "\r\t "}
+    assert not is_financial_divergence_signal(SimpleNamespace(**markers))
+    flags = markers if location == "top-level" else {"context": markers}
+    genuine = _insert_journal(journal_db, contradiction_flags=flags)
+    before = _raw_journal_evidence(journal_db)
+    assert _latest_qualified_journal(journal_db)[0] == genuine
+    assert _raw_journal_evidence(journal_db) == before
+
+
+@pytest.mark.parametrize("location", ("top-level", "context"))
+@pytest.mark.parametrize("key", ("signal_type", "producer_module", "source"))
+@pytest.mark.parametrize("value", [
+    pytest.param([" \tFUNDAMENTAL_DIVERGENCE\n"], id="marker-in-array"),
+    pytest.param({"name": "\nINTELLIGENCE.FUNDAMENTAL_DIVERGENCE\t"}, id="marker-in-object"),
+    pytest.param(None, id="null-marker"),
+    pytest.param(123, id="numeric-marker"),
+    pytest.param(True, id="boolean-marker"),
+])
+def test_pg_normalization_never_coerces_nonstring_markers(journal_db, location, key, value):
+    from types import SimpleNamespace
+    from contracts.financial_signal_guard import is_financial_divergence_signal
+
+    markers = {key: value}
+    assert not is_financial_divergence_signal(SimpleNamespace(**markers))
+    flags = markers if location == "top-level" else {"context": markers}
+    genuine = _insert_journal(journal_db, contradiction_flags=flags)
+    before = _raw_journal_evidence(journal_db)
+    assert _latest_qualified_journal(journal_db)[0] == genuine
+    assert _raw_journal_evidence(journal_db) == before

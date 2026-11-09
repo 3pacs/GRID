@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import ast
 import contextlib
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -148,7 +149,8 @@ class _OneConnection:
 def _diagnose(conn):
     # Execute actual function source, not a replacement query or a live import.
     tree = ast.parse(SOURCE.read_bytes())
-    projected = ("_normalize_source_key", "_classify_pull_failure", "diagnose_and_fix_pulls")
+    projected = ("_normalize_source_key", "_classify_pull_failure", "_recovered_after",
+                 "_held_source_names", "diagnose_and_fix_pulls")
     functions = {
         node.name: node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in projected
@@ -161,7 +163,8 @@ def _diagnose(conn):
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     module = ast.fix_missing_locations(ast.Module(body=[future, *probe, *(functions[name] for name in projected)], type_ignores=[]))
     log = _Log()
-    namespace = {"log": log, "json": json, "re": re}
+    namespace = {"log": log, "json": json, "re": re, "datetime": datetime, "timezone": timezone,
+                 "_REPAIR_SCHEDULE_LOCK": threading.Lock(), "_REPAIR_RECOVERED_AT": {}}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     engine = _OneConnection(conn)
     # BOTH flags are necessary: production dry_run is checked after optional LLM diagnosis.
