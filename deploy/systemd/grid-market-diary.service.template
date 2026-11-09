@@ -13,6 +13,7 @@
 # to use — that checkout is stale/diverged and no live service runs from it
 # (systemd template sweep, 2026-09-28; same finding as PR #712/#713/#714
 # review for grid-dollar-flows/grid-causal-links/grid-regime-state-vectors).
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
 [Unit]
 Description=GRID market diary writer (rule-based sections + LLM narrative, pre-open thesis verdict)
 After=network.target postgresql.service
