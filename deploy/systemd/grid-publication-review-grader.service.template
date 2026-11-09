@@ -30,6 +30,8 @@ EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=GRID_PUBLICATION_PACKET_PUBLIC_ROOT=/data/grid/outputs/publication-packets
 Environment=GRID_PUBLICATION_REVIEW_ROOT=/home/grid/research/publication-reviews
+# World-readable copy (review.jsonl + receipts) next to the public packet tree, for fleet agents.
+Environment=GRID_PUBLICATION_REVIEW_PUBLIC_ROOT=/data/grid/outputs/publication-reviews
 Environment=GRID_PUBLICATION_GRADER_TIER=reason
 # Same interpreter grid-publication-packet runs under (py314.conf drop-in).
 ExecStart=/usr/bin/flock -n /tmp/grid-publication-review-grader.lock /data/grid_v4/grid_venv-314/bin/python scripts/grade_publication_review.py
