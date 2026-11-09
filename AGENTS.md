@@ -438,3 +438,15 @@ Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/
   generator's own Yahoo reader, `read_latest(as_of_ts=stated_at)` for FRED). Nov 4-7 narratives
   carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
   the wrong clock for grading a past publication.
+
+## 2026-11-09 - Deterministic briefing guard regression clock
+
+Full Python 3.14 CI found a pre-existing test false positive: forbidden financial
+text 8.96 happened to occur inside assembly timestamp 08:16:38.960504. Pin the
+single regression's briefing clock while preserving all numeric, semantic, file
+and DB-persistence assertions. No production code or guard changes.
+
+Local Windows run: 241 briefing tests passed; 15 cannot execute because the
+existing social sentiment import requires Unix fcntl. The targeted regression
+is among those platform-blocked tests. Hosted Linux full CI is the acceptance
+check. Company intake/quality remains 62 tests and 9 subtests passing.
