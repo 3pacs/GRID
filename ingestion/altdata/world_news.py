@@ -144,8 +144,18 @@ def _trip_payment_required() -> None:
 
 
 def _payment_required_result(target_date: date | None = None) -> dict[str, Any]:
+    """The leaf for a day a 402 kept us from pulling.
+
+    SKIPPED, not FAILED (2026-11-09): a 402 is the key's plan or its daily
+    points quota (50/day on the configured key, measured from the
+    X-API-Quota-* headers), an owner-side configuration limit, not a broken
+    run. Nothing was written for the day (its transaction rolled back) and a
+    later run re-pulls it, because only days with a real count are captured.
+    ``pull_all`` turns this into PARTIAL when the same run already committed
+    an earlier day -- coverage is then genuinely incomplete.
+    """
     out: dict[str, Any] = {
-        "status": "FAILED", "rows_inserted": 0, "error": PAYMENT_REQUIRED_REASON,
+        "status": "SKIPPED", "rows_inserted": 0, "reason": PAYMENT_REQUIRED_REASON,
     }
     if target_date is not None:
         out["date"] = target_date.isoformat()
@@ -553,7 +563,7 @@ class WorldNewsPuller(BasePuller):
             return [{"status": "SKIPPED", "reason": "WORLDNEWS_API_KEY not set"}]
         if self._api_expired or _payment_required_active():
             log.debug("WorldNews pull_all held by the 402 circuit breaker")
-            return [_payment_required_result()]
+            return [_payment_required_result()]  # SKIPPED: quota/plan, no request sent
 
         # Ensure features are registered
         self._ensure_features()
@@ -581,9 +591,30 @@ class WorldNewsPuller(BasePuller):
                 current += timedelta(days=1)
                 continue
             day_result = self.pull_day(current)
-            results.append(day_result)
             if self._api_expired:
-                break  # 402: the rest of the run would only hit it again
+                # 402: the rest of the run would only hit it again. A 402
+                # after this run pulled an earlier day is a quota-cut
+                # PARTIAL (the reason names the 402); a 402 on the run's
+                # first request leaves the SKIPPED leaf, so a run that could
+                # fetch nothing new reports SKIPPED rather than PARTIAL or
+                # FAILED -- already-captured days are folded into its reason.
+                pulled_a_day = any("total_articles" in r for r in results)
+                if pulled_a_day:
+                    day_result = {**day_result, "status": "PARTIAL",
+                                  "error": PAYMENT_REQUIRED_REASON}
+                    day_result.pop("reason", None)
+                    results.append(day_result)
+                elif results:
+                    n_unchanged = len(results)
+                    day_result = {**day_result, "reason": (
+                        f"{PAYMENT_REQUIRED_REASON} ({n_unchanged} earlier "
+                        f"day(s) already captured, unchanged)"
+                    )}
+                    results = [day_result]
+                else:
+                    results.append(day_result)
+                break
+            results.append(day_result)
             current += timedelta(days=1)
 
         total_rows = sum(r.get("rows_inserted", 0) for r in results)

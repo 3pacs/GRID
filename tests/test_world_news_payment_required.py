@@ -88,7 +88,8 @@ class TestPaymentRequired:
         calls = _http(monkeypatch, [200] * 12 + [402])
         results = puller.pull_all(days_back=3)
         assert len(calls) == 13                       # no request after the 402
-        assert results[-1]["status"] == "FAILED"
+        # 402 after day 1 committed: a quota-cut PARTIAL leaf (2026-11-09).
+        assert results[-1]["status"] == "PARTIAL"
         assert "402" in results[-1]["error"] and "renew" in results[-1]["error"]
         assert len(results) == 2                      # day 3 never attempted
         # Day 1 wrote its 30 category rows + 3 composites. Day 2's two good
@@ -122,11 +123,13 @@ class TestPaymentRequired:
         out = fresh.pull_all(days_back=1)
         assert len(calls) == 11 and out[0]["rows_inserted"] == 33
 
-    def test_scheduler_sees_failed(self, puller, monkeypatch):
-        from ingestion.smart_scheduler import OUTCOME_FAILED, _classify_outcome
+    def test_scheduler_sees_skipped_on_first_call_402(self, puller, monkeypatch):
+        # A 402 on the run's first request is the key's plan/daily quota:
+        # SKIPPED (owner configuration), not FAILED (2026-11-09).
+        from ingestion.smart_scheduler import OUTCOME_SKIPPED, _classify_outcome
 
         _http(monkeypatch, [402])
-        assert _classify_outcome(puller.pull_all(days_back=2))[0] == OUTCOME_FAILED
+        assert _classify_outcome(puller.pull_all(days_back=2))[0] == OUTCOME_SKIPPED
 
 
 @pytest.mark.unit

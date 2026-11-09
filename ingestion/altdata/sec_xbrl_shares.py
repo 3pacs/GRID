@@ -48,6 +48,7 @@ from ingestion.altdata.sec_xbrl_financials import (
     _fetch_company_facts,
     _fetch_ticker_to_cik_map,
     _sector_map_tickers,
+    company_facts_not_found,
 )
 
 
@@ -639,6 +640,14 @@ class SECXBRLSharesPuller:
                     if not permitted():
                         raise _MaterializationDeferred("cancelled after facts")
                     pause()
+                    if facts is None and company_facts_not_found(cik_padded):
+                        # SEC 404: the issuer has never filed XBRL (F-6-only
+                        # ADR shells such as BYDDF, RBGLY -- the "2 of 1268
+                        # items failed: facts_unavailable" on every run).
+                        # Nothing to materialize, like no_cik; not a failure.
+                        results.append({"ticker": ticker, "status": "NO_NEW_DATA",
+                                        "rows": 0, "reason": "no_xbrl_facts"})
+                        continue
                     if facts is None:
                         raise RuntimeError("facts_unavailable")
                     timeline = _extract_shares_entries(facts)

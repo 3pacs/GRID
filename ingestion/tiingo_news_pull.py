@@ -66,6 +66,36 @@ def _next_month_first(today: date) -> date:
     return date(today.year, today.month + 1, 1)
 
 
+# GRID (yfinance-form) ticker -> the tag Tiingo's news index files articles
+# under. Probed on grid-svr 2026-11-09 (7-day and 90-day windows): BTC-USD,
+# ETH-USD, btcusd and ethusd return [] while "btc" / "eth" return 36 / 23
+# articles; DX-Y.NYB and dxy return [] over 90 days (an ICE index, no news
+# tag), so it is not queried. Those three were 3 of the "7 of 51 items
+# failed or partial" on every run. None = Tiingo has no news tag for it.
+_TIINGO_NEWS_SYMBOL: dict[str, str | None] = {
+    "BTC-USD": "btc",
+    "ETH-USD": "eth",
+    "DX-Y.NYB": None,
+}
+
+
+def _tiingo_news_symbol(ticker: str) -> str | None:
+    """The ``tickers=`` value for a GRID ticker, or None when there is none."""
+    if ticker in _TIINGO_NEWS_SYMBOL:
+        return _TIINGO_NEWS_SYMBOL[ticker]
+    return ticker
+
+
+def _default_news_tickers() -> list[str]:
+    """YF_TICKER_LIST minus indices, futures, FX pairs and untaggable symbols."""
+    from ingestion.yfinance_pull import YF_TICKER_LIST
+
+    return [
+        t for t in YF_TICKER_LIST
+        if not t.startswith("^") and "=" not in t and _tiingo_news_symbol(t) is not None
+    ]
+
+
 def _tiingo_headers() -> dict[str, str]:
     return {
         "Content-Type": "application/json",
@@ -98,7 +128,13 @@ class TiingoNewsPuller(BasePuller):
         start_date: str | date | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
-        """Fetch news articles for a single ticker."""
+        """Fetch news articles for a single ticker.
+
+        ``ticker`` is the GRID ticker (series ids keep it); the request uses
+        its Tiingo news tag. A ticker with no articles since ``start_date`` is
+        ``NO_DATA`` -- checked, nothing new -- not PARTIAL: quiet ETFs such as
+        XLI/SLV/DBA/FXE/FXY/BKLN/ANGL often have none in a 7-day window.
+        """
         import requests
 
         result: dict[str, Any] = {
@@ -120,8 +156,14 @@ class TiingoNewsPuller(BasePuller):
             result["error"] = f"tiingo bandwidth cap until {paused_until.isoformat()}"
             return result
 
+        symbol = _tiingo_news_symbol(ticker)
+        if symbol is None:
+            result["status"] = "SKIPPED"
+            result["reason"] = f"{ticker} has no Tiingo news tag"
+            return result
+
         params: dict[str, Any] = {
-            "tickers": ticker,
+            "tickers": symbol,
             "startDate": str(start_date),
             "limit": limit,
             "sortBy": "date",
@@ -162,7 +204,8 @@ class TiingoNewsPuller(BasePuller):
             articles = resp.json()
 
             if not articles:
-                result["status"] = "PARTIAL"
+                result["status"] = "NO_DATA"
+                result["reason"] = f"no {symbol} articles since {start_date}"
                 return result
 
             result["articles"] = len(articles)
@@ -263,13 +306,7 @@ class TiingoNewsPuller(BasePuller):
     ) -> list[dict[str, Any]]:
         """Pull news for all tickers."""
         if ticker_list is None:
-            from ingestion.yfinance_pull import YF_TICKER_LIST
-            # Clean tickers for Tiingo (no ^ or =)
-            ticker_list = [
-                t.replace("^", "").replace("=F", "").replace("=X", "")
-                for t in YF_TICKER_LIST
-                if not t.startswith("^") and "=" not in t
-            ]
+            ticker_list = _default_news_tickers()
 
         results = []
         total_articles = 0

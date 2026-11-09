@@ -388,14 +388,29 @@ def _fetch_ticker_to_cik_map() -> dict[str, str]:
 # ── Company Facts fetch ─────────────────────────────────────────────────
 
 
+# CIKs whose companyfacts answered 404 on their latest fetch in this process.
+# SEC serves 404 when an issuer has never filed XBRL -- e.g. CIK 0001445162
+# (BYD CO LTD, BYDDF) and 0001420798 (RECKITT BENCKISER, RBGLY), whose only
+# filings are F-6 ADR registrations (checked 2026-11-09). That is "nothing
+# to read", not an unavailable source; 403/5xx/network/parse stay failures.
+_COMPANY_FACTS_NOT_FOUND: set[str] = set()
+
+
+def company_facts_not_found(cik_padded: str) -> bool:
+    """True when the latest companyfacts fetch for this CIK was an HTTP 404."""
+    return cik_padded in _COMPANY_FACTS_NOT_FOUND
+
+
 def _fetch_company_facts(cik_padded: str) -> dict[str, Any] | None:
     """Fetch Company Facts JSON for a zero-padded CIK.
 
     Returns:
         Parsed JSON dict, or None on 404/403/parse failure (caller should
-        log and continue).
+        log and continue). ``company_facts_not_found(cik)`` tells a 404
+        (issuer files no XBRL) apart from the other None causes.
     """
     url = _COMPANY_FACTS_URL.format(cik=cik_padded)
+    _COMPANY_FACTS_NOT_FOUND.discard(cik_padded)
     try:
         resp = requests.get(
             url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS
@@ -405,7 +420,14 @@ def _fetch_company_facts(cik_padded: str) -> dict[str, Any] | None:
                     c=cik_padded, e=str(exc))
         return None
 
-    if resp.status_code in (403, 404):
+    if resp.status_code == 404:
+        # Permanent for a non-XBRL filer; INFO so the same CIKs do not add
+        # a warning on every run.
+        _COMPANY_FACTS_NOT_FOUND.add(cik_padded)
+        log.info("SEC companyfacts CIK={c} HTTP 404 (no XBRL facts filed)",
+                 c=cik_padded)
+        return None
+    if resp.status_code == 403:
         log.warning("SEC companyfacts CIK={c} HTTP {s}",
                     c=cik_padded, s=resp.status_code)
         return None
