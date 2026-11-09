@@ -27,10 +27,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import normalization.entity_map as em_module
 from normalization.entity_map import (
     NEW_MAPPINGS_V2,
     SEED_MAPPINGS,
     EntityMap,
+    pattern_collision,
+    static_feeds,
     yf_candidate_feature_names,
     yf_ticker_stems,
 )
@@ -66,6 +69,9 @@ def em() -> EntityMap:
         (15, "cl_close"),
         (16, "gspc_full"),        # deliberately shadows the static YF:^GSPC
         (17, "uup_full"),         # deliberately shadows the static YF:UUP
+        (18, "gold_full"),        # gold futures, static YF:GC=F:close -- NOT Barrick
+        (19, "gold_adj_close"),   # a legitimate derived name for Barrick
+        (20, "btc_full"),         # Binance/CoinGecko bitcoin, never yfinance
     ]))
 
 
@@ -285,3 +291,61 @@ class TestCandidateDerivation:
     def test_candidate_list_is_bounded(self) -> None:
         for sid in ["YF:BRK-B:adj_close", "YF:^BTC-USD=F:adj_close"]:
             assert len(yf_candidate_feature_names(sid)) <= 12
+
+
+# ── 7. Same-named ticker, unrelated feature: the collision guard ─────────
+#
+# Measured on griddb 2026-11-08: Barrick Gold (ticker GOLD, Tiingo adj_close
+# since 2025-12-02) had been pattern-resolving into gold_full, the gold-futures
+# feature fed statically by YF:GC=F:close. The fallback derives names from the
+# ticker alone, so it must refuse a registered candidate whose static feed is a
+# different ticker or a non-yfinance source.
+
+class TestPatternCollisionGuard:
+    def test_barrick_never_reaches_the_gold_futures_feature(self, em) -> None:
+        assert pattern_collision("YF:GOLD:adj_close", "gold_full") == "YF:GC=F:close"
+        # gold_full is registered, but the guard skips it; the next candidate
+        # (gold_adj_close, no static feed) is the one Barrick resolves to.
+        assert em.get_feature_id("YF:GOLD:adj_close") == 19
+
+    def test_barrick_is_unresolved_when_only_the_colliding_name_is_registered(self) -> None:
+        em2 = EntityMap(db_engine=_engine([(18, "gold_full")]))
+        assert em2.get_feature_id("YF:GOLD:adj_close") is None
+        assert em2.get_feature_id("YF:GOLD:close") is None
+
+    def test_non_yfinance_static_feed_blocks_the_same_named_ticker(self, em) -> None:
+        blocker = pattern_collision("YF:BTC:adj_close", "btc_full")
+        assert blocker is not None and not blocker.startswith("YF:")
+        assert em.get_feature_id("YF:BTC:adj_close") is None
+
+    def test_same_ticker_static_feed_is_not_a_collision(self) -> None:
+        # xlp_full is fed statically by YF:XLP:adj_close; a pattern lookup for
+        # the same ticker's other fields may still derive xlp_* names.
+        assert pattern_collision("YF:XLP:adj_close", "xlp_full") is None
+        assert pattern_collision("YF:XLP:open", "xlp_open") is None
+
+    def test_feature_without_static_feed_is_never_blocked(self) -> None:
+        assert static_feeds("nvda_open") == []
+        assert pattern_collision("YF:NVDA:open", "nvda_open") is None
+
+    def test_non_yf_series_id_is_never_a_collision(self) -> None:
+        assert pattern_collision("BINANCE:BTCUSDT:close", "btc_full") is None
+
+    def test_generic_case_with_explicit_mappings(self) -> None:
+        mappings = {"ACME:widget:px": "corn_full"}
+        assert pattern_collision("YF:CORN:adj_close", "corn_full", mappings) == "ACME:widget:px"
+        assert pattern_collision("YF:CORN:adj_close", "corn_full", {"YF:CORN:adj_close": "corn_full"}) is None
+
+    def test_refusal_is_cached_and_warned_once(self, em, monkeypatch) -> None:
+        em_module._WARNED_PATTERN_COLLISIONS.discard(("YF:GOLD:close", "gold_full"))
+        warnings: list[str] = []
+        monkeypatch.setattr(em_module.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw)))
+        # close may only derive gold_close, which is not registered here, so
+        # this is a plain miss; adj_close hits the guard on gold_full first.
+        em_module._WARNED_PATTERN_COLLISIONS.discard(("YF:GOLD:adj_close", "gold_full"))
+        em._pattern_cache.clear()
+        assert em.get_feature_id("YF:GOLD:adj_close") == 19
+        em._pattern_cache.clear()
+        assert em.get_feature_id("YF:GOLD:adj_close") == 19
+        refusals = [w for w in warnings if "refused YF:GOLD:adj_close -> gold_full" in w]
+        assert len(refusals) == 1 and "YF:GC=F:close" in refusals[0]

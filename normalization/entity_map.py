@@ -1168,6 +1168,62 @@ def price_basis_conflicts(mappings: dict[str, str] | None = None) -> dict[str, d
     return conflicts
 
 
+# feature name -> sorted static series ids, over the merged static dicts; rebuilt
+# whenever either dict changes size (load_v2_mappings merges V2 into SEED).
+_STATIC_FEEDS_INDEX: dict[str, list[str]] = {}
+_STATIC_FEEDS_INDEX_KEY: tuple[int, int] = (-1, -1)
+
+
+def _static_feeds_index() -> dict[str, list[str]]:
+    global _STATIC_FEEDS_INDEX, _STATIC_FEEDS_INDEX_KEY
+    key = (len(SEED_MAPPINGS), len(NEW_MAPPINGS_V2))
+    if key != _STATIC_FEEDS_INDEX_KEY:
+        index: dict[str, list[str]] = {}
+        for sid, name in {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}.items():
+            index.setdefault(name, []).append(sid)
+        _STATIC_FEEDS_INDEX = {name: sorted(sids) for name, sids in index.items()}
+        _STATIC_FEEDS_INDEX_KEY = key
+    return _STATIC_FEEDS_INDEX
+
+
+def static_feeds(feature: str, mappings: dict[str, str] | None = None) -> list[str]:
+    """Series ids statically mapped onto ``feature`` (merged SEED + V2, sorted).
+
+    Pure; touches no database. Used by the pattern fallback's collision guard
+    (once per pattern-resolved series_id, the result is cached with it) and by
+    scripts/repair_full_panel_vintages.py to decide a feature's scope.
+    """
+    if mappings is None:
+        return list(_static_feeds_index().get(feature, []))
+    return sorted(sid for sid, name in mappings.items() if name == feature)
+
+
+def pattern_collision(series_id: str, feature: str, mappings: dict[str, str] | None = None) -> str | None:
+    """The static feed that forbids ``series_id`` from pattern-resolving onto ``feature``.
+
+    The ``YF:<ticker>:<field>`` fallback derives feature names from the ticker
+    alone, so a ticker spelled like an unrelated feature collides with it:
+    ``YF:GOLD:adj_close`` (Barrick Gold) derives ``gold_full``, which is the
+    gold-futures feature fed by ``YF:GC=F:close`` (measured on griddb
+    2026-11-08: Barrick closes had been resolving into ``gold_full`` since
+    2025-12-02). A feature that already has a static feed from a different
+    yfinance ticker, or from any non-yfinance source (``BINANCE:...``,
+    ``CG:...``), is therefore off-limits to the pattern path.
+
+    Returns the first offending static series id, or ``None`` when the
+    feature has no static feed or every static feed is the same ticker.
+    """
+    m = _YF_SERIES_RE.match(series_id)
+    if m is None:
+        return None
+    ticker = m.group("ticker")
+    for sid in static_feeds(feature, mappings):
+        fm = _YF_SERIES_RE.match(sid)
+        if fm is None or fm.group("ticker") != ticker:
+            return sid
+    return None
+
+
 # ── Dynamic pattern resolution for per-ticker yfinance OHLCV ──────────────
 #
 # The yfinance pullers emit one series per ticker *per field*:
@@ -1190,6 +1246,11 @@ def price_basis_conflicts(mappings: dict[str, str] | None = None) -> dict[str, d
 # feature not in registry" in this process. Module-level because the resolver
 # constructs a new EntityMap per cycle; see EntityMap.get_feature_id.
 _WARNED_MAPPED_MISSES: set[tuple[str, str]] = set()
+
+# (series_id, derived feature name) pairs already refused by the pattern
+# fallback's collision guard (see pattern_collision). Module-level for the
+# same reason as _WARNED_MAPPED_MISSES: one warning per process, not per cycle.
+_WARNED_PATTERN_COLLISIONS: set[tuple[str, str]] = set()
 
 # Sentinel for the pattern cache.  A cached *miss* is stored as None, so
 # "absent from the cache" needs a value None cannot collide with.
@@ -1669,9 +1730,23 @@ class EntityMap:
         resolved_name: str | None = None
         for name in candidates:
             fid = self._feature_cache.get(name)
-            if fid is not None:
-                feature_id, resolved_name = fid, name
-                break
+            if fid is None:
+                continue
+            blocker = pattern_collision(series_id, name)
+            if blocker is not None:
+                # Same-named ticker, unrelated feature (Barrick GOLD vs the
+                # gold-futures gold_full). Never resolve; warn once per pair.
+                if (series_id, name) not in _WARNED_PATTERN_COLLISIONS:
+                    _WARNED_PATTERN_COLLISIONS.add((series_id, name))
+                    log.warning(
+                        "Pattern fallback refused {sid} -> {fn}: the feature is "
+                        "statically fed by {blocker} (different ticker/source); "
+                        "rows of {sid} stay unresolved",
+                        sid=series_id, fn=name, blocker=blocker,
+                    )
+                continue
+            feature_id, resolved_name = fid, name
+            break
 
         self._pattern_cache[series_id] = feature_id
 

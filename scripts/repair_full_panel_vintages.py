@@ -16,7 +16,29 @@ stops new wrong-basis vintages; the rows already written are still served
 for every ``as_of`` that reaches them. This script plans and, on request,
 performs the repair of those rows.
 
-What the repair does, per feature (one transaction each):
+Scope (added 2026-11-08 after the first dry run on grid-svr). A feature is
+planned only when the entity map feeds it from the policy's single yfinance
+price field: ``YF:<T>:adj_close`` (or ``YF:<T>:close`` for
+RAW_CLOSE_FULL_FEATURES), with ``<T>`` taken from that feed, never from the
+feature name. Everything else is reported with a status and never touched:
+
+* OUT_OF_SCOPE -- static feed is not one yfinance price field, or a yfinance
+  field of another ticker (``btc_full`` <- BINANCE/CoinGecko; ``gold_full``'s
+  name would have become Barrick's ticker GOLD, which turned every gold
+  futures row into an "outlier" against a $30 stock).
+* NO_BASIS_SPLIT -- RAW_CLOSE_FULL_FEATURES other than ``spy_full``
+  (indices, futures, crypto): no corporate actions, so ``adj_close == close``
+  and a value that matches one field only is pull-timing drift on a 24/7 or
+  settlement bar, not a basis flip.
+* EXCLUDED -- named with ``--exclude``.
+* NEEDS_BACKFILL -- in scope and classified, but the retraction would leave
+  more than ``--coverage-floor`` (default 1 %) of the served cells with no
+  on-basis raw row to re-vintage from (ACN/HON: Tiingo adj_close starts
+  2021-04-01, half the 2010+ cells). Reported with the obs_date range to
+  backfill; never applied. Backfill first, then re-run: the new raw rows get
+  the backfill day's vintage and the repair re-vintages from them.
+
+What the repair does, per IN_SCOPE feature:
 
 1. Classifies every resolved row of the feature by matching its value
    against the raw rows of the two price fields for that obs_date:
@@ -34,13 +56,30 @@ What the repair does, per feature (one transaction each):
    not touched.
 3. A cell left with no visible vintage gets ONE new vintage dated the
    repair day, carrying the latest on-basis raw value (ON CONFLICT DO
-   NOTHING on the unique key). A cell with no on-basis raw row stays dark
-   and is counted.
+   NOTHING on the unique key) -- provided the date has a raw close row (a
+   real trading day) and the value is not itself an outlier against the
+   neighbouring cells; otherwise the latest sane candidate, or nothing
+   (``revintage_rejected`` lists why). The r1/r2 plans re-vintaged XLP's
+   0.6 holiday junk from the junk print itself; this rule is the fix. A
+   cell with no usable on-basis raw row stays dark and is counted.
 
-Reads are bounded and indexed: ``resolved_series`` by feature_id,
-``raw_series`` by (series_id, obs_date range) in one-year chunks, never an
-IN-list over raw_series. Every read-only statement runs in a READ ONLY
-transaction with a statement_timeout. Like scripts/audit_backdated_vintages.py
+Dark-cell accounting: ``cells_dark_before`` (no visible row today: every row
+already retracted, typically the backdated fill rows retracted by
+scripts/audit_backdated_vintages.py), ``cells_newly_dark`` (served today on
+a real trading day -- a SUCCESS raw close row exists for the date -- and dark
+after the plan: the number the coverage floor judges),
+``cells_phantom_cleared`` (served today on a date with no raw close at all,
+i.e. a holiday junk print, dark after the plan: the repair working as
+intended), ``cells_restored`` (dark today, re-vintaged by the plan),
+``cells_left_dark`` (dark after the plan, before + newly + phantom, for
+continuity with the first dry run).
+
+Reads are bounded and indexed: ``resolved_series`` by feature_id in one
+transaction, ``raw_series`` by (series_id, obs_date range) in one-year
+chunks, EACH CHUNK IN ITS OWN READ ONLY TRANSACTION, so no connection is
+held for the whole feature (the first dry run held one 60-70 s per large
+feature). Never an IN-list over raw_series. Every read-only statement has a
+statement_timeout. Like scripts/audit_backdated_vintages.py
 it refuses to run between 03:30 and 10:30 UTC (backup/DB window) unless
 ``--allow-db-window`` is passed.
 
@@ -48,6 +87,7 @@ Usage::
 
     python scripts/repair_full_panel_vintages.py --feature xlp_full --feature gld_full
     python scripts/repair_full_panel_vintages.py --all-full-features --max-features 40 --out plan.json
+    python scripts/repair_full_panel_vintages.py --all-full-features --exclude lly_full --out plan.json
     python scripts/repair_full_panel_vintages.py --feature xlp_full --apply --run-tag full-basis-20261108
 
 Exit status: 0 complete (dry run or apply); 1 any feature reported an error
@@ -64,6 +104,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 from dataclasses import asdict, dataclass, field
@@ -76,7 +117,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
-from normalization.entity_map import RAW_CLOSE_FULL_FEATURES  # noqa: E402
+from normalization.entity_map import RAW_CLOSE_FULL_FEATURES, static_feeds  # noqa: E402
+from price_close_contract import SPY_CLOSE_FEATURE  # noqa: E402
 
 DB_WINDOW_START = time(3, 30)
 DB_WINDOW_END = time(10, 30)
@@ -86,6 +128,9 @@ VALUE_TOL_REL = 1e-6
 VALUE_TOL_ABS = 1e-6
 OUTLIER_REL = 0.50
 OUTLIER_NEIGHBOURS = 5
+#: Largest share of today's served cells a plan may leave dark before the
+#: feature is NEEDS_BACKFILL instead of applicable.
+DEFAULT_COVERAGE_FLOOR = 0.01
 RETRACTION_REASON = (
     "wrong price basis for {feature}: value matches YF:{ticker}:{field}, "
     "basis is YF:{ticker}:{target} (PRICE BASIS POLICY 2026-11-08)"
@@ -101,6 +146,16 @@ AMBIGUOUS = "AMBIGUOUS"
 UNMATCHED = "UNMATCHED"
 OUTLIER = "OUTLIER"
 ALREADY_RETRACTED = "ALREADY_RETRACTED"
+
+# per-feature plan status
+IN_SCOPE = "IN_SCOPE"
+OUT_OF_SCOPE = "OUT_OF_SCOPE"
+NO_BASIS_SPLIT = "NO_BASIS_SPLIT"
+EXCLUDED = "EXCLUDED"
+NEEDS_BACKFILL = "NEEDS_BACKFILL"
+APPLICABLE_STATUSES = frozenset({IN_SCOPE})
+
+_YF_PRICE_RE = re.compile(r"^YF:(?P<ticker>[^:]+):(?P<field>close|adj_close)$")
 
 #: Records produced from the corrupted panel. Owners re-label; this script
 #: reads none of them and writes none of them.
@@ -171,6 +226,53 @@ def target_field(feature: str) -> str:
     return "close" if feature in RAW_CLOSE_FULL_FEATURES else "adj_close"
 
 
+@dataclass
+class Scope:
+    """Whether and how a ``_full`` feature may be planned (pure, no DB)."""
+    feature: str
+    status: str
+    ticker: str
+    target_field: str
+    feed: str  # "static" | "pattern" | "n/a"
+    feeds: list[str] = field(default_factory=list)
+    reason: str | None = None
+
+
+def feature_scope(feature: str, *, exclude: Iterable[str] = (),
+                  mappings: dict[str, str] | None = None) -> Scope:
+    """Decide a feature's status from the entity map, taking the ticker from its feed.
+
+    IN_SCOPE needs exactly one static feed that is ``YF:<T>:<policy field>``,
+    or no static feed at all (the ``YF:<T>:adj_close -> <t>_full`` pattern
+    fallback, where ``<T>`` is derived from the name). RAW_CLOSE_FULL_FEATURES
+    other than ``spy_full`` are NO_BASIS_SPLIT; a feature whose static
+    feed is another ticker or another source is OUT_OF_SCOPE.
+    """
+    target = target_field(feature)
+    feeds = static_feeds(feature, mappings)
+    ticker = ticker_for_feature(feature)
+    feed = "pattern"
+    if feeds:
+        feed = "static"
+        price = [(sid, _YF_PRICE_RE.match(sid)) for sid in feeds]
+        if len(feeds) != 1 or price[0][1] is None:
+            return Scope(feature, OUT_OF_SCOPE, ticker, target, feed, feeds,
+                         f"static feed is not one yfinance price field: {feeds}; the alternating-basis "
+                         "defect cannot have happened here and a same-named yfinance ticker is unrelated")
+        sid, m = price[0]
+        ticker = m.group("ticker")
+        if m.group("field") != target:
+            return Scope(feature, OUT_OF_SCOPE, ticker, target, feed, feeds,
+                         f"static feed {sid} is not the policy basis field {target!r}")
+    if feature in set(exclude):
+        return Scope(feature, EXCLUDED, ticker, target, feed, feeds, "named with --exclude")
+    if feature in RAW_CLOSE_FULL_FEATURES and feature != SPY_CLOSE_FEATURE:
+        return Scope(feature, NO_BASIS_SPLIT, ticker, target, feed, feeds,
+                     "raw-close basis by allowlist and no corporate actions: adj_close == close, a value "
+                     "matching one field only is pull-timing drift, not a basis flip")
+    return Scope(feature, IN_SCOPE, ticker, target, feed, feeds)
+
+
 def _close(a: float, b: float) -> bool:
     return abs(a - b) <= max(VALUE_TOL_ABS, VALUE_TOL_REL * max(abs(a), abs(b)))
 
@@ -236,6 +338,36 @@ def latest_per_cell(rows: Iterable[ResolvedRow], keep: Callable[[ResolvedRow], b
     return best
 
 
+class NeighbourReference:
+    """Median of the latest on-basis values of the nearest cells around a date."""
+
+    def __init__(self, rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS) -> None:
+        self.ref = latest_per_cell(rows, lambda r: r.cls in (ON_BASIS, AMBIGUOUS))
+        self.dates = sorted(self.ref)
+        self.pos = {d: i for i, d in enumerate(self.dates)}
+        self.neighbours = neighbours
+
+    def deviation(self, obs_date: date, value: float) -> float | None:
+        """``value / median - 1`` against the neighbouring cells, or None when too few neighbours."""
+        if len(self.dates) < 3:
+            return None
+        i = self.pos.get(obs_date)
+        n = self.neighbours
+        if i is None:
+            # Not a reference cell itself: anchor on the nearest earlier cell.
+            i = sum(1 for d in self.dates if d < obs_date)
+            window = self.dates[max(0, i - n): i] + self.dates[i: i + n]
+        else:
+            window = self.dates[max(0, i - n): i] + self.dates[i + 1: i + 1 + n]
+        vals = [self.ref[d].value for d in window if self.ref[d].value > 0]
+        if len(vals) < 3:
+            return None
+        med = statistics.median(vals)
+        if med <= 0:
+            return None
+        return value / med - 1.0
+
+
 def flag_outliers(rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS, rel: float = OUTLIER_REL) -> int:
     """Mark ON_BASIS / UNMATCHED / AMBIGUOUS rows far from their neighbours as OUTLIER.
 
@@ -243,30 +375,13 @@ def flag_outliers(rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS,
     the ``neighbours`` nearest cells on each side (its own cell excluded).
     Returns the number of rows flagged.
     """
-    ref = latest_per_cell(rows, lambda r: r.cls in (ON_BASIS, AMBIGUOUS))
-    dates = sorted(ref)
-    if len(dates) < 3:
-        return 0
-    pos = {d: i for i, d in enumerate(dates)}
+    reference = NeighbourReference(rows, neighbours)
     flagged = 0
     for r in rows:
         if r.cls not in (ON_BASIS, UNMATCHED, AMBIGUOUS):
             continue
-        i = pos.get(r.obs_date)
-        if i is None:
-            # Not a reference cell itself: anchor on the nearest earlier cell.
-            i = sum(1 for d in dates if d < r.obs_date)
-            window = dates[max(0, i - neighbours): i] + dates[i: i + neighbours]
-        else:
-            window = dates[max(0, i - neighbours): i] + dates[i + 1: i + 1 + neighbours]
-        vals = [ref[d].value for d in window if ref[d].value > 0]
-        if len(vals) < 3:
-            continue
-        med = statistics.median(vals)
-        if med <= 0:
-            continue
-        pct = r.value / med - 1.0
-        if abs(pct) > rel:
+        pct = reference.deviation(r.obs_date, r.value)
+        if pct is not None and abs(pct) > rel:
             r.cls, r.outlier_pct = OUTLIER, pct
             flagged += 1
     return flagged
@@ -290,15 +405,30 @@ class FeaturePlan:
     feature: str
     ticker: str
     target_field: str
+    status: str = IN_SCOPE
+    scope_reason: str | None = None
+    feed: str = "n/a"
+    feeds: list[str] = field(default_factory=list)
     feature_id: int | None = None
     rows: int = 0
     cells: int = 0
     by_class: dict[str, int] = field(default_factory=dict)
     retract: list[dict[str, Any]] = field(default_factory=list)
     revintage: list[dict[str, Any]] = field(default_factory=list)
+    revintage_rejected: list[dict[str, Any]] = field(default_factory=list)
+    cells_dark_before: int = 0
     cells_dark_after: int = 0
     cells_revintaged: int = 0
     cells_left_dark: int = 0
+    cells_newly_dark: int = 0
+    cells_phantom_cleared: int = 0
+    cells_restored: int = 0
+    newly_dark_share: float | None = None
+    newly_dark_range: dict[str, Any] | None = None
+    #: False when the first cell the repaired series would serve has no raw
+    #: close row (a holiday junk print survived); None when nothing is served.
+    after_first_on_trading_day: bool | None = None
+    backfill_hint: str | None = None
     raw_rows_read: dict[str, int] = field(default_factory=dict)
     served_before: dict[str, Any] = field(default_factory=dict)
     served_after: dict[str, Any] = field(default_factory=dict)
@@ -306,11 +436,23 @@ class FeaturePlan:
     applied: dict[str, int] | None = None
     error: str | None = None
 
+    @property
+    def applicable(self) -> bool:
+        return self.status in APPLICABLE_STATUSES and self.error is None and bool(self.retract or self.revintage)
+
     def summary(self) -> dict[str, Any]:
         d = asdict(self)
         d["retract"] = len(self.retract)
         d["revintage"] = len(self.revintage)
+        d["revintage_rejected"] = len(self.revintage_rejected)
+        d["applicable"] = self.applicable
         return d
+
+
+def plan_from_scope(scope: Scope, feature_id: int | None = None) -> FeaturePlan:
+    return FeaturePlan(feature=scope.feature, ticker=scope.ticker, target_field=scope.target_field,
+                       status=scope.status, scope_reason=scope.reason, feed=scope.feed,
+                       feeds=list(scope.feeds), feature_id=feature_id)
 
 
 def plan_feature(
@@ -320,11 +462,21 @@ def plan_feature(
     *,
     repair_day: date,
     feature_id: int | None = None,
+    scope: Scope | None = None,
+    coverage_floor: float = DEFAULT_COVERAGE_FLOOR,
 ) -> FeaturePlan:
-    """Pure: classify, flag, simulate the served series before/after, list actions."""
-    target = target_field(feature)
-    plan = FeaturePlan(feature=feature, ticker=ticker_for_feature(feature), target_field=target,
-                       feature_id=feature_id, rows=len(rows), cells=len({r.obs_date for r in rows}))
+    """Pure: classify, flag, simulate the served series before/after, list actions.
+
+    ``scope`` defaults to :func:`feature_scope` (no exclusions); a plan is built
+    whatever the status so a dry run can still show what the rows look like,
+    but only IN_SCOPE plans are applicable. A plan whose newly-dark share
+    exceeds ``coverage_floor`` becomes NEEDS_BACKFILL.
+    """
+    if scope is None:
+        scope = feature_scope(feature)
+    target = scope.target_field
+    plan = plan_from_scope(scope, feature_id)
+    plan.rows, plan.cells = len(rows), len({r.obs_date for r in rows})
     classify_rows(rows, raw, target)
     flag_outliers(rows)
     plan.by_class = {}
@@ -332,7 +484,10 @@ def plan_feature(
         plan.by_class[r.cls] = plan.by_class.get(r.cls, 0) + 1
     plan.raw_rows_read = {f: sum(len(v) for v in by_date.values()) for f, by_date in raw.items()}
 
+    all_cells = {r.obs_date for r in rows}
     before = latest_per_cell(rows, lambda r: not r.retracted)
+    dark_before = all_cells - set(before)
+    plan.cells_dark_before = len(dark_before)
     plan.served_before = ratio_and_jumps({d: r.value for d, r in before.items()})
 
     to_retract = [r for r in rows if r.cls in (OFF_BASIS, OUTLIER)]
@@ -350,20 +505,70 @@ def plan_feature(
     after = latest_per_cell(rows, lambda r: not r.retracted and (r.obs_date, r.vintage_date) not in retract_keys)
     dark = sorted({r.obs_date for r in rows} - set(after))
     plan.cells_dark_after = len(dark)
+    # The reference for a re-vintage candidate is the series that survives
+    # the retractions (OUTLIER rows are no longer ON_BASIS, so a junk print
+    # never anchors its own neighbourhood).
+    reference = NeighbourReference(rows)
     for d in dark:
         cands = raw.get(target, {}).get(d, [])
         if not cands:
             continue
+        if d not in raw.get("close", {}):
+            # No as-traded print for the date: a holiday / weekend cell that
+            # only ever held a junk adj_close row. Nothing honest to serve.
+            plan.revintage_rejected.append({"obs_date": d.isoformat(), "why": "no raw close row: not a trading day"})
+            continue
         best = max(cands, key=lambda c: c.pull_date)
+        pct = reference.deviation(d, best.value)
+        if pct is not None and abs(pct) > OUTLIER_REL:
+            # The latest on-basis raw value is itself a junk print (the r2 plan
+            # would have re-inserted XLP's 0.6 holiday prints under today's
+            # vintage). Try the latest sane candidate instead.
+            sane = [c for c in sorted(cands, key=lambda c: c.pull_date, reverse=True)
+                    if (p2 := reference.deviation(d, c.value)) is None or abs(p2) <= OUTLIER_REL]
+            if not sane:
+                plan.revintage_rejected.append({"obs_date": d.isoformat(), "value": best.value,
+                                                "why": f"every on-basis raw value is an outlier ({pct:+.0%} vs neighbours)"})
+                continue
+            best = sane[0]
         if any(r.obs_date == d and r.vintage_date == repair_day for r in rows):
             # Today's key is taken by a row we are retracting; cannot re-vintage today.
+            plan.revintage_rejected.append({"obs_date": d.isoformat(), "why": "repair-day vintage key already used"})
             continue
         plan.revintage.append({"obs_date": d.isoformat(), "value": best.value, "source_id": best.source_id,
                                "from_pull_date": best.pull_date.isoformat(), "vintage_date": repair_day.isoformat()})
         after[d] = ResolvedRow(id=-1, obs_date=d, vintage_date=repair_day, value=best.value, source_id=best.source_id)
     plan.cells_revintaged = len(plan.revintage)
     plan.cells_left_dark = plan.cells_dark_after - plan.cells_revintaged
+    # A served cell that goes dark is a loss only on a real trading day: a
+    # SUCCESS raw close row for that date proves there was a print. A cell on
+    # a date with no raw close at all held nothing but a phantom (the ~0.6
+    # holiday junk a yfinance writer stamped into XLP/XLB/XLRE/XLI adj_close:
+    # r2 showed xli_full with 5,598 cells against ~4,250 trading days); going
+    # dark is the repair, so it is reported apart and never counts against
+    # the coverage floor.
+    gone = set(before) - set(after)
+    newly_dark = sorted(d for d in gone if d in raw.get("close", {}))
+    plan.cells_newly_dark = len(newly_dark)
+    plan.cells_phantom_cleared = len(gone) - len(newly_dark)
+    plan.cells_restored = len(dark_before & set(after))
+    plan.newly_dark_share = (len(newly_dark) / len(before)) if before else 0.0
+    if newly_dark:
+        plan.newly_dark_range = {"obs_min": newly_dark[0].isoformat(), "obs_max": newly_dark[-1].isoformat(),
+                                 "n": len(newly_dark)}
+    if plan.status == IN_SCOPE and plan.newly_dark_share > coverage_floor:
+        plan.status = NEEDS_BACKFILL
+        plan.scope_reason = (
+            f"{len(newly_dark)} of {len(before)} served cells ({plan.newly_dark_share:.1%}) have no "
+            f"YF:{plan.ticker}:{target} raw row to re-vintage from (floor {coverage_floor:.1%})"
+        )
+        plan.backfill_hint = (
+            f"backfill YF:{plan.ticker}:{target} for obs_date {newly_dark[0].isoformat()}..{newly_dark[-1].isoformat()} "
+            f"({len(newly_dark)} cells), then re-run this plan"
+        )
     plan.served_after = ratio_and_jumps({d: r.value for d, r in after.items()})
+    if after:
+        plan.after_first_on_trading_day = min(after) in raw.get("close", {})
 
     for r in to_retract[:6]:
         plan.examples.append({"obs_date": r.obs_date.isoformat(), "vintage_date": r.vintage_date.isoformat(),
@@ -418,20 +623,37 @@ def read_resolved(conn: Connection, feature_id: int, start: date, has_retraction
     return out
 
 
-def read_raw_by_field(conn: Connection, ticker: str, start: date, end: date) -> dict[str, dict[date, list[RawCandidate]]]:
-    """SUCCESS raw rows of ``YF:<ticker>:close`` and ``:adj_close`` in yearly obs_date chunks."""
+def year_chunks(start: date, end: date) -> list[tuple[date, date]]:
+    out: list[tuple[date, date]] = []
+    lo = start
+    while lo <= end:
+        hi = min(date(lo.year, 12, 31), end)
+        out.append((lo, hi))
+        lo = hi + timedelta(days=1)
+    return out
+
+
+def read_raw_chunk(conn: Connection, sid: str, lo: date, hi: date, into: dict[date, list[RawCandidate]]) -> int:
+    n = 0
+    for od, val, ts, src in conn.execute(_RAW_CHUNK_SQL, {"sid": sid, "lo": lo, "hi": hi}):
+        if val is None:
+            continue
+        pulled = ts.astimezone(timezone.utc).date() if isinstance(ts, datetime) and ts.tzinfo else _as_date(ts)
+        into.setdefault(_as_date(od), []).append(RawCandidate(float(val), pulled, int(src)))
+        n += 1
+    return n
+
+
+def read_raw_by_field(engine: Engine, ticker: str, start: date, end: date,
+                      timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS) -> dict[str, dict[date, list[RawCandidate]]]:
+    """SUCCESS raw rows of ``YF:<ticker>:close`` and ``:adj_close``, one short READ ONLY transaction per year chunk."""
     out: dict[str, dict[date, list[RawCandidate]]] = {"close": {}, "adj_close": {}}
     for fld in out:
         sid = f"YF:{ticker}:{fld}"
-        lo = start
-        while lo <= end:
-            hi = min(date(lo.year, 12, 31), end)
-            for od, val, ts, src in conn.execute(_RAW_CHUNK_SQL, {"sid": sid, "lo": lo, "hi": hi}):
-                if val is None:
-                    continue
-                pulled = ts.astimezone(timezone.utc).date() if isinstance(ts, datetime) and ts.tzinfo else _as_date(ts)
-                out[fld].setdefault(_as_date(od), []).append(RawCandidate(float(val), pulled, int(src)))
-            lo = hi + timedelta(days=1)
+        for lo, hi in year_chunks(start, end):
+            with engine.connect() as conn, conn.begin():
+                _readonly(conn, timeout_ms)
+                read_raw_chunk(conn, sid, lo, hi, out[fld])
     return out
 
 
@@ -440,22 +662,26 @@ def retractions_table_exists(conn: Connection) -> bool:
 
 
 def plan_feature_db(engine: Engine, feature: str, *, start: date, repair_day: date,
-                    timeout_ms: int) -> FeaturePlan:
+                    timeout_ms: int, scope: Scope | None = None,
+                    coverage_floor: float = DEFAULT_COVERAGE_FLOOR) -> FeaturePlan:
+    """Plan one IN_SCOPE feature: resolved rows in one transaction, raw rows per year chunk."""
+    scope = scope or feature_scope(feature)
     try:
         with engine.connect() as conn, conn.begin():
             _readonly(conn, timeout_ms)
             row = conn.execute(text("SELECT id FROM feature_registry WHERE name = :n"), {"n": feature}).fetchone()
             if row is None:
-                p = FeaturePlan(feature=feature, ticker=ticker_for_feature(feature), target_field=target_field(feature))
+                p = plan_from_scope(scope)
                 p.error = "feature not in feature_registry"
                 return p
             fid = int(row[0])
             rows = read_resolved(conn, fid, start, retractions_table_exists(conn))
-            end = max((r.obs_date for r in rows), default=start)
-            raw = read_raw_by_field(conn, ticker_for_feature(feature), start, end)
-        return plan_feature(feature, rows, raw, repair_day=repair_day, feature_id=fid)
+        end = max((r.obs_date for r in rows), default=start)
+        raw = read_raw_by_field(engine, scope.ticker, start, end, timeout_ms)
+        return plan_feature(feature, rows, raw, repair_day=repair_day, feature_id=fid, scope=scope,
+                            coverage_floor=coverage_floor)
     except Exception as exc:  # one feature's timeout must not hide the others
-        p = FeaturePlan(feature=feature, ticker=ticker_for_feature(feature), target_field=target_field(feature))
+        p = plan_from_scope(scope)
         p.error = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
         return p
 
@@ -481,6 +707,8 @@ def apply_plan(engine: Engine, plan: FeaturePlan, *, run_tag: str, timeout_ms: i
     """Write the plan's retractions and re-vintages in one transaction. Appends only."""
     if plan.feature_id is None or plan.error:
         raise RuntimeError(f"{plan.feature}: nothing to apply ({plan.error})")
+    if plan.status not in APPLICABLE_STATUSES:
+        raise RuntimeError(f"{plan.feature}: status {plan.status} is not applicable ({plan.scope_reason})")
     done = {"retracted": 0, "revintaged": 0}
     with engine.begin() as conn:
         _timeout(conn, timeout_ms)
@@ -513,10 +741,12 @@ def list_full_features(engine: Engine, limit: int, timeout_ms: int) -> list[str]
 
 def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_tag: str | None,
         timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS, allow_db_window: bool = False,
+        exclude: Iterable[str] = (), coverage_floor: float = DEFAULT_COVERAGE_FLOOR,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> dict[str, Any]:
     started = clock()
     check_window(started, allow_db_window)
     repair_day = started.astimezone(timezone.utc).date()
+    exclude = frozenset(exclude)
     plans: list[dict[str, Any]] = []
     stopped = None
     for f in features:
@@ -525,32 +755,57 @@ def run(engine: Engine, features: list[str], *, start: date, apply: bool, run_ta
         except DbWindowRefused as exc:
             stopped = f"db_window: {exc}"
             break
-        plan = plan_feature_db(engine, f, start=start, repair_day=repair_day, timeout_ms=timeout_ms)
-        if apply and plan.error is None and (plan.retract or plan.revintage):
+        scope = feature_scope(f, exclude=exclude)
+        if scope.status != IN_SCOPE:
+            # Out of scope / skipped / excluded: no DB read, no action, reported.
+            plan = plan_from_scope(scope)
+        else:
+            plan = plan_feature_db(engine, f, start=start, repair_day=repair_day, timeout_ms=timeout_ms,
+                                   scope=scope, coverage_floor=coverage_floor)
+        if apply and plan.applicable:
             try:
                 plan.applied = apply_plan(engine, plan, run_tag=run_tag or "", timeout_ms=timeout_ms)
             except Exception as exc:  # noqa: BLE001
                 plan.error = f"apply failed: {type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
         print(
-            f"{plan.feature:>14} rows={plan.rows:>7} cells={plan.cells:>6} "
+            f"{plan.feature:>14} {plan.status:<22} rows={plan.rows:>7} cells={plan.cells:>6} "
             f"retract={len(plan.retract):>6} revintage={len(plan.revintage):>5} "
-            f"left_dark={plan.cells_left_dark:>5} ratio {plan.served_before.get('ratio')!s:>12} -> "
+            f"dark_before={plan.cells_dark_before:>5} newly_dark={plan.cells_newly_dark:>5} "
+            f"phantom={plan.cells_phantom_cleared:>5} restored={plan.cells_restored:>5} ratio {plan.served_before.get('ratio')!s:>12} -> "
             f"{plan.served_after.get('ratio')!s:>12} jumps {plan.served_before.get('jumps_gt_10pct')} -> "
             f"{plan.served_after.get('jumps_gt_10pct')}"
+            + (f"  {plan.scope_reason}" if plan.scope_reason and plan.status != IN_SCOPE else "")
+            + ("  WARNING first served cell is not a trading day" if plan.after_first_on_trading_day is False else "")
             + (f"  ERROR {plan.error}" if plan.error else "")
             + (f"  APPLIED {plan.applied}" if plan.applied else ""),
             file=sys.stderr,
         )
         plans.append(plan.summary())
+    by_status: dict[str, int] = {}
+    for p in plans:
+        by_status[p["status"]] = by_status.get(p["status"], 0) + 1
+    applicable = [p for p in plans if p["applicable"]]
     return {
         "generated_at": started.astimezone(timezone.utc).isoformat(), "mode": "apply" if apply else "dry_run",
         "run_tag": run_tag, "repair_day": repair_day.isoformat(), "start": start.isoformat(),
-        "statement_timeout_ms": timeout_ms, "features": plans, "stopped": stopped,
+        "statement_timeout_ms": timeout_ms, "coverage_floor": coverage_floor, "exclude": sorted(exclude),
+        "features": plans, "stopped": stopped,
         "complete": stopped is None and len(plans) == len(features),
         "errors": sum(1 for p in plans if p["error"]),
+        "by_status": by_status,
+        "after_first_not_trading_day": sorted(p["feature"] for p in plans if p["after_first_on_trading_day"] is False),
         "totals": {
             "rows": sum(p["rows"] for p in plans), "retract": sum(p["retract"] for p in plans),
             "revintage": sum(p["revintage"] for p in plans), "left_dark": sum(p["cells_left_dark"] for p in plans),
+            "dark_before": sum(p["cells_dark_before"] for p in plans),
+            "newly_dark": sum(p["cells_newly_dark"] for p in plans),
+            "phantom_cleared": sum(p["cells_phantom_cleared"] for p in plans),
+            "restored": sum(p["cells_restored"] for p in plans),
+        },
+        "applicable_totals": {
+            "features": len(applicable), "retract": sum(p["retract"] for p in applicable),
+            "revintage": sum(p["revintage"] for p in applicable),
+            "newly_dark": sum(p["cells_newly_dark"] for p in applicable),
         },
         "downstream": DOWNSTREAM_RECORDS,
     }
@@ -561,6 +816,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--feature", action="append", default=[], help="a _full feature name (repeatable)")
     p.add_argument("--all-full-features", action="store_true", help="every feature_registry name ending in _full")
     p.add_argument("--max-features", type=int, default=100)
+    p.add_argument("--exclude", action="append", default=[], help="a _full feature to report but never plan or apply (repeatable)")
+    p.add_argument("--coverage-floor", type=float, default=DEFAULT_COVERAGE_FLOOR,
+                   help="largest newly-dark share of served cells an applicable plan may leave (default 0.01)")
     p.add_argument("--start", type=date.fromisoformat, default=DEFAULT_START, help="first obs_date (default 2010-01-01)")
     p.add_argument("--apply", action="store_true", help="WRITE retractions and re-vintages (default: dry run)")
     p.add_argument("--run-tag", help="required with --apply; stored on every retraction")
@@ -578,6 +836,9 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
     if not args.feature and not args.all_full_features:
         print("name at least one --feature or pass --all-full-features", file=sys.stderr)
         return 2
+    if not 0.0 <= args.coverage_floor <= 1.0:
+        print("--coverage-floor must be between 0 and 1", file=sys.stderr)
+        return 2
     if engine is None:
         from db import get_engine  # noqa: PLC0415 -- deferred: config needs the service env
 
@@ -588,7 +849,8 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
                      if f not in features]
     try:
         report = run(engine, features, start=args.start, apply=args.apply, run_tag=args.run_tag,
-                     timeout_ms=args.statement_timeout_ms, allow_db_window=args.allow_db_window)
+                     timeout_ms=args.statement_timeout_ms, allow_db_window=args.allow_db_window,
+                     exclude=args.exclude, coverage_floor=args.coverage_floor)
     except DbWindowRefused as exc:
         print(str(exc), file=sys.stderr)
         return 1

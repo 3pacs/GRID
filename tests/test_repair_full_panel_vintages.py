@@ -17,13 +17,19 @@ import pytest
 import scripts.repair_full_panel_vintages as rep
 from scripts.repair_full_panel_vintages import (
     AMBIGUOUS,
+    EXCLUDED,
+    IN_SCOPE,
+    NEEDS_BACKFILL,
     OFF_BASIS,
     ON_BASIS,
+    OUT_OF_SCOPE,
     OUTLIER,
+    NO_BASIS_SPLIT,
     UNMATCHED,
     RawCandidate,
     ResolvedRow,
     check_window,
+    feature_scope,
     plan_feature,
     target_field,
     ticker_for_feature,
@@ -179,3 +185,248 @@ class TestCli:
 
     def test_needs_a_feature(self, capsys) -> None:
         assert rep.main([], engine=object()) == 2
+
+
+# ── Scope: the ticker comes from the entity-map feed, never from the name ──
+#
+# First dry run on grid-svr (2026-11-08): gold_full (fed by YF:GC=F:close) was
+# compared against ticker GOLD = Barrick Gold and planned 100 % retraction;
+# btc_full / eth_full (Binance, CoinGecko) against bare BTC / ETH equities;
+# eth_usd_full lost 2,058 rows to pull-timing drift on 24/7 bars.
+
+class TestScope:
+    def test_static_adj_close_feed_is_in_scope_with_the_feed_ticker(self) -> None:
+        sc = feature_scope("brk-b_full")
+        assert (sc.status, sc.ticker, sc.target_field, sc.feed) == (IN_SCOPE, "BRK-B", "adj_close", "static")
+        assert sc.feeds == ["YF:BRK-B:adj_close"]
+
+    def test_spy_full_stays_in_scope_on_the_receipted_raw_close(self) -> None:
+        sc = feature_scope("spy_full")
+        assert (sc.status, sc.ticker, sc.target_field) == (IN_SCOPE, "SPY", "close")
+
+    def test_gold_futures_are_never_compared_against_barrick(self) -> None:
+        sc = feature_scope("gold_full")
+        assert sc.ticker == "GC=F" and sc.ticker != ticker_for_feature("gold_full")
+        assert sc.status == NO_BASIS_SPLIT
+
+    def test_binance_and_coingecko_features_are_out_of_scope(self) -> None:
+        for f in ("btc_full", "eth_full", "sol_full"):
+            sc = feature_scope(f)
+            assert sc.status == OUT_OF_SCOPE, f
+            assert "not one yfinance price field" in (sc.reason or "")
+
+    def test_crypto_and_index_allowlist_features_are_skipped(self) -> None:
+        for f in ("btc_usd_full", "eth_usd_full", "sol_usd_full", "sp500_full"):
+            sc = feature_scope(f)
+            assert sc.status == NO_BASIS_SPLIT, f
+            assert "pull-timing drift" in (sc.reason or "")
+
+    def test_pattern_only_feature_is_in_scope_with_the_name_ticker(self) -> None:
+        sc = feature_scope("zzz_full")
+        assert (sc.status, sc.ticker, sc.feed, sc.feeds) == (IN_SCOPE, "ZZZ", "pattern", [])
+
+    def test_exclude_wins_over_in_scope(self) -> None:
+        assert feature_scope("xlp_full", exclude={"xlp_full"}).status == EXCLUDED
+        assert feature_scope("xlp_full").status == IN_SCOPE
+
+    def test_explicit_mappings_two_feeds_or_wrong_field(self) -> None:
+        two = {"YF:ACME:adj_close": "acme_full", "ACME:px": "acme_full"}
+        assert feature_scope("acme_full", mappings=two).status == OUT_OF_SCOPE
+        wrong = {"YF:ACME:close": "acme_full"}
+        sc = feature_scope("acme_full", mappings=wrong)
+        assert sc.status == OUT_OF_SCOPE and "policy basis field" in (sc.reason or "")
+
+    def test_every_static_full_feature_has_a_definite_status(self) -> None:
+        from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
+        feats = {n for n in {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}.values() if n.endswith("_full")}
+        statuses = {f: feature_scope(f).status for f in feats}
+        assert set(statuses.values()) <= {IN_SCOPE, OUT_OF_SCOPE, NO_BASIS_SPLIT}
+        assert statuses["gold_full"] == NO_BASIS_SPLIT
+        assert statuses["btc_full"] == OUT_OF_SCOPE
+        assert sum(1 for v in statuses.values() if v == IN_SCOPE) >= 100
+
+
+# ── Dark-cell accounting and the coverage floor ─────────────────────────────
+
+def _backfill_gap_fixture(missing_first_n: int):
+    """ACN/HON shape: the adj_close feed starts at cell ``missing_first_n``.
+
+    Before it, every vintage came from the raw close (there was no adj_close
+    pull to race with) and there is no adj_close raw row to re-vintage from.
+    """
+    days, rows, raw = _fixture()
+    gap = set(days[:missing_first_n])
+    for d in gap:
+        raw["adj_close"].pop(d, None)
+    close_only = []
+    for r in rows:
+        if r.obs_date in gap:
+            close_val = raw["close"][r.obs_date][0].value
+            if r.value != close_val:
+                r.value = close_val
+        close_only.append(r)
+    return days, close_only, raw
+
+
+class TestDarkAccounting:
+    def test_newly_dark_restored_and_dark_before_are_separate(self) -> None:
+        days, rows, raw = _fixture()
+        # cell 0: every row already retracted (the earlier fill retraction) -> dark today
+        for r in rows:
+            if r.obs_date == days[0]:
+                r.retracted = True
+        # cell 1: a dark-today cell with an on-basis raw row -> restored by the plan
+        for r in rows:
+            if r.obs_date == days[1]:
+                r.retracted = True
+        raw["adj_close"].pop(days[0])
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert plan.cells_dark_before == 2
+        assert plan.cells_restored == 1          # days[1] re-vintaged from its adj_close raw row
+        assert plan.cells_newly_dark == 0        # every served cell keeps or regains a vintage
+        assert plan.cells_left_dark == 1         # days[0]: dark before, still dark, no raw row
+        assert plan.status == IN_SCOPE and plan.applicable
+
+    def test_coverage_floor_marks_needs_backfill_with_the_missing_range(self) -> None:
+        days, rows, raw = _backfill_gap_fixture(15)
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        # The first 15 cells hold raw-close rows only: all OFF_BASIS, retracted,
+        # and no adj_close raw row exists to re-vintage them from.
+        assert plan.cells_newly_dark == 15
+        assert plan.newly_dark_share == 0.5
+        assert plan.status == NEEDS_BACKFILL
+        assert not plan.applicable
+        assert plan.newly_dark_range["obs_min"] == days[0].isoformat()
+        assert plan.newly_dark_range["obs_max"] <= days[14].isoformat()
+        assert "backfill YF:XLP:adj_close for obs_date" in plan.backfill_hint
+        assert plan.retract  # the plan is still shown; it is just not applicable
+
+    def test_floor_is_configurable(self) -> None:
+        days, rows, raw = _backfill_gap_fixture(15)
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY, coverage_floor=1.0)
+        assert plan.status == IN_SCOPE and plan.applicable
+
+    def test_holiday_junk_cell_going_dark_is_phantom_not_a_loss(self) -> None:
+        days, rows, raw = _fixture()
+        holiday = date(2024, 1, 6)  # a Saturday: no raw close, one junk 0.6 adj_close print
+        assert holiday not in raw["close"]
+        raw["adj_close"][holiday] = [RawCandidate(0.6, V3, 2)]
+        rows.append(ResolvedRow(id=9999, obs_date=holiday, vintage_date=V3, value=0.6, source_id=2))
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        junk = [r for r in plan.retract if r["obs_date"] == holiday.isoformat()]
+        assert len(junk) == 1 and junk[0]["cls"] == OUTLIER
+        assert plan.cells_phantom_cleared == 1
+        assert plan.cells_newly_dark == 0 and plan.newly_dark_share == 0.0
+        assert plan.cells_left_dark == 1
+        assert not [v for v in plan.revintage if v["value"] == 0.6]
+        assert plan.revintage_rejected == [{"obs_date": holiday.isoformat(), "why": "no raw close row: not a trading day"}]
+        assert plan.status == IN_SCOPE and plan.applicable
+
+    def test_many_phantom_cells_never_trip_the_floor(self) -> None:
+        days, rows, raw = _fixture()
+        # 10 weekend/holiday cells of junk against 30 trading days: 25 % of cells
+        d = date(2024, 1, 6)
+        added = 0
+        while added < 10:
+            if d.weekday() >= 5:
+                raw["adj_close"][d] = [RawCandidate(0.6, V3, 2)]
+                rows.append(ResolvedRow(id=5000 + added, obs_date=d, vintage_date=V3, value=0.6, source_id=2))
+                added += 1
+            d += timedelta(days=1)
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert plan.cells_phantom_cleared == 10 and plan.cells_newly_dark == 0
+        assert plan.status == IN_SCOPE
+        assert not plan.revintage and len(plan.revintage_rejected) == 10
+
+    def test_junk_print_is_never_revintaged(self) -> None:
+        # A real trading day whose only adj_close raw candidate left after the
+        # retraction is the 0.6 junk print, and a later honest one: the honest
+        # value is chosen; with junk only, the cell stays dark and says why.
+        days, rows, raw = _fixture()
+        d = days[10]
+        raw["adj_close"][d] = [RawCandidate(0.6, V3, 2)]
+        rows = [r for r in rows if r.obs_date != d]
+        rows.append(ResolvedRow(id=7001, obs_date=d, vintage_date=V2, value=raw["close"][d][0].value, source_id=2))
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert not [v for v in plan.revintage if v["obs_date"] == d.isoformat()]
+        rejected = [v for v in plan.revintage_rejected if v["obs_date"] == d.isoformat()]
+        assert len(rejected) == 1 and "outlier" in rejected[0]["why"]
+        assert plan.cells_newly_dark == 1  # an honest loss on a trading day, reported
+        # now add an honest earlier adj_close pull: it is used although it is older
+        raw["adj_close"][d].append(RawCandidate(70.5, V1, 3))
+        plan = plan_feature("xlp_full", [ResolvedRow(**{**r.__dict__, "cls": "", "matched_field": None,
+                                                        "outlier_pct": None}) for r in rows], raw, repair_day=REPAIR_DAY)
+        got = [v for v in plan.revintage if v["obs_date"] == d.isoformat()]
+        assert len(got) == 1 and got[0]["value"] == 70.5 and got[0]["from_pull_date"] == V1.isoformat()
+        assert plan.cells_newly_dark == 0
+
+    def test_xlp_shape_holiday_junk_first_cell_is_cleared_and_the_ratio_moves(self) -> None:
+        """r2 on grid-svr: xlp_full served 2010-01-01 (a holiday) = 0.7245 first and 90.08 last,
+        ratio 124, 301 jumps, before AND after -- the dark holiday cell was refilled from the
+        junk print. The repaired series must start on a trading day with a sane ratio."""
+        days, rows, raw = _fixture()
+        holidays = [date(2024, 1, 1), date(2024, 1, 6), date(2024, 1, 7), date(2024, 1, 14)]
+        for i, h in enumerate(holidays):
+            assert h not in raw["close"]
+            raw["adj_close"][h] = [RawCandidate(0.7245, V3, 2)]
+            rows.append(ResolvedRow(id=8000 + i, obs_date=h, vintage_date=V3, value=0.7245, source_id=2))
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert plan.served_before["first"][0] == "2024-01-01" and plan.served_before["ratio"] > 90
+        assert plan.served_after["first"][0] == days[0].isoformat()
+        assert plan.after_first_on_trading_day is True
+        assert 1.0 < plan.served_after["ratio"] < 1.1 and plan.served_after["jumps_gt_10pct"] == 0
+        assert plan.cells_phantom_cleared == 4 and plan.cells_newly_dark == 0
+        assert not plan.revintage or all(v["value"] != 0.7245 for v in plan.revintage)
+        assert plan.status == IN_SCOPE and plan.applicable
+        assert plan.summary()["after_first_on_trading_day"] is True
+
+    def test_clean_fixture_has_no_newly_dark_cells(self) -> None:
+        _, rows, raw = _fixture()
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        assert (plan.cells_dark_before, plan.cells_newly_dark, plan.cells_restored) == (0, 0, 0)
+        assert plan.newly_dark_share == 0.0 and plan.newly_dark_range is None
+
+    def test_summary_carries_status_and_applicable(self) -> None:
+        _, rows, raw = _fixture()
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY)
+        d = plan.summary()
+        for k in ("status", "scope_reason", "feed", "feeds", "cells_dark_before", "cells_newly_dark",
+                  "cells_phantom_cleared", "cells_restored", "newly_dark_share", "applicable"):
+            assert k in d
+        assert d["status"] == IN_SCOPE and d["applicable"] is True
+
+
+class TestRunScope:
+    def test_non_in_scope_features_never_touch_the_database(self) -> None:
+        from unittest.mock import MagicMock
+        engine = MagicMock()
+        report = rep.run(engine, ["gold_full", "btc_full", "eth_usd_full", "xlp_full"], start=date(2010, 1, 1),
+                         apply=True, run_tag="t", exclude={"xlp_full"},
+                         clock=lambda: datetime(2026, 11, 10, 15, 0, tzinfo=timezone.utc))
+        engine.connect.assert_not_called()
+        engine.begin.assert_not_called()
+        statuses = {p["feature"]: p["status"] for p in report["features"]}
+        assert statuses == {"gold_full": NO_BASIS_SPLIT, "btc_full": OUT_OF_SCOPE,
+                            "eth_usd_full": NO_BASIS_SPLIT, "xlp_full": EXCLUDED}
+        assert report["by_status"] == {NO_BASIS_SPLIT: 2, OUT_OF_SCOPE: 1, EXCLUDED: 1}
+        assert report["applicable_totals"]["features"] == 0
+        assert all(p["applied"] is None for p in report["features"])
+        assert report["complete"] is True and report["errors"] == 0
+
+    def test_apply_refuses_a_non_applicable_plan(self) -> None:
+        from unittest.mock import MagicMock
+        days, rows, raw = _backfill_gap_fixture(15)
+        plan = plan_feature("xlp_full", rows, raw, repair_day=REPAIR_DAY, feature_id=7)
+        assert plan.status == NEEDS_BACKFILL
+        with pytest.raises(RuntimeError, match="NEEDS_BACKFILL"):
+            rep.apply_plan(MagicMock(), plan, run_tag="t", timeout_ms=1000)
+
+
+class TestCliScope:
+    def test_coverage_floor_must_be_a_share(self, capsys) -> None:
+        assert rep.main(["--feature", "xlp_full", "--coverage-floor", "5"], engine=object()) == 2
+        assert "--coverage-floor" in capsys.readouterr().err
+
+    def test_exclude_is_repeatable(self) -> None:
+        args = rep.build_parser().parse_args(["--feature", "a_full", "--exclude", "x_full", "--exclude", "y_full"])
+        assert args.exclude == ["x_full", "y_full"] and args.coverage_floor == rep.DEFAULT_COVERAGE_FLOOR
