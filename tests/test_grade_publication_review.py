@@ -693,3 +693,165 @@ def test_main_day_and_lookback(tmp_path, closes, monkeypatch, capsys):
     assert code == 0 and [r["state"] for r in receipts] == ["UNCHANGED"]
     with pytest.raises(SystemExit):
         grader.main(["--day", "yesterday"])
+
+
+# ── stated current-state figures (data_quality, graded at the publication instant) ─────
+
+FIGURE_TEXT = ("## What's Happening Now\n"
+               "The market is in a **FRAGILE** regime (confidence 0.6024). The VIX stands at 28.18, with the "
+               "9-day tenor at 32.66. Equity indices (S&P 500 at 7,353.73, Nasdaq at 24315.0) show negative "
+               "5-day momentum (-2.68%). The S&P 500 z-score is reported as 0.6 and S&P 500 z=0.7. "
+               "The 10Y-2Y yield curve spread is positive at 0.38%. HYG at 77.28.\n\n## Equities\n- data\n")
+
+
+def test_extract_figures_finds_levels_and_skips_derived_quantities():
+    figs = grader.extract_figures(grader.narrative_window(FIGURE_TEXT))
+    got = [(f.figure.series_id, f.span, f.stated, f.decimals) for f in figs]
+    assert got == [
+        ("YF:^VIX:close", "VIX stands at 28.18", 28.18, 2),
+        ("YF:^VIX9D:close", "9-day tenor at 32.66", 32.66, 2),
+        ("YF:^GSPC:close", "S&P 500 at 7,353.73", 7353.73, 2),
+        ("YF:^IXIC:close", "Nasdaq at 24315.0", 24315.0, 1),
+        ("T10Y2Y", "10Y-2Y yield curve spread is positive at 0.38%", 0.38, 2),
+        ("YF:HYG:close", "HYG at 77.28", 77.28, 2),
+    ]
+    assert all(f.span in FIGURE_TEXT for f in figs)
+    # a price quoted as a percent is a move, a rate without one is not a rate
+    assert grader.extract_figures("The S&P 500 is at -2.68% on the week, the 10Y-2Y spread at 0.38 today.") == []
+
+
+def test_figure_matches_at_printed_precision():
+    assert grader.figure_matches(28.18, 2, 28.1849)
+    assert grader.figure_matches(7353.73, 2, 7353.7301)
+    assert grader.figure_matches(24315.0, 1, 24315.04)
+    assert grader.figure_matches(26.9, 1, 26.91)          # rounded to one decimal before printing
+    assert not grader.figure_matches(28.18, 2, 25.64)
+    assert not grader.figure_matches(7353.73, 2, 7376.86)
+
+
+@pytest.fixture
+def known(monkeypatch):
+    table: dict[str, object] = {}
+    calls: list[tuple[str, datetime]] = []
+
+    def fake(conn, series_id, at):
+        calls.append((series_id, at))
+        value = table.get(series_id)
+        if isinstance(value, Exception):
+            raise value
+        return None if value is None else grader._FigureValue(float(value), "2026-11-06", "yfinance")
+
+    monkeypatch.setattr(grader, "figure_at", fake)
+    return table, calls
+
+
+def test_grade_figure_confirmed_refuted_and_unscorable(known):
+    table, calls = known
+    table.update({"YF:^VIX:close": 28.18, "YF:^VIX9D:close": 27.18, "YF:^GSPC:close": 7353.7300,
+                  "YF:^IXIC:close": 24315.0, "T10Y2Y": ValueError("mixed sources")})
+    p = grader.Publication("market_briefings:5018", "market_briefings", T_FRI_PRE_CLOSE, FIGURE_TEXT, sha(FIGURE_TEXT), {})
+    rows = [grader.grade_figure(object(), p, f) for f in grader.extract_figures(grader.narrative_window(FIGURE_TEXT))]
+    by = {r["claim_span"]: r for r in rows}
+    vix = by["VIX stands at 28.18"]
+    assert vix["verdict"] == "confirmed" and vix["claim_type"] == "data_quality" and vix["knowable_at_stated_at"] is True
+    assert vix["instrument"] == "^VIX" and vix["root_cause"] is None
+    assert vix["horizon_end"] == grader.iso(T_FRI_PRE_CLOSE + grader.FIGURE_HORIZON)
+    assert vix["evidence"][0]["as_of"] == grader.iso(T_FRI_PRE_CLOSE)
+    nine = by["9-day tenor at 32.66"]
+    assert nine["verdict"] == "refuted" and "was 27.18" in nine["root_cause"]
+    assert by["10Y-2Y yield curve spread is positive at 0.38%"]["verdict"] == "unscorable"
+    assert "unreadable at stated_at (ValueError)" in by["10Y-2Y yield curve spread is positive at 0.38%"]["root_cause"]
+    assert by["HYG at 77.28"]["verdict"] == "unscorable" and "no accepted YF:HYG:close" in by["HYG at 77.28"]["root_cause"]
+    assert all(at == T_FRI_PRE_CLOSE for _, at in calls)        # read at the publication instant, never later
+
+
+def test_figure_rows_join_extracted_claims_and_survive_a_failed_extraction(tmp_path, closes, known):
+    table, _ = known
+    table.update({"YF:^VIX:close": 28.18})
+    p = grader.Publication("market_briefings:5018", "market_briefings", T_FRI_PRE_CLOSE, FIGURE_TEXT, sha(FIGURE_TEXT), {})
+    rows, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: FakeClient("[]"))
+    assert len(rows) == 6 and not any("no checkable claim" in (r["root_cause"] or "") for r in rows)
+    rows, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path / "b", lambda: None)
+    assert len(rows) == 6 and not any("extraction unavailable" in (r["root_cause"] or "") for r in rows)
+
+
+def test_figure_at_uses_the_generators_reader_for_yahoo_and_read_latest_for_fred(monkeypatch):
+    import types
+    seen = {}
+
+    def yf(conn, sid, at):
+        seen["yf"] = (sid, at)
+        return {"value": 28.18, "date": "2026-11-06", "source": "yfinance"}
+
+    monkeypatch.setitem(sys.modules, "ollama.market_briefing", types.SimpleNamespace(_read_yf_snapshot_value=yf))
+    out = grader.figure_at(object(), "YF:^VIX:close", T_FRI_PRE_CLOSE)
+    assert seen["yf"] == ("YF:^VIX:close", T_FRI_PRE_CLOSE) and out.value == 28.18 and out.obs_date == "2026-11-06"
+
+    import store.observations as obs_mod
+
+    def latest(conn, sid, *, source=None, as_of=None, as_of_ts=None):
+        seen["fred"] = (sid, as_of, as_of_ts)
+        return Observation(sid, date(2026, 11, 5), 0.38, as_of_ts, "FRED")
+
+    monkeypatch.setattr(obs_mod, "read_latest", latest)
+    out = grader.figure_at(object(), "T10Y2Y", T_FRI_PRE_CLOSE)
+    assert seen["fred"] == ("T10Y2Y", T_FRI_PRE_CLOSE.date(), T_FRI_PRE_CLOSE) and out.value == 0.38 and out.source == "FRED"
+    monkeypatch.setitem(sys.modules, "ollama.market_briefing", types.SimpleNamespace(_read_yf_snapshot_value=lambda *a: None))
+    assert grader.figure_at(object(), "YF:^VIX:close", T_FRI_PRE_CLOSE) is None
+
+
+def test_figure_rows_pass_the_real_ingest_validators(tmp_path, closes, known, monkeypatch):
+    table, _ = known
+    table.update({"YF:^VIX:close": 28.18, "YF:^VIX9D:close": 27.18, "YF:^GSPC:close": 7353.73})
+    packet_root, review_root = tmp_path / "packets", tmp_path / "reviews"
+    write_packet(packet_root, DAY, [pub("market_briefings:5018", FIGURE_TEXT, T_SAT, briefing_type="hourly"),
+                                    pub("thesis_snapshots:1", THESIS_TEXT, T_SAT, overall_direction="neutral")])
+    receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
+                               client_factory=lambda: FakeClient("[]"), ingest=False)
+    assert receipt["state"] == "WRITTEN"
+    assert receipt["verdicts"] == {"confirmed": 2, "partially_confirmed": 1, "refuted": 1, "unscorable": 3}
+    validation = validate_with_ingest(review_root, packet_root, DAY, GRADED_LATE)
+    assert len(validation.accepted) == 7
+
+
+# ── public copy of the review ───────────────────────────────────────────────────────────
+
+def test_grade_day_publishes_review_and_receipts_but_not_the_cache(tmp_path, closes, monkeypatch):
+    packet_root, review_root, _ = _day_fixture(tmp_path)
+    public = tmp_path / "public"
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: {"state": "INGESTED", "run_id": 1})
+    receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
+                               client_factory=lambda: None, public_root=public)
+    folder = review_root / DAY.isoformat()
+    (folder / "ingest-receipt.json").write_text('{"state": "INGESTED"}')
+    (folder / "extractions").mkdir(exist_ok=True)
+    out = public / DAY.isoformat()
+    assert receipt["published"]["files"] == ["review.jsonl", "grader-receipt.json"]
+    assert (out / "review.jsonl").read_bytes() == (folder / "review.jsonl").read_bytes()
+    assert (out / "review.jsonl").stat().st_mode & 0o777 == 0o644 and out.stat().st_mode & 0o777 == 0o755
+    assert public.stat().st_mode & 0o777 == 0o755
+    again = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root,
+                             now=GRADED_LATE + timedelta(hours=1), client_factory=lambda: None, public_root=public)
+    assert again["state"] == "UNCHANGED"
+    assert again["published"]["files"] == ["review.jsonl", "grader-receipt.json", "ingest-receipt.json"]
+    assert sorted(p.name for p in out.iterdir()) == ["grader-receipt.json", "ingest-receipt.json", "review.jsonl"]
+    assert json.loads((out / "grader-receipt.json").read_text())["state"] == "UNCHANGED"
+
+
+def test_publish_is_skipped_on_dry_run_and_refusal_and_never_follows_a_symlink(tmp_path, closes):
+    packet_root, review_root, _ = _day_fixture(tmp_path)
+    public = tmp_path / "public"
+    dry = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
+                           client_factory=lambda: None, dry_run=True, public_root=public)
+    assert "published" not in dry and not public.exists()
+    refused = grader.grade_day(FakeEngine(), DAY + timedelta(days=1), packet_root=packet_root, review_root=review_root,
+                               now=GRADED_LATE, client_factory=lambda: None, public_root=public)
+    assert refused["state"] == "REFUSED" and "published" not in refused
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    public.mkdir()
+    (public / DAY.isoformat()).symlink_to(target)
+    receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
+                               client_factory=lambda: None, ingest=False, public_root=public)
+    assert receipt["state"] == "WRITTEN" and receipt["published"]["error"] == "OSError"
+    assert list(target.iterdir()) == []

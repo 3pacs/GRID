@@ -67,6 +67,11 @@ DEFAULT_PACKET_ROOT = Path(os.environ.get(
     "GRID_PUBLICATION_PACKET_PUBLIC_ROOT",
     os.environ.get("GRID_PUBLICATION_PACKET_ROOT", "~/research/publication-packets"))).expanduser()
 DEFAULT_REVIEW_ROOT = Path(os.environ.get("GRID_PUBLICATION_REVIEW_ROOT", "~/research/publication-reviews")).expanduser()
+#: World-readable copy of each day's review and receipts, next to the public packet tree, so any
+#: fleet agent can read it (the review root lives under the grid user's 0700 home).
+DEFAULT_PUBLIC_ROOT = Path(os.environ.get("GRID_PUBLICATION_REVIEW_PUBLIC_ROOT",
+                                          "~/research/publication-reviews-public")).expanduser()
+PUBLIC_REVIEW_FILES = ("review.jsonl", "grader-receipt.json", "ingest-receipt.json")
 DEFAULT_LOOKBACK_DAYS = 10         # longest horizon is "week" (+7 calendar days, rolled to a session: <= D+9)
 DEFAULT_TIER = os.environ.get("GRID_PUBLICATION_GRADER_TIER", "reason")
 DEFAULT_PROVIDER = os.environ.get("GRID_PUBLICATION_GRADER_PROVIDER") or None
@@ -116,6 +121,49 @@ INSTRUMENT_ALIASES: dict[str, str] = {
     "TREASURIES": "TLT", "LONG BONDS": "TLT", "GOLD": "GLD", "SILVER": "SLV", "OIL": "USO", "CRUDE": "USO",
     "WTI": "USO", "NATURAL GAS": "UNG", "HIGH YIELD": "HYG", "CREDIT": "HYG",
 }
+
+
+#: Current-state figures the briefing generator states, mapped to the raw_series ids it reads
+#: them from (ollama/market_briefing.py ``key_series``). ``pct`` marks a rate quoted with "%".
+#: A narrative briefing is mostly sentences like "The VIX stands at 28.18": no forecast, but a
+#: checkable statement of what GRID's data said at the publication instant.
+@dataclass(frozen=True)
+class Figure:
+    series_id: str
+    label: str
+    names: str          # regex alternation, case-insensitive, matched on word boundaries
+    pct: bool = False
+
+
+FIGURES: tuple[Figure, ...] = (
+    Figure("YF:^VIX9D:close", "VIX 9-day", r"VIX9D|9-day VIX|VIX 9-day(?: tenor)?|9-day tenor"),
+    Figure("YF:^VIX3M:close", "VIX 3-month", r"VIX3M|3-month VIX|VIX 3-month(?: tenor)?"),
+    Figure("YF:^VIX:close", "VIX", r"VIX(?![ -]?(?:9|3M|9-day|3-month))"),
+    Figure("YF:^GSPC:close", "S&P 500", r"S&P 500|S&P|SPX|\^GSPC"),
+    Figure("YF:^IXIC:close", "Nasdaq Composite", r"Nasdaq(?: Composite)?|\^IXIC"),
+    Figure("YF:^DJI:close", "Dow Jones", r"Dow Jones|Dow|\^DJI"),
+    Figure("YF:^RUT:close", "Russell 2000", r"Russell 2000|\^RUT"),
+    Figure("YF:HYG:close", "HYG", r"HYG"),
+    Figure("YF:LQD:close", "LQD", r"LQD"),
+    Figure("YF:JNK:close", "JNK", r"JNK"),
+    Figure("YF:EMB:close", "EMB", r"EMB"),
+    Figure("YF:GLD:close", "GLD", r"GLD"),
+    Figure("YF:UUP:close", "UUP", r"UUP"),
+    Figure("T10Y2Y", "10Y-2Y spread", r"10Y-2Y(?: yield curve)?(?: spread)?|2s10s|10-year minus 2-year", pct=True),
+    Figure("T10Y3M", "10Y-3M spread", r"10Y-3M(?: spread)?|10-year minus 3-month", pct=True),
+    Figure("DFF", "fed funds rate", r"(?:effective )?fed funds(?: rate)?", pct=True),
+    Figure("DGS2", "2-year Treasury yield", r"2-year (?:Treasury )?yield", pct=True),
+    Figure("DGS5", "5-year Treasury yield", r"5-year (?:Treasury )?yield", pct=True),
+)
+#: Between the name and the number: a short run of words with no digit, ending in a level verb.
+#: Anything naming a derived quantity (z-score, momentum, ratio, change ...) is not a level claim.
+_FIGURE_GAP = r"(?P<gap>[^0-9\n.;()\[\]]{0,48}?)\b(?:stands at|stood at|is at|was at|closed at|at|of|is|was|=)\s*"
+_FIGURE_NUMBER = r"(?P<num>\$?[0-9][0-9,]*(?:\.[0-9]+)?)(?P<pct>\s?%)?"
+_DERIVED = re.compile(r"z-score|\bz\b|momentum|ratio|change|volume|percentile|score|return|breadth|ma\b|average|"
+                      r"put/call|spread change|week|day move|bps", re.IGNORECASE)
+_FIGURE_RES = tuple((fig, re.compile(rf"(?<![A-Za-z0-9^])(?P<name>{fig.names})(?![A-Za-z0-9]){_FIGURE_GAP}{_FIGURE_NUMBER}",
+                                     re.IGNORECASE)) for fig in FIGURES)
+FIGURE_HORIZON = timedelta(minutes=1)   # a current-state figure is checkable at once; the ingest wants horizon > stated
 
 
 # ── small helpers (same conventions as the producer and the ingest) ────────────────────
@@ -616,6 +664,107 @@ def horizon_session_for(pub: Publication, horizon: str | None) -> date:
     return d
 
 
+@dataclass(frozen=True)
+class StatedFigure:
+    figure: Figure
+    span: str
+    stated: float
+    decimals: int
+
+
+def extract_figures(window: str) -> list[StatedFigure]:
+    """Deterministic: "<instrument name> ... at <number>" level statements in a narrative window."""
+    found: list[StatedFigure] = []
+    taken: list[tuple[int, int]] = []
+    for fig, pattern in _FIGURE_RES:
+        for m in pattern.finditer(window):
+            start, end = m.start("name"), m.end("num") + (len(m.group("pct")) if m.group("pct") else 0)
+            if any(a < end and start < b for a, b in taken):
+                continue                        # a more specific figure already claimed this text
+            if _DERIVED.search(m.group("gap") or ""):
+                continue
+            if bool(m.group("pct")) != fig.pct:
+                continue                        # "S&P 500 at -2.68%" is a move, "spread at 0.38" is not a rate
+            raw = m.group("num").lstrip("$").replace(",", "")
+            try:
+                stated = float(raw)
+            except ValueError:
+                continue
+            if not math.isfinite(stated):
+                continue
+            span = window[start:end].strip()
+            if not MIN_SPAN_CHARS <= len(span) <= MAX_SPAN_CHARS or span not in window:
+                continue
+            decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
+            taken.append((start, end))
+            found.append(StatedFigure(fig, span, stated, decimals))
+    found.sort(key=lambda f: window.find(f.span))
+    return found
+
+
+def figure_at(conn: Any, series_id: str, at: datetime) -> Any | None:
+    """The value GRID's briefing generator would have read for ``series_id`` at ``at``.
+
+    Yahoo series go through the generator's own reader (policy-eligible completed captures);
+    FRED series through the accepted-only latest read. Both bounded by pull time <= ``at``.
+    Returns an object with ``value``, ``obs_date``, ``source`` or None.
+    """
+    if series_id.startswith("YF:"):
+        from ollama.market_briefing import _read_yf_snapshot_value
+        entry = _read_yf_snapshot_value(conn, series_id, at)
+        if not entry:
+            return None
+        return _FigureValue(float(entry["value"]), str(entry["date"]), str(entry.get("source") or "yfinance"))
+    from store.observations import read_latest
+    obs = read_latest(conn, series_id, as_of=at.date(), as_of_ts=at)
+    return None if obs is None else _FigureValue(float(obs.value), obs.obs_date.isoformat(), obs.source or "raw_series")
+
+
+@dataclass(frozen=True)
+class _FigureValue:
+    value: float
+    obs_date: str
+    source: str
+
+
+def figure_matches(stated: float, decimals: int, observed: float) -> bool:
+    """Stated equals observed at the precision the briefing printed (half a unit of its last digit,
+    plus 0.05 % for a value the briefing rounded before printing)."""
+    tolerance = 0.5 * 10 ** (-decimals) + 0.0005 * abs(observed)
+    return abs(stated - observed) <= tolerance
+
+
+def grade_figure(conn: Any, pub: Publication, stated: StatedFigure) -> dict[str, Any]:
+    fig = stated.figure
+    horizon = iso(pub.published_at + FIGURE_HORIZON)
+    try:
+        observed = figure_at(conn, fig.series_id, pub.published_at)
+    except Exception as exc:  # a reader fault (mixed sources, bad row) is this claim's reason, not the day's
+        return unscorable(pub, stated.span, "data_quality",
+                          f"{fig.label}: {fig.series_id} unreadable at stated_at ({type(exc).__name__})",
+                          horizon_end=horizon)
+    if observed is None or not math.isfinite(observed.value):
+        return unscorable(pub, stated.span, "data_quality",
+                          f"{fig.label}: no accepted {fig.series_id} value known at stated_at", horizon_end=horizon)
+    holds = figure_matches(stated.stated, stated.decimals, observed.value)
+    unit = "%" if fig.pct else ""
+    evidence = [{"source": f"{observed.source} {fig.series_id}",
+                 "observed": f"{observed.value:g}{unit} obs_date {observed.obs_date} (latest known at stated_at)",
+                 "as_of": iso(pub.published_at), "url": None},
+                {"source": "grader", "observed": f"stated {stated.stated:g}{unit} vs known {observed.value:g}{unit}",
+                 "as_of": iso(pub.published_at), "url": None}]
+    root_cause = None if holds else (f"stated {fig.label} {stated.stated:g}{unit}; GRID's {fig.series_id} at the "
+                                     f"publication instant was {observed.value:g}{unit} ({observed.obs_date})")
+    return _row(pub, stated.span, "data_quality", instrument=_instrument_for(fig), horizon_end=horizon,
+                verdict="confirmed" if holds else "refuted", evidence=evidence, knowable_at_stated_at=True,
+                root_cause=root_cause, grader_confidence=0.9)
+
+
+def _instrument_for(fig: Figure) -> str:
+    sid = fig.series_id
+    return (sid.split(":")[1] if sid.startswith("YF:") else sid)[:32]
+
+
 def grade_briefing(conn: Any, pub: Publication, graded_at: datetime, folder: Path, client_factory: Any,
                    *, persist: bool = True) -> tuple[list[dict[str, Any]], str | None]:
     """Rows for a briefing/diary record plus the extraction model used (None when no model was needed)."""
@@ -625,12 +774,15 @@ def grade_briefing(conn: Any, pub: Publication, graded_at: datetime, folder: Pat
                            "no narrative to grade: the record says its AI narrative was withheld or unavailable "
                            "(data summary only)")], None
     opening = first_sentence_span(pub.text)
+    figure_rows = [grade_figure(conn, pub, f) for f in extract_figures(narrative_window(pub.text))]
     extraction = cached_extraction(folder, pub, client_factory, persist=persist)
     if extraction.error:
+        if figure_rows:
+            return figure_rows, extraction.model
         rows = [] if opening is None else [unscorable(pub, opening, "data_quality",
                                                       f"claim extraction unavailable: {extraction.error}")]
         return rows, extraction.model
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = list(figure_rows)
     for claim in extraction.claims:
         span, kind = claim["span"], claim["claim_type"]
         ticker = resolve_instrument(claim["instrument"])
@@ -740,7 +892,7 @@ def verdict_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT, review_root: Path = DEFAULT_REVIEW_ROOT,
               dry_run: bool = False, now: datetime | None = None, client_factory: Any = None,
-              ingest: bool = True, force: bool = False) -> dict[str, Any]:
+              ingest: bool = True, force: bool = False, public_root: Path | None = None) -> dict[str, Any]:
     """Grade one publication day; returns the grader receipt (also written to ``<review_root>/<D>/grader-receipt.json``)."""
     graded_at = now or datetime.now(timezone.utc)
     folder = review_root / day.isoformat()
@@ -811,6 +963,8 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             write_file(folder / "grader-receipt.json", json.dumps(receipt, indent=2, sort_keys=True, default=str).encode("utf-8"))
         except OSError as exc:
             receipt["receipt_write_error"] = type(exc).__name__
+        if public_root is not None and receipt.get("state") in {"WRITTEN", "UNCHANGED"}:
+            receipt["published"] = publish_review(folder, public_root / day.isoformat())
     return receipt
 
 
@@ -827,6 +981,36 @@ def run_ingest(engine: Any, day: date, review_root: Path, packet_root: Path) -> 
         return {"state": "FAILED", "reason": f"hand-off: {type(exc).__name__}"}
     return {key: result.get(key) for key in ("state", "reason", "run_id", "accepted_rows", "rejected_rows",
                                               "declared_mismatch", "receipt_file")}
+
+
+def publish_review(folder: Path, public_dir: Path) -> dict[str, Any]:
+    """Copy the day's review and receipts (allow-list, bytes unchanged) into the public tree.
+
+    Dirs 0755, files 0644, never through a symlink at either end; only changed files are
+    rewritten. Best effort: a failure is reported, never raised (the review is already written).
+    """
+    out: dict[str, Any] = {"public_dir": str(public_dir), "files": []}
+    try:
+        if public_dir.is_symlink() or public_dir.parent.is_symlink():
+            raise OSError("public review dir is a symlink")
+        public_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(public_dir.parent, 0o755)
+        os.chmod(public_dir, 0o755)
+        for name in PUBLIC_REVIEW_FILES:
+            src = folder / name
+            if not src.is_file() or src.is_symlink():
+                continue
+            data = read_regular_file(src, MAX_FILE_BYTES)
+            dst = public_dir / name
+            if dst.is_file() and not dst.is_symlink() and read_regular_file(dst, MAX_FILE_BYTES) == data:
+                out["files"].append(name)
+                continue
+            write_file(dst, data, 0o644)
+            out["files"].append(name)
+    except (OSError, Refused) as exc:
+        out["error"] = type(exc).__name__
+        print(f"{JOB}: could not publish review to {public_dir}: {type(exc).__name__}", file=sys.stderr)
+    return out
 
 
 def _ingest_module() -> Any:
@@ -875,6 +1059,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="grade and report; write nothing, ingest nothing")
     parser.add_argument("--no-ingest", action="store_true", help="write review.jsonl but leave the ingest to its timer")
     parser.add_argument("--force", action="store_true", help="rewrite review.jsonl even when the verdict rows are unchanged")
+    parser.add_argument("--public-root", default=str(DEFAULT_PUBLIC_ROOT),
+                        help="world-readable copy of review.jsonl + receipts per day (default from "
+                             "GRID_PUBLICATION_REVIEW_PUBLIC_ROOT)")
+    parser.add_argument("--no-publish", action="store_true", help="do not copy the review into the public tree")
     parser.add_argument("--json", action="store_true", help="print the receipts as JSON")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
@@ -891,7 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
     for day in days:
         receipt = grade_day(engine, day, packet_root=Path(args.packet_root).expanduser(),
                             review_root=Path(args.review_root).expanduser(), dry_run=args.dry_run, now=now,
-                            ingest=not args.no_ingest, force=args.force)
+                            ingest=not args.no_ingest, force=args.force,
+                            public_root=None if args.no_publish else Path(args.public_root).expanduser())
         if receipt.get("state") == "REFUSED" and not args.day and "not present" in str(receipt.get("reason")):
             continue  # a lookback day without a packet is not news
         receipts.append(receipt)
