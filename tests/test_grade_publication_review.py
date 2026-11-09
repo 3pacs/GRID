@@ -729,45 +729,122 @@ def test_figure_matches_at_printed_precision():
     assert not grader.figure_matches(7353.73, 2, 7376.86)
 
 
+def _o(sid: str, d: date, value: float, pulled: datetime, source: str = "yfinance") -> Observation:
+    return Observation(sid, d, value, pulled, source)
+
+
+FRI = date(2026, 11, 6)
+THU = date(2026, 11, 5)
+WED = date(2026, 11, 4)
+
+
+def _z(day: date, hh: int, mm: int = 0) -> datetime:
+    return datetime(day.year, day.month, day.day, hh, mm, tzinfo=timezone.utc)
+
+
 @pytest.fixture
-def known(monkeypatch):
-    table: dict[str, object] = {}
-    calls: list[tuple[str, datetime]] = []
+def vintages(monkeypatch):
+    """series_id -> list of Observation; the grader reads them through _vintages."""
+    table: dict[str, list[Observation]] = {}
 
-    def fake(conn, series_id, at):
-        calls.append((series_id, at))
-        value = table.get(series_id)
-        if isinstance(value, Exception):
-            raise value
-        return None if value is None else grader._FigureValue(float(value), "2026-11-06", "yfinance")
+    def fake(conn, series_id, start, end):
+        return sorted((o for o in table.get(series_id, []) if start <= o.obs_date <= end),
+                      key=lambda o: (o.obs_date, o.pull_timestamp))
 
-    monkeypatch.setattr(grader, "figure_at", fake)
-    return table, calls
+    monkeypatch.setattr(grader, "_vintages", fake)
+    return table
 
 
-def test_grade_figure_confirmed_refuted_and_unscorable(known):
-    table, calls = known
-    table.update({"YF:^VIX:close": 28.18, "YF:^VIX9D:close": 27.18, "YF:^GSPC:close": 7353.7300,
-                  "YF:^IXIC:close": 24315.0, "T10Y2Y": ValueError("mixed sources")})
-    p = grader.Publication("market_briefings:5018", "market_briefings", T_FRI_PRE_CLOSE, FIGURE_TEXT, sha(FIGURE_TEXT), {})
-    rows = [grader.grade_figure(object(), p, f) for f in grader.extract_figures(grader.narrative_window(FIGURE_TEXT))]
-    by = {r["claim_span"]: r for r in rows}
-    vix = by["VIX stands at 28.18"]
-    assert vix["verdict"] == "confirmed" and vix["claim_type"] == "data_quality" and vix["knowable_at_stated_at"] is True
-    assert vix["instrument"] == "^VIX" and vix["root_cause"] is None
-    assert vix["horizon_end"] == grader.iso(T_FRI_PRE_CLOSE + grader.FIGURE_HORIZON)
-    assert vix["evidence"][0]["as_of"] == grader.iso(T_FRI_PRE_CLOSE)
-    nine = by["9-day tenor at 32.66"]
-    assert nine["verdict"] == "refuted" and "was 27.18" in nine["root_cause"]
-    assert by["10Y-2Y yield curve spread is positive at 0.38%"]["verdict"] == "unscorable"
-    assert "unreadable at stated_at (ValueError)" in by["10Y-2Y yield curve spread is positive at 0.38%"]["root_cause"]
-    assert by["HYG at 77.28"]["verdict"] == "unscorable" and "no accepted YF:HYG:close" in by["HYG at 77.28"]["root_cause"]
-    assert all(at == T_FRI_PRE_CLOSE for _, at in calls)        # read at the publication instant, never later
+def _vix(table, *rows):
+    table.setdefault("YF:^VIX:close", []).extend(_o("YF:^VIX:close", d, v, t) for d, v, t in rows)
 
 
-def test_figure_rows_join_extracted_claims_and_survive_a_failed_extraction(tmp_path, closes, known):
-    table, _ = known
-    table.update({"YF:^VIX:close": 28.18})
+def _range(table, d, lo, hi, pulled):
+    table.setdefault("YF:^VIX:low", []).append(_o("YF:^VIX:low", d, lo, pulled))
+    table.setdefault("YF:^VIX:high", []).append(_o("YF:^VIX:high", d, hi, pulled))
+
+
+def _judge(text: str, at: datetime):
+    [stated] = grader.extract_figures(text)
+    p = grader.Publication("market_briefings:1", "market_briefings", at, text, sha(text), {})
+    return grader.grade_figure(object(), p, stated)
+
+
+def test_intraday_spike_is_confirmed_by_the_captures_around_the_statement(vintages):
+    # the old reader compared 26.9 with the last completed close (16.61) and refuted a true statement
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 21.0, _z(FRI, 15)), (FRI, 26.5, _z(FRI, 18, 30)),
+         (FRI, 27.4, _z(FRI, 19, 30)))
+    row = _judge("The VIX of 26.9 shows the spike.", _z(FRI, 19))          # 14:00 ET, session open
+    assert row["verdict"] == "confirmed" and row["root_cause"] is None
+    assert [e["observed"].split(" ")[0] for e in row["evidence"]] == ["26.5", "27.4"]
+
+
+def test_evening_statement_matches_the_days_close_before_grid_calls_it_final(vintages):
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.9, _z(FRI, 21, 20)))
+    row = _judge("The VIX at 26.9 into the close.", _z(FRI, 23))
+    assert row["verdict"] == "confirmed" and row["knowable_at_stated_at"] is True
+
+
+def test_a_true_close_grid_had_not_pulled_yet_is_confirmed_not_knowable(vintages):
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.9, _z(FRI, 21, 30)))
+    row = _judge("The VIX at 26.9 into the close.", _z(FRI, 21, 5))
+    assert row["verdict"] == "confirmed" and row["knowable_at_stated_at"] is False
+
+
+def test_quoting_yesterdays_close_after_todays_was_known_is_stale(vintages):
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.9, _z(FRI, 21, 20)))
+    row = _judge("The VIX at 16.61 is calm.", _z(FRI, 23))
+    assert row["verdict"] == "partially_confirmed" and "stale" in row["root_cause"]
+    assert "2026-11-05 close" in row["root_cause"] and "26.9" in row["root_cause"]
+
+
+def test_morning_statement_quoting_the_previous_close_is_confirmed(vintages):
+    _vix(vintages, (WED, 18.0, _z(THU, 4)), (THU, 16.61, _z(THU, 21, 20)))
+    row = _judge("The VIX at 16.61 before the open.", _z(FRI, 13))        # 08:00 ET, before the open
+    assert row["verdict"] == "confirmed"
+
+
+def test_inside_the_range_without_a_pinning_capture_is_partial(vintages):
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 18.0, _z(FRI, 15)), (FRI, 19.0, _z(FRI, 16)),
+         (FRI, 29.0, _z(FRI, 21, 20)))
+    _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
+    row = _judge("The VIX of 26.9 shows the spike.", _z(FRI, 19))
+    assert row["verdict"] == "partially_confirmed" and "inside the 2026-11-06 range 16-30" in row["root_cause"]
+
+
+def test_a_value_the_market_never_printed_is_refuted_with_evidence(vintages):
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.0, _z(FRI, 18)), (FRI, 27.0, _z(FRI, 20)))
+    _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
+    row = _judge("The VIX of 40.1 is a panic.", _z(FRI, 19))
+    assert row["verdict"] == "refuted" and "outside the session range" in row["root_cause"]
+    assert any("range 16-30" in e["observed"] for e in row["evidence"])
+    assert all(e["as_of"] <= grader.iso(GRADED_LATE) for e in row["evidence"])
+
+
+def test_fred_rate_latest_versus_stale_by_release_time(vintages):
+    vintages["T10Y2Y"] = [_o("T10Y2Y", THU, 0.38, _z(FRI, 12), "FRED"), _o("T10Y2Y", FRI, 0.34, _z(date(2026, 11, 7), 12), "FRED")]
+    early = _judge("The 10Y-2Y spread is at 0.38% today.", _z(date(2026, 11, 7), 1))   # Friday's value not out yet
+    assert early["verdict"] == "confirmed"
+    late = _judge("The 10Y-2Y spread is at 0.38% today.", _z(date(2026, 11, 7), 18))   # Friday's 0.34 was out
+    assert late["verdict"] == "partially_confirmed" and "stale" in late["root_cause"]
+    wrong = _judge("The 10Y-2Y spread is at 0.52% today.", _z(date(2026, 11, 7), 18))
+    assert wrong["verdict"] == "refuted"
+
+
+def test_no_capture_at_all_is_unscorable_and_reader_faults_stay_local(vintages, monkeypatch):
+    row = _judge("HYG at 77.28 in the tape.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable" and "no YF:HYG:close capture" in row["root_cause"]
+
+    def boom(*a, **k):
+        raise RuntimeError("db")
+
+    monkeypatch.setattr(grader, "_vintages", boom)
+    row = _judge("HYG at 77.28 in the tape.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable" and "unreadable (RuntimeError)" in row["root_cause"]
+
+
+def test_figure_rows_join_extracted_claims_and_survive_a_failed_extraction(tmp_path, closes, vintages):
+    _vix(vintages, (THU, 28.18, _z(FRI, 4)))
     p = grader.Publication("market_briefings:5018", "market_briefings", T_FRI_PRE_CLOSE, FIGURE_TEXT, sha(FIGURE_TEXT), {})
     rows, _ = grader.grade_briefing(object(), p, GRADED_LATE, tmp_path, lambda: FakeClient("[]"))
     assert len(rows) == 6 and not any("no checkable claim" in (r["root_cause"] or "") for r in rows)
@@ -775,43 +852,46 @@ def test_figure_rows_join_extracted_claims_and_survive_a_failed_extraction(tmp_p
     assert len(rows) == 6 and not any("extraction unavailable" in (r["root_cause"] or "") for r in rows)
 
 
-def test_figure_at_uses_the_generators_reader_for_yahoo_and_read_latest_for_fred(monkeypatch):
-    import types
-    seen = {}
-
-    def yf(conn, sid, at):
-        seen["yf"] = (sid, at)
-        return {"value": 28.18, "date": "2026-11-06", "source": "yfinance"}
-
-    monkeypatch.setitem(sys.modules, "ollama.market_briefing", types.SimpleNamespace(_read_yf_snapshot_value=yf))
-    out = grader.figure_at(object(), "YF:^VIX:close", T_FRI_PRE_CLOSE)
-    assert seen["yf"] == ("YF:^VIX:close", T_FRI_PRE_CLOSE) and out.value == 28.18 and out.obs_date == "2026-11-06"
-
-    import store.observations as obs_mod
-
-    def latest(conn, sid, *, source=None, as_of=None, as_of_ts=None):
-        seen["fred"] = (sid, as_of, as_of_ts)
-        return Observation(sid, date(2026, 11, 5), 0.38, as_of_ts, "FRED")
-
-    monkeypatch.setattr(obs_mod, "read_latest", latest)
-    out = grader.figure_at(object(), "T10Y2Y", T_FRI_PRE_CLOSE)
-    assert seen["fred"] == ("T10Y2Y", T_FRI_PRE_CLOSE.date(), T_FRI_PRE_CLOSE) and out.value == 0.38 and out.source == "FRED"
-    monkeypatch.setitem(sys.modules, "ollama.market_briefing", types.SimpleNamespace(_read_yf_snapshot_value=lambda *a: None))
-    assert grader.figure_at(object(), "YF:^VIX:close", T_FRI_PRE_CLOSE) is None
-
-
-def test_figure_rows_pass_the_real_ingest_validators(tmp_path, closes, known, monkeypatch):
-    table, _ = known
-    table.update({"YF:^VIX:close": 28.18, "YF:^VIX9D:close": 27.18, "YF:^GSPC:close": 7353.73})
+def test_figure_rows_pass_the_real_ingest_validators(tmp_path, closes, vintages):
+    _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.9, _z(FRI, 21, 20)))
+    _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
+    vintages["YF:^GSPC:close"] = [_o("YF:^GSPC:close", FRI, 7353.73, _z(FRI, 21, 20))]
+    text = ("## What's Happening Now\nThe VIX at 26.9 into the close, VIX 9-day at 40.0 and the S&P 500 at "
+            "7,353.73. HYG at 77.28.\n\n## Equities\n- data\n")
     packet_root, review_root = tmp_path / "packets", tmp_path / "reviews"
-    write_packet(packet_root, DAY, [pub("market_briefings:5018", FIGURE_TEXT, T_SAT, briefing_type="hourly"),
+    write_packet(packet_root, DAY, [pub("market_briefings:5018", text, T_SAT, briefing_type="hourly"),
                                     pub("thesis_snapshots:1", THESIS_TEXT, T_SAT, overall_direction="neutral")])
     receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
                                client_factory=lambda: FakeClient("[]"), ingest=False)
     assert receipt["state"] == "WRITTEN"
-    assert receipt["verdicts"] == {"confirmed": 2, "partially_confirmed": 1, "refuted": 1, "unscorable": 3}
+    assert receipt["verdicts"] == {"confirmed": 2, "partially_confirmed": 1, "unscorable": 2}
     validation = validate_with_ingest(review_root, packet_root, DAY, GRADED_LATE)
-    assert len(validation.accepted) == 7
+    assert len(validation.accepted) == 5
+
+
+def test_read_vintages_returns_every_accepted_vintage_bounded():
+    import store.observations as obs_mod
+
+    class Conn:
+        def __init__(self):
+            self.seen = None
+
+        def execute(self, clause, params):
+            self.seen = (str(clause), params)
+
+            class R:
+                @staticmethod
+                def fetchall():
+                    return [(FRI, 21.0, _z(FRI, 15), "yfinance"), (FRI, None, _z(FRI, 16), "yfinance"),
+                            (FRI, 26.9, _z(FRI, 21, 20), "TIINGO")]
+            return R()
+
+    conn = Conn()
+    out = obs_mod.read_vintages(conn, "YF:^VIX:close", start=THU, end=FRI)
+    sql, params = conn.seen
+    assert "pull_status = :ok" in sql and "obs_date >= :start" in sql and "LIMIT :limit" in sql
+    assert params == {"sid": "YF:^VIX:close", "ok": "SUCCESS", "start": THU, "end": FRI, "limit": obs_mod.MAX_VINTAGES}
+    assert [(o.value, o.source) for o in out] == [(21.0, "yfinance"), (26.9, "TIINGO")]
 
 
 # ── public copy of the review ───────────────────────────────────────────────────────────
