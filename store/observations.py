@@ -280,6 +280,44 @@ def read_latest(
     return Observation(series_id, _coerce_date(row[0]), float(row[1]), _coerce_ts(row[2]), row[3])
 
 
+_VINTAGES_SQL = (
+    "SELECT r.obs_date, r.value, r.pull_timestamp, sc.name FROM raw_series r "
+    "JOIN source_catalog sc ON sc.id = r.source_id "
+    "WHERE r.series_id = :sid AND r.pull_status = :ok "
+    "  AND r.obs_date >= :start AND r.obs_date <= :end "
+    "ORDER BY r.obs_date ASC, r.pull_timestamp ASC LIMIT :limit"
+)
+MAX_VINTAGES = 5000
+
+
+def read_vintages(
+    conn: Any,
+    series_id: str,
+    *,
+    start: date,
+    end: date,
+    limit: int = MAX_VINTAGES,
+) -> list[Observation]:
+    """Every accepted vintage of ``series_id`` labelled in ``[start, end]``, every source,
+    oldest label then oldest pull first.
+
+    Unlike :func:`read_window` nothing is deduplicated: intraday captures, the completed
+    close and later revisions all come back with their pull times. For checking a
+    statement made at a known instant ("was VIX really 26.9 then?"), where the latest
+    vintage alone answers a different question. Bounded by the label window and ``limit``.
+    """
+    rows = conn.execute(
+        text(_VINTAGES_SQL),
+        {"sid": series_id, "ok": SUCCESS, "start": start, "end": end, "limit": int(limit)},
+    ).fetchall()
+    out: list[Observation] = []
+    for row in rows:
+        if row[1] is None:
+            continue
+        out.append(Observation(series_id, _coerce_date(row[0]), float(row[1]), _coerce_ts(row[2]), row[3]))
+    return out
+
+
 def read_latest_n(
     conn: Any,
     series_id: str,

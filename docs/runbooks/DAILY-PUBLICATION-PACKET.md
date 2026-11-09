@@ -281,12 +281,17 @@ ingest enforces; the grader constructs rows so they pass by construction):
 - `market_briefings` narratives are mostly descriptive ("The VIX stands at 28.18"): every
   current-state figure on a series the generator reads (`ollama/market_briefing.py` key_series:
   VIX, VIX9D, VIX3M, S&P 500, Nasdaq, Dow, Russell 2000, HYG/LQD/JNK/EMB, GLD, UUP, T10Y2Y,
-  T10Y3M, DFF, DGS2, DGS5) becomes a `data_quality` row graded against what GRID knew at the
-  publication instant: Yahoo series through the generator's own reader, FRED through
-  `store.observations.read_latest(as_of_ts=stated_at)`. `confirmed` when equal at the printed
-  precision, `refuted` with both numbers otherwise, `unscorable` when no value was known.
-  Derived quantities (z-scores, momentum, ratios, moves in %) are skipped. This measures how
-  often a briefing misstates its own data, which no other check does.
+  T10Y3M, DFF, DGS2, DGS5) becomes a `data_quality` row judged on whether the number was real
+  at the instant it was stated, from every capture GRID holds around it
+  (`store.observations.read_vintages`: intraday pulls, the completed close, the session's
+  high/low, later revisions). During a session: confirmed when it lies between the in-session
+  captures within 90 minutes of the statement, or equals the previous completed close;
+  partially confirmed when it is only inside the session's high/low. After a close: confirmed
+  when it equals the newest completed close (even one GRID pulled after the statement:
+  `knowable_at_stated_at` says which); partially confirmed as stale when it equals an older
+  close while a newer one was already known. FRED rates use the same newest-vs-stale rule over
+  observation dates. Anything else is refuted, with the nearest captures and the range as
+  evidence. Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
 - A day whose verdict rows and header (packet sha, models) did not change is left alone
   (`UNCHANGED`); a change rewrites the file and the ingest records a new run that supersedes the
   previous one. A hand-off that failed (database down) is retried on the next run until the
