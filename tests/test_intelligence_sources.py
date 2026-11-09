@@ -235,6 +235,7 @@ class TestGDELTEnhanced:
         assert GDELTPuller.SOURCE_NAME == "GDELT"
         assert GDELTPuller.SOURCE_CONFIG["cost_tier"] == "FREE"
 
+    @patch("ingestion.altdata.gdelt_doc.MIN_INTERVAL_S", 0.0)  # no real spacing waits
     @patch("ingestion.altdata.gdelt.requests.get")
     def test_pull_recent_returns_enhanced_fields(self, mock_get):
         """pull_recent should return actor_rows and tension_rows counts."""
@@ -251,14 +252,9 @@ class TestGDELTEnhanced:
         mock_resp.json.return_value = {"timeline": []}
         mock_get.return_value = mock_resp
 
-        from ingestion.altdata.gdelt import GDELTPuller, _TokenBucket
+        from ingestion.altdata.gdelt import GDELTPuller
 
         puller = GDELTPuller(engine)
-        puller._doc_throttle = _TokenBucket(
-            max_per_window=10_000,
-            capacity=10_000,
-            sleep=lambda _seconds: None,
-        )
         result = puller.pull_recent(days_back=2)
 
         assert result["source"] == "GDELT"

@@ -1307,8 +1307,14 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         "method": "pull_recent",
         # GDELT answers grid-svr with 429 even for single requests at a
         # 5-minute cadence (2026-11-04); hourly is within its tolerance.
+        # Every DOC request waits for the host-wide gate (gdelt_doc.py):
+        # one in flight per host, 6 s apart, and a shared cooldown after a
+        # 429. GDELT takes 10-20 s per answer and refused about half the
+        # first tries from grid-svr (probe 2026-11-09: 2 of 4 answered, each
+        # after a 60 s cooldown), so four queries need up to ~6 min; the old
+        # 60 s timeout cut runs short. pull_recent stops at deadline_at.
         "freq_h": 1,
-        "timeout_s": 60,
+        "timeout_s": 360,
         "kwargs": {
             "days_back": 1,
             "max_theme_queries": 4,
@@ -1316,7 +1322,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
             "include_tensions": False,
             "include_signals": False,
         },
-    },  # 5 min — bounded breaking-events lane; full GDELT runs belong in catch-up/backfill
+    },  # bounded breaking-events lane; full GDELT runs belong in catch-up/backfill
     {
         "name": "news_scraper",
         "mod": "ingestion.altdata.news_scraper",
