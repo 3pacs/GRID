@@ -134,7 +134,9 @@ def test_observations_filters_on_success_only():
     assert obs.SUCCESS == "SUCCESS"
     # 4 since 2026-11-06 (W2-10): _SPLITS_SQL (read_splits) joined the
     # window/latest/source-names queries; it is SUCCESS-only the same way.
-    assert source.count("r.pull_status = :ok") == 4
+    # 5 since 2026-11-09: _VINTAGES_SQL (read_vintages, every accepted vintage
+    # for the publication grader's truth check), SUCCESS-only the same way.
+    assert source.count("r.pull_status = :ok") == 5
     assert not re.search(r"pull_status\s*(!=|<>|NOT\s+IN)", source, re.I)
 
 
