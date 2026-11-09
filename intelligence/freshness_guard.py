@@ -2,7 +2,7 @@
 GRID — Feature Freshness Guard.
 
 Reusable utility to check whether features have recent data before
-running analysis.  Returns a status per feature: FRESH, STALE, or MISSING.
+running analysis.  Returns a status per feature: FRESH, STALE, INVALID, or MISSING.
 
 Usage:
     from intelligence.freshness_guard import check_freshness, FreshnessStatus
@@ -30,7 +30,7 @@ class FreshnessStatus:
     """Immutable status for a single feature's data freshness."""
 
     feature_name: str
-    status: str  # "FRESH", "STALE", or "MISSING"
+    status: str  # "FRESH", "STALE", "INVALID", or "MISSING"
     last_date: date | None
     days_old: int | None
     sla_days: int
@@ -91,7 +91,8 @@ def check_freshness(
                     )
                 else:
                     days_old = (today - latest).days
-                    status = "STALE" if days_old > sla else "FRESH"
+                    status = ("INVALID" if days_old < 0 else
+                              "STALE" if days_old > sla else "FRESH")
                     results[name] = FreshnessStatus(
                         feature_name=name,
                         status=status,
@@ -139,7 +140,10 @@ def log_stale_features(
     """
     prefix = f"[{caller}] " if caller else ""
     for name, fs in statuses.items():
-        if fs.status == "STALE":
+        if fs.status == "INVALID":
+            log.warning("{pfx}SANITY freshness: {n} is INVALID (future observation {d})",
+                        pfx=prefix, n=name, d=fs.last_date)
+        elif fs.status == "STALE":
             log.warning(
                 "{pfx}SANITY freshness: {n} is STALE "
                 "(last data {d}, {age}d old, SLA={sla}d)",
