@@ -280,6 +280,40 @@ Verification and limits:
   future rows; only the current unlabelled row is counted. All 494 combined
   offline tests passed again; Ruff and diff checks passed.
 
+## 2026-11-07 - Alpha Vantage transcript coverage (isolated source only)
+
+- Extended the existing earnings-events puller with durable symbol/quarter
+  rotation, explicit local pacing and optional daily budgets, and provider-notice
+  stop behavior. Kept all live wrappers, schedules and account allocations unchanged.
+- Reused stored SEC fiscal metadata matched to exact filings rather than guessing
+  calendar quarters. Missing/ambiguous metadata and legacy transcript provenance
+  are reported as coverage gaps; no historical rows are repaired automatically.
+- Added `docs/reference/ALPHAVANTAGE_COVERAGE_ROLLOUT.md` with prerequisites,
+  milestones and minimum data contracts. AV bulk adapters remain unchanged/unrun.
+- 56 focused offline tests passed with socket access blocked; changed-file lint,
+  compilation and diff checks passed. Independent source review's legacy-date
+  finding was fixed and regression-tested. PostgreSQL integration, account-wide
+  budget allocation, legacy reconciliation and date-aware consumers remain gates.
+- Local branch only. No provider requests, production writes, push, PR, merge or
+  deployment. This does not establish live coverage or complete valuation inputs.
+
+### Follow-on qualification (2026-11-07, source still local)
+
+- Verified current upstream work and no overlapping open AV/fiscal PR. Continued
+  the existing branch without changing Claude's daily-packet/Hermes work.
+- Bounded production READ ONLY aggregates found 373 recent candidate SEC fact
+  rows across 21 tickers, reducing to 40 verified period pairs across 20 tickers
+  when matched to stored SEC filings. One legacy overlap leaves 39 potentially
+  requestable pairs; this is not fresh provider or full-universe qualification.
+- All 240 legacy AV transcript rows (160 tickers) lack new provenance fields;
+  all have filing_date=period_end, including three future-dated rows. No repairs.
+- Added five actual PostgreSQL 15.19 tests in a separate private Unix-socket
+  cluster. Together with 56 offline tests, 61 passed with provider calls blocked.
+- Documented eight independent AV client modules/scripts and requirements for
+  real account-wide budgeting. The current local ledger is not a global limiter.
+- No production writes, paid API calls, push, PR, merge, deployment, or scheduler
+  changes. Legacy date semantics, metadata breadth and shared budgets remain gates.
+
 ## 2026-11-07 - daily publication packet: in-repo producer replaces the per-day capture ceremony
 
 What was done:
@@ -318,6 +352,32 @@ Verification and limits:
 - Runtime acceptance (a naturally scheduled run, mirror delivery, the daily review's
   own stages) is recorded in the runbook's consumer checklist; the producer cannot
   supply those receipts. Gemini/provider input remains the daily review's own gate.
+
+
+## 2026-11-08 - AV date-aware consumers and draft reconciliation
+
+- Integrated current main into draft #1051. Kept its rendering-date helper and
+  both fresh/stale digest tests; no main push, PR merge or deployment.
+- Added forward source migration removing fabricated period-end earnings dates
+  from the compatibility view and disabling unverified calendar stub insertion.
+  Historical rows remain untouched; unknown dates stay NULL.
+- Wired provenance/availability-gated AV read-through transcript analyses without
+  writing the incompatible legacy analysis table. Historical as-of output is
+  explicitly recomputed from current evidence, not an immutable PIT snapshot.
+- 155 offline tests passed with outbound sockets blocked; six real PostgreSQL
+  contracts passed in a disposable private-socket cluster, then it was stopped.
+  Changed-file Ruff and diff checks passed. New-head remote CI remains separate.
+- No provider calls or production access. Historical reconciliation, metadata
+  breadth, immutable revision history and shared-account quotas remain gates.
+
+
+### AV draft CI follow-up
+
+- The raw-read guard exposed an obsolete allowance for analyzer docstring prose.
+  Verified both source heads: the actual EDGAR SQL already filters SUCCESS.
+  Removed only that allowlist entry; scanner/enforcement unchanged.
+- 157 focused offline tests including both repository-wide guard scans passed
+  with outbound sockets blocked. New full CI remains pending after draft push.
 
 ## 2026-11-08 — Daily review becomes machine-readable: `review.jsonl` ingest (Claude)
 
@@ -400,3 +460,19 @@ is retired — two writers of `review.jsonl` would race; the pull mirror is reti
 `sudo install` (unchanged rule). Not verified here: the first scheduled run on grid-svr, the
 LLM extraction path against a live provider (no narrative exists in any current packet to
 extract from), and the deploy-time unit sync on the real host.
+
+
+## 2026-11-09 - AV draft integration after publication-review landing
+
+- Integrated main cd55457 into existing draft #1051 and preserved both sides of
+  the append-only log conflict. No source consumer contract was changed.
+- Found sibling AV and publication-review migration heads. Added a no-op merge
+  revision preserving both parent histories and refusing unsafe downgrade.
+- 144 focused offline AV/analyzer/date/digest/raw-read and migration-graph tests
+  passed, with 2 subtests and outbound socket connections blocked. The new graph
+  test initially missed annotated metadata; corrected it before the passing run.
+- Changed-file Ruff and authored-diff checks passed. No actual PostgreSQL replay
+  or full repository suite was rerun locally; new-head hosted CI is still needed.
+- Shared-account budgeting, delayed-dispatch pacing, historical reconciliation,
+  metadata breadth and separate canary approval remain rollout gates. No provider
+  calls, production access, scheduler changes, merge to main or deployment.

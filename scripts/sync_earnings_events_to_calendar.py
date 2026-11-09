@@ -1,7 +1,8 @@
 """Task #186: mirror earnings_events → earnings_calendar.
 
-Tiny wrapper around the SQL function sync_earnings_events_to_calendar() so
-hermes_operator can schedule it.  Idempotent.  Logs (inserted, total).
+Compatibility wrapper. The date-contract migration makes the SQL function
+return zero inserts: fiscal period ends are not actual earnings event dates.
+Existing calendar rows are not repaired by this wrapper.
 """
 
 from __future__ import annotations
