@@ -67,3 +67,42 @@ live coverage or full-suite pass claimed. Independent review found a missingness
    after each completed3m checkpoint. Do not change frozen GEX evaluations.
 
 No new subscription or claim of complete live interval readiness is implied.
+
+## Follow-up: adapter and read API implemented locally
+
+`ingestion/realtime/native_minutes.py` now parses retained Schwab price-history
+responses only with explicit minute/1 request metadata and matching symbol. It
+preserves every closed candle's OHLCV, actual response receipt, payload hash and
+revision identity. Forming candles are counted/excluded. Adjustment basis is
+`provider_unspecified`, not assumed unadjusted. Historical downloads become
+available at retrieval time, never at their historical candle timestamps.
+
+The point-in-time selector chooses the latest eligible receipt for each event
+minute, refusing conflicting revisions at that latest time. Selection is
+permutation-invariant. A fixed-path, size-bounded read-only JSONL loader accepts
+`grid.native-minute.v1` rows with all MinuteBar provenance fields explicit.
+This is a consumer contract, not a new writer/timer. A schema label alone is not
+proof of source quality; the supplying producer and receipt chain still require
+verification. No existing private files were exported or read for these tests.
+
+`api/research_intervals.py` supplies an **unregistered** private admin router
+factory. Endpoint: GET `/api/v1/research/intervals` with symbol, source,
+session_key, interval, timezone-aware as_of and price_basis. The factory requires
+an explicitly configured retained-data loader and verified session lookup; both
+absent by default. No provider fallback, network call, credentials, writer,
+production app import or public projection. Responses include provenance,
+coverage and `live:false`; historical completeness is not live-feed health.
+The future production mount must retain existing GRID `require_role('admin')`.
+No `api.main` registration was added.
+
+44 focused tests pass, including synthetic retained-file→private-API coverage,
+401/403 guards, fail-closed unconfigured source, future/naive cutoffs,
+provenance failure, gaps, private caching, and sanitized errors. Test auth is
+injected; the existing GRID JWT implementation is not re-tested here. Tests use
+existing local FastAPI dependencies without installing/changing anything.
+Independent review found an input-order ambiguity bug in PIT selection; fixed
+with a permutation regression. Full backend/integration CI not run.
+
+Remaining: producer/source validation and actual coverage, durable retention,
+trusted exchange-calendar adapter, production API mounting and GEX consumer,
+weekly/monthly manifests, controller review and safe deployment after bootstrap.

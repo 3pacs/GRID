@@ -427,3 +427,13 @@ changed. 18 focused unit tests and Ruff passed. See
 `docs/RESEARCH-INTERVAL-READINESS-20261110.md` for source audit and remaining
 retention/API/calendar gates. Existing Yahoo sampled-close builder and frozen
 GEX study cannot substantiate new3m/0DTE probability claims.
+
+### 2026-11-10 follow-up - retained native-minute adapter and private API factory
+
+Added pure Schwab minute parser, bounded retained JSONL reader, deterministic
+PIT revision selection and unregistered admin read-router factory.44 focused
+tests pass plus Ruff; synthetic data only. The router defaults unconfigured,
+returns explicit coverage and never claims live-feed health. No production
+mount, writer, provider call, credentials or schedule changes. Reviewed PIT
+selection input-order defect corrected with permutation regression. See the
+interval readiness document for remaining producer/calendar/integration gates.
