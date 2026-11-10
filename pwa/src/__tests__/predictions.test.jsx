@@ -118,6 +118,13 @@ describe('Predictions evidence panel', () => {
         expect(screen.getByText(/relative advantage can still lose money/)).toBeInTheDocument();
         expect(screen.queryByText('EDGE')).not.toBeInTheDocument();
     });
+
+    it('does not invent a count for an older comparison payload', () => {
+        render(<EvidencePanel evidence={{
+            ...EVIDENCE, summary: { models_tested: 7, models_with_edge: 2 },
+        }} />);
+        expect(screen.getByTestId('evidence-headline')).toHaveTextContent('Relative comparison count unavailable.');
+    });
 });
 
 describe('Prediction operator lifecycle', () => {

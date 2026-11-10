@@ -45,6 +45,7 @@ MAX_PLAUSIBLE_PNL_PCT = 100.0
 VERDICT_RELATIVE_ADVANTAGE = "relative_advantage"
 VERDICT_NO_RELATIVE_ADVANTAGE = "no_relative_advantage"
 VERDICT_INSUFFICIENT = "insufficient_windows"
+EVIDENCE_CLASS = "exploratory_relative_comparison"
 
 _SPLIT_ADJUSTED = "oracle_rescore_split_adjusted_v1"
 
@@ -174,7 +175,7 @@ def build_evidence(
     official = [o for o in plausible if o.basis == "official"]
     corrected = [o for o in plausible if o.basis != "official"]
     return {
-        "evidence_class": "exploratory_relative_comparison",
+        "evidence_class": EVIDENCE_CLASS,
         "financial_edge_demonstrated": False,
         "method": {
             "outcome_basis": "split-adjusted rescore > hindsight rescore > official verdict",

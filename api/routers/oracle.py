@@ -253,16 +253,16 @@ def get_evidence(
     the route builds it here (a few seconds) and caches it for 6 h.
     """
     from api.precompute_serving import read_precomputed
+    from oracle.evidence import EVIDENCE_CLASS, build_evidence, load_outcomes
 
     stored, meta = read_precomputed("oracle.evidence")
-    if stored is not None:
-        stored["precompute"] = meta
-        return stored
+    # A pre-deployment snapshot can outlive its producing worker. Its old
+    # financial-edge verdicts must pass through the current builder first.
+    if stored is not None and stored.get("evidence_class") == EVIDENCE_CLASS:
+        return {**stored, "precompute": meta}
     cached = _evidence_cache.get("evidence")
     if cached is not None:
         return cached
-    from oracle.evidence import build_evidence, load_outcomes
-
     built = build_evidence(load_outcomes(get_db_engine()))
     _evidence_cache.set("evidence", built)
     return built

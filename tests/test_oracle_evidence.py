@@ -103,3 +103,27 @@ def test_job_and_route_are_wired() -> None:
     from api.routers import oracle as oracle_router
 
     assert "/api/v1/oracle/evidence" in {getattr(r, "path", "") for r in oracle_router.router.routes}
+
+
+def test_route_rebuilds_legacy_precompute_and_serves_current_snapshot(monkeypatch):
+    from unittest.mock import Mock
+
+    from api import precompute_serving
+    from api.routers import oracle as route
+    from utils.ttl_cache import TTLCache
+
+    legacy = {"summary": {"models_with_edge": 1}, "models": [{"verdict": "edge"}]}
+    current = build_evidence([])
+    meta = {"age_seconds": 0}
+    reader = Mock(side_effect=[(legacy, meta), (legacy, meta), (current, meta)])
+    load = Mock(return_value=[])
+    monkeypatch.setattr(precompute_serving, "read_precomputed", reader)
+    monkeypatch.setattr(ev, "load_outcomes", load)
+    monkeypatch.setattr(route, "get_db_engine", lambda: None)
+    monkeypatch.setattr(route, "_evidence_cache", TTLCache(ttl=60, max_size=1))
+
+    assert route.get_evidence() == current
+    assert route.get_evidence() == current
+    assert route.get_evidence() == {**current, "precompute": meta}
+    load.assert_called_once()
+    assert "precompute" not in current

@@ -565,8 +565,10 @@ export function EvidencePanel({ evidence }) {
     const sm = evidence.summary;
     const method = evidence.method || {};
     const models = evidence.models || [];
-    const relativeCount = sm.models_with_relative_advantage ?? 0;
-    const headline = `${relativeCount} of ${sm.models_tested} testable models show a relative advantage. Financial edge is not demonstrated.`;
+    const relativeCount = sm.models_with_relative_advantage;
+    const headline = Number.isInteger(relativeCount) && Number.isInteger(sm.models_tested)
+        ? `${relativeCount} of ${sm.models_tested} testable models show a relative advantage. Financial edge is not demonstrated.`
+        : 'Relative comparison count unavailable.';
     return (
         <div style={{ ...shared.card, padding: '14px 16px', marginBottom: '12px' }}>
             <div style={s.sectionTitle}>EXPLORATORY MODEL COMPARISON</div>
