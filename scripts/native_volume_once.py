@@ -13,6 +13,8 @@ from contextlib import contextmanager
 import fcntl
 import os
 import stat
+import signal
+import threading
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -23,6 +25,29 @@ from ingestion.realtime.minute_retention import sqlite_loader
 from ingestion.realtime.native_volume_worker import run_once, owner_lock, request_plan, _read_checkpoint
 from ingestion.realtime.native_volume_snapshot import build_snapshot, write_snapshot
 from ingestion.realtime.research_intervals import _utc
+
+
+class InvocationDeadline(BaseException):
+    """Not swallowed by provider handlers; uncertain work stays held."""
+
+
+@contextmanager
+def invocation_deadline(seconds=45):
+    """POSIX wall deadline over configuration, locks, refresh, GET and writes."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError('native acquisition requires main-thread deadline')
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        raise RuntimeError('existing timer; refuse nested invocation')
+    previous = signal.getsignal(signal.SIGALRM)
+    def expired(signum, frame):
+        raise InvocationDeadline()
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 @contextmanager
@@ -48,7 +73,7 @@ def default_client():
     # This import may load normal GRID configuration and credentials. It happens
     # only after worker lock, request planning, custody and disk checks passed.
     from ingestion.schwab_market import SchwabMarketClient
-    return SchwabMarketClient(max_retries=0, timeout=12)
+    return SchwabMarketClient(max_retries=0, timeout=12, token_lock_timeout=3, reauth_on_401=False)
 
 
 class LazyClient:
@@ -60,13 +85,15 @@ class LazyClient:
         policy = getattr(client, '_max_retries', None)
         if type(policy) is not int or policy != 0:
             raise ValueError('explicit zero retry policy required')
+        if getattr(client, '_reauth_on_401', None) is not False or getattr(client, '_token_lock_timeout', None) != 3:
+            raise ValueError('bounded no-reauth client required')
         return client.price_history(symbol, **params)
 
 
-def main(argv=None, *, calendar_factory=None, client_factory=default_client,
+def _main(argv=None, *, calendar_factory=None, client_factory=default_client,
          clock=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--fetch', action='store_true', help='explicitly allow one provider request')
+    parser.add_argument('--fetch', action='store_true', help='allow at most one history GET plus optional preflight OAuth refresh')
     parser.add_argument('--root', required=True, type=Path)
     parser.add_argument('--initialize', action='store_true')
     parser.add_argument('--calendar-manifest', type=Path)
@@ -116,6 +143,18 @@ def main(argv=None, *, calendar_factory=None, client_factory=default_client,
     except Exception:
         # No chained errors, provider payloads, secret paths or config values.
         print(json.dumps({'status':'blocked','reason':'preflight, acquisition or snapshot failed; inspect private checkpoint and receipts before manual recovery'}))
+        return 1
+
+
+def main(argv=None, **kwargs):
+    try:
+        with invocation_deadline():
+            return _main(argv, **kwargs)
+    except InvocationDeadline:
+        print(json.dumps({'status':'blocked','reason':'45-second invocation deadline; inspect checkpoint and receipts; no automatic retry'}))
+        return 1
+    except RuntimeError:
+        print(json.dumps({'status':'blocked','reason':'exclusive main-thread deadline unavailable'}))
         return 1
 
 

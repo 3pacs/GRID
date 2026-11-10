@@ -106,7 +106,7 @@ def request_plan(calendar, session_key, now, previous=None):
 
 def run_once(client, *, root, calendar, session_key, symbol='SPY', initialize_store=False,
              clock=None, disk_budget_bytes=128_000_000):
-    """One provider call maximum, explicit store initialization, no retries."""
+    """One client invocation maximum; caller enforces transport/deadline policy."""
     clock = clock or (lambda: datetime.now(timezone.utc))
     if not isinstance(symbol,str) or not re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,11}',symbol):
         raise ValueError('invalid symbol')

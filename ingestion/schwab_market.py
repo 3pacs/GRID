@@ -239,10 +239,19 @@ def _read_private(path: Path) -> str:
         return fh.read()
 
 
+def _validated_token_lock_timeout(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError("token_lock_timeout must be finite and positive or None")
+    return float(value)
+
+
 class _TokenFileLock:
     """Exclusive advisory lock on ``<token file>.lock`` (same directory, 0600)."""
 
-    def __init__(self, token_file: Path) -> None:
+    def __init__(self, token_file: Path, timeout: float | None = None) -> None:
+        self.timeout = _validated_token_lock_timeout(timeout)
         self.path = token_file.with_name(token_file.name + ".lock")
         self._fd: int | None = None
 
@@ -274,7 +283,25 @@ class _TokenFileLock:
                 )
             if stat.S_IMODE(st.st_mode) & 0o077:
                 os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if self.timeout is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + self.timeout
+                attempted = False
+                while True:
+                    if attempted and time.monotonic() >= deadline:
+                        raise SchwabTransientError("Schwab token lock timed out")
+                    attempted = True
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EINTR):
+                            raise
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise SchwabTransientError("Schwab token lock timed out") from None
+                        time.sleep(min(0.05, remaining))
         except BaseException:
             os.close(fd)
             raise
@@ -376,6 +403,10 @@ class SchwabMarketClient:
     Parameters are injectable for tests: ``session`` must offer
     ``get``/``post`` with the :mod:`requests` signature, ``sleep`` and
     ``now`` replace :func:`time.sleep` / :func:`time.time`.
+    ``token_lock_timeout`` optionally bounds lock contention using monotonic time
+    (None preserves the existing blocking default). ``reauth_on_401=False``
+    disables the separate 401 refresh/replay, even when max_retries is zero.
+    Normal pre-request expiry refresh remains enabled under the shared lock.
     """
 
     def __init__(
@@ -388,11 +419,17 @@ class SchwabMarketClient:
         session: Any | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        token_lock_timeout: float | None = None,
+        reauth_on_401: bool = True,
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         backoff_cap: float = DEFAULT_BACKOFF_CAP,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
     ) -> None:
+        self._token_lock_timeout = _validated_token_lock_timeout(token_lock_timeout)
+        if type(reauth_on_401) is not bool:
+            raise ValueError("reauth_on_401 must be bool")
+        self._reauth_on_401 = reauth_on_401
         self._app_key, self._app_secret = load_credentials(
             app_key, app_secret, credentials_file
         )
@@ -411,7 +448,7 @@ class SchwabMarketClient:
     # -- token file ---------------------------------------------------------
 
     def _lock(self) -> _TokenFileLock:
-        return _TokenFileLock(self._token_file)
+        return _TokenFileLock(self._token_file, timeout=self._token_lock_timeout)
 
     def _load_tokens(self) -> dict[str, Any]:
         try:
@@ -622,7 +659,7 @@ class SchwabMarketClient:
                     raise SchwabTransientError(
                         f"Schwab GET {path} returned a non-JSON body"
                     ) from None
-            if status == 401 and not reauthed:
+            if status == 401 and self._reauth_on_401 and not reauthed:
                 reauthed = True
                 stale = token
                 log.warning("Schwab GET {path} returned 401; refreshing access token once", path=path)

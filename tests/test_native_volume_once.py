@@ -59,3 +59,51 @@ def test_manifest_flags_composed(root,monkeypatch):
     monkeypatch.setattr(cli,'default_calendar',calendar)
     assert cli.main(['--fetch','--root',str(root),'--calendar-manifest','/reviewed/cal.json','--calendar-sha256','a'*64],client_factory=forbidden,clock=lambda:T+timedelta(days=1))==0
     assert seen==[('/reviewed/cal.json','a'*64)]
+
+def test_deadline_interrupts_wait_and_restores_handler():
+    import signal,time
+    before=signal.getsignal(signal.SIGALRM)
+    started=time.monotonic()
+    with pytest.raises(cli.InvocationDeadline):
+        with cli.invocation_deadline(.03):time.sleep(2)
+    assert time.monotonic()-started < .5
+    assert signal.getitimer(signal.ITIMER_REAL)==(0.,0.)
+    assert signal.getsignal(signal.SIGALRM)==before
+
+
+def test_deadline_cumulative_not_per_operation():
+    import time
+    with pytest.raises(cli.InvocationDeadline):
+        with cli.invocation_deadline(.04):
+            time.sleep(.025)
+            time.sleep(.025)
+
+
+def test_deadline_preserves_uncertain_checkpoint(root,monkeypatch):
+    import json,time
+    from contextlib import contextmanager
+    original=cli.invocation_deadline
+    @contextmanager
+    def short():
+        with original(.03):yield
+    monkeypatch.setattr(cli,'invocation_deadline',short)
+    class Hanging:
+        _max_retries=0
+        _reauth_on_401=False
+        _token_lock_timeout=3
+        def price_history(self,*a,**kw):time.sleep(2)
+    args=['--fetch','--initialize','--root',str(root)]
+    assert cli.main(args,calendar_factory=Calendar,client_factory=Hanging,clock=lambda:T)==1
+    assert json.loads((root/'checkpoint.json').read_text())['status']=='in_progress'
+    assert not (root/'native-volume.json').exists()
+    assert cli.main(args,calendar_factory=Calendar,client_factory=forbidden,clock=lambda:T)==1
+
+
+def test_nested_timer_refused():
+    import signal
+    signal.setitimer(signal.ITIMER_REAL,10)
+    try:
+        with pytest.raises(RuntimeError):
+            with cli.invocation_deadline():pass
+        assert signal.getitimer(signal.ITIMER_REAL)[0]>0
+    finally:signal.setitimer(signal.ITIMER_REAL,0)

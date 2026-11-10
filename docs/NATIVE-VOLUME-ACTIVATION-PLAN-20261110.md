@@ -7,7 +7,8 @@ Do not enable rollover gate, replace quote/chain feeds or unlock old volume sign
 
 ## One writer, bounded requests, no work in HTTP request handlers
 Choose one GRID-owned invocation, separate from gex-watch startup. Use existing
-SchwabMarketClient(max_retries=0), shared credential lock; do not copy credentials.
+SchwabMarketClient(max_retries=0,timeout=12,token_lock_timeout=3,reauth_on_401=False),
+shared credential lock; do not copy credentials.
 Explicit date ranges; no ambiguous default period10, which excludes current day.
 Initial bootstrap fetch from oldest expected prior session open through current
 clock (at most31calendar days, bounded parser100k bars/12MB receipt). Retain actual
@@ -15,7 +16,13 @@ arrival timestamps; never call these historical point-in-time observations.
 After bootstrap, fetch only a small overlap of recent minutes (proposed3minutes)
 at a proposed60-second cadence, at least5seconds after closed boundary. Never
 refetch the entire10day history every minute. One dedicated writer/lease; existing
-request timeout and no retries; expose errors without fallback to Yahoo.
+12-second socket timeout,3-second token-lock wait and45-second whole CLI wall
+deadline. At most one history GET, no401 replay or transient retry. Before that
+GET, normal expiry refresh may make one OAuth POST and atomically update the
+shared token under its original lock. This is not a one-network-call contract.
+The wall deadline encompasses client construction, lock/refresh, GET, retention
+and snapshot; expiry preserves uncertain custody and requires reconciliation.
+Expose errors without fallback to Yahoo.
 Revisions append immutably; overlapping requests are not duplicate trades and
 must be selected as-of by latest receipt, never summed. Record receipt hashes,
 row counts, last successful event/receipt and refusal reason. Set disk budget and
@@ -95,3 +102,29 @@ candidate code separately from the running release, provision private store/root
 run one explicit bootstrap with normal GRID environment, inspect actual coverage
 and private snapshot, then authorize cadence and private GEX consumer activation.
 No timer/service/environment/file installation on production has been performed.
+
+## Bounded transport and explicit recovery correction
+The opt-in worker now refuses401 without auth replay; existing unrelated clients
+retain their original defaults. Token contention is bounded at3seconds and the
+CLI has a45-second POSIX main-thread wall deadline. No provider exception can
+swallow that deadline. A timeout during an OAuth refresh can leave its remote
+outcome uncertain even though token-file replacement remains atomic; inspect
+existing token state through the established owner before retry, never re-login
+or reset a checkpoint automatically.
+
+`python -m scripts.native_volume_reconcile --root ROOT --receipt-sha256 SHA
+--calendar-manifest MANIFEST --calendar-sha256 DIGEST` is a local-only operator
+reconciliation. It accepts only an existing immutable captured receipt matching
+the exact checkpoint request, preserves the old checkpoint, replays idempotently,
+and verifies every expected prior/current minute before completing the checkpoint.
+`--republish-only` regenerates a snapshot from a completed checkpoint without any
+provider call. An old receipt produces stale/degraded output, not fresh data.
+No matching receipt or incomplete coverage remains blocked. This is not an
+automatic reset or authorization for another fetch. More-than3minute catch-up
+still requires an explicit bounded recovery acquisition plan.
+
+Before unattended activation, wire the existing operations alert route to nonzero
+exit, checkpoint not complete, missing/stale snapshot (>180seconds), and disk
+budget refusal. Notification configuration and a recovery drill are required;
+they have not been installed by this offline change. Do not call this unattended
+ready merely because the normal cadence succeeds.
