@@ -4,7 +4,6 @@ from datetime import date, datetime, timedelta, timezone
 import json
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -88,7 +87,7 @@ def test_real_generation_uses_decision_clock_and_persists_audit(monkeypatch, bas
                      for name in ("synthetic", "second_synthetic")]
     monkeypatch.setattr(oe, "_USE_SIGNAL_REGISTRY", False)
     monkeypatch.setattr(oracle, "_get_flow_context", lambda ticker: {})
-    monkeypatch.setattr(oracle, "_get_spot_price", lambda ticker: 100)
+    monkeypatch.setattr(oracle, "_get_entry_price_reference", lambda ticker: {"price": 100, "status": "measured"})
     monkeypatch.setattr(oracle, "_get_credit_cycle_routing", lambda: {})
     monkeypatch.setattr(oracle, "_get_journal_feedback", lambda ticker: {})
     monkeypatch.setattr(oracle, "_get_convergence_for_ticker", lambda ticker: [])
@@ -117,13 +116,11 @@ def test_real_generation_uses_decision_clock_and_persists_audit(monkeypatch, bas
     payload = pred.to_dict()
     json.dumps(payload, allow_nan=False)
     assert len(payload["flow_context"]["actor_evidence"]["observations"]) == 5
-    if base_count == 3:
-        assert payload["signals"][-1]["provenance"]["row_id"] == 4
-    else:
-        assert all(not sig["provenance"] for sig in payload["signals"])
-        assert payload["flow_context"]["actor_evidence"]["direct_vote_row_ids"] == [4]
-        html = json.dumps(_prediction_section(payload, NOW.date()))
-        assert "exact event age is unknown" in html
+    assert len(payload["signals"]) == base_count + 1
+    assert payload["signals"][-1]["provenance"]["row_id"] == 4
+    assert payload["flow_context"]["actor_evidence"]["direct_vote_row_ids"] == [4]
+    html = json.dumps(_prediction_section(payload, NOW.date()))
+    assert "exact event age is unknown" in html
 
 
 def test_credibility_weight_changes_record_used_lineage_per_model():
@@ -199,48 +196,3 @@ def test_report_discloses_sample_count_and_validates_count_html():
     receipt["observation_count"] = "<script>alert(1)</script>"
     html = json.dumps(_prediction_section(payload, NOW.date()))
     assert "<script>" not in html and "12/unknown" in html
-
-
-def test_storage_keeps_used_receipt_atomic_on_insert_and_update_after_display_cap(monkeypatch):
-    from oracle import prediction_context as context
-    for name in ("fetch_liquidity_regime", "fetch_fci_regime", "fetch_vix_level"):
-        monkeypatch.setattr(context, name, lambda *args: None)
-    engine = MagicMock()
-    conn = engine.begin.return_value.__enter__.return_value
-    stored = {}
-    statements = []
-    def execute(statement, params=None):
-        sql = str(statement)
-        assert "INSERT INTO oracle_predictions" in sql
-        statements.append(sql)
-        inserted = not stored
-        if inserted:
-            stored["fc"] = params["fc"]
-        # Model the exact existing SQL update: signals replaced, flow untouched.
-        stored["sig"] = params["sig"]
-        result = MagicMock()
-        result.fetchone.return_value = (inserted,)
-        return result
-    conn.execute.side_effect = execute
-    oracle = oe.OracleEngine.__new__(oe.OracleEngine)
-    oracle.engine = engine
-    for row_id in (1, 2):
-        signals = [oe.Signal(f"base{i}", "equity", 0, 0, "neutral", 1, 1) for i in range(11)]
-        audit = oe._inject_actor_evidence(signals, bridge.select_actor_evidence([candidate(row_id)], as_of=NOW))
-        pred = oe.OraclePrediction(
-            id=f"synthetic{row_id}", timestamp=NOW, ticker="TEST",
-            prediction_type=oe.PredictionType.DIRECTION, direction="CALL",
-            target_price=101, current_price=100, expiry=date(2026, 1, 27),
-            confidence=.5, expected_move_pct=1, signals=signals[:10],
-            flow_context={"actor_evidence": audit}, model_name="synthetic", model_version="test")
-        oracle._store_predictions([pred])
-        payload = json.loads(stored["sig"])
-        assert len(payload["items"]) == 10
-        assert all(s["family"] != "actor_intelligence" for s in payload["items"])
-        receipt = payload["actor_evidence"]
-        assert receipt["direct_vote_row_ids"] == [row_id]
-        assert receipt["used_groups"][0]["supporting_rows"][0]["row_id"] == row_id
-        assert "actor_evidence" not in json.loads(stored["fc"])
-        html = json.dumps(_prediction_section({"ticker": "TEST", "signals": payload}, NOW.date()))
-        assert "1 direct votes" in html and "exact event age is unknown" in html
-    assert all("signals    = EXCLUDED.signals" in sql for sql in statements)

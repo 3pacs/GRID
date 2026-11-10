@@ -179,7 +179,7 @@ class OraclePrediction:
     prediction_type: PredictionType
     direction: str                 # "CALL" / "PUT" / "LONG" / "SHORT"
     target_price: float | None     # Strike or target
-    current_price: float
+    current_price: float | None
     expiry: date                   # When to score this
     confidence: float              # 0-1
     expected_move_pct: float       # Expected % move
@@ -211,6 +211,7 @@ class OraclePrediction:
     # the 90 d calibration bucket could never fill (LEVER-PACKAGE.md §5.1).
     # None on legacy rows; derived from expiry when not explicitly requested.
     horizon_days: int | None = None
+    recording_policy: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -770,7 +771,8 @@ class OracleEngine:
                     scored_at TIMESTAMPTZ,
                     score_notes TEXT,
                     dedup_keep BOOLEAN NOT NULL DEFAULT TRUE,
-                    null_write_policy TEXT
+                    null_write_policy TEXT,
+                    recording_policy TEXT
                 )
             """))
             # ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on the table even
@@ -821,6 +823,7 @@ class OracleEngine:
                     description TEXT,
                     signal_families JSONB,
                     weight DOUBLE PRECISION DEFAULT 1.0,
+                    active BOOLEAN DEFAULT TRUE,
                     predictions_made INTEGER DEFAULT 0,
                     hits INTEGER DEFAULT 0,
                     misses INTEGER DEFAULT 0,
@@ -830,6 +833,15 @@ class OracleEngine:
                     last_updated TIMESTAMPTZ
                 )
             """))
+            model_columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'oracle_models'
+                """))
+            }
+            if "active" not in model_columns:
+                # Unknown historical admission remains NULL and cannot publish.
+                conn.execute(text("ALTER TABLE oracle_models ADD COLUMN active BOOLEAN"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oracle_iterations (
                     id SERIAL PRIMARY KEY,
@@ -852,18 +864,13 @@ class OracleEngine:
                 CREATE INDEX IF NOT EXISTS idx_oracle_pred_ticker
                 ON oracle_predictions (ticker, created_at DESC)
             """))
-            conn.execute(text("""
-                CREATE UNIQUE INDEX IF NOT EXISTS oracle_predictions_dedup_unique
-                ON oracle_predictions (
-                    ticker,
-                    direction,
-                    expiry,
-                    prediction_type,
-                    (COALESCE(model_version, '')),
-                    ((created_at AT TIME ZONE 'UTC')::date)
-                )
-                WHERE dedup_keep = TRUE
-            """))
+            if "recording_policy" not in existing_columns:
+                conn.execute(text("""
+                    ALTER TABLE oracle_predictions
+                    ADD COLUMN IF NOT EXISTS recording_policy TEXT
+                """))
+            from oracle.dedup_index import ensure_dedup_index_on_connection
+            ensure_dedup_index_on_connection(conn)
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS oracle_predictions_dedup_keep_created
                 ON oracle_predictions (created_at DESC)
@@ -886,31 +893,26 @@ class OracleEngine:
             """))
 
     def _load_models(self) -> list[OracleModel]:
-        """Load models from DB or seed defaults."""
-        models = []
+        """Load the explicitly active roster; empty/unknown registries abstain.
+
+        Model creation is an explicit ModelFactory operation. Reading an empty
+        registry must not create models or undo a prior retirement decision.
+        """
         with self.engine.connect() as conn:
-            rows = conn.execute(text("SELECT * FROM oracle_models")).fetchall()
-            if rows:
-                for r in rows:
-                    models.append(OracleModel(
-                        name=r[0], version=r[1] or "1.0", description=r[2] or "",
-                        signal_families=r[3] or [], weight=r[4] or 1.0,
-                        predictions_made=r[5] or 0, hits=r[6] or 0,
-                        misses=r[7] or 0, partials=r[8] or 0,
-                        cumulative_pnl=r[9] or 0.0, sharpe=r[10] or 0.0,
-                        last_updated=r[11],
-                    ))
-            else:
-                # Seed defaults
-                models = list(DEFAULT_MODELS)
-                with self.engine.begin() as wconn:
-                    for m in models:
-                        wconn.execute(text(
-                            "INSERT INTO oracle_models (name, version, description, signal_families, weight) "
-                            "VALUES (:n, :v, :d, :sf, :w) ON CONFLICT DO NOTHING"
-                        ), {"n": m.name, "v": m.version, "d": m.description,
-                            "sf": json.dumps(m.signal_families), "w": m.weight})
-        return models
+            rows = conn.execute(text("""
+                SELECT name, version, description, signal_families, weight,
+                       predictions_made, hits, misses, partials, cumulative_pnl,
+                       sharpe, last_updated
+                FROM oracle_models WHERE active IS TRUE ORDER BY name
+            """)).fetchall()
+        return [OracleModel(
+            name=r[0], version=r[1] or "1.0", description=r[2] or "",
+            signal_families=r[3] or [], weight=r[4] if r[4] is not None else 1.0,
+            predictions_made=r[5] or 0, hits=r[6] or 0,
+            misses=r[7] or 0, partials=r[8] or 0,
+            cumulative_pnl=r[9] or 0.0, sharpe=r[10] or 0.0,
+            last_updated=r[11],
+        ) for r in rows]
 
     # ── Signal Assembly ─────────────────────────────────────────────────
 
@@ -1462,8 +1464,11 @@ class OracleEngine:
         flow_ctx = self._get_flow_context(ticker)
         log.info("Oracle {ticker}: flow context ready", ticker=ticker)
 
-        # Get current price
-        spot = self._get_spot_price(ticker)
+        # Freeze the exact observed reference receipt; undated daily spots
+        # and previous closes cannot silently become today's entry.
+        reference = self._get_entry_price_reference(ticker)
+        spot = reference.get("price") if reference.get("status") == "measured" else None
+        flow_ctx = {**(flow_ctx or {}), "entry_price_basis": reference}
         if not spot:
             log.warning(
                 "Oracle: no spot price for {t} - storing no_data placeholder per model",
@@ -1481,14 +1486,15 @@ class OracleEngine:
                     prediction_type=PredictionType.DIRECTION,
                     direction="NONE",
                     target_price=None,
-                    current_price=0.0,
+                    current_price=None,
                     expiry=placeholder_expiry,
                     confidence=0.0,
                     expected_move_pct=0.0,
                     model_name=model.name,
                     model_version=model.version,
                     verdict=Verdict.NO_DATA,
-                    score_notes="No spot price available at prediction time",
+                    score_notes=reference.get("reason") or "No qualified entry reference at decision time",
+                    flow_context=flow_ctx,
                     horizon_days=self._horizon_days_for(now, placeholder_expiry, horizon_days),
                 )
                 ticker_predictions.append(placeholder)
@@ -1523,6 +1529,13 @@ class OracleEngine:
                         fc = self._get_timesfm_forecast(ticker)
                         if not fc:
                             continue  # No forecast available for this ticker
+                        if horizon_days is not None and int(fc["horizon"]) != int(horizon_days):
+                            # A seven-day forecast is not a next-session
+                            # forecast. Never relabel its endpoint/target to
+                            # make it fit the requested measurement cohort.
+                            log.info("TimesFM {t}: cached horizon {h} does not match requested {r}",
+                                     t=ticker, h=fc["horizon"], r=horizon_days)
+                            continue
 
                         # Build a lightweight forecast result object
                         class _ForecastResult:
@@ -1575,6 +1588,7 @@ class OracleEngine:
                                 model_weights={
                                     m.name: m.weight for m in self.models
                                 },
+                                flow_context={**pred.flow_context, **flow_ctx},
                             )
                             ticker_predictions.append(pred)
                     except Exception as exc:
@@ -1780,7 +1794,7 @@ class OracleEngine:
                     confidence = min(0.95, raw_capped)
 
                 # Expected move (conservative estimate)
-                expected_move = signal_strength * 0.5  # 0.5% per unit of signal strength
+                expected_move = min(30.0, signal_strength * 0.5)
 
                 # Target price
                 if direction == "CALL":
@@ -1814,8 +1828,10 @@ class OracleEngine:
                     expiry=expiry,
                     confidence=round(confidence, 4),
                     expected_move_pct=round(expected_move, 2),
-                    signals=signals[:10],  # Top 10 signals
-                    anti_signals=anti_signals[:5],  # Top 5 anti-signals
+                    # Preserve all inputs used by the decision. The UI may
+                    # summarize them, but the immutable record must not.
+                    signals=signals,
+                    anti_signals=anti_signals,
                     signal_strength=round(signal_strength, 3),
                     coherence=round(coherence, 3),
                     model_name=model.name,
@@ -1842,127 +1858,151 @@ class OracleEngine:
         return ticker_predictions
 
     def generate_predictions(
-        self, tickers: list[str] | None = None, horizon_days: int | None = None
+        self, tickers: list[str] | None = None, horizon_days: int | None = None,
+        *, should_continue: Any = None,
     ) -> list[OraclePrediction]:
-        """Generate predictions for all tickers using all models.
+        """Generate and freeze at most two tickers per committed decision batch.
 
-        Each model produces a prediction for each ticker. Predictions
-        with low confidence are still logged — they're how we learn.
-
-        ``horizon_days`` (2026-09-10): when given, every prediction expires
-        ``horizon_days`` calendar days out instead of at the next monthly
-        options expiry, and the value is stored in ``oracle_predictions.
-        horizon_days``. ``None`` keeps the legacy behaviour.
+        Every batch finishes its inputs and guard before its UTC decision
+        timestamp. Earlier quotes never wait for an entire universe to finish.
+        An optional cooperative deadline fences both dispatch and publication;
+        a timed-out worker cannot publish after returning from slow inputs.
         """
-        if tickers is None:
-            tickers = self._get_active_tickers()
-
-        all_predictions = []
-        signal_cache: dict[tuple[str, tuple[str, ...]], list[Signal]] = {}
-        now = datetime.now(timezone.utc)
-
-        total_tickers = len(tickers)
-        # ── Parallel ticker fanout ──────────────────────────────
-        # Was sequential — 41 tickers × 30-50s each = ~25 min/cycle,
-        # blew past ORACLE_CYCLE_TIMEOUT_SECONDS=300s. Now we run up
-        # to GRID_ORACLE_PARALLELISM (default 4) tickers in parallel,
-        # matching the GPU server's --parallel slot count. Each
-        # worker is a full ticker pipeline (flow ctx + spot + N
-        # model predicts). signal_cache keys include ticker so
-        # cross-ticker writes never collide; CPython GIL makes the
-        # dict insert thread-safe. Set GRID_ORACLE_PARALLELISM=1
-        # to fall back to single-threaded behaviour.
         import concurrent.futures
         import os as _os
-        _max_workers = max(1, int(_os.getenv("GRID_ORACLE_PARALLELISM", "4")))
-        log.info(
-            "Oracle: dispatching {n} tickers across {w} workers",
-            n=total_tickers, w=_max_workers,
-        )
 
-        def _run_one(args):
-            idx, ticker = args
-            try:
-                return self._oracle_one_ticker(
-                    idx, ticker, total_tickers, now, signal_cache,
-                    horizon_days=horizon_days,
-                )
-            except Exception as exc:
-                log.warning("Oracle ticker {t} failed: {e}", t=ticker, e=str(exc))
-                return []
+        totals = {key: 0 for key in (
+            "upsert_statements", "inserted", "updated", "predictions", "duplicates",
+            "rejected", "abstentions", "qualified", "failed_tickers", "completed_batches",
+        )}
+        self._last_store_counts = dict(totals)
+        self._last_guard_verdicts = []
 
-        if _max_workers <= 1:
-            for idx_t in enumerate(tickers, start=1):
-                all_predictions.extend(_run_one(idx_t))
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as ex:
-                for preds in ex.map(_run_one, enumerate(tickers, start=1)):
-                    all_predictions.extend(preds)
+        def check_budget():
+            if should_continue is not None and not should_continue():
+                self._last_store_counts = dict(totals)
+                raise TimeoutError("Oracle generation stopped before further publication")
 
-        # Sort by confidence
-        all_predictions.sort(key=lambda p: -p.confidence)
-
-        # ── Hallucination Guard ─────────────────────────────────────
-        # Run all predictions through the Feynman-inspired verification
-        # layer BEFORE storage. Adjusts confidence downward for
-        # hallucination signatures (stale signals, contradictions,
-        # incoherent directions, uncalibrated models, mono-source, etc.)
+        check_budget()
+        # Empty/unknown admission never resurrects a default roster.
+        self.models = self._load_models()
+        if not self.models:
+            return []
+        if tickers is None:
+            tickers = self._get_active_tickers()
+        tickers = list(tickers)
+        batch_size = min(2, max(1, int(_os.getenv("GRID_ORACLE_BATCH_SIZE", "2"))))
+        workers = min(batch_size, max(1, int(_os.getenv("GRID_ORACLE_PARALLELISM", "4"))))
+        total_tickers = len(tickers)
+        all_predictions: list[OraclePrediction] = []
+        model_stats = {m.name: {"hits": m.hits, "misses": m.misses, "partials": m.partials}
+                       for m in self.models}
+        calibration_report = None
         try:
-            from oracle.hallucination_guard import verify_predictions
+            from oracle.calibration import compute_calibration
+            calibration_report = compute_calibration(self.engine)
+        except Exception:
+            pass
 
-            model_stats = {
-                m.name: {
-                    "hits": m.hits,
-                    "misses": m.misses,
-                    "partials": m.partials,
-                }
-                for m in self.models
-            }
+        for offset in range(0, total_tickers, batch_size):
+            check_budget()
+            batch = tickers[offset:offset + batch_size]
+            batch_started = datetime.now(timezone.utc)
+            signal_cache: dict[tuple[str, tuple[str, ...]], list[Signal]] = {}
 
-            # Optionally pull calibration report
-            cal_report = None
+            def run_one(args):
+                idx, ticker = args
+                try:
+                    if should_continue is not None and not should_continue():
+                        raise TimeoutError("Oracle ticker dispatch deadline elapsed")
+                    return self._oracle_one_ticker(
+                        idx, ticker, total_tickers, batch_started, signal_cache,
+                        horizon_days=horizon_days,
+                    ), False
+                except Exception as exc:
+                    log.warning("Oracle ticker {t} failed: {e}", t=ticker, e=str(exc))
+                    return [], True
+
+            items = list(enumerate(batch, start=offset + 1))
+            if workers == 1 or len(items) == 1:
+                results = [run_one(item) for item in items]
+            else:
+                # Submit only this batch; no whole-universe queue can outlive
+                # its admission clock or delay an already complete decision.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+                    results = list(ex.map(run_one, items))
+            candidates = []
+            for predictions, failed in results:
+                candidates.extend(predictions)
+                totals["failed_tickers"] += int(failed)
+            candidates.sort(key=lambda p: -(p.confidence or 0.0))
+            check_budget()
             try:
-                from oracle.calibration import compute_calibration
-                cal_report = compute_calibration(self)
+                from oracle.hallucination_guard import verify_predictions
+                candidates, verdicts = verify_predictions(
+                    candidates, calibration_report=calibration_report, model_stats=model_stats,
+                )
+                self._last_guard_verdicts.extend(verdicts)
+            except Exception as exc:
+                self._last_store_counts = dict(totals)
+                raise RuntimeError("Oracle verification guard unavailable; batch not published") from exc
+            check_budget()
+            # The last input and guard precede this instant. Storage performs
+            # the final source-age/session validation against this exact clock.
+            decision_at = datetime.now(timezone.utc)
+            candidates = [replace(p, timestamp=decision_at) for p in candidates]
+            check_budget()
+            try:
+                if should_continue is None:
+                    committed = self._store_predictions(candidates)
+                else:
+                    committed = self._store_predictions(candidates, should_continue=should_continue)
             except Exception:
-                pass  # Calibration data may not exist yet
+                self._last_store_counts = dict(totals)
+                raise
+            for key in totals:
+                if key not in {"failed_tickers", "completed_batches"}:
+                    totals[key] += int(self._last_store_counts.get(key, 0))
+            totals["completed_batches"] += 1
+            self._last_store_counts = dict(totals)
+            # Abstentions are durable records, never advertised predictions.
+            all_predictions.extend(p for p in committed if p.verdict == Verdict.PENDING)
 
-            all_predictions, self._last_guard_verdicts = verify_predictions(
-                all_predictions,
-                calibration_report=cal_report,
-                model_stats=model_stats,
-            )
-
-            # Re-sort after confidence adjustments
-            all_predictions.sort(key=lambda p: -p.confidence)
-        except Exception as exc:
-            log.debug("Hallucination guard skipped: {e}", e=str(exc))
-            self._last_guard_verdicts = []
-
-        # Log all predictions
-        self._store_predictions(all_predictions)
-
-        log.info(
-            "Oracle generated {n} predictions across {t} tickers × {m} models",
-            n=len(all_predictions), t=len(tickers), m=len(self.models),
-        )
-
+        all_predictions.sort(key=lambda p: -(p.confidence or 0.0))
+        log.info("Oracle generated {n} qualified predictions in {b} bounded batches; {f} tickers failed",
+                 n=len(all_predictions), b=totals["completed_batches"], f=totals["failed_tickers"])
         return all_predictions
 
     # ── Scoring Loop ────────────────────────────────────────────────────
 
-    def score_expired_predictions(self) -> dict[str, Any]:
+    def score_expired_predictions(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Score all predictions that have reached their expiry date.
 
         This is the feedback loop. Every scored prediction adjusts model weights.
         """
-        today = date.today()
+        from scripts.score_oracle_trades import (
+            _as_date,
+            _score_note,
+            classify_outcome,
+            load_expiry_closes,
+            load_split_book,
+            resolve_expiry_close,
+            split_adjusted_close,
+        )
+
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("scoring clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+        today = now.date()
         scored = 0
         results = {
             "hits": 0,
             "misses": 0,
             "partials": 0,
             "total": 0,
+            "pending_price": 0,
+            "no_data": 0,
             # Rows closed as 'no_data' because their entry price was NULL
             # AND the row is stamped as written under the honest-NULL policy
             # (null_write_policy == NULL_WRITE_POLICY). Reported, never
@@ -1990,15 +2030,25 @@ class OracleEngine:
                        created_at
                 FROM oracle_predictions
                 WHERE verdict = 'pending' AND expiry <= :today
-                ORDER BY expiry
+                ORDER BY expiry, id
             """), {"today": today}).fetchall()
 
             # no_data rows are already final - exclude from scoring loop
             rows = [r for r in rows if r[2] != "NONE"]
-            # Recorded splits (YF:{T}:split_factor) for the tickers being
-            # scored: an expiry price after a split is put on the entry's
-            # share basis before the verdict (W2-10, split_adjusted_v1).
-            split_book = self._load_split_book(sorted({r[1] for r in rows}))
+            # The scheduled engine and manual scorer share the same settled,
+            # raw-close policy. Load once per batch, preserving source/vintage
+            # for split rebasing; never fall back to an intraday options spot
+            # or an adjusted/stale close. Failed reads abort rather than grade
+            # on an unknown share basis.
+            priceable = [r for r in rows if r[2] in ("CALL", "PUT")
+                         and entry_price_score_note(r[4]) is None]
+            price_book, split_book = {}, {}
+            if priceable:
+                tickers = sorted({r[1] for r in priceable})
+                start = min(_as_date(r[5]) for r in priceable) - timedelta(days=7)
+                end = max(_as_date(r[5]) for r in priceable)
+                price_book = load_expiry_closes(conn, tickers, start, end, as_of_ts=now)
+                split_book = load_split_book(conn, tickers, as_of_ts=now)
             for r in rows:
                 (pred_id, ticker, direction, target, entry, expiry, conf, expected,
                  model, policy, created_at) = r
@@ -2026,14 +2076,17 @@ class OracleEngine:
                 entry_note = entry_price_score_note(entry)
                 if entry_note is not None:
                     if entry is None and policy == NULL_WRITE_POLICY:
-                        conn.execute(text("""
+                        closed = conn.execute(text("""
                             UPDATE oracle_predictions
                             SET verdict = 'no_data',
                                 score_notes = :notes,
                                 scored_at = NOW()
-                            WHERE id = :id
-                        """), {"notes": entry_note, "id": pred_id})
-                        results["unscorable_entry_price"] += 1
+                            WHERE id = :id AND verdict = 'pending'
+                            RETURNING id
+                        """), {"notes": entry_note, "id": pred_id}).fetchone()
+                        if closed is not None:
+                            results["unscorable_entry_price"] += 1
+                            results["no_data"] += 1
                     elif entry is None:
                         log.warning(
                             "score_expired_predictions: pending row {id} has "
@@ -2054,52 +2107,50 @@ class OracleEngine:
                         results["held_legacy_entry_price"] += 1
                     continue
 
-                # Get actual price at expiry
-                actual = self._get_price_at_date(ticker, expiry)
-                if actual is None:
+                if direction not in ("CALL", "PUT"):
                     continue
-                raw_actual = actual
-                actual = self._split_adjust_exit(split_book, ticker, actual, expiry, created_at)
-                split_note = (
-                    f" [raw ${raw_actual:.2f} x{actual / raw_actual:g} split, split_adjusted_v1]"
-                    if raw_actual > 0 and abs(actual / raw_actual - 1.0) > 1e-9 else ""
+                res = resolve_expiry_close(
+                    price_book, ticker, expiry, created_at=created_at, now=now,
                 )
-
-                actual_move = (actual - entry) / entry * 100
-
-                # Score
-                if direction == "CALL":
-                    hit = actual > entry
-                    pnl = actual_move
-                elif direction == "PUT":
-                    hit = actual < entry
-                    pnl = -actual_move
-                else:
+                if res.status == "pending":
+                    results["pending_price"] += 1
+                    continue
+                if res.status != "priced":
+                    closed = conn.execute(text("""
+                        UPDATE oracle_predictions
+                        SET verdict = 'no_data', score_notes = :notes, scored_at = NOW()
+                        WHERE id = :id AND verdict = 'pending'
+                        RETURNING id
+                    """), {"notes": res.note, "id": pred_id}).fetchone()
+                    if closed is not None:
+                        results["no_data"] += 1
                     continue
 
-                # Verdict
-                if hit and abs(actual_move) >= abs(expected) * 0.5:
-                    verdict = "hit"
-                    results["hits"] += 1
-                elif hit:
-                    verdict = "partial"
-                    results["partials"] += 1
-                else:
-                    verdict = "miss"
-                    results["misses"] += 1
+                actual, factor = split_adjusted_close(
+                    split_book, ticker, res.price, res.session_date,
+                    created_at=created_at, source=res.source,
+                    pull_timestamp=res.pull_timestamp,
+                )
+                verdict, actual_move, pnl = classify_outcome(direction, entry, actual, expected)
 
-                # Update prediction
-                conn.execute(text("""
+                # Only the scorer that wins the pending transition may count
+                # this verdict or emit a lesson. A concurrent scorer can have
+                # selected the same row before this transaction commits.
+                updated = conn.execute(text("""
                     UPDATE oracle_predictions
                     SET verdict = :v, actual_price = :ap, actual_move_pct = :am,
                         pnl_pct = :pnl, scored_at = NOW(),
                         score_notes = :notes
-                    WHERE id = :id
+                    WHERE id = :id AND verdict = 'pending'
+                    RETURNING id
                 """), {
                     "v": verdict, "ap": actual, "am": round(actual_move, 2),
                     "pnl": round(pnl, 2), "id": pred_id,
-                    "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%){split_note}",
-                })
+                    "notes": _score_note(entry, res, actual_move, factor),
+                }).fetchone()
+                if updated is None:
+                    continue
+                results[{"hit": "hits", "partial": "partials", "miss": "misses"}[verdict]] += 1
                 verdict_lessons.append({
                     "prediction_id": pred_id, "ticker": ticker, "direction": direction,
                     "verdict": verdict, "model": model, "created_at": created_at,
@@ -2193,7 +2244,9 @@ class OracleEngine:
         work in different regimes).
         """
         if event_driven:
-            return self._reconcile_event_driven_weights()
+            result = self._reconcile_event_driven_weights()
+            self.models = self._load_models()
+            return result
 
         MIN_WEIGHT = 0.1
         MAX_WEIGHT = 3.0
@@ -2380,6 +2433,9 @@ class OracleEngine:
         except Exception as exc:
             log.debug("Trace evolver failed: {e}", e=str(exc))
 
+        # Both evolvers can retire or add models. Do not keep the startup roster.
+        self.models = self._load_models()
+
         # 3. Generate new predictions
         predictions = self.generate_predictions(tickers, horizon_days=horizon_days)
 
@@ -2404,7 +2460,11 @@ class OracleEngine:
             "evolution": evolve_result,
             "trace_evolution": trace_evolve_result,
             "new_predictions": len(predictions),
-            "distinct_positions_written": _counts.get("inserted"),
+            "distinct_positions_written": _counts.get("qualified", _counts.get("inserted")),
+            "new_abstentions": _counts.get("abstentions", 0),
+            "new_record_rows": _counts.get("inserted"),
+            "unchanged_forecasts": _counts.get("duplicates", 0),
+            "rejected_models": _counts.get("rejected", 0),
             "positions_updated": _counts.get("updated"),
             "upsert_statements": _counts.get("upsert_statements"),
             "top_predictions": [p.to_dict() for p in predictions[:10]],
@@ -2414,7 +2474,7 @@ class OracleEngine:
 
         log.info(
             "═══ Oracle Cycle Complete: {n} model votes → {d} new positions ═══",
-            n=len(predictions), d=_counts.get("inserted", "?"),
+            n=len(predictions), d=_counts.get("qualified", _counts.get("inserted", "?")),
         )
         return result
 
@@ -2426,41 +2486,23 @@ class OracleEngine:
             rows = conn.execute(text(ORACLE_ACTIVE_TICKERS_SQL)).fetchall()
         return [r[0] for r in rows]
 
+    def _get_entry_price_reference(self, ticker: str) -> dict[str, Any]:
+        """Freeze a source-dated observed reference, or a stated abstention."""
+        from oracle.entry_price_policy import load_quote_reference
+
+        as_of = datetime.now(timezone.utc)
+        try:
+            with self.engine.connect() as conn:
+                return load_quote_reference(conn, ticker, as_of=as_of)
+        except Exception:
+            log.warning("Oracle reference unavailable for {t}", t=ticker)
+            return {"status": "unavailable", "ticker": ticker, "price": None,
+                    "reason": "timestamped reference lookup failed"}
+
     def _get_spot_price(self, ticker: str) -> float | None:
-        """Get latest spot price for a ticker.
-
-        Raw basis only. The value returned here becomes ``entry_price`` on
-        new ``OraclePrediction`` rows, which must stay on the same raw basis
-        as ``options_daily_signals.spot_price`` (this method's primary
-        source) and as the actual/exit price ``scripts/score_oracle_trades.py``
-        scores it against (raw ``YF:{ticker}:close`` via
-        ``load_expiry_closes()``, oracle_expiry_close_v2). The fallback below used to prefer ``adj_close`` over
-        ``close`` -- silently mixing an adjusted entry price against a raw
-        exit price, the same dividend/split-driven spurious-return bug
-        PR #503 fixed for intelligence/trust_scorer.py and
-        trading/options_tracker.py. No adjusted fallback: if a raw close
-        isn't available, return ``None`` so the caller
-        (``generate_predictions_for_ticker``) stores its existing
-        ``NO_DATA`` placeholder instead of a wrong-basis price.
-        """
-        with self.engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT spot_price FROM options_daily_signals
-                WHERE ticker = :t AND spot_price > 0
-                ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker}).fetchone()
-            if row:
-                return float(row[0])
-
-            # Fallback to yfinance raw close. Raw only -- see docstring.
-            row = conn.execute(text("""
-                SELECT value FROM raw_series
-                WHERE series_id = :sid AND pull_status = 'SUCCESS'
-                ORDER BY obs_date DESC LIMIT 1
-            """), {"sid": f"YF:{ticker}:close"}).fetchone()
-            if row:
-                return float(row[0])
-            return None
+        """Compatibility price-only view of the qualified reference receipt."""
+        receipt = self._get_entry_price_reference(ticker)
+        return receipt.get("price") if receipt.get("status") == "measured" else None
 
     def _load_split_book(self, tickers: list[str]) -> dict[str, list[Any]]:
         """Recorded splits per ticker; ``{}`` (no adjustment) if the read fails.
@@ -2518,51 +2560,22 @@ class OracleEngine:
         return price_in_basis(price, exit_day, basis_date=created, splits=events)
 
     def _get_price_at_date(self, ticker: str, target_date: date) -> float | None:
-        """Get price at or near a specific date for scoring.
+        """Return the settled raw expiry close, with no stale/adjusted fallback.
 
-        For ``target_date >= today`` we use an EQUALITY match instead of
-        ``<=`` — the market hasn't closed on the expiry day yet, so falling
-        back to an earlier close would lock in the wrong actual_price and
-        flip the verdict to a final state that the post-close scorer would
-        then skip (verdict != 'pending'). When the same-day close hasn't
-        been ingested, return None and leave the prediction pending.
-        (2026-05-15: caught after 2.27M Friday-expiry predictions got scored
-        Thursday night against Thursday's close.)
+        The scoring loop uses the batch resolver directly so it retains the
+        source, vintage, creation boundary and split basis. This compatibility
+        helper uses the same price-admission policy for price-only callers.
         """
-        same_day_only = target_date >= date.today()
-        date_filter = "signal_date = :d" if same_day_only else "signal_date <= :d"
-        raw_date_filter = "obs_date = :d" if same_day_only else "obs_date <= :d"
+        from scripts.score_oracle_trades import load_expiry_closes, resolve_expiry_close
+
+        now = datetime.now(timezone.utc)
         with self.engine.connect() as conn:
-            row = conn.execute(text(f"""
-                SELECT spot_price FROM options_daily_signals
-                WHERE ticker = :t AND {date_filter} AND spot_price > 0
-                ORDER BY signal_date DESC LIMIT 1
-            """), {"t": ticker, "d": target_date}).fetchone()
-            if row:
-                return float(row[0])
-            # Fallback: try direct ticker, then USD suffix (for crypto)
-            for sid in [f"YF:{ticker}:adj_close", f"YF:{ticker}:close",
-                       f"YF:{ticker}-USD:adj_close", f"YF:{ticker}-USD:close"]:
-                row = conn.execute(text(f"""
-                    SELECT value FROM raw_series
-                    WHERE series_id = :sid AND {raw_date_filter} AND pull_status = 'SUCCESS'
-                    ORDER BY obs_date DESC LIMIT 1
-                """), {"sid": sid, "d": target_date}).fetchone()
-                if row:
-                    return float(row[0])
-            # Last resort: resolved_series
-            row = conn.execute(text(f"""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON fr.id = rs.feature_id
-                WHERE (fr.name = :n1 OR fr.name = :n2)
-                AND {raw_date_filter} AND rs.value IS NOT NULL
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {
-                "n1": f"{ticker.lower()}_full",
-                "n2": f"{ticker.lower()}_usd_full",
-                "d": target_date,
-            }).fetchone()
-            return float(row[0]) if row else None
+            book = load_expiry_closes(
+                conn, [ticker], target_date - timedelta(days=7), target_date,
+                as_of_ts=now,
+            )
+        result = resolve_expiry_close(book, ticker, target_date, created_at=None, now=now)
+        return result.price if result.status == "priced" else None
 
     def _next_monthly_expiry(self) -> date:
         """Get the next monthly options expiry (3rd Friday)."""
@@ -2586,146 +2599,127 @@ class OracleEngine:
 
         return third_friday
 
-    def _store_predictions(self, predictions: list[OraclePrediction]) -> None:
-        """Store predictions to the journal.
+    def _store_predictions(
+        self, predictions: list[OraclePrediction], *, should_continue: Any = None,
+    ) -> list[OraclePrediction]:
+        """Commit only admitted models' first daily forecast; return new rows.
 
-        Every row's ``signals`` JSONB payload is enriched with the 4 context
-        keys required by the 11-layer conviction stack: ``regime``,
-        ``fci_regime``, ``vix_level``, and ``signal_contributions``. Enrichment
-        never raises — missing upstream features fall back to safe defaults
-        (see ``oracle.prediction_context``).
+        All forecast inputs/evidence are immutable on retry, including after
+        scoring. Context is frozen from generation; storage performs no fresh
+        feature lookups after the decision timestamp. A duplicate or rejected
+        candidate is never advertised as a newly committed prediction.
+
+        A supplied deadline is checked inside the transaction and immediately
+        before commit. Expiry rolls back the whole batch; local database wait
+        limits bound individual statements. This cooperative guard cannot
+        cancel an already-issued COMMIT/WAL wait.
         """
-        # 2026-05-09 PERF/CORRECTNESS FIX: previously called
-        # build_prediction_context(self.engine, ...) per prediction inside an
-        # open transaction. With ~5743 predictions per cycle that issued
-        # ~17K DB round-trips on side connections while the outer
-        # `engine.begin()` connection sat idle holding a transaction —
-        # exhausted the pool, never logged, and the cycle was killed by
-        # systemctl before any rows committed (last successful write
-        # 2026-05-08 04:33). The regime / fci / vix lookups are constant
-        # per cycle (same as_of_date for every prediction) so hoist them
-        # out and only do per-row signal_contributions work (pure Python).
+        from oracle.dedup_index import FORWARD_RECORDING_POLICY, forecast_identity
+        from oracle.entry_price_policy import validate_quote_reference
         from oracle.prediction_context import (
-            DEFAULT_FCI_REGIME,
-            DEFAULT_REGIME,
-            SIGNAL_CONTRIBUTIONS_BASIS,
-            aggregate_signal_weights,
-            canonical_regime,
-            enrich_signals_payload,
-            extract_signal_contributions,
-            fetch_fci_regime,
-            fetch_liquidity_regime,
-            fetch_vix_level,
+            SIGNAL_CONTRIBUTIONS_BASIS, aggregate_signal_weights,
+            enrich_signals_payload, extract_signal_contributions,
         )
 
-        # Determine cycle as_of date once (predictions in the same cycle
-        # share a timestamp date).
-        cycle_as_of: date = date.today()
-        if predictions:
-            ts0 = predictions[0].timestamp
-            if isinstance(ts0, datetime):
-                cycle_as_of = ts0.date()
+        self._last_store_counts = {key: 0 for key in (
+            "upsert_statements", "inserted", "updated", "duplicates", "rejected",
+            "abstentions", "qualified", "predictions",
+        )}
 
-        # Cache regime / fci / vix for the whole batch.
-        try:
-            cached_regime = canonical_regime(
-                fetch_liquidity_regime(self.engine, cycle_as_of)
-            )
-        except Exception as exc:
-            log.warning("regime lookup failed, defaulting to NEUTRAL: {e}", e=str(exc))
-            cached_regime = DEFAULT_REGIME
-        try:
-            cached_fci = canonical_regime(
-                fetch_fci_regime(self.engine, cycle_as_of)
-            )
-        except Exception as exc:
-            log.warning("fci lookup failed, defaulting to NEUTRAL: {e}", e=str(exc))
-            cached_fci = DEFAULT_FCI_REGIME
-        try:
-            cached_vix = fetch_vix_level(self.engine, cycle_as_of)
-        except Exception as exc:
-            log.warning("vix lookup failed, defaulting to None: {e}", e=str(exc))
-            cached_vix = None
+        def check_publication_budget():
+            if should_continue is not None and not should_continue():
+                raise TimeoutError("Oracle publication deadline elapsed; batch rolled back")
 
-        log.info(
-            "_store_predictions: writing {n} predictions (regime={r}, fci={f}, vix={v})",
-            n=len(predictions), r=cached_regime, f=cached_fci, v=cached_vix,
-        )
-
-        written = 0
-        inserted = 0   # rows that did not exist (xmax = 0 on RETURNING)
-        updated = 0    # rows that collided with a kept row and were upserted
+        check_publication_budget()
+        for prediction in predictions:
+            ts = prediction.timestamp
+            if not isinstance(ts, datetime) or ts.tzinfo is None or ts.utcoffset() is None:
+                raise ValueError("prediction decision timestamp must be timezone-aware")
+        accepted: list[OraclePrediction] = []
+        duplicates = rejected = abstentions = 0
         with self.engine.begin() as conn:
+            check_publication_budget()
+            if should_continue is not None:
+                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                conn.execute(text("SET LOCAL statement_timeout = '10s'"))
+            from oracle.model_factory import ModelFactory
+            admitted = ModelFactory.active_model_names(
+                conn, [p.model_name for p in predictions], lock=True,
+            )
+            check_publication_budget()
             for p in predictions:
-                # Per-signal shares: duplicate names are summed and the dict
-                # sums to 1.0 (the per_signal_brier contract). The earlier
-                # ``{s.name: s.weight}`` comprehension kept only the last of
-                # e.g. ten ``sector_network`` items. New rows only; stored
-                # rows are never rewritten.
-                try:
-                    model_votes = aggregate_signal_weights(p.signals)
-                except Exception:
-                    model_votes = {}
-
-                try:
-                    contributions = extract_signal_contributions(
-                        model_weights=p.model_weights,
-                        model_votes=model_votes,
-                    )
-                except Exception:
-                    contributions = {}
-
+                if p.model_name not in admitted:
+                    rejected += 1
+                    continue
+                receipt = p.flow_context.get("entry_price_basis")
+                receipt_error = validate_quote_reference(receipt, as_of=p.timestamp, ticker=p.ticker)
+                if receipt_error is None and p.current_price != receipt.get("price"):
+                    receipt_error = "entry_price_does_not_match_frozen_receipt"
+                if p.verdict == Verdict.NO_DATA or receipt_error is not None:
+                    abstention_context = dict(p.flow_context)
+                    if p.direction != "NONE":
+                        abstention_context["candidate_direction"] = p.direction
+                    p = replace(p, direction="NONE", verdict=Verdict.NO_DATA,
+                                current_price=None, target_price=None, confidence=None,
+                                flow_context=abstention_context,
+                                score_notes=p.score_notes or str(receipt_error or "entry_unavailable"))
+                model_votes = aggregate_signal_weights(p.signals)
+                contributions = extract_signal_contributions(
+                    model_weights=p.model_weights, model_votes=model_votes,
+                )
                 context = {
-                    "regime": cached_regime,
-                    "fci_regime": cached_fci,
-                    "vix_level": cached_vix,
-                    "signal_contributions": contributions,
+                    key: p.flow_context.get(key)
+                    for key in ("regime", "fci_regime", "vix_level")
                 }
+                context["signal_contributions"] = contributions
+                context["context_basis"] = "frozen_at_decision; missing values unobserved"
                 if model_votes and contributions == model_votes:
                     context["signal_contributions_basis"] = SIGNAL_CONTRIBUTIONS_BASIS
-
-                raw_signals = [asdict(s) for s in p.signals]
-                # The existing upsert replaces signals but not flow_context.
-                # Keep used actor refs and their receipt in this same JSON value
-                # so an update cannot strand them against an earlier evaluation.
+                # Freeze the actor receipt with the signals it describes.
                 if "actor_evidence" in p.flow_context:
                     context["actor_evidence"] = p.flow_context["actor_evidence"]
-                enriched_signals = enrich_signals_payload(raw_signals, context)
-
-                # 2026-04-29: dedup on natural key (ticker, direction, expiry,
-                # prediction_type, model_version, DATE(created_at)). The partial
-                # unique index `oracle_predictions_dedup_unique` only enforces
-                # this on rows with dedup_keep=TRUE, so historical duplicates
-                # (dedup_keep=FALSE) stay in the table for audit. New inserts
-                # that collide with an existing keep=TRUE row update the
-                # confidence (highest wins) instead of writing a fresh duplicate.
-                _res = conn.execute(text("""
+                context["forecast_contract"] = {
+                    "recording_policy": FORWARD_RECORDING_POLICY,
+                    "confidence_event": "strict_hit",
+                    "strict_hit": "correct direction and move >= 0.5 * abs(stated_expected_move_pct)",
+                    "partial": "correct direction below strict_hit threshold",
+                    "miss": "otherwise",
+                    "probability_status": "unvalidated",
+                    "target_price_role": "descriptive",
+                    "entry_basis": "raw_unadjusted",
+                    "evidence_class": ("unavailable" if p.verdict == Verdict.NO_DATA
+                                       else "prospective_observed_reference"),
+                    "executable": False,
+                    "exit_basis": "settled_raw_close_split_rebased_to_entry",
+                }
+                enriched_signals = enrich_signals_payload([asdict(s) for s in p.signals], context)
+                prediction_id = forecast_identity(
+                    ticker=p.ticker, direction=p.direction, expiry=p.expiry,
+                    prediction_type=p.prediction_type.value, model_name=p.model_name,
+                    model_version=p.model_version, timestamp=p.timestamp,
+                )
+                check_publication_budget()
+                row = conn.execute(text("""
                     INSERT INTO oracle_predictions
-                    (id, ticker, prediction_type, direction, target_price, entry_price,
+                    (id, created_at, ticker, prediction_type, direction, target_price, entry_price,
                      expiry, confidence, expected_move_pct, signal_strength, coherence,
                      model_name, model_version, signals, anti_signals, flow_context, model_weights,
-                     horizon_days, null_write_policy)
-                    VALUES (:id, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
-                            :mn, :mv, :sig, :anti, :fc, :mw, :hd, :nwp)
+                     horizon_days, null_write_policy, recording_policy, verdict, score_notes)
+                    VALUES (:id, :created_at, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
+                            :mn, :mv, :sig, :anti, :fc, :mw, :hd, :nwp, :rp, :verdict, :score_notes)
                     ON CONFLICT (
-                        ticker, direction, expiry, prediction_type,
+                        ticker, direction, expiry, prediction_type, model_name,
                         (COALESCE(model_version, '')),
-                        ((created_at AT TIME ZONE 'UTC')::date)
+                        ((created_at AT TIME ZONE 'UTC')::date),
+                        (COALESCE(recording_policy, 'legacy'))
                     ) WHERE dedup_keep = TRUE
-                    DO UPDATE SET
-                        confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
-                        signals    = EXCLUDED.signals,
-                        signal_strength = EXCLUDED.signal_strength,
-                        coherence  = EXCLUDED.coherence,
-                        model_weights = EXCLUDED.model_weights
-                    RETURNING (xmax = 0) AS inserted
+                    DO NOTHING RETURNING id
                 """), {
-                    "id": p.id, "t": p.ticker, "pt": p.prediction_type.value,
-                    "d": p.direction,
+                    "id": prediction_id, "created_at": p.timestamp.astimezone(timezone.utc),
+                    "t": p.ticker, "pt": p.prediction_type.value, "d": p.direction,
                     "tp": float(p.target_price) if p.target_price is not None else None,
                     "ep": float(p.current_price) if p.current_price is not None else None,
-                    "exp": p.expiry,
-                    "conf": float(p.confidence),
+                    "exp": p.expiry, "conf": float(p.confidence) if p.confidence is not None else None,
                     "em": float(p.expected_move_pct) if p.expected_move_pct is not None else None,
                     "ss": float(p.signal_strength) if p.signal_strength is not None else None,
                     "coh": float(p.coherence) if p.coherence is not None else None,
@@ -2735,31 +2729,25 @@ class OracleEngine:
                     "fc": json.dumps({k: v for k, v in p.flow_context.items() if k != "actor_evidence"}, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
                     "hd": int(p.horizon_days) if p.horizon_days is not None else None,
-                    "nwp": NULL_WRITE_POLICY,
-                })
-                written += 1
-                try:
-                    _row = _res.fetchone() if hasattr(_res, "fetchone") else None
-                    if _row is not None and bool(_row[0]):
-                        inserted += 1
-                    elif _row is not None:
-                        updated += 1
-                except Exception:  # noqa: BLE001 — counting is best-effort
-                    pass
-
-        # Model votes vs positions: N models x M tickers collapse onto one row
-        # per (ticker, direction, expiry, type, day). Report both so a cycle
-        # that upserts 4,340 statements onto 14 rows is described as 14.
+                    "nwp": NULL_WRITE_POLICY, "rp": FORWARD_RECORDING_POLICY,
+                    "verdict": p.verdict.value, "score_notes": p.score_notes,
+                }).fetchone()
+                if row is None:
+                    duplicates += 1
+                else:
+                    accepted.append(replace(p, id=row[0], recording_policy=FORWARD_RECORDING_POLICY))
+                    abstentions += int(p.verdict == Verdict.NO_DATA)
+            check_publication_budget()
         self._last_store_counts = {
-            "upsert_statements": written,
-            "inserted": inserted,
-            "updated": updated,
+            "upsert_statements": len(predictions) - rejected,
+            "inserted": len(accepted), "updated": 0,
+            "duplicates": duplicates, "rejected": rejected, "abstentions": abstentions,
+            "qualified": len(accepted) - abstentions,
             "predictions": len(predictions),
         }
-        log.info(
-            "_store_predictions: {w}/{n} upserts → {i} new positions, {u} updated",
-            w=written, n=len(predictions), i=inserted, u=updated,
-        )
+        log.info("_store_predictions: {i} new, {d} unchanged, {r} rejected",
+                 i=len(accepted), d=duplicates, r=rejected)
+        return accepted
 
     def _get_leaderboard(self) -> list[dict]:
         """Get model performance leaderboard."""
@@ -2914,6 +2902,20 @@ class EnsemblePredictor:
                 )
             except Exception as exc:
                 log.debug("Ensemble: {m} failed: {e}", m=model.name, e=str(exc))
+
+        # Signal collection can outlive a model retirement. The response admits
+        # votes against the registry at this final read, never a stale roster.
+        from oracle.model_factory import ModelFactory
+
+        with self.engine.connect() as conn:
+            admitted = ModelFactory.active_model_names(
+                conn, [vote["model_name"] for vote in votes],
+            )
+        votes = [vote for vote in votes if vote["model_name"] in admitted]
+        regime_router_weights = {
+            name: weight for name, weight in regime_router_weights.items()
+            if name in admitted
+        }
 
         if not votes:
             return EnsemblePrediction(

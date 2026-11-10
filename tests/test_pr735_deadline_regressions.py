@@ -4,7 +4,7 @@ import ast
 import inspect
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -165,64 +165,87 @@ def test_options_success_does_not_repeat_unbounded_scheduler_catalog_write(monke
     sched._update_last_pull.assert_not_called()
 
 
-def _actual_oracle_dispatch(monkeypatch, elapsed, *, last=None, retry=True, dry_run=False):
-    """Execute the real run_cycle oracle block with every external action mocked."""
-    tree = ast.parse(inspect.getsource(ho.run_cycle))
-    oracle_block = next(
-        node for node in tree.body[0].body
-        if isinstance(node, ast.Try)
-        and any(isinstance(n, ast.Constant) and n.value == "Running Oracle prediction cycle..."
-                for n in ast.walk(node))
-    )
+_SESSION_NOW = datetime(2026, 11, 10, 15, tzinfo=timezone.utc)
+
+
+def _actual_oracle_dispatch(monkeypatch, seconds_left, *, last=None, retry=True, dry_run=False):
+    """Run the production run_cycle call site and hourly admission, with no external work."""
+    cycle = ast.parse(inspect.getsource(ho.run_cycle))
+    calls = [node for node in ast.walk(cycle) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == "_run_oracle_forward_step"]
+    assert len(calls) == 1
+
+    class SessionClock(datetime):
+        @classmethod
+        def now(cls, tz):
+            return _SESSION_NOW.astimezone(tz)
+
+    monkeypatch.setattr(ho, "datetime", SessionClock)
+    monkeypatch.setattr(ho, "time", types.SimpleNamespace(monotonic=lambda: 1000.0))
+    engine = MagicMock()
     state = types.SimpleNamespace(last_oracle_cycle=last, current_step="previous", cooldowns=MagicMock())
     state.cooldowns.can_retry.return_value = retry
-    engine = MagicMock()
-    oracle_engine = types.ModuleType("oracle.engine")
-    oracle_engine.OracleEngine = MagicMock()
-    oracle_report = types.ModuleType("oracle.report")
-    oracle_report.send_oracle_report = MagicMock()
-    monkeypatch.setitem(sys.modules, "oracle.engine", oracle_engine)
-    monkeypatch.setitem(sys.modules, "oracle.report", oracle_report)
-    dispatch = MagicMock(return_value=({"new_predictions": 1, "scoring": {}}, True))
-    monkeypatch.setattr(ho.time, "monotonic", lambda: 1000 + elapsed)
+    report_module = types.ModuleType("oracle.report")
+    report_module.send_oracle_report = MagicMock()
+    monkeypatch.setitem(sys.modules, "oracle.report", report_module)
+    worker = MagicMock(return_value={"status": "completed", "new_predictions": 1})
+    monkeypatch.setattr(ho, "_run_oracle_forward_pass", worker)
+    dispatch = MagicMock(side_effect=lambda name, work, timeout, state: (work(), True))
+    monkeypatch.setattr(ho, "_run_with_timeout", dispatch)
+    result = {}
     namespace = dict(vars(ho), state=state, engine=engine, dry_run=dry_run,
-                     cycle_start=1000, cycle_deadline=1000 + ho.CYCLE_TIMEOUT_SECONDS,
-                     cycle_result={}, _run_with_timeout=dispatch)
-    exec(compile(ast.Module(body=[oracle_block], type_ignores=[]), "actual_oracle_dispatch", "exec"), namespace)
-    return state, namespace["cycle_result"], dispatch, oracle_engine.OracleEngine
+                     cycle_deadline=1000.0 + seconds_left, cycle_result=result)
+    eval(compile(ast.Expression(calls[0]), "actual_oracle_dispatch", "eval"), namespace)
+    return state, result["oracle"], dispatch, worker
 
 
-@pytest.mark.parametrize("elapsed", [201, 900, 1260, 4499, 4501])
-def test_actual_oracle_never_starts_without_full_budget_and_cleanup(monkeypatch, elapsed):
-    state, result, dispatch, constructor = _actual_oracle_dispatch(monkeypatch, elapsed)
+@pytest.mark.parametrize("seconds_left", [-1, 0, 1, 300, 599])
+def test_actual_oracle_never_starts_without_full_budget_and_cleanup(monkeypatch, seconds_left):
+    state, result, dispatch, worker = _actual_oracle_dispatch(monkeypatch, seconds_left)
     dispatch.assert_not_called()
-    constructor.assert_not_called()
+    worker.assert_not_called()
     assert state.last_oracle_cycle is None
     assert state.current_step == "previous"
     state.cooldowns.record_attempt.assert_not_called()
-    assert result["oracle"]["deferred"] == "insufficient_cycle_budget"
+    assert result == {"status": "deferred", "reason": "insufficient_cycle_budget",
+                      "budget_left_s": seconds_left, "required_s": 600}
 
 
-@pytest.mark.parametrize("elapsed", [0, 100, 200])
-def test_actual_oracle_runs_with_original_contract_when_budget_fits(monkeypatch, elapsed):
-    state, result, dispatch, _constructor = _actual_oracle_dispatch(monkeypatch, elapsed)
-    assert dispatch.call_args.args[2] == 4000
+@pytest.mark.parametrize("seconds_left", [600, 601, 4500])
+def test_actual_oracle_runs_when_forward_budget_and_cleanup_fit(monkeypatch, seconds_left):
+    state, result, dispatch, worker = _actual_oracle_dispatch(
+        monkeypatch, seconds_left, last=_SESSION_NOW - timedelta(hours=1),
+    )
     assert ho.CYCLE_TIMEOUT_SECONDS == 4500
-    assert state.last_oracle_cycle is not None
-    assert result["oracle"]["predictions"] == 1
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[0] == "oracle_cycle"
+    assert dispatch.call_args.args[2:] == (300, state)
+    worker.assert_called_once()
+    assert state.last_oracle_cycle == _SESSION_NOW
+    state.cooldowns.record_attempt.assert_called_once_with("oracle_cycle", success=True)
+    assert result == {"status": "completed", "new_predictions": 1}
 
 
-def test_oracle_due_and_blacklist_rules_survive_budget_gate(monkeypatch):
-    recent = datetime.now(timezone.utc)
-    for last, retry in [(recent, True), (None, False)]:
-        state, result, dispatch, _constructor = _actual_oracle_dispatch(monkeypatch, 0, last=last, retry=retry)
-        dispatch.assert_not_called()
-        assert state.last_oracle_cycle == last
-        assert "oracle" not in result
-
-
-def test_dry_run_late_oracle_does_not_advance_marker(monkeypatch):
-    state, result, dispatch, _constructor = _actual_oracle_dispatch(monkeypatch, 1260, dry_run=True)
+@pytest.mark.parametrize(("last", "retry", "reason"), [
+    (_SESSION_NOW - timedelta(seconds=3599), True, "hourly_cadence"),
+    (None, False, "timeout_or_failure_cooldown"),
+])
+def test_oracle_due_and_blacklist_rules_survive_budget_gate(monkeypatch, last, retry, reason):
+    state, result, dispatch, worker = _actual_oracle_dispatch(monkeypatch, 4500, last=last, retry=retry)
     dispatch.assert_not_called()
+    worker.assert_not_called()
+    state.cooldowns.record_attempt.assert_not_called()
+    assert state.current_step == "previous"
+    assert state.last_oracle_cycle == last
+    assert result == {"status": "deferred", "reason": reason}
+
+
+@pytest.mark.parametrize(("seconds_left", "reason"), [(599, "insufficient_cycle_budget"), (600, "dry_run")])
+def test_dry_run_does_not_advance_marker(monkeypatch, seconds_left, reason):
+    state, result, dispatch, worker = _actual_oracle_dispatch(monkeypatch, seconds_left, dry_run=True)
+    dispatch.assert_not_called()
+    worker.assert_not_called()
+    state.cooldowns.record_attempt.assert_not_called()
+    assert state.current_step == "previous"
     assert state.last_oracle_cycle is None
-    assert result["oracle"]["deferred"] == "insufficient_cycle_budget"
+    assert result["reason"] == reason

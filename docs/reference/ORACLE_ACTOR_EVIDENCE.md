@@ -75,26 +75,19 @@ support references (each inherits its group's observation DATE and canonical
 direction, and carries its own row/source ID, ingestion time and raw direction),
 exact counts/dispositions for the candidate window, sampled
 withheld/superseded detail, direct-vote identities and source-weight changes.
-The writer persists this receipt under `signals.actor_evidence` in the enriched
-signals JSON, not in stored `flow_context`. The existing upsert replaces that
-entire signals JSON atomically. Each Signal's `used_group_row_id` therefore
-resolves within the same stored value, and the used groups survive Oracle's
-ten-signal display cap. There is no duplicate actor receipt in persisted flow
-context. Reports accept both in-memory and persisted forms and label date-only
-age and ingestion separately and disclose incomplete actor coverage.
+The writer freezes the receipt under `signals.actor_evidence` alongside the full
+signal list, including signals beyond the report's display limit. A retry with
+the same forecast identity preserves the first accepted signals and receipt.
+Reports read both generated forecasts and stored receipts, label the observation
+date and ingestion time separately, and disclose incomplete actor coverage.
 
 ## Limits
 
 - `signal_data` and the actors table are mutable and have no historical-vintage
   replay contract. Filtering `created_at` is necessary but not sufficient for
   historical replay; current actor attributes are explicitly labelled as such.
-- Existing prediction upserts can mix fields from separate evaluations. This
-  patch keeps new actor receipts atomic with their signals, but does not fix
-  the mixed confidence/target policy or reconstruct historical predictions.
-- Other Oracle inputs, including options snapshots and convergence injection,
-  retain their existing freshness behavior. This is not an all-source freshness
-  repair, model recalibration, provider coverage guarantee or financial-edge
-  validation.
+- The prospective writer preserves the original model, price, confidence and
+  evidence. Historical records can still contain fields from multiple evaluations.
 - Unknown aliases, duplicate people across channels and semantically correlated
   sources need a separate entity/provenance model. The name/channel rule makes
   no stronger independence claim.
@@ -108,3 +101,5 @@ distinct actors, missing/future/old dates, availability bounds, overflow,
 serialized lineage, date-only reporting and actual Oracle score/coherence
 changes. The source SELECT also runs against a synthetic in-memory SQL table;
 PostgreSQL-specific actor lookup is mocked. Live production data is not needed.
+
+The required PostgreSQL suite in `test_forecaster_identity_pg.py` submits two actor receipts for one forecast identity and checks the original receipt and full signal list after the retry.

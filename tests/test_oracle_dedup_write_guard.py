@@ -1,18 +1,8 @@
-"""Write-path guard tests for oracle_predictions natural-key dedup.
+"""Oracle writers share the complete v2 identity and immutable DO NOTHING.
 
-Companion to ``tests/test_oracle_dedup_consumers.py`` (which pins the consumer
-read path and the writers' ON CONFLICT clause at the *source* level). This file
-exercises the *runtime* behaviour of the two non-engine writers
-(``oracle/publish.py`` and ``intelligence/obsidian_agent.py``) and proves:
-
-1. Each writer is idempotent on the natural key: the emitted INSERT carries
-   ``ON CONFLICT (... COALESCE(model_version,'') ... created_at AT TIME ZONE
-   'UTC' ...) WHERE dedup_keep = TRUE DO UPDATE SET ...``.
-2. Pre-migration safety: before that insert runs, the writer ensures the
-   partial unique index ``oracle_predictions_dedup_unique`` exists (so the
-   ON CONFLICT can't raise 42P10 on a not-yet-migrated DB).
-3. ``ensure_dedup_index`` runs at most once per process and never raises into
-   the caller's hot path even if the DDL fails.
+The runtime guard checks each target database, refuses legacy/invalid arbiters,
+and surfaces DDL errors. Real migration/retry/race proofs are in the PostgreSQL
+identity tests; these fast checks cover all three writer SQL contracts.
 """
 
 from __future__ import annotations
@@ -45,7 +35,10 @@ class _RecordingConn:
 
     def execute(self, clause: Any, params: dict[str, Any] | None = None) -> "_Result":
         self._sink.append(str(clause))
-        return _Result()
+        result = _Result()
+        if "INSERT INTO oracle_predictions" in str(clause):
+            result.fetchone = lambda: (params["id"],)
+        return result
 
 
 class _Result:
@@ -78,7 +71,9 @@ _ON_CONFLICT_NEEDLES = (
     "(COALESCE(model_version, ''))",
     "created_at AT TIME ZONE 'UTC'",
     "WHERE dedup_keep = TRUE",
-    "DO UPDATE SET",
+    "DO NOTHING",
+    "model_name",
+    "recording_policy",
 )
 
 _INDEX_NEEDLES = (
@@ -192,27 +187,21 @@ def test_obsidian_cycle_ensures_index_then_upserts_on_natural_key(monkeypatch):
 # oracle/dedup_index.py helper semantics
 # ---------------------------------------------------------------------------
 
-def test_ensure_dedup_index_runs_once_per_process():
+def test_ensure_dedup_index_rechecks_each_database():
     from oracle.dedup_index import ensure_dedup_index
-
-    engine = _RecordingEngine()
-    ensure_dedup_index(engine)  # type: ignore[arg-type]
-    ensure_dedup_index(engine)  # type: ignore[arg-type]
-
-    ddls = [s for s in engine.executed if "oracle_predictions_dedup_unique" in s]
-    assert len(ddls) == 1, "index ensure should fire exactly once per process"
+    engines = [_RecordingEngine(), _RecordingEngine()]
+    for engine in engines:
+        ensure_dedup_index(engine)
+        assert any("CREATE UNIQUE INDEX" in sql for sql in engine.executed)
 
 
-def test_ensure_dedup_index_swallows_ddl_failure():
+def test_ensure_dedup_index_propagates_ddl_failure():
     from oracle.dedup_index import ensure_dedup_index
-
     class _BoomEngine:
         def begin(self):
             raise RuntimeError("ddl lock timeout")
-
-    # Must not raise — pre-migration safety is best-effort, the writer's own
-    # insert surfaces the real error if the index truly can't be created.
-    ensure_dedup_index(_BoomEngine())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="ddl lock timeout"):
+        ensure_dedup_index(_BoomEngine())
 
 
 def test_helper_index_ddl_matches_engine_and_publish_predicate():
@@ -224,7 +213,7 @@ def test_helper_index_ddl_matches_engine_and_publish_predicate():
     root = Path(__file__).resolve().parents[1]
     engine_src = (root / "oracle/engine.py").read_text()
     migration_src = (
-        root / "migrations/0056_oracle_predictions_dedup_guard_index.sql"
+        root / "migrations/versions/oracle_forward_v2_20261110.py"
     ).read_text()
 
     predicate_lines = (
@@ -233,12 +222,13 @@ def test_helper_index_ddl_matches_engine_and_publish_predicate():
         "expiry,",
         "prediction_type,",
         "(COALESCE(model_version, '')),",
-        "((created_at AT TIME ZONE 'UTC')::date)",
+        "((created_at AT TIME ZONE 'UTC')::date),",
+        "(COALESCE(recording_policy, 'legacy'))",
     )
     for line in predicate_lines:
         assert line in _DEDUP_INDEX_DDL
-        assert line in engine_src
         assert line in migration_src
+    assert "ensure_dedup_index_on_connection" in engine_src
 
     assert "WHERE dedup_keep = TRUE" in _DEDUP_INDEX_DDL
     assert "oracle_predictions_dedup_unique" in migration_src

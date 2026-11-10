@@ -165,12 +165,26 @@ def build_oracle_report(cycle_result: dict[str, Any], *, now: datetime | None = 
     inserted = _count(cycle_result.get("distinct_positions_written"))
     updated = _count(cycle_result.get("positions_updated"))
     writes = _count(cycle_result.get("upsert_statements"))
+    forward_record = "new_abstentions" in cycle_result
+    abstentions = _count(cycle_result.get("new_abstentions"))
+    unchanged = _count(cycle_result.get("unchanged_forecasts"))
     # Update operations can touch the same row repeatedly. Incomplete RETURNING
     # counts cannot establish a distinct-row total; never substitute model votes.
-    if writes is not None and (inserted is None or updated is None or inserted + updated != writes):
+    if forward_record:
+        if (None in (inserted, abstentions, unchanged, writes) or updated != 0
+                or inserted + abstentions + unchanged != writes):
+            inserted = updated = None
+    elif writes is not None and (inserted is None or updated is None or inserted + updated != writes):
         inserted = updated = None
     headline = f"{inserted:,} New prediction rows" if inserted is not None else "New rows unknown"
     vote_label = f"{votes:,} model votes" if votes is not None else "model votes unknown"
+    if forward_record:
+        vote_label = f"{votes:,} accepted forecasts" if votes is not None else "accepted count unknown"
+    admission_note = (
+        f"<p>{abstentions:,} new abstention records; {unchanged:,} prior forecasts preserved unchanged. "
+        "Abstentions are excluded from new forecast counts and top calls.</p>"
+        if forward_record and abstentions is not None and unchanged is not None else ""
+    )
     subject = f"GRID Oracle - {headline} | {vote_label}"
     scoring = cycle_result.get("scoring") or {}
     summary = _scoring_summary(scoring)
@@ -189,6 +203,7 @@ def build_oracle_report(cycle_result: dict[str, Any], *, now: datetime | None = 
             f"<p>{vote_label}; "
             + (f"{updated:,} update operations" if updated is not None else "update count unknown")
             + ". Updates are not distinct positions or executed trades.</p>"
+            + admission_note +
             f"<p><strong>{summary}</strong><br>{exceptions}. "
             "These counts describe this scoring pass, not the entire pending backlog.</p>"
             f"<p>{len(preds)} supplied prediction details below; {len(changes)} model weight changes. "

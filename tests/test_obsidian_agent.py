@@ -25,7 +25,7 @@ class TestActOnApproval:
             },
         )
 
-        assert actions == ["Created prediction stub for NVDA from alpha note 'NVDA setup'"]
+        assert actions == ["Recorded immutable research stub for NVDA from alpha note 'NVDA setup'"]
         assert len(conn.calls) == 1
         sql, params = conn.calls[0]
         assert "INSERT INTO oracle_predictions" in sql
@@ -38,7 +38,9 @@ class TestActOnApproval:
         assert "(COALESCE(model_version, ''))" in sql
         assert "created_at AT TIME ZONE 'UTC'" in sql
         assert "WHERE dedup_keep = TRUE" in sql
-        assert "DO UPDATE SET" in sql
+        assert "DO NOTHING" in sql
+        assert "DO UPDATE" not in sql
+        assert "recording_policy" in sql
         assert params["ticker"] == "NVDA"
         assert params["prediction_type"] == "vault_alpha"
         assert params["model_name"] == "vault_alpha"

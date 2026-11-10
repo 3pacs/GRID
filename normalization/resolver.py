@@ -22,6 +22,7 @@ from sqlalchemy.engine import Engine
 
 from binance_close_contract import CANONICAL_CLOSE_SERIES, is_completed_canonical_close
 from normalization.entity_map import EntityMap, SELECTED_ROW_CAP, validate_selected_request
+from tiingo_symbol_contract import is_foreign_tiingo_row
 from price_close_contract import (
     SPY_CLOSE_CONTRACT,
     SPY_CLOSE_SERIES,
@@ -955,6 +956,8 @@ class Resolver:
                 # Group by (series_id, obs_date)
                 groups: dict[tuple[str, Any], list[dict]] = {}
                 for row in rows:
+                    if is_foreign_tiingo_row(row[0], row[6], row[1]):
+                        continue  # another instrument's price (tiingo_symbol_contract)
                     key = (row[0], row[1])
                     if key not in groups:
                         groups[key] = []

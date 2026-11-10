@@ -110,9 +110,16 @@ def test_scorer_writes_one_lesson_per_verdict_after_commit(monkeypatch):
     events: list[str] = []
     eng = OracleEngine.__new__(OracleEngine)
     eng.engine = _scoring_engine(rows, events)
-    monkeypatch.setattr(eng, "_load_split_book", lambda tickers: {}, raising=False)
-    monkeypatch.setattr(eng, "_get_price_at_date", lambda t, d: prices[t], raising=False)
-    monkeypatch.setattr(eng, "_split_adjust_exit", lambda book, t, a, e, c: a, raising=False)
+    import scripts.score_oracle_trades as sot
+    from store.observations import Observation
+
+    session = sot.expiry_session_date("NVDA", expiry)
+    monkeypatch.setattr(sot, "load_expiry_closes", lambda *a, **kw: {
+        t: {session: Observation(sot.close_series_id(t), session, value,
+                                datetime(2026, 11, 7, tzinfo=timezone.utc), "TIINGO")}
+        for t, value in prices.items()
+    })
+    monkeypatch.setattr(sot, "load_split_book", lambda *a, **kw: {})
     written: list[Any] = []
 
     def _capture(engine, lesson, **kw):

@@ -78,7 +78,8 @@ class _FakeIncremental(TiingoPuller):
         time.sleep(self.fetch_delay_s)
         with self._mu:
             self.in_flight -= 1
-        return {"ticker": ticker, "status": "SUCCESS", "rows_inserted": 6, "errors": []}
+        return {"ticker": ticker, "status": "SUCCESS", "rows_inserted": 6, "errors": [],
+                "latest_obs": _SESSION}
 
 
 # Tuesday 2026-09-29, 20:00 ET (EDT): that day's EOD bar should exist.

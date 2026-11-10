@@ -618,7 +618,10 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # gdelt registry entry: timeout_s 60 -> 360 and its comments
         # (requests wait for the shared GDELT DOC gate; pull_recent stops
         # at deadline_at). Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','59d5cee2d87302e19793901f415f9530b264296e2c5f67cda38f41abd23280fb'),(SCHED,'\nimport calendar\n','3ca3c3f9257ab076c23a5dea33937c749b509965b208121b2789aa0186e436a9')]:
+        # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
+        # forward pass and adds its helpers and budget. The SEC dispatch
+        # prefix and entire smart_scheduler.py match parent 18e49822.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','bd887fc76b56b2f4f6073097b9a2b6bfeaca67eddb3171d0f2806cdd07dd52b6'),(SCHED,'\nimport calendar\n','3ca3c3f9257ab076c23a5dea33937c749b509965b208121b2789aa0186e436a9')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
@@ -630,6 +633,8 @@ class CurrentSecDefaultTests(unittest.TestCase):
             (' or time.monotonic() >= cycle_deadline',''),
             ('if state.cooldowns.can_retry(src):','if True:'),
             ('def git_pull() -> dict[str, Any]:','def unintended_git_pull() -> dict[str, Any]:'),
+            ('_run_oracle_forward_step(engine, state, dry_run, cycle_result, cycle_deadline)',
+             '_run_oracle_forward_step(engine, state, False, cycle_result, cycle_deadline)'),
         ]
         read=Path.read_text
         for before,after in mutations:
@@ -730,14 +735,31 @@ class CurrentSecDefaultTests(unittest.TestCase):
             with self.assertRaises(m.SecOnlyRefused):m._sec_json(raw)
         with self.assertRaises(m.SecOnlyRefused):m._sec_outer_clock(True,lambda:1.)
     def test_sec_early_operator_still_refuses_without_broad_imports(self):
+        from tempfile import TemporaryDirectory
+
         original=builtins.__import__;effects=[]
         def imp(name,*a,**k):
-            if name.split('.')[0] in ('loguru','sqlalchemy','config','ingestion','orchestration'):
+            if name.split('.')[0] in ('loguru','sqlalchemy','config','ingestion','orchestration','oracle'):
                 effects.append(name);raise RuntimeError('broad import forbidden')
             return original(name,*a,**k)
-        with patch.object(sys,'argv',[str(OPER),'--sec-unknown']),patch('os.chdir',side_effect=lambda *a:effects.append('chdir')),patch.object(builtins,'__import__',imp),contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(SystemExit) as caught:runpy.run_path(str(OPER),run_name='__main__')
-        self.assertEqual(caught.exception.code,2);self.assertEqual(effects,[])
+        with TemporaryDirectory() as directory:
+            selection = Path(directory) / 'selection.json'
+            raw = b'{}'
+            selection.write_bytes(raw)
+            for args,code in [
+                (['--sec-unknown'], 'CLI_OR_INPUT_REFUSED'),
+                (['--sec-only','--sec-selection',str(selection),'--sec-selection-sha256',digest(raw)],
+                 'SELECTION_FIELDS'),
+            ]:
+                with self.subTest(args=args), patch.object(sys,'argv',[str(OPER),*args]), \
+                     patch('os.chdir',side_effect=lambda *a:effects.append('chdir')), \
+                     patch.object(builtins,'__import__',imp), contextlib.redirect_stdout(io.StringIO()) as out:
+                    with self.assertRaises(SystemExit) as caught:
+                        runpy.run_path(str(OPER),run_name='__main__')
+                self.assertEqual(caught.exception.code,2)
+                receipt=json.loads(out.getvalue())
+                self.assertEqual((receipt['status'],receipt['code']),('REFUSED',code))
+                self.assertEqual(effects,[])
 
 
 class SecPreservationEncodingTests(unittest.TestCase):

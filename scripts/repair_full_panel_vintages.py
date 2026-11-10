@@ -74,6 +74,27 @@ intended), ``cells_restored`` (dark today, re-vintaged by the plan),
 ``cells_left_dark`` (dark after the plan, before + newly + phantom, for
 continuity with the first dry run).
 
+Pre-inception cells (added 2026-11-10). ``xlre_full`` served a 2010-01-01
+cell and others before XLRE existed (listed 2015-10-08); the junk value sits
+in BOTH raw fields, so the classifier calls it AMBIGUOUS (kept) and the
+neighbouring junk cells anchor the outlier median. A ticker listed in
+``INCEPTION_DATES`` (an explicit, cited override map, never a data
+heuristic) has every row dated before its first trading day classed
+PRE_INCEPTION: retracted under its own reason, never re-vintaged, never a
+neighbour for the outlier reference, and a pre-inception cell going dark is
+``cells_phantom_cleared`` (never against the coverage floor).
+
+Trading-day test (2026-11-10). "A raw close row exists" misfired as the test
+for a real trading day (nasdaq_full, russell2000_full, pypl_full, rxt_full
+were flagged on ordinary Mondays: their raw close rows were simply absent).
+``after_first_on_trading_day`` now asks the market calendar
+(``is_trading_day``: ingestion/market_calendar.py plus its documented
+corrections). The newly-dark / phantom split used the same proxy and had the
+mirror-image fault (a served cell on a real trading day with no raw close row
+was called phantom and hidden from the floor): a gone cell is now phantom
+only when the calendar says closed AND no raw close row exists, or when it is
+pre-inception; otherwise it is a real loss.
+
 Reads are bounded and indexed: ``resolved_series`` by feature_id in one
 transaction, ``raw_series`` by (series_id, obs_date range) in one-year
 chunks, EACH CHUNK IN ITS OWN READ ONLY TRANSACTION, so no connection is
@@ -117,6 +138,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import Connection, Engine  # noqa: E402
 
+from ingestion.market_calendar import is_market_open, is_weekend
 from normalization.entity_map import RAW_CLOSE_FULL_FEATURES, static_feeds  # noqa: E402
 from price_close_contract import SPY_CLOSE_FEATURE  # noqa: E402
 
@@ -128,6 +150,12 @@ VALUE_TOL_REL = 1e-6
 VALUE_TOL_ABS = 1e-6
 OUTLIER_REL = 0.50
 OUTLIER_NEIGHBOURS = 5
+#: A neighbour more than this many calendar days from the date being judged
+#: is no evidence about it. Without the bound, a cell at the start of a long
+#: dark span was judged against cells years away: r3 (2026-11-09) rejected
+#: every honest DIS/DUK/LOW/MCD/LLY/MMM/MSTR 2010-2024 adj_close and the
+#: fresh ACN/HON backfill as "-50..-94 % vs neighbours" against 2021+ prices.
+OUTLIER_MAX_GAP_DAYS = 30
 #: Largest share of today's served cells a plan may leave dark before the
 #: feature is NEEDS_BACKFILL instead of applicable.
 DEFAULT_COVERAGE_FLOOR = 0.01
@@ -140,11 +168,60 @@ OUTLIER_REASON = (
     "(junk print, PRICE BASIS POLICY 2026-11-08)"
 )
 
+PRE_INCEPTION_REASON = (
+    "pre-inception cell for {feature}: obs_date {obs_date} is before {ticker}'s first trading day "
+    "{inception} (no such price existed; pre-inception repair 2026-11-10)"
+)
+
+#: First exchange trading day per ticker, for ETFs whose ``_full`` feature
+#: serves cells before the fund existed. EXPLICIT OVERRIDES, never inferred
+#: from data (the junk sits in both raw fields, so data cannot tell). A row
+#: with obs_date before the date is retracted and never re-vintaged.
+#: Sources: State Street Global Advisors fund pages, read 2026-11-10. Each
+#: page's "Inception Date" is the day the fund was seeded, one day before the
+#: "Listing Date" (NYSE Arca, first day a price exists); the listing date is
+#: the one used here:
+#:   XLRE  Inception Oct 07 2015, Listing Date Oct 08 2015
+#:         https://www.ssga.com/us/en/intermediary/etfs/funds/real-estate-select-sector-spdr-fund-xlre
+#:   XLC   Inception Jun 18 2018, Listing Date Jun 19 2018
+#:         https://www.ssga.com/us/en/intermediary/etfs/funds/communication-services-select-sector-spdr-fund-xlc
+INCEPTION_DATES: dict[str, date] = {
+    "XLRE": date(2015, 10, 8),
+    "XLC": date(2018, 6, 19),
+}
+
+#: Weekday closures ingestion/market_calendar.py does not list (it covers the
+#: standard holidays only): Hurricane Sandy, and the national days of mourning
+#: for G. H. W. Bush and J. Carter.
+_SPECIAL_CLOSURES = frozenset({date(2012, 10, 29), date(2012, 10, 30), date(2018, 12, 5), date(2025, 1, 9)})
+#: NYSE first closed for Juneteenth in 2022; market_calendar lists it for every year.
+_JUNETEENTH_FIRST_YEAR = 2022
+
+
+def _juneteenth_observed(year: int) -> date:
+    d = date(year, 6, 19)
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def is_trading_day(d: date) -> bool:
+    """US equity market open on ``d``: ``is_market_open`` corrected for pre-2022 Juneteenth and one-off closures."""
+    if d in _SPECIAL_CLOSURES:
+        return False
+    if is_market_open(d):
+        return True
+    return d.year < _JUNETEENTH_FIRST_YEAR and not is_weekend(d) and d == _juneteenth_observed(d.year)
+
+
 ON_BASIS = "ON_BASIS"
 OFF_BASIS = "OFF_BASIS"
 AMBIGUOUS = "AMBIGUOUS"
 UNMATCHED = "UNMATCHED"
 OUTLIER = "OUTLIER"
+PRE_INCEPTION = "PRE_INCEPTION"
 ALREADY_RETRACTED = "ALREADY_RETRACTED"
 
 # per-feature plan status
@@ -339,13 +416,30 @@ def latest_per_cell(rows: Iterable[ResolvedRow], keep: Callable[[ResolvedRow], b
 
 
 class NeighbourReference:
-    """Median of the latest on-basis values of the nearest cells around a date."""
+    """Median of the latest on-basis values of the nearest cells around a date.
 
-    def __init__(self, rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS) -> None:
-        self.ref = latest_per_cell(rows, lambda r: r.cls in (ON_BASIS, AMBIGUOUS))
-        self.dates = sorted(self.ref)
+    Only cells within ``max_gap_days`` of the date count as neighbours.
+    """
+
+    def __init__(self, rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS,
+                 max_gap_days: int = OUTLIER_MAX_GAP_DAYS) -> None:
+        ref = latest_per_cell(rows, lambda r: r.cls in (ON_BASIS, AMBIGUOUS))
+        self._init({d: r.value for d, r in ref.items()}, neighbours, max_gap_days)
+
+    @classmethod
+    def from_values(cls, values: dict[date, float], neighbours: int = OUTLIER_NEIGHBOURS,
+                    max_gap_days: int = OUTLIER_MAX_GAP_DAYS) -> NeighbourReference:
+        """A reference over a plain date -> value map (e.g. raw candidates)."""
+        self = cls.__new__(cls)
+        self._init(values, neighbours, max_gap_days)
+        return self
+
+    def _init(self, values: dict[date, float], neighbours: int, max_gap_days: int) -> None:
+        self.ref = values
+        self.dates = sorted(values)
         self.pos = {d: i for i, d in enumerate(self.dates)}
         self.neighbours = neighbours
+        self.max_gap = timedelta(days=max_gap_days)
 
     def deviation(self, obs_date: date, value: float) -> float | None:
         """``value / median - 1`` against the neighbouring cells, or None when too few neighbours."""
@@ -359,7 +453,8 @@ class NeighbourReference:
             window = self.dates[max(0, i - n): i] + self.dates[i: i + n]
         else:
             window = self.dates[max(0, i - n): i] + self.dates[i + 1: i + 1 + n]
-        vals = [self.ref[d].value for d in window if self.ref[d].value > 0]
+        vals = [self.ref[d] for d in window
+                if self.ref[d] > 0 and abs(d - obs_date) <= self.max_gap]
         if len(vals) < 3:
             return None
         med = statistics.median(vals)
@@ -423,10 +518,15 @@ class FeaturePlan:
     cells_newly_dark: int = 0
     cells_phantom_cleared: int = 0
     cells_restored: int = 0
+    #: ``INCEPTION_DATES`` entry for the ticker (ISO date) and how many of
+    #: ``cells_phantom_cleared`` are cells dated before it.
+    inception_date: str | None = None
+    cells_pre_inception_cleared: int = 0
     newly_dark_share: float | None = None
     newly_dark_range: dict[str, Any] | None = None
-    #: False when the first cell the repaired series would serve has no raw
-    #: close row (a holiday junk print survived); None when nothing is served.
+    #: False when the first cell the repaired series would serve is not a US
+    #: trading day per the market calendar (a holiday junk print survived) or
+    #: is before the ticker's inception; None when nothing is served.
     after_first_on_trading_day: bool | None = None
     backfill_hint: str | None = None
     raw_rows_read: dict[str, int] = field(default_factory=dict)
@@ -445,6 +545,11 @@ class FeaturePlan:
         d["retract"] = len(self.retract)
         d["revintage"] = len(self.revintage)
         d["revintage_rejected"] = len(self.revintage_rejected)
+        by_why: dict[str, int] = {}
+        for x in self.revintage_rejected:
+            key = re.sub(r"\s*\(.*\)$", "", x["why"])
+            by_why[key] = by_why.get(key, 0) + 1
+        d["revintage_rejected_by_why"] = by_why
         d["applicable"] = self.applicable
         return d
 
@@ -478,6 +583,14 @@ def plan_feature(
     plan = plan_from_scope(scope, feature_id)
     plan.rows, plan.cells = len(rows), len({r.obs_date for r in rows})
     classify_rows(rows, raw, target)
+    inception = INCEPTION_DATES.get(plan.ticker)
+    plan.inception_date = inception.isoformat() if inception else None
+    if inception is not None:
+        # Before outlier flagging: a pre-inception row is not an ON_BASIS /
+        # AMBIGUOUS neighbour, so the junk cannot anchor its own median.
+        for r in rows:
+            if r.cls != ALREADY_RETRACTED and r.obs_date < inception:
+                r.cls = PRE_INCEPTION
     flag_outliers(rows)
     plan.by_class = {}
     for r in rows:
@@ -490,10 +603,13 @@ def plan_feature(
     plan.cells_dark_before = len(dark_before)
     plan.served_before = ratio_and_jumps({d: r.value for d, r in before.items()})
 
-    to_retract = [r for r in rows if r.cls in (OFF_BASIS, OUTLIER)]
+    to_retract = [r for r in rows if r.cls in (OFF_BASIS, OUTLIER, PRE_INCEPTION)]
     other = "close" if target == "adj_close" else "adj_close"
     for r in to_retract:
-        if r.cls == OFF_BASIS:
+        if r.cls == PRE_INCEPTION:
+            reason = PRE_INCEPTION_REASON.format(feature=feature, obs_date=r.obs_date.isoformat(),
+                                                 ticker=plan.ticker, inception=inception.isoformat())
+        elif r.cls == OFF_BASIS:
             reason = RETRACTION_REASON.format(feature=feature, ticker=plan.ticker, field=other, target=target)
         else:
             reason = OUTLIER_REASON.format(feature=feature, pct=r.outlier_pct or 0.0)
@@ -509,24 +625,45 @@ def plan_feature(
     # the retractions (OUTLIER rows are no longer ON_BASIS, so a junk print
     # never anchors its own neighbourhood).
     reference = NeighbourReference(rows)
+    # Where no served cell is near (a long dark span: every cell of a stretch
+    # was raw-basis), judge a candidate against the candidates of the nearby
+    # dark dates instead: the on-basis raw series must agree with itself, so a
+    # junk print inside the span is still caught.
+    candidate_ref = NeighbourReference.from_values({
+        d: max(raw[target][d], key=lambda c: c.pull_date).value
+        for d in dark if raw.get(target, {}).get(d) and d in raw.get("close", {})
+        and (inception is None or d >= inception)
+    })
+
+    def deviation(d: date, value: float) -> float | None:
+        pct = reference.deviation(d, value)
+        return candidate_ref.deviation(d, value) if pct is None else pct
+
+    closed_day_junk: set[date] = set()  # market-closed dates whose only raw close print is a junk outlier
     for d in dark:
+        if inception is not None and d < inception:
+            continue  # pre-inception: never re-vintaged, whatever the raw rows say
         cands = raw.get(target, {}).get(d, [])
         if not cands:
             continue
         if d not in raw.get("close", {}):
             # No as-traded print for the date: a holiday / weekend cell that
             # only ever held a junk adj_close row. Nothing honest to serve.
-            plan.revintage_rejected.append({"obs_date": d.isoformat(), "why": "no raw close row: not a trading day"})
+            why = ("no raw close row: not a trading day" if not is_trading_day(d)
+                   else "no raw close row on a trading day")
+            plan.revintage_rejected.append({"obs_date": d.isoformat(), "why": why})
             continue
         best = max(cands, key=lambda c: c.pull_date)
-        pct = reference.deviation(d, best.value)
+        pct = deviation(d, best.value)
         if pct is not None and abs(pct) > OUTLIER_REL:
             # The latest on-basis raw value is itself a junk print (the r2 plan
             # would have re-inserted XLP's 0.6 holiday prints under today's
             # vintage). Try the latest sane candidate instead.
             sane = [c for c in sorted(cands, key=lambda c: c.pull_date, reverse=True)
-                    if (p2 := reference.deviation(d, c.value)) is None or abs(p2) <= OUTLIER_REL]
+                    if (p2 := deviation(d, c.value)) is None or abs(p2) <= OUTLIER_REL]
             if not sane:
+                if not is_trading_day(d):
+                    closed_day_junk.add(d)
                 plan.revintage_rejected.append({"obs_date": d.isoformat(), "value": best.value,
                                                 "why": f"every on-basis raw value is an outlier ({pct:+.0%} vs neighbours)"})
                 continue
@@ -546,11 +683,19 @@ def plan_feature(
     # holiday junk a yfinance writer stamped into XLP/XLB/XLRE/XLI adj_close:
     # r2 showed xli_full with 5,598 cells against ~4,250 trading days); going
     # dark is the repair, so it is reported apart and never counts against
-    # the coverage floor.
+    # the coverage floor. Phantom = before the ticker existed, or the calendar
+    # says closed AND no raw close row exists (or the only one is a junk
+    # outlier: grid-svr 2026-11-10 holds 0.91-1.0 XLRE/XLP prints on the
+    # 2018-12-05 and 2025-01-09 days of mourning); a cell on a calendar
+    # trading day without a raw close row is a real loss (it used to hide as
+    # phantom).
     gone = set(before) - set(after)
-    newly_dark = sorted(d for d in gone if d in raw.get("close", {}))
+    pre_inception = {d for d in gone if inception is not None and d < inception}
+    newly_dark = sorted(d for d in gone - pre_inception - closed_day_junk
+                        if d in raw.get("close", {}) or is_trading_day(d))
     plan.cells_newly_dark = len(newly_dark)
     plan.cells_phantom_cleared = len(gone) - len(newly_dark)
+    plan.cells_pre_inception_cleared = len(pre_inception)
     plan.cells_restored = len(dark_before & set(after))
     plan.newly_dark_share = (len(newly_dark) / len(before)) if before else 0.0
     if newly_dark:
@@ -568,7 +713,8 @@ def plan_feature(
         )
     plan.served_after = ratio_and_jumps({d: r.value for d, r in after.items()})
     if after:
-        plan.after_first_on_trading_day = min(after) in raw.get("close", {})
+        first = min(after)
+        plan.after_first_on_trading_day = is_trading_day(first) and (inception is None or first >= inception)
 
     for r in to_retract[:6]:
         plan.examples.append({"obs_date": r.obs_date.isoformat(), "vintage_date": r.vintage_date.isoformat(),

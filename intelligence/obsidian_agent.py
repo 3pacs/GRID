@@ -136,29 +136,33 @@ def act_on_approval(conn, note: dict[str, Any]) -> list[str]:
     if domain == "alpha":
         entities = extract_entities(note["body"])
         for ticker in entities["tickers"][:1]:
-            prediction_id = f"vault_alpha:{ticker}:{now.date().isoformat()}"
+            from oracle.dedup_index import EXTERNAL_RECORDING_POLICY, forecast_identity
             expiry = (now + timedelta(days=7)).date()
+            prediction_id = forecast_identity(
+                ticker=ticker, direction="pending_analysis", expiry=expiry,
+                prediction_type="vault_alpha", model_name="vault_alpha",
+                model_version="obsidian-agent-v1", timestamp=now,
+                recording_policy=EXTERNAL_RECORDING_POLICY,
+            )
             conn.execute(text("""
                 INSERT INTO oracle_predictions
                     (id, ticker, prediction_type, direction, target_price, entry_price,
                      expiry, confidence, model_name, model_version, signals, flow_context,
-                     created_at, verdict)
+                     created_at, verdict, recording_policy)
                 VALUES
                     (:id, :ticker, :prediction_type, :direction, NULL, :entry_price,
                      :expiry, :confidence, :model_name, :model_version,
-                     CAST(:signals AS jsonb), CAST(:flow_context AS jsonb), :now, 'pending')
+                     CAST(:signals AS jsonb), CAST(:flow_context AS jsonb), :now, 'pending', :rp)
                 ON CONFLICT (
-                    ticker, direction, expiry, prediction_type,
+                    ticker, direction, expiry, prediction_type, model_name,
                     (COALESCE(model_version, '')),
-                    ((created_at AT TIME ZONE 'UTC')::date)
+                    ((created_at AT TIME ZONE 'UTC')::date),
+                    (COALESCE(recording_policy, 'legacy'))
                 ) WHERE dedup_keep = TRUE
-                DO UPDATE SET
-                    confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
-                    signals = EXCLUDED.signals,
-                    flow_context = EXCLUDED.flow_context,
-                    verdict = EXCLUDED.verdict
+                DO NOTHING
             """), {
                 "id": prediction_id,
+                "rp": EXTERNAL_RECORDING_POLICY,
                 "ticker": ticker,
                 "prediction_type": "vault_alpha",
                 "direction": "pending_analysis",
@@ -180,7 +184,7 @@ def act_on_approval(conn, note: dict[str, Any]) -> list[str]:
                 }),
                 "now": now,
             })
-            actions.append(f"Created prediction stub for {ticker} from alpha note '{title}'")
+            actions.append(f"Recorded immutable research stub for {ticker} from alpha note '{title}'")
 
     if domain == "tools":
         actions.append(f"Tool '{title}' approved — queued for compute stack evaluation")
@@ -437,10 +441,7 @@ def run_agent_cycle(engine) -> dict[str, Any]:
     """Run one full agent cycle: react, enrich, prioritize, act."""
     stats = {"enriched": 0, "flagged": 0, "acted": 0}
 
-    # Pre-migration safety: act_on_approval below inserts into oracle_predictions
-    # with an ON CONFLICT targeting the partial unique index
-    # oracle_predictions_dedup_unique. Ensure it exists (once/process) so that
-    # insert can't raise 42P10 on a not-yet-migrated DB.
+    # Refuse legacy/invalid identity indexes before acting on any approvals.
     from oracle.dedup_index import ensure_dedup_index
     ensure_dedup_index(engine)
 

@@ -242,3 +242,56 @@ class TestForecastToPrediction:
         p2 = forecast_to_prediction(bullish_forecast, "SPY", 100.0)
         assert p1 is not None and p2 is not None
         assert p1.id == p2.id
+
+    def test_same_day_direction_flip_has_distinct_identity(
+        self, bullish_forecast: MagicMock, bearish_forecast: MagicMock,
+    ) -> None:
+        call = forecast_to_prediction(bullish_forecast, "SPY", 100.0)
+        put = forecast_to_prediction(bearish_forecast, "SPY", 100.0)
+        assert call.direction == "CALL" and put.direction == "PUT"
+        assert call.expiry == put.expiry
+        assert call.id != put.id
+
+    def test_model_version_change_has_distinct_identity(self, bullish_forecast: MagicMock) -> None:
+        before = forecast_to_prediction(bullish_forecast, "SPY", 100.0)
+        bullish_forecast.model_version = "timesfm-new-version"
+        after = forecast_to_prediction(bullish_forecast, "SPY", 100.0)
+        assert before.id != after.id
+
+    def test_identity_expiry_and_timestamp_share_one_utc_clock(
+        self, bullish_forecast: MagicMock, monkeypatch,
+    ) -> None:
+        from datetime import datetime, timedelta, timezone
+        from oracle import forecaster_adapter as adapter
+
+        class Clock(datetime):
+            calls = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                cls.calls += 1
+                return cls(2026, 11, 10, 23, 59, 59, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(adapter, "datetime", Clock)
+        pred = forecast_to_prediction(bullish_forecast, "SPY", 100.0)
+        assert Clock.calls == 1
+        assert pred.expiry == pred.timestamp.date() + timedelta(days=7)
+
+
+def test_explicit_oracle_horizon_never_relabels_a_cached_timesfm_forecast(monkeypatch):
+    from datetime import datetime, timezone
+    from oracle.engine import OracleEngine, OracleModel
+
+    oracle = OracleEngine.__new__(OracleEngine)
+    oracle.models = [OracleModel('timeseries_enhanced', '1', 'fixture', [])]
+    oracle._get_flow_context = lambda ticker: {}
+    oracle._get_entry_price_reference = lambda ticker: {'status': 'measured', 'price': 100.0}
+    oracle._get_credit_cycle_routing = lambda: {}
+    oracle._get_journal_feedback = lambda ticker: {}
+    oracle._get_timesfm_forecast = lambda ticker: {'horizon': 7}
+    called = []
+    monkeypatch.setattr('oracle.forecaster_adapter.forecast_to_prediction',
+                        lambda *a, **kw: called.append(1))
+    result = oracle._oracle_one_ticker(1, 'SPY', 1, datetime.now(timezone.utc), {}, horizon_days=1)
+    assert result == []
+    assert called == []

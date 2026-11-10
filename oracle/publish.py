@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from oracle.dedup_index import ensure_dedup_index
+from oracle.dedup_index import EXTERNAL_RECORDING_POLICY, ensure_dedup_index, forecast_identity
 from oracle.entry_price_policy import NULL_WRITE_POLICY
 from oracle.prediction_context import (
     build_prediction_context,
@@ -163,7 +163,6 @@ def _prediction_expiry(payload: dict[str, Any]) -> date:
 
 def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dict[str, Any]:
     """Publish a reduced comparable record into the shared Oracle path."""
-    oracle_prediction_id = str(payload.get("oracle_prediction_id") or f"astrogrid:{payload['prediction_id']}")
     flow_context = {
         "source": "astrogrid",
         "target_universe": payload.get("target_universe") or "hybrid",
@@ -211,12 +210,19 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
         engine, ticker, as_of_date
     )
     signals["entry_price_basis"] = entry_price_basis
-    # Pre-migration safety: the ON CONFLICT below targets the partial unique
-    # index oracle_predictions_dedup_unique. Ensure it exists (once/process)
-    # so this insert can't raise 42P10 on a not-yet-migrated DB.
+    # Refuse a legacy arbiter until the forward identity migration is applied.
     ensure_dedup_index(engine)
+    committed_at = datetime.now(timezone.utc)
+    direction = _prediction_direction(payload)
+    expiry = _prediction_expiry(payload)
+    model_version = str(payload.get("model_version") or "astrogrid-oracle-v1")
+    oracle_prediction_id = forecast_identity(
+        ticker=ticker, direction=direction, expiry=expiry, prediction_type="astrogrid",
+        model_name="astrogrid", model_version=model_version, timestamp=committed_at,
+        recording_policy=EXTERNAL_RECORDING_POLICY,
+    )
     with engine.begin() as conn:
-        conn.execute(
+        inserted = conn.execute(
             text(
                 """
                 INSERT INTO oracle_predictions (
@@ -238,11 +244,11 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     anti_signals,
                     flow_context,
                     model_weights,
-                    null_write_policy
+                    null_write_policy, recording_policy
                 )
                 VALUES (
                     :id,
-                    NOW(),
+                    :created_at,
                     :ticker,
                     :prediction_type,
                     :direction,
@@ -259,37 +265,28 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     CAST(:anti_signals AS jsonb),
                     CAST(:flow_context AS jsonb),
                     CAST(:model_weights AS jsonb),
-                    :null_write_policy
+                    :null_write_policy, :recording_policy
                 )
                 ON CONFLICT (
-                    ticker, direction, expiry, prediction_type,
+                    ticker, direction, expiry, prediction_type, model_name,
                     (COALESCE(model_version, '')),
-                    ((created_at AT TIME ZONE 'UTC')::date)
+                    ((created_at AT TIME ZONE 'UTC')::date),
+                    (COALESCE(recording_policy, 'legacy'))
                 ) WHERE dedup_keep = TRUE
-                DO UPDATE SET
-                    confidence = CASE
-                        WHEN EXCLUDED.confidence IS NULL
-                          OR oracle_predictions.confidence IS NULL
-                        THEN NULL
-                        ELSE GREATEST(
-                            EXCLUDED.confidence, oracle_predictions.confidence
-                        )
-                    END,
-                    signals    = EXCLUDED.signals,
-                    signal_strength = EXCLUDED.signal_strength,
-                    coherence  = EXCLUDED.coherence,
-                    model_weights = EXCLUDED.model_weights
+                DO NOTHING RETURNING id
                 """
             ),
             {
                 "id": oracle_prediction_id,
+                "created_at": committed_at,
+                "recording_policy": EXTERNAL_RECORDING_POLICY,
                 "ticker": ticker,
                 "prediction_type": "astrogrid",
-                "direction": _prediction_direction(payload),
+                "direction": direction,
                 # NULL, not 0.0, when no spot was observed on or before
                 # as_of_date. `signals.entry_price_basis` says which it was.
                 "entry_price": entry_price,
-                "expiry": _prediction_expiry(payload),
+                "expiry": expiry,
                 # Three nominally independent metrics used to be the same
                 # number, and that number was 0.5 whenever the caller omitted
                 # a confidence (D-H11). `or 0.5` also rewrote a legitimate
@@ -299,7 +296,7 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                 "signal_strength": _measured_or_none(payload.get("signal_strength")),
                 "coherence": _measured_or_none(payload.get("coherence")),
                 "model_name": "astrogrid",
-                "model_version": str(payload.get("model_version") or "astrogrid-oracle-v1"),
+                "model_version": model_version,
                 "signals": json.dumps(signals),
                 "anti_signals": json.dumps([
                     {"name": "astrogrid_invalidation", "detail": _compact_text(payload.get("invalidation"))},
@@ -310,17 +307,22 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     "publish_contract": "oracle.publish.v1",
                 }),
                 # Historical-NULL provenance boundary: stamped on every
-                # INSERT, never on the ON CONFLICT UPDATE below, so a reader
+                # INSERT, never on duplicate attempts, so a reader
                 # can prove this row's entry_price/confidence NULL (if
                 # either is NULL) is this policy's honest NULL. See
                 # oracle/entry_price_policy.py and the migration docstring.
                 "null_write_policy": NULL_WRITE_POLICY,
             },
-        )
+        ).fetchone()
+        # Return the committed original, including on retries with new evidence.
+        stored = conn.execute(text("""
+            SELECT entry_price, signals FROM oracle_predictions WHERE id = :id
+        """), {"id": oracle_prediction_id}).fetchone()
     return {
-        "status": "published",
+        "status": "published" if inserted is not None else "already_published",
         "oracle_prediction_id": oracle_prediction_id,
         "contract": "oracle.publish.v1",
-        "entry_price": entry_price,
-        "entry_price_basis": entry_price_basis,
+        "recording_policy": EXTERNAL_RECORDING_POLICY,
+        "entry_price": stored[0] if stored else None,
+        "entry_price_basis": (stored[1] or {}).get("entry_price_basis") if stored else None,
     }

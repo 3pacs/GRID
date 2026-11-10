@@ -1,0 +1,202 @@
+# Lifecycle markers for tickers in analysis/sector_map_data.yaml.
+#
+# Kept out of sector_map_data.yaml on purpose: analysis/panel_insider_density.py
+# pins that file by sha256 (pre-registration vs1-insider-density-v1) and refuses
+# to run if a byte changes. The map itself stays as registered; old symbols stay
+# in it, so historical panels keep every actor (dropping dead names would add
+# survivorship bias). This file only tells the price list what to fetch today.
+#
+# Keys are tickers exactly as sector_map_data.yaml spells them.
+#   status: renamed          same issuer, now priced under `successor`
+#                            (ticker change, rebrand, Tiingo's share-class spelling)
+#           acquired         absorbed by `acquirer` (a ticker, or a name if private)
+#           delisted         no longer listed; nothing to price
+#           foreign_listing  a non-US listing Tiingo's US equity endpoint cannot serve
+#   last_session: last close Tiingo holds (its /tiingo/daily/{t} endDate)
+#
+# Instrument classes (^ indices, -USD crypto, =F futures, ATD.TO-style exchange
+# suffixes) are not listed here: ingestion.tiingo_pull.is_tiingo_equity drops
+# them by rule.
+#
+# Verified 2026-11-09 against Tiingo meta/search (the renamed successors carry
+# the old symbol's history; the old symbol returns empty meta) and the
+# 2026-11-06 session's stale list.
+
+TICKER_STATUS:
+  # ── renamed: same issuer, new symbol ────────────────────────────────────────
+  ATUS:
+    status: renamed
+    successor: OPTU
+    note: Altice USA -> Optimum Communications (2025); Tiingo OPTU history from 2017-06-22
+  BGNE:
+    status: renamed
+    successor: ONC
+    note: BeiGene -> BeOne Medicines (2025); Tiingo ONC history from 2016-02-03
+  EQR:
+    status: renamed
+    successor: VMRK
+    note: Equity Residential absorbed AvalonBay and became Vivmark Residential, trading as VMRK from 2026-08-18; Tiingo VMRK history from 1993-08-12
+  ERJ:
+    status: renamed
+    successor: EMBJ
+    note: Embraer ADS ticker change (2025); Tiingo EMBJ history from 2000-07-21
+  EXPI:
+    status: renamed
+    successor: AGNT
+    note: eXp World Holdings ticker change effective 2026-05-08
+  GCI:
+    status: renamed
+    successor: TDAY
+    note: Gannett -> USA TODAY Co.; Tiingo GCI is the pre-2019 Gannett (ends 2019-11-19), TDAY carries the current company from 2014-02-04
+  GWH:
+    status: renamed
+    successor: GWHT
+    note: ESS Tech delisted from NYSE 2026-10-02, quoted OTC as GWHT from 2026-10-05
+  KELY.A:
+    status: renamed
+    successor: KELYA
+    note: Tiingo spelling of Kelly Services class A
+  LGF.A:
+    status: renamed
+    successor: STRZ
+    note: Lions Gate Entertainment separated 2025-05; the issuer became Starz Entertainment (STRZ). The studio is now LION.
+  MOG.A:
+    status: renamed
+    successor: MOG-A
+    note: Tiingo spelling of Moog class A
+  MPW:
+    status: renamed
+    successor: MPT
+    note: Medical Properties Trust ticker change effective 2026-02-02
+  MSGS:
+    status: renamed
+    successor: MSGK
+    note: MSG Sports -> MSG Knickerbockers 2026-10-27 after spinning off MSG Rangers (MSGR); Tiingo MSGK history from 2015-10-01
+  NEP:
+    status: renamed
+    successor: XIFR
+    note: NextEra Energy Partners -> XPLR Infrastructure (2025)
+  NYCB:
+    status: renamed
+    successor: FLG
+    note: New York Community Bancorp -> Flagstar Financial (2024-10); Tiingo FLG history from 1993-11-23
+  PSTG:
+    status: renamed
+    successor: P
+    note: Pure Storage -> Everpure (2026); Tiingo P history from 2015-10-07, last PSTG close 2026-04-16
+  SJW:
+    status: renamed
+    successor: HTO
+    note: SJW Group -> H2O America (2025)
+  TPX:
+    status: renamed
+    successor: SGI
+    note: Tempur Sealy -> Somnigroup International (2025)
+  USM:
+    status: renamed
+    successor: AD
+    note: U.S. Cellular sold wireless ops to T-Mobile and became Array Digital Infrastructure (2025)
+
+  # ── acquired ────────────────────────────────────────────────────────────────
+  ALTM: {status: acquired, acquirer: RIO, last_session: 2025-03-05}
+  ARCH:
+    status: acquired
+    acquirer: CNR
+    last_session: 2025-01-14
+    note: merged with CONSOL into Core Natural Resources
+  AVB:
+    status: acquired
+    acquirer: VMRK
+    last_session: 2026-08-17
+    note: 2.793 EQR (now VMRK) shares per AVB share
+  AY: {status: acquired, acquirer: Energy Capital Partners, last_session: 2024-12-12}
+  BPMC: {status: acquired, acquirer: SNY, last_session: 2025-07-18}
+  BRFS:
+    status: acquired
+    acquirer: MBRF Global Foods (Marfrig)
+    last_session: 2025-09-22
+  BZH: {status: acquired, acquirer: DFH, last_session: 2026-10-19}
+  CFLT: {status: acquired, acquirer: IBM, last_session: 2026-03-17}
+  CHX: {status: acquired, acquirer: SLB, last_session: 2025-07-16}
+  CIVI: {status: acquired, acquirer: SM, last_session: 2026-01-29}
+  CMA: {status: acquired, acquirer: FITB, last_session: 2026-01-30}
+  COOP: {status: acquired, acquirer: RKT, last_session: 2025-10-01}
+  CTRA: {status: acquired, acquirer: DVN, last_session: 2026-05-06}
+  CYBR: {status: acquired, acquirer: PANW, last_session: 2026-02-11}
+  DBRG: {status: acquired, acquirer: SoftBank Group, last_session: 2026-09-30}
+  DFS: {status: acquired, acquirer: COF, last_session: 2025-05-16}
+  EA: {status: acquired, acquirer: PIF / Silver Lake / Affinity Partners, last_session: 2026-08-04}
+  EXAS: {status: acquired, acquirer: ABT, last_session: 2026-03-24}
+  HES: {status: acquired, acquirer: CVX, last_session: 2025-07-18}
+  HOLX: {status: acquired, acquirer: Blackstone / TPG, last_session: 2026-04-07}
+  HOUS: {status: acquired, acquirer: COMP, last_session: 2026-01-08}
+  IAS: {status: acquired, acquirer: Novacap, last_session: 2025-12-23}
+  IPG: {status: acquired, acquirer: OMC, last_session: 2025-11-26}
+  JNPR: {status: acquired, acquirer: HPE, last_session: 2025-07-02}
+  K: {status: acquired, acquirer: Mars, last_session: 2025-12-11}
+  LBRDA: {status: acquired, acquirer: CHTR, last_session: 2026-08-21}
+  MASI: {status: acquired, acquirer: DHR, last_session: 2026-06-10}
+  MSGN:
+    status: acquired
+    acquirer: SPHR
+    last_session: 2021-07-09
+    note: bought by MSG Entertainment, now Sphere Entertainment
+  NSA: {status: acquired, acquirer: PSA, last_session: 2026-07-22}
+  PCH: {status: acquired, acquirer: RYN, last_session: 2026-02-02}
+  PDCO: {status: acquired, acquirer: Patient Square Capital, last_session: 2025-04-17}
+  PLL:
+    status: acquired
+    acquirer: ELVR
+    last_session: 2025-08-29
+    note: merged with Sayona Mining into Elevra Lithium
+  PRMW:
+    status: acquired
+    acquirer: PRMB
+    last_session: 2024-11-08
+    note: combined with BlueTriton into Primo Brands
+  PTVE: {status: acquired, acquirer: Novolex, last_session: 2025-04-01}
+  RDFN: {status: acquired, acquirer: RKT, last_session: 2025-07-02}
+  RMAX: {status: acquired, acquirer: REAX, last_session: 2026-08-25}
+  SEE: {status: acquired, acquirer: CD&R, last_session: 2026-04-09}
+  SEM: {status: acquired, acquirer: Ortenzio / Jackson / WCAS consortium, last_session: 2026-07-01}
+  SKX: {status: acquired, acquirer: 3G Capital, last_session: 2025-09-12}
+  SMLR: {status: acquired, acquirer: ASST, last_session: 2026-01-16}
+  SNCY: {status: acquired, acquirer: ALGT, last_session: 2026-05-13}
+  SPR: {status: acquired, acquirer: BA, last_session: 2025-12-05}
+  TERN: {status: acquired, acquirer: MRK, last_session: 2026-05-05}
+  THS: {status: acquired, acquirer: Investindustrial, last_session: 2026-02-11}
+  TMHC: {status: acquired, acquirer: BRK-B, last_session: 2026-07-24}
+  TPH: {status: acquired, acquirer: Sumitomo Forestry, last_session: 2026-05-13}
+  VERV: {status: acquired, acquirer: LLY, last_session: 2025-07-25}
+  VRE: {status: acquired, acquirer: Affinius Capital consortium, last_session: 2026-05-26}
+  WBA: {status: acquired, acquirer: Sycamore Partners, last_session: 2025-08-28}
+  WBD:
+    status: acquired
+    acquirer: SKYD
+    last_session: 2026-10-07
+    note: Paramount Skydance merger; combined company trades as SKYD
+  WOW: {status: acquired, acquirer: DigitalBridge / Crestview, last_session: 2025-12-30}
+  X: {status: acquired, acquirer: Nippon Steel, last_session: 2025-06-18}
+
+  # ── delisted ────────────────────────────────────────────────────────────────
+  ELME:
+    status: delisted
+    last_session: 2026-10-23
+    note: liquidated; NYSE delisting 2026-11, assets moved to a liquidating trust
+  PTR:
+    status: delisted
+    note: PetroChina NYSE ADS delisted 2022-09; Tiingo PTR now resolves to an ASX stock
+  SNP:
+    status: delisted
+    note: Sinopec NYSE ADS delisted 2022-09
+
+  # ── foreign listings ────────────────────────────────────────────────────────
+  FCPO:
+    status: foreign_listing
+    note: Bursa Malaysia palm oil futures; Tiingo FCPO is Factory Card & Party Outlet
+  JDEP:
+    status: foreign_listing
+    note: Euronext Amsterdam; OTC ADR JDEPY exists
+  UMG:
+    status: foreign_listing
+    note: Euronext Amsterdam; Tiingo UMG is United Malt (ASX), OTC ADR UNVGY exists
