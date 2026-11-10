@@ -257,11 +257,14 @@ def _extract_json_blob(raw: str) -> str | None:
     return None
 
 
-def parse_red_team_response(raw: str) -> list[CounterArgument]:
+def parse_red_team_response(raw: str, *, strict_scores: bool = False) -> list[CounterArgument]:
     """Tolerantly parse an LLM response into ``CounterArgument`` objects.
 
     Returns ``[]`` on ANY failure (empty input, missing JSON, malformed
-    schema, etc.) — never raises.
+    schema, etc.) — never raises. ``strict_scores`` rejects the whole response
+    if any counter lacks finite numeric scores in [0, 1], and computes grades
+    from those scores instead of accepting a model-supplied grade. Legacy
+    callers retain their tolerant behavior by default.
     """
     blob = _extract_json_blob(raw)
     if blob is None:
@@ -282,16 +285,26 @@ def parse_red_team_response(raw: str) -> list[CounterArgument]:
     counters: list[CounterArgument] = []
     for item in raw_counters:
         if not isinstance(item, dict):
+            if strict_scores:
+                return []
             continue
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
+            if strict_scores:
+                return []
             continue
+        if strict_scores:
+            for key in ("severity", "plausibility"):
+                value = item.get(key)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not 0.0 <= value <= 1.0):
+                    return []
         severity = _clamp01(item.get("severity"))
         plausibility = _clamp01(item.get("plausibility"))
         grade_raw = item.get("grade")
         grade = (
             _clamp01(grade_raw)
-            if grade_raw is not None
+            if grade_raw is not None and not strict_scores
             else _composite_grade(severity, plausibility)
         )
         counters.append(
@@ -361,6 +374,7 @@ def red_team_prediction(
     signal_summaries: list[str],
     *,
     llm_client: Any = None,
+    strict_scores: bool = False,
 ) -> RedTeamReport:
     """Run the red-team loop for a single oracle prediction.
 
@@ -380,6 +394,10 @@ def red_team_prediction(
         Optional duck-typed LLM client. Must expose either ``.generate(prompt)``
         or ``.chat(messages)``. When ``None`` (default) we lazy-import
         ``llm.router.get_llm(Tier.LOCAL)``. Tests inject a mock.
+
+    strict_scores:
+        Reject incomplete or invalid counter scores rather than coercing them;
+        recompute each grade deterministically. Defaults to legacy tolerance.
 
     Returns
     -------
@@ -427,7 +445,7 @@ def red_team_prediction(
     if not raw_response:
         return empty_report
 
-    counters = parse_red_team_response(raw_response)
+    counters = parse_red_team_response(raw_response, strict_scores=strict_scores)
     if not counters:
         return empty_report
 
