@@ -2656,8 +2656,10 @@ class AstroGridStore:
             # rotation_variant_* runs built on the mixed-basis _full price
             # panel, docs/reference/PRICE_PANEL_BASIS.md) keeps its rows as
             # history but is never listed as a result.
-            f"NOT EXISTS (SELECT 1 FROM {self.schema}.backtest_run inv "
-            "WHERE inv.id = br.backtest_run_id AND inv.summary_payload -> 'invalidated' IS NOT NULL)",
+            (
+                f"NOT EXISTS (SELECT 1 FROM {self.schema}.backtest_run inv "
+                "WHERE inv.id = br.backtest_run_id AND inv.summary_payload -> 'invalidated' IS NOT NULL)"
+            ),
         ]
         params: dict[str, Any] = {"limit": limit, "legacy_char_symbol": LEGACY_CHAR_LIST_TARGET_SYMBOL}
         if strategy_variant:
