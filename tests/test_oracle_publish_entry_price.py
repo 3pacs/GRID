@@ -61,6 +61,11 @@ class _Conn:
             if self._engine.spot_raises:
                 raise RuntimeError("options_daily_signals is not there")
             return _Result(self._engine.spot_rows)
+        if "INSERT INTO oracle_predictions" in sql:
+            return _Result([(params["id"],)])
+        if "SELECT entry_price, signals FROM oracle_predictions" in sql:
+            inserted = _insert_params(self._engine)
+            return _Result([(inserted["entry_price"], json.loads(inserted["signals"]))])
         return _Result([])
 
     def __enter__(self):
@@ -249,11 +254,9 @@ class TestNullWritePolicyStamp:
         from oracle import publish
 
         src = inspect.getsource(publish.publish_astrogrid_prediction)
-        do_update = src[src.index("DO UPDATE SET"):src.index('"id": oracle_prediction_id')]
-        assert "null_write_policy" not in do_update, (
-            "the stamp is written once at INSERT and must never be "
-            "reset on the dedup ON CONFLICT UPDATE path"
-        )
+        assert "DO UPDATE SET" not in src
+        assert "DO NOTHING RETURNING id" in src
+
 
 
 # -- Scoring consumers -------------------------------------------------------

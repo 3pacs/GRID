@@ -1,4 +1,4 @@
-"""Evidence behind each oracle model, on corrected outcomes.
+"""Exploratory relative performance of oracle models on corrected outcomes.
 
 The scoreboard counts predictions, but predictions are not independent:
 models issue hundreds of calls that expire on the same date, so one market
@@ -6,8 +6,9 @@ move scores them all together (options_flow's 351 scored calls fall on 2
 expiry dates). A hit rate or a per-prediction bootstrap over them overstates
 the evidence by orders of magnitude (read-only audit, 2026-11-08).
 
-This module measures each model the way a rule is judged elsewhere in GRID
-(mean net expectancy, bootstrap lower bound > 0 at alpha/k):
+This comparison is not a financial-edge gate: returns are gross, forecasts
+overlap, the comparator is other forecasts, and outcomes include hindsight.
+A model can outperform its peers while every forecast loses money.
 
 * Outcomes: the corrected outcome per ``dedup_keep`` prediction -- a
   split-adjusted rescore, else a hindsight rescore, else the official
@@ -16,7 +17,7 @@ This module measures each model the way a rule is judged elsewhere in GRID
 * Excess: ``pnl_pct`` minus the mean of every prediction with the same
   direction and expiry, so a model that only bets one way is not credited
   with the market's drift.
-* Independent windows: distinct expiry dates. The lower bound is a cluster
+* Clusters: distinct expiry dates (not proven independent). The lower bound is a cluster
   bootstrap over expiry dates, and a model needs ``MIN_WINDOWS`` of them
   before it gets a verdict at all.
 * Implausible outcomes (|pnl_pct| > ``MAX_PLAUSIBLE_PNL_PCT``, i.e. price or
@@ -41,8 +42,8 @@ ALPHA = 0.05
 N_BOOT = 2000
 MAX_PLAUSIBLE_PNL_PCT = 100.0
 
-VERDICT_EDGE = "edge"
-VERDICT_NO_EDGE = "no_edge"
+VERDICT_RELATIVE_ADVANTAGE = "relative_advantage"
+VERDICT_NO_RELATIVE_ADVANTAGE = "no_relative_advantage"
 VERDICT_INSUFFICIENT = "insufficient_windows"
 
 _SPLIT_ADJUSTED = "oracle_rescore_split_adjusted_v1"
@@ -160,21 +161,26 @@ def build_evidence(
         if len(windows) >= min_windows:
             lb = _cluster_lower_bound(list(windows.values()), ALPHA / k, rng)
             row["lower_bound_pct"] = round(lb, 3)
-            row["verdict"] = VERDICT_EDGE if lb > 0 else VERDICT_NO_EDGE
+            row["verdict"] = (VERDICT_RELATIVE_ADVANTAGE if lb > 0
+                              else VERDICT_NO_RELATIVE_ADVANTAGE)
         else:
             row["verdict"] = VERDICT_INSUFFICIENT
         models.append(row)
 
-    order = {VERDICT_EDGE: 0, VERDICT_NO_EDGE: 1, VERDICT_INSUFFICIENT: 2}
+    order = {VERDICT_RELATIVE_ADVANTAGE: 0, VERDICT_NO_RELATIVE_ADVANTAGE: 1,
+             VERDICT_INSUFFICIENT: 2}
     models.sort(key=lambda r: (order[r["verdict"]], -r["windows"], -r["outcomes"]))
 
     official = [o for o in plausible if o.basis == "official"]
     corrected = [o for o in plausible if o.basis != "official"]
     return {
+        "evidence_class": "exploratory_relative_comparison",
+        "financial_edge_demonstrated": False,
         "method": {
             "outcome_basis": "split-adjusted rescore > hindsight rescore > official verdict",
             "excess": "pnl_pct minus the mean of same-direction, same-expiry predictions (all models)",
-            "independent_window": "expiry date",
+            "cluster_unit": "expiry date; overlapping horizons may remain dependent",
+            "return_basis": "gross signed forecast return, not portfolio P&L or net expectancy",
             "lower_bound": f"expiry-cluster bootstrap, one-sided alpha {ALPHA}/k, k = models with >= {min_windows} windows",
             "min_windows": min_windows,
             "min_outcomes_shown": MIN_OUTCOMES_SHOWN,
@@ -191,7 +197,11 @@ def build_evidence(
             "models_shown": len(models),
             "models_hidden_small": hidden,
             "models_tested": len(tested),
-            "models_with_edge": sum(1 for r in models if r["verdict"] == VERDICT_EDGE),
+            # Keep the old count fail-closed for consumers awaiting upgrade.
+            "models_with_edge": 0,
+            "models_with_relative_advantage": sum(
+                1 for r in models if r["verdict"] == VERDICT_RELATIVE_ADVANTAGE
+            ),
             "mean_pnl_pct": round(sum(o.pnl for o in plausible) / len(plausible), 3) if plausible else None,
         },
         "models": models,

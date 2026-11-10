@@ -978,6 +978,12 @@ class OptionsPuller(BasePuller):
 
             quote = first.get("quote", {})
             spot_price = quote.get("regularMarketPrice")
+            # Bind the header spot to this exact first response, including
+            # an explicitly empty first expiry. Later page clocks cannot
+            # substantiate this price's observation time.
+            spot_market_at = _regular_market_time(quote, session_day)
+            spot_provider = getattr(self._yahoo, "provider_by_ticker", {}).get(
+                ticker, getattr(self._yahoo, "provider", None))
             if (not isinstance(spot_price, (int, float)) or isinstance(spot_price, bool)
                     or not math.isfinite(spot_price) or spot_price <= 0):
                 return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
@@ -1167,14 +1173,15 @@ class OptionsPuller(BasePuller):
                         "INSERT INTO options_capture_batches "
                         "(capture_batch_id, ticker, snap_date, capture_ordinal, "
                         "capture_started_at, capture_completed_at, row_count, "
-                        "spot_price, capture_source) "
+                        "spot_price, capture_source, provider_regular_market_at, spot_provider) "
                         "VALUES (:batch_id, :ticker, :snap_date, :ordinal, "
-                        ":started_at, :completed_at, :row_count, :spot, :source)"
+                        ":started_at, :completed_at, :row_count, :spot, :source, :spot_market_at, :spot_provider)"
                     ),
                     {"batch_id": batch_id, "ticker": ticker, "snap_date": today_str,
                      "ordinal": capture_ordinal, "started_at": capture_started_at,
                      "completed_at": completed_at, "row_count": len(batch_rows),
-                     "spot": float(spot_price), "source": capture_source},
+                     "spot": float(spot_price), "source": capture_source,
+                     "spot_market_at": spot_market_at, "spot_provider": spot_provider},
                 )
                 snapshots_inserted = 0
                 rows_known = True

@@ -16,6 +16,13 @@ from oracle.engine import EnsemblePrediction
 
 
 @pytest.fixture(autouse=True)
+def _admit_synthetic_models(monkeypatch):
+    """These math fixtures supply explicitly active synthetic model heads."""
+    monkeypatch.setattr("oracle.model_factory.ModelFactory.active_model_names",
+                        lambda conn, names, **kw: set(names))
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_sweep_multipliers():
     """Patch the SWEEP multipliers (CAT-124/182 + ALPHA-8/9) to no-op so the
     catalyst-specific tests in this file see the pre-sweep confidence path.

@@ -768,6 +768,8 @@ IF to_regclass('options_snapshots') IS NULL THEN
         capture_completed_at TIMESTAMPTZ NOT NULL,
         row_count            INTEGER NOT NULL CHECK (row_count > 0),
         spot_price           DOUBLE PRECISION,
+        provider_regular_market_at TIMESTAMPTZ,
+        spot_provider        TEXT,
         capture_source       TEXT NOT NULL,
         backfilled           BOOLEAN NOT NULL DEFAULT false,
         registered_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),

@@ -79,6 +79,24 @@ def test_crypto_trades_every_day():
     assert sot.close_series_id("BTC") == "YF:BTC-USD:close"
 
 
+@pytest.mark.parametrize("day", [date(2026, 11, 27), date(2026, 12, 24),
+                                 date(2027, 11, 26), date(2028, 7, 3)])
+def test_cash_equity_half_day_closes_at_one_eastern(day):
+    assert sot.session_close_utc("SPY", day) == datetime.combine(day, time(13), NY).astimezone(UTC)
+    # A decision after an early close has not forecast that session's result.
+    result = sot.resolve_expiry_close(
+        _book("SPY", {day: 101}), "SPY", day,
+        created_at=datetime.combine(day, time(13, 1), NY),
+        now=datetime.combine(day, time(20), NY),
+    )
+    assert result.status == "no_data" and result.note == sot.NOTE_NO_SESSION
+
+
+def test_day_before_observed_independence_holiday_is_not_invented_half_day():
+    day = date(2026, 7, 2)
+    assert sot.session_close_utc("SPY", day) == datetime.combine(day, time(16), NY).astimezone(UTC)
+
+
 def test_close_series_is_raw_close_never_adjusted():
     assert sot.close_series_id("AAPL") == "YF:AAPL:close"
     assert "adj_close" not in sot.close_series_id("AAPL")
@@ -140,6 +158,11 @@ def test_classify_outcome_matches_the_scorer_thresholds():
     assert sot.classify_outcome("CALL", 100.0, 102.0, 10.0)[0] == "partial"
     assert sot.classify_outcome("PUT", 100.0, 102.0, -10.0)[0] == "miss"
     assert sot.classify_outcome("NONE", 100.0, 102.0, 1.0) is None
+
+
+def test_explicit_zero_expected_move_is_not_replaced_with_a_one_percent_target():
+    assert sot.classify_outcome("CALL", 100.0, 100.1, 0.0)[0] == "hit"
+    assert sot.classify_outcome("CALL", 100.0, 100.1, None)[0] == "partial"
 
 
 # ── load_expiry_closes over raw_series (SQLite stand-in) ───────────────────
@@ -279,6 +302,259 @@ def test_chunk_walk_leaves_awaiting_rows_pending_and_terminates():
         notes = c.execute(text("SELECT score_notes FROM oracle_predictions WHERE id='b-1'")).scalar()
     assert verdicts == {"a-1": "pending", "a-2": "pending", "b-1": "miss"}
     assert sot.EXPIRY_CLOSE_RULE in notes and "close 2026-11-02 TIINGO" in notes
+
+
+def _scheduled_oracle(eng):
+    """Real scheduled scorer, no schema bootstrapping or model calls."""
+    obj = object.__new__(oracle.engine.OracleEngine)
+    obj.engine = eng
+    obj.models = []
+    obj._write_verdict_lessons = lambda verdicts: 0
+    return obj
+
+
+def test_scheduled_engine_waits_for_settled_close_and_scores_once():
+    eng = _pred_engine()
+    with eng.begin() as c:
+        _pred(c, "live", "SPY", TUE)
+        _raw(c, "YF:SPY:close", 1, MON, 130.0, _ny(MON, 19))
+        _raw(c, "YF:SPY:close", 1, TUE, 120.0, _ny(TUE, 11))
+        _raw(c, "YF:SPY:adj_close", 1, TUE, 70.0, _ny(TUE, 19))
+        # Present in the fixture but unavailable to a preclose scoring clock.
+        _raw(c, "YF:SPY:close", 1, TUE, 101.0, _ny(TUE, 19))
+    obj = _scheduled_oracle(eng)
+    before = obj.score_expired_predictions(now=_ny(TUE, 12))
+    assert before["pending_price"] == 1 and before["total"] == 0
+    with eng.connect() as c:
+        assert c.execute(text("SELECT verdict FROM oracle_predictions")).scalar() == "pending"
+    after = obj.score_expired_predictions(now=_ny(TUE, 20))
+    repeated = obj.score_expired_predictions(now=_ny(TUE, 21))
+    assert after["hits"] == 1 and repeated["total"] == 0
+    with eng.connect() as c:
+        row = c.execute(text("SELECT actual_price, score_notes FROM oracle_predictions")).one()
+        assert row[0] == 101.0
+        assert "close 2026-11-03 TIINGO" in row[1]
+        assert c.execute(text("SELECT predictions_made FROM oracle_models")).scalar() == 1
+
+
+def test_scheduled_engine_weekend_and_postclose_creation_boundary():
+    eng = _pred_engine()
+    with eng.begin() as c:
+        _pred(c, "before", "SPY", SUN)
+        _pred(c, "after", "SPY", SUN, created="2026-10-31 09:00:00")
+        _raw(c, "YF:SPY:close", 1, FRI, 101.0, _ny(FRI, 19))
+    counts = _scheduled_oracle(eng).score_expired_predictions(now=_ny(MON, 8))
+    assert counts["hits"] == 1 and counts["no_data"] == 1
+    with eng.connect() as c:
+        rows = {r[0]: r for r in c.execute(text("SELECT id, verdict, score_notes FROM oracle_predictions"))}
+    assert rows["before"][1] == "hit"
+    assert rows["after"][1:] == ("no_data", sot.NOTE_NO_SESSION)
+
+
+def test_scheduled_engine_missing_close_grace_does_not_substitute_old_price():
+    eng = _pred_engine()
+    with eng.begin() as c:
+        _pred(c, "missing", "SPY", TUE)
+        _raw(c, "YF:SPY:close", 1, MON, 150.0, _ny(MON, 19))
+    obj = _scheduled_oracle(eng)
+    assert obj.score_expired_predictions(now=_ny(TUE, 20))["pending_price"] == 1
+    assert obj.score_expired_predictions(now=_ny(TUE + timedelta(days=5), 20))["no_data"] == 1
+    with eng.connect() as c:
+        row = c.execute(text("SELECT verdict, actual_price, score_notes FROM oracle_predictions")).one()
+    assert row == ("no_data", None, sot.NOTE_NO_PRICE)
+
+
+@pytest.mark.parametrize("scorer", ["scheduled", "manual"])
+def test_stale_selected_row_cannot_double_count_or_overwrite_verdict(monkeypatch, scorer):
+    """Replay the stale SELECT an overlapping worker held before the winner committed."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    eng = _pred_engine()
+    now = _ny(TUE, 20)
+    with eng.begin() as c:
+        _pred(c, "race", "SPY", TUE)
+        _raw(c, "YF:SPY:close", 1, TUE, 101.0, _ny(TUE, 19))
+        cols = ("id, ticker, direction, target_price, entry_price, expiry, confidence, "
+                "expected_move_pct, model_name, ")
+        cols += "null_write_policy, created_at" if scorer == "scheduled" else "signals, created_at"
+        stale = c.execute(text("SELECT " + cols + " FROM oracle_predictions")).fetchall()
+    obj = _scheduled_oracle(eng)
+    assert obj.score_expired_predictions(now=now)["hits"] == 1
+
+    class StaleSelection:
+        def __init__(self, conn):
+            self.conn = conn
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if sql.lstrip().startswith("SELECT id,") and "FROM oracle_predictions" in sql:
+                return SimpleNamespace(fetchall=lambda: stale)
+            return self.conn.execute(stmt, params or {})
+        def __getattr__(self, key):
+            return getattr(self.conn, key)
+
+    @contextmanager
+    def stale_begin():
+        with eng.begin() as conn:
+            yield StaleSelection(conn)
+
+    lessons = []
+    if scorer == "scheduled":
+        obj.engine = SimpleNamespace(begin=stale_begin)
+        obj._write_verdict_lessons = lambda rows: lessons.extend(rows) or len(rows)
+        counts = obj.score_expired_predictions(now=now)
+        assert counts["total"] == 0 and counts["hits"] == 0
+    else:
+        monkeypatch.setattr(sot, "_record_success_lesson_safe", lambda **kw: lessons.append(kw))
+        with stale_begin() as c:
+            counts = sot.score_one_chunk(c, engine=eng, prices=_book("SPY", {TUE: 101.0}),
+                                         today=TUE, chunk_size=10, now=now)
+        assert counts["scored"] == 0 and counts["hits"] == 0
+    assert lessons == []
+    with eng.connect() as c:
+        assert c.execute(text("SELECT predictions_made, hits FROM oracle_models")).one() == (1, 1)
+
+
+def test_generation_passes_database_engine_to_calibration(monkeypatch):
+    obj = _scheduled_oracle(_pred_engine())
+    obj._store_predictions = lambda rows: rows
+    obj._load_models = lambda: [oracle.engine.OracleModel("m", "1", "fixture", [])]
+    obj._oracle_one_ticker = lambda *args, **kwargs: []
+    captured = []
+    monkeypatch.setattr("oracle.hallucination_guard.verify_predictions", lambda rows, **kw:
+                        (captured.append(kw["calibration_report"]) or rows, []))
+    assert obj.generate_predictions(["SPY"]) == []
+    assert captured[0] is not None
+    assert captured[0].label == "insufficient_data"
+
+
+def test_decision_timestamp_is_after_guard_inputs_and_only_committed_rows_return(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    oe = oracle.engine
+    before = datetime(2026, 11, 10, 20, 59, tzinfo=UTC)
+    after = datetime(2026, 11, 10, 21, 1, tzinfo=UTC)
+    clock = {"now": before}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    model = oe.OracleModel("fixture", "1", "fixture", [])
+    prediction = oe.OraclePrediction(
+        id="candidate", timestamp=before, ticker="SPY",
+        prediction_type=oe.PredictionType.DIRECTION, direction="CALL",
+        target_price=110, current_price=100, expiry=date(2026, 11, 13),
+        confidence=0.6, expected_move_pct=10, model_name="fixture",
+    )
+    obj = oe.OracleEngine.__new__(oe.OracleEngine)
+    obj.engine = object()
+    obj._load_models = lambda: [model]
+    obj._oracle_one_ticker = lambda *a, **kw: [prediction]
+    captured = []
+
+    def guard(rows, **kwargs):
+        clock["now"] = after
+        return rows, []
+
+    def store(rows):
+        captured.extend(rows)
+        return [replace(rows[0], id="committed")]
+
+    obj._store_predictions = store
+    monkeypatch.setenv("GRID_ORACLE_PARALLELISM", "1")
+    monkeypatch.setattr(oe, "datetime", Clock)
+    monkeypatch.setattr("oracle.calibration.compute_calibration", lambda engine: SimpleNamespace())
+    monkeypatch.setattr("oracle.hallucination_guard.verify_predictions", guard)
+    result = obj.generate_predictions(["SPY"])
+    assert captured[0].timestamp == after
+    assert captured[0].timestamp > sot.session_close_utc("SPY", before.date())
+    assert [p.id for p in result] == ["committed"]
+
+
+def test_hourly_verdict_lessons_are_queued_without_writing_before_commit(monkeypatch):
+    eng = _pred_engine()
+    with eng.begin() as conn:
+        _pred(conn, "rollback", "SPY", TUE)
+    emitted, queued = [], []
+    monkeypatch.setattr(sot, "_record_success_lesson_safe", lambda **kw: emitted.append(kw))
+    with pytest.raises(RuntimeError, match="force rollback"):
+        with eng.begin() as conn:
+            result = sot.score_one_chunk(
+                conn, engine=eng, prices=_book("SPY", {TUE: 101}), today=TUE,
+                chunk_size=10, now=_ny(TUE, 20), verdicts_after_commit=queued,
+            )
+            assert result["hits"] == 1 and len(queued) == 1
+            assert emitted == []
+            raise RuntimeError("force rollback")
+    assert emitted == []
+    with eng.connect() as conn:
+        assert conn.execute(text("SELECT verdict FROM oracle_predictions WHERE id='rollback'")).scalar() == "pending"
+
+
+@pytest.mark.parametrize("competitor", ["scheduled", "hourly"])
+def test_postgres_competing_scorers_count_and_emit_once(pg_engine, monkeypatch, competitor):
+    """Two real PG transactions select pending before either updates it."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from uuid import uuid4
+
+    from sqlalchemy.schema import CreateSchema, DropSchema
+
+    schema = "oracle_race_" + uuid4().hex
+    with pg_engine.begin() as c:
+        c.execute(CreateSchema(schema))
+    eng = create_engine(pg_engine.url, connect_args={
+        "options": "-csearch_path=" + schema + " -cstatement_timeout=10000 -clock_timeout=5000",
+    })
+    try:
+        with eng.begin() as c:
+            c.execute(text(_PRED_DDL.replace("DEFAULT 1", "DEFAULT TRUE")))
+            c.execute(text(
+                "CREATE TABLE oracle_models (name TEXT PRIMARY KEY, predictions_made INTEGER DEFAULT 0, "
+                "hits INTEGER DEFAULT 0, misses INTEGER DEFAULT 0, partials INTEGER DEFAULT 0, "
+                "cumulative_pnl DOUBLE PRECISION DEFAULT 0, last_updated TIMESTAMPTZ)"
+            ))
+            c.execute(text("INSERT INTO oracle_models (name) VALUES ('m')"))
+            _pred(c, "race", "SPY", TUE, keep=True)
+        book = _book("SPY", {TUE: 101.0})
+        monkeypatch.setattr(sot, "load_expiry_closes", lambda *a, **kw: book)
+        monkeypatch.setattr(sot, "load_split_book", lambda *a, **kw: {})
+        lessons = []
+        monkeypatch.setattr(sot, "_record_success_lesson_safe", lambda **kw: lessons.append(kw))
+        barrier = Barrier(2, timeout=5)
+
+        @event.listens_for(eng, "after_cursor_execute")
+        def after_select(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().startswith("SELECT id,") and "FROM oracle_predictions" in statement:
+                barrier.wait()
+
+        def run(which):
+            if which == "hourly":
+                queued = []
+                with eng.begin() as c:
+                    result = sot.score_one_chunk(c, engine=eng, prices=book, today=TUE,
+                                                 chunk_size=10, now=_ny(TUE, 20),
+                                                 verdicts_after_commit=queued)["scored"]
+                lessons.extend(queued)
+                return result
+            obj = _scheduled_oracle(eng)
+            obj._write_verdict_lessons = lambda rows: lessons.extend(rows) or len(rows)
+            return obj.score_expired_predictions(now=_ny(TUE, 20))["total"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(run, "scheduled"), pool.submit(run, competitor)]
+            assert sorted(f.result(timeout=15) for f in futures) == [0, 1]
+        assert len(lessons) == 1
+        with eng.connect() as c:
+            assert c.execute(text("SELECT predictions_made, hits FROM oracle_models")).one() == (1, 1)
+            assert c.execute(text("SELECT actual_price, verdict FROM oracle_predictions")).one() == (101.0, "hit")
+    finally:
+        eng.dispose()
+        with pg_engine.begin() as c:
+            c.execute(DropSchema(schema, cascade=True))
 
 
 # ── hindsight rescore ───────────────────────────────────────────────────────

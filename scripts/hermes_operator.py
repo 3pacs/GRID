@@ -194,6 +194,11 @@ ORACLE_CYCLE_TIMEOUT_SECONDS = 4000           # oracle.run_cycle: 41 tickers x ~
 # Admission reserve for timeout/report bookkeeping and cycle cleanup. Do not
 # shrink the oracle's quality budget to fit a cycle delayed by ingestion.
 ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS = 300
+# The initial measured cohort is two liquid tickers, without model evolution.
+# Its own bound does not reduce the broad Oracle API's historical budget.
+ORACLE_FORWARD_TIMEOUT_SECONDS = 300
+ORACLE_FORWARD_TICKERS = ("SPY", "QQQ")
+ORACLE_FORWARD_ATTEMPT_NOTE = "oracle_forward_v2:SPY_QQQ:1d:attempt;evolution_held"
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
@@ -471,6 +476,177 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         state.cooldowns.record_attempt(name, success=False, error=str(exc))
         ex.shutdown(wait=False, cancel_futures=True)
         return None, False
+
+
+def _oracle_forward_regular_session(now: datetime) -> bool:
+    """Only the actual NY cash session, including holiday early closes."""
+    from datetime import time as wall_time
+    from zoneinfo import ZoneInfo
+    from ingestion.market_calendar import is_market_open, market_close_time
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        return False
+    local = now.astimezone(ZoneInfo("America/New_York"))
+    return (is_market_open(local.date())
+            and wall_time(9, 30) <= local.time() < market_close_time(local.date()))
+
+
+def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]) -> dict[str, Any]:
+    """Existing Oracle measurement, serialized and throttled across restarts.
+
+    The durable iteration row records an attempt, never success. The session
+    advisory lock stays owned by this worker even if the outer wait times out;
+    cooperative checks prevent an abandoned worker from starting later stages.
+    """
+    from ingestion.options import OptionsPuller, automatic_options_capture_guard
+    from oracle.engine import OracleEngine
+
+    started = datetime.now(timezone.utc)
+    policy = {"mode": "forward_measurement", "tickers": list(ORACLE_FORWARD_TICKERS),
+              "horizon_days": 1, "evolution": "held", "model_inference": "not_requested"}
+
+    def check():
+        if (not should_continue()
+                or not _oracle_forward_regular_session(datetime.now(timezone.utc))):
+            raise TimeoutError("Forward measurement deadline elapsed or equity session closed")
+
+    check()
+    oracle = OracleEngine(db_engine=engine)
+    with engine.connect() as lease:
+        locked = lease.execute(text(
+            "SELECT pg_try_advisory_lock(hashtext('oracle_forward_v2'), hashtext('SPY_QQQ_1d'))"
+        )).scalar_one()
+        if not locked:
+            return {"status": "deferred", "reason": "forward_pass_in_flight", **policy}
+        try:
+            last = lease.execute(text("""
+                SELECT MAX(iteration_at) FROM oracle_iterations WHERE notes = :note
+            """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE}).scalar_one()
+            lease.commit()  # Session lock remains held across this commit.
+            check()
+            if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 3600:
+                return {"status": "deferred", "reason": "hourly_attempt_already_recorded", **policy}
+            # Commit the attempt before any provider request; retries/restarts
+            # cannot turn an unsuccessful attempt into repeated hourly work.
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO oracle_iterations
+                    (iteration_at, models_updated, predictions_scored, notes)
+                    VALUES (clock_timestamp(), 0, 0, :note)
+                """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE})
+            check()
+            scoring = oracle.score_expired_predictions()
+            check()
+            guarded = automatic_options_capture_guard(engine)
+            if guarded is not None:
+                return {"status": "deferred", "reason": "options_writer_policy",
+                        "scoring": scoring, **policy}
+            capture = OptionsPuller(db_engine=engine).pull_all(
+                list(ORACLE_FORWARD_TICKERS), capture_source="oracle_forward",
+                should_continue=should_continue,
+            )
+            check()
+            captured = [ticker for ticker in ORACLE_FORWARD_TICKERS
+                        if any(row.get("ticker") == ticker and row.get("status") == "SUCCESS"
+                               for row in capture)]
+            if not captured:
+                return {"status": "abstained", "reason": "no_fresh_cohort_capture",
+                        "new_predictions": 0, "scoring": scoring, **policy}
+            # No run_cycle/evolve_weights/ModelEvolver/TraceEvolver or fresh
+            # TimesFM inference in this initial observation-only cohort.
+            predictions = oracle.generate_predictions(
+                captured, horizon_days=1, should_continue=should_continue,
+            )
+            check()
+            counts = oracle._last_store_counts
+            result = {
+                **policy,
+                "status": ("partial" if len(captured) < len(ORACLE_FORWARD_TICKERS)
+                           or counts.get("failed_tickers", 0) else "completed"),
+                "cycle_started_at": started.isoformat(),
+                "cycle_completed_at": datetime.now(timezone.utc).isoformat(),
+                "scoring": scoring, "evolution": {"mode": "held", "changes": {}},
+                "trace_evolution": {"mode": "held"},
+                "new_predictions": len(predictions),
+                "distinct_positions_written": counts.get("qualified", 0),
+                "new_abstentions": counts.get("abstentions", 0),
+                "new_record_rows": counts.get("inserted", 0),
+                "duplicates": counts.get("duplicates", 0),
+                "unchanged_forecasts": counts.get("duplicates", 0),
+                "rejected": counts.get("rejected", 0),
+                "rejected_models": counts.get("rejected", 0),
+                "failed_tickers": counts.get("failed_tickers", 0),
+                "positions_updated": counts.get("updated", 0),
+                "upsert_statements": counts.get("upsert_statements", 0),
+                "captured_tickers": captured,
+                "top_predictions": [p.to_dict() for p in predictions[:10]],
+                "leaderboard": oracle._get_leaderboard(),
+                "hallucination_guard": {},
+            }
+            return result
+        finally:
+            # Roll back any failed catalogue read before releasing the session
+            # lock; returning a locked connection to the pool would leak it.
+            lease.rollback()
+            lease.execute(text(
+                "SELECT pg_advisory_unlock(hashtext('oracle_forward_v2'), hashtext('SPY_QQQ_1d'))"
+            ))
+            lease.commit()
+
+
+def _run_oracle_forward_step(
+    engine: Any, state: OperatorState, dry_run: bool,
+    cycle_result: dict[str, Any], cycle_deadline: float,
+) -> None:
+    """Hourly regular-session admission in the existing Hermes Oracle slot."""
+    now = datetime.now(timezone.utc)
+    if not _oracle_forward_regular_session(now):
+        cycle_result["oracle"] = {"status": "deferred", "reason": "regular_session_closed"}
+        return
+    if state.last_oracle_cycle is not None and (now - state.last_oracle_cycle).total_seconds() < 3600:
+        cycle_result["oracle"] = {"status": "deferred", "reason": "hourly_cadence"}
+        return
+    if not state.cooldowns.can_retry("oracle_cycle"):
+        cycle_result["oracle"] = {"status": "deferred", "reason": "timeout_or_failure_cooldown"}
+        return
+    budget_left = cycle_deadline - time.monotonic()
+    needed = ORACLE_FORWARD_TIMEOUT_SECONDS + ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS
+    if budget_left < needed:
+        cycle_result["oracle"] = {"status": "deferred", "reason": "insufficient_cycle_budget",
+                                  "budget_left_s": round(budget_left, 1), "required_s": needed}
+        return
+    if dry_run:
+        cycle_result["oracle"] = {"status": "deferred", "reason": "dry_run"}
+        return
+    state.current_step = "oracle_cycle"
+    state.last_oracle_cycle = now
+    cancelled = threading.Event()
+    deadline = min(cycle_deadline - ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS,
+                   time.monotonic() + ORACLE_FORWARD_TIMEOUT_SECONDS)
+
+    def should_continue():
+        return (not cancelled.is_set() and time.monotonic() < deadline
+                and _oracle_forward_regular_session(datetime.now(timezone.utc)))
+
+    try:
+        result, ok = _run_with_timeout(
+            "oracle_cycle",
+            lambda: _run_oracle_forward_pass(engine, should_continue=should_continue),
+            ORACLE_FORWARD_TIMEOUT_SECONDS, state,
+        )
+        if not ok or not result:
+            cycle_result["oracle"] = {"status": "failed", "reason": "timeout_or_worker_failure"}
+            return
+        cycle_result["oracle"] = result
+        if result.get("status") in {"completed", "partial"}:
+            state.cooldowns.record_attempt("oracle_cycle", success=True)
+            if result.get("new_predictions", 0) > 0:
+                from oracle.report import send_oracle_report
+                send_oracle_report(result)
+    finally:
+        # Covers timeout, errors and successful return; orphan callbacks never
+        # regain admission on a later cycle or after a wall-clock rollback.
+        cancelled.set()
 
 
 class _AutoresearchGenerationTracker:
@@ -4239,64 +4415,13 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("AstroGrid celestial cycle failed: {e}", e=str(exc))
 
-    # 7d. Oracle prediction cycle (every 6 hours)
+    # 7d. Bounded prospective cohort: hourly, regular session only. Model
+    # evolution/promotion stays held; hourly cron independently grades expiry.
     try:
-        now = datetime.now(timezone.utc)
-        hours_since_oracle = 999
-        if state.last_oracle_cycle is not None:
-            hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
-        if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
-            budget_left = cycle_deadline - time.monotonic()
-            needed = ORACLE_CYCLE_TIMEOUT_SECONDS + ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS
-            if budget_left < needed:
-                log.info(
-                    "Oracle cycle deferred — {b:.0f}s of cycle budget left, needs {n}s including cleanup",
-                    b=budget_left, n=needed,
-                )
-                cycle_result["oracle"] = {
-                    "deferred": "insufficient_cycle_budget",
-                    "budget_left_s": round(budget_left, 1),
-                    "required_s": needed,
-                }
-            else:
-                state.current_step = "oracle_cycle"
-                log.info("Running Oracle prediction cycle...")
-                # Record start only after admission: an orphan can still write
-                # predictions after its inner timeout, so an actual dispatch
-                # must not refire for 6h. A budget deferral leaves this untouched.
-                state.last_oracle_cycle = now
-                if not dry_run:
-                    from oracle.engine import OracleEngine
-                    from oracle.report import send_oracle_report
-
-                    def _oracle_call():
-                        oracle = OracleEngine(db_engine=engine)
-                        return oracle.run_cycle()
-
-                    oracle_result, ok = _run_with_timeout(
-                        "oracle_cycle", _oracle_call,
-                        ORACLE_CYCLE_TIMEOUT_SECONDS, state,
-                    )
-                    if ok and oracle_result:
-                        cycle_result["oracle"] = {
-                            "predictions": oracle_result["new_predictions"],
-                            "scoring": oracle_result["scoring"],
-                            "leaderboard": oracle_result.get("leaderboard", [])[:3],
-                        }
-                        if oracle_result["new_predictions"] > 0:
-                            send_oracle_report(oracle_result)
-                        state.last_oracle_cycle = now
-                        state.cooldowns.record_attempt("oracle_cycle", success=True)
-                else:
-                    log.info("[DRY RUN] Would run Oracle cycle")
-        elif hours_since_oracle >= 6:
-            log.info(
-                "Skipping oracle_cycle — blacklisted (timed out previously, "
-                "blacklist clears in {h}h)",
-                h=TIMEOUT_BLACKLIST_HOURS,
-            )
+        _run_oracle_forward_step(engine, state, dry_run, cycle_result, cycle_deadline)
     except Exception as exc:
-        log.warning("Oracle cycle failed: {e}", e=str(exc))
+        log.warning("Oracle forward measurement failed: {e}", e=str(exc))
+        cycle_result["oracle"] = {"status": "failed", "reason": "forward_step_error"}
         state.cooldowns.record_attempt("oracle_cycle", success=False, error=str(exc))
 
     # 7d-ii. TimesFM forecast cycle (every 6 hours, alongside oracle)

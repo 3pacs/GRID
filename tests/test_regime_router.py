@@ -31,6 +31,13 @@ import pytest
 from contracts.schemas import PredictionScored, SignalRef
 
 
+@pytest.fixture(autouse=True)
+def _admit_synthetic_models(monkeypatch):
+    """These math fixtures supply explicitly active synthetic model heads."""
+    monkeypatch.setattr("oracle.model_factory.ModelFactory.active_model_names",
+                        lambda conn, names, **kw: set(names))
+
+
 # ── Shared helpers ─────────────────────────────────────────────────────────
 
 

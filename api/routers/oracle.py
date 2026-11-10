@@ -16,10 +16,10 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 from oracle.engine import EnsemblePredictor, OracleEngine
 from oracle.entry_price_policy import (
-    PNL_BASIS_MEASURED,
-    PNL_BASIS_NO_SPOT,
     PNL_BASIS_SPOT_LOOKUP_FAILED,
     entry_price_pnl_basis,
+    load_quote_reference,
+    tracking_reference_return,
 )
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
@@ -70,14 +70,16 @@ class OraclePublishRequest(BaseModel):
 def get_predictions(
     ticker: str | None = Query(None, description="Filter by ticker"),
     model: str | None = Query(None, description="Filter by model name"),
-    status: str | None = Query(None, description="active / expired / scored"),
+    status: str | None = Query(None, description="active / expired / scored / unscorable / other"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    cohort: str = Query("all", description="prospective / legacy / external / all"),
     _token: str = Depends(require_auth),
 ) -> dict:
     """Active predictions with confidence, direction, signal/anti-signal."""
     engine = get_db_engine()
-    today = date.today()
+    request_at = datetime.now(timezone.utc)
+    today = request_at.date()
 
     # Security: where_clauses is built exclusively from static string literals.
     # The user-supplied 'status' param is consumed only as a branch selector —
@@ -92,12 +94,25 @@ def get_predictions(
     if model:
         where_clauses.append("model_name = :model")
         params["model"] = model
+    if cohort == "prospective":
+        where_clauses.append("recording_policy = 'oracle_forward_v2'")
+    elif cohort == "legacy":
+        where_clauses.append("recording_policy IS NULL")
+    elif cohort == "external":
+        where_clauses.append("recording_policy = 'oracle_external_v2'")
     if status == "active":
         where_clauses.append("verdict = 'pending' AND expiry > :today")
     elif status == "expired":
         where_clauses.append("verdict = 'pending' AND expiry <= :today")
     elif status == "scored":
         where_clauses.append("verdict IN ('hit', 'miss', 'partial')")
+    elif status == "unscorable":
+        where_clauses.append("verdict = 'no_data'")
+    elif status == "other":
+        where_clauses.append(
+            "(verdict IS NULL OR verdict NOT IN ('pending', 'hit', 'miss', 'partial', 'no_data') "
+            "OR (verdict = 'pending' AND expiry IS NULL))"
+        )
 
     where_sql = " AND ".join(["dedup_keep = TRUE"] + where_clauses)
 
@@ -115,7 +130,7 @@ def get_predictions(
                 "expected_move_pct, signal_strength, coherence, "
                 "model_name, model_version, signals, anti_signals, "
                 "flow_context, verdict, actual_price, actual_move_pct, "
-                "pnl_pct, scored_at, score_notes, null_write_policy "
+                "pnl_pct, scored_at, score_notes, null_write_policy, recording_policy "
                 "FROM oracle_predictions WHERE " + where_sql + " "
                 "ORDER BY created_at DESC LIMIT :lim OFFSET :off"
             ),
@@ -123,6 +138,7 @@ def get_predictions(
         ).fetchall()
 
     predictions = []
+    quote_cache: dict[str, dict] = {}
     for r in rows:
         expiry_date = r[7]
         if isinstance(expiry_date, str):
@@ -140,27 +156,27 @@ def get_predictions(
         # about — and never a stand-in entry price or a 0% return.
         tracking_pnl = None
         tracking_pnl_basis = None
+        tracking_quote = None
+        flow_context = r[16] if isinstance(r[16], dict) else {}
+        entry_receipt = flow_context.get("entry_price_basis")
+        if entry_receipt is None and isinstance(r[14], dict):
+            entry_receipt = r[14].get("entry_price_basis")
         if r[17] == "pending":
             entry_raw = r[6]
             tracking_pnl_basis = entry_price_pnl_basis(entry_raw)
             if tracking_pnl_basis is None:
                 try:
                     with engine.connect() as conn2:
-                        spot = conn2.execute(text("""
-                            SELECT spot_price FROM options_daily_signals
-                            WHERE ticker = :t AND spot_price > 0
-                            ORDER BY signal_date DESC LIMIT 1
-                        """), {"t": r[2]}).fetchone()
-                        if spot:
-                            current = float(spot[0])
-                            entry = float(entry_raw)
-                            move_pct = (current - entry) / entry * 100
-                            tracking_pnl = move_pct if r[4] == "CALL" else -move_pct
-                            tracking_pnl_basis = PNL_BASIS_MEASURED
-                        else:
-                            tracking_pnl_basis = PNL_BASIS_NO_SPOT
-                except Exception as e:
-                    log.warning("Oracle: spot price lookup failed for {t}: {e}", t=r[2], e=str(e))
+                        if r[2] not in quote_cache:
+                            quote_cache[r[2]] = load_quote_reference(conn2, r[2], as_of=request_at)
+                        tracking_quote = quote_cache[r[2]]
+                        tracking_pnl, tracking_pnl_basis = tracking_reference_return(
+                            conn2, ticker=r[2], direction=r[4], entry_price=entry_raw,
+                            entry_receipt=entry_receipt, decision_at=r[1], expiry=expiry_date,
+                            current_receipt=tracking_quote, as_of=datetime.now(timezone.utc),
+                        )
+                except Exception:
+                    log.warning("Oracle: qualified quote lookup failed for {t}", t=r[2])
                     tracking_pnl_basis = PNL_BASIS_SPOT_LOOKUP_FAILED
 
         predictions.append({
@@ -180,7 +196,10 @@ def get_predictions(
             "model_version": r[13],
             "signals": _unwrap_signals(r[14]),
             "anti_signals": r[15] if isinstance(r[15], list) else [],
-            "flow_context": r[16] if isinstance(r[16], dict) else {},
+            "flow_context": flow_context,
+            "entry_price_basis": entry_receipt,
+            "tracking_quote": tracking_quote,
+            "recording_policy": r[24],
             "verdict": r[17],
             "actual_price": r[18],
             "actual_move_pct": r[19],
@@ -204,6 +223,7 @@ def get_predictions(
         "limit": limit,
         "offset": offset,
         "has_more": (offset + limit) < total,
+        "cohort": cohort if isinstance(cohort, str) else "all",
     }
 
 
