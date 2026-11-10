@@ -415,10 +415,16 @@ def _http403(*_a: Any) -> list:
 class TestSocialSentiment:
     def test_success_persists_scan_and_reports_one_row(self) -> None:
         engine = _social_engine()
+        # Bracket the run: the series id carries the run's date, and a run
+        # that starts before midnight UTC and stores after it is still right
+        # (CI failed on 2026-11-10 00:05Z against the 23:52Z import-time date).
+        before = date.today()  # noqa: DTZ011 -- the puller dates the scan with date.today()
         out = _run_social(engine, lambda sub: list(_POSTS), lambda term: [])
+        after = date.today()  # noqa: DTZ011
         assert out["status"] == "SUCCESS" and out["rows_inserted"] == 1
         rows = engine.conn.inserts("raw_series")
-        assert len(rows) == 1 and rows[0]["sid"] == f"social_sentiment_{_TODAY.isoformat()}"
+        assert len(rows) == 1
+        assert rows[0]["sid"] in {f"social_sentiment_{d.isoformat()}" for d in (before, after)}
         # The stored payload is the scan, not the write-contract envelope.
         assert '"status"' not in rows[0]["payload"]
         assert _classify_outcome(out) == ("SUCCESS", 1, None)

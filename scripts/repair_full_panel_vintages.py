@@ -128,6 +128,12 @@ VALUE_TOL_REL = 1e-6
 VALUE_TOL_ABS = 1e-6
 OUTLIER_REL = 0.50
 OUTLIER_NEIGHBOURS = 5
+#: A neighbour more than this many calendar days from the date being judged
+#: is no evidence about it. Without the bound, a cell at the start of a long
+#: dark span was judged against cells years away: r3 (2026-11-09) rejected
+#: every honest DIS/DUK/LOW/MCD/LLY/MMM/MSTR 2010-2024 adj_close and the
+#: fresh ACN/HON backfill as "-50..-94 % vs neighbours" against 2021+ prices.
+OUTLIER_MAX_GAP_DAYS = 30
 #: Largest share of today's served cells a plan may leave dark before the
 #: feature is NEEDS_BACKFILL instead of applicable.
 DEFAULT_COVERAGE_FLOOR = 0.01
@@ -339,13 +345,30 @@ def latest_per_cell(rows: Iterable[ResolvedRow], keep: Callable[[ResolvedRow], b
 
 
 class NeighbourReference:
-    """Median of the latest on-basis values of the nearest cells around a date."""
+    """Median of the latest on-basis values of the nearest cells around a date.
 
-    def __init__(self, rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS) -> None:
-        self.ref = latest_per_cell(rows, lambda r: r.cls in (ON_BASIS, AMBIGUOUS))
-        self.dates = sorted(self.ref)
+    Only cells within ``max_gap_days`` of the date count as neighbours.
+    """
+
+    def __init__(self, rows: list[ResolvedRow], neighbours: int = OUTLIER_NEIGHBOURS,
+                 max_gap_days: int = OUTLIER_MAX_GAP_DAYS) -> None:
+        ref = latest_per_cell(rows, lambda r: r.cls in (ON_BASIS, AMBIGUOUS))
+        self._init({d: r.value for d, r in ref.items()}, neighbours, max_gap_days)
+
+    @classmethod
+    def from_values(cls, values: dict[date, float], neighbours: int = OUTLIER_NEIGHBOURS,
+                    max_gap_days: int = OUTLIER_MAX_GAP_DAYS) -> NeighbourReference:
+        """A reference over a plain date -> value map (e.g. raw candidates)."""
+        self = cls.__new__(cls)
+        self._init(values, neighbours, max_gap_days)
+        return self
+
+    def _init(self, values: dict[date, float], neighbours: int, max_gap_days: int) -> None:
+        self.ref = values
+        self.dates = sorted(values)
         self.pos = {d: i for i, d in enumerate(self.dates)}
         self.neighbours = neighbours
+        self.max_gap = timedelta(days=max_gap_days)
 
     def deviation(self, obs_date: date, value: float) -> float | None:
         """``value / median - 1`` against the neighbouring cells, or None when too few neighbours."""
@@ -359,7 +382,8 @@ class NeighbourReference:
             window = self.dates[max(0, i - n): i] + self.dates[i: i + n]
         else:
             window = self.dates[max(0, i - n): i] + self.dates[i + 1: i + 1 + n]
-        vals = [self.ref[d].value for d in window if self.ref[d].value > 0]
+        vals = [self.ref[d] for d in window
+                if self.ref[d] > 0 and abs(d - obs_date) <= self.max_gap]
         if len(vals) < 3:
             return None
         med = statistics.median(vals)
@@ -445,6 +469,11 @@ class FeaturePlan:
         d["retract"] = len(self.retract)
         d["revintage"] = len(self.revintage)
         d["revintage_rejected"] = len(self.revintage_rejected)
+        by_why: dict[str, int] = {}
+        for x in self.revintage_rejected:
+            key = re.sub(r"\s*\(.*\)$", "", x["why"])
+            by_why[key] = by_why.get(key, 0) + 1
+        d["revintage_rejected_by_why"] = by_why
         d["applicable"] = self.applicable
         return d
 
@@ -509,6 +538,19 @@ def plan_feature(
     # the retractions (OUTLIER rows are no longer ON_BASIS, so a junk print
     # never anchors its own neighbourhood).
     reference = NeighbourReference(rows)
+    # Where no served cell is near (a long dark span: every cell of a stretch
+    # was raw-basis), judge a candidate against the candidates of the nearby
+    # dark dates instead: the on-basis raw series must agree with itself, so a
+    # junk print inside the span is still caught.
+    candidate_ref = NeighbourReference.from_values({
+        d: max(raw[target][d], key=lambda c: c.pull_date).value
+        for d in dark if raw.get(target, {}).get(d) and d in raw.get("close", {})
+    })
+
+    def deviation(d: date, value: float) -> float | None:
+        pct = reference.deviation(d, value)
+        return candidate_ref.deviation(d, value) if pct is None else pct
+
     for d in dark:
         cands = raw.get(target, {}).get(d, [])
         if not cands:
@@ -519,13 +561,13 @@ def plan_feature(
             plan.revintage_rejected.append({"obs_date": d.isoformat(), "why": "no raw close row: not a trading day"})
             continue
         best = max(cands, key=lambda c: c.pull_date)
-        pct = reference.deviation(d, best.value)
+        pct = deviation(d, best.value)
         if pct is not None and abs(pct) > OUTLIER_REL:
             # The latest on-basis raw value is itself a junk print (the r2 plan
             # would have re-inserted XLP's 0.6 holiday prints under today's
             # vintage). Try the latest sane candidate instead.
             sane = [c for c in sorted(cands, key=lambda c: c.pull_date, reverse=True)
-                    if (p2 := reference.deviation(d, c.value)) is None or abs(p2) <= OUTLIER_REL]
+                    if (p2 := deviation(d, c.value)) is None or abs(p2) <= OUTLIER_REL]
             if not sane:
                 plan.revintage_rejected.append({"obs_date": d.isoformat(), "value": best.value,
                                                 "why": f"every on-basis raw value is an outlier ({pct:+.0%} vs neighbours)"})
