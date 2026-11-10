@@ -503,8 +503,11 @@ def test_postgres_competing_scorers_count_and_emit_once(pg_engine, monkeypatch, 
 
     from sqlalchemy.schema import CreateSchema, DropSchema
 
+    if not (pg_engine.url.database or "").endswith("_test"):
+        pytest.skip("Scorer concurrency proof requires a disposable _test database")
     schema = "oracle_race_" + uuid4().hex
     with pg_engine.begin() as c:
+        assert c.execute(text("SELECT current_database()")).scalar_one().endswith("_test")
         c.execute(CreateSchema(schema))
     eng = create_engine(pg_engine.url, connect_args={
         "options": "-csearch_path=" + schema + " -cstatement_timeout=10000 -clock_timeout=5000",

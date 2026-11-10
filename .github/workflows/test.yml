@@ -232,6 +232,29 @@ jobs:
             exit 1
           fi
 
+      # Each database fixture uses a private schema. Run the competing
+      # writers, scorers and hourly advisory-lock tests serially.
+      - name: Oracle forward measurement PostgreSQL contracts
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest -q -rA \
+            tests/test_forecaster_identity_pg.py \
+            tests/test_oracle_registry_ticker_scope.py \
+            tests/test_hermes_timeout_budgets.py::test_forward_pass_captures_before_inputs_and_durable_hourly_gate_survives_restart \
+            tests/test_hermes_timeout_budgets.py::test_forward_capture_failure_never_generates_and_attempt_remains_durable \
+            tests/test_hermes_timeout_budgets.py::test_forward_existing_worker_lock_defers_without_capture_or_attempt \
+            tests/test_score_oracle_trades_expiry_close.py::test_postgres_competing_scorers_count_and_emit_once \
+            | tee /tmp/grid-oracle-forward-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-oracle-forward-pg.txt; then
+            echo "::error::An Oracle forward measurement PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # fix/cap-future-dated-reads-20260927: the general "Run tests" step
       # above leaves GRID_TEST_DB_URL unset, so tests/test_future_dated_reads_guard.py
       # would silently skip there. REQUIRE_FUTURE_DATED_READS_PG makes a
