@@ -401,6 +401,28 @@ is retired — two writers of `review.jsonl` would race; the pull mirror is reti
 LLM extraction path against a live provider (no narrative exists in any current packet to
 extract from), and the deploy-time unit sync on the real host.
 
+## 2026-11-09 - Offline company document intake
+
+Added ingestion/company_documents.py, a bounded no-network raw-document archive,
+plus scripts/ingest_company_document.py and an explicit consumer/runbook contract.
+This complements existing SEC financial and AV transcript work without modifying
+those collectors. Every snapshot binds raw bytes, metadata, parsed text and parser
+version; atomic no-replace publication preserves revisions and supports retries.
+Publication time remains distinct from retrieval and unknown timestamps stay unknown.
+Unsupported PDF/encoding and empty text are visible missingness, not usable evidence.
+
+Validation: 39 offline intake tests pass, including concurrent capture, corruption,
+PIT boundaries and CLI roundtrip; changed Python Ruff passes. No live downloads,
+paid providers, production DB, schedule, migration, repair, merge or deployment.
+Document authenticity, complete coverage and semantic fact extraction remain outside
+this primitive. Full repository CI has not been run for this local candidate.
+
+Integrated the separate evidence-quality gate and archive-verified reader wrapper.
+Combined final local validation: 62 tests and 9 subtests passed, including true
+archive-to-quality roundtrip, tamper rejection and high-precision numeric conflict
+regressions. Independent intake review found no critical defect under the documented
+trusted-archive assumption. Quality is not truth/authenticity or complete coverage.
+
 ## 2026-11-09 — Review visible to every agent; briefing figures graded (Claude)
 
 Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/grade_publication_review.py`:
@@ -417,3 +439,14 @@ Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/
   carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
   the wrong clock for grading a past publication.
 
+## 2026-11-09 - Deterministic briefing guard regression clock
+
+Full Python 3.14 CI found a pre-existing test false positive: forbidden financial
+text 8.96 happened to occur inside assembly timestamp 08:16:38.960504. Pin the
+single regression's briefing clock while preserving all numeric, semantic, file
+and DB-persistence assertions. No production code or guard changes.
+
+Local Windows run: 241 briefing tests passed; 15 cannot execute because the
+existing social sentiment import requires Unix fcntl. The targeted regression
+is among those platform-blocked tests. Hosted Linux full CI is the acceptance
+check. Company intake/quality remains 62 tests and 9 subtests passing.
