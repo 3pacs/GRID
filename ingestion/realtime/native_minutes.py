@@ -83,7 +83,7 @@ def schwab_minutes(
                 low,
                 c,
                 v,
-                f"{digest}:{raw_ts}",
+                f"{digest}:{raw_ts}:{received.isoformat()}",
                 price_basis="provider_unspecified",
             )
         )

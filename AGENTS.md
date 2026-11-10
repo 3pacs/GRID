@@ -437,3 +437,11 @@ returns explicit coverage and never claims live-feed health. No production
 mount, writer, provider call, credentials or schedule changes. Reviewed PIT
 selection input-order defect corrected with permutation regression. See the
 interval readiness document for remaining producer/calendar/integration gates.
+
+### 2026-11-10 follow-up - offline retention and versioned calendar
+
+Added explicit local append-only SQLite retention/read-only loading and pinned
+XNYS calendar adapter.55 core/API/retention tests plus7 calendar tests pass in
+separate local test environments. Initial pandas3 calendar boundary failure was
+caught and fixed by pinned2.3.3; exact optional lock saved separately from main
+requirements. No live DB, producer, mount, scheduler, shared venv or deployment.

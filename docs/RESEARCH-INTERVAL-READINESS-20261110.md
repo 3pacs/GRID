@@ -106,3 +106,42 @@ with a permutation regression. Full backend/integration CI not run.
 Remaining: producer/source validation and actual coverage, durable retention,
 trusted exchange-calendar adapter, production API mounting and GEX consumer,
 weekly/monthly manifests, controller review and safe deployment after bootstrap.
+
+## Follow-up: durable local retention and exchange calendar
+
+`minute_retention.py` implements an explicitly initialized, dedicated offline
+SQLite store. Atomic append batches preserve immutable minute revisions and
+content SHA-256, exact replay is idempotent, revision mutation refuses, concurrent
+writers serialize, and UPDATE/DELETE guards prevent routine accidental edits.
+Readers use SQLite `mode=ro`, bounded queries and content-hash verification.
+These are integrity/accident controls, not tamper-proof cryptographic attestation
+against someone with filesystem/DB ownership. Unrelated existing DB files refuse.
+Only temporary synthetic stores were created during tests; no live store exists.
+
+`research_calendar.py` supplies an optional, pinned `exchange_calendars` XNYS
+RTH adapter with bounded date coverage and dependency provenance. Verified normal
+390-minute session, 210-minute early close, DST UTC offset change, holidays,
+weekends and the January 9 2025 ad-hoc closure. It is packaged calendar data,
+not a live exchange-announcement monitor; new closures/halts require updated
+reviewed calendar evidence. Extended/futures/crypto sessions are unsupported.
+
+The initial unconstrained pandas3.1.1 dependency produced wrong calendar bounds.
+Tests caught it. The isolated venv now uses pandas2.3.3 and the adapter refuses
+other pandas/calendar versions. Exact tested optional pins are saved in
+`requirements-research-calendar.txt`; main production requirements unchanged.
+Known upstream NumPy timedelta deprecation warnings remain, not test failures.
+No shared environment changed. Missing optional calendar dependencies fail closed.
+
+Verification:55 core/adapter/API/retention tests pass in the existing local test
+venv;7 calendar tests pass in the isolated Python3.14 calendar venv, including a
+synthetic early-close calendar→SQLite retention→hourly rollup integration test.
+Ruff and diff check pass. Independent bounded review confirmed revision receipt
+identity and previous PIT corrections; no additional demonstrated defect found.
+A new provider receipt of identical candle content has a new receipt-qualified
+revision identity, while replaying the same retained envelope remains idempotent.
+
+Remaining to serve real data: verify provider request/receipt custody and actual
+coverage, authorize/configure the retained producer, mount the private read API,
+wire GEX, review deployment after bootstrap, and add weekly/monthly manifests.
+No field named source/quality alone proves truth; producer identity must be
+established. No production completeness or live probability claim is made.

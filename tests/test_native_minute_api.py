@@ -240,10 +240,6 @@ class TestIntervalApi(unittest.TestCase):
         self.assertEqual(result["status"], "awaiting_closed_window")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestRetainedExport(unittest.TestCase):
     def test_read_and_query_export(self):
         import tempfile
@@ -291,3 +287,7 @@ class TestRetainedExport(unittest.TestCase):
             p.write_text("x" * 20)
             with self.assertRaises(ValueError):
                 retained_jsonl_loader(p, max_bytes=10)("SPY", "fixture", S, S.closes)
+
+
+if __name__ == "__main__":
+    unittest.main()
