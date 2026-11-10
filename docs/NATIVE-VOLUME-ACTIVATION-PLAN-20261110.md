@@ -53,3 +53,45 @@ restart is implied by isolated code approval or the five-file gamma release.
 These runtime items need a single explicit activation proposal after scoped read
 access and existing scheduling ownership are resolved. Nothing in this document
 has been executed on production.
+
+## Implemented activation candidate update
+
+One-shot `python -m scripts.native_volume_once --fetch --root <private0700-root>
+--calendar-manifest <reviewed-json> --calendar-sha256 <pin> [--initialize]`
+now composes bounded acquisition, immutable retention and private snapshot.
+Use the existing GRID service environment without printing/copying credentials.
+No scheduler is installed. Invocation lease covers fetch through snapshot publish.
+A >3minute interruption or failed/uncertain checkpoint stops for explicit receipt
+reconciliation; there is no blind recovery/reset flag. Disk budget also stops
+before further acquisition. These failures must surface in operations, not be
+silently treated as clean data. Initial bootstrap must prove all10 prior sessions
+and current settled minutes before incremental mode.
+
+Actual runtime inventory: grid-api and gex-watch both User=grid. Therefore the
+private0600 native-volume.json can be consumed directly by GEX from a trusted0700
+root, using the SAME derived GRID contract; no admin-token provisioning or auth
+weakening is necessary. Private API remains available as a separate read view.
+GEX candidate uses `GEX_NATIVE_VOLUME_SNAPSHOT` defaultempty and a separate private
+panel; no snapshot read when disabled, public frame omits the field entirely.
+No legacy signals are unlocked. GEX needs one separately approved restart to
+load consumer code and operator-configured path; quote/chain/rollover unchanged.
+
+Actual GRID interpreter has pandas3.1.1 and lacks exchange_calendars/tzdata.
+Do NOT downgrade/install into its live environment. Runtime now uses stdlib-only
+ManifestCalendar with reviewed canonical session manifest, exported offline from
+the pinned/tested adapter. Coverage2026-10-01 through2027-12-31,315sessions,
+SHA256 efa8897e2fd94afd4f9f9b29951f142b97aece83812aca7403026df1ec4eb8ad.
+This is a calendar snapshot; future emergency closures need reviewed revision,
+not a guessed runtime fallback. Dates outside coverage fail closed.
+
+Verification:157 GRID tests+25subtests pass, one optional calendar-export test
+skipped in general environment; pinned calendar environment separately passed10
+manifest tests. GEX38suites pass. Synthetic GRIDsnapshot→GEXreader roundtrip and
+real retained Schwab historical-cutoff replay both pass. Historical replay is
+not current-live certification or evidence of predictive efficacy.
+
+Before enabling: freeze source hashes, verify existing producer ownership, stage
+candidate code separately from the running release, provision private store/root,
+run one explicit bootstrap with normal GRID environment, inspect actual coverage
+and private snapshot, then authorize cadence and private GEX consumer activation.
+No timer/service/environment/file installation on production has been performed.
