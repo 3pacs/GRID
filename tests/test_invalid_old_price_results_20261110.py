@@ -3,7 +3,8 @@
 The panel was repaired 2026-11-09/10 (docs/reference/PRICE_PANEL_BASIS.md).
 Two records computed from it remain as history but must not be served as
 results: the adaptive_rotation_live paper book (the only paper_trades input
-to realized alpha) and the 242 rotation_variant_* AstroGrid backtest runs.
+to realized alpha) and the 242 rotation_variant_* AstroGrid backtest runs
+(listed in astrogrid.backtest_run_invalidation by ag_backtest_invalid_20261110).
 """
 
 from __future__ import annotations
@@ -37,15 +38,15 @@ def test_paper_trades_query_excludes_invalid_strategies() -> None:
     assert all(reason for reason in ra.INVALID_PAPER_STRATEGIES.values())
 
 
-def test_backtest_results_skip_runs_marked_invalidated() -> None:
+def test_backtest_results_skip_invalidated_runs() -> None:
     engine = MagicMock()
     conn = engine.connect.return_value.__enter__.return_value
     conn.execute.return_value.fetchall.return_value = []
     AstroGridStore(engine).list_backtest_results(strategy_variant="grid_only")
     statement, params = conn.execute.call_args.args
     sql = str(statement)
-    assert "summary_payload -> 'invalidated' IS NOT NULL" in sql
-    assert "NOT EXISTS" in sql and "inv.id = br.backtest_run_id" in sql
+    assert "NOT EXISTS (SELECT 1 FROM astrogrid.backtest_run_invalidation inv" in sql
+    assert "inv.backtest_run_id = br.backtest_run_id" in sql
     # the existing filters still apply
     assert "br.target_symbol IS DISTINCT FROM :legacy_char_symbol" in sql
     assert params["strategy_variant"] == "grid_only"

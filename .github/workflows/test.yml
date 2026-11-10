@@ -145,6 +145,24 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
 
+      # astrogrid.backtest_run_invalidation (ag_backtest_invalid_20261110):
+      # the migration marks only rotation_variant_* runs, the marks are
+      # append-only, and list_backtest_results skips marked runs. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: Backtest invalidation PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_backtest_run_invalidation_pg.py -q -rA | tee /tmp/grid-backtest-invalidation-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-backtest-invalidation-pg.txt; then
+            echo "::error::Backtest invalidation PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # people_events (GD2, migrations/versions/people_events_20260927.py):
       # proves the real upgrade/downgrade and CHECK constraints against
       # PostgreSQL (test_people_events_migration_pg.py) and the upsert/read
