@@ -29,3 +29,27 @@ does not claim they are currently live.
 
 Tests: calendar holiday/DST/early-close windows, missing sessions/bars, mixed
 source, ambiguity, late receipt, old events, zero/fractional shares, arithmetic.
+
+## Private cache/API composition (offline implementation, not deployed)
+
+`native_volume_cache.fetch_and_retain` takes an explicitly configured existing
+Schwab client with retries disabled, an initialized dedicated local SQLite store,
+and an owner-only receipt directory. It preserves exact native response/request
+metadata before appending immutable revisions. Receipt replay is idempotent.
+Paths must be provisioned under trusted owner-controlled parent directories:
+final path checks are not a defense against an attacker controlling ancestors.
+No timer, service, credential installation or production store is created here.
+
+`api.native_volume.build_router(loader=sqlite_loader(store), calendar=XNYSCalendar())`
+is an unregistered admin-only read API. It never fetches or refreshes provider
+credentials in response to a dashboard request. GEX's separate pure
+`grid_native_volume.project` accepts private ready/fresh GRID responses, labels
+HLC3 as an estimate, and rejects stale/historical/source/provenance mismatches.
+It is not wired to GEX's server or UI yet; no new live metric is claimed.
+
+Release prerequisites: review calendar/package deployment compatibility, designate
+one cache owner and invocation cadence, initialize private store/receipt custody,
+mount admin router, provide authenticated private GEX transport, test end-to-end
+freshness and failure handling, and obtain the separate runtime release approval.
+Do not enable the rollover gate or modify feed selection as part of this work.
+Current restored GEX and live cumulative-volume assets must remain untouched.

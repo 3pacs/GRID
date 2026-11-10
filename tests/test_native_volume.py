@@ -94,7 +94,7 @@ class NativeVolumeTests(unittest.TestCase):
         rows = [replace(r, available_at=r.ts + timedelta(minutes=1)) for r in self.rows]
         self.assertIn(
             self.view(rows, max_receipt_age=1)["reason"],
-            ("receipt_stale", "event_stale"),
+            ("receipt_stale", "event_stale", "unsettled_receipt"),
         )
 
     def test_backfill_no_event_freshness(self):
@@ -149,6 +149,26 @@ class NativeVolumeTests(unittest.TestCase):
         self.assertEqual(result["status"], "degraded")
         self.assertEqual(result["rvol"], 0)
         self.assertIsNone(result["bar_vwap_estimate"])
+
+    def test_old_early_snapshot_does_not_settle(self):
+        rows = [
+            replace(r, available_at=r.ts + timedelta(minutes=1))
+            if r.ts >= self.open
+            else r
+            for r in self.rows
+        ]
+        self.assertEqual(self.view(rows)["reason"], "unsettled_receipt")
+
+    def test_baseline_requires_settled_receipts(self):
+        rows = [
+            replace(r, available_at=r.ts + timedelta(minutes=1))
+            if r.ts < self.open
+            else r
+            for r in self.rows
+        ]
+        result = self.view(rows)
+        self.assertIsNone(result["rvol"])
+        self.assertEqual(result["baseline_errors"]["1"], "baseline_unsettled_receipt")
 
     def test_fractional_volume(self):
         with self.assertRaises(ValueError):

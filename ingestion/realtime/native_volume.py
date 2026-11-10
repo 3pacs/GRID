@@ -122,6 +122,12 @@ def native_volume_view(
         for b in candles
     ):
         raise ValueError("integer share volumes required")
+    if any(
+        b.last_source_available_at < b.end + timedelta(seconds=settlement_seconds)
+        for b in candles
+    ):
+        result["reason"] = "unsettled_receipt"
+        return result
     latest = candles[-1].last_source_available_at
     age = (now - latest).total_seconds()
     result.update(
@@ -149,6 +155,11 @@ def native_volume_view(
         ]
         if any(b is None or not b.complete or b.volume is None for b in full):
             result["baseline_errors"][p.key] = "baseline_session_gap"
+        elif any(
+            b.last_source_available_at < b.end + timedelta(seconds=settlement_seconds)
+            for b in full
+        ):
+            result["baseline_errors"][p.key] = "baseline_unsettled_receipt"
         elif full_count < count:
             result["baseline_errors"][p.key] = (
                 "early_close_insufficient_elapsed_minutes"

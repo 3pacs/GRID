@@ -1,0 +1,121 @@
+"""Explicit private native-minute retention; no timer, credentials or live wiring.
+
+Caller initializes a dedicated minute_retention store and supplies a Schwab client
+configured with max_retries=0. A receipt is durably saved before bar append. If the
+append fails, replay that receipt instead of fetching again. Filesystem owners can
+alter files: hashes are integrity checks, not cryptographic producer attestation.
+"""
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+
+from ingestion.realtime.native_minutes import schwab_minutes
+from ingestion.realtime.minute_retention import append
+from ingestion.realtime.research_intervals import _utc
+
+MAX_BYTES = 12_000_000
+SCHEMA = 'grid.native-minute-receipt.v1'
+
+
+def _private(path, *, directory=False):
+    p = Path(path)
+    s = p.lstat()
+    if (not stat.S_ISDIR(s.st_mode) if directory else not stat.S_ISREG(s.st_mode)):
+        raise ValueError('private regular path required')
+    if s.st_uid != os.geteuid() or stat.S_IMODE(s.st_mode) & 0o077:
+        raise ValueError('owner-only private path required')
+    return p
+
+
+def _encoded(value):
+    raw = json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    if len(raw) > MAX_BYTES:
+        raise ValueError('receipt exceeds size bound')
+    return raw
+
+
+def _validate(receipt):
+    if receipt.get('schema') != SCHEMA or receipt.get('source') != 'schwab_pricehistory':
+        raise ValueError('unsupported receipt')
+    q = receipt['request']
+    symbol = q['symbol']
+    if not isinstance(symbol, str) or not re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,11}', symbol):
+        raise ValueError('invalid symbol')
+    if q.get('frequencyType') != 'minute' or type(q.get('frequency')) is not int or q['frequency'] != 1 or q.get('needExtendedHoursData') != 'true':
+        raise ValueError('native minute request required')
+    start, end = q['startDate'], q['endDate']
+    if type(start) is not int or type(end) is not int or start < 0 or not 0 < end-start <= 31*86400000:
+        raise ValueError('invalid bounded date range')
+    received = _utc(datetime.fromisoformat(receipt['received_at']))
+    requested = _utc(datetime.fromisoformat(receipt['requested_at']))
+    if received < requested or end > int(requested.timestamp()*1000):
+        raise ValueError('invalid receipt clocks')
+    parsed = schwab_minutes(receipt['payload'], requested_symbol=symbol, frequency_type='minute', frequency=1, received_at=received)
+    for b in receipt['payload']['candles']:
+        if not start <= b['datetime'] <= end:
+            raise ValueError('provider returned outside requested range')
+    return parsed
+
+
+def retain_receipt(receipt, *, store, receipts_dir):
+    """Validate, save immutable receipt, append revisions. Exact replay inserts zero."""
+    root = _private(receipts_dir, directory=True)
+    _private(store)
+    parsed = _validate(receipt)
+    raw = _encoded(receipt)
+    digest = hashlib.sha256(raw).hexdigest()
+    target = root / (digest + '.json')
+    # Link a complete fsynced private tempfile atomically, never overwrite a receipt.
+    fd, temporary = tempfile.mkstemp(prefix='.native-receipt-', dir=root)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError:
+            _private(target)
+            fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as f:
+                if f.read(MAX_BYTES + 1) != raw:
+                    raise ValueError('receipt hash conflict')
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.unlink(temporary)
+    inserted = append(store, parsed.bars)
+    return {'receipt_sha256': digest, 'receipt_file': str(target), 'payload_sha256': parsed.payload_sha256,
+            'inserted': inserted, 'closed_minutes': len(parsed.bars), 'excluded_forming': parsed.excluded_forming,
+            'received_at': parsed.received_at.isoformat(), 'live': False}
+
+
+def fetch_and_retain(client, *, symbol, start, end, store, receipts_dir, clock=None):
+    """One bounded client invocation; no automatic retry or implicit initialization."""
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    before = _utc(clock())
+    start, end = _utc(start), _utc(end)
+    if not isinstance(symbol, str) or not re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,11}', symbol):
+        raise ValueError('invalid symbol')
+    if start >= end or end > before or end-start > timedelta(days=31):
+        raise ValueError('invalid bounded date range')
+    _private(store)
+    _private(receipts_dir, directory=True)
+    retry_policy = getattr(client, '_max_retries', None)
+    if type(retry_policy) is not int or retry_policy != 0:
+        raise ValueError('client retries must be disabled')
+    q = dict(symbol=symbol, startDate=int(start.timestamp()*1000), endDate=int(end.timestamp()*1000), frequencyType='minute', frequency=1, needExtendedHoursData='true')
+    try:
+        payload = client.price_history(symbol, **{k:v for k,v in q.items() if k != 'symbol'})
+    except Exception:
+        raise RuntimeError('native history request failed; no automatic retry') from None
+    receipt = dict(schema=SCHEMA, source='schwab_pricehistory', request=q, requested_at=before.isoformat(), received_at=_utc(clock()).isoformat(), payload=payload)
+    return retain_receipt(receipt, store=store, receipts_dir=receipts_dir)
