@@ -770,12 +770,12 @@ def _judge(text: str, at: datetime):
     return grader.grade_figure(object(), p, stated)
 
 
-def test_intraday_spike_is_confirmed_by_the_captures_around_the_statement(vintages):
+def test_intraday_bracket_only_corroborates_the_statement(vintages):
     # the old reader compared 26.9 with the last completed close (16.61) and refuted a true statement
     _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 21.0, _z(FRI, 15)), (FRI, 26.5, _z(FRI, 18, 30)),
          (FRI, 27.4, _z(FRI, 19, 30)))
     row = _judge("The VIX of 26.9 shows the spike.", _z(FRI, 19))          # 14:00 ET, session open
-    assert row["verdict"] == "confirmed" and row["root_cause"] is None
+    assert row["verdict"] == "partially_confirmed" and row["knowable_at_stated_at"] is None
     assert [e["observed"].split(" ")[0] for e in row["evidence"]] == ["26.5", "27.4"]
 
 
@@ -809,15 +809,16 @@ def test_inside_the_range_without_a_pinning_capture_is_partial(vintages):
          (FRI, 29.0, _z(FRI, 21, 20)))
     _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
     row = _judge("The VIX of 26.9 shows the spike.", _z(FRI, 19))
-    assert row["verdict"] == "partially_confirmed" and "inside the 2026-11-06 range 16-30" in row["root_cause"]
+    assert row["verdict"] == "partially_confirmed" and "inside the session range" in row["root_cause"]
 
 
 def test_a_value_the_market_never_printed_is_refuted_with_evidence(vintages):
     _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.0, _z(FRI, 18)), (FRI, 27.0, _z(FRI, 20)))
     _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
     row = _judge("The VIX of 40.1 is a panic.", _z(FRI, 19))
-    assert row["verdict"] == "refuted" and "outside the session range" in row["root_cause"]
-    assert any("range 16-30" in e["observed"] for e in row["evidence"])
+    assert row["verdict"] == "refuted" and "outside the complete" in row["root_cause"]
+    assert any("low 16" in e["observed"] for e in row["evidence"])
+    assert any("high 30" in e["observed"] for e in row["evidence"])
     assert all(e["as_of"] <= grader.iso(GRADED_LATE) for e in row["evidence"])
 
 
@@ -937,3 +938,53 @@ def test_publish_is_skipped_on_dry_run_and_refusal_and_never_follows_a_symlink(t
                                client_factory=lambda: None, ingest=False, public_root=public)
     assert receipt["state"] == "WRITTEN" and receipt["published"]["error"] == "OSError"
     assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("offset", [-30, 0, 30])
+def test_equal_pull_is_not_an_exact_market_time_observation(vintages, offset):
+    at = _z(FRI, 19)
+    _vix(vintages, (FRI, 26.9, at + timedelta(minutes=offset)))
+    row = _judge("The VIX at 26.9 now.", at)
+    assert row["verdict"] == "partially_confirmed"
+    assert row["knowable_at_stated_at"] is None
+    assert row["evidence"][0]["as_of"] == grader.iso(at + timedelta(minutes=offset))
+    assert "market event time unknown" in row["evidence"][0]["observed"]
+
+
+def test_sparse_mismatching_pulls_cannot_refute_a_transient_level(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)), (FRI, 27.0, _z(FRI, 20)))
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable" and row["evidence"] == []
+
+
+def test_previous_close_cannot_confirm_current_intraday_level(vintages):
+    _vix(vintages, (THU, 16.61, _z(THU, 21, 20)))
+    row = _judge("The VIX at 16.61 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable"
+
+
+def test_incomplete_session_range_cannot_refute_later_price(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _range(vintages, FRI, 16.0, 27.0, _z(FRI, 18))
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable"
+
+
+def test_complete_range_refutation_preserves_actual_availability(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _range(vintages, FRI, 16.0, 27.0, _z(FRI, 21, 20))
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "refuted"
+    assert row["knowable_at_stated_at"] is False
+    assert all(e["as_of"] == grader.iso(_z(FRI, 21, 20)) for e in row["evidence"])
+
+
+@pytest.mark.parametrize("mixed", ["source", "retrieval_time"])
+def test_mixed_range_cannot_refute_current_level(vintages, mixed):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _range(vintages, FRI, 16.0, 27.0, _z(FRI, 21, 20))
+    vintages["YF:^VIX:high"] = [_o("YF:^VIX:high", FRI, 27.0,
+        _z(FRI, 21, 21) if mixed == "retrieval_time" else _z(FRI, 21, 20),
+        "another-source" if mixed == "source" else "yfinance")]
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable"
