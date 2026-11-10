@@ -102,8 +102,18 @@ def _check_signal_freshness(pred: Any) -> GuardCheck:
             adjustment=1.0,
         )
 
+    # DATE-only actor evidence supplies a labelled lower bound, not an exact
+    # timestamp. It can prove staleness but cannot prove intraday freshness.
+    ages = [s.freshness_hours for s in signals]
+    bounds = [getattr(s, "provenance", {}).get("freshness_hours_lower_bound") for s in signals]
     stale_count = sum(
-        1 for s in signals if s.freshness_hours > _STALE_HOURS
+        (age is not None and age > _STALE_HOURS)
+        or (age is None and bound is not None and bound > _STALE_HOURS)
+        for age, bound in zip(ages, bounds)
+    )
+    unknown_count = sum(
+        age is None and (bound is None or bound <= _STALE_HOURS)
+        for age, bound in zip(ages, bounds)
     )
     stale_ratio = stale_count / len(signals)
     passed = stale_ratio <= _STALE_RATIO_THRESHOLD
@@ -111,10 +121,11 @@ def _check_signal_freshness(pred: Any) -> GuardCheck:
     return GuardCheck(
         check_name="signal_freshness",
         passed=passed,
-        severity="warning" if not passed else "info",
+        severity="warning" if not passed or unknown_count else "info",
         message=(
             f"{stale_count}/{len(signals)} signals stale "
-            f"(>{_STALE_HOURS}h) — ratio {stale_ratio:.2f}"
+            f"(>{_STALE_HOURS}h) — ratio {stale_ratio:.2f}; "
+            f"{unknown_count} freshness unknown"
         ),
         adjustment=_STALE_ADJUSTMENT if not passed else 1.0,
     )

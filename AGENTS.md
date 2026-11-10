@@ -417,3 +417,28 @@ Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/
   carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
   the wrong clock for grading a past publication.
 
+
+
+## 2026-11-09 - Bound Oracle actor evidence and preserve source lineage
+
+The actor bridge now rejects aggregate/feed identities, normalizes only explicit
+bull/bear directions, applies observation-date and ingestion-availability bounds,
+and selects one latest-date vote per actor/source channel. Unknown or conflicting
+latest-day directions withhold the group; zero-trust actors cannot add coherence
+votes. No historical rows or runtime settings are changed.
+
+Actor freshness remains unknown at exact-hour precision. Reports distinguish the
+stored observation DATE, calendar-age lower bound and ingestion availability.
+Used row/source refs and scoring effects are kept in a small receipt in the same
+signals JSON value that the existing upsert replaces atomically. Candidate detail
+is explicitly sampled, complete used support is bounded, and an oversized receipt
+fails closed before any weight mutation. The existing confidence/target upsert
+policy and other signal families' freshness behavior remain outside this patch.
+
+Synthetic regression coverage includes direction, repeated/conflicting rows,
+identifier rejection, clock boundaries, actual SQL selection, size limits,
+atomic no-mutation failure, scoring/coherence and insert/update receipt retention.
+Focused bridge/Oracle/report tests passed locally. Broader compatible Oracle tests
+also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
+No production access, send, generator, migration, service change, merge or deploy.
+See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.

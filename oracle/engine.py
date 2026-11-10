@@ -38,7 +38,6 @@ from sqlalchemy.engine import Engine
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 
-import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
 
@@ -68,7 +67,96 @@ class Signal:
     z_score: float
     direction: str                 # "bullish", "bearish", "neutral"
     weight: float                  # Model weight for this signal
-    freshness_hours: float         # How old is this data
+    freshness_hours: float | None  # Exact age, unknown for DATE-only observations
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+
+MAX_ACTOR_RECEIPT_BYTES = 16_384
+
+
+def _inject_actor_evidence(signals: list[Signal], batch: dict[str, Any]) -> dict[str, Any]:
+    """Plan complete used lineage, enforce size, then apply actor evidence atomically.
+
+    The byte cap covers the audit and duplicated per-Signal provenance. Sampled
+    excluded detail never implies completeness. A receipt that cannot fit yields
+    no actor boost/vote, rather than a partial or unauditable contribution.
+    """
+    audit = {k: v for k, v in batch.items() if k != "signals"}
+    audit.update(direct_vote_row_ids=[], weight_boosts=[], used_groups=[],
+                 receipt_byte_limit=MAX_ACTOR_RECEIPT_BYTES)
+    planned_boosts: list[tuple[Signal, float]] = []
+    injected: list[Signal] = []
+    used: dict[Any, dict] = {}
+    if batch.get("complete"):
+        actor_sigs = [s for s in batch.get("signals", []) if s["direction"] in {"bullish", "bearish"}]
+        actor_trust_by_type: dict[str, float] = {}
+        for asig in actor_sigs:
+            channel = asig["signal_type"]
+            trust = asig["actor_trust"] * asig["actor_influence"]
+            actor_trust_by_type[channel] = max(actor_trust_by_type.get(channel, 0), trust)
+        for sig in signals:
+            source = getattr(sig, "source_module", "") or sig.family
+            boost = actor_trust_by_type.get(source, 0)
+            if boost > 0.5:
+                contributors = [a for a in actor_sigs if a["signal_type"] == source
+                                and a["actor_trust"] * a["actor_influence"] == boost]
+                for a in contributors:
+                    used[a["provenance"]["row_id"]] = a["provenance"]
+                planned_boosts.append((sig, sig.weight * (0.5 + boost)))
+                audit["weight_boosts"].append({
+                    "signal_name": sig.name, "source_channel": source,
+                    "prior_weight": sig.weight, "multiplier": 0.5 + boost,
+                    "result_weight": sig.weight * (0.5 + boost),
+                    "actor_row_ids": [a["provenance"]["row_id"] for a in contributors],
+                })
+        qualified = [s for s in actor_sigs if s["actor_influence"] > 0.7 and s["actor_trust"] > 0]
+        audit["direct_vote_disposition_counts"] = {
+            "injected": min(5, len(qualified)),
+            "zero_weight": sum(s["actor_trust"] <= 0 for s in actor_sigs),
+            "below_influence_threshold": sum(s["actor_influence"] <= 0.7 and s["actor_trust"] > 0
+                                             for s in actor_sigs),
+            "direct_vote_limit": max(0, len(qualified) - 5),
+        }
+        for asig in qualified[:5]:
+            provenance = asig["provenance"]
+            # Full support is stored once in the atomically replaced signals JSON. Each
+            # displayed signal keeps its own timing/identity and an exact ref.
+            signal_provenance = {k: v for k, v in provenance.items()
+                                 if k not in {"supporting_rows", "supporting_row_ids"}}
+            signal_provenance["used_group_row_id"] = provenance["row_id"]
+            signal_provenance["used_group_location"] = "signals.actor_evidence.used_groups"
+            injected.append(Signal(
+                name=f"actor:{asig['actor']}", family="actor_intelligence",
+                value=asig["actor_trust"],
+                z_score=1.5 if asig["direction"] == "bullish" else -1.5,
+                direction=asig["direction"],
+                weight=asig["actor_trust"] * asig["actor_influence"],
+                freshness_hours=None, provenance=signal_provenance,
+            ))
+            used[provenance["row_id"]] = provenance
+            audit["direct_vote_row_ids"].append(provenance["row_id"])
+        audit["direct_vote_limit"] = 5
+        audit["eligible_group_count"] = len(actor_sigs)
+    audit["used_groups"] = list(used.values())
+    receipt = {"actor_evidence": audit, "actor_signals": [asdict(s) for s in injected]}
+    if len(json.dumps(receipt, ensure_ascii=True, allow_nan=False).encode("utf-8")) > MAX_ACTOR_RECEIPT_BYTES:
+        # Fixed-size summary only; do not copy arbitrarily long source strings.
+        return {
+            "as_of": batch.get("as_of"), "complete": False,
+            "reason": "actor_receipt_size_limit_exceeded",
+            "selection_reason": batch.get("reason"),
+            "candidate_window_complete": bool(batch.get("complete")),
+            "candidate_count_lower_bound": batch.get("candidate_count_lower_bound"),
+            "observation_count": batch.get("observation_count", 0),
+            "disposition_counts": batch.get("disposition_counts", {}),
+            "observations": [], "observations_complete": False,
+            "direct_vote_row_ids": [], "weight_boosts": [], "used_groups": [],
+            "receipt_byte_limit": MAX_ACTOR_RECEIPT_BYTES,
+        }
+    for sig, weight in planned_boosts:
+        sig.weight = weight
+    signals.extend(injected)
+    return audit
 
 
 @dataclass
@@ -1519,52 +1607,16 @@ class OracleEngine:
                         signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
                     signals = [replace(sig) for sig in signal_cache[cache_key]]
 
-                # ── Actor intelligence injection ──────────────────
-                # Enrich signals with actor trust/influence from the
-                # actor graph. Actors with proven track records get
-                # their signals amplified; unknown actors stay at 0.5.
+                # Actor evidence is selected before any credibility boost or vote.
+                # Keep all candidate dispositions, even when none qualifies.
+                actor_evidence = {"complete": False, "reason": "reader_unavailable"}
                 try:
-                    from intelligence.actor_signal_bridge import (
-                        get_actor_signals_for_ticker,
-                    )
-                    if "actor_sigs" not in per_ticker:
-                        per_ticker["actor_sigs"] = get_actor_signals_for_ticker(
-                            self.engine, ticker, days=30,
+                    from intelligence.actor_signal_bridge import get_actor_evidence_for_ticker
+                    if "actor_evidence" not in per_ticker:
+                        per_ticker["actor_evidence"] = get_actor_evidence_for_ticker(
+                            self.engine, ticker, days=30, as_of=now,
                         )
-                    actor_sigs = per_ticker["actor_sigs"]
-                    if actor_sigs:
-                        # Build actor trust lookup
-                        actor_trust_by_type: dict[str, float] = {}
-                        for asig in actor_sigs:
-                            st = asig["signal_type"]
-                            trust = asig["actor_trust"] * asig["actor_influence"]
-                            if st not in actor_trust_by_type or trust > actor_trust_by_type[st]:
-                                actor_trust_by_type[st] = trust
-
-                        # Boost signal weights by actor credibility
-                        for sig in signals:
-                            src = getattr(sig, "source_module", "") or sig.family
-                            actor_boost = actor_trust_by_type.get(src, None)
-                            if actor_boost and actor_boost > 0.5:
-                                # Scale weight: 0.5 trust = 1x, 0.9 trust = 1.8x
-                                boost = 0.5 + actor_boost
-                                if hasattr(sig, '_replace'):
-                                    sig = sig._replace(weight=sig.weight * boost)
-                                elif hasattr(sig, 'weight'):
-                                    sig.weight = sig.weight * boost
-
-                        # Inject high-influence actor signals directly
-                        for asig in actor_sigs[:5]:  # Top 5 by influence
-                            if asig["actor_influence"] > 0.7:
-                                signals.append(Signal(
-                                    name=f"actor:{asig['actor']}",
-                                    family="actor_intelligence",
-                                    value=asig["actor_trust"],
-                                    z_score=1.5 if asig["direction"] in ("buy", "bullish", "long") else -1.5,
-                                    direction="bullish" if asig["direction"] in ("buy", "bullish", "long") else "bearish",
-                                    weight=asig["actor_trust"] * asig["actor_influence"],
-                                    freshness_hours=0,
-                                ))
+                    actor_evidence = _inject_actor_evidence(signals, per_ticker["actor_evidence"])
                 except Exception as exc:
                     log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
 
@@ -1785,7 +1837,7 @@ class OracleEngine:
                     model_name=model.name,
                     model_version=model.version,
                     model_weights={m.name: m.weight for m in self.models},
-                    flow_context=flow_ctx,
+                    flow_context={**flow_ctx, "actor_evidence": actor_evidence},
                     horizon_days=self._horizon_days_for(now, expiry, horizon_days),
                 )
 
@@ -2623,8 +2675,7 @@ class OracleEngine:
                 context["context_basis"] = "frozen_at_decision; missing values unobserved"
                 if model_votes and contributions == model_votes:
                     context["signal_contributions_basis"] = SIGNAL_CONTRIBUTIONS_BASIS
-                # Preserve PR1094's receipt with the exact signal batch when
-                # that additive actor-evidence producer is integrated.
+                # Freeze the actor receipt with the signals it describes.
                 if "actor_evidence" in p.flow_context:
                     context["actor_evidence"] = p.flow_context["actor_evidence"]
                 context["forecast_contract"] = {
@@ -2675,7 +2726,7 @@ class OracleEngine:
                     "mn": p.model_name, "mv": p.model_version,
                     "sig": json.dumps(enriched_signals, default=str),
                     "anti": json.dumps([asdict(a) for a in p.anti_signals], default=str),
-                    "fc": json.dumps(p.flow_context, default=str),
+                    "fc": json.dumps({k: v for k, v in p.flow_context.items() if k != "actor_evidence"}, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
                     "hd": int(p.horizon_days) if p.horizon_days is not None else None,
                     "nwp": NULL_WRITE_POLICY, "rp": FORWARD_RECORDING_POLICY,

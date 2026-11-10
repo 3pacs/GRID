@@ -145,7 +145,7 @@ class TestGetPredictionsPaginationEnvelope:
         fake_row = (
             "pred-1", now, "AAPL", "options", "CALL", 200.0, 180.0,
             "2026-06-19", 0.7, 5.0, 0.6, 0.8, "model-a", "v1",
-            [], [], {}, "hit", 210.0, 16.6, 16.6, now, "scored",
+            {"items": [], "actor_evidence": {"direct_vote_row_ids": [42]}}, [], {}, "hit", 210.0, 16.6, 16.6, now, "scored",
             "oracle_pred_nullable_0918", None,
         )
         with patch.object(mod, "get_db_engine",
@@ -155,6 +155,7 @@ class TestGetPredictionsPaginationEnvelope:
                 limit=10, offset=0, _token="test",
             )
 
+        assert result["predictions"][0]["flow_context"]["actor_evidence"]["direct_vote_row_ids"] == [42]
         assert result["total"] == 100
         assert result["limit"] == 10
         assert result["offset"] == 0

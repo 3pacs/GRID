@@ -158,6 +158,8 @@ def get_predictions(
         tracking_pnl_basis = None
         tracking_quote = None
         flow_context = r[16] if isinstance(r[16], dict) else {}
+        if isinstance(r[14], dict) and isinstance(r[14].get("actor_evidence"), dict):
+            flow_context = {**flow_context, "actor_evidence": r[14]["actor_evidence"]}
         entry_receipt = flow_context.get("entry_price_basis")
         if entry_receipt is None and isinstance(r[14], dict):
             entry_receipt = r[14].get("entry_price_basis")

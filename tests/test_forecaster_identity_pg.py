@@ -174,6 +174,39 @@ def test_retry_preserves_original_forecast_and_final_outcome(writer):
     assert _row(writer.engine, original.id) == before
 
 
+def test_actor_receipt_and_votes_survive_same_key_retry(writer):
+    from intelligence.actor_signal_bridge import select_actor_evidence
+    from oracle.engine import Signal, _inject_actor_evidence
+
+    baseline = _prediction(110.0)
+
+    def forecast(row_id):
+        actor = {
+            "id": row_id, "actor": "Example Actor", "signal_type": "congressional",
+            "source_id": f"synthetic:{row_id}", "direction": "BULL",
+            "signal_date": baseline.timestamp.date(), "created_at": baseline.timestamp,
+            "actor_trust": 0.5, "actor_influence": 0.9,
+        }
+        signals = [Signal(f"base{i}", "equity", 0, 0, "neutral", 1, 1) for i in range(11)]
+        receipt = _inject_actor_evidence(
+            signals, select_actor_evidence([actor], as_of=baseline.timestamp),
+        )
+        return replace(baseline, signals=signals,
+                       flow_context={**baseline.flow_context, "actor_evidence": receipt})
+
+    assert len(writer._store_predictions([forecast(1)])) == 1
+    original = _row(writer.engine, baseline.id)
+    assert len(original.signals["items"]) == 12
+    assert original.signals["items"][-1]["provenance"]["row_id"] == 1
+    receipt = original.signals["actor_evidence"]
+    assert receipt["direct_vote_row_ids"] == [1]
+    assert receipt["used_groups"][0]["supporting_rows"][0]["source_id"] == "synthetic:1"
+    assert "actor_evidence" not in original.flow_context
+    assert writer._store_predictions([forecast(2)]) == []
+    assert writer._last_store_counts["duplicates"] == 1
+    assert _row(writer.engine, baseline.id) == original
+
+
 def test_delayed_persistence_keeps_utc_decision_day_and_identity(writer):
     prediction = _prediction(110.0)
     issued = prediction.timestamp
