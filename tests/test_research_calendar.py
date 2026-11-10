@@ -65,6 +65,15 @@ class TestResearchCalendar(unittest.TestCase):
             self.assertEqual(out[-1].expected_minutes, 30)
             self.assertTrue(all(b.complete for b in out))
 
+    def test_exact_prior_sessions(self):
+        prior = self.calendar.prior_sessions("XNYS:2026-11-30:RTH", 10)
+        self.assertEqual(len(prior), 10)
+        self.assertEqual(prior[-1].key, "XNYS:2026-11-27:RTH")
+        self.assertEqual((prior[-1].closes - prior[-1].opens).total_seconds(), 210 * 60)
+        self.assertNotIn("XNYS:2026-11-26:RTH", [s.key for s in prior])
+        with self.assertRaises(ValueError):
+            self.calendar.prior_sessions("XNYS:2026-11-30:RTH", 0)
+
     def test_bounds(self):
         with self.assertRaises(ValueError):
             self.calendar("XNYS:2023-01-03:RTH")

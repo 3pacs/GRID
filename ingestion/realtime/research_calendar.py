@@ -28,6 +28,17 @@ class XNYSCalendar:
         self.calendar = exchange_calendars.get_calendar("XNYS", start=start, end=end)
         self.version = f"exchange_calendars:{installed}:pandas:{version('pandas')}:numpy:{version('numpy')}:tzdata:{version('tzdata')}:XNYS:{start}:{end}"
 
+    def prior_sessions(self, key, count=10):
+        """Exact immediately preceding sessions, including early-close sessions."""
+        if type(count) is not int or not 1 <= count <= 60:
+            raise ValueError("bounded positive session count required")
+        current = self(key)
+        labels = self.calendar.sessions_window(key.split(":")[1], -(count + 1))
+        sessions = tuple(self(f"XNYS:{str(day.date())}:RTH") for day in labels)
+        if len(sessions) != count + 1 or sessions[-1] != current:
+            raise ValueError("insufficient calendar history")
+        return sessions[:-1]
+
     def __call__(self, key):
         match = _KEY.fullmatch(key)
         if not match:
