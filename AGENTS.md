@@ -417,3 +417,13 @@ Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/
   carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
   the wrong clock for grading a past publication.
 
+
+## 2026-11-10 - isolated research interval core, not activated
+
+Added provenance/completeness-aware offline native1m rollups (1/2/3/5/10/15/30/
+60/120/240 minutes and trading-session daily), with availability-time filtering,
+explicit gaps and source revision identity. No production callers or schedules
+changed. 18 focused unit tests and Ruff passed. See
+`docs/RESEARCH-INTERVAL-READINESS-20261110.md` for source audit and remaining
+retention/API/calendar gates. Existing Yahoo sampled-close builder and frozen
+GEX study cannot substantiate new3m/0DTE probability claims.
