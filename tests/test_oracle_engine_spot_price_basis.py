@@ -1,110 +1,88 @@
-"""Regression: OracleEngine._get_spot_price must stay on the raw price basis.
-
-The value this method returns becomes ``entry_price`` on new
-``oracle_predictions`` rows. Its ``raw_series`` fallback used to prefer
-``YF:{ticker}:adj_close`` over ``YF:{ticker}:close`` -- silently returning a
-dividend/split-adjusted price where the primary source
-(``options_daily_signals.spot_price``) and the exit-side scorer
-(``scripts/score_oracle_trades.py``, which reads ``YF:{ticker}:close`` through
-``store/observations.py`` since S1 / oracle_expiry_close_v2) are both raw. Comparing a raw exit price against an adjusted
-entry price manufactures a spurious return equal to the cumulative
-adjustment factor -- the same mixed-basis bug PR #503 fixed for
-``intelligence/trust_scorer.py`` and ``trading/options_tracker.py``.
-"""
-
-from __future__ import annotations
-
-from unittest.mock import MagicMock
+"""Oracle entries use fresh raw spot quotes. Expiry scoring uses settled raw closes."""
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from oracle.engine import OracleEngine
-from scripts.score_oracle_trades import close_series_id
+from scripts.score_oracle_trades import classify_outcome, close_series_id
 
 
-class _FakeConn:
-    """Minimal stand-in for a SQLAlchemy Connection: routes SELECTs by table."""
-
-    def __init__(self, raw_series_rows: dict[str, float]):
-        self._raw_series_rows = raw_series_rows
-
-    def execute(self, stmt, params=None):
-        params = params or {}
-        sql = str(stmt)
-        result = MagicMock()
-        if "options_daily_signals" in sql:
-            # Force the fallback path -- these tests are about the fallback.
-            result.fetchone.return_value = None
-        elif "raw_series" in sql:
-            value = self._raw_series_rows.get(params.get("sid"))
-            result.fetchone.return_value = (value,) if value is not None else None
-        else:
-            result.fetchone.return_value = None
-        return result
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+DECISION = datetime(2026, 11, 10, 16, 0, tzinfo=timezone.utc)
 
 
-class _FakeEngine:
-    def __init__(self, raw_series_rows: dict[str, float]):
-        self._raw_series_rows = raw_series_rows
-
-    def connect(self):
-        return _FakeConn(self._raw_series_rows)
-
-
-def _make_engine(monkeypatch, raw_series_rows: dict[str, float]) -> OracleEngine:
-    # Same bypass pattern as tests/test_oracle_schema_guards.py -- skip the
-    # real DDL/model-loading side effects of __init__, they're irrelevant here.
-    monkeypatch.setattr(OracleEngine, "_ensure_tables", lambda self: None)
-    monkeypatch.setattr(OracleEngine, "_load_models", lambda self: [])
-    return OracleEngine(_FakeEngine(raw_series_rows))
-
-
-def test_get_spot_price_prefers_raw_close_over_adjusted(monkeypatch):
-    """Both adj_close and close exist (a real dividend adjustment) — raw wins."""
-    engine = _make_engine(monkeypatch, {
-        "YF:AAPL:close": 182.0,
-        "YF:AAPL:adj_close": 178.4,  # ~2% back-adjusted out for a dividend
-    })
-
-    assert engine._get_spot_price("AAPL") == pytest.approx(182.0)
-
-
-def test_get_spot_price_returns_none_without_raw_close(monkeypatch):
-    """Only adj_close is stored — must return None, not silently substitute it.
-
-    Explicit missing-price handling: the caller
-    (OracleEngine.generate_predictions_for_ticker) already treats a falsy
-    return as "no data" and stores a NO_DATA placeholder. Returning the
-    adjusted value instead would silently mix bases; returning None routes
-    the row through the existing, correct degradation path.
-    """
-    engine = _make_engine(monkeypatch, {"YF:AAPL:adj_close": 178.4})
-
-    assert engine._get_spot_price("AAPL") is None
+@pytest.fixture
+def oracle(monkeypatch):
+    db = create_engine("sqlite://")
+    with db.begin() as conn:
+        conn.execute(text("""CREATE TABLE options_capture_batches (
+            ticker TEXT, spot_price REAL, provider_regular_market_at TEXT, spot_provider TEXT,
+            capture_batch_id TEXT, capture_source TEXT, capture_started_at TEXT,
+            capture_completed_at TEXT, registered_at TEXT, snap_date TEXT,
+            backfilled BOOLEAN, capture_ordinal INTEGER)"""))
+        # Populate the retired sources with plausible but different prices so a
+        # reintroduced fallback is distinguishable from a measured spot.
+        conn.execute(text("""CREATE TABLE options_daily_signals (
+            ticker TEXT, signal_date TEXT, spot_price REAL)"""))
+        conn.execute(text("INSERT INTO options_daily_signals VALUES ('AAPL','2026-11-09',176)"))
+        conn.execute(text("""CREATE TABLE raw_series (
+            series_id TEXT, obs_date TEXT, pull_status TEXT, value REAL)"""))
+        conn.execute(text("""INSERT INTO raw_series VALUES
+            ('YF:AAPL:close','2026-11-09','SUCCESS',180),
+            ('YF:AAPL:adj_close','2026-11-09','SUCCESS',174)"""))
+    clock = Mock(wraps=datetime)
+    clock.now.return_value = DECISION
+    monkeypatch.setattr("oracle.engine.datetime", clock)
+    # Only exercise the price reader. The rest of the engine initializes the
+    # model registry and PostgreSQL schema and has its own integration tests.
+    engine = object.__new__(OracleEngine)
+    engine.engine = db
+    try:
+        yield engine
+    finally:
+        db.dispose()
 
 
-def test_entry_and_exit_price_share_the_same_raw_basis(monkeypatch):
-    """Integration: the entry-price fallback and the exit-side scorer agree.
+def _insert_capture(engine, quote_time):
+    with engine.engine.begin() as conn:
+        conn.execute(text("""INSERT INTO options_capture_batches VALUES
+            ('AAPL',182,:quote,'cboe','capture-1','oracle_forward',:started,
+             :completed,:registered,'2026-11-10',FALSE,1)"""),
+            {"quote": quote_time, "started": DECISION - timedelta(minutes=2),
+             "completed": DECISION - timedelta(minutes=1),
+             "registered": DECISION - timedelta(seconds=30)})
 
-    entry_price (OracleEngine._get_spot_price) and the actual/exit price
-    (score_oracle_trades.load_expiry_closes, which reads close_series_id())
-    must land on the same raw close series -- not just individually "raw"
-    in isolation.
-    """
-    series = {"YF:AAPL:close": 182.0, "YF:AAPL:adj_close": 178.4}
-    engine = _make_engine(monkeypatch, series)
-    entry_price = engine._get_spot_price("AAPL")
 
-    exit_series = close_series_id("AAPL")
-    assert exit_series == "YF:AAPL:close"
-    assert series[exit_series] == pytest.approx(entry_price), (
-        "entry price (OracleEngine._get_spot_price) must match the raw close "
-        "the exit-side scorer reads — both must agree on 182.0, the raw close, "
-        "not 178.4, the adjusted one"
-    )
+def test_entry_uses_dated_raw_spot_and_exit_uses_raw_close(oracle):
+    _insert_capture(oracle, DECISION - timedelta(minutes=3))
+    receipt = oracle._get_entry_price_reference("AAPL")
+    assert (receipt["status"], receipt["basis"], receipt["provider"]) == ("measured", "raw_spot", "cboe")
+    entry = oracle._get_spot_price("AAPL")
+    assert entry == 182.0
+
+    # The two prices measure different instants. Choosing the adjusted close
+    # here would change both the sign of the return and the grade.
+    expiry_prices = {"YF:AAPL:close": 184, "YF:AAPL:adj_close": 178}
+    verdict, move, _ = classify_outcome("CALL", entry, expiry_prices[close_series_id("AAPL")], 1)
+    assert verdict == "hit"
+    assert move == pytest.approx((184 / 182 - 1) * 100)
+
+
+def test_daily_prices_cannot_supply_a_missing_entry_quote(oracle):
+    receipt = oracle._get_entry_price_reference("AAPL")
+    assert receipt["status"] == "unavailable"
+    assert "no timestamped options quote" in receipt["reason"]
+    assert oracle._get_spot_price("AAPL") is None
+
+
+@pytest.mark.parametrize(("quote_time", "reason"), [
+    (None, "missing or unzoned"),
+    (DECISION - timedelta(minutes=21), "older than the 20-minute reference limit"),
+])
+def test_capture_with_missing_or_stale_provider_time_abstains(oracle, quote_time, reason):
+    _insert_capture(oracle, quote_time)
+    receipt = oracle._get_entry_price_reference("AAPL")
+    assert receipt["status"] == "unavailable"
+    assert reason in receipt["reason"]
+    assert oracle._get_spot_price("AAPL") is None

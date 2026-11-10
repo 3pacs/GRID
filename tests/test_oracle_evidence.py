@@ -1,4 +1,4 @@
-"""Oracle evidence counts independent expiry windows and excess return.
+"""Oracle evidence counts expiry clusters and exploratory relative returns.
 
 Read-only audit 2026-11-08: options_flow's 351 scored calls fall on 2 expiry
 dates; its +2.64% raw mean was the market's drift on those two windows.
@@ -47,19 +47,39 @@ def test_one_direction_drift_is_not_edge() -> None:
     assert m["windows"] == 40
     assert m["raw_mean_pct"] == 0.5
     assert m["excess_mean_pct"] == 0.0
-    assert m["verdict"] == ev.VERDICT_NO_EDGE
+    assert m["verdict"] == ev.VERDICT_NO_RELATIVE_ADVANTAGE
 
 
-def test_consistent_excess_over_many_windows_is_edge() -> None:
+def test_consistent_excess_is_relative_advantage_not_financial_edge() -> None:
     expiries = [date(2026, 1, 2) + timedelta(days=7 * i) for i in range(40)]
     rows = []
     for e in expiries:
         rows += [_o("good", 2.0, e) for _ in range(3)]
         rows += [_o("crowd", -1.0, e) for _ in range(3)]
     out = build_evidence(rows, seed=2)
-    assert _model(out, "good")["verdict"] == ev.VERDICT_EDGE
-    assert _model(out, "crowd")["verdict"] == ev.VERDICT_NO_EDGE
-    assert out["summary"]["models_with_edge"] == 1
+    assert _model(out, "good")["verdict"] == ev.VERDICT_RELATIVE_ADVANTAGE
+    assert _model(out, "crowd")["verdict"] == ev.VERDICT_NO_RELATIVE_ADVANTAGE
+    assert out["summary"]["models_with_relative_advantage"] == 1
+    assert out["summary"]["models_with_edge"] == 0
+    assert out["financial_edge_demonstrated"] is False
+
+
+def test_hindsight_only_losing_models_cannot_demonstrate_financial_edge() -> None:
+    rows = []
+    for i in range(30):
+        expiry = date(2026, 1, 2) + timedelta(days=i)
+        rows += [_o("less_bad", -1.0, expiry, basis="hindsight", verdict="miss"),
+                 _o("worse", -3.0, expiry, basis="hindsight", verdict="miss")]
+    out = build_evidence(rows)
+    less_bad = _model(out, "less_bad")
+    assert less_bad["raw_mean_pct"] == -1.0
+    assert less_bad["hit_rate"] == 0.0
+    assert less_bad["official"] == 0
+    assert less_bad["verdict"] == ev.VERDICT_RELATIVE_ADVANTAGE
+    assert out["evidence_class"] == "exploratory_relative_comparison"
+    assert out["financial_edge_demonstrated"] is False
+    assert out["summary"]["models_with_edge"] == 0
+    assert "independent_window" not in out["method"]
 
 
 def test_implausible_outcomes_and_small_models_are_counted_not_listed() -> None:
@@ -83,3 +103,27 @@ def test_job_and_route_are_wired() -> None:
     from api.routers import oracle as oracle_router
 
     assert "/api/v1/oracle/evidence" in {getattr(r, "path", "") for r in oracle_router.router.routes}
+
+
+def test_route_rebuilds_legacy_precompute_and_serves_current_snapshot(monkeypatch):
+    from unittest.mock import Mock
+
+    from api import precompute_serving
+    from api.routers import oracle as route
+    from utils.ttl_cache import TTLCache
+
+    legacy = {"summary": {"models_with_edge": 1}, "models": [{"verdict": "edge"}]}
+    current = build_evidence([])
+    meta = {"age_seconds": 0}
+    reader = Mock(side_effect=[(legacy, meta), (legacy, meta), (current, meta)])
+    load = Mock(return_value=[])
+    monkeypatch.setattr(precompute_serving, "read_precomputed", reader)
+    monkeypatch.setattr(ev, "load_outcomes", load)
+    monkeypatch.setattr(route, "get_db_engine", lambda: None)
+    monkeypatch.setattr(route, "_evidence_cache", TTLCache(ttl=60, max_size=1))
+
+    assert route.get_evidence() == current
+    assert route.get_evidence() == current
+    assert route.get_evidence() == {**current, "precompute": meta}
+    load.assert_called_once()
+    assert "precompute" not in current

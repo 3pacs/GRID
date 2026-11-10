@@ -17,7 +17,7 @@ from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from oracle.signal_aggregator import WeightConfig, WeightMode
 
@@ -76,6 +76,28 @@ class ModelSpec:
 
 class ModelFactory:
 
+    @staticmethod
+    def active_model_names(
+        conn: Connection, model_names: list[str], *, lock: bool = False,
+    ) -> set[str]:
+        """Admit only explicitly active registry rows, on the caller's transaction.
+
+        Writers hold FOR SHARE until commit so a concurrent retirement cannot
+        cross the final admission decision. Read failures propagate: callers
+        must never substitute a default or cached roster.
+        """
+        names = sorted(set(model_names))
+        if not names:
+            return set()
+        query = (
+            "SELECT name FROM oracle_models "
+            "WHERE name = ANY(:names) AND active IS TRUE ORDER BY name FOR SHARE"
+            if lock else
+            "SELECT name FROM oracle_models "
+            "WHERE name = ANY(:names) AND active IS TRUE ORDER BY name"
+        )
+        return {row[0] for row in conn.execute(text(query), {"names": names})}
+
     def __init__(self, engine: Engine) -> None:
         # Process-level guard: ALTER TABLE oracle_models would otherwise
         # fire on every construction. See schema_guard.py.
@@ -97,7 +119,7 @@ class ModelFactory:
         "TEXT DEFAULT 'directional'",
         "INTEGER DEFAULT 7",
         "INTEGER DEFAULT 3",
-        "BOOLEAN DEFAULT TRUE",
+        "BOOLEAN",
         "TEXT DEFAULT 'human'",
         "TEXT",
     }
@@ -112,7 +134,9 @@ class ModelFactory:
             ("prediction_type_col", "TEXT DEFAULT 'directional'"),
             ("target_horizon_days", "INTEGER DEFAULT 7"),
             ("min_signals", "INTEGER DEFAULT 3"),
-            ("active", "BOOLEAN DEFAULT TRUE"),
+            # A legacy table without admission state has unknown membership.
+            # Explicit model creation supplies True; migration must not infer it.
+            ("active", "BOOLEAN"),
             ("created_by", "TEXT DEFAULT 'human'"),
             ("parent_model", "TEXT"),
         ]
@@ -204,9 +228,12 @@ class ModelFactory:
             raise KeyError(f"Model '{model_name}' not found")
 
         def _load(v, default):
-            if v is None: return default
-            if isinstance(v, (dict, list)): return v
-            try: return json.loads(v)
+            if v is None:
+                return default
+            if isinstance(v, (dict, list)):
+                return v
+            try:
+                return json.loads(v)
             except Exception as e:
                 log.warning("ModelFactory: JSON parse failed: {e}", e=str(e))
                 return default
@@ -229,7 +256,7 @@ class ModelFactory:
             prediction_type=row.get("prediction_type_col") or "directional",
             target_horizon_days=int(row.get("target_horizon_days") or 7),
             min_signals=int(row.get("min_signals") or 3),
-            active=bool(row.get("active") if row.get("active") is not None else True),
+            active=row.get("active") is True,
             created_by=row.get("created_by") or "human",
             parent_model=row.get("parent_model"),
         )
@@ -249,12 +276,18 @@ class ModelFactory:
         if not _signal_registry_enabled():
             return []
         spec = self.get_model_spec(model_name)
-        if not spec.signal_sources:
+        if not spec.active or not spec.signal_sources:
             return []
 
         as_of_utc = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
-        params: dict[str, Any] = {"sources": spec.signal_sources, "as_of": as_of_utc}
-        clauses = ["source_module = ANY(:sources)", "valid_from <= :as_of", "(valid_until IS NULL OR valid_until > :as_of)"]
+        params: dict[str, Any] = {
+            "sources": spec.signal_sources, "as_of": as_of_utc, "model_name": model_name,
+        }
+        clauses = [
+            "source_module = ANY(:sources)", "valid_from <= :as_of",
+            "(valid_until IS NULL OR valid_until > :as_of)",
+            "EXISTS (SELECT 1 FROM oracle_models WHERE name = :model_name AND active IS TRUE)",
+        ]
         if ticker:
             params["ticker"] = ticker
             clauses.append("(ticker = :ticker OR ticker IS NULL OR ticker = '')")
@@ -276,9 +309,10 @@ class ModelFactory:
     def list_active_models(self) -> list[ModelSpec]:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT name FROM oracle_models WHERE active IS TRUE OR active IS NULL
+                SELECT name FROM oracle_models WHERE active IS TRUE ORDER BY name
             """)).fetchall()
-        return [self.get_model_spec(r[0]) for r in rows]
+        specs = [self.get_model_spec(r[0]) for r in rows]
+        return [spec for spec in specs if spec.active]
 
     def retire_model(self, model_name: str) -> None:
         with self.engine.begin() as conn:
@@ -311,7 +345,7 @@ def migrate_default_models(engine: Engine) -> None:
             conn.execute(text("""
                 UPDATE oracle_models
                 SET signal_sources = :ss, signal_filters = :sf, weight_config_json = :wc,
-                    active = TRUE, created_by = 'human', last_updated = NOW()
+                    last_updated = NOW()
                 WHERE name = :n AND signal_sources IS NULL
             """), {
                 "n": model_name,

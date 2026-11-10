@@ -23,6 +23,7 @@ fails on any skip. Proves, against a real database:
 from __future__ import annotations
 
 import importlib
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -84,11 +85,11 @@ def scratch(pg_engine: Engine):
             conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
 
 
-def _run(engine: Engine, fn_name: str) -> None:
+def _run(engine: Engine, fn_name: str, module_name: str = _MIGRATION) -> None:
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    migration = importlib.import_module(_MIGRATION)
+    migration = importlib.import_module(module_name)
     with engine.connect() as conn:
         trans = conn.begin()
         try:
@@ -200,6 +201,7 @@ class _Yahoo:
 def _capture(engine: Engine, monkeypatch, started: datetime, oi: dict[float, int],
              source: str = "options_puller") -> dict:
     """Run the real writer once, with the capture clock pinned to ``started``."""
+    _run(engine, "upgrade", "migrations.versions.options_spot_clock_20261110")
     completed = started + timedelta(minutes=2)
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -225,6 +227,90 @@ def _capture(engine: Engine, monkeypatch, started: datetime, oi: dict[float, int
         return puller._pull_ticker("SPY", SNAP_DAY.isoformat(), capture_source=source)
     finally:
         event.remove(engine, "before_cursor_execute", fixed_clock)
+
+
+def test_real_capture_registration_clock_qualifies_exact_spot_receipt(scratch, monkeypatch):
+    """Real PG clocks/transactions and a synthetic provider.
+
+    The real NY session is used during exchange hours. An injected session
+    keeps CI runnable off-hours, unless GRID_REQUIRE_REAL_SESSION=1 requires
+    an actual open exchange. Quote/read/database clocks are never restamped.
+    """
+    from ingestion import market_calendar
+    from oracle import entry_price_policy as policy
+
+    engine, _url = scratch
+    assert (engine.url.database or "").endswith("_test")
+    _run(engine, "upgrade")
+    _run(engine, "upgrade", "migrations.versions.options_spot_clock_20261110")
+    now = datetime.now(timezone.utc)
+    local = now.astimezone(policy._NY)
+    real_session = (market_calendar.is_market_open(local.date())
+                    and local.hour >= 10
+                    and local.time() < market_calendar.market_close_time(local.date()))
+    if os.environ.get("GRID_REQUIRE_REAL_SESSION") == "1":
+        assert real_session, "This proof requires the actual regular NY session"
+    if not real_session:
+        # Map actual UTC into 10:xx of the same synthetic session day for CI.
+        session_tz = timezone(timedelta(hours=10 - now.hour))
+        monkeypatch.setattr(options, "_EQUITY_TZ", session_tz)
+        monkeypatch.setattr(policy, "_NY", session_tz)
+        monkeypatch.setattr(options, "is_market_open", lambda day: True)
+        monkeypatch.setattr(market_calendar, "is_market_open", lambda day: True)
+    monkeypatch.setattr(options.time, "sleep", lambda seconds: None)
+    quote_at = (now - timedelta(minutes=2)).replace(microsecond=0)
+
+    class SyntheticProvider(_Yahoo):
+        provider = "cboe"
+        is_available = True
+
+        def get_options(self, ticker, expiry=None):
+            page = super().get_options(ticker, expiry)
+            page["expirations"] = [int((now + timedelta(days=d)).timestamp()) for d in (7, 14)]
+            page["quote"]["regularMarketPrice"] = 100.37
+            return page
+
+    puller = options.OptionsPuller.__new__(options.OptionsPuller)
+    puller.engine = engine
+    puller._ensure_tables()
+    provider = SyntheticProvider({95.0: 100, 105.0: 100}, quote_at)
+    monkeypatch.setattr(options, "options_primary_provider", lambda: "cboe")
+    monkeypatch.setattr(options, "CboeFirstOptionsClient", lambda: provider)
+    puller._push_to_resolved = lambda *args, **kwargs: 0
+    puller._mark_catalog_pulled = lambda **kwargs: True
+    results = puller.pull_all(["SPY"], capture_source="oracle_forward", should_continue=lambda: True)
+    assert len(results) == 1
+    result = results[0]
+    assert result["status"] == "SUCCESS", result
+    with engine.connect() as conn:
+        default = conn.execute(text("""
+            SELECT pg_get_expr(d.adbin, d.adrelid)
+            FROM pg_attrdef d JOIN pg_attribute a
+              ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+            WHERE d.adrelid = 'options_capture_batches'::regclass AND a.attname = 'registered_at'
+        """)).scalar_one()
+        assert default == "clock_timestamp()"
+        row = conn.execute(text("""SELECT provider_regular_market_at, capture_started_at,
+            capture_completed_at, registered_at, spot_provider, spot_price
+            FROM options_capture_batches""")).one()
+        assert row[0] == quote_at
+        assert row[0] <= row[1] <= row[2] <= row[3]
+        receipt = policy.load_quote_reference(conn, "SPY", as_of=datetime.now(timezone.utc))
+    decision = datetime.now(timezone.utc)
+    assert receipt["status"] == "measured", receipt
+    assert receipt["price"] == row[5] == 100.37
+    assert receipt["provider"] == row[4] == "cboe"
+    assert receipt["capture_source"] == "oracle_forward"
+    assert receipt["market_at"] == quote_at.isoformat()
+    assert row[3] <= datetime.fromisoformat(receipt["read_observed_at"]) <= decision
+    assert policy.validate_quote_reference(receipt, as_of=decision, ticker="SPY") is None
+    if os.environ.get("GRID_REQUIRE_REAL_SESSION") == "1":
+        print({"real_ny_session": real_session, "provider": receipt["provider"],
+               "capture_source": receipt["capture_source"], "market_at": receipt["market_at"],
+               "capture_completed_at": receipt["capture_completed_at"],
+               "registered_at": receipt["registered_at"],
+               "read_observed_at": receipt["read_observed_at"], "decision_at": decision.isoformat(),
+               "qualified": True})
 
 
 _EARLY_OI = {95.0: 500, 97.0: 10, 103.0: 10, 105.0: 500}

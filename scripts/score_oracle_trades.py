@@ -2,6 +2,10 @@
 """
 Score Oracle Trades — fix directions, score expired predictions.
 
+Invoked by the hourly catch-up script as well as the CLI. The Hermes Oracle
+engine imports the same completed-close helpers for its own scoring cycle.
+Both writers guard the pending-to-final transition before counting a result.
+
 Steps:
 1. Load settled expiry closes from raw_series through store/observations.py
    (EXPIRY_CLOSE_RULE: SUCCESS rows, latest vintage, raw close, nothing dated
@@ -49,7 +53,7 @@ from sqlalchemy.engine import Engine
 # does not import itself but which must be equally unaffected by anything
 # this import does to sys.path).
 from config import settings
-from ingestion.market_calendar import is_market_open
+from ingestion.market_calendar import is_market_open, market_close_time
 from oracle.entry_price_policy import (
     NULL_WRITE_POLICY,
     SCORE_NOTE_ENTRY_NULL,
@@ -68,8 +72,8 @@ from store.observations import (
 # does not already make this repo importable. Two guards, both required:
 #
 # * `__name__ == "__main__"` -- this must NEVER run when the module is
-#   merely imported (Hermes's oracle step does not import this module, but
-#   anything that ever does -- directly or transitively -- must not have
+#   merely imported (Hermes's oracle step imports its close helpers, and
+#   every caller -- directly or transitively -- must not have
 #   sys.path mutated as a side effect). The imports above already
 #   succeeded by this point however this module ended up loaded, so this
 #   line can only ever add a path, never fix a failure that already
@@ -151,7 +155,6 @@ EXPIRY_CLOSE_GRACE_DAYS = 4
 NOTE_NO_PRICE = "No price data at expiry"
 NOTE_NO_SESSION = "No trading session closed between creation and expiry"
 _NY = ZoneInfo("America/New_York")
-_REGULAR_CLOSE_NY = time(16, 0)
 _SETTLED_NY = time(17, 0)
 _CRYPTO_SYMBOLS = frozenset({"BTC-USD", "ETH-USD", "SOL-USD"})
 # Longest US equity closure is 4 calendar days (e.g. Good Friday weekend
@@ -198,10 +201,10 @@ def expiry_session_date(ticker: str, expiry: date) -> date | None:
 
 
 def session_close_utc(ticker: str, d: date) -> datetime:
-    """The instant session ``d`` stops trading (16:00 ET; crypto: UTC day end)."""
+    """The cash-equity session close, including half-days; crypto: UTC day end."""
     if _is_crypto(ticker):
         return datetime.combine(d + timedelta(days=1), time.min, timezone.utc)
-    return datetime.combine(d, _REGULAR_CLOSE_NY, _NY).astimezone(timezone.utc)
+    return datetime.combine(d, market_close_time(d), _NY).astimezone(timezone.utc)
 
 
 def session_settled_utc(ticker: str, d: date) -> datetime:
@@ -361,7 +364,8 @@ def classify_outcome(
         hit, pnl = actual < entry, -actual_move
     else:
         return None
-    exp_move = expected if expected else 1.0
+    # A stated zero is a direction-only threshold, not a missing estimate.
+    exp_move = expected if expected is not None else 1.0
     if hit and abs(actual_move) >= abs(exp_move) * 0.5:
         return "hit", actual_move, pnl
     if hit:
@@ -486,6 +490,7 @@ def score_one_chunk(
     now: datetime | None = None,
     after: tuple[Any, str] | None = None,
     splits: SplitBook | None = None,
+    verdicts_after_commit: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Score one chunk of expired-and-scoreable pending predictions.
 
@@ -507,6 +512,10 @@ def score_one_chunk(
     Each call must run inside its own ``engine.begin()`` block — that
     way the row-level locks released between chunks instead of being
     held for the entire 2.27M-row scoring run.
+
+    Lessons are queued in ``verdicts_after_commit`` when supplied. The
+    caller must emit them only after its transaction committed; this
+    function never writes a lesson on another connection before commit.
     """
     if now is None:
         now = datetime.combine(today, time.min, timezone.utc)
@@ -560,14 +569,16 @@ def score_one_chunk(
         # cannot sit 'pending' forever, and the two reasons stay distinct.
         entry_note = entry_price_score_note(entry)
         if entry_note is not None:
-            conn.execute(text("""
+            closed = conn.execute(text("""
                 UPDATE oracle_predictions
                 SET verdict = 'no_data', scored_at = NOW(),
                     score_notes = :notes
-                WHERE id = :id
-            """), {"id": pred_id, "notes": entry_note})
-            counters["unscorable_entry_price"] += 1
-            counters["no_data"] += 1
+                WHERE id = :id AND verdict = 'pending'
+                RETURNING id
+            """), {"id": pred_id, "notes": entry_note}).fetchone()
+            if closed is not None:
+                counters["unscorable_entry_price"] += 1
+                counters["no_data"] += 1
             continue
 
         res = resolve_expiry_close(prices, ticker, expiry, created_at=created_at, now=now)
@@ -575,13 +586,15 @@ def score_one_chunk(
             counters["pending_price"] += 1
             continue
         if res.status != "priced":
-            conn.execute(text("""
+            closed = conn.execute(text("""
                 UPDATE oracle_predictions
                 SET verdict = 'no_data', scored_at = NOW(),
                     score_notes = :notes
-                WHERE id = :id
-            """), {"id": pred_id, "notes": res.note})
-            counters["no_data"] += 1
+                WHERE id = :id AND verdict = 'pending'
+                RETURNING id
+            """), {"id": pred_id, "notes": res.note}).fetchone()
+            if closed is not None:
+                counters["no_data"] += 1
             continue
 
         actual, factor = split_adjusted_close(
@@ -593,39 +606,31 @@ def score_one_chunk(
             counters["skipped"] += 1
             continue
         verdict, actual_move, pnl = outcome
-        counters[{"hit": "hits", "partial": "partials", "miss": "misses"}[verdict]] += 1
-        if abs(factor - 1.0) > 1e-9:
-            counters["split_adjusted"] = counters.get("split_adjusted", 0) + 1
-
-        conn.execute(text("""
+        updated = conn.execute(text("""
             UPDATE oracle_predictions
             SET verdict = :v, actual_price = :ap, actual_move_pct = :am,
                 pnl_pct = :pnl, scored_at = NOW(),
                 score_notes = :notes
-            WHERE id = :id
+            WHERE id = :id AND verdict = 'pending'
+            RETURNING id
         """), {
             "v": verdict, "ap": actual, "am": round(actual_move, 2),
             "pnl": round(pnl, 2), "id": pred_id,
             "notes": _score_note(entry, res, actual_move, factor),
-        })
+        }).fetchone()
+        if updated is None:
+            continue
+        counters[{"hit": "hits", "partial": "partials", "miss": "misses"}[verdict]] += 1
+        if abs(factor - 1.0) > 1e-9:
+            counters["split_adjusted"] = counters.get("split_adjusted", 0) + 1
         counters["scored"] += 1
 
-        if verdict in ("hit", "partial"):
-            _record_success_lesson_safe(
-                engine=engine,
-                prediction_id=pred_id,
-                ticker=ticker,
-                direction=direction,
-                verdict=verdict,
-                confidence=conf,
-                expected_move_pct=expected,
-                actual_move_pct=actual_move,
-                pnl_pct=pnl,
-                signals_blob=signals_blob,
-                created_at=created_at,
-                expiry=expiry,
-                model=model,
-            )
+        if verdicts_after_commit is not None:
+            verdicts_after_commit.append({
+                "prediction_id": pred_id, "ticker": ticker, "direction": direction,
+                "verdict": verdict, "model": model, "created_at": created_at,
+                "expiry": expiry, "actual_move": actual_move, "pnl": pnl,
+            })
 
         col_map = {"hit": "hits", "partial": "partials", "miss": "misses"}
         verdict_col = col_map.get(verdict)
@@ -1254,6 +1259,7 @@ def main(argv: list[str] | None = None) -> None:
                 break
             chunk_size = min(chunk_size, remaining)
 
+        committed_verdicts: list[dict[str, Any]] = []
         with engine.begin() as chunk_conn:
             chunk_counters = score_one_chunk(
                 chunk_conn,
@@ -1264,7 +1270,17 @@ def main(argv: list[str] | None = None) -> None:
                 now=now,
                 after=cursor,
                 splits=splits,
+                verdicts_after_commit=committed_verdicts,
             )
+
+        # Use the same two-sided lesson writer as Hermes. Reaching this
+        # point proves commit; rollback/commit failure cannot emit a lesson.
+        if committed_verdicts:
+            from oracle.engine import OracleEngine
+
+            lesson_writer = OracleEngine.__new__(OracleEngine)
+            lesson_writer.engine = engine
+            lesson_writer._write_verdict_lessons(committed_verdicts)
 
         chunk_idx += 1
         fetched = chunk_counters.pop("fetched", 0)

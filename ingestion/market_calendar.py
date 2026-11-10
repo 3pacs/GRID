@@ -12,7 +12,7 @@ Usage:
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 from functools import lru_cache
 
 
@@ -119,6 +119,26 @@ def is_market_holiday(d: date) -> bool:
 def is_market_open(d: date) -> bool:
     """Return True if the US equity market is open on this date."""
     return not is_weekend(d) and not is_market_holiday(d)
+
+
+def market_close_time(d: date) -> time:
+    """NYSE cash-equity close in New York local time for a trading day.
+
+    Standard early closes: July 3 when open, the Friday after Thanksgiving,
+    and December 24 when open. Verified against the exchange's 2026–2028
+    calendar: https://www.nyse.com/markets/hours-calendars . Emergency
+    closures require an explicit calendar update, as with market_holidays.
+    This is the underlying equity close, not eligible options' 13:15 close.
+    """
+    if not is_market_open(d):
+        raise ValueError("non-trading day has no regular-session close")
+    november_first = date(d.year, 11, 1)
+    thanksgiving = november_first + timedelta(
+        days=(3 - november_first.weekday()) % 7 + 21,
+    )
+    if (d.month, d.day) in ((7, 3), (12, 24)) or d == thanksgiving + timedelta(days=1):
+        return time(13, 0)
+    return time(16, 0)
 
 
 def last_trading_day(d: date | None = None) -> date:

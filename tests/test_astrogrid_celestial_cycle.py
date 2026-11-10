@@ -16,6 +16,8 @@ constant for its own sake.
 
 from __future__ import annotations
 
+import ast
+import inspect
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -168,21 +170,22 @@ def test_interpret_false_skips_the_llm_call(
     assert result["errors"] == []
 
 
-def test_hermes_dry_run_passes_both_flags() -> None:
-    """A dry-run cycle must neither write nor call the model."""
-    import inspect
-
+def _hermes_cycle_call(name: str) -> ast.Call:
     from scripts import hermes_operator as ho
 
-    src = inspect.getsource(ho.run_cycle)
-    start = src.index("# 7c2. AstroGrid celestial cycle")
-    step = src[start : src.index("# 7d. Oracle prediction cycle", start)]
-    assert "persist=not dry_run" in step
-    assert "interpret=not dry_run" in step, (
-        "dry run must skip the interpretation too, or `hermes_operator "
-        "--dry-run` spends up to ASTROGRID_CELESTIAL_TIMEOUT_SECONDS on a "
-        "local-LLM call that produces nothing"
-    )
+    body = ast.parse(inspect.getsource(ho.run_cycle))
+    calls = [node for node in ast.walk(body) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == name]
+    assert len(calls) == 1, f"Expected one {name} call in the Hermes cycle"
+    return calls[0]
+
+
+def test_hermes_dry_run_passes_both_flags() -> None:
+    """A dry-run cycle must neither write nor call the model."""
+    call = _hermes_cycle_call("run_celestial_cycle")
+    flags = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+    assert flags.get("persist") == "not dry_run"
+    assert flags.get("interpret") == "not dry_run"
 
 
 def test_defaults_to_today_when_no_target_given(
@@ -310,14 +313,9 @@ def test_celestial_step_runs_before_the_oracle() -> None:
     bounded LLM call has no dependency on the oracle, so it belongs in front
     of it. If someone moves it back, this fails.
     """
-    import inspect
-
-    from scripts import hermes_operator as ho
-
-    src = inspect.getsource(ho.run_cycle)
-    assert src.index("# 7c2. AstroGrid celestial cycle") < src.index(
-        "# 7d. Oracle prediction cycle"
-    ), "the celestial step must run before the oracle, not behind it"
+    celestial = _hermes_cycle_call("run_celestial_cycle")
+    oracle = _hermes_cycle_call("_run_oracle_forward_step")
+    assert celestial.lineno < oracle.lineno, "Hermes must run the celestial step before the Oracle"
 
 
 # NOTE: an earlier test asserted the deferral guard was *reachable*, on the

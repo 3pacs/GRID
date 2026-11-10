@@ -591,7 +591,7 @@ JOBS: tuple[Job, ...] = (
         description="Global lever hierarchy (/intelligence/levers); the route falls back to a live build until the first result.",
     ),
     Job(
-        name="oracle_evidence", cadence_s=6 * HOUR, stale_after_s=36 * HOUR, version="1",
+        name="oracle_evidence", cadence_s=6 * HOUR, stale_after_s=36 * HOUR, version="2",
         build=build_oracle_evidence,
         outputs=(("oracle.evidence", _p()),),
         empty_fields={"oracle.evidence": ("summary", "models")},
