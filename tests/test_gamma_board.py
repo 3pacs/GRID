@@ -150,3 +150,17 @@ def test_immutable_batch_price_and_coverage(monkeypatch):
         data["net_gex"], abs=0.02
     )
     assert str(con.execute.call_args_list[0].args[0]) == "SET TRANSACTION READ ONLY"
+
+
+def test_private_snapshot_rechecks_freshness_on_cache_hit():
+    now = datetime.fromisoformat("2026-11-11T15:30:00+00:00")
+    stamp = (now - timedelta(seconds=121)).isoformat()
+    panel = {
+        "source": "Schwab",
+        "fresh": True,
+        "stale": False,
+        "as_of": stamp,
+        "spot_as_of": stamp,
+    }
+    result = board._stamp(panel, now)
+    assert result["stale"] and not result["fresh"]

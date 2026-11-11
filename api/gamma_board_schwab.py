@@ -38,7 +38,11 @@ def _rows(chain, side):
             yield from rows
 
 
-def aggregate(symbol, chain, *, now):
+class MissingOpenInterest(ValueError):
+    """Across the entire eligible chain the provider has no positive open interest."""
+
+
+def aggregate(symbol, chain, *, now, daily_oi=None):
     """Use the OCC identity, declared deliverable and provider timestamps; never substitute receipt."""
     requested = SYMBOLS[symbol]
     u = chain.get("underlying") or {}
@@ -63,7 +67,7 @@ def aggregate(symbol, chain, *, now):
     latest = None
     seen, incomplete = set(), set()
     covered = defaultdict(list)
-    dropped = count = 0
+    dropped = count = positive_oi = eligible = 0
     for i, side in enumerate(("call", "put")):
         for row in _rows(chain, side):
             occ = OCC.fullmatch(str(row.get("symbol", "")))
@@ -100,7 +104,15 @@ def aggregate(symbol, chain, *, now):
             ):
                 raise ValueError("Inconsistent contract identity")
             key = (exp.isoformat(), strike)
-            oi, gamma = row.get("openInterest"), row.get("gamma")
+            eligible += 1
+            oi = (
+                row.get("openInterest")
+                if daily_oi is None
+                else daily_oi.get(occ[0].replace(" ", ""))
+            )
+            gamma = row.get("gamma")
+            if _number(oi) and oi > 0:
+                positive_oi += 1
             if (
                 not _number(oi)
                 or oi < 0
@@ -135,6 +147,12 @@ def aggregate(symbol, chain, *, now):
             if stamp and (latest is None or stamp > latest):
                 latest = stamp
             count += 1
+    if eligible and not positive_oi:
+        raise MissingOpenInterest(
+            "Provider has no usable open interest across the chain"
+        )
+    if daily_oi is not None and count < 0.95 * eligible:
+        raise ValueError("Insufficient matched contract open interest")
     if not count or not latest:
         raise ValueError("No dated option quotes in scope")
     for cell in cells.values():
@@ -144,6 +162,8 @@ def aggregate(symbol, chain, *, now):
     ordered = sorted(totals)
     cw = max(ordered, key=lambda s: totals[s][0])
     pw = min(ordered, key=lambda s: totals[s][1])
+    if totals[cw][0] <= 0 and totals[pw][1] >= 0:
+        raise ValueError("No usable gamma exposure across the chain")
     realtime = chain.get("isDelayed") is False and u.get("delayed") is False
     fresh = bool(
         in_session
@@ -197,4 +217,31 @@ def read_board(symbol: str, *, now: datetime) -> dict:
             fromDate=day.isoformat(),
             toDate=(day + timedelta(days=30)).isoformat(),
         )
-    return aggregate(symbol, chain, now=datetime.now(timezone.utc))
+    received = datetime.now(timezone.utc)
+    try:
+        return aggregate(symbol, chain, now=received)
+    except MissingOpenInterest:
+        if symbol != "SPX":
+            raise
+    # Index chains can report zero OI throughout overnight trading. Match a single
+    # complete provider snapshot by OCC root, expiry, side and strike. Never combine
+    # different OI feeds across cells or assume that an unmatched contract has zero OI.
+    from api.gamma_board_oi import read_spx_oi
+
+    spot = chain["underlying"]["last"]
+    positions, observed = read_spx_oi(
+        day=day, low=spot * 0.95, high=spot * 1.05, now=received
+    )
+    panel = aggregate(symbol, chain, now=received, daily_oi=positions)
+    panel.update(
+        source_label="Schwab options chain + Massive daily open interest",
+        oi_source="Massive options snapshot",
+        oi_retrieved_at=observed.isoformat(),
+        source_note=(
+            "Daily open interest is matched by exact contract. Massive reports the latest "
+            "end-of-day count without a separate OI date. Snapshot retrieved "
+            + observed.isoformat(timespec="minutes")
+            + "."
+        ),
+    )
+    return panel
