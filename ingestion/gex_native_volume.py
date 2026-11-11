@@ -35,7 +35,14 @@ phantom or duplicated minutes (Yahoo's failure), far below it missing minutes.
 The gap is returned beside the payload for the operator log. Outside the
 regular session, without a full baseline, with no completed bar, or with bars
 older than the reader's 120 s limit, the status is not ``ready`` either.
-Signals never read this (``signal_confirmation`` False).
+Validation and coverage come first: the response must be SPY's with no
+duplicate minute, and every regular minute 09:30..last completed must be present
+today and in each of the exact prior ten sessions (else ``failed`` /
+``coverage_failed``; the scope gate cannot see a single missing or doubled
+minute). Sessions are the dates that have regular bars, not an exchange
+calendar: a wholly missing session is not detected as such, and the afternoons
+after an early close fail coverage until it leaves the ten. Signals never read
+this (``signal_confirmation`` False).
 """
 
 from __future__ import annotations
@@ -141,6 +148,12 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
     today = _session(now)
     if not _regular(now):
         return _payload(now, "closed", "outside_regular_session"), info
+    # Validation: the response is SPY's, and no minute appears twice (a duplicate
+    # would be counted twice; the scope gate cannot see one extra minute).
+    if str((history or {}).get("symbol") or "").strip().upper() != SYMBOL:
+        return _payload(now, "failed", "wrong_symbol"), info
+    if len({b[0] for b in bars}) != len(bars):
+        return _payload(now, "failed", "duplicate_minute"), info
     completed = [b for b in bars if b[0] + BAR_SECONDS + RECEIPT_GUARD_S <= receipt_at]
     today_all = [b for b in completed if _session(b[0]) == today]
     today_reg = [b for b in today_all if _regular(b[0])]
@@ -148,23 +161,32 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
         return _payload(now, "unavailable", "no_completed_regular_bar"), info
     end = today_reg[-1][0] + BAR_SECONDS
     through = _minute_of_session(today_reg[-1][0])
+    # Coverage: every regular minute 09:30..last completed is present today, and
+    # in each of the exact prior ten sessions. A missing minute undercounts (or
+    # skews the baseline) without moving the scope gap out of its band.
+    if [_minute_of_session(b[0]) for b in today_reg] != list(range(through + 1)):
+        return _payload(now, "coverage_failed", "missing_current_minute"), info
     cum = sum(b[4] for b in today_reg)
     if cum <= 0:
         return _payload(now, "unavailable", "zero_volume"), info
     vwap = sum((b[1] + b[2] + b[3]) / 3.0 * b[4] for b in today_reg) / cum
 
+    minutes: dict[date, set[int]] = {}
     prior: dict[date, int] = {}
-    full: set[date] = set()
     for b in bars:
         s = _session(b[0])
         if s >= today or not _regular(b[0]):
             continue
         m = _minute_of_session(b[0])
+        minutes.setdefault(s, set()).add(m)
         if m <= through:
             prior[s] = prior.get(s, 0) + b[4]
-        if m >= through:
-            full.add(s)   # the session reached this minute, so its cumulative is comparable
-    sessions = sorted(s for s in prior if s in full)[-BASELINE_SESSIONS:]
+    # The exact prior ten sessions (dates with regular bars), never an older
+    # substitute for one that is incomplete: RVOL_BASIS promises exactly these.
+    sessions = sorted(minutes)[-BASELINE_SESSIONS:]
+    need = set(range(through + 1))
+    if len(sessions) == BASELINE_SESSIONS and any(not need <= minutes[s] for s in sessions):
+        return _payload(now, "coverage_failed", "missing_baseline_minute"), info
     fields = {
         "end_of_completed_window": _iso(end), "latest_receipt_at": _iso(receipt_at),
         "receipt_age_seconds": now - receipt_at, "event_age_seconds": now - end,

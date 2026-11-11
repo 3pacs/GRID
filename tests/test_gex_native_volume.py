@@ -142,8 +142,8 @@ def test_outside_the_regular_session_is_closed():
 
 
 def test_too_few_baseline_sessions_is_not_ready():
-    hist = {"candles": [c for c in _history()["candles"]
-                        if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() >= PRIOR[4]]}
+    hist = {"symbol": "SPY", "candles": [c for c in _history()["candles"]
+                                         if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() >= PRIOR[4]]}
     assert _run(hist=hist)[0]["reason"] == "insufficient_baseline_sessions"
 
 
@@ -189,3 +189,53 @@ def test_snapshot_file_is_private_and_single_linked(tmp_path):
     os.chmod(d, 0o755)
     with pytest.raises(SystemExit):
         snap.write_private(d / "snapshot.json", {})
+
+
+# ── validation and coverage (single-producer kit, 2026-11-11) ───────────────
+
+
+def test_a_response_for_another_symbol_is_refused():
+    hist = _history()
+    hist["symbol"] = "QQQ"
+    p, _ = _run(hist=hist)
+    assert (p["status"], p["reason"]) == ("failed", "wrong_symbol")
+
+
+def test_a_duplicate_minute_is_refused_not_double_counted():
+    hist = _history()
+    hist["candles"].append(dict(hist["candles"][-1]))
+    p, _ = _run(hist=hist)
+    assert (p["status"], p["reason"]) == ("failed", "duplicate_minute")
+
+
+def test_a_missing_minute_today_fails_coverage():
+    hist = _history()
+    gap = int(_ts(TODAY, 10, 0) * 1000)
+    hist["candles"] = [c for c in hist["candles"] if c["datetime"] != gap]
+    p, _ = _run(hist=hist)
+    assert (p["status"], p["reason"]) == ("coverage_failed", "missing_current_minute")
+
+
+def test_a_missing_minute_in_a_baseline_session_fails_coverage():
+    hist = _history()
+    gap = int(_ts(PRIOR[0], 9, 45) * 1000)     # the most recent prior session
+    hist["candles"] = [c for c in hist["candles"] if c["datetime"] != gap]
+    p, _ = _run(hist=hist)
+    assert (p["status"], p["reason"]) == ("coverage_failed", "missing_baseline_minute")
+
+
+def test_a_baseline_gap_after_the_current_minute_does_not_matter():
+    hist = _history()
+    late = int(_ts(PRIOR[0], 15, 0) * 1000)    # 15:00 is after 10:29, the last completed minute
+    hist["candles"] = [c for c in hist["candles"] if c["datetime"] != late]
+    assert _run(hist=hist)[0]["status"] == "ready"
+
+
+def test_an_incomplete_baseline_session_is_not_replaced_by_an_older_one():
+    hist = _history()
+    newest = PRIOR[0]
+    hist["candles"] = [c for c in hist["candles"]
+                       if not (datetime.fromtimestamp(c["datetime"] / 1000, ET).date() == newest
+                               and datetime.fromtimestamp(c["datetime"] / 1000, ET).hour == 10)]
+    p, _ = _run(hist=hist)
+    assert p["status"] == "coverage_failed" and p["baseline_sessions"] == []
