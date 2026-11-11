@@ -200,3 +200,31 @@ TICKER_STATUS:
   UMG:
     status: foreign_listing
     note: Euronext Amsterdam; Tiingo UMG is United Malt (ASX), OTC ADR UNVGY exists
+
+  # ── stopped: Tiingo keeps serving frozen rows (added 2026-11-11) ────────────
+  # Tiingo's daily endpoint answers for these after their last session with one
+  # row a day at the last price and volume 0 (CHL: 36,358 rows since 2021). The
+  # nightly pull stored them, so sector-map readers saw dead names at a flat
+  # price. last_session = the earlier of Tiingo's /tiingo/daily/{t} endDate and
+  # the last TIINGO volume > 0 in raw_series (NOVA/FL also had stray 2026-06
+  # rows; SDIG's symbol now belongs to another issuer). tiingo_symbol_contract
+  # drops every TIINGO row after it; price_ticker gives None. Found by
+  # scripts/classify_tiingo_dead_tickers.py (1,184 sector-map tickers checked).
+  CHL: {status: delisted, last_session: 2021-01-08, note: China Mobile ADR; NYSE delisting}
+  CEO: {status: delisted, last_session: 2021-03-08, note: CNOOC ADR; NYSE delisting}
+  TTM: {status: delisted, last_session: 2023-01-23, note: Tata Motors ADR; NYSE delisting}
+  LSXMA: {status: delisted, last_session: 2024-09-09, note: Liberty SiriusXM tracking stock}
+  GOEV: {status: delisted, last_session: 2025-01-28, note: Canoo}
+  NOVA: {status: delisted, last_session: 2025-06-09, note: Sunnova; stray 2026-06 TIINGO rows after it}
+  JBSAY: {status: delisted, last_session: 2025-06-10, note: JBS SA OTC ADR}
+  TPIC: {status: delisted, last_session: 2025-08-18, note: TPI Composites (OTC at the end)}
+  FL: {status: delisted, last_session: 2025-09-05, note: Foot Locker; stray 2026-06 TIINGO rows after it}
+  GHLD: {status: delisted, last_session: 2025-11-26, note: Guild Holdings}
+  HBI: {status: delisted, last_session: 2025-12-01, note: Hanesbrands}
+  ZK: {status: delisted, last_session: 2025-12-19, note: ZEEKR}
+  SDIG: {status: delisted, last_session: 2025-03-18, note: 'Stronghold Digital; the symbol now belongs to StationDigital Corp (PINK, Tiingo endDate 2026-05-28): rows after 2025-03-18 are not this issuer'}
+  SNBR: {status: delisted, last_session: 2026-06-22, note: Sleep Number (OTC at the end)}
+  LXP: {status: delisted, last_session: 2026-10-30, note: LXP Industrial Trust}
+  RAMP: {status: delisted, last_session: 2026-10-30, note: LiveRamp}
+  # Tiingo 404 (no rows written, so no frozen prices; probably renamed, review):
+  # BITF, FI, GREE, HHC.
