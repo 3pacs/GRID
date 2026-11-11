@@ -86,3 +86,20 @@ def test_negative_sentinel_not_included_or_sold_as_real_zero():
     j["putExpDateMap"]["2026-11-11:0"]["7500.0"][0]["gamma"] = -999.0
     with pytest.raises(ValueError, match="No dated option quotes"):
         aggregate("SPX", j, now=NOW)
+
+
+def test_whole_chain_zero_is_unavailable_not_zero_gex():
+    from api.gamma_board_schwab import MissingOpenInterest
+
+    j = chain()
+    for side in ("call", "put"):
+        j[side + "ExpDateMap"]["2026-11-11:0"]["7500.0"][0]["openInterest"] = 0
+    with pytest.raises(MissingOpenInterest):
+        aggregate("SPX", j, now=NOW)
+    exact = {"SPXW261111C07500000": 10, "SPXW261111P07500000": 4}
+    b = aggregate("SPX", j, now=NOW, daily_oi=exact)
+    assert b["net_gex"] == 3375000 and b["call_wall"] == b["put_wall"] == 7500
+    with pytest.raises(ValueError):
+        aggregate("SPX", j, now=NOW, daily_oi={**exact, "SPXW261111C07500000": None})
+    with pytest.raises(MissingOpenInterest):
+        aggregate("SPX", j, now=NOW, daily_oi={"SPX261111C07500000": 10})

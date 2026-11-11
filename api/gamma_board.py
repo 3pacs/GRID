@@ -191,17 +191,20 @@ def _database_panel(symbol, now):
 
 def _stamp(panel, now):
     clocks = [panel.get("as_of"), panel.get("spot_as_of")]
+    live_provider = panel.get("source") == "Schwab"
+    maximum = timedelta(minutes=2 if live_provider else 20)
     try:
         ages = [now - datetime.fromisoformat(s) for s in clocks]
-        outdated = any(
-            age < timedelta(seconds=-5) or age > timedelta(minutes=20) for age in ages
-        )
+        outdated = any(age < timedelta(seconds=-5) or age > maximum for age in ages)
     except (TypeError, ValueError):
         outdated = True
+    is_open = session_open(now)
+    stale = bool(panel.get("stale") or outdated or (live_provider and not is_open))
     return {
         **panel,
-        "session_open": session_open(now),
-        "stale": bool(panel.get("stale") or outdated),
+        "session_open": is_open,
+        "stale": stale,
+        "fresh": bool(panel.get("fresh") and not stale),
     }
 
 
@@ -229,7 +232,11 @@ def read_panel(symbol, enabled):
                     symbol,
                     type(exc).__name__,
                 )
-            reason = "Private chain unavailable."
+            reason = (
+                "SPX chain or matching contract open interest unavailable."
+                if symbol == "SPX"
+                else "Private chain unavailable."
+            )
         if panel is None:
             try:
                 panel = _database_panel(symbol, now)
