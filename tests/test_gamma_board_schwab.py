@@ -114,3 +114,33 @@ def test_generic_equity_requires_matching_standard_option_root():
     assert aggregate("AAPL", j, now=NOW)["contracts"] == 2
     with pytest.raises(ValueError):
         aggregate("MSFT", j, now=NOW)
+
+
+@pytest.mark.parametrize("stale_clock", [MS - 120001, None, MS + 1])
+def test_recorder_omits_entire_cell_on_stale_leg_without_rejecting_valid_oi(
+    stale_clock,
+):
+    j = chain()
+    exact = {}
+    for side, cp in (("call", "C"), ("put", "P")):
+        strikes = j[side + "ExpDateMap"]["2026-11-11:0"]
+        template = strikes["7500.0"][0]
+        exact[template["symbol"].replace(" ", "")] = 10
+        extra = dict(
+            template, symbol="SPXW  261111" + cp + "07505000", strikePrice=7505.0
+        )
+        if cp == "P":
+            extra["quoteTimeInLong"] = stale_clock
+        strikes["7505.0"] = [extra]
+        exact[extra["symbol"].replace(" ", "")] = 10
+    r = aggregate("SPX", j, now=NOW, require_pair=True, daily_oi=exact)
+    assert [c["strike"] for c in r["cells"]] == [7500.0]
+    assert (
+        r["contracts"] == 2
+        and r["earliest_included_quote_at"]
+        == datetime.fromtimestamp((MS - 2000) / 1000, timezone.utc).isoformat()
+    )
+    assert len(aggregate("SPX", j, now=NOW, daily_oi=exact)["cells"]) == 2
+    exact.pop("SPXW261111P07505000")
+    with pytest.raises(ValueError, match="Insufficient matched"):
+        aggregate("SPX", j, now=NOW, daily_oi=exact, require_pair=True)

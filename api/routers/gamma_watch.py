@@ -7,12 +7,14 @@ import os
 import sqlite3
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlencode
 
 from fastapi import Path as ApiPath
+from pydantic import BaseModel, StrictBool
+from fastapi import HTTPException
 from fastapi import APIRouter, Depends, Query, Response
 
 from api.gamma_board_symbols import SYMBOL_PATTERN
@@ -169,3 +171,40 @@ def instrument_intraday(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN)],
     response.headers["Cache-Control"] = "no-store, private"
     response.headers["X-GRID-Audience"] = "private"
     return read_intraday(symbol, settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED)
+
+
+@router.get("/time-map/{symbol}", dependencies=[Depends(require_role("admin"))])
+def instrument_time_map(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max_length=5)], response: Response,
+                        session_date: date | None = Query(default=None)) -> dict:
+    """Read recorded strike exposures for a single cash session."""
+    from api.gamma_time_store import read_time_map
+    from api.gamma_time_watchlist import is_tracked
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    if not settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED:
+        return {"symbol":symbol,"status":"unavailable","reason":"Private board disabled.",
+                "times":[],"strikes":[],"values":[],"spot":[],"tracking":False}
+    return {**read_time_map(symbol,session_date), "tracking":is_tracked(symbol)}
+
+
+class TrackingRequest(BaseModel):
+    enabled: StrictBool
+
+
+@router.post("/time-map/{symbol}/tracking", dependencies=[Depends(require_role("admin"))])
+def set_time_tracking(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max_length=5)],
+                      request: TrackingRequest, response: Response) -> dict:
+    from api.gamma_time_watchlist import TrackingLimit, set_tracking
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    if not settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED:
+        raise HTTPException(status_code=503, detail="Private GEX recorder is disabled.")
+    try:
+        return {"symbol": symbol, "tracking": set_tracking(symbol, request.enabled)}
+    except TrackingLimit as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except (OSError, sqlite3.Error):
+        raise HTTPException(status_code=503, detail="GEX recording settings unavailable.") from None
