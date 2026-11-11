@@ -6,10 +6,7 @@ The GRID page is the shared comparison screen for SPX, SPY, QQQ and supported st
 
 Minute OHLC charts can be rebuilt from dated underlying bars. Each bar belongs to its exchange session; missing minutes remain gaps. The current call and put wall snapshots may serve as *current references*, not as evidence of where a wall stood earlier in the session.
 
-To extend the dedicated SPY strike-by-time display to the other symbols:
-1. Record one snapshot per tracked symbol per regular-session minute from a server-side collector, even when no browser is open. Persist the observation time, quote time, source, OI provenance, scope and version, per-strike signed GEX and contemporaneous walls. Do not recalculate old samples using the latest chain.
-2. Distinguish the same-day PM expiry book from the broader 30-day book. Skip AM-settled expiring series. Compare one SPY session to the existing collector using the same scope; explain methodology/coverage differences before comparing numeric levels. Start the SPX and QQQ historical displays at their first recorded observation.
-3. Add a time axis to the strike heat map and overlay the recorded walls on the minute price path. Preserve missing intervals and stale inputs. A custom ticker can have on-demand price history immediately; full-session GEX history requires explicit collection of that ticker.
+The strike-by-time chart uses saved observations from a single expiry. Each column shows the exposure recorded at that minute, with the observed spot price overlaid. Missing observations remain gaps; the chart does not reconstruct the morning from an afternoon options chain. The separate strike-by-expiry snapshot can cover several expirations and is not directly comparable.
 
 ## Futures context and evaluation
 
