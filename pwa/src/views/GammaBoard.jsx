@@ -64,7 +64,7 @@ function useFeed(symbol, refresh, kind, sessionDate = '') {
                     return;
                 }
                 if (next?.symbol === symbol && next.status === 'unavailable') {
-                    setState({ snapshot: null, loading: false, tracking:next.tracking, readAt, status: next.reason || `${kind} unavailable.` });
+                    setState({ snapshot: null, loading: false, tracking:next.tracking, readAt, sessionDate:next.session_date, status: next.reason || `${kind} unavailable.` });
                     return;
                 }
                 const valid = next?.symbol === symbol && next.status === 'available'
@@ -192,7 +192,9 @@ function SessionHistory({symbol, refresh, sessionDate, extra}) {
         <h3>GEX heatmap <small>strike × session time</small></h3>
         {h.status && <div className={h.snapshot ? 'gb-status' : 'gb-history-empty'} role="status">
             {!h.snapshot && <strong>{h.loading ? 'Loading session history' : 'Session heatmap unavailable'}</strong>}
-            <span>{h.status}</span></div>}
+            <span>{h.status}{h.sessionDate && !h.snapshot ? ' ('+h.sessionDate+')' : ''}</span>
+            {!extra && !sessionDate && h.tracking === true && h.status === 'No strike history recorded for this session.' &&
+                <span>Recording is enabled. New minutes will appear during regular trading hours when fresh quotes arrive.</span>}</div>}
         {h.snapshot && <GammaSessionMap map={h.snapshot} />}
         {extra && <div className="gb-record"><button type="button" disabled={saving || typeof tracked !== 'boolean'} onClick={toggle}>
             {saving?'Saving…':tracked?'Stop recording':'Record future minutes'}</button>

@@ -63,6 +63,15 @@ it('renders three independent maps and never fills an unavailable or newly selec
     fireEvent.click(screen.getByText('Latest session'));await act(async()=>{});
     expect(screen.getByRole('img',{name:/SPY net gamma by strike and recorded minute/})).toBeInTheDocument();
 });
+it('explains enabled future recording only for a confirmed empty latest pinned session',async()=>{
+    api.getGammaSessionMap.mockImplementation(s=>Promise.resolve({symbol:s,status:'unavailable',tracking:true,
+        session_date:'2026-11-10',reason:s==='QQQ'?'Storage unavailable.':'No strike history recorded for this session.'}));
+    render(<GammaBoard/>);await act(async()=>{});
+    expect(screen.getAllByText(/New minutes will appear/)).toHaveLength(2);
+    expect(within(screen.getByRole('article',{name:'QQQ gamma exposure'})).queryByText(/New minutes will appear/)).toBeNull();
+    fireEvent.change(screen.getByLabelText('Recorded session'),{target:{value:'2026-11-10'}});await act(async()=>{});
+    expect(screen.queryByText(/New minutes will appear/)).toBeNull();
+});
 it('recording an extra ticker requires its explicit server acknowledgement, independently of the local card',async()=>{
     api.getGammaSessionMap.mockImplementation(s=>Promise.resolve({symbol:s,status:'unavailable',reason:'No recordings.',tracking:false}));
     api.setGammaSessionTracking.mockResolvedValueOnce({error:true,status:409}).mockResolvedValueOnce({symbol:'AAPL',tracking:true});

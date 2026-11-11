@@ -25,6 +25,7 @@ def test_capture_observed_frame_and_provenance():
         spot=600,
         source_label="private",
         as_of=NOW.isoformat(),
+        earliest_included_quote_at=NOW.isoformat(),
         spot_as_of=NOW.isoformat(),
         cells=[dict(expiry=str(DAY), strike=605, net_gex=-2300)],
     )
@@ -47,6 +48,18 @@ def test_capture_observed_frame_and_provenance():
             write=write,
         )
         == "unqualified"
+    )
+    assert (
+        capture(
+            "QQQ",
+            clock=lambda: NOW,
+            read=lambda *a, **k: {
+                **panel,
+                "earliest_included_quote_at": "2026-11-10T17:28:39+00:00",
+            },
+            write=write,
+        )
+        == "stale"
     )
     assert len(saved) == 1
     assert (

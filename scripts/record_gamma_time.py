@@ -2,7 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import logging
 import os
 from pathlib import Path
@@ -44,9 +44,15 @@ def capture(symbol, *, clock=_utc, read=read_board, write=write_frame):
     expiry = date.fromisoformat(panel["expiries"][0])
     if expiry < day or (symbol in PINNED and expiry != day):
         return "ineligible_expiry"
-    clocks = {k: datetime.fromisoformat(panel[k]) for k in ("as_of", "spot_as_of")}
+    clock_fields = ("as_of", "spot_as_of", "earliest_included_quote_at")
+    if any(not panel.get(k) for k in clock_fields):
+        return "stale"
+    clocks = {k: datetime.fromisoformat(panel[k]) for k in clock_fields}
+    session_start = datetime.combine(day, time(9, 30), NY)
     if any(
-        v.tzinfo is None or not timedelta(0) <= observed - v <= timedelta(seconds=120)
+        v.utcoffset() is None
+        or v < session_start
+        or not timedelta(0) <= observed - v <= timedelta(seconds=120)
         for v in clocks.values()
     ):
         return "stale"

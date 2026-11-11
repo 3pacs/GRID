@@ -64,7 +64,9 @@ def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
         9, 30
     ) <= local.time() < market_close_time(today)
     cells, roots, totals = {}, defaultdict(set), defaultdict(lambda: [0.0, 0.0])
-    latest = None
+    latest = oldest = None
+    session_start = datetime.combine(today, time(9, 30), NY)
+    matched_oi = 0
     seen, incomplete = set(), set()
     covered = defaultdict(list)
     sides = defaultdict(set)
@@ -112,6 +114,8 @@ def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
                 else daily_oi.get(occ[0].replace(" ", ""))
             )
             gamma = row.get("gamma")
+            if daily_oi is not None and _number(oi) and oi >= 0 and int(oi) == oi:
+                matched_oi += 1
             if _number(oi) and oi > 0:
                 positive_oi += 1
             if (
@@ -120,6 +124,16 @@ def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
                 or int(oi) != oi
                 or (oi > 0 and (not _number(gamma) or gamma < 0))
             ):
+                incomplete.add(key)
+                dropped += 1
+                continue
+            stamp = _clock(row.get("quoteTimeInLong"), now)
+            if require_pair and (
+                stamp is None
+                or stamp < session_start
+                or not 0 <= (now - stamp).total_seconds() <= 120
+            ):
+                # Withhold the entire cell: a new put cannot date an old call.
                 incomplete.add(key)
                 dropped += 1
                 continue
@@ -138,7 +152,7 @@ def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
             cell[side + "_oi"] += int(oi)
             cell[side + "_gex"] += exposure
             sides[key].add(side)
-            covered[key].append((root, _clock(row.get("quoteTimeInLong"), now)))
+            covered[key].append((root, stamp))
     if require_pair:
         incomplete.update(key for key in cells if len(sides[key]) != 2)
     for key in incomplete:
@@ -150,12 +164,17 @@ def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
             roots[key[0]].add(root)
             if stamp and (latest is None or stamp > latest):
                 latest = stamp
+            if stamp and (oldest is None or stamp < oldest):
+                oldest = stamp
             count += 1
     if eligible and not positive_oi:
         raise MissingOpenInterest(
             "Provider has no usable open interest across the chain"
         )
-    if daily_oi is not None and count < 0.95 * eligible:
+    # Snapshot coverage and quote freshness answer different questions. An exact
+    # OI match may legitimately have an old quote and be omitted from this frame.
+    oi_coverage = matched_oi if require_pair else count
+    if daily_oi is not None and oi_coverage < 0.95 * eligible:
         raise ValueError("Insufficient matched contract open interest")
     if not count or not latest:
         raise ValueError("No dated option quotes in scope")
@@ -185,6 +204,7 @@ def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
         "units": "USD per 1% underlying move",
         "source": "Schwab",
         "as_of": latest.isoformat(),
+        **({"earliest_included_quote_at": oldest.isoformat()} if require_pair else {}),
         "spot_as_of": trade.isoformat() if trade else None,
         "last_trade_at": trade.isoformat() if trade else None,
         "underlying_quote_at": quote.isoformat() if quote else None,
@@ -275,7 +295,11 @@ def read_board(symbol: str, *, now: datetime, time_map: bool = False) -> dict:
         day=day, low=spot * 0.95, high=spot * 1.05, now=received
     )
     panel = aggregate(
-        symbol, chain, now=received, daily_oi=positions, require_pair=time_map
+        symbol,
+        chain,
+        now=datetime.now(timezone.utc) if time_map else received,
+        daily_oi=positions,
+        require_pair=time_map,
     )
     panel.update(
         source_label="Schwab options chain + Massive daily open interest",
