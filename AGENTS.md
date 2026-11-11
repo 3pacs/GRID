@@ -473,3 +473,13 @@ and never sends. Disabled cadence templates are a proposal only. The original
 7ff8a664 staged bootstrap and 14:40Z schedule stay unchanged. No provider call,
 production change, service restart, real alert, release apply or activation.
 See docs/NATIVE-VOLUME-OPERATIONS-20261111.md for gates and verification.
+
+
+## 2026-11-11 — Native-volume failure diagnostics, source only
+
+Isolated c59f0291-based candidate adds fixed failure stages and private bounded
+unvalidated response custody before semantic validation, with accepted receipt
+names granted only after unchanged validation. No retry/reset/recovery bypass,
+provider request, server change, GEX change, timer or consumer activation.
+Original failed root stays preserved. See docs/NATIVE-VOLUME-DIAGNOSTICS-20261111.md
+for uncertainty, custody, source-only verification and user-only release gates.

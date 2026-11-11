@@ -21,7 +21,7 @@ import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ingestion.realtime.native_volume_cache import _private
+from ingestion.realtime.native_volume_cache import _private, failure_stage
 from ingestion.realtime.minute_retention import sqlite_loader
 from ingestion.realtime.native_volume_worker import (
     run_once,
@@ -151,6 +151,7 @@ def _main(
         print(json.dumps({"status": "refused", "reason": "explicit --fetch required"}))
         return 2
     clock = clock or (lambda: datetime.now(timezone.utc))
+    stage = "preflight"
     try:
         root = args.root
         if not root.is_absolute() or root.resolve() != root:
@@ -175,6 +176,7 @@ def _main(
             if request_plan(calendar, key, now, prior) is None:
                 print(json.dumps({"status": "idle", "requested": False}))
                 return 0
+            stage = "worker"
             outcome = run_once(
                 LazyClient(client_factory),
                 root=root,
@@ -187,6 +189,7 @@ def _main(
                 incremental_only=args.incremental_only,
             )
             if outcome.get("requested"):
+                stage = "snapshot"
                 # Snapshot creation is also serialized with the same writer lock.
                 with owner_lock(root):
                     snapshot = build_snapshot(
@@ -211,12 +214,13 @@ def _main(
             else:
                 print(json.dumps({"status": "idle", "requested": False}))
             return 0
-    except Exception:
+    except Exception as exc:
         # No chained errors, provider payloads, secret paths or config values.
         print(
             json.dumps(
                 {
                     "status": "blocked",
+                    "failure_stage": failure_stage(exc, stage),
                     "reason": "preflight, acquisition or snapshot failed; inspect private checkpoint and receipts before manual recovery",
                 }
             )
@@ -233,6 +237,7 @@ def main(argv=None, **kwargs):
             json.dumps(
                 {
                     "status": "blocked",
+                    "failure_stage": "deadline_uncertain",
                     "reason": "45-second invocation deadline; inspect checkpoint and receipts; no automatic retry",
                 }
             )

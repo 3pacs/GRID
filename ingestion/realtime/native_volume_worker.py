@@ -18,6 +18,8 @@ from ingestion.realtime.minute_retention import initialize, sqlite_loader
 from ingestion.realtime.native_minutes import select_as_of
 from ingestion.realtime.native_volume_cache import (
     fetch_and_retain,
+    NativeVolumeFailure,
+    failure_stage,
     _private,
     MAX_BYTES,
     MIN_FREE_BYTES,
@@ -210,12 +212,11 @@ def run_once(
                 receipts_dir=receipts,
                 clock=clock,
             )
-        except Exception:
+        except Exception as exc:
+            state["failure_stage"] = failure_stage(exc)
             state["status"] = "failed"
             _checkpoint(root, state)
-            raise RuntimeError(
-                "native volume invocation failed; inspect retained receipts before recovery"
-            ) from None
+            raise NativeVolumeFailure(state["failure_stage"]) from None
         # A successful HTTP response is not bootstrap completeness. Do not strand
         # missing baseline/session minutes behind an incremental checkpoint.
         try:
@@ -250,11 +251,10 @@ def run_once(
                 if {b.ts for b in selected} != expected:
                     raise ValueError("incomplete retained coverage")
         except Exception:
+            state["failure_stage"] = "coverage"
             state["status"] = "coverage_failed"
             _checkpoint(root, state)
-            raise RuntimeError(
-                "native volume coverage incomplete; explicit recovery required"
-            ) from None
+            raise NativeVolumeFailure("coverage") from None
         state.update(
             status="complete",
             receipt_sha256=result["receipt_sha256"],

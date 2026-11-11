@@ -27,7 +27,8 @@ def test_invalid_source_no_append(setup):
     class Bad(Client):
         def price_history(self,*a,**k):return {'symbol':'WRONG','candles':[]}
     with pytest.raises(ValueError):run(Bad(),setup)
-    assert not list(Path(setup['receipts_dir']).glob('*.json'))
+    assert len(list(Path(setup['receipts_dir']).glob('unvalidated-*.json'))) == 1
+    assert not list(Path(setup['receipts_dir']).glob('[0-9a-f]' * 64 + '.json'))
 
 def test_client_retry_refused(setup):
     c=Client();c._max_retries=4

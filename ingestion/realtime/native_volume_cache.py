@@ -26,6 +26,21 @@ MIN_FREE_BYTES = 64_000_000
 MAX_INVENTORY_FILES = 10_000
 
 
+class NativeVolumeFailure(ValueError, RuntimeError):
+    """Fixed stage only; never carries a provider message or exception type."""
+
+    def __init__(self, stage):
+        self.stage = stage if stage in {
+            "request", "capture", "validation", "append", "coverage"
+        } else "unknown"
+        message = "coverage incomplete" if self.stage == "coverage" else f"{self.stage} failed"
+        super().__init__(f"native volume {message}; inspect retained receipts; no automatic retry")
+
+
+def failure_stage(exc, fallback="unknown"):
+    return exc.stage if type(exc) is NativeVolumeFailure else fallback
+
+
 def disk_inventory(dfd):
     """Bounded stat-only accounting under the already-open owner-private root.
 
@@ -146,13 +161,13 @@ def _validate(receipt):
 
 
 def retain_receipt(receipt, *, store, receipts_dir):
-    """Validate, save immutable receipt, append revisions. Exact replay inserts zero."""
+    """Capture privately, validate, publish receipt, append. Replay inserts zero."""
     root = _private(receipts_dir, directory=True)
     _private(store)
-    parsed = _validate(receipt)
     raw = _encoded(receipt)
     digest = hashlib.sha256(raw).hexdigest()
-    target = root / (digest + ".json")
+    capture = root / ("unvalidated-" + digest + ".json")
+    target = capture
     # Link a complete fsynced private tempfile atomically, never overwrite a receipt.
     fd, temporary = tempfile.mkstemp(prefix=".native-receipt-", dir=root)
     try:
@@ -175,7 +190,30 @@ def retain_receipt(receipt, *, store, receipts_dir):
             os.close(fd)
     finally:
         os.unlink(temporary)
-    inserted = append(store, parsed.bars)
+    try:
+        parsed = _validate(receipt)
+    except Exception:
+        raise NativeVolumeFailure("validation") from None
+    # Only a validated capture may acquire the accepted receipt filename.
+    target = root / (digest + ".json")
+    try:
+        os.link(capture, target, follow_symlinks=False)
+    except FileExistsError:
+        _private(target)
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as f:
+            if f.read(MAX_BYTES + 1) != raw:
+                raise NativeVolumeFailure("capture") from None
+    os.unlink(capture)
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        inserted = append(store, parsed.bars)
+    except Exception:
+        raise NativeVolumeFailure("append") from None
     return {
         "receipt_sha256": digest,
         "receipt_file": str(target),
@@ -217,9 +255,7 @@ def fetch_and_retain(client, *, symbol, start, end, store, receipts_dir, clock=N
             symbol, **{k: v for k, v in q.items() if k != "symbol"}
         )
     except Exception:
-        raise RuntimeError(
-            "native history request failed; no automatic retry"
-        ) from None
+        raise NativeVolumeFailure("request") from None
     receipt = dict(
         schema=SCHEMA,
         source="schwab_pricehistory",
@@ -228,4 +264,9 @@ def fetch_and_retain(client, *, symbol, start, end, store, receipts_dir, clock=N
         received_at=_utc(clock()).isoformat(),
         payload=payload,
     )
-    return retain_receipt(receipt, store=store, receipts_dir=receipts_dir)
+    try:
+        return retain_receipt(receipt, store=store, receipts_dir=receipts_dir)
+    except NativeVolumeFailure:
+        raise
+    except Exception:
+        raise NativeVolumeFailure("capture") from None
