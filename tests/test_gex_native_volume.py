@@ -48,9 +48,13 @@ def _history(today_minutes: int = 60, prior_v: int = 100_000, today_v: int = 150
 NOW = _ts(TODAY, 10, 30) + 5       # 10:30:05 ET: bars 09:30..10:29 completed
 
 
+def _quote(bars_total: int, gap: float = 0.13) -> int:
+    """A day counter ``gap`` above the bars, as Schwab's is (~13%)."""
+    return round(bars_total / (1 - gap))
+
+
 def _ready_payload():
-    total = 60 * 150_000
-    return nv.compute(_history(), total, now=NOW, receipt_at=NOW)
+    return nv.compute(_history(), _quote(60 * 150_000), now=NOW, receipt_at=NOW)
 
 
 def test_ready_payload_has_the_contract_gex_watch_checks():
@@ -70,15 +74,24 @@ def test_ready_payload_has_the_contract_gex_watch_checks():
 
 def test_the_minute_in_progress_is_not_counted():
     hist = _history(today_minutes=61)          # the 10:30 bar exists but has not closed at 10:30:05
-    p = nv.compute(hist, 60 * 150_000, now=NOW, receipt_at=NOW)
+    p = nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=NOW)
     assert p["cumulative_shares"] == 60 * 150_000
     assert datetime.fromisoformat(p["end_of_completed_window"]).timestamp() == _ts(TODAY, 10, 30)
 
 
-def test_bars_that_disagree_with_the_day_counter_are_unreconciled():
-    p = nv.compute(_history(), int(60 * 150_000 * 1.10), now=NOW, receipt_at=NOW)
-    assert p["status"] == "unreconciled" and p["reason"] == "bars_disagree_with_quote_total"
-    assert p["reconciliation"]["relative_difference"] > nv.RECONCILE_TOLERANCE
+@pytest.mark.parametrize(("gap", "reason"), [
+    (0.0, "bars_at_or_above_quote_total"),     # bars equal the counter: not Schwab's bar scope
+    (-0.5, "bars_at_or_above_quote_total"),    # phantom / cumulative-sized minutes (Yahoo's failure)
+    (0.45, "bars_missing_volume"),             # minutes missing
+])
+def test_bars_outside_the_scope_band_are_unreconciled(gap, reason):
+    p = nv.compute(_history(), _quote(60 * 150_000, gap), now=NOW, receipt_at=NOW)
+    assert (p["status"], p["reason"]) == ("unreconciled", reason)
+
+
+@pytest.mark.parametrize("gap", [0.06, 0.13, 0.19, 0.29])
+def test_the_measured_scope_gaps_are_ready(gap):
+    assert nv.compute(_history(), _quote(60 * 150_000, gap), now=NOW, receipt_at=NOW)["status"] == "ready"
 
 
 def test_missing_quote_counter_is_unreconciled_not_ready():
@@ -87,7 +100,7 @@ def test_missing_quote_counter_is_unreconciled_not_ready():
 
 def test_extended_hours_bars_count_toward_the_reconciliation_only():
     hist = _history(pre=10_000)                # 30 premarket minutes of 10k
-    p = nv.compute(hist, 60 * 150_000 + 30 * 10_000, now=NOW, receipt_at=NOW)
+    p = nv.compute(hist, _quote(60 * 150_000 + 30 * 10_000), now=NOW, receipt_at=NOW)
     assert p["status"] == "ready" and p["cumulative_shares"] == 60 * 150_000
     assert p["reconciliation"]["bars_total_volume"] == 60 * 150_000 + 30 * 10_000
 
@@ -100,7 +113,7 @@ def test_outside_the_regular_session_is_closed():
 def test_too_few_baseline_sessions_is_not_ready():
     hist = {"candles": [c for c in _history()["candles"]
                         if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() >= PRIOR[4]]}
-    p = nv.compute(hist, 60 * 150_000, now=NOW, receipt_at=NOW)
+    p = nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=NOW)
     assert (p["status"], p["reason"]) == ("unavailable", "insufficient_baseline_sessions")
 
 
@@ -108,7 +121,7 @@ def test_malformed_candles_are_dropped_not_trusted():
     hist = _history()
     hist["candles"] += [{"datetime": "x"}, {"datetime": int(NOW * 1000) - 600_000, "high": 1, "low": 1,
                                             "close": 1, "volume": -5}, "junk"]
-    assert nv.compute(hist, 60 * 150_000, now=NOW, receipt_at=NOW)["status"] == "ready"
+    assert nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=NOW)["status"] == "ready"
 
 
 def test_envelope_hash_matches_the_readers_canonical_form():

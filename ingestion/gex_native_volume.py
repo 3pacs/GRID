@@ -19,10 +19,16 @@ Payload (``grid.native-volume.v1``), regular session only, completed bars only:
   bars; ``calendar_version`` says so).
 
 Reconciliation, the gate for ``status: ready``. Schwab's quote ``totalVolume``
-is an independent day counter. Today's bars (all of them, extended hours
-included, since the counter covers the whole day) must agree with it within
-``RECONCILE_TOLERANCE``. Otherwise the payload is ``unreconciled`` and
-gex-watch keeps withholding the numbers. Outside the regular session, with too
+is an independent day counter, and Schwab's one-minute bars do NOT sum to it:
+they carry a stable ~81-88% of it (measured 2026-11-10 against the ToS RTD
+SPY VOLUME counter on 12 sessions, 6,156 regular-hours readings: median gap
+12.6-19.2% per session; two Schwab-counter readings that morning: 12.3%). So
+``cumulative_shares`` is provider-bar scope, not the day counter, and the
+gate checks the gap is inside ``SCOPE_GAP_MIN``..``SCOPE_GAP_MAX``: bars at or
+above the counter mean phantom or duplicated minutes (Yahoo's failure),
+bars far below it mean missing minutes. Both are ``unreconciled`` and
+gex-watch keeps withholding the numbers. RVOL and the bar VWAP compare Schwab
+bars with Schwab bars, so the stable scope gap cancels out of them. Outside the regular session, with too
 few baseline sessions, or with no completed bar the status is not ``ready``
 either. Signals never read this (``signal_confirmation`` is False).
 """
@@ -45,7 +51,8 @@ SOURCE = "schwab_pricehistory"
 CALENDAR_VERSION = "schwab-regular-bars-observed-v1"
 BASELINE_SESSIONS = 10
 HISTORY_CALENDAR_DAYS = 21          # >= 10 prior sessions plus holidays
-RECONCILE_TOLERANCE = 0.02          # |bars - quote totalVolume| / totalVolume
+SCOPE_GAP_MIN = 0.05                # (quote totalVolume - bars) / totalVolume, see the module docstring
+SCOPE_GAP_MAX = 0.30
 BAR_SECONDS = 60
 ET = ZoneInfo("America/New_York")
 OPEN, CLOSE = time(9, 30), time(16, 0)
@@ -136,13 +143,15 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
 
     day_bars = sum(b[4] for b in today_all)
     extra["reconciliation"] = {"quote_total_volume": quote_total_volume, "bars_total_volume": day_bars,
-                               "tolerance": RECONCILE_TOLERANCE}
+                               "scope_gap_band": [SCOPE_GAP_MIN, SCOPE_GAP_MAX]}
     if type(quote_total_volume) is not int or quote_total_volume <= 0:
         return _base(now, "unreconciled", "quote_total_volume_unavailable", **extra)
-    diff = abs(quote_total_volume - day_bars) / quote_total_volume
-    extra["reconciliation"]["relative_difference"] = round(diff, 6)
-    if diff > RECONCILE_TOLERANCE:
-        return _base(now, "unreconciled", "bars_disagree_with_quote_total", **extra)
+    gap = (quote_total_volume - day_bars) / quote_total_volume
+    extra["reconciliation"]["relative_difference"] = round(gap, 6)
+    if gap < SCOPE_GAP_MIN:
+        return _base(now, "unreconciled", "bars_at_or_above_quote_total", **extra)
+    if gap > SCOPE_GAP_MAX:
+        return _base(now, "unreconciled", "bars_missing_volume", **extra)
     return _base(now, "ready", None, **extra)
 
 
