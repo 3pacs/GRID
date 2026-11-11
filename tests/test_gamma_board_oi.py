@@ -145,3 +145,21 @@ def test_no_second_builder_no_historical_backfill_and_no_disabled_cache(provider
     monkeypatch.setattr(oi.settings,"POLYGON_API_KEY","")
     with pytest.raises(oi.OpenInterestUnavailable,match="disabled"): read()
     assert len(requests)==1
+
+
+def test_old_success_is_not_returned_when_its_scheduled_refresh_fails(provider, monkeypatch):
+    replies, calls = provider
+    clock = [10.]
+    monkeypatch.setattr(oi, "monotonic", lambda: clock[0])
+    replies.append(Response(page([row(7300)])))
+    read()
+    clock[0] += oi._TTL + 1
+    replies.append(Response({}, 503))
+    with pytest.raises(oi.OpenInterestUnavailable):
+        read()
+    with pytest.raises(oi.OpenInterestUnavailable, match="cooling down"):
+        read()
+    clock[0] += oi._COOLDOWN + 1
+    replies.append(Response(page([row(7300, count=88)])))
+    assert read()[0] == {"SPXW261120P07300000": 88}
+    assert len(calls) == 3
