@@ -194,14 +194,9 @@ def build_snapshot(loader, calendar, *, session_key, symbol, now):
     return envelope
 
 
-def write_snapshot(path, envelope):
-    """Atomic private file replacement at an operator-configured local path.
-
-    Parent must exist, be same-UID owner-only, and not be a symlink. Open dirfd
-    pins it across replacement. Existing targets must be same-UID0600 regular
-    files. Never chmod a foreign/insecure file or follow a target symlink.
-    """
-    if envelope.get("schema") != SCHEMA:
+def validate_envelope(envelope):
+    """Validate the shared private writer/health contract and return bounded bytes."""
+    if not isinstance(envelope, dict) or envelope.get("schema") != SCHEMA:
         raise ValueError("snapshot schema")
     payload = envelope.get("payload", {})
     validate_payload(payload, envelope.get("generated_at"))
@@ -216,7 +211,7 @@ def write_snapshot(path, envelope):
     }:
         raise ValueError("unrecognized envelope fields")
     provenance = envelope.get("provenance", {})
-    if set(provenance) != {
+    if not isinstance(provenance, dict) or set(provenance) != {
         "producer",
         "retained_rows_consulted",
         "retained_rows_sha256",
@@ -227,12 +222,24 @@ def write_snapshot(path, envelope):
     if (
         type(count) is not int
         or not 0 <= count <= 1_100_000
-        or not re.fullmatch(r"[0-9a-f]{64}", provenance.get("retained_rows_sha256", ""))
+        or not isinstance(provenance.get("retained_rows_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", provenance["retained_rows_sha256"])
     ):
         raise ValueError("invalid retained-row provenance")
     raw = canonical(envelope)
     if len(raw) > MAX_BYTES:
         raise ValueError("snapshot exceeds size bound")
+    return raw
+
+
+def write_snapshot(path, envelope):
+    """Atomic private file replacement at an operator-configured local path.
+
+    Parent must exist, be same-UID owner-only, and not be a symlink. Open dirfd
+    pins it across replacement. Existing targets must be same-UID0600 regular
+    files. Never chmod a foreign/insecure file or follow a target symlink.
+    """
+    raw = validate_envelope(envelope)
     target = Path(path).absolute()
     if target.name in ("", ".", ".."):
         raise ValueError("invalid snapshot name")

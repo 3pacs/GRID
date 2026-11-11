@@ -176,7 +176,7 @@ class ManifestCalendar:
         p = Path(path).absolute()
         if p.resolve() != p:
             raise ValueError("manifest symlink refused")
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             st = os.fstat(stream.fileno())
             if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) & 0o022:

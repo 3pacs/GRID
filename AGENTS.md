@@ -445,3 +445,20 @@ XNYS calendar adapter.55 core/API/retention tests plus7 calendar tests pass in
 separate local test environments. Initial pandas3 calendar boundary failure was
 caught and fixed by pinned2.3.3; exact optional lock saved separately from main
 requirements. No live DB, producer, mount, scheduler, shared venv or deployment.
+
+## 2026-11-11 — Native volume health and recovery qualification
+
+Completed the offline read-only health candidate in the isolated
+`codex/native-volume-readiness-20261111` branch, based on `7ff8a6640`. Reused the
+existing worker, snapshot, manifest and receipt-recovery contracts. Corrected
+malformed provenance acceptance, publication-race alerts, contradictory ready
+status and manifest FIFO blocking; bounded publication grace remains non-ready.
+Two synthetic full-session recovery drills prove receipt replay and snapshot
+republish without a second acquisition. Final focused suite: 231 passed, one
+optional export skipped, 47 subtests passed; separate pinned-calendar suite: all
+19 passed. Ruff and diff whitespace checks passed. No full-repository CI claim.
+
+No provider calls, production change, timer, credential change, alert delivery,
+consumer activation or scheduled-bootstrap duplication. Source/cadence activation
+and live coverage remain separate gates. Handoff and exact test scope:
+`docs/NATIVE-VOLUME-HEALTH-20261111.md`.

@@ -54,6 +54,24 @@ class ManifestTests(unittest.TestCase):
             p.chmod(0o600)
             return ManifestCalendar(p, hashlib.sha256(raw).hexdigest())
 
+    def test_fifo_refused_without_block(self):
+        import signal
+
+        def expired(signum, frame):
+            raise AssertionError("manifest FIFO open blocked")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calendar.json"
+            os.mkfifo(path, 0o600)
+            previous = signal.signal(signal.SIGALRM, expired)
+            signal.alarm(2)
+            try:
+                with self.assertRaises(ValueError):
+                    ManifestCalendar(path, "a" * 64)
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, previous)
+
     def test_roundtrip(self):
         c = self.load()
         self.assertEqual(c.start, date(2026, 11, 25))

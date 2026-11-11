@@ -128,3 +128,17 @@ exit, checkpoint not complete, missing/stale snapshot (>180seconds), and disk
 budget refusal. Notification configuration and a recovery drill are required;
 they have not been installed by this offline change. Do not call this unattended
 ready merely because the normal cadence succeeds.
+
+## 2026-11-11 offline health and recovery qualification
+
+A disabled-by-default read-only health CLI and two synthetic recovery drills now
+cover the existing private checkpoint/snapshot contracts. The health report uses
+fixed reason codes, bounded private reads, exact calendar identity, 180-second
+freshness checks, and a maximum 45-second pending publication interval. Shared
+envelope validation prevents malformed provenance from appearing healthy.
+
+See `docs/NATIVE-VOLUME-HEALTH-20261111.md` for command semantics, final focused
+verification, and limitations. No alert route or cadence was installed, and no
+provider acquisition or production mutation was performed. The separately
+scheduled one-shot bootstrap remains unchanged. Unattended readiness still needs
+verified notification delivery and current live coverage acceptance.
