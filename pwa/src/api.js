@@ -1452,6 +1452,25 @@ class GRIDApi {
     // Oracle
     async getOracleScoreboard() { return this._fetch('/api/v1/oracle/scoreboard'); }
     async getOracleEvidence() { return this._fetch('/api/v1/oracle/evidence'); }
+    getGammaSessionMap(symbol, signal, sessionDate) {
+        const query = sessionDate ? '?session_date=' + encodeURIComponent(sessionDate) : '';
+        return this._fetch(`/api/v1/gamma-watch/time-map/${encodeURIComponent(symbol)}` + query, { signal, cache: 'no-store' });
+    }
+
+    setGammaSessionTracking(symbol, enabled) {
+        return this._fetch(`/api/v1/gamma-watch/time-map/${encodeURIComponent(symbol)}/tracking`, {
+            method: 'POST', cache: 'no-store', body: JSON.stringify({ enabled }),
+        });
+    }
+
+    getGammaBoardIntraday(symbol, signal) {
+        return this._fetch(`/api/v1/gamma-watch/intraday/${encodeURIComponent(symbol)}`, { signal, cache: 'no-store' });
+    }
+
+    getGammaBoardInstrument(symbol, signal) {
+        return this._fetch(`/api/v1/gamma-watch/board/${encodeURIComponent(symbol)}`, { signal, cache: 'no-store' });
+    }
+
     async getOraclePredictions(params = {}) {
         const qs = new URLSearchParams(params).toString();
         return this._fetch(`/api/v1/oracle/predictions?${qs}`);

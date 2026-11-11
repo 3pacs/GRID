@@ -1222,7 +1222,7 @@ class OptionsPuller(BasePuller):
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
-                today_ts = datetime.now(timezone.utc).timestamp()
+                today_ts = _utc_now().timestamp()
                 min_dte_seconds = 2 * 86400  # 2 days
                 liquid_expirations = [e for e in selected_expirations
                                       if e - today_ts >= min_dte_seconds]
