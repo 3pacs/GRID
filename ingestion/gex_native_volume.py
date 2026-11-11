@@ -3,34 +3,39 @@
 The GEX page withholds VWAP, relative volume and volume spikes because its
 Yahoo one-minute series carries cumulative-sized "minutes" (15-25M shares in
 one bar against a ~100k norm), and the median replacement it used is an
-estimate, not trades. gex-watch already validates a private snapshot file for
-this (``grid_native_volume.read_private_snapshot``, gex repo d39561e, off
-unless ``GEX_NATIVE_VOLUME_SNAPSHOT`` names the file); nothing produced it.
-This module computes that payload from Schwab's own one-minute bars.
+estimate, not trades. gex-watch's private reader
+(``grid_native_volume.read_private_snapshot``, gex repo, hardened 2026-11-11
+in 897741a) accepts an exact ``grid.native-volume.snapshot.v1`` file and
+nothing else. This module produces that file's payload from Schwab's own
+one-minute bars; the field set, fixed basis strings and clock rules below are
+the reader's.
 
 Payload (``grid.native-volume.v1``), regular session only, completed bars only:
 
 * ``cumulative_shares``: sum of today's completed 09:30-16:00 ET bar volumes.
-* ``bar_vwap_estimate``: sum(HLC3 x volume) / sum(volume) over those bars. A
-  bar estimate, never exact trade VWAP (``exact_trade_vwap`` is False).
-* ``rvol``: today's cumulative through the last completed bar over the median
-  cumulative through the same minute of the previous ``BASELINE_SESSIONS``
-  sessions in the same response (sessions are the dates that have regular
-  bars; ``calendar_version`` says so).
+  A bar counts as completed once ``RECEIPT_GUARD_S`` seconds past its end at
+  receipt (the reader requires ``latest_receipt_at >= end + 5``).
+* ``bar_vwap_estimate``: sum(HLC3 x volume) / sum(volume) over those bars, never
+  exact trade VWAP (``exact_trade_vwap`` False).
+* ``rvol``: ``cumulative_shares / baseline_median_shares`` exactly, where the
+  baseline is the median cumulative through the same minute of the previous
+  ``BASELINE_SESSIONS`` sessions in the same response (``calendar_version``
+  says sessions are the dates that have regular bars).
+* ``as_of`` = ``served_at`` = the envelope's ``generated_at``; the receipt and
+  event ages are derived from those strings, as the reader checks them.
 
-Reconciliation, the gate for ``status: ready``. Schwab's quote ``totalVolume``
-is an independent day counter, and Schwab's one-minute bars do NOT sum to it:
-they carry a stable ~81-88% of it (measured 2026-11-10 against the ToS RTD
-SPY VOLUME counter on 12 sessions, 6,156 regular-hours readings: median gap
-12.6-19.2% per session; two Schwab-counter readings that morning: 12.3%). So
-``cumulative_shares`` is provider-bar scope, not the day counter, and the
-gate checks the gap is inside ``SCOPE_GAP_MIN``..``SCOPE_GAP_MAX``: bars at or
-above the counter mean phantom or duplicated minutes (Yahoo's failure),
-bars far below it mean missing minutes. Both are ``unreconciled`` and
-gex-watch keeps withholding the numbers. RVOL and the bar VWAP compare Schwab
-bars with Schwab bars, so the stable scope gap cancels out of them. Outside the regular session, with too
-few baseline sessions, or with no completed bar the status is not ``ready``
-either. Signals never read this (``signal_confirmation`` is False).
+Scope gate, ours, kept out of the payload (whose field set is fixed). Schwab's
+quote ``totalVolume`` is an independent day counter, and the bars do NOT sum to
+it: they carry a stable ~81-88% of it (2026-11-10: 12 sessions, 6,156
+regular-hours ToS RTD readings, median gap 12.6-19.2% per session; live
+2026-11-11 regular hours: 16.6-17.0%). ``cross_source_reconciled`` is
+therefore False, and the payload is ``ready`` only when the gap is inside
+``SCOPE_GAP_MIN``..``SCOPE_GAP_MAX``: bars at or above the counter mean
+phantom or duplicated minutes (Yahoo's failure), far below it missing minutes.
+The gap is returned beside the payload for the operator log. Outside the
+regular session, without a full baseline, with no completed bar, or with bars
+older than the reader's 120 s limit, the status is not ``ready`` either.
+Signals never read this (``signal_confirmation`` False).
 """
 
 from __future__ import annotations
@@ -49,17 +54,30 @@ ENVELOPE_SCHEMA = "grid.native-volume.snapshot.v1"
 SYMBOL = "SPY"
 SOURCE = "schwab_pricehistory"
 CALENDAR_VERSION = "schwab-regular-bars-observed-v1"
+# Must match gex-watch grid_native_volume (VWAP_BASIS, RVOL_BASIS, INTEGRITY_SCOPE,
+# and this producer's entry in its accepted producer set).
+PRODUCER = "GRID Schwab pricehistory snapshot"
+VWAP_BASIS = "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+RVOL_BASIS = "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
+INTEGRITY_SCOPE = "content integrity only; trust requires verified local producer and owner-only custody"
 BASELINE_SESSIONS = 10
 HISTORY_CALENDAR_DAYS = 21          # >= 10 prior sessions plus holidays
 SCOPE_GAP_MIN = 0.05                # (quote totalVolume - bars) / totalVolume, see the module docstring
 SCOPE_GAP_MAX = 0.30
 BAR_SECONDS = 60
+RECEIPT_GUARD_S = 5                 # reader: latest_receipt_at >= end_of_completed_window + 5
+MAX_AGE_S = 120                     # reader: receipt and event ages within 120 s of as_of
 ET = ZoneInfo("America/New_York")
 OPEN, CLOSE = time(9, 30), time(16, 0)
 
 
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def _micro(ts: float) -> float:
+    """Round to the microsecond, so ages computed here equal the reader's from the ISO strings."""
+    return datetime.fromisoformat(_iso(ts)).timestamp()
 
 
 def _bars(body: Mapping[str, Any]) -> list[tuple[float, float, float, float, int]]:
@@ -82,8 +100,7 @@ def _bars(body: Mapping[str, Any]) -> list[tuple[float, float, float, float, int
 
 
 def _regular(ts: float) -> bool:
-    d = datetime.fromtimestamp(ts, ET)
-    return OPEN <= d.time() < CLOSE
+    return OPEN <= datetime.fromtimestamp(ts, ET).time() < CLOSE
 
 
 def _session(ts: float) -> date:
@@ -95,30 +112,45 @@ def _minute_of_session(ts: float) -> int:
     return (d.hour * 60 + d.minute) - (OPEN.hour * 60 + OPEN.minute)
 
 
-def _base(now: float, status: str, reason: str | None, **extra: Any) -> dict[str, Any]:
-    return {"schema": SCHEMA, "symbol": SYMBOL, "source": SOURCE, "status": status, "reason": reason,
-            "historical_request": False, "signal_confirmation": False, "exact_trade_vwap": False,
-            "price_basis": "provider_unspecified", "calendar_version": CALENDAR_VERSION,
-            "served_at": _iso(now), **extra}
+def _payload(now: float, status: str, reason: str | None, **fields: Any) -> dict[str, Any]:
+    """The reader's exact field set; unknown values are None outside ``ready``."""
+    base = {k: None for k in (
+        "end_of_completed_window", "latest_receipt_at", "receipt_age_seconds", "event_age_seconds",
+        "completed_minutes", "cumulative_shares", "bar_vwap_estimate", "rvol", "baseline_median_shares")}
+    stamp = _iso(now)
+    base.update(
+        schema=SCHEMA, symbol=SYMBOL, source=SOURCE, price_basis="provider_unspecified",
+        as_of=stamp, served_at=stamp, session=_session(now).isoformat(), calendar_version=CALENDAR_VERSION,
+        status=status, reason=reason, baseline_sessions=[], baseline_errors={}, source_revisions=[],
+        exact_trade_vwap=False, signal_confirmation=False, cross_source_reconciled=False, live=False,
+        historical_request=False, vwap_basis=VWAP_BASIS, rvol_basis=RVOL_BASIS)
+    base.update(fields)
+    return base
 
 
 def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: float,
-            receipt_at: float) -> dict[str, Any]:
-    """Pure: Schwab pricehistory body + quote ``totalVolume`` -> payload."""
+            receipt_at: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Pure: Schwab pricehistory body + quote ``totalVolume`` -> (payload, info).
+
+    ``info`` carries the scope-gap reconciliation and the bars consulted (for
+    the envelope's provenance); neither is part of the payload.
+    """
+    now, receipt_at = _micro(now), _micro(receipt_at)
     bars = _bars(history)
+    info: dict[str, Any] = {"bars": bars, "reconciliation": None}
     today = _session(now)
     if not _regular(now):
-        return _base(now, "closed", "outside_regular_session")
-    completed = [b for b in bars if b[0] + BAR_SECONDS <= now]
+        return _payload(now, "closed", "outside_regular_session"), info
+    completed = [b for b in bars if b[0] + BAR_SECONDS + RECEIPT_GUARD_S <= receipt_at]
     today_all = [b for b in completed if _session(b[0]) == today]
     today_reg = [b for b in today_all if _regular(b[0])]
     if not today_reg:
-        return _base(now, "unavailable", "no_completed_regular_bar")
-    last = today_reg[-1][0]
-    through = _minute_of_session(last)
+        return _payload(now, "unavailable", "no_completed_regular_bar"), info
+    end = today_reg[-1][0] + BAR_SECONDS
+    through = _minute_of_session(today_reg[-1][0])
     cum = sum(b[4] for b in today_reg)
     if cum <= 0:
-        return _base(now, "unavailable", "zero_volume")
+        return _payload(now, "unavailable", "zero_volume"), info
     vwap = sum((b[1] + b[2] + b[3]) / 3.0 * b[4] for b in today_reg) / cum
 
     prior: dict[date, int] = {}
@@ -133,33 +165,50 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
         if m >= through:
             full.add(s)   # the session reached this minute, so its cumulative is comparable
     sessions = sorted(s for s in prior if s in full)[-BASELINE_SESSIONS:]
-    extra = {"as_of": _iso(last + BAR_SECONDS), "end_of_completed_window": _iso(last + BAR_SECONDS),
-             "latest_receipt_at": _iso(receipt_at), "cumulative_shares": cum,
-             "bar_vwap_estimate": round(vwap, 4), "baseline_sessions": [s.isoformat() for s in sessions]}
+    fields = {
+        "end_of_completed_window": _iso(end), "latest_receipt_at": _iso(receipt_at),
+        "receipt_age_seconds": now - receipt_at, "event_age_seconds": now - end,
+        "completed_minutes": len(today_reg), "cumulative_shares": cum,
+        "bar_vwap_estimate": round(vwap, 4), "baseline_sessions": [s.isoformat() for s in sessions],
+        "source_revisions": [f"{today.isoformat()}:{_minute_of_session(b[0])}" for b in today_reg],
+    }
     if len(sessions) < BASELINE_SESSIONS:
-        return _base(now, "unavailable", "insufficient_baseline_sessions", **extra)
-    base = median(prior[s] for s in sessions)
-    extra["rvol"] = round(cum / base, 4) if base > 0 else 0.0
+        return _payload(now, "unavailable", "insufficient_baseline_sessions", **fields), info
+    base = float(median(prior[s] for s in sessions))
+    if base <= 0:
+        return _payload(now, "unavailable", "zero_baseline", **fields), info
+    fields.update(baseline_median_shares=base, rvol=cum / base)
+    if now - end > MAX_AGE_S or now - receipt_at > MAX_AGE_S:
+        return _payload(now, "unavailable", "bars_older_than_reader_limit", **fields), info
 
     day_bars = sum(b[4] for b in today_all)
-    extra["reconciliation"] = {"quote_total_volume": quote_total_volume, "bars_total_volume": day_bars,
-                               "scope_gap_band": [SCOPE_GAP_MIN, SCOPE_GAP_MAX]}
+    recon = {"quote_total_volume": quote_total_volume, "bars_total_volume": day_bars,
+             "scope_gap_band": [SCOPE_GAP_MIN, SCOPE_GAP_MAX], "relative_difference": None}
+    info["reconciliation"] = recon
     if type(quote_total_volume) is not int or quote_total_volume <= 0:
-        return _base(now, "unreconciled", "quote_total_volume_unavailable", **extra)
+        return _payload(now, "unreconciled", "quote_total_volume_unavailable", **fields), info
     gap = (quote_total_volume - day_bars) / quote_total_volume
-    extra["reconciliation"]["relative_difference"] = round(gap, 6)
+    recon["relative_difference"] = round(gap, 6)
     if gap < SCOPE_GAP_MIN:
-        return _base(now, "unreconciled", "bars_at_or_above_quote_total", **extra)
+        return _payload(now, "unreconciled", "bars_at_or_above_quote_total", **fields), info
     if gap > SCOPE_GAP_MAX:
-        return _base(now, "unreconciled", "bars_missing_volume", **extra)
-    return _base(now, "ready", None, **extra)
+        return _payload(now, "unreconciled", "bars_missing_volume", **fields), info
+    return _payload(now, "ready", None, **fields), info
 
 
-def envelope(payload: Mapping[str, Any], *, now: float) -> dict[str, Any]:
-    """The file gex-watch reads: payload plus its canonical sha256."""
+def provenance(bars: list[tuple[float, float, float, float, int]]) -> dict[str, Any]:
+    """The bars this snapshot consulted: count and a canonical sha256."""
+    canonical = json.dumps([[b[0], b[1], b[2], b[3], b[4]] for b in bars], separators=(",", ":"))
+    return {"producer": PRODUCER, "retained_rows_consulted": len(bars),
+            "retained_rows_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+            "integrity_scope": INTEGRITY_SCOPE}
+
+
+def envelope(payload: Mapping[str, Any], prov: Mapping[str, Any]) -> dict[str, Any]:
+    """The file gex-watch reads; ``generated_at`` is the payload's ``as_of``."""
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return {"schema": ENVELOPE_SCHEMA, "generated_at": _iso(now), "payload": dict(payload),
-            "payload_sha256": hashlib.sha256(canonical.encode()).hexdigest()}
+    return {"schema": ENVELOPE_SCHEMA, "generated_at": payload["as_of"], "payload": dict(payload),
+            "payload_sha256": hashlib.sha256(canonical.encode()).hexdigest(), "provenance": dict(prov)}
 
 
 def history_params(now: float) -> dict[str, Any]:

@@ -50,16 +50,21 @@ def write_private(path: Path, data: dict) -> None:
             os.unlink(tmp)
 
 
-def run_once(client, out: Path | None) -> dict:
+def run_once(client, out: Path | None) -> tuple[dict, dict]:
     now = time.time()
+    if not nv._regular(now):
+        # Outside 09:30-16:00 ET: no Schwab calls, no write (gex-watch lets the
+        # last snapshot age out after 180 s and shows the unavailable path).
+        payload, info = nv.compute({}, None, now=now, receipt_at=now)
+        return nv.envelope(payload, nv.provenance([])), info
     quote = client.quotes(nv.SYMBOL).get(nv.SYMBOL)
     history = client.price_history(nv.SYMBOL, **nv.history_params(now))
     receipt = time.time()
-    payload = nv.compute(history, getattr(quote, "total_volume", None), now=receipt, receipt_at=receipt)
-    env = nv.envelope(payload, now=receipt)
+    payload, info = nv.compute(history, getattr(quote, "total_volume", None), now=time.time(), receipt_at=receipt)
+    env = nv.envelope(payload, nv.provenance(info["bars"]))
     if out is not None:
         write_private(out, env)
-    return env
+    return env, info
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,9 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     client = SchwabMarketClient()
     while True:
         try:
-            env = run_once(client, None if (args.print or args.dry_run) else args.out)
+            env, info = run_once(client, None if (args.print or args.dry_run) else args.out)
             pl = env["payload"]
-            r = pl.get("reconciliation") or {}
+            r = info.get("reconciliation") or {}
             line = (f"{env['generated_at']} {pl['status']} {pl.get('reason') or '-'} "
                     f"bars={r.get('bars_total_volume')} quote={r.get('quote_total_volume')} "
                     f"diff={r.get('relative_difference')}")

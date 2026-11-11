@@ -1,7 +1,8 @@
-"""ingestion.gex_native_volume: the payload gex-watch's private native-volume
-reader accepts (gex repo ``grid_native_volume.project``), built from Schwab
-one-minute bars, ``ready`` only when the bars reconcile with the quote's day
-counter. No network: synthetic candles.
+"""ingestion.gex_native_volume: the snapshot gex-watch's hardened private reader
+(gex repo ``grid_native_volume``, 897741a) accepts, built from Schwab one-minute
+bars, ``ready`` only inside the measured bar-scope gap. No network: synthetic
+candles. ``READER_FIELDS`` and the basis strings mirror the reader; the gex repo
+tests the reader against this producer's output.
 """
 
 from __future__ import annotations
@@ -20,10 +21,17 @@ from ingestion import gex_native_volume as nv
 ET = nv.ET
 TODAY = date(2026, 11, 10)   # a Tuesday
 PRIOR = [TODAY - timedelta(days=d) for d in range(1, 20) if (TODAY - timedelta(days=d)).weekday() < 5][:12]
+READER_FIELDS = frozenset((
+    "schema", "symbol", "source", "price_basis", "as_of", "session", "calendar_version",
+    "end_of_completed_window", "latest_receipt_at", "receipt_age_seconds", "event_age_seconds",
+    "completed_minutes", "status", "reason", "cumulative_shares", "bar_vwap_estimate", "rvol",
+    "baseline_sessions", "baseline_errors", "exact_trade_vwap", "signal_confirmation",
+    "cross_source_reconciled", "live", "vwap_basis", "rvol_basis", "source_revisions",
+    "baseline_median_shares", "served_at", "historical_request"))
 
 
-def _ts(d: date, hh: int, mm: int) -> float:
-    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=ET).timestamp()
+def _ts(d: date, hh: int, mm: int, ss: int = 0) -> float:
+    return datetime(d.year, d.month, d.day, hh, mm, ss, tzinfo=ET).timestamp()
 
 
 def _candle(ts: float, v: int, px: float = 750.0) -> dict:
@@ -45,7 +53,8 @@ def _history(today_minutes: int = 60, prior_v: int = 100_000, today_v: int = 150
     return {"symbol": "SPY", "candles": candles}
 
 
-NOW = _ts(TODAY, 10, 30) + 5       # 10:30:05 ET: bars 09:30..10:29 completed
+RECEIPT = _ts(TODAY, 10, 30, 7)     # 10:30:07 ET: bars 09:30..10:29 completed (>= 5 s past their end)
+NOW = RECEIPT + 1.5                  # snapshot generated after the receipt
 
 
 def _quote(bars_total: int, gap: float = 0.13) -> int:
@@ -53,30 +62,50 @@ def _quote(bars_total: int, gap: float = 0.13) -> int:
     return round(bars_total / (1 - gap))
 
 
-def _ready_payload():
-    return nv.compute(_history(), _quote(60 * 150_000), now=NOW, receipt_at=NOW)
+def _run(hist=None, quote=None, now=NOW, receipt=RECEIPT):
+    hist = _history() if hist is None else hist
+    return nv.compute(hist, _quote(60 * 150_000) if quote is None else quote, now=now, receipt_at=receipt)
 
 
-def test_ready_payload_has_the_contract_gex_watch_checks():
-    p = _ready_payload()
-    assert (p["schema"], p["symbol"], p["source"], p["status"]) == ("grid.native-volume.v1", "SPY",
-                                                                     "schwab_pricehistory", "ready")
-    assert p["historical_request"] is False and p["signal_confirmation"] is False and p["exact_trade_vwap"] is False
-    assert p["price_basis"] == "provider_unspecified" and p["calendar_version"]
+def test_ready_payload_is_exactly_the_readers_contract():
+    p, _ = _run()
+    assert set(p) == READER_FIELDS
+    assert (p["schema"], p["symbol"], p["source"], p["price_basis"], p["status"], p["reason"]) == (
+        "grid.native-volume.v1", "SPY", "schwab_pricehistory", "provider_unspecified", "ready", None)
+    for k in ("historical_request", "signal_confirmation", "exact_trade_vwap", "cross_source_reconciled", "live"):
+        assert p[k] is False, k
+    assert p["baseline_errors"] == {}
+    assert p["vwap_basis"] == "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+    assert p["rvol_basis"] == "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
     assert p["cumulative_shares"] == 60 * 150_000 and type(p["cumulative_shares"]) is int
-    assert p["bar_vwap_estimate"] > 0 and math.isclose(p["bar_vwap_estimate"], 750.0 + 0.1 / 3, abs_tol=1e-3)
+    assert p["completed_minutes"] == 60 and len(p["source_revisions"]) == 60
+    assert p["rvol"] == p["cumulative_shares"] / p["baseline_median_shares"]   # exact, as the reader checks
     assert math.isclose(p["rvol"], 1.5)
+    assert math.isclose(p["bar_vwap_estimate"], 750.0 + 0.1 / 3, abs_tol=1e-3)
     assert len(p["baseline_sessions"]) == 10 == len(set(p["baseline_sessions"]))
-    for k in ("as_of", "served_at", "latest_receipt_at", "end_of_completed_window"):
-        ts = datetime.fromisoformat(p[k]).timestamp()
-        assert 0 <= NOW - ts <= 180, k
+    assert p["session"] == TODAY.isoformat() and p["session"] not in p["baseline_sessions"]
 
 
-def test_the_minute_in_progress_is_not_counted():
-    hist = _history(today_minutes=61)          # the 10:30 bar exists but has not closed at 10:30:05
-    p = nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=NOW)
-    assert p["cumulative_shares"] == 60 * 150_000
-    assert datetime.fromisoformat(p["end_of_completed_window"]).timestamp() == _ts(TODAY, 10, 30)
+def test_clocks_follow_the_readers_rules():
+    p, _ = _run()
+    t = {k: datetime.fromisoformat(p[k]).timestamp()
+         for k in ("as_of", "served_at", "latest_receipt_at", "end_of_completed_window")}
+    assert t["as_of"] == t["served_at"]
+    assert t["end_of_completed_window"] % 60 == 0 and t["end_of_completed_window"] == _ts(TODAY, 10, 30)
+    assert t["latest_receipt_at"] >= t["end_of_completed_window"] + 5
+    assert math.isclose(p["receipt_age_seconds"], t["as_of"] - t["latest_receipt_at"], abs_tol=1e-6)
+    assert math.isclose(p["event_age_seconds"], t["as_of"] - t["end_of_completed_window"], abs_tol=1e-6)
+
+
+def test_a_bar_counts_only_five_seconds_after_it_ends():
+    early = _ts(TODAY, 10, 30, 3)      # the 10:29 bar ended 3 s ago: not yet completed
+    p, _ = _run(receipt=early, now=early + 1)
+    assert p["completed_minutes"] == 59
+
+
+def test_bars_older_than_the_reader_allows_are_not_ready():
+    p, _ = _run(now=RECEIPT + 200)
+    assert (p["status"], p["reason"]) == ("unavailable", "bars_older_than_reader_limit")
 
 
 @pytest.mark.parametrize(("gap", "reason"), [
@@ -85,51 +114,59 @@ def test_the_minute_in_progress_is_not_counted():
     (0.45, "bars_missing_volume"),             # minutes missing
 ])
 def test_bars_outside_the_scope_band_are_unreconciled(gap, reason):
-    p = nv.compute(_history(), _quote(60 * 150_000, gap), now=NOW, receipt_at=NOW)
+    p, info = _run(quote=_quote(60 * 150_000, gap))
     assert (p["status"], p["reason"]) == ("unreconciled", reason)
+    assert set(p) == READER_FIELDS and "reconciliation" not in p
+    assert math.isclose(info["reconciliation"]["relative_difference"], gap, abs_tol=1e-5)
 
 
 @pytest.mark.parametrize("gap", [0.06, 0.13, 0.19, 0.29])
 def test_the_measured_scope_gaps_are_ready(gap):
-    assert nv.compute(_history(), _quote(60 * 150_000, gap), now=NOW, receipt_at=NOW)["status"] == "ready"
+    assert _run(quote=_quote(60 * 150_000, gap))[0]["status"] == "ready"
 
 
 def test_missing_quote_counter_is_unreconciled_not_ready():
-    assert nv.compute(_history(), None, now=NOW, receipt_at=NOW)["status"] == "unreconciled"
+    assert nv.compute(_history(), None, now=NOW, receipt_at=RECEIPT)[0]["status"] == "unreconciled"
 
 
-def test_extended_hours_bars_count_toward_the_reconciliation_only():
-    hist = _history(pre=10_000)                # 30 premarket minutes of 10k
-    p = nv.compute(hist, _quote(60 * 150_000 + 30 * 10_000), now=NOW, receipt_at=NOW)
+def test_extended_hours_bars_count_toward_the_gate_only():
+    p, info = _run(hist=_history(pre=10_000), quote=_quote(60 * 150_000 + 30 * 10_000))
     assert p["status"] == "ready" and p["cumulative_shares"] == 60 * 150_000
-    assert p["reconciliation"]["bars_total_volume"] == 60 * 150_000 + 30 * 10_000
+    assert info["reconciliation"]["bars_total_volume"] == 60 * 150_000 + 30 * 10_000
 
 
 def test_outside_the_regular_session_is_closed():
-    p = nv.compute(_history(), 1, now=_ts(TODAY, 16, 30), receipt_at=_ts(TODAY, 16, 30))
-    assert (p["status"], p["reason"]) == ("closed", "outside_regular_session")
+    t = _ts(TODAY, 16, 30)
+    p, _ = nv.compute(_history(), 1, now=t, receipt_at=t)
+    assert (p["status"], p["reason"]) == ("closed", "outside_regular_session") and set(p) == READER_FIELDS
 
 
 def test_too_few_baseline_sessions_is_not_ready():
     hist = {"candles": [c for c in _history()["candles"]
                         if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() >= PRIOR[4]]}
-    p = nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=NOW)
-    assert (p["status"], p["reason"]) == ("unavailable", "insufficient_baseline_sessions")
+    assert _run(hist=hist)[0]["reason"] == "insufficient_baseline_sessions"
 
 
 def test_malformed_candles_are_dropped_not_trusted():
     hist = _history()
-    hist["candles"] += [{"datetime": "x"}, {"datetime": int(NOW * 1000) - 600_000, "high": 1, "low": 1,
+    hist["candles"] += [{"datetime": "x"}, {"datetime": int(RECEIPT * 1000) - 600_000, "high": 1, "low": 1,
                                             "close": 1, "volume": -5}, "junk"]
-    assert nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=NOW)["status"] == "ready"
+    assert _run(hist=hist)[0]["status"] == "ready"
 
 
-def test_envelope_hash_matches_the_readers_canonical_form():
-    p = _ready_payload()
-    env = nv.envelope(p, now=NOW)
+def test_envelope_matches_the_readers_canonical_form():
+    p, info = _run()
+    env = nv.envelope(p, nv.provenance(info["bars"]))
+    assert set(env) == {"schema", "generated_at", "payload", "payload_sha256", "provenance"}
+    assert env["schema"] == "grid.native-volume.snapshot.v1" and env["generated_at"] == p["as_of"]
     canonical = json.dumps(env["payload"], sort_keys=True, separators=(",", ":"), allow_nan=False)
-    assert env["schema"] == "grid.native-volume.snapshot.v1"
     assert env["payload_sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
+    prov = env["provenance"]
+    assert set(prov) == {"producer", "retained_rows_consulted", "retained_rows_sha256", "integrity_scope"}
+    assert prov["producer"] == "GRID Schwab pricehistory snapshot"
+    assert prov["retained_rows_consulted"] == len(info["bars"]) and len(prov["retained_rows_sha256"]) == 64
+    assert prov["integrity_scope"] == ("content integrity only; trust requires verified local producer "
+                                       "and owner-only custody")
 
 
 def test_history_params_cover_ten_prior_sessions():
@@ -138,15 +175,16 @@ def test_history_params_cover_ten_prior_sessions():
     assert (q["endDate"] - q["startDate"]) / 86_400_000 >= 14
 
 
-def test_snapshot_file_is_private(tmp_path, monkeypatch):
+def test_snapshot_file_is_private_and_single_linked(tmp_path):
     import scripts.gex_native_volume_snapshot as snap
 
     d = tmp_path / "nv"
     d.mkdir(mode=0o700)
     os.chmod(d, 0o700)
-    snap.write_private(d / "snapshot.json", nv.envelope(_ready_payload(), now=NOW))
+    p, info = _run()
+    snap.write_private(d / "snapshot.json", nv.envelope(p, nv.provenance(info["bars"])))
     st = (d / "snapshot.json").stat()
-    assert stat.S_IMODE(st.st_mode) == 0o600
+    assert stat.S_IMODE(st.st_mode) == 0o600 and st.st_nlink == 1
     assert json.loads((d / "snapshot.json").read_text())["payload"]["status"] == "ready"
     os.chmod(d, 0o755)
     with pytest.raises(SystemExit):
