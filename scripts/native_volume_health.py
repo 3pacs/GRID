@@ -7,6 +7,7 @@ one-shot bootstrap. The existing operations runner consumes JSON and exits:
 """
 
 import argparse
+import fcntl
 from datetime import datetime, timezone
 import json
 import os
@@ -14,7 +15,7 @@ from pathlib import Path
 import stat
 from zoneinfo import ZoneInfo
 
-from ingestion.realtime.native_volume_cache import MAX_BYTES as RECEIPT_MAX_BYTES
+from ingestion.realtime.native_volume_cache import disk_inventory
 from ingestion.realtime.native_volume_calendar import ManifestCalendar
 from ingestion.realtime.native_volume_health import evaluate
 from ingestion.realtime.research_intervals import _utc
@@ -53,26 +54,27 @@ def _json(dfd, name, cap):
     return json.loads(raw, object_pairs_hook=_unique)
 
 
-def _disk_bytes(dfd):
-    store = os.stat("minutes.sqlite", dir_fd=dfd, follow_symlinks=False)
-    _private_stat(store)
-    used = store.st_size
-    fd = os.open("receipts", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+class InventoryBusy(ValueError):
+    """A verified writer currently owns the existing inventory lock."""
+
+
+def _stable_inventory(dfd):
+    """Take a nonblocking shared lock on the existing writer file; never create it."""
     try:
-        _private_stat(os.fstat(fd), directory=True)
-        # Iterate with a hard count bound, never materialize an unbounded list.
-        with os.scandir(fd) as entries:
-            for count, entry in enumerate(entries, 1):
-                if count > 10000:
-                    raise ValueError("receipt count bound")
-                st = entry.stat(follow_symlinks=False)
-                _private_stat(st)
-                if st.st_size > RECEIPT_MAX_BYTES:
-                    raise ValueError("receipt size bound")
-                used += st.st_size
+        fd = os.open(
+            "writer.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd
+        )
+    except FileNotFoundError:
+        return disk_inventory(dfd)
+    try:
+        _private_stat(os.fstat(fd))
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise InventoryBusy("inventory writer active") from None
+        return disk_inventory(dfd)
     finally:
         os.close(fd)
-    return used
 
 
 def inspect(
@@ -134,7 +136,11 @@ def inspect(
             except (OSError, ValueError, TypeError):
                 errors.append("snapshot_unreadable")
             try:
-                args["disk_bytes"] = _disk_bytes(dfd)
+                fs = os.fstatvfs(dfd)
+                args["free_bytes"] = fs.f_bavail * fs.f_frsize
+                args["disk_bytes"], args["free_bytes"] = _stable_inventory(dfd)
+            except InventoryBusy:
+                errors.append("inventory_busy")
             except (OSError, ValueError):
                 errors.append("disk_unreadable")
             try:

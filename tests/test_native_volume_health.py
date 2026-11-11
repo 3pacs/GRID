@@ -45,6 +45,7 @@ class HealthTests(unittest.TestCase):
             checkpoint=self.checkpoint,
             snapshot=self.snapshot,
             disk_bytes=1_000_000,
+            free_bytes=1_000_000_000,
         )
 
     def check(self, **kw):
@@ -491,6 +492,7 @@ class RecoveryDrillTests(unittest.TestCase):
             checkpoint=state,
             snapshot=snapshot,
             disk_bytes=1000,
+            free_bytes=1_000_000_000,
             **kw,
         )
 

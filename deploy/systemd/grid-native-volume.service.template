@@ -1,0 +1,19 @@
+[Unit]
+Description=Explicitly enabled native-volume incremental acquisition (no bootstrap)
+# Review source/calendar pins, alert delivery and bootstrap acceptance before enabling.
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=@SOURCE_ROOT@
+Environment=GRID_NATIVE_VOLUME_CADENCE_ENABLED=0
+EnvironmentFile=@EXISTING_GRID_ENV_FILE@
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecCondition=/usr/bin/test ${GRID_NATIVE_VOLUME_CADENCE_ENABLED} = 1
+ExecStart=@PYTHON@ -B -m scripts.native_volume_once --fetch --incremental-only --root @PRIVATE_ROOT@ --calendar-manifest @CALENDAR_MANIFEST@ --calendar-sha256 @CALENDAR_SHA256@ --disk-budget-bytes 128000000
+Restart=no
+TimeoutStartSec=55
+KillMode=control-group
+UMask=0077
+StandardOutput=journal
+StandardError=journal

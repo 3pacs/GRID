@@ -1,0 +1,12 @@
+[Unit]
+Description=Native-volume incremental cadence, calendar-gated and opt-in
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09..16:*:10 America/New_York
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=grid-native-volume.service
+
+[Install]
+WantedBy=timers.target
