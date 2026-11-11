@@ -168,6 +168,17 @@ _FIELD_MAP: dict[str, str] = {
 }
 
 
+def is_mutual_fund_symbol(ticker: str) -> bool:
+    """Five letters ending in X: a mutual fund (NASDAQ fund-symbol convention).
+
+    Funds reach the daily list through insider filings (MOALX, TPYTX on
+    2026-11-10). Their NAV posts after the price slot, so they always look
+    lapsed to :func:`still_behind`. They stay readable (their TIINGO rows are
+    real NAVs); they are just not in the routine stock-close list.
+    """
+    return len(ticker) == 5 and ticker.isalpha() and ticker.isupper() and ticker.endswith("X")
+
+
 def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[str, date | None]]:
     """(ticker, latest close before the run) for every fetched ticker that
     still has no close for ``expected``: no data, a failed fetch, or data
@@ -657,11 +668,15 @@ class TiingoPuller(BasePuller):
             all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
             all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
         try:
-            from analysis.sector_map import price_tickers
+            from analysis.sector_map import price_ticker, price_tickers
             all_tickers.update(price_tickers())
+            # The lifecycle sidecar applies to every source, not just the map:
+            # a stopped symbol from the oracle/insider lists would still get
+            # Tiingo's frozen rows and trip the lapse check.
+            all_tickers = {p for t in all_tickers if (p := price_ticker(t))}
         except Exception as exc:  # noqa: BLE001 -- graceful degradation
             log.warning("Tiingo: sector map tickers unavailable: {e}", e=str(exc))
-        return sorted(t for t in all_tickers if is_tiingo_equity(t))
+        return sorted(t for t in all_tickers if is_tiingo_equity(t) and not is_mutual_fund_symbol(t))
 
     def pull_incremental(
         self,
