@@ -1452,6 +1452,10 @@ class GRIDApi {
     // Oracle
     async getOracleScoreboard() { return this._fetch('/api/v1/oracle/scoreboard'); }
     async getOracleEvidence() { return this._fetch('/api/v1/oracle/evidence'); }
+    getGammaBoardInstrument(symbol, signal) {
+        return this._fetch(`/api/v1/gamma-watch/board/${encodeURIComponent(symbol)}`, { signal, cache: 'no-store' });
+    }
+
     async getOraclePredictions(params = {}) {
         const qs = new URLSearchParams(params).toString();
         return this._fetch(`/api/v1/oracle/predictions?${qs}`);
