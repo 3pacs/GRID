@@ -41,7 +41,7 @@ class MissingOpenInterest(ValueError):
     """Across the entire eligible chain the provider has no positive open interest."""
 
 
-def aggregate(symbol, chain, *, now, daily_oi=None):
+def aggregate(symbol, chain, *, now, daily_oi=None, require_pair=False):
     """Use the OCC identity, declared deliverable and provider timestamps; never substitute receipt."""
     requested = provider_symbol(symbol)
     roots_allowed = {"SPX", "SPXW", "SPXO"} if symbol == "SPX" else {symbol}
@@ -67,6 +67,7 @@ def aggregate(symbol, chain, *, now, daily_oi=None):
     latest = None
     seen, incomplete = set(), set()
     covered = defaultdict(list)
+    sides = defaultdict(set)
     dropped = count = positive_oi = eligible = 0
     for i, side in enumerate(("call", "put")):
         for row in _rows(chain, side):
@@ -136,7 +137,10 @@ def aggregate(symbol, chain, *, now, daily_oi=None):
             )
             cell[side + "_oi"] += int(oi)
             cell[side + "_gex"] += exposure
+            sides[key].add(side)
             covered[key].append((root, _clock(row.get("quoteTimeInLong"), now)))
+    if require_pair:
+        incomplete.update(key for key in cells if len(sides[key]) != 2)
     for key in incomplete:
         cells.pop(key, None)
     for key, cell in cells.items():
@@ -204,7 +208,36 @@ def aggregate(symbol, chain, *, now, daily_oi=None):
     }
 
 
-def read_board(symbol: str, *, now: datetime) -> dict:
+def _one_expiry(symbol, chain, day):
+    """Select a single reported expiry before calculating clocks, coverage and net gamma."""
+    maps = ("callExpDateMap", "putExpDateMap")
+    available = [
+        {k.partition(":")[0] for k in (chain.get(side) or {})} for side in maps
+    ]
+    common = sorted(
+        d
+        for d in set.intersection(*available)
+        if day.isoformat() <= d <= (day + timedelta(days=30)).isoformat()
+    )
+    expiry = (
+        day.isoformat()
+        if symbol in {"SPX", "SPY", "QQQ"}
+        else (common[0] if common else None)
+    )
+    if expiry not in common:
+        raise ValueError("No eligible expiry in this session")
+    return {
+        **chain,
+        **{
+            side: {
+                k: v for k, v in chain[side].items() if k.partition(":")[0] == expiry
+            }
+            for side in maps
+        },
+    }
+
+
+def read_board(symbol: str, *, now: datetime, time_map: bool = False) -> dict:
     day = now.astimezone(NY).date()
     with requests.Session() as http:
         reader = SchwabMarketClient(session=http, timeout=12, max_retries=0)
@@ -215,14 +248,23 @@ def read_board(symbol: str, *, now: datetime) -> dict:
             strategy="SINGLE",
             strikeCount=160,
             fromDate=day.isoformat(),
-            toDate=(day + timedelta(days=30)).isoformat(),
+            toDate=(
+                day
+                if time_map and symbol in {"SPX", "SPY", "QQQ"}
+                else day + timedelta(days=30)
+            ).isoformat(),
         )
     received = datetime.now(timezone.utc)
-    try:
-        return aggregate(symbol, chain, now=received)
-    except MissingOpenInterest:
-        if symbol != "SPX":
-            raise
+    if time_map:
+        if received.astimezone(NY).date() != day:
+            raise ValueError("Session date changed during request")
+        chain = _one_expiry(symbol, chain, day)
+    if not (time_map and symbol == "SPX"):
+        try:
+            return aggregate(symbol, chain, now=received, require_pair=time_map)
+        except MissingOpenInterest:
+            if symbol != "SPX":
+                raise
     # Index chains can report zero OI throughout overnight trading. Match a single
     # complete provider snapshot by OCC root, expiry, side and strike. Never combine
     # different OI feeds across cells or assume that an unmatched contract has zero OI.
@@ -232,7 +274,9 @@ def read_board(symbol: str, *, now: datetime) -> dict:
     positions, observed = read_spx_oi(
         day=day, low=spot * 0.95, high=spot * 1.05, now=received
     )
-    panel = aggregate(symbol, chain, now=received, daily_oi=positions)
+    panel = aggregate(
+        symbol, chain, now=received, daily_oi=positions, require_pair=time_map
+    )
     panel.update(
         source_label="Schwab options chain + Massive daily open interest",
         oi_source="Massive options snapshot",

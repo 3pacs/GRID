@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { colors } from '../styles/shared.js';
 import './GammaBoard.css';
+import GammaSessionMap, {validMap} from '../components/GammaSessionMap.jsx';
 import GammaIntradayChart from '../components/GammaIntradayChart.jsx';
 
 const SYMBOLS = { SPX: 'S&P 500 index', SPY: 'S&P 500 ETF', QQQ: 'Nasdaq-100 ETF' };
@@ -32,11 +33,15 @@ function usd(value) {
 }
 
 const FEEDS = {
+    history: {load: (...args) => api.getGammaSessionMap(...args), valid: validMap},
     chain: { load: (...args) => api.getGammaBoardInstrument(...args), valid: next => Array.isArray(next.cells) && next.cells.length && Number.isFinite(next.spot) },
     intraday: { load: (...args) => api.getGammaBoardIntraday(...args), valid: next => Array.isArray(next.bars) && next.bars.length
         && Number.isFinite(Date.parse(next.session_start)) && Date.parse(next.session_end) > Date.parse(next.session_start) },
 };
-function useFeed(symbol, refresh, kind) {
+function observationTime(observation, kind) {
+    return kind === 'history' ? observation.times.at(-1) : Date.parse(observation.as_of);
+}
+function useFeed(symbol, refresh, kind, sessionDate = '') {
     const [state, setState] = useState({ snapshot: null, status: `Loading ${kind}…`, loading: true });
     const manual = useRef(null);
     useEffect(() => {
@@ -50,7 +55,8 @@ function useFeed(symbol, refresh, kind) {
             deadline = setTimeout(() => controller.abort(), DEADLINE_MS);
             setState(last => ({ ...last, loading: true }));
             try {
-                const next = await FEEDS[kind].load(symbol, controller.signal);
+                const readAt = performance.now();
+                const next = await FEEDS[kind].load(symbol, controller.signal, sessionDate);
                 if (!active) return;
                 if (typeof next?.session_open === 'boolean') interval = next.session_open ? OPEN_MS : CLOSED_MS;
                 if (next?.status === 401 || next?.status === 403) {
@@ -58,19 +64,20 @@ function useFeed(symbol, refresh, kind) {
                     return;
                 }
                 if (next?.symbol === symbol && next.status === 'unavailable') {
-                    setState({ snapshot: null, loading: false, status: next.reason || `${kind} unavailable.` });
+                    setState({ snapshot: null, loading: false, tracking:next.tracking, readAt, status: next.reason || `${kind} unavailable.` });
                     return;
                 }
-                const valid = next?.symbol === symbol && next.status === 'available' && Number.isFinite(Date.parse(next.as_of))
+                const valid = next?.symbol === symbol && next.status === 'available'
+                    && (kind === 'history' ? (!sessionDate || next.session_date === sessionDate) : Number.isFinite(Date.parse(next.as_of)))
                     && FEEDS[kind].valid(next);
                 if (controller.signal.aborted || !valid) {
                     throw new Error(`Latest ${kind} unavailable.`);
                 }
                 setState(previous => {
-                    if (previous.snapshot && next.source === previous.snapshot.source && Date.parse(next.as_of) < Date.parse(previous.snapshot.as_of)) {
+                    if (previous.snapshot && next.source === previous.snapshot.source && observationTime(next,kind) < observationTime(previous.snapshot,kind)) {
                         return { ...previous, loading: false, status: 'Provider returned an older observation. Showing last snapshot.' };
                     }
-                    return { snapshot: next, status: '', loading: false };
+                    return { snapshot: next, tracking:next.tracking, readAt, status: '', loading: false };
                 });
             } catch (err) {
                 if (active) setState(last => ({ ...last, loading: false,
@@ -78,7 +85,7 @@ function useFeed(symbol, refresh, kind) {
             } finally {
                 clearTimeout(deadline);
                 busy = false;
-                if (active && !document.hidden) timer = setTimeout(poll, interval);
+                if (active && !document.hidden && !sessionDate) timer = setTimeout(poll, interval);
             }
         }
         function visibility() {
@@ -96,7 +103,7 @@ function useFeed(symbol, refresh, kind) {
             document.removeEventListener('visibilitychange', visibility);
             manual.current = null;
         };
-    }, [symbol, kind]);
+    }, [symbol, kind, sessionDate]);
     useEffect(() => { if (refresh) manual.current?.(); }, [refresh]);
     return state;
 }
@@ -165,21 +172,48 @@ function Surface({ symbol, snapshot, metric, count }) {
     </>;
 }
 
-function Instrument({ symbol, metric, count, refresh, onRemove }) {
+function SessionHistory({symbol, refresh, sessionDate, extra}) {
+    const [changed,setChanged]=useState(null);
+    const [saving,setSaving]=useState(false);
+    const [error,setError]=useState('');
+    const h=useFeed(symbol, refresh, 'history', sessionDate);
+    const tracked=changed && changed.at > (h.readAt ?? 0) ? changed.enabled : h.tracking;
+    async function toggle() {
+        if (saving || typeof tracked !== 'boolean') return;
+        setSaving(true); setError('');
+        try {
+            const next=await api.setGammaSessionTracking(symbol,!tracked);
+            if(next?.symbol===symbol && typeof next.tracking==='boolean') setChanged({enabled:next.tracking,at:performance.now()});
+            else setError(next?.status===409 ? 'Three extra tickers are already being recorded.' : 'Recording change could not be confirmed.');
+        } catch {setError('Recording change could not be confirmed.');}
+        finally {setSaving(false);}
+    }
+    return <section className="gb-history" aria-label={symbol + ' recorded GEX history'}>
+        <h3>GEX heatmap <small>strike × session time</small></h3>
+        {h.status && <div className={h.snapshot ? 'gb-status' : 'gb-history-empty'} role="status">
+            {!h.snapshot && <strong>{h.loading ? 'Loading session history' : 'Session heatmap unavailable'}</strong>}
+            <span>{h.status}</span></div>}
+        {h.snapshot && <GammaSessionMap map={h.snapshot} />}
+        {extra && <div className="gb-record"><button type="button" disabled={saving || typeof tracked !== 'boolean'} onClick={toggle}>
+            {saving?'Saving…':tracked?'Stop recording':'Record future minutes'}</button>
+            <p>{tracked ? 'Server recording is enabled for future regular-session minutes, including while this page is closed.' : 'Enable server recording to collect future regular-session minutes while this page is closed.'}</p>
+            {error && <p role="alert">{error}</p>}
+        </div>}
+    </section>;
+}
+
+function Instrument({ symbol, metric, count, refresh, sessionDate, onRemove }) {
     const { snapshot: s, status, loading } = useFeed(symbol, refresh, 'chain');
     const intraday = useFeed(symbol, refresh, 'intraday');
     return <article className="gb-card" aria-label={symbol + ' gamma exposure'}>
         <header><div><h2>{symbol}</h2><span>{SYMBOLS[symbol] || 'Equity / ETF'}</span>{onRemove && <button className="gb-remove" type="button" aria-label={`Remove ${symbol}`} onClick={onRemove}>Remove</button>}</div>
-            <div className="gb-spot"><b>{number(s?.spot)}</b><span>Underlying spot</span></div></header>
+            <div className="gb-spot"><b>{number(s?.spot)}</b><span>Latest chain spot</span></div></header>
+        <SessionHistory key={symbol + '/' + sessionDate} symbol={symbol} refresh={refresh} sessionDate={sessionDate} extra={!!onRemove} />
+        <details className="gb-secondary"><summary>Latest expiry × strike snapshot</summary>
         <dl className="gb-walls">{[['Call wall', number(s?.call_wall)], ['Put wall', number(s?.put_wall)], ['Net GEX', signedUsd(s?.net_gex)]]
             .map(([label, val]) => <div key={label}><dt>{label}</dt><dd className={label === 'Net GEX' ? signedColor(s?.net_gex) : ''}>{val}</dd></div>)}</dl>
         {s && <div className="gb-clock"><b>{!s.session_open ? 'Last available snapshot' : s.stale ? 'Stale chain' : 'Chain snapshot'}</b> · {clock(s.as_of)}<br />
             {s.session_open ? 'Regular session open' : 'Regular session closed'} · {s.expiries?.length ? s.expiries.length + ' expiries' : 'Expiry coverage unavailable'}</div>}
-        <section className="gb-intraday" aria-label={symbol + ' intraday price'}>
-            <h3>Intraday price</h3>
-            {intraday.status && <p className="gb-status" role="status">{intraday.status}</p>}
-            {intraday.snapshot && <GammaIntradayChart snapshot={intraday.snapshot} chain={s} />}
-        </section>
         <h3 className="gb-surface-title">Gamma heatmap</h3>
         {status && <p className="gb-status" role="status">{status}</p>}
         {s && <><Surface symbol={symbol} snapshot={s} metric={metric} count={count} />
@@ -190,6 +224,12 @@ function Instrument({ symbol, metric, count, refresh, onRemove }) {
                 {s.source_note && <p>{s.source_note}</p>}
             </details></>}
         {!s && !loading && <div className="gb-empty">Waiting for a usable {symbol} chain.</div>}
+        </details>
+        <details className="gb-intraday gb-secondary" aria-label={symbol + ' intraday price'}>
+            <summary>Latest intraday price</summary>
+            {intraday.status && <p className="gb-status" role="status">{intraday.status}</p>}
+            {intraday.snapshot && <GammaIntradayChart snapshot={intraday.snapshot} chain={s} />}
+        </details>
     </article>;
 }
 
@@ -201,6 +241,7 @@ export default function GammaBoard() {
     useEffect(() => {
         try { window.localStorage.setItem(EXTRA_KEY, JSON.stringify(extra)); } catch { /* In-memory controls still work. */ }
     }, [extra]);
+    const [sessionDate, setSessionDate] = useState('');
     const [entry, setEntry] = useState('');
     const [message, setMessage] = useState('');
     const symbols = [...Object.keys(SYMBOLS), ...extra];
@@ -216,20 +257,24 @@ export default function GammaBoard() {
     }
     return <main className="gamma-board" style={{ '--gb-bg': colors.bg, '--gb-card': colors.card,
         '--gb-border': colors.border, '--gb-fg': colors.text, '--gb-muted': colors.textDim }}>
-        <header className="gb-header"><div><h1>Gamma exposure</h1><p>One-minute prices and modeled dollar gamma exposure per 1% underlying move</p></div>
+        <header className="gb-header"><div><h1>Gamma exposure</h1><p>Recorded net gamma exposure across strikes and trading time</p></div>
             <button type="button" onClick={() => setRefresh(v => v + 1)}>Refresh all</button></header>
-        <div className="gb-controls"><span className="gb-cadence">Auto-refresh · 1 min during session · 5 min after close</span><label>Exposure <select value={metric} onChange={e => setMetric(e.target.value)}>
+        <div className="gb-controls"><span className="gb-cadence">{sessionDate ? 'Archived heatmap · latest chain below' : 'Latest · auto-refresh during the session'}</span>
+            <label>Recorded session <input type="date" value={sessionDate} onChange={e=>setSessionDate(e.target.value)} /></label>
+            {sessionDate && <button type="button" onClick={()=>setSessionDate('')}>Latest session</button>}
+        </div>
+        <details className="gb-filter-disclosure"><summary>Latest expiry surface controls</summary><div className="gb-controls"><label>Exposure <select value={metric} onChange={e => setMetric(e.target.value)}>
             {Object.entries(exposures).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label>
             <label>Strike window <select value={count} onChange={e => setCount(e.target.value)}>
                 <option value="9">9 near spot</option><option value="17">17 near spot</option><option value="all">All covered strikes</option>
-            </select></label></div>
+            </select></label></div></details>
         <form onSubmit={add} className="gb-add"><label>Add ticker <input aria-label="Ticker to add" autoCapitalize="characters" autoComplete="off"
             value={entry} onChange={e => { setEntry(e.target.value); setMessage(''); }} placeholder="e.g. AAPL" /></label><button type="submit">Add</button>
             <span aria-live="polite">{message || symbols.length + ' of 6 instruments'}</span></form>
         <div className="gb-boards">{symbols.map(symbol =>
-            <Instrument key={symbol} symbol={symbol} metric={metric} count={count} refresh={refresh}
+            <Instrument key={symbol} symbol={symbol} metric={metric} count={count} refresh={refresh} sessionDate={sessionDate}
                 onRemove={extra.includes(symbol) ? () => { setExtra(extra.filter(s => s !== symbol)); setMessage(''); } : undefined} />)}</div>
-        <footer><p>◇ marks the listed strike nearest spot. Each panel’s color scale saturates at the 95th percentile of its visible nonzero exposures. Striped cells have no covered contract.</p>
+        <footer><p>Color saturates at the 95th percentile of visible nonzero exposure per panel. Blank minutes have no recording. In the expiry snapshot, ◇ marks the listed strike nearest spot.</p>
             <p>Walls mark the strike with the largest call or absolute put exposure across covered expiries. The model treats calls as positive and puts as negative. Open Source and quote times for the method and coverage of each chain.</p>
         </footer>
     </main>;

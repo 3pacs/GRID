@@ -5,7 +5,7 @@ import GammaBoard from '../views/GammaBoard.jsx';
 import { api } from '../api.js';
 import { routes, drawerSections } from '../routes.js';
 
-vi.mock('../api.js', () => ({ api: { getGammaBoardInstrument: vi.fn(), getGammaBoardIntraday: vi.fn() } }));
+vi.mock('../api.js', () => ({ api: { getGammaBoardInstrument: vi.fn(), getGammaBoardIntraday: vi.fn(), getGammaSessionMap: vi.fn(), setGammaSessionTracking: vi.fn() } }));
 const stamp = '2026-11-10T21:00:00Z';
 const expiry = '2026-11-13';
 function good(symbol, extra = {}) {
@@ -30,7 +30,7 @@ const panel = s => within(screen.getByRole('article', { name: s + ' gamma exposu
 const flush = () => act(async () => {});
 const tick = ms => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 describe('Gamma board', () => {
-    beforeEach(() => { localStorage.removeItem('grid.gamma-board.extra-symbols.v1'); vi.useFakeTimers(); api.getGammaBoardInstrument.mockReset(); api.getGammaBoardIntraday.mockReset().mockImplementation(s => Promise.resolve(prices(s))); });
+    beforeEach(() => { localStorage.removeItem('grid.gamma-board.extra-symbols.v1'); vi.useFakeTimers(); api.getGammaSessionMap.mockReset().mockImplementation(s => Promise.resolve({symbol:s,status:'unavailable',reason:'No recorded minutes.',tracking:false})); api.getGammaBoardInstrument.mockReset(); api.getGammaBoardIntraday.mockReset().mockImplementation(s => Promise.resolve(prices(s))); });
     afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
     it('keeps the three scoped surfaces together in the markets drawer and exposes exact cell details', async () => {
         expect(routes.find(r => r.id === 'gamma-board').component).toBe('./views/GammaBoard.jsx');
@@ -53,7 +53,7 @@ describe('Gamma board', () => {
         expect(panel('QQQ').getByText('Last available snapshot')).toBeInTheDocument();
         failSPY = true; await tick(60000);
         expect(api.getGammaBoardInstrument).toHaveBeenCalledTimes(4);
-        expect(panel('SPY').getByRole('status')).toHaveTextContent('Showing last snapshot');
+        expect(panel('SPY').getByText(/Showing last snapshot/)).toBeInTheDocument();
         expect(panel('SPY').getByRole('table')).toBeInTheDocument();
     });
     it('clears private prior data on access loss or authoritative unavailability', async () => {
