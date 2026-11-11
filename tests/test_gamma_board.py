@@ -23,7 +23,7 @@ def fresh_cache():
     board._CACHE.clear()
 
 
-def test_admin_only_fixed_symbols_and_private_response(monkeypatch):
+def test_admin_only_standard_symbols_and_private_response(monkeypatch):
     from secrets import token_urlsafe
 
     monkeypatch.setenv("GRID_JWT_SECRET", token_urlsafe(48))
@@ -39,13 +39,13 @@ def test_admin_only_fixed_symbols_and_private_response(monkeypatch):
 
     assert c.get(path + "SPY").status_code == 401
     assert c.get(path + "SPY", headers=auth("contributor")).status_code == 403
-    assert c.get(path + "AAPL", headers=auth("admin")).status_code == 422
+    assert c.get(path + "AAPL9", headers=auth("admin")).status_code == 422
     read.assert_not_called()
     monkeypatch.setattr(settings, "SCHWAB_PRIVATE_GEX_BOARD_ENABLED", False)
-    response = c.get(path + "QQQ", headers=auth("admin"))
+    response = c.get(path + "AAPL", headers=auth("admin"))
     assert response.headers["cache-control"] == "no-store, private"
     assert response.headers["X-GRID-Audience"] == "private"
-    read.assert_called_once_with("QQQ", False)
+    read.assert_called_once_with("AAPL", False)
 
 
 def test_single_flight_and_disabled_source_cannot_expose_schwab(monkeypatch):
@@ -164,3 +164,17 @@ def test_private_snapshot_rechecks_freshness_on_cache_hit():
     }
     result = board._stamp(panel, now)
     assert result["stale"] and not result["fresh"]
+
+
+def test_extra_ticker_budget_cannot_crowd_out_pinned_symbols(monkeypatch):
+    from collections import deque
+
+    monkeypatch.setattr(board, "_EXTRA_STARTS", deque())
+    monkeypatch.setattr(board, "_EXTRA_LIMIT", 2)
+    monkeypatch.setattr(board, "_EXTRA_CAPACITY", 1)
+    monkeypatch.setattr(board, "_database_panel", lambda *_: None)
+    for symbol in ("AAPL", "NVDA"):
+        assert board.read_panel(symbol, False)["status"] == "unavailable"
+    assert len(board._CACHE) == 1
+    assert "limit" in board.read_panel("MSFT", False)["reason"]
+    assert "limit" not in board.read_panel("SPX", False)["reason"]

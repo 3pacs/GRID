@@ -17,3 +17,21 @@
 @media(max-width:860px){.gb-boards{grid-template-columns:1fr}.gb-scroll{max-height:300px}.gb-card{padding:14px}}@media(pointer:coarse){.gb-map button{min-height:32px}.gb-controls select,.gb-header button{min-height:42px}}
 
 .gb-cadence{color:var(--gb-muted);font:12px ui-monospace,monospace;margin-right:auto}
+
+.gamma-board{--gb-positive:#62d48b;--gb-negative:#ff858b}
+.gb-positive,.gb-pick .gb-positive,.gb-legend .gb-positive{color:var(--gb-positive)}
+.gb-negative,.gb-pick .gb-negative,.gb-legend .gb-negative{color:var(--gb-negative)}
+.gb-legend i{background:linear-gradient(90deg,#f86e74,#253136,#51d282)}
+.gb-legend b{font-weight:500}
+.gb-add{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 14px;font-size:12px;color:var(--gb-muted)}
+.gb-add label{display:flex;align-items:center;gap:6px}
+.gb-add input,.gb-add button,.gb-remove{color:var(--gb-fg);background:var(--gb-card);border:1px solid var(--gb-border);border-radius:5px;padding:6px 8px;font:inherit}
+.gb-add input{width:90px;text-transform:uppercase}.gb-add button,.gb-remove{cursor:pointer}.gb-remove{margin-left:6px;font-size:11px}
+.gb-intraday{border-block:1px solid var(--gb-border);padding:10px 0;margin-top:10px}
+.gb-intraday h3,.gb-surface-title{font-size:14px;margin:4px 0}.gb-surface-title{margin-top:14px}
+.gb-price-chart svg{display:block;width:100%;cursor:crosshair}
+.gb-price-chart svg text{font:9px ui-monospace,monospace;fill:var(--gb-muted)}
+.gb-price-grid{stroke:var(--gb-border);stroke-width:1}.gb-price-chart p,.gb-minute{font-size:11px;line-height:1.45;color:var(--gb-muted);margin:3px 0}
+.gb-price-chart p:empty{display:none}.gb-price-head{display:flex;align-items:baseline;justify-content:space-between;gap:6px;flex-wrap:wrap}.gb-price-head strong{font:600 20px ui-monospace,monospace}.gb-price-head span{font:12px ui-monospace,monospace}
+.gb-minute{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.gb-minute input{min-width:60px;max-width:125px;accent-color:var(--gb-muted)}
+@media(pointer:coarse){.gb-add button,.gb-add input,.gb-remove{min-height:42px}}

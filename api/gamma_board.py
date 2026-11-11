@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime, time, timedelta, timezone
 import math
 import logging
@@ -11,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from api.gamma_board_symbols import provider_symbol
 from api.dependencies import get_db_engine
 from ingestion.market_calendar import is_market_open, market_close_time
 from physics.greeks.black_scholes import gamma
@@ -19,6 +21,13 @@ log = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
 SYMBOLS = ("SPX", "SPY", "QQQ")
 _LOCKS = {s: Lock() for s in SYMBOLS}
+# Dedicated locks/cache slots for the three pinned panels. Extra symbols share a
+# fixed number of locks and a bounded cache, even with concurrent admin clients.
+_EXTRA_LOCKS = [Lock() for _ in range(4)]
+_CACHE_GUARD = Lock()
+_EXTRA_STARTS = deque()
+_EXTRA_LIMIT = 12
+_EXTRA_CAPACITY = 24
 _CACHE = {}
 _REFRESH_SECONDS = 60
 _MAX_AGE = timedelta(days=7)
@@ -210,13 +219,29 @@ def _stamp(panel, now):
 
 def read_panel(symbol, enabled):
     """Serialize each symbol's refresh. Disabled sources cannot return their cached quotes."""
+    provider_symbol(symbol)
     key = (symbol, enabled)
-    with _LOCKS[symbol]:
+    pinned = symbol in _LOCKS
+    lock = _LOCKS[symbol] if pinned else _EXTRA_LOCKS[hash(symbol) % len(_EXTRA_LOCKS)]
+    with lock:
         now = datetime.now(timezone.utc)
         before = monotonic()
-        old = _CACHE.get(key)
-        if old and before - old[0] < _REFRESH_SECONDS:
-            return _stamp(old[1], now)
+        with _CACHE_GUARD:
+            old = _CACHE.get(key)
+            if old and before - old[0] < _REFRESH_SECONDS:
+                return _stamp(old[1], now)
+            if not pinned:
+                while _EXTRA_STARTS and before - _EXTRA_STARTS[0] >= _REFRESH_SECONDS:
+                    _EXTRA_STARTS.popleft()
+                if len(_EXTRA_STARTS) >= _EXTRA_LIMIT:
+                    return _stamp(
+                        unavailable(
+                            symbol,
+                            "Additional ticker refresh limit reached. Retry shortly.",
+                        ),
+                        now,
+                    )
+                _EXTRA_STARTS.append(before)
         reason = "Private chain provider disabled."
         panel = None
         if enabled:
@@ -237,7 +262,7 @@ def read_panel(symbol, enabled):
                 if symbol == "SPX"
                 else "Private chain unavailable."
             )
-        if panel is None:
+        if panel is None and pinned:
             try:
                 panel = _database_panel(symbol, now)
             except Exception as exc:
@@ -259,6 +284,19 @@ def read_panel(symbol, enabled):
                     "source_note": "Source unavailable. Displaying the last successful snapshot.",
                 }
         if panel is None:
-            panel = unavailable(symbol, reason + " No qualifying GRID capture.")
-        _CACHE[key] = (monotonic(), panel)
+            panel = unavailable(
+                symbol,
+                reason
+                + (
+                    " No qualifying GRID capture."
+                    if pinned
+                    else " No verified standard options chain."
+                ),
+            )
+        with _CACHE_GUARD:
+            if not pinned and key not in _CACHE:
+                extras = [k for k in _CACHE if k[0] not in _LOCKS]
+                if len(extras) >= _EXTRA_CAPACITY:
+                    del _CACHE[min(extras, key=lambda k: _CACHE[k][0])]
+            _CACHE[key] = (monotonic(), panel)
         return _stamp(panel, datetime.now(timezone.utc))
