@@ -103,3 +103,14 @@ def test_whole_chain_zero_is_unavailable_not_zero_gex():
         aggregate("SPX", j, now=NOW, daily_oi={**exact, "SPXW261111C07500000": None})
     with pytest.raises(MissingOpenInterest):
         aggregate("SPX", j, now=NOW, daily_oi={"SPX261111C07500000": 10})
+
+
+def test_generic_equity_requires_matching_standard_option_root():
+    j = chain()
+    j["underlying"]["symbol"] = j["symbol"] = "AAPL"
+    for side in ("call", "put"):
+        row = j[side + "ExpDateMap"]["2026-11-11:0"]["7500.0"][0]
+        row.update(symbol=row["symbol"].replace("SPXW", "AAPL"), optionRoot="AAPL")
+    assert aggregate("AAPL", j, now=NOW)["contracts"] == 2
+    with pytest.raises(ValueError):
+        aggregate("MSFT", j, now=NOW)

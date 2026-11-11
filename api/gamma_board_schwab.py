@@ -8,12 +8,11 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from api.gamma_board_symbols import provider_symbol
 from ingestion.market_calendar import is_market_open, market_close_time
 from ingestion.schwab_market import SchwabMarketClient
 
 NY = ZoneInfo("America/New_York")
-SYMBOLS = {"SPX": "$SPX", "SPY": "SPY", "QQQ": "QQQ"}
-ROOTS = {"SPX": {"SPX", "SPXW", "SPXO"}, "SPY": {"SPY"}, "QQQ": {"QQQ"}}
 OCC = re.compile(r"([A-Z]+) *(\d{6})([CP])(\d{8})\Z")
 METHOD = (
     "Provider gamma × daily open interest × 100 × spot² × 0.01. "
@@ -44,7 +43,8 @@ class MissingOpenInterest(ValueError):
 
 def aggregate(symbol, chain, *, now, daily_oi=None):
     """Use the OCC identity, declared deliverable and provider timestamps; never substitute receipt."""
-    requested = SYMBOLS[symbol]
+    requested = provider_symbol(symbol)
+    roots_allowed = {"SPX", "SPXW", "SPXO"} if symbol == "SPX" else {symbol}
     u = chain.get("underlying") or {}
     if (
         chain.get("status") != "SUCCESS"
@@ -71,7 +71,7 @@ def aggregate(symbol, chain, *, now, daily_oi=None):
     for i, side in enumerate(("call", "put")):
         for row in _rows(chain, side):
             occ = OCC.fullmatch(str(row.get("symbol", "")))
-            if not occ or occ[1] not in ROOTS[symbol]:
+            if not occ or occ[1] not in roots_allowed:
                 continue
             root, day, cp, strike_code = occ.groups()
             strike = int(strike_code) / 1000
@@ -209,7 +209,7 @@ def read_board(symbol: str, *, now: datetime) -> dict:
     with requests.Session() as http:
         reader = SchwabMarketClient(session=http, timeout=12, max_retries=0)
         chain = reader.option_chain(
-            SYMBOLS[symbol],
+            provider_symbol(symbol),
             contractType="ALL",
             includeUnderlyingQuote="TRUE",
             strategy="SINGLE",

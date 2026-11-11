@@ -9,11 +9,13 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlencode
 
+from fastapi import Path as ApiPath
 from fastapi import APIRouter, Depends, Query, Response
 
+from api.gamma_board_symbols import SYMBOL_PATTERN
 from api.auth import require_auth, require_role
 
 router = APIRouter(prefix="/api/v1/gamma-watch", tags=["gamma-watch"],
@@ -148,7 +150,7 @@ def get_archive(response: Response, stream: Literal["artifacts", "events", "samp
 
 
 @router.get("/board/{symbol}", dependencies=[Depends(require_role("admin"))])
-def instrument_board(symbol: Literal["SPX", "SPY", "QQQ"], response: Response) -> dict:
+def instrument_board(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max_length=5)], response: Response) -> dict:
     """Admin-only, same-origin GEX board. Provider access requires the board-specific flag."""
     from api.gamma_board import read_panel
     from config import settings
@@ -156,3 +158,14 @@ def instrument_board(symbol: Literal["SPX", "SPY", "QQQ"], response: Response) -
     response.headers["Cache-Control"] = "no-store, private"
     response.headers["X-GRID-Audience"] = "private"
     return read_panel(symbol, settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED)
+
+
+@router.get("/intraday/{symbol}", dependencies=[Depends(require_role("admin"))])
+def instrument_intraday(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN)], response: Response) -> dict:
+    """Completed cash-session bars used by the private Gamma Board."""
+    from api.gamma_board_intraday import read_intraday
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    return read_intraday(symbol, settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED)
