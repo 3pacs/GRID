@@ -458,3 +458,217 @@ def test_hermes_sleuth_dispatch_is_enabled_and_queues_one_goal_per_lead(monkeypa
 def test_chat_questions_are_stored_as_chat_leads():
     source = (Path(__file__).resolve().parents[1] / "api" / "routers" / "chat.py").read_text()
     assert source.count('origin="chat"') == 2
+
+
+# ── Research-only canonical evidence candidate; never alters v2 ─────────────
+
+
+def _event_version(**overrides):
+    row = dict(id=1, channel="form4", dedup_key="NVDA|TEST OWNER|2026-10-01|P|10",
+               content_hash="a" * 64, actor_id="TEST OWNER", actor_id_basis="normalized_name",
+               entity_ticker="NVDA", event_time=AS_OF - timedelta(days=30),
+               known_at=AS_OF - timedelta(days=1), known_at_basis="first_seen",
+               clock_contract="people-events-post-commit-receipt-v1", end_history_valid=True,
+               receipt_id="SYNTHETIC-POST-COMMIT-CAPTURE", receipt_sha256="c" * 64,
+               direction="buy", transaction_code="P", echo_of=None,
+               superseded_at=None, retracted_at=None)
+    row.update(overrides)
+    return row
+
+
+def _qualify(*rows, as_of=AS_OF):
+    return si.qualify_people_event_versions(list(rows), as_of=as_of)
+
+
+def test_evidence_candidate_uses_receipt_clock_and_keeps_exact_version():
+    result = _qualify(_event_version())
+    (record,) = result.records
+    assert result.status == "RESEARCH_ONLY_NOT_ACTIVATED"
+    assert result.contract == "people-event-evidence-v1-20261111"
+    assert record["event_time"] == (AS_OF - timedelta(days=30)).isoformat()
+    assert record["known_at"] == (AS_OF - timedelta(days=1)).isoformat()
+    assert record["id"] == 1 and record["content_hash"] == "a" * 64
+    assert record["table"] == "people_events"
+    assert result.exclusions == {}
+    assert not isinstance(record, si.Observation)
+
+
+def test_evidence_candidate_ignores_current_source_counts_and_later_metadata():
+    original = _event_version()
+    mutated = {**original, "n_sources": 999, "source_refs": ["future-reporter"],
+               "provenance": {"near_duplicate": True, "later_secret": "ignored"},
+               "source": "future-authoritative-source", "created_at": AS_OF - timedelta(days=90)}
+    assert _qualify(original) == _qualify(mutated)
+
+
+def test_evidence_candidate_never_uses_old_creation_time_for_revised_payload():
+    result = _qualify(_event_version(known_at=AS_OF + timedelta(seconds=1),
+                                    created_at=AS_OF - timedelta(days=90)))
+    assert not result.records
+    assert result.exclusions == {"not_yet_known": 1}
+
+
+@pytest.mark.parametrize("end_field", ["superseded_at", "retracted_at"])
+def test_evidence_candidate_end_boundary_is_exclusive(end_field):
+    row = _event_version(**{end_field: AS_OF})
+    assert _qualify(row, as_of=AS_OF - timedelta(microseconds=1)).records
+    assert not _qualify(row).records
+    assert _qualify(row).exclusions == {"superseded_or_retracted": 1}
+
+
+def test_evidence_candidate_correction_selects_one_version_at_boundary():
+    old = _event_version(superseded_at=AS_OF)
+    new = _event_version(id=2, content_hash="b" * 64, known_at=AS_OF,
+                         direction="sell", transaction_code="S")
+    before = _qualify(old, new, as_of=AS_OF - timedelta(microseconds=1))
+    after = _qualify(old, new)
+    assert [r["id"] for r in before.records] == [1]
+    assert [r["id"] for r in after.records] == [2]
+    assert after.records[0]["direction"] == "sell"
+
+
+def test_evidence_candidate_future_append_does_not_change_earlier_records():
+    base = _event_version()
+    future = _event_version(id=2, content_hash="b" * 64, known_at=AS_OF + timedelta(days=1))
+    assert _qualify(base).records == _qualify(base, future).records
+
+
+@pytest.mark.parametrize("delta,accepted", [(timedelta(0), True),
+                                             (timedelta(days=7), False),
+                                             (timedelta(days=7, microseconds=-1), True)])
+def test_evidence_candidate_receipt_window_is_exact(delta, accepted):
+    assert bool(_qualify(_event_version(known_at=AS_OF - delta)).records) is accepted
+
+
+@pytest.mark.parametrize("overrides,reason", [
+    ({"channel": "gov_contract_qq_aggregate"}, "unsupported_or_aggregate_channel"),
+    ({"channel": "news"}, "unsupported_or_aggregate_channel"),
+    ({"clock_contract": "public-clock"}, "unqualified_receipt_history"),
+    ({"end_history_valid": False}, "unqualified_receipt_history"),
+    ({"known_at_basis": "filing"}, "unqualified_clock_basis"),
+    ({"known_at_basis": "statutory_bound"}, "unqualified_clock_basis"),
+    ({"known_at_basis": "qq_last_modified"}, "unqualified_clock_basis"),
+    ({"entity_ticker": "NONE"}, "unqualified_ticker"),
+    ({"entity_ticker": "BTC-USD"}, "unqualified_ticker"),
+    ({"transaction_code": "A"}, "not_qualified_directional_act"),
+    ({"transaction_code": "P", "direction": "sell"}, "not_qualified_directional_act"),
+    ({"known_at": AS_OF.replace(tzinfo=None)}, "invalid_clock"),
+    ({"known_at": "2026-11-07"}, "invalid_clock"),
+    ({"event_time": AS_OF}, "invalid_event_clock"),
+    ({"event_time": AS_OF.replace(tzinfo=None)}, "invalid_event_clock"),
+    ({"id": None}, "missing_version_identity"),
+    ({"content_hash": "unknown"}, "missing_version_identity"),
+])
+def test_evidence_candidate_refuses_unqualified_rows(overrides, reason):
+    result = _qualify(_event_version(**overrides))
+    assert not result.records
+    assert result.exclusions == {reason: 1}
+
+
+@pytest.mark.parametrize("channel,direction,code,family", [
+    ("form4", "sell", "S", "insider"), ("congress", "buy", None, "congress"),
+    ("congress", "sell", None, "congress"), ("gov_contract", "award", None, "gov_contract"),
+])
+def test_evidence_candidate_admits_only_documented_directional_channels(channel, direction, code, family):
+    result = _qualify(_event_version(channel=channel, direction=direction, transaction_code=code))
+    assert result.records[0]["family"] == family
+
+
+def test_evidence_candidate_repeated_version_is_not_extra_evidence():
+    row = _event_version()
+    result = _qualify(row, dict(row))
+    assert len(result.records) == 1
+    assert result.exclusions == {"duplicate_version": 1}
+
+
+@pytest.mark.parametrize("second", [
+    {"id": 2, "content_hash": "b" * 64},
+    {"id": 2, "direction": "neutral", "transaction_code": "A"},
+    {"id": 2, "known_at_basis": "statutory_bound"},
+    {"direction": "sell", "transaction_code": "S"},
+    {"dedup_key": "DIFFERENT-ACT"},
+])
+def test_evidence_candidate_conflicting_visible_versions_withhold_whole_act(second):
+    result = _qualify(_event_version(), _event_version(**second))
+    assert not result.records
+    assert result.exclusions == {("conflicting_visible_version" if second.get("id") == 2
+                                  else "conflicting_version_identity"): 2}
+
+
+def test_evidence_candidate_empty_and_order_independent():
+    assert _qualify().records == ()
+    first = _event_version()
+    second = _event_version(id=2, dedup_key="SECOND-ACT", content_hash="b" * 64)
+    assert _qualify(first, second) == _qualify(second, first)
+
+
+def test_evidence_candidate_requires_aware_decision_before_read(monkeypatch):
+    reader = MagicMock()
+    monkeypatch.setattr("store.people_events.read_event_versions", reader)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        si.collect_people_event_evidence(MagicMock(), entity_ticker="NVDA", as_of=AS_OF.replace(tzinfo=None))
+    reader.assert_not_called()
+
+
+def test_evidence_candidate_withholds_without_post_commit_proof_before_any_io(monkeypatch):
+    reader = MagicMock(side_effect=AssertionError("public-clock read is not qualified"))
+    monkeypatch.setattr("store.people_events.read_event_versions", reader)
+    engine = MagicMock()
+    result = si.collect_people_event_evidence(engine, entity_ticker="NVDA", as_of=AS_OF)
+    assert not result.records
+    assert result.exclusions == {"commit_visibility_unproven": 1}
+    reader.assert_not_called()
+    assert engine.mock_calls == []
+
+
+@pytest.mark.parametrize("ticker", [None, "", "*", "NONE", "NVDA,SPY"])
+def test_evidence_candidate_reader_requires_one_ticker(ticker):
+    with pytest.raises(ValueError, match="one explicit"):
+        si.collect_people_event_evidence(MagicMock(), entity_ticker=ticker, as_of=AS_OF)
+
+
+def test_evidence_candidate_does_not_change_registered_runtime_or_construction():
+    import inspect
+    assert si.CONSTRUCTION == "v2"
+    assert "collect_signal_observations" in inspect.getsource(si.generate_intersection_leads)
+    assert "collect_people_event_evidence" not in inspect.getsource(si.generate_intersection_leads)
+
+
+def test_evidence_candidate_later_identity_echo_or_public_clock_cannot_rewrite_receipt():
+    row = _event_version()
+    enriched = {**row, "actor_id": "0000000001", "actor_id_basis": "owner_cik", "echo_of": 99,
+                "entity_cik": 1, "security_id": "late-resolution", "public_known_at": AS_OF - timedelta(days=50)}
+    assert _qualify(row) == _qualify(enriched)
+    assert not {"actor_id", "actor_id_basis", "echo_of", "security_id", "entity_cik"} & set(_qualify(row).records[0])
+
+
+@pytest.mark.parametrize("changes", [
+    {"superseded_at": AS_OF}, {"retracted_at": "invalid"},
+    {"direction": "sell", "transaction_code": "S", "superseded_at": AS_OF},
+])
+def test_evidence_candidate_corrupt_same_id_cannot_hide_behind_visibility(changes):
+    result = _qualify(_event_version(), _event_version(**changes))
+    assert not result.records
+    assert result.exclusions == {"conflicting_version_identity": 2}
+
+
+def test_evidence_candidate_bad_clock_version_quarantines_identifiable_act():
+    result = _qualify(_event_version(), _event_version(id=2, known_at="invalid"))
+    assert not result.records
+    assert result.exclusions == {"conflicting_act_history": 1, "invalid_clock": 1}
+
+
+@pytest.mark.parametrize("clock", ["people-events-system-receipt-v1", "transaction_start",
+                                    "public_filing", None])
+def test_evidence_candidate_does_not_relabel_existing_clocks_as_post_commit(clock):
+    result = _qualify(_event_version(clock_contract=clock))
+    assert not result.records
+    assert result.exclusions == {"unqualified_receipt_history": 1}
+
+
+@pytest.mark.parametrize("changes", [{"receipt_id": None}, {"receipt_sha256": None},
+                                      {"receipt_sha256": "not-a-receipt-hash"}])
+def test_evidence_candidate_requires_explicit_receipt_identity(changes):
+    result = _qualify(_event_version(**changes))
+    assert not result.records
+    assert result.exclusions == {"missing_version_identity": 1}

@@ -6,14 +6,16 @@ Every morning Hermes runs this and emits a briefing answering five questions:
 
     1. REGIME:    Is the dealer long-gamma (rubber band) or short-gamma
                   (slingshot) at current spot? Where is the flip?
-    2. CALENDAR:  What forced-flow dates land in the next 10 trading days?
+    2. CALENDAR:  What candidate dates land in the next 10 US trading days?
                   (Quarterly OPEX, monthly OPEX, JHEQX roll, FOMC, autocall
-                  observation dates.)
+                  observation dates require separate source evidence.)
     3. THRESHOLDS: How close is spot to (a) the gamma flip, (b) the put
                   wall, (c) the call wall? Is realized vol > implied?
-    4. WATERFALL RISK SCORE: count of independent forced-flow conditions
-                  currently tripped (0-5). Score >= 2 fires a waterfall
-                  warning into alerts/waterfall_watch.py.
+    4. WATERFALL RULE COUNT: count of tripped evidence groups (0-2),
+                  not independent votes or a calibrated probability.
+                  Score >= 2 fires a waterfall warning. The built-in
+                  calendar contains estimates, not admitted schedules,
+                  and cannot by itself supply the second group.
     5. POSTURE:   Recommended standing discipline for the day in
                   LEVER / CONDITION / INVALIDATION format.
 
@@ -28,13 +30,17 @@ trading day at ~06:30 ET (pre-open briefing window).
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from ingestion.market_calendar import is_market_open, last_trading_day, trading_days_between
 
 
 # ── Constants ────────────────────────────────────────────────────────────
@@ -44,11 +50,20 @@ GAMMA_FLIP_PROXIMITY_PCT = 1.5      # spot within X% of flip = threshold tripped
 WALL_PROXIMITY_PCT = 2.0            # spot within X% of put/call wall
 REALIZED_IMPLIED_PREMIUM_PCT = 20.0  # realized > implied by this much = short-gamma confirm
 OPEX_WEEK_LOOKAHEAD_DAYS = 10       # how far out to scan the calendar
-WATERFALL_ALERT_THRESHOLD = 2       # >= N tripped conditions triggers alert
+WATERFALL_ALERT_THRESHOLD = 2       # both evidence groups must be tripped
+GROUPED_SCORE_METHOD = "grouped_rule_count_v1"
+SCORE_GROUPS = {
+    "dealer_positioning": frozenset({
+        "gamma_flip_proximity", "short_gamma_regime", "put_wall_proximity",
+    }),
+    "calendar_catalyst": frozenset({"high_impact_catalyst_within_5d"}),
+}
+HIGH_IMPACT_KINDS = frozenset({"QUARTERLY_OPEX", "JHEQX_ROLL", "FOMC", "AUTOCALL_OBS"})
+_EQUITY_TZ = ZoneInfo("America/New_York")
 
 
-# 2026 FOMC statement release dates (approximate, update annually from fed.gov).
-# Source: Federal Reserve 2026 FOMC meeting calendar.
+# Legacy static dates: no source receipt, revision history or known-at clock.
+# Display only, not admitted schedule evidence. Coverage ends in 2026.
 FOMC_DATES_2026: list[date] = [
     date(2026, 1, 28),
     date(2026, 3, 18),
@@ -84,13 +99,27 @@ class GammaRegimeSnapshot:
 
 @dataclass(frozen=True)
 class CalendarEvent:
-    """A known forced-flow date within the lookahead window."""
+    """A candidate date, with schedule evidence distinct from observed flow.
+
+    An upstream caller may supply ``source_backed_schedule`` only after
+    verifying the specific event against its source. ``event_id`` must identify
+    that event (including the product/contract for a roll or observation), not
+    just its category. ``known_at`` is when that exact schedule revision became
+    available, not the event date or a backdated publication time. This module
+    checks the receipt's presence and decision-time bound; it does not verify
+    the external source. No built-in estimate satisfies this admission contract.
+    """
 
     event_date: date
     kind: str                       # QUARTERLY_OPEX / MONTHLY_OPEX / JHEQX_ROLL /
                                     # FOMC / AUTOCALL_OBS
     label: str
     trading_days_out: int
+    evidence_status: str = "unverified"
+    source: str | None = None
+    event_id: str | None = None
+    known_at: datetime | None = None
+    evidence_note: str = "Schedule unverified; actual flow is not established."
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -98,6 +127,15 @@ class CalendarEvent:
             "kind": self.kind,
             "label": self.label,
             "trading_days_out": self.trading_days_out,
+            "evidence_status": self.evidence_status,
+            "source": self.source,
+            "event_id": self.event_id,
+            "known_at": self.known_at.isoformat() if self.known_at else None,
+            "evidence_note": self.evidence_note,
+            "distance_basis": (
+                "ingestion.market_calendar US equity sessions; (New York reference date, event]"
+            ),
+            "observed_flow_confirmed": False,
         }
 
 
@@ -112,7 +150,12 @@ class ForcedFlowThreshold:
     tripped: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["score_group"] = next(
+            (group for group, names in SCORE_GROUPS.items() if self.name in names), None,
+        )
+        payload["diagnostic_only"] = payload["score_group"] is None
+        return payload
 
 
 @dataclass
@@ -125,16 +168,27 @@ class MorningBriefing:
     thresholds: list[ForcedFlowThreshold]
     waterfall_risk_score: int
     posture: dict[str, str]         # LEVER / CONDITION / THESIS / INVALIDATION
+    score_method: str = "unspecified_legacy"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "generated_at": self.generated_at,
             "regime": asdict(self.regime),
             "upcoming_events": [e.to_dict() for e in self.upcoming_events],
             "thresholds": [t.to_dict() for t in self.thresholds],
             "waterfall_risk_score": self.waterfall_risk_score,
+            "waterfall_score_method": self.score_method,
             "posture": self.posture,
         }
+        if self.score_method == GROUPED_SCORE_METHOD:
+            payload["waterfall_score_max"] = len(SCORE_GROUPS)
+            payload["tripped_groups"] = _tripped_score_groups(self.thresholds)
+            payload["score_limitations"] = (
+                "Grouped rule count, not independent votes or calibrated probability. "
+                "Calendar qualification establishes a sourced schedule, not observed flow. "
+                "Built-in estimates are excluded; calendar coverage is incomplete."
+            )
+        return payload
 
 
 # ── Table Setup ──────────────────────────────────────────────────────────
@@ -166,6 +220,18 @@ def _ensure_tables(engine: Engine) -> None:
 # ── Calendar Computation ─────────────────────────────────────────────────
 
 
+def _utc_now() -> datetime:
+    """Decision clock, kept separate for synthetic tests."""
+    return datetime.now(timezone.utc)
+
+
+def _session_date(as_of: datetime) -> date:
+    """US-market date at an aware instant, including after-hours and DST."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be timezone-aware")
+    return as_of.astimezone(_EQUITY_TZ).date()
+
+
 def _third_friday(year: int, month: int) -> date:
     """Return the 3rd Friday of the given month (monthly OPEX convention)."""
     first = date(year, month, 1)
@@ -176,71 +242,87 @@ def _third_friday(year: int, month: int) -> date:
 
 
 def _last_business_day(year: int, month: int) -> date:
-    """Return the last business day of the given month (approx JHEQX roll)."""
+    """Return the last US equity session, not a verified fund roll date."""
     if month == 12:
         next_month = date(year + 1, 1, 1)
     else:
         next_month = date(year, month + 1, 1)
-    last = next_month - timedelta(days=1)
-    while last.weekday() >= 5:  # Saturday/Sunday
-        last -= timedelta(days=1)
-    return last
+    return last_trading_day(next_month - timedelta(days=1))
 
 
 def _trading_days_between(start: date, end: date) -> int:
-    """Count weekdays between two dates (holiday-naive approximation)."""
+    """Count canonical US sessions in (start, end]; past dates return -1.
+
+    Standard holidays are covered; extraordinary closures depend on updates
+    to ingestion.market_calendar. This is not a foreign-market calendar.
+    """
     if end < start:
         return -1
-    days = 0
-    cur = start
-    while cur < end:
-        cur += timedelta(days=1)
-        if cur.weekday() < 5:
-            days += 1
-    return days
+    return len(trading_days_between(start, end)) - int(is_market_open(start))
 
 
 def upcoming_calendar_events(
     ref_date: date | None = None,
     lookahead_days: int = OPEX_WEEK_LOOKAHEAD_DAYS,
 ) -> list[CalendarEvent]:
-    """Enumerate forced-flow dates within the lookahead window.
+    """List unverified calendar candidates within a US-session window.
 
-    Returns events sorted by date. Includes monthly OPEX, quarterly OPEX,
-    JHEQX roll (last biz day of quarter), FOMC statement days, and autocall
-    observation dates (approximated as quarterly OPEX + 0).
+    OPEX uses a convention adjusted to the prior US session, JHEQX uses a
+    quarter-end proxy, and FOMC uses an unverified static 2026 list. None is
+    evidence of actual forced transactions or eligible for the catalyst rule.
+    Autocall schedules are contract-specific and cannot be inferred from OPEX.
+    A missing entry does not imply an empty calendar, especially after 2026.
     """
+    if isinstance(lookahead_days, bool) or not isinstance(lookahead_days, int) or lookahead_days < 0:
+        raise ValueError("lookahead_days must be a nonnegative integer of US sessions")
     if ref_date is None:
-        ref_date = datetime.now(timezone.utc).date()
+        ref_date = _session_date(_utc_now())
 
-    horizon = ref_date + timedelta(days=lookahead_days + 7)  # pad for weekends
+    horizon = ref_date
+    for _ in range(lookahead_days):
+        horizon += timedelta(days=1)
+        while not is_market_open(horizon):
+            horizon += timedelta(days=1)
     events: list[CalendarEvent] = []
 
-    # Monthly and quarterly OPEX (3rd Friday)
+    # Conventional date only; product-specific expiration/settlement may differ.
     cur_year, cur_month = ref_date.year, ref_date.month
-    for _ in range(3):  # this month + 2 ahead covers 10-day lookahead
-        opex = _third_friday(cur_year, cur_month)
+    while date(cur_year, cur_month, 1) <= horizon:
+        opex = last_trading_day(_third_friday(cur_year, cur_month))
         if ref_date <= opex <= horizon:
             is_quarterly = cur_month in (3, 6, 9, 12)
             kind = "QUARTERLY_OPEX" if is_quarterly else "MONTHLY_OPEX"
             label = (
-                f"Quarterly OPEX ({opex.strftime('%b %Y')})"
+                f"Quarterly OPEX estimate ({opex.strftime('%b %Y')})"
                 if is_quarterly
-                else f"Monthly OPEX ({opex.strftime('%b %Y')})"
+                else f"Monthly OPEX estimate ({opex.strftime('%b %Y')})"
             )
             events.append(CalendarEvent(
                 event_date=opex,
                 kind=kind,
                 label=label,
                 trading_days_out=_trading_days_between(ref_date, opex),
+                evidence_status="calendar_estimate",
+                source="convention:third_friday_prior_US_session",
+                evidence_note=(
+                    "Unverified expiration convention, not a product-specific exchange schedule; "
+                    "does not establish forced flow or autocall observations."
+                ),
             ))
-            # Autocall observation cluster on quarterly OPEX
-            if is_quarterly:
+        if cur_month in (3, 6, 9, 12):
+            roll = _last_business_day(cur_year, cur_month)
+            if ref_date <= roll <= horizon:
                 events.append(CalendarEvent(
-                    event_date=opex,
-                    kind="AUTOCALL_OBS",
-                    label="Autocall quarterly observation cluster (SX5E/KOSPI/NKY)",
-                    trading_days_out=_trading_days_between(ref_date, opex),
+                    event_date=roll,
+                    kind="JHEQX_ROLL",
+                    label="JHEQX quarter-end roll estimate (unverified)",
+                    trading_days_out=_trading_days_between(ref_date, roll),
+                    evidence_status="calendar_estimate",
+                    source="heuristic:last_US_session_of_quarter",
+                    evidence_note=(
+                        "Quarter-end proxy, not a confirmed fund roll or buffer ETF schedule; "
+                        "execution date, size and direction are unknown."
+                    ),
                 ))
         # Advance to next month
         if cur_month == 12:
@@ -249,26 +331,20 @@ def upcoming_calendar_events(
         else:
             cur_month += 1
 
-    # JHEQX quarterly roll = last business day of Mar/Jun/Sep/Dec
-    for qm in (3, 6, 9, 12):
-        for y in (ref_date.year, ref_date.year + 1):
-            roll = _last_business_day(y, qm)
-            if ref_date <= roll <= horizon:
-                events.append(CalendarEvent(
-                    event_date=roll,
-                    kind="JHEQX_ROLL",
-                    label="JHEQX + buffer ETF quarterly collar roll",
-                    trading_days_out=_trading_days_between(ref_date, roll),
-                ))
-
-    # FOMC statement days
+    # A legacy date list is not a verified, point-in-time schedule receipt.
     for fomc in FOMC_DATES_2026:
         if ref_date <= fomc <= horizon:
             events.append(CalendarEvent(
                 event_date=fomc,
                 kind="FOMC",
-                label="FOMC statement",
+                label="FOMC statement (unverified static 2026 schedule)",
                 trading_days_out=_trading_days_between(ref_date, fomc),
+                evidence_status="static_unverified",
+                source="legacy_static:FOMC_DATES_2026",
+                evidence_note=(
+                    "No source receipt or schedule-revision known-at timestamp; "
+                    "coverage limited to 2026. A policy announcement is not observed dealer flow."
+                ),
             ))
 
     events.sort(key=lambda e: (e.event_date, e.kind))
@@ -306,16 +382,24 @@ def check_gamma_regime(engine: Engine) -> GammaRegimeSnapshot:
 
     spy = next((t for t in summary["tickers"] if t["ticker"] == "SPY"), None)
     spot = 0.0
-    if spy and spy.get("spot"):
-        spot = float(spy["spot"])
-    elif summary.get("spy_spot"):
-        spot = float(summary["spy_spot"])
-    elif spy:
-        # Best-effort fallback for older dealer_gamma summaries.
-        pw = summary.get("spy_put_wall") or 0.0
-        cw = summary.get("spy_call_wall") or 0.0
-        if pw and cw:
-            spot = (pw + cw) / 2.0
+    for candidate in (spy.get("spot") if spy else None, summary.get("spy_spot")):
+        if isinstance(candidate, bool):
+            continue
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0:
+            spot = value
+            break
+    if spot == 0.0:
+        # A wall midpoint is not a market quote. Without the model's explicit
+        # reference spot, its spot-dependent regime/proximity checks are unknown.
+        return GammaRegimeSnapshot(
+            regime="UNKNOWN", spot=0.0, gamma_flip=None,
+            put_wall=None, call_wall=None, aggregate_gex=0.0,
+            snapshot_date=summary.get("snap_date", _session_date(_utc_now()).isoformat()),
+        )
 
     return GammaRegimeSnapshot(
         regime=summary.get("market_regime", "UNKNOWN"),
@@ -328,15 +412,62 @@ def check_gamma_regime(engine: Engine) -> GammaRegimeSnapshot:
     )
 
 
+def _qualified_catalyst_events(
+    events: list[CalendarEvent], as_of: datetime,
+) -> list[CalendarEvent]:
+    """Admit source-backed schedule receipts available by the decision clock.
+
+    This validates caller-supplied provenance, not the external source itself.
+    Integrations must first verify the identified event and exact revision.
+    A verified schedule still says nothing about executed flow size/direction.
+    """
+    decision_date = _session_date(as_of)
+    qualified = []
+    for event in events:
+        if (event.kind not in HIGH_IMPACT_KINDS
+                or event.evidence_status != "source_backed_schedule"
+                or not isinstance(event.source, str) or not event.source.strip()
+                or not isinstance(event.event_id, str) or not event.event_id.strip()
+                or not isinstance(event.known_at, datetime)
+                or event.known_at.tzinfo is None or event.known_at.utcoffset() is None
+                or event.known_at > as_of):
+            continue
+        # Do not trust a supplied offset to move a past/far event into the window.
+        if (type(event.trading_days_out) is not int
+                or not 0 <= event.trading_days_out <= 5
+                or event.trading_days_out != _trading_days_between(decision_date, event.event_date)):
+            continue
+        qualified.append(event)
+    return sorted(qualified, key=lambda event: (event.trading_days_out, event.event_date, event.kind))
+
+
+def _tripped_score_groups(thresholds: list[ForcedFlowThreshold]) -> dict[str, list[str]]:
+    """Count each shared evidence family at most once; never count conjunctions.
+
+    These groups are conservative overlap controls, not independent factors.
+    Unknown condition names are diagnostic-only until explicitly assigned.
+    """
+    tripped = {threshold.name for threshold in thresholds if threshold.tripped is True}
+    return {
+        group: sorted(names & tripped)
+        for group, names in SCORE_GROUPS.items() if names & tripped
+    }
+
+
 def scan_thresholds(
     regime: GammaRegimeSnapshot,
     events: list[CalendarEvent],
+    *,
+    as_of: datetime | None = None,
 ) -> list[ForcedFlowThreshold]:
-    """Evaluate the five forced-flow threshold conditions.
+    """Retain five condition details while qualifying the schedule evidence.
 
-    The conditions are chosen so that >= 2 simultaneously tripped indicates
-    meaningful tail risk of a short-gamma cascade ("waterfall").
+    The first three share dealer-positioning inputs. The fifth is a diagnostic
+    conjunction, not another vote. No condition count estimates a probability.
     """
+    if as_of is None:
+        as_of = _utc_now()
+    qualified_events = _qualified_catalyst_events(events, as_of)
     thresholds: list[ForcedFlowThreshold] = []
 
     # 1. Gamma flip proximity — spot near the transition between regimes
@@ -355,7 +486,7 @@ def scan_thresholds(
     # 2. Short-gamma regime active (regardless of flip proximity)
     thresholds.append(ForcedFlowThreshold(
         name="short_gamma_regime",
-        description="Dealers currently in short-gamma (slingshot) mode",
+        description="Assumed dealer-positioning model reports short gamma, not observed flow",
         current_value=regime.aggregate_gex,
         threshold_value=0.0,
         tripped=(regime.regime == "SHORT_GAMMA"),
@@ -367,22 +498,21 @@ def scan_thresholds(
         put_wall_dist = abs(regime.spot - regime.put_wall) / regime.spot * 100.0
     thresholds.append(ForcedFlowThreshold(
         name="put_wall_proximity",
-        description=f"Spot within {WALL_PROXIMITY_PCT}% of SPY put wall (break = short-gamma)",
+        description=f"Spot below and within {WALL_PROXIMITY_PCT}% of modeled SPY put wall",
         current_value=put_wall_dist,
         threshold_value=WALL_PROXIMITY_PCT,
         tripped=(put_wall_dist is not None and put_wall_dist <= WALL_PROXIMITY_PCT
                  and regime.put_wall is not None and regime.spot < regime.put_wall),
     ))
 
-    # 4. Quarterly catalyst in window (OPEX, JHEQX, FOMC, autocall obs)
-    high_impact_kinds = {"QUARTERLY_OPEX", "JHEQX_ROLL", "FOMC", "AUTOCALL_OBS"}
-    nearest_high = next(
-        (e for e in events if e.kind in high_impact_kinds and e.trading_days_out <= 5),
-        None,
-    )
+    # 4. Source-backed scheduled catalyst; static/estimated dates never qualify.
+    nearest_high = qualified_events[0] if qualified_events else None
     thresholds.append(ForcedFlowThreshold(
         name="high_impact_catalyst_within_5d",
-        description="Quarterly OPEX / JHEQX roll / FOMC / autocall obs within 5 trading days",
+        description=(
+            "Source-backed scheduled catalyst within 5 US sessions, known by decision time; "
+            "estimated dates excluded, actual flow unconfirmed, coverage incomplete"
+        ),
         current_value=float(nearest_high.trading_days_out) if nearest_high else None,
         threshold_value=5.0,
         tripped=nearest_high is not None,
@@ -396,7 +526,10 @@ def scan_thresholds(
     )
     thresholds.append(ForcedFlowThreshold(
         name="compound_regime_catalyst",
-        description="Short-gamma regime AND high-impact catalyst within 3 trading days",
+        description=(
+            "Diagnostic only: short-gamma model AND source-backed scheduled catalyst "
+            "within 3 US sessions; adds no score group"
+        ),
         current_value=1.0 if compound_risk else 0.0,
         threshold_value=1.0,
         tripped=compound_risk,
@@ -412,18 +545,25 @@ def build_posture(
 ) -> dict[str, str]:
     """Generate LEVER / CONDITION / THESIS / INVALIDATION per the GRID SOP."""
     tripped = [t for t in thresholds if t.tripped]
-    nearest = events[0] if events else None
+    nearest = min(events, key=lambda event: (event.event_date, event.kind)) if events else None
+    calendar_condition = (
+        f"Next listed date: {nearest.label} in {nearest.trading_days_out} US sessions; "
+        f"evidence={nearest.evidence_status}. {nearest.evidence_note} "
+        "A listed date does not establish actual forced flow."
+        if nearest else "No listed catalyst; calendar coverage is incomplete and unverified."
+    )
 
     if regime.regime == "SHORT_GAMMA":
         lever = (
-            "Dealers short gamma at current spot — forced to sell weakness "
-            "and buy strength. Slingshot regime."
+            "Modeled dealers short gamma at current spot; hedging may amplify "
+            "weakness and strength. Actual dealer flow is unverified."
         )
-        thesis = "Trade the trend, not the fade. Moves accelerate; pinning trades are unsafe."
-        condition = (
-            f"{nearest.label} in {nearest.trading_days_out} trading days"
-            if nearest else "No high-impact catalyst in lookahead window"
+        thesis = (
+            "Research scenario: if short-gamma positioning is validated, monitor whether "
+            "hedging reinforces the trend. Acceleration and failure of pinning are not "
+            "established; no automatic trade recommendation."
         )
+        condition = calendar_condition
         invalidation = (
             "Two consecutive SPY closes with recomputed modeled GEX positive "
             "at the reference spot; crossing the nearest gamma flip alone "
@@ -431,18 +571,15 @@ def build_posture(
         )
     elif regime.regime == "LONG_GAMMA":
         lever = (
-            "Dealers long gamma — suppressing realized vol. Rubber band regime; "
-            "pinning forces dominate."
+            "Modeled dealers long gamma; hedging may dampen realized volatility. "
+            "Pinning is not guaranteed and actual dealer flow is unverified."
         )
         thesis = (
-            "Pinning trades are in season but size for the slingshot. Own cheap "
-            "tail hedges. Exit all pinning trades before high-impact catalysts."
+            "Research scenario: if long-gamma positioning is validated, monitor whether "
+            "price behavior is consistent with dampening or pinning. Calendar candidates "
+            "alone do not establish hedge value or warrant a trade."
         )
-        condition = (
-            f"{nearest.label} in {nearest.trading_days_out} trading days — "
-            f"pinning force dissolves at close of that day"
-            if nearest else "Quiet calendar; structural pinning dominant"
-        )
+        condition = calendar_condition
         invalidation = (
             "Two consecutive SPY closes with recomputed modeled GEX negative "
             "at the reference spot, or a separately verified volatility "
@@ -450,14 +587,18 @@ def build_posture(
         )
     else:
         lever = "Regime unknown — dealer_gamma data unavailable or stale."
-        thesis = "Reduce size until regime can be determined."
+        thesis = (
+            "Research status: withhold directional conclusions until usable positioning "
+            "evidence is available; no automatic trade recommendation."
+        )
         condition = "N/A"
         invalidation = "N/A"
 
     if any(t.name == "compound_regime_catalyst" and t.tripped for t in thresholds):
         thesis = (
-            "WATERFALL ALERT: compound short-gamma + catalyst setup. "
-            "No new short vol. Carry tail hedges. " + thesis
+            "WATERFALL WATCH: modeled short-gamma + sourced schedule setup, "
+            "not confirmed flow or a calibrated probability. "
+            "Review both evidence sources before interpreting the scenario. " + thesis
         )
 
     return {
@@ -466,6 +607,8 @@ def build_posture(
         "thesis": thesis,
         "invalidation": invalidation,
         "tripped_count": str(len(tripped)),
+        "tripped_group_count": str(len(_tripped_score_groups(thresholds))),
+        "score_method": GROUPED_SCORE_METHOD,
     }
 
 
@@ -473,20 +616,28 @@ def build_posture(
 
 
 def build_morning_briefing(engine: Engine) -> MorningBriefing:
-    """Orchestrate the full morning briefing."""
+    """Build a grouped-rule briefing, not a calibrated waterfall forecast.
+
+    The legacy output name is retained, but its new versioned count is 0-2,
+    not the historical 0-5 raw-check sum. Built-in calendar estimates cannot
+    activate the calendar group, so they cannot trigger a two-group alert.
+    Future calendar integration needs source/event/revision-known-at admission.
+    """
+    as_of = _utc_now()
     regime = check_gamma_regime(engine)
-    events = upcoming_calendar_events()
-    thresholds = scan_thresholds(regime, events)
-    score = sum(1 for t in thresholds if t.tripped)
+    events = upcoming_calendar_events(ref_date=_session_date(as_of))
+    thresholds = scan_thresholds(regime, events, as_of=as_of)
+    score = len(_tripped_score_groups(thresholds))
     posture = build_posture(regime, events, thresholds)
 
     return MorningBriefing(
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=as_of.isoformat(),
         regime=regime,
         upcoming_events=events,
         thresholds=thresholds,
         waterfall_risk_score=score,
         posture=posture,
+        score_method=GROUPED_SCORE_METHOD,
     )
 
 
@@ -543,7 +694,7 @@ def run_forced_flow_cycle(engine: Engine) -> dict[str, Any]:
         log.warning("persist_briefing failed: {e}", e=str(exc))
         row_id = 0
 
-    # Fire waterfall alert if enough conditions tripped
+    # Both evidence groups must trip; overlapping raw checks cannot trigger it.
     if briefing.waterfall_risk_score >= WATERFALL_ALERT_THRESHOLD:
         try:
             from alerts.waterfall_watch import send_waterfall_alert
@@ -563,6 +714,8 @@ def run_forced_flow_cycle(engine: Engine) -> dict[str, Any]:
         "briefing_id": row_id,
         "regime": briefing.regime.regime,
         "waterfall_risk_score": briefing.waterfall_risk_score,
+        "waterfall_score_method": briefing.score_method,
+        "tripped_groups": _tripped_score_groups(briefing.thresholds),
         "tripped_conditions": [t.name for t in briefing.thresholds if t.tripped],
         "upcoming_event_count": len(briefing.upcoming_events),
     }

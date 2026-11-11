@@ -442,3 +442,14 @@ Focused bridge/Oracle/report tests passed locally. Broader compatible Oracle tes
 also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
 No production access, send, generator, migration, service change, merge or deploy.
 See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.
+
+## 2026-11-11 — Foundation evidence admission review
+
+Canonical people-event public-known clocks and transaction recording clocks are
+not interchangeable with durable post-commit decision receipts. Historical event
+admission remains held with `commit_visibility_unproven`; the new pure receipt
+prototype is synthetic contract proof only and has no live producer. Existing
+Sleuth v2 executable behavior is unchanged. Forced-flow source candidate groups
+overlapping diagnostics and keeps estimated schedules out of its count. Review
+score-version compatibility and warning suppression before any release. Details:
+`docs/reference/GRID_FOUNDATION_EVIDENCE_20261111.md`.
