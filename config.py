@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     # credentials or the network. Turning it on is an operator decision made in a
     # reviewed change; Schwab data is private and may not be redistributed.
     SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
+    # Allows the separate admin-only SPX/SPY/QQQ board to read option chains.
+    SCHWAB_PRIVATE_GEX_BOARD_ENABLED: bool = False
 
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
@@ -656,6 +658,7 @@ class Settings(BaseSettings):
         "GRID_TRUST_PRUNE_NO_EDGE",
         "GRID_API_PRECOMPUTE_ENABLED",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
+        "SCHWAB_PRIVATE_GEX_BOARD_ENABLED",
         mode="before",
     )
     @classmethod

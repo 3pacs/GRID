@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Query, Response
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role
 
 router = APIRouter(prefix="/api/v1/gamma-watch", tags=["gamma-watch"],
                    dependencies=[Depends(require_auth)])
@@ -145,3 +145,14 @@ def get_archive(response: Response, stream: Literal["artifacts", "events", "samp
     except (OSError, sqlite3.Error, ValueError):
         response.status_code = 503
         return {"status": "unavailable", "records": None, "reason": "Gamma Watch journal unavailable or invalid."}
+
+
+@router.get("/board/{symbol}", dependencies=[Depends(require_role("admin"))])
+def instrument_board(symbol: Literal["SPX", "SPY", "QQQ"], response: Response) -> dict:
+    """Admin-only, same-origin GEX board. Provider access requires the board-specific flag."""
+    from api.gamma_board import read_panel
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    return read_panel(symbol, settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED)
