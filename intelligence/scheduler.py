@@ -422,6 +422,34 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("07:15").do(_trial_outcomes_daily)
 
+    def _derived_features_daily() -> None:
+        """Recompute the stored derived features (2026-11-11).
+
+        ``scripts/compute_derived_features.py`` is the only writer of
+        sp500_mom_*, sp500_adline*, sp500_pct_above_200ma, hy_spread_*,
+        copper_gold_*, vix_3m_ratio, dxy_3m_chg, cpi_yoy, real_ffr and the
+        systemic_* stress series, and it had no scheduled caller: it last
+        ran by hand ~2026-03-24, and every PIT read since returned those
+        March values as the latest (features/lab.py, the oracle pruning
+        set, the LLM reasoners). It writes only new or changed rows, never
+        over a target another source keeps fresh, and warns when an output
+        stops advancing.
+        """
+        try:
+            from scripts.compute_derived_features import run as _derive
+
+            summary = _derive(dry_run=False) or {}
+            stale = summary.get("stale") or []
+            (log.warning if stale else log.info)(
+                "derived features daily: features={f} inserted={i} skipped={k} stale={s}",
+                f=summary.get("features", 0), i=summary.get("inserted", 0),
+                k=summary.get("skipped", 0), s=",".join(stale) or "none",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("derived features daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("07:30").do(_derived_features_daily)
+
     def _long_horizon_sweep() -> None:
         """Weekly 90-day decision sweep (LEVER-PACKAGE §7 T2.2).
 
