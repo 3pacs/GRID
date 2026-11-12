@@ -5,7 +5,7 @@ import GammaBoard from '../views/GammaBoard.jsx';
 import { api } from '../api.js';
 import { routes, drawerSections } from '../routes.js';
 
-vi.mock('../api.js', () => ({ api: { getGammaBoardInstrument: vi.fn(), getGammaBoardIntraday: vi.fn(), getGammaSessionMap: vi.fn(), setGammaSessionTracking: vi.fn() } }));
+vi.mock('../api.js', () => ({ api: { getGammaBoardInstrument: vi.fn(), getGammaBoardIntraday: vi.fn(), getSpyBandFlags:vi.fn(async()=>({status:'unavailable',reason:'Flag ledger unavailable.'})),getGammaSessionMap: vi.fn(), setGammaSessionTracking: vi.fn() } }));
 const stamp = '2026-11-10T21:00:00Z';
 const expiry = '2026-11-13';
 function good(symbol, extra = {}) {
