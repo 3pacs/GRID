@@ -749,6 +749,16 @@ class Settings(BaseSettings):
     # Tier.QUICK primary (short classification/extraction). Distinct from the
     # legacy LLM_QUICK_PROVIDER below, which is LOCAL's fallback key.
     LLM_QUICK_TIER_PROVIDER: str = "llamacpp_threadripper"
+    # LLM task queue: background (priority-3) tasks whose tier is REASON are
+    # handed round-robin to these providers instead of LLM_REASON_PROVIDER.
+    # grid-hermes pins REASON to the RTX 3090, and on 2026-11-12 its background
+    # queue alone kept that single slot generating ~94% of the day while
+    # gridz4 sat at 4% and x99-hex near 0. ``llamacpp`` is the gridz4 :8086
+    # proxy; both nodes serve the same Qwen3.8-27B. A provider that is off or
+    # not answering is skipped; if none answers the task uses its own tier as
+    # before. Blank restores the old routing. Realtime and scheduled tasks
+    # (priority 1-2) and LOCAL/ORACLE-tier tasks are never rerouted.
+    LLM_TASKQUEUE_BACKGROUND_PROVIDERS: str = "llamacpp,llamacpp_x99"
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
     LLM_DEFAULT_PROVIDER: str = "llamacpp"
     LLM_QUICK_PROVIDER: str = "llamacpp"
