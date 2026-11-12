@@ -54,6 +54,13 @@ signal_cooccurrence=410, regime_brier=0 (blocked on oracle enrichment), meta_lea
   called only by `scripts/bootstrap_per_signal_brier.py`. `per_signal_brier_history`
   was last updated 2026-05-16 (183 rows). The calibrators stay frozen until the scorer
   (`score_expired_predictions`) or a scheduled replay feeds them.
+- **Co-occurrence lift was frozen (guarded 2026-11-11).** `signal_cooccurrence_history`
+  (490 rows) was written once by a bootstrap on 2026-05-17 and nothing refreshes it, yet
+  `get_lift_multiplier` kept moving live `should_i_trade` conviction by up to ±25% from
+  it. Pairs not updated within `COOCCURRENCE_MAX_STALE_DAYS` (30) now count as
+  uncalibrated, so the layer is a neutral 1.0 until a refresh lands. A refresh must
+  rebuild the table over a rolling window: `record_joint_prediction` increments counts
+  with no per-prediction ledger, so re-running the bootstrap double-counts.
 
 **Trust inputs and pruning (S16, 2026-11-06, both flags default off).** The convergence
 layer's per-stream trust comes from `signal_sources.trust_score`, which
