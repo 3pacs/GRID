@@ -860,6 +860,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # 2021-11-19); registered by migrations/versions/ghost_features_20261104.py.
     "CBOE:COR3M": "implied_correlation_3m",
     "CBOE:SKEW": "skew_index",
+    # ingestion/altdata/cboe_indices.py writes SKEW with the feature name as
+    # series_id (like vvix). Only the one-off bulk pull wrote CBOE:SKEW, so
+    # without this the daily rows never resolved and skew_index stopped at
+    # 2026-03-25 (D0 gap G11, #1129).
+    "skew_index": "skew_index",
 
     # Binance crypto (bulk ZIP)
     "BINANCE:BTCUSDT:close": "btc_full",       # TYPO-FIX: btc_close not in registry, btc_full exists
