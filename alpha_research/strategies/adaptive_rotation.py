@@ -305,6 +305,7 @@ def run_rotation(
     *,
     pit: PITStore | None = None,
     data_as_of: date | None = None,
+    prepared_prices: pd.DataFrame | None = None,
 ) -> RotationResult:
     """
     Run one iteration of the Adaptive Rotation Strategy.
@@ -316,6 +317,8 @@ def run_rotation(
     ``data_as_of``: the vintage cutoff of the price panel read. ``None``
     keeps the historical behaviour (today, i.e. latest vintages); a backtest
     pins it once so every rebalance reads the same vintages.
+    A caller that already materialized the adjusted panel may supply it as
+    ``prepared_prices``. Re-reading raw vintages could apply the same split twice.
     """
     if as_of_date is None:
         as_of_date = date.today()
@@ -332,14 +335,19 @@ def run_rotation(
     all_tickers.update(["SPY", "QQQ"])
     all_tickers.update(FALLBACK_TICKERS)
 
-    prices = build_price_panel(
-        engine,
-        tickers=list(all_tickers),
-        start_date=start,
-        end_date=as_of_date,
-        as_of_date=data_as_of,
-        pit=pit,
-    )
+    if prepared_prices is None:
+        prices = build_price_panel(
+            engine,
+            tickers=list(all_tickers),
+            start_date=start,
+            end_date=as_of_date,
+            as_of_date=data_as_of,
+            pit=pit,
+        )
+    else:
+        # Preserve the same universe and decision window as the ordinary read.
+        cutoff = min(as_of_date, data_as_of) if data_as_of is not None else as_of_date
+        prices = prepared_prices.loc[str(start):str(cutoff), prepared_prices.columns.isin(all_tickers)]
 
     if prices.empty or "SPY" not in prices.columns:
         reason = (
