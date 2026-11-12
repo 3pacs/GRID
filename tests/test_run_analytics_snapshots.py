@@ -510,3 +510,17 @@ def test_cross_asset_features_are_the_maintained_set():
               "dollar_index", "vix", "hy_spread", "ig_spread"}
     assert not legacy & set(names)
     assert len(names) == len(set(names))
+
+
+def test_clustering_is_off_the_daily_default_but_still_runnable():
+    """2026-11-12: clustering left the scheduled run (no decision reads it);
+    it stays selectable with --steps."""
+    import scripts.run_analytics_snapshots as ras
+
+    assert "clustering" not in ras.DEFAULT_STEPS
+    assert "clustering_sector" not in ras.DEFAULT_STEPS
+    assert {"feature_engineering", "orthogonality", "feature_importance",
+            "options_scan"} <= set(ras.DEFAULT_STEPS)
+    assert {"clustering", "clustering_sector"} <= set(ras.ALL_STEPS)
+    import inspect
+    assert inspect.signature(ras.run).parameters["steps"].default == ras.DEFAULT_STEPS

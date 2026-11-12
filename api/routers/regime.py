@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
@@ -304,23 +305,11 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
         macro.sort(key=lambda x: x["confidence"], reverse=True)
         strategy.sort(key=lambda x: x["confidence"], reverse=True)
 
-        # Get feature contributions from the latest clustering result
-        feature_contributions = []
-        try:
-            from discovery.clustering import ClusterDiscovery
-
-            cd = ClusterDiscovery(engine)
-            leaders = cd.identify_transition_leaders()
-            if leaders:
-                for feat_name, importance in sorted(
-                    leaders.items(), key=lambda x: abs(x[1]), reverse=True
-                )[:15]:
-                    feature_contributions.append({
-                        "feature": feat_name,
-                        "importance": round(float(importance), 4),
-                    })
-        except Exception as e:
-            log.warning("Regime: feature contribution query failed: {e}", e=str(e))
+        # No source for per-feature regime contributions. This used to call
+        # ClusterDiscovery(engine).identify_transition_leaders() with none of
+        # its required arguments, which raised on every request (caught and
+        # logged), so the list was always empty; the PWA hides it when empty.
+        feature_contributions: list[dict[str, Any]] = []
 
         # Top movers — features with biggest recent changes
         top_movers = []
