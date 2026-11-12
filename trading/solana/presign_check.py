@@ -53,12 +53,18 @@ ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 MEMO_PROGRAM_ID = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 JUPITER_V6_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 
-# Programs a Jupiter swap may invoke at the top level. AMMs run as CPIs
-# inside the Jupiter router and need no entry. Any other top-level program
-# is refused before signing: simulation alone cannot rule out a program that
-# behaves differently on chain than in simulation. Extend per deployment
+# Programs a Jupiter swap may invoke at the TOP LEVEL. Any other top-level
+# program is refused before signing. Extend per deployment
 # (PaperSolanaExecutor(presign_allowed_programs=...)) only after reviewing
 # the program.
+#
+# Limit: this does not vet the AMM programs the Jupiter router reaches by
+# CPI. The route names them as accounts, and a compromised /order response
+# can name any program. The balance check catches what such a program does
+# in simulation, but nothing here stops a program that behaves differently
+# on chain than in simulation. The remaining bound is economic: the wallet
+# can lose at most the input ceiling the caller sets (one trade's notional),
+# plus the SOL fee allowance.
 DEFAULT_ALLOWED_PROGRAMS: frozenset[str] = frozenset({
     SYSTEM_PROGRAM_ID,
     COMPUTE_BUDGET_PROGRAM_ID,

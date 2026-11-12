@@ -313,3 +313,24 @@ def test_executor_live_raises_when_computed_atoms_zero(
     # skipped; the ultimate error surfaces as a limit OR as this guard.
     with pytest.raises((ValueError, RuntimeError)):
         executor.execute(_decision(size_fraction=0.0))
+
+
+def test_executor_live_refuses_collapsed_presign_floor(
+    mock_engine, mock_jupiter, mock_safety, mock_limits
+):
+    """A mis-set price-impact limit must not collapse the pre-sign floor (#1143)."""
+    wallet = MagicMock()
+    wallet.address = "WALLET123"
+    mock_safety.config.max_price_impact_pct = 95.0
+    executor = PaperSolanaExecutor(
+        engine=mock_engine,
+        jupiter=mock_jupiter,
+        live=True,
+        wallet=wallet,
+        safety=mock_safety,
+        limits=mock_limits,
+    )
+    with pytest.raises(ValueError, match="tolerance"):
+        executor.execute(_decision(size_fraction=0.5))
+    mock_jupiter.get_order.assert_not_called()
+    mock_jupiter.execute_swap.assert_not_called()

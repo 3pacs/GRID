@@ -44,6 +44,8 @@ SOLANA_STRATEGY_ID = "solana_autohedge"
 # Any valid base58 address works — the simulation never broadcasts.
 _PROBE_TAKER = "11111111111111111111111111111111"
 _USDC_DECIMALS = 6
+# Largest output-floor tolerance the live path accepts (#1143).
+_MAX_PRESIGN_TOLERANCE = 0.20
 
 
 @dataclass(frozen=True)
@@ -404,9 +406,18 @@ class PaperSolanaExecutor:
             raise ValueError("live execution requires a positive USD notional")
 
         # Output floor from our own sizing and price, never from the
-        # Jupiter response: the safety check's price-impact limit plus a
-        # 2-point buffer.
+        # Jupiter /order response: the safety check's price-impact limit plus
+        # a 2-point buffer, clamped to 20 %. The price itself is Jupiter's
+        # price API (no independent oracle covers long-tail tokens), so
+        # the floor is a sanity bound, not an oracle. The hard bound is the
+        # input ceiling, which is ours.
         tolerance = (float(self.safety.config.max_price_impact_pct) + 2.0) / 100.0
+        if not 0.0 < tolerance <= _MAX_PRESIGN_TOLERANCE:
+            # A mis-set price-impact limit must not collapse the floor.
+            raise ValueError(
+                f"pre-sign output tolerance {tolerance:.3f} outside "
+                f"(0, {_MAX_PRESIGN_TOLERANCE}]; check SafetyConfig.max_price_impact_pct"
+            )
         if decision.action == "BUY":
             input_mint, output_mint = self.quote_mint, decision.mint
             input_atoms, expected_out = quote_atoms, trade_size_atoms
