@@ -208,3 +208,16 @@ def set_time_tracking(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max
         raise HTTPException(status_code=409, detail=str(exc)) from None
     except (OSError, sqlite3.Error):
         raise HTTPException(status_code=503, detail="GEX recording settings unavailable.") from None
+
+
+@router.get("/spy-band-flags", dependencies=[Depends(require_role("admin"))])
+def spy_band_flags(response: Response, session_date: date | None = Query(default=None)) -> dict:
+    """Read the private prospective SPY flag journal and its two scorecards."""
+    from api.gamma_band_store import snapshot
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    if not settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED:
+        return {"status": "unavailable", "reason": "Private board disabled.", "events": [], "stats": []}
+    return snapshot(session_date)

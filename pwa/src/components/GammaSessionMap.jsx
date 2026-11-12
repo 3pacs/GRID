@@ -89,10 +89,28 @@ function draw(canvas, m, times) {
     }
 }
 
-export default function GammaSessionMap({ map }) {
+const confirmTime = new Intl.DateTimeFormat('en-US', {timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+function flagMarkers(map, ledger, model) {
+    if(map.symbol !== 'SPY' || !ledger || ledger.session_date !== map.session_date ||
+        (ledger.symbol != null && ledger.symbol !== 'SPY') || !Array.isArray(ledger.events)) return [];
+    const strikeRows=new Map(model.rows.map((r,i)=>[r.strike,i]));
+    return ledger.events.flatMap(e=>{
+        if(!e || !['first_cross','failed_reclaim'].includes(e.kind) || !strikeRows.has(e.red) || !Number.isFinite(e.target)) return [];
+        const t=Date.parse(e.signal_time);
+        if(!Number.isFinite(t) || t<model.start || t>model.end) return [];
+        const name=e.kind==='first_cross'?'First cross':'Failed reclaim';
+        return [{key:e.kind+'/'+e.red+'/'+t, kind:e.kind, x:(t-model.start)/(model.end-model.start),
+            y:1-(strikeRows.get(e.red)+.5)/model.rows.length,
+            label:`${name} · ${confirmTime.format(t)} ET · red ${fmt.format(e.red)} → target ${fmt.format(e.target)}`}];
+    });
+}
+export default function GammaSessionMap({ map, ledger }) {
     const [showAll,setShowAll]=useState(false);
     const [pick,setPick]=useState(null);
     const model=useMemo(()=>sessionGeometry(map,showAll),[map,showAll]);
+    const markers=useMemo(()=>flagMarkers(map,ledger,model),[map,ledger,model]);
+    const [selectedFlag,setSelectedFlag]=useState(null);
+    const activeFlag=markers.find(m=>m.key===selectedFlag);
     const canvas=useRef(null);
     useEffect(()=>{draw(canvas.current,model,map.times);},[model,map.times]);
     const initial=model.strongest || {row:Math.floor(model.rows.length/2),t:model.latest};
@@ -102,9 +120,10 @@ export default function GammaSessionMap({ map }) {
     const k=model.rows[row].strike;
     const c=model.columns.get(t);
     const value=c===undefined?null:model.rows[row].values[c];
-    function select(r,time){setPick({strike:model.rows[Math.max(0,Math.min(r,model.rows.length-1))].strike,
+    function select(r,time){setSelectedFlag(null);setPick({strike:model.rows[Math.max(0,Math.min(r,model.rows.length-1))].strike,
         t:Math.max(model.start,Math.min(model.end-MINUTE,time))});}
     function pointer(e){
+        if(e.target.closest?.('[data-flag-marker]'))return;
         const rect=e.currentTarget.getBoundingClientRect();
         select(model.rows.length-1-Math.floor((e.clientY-rect.top)/rect.height*model.rows.length),
             model.start+Math.floor((e.clientX-rect.left)/rect.width*model.minutes)*MINUTE);
@@ -123,12 +142,20 @@ export default function GammaSessionMap({ map }) {
                     if(delta){e.preventDefault();select(row+delta[0],t+delta[1]*MINUTE);}}}
                 onPointerDown={pointer} onPointerMove={e=>{if(e.pointerType==='mouse')pointer(e);}}>
                 <canvas ref={canvas} width={W} height={H} role="img" aria-label={map.symbol+' net gamma by strike and recorded minute'} />
+                {markers.map(m=><button key={m.key} type="button" data-flag-marker={m.kind} className="gb-time-flag"
+                    style={{left:(m.x*100)+'%',top:(m.y*100)+'%'}} aria-label={m.label} title={m.label}
+                    onFocus={()=>setSelectedFlag(m.key)} onClick={()=>setSelectedFlag(m.key)}>
+                    <span aria-hidden="true">{m.kind==='first_cross'?'▲':'▼'}</span></button>)}
                 <i className="gb-time-reticle" style={{left:100*(t+MINUTE/2-model.start)/(model.end-model.start)+'%',
                     top:100*(model.rows.length-row-.5)/model.rows.length+'%'}} />
             </div><div className="gb-xlabels"><span>{et.format(model.start)}</span><span>{et.format((model.end+model.start)/2)} ET</span><span>{et.format(model.end)}</span></div>
         </div>
         <div className="gb-time-inspect" aria-live="polite"><strong>{et.format(t)} ET · {fmt.format(k)} strike</strong>
             <b className={value>0?'gb-positive':value<0?'gb-negative':''}>{Number.isFinite(value)?signed(value):'No observation'}</b></div>
+        {markers.length>0 && <div className="gb-map-flag-caption">
+            <span>▲ First cross · ▼ Failed reclaim</span>
+            {activeFlag && <strong aria-live="polite">{activeFlag.label}</strong>}
+        </div>}
         <div className="gb-time-footer"><span>{map.source} · USD per 1% move</span>
             <button type="button" onClick={()=>{setShowAll(!showAll);setPick(null);}}>{showAll?'Near spot':'All strikes'}</button></div>
     </div>;

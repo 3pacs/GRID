@@ -1452,6 +1452,11 @@ class GRIDApi {
     // Oracle
     async getOracleScoreboard() { return this._fetch('/api/v1/oracle/scoreboard'); }
     async getOracleEvidence() { return this._fetch('/api/v1/oracle/evidence'); }
+    getSpyBandFlags(signal, sessionDate) {
+        const query = sessionDate ? '?session_date=' + encodeURIComponent(sessionDate) : '';
+        return this._fetch('/api/v1/gamma-watch/spy-band-flags' + query, { signal, cache: 'no-store' });
+    }
+
     getGammaSessionMap(symbol, signal, sessionDate) {
         const query = sessionDate ? '?session_date=' + encodeURIComponent(sessionDate) : '';
         return this._fetch(`/api/v1/gamma-watch/time-map/${encodeURIComponent(symbol)}` + query, { signal, cache: 'no-store' });

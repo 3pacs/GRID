@@ -47,3 +47,18 @@
 
 .gb-history-empty{min-height:150px;display:flex;align-items:flex-start;justify-content:center;flex-direction:column;gap:5px;margin:8px 0;color:var(--gb-muted);font-size:12px;border-block:1px solid var(--gb-border)}
 .gb-history-empty strong{font-size:14px;color:var(--gb-fg)}
+
+.gb-flags{border-top:1px solid var(--gb-border);margin-top:14px;padding-top:11px;color:var(--gb-fg)}
+.gb-flags h3{margin:0;font-size:16px}.gb-flags h4{font-size:12px;margin:12px 0 5px}
+.gb-flags p{font-size:11px;color:var(--gb-muted);margin:4px 0;line-height:1.45}
+.gb-flags .gb-status{color:#e3a477}.gb-flag-line{display:flex;justify-content:space-between;gap:6px;align-items:baseline;font-size:13px;flex-wrap:wrap}
+.gb-flag-line b,.gb-flag-event dd{font:500 12px ui-monospace,monospace}.gb-flags .gb-event-list{list-style:none;padding:0;margin:0;max-height:270px;overflow:auto}.gb-flag-event,.gb-flag-family{padding:7px 0;border-top:1px solid var(--gb-border)}
+.gb-flag-event dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin:8px 0}.gb-flag-event dt{font-size:10px;color:var(--gb-muted)}.gb-flag-event dd{margin:0}
+.gb-flag-hit{color:var(--gb-positive)}.gb-flag-miss{color:var(--gb-negative)}
+.gb-flags-buckets select{margin:5px;padding:4px;background:var(--gb-card);color:var(--gb-fg);border:1px solid var(--gb-border);border-radius:4px}
+.gb-flags-buckets table{border-collapse:collapse;width:100%;font-size:11px;font-variant-numeric:tabular-nums}.gb-flags-buckets th,.gb-flags-buckets td{padding:5px 2px;text-align:right;font-weight:400;border-bottom:1px solid var(--gb-border)}
+.gb-flags-buckets th:first-child{text-align:left}.gb-flag-footnote{margin-bottom:7px}
+.gb-time-raster .gb-time-flag{position:absolute;z-index:2;padding:0;background:#0b1421;border:1px solid #d4dbdf;border-radius:3px;transform:translate(-50%,-50%);width:14px;height:14px;line-height:11px;font:10px/11px ui-monospace,monospace;color:#ebf5fa;cursor:pointer}
+.gb-time-flag[data-flag-marker=first_cross] span{color:#84f0b0}.gb-time-flag[data-flag-marker=failed_reclaim] span{color:#ff9ca2}
+.gb-time-flag:focus-visible{outline:2px solid #fff;outline-offset:2px;z-index:3}
+.gb-map-flag-caption{display:grid;gap:3px;font:11px/1.45 ui-monospace,monospace;color:var(--gb-muted);margin:3px 0}.gb-map-flag-caption strong{color:var(--gb-fg);font-weight:500}

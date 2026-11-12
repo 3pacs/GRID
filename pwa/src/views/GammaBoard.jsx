@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { colors } from '../styles/shared.js';
 import './GammaBoard.css';
+import SpyBandFlags from '../components/SpyBandFlags.jsx';
 import GammaSessionMap, {validMap} from '../components/GammaSessionMap.jsx';
 import GammaIntradayChart from '../components/GammaIntradayChart.jsx';
 
@@ -33,6 +34,9 @@ function usd(value) {
 }
 
 const FEEDS = {
+    flags: { load: (_symbol, signal, day) => api.getSpyBandFlags(signal, day),
+        valid: next => /^\d{4}-\d{2}-\d{2}$/.test(next.session_date)
+            && Array.isArray(next.events) && Array.isArray(next.stats) && next.stats.every(row => row && typeof row === 'object') },
     history: {load: (...args) => api.getGammaSessionMap(...args), valid: validMap},
     chain: { load: (...args) => api.getGammaBoardInstrument(...args), valid: next => Array.isArray(next.cells) && next.cells.length && Number.isFinite(next.spot) },
     intraday: { load: (...args) => api.getGammaBoardIntraday(...args), valid: next => Array.isArray(next.bars) && next.bars.length
@@ -63,12 +67,13 @@ function useFeed(symbol, refresh, kind, sessionDate = '') {
                     setState({ snapshot: null, loading: false, status: 'Administrator access required.' });
                     return;
                 }
-                if (next?.symbol === symbol && next.status === 'unavailable') {
+                const matchesSymbol = next?.symbol === symbol || (kind === 'flags' && next?.symbol == null);
+                if (matchesSymbol && next?.status === 'unavailable') {
                     setState({ snapshot: null, loading: false, tracking:next.tracking, readAt, sessionDate:next.session_date, status: next.reason || `${kind} unavailable.` });
                     return;
                 }
-                const valid = next?.symbol === symbol && next.status === 'available'
-                    && (kind === 'history' ? (!sessionDate || next.session_date === sessionDate) : Number.isFinite(Date.parse(next.as_of)))
+                const valid = matchesSymbol && next?.status === 'available'
+                    && ((kind === 'history' || kind === 'flags') ? (!sessionDate || next.session_date === sessionDate) : Number.isFinite(Date.parse(next.as_of)))
                     && FEEDS[kind].valid(next);
                 if (controller.signal.aborted || !valid) {
                     throw new Error(`Latest ${kind} unavailable.`);
@@ -172,7 +177,7 @@ function Surface({ symbol, snapshot, metric, count }) {
     </>;
 }
 
-function SessionHistory({symbol, refresh, sessionDate, extra}) {
+function SessionHistory({symbol, refresh, sessionDate, extra, ledger}) {
     const [changed,setChanged]=useState(null);
     const [saving,setSaving]=useState(false);
     const [error,setError]=useState('');
@@ -195,7 +200,7 @@ function SessionHistory({symbol, refresh, sessionDate, extra}) {
             <span>{h.status}{h.sessionDate && !h.snapshot ? ' ('+h.sessionDate+')' : ''}</span>
             {!extra && !sessionDate && h.tracking === true && h.status === 'No strike history recorded for this session.' &&
                 <span>Recording is enabled. New minutes will appear during regular trading hours when fresh quotes arrive.</span>}</div>}
-        {h.snapshot && <GammaSessionMap map={h.snapshot} />}
+        {h.snapshot && <GammaSessionMap map={h.snapshot} ledger={ledger} />}
         {extra && <div className="gb-record"><button type="button" disabled={saving || typeof tracked !== 'boolean'} onClick={toggle}>
             {saving?'Saving…':tracked?'Stop recording':'Record future minutes'}</button>
             <p>{tracked ? 'Server recording is enabled for future regular-session minutes, including while this page is closed.' : 'Enable server recording to collect future regular-session minutes while this page is closed.'}</p>
@@ -204,13 +209,23 @@ function SessionHistory({symbol, refresh, sessionDate, extra}) {
     </section>;
 }
 
+function SpySession({refresh,sessionDate}) {
+    const feed = useFeed('SPY', refresh, 'flags', sessionDate);
+    return <>
+        <SessionHistory symbol="SPY" refresh={refresh} sessionDate={sessionDate} ledger={feed.snapshot} />
+        <SpyBandFlags feed={feed} />
+    </>;
+}
+
 function Instrument({ symbol, metric, count, refresh, sessionDate, onRemove }) {
     const { snapshot: s, status, loading } = useFeed(symbol, refresh, 'chain');
     const intraday = useFeed(symbol, refresh, 'intraday');
     return <article className="gb-card" aria-label={symbol + ' gamma exposure'}>
         <header><div><h2>{symbol}</h2><span>{SYMBOLS[symbol] || 'Equity / ETF'}</span>{onRemove && <button className="gb-remove" type="button" aria-label={`Remove ${symbol}`} onClick={onRemove}>Remove</button>}</div>
             <div className="gb-spot"><b>{number(s?.spot)}</b><span>Latest chain spot</span></div></header>
-        <SessionHistory key={symbol + '/' + sessionDate} symbol={symbol} refresh={refresh} sessionDate={sessionDate} extra={!!onRemove} />
+        {symbol === 'SPY'
+            ? <SpySession key={sessionDate} refresh={refresh} sessionDate={sessionDate} />
+            : <SessionHistory key={sessionDate} symbol={symbol} refresh={refresh} sessionDate={sessionDate} extra={!!onRemove} />}
         <details className="gb-secondary"><summary>Latest expiry × strike snapshot</summary>
         <dl className="gb-walls">{[['Call wall', number(s?.call_wall)], ['Put wall', number(s?.put_wall)], ['Net GEX', signedUsd(s?.net_gex)]]
             .map(([label, val]) => <div key={label}><dt>{label}</dt><dd className={label === 'Net GEX' ? signedColor(s?.net_gex) : ''}>{val}</dd></div>)}</dl>

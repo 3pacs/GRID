@@ -5,7 +5,7 @@ import GammaBoard from '../views/GammaBoard.jsx';
 import GammaSessionMap, {sessionGeometry, validMap} from '../components/GammaSessionMap.jsx';
 import {api} from '../api.js';
 
-vi.mock('../api.js',()=>({api:{getGammaSessionMap:vi.fn(),setGammaSessionTracking:vi.fn(),
+vi.mock('../api.js',()=>({api:{getSpyBandFlags:vi.fn(async()=>({status:'unavailable',reason:'Flag ledger unavailable.'})),getGammaSessionMap:vi.fn(),setGammaSessionTracking:vi.fn(),
     getGammaBoardInstrument:vi.fn(),getGammaBoardIntraday:vi.fn()}}));
 const start=Date.parse('2026-11-10T14:30:00Z');
 function frame(symbol='SPY', extra={}) {
@@ -95,4 +95,28 @@ it('reads the dated map and writes tracking through the private no-store API',as
     expect(fetch.mock.calls[0][1]).toMatchObject({signal:controller.signal,cache:'no-store'});
     expect(fetch.mock.calls[1][0]).toMatch(/time-map\/AAPL\/tracking$/);
     expect(fetch.mock.calls[1][1]).toMatchObject({method:'POST',cache:'no-store',body:'{"enabled":true}'});
+});
+
+it('places distinct SPY flag markers at their confirmed time and recorded strike, with an accessible target',()=>{
+    const data=frame();
+    const events=[
+        {kind:'first_cross',red:750,target:751,signal_time:'2026-11-10T14:31:00Z'},
+        {kind:'failed_reclaim',red:750,target:749,signal_time:'2026-11-10T14:34:00Z'},
+        {kind:'first_cross',red:999,target:1001,signal_time:'2026-11-10T15:00:00Z'},
+        {kind:'first_cross',red:750,target:751,signal_time:'2026-11-09T15:00:00Z'},
+    ];
+    const ledger={session_date:data.session_date,events};
+    const {rerender}=render(<GammaSessionMap map={data} ledger={ledger}/>);
+    const first=screen.getByRole('button',{name:'First cross · 09:31:00 ET · red 750 → target 751'});
+    const second=screen.getByRole('button',{name:'Failed reclaim · 09:34:00 ET · red 750 → target 749'});
+    expect(parseFloat(first.style.left)).toBeCloseTo(100/390,8);
+    expect(first.style.top).toBe('50%');
+    expect(first.textContent).not.toBe(second.textContent);
+    fireEvent.click(second);
+    expect(screen.getByText(second.getAttribute('aria-label'))).toBeInTheDocument();
+    expect(document.querySelectorAll('[data-flag-marker]')).toHaveLength(2);
+    rerender(<GammaSessionMap map={frame('QQQ')} ledger={ledger}/>);
+    expect(document.querySelectorAll('[data-flag-marker]')).toHaveLength(0);
+    rerender(<GammaSessionMap map={data} ledger={{...ledger,session_date:'2026-11-09'}}/>);
+    expect(document.querySelectorAll('[data-flag-marker]')).toHaveLength(0);
 });
