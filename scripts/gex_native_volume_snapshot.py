@@ -52,9 +52,13 @@ def write_private(path: Path, data: dict) -> None:
 
 def run_once(client, out: Path | None) -> tuple[dict, dict]:
     now = time.time()
-    if not nv._regular(now):
-        # Outside 09:30-16:00 ET: no Schwab calls, no write (gex-watch lets the
-        # last snapshot age out after 180 s and shows the unavailable path).
+    try:
+        _, current, _ = nv.calendar_window(now)
+    except (OSError, ValueError):
+        current = None
+    if current is None:
+        # Known closure or unavailable pinned calendar: no Schwab calls and no
+        # write (the private reader lets the previous snapshot age out).
         payload, info = nv.compute({}, None, now=now, receipt_at=now)
         return nv.envelope(payload, nv.provenance([])), info
     quote = client.quotes(nv.SYMBOL).get(nv.SYMBOL)

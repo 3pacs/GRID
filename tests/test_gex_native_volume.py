@@ -144,7 +144,7 @@ def test_outside_the_regular_session_is_closed():
 def test_too_few_baseline_sessions_is_not_ready():
     hist = {"symbol": "SPY", "candles": [c for c in _history()["candles"]
                                          if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() >= PRIOR[4]]}
-    assert _run(hist=hist)[0]["reason"] == "insufficient_baseline_sessions"
+    assert _run(hist=hist)[0]["reason"] == "missing_baseline_session"
 
 
 def test_malformed_candles_are_dropped_not_trusted():
@@ -239,3 +239,263 @@ def test_an_incomplete_baseline_session_is_not_replaced_by_an_older_one():
                                and datetime.fromtimestamp(c["datetime"] / 1000, ET).hour == 10)]
     p, _ = _run(hist=hist)
     assert p["status"] == "coverage_failed" and p["baseline_sessions"] == []
+
+
+# Exact exchange-session coverage (source-only calendar correction).
+def test_an_entire_missing_expected_session_is_not_replaced_by_older_data():
+    hist = _history()
+    missing = PRIOR[0]
+    hist["candles"] = [c for c in hist["candles"]
+                       if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() != missing]
+    observed = {datetime.fromtimestamp(c["datetime"] / 1000, ET).date()
+                for c in hist["candles"]} - {TODAY}
+    assert len(observed) == 11  # Enough older dates hid the gap before this fix.
+    p, _ = _run(hist=hist)
+    assert (p["status"], p["reason"]) == ("coverage_failed", "missing_baseline_session")
+    assert p["rvol"] is None and p["baseline_median_shares"] is None
+
+
+@pytest.mark.parametrize("day", [date(2026, 11, 14), date(2026, 11, 26), date(2026, 12, 25)])
+def test_weekends_and_exchange_holidays_are_closed(day):
+    now = _ts(day, 10, 30)
+    p, _ = _run(now=now, receipt=now)
+    assert (p["status"], p["reason"]) == ("closed", "outside_regular_session")
+
+
+@pytest.mark.parametrize("day", [date(2026, 9, 30), date(2028, 1, 3)])
+def test_dates_outside_the_pinned_calendar_fail_closed(day):
+    now = _ts(day, 10, 30)
+    p, _ = _run(now=now, receipt=now)
+    assert (p["status"], p["reason"]) == ("unavailable", "calendar_unavailable")
+
+
+def test_early_close_boundary_is_closed():
+    now = _ts(date(2026, 11, 27), 13, 0)
+    p, _ = _run(now=now, receipt=now)
+    assert (p["status"], p["reason"]) == ("closed", "outside_regular_session")
+
+
+def _scheduled_history(day: date, count: int) -> dict:
+    """Synthetic OHLCV only; days and their bounds come from the pinned schedule."""
+    cal = nv._calendar()
+    current = cal.for_date(day)
+    assert current is not None
+    prior = cal.prior_sessions(current.key, 12)
+    candles = []
+    for session in prior:
+        candles += _day(nv._session(session.opens.timestamp()),
+                        int((session.closes - session.opens).total_seconds() / 60))
+    candles += _day(day, count, 150_000)
+    return {"symbol": "SPY", "candles": candles}
+
+
+def test_pinned_calendar_identity_and_dst_boundaries():
+    cal = nv._calendar()
+    assert cal.version == nv.CALENDAR_VERSION
+    assert hashlib.sha256(nv.CALENDAR_PATH.read_bytes()).hexdigest() == nv.CALENDAR_SHA256
+    assert cal.for_date(date(2026, 10, 30)).opens.hour == 13
+    assert cal.for_date(date(2026, 11, 2)).opens.hour == 14
+    assert cal.for_date(date(2027, 3, 12)).opens.hour == 14
+    assert cal.for_date(date(2027, 3, 15)).opens.hour == 13
+    # New Year's Day 2028 is Saturday: XNYS remains open on 2027-12-31.
+    assert cal.for_date(date(2027, 12, 31)) is not None
+    p, _ = _run()
+    assert p["calendar_version"] == nv.CALENDAR_VERSION
+    assert p["baseline_sessions"] == [
+        "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30", "2026-11-02",
+        "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09"]
+
+
+@pytest.mark.parametrize("day", [date(2026, 11, 27), date(2026, 12, 24)])
+def test_shortened_current_session_uses_real_open_close(day):
+    now = _ts(day, 12, 59, 7)
+    p, _ = _run(hist=_scheduled_history(day, 209), quote=_quote(209 * 150_000), now=now, receipt=now)
+    assert p["status"] == "ready" and p["completed_minutes"] == 209
+    assert "2026-11-26" not in p["baseline_sessions"]
+    p, _ = _run(now=_ts(day, 13, 0), receipt=_ts(day, 13, 0))
+    assert p["status"] == "closed"
+
+
+@pytest.mark.parametrize("minutes,reason", [(60, None), (210, None), (211, "incomparable_baseline_session")])
+def test_short_prior_session_is_never_extended_rescaled_or_replaced(minutes, reason):
+    day = date(2026, 11, 30)
+    now = _ts(day, 9, 30) + minutes * 60 + 7
+    history = _scheduled_history(day, minutes)
+    # Even bogus provider bars after the prior close cannot make it comparable.
+    history["candles"] += [_candle(_ts(date(2026, 11, 27), 13, 0), 100_000)]
+    p, _ = _run(hist=history, quote=_quote(minutes * 150_000), now=now, receipt=now)
+    assert p["reason"] == reason
+    if reason is None:
+        assert p["status"] == "ready" and math.isclose(p["rvol"], 1.5)
+        assert p["baseline_sessions"] == [
+            "2026-11-13", "2026-11-16", "2026-11-17", "2026-11-18", "2026-11-19",
+            "2026-11-20", "2026-11-23", "2026-11-24", "2026-11-25", "2026-11-27"]
+    else:
+        assert p["status"] == "unavailable" and p["rvol"] is None
+        assert p["baseline_errors"] == {"2026-11-27": "early_close_insufficient_elapsed_minutes"}
+
+
+def test_missing_expected_session_after_holiday_is_not_substituted():
+    day, missing = date(2026, 11, 30), date(2026, 11, 25)
+    history = _scheduled_history(day, 60)
+    history["candles"] = [c for c in history["candles"]
+                          if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() != missing]
+    now = _ts(day, 10, 30, 7)
+    p, _ = _run(hist=history, now=now, receipt=now)
+    assert p["reason"] == "missing_baseline_session"
+    assert p["baseline_errors"] == {missing.isoformat(): "missing_baseline_session"}
+
+
+def test_calendar_start_with_insufficient_expected_history_is_unavailable():
+    now = _ts(date(2026, 10, 2), 10, 30)
+    p, _ = _run(now=now, receipt=now)
+    assert (p["status"], p["reason"]) == ("unavailable", "calendar_unavailable")
+
+
+@pytest.mark.parametrize("fault", ["missing", "corrupt", "writable", "symlink"])
+def test_untrusted_or_unavailable_manifest_cannot_fall_back(tmp_path, monkeypatch, fault):
+    manifest = tmp_path / "calendar.json"
+    if fault != "missing":
+        manifest.write_bytes(nv.CALENDAR_PATH.read_bytes() + (b" " if fault == "corrupt" else b""))
+        manifest.chmod(0o666 if fault == "writable" else 0o644)
+    if fault == "symlink":
+        link = tmp_path / "link"
+        link.symlink_to(manifest)
+        manifest = link
+    monkeypatch.setattr(nv, "CALENDAR_PATH", manifest)
+    p, _ = _run()
+    assert (p["status"], p["reason"]) == ("unavailable", "calendar_unavailable")
+    assert set(p) == READER_FIELDS and p["rvol"] is None
+
+
+def test_a_calendar_file_corrupted_after_success_is_not_cached(tmp_path, monkeypatch):
+    manifest = tmp_path / "calendar.json"
+    manifest.write_bytes(nv.CALENDAR_PATH.read_bytes())
+    manifest.chmod(0o644)
+    monkeypatch.setattr(nv, "CALENDAR_PATH", manifest)
+    assert _run()[0]["status"] == "ready"
+    manifest.write_bytes(b"{}")
+    assert _run()[0]["reason"] == "calendar_unavailable"
+
+
+@pytest.mark.parametrize("day,hour,reason", [
+    (date(2026, 11, 14), 11, "outside_regular_session"),
+    (date(2026, 11, 26), 11, "outside_regular_session"),
+    (date(2026, 11, 27), 13, "outside_regular_session"),
+    (date(2028, 1, 3), 11, "calendar_unavailable"),
+    (date(2026, 10, 2), 11, "calendar_unavailable"),
+])
+def test_runner_calls_no_provider_and_writes_nothing_when_calendar_withholds(monkeypatch, day, hour, reason):
+    import scripts.gex_native_volume_snapshot as snap
+
+    def refuse(*args, **kwargs):
+        pytest.fail("Provider call or snapshot write happened outside verified session coverage")
+
+    class RefusingClient:
+        quotes = price_history = refuse
+
+    now = _ts(day, hour, 0)
+    monkeypatch.setattr(snap.time, "time", lambda: now)
+    monkeypatch.setattr(snap, "write_private", refuse)
+    env, _ = snap.run_once(RefusingClient(), nv.CALENDAR_PATH.parent / "must-not-write.json")
+    assert env["payload"]["reason"] == reason
+
+
+def test_runner_calendar_failure_never_contacts_provider(tmp_path, monkeypatch):
+    import scripts.gex_native_volume_snapshot as snap
+
+    class RefusingClient:
+        def __getattr__(self, name):
+            pytest.fail("Provider called without a verified calendar")
+
+    monkeypatch.setattr(nv, "CALENDAR_PATH", tmp_path / "missing")
+    monkeypatch.setattr(snap.time, "time", lambda: NOW)
+    env, _ = snap.run_once(RefusingClient(), None)
+    assert env["payload"]["reason"] == "calendar_unavailable"
+
+
+@pytest.mark.parametrize("day", [TODAY, PRIOR[0]])
+def test_shifted_second_bars_do_not_satisfy_exact_minute_coverage(day):
+    history = _history()
+    stamp = int(_ts(day, 9, 45) * 1000)
+    for candle in history["candles"]:
+        if candle["datetime"] == stamp:
+            candle["datetime"] += 1000
+    p, _ = _run(hist=history)
+    assert p["status"] == "coverage_failed" and p["rvol"] is None
+
+
+@pytest.mark.parametrize("scenario", ["ready", "missing_session", "short_baseline"])
+def test_optional_sibling_gex_reader_compatibility(tmp_path, scenario):
+    """Exact deployed-reader integration when an operator supplies its source path."""
+    import importlib.util
+    from pathlib import Path
+    from scripts.gex_native_volume_snapshot import write_private
+
+    reader_path = os.environ.get("GEX_NATIVE_READER")
+    if not reader_path:
+        pytest.skip("Set GEX_NATIVE_READER to the sibling GEX grid_native_volume.py")
+    assert Path(reader_path).is_absolute() and Path(reader_path).is_file()
+    spec = importlib.util.spec_from_file_location("gex_native_reader_contract", reader_path)
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    now, receipt = NOW, RECEIPT
+    history, quote = _history(), _quote(60 * 150_000)
+    if scenario == "missing_session":
+        history["candles"] = [c for c in history["candles"]
+                              if datetime.fromtimestamp(c["datetime"] / 1000, ET).date() != PRIOR[0]]
+    elif scenario == "short_baseline":
+        day = date(2026, 11, 30)
+        now = receipt = _ts(day, 13, 1, 7)
+        history, quote = _scheduled_history(day, 211), _quote(211 * 150_000)
+    p, info = nv.compute(history, quote, now=now, receipt_at=receipt)
+    directory = tmp_path / "snapshot"
+    directory.mkdir(mode=0o700)
+    path = directory / "snapshot.json"
+    write_private(path, nv.envelope(p, nv.provenance(info["bars"])))
+    projected = reader.read_private_snapshot(str(path), now)
+    if scenario == "ready":
+        assert p["calendar_version"] == nv.CALENDAR_VERSION
+        assert projected["status"] == "ready", projected
+        assert projected["rvol"] == p["rvol"]
+    else:
+        assert projected["status"] == "unavailable", projected
+    assert projected["signal_confirmation"] is False
+    assert projected["exact_trade_vwap"] is False
+
+
+def test_baseline_with_only_later_bars_reports_a_minute_gap():
+    history = _history()
+    missing = PRIOR[0]
+    history["candles"] = [c for c in history["candles"] if
+                          not (_ts(missing, 9, 30) <= c["datetime"] / 1000 < _ts(missing, 10, 30))]
+    p, _ = _run(hist=history)
+    assert (p["status"], p["reason"]) == ("coverage_failed", "missing_baseline_minute")
+
+
+def test_manifest_symlink_cycle_is_unavailable(tmp_path, monkeypatch):
+    path = tmp_path / "cycle"
+    path.symlink_to(path)
+    monkeypatch.setattr(nv, "CALENDAR_PATH", path)
+    assert _run()[0]["reason"] == "calendar_unavailable"
+
+
+def test_runner_open_session_still_uses_one_quote_and_one_history_call(monkeypatch):
+    from types import SimpleNamespace
+    import scripts.gex_native_volume_snapshot as snap
+
+    calls = []
+
+    class FakeClient:
+        def quotes(self, symbol):
+            calls.append(("quotes", symbol))
+            return {symbol: SimpleNamespace(total_volume=_quote(60 * 150_000))}
+
+        def price_history(self, symbol, **params):
+            calls.append(("history", symbol, params))
+            return _history()
+
+    monkeypatch.setattr(snap.time, "time", lambda: NOW)
+    env, _ = snap.run_once(FakeClient(), None)
+    assert env["payload"]["status"] == "ready"
+    assert calls == [("quotes", "SPY"), ("history", "SPY", nv.history_params(NOW))]

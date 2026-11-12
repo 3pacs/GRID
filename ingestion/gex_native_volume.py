@@ -12,15 +12,15 @@ the reader's.
 
 Payload (``grid.native-volume.v1``), regular session only, completed bars only:
 
-* ``cumulative_shares``: sum of today's completed 09:30-16:00 ET bar volumes.
+* ``cumulative_shares``: sum of today's completed exchange regular-session bar volumes.
   A bar counts as completed once ``RECEIPT_GUARD_S`` seconds past its end at
   receipt (the reader requires ``latest_receipt_at >= end + 5``).
 * ``bar_vwap_estimate``: sum(HLC3 x volume) / sum(volume) over those bars, never
   exact trade VWAP (``exact_trade_vwap`` False).
 * ``rvol``: ``cumulative_shares / baseline_median_shares`` exactly, where the
   baseline is the median cumulative through the same minute of the previous
-  ``BASELINE_SESSIONS`` sessions in the same response (``calendar_version``
-  says sessions are the dates that have regular bars).
+  ``BASELINE_SESSIONS`` expected exchange sessions in the same response.
+  A missing session is never replaced by an older observed date.
 * ``as_of`` = ``served_at`` = the envelope's ``generated_at``; the receipt and
   event ages are derived from those strings, as the reader checks them.
 
@@ -39,10 +39,10 @@ Validation and coverage come first: the response must be SPY's with no
 duplicate minute, and every regular minute 09:30..last completed must be present
 today and in each of the exact prior ten sessions (else ``failed`` /
 ``coverage_failed``; the scope gate cannot see a single missing or doubled
-minute). Sessions are the dates that have regular bars, not an exchange
-calendar: a wholly missing session is not detected as such, and the afternoons
-after an early close fail coverage until it leaves the ten. Signals never read
-this (``signal_confirmation`` False).
+minute). The pinned offline XNYS manifest defines sessions, holidays, DST and
+early closes. Unknown calendar coverage fails closed. An early-close baseline
+that cannot supply the current elapsed window is unavailable, never rescaled
+or replaced. Signals never read this (``signal_confirmation`` False).
 """
 
 from __future__ import annotations
@@ -51,16 +51,23 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from ingestion.market_calendar import ManifestCalendar, MarketSession
 
 SCHEMA = "grid.native-volume.v1"
 ENVELOPE_SCHEMA = "grid.native-volume.snapshot.v1"
 SYMBOL = "SPY"
 SOURCE = "schwab_pricehistory"
-CALENDAR_VERSION = "schwab-regular-bars-observed-v1"
+CALENDAR_PATH = (Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests/"
+                 "xnys-rth-20261001-20271231.json")
+CALENDAR_SHA256 = "efa8897e2fd94afd4f9f9b29951f142b97aece83812aca7403026df1ec4eb8ad"
+CALENDAR_VERSION = (f"manifest:{CALENDAR_SHA256}:exchange_calendars:4.11.2:pandas:2.3.3:"
+                    "numpy:2.5.4:tzdata:2026.6:XNYS:2026-01-01:2027-12-31")
 # Must match gex-watch grid_native_volume (VWAP_BASIS, RVOL_BASIS, INTEGRITY_SCOPE,
 # and this producer's entry in its accepted producer set).
 PRODUCER = "GRID Schwab pricehistory snapshot"
@@ -75,7 +82,6 @@ BAR_SECONDS = 60
 RECEIPT_GUARD_S = 5                 # reader: latest_receipt_at >= end_of_completed_window + 5
 MAX_AGE_S = 120                     # reader: receipt and event ages within 120 s of as_of
 ET = ZoneInfo("America/New_York")
-OPEN, CLOSE = time(9, 30), time(16, 0)
 
 
 def _iso(ts: float) -> str:
@@ -106,17 +112,35 @@ def _bars(body: Mapping[str, Any]) -> list[tuple[float, float, float, float, int
     return out
 
 
-def _regular(ts: float) -> bool:
-    return OPEN <= datetime.fromtimestamp(ts, ET).time() < CLOSE
+def _calendar() -> ManifestCalendar:
+    # Revalidate each invocation; a missing/corrupt/replaced file must not leave
+    # a previously cached schedule usable. The digest is pinned in source.
+    calendar = ManifestCalendar(CALENDAR_PATH, CALENDAR_SHA256)
+    if calendar.version != CALENDAR_VERSION:
+        raise ValueError("calendar provenance mismatch")
+    return calendar
+
+
+def calendar_window(now: float) -> tuple[ManifestCalendar, MarketSession | None, tuple[MarketSession, ...]]:
+    """Current open session + exact ten prior sessions, or closed/unknown.
+
+    None current means known closed. Unknown coverage or insufficient preceding
+    calendar history raises; neither may fall back to weekdays or observed bars.
+    The runner calls this before making any provider request.
+    """
+    calendar = _calendar()
+    current = calendar.for_date(_session(now))
+    if current is None or not current.opens.timestamp() <= now < current.closes.timestamp():
+        return calendar, None, ()
+    return calendar, current, calendar.prior_sessions(current.key, BASELINE_SESSIONS)
 
 
 def _session(ts: float) -> date:
     return datetime.fromtimestamp(ts, ET).date()
 
 
-def _minute_of_session(ts: float) -> int:
-    d = datetime.fromtimestamp(ts, ET)
-    return (d.hour * 60 + d.minute) - (OPEN.hour * 60 + OPEN.minute)
+def _minute_of_session(ts: float, session: MarketSession) -> int:
+    return int((ts - session.opens.timestamp()) // BAR_SECONDS)
 
 
 def _payload(now: float, status: str, reason: str | None, **fields: Any) -> dict[str, Any]:
@@ -137,7 +161,7 @@ def _payload(now: float, status: str, reason: str | None, **fields: Any) -> dict
 
 def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: float,
             receipt_at: float) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Pure: Schwab pricehistory body + quote ``totalVolume`` -> (payload, info).
+    """Schwab body + quote + verified local calendar -> (payload, info).
 
     ``info`` carries the scope-gap reconciliation and the bars consulted (for
     the envelope's provenance); neither is part of the payload.
@@ -146,7 +170,11 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
     bars = _bars(history)
     info: dict[str, Any] = {"bars": bars, "reconciliation": None}
     today = _session(now)
-    if not _regular(now):
+    try:
+        _, current, expected = calendar_window(now)
+    except (OSError, ValueError):
+        return _payload(now, "unavailable", "calendar_unavailable"), info
+    if current is None:
         return _payload(now, "closed", "outside_regular_session"), info
     # Validation: the response is SPY's, and no minute appears twice (a duplicate
     # would be counted twice; the scope gate cannot see one extra minute).
@@ -156,46 +184,58 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
         return _payload(now, "failed", "duplicate_minute"), info
     completed = [b for b in bars if b[0] + BAR_SECONDS + RECEIPT_GUARD_S <= receipt_at]
     today_all = [b for b in completed if _session(b[0]) == today]
-    today_reg = [b for b in today_all if _regular(b[0])]
+    today_reg = [b for b in today_all
+                 if current.opens.timestamp() <= b[0] < current.closes.timestamp()]
     if not today_reg:
         return _payload(now, "unavailable", "no_completed_regular_bar"), info
     end = today_reg[-1][0] + BAR_SECONDS
-    through = _minute_of_session(today_reg[-1][0])
+    through = _minute_of_session(today_reg[-1][0], current)
     # Coverage: every regular minute 09:30..last completed is present today, and
     # in each of the exact prior ten sessions. A missing minute undercounts (or
     # skews the baseline) without moving the scope gap out of its band.
-    if [_minute_of_session(b[0]) for b in today_reg] != list(range(through + 1)):
+    if [b[0] for b in today_reg] != [current.opens.timestamp() + BAR_SECONDS * m for m in range(through + 1)]:
         return _payload(now, "coverage_failed", "missing_current_minute"), info
     cum = sum(b[4] for b in today_reg)
     if cum <= 0:
         return _payload(now, "unavailable", "zero_volume"), info
     vwap = sum((b[1] + b[2] + b[3]) / 3.0 * b[4] for b in today_reg) / cum
 
-    minutes: dict[date, set[int]] = {}
+    # Calendar-selected sessions, never the newest ten nonempty data dates.
+    # An early close is comparable only while every exact prior session can
+    # supply the same elapsed minute count. No scaling or older substitute.
+    sessions = [_session(s.opens.timestamp()) for s in expected]
+    short = {d.isoformat(): "early_close_insufficient_elapsed_minutes"
+             for d, s in zip(sessions, expected)
+             if (s.closes - s.opens).total_seconds() < (through + 1) * BAR_SECONDS}
+    if short:
+        return _payload(now, "unavailable", "incomparable_baseline_session", baseline_errors=short), info
+    by_day = dict(zip(sessions, expected))
+    minutes: dict[date, list[float]] = {}
     prior: dict[date, int] = {}
     for b in bars:
-        s = _session(b[0])
-        if s >= today or not _regular(b[0]):
+        d = _session(b[0])
+        session = by_day.get(d)
+        if session is None or not session.opens.timestamp() <= b[0] < session.closes.timestamp():
             continue
-        m = _minute_of_session(b[0])
-        minutes.setdefault(s, set()).add(m)
+        minutes.setdefault(d, [])
+        m = _minute_of_session(b[0], session)
         if m <= through:
-            prior[s] = prior.get(s, 0) + b[4]
-    # The exact prior ten sessions (dates with regular bars), never an older
-    # substitute for one that is incomplete: RVOL_BASIS promises exactly these.
-    sessions = sorted(minutes)[-BASELINE_SESSIONS:]
-    need = set(range(through + 1))
-    if len(sessions) == BASELINE_SESSIONS and any(not need <= minutes[s] for s in sessions):
-        return _payload(now, "coverage_failed", "missing_baseline_minute"), info
+            minutes[d].append(b[0])
+            prior[d] = prior.get(d, 0) + b[4]
+    missing = {d.isoformat(): "missing_baseline_session" for d in sessions if d not in minutes}
+    if missing:
+        return _payload(now, "coverage_failed", "missing_baseline_session", baseline_errors=missing), info
+    gaps = {d.isoformat(): "missing_baseline_minute" for d, s in by_day.items()
+            if minutes[d] != [s.opens.timestamp() + BAR_SECONDS * m for m in range(through + 1)]}
+    if gaps:
+        return _payload(now, "coverage_failed", "missing_baseline_minute", baseline_errors=gaps), info
     fields = {
         "end_of_completed_window": _iso(end), "latest_receipt_at": _iso(receipt_at),
         "receipt_age_seconds": now - receipt_at, "event_age_seconds": now - end,
         "completed_minutes": len(today_reg), "cumulative_shares": cum,
         "bar_vwap_estimate": round(vwap, 4), "baseline_sessions": [s.isoformat() for s in sessions],
-        "source_revisions": [f"{today.isoformat()}:{_minute_of_session(b[0])}" for b in today_reg],
+        "source_revisions": [f"{today.isoformat()}:{_minute_of_session(b[0], current)}" for b in today_reg],
     }
-    if len(sessions) < BASELINE_SESSIONS:
-        return _payload(now, "unavailable", "insufficient_baseline_sessions", **fields), info
     base = float(median(prior[s] for s in sessions))
     if base <= 0:
         return _payload(now, "unavailable", "zero_baseline", **fields), info
