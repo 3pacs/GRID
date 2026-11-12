@@ -17,6 +17,7 @@ circuit breaker, and decision journal plumbing all work unchanged.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,7 @@ SOLANA_STRATEGY_ID = "solana_autohedge"
 # Probe wallet used when taker=None and we still want to simulate a sell.
 # Any valid base58 address works — the simulation never broadcasts.
 _PROBE_TAKER = "11111111111111111111111111111111"
+_USDC_DECIMALS = 6
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,7 @@ class PaperSolanaExecutor:
         limit_config: LimitConfig | None = None,
         capital_per_trade_usd: float | None = None,
         exit_manager: "ExitManager | None" = None,
+        presign_allowed_programs: frozenset[str] | None = None,
     ) -> None:
         self.engine = engine
         self.paper = PaperTradingEngine(engine)
@@ -108,6 +111,9 @@ class PaperSolanaExecutor:
             else self.limits.config.capital_per_trade_usd
         )
         self.exit_manager = exit_manager
+        # Top-level programs a live order may invoke (#1143). None = the
+        # reviewed default in trading/solana/presign_check.py.
+        self.presign_allowed_programs = presign_allowed_programs
 
         self._ensure_strategy_row()
 
@@ -377,30 +383,52 @@ class PaperSolanaExecutor:
             )
 
         # For BUY we swap quote → token, for SELL we swap token → quote.
-        # The atom count comes from ``execute()``, which has already
-        # translated the pipeline's portfolio fraction into USD notional
-        # and then into raw token atoms using the decimals found by the
-        # safety check. That's the only place sizing math lives.
-        if decision.action == "BUY":
-            input_mint, output_mint = self.quote_mint, decision.mint
-        else:
-            input_mint, output_mint = decision.mint, self.quote_mint
-
+        # ``trade_size_atoms`` comes from ``execute()``: the USD notional
+        # converted into *target-token* atoms with the decimals the safety
+        # check found. It is the input amount for a SELL and the expected
+        # output for a BUY. A BUY spends the notional in quote atoms; before
+        # #1143 it passed the token-atom count as the USDC input amount.
         if trade_size_atoms <= 0:
             raise ValueError(
                 "live execution requires a positive trade_size_atoms; "
                 "the safety gate should have computed this"
             )
+        if self.quote_mint != USDC_MINT:
+            raise ValueError(
+                "live execution supports a USDC quote only; quote-atom "
+                "sizing for other quote mints is not implemented"
+            )
+        trade_usd = self._trade_notional_usd(decision)
+        quote_atoms = int(trade_usd * 10**_USDC_DECIMALS)
+        if quote_atoms <= 0:
+            raise ValueError("live execution requires a positive USD notional")
+
+        # Output floor from our own sizing and price, never from the
+        # Jupiter response: the safety check's price-impact limit plus a
+        # 2-point buffer.
+        tolerance = (float(self.safety.config.max_price_impact_pct) + 2.0) / 100.0
+        if decision.action == "BUY":
+            input_mint, output_mint = self.quote_mint, decision.mint
+            input_atoms, expected_out = quote_atoms, trade_size_atoms
+        else:
+            input_mint, output_mint = decision.mint, self.quote_mint
+            input_atoms, expected_out = trade_size_atoms, quote_atoms
+        min_output_atoms = max(1, int(expected_out * (1.0 - tolerance)))
 
         order = self.jupiter.get_order(
             input_mint=input_mint,
             output_mint=output_mint,
-            amount=trade_size_atoms,
+            amount=input_atoms,
             taker=self.wallet.address,
         )
-        raw = self.jupiter.execute_swap(
-            order, self.wallet, verify=self._verify_before_signing,
+        verify = functools.partial(
+            self._verify_before_signing,
+            expected_input_mint=input_mint,
+            expected_output_mint=output_mint,
+            max_input_atoms=input_atoms,
+            min_output_atoms=min_output_atoms,
         )
+        raw = self.jupiter.execute_swap(order, self.wallet, verify=verify)
 
         log.info(
             "Solana live swap submitted — {sym} {action} req={r}",
@@ -425,11 +453,32 @@ class PaperSolanaExecutor:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _verify_before_signing(self, order: Any, wallet_address: str) -> Any:
+    def _verify_before_signing(
+        self,
+        order: Any,
+        wallet_address: str,
+        *,
+        expected_input_mint: str,
+        expected_output_mint: str,
+        max_input_atoms: int,
+        min_output_atoms: int,
+    ) -> Any:
         """Simulate the Jupiter order on our own RPC before it is signed (#1143)."""
-        from trading.solana.presign_check import verify_order_before_signing
+        from trading.solana.presign_check import (
+            DEFAULT_ALLOWED_PROGRAMS,
+            verify_order_before_signing,
+        )
 
-        return verify_order_before_signing(order, wallet_address, self.safety.rpc)
+        return verify_order_before_signing(
+            order,
+            wallet_address,
+            self.safety.rpc,
+            expected_input_mint=expected_input_mint,
+            expected_output_mint=expected_output_mint,
+            max_input_atoms=max_input_atoms,
+            min_output_atoms=min_output_atoms,
+            allowed_programs=self.presign_allowed_programs or DEFAULT_ALLOWED_PROGRAMS,
+        )
 
     def _fetch_entry_price(self, mint: str) -> float | None:
         try:

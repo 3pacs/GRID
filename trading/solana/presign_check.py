@@ -18,12 +18,15 @@ own Solana RPC and no new dependency:
    ``sigVerify=false``, ``replaceRecentBlockhash=true``).
 3. Net the wallet's changes per mint across every token account the wallet
    owns before or after (classic SPL Token and Token-2022), and native SOL
-   (wallet lamports plus wrapped-SOL token amounts).
-4. Refuse unless: the wallet is a required signer; the simulation succeeds;
+   (wallet lamports plus the lamports of every wallet-owned token account).
+4. Refuse unless: the order's mints and input match what the caller asked
+   for (expectations come from the caller, never from the response); every
+   top-level program is on an allowlist; the wallet is a required signer;
+   the simulation succeeds;
    no wallet token account gains a delegate or a foreign close authority and
    the wallet account is not reassigned;
-   the output mint rises by at least the order's minimum; the input mint
-   falls by no more than the order's input amount; no other mint falls; and
+   the output mint rises by at least the caller's floor; the input mint
+   falls by no more than the caller's ceiling; no other mint falls; and
    SOL outside the swap legs falls by no more than a fee/rent allowance.
 
 Every failure, including an RPC failure or an undecodable transaction,
@@ -43,8 +46,28 @@ from loguru import logger as log
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EnaFFtpo5ESD6mN91R"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
+COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111"
+ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+MEMO_PROGRAM_ID = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+JUPITER_V6_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+
+# Programs a Jupiter swap may invoke at the top level. AMMs run as CPIs
+# inside the Jupiter router and need no entry. Any other top-level program
+# is refused before signing: simulation alone cannot rule out a program that
+# behaves differently on chain than in simulation. Extend per deployment
+# (PaperSolanaExecutor(presign_allowed_programs=...)) only after reviewing
+# the program.
+DEFAULT_ALLOWED_PROGRAMS: frozenset[str] = frozenset({
+    SYSTEM_PROGRAM_ID,
+    COMPUTE_BUDGET_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    MEMO_PROGRAM_ID,
+    JUPITER_V6_PROGRAM_ID,
+})
 _TOKEN_PROGRAMS = frozenset({TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID})
 
 # SPL token account layout: mint[0:32], owner[32:64], amount u64 LE [64:72],
@@ -62,8 +85,6 @@ MAX_ACCOUNTS = 100
 # (~0.00204 SOL each). 0.01 SOL.
 DEFAULT_MAX_SOL_FEE_LAMPORTS = 10_000_000
 
-# Used only when the order carries no otherAmountThreshold.
-DEFAULT_SLIPPAGE_TOLERANCE_BPS = 300
 
 
 class PresignCheckFailed(RuntimeError):
@@ -128,6 +149,7 @@ class DecodedMessage:
     static_keys: tuple[str, ...]
     static_writable: tuple[str, ...]
     lookups: tuple[AddressTableLookup, ...] = field(default=())
+    invoked_programs: tuple[str, ...] = field(default=())
 
     @property
     def required_signers(self) -> tuple[str, ...]:
@@ -169,8 +191,13 @@ def decode_transaction(b64_tx: str) -> DecodedMessage:
 
     _, pos = _take(buf, pos, 32)  # recent blockhash
     n_ix, pos = _read_compact_u16(buf, pos)
+    programs: list[str] = []
     for _ in range(n_ix):
-        _, pos = _take(buf, pos, 1)  # program id index
+        prog, pos = _take(buf, pos, 1)  # program id index
+        # Invoked programs must be static keys.
+        if prog[0] >= n_keys:
+            raise PresignCheckFailed("instruction program id is not a static key")
+        programs.append(keys[prog[0]])
         n_acc, pos = _read_compact_u16(buf, pos)
         _, pos = _take(buf, pos, n_acc)
         n_data, pos = _read_compact_u16(buf, pos)
@@ -197,6 +224,7 @@ def decode_transaction(b64_tx: str) -> DecodedMessage:
         static_keys=tuple(keys),
         static_writable=tuple(writable),
         lookups=tuple(lookups),
+        invoked_programs=tuple(dict.fromkeys(programs)),
     )
 
 
@@ -304,23 +332,35 @@ def wallet_deltas(
     pre: list[dict[str, Any] | None],
     post: list[dict[str, Any] | None],
 ) -> dict[str, int]:
-    """Net change per mint for the wallet; SOL_MINT includes native lamports."""
+    """Net change per mint for the wallet.
+
+    SOL_MINT is the wallet's lamports plus the lamports held by every token
+    account the wallet owns. That covers wrapped SOL (lamports = rent +
+    amount), rent paid into new token accounts, and rent of a closed wallet
+    token account sent anywhere but back to the wallet. Other mints are
+    token amounts. Ownership is judged on each side separately, so an
+    account whose owner moves away from the wallet counts as a full loss.
+    """
     if not (len(addresses) == len(pre) == len(post)):
         raise PresignCheckFailed("account state count mismatch")
     deltas: dict[str, int] = defaultdict(int)
+
+    def lamports(account: dict[str, Any] | None) -> int:
+        return int((account or {}).get("lamports", 0))
+
     for addr, before, after in zip(addresses, pre, post):
         if addr == wallet:
-            deltas[SOL_MINT] += int((after or {}).get("lamports", 0)) - int(
-                (before or {}).get("lamports", 0)
-            )
+            deltas[SOL_MINT] += lamports(after) - lamports(before)
             continue
         b_state, a_state = _token_state(before), _token_state(after)
-        # Ownership is judged on each side separately: an account whose
-        # owner moves away from the wallet counts as a full loss.
         if b_state and b_state[1] == wallet:
-            deltas[b_state[0]] -= b_state[2]
+            deltas[SOL_MINT] -= lamports(before)
+            if b_state[0] != SOL_MINT:
+                deltas[b_state[0]] -= b_state[2]
         if a_state and a_state[1] == wallet:
-            deltas[a_state[0]] += a_state[2]
+            deltas[SOL_MINT] += lamports(after)
+            if a_state[0] != SOL_MINT:
+                deltas[a_state[0]] += a_state[2]
     return dict(deltas)
 
 
@@ -334,20 +374,16 @@ class PresignReport:
     writable_count: int
     min_output_atoms: int
     max_input_atoms: int
+    invoked_programs: tuple[str, ...]
 
 
-def _min_output_atoms(order: Any, slippage_tolerance_bps: int) -> int:
+def _order_threshold(order: Any) -> int:
+    """Jupiter's own minimum output, or 0. Only ever tightens our floor."""
     raw = getattr(order, "raw", None) or {}
-    threshold = raw.get("otherAmountThreshold")
-    if threshold not in (None, "", "0", 0):
-        try:
-            return int(threshold)
-        except (TypeError, ValueError) as exc:
-            raise PresignCheckFailed(f"bad otherAmountThreshold {threshold!r}") from exc
-    out_amount = int(getattr(order, "out_amount", 0) or 0)
-    if out_amount <= 0:
-        raise PresignCheckFailed("order has no expected output amount")
-    return out_amount * (10_000 - slippage_tolerance_bps) // 10_000
+    try:
+        return max(0, int(raw.get("otherAmountThreshold") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def verify_order_before_signing(
@@ -355,26 +391,50 @@ def verify_order_before_signing(
     wallet_address: str,
     rpc: _RPC,
     *,
+    expected_input_mint: str,
+    expected_output_mint: str,
+    max_input_atoms: int,
+    min_output_atoms: int,
+    allowed_programs: frozenset[str] = DEFAULT_ALLOWED_PROGRAMS,
     max_sol_fee_lamports: int = DEFAULT_MAX_SOL_FEE_LAMPORTS,
-    slippage_tolerance_bps: int = DEFAULT_SLIPPAGE_TOLERANCE_BPS,
 ) -> PresignReport:
-    """Raise :class:`PresignCheckFailed` unless the order does what it says.
+    """Raise :class:`PresignCheckFailed` unless the order does what *we* asked.
+
+    The expectations (mints, input ceiling, output floor) come from the
+    caller's own request and price, never from the Jupiter response being
+    checked: a compromised endpoint controls ``order.input_mint``,
+    ``order.in_amount`` and ``otherAmountThreshold`` as easily as the
+    transaction bytes. The order's threshold can only raise the floor.
 
     ``order`` is a :class:`trading.solana.jupiter_client.SwapOrder`.
     """
     if not wallet_address:
         raise PresignCheckFailed("wallet address is required")
-    in_mint, out_mint = order.input_mint, order.output_mint
-    if in_mint == out_mint:
-        raise PresignCheckFailed("input and output mint are the same")
-    max_input = int(order.in_amount)
+    in_mint, out_mint = expected_input_mint, expected_output_mint
+    if not in_mint or not out_mint or in_mint == out_mint:
+        raise PresignCheckFailed("expected input and output mints must differ")
+    if (order.input_mint, order.output_mint) != (in_mint, out_mint):
+        raise PresignCheckFailed(
+            f"order swaps {order.input_mint} -> {order.output_mint}, "
+            f"requested {in_mint} -> {out_mint}"
+        )
+    max_input = int(max_input_atoms)
     if max_input <= 0:
-        raise PresignCheckFailed("order has no input amount")
-    min_output = _min_output_atoms(order, slippage_tolerance_bps)
+        raise PresignCheckFailed("max_input_atoms must be positive")
+    if int(order.in_amount) > max_input:
+        raise PresignCheckFailed(
+            f"order spends {order.in_amount}, requested at most {max_input}"
+        )
+    if int(min_output_atoms) <= 0:
+        raise PresignCheckFailed("min_output_atoms must be positive")
+    min_output = max(int(min_output_atoms), _order_threshold(order))
 
     message = decode_transaction(order.transaction)
     if wallet_address not in message.required_signers:
         raise PresignCheckFailed("wallet is not a required signer of the order")
+    unknown = [p for p in message.invoked_programs if p not in allowed_programs]
+    if unknown:
+        raise PresignCheckFailed(f"order invokes programs outside the allowlist: {unknown}")
 
     try:
         addresses = writable_accounts(message, rpc)
@@ -433,4 +493,5 @@ def verify_order_before_signing(
         writable_count=len(addresses),
         min_output_atoms=min_output,
         max_input_atoms=max_input,
+        invoked_programs=message.invoked_programs,
     )

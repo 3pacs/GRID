@@ -279,11 +279,17 @@ def test_executor_live_happy_path(
     # Computed atoms from USD notional — NOT the raw fraction
     assert call["amount"] > 0
     mock_jupiter.execute_swap.assert_called_once()
-    # The live path always passes the pre-sign check (#1143).
-    assert (
-        mock_jupiter.execute_swap.call_args.kwargs["verify"]
-        == executor._verify_before_signing
-    )
+    # The live path always passes the pre-sign check (#1143), bound to our
+    # own request rather than to the Jupiter response.
+    verify = mock_jupiter.execute_swap.call_args.kwargs["verify"]
+    assert verify.func == executor._verify_before_signing
+    assert verify.keywords["expected_input_mint"] == USDC_MINT
+    assert verify.keywords["expected_output_mint"] == SOL_MINT
+    # A BUY spends the USD notional in USDC atoms (6 decimals), not the
+    # target-token atom count.
+    assert call["amount"] == verify.keywords["max_input_atoms"]
+    assert call["amount"] == int(executor._trade_notional_usd(_decision(size_fraction=0.5)) * 10**6)
+    assert verify.keywords["min_output_atoms"] > 0
     assert result.safety_report is not None
     assert result.limit_decision is not None
 

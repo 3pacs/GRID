@@ -224,6 +224,20 @@ def _order(tx: str | None = None, **kw: Any) -> Order:
     return Order(**defaults)
 
 
+_EXPECT = dict(
+    expected_input_mint=USDC,
+    expected_output_mint=TOKEN,
+    max_input_atoms=1_000_000,
+    min_output_atoms=495,
+    allowed_programs=frozenset({PROGRAM}),
+)
+
+
+def _verify(order: Order, wallet: str, rpc: Any, **kw: Any) -> pc.PresignReport:
+    """verify_order_before_signing with this file's request expectations."""
+    return verify_order_before_signing(order, wallet, rpc, **{**_EXPECT, **kw})
+
+
 # ----------------------------------------------------------------------
 # Decoding
 # ----------------------------------------------------------------------
@@ -256,7 +270,7 @@ def test_decode_rejects_garbage(bad):
 # ----------------------------------------------------------------------
 def test_good_swap_passes():
     rpc = FakeRPC(pre=_base_pre(), post=_good_post())
-    report = verify_order_before_signing(_order(), WALLET, rpc)
+    report = _verify(_order(), WALLET, rpc)
     assert report.deltas[USDC] == -1_000_000
     assert report.deltas[TOKEN] == 500
     assert report.min_output_atoms == 495
@@ -267,102 +281,168 @@ def test_extra_sol_transfer_out_is_refused():
     post = _good_post()
     post[WALLET] = _wallet_account(1_000_000_000 - 500_000_000)  # 0.5 SOL gone
     with pytest.raises(PresignCheckFailed, match="SOL falls"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_output_paid_to_someone_else_is_refused():
     post = _good_post()
     post[TOKEN_ACCT] = _token_account(TOKEN, ATTACKER, 500)
     with pytest.raises(PresignCheckFailed, match="output"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_different_output_token_is_refused():
     post = _good_post()
     post[TOKEN_ACCT] = _token_account(OTHER, WALLET, 500)
     with pytest.raises(PresignCheckFailed, match="output"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_output_below_threshold_is_refused():
     post = _good_post()
     post[TOKEN_ACCT] = _token_account(TOKEN, WALLET, 100)
     with pytest.raises(PresignCheckFailed, match="needs >= 495"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_input_overspend_is_refused():
     post = _good_post()
     post[USDC_ACCT] = _token_account(USDC, WALLET, 0)  # all 5 USDC, order said 1
     with pytest.raises(PresignCheckFailed, match="input"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_unrelated_token_drained_is_refused():
     post = _good_post()
     post[OTHER_ACCT] = _token_account(OTHER, WALLET, 0)
     with pytest.raises(PresignCheckFailed, match="unrelated mint"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_token_account_ownership_moved_is_refused():
     post = _good_post()
     post[OTHER_ACCT] = _token_account(OTHER, ATTACKER, 777)  # SetAuthority(owner)
     with pytest.raises(PresignCheckFailed, match="unrelated mint"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_new_delegate_is_refused():
     post = _good_post()
     post[OTHER_ACCT] = _token_account(OTHER, WALLET, 777, delegate=ATTACKER_RAW, delegated=777)
     with pytest.raises(PresignCheckFailed, match="delegates"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_foreign_close_authority_is_refused():
     post = _good_post()
     post[TOKEN_ACCT] = _token_account(TOKEN, WALLET, 500, close_authority=ATTACKER_RAW)
     with pytest.raises(PresignCheckFailed, match="close authority"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_wallet_reassigned_is_refused():
     post = _good_post()
     post[WALLET] = _wallet_account(1_000_000_000 - 5_000 - 2_039_280, owner=PROGRAM)
     with pytest.raises(PresignCheckFailed, match="reassigned"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), post))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), post))
 
 
 def test_wallet_not_a_signer_is_refused():
     rpc = FakeRPC(pre=_base_pre(), post=_good_post())
     with pytest.raises(PresignCheckFailed, match="required signer"):
-        verify_order_before_signing(_order(), ATTACKER, rpc)
+        _verify(_order(), ATTACKER, rpc)
     assert rpc.simulated == []
 
 
 def test_simulation_error_is_refused():
     rpc = FakeRPC(pre=_base_pre(), post=_good_post(), sim_err={"InstructionError": [0, "Custom"]})
     with pytest.raises(PresignCheckFailed, match="simulation failed"):
-        verify_order_before_signing(_order(), WALLET, rpc)
+        _verify(_order(), WALLET, rpc)
 
 
 def test_rpc_failure_is_refused():
     rpc = MagicMock()
     rpc.get_multiple_accounts.side_effect = RuntimeError("timeout")
     with pytest.raises(PresignCheckFailed, match="RPC failed"):
-        verify_order_before_signing(_order(), WALLET, rpc)
+        _verify(_order(), WALLET, rpc)
 
 
-def test_missing_threshold_falls_back_to_quoted_out_with_tolerance():
+def test_order_threshold_cannot_lower_our_floor():
+    # A compromised response advertising a tiny threshold does not lower it.
     rpc = FakeRPC(pre=_base_pre(), post=_good_post())
-    report = verify_order_before_signing(_order(raw={}, out_amount=510), WALLET, rpc)
-    assert report.min_output_atoms == 510 * 9_700 // 10_000
+    report = _verify(_order(raw={"otherAmountThreshold": "1"}), WALLET, rpc)
+    assert report.min_output_atoms == 495
 
 
-def test_no_expected_output_is_refused():
+def test_order_threshold_can_raise_our_floor():
     rpc = FakeRPC(pre=_base_pre(), post=_good_post())
-    with pytest.raises(PresignCheckFailed, match="expected output"):
-        verify_order_before_signing(_order(raw={}, out_amount=0), WALLET, rpc)
+    with pytest.raises(PresignCheckFailed, match="needs >= 501"):
+        _verify(_order(raw={"otherAmountThreshold": "501"}), WALLET, rpc)
+
+
+def test_non_positive_floor_is_refused():
+    rpc = FakeRPC(pre=_base_pre(), post=_good_post())
+    with pytest.raises(PresignCheckFailed, match="min_output_atoms"):
+        _verify(_order(), WALLET, rpc, min_output_atoms=0)
+
+
+def test_order_mints_must_match_the_request():
+    # The response swaps for a different token AND the transaction delivers
+    # it, so balances alone would look consistent with the response.
+    post = _good_post()
+    post[TOKEN_ACCT] = _token_account(OTHER, WALLET, 500)
+    rpc = FakeRPC(pre=_base_pre(), post=post)
+    with pytest.raises(PresignCheckFailed, match="requested"):
+        _verify(_order(output_mint=OTHER), WALLET, rpc)
+    assert rpc.simulated == []
+
+
+def test_order_input_above_request_is_refused():
+    rpc = FakeRPC(pre=_base_pre(), post=_good_post())
+    with pytest.raises(PresignCheckFailed, match="requested at most"):
+        _verify(_order(in_amount=5_000_000), WALLET, rpc)
+
+
+def test_input_ceiling_comes_from_request_not_order():
+    # Order claims a small input; transaction spends the request's maximum.
+    post = _good_post()
+    post[USDC_ACCT] = _token_account(USDC, WALLET, 3_000_000)  # 2 USDC spent
+    with pytest.raises(PresignCheckFailed, match="input"):
+        _verify(_order(in_amount=1), WALLET, FakeRPC(_base_pre(), post))
+
+
+def test_program_outside_allowlist_is_refused():
+    rpc = FakeRPC(pre=_base_pre(), post=_good_post())
+    with pytest.raises(PresignCheckFailed, match="allowlist"):
+        _verify(_order(), WALLET, rpc, allowed_programs=pc.DEFAULT_ALLOWED_PROGRAMS)
+    assert rpc.simulated == []
+
+
+def test_default_allowlist_ids_are_valid_addresses():
+    for program in pc.DEFAULT_ALLOWED_PROGRAMS:
+        n = 0
+        for ch in program:
+            n = n * 58 + pc._B58_ALPHABET.index(ch)
+        raw = n.to_bytes(32, "big")
+        assert b58encode(raw) == program
+
+
+def test_closed_wallet_token_account_rent_sent_elsewhere_counts_as_sol_loss():
+    pre = _base_pre()
+    pre[OTHER_ACCT] = _token_account(OTHER, WALLET, 0, lamports=50_000_000)
+    post = _good_post()
+    post[OTHER_ACCT] = None  # closed; lamports did not return to the wallet
+    with pytest.raises(PresignCheckFailed, match="SOL falls"):
+        _verify(_order(), WALLET, FakeRPC(pre, post))
+
+
+def test_wrapped_sol_is_counted_once():
+    pre = _base_pre()
+    pre[OTHER_ACCT] = _token_account(SOL_MINT, WALLET, 1_000_000, lamports=3_039_280)
+    post = _good_post()
+    post[OTHER_ACCT] = _token_account(SOL_MINT, WALLET, 1_000_000, lamports=3_039_280)
+    report = _verify(_order(), WALLET, FakeRPC(pre, post))
+    assert report.deltas[SOL_MINT] == -5_000
 
 
 def test_lookup_table_writable_accounts_are_checked():
@@ -377,7 +457,7 @@ def test_lookup_table_writable_accounts_are_checked():
     rpc = FakeRPC(pre=_base_pre(), post=post, tables=tables)
 
     with pytest.raises(PresignCheckFailed, match="unrelated mint"):
-        verify_order_before_signing(_order(tx), WALLET, rpc)
+        _verify(_order(tx), WALLET, rpc)
     assert OTHER_ACCT in rpc.simulated[0]
 
 
@@ -398,14 +478,16 @@ def test_sol_input_swap_with_wrap_and_rent_passes():
     }
     order = _order(input_mint=SOL_MINT, output_mint=USDC, in_amount=1_000_000_000,
                    out_amount=150_000_000, raw={"otherAmountThreshold": "148000000"})
-    report = verify_order_before_signing(order, WALLET, FakeRPC(pre, post))
+    report = _verify(order, WALLET, FakeRPC(pre, post), expected_input_mint=SOL_MINT,
+                     expected_output_mint=USDC, max_input_atoms=1_000_000_000,
+                     min_output_atoms=148_000_000)
     assert report.deltas[SOL_MINT] == -1_000_005_000
 
 
 def test_too_many_writable_accounts_is_refused(monkeypatch):
     monkeypatch.setattr(pc, "MAX_ACCOUNTS", 3)
     with pytest.raises(PresignCheckFailed, match="writable accounts"):
-        verify_order_before_signing(_order(), WALLET, FakeRPC(_base_pre(), _good_post()))
+        _verify(_order(), WALLET, FakeRPC(_base_pre(), _good_post()))
 
 
 # ----------------------------------------------------------------------
@@ -464,3 +546,17 @@ def test_rpc_methods_shape():
     assert params[1]["sigVerify"] is False
     assert params[1]["replaceRecentBlockhash"] is True
     assert params[1]["accounts"]["addresses"] == ["a"]
+
+
+def test_token_2022_accounts_are_counted():
+    # Same drain as test_unrelated_token_drained_is_refused, on Token-2022.
+    pre = _base_pre()
+    acct = _token_account(OTHER, WALLET, 777)
+    acct["owner"] = pc.TOKEN_2022_PROGRAM_ID
+    pre[OTHER_ACCT] = acct
+    post = _good_post()
+    drained = _token_account(OTHER, WALLET, 0)
+    drained["owner"] = pc.TOKEN_2022_PROGRAM_ID
+    post[OTHER_ACCT] = drained
+    with pytest.raises(PresignCheckFailed, match="unrelated mint"):
+        _verify(_order(), WALLET, FakeRPC(pre, post))
