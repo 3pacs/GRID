@@ -221,3 +221,26 @@ class TestPutCallDailyPages:
         items = [{"status": "SUCCESS", "rows_inserted": 0, "feature_name": k} for k in CBOE_INDICES]
         items.append({"status": "SUCCESS", "rows_inserted": 0, "feature_name": "put_call_ratio"})
         assert _classify_outcome(items)[0] == OUTCOME_NO_NEW_DATA
+
+
+# ── Every series_id the puller writes must resolve (D0 gap G11) ────────────
+# The daily puller writes SKEW as series_id "skew_index"; only the old bulk
+# pull wrote "CBOE:SKEW". With no mapping for "skew_index" the resolver
+# dropped every daily row and the feature stopped at 2026-03-25.
+
+
+def test_every_written_series_id_has_an_entity_mapping():
+    from ingestion.altdata.cboe_indices import CBOE_INDICES, PUT_CALL_SERIES_ID
+    from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
+
+    mappings = {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}
+    written = [*CBOE_INDICES, PUT_CALL_SERIES_ID]
+    unmapped = [sid for sid in written if sid not in mappings]
+    assert unmapped == [], f"CBOE series ids with no entity mapping: {unmapped}"
+
+
+def test_skew_daily_and_bulk_ids_resolve_to_the_same_feature():
+    from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
+
+    mappings = {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}
+    assert mappings["skew_index"] == mappings["CBOE:SKEW"] == "skew_index"
