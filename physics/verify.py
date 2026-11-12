@@ -280,8 +280,8 @@ class MarketPhysicsVerifier:
                 )
 
         # Case 4: Copper/gold ratio should be positive
-        copper = self._get_latest_value("copper_futures_close", as_of_date)
-        gold = self._get_latest_value("gold_futures_close", as_of_date)
+        copper = self._get_latest_value("copper", as_of_date)
+        gold = self._get_latest_value("gold_full", as_of_date)
         if copper is not None and gold is not None:
             cases_tested += 1
             if copper > 0 and gold > 0:
@@ -293,7 +293,7 @@ class MarketPhysicsVerifier:
                 )
 
         # Case 5: S&P 500 should be positive
-        sp500 = self._get_latest_value("sp500_close", as_of_date)
+        sp500 = self._get_latest_value("sp500_full", as_of_date)
         if sp500 is not None:
             cases_tested += 1
             if sp500 > 0:

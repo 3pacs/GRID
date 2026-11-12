@@ -126,6 +126,15 @@ def test_intelligence_loop_registers_expected_jobs(monkeypatch):
         "at": "06:50",
         "func": "_sentiment_outcomes_daily",
     }
+    # 2026-11-11: compute_derived_features.py had no scheduled caller and
+    # its outputs froze in March 2026.
+    assert jobs_by_name["_derived_features_daily"] == {
+        "interval": 1,
+        "unit": "day",
+        "day": None,
+        "at": "07:30",
+        "func": "_derived_features_daily",
+    }
 
 
 def test_wave3_held_writer_jobs_default_off(monkeypatch):
@@ -624,3 +633,62 @@ def test_scheduled_callbacks_write_pull_log(
     )
     fake_schedule.callbacks[callback]()
     assert _pull_log_rows(engine) == [(puller, sid, "SUCCESS", 2, None)]
+
+
+def test_derived_features_daily_runs_builder_and_reports(monkeypatch):
+    from scripts import compute_derived_features as cdf
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    calls: list[bool] = []
+
+    def _fake_run(family_filter=None, dry_run=False):
+        calls.append(dry_run)
+        return {"features": 15, "inserted": 12, "skipped": 0, "stale": []}
+
+    monkeypatch.setattr(cdf, "run", _fake_run)
+    infos: list[str] = []
+    monkeypatch.setattr(scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw)))
+
+    fake_schedule.callbacks["_derived_features_daily"]()
+
+    assert calls == [False]
+    assert infos[-1] == (
+        "derived features daily: features=15 inserted=12 skipped=0 stale=none"
+    )
+
+
+def test_derived_features_daily_warns_on_stale_outputs(monkeypatch):
+    from scripts import compute_derived_features as cdf
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    monkeypatch.setattr(
+        cdf, "run",
+        lambda family_filter=None, dry_run=False: {
+            "features": 15, "inserted": 3, "skipped": 0, "stale": ["real_ffr"],
+        },
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw)))
+
+    fake_schedule.callbacks["_derived_features_daily"]()
+
+    assert warnings == [
+        "derived features daily: features=15 inserted=3 skipped=0 stale=real_ffr"
+    ]
+
+
+def test_derived_features_daily_logs_failure_as_warning(monkeypatch):
+    from scripts import compute_derived_features as cdf
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+
+    def _boom(family_filter=None, dry_run=False):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(cdf, "run", _boom)
+    warnings: list[str] = []
+    monkeypatch.setattr(scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw)))
+
+    fake_schedule.callbacks["_derived_features_daily"]()
+
+    assert warnings == ["derived features daily failed: db down"]

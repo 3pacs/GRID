@@ -290,41 +290,36 @@ def check_gamma_regime(engine: Engine) -> GammaRegimeSnapshot:
             snapshot_date=datetime.now(timezone.utc).date().isoformat(),
         )
 
+    # The latest *completed* SPY capture, not today's UTC date: Hermes runs
+    # this at 06:00-06:40 UTC and the day's first capture completes ~14:40
+    # UTC, so the date-default read found no chain on every run and every
+    # briefing since 2026-09-25 was UNKNOWN (37 of 46 in 120 days); four of
+    # the five waterfall conditions need the regime, so no alert could fire.
+    # SPY is the only ticker with a verified spot receipt, and the market
+    # proxy the briefing reports.
     try:
         dge = DealerGammaEngine(db_engine=engine)
-        summary = dge.get_market_gex_summary()
+        spy = dge.compute_latest_completed_gex_profile("SPY")
     except Exception as exc:
-        log.warning("get_market_gex_summary failed: {e}", e=str(exc))
-        summary = {"error": str(exc)}
+        log.warning("compute_latest_completed_gex_profile failed: {e}", e=str(exc))
+        spy = {"error": str(exc)}
 
-    if "error" in summary or not summary.get("tickers"):
+    if "error" in spy or not spy.get("spot") or not spy.get("regime"):
         return GammaRegimeSnapshot(
             regime="UNKNOWN", spot=0.0, gamma_flip=None,
             put_wall=None, call_wall=None, aggregate_gex=0.0,
             snapshot_date=datetime.now(timezone.utc).date().isoformat(),
         )
 
-    spy = next((t for t in summary["tickers"] if t["ticker"] == "SPY"), None)
-    spot = 0.0
-    if spy and spy.get("spot"):
-        spot = float(spy["spot"])
-    elif summary.get("spy_spot"):
-        spot = float(summary["spy_spot"])
-    elif spy:
-        # Best-effort fallback for older dealer_gamma summaries.
-        pw = summary.get("spy_put_wall") or 0.0
-        cw = summary.get("spy_call_wall") or 0.0
-        if pw and cw:
-            spot = (pw + cw) / 2.0
-
     return GammaRegimeSnapshot(
-        regime=summary.get("market_regime", "UNKNOWN"),
-        spot=spot,
-        gamma_flip=summary.get("spy_gamma_flip"),
-        put_wall=summary.get("spy_put_wall"),
-        call_wall=summary.get("spy_call_wall"),
-        aggregate_gex=float(summary.get("aggregate_gex", 0.0)),
-        snapshot_date=summary.get("snap_date", datetime.now(timezone.utc).date().isoformat()),
+        regime=spy["regime"],
+        spot=float(spy["spot"]),
+        gamma_flip=spy.get("gamma_flip"),
+        put_wall=spy.get("put_wall"),
+        call_wall=spy.get("call_wall"),
+        aggregate_gex=float(spy.get("gex_aggregate") or 0.0),
+        snapshot_date=spy.get("chain_snap_date") or spy.get("snap_date")
+        or datetime.now(timezone.utc).date().isoformat(),
     )
 
 

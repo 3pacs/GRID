@@ -3,7 +3,13 @@
 
 Reads resolved_series inputs, applies transformations (ratios, spreads, rolling
 changes, slopes, momentum), and inserts results back into resolved_series using
-the bulk ON CONFLICT DO NOTHING pattern.
+the bulk ON CONFLICT DO NOTHING pattern. Only new or changed rows are written.
+
+Runs daily from intelligence/scheduler.py (``_derived_features_daily``). It had
+no scheduled caller until 2026-11-11; the last manual run was ~2026-03-24, and
+every feature only this script writes froze there (sp500_mom_*, sp500_adline*,
+hy_spread_*, copper_gold_*, vix_3m_ratio, dxy_3m_chg, real_ffr, ...). Two inputs
+had also died: ``sp500`` (now ``sp500_full``) and ``gold`` (now ``gold_full``).
 
 Usage:
   python scripts/compute_derived_features.py                 # compute all
@@ -16,7 +22,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +60,13 @@ COMPUTED_SOURCE_ID = 183  # source_catalog.name = 'computed'
 #   "cumsum_ratio"    — cumulative sum ratio for adline
 #   "slope_of"        — slope of another computed series
 
+# Not computed here (removed 2026-11-11) because a better live writer owns them
+# and a daily run would shadow it with a cruder proxy as a newer vintage:
+#   FRED-sourced: treasury_bill_spread, rrp_as_pct_of_peak, sofr_spread_to_ffr,
+#     yc_5s30s_spread, yc_butterfly_2_5_10, yc_term_premium (ACM estimate)
+#   Comtrade: trade_volume_yoy, us_china_trade_balance
+# run() also refuses any target another source has written within
+# STALE_OUTPUT_DAYS (_owned_elsewhere).
 COMPUTATIONS = [
     # ── FX ────────────────────────────────────────────────────────────────
     # ── CPI ─────────────────────────────────────────────────────────────
@@ -83,64 +96,18 @@ COMPUTATIONS = [
         "params": {},
         "family": "rates",
     },
-    {
-        "name": "sofr_spread_to_ffr",
-        "inputs": ["sofr", "fed_funds_rate"],
-        "op": "spread",
-        "params": {},
-        "family": "rates",
-    },
-    {
-        "name": "treasury_bill_spread",
-        "inputs": ["yld_curve_3m10y"],
-        "op": "negate",
-        "params": {},
-        "family": "rates",
-        "note": "3m10y spread is 10y-3m; negate for 3m-FFR proxy",
-    },
-    {
-        "name": "rrp_as_pct_of_peak",
-        "inputs": ["reverse_repo"],
-        "op": "rolling_max_pct",
-        "params": {},
-        "family": "rates",
-    },
-    {
-        "name": "yc_5s30s_spread",
-        "inputs": ["yc_30y", "yc_5y"],
-        "op": "spread",
-        "params": {},
-        "family": "rates",
-        "note": "Long-end steepness: 30y - 5y",
-    },
-    {
-        "name": "yc_butterfly_2_5_10",
-        "inputs": ["yc_2y", "treasury_10y", "yc_5y"],
-        "op": "butterfly",
-        "params": {},
-        "family": "rates",
-        "note": "Butterfly: (2y + 10y)/2 - 5y — measures belly richness",
-    },
-    {
-        "name": "yc_term_premium",
-        "inputs": ["treasury_10y", "yc_2y"],
-        "op": "term_premium",
-        "params": {"window": 252},
-        "family": "rates",
-        "note": "Term premium proxy: (10y - 2y) - rolling mean of 2y changes",
-    },
 
     # ── Breadth ───────────────────────────────────────────────────────────
     {
         "name": "sp500_mom_3m",
-        "inputs": ["sp500"],
+        "inputs": ["sp500_full"],
         "op": "pct_change",
         "params": {"periods": 63},
         "family": "breadth",
     },
     {
         "name": "sp500_mom_12_1",
-        "inputs": ["sp500"],
+        "inputs": ["sp500_full"],
         "op": "momentum_12_1",
         "params": {},
         "family": "breadth",
@@ -148,7 +115,7 @@ COMPUTATIONS = [
     },
     {
         "name": "sp500_adline",
-        "inputs": ["sp500"],
+        "inputs": ["sp500_full"],
         "op": "adline_proxy",
         "params": {},
         "family": "breadth",
@@ -156,14 +123,14 @@ COMPUTATIONS = [
     },
     {
         "name": "sp500_adline_slope",
-        "inputs": ["sp500"],
+        "inputs": ["sp500_full"],
         "op": "adline_slope",
         "params": {"window": 63},
         "family": "breadth",
     },
     {
         "name": "sp500_pct_above_200ma",
-        "inputs": ["sp500"],
+        "inputs": ["sp500_full"],
         "op": "pct_above_ma",
         "params": {"window": 200},
         "family": "breadth",
@@ -188,14 +155,14 @@ COMPUTATIONS = [
     },
     {
         "name": "copper_gold_ratio",
-        "inputs": ["copper", "gold"],
+        "inputs": ["copper", "gold_full"],
         "op": "ratio",
         "params": {},
         "family": "commodity",
     },
     {
         "name": "copper_gold_slope",
-        "inputs": ["copper", "gold"],
+        "inputs": ["copper", "gold_full"],
         "op": "ratio_slope",
         "params": {"window": 63},
         "family": "commodity",
@@ -214,23 +181,12 @@ COMPUTATIONS = [
     },
 
     # ── Macro ─────────────────────────────────────────────────────────────
-    {
-        "name": "conf_board_lei_slope",
-        "inputs": ["conf_board_lei"],
-        "op": "slope",
-        "params": {"window": 63},
-        "family": "macro",
-    },
+    # conf_board_lei_slope removed 2026-11-11: its input conf_board_lei is
+    # deprecated and last observed 2020-02-01.
 
     # ── Systemic ────────���────────────────────────────────────────────────
-    {
-        "name": "systemic_stress_composite",
-        "inputs": ["hy_oas_spread", "vix_spot", "ted_spread"],
-        "op": "zscore_weighted_avg",
-        "params": {"window": 252, "weights": [0.4, 0.35, 0.25]},
-        "family": "systemic",
-        "note": "Weighted average of HY spread z-score + VIX z-score + TED spread z-score",
-    },
+    # systemic_stress_composite removed 2026-11-11: the target is deprecated
+    # in feature_registry and ted_spread (deprecated) ended 2022-01-21.
     {
         "name": "systemic_credit_stress",
         "inputs": ["hy_oas_spread"],
@@ -249,23 +205,6 @@ COMPUTATIONS = [
     },
 
     # ── Trade ──────────��─────────────────────────────────────────────────
-    {
-        "name": "trade_volume_yoy",
-        "inputs": [],
-        "raw_inputs": [("YF:EEM:volume", "eem_volume")],
-        "op": "raw_yoy_pct_change",
-        "params": {"periods": 252},
-        "family": "trade",
-        "note": "EEM ETF volume YoY change as proxy for global trade activity",
-    },
-    {
-        "name": "us_china_trade_balance",
-        "inputs": ["trade_balance"],
-        "op": "alias",
-        "params": {},
-        "family": "trade",
-        "note": "US trade balance (BOPGTB) as proxy — covers China bilateral component",
-    },
 ]
 
 
@@ -635,6 +574,57 @@ OPS = {
 # ── Bulk insert into resolved_series ─────────────────────────────────────────
 
 BATCH_SIZE = 5000
+# A computed series whose newest value is older than this is logged as stale.
+# Monthly inputs (cpi_index) land ~6 weeks after the month they describe.
+STALE_OUTPUT_DAYS = 45
+# Relative tolerance below which a recomputed value counts as unchanged.
+CHANGE_RTOL = 1e-9
+
+
+def changed_rows(computed: pd.Series, existing: pd.Series) -> pd.Series:
+    """The part of ``computed`` that is new or differs from ``existing``.
+
+    ``existing`` is the target feature as PIT's LATEST_AS_OF reads it now, so
+    a row is skipped only when every reader already sees the same value.
+    """
+    if existing.empty:
+        return computed
+    prev = existing.reindex(computed.index)
+    same = prev.notna() & np.isclose(
+        computed.to_numpy(dtype=float), prev.to_numpy(dtype=float),
+        rtol=CHANGE_RTOL, atol=0.0,
+    )
+    return computed[~same]
+
+
+def _owned_elsewhere(engine, feature_id: int, run_date: date) -> str | None:
+    """Name of another source that wrote ``feature_id`` recently, else None.
+
+    A target another live writer keeps fresh (FRED, Comtrade, ...) is not
+    ours to write: a computed row would become the newest vintage and every
+    LATEST_AS_OF reader would switch to it. "Recently" is STALE_OUTPUT_DAYS
+    of ``vintage_date``; a writer silent for longer is dead, and this job may
+    take the target over (cpi_yoy's FRED rows stopped 2026-03-24).
+    """
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT COALESCE(sc.name, rs.source_priority_used::text)
+                FROM resolved_series rs
+                LEFT JOIN source_catalog sc ON sc.id = rs.source_priority_used
+                WHERE rs.feature_id = :fid
+                  AND rs.source_priority_used <> :computed
+                  AND rs.vintage_date >= :since
+                ORDER BY rs.vintage_date DESC
+                LIMIT 1
+            """),
+            {
+                "fid": feature_id,
+                "computed": COMPUTED_SOURCE_ID,
+                "since": run_date - timedelta(days=STALE_OUTPUT_DAYS),
+            },
+        ).fetchone()
+    return row[0] if row else None
 
 
 def insert_computed(
@@ -705,7 +695,7 @@ def insert_computed(
 
 # ── Main pipeline ────────────────────────────────────────────────────────────
 
-def run(family_filter: str | None = None, dry_run: bool = False):
+def run(family_filter: str | None = None, dry_run: bool = False) -> dict:
     engine = get_engine()
 
     # Refuse to run at all if resolved_series_retractions is missing: every
@@ -719,7 +709,7 @@ def run(family_filter: str | None = None, dry_run: bool = False):
             "compute_derived_features: resolved_series_retractions is "
             "missing (PR #683 not deployed here) — refusing to run"
         )
-        return
+        return {"features": 0, "inserted": 0, "skipped": 0, "stale": [], "refused": True}
 
     run_date = datetime.now(timezone.utc).date()
     pit = PITStore(engine)
@@ -728,6 +718,7 @@ def run(family_filter: str | None = None, dry_run: bool = False):
     total_inserted = 0
     total_features = 0
     total_skipped = 0
+    stale: list[str] = []
 
     for comp in COMPUTATIONS:
         name = comp["name"]
@@ -742,6 +733,14 @@ def run(family_filter: str | None = None, dry_run: bool = False):
         fid = get_feature_id(engine, name)
         if fid is None:
             log.warning("  Feature '{name}' not in feature_registry — skipping", name=name)
+            total_skipped += 1
+            continue
+        owner = _owned_elsewhere(engine, fid, run_date)
+        if owner is not None:
+            log.warning(
+                "  {name} is kept fresh by source {owner} — not writing over it",
+                name=name, owner=owner,
+            )
             total_skipped += 1
             continue
 
@@ -806,6 +805,23 @@ def run(family_filter: str | None = None, dry_run: bool = False):
         log.info("  Computed {n} values [{mn} → {mx}]",
                  n=len(result), mn=result.index.min().date(), mx=result.index.max().date())
 
+        lag = (run_date - result.index.max().date()).days
+        if lag > STALE_OUTPUT_DAYS:
+            # The 2026-03 failure mode: an input stops updating and every
+            # derived value downstream freezes without a single error.
+            log.warning(
+                "  {name}: newest computed value is {lag}d old ({mx}) — an input "
+                "has stopped updating",
+                name=name, lag=lag, mx=result.index.max().date(),
+            )
+            stale.append(name)
+
+        # Only obs_dates that are new, or whose value changed, get a new
+        # vintage. Rewriting the whole history every run would add one full
+        # copy of every series per day without changing what any PIT read sees.
+        existing = load_resolved(engine, name, run_date, pit)
+        result = changed_rows(result, existing)
+
         # Insert
         n_ins = insert_computed(engine, fid, result, run_date, dry_run=dry_run)
         log.info("  Inserted {n} rows for {name} (feature_id={fid})", n=n_ins, name=name, fid=fid)
@@ -832,6 +848,13 @@ def run(family_filter: str | None = None, dry_run: bool = False):
                 ORDER BY fr.family, fr.name
             """)).fetchall()
         log.info("Remaining features with zero data: {n}", n=len(gaps))
+
+    return {
+        "features": total_features,
+        "inserted": total_inserted,
+        "skipped": total_skipped,
+        "stale": stale,
+    }
 
 
 def main():

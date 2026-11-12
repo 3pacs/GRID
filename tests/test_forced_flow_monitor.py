@@ -330,65 +330,60 @@ def test_check_gamma_regime_handles_missing_import(mock_engine):
 
 
 @pytest.mark.unit
-def test_check_gamma_regime_uses_dealer_gamma_engine_contract(mock_engine):
-    """Forced-flow monitor should call DealerGammaEngine with its real constructor."""
-    summary = {
-        "snap_date": "2026-04-14",
-        "aggregate_gex": -123_000_000,
-        "market_regime": "SHORT_GAMMA",
-        "spy_gamma_flip": 501.0,
-        "spy_put_wall": 490.0,
-        "spy_call_wall": 512.0,
-        "tickers": [{
-            "ticker": "SPY",
-            "spot": 500.0,
-            "gex": -123_000_000,
-            "regime": "SHORT_GAMMA",
-            "gamma_flip": 501.0,
-            "vanna": 0,
-            "charm": 0,
-        }],
+def test_check_gamma_regime_reads_latest_completed_spy_capture(mock_engine):
+    """The monitor runs ~06:00 UTC, before the day's capture exists, so it
+    must read the latest completed SPY capture (not today's UTC date)."""
+    profile = {
+        "ticker": "SPY",
+        "snap_date": "2026-11-11",
+        "chain_snap_date": "2026-11-10",
+        "spot": 500.0,
+        "regime": "SHORT_GAMMA",
+        "gamma_flip": 501.0,
+        "put_wall": 490.0,
+        "call_wall": 512.0,
+        "gex_aggregate": -123_000_000,
+        "chain_age_seconds": 55_000,
     }
 
     with patch("physics.dealer_gamma.DealerGammaEngine") as engine_cls:
-        engine_cls.return_value.get_market_gex_summary.return_value = summary
+        engine_cls.return_value.compute_latest_completed_gex_profile.return_value = profile
         result = check_gamma_regime(mock_engine)
 
     engine_cls.assert_called_once_with(db_engine=mock_engine)
+    engine_cls.return_value.compute_latest_completed_gex_profile.assert_called_once_with("SPY")
+    engine_cls.return_value.get_market_gex_summary.assert_not_called()
     assert result.regime == "SHORT_GAMMA"
     assert result.spot == 500.0
     assert result.gamma_flip == 501.0
+    assert result.put_wall == 490.0
+    assert result.call_wall == 512.0
+    assert result.aggregate_gex == -123_000_000
+    assert result.snapshot_date == "2026-11-10"
 
 
 @pytest.mark.unit
-def test_check_gamma_regime_unknown_when_spy_spot_unavailable(mock_engine):
-    """get_market_gex_summary reporting no usable SPY row (the shape
-    physics.dealer_gamma now returns when no measured spot exists) must map
-    to regime UNKNOWN — never a fabricated NEUTRAL/0 regime."""
-    summary = {
-        "snap_date": "2026-09-24",
-        "total_tickers": 0,
-        "aggregate_gex": 0,
-        "aggregate_vanna": 0,
-        "aggregate_charm": 0,
-        "long_gamma_count": 0,
-        "short_gamma_count": 0,
-        "market_regime": "UNKNOWN",
-        "spy_spot": None,
-        "spy_gamma_flip": None,
-        "spy_put_wall": None,
-        "spy_call_wall": None,
-        "spy_gex": None,
-        "tickers": [],
-    }
+def test_check_gamma_regime_unknown_when_no_completed_capture(mock_engine):
+    """No admissible capture (or no verified SPY spot) maps to UNKNOWN --
+    never a fabricated NEUTRAL/0 regime."""
     with patch("physics.dealer_gamma.DealerGammaEngine") as engine_cls:
-        engine_cls.return_value.get_market_gex_summary.return_value = summary
+        engine_cls.return_value.compute_latest_completed_gex_profile.return_value = {
+            "ticker": "SPY", "error": "no completed capture",
+        }
         result = check_gamma_regime(mock_engine)
 
     assert result.regime == "UNKNOWN"
     assert result.gamma_flip is None
     assert result.put_wall is None
     assert result.call_wall is None
+
+
+@pytest.mark.unit
+def test_check_gamma_regime_unknown_when_profile_read_raises(mock_engine):
+    with patch("physics.dealer_gamma.DealerGammaEngine") as engine_cls:
+        engine_cls.return_value.compute_latest_completed_gex_profile.side_effect = RuntimeError("db")
+        result = check_gamma_regime(mock_engine)
+    assert result.regime == "UNKNOWN"
 
 
 @pytest.mark.unit

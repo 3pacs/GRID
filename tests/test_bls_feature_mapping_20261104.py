@@ -68,5 +68,8 @@ def test_derived_spreads_read_the_live_names() -> None:
     from pathlib import Path
 
     src = Path(__file__).resolve().parents[1].joinpath("scripts/compute_derived_features.py").read_text()
-    assert '"yc_10y"' not in src and '"treasury_10y"' in src and '"yc_2y"' in src
+    # The builder must never read the dead yc_10y. Its curve features
+    # (yc_term_premium, yc_butterfly_2_5_10) were removed 2026-11-11 because a
+    # live FRED writer owns them, so it no longer reads treasury_10y/yc_2y.
+    assert '"yc_10y"' not in src
     ast.parse(src)

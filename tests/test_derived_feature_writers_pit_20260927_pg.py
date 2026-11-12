@@ -180,15 +180,17 @@ def _feature(engine: Engine, name: str, family: str = "commodity") -> int:
         ).scalar_one()
 
 
-def _resolved(engine: Engine, fid: int, obs: date, vintage: date, value: float) -> None:
+def _resolved(
+    engine: Engine, fid: int, obs: date, vintage: date, value: float, source: int = 1,
+) -> None:
     with engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO resolved_series "
                 "(feature_id, obs_date, release_date, vintage_date, value, source_priority_used) "
-                "VALUES (:f, :o, :v, :v, :val, 1)"
+                "VALUES (:f, :o, :v, :v, :val, :src)"
             ),
-            {"f": fid, "o": obs, "v": vintage, "val": value},
+            {"f": fid, "o": obs, "v": vintage, "val": value, "src": source},
         )
 
 
@@ -218,10 +220,10 @@ def _count_resolved(engine: Engine, fid: int) -> int:
 
 def _seed_copper_gold_resolved(engine: Engine) -> tuple[int, int, int, int]:
     """feature_registry + resolved_series for compute_derived_features.py's
-    "copper"/"gold" inputs and its "copper_gold_ratio"/"copper_gold_slope"
+    "copper"/"gold_full" inputs and its "copper_gold_ratio"/"copper_gold_slope"
     targets. copper carries a clean V1 and a later, contaminated V2."""
     copper = _feature(engine, "copper")
-    gold = _feature(engine, "gold")
+    gold = _feature(engine, "gold_full")
     ratio_fid = _feature(engine, "copper_gold_ratio")
     slope_fid = _feature(engine, "copper_gold_slope")
     _resolved(engine, copper, D_OBS, V1, 4.0)     # clean: ratio should use this
@@ -313,8 +315,9 @@ def test_cdf_never_overwrites_an_existing_vintage(scratch, monkeypatch):
     monkeypatch.setattr(cdf, "get_engine", lambda: scratch)
     today = _db_today(scratch)
     # A row already on file for this exact (feature, obs_date, vintage=today)
-    # key, as if an earlier run today (or the resolver) already wrote it.
-    _resolved(scratch, ratio_fid, D_OBS, today, -12345.0)
+    # key, as if an earlier run today already wrote it. Computed source, so
+    # the "owned elsewhere" guard does not skip the target before the insert.
+    _resolved(scratch, ratio_fid, D_OBS, today, -12345.0, source=cdf.COMPUTED_SOURCE_ID)
 
     cdf.run(family_filter="commodity", dry_run=False)
 
@@ -325,6 +328,48 @@ def test_cdf_never_overwrites_an_existing_vintage(scratch, monkeypatch):
         ).fetchall()
     assert len(rows) == 1
     assert rows[0][0] == pytest.approx(-12345.0)  # untouched, not overwritten
+
+
+def test_cdf_second_run_same_day_writes_nothing(scratch, monkeypatch):
+    """Only new or changed rows are written; an unchanged rerun is a no-op."""
+    _install_retractions_table(scratch)
+    copper, gold, ratio_fid, slope_fid = _seed_copper_gold_resolved(scratch)
+    monkeypatch.setattr(cdf, "get_engine", lambda: scratch)
+
+    first = cdf.run(family_filter="commodity", dry_run=False)
+    second = cdf.run(family_filter="commodity", dry_run=False)
+
+    assert first["inserted"] >= 1
+    assert second["inserted"] == 0
+    assert _count_resolved(scratch, ratio_fid) == 1
+
+
+def test_cdf_does_not_write_over_a_target_another_source_keeps_fresh(scratch, monkeypatch):
+    """A target with a recent non-computed vintage belongs to that writer."""
+    _install_retractions_table(scratch)
+    copper, gold, ratio_fid, slope_fid = _seed_copper_gold_resolved(scratch)
+    today = _db_today(scratch)
+    _resolved(scratch, ratio_fid, D_OBS, today - timedelta(days=1), 7.0, source=1)
+    monkeypatch.setattr(cdf, "get_engine", lambda: scratch)
+
+    summary = cdf.run(family_filter="commodity", dry_run=False)
+
+    assert _count_resolved(scratch, ratio_fid) == 1  # only the other writer's row
+    assert summary["skipped"] >= 1
+
+
+def test_cdf_takes_over_a_target_whose_other_writer_went_silent(scratch, monkeypatch):
+    """cpi_yoy's FRED rows stopped 2026-03-24: a writer silent for longer than
+    STALE_OUTPUT_DAYS no longer blocks the builder."""
+    _install_retractions_table(scratch)
+    copper, gold, ratio_fid, slope_fid = _seed_copper_gold_resolved(scratch)
+    old = _db_today(scratch) - timedelta(days=cdf.STALE_OUTPUT_DAYS + 10)
+    _resolved(scratch, ratio_fid, D_OBS, old, 7.0, source=1)
+    monkeypatch.setattr(cdf, "get_engine", lambda: scratch)
+
+    cdf.run(family_filter="commodity", dry_run=False)
+
+    assert _count_resolved(scratch, ratio_fid) == 2  # old row kept, new vintage added
 
 
 # ---------------------------------------------------------------------------

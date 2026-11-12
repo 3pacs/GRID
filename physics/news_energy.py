@@ -31,8 +31,8 @@ from store.pit import PITStore
 
 # Key market features to cross-correlate with news energy
 _MARKET_FEATURES = [
-    "sp500",
-    "vix",
+    "sp500_full",  # sp500 stopped updating 2026-03-24
+    "vix_spot",    # vix stopped updating 2026-04-02
     "treasury_10y",
     "yc_2y",  # FRED DGS2; treasury_2y stopped updating 2026-03
     "dxy_index",
