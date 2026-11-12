@@ -34,9 +34,12 @@ after the first night's ten leads; every lead records it in its evidence):
    of buys already counted, so they cast no vote (amendment registered
    2026-11-08 before the first v2 run).
 
-Every observation carries its citation (table and row key) and was recorded
-by ``as_of`` (``created_at <= as_of``): rows dated in the future or written
-later are not evidence yet.
+The registered v2 reader bounds raw rows by ``created_at <= as_of``. This
+excludes later inserts, but does NOT certify the historical availability of
+an overwritten payload. Do not use v2 as a qualified historical event panel.
+The explicit research-only ``collect_people_event_evidence`` candidate below
+withholds historical admission until a post-commit receipt contract exists;
+it is not wired into v2.
 
 Every investigation ends in a declared outcome (``investigate_intersection_lead``):
 
@@ -63,6 +66,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from itertools import pairwise
@@ -347,6 +351,186 @@ def find_intersections(observations: list[Observation], window_end: date,
                                           dissent=dissent, split=split, context=context))
     leads.sort(key=lambda lead: (-lead.priority, lead.ticker))
     return leads
+
+
+# ── Foundation evidence candidate (NOT the registered v2 lead path) ─────────
+
+PEOPLE_EVIDENCE_CONTRACT = "people-event-evidence-v1-20261111"
+PROVEN_PEOPLE_RECEIPT_CLOCK = "people-events-post-commit-receipt-v1"
+_EVIDENCE_CHANNELS = {"form4": "insider", "congress": "congress", "gov_contract": "gov_contract"}
+_EVIDENCE_CLOCK_BASES = frozenset({"first_seen"})
+
+
+@dataclass(frozen=True)
+class PeopleEvidenceBatch:
+    """Research-only evidence receipt, deliberately not an ``Observation``/lead.
+
+    No actor-count, echo/independence, historical coverage or profitability claim is
+    implied by admission. The canonical store owns payload versioning and its
+    receipt clocks; this reader cannot repair missing versions retroactively.
+    """
+
+    as_of: datetime
+    records: tuple[dict[str, Any], ...]
+    exclusions: dict[str, int]
+    contract: str = PEOPLE_EVIDENCE_CONTRACT
+    status: str = "RESEARCH_ONLY_NOT_ACTIVATED"
+
+
+def _evidence_clock(value: Any) -> datetime:
+    # A naive timestamp must not silently inherit the machine's timezone.
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise ValueError("evidence clocks must be timezone-aware datetimes")
+    return value.astimezone(timezone.utc)
+
+
+def qualify_people_event_versions(versions: list[dict[str, Any]], *,
+                                  as_of: datetime) -> PeopleEvidenceBatch:
+    """Qualify canonical version rows for an explicit decision, without I/O.
+
+    Input is a caller-supplied canonical version snapshot with an explicit
+    post-commit receipt identity/hash, NOT any current raw/public-clock store
+    reader. The current store has no producer of this receipt contract. This
+    function checks structural consistency, not receipt authenticity; only
+    synthetic fixtures exercise admission until a producer is qualified.
+    Reuse the canonical visibility predicate, retain exact version IDs/hashes,
+    and use system-receipt recency ``(as_of - WINDOW_DAYS, as_of]`` rather than
+    pretending a transaction date is an availability date. Corrections and
+    retractions take effect at their known boundary, including equality.
+
+    This is a foundation candidate only. Scheduled construction v2, all frozen
+    trials, baselines, journals and outcomes remain unchanged. A separately
+    registered construction is required before these records can make leads.
+    """
+    import pandas as pd
+
+    from intelligence.people_events_pipeline.plan import visible_at
+
+    as_of = _evidence_clock(as_of)
+    start = as_of - timedelta(days=WINDOW_DAYS)
+    excluded: Counter[str] = Counter()
+    # Same-ID integrity is distinct from two visible versions of one act.
+    # Check it before visibility: a contradictory copy cannot hide behind a
+    # bad clock or an end marker. Newly appended future IDs remain irrelevant.
+    version_fields = ("id", "channel", "dedup_key", "content_hash", "event_time", "known_at",
+                      "known_at_basis", "entity_ticker", "direction", "transaction_code",
+                      "superseded_at", "retracted_at", "clock_contract", "end_history_valid",
+                      "receipt_id", "receipt_sha256")
+    fingerprints: dict[Any, set[str]] = {}
+    for row in versions:
+        fingerprint = json.dumps({k: row.get(k) for k in version_fields}, sort_keys=True, default=str)
+        fingerprints.setdefault(row.get("id"), set()).add(fingerprint)
+    invalid_acts = set()
+    clocked = []
+    for row in versions:
+        if len(fingerprints[row.get("id")]) > 1:
+            excluded["conflicting_version_identity"] += 1
+            invalid_acts.add((row.get("channel"), row.get("dedup_key")))
+            continue
+        try:
+            known = _evidence_clock(row.get("known_at"))
+            if known > as_of:
+                excluded["not_yet_known"] += 1
+                continue
+            ends = {k: _evidence_clock(row[k]) if row.get(k) is not None else None
+                    for k in ("superseded_at", "retracted_at")}
+            if any(end is not None and end < known for end in ends.values()):
+                raise ValueError("end precedes receipt")
+        except (ValueError, TypeError, OverflowError):
+            excluded["invalid_clock"] += 1
+            invalid_acts.add((row.get("channel"), row.get("dedup_key")))
+            continue
+        if row.get("clock_contract") != PROVEN_PEOPLE_RECEIPT_CLOCK or row.get("end_history_valid") is not True:
+            excluded["unqualified_receipt_history"] += 1
+            invalid_acts.add((row.get("channel"), row.get("dedup_key")))
+            continue
+        clocked.append({**row, "known_at": known, **ends})
+    clean = [row for row in clocked if (row.get("channel"), row.get("dedup_key")) not in invalid_acts]
+    excluded["conflicting_act_history"] += len(clocked) - len(clean)
+    clocked = clean
+    visible = visible_at(pd.DataFrame(clocked, dtype=object), pd.Timestamp(as_of))
+    excluded["superseded_or_retracted"] += len(clocked) - len(visible)
+    visible_rows = visible.to_dict("records")
+    # Check consistency BEFORE eligibility filters. A corrupt second version
+    # must not disappear just because its direction/clock basis is ineligible.
+    acts: dict[tuple[Any, Any], set[int]] = {}
+    for row in visible_rows:
+        acts.setdefault((row.get("channel"), row.get("dedup_key")), set()).add(row.get("id"))
+    admitted = []
+    for row in visible_rows:
+        if len(acts[(row.get("channel"), row.get("dedup_key"))]) > 1:
+            excluded["conflicting_visible_version"] += 1
+            continue
+        channel = row.get("channel")
+        if channel not in _EVIDENCE_CHANNELS:
+            excluded["unsupported_or_aggregate_channel"] += 1
+            continue
+        if row.get("known_at_basis") not in _EVIDENCE_CLOCK_BASES:
+            excluded["unqualified_clock_basis"] += 1
+            continue
+        known = _evidence_clock(row["known_at"])
+        if known <= start:
+            excluded["outside_receipt_window"] += 1
+            continue
+        try:
+            event_time = _evidence_clock(row.get("event_time"))
+            if event_time > known:
+                raise ValueError("act is dated after its availability")
+        except (ValueError, TypeError, OverflowError):
+            excluded["invalid_event_clock"] += 1
+            continue
+        ticker = row.get("entity_ticker")
+        if not isinstance(ticker, str) or not is_testable_ticker(ticker) or is_placeholder_ticker(ticker):
+            excluded["unqualified_ticker"] += 1
+            continue
+        direction, code = row.get("direction"), row.get("transaction_code")
+        if ((channel == "form4" and (code, direction) not in (("P", "buy"), ("S", "sell")))
+                or (channel == "congress" and direction not in ("buy", "sell"))
+                or (channel == "gov_contract" and direction != "award")):
+            excluded["not_qualified_directional_act"] += 1
+            continue
+        rid, digest = row.get("id"), row.get("content_hash")
+        identity = (row.get("dedup_key"), row.get("receipt_id"))
+        if (isinstance(rid, bool) or not isinstance(rid, int) or rid <= 0
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(row.get("receipt_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", row["receipt_sha256"])
+                or not all(isinstance(v, str) and v.strip() for v in identity)):
+            excluded["missing_version_identity"] += 1
+            continue
+        admitted.append({
+            "table": "people_events", "id": rid, "content_hash": digest,
+            "channel": channel, "family": _EVIDENCE_CHANNELS[channel],
+            "dedup_key": identity[0], "clock_contract": PROVEN_PEOPLE_RECEIPT_CLOCK,
+            "receipt_id": identity[1], "receipt_sha256": row["receipt_sha256"],
+            "ticker": ticker, "direction": direction, "transaction_code": code,
+            "event_time": event_time.isoformat(), "known_at": known.isoformat(),
+            "known_at_basis": row["known_at_basis"],
+        })
+    # Repeated copies of exactly the same canonical version remain one act.
+    records = list({record["id"]: record for record in admitted}.values())
+    excluded["duplicate_version"] += len(admitted) - len(records)
+    records.sort(key=lambda r: (r["known_at"], r["id"]))
+    return PeopleEvidenceBatch(as_of, tuple(records), {k: v for k, v in sorted(excluded.items()) if v})
+
+
+def collect_people_event_evidence(engine: Engine, *, entity_ticker: str,
+                                  as_of: datetime) -> PeopleEvidenceBatch:
+    """Fail-closed historical admission gate, with no database/provider I/O.
+
+    Canonical ``known_at`` may tighten in place, ``ingested_at`` is transaction
+    start, and revision ``recorded_at`` is pre-commit. None proves when a
+    payload became usable by a decision. A successful insertion run alone
+    cannot qualify later retractions. Until a durable post-commit capture
+    adapter is reviewed, withhold rather than relabel these clocks first_seen.
+    The scheduled v2 producer does not call this gate.
+    """
+    as_of = _evidence_clock(as_of)
+    if (not isinstance(entity_ticker, str) or not is_testable_ticker(entity_ticker)
+            or is_placeholder_ticker(entity_ticker)):
+        raise ValueError("entity_ticker must be one explicit testable ticker")
+    return PeopleEvidenceBatch(as_of, (), {"commit_visibility_unproven": 1})
+
 
 
 # ── Data access (read-only) ─────────────────────────────────────────────────

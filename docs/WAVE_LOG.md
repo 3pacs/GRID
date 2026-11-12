@@ -35,3 +35,7 @@ Append-only record of dispatched agent tasks.
 - **2026-11-10T17:54:09.564144+00:00** — task #11105 — concept: `oracle model admission` — coverage: new — files: 1
 - **2026-11-10T17:56:41.277265+00:00** — task #11106 — concept: `oracle entry price admission` — coverage: new — files: 4
 - **2026-11-10T18:07:18.367224+00:00** — task #11107 — concept: `oracle bounded forward cycle` — coverage: new — files: 1
+- **2026-11-11T11:23:40.219266+00:00** — task #1129 — concept: `sleuth` — coverage: extend — files: 0
+- **2026-11-11T11:23:41.473939+00:00** — task #1130 — concept: `forced_flow` — coverage: extend — files: 2
+
+- 2026-11-12: source-only foundation reconciliation of dc7d53a9 onto adfa50a9 preserves #1138 completed-capture reader; 380 offline targeted tests pass. No historical admission, production operation or release.

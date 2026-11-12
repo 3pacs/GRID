@@ -1,17 +1,13 @@
 """
 GRID Alerts — Waterfall Watch.
 
-Fires a premium newsletter-style email when the forced_flow_monitor detects
-two or more forced-flow conditions simultaneously tripped. Some conditions
-combine other checks, so the count is not a count of independent risks. This
-is the practical expression of the discipline from
-docs/playbooks/opex_waterfall.md: stop trading from a directional view and
-start trading from "who is about to be forced to transact, and in which
-direction".
+Renders versioned grouped rule counts separately from overlapping condition
+diagnostics. Historical briefings without that method retain their original
+raw-check presentation. Neither scale is a calibrated probability, and a
+sourced schedule is not evidence that dealer transactions occurred.
 
-The alert is intentionally loud because by the time the waterfall starts,
-the dealer is already selling into the spot — discretionary traders only
-have edge if they move before the forced seller does.
+Alert activation remains the monitor's responsibility. Its built-in calendar
+estimates cannot supply the second evidence group required by the new method.
 """
 
 from __future__ import annotations
@@ -79,6 +75,23 @@ def _check_counts(briefing: "MorningBriefing") -> tuple[int, int, int]:
     return states.count("TRIPPED"), len(states) - missing, missing
 
 
+def _uses_grouped_score(briefing: "MorningBriefing") -> bool:
+    """Only the explicitly versioned method uses the 0-2 presentation."""
+    return getattr(briefing, "score_method", None) == "grouped_rule_count_v1"
+
+
+def _grouped_count(briefing: "MorningBriefing") -> int | None:
+    """Validate the reported count without reconstructing or rescoring history."""
+    count = _number(briefing.waterfall_risk_score)
+    return int(count) if count in (0, 1, 2) else None
+
+
+def _alert_accent(briefing: "MorningBriefing") -> str:
+    if _uses_grouped_score(briefing):
+        return "red" if _grouped_count(briefing) == 2 else "amber"
+    return "red" if briefing.waterfall_risk_score >= 3 else "amber"
+
+
 def _format_event_line(event: dict[str, Any]) -> str:
     event_date = _date(event.get("event_date"))
     today = datetime.now(timezone.utc).date()
@@ -92,11 +105,15 @@ def _format_event_line(event: dict[str, Any]) -> str:
             f"{_esc(event_date or 'n/a')} ({status}{relative})")
 
 
-def _format_threshold_line(th: dict[str, Any], regime: str | None = None) -> str:
+def _format_threshold_line(
+    th: dict[str, Any], regime: str | None = None, *, grouped: bool = False,
+) -> str:
     cur, threshold = _number(th.get("current_value")), _number(th.get("threshold_value"))
     cur_str = f"{cur:.2f}" if cur is not None else "n/a"
     thr_str = f"{threshold:.2f}" if threshold is not None else "n/a"
     status = _threshold_state(th, regime)
+    if grouped and status == "NO LISTED EVENT":
+        status = "NO QUALIFIED SCHEDULE"
     if status == "MISSING" and regime == "UNKNOWN":
         cur_str = "n/a (regime inputs unavailable)"
     return (f"{status} <strong>{_esc(th.get('name'))}</strong>: {_esc(th.get('description'))} "
@@ -107,6 +124,13 @@ def _build_html_body(briefing: "MorningBriefing") -> str:
     """Summary-first briefing with supplied-check coverage and source dates."""
     regime, posture = briefing.regime, briefing.posture
     tripped, checked, missing = _check_counts(briefing)
+    grouped = _uses_grouped_score(briefing)
+    count = _grouped_count(briefing) if grouped else None
+    headline = f"{tripped}/{checked} checked conditions tripped"
+    headline_color = "#EF4444"
+    if grouped:
+        headline = f"{count}/2 evidence groups tripped" if count is not None else "Evidence-group count unavailable"
+        headline_color = "#EF4444" if count == 2 else "#F59E0B"
     today = datetime.now(timezone.utc).date()
     snapshot_date = _date(regime.snapshot_date)
     snapshot_age = (today - snapshot_date).days if snapshot_date else None
@@ -119,18 +143,32 @@ def _build_html_body(briefing: "MorningBriefing") -> str:
     briefing_note = ""
     if generated_date and generated_date < today:
         briefing_note = f" Briefing is {(today - generated_date).days} day(s) old; this is a historical snapshot."
-    summary_lines = [
-        f"{len(briefing.thresholds)} supplied conditions: {checked} checked, {missing} missing-input conditions.",
-        f"Monitor-reported risk score: {briefing.waterfall_risk_score}. "
-        "The displayed count uses the supplied checks; it is not a probability. "
-        "Compound conditions overlap with their component checks.",
-    ]
+    if grouped:
+        summary_lines = [
+            "Method: grouped_rule_count_v1. The two evidence groups are dealer positioning "
+            "and calendar catalyst; this is not independent voting or a calibrated probability.",
+            f"Raw diagnostics: {tripped}/{checked} checked conditions tripped, "
+            f"{missing} missing-input conditions; {len(briefing.thresholds)} conditions supplied. "
+            "Shared positioning checks count once; the compound check adds no group.",
+            "Built-in calendar estimates cannot activate a two-group alert. "
+            "A sourced schedule is not observed flow; calendar coverage remains incomplete.",
+            "Historical raw-condition scores use a different scale and are not directly comparable.",
+        ]
+        if count is None:
+            summary_lines.append("The reported grouped count is invalid or missing; expected an integer from 0 to 2.")
+    else:
+        summary_lines = [
+            f"{len(briefing.thresholds)} supplied conditions: {checked} checked, {missing} missing-input conditions.",
+            f"Monitor-reported risk score: {briefing.waterfall_risk_score}. "
+            "The displayed count uses the supplied checks; it is not a probability. "
+            "Compound conditions overlap with their component checks.",
+        ]
     names = [th.name.replace("_", " ") for th in briefing.thresholds
              if _threshold_state(th.to_dict(), regime.regime) == "TRIPPED"]
     summary_lines.append("Tripped: " + (", ".join(names) if names else "none in the available checks"))
     if missing:
         summary_lines.append("Missing measurements are not all-clear conditions. Review data coverage before relying on the posture.")
-    if briefing.waterfall_risk_score != tripped:
+    if not grouped and briefing.waterfall_risk_score != tripped:
         summary_lines.append("Reported score differs from the available tripped checks; treat the headline as supplied-check coverage.")
     dated_events = sorted(((_date(e.event_date), e) for e in briefing.upcoming_events if _date(e.event_date)),
                           key=lambda pair: pair[0])
@@ -155,11 +193,12 @@ def _build_html_body(briefing: "MorningBriefing") -> str:
     gex_str = numeric(regime.aggregate_gex, ',.0f') if regime.regime != "UNKNOWN" else "n/a"
     event_lines = "".join(f"<li>{_format_event_line(e.to_dict())}</li>" for e in briefing.upcoming_events)
     event_lines = event_lines or "<li>No calendar events supplied; schedule coverage unconfirmed.</li>"
-    threshold_lines = "".join(f"<li>{_format_threshold_line(t.to_dict(), regime.regime)}</li>"
+    threshold_lines = "".join(f"<li>{_format_threshold_line(t.to_dict(), regime.regime, grouped=grouped)}</li>"
                               for t in briefing.thresholds) or "<li>No threshold checks supplied.</li>"
+    threshold_heading = "Raw Condition Diagnostics" if grouped else "Threshold Checks"
     return f"""
-    <div style="font-size:32px;font-weight:800;color:#EF4444;">
-        {tripped}/{checked} checked conditions tripped
+    <div style="font-size:32px;font-weight:800;color:{headline_color};">
+        {headline}
     </div>
     {summary}
     <p><strong>Regime:</strong> {_esc(regime.regime)}<br>
@@ -168,7 +207,7 @@ def _build_html_body(briefing: "MorningBriefing") -> str:
     <strong>Aggregate GEX:</strong> {gex_str}</p>
     <h3 style="color:#1A6EBF;">Supplied Forced-Flow Dates</h3>
     <ul>{event_lines}</ul>
-    <h3 style="color:#1A6EBF;">Threshold Checks</h3>
+    <h3 style="color:#1A6EBF;">{threshold_heading}</h3>
     <ul>{threshold_lines}</ul>
     <h3 style="color:#F59E0B;">Standing Posture</h3>
     <p><strong>LEVER:</strong> {_esc(posture.get('lever', 'n/a'))}<br>
@@ -215,7 +254,7 @@ def send_waterfall_alert(briefing: "MorningBriefing") -> bool:
         sections = [{
             "title": "Waterfall Watch: at a glance",
             "body": body_html,
-            "accent": "red" if score >= 3 else "amber",
+            "accent": _alert_accent(briefing),
         }]
         _send(subject, sections)
         log.info("waterfall_watch: alert queued - monitor score {s}", s=score)
@@ -239,5 +278,10 @@ def build_alert_subject(briefing: "MorningBriefing") -> str:
     """Expose subject-line construction for testability."""
     tripped, checked, _ = _check_counts(briefing)
     regime = " ".join(str(briefing.regime.regime).split())
+    if _uses_grouped_score(briefing):
+        count = _grouped_count(briefing)
+        label = f"{count}/2 evidence groups" if count is not None else "group count unavailable"
+        return (f"{SUBJECT_PREFIX} - {label} "
+                f"({regime}; {tripped}/{checked} raw checks tripped)")
     return (f"{SUBJECT_PREFIX} - {tripped}/{checked} checked tripped "
             f"({regime}; {briefing.waterfall_risk_score} reported)")

@@ -10,8 +10,6 @@ forced-flow briefing reads UNKNOWN instead of scoring a regime.
 
 from __future__ import annotations
 
-import sys
-import types
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Self
 
@@ -162,17 +160,37 @@ def test_forced_flow_briefing_does_not_score_a_regime_off_a_strike(
 ) -> None:
     from intelligence.forced_flow_monitor import build_morning_briefing
 
-    monkeypatch.setitem(
-        sys.modules, "ingestion.options",
-        types.SimpleNamespace(EQUITY_TICKERS=["SPY", "QQQ"]),
-    )
-    monkeypatch.setattr(
-        DealerGammaEngine, "_load_chain",
-        lambda self, _ticker, _snap_date: _chain(),
-    )
-    monkeypatch.setattr(DealerGammaEngine, "_get_spot_receipt", lambda self, _ticker, _time: None)
-    # QQQ has a measured close; SPY has none.
-    briefing = build_morning_briefing(_FakeDB({"qqq": 600.0}))
+    chain = _chain()
+    batch = chain.attrs["batch_id"]
+    completed = chain.attrs["capture_completed_at"]
+    cutoff = completed + timedelta(hours=1)
+    selected, loaded, receipts = [], [], []
+
+    def select_batch(self, ticker, day, as_of):
+        selected.append((ticker, day, as_of))
+        return SNAP_DATE, batch
+
+    def load_chain(self, ticker, day, *, capture_batch_id, cutoff):
+        loaded.append((ticker, day, capture_batch_id, cutoff))
+        return chain
+
+    def no_spot_receipt(self, ticker, at):
+        receipts.append((ticker, at))
+        return None
+
+    monkeypatch.setattr("physics.dealer_gamma._utc_now", lambda: cutoff)
+    monkeypatch.setattr(DealerGammaEngine, "latest_completed_capture_batch", select_batch)
+    monkeypatch.setattr(DealerGammaEngine, "_load_chain", load_chain)
+    monkeypatch.setattr(DealerGammaEngine, "_get_spot_receipt", no_spot_receipt)
+    # Exercise the completed-capture path all the way to its missing receipt,
+    # not an unrelated registry-query exception swallowed into UNKNOWN.
+    db = _FakeDB({"qqq": 600.0})
+    briefing = build_morning_briefing(db)
+
+    assert selected == [("SPY", SNAP_DATE, cutoff)]
+    assert loaded == [("SPY", SNAP_DATE, batch, cutoff)]
+    assert receipts == [("SPY", completed)]
+    assert db.statements == []  # no fallback query for an options strike
 
     assert briefing.regime.regime == "UNKNOWN"
     assert briefing.regime.spot == 0.0

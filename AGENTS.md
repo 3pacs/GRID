@@ -442,3 +442,24 @@ Focused bridge/Oracle/report tests passed locally. Broader compatible Oracle tes
 also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
 No production access, send, generator, migration, service change, merge or deploy.
 See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.
+
+## 2026-11-11 — Foundation evidence admission review
+
+Canonical people-event public-known clocks and transaction recording clocks are
+not interchangeable with durable post-commit decision receipts. Historical event
+admission remains held with `commit_visibility_unproven`; the new pure receipt
+prototype is synthetic contract proof only and has no live producer. Existing
+Sleuth v2 executable behavior is unchanged. Forced-flow source candidate groups
+overlapping diagnostics and keeps estimated schedules out of its count. Review
+score-version compatibility and warning suppression before any release. Details:
+`docs/reference/GRID_FOUNDATION_EVIDENCE_20261111.md`.
+
+## 2026-11-12 — Foundation reconciliation, source only
+
+Ported prior `dc7d53a9` onto main `adfa50a9` in an isolated worktree. Kept
+#1138's completed SPY capture reader and chain date; adapted the finite-positive
+spot guard and synthetic fixtures without restoring summary/wall-midpoint
+fallbacks. The prior kit remains unchanged. 380 offline targeted tests passed,
+scoped lint/whitespace passed, and pre-existing Sleuth functions/classes remain
+AST-identical. No DB/provider/outcome access, external publishing or release.
+Historical admission and the grouped-count release hold remain unresolved.
