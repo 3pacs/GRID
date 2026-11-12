@@ -5,8 +5,19 @@
   "issue": "3pacs/GRID#1129",
   "drafted_at": "2026-11-12",
   "drafted_from_main": "b27a2065",
-  "research_owner": null,
-  "reviewer": null,
+  "research_owner": {
+    "agent": "Claude",
+    "named_by": "operator",
+    "named_at": "2026-11-12",
+    "signed": false
+  },
+  "reviewer": {
+    "agent": "Codex",
+    "named_by": "operator",
+    "named_at": "2026-11-12",
+    "pickup_confirmed": false,
+    "signed": false
+  },
   "signed_at": null,
   "contract_body_sha256": null,
   "admission_status_values": [
@@ -872,7 +883,7 @@
   "gaps": [
     {
       "id": "G1",
-      "text": "research owner and independent reviewer not named"
+      "text": "RESOLVED 2026-11-12: owner Claude, reviewer Codex (named by the operator); signatures pending"
     },
     {
       "id": "G2",

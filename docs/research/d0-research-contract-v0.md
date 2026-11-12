@@ -7,8 +7,9 @@
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
 | Version | `d0-contract-v0` — **DRAFT, unsigned** |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
-| Research owner (signs) | _unassigned_ |
-| Independent reviewer (signs the admission manifest) | _unassigned_ |
+| Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
+| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12); pickup not yet confirmed |
+| Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
 
@@ -370,7 +371,7 @@ Gaps block only the hypotheses named in the gap list below.
 
 | # | Gap | Blocks | Proposed owner | Needs |
 |---|---|---|---|---|
-| G1 | Research owner and independent reviewer not named | signing; everything | operator | a decision |
+| G1 | ~~Research owner and independent reviewer not named~~ resolved 2026-11-12: owner Claude, reviewer Codex | signing | — | Codex pickup + first pass |
 | G2 | No EDGAR acceptance-datetime history; `earnings_events` starts 2026-02-19 | D1-F1, D1-F2 history | existing SEC lane (#1050 author) | approval of a free backfill job |
 | G3 | No point-in-time liquid-equity universe | all D1 history | — | Tiingo EOD incl. delisted + `security_master` validity |
 | G4 | No options cost class in `evals/e2/cost_model.json` | D2 scoring through E2 | E2 owner | versioned cost-model bump |
