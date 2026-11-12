@@ -249,22 +249,25 @@ def _pull_signal_source_events(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_type, source_id, ticker, signal_type,
-                       signal_date, signal_value, trust_score,
-                       outcome
+                SELECT source_type, source_id, signal_type, signal_date,
+                       signal_value, trust_score, outcome
                 FROM signal_sources
                 WHERE ticker = :t AND signal_date >= :c
                 ORDER BY signal_date DESC
                 LIMIT :lim
             """), {"t": ticker, "c": cutoff, "lim": MAX_EVENTS_PER_QUERY}).fetchall()
 
-            for r in rows:
-                src_type = r[0] or ""
-                src_id = r[1] or ""
-                meta = _parse_json_metadata(r[6])
+            # Read by column name: positional reads went stale when the
+            # SELECT changed and r[8] raised on every row (D0 gap G6).
+            for row in rows:
+                r = row._mapping
+                src_type = r["source_type"] or ""
+                src_id = r["source_id"] or ""
+                # signal_value is the JSONB details payload.
+                meta = _parse_json_metadata(r["signal_value"])
                 amount = _safe_float(meta.get("amount_usd") or meta.get("estimated_value"))
-                if amount is None:
-                    amount = _safe_float(r[5])  # signal_value as fallback
+                if amount is None and not isinstance(r["signal_value"], (dict, list, str)):
+                    amount = _safe_float(r["signal_value"])  # bare numeric payload
 
                 event_type = _SOURCE_TYPE_MAP.get(src_type.lower(), src_type.lower())
 
@@ -274,20 +277,20 @@ def _pull_signal_source_events(
                 elif meta.get("transaction_type"):
                     desc_parts.append(str(meta["transaction_type"]))
 
-                outcome_str = str(r[8] or "PENDING")
+                outcome_str = str(r["outcome"] or "PENDING")
                 if outcome_str != "PENDING":
                     desc_parts.append(f"[outcome: {outcome_str}]")
 
                 events.append(Event(
-                    timestamp=_parse_ts(r[4]),
+                    timestamp=_parse_ts(r["signal_date"]),
                     event_type=event_type,
                     actor=src_id if src_id else None,
                     ticker=ticker,
-                    direction=_direction_from_signal(r[3]),
+                    direction=_direction_from_signal(r["signal_type"]),
                     amount_usd=amount,
                     description=" — ".join(desc_parts),
                     source=f"signal_sources:{src_type}",
-                    confidence=_confidence_label(_safe_float(r[7])),
+                    confidence=_confidence_label(_safe_float(r["trust_score"])),
                     lead_time_to_next_move=None,
                 ))
     except Exception as exc:
@@ -545,9 +548,21 @@ def _pull_earnings_events(
                 SELECT earnings_date, fiscal_quarter, eps_estimate, eps_actual,
                        eps_surprise_pct, revenue_estimate, revenue_actual,
                        revenue_surprise_pct, classification, reported
-                FROM earnings_calendar
-                WHERE ticker = :t AND earnings_date >= :c
-                ORDER BY earnings_date DESC
+                FROM earnings_calendar ec
+                WHERE ec.ticker = :t AND ec.earnings_date >= :c
+                  -- Refuse compat stubs mirrored from earnings_events by
+                  -- scripts/sync_earnings_events_to_calendar.py: their
+                  -- earnings_date is the SEC period_end, not a release date
+                  -- (D0 gap G7). The real filing is read below by filing_date.
+                  AND NOT (
+                      ec.eps_actual IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM earnings_events ee
+                          WHERE ee.ticker = ec.ticker
+                            AND ee.period_end = ec.earnings_date
+                      )
+                  )
+                ORDER BY ec.earnings_date DESC
                 LIMIT :lim
             """), {"t": ticker, "c": cutoff.date(), "lim": MAX_EVENTS_PER_QUERY}).fetchall()
 
@@ -609,37 +624,40 @@ def _pull_earnings_events(
 
     # Task #186: additive pull from earnings_events (#151 puller) for
     # filing-level coverage (10-K/10-Q/8-K/EARNINGS_CALL/DEF 14A/S-1)
-    # that earnings_calendar may not yet have.  Dedupe on YYYY-MM-DD prefix
-    # (Event.timestamp is an ISO-8601 string per _parse_ts).
+    # that earnings_calendar may not yet have.  A filing becomes known on
+    # its filing_date, never on period_end (the fiscal period it covers,
+    # weeks earlier): stamping period_end put filings before they existed
+    # (D0 gap G6).  Dedupe on the YYYY-MM-DD prefix of the filing date.
     seen_dates: set[str] = {
         str(ev.timestamp)[:10] for ev in events if ev.timestamp
     }
     try:
         with engine.connect() as conn:
             ev_rows = conn.execute(text("""
-                SELECT period_end, fiscal_quarter, event_type, summary,
-                       sentiment, confidence, filing_date
+                SELECT filing_date, period_end, fiscal_quarter, event_type,
+                       summary, sentiment
                 FROM earnings_events
-                WHERE ticker = :t AND period_end >= :c
-                ORDER BY period_end DESC
+                WHERE ticker = :t AND filing_date >= :c
+                ORDER BY filing_date DESC
                 LIMIT :lim
             """), {
                 "t": ticker, "c": cutoff.date(), "lim": MAX_EVENTS_PER_QUERY,
             }).fetchall()
 
-            for r in ev_rows:
-                period_end = r[0]
-                if period_end is None:
+            for row in ev_rows:
+                r = row._mapping
+                filing_date = r["filing_date"]
+                if filing_date is None:
+                    continue  # unknown availability: refuse, never guess
+                fd_key = str(filing_date)[:10]
+                if fd_key in seen_dates:
                     continue
-                pe_key = str(period_end)[:10]
-                if pe_key in seen_dates:
-                    continue
-                seen_dates.add(pe_key)
+                seen_dates.add(fd_key)
 
-                quarter = r[1] or ""
-                ev_type = r[2] or "filing"
-                summary = r[3] or ""
-                sentiment = (r[4] or "").lower()
+                quarter = r["fiscal_quarter"] or ""
+                ev_type = r["event_type"] or "filing"
+                summary = r["summary"] or ""
+                sentiment = (r["sentiment"] or "").lower()
 
                 if sentiment in ("positive", "bullish"):
                     direction = "bullish"
@@ -649,11 +667,13 @@ def _pull_earnings_events(
                     direction = "neutral"
 
                 desc = f"{ev_type} {quarter}".strip()
+                if r["period_end"] is not None:
+                    desc += f" (period end {str(r['period_end'])[:10]})"
                 if summary:
                     desc += f": {summary[:160]}"
 
                 events.append(Event(
-                    timestamp=_parse_ts(period_end),
+                    timestamp=_parse_ts(filing_date),
                     event_type="earnings_filing",
                     actor=None,
                     ticker=ticker,
