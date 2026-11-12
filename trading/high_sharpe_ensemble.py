@@ -255,6 +255,7 @@ def adaptive_rotation_weights(ctx: DecisionContext) -> dict[str, float]:
         raise ValueError("adaptive_rotation needs a PanelPITStore in the decision context")
     result = ar.run_rotation(
         ctx.engine, as_of_date=ctx.as_of, positions={}, pit=ctx.pit, data_as_of=ctx.pit.data_as_of,
+        prepared_prices=ctx.pit.prices_through(ctx.as_of),
     )
     return dict(result.weights)
 
@@ -690,9 +691,8 @@ def candidate_set(name: str) -> CandidateSet:
 class PanelPITStore(PITStore):
     """A ``PITStore`` that answers from an in-memory, already-loaded price panel.
 
-    ``run_rotation`` reads prices through ``build_price_panel(..., pit=...)`` and VIX
-    through ``get_vix_series(..., pit=...)``; both call ``feature_ids_by_name`` and
-    then ``get_feature_matrix`` / ``get_pit``. This store serves those calls from the
+    Rotation reads the already-adjusted panel through ``prices_through`` and
+    VIX through ``get_vix_series(..., pit=...)``. This store serves those calls from the
     panel and refuses any read whose ``end_date`` lies after the decision date it
     was positioned at (:meth:`position`), so the rotation strategy cannot see
     forward prices even by accident. ``data_as_of`` is the vintage date of the
@@ -719,6 +719,12 @@ class PanelPITStore(PITStore):
             raise ValueError(
                 f"LOOKAHEAD: read to {end_date} requested at decision date {self.decision_date}"
             )
+
+    def prices_through(self, end_date: date) -> pd.DataFrame:
+        """Return the frozen price basis within the positioned decision and snapshot cutoff."""
+        self._guard(end_date)
+        self.reads += 1
+        return self.panel.loc[:str(min(end_date, self.data_as_of))]
 
     def feature_ids_by_name(self, names: list[str]) -> dict[str, int]:
         return {n: self._name_to_id[n] for n in names if n in self._name_to_id}

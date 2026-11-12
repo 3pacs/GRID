@@ -168,6 +168,35 @@ def test_panel_pit_store_refuses_forward_reads(panel):
     assert max(v["obs_date"]) <= date(2020, 6, 30)
 
 
+def test_rotation_reads_frozen_prices_without_rebasing_or_leaking_other_rows(panel, monkeypatch):
+    from alpha_research.strategies import adaptive_rotation as ar
+
+    prices, vix = panel
+    # A large move in a prepared panel is data, not evidence of a new split.
+    prices = prices[["SPY", "QQQ"]].copy()
+    prices.loc["2021-06-29", "SPY"] *= 3
+    prices["UNRELATED"] = 42.0
+    decision = date(2021, 6, 30)
+    pit = hse.PanelPITStore(prices, vix, data_as_of=date(2022, 1, 3))
+    ctx = hse.DecisionContext(as_of=decision, prices=prices, vix=vix, engine=None, pit=pit)
+    original_score = ar.score_groups
+    observed = []
+
+    def capture_scores(frame, benchmark):
+        observed.append(frame.copy())
+        return original_score(frame, benchmark)
+
+    monkeypatch.setattr(ar, "score_groups", capture_scores)
+    monkeypatch.setattr(ar, "build_price_panel", lambda *a, **k: pytest.fail("re-read prepared prices"))
+    pit.position(date(2021, 6, 29))
+    with pytest.raises(ValueError, match="LOOKAHEAD"):
+        hse.adaptive_rotation_weights(ctx)
+    pit.position(decision)
+    hse.adaptive_rotation_weights(ctx)
+    assert len(observed) == 1
+    pd.testing.assert_frame_equal(observed[0], prices.loc["2020-06-30":"2021-06-30", ["SPY", "QQQ"]])
+
+
 def test_weights_do_not_change_when_future_prices_change(panel):
     """Every candidate's decision at d is a function of data ≤ d only."""
     prices, vix = panel
