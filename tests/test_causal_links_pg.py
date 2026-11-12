@@ -200,11 +200,9 @@ def test_run_persists_only_pre_trade_events_idempotently_with_provenance():
         first = run_causal_links(engine, days=90, code_sha="sha-one", batch_size=1)
         rows = _links(engine)
         assert first.status == "succeeded"
-        assert first.edges_written == len(rows) == 3
+        assert first.edges_written == len(rows) == 1
         keys = {(r["actor"], r["event_key"]) for r in rows}
         assert keys == {
-            ("Rep A", f"earnings:GPOR:{_d(-70).isoformat()}"),
-            ("Timothy Cutt", f"earnings:GPOR:{_d(-15).isoformat()}"),
             ("Timothy Cutt", "contract:GPOR:W1"),
         }
         for r in rows:
@@ -218,12 +216,11 @@ def test_run_persists_only_pre_trade_events_idempotently_with_provenance():
         assert all(r["action_channel"] == "form4" and r["action"] == "SELL" for r in form4)
         contract = next(r for r in rows if r["event_kind"] == "contract")
         assert contract["event_date"] == _d(-20)  # first seen, not the future Start Date
-        congress = next(r for r in rows if r["actor"] == "Rep A")
-        assert congress["action_known_at_basis"] == "statutory_bound"
+        assert first.to_dict()["earnings_timing"]["status"] == "withheld"
 
         second = run_causal_links(engine, days=90, code_sha="sha-two")
         rows2 = _links(engine)
-        assert len(rows2) == 3
+        assert len(rows2) == 1
         assert {r["first_run_id"] for r in rows2} == {first.run_id}
         assert {r["run_id"] for r in rows2} == {second.run_id}
         assert {r["code_sha"] for r in rows2} == {"sha-two"}
@@ -231,7 +228,7 @@ def test_run_persists_only_pre_trade_events_idempotently_with_provenance():
             runs = conn.execute(text(
                 "SELECT status, edges_written, code_sha FROM causal_link_runs ORDER BY started_at"
             )).fetchall()
-        assert [(r[0], r[1]) for r in runs] == [("succeeded", 3), ("succeeded", 3)]
+        assert [(r[0], r[1]) for r in runs] == [("succeeded", 1), ("succeeded", 1)]
 
 
 def test_get_routes_read_persisted_links_select_only_with_as_of():
@@ -269,14 +266,14 @@ def test_get_routes_read_persisted_links_select_only_with_as_of():
 
         assert timeline["generated"] is True and timeline["as_of"]
         assert timeline["last_run"]["code_sha"] == "sha-final"
-        assert len(timeline["links"]) == 3
+        assert len(timeline["links"]) == 1
         for link in timeline["links"]:
             assert link["cause_date"] <= link["effect_date"]
             assert link["score_is_probability"] is False
             assert link["code_sha"] == "sha-final"
-        assert why["narrative"] is None and why["total_causes"] == 3
+        assert why["narrative"] is None and why["total_causes"] == 1
         assert why["as_of"] == timeline["as_of"]
-        assert batch["total_causes"] == 3
+        assert batch["total_causes"] == 1
 
 
 def test_get_routes_are_honest_before_any_run():
@@ -289,3 +286,51 @@ def test_get_routes_are_honest_before_any_run():
             out = c.get_causal_links(ticker="GPOR", days=90, _token="t")
         assert out["generated"] is False and out["links"] == []
         assert "not scheduled" in out["reason"]
+
+
+@pytest.mark.parametrize("provenance", [False, True])
+def test_earnings_guard_supports_legacy_and_mismatched_identities(provenance):
+    """Execute the exact shared fragment on both old and additive table shapes."""
+    from intelligence.causal_links import EARNINGS_EDGE_READ_GUARD_SQL
+    with _schema() as engine:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE causal_links (id INT, cause_type TEXT)"))
+            conn.execute(text("INSERT INTO causal_links VALUES (1, 'contract'), (2, ' Earnings_release '), (3, NULL)"))
+            if provenance:
+                conn.execute(text("ALTER TABLE causal_links ADD COLUMN event_kind TEXT, ADD COLUMN event_key TEXT"))
+                conn.execute(text("INSERT INTO causal_links VALUES (4, 'contract', 'earnings', NULL), (5, 'contract', 'contract', 'earnings:AAA:date')"))
+        with engine.connect() as conn:
+            count_before = conn.execute(text("SELECT count(*) FROM causal_links")).scalar()
+            kept = conn.execute(text("SELECT id FROM causal_links WHERE TRUE " + EARNINGS_EDGE_READ_GUARD_SQL + " ORDER BY id")).scalars().all()
+            count_after = conn.execute(text("SELECT count(*) FROM causal_links")).scalar()
+        assert kept == [1, 3]
+        assert count_after == count_before == (5 if provenance else 3)
+
+
+def test_persisted_earnings_are_preserved_but_filtered_before_read_limit():
+    from intelligence.causal_links import read_links, run_causal_links
+    with _schema() as engine:
+        _seed(engine)
+        _migrate(engine, "upgrade")
+        run_causal_links(engine, days=90, code_sha="synthetic")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO causal_links (edge_key, cause_type, event_kind, event_key,
+                    action_date, known_at, probability, ticker)
+                VALUES ('old-earnings', 'earnings', 'earnings', 'earnings:GPOR:old',
+                    :d, NOW(), 1.0, 'GPOR')
+            """), {"d": _d(-1)})
+        statements = []
+        def record(_conn, _cursor, sql, _params, _context, _many):
+            statements.append(sql)
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            with engine.connect() as conn:
+                rows = read_links(conn, ticker="GPOR", since=_d(-90), limit=1)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert len(rows) == 1 and rows[0]["event_kind"] == "contract"
+        assert all(sql.lstrip().upper().startswith("SELECT") for sql in statements)
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM causal_links")).scalar() == 2
+            assert conn.execute(text("SELECT count(*) FROM causal_links WHERE edge_key='old-earnings'")).scalar() == 1

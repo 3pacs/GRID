@@ -1,14 +1,19 @@
-"""Tests for intelligence/event_sequence.py source pulls (D0 gap G6, #1129).
+"""Tests for intelligence/event_sequence.py source pulls (D0 gaps G6/G7, #1129, #1142).
 
 Runs the real SQL against an in-memory SQLite database with the columns the
-pulls read. Covers the two G6 defects and the G7 compat-stub refusal:
+pulls read. After the #1145 fix was integrated with Codex's D0 reader guards
+(8befc05e), the contract is:
 
-* ``_pull_signal_source_events`` read ``r[8]`` from an 8-column row, so every
-  row raised and every signal_sources event was dropped.
-* ``earnings_events`` filings were stamped at ``period_end`` (the fiscal
-  period covered, weeks before the filing existed) instead of ``filing_date``.
-* ``earnings_calendar`` rows mirrored from ``earnings_events`` (earnings_date
-  == SEC period_end, no EPS actual) are refused rather than read as releases.
+* ``_pull_signal_source_events`` reads rows by column name (the old ``r[8]``
+  read on an 8-column row dropped every event). Events are emitted, but their
+  timing is held: ``confidence="unverified"``, ``timestamp_basis=
+  "source_event_date"`` and a ``timing_hold_reason``. Stored ``outcome`` text
+  is not copied into descriptions, because outcomes need their own
+  availability boundary.
+* ``_pull_earnings_events`` withholds calendar rows and filing rollups without
+  reading them. Neither ``period_end`` nor ``filing_date`` proves when the
+  stored summary/sentiment payload became available, and the compat stubs
+  (``earnings_date == period_end``) would otherwise read as releases.
 """
 
 from __future__ import annotations
@@ -66,7 +71,7 @@ CUTOFF = NOW - timedelta(days=90)
 
 
 class TestSignalSourceEvents:
-    def test_rows_are_returned_not_dropped(self, engine):
+    def test_rows_are_returned_not_dropped_and_timing_is_held(self, engine):
         _insert(engine, "signal_sources", source_type="congressional",
                 source_id="Rep. Example", ticker="NVDA", signal_date=_d(10),
                 signal_type="BUY",
@@ -79,12 +84,11 @@ class TestSignalSourceEvents:
 
         events = es._pull_signal_source_events(engine, "NVDA", CUTOFF)
 
-        assert len(events) == 2
+        assert len(events) == 2  # the G6 bug returned [] here
         by_type = {e.event_type: e for e in events}
         cong = by_type["congressional"]
         assert cong.amount_usd == 50000.0
         assert cong.direction == "bullish"
-        assert cong.confidence == "confirmed"  # trust_score 0.85, not outcome text
         assert cong.actor == "Rep. Example"
         assert "purchase" in cong.description
         assert cong.timestamp.startswith(_d(10))
@@ -92,8 +96,12 @@ class TestSignalSourceEvents:
         dark = by_type["dark_pool"]
         assert dark.direction == "bearish"
         assert dark.amount_usd is None
-        assert dark.confidence == "estimated"  # 0.3
-        assert "[outcome: CORRECT]" in dark.description
+        for ev in events:
+            assert ev.confidence == "unverified"  # not derived from trust_score
+            assert ev.timestamp_basis == "source_event_date"
+            assert ev.timing_hold_reason == es.EVENT_TIMING_HOLD_REASON
+            assert ev.source_record_id is not None
+            assert "[outcome:" not in ev.description  # no outcome leakage
 
     def test_respects_cutoff_and_ticker(self, engine):
         _insert(engine, "signal_sources", source_type="insider", source_id="CFO",
@@ -117,80 +125,36 @@ class TestSignalSourceEvents:
         assert events[0].direction == "neutral"
 
 
-class TestEarningsFilingTiming:
-    def test_filing_is_stamped_at_filing_date_not_period_end(self, engine):
+class TestEarningsWithheld:
+    """Calendar rows and filing rollups are withheld until release/version receipts exist."""
+
+    def _seed(self, engine):
+        # A real filing (filing_date after period_end), a G7 compat stub
+        # (earnings_date == period_end, no EPS actual), and a calendar row
+        # that does carry an EPS actual.
         _insert(engine, "earnings_events", ticker="NVDA", event_type="10-Q",
                 filing_date=_d(20), period_end=_d(50), fiscal_quarter="Q3",
                 summary="quarterly report", sentiment="positive", confidence=0.9)
-
-        events = es._pull_earnings_events(engine, "NVDA", CUTOFF)
-
-        assert len(events) == 1
-        ev = events[0]
-        assert ev.event_type == "earnings_filing"
-        assert ev.timestamp.startswith(_d(20))
-        assert f"period end {_d(50)}" in ev.description
-        assert ev.direction == "bullish"
-
-    def test_cutoff_applies_to_filing_date(self, engine):
-        # Period ended before the window, but the filing landed inside it.
-        _insert(engine, "earnings_events", ticker="NVDA", event_type="10-K",
-                filing_date=_d(30), period_end=_d(120), fiscal_quarter="FY",
-                summary=None, sentiment=None, confidence=None)
-        # Filed before the window: excluded even though nothing else is.
-        _insert(engine, "earnings_events", ticker="NVDA", event_type="8-K",
-                filing_date=_d(100), period_end=_d(100), fiscal_quarter=None,
-                summary=None, sentiment=None, confidence=None)
-
-        events = es._pull_earnings_events(engine, "NVDA", CUTOFF)
-
-        assert [e.timestamp[:10] for e in events] == [_d(30)]
-
-    def test_compat_stub_is_refused(self, engine):
-        # Stub mirrored by sync_earnings_events_to_calendar: earnings_date is
-        # the SEC period_end and there is no EPS actual.
-        _insert(engine, "earnings_events", ticker="NVDA", event_type="10-Q",
-                filing_date=_d(20), period_end=_d(50), fiscal_quarter="Q3",
-                summary=None, sentiment=None, confidence=None)
         _insert(engine, "earnings_calendar", ticker="NVDA", earnings_date=_d(50),
-                fiscal_quarter="Q3", eps_estimate=None, eps_actual=None,
-                eps_surprise_pct=None, revenue_estimate=None,
-                revenue_actual=None, revenue_surprise_pct=None,
-                classification=None, reported=True)
+                fiscal_quarter="Q3", eps_actual=None, reported=True)
+        _insert(engine, "earnings_calendar", ticker="NVDA", earnings_date=_d(15),
+                fiscal_quarter="Q4", eps_estimate=1.0, eps_actual=1.2,
+                eps_surprise_pct=20.0, reported=True)
 
+    def test_nothing_is_emitted(self, engine):
+        self._seed(engine)
+        assert es._pull_earnings_events(engine, "NVDA", CUTOFF) == []
+
+    def test_compat_stub_cannot_appear_as_a_release(self, engine):
+        self._seed(engine)
         events = es._pull_earnings_events(engine, "NVDA", CUTOFF)
+        assert not any(_d(50) in str(e.timestamp) for e in events)
 
-        assert [e.source for e in events] == ["earnings_events"]
-        assert all(not e.timestamp.startswith(_d(50)) for e in events)
+    def test_withholding_does_no_io(self):
+        class Boom:
+            def connect(self):
+                raise AssertionError("earnings pull must not read the database")
 
-    def test_real_calendar_release_is_kept_and_dedupes_same_day_filing(self, engine):
-        _insert(engine, "earnings_calendar", ticker="NVDA", earnings_date=_d(20),
-                fiscal_quarter="Q3", eps_estimate=1.0, eps_actual=1.2,
-                eps_surprise_pct=20.0, revenue_estimate=3.0e10,
-                revenue_actual=3.5e10, revenue_surprise_pct=16.0,
-                classification="beat", reported=True)
-        # 8-K filed the same day as the release: one event, not two.
-        _insert(engine, "earnings_events", ticker="NVDA", event_type="8-K",
-                filing_date=_d(20), period_end=_d(50), fiscal_quarter="Q3",
-                summary=None, sentiment=None, confidence=None)
+            begin = connect
 
-        events = es._pull_earnings_events(engine, "NVDA", CUTOFF)
-
-        assert len(events) == 1
-        assert events[0].source == "earnings_calendar"
-        assert events[0].direction == "bullish"
-
-    def test_calendar_row_with_actual_on_period_end_is_not_treated_as_stub(self, engine):
-        # A populated EPS actual means a real puller wrote it; keep it.
-        _insert(engine, "earnings_events", ticker="NVDA", event_type="10-Q",
-                filing_date=_d(20), period_end=_d(50), fiscal_quarter="Q3",
-                summary=None, sentiment=None, confidence=None)
-        _insert(engine, "earnings_calendar", ticker="NVDA", earnings_date=_d(50),
-                fiscal_quarter="Q3", eps_estimate=1.0, eps_actual=1.1,
-                eps_surprise_pct=10.0, revenue_estimate=None,
-                revenue_actual=None, revenue_surprise_pct=None,
-                classification="beat", reported=True)
-
-        events = es._pull_earnings_events(engine, "NVDA", CUTOFF)
-
-        assert sorted(e.source for e in events) == ["earnings_calendar", "earnings_events"]
+        assert es._pull_earnings_events(Boom(), "NVDA", CUTOFF) == []

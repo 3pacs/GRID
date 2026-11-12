@@ -27,9 +27,10 @@ Every edge carries the evidence for its timing:
 * ``action_known_at`` — the earliest defensible time the trade was public
   (Form 4 ``fileDate``; else the time GRID first saw it; for congressional
   trades ``max(transaction + 45 days, first seen)``, the statutory bound);
-* ``event_known_at`` — when the event was public (earnings: end of the
-  release day; contract awards: when GRID first saw the award, and only for
-  awards that were fresh then — backfilled old awards are not events);
+* ``event_known_at`` — the legacy contract-award first-seen clock; earnings
+  timing is withheld because mutable calendar/filing rows do not establish
+  release or exact-version availability. This guard does not newly certify
+  the remaining sources;
 * ``known_at`` — ``max(action_known_at, event_known_at)``, the first moment
   the pair could have been asserted. Views never show an edge before it.
 
@@ -71,6 +72,21 @@ from sqlalchemy.engine import Connection, Engine
 
 EDGE_SCHEMA_VERSION = "antecedent_v1"
 SCORE_METHOD = "recency_linear_v1"
+EARNINGS_TIMING_HOLD_REASON = "release_version_knowledge_unproven"
+# Static fragment for the three existing causal_links readers, before LIMIT.
+# Whole-row JSON keeps optional provenance fields safe on legacy schemas.
+EARNINGS_EDGE_READ_GUARD_SQL = (
+    "AND LOWER(BTRIM(COALESCE(cause_type, ''))) NOT LIKE 'earnings%' "
+    "AND LOWER(BTRIM(COALESCE(to_jsonb(causal_links)->>'event_kind', ''))) NOT LIKE 'earnings%' "
+    "AND LOWER(BTRIM(COALESCE(to_jsonb(causal_links)->>'event_key', ''))) NOT LIKE 'earnings:%' "
+)
+
+
+
+def earnings_timing_policy() -> dict[str, str]:
+    """Static coverage policy, not a count of missing events or a run result."""
+    return {"status": "withheld", "reason": EARNINGS_TIMING_HOLD_REASON}
+
 
 EARNINGS_WINDOW_DAYS = 30
 CONTRACT_WINDOW_DAYS = 60
@@ -214,6 +230,8 @@ class RunSummary:
             "edges_written": self.edges_written,
             "status": self.status,
             "dry_run": self.dry_run,
+            "coverage": "partial",
+            "earnings_timing": earnings_timing_policy(),
         }
 
 
@@ -428,43 +446,13 @@ def canonical_actions(rows: Iterable[dict[str, Any]], as_of: datetime) -> list[A
 
 
 def earnings_events(rows: Iterable[dict[str, Any]]) -> list[AntecedentEvent]:
-    """Reported earnings releases. Unreported calendar rows are estimates, not events."""
-    out: dict[tuple[str, date], AntecedentEvent] = {}
-    for row in rows:
-        ticker = (row.get("ticker") or "").strip().upper()
-        e_day = _as_date(row.get("earnings_date"))
-        eps_act = row.get("eps_actual")
-        if not ticker or e_day is None:
-            continue
-        if not (row.get("reported") is True or eps_act is not None):
-            continue
-        eps_est = row.get("eps_estimate")
-        quarter = row.get("fiscal_quarter")
-        if eps_act is not None and eps_est is not None:
-            a, e = float(eps_act), float(eps_est)
-            verdict = "beat" if a > e else "miss" if a < e else "inline"
-            desc = f"Earnings {verdict} released {e_day} ({a:.2f} vs {e:.2f} est)"
-        else:
-            desc = f"Earnings released {e_day}"
-        if quarter:
-            desc += f" [{quarter}]"
-        out[(ticker, e_day)] = AntecedentEvent(
-            kind="earnings",
-            ticker=ticker,
-            key=f"earnings:{ticker}:{e_day.isoformat()}",
-            event_date=e_day,
-            known_at=end_of_day(e_day),
-            known_at_basis="release_date",
-            window_days=EARNINGS_WINDOW_DAYS,
-            description=desc,
-            evidence={
-                "eps_estimate": None if eps_est is None else float(eps_est),
-                "eps_actual": None if eps_act is None else float(eps_act),
-                "surprise_pct": None if row.get("eps_surprise_pct") is None else float(row["eps_surprise_pct"]),
-                "fiscal_quarter": quarter,
-            },
-        )
-    return list(out.values())
+    """Mutable calendar rows cannot prove release or exact-version knowledge.
+
+    Reported flags, EPS values, source labels, filing dates and ingestion times
+    do not unlock admission. Preserve source rows; this consumer is held until
+    a separately reviewed immutable evidence contract exists.
+    """
+    return []
 
 
 def contract_events(rows: Iterable[dict[str, Any]]) -> list[AntecedentEvent]:
@@ -598,16 +586,8 @@ def load_action_rows(
 def load_event_rows(
     conn: Connection, tickers: Sequence[str], since: date, as_of: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    earn = _mappings(conn, (
-        "SELECT UPPER(ticker) AS ticker, earnings_date, fiscal_quarter, eps_estimate, "
-        "       eps_actual, eps_surprise_pct, reported "
-        "FROM earnings_calendar "
-        "WHERE UPPER(ticker) = ANY(:tickers) AND earnings_date BETWEEN :start AND :until"
-    ), {
-        "tickers": list(tickers),
-        "start": since - timedelta(days=EARNINGS_WINDOW_DAYS + 1),
-        "until": as_of.date(),
-    })
+    # Intentionally no calendar read while its timing contract is unqualified.
+    earn: list[dict[str, Any]] = []
     contracts = _mappings(conn, (
         "SELECT id, source_id, UPPER(ticker) AS ticker, signal_date, signal_value, created_at "
         "FROM signal_sources "
@@ -812,7 +792,10 @@ def latest_run(conn: Connection) -> dict[str, Any] | None:
 def read_links(
     conn: Connection, *, ticker: str | None, since: date, limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """Persisted provenance-bearing edges (legacy rows without edge_key are excluded)."""
+    """Read surviving edges, excluding unqualified earnings before LIMIT.
+
+    Stored history is preserved. Legacy rows without edge_key remain excluded.
+    """
     params: dict[str, Any] = {"since": since, "lim": int(limit)}
     sql = (
         "SELECT id, edge_key, signal_id, actor, ticker, action, action_channel, action_date, "
@@ -823,6 +806,7 @@ def read_links(
         "FROM causal_links "
         "WHERE edge_key IS NOT NULL AND known_at <= NOW() AND action_date >= :since "
     )
+    sql += EARNINGS_EDGE_READ_GUARD_SQL
     if ticker:
         sql += "AND ticker = :ticker "
         params["ticker"] = ticker.strip().upper()
@@ -901,6 +885,8 @@ def read_links_payload(
         "claim": "public event preceded the trade; not proof of cause",
         "score_method": SCORE_METHOD,
         "score_is_probability": False,
+        "coverage": "partial",
+        "earnings_timing": earnings_timing_policy(),
     }
     with engine.connect() as conn:
         if not schema_ready(conn):

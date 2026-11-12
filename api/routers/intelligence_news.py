@@ -139,10 +139,10 @@ def get_event_sequence(
     with_lead_times: bool = Query(False, description="Compute lead times to next price move"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Build a chronological timeline of ALL events for a ticker or sector.
+    """Display the partial legacy timeline with explicit timing holds.
 
     Pulls from signal_sources, news_articles, options_daily_signals,
-    decision_journal, cross_reference_checks, and earnings_calendar.
+    decision_journal and cross_reference_checks. Earnings timing is withheld.
 
     Supply either ``ticker`` or ``sector`` (not both).  If ``sector`` is
     provided, events for all constituent tickers are returned.
@@ -156,16 +156,17 @@ def get_event_sequence(
             build_sector_sequence,
             build_sequence_with_lead_times,
             events_to_dicts,
+            timing_coverage_policy,
         )
 
         engine = get_db_engine()
 
         if sector:
-            events = build_sector_sequence(engine, sector=sector, days=days)
+            events = build_sector_sequence(engine, sector=sector, days=days, include_unqualified=True)
         elif with_lead_times:
-            events = build_sequence_with_lead_times(engine, ticker=ticker, days=days)
+            events = build_sequence_with_lead_times(engine, ticker=ticker, days=days, include_unqualified=True)
         else:
-            events = build_sequence(engine, ticker=ticker, days=days)
+            events = build_sequence(engine, ticker=ticker, days=days, include_unqualified=True)
 
         type_counts: dict[str, int] = {}
         direction_counts: dict[str, int] = {}
@@ -181,6 +182,8 @@ def get_event_sequence(
             "days": days,
             "type_counts": type_counts,
             "direction_counts": direction_counts,
+            "coverage": "partial",
+            "timing_policy": timing_coverage_policy(display_only=True),
         }
     except Exception as exc:
         log.warning("Event sequence failed: {e}", e=str(exc))
@@ -204,7 +207,7 @@ def get_recurring_patterns(
     times.  Examples: "insider sell -> dark pool spike -> price drop".
     """
     try:
-        from intelligence.event_sequence import find_recurring_patterns
+        from intelligence.event_sequence import find_recurring_patterns, timing_coverage_policy
 
         engine = get_db_engine()
         patterns = find_recurring_patterns(engine, min_occurrences=min_occurrences)
@@ -212,6 +215,8 @@ def get_recurring_patterns(
             "patterns": patterns,
             "count": len(patterns),
             "min_occurrences": min_occurrences,
+            "coverage": "partial",
+            "timing_policy": timing_coverage_policy(),
         }
     except Exception as exc:
         log.warning("Recurring pattern detection failed: {e}", e=str(exc))

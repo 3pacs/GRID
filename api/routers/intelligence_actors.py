@@ -1818,6 +1818,8 @@ def _intel_expand_graph(engine: Any, ticker: str, max_per_hop: int = 6) -> dict[
                 )
 
         # ── Hop 2: causal levers affecting the ticker ──
+        from intelligence.causal_links import EARNINGS_EDGE_READ_GUARD_SQL
+
         cause_nodes: list[str] = []
         if _table_exists(conn, "causal_links"):
             try:
@@ -1825,6 +1827,7 @@ def _intel_expand_graph(engine: Any, ticker: str, max_per_hop: int = 6) -> dict[
                     SELECT cause_type, probable_cause, MAX(probability) AS prob
                     FROM causal_links
                     WHERE UPPER(ticker) = :t
+                """ + EARNINGS_EDGE_READ_GUARD_SQL + """
                     GROUP BY cause_type, probable_cause
                     ORDER BY prob DESC NULLS LAST
                     LIMIT :lim
@@ -1914,12 +1917,16 @@ def _intel_expand_graph(engine: Any, ticker: str, max_per_hop: int = 6) -> dict[
                     amount=amt,
                 )
 
+    from intelligence.causal_links import earnings_timing_policy
+
     return {
         "nodes": list(nodes.values()),
         "edges": edges,
         "center": center_id,
         "ticker": t,
         "relationship_colors": _RELATIONSHIP_COLORS,
+        "causal_links_coverage": "partial",
+        "earnings_timing": earnings_timing_policy(),
     }
 
 
