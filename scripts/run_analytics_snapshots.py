@@ -88,8 +88,10 @@ RESOLVER_CANARY_FEATURE = "spy_full"
 MAX_STALENESS_DAYS = 10
 # FeatureLab inputs: daily series must be this fresh; monthly releases get a
 # publication-lag allowance instead of being reported as today's value.
-FEATURE_INPUT_MAX_AGE_DAYS = 10
-FEATURE_INPUT_AGE_OVERRIDES = {"cpi_yoy": 75}
+from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS  # noqa: E402
+
+FEATURE_INPUT_MAX_AGE_DAYS = DEFAULT_INPUT_MAX_AGE_DAYS
+FEATURE_INPUT_AGE_OVERRIDES = DEFAULT_INPUT_AGE_OVERRIDES
 # options_mispricing_scans older than this is not summarised as current.
 OPTIONS_SCAN_MAX_AGE_DAYS = 4
 OPTIONS_TOP_N = 10
