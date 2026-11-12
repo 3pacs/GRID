@@ -198,6 +198,37 @@ def _build_client(provider: str) -> Any:
     return client
 
 
+def get_provider_client(provider: str) -> Any | None:
+    """Return the client for exactly ``provider``, or ``None`` — never a fallback.
+
+    ``get_llm(provider=...)`` walks the tier's fallback chain when the named
+    provider is down, so its caller cannot tell which node answered. A caller
+    that spreads work over several nodes itself (the LLM task queue's
+    background rotation) needs the opposite: this node or nothing, so it can
+    move on to the next node in its own list.
+
+    Shares ``get_llm``'s client cache and refusal cooldown, so a dark node
+    costs one connect timeout per ``LLM_PROVIDER_COOLDOWN_SECONDS``.
+
+    Args:
+        provider: Router provider name (``llamacpp``, ``llamacpp_x99``, ...).
+
+    Returns:
+        An available client, or ``None`` when the provider is disabled,
+        unconfigured, cooling down, or failed its health probe.
+    """
+    if _provider_in_backoff(provider):
+        return None
+    cached = _client_cache.get(provider)
+    if cached is not None and getattr(cached, "is_available", True):
+        return cached
+    client = _build_client(provider)
+    if client is not None and getattr(client, "is_available", False):
+        _client_cache[provider] = client
+        return client
+    return None
+
+
 # (provider, fallback) pairs already warned in this process. A dead primary
 # (LLM_LOCAL_PROVIDER=llamacpp_quick pointing at a retired host) made every
 # get_llm() call log "LLM provider ... unavailable, falling back to ..."

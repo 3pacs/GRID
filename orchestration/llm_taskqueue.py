@@ -87,6 +87,11 @@ class LLMTaskQueue:
         self._engine = engine
         self._client = None  # lazy — import heavy
         self._clients_by_tier: dict[str, Any] = {}  # tier-string → client
+        # Background rotation (see _next_background_client): index of the
+        # provider the next REASON-tier background task starts from, and how
+        # many tasks each provider has been handed since start.
+        self._background_rr: int = 0
+        self._background_by_provider: dict[str, int] = {}
 
         # Priority queue (min-heap on _sort_key)
         self._queue: list[LLMTask] = []
@@ -118,8 +123,56 @@ class LLMTaskQueue:
     # ------------------------------------------------------------------
     # Client init (lazy — avoids import at module load)
     # ------------------------------------------------------------------
-    def _get_client(self, task_type: str | None = None):
+    def _next_background_client(self) -> Any | None:
+        """Pick the next node for a REASON-tier background task, round-robin.
+
+        Walks ``LLM_TASKQUEUE_BACKGROUND_PROVIDERS`` starting one past the
+        provider used last time and returns the first that answers, so the
+        work alternates between nodes and a node that is off or cooling down
+        is skipped rather than stalling the queue. Returns ``None`` when the
+        setting is blank or no listed provider is available; the caller then
+        uses the task's own tier, i.e. the routing from before this existed.
+        """
+        try:
+            from config import settings
+            from llm.router import get_provider_client
+        except ImportError as exc:
+            log.debug("LLM-TQ: background rotation unavailable: {e}", e=str(exc))
+            return None
+
+        raw = getattr(settings, "LLM_TASKQUEUE_BACKGROUND_PROVIDERS", "") or ""
+        providers = list(dict.fromkeys(p.strip() for p in str(raw).split(",") if p.strip()))
+        if not providers:
+            return None
+
+        start = self._background_rr % len(providers)
+        for offset in range(len(providers)):
+            index = (start + offset) % len(providers)
+            provider = providers[index]
+            try:
+                client = get_provider_client(provider)
+            except Exception as exc:  # one broken provider must not sink the rest
+                log.debug(
+                    "LLM-TQ: background provider {p} failed: {e}", p=provider, e=str(exc)
+                )
+                continue
+            if client is None:
+                continue
+            self._background_rr = index + 1
+            self._background_by_provider[provider] = (
+                self._background_by_provider.get(provider, 0) + 1
+            )
+            return client
+        return None
+
+    def _get_client(self, task_type: str | None = None, priority: int | None = None):
         """Return an LLM client sized to the task's tier.
+
+        Background work (``priority`` 3 or lower urgency) on the REASON tier
+        is the bulk of the queue and none of it is latency-sensitive, so it
+        is spread over ``LLM_TASKQUEUE_BACKGROUND_PROVIDERS`` first; realtime
+        and scheduled tasks, and LOCAL/ORACLE-tier tasks, keep their tier's
+        provider.
 
         Routine analysis (hypothesis_generation, company_analysis, …) routes
         through Tier.REASON; extraction/summarisation through Tier.LOCAL;
@@ -133,6 +186,10 @@ class LLMTaskQueue:
             if task_type is not None
             else "oracle"
         )
+        if priority is not None and priority >= 3 and tier_str == "reason":
+            spread = self._next_background_client()
+            if spread is not None:
+                return spread
         cached = self._clients_by_tier.get(tier_str)
         if cached is not None and getattr(cached, "is_available", True):
             return cached
@@ -220,7 +277,7 @@ class LLMTaskQueue:
             id=task.id, p=task.priority, t=task.task_type,
         )
 
-        client = self._get_client(task.task_type)
+        client = self._get_client(task.task_type, task.priority)
         if client is None or not client.is_available:
             task.error = "LLM client unavailable"
             task.completed_at = datetime.now(timezone.utc).isoformat()
@@ -664,6 +721,7 @@ class LLMTaskQueue:
             "total_completed": self._total_completed,
             "total_errors": self._total_errors,
             "total_timeouts": self._total_timeouts,
+            "background_by_provider": dict(self._background_by_provider),
             "throughput_per_hour": throughput,
             "uptime_seconds": round(uptime, 1),
             "idle_pct": idle_pct,
