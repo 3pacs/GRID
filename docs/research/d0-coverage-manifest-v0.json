@@ -1,0 +1,922 @@
+{
+  "schema": "d0-coverage-manifest/0",
+  "contract": "d0-contract-v0",
+  "status": "DRAFT_UNSIGNED",
+  "issue": "3pacs/GRID#1129",
+  "drafted_at": "2026-11-12",
+  "drafted_from_main": "b27a2065",
+  "research_owner": null,
+  "reviewer": null,
+  "signed_at": null,
+  "contract_body_sha256": null,
+  "admission_status_values": [
+    "ADMITTED",
+    "FORWARD_ONLY",
+    "INSPECTED",
+    "EVIDENCE_ONLY",
+    "EXCLUDED_STALE",
+    "EXCLUDED_UNKNOWN_AVAILABILITY",
+    "UNAVAILABLE"
+  ],
+  "inputs": [
+    {
+      "id": "grid.options_capture_batches.SPY",
+      "track": "D2",
+      "provider": "Cboe delayed JSON (Yahoo fallback, 429 since 2026-09-29)",
+      "identity": "ticker/expiry/opt_type/strike parsed from OCC symbol; OCC symbol not stored",
+      "units": "USD per share; IV decimal",
+      "basis": "raw",
+      "clocks": {
+        "observation": "snap_date + batch capture time",
+        "first_availability": "batch registered_at (no per-contract quote time)",
+        "ingestion": "capture_started_at/capture_completed_at",
+        "calculation": "options_daily_signals at snap date"
+      },
+      "coverage": {
+        "start": "2026-10-01",
+        "end": "2026-11-11",
+        "sessions": 30,
+        "batches": 359,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "spot clock/provider NULL before 2026-11-10; 4 backfilled batches with NULL spot",
+      "latency": "~15 min delayed",
+      "entitlement": "Cboe delayed public",
+      "storage_limits": "griddb append-only; MAX_EXPIRATIONS=12; no bid/ask size",
+      "admission_status": "FORWARD_ONLY",
+      "blocked_hypotheses": [
+        "D2 historical"
+      ],
+      "notes": "30 sessions: diagnostic only until 120"
+    },
+    {
+      "id": "grid.raw_series.CBOE:VIX",
+      "track": "D2",
+      "provider": "Cboe daily CSV",
+      "identity": "CBOE:VIX",
+      "units": "index points",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "obs_date close",
+        "first_availability": "after 16:15 ET close",
+        "ingestion": "pull_timestamp",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "1990-01-02",
+        "end": "2026-11-10",
+        "rows": 9313,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "",
+      "latency": "daily",
+      "entitlement": "public",
+      "storage_limits": "raw_series",
+      "admission_status": "ADMITTED",
+      "blocked_hypotheses": [],
+      "notes": "regime conditioning only"
+    },
+    {
+      "id": "grid.raw_series.CBOE:VIX9D",
+      "track": "D2",
+      "provider": "Cboe daily CSV",
+      "identity": "CBOE:VIX9D",
+      "units": "index points",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "obs_date close",
+        "first_availability": "after close",
+        "ingestion": "pull_timestamp",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "2011-01-04",
+        "end": "2026-11-10",
+        "rows": 3987,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "",
+      "latency": "daily",
+      "entitlement": "public",
+      "storage_limits": "raw_series",
+      "admission_status": "ADMITTED",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "grid.raw_series.CBOE:VIX3M",
+      "track": "D2",
+      "provider": "Cboe daily CSV",
+      "identity": "CBOE:VIX3M",
+      "units": "index points",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "obs_date close",
+        "first_availability": "after close",
+        "ingestion": "pull_timestamp",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "2009-09-18",
+        "end": "2026-11-10",
+        "rows": 4313,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "",
+      "latency": "daily",
+      "entitlement": "public",
+      "storage_limits": "raw_series",
+      "admission_status": "ADMITTED",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "grid.raw_series.CBOE:SKEW",
+      "track": "D2",
+      "provider": "Cboe daily CSV",
+      "identity": "CBOE:SKEW",
+      "units": "index points",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "obs_date close",
+        "first_availability": "after close",
+        "ingestion": "pull_timestamp",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "1990-01-02",
+        "end": "2026-03-25",
+        "rows": 9108,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "stale since 2026-03-25",
+      "latency": "daily",
+      "entitlement": "public",
+      "storage_limits": "raw_series",
+      "admission_status": "EXCLUDED_STALE",
+      "blocked_hypotheses": [
+        "SKEW conditioner"
+      ],
+      "notes": "gap G11"
+    },
+    {
+      "id": "live.schwab.chains_quotes_bars",
+      "track": "D2",
+      "provider": "Schwab Market Data (read-only)",
+      "identity": "OCC symbol",
+      "units": "USD",
+      "basis": "raw",
+      "clocks": {
+        "observation": "provider quoteTime",
+        "first_availability": "provider quoteTime",
+        "ingestion": "GRID receipt time (vintage)",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "live",
+        "end": "live"
+      },
+      "missingness": "no aggressor side; bars ~81-88% of totalVolume",
+      "latency": "seconds",
+      "entitlement": "personal API; redistribution forbidden",
+      "storage_limits": "process-local only, persist_allowed=False",
+      "admission_status": "FORWARD_ONLY",
+      "blocked_hypotheses": [],
+      "notes": "feeds fly-shadow/1 and bounce-shadow/1"
+    },
+    {
+      "id": "grid.polygon.v3_snapshot_options",
+      "track": "D2",
+      "provider": "Polygon",
+      "identity": "n/a",
+      "units": "n/a",
+      "basis": "n/a",
+      "clocks": {
+        "observation": null,
+        "first_availability": null,
+        "ingestion": null,
+        "calculation": null
+      },
+      "coverage": {
+        "start": null,
+        "end": null
+      },
+      "missingness": "403 NOT_AUTHORIZED; puller SKIPPED",
+      "latency": "n/a",
+      "entitlement": "not entitled",
+      "storage_limits": "nothing stored",
+      "admission_status": "UNAVAILABLE",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "research.polygon.SPY_1min",
+      "track": "D2",
+      "provider": "Polygon (offline research copy, GEX repo scratch)",
+      "identity": "SPY",
+      "units": "USD per share",
+      "basis": "raw",
+      "clocks": {
+        "observation": "bar end",
+        "first_availability": "bar end + provider delay",
+        "ingestion": "fetch_log time",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "2024-11",
+        "end": "2026-11",
+        "note": "rolling ~2-year entitlement"
+      },
+      "missingness": "",
+      "latency": "n/a (history)",
+      "entitlement": "existing key",
+      "storage_limits": "outside GRID custody",
+      "admission_status": "INSPECTED",
+      "blocked_hypotheses": [
+        "new intraday rules on this window"
+      ],
+      "notes": "see inspected_windows"
+    },
+    {
+      "id": "research.xnas_itch.SPY_1min_and_trades",
+      "track": "D2",
+      "provider": "XNAS.ITCH via usage-based vendor (offline copy)",
+      "identity": "SPY",
+      "units": "USD per share; shares",
+      "basis": "raw",
+      "clocks": {
+        "observation": "bar/trade time",
+        "first_availability": "trade time",
+        "ingestion": "fetch_log time",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "2022-11",
+        "end": "2026-11"
+      },
+      "missingness": "Nasdaq is a sample of SPY volume",
+      "latency": "n/a",
+      "entitlement": "usage-based",
+      "storage_limits": "outside GRID custody",
+      "admission_status": "INSPECTED",
+      "blocked_hypotheses": [],
+      "notes": "edge8 holdout 2022-11..2024-11 unread for edge8 family only"
+    },
+    {
+      "id": "research.opra.cbbo_1m.SPY_0dte_near_spot",
+      "track": "D2",
+      "provider": "OPRA consolidated BBO 1-min (offline copy)",
+      "identity": "OCC symbol",
+      "units": "USD per share",
+      "basis": "raw",
+      "clocks": {
+        "observation": "quote in force at minute end",
+        "first_availability": "same",
+        "ingestion": "fetch_log time",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "start": "2022-11-14",
+        "end": "2026-11-09",
+        "vendor_history_from": "2013"
+      },
+      "missingness": "",
+      "latency": "n/a",
+      "entitlement": "usage-based; each fetch needs operator approval",
+      "storage_limits": "outside GRID custody",
+      "admission_status": "INSPECTED",
+      "blocked_hypotheses": [
+        "D2-H1 needs pre-2022-11-14 fetch"
+      ],
+      "notes": "pre-2022-11-14 untouched (gap G5)"
+    },
+    {
+      "id": "research.opra.open_interest_statistics",
+      "track": "D2",
+      "provider": "OPRA statistics stat_type 9 (offline copy)",
+      "identity": "OCC number; mode across exchanges",
+      "units": "contracts",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "prior close",
+        "first_availability": "~06:30 ET",
+        "ingestion": "fetch_log",
+        "calculation": "rebuilt books every 2 min"
+      },
+      "coverage": {
+        "start": "2022-11-14",
+        "end": "2026-03-25",
+        "sessions": 780
+      },
+      "missingness": "56 thin-OI sessions, 6 half days excluded",
+      "latency": "overnight",
+      "entitlement": "usage-based",
+      "storage_limits": "outside GRID custody",
+      "admission_status": "INSPECTED",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "grid.people_events.form4",
+      "track": "D1",
+      "provider": "SEC Form 4 (EDGAR / DERA) materialized",
+      "identity": "entity_cik + entity_ticker + security_id",
+      "units": "USD (size_usd); shares",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "event_time (transaction)",
+        "first_availability": "known_at, basis=filing (date-level; no acceptance time)",
+        "ingestion": "ingested_at",
+        "calculation": "materializer run_id"
+      },
+      "coverage": {
+        "start": "2006-01-04",
+        "end": "2026-07-01",
+        "rows": 4461947,
+        "ciks": 16599,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "no rows after 2026-07-01 (materializer unscheduled)",
+      "latency": "1 filing day",
+      "entitlement": "public",
+      "storage_limits": "griddb, supersede/retract columns",
+      "admission_status": "EVIDENCE_ONLY",
+      "blocked_hypotheses": [
+        "D1-F3 evaluation (owned by VS1)"
+      ],
+      "notes": "gaps G10"
+    },
+    {
+      "id": "grid.signal_sources.insider",
+      "track": "D1",
+      "provider": "EDGAR + QuiverQuant",
+      "identity": "ticker",
+      "units": "varies",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "signal_date",
+        "first_availability": "created_at (ingest proxy)",
+        "ingestion": "created_at",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "insider": {
+          "rows": 20806,
+          "start": "2018-08-15",
+          "end": "2026-11-10"
+        },
+        "quiverquant_insider": {
+          "rows": 60408,
+          "start": "2002-03-24",
+          "end": "2026-11-10"
+        },
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "",
+      "latency": "daily",
+      "entitlement": "public / QuiverQuant",
+      "storage_limits": "griddb",
+      "admission_status": "EVIDENCE_ONLY",
+      "blocked_hypotheses": [],
+      "notes": "edge-report-forward-20261106: NO_EDGE"
+    },
+    {
+      "id": "grid.insider_trades",
+      "track": "D1",
+      "provider": "EDGAR search index",
+      "identity": "ticker",
+      "units": "USD; shares",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "trade_date",
+        "first_availability": "filing_date (2,897 of 20,013 rows)",
+        "ingestion": "created_at",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "rows": 20013,
+        "tickers": 2253,
+        "filing_date_filled": 2897,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "filing_date NULL on 86%",
+      "latency": "n/a",
+      "entitlement": "public",
+      "storage_limits": "griddb",
+      "admission_status": "EXCLUDED_UNKNOWN_AVAILABILITY",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "grid.earnings_events",
+      "track": "D1",
+      "provider": "SEC EDGAR filings",
+      "identity": "CIK + accession",
+      "units": "n/a",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "period_end",
+        "first_availability": "filing_date (date-only; no acceptance datetime)",
+        "ingestion": "created_at",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "8-K": {
+          "rows": 4623,
+          "tickers": 1354
+        },
+        "10-Q": 1556,
+        "10-K": 81,
+        "start": "2026-02-19",
+        "end": "2026-11-10",
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "no history before 2026-02-19",
+      "latency": "1 day",
+      "entitlement": "public",
+      "storage_limits": "griddb",
+      "admission_status": "FORWARD_ONLY",
+      "blocked_hypotheses": [
+        "D1-F1",
+        "D1-F2 history"
+      ],
+      "notes": "gap G2: EDGAR acceptance-datetime backfill 2012-2025"
+    },
+    {
+      "id": "grid.earnings_calendar",
+      "track": "D1",
+      "provider": "yfinance + compat stubs from earnings_events",
+      "identity": "ticker",
+      "units": "EPS",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "earnings_date",
+        "first_availability": "none (estimates overwritten, pull_timestamp reset)",
+        "ingestion": "pull_timestamp",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "rows": 10508,
+        "tickers": 1203,
+        "start": "2002-07-31",
+        "end": "2027-04-01",
+        "stub_rows_earnings_date_eq_period_end": 2131,
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "estimates not PIT; release time-of-day missing",
+      "latency": "n/a",
+      "entitlement": "public",
+      "storage_limits": "griddb",
+      "admission_status": "EXCLUDED_UNKNOWN_AVAILABILITY",
+      "blocked_hypotheses": [
+        "any earnings family using these dates"
+      ],
+      "notes": "gap G7; refusal example"
+    },
+    {
+      "id": "grid.business_events",
+      "track": "D1",
+      "provider": "headline regex (business_news_parser)",
+      "identity": "regex ticker",
+      "units": "n/a",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "article published_at",
+        "first_availability": "missing",
+        "ingestion": "missing",
+        "calculation": "created_at"
+      },
+      "coverage": {
+        "rows": 1944,
+        "start": "2026-03-12",
+        "end": "2026-11-12",
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "cross-outlet duplicates",
+      "latency": "6 h",
+      "entitlement": "news feeds",
+      "storage_limits": "griddb",
+      "admission_status": "EVIDENCE_ONLY",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "grid.deal_pipeline",
+      "track": "D1",
+      "provider": "headline regex (deal_detector)",
+      "identity": "name strings",
+      "units": "n/a",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "detected_at (article time or NOW())",
+        "first_availability": "missing",
+        "ingestion": "missing",
+        "calculation": "updated_at (overwritten)"
+      },
+      "coverage": {
+        "rows": 1659,
+        "start": "2026-03-12",
+        "end": "2026-11-11",
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "no stage history",
+      "latency": "6 h",
+      "entitlement": "news feeds",
+      "storage_limits": "griddb",
+      "admission_status": "EVIDENCE_ONLY",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "grid.supply_chain_edges",
+      "track": "D1",
+      "provider": "latest 10-K regex",
+      "identity": "name slugs",
+      "units": "n/a",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "as_of = 10-K filing date",
+        "first_availability": "latest 10-K only",
+        "ingestion": "n/a",
+        "calculation": "n/a"
+      },
+      "coverage": {
+        "rows": 857,
+        "start": "2015-12-31",
+        "end": "2026-07-14",
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "no change history",
+      "latency": "weekly",
+      "entitlement": "public",
+      "storage_limits": "griddb",
+      "admission_status": "EXCLUDED_UNKNOWN_AVAILABILITY",
+      "blocked_hypotheses": [
+        "customer-supplier family"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "grid.causal_links",
+      "track": "D1",
+      "provider": "computed",
+      "identity": "ticker",
+      "units": "n/a",
+      "basis": "n/a",
+      "clocks": {
+        "observation": "event",
+        "first_availability": "known_at + basis",
+        "ingestion": "created_at",
+        "calculation": "computed_at"
+      },
+      "coverage": {
+        "rows": 2358,
+        "start": "2026-09-01",
+        "end": "2026-11-11",
+        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+      },
+      "missingness": "accepts earnings_calendar stubs",
+      "latency": "n/a",
+      "entitlement": "n/a",
+      "storage_limits": "griddb",
+      "admission_status": "FORWARD_ONLY",
+      "blocked_hypotheses": [],
+      "notes": ""
+    },
+    {
+      "id": "universe.liquid_us_equity_pit",
+      "track": "D1",
+      "provider": null,
+      "identity": null,
+      "units": null,
+      "basis": null,
+      "clocks": {
+        "observation": null,
+        "first_availability": null,
+        "ingestion": null,
+        "calculation": null
+      },
+      "coverage": {
+        "start": null,
+        "end": null
+      },
+      "missingness": "does not exist",
+      "latency": "n/a",
+      "entitlement": "Tiingo EOD (existing key)",
+      "storage_limits": "n/a",
+      "admission_status": "UNAVAILABLE",
+      "blocked_hypotheses": [
+        "all D1 history"
+      ],
+      "notes": "gap G3"
+    },
+    {
+      "id": "index.additions_deletions",
+      "track": "D1",
+      "provider": null,
+      "identity": null,
+      "units": null,
+      "basis": null,
+      "clocks": {
+        "observation": null,
+        "first_availability": null,
+        "ingestion": null,
+        "calculation": null
+      },
+      "coverage": {
+        "start": null,
+        "end": null
+      },
+      "missingness": "no source",
+      "latency": "n/a",
+      "entitlement": "n/a",
+      "storage_limits": "n/a",
+      "admission_status": "UNAVAILABLE",
+      "blocked_hypotheses": [
+        "index-flow family"
+      ],
+      "notes": ""
+    }
+  ],
+  "inspected_windows": [
+    {
+      "ledger": "gex panel_trials row 10",
+      "family": "volume-climax fade",
+      "window": {
+        "start": "2025-05-01",
+        "end": "2025-12-31"
+      },
+      "verdict": "FAIL",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex 41d2181",
+      "family": "range-offsides fakeout fade",
+      "window": {
+        "start": "2026-03-25",
+        "end": "2026-11-04"
+      },
+      "verdict": "FAIL",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge1 DAYSIDE",
+      "family": "late-day prior-close side",
+      "window": {
+        "start": "2025-04-02",
+        "end": "2026-03-24"
+      },
+      "verdict": "FAIL",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex 98f0702",
+      "family": "rules-2 shadow level fade",
+      "window": {
+        "start": "2026-11-04",
+        "end": "2026-11-06"
+      },
+      "verdict": "FAIL",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge2 c5051ea",
+      "family": "option flow / skew / magnet / overnight shares",
+      "window": {
+        "start": "2022-11-14",
+        "end": "2026-11-09"
+      },
+      "verdict": "FAIL x4",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge3 2ee3eff",
+      "family": "calendar anomalies (daily)",
+      "window": {
+        "start": "1993-01-29",
+        "end": "2026-11-10"
+      },
+      "verdict": "FAIL x3, UNDERPOWERED x1",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge4 7c6cc9a",
+      "family": "pin-range/2, gamma-break/1, em-exhaustion/1 replay",
+      "window": {
+        "start": "2022-11-14",
+        "end": "2026-03-25"
+      },
+      "verdict": "FAIL x3",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge5 9f664a8",
+      "family": "day-type levers",
+      "window": {
+        "start": "2022-11-14",
+        "end": "2026-11-09"
+      },
+      "verdict": "FAIL, UNDERPOWERED x2",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge6 cb7b213",
+      "family": "0DTE short iron fly",
+      "window": {
+        "start": "2022-11-14",
+        "end": "2026-11-09"
+      },
+      "verdict": "PASS 12:00/14:00/15:00; FAIL 09:35",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge7 6b90351",
+      "family": "pin setups",
+      "window": {
+        "start": "2022-11-14",
+        "end": "2026-11-09"
+      },
+      "verdict": "FAIL x3, UNDERPOWERED x1",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "gex edge8 73ffc1d (dev only)",
+      "family": "trade-flow turn markers",
+      "window": {
+        "start": "2024-11-01",
+        "end": "2026-11-09"
+      },
+      "verdict": "not registered",
+      "record": "3pacs/GRID#1133"
+    },
+    {
+      "ledger": "#1065 v1-v6",
+      "family": "ETF ensembles",
+      "window": {
+        "start": "2017-01-01",
+        "end": "2026-10-31"
+      },
+      "verdict": "FAIL x6; 492 trials",
+      "record": "3pacs/GRID#1065"
+    },
+    {
+      "ledger": "VS1 v8",
+      "family": "Form 4 insider density",
+      "window": {
+        "start": "2008-01-01",
+        "end": "2026-07-01"
+      },
+      "verdict": "registered; holdout 2020-01-01..2026-07-01 reserved",
+      "record": "docs/paper_log/vs1-insider-density-v8-preregistration.md"
+    },
+    {
+      "ledger": "edge-report-forward-20261106",
+      "family": "all signal_sources",
+      "window": {
+        "start": "2002-03-24",
+        "end": "2026-11-06"
+      },
+      "verdict": "NO_EDGE",
+      "record": "docs/research/edge-report-forward-20261106.md"
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "D1-F1",
+      "track": "D1",
+      "statement": "8-K Item 2.02 earnings releases: top-quintile ranked events beat declare-all, sector-relative, +5 and +20 sessions",
+      "window": {
+        "dev": [
+          "2012-01-01",
+          "2018-12-31"
+        ],
+        "holdout": [
+          "2019-01-01",
+          "2025-12-31"
+        ]
+      },
+      "n_floor": 200,
+      "one_sided_level": 0.9875,
+      "look": "one per horizon",
+      "status": "BLOCKED: G1,G2,G3"
+    },
+    {
+      "id": "D1-F2",
+      "track": "D1",
+      "statement": "8-K Items 1.01/2.01/1.02 deal events: same test",
+      "window": {
+        "dev": [
+          "2012-01-01",
+          "2018-12-31"
+        ],
+        "holdout": [
+          "2019-01-01",
+          "2025-12-31"
+        ]
+      },
+      "n_floor": 200,
+      "one_sided_level": 0.9875,
+      "look": "one per horizon",
+      "status": "BLOCKED: G1,G2,G3"
+    },
+    {
+      "id": "D1-F3",
+      "track": "D1",
+      "statement": "Form 4 open-market purchases",
+      "window": "evidence-only; evaluation owned by VS1 v8 / trade-edge-v2",
+      "n_floor": null,
+      "one_sided_level": null,
+      "look": null,
+      "status": "EVIDENCE_ONLY"
+    },
+    {
+      "id": "D2-H1",
+      "track": "D2",
+      "statement": "edge6 14:00/15:00 ATM short iron fly replicates on pre-2022-11-14 M/W/F SPY expiries",
+      "window": {
+        "holdout": [
+          "2018-01-02",
+          "2022-11-11"
+        ]
+      },
+      "n_floor": 300,
+      "one_sided_level": 0.9833,
+      "look": "one",
+      "status": "BLOCKED: G1,G4,G5"
+    },
+    {
+      "id": "D2-H2",
+      "track": "D2",
+      "statement": "fly-shadow/1: 15:00 fly exited 15:55 at bid/ask has mean net > 0 (adopted unchanged, registration fe8318a)",
+      "window": {
+        "forward_from": "2026-11-12"
+      },
+      "n_floor": 100,
+      "one_sided_level": 0.95,
+      "look": "one at 100 traded sessions",
+      "status": "COLLECTING (0 judged rows on 2026-11-12)"
+    },
+    {
+      "id": "D2-H3",
+      "track": "D2",
+      "statement": "bounce-shadow/1: long SPY 15:29-15:59 after negative-gamma late bounce (adopted unchanged, registration f8b3874; informed by edge7 P3)",
+      "window": {
+        "forward_from": "2026-11-12"
+      },
+      "n_floor": 50,
+      "one_sided_level": 0.95,
+      "look": "one at 50 qualifying sessions",
+      "status": "COLLECTING (0 judged rows on 2026-11-12)"
+    }
+  ],
+  "gaps": [
+    {
+      "id": "G1",
+      "text": "research owner and independent reviewer not named"
+    },
+    {
+      "id": "G2",
+      "text": "no EDGAR acceptance-datetime history before 2026-02-19"
+    },
+    {
+      "id": "G3",
+      "text": "no point-in-time liquid-equity universe"
+    },
+    {
+      "id": "G4",
+      "text": "no options cost class in evals/e2/cost_model.json"
+    },
+    {
+      "id": "G5",
+      "text": "pre-2022-11-14 OPRA quotes not fetched (spend approval)"
+    },
+    {
+      "id": "G6",
+      "text": "event_sequence drops signal_sources events (r[8]) and stamps filings at period_end"
+    },
+    {
+      "id": "G7",
+      "text": "2,131 earnings_calendar compat stubs read as releases by causal_links"
+    },
+    {
+      "id": "G8",
+      "text": "S11/E3 window format lacks contract identity, intraday horizon, inspected-not-tested"
+    },
+    {
+      "id": "G9",
+      "text": "SPY chain history in GRID is 30 sessions; OCC symbol and bid/ask size not stored"
+    },
+    {
+      "id": "G10",
+      "text": "people_events materializer unscheduled (stale since 2026-07-01)"
+    },
+    {
+      "id": "G11",
+      "text": "CBOE SKEW stale since 2026-03-25"
+    },
+    {
+      "id": "G12",
+      "text": "forced_flow_monitor ignores holidays; FOMC dates hard-coded for 2026"
+    }
+  ]
+}
