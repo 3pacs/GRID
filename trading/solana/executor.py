@@ -398,7 +398,9 @@ class PaperSolanaExecutor:
             amount=trade_size_atoms,
             taker=self.wallet.address,
         )
-        raw = self.jupiter.execute_swap(order, self.wallet)
+        raw = self.jupiter.execute_swap(
+            order, self.wallet, verify=self._verify_before_signing,
+        )
 
         log.info(
             "Solana live swap submitted — {sym} {action} req={r}",
@@ -423,6 +425,12 @@ class PaperSolanaExecutor:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _verify_before_signing(self, order: Any, wallet_address: str) -> Any:
+        """Simulate the Jupiter order on our own RPC before it is signed (#1143)."""
+        from trading.solana.presign_check import verify_order_before_signing
+
+        return verify_order_before_signing(order, wallet_address, self.safety.rpc)
+
     def _fetch_entry_price(self, mint: str) -> float | None:
         try:
             snapshot = self.jupiter.get_token_price(mint).get(mint, {})

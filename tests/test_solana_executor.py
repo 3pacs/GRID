@@ -279,6 +279,11 @@ def test_executor_live_happy_path(
     # Computed atoms from USD notional — NOT the raw fraction
     assert call["amount"] > 0
     mock_jupiter.execute_swap.assert_called_once()
+    # The live path always passes the pre-sign check (#1143).
+    assert (
+        mock_jupiter.execute_swap.call_args.kwargs["verify"]
+        == executor._verify_before_signing
+    )
     assert result.safety_report is not None
     assert result.limit_decision is not None
 
