@@ -59,3 +59,4 @@ llm/autoresearch/host_profiles.json
 
 # Hermes-generated wiki reports (regenerated each cycle; not source)
 docs/wiki/
+outputs/supply_chain/

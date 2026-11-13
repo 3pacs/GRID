@@ -387,7 +387,7 @@ def test_each_detector_failure_is_visible_in_sent_summary(monkeypatch, failed):
     with patch("alerts.email._send") as send:
         result = sca.run_all(MagicMock(), send_email=True)
     assert result["failed_detectors"] == [failed]
-    assert result["total"] == 6
+    assert result["total"] == len(sca.DETECTOR_ORDER) - 1
     summary = send.call_args.args[1][0]["body"]
     assert f"detector(s) failed: {failed}" in summary
     assert "not a source-data timestamp" in summary

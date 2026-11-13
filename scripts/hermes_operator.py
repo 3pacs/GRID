@@ -3531,6 +3531,38 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Actor report import failed: {e}", e=str(exc))
 
+        # Supply-chain graph upkeep (3pacs/GRID#1179). The graph had no new
+        # edge after 2026-07-14: both jobs existed (_SOURCE_EXTRAS lists them)
+        # but nothing ran them. The 10-K parser is deterministic regex mining
+        # of SEC filings (no LLM; edges upsert as confidence 'derived'), SEC
+        # rate-limited, 15 minutes a week, resuming its pass from a persistent
+        # checkpoint. The validator then re-checks every edge against prices.
+        try:
+            from ingestion.altdata.supply_chain_parser import (
+                run_weekly as run_supply_chain_parser,
+            )
+            results["weekly_supply_chain_parser"] = _run_intel_task(
+                "weekly_supply_chain_parser",
+                run_supply_chain_parser,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Supply-chain parser import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.supply_chain_edge_validator import (
+                run_weekly as run_supply_chain_edge_validator,
+            )
+            results["weekly_supply_chain_edge_validator"] = _run_intel_task(
+                "weekly_supply_chain_edge_validator",
+                run_supply_chain_edge_validator,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Supply-chain edge validator import failed: {e}", e=str(exc))
+
         state.last_weekly_intel = now
 
     return results

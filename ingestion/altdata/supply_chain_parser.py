@@ -27,9 +27,16 @@ Pipeline for each ticker:
   7. Upsert the edge into ``supply_chain_edges`` and any new node
      into ``supply_chain_nodes`` using parameterized SQL.
 
-Checkpointing: the parser writes ``/tmp/grid_10k_parser_checkpoint.json``
-so it can be resumed across runs. The total wall-clock budget is
-capped at 1 hour per invocation.
+Checkpointing: the parser writes its progress to
+``$GRID_SUPPLY_CHAIN_CHECKPOINT`` (default
+``outputs/supply_chain/10k_parser_checkpoint.json`` in the repo; it was
+``/tmp``, which a reboot or a private tmp wipes), so it resumes across runs.
+Once every ticker in the universe is done, the next run starts a new pass
+(``cycle`` + 1), so a weekly schedule keeps re-reading the universe and picks
+up new 10-Ks (3pacs/GRID#1179); edges upsert, so a re-read never duplicates.
+The total wall-clock budget is capped at 1 hour per invocation; the Hermes
+weekly run uses :data:`WEEKLY_BUDGET_SECONDS` (it runs inline in the Hermes
+loop).
 
 Rate limit: the SEC Fair Access guideline caps traffic at 10 req/sec.
 We sleep ~120 ms between requests and send a descriptive User-Agent.
@@ -65,7 +72,15 @@ _COMPANY_TICKERS_URL: str = "https://www.sec.gov/files/company_tickers.json"
 _SUBMISSIONS_URL: str = "https://data.sec.gov/submissions/CIK{cik}.json"
 _ARCHIVES_BASE: str = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{doc}"
 
-_CHECKPOINT_PATH: Path = Path("/tmp/grid_10k_parser_checkpoint.json")
+import os as _os
+
+_CHECKPOINT_PATH: Path = Path(
+    _os.environ.get(
+        "GRID_SUPPLY_CHAIN_CHECKPOINT",
+        str(Path(__file__).resolve().parents[2] / "outputs" / "supply_chain" / "10k_parser_checkpoint.json"),
+    )
+)
+WEEKLY_BUDGET_SECONDS: int = 900  # Hermes runs weekly tasks inline: 15 minutes, then resume next week
 _DEFAULT_RUN_BUDGET_SECONDS: int = 3600  # 1 hour hard cap
 _MAX_DOC_BYTES: int = 12 * 1024 * 1024   # 12 MB cap per 10-K doc
 
@@ -907,10 +922,11 @@ class SupplyChain10KParser:
         except Exception:
             return {"done": [], "stats": {}}
 
-    def _save_checkpoint(self, done: list[str]) -> None:
+    def _save_checkpoint(self, done: list[str], cycle: int = 1) -> None:
         try:
             payload = {
                 "done": done,
+                "cycle": cycle,
                 "stats": {
                     "edges": self.stats.edges_created,
                     "nodes": self.stats.nodes_created,
@@ -918,9 +934,12 @@ class SupplyChain10KParser:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
             }
-            _CHECKPOINT_PATH.write_text(json.dumps(payload, indent=2))
+            _CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _CHECKPOINT_PATH.with_name(_CHECKPOINT_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(_CHECKPOINT_PATH)  # atomic: a crash mid-write never loses the progress
         except Exception as exc:
-            log.debug("checkpoint save failed: {e}", e=str(exc))
+            log.warning("checkpoint save failed: {e}", e=str(exc))
 
     # ── Ticker universe ──────────────────────────────────────────────────
 
@@ -1090,6 +1109,7 @@ class SupplyChain10KParser:
 
         checkpoint = self._load_checkpoint()
         done: list[str] = list(checkpoint.get("done", []))
+        cycle = int(checkpoint.get("cycle", 1) or 1)
         done_set = set(done)
 
         if tickers is None:
@@ -1098,6 +1118,13 @@ class SupplyChain10KParser:
             universe = [t.upper() for t in tickers]
 
         queued = [t for t in universe if t not in done_set]
+        if not queued and universe and tickers is None:
+            # Pass complete: start the next one so a weekly schedule keeps
+            # re-reading 10-Ks instead of idling forever (3pacs/GRID#1179).
+            cycle += 1
+            done, done_set = [], set()
+            queued = list(universe)
+            log.info("SupplyChain10KParser: universe done, starting pass {c}", c=cycle)
         if limit is not None:
             queued = queued[:limit]
 
@@ -1124,9 +1151,9 @@ class SupplyChain10KParser:
             done_set.add(ticker)
             # Checkpoint every 10 tickers to survive interruptions
             if len(done) % 10 == 0:
-                self._save_checkpoint(done)
+                self._save_checkpoint(done, cycle)
 
-        self._save_checkpoint(done)
+        self._save_checkpoint(done, cycle)
 
         summary = {
             "tickers_processed": self.stats.tickers_processed,
@@ -1137,6 +1164,9 @@ class SupplyChain10KParser:
             "nodes_created": self.stats.nodes_created,
             "pattern_hits": self.stats.pattern_hits,
             "elapsed_seconds": round(time.monotonic() - started, 1),
+            "cycle": cycle,
+            "universe": len(universe),
+            "remaining_in_pass": len([t for t in universe if t not in done_set]),
         }
         log.info("SupplyChain10KParser done: {s}", s=summary)
         return summary
@@ -1145,8 +1175,14 @@ class SupplyChain10KParser:
 # ── Hermes entrypoint (weekly) ────────────────────────────────────────────────
 
 
-def run_weekly(db_engine: Engine | None = None) -> dict[str, Any]:
-    """Hermes operator entrypoint. Runs once a week for 1 hour max."""
+def run_weekly(
+    db_engine: Engine | None = None, budget_seconds: int = WEEKLY_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """Hermes operator entrypoint: once a week, ``budget_seconds`` (15 min) per run.
+
+    Hermes runs it inline in its loop, so the budget is short; the
+    checkpoint carries the pass across weeks.
+    """
     if db_engine is None:
         from db import get_engine
 
@@ -1154,7 +1190,7 @@ def run_weekly(db_engine: Engine | None = None) -> dict[str, Any]:
     parser = SupplyChain10KParser(db_engine=db_engine)
     return parser.run(
         limit=None,
-        budget_seconds=_DEFAULT_RUN_BUDGET_SECONDS,
+        budget_seconds=budget_seconds,
     )
 
 

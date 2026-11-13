@@ -631,10 +631,15 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # timeout_s 600, TIINGO_API_KEY, with a 2-line comment) and its
         # REGISTRY_CATALOG_NAMES alias finra_dix -> FINRA_SHORT_VOLUME. Needs
         # reviewer acceptance like the prior pins.
+        # OPER re-pinned 69b8efc2 -> be8b5f59 (2026-11-13,
+        # feat/supply-chain-weekly-20261113, 3pacs/GRID#1179): the only operator
+        # edit is two _run_intel_task calls appended to the Sunday weekly block
+        # (supply_chain_parser.run_weekly, supply_chain_edge_validator.run_weekly)
+        # with a 6-line comment. Needs reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','69b8efc2c8f1dcbffcf0bd2ae7f4a9c0fdc861ccb5fb6914d0e76b20c6b2a84a'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','be8b5f59a2d215b6815f07848d2d3232ea207c80c90eae375d9e5d90ea294054'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
