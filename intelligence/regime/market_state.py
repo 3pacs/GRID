@@ -24,7 +24,7 @@ calendar has no availability lag.
 
 News comes from the daily newspaper-based uncertainty indexes (USEPUINDXD, WLEMUINDXD), read from ALFRED vintages
 (``store/fred_vintages.py``) as FRED showed them on each day, because they are revised for weeks after first print.
-``news_shock`` labels a high first print "scheduled" when a release fell on its day, else "unscheduled". Release and
+``news_shock`` reports elevated uncertainty and calendar co-occurrence without attributing a shock. Release and
 earnings surprises, DIX and dealer gamma are listed in :data:`PENDING`; the record says so instead of filling them.
 """
 
@@ -306,21 +306,28 @@ def _first_print(series_id: str) -> Callable[["_Reads"], pd.Series]:
 
 
 def news_shock(reading: dict[str, Any], obs_date: date | None, calendar: dict[str, list[date]]) -> dict[str, Any]:
-    """Classify today's news first print: unscheduled news, scheduled-event news, or none.
+    """Describe a newspaper uncertainty proxy and calendar co-occurrence, not news causality.
 
-    A first print at least SHOCK_Z robust z above its own baseline is news. It is "scheduled" when a scheduled
-    release (``config/econ_release_dates.json``) fell on the observation's day, else "unscheduled".
+    A large index reading is not proof of a market-moving shock. Sharing a date with a
+    listed release cannot attribute the reading to that release. Conversely, no listed
+    release or a low proxy reading cannot establish an unscheduled shock or flow-only day.
+    The enclosing key remains ``news_shock`` for record compatibility; kind is descriptive.
     """
     if reading.get("status") != "ok" or obs_date is None:
         return {"status": "unavailable", "reason": reading.get("reason", "no first print")}
     z = reading.get("robust_z")
+    if isinstance(z, (bool, np.bool_)) or not isinstance(z, (int, float, np.number)) or not np.isfinite(z):
+        return {"status": "unavailable", "reason": "first-print robust_z is not a finite number"}
     events = sorted(k for k, ds in calendar.items() if obs_date in ds) if calendar else []
-    if z is None or z < SHOCK_Z:
-        kind = "none"
-    else:
-        kind = "scheduled" if events else "unscheduled"
-    return {"status": "ok", "kind": kind, "obs_date": obs_date.isoformat(), "robust_z": z, "threshold_z": SHOCK_Z,
-            "events_on_obs_day": events, "calendar_known": bool(calendar)}
+    context = "listed_release" if events else ("no_listed_release" if calendar else "unknown")
+    return {
+        "status": "ok", "kind": "elevated_uncertainty" if z >= SHOCK_Z else "not_elevated",
+        "obs_date": obs_date.isoformat(), "robust_z": float(z), "threshold_z": SHOCK_Z,
+        "events_on_obs_day": events, "calendar_known": bool(calendar), "calendar_context": context,
+        "news_attribution": "unverified", "supports_flow_only_classification": False,
+        "basis": "newspaper uncertainty index first print; calendar co-occurrence only",
+    }
+
 
 
 VARIABLES: list[VarSpec] = [

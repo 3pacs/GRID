@@ -204,16 +204,16 @@ def test_first_print_is_the_newest_weekday_as_first_shown():
     assert obs2[date(2025, 2, 3)] == date(2025, 1, 31)
 
 
-def test_news_shock_scheduled_vs_unscheduled():
+def test_news_uncertainty_calendar_cooccurrence():
     ok = {"status": "ok", "robust_z": 3.1}
     cal = {"cpi": [date(2025, 2, 12)]}
-    assert M.news_shock(ok, date(2025, 2, 12), cal)["kind"] == "scheduled"
-    assert M.news_shock(ok, date(2025, 2, 13), cal)["kind"] == "unscheduled"
-    assert M.news_shock({"status": "ok", "robust_z": 1.0}, date(2025, 2, 13), cal)["kind"] == "none"
+    assert M.news_shock(ok, date(2025, 2, 12), cal)["kind"] == "elevated_uncertainty"
+    assert M.news_shock(ok, date(2025, 2, 13), cal)["kind"] == "elevated_uncertainty"
+    assert M.news_shock({"status": "ok", "robust_z": 1.0}, date(2025, 2, 13), cal)["kind"] == "not_elevated"
     assert M.news_shock({"status": "unavailable", "reason": "x"}, None, cal)["status"] == "unavailable"
 
 
-def test_record_reads_news_from_vintages_and_flags_an_unscheduled_spike(engine):
+def test_record_reads_news_from_vintages_and_reports_uncertainty(engine):
     _seed(engine)
     spike = date(2025, 6, 9)      # Monday; first printed 06-10 (the as_of)
     for sid in ("USEPUINDXD", "WLEMUINDXD"):
@@ -222,10 +222,10 @@ def test_record_reads_news_from_vintages_and_flags_an_unscheduled_spike(engine):
     for k in ("news_uncertainty", "equity_news_uncertainty", "news_first_print"):
         assert st["variables"][k]["status"] == "ok", (k, st["variables"][k])
     shock = st["news_shock"]
-    assert shock["obs_date"] == "2025-06-09" and shock["kind"] == "unscheduled" and shock["robust_z"] >= 2
-    # nfp on 06-06 is not the spike's day; with CPI moved onto it, the same spike is scheduled news.
+    assert shock["obs_date"] == "2025-06-09" and shock["kind"] == "elevated_uncertainty" and shock["robust_z"] >= 2
+    # nfp on 06-06 is not the spike's day; with CPI moved onto it, the same proxy observation co-occurs with CPI; causation stays unverified.
     st2 = M.compute_market_state(engine, AS_OF, calendar={**CAL, "cpi": [spike]}).to_dict()
-    assert st2["news_shock"]["kind"] == "scheduled" and st2["news_shock"]["events_on_obs_day"] == ["cpi"]
+    assert st2["news_shock"]["kind"] == "elevated_uncertainty" and st2["news_shock"]["events_on_obs_day"] == ["cpi"]
 
 
 def test_a_news_revision_after_as_of_never_changes_the_record(engine):
@@ -237,3 +237,30 @@ def test_a_news_revision_after_as_of_never_changes_the_record(engine):
                                       "realtime_end": FV.OPEN_END, "value": 9999.0}])
     after = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
     assert json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True)
+
+
+@pytest.mark.parametrize("z", [None, float("nan"), float("inf"), float("-inf"), True, "high"])
+def test_news_uncertainty_invalid_measurement_is_unavailable(z):
+    result = M.news_shock({"status": "ok", "robust_z": z}, date(2025, 2, 12), {})
+    assert result["status"] == "unavailable"
+
+
+def test_news_uncertainty_missing_calendar_does_not_imply_unscheduled_shock():
+    result = M.news_shock({"status": "ok", "robust_z": 3.0}, date(2025, 2, 12), {})
+    assert result["kind"] == "elevated_uncertainty"
+    assert result["calendar_context"] == "unknown"
+    assert result["news_attribution"] == "unverified"
+
+
+def test_news_uncertainty_same_date_event_is_not_causal_attribution():
+    result = M.news_shock({"status": "ok", "robust_z": 3.0}, date(2025, 2, 12), {"cpi": [date(2025, 2, 12)]})
+    assert result["kind"] == "elevated_uncertainty"
+    assert result["calendar_context"] == "listed_release"
+    assert result["news_attribution"] == "unverified"
+    assert result["supports_flow_only_classification"] is False
+
+
+def test_low_news_uncertainty_does_not_prove_no_news():
+    result = M.news_shock({"status": "ok", "robust_z": 0.0}, date(2025, 2, 12), {"cpi": [date(2025, 2, 13)]})
+    assert result["kind"] == "not_elevated"
+    assert result["supports_flow_only_classification"] is False
