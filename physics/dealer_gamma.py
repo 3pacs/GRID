@@ -776,6 +776,19 @@ class DealerGammaEngine:
                                           "created_at", "capture_batch_id", "capture_ordinal",
                                           "capture_started_at", "capture_completed_at",
                                           "provider_regular_market_at"])
+        # Corrupt numerics invalidate the batch, rather than silently removing
+        # one side of exposure and publishing a directional partial profile.
+        # Legitimate zero/nonpositive OI or IV retain the existing filter below.
+        for column in ("strike", "open_interest", "implied_volatility"):
+            values = df[column]
+            if values.map(lambda value: isinstance(value, (bool, np.bool_))).any():
+                return pd.DataFrame()
+            numeric = pd.to_numeric(values, errors="coerce")
+            if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+                return pd.DataFrame()
+            df[column] = numeric
+        if (df["strike"] <= 0).any():
+            return pd.DataFrame()
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         df = df[(df["dte"] > 0)
                 & (df["open_interest"] > 0)
