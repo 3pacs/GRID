@@ -50,10 +50,10 @@ def test_admitted_while_unsigned_is_refused_with_every_reason():
         assert needle in errs, needle
 
 
-def test_admitted_with_all_prerequisites_passes():
+def test_declared_prerequisites_do_not_authenticate_admission():
     m = _signed(_real())
     m["inputs"].append(_admitted_input())
-    assert M.validate(m) == []
+    assert any("authenticated verifier not implemented" in e for e in M.validate(m))
 
 
 def test_unknown_status_and_unsigned_hypothesis_admission_are_refused():
@@ -76,3 +76,27 @@ def test_cli_exit_codes(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps(m))
     assert M.main(["--manifest", str(bad)]) == 1
+
+
+def test_signed_hypothesis_without_dependencies_is_refused():
+    m = _signed(_real())
+    m["hypotheses"][0]["status"] = "ADMITTED"
+    assert M.validate(m)
+
+def test_false_string_signatures_cannot_admit():
+    m = _signed(_real())
+    m["research_owner"]["signed"] = "false"
+    m["reviewer"]["signed"] = "false"
+    m["signed_at"] = "not-a-date"
+    m["contract_body_sha256"] = "x"
+    m["reviewer"]["manifest_sha256"] = "y"
+    m["hypotheses"][0]["status"] = "ADMITTED"
+    assert M.validate(m)
+
+def test_null_visibility_cannot_admit_backfilled_input():
+    m = _signed(_real())
+    i = next(i for i in m["inputs"] if i["id"] == "grid.raw_series.CBOE:SKEW")
+    i["admission_status"] = "ADMITTED"
+    i["clocks"]["first_availability_receipt"] = "sha256:placeholder"
+    i["clocks"]["durable_visibility"] = None
+    assert M.validate(m)
