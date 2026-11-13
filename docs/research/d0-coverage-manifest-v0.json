@@ -102,7 +102,7 @@
       "storage_limits": "raw_series",
       "admission_status": "CANDIDATE_UNREVIEWED",
       "blocked_hypotheses": [],
-      "notes": "regime conditioning only, under the section 6.1 daily-conditioner rule; first availability 'after close' is an assertion, not a checked historical receipt. The 2026-04-09 yfinance vintage of vix_spot holds 1,640 of 9,134 rows more than 5 % off the other sources (e.g. 2025-07-07: 33.43 vs 17.79), all superseded on 2026-04-10, 0 retracted; reads at as_of 2026-04-09 are excluded unless retracted. Holiday-print cause (likely Cboe global trading hours) not verified",
+      "notes": "regime conditioning only, under the section 6.1 daily-conditioner rule; first availability 'after close' is an assertion, not a checked historical receipt. The 2026-04-09 yfinance vintage of vix_spot holds 1,640 of 9,134 rows more than 5 % off the other sources (e.g. 2025-07-07: 33.43 vs 17.79), all superseded on 2026-04-10, 0 retracted; only one row (obs 2026-04-09) is a first release. Reads at as_of 2026-04-09 are excluded; a retraction would not hide them (store/pit.py applies a retraction only from its own date). Holiday-print cause (likely Cboe global trading hours) not verified",
       "receipts": {
         "query_sha256": "57885d71cc44d758e037275f27e7e3d3ec872f09334570d55ce864b7979eb93b",
         "snapshot": "docs/research/d0-receipts/vix_holiday_rows.result.json",
@@ -129,6 +129,11 @@
             "snapshot": "docs/research/d0-receipts/retractions_check.result.json",
             "query_sha256": "cf8d560fe58fdeb590de28aec694de20e42f8d3958128775fc273aa69f8425b8",
             "receipt_sha256": "7c056649efccf87b4add601927349e51cc8ac82ab095383c03c6a90c35b39fc3"
+          },
+          {
+            "snapshot": "docs/research/d0-receipts/vintage_20260409_first_release.result.json",
+            "query_sha256": "761eee8c07958890cca189b68e11d2952c7c8c9ec73d7afa317bb5b7744a8c8f",
+            "receipt_sha256": "30dd374f89f7f59ef0a7c20bcd43e98606fc992a33b7e56528c64d4bab6666fb"
           }
         ]
       }

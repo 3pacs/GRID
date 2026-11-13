@@ -123,7 +123,7 @@ An input enters a decision only if all six are known; otherwise it is `EXCLUDED_
 |---|---|---|---|---|
 | `options_capture_batches` / `options_snapshots_all`, SPY, Cboe delayed (~15 min) | GRID griddb, append-only | **2026-10-01 .. 2026-11-11, 30 sessions, 359 batches** (measured 2026-11-12) | batch `registered_at`, `capture_started/completed_at`; per-contract quote time absent; spot clock only from 2026-11-10 | forward-only; too short for any historical claim; OCC symbol not stored, no bid/ask size |
 | `options_daily_signals` / `spy_iv_*` features | GRID | same as above | obs = release = snap date | diagnostic; "25-delta" is a ±10 % moneyness proxy |
-| CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | **CANDIDATE_UNREVIEWED**. Proposed for regime conditioning as the prior session's close, read under the §6.1 daily-conditioner rule. "Published after the close" is an assertion, not a checked historical first-availability receipt. Measured 2026-11-13 (`d0-receipts/vix_*`, `vintage_20260409`): `vix_spot` carries real Cboe prints on non-session days (from 2022-05-30, every NYSE holiday except New Year's Day, Good Friday and Christmas; also the 2004-06-11 and 2025-01-09 closures); CBOE, FRED and yfinance agree on them. The 2026-04-09 yfinance vintage holds 1,640 rows more than 5 % off the other sources, superseded on 2026-04-10 and not retracted. VIX9D/VIX3M were not measured |
+| CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | **CANDIDATE_UNREVIEWED**. Proposed for regime conditioning as the prior session's close, read under the §6.1 daily-conditioner rule. "Published after the close" is an assertion, not a checked historical first-availability receipt. Measured 2026-11-13 (`d0-receipts/vix_*`, `vintage_20260409`): `vix_spot` carries real Cboe prints on non-session days (from 2022-05-30, every NYSE holiday except New Year's Day, Good Friday and Christmas; also the 2004-06-11 and 2025-01-09 closures); CBOE, FRED and yfinance agree on them. The 2026-04-09 yfinance vintage holds 1,640 rows more than 5 % off the other sources, superseded on 2026-04-10 and not retracted. Only one of them (obs 2026-04-09) is a first release. VIX9D/VIX3M were not measured |
 | CBOE SKEW (`skew_index`) | GRID `resolved_series` | **1990-01-02 .. 2026-11-11**, 9,268 dates (measured 2026-11-13, query receipt `d0-receipts/g11_skew_coverage`). Since 2026-03-26 the only `vix_spot` dates without SKEW are 4 US market holidays; 50 such dates over the full history, not itemised | daily close; first resolved vintage 1 day after obs for 150 of 160 dates since 2026-03-26, 2–6 days for 10. Rows for 2026-03-26 .. 11-11 were committed by the 2026-11-13 backfill (clock 4 **UNPROVEN**) | **CANDIDATE_UNREVIEWED**, on the same terms as VIX: "after the close" is an assertion, not a first-availability receipt (G11 coverage closed) |
 | Schwab chains / quotes / 1-min bars | process-local only, `persist_allowed=False`; no redistribution | live only | provider quoteTime + receipt time | live inputs for forward shadows; no history; no aggressor side |
 | Polygon `/v3/snapshot/options` | — | 403, puller SKIPPED | — | unavailable |
@@ -337,9 +337,9 @@ under an append-only table with accession as key. Compute small.
     Cboe publishes VIX on most NYSE holidays since 2022-05-30 (§3.1); SKEW is not published on them;
   - if the value for that session is missing, the cell is excluded for session *t* and counted (§7 rule 4).
     It is never filled from an earlier session or from another conditioner;
-  - a read that would serve the unretracted 2026-04-09 yfinance `vix_spot` vintage (`as_of` on 2026-04-09)
-    is excluded and counted, unless that vintage is retracted before signing. A retraction is a separate,
-    unauthorised write;
+  - a read that would serve the bad 2026-04-09 yfinance `vix_spot` vintage (`as_of` on 2026-04-09) is
+    excluded and counted. A retraction cannot replace this rule: `store/pit.py` hides a retracted row only
+    for `as_of` on or after the retraction date, so replays at `as_of` 2026-04-09 would still serve it;
   - sessions are checked against `ingestion/market_calendar.py` plus the #1100 corrections, never against
     the dates of another series. Calendar comparisons exclude retracted rows (`spy_full` holds retracted
     rows on the closed days 2025-01-09 and 2025-07-04).
@@ -609,7 +609,7 @@ conditioner takes; it is set before any D2 data is scored.
 
 | Change | Where |
 |---|---|
-| Daily-conditioner rule: the prior-session close on the §6.1 session calendar; non-session prints ignored; missing → excluded, never filled; the 2026-04-09 bad vintage excluded unless retracted | §6.1 |
+| Daily-conditioner rule: the prior-session close on the §6.1 session calendar; non-session prints ignored; missing → excluded, never filled; reads at `as_of` 2026-04-09 excluded (a retraction would not hide them, since it applies only from its own date) | §6.1 |
 | VIX holiday prints and the 2026-04-09 vintage measured with five read-only query receipts (`d0-receipts/vix_holiday_rows`, `vix_vs_spy_calendar`, `vintage_20260409`, `served_20260409`, `retractions_check`) | §3.1, manifest `grid.raw_series.CBOE:VIX` |
 | The revision 3 side finding is answered: the holiday rows are real Cboe prints, not a GRID defect | §3.1 |
 
