@@ -104,14 +104,19 @@ class ActorImpact:
 
 # ── Query helpers ────────────────────────────────────────────────────────────
 
-# 3pacs/GRID#1180: an edge the 10-K/10-Q parser derived joins the contagion
-# graph only after the weekly validator has measured it (last_validation_at)
-# and not flagged it weak. Curated tiers (confirmed, inferred,
-# derived_from_backtest) are unchanged. Derived edges whose endpoints the
-# validator cannot price (private or foreign) stay out until they can be checked.
+# 3pacs/GRID#1180: a derived edge joins the contagion graph only after the
+# weekly validator has measured it (last_validation_at) and not flagged it
+# weak. Curated tiers (confirmed, inferred, derived_from_backtest) are
+# unchanged. The validator can only price edges between two listed nodes, so
+# an 8-K edge (ingestion/altdata/supply_chain_8k.py: a verbatim quote checked
+# against the filing, and its URL) with a private or other non-ticker end
+# joins on that citation; 10-K/10-Q regex edges to private nodes stay out.
 VALIDATED_DERIVED_GATE = (
     " AND NOT (confidence = 'derived'"
-    " AND (last_validation_at IS NULL OR COALESCE(relationship_weak, FALSE)))"
+    " AND (last_validation_at IS NULL OR COALESCE(relationship_weak, FALSE))"
+    " AND NOT (source LIKE '8-K % Item 1.01 https://www.sec.gov/%'"
+    " AND EXISTS (SELECT 1 FROM supply_chain_nodes gate_n"
+    " WHERE gate_n.id IN (upstream_id, downstream_id) AND gate_n.type <> 'ticker')))"
 )
 
 _EDGE_COLS = (
