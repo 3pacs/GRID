@@ -102,7 +102,7 @@
       "storage_limits": "raw_series",
       "admission_status": "CANDIDATE_UNREVIEWED",
       "blocked_hypotheses": [],
-      "notes": "regime conditioning only, under the section 6.1 daily-conditioner rule; first availability 'after close' is an assertion, not a checked historical receipt. The 2026-04-09 yfinance vintage of vix_spot holds 1,640 of 9,134 rows more than 5 % off the other sources (e.g. 2025-07-07: 33.43 vs 17.79), all superseded on 2026-04-10, 0 retracted; only one row (obs 2026-04-09) is a first release. Reads at as_of 2026-04-09 are excluded; a retraction would not hide them (store/pit.py applies a retraction only from its own date). Holiday-print cause (likely Cboe global trading hours) not verified",
+      "notes": "regime conditioning only, under the section 6.1 daily-conditioner rule; first availability 'after close' is an assertion, not a checked historical receipt. The 2026-04-09 yfinance vintage of vix_spot holds 1,640 of 9,134 rows more than 5 % off the other sources (e.g. 2025-07-07: 33.43 vs 17.79), all superseded on 2026-04-10; the whole vintage was retracted 2026-11-13 10:31Z (run_tag vix-spot-yf-20260409, 9,134 rows; served_from_vintage 0 before and after; docs/research/d0-receipts/vix_0409_retraction*); only one row (obs 2026-04-09) is a first release. Reads at as_of 2026-04-09 are excluded; a retraction would not hide them (store/pit.py applies a retraction only from its own date). Holiday-print cause (likely Cboe global trading hours) not verified",
       "receipts": {
         "query_sha256": "57885d71cc44d758e037275f27e7e3d3ec872f09334570d55ce864b7979eb93b",
         "snapshot": "docs/research/d0-receipts/vix_holiday_rows.result.json",
@@ -134,6 +134,18 @@
             "snapshot": "docs/research/d0-receipts/vintage_20260409_first_release.result.json",
             "query_sha256": "761eee8c07958890cca189b68e11d2952c7c8c9ec73d7afa317bb5b7744a8c8f",
             "receipt_sha256": "30dd374f89f7f59ef0a7c20bcd43e98606fc992a33b7e56528c64d4bab6666fb"
+          },
+          {
+            "snapshot": "docs/research/d0-receipts/vix_0409_retraction_verify.result.json",
+            "query_sha256": "c98164baa16e1ecfbff1a16b6ff82d3eecdf23bc9d1bda738fb9f1cb800c34cd",
+            "receipt_sha256": "8f09f1c9fd346ff41e90bed468beb2c795df5018784b8fd1d1024902eba1161a"
+          },
+          {
+            "snapshot": "docs/research/d0-receipts/vix_0409_retraction_apply.result.json",
+            "script_sha256": "c4872f887b2b0ee31522557564879e1c4efe5d0a18af509dfce305ccc6a61412",
+            "runner_sha256": "a0e5e2fb5a0d0c9348cc116e86592e345d256861180d19d711288795de733663",
+            "dryrun_sha256": "9b0dd2326ee279d1ef8d5219602b25c262b8be4da41852762cecb480c9d6d31d",
+            "receipt_sha256": "6839cbd26f65af72a980a54f2be5e965c9bb1b80752ee2b22477588a20cc11e4"
           }
         ]
       }
