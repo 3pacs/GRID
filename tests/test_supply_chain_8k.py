@@ -284,3 +284,35 @@ def test_a_missing_index_is_a_holiday_once_a_later_day_has_one(job, monkeypatch)
     assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-11-12"  # waits for the 13th
     s = j.run(today=date(2026, 11, 18))  # the 13th still has no index, now more than 3 days old
     assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-11-17"
+
+
+@pytest.mark.parametrize("kind, provides, rel", [
+    ("supply", "medical-grade silicone", "component"),
+    ("manufacturing", "buccal film", "contract_mfg"),
+    ("distribution", "TULSA-PRO system", "distribution"),
+    ("license", "exclusive license to ZW209", "licensor"),
+    ("", "exclusive license to KIO-401", "licensor"),  # no kind: fall back to the parser's words
+])
+def test_relationship_follows_the_kind_whichever_party_filed(job, kind, provides, rel):
+    j = job(FakeLLM(""), {})
+    j._graph_names["delta air lines"] = "dal"
+    link = s8.Link("FILER", "The Boeing Company", provides, "q", kind=kind)
+    filer = s8.Filing("0000027904", "DAL", "dal", "DELTA AIR LINES, INC.", "a", date(2026, 1, 12), url="u")
+    sells, _ = j.edge_for(filer, "Boeing Company", "filer_supplies", link)
+    other = s8.Filing("0000012927", "BA", "ba", "BOEING CO", "b", date(2026, 1, 12), url="u")
+    buys, _ = j.edge_for(other, "Delta Air Lines", "filer_buys",
+                         s8.Link("Delta Air Lines", "FILER", provides, "q", kind=kind))
+    assert (sells.upstream_id, sells.downstream_id, sells.relationship) == ("dal", "ba", rel)
+    assert (buys.upstream_id, buys.downstream_id, buys.relationship) == ("dal", "ba", rel)  # same edge key
+
+
+def test_a_subsidiary_resolves_to_its_listed_parent():
+    j = universe_job()
+    j.filer_universe()
+    nid, node = j.resolve_counterparty("Baker Hughes Energy Services LLC")
+    assert nid == "bkr" and (node.id, node.type) == ("bkr", "ticker")
+    nid, node = j.resolve_counterparty("Delta Air Lines Cargo, Inc.")
+    assert nid == "dal" and node.type == "ticker"
+    # a one-word parent is not inferred from a longer name: a private node, not BA
+    assert j.resolve_counterparty("Boeing Commercial Airplanes Services LLC")[1].type == "private_company"
+    assert s8._parent("apple hospitality reit", {"apple": "aapl"}) is None  # one-word keys never claim
