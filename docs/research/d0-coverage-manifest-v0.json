@@ -1187,5 +1187,5 @@
   ],
   "revision": 4,
   "revised_at": "2026-11-13",
-  "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. Enforced by analysis/d0_manifest.py. An input label is never a hypothesis admission."
+  "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. analysis/d0_manifest.py currently checks draft labels only and refuses all ADMITTED labels until an authenticated admission verifier exists. An input label is never a hypothesis admission."
 }

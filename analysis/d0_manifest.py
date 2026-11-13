@@ -1,4 +1,8 @@
-"""D0 coverage manifest validator (#1129, #1142): refuse ``ADMITTED`` without its prerequisites.
+"""D0 provisional label checker (#1129, #1142), not an admission authority.
+
+All ADMITTED labels fail closed until an authenticated verifier exists. Passing
+this checker validates draft labels only, not signatures, receipts, dependencies
+or coverage. The prerequisite checks below provide diagnostics, not admission.
 
 The D0 research contract (``docs/research/d0-research-contract-v0.md`` §8) lets an
 input carry ``ADMITTED`` only when all of these hold:
@@ -41,6 +45,7 @@ def input_admission_errors(inp: dict[str, Any], manifest: dict[str, Any]) -> lis
     """Why this input may not be ADMITTED (empty list = prerequisites met)."""
     errs: list[str] = []
     iid = inp.get("id", "<no id>")
+    errs.append(f"{iid}: ADMITTED unavailable: authenticated verifier not implemented")
     if not _contract_signed(manifest):
         errs.append(f"{iid}: contract not signed / body hash not pinned")
     if not _reviewer_signed(manifest):
@@ -72,6 +77,8 @@ def validate(manifest: dict[str, Any]) -> list[str]:
             errs.extend(input_admission_errors(inp, manifest))
     signed = _contract_signed(manifest) and _reviewer_signed(manifest)
     for h in manifest.get("hypotheses") or []:
+        if h.get("status") == "ADMITTED":
+            errs.append(f"{h.get('id')}: ADMITTED unavailable: authenticated verifier not implemented")
         if h.get("status") == "ADMITTED" and not signed:
             errs.append(f"{h.get('id')}: hypothesis ADMITTED while the contract or manifest is unsigned")
     return errs
