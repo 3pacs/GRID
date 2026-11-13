@@ -93,14 +93,15 @@ def test_record_is_complete_and_every_reading_is_standardized(engine):
     assert st["rule"] == "market-state/1" and st["baseline_rule"] == "trailing-robust/1"
     missing = {k: v.get("reason") for k, v in st["variables"].items() if v["status"] != "ok"}
     # No vintages stored in this fixture: the three news variables are unavailable, not guessed.
-    assert set(missing) == {"short_volume_ratio", "news_uncertainty", "equity_news_uncertainty", "news_first_print"}
-    assert st["news_shock"]["status"] == "unavailable"
+    assert set(missing) == {"short_volume_ratio", "news_uncertainty", "equity_news_uncertainty", "news_first_print",
+                            "dix", "dix_change_5d", "dealer_gamma", "spot_vs_gamma_flip"}
+    assert st["news_shock"]["status"] == "unavailable" and st["gamma_state"]["status"] == "unavailable"
     for k, v in st["variables"].items():
         if v["status"] == "ok":
             assert {"value", "median", "robust_z", "percentile", "label", "n", "obs_date"} <= set(v), k
             assert date.fromisoformat(v["obs_date"]) <= AS_OF, k
     assert st["spy_basis"] == "YF:SPY:close"
-    assert set(st["pending"]) == {"release_surprise", "earnings_surprise", "dix", "dealer_gamma"}
+    assert set(st["pending"]) == {"release_surprise", "earnings_surprise"}
 
 
 def test_monthly_value_waits_for_its_publication_lag(engine):
@@ -264,3 +265,42 @@ def test_low_news_uncertainty_does_not_prove_no_news():
     result = M.news_shock({"status": "ok", "robust_z": 0.0}, date(2025, 2, 12), {"cpi": [date(2025, 2, 13)]})
     assert result["kind"] == "not_elevated"
     assert result["supports_flow_only_classification"] is False
+
+
+# ── DIX and dealer gamma ──────────────────────────────────────────────────
+
+def _gex_table(engine, rows):
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE dealer_gex_daily (obs_date DATE, ticker TEXT, spot_price REAL, net_gex_usd_m REAL, "
+                       "spot_to_flip_pct REAL, gamma_flip_strike REAL, gex_regime TEXT)"))
+        c.execute(text("INSERT INTO dealer_gex_daily VALUES (:d, 'SPY', :s, :n, :p, :f, :r)"), rows)
+
+
+def test_dix_reads_raw_series_with_its_lag(engine):
+    _seed(engine)
+    _ins(engine, [{"s": "finra:dix_sp500", "src": FRED, "d": d, "ts": BACKFILL, "v": 0.45 + 0.01 * math.sin(i / 9)}
+                  for i, d in enumerate(_bdays(date(2023, 1, 2), END))])
+    v = M.compute_market_state(engine, AS_OF, calendar=CAL).variables
+    assert v["dix"]["status"] == "ok" and v["dix_change_5d"]["status"] == "ok"
+    assert v["dix"]["obs_date"] == "2025-06-09"        # one business day lag: 06-10's file is not counted at 06-10
+
+
+def test_short_gamma_history_reports_value_without_a_baseline(engine):
+    _seed(engine)
+    days = list(_bdays(date(2025, 4, 1), AS_OF))[-35:]
+    _gex_table(engine, [{"d": d, "s": 560.0 + i, "n": 8000.0 - 100 * i, "p": 1.5 - 0.1 * i, "f": 552.0 + i,
+                         "r": "positive_gamma" if i < 20 else "negative_gamma"} for i, d in enumerate(days)])
+    st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    g = st["variables"]["dealer_gamma"]
+    assert g["status"] == "no_baseline" and g["value"] == pytest.approx(8000.0 - 100 * 34) and g["n"] == 34
+    assert "robust_z" not in g and st["coverage"]["no_baseline"] >= 2
+    gs = st["gamma_state"]
+    assert gs["status"] == "ok" and gs["regime"] == "negative_gamma" and gs["obs_date"] == str(days[-1])
+    assert gs["spot_vs_flip"] == "below"
+
+
+def test_gamma_row_after_as_of_is_never_read(engine):
+    _seed(engine)
+    _gex_table(engine, [{"d": AS_OF + timedelta(days=1), "s": 1.0, "n": 1.0, "p": 1.0, "f": 1.0, "r": "x"}])
+    st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    assert st["gamma_state"]["status"] == "unavailable"

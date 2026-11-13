@@ -24,8 +24,12 @@ calendar has no availability lag.
 
 News comes from the daily newspaper-based uncertainty indexes (USEPUINDXD, WLEMUINDXD), read from ALFRED vintages
 (``store/fred_vintages.py``) as FRED showed them on each day, because they are revised for weeks after first print.
-``news_shock`` reports elevated uncertainty and calendar co-occurrence without attributing a shock. Release and
-earnings surprises, DIX and dealer gamma are listed in :data:`PENDING`; the record says so instead of filling them.
+``news_shock`` reports elevated uncertainty and calendar co-occurrence without attributing a shock.
+
+DIX is GRID's ``finra:dix_sp500`` series (``ingestion/altdata/finra_dix.py``). Dealer gamma comes from
+``dealer_gex_daily`` (``physics/dealer_gex_daily.py``), whose SPY history starts with registered option captures on
+2026-09-26; until it has a baseline's worth of sessions it is reported ``no_baseline`` with its value, and
+``gamma_state`` gives the regime and flip. Release and earnings surprises are listed in :data:`PENDING`.
 """
 
 from __future__ import annotations
@@ -87,6 +91,7 @@ LAGS: dict[str, PublicationLag | None] = {
     "INDPRO": PublicationLag(50, "calendar", "Fed G.17, ~15th-18th of the next month"),
     "UMCSENT": PublicationLag(60, "calendar", "UMich sentiment as posted to FRED"),
     "finra:short_volume_agg:market_ratio": _NEXT_BD,
+    "finra:dix_sp500": _NEXT_BD,
 }
 SOURCES: dict[str, str] = {"CBOE:VIX": "CBOE", "CBOE:VIX3M": "CBOE"}
 
@@ -94,8 +99,6 @@ SOURCES: dict[str, str] = {"CBOE:VIX": "CBOE", "CBOE:VIX3M": "CBOE"}
 PENDING: dict[str, str] = {
     "release_surprise": "actual minus consensus per scheduled release; GRID has no consensus source yet",
     "earnings_surprise": "mega-cap EPS actual vs estimate (FMP), read point in time",
-    "dix": "dollar-weighted S&P 500 dark-pool short ratio (FINRA files back to 2018-08; edge search 11 rebuild)",
-    "dealer_gamma": "end-of-day net GEX and distance to the gamma flip; dealer_gex_daily has no writer",
 }
 
 
@@ -145,6 +148,23 @@ class _Reads:
                 df = pd.DataFrame(columns=["obs_date", "realtime_start", "realtime_end", "value"])
             self._memo[key] = df
         return self._memo[key]
+
+    def gex_rows(self) -> pd.DataFrame:
+        """``dealer_gex_daily`` SPY rows up to as_of. A row for day d comes from a capture completed by the end of d
+        (``physics/dealer_gex_daily.py``), so it is known at the end of d."""
+        if "__gex__" not in self._memo:
+            try:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(_GEX_SQL, {"t": "SPY", "a": self.as_of - timedelta(days=self.lookback_days),
+                                                   "b": self.as_of}).fetchall()
+            except Exception as exc:
+                log.warning("market_state: dealer_gex_daily unreadable: {e}", e=str(exc))
+                rows = []
+            df = pd.DataFrame(rows, columns=["obs_date", "net_gex_usd_m", "spot_to_flip_pct", "gamma_flip_strike",
+                                             "gex_regime", "spot_price"])
+            df["obs_date"] = [x if isinstance(x, date) else date.fromisoformat(str(x)[:10]) for x in df["obs_date"]]
+            self._memo["__gex__"] = df.set_index("obs_date").sort_index() if len(df) else df
+        return self._memo["__gex__"]
 
     def spy(self) -> pd.Series:
         """SPY closes known at ``as_of``, one basis per record.
@@ -330,6 +350,36 @@ def news_shock(reading: dict[str, Any], obs_date: date | None, calendar: dict[st
 
 
 
+# ── DIX and dealer gamma ──
+
+_GEX_SQL = text(
+    "SELECT obs_date, net_gex_usd_m, spot_to_flip_pct, gamma_flip_strike, gex_regime, spot_price "
+    "FROM dealer_gex_daily WHERE ticker = :t AND obs_date >= :a AND obs_date <= :b ORDER BY obs_date"
+)
+
+
+def _gex_col(col: str) -> Callable[["_Reads"], pd.Series]:
+    def f(r: "_Reads") -> pd.Series:
+        df = r.gex_rows()
+        return pd.Series(dtype=float) if df.empty else df[col].astype(float).dropna()
+    return f
+
+
+def _change(series_id: str, periods: int) -> Callable[["_Reads"], pd.Series]:
+    return lambda r: r.series(series_id).diff(periods).dropna()
+
+
+def gamma_state(df: pd.DataFrame, as_of: date) -> dict[str, Any]:
+    """The latest dealer-gamma row's categorical read (regime, flip), or unavailable."""
+    if df is None or df.empty:
+        return {"status": "unavailable", "reason": "no dealer_gex_daily row at or before as_of"}
+    d = df.index[-1]
+    row = df.iloc[-1]
+    return {"status": "ok", "obs_date": str(d), "age_days": (as_of - d).days, "regime": row["gex_regime"],
+            "gamma_flip": float(row["gamma_flip_strike"]), "spot": float(row["spot_price"]),
+            "spot_vs_flip": "above" if float(row["spot_to_flip_pct"]) >= 0 else "below"}
+
+
 VARIABLES: list[VarSpec] = [
     VarSpec("vix", "volatility", "daily_fast", _level("CBOE:VIX"), "index points"),
     VarSpec("vix_term", "volatility", "daily_fast", _ratio("CBOE:VIX", "CBOE:VIX3M"), "VIX / VIX3M",
@@ -351,6 +401,13 @@ VARIABLES: list[VarSpec] = [
     VarSpec("spy_vs_200d", "trend", "daily_fast", _spy_ma_distance(200), "SPY / 200-day average - 1"),
     VarSpec("short_volume_ratio", "flow", "daily_fast", _level("finra:short_volume_agg:market_ratio"),
             "short / total off-exchange volume, all symbols", "FINRA aggregate; GRID history from 2025-11"),
+    VarSpec("dix", "flow", "daily_fast", _level("finra:dix_sp500"),
+            "dark-pool short share of S&P 500 dollar volume", "FINRA Reg SHO file, same-day close weights; from 2018-08"),
+    VarSpec("dix_change_5d", "flow", "daily_fast", _change("finra:dix_sp500", 5), "DIX change over 5 sessions"),
+    VarSpec("dealer_gamma", "positioning", "daily_fast", _gex_col("net_gex_usd_m"),
+            "$M per 1% SPY move (assumed long calls / short puts)", "dealer_gex_daily; registered captures from 2026-09-26"),
+    VarSpec("spot_vs_gamma_flip", "positioning", "daily_fast", _gex_col("spot_to_flip_pct"),
+            "% SPY above (+) or below (-) its gamma flip"),
     VarSpec("news_uncertainty", "news", "daily_fast", _settled("USEPUINDXD"),
             "EPU index, 7-day mean of days t-9..t-3", "Baker-Bloom-Davis daily newspaper index, as FRED showed it on t"),
     VarSpec("equity_news_uncertainty", "news", "daily_fast", _settled("WLEMUINDXD"),
@@ -412,6 +469,7 @@ class MarketState:
     variables: dict[str, dict[str, Any]] = field(default_factory=dict)
     events: dict[str, Any] = field(default_factory=dict)
     news_shock: dict[str, Any] = field(default_factory=dict)
+    gamma_state: dict[str, Any] = field(default_factory=dict)
     spy_basis: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -424,8 +482,11 @@ class MarketState:
             "variables": self.variables,
             "events": self.events,
             "news_shock": self.news_shock,
+            "gamma_state": self.gamma_state,
             "pending": PENDING,
-            "coverage": {"ok": len(ok), "total": len(self.variables)},
+            "coverage": {"ok": len(ok), "no_baseline": sum(1 for v in self.variables.values()
+                                                           if v.get("status") == "no_baseline"),
+                         "total": len(self.variables)},
             "spy_basis": self.spy_basis,
         }
 
@@ -451,7 +512,9 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
         reading = standardize_last(hist.to_numpy(dtype=float), window=window, min_obs=min_obs)
         last_obs = hist.index[-1]
         if reading is None:
-            state.variables[spec.name] = {**base, "status": "unavailable", "obs_date": str(last_obs),
+            # Known value, too little history to say what normal is: report the value, no z or label.
+            state.variables[spec.name] = {**base, "status": "no_baseline", "obs_date": str(last_obs),
+                                          "value": round(float(hist.iloc[-1]), 6), "n": int(len(hist) - 1),
                                           "reason": f"{len(hist) - 1} prior observations known; baseline needs {min_obs}"}
             continue
         state.variables[spec.name] = {**base, "status": "ok", "obs_date": str(last_obs),
@@ -462,6 +525,7 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
     state.events = events_state(as_of, cal)
     state.news_shock = news_shock(state.variables.get("news_first_print", {}),
                                   reads.first_print_obs.get("USEPUINDXD"), cal)
+    state.gamma_state = gamma_state(reads.gex_rows(), as_of)
     return state
 
 

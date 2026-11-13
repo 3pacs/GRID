@@ -7,7 +7,10 @@
 # Backfill once before enabling: the news-index vintages first, then the records (sessions in date order;
 # insert-only, so a rerun skips what exists):
 #   python3 -m ingestion.fred_vintages backfill
+#   python3 -m ingestion.altdata.finra_dix --backfill 2018-08-01 <yesterday>
+#   python3 scripts/run_dealer_gex_daily.py --from 2026-09-26 --to <yesterday>
 #   python3 scripts/run_market_state.py --no-refresh --from 2019-01-02 --to <yesterday>
+# Nightly order: finra_dix (smart scheduler) and run_dealer_gex_daily.py before this unit.
 [Unit]
 Description=GRID market-state record writer (prior completed session only, point-in-time, insert-only)
 After=network.target postgresql.service
