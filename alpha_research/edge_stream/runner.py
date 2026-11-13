@@ -439,18 +439,19 @@ def preflight(prop: dict, source: BarSource, today: date, extras: dict | None = 
         start, end = date.fromisoformat(prop["window"]["start"]), date.fromisoformat(prop["window"]["end"])
         sessions = [b[0] for b in daily.daily(family.hedge, start, end)]
         hours: dict[str, int] = {}
-        n_events = left_out = 0
+        n_events, left_out = 0, []
         for t in prop["instruments"]:
             found = events.events(t, start - timedelta(days=family.events_lookback_days), end)
             if found is None:
-                left_out += 1
+                left_out.append(t)
                 continue
             for e in family.company_events(found):
                 if e["filing_date"] >= start.isoformat():
                     n_events += 1
                     hours[e["accepted_et"][11:13]] = hours.get(e["accepted_et"][11:13], 0) + 1
-        return {"sessions": len(sessions), "instruments": len(prop["instruments"]), "left_out": left_out,
-                "events_in_window": n_events, "accepted_hour_et": dict(sorted(hours.items()))}
+        return {"sessions": len(sessions), "instruments": len(prop["instruments"]), "left_out": len(left_out),
+                "left_out_tickers": left_out, "events_in_window": n_events,
+                "accepted_hour_et": dict(sorted(hours.items()))}
     bars, start, _ = _read(prop, source, today)
     return {t: sum(1 for d, b in s.items() if d >= start.isoformat() and family.needed(b)) for t, s in bars.items()}
 

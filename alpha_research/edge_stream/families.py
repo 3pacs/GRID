@@ -220,8 +220,8 @@ class EarningsContamination:
 
     def spec(self) -> dict:
         return {
-            "event": "an 8-K with Item 2.02 (SEC EDGAR submissions API), timed by its acceptance time read as "
-                     f"Eastern; one event per company per {self.min_gap_days} days (the earliest)",
+            "event": "an 8-K with Item 2.02 (SEC EDGAR submissions API), timed by its acceptance time (UTC, "
+                     f"converted to Eastern); one event per company per {self.min_gap_days} days (the earliest)",
             "reaction_day": "the first session whose close is after acceptance (same day if accepted before 16:00 ET)",
             "decision": "at the reaction day's close, from that close and the prior session's close of the stock "
                         f"and {self.hedge}",

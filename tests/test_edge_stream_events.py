@@ -198,9 +198,11 @@ def test_cycle_amends_the_live_v1_ledger_before_it_registers(monkeypatch, tmp_pa
 # --- filings and daily bars -----------------------------------------------------------
 
 
-def test_acceptance_time_is_read_as_eastern_wall_clock():
-    assert D.parse_acceptance("2026-01-29T16:05:12.000Z") == datetime(2026, 1, 29, 16, 5, 12)
-    assert D.parse_acceptance("2026-01-29T16:05:12") == datetime(2026, 1, 29, 16, 5, 12)
+def test_acceptance_time_is_utc_converted_to_eastern():
+    assert D.parse_acceptance("2026-01-29T21:05:12.000Z") == datetime(2026, 1, 29, 16, 5, 12)     # winter
+    assert D.parse_acceptance("2026-07-29T20:05:12.000Z") == datetime(2026, 7, 29, 16, 5, 12)     # summer
+    assert D.parse_acceptance("2026-01-30T01:30:00.000Z") == datetime(2026, 1, 29, 20, 30, 0)     # the evening before
+    assert D.parse_acceptance("2026-01-29T16:05:12") == datetime(2026, 1, 29, 16, 5, 12)          # no zone: Eastern
     assert D.parse_acceptance("2026-01-29T21:05:12+00:00") == datetime(2026, 1, 29, 16, 5, 12)
     assert D.parse_acceptance("2026-07-29T20:05:12+00:00") == datetime(2026, 7, 29, 16, 5, 12)
     assert D.parse_acceptance("") is None and D.parse_acceptance("soon") is None
@@ -209,8 +211,8 @@ def test_acceptance_time_is_read_as_eastern_wall_clock():
 PAGE = {
     "form": ["8-K", "8-K", "8-K/A", "10-Q", "8-K", "8-K"],
     "filingDate": ["2026-04-23", "2026-03-02", "2026-02-10", "2026-01-30", "2026-01-29", "2025-10-23"],
-    "acceptanceDateTime": ["2026-04-23T16:10:00.000Z", "2026-03-02T08:00:00.000Z", "2026-02-10T17:00:00.000Z",
-                           "2026-01-30T06:30:00.000Z", "2026-01-29T16:05:12.000Z", "2025-10-23T16:07:00.000Z"],
+    "acceptanceDateTime": ["2026-04-23T20:10:00.000Z", "2026-03-02T13:00:00.000Z", "2026-02-10T22:00:00.000Z",
+                           "2026-01-30T11:30:00.000Z", "2026-01-29T21:05:12.000Z", "2025-10-23T20:07:00.000Z"],
     "items": ["2.02,9.01", "5.02", "2.02", "", "9.01, 2.02", "2.02,9.01"],
     "accessionNumber": ["a4", "a3", "a2", "a1", "a0", "z9"],
 }
@@ -219,7 +221,9 @@ PAGE = {
 def test_only_original_8k_item_202_filings_in_range_are_events():
     rows, oldest = D.earnings_filings(PAGE, date(2026, 1, 1), date(2026, 5, 1))
     assert [r["accession"] for r in rows] == ["a4", "a0"] and oldest == "2025-10-23"
-    assert rows[1] == {"accession": "a0", "filing_date": "2026-01-29", "accepted_et": "2026-01-29T16:05:12"}
+    assert rows[1] == {"accession": "a0", "filing_date": "2026-01-29", "accepted_et": "2026-01-29T16:05:12",
+                       "accepted_raw": "2026-01-29T21:05:12.000Z"}
+    assert rows[0]["accepted_et"] == "2026-04-23T16:10:00"                                        # 20:10Z in summer
 
 
 class FakeEdgar(D.EdgarEventSource):
@@ -235,7 +239,7 @@ class FakeEdgar(D.EdgarEventSource):
 
 
 def test_edgar_source_reads_pages_caches_and_leaves_out_what_it_cannot_cover(tmp_path):
-    older = {"form": ["8-K"], "filingDate": ["2025-07-24"], "acceptanceDateTime": ["2025-07-24T16:06:00.000Z"],
+    older = {"form": ["8-K"], "filingDate": ["2025-07-24"], "acceptanceDateTime": ["2025-07-24T20:06:00.000Z"],
              "items": ["2.02"], "accessionNumber": ["old"]}
     recent_short = {k: v[:2] for k, v in PAGE.items()}          # oldest 2026-03-02: does not reach the start
     src = FakeEdgar(tmp_path, {
@@ -468,7 +472,8 @@ def test_dry_run_counts_filings_and_hours_without_forming_a_trade(tmp_path, monk
     s = R.run_cycle(led, StaticSource({}, today=TODAY), tmp_path, now=NOW, dry_run=True,
                     extras=extras_for(0.0, tickers=TICKERS[:10]))
     pre = s["registered"][0]["preflight_sessions_with_bars"]
-    assert pre["instruments"] == 10 and pre["left_out"] == 0 and pre["events_in_window"] >= 25
+    assert pre["instruments"] == 10 and pre["left_out"] == 0 and pre["left_out_tickers"] == []
+    assert pre["events_in_window"] >= 25
     assert set(pre["accepted_hour_et"]) == {"16"} and pre["sessions"] > 200
     assert len(led.records) == 2 and not (tmp_path / "status.json").exists()
 

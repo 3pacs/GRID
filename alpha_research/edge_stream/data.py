@@ -244,19 +244,16 @@ class EventSource(Protocol):
 def parse_acceptance(raw: str) -> datetime | None:
     """EDGAR ``acceptanceDateTime`` as an Eastern wall-clock time (naive).
 
-    EDGAR shows acceptance in Eastern time; the submissions API renders the same field with
-    a ``Z`` suffix. The value is read as Eastern wall clock. If a value were in fact UTC, this
-    reading places it four or five hours late, never early, so a filing can only be assigned
-    to a later reaction day than the true one and nothing after the decision is ever used.
-    A value with a real numeric offset is converted.
+    The submissions API gives UTC with a ``Z`` suffix. Measured 2026-11-13 on 1,859 Item 2.02
+    filings of 480 S&P 500 companies: the raw hour clusters at 10-13 and 20-21, which is the
+    pre-market and after-close release pattern in UTC (in Eastern it would be mid-morning and
+    late evening). A value without a zone is taken as Eastern (EDGAR's own pages).
     """
     if not raw:
         return None
     text = str(raw).strip()
     try:
-        if text.endswith("Z"):
-            return datetime.fromisoformat(text[:-1]).replace(tzinfo=None)
-        parsed = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
     except ValueError:
         return None
     return parsed.astimezone(ET).replace(tzinfo=None) if parsed.tzinfo is not None else parsed
@@ -279,7 +276,7 @@ def earnings_filings(page: dict, start: date, end: date) -> tuple[list[dict], st
         if when is None:
             continue
         out.append({"accession": accessions[i] if i < len(accessions) else None, "filing_date": dates[i],
-                    "accepted_et": when.isoformat(timespec="seconds")})
+                    "accepted_et": when.isoformat(timespec="seconds"), "accepted_raw": str(accepted[i])})
     return out, (min(dates) if dates else None)
 
 
