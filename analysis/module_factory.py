@@ -74,6 +74,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from analysis import ledger_steered_exploration as lse
+from analysis.factory_session_calendar import FactoryCalendar
 from analysis.factory_stats import (
     FACTORY_ORIGIN,
     MAX_T_SELECTION,
@@ -310,7 +311,7 @@ def load_sessions(db_path: Path, run: RunFile) -> dict[str, Session]:
     return {d: Session(b) for d, b in by_day.items()}
 
 
-def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, list[dict]], dict]:
+def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCalendar | None = None) -> tuple[dict[str, list[dict]], dict]:
     """Point-in-time rows per family, and a coverage summary.
 
     The z history of a (feature, decision time) holds only earlier eligible
@@ -328,7 +329,20 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
     prev = None
     for day in days:
         session = sessions[day]
-        prior, prev = prev, session  # previous observed session, including half-days
+        prior, prev = prev, session  # fixture-only fallback; run() always supplies pinned calendar
+        schedule = None
+        if calendar is not None:
+            schedule = calendar.for_day(day)
+            if schedule is None:
+                continue
+            prior_day = calendar.previous_day(day)
+            prior_schedule = calendar.for_day(prior_day)
+            # Conservative protocol: shortened priors remain withheld even if
+            # a vendor incorrectly supplies fabricated after-close minute bars.
+            if (prior_schedule.closes - prior_schedule.opens).total_seconds() != 390 * 60:
+                skipped_no_label += len(run.families())
+                continue
+            prior = sessions.get(prior_day)
         if prior is None:
             continue
         # Without an authenticated historical session calendar, a short prior
@@ -338,6 +352,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
             skipped_no_label += len(run.families())
             continue
         for t in run.decision_times:
+            if schedule is not None and _minutes(t) >= _minutes(schedule.closes.astimezone(NY).strftime('%H:%M')):
+                continue
             bar = _hm(_minutes(t) - 1)
             # Only bars whose intervals have closed by T may qualify signals.
             # A missing later entry, exit, or post-exit bar cannot change z history.
@@ -373,6 +389,9 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
                 else:
                     exit_bar = _hm(_minutes(bar) + int(h[:-1]))
                     ends = decided + timedelta(minutes=int(h[:-1]))
+                if schedule is not None and ends > schedule.closes:
+                    skipped_no_label += 1
+                    continue
                 exit_px = session.bars[exit_bar][3] if exit_bar in session.bars else None
                 if not entry or not exit_px:
                     skipped_no_label += 1
@@ -409,8 +428,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
         "sessions_eligible": len(eligible),
         "sessions_below_full_bars_diagnostic": len(days) - len(full_coverage),
         "full_bars_role": "retrospective coverage only; never eligibility",
-        "signal_eligibility": "complete 09:30 through T-1 prefix; prior observed session complete",
-        "calendar_qualification": "UNQUALIFIED: prior observed day is not verified against exchange calendar",
+        "signal_eligibility": "complete 09:30 through T-1 prefix; prior session complete; shortened prior withheld",
+        "calendar_qualification": calendar.version if calendar else "UNQUALIFIED: prior observed day is not verified against exchange calendar",
         "first_eligible": min(eligible) if eligible else None,
         "last_eligible": max(eligible) if eligible else None,
         "rows_per_family": {f: len(r) for f, r in families.items()},
@@ -574,6 +593,8 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
     """One factory run, declared on ``ledger`` before any data is read. Returns the report."""
     body = json.loads(Path(run_file).read_text())
     spec = RunFile.from_dict(body)
+    calendar = FactoryCalendar()
+    calendar.validate_window(spec.first_session, spec.last_session)
     manifest, manifest_sha = check_data(Path(data_dir))
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
@@ -584,7 +605,7 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
     try:
         verify_data(Path(data_dir), manifest)
         sessions = load_sessions(Path(data_dir) / DATA_FILE, spec)
-        families, coverage = build_rows(sessions, spec)
+        families, coverage = build_rows(sessions, spec, calendar=calendar)
         frozen = discover(protocol_for(spec), families)
         write_once(out / "discovery-frozen.json", frozen)
         rep = report(spec, frozen, coverage, families)
