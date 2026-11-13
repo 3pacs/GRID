@@ -145,7 +145,7 @@ def test_rows_are_point_in_time_and_short_sessions_are_skipped(tmp_path):
     data, days = staged(tmp_path, n=60, short_day=sessions(60)[30])
     spec = mf.RunFile.from_dict(run_file(tmp_path, days, target_unit="dollars")[1])
     families, cov = mf.build_rows(mf.load_sessions(data / mf.DATA_FILE, spec), spec)
-    assert cov["sessions_skipped_short"] == 1
+    assert cov["sessions_below_full_bars_diagnostic"] == 1
     rows = families["SPY|change|14:00+60m"]
     assert len(rows) == 60 - 1 - 2  # first has no prior; short and its following session are withheld
     assert all(r["cost"] == 0.04 and r["target"] == r["target_dollars"] for r in rows)
