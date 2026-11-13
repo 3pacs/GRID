@@ -28,13 +28,18 @@ baseline, so each reads as "this far above or below its normal". Code: `intellig
 | inflation / growth | cpi_yoy, industrial_production_yoy, consumer_sentiment | CPIAUCSL, INDPRO, UMCSENT | monthly |
 | trend | spy_vs_50d, spy_vs_200d | SPY close (spy_full, else YF:SPY:close) | daily fast |
 | flow | short_volume_ratio | finra:short_volume_agg:market_ratio (GRID history from 2025-11) | daily fast |
+| flow | dix, dix_change_5d | finra:dix_sp500: S&P 500 dollar-weighted dark-pool short share (`ingestion/altdata/finra_dix.py`, from 2018-08) | daily fast |
+| positioning | dealer_gamma, spot_vs_gamma_flip | dealer_gex_daily (SPY; `physics/dealer_gex_daily.py`; registered captures from 2026-09-26) | daily fast |
+| gamma_state | regime, gamma_flip, spot_vs_flip | latest dealer_gex_daily row | — |
 | news | news_uncertainty, equity_news_uncertainty | USEPUINDXD, WLEMUINDXD: 7-day mean of days t-9..t-3, as FRED showed them on t | daily fast |
 | news | news_first_print | USEPUINDXD: newest weekday first print, compared only with past first prints | daily fast |
 | events | today, next, within_14d | FRED release dates (CPI, PPI, NFP, GDP, PCE, retail sales) + Fed calendar (FOMC) | — |
 | news_shock | elevated_uncertainty / not_elevated | news_first_print z ≥ 2; calendar co-occurrence separate, attribution unverified | — |
 
-Pending (listed in every record as `pending`): release surprise (no consensus source yet), earnings surprise, DIX,
-dealer gamma.
+Pending (listed in every record as `pending`): release surprise (no consensus source yet), earnings surprise.
+
+A variable with some history but less than its baseline needs is `no_baseline`: value and observation date, no z or
+label. Dealer gamma reads that way until ~120 sessions of registered captures exist (around spring 2027).
 
 ## News and vintages
 
@@ -58,3 +63,15 @@ lookahead. Rows are insert-only; `--replace` is the only way to rewrite a date.
 
 ### News attribution boundary
 The newspaper uncertainty proxy does not establish a market-moving shock, its cause, or a quiet/flow-only session. `calendar_context` reports only listed-release co-occurrence (or unknown when no calendar is loaded). `news_attribution` stays `unverified`; `supports_flow_only_classification` is false. Nonfinite or nonnumeric proxy scores are unavailable. The enclosing `news_shock` key is retained, but the new descriptive kinds intentionally replace the overclaiming scheduled/unscheduled/none categories. No production consumer currently reads those categories.
+
+## DIX and dealer gamma
+
+DIX_d = Σ ShortVolume×close / Σ TotalVolume×close over day d's S&P 500 members (`config/sp500_membership.json`, built
+from fja05680/sp500 by `scripts/build_sp500_membership.py`), FINRA's CNMS file and same-day Tiingo closes. Share
+weights track SqueezeMetrics' published DIX at only 0.90 correlation; dollar weights at 0.997 over 2,083 days. Checked
+2026-11-05..11 against SqueezeMetrics to the third decimal. Backfill: `python -m ingestion.altdata.finra_dix --backfill
+2018-08-01 <yesterday>`; nightly: the smart-scheduler entry `finra_dix`.
+
+`dealer_gex_daily` (the godview table that had no writer) gets one SPY row per session from the latest registered
+options capture completed by the end of that UTC day (`scripts/run_dealer_gex_daily.py`). Units: $M per 1 % SPY move.
+Sessions without a registered capture, a spot receipt or a GEX zero crossing are skipped, not guessed.
