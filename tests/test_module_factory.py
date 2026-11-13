@@ -150,7 +150,7 @@ def test_rows_are_point_in_time_and_short_sessions_are_skipped(tmp_path):
     families, cov = mf.build_rows(mf.load_sessions(data / mf.DATA_FILE, spec), spec)
     assert cov["sessions_skipped_short"] == 1
     rows = families["SPY|change|14:00+60m"]
-    assert len(rows) == 60 - 1 - 1  # first session has no prior close; the short one is skipped
+    assert len(rows) == 60 - 1 - 2  # first has no prior; short and its following session are withheld
     assert all(r["cost"] == 0.04 and r["target"] == r["target_dollars"] for r in rows)
     for row in rows:
         for sig in row["features"].values():

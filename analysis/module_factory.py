@@ -6,7 +6,8 @@ in a factory ledger (``analysis.ledger_steered_exploration.Ledger.create_factory
 A run file (JSON) declares everything: decision times, horizons, features,
 z thresholds, sides, the per-share cost, alpha, permutations and seed. A module
 (a trial) is ``feature z >= +k`` or ``feature z <= -k`` at one decision time,
-taken long or short, judged on the SPY change over one horizon minus the cost
+taken long or short, entered at the open one minute after T (a declared bar-price
+proxy, not an executable-quote guarantee), judged through T+horizon minus the cost
 (``offline_research_proof`` statistic ``net_when_fires``). The run's bar is the
 Westfall-Young step-down max-T over every tested module (selection ``max_t``).
 
@@ -175,8 +176,8 @@ class RunFile:
             if not 10 * 60 <= hm <= 15 * 60:
                 raise RunFileError(f"decision time {t} outside 10:00..15:00 ET")
         for h in self.horizons:
-            if h != "close" and not (h.endswith("m") and h[:-1].isdigit() and 1 <= int(h[:-1]) <= 390):
-                raise RunFileError(f"horizon {h!r} is '<minutes>m' or 'close'")
+            if h != "close" and not (h.endswith("m") and h[:-1].isdigit() and 2 <= int(h[:-1]) <= 390):
+                raise RunFileError(f"horizon {h!r} is '<minutes>m' (at least 2m) or 'close'")
         if set(self.features) - set(FEATURES):
             raise RunFileError(f"unknown features {sorted(set(self.features) - set(FEATURES))}")
         if set(self.sides) - set(SIDES) or not self.sides:
@@ -240,7 +241,7 @@ def robust_z(x, hist):
 
 
 class Session:
-    """One SPY session's minute bars {hm: (o, h, l, c, v)} with close-at-or-before lookups."""
+    """One SPY session's minute bars {hm: (o, h, low, c, v)} with close-at-or-before lookups."""
 
     def __init__(self, bars: dict):
         self.hms = sorted(bars)
@@ -303,8 +304,8 @@ def load_sessions(db_path: Path, run: RunFile) -> dict[str, Session]:
     finally:
         con.close()
     by_day: dict[str, dict] = {}
-    for day, hm, o, h, l, c, v in rows:
-        by_day.setdefault(day, {})[hm] = (o, h, l, c, v)
+    for day, hm, o, h, low, c, v in rows:
+        by_day.setdefault(day, {})[hm] = (o, h, low, c, v)
     return {d: Session(b) for d, b in by_day.items()}
 
 
@@ -323,14 +324,27 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
     skipped_no_label = skipped_no_scale = 0
     diag = {(f, t): {"rows": 0, "z": 0, "raw_by_year": {}, "z_by_year": {}} for f in run.features for t in run.decision_times}
     prev = None
-    for day in eligible:
+    eligible_set = set(eligible)
+    for day in days:
         session = sessions[day]
-        if prev is None:
-            prev = session
+        prior, prev = prev, session  # previous observed session, including half-days
+        if prior is None or day not in eligible_set:
+            continue
+        # Without an authenticated historical session calendar, a short prior
+        # may be a half-day or a broken capture. Never substitute an older day.
+        expected_prior = {_hm(i) for i in range(9 * 60 + 30, 16 * 60)}
+        if set(prior.hms) != expected_prior:
+            skipped_no_label += len(run.families())
             continue
         for t in run.decision_times:
             bar = _hm(_minutes(t) - 1)
-            raw = raw_features(session, prev, bar)
+            required = {bar, _hm(_minutes(t) + 1)}
+            if "F1_shift30" in run.features:
+                required.add(_hm(_minutes(bar) - 30))
+            if not required.issubset(session.bars):
+                skipped_no_label += len(run.horizons)
+                continue
+            raw = raw_features(session, prior, bar)
             z = {f: robust_z(raw[f], history[(f, t)]) for f in run.features}
             for f in run.features:
                 d = diag[(f, t)]
@@ -341,7 +355,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
                 if z[f] is not None:
                     d["z"] += 1
                     d["z_by_year"].setdefault(day[:4], []).append(z[f])
-            entry = session.close(bar)
+            entry_bar = _hm(_minutes(t) + 1)
+            entry = session.bars[entry_bar][0]
             decided = datetime.fromisoformat(f"{day}T{t}").replace(tzinfo=NY)
             signals = {}
             for name in modules:
@@ -352,10 +367,11 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
                 signals[name] = {"value": SIDES[side] if fires else None, "known_at": decided.isoformat()}
             for h in run.horizons:
                 if h == "close":
-                    exit_px, ends = session.close("15:59"), decided.replace(hour=16, minute=0)
+                    exit_bar, ends = "15:59", decided.replace(hour=16, minute=0)
                 else:
-                    exit_px = session.close(_hm(_minutes(bar) + int(h[:-1])))
+                    exit_bar = _hm(_minutes(bar) + int(h[:-1]))
                     ends = decided + timedelta(minutes=int(h[:-1]))
+                exit_px = session.bars[exit_bar][3] if exit_bar in session.bars else None
                 if not entry or not exit_px:
                     skipped_no_label += 1
                     continue
@@ -375,6 +391,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
                 families[family].append({
                     "origin": ORIGIN,
                     "decision_at": decided.isoformat(),
+                    "entry_at": (decided + timedelta(minutes=1)).isoformat(),
+                    "entry_price_basis": "next_minute_open_proxy",
                     "label_end": ends.isoformat(),
                     "target_known_at": ends.isoformat(),
                     "horizon": f"{t}+{h}",
@@ -384,7 +402,6 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
                     "target_dollars": change,
                     "features": signals,
                 })
-        prev = session
     coverage = {
         "sessions_read": len(days),
         "sessions_eligible": len(eligible),
@@ -395,6 +412,7 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
         "labels_missing": skipped_no_label,
         "labels_unscaled": skipped_no_scale,
         "target_unit": run.target_unit,
+        "entry_rule": "open at T+1 minute; quote fills/slippage not established",
         "features": {
             f"{f}@{t}": {
                 "coverage_z": round(d["z"] / d["rows"], 4) if d["rows"] else None,
