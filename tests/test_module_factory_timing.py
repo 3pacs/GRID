@@ -43,3 +43,41 @@ def test_horizon_must_extend_beyond_delayed_entry():
     body=dict(run_id='x',first_session='2023-01-03',last_session='2023-01-05',decision_times=['14:00'],horizons=['1m'],features=['F1'],z_thresholds=[1.0])
     with pytest.raises(m.RunFileError):
         m.RunFile.from_dict(body)
+
+
+def test_post_exit_gaps_do_not_change_decision_or_label():
+    a, complete = bars(), bars()
+    incomplete = {hm: b for hm, b in complete.items() if hm < "15:00"}
+    assert rows(a, complete) == rows(a, incomplete)
+    assert len(rows(a, incomplete)) == 1
+
+
+def test_missing_predecision_bar_withholds_even_if_daily_count_passes():
+    a, b = bars(), bars()
+    del b["10:17"]
+    assert rows(a, b) == []
+
+
+def test_missing_future_entry_does_not_change_feature_history(monkeypatch):
+    seen = []
+    original = m.robust_z
+    def capture(value, history):
+        seen.append((value, tuple(history)))
+        return original(value, history)
+    monkeypatch.setattr(m, "robust_z", capture)
+    s = {"2023-01-03": m.Session(bars()), "2023-01-04": m.Session(bars(101))}
+    m.build_rows(s, spec())
+    expected = list(seen)
+    seen.clear()
+    missing_entry = bars(101)
+    del missing_entry["14:01"]
+    s["2023-01-04"] = m.Session(missing_entry)
+    m.build_rows(s, spec())
+    assert seen == expected and seen
+
+
+def test_coverage_labels_calendar_as_unqualified():
+    _, coverage = m.build_rows({"2023-01-03":m.Session(bars()),
+                                "2023-01-04":m.Session(bars())}, spec())
+    assert coverage["calendar_qualification"].startswith("UNQUALIFIED")
+    assert coverage["full_bars_role"].startswith("retrospective")
