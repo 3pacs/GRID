@@ -20,9 +20,29 @@ def load(monkeypatch, *, column=None, value=None):
     return DealerGammaEngine(engine)._load_chain("SPY", DAY, cutoff=END)
 
 @pytest.mark.parametrize("column", [0, 2, 3])
-@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan"), None, "broken", True])
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan"), "broken", True])
 def test_malformed_numeric_fails_whole_chain(monkeypatch, column, value):
     assert load(monkeypatch, column=column, value=value).empty
+
+def test_null_strike_fails_whole_chain(monkeypatch):
+    # strike is NOT NULL in the store; a NULL there is corruption.
+    assert load(monkeypatch, column=0, value=None).empty
+
+@pytest.mark.parametrize("column", [2, 3])
+def test_null_oi_or_iv_drops_only_that_contract(monkeypatch, column):
+    # The writer stores NULL when the provider quotes no usable IV (about one
+    # contract in ten on a real chain). That contract is dropped; the batch loads.
+    chain = load(monkeypatch, column=column, value=None)
+    assert len(chain) == 1
+    assert chain["open_interest"].notna().all() and chain["implied_volatility"].notna().all()
+
+def test_null_iv_on_every_contract_leaves_no_usable_rows(monkeypatch):
+    row = (750.0, "call", 100, None, DAY + timedelta(days=7), timedelta(days=7),
+           END - timedelta(seconds=2), "11111111-1111-4111-8111-111111111111", 1,
+           END - timedelta(seconds=5), END, END - timedelta(hours=3), None)
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = [row, row]
+    assert DealerGammaEngine(engine)._load_chain("SPY", DAY, cutoff=END).empty
 
 @pytest.mark.parametrize("value", [0, -1])
 def test_nonpositive_strike_fails_whole_chain(monkeypatch, value):

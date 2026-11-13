@@ -779,12 +779,26 @@ class DealerGammaEngine:
         # Corrupt numerics invalidate the batch, rather than silently removing
         # one side of exposure and publishing a directional partial profile.
         # Legitimate zero/nonpositive OI or IV retain the existing filter below.
+        # So does SQL NULL in the two nullable columns: the chain writer stores
+        # NULL when the provider quotes no usable IV (ingestion/options.py),
+        # which is roughly one contract in ten on every real chain. NULL means
+        # "no measurement for this contract", not corruption; such a row is
+        # dropped by the filter below, never the whole batch. NaN, infinities,
+        # booleans and non-numeric values are still corrupt. NULL is read from
+        # the raw rows because pandas turns None into NaN in a numeric column.
+        stored_null = {
+            "open_interest": np.array([row[2] is None for row in rows], dtype=bool),
+            "implied_volatility": np.array([row[3] is None for row in rows], dtype=bool),
+        }
         for column in ("strike", "open_interest", "implied_volatility"):
             values = df[column]
             if values.map(lambda value: isinstance(value, (bool, np.bool_))).any():
                 return pd.DataFrame()
             numeric = pd.to_numeric(values, errors="coerce")
-            if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+            usable = np.isfinite(numeric.to_numpy(dtype=float))
+            if column in stored_null:
+                usable = usable | stored_null[column]
+            if not usable.all():
                 return pd.DataFrame()
             df[column] = numeric
         if (df["strike"] <= 0).any():
