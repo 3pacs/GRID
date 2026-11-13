@@ -920,7 +920,10 @@ class VolSurfaceEngine:
     ) -> pd.DataFrame:
         """Query options_snapshots for a ticker.
 
-        Tries exact snap_date first, falls back to most recent available.
+        Require the exact requested snapshot date. A missing/invalid session
+        stays unavailable: substituting another date would mix chain and spot
+        clocks and can leak future snapshots into a historical request.
+        This date bound alone does not prove publication-time availability.
 
         Parameters:
             ticker: Underlying ticker symbol.
@@ -946,17 +949,6 @@ class VolSurfaceEngine:
             ).fetchall()
 
         if not rows:
-            # Fall back to most recent snap_date
-            with self.engine.connect() as conn:
-                latest = conn.execute(
-                    text(
-                        "SELECT MAX(snap_date) FROM options_snapshots "
-                        "WHERE ticker = :t"
-                    ),
-                    {"t": ticker},
-                ).fetchone()
-                if latest and latest[0] and latest[0] != as_of_date:
-                    return self._get_options_data(ticker, latest[0])
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=[
