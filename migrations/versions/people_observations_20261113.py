@@ -5,7 +5,7 @@ No backfill, scheduler, or existing reader activation. Downgrade refuses data lo
 from alembic import op
 
 revision = 'people_observations_20261113'
-down_revision = 'options_spot_clock_20261110'
+down_revision = 'finra_dix_feature_20261113'
 branch_labels = None
 depends_on = None
 

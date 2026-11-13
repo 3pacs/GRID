@@ -70,3 +70,13 @@ history or retroactively certify known_at/ingested_at/recorded_at.
 No job, writer, scheduler, frozen study or provider call invokes this code.
 Migration graph and user-run apply remain review/release tasks. Claude verifies
 the kit; Anik applies any eventual release.
+
+
+## Current-main integration (2026-11-13)
+
+Reconciled onto main `e7d2b029c7ca6209960cddf040f4c74d3515a125`.
+This candidate adds only the observer files; it does not replay the older
+foundation branch or overwrite its readers. The additive migration now follows
+`finra_dix_feature_20261113`, preserving one Alembic head. The regression suite
+checks the revision path and tests actual observation DDL on disposable PostgreSQL.
+This is not a full all-history migration rehearsal, nor production activation.

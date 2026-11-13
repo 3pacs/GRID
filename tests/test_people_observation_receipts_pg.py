@@ -1,7 +1,7 @@
 """Disposable PostgreSQL only: committed-state receipts and failure recovery."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime
 from unittest.mock import patch
 
 import pytest
@@ -9,11 +9,11 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 
 from store import people_event_observations as O
-from test_people_events_v2_migration_pg import schema_engine, v2, _ROW, _insert, _run
+from test_people_events_v2_migration_pg import schema_engine, v2, _ROW, _insert, _run  # noqa: F401 (pytest fixtures)
 
 
 @pytest.fixture
-def observed(v2):
+def observed(v2):  # noqa: F811 (pytest fixture dependency)
     _run(v2, 'migrations.versions.people_observations_20261113')
     return v2
 
@@ -128,7 +128,8 @@ def test_append_only_and_nonempty_downgrade_refused(observed):
                 'TRUNCATE people_event_observations',
                 "UPDATE people_event_observations SET payload_text='{}'"]:
         with pytest.raises(DBAPIError):
-            with observed.begin() as conn: conn.execute(text(sql))
+            with observed.begin() as conn:
+                conn.execute(text(sql))
     with pytest.raises(DBAPIError, match='refusing'):
         _run(observed, 'migrations.versions.people_observations_20261113', 'downgrade')
     assert capture(observed).verify()['events'] == []
@@ -137,22 +138,26 @@ def test_append_only_and_nonempty_downgrade_refused(observed):
 def test_migration_reapply_and_empty_downgrade(observed):
     _run(observed, 'migrations.versions.people_observations_20261113')
     _run(observed, 'migrations.versions.people_observations_20261113', 'downgrade')
-    with pytest.raises(DBAPIError): capture(observed)
+    with pytest.raises(DBAPIError):
+        capture(observed)
 
 
 def test_capture_bounds_refuse_not_truncate(observed):
     _insert(observed)
     with patch.object(O, 'MAX_ROWS', 0):
-        with pytest.raises(ValueError, match='bounded'): capture(observed)
+        with pytest.raises(ValueError, match='bounded'):
+            capture(observed)
     with patch.object(O, 'MAX_BYTES', 1):
-        with pytest.raises(ValueError, match='bounded'): capture(observed)
+        with pytest.raises(ValueError, match='bounded'):
+            capture(observed)
     with observed.connect() as conn:
         assert conn.execute(text('SELECT count(*) FROM people_event_observations')).scalar_one() == 0
 
 
 @pytest.mark.parametrize('acts', [[], [('form4', '')], [('form4',)], [('form4', 'x')]*101])
 def test_invalid_scope_no_database_read(observed, acts):
-    with pytest.raises(ValueError): O.capture_observation(observed, request_id='r', acts=acts)
+    with pytest.raises(ValueError):
+        O.capture_observation(observed, request_id='r', acts=acts)
 
 
 def test_failure_after_insert_before_commit_rolls_back(observed):
@@ -181,7 +186,8 @@ def test_process_dies_after_commit_before_ack_retry_recovers(observed):
     process.start()
     process.join(10)
     if process.is_alive():
-        process.terminate(); process.join()
+        process.terminate()
+        process.join()
         pytest.fail('bounded crash witness did not finish')
     assert process.exitcode == 23
     persisted = O.read_observation(observed, request_id='lost-ack')
@@ -239,3 +245,19 @@ def test_durable_receipt_overrides_async_session_commit_locally(observed):
     assert O.read_observation(observed, request_id='r1') == receipt
     with observed.connect() as conn:
         assert conn.exec_driver_sql('SHOW synchronous_commit').scalar_one() == 'off'
+
+
+def test_observer_migration_is_single_head_after_current_base():
+    """The isolated candidate must extend, not fork, the deployed migration graph."""
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    root = Path(__file__).resolve().parents[1]
+    config = Config(str(root / 'alembic.ini'))
+    config.set_main_option('script_location', str(root / 'migrations'))
+    scripts = ScriptDirectory.from_config(config)
+    assert scripts.get_heads() == ['people_observations_20261113']
+    revision = scripts.get_revision('people_observations_20261113')
+    assert revision.down_revision == 'finra_dix_feature_20261113'
+    chain = list(scripts.iterate_revisions(revision.revision, revision.down_revision))
+    assert [r.revision for r in chain] == [revision.revision]
