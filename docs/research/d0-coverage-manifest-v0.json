@@ -1112,7 +1112,7 @@
     {
       "id": "G6",
       "text": "event_sequence dropped signal_sources events (r[8]) and stamped filings at period_end",
-      "status": "#1145 merged and deployed 2026-11-12; Codex 8befc05e stricter guards integrated locally as bce4f5d5 on claude/d0-reader-guards-integrate-20261113 (tests pass locally); branch not pushed, no PR open; lead times HOLD until merged"
+      "status": "#1145 merged and deployed 2026-11-12; Codex 8befc05e stricter guards integrated as 25467893 in PR #1167 (opened 2026-11-13, unmerged; 629 local tests pass); lead times HOLD until merged"
     },
     {
       "id": "G7",
