@@ -1112,12 +1112,12 @@
     {
       "id": "G6",
       "text": "event_sequence dropped signal_sources events (r[8]) and stamped filings at period_end",
-      "status": "#1145 merged and deployed 2026-11-12; Codex 8befc05e stricter guards integrated as 25467893 in PR #1167 (opened 2026-11-13, unmerged; 629 local tests pass); lead times HOLD until merged"
+      "status": "#1145 merged and deployed 2026-11-12; Codex 8befc05e stricter guards merged and deployed in #1167 (99dbd52a, 2026-11-13); timing held at the reader; lead times HOLD until release/version receipts exist"
     },
     {
       "id": "G7",
       "text": "2,131 earnings_calendar compat stubs read as releases by causal_links",
-      "status": "reader-side hold in 8befc05e integration (three direct causal_links readers only); causation_graph and causal_chains uncovered; no mass rewrite on the date-equality count"
+      "status": "reader-side hold deployed in #1167 (99dbd52a) (three direct causal_links readers only); causation_graph and causal_chains uncovered; no mass rewrite on the date-equality count"
     },
     {
       "id": "G8",
