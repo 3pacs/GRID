@@ -96,19 +96,41 @@
         "rows": 9313,
         "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
       },
-      "missingness": "",
+      "missingness": "measured 2026-11-13 against resolved spy_full dates (retracted rows included): 3 spy_full dates lack vix_spot (one each in 2001, 2006, 2007; not itemised). vix_spot also carries real Cboe prints on non-session days (from 2022-05-30 every NYSE holiday except New Year's Day, Good Friday, Christmas; plus 2004-06-11 and 2025-01-09), which the section 6.1 daily-conditioner rule ignores",
       "latency": "daily",
       "entitlement": "public",
       "storage_limits": "raw_series",
       "admission_status": "CANDIDATE_UNREVIEWED",
       "blocked_hypotheses": [],
-      "notes": "regime conditioning only; first availability 'after close' is an assertion, not a checked historical receipt; missingness not measured",
+      "notes": "regime conditioning only, under the section 6.1 daily-conditioner rule; first availability 'after close' is an assertion, not a checked historical receipt. The 2026-04-09 yfinance vintage of vix_spot holds 1,640 of 9,134 rows more than 5 % off the other sources (e.g. 2025-07-07: 33.43 vs 17.79), all superseded on 2026-04-10, 0 retracted; reads at as_of 2026-04-09 are excluded unless retracted. Holiday-print cause (likely Cboe global trading hours) not verified",
       "receipts": {
-        "query_sha256": null,
-        "snapshot": null,
-        "source_version": null,
-        "receipt_sha256": null,
-        "exclusions": null
+        "query_sha256": "57885d71cc44d758e037275f27e7e3d3ec872f09334570d55ce864b7979eb93b",
+        "snapshot": "docs/research/d0-receipts/vix_holiday_rows.result.json",
+        "source_version": "griddb production, read on grid-svr",
+        "receipt_sha256": "080b7d6e8c9d9e9e2720851607230a6ccb6391cbd6dae06211bce36227a77bab",
+        "exclusions": null,
+        "additional": [
+          {
+            "snapshot": "docs/research/d0-receipts/vix_vs_spy_calendar.result.json",
+            "query_sha256": "c6a90e6abc16d6e4116602393373fe7603e8e46c4c8529041151379a99a22109",
+            "receipt_sha256": "ae9634d34a1f0e0cb682b94bcb4fc0e25a3ad4bd025be2b0b19df078b266a93c"
+          },
+          {
+            "snapshot": "docs/research/d0-receipts/vintage_20260409.result.json",
+            "query_sha256": "ec95acdaf900ef8cb102863a8f242cea8529fae633bcc1cc28844ee1deb22ca6",
+            "receipt_sha256": "501abb3eb90622ff7d97bb1c55dd2a59c74a6e5771cf1afc227378d61b0d4f41"
+          },
+          {
+            "snapshot": "docs/research/d0-receipts/served_20260409.result.json",
+            "query_sha256": "9f25d2d5a13ae72211daee851a165398d4de0e0c63a245d27a3c25142a5b0e1e",
+            "receipt_sha256": "535e3e7afb653bd0da0c09941a7634be371701ebe3420f3aa0924fa314e71565"
+          },
+          {
+            "snapshot": "docs/research/d0-receipts/retractions_check.result.json",
+            "query_sha256": "cf8d560fe58fdeb590de28aec694de20e42f8d3958128775fc273aa69f8425b8",
+            "receipt_sha256": "7c056649efccf87b4add601927349e51cc8ac82ab095383c03c6a90c35b39fc3"
+          }
+        ]
       }
     },
     {
@@ -1146,7 +1168,7 @@
       "status": "open; source-only design + disposable-PostgreSQL concurrency plan next"
     }
   ],
-  "revision": 3,
+  "revision": 4,
   "revised_at": "2026-11-13",
   "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. Enforced by analysis/d0_manifest.py. An input label is never a hypothesis admission."
 }

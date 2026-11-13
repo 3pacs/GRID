@@ -1,0 +1,147 @@
+{
+ "measured_at": "2026-11-13T05:14:32+00:00",
+ "query_sha256": "ec95acdaf900ef8cb102863a8f242cea8529fae633bcc1cc28844ee1deb22ca6",
+ "rows": [
+  {
+   "a": "8360",
+   "b": "7302",
+   "c": "3920",
+   "d": "4429",
+   "e": "1993-01-29 .. 2026-04-09",
+   "g": "dfa-spy-full-backdated-20261002,full-basis-20261109,reresolve_20260927",
+   "h": "5",
+   "part": "spy_full"
+  },
+  {
+   "a": "2014-04-29",
+   "b": "101.28",
+   "c": "187.75",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-05-09",
+   "b": "99.99",
+   "c": "187.96",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-05-29",
+   "b": "103.58",
+   "c": "192.37",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-05-30",
+   "b": "102.71",
+   "c": "192.68",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-06-16",
+   "b": "106.90",
+   "c": "194.29",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-07-01",
+   "b": "105.34",
+   "c": "197.03",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-07-03",
+   "b": "104.06",
+   "c": "198.20",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-07-11",
+   "b": "100.83",
+   "c": "196.61",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-07-29",
+   "b": "100.97",
+   "c": "196.95",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-07-31",
+   "b": "98.17",
+   "c": "193.09",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-08-04",
+   "b": "98.29",
+   "c": "193.89",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "2014-08-07",
+   "b": "97.34",
+   "c": "191.03",
+   "d": null,
+   "e": null,
+   "g": null,
+   "h": null,
+   "part": "spy_full bad_unretracted_sample"
+  },
+  {
+   "a": "9134",
+   "b": "1640",
+   "c": "0",
+   "d": "1640",
+   "e": "1990-01-02 .. 2026-04-09",
+   "g": null,
+   "h": "0",
+   "part": "vix_spot"
+  }
+ ],
+ "transaction": "READ ONLY"
+}

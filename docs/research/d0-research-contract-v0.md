@@ -5,10 +5,10 @@
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0`, **revision 3** (revision 2 answered the reviewer's first pass; revision 3 adds the G11 SKEW receipts and the G6 status, §10.1) — **DRAFT, unsigned** |
+| Version | `d0-contract-v0`, **revision 4** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2) — **DRAFT, unsigned** |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
 | Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
-| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1) |
+| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2) |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
@@ -123,7 +123,7 @@ An input enters a decision only if all six are known; otherwise it is `EXCLUDED_
 |---|---|---|---|---|
 | `options_capture_batches` / `options_snapshots_all`, SPY, Cboe delayed (~15 min) | GRID griddb, append-only | **2026-10-01 .. 2026-11-11, 30 sessions, 359 batches** (measured 2026-11-12) | batch `registered_at`, `capture_started/completed_at`; per-contract quote time absent; spot clock only from 2026-11-10 | forward-only; too short for any historical claim; OCC symbol not stored, no bid/ask size |
 | `options_daily_signals` / `spy_iv_*` features | GRID | same as above | obs = release = snap date | diagnostic; "25-delta" is a ±10 % moneyness proxy |
-| CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | **CANDIDATE_UNREVIEWED**. Proposed for regime conditioning as the prior session's close. "Published after the close" is an assertion, not a checked historical first-availability receipt; missingness is not yet measured |
+| CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | **CANDIDATE_UNREVIEWED**. Proposed for regime conditioning as the prior session's close, read under the §6.1 daily-conditioner rule. "Published after the close" is an assertion, not a checked historical first-availability receipt. Measured 2026-11-13 (`d0-receipts/vix_*`, `vintage_20260409`): `vix_spot` carries real Cboe prints on non-session days (from 2022-05-30, every NYSE holiday except New Year's Day, Good Friday and Christmas; also the 2004-06-11 and 2025-01-09 closures); CBOE, FRED and yfinance agree on them. The 2026-04-09 yfinance vintage holds 1,640 rows more than 5 % off the other sources, superseded on 2026-04-10 and not retracted. VIX9D/VIX3M were not measured |
 | CBOE SKEW (`skew_index`) | GRID `resolved_series` | **1990-01-02 .. 2026-11-11**, 9,268 dates (measured 2026-11-13, query receipt `d0-receipts/g11_skew_coverage`). Since 2026-03-26 the only `vix_spot` dates without SKEW are 4 US market holidays; 50 such dates over the full history, not itemised | daily close; first resolved vintage 1 day after obs for 150 of 160 dates since 2026-03-26, 2–6 days for 10. Rows for 2026-03-26 .. 11-11 were committed by the 2026-11-13 backfill (clock 4 **UNPROVEN**) | **CANDIDATE_UNREVIEWED**, on the same terms as VIX: "after the close" is an assertion, not a first-availability receipt (G11 coverage closed) |
 | Schwab chains / quotes / 1-min bars | process-local only, `persist_allowed=False`; no redistribution | live only | provider quoteTime + receipt time | live inputs for forward shadows; no history; no aggressor side |
 | Polygon `/v3/snapshot/options` | — | 403, puller SKIPPED | — | unavailable |
@@ -330,6 +330,19 @@ under an append-only table with accession as key. Compute small.
 - **Calendar:** NYSE regular sessions from `ingestion/market_calendar.py` plus the local corrections already
   in #1100; half days excluded from intraday families; sessions with thin open interest excluded by the edge4
   rule (fixed before data, recorded per session).
+- **Daily conditioners (VIX, VIX9D, VIX3M, SKEW).** For decision session *t*, a conditioner is the official
+  close dated on the last session of this calendar strictly before *t*, read `as_of` the decision time
+  (§7 rule 6). The conditioner's own row dates never define sessions:
+  - prints dated on non-session days are ignored, never used as "the prior session" and never averaged in.
+    Cboe publishes VIX on most NYSE holidays since 2022-05-30 (§3.1); SKEW is not published on them;
+  - if the value for that session is missing, the cell is excluded for session *t* and counted (§7 rule 4).
+    It is never filled from an earlier session or from another conditioner;
+  - a read that would serve the unretracted 2026-04-09 yfinance `vix_spot` vintage (`as_of` on 2026-04-09)
+    is excluded and counted, unless that vintage is retracted before signing. A retraction is a separate,
+    unauthorised write;
+  - sessions are checked against `ingestion/market_calendar.py` plus the #1100 corrections, never against
+    the dates of another series. Calendar comparisons exclude retracted rows (`spy_full` holds retracted
+    rows on the closed days 2025-01-09 and 2025-07-04).
 - **Separate questions, scored separately:** (a) forecast quality of a volatility measure (diagnostic);
   (b) after-cost tradability of a fixed structure (economic). A pass on (a) never implies (b).
 
@@ -588,5 +601,16 @@ No threshold, window, hypothesis or rule changed. No outcome was read.
 | SKEW moves from `EXCLUDED_STALE` to `CANDIDATE_UNREVIEWED`; clock 4 recorded as `UNPROVEN`, because the 2026-03-26 .. 11-11 rows were committed by the 2026-11-13 backfill | §3.1, manifest |
 | Side finding, not checked further: resolved `vix_spot` carries rows on 4 US market holidays since 2026-03-26 (2026-05-25, 06-19, 07-03, 09-07). VIX missingness stays unmeasured | §3.1 |
 | G6 status corrected: revision 2 said "PR pending" when no PR existed. The integration is #1167, merged and deployed 2026-11-13 as `99dbd52a` | §1, G6 |
+
+### 10.2 Revision 4: one D2 rule (2026-11-13)
+
+No threshold, window or hypothesis changed. No outcome was read. The rule only fixes which value a daily
+conditioner takes; it is set before any D2 data is scored.
+
+| Change | Where |
+|---|---|
+| Daily-conditioner rule: the prior-session close on the §6.1 session calendar; non-session prints ignored; missing → excluded, never filled; the 2026-04-09 bad vintage excluded unless retracted | §6.1 |
+| VIX holiday prints and the 2026-04-09 vintage measured with five read-only query receipts (`d0-receipts/vix_holiday_rows`, `vix_vs_spy_calendar`, `vintage_20260409`, `served_20260409`, `retractions_check`) | §3.1, manifest `grid.raw_series.CBOE:VIX` |
+| The revision 3 side finding is answered: the holiday rows are real Cboe prints, not a GRID defect | §3.1 |
 
 <!-- D0-CONTRACT-BODY-END -->
