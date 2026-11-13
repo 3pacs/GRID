@@ -92,13 +92,15 @@ def test_record_is_complete_and_every_reading_is_standardized(engine):
     st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
     assert st["rule"] == "market-state/1" and st["baseline_rule"] == "trailing-robust/1"
     missing = {k: v.get("reason") for k, v in st["variables"].items() if v["status"] != "ok"}
-    assert missing == {"short_volume_ratio": "no observation known at as_of"}
+    # No vintages stored in this fixture: the three news variables are unavailable, not guessed.
+    assert set(missing) == {"short_volume_ratio", "news_uncertainty", "equity_news_uncertainty", "news_first_print"}
+    assert st["news_shock"]["status"] == "unavailable"
     for k, v in st["variables"].items():
         if v["status"] == "ok":
             assert {"value", "median", "robust_z", "percentile", "label", "n", "obs_date"} <= set(v), k
             assert date.fromisoformat(v["obs_date"]) <= AS_OF, k
     assert st["spy_basis"] == "YF:SPY:close"
-    assert set(st["pending"]) >= {"news_intensity", "release_surprise", "dix", "dealer_gamma"}
+    assert set(st["pending"]) == {"release_surprise", "earnings_surprise", "dix", "dealer_gamma"}
 
 
 def test_monthly_value_waits_for_its_publication_lag(engine):
@@ -160,3 +162,105 @@ def test_storage_is_insert_only_unless_replace(engine):
         rows = c.execute(text("SELECT as_of_date, rule, record FROM market_state_daily")).fetchall()
     assert len(rows) == 1 and rows[0][1] == "market-state/1"
     assert json.loads(rows[0][2])["as_of"] == AS_OF.isoformat()
+
+
+# ── news (ALFRED vintages) ────────────────────────────────────────────────
+
+from store import fred_vintages as FV  # noqa: E402
+
+
+def _vintage_rows(start: date, end: date, *, spike_obs: date | None = None) -> list[dict]:
+    """Synthetic daily index: first print 40 % low, settled the next day; weekends at half level."""
+    rows, d, i = [], start, 0
+    while d <= end:
+        settled = (150.0 if d.weekday() < 5 else 75.0) + 10 * math.sin(i / 11.0)
+        if spike_obs is not None and d == spike_obs:
+            settled *= 4
+        first = settled * 0.6
+        rows.append({"obs_date": d, "realtime_start": d + timedelta(days=1), "realtime_end": d + timedelta(days=1),
+                     "value": first})
+        rows.append({"obs_date": d, "realtime_start": d + timedelta(days=2), "realtime_end": FV.OPEN_END,
+                     "value": settled})
+        d, i = d + timedelta(days=1), i + 1
+    return rows
+
+
+def test_settled_news_uses_only_versions_live_on_each_day():
+    vint = pd.DataFrame(_vintage_rows(date(2025, 1, 1), date(2025, 3, 1)))
+    s = M.settled_news(vint, [date(2025, 2, 3)])
+    # obs 2025-01-25..31 (t-9..t-3) are all past their second day by 02-03: settled values, full week.
+    want = [((150.0 if (date(2025, 1, 25) + timedelta(days=k)).weekday() < 5 else 75.0)
+             + 10 * math.sin((date(2025, 1, 25) + timedelta(days=k) - date(2025, 1, 1)).days / 11.0)) for k in range(7)]
+    assert s.iloc[0] == pytest.approx(sum(want) / 7)
+
+
+def test_first_print_is_the_newest_weekday_as_first_shown():
+    vint = pd.DataFrame(_vintage_rows(date(2025, 1, 1), date(2025, 3, 1)))
+    s, obs_for = M.first_print_news(vint, [date(2025, 2, 4)])       # Tuesday
+    assert obs_for[date(2025, 2, 4)] == date(2025, 2, 3)            # Monday's first print, published Tuesday
+    i = (date(2025, 2, 3) - date(2025, 1, 1)).days
+    assert s.iloc[0] == pytest.approx(0.6 * (150.0 + 10 * math.sin(i / 11.0)))
+    s2, obs2 = M.first_print_news(vint, [date(2025, 2, 3)])          # Monday: newest weekday printed is Friday
+    assert obs2[date(2025, 2, 3)] == date(2025, 1, 31)
+
+
+def test_news_uncertainty_calendar_cooccurrence():
+    ok = {"status": "ok", "robust_z": 3.1}
+    cal = {"cpi": [date(2025, 2, 12)]}
+    assert M.news_shock(ok, date(2025, 2, 12), cal)["kind"] == "elevated_uncertainty"
+    assert M.news_shock(ok, date(2025, 2, 13), cal)["kind"] == "elevated_uncertainty"
+    assert M.news_shock({"status": "ok", "robust_z": 1.0}, date(2025, 2, 13), cal)["kind"] == "not_elevated"
+    assert M.news_shock({"status": "unavailable", "reason": "x"}, None, cal)["status"] == "unavailable"
+
+
+def test_record_reads_news_from_vintages_and_reports_uncertainty(engine):
+    _seed(engine)
+    spike = date(2025, 6, 9)      # Monday; first printed 06-10 (the as_of)
+    for sid in ("USEPUINDXD", "WLEMUINDXD"):
+        FV.upsert(engine, sid, _vintage_rows(date(2023, 12, 1), date(2025, 6, 9), spike_obs=spike))
+    st = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    for k in ("news_uncertainty", "equity_news_uncertainty", "news_first_print"):
+        assert st["variables"][k]["status"] == "ok", (k, st["variables"][k])
+    shock = st["news_shock"]
+    assert shock["obs_date"] == "2025-06-09" and shock["kind"] == "elevated_uncertainty" and shock["robust_z"] >= 2
+    # nfp on 06-06 is not the spike's day; with CPI moved onto it, the same proxy observation co-occurs with CPI; causation stays unverified.
+    st2 = M.compute_market_state(engine, AS_OF, calendar={**CAL, "cpi": [spike]}).to_dict()
+    assert st2["news_shock"]["kind"] == "elevated_uncertainty" and st2["news_shock"]["events_on_obs_day"] == ["cpi"]
+
+
+def test_a_news_revision_after_as_of_never_changes_the_record(engine):
+    _seed(engine)
+    for sid in ("USEPUINDXD", "WLEMUINDXD"):
+        FV.upsert(engine, sid, _vintage_rows(date(2023, 12, 1), date(2025, 6, 9)))
+    before = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    FV.upsert(engine, "USEPUINDXD", [{"obs_date": date(2025, 6, 9), "realtime_start": date(2025, 6, 11),
+                                      "realtime_end": FV.OPEN_END, "value": 9999.0}])
+    after = M.compute_market_state(engine, AS_OF, calendar=CAL).to_dict()
+    assert json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True)
+
+
+@pytest.mark.parametrize("z", [None, float("nan"), float("inf"), float("-inf"), True, "high"])
+def test_news_uncertainty_invalid_measurement_is_unavailable(z):
+    result = M.news_shock({"status": "ok", "robust_z": z}, date(2025, 2, 12), {})
+    assert result["status"] == "unavailable"
+
+
+def test_news_uncertainty_missing_calendar_does_not_imply_unscheduled_shock():
+    result = M.news_shock({"status": "ok", "robust_z": 3.0}, date(2025, 2, 12), {})
+    assert result["kind"] == "elevated_uncertainty"
+    assert result["calendar_context"] == "unknown"
+    assert result["news_attribution"] == "unverified"
+
+
+def test_news_uncertainty_same_date_event_is_not_causal_attribution():
+    result = M.news_shock({"status": "ok", "robust_z": 3.0}, date(2025, 2, 12), {"cpi": [date(2025, 2, 12)]})
+    assert result["kind"] == "elevated_uncertainty"
+    assert result["calendar_context"] == "listed_release"
+    assert result["news_attribution"] == "unverified"
+    assert result["supports_flow_only_classification"] is False
+
+
+def test_low_news_uncertainty_does_not_prove_no_news():
+    result = M.news_shock({"status": "ok", "robust_z": 0.0}, date(2025, 2, 12), {"cpi": [date(2025, 2, 13)]})
+    assert result["kind"] == "not_elevated"
+    assert result["supports_flow_only_classification"] is False

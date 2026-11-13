@@ -4,8 +4,10 @@
 #   sudo cp deploy/systemd/grid-market-state.service.template /etc/systemd/system/grid-market-state.service
 #   sudo cp deploy/systemd/grid-market-state.timer.template   /etc/systemd/system/grid-market-state.timer
 #   sudo systemctl daemon-reload && sudo systemctl enable --now grid-market-state.timer
-# Backfill once before enabling (sessions in date order; insert-only, so a rerun skips what exists):
-#   python3 scripts/run_market_state.py --from 2019-01-02 --to <yesterday>
+# Backfill once before enabling: the news-index vintages first, then the records (sessions in date order;
+# insert-only, so a rerun skips what exists):
+#   python3 -m ingestion.fred_vintages backfill
+#   python3 scripts/run_market_state.py --no-refresh --from 2019-01-02 --to <yesterday>
 [Unit]
 Description=GRID market-state record writer (prior completed session only, point-in-time, insert-only)
 After=network.target postgresql.service

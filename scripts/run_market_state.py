@@ -11,6 +11,9 @@ Usage:
     python3 scripts/run_market_state.py                         # prior session
     python3 scripts/run_market_state.py --dry-run --json        # print the record, write nothing
     python3 scripts/run_market_state.py --from 2019-01-02 --to 2026-11-12   # backfill sessions
+
+Before computing, a real run fetches the FRED vintages published since the last stored one for the news indexes
+(``ingestion/fred_vintages.py``; ``--no-refresh`` skips it). First time: ``python -m ingestion.fred_vintages backfill``.
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="compute without writing")
     p.add_argument("--json", action="store_true", help="print each record (dry run) or summary as JSON")
     p.add_argument("--replace", action="store_true", help="overwrite an existing row for the same date")
+    p.add_argument("--no-refresh", action="store_true",
+                   help="skip fetching new FRED vintages of the news indexes first (a dry run never fetches)")
     return p
 
 
@@ -72,6 +77,11 @@ def main(argv: list[str] | None = None, engine=None) -> int:
 
         engine = get_engine()
     calendar = load_calendar()
+    refresh: list[dict] = []
+    if not a.dry_run and not a.no_refresh:
+        from ingestion.fred_vintages import SERIES, refresh as refresh_vintages
+
+        refresh = [refresh_vintages(engine, s) for s in SERIES]
     written = skipped = 0
     for t in targets:
         state = compute_market_state(engine, t, calendar=calendar)
@@ -88,7 +98,9 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             skipped += 1
     if not a.dry_run:
         summary = {"job": "run_market_state", "sessions": len(targets), "written": written,
-                   "already_present": skipped, "generated_at": datetime.now(timezone.utc).isoformat()}
+                   "already_present": skipped, "vintage_refresh": [{k: r.get(k) for k in ("series", "status", "rows_sent")}
+                                                                   for r in refresh],
+                   "generated_at": datetime.now(timezone.utc).isoformat()}
         print(json.dumps(summary) if a.json else
               f"market-state: {written} written, {skipped} already present, {len(targets)} sessions")
     return 0

@@ -28,10 +28,26 @@ baseline, so each reads as "this far above or below its normal". Code: `intellig
 | inflation / growth | cpi_yoy, industrial_production_yoy, consumer_sentiment | CPIAUCSL, INDPRO, UMCSENT | monthly |
 | trend | spy_vs_50d, spy_vs_200d | SPY close (spy_full, else YF:SPY:close) | daily fast |
 | flow | short_volume_ratio | finra:short_volume_agg:market_ratio (GRID history from 2025-11) | daily fast |
+| news | news_uncertainty, equity_news_uncertainty | USEPUINDXD, WLEMUINDXD: 7-day mean of days t-9..t-3, as FRED showed them on t | daily fast |
+| news | news_first_print | USEPUINDXD: newest weekday first print, compared only with past first prints | daily fast |
 | events | today, next, within_14d | FRED release dates (CPI, PPI, NFP, GDP, PCE, retail sales) + Fed calendar (FOMC) | — |
+| news_shock | elevated_uncertainty / not_elevated | news_first_print z ≥ 2; calendar co-occurrence separate, attribution unverified | — |
 
-Pending (listed in every record as `pending`): news intensity and unscheduled-news shock, release surprise
-(no consensus source yet), earnings surprise, DIX, dealer gamma.
+Pending (listed in every record as `pending`): release surprise (no consensus source yet), earnings surprise, DIX,
+dealer gamma.
+
+## News and vintages
+
+The daily newspaper-based uncertainty indexes (Baker, Bloom, Davis) are revised for weeks: USEPUINDXD for
+2022-06-02 first printed 60.23 and settled at 144.13. `fred_vintages` (`store/fred_vintages.py`, filled by
+`ingestion/fred_vintages.py` from ALFRED) keeps every published version with the dates it was live, and answers
+"what did FRED show for day X at the end of day D" for D within 45 days of X. Each past day's news reading is rebuilt
+from the versions live on that day, so a first print is compared with past first prints, never with revised history.
+First fill: `python -m ingestion.fred_vintages backfill` (vintages start 2014-03-27); the nightly writer refreshes it.
+
+Checked on real data (read-only, 2026-11-13): 2020-03-16 and 2025-04-04/08 (tariffs) had elevated uncertainty
+(z 5.0, 3.95, 5.0); 2022-06-13, the session after a hot CPI print, was not elevated (z −0.28).
+These proxy readings do not themselves attribute the moves to news or establish that a session had no news.
 
 ## Availability
 
@@ -39,3 +55,6 @@ Every input goes through `store.observations.read_window_known_at` with a declar
 (`market_state.LAGS`; documented shutdown releases override it). Backfilled history is revised vintage, not first
 release. Monthly values therefore arrive a few weeks after their real release; that costs freshness, never adds
 lookahead. Rows are insert-only; `--replace` is the only way to rewrite a date.
+
+### News attribution boundary
+The newspaper uncertainty proxy does not establish a market-moving shock, its cause, or a quiet/flow-only session. `calendar_context` reports only listed-release co-occurrence (or unknown when no calendar is loaded). `news_attribution` stays `unverified`; `supports_flow_only_classification` is false. Nonfinite or nonnumeric proxy scores are unavailable. The enclosing `news_shock` key is retained, but the new descriptive kinds intentionally replace the overclaiming scheduled/unscheduled/none categories. No production consumer currently reads those categories.
