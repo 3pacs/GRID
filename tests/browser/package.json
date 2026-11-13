@@ -5,6 +5,7 @@
   "description": "Puppeteer-core evidence runner for tests/browser/run_evidence.mjs. Drives system Chrome/Edge against the fixture-backed PWA harness and saves screenshots/text/console/network logs as files. Not part of the pwa/ app — do not add this dependency to pwa/package.json.",
   "type": "module",
   "scripts": {
+    "test": "node --test spy_contract.test.mjs acceptance_gates.test.mjs",
     "evidence": "node run_evidence.mjs"
   },
   "devDependencies": {
