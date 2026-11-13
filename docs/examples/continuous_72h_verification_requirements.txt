@@ -44,7 +44,7 @@ pytz==2026.4
 requests==2.34.2
 rsa==4.9.1
 six==1.17.0
-soupsieve==2.10
+soupsieve==4.0
 sqlalchemy==2.0.54
 starlette==1.7.0
 typing-extensions==4.16.0
