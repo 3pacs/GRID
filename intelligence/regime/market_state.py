@@ -20,8 +20,12 @@ Availability contract (``as_of`` = end of that UTC day), same as state_vector:
 
 Scheduled economic events come from ``config/econ_release_dates.json`` (official release dates: BLS / BEA / Fed;
 regenerate with ``scripts/build_econ_release_dates.py``). A release date is public long before the release, so the
-calendar has no availability lag. Unscheduled news and release surprises are not in record v1 (their history sources
-are listed in :data:`PENDING`), and the record says so instead of filling them.
+calendar has no availability lag.
+
+News comes from the daily newspaper-based uncertainty indexes (USEPUINDXD, WLEMUINDXD), read from ALFRED vintages
+(``store/fred_vintages.py``) as FRED showed them on each day, because they are revised for weeks after first print.
+``news_shock`` labels a high first print "scheduled" when a release fell on its day, else "unscheduled". Release and
+earnings surprises, DIX and dealer gamma are listed in :data:`PENDING`; the record says so instead of filling them.
 """
 
 from __future__ import annotations
@@ -88,8 +92,6 @@ SOURCES: dict[str, str] = {"CBOE:VIX": "CBOE", "CBOE:VIX3M": "CBOE"}
 
 # Inputs a later record version adds; listed in every record so a reader sees what is not there yet.
 PENDING: dict[str, str] = {
-    "news_intensity": "needs a news-volume source with history before 2026-03 (GDELT DOC timeline volume)",
-    "unscheduled_news_shock": "news_intensity on a day with no scheduled event",
     "release_surprise": "actual minus consensus per scheduled release; GRID has no consensus source yet",
     "earnings_surprise": "mega-cap EPS actual vs estimate (FMP), read point in time",
     "dix": "dollar-weighted S&P 500 dark-pool short ratio (FINRA files back to 2018-08; edge search 11 rebuild)",
@@ -112,8 +114,9 @@ class _Reads:
 
     def __init__(self, engine: Engine, as_of: date, lookback_days: int) -> None:
         self.engine, self.as_of, self.lookback_days = engine, as_of, lookback_days
-        self._memo: dict[str, pd.Series] = {}
+        self._memo: dict[str, Any] = {}
         self.spy_basis: str | None = None
+        self.first_print_obs: dict[str, date | None] = {}
 
     def series(self, series_id: str) -> pd.Series:
         if series_id not in self._memo:
@@ -128,6 +131,20 @@ class _Reads:
             s = pd.Series({o.obs_date: o.value for o in obs if o.value is not None}, dtype=float).sort_index()
             self._memo[series_id] = s[np.isfinite(s.to_numpy())] if len(s) else s
         return self._memo[series_id]
+
+    def vintages(self, series_id: str) -> pd.DataFrame:
+        """ALFRED vintage rows (store/fred_vintages.py) for observations in the lookback, published by as_of."""
+        key = "__vint__" + series_id
+        if key not in self._memo:
+            from store import fred_vintages as FV
+
+            try:
+                df = FV.load(self.engine, series_id, self.as_of - timedelta(days=NEWS_LOOKBACK_DAYS), self.as_of, self.as_of)
+            except Exception as exc:  # table absent before the first fetch
+                log.warning("market_state: no vintages for {s}: {e}", s=series_id, e=str(exc))
+                df = pd.DataFrame(columns=["obs_date", "realtime_start", "realtime_end", "value"])
+            self._memo[key] = df
+        return self._memo[key]
 
     def spy(self) -> pd.Series:
         """SPY closes known at ``as_of``, one basis per record.
@@ -224,6 +241,88 @@ def _net_liq_change_4w(r: _Reads) -> pd.Series:
     return _net_liq(r).diff(4).dropna()
 
 
+# ── News (daily newspaper-based uncertainty indexes, read as FRED showed them on each day) ──
+#
+# USEPUINDXD / WLEMUINDXD are revised for weeks: the first print of 2022-06-02 was 60.23, the settled value 144.13.
+# Each past day's reading is recomputed from the vintages live on that day, so today's reading is compared with past
+# readings made the same way (a first print against past first prints), never with revised history.
+NEWS_SETTLE_DAYS = 3          # skip the newest observations, which move most after first print
+NEWS_WINDOW_DAYS = 7          # a full week, so weekday/weekend levels never tilt the mean
+NEWS_MIN_KNOWN = 5
+NEWS_LOOKBACK_DAYS = 420      # 252 trading days of readings plus the 7+3 day window and holidays
+SHOCK_Z = 2.0
+
+
+def _reading_days(as_of: date) -> list[date]:
+    from ingestion.market_calendar import trading_days_between
+
+    days = trading_days_between(as_of - timedelta(days=NEWS_LOOKBACK_DAYS - 15), as_of)
+    return days if days and days[-1] == as_of else days + [as_of]
+
+
+def settled_news(vint: pd.DataFrame, days: list[date]) -> pd.Series:
+    """Per day t: mean of the observations t-9..t-3 as FRED showed them at the end of t (>= 5 known)."""
+    from store.fred_vintages import values_as_of
+
+    out = {}
+    for t in days:
+        obs = [t - timedelta(days=NEWS_SETTLE_DAYS + k) for k in range(NEWS_WINDOW_DAYS)]
+        vals = [v for v in values_as_of(vint, obs, t).values() if v is not None]
+        if len(vals) >= NEWS_MIN_KNOWN:
+            out[t] = float(np.mean(vals))
+    return pd.Series(out, dtype=float).sort_index()
+
+
+def first_print_news(vint: pd.DataFrame, days: list[date]) -> tuple[pd.Series, dict[date, date]]:
+    """Per day t: the newest weekday observation FRED had published by the end of t, as first shown then.
+
+    Returns (readings by t, the observation date each reading is for). Weekday observations only, so the reading never
+    flips between weekday and weekend newspaper levels.
+    """
+    from store.fred_vintages import values_as_of
+
+    out, obs_for = {}, {}
+    for t in days:
+        cands = [t - timedelta(days=k) for k in range(1, 6)]
+        cands = [o for o in cands if o.weekday() < 5]
+        known = values_as_of(vint, cands, t)
+        for o in cands:                      # newest first
+            if known.get(o) is not None:
+                out[t], obs_for[t] = known[o], o
+                break
+    return pd.Series(out, dtype=float).sort_index(), obs_for
+
+
+def _settled(series_id: str) -> Callable[["_Reads"], pd.Series]:
+    return lambda r: settled_news(r.vintages(series_id), _reading_days(r.as_of))
+
+
+def _first_print(series_id: str) -> Callable[["_Reads"], pd.Series]:
+    def f(r: "_Reads") -> pd.Series:
+        s, obs_for = first_print_news(r.vintages(series_id), _reading_days(r.as_of))
+        r.first_print_obs[series_id] = obs_for.get(r.as_of)
+        return s
+    return f
+
+
+def news_shock(reading: dict[str, Any], obs_date: date | None, calendar: dict[str, list[date]]) -> dict[str, Any]:
+    """Classify today's news first print: unscheduled news, scheduled-event news, or none.
+
+    A first print at least SHOCK_Z robust z above its own baseline is news. It is "scheduled" when a scheduled
+    release (``config/econ_release_dates.json``) fell on the observation's day, else "unscheduled".
+    """
+    if reading.get("status") != "ok" or obs_date is None:
+        return {"status": "unavailable", "reason": reading.get("reason", "no first print")}
+    z = reading.get("robust_z")
+    events = sorted(k for k, ds in calendar.items() if obs_date in ds) if calendar else []
+    if z is None or z < SHOCK_Z:
+        kind = "none"
+    else:
+        kind = "scheduled" if events else "unscheduled"
+    return {"status": "ok", "kind": kind, "obs_date": obs_date.isoformat(), "robust_z": z, "threshold_z": SHOCK_Z,
+            "events_on_obs_day": events, "calendar_known": bool(calendar)}
+
+
 VARIABLES: list[VarSpec] = [
     VarSpec("vix", "volatility", "daily_fast", _level("CBOE:VIX"), "index points"),
     VarSpec("vix_term", "volatility", "daily_fast", _ratio("CBOE:VIX", "CBOE:VIX3M"), "VIX / VIX3M",
@@ -245,6 +344,12 @@ VARIABLES: list[VarSpec] = [
     VarSpec("spy_vs_200d", "trend", "daily_fast", _spy_ma_distance(200), "SPY / 200-day average - 1"),
     VarSpec("short_volume_ratio", "flow", "daily_fast", _level("finra:short_volume_agg:market_ratio"),
             "short / total off-exchange volume, all symbols", "FINRA aggregate; GRID history from 2025-11"),
+    VarSpec("news_uncertainty", "news", "daily_fast", _settled("USEPUINDXD"),
+            "EPU index, 7-day mean of days t-9..t-3", "Baker-Bloom-Davis daily newspaper index, as FRED showed it on t"),
+    VarSpec("equity_news_uncertainty", "news", "daily_fast", _settled("WLEMUINDXD"),
+            "equity-market uncertainty index, 7-day mean of days t-9..t-3", "as FRED showed it on t"),
+    VarSpec("news_first_print", "news", "daily_fast", _first_print("USEPUINDXD"),
+            "EPU index, newest weekday first print", "timely but noisy: compared only with past first prints"),
 ]
 VAR_NAMES = [v.name for v in VARIABLES]
 
@@ -299,6 +404,7 @@ class MarketState:
     as_of: date
     variables: dict[str, dict[str, Any]] = field(default_factory=dict)
     events: dict[str, Any] = field(default_factory=dict)
+    news_shock: dict[str, Any] = field(default_factory=dict)
     spy_basis: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -310,6 +416,7 @@ class MarketState:
             "availability": "known by the end of as_of (UTC); backfilled history is revised vintage",
             "variables": self.variables,
             "events": self.events,
+            "news_shock": self.news_shock,
             "pending": PENDING,
             "coverage": {"ok": len(ok), "total": len(self.variables)},
             "spy_basis": self.spy_basis,
@@ -344,7 +451,10 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
                                       "age_days": (as_of - last_obs).days if isinstance(last_obs, date) else None,
                                       **reading.to_dict()}
     state.spy_basis = reads.spy_basis
-    state.events = events_state(as_of, load_calendar() if calendar is None else calendar)
+    cal = load_calendar() if calendar is None else calendar
+    state.events = events_state(as_of, cal)
+    state.news_shock = news_shock(state.variables.get("news_first_print", {}),
+                                  reads.first_print_obs.get("USEPUINDXD"), cal)
     return state
 
 
