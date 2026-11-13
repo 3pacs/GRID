@@ -618,10 +618,17 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # gdelt registry entry: timeout_s 60 -> 360 and its comments
         # (requests wait for the shared GDELT DOC gate; pull_recent stops
         # at deadline_at). Needs reviewer acceptance like the prior pins.
+        # OPER re-pinned bd887fc7 -> 69b8efc2 (2026-11-13,
+        # claude/edge-stream-20261113): the only operator edit is a 14-line
+        # block at the top of run_intelligence_tasks (after the dry-run
+        # return) that calls alpha_research.edge_stream.hermes.maybe_spawn_cycle
+        # in a try/except; it only spawns a detached child and is inert
+        # without the EDGE_STREAM_* env. Needs reviewer acceptance like the
+        # prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','bd887fc76b56b2f4f6073097b9a2b6bfeaca67eddb3171d0f2806cdd07dd52b6'),(SCHED,'\nimport calendar\n','3ca3c3f9257ab076c23a5dea33937c749b509965b208121b2789aa0186e436a9')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','69b8efc2c8f1dcbffcf0bd2ae7f4a9c0fdc861ccb5fb6914d0e76b20c6b2a84a'),(SCHED,'\nimport calendar\n','3ca3c3f9257ab076c23a5dea33937c749b509965b208121b2789aa0186e436a9')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
