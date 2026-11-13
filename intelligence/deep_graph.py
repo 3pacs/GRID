@@ -1595,6 +1595,8 @@ def discover_hidden_influence(engine: Engine) -> list[dict[str, Any]]:
     all_overlaps = find_all_overlaps(engine, tickers)
 
     # Phase 2: Cross-reference with causal chains
+    from intelligence.causal_links import EARNINGS_EDGE_READ_GUARD_SQL
+
     causal_actors: dict[str, list[str]] = defaultdict(list)  # actor -> [tickers]
     try:
         with engine.connect() as conn:
@@ -1602,7 +1604,8 @@ def discover_hidden_influence(engine: Engine) -> list[dict[str, Any]]:
                 "SELECT actor, ticker "
                 "FROM causal_links "
                 "WHERE created_at >= NOW() - INTERVAL '90 days' "
-                "ORDER BY created_at DESC "
+                + EARNINGS_EDGE_READ_GUARD_SQL
+                + "ORDER BY created_at DESC "
                 "LIMIT 1000"
             )).fetchall()
             for row in rows:

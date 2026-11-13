@@ -412,6 +412,7 @@ def get_hidden_influence(
 
     try:
         from intelligence.deep_graph import discover_hidden_influence
+        from intelligence.causal_links import earnings_timing_policy
 
         engine = get_db_engine()
         t0 = time.time()
@@ -422,6 +423,8 @@ def get_hidden_influence(
             "discoveries": discoveries,
             "count": len(discoveries),
             "elapsed_seconds": round(elapsed, 2),
+            "causal_links_coverage": "partial",
+            "earnings_timing": earnings_timing_policy(),
         }
 
     except Exception as exc:

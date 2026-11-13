@@ -26,15 +26,15 @@ def _row(**over):
         "id": 7, "edge_key": "k" * 64, "signal_id": 42, "actor": "Jane Doe", "ticker": "AAPL",
         "action": "SELL", "action_channel": "form4", "action_date": date(2026, 9, 15),
         "action_known_at": datetime(2026, 9, 17, tzinfo=timezone.utc),
-        "action_known_at_basis": "filing", "cause_type": "earnings",
-        "probable_cause": "Earnings beat released 2026-09-10 (1.10 vs 1.00 est)",
-        "event_kind": "earnings", "event_key": "earnings:AAPL:2026-09-10",
+        "action_known_at_basis": "filing", "cause_type": "contract",
+        "probable_cause": "Contract award first seen 2026-09-11",
+        "event_kind": "contract", "event_key": "contract:AAPL:W1",
         "event_date": date(2026, 9, 10),
         "event_known_at": datetime(2026, 9, 11, tzinfo=timezone.utc),
-        "event_known_at_basis": "release_date",
+        "event_known_at_basis": "first_seen",
         "known_at": datetime(2026, 9, 17, tzinfo=timezone.utc), "lead_time_days": 4.0,
         "probability": 0.647, "score_method": cl.SCORE_METHOD,
-        "evidence": '[{"type": "earnings"}]', "run_id": "r2", "first_run_id": "r1",
+        "evidence": '[{"type": "contract"}]', "run_id": "r2", "first_run_id": "r1",
         "code_sha": "abc123", "computed_at": datetime(2026, 9, 27, 7, 41, tzinfo=timezone.utc),
     }
     row.update(over)
@@ -92,11 +92,11 @@ class TestCausalLinksEndpoint:
         assert link["effect_date"] == "2026-09-15"
         assert link["effect_description"] == "Jane Doe SELL AAPL"
         assert link["known_at"].startswith("2026-09-17")
-        assert link["event_known_at_basis"] == "release_date"
+        assert link["event_known_at_basis"] == "first_seen"
         assert link["run_id"] == "r2" and link["first_run_id"] == "r1"
         assert link["score"] == 0.647
         assert link["score_is_probability"] is False
-        assert link["evidence"] == [{"type": "earnings"}]
+        assert link["evidence"] == [{"type": "contract"}]
         assert "Price reaction" not in str(out)
 
     def test_db_error_returns_graceful_error(self):
@@ -125,5 +125,5 @@ class TestCausationGet:
         assert out["as_of"] == _RUN["as_of"]
         assert out["total_causes"] == 1
         cause = out["causes"][0]
-        assert cause["ticker"] == "AAPL" and cause["probable_cause"].startswith("Earnings beat")
+        assert cause["ticker"] == "AAPL" and cause["probable_cause"].startswith("Contract award")
         assert cause["score_method"] == cl.SCORE_METHOD

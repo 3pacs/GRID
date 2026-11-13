@@ -11,7 +11,7 @@ Data sources:
   - options_daily_signals (options flow / regime changes)
   - decision_journal     (model decisions and recommendations)
   - cross_reference_checks (macro divergence events)
-  - earnings_calendar    (earnings dates and surprises)
+  - earnings timing is withheld pending exact-version release evidence
 
 Key entry points:
   build_sequence          — full chronological event list for a ticker
@@ -23,6 +23,7 @@ Key entry points:
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -79,6 +80,40 @@ class Event:
     source: str
     confidence: str
     lead_time_to_next_move: float | None  # computed after the fact
+    timestamp_basis: str = "legacy_unspecified"
+    timing_hold_reason: str | None = None
+    source_record_id: str | None = None
+
+
+EVENT_TIMING_HOLD_REASON = (
+    "Historical exact-version availability is unverified; descriptive only, "
+    "not admitted to lead-time or recurring-pattern inference."
+)
+EARNINGS_CALENDAR_HOLD_REASON = (
+    "Mutable calendar and filing rows lack qualified release/version receipts; "
+    "period-end compatibility stubs are not earnings releases."
+)
+
+
+def timing_coverage_policy(*, display_only: bool = False) -> dict[str, Any]:
+    """Static policy; absence of held inputs is not zero historical events."""
+    return {
+        "signal_sources": {
+            "status": "display_only" if display_only else "withheld",
+            "reason": EVENT_TIMING_HOLD_REASON,
+        },
+        "earnings": {"status": "withheld", "reason": EARNINGS_CALENDAR_HOLD_REASON},
+        "other_sources": "legacy_unreviewed",
+    }
+
+
+def timing_is_held(event: Any) -> bool:
+    """Keep restored/unqualified records out of existing temporal consumers."""
+    source = str(getattr(event, "source", "") or "")
+    return bool(getattr(event, "timing_hold_reason", None)) or (
+        source.startswith("signal_sources:")
+        or source in {"earnings_calendar", "earnings_events"}
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -151,7 +186,8 @@ def _parse_json_metadata(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
     except (json.JSONDecodeError, TypeError):
         return {}
 
@@ -244,55 +280,52 @@ def _get_price_series(
 def _pull_signal_source_events(
     engine: Engine, ticker: str, cutoff: datetime,
 ) -> list[Event]:
-    """Pull events from signal_sources table."""
+    """Current source records for descriptive display, not historical admission.
+
+    Named result columns bind signal_value metadata without positional coupling.
+    Outcome labels are deliberately not read: they are not pre-event evidence.
+    Mutable source timestamps cannot prove when this exact payload was visible.
+    """
     events: list[Event] = []
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_type, source_id, signal_type, signal_date,
-                       signal_value, trust_score, outcome
+                SELECT id, source_type, source_id, ticker, signal_type,
+                       signal_date, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND signal_date >= :c
                 ORDER BY signal_date DESC
                 LIMIT :lim
-            """), {"t": ticker, "c": cutoff, "lim": MAX_EVENTS_PER_QUERY}).fetchall()
-
-            # Read by column name: positional reads went stale when the
-            # SELECT changed and r[8] raised on every row (D0 gap G6).
-            for row in rows:
-                r = row._mapping
-                src_type = r["source_type"] or ""
-                src_id = r["source_id"] or ""
-                # signal_value is the JSONB details payload.
-                meta = _parse_json_metadata(r["signal_value"])
-                amount = _safe_float(meta.get("amount_usd") or meta.get("estimated_value"))
-                if amount is None and not isinstance(r["signal_value"], (dict, list, str)):
-                    amount = _safe_float(r["signal_value"])  # bare numeric payload
-
-                event_type = _SOURCE_TYPE_MAP.get(src_type.lower(), src_type.lower())
-
+            """), {"t": ticker, "c": cutoff, "lim": MAX_EVENTS_PER_QUERY}).mappings().all()
+        for row in rows:
+            try:
+                src_type = str(row.get("source_type") or "")
+                src_id = str(row.get("source_id") or "")
+                meta = _parse_json_metadata(row.get("signal_value"))
+                amount = None
+                for candidate in (meta.get("amount_usd"), meta.get("estimated_value"), row.get("signal_value")):
+                    value = _safe_float(candidate)
+                    if value is not None and math.isfinite(value):
+                        amount = value
+                        break
                 desc_parts = [f"{src_type} signal from {src_id}"]
-                if meta.get("description"):
-                    desc_parts.append(str(meta["description"]))
-                elif meta.get("transaction_type"):
-                    desc_parts.append(str(meta["transaction_type"]))
-
-                outcome_str = str(r["outcome"] or "PENDING")
-                if outcome_str != "PENDING":
-                    desc_parts.append(f"[outcome: {outcome_str}]")
-
+                detail = meta.get("description") or meta.get("transaction_type")
+                if detail:
+                    desc_parts.append(str(detail))
                 events.append(Event(
-                    timestamp=_parse_ts(r["signal_date"]),
-                    event_type=event_type,
-                    actor=src_id if src_id else None,
-                    ticker=ticker,
-                    direction=_direction_from_signal(r["signal_type"]),
-                    amount_usd=amount,
-                    description=" — ".join(desc_parts),
+                    timestamp=_parse_ts(row.get("signal_date")),
+                    event_type=_SOURCE_TYPE_MAP.get(src_type.lower(), src_type.lower()),
+                    actor=src_id or None, ticker=ticker,
+                    direction=_direction_from_signal(row.get("signal_type")),
+                    amount_usd=amount, description=" — ".join(desc_parts),
                     source=f"signal_sources:{src_type}",
-                    confidence=_confidence_label(_safe_float(r["trust_score"])),
-                    lead_time_to_next_move=None,
+                    confidence="unverified",
+                    lead_time_to_next_move=None, timestamp_basis="source_event_date",
+                    timing_hold_reason=EVENT_TIMING_HOLD_REASON,
+                    source_record_id=str(row["id"]) if row.get("id") is not None else None,
                 ))
+            except (TypeError, ValueError, AttributeError) as exc:
+                log.warning("Malformed signal row withheld for {t}: {e}", t=ticker, e=str(exc))
     except Exception as exc:
         log.debug("signal_sources pull for {t} failed: {e}", t=ticker, e=str(exc))
     return events
@@ -540,154 +573,12 @@ def _pull_crossref_events(
 def _pull_earnings_events(
     engine: Engine, ticker: str, cutoff: datetime,
 ) -> list[Event]:
-    """Pull events from earnings_calendar."""
-    events: list[Event] = []
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT earnings_date, fiscal_quarter, eps_estimate, eps_actual,
-                       eps_surprise_pct, revenue_estimate, revenue_actual,
-                       revenue_surprise_pct, classification, reported
-                FROM earnings_calendar ec
-                WHERE ec.ticker = :t AND ec.earnings_date >= :c
-                  -- Refuse compat stubs mirrored from earnings_events by
-                  -- scripts/sync_earnings_events_to_calendar.py: their
-                  -- earnings_date is the SEC period_end, not a release date
-                  -- (D0 gap G7). The real filing is read below by filing_date.
-                  AND NOT (
-                      ec.eps_actual IS NULL
-                      AND EXISTS (
-                          SELECT 1 FROM earnings_events ee
-                          WHERE ee.ticker = ec.ticker
-                            AND ee.period_end = ec.earnings_date
-                      )
-                  )
-                ORDER BY ec.earnings_date DESC
-                LIMIT :lim
-            """), {"t": ticker, "c": cutoff.date(), "lim": MAX_EVENTS_PER_QUERY}).fetchall()
+    """Withhold both calendar and mutable filing rollups without reading them.
 
-            for r in rows:
-                quarter = r[1] or ""
-                eps_est = _safe_float(r[2])
-                eps_act = _safe_float(r[3])
-                surprise = _safe_float(r[4])
-                rev_est = _safe_float(r[5])
-                rev_act = _safe_float(r[6])
-                _safe_float(r[7])
-                classification = r[8] or "pending"
-                reported = r[9]
-
-                if reported and eps_act is not None:
-                    # Reported earnings — include surprise info
-                    direction = "neutral"
-                    if surprise is not None:
-                        if surprise > 5.0:
-                            direction = "bullish"
-                        elif surprise < -5.0:
-                            direction = "bearish"
-
-                    desc = f"Earnings {quarter}: EPS actual={eps_act:.2f}"
-                    if eps_est is not None:
-                        desc += f" (est={eps_est:.2f})"
-                    if surprise is not None:
-                        desc += f", surprise={surprise:+.1f}%"
-                    if rev_act is not None:
-                        desc += f", revenue=${rev_act/1e9:.2f}B" if rev_act > 1e6 else f", revenue=${rev_act:.0f}"
-                    if classification:
-                        desc += f" [{classification}]"
-
-                    amount = rev_act if rev_act else None
-                else:
-                    # Upcoming / unported earnings
-                    direction = "neutral"
-                    desc = f"Earnings scheduled {quarter}"
-                    if eps_est is not None:
-                        desc += f": EPS est={eps_est:.2f}"
-                    if rev_est is not None:
-                        desc += f", revenue est=${rev_est/1e9:.2f}B" if rev_est > 1e6 else ""
-                    amount = None
-
-                events.append(Event(
-                    timestamp=_parse_ts(r[0]),
-                    event_type="earnings",
-                    actor=None,
-                    ticker=ticker,
-                    direction=direction,
-                    amount_usd=amount,
-                    description=desc,
-                    source="earnings_calendar",
-                    confidence="confirmed" if reported else "estimated",
-                    lead_time_to_next_move=None,
-                ))
-    except Exception as exc:
-        log.debug("earnings_calendar pull for {t} failed: {e}", t=ticker, e=str(exc))
-
-    # Task #186: additive pull from earnings_events (#151 puller) for
-    # filing-level coverage (10-K/10-Q/8-K/EARNINGS_CALL/DEF 14A/S-1)
-    # that earnings_calendar may not yet have.  A filing becomes known on
-    # its filing_date, never on period_end (the fiscal period it covers,
-    # weeks earlier): stamping period_end put filings before they existed
-    # (D0 gap G6).  Dedupe on the YYYY-MM-DD prefix of the filing date.
-    seen_dates: set[str] = {
-        str(ev.timestamp)[:10] for ev in events if ev.timestamp
-    }
-    try:
-        with engine.connect() as conn:
-            ev_rows = conn.execute(text("""
-                SELECT filing_date, period_end, fiscal_quarter, event_type,
-                       summary, sentiment
-                FROM earnings_events
-                WHERE ticker = :t AND filing_date >= :c
-                ORDER BY filing_date DESC
-                LIMIT :lim
-            """), {
-                "t": ticker, "c": cutoff.date(), "lim": MAX_EVENTS_PER_QUERY,
-            }).fetchall()
-
-            for row in ev_rows:
-                r = row._mapping
-                filing_date = r["filing_date"]
-                if filing_date is None:
-                    continue  # unknown availability: refuse, never guess
-                fd_key = str(filing_date)[:10]
-                if fd_key in seen_dates:
-                    continue
-                seen_dates.add(fd_key)
-
-                quarter = r["fiscal_quarter"] or ""
-                ev_type = r["event_type"] or "filing"
-                summary = r["summary"] or ""
-                sentiment = (r["sentiment"] or "").lower()
-
-                if sentiment in ("positive", "bullish"):
-                    direction = "bullish"
-                elif sentiment in ("negative", "bearish"):
-                    direction = "bearish"
-                else:
-                    direction = "neutral"
-
-                desc = f"{ev_type} {quarter}".strip()
-                if r["period_end"] is not None:
-                    desc += f" (period end {str(r['period_end'])[:10]})"
-                if summary:
-                    desc += f": {summary[:160]}"
-
-                events.append(Event(
-                    timestamp=_parse_ts(filing_date),
-                    event_type="earnings_filing",
-                    actor=None,
-                    ticker=ticker,
-                    direction=direction,
-                    amount_usd=None,
-                    description=desc,
-                    source="earnings_events",
-                    confidence="confirmed",
-                    lead_time_to_next_move=None,
-                ))
-    except Exception as exc:
-        log.debug("earnings_events pull for {t} failed: {e}", t=ticker, e=str(exc))
-
-    return events
+    Neither period_end nor filing_date establishes availability of the current
+    summary/sentiment payload. Release/version receipts are required first.
+    """
+    return []
 
 
 def _pull_price_move_events(
@@ -731,12 +622,14 @@ def build_sequence(
     engine: Engine,
     ticker: str,
     days: int = 90,
+    *,
+    include_unqualified: bool = False,
 ) -> list[Event]:
-    """Build a chronological timeline of ALL events for a ticker.
+    """Build the legacy timeline, excluding known-unqualified timing by default.
 
-    Pulls from signal_sources, news_articles, options_daily_signals,
-    decision_journal, cross_reference_checks, and earnings_calendar.
-    Sorts all events chronologically.
+    include_unqualified is a display-only opt-in for current signal rows, never
+    a research admission. Earnings timing remains held in both modes. Other
+    legacy sources retain their behavior and are not certified by this guard.
 
     Parameters:
         engine: SQLAlchemy engine.
@@ -753,13 +646,17 @@ def build_sequence(
 
     # Pull from all sources — each gracefully degrades on failure
     all_events: list[Event] = []
-    all_events.extend(_pull_signal_source_events(engine, ticker, cutoff))
+    if include_unqualified:
+        all_events.extend(_pull_signal_source_events(engine, ticker, cutoff))
     all_events.extend(_pull_news_events(engine, ticker, cutoff))
     all_events.extend(_pull_options_events(engine, ticker, cutoff))
     all_events.extend(_pull_decision_journal_events(engine, ticker, cutoff))
     all_events.extend(_pull_crossref_events(engine, ticker, cutoff))
     all_events.extend(_pull_earnings_events(engine, ticker, cutoff))
     all_events.extend(_pull_price_move_events(engine, ticker, cutoff))
+
+    if not include_unqualified:
+        all_events = [event for event in all_events if not timing_is_held(event)]
 
     # Sort chronologically (oldest first)
     all_events.sort(key=lambda e: e.timestamp or "")
@@ -775,6 +672,8 @@ def build_sector_sequence(
     engine: Engine,
     sector: str,
     days: int = 90,
+    *,
+    include_unqualified: bool = False,
 ) -> list[Event]:
     """Build a chronological timeline for all tickers in a sector.
 
@@ -797,7 +696,9 @@ def build_sector_sequence(
 
     all_events: list[Event] = []
     for ticker in tickers:
-        all_events.extend(build_sequence(engine, ticker, days=days))
+        all_events.extend(build_sequence(
+            engine, ticker, days=days, include_unqualified=include_unqualified,
+        ))
 
     # Re-sort the combined list chronologically
     all_events.sort(key=lambda e: e.timestamp or "")
@@ -822,6 +723,9 @@ def compute_lead_times(
     Returns:
         The same list of Event instances with lead_time_to_next_move populated.
     """
+    for event in events:
+        if timing_is_held(event):
+            event.lead_time_to_next_move = None
     if not price_series or len(price_series) < 2:
         return events
 
@@ -841,7 +745,7 @@ def compute_lead_times(
 
     # For each event, find the next significant move after it
     for event in events:
-        if not event.timestamp:
+        if timing_is_held(event) or not event.timestamp:
             continue
         try:
             if "T" in event.timestamp:
@@ -919,7 +823,8 @@ def find_recurring_patterns(
     # Build events per ticker
     events_by_ticker: dict[str, list[Event]] = {}
     for ticker in tickers:
-        seq = build_sequence(engine, ticker, days=365)
+        seq = [event for event in build_sequence(engine, ticker, days=365)
+               if not timing_is_held(event)]
         if seq:
             events_by_ticker[ticker] = seq
 
@@ -1060,12 +965,16 @@ def build_sequence_with_lead_times(
     engine: Engine,
     ticker: str,
     days: int = 90,
+    *,
+    include_unqualified: bool = False,
 ) -> list[Event]:
     """Build event sequence and compute lead times in one call.
 
     Combines build_sequence() and compute_lead_times() for the common case.
     """
-    events = build_sequence(engine, ticker, days=days)
+    events = build_sequence(
+        engine, ticker, days=days, include_unqualified=include_unqualified,
+    )
     if not events:
         return events
 
