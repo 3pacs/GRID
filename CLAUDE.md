@@ -217,3 +217,4 @@ Read the matching file only when the task calls for it — keep this core file l
 | Returning a number that might be missing, modelled or stale (any API/analytics output) | `docs/reference/AVAILABILITY_CONTRACT.md` (+ `store/availability.py`, `store/observations.py`) |
 | Reading or repairing `{ticker}_full` price panels, or anything split/dividend-adjusted | `docs/reference/PRICE_PANEL_BASIS.md` (+ `normalization/entity_map.py` PRICE BASIS POLICY, `scripts/repair_full_panel_vintages.py`) |
 | Scoring, confirming or relabelling hypotheses (`discovered_hypotheses`, `hypothesis_registry`) | `docs/reference/HYPOTHESIS_SCORING_V2.md` (+ `intelligence/hypothesis_trials.py`) |
+| Registering or running edge-search looks (trading-rule hypotheses judged once on fresh data, Hermes edge stream) | `docs/reference/EDGE_STREAM.md` (+ `alpha_research/edge_stream/`) |
