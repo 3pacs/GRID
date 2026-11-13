@@ -287,33 +287,44 @@ def test_canonical_hash_is_order_and_key_stable():
     assert L.ledger_sha256([a]) != L.ledger_sha256([rec(id="other")])
 
 
-def test_committed_v1_ledger_validates_against_its_build_time_and_pin():
+def test_committed_v2_ledger_validates_against_its_build_time_and_pin():
     path = L.REPO / L.LEDGER_PATH
     records = L.load_ledger(path)
     assert L.LEDGER_BUILT_AT is not None
     assert L.validate_ledger(records, built_at=L.LEDGER_BUILT_AT) == []
     assert path.read_bytes() == L.canonical_bytes(records), "ledger file must be in canonical form"
-    assert L.FROZEN_LEDGER_SHA256 is not None, "R3 v1 is frozen; the ledger pin must stay set"
+    assert L.FROZEN_LEDGER_SHA256 is not None, "R3 v2 is frozen; the ledger pin must stay set"
     assert L.ledger_sha256(records) == L.FROZEN_LEDGER_SHA256
 
 
-def test_frozen_v1_and_v0_artifacts_match_their_pins():
-    for pins in (L.FROZEN_FILES, L.V0_FROZEN_FILES):
+def test_frozen_v2_v1_and_v0_artifacts_match_their_pins():
+    for pins in (L.FROZEN_FILES, L.V1_FROZEN_FILES, L.V0_FROZEN_FILES):
         assert pins
         for rel, want in pins.items():
             got = hashlib.sha256((L.REPO / rel).read_bytes()).hexdigest()
             assert got == want, f"{rel} changed after its freeze; publish a new version instead"
 
 
-def test_v1_stack_split_and_every_record_has_a_review_field():
+def test_v2_stack_split_review_counts_and_no_unhashed_retrieval_time():
     records = L.load_ledger(L.REPO / L.LEDGER_PATH)
-    assert len(records) == 453
+    assert len(records) == 455
     assert all("review" in r for r in records)
+    critic = [r for r in records if r["review"]["verdict"] in ("CONFIRMED", "CORRECTED", "UNVERIFIABLE")]
+    assert len(critic) == 200  # the header's "200 critic-checked"
+    for r in records:  # a retrieval time exists only where bytes were kept and hashed
+        if r["source"]["retrieved_sha256"] is None:
+            assert r["source"]["retrieved_at"] is None, r["id"]
     stack = L.commitment_stack(records)
     assert stack["counted_total_usd_bn"] == pytest.approx(542.4)
     assert stack["counted_by_firmness_usd_bn"] == pytest.approx(
-        {"firm": 118.0, "cancellable": 279.0, "contingent": 133.5, "post_balance": 11.9})
+        {"firm": 118.0, "partly_cancellable": 279.0, "contingent": 133.5, "post_balance": 11.9})
     assert stack["counted_by_circularity_usd_bn"]["capacity_backstop"] == pytest.approx(36.0)
+
+
+def test_v1_ledger_is_not_valid_under_v2_rules():
+    """v1 labels the supply line plain 'cancellable', which v2 no longer allows."""
+    v1 = L.load_ledger(L.REPO / L.V1_LEDGER_PATH)
+    assert any("firmness" in e for e in L.validate_ledger(v1))
 
 
 def test_v0_ledger_fails_the_v1_build_time_rule():
@@ -387,3 +398,25 @@ def test_sensitivity_prints_implied_working_capital():
     out = L.run_scenarios(records, spec)["scenarios"]["base"]
     assert out["implied_extra_working_capital_bn"] == pytest.approx((0.55 - 0.45) * out["fwd4q_revenue_bn"])
     assert out["implied_extra_dso_days_if_all_receivables"] == pytest.approx(0.10 * 364.0)
+
+
+# ----------------------------------------------------------------- v2 validator rules
+
+
+def test_date_only_retrieval_on_build_day_counts_as_end_of_day():
+    errs = L.validate_record(rec(source={"retrieved_at": "2026-11-13"}), built_at="2026-11-13T03:00:00Z")
+    assert any("after the ledger build time" in e for e in errs)
+
+
+def test_counted_record_needs_a_hash():
+    assert any("needs the sha256" in e for e in L.validate_record(rec(source={"retrieved_sha256": None})))
+
+
+def test_total_must_equal_its_declared_components():
+    a = rec(id="a", amount={"value": 10.0})
+    b = rec(id="b", amount={"value": 5.0})
+    tot = rec(id="t", counted=False, amount={"value": 16.0}, total_of=["a", "b"])
+    tot.pop("firmness")
+    assert any("!= sum of its components" in e for e in L.validate_ledger([a, b, tot]))
+    tot["amount"]["value"] = 15.0
+    assert L.validate_ledger([a, b, tot]) == []

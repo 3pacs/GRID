@@ -32,26 +32,34 @@ from typing import Any, Iterable
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = "r3-nvda-ledger/0"
-LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v1.jsonl")
-SCENARIOS_PATH = Path("docs/research/r3-nvda/scenarios-v1.json")
+LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v2.jsonl")
+SCENARIOS_PATH = Path("docs/research/r3-nvda/scenarios-v2.json")
 #: v0 (frozen 2026-11-13, superseded by v1 after the independent review on #1150)
 #: stays in the repo unchanged as the record of what was frozen first.
 V0_LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v0.jsonl")
 #: Records must have become public strictly before this instant. NVIDIA's
 #: Q3 FY2027 release is scheduled after the 2026-11-17 close (~21:20Z).
 FREEZE_CUTOFF = "2026-11-17T21:00:00+00:00"
-#: v1 pins: sha256 of the canonical v1 ledger bytes and the build instant. No
-#: record may claim a retrieval after LEDGER_BUILT_AT. Any change after the freeze is v2.
-FROZEN_LEDGER_SHA256: str | None = "fdbe3cb66db6aab3c8ce0969b2891bb5a7b3ecf98f8cf608714ae723426a8e06"
-LEDGER_BUILT_AT: str | None = "2026-11-13T03:06:53Z"
+#: v2 pins: sha256 of the canonical v2 ledger bytes and the build instant. No
+#: record may claim a retrieval after LEDGER_BUILT_AT. Any change after the freeze is v3.
+FROZEN_LEDGER_SHA256: str | None = "c593b3975239a1c0ab6eff6acc4fd812f8b1f6d6c16536a6d8b11df3ff6c5dc6"
+LEDGER_BUILT_AT: str | None = "2026-11-13T04:33:42Z"
 FROZEN_AT = "2026-11-13"
-#: The other frozen v1 artifacts (raw-byte sha256), checked by the tests.
+#: The other frozen v2 artifacts (raw-byte sha256), checked by the tests.
 FROZEN_FILES: dict[str, str] = {
+    "docs/research/r3-nvda/scenarios-v2.json": "19215c253633e570dff8322da8abfc1ec95e1aabbec25d78102ceaa70133bb88",
+    "docs/research/r3-nvda/health-v2.json": "f5b8dbb0c1088a4224e1bf855851548ad9b39c8fb37fffa938c3e012824684ed",
+    "docs/research/r3-nvda/synthesis-v2.md": "ba9df7bd9787acaeef63d86444e0b9d5d993ab0088ff85338f9780d88ef7ca3b",
+    "docs/research/r3-nvda/health-rubric-v0.md": "5e11a86e02cef71a14be3abb403ffe04c35c9011d911e52f74b1b926984c909c",
+}
+#: v1 artifacts (raw-byte sha256), superseded by v2 after the re-review on #1150.
+V1_FROZEN_FILES: dict[str, str] = {
+    "docs/research/r3-nvda/ledger-v1.jsonl": "fdbe3cb66db6aab3c8ce0969b2891bb5a7b3ecf98f8cf608714ae723426a8e06",
     "docs/research/r3-nvda/scenarios-v1.json": "e5564229cb5f1a8d4797f4890aa8699c2129621e50546163e6f7613a89b3ebea",
     "docs/research/r3-nvda/health-v1.json": "ad7a7b6cd03a2bd315a80562c6a1fafaedc311fcaf2e8b59249c7531bb95a1d0",
     "docs/research/r3-nvda/synthesis-v1.md": "9b3262acd991cdb5d155c440dc3d6317644a1e686a65a046e15964499abfe4d8",
-    "docs/research/r3-nvda/health-rubric-v0.md": "5e11a86e02cef71a14be3abb403ffe04c35c9011d911e52f74b1b926984c909c",
 }
+V1_LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v1.jsonl")
 #: v0 artifacts (raw-byte sha256). They must never change: they are the record of
 #: the first freeze, superseded by v1 after the review on #1150.
 V0_FROZEN_FILES: dict[str, str] = {
@@ -100,9 +108,10 @@ CIRCULARITY = (
 )
 CONFIDENCE = ("primary_verbatim", "primary_paraphrase", "secondary_only")
 UNITS = ("billions", "millions", "GW", "units", "percent", None)
-#: How binding a counted commitment is (v1). Contingent caps and post-balance-date
-#: events are reported apart from firm and cancellable obligations.
-FIRMNESS = ("firm", "cancellable", "contingent", "post_balance")
+#: How binding a counted commitment is (v2). "partly_cancellable": the filer says
+#: some of it may be cancelled "in certain instances", share not disclosed.
+#: "post_balance" is a timing label (agreed after the balance date), kept apart.
+FIRMNESS = ("firm", "partly_cancellable", "contingent", "post_balance")
 HEX = set("0123456789abcdef")
 #: Bases whose dollars can be NVIDIA's (demand on NVIDIA, or NVIDIA's own
 #: obligations). Whole-project spend and counterparty capex are context only.
@@ -240,7 +249,7 @@ def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF, built_at: st
             if not isinstance(ret, str):
                 raise TypeError("retrieved_at must be a string")
             ret_ts = _parse_ts(ret, end_of_day=True)
-            if built_at is not None and _parse_ts(ret) > _parse_ts(built_at):
+            if built_at is not None and _parse_ts(ret, end_of_day=True) > _parse_ts(built_at):
                 errs.append(f"{rid}: retrieved_at {ret} is after the ledger build time {built_at}")
             if pub_ts is not None and ret_ts < pub_ts:
                 errs.append(f"{rid}: retrieved_at {ret} is before published_at {pub}")
@@ -266,6 +275,8 @@ def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF, built_at: st
         errs.append(f"{rid}: only a primary record with a value can be counted")
     if r["counted"] and _finite(amt["value"]) and amt["value"] < 0:
         errs.append(f"{rid}: a counted commitment cannot be negative")
+    if r["counted"] and src.get("retrieved_sha256") is None:
+        errs.append(f"{rid}: a counted record needs the sha256 of its source bytes")
     if r["counted"] and r.get("firmness") not in FIRMNESS:
         errs.append(f"{rid}: a counted record needs firmness in {FIRMNESS}")
     total_of = r.get("total_of")
@@ -300,6 +311,12 @@ def validate_ledger(
                 errs.append(f"{r.get('id')}: total_of names unknown record {comp}")
             elif r.get("counted") and by_id[comp].get("counted"):
                 errs.append(f"{r.get('id')}: a total and its component {comp} are both counted")
+        comps = [by_id[c] for c in (r.get("total_of") or []) if c in by_id]
+        if comps and len(comps) == len(r.get("total_of") or []):
+            tot = _to_billions(r["amount"]) if isinstance(r.get("amount"), dict) else None
+            parts = [_to_billions(c["amount"]) for c in comps]
+            if tot is not None and all(x is not None for x in parts) and abs(tot - sum(parts)) > 0.5:
+                errs.append(f"{r.get('id')}: total {tot} != sum of its components {sum(parts)}")
     return errs
 
 
@@ -479,7 +496,7 @@ def implied_flat_growth(
 def run_scenarios(records: list[dict[str, Any]], spec: dict[str, Any]) -> dict[str, Any]:
     """Resolve the shared basis and each scenario; UNAVAILABLE where an observed input is missing."""
     idx = _index(records)
-    out: dict[str, Any] = {"schema": "r3-nvda-scenarios-result/0", "basis": {}, "scenarios": {}}
+    out: dict[str, Any] = {"schema": "r3-nvda-scenarios-result/2", "basis": {}, "scenarios": {}}
     try:
         basis = spec["basis"]
         price_spec = basis["price"]
