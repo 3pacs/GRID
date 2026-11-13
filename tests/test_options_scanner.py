@@ -635,3 +635,23 @@ class TestSignalFreshness:
 
         signals = json.loads(_insert_params(conn)[0]["signals"])
         assert signals["pcr"] == {"score": 7.0, "value": "2.4", "direction": "CALL"}
+
+@pytest.mark.parametrize('value', [float('inf'), float('-inf'), 'Infinity', '-Infinity', True, False, np.bool_(True)])
+def test_nullable_float_rejects_nonfinite_and_boolean(value):
+    assert _nullable_float(value) is None
+
+
+@pytest.mark.parametrize('value', [float('inf'), True, np.bool_(True)])
+def test_nonprice_spot_is_not_an_opportunity(value):
+    scanner = _scanner_with_row(_signal_row(spot_price=value))
+    coverage = {}
+    assert scanner._scan_ticker('SPY', date(2026, 9, 11), coverage) == []
+    assert coverage['no_spot'] == 1
+
+
+@pytest.mark.parametrize('value', [float('inf'), float('-inf'), True])
+def test_invalid_iv_persists_as_missing(value):
+    engine, conn = _write_engine()
+    scanner = OptionsScanner(db_engine=engine)
+    scanner.persist_scan([_make_opportunity(ticker='SPY', spot_price=750.0, iv_atm=value)])
+    assert _insert_params(conn)[-1]['iv'] is None
