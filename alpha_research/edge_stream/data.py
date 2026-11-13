@@ -225,6 +225,7 @@ SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 #: files thousands of prospectus supplements a month) is left out rather than half read.
 EDGAR_MAX_EXTRA_PAGES = 120
 EARNINGS_ITEM = "2.02"  # 8-K Item 2.02, Results of Operations and Financial Condition
+EDGAR_ATTEMPTS = 4  # per request, with a doubling pause, before the cycle's attempt fails
 
 
 class DailySource(Protocol):
@@ -367,7 +368,8 @@ class EdgarEventSource:
     """
 
     def __init__(self, cache_path: str | Path, user_agent: str | None = None, *, gap_s: float = 0.15,
-                 max_requests: int = 2500, now: datetime | None = None, timeout_s: float = 30.0) -> None:
+                 max_requests: int = 2500, now: datetime | None = None, timeout_s: float = 30.0,
+                 backoff_s: float = 2.0) -> None:
         self.cache_path = Path(cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         if user_agent is None:
@@ -379,6 +381,7 @@ class EdgarEventSource:
         self.requests = 0
         self.now = now
         self.timeout_s = timeout_s
+        self.backoff_s = backoff_s
         self._ciks: dict[str, str] | None = None
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS edgar_events (ticker TEXT PRIMARY KEY, start TEXT, end TEXT,"
@@ -395,21 +398,28 @@ class EdgarEventSource:
 
         if not self._ua:
             raise SourceError("SEC_USER_AGENT not configured")
-        if self.requests >= self.max_requests:
-            raise RequestCapReached(f"EDGAR request cap {self.max_requests} reached this cycle")
-        self.requests += 1
-        time.sleep(self.gap_s)
-        try:
-            resp = requests.get(url, headers={"User-Agent": self._ua, "Accept-Encoding": "gzip, deflate"},
-                                timeout=self.timeout_s)
-        except requests.RequestException as exc:
-            raise SourceError(f"EDGAR {type(exc).__name__}") from None
-        if resp.status_code >= 400:
-            raise SourceError(f"EDGAR {resp.status_code} for {url.rsplit('/', 1)[-1]}")
-        try:
-            return resp.json()
-        except ValueError:
-            raise SourceError("EDGAR answered non-JSON") from None
+        name, last = url.rsplit("/", 1)[-1], "no attempt"
+        for attempt in range(EDGAR_ATTEMPTS):
+            if self.requests >= self.max_requests:
+                raise RequestCapReached(f"EDGAR request cap {self.max_requests} reached this cycle")
+            self.requests += 1
+            time.sleep(self.gap_s + self.backoff_s * (2 ** attempt - 1))
+            try:
+                resp = requests.get(url, headers={"User-Agent": self._ua, "Accept-Encoding": "gzip, deflate"},
+                                    timeout=self.timeout_s)
+            except requests.RequestException as exc:  # a timeout or reset: one of ~500 requests, retried
+                last = type(exc).__name__
+                continue
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last = str(resp.status_code)
+                continue
+            if resp.status_code >= 400:
+                raise SourceError(f"EDGAR {resp.status_code} for {name}")
+            try:
+                return resp.json()
+            except ValueError:
+                raise SourceError(f"EDGAR answered non-JSON for {name}") from None
+        raise SourceError(f"EDGAR gave up on {name} after {EDGAR_ATTEMPTS} attempts (last: {last})")
 
     def _cik(self, ticker: str) -> str | None:
         if self._ciks is None:

@@ -269,6 +269,37 @@ def test_edgar_source_refuses_a_filer_with_too_many_pages_and_needs_a_user_agent
         bare.events("ABT", date(2026, 1, 1), date(2026, 5, 1))
 
 
+def test_edgar_requests_retry_a_timeout_and_a_429_then_give_up(tmp_path, monkeypatch):
+    import requests
+
+    class Resp:
+        def __init__(self, code, body=None):
+            self.status_code, self._body = code, body
+
+        def json(self):
+            return self._body
+
+    script = []
+
+    def fake_get(url, headers, timeout):
+        assert headers["User-Agent"] == "GRID tests"
+        step = script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    src = D.EdgarEventSource(tmp_path / "e.sqlite3", user_agent="GRID tests", gap_s=0, backoff_s=0)
+    script[:] = [requests.exceptions.ReadTimeout(), Resp(429), Resp(200, {"ok": 1})]
+    assert src._get("https://data.sec.gov/submissions/CIK1.json") == {"ok": 1} and src.requests == 3
+    script[:] = [Resp(503)] * D.EDGAR_ATTEMPTS
+    with pytest.raises(D.SourceError, match="gave up on CIK1.json after 4 attempts"):
+        src._get("https://data.sec.gov/submissions/CIK1.json")
+    script[:] = [Resp(404)]
+    with pytest.raises(D.SourceError, match="EDGAR 404"):
+        src._get("https://data.sec.gov/submissions/CIK1.json")
+
+
 def test_polygon_daily_source_parses_caches_and_refuses_gaps(tmp_path):
     minute = D.PolygonMinuteSource(tmp_path / "b.sqlite3", api_key="k", gap_s=0,
                                    now=datetime(2026, 3, 2, 12, tzinfo=timezone.utc))
