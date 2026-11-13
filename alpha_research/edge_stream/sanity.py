@@ -79,6 +79,13 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
            if P.LIQUIDITY.get(t) is None
            or (proposal["costs"].get(t) or {}).get("usd", 0) < P.COST_FLOORS[P.LIQUIDITY[t]]["usd"]
            or (proposal["costs"].get(t) or {}).get("bp", 0) < P.COST_FLOORS[P.LIQUIDITY[t]]["bp"]]
+    hedge = proposal.get("hedge")
+    if hedge is not None:
+        tier = P.LIQUIDITY.get(hedge.get("instrument"))
+        if hedge.get("instrument") != P.HEDGE_INSTRUMENT or tier is None \
+                or hedge.get("usd", 0) < P.COST_FLOORS[tier]["usd"] or hedge.get("bp", 0) < P.COST_FLOORS[tier]["bp"] \
+                or proposal.get("short_carry_annual", 0) < P.SHORT_CARRY_ANNUAL:
+            bad.append("hedge leg / short carry")
     r["G4_costs"] = "ok" if instruments and not bad else f"costs below the policy floor for {bad}"
 
     # G5 executable exit
@@ -131,6 +138,12 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
     # G9 decision before entry, guarded harness
     if family is None:
         r["G9_no_lookahead"] = "no family"
+    elif getattr(family, "kind", "session") == "event":
+        # decided at the reaction day's close, entered at the next session's open; the family's
+        # decide() refuses any bar after the reaction day (LookaheadError)
+        ok = (family.decision, family.entry) == ("reaction-day close", "next session open") \
+            and hasattr(family, "decide") and hasattr(family, "event_trade")
+        r["G9_no_lookahead"] = "ok" if ok else "entry is not after the decision"
     else:
         # the entry price is the close of the entry bar: it must not be earlier than the decision
         ok = _plus1(family.entry_hm) >= family.decision_hm and hasattr(family, "session_trade")

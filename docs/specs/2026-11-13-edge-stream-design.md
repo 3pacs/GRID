@@ -161,3 +161,24 @@ PR opened, not merged (merges deploy; Anik's word). The code is inert until Anik
   inside the cycle lock, `verify` re-hashes every look report.
 - Known and accepted: the S11 `_append` does not fsync (a power cut can lose the last record; the anchor check then
   refuses to open until repaired by hand, fail-closed); serial dependence across adjacent sessions is not modelled.
+
+## Addendum 2026-11-13: EC1 and policy amendments
+
+Anik asked for the "contaminated earnings" idea to be registered in the stream. It needed three things the first
+slice did not have, added together:
+
+- `edge_policy_amendment` (ledger): the tighten-only amendment this design promised but had not implemented.
+  `policy.py` is now `edge-stream-policy/2`: the `sp500_events` group (490 S&P 500 members as of 2025-12-31, frozen
+  in `universe.py`), the `large_cap` cost tier, a 2 %/yr short-leg carry, SPY as the one allowed hedge leg, and a
+  reserved-years consumption entry for D0 contract D1 (8-K Item 2.02, 2012-2025).
+- Event sources (`data.py`): Polygon daily bars (one request per ticker, one adjustment basis per response) and
+  EDGAR 8-K Item 2.02 filings with their acceptance time (read as Eastern; if a value were UTC the reading is late,
+  never early).
+- Family EC1 (`families.py`) and its look path (`runner._event_look`): decision at the reaction day's close, entry
+  at the next open, exit at the close 15 sessions later, SPY-hedged, both sides judged, trades resampled by ISO week.
+
+Not measured before registration, on purpose: how many events qualify. Rough arithmetic (490 names x ~3.5 releases
+in the window, a market day beyond 0.75 % about a third of the time, half of those against the stock, about half
+with a 2 % residual) gives 100-200 trades; the look reads UNDERPOWERED if a side has fewer than 50.
+With weekly resampling and alpha 0.00125 the look can only confirm an average hedged drift of roughly 1.5-2 % per
+trade. Citations in the family are from memory and need a reviewer's check.

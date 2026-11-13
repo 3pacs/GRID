@@ -8,6 +8,9 @@ adds its own record kinds on a dedicated ledger (a placeholder S11 catalog satis
 genesis; no S11 allocation ever runs on it):
 
 ``edge_policy``        seq 1, once: the frozen :func:`policy.policy_payload` and its sha256.
+``edge_policy_amendment``  a later policy that only tightens the one before it
+                       (:func:`policy.tightening_violations`); registrations after it are
+                       sealed under its sha256.
 ``edge_registration``  sealed before the look's data is read; its line sha256 is the seal.
 ``edge_look``          the one look of a registration (verdicts + report sha); SPENT.
 ``edge_abandoned``     a registration closed without a look; its alpha stays spent.
@@ -31,7 +34,8 @@ POLICY_KIND = "edge_policy"
 REGISTRATION_KIND = "edge_registration"
 LOOK_KIND = "edge_look"
 ABANDONED_KIND = "edge_abandoned"
-STREAM_KINDS = (POLICY_KIND, REGISTRATION_KIND, LOOK_KIND, ABANDONED_KIND)
+AMENDMENT_KIND = "edge_policy_amendment"
+STREAM_KINDS = (POLICY_KIND, REGISTRATION_KIND, LOOK_KIND, ABANDONED_KIND, AMENDMENT_KIND)
 
 PLACEHOLDER_CATALOG = Catalog(
     families=("EDGE_LOOKS|change|fwd1",),
@@ -90,6 +94,7 @@ class StreamState:
     registrations: dict[str, dict] = field(default_factory=dict)  # sha -> record (ledger order)
     looks: dict[str, dict] = field(default_factory=dict)  # registration sha -> look record
     abandoned: dict[str, dict] = field(default_factory=dict)  # registration sha -> record
+    amendments: list[dict] = field(default_factory=list)  # edge_policy_amendment records, in order
 
     def closed(self, reg_sha: str) -> bool:
         return reg_sha in self.looks or reg_sha in self.abandoned
@@ -153,6 +158,11 @@ def load_state(ledger: Ledger) -> StreamState:
         _require(kind in STREAM_KINDS and kind != POLICY_KIND,
                  f"record {rec['seq']}: kind {kind!r} does not belong on the edge-looks ledger")
         sha = ledger.line_sha(rec["seq"])
+        if kind == AMENDMENT_KIND:
+            _check_amendment(state, rec)
+            state.policy, state.policy_sha256 = rec["policy"], rec["policy_sha256"]
+            state.amendments.append(rec)
+            continue
         if kind == REGISTRATION_KIND:
             _check_registration(state, rec)
             state.registrations[sha] = rec
@@ -239,6 +249,19 @@ def _check_registration(state: StreamState, reg: dict) -> None:
                        + "; ".join(f"{h['start']}..{h['end']} by {h['by']}" for h in hits))
 
 
+def _check_amendment(state: StreamState, rec: dict) -> None:
+    seq = rec.get("seq")
+    _require(isinstance(rec.get("policy"), dict)
+             and sha256_bytes(P.canonical_bytes(rec["policy"])) == rec.get("policy_sha256"),
+             f"record {seq}: amendment payload does not match its sha256")
+    _require(rec.get("previous_policy_sha256") == state.policy_sha256,
+             f"record {seq}: amendment does not follow the policy in force")
+    _require(rec["policy_sha256"] != state.policy_sha256, f"record {seq}: amendment changes nothing")
+    _require(bool(rec.get("reason")), f"record {seq}: amendment without a reason")
+    bad = P.tightening_violations(state.policy, rec["policy"])
+    _require(not bad, f"record {seq}: amendment loosens the policy: " + "; ".join(bad[:5]))
+
+
 def _check_look(rec: dict) -> None:
     _require(rec.get("verdict") in VERDICTS, f"record {rec['seq']}: bad verdict")
     _require(all(t.get("verdict") in VERDICTS for t in rec.get("trials", [])),
@@ -260,8 +283,30 @@ def _append(ledger: Ledger, record: dict) -> tuple[dict, str]:
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 
+def amend_policy(ledger: Ledger, reason: str, recorded_at: str | None = None) -> str | None:
+    """Record the code's policy as an amendment when it differs from the one in force.
+
+    Returns the amendment's sha256, or ``None`` when the ledger already carries this
+    policy. A code policy that loosens anything is refused (:class:`StreamRefused`), and
+    then no registration can be sealed until the code is put right.
+    """
+    state = load_state(ledger)
+    new = P.policy_payload()
+    new_sha = P.policy_sha256()
+    if new_sha == state.policy_sha256:
+        return None
+    record = {"kind": AMENDMENT_KIND, "policy": new, "policy_sha256": new_sha,
+              "previous_policy_sha256": state.policy_sha256, "reason": reason,
+              "recorded_at": recorded_at or now_iso()}
+    _check_amendment(state, {**record, "seq": len(ledger.records)})
+    _, sha = _append(ledger, record)
+    return sha
+
+
 def append_registration(ledger: Ledger, registration: dict) -> str:
     state = load_state(ledger)
+    _require(state.policy_sha256 == P.policy_sha256(),
+             "the code's policy is not the policy in force on the ledger: amend_policy first")
     record = {**registration, "kind": REGISTRATION_KIND, "policy_sha256": state.policy_sha256}
     record.setdefault("recorded_at", now_iso())
     probe = {**record, "seq": len(ledger.records)}
