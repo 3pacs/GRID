@@ -169,8 +169,11 @@ def test_execute_swap_posts_signed_transaction(mock_http):
         raw={},
     )
 
-    result = client.execute_swap(order, fake_wallet)
+    fake_wallet.address = "WALLET"
+    verify = MagicMock()
+    result = client.execute_swap(order, fake_wallet, verify=verify)
 
+    verify.assert_called_once_with(order, "WALLET")
     fake_wallet.sign_base64_transaction.assert_called_once_with("UNSIGNED_BASE64")
     body = mock_http.post.call_args.kwargs["json"]
     assert body == {"signedTransaction": "SIGNED_BASE64", "requestId": "req-1"}

@@ -185,6 +185,48 @@ class SolanaRPC:
                 raise SolanaRPCError(f"{method} failed: {exc}") from exc
 
     # ------------------------------------------------------------------
+    # Account state (used by the pre-sign check, trading/solana/presign_check)
+    # ------------------------------------------------------------------
+    def get_multiple_accounts(self, addresses: list[str]) -> list[dict[str, Any] | None]:
+        """Current state of up to 100 accounts, base64-encoded data."""
+        if not addresses:
+            return []
+        result = self._call(
+            "getMultipleAccounts",
+            [addresses, {"encoding": "base64", "commitment": "confirmed"}],
+        )
+        value = (result or {}).get("value")
+        if not isinstance(value, list) or len(value) != len(addresses):
+            raise SolanaRPCError("getMultipleAccounts returned the wrong shape")
+        return value
+
+    def simulate_transaction(
+        self, b64_tx: str, account_addresses: list[str],
+    ) -> dict[str, Any]:
+        """Simulate an unsigned transaction; return ``{err, logs, accounts}``.
+
+        ``accounts`` holds the post-simulation state of ``account_addresses``
+        in the same order (``None`` for an account that would not exist).
+        """
+        result = self._call(
+            "simulateTransaction",
+            [
+                b64_tx,
+                {
+                    "encoding": "base64",
+                    "sigVerify": False,
+                    "replaceRecentBlockhash": True,
+                    "commitment": "confirmed",
+                    "accounts": {"encoding": "base64", "addresses": account_addresses},
+                },
+            ],
+        )
+        value = (result or {}).get("value")
+        if not isinstance(value, dict):
+            raise SolanaRPCError("simulateTransaction returned no value")
+        return value
+
+    # ------------------------------------------------------------------
     # Mint info
     # ------------------------------------------------------------------
     def get_mint_info(self, mint: str) -> MintInfo:
