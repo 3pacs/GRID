@@ -9,6 +9,6 @@
     "evidence": "node run_evidence.mjs"
   },
   "devDependencies": {
-    "puppeteer-core": "^23.11.1"
+    "puppeteer-core": "^25.17.0"
   }
 }
