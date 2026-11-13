@@ -30,7 +30,7 @@ platformdirs==4.12.2
 pluggy==1.6.0
 protobuf==7.36.2
 psycopg2-binary==2.9.13
-pyasn1==0.6.4
+pyasn1==0.6.5
 pycparser==3.0
 pydantic==2.13.5
 pydantic-core==2.46.5
