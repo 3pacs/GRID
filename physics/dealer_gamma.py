@@ -624,16 +624,22 @@ class DealerGammaEngine:
 
         Reads ``options_capture_batches`` (a row is registered once its capture
         completed): latest day on or before ``on_or_before``, then highest
-        ordinal on that day, both bounded by ``capture_completed_at <= cutoff``.
+        ordinal on that day, bounded by both capture completion and registry
+        registration timestamps at or before ``cutoff``.
         A batch registered later than the cutoff is invisible even when it is
         the day's latest in the ``options_snapshots`` view. ``None`` when none
         qualifies or the registry cannot be read; the caller fails closed.
+
+        Registration time is a necessary exclusion bound, not proof that the
+        transaction had committed or was observable at the cutoff. This live
+        selector does not establish historical point-in-time admission.
         """
         query = text("""
             SELECT snap_date, capture_batch_id FROM options_capture_batches
             WHERE ticker = :ticker
               AND snap_date <= :on_or_before
               AND capture_completed_at <= :cutoff
+              AND registered_at <= :cutoff
             ORDER BY snap_date DESC, capture_ordinal DESC
             LIMIT 1
             """)
