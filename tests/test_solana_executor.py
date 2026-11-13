@@ -279,6 +279,17 @@ def test_executor_live_happy_path(
     # Computed atoms from USD notional — NOT the raw fraction
     assert call["amount"] > 0
     mock_jupiter.execute_swap.assert_called_once()
+    # The live path always passes the pre-sign check (#1143), bound to our
+    # own request rather than to the Jupiter response.
+    verify = mock_jupiter.execute_swap.call_args.kwargs["verify"]
+    assert verify.func == executor._verify_before_signing
+    assert verify.keywords["expected_input_mint"] == USDC_MINT
+    assert verify.keywords["expected_output_mint"] == SOL_MINT
+    # A BUY spends the USD notional in USDC atoms (6 decimals), not the
+    # target-token atom count.
+    assert call["amount"] == verify.keywords["max_input_atoms"]
+    assert call["amount"] == int(executor._trade_notional_usd(_decision(size_fraction=0.5)) * 10**6)
+    assert verify.keywords["min_output_atoms"] > 0
     assert result.safety_report is not None
     assert result.limit_decision is not None
 
@@ -302,3 +313,24 @@ def test_executor_live_raises_when_computed_atoms_zero(
     # skipped; the ultimate error surfaces as a limit OR as this guard.
     with pytest.raises((ValueError, RuntimeError)):
         executor.execute(_decision(size_fraction=0.0))
+
+
+def test_executor_live_refuses_collapsed_presign_floor(
+    mock_engine, mock_jupiter, mock_safety, mock_limits
+):
+    """A mis-set price-impact limit must not collapse the pre-sign floor (#1143)."""
+    wallet = MagicMock()
+    wallet.address = "WALLET123"
+    mock_safety.config.max_price_impact_pct = 95.0
+    executor = PaperSolanaExecutor(
+        engine=mock_engine,
+        jupiter=mock_jupiter,
+        live=True,
+        wallet=wallet,
+        safety=mock_safety,
+        limits=mock_limits,
+    )
+    with pytest.raises(ValueError, match="tolerance"):
+        executor.execute(_decision(size_fraction=0.5))
+    mock_jupiter.get_order.assert_not_called()
+    mock_jupiter.execute_swap.assert_not_called()

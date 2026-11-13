@@ -624,16 +624,22 @@ class DealerGammaEngine:
 
         Reads ``options_capture_batches`` (a row is registered once its capture
         completed): latest day on or before ``on_or_before``, then highest
-        ordinal on that day, both bounded by ``capture_completed_at <= cutoff``.
+        ordinal on that day, bounded by both capture completion and registry
+        registration timestamps at or before ``cutoff``.
         A batch registered later than the cutoff is invisible even when it is
         the day's latest in the ``options_snapshots`` view. ``None`` when none
         qualifies or the registry cannot be read; the caller fails closed.
+
+        Registration time is a necessary exclusion bound, not proof that the
+        transaction had committed or was observable at the cutoff. This live
+        selector does not establish historical point-in-time admission.
         """
         query = text("""
             SELECT snap_date, capture_batch_id FROM options_capture_batches
             WHERE ticker = :ticker
               AND snap_date <= :on_or_before
               AND capture_completed_at <= :cutoff
+              AND registered_at <= :cutoff
             ORDER BY snap_date DESC, capture_ordinal DESC
             LIMIT 1
             """)
@@ -770,6 +776,33 @@ class DealerGammaEngine:
                                           "created_at", "capture_batch_id", "capture_ordinal",
                                           "capture_started_at", "capture_completed_at",
                                           "provider_regular_market_at"])
+        # Corrupt numerics invalidate the batch, rather than silently removing
+        # one side of exposure and publishing a directional partial profile.
+        # Legitimate zero/nonpositive OI or IV retain the existing filter below.
+        # So does SQL NULL in the two nullable columns: the chain writer stores
+        # NULL when the provider quotes no usable IV (ingestion/options.py),
+        # which is roughly one contract in ten on every real chain. NULL means
+        # "no measurement for this contract", not corruption; such a row is
+        # dropped by the filter below, never the whole batch. NaN, infinities,
+        # booleans and non-numeric values are still corrupt. NULL is read from
+        # the raw rows because pandas turns None into NaN in a numeric column.
+        stored_null = {
+            "open_interest": np.array([row[2] is None for row in rows], dtype=bool),
+            "implied_volatility": np.array([row[3] is None for row in rows], dtype=bool),
+        }
+        for column in ("strike", "open_interest", "implied_volatility"):
+            values = df[column]
+            if values.map(lambda value: isinstance(value, (bool, np.bool_))).any():
+                return pd.DataFrame()
+            numeric = pd.to_numeric(values, errors="coerce")
+            usable = np.isfinite(numeric.to_numpy(dtype=float))
+            if column in stored_null:
+                usable = usable | stored_null[column]
+            if not usable.all():
+                return pd.DataFrame()
+            df[column] = numeric
+        if (df["strike"] <= 0).any():
+            return pd.DataFrame()
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         df = df[(df["dte"] > 0)
                 & (df["open_interest"] > 0)

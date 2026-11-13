@@ -1498,6 +1498,9 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "eia",                "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
     {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume_agg", "cls": "FINRAShortVolumeAggPuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
     {"name": "sec_ftd",            "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
+    # DIX (finra:dix_sp500): the S&P 500 dollar-weighted dark-pool short ratio from the same FINRA file plus one
+    # Tiingo close per member (~500 requests, a few minutes), hence its own entry and timeout.
+    {"name": "finra_dix",          "mod": "ingestion.altdata.finra_dix",       "cls": "FINRADixPuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 600, "api_key": "TIINGO_API_KEY", "api_key_mode": "env", "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
 ]
 
 # ── Registry name → source_catalog name ─────────────────────────────────
@@ -1529,6 +1532,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
 # several entries share one catalog row (FRED, yfinance, Kalshi,
 # polymarket) and a shared row cannot say when each job last ran.
 REGISTRY_CATALOG_NAMES: dict[str, str] = {
+    "finra_dix":              "FINRA_SHORT_VOLUME",   # DIX rows ride the FINRA file's own catalog row
     "options":                "YFINANCE_OPTIONS",
     "insider_filings":        "SEC_INSIDER",
     "congressional":          "CONGRESS_TRADING",

@@ -625,10 +625,16 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # in a try/except; it only spawns a detached child and is inert
         # without the EDGE_STREAM_* env. Needs reviewer acceptance like the
         # prior pins.
+        # SCHED re-pinned 3ca3c3f9 -> 01432bbd (2026-11-13,
+        # claude/market-state-dix-gamma-20261113): the only scheduler edits are
+        # a new finra_dix PULLER_REGISTRY entry (FINRADixPuller.pull_recent,
+        # timeout_s 600, TIINGO_API_KEY, with a 2-line comment) and its
+        # REGISTRY_CATALOG_NAMES alias finra_dix -> FINRA_SHORT_VOLUME. Needs
+        # reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','69b8efc2c8f1dcbffcf0bd2ae7f4a9c0fdc861ccb5fb6914d0e76b20c6b2a84a'),(SCHED,'\nimport calendar\n','3ca3c3f9257ab076c23a5dea33937c749b509965b208121b2789aa0186e436a9')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','69b8efc2c8f1dcbffcf0bd2ae7f4a9c0fdc861ccb5fb6914d0e76b20c6b2a84a'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
