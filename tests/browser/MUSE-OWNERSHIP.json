@@ -1,0 +1,40 @@
+{
+  "snapshot": "2026-11-06; read-only repository evidence; no live serving check",
+  "primary_coordination_route": "https://github.com/3pacs/muse/pull/2",
+  "coordination_head": "6965bbac0d089efe01658243a5565c86c8aced55",
+  "J1_recovery": {
+    "owner": "Existing Muse author in the PR2/redteam/fixes-j1f lane; retained independent reviewer",
+    "accepted_source": "8649ad541cb794d0d26cdc4bb2f18ccd1ad0a7ac",
+    "state": "Finite publication/replay slice independently accepted; no new backend task",
+    "evidence": "https://github.com/3pacs/muse/pull/2#issuecomment-6003386139",
+    "limits": "Twelve previously recorded numerical/admission/dashboard findings are out of this acceptance; adoption and deployment are separate. PR3 e201a45c is obsolete as a status proxy."
+  },
+  "granular_UI": {
+    "owner": "Existing Muse frontend uig1/** lane; GRID owns canonical estimator/schema",
+    "progression": "UI-G1 -> UI-G2 -> UI-G3-P1; do not restart UI-G1",
+    "accepted_source": "e5a8a0ceb8391a124a8459fbe13e91bbbcdc161e",
+    "content_pin": "de7027e0346e4e8fda1fc3d049df2ce596ae7dfd",
+    "HTML_sha256": "0baf2049cbe23694b4ef9b90267369572088f83f358d8576caa5d43e47b46aa6",
+    "state": "Finite standalone synthetic explorer/source export accepted; 30/30 source tests and 20/20 independent browser checks in retained reviewer receipt",
+    "evidence": "https://github.com/3pacs/muse/pull/2#issuecomment-6005299300",
+    "limits": "Those tests were not repeated here. They do not prove adoption into GRID or served release identity."
+  },
+  "self_hosted_serving": {
+    "owner": "Existing server/frontend owner (Claude/precision5520 server-owner report); MAIN retains coordination/order ownership",
+    "selected_path": "https://gex.stepdad.finance/dashboard/",
+    "path_authority": "User-reported sole serving path, documented in MAIN Amendment 2; not newly visited here",
+    "amendment": "https://github.com/3pacs/muse/blob/6965bbac0d089efe01658243a5565c86c8aced55/docs/muse-gex-deploy-20261020/DEPLOY-AMENDMENT-2.md",
+    "source_packet": "e407fbde8cbb51147e5104863e9dd80a44ead747",
+    "reviewed_dashboard_JS_sha256": "4f98536fe82b6ffa350da06741f29124e9fb5259bf277c97741767a69423f65f",
+    "state": "MAIN scope reconciliation and finite source findings CLOSED; installation OWNER-ATTESTED; independent current serving-body/browser identity UNVERIFIED",
+    "next_owner_scope": "Existing owner's narrow response-digest/capture/browser-text evidence within existing authority; no new operational action ordered",
+    "no_duplicate_work": "No hosted Muse takeover, apex migration, replacement frontend author or repeated finite J1/UI acceptance is needed for Amendment 2."
+  },
+  "GRID_M1_scope": {
+    "existing_surface": "pwa/src/views/Options.jsx -> GammaWatch.jsx -> gammaWatchPublicAdapter.js -> /api/v1/gamma-watch/state; public gex-screen/2 projection",
+    "adoption_search": "At GRID base 5b16185b, git grep under pwa/src, api/routers and docs found no gex-granular-v1, uig1 or accepted Muse pin references. This does not audit external service source/configuration.",
+    "status": "Local SPY journey evidence only; no independent deployed linkage or source-byte acceptance",
+    "current_owner_availability": "Unknown; historical acknowledgements and repository documents are not live worker telemetry",
+    "coordination_correction": "Treat J1/UI finite slices as complete. Map any integration requirement to the existing serving owner before assigning new work; preserve the current public-schema GRID surface and estimator boundary."
+  }
+}
