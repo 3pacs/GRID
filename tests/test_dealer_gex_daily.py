@@ -88,3 +88,42 @@ def test_row_units_are_millions_per_one_percent(monkeypatch):
     assert row["call_gex_usd_m"] == pytest.approx(3e8 * 1.0 / 1e6)
     assert row["spot_to_flip_pct"] == pytest.approx(2.0)
     assert row["gex_regime"] == "positive_gamma" and row["capture_batch_id"] == "b"
+
+
+def test_max_pain_returns_a_plain_float():
+    c = pd.DataFrame([{"strike": 100.0, "opt_type": "put", "open_interest": 30.0},
+                      {"strike": 90.0, "opt_type": "call", "open_interest": 10.0}])
+    assert type(G.max_pain(c)) is float
+
+
+def test_insert_params_are_plain_python_values():
+    import numpy as np
+
+    row = {"obs_date": date(2026, 10, 1), "ticker": "SPY", "gex_regime": "SHORT_GAMMA", "spot_price": np.float64(762.63),
+           "net_gex_usd_m": -9718.5, "call_gex_usd_m": 10204.4, "put_gex_usd_m": -19922.9, "gamma_flip_strike": 769.55,
+           "spot_to_flip_pct": -0.907, "max_pain_strike": np.float64(765.0), "put_call_oi_ratio": np.float64(3.0),
+           "atm_iv": None}
+    p = G.insert_params(row)
+    assert p["pain"] == 765.0 and p["iv"] is None
+    assert all(type(p[k]) is float for k in ("spot", "net", "call", "put", "flip", "dist", "pain", "pcr"))
+    assert "np." not in repr(p)
+
+
+def test_store_row_binds_numpy_values_on_a_real_driver():
+    """SQLite stand-in for the insert: the row from the 2026-11-13 failure stores and reads back."""
+    import numpy as np
+    from sqlalchemy import create_engine, text
+
+    eng = create_engine("sqlite://")
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE dealer_gex_daily (obs_date DATE, ticker TEXT, spot_price REAL, net_gex_usd_m REAL, "
+                       "call_gex_usd_m REAL, put_gex_usd_m REAL, gamma_flip_strike REAL, spot_to_flip_pct REAL, "
+                       "gex_regime TEXT, max_pain_strike REAL, put_call_oi_ratio REAL, atm_iv REAL, "
+                       "PRIMARY KEY (obs_date, ticker))"))
+    row = {"obs_date": date(2026, 10, 1), "ticker": "SPY", "gex_regime": "SHORT_GAMMA", "spot_price": 762.63,
+           "net_gex_usd_m": -9718.5, "call_gex_usd_m": 10204.4, "put_gex_usd_m": -19922.9, "gamma_flip_strike": 769.55,
+           "spot_to_flip_pct": -0.907, "max_pain_strike": np.float64(765.0), "put_call_oi_ratio": 3.008, "atm_iv": 0.1316}
+    assert G.store_row(eng, row) is True
+    assert G.store_row(eng, row) is False                         # insert-only: a second write is a no-op
+    with eng.connect() as c:
+        assert c.execute(text("SELECT max_pain_strike FROM dealer_gex_daily")).scalar() == 765.0
