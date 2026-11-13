@@ -187,37 +187,39 @@
       "id": "grid.raw_series.CBOE:SKEW",
       "track": "D2",
       "provider": "Cboe daily CSV",
-      "identity": "CBOE:SKEW",
+      "identity": "resolved_series feature skew_index (raw series CBOE:SKEW to 2026-03-25, skew_index from 2026-03-26)",
       "units": "index points",
       "basis": "n/a",
       "clocks": {
         "observation": "obs_date close",
         "first_availability": "after close",
-        "ingestion": "pull_timestamp",
+        "ingestion": "pull_timestamp; resolved vintage_date = pull date. From 2026-03-26 the first vintage is 1 day after obs_date for 150 of 160 dates, 2-6 days for 10 (detail receipt)",
         "calculation": "n/a",
-        "durable_visibility": null
+        "durable_visibility": "UNPROVEN (resolved rows for 2026-03-26..2026-11-11 were committed by the 2026-11-13 backfill; their vintage_date carries the original raw pull date)",
+        "first_availability_receipt": null
       },
       "coverage": {
         "start": "1990-01-02",
-        "end": "2026-03-25",
-        "rows": 9108,
-        "measured": "2026-11-12, read-only griddb query (SET TRANSACTION READ ONLY)"
+        "end": "2026-11-11",
+        "rows": 9268,
+        "measured": "2026-11-13T04:15:06Z, read-only griddb query (SET TRANSACTION READ ONLY); distinct resolved obs_dates; 0 vintages before obs_date; 0 dates with conflicting values"
       },
-      "missingness": "stale since 2026-03-25",
+      "missingness": "measured 2026-11-13 against resolved vix_spot dates: since 2026-03-26, 4 vix_spot dates lack SKEW, all US market holidays (2026-05-25, 06-19, 07-03, 09-07) on which vix_spot carries a row; 1990-01-02..2026-11-11: 50 such dates, not itemised",
       "latency": "daily",
       "entitlement": "public",
       "storage_limits": "raw_series",
-      "admission_status": "EXCLUDED_STALE",
-      "blocked_hypotheses": [
-        "SKEW conditioner"
-      ],
-      "notes": "gap G11; entity_map mapping fixed by #1146 (merged 2026-11-12); coverage not re-measured since, so status unchanged",
+      "admission_status": "CANDIDATE_UNREVIEWED",
+      "blocked_hypotheses": [],
+      "notes": "gap G11 closed for coverage: entity_map mapping #1146, resolver series filter #1148 and obs-date floor #1149 (all merged and deployed 2026-11-12/13); scoped backfill 2026-11-13 wrote 7,696 resolved rows. First availability 'after close' is still an assertion, not a checked historical receipt. Why vix_spot has rows on market holidays was not checked",
       "receipts": {
-        "query_sha256": null,
-        "snapshot": null,
-        "source_version": null,
-        "receipt_sha256": null,
-        "exclusions": null
+        "query_sha256": "82d38c79ca82ad903925353eaf5079dd71531e28d4c2e5a454585ed873a3aa2d",
+        "snapshot": "docs/research/d0-receipts/g11_skew_coverage.result.json",
+        "source_version": "griddb production, read on grid-svr; rows written by the resolver at 98520f45",
+        "receipt_sha256": "b68012edfc1555cc385915f07867b746343251ac04ff12eab29c1eed95ea709c",
+        "exclusions": null,
+        "detail_query_sha256": "029f527b1de82a25c8841455c4a52efbcfc18e15958ca129316fe5c9d468c90e",
+        "detail_snapshot": "docs/research/d0-receipts/g11_skew_detail.result.json",
+        "detail_receipt_sha256": "ee9b0b3b7aa039b19ccfe13293a35ad5a50beb600285802e29d05c4f56f4961d"
       }
     },
     {
@@ -1110,7 +1112,7 @@
     {
       "id": "G6",
       "text": "event_sequence dropped signal_sources events (r[8]) and stamped filings at period_end",
-      "status": "#1145 merged 2026-11-12; Codex 8befc05e stricter guards integrated on claude/d0-reader-guards-integrate-20261113 (tests pass locally); PR pending; lead times HOLD until merged"
+      "status": "#1145 merged and deployed 2026-11-12; Codex 8befc05e stricter guards integrated locally as bce4f5d5 on claude/d0-reader-guards-integrate-20261113 (tests pass locally); branch not pushed, no PR open; lead times HOLD until merged"
     },
     {
       "id": "G7",
@@ -1132,7 +1134,7 @@
     {
       "id": "G11",
       "text": "CBOE SKEW stale since 2026-03-25",
-      "status": "#1146 merged 2026-11-12 (entity_map); coverage re-measure with query receipt pending"
+      "status": "coverage CLOSED 2026-11-13: #1146 + #1148 + #1149 merged and deployed; backfill wrote 7,696 rows; skew_index resolves 1990-01-02..2026-11-11 with query receipts; input is CANDIDATE_UNREVIEWED (first-availability assertion and clock 4 still open, as for VIX)"
     },
     {
       "id": "G12",
@@ -1144,7 +1146,7 @@
       "status": "open; source-only design + disposable-PostgreSQL concurrency plan next"
     }
   ],
-  "revision": 2,
+  "revision": 3,
   "revised_at": "2026-11-13",
   "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. Enforced by analysis/d0_manifest.py. An input label is never a hypothesis admission."
 }

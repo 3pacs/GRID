@@ -1,0 +1,52 @@
+{
+ "measured_at": "2026-11-13T04:15:07+00:00",
+ "query_sha256": "029f527b1de82a25c8841455c4a52efbcfc18e15958ca129316fe5c9d468c90e",
+ "rows": [
+  {
+   "k": "1",
+   "n": "150",
+   "part": "lag_hist"
+  },
+  {
+   "k": "2",
+   "n": "5",
+   "part": "lag_hist"
+  },
+  {
+   "k": "3",
+   "n": "3",
+   "part": "lag_hist"
+  },
+  {
+   "k": "5",
+   "n": "1",
+   "part": "lag_hist"
+  },
+  {
+   "k": "6",
+   "n": "1",
+   "part": "lag_hist"
+  },
+  {
+   "k": "2026-05-25",
+   "n": null,
+   "part": "vix_date_missing_skew"
+  },
+  {
+   "k": "2026-06-19",
+   "n": null,
+   "part": "vix_date_missing_skew"
+  },
+  {
+   "k": "2026-07-03",
+   "n": null,
+   "part": "vix_date_missing_skew"
+  },
+  {
+   "k": "2026-09-07",
+   "n": null,
+   "part": "vix_date_missing_skew"
+  }
+ ],
+ "transaction": "READ ONLY"
+}

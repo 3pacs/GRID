@@ -1,0 +1,43 @@
+{
+ "measured_at": "2026-11-13T04:15:06+00:00",
+ "query_sha256": "82d38c79ca82ad903925353eaf5079dd71531e28d4c2e5a454585ed873a3aa2d",
+ "rows": [
+  {
+   "dates_with_conflicting_values": null,
+   "distinct_obs_dates": "9108",
+   "end_date": "2026-03-25",
+   "max_vintage_lag_days_since_20260326": null,
+   "part": "raw:CBOE:SKEW",
+   "start_date": "1990-01-02",
+   "vintage_before_obs": null,
+   "vintage_rows": "9108",
+   "vix_dates_missing_skew": null,
+   "vix_dates_missing_skew_since_20260326": null
+  },
+  {
+   "dates_with_conflicting_values": null,
+   "distinct_obs_dates": "9268",
+   "end_date": "2026-11-11",
+   "max_vintage_lag_days_since_20260326": null,
+   "part": "raw:skew_index",
+   "start_date": "1990-01-02",
+   "vintage_before_obs": null,
+   "vintage_rows": "1014225",
+   "vix_dates_missing_skew": null,
+   "vix_dates_missing_skew_since_20260326": null
+  },
+  {
+   "dates_with_conflicting_values": "0",
+   "distinct_obs_dates": "9268",
+   "end_date": "2026-11-11",
+   "max_vintage_lag_days_since_20260326": "194",
+   "part": "resolved",
+   "start_date": "1990-01-02",
+   "vintage_before_obs": "0",
+   "vintage_rows": "16804",
+   "vix_dates_missing_skew": "50",
+   "vix_dates_missing_skew_since_20260326": "4"
+  }
+ ],
+ "transaction": "READ ONLY"
+}

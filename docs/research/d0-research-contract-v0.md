@@ -5,10 +5,10 @@
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0`, **revision 2** (after the reviewer's first pass of 2026-11-12) — **DRAFT, unsigned** |
+| Version | `d0-contract-v0`, **revision 3** (revision 2 answered the reviewer's first pass; revision 3 adds the G11 SKEW receipts and the G6 status, §10.1) — **DRAFT, unsigned** |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
 | Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
-| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; this revision answers it (§10) |
+| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1) |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
@@ -54,7 +54,7 @@ D1 modules to extend (none replaced):
 |---|---|---|---|---|
 | `intelligence/business_news_parser.py` | `business_events` | scheduler, every 6 h | **missing** (only article `published_at`) | cross-outlet stories not deduped |
 | `intelligence/deal_detector.py` | `deal_pipeline` | scheduler, every 6 h | **missing**; `detected_at` = article time or NOW() | `updated_at` overwritten per stage (no stage history) |
-| `intelligence/event_sequence.py` | — (read-only) | API, forensics, pattern_engine | **missing** | G6. #1145 (merged 2026-11-12) reads `signal_sources` by column name and times filings by `filing_date`. Codex's reader guards (8befc05e, integration branch `claude/d0-reader-guards-integrate-20261113`, **unmerged, SOURCE-READY**) go further: signal events carry a timing hold, and calendar/filing rollups are withheld until release/version receipts exist |
+| `intelligence/event_sequence.py` | — (read-only) | API, forensics, pattern_engine | **missing** | G6. #1145 (merged 2026-11-12) reads `signal_sources` by column name and times filings by `filing_date`. Codex's reader guards (8befc05e, integrated locally as `bce4f5d5` on `claude/d0-reader-guards-integrate-20261113`, **not pushed, no PR, SOURCE-READY**) go further: signal events carry a timing hold, and calendar/filing rollups are withheld until release/version receipts exist |
 | `intelligence/causal_links.py` (+ `causation*`) | `causal_links` | systemd template | **present** (`known_at` + basis), but `known_at` = end of `earnings_date` for calendar rows | G7: accepts `earnings_calendar` compat stubs as releases. 8befc05e holds that timing in the three direct `causal_links` readers (unmerged). `causation_graph` calendar reads and persisted `causal_chains` are **not** covered and remain unqualified |
 | `intelligence/actor_network.py` + `actors/` | `actors`, `wealth_flows`, `actor_connections` | Hermes, 6 h | missing | CIK→ticker from the current `company_tickers.json` only |
 | `intelligence/sleuth_intersections.py` | `investigation_leads` | Hermes, daily | proxied by `signal_sources.created_at` | — (keeps #1071 construction rules) |
@@ -124,7 +124,7 @@ An input enters a decision only if all six are known; otherwise it is `EXCLUDED_
 | `options_capture_batches` / `options_snapshots_all`, SPY, Cboe delayed (~15 min) | GRID griddb, append-only | **2026-10-01 .. 2026-11-11, 30 sessions, 359 batches** (measured 2026-11-12) | batch `registered_at`, `capture_started/completed_at`; per-contract quote time absent; spot clock only from 2026-11-10 | forward-only; too short for any historical claim; OCC symbol not stored, no bid/ask size |
 | `options_daily_signals` / `spy_iv_*` features | GRID | same as above | obs = release = snap date | diagnostic; "25-delta" is a ±10 % moneyness proxy |
 | CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | **CANDIDATE_UNREVIEWED**. Proposed for regime conditioning as the prior session's close. "Published after the close" is an assertion, not a checked historical first-availability receipt; missingness is not yet measured |
-| CBOE SKEW | GRID | ended **2026-03-25** as measured 2026-11-12. #1146 (merged 2026-11-12) maps the daily CBOE SKEW rows in `entity_map` | — | **EXCLUDED** until coverage is re-measured after #1146 with a query receipt (G11) |
+| CBOE SKEW (`skew_index`) | GRID `resolved_series` | **1990-01-02 .. 2026-11-11**, 9,268 dates (measured 2026-11-13, query receipt `d0-receipts/g11_skew_coverage`). Since 2026-03-26 the only `vix_spot` dates without SKEW are 4 US market holidays; 50 such dates over the full history, not itemised | daily close; first resolved vintage 1 day after obs for 150 of 160 dates since 2026-03-26, 2–6 days for 10. Rows for 2026-03-26 .. 11-11 were committed by the 2026-11-13 backfill (clock 4 **UNPROVEN**) | **CANDIDATE_UNREVIEWED**, on the same terms as VIX: "after the close" is an assertion, not a first-availability receipt (G11 coverage closed) |
 | Schwab chains / quotes / 1-min bars | process-local only, `persist_allowed=False`; no redistribution | live only | provider quoteTime + receipt time | live inputs for forward shadows; no history; no aggressor side |
 | Polygon `/v3/snapshot/options` | — | 403, puller SKIPPED | — | unavailable |
 | SPY 1-min bars, Polygon | offline research copy (GEX repo scratch) | rolling ~2 yr (2024-11 ..) | bar end | inspected (§4); not GRID custody |
@@ -551,12 +551,12 @@ Gaps block only the hypotheses named in the gap list below.
 | G3 | No point-in-time liquid-equity universe | all D1 history | — | Tiingo EOD incl. delisted + `security_master` validity |
 | G4 | No options cost class in `evals/e2/cost_model.json` | D2 scoring through E2 | E2 owner | versioned cost-model bump |
 | G5 | Pre-2022-11 OPRA quotes not fetched | D2-H1a, D2-H1b | GEX research lane | First, reconcile the full inspection ledger and fix the exact contract and target scope in a fetch manifest (§6.2). Then the operator's spend approval with a cap |
-| G6 | `event_sequence.py` dropped all `signal_sources` events (`r[8]`) and stamped filings at `period_end` | any D1 card that uses event_sequence | Claude (owner integration) | #1145 merged 2026-11-12. Codex's stricter guards (8befc05e) are integrated with #1145 on `claude/d0-reader-guards-integrate-20261113`: local tests pass, the PR is pending, and nothing is merged or deployed. Until it merges, event-sequence lead times stay on HOLD |
+| G6 | `event_sequence.py` dropped all `signal_sources` events (`r[8]`) and stamped filings at `period_end` | any D1 card that uses event_sequence | Claude (owner integration) | #1145 merged and deployed 2026-11-12. Codex's stricter guards (8befc05e) are integrated with #1145 as local commit `bce4f5d5` on `claude/d0-reader-guards-integrate-20261113`: local tests pass, but the branch is not pushed, no PR is open, and nothing is merged or deployed. Until it merges, event-sequence lead times stay on HOLD |
 | G7 | `earnings_calendar` compat stubs (`earnings_date = period_end`; 2,131 by date equality, the author's count) read as releases | D1 (excluded by rule meanwhile); earnings causal-link timing on HOLD | readers: the 8befc05e integration; producer: #1051 author | The reader-side hold covers the three direct `causal_links` readers, not `causation_graph` or persisted `causal_chains`. Stored rows are never mass-rewritten on the date-equality count. Any repair is separately authorised |
 | G8 | S11/E3 windows cannot express contract identity, intraday horizon or "inspected, not tested" | native D2 window checks | S11/E3 owner | version bump |
 | G9 | GRID holds 30 sessions of SPY chains; long history is offline research copies; OCC symbol and bid/ask size not stored | D2 GRID custody (#1132, #1108) | options ingestion owner | schema change, separately authorised |
 | G10 | `people_events` materializer unscheduled (stale since 2026-07-01) | D1-F3 evidence currency | people_events owner | schedule approval |
-| G11 | CBOE SKEW stale since 2026-03-25 | SKEW as a D2 conditioner (excluded meanwhile) | altdata owner | `entity_map` mapping fixed by #1146 (merged 2026-11-12). Still needs coverage re-measured, with a query receipt |
+| G11 | ~~CBOE SKEW stale since 2026-03-25~~ coverage closed 2026-11-13 | — (SKEW is now `CANDIDATE_UNREVIEWED`, like VIX) | — | #1146 (`entity_map`), #1148 (resolver series filter) and #1149 (obs-date floor) merged and deployed. A scoped backfill wrote 7,696 rows; `skew_index` resolves through 2026-11-11 with 0 conflicting values and 0 vintages before their obs date (receipts in `docs/research/d0-receipts/`). First availability and clock 4 stay open, as for every Cboe input |
 | G12 | `forced_flow_monitor` ignores holidays; FOMC dates hard-coded for 2026 | forced-flow family (not in v1) | intelligence owner | Fix before any v2. Not fixed by #1141 |
 | G13 | No durable exact-version post-commit visibility receipt (clock 4), including corrections and retractions | historical admission of `people_events` and any table whose ingestion time is not commit visibility | people_events owner | Source-only design that links durable receipts to the canonical `people_events` pipeline, plus a disposable-PostgreSQL concurrency test plan. No second materializer, no historical repair, no runtime activation |
 
@@ -577,5 +577,16 @@ Gaps block only the hypotheses named in the gap list below.
 | Pre-2022 OPRA is a candidate window | §3.1, §6.2 and G5 |
 | No second fly pilot in D4 | §6.5 |
 | Unmerged foundation fixes; #1141 does not certify calendars | §1, G6, G7, G11 and G12 |
+
+### 10.1 Revision 3: measurements only (2026-11-13)
+
+No threshold, window, hypothesis or rule changed. No outcome was read.
+
+| Change | Where |
+|---|---|
+| SKEW coverage re-measured with two read-only query receipts (SQL text plus result file, sha256 in the manifest): `d0-receipts/g11_skew_coverage` and `d0-receipts/g11_skew_detail` | §3.1, G11, manifest `grid.raw_series.CBOE:SKEW` |
+| SKEW moves from `EXCLUDED_STALE` to `CANDIDATE_UNREVIEWED`; clock 4 recorded as `UNPROVEN`, because the 2026-03-26 .. 11-11 rows were committed by the 2026-11-13 backfill | §3.1, manifest |
+| Side finding, not checked further: resolved `vix_spot` carries rows on 4 US market holidays since 2026-03-26 (2026-05-25, 06-19, 07-03, 09-07). VIX missingness stays unmeasured | §3.1 |
+| G6 status corrected: the reader-guard integration is local commit `bce4f5d5`, not pushed and with no PR (revision 2 said "PR pending") | §1, G6 |
 
 <!-- D0-CONTRACT-BODY-END -->
