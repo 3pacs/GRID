@@ -13,6 +13,7 @@ import math
 import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from collections.abc import Sequence
 from typing import Any
 
 import pandas as pd
@@ -172,6 +173,18 @@ def _window_bounds(
     if since is None:
         since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     return {"since": since, "until": until}
+
+
+def _normalise_series_ids(series_ids: Sequence[str] | None) -> list[str] | None:
+    """Validate an operator-supplied series filter; None means no filter."""
+    if series_ids is None:
+        return None
+    if isinstance(series_ids, str):
+        raise TypeError("series_ids must be a sequence of strings, not one string")
+    out = sorted({str(sid).strip() for sid in series_ids})
+    if not out or any(not sid for sid in out):
+        raise ValueError("series_ids must be non-empty strings")
+    return out
 
 
 class _ResolvedBatchError(RuntimeError):
@@ -716,6 +729,7 @@ class Resolver:
         until: datetime | date | None = None,
         dry_run: bool = False,
         scan_budget_s: float | None = None,
+        series_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Resolve raw_series → resolved_series using multithreaded workers.
 
@@ -743,6 +757,11 @@ class Resolver:
                 before it stops starting slices and resolves the prefix it
                 enumerated. None (the default, and every manual/backfill
                 caller) scans the whole window. See ``_scan_series_ids``.
+            series_ids: Resolve only these raw series ids and skip the
+                distinct-series scan. For an operator backfill of one feed
+                (e.g. ``skew_index`` after its mapping landed) without
+                re-walking every series in the window. Same per-row path,
+                vintages and conflict handling as an unfiltered run.
 
         Returns:
             dict with resolved, conflicts_found, errors, series_scanned,
@@ -771,11 +790,13 @@ class Resolver:
         # is reported as having been scanned through. Conservative — the
         # final open slice actually sees rows written after this instant.
         started_utc = datetime.now(timezone.utc)
+        selected_series = _normalise_series_ids(series_ids)
         log.info(
             "Starting resolution (workers={w}, lookback={d}d, since={s}, "
-            "until={u}, dry_run={dr}, scan_budget={b})",
+            "until={u}, dry_run={dr}, scan_budget={b}, series_filter={f})",
             w=workers, d=lookback_days, s=since, u=until, dr=dry_run,
             b=scan_budget_s,
+            f=len(selected_series) if selected_series is not None else "none",
         )
 
         # Window bounds are passed to both statements below as bound
@@ -858,10 +879,17 @@ class Resolver:
         except Exception as exc:
             log.warning("Could not load feature families: {e}", e=str(exc))
 
-        log.info("Fetching distinct series_ids...")
-        all_series, scanned_through, scan_complete = self._scan_series_ids(
-            window_params, scan_budget_s=scan_budget_s, open_end=started_utc,
-        )
+        if selected_series is not None:
+            # Operator filter: the worker query already restricts rows to
+            # ``series_id = ANY(:sids)``, so the window scan is not needed.
+            all_series = selected_series
+            scanned_through = window_params["until"] or started_utc
+            scan_complete = True
+        else:
+            log.info("Fetching distinct series_ids...")
+            all_series, scanned_through, scan_complete = self._scan_series_ids(
+                window_params, scan_budget_s=scan_budget_s, open_end=started_utc,
+            )
         if not scan_complete:
             # Resolve exactly the prefix the scan enumerated. Without this the
             # worker fetch would still reach to the end of the window and
@@ -1145,6 +1173,7 @@ class Resolver:
         workers: int,
         dry_run: bool,
         totals: dict[str, Any],
+        series_ids: Sequence[str] | None = None,
     ) -> None:
         """Resolve one window, halving it and retrying on a statement timeout.
 
@@ -1175,6 +1204,7 @@ class Resolver:
         try:
             result = self.resolve_pending(
                 workers=workers, since=since, until=until, dry_run=dry_run,
+                series_ids=series_ids,
             )
         except Exception as exc:
             elapsed = round(time.monotonic() - chunk_t0, 2)
@@ -1187,8 +1217,8 @@ class Resolver:
                     a=since, b=until, e=elapsed, h=span_s / 7200,
                 )
                 totals["chunks_narrowed"] += 1
-                self._resolve_window(since, midpoint, workers, dry_run, totals)
-                self._resolve_window(midpoint, until, workers, dry_run, totals)
+                self._resolve_window(since, midpoint, workers, dry_run, totals, series_ids)
+                self._resolve_window(midpoint, until, workers, dry_run, totals, series_ids)
                 return
             # Warning, not error: a window that cannot be narrowed further is
             # an operational problem to look at, not a crash to propagate.
@@ -1238,6 +1268,7 @@ class Resolver:
         chunk_days: int = DEFAULT_BACKFILL_CHUNK_DAYS,
         workers: int = 8,
         dry_run: bool = False,
+        series_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Resolve a historical pull_timestamp range in bounded chunks.
 
@@ -1266,6 +1297,8 @@ class Resolver:
             chunk_days: Width of each slice in days.
             workers: Concurrent resolver threads per slice.
             dry_run: Measure without writing (see ``resolve_pending``).
+            series_ids: Resolve only these raw series ids (see
+                ``resolve_pending``).
 
         Returns:
             dict with the same keys as ``resolve_pending`` plus ``chunks``,
@@ -1275,6 +1308,7 @@ class Resolver:
         """
         if chunk_days < 1:
             raise ValueError("chunk_days must be >= 1")
+        series_ids = _normalise_series_ids(series_ids)
 
         start = _as_datetime(since)
         end = _as_datetime(until) if until is not None else datetime.now(start.tzinfo)
@@ -1294,7 +1328,7 @@ class Resolver:
         cursor = start
         while cursor < end:
             chunk_end = min(cursor + timedelta(days=chunk_days), end)
-            self._resolve_window(cursor, chunk_end, workers, dry_run, totals)
+            self._resolve_window(cursor, chunk_end, workers, dry_run, totals, series_ids)
             cursor = chunk_end
 
         if totals["failed_ranges"]:
@@ -1392,6 +1426,11 @@ def main(argv: list[str] | None = None) -> int:
         "--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
         help=f"Window when --since is absent (default: {DEFAULT_LOOKBACK_DAYS}).",
     )
+    parser.add_argument(
+        "--series-id", action="append", dest="series_ids", metavar="SERIES_ID",
+        help="Resolve only this raw series_id (repeatable). Skips the "
+             "distinct-series scan; same per-row path and vintages.",
+    )
     parser.add_argument("--workers", type=int, default=8, help="Resolver threads.")
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -1413,12 +1452,14 @@ def main(argv: list[str] | None = None) -> int:
             chunk_days=args.chunk_days,
             workers=args.workers,
             dry_run=args.dry_run,
+            series_ids=args.series_ids,
         )
     else:
         summary = resolver.resolve_pending(
             lookback_days=args.lookback_days,
             workers=args.workers,
             dry_run=args.dry_run,
+            series_ids=args.series_ids,
         )
     print(f"Resolution summary: {summary}")
 
