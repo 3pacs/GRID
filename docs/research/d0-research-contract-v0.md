@@ -5,10 +5,10 @@
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0` — **DRAFT, unsigned** |
+| Version | `d0-contract-v0`, **revision 2** (after the reviewer's first pass of 2026-11-12) — **DRAFT, unsigned** |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
 | Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
-| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12); pickup not yet confirmed |
+| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; this revision answers it (§10) |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
@@ -54,30 +54,64 @@ D1 modules to extend (none replaced):
 |---|---|---|---|---|
 | `intelligence/business_news_parser.py` | `business_events` | scheduler, every 6 h | **missing** (only article `published_at`) | cross-outlet stories not deduped |
 | `intelligence/deal_detector.py` | `deal_pipeline` | scheduler, every 6 h | **missing**; `detected_at` = article time or NOW() | `updated_at` overwritten per stage (no stage history) |
-| `intelligence/event_sequence.py` | — (read-only) | API, forensics, pattern_engine | **missing** | reads `r[8]` from an 8-column row (`:256`/`:277`), so every `signal_sources` event is silently dropped; stamps SEC filings at `period_end`, not filing date (`:656`) = weeks of lookahead |
-| `intelligence/causal_links.py` (+ `causation*`) | `causal_links` | systemd template | **present** (`known_at` + basis) | accepts `earnings_calendar` stub rows (below) as real releases |
+| `intelligence/event_sequence.py` | — (read-only) | API, forensics, pattern_engine | **missing** | G6. #1145 (merged 2026-11-12) reads `signal_sources` by column name and times filings by `filing_date`. Codex's reader guards (8befc05e, integration branch `claude/d0-reader-guards-integrate-20261113`, **unmerged, SOURCE-READY**) go further: signal events carry a timing hold, and calendar/filing rollups are withheld until release/version receipts exist |
+| `intelligence/causal_links.py` (+ `causation*`) | `causal_links` | systemd template | **present** (`known_at` + basis), but `known_at` = end of `earnings_date` for calendar rows | G7: accepts `earnings_calendar` compat stubs as releases. 8befc05e holds that timing in the three direct `causal_links` readers (unmerged). `causation_graph` calendar reads and persisted `causal_chains` are **not** covered and remain unqualified |
 | `intelligence/actor_network.py` + `actors/` | `actors`, `wealth_flows`, `actor_connections` | Hermes, 6 h | missing | CIK→ticker from the current `company_tickers.json` only |
 | `intelligence/sleuth_intersections.py` | `investigation_leads` | Hermes, daily | proxied by `signal_sources.created_at` | — (keeps #1071 construction rules) |
 | `intelligence/forced_flow_monitor.py` | `forced_flow_briefings` | Hermes 06:00–06:40 **UTC** (docstring says ET) | n/a | ignores holidays; FOMC dates hard-coded for 2026 |
 | `people_events` (migration `people_events_20260927`) | `people_events` | **no scheduled materializer** | **present** (`known_at`, `known_at_basis`, `dedup_key`, supersede/retract) | stale since 2026-07-01 |
 | `intelligence/security_master.py` | `security_master` (22,401 rows), `security_identifiers` (`valid_from`/`valid_to`) | — | — | no D1 module uses it; seed never flips `is_active` |
 | #1050 / #1051 / #1090 (open drafts) | SEC periods, AV transcripts, company documents | — | present in design | unmerged; #1051 stops new earnings stubs but does not repair existing ones |
+| Foundation source kit `25f7a982` (Codex, unmerged) | — | — | — | **SOURCE-READY evidence only**: scoped independent source approval for its offline tests; includes the `commit_visibility_unproven` refusal (§2). Not research admission, not release approval |
+| #1141 (merged) native-volume calendar | — | — | — | pins one calendar for the GEX native-volume reader. It does **not** certify product-expiration, FOMC or roll schedules, and grants no new source or capture authority. Holiday and calendar-estimate defects elsewhere (`forced_flow_monitor`, G12) are not fixed by it |
 
 ---
 
-## 2. Clocks every admitted input must carry
+## 2. Clocks
 
-An observation enters causal evaluation only if all five are known; otherwise it is `EXCLUDED_UNKNOWN_AVAILABILITY`.
+### 2.1 Input clocks: every admitted input carries all six
 
-1. **observation / event time** — what the value describes;
-2. **first public availability** — when anyone outside could first have known it;
-3. **retrieval / ingestion time** — when GRID received it (`pull_timestamp`, `registered_at`, `vintage`);
-4. **calculation time** — when the derived value was computed;
-5. **decision time** — the as-of the research rule acts on (must be ≥ 2 and ≥ 3, plus registered latency).
+An input enters a decision only if all six are known; otherwise it is `EXCLUDED_UNKNOWN_AVAILABILITY`.
 
-Retrieval time may stand in for first availability only for the forward period, never for history
-reconstructed today. Today's corrected data is never used to reconstruct what was knowable then; a repaired
-series is read `as_of` the decision time, which returns the pre-repair value when that is what was served.
+1. **Observation / event time.** What the value describes.
+2. **First public availability.** When anyone outside could first have known it. When only a proxy is
+   available, the proxy is named. Example: the EDGAR acceptance datetime is first **SEC-public**
+   availability. It is not necessarily the first public announcement, since a company release or a news
+   wire can come earlier. Rules built on it use a conservative SEC-delayed entry and never claim to capture
+   the earlier move.
+3. **Retrieval / ingestion time.** When GRID's process received it (`pull_timestamp`, `registered_at`,
+   `vintage`).
+4. **Durable system visibility.** When the exact version became visible to readers **after commit**. This is
+   not the ingestion timestamp:
+   - `people_events.ingested_at` is the transaction start;
+   - revision `recorded_at` is written before commit;
+   - `known_at` can tighten later.
+
+   Until a durable exact-version visibility receipt exists, covering corrections and retractions, clock 4 is
+   `UNPROVEN`. Historical feature admission is refused, as source kit `25f7a982`'s
+   `commit_visibility_unproven` refusal does. A receipt prototype is not a qualified producer (gap G13).
+5. **Calculation time.** When the derived value was computed.
+6. **Decision cutoff.** The instant the research rule acts. It must be ≥ clocks 2, 3 and 4 for every input,
+   plus the registered order latency. Only prices **observed at or before** the cutoff may set direction,
+   eligibility or ranking.
+
+### 2.2 Outcome clocks are separate
+
+- **An outcome is not an input.** It is the entry and exit prices and the horizon return.
+- **Each outcome has its own clock and provider contract.** An outcome stays `PENDING` until its horizon has
+  matured and its price is available under that contract.
+- **A late, missing or revised outcome stays `PENDING` / `UNAVAILABLE`.** It is never backdated into the
+  decision, and it never changes a decision already made.
+- **Forbidden:** requiring that an outcome be "present as of the decision time", or reading one before its
+  horizon matures.
+
+### 2.3 Corrected history
+
+- **Retrieval time stands in for availability only in the forward period.** It may stand in for first
+  availability or visibility there, never for history reconstructed today.
+- **Revisable knowledge is read as of the decision cutoff.** This covers estimates, filings, relationships,
+  availability, sector and universe membership.
+- **The single exception is the pipeline-repair rule in §7.7.**
 
 ---
 
@@ -89,13 +123,13 @@ series is read `as_of` the decision time, which returns the pre-repair value whe
 |---|---|---|---|---|
 | `options_capture_batches` / `options_snapshots_all`, SPY, Cboe delayed (~15 min) | GRID griddb, append-only | **2026-10-01 .. 2026-11-11, 30 sessions, 359 batches** (measured 2026-11-12) | batch `registered_at`, `capture_started/completed_at`; per-contract quote time absent; spot clock only from 2026-11-10 | forward-only; too short for any historical claim; OCC symbol not stored, no bid/ask size |
 | `options_daily_signals` / `spy_iv_*` features | GRID | same as above | obs = release = snap date | diagnostic; "25-delta" is a ±10 % moneyness proxy |
-| CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | admitted for regime conditioning (close known after 16:15 ET) |
-| CBOE SKEW | GRID | ends **2026-03-25** (stale) | — | excluded until the puller is fixed |
+| CBOE VIX / VIX9D / VIX3M | GRID `raw_series` | VIX 1990-01-02 .. 2026-11-10; VIX9D from 2011-01-04; VIX3M from 2009-09-18 | daily close; pull_timestamp | **CANDIDATE_UNREVIEWED**. Proposed for regime conditioning as the prior session's close. "Published after the close" is an assertion, not a checked historical first-availability receipt; missingness is not yet measured |
+| CBOE SKEW | GRID | ended **2026-03-25** as measured 2026-11-12. #1146 (merged 2026-11-12) maps the daily CBOE SKEW rows in `entity_map` | — | **EXCLUDED** until coverage is re-measured after #1146 with a query receipt (G11) |
 | Schwab chains / quotes / 1-min bars | process-local only, `persist_allowed=False`; no redistribution | live only | provider quoteTime + receipt time | live inputs for forward shadows; no history; no aggressor side |
 | Polygon `/v3/snapshot/options` | — | 403, puller SKIPPED | — | unavailable |
 | SPY 1-min bars, Polygon | offline research copy (GEX repo scratch) | rolling ~2 yr (2024-11 ..) | bar end | inspected (§4); not GRID custody |
 | SPY 1-min bars, XNAS.ITCH | offline research copy | 2022-11 .. 2026-11 | bar end | inspected (§4) |
-| OPRA cbbo-1m, near-spot 0DTE strikes | offline research copy | 2022-11-14 .. 2026-11-09 fetched; vendor history from 2013 | quote in force at minute end | inspected 2022-11-14 .. 2026-11-09; **pre-2022-11 not fetched, untouched** |
+| OPRA cbbo-1m, near-spot 0DTE strikes | offline research copy | 2022-11-14 .. 2026-11-09 fetched; vendor history from 2013 | quote in force at minute end | inspected 2022-11-14 .. 2026-11-09. Pre-2022-11 not fetched by this lane: a **candidate** replication window, not untouched by assertion (§6.2, G5) |
 | OPRA open interest (statistics, stat_type 9) | offline research copy | 2022-11-14 .. 2026-03-25 rebuilt books | published ~06:30 ET from the prior close (PIT-safe) | inspected |
 | SPY trades with aggressor side (XNAS.ITCH) | offline research copy | 2022-11 .. 2026-11 | trade time | dev 2024-11 .. 2026-11 inspected for edge8; 2022-11 .. 2024-11 unread for edge8 only |
 | Tiingo SPY adjusted daily | GRID key; offline copy for edge3 | 1993 .. | daily | inspected for calendar rules 1993 .. 2026-11-10 |
@@ -169,9 +203,9 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
 
 ### 5.1 Frozen scope (proposed)
 
-- **Universe:** US-listed common stocks whose trailing 60-session median dollar volume is ≥ $20 M **as of
-  the event's first-availability date**, computed from Tiingo EOD including delisted names (existing key,
-  no new vendor). Identity through `security_master` / `security_identifiers` valid at the event date;
+- **Universe:** US-listed common stocks whose trailing 60-session median dollar volume is ≥ $20 M, measured
+  over the 60 sessions **ending the session before acceptance**. Computed from Tiingo EOD including delisted
+  names (existing key, no new vendor). No future-informed liquidity or universe selection. Identity through `security_master` / `security_identifiers` valid at the event date;
   ticker reuse resolved by CIK. Until this universe exists (gap G3) no historical D1 look can run.
 - **Families (k = 2 evaluated, 1 evidence-only).** Chosen for source quality, not for expected return:
 
@@ -183,19 +217,32 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
 
   Not in v1: customer-supplier links (no change history), index additions/deletions (no source),
   OPEX/FOMC forced flows (calendar defects; SPY flows are D2's), headline-only deal news.
-- **Event time and entry:** the first regular-session open strictly after acceptance time + 5 minutes.
-  An after-close filing enters at the next open; the announcement-day move before entry is recorded on the
-  card as "already moved" and is never claimed.
+- **Clocks (one decision cutoff per event; daily data only in v1).**
+  - **Acceptance A:** the EDGAR acceptance datetime. This is the SEC-public proxy (§2.1).
+  - **Day 0:** the first regular session whose 16:00 ET close is **strictly after A + 5 minutes**. So a
+    pre-open or intraday acceptance before 15:55 ET falls on that day; a later or after-close acceptance falls
+    on the next session.
+  - **Reference price P₋₁:** the last regular-session close **before** A.
+  - **Decision cutoff D:** the day-0 close. Direction, eligibility and ranking use only prices observed at
+    or before D: P₋₁ and the day-0 close C₀.
+  - **Entry:** the open auction of day +1, as an order placed after D.
+
+  The entry open is an outcome-clock observation (§2.2). It never decides its own fill. The day-0 move
+  (C₀ / P₋₁ − 1) is recorded on the card as "already moved" and is never claimed.
 - **Horizons (2):** [entry, +5 sessions] and [entry, +20 sessions], open-to-close.
 - **Outcome:** return minus the sector ETF return over the same span (sector from `analysis/sector_map`
   as of the event date), with SPY-relative reported alongside.
-- **Variants:** direction = sign of the [−1, entry) reaction (continuation); its mirror (reversal) is the
-  control, not a second chance.
+- **Variants:** direction = sign of C₀ / P₋₁ − 1 (continuation). Its mirror (reversal) is the control, not
+  a second chance. A zero or missing C₀ or P₋₁ makes the event `EXCLUDED_INPUT`.
 - **Controls:** (a) declare-all baseline — every eligible event, unranked; (b) placebo — the same issuers on
   dates shifted by ±60 sessions; (c) shuffled-relationship control for any card using a link.
-- **Ranking rule (frozen before D3):** data quality tier, then event strength (item type; for F1 the
-  absolute day-0 reaction in units of the issuer's trailing 60-session volatility), then liquidity. No
-  composite probability. "Priced-in" is shown as unknown when there is no PIT consensus or option-implied move,
+- **Ranking rule (frozen before D3):**
+  - Order: data quality tier, then event strength, then liquidity. No composite probability.
+  - **Event strength:** item type. For F1 it is |C₀ / P₋₁ − 1| divided by the issuer's 60-session close-to-close
+    volatility ending at P₋₁.
+  - **Ranking bucket:** a quintile is not formed across events whose cutoffs fall later. Each event is placed
+    in a quintile by fixed strength breakpoints, computed on the development window only and frozen before
+    the holdout opens. So an event's bucket is known at its own cutoff D. "Priced-in" is shown as unknown when there is no PIT consensus or option-implied move,
   which is the default in v1 (`earnings_calendar` estimates are not PIT).
 
 ### 5.2 Windows (fixed before the EDGAR fetch)
@@ -214,16 +261,34 @@ No D1 family above has been tested on these windows by any ledger in §4 (VS1 co
   sensitivity reported.
 - **Sample floor:** ≥ 200 events in the top quintile and ≥ 60 distinct event weeks per cell in the holdout,
   else UNDERPOWERED.
-- **Power rationale:** with per-event excess-return SD of about 4 % at +5 and 8 % at +20 sessions (to be
-  measured on development data and recorded before the holdout opens), n = 200 gives SE ≈ 0.28 % / 0.57 %,
-  so the minimum detectable difference at 0.9875 and 80 % power is about 0.85 % / 1.7 %. If the measured
-  development SD implies power < 0.5 at the literature-plausible effect, the cell is STOP_UNDERPOWERED before
-  the holdout, as in the VS1 Stage-0 gate.
+- **Power rationale.** These numbers are placeholders, not the gate.
+  - Assuming per-event excess-return SDs of about 4 % at +5 sessions and 8 % at +20, n = 200 gives a naive
+    SE of about 0.28 % / 0.57 %. The minimum detectable difference at 0.9875 and 80 % power would then be
+    about 0.85 % / 1.7 %.
+  - **Clustering:** the test clusters by issuer and event week, so the naive per-event SE overstates power.
+    Before the holdout opens, the development data alone is used to estimate the effective sample size (the
+    design effect from those clusters) and the variance of the **paired** statistic (top quintile minus
+    declare-all).
+  - **The power gate is frozen from those estimates before any untouched outcome is read.** If power is
+    below 0.5 at the literature-plausible effect, the cell is STOP_UNDERPOWERED before the holdout, as in
+    the VS1 Stage-0 gate.
 - **Economic:** top-quintile mean net excess ≥ 0.5 % at +5 or ≥ 1 % at +20; capacity reported at 1 % of
   median dollar volume.
-- **Operational (per event):** acceptance datetime present; CIK resolves to one security valid at that time;
-  entry and exit prices present `as_of` the decision time; sector known. Otherwise `EXCLUDED_*`, counted.
-  Exclusions > 10 % of eligible events in a cell → HOLD with the cause.
+- **Operational, inputs:** each event needs all of the following at its decision cutoff D:
+  - an acceptance datetime;
+  - a CIK that resolves to one security valid at A;
+  - P₋₁ and C₀;
+  - a trailing liquidity and volatility window;
+  - a sector as of A.
+
+  Otherwise the event is `EXCLUDED_*` and counted.
+- **Operational, outcomes:**
+  - The entry open and the +5 / +20 exit prices are outcome-clock observations (§2.2), read under the price
+    contract once the horizon has matured.
+  - Until then the event is `PENDING`. A late or missing outcome stays `PENDING` / `UNAVAILABLE` and never
+    changes the decision.
+  - Exclusions over 10 % of eligible events in a cell → HOLD with the cause. Inputs and outcomes are counted
+    separately.
 
 ### 5.4 GO / HOLD / RETIRE
 
@@ -243,8 +308,17 @@ under an append-only table with accession as key. Compute small.
   entry open → card with "already moved", sector-relative outcome slot left PENDING. Binds to the #958 chain
   shape (input → materialization row → reasoning output or unavailable reason → retained bytes); M0 does not
   prove accuracy.
-- **Refusal:** one of the 2,131 `earnings_calendar` rows whose `earnings_date` equals a SEC `period_end`
-  (compat stub, `reported = TRUE`), refused as `EXCLUDED_UNKNOWN_AVAILABILITY`.
+- **Refusal:** one `earnings_calendar` compat-stub row (`earnings_date` equals a SEC `period_end`,
+  `reported = TRUE`), refused as `EXCLUDED_UNKNOWN_AVAILABILITY`.
+  - "2,131 rows" is the author's measurement from 2026-11-12. Date equality alone does not prove every
+    matching row is a stub, so no row is deleted, rewritten or quarantined on that count.
+- **Leakage fixture (synthetic, no outcomes):** three filings, all with outcomes left `PENDING`:
+  - pre-open, accepted 07:00 ET;
+  - intraday, accepted 11:30 ET;
+  - after-close, accepted 16:30 ET.
+
+  The test mutates every price **after** each event's day-0 close and asserts that direction, eligibility,
+  strength and quintile are unchanged. It also mutates C₀ and asserts that they do change.
 
 ---
 
@@ -259,13 +333,32 @@ under an append-only table with accession as key. Compute small.
 - **Separate questions, scored separately:** (a) forecast quality of a volatility measure (diagnostic);
   (b) after-cost tradability of a fixed structure (economic). A pass on (a) never implies (b).
 
-### 6.2 Hypotheses (k = 3, one family)
+### 6.2 Hypotheses: D2-H1 has two cells; D2-H2 and D2-H3 are adopted unchanged
 
-| ID | Hypothesis | Data | Window | Look |
+| ID | Hypothesis and exact estimand | Data | Window | Look |
 |---|---|---|---|---|
-| D2-H1 | The 0DTE variance premium found in edge6 replicates out of sample: the 14:00 and 15:00 ET ATM short iron fly (wings and strike rule exactly as edge6, frozen code hash) has mean net > 0 at bid/ask on **pre-2022-11-14 Monday/Wednesday/Friday SPY expiries** | OPRA cbbo-1m, not yet fetched | 2018-01-02 .. 2022-11-11 expiry days (exact start = first full year with M/W/F expiries in the vendor data; fixed before fetch) | one look, after the fetch manifest is hashed |
-| D2-H2 | fly-shadow/1 forward: the 15:00 fly exited at 15:55 (shorts at ask, wings at bid) has mean net > 0 | live Schwab chain, ledger `fly_days` | forward from 2026-11-12 | one look at 100 traded sessions (already registered fe8318a; D0 adopts it unchanged) |
-| D2-H3 | bounce-shadow/1 forward: long SPY 15:29→15:59 after a negative-gamma late-day bounce | live dte0 regime + bars | forward from 2026-11-12 | one look at 50 qualifying sessions (registered f8b3874; adopted unchanged). **Not independent of history:** chosen after edge7 P3 (short the same bounce, −0.391, n 83) was read |
+| D2-H1a / D2-H1b | edge6 replication at **14:00** (H1a) and **15:00** (H1b) ET, two separate cells. Short ATM iron butterfly exactly as edge6 (registered cb7b213), with K = the strike nearest spot that has both a call and a put quote. **Entry:** sell the K call and K put at their bids and buy the K+5 call and K−5 put at their asks, at the quote mark T (§6.3); spot = the close of the 1-minute bar ending at T. **Exit: cash settlement at the 15:59 close S** (edge6 formula); no early exit. Fees $0.03 per contract per leg. Net in dollars per share; risk per trade = 5 − credit. | OPRA cbbo-1m plus SPY 1-minute bars, not yet fetched | Monday/Wednesday/Friday SPY expiry days 2018-01-02 .. 2022-11-11. The exact start, contract list and strike/target scope are fixed in a fetch manifest **before** the fetch | one look per cell after the fetch manifest is hashed |
+| D2-H2 | fly-shadow/1 forward: the 15:00 fly **exited at 15:55** (shorts bought back at the ask, wings sold at the bid) | live Schwab chain, ledger `fly_days` | forward from 2026-11-12 | one look at 100 traded sessions. Registered fe8318a; adopted **unchanged**, including its own test and level |
+| D2-H3 | bounce-shadow/1 forward: long SPY 15:29 → 15:59 after a negative-gamma late-day bounce | live dte0 regime plus bars | forward from 2026-11-12 | one look at 50 qualifying sessions. Registered f8b3874; adopted unchanged. **Not independent of history:** chosen after edge7 P3 (short the same bounce, −0.391, n 83) was read |
+
+**The estimands differ:**
+- **D2-H1** is settlement-graded and historical.
+- **D2-H2** exits at 15:55 and runs forward.
+
+A D2-H1 pass does not show that the 15:55 exit earns the same, and a D2-H2 pass does not replicate the
+settlement result. The only comparison D0 makes is the GO rule in §6.5, frozen here before either look.
+
+**Pre-2022 window, before fetching (G5):**
+- **Reconcile the full inspection ledger.** This covers GEX edge1–edge8, #647, VS1, #1065 and the daily-SPY
+  calendar looks in §4. The aim is to confirm that no SPY option-premium family, entry time or contract scope
+  has been tested on 2018 .. 2022-11.
+- **Protected reservations.** The daily-SPY reservations (edge3 holdout 2013 .. 2026-11-10, calendar rules
+  only) and the insider reservations stay protected. They are not opened by this fetch.
+- **If reconciliation finds an overlap,** that cell is struck before the fetch and recorded here as a new
+  revision.
+
+**Excluded entry times:** 09:35 (edge6 FAIL) and 12:00 (edge6 PASS, but not chosen) are not tested, and are
+counted in the selection disclosure in §6.4.
 
 Diagnostic only (no pass/fail, cannot promote): realised-vs-implied variance by time of day on GRID's own
 `options_capture_batches` once it reaches 120 sessions.
@@ -275,45 +368,84 @@ intraday rule on 2022-11 .. 2026-11.
 
 ### 6.3 Execution and costs (fixed)
 
-- Option fills: enter at the ask (buy) / bid (sell) in force at the end of minute t+1 after the signal; exit
-  at the opposite side at the end of the exit minute; fee $0.03 per contract per side. No mid fills.
+- **Quote marks.** Every signal, fill and exit mark uses the quote **in force at or before** the mark: the
+  latest update at or before it, never one after.
+- **Maximum quote age:** 60 s per leg.
+- **Maximum spread:** $0.20 per leg, or 50 % of that leg's mid, whichever is larger.
+- **Simultaneous availability:** all four legs must meet the age and spread rules at the same mark.
+  Otherwise the session is `EXCLUDED_INPUT` for that cell.
+- **Size:** one contract per leg, full fill at the quoted price. Displayed size and partial fills are not
+  modelled.
+- **D2-H1 (replication):** fills at mark T, exactly as edge6.
+  - Spot and quotes share the mark, so each fill is labelled **MODELED_BBO_SAME_MARK**.
+  - A conservative sensitivity, reported and not judged, fills at the quote in force at T + 1 minute.
+- **D2-H2:** keeps fe8318a's registered fills.
+- **Fees:** $0.03 per contract per side. No mid fills in any judged result.
+- **Labels.** Every option result is labelled **MODELED_BBO**, not observed execution; D2-H2's
+  Schwab-quote-graded fills are modelled too. A quote snapshot within two minutes with positive bids is
+  **not** proof that the trade could be executed.
+- **What missing execution proof blocks.** Without it, no economic or execution claim can be made, in
+  particular the §6.4 economic threshold for anything beyond MODELED_BBO. Descriptive and statistical
+  diagnostics can still be reported.
 - Shares: $0.04 per share round trip (D2-H3), plus a 6 bp round-trip sensitivity (`evals/e2` `e2-costs-v1`).
 - **Gap:** no options cost class exists in `evals/e2/cost_model.json`. D2 must add `us_equity_option_0dte`
   to the cost model (versioned) before D3 can score through E2.
-- Settlement-graded results (15:59 settle) are reported but are not the judged metric for any live-exit
-  hypothesis; pin risk is reported as the share of entries settling within $0.25 of a short strike.
+- **D2-H1 is judged on settlement** (§6.2).
+- **For the live-exit hypothesis (D2-H2),** the settlement-graded result is reported but never judged.
+- **Pin risk** is reported for every fly cell, as the share of entries settling within $0.25 of a short
+  strike.
 
 ### 6.4 Success thresholds (fixed before any outcome)
 
-**Statistical:** per hypothesis, mean net per trade > 0 with a seeded percentile-bootstrap lower bound
-(B = 10 000, seed 20261107) above 0 at one-sided level 1 − 0.05/k, k = 3 → 0.9833 for D2-H1. D2-H2 and
-D2-H3 keep their registered levels (0.95) because they were registered first; the family-wise
-correction across D2 is reported alongside.
+**Statistical:**
+- **D2-H1a and D2-H1b** are each tested separately: mean net per trade > 0, with a seeded
+  percentile-bootstrap lower bound (B = 10 000, seed 20261107) above 0 at one-sided **1 − 0.05/2 = 0.975**
+  (Bonferroni over the two H1 cells).
+- **D2-H1 PASS** requires **both** cells to pass (an intersection–union rule), and each cell's mean must be
+  positive in a majority of the calendar years covered.
+- **If one cell passes,** that cell's own claim stands, but D2-H1 is not a PASS.
+- **D2-H2 and D2-H3** keep their registered tests and levels (0.95) unchanged. D0 does not regrade them.
 
-**Sample floor:** D2-H1 n ≥ 300 sessions per entry time; D2-H2 n = 100; D2-H3 n = 50. Fewer eligible
+**Program-level selection, disclosed and not corrected by these per-look levels:**
+- edge6 was chosen as the one PASS among the SPY option and intraday looks of 2026-11-06 .. 11-12 (#1133: 10
+  looks, about 40 rules and cells, all others FAIL or UNDERPOWERED).
+- edge6's own four entry times included 09:35 FAIL and 12:00 PASS.
+- D2-H1 is a replication on a candidate-untouched window for that reason. Its result is reported together
+  with the full program count, and never as a standalone discovery.
+
+**Sample floor:** D2-H1a and D2-H1b n ≥ 300 sessions each; D2-H2 n = 100; D2-H3 n = 50. Fewer eligible
 sessions than the floor = UNDERPOWERED = HOLD, never PASS.
 
 **Power rationale (D2-H1/H2):** edge6 at 15:00 gives mean +0.195, bootstrap LB(0.9875) +0.131 at n = 986,
 so SD ≈ 0.90 per trade. At n = 100 (D2-H2), the one-sided 95 % bound clears 0 when the sample mean
 exceeds ≈ 0.148: power ≈ 0.70 if the true mean is 0.195, ≈ 0.50 if a 15:55 exit cuts it to 0.15. The
 distribution is left-skewed (many small wins, rare losses near −4), so the bootstrap at n = 100 is likely
-optimistic; D3 reports a block-bootstrap and a worst-decile sensitivity. At n = 300 (D2-H1, level 0.9833, bound clears 0 above ≈ 0.111), power ≈ 0.95
-for a true mean of 0.195 and ≈ 0.77 for 0.15. These use the 2022–2026 SD; M/W/F-only history may differ.
+optimistic; D3 reports a block-bootstrap and a worst-decile sensitivity. At n = 300 per H1 cell (level 0.975, bound clears 0 above ≈ 0.102), power ≈ 0.96
+for a true mean of 0.195 and ≈ 0.82 for 0.15. Because both cells must pass, joint power is about their product
+if they are independent. The 14:00 and 15:00 cells share sessions, so joint power is higher than that product. These use the 2022–2026 SD; M/W/F-only history may differ.
 
 **Economic:** mean net ≥ 2 % of capital at risk (5 − credit) per trade; max drawdown reported in units of
 mean monthly net; positive in a majority of calendar years covered.
 
-**Operational (per session, before inclusion):** chain captured within 2 minutes of each grading mark;
-both short strikes and both wings quoted (bid > 0, ask ≥ bid); spot clock present; otherwise the session is
-`EXCLUDED_INPUT` and counted. If excluded sessions exceed 10 % of eligible sessions at any fixed review
+**Operational (per session, before inclusion):**
+- all four legs meet the §6.3 quote rules at every judged mark: quoted at or before the mark, aged ≤ 60 s,
+  within the spread cap, bid > 0 and ask ≥ bid;
+- the spot clock is present.
+
+Otherwise the session is `EXCLUDED_INPUT` and counted. D2-H2 keeps fe8318a's own inclusion rule. If excluded sessions exceed 10 % of eligible sessions at any fixed review
 (the #647 stop rule), the hypothesis halts as HOLD with the cause recorded.
 
 ### 6.5 GO / HOLD / RETIRE
 
-- **GO** (eligible for D4 prospective paper): D2-H1 PASS **and** D2-H2 PASS at their looks.
+- **GO** (frozen here, before either look): D2-H1 PASS **and** D2-H2 PASS at their own looks.
+  - This cross-program rule is D0's. It reads D2-H2's verdict as registered and does not change it.
+  - **D4 does not run another fly pilot.** D2-H2 is already the prospective paper test, so its immutable
+    evidence maps directly onto D4's acceptance rule.
+  - A D4 step is added only for a genuinely new validation question, such as executable fills. It is then
+    registered separately, without touching fe8318a.
 - **HOLD:** either is UNDERPOWERED, or operational exclusions exceed 10 %, or D2-H1 cannot be fetched
   (spend not approved). Calendar time alone never converts HOLD to GO.
-- **RETIRE:** D2-H1 FAIL (the premium did not replicate) **or** D2-H2 FAIL. A retired structure returns only
+- **RETIRE:** D2-H1 FAIL **or** D2-H2 FAIL. D2-H1 FAIL means either H1 cell FAILs; an UNDERPOWERED cell gives HOLD, not FAIL. A retired structure returns only
   as a new registration on new data.
 - D2-H3 decides only its own GO/RETIRE; it cannot rescue or sink the fly.
 
@@ -325,8 +457,12 @@ with a quoted cap before it starts; no subscription.
 
 ### 6.7 Examples required before admission
 
-- **Traceable:** one fly-shadow/1 graded session — chain capture id, quotes at 15:00 and 15:55, fills,
-  net, ledger row hash.
+- **Traceable:** one fly-shadow/1 graded session. It shows:
+  - chain capture id;
+  - quotes at 15:00 and 15:55, with each leg's quote time and age;
+  - fills labelled MODELED_BBO;
+  - net;
+  - ledger row hash.
 - **Refusal:** one session excluded for missing quotes or a stale spot clock, with the exclusion reason as
   stored. (The pre-registration rows from 2026-11-04 .. 11-11 are graded but outside the judged sample;
   they may serve as the mechanics example, labelled pre-registration.)
@@ -346,19 +482,58 @@ with a quoted cap before it starts; no subscription.
 5. **Publish negatives.** Every verdict, including FAIL and UNDERPOWERED, is recorded on the issue and in
    the ledger.
 6. **No reconstruction from corrected data.** Historical inputs are read `as_of` the decision time.
-7. **Repaired prices.** The #1084 repair fixed GRID's own pipeline error (mixed raw/adjusted vintages), not
-   information the market lacked, so historical research reads the repaired series (current `as_of`) and
-   discloses it. Because adjusted closes are back-adjusted with later corporate actions, they are used only as
-   **returns** (ratios), never as price levels or level thresholds. Revisable *knowledge* (estimates, filings,
-   relationships, availability) is always read `as_of` the decision time.
+7. **Repaired prices: the one narrow exception to rule 6.** The #1084 repair fixed GRID's own pipeline
+   error (mixed raw and adjusted vintages), not information the market lacked. So historical research may
+   read the repaired price series at the current `as_of`, under these conditions:
+   - **Fixed repair manifest.** The read is bound to the repair run_tags (`full-basis-20261109`,
+     `full-basis-20261110-nine`, `full-basis-20261110-xlre`, `tiingo-foreign-20261109`) and the
+     retraction-table state as of the contract's signing. A later repair is a new revision.
+   - **Basis.** Tiingo adjusted closes, used **only as returns** (ratios within one series), never as price
+     levels or level thresholds, because they are back-adjusted with later corporate actions.
+   - **Corporate actions.** Splits and dividends inside a return span are handled by the adjusted series
+     itself. A span containing a delisting, symbol change or merger is resolved through `security_master`
+     validity at the event date, or excluded.
+   - **What it does not admit:**
+     - revised knowledge: estimates, filings, relationships, availability;
+     - current sector membership (sector is read as of the event);
+     - any liquidity or universe selection computed with data after the decision cutoff.
+
+     Those are always read as of the decision cutoff (§2.3).
 
 ## 8. Admission manifest and independent review
 
-Admission happens per hypothesis, never project-wide. A hypothesis is admitted when the manifest
-(`d0-coverage-manifest-v0.json`) shows, for every input it uses: status `ADMITTED`, a file or query hash,
-and coverage meeting its sample floor. The independent reviewer then:
+Admission happens per hypothesis, never project-wide.
 
-- [ ] re-runs the coverage queries and matches counts within 0.5 %;
+**While this contract is unsigned, no input may carry `ADMITTED`.** The strongest allowed label is
+`CANDIDATE_UNREVIEWED`. An input label is never a hypothesis admission.
+
+An input may be marked `ADMITTED` only when all of these hold:
+- the contract is signed and the body hash is pinned;
+- the reviewer has signed the manifest;
+- the input has a measured missingness entry;
+- it has a first-availability receipt, not an assertion such as "after close";
+- it has a durable-visibility status other than `UNPROVEN`, where clock 4 applies;
+- it has a file or query receipt.
+
+`analysis/d0_manifest.py` refuses any other `ADMITTED`, and its test runs in CI.
+
+A hypothesis is admitted when every input it uses is `ADMITTED` and coverage meets its sample floor.
+
+**Reproducibility record,** per input:
+- exact query text and its sha256;
+- source cutoff or snapshot identity;
+- source version;
+- receipt hash;
+- exclusion list.
+
+A later live re-query that differs is a **new coverage observation**, recorded with its own receipt. It is
+not a failure, and it does not overwrite the earlier one.
+
+The independent reviewer then:
+
+- [ ] re-runs each coverage query from its recorded text against the recorded snapshot, or records a new
+      observation as above;
+- [ ] runs the §5.6 leakage fixture and the clock-4 visibility refusal;
 - [ ] injects late, revised, missing and duplicate observations into a fixture and confirms each is
       excluded or deduplicated as stated;
 - [ ] reproduces the traceable example and the refusal example for each track;
@@ -375,13 +550,32 @@ Gaps block only the hypotheses named in the gap list below.
 | G2 | No EDGAR acceptance-datetime history; `earnings_events` starts 2026-02-19 | D1-F1, D1-F2 history | existing SEC lane (#1050 author) | approval of a free backfill job |
 | G3 | No point-in-time liquid-equity universe | all D1 history | — | Tiingo EOD incl. delisted + `security_master` validity |
 | G4 | No options cost class in `evals/e2/cost_model.json` | D2 scoring through E2 | E2 owner | versioned cost-model bump |
-| G5 | Pre-2022-11 OPRA quotes not fetched | D2-H1 | GEX research lane | operator spend approval with a cap |
-| G6 | `event_sequence.py` drops all `signal_sources` events (`r[8]`) and stamps filings at `period_end` | any D1 card that uses event_sequence | intelligence owner | small fix PR + tests |
-| G7 | 2,131 `earnings_calendar` compat stubs read as real releases by `causal_links` | D1 (excluded by rule meanwhile) | #1051 author | repair or quarantine, separately authorised |
+| G5 | Pre-2022-11 OPRA quotes not fetched | D2-H1a, D2-H1b | GEX research lane | First, reconcile the full inspection ledger and fix the exact contract and target scope in a fetch manifest (§6.2). Then the operator's spend approval with a cap |
+| G6 | `event_sequence.py` dropped all `signal_sources` events (`r[8]`) and stamped filings at `period_end` | any D1 card that uses event_sequence | Claude (owner integration) | #1145 merged 2026-11-12. Codex's stricter guards (8befc05e) are integrated with #1145 on `claude/d0-reader-guards-integrate-20261113`: local tests pass, the PR is pending, and nothing is merged or deployed. Until it merges, event-sequence lead times stay on HOLD |
+| G7 | `earnings_calendar` compat stubs (`earnings_date = period_end`; 2,131 by date equality, the author's count) read as releases | D1 (excluded by rule meanwhile); earnings causal-link timing on HOLD | readers: the 8befc05e integration; producer: #1051 author | The reader-side hold covers the three direct `causal_links` readers, not `causation_graph` or persisted `causal_chains`. Stored rows are never mass-rewritten on the date-equality count. Any repair is separately authorised |
 | G8 | S11/E3 windows cannot express contract identity, intraday horizon or "inspected, not tested" | native D2 window checks | S11/E3 owner | version bump |
 | G9 | GRID holds 30 sessions of SPY chains; long history is offline research copies; OCC symbol and bid/ask size not stored | D2 GRID custody (#1132, #1108) | options ingestion owner | schema change, separately authorised |
 | G10 | `people_events` materializer unscheduled (stale since 2026-07-01) | D1-F3 evidence currency | people_events owner | schedule approval |
-| G11 | CBOE SKEW stale since 2026-03-25 | SKEW as a D2 conditioner (excluded meanwhile) | altdata owner | puller fix |
-| G12 | `forced_flow_monitor` ignores holidays; FOMC dates hard-coded for 2026 | forced-flow family (not in v1) | intelligence owner | fix before any v2 |
+| G11 | CBOE SKEW stale since 2026-03-25 | SKEW as a D2 conditioner (excluded meanwhile) | altdata owner | `entity_map` mapping fixed by #1146 (merged 2026-11-12). Still needs coverage re-measured, with a query receipt |
+| G12 | `forced_flow_monitor` ignores holidays; FOMC dates hard-coded for 2026 | forced-flow family (not in v1) | intelligence owner | Fix before any v2. Not fixed by #1141 |
+| G13 | No durable exact-version post-commit visibility receipt (clock 4), including corrections and retractions | historical admission of `people_events` and any table whose ingestion time is not commit visibility | people_events owner | Source-only design that links durable receipts to the canonical `people_events` pipeline, plus a disposable-PostgreSQL concurrency test plan. No second materializer, no historical repair, no runtime activation |
+
+## 10. Revision 2: response to the reviewer's first pass (2026-11-13)
+
+| Reviewer item | Where answered |
+|---|---|
+| 1. D1 decision and ranking leakage | §5.1. One decision cutoff (day-0 close), reference prices observed by then, frozen development-only quintile breakpoints, entry at the next open as an outcome observation. §5.6 adds the pre-open / intraday / after-close leakage fixture |
+| 2. Input clocks versus outcome clocks | §2.2 and §5.3. Outcomes stay `PENDING` until mature; late exits never change the decision |
+| 3. Multiplicity and D2-H1 aggregation | §6.2 and §6.4. Two H1 cells at 0.975, both required; H2 and H3 unchanged; program-level selection disclosed |
+| 4. Manifest looked admitted while unsigned | §3.1 and §8. `CANDIDATE_UNREVIEWED`; `analysis/d0_manifest.py` refuses `ADMITTED` without its prerequisites |
+| 5. Durable knowledge visibility | §2.1 clock 4 and G13. `UNPROVEN` until receipts exist; reference to `25f7a982` `commit_visibility_unproven` |
+| 6. D2 exit contract and executable-versus-simulated labels | §6.2 and §6.3. Exact entry and exit per cell; quote-at-or-before, age, spread, four-leg and size rules; MODELED_BBO labels; missing execution proof blocks economic claims only |
+| EDGAR acceptance is SEC-public, not first announcement | §2.1 and §5.1 |
+| Narrow pipeline-repair exception | §7.7 |
+| Clustered power | §5.3 |
+| Reproducibility beyond count matching | §8 |
+| Pre-2022 OPRA is a candidate window | §3.1, §6.2 and G5 |
+| No second fly pilot in D4 | §6.5 |
+| Unmerged foundation fixes; #1141 does not certify calendars | §1, G6, G7, G11 and G12 |
 
 <!-- D0-CONTRACT-BODY-END -->

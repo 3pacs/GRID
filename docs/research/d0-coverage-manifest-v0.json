@@ -15,13 +15,20 @@
     "agent": "Codex",
     "named_by": "operator",
     "named_at": "2026-11-12",
-    "pickup_confirmed": false,
-    "signed": false
+    "pickup_confirmed": true,
+    "signed": false,
+    "first_pass": {
+      "received": "2026-11-13",
+      "verdict": "REQUEST_CHANGES",
+      "reviewed_head": "bf03b8e07666dfe4542f191d73f5ca95394f0dc6",
+      "artifact_sha256_prefix": "86b4f33edd3ece33"
+    }
   },
   "signed_at": null,
   "contract_body_sha256": null,
   "admission_status_values": [
     "ADMITTED",
+    "CANDIDATE_UNREVIEWED",
     "FORWARD_ONLY",
     "INSPECTED",
     "EVIDENCE_ONLY",
@@ -41,7 +48,8 @@
         "observation": "snap_date + batch capture time",
         "first_availability": "batch registered_at (no per-contract quote time)",
         "ingestion": "capture_started_at/capture_completed_at",
-        "calculation": "options_daily_signals at snap date"
+        "calculation": "options_daily_signals at snap date",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "2026-10-01",
@@ -58,7 +66,14 @@
       "blocked_hypotheses": [
         "D2 historical"
       ],
-      "notes": "30 sessions: diagnostic only until 120"
+      "notes": "30 sessions: diagnostic only until 120",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.raw_series.CBOE:VIX",
@@ -71,7 +86,9 @@
         "observation": "obs_date close",
         "first_availability": "after 16:15 ET close",
         "ingestion": "pull_timestamp",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null,
+        "first_availability_receipt": null
       },
       "coverage": {
         "start": "1990-01-02",
@@ -83,9 +100,16 @@
       "latency": "daily",
       "entitlement": "public",
       "storage_limits": "raw_series",
-      "admission_status": "ADMITTED",
+      "admission_status": "CANDIDATE_UNREVIEWED",
       "blocked_hypotheses": [],
-      "notes": "regime conditioning only"
+      "notes": "regime conditioning only; first availability 'after close' is an assertion, not a checked historical receipt; missingness not measured",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.raw_series.CBOE:VIX9D",
@@ -98,7 +122,9 @@
         "observation": "obs_date close",
         "first_availability": "after close",
         "ingestion": "pull_timestamp",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null,
+        "first_availability_receipt": null
       },
       "coverage": {
         "start": "2011-01-04",
@@ -110,9 +136,16 @@
       "latency": "daily",
       "entitlement": "public",
       "storage_limits": "raw_series",
-      "admission_status": "ADMITTED",
+      "admission_status": "CANDIDATE_UNREVIEWED",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "first availability 'after close' is an assertion, not a checked historical receipt; missingness not measured",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.raw_series.CBOE:VIX3M",
@@ -125,7 +158,9 @@
         "observation": "obs_date close",
         "first_availability": "after close",
         "ingestion": "pull_timestamp",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null,
+        "first_availability_receipt": null
       },
       "coverage": {
         "start": "2009-09-18",
@@ -137,9 +172,16 @@
       "latency": "daily",
       "entitlement": "public",
       "storage_limits": "raw_series",
-      "admission_status": "ADMITTED",
+      "admission_status": "CANDIDATE_UNREVIEWED",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "first availability 'after close' is an assertion, not a checked historical receipt; missingness not measured",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.raw_series.CBOE:SKEW",
@@ -152,7 +194,8 @@
         "observation": "obs_date close",
         "first_availability": "after close",
         "ingestion": "pull_timestamp",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "1990-01-02",
@@ -168,7 +211,14 @@
       "blocked_hypotheses": [
         "SKEW conditioner"
       ],
-      "notes": "gap G11"
+      "notes": "gap G11; entity_map mapping fixed by #1146 (merged 2026-11-12); coverage not re-measured since, so status unchanged",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "live.schwab.chains_quotes_bars",
@@ -181,7 +231,8 @@
         "observation": "provider quoteTime",
         "first_availability": "provider quoteTime",
         "ingestion": "GRID receipt time (vintage)",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "live",
@@ -193,7 +244,14 @@
       "storage_limits": "process-local only, persist_allowed=False",
       "admission_status": "FORWARD_ONLY",
       "blocked_hypotheses": [],
-      "notes": "feeds fly-shadow/1 and bounce-shadow/1"
+      "notes": "feeds fly-shadow/1 and bounce-shadow/1",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.polygon.v3_snapshot_options",
@@ -206,7 +264,8 @@
         "observation": null,
         "first_availability": null,
         "ingestion": null,
-        "calculation": null
+        "calculation": null,
+        "durable_visibility": null
       },
       "coverage": {
         "start": null,
@@ -218,7 +277,14 @@
       "storage_limits": "nothing stored",
       "admission_status": "UNAVAILABLE",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "research.polygon.SPY_1min",
@@ -231,7 +297,8 @@
         "observation": "bar end",
         "first_availability": "bar end + provider delay",
         "ingestion": "fetch_log time",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "2024-11",
@@ -246,7 +313,14 @@
       "blocked_hypotheses": [
         "new intraday rules on this window"
       ],
-      "notes": "see inspected_windows"
+      "notes": "see inspected_windows",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "research.xnas_itch.SPY_1min_and_trades",
@@ -259,7 +333,8 @@
         "observation": "bar/trade time",
         "first_availability": "trade time",
         "ingestion": "fetch_log time",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "2022-11",
@@ -271,7 +346,14 @@
       "storage_limits": "outside GRID custody",
       "admission_status": "INSPECTED",
       "blocked_hypotheses": [],
-      "notes": "edge8 holdout 2022-11..2024-11 unread for edge8 family only"
+      "notes": "edge8 holdout 2022-11..2024-11 unread for edge8 family only",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "research.opra.cbbo_1m.SPY_0dte_near_spot",
@@ -284,7 +366,8 @@
         "observation": "quote in force at minute end",
         "first_availability": "same",
         "ingestion": "fetch_log time",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "2022-11-14",
@@ -299,7 +382,14 @@
       "blocked_hypotheses": [
         "D2-H1 needs pre-2022-11-14 fetch"
       ],
-      "notes": "pre-2022-11-14 untouched (gap G5)"
+      "notes": "pre-2022-11-14 untouched (gap G5); pre-2022-11 is a candidate replication window, to be reconciled against the full inspection ledger before any fetch (G5)",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "research.opra.open_interest_statistics",
@@ -312,7 +402,8 @@
         "observation": "prior close",
         "first_availability": "~06:30 ET",
         "ingestion": "fetch_log",
-        "calculation": "rebuilt books every 2 min"
+        "calculation": "rebuilt books every 2 min",
+        "durable_visibility": null
       },
       "coverage": {
         "start": "2022-11-14",
@@ -325,7 +416,14 @@
       "storage_limits": "outside GRID custody",
       "admission_status": "INSPECTED",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.people_events.form4",
@@ -338,7 +436,8 @@
         "observation": "event_time (transaction)",
         "first_availability": "known_at, basis=filing (date-level; no acceptance time)",
         "ingestion": "ingested_at",
-        "calculation": "materializer run_id"
+        "calculation": "materializer run_id",
+        "durable_visibility": "UNPROVEN (ingested_at = transaction start; revision recorded_at before commit; known_at can tighten later; see G13 and source kit 25f7a982 commit_visibility_unproven)"
       },
       "coverage": {
         "start": "2006-01-04",
@@ -355,7 +454,14 @@
       "blocked_hypotheses": [
         "D1-F3 evaluation (owned by VS1)"
       ],
-      "notes": "gaps G10"
+      "notes": "gaps G10",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.signal_sources.insider",
@@ -368,7 +474,8 @@
         "observation": "signal_date",
         "first_availability": "created_at (ingest proxy)",
         "ingestion": "created_at",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "insider": {
@@ -389,7 +496,14 @@
       "storage_limits": "griddb",
       "admission_status": "EVIDENCE_ONLY",
       "blocked_hypotheses": [],
-      "notes": "edge-report-forward-20261106: NO_EDGE"
+      "notes": "edge-report-forward-20261106: NO_EDGE",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.insider_trades",
@@ -402,7 +516,8 @@
         "observation": "trade_date",
         "first_availability": "filing_date (2,897 of 20,013 rows)",
         "ingestion": "created_at",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "rows": 20013,
@@ -416,7 +531,14 @@
       "storage_limits": "griddb",
       "admission_status": "EXCLUDED_UNKNOWN_AVAILABILITY",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.earnings_events",
@@ -429,7 +551,8 @@
         "observation": "period_end",
         "first_availability": "filing_date (date-only; no acceptance datetime)",
         "ingestion": "created_at",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "8-K": {
@@ -451,7 +574,14 @@
         "D1-F1",
         "D1-F2 history"
       ],
-      "notes": "gap G2: EDGAR acceptance-datetime backfill 2012-2025"
+      "notes": "gap G2: EDGAR acceptance-datetime backfill 2012-2025",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.earnings_calendar",
@@ -464,7 +594,8 @@
         "observation": "earnings_date",
         "first_availability": "none (estimates overwritten, pull_timestamp reset)",
         "ingestion": "pull_timestamp",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "rows": 10508,
@@ -482,7 +613,14 @@
       "blocked_hypotheses": [
         "any earnings family using these dates"
       ],
-      "notes": "gap G7; refusal example"
+      "notes": "gap G7; refusal example",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.business_events",
@@ -495,7 +633,8 @@
         "observation": "article published_at",
         "first_availability": "missing",
         "ingestion": "missing",
-        "calculation": "created_at"
+        "calculation": "created_at",
+        "durable_visibility": null
       },
       "coverage": {
         "rows": 1944,
@@ -509,7 +648,14 @@
       "storage_limits": "griddb",
       "admission_status": "EVIDENCE_ONLY",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.deal_pipeline",
@@ -522,7 +668,8 @@
         "observation": "detected_at (article time or NOW())",
         "first_availability": "missing",
         "ingestion": "missing",
-        "calculation": "updated_at (overwritten)"
+        "calculation": "updated_at (overwritten)",
+        "durable_visibility": null
       },
       "coverage": {
         "rows": 1659,
@@ -536,7 +683,14 @@
       "storage_limits": "griddb",
       "admission_status": "EVIDENCE_ONLY",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.supply_chain_edges",
@@ -549,7 +703,8 @@
         "observation": "as_of = 10-K filing date",
         "first_availability": "latest 10-K only",
         "ingestion": "n/a",
-        "calculation": "n/a"
+        "calculation": "n/a",
+        "durable_visibility": null
       },
       "coverage": {
         "rows": 857,
@@ -565,7 +720,14 @@
       "blocked_hypotheses": [
         "customer-supplier family"
       ],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "grid.causal_links",
@@ -578,7 +740,8 @@
         "observation": "event",
         "first_availability": "known_at + basis",
         "ingestion": "created_at",
-        "calculation": "computed_at"
+        "calculation": "computed_at",
+        "durable_visibility": null
       },
       "coverage": {
         "rows": 2358,
@@ -592,7 +755,14 @@
       "storage_limits": "griddb",
       "admission_status": "FORWARD_ONLY",
       "blocked_hypotheses": [],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "universe.liquid_us_equity_pit",
@@ -605,7 +775,8 @@
         "observation": null,
         "first_availability": null,
         "ingestion": null,
-        "calculation": null
+        "calculation": null,
+        "durable_visibility": null
       },
       "coverage": {
         "start": null,
@@ -619,7 +790,14 @@
       "blocked_hypotheses": [
         "all D1 history"
       ],
-      "notes": "gap G3"
+      "notes": "gap G3",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     },
     {
       "id": "index.additions_deletions",
@@ -632,7 +810,8 @@
         "observation": null,
         "first_availability": null,
         "ingestion": null,
-        "calculation": null
+        "calculation": null,
+        "durable_visibility": null
       },
       "coverage": {
         "start": null,
@@ -646,7 +825,14 @@
       "blocked_hypotheses": [
         "index-flow family"
       ],
-      "notes": ""
+      "notes": "",
+      "receipts": {
+        "query_sha256": null,
+        "snapshot": null,
+        "source_version": null,
+        "receipt_sha256": null,
+        "exclusions": null
+      }
     }
   ],
   "inspected_windows": [
@@ -841,9 +1027,9 @@
       "status": "EVIDENCE_ONLY"
     },
     {
-      "id": "D2-H1",
+      "id": "D2-H1a",
       "track": "D2",
-      "statement": "edge6 14:00/15:00 ATM short iron fly replicates on pre-2022-11-14 M/W/F SPY expiries",
+      "statement": "edge6 replication, 14:00 ET short ATM iron butterfly (cb7b213 rules): entry at bids/asks at quote mark 14:00, cash settlement at the 15:59 close, $0.03/contract/leg; MODELED_BBO_SAME_MARK; T+1-minute fill sensitivity reported",
       "window": {
         "holdout": [
           "2018-01-02",
@@ -851,9 +1037,26 @@
         ]
       },
       "n_floor": 300,
-      "one_sided_level": 0.9833,
+      "one_sided_level": 0.975,
       "look": "one",
-      "status": "BLOCKED: G1,G4,G5"
+      "status": "BLOCKED: G1,G4,G5",
+      "joint_rule": "D2-H1 PASS requires D2-H1a and D2-H1b both PASS; each cell's mean positive in a majority of calendar years"
+    },
+    {
+      "id": "D2-H1b",
+      "track": "D2",
+      "statement": "edge6 replication, 15:00 ET short ATM iron butterfly (cb7b213 rules): entry at bids/asks at quote mark 15:00, cash settlement at the 15:59 close, $0.03/contract/leg; MODELED_BBO_SAME_MARK; T+1-minute fill sensitivity reported",
+      "window": {
+        "holdout": [
+          "2018-01-02",
+          "2022-11-11"
+        ]
+      },
+      "n_floor": 300,
+      "one_sided_level": 0.975,
+      "look": "one",
+      "status": "BLOCKED: G1,G4,G5",
+      "joint_rule": "D2-H1 PASS requires D2-H1a and D2-H1b both PASS; each cell's mean positive in a majority of calendar years"
     },
     {
       "id": "D2-H2",
@@ -865,7 +1068,8 @@
       "n_floor": 100,
       "one_sided_level": 0.95,
       "look": "one at 100 traded sessions",
-      "status": "COLLECTING (0 judged rows on 2026-11-12)"
+      "status": "COLLECTING (0 judged rows on 2026-11-12)",
+      "note": "adopted unchanged; registered test and level not regraded by D0"
     },
     {
       "id": "D2-H3",
@@ -877,13 +1081,15 @@
       "n_floor": 50,
       "one_sided_level": 0.95,
       "look": "one at 50 qualifying sessions",
-      "status": "COLLECTING (0 judged rows on 2026-11-12)"
+      "status": "COLLECTING (0 judged rows on 2026-11-12)",
+      "note": "adopted unchanged; registered test and level not regraded by D0"
     }
   ],
   "gaps": [
     {
       "id": "G1",
-      "text": "RESOLVED 2026-11-12: owner Claude, reviewer Codex (named by the operator); signatures pending"
+      "text": "RESOLVED 2026-11-12: owner Claude, reviewer Codex (named by the operator); signatures pending",
+      "status": "resolved; reviewer first pass received 2026-11-13"
     },
     {
       "id": "G2",
@@ -903,11 +1109,13 @@
     },
     {
       "id": "G6",
-      "text": "event_sequence drops signal_sources events (r[8]) and stamps filings at period_end"
+      "text": "event_sequence dropped signal_sources events (r[8]) and stamped filings at period_end",
+      "status": "#1145 merged 2026-11-12; Codex 8befc05e stricter guards integrated on claude/d0-reader-guards-integrate-20261113 (tests pass locally); PR pending; lead times HOLD until merged"
     },
     {
       "id": "G7",
-      "text": "2,131 earnings_calendar compat stubs read as releases by causal_links"
+      "text": "2,131 earnings_calendar compat stubs read as releases by causal_links",
+      "status": "reader-side hold in 8befc05e integration (three direct causal_links readers only); causation_graph and causal_chains uncovered; no mass rewrite on the date-equality count"
     },
     {
       "id": "G8",
@@ -923,11 +1131,20 @@
     },
     {
       "id": "G11",
-      "text": "CBOE SKEW stale since 2026-03-25"
+      "text": "CBOE SKEW stale since 2026-03-25",
+      "status": "#1146 merged 2026-11-12 (entity_map); coverage re-measure with query receipt pending"
     },
     {
       "id": "G12",
       "text": "forced_flow_monitor ignores holidays; FOMC dates hard-coded for 2026"
+    },
+    {
+      "id": "G13",
+      "text": "no durable exact-version post-commit visibility receipt (clock 4), incl. corrections/retractions",
+      "status": "open; source-only design + disposable-PostgreSQL concurrency plan next"
     }
-  ]
+  ],
+  "revision": 2,
+  "revised_at": "2026-11-13",
+  "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. Enforced by analysis/d0_manifest.py. An input label is never a hypothesis admission."
 }
