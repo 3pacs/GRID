@@ -32,19 +32,33 @@ from typing import Any, Iterable
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA = "r3-nvda-ledger/0"
-LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v0.jsonl")
-SCENARIOS_PATH = Path("docs/research/r3-nvda/scenarios-v0.json")
+LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v1.jsonl")
+SCENARIOS_PATH = Path("docs/research/r3-nvda/scenarios-v1.json")
+#: v0 (frozen 2026-11-13, superseded by v1 after the independent review on #1150)
+#: stays in the repo unchanged as the record of what was frozen first.
+V0_LEDGER_PATH = Path("docs/research/r3-nvda/ledger-v0.jsonl")
 #: Records must have become public strictly before this instant. NVIDIA's
 #: Q3 FY2027 release is scheduled after the 2026-11-17 close (~21:20Z).
 FREEZE_CUTOFF = "2026-11-17T21:00:00+00:00"
-#: sha256 of the canonical ledger bytes, pinned at the freeze (2026-11-13, before
-#: the 2026-11-17 report). Any change to the ledger after this is a new version.
-FROZEN_LEDGER_SHA256: str | None = "484f39994d26e9e2cf4185b686edbf58f79b8ed09258d84f34146b91dab9e23c"
+#: v1 pins: sha256 of the canonical v1 ledger bytes and the build instant. No
+#: record may claim a retrieval after LEDGER_BUILT_AT. Any change after the freeze is v2.
+FROZEN_LEDGER_SHA256: str | None = "fdbe3cb66db6aab3c8ce0969b2891bb5a7b3ecf98f8cf608714ae723426a8e06"
+LEDGER_BUILT_AT: str | None = "2026-11-13T03:06:53Z"
 FROZEN_AT = "2026-11-13"
-#: The other frozen artifacts (raw-byte sha256), checked by the tests.
+#: The other frozen v1 artifacts (raw-byte sha256), checked by the tests.
 FROZEN_FILES: dict[str, str] = {
+    "docs/research/r3-nvda/scenarios-v1.json": "e5564229cb5f1a8d4797f4890aa8699c2129621e50546163e6f7613a89b3ebea",
+    "docs/research/r3-nvda/health-v1.json": "ad7a7b6cd03a2bd315a80562c6a1fafaedc311fcaf2e8b59249c7531bb95a1d0",
+    "docs/research/r3-nvda/synthesis-v1.md": "9b3262acd991cdb5d155c440dc3d6317644a1e686a65a046e15964499abfe4d8",
+    "docs/research/r3-nvda/health-rubric-v0.md": "5e11a86e02cef71a14be3abb403ffe04c35c9011d911e52f74b1b926984c909c",
+}
+#: v0 artifacts (raw-byte sha256). They must never change: they are the record of
+#: the first freeze, superseded by v1 after the review on #1150.
+V0_FROZEN_FILES: dict[str, str] = {
+    "docs/research/r3-nvda/ledger-v0.jsonl": "484f39994d26e9e2cf4185b686edbf58f79b8ed09258d84f34146b91dab9e23c",
     "docs/research/r3-nvda/scenarios-v0.json": "26df5078b631c0ffa8c18befcb14bd4053ecbf66dc8fe5e87f29e82c6b70e2d7",
     "docs/research/r3-nvda/health-v0.json": "35f5e4ffd337c7d4c69e7d518421528816a3b8af133658d2b5d7cd0e12c8bad4",
+    "docs/research/r3-nvda/synthesis-v0.md": "b599c3c05668bd580ee34067b7715ffcca528b4aa91c269e19e6bc7325a7fe06",
     "docs/research/r3-nvda/health-rubric-v0.md": "5e11a86e02cef71a14be3abb403ffe04c35c9011d911e52f74b1b926984c909c",
 }
 
@@ -86,6 +100,10 @@ CIRCULARITY = (
 )
 CONFIDENCE = ("primary_verbatim", "primary_paraphrase", "secondary_only")
 UNITS = ("billions", "millions", "GW", "units", "percent", None)
+#: How binding a counted commitment is (v1). Contingent caps and post-balance-date
+#: events are reported apart from firm and cancellable obligations.
+FIRMNESS = ("firm", "cancellable", "contingent", "post_balance")
+HEX = set("0123456789abcdef")
 #: Bases whose dollars can be NVIDIA's (demand on NVIDIA, or NVIDIA's own
 #: obligations). Whole-project spend and counterparty capex are context only.
 NVIDIA_DOLLAR_BASES = (
@@ -125,10 +143,11 @@ SOURCE_REQUIRED = (
 )
 
 
-def _parse_ts(value: str) -> datetime:
+def _parse_ts(value: str, *, end_of_day: bool = False) -> datetime:
+    """Parse an ISO date or datetime. A date-only value means midnight, or 23:59:59 with ``end_of_day``."""
     text = value.strip()
     if len(text) == 10:
-        text += "T00:00:00+00:00"
+        text += "T23:59:59+00:00" if end_of_day else "T00:00:00+00:00"
     text = text.replace("Z", "+00:00")
     ts = datetime.fromisoformat(text)
     if ts.tzinfo is None:
@@ -164,7 +183,7 @@ def load_ledger(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF) -> list[str]:
+def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF, built_at: str | None = None) -> list[str]:
     rid = r.get("id", "<no id>")
     errs: list[str] = []
     missing = [k for k in REQUIRED if k not in r]
@@ -196,16 +215,40 @@ def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF) -> list[str]
         return errs
     if not isinstance(src["url"], str) or not src["url"].startswith("https://"):
         errs.append(f"{rid}: source.url must be an https URL")
-    try:
-        if not isinstance(src["published_at"], str):
-            raise TypeError("published_at must be a string")
-        if _parse_ts(src["published_at"]) >= _parse_ts(cutoff):
-            errs.append(f"{rid}: published_at {src['published_at']} is not before the freeze cutoff {cutoff}")
-    except (TypeError, ValueError):
-        errs.append(f"{rid}: published_at {src.get('published_at')!r} is not an ISO date/time")
+    secondary_uncounted = r["confidence"] == "secondary_only" and r["counted"] is False
+    pub = src["published_at"]
+    pub_ts = None
+    if pub is None:
+        if not secondary_uncounted:
+            errs.append(f"{rid}: published_at may be null only on an uncounted secondary_only record")
+    else:
+        try:
+            if not isinstance(pub, str):
+                raise TypeError("published_at must be a string")
+            # A date-only publication counts as the end of that day (it could be any time on it).
+            if _parse_ts(pub, end_of_day=True) >= _parse_ts(cutoff):
+                errs.append(f"{rid}: published_at {pub} is not before the freeze cutoff {cutoff}")
+            pub_ts = _parse_ts(pub)
+        except (TypeError, ValueError):
+            errs.append(f"{rid}: published_at {pub!r} is not an ISO date/time")
+    ret = src["retrieved_at"]
+    if ret is None:
+        if not secondary_uncounted:
+            errs.append(f"{rid}: retrieved_at may be null only on an uncounted secondary_only record")
+    else:
+        try:
+            if not isinstance(ret, str):
+                raise TypeError("retrieved_at must be a string")
+            ret_ts = _parse_ts(ret, end_of_day=True)
+            if built_at is not None and _parse_ts(ret) > _parse_ts(built_at):
+                errs.append(f"{rid}: retrieved_at {ret} is after the ledger build time {built_at}")
+            if pub_ts is not None and ret_ts < pub_ts:
+                errs.append(f"{rid}: retrieved_at {ret} is before published_at {pub}")
+        except (TypeError, ValueError):
+            errs.append(f"{rid}: retrieved_at {ret!r} is not an ISO date/time")
     sha = src["retrieved_sha256"]
-    if sha is not None and (not isinstance(sha, str) or len(sha) != 64):
-        errs.append(f"{rid}: retrieved_sha256 must be 64 hex chars or null")
+    if sha is not None and (not isinstance(sha, str) or len(sha) != 64 or not set(sha) <= HEX):
+        errs.append(f"{rid}: retrieved_sha256 must be 64 lowercase hex chars or null")
 
     amt = r["amount"]
     if not isinstance(amt, dict) or not {"value", "currency", "units", "basis"} <= set(amt):
@@ -221,14 +264,23 @@ def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF) -> list[str]
             errs.append(f"{rid}: a primary_verbatim number needs its verbatim quote")
     if r["counted"] and (amt["value"] is None or r["confidence"] == "secondary_only"):
         errs.append(f"{rid}: only a primary record with a value can be counted")
+    if r["counted"] and _finite(amt["value"]) and amt["value"] < 0:
+        errs.append(f"{rid}: a counted commitment cannot be negative")
+    if r["counted"] and r.get("firmness") not in FIRMNESS:
+        errs.append(f"{rid}: a counted record needs firmness in {FIRMNESS}")
+    total_of = r.get("total_of")
+    if total_of is not None and (not isinstance(total_of, list) or not all(isinstance(x, str) for x in total_of)):
+        errs.append(f"{rid}: total_of must be a list of record ids")
     return errs
 
 
-def validate_ledger(records: list[dict[str, Any]], cutoff: str = FREEZE_CUTOFF) -> list[str]:
+def validate_ledger(
+    records: list[dict[str, Any]], cutoff: str = FREEZE_CUTOFF, built_at: str | None = None
+) -> list[str]:
     errs: list[str] = []
     seen: set[str] = set()
     for r in records:
-        errs.extend(validate_record(r, cutoff))
+        errs.extend(validate_record(r, cutoff, built_at))
         rid = r.get("id")
         if rid in seen:
             errs.append(f"{rid}: duplicate id")
@@ -241,6 +293,13 @@ def validate_ledger(records: list[dict[str, Any]], cutoff: str = FREEZE_CUTOFF) 
         counted = [m["id"] for m in members if m.get("counted")]
         if len(counted) > 1:
             errs.append(f"dedup_group {g}: {len(counted)} counted records {counted}; at most one may count")
+    by_id = {r.get("id"): r for r in records}
+    for r in records:
+        for comp in r.get("total_of") or []:
+            if comp not in by_id:
+                errs.append(f"{r.get('id')}: total_of names unknown record {comp}")
+            elif r.get("counted") and by_id[comp].get("counted"):
+                errs.append(f"{r.get('id')}: a total and its component {comp} are both counted")
     return errs
 
 
@@ -258,6 +317,7 @@ def commitment_stack(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Counted commitment dollars by stage x basis (USD bn), plus what was left out and why."""
     stack: dict[str, dict[str, float]] = {}
     by_circ: dict[str, float] = {}
+    by_firm: dict[str, float] = {}
     excluded: list[dict[str, str]] = []
     for r in records:
         if r["record_kind"] != "commitment":
@@ -277,12 +337,18 @@ def commitment_stack(records: list[dict[str, Any]]) -> dict[str, Any]:
         stack[r["stage"]][basis] += bn
         by_circ.setdefault(r["circularity"], 0.0)
         by_circ[r["circularity"]] += bn
+        firm = r.get("firmness") or "unspecified"
+        by_firm.setdefault(firm, 0.0)
+        by_firm[firm] += bn
     circular = sorted(
         r["id"] for r in records if r["record_kind"] == "commitment" and r["circularity"] not in ("none", "unknown")
     )
     return {
         "stack_usd_bn": stack,
         "counted_by_circularity_usd_bn": by_circ,
+        "counted_by_firmness_usd_bn": by_firm,
+        # A sum across firm, cancellable, contingent and post-balance lines has no
+        # single meaning; read it only next to counted_by_firmness_usd_bn.
         "counted_total_usd_bn": sum(by_circ.values()),
         "excluded": excluded,
         "circular_ids": circular,
@@ -417,6 +483,8 @@ def run_scenarios(records: list[dict[str, Any]], spec: dict[str, Any]) -> dict[s
     try:
         basis = spec["basis"]
         price_spec = basis["price"]
+        if "observed" in price_spec:
+            raise ValueError("the price is a dated assumption, never an observed ledger id")
         if not price_spec.get("as_of") or not price_spec.get("source"):
             raise ValueError("the price basis needs 'as_of' and 'source' (a dated, labelled price)")
         price_v = resolve_input(price_spec, idx, units="usd_bn").value
@@ -447,11 +515,11 @@ def run_scenarios(records: list[dict[str, Any]], spec: dict[str, Any]) -> dict[s
     }
     for name, sc in spec["scenarios"].items():
         try:
+            if "observed" in sc["fcf_multiple"]:
+                raise ValueError("fcf_multiple is always an assumption")
             growth = [resolve_input(g, idx, units="percent").value for g in sc["qoq_growth"]]
             fcf_margin = resolve_input(sc["fcf_margin"], idx, units="percent")
             mult = resolve_input(sc["fcf_multiple"], idx, units="percent")
-            if "observed" in sc["fcf_multiple"]:
-                raise ValueError("fcf_multiple is always an assumption")
         except Unavailable as exc:
             out["scenarios"][name] = {"status": "UNAVAILABLE", "why": str(exc)}
             continue
@@ -464,6 +532,13 @@ def run_scenarios(records: list[dict[str, Any]], spec: dict[str, Any]) -> dict[s
             diluted_shares_bn=shares.value,
         )
         res["vs_price_pct"] = (res["value_per_share"] / price_v - 1.0) * 100.0
+        if "reference_fcf_margin" in sc:
+            ref = resolve_input(sc["reference_fcf_margin"], idx, units="percent").value
+            extra = (ref - fcf_margin.value) * res["fwd4q_revenue_bn"]
+            res["reference_fcf_margin"] = ref
+            res["implied_extra_working_capital_bn"] = extra
+            # Extra days of forward revenue tied up if all of it sat in receivables.
+            res["implied_extra_dso_days_if_all_receivables"] = extra / (res["fwd4q_revenue_bn"] / 364.0)
         res["implied_flat_qoq_growth_at_price"] = implied_flat_growth(
             price=price_v,
             base_quarter_revenue_bn=base_rev.value,
@@ -485,7 +560,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cutoff", default=FREEZE_CUTOFF)
     args = ap.parse_args(argv)
     records = load_ledger(args.ledger)
-    errs = validate_ledger(records, args.cutoff)
+    built_at = LEDGER_BUILT_AT if args.ledger.resolve() == (REPO / LEDGER_PATH).resolve() else None
+    errs = validate_ledger(records, args.cutoff, built_at)
     report: dict[str, Any] = {
         "schema": SCHEMA,
         "records": len(records),

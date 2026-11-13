@@ -37,6 +37,7 @@ def rec(**over):
         "circularity": "none",
         "dedup_group": None,
         "counted": True,
+        "firmness": "firm",
         "unknowns": [],
         "confidence": "primary_verbatim",
     }
@@ -82,7 +83,7 @@ def test_good_record_validates():
         ({"amount": {"units": "trillions"}}, "units="),
         ({"source": {"quote": ""}}, "verbatim quote"),
         ({"source": {"url": "http://example.com"}}, "https"),
-        ({"source": {"retrieved_sha256": "abc"}}, "64 hex"),
+        ({"source": {"retrieved_sha256": "abc"}}, "hex"),
         ({"counted": "yes"}, "true/false"),
         ({"confidence": "secondary_only"}, "only a primary record"),
         ({"amount": {"value": None}}, "only a primary record"),
@@ -100,9 +101,9 @@ def test_missing_field_rejected():
 
 
 def test_record_published_after_cutoff_is_lookahead():
-    errs = L.validate_record(rec(source={"published_at": "2026-11-17T21:20:00Z"}))
+    errs = L.validate_record(rec(source={"published_at": "2026-11-17T21:20:00Z", "retrieved_at": "2026-11-17T22:00:00Z"}))
     assert any("freeze cutoff" in e for e in errs)
-    assert L.validate_record(rec(source={"published_at": "2026-11-17T20:59:59Z"})) == []
+    assert L.validate_record(rec(source={"published_at": "2026-11-17T20:59:59Z", "retrieved_at": "2026-11-17T21:00:00Z"})) == []
 
 
 def test_date_only_published_at_is_accepted():
@@ -286,28 +287,103 @@ def test_canonical_hash_is_order_and_key_stable():
     assert L.ledger_sha256([a]) != L.ledger_sha256([rec(id="other")])
 
 
-def test_committed_ledger_validates_and_matches_pin():
+def test_committed_v1_ledger_validates_against_its_build_time_and_pin():
     path = L.REPO / L.LEDGER_PATH
-    if not path.exists():
-        pytest.skip("ledger not committed yet")
     records = L.load_ledger(path)
-    assert L.validate_ledger(records) == []
+    assert L.LEDGER_BUILT_AT is not None
+    assert L.validate_ledger(records, built_at=L.LEDGER_BUILT_AT) == []
     assert path.read_bytes() == L.canonical_bytes(records), "ledger file must be in canonical form"
-    if L.FROZEN_LEDGER_SHA256 is not None:
-        assert L.ledger_sha256(records) == L.FROZEN_LEDGER_SHA256
+    assert L.FROZEN_LEDGER_SHA256 is not None, "R3 v1 is frozen; the ledger pin must stay set"
+    assert L.ledger_sha256(records) == L.FROZEN_LEDGER_SHA256
 
 
-def test_frozen_artifacts_match_their_pins():
-    assert L.FROZEN_LEDGER_SHA256 is not None, "R3 v0 is frozen; the ledger pin must stay set"
-    for rel, want in L.FROZEN_FILES.items():
-        got = hashlib.sha256((L.REPO / rel).read_bytes()).hexdigest()
-        assert got == want, f"{rel} changed after the freeze; publish a new version instead"
+def test_frozen_v1_and_v0_artifacts_match_their_pins():
+    for pins in (L.FROZEN_FILES, L.V0_FROZEN_FILES):
+        assert pins
+        for rel, want in pins.items():
+            got = hashlib.sha256((L.REPO / rel).read_bytes()).hexdigest()
+            assert got == want, f"{rel} changed after its freeze; publish a new version instead"
 
 
-def test_frozen_ledger_has_nothing_after_the_cutoff_and_every_record_reviewed_or_owned():
+def test_v1_stack_split_and_every_record_has_a_review_field():
     records = L.load_ledger(L.REPO / L.LEDGER_PATH)
-    assert len(records) == 450
-    unreviewed = [r["id"] for r in records if "review" not in r]
-    assert unreviewed == ["nvda-8k-20261112-ceo-resignation", "nvda-8k-20261112-ex991-commitments-continue"]
+    assert len(records) == 453
+    assert all("review" in r for r in records)
     stack = L.commitment_stack(records)
     assert stack["counted_total_usd_bn"] == pytest.approx(542.4)
+    assert stack["counted_by_firmness_usd_bn"] == pytest.approx(
+        {"firm": 118.0, "cancellable": 279.0, "contingent": 133.5, "post_balance": 11.9})
+    assert stack["counted_by_circularity_usd_bn"]["capacity_backstop"] == pytest.approx(36.0)
+
+
+def test_v0_ledger_fails_the_v1_build_time_rule():
+    """The reason v1 exists: v0 claims retrievals after its own write time."""
+    v0 = L.load_ledger(L.REPO / L.V0_LEDGER_PATH)
+    errs = L.validate_ledger(v0, built_at="2026-11-13T01:12:40Z")
+    assert any("after the ledger build time" in e for e in errs)
+
+
+# ----------------------------------------------------------------- v1 validator rules
+
+
+def test_date_only_publication_on_cutoff_day_is_lookahead():
+    errs = L.validate_record(rec(source={"published_at": "2026-11-17", "retrieved_at": "2026-11-17T22:00:00Z"}))
+    assert any("freeze cutoff" in e for e in errs)
+    assert L.validate_record(rec(source={"published_at": "2026-11-16", "retrieved_at": "2026-11-16T12:00:00Z"})) == []
+
+
+def test_retrieval_after_build_or_before_publication_is_refused():
+    errs = L.validate_record(rec(source={"retrieved_at": "2026-11-13T04:00:00Z"}), built_at="2026-11-13T03:00:00Z")
+    assert any("after the ledger build time" in e for e in errs)
+    errs = L.validate_record(rec(source={"published_at": "2026-08-27T16:05:00Z", "retrieved_at": "2026-08-01T00:00:00Z"}))
+    assert any("before published_at" in e for e in errs)
+
+
+def test_null_times_only_on_uncounted_secondary_records():
+    sec = rec(confidence="secondary_only", counted=False, amount={"value": None},
+              source={"published_at": None, "retrieved_at": None, "quote": ""})
+    assert L.validate_record(sec) == []
+    prim = rec(source={"published_at": None})
+    assert any("may be null only" in e for e in L.validate_record(prim))
+    prim = rec(source={"retrieved_at": None})
+    assert any("may be null only" in e for e in L.validate_record(prim))
+
+
+def test_hash_must_be_hex_counted_values_non_negative_and_firmness_required():
+    assert any("hex" in e for e in L.validate_record(rec(source={"retrieved_sha256": "z" * 64})))
+    assert any("negative" in e for e in L.validate_record(rec(amount={"value": -1.0})))
+    r = rec()
+    del r["firmness"]
+    assert any("firmness" in e for e in L.validate_record(r))
+    assert any("firmness" in e for e in L.validate_record(rec(firmness="maybe")))
+
+
+def test_total_and_component_cannot_both_count():
+    comp = rec(id="c1")
+    tot = rec(id="t1", total_of=["c1"])
+    errs = L.validate_ledger([comp, tot])
+    assert any("both counted" in e for e in errs)
+    tot["counted"] = False
+    tot.pop("firmness")
+    assert L.validate_ledger([comp, tot]) == []
+    assert any("unknown record" in e for e in L.validate_ledger([rec(id="t2", counted=False, total_of=["nope"])]))
+
+
+def test_price_and_multiple_can_never_be_ledger_ids():
+    records, spec = _scenario_fixture()
+    bad = copy.deepcopy(spec)
+    bad["basis"]["price"] = {"observed": "shares", "as_of": "2026-11-10", "source": "x"}
+    with pytest.raises(ValueError, match="never an observed"):
+        L.run_scenarios(records, bad)
+    bad = copy.deepcopy(spec)
+    bad["scenarios"]["base"]["fcf_multiple"] = {"observed": "fcfm"}
+    with pytest.raises(ValueError, match="always an assumption"):
+        L.run_scenarios(records, bad)
+
+
+def test_sensitivity_prints_implied_working_capital():
+    records, spec = _scenario_fixture()
+    spec["scenarios"]["base"]["reference_fcf_margin"] = {"assumption": 0.55, "why": "x"}
+    out = L.run_scenarios(records, spec)["scenarios"]["base"]
+    assert out["implied_extra_working_capital_bn"] == pytest.approx((0.55 - 0.45) * out["fwd4q_revenue_bn"])
+    assert out["implied_extra_dso_days_if_all_receivables"] == pytest.approx(0.10 * 364.0)
