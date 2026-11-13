@@ -420,3 +420,17 @@ def test_total_must_equal_its_declared_components():
     assert any("!= sum of its components" in e for e in L.validate_ledger([a, b, tot]))
     tot["amount"]["value"] = 15.0
     assert L.validate_ledger([a, b, tot]) == []
+
+
+def test_compact_dates_are_rejected_not_read_as_midnight():
+    errs = L.validate_record(rec(source={"published_at": "20261117"}))
+    assert any("not an ISO date/time" in e for e in errs)
+    errs = L.validate_record(rec(source={"retrieved_at": "20261113"}), built_at="2026-11-13T03:00:00Z")
+    assert any("not an ISO date/time" in e for e in errs)
+
+
+def test_retrieval_time_without_hash_is_refused():
+    r = rec(confidence="secondary_only", counted=False, amount={"value": None},
+            source={"retrieved_sha256": None, "quote": ""})
+    r.pop("firmness")
+    assert any("needs the sha256 of the retrieved bytes" in e for e in L.validate_record(r))

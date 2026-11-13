@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sys
 from typing import Any, Iterable
 
@@ -113,6 +114,7 @@ UNITS = ("billions", "millions", "GW", "units", "percent", None)
 #: "post_balance" is a timing label (agreed after the balance date), kept apart.
 FIRMNESS = ("firm", "partly_cancellable", "contingent", "post_balance")
 HEX = set("0123456789abcdef")
+ISO_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}(T|$)")
 #: Bases whose dollars can be NVIDIA's (demand on NVIDIA, or NVIDIA's own
 #: obligations). Whole-project spend and counterparty capex are context only.
 NVIDIA_DOLLAR_BASES = (
@@ -155,6 +157,8 @@ SOURCE_REQUIRED = (
 def _parse_ts(value: str, *, end_of_day: bool = False) -> datetime:
     """Parse an ISO date or datetime. A date-only value means midnight, or 23:59:59 with ``end_of_day``."""
     text = value.strip()
+    if not ISO_PREFIX.match(text):
+        raise ValueError(f"not an ISO YYYY-MM-DD date/time: {value!r}")
     if len(text) == 10:
         text += "T23:59:59+00:00" if end_of_day else "T00:00:00+00:00"
     text = text.replace("Z", "+00:00")
@@ -256,6 +260,8 @@ def validate_record(r: dict[str, Any], cutoff: str = FREEZE_CUTOFF, built_at: st
         except (TypeError, ValueError):
             errs.append(f"{rid}: retrieved_at {ret!r} is not an ISO date/time")
     sha = src["retrieved_sha256"]
+    if sha is None and ret is not None:
+        errs.append(f"{rid}: a retrieval time needs the sha256 of the retrieved bytes (no bytes kept -> null)")
     if sha is not None and (not isinstance(sha, str) or len(sha) != 64 or not set(sha) <= HEX):
         errs.append(f"{rid}: retrieved_sha256 must be 64 lowercase hex chars or null")
 
