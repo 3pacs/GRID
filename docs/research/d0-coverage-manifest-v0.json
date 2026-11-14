@@ -1,7 +1,7 @@
 {
   "schema": "d0-coverage-manifest/0",
   "contract": "d0-contract-v0",
-  "status": "DRAFT_UNSIGNED",
+  "status": "OWNER_SIGNED_REVIEWER_UNSIGNED",
   "issue": "3pacs/GRID#1129",
   "drafted_at": "2026-11-12",
   "drafted_from_main": "b27a2065",
@@ -9,7 +9,14 @@
     "agent": "Claude",
     "named_by": "operator",
     "named_at": "2026-11-12",
-    "signed": false
+    "signed": true,
+    "signature": {
+      "date": "2026-11-14",
+      "operator_go": "Yes, sign and pin",
+      "after_review": "Codex ACCEPT of 5e7c34aa (draft source-review PASS)",
+      "pinned_in": "analysis/d0_manifest.py D0_CONTRACT_BODY_SHA256",
+      "admits_nothing": true
+    }
   },
   "reviewer": {
     "agent": "Codex",
@@ -24,8 +31,8 @@
       "artifact_sha256_prefix": "86b4f33edd3ece33"
     }
   },
-  "signed_at": null,
-  "contract_body_sha256": null,
+  "signed_at": "2026-11-14",
+  "contract_body_sha256": "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82574e2681285",
   "admission_status_values": [
     "ADMITTED",
     "CANDIDATE_UNREVIEWED",

@@ -1,21 +1,23 @@
-# D0 research contract — event scanner (D1) and SPY volatility lab (D2), v0 DRAFT
+# D0 research contract — event scanner (D1) and SPY volatility lab (D2), v0 (owner-signed 2026-11-14)
 
 <!-- D0-CONTRACT-BODY-BEGIN -->
 
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0`, **revision 6** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3; revision 6 makes historical D1 results diagnostic-only, §10.4) — **DRAFT, unsigned** |
+| Version | `d0-contract-v0`, **revision 6** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3; revision 6 makes historical D1 results diagnostic-only, §10.4) — **signed by the research owner 2026-11-14** (§10.5). The reviewer has not signed the admission manifest, and nothing is admitted |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
-| Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
+| Research owner (signs) | **Claude** (named by the operator 2026-11-12). **Signed 2026-11-14** on the operator's "Yes, sign and pin", after the reviewer accepted revision 6 at `5e7c34aa`. The body hash is pinned as `D0_CONTRACT_BODY_SHA256` in `analysis/d0_manifest.py`, checked by a test |
 | Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2). Re-checks of `88768412` (2026-11-13) and `217d9c91` (2026-11-14): **REQUEST_CHANGES**; revision 5 answers both (§10.3). Re-check of `222e9083` (2026-11-14): **REQUEST_CHANGES** on historical availability only; revision 6 answers it (§10.4). Re-check of `5e7c34aa` (2026-11-14): **ACCEPT**, draft source-review PASS. That is not a signature, admission, holdout access, merge or release |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
 
-**Status of every number in this file: proposed default.** Nothing here is frozen until the research owner
-signs and the body hash is pinned. Changing a threshold after any outcome is read makes this a new version
-with fresh evidence, never a free retry.
+**Status of every number in this file: frozen for `d0-contract-v0`.** The research owner signed this body
+on 2026-11-14 and its hash is pinned, so any edit to the body fails the pin test. A change is a new
+contract version with a new pin, recorded before any outcome is read; after an outcome is read it also
+needs fresh evidence, never a free retry. Signing freezes the rules. It admits nothing: admission still
+needs the reviewer's signature, the G14 verifier and §8 for each hypothesis.
 
 **Not authorised by this document:** provider collection, spend, schema changes, scheduler/timer changes,
 historical repair, merge, deploy, empirical scoring, promotion, brokerage orders. Each keeps its own gate.
@@ -202,7 +204,7 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
 
 ## 5. Track D1 — event-and-relationship scanner, v1
 
-### 5.1 Frozen scope (proposed)
+### 5.1 Frozen scope
 
 - **Universe:** US-listed common stocks whose trailing 60-session median dollar volume is ≥ $20 M, measured
   over the 60 sessions **ending the session before acceptance**. Computed from Tiingo EOD including delisted
@@ -393,7 +395,7 @@ under an append-only table with accession as key. Compute small.
 
 ## 6. Track D2 — SPY volatility lab, v1
 
-### 6.1 Frozen scope (proposed)
+### 6.1 Frozen scope
 
 - **Instrument:** SPY and its listed options only. No SPX, no other underlying.
 - **Calendar:** NYSE regular sessions from `ingestion/market_calendar.py` plus the local corrections already
@@ -591,8 +593,8 @@ with a quoted cap before it starts; no subscription.
 
 Admission happens per hypothesis, never project-wide.
 
-**While this contract is unsigned, no input may carry `ADMITTED`.** The strongest allowed label is
-`CANDIDATE_UNREVIEWED`. An input label is never a hypothesis admission.
+**Until the reviewer has signed the admission manifest and G14 is closed, no input may carry `ADMITTED`.**
+The owner's signature alone admits nothing. The strongest allowed label is `CANDIDATE_UNREVIEWED`. An input label is never a hypothesis admission.
 
 An input may be marked `ADMITTED` only when all of these hold:
 - the contract is signed and the body hash is pinned;
@@ -716,5 +718,15 @@ no outcome was read.
 |---|---|---|
 | Historical `PROXY_EOD_BY_DEADLINE` asserted availability by 20:00 without receipts, against §2 and §8 | The proxy now names a gap and does not fill it. Historical clocks 2–4 stay unknown; no historical late-input exclusion is claimed; every result on the proxy is DIAGNOSTIC_ONLY / NOT_ADMITTED and gets no §5.4 verdict and no admission. A judged historical result needs a qualified price-only exception (new gap G15); until then the D1 holdout stays unopened | §5.1, §5.4, §9 G15 |
 | Implementation items before admission | Recorded as requirements, not built: one named quantile estimator fixed in source and tests before the development data is read; zero or missing volatility → `EXCLUDED_INPUT`; tied breakpoints → HOLD, never invented cutoffs; liquidity = the universe's 60-session median dollar volume | §5.1 |
+
+### 10.5 Owner signature (2026-11-14)
+
+The research owner signed revision 6 after the reviewer's ACCEPT of `5e7c34aa`, on the operator's
+"Yes, sign and pin". At signing, only status wording changed: the title, the version and owner rows, the
+status paragraph, the two "Frozen scope (proposed)" headings and the opening of §8 now say the body is
+owner-signed and admits nothing. No threshold, window, horizon, level, floor or rule changed, and no
+outcome was read. The pinned hash covers the text between the body markers. It is recorded in
+`analysis/d0_manifest.py` (`D0_CONTRACT_BODY_SHA256`) and in the manifest's `contract_body_sha256`, never
+inside the body itself.
 
 <!-- D0-CONTRACT-BODY-END -->

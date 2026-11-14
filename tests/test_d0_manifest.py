@@ -1,4 +1,4 @@
-"""Tests for the D0 manifest validator: ADMITTED is refused without its prerequisites."""
+"""Tests for the D0 manifest checker (every ADMITTED refused) and the owner-signed contract body pin."""
 
 from __future__ import annotations
 
@@ -12,12 +12,62 @@ def _real():
     return json.loads((M.REPO / M.MANIFEST_PATH).read_text(encoding="utf-8"))
 
 
-def test_committed_manifest_is_valid_and_admits_nothing_while_unsigned():
+def test_committed_manifest_is_owner_signed_pinned_and_admits_nothing():
     m = _real()
     assert M.validate(m) == []
-    assert m["signed_at"] is None and m["contract_body_sha256"] is None
+    assert M.contract_pin_errors(m) == []
+    assert m["research_owner"]["signed"] is True and m["signed_at"] == "2026-11-14"
+    assert m["contract_body_sha256"] == M.D0_CONTRACT_BODY_SHA256
+    assert m["reviewer"]["signed"] is False
     assert not any(i["admission_status"] == "ADMITTED" for i in m["inputs"])
     assert not any(h.get("status") == "ADMITTED" for h in m["hypotheses"])
+
+
+def test_contract_body_hash_is_pinned_and_lf_stable():
+    text = (M.REPO / M.CONTRACT_PATH).read_text(encoding="utf-8")
+    assert M.body_sha256(M.contract_body(text)) == M.D0_CONTRACT_BODY_SHA256
+    assert M.body_sha256(M.contract_body(text.replace("\n", "\r\n"))) == M.D0_CONTRACT_BODY_SHA256
+
+
+def _contract_copy(tmp_path, text):
+    (tmp_path / M.CONTRACT_PATH).parent.mkdir(parents=True)
+    (tmp_path / M.CONTRACT_PATH).write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def test_any_body_edit_is_refused(tmp_path):
+    text = (M.REPO / M.CONTRACT_PATH).read_text(encoding="utf-8")
+    edited = text.replace("≥ 200 events in the top quintile", "≥ 150 events in the top quintile", 1)
+    assert edited != text
+    errs = M.contract_pin_errors(_real(), repo_root=_contract_copy(tmp_path, edited))
+    assert any("!= pinned" in e for e in errs)
+
+
+def test_text_outside_the_body_is_not_pinned(tmp_path):
+    text = (M.REPO / M.CONTRACT_PATH).read_text(encoding="utf-8")
+    assert M.contract_pin_errors(_real(), repo_root=_contract_copy(tmp_path, "# retitled\n" + text.split("\n", 1)[1])) == []
+
+
+def test_missing_or_duplicate_markers_are_refused(tmp_path):
+    text = (M.REPO / M.CONTRACT_PATH).read_text(encoding="utf-8")
+    errs = M.contract_pin_errors(_real(), repo_root=_contract_copy(tmp_path, text + "\n" + M.BODY_END + "\n"))
+    assert errs and "unreadable" in errs[0]
+
+
+def test_manifest_signature_fields_must_match_the_pin():
+    m = _real()
+    m["contract_body_sha256"] = "a" * 64
+    assert any("does not equal the pinned" in e for e in M.contract_pin_errors(m))
+    m = _real()
+    m["signed_at"] = "14 Nov 2026"
+    assert any("not a YYYY-MM-DD" in e for e in M.contract_pin_errors(m))
+    m = _real()
+    m["research_owner"]["signed"] = "true"
+    assert any("research_owner.signed is not true" in e for e in M.contract_pin_errors(m))
+    m = _real()
+    m["research_owner"]["signed"] = "true"
+    m["contract_body_sha256"] = "X" * 64
+    assert any("lowercase sha256" in e for e in M.contract_pin_errors(m))
 
 
 def _admitted_input():
@@ -37,8 +87,15 @@ def _signed(m):
     return m
 
 
+def _unsigned(m):
+    m["signed_at"] = None
+    m["contract_body_sha256"] = None
+    m["research_owner"]["signed"] = False
+    return m
+
+
 def test_admitted_while_unsigned_is_refused_with_every_reason():
-    m = _real()
+    m = _unsigned(_real())
     inp = _admitted_input()
     inp["missingness"] = ""
     inp["clocks"] = {"first_availability_receipt": None, "durable_visibility": "UNPROVEN (ingested_at = txn start)"}
