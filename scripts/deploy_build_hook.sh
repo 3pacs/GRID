@@ -41,6 +41,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # checkout).
 bash "${SCRIPT_DIR}/deploy_pin_candidate_sha.sh" "$CANDIDATE_DIR" "$SRC_URL" "$EXPECTED_SHA"
 
+# Keep the strict manifest reader: normalize only hash-verified candidate files.
+# Before dependencies/migrations and activation; never operates on the live alias.
+python3 "${SCRIPT_DIR}/prepare_factory_calendars.py" "$CANDIDATE_DIR"
+
 cd "$CANDIDATE_DIR"
 
 pip install -r requirements.txt
