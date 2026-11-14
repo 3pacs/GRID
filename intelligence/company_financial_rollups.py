@@ -231,7 +231,7 @@ _TTM_UPSERT_SQL_TEXT = """
                              COALESCE(NULLIF(counterparty_id, ''), '__none__'),
                              source_filing, confidence
             )) AS fp
-        FROM capital_flows
+        FROM capital_flows_current
         WHERE period_type = 'quarter'
           AND amount_usd IS NOT NULL
         GROUP BY actor_id
@@ -242,11 +242,15 @@ _TTM_UPSERT_SQL_TEXT = """
     -- left) join would silently miss one side.
     changed_actors AS (
         SELECT
-            COALESCE(c.actor_id, s.actor_id) AS actor_id,
-            c.fp AS new_fingerprint
+            COALESCE(c.actor_id, s.actor_id, h.actor_id) AS actor_id,
+            c.fp AS new_fingerprint,
+            h.snapshot_id AS new_sec_snapshot_id
         FROM current_fp c
         FULL OUTER JOIN capital_flows_ttm_state s ON s.actor_id = c.actor_id
+        FULL OUTER JOIN sec_financial_snapshot_heads h
+          ON h.actor_id = COALESCE(c.actor_id, s.actor_id)
         WHERE c.fp IS DISTINCT FROM s.quarter_fingerprint
+           OR h.snapshot_id IS DISTINCT FROM s.sec_snapshot_id
     ),
     -- Dedup base quarterly rows by natural key. The base table can
     -- have multiple source_filing variants for the same logical
@@ -290,7 +294,7 @@ _TTM_UPSERT_SQL_TEXT = """
                     as_of DESC NULLS LAST,
                     id DESC
             ) AS rk
-        FROM capital_flows
+        FROM capital_flows_current
         WHERE period_type = 'quarter'
           AND amount_usd IS NOT NULL
           -- Still needs each changed actor's FULL quarterly history (not
@@ -371,11 +375,12 @@ _TTM_UPSERT_SQL_TEXT = """
     -- future re-insertion is still detected as a change from NULL, and a
     -- repeat with no rows stays stable (NULL IS NOT DISTINCT FROM NULL).
     state_upsert AS (
-        INSERT INTO capital_flows_ttm_state (actor_id, quarter_fingerprint, computed_at)
-        SELECT actor_id, new_fingerprint, NOW()
+        INSERT INTO capital_flows_ttm_state (actor_id, quarter_fingerprint, computed_at, sec_snapshot_id)
+        SELECT actor_id, new_fingerprint, NOW(), new_sec_snapshot_id
         FROM changed_actors
         ON CONFLICT (actor_id) DO UPDATE SET
             quarter_fingerprint = EXCLUDED.quarter_fingerprint,
+            sec_snapshot_id = EXCLUDED.sec_snapshot_id,
             computed_at = EXCLUDED.computed_at
         RETURNING actor_id
     )
@@ -543,7 +548,7 @@ _ROLL_UPSERT_SQL = text(
             MAX(NULLIF(counterparty_id, '')) AS counterparty_id,
             MAX(currency) AS currency,
             SUM(amount_usd) AS amount_usd
-        FROM capital_flows
+        FROM capital_flows_current
         WHERE period_type = 'announcement'
           AND amount_usd IS NOT NULL
           AND fiscal_period IS NOT NULL

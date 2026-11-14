@@ -95,7 +95,7 @@ _DEALS_SQL = text(
         actor_id                   AS acquirer_ticker,
         counterparty_id            AS target_ticker,
         MAX(amount_usd)            AS deal_size_usd
-    FROM capital_flows
+    FROM capital_flows_current
     WHERE period_type = 'announcement'
       AND flow_type   = 'acquisitions'
       AND counterparty_id IS NOT NULL

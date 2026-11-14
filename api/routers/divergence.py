@@ -20,6 +20,7 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
+from utils.financial_cache import FinancialCacheUnavailable, get_cached_financial
 
 router = APIRouter(prefix="/api/v1", tags=["divergence"])
 
@@ -53,11 +54,10 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     }
 
 
-@router.get("/divergence/{classification}")
-def list_divergence(
+def _read_divergence_list(
     classification: str,
     limit: int = Query(20, ge=1, le=200),
-    _token: str = Depends(require_auth),
+    engine: Any = None,
 ) -> dict[str, Any]:
     """Return the top-N rows of one classification, newest snapshot,
     ranked by absolute divergence (largest first)."""
@@ -70,15 +70,9 @@ def list_divergence(
             ),
         )
 
-    cache_key = f"list|{classification}|{limit}"
-    cached = _CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    engine = get_db_engine()
     try:
         with engine.connect() as conn:
-            if not _table_exists(conn, "public.fundamental_divergence"):
+            if not _table_exists(conn, "public.fundamental_divergence_current"):
                 payload = {
                     "classification": classification,
                     "rows": [],
@@ -89,7 +83,6 @@ def list_divergence(
                         "reason": "table_missing",
                     },
                 }
-                _CACHE.set(cache_key, payload)
                 return payload
 
             rows = conn.execute(
@@ -97,10 +90,10 @@ def list_divergence(
                     """
                     SELECT ticker, as_of, sector, fundamental_score,
                            price_score, divergence, classification, narrative
-                    FROM fundamental_divergence
+                    FROM fundamental_divergence_current
                     WHERE classification = :c
                       AND as_of = (
-                        SELECT MAX(as_of) FROM fundamental_divergence
+                        SELECT MAX(as_of) FROM fundamental_divergence_current
                       )
                     ORDER BY ABS(divergence) DESC
                     LIMIT :lim
@@ -126,28 +119,20 @@ def list_divergence(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
     }
-    _CACHE.set(cache_key, payload)
     return payload
 
 
-@router.get("/actors/{actor_id}/divergence")
-def get_actor_divergence(
+def _read_actor_divergence(
     actor_id: str,
-    _token: str = Depends(require_auth),
+    engine: Any = None,
 ) -> dict[str, Any]:
     """Return the latest divergence row for one ticker/actor."""
-    cache_key = f"actor|{actor_id}"
-    cached = _CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     # Case-insensitive lookup — seed stores lowercase, map uses upper.
     variants = list({actor_id, actor_id.upper(), actor_id.lower()})
 
-    engine = get_db_engine()
     try:
         with engine.connect() as conn:
-            if not _table_exists(conn, "public.fundamental_divergence"):
+            if not _table_exists(conn, "public.fundamental_divergence_current"):
                 raise HTTPException(
                     status_code=404,
                     detail="fundamental_divergence table not available",
@@ -157,7 +142,7 @@ def get_actor_divergence(
                     """
                     SELECT ticker, as_of, sector, fundamental_score,
                            price_score, divergence, classification, narrative
-                    FROM fundamental_divergence
+                    FROM fundamental_divergence_current
                     WHERE ticker = ANY(:ids)
                     ORDER BY as_of DESC
                     LIMIT 1
@@ -188,5 +173,29 @@ def get_actor_divergence(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
     }
-    _CACHE.set(cache_key, payload)
     return payload
+
+
+
+@router.get("/divergence/{classification}")
+def list_divergence(classification: str, limit: int = Query(20, ge=1, le=200),
+                    _token: str = Depends(require_auth)) -> dict[str, Any]:
+    if classification not in _VALID_CLASSIFICATIONS:
+        raise HTTPException(status_code=400, detail=f"Invalid classification {classification!r}")
+    engine = get_db_engine()
+    try:
+        return get_cached_financial(_CACHE, f"list|{classification}|{limit}", engine,
+            lambda: _read_divergence_list(classification, limit, engine),
+            cache_if=lambda result: result.get('provenance', {}).get('source') == 'db')
+    except FinancialCacheUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Current financial source unavailable") from exc
+
+
+@router.get("/actors/{actor_id}/divergence")
+def get_actor_divergence(actor_id: str, _token: str = Depends(require_auth)) -> dict[str, Any]:
+    engine = get_db_engine()
+    try:
+        return get_cached_financial(_CACHE, f"actor|{actor_id}", engine,
+            lambda: _read_actor_divergence(actor_id, engine))
+    except FinancialCacheUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Current financial source unavailable") from exc

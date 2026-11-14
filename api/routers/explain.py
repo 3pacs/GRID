@@ -389,7 +389,7 @@ def _collect_announcements(conn: Any, actor_id: str, start: date, end: date) -> 
                 text(
                     "SELECT id, fiscal_period, flow_type, direction, "
                     "       amount_usd, source_filing, counterparty_id "
-                    "FROM capital_flows "
+                    "FROM capital_flows_current "
                     "WHERE actor_id = :a "
                     "  AND period_type = 'announcement' "
                     "  AND fiscal_period BETWEEN :s AND :e "

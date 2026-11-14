@@ -358,10 +358,13 @@ def _card_inputs():
     return opp, v
 
 
-def test_card_states_the_exact_call(monkeypatch):
-    # Rendered two days after the idea date: against the real clock the card
-    # adds "STALE at rendering" once 2026-11-03 is MAX_SIGNAL_AGE_DAYS old.
-    monkeypatch.setattr(hx, "_utc_today", lambda: date(2026, 11, 5))
+@pytest.mark.parametrize("rendered_day, stale_note", [
+    (3, ""),
+    (8, "; STALE at rendering (5d old)"),
+])
+def test_card_states_the_exact_call(monkeypatch, rendered_day, stale_note):
+    # Pin main's clock seam while retaining both fresh and stale regressions.
+    monkeypatch.setattr(hx, "_utc_today", lambda: date(2026, 11, rendered_day))
     opp, v = _card_inputs()
     card = hx._format_opportunity_card(opp, v, 1)
     plain = hx._plain(card["body"])
@@ -376,7 +379,9 @@ def test_card_states_the_exact_call(monkeypatch):
     assert "exit if OMER trades above $20.39" in plain
     assert "earnings 2026-11-12 (earnings_calendar) FQ 3" in plain
     assert "OTM-put/ATM IV skew 0.73" in plain
-    assert "options_daily_signals row 2026-11-03 (0d old at idea date), captured 2026-11-03 15:00Z" in plain
+    assert ("options_daily_signals row 2026-11-03 (0d old at idea date)"
+            f"{stale_note}, captured 2026-11-03 15:00Z") in plain
+    assert ("STALE at rendering" in plain) == bool(stale_note)
     assert "SUSPECT: IV <b>high</b>" in plain          # escaped in HTML ...
     assert "<b>high</b>" not in card["body"]            # ... not injected
     # The fictional payoff multiple is gone.

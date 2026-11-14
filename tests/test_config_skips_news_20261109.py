@@ -18,6 +18,7 @@ No network: every HTTP call is mocked.
 from __future__ import annotations
 
 from datetime import date
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,6 +38,7 @@ class _Resp:
     def __init__(self, status: int, body=None, text: str = "") -> None:
         self.status_code = status
         self._body = body
+        self.content = json.dumps(body).encode("utf-8") if body is not None else b""
         self.text = text
 
     def json(self):

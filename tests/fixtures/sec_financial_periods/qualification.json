@@ -1,0 +1,54 @@
+{
+  "nvda": {
+    "simple_mapping_context_counts_before_deduplication": {
+      "admitted_contexts": 1473,
+      "rejected_contexts": 675
+    },
+    "rejected_context_duration_days": {
+      "182": 331,
+      "183": 9,
+      "185": 9,
+      "273": 326
+    },
+    "all_flow_output_rows": 587,
+    "output_period_types": {
+      "annual": 171,
+      "quarter": 416
+    }
+  },
+  "aapl": {
+    "simple_mapping_context_counts_before_deduplication": {
+      "admitted_contexts": 1620,
+      "rejected_contexts": 818
+    },
+    "rejected_context_duration_days": {
+      "91": 25,
+      "98": 1,
+      "182": 296,
+      "189": 63,
+      "273": 311,
+      "280": 63,
+      "364": 40,
+      "371": 19
+    },
+    "all_flow_output_rows": 599,
+    "output_period_types": {
+      "annual": 195,
+      "quarter": 404
+    }
+  },
+  "tsm": {
+    "simple_mapping_context_counts_before_deduplication": {
+      "admitted_contexts": 107,
+      "rejected_contexts": 10
+    },
+    "rejected_context_duration_days": {
+      "181": 8,
+      "182": 2
+    },
+    "all_flow_output_rows": 64,
+    "output_period_types": {
+      "annual": 64
+    }
+  }
+}

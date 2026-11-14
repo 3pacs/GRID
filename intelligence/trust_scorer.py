@@ -2269,7 +2269,7 @@ class TrustScorer:
                         "SELECT actor_id, counterparty_id, flow_type, direction, "
                         "       amount_usd, source_filing, confidence, as_of, "
                         "       fiscal_period, period_type "
-                        "FROM capital_flows "
+                        "FROM capital_flows_current "
                         "WHERE (actor_id = ANY(:keys) OR counterparty_id = ANY(:keys)) "
                         "  AND (source_filing LIKE '10-%' OR source_filing LIKE '20-%') "
                         "  AND as_of >= :lb "
