@@ -30,6 +30,26 @@ Public API
     resolve_entity(engine, name) -> str | None
     shock_spec_for(pattern_name) -> tuple[str, float] | None
 
+Reading headlines correctly (3pacs/GRID#1178)
+----------------------------------------------
+A 2026-11-13 dry scan of 30 days resolved 6 shocks, and 3 were misreads:
+"gold" resolved to Goldman Sachs by a name-prefix match, "oil plunges" became
+a price *increase*, and a question headline was taken as an event. So:
+
+* commodity verbs carry a direction. A rise (surges, soars, ...) is a
+  ``price_increase``; a fall (plunges, crashes, ...) has no supported shock
+  type in ``chain_contagion`` and is skipped as ``price_fall_unsupported``,
+  never mapped to the opposite direction;
+* a commodity shock resolves only to the commodity's own node id (exact
+  match), never through the company name resolver;
+* company name prefixes match only at a word boundary ("Gold" never matches
+  "Goldman Sachs");
+* question, hedged and hypothetical headlines never trigger;
+* every skip is counted by reason in ``run_once``'s report;
+* every persisted prediction records what the stop rule in #1177 scores:
+  the direction its downstream calls imply (``down``: margin hits) and the
+  triggering article's publication time.
+
 The module is PURE LIBRARY — no CLI code here. Use
 ``scripts/run_news_contagion_listener.py`` as the thin entrypoint.
 """
@@ -187,9 +207,17 @@ _SKIP_PATTERNS: tuple[tuple[str, str], ...] = (
     ("m_and_a", r"agrees to acquire|takeover bid|to break up"),
     # CEO departures — too diffuse
     ("ceo_departure", r"step down|resigns|ousted"),
+    # Questions, hedges and hypotheticals are not events (#1178)
+    ("question", r"\?\s*$"),
+    # ("may" is left out: it is also the month)
+    ("hedged", (r"\b(could|might|would|weighs|weighing|considers|considering|"
+                r"possible|potential|rumou?rs?|fears?|risk of|threatens?|warns of)\b")),
 )
 
-_SPIKE_VERBS = r"(surges|plunges|soars|spikes|crashes|rockets|collapses)"
+_RISE_VERBS = ("surges", "soars", "spikes", "rockets", "jumps", "rallies", "climbs")
+_FALL_VERBS = ("plunges", "crashes", "collapses", "slides", "tumbles", "sinks", "drops", "falls")
+_SPIKE_VERBS = rf"({'|'.join(_RISE_VERBS + _FALL_VERBS)})"
+SCORE_DIRECTION = "down"  # every simulated impact is a margin hit (#1177 stop rule)
 
 
 @dataclass(frozen=True)
@@ -205,6 +233,7 @@ class Candidate:
     raw_entity: str  # the text span matched by the pattern
     resolved_node: str | None = None
     reason: str = ""  # populated when skipped
+    published_at: str | None = None  # the triggering article's time (ISO)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -217,6 +246,7 @@ class Candidate:
             "raw_entity": self.raw_entity,
             "resolved_node": self.resolved_node,
             "reason": self.reason,
+            "published_at": self.published_at,
         }
 
 
@@ -254,17 +284,23 @@ def detect_patterns(title: str) -> list[tuple[str, str, str, float]]:
     for every pattern that matches ``title``.
 
     Commodity spike detection is layered on top. Skip-list patterns
-    (M&A, CEO departures) suppress everything else — they mean "this is
-    out of scope for the listener" so we don't want an entity scan to
-    accidentally still fire a supply disruption.
+    (M&A, CEO departures, questions, hedges) suppress everything else — they
+    mean "this is out of scope for the listener" so we don't want an entity
+    scan to accidentally still fire a supply disruption.
+    """
+    return classify_title(title)[0]
+
+
+def classify_title(title: str) -> tuple[list[tuple[str, str, str, float]], list[str]]:
+    """``(hits, skip reasons)`` for one headline; see :func:`detect_patterns`.
+
+    A skip reason is reported only when the headline would otherwise have
+    fired, so the counts say what the guards actually stopped.
     """
     if not title:
-        return []
+        return [], []
 
-    # Kill-list first — if any skip pattern hits, drop the article entirely.
-    for _name, rx in _SKIP_COMPILED:
-        if rx.search(title):
-            return []
+    skipped: list[str] = []
 
     hits: list[tuple[str, str, str, float]] = []
     for name, rx, stype, mag in COMPILED_PATTERNS:
@@ -280,14 +316,22 @@ def detect_patterns(title: str) -> list[tuple[str, str, str, float]]:
             continue
         hits.append((name, entity, stype, mag))
 
-    # Commodity spike detection.
+    # Commodity spike detection: rises only (a fall has no shock type).
     cm = _COMMODITY_SPIKE_RE.search(title)
     if cm:
         raw = cm.group(1).lower().strip()
         node = _COMMODITY_ALIAS.get(raw, raw.replace(" ", "_"))
-        hits.append(("commodity_spike", node, "price_increase", 0.20))
+        if cm.group(2).lower() in _FALL_VERBS:
+            skipped.append("price_fall_unsupported")
+        else:
+            hits.append(("commodity_spike", node, "price_increase", 0.20))
 
-    return hits
+    # Kill-list: any skip pattern drops the whole article (and is counted
+    # only when something would have fired).
+    for name, rx in _SKIP_COMPILED:
+        if rx.search(title):
+            return [], [name] if hits else []
+    return hits, skipped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,9 +406,9 @@ def resolve_entity(conn: Any, name: str) -> str | None:
     if norm in index:
         return index[norm]
 
-    # Prefix match in sector_map (e.g. "TSMC Arizona" -> "tsmc")
+    # Prefix match in sector_map at a word boundary (e.g. "TSMC Arizona" -> "tsmc")
     for key, ticker in index.items():
-        if norm.startswith(key) and len(key) >= 3:
+        if len(key) >= 3 and norm.startswith(key + " "):
             return ticker
 
     # Supply chain nodes — name match first, then id match.
@@ -379,7 +423,8 @@ def resolve_entity(conn: Any, name: str) -> str | None:
                 LIMIT 1
                 """
             ),
-            {"n": norm, "prefix": f"{norm}%"},
+            # word boundary: "gold" never matches "goldman sachs" (#1178)
+            {"n": norm, "prefix": f"{norm} %"},
         ).fetchone()
         if row and row[0]:
             return str(row[0]).lower()
@@ -399,6 +444,23 @@ def resolve_entity(conn: Any, name: str) -> str | None:
         pass
 
     return None
+
+
+def resolve_commodity(conn: Any, node: str) -> str | None:
+    """A commodity shock's node: the exact ``supply_chain_nodes.id`` or None.
+
+    Never goes through :func:`resolve_entity`, so a commodity can never
+    resolve to a company (#1178). Never raises.
+    """
+    try:
+        row = conn.execute(
+            text("SELECT id FROM supply_chain_nodes WHERE id = :nid LIMIT 1"),
+            {"nid": node},
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - never raises, like every lookup here
+        log.debug("news_contagion: commodity lookup failed: {e}", e=str(exc))
+        return None
+    return str(row[0]).lower() if row and row[0] else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,11 +495,14 @@ def _fetch_recent_news(
 
 
 def scan_news(
-    engine: Engine, since_hours: int = 24, limit: int = 500
+    engine: Engine, since_hours: int = 24, limit: int = 500,
+    skipped: dict[str, int] | None = None,
 ) -> list[Candidate]:
     """Scan recent news and return every resolved/unresolved candidate.
 
-    Never raises. DB errors return an empty list.
+    ``skipped``: when given, filled with skip-reason counts (questions,
+    hedges, M&A, price falls, ...). Never raises. DB errors return an
+    empty list.
     """
     if since_hours <= 0 or limit <= 0:
         return []
@@ -446,9 +511,17 @@ def scan_news(
     try:
         with engine.connect() as conn:
             news = _fetch_recent_news(conn, since_hours, limit)
-            for news_id, title, url, _ts in news:
-                for pattern, raw_entity, stype, mag in detect_patterns(title):
-                    resolved = resolve_entity(conn, raw_entity)
+            for news_id, title, url, ts in news:
+                hits, reasons = classify_title(title)
+                if skipped is not None:
+                    for reason in reasons:
+                        skipped[reason] = skipped.get(reason, 0) + 1
+                for pattern, raw_entity, stype, mag in hits:
+                    resolved = (
+                        resolve_commodity(conn, raw_entity)
+                        if pattern == "commodity_spike"
+                        else resolve_entity(conn, raw_entity)
+                    )
                     candidate = Candidate(
                         news_id=news_id,
                         url=url,
@@ -459,6 +532,7 @@ def scan_news(
                         raw_entity=raw_entity,
                         resolved_node=resolved,
                         reason="" if resolved else "unresolved",
+                        published_at=ts.isoformat() if hasattr(ts, "isoformat") else None,
                     )
                     out.append(candidate)
     except Exception as exc:
@@ -502,7 +576,13 @@ def _persist(
     result: dict[str, Any],
 ) -> int | None:
     """Insert a contagion prediction row. Returns new id or None on failure."""
-    summary = result.get("summary") or {}
+    summary = {
+        **(result.get("summary") or {}),
+        # what the #1177 stop rule scores (v4 crowd rank, from the trigger)
+        "score_direction": SCORE_DIRECTION,
+        "trigger_published_at": candidate.published_at,
+        "trigger_pattern": candidate.pattern,
+    }
     ranked = result.get("ranked_impact") or []
     try:
         with engine.begin() as conn:
@@ -569,7 +649,8 @@ def run_once(
         }
     """
     started = datetime.now(timezone.utc)
-    candidates = scan_news(engine, since_hours=since_hours, limit=limit)
+    skipped_by_reason: dict[str, int] = {}
+    candidates = scan_news(engine, since_hours=since_hours, limit=limit, skipped=skipped_by_reason)
 
     by_pattern: dict[str, int] = {}
     predictions: list[dict[str, Any]] = []
@@ -681,6 +762,7 @@ def run_once(
         "skipped_duplicate": skipped_dup,
         "errors": errors,
         "by_pattern": by_pattern,
+        "skipped_by_reason": skipped_by_reason,
         "predictions": predictions[:50],
         "unresolved_samples": unresolved_samples,
         "dry_run": bool(dry_run),

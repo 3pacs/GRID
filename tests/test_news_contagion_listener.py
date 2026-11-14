@@ -105,7 +105,7 @@ def test_detect_commodity_spike():
 
 
 def test_detect_oil_alias():
-    hits = detect_patterns("Oil plunges 8% after OPEC surprise")
+    hits = detect_patterns("Oil surges 8% after OPEC surprise")
     spike = next(h for h in hits if h[0] == "commodity_spike")
     assert spike[1] == "oil_crude"
 
@@ -361,3 +361,121 @@ def test_candidate_is_frozen_and_serializable():
     d = c.as_dict()
     assert d["news_id"] == 1
     assert d["resolved_node"] == "acme"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Reading headlines correctly (3pacs/GRID#1178): the 2026-11-13 misreads
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("verb", ["plunges", "crashes", "collapses", "slides", "tumbles", "sinks", "drops", "falls"])
+def test_a_commodity_fall_is_never_a_price_increase(verb):
+    hits, skipped = ncl.classify_title(f"Oil {verb} after US midterms")
+    assert not [h for h in hits if h[0] == "commodity_spike"]
+    assert skipped == ["price_fall_unsupported"]
+
+
+def test_misread_oil_plunges_headline():
+    hits, skipped = ncl.classify_title("Asian Chip Stocks Slide, Oil Plunges After US Midterms")
+    assert hits == [] and skipped == ["price_fall_unsupported"]
+
+
+@pytest.mark.parametrize("verb", ["surges", "soars", "spikes", "rockets", "jumps", "rallies", "climbs"])
+def test_a_commodity_rise_is_a_price_increase(verb):
+    hits = detect_patterns(f"Copper {verb} on smelter outage")
+    assert ("commodity_spike", "copper", "price_increase", 0.20) in hits
+
+
+@pytest.mark.parametrize("title, reason", [
+    ("Oracle Calls Force Majeure Already?", "question"),
+    ("Acme weighs whether it files for bankruptcy", "hedged"),
+    ("Strike at Ford plant could last weeks", "hedged"),
+    ("Copper supply fears grow as Chile mine halts production", "hedged"),
+])
+def test_questions_and_hedges_never_trigger(title, reason):
+    assert detect_patterns(title.replace("?", "").replace(" could", "").replace("weighs whether it ", "")
+                           .replace(" fears grow as", "")), "control: without the hedge it fires"
+    hits, skipped = ncl.classify_title(title)
+    assert hits == [] and skipped == [reason]
+
+
+def test_a_question_that_would_never_fire_is_not_counted():
+    assert ncl.classify_title("Is the Fed done hiking?") == ([], [])
+
+
+def test_may_the_month_is_not_a_hedge():
+    hits = detect_patterns("Copper surges in May on smelter outage")
+    assert ("commodity_spike", "copper", "price_increase", 0.20) in hits
+
+
+@pytest.mark.parametrize("title, pattern", [
+    ("Acme files for bankruptcy", "bankruptcy"),
+    ("fire at Samsung plant disrupts memory output", "fire_at"),
+    ("Corn Soars After USDA Cuts American Yield in Another Surprise", "commodity_spike"),
+])
+def test_controls_still_trigger(title, pattern):
+    assert any(h[0] == pattern for h in detect_patterns(title))
+
+
+def _sector_map(monkeypatch, actors):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "analysis.sector_map", SimpleNamespace(SECTOR_MAP={
+        "Financials": {"subsectors": {"Banks": {"actors": actors}}}}))
+
+
+def test_gold_never_resolves_to_goldman(monkeypatch):
+    _sector_map(monkeypatch, [{"name": "Goldman Sachs", "ticker": "GS"}])
+    conn = MagicMock()
+    conn.execute.return_value.fetchone.return_value = None
+    assert resolve_entity(conn, "Gold") is None
+    params = [c.args[1] for c in conn.execute.call_args_list if len(c.args) > 1]
+    assert {"n": "gold", "prefix": "gold %"} in params  # word-boundary prefix only
+
+
+def test_word_boundary_prefix_still_resolves(monkeypatch):
+    _sector_map(monkeypatch, [{"name": "TSMC", "ticker": "TSM"}])
+    assert resolve_entity(MagicMock(), "TSMC Arizona") == "tsm"
+
+
+def test_commodity_shock_resolves_only_to_its_own_node(monkeypatch):
+    _sector_map(monkeypatch, [{"name": "Goldman Sachs", "ticker": "GS"}])
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = [
+        (7, "Gold Surges as Dollar, Yields Fall", "http://n/7", None),
+    ]
+    conn.execute.return_value.fetchone.return_value = None  # no 'gold' node in the graph
+    out = ncl.scan_news(_fake_engine(conn), since_hours=24, limit=10)
+    assert [(c.pattern, c.raw_entity, c.resolved_node, c.reason) for c in out] == [
+        ("commodity_spike", "gold", None, "unresolved")]
+    ids = [c.args[1] for c in conn.execute.call_args_list if len(c.args) > 1 and "nid" in c.args[1]]
+    assert ids == [{"nid": "gold"}]
+
+
+def test_run_once_reports_skips_by_reason(monkeypatch):
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = [
+        (1, "Oracle Calls Force Majeure Already?", "u1", None),
+        (2, "Oil plunges after OPEC surprise", "u2", None),
+        (3, "Microsoft agrees to acquire Activision", "u3", None),
+    ]
+    report = run_once(_fake_engine(conn), since_hours=24, dry_run=True)
+    # the M&A headline would not have fired, so it is not counted
+    assert report["skipped_by_reason"] == {"question": 1, "price_fall_unsupported": 1}
+    assert report["fired"] == 0
+
+
+def test_persist_records_what_the_stop_rule_scores():
+    conn = MagicMock()
+    conn.execute.return_value.fetchone.return_value = (42,)
+    cand = Candidate(news_id=9, url="u", title="Acme files for bankruptcy", pattern="bankruptcy",
+                     shock_type="supply_disruption", magnitude=0.7, raw_entity="Acme",
+                     resolved_node="acme", published_at="2026-11-13T14:00:00+00:00")
+    assert ncl._persist(_fake_engine(conn), cand, {"summary": {"total_actors_affected": 3}}) == 42
+    import json as _json
+
+    summary = _json.loads(conn.execute.call_args.args[1]["summary"])
+    assert summary["score_direction"] == "down"
+    assert summary["trigger_published_at"] == "2026-11-13T14:00:00+00:00"
+    assert summary["trigger_pattern"] == "bankruptcy"
+    assert summary["total_actors_affected"] == 3
