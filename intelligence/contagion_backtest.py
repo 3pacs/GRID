@@ -475,7 +475,6 @@ def score_predictions(
             sim_at = sim_at.replace(tzinfo=timezone.utc)
         horizon = sim_at + timedelta(days=as_of_days_ago)
 
-        node_types: dict[str, str] = {}
         try:
             from intelligence.supply_chain_symbols import load_node_types
 
@@ -483,8 +482,10 @@ def score_predictions(
                 node_types = load_node_types(
                     conn, (e.get("id") for e in pred.ranked_impact or [] if isinstance(e, dict))
                 )
-        except Exception as exc:  # noqa: BLE001 - scoring falls back to symbol_for without types
-            log.debug("contagion_backtest: node types unavailable: {e}", e=str(exc))
+        except Exception as exc:  # noqa: BLE001 - fail closed: no types, no scores for this prediction
+            log.warning("contagion_backtest: node types unavailable, prediction {p} not scored: {e}",
+                        p=pred.id, e=str(exc))
+            continue
         impact_tickers = _iter_impact_tickers(pred.ranked_impact, node_types=node_types)
         if not impact_tickers:
             continue

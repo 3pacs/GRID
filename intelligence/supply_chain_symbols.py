@@ -16,8 +16,11 @@ CORN fund. :func:`symbol_for` is the one rule every consumer uses instead:
 4. an id with a foreign exchange suffix (``005930.ks``, ``2317.tw``), or a
    foreign company whose slug looks like a US symbol (:data:`FOREIGN_SLUGS`:
    ``lindt``, ``lonza``), is untradable: no US listing is scored;
-5. otherwise the upper-cased id is the symbol if it looks like a US symbol
-   (1-5 letters, optional class suffix such as ``BF-B``); else untradable.
+5. otherwise, only for a node typed ``ticker``, the upper-cased id is the
+   symbol if it looks like a US symbol (1-5 letters, optional class suffix
+   such as ``BF-B``). A node whose type is unknown (``node_type`` None: no
+   ``supply_chain_nodes`` row) is untradable, "type unknown": ``corn`` alone
+   would otherwise be scored as the CORN fund.
 
 Callers still treat a symbol without a price series as untestable; this map
 only stops non-symbols from being scored as symbols. Pure except
@@ -104,7 +107,7 @@ _US_SYMBOL = re.compile(r"^[A-Z]{1,5}(-[A-Z])?$")
 class Tradable:
     node_id: str
     symbol: str | None
-    reason: str  # "type:<t>", "alias", "id", "delisted: ...", "foreign listing", "not a US symbol"
+    reason: str  # "type:<t>", "type unknown", "alias", "id", "delisted: ...", "foreign listing", "not a US symbol"
 
 
 def symbol_for(node_id: str, node_type: str | None = None) -> Tradable:
@@ -123,6 +126,8 @@ def symbol_for(node_id: str, node_type: str | None = None) -> Tradable:
         return Tradable(nid, None, "foreign listing")
     if key in UNKNOWN_LISTING:
         return Tradable(nid, None, "no listing found")
+    if node_type != "ticker":
+        return Tradable(nid, None, "type unknown" if node_type is None else f"type:{node_type}")
     symbol = nid.upper()
     if not _US_SYMBOL.match(symbol):
         return Tradable(nid, None, "not a US symbol")
@@ -130,15 +135,16 @@ def symbol_for(node_id: str, node_type: str | None = None) -> Tradable:
 
 
 def load_node_types(conn: Any, ids: Iterable[str]) -> dict[str, str]:
-    """``{lower(id): type}`` for the given node ids (read-only; {} on error)."""
+    """``{lower(id): type}`` for the given node ids (one read-only query).
+
+    A database error propagates: a caller that cannot read the types must not
+    score, because :func:`symbol_for` without a type fails closed only per id.
+    """
     wanted = sorted({str(i).strip() for i in ids if i})
     if not wanted:
         return {}
-    try:
-        rows = conn.execute(
-            text("SELECT id, type FROM supply_chain_nodes WHERE LOWER(id) = ANY(:ids)"),
-            {"ids": [w.lower() for w in wanted]},
-        ).fetchall()
-    except Exception:  # noqa: BLE001 - callers fall back to symbol_for without types
-        return {}
+    rows = conn.execute(
+        text("SELECT id, type FROM supply_chain_nodes WHERE LOWER(id) = ANY(:ids)"),
+        {"ids": [w.lower() for w in wanted]},
+    ).fetchall()
     return {str(r[0]).lower(): str(r[1]) for r in rows}

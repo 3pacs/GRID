@@ -65,6 +65,7 @@ from sqlalchemy.engine import Engine
 from intelligence.cross_lens import (
     compute_log_returns,
     fetch_close_series,
+    UNTYPED,
     resolve_price_series_id,
 )
 
@@ -103,6 +104,10 @@ class EdgeRow:
     relationship_weak: bool
     relationship: str = ""
     pct_downstream_cogs: float | None = None
+    # supply_chain_nodes.type from list_edges; None = no node row (fail closed);
+    # UNTYPED = built without a type lookup (resolver treats the id as a ticker)
+    upstream_type: Any = UNTYPED
+    downstream_type: Any = UNTYPED
 
 
 @dataclass(frozen=True)
@@ -141,10 +146,14 @@ def list_edges(engine: Engine, limit: int | None = None) -> list[EdgeRow]:
     """
     sql = text(
         """
-        SELECT id, upstream_id, downstream_id, weak_since,
-               relationship_weak, relationship, pct_downstream_cogs
-        FROM supply_chain_edges
-        ORDER BY id ASC
+        SELECT e.id, e.upstream_id, e.downstream_id, e.weak_since,
+               e.relationship_weak, e.relationship, e.pct_downstream_cogs,
+               (SELECT n.type FROM supply_chain_nodes n
+                 WHERE LOWER(n.id) = LOWER(e.upstream_id) ORDER BY n.id LIMIT 1),
+               (SELECT n.type FROM supply_chain_nodes n
+                 WHERE LOWER(n.id) = LOWER(e.downstream_id) ORDER BY n.id LIMIT 1)
+        FROM supply_chain_edges e
+        ORDER BY e.id ASC
         """
         + (" LIMIT :lim" if limit else "")
     )
@@ -164,6 +173,8 @@ def list_edges(engine: Engine, limit: int | None = None) -> list[EdgeRow]:
             pct_downstream_cogs=(
                 float(r[6]) if r[6] is not None else None
             ),
+            upstream_type=r[7],
+            downstream_type=r[8],
         )
         for r in rows
     ]
@@ -177,6 +188,8 @@ def compute_edge_correlation(
     upstream_id: str,
     downstream_id: str,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    upstream_type: Any = UNTYPED,
+    downstream_type: Any = UNTYPED,
 ) -> tuple[float | None, int, str]:
     """Return ``(corr, n_obs, detail)`` for a single edge.
 
@@ -193,10 +206,10 @@ def compute_edge_correlation(
       not trying to detect lead/lag; it only wants the answer to "do these
       two things actually move together over 180d?".
     """
-    up_sid = resolve_price_series_id(upstream_id)
+    up_sid = resolve_price_series_id(upstream_id, upstream_type)
     if up_sid is None:
         return None, 0, "no_upstream_series"
-    down_sid = resolve_price_series_id(downstream_id)
+    down_sid = resolve_price_series_id(downstream_id, downstream_type)
     if down_sid is None:
         return None, 0, "no_downstream_series"
 
@@ -371,7 +384,8 @@ def validate_edge(
     """Validate a single edge and (on success) persist the new state."""
     try:
         corr, n_obs, detail = compute_edge_correlation(
-            engine, edge.upstream_id, edge.downstream_id, lookback_days
+            engine, edge.upstream_id, edge.downstream_id, lookback_days,
+            upstream_type=edge.upstream_type, downstream_type=edge.downstream_type,
         )
     except Exception as exc:
         log.warning(
