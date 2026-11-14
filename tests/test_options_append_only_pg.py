@@ -202,6 +202,9 @@ def _capture(engine: Engine, monkeypatch, started: datetime, oi: dict[float, int
              source: str = "options_puller") -> dict:
     """Run the real writer once, with the capture clock pinned to ``started``."""
     _run(engine, "upgrade", "migrations.versions.options_spot_clock_20261110")
+    # Current writer requires its additive clock schema; historical migration
+    # and downgrade-only tests still exercise their original schema.
+    _run(engine, "upgrade", "migrations.versions.options_contract_clocks_20261114")
     completed = started + timedelta(minutes=2)
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -243,6 +246,9 @@ def test_real_capture_registration_clock_qualifies_exact_spot_receipt(scratch, m
     assert (engine.url.database or "").endswith("_test")
     _run(engine, "upgrade")
     _run(engine, "upgrade", "migrations.versions.options_spot_clock_20261110")
+    # Current writer requires its additive clock schema; historical migration
+    # and downgrade-only tests still exercise their original schema.
+    _run(engine, "upgrade", "migrations.versions.options_contract_clocks_20261114")
     now = datetime.now(timezone.utc)
     local = now.astimezone(policy._NY)
     real_session = (market_calendar.is_market_open(local.date())
