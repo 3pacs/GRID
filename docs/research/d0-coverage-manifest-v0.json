@@ -1022,7 +1022,7 @@
     {
       "id": "D1-F1",
       "track": "D1",
-      "statement": "8-K Item 2.02 earnings releases: top-quintile ranked events beat declare-all, sector-relative, +5 and +20 sessions",
+      "statement": "8-K Item 2.02 earnings releases: top-quintile ranked events beat declare-all, sector-relative, +5 and +20 sessions; prices observed by the actual day-0 close O, decision at deadline D = 20:00 ET, late C0 = EXCLUDED_LATE_INPUT (contract section 5.1)",
       "window": {
         "dev": [
           "2012-01-01",
@@ -1036,12 +1036,12 @@
       "n_floor": 200,
       "one_sided_level": 0.9875,
       "look": "one per horizon",
-      "status": "BLOCKED: G1,G2,G3"
+      "status": "BLOCKED: G14,G2,G3"
     },
     {
       "id": "D1-F2",
       "track": "D1",
-      "statement": "8-K Items 1.01/2.01/1.02 deal events: same test",
+      "statement": "8-K Items 1.01/2.01/1.02 deal events: same test; one event per accession (an 8-K with Item 2.02 is F1 only); strength = scaled day-0 move as F1; ties per section 5.1",
       "window": {
         "dev": [
           "2012-01-01",
@@ -1055,7 +1055,7 @@
       "n_floor": 200,
       "one_sided_level": 0.9875,
       "look": "one per horizon",
-      "status": "BLOCKED: G1,G2,G3"
+      "status": "BLOCKED: G14,G2,G3"
     },
     {
       "id": "D1-F3",
@@ -1070,7 +1070,7 @@
     {
       "id": "D2-H1a",
       "track": "D2",
-      "statement": "edge6 replication, 14:00 ET short ATM iron butterfly (cb7b213 rules): entry at bids/asks at quote mark 14:00, cash settlement at the 15:59 close, $0.03/contract/leg; MODELED_BBO_SAME_MARK; T+1-minute fill sensitivity reported",
+      "statement": "edge6 replication, 14:00 ET short ATM iron butterfly (cb7b213 rules): entry at bids/asks at quote mark 14:00, exit = synthetic intrinsic-payoff proxy at the 15:59 1-minute close (not settlement; no exercise/assignment/after-hours claim), fee $0.0003/share/leg = $0.03/contract at multiplier 100, four entry legs only (edge6 cb7b213 / vrp_edge6.py FEE); MODELED_BBO_SAME_MARK; T+1-minute fill sensitivity reported",
       "window": {
         "holdout": [
           "2018-01-02",
@@ -1080,13 +1080,13 @@
       "n_floor": 300,
       "one_sided_level": 0.975,
       "look": "one",
-      "status": "BLOCKED: G1,G4,G5",
+      "status": "BLOCKED: G14,G4,G5",
       "joint_rule": "D2-H1 PASS requires D2-H1a and D2-H1b both PASS; each cell's mean positive in a majority of calendar years"
     },
     {
       "id": "D2-H1b",
       "track": "D2",
-      "statement": "edge6 replication, 15:00 ET short ATM iron butterfly (cb7b213 rules): entry at bids/asks at quote mark 15:00, cash settlement at the 15:59 close, $0.03/contract/leg; MODELED_BBO_SAME_MARK; T+1-minute fill sensitivity reported",
+      "statement": "edge6 replication, 15:00 ET short ATM iron butterfly (cb7b213 rules): entry at bids/asks at quote mark 15:00, exit = synthetic intrinsic-payoff proxy at the 15:59 1-minute close (not settlement; no exercise/assignment/after-hours claim), fee $0.0003/share/leg = $0.03/contract at multiplier 100, four entry legs only (edge6 cb7b213 / vrp_edge6.py FEE); MODELED_BBO_SAME_MARK; T+1-minute fill sensitivity reported",
       "window": {
         "holdout": [
           "2018-01-02",
@@ -1096,7 +1096,7 @@
       "n_floor": 300,
       "one_sided_level": 0.975,
       "look": "one",
-      "status": "BLOCKED: G1,G4,G5",
+      "status": "BLOCKED: G14,G4,G5",
       "joint_rule": "D2-H1 PASS requires D2-H1a and D2-H1b both PASS; each cell's mean positive in a majority of calendar years"
     },
     {
@@ -1183,9 +1183,14 @@
       "id": "G13",
       "text": "no durable exact-version post-commit visibility receipt (clock 4), incl. corrections/retractions",
       "status": "open; source-only design + disposable-PostgreSQL concurrency plan next"
+    },
+    {
+      "id": "G14",
+      "text": "no authenticated admission verifier; the provisional checker (cf879835) refuses every ADMITTED",
+      "status": "open; owner Claude, reviewer Codex; source and synthetic tests only"
     }
   ],
-  "revision": 4,
-  "revised_at": "2026-11-13",
+  "revision": 5,
+  "revised_at": "2026-11-14",
   "admission_rule": "ADMITTED requires: contract signed and body hash pinned, reviewer signed, measured missingness, a first-availability receipt (not an assertion), durable visibility not UNPROVEN where clock 4 applies, and a file or query receipt. analysis/d0_manifest.py currently checks draft labels only and refuses all ADMITTED labels until an authenticated admission verifier exists. An input label is never a hypothesis admission."
 }

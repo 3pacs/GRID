@@ -5,10 +5,10 @@
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0`, **revision 4** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2) — **DRAFT, unsigned** |
+| Version | `d0-contract-v0`, **revision 5** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3) — **DRAFT, unsigned** |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
 | Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
-| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2) |
+| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2). Re-checks of `88768412` (2026-11-13) and `217d9c91` (2026-11-14): **REQUEST_CHANGES**; revision 5 answers both (§10.3) |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
@@ -93,7 +93,8 @@ An input enters a decision only if all six are known; otherwise it is `EXCLUDED_
 5. **Calculation time.** When the derived value was computed.
 6. **Decision cutoff.** The instant the research rule acts. It must be ≥ clocks 2, 3 and 4 for every input,
    plus the registered order latency. Only prices **observed at or before** the cutoff may set direction,
-   eligibility or ranking.
+   eligibility or ranking. A track may fix an earlier price-observation cutoff than its decision time; D1
+   does (§5.1: prices observed by the day-0 close O, decision at the later deadline D).
 
 ### 2.2 Outcome clocks are separate
 
@@ -217,15 +218,32 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
 
   Not in v1: customer-supplier links (no change history), index additions/deletions (no source),
   OPEX/FOMC forced flows (calendar defects; SPY flows are D2's), headline-only deal news.
-- **Clocks (one decision cutoff per event; daily data only in v1).**
+- **Clocks (one price-observation cutoff O and one decision deadline D per event; daily data only in v1).**
   - **Acceptance A:** the EDGAR acceptance datetime. This is the SEC-public proxy (§2.1).
-  - **Day 0:** the first regular session whose 16:00 ET close is **strictly after A + 5 minutes**. So a
-    pre-open or intraday acceptance before 15:55 ET falls on that day; a later or after-close acceptance falls
-    on the next session.
+  - **Session closes are the actual ones.** Every close below is the session's actual regular close from
+    `ingestion/market_calendar.py` plus the #1100 corrections: 16:00 ET, or 13:00 ET on an NYSE early close.
+    16:00 is never assumed.
+  - **Day 0:** the first regular session whose actual close is **strictly after A + 5 minutes**. So an
+    acceptance more than 5 minutes before that day's close (before 15:55 ET, or 12:55 ET on an early close)
+    falls on that day; a later or after-close acceptance falls on the next session.
   - **Reference price P₋₁:** the last regular-session close **before** A.
-  - **Decision cutoff D:** the day-0 close. Direction, eligibility and ranking use only prices observed at
-    or before D: P₋₁ and the day-0 close C₀.
-  - **Entry:** the open auction of day +1, as an order placed after D.
+  - **Price-observation cutoff O:** the actual close of day 0. Direction, eligibility and ranking use only
+    prices **observed** at or before O: P₋₁ and the day-0 close C₀.
+  - **Operational decision deadline D:** 20:00 ET on the calendar day of day 0, which is later than O.
+    The decision is made at D, never at O. 20:00 is a fixed margin chosen before any data is read, not a
+    measured publication time. Every input, C₀ included, must be available by D under §2.1 (clocks 2, 3
+    and 4 at or before D):
+    - **Forward period:** C₀'s retrieval time and durable-visibility receipt must both be at or before D.
+    - **Historical windows:** GRID did not retrieve these closes at the time. C₀'s availability by D is the
+      named proxy `PROXY_EOD_BY_DEADLINE`: the official close is disseminated after the closing auction,
+      and vendor end-of-day files are published the same evening. This is an assumption, not a receipt,
+      and every historical D1 result carries the label.
+    - **Late or missing C₀:** an event whose C₀ is not available by D is `EXCLUDED_LATE_INPUT` and counted
+      (§7 rule 4). It is skipped, never deferred to a later session, and C₀ is never backdated to D.
+  - **Order latency (registered):** the entry is a market-on-open order for day +1, submitted no earlier
+    than D + 15 minutes and before the listing exchange's opening-auction order cutoff. An event whose
+    order cannot meet that cutoff is `EXCLUDED_LATE_INPUT`.
+  - **Entry:** the open auction of day +1, the first regular session after day 0.
 
   The entry open is an outcome-clock observation (§2.2). It never decides its own fill. The day-0 move
   (C₀ / P₋₁ − 1) is recorded on the card as "already moved" and is never claimed.
@@ -238,11 +256,20 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
   dates shifted by ±60 sessions; (c) shuffled-relationship control for any card using a link.
 - **Ranking rule (frozen before D3):**
   - Order: data quality tier, then event strength, then liquidity. No composite probability.
-  - **Event strength:** item type. For F1 it is |C₀ / P₋₁ − 1| divided by the issuer's 60-session close-to-close
-    volatility ending at P₋₁.
+  - **Event strength (F1 and F2):** |C₀ / P₋₁ − 1| divided by the issuer's 60-session close-to-close
+    volatility ending at P₋₁. Item type does not set F2's strength: three item types cannot form five
+    reproducible quintiles. F2's item set is recorded on every card and reported per quintile.
+  - **One event per accession.** An 8-K that carries Item 2.02 is an F1 event only, whatever else it
+    reports. Otherwise an 8-K carrying any of Items 1.01, 2.01 or 1.02 is one F2 event, with its item set
+    recorded.
   - **Ranking bucket:** a quintile is not formed across events whose cutoffs fall later. Each event is placed
-    in a quintile by fixed strength breakpoints, computed on the development window only and frozen before
-    the holdout opens. So an event's bucket is known at its own cutoff D. "Priced-in" is shown as unknown when there is no PIT consensus or option-implied move,
+    in a quintile by four fixed strength breakpoints b₁ < b₂ < b₃ < b₄, computed per family on the
+    development window only and frozen before the holdout opens. So an event's bucket is known at its own
+    deadline D.
+  - **Ties:** an event's quintile is 1 + the number of breakpoints at or below its strength, so a strength
+    equal to a breakpoint goes to the higher quintile. Within a bucket, any ordering ties are broken by
+    liquidity (higher first), then by accession number ascending.
+  - **"Priced-in"** is shown as unknown when there is no PIT consensus or option-implied move,
   which is the default in v1 (`earnings_calendar` estimates are not PIT).
 
 ### 5.2 Windows (fixed before the EDGAR fetch)
@@ -274,7 +301,7 @@ No D1 family above has been tested on these windows by any ledger in §4 (VS1 co
     the VS1 Stage-0 gate.
 - **Economic:** top-quintile mean net excess ≥ 0.5 % at +5 or ≥ 1 % at +20; capacity reported at 1 % of
   median dollar volume.
-- **Operational, inputs:** each event needs all of the following at its decision cutoff D:
+- **Operational, inputs:** each event needs all of the following, observed by O and available by D:
   - an acceptance datetime;
   - a CIK that resolves to one security valid at A;
   - P₋₁ and C₀;
@@ -292,9 +319,22 @@ No D1 family above has been tested on these windows by any ledger in §4 (VS1 co
 
 ### 5.4 GO / HOLD / RETIRE
 
-- **GO** for a family: both horizons pass, or one passes and the other has a positive point estimate.
-- **HOLD:** UNDERPOWERED, exclusions > 10 %, or the EDGAR/universe gaps (G2, G3) are unresolved.
-- **RETIRE:** both horizons fail. A changed family is a new registration on the forward period only.
+Each horizon cell gets one verdict:
+- **UNDERPOWERED:** below its sample floor, or STOP_UNDERPOWERED.
+- **PASS:** it meets its floor and its statistical threshold (§5.3).
+- **FAIL:** it meets its floor but not its statistical threshold.
+
+A family's verdict is the first of these rules that applies, in this order:
+1. **HOLD:** the EDGAR/universe gaps (G2, G3) are unresolved, or exclusions exceed 10 % in either cell.
+2. **HOLD:** either cell is UNDERPOWERED. This takes precedence over any point estimate: PASS +
+   UNDERPOWERED is HOLD, and so is FAIL + UNDERPOWERED.
+3. **RETIRE:** both cells FAIL.
+4. **GO:** both cells PASS, or one PASSes and the FAIL cell's point estimate is > 0. Either way the §5.3
+   economic threshold must also be met; otherwise the verdict is HOLD (below the economic threshold).
+5. **HOLD (horizons disagree):** one PASSes and the FAIL cell's point estimate is ≤ 0.
+
+A HOLD from rule 2, 4 or 5 is never converted to GO by more calendar time on the same windows. A changed
+family is a new registration on the forward period only.
 
 ### 5.5 Budget
 
@@ -312,12 +352,16 @@ under an append-only table with accession as key. Compute small.
   `reported = TRUE`), refused as `EXCLUDED_UNKNOWN_AVAILABILITY`.
   - "2,131 rows" is the author's measurement from 2026-11-12. Date equality alone does not prove every
     matching row is a stub, so no row is deleted, rewritten or quarantined on that count.
-- **Leakage fixture (synthetic, no outcomes):** three filings, all with outcomes left `PENDING`:
+- **Leakage fixture (synthetic, no outcomes):** five filings, all with outcomes left `PENDING`:
   - pre-open, accepted 07:00 ET;
   - intraday, accepted 11:30 ET;
   - after-close, accepted 16:30 ET.
 
-  The test mutates every price **after** each event's day-0 close and asserts that direction, eligibility,
+  - early close: accepted 12:58 ET on an NYSE early-close day, so day 0 is the next session;
+  - delayed C₀ (forward case): C₀ becomes visible at D + 1 minute, so the event is `EXCLUDED_LATE_INPUT`,
+    not decided at a later time.
+
+  The test mutates every price observed **after** each event's O and asserts that direction, eligibility,
   strength and quintile are unchanged. It also mutates C₀ and asserts that they do change.
 
 ---
@@ -351,16 +395,16 @@ under an append-only table with accession as key. Compute small.
 
 | ID | Hypothesis and exact estimand | Data | Window | Look |
 |---|---|---|---|---|
-| D2-H1a / D2-H1b | edge6 replication at **14:00** (H1a) and **15:00** (H1b) ET, two separate cells. Short ATM iron butterfly exactly as edge6 (registered cb7b213), with K = the strike nearest spot that has both a call and a put quote. **Entry:** sell the K call and K put at their bids and buy the K+5 call and K−5 put at their asks, at the quote mark T (§6.3); spot = the close of the 1-minute bar ending at T. **Exit: cash settlement at the 15:59 close S** (edge6 formula); no early exit. Fees $0.03 per contract per leg. Net in dollars per share; risk per trade = 5 − credit. | OPRA cbbo-1m plus SPY 1-minute bars, not yet fetched | Monday/Wednesday/Friday SPY expiry days 2018-01-02 .. 2022-11-11. The exact start, contract list and strike/target scope are fixed in a fetch manifest **before** the fetch | one look per cell after the fetch manifest is hashed |
+| D2-H1a / D2-H1b | edge6 replication at **14:00** (H1a) and **15:00** (H1b) ET, two separate cells. Short ATM iron butterfly exactly as edge6 (registered cb7b213), with K = the strike nearest spot that has both a call and a put quote. **Entry:** sell the K call and K put at their bids and buy the K+5 call and K−5 put at their asks, at the quote mark T (§6.3); spot = the close of the 1-minute bar ending at T. **Exit: a synthetic intrinsic-payoff proxy, not settlement.** Each leg is valued at its intrinsic value at S, the close of SPY's 15:59 1-minute bar (the edge6 formula, `vrp_edge6.py` at 35fa182); no early exit. SPY options are American-style and physically settled, so this proxy makes no claim about exercise, assignment, after-hours moves or the official expiry value. **Fees, bound to edge6:** $0.0003 per share per leg, which is $0.03 per contract at the 100-share multiplier, charged on the four entry legs only and never at the proxy exit (edge6 protocol cb7b213: "Fees 0.0003 per share per leg"; code `FEE = 0.0003`, net = credit − payoff − 4 × FEE). Net in dollars per share; risk per trade = 5 − credit, per share. | OPRA cbbo-1m plus SPY 1-minute bars, not yet fetched | Monday/Wednesday/Friday SPY expiry days 2018-01-02 .. 2022-11-11. The exact start, contract list and strike/target scope are fixed in a fetch manifest **before** the fetch | one look per cell after the fetch manifest is hashed |
 | D2-H2 | fly-shadow/1 forward: the 15:00 fly **exited at 15:55** (shorts bought back at the ask, wings sold at the bid) | live Schwab chain, ledger `fly_days` | forward from 2026-11-12 | one look at 100 traded sessions. Registered fe8318a; adopted **unchanged**, including its own test and level |
 | D2-H3 | bounce-shadow/1 forward: long SPY 15:29 → 15:59 after a negative-gamma late-day bounce | live dte0 regime plus bars | forward from 2026-11-12 | one look at 50 qualifying sessions. Registered f8b3874; adopted unchanged. **Not independent of history:** chosen after edge7 P3 (short the same bounce, −0.391, n 83) was read |
 
 **The estimands differ:**
-- **D2-H1** is settlement-graded and historical.
+- **D2-H1** is graded on the synthetic payoff proxy and is historical.
 - **D2-H2** exits at 15:55 and runs forward.
 
 A D2-H1 pass does not show that the 15:55 exit earns the same, and a D2-H2 pass does not replicate the
-settlement result. The only comparison D0 makes is the GO rule in §6.5, frozen here before either look.
+proxy result. The only comparison D0 makes is the GO rule in §6.5, frozen here before either look.
 
 **Pre-2022 window, before fetching (G5):**
 - **Reconcile the full inspection ledger.** This covers GEX edge1–edge8, #647, VS1, #1065 and the daily-SPY
@@ -394,7 +438,7 @@ intraday rule on 2022-11 .. 2026-11.
   - Spot and quotes share the mark, so each fill is labelled **MODELED_BBO_SAME_MARK**.
   - A conservative sensitivity, reported and not judged, fills at the quote in force at T + 1 minute.
 - **D2-H2:** keeps fe8318a's registered fills.
-- **Fees:** $0.03 per contract per side. No mid fills in any judged result.
+- **Fees:** D2-H1 uses the edge6 fee in §6.2: $0.0003 per share per leg, entry legs only. D2-H2 keeps fe8318a's registered fees and units. No mid fills in any judged result.
 - **Labels.** Every option result is labelled **MODELED_BBO**, not observed execution; D2-H2's
   Schwab-quote-graded fills are modelled too. A quote snapshot within two minutes with positive bids is
   **not** proof that the trade could be executed.
@@ -404,9 +448,9 @@ intraday rule on 2022-11 .. 2026-11.
 - Shares: $0.04 per share round trip (D2-H3), plus a 6 bp round-trip sensitivity (`evals/e2` `e2-costs-v1`).
 - **Gap:** no options cost class exists in `evals/e2/cost_model.json`. D2 must add `us_equity_option_0dte`
   to the cost model (versioned) before D3 can score through E2.
-- **D2-H1 is judged on settlement** (§6.2).
-- **For the live-exit hypothesis (D2-H2),** the settlement-graded result is reported but never judged.
-- **Pin risk** is reported for every fly cell, as the share of entries settling within $0.25 of a short
+- **D2-H1 is judged on the synthetic payoff proxy** (§6.2). No D2-H1 result is a claim about exercise, assignment or after-hours outcomes.
+- **For the live-exit hypothesis (D2-H2),** the proxy-graded result is reported but never judged.
+- **Pin risk** is reported for every fly cell, as the share of entries whose proxy mark S is within $0.25 of a short
   strike.
 
 ### 6.4 Success thresholds (fixed before any outcome)
@@ -459,6 +503,10 @@ Otherwise the session is `EXCLUDED_INPUT` and counted. D2-H2 keeps fe8318a's own
     registered separately, without touching fe8318a.
 - **HOLD:** either is UNDERPOWERED, or operational exclusions exceed 10 %, or D2-H1 cannot be fetched
   (spend not approved). Calendar time alone never converts HOLD to GO.
+- **Precedence (fixed before either look):** RETIRE first, then HOLD, then GO. A FAIL in any judged cell
+  (H1a, H1b or H2) is RETIRE even when another cell is UNDERPOWERED, because a FAIL is evidence against
+  the structure and an UNDERPOWERED cell is not evidence for it. Without a FAIL, any UNDERPOWERED cell or
+  other HOLD cause gives HOLD.
 - **RETIRE:** D2-H1 FAIL **or** D2-H2 FAIL. D2-H1 FAIL means either H1 cell FAILs; an UNDERPOWERED cell gives HOLD, not FAIL. A retired structure returns only
   as a new registration on new data.
 - D2-H3 decides only its own GO/RETIRE; it cannot rescue or sink the fly.
@@ -529,7 +577,11 @@ An input may be marked `ADMITTED` only when all of these hold:
 - it has a durable-visibility status other than `UNPROVEN`, where clock 4 applies;
 - it has a file or query receipt.
 
-`analysis/d0_manifest.py` refuses any other `ADMITTED`, and its test runs in CI.
+`analysis/d0_manifest.py` is a **provisional label checker, not an admission authority** (Codex's
+cf879835, integrated in revision 5). Until an authenticated admission verifier exists (G14), it refuses
+**every** `ADMITTED` label, input or hypothesis, even one whose listed prerequisites look complete. Its
+prerequisite checks are diagnostics only. Its test runs in CI. So signing this contract cannot admit
+anything until G14 is closed.
 
 A hypothesis is admitted when every input it uses is `ADMITTED` and coverage meets its sample floor.
 
@@ -573,15 +625,16 @@ Gaps block only the hypotheses named in the gap list below.
 | G11 | ~~CBOE SKEW stale since 2026-03-25~~ coverage closed 2026-11-13 | — (SKEW is now `CANDIDATE_UNREVIEWED`, like VIX) | — | #1146 (`entity_map`), #1148 (resolver series filter) and #1149 (obs-date floor) merged and deployed. A scoped backfill wrote 7,696 rows; `skew_index` resolves through 2026-11-11 with 0 conflicting values and 0 vintages before their obs date (receipts in `docs/research/d0-receipts/`). First availability and clock 4 stay open, as for every Cboe input |
 | G12 | `forced_flow_monitor` ignores holidays; FOMC dates hard-coded for 2026 | forced-flow family (not in v1) | intelligence owner | Fix before any v2. Not fixed by #1141 |
 | G13 | No durable exact-version post-commit visibility receipt (clock 4), including corrections and retractions | historical admission of `people_events` and any table whose ingestion time is not commit visibility | people_events owner | Source-only design that links durable receipts to the canonical `people_events` pipeline, plus a disposable-PostgreSQL concurrency test plan. No second materializer, no historical repair, no runtime activation |
+| G14 | No authenticated admission verifier. The provisional checker refuses every `ADMITTED` (§8) | every admission, so every look | Claude (research owner), reviewed by Codex | Exact booleans and validated signature, hash and date formats; explicit required-input ids per hypothesis, each `ADMITTED`, with the sample floor measured and unknown dependencies refused; a durable-visibility state of applicable / qualified / not_applicable with reason and receipt, never null as an exemption; the pinned contract body digest verified at signing, and a manifest digest scope with no self-referential signature field. Source and synthetic tests only |
 
 ## 10. Revision 2: response to the reviewer's first pass (2026-11-13)
 
 | Reviewer item | Where answered |
 |---|---|
-| 1. D1 decision and ranking leakage | §5.1. One decision cutoff (day-0 close), reference prices observed by then, frozen development-only quintile breakpoints, entry at the next open as an outcome observation. §5.6 adds the pre-open / intraday / after-close leakage fixture |
+| 1. D1 decision and ranking leakage | §5.1. One decision cutoff (day-0 close; split in revision 5 into the observation cutoff O and the deadline D, §10.3), reference prices observed by then, frozen development-only quintile breakpoints, entry at the next open as an outcome observation. §5.6 adds the pre-open / intraday / after-close leakage fixture |
 | 2. Input clocks versus outcome clocks | §2.2 and §5.3. Outcomes stay `PENDING` until mature; late exits never change the decision |
 | 3. Multiplicity and D2-H1 aggregation | §6.2 and §6.4. Two H1 cells at 0.975, both required; H2 and H3 unchanged; program-level selection disclosed |
-| 4. Manifest looked admitted while unsigned | §3.1 and §8. `CANDIDATE_UNREVIEWED`; `analysis/d0_manifest.py` refuses `ADMITTED` without its prerequisites |
+| 4. Manifest looked admitted while unsigned | §3.1 and §8. `CANDIDATE_UNREVIEWED`; since revision 5, `analysis/d0_manifest.py` refuses every `ADMITTED` until the G14 verifier exists |
 | 5. Durable knowledge visibility | §2.1 clock 4 and G13. `UNPROVEN` until receipts exist; reference to `25f7a982` `commit_visibility_unproven` |
 | 6. D2 exit contract and executable-versus-simulated labels | §6.2 and §6.3. Exact entry and exit per cell; quote-at-or-before, age, spread, four-leg and size rules; MODELED_BBO labels; missing execution proof blocks economic claims only |
 | EDGAR acceptance is SEC-public, not first announcement | §2.1 and §5.1 |
@@ -614,5 +667,18 @@ conditioner takes; it is set before any D2 data is scored.
 | VIX holiday prints and the 2026-04-09 vintage measured with five read-only query receipts (`d0-receipts/vix_holiday_rows`, `vix_vs_spy_calendar`, `vintage_20260409`, `served_20260409`, `retractions_check`) | §3.1, manifest `grid.raw_series.CBOE:VIX` |
 | The revision 3 side finding is answered: the holiday rows are real Cboe prints, not a GRID defect | §3.1 |
 | Note added after revision 4, no rule changed: the 2026-04-09 yfinance `vix_spot` vintage was retracted on 2026-11-13 10:31Z (9,134 rows, run_tag `vix-spot-yf-20260409`, operator-approved). Script, runner, dry-run and apply outputs, and a separate read-only check are in `d0-receipts/vix_0409_retraction*`. The §6.1 exclusion of reads at `as_of` 2026-04-09 stays | §3.1, §6.1, manifest `grid.raw_series.CBOE:VIX` |
+
+### 10.3 Revision 5: response to the re-checks of 88768412 and 217d9c91 (2026-11-14)
+
+No threshold, window, horizon, level or sample floor changed. No outcome was read. Every change below
+fixes a definition, a label or a precedence before any look.
+
+| Reviewer item | Change | Where |
+|---|---|---|
+| 1. Admission checker fails open (three synthetic witnesses) | Codex's cf879835 integrated as-is (authorship kept): the checker is a provisional label checker and refuses every `ADMITTED`. All three witnesses are now refused. The real verifier is gap G14 | §8, §9 G14, `analysis/d0_manifest.py`, manifest `admission_rule` |
+| 2. D1 conflated the observation cutoff with usable-data time | The price-observation cutoff O (the actual day-0 close) is separate from the operational deadline D (20:00 ET). C₀ must be available by D; historical availability is the named proxy `PROXY_EOD_BY_DEADLINE`; a late C₀ is `EXCLUDED_LATE_INPUT`, skipped and never backdated or deferred. Registered order latency: D + 15 minutes, before the opening-auction order cutoff. Actual closes, early closes included; the leakage fixture adds early-close and delayed-C₀ cases | §5.1, §5.3, §5.6 |
+| 3. D2-H1 called the 15:59 intrinsic mark "cash settlement"; fee units ambiguous | Relabelled as a synthetic intrinsic-payoff proxy, with no exercise, assignment or after-hours claim. Fee bound to edge6: $0.0003 per share per leg ($0.03 per contract at the 100-share multiplier), four entry legs only. H2 and H3 unchanged | §6.2, §6.3, manifest D2-H1a/b |
+| Mixed-horizon precedence | D1: an UNDERPOWERED cell gives HOLD over any point estimate; FAIL + UNDERPOWERED is HOLD; PASS + FAIL with a point estimate ≤ 0 is HOLD (horizons disagree); GO also needs the §5.3 economic threshold. D2: RETIRE, then HOLD, then GO | §5.4, §6.5 |
+| F2 strength and ties | F2 uses the same scaled day-0 move as F1 (item type alone cannot form quintiles); one event per accession, Item 2.02 → F1; fixed per-family breakpoints, a value equal to a breakpoint goes up, then liquidity and accession number break ties | §5.1 |
 
 <!-- D0-CONTRACT-BODY-END -->
