@@ -11,11 +11,13 @@ TLS is forced for external SMTP to protect signal data in transit.
 
 from __future__ import annotations
 
+import atexit
 import html
 import math
 import smtplib
 import re
 import threading
+import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -386,9 +388,40 @@ def _section_text(title: str, body: str, accent: str = "") -> dict:
 # SMTP sending
 # ---------------------------------------------------------------------------
 
+# Sends still in flight. A one-shot process (a systemd oneshot, a cron script) used to exit while its
+# daemon mail thread was still connecting, so the message was never sent and nothing was logged: the
+# fleet heartbeat raised 1,322 alerts between 2026-05-25 and 2026-11-14 and delivered none.
+_PENDING_SENDS: list[threading.Thread] = []
+_PENDING_LOCK = threading.Lock()
+EXIT_DRAIN_SECONDS = 45.0   # one SMTP attempt is capped at 30 s
+
+
 def _send_in_thread(subject: str, html: str, plain: str) -> None:
     t = threading.Thread(target=_do_send, args=(subject, html, plain), daemon=True, name="grid-email")
+    with _PENDING_LOCK:
+        _PENDING_SENDS[:] = [p for p in _PENDING_SENDS if p.is_alive()]
+        _PENDING_SENDS.append(t)
     t.start()
+
+
+def _drain_pending_sends(timeout: float = EXIT_DRAIN_SECONDS) -> int:
+    """Wait up to ``timeout`` seconds for in-flight sends; return how many were still running.
+
+    Registered with ``atexit`` so a short-lived process delivers what it queued. The threads stay
+    daemonic, so a hung SMTP server delays exit by at most ``timeout`` and never blocks it.
+    """
+    deadline = time.monotonic() + timeout
+    with _PENDING_LOCK:
+        pending = [t for t in _PENDING_SENDS if t.is_alive()]
+    for t in pending:
+        t.join(max(0.0, deadline - time.monotonic()))
+    left = sum(1 for t in pending if t.is_alive())
+    if left:
+        log.warning("E-mail: {n} send(s) still in flight at exit after {s:.0f}s", n=left, s=timeout)
+    return left
+
+
+atexit.register(_drain_pending_sends)
 
 
 def _validated_research_recipients(value: tuple[str, ...]) -> tuple[str, str]:
