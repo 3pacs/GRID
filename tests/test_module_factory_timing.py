@@ -81,3 +81,37 @@ def test_coverage_labels_calendar_as_unqualified():
                                 "2023-01-04":m.Session(bars())}, spec())
     assert coverage["calendar_qualification"].startswith("UNQUALIFIED")
     assert coverage["full_bars_role"].startswith("retrospective")
+
+
+@pytest.mark.parametrize("missing", ["14:01", "14:59"])
+def test_missing_future_entry_or_exit_keeps_that_days_value_in_later_history(monkeypatch, missing):
+    """A day whose entry or exit bar is missing still adds its own raw value
+    to the z history, so later sessions see the same value. The day after it
+    is withheld by the prior-completeness rule, which reads only past bars."""
+    seen = []
+    original = m.robust_z
+    def capture(value, history):
+        seen.append((value, tuple(history)))
+        return original(value, history)
+    monkeypatch.setattr(m, "robust_z", capture)
+    run = m.RunFile.from_dict(dict(run_id="synthetic-only", first_session="2023-01-03",
+        last_session="2023-01-06", decision_times=["14:00"], horizons=["60m"], features=["F1"],
+        z_thresholds=[1.0], target_unit="dollars", perms=99, z_history=20))
+
+    def calls(second):
+        seen.clear()
+        s = {"2023-01-03": m.Session(bars(100)), "2023-01-04": m.Session(second),
+             "2023-01-05": m.Session(bars(103)), "2023-01-06": m.Session(bars(106))}
+        m.build_rows(s, run)
+        return list(seen)
+
+    complete = calls(bars(101))
+    gap = bars(101)
+    del gap[missing]
+    withheld = calls(gap)
+
+    day2, day3, day4 = complete
+    assert day2[1] == () and day3[1] == (day2[0],) and day4[1] == (day2[0], day3[0])
+    # Day 2's own z input and its appended value are unchanged; day 3 is
+    # withheld (incomplete prior), so day 4 sees day 2's value and nothing else.
+    assert withheld == [day2, (day4[0], (day2[0],))]
