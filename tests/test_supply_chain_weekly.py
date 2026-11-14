@@ -28,7 +28,7 @@ from intelligence.supply_chain_symbols import (
     ("SQ", "ticker", "XYZ"),
     ("bf_b", "ticker", "BF-B"),
     ("aapl", "ticker", "AAPL"),
-    ("HSY", None, "HSY"),
+    ("tsmc", None, "TSM"),  # a curated alias needs no type
 ])
 def test_listed_nodes_map_to_their_symbol(node, typ, symbol):
     assert symbol_for(node, typ).symbol == symbol
@@ -45,7 +45,8 @@ def test_listed_nodes_map_to_their_symbol(node, typ, symbol):
     ("pxd", "ticker", "delisted: Pioneer, acquired by ExxonMobil (2024)"),
     ("foxconn", "ticker", "not a US symbol"),
     ("air_liquide", "ticker", "not a US symbol"),
-    ("OPENAI", None, "not a US symbol"),
+    ("OPENAI", None, "type unknown"),
+    ("HSY", None, "type unknown"),
     ("lindt", "ticker", "foreign listing"),
     ("trina", "ticker", "foreign listing"),
     ("cyrk", "ticker", "no listing found"),
@@ -55,10 +56,11 @@ def test_untradable_nodes_carry_a_reason(node, typ, reason):
     assert t.symbol is None and t.reason == reason
 
 
-def test_without_types_a_bare_commodity_id_looks_like_a_symbol():
-    # documents why callers load node types: "corn" alone is also the CORN fund
-    assert symbol_for("corn").symbol == "CORN"
+def test_an_untyped_id_fails_closed():
+    # "corn" with no node row must not be scored as the CORN fund (Codex review of #1182)
+    assert symbol_for("corn").symbol is None and symbol_for("corn").reason == "type unknown"
     assert symbol_for("corn", "commodity").symbol is None
+    assert symbol_for("corn", "ticker").symbol == "CORN"
 
 
 def test_aliases_and_delisted_never_overlap_and_are_us_symbols():
@@ -69,14 +71,29 @@ def test_aliases_and_delisted_never_overlap_and_are_us_symbols():
     assert all(symbol_for(k, "ticker").symbol == v for k, v in NODE_SYMBOLS.items())
 
 
-def test_load_node_types_lowercases_and_survives_errors():
+def test_load_node_types_lowercases_and_raises_on_errors():
     conn = MagicMock()
     conn.execute.return_value.fetchall.return_value = [("SQ", "ticker"), ("corn", "commodity")]
     assert load_node_types(conn, ["SQ", "corn", None]) == {"sq": "ticker", "corn": "commodity"}
     assert conn.execute.call_args.args[1] == {"ids": ["sq", "corn"]}
     conn.execute.side_effect = RuntimeError("no table")
-    assert load_node_types(conn, ["x"]) == {}
+    with pytest.raises(RuntimeError):
+        load_node_types(conn, ["x"])
     assert load_node_types(MagicMock(), []) == {}
+
+
+def test_backtest_skips_a_prediction_when_node_types_cannot_be_read(monkeypatch):
+    from intelligence import contagion_backtest as cb
+    from intelligence import supply_chain_symbols as scs
+
+    pred = MagicMock(id=7, simulated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                     ranked_impact=[{"id": "corn", "margin_impact_pct": -0.03}])
+    monkeypatch.setattr(cb, "_fetch_predictions", lambda *a, **k: [pred])
+    monkeypatch.setattr(scs, "load_node_types", MagicMock(side_effect=RuntimeError("db down")))
+    scored = MagicMock(return_value=[])
+    monkeypatch.setattr(cb, "_iter_impact_tickers", scored)
+    assert cb.score_predictions(MagicMock(), 7) == 0
+    assert not scored.called  # no guessing without types
 
 
 def test_backtest_scores_symbols_not_node_ids():
@@ -90,6 +107,8 @@ def test_backtest_scores_symbols_not_node_ids():
     types = {"tsmc": "ticker", "openai": "private_company", "corn": "commodity",
              "005930.ks": "ticker", "aapl": "ticker"}
     assert [t[0] for t in _iter_impact_tickers(ranked, node_types=types)] == ["TSM", "AAPL"]
+    untyped = ranked + [{"id": "hsy", "margin_impact_pct": -0.005}]  # no node row
+    assert [t[0] for t in _iter_impact_tickers(untyped, node_types=types)] == ["TSM", "AAPL"]
 
 
 # --- 10-K parser: persistent checkpoint and rolling pass ----------------------------
