@@ -34,8 +34,10 @@ DIX is GRID's ``finra:dix_sp500`` series (``ingestion/altdata/finra_dix.py``). D
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -112,6 +114,43 @@ class VarSpec:
     note: str = ""
 
 
+def raw_selection_receipt(observations: list, selected: pd.Series, *, series_id: str,
+                          as_of: date, start: date, status: str = "read") -> dict[str, Any]:
+    """Hash exactly the finite, date-collapsed raw inputs consumed, including their clocks.
+
+    This is a selection fingerprint, not immutable byte custody or PIT qualification.
+    No arbitrary raw_payload is copied. Modeled publication dates remain modeled.
+    """
+    by_date = {o.obs_date: o for o in observations if o.value is not None}
+    rows = []
+    for d in selected.index:
+        o = by_date[d]
+        rows.append({"series_id": o.series_id, "obs_date": o.obs_date.isoformat(),
+                     "value": float(selected.loc[d]), "source": o.source,
+                     "pull_timestamp": o.pull_timestamp.isoformat() if o.pull_timestamp else None,
+                     "known_at": o.known_at.isoformat() if o.known_at else None,
+                     "known_at_basis": o.known_at_basis})
+    encoded = json.dumps(rows, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    bases = Counter(row["known_at_basis"] or "unknown" for row in rows)
+    return {"schema": "market-state-raw-selection/1", "status": status,
+            "series_id": series_id, "as_of": as_of.isoformat(), "start": start.isoformat(),
+            "source_filter": SOURCES.get(series_id),
+            "publication_policy": {**asdict(LAGS[series_id]),
+                "release_overrides": [[a.isoformat(), b.isoformat()] for a, b in LAGS[series_id].release_overrides],
+                "unpublished_dates": sorted(d.isoformat() for d in LAGS[series_id].unpublished_dates)}
+                if series_id in LAGS else None,
+            "rows": len(rows), "selected_rows_sha256": hashlib.sha256(encoded).hexdigest(),
+            "row_hash_fields": ["series_id", "obs_date", "value", "source", "pull_timestamp",
+                                "known_at", "known_at_basis"],
+            "first_obs_date": rows[0]["obs_date"] if rows else None,
+            "latest_observation": rows[-1] if rows else None,
+            "known_at_basis_counts": dict(sorted(bases.items())),
+            "missing_pull_timestamps": sum(row["pull_timestamp"] is None for row in rows),
+            "source_names": sorted({row["source"] for row in rows if row["source"]}),
+            "pit_qualified": False,
+            "limitation": "fingerprint only; modeled lag cannot reconstruct revised vintages"}
+
+
 class _Reads:
     """Known-at reads for one ``as_of``, memoized per series."""
 
@@ -120,10 +159,12 @@ class _Reads:
         self._memo: dict[str, Any] = {}
         self.spy_basis: str | None = None
         self.first_print_obs: dict[str, date | None] = {}
+        self.raw_lineage: dict[str, dict[str, Any]] = {}
 
     def series(self, series_id: str) -> pd.Series:
         if series_id not in self._memo:
             start = self.as_of - timedelta(days=self.lookback_days)
+            status = "read"
             try:
                 with self.engine.connect() as conn:
                     obs = read_window_known_at(conn, series_id, as_of=self.as_of, lag=LAGS.get(series_id),
@@ -131,8 +172,11 @@ class _Reads:
             except MixedSourceError as exc:
                 log.warning("market_state: {s} is mixed-source, skipped: {e}", s=series_id, e=str(exc))
                 obs = []
+                status = "refused_mixed_source"
             s = pd.Series({o.obs_date: o.value for o in obs if o.value is not None}, dtype=float).sort_index()
             self._memo[series_id] = s[np.isfinite(s.to_numpy())] if len(s) else s
+            self.raw_lineage[series_id] = raw_selection_receipt(
+                obs, self._memo[series_id], series_id=series_id, as_of=self.as_of, start=start, status=status)
         return self._memo[series_id]
 
     def vintages(self, series_id: str) -> pd.DataFrame:
@@ -471,6 +515,8 @@ class MarketState:
     news_shock: dict[str, Any] = field(default_factory=dict)
     gamma_state: dict[str, Any] = field(default_factory=dict)
     spy_basis: str | None = None
+    writer_provenance: dict[str, Any] | None = None
+    source_lineage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         ok = [k for k, v in self.variables.items() if v.get("status") == "ok"]
@@ -478,7 +524,7 @@ class MarketState:
             "rule": RECORD_RULE,
             "baseline_rule": BASELINE_RULE,
             "as_of": self.as_of.isoformat(),
-            "availability": "known by the end of as_of (UTC); backfilled history is revised vintage",
+            "availability": "date-bounded with source-specific availability rules; modeled-lag backfills may use revised vintages",
             "variables": self.variables,
             "events": self.events,
             "news_shock": self.news_shock,
@@ -488,6 +534,8 @@ class MarketState:
                                                            if v.get("status") == "no_baseline"),
                          "total": len(self.variables)},
             "spy_basis": self.spy_basis,
+            "writer_provenance": self.writer_provenance,
+            "source_lineage": self.source_lineage,
         }
 
 
@@ -526,6 +574,13 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
     state.news_shock = news_shock(state.variables.get("news_first_print", {}),
                                   reads.first_print_obs.get("USEPUINDXD"), cal)
     state.gamma_state = gamma_state(reads.gex_rows(), as_of)
+    state.source_lineage = {
+        "schema": "market-state-source-lineage/1", "status": "partial", "pit_qualified": False,
+        "raw_series": reads.raw_lineage,
+        "unqualified_read_paths": ["ALFRED vintage selection/capture", "dealer-gamma capture",
+                                   "SPY resolved/raw selected window", "calendar publication/capture"],
+        "limitation": "selected raw-input fingerprints only; not full immutable custody or scheduled-run evidence",
+    }
     return state
 
 
