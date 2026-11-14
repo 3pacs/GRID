@@ -8,7 +8,7 @@ z thresholds, sides, the per-share cost, alpha, permutations and seed. A module
 (a trial) is ``feature z >= +k`` or ``feature z <= -k`` at one decision time,
 taken long or short, entered at the open one minute after T (a declared bar-price
 proxy, not an executable-quote guarantee), judged through T+horizon minus the cost
-(``offline_research_proof`` statistic ``net_when_fires``). The run's bar is the
+(``analysis.factory_stats`` statistic ``net_when_fires``). The run's bar is the
 Westfall-Young step-down max-T over every tested module (selection ``max_t``).
 
 Order of a run (the ledger sees the run before the data does):
@@ -73,16 +73,16 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from analysis import ledger_steered_exploration as lse
-from analysis.offline_research_proof import (
+from analysis.factory_stats import (
+    FACTORY_ORIGIN,
     MAX_T_SELECTION,
     NET_WHEN_FIRES,
-    Protocol,
-    digest,
+    FactoryProtocol,
     discover,
-    write_once,
 )
+from analysis.offline_research_proof import digest, write_once
 
-ORIGIN = "intraday_dev_ranking"
+ORIGIN = FACTORY_ORIGIN
 DEV_FIRST = "2022-11-14"  # edge9's holdout ends before this; nothing earlier is read
 NY = ZoneInfo("America/New_York")
 FEATURE_SPECS = {
@@ -427,10 +427,10 @@ def build_rows(sessions: dict[str, Session], run: RunFile) -> tuple[dict[str, li
     return families, coverage
 
 
-def protocol_for(run: RunFile) -> Protocol:
+def protocol_for(run: RunFile) -> FactoryProtocol:
     first = datetime.fromisoformat(f"{run.first_session}T00:00").replace(tzinfo=NY)
     split = datetime.fromisoformat(f"{run.last_session}T00:00").replace(tzinfo=NY) + timedelta(days=1)
-    return Protocol(
+    return FactoryProtocol(
         run_id=run.run_id,
         features=run.modules(),
         families=run.families(),

@@ -76,23 +76,6 @@ S11 (ledger-steered exploration, ``analysis.ledger_steered_exploration``):
   per-run shares sum to at most the ledger's global level, so the family-wise
   error (and hence the FDR) is bounded across every run the ledger records.
   A ledger run may not declare a ``self_lag`` trial.
-
-Module factory (3pacs/GRID#1155):
-
-* ``statistic="net_when_fires"``: a feature is a module's firing signal: +1
-  (long) or -1 (short) when it fires, ``None`` when it abstains. The measure is
-  the mean of ``side * target - cost`` over the fires (``target`` a ``change``
-  label in price units, ``cost`` per share), with its t statistic; the marginal
-  p is one-sided on t against block permutations of the target.
-* ``selection="max_t"``: Westfall-Young step-down max-T over every tested
-  trial of the run. All families share each session permutation, so the bar
-  is the null distribution of the run's best t: it scales with the number of
-  trials, needs no per-trial permutation budget, and is valid under any
-  dependence between trials. A trial is selected when its adjusted p is <=
-  ``selection_alpha`` and its mean net is > 0. Ranking runs only: the factory
-  never claims a discovery from them (forward live recording is the test).
-* Origin ``intraday_dev_ranking``: rows built by ``analysis.module_factory``
-  from staged dev bars; its state marks every result as dev ranking only.
 """
 
 from __future__ import annotations
@@ -116,7 +99,6 @@ ORIGINS = {
     "synthetic_fixture": "SYNTHETIC_PROOF_ONLY",
     "exploratory_replay": "EXPLORATORY_REPLAY_ONLY",
     "latest_vintage_read": "LATEST_VINTAGE_READ_EXPLORATORY",
-    "intraday_dev_ranking": "INTRADAY_DEV_RANKING_ONLY",
 }
 LATEST_VINTAGE_ORIGIN = "latest_vintage_read"
 SAMPLING = ("horizon_spaced", "fixed_step_block_null")
@@ -127,8 +109,7 @@ FIXED_STEP_CAVEAT = (
     "(#658 review: 8.5% at n=60, 10.75% at n=240 for nominal 5%); diagnostic "
     "only, never selects, no candidates"
 )
-STATISTICS = ("pearson", "spearman", "net_when_fires")
-NET_WHEN_FIRES = "net_when_fires"
+STATISTICS = ("pearson", "spearman")
 # Data-driven block (S09b): the tolerated Bartlett-weight bias of the block null,
 # sum_k min(k/L, 1) |phi|^k ~ |phi| / ((1 - |phi|)^2 L) <= BLOCK_TOLERANCE, and
 # the fewest blocks a permutation may have.
@@ -142,9 +123,8 @@ CAPPED_BLOCK_CALIBRATION = (
 )
 SELF_LAG = "self_lag"
 # S11: per-run BH (default) or Holm at the ledger-issued run alpha.
-SELECTIONS = ("bh_run", "ledger_holm", "max_t")
+SELECTIONS = ("bh_run", "ledger_holm")
 LEDGER_SELECTION = "ledger_holm"
-MAX_T_SELECTION = "max_t"
 
 
 FORWARD_PENDING = "FORWARD_EVIDENCE_PENDING"
@@ -199,7 +179,6 @@ class Protocol:
     selection: str = "bh_run"
     selection_alpha: float = 0.0  # ledger-issued run alpha (ledger_holm only)
     allocation_sha256: str = ""  # the ledger allocation record (ledger_holm only)
-    cost: float = 0.0  # per-share cost subtracted from every fire (net_when_fires only)
 
     def validate(self):
         if self.origin not in ORIGINS:
@@ -243,9 +222,6 @@ class Protocol:
             or self.step < 1
             or self.block < 0
             or self.perms < 99
-            or not math.isfinite(self.cost)
-            or self.cost < 0
-            or (self.cost and self.statistic != NET_WHEN_FIRES)
         ):
             raise ValueError("invalid frozen statistical protocol")
         self.validate_selection()
@@ -260,12 +236,6 @@ class Protocol:
             raise ValueError("declared trials must name declared families and features")
         if self.selection not in SELECTIONS:
             raise ValueError("unknown selection rule")
-        if (self.selection == MAX_T_SELECTION) != (self.statistic == NET_WHEN_FIRES):
-            raise ValueError("max_t selects net_when_fires runs, and only them")
-        if self.selection == MAX_T_SELECTION:
-            if not 0 < self.selection_alpha <= 0.10 or self.allocation_sha256:
-                raise ValueError("max_t needs a run alpha in (0, 0.10] and no ledger allocation")
-            return
         if self.selection != LEDGER_SELECTION:
             if self.selection_alpha or self.allocation_sha256:
                 raise ValueError("only ledger_holm runs carry a ledger alpha/allocation")
@@ -646,126 +616,7 @@ def corrected_p(p, total):
 # --- measurement -----------------------------------------------------------------
 
 
-def net_stats(sides, targets, cost):
-    """(n, mean net, t) of ``side * target - cost`` over the fires; t is None when undefined.
-
-    ``cost``: one value, or one per fire (a row's own ``cost``, in target units).
-    """
-    net = np.asarray(sides, dtype=float) * np.asarray(targets, dtype=float) - np.asarray(cost, dtype=float)
-    n = len(net)
-    mean = float(net.mean()) if n else None
-    if n < 2:
-        return n, mean, None
-    sd = float(net.std(ddof=1))
-    return n, mean, (mean / (sd / math.sqrt(n)) if sd > 0 else None)
-
-
-def measure_net(rows, feature, protocol, block):
-    """net_when_fires: n, mean net and t of the module's fires.
-
-    Its p-values (marginal and max-T adjusted, both one-sided) come from the
-    run's shared permutations in :func:`max_t_adjusted`; ``p`` is a 1.0
-    placeholder until then.
-    """
-    triples = [
-        (row["features"][feature]["value"], row["target"], row_cost(row, protocol))
-        for row in rows
-        if row["features"][feature]["value"] is not None
-    ]
-    if any(side not in (1.0, -1.0) for side, _, _ in triples):
-        raise ValueError("a net_when_fires signal is +1, -1 or None")
-    if len(triples) < protocol.min_n:
-        return {"n": len(triples), "r": None, "t": None, "p": 1.0, "status": "insufficient_data"}
-    n, mean, t = net_stats(*zip(*triples))
-    if t is None:
-        return {"n": n, "r": mean, "t": None, "p": 1.0, "status": "zero_variance"}
-    return {"n": n, "r": mean, "t": t, "p": 1.0, "status": "tested"}
-
-
-def row_cost(row, protocol):
-    """A row's cost in target units: its own ``cost`` when given, else the protocol's."""
-    cost = row.get("cost", protocol.cost)
-    if not (isinstance(cost, (int, float)) and math.isfinite(cost) and cost >= 0):
-        raise ValueError("a row cost is a finite number >= 0")
-    return float(cost)
-
-
-def net_t_matrix(targets, sides, cost):
-    """t of ``side * target - cost`` over each column's fires, for every row of ``targets``.
-
-    ``targets``: perms x n (NaN = no label for that session); ``sides``: n x m
-    with +1 / -1 at fires and 0 elsewhere; ``cost``: one value or one per
-    session (it stays with the session's decision when the targets are
-    permuted). Returns perms x m float32, -inf where a column has < 2
-    labelled fires or zero variance. Matrix products only, using
-    (s y - c)^2 = y^2 - 2 s y c + c^2 for s = +/-1.
-    """
-    labelled = np.isfinite(targets)
-    mask = labelled.astype(float)
-    y = np.where(labelled, targets, 0.0)
-    fires = np.abs(sides)
-    c = np.broadcast_to(np.asarray(cost, dtype=float), (sides.shape[0],))[:, None]
-    n = mask @ fires
-    total = y @ sides - mask @ (c * fires)
-    squares = (y * y) @ fires - 2 * (y @ (sides * c)) + mask @ (c * c * fires)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mean = total / n
-        var = (squares - n * mean**2) / (n - 1)
-        t = mean / np.sqrt(var / n)
-    t[~((n >= 2) & (var > 1e-18))] = -np.inf
-    return t.astype(np.float32)
-
-
-def max_t_adjusted(families, ledger, protocol, block):
-    """Westfall-Young step-down max-T adjusted p over every tested trial (one-sided).
-
-    One block permutation of the run's session sequence is applied to every
-    family's targets, so each permutation yields a t for every trial at once and
-    the run's best null t is compared with each observed t. Untestable trials
-    get p = 1. Returns (marginal p, adjusted p, critical t at
-    ``selection_alpha`` = the run's first-step bar, sessions), the p lists
-    aligned with ``ledger``.
-    """
-    sessions = sorted({row["decision_at"][:10] for rows in families.values() for row in rows})
-    at = {d: i for i, d in enumerate(sessions)}
-    tested = [i for i, t in enumerate(ledger) if t["status"] == "tested"]
-    adjusted, marginal = [1.0] * len(ledger), [1.0] * len(ledger)
-    if not tested:
-        return marginal, adjusted, None, len(sessions)
-    perm = block_permutations(len(sessions), block, protocol.perms, protocol.seed)
-    null = np.empty((protocol.perms, len(tested)), dtype=np.float32)
-    by_family = {}
-    for col, i in enumerate(tested):
-        by_family.setdefault(ledger[i]["family"], []).append((col, ledger[i]["feature"]))
-    for family, members in by_family.items():
-        rows = families[family]
-        y = np.full(len(sessions), np.nan)
-        cost = np.zeros(len(sessions))
-        sides = np.zeros((len(sessions), len(members)))
-        for row in rows:
-            k = at[row["decision_at"][:10]]
-            y[k] = row["target"]
-            cost[k] = row_cost(row, protocol)
-            for j, (_, feature) in enumerate(members):
-                sides[k, j] = row["features"][feature]["value"] or 0.0
-        null[:, [col for col, _ in members]] = net_t_matrix(y[perm], sides, cost)
-    observed = np.array([ledger[i]["t"] for i in tested], dtype=np.float32)
-    for col, i in enumerate(tested):
-        marginal[i] = float((1 + int((null[:, col] >= observed[col] - 1e-6).sum())) / (protocol.perms + 1))
-    order = np.argsort(-observed, kind="stable")
-    # successive maxima from the bottom of the observed ranking (step-down)
-    tail_max = np.maximum.accumulate(null[:, order[::-1]], axis=1)[:, ::-1]
-    exceed = (tail_max >= observed[order][None, :] - 1e-6).sum(axis=0)
-    step = np.maximum.accumulate((1 + exceed) / (protocol.perms + 1))
-    for rank, col in enumerate(order):
-        adjusted[tested[col]] = float(min(1.0, step[rank]))
-    critical = float(np.quantile(null.max(axis=1), 1 - protocol.selection_alpha))
-    return marginal, adjusted, critical, len(sessions)
-
-
 def measure(rows, feature, protocol, block):
-    if protocol.statistic == NET_WHEN_FIRES:
-        return measure_net(rows, feature, protocol, block)
     pairs = [
         (row["features"][feature]["value"], row["target"])
         for row in rows
@@ -870,30 +721,15 @@ def discover(protocol, discovery_rows, panel=None):
     # Only horizon-spaced runs may select (the fixed-step null is anti-conservative).
     eligible = protocol.sampling in CANDIDATE_SAMPLING
     ledger_run = protocol.selection == LEDGER_SELECTION
-    max_t_run = protocol.selection == MAX_T_SELECTION
-    max_t = {}
-    if max_t_run:
-        joint_block = protocol.block or max(blocks.values(), default=1)
-        marginal, adjusted_all, critical, n_sessions = max_t_adjusted(families, ledger, protocol, joint_block)
-        for trial, p_marginal in zip(ledger, marginal):
-            trial["p"] = p_marginal
-        level = protocol.selection_alpha
-        max_t = {"block": joint_block, "critical_t": critical, "sessions": n_sessions,
-                 "tested": sum(t["status"] == "tested" for t in ledger)}
-    else:
-        adjust, level = (
-            (holm_adjusted, protocol.selection_alpha)
-            if ledger_run
-            else (bh_adjusted, protocol.fdr_q)
-        )
-        adjusted_all = adjust([t["p"] for t in ledger])
-    for trial, adjusted in zip(ledger, adjusted_all):
+    adjust, level = (
+        (holm_adjusted, protocol.selection_alpha)
+        if ledger_run
+        else (bh_adjusted, protocol.fdr_q)
+    )
+    for trial, adjusted in zip(ledger, adjust([t["p"] for t in ledger])):
         trial["adjusted_p"] = adjusted
         trial["selected"] = (
-            eligible
-            and trial["status"] == "tested"
-            and adjusted <= level
-            and (not max_t_run or trial["r"] > 0)
+            eligible and trial["status"] == "tested" and adjusted <= level
         )
     tested = sum(t["status"] == "tested" for t in ledger)
     # Block caveats only where trials could be tested (n >= min_n).
@@ -917,9 +753,8 @@ def discover(protocol, discovery_rows, panel=None):
         "ledger": ledger,
         "candidate_eligible": eligible,
         "caveats": caveats,
-        **({"max_t": max_t} if max_t_run else {}),
         "method": (
-            f"{'net when fires (side x target - cost; a row cost where given, else ' + format(protocol.cost, 'g') + ')' if max_t_run else 'fixed lag0 ' + protocol.statistic}; {protocol.sampling} sampling; "
+            f"fixed lag0 {protocol.statistic}; {protocol.sampling} sampling; "
             f"block-permutation null ({protocol.perms} perms, seed {protocol.seed}, "
             f"block {'declared' if protocol.block else 'from discovery target acf1'}); "
             "self_lag proxy trials never select; "
@@ -928,14 +763,8 @@ def discover(protocol, discovery_rows, panel=None):
                 f"{protocol.allocation_sha256[:12]}) over the declared trials incl. "
                 "untestable"
                 if ledger_run
-                else (
-                    f"Westfall-Young step-down max-T at {protocol.selection_alpha:.6g} over "
-                    "every tested trial, one session permutation shared by all families "
-                    f"(block {max_t.get('block')}), selected only with mean net > 0"
-                    if max_t_run
-                    else f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
-                    "untestable"
-                )
+                else f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
+                "untestable"
             )
             + "; holdout Bonferroni over frozen selections"
             + ("" if eligible else f"; CAVEAT: {FIXED_STEP_CAVEAT}")

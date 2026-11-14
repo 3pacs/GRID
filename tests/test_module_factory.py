@@ -14,11 +14,8 @@ import pytest
 
 from analysis import ledger_steered_exploration as lse
 from analysis import module_factory as mf
-from analysis.offline_research_proof import (
-    block_permutations,
-    max_t_adjusted,
-    net_t_matrix,
-)
+from analysis.factory_stats import max_t_adjusted, net_t_matrix
+from analysis.offline_research_proof import block_permutations
 
 
 def sessions(n, first=date(2023, 1, 3)):
@@ -268,7 +265,7 @@ def test_net_t_matrix_matches_direct_computation():
 
 
 def test_max_t_adjusted_is_monotone_above_marginal_and_matches_brute_force():
-    from analysis.offline_research_proof import Protocol
+    from analysis.factory_stats import FactoryProtocol as Protocol
 
     rng = np.random.default_rng(5)
     n, perms = 80, 299
@@ -355,3 +352,21 @@ def test_net_t_matrix_with_a_cost_per_session():
     fired = (sides[:, 0] != 0) & np.isfinite(y_nan)
     net = sides[fired, 0] * y[fired] - cost[fired]
     assert t == pytest.approx(net.mean() / (net.std(ddof=1) / np.sqrt(len(net))), rel=1e-5)
+
+
+def test_factory_protocol_keeps_the_offline_proof_checks_and_its_own():
+    from analysis.factory_stats import FactoryProtocol
+    from analysis.offline_research_proof import Protocol
+
+    good = dict(run_id="x", features=("a",), split="2030-01-01T00:00:00+00:00",
+                end="2030-01-02T00:00:00+00:00", origin="intraday_dev_ranking", selection_alpha=0.05)
+    FactoryProtocol(**good).validate()
+    for bad in ({"selection_alpha": 0.0}, {"selection_alpha": 0.2}, {"statistic": "pearson"},
+                {"selection": "bh_run"}, {"cost": -0.01}, {"cost": float("nan")},
+                {"min_n": 10}, {"split": "2030-01-03T00:00:00+00:00"}, {"origin": "unknown"},
+                {"allocation_sha256": "a" * 64}, {"self_lag": (("target", "a"),)}):
+        with pytest.raises(ValueError):
+            FactoryProtocol(**{**good, **bad}).validate()
+    # the offline proof itself (E0 v1 machinery) still knows nothing of the factory
+    with pytest.raises(ValueError):
+        Protocol(**{**good, "origin": "synthetic_fixture", "statistic": "net_when_fires"}).validate()
