@@ -20,9 +20,9 @@ from typing import Callable, Optional
 
 import psycopg2
 import psycopg2.extras
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
 from loguru import logger as log
 from passlib.context import CryptContext
 
@@ -192,7 +192,7 @@ def verify_token(token: str) -> bool:
     try:
         jwt.decode(token, jwt_secret, algorithms=["HS256"])
         return True
-    except JWTError:
+    except jwt.PyJWTError:
         return False
 
 
@@ -201,7 +201,7 @@ def decode_token(token: str) -> Optional[dict]:
     _, jwt_secret, _ = _get_settings()
     try:
         return jwt.decode(token, jwt_secret, algorithms=["HS256"])
-    except JWTError:
+    except jwt.PyJWTError:
         return None
 
 
