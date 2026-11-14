@@ -265,12 +265,12 @@ def test_a_budget_stops_between_filings_and_the_next_run_resumes(job, monkeypatc
     j = job(llm, {"0000027904": DAL_SECTION, "0000000999": DAL_SECTION})
     clock = iter([0.0, 0.0, 999.0, 999.0])
     monkeypatch.setattr(s8.time, "monotonic", lambda: next(clock, 999.0))
-    first = j.run(since=date(2026, 1, 12), today=date(2026, 1, 13), budget_seconds=10)
+    first = j.run(write=True, since=date(2026, 1, 12), today=date(2026, 1, 13), budget_seconds=10)
     assert first.stopped_early and first.listed_8ks == 1 and first.days == []
     ck = json.loads(s8.CHECKPOINT_PATH.read_text())
     assert ck["last_day"] == "2026-01-11" and ck["seen"] == ["0000027904-26-000002"]
     monkeypatch.setattr(s8.time, "monotonic", lambda: 0.0)
-    second = j.run(today=date(2026, 1, 13), budget_seconds=10)  # from the checkpoint
+    second = j.run(write=True, today=date(2026, 1, 13), budget_seconds=10)  # from the checkpoint
     assert second.listed_8ks == 1 and second.days == ["2026-01-12"] and not second.stopped_early
     assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-01-12"
 
@@ -279,11 +279,101 @@ def test_a_missing_index_is_a_holiday_once_a_later_day_has_one(job, monkeypatch)
     j = job(FakeLLM(reply()), {}, items="2.02")
     missing = {date(2026, 11, 11), date(2026, 11, 13)}  # Veterans Day; then a day not yet published
     monkeypatch.setattr(j, "index_8ks", lambda day: None if day in missing else [])
-    s = j.run(since=date(2026, 11, 10), today=date(2026, 11, 14))
+    s = j.run(write=True, since=date(2026, 11, 10), today=date(2026, 11, 14))
     assert s.days == ["2026-11-10", "2026-11-12"] and s.skipped == {"no_index": 2}
     assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-11-12"  # waits for the 13th
-    s = j.run(today=date(2026, 11, 18))  # the 13th still has no index, now more than 3 days old
+    s = j.run(write=True, today=date(2026, 11, 18))  # the 16th has an index; the 13th still has none
     assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-11-17"
+
+
+# --- Codex source review of #1188 (pickup sha256 611188e3) ----------------------------
+
+
+def test_a_dry_run_never_moves_the_checkpoint(job):
+    llm = FakeLLM(reply(("The Boeing Company", "FILER", "787-10 aircraft", QUOTE_DAL)))
+    j = job(llm, {"0000027904": DAL_SECTION, "0000000999": LOAN_SECTION})
+    s8.EightKSupplyLinks.save_checkpoint(date(2026, 1, 11), [])
+    before = s8.CHECKPOINT_PATH.read_text()
+    dry = j.run(write=False, today=date(2026, 1, 13))
+    assert dry.listed_8ks == 2 and not dry.checkpoint_advanced
+    assert s8.CHECKPOINT_PATH.read_text() == before
+    wet = j.run(write=True, today=date(2026, 1, 13))  # sees the same filings the dry run read
+    assert wet.listed_8ks == 2 and len(wet.links) == 1 and wet.checkpoint_advanced
+
+
+def test_a_bad_reply_is_retried_then_given_up(job):
+    j = job(FakeLLM("not json"), {"0000027904": DAL_SECTION, "0000000999": LOAN_SECTION})
+    for n in range(1, s8.MAX_ATTEMPTS):
+        s = j.run(write=True, since=date(2026, 1, 12), today=date(2026, 1, 13))
+        ck = json.loads(s8.CHECKPOINT_PATH.read_text())
+        assert s.rejected == {"bad_reply": 1} and s.days == []
+        assert ck["last_day"] == "2026-01-11"  # the day stays unfinished
+        assert ck["seen"] == ["0000000999-26-000004"]  # only the filing whose outcome is final
+        assert ck["attempts"] == {"0000027904-26-000002": n}
+    s = j.run(write=True, today=date(2026, 1, 13))
+    ck = json.loads(s8.CHECKPOINT_PATH.read_text())
+    assert s.skipped.get("gave_up_bad_reply") == 1 and s.days == ["2026-01-12"]
+    assert ck["last_day"] == "2026-01-12" and ck["attempts"] == {} and len(ck["seen"]) == 2
+
+
+def test_no_local_model_stops_without_marking_anything_seen(job, monkeypatch):
+    j = job(None, {"0000027904": DAL_SECTION, "0000000999": DAL_SECTION})
+    monkeypatch.setattr(j, "_client", lambda: None)
+    s = j.run(write=True, since=date(2026, 1, 12), today=date(2026, 1, 13))
+    ck = json.loads(s8.CHECKPOINT_PATH.read_text())
+    assert s.rejected == {"no_model": 1} and s.listed_8ks == 1  # stopped at the first model call
+    assert ck["last_day"] == "2026-01-11" and ck["seen"] == [] and ck["attempts"] == {}
+
+
+def test_unreadable_submissions_are_retried_not_marked_seen(job, monkeypatch):
+    j = job(FakeLLM(reply()), {}, items="2.02")
+    monkeypatch.setattr(j, "filing_details", lambda f: False)
+    s = j.run(write=True, since=date(2026, 1, 12), today=date(2026, 1, 13))
+    ck = json.loads(s8.CHECKPOINT_PATH.read_text())
+    assert s.skipped == {"not_in_submissions": 2} and ck["seen"] == [] and ck["last_day"] == "2026-01-11"
+
+
+def test_a_refused_index_stops_the_pass_before_that_day(job, monkeypatch):
+    j = job(FakeLLM(reply()), {}, items="2.02")
+
+    def index(day):
+        if day == date(2026, 11, 11):
+            raise s8.IndexRefused("429")
+        return []
+    monkeypatch.setattr(j, "index_8ks", index)
+    s = j.run(write=True, since=date(2026, 11, 10), today=date(2026, 11, 14))
+    assert s.days == ["2026-11-10"] and s.skipped == {"index_refused": 1}
+    assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-11-10"
+
+
+def test_a_403_that_was_a_refusal_is_not_passed_as_a_holiday(job, monkeypatch):
+    j = job(FakeLLM(reply()), {}, items="2.02")
+    asked = []
+
+    def index(day):  # the 11th is refused once, then answers on the second ask
+        asked.append(day)
+        return None if day == date(2026, 11, 11) and asked.count(day) == 1 else []
+    monkeypatch.setattr(j, "index_8ks", index)
+    s = j.run(write=True, since=date(2026, 11, 10), today=date(2026, 11, 14))
+    assert s.days == ["2026-11-10"] and s.skipped == {"no_index": 1, "index_appeared_on_retry": 1}
+    assert json.loads(s8.CHECKPOINT_PATH.read_text())["last_day"] == "2026-11-10"  # resumes at the 11th
+
+
+@pytest.mark.parametrize("status, want", [(404, None), (403, None), (429, "refused"), (503, "refused"),
+                                          ("boom", "refused")])
+def test_index_status_classification(monkeypatch, status, want):
+    monkeypatch.setattr(s8.time, "sleep", lambda s: None)
+    parser = MagicMock()
+    if status == "boom":
+        parser.session.get.side_effect = OSError("reset")
+    else:
+        parser.session.get.return_value = MagicMock(status_code=status, text="")
+    job = s8.EightKSupplyLinks(MagicMock(), parser=parser)
+    if want is None:
+        assert job.index_8ks(date(2026, 11, 11)) is None
+    else:
+        with pytest.raises(s8.IndexRefused):
+            job.index_8ks(date(2026, 11, 11))
 
 
 @pytest.mark.parametrize("kind, provides, rel", [

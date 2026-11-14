@@ -42,8 +42,10 @@ Daily pass, per business day since the checkpoint:
    contagion uses them only after the edge validator has measured them
    (``chain_contagion.VALIDATED_DERIVED_GATE``).
 
-Writes nothing unless ``write=True``. The checkpoint (last day read plus the
-accessions seen) is a JSON file written atomically.
+Writes nothing unless ``write=True``. The checkpoint (last day read, the
+accessions whose outcome is final, and retry counts) is a JSON file written
+atomically, and only by a write run: a dry run starts from it and leaves it
+as it was, so a dry run never hides filings from the next write run.
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ CHECKPOINT_PATH = Path(os.environ.get(
 FIRST_RUN_LOOKBACK_DAYS = 7
 MAX_DAYS_PER_RUN = 30
 SEEN_KEEP = 5000
+MAX_ATTEMPTS = 3  # a filing that cannot be read is retried on this many runs, then given up (counted)
 SECTION_CHARS = 8000
 # GPU nodes only, in router order. Paid providers are never in this list, so
 # no setting can send a filing to a cloud model from here.
@@ -155,9 +158,14 @@ class RunSummary:
     nodes_written: int = 0
     write: bool = False
     stopped_early: bool = False
+    checkpoint_advanced: bool = False
 
     def bump(self, bucket: dict[str, int], key: str) -> None:
         bucket[key] = bucket.get(key, 0) + 1
+
+
+class IndexRefused(RuntimeError):
+    """EDGAR did not answer for a daily index (network error, 429, 5xx): not proof of a holiday."""
 
 
 def company_key(name: str) -> str:
@@ -311,6 +319,7 @@ class EightKSupplyLinks:
         return self.parser._resolve_counterparty(name)
 
     def _get(self, url: str) -> Any | None:
+        self._last_status = None  # None: no answer at all
         try:
             resp = self.parser.session.get(url, timeout=scp._REQUEST_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - network errors end this read, not the run
@@ -318,6 +327,7 @@ class EightKSupplyLinks:
             return None
         finally:
             time.sleep(scp._RATE_LIMIT_SLEEP)
+        self._last_status = resp.status_code
         if resp.status_code in (403, 404):  # weekends and holidays have no index
             return None
         if resp.status_code >= 400:
@@ -326,16 +336,28 @@ class EightKSupplyLinks:
         return resp
 
     def index_8ks(self, day: date) -> list[tuple[str, str, str]] | None:
+        """The day's 8-K lines; None when EDGAR says there is no index (403/404).
+
+        Any other failure raises :class:`IndexRefused`. A 403 can also be a
+        rate-limit refusal, so ``run`` passes a no-index day only after asking
+        again once a later day's index has been read.
+        """
         q = (day.month - 1) // 3 + 1
         resp = self._get(FORM_INDEX_URL.format(y=day.year, q=q, ymd=day.strftime("%Y%m%d")))
-        return None if resp is None else parse_index(resp.text)
+        if resp is not None:
+            return parse_index(resp.text)
+        if getattr(self, "_last_status", None) in (403, 404):
+            return None
+        raise IndexRefused(f"{day.isoformat()}: status {getattr(self, '_last_status', None)}")
 
     def filing_details(self, filing: Filing) -> bool:
         """Fill items and URL from the filer's submissions JSON; False when not listed."""
         sub = self._submissions.get(filing.cik)
         if sub is None:
             resp = self._get(scp._SUBMISSIONS_URL.format(cik=filing.cik))
-            sub = (resp.json().get("filings", {}).get("recent", {}) if resp is not None else {})
+            if resp is None:
+                return False  # not cached: a failed fetch is retried, not remembered
+            sub = resp.json().get("filings", {}).get("recent", {})
             self._submissions[filing.cik] = sub
         accs = sub.get("accessionNumber", [])
         if filing.accession not in accs:
@@ -407,8 +429,9 @@ class EightKSupplyLinks:
             return {}
 
     @staticmethod
-    def save_checkpoint(last_day: date, seen: list[str]) -> None:
+    def save_checkpoint(last_day: date, seen: list[str], attempts: dict[str, int] | None = None) -> None:
         payload = {"last_day": last_day.isoformat(), "seen": seen[-SEEN_KEEP:],
+                   "attempts": dict(attempts or {}),
                    "updated_at": datetime.now(timezone.utc).isoformat()}
         CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = CHECKPOINT_PATH.with_name(CHECKPOINT_PATH.name + ".tmp")
@@ -432,11 +455,21 @@ class EightKSupplyLinks:
             checkpoint: bool = True, budget_seconds: float | None = None) -> RunSummary:
         """Read each business day in order; the checkpoint advances one finished day at a time.
 
-        A day with no index is a holiday once a later day has one (EDGAR
-        publishes in order) or once it is more than three days old; until
-        then (not yet published, or an SEC refusal) the checkpoint stays
-        before it. With a budget the pass stops between filings; filings
-        already read stay in ``seen``.
+        Only a write run saves the checkpoint; a dry run reads it and leaves it.
+
+        A day EDGAR has no index for (403/404) passes only when a later day's
+        index has been read in the same run and the day still has none when
+        asked again (EDGAR publishes in order, and a rate-limit refusal does not
+        repeat for one URL). Until then the checkpoint stays before it. Any other
+        index failure stops the pass there.
+
+        A filing joins ``seen`` only once its outcome is final (no Item 1.01, not
+        a commercial section, links checked). One that could not be read
+        (submissions or text unavailable, a bad model reply) leaves its day
+        unfinished, so the next write run asks again; after ``MAX_ATTEMPTS``
+        runs it is given up and counted under ``skipped``. With no local model
+        the pass stops and counts nothing as tried. With a budget the pass stops
+        between filings.
         """
         started = time.monotonic()
         summary = RunSummary(write=write)
@@ -444,16 +477,33 @@ class EightKSupplyLinks:
         days = self.days_to_read(today, since)
         filers = self.filer_universe()
         summary.universe = len(filers)
-        seen = list(self.load_checkpoint().get("seen", [])) if checkpoint else []
+        saved = self.load_checkpoint() if checkpoint else {}
+        advance = checkpoint and write
+        seen = list(saved.get("seen", []))
         seen_set = set(seen)
+        attempts: dict[str, int] = {k: int(v) for k, v in (saved.get("attempts") or {}).items()}
+        unconfirmed: list[date] = []  # no-index days not yet shown to be holidays
+
+        def final(acc: str) -> None:
+            seen.append(acc)
+            seen_set.add(acc)
+            attempts.pop(acc, None)
+
         for day in days:
-            listed = self.index_8ks(day)
+            try:
+                listed = self.index_8ks(day)
+            except IndexRefused as exc:
+                summary.bump(summary.skipped, "index_refused")
+                log.warning("supply_chain_8k: index refused, stopping before {d}: {e}", d=day, e=str(exc))
+                break
             if listed is None:
                 summary.bump(summary.skipped, "no_index")
-                if checkpoint and day < today - timedelta(days=3):
-                    self.save_checkpoint(day, seen)
-                continue  # a later day with an index moves the checkpoint past it
-            finished = True
+                unconfirmed.append(day)
+                continue
+            if not self._still_absent(unconfirmed, summary):
+                break  # resume at the first unconfirmed day next run
+            unconfirmed = []
+            finished, stop = True, False
             for cik, company, acc in listed:
                 if cik not in filers or acc in seen_set:
                     continue
@@ -464,37 +514,65 @@ class EightKSupplyLinks:
                 filing = Filing(cik, sym, node_id, company, acc, day, in_graph=in_graph)
                 summary.listed_8ks += 1
                 summary.graph_8ks += in_graph
-                seen.append(acc)
-                seen_set.add(acc)
-                self._read_filing(filing, summary, write)
+                retry = self._read_filing(filing, summary, write)
+                if retry is None:
+                    final(acc)
+                elif retry == "no_model":
+                    finished, stop = False, True
+                    break
+                else:
+                    attempts[acc] = attempts.get(acc, 0) + 1
+                    if attempts[acc] >= MAX_ATTEMPTS:
+                        summary.bump(summary.skipped, f"gave_up_{retry}")
+                        final(acc)
+                    else:
+                        finished = False  # the next run asks for this filing again
             if finished:
                 summary.days.append(day.isoformat())
-            if checkpoint:
-                last_done = day if finished else day - timedelta(days=1)
-                self.save_checkpoint(last_done, seen)
-            if not finished:
+            if advance:
+                self.save_checkpoint(day if finished else day - timedelta(days=1), seen, attempts)
+                summary.checkpoint_advanced = True
+            if not finished or stop:
                 break
         summary.provider = self._provider_name
         return summary
 
-    def _read_filing(self, filing: Filing, summary: RunSummary, write: bool) -> None:
+    def _still_absent(self, days: list[date], summary: RunSummary) -> bool:
+        """Ask each no-index day again after a later day's index was read; True when all still have none."""
+        for gap in days:
+            try:
+                again = self.index_8ks(gap)
+            except IndexRefused:
+                summary.bump(summary.skipped, "index_refused")
+                return False
+            if again is not None:
+                summary.bump(summary.skipped, "index_appeared_on_retry")
+                return False
+        return True
+
+    def _read_filing(self, filing: Filing, summary: RunSummary, write: bool) -> str | None:
+        """None when the filing's outcome is final; else why it should be read again."""
         if not self.filing_details(filing):
             summary.bump(summary.skipped, "not_in_submissions")
-            return
+            return "not_in_submissions"
         if "1.01" not in filing.items:
             summary.bump(summary.skipped, "no_item_101")
-            return
+            return None
         summary.item_101 += 1
         body = self.filing_text(filing)
-        section = item_101_section(body or "")
+        if body is None:
+            summary.bump(summary.skipped, "text_unavailable")
+            return "text_unavailable"
+        section = item_101_section(body)
         kind = classify_section(section) if section else "no_section"
         if kind not in ("commercial", "mixed"):
             summary.bump(summary.skipped, kind)
-            return
+            return None
         links = self.extract(filing, section)
         if links is None:
-            summary.bump(summary.rejected, "no_model" if self._llm is None else "bad_reply")
-            return
+            reason = "no_model" if self._llm is None else "bad_reply"
+            summary.bump(summary.rejected, reason)
+            return reason
         summary.model_calls += 1
         for link in links:
             other, why = validate_link(link, section)
@@ -557,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--since", type=date.fromisoformat, help="first day to read (default: checkpoint)")
-    ap.add_argument("--write", action="store_true", help="upsert edges (default: dry run)")
+    ap.add_argument("--write", action="store_true", help="upsert edges and advance the checkpoint (default: dry run, checkpoint untouched)")
     ap.add_argument("--no-checkpoint", action="store_true", help="neither read nor advance the checkpoint")
     args = ap.parse_args(argv)
     summary = EightKSupplyLinks(get_engine()).run(write=args.write, since=args.since,
