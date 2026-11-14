@@ -1149,6 +1149,359 @@ def alert_on_discovery_insight(title: str, description: str, data: dict | None =
     _send(f"GRID Intelligence — {title}", sections)
 
 
+# ---------------------------------------------------------------------------
+# Anomaly report (intelligence/anomaly_report.py -> one e-mail)
+# ---------------------------------------------------------------------------
+
+_VERDICT_TITLE = {"sharp_move": "Sharp move", "new_extreme": "New extreme", "stretched": "Stretched"}
+_ANOMALY_MAX_MOVE_CARDS = 6
+_ANOMALY_MAX_TABLE_ROWS = 12
+_CELL = "padding:6px 8px 6px 0;font-size:13px;color:#C8D8E8;border-bottom:1px solid #1A2A3A;"
+_HEAD = "padding:6px 8px 6px 0;font-size:11px;color:#5A7A96;text-align:left;border-bottom:1px solid #1A2A3A;"
+_NOTE = "font-size:13px;color:#9AB2C8;line-height:1.5;"
+
+
+def _an_num(value: Any) -> str:
+    """A level, sized to its magnitude: 5,273 / 162.85 / 0.0675."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "n/a"
+    mag = abs(value)
+    if mag >= 1000:
+        return f"{value:,.0f}"
+    if mag >= 10:
+        return f"{value:,.2f}"
+    if mag >= 1:
+        return f"{value:.3f}"
+    return f"{value:.4f}"
+
+
+def _an_pct(value: Any, signed: bool = True) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "n/a"
+    return f"{value * 100:+.1f}%" if signed else f"{value * 100:.0f}%"
+
+
+def _an_day(iso: Any) -> str:
+    """'2026-11-13' -> 'Nov 13'; anything unparseable comes back as it was."""
+    try:
+        d = datetime.strptime(str(iso)[:10], "%Y-%m-%d")
+    except ValueError:
+        return str(iso) if iso else "n/a"
+    return f"{d.strftime('%b')} {d.day}"
+
+
+def _an_day_year(iso: Any) -> str:
+    try:
+        d = datetime.strptime(str(iso)[:10], "%Y-%m-%d")
+    except ValueError:
+        return str(iso) if iso else "n/a"
+    return f"{d.strftime('%b')} {d.day}, {d.year}"
+
+
+def _an_change(change: dict | None) -> str:
+    if not change or change.get("value") is None:
+        return "n/a"
+    if change.get("unit") == "pct":
+        return _an_pct(change["value"])
+    value = change["value"]
+    return f"{value:+.3f}" if abs(value) < 10 else f"{value:+,.2f}"
+
+
+def _an_change_note(change: dict | None) -> str:
+    """How unusual a change is against the feature's own changes."""
+    z = (change or {}).get("robust_z")
+    if z is None:
+        return ""
+    if abs(z) >= 2.5:
+        return f"rare ({abs(z):.1f}σ)"
+    if abs(z) >= 1.5:
+        return f"large ({abs(z):.1f}σ)"
+    return "ordinary"
+
+
+def _an_target(name: Any) -> str:
+    text = str(name or "")
+    for suffix in ("_usd_full", "_full", "_close"):
+        if text.lower().endswith(suffix):
+            return text[: -len(suffix)].replace("_", "-").upper()
+    return text.upper()
+
+
+def _an_situation(item: dict) -> str:
+    z = item.get("zscore") or 0.0
+    side = "above" if z >= 0 else "below"
+    return (f"{_an_num(item.get('value'))} on {_an_day(item.get('obs_date'))}: {abs(z):.1f}σ {side} "
+            f"its one-year average of {_an_num(item.get('mean'))}.")
+
+
+def _an_excursion(item: dict, threshold: Any) -> str:
+    ex = item.get("excursion") or {}
+    n = ex.get("sessions")
+    if not n:
+        return ""
+    plural = "session" if n == 1 else "sessions"
+    text = f"Beyond {threshold}σ for {n} {plural}, since {_an_day(ex.get('since'))}."
+    if item.get("verdict") == "stretched":
+        text += " A one-year trend, not a new event."
+    return text
+
+
+def _an_range(item: dict) -> str:
+    r = item.get("range") or {}
+    if not r or r.get("high") is None:
+        return ""
+    return (f"One-year range {_an_num(r.get('low'))} ({_an_day(r.get('low_date'))}) to "
+            f"{_an_num(r.get('high'))} ({_an_day(r.get('high_date'))}): now {_an_pct(r.get('off_high'))} "
+            f"from the high, {_an_pct(r.get('off_low'))} from the low.")
+
+
+def _an_history(h: dict | None) -> str:
+    """One precedent read in a sentence or two; every number carries its n."""
+    h = h or {}
+    if not h:
+        return ""
+    basis = str(h.get("basis") or "level")
+    side = h.get("direction", "above")
+    if basis.startswith("change_"):
+        cut = h.get("cut")
+        size = _an_pct(cut, signed=False) if h.get("unit") == "pct" else _an_num(cut)
+        if h.get("unit") == "pct" and isinstance(cut, (int, float)):
+            size = f"{cut * 100:.1f}%"
+        event = f"it {'rose' if side == 'above' else 'fell'} {size} or more in {basis.split('_')[1]} sessions"
+    else:
+        what = f"this far {side} its trailing year"
+        event = f"it was {what}"
+    if not h.get("available"):
+        return f"No precedent read: {h.get('reason', 'unavailable')}."
+    target = _an_target(h.get("target"))
+    since = _an_day_year(h.get("since"))
+    n = h.get("n", 0)
+    if n == 0:
+        return f"No precedent since {since}: the first time {event}."
+    long = (h.get("horizons") or {}).get("fwd_20") or {}
+    short = (h.get("horizons") or {}).get("fwd_5") or {}
+    if not h.get("enough"):
+        cases = ", ".join(
+            f"{_an_day_year(e.get('date'))} {_an_pct(e.get('fwd_20'))}"
+            for e in h.get("episodes") or [] if e.get("fwd_20") is not None)
+        tail = f" {target} 20 sessions after: {cases}." if cases else ""
+        return (f"{n} prior time{'s' if n != 1 else ''} {event} since {since}: "
+                f"too few to read.{tail}")
+    parts = []
+    for sessions, row in ((20, long), (5, short)):
+        if not row.get("n"):
+            continue
+        ups = round((row.get("share_up") or 0.0) * row["n"])
+        parts.append(
+            f"{sessions} sessions later {target} was higher in {ups} of {row['n']} "
+            f"(median {_an_pct(row.get('median'))}, worst {_an_pct(row.get('worst'))}, "
+            f"best {_an_pct(row.get('best'))}); any {sessions}-session window: "
+            f"higher {_an_pct(row.get('baseline_share_up'), signed=False)}, "
+            f"median {_an_pct(row.get('baseline_median'))}")
+    return (f"The {n} prior times {event} (since {since}): " + ". ".join(parts)
+            + ". A base rate, not a tested rule.")
+
+
+def _an_move_section(item: dict, threshold: Any) -> dict:
+    changes = item.get("changes") or {}
+    rows = [(f"{h} session{'s' if h != 1 else ''}", changes.get(f"d{h}")) for h in (1, 5, 20)]
+    cells = "".join(
+        f'<td style="{_CELL}"><span style="font-size:11px;color:#5A7A96;">{label}</span><br>'
+        f'<strong style="color:#E8F0F8;font-size:15px;">{html.escape(_an_change(ch))}</strong><br>'
+        f'<span style="font-size:11px;color:#9AB2C8;">{html.escape(_an_change_note(ch))}</span></td>'
+        for label, ch in rows)
+    situation, excursion = _an_situation(item), _an_excursion(item, threshold)
+    span = _an_range(item)
+    reads = [r for r in (_an_history(item.get("move_history")), _an_history(item.get("history"))) if r]
+    context = " ".join(x for x in (excursion, span) if x)
+    body = (f'<p style="margin:0 0 10px;">{html.escape(situation)}</p>'
+            f'<table style="width:100%;border-collapse:collapse;margin-bottom:10px;"><tr>{cells}</tr></table>'
+            + (f'<p style="margin:0 0 10px;">{html.escape(context)}</p>' if context else "")
+            + (f'<p style="margin:0 0 6px;{_NOTE}"><strong>What followed before.</strong></p>' if reads else "")
+            + "".join(f'<p style="margin:0 0 6px;{_NOTE}">{html.escape(r)}</p>' for r in reads))
+    plain_changes = "; ".join(
+        f"{label} {_an_change(ch)}" + (f" ({_an_change_note(ch)})" if _an_change_note(ch) else "")
+        for label, ch in rows)
+    plain = "\n".join(x for x in (situation, plain_changes, context,
+                                  "What followed before." if reads else "", *(f"- {r}" for r in reads)) if x)
+    title = f"{_VERDICT_TITLE.get(item.get('verdict'), 'Flagged')} — {item.get('label', item.get('feature'))}"
+    return {"title": html.escape(title), "body": body, "plain": plain,
+            "accent": "amber" if item.get("verdict") == "sharp_move" else "purple"}
+
+
+def _an_table_section(title: str, intro: str, items: list[dict], accent: str = "") -> dict:
+    shown, extra = items[:_ANOMALY_MAX_TABLE_ROWS], len(items) - _ANOMALY_MAX_TABLE_ROWS
+    rows, plain_rows = "", []
+    for it in shown:
+        z = it.get("zscore") or 0.0
+        sessions = (it.get("excursion") or {}).get("sessions")
+        d20 = _an_change((it.get("changes") or {}).get("d20"))
+        rows += (f'<tr><td style="{_CELL}">{html.escape(str(it.get("label", it.get("feature"))))}</td>'
+                 f'<td style="{_CELL}">{html.escape(_an_num(it.get("value")))}</td>'
+                 f'<td style="{_CELL}">{z:+.1f}σ</td>'
+                 f'<td style="{_CELL}">{html.escape(d20)}</td>'
+                 f'<td style="{_CELL}">{sessions if sessions is not None else "n/a"}</td></tr>')
+        plain_rows.append(f"- {it.get('label', it.get('feature'))}: {_an_num(it.get('value'))}, {z:+.1f}σ, "
+                          f"20 sessions {d20}, beyond for {sessions if sessions is not None else 'n/a'} sessions")
+    more = f"{extra} more not shown." if extra > 0 else ""
+    body = (f'<p style="margin:0 0 10px;{_NOTE}">{html.escape(intro)}</p>'
+            f'<table style="width:100%;border-collapse:collapse;"><thead><tr>'
+            f'<th style="{_HEAD}">Feature</th><th style="{_HEAD}">Now</th><th style="{_HEAD}">vs 1-yr</th>'
+            f'<th style="{_HEAD}">20 sessions</th><th style="{_HEAD}">Sessions beyond</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table>'
+            + (f'<p style="margin:8px 0 0;{_NOTE}">{more}</p>' if more else ""))
+    return {"title": html.escape(title), "body": body, "accent": accent,
+            "plain": "\n".join([intro, *plain_rows] + ([more] if more else []))}
+
+
+def _an_names(names: list[str], limit: int = 6) -> str:
+    shown = ", ".join(names[:limit])
+    return shown + (f" (+{len(names) - limit} more)" if len(names) > limit else "")
+
+
+def _an_fault_text(fault: dict, items_by_feature: dict[str, dict]) -> str:
+    label = fault.get("label", fault.get("id", "series"))
+    if fault.get("kind") in ("split", "reverse_split"):
+        ratio = fault.get("ratio")
+        z = items_by_feature.get(fault.get("feature", ""), {}).get("zscore")
+        if fault.get("shape") == "basis_break":
+            reading = f"The {abs(z):.1f}σ reading is that break, not a market move. " if z is not None else ""
+            return (f"{label}: the level changed by a factor of about {ratio} on {_an_day(fault.get('date'))} "
+                    f"and stayed there ({_an_num(fault.get('before'))} to {_an_num(fault.get('after'))}). "
+                    f"That is the series changing source or unit. {reading}"
+                    f"Every level reading on this series is wrong until it is put on one basis.")
+        shape = f"{ratio}-for-1 split" if fault["kind"] == "split" else f"1-for-{ratio} reverse split"
+        reading = f"The {abs(z):.1f}σ reading is the split, not a market move. " if z is not None else ""
+        return (f"{label}: looks like a {shape} on {_an_day(fault.get('date'))} that the series was not "
+                f"adjusted for ({_an_num(fault.get('before'))} to {_an_num(fault.get('after'))}). {reading}"
+                f"Every level reading on this series is wrong until it is re-based.")
+    text = (f"{label}: {fault.get('collapsed')} of {fault.get('members')} series have been under a fifth of "
+            f"their own normal since {_an_day(fault.get('onset'))} "
+            f"(median {_an_pct(fault.get('median_ratio'), signed=False)} of normal). "
+            f"That is the feed, not the market.")
+    flagged = [items_by_feature.get(n, {}).get("label", n) for n in fault.get("flagged") or []]
+    suspect = [items_by_feature.get(n, {}).get("label", n) for n in fault.get("suspect") or []]
+    if flagged:
+        text += f" Flagged because of it: {_an_names(flagged)}."
+    if suspect:
+        text += f" Computed from the same chains, treat as unverified: {_an_names(suspect)}."
+    return text
+
+
+def anomaly_report_headline(report: dict) -> tuple[str, str]:
+    """(counts line, one-paragraph summary) for the top card and the subject."""
+    items = report.get("items") or []
+    counts = report.get("counts") or {}
+    moves = [i for i in items if i.get("verdict") in ("sharp_move", "new_extreme")]
+    n_fault = counts.get("data_fault", 0) + counts.get("suspect", 0) + counts.get("stale", 0)
+    n_stretched = counts.get("stretched", 0)
+    bits = [f"{len(moves)} new move{'s' if len(moves) != 1 else ''}", f"{n_stretched} stretched"]
+    if n_fault:
+        bits.append(f"{n_fault} bad-data reading{'s' if n_fault != 1 else ''}")
+    sentences: list[str] = []
+    if moves:
+        top = moves[0]
+        z = top.get("zscore") or 0.0
+        d20 = (top.get("changes") or {}).get("d20")
+        move = f" after {_an_change(d20)} in 20 sessions" if d20 and d20.get("value") is not None else ""
+        sentences.append(f"{top.get('label')} is {abs(z):.1f}σ {'above' if z >= 0 else 'below'} "
+                         f"its one-year average{move}.")
+        if len(moves) > 1:
+            sentences.append("Also new: " + _an_names([str(m.get("label")) for m in moves[1:]], 4) + ".")
+    else:
+        sentences.append("No new market move in this scan.")
+    if n_fault:
+        sentences.append(f"{n_fault} of the {report.get('flagged', len(items))} flagged readings come from "
+                         f"bad data (a split, a broken feed or a stale series), not from the market.")
+    if n_stretched:
+        sentences.append(f"{n_stretched} have sat beyond the threshold for more than a week: nothing new.")
+    return " · ".join(bits), " ".join(sentences)
+
+
+def anomaly_report_subject(report: dict) -> str:
+    items = report.get("items") or []
+    moves = [i for i in items if i.get("verdict") in ("sharp_move", "new_extreme")]
+    n_fault = len(report.get("faults") or []) + sum(1 for i in items if i.get("verdict") == "stale")
+    if moves:
+        top = moves[0]
+        d20 = (top.get("changes") or {}).get("d20")
+        if d20 and d20.get("value") is not None and d20.get("unit") == "pct":
+            lead = f"{top.get('label')} {_an_change(d20)} in 20 sessions"
+        else:
+            lead = f"{top.get('label')} {(top.get('zscore') or 0.0):+.1f}σ"
+        if len(moves) > 1:
+            lead += f", +{len(moves) - 1} more"
+    else:
+        lead = "no new market move"
+    if n_fault:
+        lead += f"; {n_fault} data fault{'s' if n_fault != 1 else ''}"
+    return f"GRID anomalies {_an_day(report.get('latest_obs') or report.get('as_of'))}: {lead}"
+
+
+def anomaly_report_sections(report: dict) -> list[dict]:
+    """The report as newsletter sections (situation first, faults and method last)."""
+    items = report.get("items") or []
+    threshold = report.get("threshold", 2.5)
+    by_feature = {str(i.get("feature")): i for i in items}
+    moves = [i for i in items if i.get("verdict") in ("sharp_move", "new_extreme")]
+    stretched = [i for i in items if i.get("verdict") == "stretched"]
+    counts_line, summary = anomaly_report_headline(report)
+    scanned = report.get("features_scanned")
+    label = (f"Anomaly scan, data through {_an_day_year(report.get('latest_obs') or report.get('as_of'))} · "
+             f"{report.get('flagged', len(items))} flagged"
+             + (f" of {scanned:,} features" if isinstance(scanned, int) else ""))
+    sections = [_section_summary(counts_line, label, summary, "amber" if moves else "")]
+
+    sections += [_an_move_section(i, threshold) for i in moves[:_ANOMALY_MAX_MOVE_CARDS]]
+    if len(moves) > _ANOMALY_MAX_MOVE_CARDS:
+        sections.append(_an_table_section(
+            "More new moves", "Also newly beyond the threshold.", moves[_ANOMALY_MAX_MOVE_CARDS:], "purple"))
+    if stretched:
+        sections.append(_an_table_section(
+            "Stretched, nothing new",
+            f"Beyond {threshold}σ of the one-year average for more than a week. For a price that has "
+            "trended all year this is the trend showing up in the average, not an event.", stretched))
+
+    faded = [i for i in items if i.get("verdict") == "faded"]
+    if faded:
+        text = (f"Flagged on the scan's shared data date ({_an_day(report.get('as_of'))}) and back inside "
+                f"{threshold}σ on their own latest observation: "
+                + ", ".join(f"{i.get('label')} ({(i.get('zscore') or 0.0):+.1f}σ)" for i in faded) + ".")
+        sections.append({"title": "Back inside the threshold", "plain": text,
+                         "body": f'<p style="margin:0;{_NOTE}">{html.escape(text)}</p>'})
+
+    faults = report.get("faults") or []
+    stale = [i for i in items if i.get("verdict") == "stale"]
+    if faults or stale:
+        texts = [_an_fault_text(f, by_feature) for f in faults]
+        texts += [
+            f"{i.get('label')}: no observation since {_an_day((i.get('fault') or {}).get('last_obs'))} "
+            f"({(i.get('fault') or {}).get('days_behind')} days). The scan is reading a carried-forward "
+            f"value, not a new one."
+            for i in stale]
+        sections.append({
+            "title": "Data faults: not market signals",
+            "body": "".join(f'<p style="margin:0 0 10px;">{html.escape(t)}</p>' for t in texts),
+            "plain": "\n".join(f"- {t}" for t in texts),
+            "accent": "red",
+        })
+
+    method = (f"A feature is flagged when its latest value is more than {threshold}σ from its one-year "
+              "average. Each change is rated against the feature's own past changes. \"What followed "
+              "before\" counts earlier crossings of the same threshold and is a description of the past "
+              "with its sample size, not a trading rule that has been tested.")
+    sections.append({"title": "How to read this", "plain": method,
+                     "body": f'<p style="margin:0;{_NOTE}">{html.escape(method)}</p>'})
+    return sections
+
+
+def send_anomaly_report(report: dict) -> None:
+    """E-mail one anomaly report (``intelligence.anomaly_report.build_report``)."""
+    if not report or not report.get("items"):
+        return
+    _send(anomaly_report_subject(report), anomaly_report_sections(report))
+
+
 def send_test_email() -> bool:
     """Send a test newsletter showcasing the template and expansion plan."""
     sections = [
