@@ -4,8 +4,8 @@
 One row per session, insert-only: a date that already has a row is left as it is unless ``--replace`` is given.
 Computes the prior completed trading session by default (never today's), the same rule as
 ``scripts/run_regime_state_vectors.py``. ``--from/--to`` backfills a range of sessions in date order; every record is
-computed only from what was known by the end of its own date, so a backfilled row equals what the nightly run would
-have written then (apart from the revised-vintage caveat in the module docstring).
+computed using date bounds and declared source availability policies. Modeled lags on revised backfills do not
+reconstruct the historical nightly result; that requires retained vintages and publication/capture evidence.
 
 Usage:
     python3 scripts/run_market_state.py                         # prior session
