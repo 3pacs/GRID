@@ -283,11 +283,21 @@ def _upsert_result(
 def _iter_impact_tickers(
     ranked_impact: Iterable[dict[str, Any]],
     limit: int = 25,
+    node_types: dict[str, str] | None = None,
 ) -> list[tuple[str, float, float]]:
-    """Extract (ticker, predicted_margin, predicted_rev_risk) triples from
+    """Extract (symbol, predicted_margin, predicted_rev_risk) triples from
     the ``ranked_impact`` list. Only keeps the top ``limit`` by |margin|
     to avoid scoring every long-tail downstream node.
+
+    Each node id becomes the US symbol it is scored on through
+    :func:`intelligence.supply_chain_symbols.symbol_for` (3pacs/GRID#1179):
+    private companies, commodities, countries, foreign listings and delisted
+    companies are dropped, and slugs map to their symbol (``tsmc`` -> TSM).
+    ``node_types``: ``{lower(id): supply_chain_nodes.type}``.
     """
+    from intelligence.supply_chain_symbols import symbol_for
+
+    types = node_types or {}
     out: list[tuple[str, float, float]] = []
     for entry in ranked_impact or []:
         if not isinstance(entry, dict):
@@ -295,9 +305,8 @@ def _iter_impact_tickers(
         tid = entry.get("id") or entry.get("ticker")
         if not tid or not isinstance(tid, str):
             continue
-        # Only "ticker-like" ids — commodity seeds like "cocoa_beans" have no
-        # price series, skip them cheaply.
-        if "_" in tid or len(tid) > 8:
+        tradable = symbol_for(tid, types.get(tid.strip().lower()))
+        if tradable.symbol is None:
             continue
         try:
             pm = float(entry.get("margin_impact_pct") or 0.0)
@@ -307,7 +316,7 @@ def _iter_impact_tickers(
             prr = float(entry.get("revenue_at_risk_usd") or 0.0)
         except (TypeError, ValueError):
             prr = 0.0
-        out.append((tid.strip().upper(), pm, prr))
+        out.append((tradable.symbol, pm, prr))
     out.sort(key=lambda x: abs(x[1]), reverse=True)
     return out[:limit]
 
@@ -466,7 +475,18 @@ def score_predictions(
             sim_at = sim_at.replace(tzinfo=timezone.utc)
         horizon = sim_at + timedelta(days=as_of_days_ago)
 
-        impact_tickers = _iter_impact_tickers(pred.ranked_impact)
+        try:
+            from intelligence.supply_chain_symbols import load_node_types
+
+            with engine.connect() as conn:
+                node_types = load_node_types(
+                    conn, (e.get("id") for e in pred.ranked_impact or [] if isinstance(e, dict))
+                )
+        except Exception as exc:  # noqa: BLE001 - fail closed: no types, no scores for this prediction
+            log.warning("contagion_backtest: node types unavailable, prediction {p} not scored: {e}",
+                        p=pred.id, e=str(exc))
+            continue
+        impact_tickers = _iter_impact_tickers(pred.ranked_impact, node_types=node_types)
         if not impact_tickers:
             continue
 
