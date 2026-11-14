@@ -5,10 +5,10 @@
 | Field | Value |
 |---|---|
 | Issue | #1129 (roadmap #1128; extends #960, does not replace it) |
-| Version | `d0-contract-v0`, **revision 5** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3) — **DRAFT, unsigned** |
+| Version | `d0-contract-v0`, **revision 5** (revision 2 answered the reviewer's first pass; revision 3 added the G11 SKEW receipts and the G6 status, §10.1; revision 4 adds the D2 daily-conditioner rule, §10.2; revision 5 answers the reviewer's re-checks of 88768412 and 217d9c91, §10.3; revision 6 makes historical D1 results diagnostic-only, §10.4) — **DRAFT, unsigned** |
 | Drafted | 2026-11-12, Claude, from origin/main `b27a2065` |
 | Research owner (signs) | **Claude** (named by the operator 2026-11-12); signature pending the reviewer's first pass |
-| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2). Re-checks of `88768412` (2026-11-13) and `217d9c91` (2026-11-14): **REQUEST_CHANGES**; revision 5 answers both (§10.3) |
+| Independent reviewer (signs the admission manifest) | **Codex** (named by the operator 2026-11-12). First pass received 2026-11-13: **REQUEST_CHANGES** on head `bf03b8e0`; revision 2 answers it (§10); revision 3 adds measurements only (§10.1); revision 4 adds one D2 rule (§10.2). Re-checks of `88768412` (2026-11-13) and `217d9c91` (2026-11-14): **REQUEST_CHANGES**; revision 5 answers both (§10.3). Re-check of `222e9083` (2026-11-14): **REQUEST_CHANGES** on historical availability only; revision 6 answers it (§10.4) |
 | Signing order | reviewer's first pass on this draft → owner revises and signs (body hash pinned) → reviewer runs §8 and signs the admission manifest per hypothesis |
 | Body hash | computed at signing over the text between the `D0-CONTRACT-BODY` markers (LF-normalised sha256), then pinned the house way: a `D0_CONTRACT_BODY_SHA256` constant checked by a test, as `analysis/gex_intraday_prereg.py:36` does |
 | Machine-readable manifest | `docs/research/d0-coverage-manifest-v0.json` |
@@ -234,10 +234,22 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
     measured publication time. Every input, C₀ included, must be available by D under §2.1 (clocks 2, 3
     and 4 at or before D):
     - **Forward period:** C₀'s retrieval time and durable-visibility receipt must both be at or before D.
-    - **Historical windows:** GRID did not retrieve these closes at the time. C₀'s availability by D is the
-      named proxy `PROXY_EOD_BY_DEADLINE`: the official close is disseminated after the closing auction,
-      and vendor end-of-day files are published the same evening. This is an assumption, not a receipt,
-      and every historical D1 result carries the label.
+    - **Historical windows: availability by D is unknown.** GRID did not retrieve these closes at the
+      time, and nothing held shows that a given close, in the version read today, existed by 20:00 ET
+      ("the same evening" is not a 20:00 bound). A historical run may read C₀ only under the label
+      `PROXY_EOD_BY_DEADLINE`, which names the gap and does not fill it:
+      - its clocks 2, 3 and 4 stay **unknown**, never treated as timely;
+      - its late-input exclusion cannot be applied, because no historical observation shows which closes
+        missed D, so no historical event is `EXCLUDED_LATE_INPUT` and the miss rate is reported as unknown;
+      - every result built on it is **DIAGNOSTIC_ONLY / NOT_ADMITTED**. It cannot satisfy any D1 GO,
+        RETIRE or HOLD verdict (§5.4), any admission (§8) or any claim beyond a description.
+      - §7.7's repaired-price exception covers the price **basis** only; it does not establish publication
+        time.
+
+      The only route to a judged historical D1 result is gap G15: a price-only availability exception tied
+      to a named source, version and basis and to retained evidence. It must state which clocks it does not
+      establish and which claims stay forbidden, and be qualified before any judged look. Until G15 is
+      closed, the D1 holdout (§5.2) stays unopened.
     - **Late or missing C₀:** an event whose C₀ is not available by D is `EXCLUDED_LATE_INPUT` and counted
       (§7 rule 4). It is skipped, never deferred to a later session, and C₀ is never backdated to D.
   - **Order latency (registered):** the entry is a market-on-open order for day +1, submitted no earlier
@@ -271,11 +283,21 @@ Consequence for D1: **Form 4 insider tests belong to the VS1 lane.** D1 opens no
     liquidity (higher first), then by accession number ascending.
   - **"Priced-in"** is shown as unknown when there is no PIT consensus or option-implied move,
   which is the default in v1 (`earnings_calendar` estimates are not PIT).
+- **Ranking implementation, frozen in source and tests before admission** (requirements, not yet built):
+  - **Quantile estimator:** one named estimator computes b₁ .. b₄ from the development strengths. It is
+    fixed in source, with tests, before the development data is read.
+  - **Zero or missing volatility:** an issuer whose 60-session volatility is zero or missing at P₋₁ has no
+    strength; the event is `EXCLUDED_INPUT` and counted, never given a substitute volatility.
+  - **Duplicate breakpoints:** if development strengths tie so that strict b₁ < b₂ < b₃ < b₄ do not exist,
+    the family is HOLD (cause recorded). Cutoffs are never invented, and never chosen after the holdout
+    is seen.
+  - **Liquidity (tie-break):** the universe measure, trailing 60-session median dollar volume ending the
+    session before A (§5.1 universe).
 
 ### 5.2 Windows (fixed before the EDGAR fetch)
 
 - Development: acceptance dates 2012-01-01 .. 2018-12-31.
-- Holdout: 2019-01-01 .. 2025-12-31, one look per family × horizon.
+- Holdout: 2019-01-01 .. 2025-12-31, one look per family × horizon. It stays unopened until G15 is closed (§5.1).
 - Forward: from the signing date, through the existing E2/S10 forward chain.
 
 No D1 family above has been tested on these windows by any ledger in §4 (VS1 covers insider density only).
@@ -323,6 +345,9 @@ Each horizon cell gets one verdict:
 - **UNDERPOWERED:** below its sample floor, or STOP_UNDERPOWERED.
 - **PASS:** it meets its floor and its statistical threshold (§5.3).
 - **FAIL:** it meets its floor but not its statistical threshold.
+
+Only results whose every input has clocks 2, 3 and 4 shown at or before D enter this table. A result
+built on `PROXY_EOD_BY_DEADLINE` (§5.1) is DIAGNOSTIC_ONLY and gets no verdict here.
 
 A family's verdict is the first of these rules that applies, in this order:
 1. **HOLD:** the EDGAR/universe gaps (G2, G3) are unresolved, or exclusions exceed 10 % in either cell.
@@ -626,6 +651,7 @@ Gaps block only the hypotheses named in the gap list below.
 | G12 | `forced_flow_monitor` ignores holidays; FOMC dates hard-coded for 2026 | forced-flow family (not in v1) | intelligence owner | Fix before any v2. Not fixed by #1141 |
 | G13 | No durable exact-version post-commit visibility receipt (clock 4), including corrections and retractions | historical admission of `people_events` and any table whose ingestion time is not commit visibility | people_events owner | Source-only design that links durable receipts to the canonical `people_events` pipeline, plus a disposable-PostgreSQL concurrency test plan. No second materializer, no historical repair, no runtime activation |
 | G14 | No authenticated admission verifier. The provisional checker refuses every `ADMITTED` (§8) | every admission, so every look | Claude (research owner), reviewed by Codex | Exact booleans and validated signature, hash and date formats; explicit required-input ids per hypothesis, each `ADMITTED`, with the sample floor measured and unknown dependencies refused; a durable-visibility state of applicable / qualified / not_applicable with reason and receipt, never null as an exemption; the pinned contract body digest verified at signing, and a manifest digest scope with no self-referential signature field. Source and synthetic tests only |
+| G15 | No qualified historical price-availability exception for D1: historical C₀ availability by D is unknown (§5.1) | every judged historical D1 result; the D1 holdout stays unopened | Claude (research owner), reviewed by Codex | A price-only exception tied to a named source, version and basis and to retained evidence. It states the clocks it does not establish and the claims it forbids, and is qualified before any judged look. No clock backfill and no outcome read. Until then historical D1 runs are DIAGNOSTIC_ONLY |
 
 ## 10. Revision 2: response to the reviewer's first pass (2026-11-13)
 
@@ -680,5 +706,15 @@ fixes a definition, a label or a precedence before any look.
 | 3. D2-H1 called the 15:59 intrinsic mark "cash settlement"; fee units ambiguous | Relabelled as a synthetic intrinsic-payoff proxy, with no exercise, assignment or after-hours claim. Fee bound to edge6: $0.0003 per share per leg ($0.03 per contract at the 100-share multiplier), four entry legs only. H2 and H3 unchanged | §6.2, §6.3, manifest D2-H1a/b |
 | Mixed-horizon precedence | D1: an UNDERPOWERED cell gives HOLD over any point estimate; FAIL + UNDERPOWERED is HOLD; PASS + FAIL with a point estimate ≤ 0 is HOLD (horizons disagree); GO also needs the §5.3 economic threshold. D2: RETIRE, then HOLD, then GO | §5.4, §6.5 |
 | F2 strength and ties | F2 uses the same scaled day-0 move as F1 (item type alone cannot form quintiles); one event per accession, Item 2.02 → F1; fixed per-family breakpoints, a value equal to a breakpoint goes up, then liquidity and accession number break ties | §5.1 |
+
+### 10.4 Revision 6: historical D1 availability (2026-11-14)
+
+This answers the re-check of `222e9083`. No threshold, window, horizon, level or sample floor changed, and
+no outcome was read.
+
+| Reviewer item | Change | Where |
+|---|---|---|
+| Historical `PROXY_EOD_BY_DEADLINE` asserted availability by 20:00 without receipts, against §2 and §8 | The proxy now names a gap and does not fill it. Historical clocks 2–4 stay unknown; no historical late-input exclusion is claimed; every result on the proxy is DIAGNOSTIC_ONLY / NOT_ADMITTED and gets no §5.4 verdict and no admission. A judged historical result needs a qualified price-only exception (new gap G15); until then the D1 holdout stays unopened | §5.1, §5.4, §9 G15 |
+| Implementation items before admission | Recorded as requirements, not built: one named quantile estimator fixed in source and tests before the development data is read; zero or missing volatility → `EXCLUDED_INPUT`; tied breakpoints → HOLD, never invented cutoffs; liquidity = the universe's 60-session median dollar volume | §5.1 |
 
 <!-- D0-CONTRACT-BODY-END -->
