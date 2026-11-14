@@ -471,6 +471,7 @@ class MarketState:
     news_shock: dict[str, Any] = field(default_factory=dict)
     gamma_state: dict[str, Any] = field(default_factory=dict)
     spy_basis: str | None = None
+    writer_provenance: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         ok = [k for k, v in self.variables.items() if v.get("status") == "ok"]
@@ -488,6 +489,7 @@ class MarketState:
                                                            if v.get("status") == "no_baseline"),
                          "total": len(self.variables)},
             "spy_basis": self.spy_basis,
+            "writer_provenance": self.writer_provenance,
         }
 
 
