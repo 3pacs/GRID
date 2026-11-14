@@ -113,6 +113,10 @@ class _FakeDB:
     predictions: list[dict[str, Any]] = field(default_factory=list)
     prices: list[_FakePrice] = field(default_factory=list)
     upserts: list[dict[str, Any]] = field(default_factory=list)
+    # supply_chain_nodes: {lower(id): type}; ids not listed have no node row
+    node_types: dict[str, str] = field(default_factory=lambda: {
+        "hsy": "ticker", "aapl": "ticker", "tsla": "ticker", "nvda": "ticker",
+        "cocoa_beans": "commodity", "somereallylongnode": "ticker"})
 
 
 class _FakeConn:
@@ -150,6 +154,11 @@ class _FakeConn:
             rows.sort(key=lambda row: (row[1], row[0]))
             rows = rows[:limit]
             return _Result(rows)
+
+        # Node types (read-only lookup before scoring)
+        if "from supply_chain_nodes" in sql:
+            return _Result([_Row((i, self._db.node_types[i])) for i in p.get("ids", [])
+                            if i in self._db.node_types])
 
         # Price fetch
         if "from raw_series" in sql:
@@ -386,6 +395,17 @@ def test_score_filters_non_ticker_nodes():
     # Only HSY should be scored.
     assert n == 1
     assert db.upserts[0]["ticker"] == "HSY"
+
+
+def test_score_drops_ids_without_a_node_row():
+    """Fail closed (Codex review of #1182): no supply_chain_nodes row, no score."""
+    db = _FakeDB()
+    db.predictions.append(_make_prediction(21, days_ago=7, ranked_impact=[
+        {"id": "corn", "margin_impact_pct": -0.10},  # no row: not the CORN fund
+        {"id": "HSY", "margin_impact_pct": -0.04},
+    ]))
+    assert score_predictions(_FakeEngine(db), as_of_days_ago=7) == 1
+    assert [u["ticker"] for u in db.upserts] == ["HSY"]
 
 
 def test_score_handles_json_string_ranked_impact():
