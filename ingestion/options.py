@@ -582,17 +582,7 @@ def cboe_chain_pages(doc: Any, ticker: str, today: date) -> dict[str, Any] | Non
             # Raw clocks retain their semantics. Last trade is not a bid/ask
             # update, and the undated document clock cannot certify freshness.
             "clockMetadata": {
-                "schema_version": 1,
-                "provider": "cboe",
-                "document_timestamp_raw": doc.get("timestamp") if isinstance(doc.get("timestamp"), str) else None,
-                "document_timestamp_timezone": "unknown",
-                "underlying_last_trade_raw": trade_time if isinstance(trade_time, str) else None,
-                "underlying_last_trade_timezone": "America/New_York",
                 "contract_last_trade_raw": item.get("last_trade_time") if isinstance(item.get("last_trade_time"), str) else None,
-                "contract_last_trade_timezone": "unknown",
-                "bid_ask_updated_at": None,
-                "bid_ask_freshness": "unknown",
-                "synchronization": "unknown",
             },
             "strike": strike,
             "lastPrice": _finite(item.get("last_trade_price")),
@@ -603,6 +593,20 @@ def cboe_chain_pages(doc: Any, ticker: str, today: date) -> dict[str, Any] | Non
             "impliedVolatility": iv if iv is not None and iv > 0 else None,
             "inTheMoney": bool(spot is not None and (strike < spot if is_call else strike > spot)),
         })
+    # Shared provider/document semantics belong once per capture, not on
+    # every contract. Contract rows join this through capture_batch_id.
+    quote["clockMetadata"] = {
+        "schema_version": 2,
+        "provider": "cboe",
+        "document_timestamp_raw": doc.get("timestamp") if isinstance(doc.get("timestamp"), str) else None,
+        "document_timestamp_timezone": "unknown",
+        "underlying_last_trade_raw": trade_time if isinstance(trade_time, str) else None,
+        "underlying_last_trade_timezone": "America/New_York",
+        "contract_last_trade_timezone": "unknown",
+        "bid_ask_updated_at": None,
+        "bid_ask_freshness": "unknown",
+        "synchronization": "unknown",
+    }
     return {"expirations": sorted(pages), "pages": pages, "quote": quote}
 
 
@@ -1190,15 +1194,16 @@ class OptionsPuller(BasePuller):
                         "INSERT INTO options_capture_batches "
                         "(capture_batch_id, ticker, snap_date, capture_ordinal, "
                         "capture_started_at, capture_completed_at, row_count, "
-                        "spot_price, capture_source, provider_regular_market_at, spot_provider) "
+                        "spot_price, capture_source, provider_regular_market_at, spot_provider, clock_metadata) "
                         "VALUES (:batch_id, :ticker, :snap_date, :ordinal, "
-                        ":started_at, :completed_at, :row_count, :spot, :source, :spot_market_at, :spot_provider)"
+                        ":started_at, :completed_at, :row_count, :spot, :source, :spot_market_at, :spot_provider, CAST(:clock_metadata AS JSONB))"
                     ),
                     {"batch_id": batch_id, "ticker": ticker, "snap_date": today_str,
                      "ordinal": capture_ordinal, "started_at": capture_started_at,
                      "completed_at": completed_at, "row_count": len(batch_rows),
                      "spot": float(spot_price), "source": capture_source,
-                     "spot_market_at": spot_market_at, "spot_provider": spot_provider},
+                     "spot_market_at": spot_market_at, "spot_provider": spot_provider,
+                     "clock_metadata": json.dumps(quote.get("clockMetadata")) if isinstance(quote.get("clockMetadata"), dict) else None},
                 )
                 snapshots_inserted = 0
                 rows_known = True

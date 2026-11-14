@@ -284,12 +284,15 @@ def test_pull_ticker_publishes_a_cboe_batch(monkeypatch: pytest.MonkeyPatch) -> 
     db = puller.engine
     assert len(db.batches) == 1 and db.batches[0]["row_count"] == 7
     assert db.rows
+    batch_clocks = json.loads(db.batches[0]["clock_metadata"])
+    assert batch_clocks["provider"] == "cboe"
+    assert batch_clocks["bid_ask_freshness"] == "unknown"
+    assert batch_clocks["bid_ask_updated_at"] is None
+    assert batch_clocks["document_timestamp_raw"] == _doc()["timestamp"]
     for row in db.rows:
         clocks = json.loads(row["clock_metadata"])
-        assert clocks["provider"] == "cboe"
-        assert clocks["bid_ask_freshness"] == "unknown"
-        assert clocks["bid_ask_updated_at"] is None
-        assert clocks["document_timestamp_raw"] == _doc()["timestamp"]
+        assert set(clocks) == {"contract_last_trade_raw"}
+
     assert db.batches[0]["spot"] == pytest.approx(95.4576)
     assert {r["expiry"] for r in db.rows} == {"2026-11-06", "2026-11-13"}
     assert all(r["provider_regular_market_at"].date() == date(2026, 11, 5) for r in db.rows)
@@ -318,9 +321,9 @@ def test_cboe_clock_metadata_keeps_unknown_quote_time():
     doc["data"]["last_trade_time"] = "2026-11-05T19:00:00"
     chain = options.cboe_chain_pages(doc, "KO", date(2026, 11, 5))
     row = chain["pages"][NOV06]["calls"][0]
-    clocks = row["clockMetadata"]
+    clocks = chain["quote"]["clockMetadata"]
     assert clocks["underlying_last_trade_raw"] == "2026-11-05T19:00:00"
-    assert clocks["contract_last_trade_raw"] == doc["data"]["options"][0]["last_trade_time"]
+    assert row["clockMetadata"]["contract_last_trade_raw"] == doc["data"]["options"][0]["last_trade_time"]
     assert clocks["document_timestamp_raw"] == doc["timestamp"]
     assert clocks["bid_ask_updated_at"] is None
     assert clocks["bid_ask_freshness"] == clocks["synchronization"] == "unknown"
@@ -335,8 +338,8 @@ def test_cboe_clock_metadata_missing_clocks_are_not_invented():
     chain = options.cboe_chain_pages(doc, "KO", date(2026, 11, 5))
     clocks = chain["pages"][NOV06]["calls"][0]["clockMetadata"]
     assert clocks["contract_last_trade_raw"] is None
-    assert clocks["document_timestamp_raw"] is None
-    assert clocks["bid_ask_updated_at"] is None
+    assert chain["quote"]["clockMetadata"]["document_timestamp_raw"] is None
+    assert chain["quote"]["clockMetadata"]["bid_ask_updated_at"] is None
 
 
 def test_advancing_underlying_never_certifies_unchanged_option_quotes():
@@ -350,7 +353,7 @@ def test_advancing_underlying_never_certifies_unchanged_option_quotes():
     assert first["quote"]["regularMarketTime"] < later["quote"]["regularMarketTime"]
     assert (a["bid"], a["ask"], a["impliedVolatility"]) == (b["bid"], b["ask"], b["impliedVolatility"])
     assert a["clockMetadata"]["contract_last_trade_raw"] == b["clockMetadata"]["contract_last_trade_raw"]
-    assert b["clockMetadata"]["bid_ask_freshness"] == "unknown"
+    assert later["quote"]["clockMetadata"]["bid_ask_freshness"] == "unknown"
 
 
 def test_clock_metadata_does_not_reinterpret_unexpected_raw_clock_types():
@@ -360,6 +363,6 @@ def test_clock_metadata_does_not_reinterpret_unexpected_raw_clock_types():
         item["last_trade_time"] = 1234
     chain = options.cboe_chain_pages(doc, "KO", date(2026, 11, 5))
     clocks = chain["pages"][NOV06]["calls"][0]["clockMetadata"]
-    assert clocks["document_timestamp_raw"] is None
+    assert chain["quote"]["clockMetadata"]["document_timestamp_raw"] is None
     assert clocks["contract_last_trade_raw"] is None
-    assert clocks["synchronization"] == "unknown"
+    assert chain["quote"]["clockMetadata"]["synchronization"] == "unknown"
