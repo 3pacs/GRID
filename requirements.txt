@@ -24,7 +24,7 @@ edgartools>=4.6.3
 # load_workbook, styles), and pandas .to_excel/.read_excel paths in
 # ingestion/altdata (aaii_sentiment, nyfed_gscpi) + ingestion/trade (wiod)
 # also default to the openpyxl engine for .xlsx.
-openpyxl>=3.1.0
+openpyxl>=3.1.5
 
 # Analysis
 scikit-learn>=1.4.0
@@ -65,7 +65,7 @@ langfuse>=4.15.2
 akshare>=1.14.0
 dbnomics>=0.2.6
 eurostat>=1.1.1
-requests-cache>=1.1.0
+requests-cache>=1.3.3
 
 # Trade data
 comtradeapicall>=0.1.4
@@ -101,7 +101,7 @@ xgboost>=3.4.1; python_version >= "3.12"
 fastapi>=0.139.0,<0.140.0
 uvicorn>=0.49.0
 python-multipart>=0.0.6
-python-jose[cryptography]>=3.5.0
+PyJWT>=2.15.1,<3
 passlib[bcrypt]>=1.7.4
 bcrypt>=4.0,<4.1
 httpx>=0.26.0

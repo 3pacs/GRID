@@ -496,6 +496,8 @@ SEED_MAPPINGS: dict[str, str] = {
     "finra:short_volume_agg:spy_ratio": "finra_short_volume_ratio_spy",
     "finra:short_volume_agg:qqq_ratio": "finra_short_volume_ratio_qqq",
     "finra:short_volume_agg:iwm_ratio": "finra_short_volume_ratio_iwm",
+    # DIX (ingestion/altdata/finra_dix.py; migration finra_dix_feature_20261113)
+    "finra:dix_sp500": "finra_dix_sp500",
 
     # ── WorldNews series (wn_*) ──────────────────────────────────────────
     "wn_geopolitical_article_count": "wn_geopolitical_article_count",

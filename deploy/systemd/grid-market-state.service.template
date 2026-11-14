@@ -1,0 +1,28 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) activates the nightly market-state record
+# (intelligence/regime/market_state.py, rule market-state/1) and needs an explicit operator decision.
+# Install (on grid-svr):
+#   sudo cp deploy/systemd/grid-market-state.service.template /etc/systemd/system/grid-market-state.service
+#   sudo cp deploy/systemd/grid-market-state.timer.template   /etc/systemd/system/grid-market-state.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-market-state.timer
+# Backfill once before enabling: the news-index vintages first, then the records (sessions in date order;
+# insert-only, so a rerun skips what exists):
+#   python3 -m ingestion.fred_vintages backfill
+#   python3 -m ingestion.altdata.finra_dix --backfill 2018-08-01 <yesterday>
+#   python3 scripts/run_dealer_gex_daily.py --from 2026-09-26 --to <yesterday>
+#   python3 scripts/run_market_state.py --no-refresh --from 2019-01-02 --to <yesterday>
+# Nightly order: finra_dix (smart scheduler) and run_dealer_gex_daily.py before this unit.
+[Unit]
+Description=GRID market-state record writer (prior completed session only, point-in-time, insert-only)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/flock -n /tmp/grid-market-state.lock /usr/bin/python3 /data/grid_v4/grid_release/scripts/run_market_state.py --json
+TimeoutStartSec=15min
+Nice=10
+StandardOutput=journal
+StandardError=journal

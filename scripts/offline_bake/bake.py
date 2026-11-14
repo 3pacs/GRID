@@ -94,16 +94,16 @@ def mint_admin_jwt() -> str:
     if not secret or secret == "dev-secret-change-me":
         raise RuntimeError("GRID_JWT_SECRET missing in repo .env")
     try:
-        from jose import jwt as jose_jwt
+        import jwt
     except ImportError as exc:
-        raise RuntimeError("python-jose not installed: pip install python-jose") from exc
+        raise RuntimeError("PyJWT not installed: pip install PyJWT") from exc
     payload = {
         "sub": "mirror-baker",
         "role": "admin",
         "exp": datetime.now(timezone.utc) + timedelta(hours=24),
         "iat": datetime.now(timezone.utc),
     }
-    return jose_jwt.encode(payload, secret, algorithm="HS256")
+    return jwt.encode(payload, secret, algorithm="HS256")
 
 
 def fetch(url: str, *, token: str = "", max_bytes: int = 25 * 1024 * 1024,

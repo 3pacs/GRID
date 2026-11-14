@@ -684,11 +684,24 @@ def test_main_day_and_lookback(tmp_path, closes, monkeypatch, capsys):
     monkeypatch.setattr(grader, "default_client_factory", lambda: None)
     import types
     monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: FakeEngine()))
+    # Both runs read the wall clock (graded_at, and the lookback window ends yesterday): pin it
+    # 6 days after DAY, so the window is DAY .. DAY+5 (unpinned, DAY fell out of the window on
+    # 2026-11-14 and every run went red).
+    class _SixDaysOn(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(DAY.year, DAY.month, DAY.day, 11, 35, tzinfo=timezone.utc) + timedelta(days=6)
+
+    monkeypatch.setattr(grader, "datetime", _SixDaysOn)
     code = grader.main(["--day", DAY.isoformat(), "--packet-root", str(packet_root), "--review-root", str(review_root)])
     out = capsys.readouterr().out
     assert code == 0 and f"{DAY}: WRITTEN rows=4" in out and "ingest=INGESTED" in out
-    # lookback: days without a packet are skipped silently, the graded day is UNCHANGED
-    code = grader.main(["--lookback", "6", "--packet-root", str(packet_root), "--review-root", str(review_root), "--json"])
+    # lookback: days without a packet are skipped silently, the graded day is UNCHANGED.
+    # The window ends at the real yesterday, so size it to reach back to the fixed DAY
+    # (a constant 6 stopped covering DAY once the wall clock passed 2026-11-13).
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    lookback = max(6, (yesterday - DAY).days + 1)
+    code = grader.main(["--lookback", str(lookback), "--packet-root", str(packet_root), "--review-root", str(review_root), "--json"])
     receipts = json.loads(capsys.readouterr().out)
     assert code == 0 and [r["state"] for r in receipts] == ["UNCHANGED"]
     with pytest.raises(SystemExit):
