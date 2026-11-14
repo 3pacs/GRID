@@ -20,8 +20,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import ledger as L
-from .data import PolygonMinuteSource
+from .data import EdgarEventSource, PolygonDailySource, PolygonMinuteSource
 from .runner import build_status, run_cycle
+
+
+def _extras(source: PolygonMinuteSource, data: Path) -> dict:
+    """Sources of the multi-day event families: daily bars (same key and request cap as the
+    minute bars) and SEC filings (needs ``SEC_USER_AGENT``; without it nothing is registered)."""
+    return {"daily": PolygonDailySource(source), "events": EdgarEventSource(data / "bars.sqlite3")}
 
 
 def _paths(args) -> tuple[str | None, str | None, Path]:
@@ -40,7 +46,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-register", action="store_true")
     ap.add_argument("--max-requests", type=int, default=400)
+    ap.add_argument("--family", help="with --dry-run: preview this family's next queue item")
     args = ap.parse_args(argv)
+    if args.family and not args.dry_run:
+        ap.error("--family is a dry-run preview")
     led, anc, data = _paths(args)
 
     if args.command == "genesis":
@@ -55,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         source = PolygonMinuteSource(data / "bars.sqlite3", max_requests=args.max_requests)
         # opened inside the cycle lock, so a second process never works from a stale copy
         summary = run_cycle(lambda: L.open_ledger(led, anc), source, data, dry_run=args.dry_run,
-                            register=not args.no_register)
+                            register=not args.no_register, extras=_extras(source, data),
+                            only_family=args.family)
         print(json.dumps(summary, indent=1, sort_keys=True, default=str))
         return 0
     if led and anc:
@@ -87,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     source = PolygonMinuteSource(data / "bars.sqlite3", max_requests=args.max_requests)
-    summary = run_cycle(ledger, source, data, dry_run=args.dry_run, register=not args.no_register)
+    summary = run_cycle(ledger, source, data, dry_run=args.dry_run, register=not args.no_register,
+                        extras=_extras(source, data), only_family=args.family)
     print(json.dumps(summary, indent=1, sort_keys=True, default=str))
     return 0
 

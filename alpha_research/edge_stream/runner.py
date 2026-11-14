@@ -33,6 +33,7 @@ from . import ledger as L
 from . import policy as P
 from . import sanity
 from .data import BarSource, RequestCapReached, SourceError, manifest_sha256, today_et
+from .ledger import sha256_bytes
 from .families import FAMILIES, QUEUE, build_proposal, code_sha256
 from .stats import judge
 
@@ -70,11 +71,31 @@ def _read(reg: dict, source: BarSource, today: date) -> tuple[dict, date, date]:
     return bars, start, end
 
 
-def forward_progress(reg: dict, source: BarSource, today: date) -> dict:
+def _is_event(family) -> bool:
+    return getattr(family, "kind", "session") == "event"
+
+
+def _event_sources(extras: dict | None) -> tuple:
+    """(daily source, event source) of a multi-day event family, or SourceError."""
+    if not extras or "daily" not in extras or "events" not in extras:
+        raise SourceError("daily-bar and filing sources are not configured")
+    why = extras["events"].ready()
+    if why:
+        raise SourceError(why)
+    return extras["daily"], extras["events"]
+
+
+def forward_progress(reg: dict, source: BarSource, today: date, extras: dict | None = None) -> dict:
     """Sessions available to a forward registration (presence only; no outcome)."""
     family = FAMILIES[reg["family"]]
-    bars, start, end = _read(reg, source, today)
-    days = sorted({d for t, s in bars.items() for d, b in s.items() if d >= start.isoformat() and family.needed(b)})
+    if _is_event(family):
+        daily, _ = _event_sources(extras)
+        start, end = date.fromisoformat(reg["window"]["start"]), today
+        days = [b[0] for b in daily.daily(family.hedge, start, end)]
+    else:
+        bars, start, end = _read(reg, source, today)
+        days = sorted({d for t, s in bars.items() for d, b in s.items()
+                       if d >= start.isoformat() and family.needed(b)})
     target = reg["window"]["n_target_sessions"]
     elapsed = _weekdays_between(start, end)
     ready = len(days) >= target or elapsed >= reg["window"]["max_sessions"]
@@ -84,10 +105,39 @@ def forward_progress(reg: dict, source: BarSource, today: date) -> dict:
             "window_end": window_end}
 
 
-def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date) -> tuple[dict, bytes]:
+def _event_look(reg_sha: str, reg: dict, family, today: date, extras: dict | None) -> tuple[dict, bytes]:
+    """The look of a multi-day event family: trades from filings and daily bars, pooled, one trial."""
+    daily, events = _event_sources(extras)
+    start = date.fromisoformat(reg["window"]["start"])
+    if reg["lane"] == "history":
+        end = date.fromisoformat(reg["window"]["end"])
+    else:
+        prog = forward_progress(reg, None, today, extras)
+        if not prog["ready"]:
+            raise NotReady(f"{prog['sessions']}/{prog['target']} sessions")
+        end = date.fromisoformat(prog["window_end"])
+    got = family.collect(list(reg["instruments"]), start, end, daily, events)
+    trades = got["trades"]
+    result = {"trial_id": reg["trials"][0]["trial_id"], **judge(trades, reg["alpha_trial"], reg["directional"])}
+    manifest = sha256_bytes(P.canonical_bytes(got["used"]))
+    data = {"source": f"{type(daily).__name__} + {type(events).__name__}", "manifest_sha256": manifest,
+            "window_start": start.isoformat(), "window_end": end.isoformat(),
+            "sessions_in_window": sum(1 for d in got["sessions"] if d >= start.isoformat()),
+            "events_skipped": dict(sorted(got["skipped"].items())),
+            "instruments_left_out": dict(sorted(got["left_out"].items())),
+            "resampling_unit": "ISO week of entry (the 'sessions' count of the trial is weeks)",
+            "costs": "policy floor per side on four sides (stock and hedge, in and out) + short carry; "
+                     "daily bars carry no bid/ask"}
+    return _finish(reg_sha, reg, result, {}, data, trades)
+
+
+def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date,
+                 extras: dict | None = None) -> tuple[dict, bytes]:
     family = FAMILIES.get(reg["family"])
     if family is None or code_sha256(family) != reg["code_sha256"]:
         raise CodeChanged(f"family {reg['family']} code differs from the registered sha")
+    if _is_event(family):
+        return _event_look(reg_sha, reg, family, today, extras)
     bars, start, end = _read(reg, source, today)
     window_end = end.isoformat()
     if reg["lane"] == "forward":
@@ -125,7 +175,16 @@ def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date) -> tup
     }
     for v in per_instrument.values():
         v["role"] = "descriptive only (the registered trial is pooled)"
-    manifest = manifest_sha256(used)
+    data = {"source": type(source).__name__, "manifest_sha256": manifest_sha256(used),
+            "window_start": start.isoformat(), "window_end": window_end,
+            "sessions_skipped": skipped,
+            "costs": "policy floor per side: max(usd, bp x price); Polygon bars carry no bid/ask"}
+    return _finish(reg_sha, reg, result, per_instrument, data, trades)
+
+
+def _finish(reg_sha: str, reg: dict, result: dict, per_instrument: dict, data: dict,
+            trades: list[dict]) -> tuple[dict, bytes]:
+    """The look record and the canonical report bytes of one judged trial."""
     report = {
         "schema": REPORT_SCHEMA,
         "registration_sha256": reg_sha,
@@ -138,10 +197,7 @@ def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date) -> tup
         "verdict": result["verdict"],
         "trial": result,
         "per_instrument": per_instrument,
-        "data": {"source": type(source).__name__, "manifest_sha256": manifest,
-                 "window_start": start.isoformat(), "window_end": window_end,
-                 "sessions_skipped": skipped,
-                 "costs": "policy floor per side: max(usd, bp x price); Polygon bars carry no bid/ask"},
+        "data": data,
         "consumption_disclosure": [c for c in P.PRIOR_CONSUMPTION if c["group"] == reg["group"]],
         "trades": [{k: (round(v, 10) if isinstance(v, float) else v) for k, v in x.items()} for x in trades],
         "promotion_allowed": False,
@@ -152,7 +208,8 @@ def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date) -> tup
         "trials": [{k: result.get(k) for k in ("trial_id", "verdict", "n", "n_long", "n_short", "sessions",
                                                "mean_net", "mean_long", "mean_short", "bootstrap_lower", "t_lower",
                                                "always_long_mean_net", "reasons")}],
-        "data": {"manifest_sha256": manifest, "window_start": start.isoformat(), "window_end": window_end},
+        "data": {"manifest_sha256": data["manifest_sha256"], "window_start": data["window_start"],
+                 "window_end": data["window_end"]},
         "code_sha256": reg["code_sha256"],
     }
     return look, body
@@ -247,14 +304,20 @@ def _proposal_day(item: dict, today: date, now: datetime) -> date:
 
 
 def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime | None = None,
-              dry_run: bool = False, register: bool = True) -> dict:
+              dry_run: bool = False, register: bool = True, extras: dict | None = None,
+              only_family: str | None = None) -> dict:
     """One cycle. ``ledger`` is a Ledger, or a zero-argument opener called inside the lock
-    (the CLI passes one, so a second process never works from a stale copy)."""
+    (the CLI passes one, so a second process never works from a stale copy). ``extras``:
+    ``{"daily": DailySource, "events": EventSource}`` for multi-day event families.
+    ``only_family`` (dry runs only) previews that family's next queue item instead of the first."""
+    if only_family and not dry_run:
+        raise ValueError("only_family is a dry-run preview; a real cycle takes the queue in order")
     now = now or datetime.now(timezone.utc)
     today = today_et(now)
     data_dir = Path(data_dir)
     summary: dict = {"at": now.isoformat(), "today_et": today.isoformat(), "dry_run": dry_run,
-                     "looks": [], "forward": [], "registered": [], "rejected": [], "abandoned": [], "errors": []}
+                     "looks": [], "forward": [], "registered": [], "rejected": [], "abandoned": [], "errors": [],
+                     "deferred": []}
     with cycle_lock(data_dir):
         if callable(ledger) and not isinstance(ledger, Ledger):
             ledger = ledger()
@@ -263,16 +326,19 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
         for reg_sha, reg in state.open_registrations():
             try:
                 if reg["lane"] == "forward":
-                    prog = forward_progress(reg, source, today)
+                    prog = forward_progress(reg, source, today, extras)
                     summary["forward"].append({"registration": reg_sha[:16], **prog})
                     if not prog["ready"] or dry_run:
                         continue
                 elif dry_run:
+                    if _is_event(FAMILIES.get(reg["family"])):
+                        summary["looks"].append({"registration": reg_sha[:16], "would_look": True})
+                        continue
                     bars, start, _ = _read(reg, source, today)
                     summary["looks"].append({"registration": reg_sha[:16], "would_look": True,
                                              "sessions_cached": {t: len(s) for t, s in bars.items()}})
                     continue
-                look, body = compute_look(reg_sha, reg, source, today)
+                look, body = compute_look(reg_sha, reg, source, today, extras)
             except CodeChanged as exc:
                 if not dry_run:
                     L.append_abandoned(ledger, reg_sha, str(exc))
@@ -297,11 +363,23 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
             summary["looks"].append({"registration": reg_sha[:16], "proposal_id": reg["proposal_id"],
                                      "verdict": look["verdict"]})
             log.info("edge_stream look {p}: {v}", p=reg["proposal_id"], v=look["verdict"])
+        # the code's policy must be the policy in force before anything new is sealed; an open
+        # registration sealed under the old one was closed above (its code hash carries the policy)
+        if not dry_run:
+            try:
+                amended = L.amend_policy(ledger, f"code policy {P.POLICY_VERSION}", now.isoformat())
+                if amended:
+                    summary["policy_amended"] = {"amendment": amended[:16], "policy_sha256": P.policy_sha256()}
+                    log.info("edge_stream policy amended to {v}", v=P.POLICY_VERSION)
+            except L.StreamRefused as exc:
+                summary["errors"].append({"policy": str(exc)})
+                register = False
         state = L.load_state(ledger)
+        policy_ok = dry_run or state.policy_sha256 == P.policy_sha256()
         # 2. confirmations
         for reg_sha, look in state.looks.items():
             reg = state.registrations[reg_sha]
-            if reg["stage"] != 1 or look["verdict"] != "PASS" or dry_run:
+            if reg["stage"] != 1 or look["verdict"] != "PASS" or dry_run or not policy_ok:
                 continue
             if any(r.get("confirms") == reg_sha for r in state.registrations.values()):
                 continue
@@ -320,12 +398,24 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
                     continue
                 if (item["family"], item["group"], item["lane"]) in done or item["family"] not in FAMILIES:
                     continue
+                if only_family and item["family"] != only_family:
+                    continue
+                if _is_event(FAMILIES[item["family"]]):
+                    # sealed only when its sources can be read: a registration that could never
+                    # look would be abandoned with its alpha and window spent
+                    try:
+                        _event_sources(extras)
+                    except SourceError as exc:
+                        summary["deferred"].append({"family": item["family"], "group": item["group"],
+                                                    "reason": str(exc)})
+                        continue
                 try:
                     prop = build_proposal(item, _proposal_day(item, today, now), proposer=item["proposer"])
                 except Exception as exc:  # a malformed inbox proposal
                     summary["rejected"].append({"proposal": str(item)[:200], "error": repr(exc)})
                     continue
-                if _register_or_reject(ledger, state, prop, today, now, data_dir, summary, dry_run, source):
+                if _register_or_reject(ledger, state, prop, today, now, data_dir, summary, dry_run, source,
+                                       extras):
                     break
         state = L.load_state(ledger)
         status = build_status(ledger, state, now, summary)
@@ -336,18 +426,39 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
     return summary
 
 
-def preflight(prop: dict, source: BarSource, today: date) -> dict:
+def preflight(prop: dict, source: BarSource, today: date, extras: dict | None = None) -> dict:
     """Dry-run data check for a would-be registration: sessions whose needed bars exist.
 
     Presence only (no price is compared, no trade formed), so a preflight spends nothing.
+    For an event family: sessions in the window, filings found, and the hour of day they
+    were accepted (a check of the filing clock), with no price read beyond the session dates.
     """
     family = FAMILIES[prop["family"]]
+    if _is_event(family):
+        daily, events = _event_sources(extras)
+        start, end = date.fromisoformat(prop["window"]["start"]), date.fromisoformat(prop["window"]["end"])
+        sessions = [b[0] for b in daily.daily(family.hedge, start, end)]
+        hours: dict[str, int] = {}
+        n_events, left_out = 0, []
+        for t in prop["instruments"]:
+            found = events.events(t, start - timedelta(days=family.events_lookback_days), end)
+            if found is None:
+                left_out.append(t)
+                continue
+            for e in family.company_events(found):
+                if e["filing_date"] >= start.isoformat():
+                    n_events += 1
+                    hours[e["accepted_et"][11:13]] = hours.get(e["accepted_et"][11:13], 0) + 1
+        return {"sessions": len(sessions), "instruments": len(prop["instruments"]), "left_out": len(left_out),
+                "left_out_tickers": left_out, "events_in_window": n_events,
+                "accepted_hour_et": dict(sorted(hours.items()))}
     bars, start, _ = _read(prop, source, today)
     return {t: sum(1 for d, b in s.items() if d >= start.isoformat() and family.needed(b)) for t, s in bars.items()}
 
 
 def _register_or_reject(ledger: Ledger, state: L.StreamState, prop: dict, today: date, now: datetime,
-                        data_dir: Path, summary: dict, dry_run: bool, source: BarSource | None = None) -> bool:
+                        data_dir: Path, summary: dict, dry_run: bool, source: BarSource | None = None,
+                        extras: dict | None = None) -> bool:
     # one clock for the record: recorded_at and the budget epoch are UTC; windows are ET dates
     prop = {**prop, "recorded_at": now.isoformat(), "epoch": now.year}
     try:
@@ -360,7 +471,7 @@ def _register_or_reject(ledger: Ledger, state: L.StreamState, prop: dict, today:
             row = {"would_register": prop["proposal_id"], "window": prop["window"]}
             if source is not None and prop["lane"] == "history":
                 try:
-                    row["preflight_sessions_with_bars"] = preflight(prop, source, today)
+                    row["preflight_sessions_with_bars"] = preflight(prop, source, today, extras)
                 except SourceError as exc:
                     row["preflight_error"] = str(exc)
             summary["registered"].append(row)
