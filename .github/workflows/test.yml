@@ -870,6 +870,25 @@ jobs:
             exit 1
           fi
 
+      # #1194: an intraday pull then a POLICY_ELIGIBLE close pull must yield a
+      # close vintage under the real ON CONFLICT DO NOTHING, and
+      # scripts/audit_stuck_close_vintages.py must report a stuck cell
+      # read-only. A skip (PostgreSQL unreachable) must fail this step.
+      - name: Stuck close vintages PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_STUCK_CLOSE_AUDIT_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_audit_stuck_close_vintages_pg.py -q -rA | tee /tmp/grid-stuck-close-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-stuck-close-pg.txt; then
+            echo "::error::Stuck close vintages PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # scripts/repair_full_panel_vintages.py (PRICE BASIS POLICY repair):
       # scope from the entity-map feed, dry run writes nothing, --apply appends
       # retractions and re-vintages only, NEEDS_BACKFILL/skipped/excluded
