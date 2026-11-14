@@ -631,6 +631,14 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # timeout_s 600, TIINGO_API_KEY, with a 2-line comment) and its
         # REGISTRY_CATALOG_NAMES alias finra_dix -> FINRA_SHORT_VOLUME. Needs
         # reviewer acceptance like the prior pins.
+        # OPER re-pinned be8b5f59 -> cf33f834 (2026-11-13,
+        # feat/supply-chain-8k-20261113, 3pacs/GRID#1180): the only operator
+        # edits are a new _daily_intel_supply_chain_8k wrapper (calls
+        # ingestion.altdata.supply_chain_8k.run_daily), its DAILY_INTEL_TASKS
+        # entry after corporate_actions, and a DAILY_INTEL_HOLD_REASONS entry:
+        # the task is held (not in DAILY_INTEL_INITIAL_ALLOWLIST), so nothing
+        # new runs until the owner releases it. Needs reviewer acceptance like
+        # the prior pins.
         # OPER re-pinned 69b8efc2 -> be8b5f59 (2026-11-13,
         # feat/supply-chain-weekly-20261113, 3pacs/GRID#1179): the only operator
         # edit is two _run_intel_task calls appended to the Sunday weekly block
@@ -639,7 +647,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','be8b5f59a2d215b6815f07848d2d3232ea207c80c90eae375d9e5d90ea294054'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','cf33f8349489c3635f9be93a3d58426d9248ce0082d5a7cffa5605d2838ed208'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
