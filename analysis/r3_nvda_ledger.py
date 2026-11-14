@@ -576,12 +576,234 @@ def run_scenarios(records: list[dict[str, Any]], spec: dict[str, Any]) -> dict[s
     return out
 
 
+# Additive offline desk view. Frozen scenario calculation above is unchanged.
+DESK_CASH_SHA256 = "f91269644600989380e6ec03dac43c9187b95232b8535557ca28d7c1934fd902"
+# First receipt of this exact integration bundle, not a claimed original filing receipt.
+DESK_BUNDLE_OBSERVED_AT = "2026-11-14T09:27:06.330970+00:00"
+
+
+def _desk_clock(value: str) -> datetime:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value
+    ):
+        raise ValueError("desk clock must be a full timezone-aware ISO datetime")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _desk_source_clock(value: str) -> datetime:
+    # Date-only ledger publications are conservatively unavailable until next midnight.
+    from datetime import timedelta
+
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return _desk_clock(value + "T00:00:00Z") + timedelta(days=1)
+    return _desk_clock(value)
+
+
+def _desk_cash(cash: dict, records: list[dict]) -> dict:
+    """Recalculate the pinned adapter artifact; do not reclassify it as new source verification."""
+    from analysis.r3_nvda_cash_source import LABELS, SPECS, derive_q2, reconcile
+
+    if cash.get("schema") != "nvda-cash-reconciliation/1":
+        raise ValueError("unsupported cash artifact schema")
+    facts = cash["facts"]
+    if set(facts) != {"Q1", "H1", "Q2"}:
+        raise ValueError("exact Q1, H1 and derived Q2 periods required")
+    sources = {}
+    for period in ("Q1", "H1"):
+        spec = SPECS[period]
+        if set(facts[period]) != set(LABELS):
+            raise ValueError("cash field coverage changed")
+        matches = [r for r in records if r["source"]["url"] == spec["url"]
+                   and r["source"]["retrieved_sha256"] == spec["sha256"]]
+        if not matches:
+            raise ValueError("cash source absent from frozen ledger")
+        for item in facts[period].values():
+            if type(item["value"]) not in (int, float) or not math.isfinite(item["value"]):
+                raise ValueError("finite non-boolean cash value required")
+            expected = {"kind": "observed", "currency": "USD", "unit": "millions",
+                        "period_start": spec["start"], "period_end": spec["end"],
+                        "source_url": spec["url"], "source_sha256": spec["sha256"],
+                        "published_at": spec["published_at"], "retrieved_at": spec["retrieved_at"]}
+            if any(item.get(key) != value for key, value in expected.items()):
+                raise ValueError("cash source interval or provenance mismatch")
+            if not item.get("row_text"):
+                raise ValueError("cash source row missing")
+        exact_matches = [r["id"] for r in matches
+                         if r["source"]["published_at"] == spec["published_at"]
+                         and r["source"]["retrieved_at"] == spec["retrieved_at"]]
+        if not exact_matches:
+            raise ValueError("cash source clocks absent from frozen ledger")
+        pub, ret = _desk_clock(spec["published_at"]), _desk_clock(spec["retrieved_at"])
+        if ret < pub:
+            raise ValueError("cash receipt precedes publication")
+        sources[period] = {"url": spec["url"], "sha256": spec["sha256"],
+                           "published_at": pub.isoformat(), "retrieved_at": ret.isoformat(),
+                           "ledger_source_record_ids": sorted(exact_matches),
+                           "verification": "inherited raw-source verification; not reread in this integration"}
+    if facts["Q2"] != derive_q2(facts["Q1"], facts["H1"]):
+        raise ValueError("Q2 does not equal same-basis H1 minus Q1")
+    computed = {period: reconcile(rows) for period, rows in facts.items()}
+    if computed != cash["reconciliations"]:
+        raise ValueError("stored cash reconciliation differs from recalculation")
+    return {"sources": sources, "totals": computed}
+
+
+def desk_report(ledger_raw: bytes, cash_raw: bytes, *, as_of: str,
+                max_age_days: int) -> dict:
+    """Pinned, offline accounting evidence and explicit gaps, never a trade signal.
+
+    The fixed bundle receipt prevents reconstructing this report as if it had
+    existed before we assembled it. Source publication and original retrieval
+    clocks remain separate. No network, database, model inference or file writes.
+    """
+    from datetime import timedelta
+    from analysis.desk_evidence import DeskEvidence, EvidenceKind, evidence_card
+
+    now = _desk_clock(as_of)
+    available_floor = max(_desk_clock(DESK_BUNDLE_OBSERVED_AT), _desk_clock(LEDGER_BUILT_AT))
+    if now < available_floor:
+        # Record IDs and fiscal labels can themselves disclose future facts.
+        # Reject before inspecting/presenting any artifact-derived content.
+        raise ValueError("input bundle unavailable at report cutoff")
+    if type(max_age_days) is not int or not 1 <= max_age_days <= 3660:
+        raise ValueError("explicit max_age_days must be an integer in [1, 3660]")
+    if not isinstance(ledger_raw, bytes) or not isinstance(cash_raw, bytes):
+        raise ValueError("exact artifact bytes required")
+    if hashlib.sha256(ledger_raw).hexdigest() != FROZEN_LEDGER_SHA256:
+        raise ValueError("frozen v2 ledger hash mismatch")
+    if hashlib.sha256(cash_raw).hexdigest() != DESK_CASH_SHA256:
+        raise ValueError("cash reconciliation artifact hash mismatch")
+    records = [json.loads(line) for line in ledger_raw.decode("utf-8").splitlines() if line.strip()]
+    errors = validate_ledger(records, FREEZE_CUTOFF, LEDGER_BUILT_AT)
+    if errors:
+        raise ValueError("invalid frozen ledger: " + "; ".join(errors))
+    cash = json.loads(cash_raw)
+    checked = _desk_cash(cash, records)
+    bundle_clock = _desk_clock(DESK_BUNDLE_OBSERVED_AT)
+    built_clock = _desk_clock(LEDGER_BUILT_AT)
+    available_floor = max(bundle_clock, built_clock)
+
+    def card(identity, source_published, source_retrieved):
+        return evidence_card(DeskEvidence(
+            item_id=identity, kind=EvidenceKind.DEVELOPMENT,
+            receipt_id="sha256:" + DESK_CASH_SHA256 if identity.startswith("nvda-cash-")
+            else "sha256:" + FROZEN_LEDGER_SHA256,
+            observed_at=source_published,
+            available_at=max(source_published, source_retrieved, available_floor),
+            samples=0,
+        ), as_of=now, max_age=timedelta(days=max_age_days))
+
+    periods = []
+    for period in ("Q1", "H1", "Q2"):
+        parents = ("Q1", "H1") if period == "Q2" else (period,)
+        source_refs = [checked["sources"][p] for p in parents]
+        published = max(_desk_clock(s["published_at"]) for s in source_refs)
+        retrieved = max(_desk_clock(s["retrieved_at"]) for s in source_refs)
+        label = card("nvda-cash-" + period, published, retrieved)
+        known = max(published, retrieved, available_floor) <= now
+        sample = cash["facts"][period]["cfo"]
+        periods.append({
+            "period": period, "period_start": sample["period_start"],
+            "period_end": sample["period_end"], "unit": "USD_millions",
+            "status": "historical_accounting_context" if known else "UNAVAILABLE",
+            "kind": "derived" if period == "Q2" else "observed",
+            "totals": checked["totals"][period] if known else None,
+            "facts": {
+                field: {**{key: value for key, value in fact.items() if key != "available_at"},
+                        "inherited_publication_available_at": fact.get("available_at"),
+                        "available_at": label["available_at"]}
+                for field, fact in cash["facts"][period].items()
+            } if known else None,
+            "sources": source_refs, "evidence": label,
+            "cash_basis": "CFO less capex; issuer-style FCF also deducts finance principal. Not FCFF/FCFE.",
+        })
+
+    candidates = []
+    for record in records:
+        if record["stage"] not in {"delivery", "recognized_revenue", "cash_receipt"}:
+            continue
+        source = record["source"]
+        reasons = []
+        known = False
+        try:
+            published = _desk_source_clock(source["published_at"])
+            retrieved = _desk_source_clock(source["retrieved_at"])
+            known = retrieved >= published and max(published, retrieved, available_floor) <= now
+            if not known:
+                reasons.append("unavailable_at_report_cutoff")
+        except (ValueError, TypeError):
+            reasons.append("missing_or_invalid_source_clock")
+        amount = record["amount"]
+        if record["stage"] == "delivery":
+            if amount["currency"] != "USD" or amount["units"] not in {"millions", "billions"}:
+                reasons.append("not_delivery_dollar_consideration")
+            if amount["basis"] != "nvidia_revenue":
+                reasons.append("nvidia_attribution_unqualified")
+            reasons.append("missing_qualified_lot_and_recognition_mapping")
+        elif record["stage"] == "recognized_revenue":
+            reasons.append("scoped_historical_revenue_is_not_a_forecast_delivery_lot")
+        else:
+            reasons.append("cash_receipt_stage_is_not_recognized_nvidia_sales")
+        candidates.append({"record_id": record["id"], "stage": record["stage"],
+                           "issuer": record["issuer"], "fiscal_period": record["fiscal_period"],
+                           "amount": amount if known else None,
+                           "source_url": source["url"], "source_sha256": source["retrieved_sha256"],
+                           "published_at": source["published_at"], "retrieved_at": source["retrieved_at"],
+                           "known_at_cutoff": known, "usable_for_recognition": False,
+                           "reasons": reasons})
+    blockers = [
+        {"code": "DELIVERY_ATTRIBUTION", "needs": "NVIDIA-attributable dollar consideration, canonical disjoint lots, delivered/accepted milestones and recognition rule."},
+        {"code": "FISCAL_ALLOCATION", "needs": "Source-qualified fiscal intervals and explicit cancellation/recognition assumptions, not counterparty fiscal labels."},
+        {"code": "INCREMENTAL_CASH", "needs": "Qualified margin, cash opex, cash taxes, working-capital adjustments and capex for each scenario period. Historical totals are not forecasts."},
+        {"code": "VALUATION_CONVENTION", "needs": "FCFF/FCFE, financing/interest treatment, dilution and qualified valuation-date price, shares and net cash."},
+    ]
+    return {
+        "schema": "r3-nvda-desk-report/1", "as_of": now.isoformat(),
+        "status": "offline_historical_context_with_open_gaps",
+        "input_bundle_observed_at": DESK_BUNDLE_OBSERVED_AT,
+        "ledger_built_at": LEDGER_BUILT_AT, "ledger_records": len(records),
+        "ledger_sha256": FROZEN_LEDGER_SHA256, "cash_artifact_sha256": DESK_CASH_SHA256,
+        "freshness_policy_days": max_age_days,
+        "source_verification": "Existing pinned artifacts checked; issuer HTML verification inherited, not independently repeated.",
+        "cash_periods": periods,
+        "recognition": {"status": "UNAVAILABLE", "result": None,
+                        "candidate_records": sorted(candidates, key=lambda row: row["record_id"]),
+                        "blockers": blockers},
+        "valuation": None, "probability": None, "trade_signal": None,
+        "promotion_allowed": False, "forward_evidence": False,
+        "limitations": ["Accounting reconciliation is not predictive evidence.",
+                        "Stale historical figures remain context and must not become current signal inputs.",
+                        "Future/unreceived inputs have no numeric payload.",
+                        "No recognition scenario is evaluated without a qualified mapping; no missing value is zero-filled.",
+                        "Frozen v2, its valuation scenarios and the existing Nov18 comparison are unchanged."],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ledger", type=Path, default=REPO / LEDGER_PATH)
     ap.add_argument("--scenarios", type=Path, default=REPO / SCENARIOS_PATH)
     ap.add_argument("--cutoff", default=FREEZE_CUTOFF)
+    ap.add_argument("--desk-cash", type=Path, help="Pinned cash artifact for offline desk mode")
+    ap.add_argument("--desk-as-of", help="Full timezone-aware report cutoff")
+    ap.add_argument("--desk-max-age-days", type=int, help="Explicit source freshness policy")
     args = ap.parse_args(argv)
+    if args.desk_cash is not None:
+        if args.desk_as_of is None or args.desk_max_age_days is None:
+            ap.error("--desk-cash requires --desk-as-of and --desk-max-age-days")
+        try:
+            report = desk_report(args.ledger.read_bytes(), args.desk_cash.read_bytes(),
+                                 as_of=args.desk_as_of, max_age_days=args.desk_max_age_days)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            json.dump({"schema": "r3-nvda-desk-report/1", "status": "UNAVAILABLE",
+                       "error": str(exc), "promotion_allowed": False}, sys.stdout)
+            sys.stdout.write("\n")
+            return 1
+        json.dump(report, sys.stdout, indent=2, sort_keys=True, allow_nan=False)
+        sys.stdout.write("\n")
+        return 0
+    if args.desk_as_of is not None or args.desk_max_age_days is not None:
+        ap.error("desk options require --desk-cash")
     records = load_ledger(args.ledger)
     built_at = LEDGER_BUILT_AT if args.ledger.resolve() == (REPO / LEDGER_PATH).resolve() else None
     errs = validate_ledger(records, args.cutoff, built_at)
