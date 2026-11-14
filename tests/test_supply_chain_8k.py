@@ -478,3 +478,68 @@ def test_a_subsidiary_resolves_to_its_listed_parent():
     # a one-word parent is not inferred from a longer name: a private node, not BA
     assert j.resolve_counterparty("Boeing Commercial Airplanes Services LLC")[1].type == "private_company"
     assert s8._parent("apple hospitality reit", {"apple": "aapl"}) is None  # one-word keys never claim
+
+
+# --- Codex recheck of 0240544f (pickup sha256 3aa1c7e5) -------------------------------
+
+
+def _resp(payload=None, raises=False):
+    r = MagicMock(status_code=200)
+    if raises:
+        r.json.side_effect = ValueError("Expecting value")
+    else:
+        r.json.return_value = payload
+    return r
+
+
+@pytest.mark.parametrize("payload", [
+    {}, None, [], "x",
+    {"0": {"cik_str": 320193, "title": "Apple"}},  # no ticker
+    {"0": {"ticker": " ", "cik_str": 320193}},
+    {"0": {"ticker": "AAPL", "cik_str": "abc"}},
+    {"0": {"ticker": "AAPL", "cik_str": 0}},
+    {"0": {"ticker": "AAPL", "cik_str": True}},
+    {"0": {"ticker": "AAPL", "cik_str": 320193}, "1": "garbage"},  # one bad entry fails the list
+])
+def test_an_empty_null_or_malformed_ticker_list_on_200_raises(payload):
+    with pytest.raises(s8.UniverseUnavailable):
+        s8.parse_ticker_list(_resp(payload))
+
+
+def test_a_ticker_list_that_is_not_json_raises():
+    with pytest.raises(s8.UniverseUnavailable):
+        s8.parse_ticker_list(_resp(raises=True))
+
+
+def test_a_valid_ticker_list_parses():
+    got = s8.parse_ticker_list(_resp({"0": {"ticker": "aapl", "cik_str": 320193, "title": "Apple Inc."},
+                                      "1": {"ticker": "BRK.B", "cik_str": "1067983", "title": None}}))
+    assert got == [("AAPL", "0000320193", "Apple Inc."), ("BRK.B", "0001067983", "")]
+
+
+@pytest.mark.parametrize("payload", [
+    {},  # empty body on a 200
+    {"0": {"ticker": "005930.KS", "cik_str": 1, "title": "Samsung"}},  # valid, but no US filer
+])
+def test_a_200_with_no_usable_filer_keeps_every_pending_day(job, monkeypatch, payload):
+    j = job(FakeLLM(reply()), {"0000027904": DAL_SECTION, "0000000999": LOAN_SECTION})
+    monkeypatch.setattr(j, "filer_universe", lambda: s8.EightKSupplyLinks.filer_universe(j))
+    monkeypatch.setattr(j, "_get", lambda url: _resp(payload))
+    s8.EightKSupplyLinks.save_checkpoint(date(2026, 1, 11), [])
+    before = s8.CHECKPOINT_PATH.read_text()
+    s = j.run(write=True, today=date(2026, 1, 13))
+    assert s.skipped == {"universe_unavailable": 1} and s.days == [] and s.listed_8ks == 0
+    assert not s.checkpoint_advanced and s8.CHECKPOINT_PATH.read_text() == before
+
+
+def test_more_than_2000_given_up_filings_all_survive_save_reload_and_a_run(job):
+    many = [{"accession": f"0000000001-26-{i:06d}", "cik": "0000000001", "company": "OLD CO",
+             "day": "2025-01-02", "reason": "bad_reply", "attempts": 3, "at": "2025-01-03T00:00:00+00:00"}
+            for i in range(2500)]
+    s8.EightKSupplyLinks.save_checkpoint(date(2026, 1, 11), [], gave_up=many)
+    assert json.loads(s8.CHECKPOINT_PATH.read_text())["gave_up"] == many
+    j = job(FakeLLM(reply()), {}, items="2.02")
+    s = j.run(write=True, today=date(2026, 1, 13))  # a write run re-saves the checkpoint
+    kept = json.loads(s8.CHECKPOINT_PATH.read_text())["gave_up"]
+    assert s.checkpoint_advanced and s.gave_up == 2500
+    assert len(kept) == 2500 and kept[0]["accession"] == "0000000001-26-000000"  # the oldest stays

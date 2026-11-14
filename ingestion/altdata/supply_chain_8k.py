@@ -68,7 +68,6 @@ from intelligence.supply_chain_symbols import symbol_for
 
 FORM_INDEX_URL = "https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{q}/form.{ymd}.idx"
 QUARTER_LISTING_URL = "https://www.sec.gov/Archives/edgar/daily-index/{y}/QTR{q}/index.json"
-GAVE_UP_KEEP = 2000  # given-up filings kept in the checkpoint for --retry-gave-up
 CHECKPOINT_PATH = Path(os.environ.get(
     "GRID_SUPPLY_CHAIN_8K_CHECKPOINT",
     str(Path(__file__).resolve().parents[2] / "outputs" / "supply_chain" / "8k_checkpoint.json"),
@@ -175,6 +174,31 @@ class UniverseUnavailable(RuntimeError):
     """The SEC ticker list could not be read, so no filer can be recognised."""
 
 
+def parse_ticker_list(resp: Any) -> list[tuple[str, str, str]]:
+    """``[(symbol, cik10, title)]`` from a company_tickers.json response; raises on anything odd.
+
+    The payload must be a non-empty object whose every value has a non-empty
+    ``ticker`` and a positive integer ``cik_str``. An empty, null or malformed
+    body raises :class:`UniverseUnavailable`, so the pass stops instead of
+    reading days with no recognisable filer.
+    """
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise UniverseUnavailable(f"SEC ticker list: not JSON ({exc})") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise UniverseUnavailable(f"SEC ticker list: empty or not an object ({type(payload).__name__})")
+    out = []
+    for key, e in payload.items():
+        ticker = e.get("ticker") if isinstance(e, dict) else None
+        cik = e.get("cik_str") if isinstance(e, dict) else None
+        if not isinstance(ticker, str) or not ticker.strip() or isinstance(cik, bool) \
+                or not str(cik).isdigit() or int(cik) <= 0:
+            raise UniverseUnavailable(f"SEC ticker list: malformed entry {key!r}")
+        out.append((ticker.strip().upper(), str(int(cik)).zfill(10), str(e.get("title") or "")))
+    return out
+
+
 def company_key(name: str) -> str:
     """Comparable company name: ``The Boeing Company`` and ``BOEING CO`` both give ``boeing``."""
     s = re.sub(r"[^a-z0-9&]+", " ", (name or "").lower().replace("\u2019", "'").replace("'s", "s"))
@@ -275,8 +299,7 @@ class EightKSupplyLinks:
         resp = self._get(scp._COMPANY_TICKERS_URL)
         if resp is None:
             raise UniverseUnavailable(f"SEC ticker list: status {getattr(self, '_last_status', None)}")
-        return [(str(e.get("ticker", "")).upper(), str(e.get("cik_str", "")).zfill(10), str(e.get("title", "")))
-                for e in (resp.json() or {}).values()]
+        return parse_ticker_list(resp)
 
     def filer_universe(self) -> dict[str, tuple[str, str, bool]]:
         """``{cik10: (symbol, node_id, in_graph)}``: graph companies, then every SEC-listed symbol.
@@ -309,6 +332,8 @@ class EightKSupplyLinks:
                 listed[cik] = sym
         for cik, sym in listed.items():
             out[cik] = (sym, sym.lower(), sym.lower() in known)
+        if not out:
+            raise UniverseUnavailable("no filer could be recognised from the SEC ticker list")
         self._universe = out
         return out
 
@@ -470,7 +495,7 @@ class EightKSupplyLinks:
     def save_checkpoint(last_day: date, seen: list[str], attempts: dict[str, int] | None = None,
                         gave_up: list[dict[str, Any]] | None = None) -> None:
         payload = {"last_day": last_day.isoformat(), "seen": seen[-SEEN_KEEP:],
-                   "attempts": dict(attempts or {}), "gave_up": list(gave_up or [])[-GAVE_UP_KEEP:],
+                   "attempts": dict(attempts or {}), "gave_up": list(gave_up or []),  # never truncated: each is a recoverable failure
                    "updated_at": datetime.now(timezone.utc).isoformat()}
         CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = CHECKPOINT_PATH.with_name(CHECKPOINT_PATH.name + ".tmp")
