@@ -220,3 +220,39 @@ def test_statement_cli_prints_the_signed_bytes(capsysbinary):
     body = json.loads(out)
     assert body["hypothesis"] == "D1-F1" and body["contract_body_sha256"] == M.D0_CONTRACT_BODY_SHA256
     assert body["namespace"] == A.NAMESPACE
+
+
+def _signers_with(world, lines):
+    (world["root"] / A.ALLOWED_SIGNERS).write_text("".join(ln + "\n" for ln in lines))
+
+
+@pytest.mark.parametrize("make, needle", [
+    # one person holding both roles: the same key under both principals
+    (lambda r, o: [f'reviewer namespaces="{A.NAMESPACE}" {r}', f'operator namespaces="{A.NAMESPACE}" {r}'],
+     "same key is listed"),
+    (lambda r, o: [f'reviewer,operator namespaces="{A.NAMESPACE}" {r}'], "no lists or wildcards"),
+    (lambda r, o: [f'* namespaces="{A.NAMESPACE}" {r}'], "no lists or wildcards"),
+    (lambda r, o: [f'reviewer cert-authority,namespaces="{A.NAMESPACE}" {r}', f'operator namespaces="{A.NAMESPACE}" {o}'],
+     "options must be exactly"),
+    (lambda r, o: [f'reviewer {r}', f'operator namespaces="{A.NAMESPACE}" {o}'], "options must be exactly"),
+    (lambda r, o: [f'reviewer namespaces="{A.NAMESPACE}" {r}', f'reviewer namespaces="{A.NAMESPACE}" {o}',
+                   f'operator namespaces="{A.NAMESPACE}" {o}'], "more than one key"),
+    (lambda r, o: [f'reviewer namespaces="{A.NAMESPACE}" {r}', f'operator namespaces="{A.NAMESPACE}" {o}',
+                   f'intruder namespaces="{A.NAMESPACE}" {o}'], "is not one of"),
+])
+def test_two_party_control_cannot_be_collapsed(world, make, needle):
+    r, o = world["keys"]["reviewer"][1], world["keys"]["operator"][1]
+    _signers_with(world, make(r, o))
+    ok, errs = _has(_errs(world), needle)
+    assert ok, errs
+
+
+def test_operator_signature_under_both_names_with_one_key_is_refused(world):
+    # the operator signs as both principals with one key listed twice
+    r_key, o_key = world["keys"]["operator"][0], world["keys"]["operator"][0]
+    o_pub = world["keys"]["operator"][1]
+    _signers_with(world, [f'reviewer namespaces="{A.NAMESPACE}" {o_pub}', f'operator namespaces="{A.NAMESPACE}" {o_pub}'])
+    _sign(world["root"], world["m"], HYP, "reviewer", r_key)
+    _sign(world["root"], world["m"], HYP, "operator", o_key)
+    ok, errs = _has(_errs(world), "same key is listed")
+    assert ok, errs

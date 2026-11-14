@@ -54,6 +54,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 from analysis import d0_manifest as M
@@ -196,24 +197,73 @@ def _owner_errors(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     return errs
 
 
+_SIGNER_OPTIONS = f'namespaces="{NAMESPACE}"'
+_KEY_TYPES = {"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa",
+              "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"}
+
+
+def parse_signers(signers: Path) -> tuple[dict[str, str], list[str]]:
+    """Strictly parse ``allowed_signers`` into {principal: its one line}, with every reason it is unusable.
+
+    Two-party control: each line names exactly one known principal (no comma lists, no
+    wildcards), carries exactly the option ``namespaces="grid-d0-admission"`` (so no
+    ``cert-authority``, validity or other option), and a plain public key. Each principal has
+    exactly one line, and no key may appear under two principals.
+    """
+    if not signers.is_file():
+        return {}, ["allowed_signers file missing"]
+    lines: dict[str, str] = {}
+    keys: dict[str, str] = {}
+    errs: list[str] = []
+    for n, raw in enumerate(signers.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            errs.append(f"allowed_signers line {n}: expected <principal> {_SIGNER_OPTIONS} <key-type> <key>")
+            continue
+        principal, options, ktype, key = parts[0], parts[1], parts[2], parts[3]
+        if principal not in REQUIRED_PRINCIPALS:
+            errs.append(f"allowed_signers line {n}: principal {principal!r} is not one of {list(REQUIRED_PRINCIPALS)}"
+                        " (no lists or wildcards)")
+            continue
+        if options != _SIGNER_OPTIONS:
+            errs.append(f"allowed_signers line {n}: options must be exactly {_SIGNER_OPTIONS}")
+            continue
+        if ktype not in _KEY_TYPES:
+            errs.append(f"allowed_signers line {n}: key type {ktype!r} is not a plain public key type")
+            continue
+        if principal in lines:
+            errs.append(f"allowed_signers: principal {principal!r} has more than one key")
+            continue
+        if key in keys:
+            errs.append(f"allowed_signers: the same key is listed for {keys[key]!r} and {principal!r}")
+            continue
+        lines[principal], keys[key] = " ".join(parts), principal
+    return lines, errs
+
+
 def verify_signature(statement: bytes, sig: Path, principal: str, signers: Path) -> str | None:
-    """None when ``sig`` is a valid signature of ``statement`` by ``principal``; else why not."""
+    """None when ``sig`` is a valid signature of ``statement`` by ``principal``'s one key; else why not."""
     exe = shutil.which("ssh-keygen")
     if exe is None:
         return "ssh-keygen not found; signatures cannot be verified"
     if not sig.is_file():
         return f"signature {sig.name} missing"
-    if not signers.is_file():
-        return "allowed_signers file missing"
-    listed = [ln.split()[0] for ln in signers.read_text(encoding="utf-8").splitlines()
-              if ln.strip() and not ln.lstrip().startswith("#")]
-    if principal not in listed:
+    lines, errs = parse_signers(signers)
+    if errs:
+        return "; ".join(errs)
+    if principal not in lines:
         return f"principal {principal!r} has no key in allowed_signers"
-    try:
-        run = subprocess.run([exe, "-Y", "verify", "-f", str(signers), "-I", principal, "-n", NAMESPACE,
-                              "-s", str(sig)], input=statement, capture_output=True, timeout=20, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"ssh-keygen verify failed to run: {exc}"
+    with tempfile.TemporaryDirectory() as tmp:  # verify against this principal's line only
+        only = Path(tmp) / "allowed_signers"
+        only.write_text(lines[principal] + "\n", encoding="utf-8")
+        try:
+            run = subprocess.run([exe, "-Y", "verify", "-f", str(only), "-I", principal, "-n", NAMESPACE,
+                                  "-s", str(sig)], input=statement, capture_output=True, timeout=20, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"ssh-keygen verify failed to run: {exc}"
     return None if run.returncode == 0 else f"signature {sig.name} does not verify for {principal!r}"
 
 
