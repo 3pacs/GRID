@@ -1,8 +1,10 @@
-"""D0 provisional label checker (#1129, #1142), not an admission authority.
+"""D0 manifest checker (#1129, #1142): labels, the contract body pin and admission.
 
-All ADMITTED labels fail closed until an authenticated verifier exists. Passing
-this checker validates draft labels only, not signatures, receipts, dependencies
-or coverage. The prerequisite checks below provide diagnostics, not admission.
+:func:`validate` is the single entry point. It checks the status labels, the owner-signed
+contract body pin (:func:`contract_pin_errors`), and every ``ADMITTED`` label through
+the authenticated verifier in ``analysis/d0_admission.py`` (gap G14). That verifier is
+fail-closed: nothing is admitted until the reviewer has accepted it, and until the
+reviewer and the operator have signed with keys registered in ``allowed_signers``.
 
 The D0 research contract (``docs/research/d0-research-contract-v0.md`` §8) lets an
 input carry ``ADMITTED`` only when all of these hold:
@@ -26,6 +28,7 @@ and the manifest JSON. It never reads the database, a provider or an outcome.
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import hashlib
 import json
 import re
@@ -45,6 +48,16 @@ D0_CONTRACT_BODY_SHA256 = "7643c1e096d8c75567598d16ebf077a246e862c0c922a8f674e82
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _real_date(value: Any) -> bool:
+    if not (isinstance(value, str) and _DATE_RE.fullmatch(value)):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 class ContractError(ValueError):
@@ -80,8 +93,8 @@ def contract_pin_errors(manifest: dict[str, Any], repo_root: Path = REPO,
     if owner.get("signed") is True:
         if manifest.get("contract_body_sha256") != pinned:
             errs.append("manifest contract_body_sha256 does not equal the pinned body hash")
-        if not (isinstance(manifest.get("signed_at"), str) and _DATE_RE.fullmatch(manifest["signed_at"])):
-            errs.append("manifest signed_at is not a YYYY-MM-DD date")
+        if not _real_date(manifest.get("signed_at")):
+            errs.append("manifest signed_at is not a real YYYY-MM-DD date")
     elif manifest.get("contract_body_sha256") is not None or manifest.get("signed_at") is not None:
         errs.append("manifest carries a body hash or signed_at but research_owner.signed is not true")
     h = manifest.get("contract_body_sha256")
@@ -90,41 +103,10 @@ def contract_pin_errors(manifest: dict[str, Any], repo_root: Path = REPO,
     return errs
 
 
-def _contract_signed(m: dict[str, Any]) -> bool:
-    return bool(m.get("signed_at")) and bool(m.get("contract_body_sha256")) and bool(
-        (m.get("research_owner") or {}).get("signed")
-    )
+def validate(manifest: dict[str, Any], repo_root: Path = REPO) -> list[str]:
+    """Every reason the manifest is not acceptable as committed (empty list = acceptable)."""
+    from analysis import d0_admission  # imported here: d0_admission imports this module
 
-
-def _reviewer_signed(m: dict[str, Any]) -> bool:
-    r = m.get("reviewer") or {}
-    return bool(r.get("signed")) and bool(r.get("manifest_sha256"))
-
-
-def input_admission_errors(inp: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
-    """Why this input may not be ADMITTED (empty list = prerequisites met)."""
-    errs: list[str] = []
-    iid = inp.get("id", "<no id>")
-    errs.append(f"{iid}: ADMITTED unavailable: authenticated verifier not implemented")
-    if not _contract_signed(manifest):
-        errs.append(f"{iid}: contract not signed / body hash not pinned")
-    if not _reviewer_signed(manifest):
-        errs.append(f"{iid}: reviewer has not signed the manifest")
-    if not str(inp.get("missingness") or "").strip():
-        errs.append(f"{iid}: missingness not measured")
-    clocks = inp.get("clocks") or {}
-    if not clocks.get("first_availability_receipt"):
-        errs.append(f"{iid}: no first-availability receipt (an assertion is not a receipt)")
-    vis = clocks.get("durable_visibility")
-    if isinstance(vis, str) and vis.upper().startswith("UNPROVEN"):
-        errs.append(f"{iid}: durable visibility UNPROVEN")
-    rec = inp.get("receipts") or {}
-    if not (rec.get("query_sha256") or rec.get("receipt_sha256")):
-        errs.append(f"{iid}: no file or query receipt")
-    return errs
-
-
-def validate(manifest: dict[str, Any]) -> list[str]:
     errs: list[str] = []
     allowed = set(manifest.get("admission_status_values") or [])
     if "CANDIDATE_UNREVIEWED" not in allowed:
@@ -133,14 +115,8 @@ def validate(manifest: dict[str, Any]) -> list[str]:
         status = inp.get("admission_status")
         if status not in allowed:
             errs.append(f"{inp.get('id')}: admission_status {status!r} not in admission_status_values")
-        if status == "ADMITTED":
-            errs.extend(input_admission_errors(inp, manifest))
-    signed = _contract_signed(manifest) and _reviewer_signed(manifest)
-    for h in manifest.get("hypotheses") or []:
-        if h.get("status") == "ADMITTED":
-            errs.append(f"{h.get('id')}: ADMITTED unavailable: authenticated verifier not implemented")
-        if h.get("status") == "ADMITTED" and not signed:
-            errs.append(f"{h.get('id')}: hypothesis ADMITTED while the contract or manifest is unsigned")
+    errs += contract_pin_errors(manifest, repo_root=repo_root)
+    errs += d0_admission.admission_errors(manifest, repo_root=repo_root)
     return errs
 
 
@@ -149,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", type=Path, default=REPO / MANIFEST_PATH)
     args = ap.parse_args(argv)
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-    errs = validate(manifest) + contract_pin_errors(manifest)
+    errs = validate(manifest)
     for e in errs:
         print(e)
     print("OK" if not errs else f"{len(errs)} error(s)")

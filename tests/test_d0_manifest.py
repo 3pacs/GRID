@@ -60,7 +60,10 @@ def test_manifest_signature_fields_must_match_the_pin():
     assert any("does not equal the pinned" in e for e in M.contract_pin_errors(m))
     m = _real()
     m["signed_at"] = "14 Nov 2026"
-    assert any("not a YYYY-MM-DD" in e for e in M.contract_pin_errors(m))
+    assert any("not a real YYYY-MM-DD" in e for e in M.contract_pin_errors(m))
+    m = _real()
+    m["signed_at"] = "2026-02-30"
+    assert any("not a real YYYY-MM-DD" in e for e in M.contract_pin_errors(m))
     m = _real()
     m["research_owner"]["signed"] = "true"
     assert any("research_owner.signed is not true" in e for e in M.contract_pin_errors(m))
@@ -102,15 +105,16 @@ def test_admitted_while_unsigned_is_refused_with_every_reason():
     inp["receipts"] = {}
     m["inputs"].append(inp)
     errs = " | ".join(M.validate(m))
-    for needle in ("contract not signed", "reviewer has not signed", "missingness", "first-availability receipt",
-                   "durable visibility UNPROVEN", "file or query receipt"):
+    for needle in ("not yet accepted by the reviewer", "without an ADMITTED hypothesis", "missingness not measured",
+                   "first-availability receipt: not a file receipt", "null or text is never an exemption",
+                   "query receipt snapshot"):
         assert needle in errs, needle
 
 
 def test_declared_prerequisites_do_not_authenticate_admission():
     m = _signed(_real())
     m["inputs"].append(_admitted_input())
-    assert any("authenticated verifier not implemented" in e for e in M.validate(m))
+    assert any("not yet accepted by the reviewer" in e for e in M.validate(m))
 
 
 def test_unknown_status_and_unsigned_hypothesis_admission_are_refused():
@@ -121,7 +125,8 @@ def test_unknown_status_and_unsigned_hypothesis_admission_are_refused():
     m["hypotheses"][0] = dict(m["hypotheses"][0], status="ADMITTED")
     errs = " | ".join(M.validate(m))
     assert "not in admission_status_values" in errs
-    assert "hypothesis ADMITTED while the contract or manifest is unsigned" in errs
+    assert "ADMITTED refused: the G14 verifier is not yet accepted by the reviewer" in errs
+    assert "required_inputs must be a non-empty list" in errs
 
 
 def test_cli_exit_codes(tmp_path):

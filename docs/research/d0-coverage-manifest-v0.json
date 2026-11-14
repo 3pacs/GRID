@@ -1194,7 +1194,7 @@
     {
       "id": "G14",
       "text": "no authenticated admission verifier; the provisional checker (cf879835) refuses every ADMITTED",
-      "status": "open; owner Claude, reviewer Codex; source and synthetic tests only"
+      "status": "built 2026-11-14 (analysis/d0_admission.py, tests/test_d0_admission.py), awaiting reviewer acceptance; VERIFIER_ACCEPTED=false and allowed_signers has no keys, so nothing can be admitted; not closed"
     },
     {
       "id": "G15",
