@@ -174,6 +174,7 @@ def _run(monkeypatch, rows: list[_Opp], *, recent: list[dict] | None = None,
          no_contract: frozenset[str] = frozenset(), ledger_read_error: bool = False,
          ledger_write_error: bool = False, force: bool = False, scanner_error: bool = False) -> _Run:
     """Drive ``run_100x_digest`` over ``rows`` and record what it selected."""
+    monkeypatch.setattr(hx, "_digest_paused", lambda: None)
     scanner_mod = types.ModuleType("discovery.options_scanner")
 
     class OptionsScanner:
@@ -510,3 +511,31 @@ def test_forced_digest_keeps_scanner_failure_visible(monkeypatch):
     assert run.result["sent"] is True
     assert "Scanner failed: candidate coverage is unavailable" in run.sent["plain"]
     assert "0 scanner candidates returned" not in run.sent["plain"]
+
+
+class TestPause:
+    """While OPTIONS_DIGEST_ENABLED is false the digest scans, records and sends nothing."""
+
+    def test_default_setting_is_paused(self):
+        # Read the source: other tests in a run may have replaced the ``config`` module with a stub.
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parent.parent / "config.py").read_text()
+        assert re.search(r"^\s+OPTIONS_DIGEST_ENABLED: bool = False$", source, re.MULTILINE)
+
+    def test_paused_run_touches_nothing_even_when_forced(self, monkeypatch):
+        touched: list[str] = []
+        monkeypatch.setattr(hx, "_digest_paused", lambda: "paused: test")
+        monkeypatch.setattr(hx, "_get_engine", lambda: touched.append("engine"))
+        monkeypatch.setattr(hx, "_send_in_thread", lambda *a, **k: touched.append("send"))
+        for force in (False, True):
+            assert hx.run_100x_digest(force=force) == {"sent": False, "reason": "paused: test", "scanned": 0}
+        assert touched == []
+
+    def test_setting_controls_the_pause(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config.settings, "OPTIONS_DIGEST_ENABLED", False, raising=False)
+        assert "OPTIONS_DIGEST_ENABLED is false" in hx._digest_paused()
+        monkeypatch.setattr(config.settings, "OPTIONS_DIGEST_ENABLED", True, raising=False)
+        assert hx._digest_paused() is None

@@ -38,14 +38,17 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store import precomputed as store
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 MINUTE = 60
 HOUR = 3600
@@ -297,8 +300,9 @@ def build_associations(ctx: BuildContext) -> list[Output]:
         if raw is not None else None
     anomaly_as_of = (anomaly_window.index.max().date()
                      if anomaly_window is not None and not anomaly_window.empty else None)
-    _alert_on_new_extremes(ctx, anomalies)
-    out.append(Output("associations.anomalies", {"sigma_threshold": 2.5, "days": 252}, anomalies, anomaly_as_of))
+    anomaly_inputs = _report_and_alert(ctx, anomalies, pit, registry, raw, anomaly_window, anomaly_as_of)
+    out.append(Output("associations.anomalies", {"sigma_threshold": 2.5, "days": 252}, anomalies, anomaly_as_of,
+                      inputs=anomaly_inputs))
 
     regime = assoc._compute_regime_features(504, raw=raw, registry=registry)
     regime_as_of = _max_date([raw.index.max()]) if raw is not None and not raw.empty else None
@@ -306,24 +310,79 @@ def build_associations(ctx: BuildContext) -> list[Output]:
     return out
 
 
-def _alert_on_new_extremes(ctx: BuildContext, anomalies: dict[str, Any]) -> None:
-    """E-mail extreme anomalies only when the extreme set changed.
+ANOMALY_HISTORY_DAYS = 1900        # ~5 trading years of calendar days for the precedent read
+_ANOMALY_PARAMS = {"sigma_threshold": 2.5, "days": 252}
 
-    The GET used to e-mail on every page view with an extreme anomaly; the
-    job would e-mail every run. Now: only when the set of extreme features
-    differs from the previous stored scan.
+
+def _anomaly_history(pit: Any, registry: pd.DataFrame, names: list[str]) -> pd.DataFrame | None:
+    """Long PIT read (LATEST_AS_OF, as of today) for the flagged features and their linked price series."""
+    from intelligence import anomaly_report as ar
+
+    name_to_id = dict(zip(registry["name"], registry["id"]))
+    family = dict(zip(registry["name"], registry["family"]))
+    wanted = set(names)
+    for name in names:
+        target = ar.linked_price_feature(name, ar.feature_kind(name, family.get(name)), name_to_id)
+        if target:
+            wanted.add(target)
+    ids = [int(name_to_id[n]) for n in sorted(wanted) if n in name_to_id]
+    if not ids:
+        return None
+    today = date.today()
+    frame = pit.get_feature_matrix(
+        feature_ids=ids, start_date=today - timedelta(days=ANOMALY_HISTORY_DAYS), end_date=today,
+        as_of_date=today, vintage_policy="LATEST_AS_OF",
+    )
+    id_to_name = {v: k for k, v in name_to_id.items()}
+    return frame.rename(columns=lambda c: id_to_name.get(c, str(c)))
+
+
+def _report_and_alert(
+    ctx: BuildContext,
+    anomalies: dict[str, Any],
+    pit: Any,
+    registry: pd.DataFrame,
+    raw: pd.DataFrame | None,
+    window: pd.DataFrame | None,
+    as_of: date | None,
+) -> dict[str, Any]:
+    """Attach the anomaly report to the scan and e-mail it when it has a new headline.
+
+    The report (``intelligence/anomaly_report.py``) is stored in the scan payload under ``report``. The
+    e-mail goes out only when the report's headline set (new moves, stretched readings past 3.5 sigma,
+    data faults) has an entry the previous scan's did not: a reading that merely persists, ages from
+    "new" to "stretched" or drops out sends nothing. Returns the ``inputs`` to store with the scan (the
+    headline set the next run compares against). A failure here never fails the scan.
     """
-    from api.routers.associations import extreme_anomalies, send_extreme_anomaly_alert
+    flagged = anomalies.get("anomalies") or []
+    prev = ctx.previous("associations.anomalies", _ANOMALY_PARAMS)
+    previous_key = list((prev.inputs or {}).get("headline_key") or []) if prev is not None else []
+    if not flagged or raw is None or raw.empty:
+        return {"headline_key": []}
+    try:
+        from intelligence import anomaly_report as ar
 
-    extreme = extreme_anomalies(anomalies.get("anomalies") or [])
-    current = sorted(a["feature"] for a in extreme)
-    prev_row = ctx.previous("associations.anomalies", {"sigma_threshold": 2.5, "days": 252})
-    previous: list[str] = []
-    if prev_row is not None and prev_row.has_payload:
-        prev_payload = prev_row.payload() or {}
-        previous = sorted(a["feature"] for a in extreme_anomalies(prev_payload.get("anomalies") or []))
-    if current and current != previous:
-        send_extreme_anomaly_alert(extreme)
+        id_to_name = dict(zip(registry["id"], registry["name"]))
+        recent = raw.rename(columns=lambda c: id_to_name.get(c, str(c)))
+        history = _anomaly_history(pit, registry, [str(a["feature"]) for a in flagged])
+        report = ar.build_report(
+            flagged, recent, history=history, registry=registry, as_of=as_of, generated_at=ctx.now,
+            features_scanned=int(window.shape[1]) if window is not None else None,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the report is an add-on; the scan stands without it
+        log.warning("api precompute: anomaly report failed: {e}", e=str(exc))
+        return {"headline_key": previous_key}
+    anomalies["report"] = report
+    fresh = ar.new_headlines(report, previous_key)
+    if fresh:
+        try:
+            from alerts.email import send_anomaly_report
+
+            send_anomaly_report(report)
+            log.info("Anomaly report e-mailed: new headline entries {k}", k=fresh)
+        except Exception as exc:  # noqa: BLE001 -- e-mail is best effort
+            log.warning("api precompute: anomaly report e-mail failed: {e}", e=str(exc))
+    return {"headline_key": report["headline_key"]}
 
 
 def _narrative_input_hash(checks: list[Any]) -> str:
