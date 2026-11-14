@@ -684,6 +684,15 @@ def test_main_day_and_lookback(tmp_path, closes, monkeypatch, capsys):
     monkeypatch.setattr(grader, "default_client_factory", lambda: None)
     import types
     monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: FakeEngine()))
+    # Both runs read the wall clock (graded_at, and the lookback window ends yesterday): pin it
+    # 6 days after DAY, so the window is DAY .. DAY+5 (unpinned, DAY fell out of the window on
+    # 2026-11-14 and every run went red).
+    class _SixDaysOn(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(DAY.year, DAY.month, DAY.day, 11, 35, tzinfo=timezone.utc) + timedelta(days=6)
+
+    monkeypatch.setattr(grader, "datetime", _SixDaysOn)
     code = grader.main(["--day", DAY.isoformat(), "--packet-root", str(packet_root), "--review-root", str(review_root)])
     out = capsys.readouterr().out
     assert code == 0 and f"{DAY}: WRITTEN rows=4" in out and "ingest=INGESTED" in out
