@@ -252,7 +252,7 @@ def test_registry_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_selector_query_carries_both_bounds_and_exact_order() -> None:
     src = inspect.getsource(DealerGammaEngine.latest_completed_capture_batch)
-    for clause in ("snap_date <= :on_or_before", "capture_completed_at <= :cutoff",
+    for clause in ("snap_date <= :on_or_before", "capture_completed_at <= :cutoff", "registered_at <= :cutoff",
                    "ORDER BY snap_date DESC, capture_ordinal DESC", "LIMIT 1"):
         assert clause in src
 

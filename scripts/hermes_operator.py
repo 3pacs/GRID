@@ -3122,6 +3122,20 @@ def run_intelligence_tasks(
         log.info("[DRY RUN] Would run intelligence tasks")
         return {"skipped": "dry_run"}
 
+    # ── Edge stream: one register-and-look cycle a day (detached child) ──
+    # First in this step because it only spawns a process and returns: the
+    # cycle (Polygon fetches, bootstrap) runs outside Hermes under its own
+    # lock and wall clock. Inert without the EDGE_STREAM_* env (drop-in
+    # zz-edge-stream.conf); see docs/reference/EDGE_STREAM.md.
+    try:
+        from alpha_research.edge_stream.hermes import maybe_spawn_cycle
+        spawned = maybe_spawn_cycle(now)
+        if spawned:
+            results["edge_stream"] = spawned
+            log.info("edge_stream cycle spawned (pid {p})", p=spawned.get("pid"))
+    except Exception as exc:
+        log.warning("edge_stream spawn failed: {e}", e=str(exc))
+
     # ── Earnings events → earnings_calendar back-compat sync ────────
     # Cheap (~50ms single SQL call) so runs FIRST — before the
     # intelligence_tasks 360s budget can be consumed by slow LLM jobs

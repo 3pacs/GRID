@@ -947,6 +947,12 @@ class Settings(BaseSettings):
 
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
+    # "GRID Options — N calls" (alerts/hundredx_digest.py). Paused 2026-11-14: from 2026-11-09 the
+    # option chains it scores changed character (zero-volume rows 7 % -> 65 %, the IV-skew vote on
+    # 50 of 50 calls since, 4 of 8 before), and it quoted "BUY @ ask" with the market closed. While
+    # False the digest neither records a call nor sends one. Turn it back on only after the chain
+    # feed is diagnosed and the rows written since 2026-11-09 are rebuilt.
+    OPTIONS_DIGEST_ENABLED: bool = False
     # Research newsletter only. Supply a JSON array of two approved addresses
     # at deployment; an empty/invalid audience fails closed without falling
     # back to ALERT_EMAIL_TO. Other alert categories retain their own routing.

@@ -6,7 +6,7 @@
 grid/
 ├── api/                          # FastAPI REST API and WebSocket server
 │   ├── main.py                   # App entry point, middleware, WebSocket, PWA serving
-│   ├── auth.py                   # JWT authentication (single-operator, bcrypt + jose)
+│   ├── auth.py                   # JWT authentication (single-operator, bcrypt + PyJWT)
 │   ├── dependencies.py           # @lru_cache singleton factories (engine, PITStore, journal, registry)
 │   ├── routers/                  # API route handlers (thin — delegate to domain modules)
 │   │   ├── agents.py             # TradingAgents run/status endpoints

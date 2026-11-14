@@ -1,0 +1,20 @@
+# TEMPLATE — NOT INSTALLED. Writes dealer_gex_daily (SPY) for the prior completed session (physics/dealer_gex_daily.py).
+# Install (on grid-svr):
+#   sudo cp deploy/systemd/grid-dealer-gex-daily.service.template /etc/systemd/system/grid-dealer-gex-daily.service
+#   sudo cp deploy/systemd/grid-dealer-gex-daily.timer.template   /etc/systemd/system/grid-dealer-gex-daily.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-dealer-gex-daily.timer
+[Unit]
+Description=GRID dealer_gex_daily writer (SPY, prior session, end-of-day capture cutoff, insert-only)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/flock -n /tmp/grid-dealer-gex-daily.lock /usr/bin/python3 /data/grid_v4/grid_release/scripts/run_dealer_gex_daily.py --json
+TimeoutStartSec=10min
+Nice=10
+StandardOutput=journal
+StandardError=journal

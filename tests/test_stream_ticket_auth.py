@@ -15,10 +15,10 @@ from __future__ import annotations
 import os
 import time
 
+import jwt
 import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
-from jose import jwt
 
 os.environ.setdefault("ENVIRONMENT", "development")
 os.environ.setdefault("DB_PASSWORD", "testpass")

@@ -484,22 +484,93 @@ class TestNarrativeBuilder:
         assert xref._generate_narrative([_check("a")], []) == text
 
 
-class TestAnomalyAlertOnChange:
-    def test_alert_only_when_extreme_set_changes(self, fake_store, monkeypatch):
-        from api.routers import associations
+class TestAnomalyReportAlert:
+    """The scan stores its report and e-mails it only when the headline set gains an entry."""
 
-        sent: list[list[str]] = []
-        monkeypatch.setattr(associations, "send_extreme_anomaly_alert",
-                            lambda ex: sent.append([a["feature"] for a in ex]))
+    PARAMS = {"sigma_threshold": 2.5, "days": 252}
+
+    def _world(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        idx = pd.bdate_range(end=pd.Timestamp(date.today()), periods=400)  # noqa: DTZ011
+        rng = np.random.default_rng(21)
+        vix = pd.Series(18.0 + rng.normal(0, 1.0, len(idx)), index=idx)
+        vix.iloc[-1] = 45.0                                    # jumps today
+        dxy = pd.Series(100.0 + rng.normal(0, 0.5, len(idx)), index=idx)
+        spy = pd.Series(500.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.008, len(idx)))), index=idx)
+        raw = pd.DataFrame({1: vix, 2: dxy, 3: spy})
+        registry = pd.DataFrame([(1, "vix", "vol", "CBOE VIX Index"), (2, "dxy", "fx", "Dollar Index"),
+                                 (3, "spy_full", "equity", "Close SPY")],
+                                columns=["id", "name", "family", "description"])
+        return raw, registry
+
+    class _Pit:
+        def __init__(self, raw: pd.DataFrame) -> None:
+            self.raw, self.calls = raw, 0
+
+        def get_feature_matrix(self, feature_ids, start_date, end_date, as_of_date, vintage_policy):
+            self.calls += 1
+            assert vintage_policy == "LATEST_AS_OF" and as_of_date == end_date
+            return self.raw[[c for c in self.raw.columns if c in feature_ids]]
+
+    def _scan(self, raw: pd.DataFrame) -> dict:
+        w = raw[1].tail(175)
+        return {"anomalies": [{"feature": "vix", "zscore": round(float((w.iloc[-1] - w.mean()) / w.std()), 3),
+                               "current_value": 45.0, "historical_mean": round(float(w.mean()), 4),
+                               "historical_std": round(float(w.std()), 4), "severity": "extreme",
+                               "broken_correlations": []}],
+                "threshold": 2.5}
+
+    def test_report_is_stored_and_mailed_once_per_new_headline(self, fake_store, monkeypatch):
+        from alerts import email as grid_email
+
+        sent: list[dict] = []
+        monkeypatch.setattr(grid_email, "send_anomaly_report", sent.append)
+        raw, registry = self._world()
+        pit = self._Pit(raw)
         ctx = ap.BuildContext(engine=ENGINE, now=NOW)
-        scan = {"anomalies": [{"feature": "vix", "zscore": 4.0}, {"feature": "dxy", "zscore": 2.6}]}
-        ap._alert_on_new_extremes(ctx, scan)
-        assert sent == [["vix"]]
-        fake_store.put("associations.anomalies", {"sigma_threshold": 2.5, "days": 252}, scan)
-        ap._alert_on_new_extremes(ctx, scan)
-        assert sent == [["vix"]]  # unchanged set: no repeat e-mail
-        ap._alert_on_new_extremes(ctx, {"anomalies": [{"feature": "hy", "zscore": -3.9}]})
-        assert sent == [["vix"], ["hy"]]
+
+        scan = self._scan(raw)
+        inputs = ap._report_and_alert(ctx, scan, pit, registry, raw, raw, date.today())  # noqa: DTZ011
+        report = scan["report"]
+        assert report["schema"] == "anomaly-report/1" and report["items"][0]["feature"] == "vix"
+        assert report["items"][0]["verdict"] == "sharp_move"
+        assert report["items"][0]["history"]["target"] == "spy_full"   # the long read fetched the linked price
+        assert inputs == {"headline_key": ["vix"]} and len(sent) == 1 and pit.calls == 1
+
+        fake_store.put("associations.anomalies", self.PARAMS, scan, inputs=inputs)
+        again = self._scan(raw)
+        assert ap._report_and_alert(ctx, again, pit, registry, raw, raw, date.today()) == inputs  # noqa: DTZ011
+        assert len(sent) == 1 and "report" in again              # same headline: stored, not re-sent
+
+        fake_store.put("associations.anomalies", self.PARAMS, scan, inputs={"headline_key": ["vix", "old"]})
+        ap._report_and_alert(ctx, self._scan(raw), pit, registry, raw, raw, date.today())  # noqa: DTZ011
+        assert len(sent) == 1                                    # an entry dropping out sends nothing
+
+        fake_store.put("associations.anomalies", self.PARAMS, scan, inputs={"headline_key": []})
+        ap._report_and_alert(ctx, self._scan(raw), pit, registry, raw, raw, date.today())  # noqa: DTZ011
+        assert len(sent) == 2                                    # a new entry does
+
+    def test_nothing_flagged_sends_nothing(self, fake_store, monkeypatch):
+        from alerts import email as grid_email
+
+        sent: list[dict] = []
+        monkeypatch.setattr(grid_email, "send_anomaly_report", sent.append)
+        raw, registry = self._world()
+        scan = {"anomalies": []}
+        inputs = ap._report_and_alert(ap.BuildContext(engine=ENGINE, now=NOW), scan, self._Pit(raw),
+                                      registry, raw, raw, None)
+        assert inputs == {"headline_key": []} and sent == [] and "report" not in scan
+
+    def test_a_report_failure_keeps_the_scan_and_the_previous_key(self, fake_store, monkeypatch):
+        from intelligence import anomaly_report
+
+        raw, registry = self._world()
+        scan = self._scan(raw)
+        fake_store.put("associations.anomalies", self.PARAMS, scan, inputs={"headline_key": ["vix"]})
+        monkeypatch.setattr(anomaly_report, "build_report",
+                            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
+        inputs = ap._report_and_alert(ap.BuildContext(engine=ENGINE, now=NOW), scan, self._Pit(raw),
+                                      registry, raw, raw, None)
+        assert inputs == {"headline_key": ["vix"]} and "report" not in scan and scan["anomalies"]
 
 
 class TestAssociationsSharedRead:
