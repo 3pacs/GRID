@@ -44,7 +44,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_fa
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_evidence.py' -v
 ```
 
-19 new synthetic tests passed on cloud Python 3.12 using identical source loaded
+21 synthetic tests passed on cloud Python 3.12 using identical source loaded
 in memory (no filesystem writes). The 17 existing helper tests passed on Precision
 Python 3.14 before this change. Ruff is unavailable on the cloud host; CI and
 Claude's checkout checks remain required. No production report or holdout used.
@@ -58,3 +58,13 @@ rendering and the scheduled daily brief remain separate work. No new daily revie
 writer is introduced; GRID's existing review pipeline stays untouched.
 
 Claude verifies the exact final kit; Anik alone applies any GRID release.
+
+## Review hardening
+
+Oversized numeric metrics and decoder recursion failures normalize to ValueError;
+no raw OverflowError/RecursionError escapes these boundaries. A selected ID outside
+the truncated ranking is only a producer claim: the report has no row proving it
+exists or was tested. Output explicitly states selected IDs have not been checked
+against frozen discovery. A downstream caller must verify them before any selection
+or activation. The independently obtained expected file hash remains a caller
+contract, not something this pure adapter can prove.
