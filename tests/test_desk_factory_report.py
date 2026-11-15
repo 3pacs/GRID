@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 from analysis.desk_factory_report import factory_report_cards, MAX_REPORT_BYTES
@@ -73,6 +74,8 @@ class FactoryDeskTest(unittest.TestCase):
         result = self.adapt()
         self.assertFalse(result["ranking_complete"])
         self.assertEqual(result["selected_not_in_ranking"], ["outside-top"])
+        self.assertFalse(result["selected_ids_verified_against_discovery"])
+        self.assertEqual(result["selected_not_in_ranking_status"], "producer_claim_only")
 
     def test_complete_ranking_cannot_miss_selected(self):
         self.rep["selected"] = ["outside-top"]
@@ -157,6 +160,19 @@ class FactoryDeskTest(unittest.TestCase):
         for value in (-0.1, 1.1):
             self.rep["ranking"][0]["adjusted_p"] = value
             with self.assertRaises(ValueError):
+                self.adapt()
+
+    def test_oversized_integer_metric_normalized(self):
+        self.rep["ranking"][0]["r"] = 10 ** 400
+        with self.assertRaisesRegex(ValueError, "finite numeric"):
+            self.adapt()
+
+    def test_deep_json_normalized(self):
+        raw = b"[" * 2000 + b"0" + b"]" * 2000
+        with self.assertRaises(ValueError):
+            self.adapt(raw=raw)
+        with patch("analysis.desk_factory_report.json.loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(ValueError, "invalid report JSON"):
                 self.adapt()
 
     def test_bounded_identity(self):
