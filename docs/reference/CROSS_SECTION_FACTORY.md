@@ -85,3 +85,32 @@ the new state. The test proves every other field passes.
 S&P 500 members, overnight and intraday horizons: 2010-01-04 .. 2026-11-13 is consumed for rules that rank on a
 stock's own past overnight or intraday returns (edge search 12; #1133). Other signals and the `close_1d` horizon
 have been searched on 2010–2022 only by runs on a factory ledger. Nothing here has read 2023 onward.
+
+## First runs (2026-11-15, scratch ledger, development days 2010-01-04 .. 2022-12-29)
+
+Run files: `docs/research/cross-section-runs/`. Both were declared on a scratch factory ledger (genesis, two
+declared, two results), not on `/data/grid_ledgers/factory`. Cost 1 bp a side; 10,000 draws; seed 20261107.
+
+**`xs-overnight-persistence-20261115`** (the edge search 12 card, from a run file): 12 modules, bar t 2.33, 7 cleared.
+
+| Module | Gross bp | Net bp | t | By hand (edge search 12) |
+|---|---|---|---|---|
+| overnight mean 252, pooled 5 %, overnight | 9.06 | 5.06 | 4.33 | 9.06, 5.06, 4.33 |
+| pooled 10 % | 7.27 | 3.27 | 3.69 | 7.27, 3.27, 3.69 |
+| pooled 20 % | 5.76 | 1.76 | 2.63 | 5.76, 1.76 |
+| within sector 10 % | 6.08 | 2.08 | 3.27 | 6.06 gross |
+| within sector 20 % | 4.85 | 0.85 | 1.93 | 4.77 gross |
+| faded intraday, pooled 5 % | 8.26 | 4.26 | 2.28 | 8.26 gross |
+
+The pooled modules match to the last digit. The within-sector ones differ by under 0.1 bp because this run places
+unlabelled past members from development bars only (282 placed, 78 % accuracy on 439 labelled names), where the
+by-hand card used bars through 2026. Report sha256 `437d89d7…`.
+
+**`xs-published-effects-1-20261115`** (12-1 momentum, 5-day reversal, nearness to the 52-week high; one-day holds):
+12 modules, bar t 2.27, **none cleared**. Best: 5-day reversal, within sector 10 %, 4.53 bp gross, 0.53 net, t 0.33.
+Momentum earned 1.0 bp gross or less and the 52-week-high modules were negative. Report sha256 `ef0e10ec…`.
+
+The reversal card shows why the card matters even for a module that fails: before cost it earned 23.8 bp a night
+while the market was falling and speeding up (343 nights) and 33.5 on VIX spike days (265 nights), against 0.2 to 2.0
+in rising markets. That is a description of a searched sample, and the daily full-turnover cost is harsh on slow
+signals, but it is the kind of conditional statement a pooled verdict hides.

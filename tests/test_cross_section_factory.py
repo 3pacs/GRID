@@ -2,7 +2,7 @@
 import csv
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,7 @@ from analysis import ledger_steered_exploration as lse
 from analysis.desk_factory_report import factory_report_cards
 
 SECTORS = ("Energy", "Information Technology", "Utilities")
-HEADER = "date,close,high,low,open,volume,adjClose,adjHigh,adjLow,adjOpen,adjVolume,divCash,splitFactor".split(",")
+HEADER = ["date", "close", "high", "low", "open", "volume", "adjClose", "adjHigh", "adjLow", "adjOpen", "adjVolume", "divCash", "splitFactor"]
 
 
 def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False):
@@ -97,14 +97,14 @@ def test_run_declares_first_selects_the_planted_effect_and_feeds_the_evidence_ad
     # every field the desk evidence adapter reads is there; only the state label is new
     raw = (tmp_path / "out" / "report.json").read_bytes().replace(b"CROSS_SECTION_DEV_RANKING_ONLY", b"INTRADAY_DEV_RANKING_ONLY")
     import hashlib
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cards = factory_report_cards(raw, expected_sha256=hashlib.sha256(raw).hexdigest(), receipt_id="r1", observed_at=now,
                                  available_at=now, as_of=now, max_age=timedelta(days=1))
     assert cards["selected_count"] == 2 and cards["tested_trials"] == 4
 
 
 def test_spreads_match_a_by_hand_computation_and_ignore_later_bars(tmp_path):
-    days, _ = build(tmp_path)
+    build(tmp_path)
     run = X.RunFile.from_dict(RUN)
     panel = X.load_panel(tmp_path, run)
     res = X.evaluate(panel, run)
@@ -151,7 +151,7 @@ def test_run_files_it_refuses(change):
 def test_a_failed_run_is_closed_as_abandoned(tmp_path):
     build(tmp_path, n_days=120)
     ledger = ledger_at(tmp_path)
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.OperationalError):
         X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "missing-state.db", ledger, tmp_path / "out")
     last = json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])
     assert last["kind"] == lse.FACTORY_ABANDONED and lse.factory_open_run(ledger) is None

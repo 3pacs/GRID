@@ -82,7 +82,7 @@ class RunFile:
              "perms", "seed", "min_ranked", "min_session_bars", "cards")
 
     @classmethod
-    def from_dict(cls, value: dict) -> "RunFile":
+    def from_dict(cls, value: dict) -> RunFile:
         if not isinstance(value, dict) or set(value) - set(cls._keys):
             raise RunFileError("unknown run-file keys")
         try:
@@ -174,8 +174,8 @@ def load_panel(data_dir: Path, run: RunFile) -> Panel:
             continue
         df["date"] = df["date"].str[:10]
         df = df[df["date"] <= DEV_LAST_BAR].drop_duplicates("date").set_index("date")   # nothing later is ever held
-        for k in cols_data:
-            cols_data[k][p.stem] = df[k]
+        for k, store in cols_data.items():
+            store[p.stem] = df[k]
     f = {k: pd.DataFrame(v).sort_index() for k, v in cols_data.items()}
     counts = f["close"].notna().sum(axis=1)
     sessions = [d for d, n in counts.items() if n >= run.min_session_bars]
@@ -328,7 +328,7 @@ def evaluate(panel: Panel, run: RunFile) -> dict:
             for m in mods:
                 y, q, res = ys[m["horizon"]][r], m["fraction"], out[m["trial_id"]]
                 if m["ranking"] == "pooled":
-                    k = int(math.floor(q * len(idx)))
+                    k = math.floor(q * len(idx))
                     res["gross"][r], res["names"][r] = _spread(sig[r], tick, idx, k, y), k
                     continue
                 floor = max(8, math.ceil(1 / q))
@@ -336,7 +336,7 @@ def evaluate(panel: Panel, run: RunFile) -> dict:
                 for s, sidx in enumerate(by_sector):
                     if len(sidx) < floor:
                         continue
-                    k = max(1, int(math.floor(q * len(sidx))))
+                    k = max(1, math.floor(q * len(sidx)))
                     v = _spread(sig[r], tick, sidx, k, y)
                     res["per_sector"][r, s], res["k_sector"][r, s] = v, k
                     if not math.isnan(v):
@@ -397,9 +397,9 @@ def load_state(path: Path) -> dict:
 def _cut(v: np.ndarray, cost: float) -> dict:
     v = v[~np.isnan(v)]
     if len(v) < 30:
-        return {"nights": int(len(v))}
+        return {"nights": len(v)}
     mean, sd = float(v.mean()), float(v.std(ddof=1))
-    return {"nights": int(len(v)), "gross_bp": round(mean * 1e4, 3), "net_bp": round((mean - cost) * 1e4, 3),
+    return {"nights": len(v), "gross_bp": round(mean * 1e4, 3), "net_bp": round((mean - cost) * 1e4, 3),
             "sd_bp": round(sd * 1e4, 2), "t_gross": round(mean / (sd / math.sqrt(len(v))), 3) if sd else None}
 
 
@@ -446,8 +446,8 @@ def card(panel: Panel, module: dict, res: dict, state: dict, cost: float) -> dic
                 phase[r, j] = rec["sectors"].get(s, {}).get("phase")
                 leading[r, j] = rec["sectors"].get(s, {}).get("leading")
         out["sector_phase"] = {str(p): _cut(pooled(phase == p), cost) for p in sorted({x for x in phase.ravel() if x})}
-        out["sector_vs_market"] = {"leading": _cut(pooled(leading == True), cost),      # noqa: E712
-                                   "lagging": _cut(pooled(leading == False), cost)}     # noqa: E712
+        out["sector_vs_market"] = {"leading": _cut(pooled(leading == True), cost),
+                                   "lagging": _cut(pooled(leading == False), cost)}
     return out
 
 
@@ -472,6 +472,7 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
     lse.record_factory_declared(ledger, run_id=spec.run_id, run_file=body, data_manifest_sha256=man_sha,
                                 trial_count=spec.trial_count())
     try:
+        write_once(out / "data-manifest.json", man)
         panel = load_panel(Path(data_dir), spec)
         results = evaluate(panel, spec)
         modules = spec.modules()
@@ -486,7 +487,7 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
             mean_net = float(g.mean() - SIDES[m["horizon"]] * cost) if len(g) else None
             sd = float(g.std(ddof=1)) if len(g) > 1 else None
             trials.append({"trial_id": m["trial_id"], "family": m["family"], "feature": m["feature"],
-                           "status": "tested" if tested else "untestable", "n": int(len(g)),
+                           "status": "tested" if tested else "untestable", "n": len(g),
                            "r": (mean_net / sd) if tested and sd else None, "net_dollars": mean_net if tested else None,
                            "gross_bp": float(g.mean() * 1e4) if len(g) else None,
                            "t": float(bar["t"][j]) if tested else None, "p": float(bar["p"][j]), "adjusted_p": float(bar["adjusted_p"][j]),

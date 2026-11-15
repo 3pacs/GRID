@@ -1,0 +1,5 @@
+{"run_id": "xs-overnight-persistence-20261115", "first_session": "2010-01-04", "last_session": "2022-12-29",
+ "signals": [{"name": "overnight_252", "kind": "mean_overnight", "lookback": 252, "horizons": ["overnight"]},
+             {"name": "overnight_252_fade", "kind": "mean_overnight", "lookback": 252, "sign": -1, "horizons": ["intraday"]}],
+ "rankings": ["pooled", "within_sector"], "fractions": [0.05, 0.1, 0.2], "cost_bp_per_side": 1.0, "alpha": 0.05,
+ "perms": 10000, "seed": 20261107, "cards": 4}
