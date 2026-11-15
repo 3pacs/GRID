@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from analysis.desk_evidence import DeskEvidence, EvidenceKind, evidence_card
 
 MAX_REPORT_BYTES = 2_000_000
+MAX_COUNT = 2 ** 53 - 1  # Exact integer interoperability with JSON/float consumers.
 
 
 def _identity(value):
@@ -29,8 +30,8 @@ def _sha(value):
 
 
 def _count(value):
-    if type(value) is not int or value < 0:
-        raise ValueError("nonnegative integer required")
+    if type(value) is not int or not 0 <= value <= MAX_COUNT:
+        raise ValueError("count must be an exact nonnegative JSON-safe integer")
     return value
 
 
