@@ -112,7 +112,7 @@
 ### Auth (implied, not in requirements.txt)
 | Package | Purpose |
 |---------|---------|
-| `python-jose` | JWT encode/decode (`grid/api/auth.py`) |
+| `PyJWT` | JWT encode/decode (`grid/api/auth.py`) |
 | `passlib` | bcrypt password hashing (`grid/api/auth.py`) |
 
 ### Data Formats
