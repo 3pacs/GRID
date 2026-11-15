@@ -54,6 +54,7 @@ class ReceiptCallerTest(unittest.TestCase):
         self.assertEqual(result["report_sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(result["report_canonical_sha256"], self.receipt["report_sha256"])
         self.assertEqual(result["outcome"], "no_selected_candidates")
+        self.assertEqual(result["integrity"], "report_canonical_object_matches_pinned_result_receipt")
         self.assertEqual(result["ranking"][0]["reported_metrics"]["net_dollars"], -0.04)
 
     def test_changed_report_rejected_against_original_receipt(self):
