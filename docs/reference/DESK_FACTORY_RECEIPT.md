@@ -67,3 +67,32 @@ artifact is consumed. Full factory10 remains open.
 The complete tested-trial receipt is checked for safe counts and finite metrics,
 including tested trials omitted from the displayed ranking. Boolean counts,
 oversized integers and invalid p-values cannot enter through that omitted subset.
+
+## Independent review follow-up
+
+The integrity field now identifies the actual check: canonical report object
+matches a pinned result receipt, not merely a same-byte hash comparison.
+
+Concrete pin source: open the existing factory ledger together with its matching
+anchor and verify it. For the latest result, use its verified ledger head. For an
+older result, use the next record's prev_sha256 only after verifying that record's
+membership in the full anchored chain. An unverified next record is not an anchor.
+Do not read a result hash from the untrusted receipt itself and call it custody.
+
+Additional synthetic producer seam check:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_factory_receipt_producer.py' -v
+```
+
+This generates temporary planted/noise bars using existing factory fixtures,
+runs the real producer, reopens its synthetic ledger with its anchor, and feeds
+the emitted report/result to the caller. Only private temporary calendar copies
+are created; their exact pinned bytes are unchanged and checkout permissions are
+not modified. No actual research ledger or holdout is used.
+
+Author follow-up verification: all 18 caller tests plus the producer seam passed
+(19 tests total, 2.94 seconds) on Precision Python 3.11.15 using the existing
+factory source and generated temporary artifacts only. The original independent
+review also passed 18+22+17 tests at the preceding head on Python 3.14.4; a changed
+head still requires renewed verification.
