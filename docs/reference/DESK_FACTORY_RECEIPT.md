@@ -51,7 +51,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_fa
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_evidence.py' -v
 ```
 
-17 new synthetic tests passed in memory on Python 3.12. Cases include canonical
+18 new synthetic tests passed in memory on Python 3.12. Cases include canonical
 versus file digest mismatch, changed report/receipt, phantom selected IDs,
 truncated ranking, negative/no-testable results, clocks and no input mutation.
 No actual ledger, dataset, provider, factory run or holdout was read.
@@ -63,3 +63,7 @@ No filesystem/CLI ingestion or production wiring; no live-slot, Sleuth or thesis
 feed; no scheduler; no replacement daily review writer. An existing owner must
 provide the verified receipt pin and its availability evidence before a real
 artifact is consumed. Full factory10 remains open.
+
+The complete tested-trial receipt is checked for safe counts and finite metrics,
+including tested trials omitted from the displayed ranking. Boolean counts,
+oversized integers and invalid p-values cannot enter through that omitted subset.
