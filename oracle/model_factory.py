@@ -141,7 +141,22 @@ class ModelFactory:
             ("parent_model", "TEXT"),
         ]
         with self.engine.begin() as conn:
-            for col_name, col_def in cols:
+            # Inspect the same search-path relation that unqualified ALTER uses.
+            # IF NOT EXISTS still takes ACCESS EXCLUSIVE even on complete tables.
+            # Catalog errors propagate; never declare an unverified schema ready.
+            existing = {
+                row[0] for row in conn.execute(text("""
+                    SELECT attname FROM pg_catalog.pg_attribute
+                    WHERE attrelid = pg_catalog.to_regclass('oracle_models')
+                      AND attnum > 0 AND NOT attisdropped
+                """))
+            }
+            missing = [(name, definition) for name, definition in cols if name not in existing]
+            if not missing:
+                log.info("ModelFactory schema already complete; runtime DDL skipped")
+                return
+            log.info("ModelFactory schema compatibility path: {n} missing columns", n=len(missing))
+            for col_name, col_def in missing:
                 # Security: assert both identifier and type fragment are whitelisted
                 # before interpolating into DDL.  Raises AssertionError (not caught
                 # by generic Exception handlers) so a misconfigured cols list fails
