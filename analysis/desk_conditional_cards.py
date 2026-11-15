@@ -11,6 +11,7 @@ DIMENSIONS = (
     "sector", "group", "sector_phase", "sector_vs_market",
 )
 METRICS = ("gross_bp", "net_bp", "sd_bp", "t_gross")
+NIGHT_PARTITIONS = ("year", "market_phase", "fed_balance_sheet", "vix_third", "spike_state")
 
 
 def _finite(value):
@@ -108,7 +109,22 @@ def conditional_factory_cards(raw: bytes, **adapter_args) -> dict:
                 if checked["nights"] > overall["nights"]:
                     raise ValueError("stratum exceeds overall nights")
                 cuts[dim][group] = checked
+        partition_coverage = {}
+        for dim in NIGHT_PARTITIONS:
+            if dim not in cuts:
+                partition_coverage[dim] = {"status": "not_supplied"}
+                continue
+            covered = sum(cut["nights"] for cut in cuts[dim].values())
+            if covered > overall["nights"]:
+                raise ValueError("night partition exceeds overall nights")
+            partition_coverage[dim] = {
+                "status": "reported_partition_counts",
+                "classified_nights": covered,
+                "unclassified_nights": overall["nights"] - covered,
+                "total_nights": overall["nights"],
+            }
         rows.append({
+            "partition_coverage": partition_coverage,
             "trial_id": trial_id, "evidence": copy.deepcopy(ranked[trial_id]["evidence"]),
             "overall": overall, "state_rows_matched": matched, "cuts": cuts,
             "standing": "development_descriptions_only",
@@ -160,6 +176,8 @@ def render_conditional_cards(raw: bytes, **adapter_args) -> str:
                   "Evidence: " + _text(card["evidence"]["label"]) +
                   "; quality=" + _text(card["evidence"]["quality"]),
                   "Reasons: " + _text(", ".join(card["evidence"]["reasons"]) or "none"),
+                  "Night partition coverage (reported counts, not verified timestamps): " +
+                  _text(json.dumps(card["partition_coverage"], sort_keys=True)),
                   "| Dimension | Stratum | Nights | Gross bp | Net bp | SD bp | t gross |",
                   "|---|---|---:|---:|---:|---:|---:|"]
         entries = [("overall", "all", card["overall"])]
