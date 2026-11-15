@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
-from analysis.desk_factory_report import factory_report_cards, MAX_REPORT_BYTES
+from analysis.desk_factory_report import factory_report_cards, MAX_REPORT_BYTES, MAX_COUNT
 
 
 def fixture():
@@ -174,6 +174,21 @@ class FactoryDeskTest(unittest.TestCase):
         with patch("analysis.desk_factory_report.json.loads", side_effect=RecursionError):
             with self.assertRaisesRegex(ValueError, "invalid report JSON"):
                 self.adapt()
+
+    def test_count_interoperability_bounds(self):
+        for value in (MAX_COUNT + 1, 10 ** 400):
+            for key in ("trial_count", "tested", "untestable", "n"):
+                rep = fixture()
+                if key == "n":
+                    rep["ranking"][0][key] = value
+                else:
+                    rep[key] = value
+                with self.subTest(key=key, value_bits=value.bit_length()):
+                    with self.assertRaisesRegex(ValueError, "JSON-safe"):
+                        self.adapt(rep)
+        self.rep["ranking"][0]["n"] = MAX_COUNT
+        self.assertEqual(self.adapt()["ranking"][0]["development_fires"], MAX_COUNT)
+        self.assertEqual(int(float(MAX_COUNT)), MAX_COUNT)
 
     def test_bounded_identity(self):
         for value in ("", " " * 3, "x" * 513, 9):
