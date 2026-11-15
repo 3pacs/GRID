@@ -156,5 +156,31 @@ class ConditionalTest(unittest.TestCase):
             self.adapt()
 
 
+    def test_night_partition_gaps_explicit(self):
+        coverage = self.adapt()["cards"][0]["partition_coverage"]
+        self.assertEqual(coverage["market_phase"], {
+            "status": "reported_partition_counts", "classified_nights": 80,
+            "unclassified_nights": 20, "total_nights": 100})
+        self.assertEqual(coverage["spike_state"]["unclassified_nights"], 100)
+        self.assertEqual(coverage["fed_balance_sheet"], {"status": "not_supplied"})
+        self.assertIn("unclassified_nights", self.adapt(render=True))
+
+    def test_partition_overcount_rejected(self):
+        self.rep["cards"]["a"]["year"]["2022"] = cut(60)
+        with self.assertRaisesRegex(ValueError, "partition"):
+            self.adapt()
+
+    def test_all_optional_dimensions_preserved_without_overlap_sum(self):
+        card = self.rep["cards"]["a"]
+        for dim in ("fed_balance_sheet", "vix_third", "sector_phase", "group", "sector_vs_market"):
+            card[dim] = {"one": cut(60), "two": cut(40)}
+        # Sector groups can overlap in time: 160 memberships across100 nights.
+        card["sector"] = {"tech": cut(80), "utilities": cut(80)}
+        result = self.adapt()["cards"][0]
+        for dim in ("fed_balance_sheet", "vix_third", "sector_phase", "group", "sector_vs_market", "sector"):
+            self.assertEqual(result["cuts"][dim], card[dim])
+        self.assertNotIn("sector", result["partition_coverage"])
+
+
 if __name__ == "__main__":
     unittest.main()
