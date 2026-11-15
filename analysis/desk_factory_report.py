@@ -73,7 +73,9 @@ def factory_report_cards(
         raise ValueError("invalid report JSON") from exc
     if not isinstance(rep, dict):
         raise ValueError("report object required")
-    if rep.get("state") != "INTRADAY_DEV_RANKING_ONLY" or rep.get("promotion_allowed") is not False:
+    if rep.get("state") not in (
+        "INTRADAY_DEV_RANKING_ONLY", "CROSS_SECTION_DEV_RANKING_ONLY",
+    ) or rep.get("promotion_allowed") is not False:
         raise ValueError("development-only state required")
     run_id = _identity(rep.get("run_id"))
     frozen_sha = _sha(rep.get("frozen_sha256"))
@@ -138,6 +140,9 @@ def factory_report_cards(
     return {
         "schema": "desk-factory-report-v1",
         "run_id": run_id,
+        "source_state": rep["state"],
+        "adapter_scope": "ranking_summary_only",
+        "unadapted_report_fields": [key for key in ("cards", "coverage", "method", "max_t") if key in rep],
         "report_sha256": actual,
         "frozen_sha256": frozen_sha,
         "integrity": "report_bytes_match_expected_hash",
