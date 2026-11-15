@@ -36,7 +36,16 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_co
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_factory_report.py' -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_evidence.py' -v
 ```
-Expected 16 + 26 + 17 synthetic tests. No actual research artifacts or holdouts.
+Expected 19 + 26 + 17 synthetic tests. No actual research artifacts or holdouts.
 Claude verifies exact kit; Anik applies. Full #1164 still requires real caller
 wiring, separate confirmation/forward outcomes, hypothesis/invalidation context
 and the other desk inputs. This is not an automatically validated strategy.
+
+## Missing regime coverage
+The producer's year/market-phase/Fed/VIX/spike groups partition traded nights.
+For these dimensions only, show supplied classified nights and the residual
+unclassified nights against the overall count; missing dimension says
+not_supplied, not zero coverage. Reject sums exceeding the overall count.
+This checks reported counts, not actual timestamp uniqueness or point-in-time
+label quality. Sector/group/sector-phase/sector-vs-market memberships can overlap
+within a night and are never added into a unique-night denominator.
