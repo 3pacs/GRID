@@ -6,10 +6,11 @@ verifies the pinned record only, not the ledger chain or the frozen discovery.
 """
 import hashlib
 import json
+import math
 import re
 from datetime import datetime, timedelta
 
-from analysis.desk_factory_report import MAX_REPORT_BYTES, factory_report_cards
+from analysis.desk_factory_report import MAX_COUNT, MAX_REPORT_BYTES, factory_report_cards
 
 MAX_RESULT_BYTES = 8_000_000
 
@@ -127,6 +128,17 @@ def receipt_bound_factory_cards(
             raise ValueError("explicit trial selection required")
         if trial["selected"] and status != "tested":
             raise ValueError("untested trial cannot be selected")
+        if status == "tested":
+            if type(trial.get("n")) is not int or not 0 <= trial["n"] <= MAX_COUNT:
+                raise ValueError("tested receipt trial needs a JSON-safe fire count")
+            for key in ("r", "net_dollars", "t", "p", "adjusted_p"):
+                value = trial.get(key)
+                try:
+                    finite = type(value) in (int, float) and math.isfinite(value)
+                except OverflowError as exc:
+                    raise ValueError("invalid tested receipt metric") from exc
+                if not finite or (key in ("p", "adjusted_p") and not 0 <= value <= 1):
+                    raise ValueError("invalid tested receipt metric")
         tested += status == "tested"
         selected += trial["selected"]
         if trial["selected"]:
