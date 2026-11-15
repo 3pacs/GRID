@@ -44,7 +44,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_fa
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_evidence.py' -v
 ```
 
-21 synthetic tests passed on cloud Python 3.12 using identical source loaded
+22 synthetic tests passed on cloud Python 3.12 using identical source loaded
 in memory (no filesystem writes). The 17 existing helper tests passed on Precision
 Python 3.14 before this change. Ruff is unavailable on the cloud host; CI and
 Claude's checkout checks remain required. No production report or holdout used.
@@ -68,3 +68,7 @@ exists or was tested. Output explicitly states selected IDs have not been checke
 against frozen discovery. A downstream caller must verify them before any selection
 or activation. The independently obtained expected file hash remains a caller
 contract, not something this pure adapter can prove.
+
+All count fields, including development fires, are bounded to 0..2**53-1.
+This rejects implausibly large counts before downstream float/JavaScript consumers
+can overflow or silently lose integer precision. No truncation/clamping occurs.
