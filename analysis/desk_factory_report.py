@@ -68,7 +68,7 @@ def factory_report_cards(
     receipt_id = _identity(receipt_id)
     try:
         rep = json.loads(raw, object_pairs_hook=_object, parse_constant=_constant)
-    except (UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError, OverflowError) as exc:
         raise ValueError("invalid report JSON") from exc
     if not isinstance(rep, dict):
         raise ValueError("report object required")
@@ -113,7 +113,11 @@ def factory_report_cards(
         metrics = {}
         for key in ("r", "net_dollars", "t", "p", "adjusted_p"):
             value = row.get(key)
-            if type(value) not in (int, float) or not math.isfinite(value):
+            try:
+                finite = type(value) in (int, float) and math.isfinite(value)
+            except (OverflowError, RecursionError) as exc:
+                raise ValueError("finite numeric ranking metric required") from exc
+            if not finite:
                 raise ValueError("finite numeric ranking metric required")
             if key in ("p", "adjusted_p") and not 0 <= value <= 1:
                 raise ValueError("invalid p-value")
@@ -150,6 +154,8 @@ def factory_report_cards(
                     "development_candidates_only" if selected_ids else
                     "no_selected_candidates"),
         "selected_trial_ids": selected_ids,
+        "selected_ids_verified_against_discovery": False,
+        "selected_not_in_ranking_status": "producer_claim_only",
         "ranking_complete": len(ranking) == tested,
         "selected_not_in_ranking": [v for v in selected_ids if v not in seen],
         "ranking": rows,
