@@ -157,6 +157,19 @@ class ReceiptCallerTest(unittest.TestCase):
         self.receipt["trials"][0]["status"] = "insufficient"
         self.assertEqual(self.call()["outcome"], "no_testable_trials")
 
+    def test_unranked_receipt_count_and_metrics_validated(self):
+        for field, value in (("n", True), ("n", 10 ** 400), ("n", -1),
+                             ("r", 10 ** 400), ("p", 2), ("t", True)):
+            self.report, self.receipt = fixture()
+            self.report.update(trial_count=2, tested=2, selected=["b"])
+            other = {**self.receipt["trials"][0], "trial_id": "b", "selected": True}
+            other[field] = value
+            self.receipt["trials"].append(other)
+            self.receipt.update(trial_count=2, tested_count=2, selected_count=1)
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    self.call()
+
     def test_no_input_mutation(self):
         raw, receipt = self.raw()
         before = copy.deepcopy((self.report, self.receipt))
