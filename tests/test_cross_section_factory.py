@@ -107,7 +107,8 @@ def test_spreads_match_a_by_hand_computation_and_ignore_later_bars(tmp_path):
     build(tmp_path)
     run = X.RunFile.from_dict(RUN)
     panel = X.load_panel(tmp_path, run)
-    res = X.evaluate(panel, run)
+    states = X.state_arrays(panel, X.load_state(tmp_path / "state.db"))
+    res = X.evaluate(panel, run, states)
     r = panel.sessions.index("2015-06-15")
     on = pd.DataFrame(panel.on, index=panel.sessions, columns=panel.cols)
     sig = on.iloc[r - 20:r + 1].clip(-0.10, 0.10).mean()
@@ -126,7 +127,7 @@ def test_spreads_match_a_by_hand_computation_and_ignore_later_bars(tmp_path):
         df = pd.read_csv(p)
         df.loc[df["date"] > panel.sessions[r + 1], ["open", "close", "high", "low", "adjOpen", "adjClose"]] *= 1.2
         df.to_csv(p, index=False)
-    res2 = X.evaluate(X.load_panel(tmp_path, run), run)
+    res2 = X.evaluate(X.load_panel(tmp_path, run), run, states)
     for tid in res:
         assert res2[tid]["gross"][r] == res[tid]["gross"][r]
 
@@ -148,13 +149,61 @@ def test_run_files_it_refuses(change):
         X.RunFile.from_dict({**RUN, **change})
 
 
-def test_a_failed_run_is_closed_as_abandoned(tmp_path):
+def test_a_failed_run_is_closed_as_abandoned_and_a_missing_state_record_is_refused_first(tmp_path):
     build(tmp_path, n_days=120)
     ledger = ledger_at(tmp_path)
-    with pytest.raises(sqlite3.OperationalError):
-        X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "missing-state.db", ledger, tmp_path / "out")
+    body = write_run(tmp_path, {**RUN, "last_session": "2015-05-29"})
+    before = len((tmp_path / "l.jsonl").read_text().splitlines())
+    with pytest.raises(X.RunFileError):                       # refused before anything is declared
+        X.run(body, tmp_path, tmp_path / "missing-state.db", ledger, tmp_path / "out0")
+    assert len((tmp_path / "l.jsonl").read_text().splitlines()) == before and not (tmp_path / "out0").exists()
+    (tmp_path / "junk.db").write_bytes(b"not a database, long enough to be read as one " * 40)
+    with pytest.raises(sqlite3.DatabaseError):
+        X.run(body, tmp_path, tmp_path / "junk.db", ledger, tmp_path / "out")
     last = json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])
     assert last["kind"] == lse.FACTORY_ABANDONED and lse.factory_open_run(ledger) is None
+
+
+def test_gates_trade_only_the_nights_and_sectors_they_name(tmp_path):
+    build(tmp_path)
+    body = {**RUN, "min_ranked_gated": 10, "signals": [
+        {"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"]},
+        {"name": "on21_rising", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"], "gate": {"market_phase": ["rising, slowing"]}},
+        {"name": "on21_leaders", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"], "gate": {"sector_leading": True}},
+        {"name": "on21_no_defensive", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"], "gate": {"groups": ["cyclical", "growth"]}}]}
+    run = X.RunFile.from_dict(body)
+    panel = X.load_panel(tmp_path, run)
+    states = X.state_arrays(panel, X.load_state(tmp_path / "state.db"))
+    res = X.evaluate(panel, run, states)
+    plain, rising = res["on21|pooled|q20|overnight"]["gross"], res["on21_rising|pooled|q20|overnight"]["gross"]
+    on_nights = np.array([p == "rising, slowing" for p in states.night["market_phase"]])
+    traded = ~np.isnan(plain)
+    assert np.isnan(rising[traded & ~on_nights]).all()                      # turned away
+    np.testing.assert_array_equal(rising[traded & on_nights], plain[traded & on_nights])   # same picks when let through
+    assert 0.3 < (~np.isnan(rising)).sum() / traded.sum() < 0.7
+    leaders = res["on21_leaders|within_sector|q20|overnight"]
+    assert np.isnan(leaders["per_sector"][:, 1:]).all() and (~np.isnan(leaders["per_sector"][:, 0])).sum() > 100   # only Energy leads
+    np.testing.assert_allclose(leaders["gross"][traded], res["on21|within_sector|q20|overnight"]["per_sector"][traded, 0])
+    no_def = res["on21_no_defensive|within_sector|q20|overnight"]
+    assert np.isnan(no_def["per_sector"][:, 2]).all()                       # Utilities is defensive
+    for change in ({"gate": {"weather": ["sunny"]}}, {"gate": {"groups": ["speculative"]}}, {"gate": {"sector_leading": "yes"}},
+                   {"gate": {"market_phase": []}}):
+        with pytest.raises(X.RunFileError):
+            X.RunFile.from_dict({**body, "signals": [{**body["signals"][0], **change}]})
+
+
+def test_turnover_is_full_overnight_and_partial_for_a_slow_signal_held_close_to_close(tmp_path):
+    build(tmp_path)
+    run = X.RunFile.from_dict(RUN)
+    panel = X.load_panel(tmp_path, run)
+    states = X.state_arrays(panel, X.load_state(tmp_path / "state.db"))
+    res = X.evaluate(panel, run, states)
+    over, slow = res["on21|pooled|q20|overnight"], res["mom63|pooled|q20|close_1d"]
+    assert np.nanmin(over["turnover"]) == 1.0 == np.nanmax(over["turnover"])
+    t = slow["turnover"][~np.isnan(slow["turnover"])]
+    assert t[0] == 1.0 and 0.0 < t[1:].mean() < 0.5                         # the first night buys everything, later ones a part
+    assert X._turnover(None, np.array([1, 2]), np.array([3, 4])) == 1.0
+    assert X._turnover((np.array([1, 2]), np.array([3, 4])), np.array([1, 9]), np.array([3, 4])) == 0.25
 
 
 def test_sign_flip_bar():

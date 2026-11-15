@@ -57,6 +57,8 @@ GROUPS = {
     "defensive": ("Consumer Staples", "Utilities"),
 }
 GROUP_OF = {s: g for g, names in GROUPS.items() for s in names}
+NIGHT_GATES = ("market_phase", "fed_balance_sheet", "vix_third", "spike_state")   # one value per night
+SECTOR_GATES = ("sector_phase", "sector_leading", "groups")                        # one value per sector per night
 
 
 class RunFileError(ValueError):
@@ -77,9 +79,10 @@ class RunFile:
     seed: int = 20261107
     min_ranked: int = 400
     min_session_bars: int = 300
+    min_ranked_gated: int = 60
     cards: int = 5
     _keys = ("run_id", "first_session", "last_session", "signals", "rankings", "fractions", "cost_bp_per_side", "alpha",
-             "perms", "seed", "min_ranked", "min_session_bars", "cards")
+             "perms", "seed", "min_ranked", "min_session_bars", "min_ranked_gated", "cards")
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -103,7 +106,7 @@ class RunFile:
             raise RunFileError(f"window must lie inside the development days {DEV_FIRST} .. {DEV_LAST}")
         names = set()
         for s in self.signal_specs():
-            if set(s) - {"name", "kind", "lookback", "skip", "sign", "horizons"} or s.get("kind") not in SIGNAL_KINDS:
+            if set(s) - {"name", "kind", "lookback", "skip", "sign", "horizons", "gate"} or s.get("kind") not in SIGNAL_KINDS:
                 raise RunFileError(f"unknown signal: {s}")
             if not isinstance(s.get("name"), str) or s["name"] in names or "|" in s["name"]:
                 raise RunFileError("each signal needs its own name, without '|'")
@@ -114,14 +117,25 @@ class RunFile:
                 raise RunFileError("sign is 1 or -1, skip is 0 .. 63")
             if not s.get("horizons") or set(s["horizons"]) - set(SIDES):
                 raise RunFileError(f"horizons must be among {sorted(SIDES)}")
+            gate = s.get("gate", {})
+            if not isinstance(gate, dict) or set(gate) - set(NIGHT_GATES) - set(SECTOR_GATES):
+                raise RunFileError(f"a gate may use {NIGHT_GATES + SECTOR_GATES}")
+            for key, allowed in gate.items():
+                if key == "sector_leading":
+                    if type(allowed) is not bool:
+                        raise RunFileError("sector_leading is true or false")
+                elif not (isinstance(allowed, list) and allowed and all(isinstance(v, str) for v in allowed)):
+                    raise RunFileError(f"gate {key} needs a list of values")
+            if set(gate.get("groups", ())) - set(GROUPS):
+                raise RunFileError(f"groups must be among {sorted(GROUPS)}")
         if not names or not self.rankings or set(self.rankings) - set(RANKINGS):
             raise RunFileError(f"rankings must be among {RANKINGS}")
         if not self.fractions or any(not (isinstance(q, float) and 0.01 <= q <= 0.5) for q in self.fractions):
             raise RunFileError("fractions must be between 0.01 and 0.5")
         if not (0 < self.alpha <= 0.10 and 1_000 <= self.perms <= 100_000 and 0 <= self.cost_bp_per_side <= 50):
             raise RunFileError("alpha in (0, 0.10], perms 1,000 .. 100,000, cost 0 .. 50 bp")
-        if self.min_ranked < 20 or self.min_session_bars < 20 or not 0 <= self.cards <= 50:
-            raise RunFileError("min_ranked and min_session_bars at least 20, cards 0 .. 50")
+        if min(self.min_ranked, self.min_session_bars) < 20 or self.min_ranked_gated < 10 or not 0 <= self.cards <= 50:
+            raise RunFileError("min_ranked and min_session_bars at least 20, min_ranked_gated at least 10, cards 0 .. 50")
 
     def modules(self) -> list[dict]:
         out = []
@@ -140,14 +154,17 @@ class RunFile:
 
 # ── Data ──────────────────────────────────────────────────────────────────
 
-def manifest(data_dir: Path) -> tuple[dict, str]:
+def manifest(data_dir: Path, state_db: Path) -> tuple[dict, str]:
     """Name, size and sha256 of every input file. Hashing is the only read before the run is declared."""
     files = {}
     for p in sorted([*Path(data_dir).glob("prices/*.csv"), *(Path(data_dir) / n for n in ("members.csv", "sectors.csv", "renames.json"))]):
         files[str(p.relative_to(data_dir))] = {"bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
     if len(files) < 4:
         raise RunFileError("data directory needs prices/*.csv, members.csv, sectors.csv and renames.json")
-    body = {"schema": "cross-section-data-manifest/1", "files": files}
+    if not Path(state_db).is_file():
+        raise RunFileError("the sector state record (--state-db) is missing")
+    body = {"schema": "cross-section-data-manifest/2", "files": files,
+            "state_db": {"bytes": Path(state_db).stat().st_size, "sha256": hashlib.sha256(Path(state_db).read_bytes()).hexdigest()}}
     return body, digest(body)
 
 
@@ -297,51 +314,132 @@ def outcome(panel: Panel, horizon: str) -> np.ndarray:
     return out
 
 
-def _spread(sig: np.ndarray, tick: np.ndarray, idx: np.ndarray, k: int, y: np.ndarray) -> float:
+def _spread(sig: np.ndarray, tick: np.ndarray, idx: np.ndarray, k: int, y: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """(top-minus-bottom mean outcome, bottom picks, top picks) of the k lowest and k highest signals in idx."""
     order = idx[np.lexsort((tick[idx], sig[idx]))]
-    lo, hi = y[order[:k]], y[order[-k:]]
+    lo_i, hi_i = order[:k], order[-k:]
+    lo, hi = y[lo_i], y[hi_i]
     lo, hi = lo[~np.isnan(lo)], hi[~np.isnan(hi)]
-    return float(hi.mean() - lo.mean()) if len(lo) and len(hi) else float("nan")
+    return (float(hi.mean() - lo.mean()) if len(lo) and len(hi) else float("nan")), lo_i, hi_i
 
 
-def evaluate(panel: Panel, run: RunFile) -> dict:
-    """trial_id -> {"gross": per-session spread, "per_sector": sessions x sectors or None, "names": per session}."""
+@dataclass
+class States:
+    """What the state record said the evening before each decision day (row r = the record of sessions[r-1])."""
+    night: dict               # field -> list of values, None where no record
+    sector_phase: np.ndarray  # sessions x sectors, object
+    sector_leading: np.ndarray
+    matched: int
+
+
+def state_arrays(panel: Panel, state: dict) -> States:
+    n_d, n_s = len(panel.sessions), len(panel.sectors)
+    night = {k: [None] * n_d for k in NIGHT_GATES}
+    phase = np.full((n_d, n_s), None, dtype=object)
+    leading = np.full((n_d, n_s), None, dtype=object)
+    matched = 0
+    for r in range(1, n_d):
+        rec = state.get(panel.sessions[r - 1])
+        if rec is None:
+            continue
+        matched += 1
+        night["market_phase"][r] = rec["market"]["phase"]
+        night["fed_balance_sheet"][r] = rec["fed_balance_sheet"].get("phase")
+        night["vix_third"][r] = rec["vix"].get("third")
+        night["spike_state"][r] = rec["vix"].get("spike_state")
+        for j, s in enumerate(panel.sectors):
+            sec = rec["sectors"].get(s, {})
+            phase[r, j], leading[r, j] = sec.get("phase"), sec.get("leading")
+    return States(night, phase, leading, matched)
+
+
+def _sectors_allowed(gate: dict, states: States, panel: Panel, r: int) -> np.ndarray | None:
+    """Which sectors a gate lets through on decision day r; None when the gate names no sector condition."""
+    if not set(gate) & set(SECTOR_GATES):
+        return None
+    ok = np.ones(len(panel.sectors), dtype=bool)
+    if "groups" in gate:
+        ok &= np.array([GROUP_OF[s] in gate["groups"] for s in panel.sectors])
+    if "sector_phase" in gate:
+        ok &= np.array([p in gate["sector_phase"] for p in states.sector_phase[r]])
+    if "sector_leading" in gate:
+        ok &= np.array([v is gate["sector_leading"] for v in states.sector_leading[r]])
+    return ok
+
+
+def _turnover(prev: tuple | None, lo: np.ndarray, hi: np.ndarray) -> float:
+    """Share of each side replaced since the previous night's picks (1.0 = everything is new)."""
+    if prev is None or not len(lo) or not len(hi):
+        return 1.0
+    return 0.5 * ((1 - len(np.intersect1d(prev[0], lo)) / len(lo)) + (1 - len(np.intersect1d(prev[1], hi)) / len(hi)))
+
+
+def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
+    """trial_id -> gross spread per session, names a side, turnover, and per-sector spreads for within-sector modules.
+
+    A night a module's gate turns away is NaN (not traded). Turnover is 1.0 on the overnight and intraday horizons,
+    which open and close every position; on ``close_1d`` it is the share of names replaced since the previous
+    traded night, so a slow signal is charged for what it actually trades."""
     tick = np.array(panel.cols, dtype=object)
     rows = [r for r, d in enumerate(panel.sessions[:-1]) if run.first_session <= d <= run.last_session]
     n_d, n_s = len(panel.sessions), len(panel.sectors)
-    specs = {s["name"]: s for s in run.signal_specs()}
     out = {}
-    for name, spec in specs.items():
+    for spec in run.signal_specs():
+        name, gate = spec["name"], spec.get("gate", {})
         sig = signal_matrix(panel, spec)
         eligible = panel.base & ~np.isnan(sig)
         mods = [m for m in run.modules() if m["signal"] == name]
         ys = {h: outcome(panel, h) for h in spec["horizons"]}
+        prev: dict = {}
         for m in mods:
-            out[m["trial_id"]] = {"gross": np.full(n_d, np.nan), "names": np.zeros(n_d),
-                                  "per_sector": np.full((n_d, n_s), np.nan) if m["ranking"] == "within_sector" else None,
-                                  "k_sector": np.zeros((n_d, n_s)) if m["ranking"] == "within_sector" else None}
+            within = m["ranking"] == "within_sector"
+            out[m["trial_id"]] = {"gross": np.full(n_d, np.nan), "names": np.zeros(n_d), "turnover": np.full(n_d, np.nan),
+                                  "per_sector": np.full((n_d, n_s), np.nan) if within else None,
+                                  "k_sector": np.zeros((n_d, n_s)) if within else None}
         for r in rows:
             idx = np.flatnonzero(eligible[r])
             if len(idx) < run.min_ranked:
                 continue
+            if any(states.night[k][r] not in gate[k] for k in NIGHT_GATES if k in gate):
+                continue
+            allowed = _sectors_allowed(gate, states, panel, r)
+            if allowed is not None:
+                sec = panel.sector[idx]
+                idx = idx[(sec >= 0) & allowed[np.clip(sec, 0, None)]]
+                if len(idx) < run.min_ranked_gated:
+                    continue
             by_sector = [idx[panel.sector[idx] == s] for s in range(n_s)]
             for m in mods:
                 y, q, res = ys[m["horizon"]][r], m["fraction"], out[m["trial_id"]]
                 if m["ranking"] == "pooled":
                     k = math.floor(q * len(idx))
-                    res["gross"][r], res["names"][r] = _spread(sig[r], tick, idx, k, y), k
-                    continue
-                floor = max(8, math.ceil(1 / q))
-                num = den = 0.0
-                for s, sidx in enumerate(by_sector):
-                    if len(sidx) < floor:
+                    if k < 1:
                         continue
-                    k = max(1, math.floor(q * len(sidx)))
-                    v = _spread(sig[r], tick, sidx, k, y)
-                    res["per_sector"][r, s], res["k_sector"][r, s] = v, k
-                    if not math.isnan(v):
-                        num, den = num + k * v, den + k
-                res["gross"][r], res["names"][r] = (num / den if den else float("nan")), den
+                    v, lo, hi = _spread(sig[r], tick, idx, k, y)
+                    names = k
+                else:
+                    floor = max(8, math.ceil(1 / q))
+                    num = den = 0.0
+                    los, his = [], []
+                    for s, sidx in enumerate(by_sector):
+                        if len(sidx) < floor:
+                            continue
+                        k = max(1, math.floor(q * len(sidx)))
+                        sv, lo_s, hi_s = _spread(sig[r], tick, sidx, k, y)
+                        res["per_sector"][r, s], res["k_sector"][r, s] = sv, k
+                        los.append(lo_s)
+                        his.append(hi_s)
+                        if not math.isnan(sv):
+                            num, den = num + k * sv, den + k
+                    if not den:
+                        continue
+                    v, names = num / den, den
+                    lo, hi = np.concatenate(los), np.concatenate(his)
+                res["gross"][r], res["names"][r] = v, names
+                last = prev.get(m["trial_id"])
+                adjacent = last is not None and last[0] == r - 1
+                res["turnover"][r] = _turnover(last[1] if adjacent else None, lo, hi) if m["horizon"] == "close_1d" else 1.0
+                prev[m["trial_id"]] = (r, (lo, hi))
     return out
 
 
@@ -394,60 +492,47 @@ def load_state(path: Path) -> dict:
         con.close()
 
 
-def _cut(v: np.ndarray, cost: float) -> dict:
-    v = v[~np.isnan(v)]
+def _cut(gross: np.ndarray, cost: np.ndarray) -> dict:
+    """Summary of the nights where ``gross`` is known; ``cost`` is the module's cost on those same nights."""
+    keep = ~np.isnan(gross)
+    v, c = gross[keep], cost[keep]
     if len(v) < 30:
         return {"nights": len(v)}
     mean, sd = float(v.mean()), float(v.std(ddof=1))
-    return {"nights": len(v), "gross_bp": round(mean * 1e4, 3), "net_bp": round((mean - cost) * 1e4, 3),
+    return {"nights": len(v), "gross_bp": round(mean * 1e4, 3), "net_bp": round((mean - float(np.nanmean(c))) * 1e4, 3),
             "sd_bp": round(sd * 1e4, 2), "t_gross": round(mean / (sd / math.sqrt(len(v))), 3) if sd else None}
 
 
-def card(panel: Panel, module: dict, res: dict, state: dict, cost: float) -> dict:
+def card(panel: Panel, res: dict, states: States, cost: np.ndarray) -> dict:
     """Where the module paid: by year and by the states recorded the evening before each decision day."""
     gross = res["gross"]
-    label = {"market_phase": [None] * len(gross), "fed_balance_sheet": [None] * len(gross), "vix_third": [None] * len(gross),
-             "spike_state": [None] * len(gross)}
-    recs = [None] * len(gross)
-    for r in range(1, len(gross)):
-        rec = state.get(panel.sessions[r - 1])
-        if rec is None or math.isnan(gross[r]):
-            continue
-        recs[r] = rec
-        label["market_phase"][r] = rec["market"]["phase"]
-        label["fed_balance_sheet"][r] = rec["fed_balance_sheet"].get("phase")
-        label["vix_third"][r] = rec["vix"].get("third")
-        label["spike_state"][r] = rec["vix"].get("spike_state")
-    out: dict = {"overall": _cut(gross, cost), "state_rows_matched": sum(r is not None for r in recs)}
+    traded = ~np.isnan(gross)
+
+    def where(mask: np.ndarray) -> dict:
+        return _cut(np.where(mask, gross, np.nan), cost)
+
+    out: dict = {"overall": _cut(gross, cost), "state_rows_matched": states.matched}
     years = np.array([d[:4] for d in panel.sessions])
-    out["year"] = {y: _cut(gross[years == y], cost) for y in sorted(set(years[~np.isnan(gross)]))}
-    for name, values in label.items():
-        arr = np.array(values, dtype=object)
-        out[name] = {str(v): _cut(gross[arr == v], cost) for v in sorted({x for x in values if x is not None})}
+    out["year"] = {y: where(years == y) for y in sorted(set(years[traded]))}
+    for name in NIGHT_GATES:
+        arr = np.array(states.night[name], dtype=object)
+        out[name] = {str(v): where(arr == v) for v in sorted({x for x, t in zip(states.night[name], traded) if t and x is not None})}
     if res["per_sector"] is not None:
         ps, ks = res["per_sector"], res["k_sector"]
 
-        def pooled(pick: np.ndarray) -> np.ndarray:
+        def pooled(pick: np.ndarray) -> dict:
             use = pick & ~np.isnan(ps) & (ks > 0)
             w = np.where(use, ks, 0.0)
             tot = w.sum(axis=1)
-            return np.where(tot > 0, (np.where(use, ps, 0.0) * w).sum(axis=1) / np.where(tot > 0, tot, 1), np.nan)
+            return _cut(np.where(tot > 0, (np.where(use, ps, 0.0) * w).sum(axis=1) / np.where(tot > 0, tot, 1), np.nan), cost)
 
-        n_s = len(panel.sectors)
+        every = np.ones_like(ps, dtype=bool)
         out["sector"] = {s: _cut(ps[:, j], cost) for j, s in enumerate(panel.sectors)}
-        out["group"] = {g: _cut(pooled(np.tile([GROUP_OF[s] == g for s in panel.sectors], (len(gross), 1))), cost) for g in GROUPS}
-        phase = np.empty((len(gross), n_s), dtype=object)
-        leading = np.zeros((len(gross), n_s), dtype=object)
-        leading[:] = None
-        for r, rec in enumerate(recs):
-            if rec is None:
-                continue
-            for j, s in enumerate(panel.sectors):
-                phase[r, j] = rec["sectors"].get(s, {}).get("phase")
-                leading[r, j] = rec["sectors"].get(s, {}).get("leading")
-        out["sector_phase"] = {str(p): _cut(pooled(phase == p), cost) for p in sorted({x for x in phase.ravel() if x})}
-        out["sector_vs_market"] = {"leading": _cut(pooled(leading == True), cost),
-                                   "lagging": _cut(pooled(leading == False), cost)}
+        out["group"] = {g: pooled(every & np.array([GROUP_OF[s] == g for s in panel.sectors])[None, :]) for g in GROUPS}
+        seen = sorted({x for x in states.sector_phase[traded].ravel() if x})
+        out["sector_phase"] = {str(p): pooled(states.sector_phase == p) for p in seen}
+        out["sector_vs_market"] = {"leading": pooled(states.sector_leading == True),
+                                   "lagging": pooled(states.sector_leading == False)}
     return out
 
 
@@ -463,10 +548,10 @@ def open_ledger(ledger_path: Path, anchor_path: Path, genesis: str | None) -> ls
 
 
 def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out: Path) -> dict:
-    """One cross-section run, declared on ``ledger`` before any price is parsed. Returns the report."""
+    """One cross-section run, declared on ``ledger`` before any price or state row is parsed. Returns the report."""
     body = json.loads(Path(run_file).read_text())
     spec = RunFile.from_dict(body)
-    man, man_sha = manifest(Path(data_dir))
+    man, man_sha = manifest(Path(data_dir), Path(state_db))
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
     lse.record_factory_declared(ledger, run_id=spec.run_id, run_file=body, data_manifest_sha256=man_sha,
@@ -474,49 +559,56 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
     try:
         write_once(out / "data-manifest.json", man)
         panel = load_panel(Path(data_dir), spec)
-        results = evaluate(panel, spec)
+        states = state_arrays(panel, load_state(Path(state_db)))
+        results = evaluate(panel, spec, states)
         modules = spec.modules()
-        cost = spec.cost_bp_per_side * 1e-4
-        net = np.column_stack([results[m["trial_id"]]["gross"] - SIDES[m["horizon"]] * cost for m in modules])
+        gates = {s["name"]: s.get("gate", {}) for s in spec.signal_specs()}
+        per_side = spec.cost_bp_per_side * 1e-4
+        costs = {m["trial_id"]: SIDES[m["horizon"]] * per_side * results[m["trial_id"]]["turnover"] for m in modules}
+        net = np.column_stack([results[m["trial_id"]]["gross"] - costs[m["trial_id"]] for m in modules])
         bar = sign_flip_max_t(net, spec.perms, spec.seed, spec.alpha)
+        window = sum(1 for d in panel.sessions[:-1] if spec.first_session <= d <= spec.last_session)
         trials = []
         for j, m in enumerate(modules):
+            x = net[:, j]
+            x = x[~np.isnan(x)]
             g = results[m["trial_id"]]["gross"]
             g = g[~np.isnan(g)]
             tested = bool(bar["tested"][j])
-            mean_net = float(g.mean() - SIDES[m["horizon"]] * cost) if len(g) else None
-            sd = float(g.std(ddof=1)) if len(g) > 1 else None
+            sd = float(x.std(ddof=1)) if len(x) > 1 else None
             trials.append({"trial_id": m["trial_id"], "family": m["family"], "feature": m["feature"],
-                           "status": "tested" if tested else "untestable", "n": len(g),
-                           "r": (mean_net / sd) if tested and sd else None, "net_dollars": mean_net if tested else None,
+                           "status": "tested" if tested else "untestable", "n": len(x),
+                           "r": (float(x.mean()) / sd) if tested and sd else None, "net_dollars": float(x.mean()) if tested else None,
                            "gross_bp": float(g.mean() * 1e4) if len(g) else None,
+                           "turnover": float(np.nanmean(results[m["trial_id"]]["turnover"])) if len(g) else None,
+                           "share_of_nights": len(x) / window if window else None, "gate": gates[m["signal"]],
                            "t": float(bar["t"][j]) if tested else None, "p": float(bar["p"][j]), "adjusted_p": float(bar["adjusted_p"][j]),
                            "selected": bool(tested and bar["adjusted_p"][j] <= spec.alpha)})
         max_t = {"critical_t": bar["critical_t"], "alpha": spec.alpha, "perms": spec.perms, "seed": spec.seed,
                  "null": "joint sign flips of nightly net spreads, step-down"}
-        payload = {"method": {"statistic": "t of the mean net spread per night", "selection": "max_t_sign_flip",
-                              "cost_bp_per_side": spec.cost_bp_per_side, "sides_per_night": SIDES},
+        payload = {"method": {"statistic": "t of the mean net spread per traded night", "selection": "max_t_sign_flip",
+                              "cost_bp_per_side": spec.cost_bp_per_side, "sides_per_night": SIDES,
+                              "cost": "sides x cost x turnover; turnover is 1 except on close_1d, where it is the share of names replaced"},
                    "run_file": body, "data_manifest_sha256": man_sha, "trial_count": len(trials),
                    "untestable_count": sum(t["status"] != "tested" for t in trials), "max_t": max_t, "ledger": trials}
         frozen = {"payload": payload, "sha256": digest(payload)}
         write_once(out / "discovery-frozen.json", frozen)
         tested_rows = sorted((t for t in trials if t["status"] == "tested"), key=lambda t: -t["t"])
-        state = load_state(Path(state_db))
-        by_id = {m["trial_id"]: m for m in modules}
         carded = [t["trial_id"] for t in tested_rows[:spec.cards]]
         carded += [t["trial_id"] for t in tested_rows if t["selected"] and t["trial_id"] not in carded]
         member_days = panel.member[[r for r, d in enumerate(panel.sessions) if spec.first_session <= d <= spec.last_session]]
         rep = {
             "run_id": spec.run_id, "state": STATE, "promotion_allowed": False, "frozen_sha256": frozen["sha256"],
-            "method": payload["method"], "target_unit": "net return per $1 long and $1 short per night (fraction)",
+            "method": payload["method"], "target_unit": "net return per $1 long and $1 short per traded night (fraction)",
             "coverage": {"sessions": len(panel.sessions), "first": panel.sessions[0], "last": panel.sessions[-1],
                          "price_files": len(panel.cols), "members_mean": float(member_days.sum(axis=1).mean()),
-                         "sector_assignment": panel.assignment, "data_manifest_sha256": man_sha},
+                         "sector_assignment": panel.assignment, "state_rows_matched": states.matched,
+                         "data_manifest_sha256": man_sha},
             "trial_count": len(trials), "tested": len(tested_rows), "untestable": payload["untestable_count"], "max_t": max_t,
             "selected": [t["trial_id"] for t in tested_rows if t["selected"]],
-            "ranking": [{k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "gross_bp", "t", "p",
-                                           "adjusted_p", "selected")} for t in tested_rows],
-            "cards": {tid: card(panel, by_id[tid], results[tid], state, SIDES[by_id[tid]["horizon"]] * cost) for tid in carded},
+            "ranking": [{k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "gross_bp", "turnover",
+                                           "share_of_nights", "gate", "t", "p", "adjusted_p", "selected")} for t in tested_rows],
+            "cards": {tid: card(panel, results[tid], states, costs[tid]) for tid in carded},
             "note": "development ranking only; a selected module is a candidate for one confirmation look, not a finding",
         }
         write_once(out / "report.json", rep)
@@ -538,10 +630,10 @@ def report_markdown(rep: dict) -> str:
              f"Development ranking only. {rep['tested']} modules tested, {len(rep['selected'])} cleared the bar "
              f"(t {bar:.2f} at {rep['max_t']['alpha']}, best of {rep['max_t']['perms']:,} sign-flipped searches)."
              if bar is not None else "Development ranking only. No module could be tested.", "",
-             "| Module | Nights | Gross bp | Net bp | t | Adjusted p | Cleared |", "|---|---|---|---|---|---|---|"]
+             "| Module | Nights | Share of nights | Turnover | Gross bp | Net bp | t | Adjusted p | Cleared |", "|---|---|---|---|---|---|---|---|---|"]
     for t in rep["ranking"]:
-        lines.append(f"| {t['trial_id']} | {t['n']:,} | {t['gross_bp']:.2f} | {t['net_dollars'] * 1e4:.2f} | {t['t']:.2f} | "
-                     f"{t['adjusted_p']:.4f} | {'yes' if t['selected'] else 'no'} |")
+        lines.append(f"| {t['trial_id']} | {t['n']:,} | {t['share_of_nights']:.2f} | {t['turnover']:.2f} | {t['gross_bp']:.2f} | "
+                     f"{t['net_dollars'] * 1e4:.2f} | {t['t']:.2f} | {t['adjusted_p']:.4f} | {'yes' if t['selected'] else 'no'} |")
     for tid, c in rep["cards"].items():
         lines += ["", f"## {tid}", "", "| Cut | Value | Nights | Gross bp | Net bp | t |", "|---|---|---|---|---|---|"]
         for name, cells in c.items():
