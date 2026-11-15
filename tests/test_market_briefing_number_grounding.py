@@ -327,6 +327,16 @@ def test_generate_briefing_flags_fabricated_number_leaves_real_one_alone(tmp_pat
 def test_generate_briefing_withholds_hedging_claim_before_persistence(
     tmp_path, monkeypatch, briefing_type,
 ):
+    # Assembly metadata is not numeric claim evidence. A real CI timestamp
+    # ended in 38.965764, spuriously matching the forbidden claim token "8.96".
+    # Fix this test's clock rather than weakening the publication assertions.
+    class AssemblyClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = datetime(2026, 9, 26, tzinfo=timezone.utc)
+            return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr("ollama.market_briefing.datetime", AssemblyClock)
     monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
     monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
 
