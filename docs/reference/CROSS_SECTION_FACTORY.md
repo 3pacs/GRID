@@ -53,9 +53,24 @@ long-short spread trades every night, so that permutation leaves its mean where 
 `"sign": -1` turns a signal around. Horizons: `overnight` (close of d to open of d+1), `intraday` (open to close of
 d+1), `close_1d` (close of d to close of d+1). Each signal lists its own horizons.
 
-**Cost.** `cost_bp_per_side` of traded notional, four sides a night per $1 long and $1 short, on every horizon. For
-slow signals held close to close this overstates turnover and so understates the net; the ranking also shows the
-gross. A turnover-aware cost is not built.
+**Cost.** `cost_bp_per_side` of traded notional × four sides × turnover, per $1 long and $1 short. Overnight and
+intraday open and close every position, so their turnover is 1. On `close_1d` turnover is the share of names
+replaced since the previous traded night (1 on the first night of a stretch), so a slow signal pays for what it
+trades. The ranking shows gross, net and mean turnover.
+
+## Gates
+
+A signal may carry a `gate` on the state recorded the evening before the decision day:
+
+| Gate | Applies to | Values |
+|---|---|---|
+| `market_phase`, `fed_balance_sheet`, `vix_third`, `spike_state` | the whole night | a list of allowed values |
+| `sector_phase`, `groups` | each sector that night | a list of allowed values |
+| `sector_leading` | each sector that night | `true` or `false` |
+
+A night the gate turns away is not traded and is not in the module's sample. With a sector gate only stocks of the
+sectors let through are ranked (at least `min_ranked_gated` of them). A gated signal is its own module, so the
+condition is judged against the run's bar with everything else instead of being read off a card afterwards.
 
 ## The card
 
@@ -114,3 +129,26 @@ The reversal card shows why the card matters even for a module that fails: befor
 while the market was falling and speeding up (343 nights) and 33.5 on VIX spike days (265 nights), against 0.2 to 2.0
 in rising markets. That is a description of a searched sample, and the daily full-turnover cost is harsh on slow
 signals, but it is the kind of conditional statement a pooled verdict hides.
+
+**`xs-gated-1-20261115`** (gates, turnover-aware cost): 16 modules, bar t 2.39, 13 cleared. Report sha256 `e65d694c…`.
+
+| Module (within sector 20 %) | Nights | Turnover | Gross bp | Net bp | t |
+|---|---|---|---|---|---|
+| overnight mean 252, rising market and rising non-defensive sectors | 2,401 | 1.00 | 5.64 | 1.64 | 3.19 |
+| 5-day reversal, falling market only | 752 | 0.37 | 13.42 | 11.93 | 2.91 |
+| 5-day reversal, VIX spike days only | 265 | 0.50 | 27.77 | 25.78 | 2.73 |
+| 5-day reversal, every night | 3,271 | 0.36 | 4.09 | 2.66 | 2.15 |
+
+Read these with three cautions.
+
+1. **The reversal gates were chosen after seeing run 2's card.** The bar covers the 16 modules of this run, not
+   that earlier look, so these t values are flattered.
+2. **Half the falling-market result is one year.** 2020 earned 72.3 bp net on 69 nights, 56 % of the module's total.
+   The other eight years with 30 or more gated nights average about 5.6 bp net; six of them are positive. The
+   spike-day module has only four years with 30 or more nights, and 2020 dominates it too (83.2 bp on 42 nights).
+3. **The unread years cannot settle it.** 2023–2026 holds 200 falling-market nights and 60 spike days (counted from
+   the state record, no return read). At the development effect size a confirmation at 0.05 would have about a
+   44 % chance of passing for the falling-market module and 36 % for spike days, before allowing for caution 1.
+
+The overnight rule here is the one `overnight-shadow/1` records forward (#1215); its gross (5.64) matches the
+by-hand figure (5.63).
