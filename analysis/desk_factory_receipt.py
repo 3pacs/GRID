@@ -156,6 +156,7 @@ def receipt_bound_factory_cards(
         for key in ("family", "feature", "n", "r", "net_dollars", "t", "p", "adjusted_p", "selected"):
             if key not in trial or trial[key] != row[key]:
                 raise ValueError("ranked trial disagrees with receipt")
+    result["integrity"] = "report_canonical_object_matches_pinned_result_receipt"
     result["clock_scope"] = "result_record_observation_and_receipt_availability"
     result["result_receipt_sha256"] = expected_result_sha256
     result["report_canonical_sha256"] = receipt["report_sha256"]
