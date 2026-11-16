@@ -94,6 +94,8 @@ LEGACY_FEATURES: tuple[str, ...] = (*gb.FEATURES, "gdelt_article_count")
 RS_LEGACY_TABLE = "resolved_series_gdelt_legacy_20261116"
 SUMMARY_LEGACY_TABLE = "gdelt_daily_summary_gdelt_legacy_20261116"
 PLAN_VERSION = 1
+#: A timed-out request is retried; measured 2026-11-16: 2 of ~4,740 HEADs timed out once.
+FETCH_ATTEMPTS = 3
 
 Fetch = Callable[[str, bool], gb.Fetched]   # (url, head_only) -> Fetched
 
@@ -108,11 +110,18 @@ class RebuildRefused(RuntimeError):
 def _default_fetch(url: str, head_only: bool) -> gb.Fetched:
     import requests
 
-    fetched = datetime.now(timezone.utc)
     call = requests.head if head_only else requests.get
-    resp = call(url, timeout=gb.HTTP_TIMEOUT_S, headers={"User-Agent": gb.USER_AGENT})
-    return gb.Fetched(resp.status_code, b"" if head_only else resp.content,
-                      resp.headers.get("Last-Modified"), fetched)
+    for attempt in range(FETCH_ATTEMPTS):
+        fetched = datetime.now(timezone.utc)
+        try:
+            resp = call(url, timeout=gb.HTTP_TIMEOUT_S, headers={"User-Agent": gb.USER_AGENT})
+        except requests.RequestException:
+            if attempt == FETCH_ATTEMPTS - 1:
+                raise
+            continue
+        return gb.Fetched(resp.status_code, b"" if head_only else resp.content,
+                          resp.headers.get("Last-Modified"), fetched)
+    raise AssertionError("unreachable")
 
 
 def _last_modified(got: gb.Fetched) -> datetime | None:
@@ -237,7 +246,9 @@ def legacy_set(conn: Connection) -> dict[str, Any]:
 
 
 def plan(engine: Engine, *, archive: Path | None, first: date = FIRST_DAY, last: date = LAST_DAY,
-         workers: int = 8, fetch: Fetch | None = None) -> dict[str, Any]:
+         workers: int = 8, fetch: Fetch | None = None, reuse: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the plan. ``reuse``: an earlier plan whose ``ok`` days are kept as they are (only the
+    other days are built again); the legacy set is always read afresh."""
     with engine.connect() as conn:
         conn.execute(text("SET TRANSACTION READ ONLY"))
         legacy = legacy_set(conn)
@@ -245,12 +256,16 @@ def plan(engine: Engine, *, archive: Path | None, first: date = FIRST_DAY, last:
             "SELECT f.name, r.obs_date, r.value FROM resolved_series r JOIN feature_registry f "
             "ON f.id = r.feature_id WHERE r.id = ANY(:ids)"), {"ids": legacy["ids"]})}
     days = [(first + timedelta(days=i)).isoformat() for i in range((last - first).days + 1)]
+    kept = {d["day"]: d for d in (reuse or {}).get("days", []) if d["status"] == "ok"}
+    todo = [d for d in days if d not in kept]
     if fetch is not None or workers <= 1:
-        records = [build_day(date.fromisoformat(d), archive, fetch or _default_fetch) for d in days]
+        built = [build_day(date.fromisoformat(d), archive, fetch or _default_fetch) for d in todo]
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
-            records = list(pool.map(_build_day_job, [(d, str(archive) if archive else None) for d in days],
-                                    chunksize=4))
+            built = list(pool.map(_build_day_job, [(d, str(archive) if archive else None) for d in todo],
+                                  chunksize=4))
+    by_day = {**kept, **{r["day"]: r for r in built}}
+    records = [by_day[d] for d in days]
     ok = [r for r in records if r["status"] == "ok"]
     lags = sorted((date.fromisoformat(r["release_date"]) - date.fromisoformat(r["day"])).days for r in ok)
     ratios = sorted(
@@ -261,7 +276,7 @@ def plan(engine: Engine, *, archive: Path | None, first: date = FIRST_DAY, last:
         "first_day": first.isoformat(), "last_day": last.isoformat(), "legacy": legacy,
         "days": records,
         "report": {
-            "days": len(records), "days_ok": len(ok),
+            "days": len(records), "days_ok": len(ok), "days_reused": len(kept),
             "days_by_source": _count(r.get("source") for r in ok),
             "days_left_out": {r["day"]: r["status"] for r in records if r["status"] != "ok"},
             "points_to_write": sum(len(r["values"]) for r in ok),
@@ -433,6 +448,7 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
     pl.add_argument("--last", type=date.fromisoformat, default=LAST_DAY)
     pl.add_argument("--workers", type=int, default=8)
     pl.add_argument("--out", type=Path, required=True)
+    pl.add_argument("--reuse", type=Path, help="an earlier plan: keep its ok days, build only the others")
     ap = sub.add_parser("apply", help="WRITE: snapshot, copy, delete, rebuild (one transaction)")
     ap.add_argument("--plan", type=Path, required=True)
     ap.add_argument("--run-tag", required=True)
@@ -444,7 +460,15 @@ def main(argv: list[str] | None = None, engine: Engine | None = None) -> int:
     engine = engine or _engine(args.db_url)
     try:
         if args.cmd == "plan":
-            result = plan(engine, archive=args.archive, first=args.first, last=args.last, workers=args.workers)
+            if args.reuse is not None and args.reuse.resolve() == args.out.resolve():
+                print("--reuse and --out must differ: a plan is never overwritten in place", file=sys.stderr)
+                return 2
+            reuse = json.loads(args.reuse.read_text()) if args.reuse is not None else None
+            if reuse is not None and reuse.get("plan_version") != PLAN_VERSION:
+                print("--reuse plan has another plan_version", file=sys.stderr)
+                return 2
+            result = plan(engine, archive=args.archive, first=args.first, last=args.last, workers=args.workers,
+                          reuse=reuse)
             args.out.write_text(json.dumps(result, default=str))
             shown = {k: v for k, v in result["legacy"].items() if k not in ("ids", "summary_dates")}
             print(json.dumps({"out": str(args.out), "legacy": shown, "report": result["report"]}, indent=1))
