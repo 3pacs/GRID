@@ -492,7 +492,11 @@ def pull_options_history(engine) -> list[dict]:
                         if value is None or pd.isna(value):
                             continue
                         suffix = metric_name.removeprefix(f"{prefix}_")
-                        sid = f"OPT:{ticker_sym}:{suffix}"
+                        # Preserve existing raw IDs for untouched metrics,
+                        # including BRK-B's historical b_* spelling.
+                        series_suffix = (suffix if suffix in (PUT_WING, CALL_WING, WING_SPREAD)
+                                         else metric_name.split("_", 1)[1])
+                        sid = f"OPT:{ticker_sym}:{series_suffix}"
                         # Check if already exists. Excludes QUARANTINED like
                         # the other existence checks in this file (_bulk_insert
                         # above) -- a quarantined row is not valid data for

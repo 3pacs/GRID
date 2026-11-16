@@ -31,11 +31,18 @@ An empty selected expiry has missing wings; another tenor is never substituted.
 Batch identity enables replay from the immutable options store. These clocks
 and identities are lineage, not proof of executable quote freshness.
 
-The term-structure API uses one registered, non-backfilled capture and that
-capture's actual spot. It reads contracts by immutable batch ID, once per expiry.
+The term-structure API takes the latest snapshot day from the view, then that
+day's highest-ordinal registered batch and its actual spot. It does not search
+earlier days or earlier same-day batches for a more usable capture. A backfilled
+latest batch, missing registration or missing observed spot makes it abstain.
+It reads contracts by immutable batch ID, once per expiry.
 Missing observed spot/registration produces an explicit unavailable response;
 the highest-OI strike is never used as a spot price. A later capture during the
 read cannot mix its contracts with the selected batch.
+
+When a client supplies no provider identity, the stored `source` is NULL.
+The API withholds the proxy and percentile even if the band contains contracts;
+the sample counts distinguish this unknown-lineage case from an empty band.
 
 ## Storage and compatibility
 
@@ -51,7 +58,8 @@ New primary resolved features use the new v1 names, descriptive registry text,
 `NAN` missing-data policy and `model_eligible=false`. Each inserted resolved value
 stores its own metadata atomically. The existing first-insert-per-day conflict
 policy remains: a later daily-signal update does not overwrite the earlier
-resolved value **or its lineage**. New registry eligibility starts on publication
+resolved value **or its lineage**. Joining these stores by date alone can yield
+different values; a date is not a capture identity. New registry eligibility starts on publication
 day. No feature is admitted to research by this patch.
 
 The bulk script uses the same helper but writes only new raw series names,
@@ -62,6 +70,8 @@ It no longer appends its different wing-median formula to old `iv_25d_*` or
 the generic resolver cannot carry their per-value metadata into the new primary
 resolved features. A future lineage-aware resolver change needs separate review.
 Other legacy bulk metrics and formulas are outside this correction.
+Their existing raw IDs are preserved, including BRK-B's legacy `b_pcr`,
+`b_iv_atm`, etc.; only the new wing/spread suffixes use the new naming contract.
 
 Watchlist and term-structure responses keep deprecated `iv_25d_*` keys as NULL.
 Watchlist retains old numbers under `legacy_wing_iv` with `method=unknown_legacy`.
@@ -70,6 +80,10 @@ the new names is forbidden. The derivatives UI uses the new proxy fields and
 labels. Related-feature and anomaly descriptions label old names as legacy with
 unknown method. Existing stored registry descriptions and original research
 remain unchanged. Old external clients will see missing wings until updated.
+`scripts/run_analytics_snapshots.py` retains only the legacy wing suffixes in
+`SECTOR_FEATURE_SUFFIXES`: it does not automatically add the new model-ineligible
+features. Sector sets therefore lose current wing members as legacy series stop
+updating; admitting replacement model inputs needs a separate reviewed change.
 
 ## Historical percentiles
 

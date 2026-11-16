@@ -471,6 +471,24 @@ See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits
   repair, holdout access, service/schedule change, merge or deploy. Anik alone
   applies releases; migration precedes code and API/UI ship together.
 
+### Same task - exact schema conformance and retained-review follow-up
+
+- Both backend CI jobs on a0a13c3a failed only the exact resolved-series column
+  pin (21,545 passed in each). Added the nullable `options_iv_metadata` column
+  explicitly to that exact set, preserved the equality assertion, tested its
+  JSONB/no-default declaration against the real migration operation, and added
+  the options publisher to guarded SQL modules with mandatory SQL coverage.
+- Read Claude's exact-head REQUEST_CHANGES before editing. Preserved that
+  verdict and v1 kit. Also retained existing BRK-B bulk IDs for untouched
+  metrics and tested their preservation; clarified latest-capture abstention,
+  unknown-provider missingness and the sector analytics legacy-suffix boundary.
+- Expanded offline selection includes the schema guard: 480 passed, one
+  explicit disposable-PostgreSQL skip; shared helper still 100% covered. No
+  claim that old-head CI or the old REQUEST_CHANGES verdict is cleared by this
+  local result. The same draft PR needs new-head CI and retained verification.
+- No production/holdout access, provider request, credential/service change,
+  merge or apply. Anik retains release authority.
+
 ## 2026-11-14 — Integrate accepted offline NVDA desk report
 
 Additive #1085 report mode joins the existing frozen ledger, historical cash

@@ -257,10 +257,11 @@ def test_legacy_api_values_are_explicitly_unknown():
     assert result["legacy_wing_iv"] == {"method": "unknown_legacy", "iv_25d_put": .9, "iv_25d_call": .8}
 
 
-def test_bulk_path_uses_same_proxy_without_atm_fill_or_legacy_series(monkeypatch):
+@pytest.mark.parametrize("ticker_symbol,legacy_suffix", [("SPY", "pcr"), ("BRK-B", "b_pcr")])
+def test_bulk_path_uses_same_proxy_without_atm_fill_or_legacy_series(monkeypatch, ticker_symbol, legacy_suffix):
     from scripts import bulk_historical_pull as bulk
     import yfinance
-    monkeypatch.setattr(bulk, "OPTIONS_TICKERS", ["SPY"])
+    monkeypatch.setattr(bulk, "OPTIONS_TICKERS", [ticker_symbol])
     monkeypatch.setattr(bulk, "_ensure_source", lambda *a: 7)
     monkeypatch.setattr(bulk.time, "sleep", lambda *a: None)
     day = date.today()
@@ -276,10 +277,14 @@ def test_bulk_path_uses_same_proxy_without_atm_fill_or_legacy_series(monkeypatch
     assert bulk.pull_options_history(db)[0]["status"] == "OK"
     writes = [c.args[1] for c in conn.execute.call_args_list if "INSERT INTO raw_series" in str(c.args[0])]
     by_id = {p["sid"]: p for p in writes}
-    assert "OPT:SPY:iv_m90_put_v1" not in by_id  # no put band, never ATM
-    assert by_id["OPT:SPY:iv_m110_call_v1"]["val"] == .2
-    assert json.loads(by_id["OPT:SPY:iv_m110_call_v1"]["payload"])["source"] == "yahoo"
-    assert not any("iv_25d" in p["sid"] or p["sid"] == "OPT:SPY:iv_skew" for p in writes)
+    assert f"OPT:{ticker_symbol}:iv_m90_put_v1" not in by_id  # no put band, never ATM
+    assert by_id[f"OPT:{ticker_symbol}:iv_m110_call_v1"]["val"] == .2
+    assert json.loads(by_id[f"OPT:{ticker_symbol}:iv_m110_call_v1"]["payload"])["source"] == "yahoo"
+    assert f"OPT:{ticker_symbol}:{legacy_suffix}" in by_id
+    legacy_prefix = "b_" if ticker_symbol == "BRK-B" else ""
+    for suffix in ("pcr", "iv_atm", "max_pain", "total_oi", "opt_vol", "oi_conc", "term_slope"):
+        assert f"OPT:{ticker_symbol}:{legacy_prefix}{suffix}" in by_id
+    assert not any("iv_25d" in p["sid"] or p["sid"] == f"OPT:{ticker_symbol}:iv_skew" for p in writes)
 
 
 def test_delta_strike_proxy_moves_with_tenor_and_iv_while_fixed_bands_do_not():
