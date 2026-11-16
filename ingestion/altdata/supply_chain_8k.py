@@ -491,7 +491,7 @@ class EightKSupplyLinks:
         payload = {"last_day": last_day.isoformat(), "seen": seen[-SEEN_KEEP:],
                    "attempts": dict(attempts or {}), "gave_up": list(gave_up or []),  # never truncated: each is a recoverable failure
                    "updated_at": datetime.now(timezone.utc).isoformat()}
-        CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        scp.ensure_checkpoint_dir(CHECKPOINT_PATH)
         tmp = CHECKPOINT_PATH.with_name(CHECKPOINT_PATH.name + ".tmp")
         tmp.write_text(json.dumps(payload, indent=1))
         tmp.replace(CHECKPOINT_PATH)

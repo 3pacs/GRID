@@ -2257,6 +2257,17 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # explain a miss, they no longer feed learning (lessons now come from
     # official verdicts, both sides; intelligence/reasoning_bank.py).
     "postmortem_batch",
+    # ingestion/altdata/supply_chain_8k.py::run_daily -- a local GPU model
+    # (never a paid provider) reads 8-K Item 1.01 text for who supplies whom
+    # and upserts supply_chain_nodes/edges as confidence 'derived', each
+    # citing its filing URL and a verbatim quote; contagion ignores them
+    # until the edge validator has measured them. Released 2026-11-16 by
+    # the owner ("release the supply_chain_8k task", 3pacs/GRID#1180). Its
+    # only caller is this task; the weekly 10-K parser writes the same
+    # tables through ON CONFLICT upserts on a different (form) key, and its
+    # checkpoint lives in outputs/supply_chain, a symlink into /data that
+    # outlives release swaps.
+    "supply_chain_8k",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -2344,14 +2355,6 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "uses llm.router Tier.REASON (and a local Gemma extractor) to "
         "extract guidance/milestone figures and inserts them as raw_series "
         "data points, not just audit metadata"
-    ),
-    "supply_chain_8k": (
-        "LLM-driven write awaiting owner release (3pacs/GRID#1180, 2026-11-13): "
-        "ingestion/altdata/supply_chain_8k.py asks a local GPU model (never a paid "
-        "provider) who supplies whom in 8-K Item 1.01 text and upserts "
-        "supply_chain_nodes/supply_chain_edges rows as confidence 'derived', each "
-        "citing its filing URL and a verbatim quote; contagion ignores them until "
-        "the edge validator has measured them"
     ),
     "insight_cleanup": (
         "held for the initial subset by the controller (2026-09-20): file "
