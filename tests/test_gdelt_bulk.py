@@ -173,6 +173,15 @@ def test_a_day_with_no_tone_has_no_average_rather_than_zero():
 
 # --- database ---------------------------------------------------------------------------
 
+#: Every gdelt_bulk migration, in order.
+MIGRATIONS = ("gdelt_bulk_loader_20261116", "gdelt_gkg_20261116")
+
+
+def _migration_ddl() -> tuple[str, ...]:
+    return tuple(stmt for name in MIGRATIONS
+                 for stmt in importlib.import_module(f"migrations.versions.{name}").DDL)
+
+
 _CORE_DDL = (
     """CREATE TABLE source_catalog (
         id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, base_url TEXT NOT NULL,
@@ -193,6 +202,7 @@ _CORE_DDL = (
         resolution_version INTEGER NOT NULL DEFAULT 1)""",
     "CREATE UNIQUE INDEX uq_rs ON resolved_series (feature_id, obs_date, vintage_date)",
 )
+MIGRATION_DDL = _migration_ddl()
 
 
 @pytest.fixture
@@ -201,9 +211,8 @@ def engine(pg_engine):
         conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {SCHEMA}"))
     eng = create_engine(pg_engine.url, connect_args={"options": f"-csearch_path={SCHEMA}"})
-    migration = importlib.import_module("migrations.versions.gdelt_bulk_loader_20261116")
     with eng.begin() as conn:
-        for stmt in _CORE_DDL + migration.DDL:
+        for stmt in _CORE_DDL + MIGRATION_DDL:
             conn.execute(text(stmt))
     yield eng
     eng.dispose()
