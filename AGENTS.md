@@ -442,3 +442,14 @@ Focused bridge/Oracle/report tests passed locally. Broader compatible Oracle tes
 also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
 No production access, send, generator, migration, service change, merge or deploy.
 See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.
+
+## 2026-11-14 — Integrate accepted offline NVDA desk report
+
+Additive #1085 report mode joins the existing frozen ledger, historical cash
+reconciliation and #1204 evidence labels. The accepted kit's five files are
+byte-identical; its bundle availability floor is preserved. 111 offline tests,
+Ruff and exact report reproduction pass on the integration base c19920e9.
+No recognition/valuation/trade result is fabricated: seven candidates remain
+unusable. Frozen v2, legacy scenarios and the Nov18 comparison are unchanged.
+See docs/research/r3-nvda/desk-report-v1.md. Full CI pending; Claude verifies final
+kit and Anik applies releases. No production or holdout changes.

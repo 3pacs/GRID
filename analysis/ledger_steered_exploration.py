@@ -171,6 +171,22 @@ declared in one batch at most (its holdout is spent). The batches draw nothing
 from the alpha-spending schedule above (their error control is per-batch BH),
 but their trials count in :func:`declared_trial_count`, so a gate passed
 before a batch is stale after it.
+
+Module factory runs (3pacs/GRID#1155)
+-------------------------------------
+A factory ledger (:meth:`Ledger.create_factory`, genesis ``program:
+module_factory``, no catalog) records the factory's fluid ranking runs and
+nothing else: no S11 allocation, run result, catalog extension or hypothesis
+batch may be appended to it, and no factory record to any other ledger. Each
+run is declared (``factory_run_declared``: run id, the run file's sha256 and
+body, the staged data manifest's sha256 and the trial count the run file
+implies) *before* any data is read, then closed by exactly one
+``factory_run_result`` (trials, max-T bar, report sha256) or
+``factory_run_abandoned`` (reason). One run is open at a time. Factory runs
+rank candidates for forward live recording; they draw nothing from the
+alpha-spending schedule and claim no discovery, but their trials count in
+:func:`declared_trial_count`, so the honest total of shots taken is always
+on the ledger.
 """
 
 from __future__ import annotations
@@ -216,6 +232,13 @@ FORWARD_LOG_SOURCE = "hypothesis_forward_v1"
 HYPOTHESIS_BATCH_KIND = "hypothesis_batch"
 HYPOTHESIS_TRIAL_STATUSES = ("tested", "untestable", "ineligible")
 HYPOTHESIS_VERDICTS = ("confirmed", "invalidated", "expired")
+# Module factory ledgers (analysis.module_factory; files only here).
+FACTORY_PROGRAM = "module_factory"
+FACTORY_DECLARED = "factory_run_declared"
+FACTORY_RESULT = "factory_run_result"
+FACTORY_ABANDONED = "factory_run_abandoned"
+FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED)
+FACTORY_SPENDING = "none: ranking runs claim no discovery; the evidence is forward live recording"
 REPO = Path(__file__).resolve().parent.parent
 MAX_Q = 0.10
 PERMS_CAP = 20000
@@ -754,6 +777,51 @@ class Ledger:
         ledger._init([line])
         return ledger
 
+    @classmethod
+    def create_factory(
+        cls,
+        path: str | Path | None,
+        *,
+        ledger_id: str,
+        anchor: str | Path | None = None,
+        recorded_at: str | None = None,
+    ) -> Ledger:
+        """Genesis of a module factory ledger: no catalog, no alpha spending, factory records only."""
+        if not ledger_id or ledger_id == CANONICAL_LEDGER_ID:
+            raise ValueError("a factory ledger needs its own id, never the hypothesis loop's")
+        if (path is None) != (anchor is None):
+            raise ValueError("a file ledger needs an anchor; an in-memory one has none")
+        if anchor is not None and Anchor(anchor).records():
+            raise ValueError(f"ledger {ledger_id!r} already has an anchor: a new genesis would reset it")
+        genesis = {
+            "kind": "genesis",
+            "seq": 0,
+            "prev_sha256": None,
+            "ledger_version": LEDGER_VERSION,
+            "ledger_id": ledger_id,
+            "program": FACTORY_PROGRAM,
+            "q": MAX_Q,
+            "spending": FACTORY_SPENDING,
+            "within_run": "max_t",
+            "storage": "memory" if path is None else "file+anchor",
+            "promotion_allowed": False,
+            "recorded_at": recorded_at or now_iso(),
+        }
+        line = canonical(genesis)
+        ledger = cls.__new__(cls)
+        ledger.path = None if path is None else Path(path)
+        ledger.anchor = None if anchor is None else Anchor(anchor)
+        if path is not None:
+            with Path(path).open("xb") as stream:
+                stream.write(line + b"\n")
+            ledger.anchor.append(ledger_id, 0, sha256_bytes(line))
+        ledger._init([line])
+        return ledger
+
+    @property
+    def is_factory(self) -> bool:
+        return self.genesis.get("program") == FACTORY_PROGRAM
+
     def _read_lines(self) -> list[bytes]:
         data = self.path.read_bytes()
         if not data.endswith(b"\n"):
@@ -843,6 +911,12 @@ class Ledger:
         if record.get("promotion_allowed", False) is not False:
             raise ValueError("the ledger never allows promotion")
         kind = record.get("kind")
+        if self.is_factory != (kind in FACTORY_KINDS):
+            raise ValueError(
+                f"a {'factory' if self.is_factory else 'S11'} ledger refuses {kind!r} records"
+            )
+        if kind in FACTORY_KINDS:
+            validate_factory_record(record, factory_open_run(self))
         if kind == HYPOTHESIS_BATCH_KIND:
             validate_hypothesis_batch(record, self.q, hypothesis_batch_trials(self))
         if kind == "catalog_extension":
@@ -965,6 +1039,8 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     current_catalog_sha: str | None = None
     open_allocation_sha: str | None = None
     hypotheses_seen: set[str] = set()
+    factory = False
+    open_factory: tuple[dict, str] | None = None
 
     for seq, line in enumerate(lines):
         record = json.loads(line)
@@ -978,7 +1054,13 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
             raise ValueError(f"record {seq}: promotion is never allowed")
 
         kind = record.get("kind")
+        if seq and factory != (kind in FACTORY_KINDS):
+            raise ValueError(f"record {seq}: {kind!r} does not belong on this ledger's program")
+        if kind in FACTORY_KINDS:
+            validate_factory_record(record, open_factory)
+            open_factory = (record, sha256_bytes(line)) if kind == FACTORY_DECLARED else None
         if kind == "genesis":
+            factory = record.get("program") == FACTORY_PROGRAM
             if "catalog" in record:
                 current_catalog = catalog_from_dict(record["catalog"])
                 current_catalog.validate()
@@ -1780,6 +1862,7 @@ def declared_trial_count(ledger: Ledger) -> int:
     return int(
         sum(a["trial_count"] for a in ledger.allocations())
         + sum(b["trial_count"] for b in ledger.of_kind(HYPOTHESIS_BATCH_KIND))
+        + sum(r["trial_count"] for r in ledger.of_kind(FACTORY_DECLARED))
     )
 
 
@@ -2088,9 +2171,145 @@ def summarize_hypothesis_batches(ledger: Ledger) -> dict:
     }
 
 
+def factory_open_run(ledger: Ledger) -> tuple[dict, str] | None:
+    """The last ``factory_run_declared`` record and its line sha256, if no result or abandonment closed it."""
+    last = None
+    for record in ledger.records:
+        if record["kind"] == FACTORY_DECLARED:
+            last = (record, ledger.line_sha(record["seq"]))
+        elif record["kind"] in (FACTORY_RESULT, FACTORY_ABANDONED):
+            last = None
+    return last
+
+
+def validate_factory_record(record: dict, open_run: tuple[dict, str] | None) -> None:
+    """One run open at a time; a result or abandonment closes exactly the open declared run."""
+    kind = record.get("kind")
+    if kind == FACTORY_DECLARED:
+        if open_run is not None:
+            raise ValueError(f"factory run {open_run[0]['run_id']!r} is still open: record or abandon it")
+        sha = record.get("run_file_sha256", "")
+        if (
+            not record.get("run_id")
+            or len(sha) != 64
+            or digest(record.get("run_file")) != sha
+            or len(record.get("data_manifest_sha256", "")) != 64
+            or not isinstance(record.get("trial_count"), int)
+            or record["trial_count"] < 1
+        ):
+            raise ValueError("a declared factory run needs a run id, its run file and hash, the data manifest hash and a trial count")
+        return
+    if open_run is None or record.get("declared_sha256") != open_run[1]:
+        raise ValueError(f"{kind} must close the open declared factory run")
+    if record.get("run_id") != open_run[0]["run_id"]:
+        raise ValueError(f"{kind} names a different run id than the open declared run")
+    if kind == FACTORY_RESULT:
+        trials = record.get("trials")
+        if not isinstance(trials, list) or record.get("trial_count") != len(trials):
+            raise ValueError("a factory result lists every trial it measured")
+        if record["trial_count"] != open_run[0]["trial_count"]:
+            raise ValueError("a factory result measures exactly the trials its run file declared")
+        if record.get("run_file_sha256") != open_run[0]["run_file_sha256"]:
+            raise ValueError("a factory result must carry its declared run file hash")
+    elif not record.get("reason"):
+        raise ValueError("an abandoned factory run states its reason")
+
+
+def record_factory_declared(ledger, *, run_id, run_file, data_manifest_sha256, trial_count,
+                            recorded_at=None) -> dict:
+    """Declare a factory run before its data is read; returns ``{record, sha256}``."""
+    record = _finite({
+        "kind": FACTORY_DECLARED,
+        "run_id": run_id,
+        "run_file": run_file,
+        "run_file_sha256": digest(run_file),
+        "data_manifest_sha256": data_manifest_sha256,
+        "trial_count": int(trial_count),
+        "n_trials_declared_before": declared_trial_count(ledger),
+        "recorded_at": recorded_at or now_iso(),
+    })
+    appended, sha = ledger._append(record)
+    return {"record": appended, "sha256": sha}
+
+
+def record_factory_result(ledger, *, trials, max_t, report_sha256, frozen_sha256, recorded_at=None) -> dict:
+    """Close the open factory run with its measured trials; returns ``{record, sha256}``."""
+    open_run = factory_open_run(ledger)
+    if open_run is None:
+        raise ValueError("no open factory run")
+    declared, declared_sha = open_run
+    record = _finite({
+        "kind": FACTORY_RESULT,
+        "run_id": declared["run_id"],
+        "declared_sha256": declared_sha,
+        "run_file_sha256": declared["run_file_sha256"],
+        "trial_count": len(trials),
+        "tested_count": sum(t["status"] == "tested" for t in trials),
+        "selected_count": sum(bool(t["selected"]) for t in trials),
+        "max_t": max_t,
+        "frozen_sha256": frozen_sha256,
+        "report_sha256": report_sha256,
+        "trials": trials,
+        "recorded_at": recorded_at or now_iso(),
+    })
+    appended, sha = ledger._append(record)
+    return {"record": appended, "sha256": sha}
+
+
+def record_factory_abandoned(ledger, *, reason, recorded_at=None) -> dict:
+    """Close the open factory run without a result (its trials stay counted)."""
+    open_run = factory_open_run(ledger)
+    if open_run is None:
+        raise ValueError("no open factory run")
+    record = {
+        "kind": FACTORY_ABANDONED,
+        "run_id": open_run[0]["run_id"],
+        "declared_sha256": open_run[1],
+        "reason": str(reason),
+        "recorded_at": recorded_at or now_iso(),
+    }
+    appended, sha = ledger._append(record)
+    return {"record": appended, "sha256": sha}
+
+
+def summarize_factory(ledger: Ledger) -> dict:
+    """Files-only status of a factory ledger: every run and every candidate it ever declared."""
+    results = ledger.of_kind(FACTORY_RESULT)
+    trials = [t for r in results for t in r["trials"]]
+    open_run = factory_open_run(ledger)
+    return {
+        "ledger_id": ledger.genesis["ledger_id"],
+        "program": FACTORY_PROGRAM,
+        "head_sha256": ledger.head,
+        "records": len(ledger.records),
+        "runs_declared": len(ledger.of_kind(FACTORY_DECLARED)),
+        "runs_recorded": len(results),
+        "runs_abandoned": len(ledger.of_kind(FACTORY_ABANDONED)),
+        "run_open": open_run[0]["run_id"] if open_run else None,
+        "candidates_declared": declared_trial_count(ledger),
+        "candidates_measured": len(trials),
+        "candidates_tested": sum(t["status"] == "tested" for t in trials),
+        "candidates_selected": sum(bool(t["selected"]) for t in trials),
+        "runs": [
+            {"run_id": r["run_id"], "trial_count": r["trial_count"], "tested": r["tested_count"],
+             "selected": r["selected_count"], "critical_t": (r.get("max_t") or {}).get("critical_t")}
+            for r in results
+        ],
+        "error_control": (
+            "per run: Westfall-Young step-down max-T over the run's tested trials at its "
+            "run-file alpha; across runs: none claimed (ranking only, every run counted); "
+            "the evidence is forward live recording"
+        ),
+        "spending": FACTORY_SPENDING,
+        "promotion_allowed": False,
+    }
+
+
 def summarize(ledger: Ledger) -> dict:
     """Files-only status: runs, trials, alpha spent, discoveries, family yields."""
     ledger.verify()
+    if ledger.is_factory:
+        return summarize_factory(ledger)
     results = ledger.trial_results()
     outcomes = ledger.outcomes()["families"]
     return {

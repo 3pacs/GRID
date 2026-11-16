@@ -773,6 +773,7 @@ class TestRealTaskTableSanity:
             "attention_anomaly",
             "edgar_transcripts",
             "corporate_actions",
+            "supply_chain_8k",
             "capital_flow_rollups",
             "fundamental_divergence",
             "holder_deal_overlap",
@@ -847,6 +848,8 @@ class TestDailyIntelAllowlistClassification:
             "sleuth_dispatch",
             # owner-approved 2026-11-07: explains misses, writes no lessons
             "postmortem_batch",
+            # owner-released 2026-11-16: 8-K supply links, local GPU model only
+            "supply_chain_8k",
         }
         assert ho.DAILY_INTEL_INITIAL_ALLOWLIST == expected_allow
 
@@ -1159,7 +1162,7 @@ class TestDoneQueuedOutcome:
 
 
 class TestPeriodOutcomeWordingWithHeldTasks:
-    def test_real_allowlist_with_13_held_reports_complete_for_enabled_tasks(
+    def test_real_allowlist_with_12_held_reports_complete_for_enabled_tasks(
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
@@ -1190,7 +1193,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         results: dict[str, Any] = {}
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
-        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 9
+        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 10
         assert len(ho.DAILY_INTEL_HOLD_REASONS) == 12
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
@@ -1200,9 +1203,9 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             if msg.startswith("daily_intel: period=") and "outcome" in kw
         )
         assert summary["outcome"] == "complete_for_enabled_tasks"
-        assert summary["n"] == 9
-        assert summary["d"] == 7, (
-            "7 of the 9 allow-listed tasks report plain 'done' — "
+        assert summary["n"] == 10
+        assert summary["d"] == 8, (
+            "8 of the 10 allow-listed tasks report plain 'done' — "
             "storage_maintenance_subagent and sleuth_dispatch are the "
             "exceptions (see below)"
         )

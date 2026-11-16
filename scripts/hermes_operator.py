@@ -1962,6 +1962,18 @@ def _daily_intel_corporate_actions(
     )
 
 
+def _daily_intel_supply_chain_8k(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Supplier/customer links from 8-K Item 1.01 filings (3pacs/GRID#1180):
+    EDGAR's daily form index, keyword screen, local-GPU extraction, cited
+    'derived' edges that contagion uses only after validation. Stops within
+    its own 150 s budget and resumes from its checkpoint."""
+    from ingestion.altdata.supply_chain_8k import run_daily
+
+    results["supply_chain_8k"] = run_daily(engine)
+
+
 def _daily_intel_capital_flow_rollups(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -2162,6 +2174,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("supply_chain_8k", _daily_intel_supply_chain_8k, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
@@ -2244,6 +2257,17 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # explain a miss, they no longer feed learning (lessons now come from
     # official verdicts, both sides; intelligence/reasoning_bank.py).
     "postmortem_batch",
+    # ingestion/altdata/supply_chain_8k.py::run_daily -- a local GPU model
+    # (never a paid provider) reads 8-K Item 1.01 text for who supplies whom
+    # and upserts supply_chain_nodes/edges as confidence 'derived', each
+    # citing its filing URL and a verbatim quote; contagion ignores them
+    # until the edge validator has measured them. Released 2026-11-16 by
+    # the owner ("release the supply_chain_8k task", 3pacs/GRID#1180). Its
+    # only caller is this task; the weekly 10-K parser writes the same
+    # tables through ON CONFLICT upserts on a different (form) key, and its
+    # checkpoint lives in outputs/supply_chain, a symlink into /data that
+    # outlives release swaps.
+    "supply_chain_8k",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -3530,6 +3554,38 @@ def run_intelligence_tasks(
             )
         except Exception as exc:
             log.warning("Actor report import failed: {e}", e=str(exc))
+
+        # Supply-chain graph upkeep (3pacs/GRID#1179). The graph had no new
+        # edge after 2026-07-14: both jobs existed (_SOURCE_EXTRAS lists them)
+        # but nothing ran them. The 10-K parser is deterministic regex mining
+        # of SEC filings (no LLM; edges upsert as confidence 'derived'), SEC
+        # rate-limited, 15 minutes a week, resuming its pass from a persistent
+        # checkpoint. The validator then re-checks every edge against prices.
+        try:
+            from ingestion.altdata.supply_chain_parser import (
+                run_weekly as run_supply_chain_parser,
+            )
+            results["weekly_supply_chain_parser"] = _run_intel_task(
+                "weekly_supply_chain_parser",
+                run_supply_chain_parser,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Supply-chain parser import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.supply_chain_edge_validator import (
+                run_weekly as run_supply_chain_edge_validator,
+            )
+            results["weekly_supply_chain_edge_validator"] = _run_intel_task(
+                "weekly_supply_chain_edge_validator",
+                run_supply_chain_edge_validator,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Supply-chain edge validator import failed: {e}", e=str(exc))
 
         state.last_weekly_intel = now
 
@@ -5066,7 +5122,12 @@ def main(args: list[str] | None = None) -> None:
         from oracle.model_factory import migrate_default_models
         migrate_default_models(_get_engine_for_migrate())
     except Exception as exc:
-        log.debug("migrate_default_models: {e}", e=str(exc))
+        # Visible at normal journal level; do not log SQL/parameters or credentials.
+        log.warning(
+            "migrate_default_models failed: type={t} pgcode={c}; subscriptions unverified",
+            t=type(exc).__name__,
+            c=getattr(getattr(exc, "orig", exc), "pgcode", None),
+        )
 
     if opts.once:
         result = run_cycle(state, dry_run=opts.dry_run)

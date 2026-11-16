@@ -664,6 +664,37 @@ class TestPullAll:
 
 class TestFetchJson:
     @patch("ingestion.altdata.defi_llama_puller.ingest_actors_batch", return_value=0)
+    def test_protocols_uses_documented_full_endpoint_and_preserves_lineage(self, _, puller):
+        """Exercise public full-list URL through insertion, without provider/DB IO."""
+        p, engine, conn = puller
+        conn.execute.return_value.fetchone.return_value = None
+        response = MagicMock()
+        response.json.return_value = [{
+            "name": "Synthetic Protocol", "slug": "synthetic-protocol", "tvl": 123.5,
+            "change_1d": -25, "category": "Lending", "chains": ["Ethereum"],
+        }]
+
+        def get(url, **kwargs):
+            if url != "https://api.llama.fi/protocols":
+                raise AssertionError("protocols routed to dead versioned or lite endpoint")
+            return response
+
+        with patch("ingestion.altdata.defi_llama_puller.requests.get", side_effect=get) as http, \
+                patch.object(p, "_insert_raw") as insert:
+            result = p.pull_protocols()
+
+        assert result["status"] == "SUCCESS"
+        assert result["rows_inserted"] == 1
+        http.assert_called_once()
+        response.raise_for_status.assert_called_once()
+        row = insert.call_args_list[0].kwargs
+        assert row["series_id"] == "defillama.protocol_tvl.synthetic_protocol"
+        assert row["value"] == 123.5
+        assert row["raw_payload"]["source_url"] == "https://api.llama.fi/protocols"
+        assert row["raw_payload"]["is_anomaly"] is True
+        assert row["conn"] is conn
+
+    @patch("ingestion.altdata.defi_llama_puller.ingest_actors_batch", return_value=0)
     def test_stablecoins_uses_public_operation_server_and_preserves_lineage(self, _, puller):
         """Exercise HTTP routing through committed-row reporting, offline."""
         p, engine, conn = puller

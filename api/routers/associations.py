@@ -785,17 +785,24 @@ def extreme_anomalies(anomalies: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def send_extreme_anomaly_alert(extreme: list[dict[str, Any]]) -> None:
-    """E-mail the extreme anomalies (no-op when there are none)."""
+    """E-mail the extreme anomalies (no-op when there are none).
+
+    Only the inline ``alert=True`` path uses this. The scheduled scan sends the full report instead
+    (``intelligence/anomaly_report.py`` via ``intelligence.api_precompute._report_and_alert``).
+    """
     if not extreme:
         return
     try:
         from alerts.email import alert_on_discovery_insight
-        features_text = ", ".join(f"{a['feature']} (z={a['zscore']:.1f})" for a in extreme[:5])
+        # Plain text: alert_on_discovery_insight escapes its body, so markup arrives as literal tags.
+        lines = "\n".join(
+            f"{a['feature']}: {a.get('current_value')} (z={a['zscore']:+.1f}, "
+            f"1-yr mean {a.get('historical_mean')})"
+            for a in extreme
+        )
         alert_on_discovery_insight(
             f"Extreme Anomalies Detected ({len(extreme)})",
-            f"The following features are behaving anomalously:<br><br>"
-            f"<strong>{features_text}</strong><br><br>"
-            f"Review the Associations feed for details.",
+            f"Features more than {EXTREME_ANOMALY_Z} standard deviations from their one-year mean:\n\n{lines}",
         )
     except Exception as e:
         log.warning("Associations: anomaly alert dispatch failed: {e}", e=str(e))
