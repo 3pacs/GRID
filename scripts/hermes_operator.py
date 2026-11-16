@@ -5119,7 +5119,12 @@ def main(args: list[str] | None = None) -> None:
         from oracle.model_factory import migrate_default_models
         migrate_default_models(_get_engine_for_migrate())
     except Exception as exc:
-        log.debug("migrate_default_models: {e}", e=str(exc))
+        # Visible at normal journal level; do not log SQL/parameters or credentials.
+        log.warning(
+            "migrate_default_models failed: type={t} pgcode={c}; subscriptions unverified",
+            t=type(exc).__name__,
+            c=getattr(getattr(exc, "orig", exc), "pgcode", None),
+        )
 
     if opts.once:
         result = run_cycle(state, dry_run=opts.dry_run)

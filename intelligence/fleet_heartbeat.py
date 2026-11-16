@@ -42,12 +42,15 @@ from loguru import logger as log
 # host = ssh target (must be reachable from grid-svr). gpu = expected GPU count
 # (0 = no GPU probe). heal = allow auto-heal actions on this node.
 FLEET = {
-    "grid-svr": {"host": None, "gpu": 2, "heal": True, "critical": True},   # local
-    "gridz4":   {"host": "gridz4", "gpu": 2, "heal": True, "critical": True},
-    "redbox":   {"host": "redbox", "gpu": 2, "heal": True, "critical": False},
-    "koala":    {"host": "koala", "gpu": 2, "heal": True, "critical": False},
-    "ocr-node": {"host": "ocr-node", "gpu": 2, "heal": True, "critical": False},  # OCR GPU node, often off
+    "grid-svr": {"host": None, "gpu": 1, "heal": True, "critical": True},   # local; one RTX 3090
+    "gridz4":   {"host": "gridz4", "gpu": 1, "heal": True, "critical": True},  # one RTX PRO 4000
 }
+# Pruned 2026-11-14 (owner: "Yes, remove all three"): redbox, koala and ocr-node. All three are retired
+# from every LLM chain (llm/router.py ``_RETIRED_PROVIDERS``) and had been "down" for months (koala
+# 28,024 consecutive sweeps, about 97 days), re-firing daily as [STILL DOWN] CRITICAL. With the two GPU
+# rows below and the oracle probe, 6 of 14 entities read not-up by design.
+# GPU counts corrected the same day from ``nvidia-smi`` on each host: one card each, not two, so both
+# rows had read "degraded 1/2 cards" on every sweep.
 # Pruned 2026-08-08 (owner: "prune them theyre gone"): p9d and z400 were decommissioned
 # but stayed in this registry, accumulating 11,550 and 6,739 consecutive failures as
 # "not in tailnet peer list". Dead entries are not free: with re-notification enabled
@@ -60,7 +63,9 @@ FLEET = {
 # kind: "http_ok" any 2xx/401; "ollama" expects /api/tags 200; "llamacpp" /health 200.
 ENDPOINTS = {
     "grid-api":          ("http://localhost:8000/api/v1/intelligence/news", "http_ok", "grid-api"),
-    "oracle-27b":        ("http://localhost:8081/health", "llamacpp", "grid-llamacpp-oracle"),
+    # The oracle moved to 127.0.0.1:18081 under grid-hermes-3090-oracle; nothing listens on :8081 and
+    # grid-llamacpp-oracle is disabled on purpose (CLAUDE.md, fleet audit 2026-11-05).
+    "oracle-27b":        ("http://localhost:18081/health", "llamacpp", "grid-hermes-3090-oracle"),
     "gemma-classifier":  ("http://localhost:8082/health", "llamacpp", "grid-micro-classifier"),
     "gemma-narrator":    ("http://localhost:8083/health", "llamacpp", "grid-micro-narrator"),
     "gemma-extractor":   ("http://localhost:8084/health", "llamacpp", "grid-micro-extractor"),
@@ -71,6 +76,10 @@ ENDPOINTS = {
 FRESHNESS = {
     "the-meter": ("/data/the-meter/data/automation/grid-ingest-latest.json", 24 * 60),
 }
+
+# Ports on the primary host that front GPU inference (old oracle shim, gridz4 proxy, Ollama, the
+# live oracle). An endpoint bound to one of them is never auto-healed.
+PRIMARY_GPU_PORTS = frozenset({8081, 8086, 11434, 18081})
 
 ALERT_STRIKES = 2            # consecutive fails before alerting (debounce)
 RENOTIFY_EVERY_SWEEPS = 288  # re-alert a still-down entity this often (~daily @ 5min)
@@ -289,7 +298,7 @@ def _protected_gpu_unit(unit: str) -> bool:
     # worker can own GPU jobs. Keep the protection independent of heal flags
     # and ENDPOINTS so aliases or registry overrides cannot remove it.
     return any(name == root or name.startswith((root + "-", root + "@"))
-               for root in ("ollama", "grid-llamacpp", "grid-worker", "nvidia"))
+               for root in ("ollama", "grid-llamacpp", "grid-hermes-3090-oracle", "grid-worker", "nvidia"))
 
 
 def _valid_gpu_host(host: Any) -> bool:
@@ -364,7 +373,7 @@ def _heal_refusal(entity: str, kind: str) -> str | None:
                 port = target.port  # validate even when the hostname is remote
                 if target.netloc.endswith(":") or port == 0:
                     return "auto-heal refused: invalid endpoint port"
-                if _primary_host(target.hostname) and port in {8081, 8086, 11434}:
+                if _primary_host(target.hostname) and port in PRIMARY_GPU_PORTS:
                     return "auto-heal refused: primary GPU endpoint requires operator handling"
             except (TypeError, ValueError, AttributeError):
                 return "auto-heal refused: invalid endpoint URL"

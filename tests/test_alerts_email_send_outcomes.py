@@ -135,3 +135,61 @@ def test_connection_lost_during_sendmail_is_uncertain_not_failed(monkeypatch) ->
     status = email_mod._do_send("subject", "<p>html</p>", "plain")
 
     assert status == "uncertain"
+
+
+# ---------------------------------------------------------------------------
+# A short-lived process must deliver what it queued (fleet heartbeat, cron scripts)
+# ---------------------------------------------------------------------------
+
+
+def test_drain_waits_for_an_in_flight_send(monkeypatch):
+    import threading
+    import time as _time
+
+    from alerts import email as grid_email
+
+    done = threading.Event()
+
+    def slow_send(subject, html, plain):
+        _time.sleep(0.2)
+        done.set()
+
+    monkeypatch.setattr(grid_email, "_do_send", slow_send)
+    grid_email._send_in_thread("s", "<p>h</p>", "p")
+    assert not done.is_set()
+    assert grid_email._drain_pending_sends(timeout=5.0) == 0
+    assert done.is_set()
+
+
+def test_drain_gives_up_at_its_deadline(monkeypatch):
+    import threading
+
+    from alerts import email as grid_email
+
+    release = threading.Event()
+    monkeypatch.setattr(grid_email, "_do_send", lambda *_a: release.wait(5.0))
+    grid_email._send_in_thread("s", "<p>h</p>", "p")
+    assert grid_email._drain_pending_sends(timeout=0.05) == 1
+    release.set()
+    assert grid_email._drain_pending_sends(timeout=5.0) == 0
+
+
+def test_a_one_shot_process_delivers_before_it_exits(tmp_path):
+    """The regression itself: queue a send, fall off the end of the script, the send still happens."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    marker = tmp_path / "delivered"
+    script = (
+        "import time\n"
+        "from alerts import email as e\n"
+        "def slow(subject, html, plain):\n"
+        "    time.sleep(0.4)\n"
+        f"    open({str(marker)!r}, 'w').write(subject)\n"
+        "e._do_send = slow\n"
+        "e._send_in_thread('fleet alert', '<p>x</p>', 'x')\n"
+    )
+    root = Path(__file__).resolve().parent.parent
+    subprocess.run([sys.executable, "-c", script], cwd=root, check=True, timeout=30)
+    assert marker.read_text() == "fleet alert"

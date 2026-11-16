@@ -58,8 +58,8 @@ These proxy readings do not themselves attribute the moves to news or establish 
 
 Every input goes through `store.observations.read_window_known_at` with a declared, deliberately late publication lag
 (`market_state.LAGS`; documented shutdown releases override it). Backfilled history is revised vintage, not first
-release. Monthly values therefore arrive a few weeks after their real release; that costs freshness, never adds
-lookahead. Rows are insert-only; `--replace` is the only way to rewrite a date.
+release. Monthly values may therefore arrive late, but a conservative lag does not remove later revisions.
+Historical nightly equivalence is unproven without retained vintages and publication/capture evidence. Rows are insert-only; `--replace` is the only way to rewrite a date.
 
 ### News attribution boundary
 The newspaper uncertainty proxy does not establish a market-moving shock, its cause, or a quiet/flow-only session. `calendar_context` reports only listed-release co-occurrence (or unknown when no calendar is loaded). `news_attribution` stays `unverified`; `supports_flow_only_classification` is false. Nonfinite or nonnumeric proxy scores are unavailable. The enclosing `news_shock` key is retained, but the new descriptive kinds intentionally replace the overclaiming scheduled/unscheduled/none categories. No production consumer currently reads those categories.
@@ -75,3 +75,17 @@ weights track SqueezeMetrics' published DIX at only 0.90 correlation; dollar wei
 `dealer_gex_daily` (the godview table that had no writer) gets one SPY row per session from the latest registered
 options capture completed by the end of that UTC day (`scripts/run_dealer_gex_daily.py`). Units: $M per 1 % SPY move.
 Sessions without a registered capture, a spot receipt or a GEX zero crossing are skipped, not guessed.
+
+## Raw-input lineage fingerprint (partial)
+
+New records retain `source_lineage.raw_series` for each `_Reads.series` input. Each receipt hashes the exact
+finite date-collapsed rows consumed, including value, source, pull clock, known-at date and known-at basis.
+It also retains the source filter, declared publication policy, counts and latest selected observation.
+The hash uses UTF-8 canonical JSON (sorted keys, compact separators, strict finite numbers), in observation-date
+order. It fingerprints selection, not immutable custody: underlying source rows still need retained storage.
+No raw payload, URL, credential or extra provider request is included. Values/selection/scoring are unchanged.
+
+`modeled_lag` remains distinct from `pulled`, missing clocks remain missing, and a mixed-source refusal is
+distinct from an empty successful read. Nothing is promoted to PIT-qualified. ALFRED selection/capture,
+dealer capture, the selected SPY window and calendar publication/capture are explicitly unqualified paths.
+This first slice does not wire catch-up, prove scheduled operation, revise historical rows or change timers.
