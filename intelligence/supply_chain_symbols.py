@@ -68,7 +68,6 @@ NODE_SYMBOLS: dict[str, str] = {
     "post_holdings": "POST",
     "sq": "XYZ",  # Block renamed its symbol from SQ
     "sysco": "SYY",
-    "treehouse": "THS",
     "tsmc": "TSM",  # NYSE ADR
     "tyson": "TSN",
     "venture_global": "VG",
@@ -77,6 +76,12 @@ NODE_SYMBOLS: dict[str, str] = {
 
 DELISTED: dict[str, str] = {
     "catalent": "acquired by Novo Holdings (2024)",
+    # Checked 2026-11-16: no SEC ticker and no close since the date shown
+    # (K, THS, WBA match analysis/sector_map_ticker_status.yaml).
+    "k": "Kellanova, acquired by Mars (last close 2025-12-11)",
+    "qrvo": "Qorvo, no SEC ticker and no close after 2026-09-25",
+    "treehouse": "TreeHouse Foods, acquired by Investindustrial (last close 2026-02-11)",
+    "wba": "Walgreens Boots Alliance, acquired by Sycamore Partners (last close 2025-08-28)",
     "livent": "merged into Arcadium Lithium, since acquired",
     "pfpt": "Proofpoint, taken private (2021)",
     "pxd": "Pioneer, acquired by ExxonMobil (2024)",
