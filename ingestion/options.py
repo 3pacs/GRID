@@ -100,7 +100,11 @@ NO_CHAIN = _NoChain()
 
 
 class OptionsSourceAccessDenied(Exception):
-    """Explicit provider refusal, never absence or permission to fall back."""
+    """Explicit HTTP refusal, not a diagnosis of its cause or optionability.
+
+    The provider may conceal a missing/unsupported symbol behind 403. That
+    ambiguity is not proof of no listed options or permission to fall back.
+    """
 
     def __init__(self, provider: str, http_status: int) -> None:
         self.provider = provider
@@ -826,6 +830,13 @@ class OptionsPuller(BasePuller):
                 ticker and reports it and the remaining tickers as DEFERRED.
             capture_source: Writer label recorded on each registered batch
                 in ``options_capture_batches`` (e.g. "gem_daily").
+
+        A 401/403 stops this entire run, including when it first occurs in
+        the catalyst tail after every core ticker succeeds. Earlier complete
+        captures remain, but coverage is PARTIAL and source freshness is not
+        published. No absence cache is inferred from refusal. A later call
+        creates a new client and can repeat this partial outcome; this is not
+        a persistent rights gate or permission to run the collector.
 
         Returns:
             OptionsPullResults: List-compatible results with a source-wide

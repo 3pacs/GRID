@@ -448,3 +448,54 @@ def test_denial_never_serves_a_previously_cached_chain(status: int) -> None:
     with pytest.raises(options.OptionsSourceAccessDenied):
         client.get_options("KO", NOV06)
     assert len(session.urls) == 2
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_catalyst_tail_refusal_keeps_complete_core_partial_on_each_new_run(
+    monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    # One representative core ticker, then the actual default-universe
+    # assembly path (not an explicit tickers override). A symbol possibly
+    # hidden behind 403 is deliberately NOT treated as confirmed absent.
+    monkeypatch.delenv("GRID_OPTIONS_PRIMARY_PROVIDER", raising=False)
+    monkeypatch.setattr(options, "EQUITY_TICKERS", ["KO"])
+    monkeypatch.setattr(options, "_NO_OPTIONS_UNTIL", {})
+    puller = options.OptionsPuller.__new__(options.OptionsPuller)
+    puller.engine = _DB()
+    universe_calls: list[bool] = []
+
+    def catalyst_tail(engine: Any, *, require_complete: bool) -> list[str]:
+        assert engine is puller.engine
+        universe_calls.append(require_complete)
+        return ["NUOX", "VXRT"]
+
+    monkeypatch.setattr(options, "catalyst_options_universe", catalyst_tail)
+    composites = [_composite(monkeypatch, _Resp(200, _doc()), _Resp(status)) for _ in range(2)]
+    clients = iter(client for client, _made in composites)
+    monkeypatch.setattr(options, "CboeFirstOptionsClient", lambda: next(clients))
+    monkeypatch.setattr(options.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(puller, "_push_to_resolved", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(puller, "_mark_catalog_pulled",
+                        lambda **_kw: pytest.fail("incomplete catalyst coverage is not fresh"))
+
+    for run, (client, made) in enumerate(composites, start=1):
+        prior_batches = list(puller.engine.batches)
+        results = puller.pull_all()
+        assert [r["ticker"] for r in results] == ["KO", "NUOX", "VXRT"]
+        assert [r["status"] for r in results] == ["SUCCESS", "FAILED", "SKIPPED"]
+        assert results[1]["reason"] == "source_access_denied"
+        assert results[2]["reason"] == "source_access_denied_before_request"
+        assert results.summary["scope"] == "full_universe"
+        assert results.summary["status"] == "PARTIAL"
+        assert results.summary["rows_inserted"] == results[0]["rows_inserted"] > 0
+        assert results.summary["tickers_ok"] == 1
+        assert results.summary["tickers_total"] == 3
+        assert results.summary["tickers_no_chain"] == results.summary["tickers_no_options"] == 0
+        assert results.summary["error"] == f"cboe access denied (HTTP {status}); remaining tickers not requested"
+        assert [url.rsplit("/", 1)[-1] for url in client.cboe.session.urls] == ["KO.json", "NUOX.json"]
+        assert made == []  # no vendor fallback or next-symbol request after refusal
+        assert options._NO_OPTIONS_UNTIL == {}  # not cached as an absent catalyst
+        assert len(puller.engine.batches) == len(puller.engine.signals) == run
+        assert len(puller.engine.rows) == run * 7
+        assert puller.engine.batches[:len(prior_batches)] == prior_batches
+    assert universe_calls == [True, True]
