@@ -16,7 +16,10 @@ Pipeline for each ticker:
 
   1. Resolve CIK via the SEC company_tickers.json cache.
   2. Pull ``data.sec.gov/submissions/CIK{cik}.json`` and locate the
-     most recent 10-K entry (latest accession + primary document).
+     most recent 10-K entry (latest accession + primary document). 10-Qs
+     are not read (:data:`FORMS_READ`): on 2026-11-13, 32 newer 10-Qs across
+     40 priority tickers yielded 0 relationships (33 10-Ks yielded 3), and
+     each would cost a fetch inside the weekly budget (3pacs/GRID#1180).
   3. Fetch the primary document from the SEC Archives and run it
      through BeautifulSoup to strip XBRL inline-tag noise.
   4. Extract the Item 1 and Item 1A sections via regex anchors.
@@ -25,7 +28,9 @@ Pipeline for each ticker:
   6. For every (supplier, buyer, relationship) triple, resolve the
      counterparty to an existing node id or slug a new one.
   7. Upsert the edge into ``supply_chain_edges`` and any new node
-     into ``supply_chain_nodes`` using parameterized SQL.
+     into ``supply_chain_nodes`` using parameterized SQL. Every edge's
+     ``source`` names the form, year, ticker and section and ends with the
+     filing's SEC Archives URL, so each edge cites the document it came from.
 
 Checkpointing: the parser writes its progress to
 ``$GRID_SUPPLY_CHAIN_CHECKPOINT`` (default
@@ -80,6 +85,7 @@ _CHECKPOINT_PATH: Path = Path(
         str(Path(__file__).resolve().parents[2] / "outputs" / "supply_chain" / "10k_parser_checkpoint.json"),
     )
 )
+FORMS_READ: tuple[str, ...] = ("10-K",)  # 10-Q measured and dropped, see the module docstring
 WEEKLY_BUDGET_SECONDS: int = 900  # Hermes runs weekly tasks inline: 15 minutes, then resume next week
 _DEFAULT_RUN_BUDGET_SECONDS: int = 3600  # 1 hour hard cap
 _MAX_DOC_BYTES: int = 12 * 1024 * 1024   # 12 MB cap per 10-K doc
@@ -530,6 +536,10 @@ class SupplyChain10KParser:
 
     def _latest_10k_meta(self, cik: str) -> dict[str, Any] | None:
         """Return {accession, primary_doc, filing_date} for the latest 10-K."""
+        return self._latest_filing_meta(cik, "10-K")
+
+    def _latest_filing_meta(self, cik: str, form_wanted: str) -> dict[str, Any] | None:
+        """Return {accession, primary_doc, filing_date, form} for the latest ``form_wanted``."""
         try:
             url = _SUBMISSIONS_URL.format(cik=cik)
             resp = self.session.get(url, timeout=_REQUEST_TIMEOUT)
@@ -548,7 +558,7 @@ class SupplyChain10KParser:
         primaries = recent.get("primaryDocument", [])
 
         for i, form in enumerate(forms):
-            if form != "10-K":
+            if form != form_wanted:
                 continue
             acc = accessions[i] if i < len(accessions) else ""
             prim = primaries[i] if i < len(primaries) else ""
@@ -563,16 +573,21 @@ class SupplyChain10KParser:
                 "accession": acc,
                 "primary_doc": prim,
                 "filing_date": fdate,
+                "form": form_wanted,
             }
         return None
 
-    def _fetch_10k_text(self, cik: str, meta: dict[str, Any]) -> str | None:
-        """Fetch and BeautifulSoup-strip a 10-K primary document."""
-        cik_no_pad = cik.lstrip("0") or "0"
-        acc_clean = meta["accession"].replace("-", "")
-        url = _ARCHIVES_BASE.format(
-            cik=cik_no_pad, acc=acc_clean, doc=meta["primary_doc"]
+    @staticmethod
+    def _filing_url(cik: str, meta: dict[str, Any]) -> str:
+        return _ARCHIVES_BASE.format(
+            cik=cik.lstrip("0") or "0",
+            acc=meta["accession"].replace("-", ""),
+            doc=meta["primary_doc"],
         )
+
+    def _fetch_10k_text(self, cik: str, meta: dict[str, Any]) -> str | None:
+        """Fetch and BeautifulSoup-strip a 10-K (or 10-Q) primary document."""
+        url = self._filing_url(cik, meta)
         try:
             resp = self.session.get(url, timeout=_REQUEST_TIMEOUT, stream=True)
             resp.raise_for_status()
@@ -684,6 +699,8 @@ class SupplyChain10KParser:
         section_text: str,
         section_label: str,
         filing_date: date,
+        form: str = "10-K",
+        url: str = "",
     ) -> tuple[list[DerivedEdge], list[DerivedNode]]:
         edges: list[DerivedEdge] = []
         new_nodes: list[DerivedNode] = []
@@ -727,7 +744,10 @@ class SupplyChain10KParser:
                     upstream_id=upstream,
                     downstream_id=downstream,
                     relationship=relationship,
-                    source=f"10-K {filing_date.year} {ticker.upper()} {section_label}",
+                    source=(
+                        f"{form} {filing_date.year} {ticker.upper()} {section_label}"
+                        + (f" {url}" if url else "")
+                    ),
                     as_of=filing_date,
                     input_type=input_type,
                     pct_upstream_revenue=pct_upstream_rev,
@@ -975,63 +995,75 @@ class SupplyChain10KParser:
 
     # ── Orchestration ────────────────────────────────────────────────────
 
+    def _filings_to_read(self, cik: str) -> list[dict[str, Any]]:
+        """The latest filing of each form in :data:`FORMS_READ`, newest first.
+
+        Newest first, so when two filings disclose the same relationship the
+        edge dedup keeps the newer filing's figure and citation.
+        """
+        found = [m for form in FORMS_READ if (m := self._latest_filing_meta(cik, form))]
+        return sorted(found, key=lambda m: m["filing_date"], reverse=True)
+
     def process_ticker(self, ticker: str) -> int:
-        """Process a single ticker. Returns number of edges created."""
+        """Process a single ticker's latest filings (:data:`FORMS_READ`). Returns edges created."""
         cik = self._resolve_cik(ticker)
         if not cik:
             self.stats.tickers_skipped += 1
             log.debug("No CIK for {t}", t=ticker)
             return 0
 
-        meta = self._latest_10k_meta(cik)
-        if not meta:
+        filings = self._filings_to_read(cik)
+        if not filings:
             self.stats.tickers_skipped += 1
-            log.debug("No 10-K meta for {t} cik={c}", t=ticker, c=cik)
+            log.debug("No {f} meta for {t} cik={c}", f="/".join(FORMS_READ), t=ticker, c=cik)
             return 0
-
-        full_text = self._fetch_10k_text(cik, meta)
-        if not full_text:
-            self.stats.filings_failed += 1
-            return 0
-        self.stats.filings_fetched += 1
 
         # Slug the ticker downstream id. Parser uses lowercase to match seed.
         downstream_id = ticker.lower()
-
-        item1 = self._extract_section(full_text, _ITEM_1_RE)
-        item1a = self._extract_section(full_text, _ITEM_1A_RE)
-        concentration = self._extract_concentration_notes(full_text)
-        # Scan the whole document too — the principal-customer disclosure
-        # sometimes lives in segment / MD&A narratives far from Item 1.
-        # We rely on the customer-context filter to suppress drug/segment
-        # false positives.
-
         all_edges: list[DerivedEdge] = []
         all_nodes: list[DerivedNode] = []
-
-        for section_text, label in (
-            (item1, "Item 1"),
-            (item1a, "Item 1A"),
-            (concentration, "Concentration Notes"),
-            (full_text, "Full Text"),
-        ):
-            if not section_text:
+        latest = filings[0]
+        for meta in filings:
+            full_text = self._fetch_10k_text(cik, meta)
+            if not full_text:
+                self.stats.filings_failed += 1
                 continue
-            try:
-                edges, nodes = self._extract_edges(
-                    ticker=ticker,
-                    downstream_id=downstream_id,
-                    section_text=section_text,
-                    section_label=label,
-                    filing_date=meta["filing_date"],
-                )
-                all_edges.extend(edges)
-                all_nodes.extend(nodes)
-            except Exception as exc:
-                log.warning(
-                    "parse error {t} {lbl}: {e}",
-                    t=ticker, lbl=label, e=str(exc),
-                )
+            self.stats.filings_fetched += 1
+            url = self._filing_url(cik, meta)
+            form = meta.get("form", "10-K")
+            item1 = self._extract_section(full_text, _ITEM_1_RE)
+            item1a = self._extract_section(full_text, _ITEM_1A_RE)
+            concentration = self._extract_concentration_notes(full_text)
+            # Scan the whole document too — the principal-customer disclosure
+            # sometimes lives in segment / MD&A narratives far from Item 1.
+            # We rely on the customer-context filter to suppress drug/segment
+            # false positives.
+            for section_text, label in (
+                (item1, "Item 1"),
+                (item1a, "Item 1A"),
+                (concentration, "Concentration Notes"),
+                (full_text, "Full Text"),
+            ):
+                if not section_text:
+                    continue
+                try:
+                    edges, nodes = self._extract_edges(
+                        ticker=ticker,
+                        downstream_id=downstream_id,
+                        section_text=section_text,
+                        section_label=label,
+                        filing_date=meta["filing_date"],
+                        form=form,
+                        url=url,
+                    )
+                    all_edges.extend(edges)
+                    all_nodes.extend(nodes)
+                except Exception as exc:
+                    log.warning(
+                        "parse error {t} {f} {lbl}: {e}",
+                        t=ticker, f=form, lbl=label, e=str(exc),
+                    )
+        meta = latest
 
         if not all_edges:
             return 0

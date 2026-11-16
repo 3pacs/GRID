@@ -104,6 +104,16 @@ class ActorImpact:
 
 # ── Query helpers ────────────────────────────────────────────────────────────
 
+# 3pacs/GRID#1180: an edge the 10-K/10-Q parser derived joins the contagion
+# graph only after the weekly validator has measured it (last_validation_at)
+# and not flagged it weak. Curated tiers (confirmed, inferred,
+# derived_from_backtest) are unchanged. Derived edges whose endpoints the
+# validator cannot price (private or foreign) stay out until they can be checked.
+VALIDATED_DERIVED_GATE = (
+    " AND NOT (confidence = 'derived'"
+    " AND (last_validation_at IS NULL OR COALESCE(relationship_weak, FALSE)))"
+)
+
 _EDGE_COLS = (
     "upstream_id, downstream_id, relationship, input_type, annual_usd, "
     "pct_downstream_cogs, chokepoint_score"
@@ -124,7 +134,7 @@ def _fetch_downstream_edges(conn: Any, node_id: str) -> list[dict[str, Any]]:
     # _EDGE_COLS is a module constant
     edge_sql = (
         "SELECT " + _EDGE_COLS + " FROM supply_chain_edges "
-        "WHERE upstream_id = :n"
+        "WHERE upstream_id = :n" + VALIDATED_DERIVED_GATE
     )
     try:
         rows = conn.execute(text(edge_sql), {"n": node_id}).fetchall()
