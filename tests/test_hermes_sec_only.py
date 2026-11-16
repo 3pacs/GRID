@@ -661,10 +661,15 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # Then c8cadc77 -> 3b406bba (2026-11-16, claude/gdelt-release-next-day-20261116):
         # the gdelt_bulk_events hold reason now says each day is dated D+1 or
         # later; text only, the task stays held.
+        # Then 3b406bba -> 3b8fa7df (2026-11-16, claude/gdelt-gkg-loader-20261116):
+        # adds _daily_intel_gdelt_gkg_daily (calls ingestion.altdata.gdelt_bulk.
+        # run_gkg_daily), DAILY_INTEL_GDELT_GKG_BUDGET_S, its DAILY_INTEL_TASKS
+        # entry after gdelt_bulk_events and a DAILY_INTEL_HOLD_REASONS entry:
+        # held, nothing new runs until the owner releases it.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','3b406bba69f9038f77b3347fe8ff26dbef7afcdd2b67df28f2c99b8b60d97388'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','3b8fa7df1cd50c7efc39b5c489d2d99f3837f70bab19cee45ab06707ea8a3cf9'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
