@@ -490,6 +490,8 @@ def test_gkg_groups_match_fips_pairs_exact_names_and_theme_sets():
     assert values["gkg_docs_total"] == 4.0 and values["gkg_theme_inflation_tone"] == pytest.approx(-2.0)
     assert values["gkg_person_bessent_docs"] == 1.0 and "gkg_person_bessent_tone" not in values
     assert "gkg_person_yellen_docs" not in gb.GKG_FEATURES
+    assert {"gkg_person_warsh_tone", "gkg_person_hassett_docs"} <= set(gb.GKG_FEATURES)
+    assert len(gb.GKG_FEATURES) == 1 + 2 * (7 + 7 + 10)
 
 
 def test_gkg_aggregates_survive_json_and_add_up():

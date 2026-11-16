@@ -697,6 +697,9 @@ GKG_PERSONS: dict[str, tuple[str, ...]] = {
     "xi": ("xi jinping", "president xi"),
     "putin": ("vladimir putin",),
     "bessent": ("scott bessent",),
+    # Added 2026-11-16 (owner): 42 and 16 docs on 2026-11-13.
+    "warsh": ("kevin warsh",),
+    "hassett": ("kevin hassett",),
 }
 #: A document matches a topic when it carries any of the topic's GKG theme codes.
 #: Chosen from the theme counts of 2026-11-13 (docs that day in brackets). The DOC

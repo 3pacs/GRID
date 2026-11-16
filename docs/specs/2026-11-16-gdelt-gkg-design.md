@@ -83,7 +83,7 @@ This answers decision 3. The theme sets are chosen from these counts.
   - Xi: Persons had none. AllNames finds him once the name is matched as whole words inside a titled entry ("Chinese President Xi Jinping"): 212 documents in the end-to-end run of the day. Every person is matched on Persons (exact) or AllNames (whole words).
   - Powell 10 and Lagarde 7.
   - Bin Salman 0 and Ueda 1: **left out**, because a series of zeros says nothing.
-  - Kevin Warsh had 42 and Kevin Hassett 16. They are not added: **your call**.
+  - Kevin Warsh had 42 and Kevin Hassett 16. **Added 2026-11-16** at Anik's word, which brings the total to 48 `gkg_*` series.
   - "kimberly powell" (434, at Nvidia) and "jonathan powell" (203) are why names match exactly, not by surname.
 - **Theme sets** (a document matches if it carries any code in the set):
   - armed_conflict: `ARMEDCONFLICT` 11,273

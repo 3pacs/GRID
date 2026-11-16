@@ -2302,6 +2302,21 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # checkpoint lives in outputs/supply_chain, a symlink into /data that
     # outlives release swaps.
     "supply_chain_8k",
+    # ingestion/altdata/gdelt_bulk.py::run_daily -- no LLM -- GDELT 2.0
+    # 15-minute export files into gdelt_events (duplicates skipped),
+    # gdelt_export_files, gdelt_daily_summary and the 12 gdelt_* daily
+    # features, each dated D+1 or later. Released 2026-11-16 by the owner
+    # ("1-4 for gdelt") after one grid-svr run of 2026-03-20 matched GDELT
+    # 1.0's daily file (116,574 events) and was dated 2026-03-21. Its only
+    # other caller is the operator CLI, serialised with it by a pg advisory
+    # lock; it stops between files within its own 100 s budget.
+    "gdelt_bulk_events",
+    # ingestion/altdata/gdelt_bulk.py::run_gkg_daily -- no LLM -- GDELT 2.0
+    # GKG files into per-file ledger aggregates, gdelt_gkg_daily and the
+    # gkg_* daily features, registered not model-eligible until a >= 90 %
+    # precision hand-read, each dated D+1 or later. Released 2026-11-16 by
+    # the owner with gdelt_bulk_events. Own advisory lock, 100 s budget.
+    "gdelt_gkg_daily",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -2404,25 +2419,6 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "held for the initial subset by the controller (2026-09-20): file "
         "deletion/truncation policy (directories, retention, exclusions) "
         "to be accepted separately"
-    ),
-    "gdelt_bulk_events": (
-        "new daily writer, held until the owner releases it (2026-11-16): "
-        "ingestion/altdata/gdelt_bulk.py::run_daily -- no LLM -- inserts "
-        "gdelt_events (duplicates skipped), gdelt_export_files and "
-        "gdelt_daily_summary rows and the 12 gdelt_* daily feature points, "
-        "each dated D+1 or the UTC date GDELT published the day's last file, if later. "
-        "Its only other caller is the "
-        "operator CLI (python -m ingestion.altdata.gdelt_bulk), serialised "
-        "with it by a pg advisory lock"
-    ),
-    "gdelt_gkg_daily": (
-        "new daily writer, held until the owner releases it (2026-11-16): "
-        "ingestion/altdata/gdelt_bulk.py::run_gkg_daily -- no LLM -- inserts "
-        "gdelt_export_files rows of kind gkg, gdelt_gkg_daily rows and the "
-        "gkg_* daily feature points (not model-eligible), each dated D+1 or later. "
-        "Its only other caller is the operator CLI "
-        "(python -m ingestion.altdata.gdelt_bulk --kind gkg), serialised with it "
-        "by its own pg advisory lock"
     ),
 }
 
