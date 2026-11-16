@@ -332,12 +332,21 @@ class EightKSupplyLinks:
         return out
 
     def resolve_counterparty(self, name: str) -> tuple[str, scp.DerivedNode | None]:
-        """Graph node by name, else an SEC-listed company (its node, or a new ``ticker`` node), else private."""
+        """Graph node by name, else an SEC-listed company (its node, or a new ``ticker`` node), else private.
+
+        Exact names come before parents: "Coca-Cola Consolidated" is its own
+        SEC filer (COKE), not a subsidiary of the graph's Coca-Cola (KO).
+        """
         key = company_key(name)
-        node = self._graph_names.get(key) or _parent(key, self._graph_names)
+        node = self._graph_names.get(key)
         if node:
             return node, None
-        cik = self._by_name.get(key) or _parent(key, self._by_name)
+        cik = self._by_name.get(key)
+        if not (cik and cik in self._universe):
+            node = _parent(key, self._graph_names)
+            if node:
+                return node, None
+            cik = _parent(key, self._by_name)
         if cik and cik in self._universe:
             sym, nid, in_graph = self._universe[cik]
             return nid, None if in_graph else scp.DerivedNode(id=nid, name=_display(self._titles.get(cik, name)),
