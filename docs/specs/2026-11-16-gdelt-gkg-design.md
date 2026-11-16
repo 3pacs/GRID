@@ -1,6 +1,11 @@
 # GDELT GKG: tone, tension, breaking news and company mentions from the bulk files (design, for agreement)
 
-Status: **design, awaiting Anik's agreement.** Nothing is built.
+Status: **agreed by Anik 2026-11-16, as recommended**, with three additions:
+- move the DOC callers and breaking news onto the bulk/GKG path now, a small slice at a time;
+- Bessent replaces Yellen;
+- nothing feeds a model until a hand-read shows at least 90% precision.
+
+PR 1 (ledger `kind`, GKG parser, `gdelt_gkg_daily`, `gkg_*` series, held Hermes task `gdelt_gkg_daily`) is built. See "Weekday measurement" below for the lists it uses.
 
 This is slice 3 of moving GDELT onto its bulk files:
 - slice 1 is the export loader, 3pacs/GRID#1232;
@@ -54,6 +59,48 @@ GDELT's Global Knowledge Graph (GKG 2.1) is published every 15 minutes next to t
   - No v2 GKG files are stored (`/data/gdelt/v2/english` has export and mentions only).
   - `/data/gdelt/v1/gkg` holds 9,470 GKG 1.0 daily files. GKG 1.0 has themes, persons, organizations, locations and tone, but no V2 character offsets.
   - Whether a GKG 1.0 daily file equals its day's GKG 2.1 files must be measured the way slice 1 did for events, before it is used as history.
+
+## Weekday measurement (Friday 2026-11-13, all 96 GKG files, grid-svr)
+
+This answers decision 3. The theme sets are chosen from these counts.
+
+- **Volume.** 104,883 documents (642 to 1,766 per file), 444.7 MB zipped, every row 27 columns, 9,090 distinct theme codes. That is about 160 GB a year to download. Nothing raw is kept.
+- **Pairs** (docs, mean tone):
+
+  | pair | docs | mean tone |
+  |---|---:|---:|
+  | US–China | 3,326 | −1.18 |
+  | US–Iran | 2,741 | −2.58 |
+  | Russia–Ukraine | 2,127 | −1.28 |
+  | US–Russia | 2,028 | −1.40 |
+  | Israel–Iran | 1,013 | −3.05 |
+  | India–China | 695 | −0.15 |
+  | China–Taiwan | 591 | −1.41 |
+
+  Every pair is usable daily.
+- **Persons** (exact lower-cased names in Persons; in AllNames for Xi):
+  - Putin 1,285 and Bessent 341.
+  - Xi: Persons had none, but AllNames found him (32 documents in 12 files, about 150 a day). He is matched on Persons or AllNames.
+  - Powell 10 and Lagarde 7.
+  - Bin Salman 0 and Ueda 1: **left out**, because a series of zeros says nothing.
+  - Kevin Warsh had 42 and Kevin Hassett 16. They are not added: **your call**.
+  - "kimberly powell" (434, at Nvidia) and "jonathan powell" (203) are why names match exactly, not by surname.
+- **Theme sets** (a document matches if it carries any code in the set):
+  - armed_conflict: `ARMEDCONFLICT` 11,273
+  - inflation: `ECON_INFLATION` 2,307, `WB_442_INFLATION` 2,167
+  - rates: `ECON_INTEREST_RATES` 1,473, `EPU_POLICY_INTEREST_RATE(S)` 900 / 840
+  - fed: `EPU_POLICY_FEDERAL_RESERVE` 825
+  - central_bank: `ECON_CENTRALBANK` 691, `WB_1235_CENTRAL_BANKS` 688, `EPU_POLICY_CENTRAL_BANK` 671
+  - sanctions: `SANCTIONS` 1,132
+  - oil: `ECON_OILPRICE` 1,222, `ENV_OIL` 2,978
+  - currency: `ECON_CURRENCY_EXCHANGE_RATE` 643, `EPU_CATS_SOVEREIGN_DEBT_CURRENCY_CRISES` 245
+  - trade_dispute: `ECON_TRADE_DISPUTE` 102
+  - defense_spending: `SLFID_MILITARY_SPENDING` 142
+  - The DOC topics recession, chip export controls and Taiwan strait have no theme code with 50 or more documents. They get no theme series; Taiwan is covered by the China–Taiwan pair, and chips by company mentions (item 4).
+- **Precision gate.** Every `gkg_*` feature is registered `model_eligible = FALSE`. One may be switched on only after:
+  - 30 days of the series exist;
+  - a hand-read of at least 100 matched documents for its group shows at least 90% are about the group;
+  - the read is recorded in this doc.
 
 ## Design
 
