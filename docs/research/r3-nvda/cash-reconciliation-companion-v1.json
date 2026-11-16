@@ -1,0 +1,817 @@
+{
+  "schema": "nvda-cash-reconciliation/1",
+  "facts": {
+    "Q1": {
+      "net_income": {
+        "value": 58321,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Net income $ 58,321 $ 18,775",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "sbc": {
+        "value": 1928,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Stock-based compensation expense 1,928 1,474",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "deferred_tax": {
+        "value": 1584,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Deferred income taxes 1,584 ( 2,177 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "da": {
+        "value": 997,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Depreciation and amortization 997 611",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "equity_gains": {
+        "value": -15936,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "(Gains) losses from equity securities, net ( 15,936 ) 175",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "other": {
+        "value": -94,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Other ( 94 ) ( 98 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "ar": {
+        "value": -2243,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Accounts receivable ( 2,243 ) 933",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "inventory": {
+        "value": -4420,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Inventories ( 4,420 ) ( 1,258 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "prepaid_other_assets": {
+        "value": -983,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Prepaid expenses and other assets ( 983 ) 560",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "ap": {
+        "value": 2210,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Accounts payable 2,210 941",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "accrued_current": {
+        "value": 7763,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Accrued and other current liabilities 7,763 7,128",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "other_longterm": {
+        "value": 1217,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Other long-term liabilities 1,217 350",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "cfo": {
+        "value": 50344,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Net cash provided by operating activities 50,344 27,414",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "capex": {
+        "value": -1757,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Purchases related to property and equipment and intangible assets ( 1,757 ) ( 1,227 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "principal": {
+        "value": -33,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-04-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000052/nvda-20260426.htm",
+        "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4",
+        "published_at": "2026-05-20T16:35:52-04:00",
+        "retrieved_at": "2026-11-13T00:17:53Z",
+        "row_text": "Principal payments on property and equipment and intangible assets ( 33 ) ( 52 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      }
+    },
+    "H1": {
+      "net_income": {
+        "value": 118010,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Net income $ 118,010 $ 45,197",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "sbc": {
+        "value": 3954,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Stock-based compensation expense 3,954 3,099",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "deferred_tax": {
+        "value": 982,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Deferred income taxes 982 ( 2,160 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "da": {
+        "value": 2124,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Depreciation and amortization 2,124 1,280",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "equity_gains": {
+        "value": -23707,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Gains from equity securities, net ( 23,707 ) ( 2,073 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "other": {
+        "value": 222,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Other 222 ( 196 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "ar": {
+        "value": -24590,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Accounts receivable ( 24,590 ) ( 4,743 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "inventory": {
+        "value": -10204,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Inventories ( 10,204 ) ( 4,880 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "prepaid_other_assets": {
+        "value": -6480,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Prepaid expenses and other assets ( 6,480 ) 946",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "ap": {
+        "value": 4125,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Accounts payable 4,125 2,255",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "accrued_current": {
+        "value": 8015,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Accrued and other current liabilities 8,015 3,075",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "other_longterm": {
+        "value": 1970,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Other long-term liabilities 1,970 979",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "cfo": {
+        "value": 74421,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Net cash provided by operating activities 74,421 42,779",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "capex": {
+        "value": -4434,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Purchases related to property and equipment and intangible assets ( 4,434 ) ( 3,122 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      },
+      "principal": {
+        "value": -92,
+        "kind": "observed",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-01-26",
+        "period_end": "2026-07-26",
+        "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+        "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24",
+        "published_at": "2026-08-26T16:36:00-04:00",
+        "retrieved_at": "2026-11-13T00:17:54Z",
+        "row_text": "Principal payments on property and equipment and intangible assets ( 92 ) ( 73 )",
+        "section": "Condensed Consolidated Statements of Cash Flows",
+        "column": "first/current-period"
+      }
+    },
+    "Q2": {
+      "net_income": {
+        "value": 59689,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "net_income",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "net_income",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "sbc": {
+        "value": 2026,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "sbc",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "sbc",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "deferred_tax": {
+        "value": -602,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "deferred_tax",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "deferred_tax",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "da": {
+        "value": 1127,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "da",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "da",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "equity_gains": {
+        "value": -7771,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "equity_gains",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "equity_gains",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "other": {
+        "value": 316,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "other",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "other",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "ar": {
+        "value": -22347,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "ar",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "ar",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "inventory": {
+        "value": -5784,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "inventory",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "inventory",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "prepaid_other_assets": {
+        "value": -5497,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "prepaid_other_assets",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "prepaid_other_assets",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "ap": {
+        "value": 1915,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "ap",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "ap",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "accrued_current": {
+        "value": 252,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "accrued_current",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "accrued_current",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "other_longterm": {
+        "value": 753,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "other_longterm",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "other_longterm",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "cfo": {
+        "value": 24077,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "cfo",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "cfo",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "capex": {
+        "value": -2677,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "capex",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "capex",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      },
+      "principal": {
+        "value": -59,
+        "kind": "derived",
+        "currency": "USD",
+        "unit": "millions",
+        "period_start": "2026-04-27",
+        "period_end": "2026-07-26",
+        "formula": "H1 minus Q1",
+        "inputs": [
+          {
+            "period": "H1",
+            "field": "principal",
+            "source_sha256": "66cbd404bb7d5c6d67e57d5440029fd8dd6be64dfce5ad9ae04622d2e7d7fa24"
+          },
+          {
+            "period": "Q1",
+            "field": "principal",
+            "source_sha256": "ac4b0aa2f61a454a29df784d128b9da2f2410654276f65580fe29c79bd4bf0b4"
+          }
+        ],
+        "available_at": "2026-08-26T16:36:00-04:00"
+      }
+    }
+  },
+  "reconciliations": {
+    "Q1": {
+      "cfo": 50344,
+      "cfo_less_capex": 48587,
+      "issuer_style_fcf": 48554,
+      "cfo_residual": 0
+    },
+    "H1": {
+      "cfo": 74421,
+      "cfo_less_capex": 69987,
+      "issuer_style_fcf": 69895,
+      "cfo_residual": 0
+    },
+    "Q2": {
+      "cfo": 24077,
+      "cfo_less_capex": 21400,
+      "issuer_style_fcf": 21341,
+      "cfo_residual": 0
+    }
+  },
+  "limitations": [
+    "Pinned historical sources, not a refreshed investment view",
+    "Publication/retrieval timestamps inherited from frozen ledger; source bytes independently hash checked",
+    "Cash flow is not FCFF or FCFE; no valuation",
+    "Net-of-acquisition cash-flow adjustments used, not raw stock differences"
+  ]
+}

@@ -1,5 +1,13 @@
 # Browser-acceptance harness — first-release journeys
 
+**2026-11-06 M1 update:** start with [M1-SPY-JOURNEY.md](M1-SPY-JOURNEY.md)
+for the current portable runner and source-bound SPY Options/Gamma Watch matrix.
+Historical sections below describe the September baseline; the Linux
+re-baseline records the preserved #977 work. Neither establishes deployed-build
+acceptance for this candidate. The runner
+now defaults to this worktree's `pwa/`, uses `#/god-view`, and records the
+actual source and served development-module identities.
+
 Local, fixture-backed harness for demonstrating the five first-release user
 journeys against the PWA in a real browser, with **no database, no Docker,
 no ssh, and no production/staging access**. This directory only produces

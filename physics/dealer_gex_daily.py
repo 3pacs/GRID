@@ -55,7 +55,7 @@ def max_pain(chain: pd.DataFrame) -> float | None:
         return float(((k - calls["strike"]).clip(lower=0) * calls["open_interest"]).sum()
                      + ((puts["strike"] - k).clip(lower=0) * puts["open_interest"]).sum())
 
-    return min(ks, key=pay)
+    return float(min(ks, key=pay))      # ks holds numpy scalars; the driver can't bind np.float64 under numpy 2
 
 
 def chain_extras(chain: pd.DataFrame, spot: float) -> dict[str, float | None]:
@@ -107,13 +107,27 @@ def compute_row(engine: Engine, d: date, ticker: str = TICKER) -> dict[str, Any]
             "capture_batch_id": batch, "capture_completed_at": prof.get("chain_capture_completed_at"), **ex}
 
 
+_NUMERIC = {"spot": "spot_price", "net": "net_gex_usd_m", "call": "call_gex_usd_m", "put": "put_gex_usd_m",
+            "flip": "gamma_flip_strike", "dist": "spot_to_flip_pct", "pain": "max_pain_strike",
+            "pcr": "put_call_oi_ratio", "iv": "atm_iv"}
+
+
+def insert_params(row: dict[str, Any]) -> dict[str, Any]:
+    """Bind parameters for ``_INSERT_SQL``: numeric columns as plain Python floats.
+
+    Under numpy 2, psycopg2 renders an ``np.float64`` by its repr (``np.float64(765.0)``), which Postgres reads as a
+    schema-qualified name and rejects (first live run, 2026-11-13).
+    """
+    out: dict[str, Any] = {"d": row["obs_date"], "t": row["ticker"], "regime": row["gex_regime"]}
+    for key, col in _NUMERIC.items():
+        v = row[col]
+        out[key] = None if v is None else float(v)
+    return out
+
+
 def store_row(engine: Engine, row: dict[str, Any]) -> bool:
     with engine.begin() as conn:
-        res = conn.execute(_INSERT_SQL, {
-            "d": row["obs_date"], "t": row["ticker"], "spot": row["spot_price"], "net": row["net_gex_usd_m"],
-            "call": row["call_gex_usd_m"], "put": row["put_gex_usd_m"], "flip": row["gamma_flip_strike"],
-            "dist": row["spot_to_flip_pct"], "regime": row["gex_regime"], "pain": row["max_pain_strike"],
-            "pcr": row["put_call_oi_ratio"], "iv": row["atm_iv"]})
+        res = conn.execute(_INSERT_SQL, insert_params(row))
     return bool(res.rowcount)
 
 
