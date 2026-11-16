@@ -2391,10 +2391,10 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
     "gdelt_bulk_events": (
         "new daily writer, held until the owner releases it (2026-11-16): "
         "ingestion/altdata/gdelt_bulk.py::run_daily -- no LLM -- inserts "
-        "gdelt_events (ON CONFLICT DO NOTHING), gdelt_export_files and "
-        "gdelt_daily_summary rows and the 12 gdelt_* points in "
-        "resolved_series (release_date = vintage_date = the UTC date GDELT "
-        "published the day's last file). Its only other caller is the "
+        "gdelt_events (duplicates skipped), gdelt_export_files and "
+        "gdelt_daily_summary rows and the 12 gdelt_* daily feature points, "
+        "each dated by the UTC date GDELT published the day's last file. "
+        "Its only other caller is the "
         "operator CLI (python -m ingestion.altdata.gdelt_bulk), serialised "
         "with it by a pg advisory lock"
     ),
