@@ -34,6 +34,7 @@ from sqlalchemy import text
 from config import settings
 from db import get_engine
 from normalization.resolver import Resolver
+from store.options_iv import CALL_WING, PUT_WING, WING_SPREAD, fixed_moneyness_wings
 
 TRUST_OFFICIAL = 1
 TRUST_AGGREGATOR = 3
@@ -429,19 +430,17 @@ def pull_options_history(engine) -> list[dict]:
                 ])
                 iv_atm = all_iv.median() if len(all_iv) > 0 else 0
 
-                # IV skew (25d put IV - 25d call IV proxy: use OTM options)
+                # Versioned fixed-moneyness proxies. Never append a different
+                # formula to the old 25d/iv_skew series or fabricate ATM wings.
                 info = ticker.info or {}
-                current_price = info.get("regularMarketPrice", info.get("previousClose", 0))
-                if current_price > 0:
-                    otm_puts = puts[puts["strike"] < current_price * 0.95]
-                    otm_calls = calls[calls["strike"] > current_price * 1.05]
-                    iv_25d_put = otm_puts["impliedVolatility"].median() if len(otm_puts) > 0 else iv_atm
-                    iv_25d_call = otm_calls["impliedVolatility"].median() if len(otm_calls) > 0 else iv_atm
-                    iv_skew = iv_25d_put - iv_25d_call
-                else:
-                    iv_25d_put = iv_atm
-                    iv_25d_call = iv_atm
-                    iv_skew = 0
+                wings = fixed_moneyness_wings(
+                    calls.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    puts.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    info.get("regularMarketPrice"), expiry=nearest["expiry"],
+                    snap_date=today, source="yahoo",
+                )
+                wing_spread = (wings[PUT_WING] - wings[CALL_WING]
+                               if wings[PUT_WING] is not None and wings[CALL_WING] is not None else None)
 
                 # Max pain (strike with max total OI)
                 all_strikes = pd.concat([
@@ -477,9 +476,9 @@ def pull_options_history(engine) -> list[dict]:
                 metrics = {
                     f"{prefix}_pcr": pcr,
                     f"{prefix}_iv_atm": iv_atm,
-                    f"{prefix}_iv_skew": iv_skew,
-                    f"{prefix}_iv_25d_put": iv_25d_put,
-                    f"{prefix}_iv_25d_call": iv_25d_call,
+                    f"{prefix}_{WING_SPREAD}": wing_spread,
+                    f"{prefix}_{PUT_WING}": wings[PUT_WING],
+                    f"{prefix}_{CALL_WING}": wings[CALL_WING],
                     f"{prefix}_max_pain": max_pain,
                     f"{prefix}_total_oi": total_oi,
                     f"{prefix}_opt_vol": opt_vol,
@@ -492,7 +491,8 @@ def pull_options_history(engine) -> list[dict]:
                     for metric_name, value in metrics.items():
                         if value is None or pd.isna(value):
                             continue
-                        sid = f"OPT:{ticker_sym}:{metric_name.split('_', 1)[1] if '_' in metric_name else metric_name}"
+                        suffix = metric_name.removeprefix(f"{prefix}_")
+                        sid = f"OPT:{ticker_sym}:{suffix}"
                         # Check if already exists. Excludes QUARANTINED like
                         # the other existence checks in this file (_bulk_insert
                         # above) -- a quarantined row is not valid data for
@@ -504,9 +504,10 @@ def pull_options_history(engine) -> list[dict]:
                         ), {"sid": sid, "src": source_id, "od": today}).fetchone()
                         if not existing:
                             conn.execute(text(
-                                "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                            ), {"sid": sid, "src": source_id, "od": today, "val": float(value)})
+                                "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status, raw_payload) "
+                                "VALUES (:sid, :src, :od, :val, 'SUCCESS', CAST(:payload AS JSONB))"
+                            ), {"sid": sid, "src": source_id, "od": today, "val": float(value),
+                                "payload": json.dumps(wings["wing_iv_metadata"]) if suffix in (PUT_WING, CALL_WING, WING_SPREAD) else None})
                             count += 1
 
                 results.append({"ticker": ticker_sym, "metrics_inserted": count, "pcr": round(pcr, 3),

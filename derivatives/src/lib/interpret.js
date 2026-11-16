@@ -374,7 +374,8 @@ export function interpretPCR(pcr) {
 /**
  * Interpret implied volatility skew.
  *
- * Skew = IV of 25-delta put / IV of 25-delta call.
+ * Skew is the supplied put/call IV ratio; its wing method must be labeled
+ * by the caller. A fixed strike proxy is not a 25-delta measurement.
  * Steep skew means downside protection is expensive (fear premium).
  * Flat skew means complacency.
  *

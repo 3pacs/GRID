@@ -33,6 +33,7 @@ from sqlalchemy.pool import NullPool
 
 from ingestion.base import BasePuller
 from ingestion.market_calendar import is_market_open
+from store.options_iv import CALL_WING, PUT_WING, fixed_moneyness_wings
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -768,6 +769,9 @@ class OptionsPuller(BasePuller):
                     iv_atm          DOUBLE PRECISION,
                     iv_25d_put      DOUBLE PRECISION,
                     iv_25d_call     DOUBLE PRECISION,
+                    iv_m90_put_v1   DOUBLE PRECISION,
+                    iv_m110_call_v1 DOUBLE PRECISION,
+                    wing_iv_metadata JSONB,
                     term_structure_slope DOUBLE PRECISION,
                     oi_concentration     DOUBLE PRECISION,
                     created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -1275,9 +1279,14 @@ class OptionsPuller(BasePuller):
                 # ATM IV
                 iv_atm = _compute_atm_iv(near_calls_df, near_puts_df, spot_price)
 
-                # 25-delta wings
-                iv_25d_put = _compute_wing_iv(near_puts_df, spot_price, delta_strike_pct=0.90)
-                iv_25d_call = _compute_wing_iv(near_calls_df, spot_price, delta_strike_pct=1.10)
+                # Versioned fixed-moneyness proxies, never 25-delta IV.
+                wings = fixed_moneyness_wings(
+                    near_calls_df.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    near_puts_df.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    spot_price, expiry=near_expiry, snap_date=today_str,
+                    source=spot_provider, capture_batch_id=batch_id,
+                    spot_observed_at=spot_market_at.isoformat() if spot_market_at else None,
+                )
 
                 # Term structure slope (IV of far expiry - near expiry)
                 term_slope = None
@@ -1294,9 +1303,9 @@ class OptionsPuller(BasePuller):
                         "INSERT INTO options_daily_signals "
                         "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
                         "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
-                        "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration) "
+                        "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
                         "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
-                        ":iv_atm, :iv_25d_put, :iv_25d_call, :ts_slope, :oi_conc) "
+                        ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
                         "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
                         "put_call_ratio = EXCLUDED.put_call_ratio, "
                         "max_pain = EXCLUDED.max_pain, "
@@ -1306,8 +1315,9 @@ class OptionsPuller(BasePuller):
                         "near_expiry = EXCLUDED.near_expiry, "
                         "spot_price = EXCLUDED.spot_price, "
                         "iv_atm = EXCLUDED.iv_atm, "
-                        "iv_25d_put = EXCLUDED.iv_25d_put, "
-                        "iv_25d_call = EXCLUDED.iv_25d_call, "
+                        "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
+                        "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
+                        "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
                         "term_structure_slope = EXCLUDED.term_structure_slope, "
                         "oi_concentration = EXCLUDED.oi_concentration"
                     ),
@@ -1316,8 +1326,9 @@ class OptionsPuller(BasePuller):
                         "pcr": put_call_ratio, "mp": max_pain, "ivs": iv_skew,
                         "oi": total_oi, "vol": total_volume,
                         "ne": near_expiry, "spot": spot_price,
-                        "iv_atm": iv_atm, "iv_25d_put": iv_25d_put,
-                        "iv_25d_call": iv_25d_call,
+                        "iv_atm": iv_atm, PUT_WING: wings[PUT_WING],
+                        CALL_WING: wings[CALL_WING],
+                        "wing_meta": json.dumps(wings["wing_iv_metadata"]),
                         "ts_slope": term_slope, "oi_conc": oi_conc,
                     },
                 )
@@ -1330,11 +1341,11 @@ class OptionsPuller(BasePuller):
                     "total_oi": ("sentiment", f"{ticker} Total Open Interest", total_oi),
                     "opt_vol": ("sentiment", f"{ticker} Total Options Volume", total_volume),
                     "iv_atm": ("vol", f"{ticker} ATM Implied Volatility", iv_atm),
-                    "iv_25d_put": ("vol", f"{ticker} 25-Delta Put IV", iv_25d_put),
-                    "iv_25d_call": ("vol", f"{ticker} 25-Delta Call IV", iv_25d_call),
+                    PUT_WING: ("vol", f"{ticker} Put IV proxy: 87-93% spot mean v1", wings[PUT_WING]),
+                    CALL_WING: ("vol", f"{ticker} Call IV proxy: 107-113% spot mean v1", wings[CALL_WING]),
                     "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
                     "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                }, should_continue=should_continue)
+                }, should_continue=should_continue, wing_metadata=wings["wing_iv_metadata"])
                 _check_budget(should_continue)
                 signals_written = _affected_rows(signal_write)
                 rows_inserted = (
@@ -1384,6 +1395,7 @@ class OptionsPuller(BasePuller):
         signals: dict[str, tuple[str, str, Any]],
         *,
         should_continue: Callable[[], bool] | None = None,
+        wing_metadata: dict | None = None,
     ) -> int | None:
         """Push computed signals to feature_registry + resolved_series."""
         prefix = ticker.lower().replace("-", "_")
@@ -1409,10 +1421,13 @@ class OptionsPuller(BasePuller):
                     "transformation_version, lag_days, normalization, "
                     "missing_data_policy, eligible_from_date, model_eligible) "
                     "VALUES (:name, :fam, :desc, 'RAW', 1, 0, 'ZSCORE', "
-                    "'FORWARD_FILL', '2024-04-01', TRUE) "
+                    ":missing_policy, :eligible_from, :model_eligible) "
                     "ON CONFLICT (name) DO NOTHING RETURNING id"
                 ),
-                {"name": feat_name, "fam": family, "desc": desc},
+                {"name": feat_name, "fam": family, "desc": desc,
+                 "missing_policy": "NAN" if suffix in (PUT_WING, CALL_WING) else "FORWARD_FILL",
+                 "eligible_from": today_str if suffix in (PUT_WING, CALL_WING) else "2024-04-01",
+                 "model_eligible": suffix not in (PUT_WING, CALL_WING)},
             ).fetchone()
 
             if row:
@@ -1431,13 +1446,14 @@ class OptionsPuller(BasePuller):
                 text(
                     "INSERT INTO resolved_series "
                     "(feature_id, obs_date, release_date, vintage_date, value, "
-                    "source_priority_used) "
-                    "VALUES (:fid, :od, :rd, :vd, :val, :src) "
+                    "source_priority_used, options_iv_metadata) "
+                    "VALUES (:fid, :od, :rd, :vd, :val, :src, CAST(:wing_meta AS JSONB)) "
                     "ON CONFLICT DO NOTHING"
                 ),
                 {
                     "fid": fid, "od": today_str, "rd": today_str,
                     "vd": today_str, "val": float(val), "src": self.source_id,
+                    "wing_meta": json.dumps(wing_metadata) if suffix in (PUT_WING, CALL_WING) else None,
                 },
             )
             count = _affected_rows(written)
@@ -1526,25 +1542,6 @@ def _compute_atm_iv(
     iv = atm["impliedVolatility"].mean()
     return float(iv) if pd.notna(iv) else None
 
-
-def _compute_wing_iv(
-    df: pd.DataFrame, spot_price: float, delta_strike_pct: float
-) -> float | None:
-    """Compute average IV around a specific strike level (e.g. 90% or 110% of spot)."""
-    if df.empty or "impliedVolatility" not in df.columns:
-        return None
-
-    target = spot_price * delta_strike_pct
-    band = spot_price * 0.03
-    wing = df[
-        (df["strike"] >= target - band) &
-        (df["strike"] <= target + band)
-    ]
-    if wing.empty:
-        return None
-
-    iv = wing["impliedVolatility"].mean()
-    return float(iv) if pd.notna(iv) else None
 
 
 def _compute_oi_concentration(
