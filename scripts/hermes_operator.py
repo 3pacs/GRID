@@ -325,6 +325,10 @@ DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_ma
 #   said not to do, so it stays at 60s.
 DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S = 90
 DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S
+# gdelt_bulk_events: downloads GDELT 2.0 15-minute export files (~0.2 s each
+# measured from grid-svr 2026-11-16) and stops itself between files after
+# ingestion.altdata.gdelt_bulk.DAILY_BUDGET_SECONDS (100 s); 20 s headroom.
+DAILY_INTEL_GDELT_BULK_BUDGET_S = 120
 
 # Sector health snapshot — daily due-period scheduling (2026-09-19). Was
 # "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
@@ -1974,6 +1978,18 @@ def _daily_intel_supply_chain_8k(
     results["supply_chain_8k"] = run_daily(engine)
 
 
+def _daily_intel_gdelt_bulk_events(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """GDELT 2.0 15-minute export files into gdelt_events, gdelt_daily_summary
+    and the 12 gdelt_* daily features, dated by when GDELT published each day's
+    last file. Resumes from its file ledger (gdelt_export_files) and stops
+    within its own 100 s budget. No LLM."""
+    from ingestion.altdata.gdelt_bulk import run_daily
+
+    results["gdelt_bulk_events"] = run_daily(engine)
+
+
 def _daily_intel_capital_flow_rollups(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -2178,6 +2194,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("gdelt_bulk_events", _daily_intel_gdelt_bulk_events, DAILY_INTEL_GDELT_BULK_BUDGET_S),
     DailyIntelTask("sleuth_dispatch", _daily_intel_sleuth_dispatch, DAILY_INTEL_SQL_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
@@ -2370,6 +2387,16 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "held for the initial subset by the controller (2026-09-20): file "
         "deletion/truncation policy (directories, retention, exclusions) "
         "to be accepted separately"
+    ),
+    "gdelt_bulk_events": (
+        "new daily writer, held until the owner releases it (2026-11-16): "
+        "ingestion/altdata/gdelt_bulk.py::run_daily -- no LLM -- inserts "
+        "gdelt_events (ON CONFLICT DO NOTHING), gdelt_export_files and "
+        "gdelt_daily_summary rows and the 12 gdelt_* points in "
+        "resolved_series (release_date = vintage_date = the UTC date GDELT "
+        "published the day's last file). Its only other caller is the "
+        "operator CLI (python -m ingestion.altdata.gdelt_bulk), serialised "
+        "with it by a pg advisory lock"
     ),
 }
 
