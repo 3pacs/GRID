@@ -49,6 +49,8 @@ NODE_SYMBOLS: dict[str, str] = {
     "cameco": "CCJ",
     "canadian_solar": "CSIQ",
     "cloudflare": "NET",
+    "coca_cola_consolidated": "COKE",  # listed; was filed as a private company (2026-11-16)
+    "coca_cola_europacific_partners": "CCEP",  # listed; was filed as a private company (2026-11-16)
     "coherent": "COHR",
     "corning": "GLW",
     "crown_holdings": "CCK",
@@ -58,19 +60,28 @@ NODE_SYMBOLS: dict[str, str] = {
     "intel": "INTC",
     "international_paper": "IP",
     "kfc_parent": "YUM",
+    "knowles": "KN",  # listed; was filed as a private company (2026-11-16)
+    "lattice_semiconductor": "LSCC",  # listed; was filed as a private company (2026-11-16)
     "linde": "LIN",
     "lumentum": "LITE",
     "micron": "MU",
     "mp_materials": "MP",
     "nextdecade": "NEXT",
     "oi_glass": "OI",
+    "on_semiconductor": "ON",  # listed; was filed as a private company (2026-11-16)
     "packaging_corp": "PKG",
     "post_holdings": "POST",
+    "power_integrations": "POWI",  # listed; was filed as a private company (2026-11-16)
     "sq": "XYZ",  # Block renamed its symbol from SQ
+    "synaptics": "SYNA",  # listed; was filed as a private company (2026-11-16)
     "sysco": "SYY",
+    "td_synnex": "SNX",  # listed; was filed as a private company (2026-11-16)
+    "the_chemours": "CC",  # listed; was filed as a private company (2026-11-16)
     "tsmc": "TSM",  # NYSE ADR
     "tyson": "TSN",
     "venture_global": "VG",
+    "vertex": "VRTX",  # listed; was filed as a private company (2026-11-16)
+    "viavi_solutions": "VIAV",  # listed; was filed as a private company (2026-11-16)
     "westrock": "SW",  # merged into Smurfit Westrock
 }
 
