@@ -123,13 +123,12 @@ def test_client_one_request_serves_every_expiry() -> None:
 
 
 def test_client_maps_ticker_to_cboe_symbol() -> None:
-    session = _Session(_Resp(403))
+    session = _Session(_Resp(404))
     options.CboeOptionsClient(session=session).get_options("BRK-B")
     assert session.urls == ["https://cdn.cboe.com/api/global/delayed_quotes/options/BRK.B.json"]
 
 
 @pytest.mark.parametrize(("response", "expected"), [
-    (_Resp(403), options.NO_CHAIN),          # S3 AccessDenied: no listed options
     (_Resp(404), options.NO_CHAIN),
     (_Resp(429), None),                      # transport/provider failure
     (_Resp(500), None),
@@ -206,7 +205,7 @@ def test_cboe_failure_falls_back_to_yahoo_for_the_whole_ticker(monkeypatch: pyte
 
 
 def test_cboe_no_chain_is_authoritative(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, made = _composite(monkeypatch, _Resp(403))
+    client, made = _composite(monkeypatch, _Resp(404))
     assert client.get_options("NUOX") is options.NO_CHAIN
     assert made == []
 
@@ -366,3 +365,86 @@ def test_clock_metadata_does_not_reinterpret_unexpected_raw_clock_types():
     assert chain["quote"]["clockMetadata"]["document_timestamp_raw"] is None
     assert clocks["contract_last_trade_raw"] is None
     assert chain["quote"]["clockMetadata"]["synchronization"] == "unknown"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_access_denial_is_latched_without_fallback(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    client, made = _composite(monkeypatch, _Resp(status))
+    for ticker, expiry in [("NUOX", None), ("KO", None), ("NUOX", NOV06)]:
+        with pytest.raises(options.OptionsSourceAccessDenied) as caught:
+            client.get_options(ticker, expiry)
+        assert caught.value.provider == "cboe"
+        assert caught.value.http_status == status
+        assert str(caught.value) == f"cboe access denied (HTTP {status})"
+    assert len(client.cboe.session.urls) == 1
+    assert client.cboe.last_no_chain is False
+    assert client.provider_by_ticker == {}  # no provider supplied a capture
+    assert made == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("successful_prefix", [False, True])
+def test_access_denial_stops_run_without_absence_or_freshness(
+    monkeypatch: pytest.MonkeyPatch, status: int, successful_prefix: bool,
+) -> None:
+    monkeypatch.delenv("GRID_OPTIONS_PRIMARY_PROVIDER", raising=False)
+    monkeypatch.setattr(options, "_NO_OPTIONS_UNTIL", {})
+    tickers = (["KO"] if successful_prefix else []) + ["NUOX", "PEP"]
+    monkeypatch.setattr(options, "EQUITY_TICKERS", tickers)
+    monkeypatch.setattr(options, "catalyst_options_universe", lambda *_a, **_kw: [])
+    responses = ([_Resp(200, _doc())] if successful_prefix else []) + [_Resp(status)]
+    client, made = _composite(monkeypatch, *responses)
+    monkeypatch.setattr(options, "CboeFirstOptionsClient", lambda: client)
+    monkeypatch.setattr(options.time, "sleep", lambda *_a: None)
+    puller = options.OptionsPuller.__new__(options.OptionsPuller)
+    puller.engine = _DB()
+    monkeypatch.setattr(puller, "_push_to_resolved", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(puller, "_mark_catalog_pulled",
+                        lambda **_kw: pytest.fail("denial must not publish source freshness"))
+
+    results = puller.pull_all()
+
+    denied, unrequested = results[-2:]
+    assert denied == {"ticker": "NUOX", "status": "FAILED", "rows_inserted": 0,
+                      "reason": "source_access_denied", "error": f"cboe access denied (HTTP {status})",
+                      "provider": "cboe", "http_status": status}
+    assert unrequested == {"ticker": "PEP", "status": "SKIPPED", "rows_inserted": 0,
+                           "reason": "source_access_denied_before_request", "provider": "cboe",
+                           "blocked_by_http_status": status}
+    assert results.summary["status"] == ("PARTIAL" if successful_prefix else "FAILED")
+    assert "access denied" in results.summary["error"]
+    assert results.summary["tickers_no_options"] == results.summary["tickers_no_chain"] == 0
+    assert options._NO_OPTIONS_UNTIL == {}
+    assert len(client.cboe.session.urls) == (2 if successful_prefix else 1)
+    assert made == []
+    assert len(puller.engine.batches) == (1 if successful_prefix else 0)
+    assert len(puller.engine.signals) == (1 if successful_prefix else 0)
+    assert len(puller.engine.rows) == (7 if successful_prefix else 0)
+    if successful_prefix:
+        assert results[0]["status"] == "SUCCESS"  # prior complete capture is not rewritten
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_denial_never_reuses_an_already_initialised_fallback(
+    monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    client, made = _composite(monkeypatch, _Resp(429), _Resp(status))
+    assert client.get_options("KO") is not None
+    assert made[0].calls == [("KO", None)]
+    for ticker, expiry in [("PEP", None), ("KO", NOV06), ("KO", None)]:
+        with pytest.raises(options.OptionsSourceAccessDenied):
+            client.get_options(ticker, expiry)
+    assert len(client.cboe.session.urls) == 2
+    assert made[0].calls == [("KO", None)]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_denial_never_serves_a_previously_cached_chain(status: int) -> None:
+    session = _Session(_Resp(200, _doc()), _Resp(status))
+    client = options.CboeOptionsClient(session=session)
+    assert client.get_options("KO") is not None
+    with pytest.raises(options.OptionsSourceAccessDenied):
+        client.get_options("PEP")
+    with pytest.raises(options.OptionsSourceAccessDenied):
+        client.get_options("KO", NOV06)
+    assert len(session.urls) == 2
