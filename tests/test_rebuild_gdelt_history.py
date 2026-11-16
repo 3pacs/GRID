@@ -246,3 +246,14 @@ def test_cli_requires_a_run_tag_and_a_snapshot_dir_for_apply(capsys):
     with pytest.raises(SystemExit):
         rb.main(["apply", "--plan", "p.json"])
     assert rb.main(["plan", "--out", "x.json", "--last", "2026-03-20"], engine=object()) == 2
+
+
+def test_a_reused_plan_keeps_its_ok_days_and_builds_only_the_others(engine):
+    seed_legacy(engine)
+    first = rb.plan(engine, archive=None, first=D1, last=D3, fetch=fake_history())
+    fake = fake_history()
+    fake.v1(D3, [v1_row(9, D3)], at(D3 + timedelta(days=1), 7))      # D3 has appeared since
+    again = rb.plan(engine, archive=None, first=D1, last=D3, fetch=fake, reuse=first)
+    assert again["report"]["days_reused"] == 2 and again["report"]["days_ok"] == 3
+    assert {u for u, _ in fake.calls} == {rb.V1_URL.format(day=f"{D3:%Y%m%d}")}
+    assert [d["day"] for d in again["days"]] == [D1.isoformat(), D2.isoformat(), D3.isoformat()]
