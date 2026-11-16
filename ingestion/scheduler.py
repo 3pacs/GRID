@@ -1770,7 +1770,7 @@ def run_daily_pulls(
     from ingestion.market_calendar import is_market_open
 
     if slot is not None:
-        late = _slot_lateness(slot, tz=slot_tz)
+        late = _slot_lateness(slot) if slot_tz is None else _slot_lateness(slot, tz=slot_tz)
         if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
             log.warning(
                 "Skipping the {s} run_daily_pulls slot: released {m:.0f} min late "
