@@ -481,6 +481,19 @@ def test_a_subsidiary_resolves_to_its_listed_parent():
     assert s8._parent("apple hospitality reit", {"apple": "aapl"}) is None  # one-word keys never claim
 
 
+def test_a_listed_company_named_like_a_graph_company_is_not_its_subsidiary():
+    j = universe_job()
+    j.sec_listing = lambda: [("KO", "0000021344", "COCA COLA CO"),
+                             ("COKE", "0000317540", "COCA COLA CONSOLIDATED, INC.")]
+    j.engine.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = [
+        ("ko", "ticker", "Coca-Cola")]
+    j.filer_universe()
+    nid, node = j.resolve_counterparty("Coca-Cola Consolidated, Inc.")
+    assert nid == "coke" and node.type == "ticker"  # its own filer, not KO
+    assert j.resolve_counterparty("The Coca-Cola Company") == ("ko", None)
+    assert j.resolve_counterparty("Coca-Cola Refreshments USA, Inc.") == ("ko", None)  # no filer: the parent
+
+
 # --- Codex recheck of 0240544f (pickup sha256 3aa1c7e5) -------------------------------
 
 
