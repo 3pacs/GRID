@@ -86,7 +86,9 @@ DELISTED: dict[str, str] = {
 
 # Foreign companies whose slug looks like a US symbol (no YF close series under it, 2026-11-13).
 FOREIGN_SLUGS: dict[str, str] = {
+    "byd": "BYD Company (Hong Kong / Shenzhen); US BYD is Boyd Gaming",
     "cmoc": "CMOC Group (Shanghai / Hong Kong)",
+    "csl": "CSL Limited (ASX); US CSL is Carlisle Companies",
     "divis": "Divi's Laboratories (India)",
     "jinko": "JinkoSolar (Shanghai; US ADR delisted)",
     "jsr": "JSR Corporation (Tokyo; taken private)",

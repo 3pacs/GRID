@@ -277,7 +277,6 @@
     {"id": "sbux", "name": "Starbucks", "type": "ticker", "country": "USA"},
     {"id": "bny", "name": "Bank of New York Mellon", "type": "ticker", "country": "USA"},
     {"id": "kfc_parent", "name": "Yum Brands (KFC parent)", "type": "ticker", "country": "USA"},
-    {"id": "kbh", "name": "Keurig Dr Pepper (Keurig pod co-manufacturer)", "type": "ticker", "country": "USA"},
     {"id": "heineken", "name": "Heineken NV", "type": "ticker", "country": "Netherlands"}
   ],
   "edges": [

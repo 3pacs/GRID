@@ -49,6 +49,8 @@ def test_listed_nodes_map_to_their_symbol(node, typ, symbol):
     ("HSY", None, "type unknown"),
     ("lindt", "ticker", "foreign listing"),
     ("trina", "ticker", "foreign listing"),
+    ("byd", "ticker", "foreign listing"),  # US BYD is Boyd Gaming
+    ("csl", "ticker", "foreign listing"),  # US CSL is Carlisle
     ("cyrk", "ticker", "no listing found"),
 ])
 def test_untradable_nodes_carry_a_reason(node, typ, reason):
