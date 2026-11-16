@@ -470,9 +470,10 @@ def test_gkg_groups_match_fips_pairs_exact_names_and_theme_sets():
     stamp = datetime(2026, 11, 13, 12, tzinfo=UTC)
     rows = [
         gkg_row("a", stamp, countries=("US", "CH"), persons=("vladimir putin",), themes=("ECON_INFLATION",), tone="-1"),
-        gkg_row("b", stamp, countries=("US",), allnames=("Xi Jinping",), themes=("WB_442_INFLATION", "SANCTIONS"),
+        gkg_row("b", stamp, countries=("US",), allnames=("Chinese President Xi Jinping", "Maxi Jinpingo"), themes=("WB_442_INFLATION", "SANCTIONS"),
                 tone="-3"),
-        gkg_row("c", stamp, persons=("kimberly powell",), countries=("CH", "TW", "US")),   # not Jerome Powell
+        gkg_row("c", stamp, persons=("kimberly powell",), allnames=("Jerome Powells Bakery",),
+                countries=("CH", "TW", "US")),                     # neither is Jerome Powell
         gkg_row("a", stamp, countries=("US", "CH")),                    # repeated record id: counted once
         gkg_row("d", stamp, ncols=20),                                  # wrong width: rejected
         gkg_row("e", stamp, tone="n/a", persons=("scott bessent",)),   # no tone: counted, not averaged

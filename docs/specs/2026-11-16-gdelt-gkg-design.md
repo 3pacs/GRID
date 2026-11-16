@@ -80,7 +80,7 @@ This answers decision 3. The theme sets are chosen from these counts.
   Every pair is usable daily.
 - **Persons** (exact lower-cased names in Persons; in AllNames for Xi):
   - Putin 1,285 and Bessent 341.
-  - Xi: Persons had none, but AllNames found him (32 documents in 12 files, about 150 a day). He is matched on Persons or AllNames.
+  - Xi: Persons had none. AllNames finds him once the name is matched as whole words inside a titled entry ("Chinese President Xi Jinping"): 212 documents in the end-to-end run of the day. Every person is matched on Persons (exact) or AllNames (whole words).
   - Powell 10 and Lagarde 7.
   - Bin Salman 0 and Ueda 1: **left out**, because a series of zeros says nothing.
   - Kevin Warsh had 42 and Kevin Hassett 16. They are not added: **your call**.

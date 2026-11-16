@@ -687,9 +687,9 @@ GKG_PAIRS: dict[str, tuple[str, str]] = {
     "china_taiwan": ("CH", "TW"), "russia_ukraine": ("RS", "UP"), "israel_iran": ("IS", "IR"),
     "india_china": ("IN", "CH"),
 }
-#: Exact lower-cased names in Persons or AllNames. Measured 2026-11-13: putin 1,285 docs,
+#: Exact lower-cased names in Persons, or the name as whole words in an AllNames entry. Measured 2026-11-13: putin 1,285 docs,
 #: bessent 341 (Treasury Secretary, replaces the DOC list's Yellen: Anik, 2026-11-16),
-#: xi ~150 (only AllNames finds him: Persons had none), powell 10, lagarde 7.
+#: xi 212 (only AllNames finds him: Persons had none), powell 10, lagarde 7.
 #: Bin Salman (0) and Ueda (1) were left out: a series of zero counts says nothing.
 GKG_PERSONS: dict[str, tuple[str, ...]] = {
     "powell": ("jerome powell", "jay powell"),
@@ -798,9 +798,12 @@ def _gkg_groups(rec: list[str]) -> list[str]:
     countries = {loc.split("#")[2] for loc in (rec[GKG_COL_V2LOCATIONS] or rec[GKG_COL_LOCATIONS]).split(";")
                  if loc.count("#") >= 2}
     out += [f"pair_{k}" for k, (a, b) in GKG_PAIRS.items() if a in countries and b in countries]
-    names = {n.strip().lower() for n in rec[GKG_COL_PERSONS].split(";") if n.strip()}
-    names |= {n.rsplit(",", 1)[0].strip().lower() for n in rec[GKG_COL_ALLNAMES].split(";") if n.strip()}
-    out += [f"person_{k}" for k, aliases in GKG_PERSONS.items() if names.intersection(aliases)]
+    persons = {n.strip().lower() for n in rec[GKG_COL_PERSONS].split(";") if n.strip()}
+    # AllNames entries carry titles ("President Xi Jinping"): an alias matches as whole words.
+    allnames = [f" {' '.join(n.rsplit(',', 1)[0].lower().split())} " for n in rec[GKG_COL_ALLNAMES].split(";")
+                if n.strip()]
+    out += [f"person_{k}" for k, aliases in GKG_PERSONS.items()
+            if persons.intersection(aliases) or any(f" {a} " in n for a in aliases for n in allnames)]
     themes = {t for t in rec[GKG_COL_THEMES].split(";") if t}
     out += [f"theme_{k}" for k, codes in GKG_THEMES.items() if themes & codes]
     return out
