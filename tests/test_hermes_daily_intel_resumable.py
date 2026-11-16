@@ -773,6 +773,7 @@ class TestRealTaskTableSanity:
             "attention_anomaly",
             "edgar_transcripts",
             "corporate_actions",
+            "supply_chain_8k",
             "capital_flow_rollups",
             "fundamental_divergence",
             "holder_deal_overlap",
@@ -820,6 +821,8 @@ class TestDailyIntelAllowlistClassification:
             # live grid-flow-materializer.timer (separate process, every
             # 30 min, old checkout) writes the same keys
             "flow_materialize",
+            # LLM-extracted supply-chain edges, awaiting owner release (#1180)
+            "supply_chain_8k",
         }
         assert set(ho.DAILY_INTEL_HOLD_REASONS) == expected_holds
 
@@ -1191,7 +1194,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
         assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 9
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 12
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 13
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -1215,7 +1218,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 12, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 13, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []

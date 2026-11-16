@@ -89,23 +89,36 @@ def test_a_failed_fetch_of_one_filing_still_reads_the_other(parser, monkeypatch)
 
 def test_contagion_uses_derived_edges_only_after_validation():
     engine = create_engine("sqlite://")
+    k8 = "8-K 2026-11-12 TSM Item 1.01 https://www.sec.gov/Archives/edgar/data/1046179/000104617926000001/a.htm"
+    k10 = "10-K 2026 TSM concentration https://www.sec.gov/Archives/edgar/data/1046179/000104617926000002/b.htm"
     with engine.begin() as conn:
         conn.execute(text(
             "create table supply_chain_edges (upstream_id text, downstream_id text, relationship text,"
             " input_type text, annual_usd real, pct_downstream_cogs real, chokepoint_score real,"
-            " confidence text, last_validation_at text, relationship_weak boolean)"))
+            " confidence text, last_validation_at text, relationship_weak boolean, source text)"))
+        conn.execute(text("create table supply_chain_nodes (id text, type text)"))
+        for nid, typ in [("tsmc", "ticker"), ("aapl", "ticker"), ("openai", "private_company"),
+                         ("cargill", "private_company")]:
+            conn.execute(text("insert into supply_chain_nodes values (:i, :t)"), {"i": nid, "t": typ})
         rows = [
-            ("confirmed_unchecked", "confirmed", None, None),
-            ("derived_unchecked", "derived", None, None),
-            ("derived_checked", "derived", "2026-11-15", False),
-            ("derived_weak", "derived", "2026-11-15", True),
-            ("derived_checked_null_weak", "derived", "2026-11-15", None),
-            ("backtest_tier", "derived_from_backtest", None, None),
+            ("confirmed_unchecked", "confirmed", None, None, ""),
+            ("derived_unchecked", "derived", None, None, ""),
+            ("derived_checked", "derived", "2026-11-15", False, ""),
+            ("derived_weak", "derived", "2026-11-15", True, ""),
+            ("derived_checked_null_weak", "derived", "2026-11-15", None, ""),
+            ("backtest_tier", "derived_from_backtest", None, None, ""),
+            # 8-K edge to a private company: the validator cannot price it; it joins on its citation
+            ("openai", "derived", None, None, k8),
+            # 8-K edge between two listed nodes: waits for the validator like any derived edge
+            ("aapl", "derived", None, None, k8),
+            # 10-K regex edge to a private company: still out
+            ("cargill", "derived", None, None, k10),
         ]
-        for down, conf, checked, weak in rows:
+        for down, conf, checked, weak, src in rows:
             conn.execute(text(
                 "insert into supply_chain_edges values ('tsmc', :d, 'supplier', null, null, null, null,"
-                " :c, :v, :w)"), {"d": down, "c": conf, "v": checked, "w": weak})
+                " :c, :v, :w, :s)"), {"d": down, "c": conf, "v": checked, "w": weak, "s": src})
     with engine.connect() as conn:
         got = sorted(e["downstream_id"] for e in cc._fetch_downstream_edges(conn, "tsmc"))
-    assert got == ["backtest_tier", "confirmed_unchecked", "derived_checked", "derived_checked_null_weak"]
+    assert got == ["backtest_tier", "confirmed_unchecked", "derived_checked", "derived_checked_null_weak",
+                   "openai"]

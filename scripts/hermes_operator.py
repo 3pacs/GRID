@@ -1962,6 +1962,18 @@ def _daily_intel_corporate_actions(
     )
 
 
+def _daily_intel_supply_chain_8k(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Supplier/customer links from 8-K Item 1.01 filings (3pacs/GRID#1180):
+    EDGAR's daily form index, keyword screen, local-GPU extraction, cited
+    'derived' edges that contagion uses only after validation. Stops within
+    its own 150 s budget and resumes from its checkpoint."""
+    from ingestion.altdata.supply_chain_8k import run_daily
+
+    results["supply_chain_8k"] = run_daily(engine)
+
+
 def _daily_intel_capital_flow_rollups(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -2162,6 +2174,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("supply_chain_8k", _daily_intel_supply_chain_8k, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
@@ -2331,6 +2344,14 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "uses llm.router Tier.REASON (and a local Gemma extractor) to "
         "extract guidance/milestone figures and inserts them as raw_series "
         "data points, not just audit metadata"
+    ),
+    "supply_chain_8k": (
+        "LLM-driven write awaiting owner release (3pacs/GRID#1180, 2026-11-13): "
+        "ingestion/altdata/supply_chain_8k.py asks a local GPU model (never a paid "
+        "provider) who supplies whom in 8-K Item 1.01 text and upserts "
+        "supply_chain_nodes/supply_chain_edges rows as confidence 'derived', each "
+        "citing its filing URL and a verbatim quote; contagion ignores them until "
+        "the edge validator has measured them"
     ),
     "insight_cleanup": (
         "held for the initial subset by the controller (2026-09-20): file "

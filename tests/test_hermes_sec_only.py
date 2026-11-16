@@ -640,10 +640,17 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # edit plus #1182's two _run_intel_task calls appended to the Sunday
         # weekly block (supply_chain_parser.run_weekly,
         # supply_chain_edge_validator.run_weekly) with their comment.
+        # Then 58d56e41 -> afc60c8e (2026-11-15, feat/supply-chain-8k-20261113,
+        # 3pacs/GRID#1180/#1188): adds a _daily_intel_supply_chain_8k wrapper
+        # (calls ingestion.altdata.supply_chain_8k.run_daily), its
+        # DAILY_INTEL_TASKS entry after corporate_actions, and a
+        # DAILY_INTEL_HOLD_REASONS entry: the task is held (not in
+        # DAILY_INTEL_INITIAL_ALLOWLIST), so nothing new runs until the owner
+        # releases it.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','58d56e4108958d68bcdaa11754c43ee9a40252d306140661cc357c9f6c056a59'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','afc60c8e00f280b0428b29e8dd8ca653c99493696e6c6b10148c5f4a2df7ff75'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
