@@ -25,12 +25,14 @@ When a day is known (PIT)
 A file's publication instant is its HTTP ``Last-Modified`` header (measured:
 a median of 11 minutes *before* the stamp, but one file of 2026-11-15 went up
 98 minutes after it), else the instant GRID fetched it, which is never
-earlier. A day is known when its last file is published, so its summary and
-features carry ``release_date = vintage_date =`` the UTC date of the latest
-publication instant among its files -- never ``obs_date`` copied over. That
-is usually D itself (the 23:45 file goes up near 23:35 UTC) and D+1 whenever a
-late file crosses midnight; ``store.pit`` reads a date as "known by the end of
-that UTC day".
+earlier. A day is known when its last file is published. ``store.pit`` reads
+a date as "known by the end of that UTC day", and GRID's rule for this source
+(Anik, 2026-11-16) is that ``release_date`` never equals ``obs_date``: a day's
+summary and features carry ``release_date = vintage_date =`` the later of D+1
+and the UTC date of the latest publication instant among its files. The 23:45
+file usually goes up near 23:35 UTC on D, so that is D+1; a file published two
+days late moves the day to D+2. GDELT 1.0's daily file for D, the history
+source, is published about 07:00 UTC on D+1, so both are dated alike.
 
 Idempotency and resume
 ----------------------
@@ -190,6 +192,11 @@ def published_at(last_modified: str | None, fetched_at: datetime) -> tuple[datet
 
 
 # --- parsing --------------------------------------------------------------------------
+
+
+def release_day(obs_day: date, published: datetime) -> date:
+    """The date a day's points are known: the later of D+1 and the publication date, never D."""
+    return max(obs_day + timedelta(days=1), published.astimezone(timezone.utc).date())
 
 
 @dataclass
@@ -521,9 +528,10 @@ class GdeltBulkLoader:
             summary.days_finalised.append(day.isoformat())
             if published is None:
                 return
-            known = published.astimezone(timezone.utc).date()
-            if known > day:
+            published_day = published.astimezone(timezone.utc).date()
+            if published_day > day:
                 summary.late_days.append(day.isoformat())
+            known = release_day(day, published)
             for name, value in values.items():
                 hit = conn.execute(text(
                     "INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "

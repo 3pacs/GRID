@@ -2393,7 +2393,7 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "ingestion/altdata/gdelt_bulk.py::run_daily -- no LLM -- inserts "
         "gdelt_events (duplicates skipped), gdelt_export_files and "
         "gdelt_daily_summary rows and the 12 gdelt_* daily feature points, "
-        "each dated by the UTC date GDELT published the day's last file. "
+        "each dated D+1 or the UTC date GDELT published the day's last file, if later. "
         "Its only other caller is the "
         "operator CLI (python -m ingestion.altdata.gdelt_bulk), serialised "
         "with it by a pg advisory lock"

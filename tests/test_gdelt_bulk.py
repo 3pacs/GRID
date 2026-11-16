@@ -251,8 +251,8 @@ def test_a_full_day_loads_and_is_dated_by_its_last_publication(engine):
 
     got = features(engine)
     assert set(got) == set(gb.FEATURES)
-    # Every point: observed on D, known on the UTC date of D's last publication (here D itself).
-    assert {v[:3] for v in got.values()} == {(DAY, DAY, DAY)}
+    # Every point: observed on D, known on D+1 although D's last file went up on D (never release = obs).
+    assert {v[:3] for v in got.values()} == {(DAY, DAY + timedelta(days=1), DAY + timedelta(days=1))}
     assert got["gdelt_total_events"][3] == 192.0 and got["gdelt_events_cn"][3] == 96.0
     assert scalar(engine, "SELECT count(*) FROM gdelt_daily_summary WHERE summary_date < :d", d=DAY) == 1
 
@@ -267,6 +267,24 @@ def test_a_file_published_after_midnight_moves_the_whole_day_to_the_next_date(en
     s = gb.GdeltBulkLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
     assert s.late_days == [DAY.isoformat()]
     assert {v[1:3] for v in features(engine).values()} == {(DAY + timedelta(days=1),) * 2}
+
+
+def test_a_file_published_two_days_late_moves_the_day_to_that_date(engine):
+    legacy_day(engine, DAY - timedelta(days=1))
+    fake = FakeGdelt(NEWEST)
+    fake.add_day(DAY)
+    last = gb.day_stamps(DAY)[-1]
+    fake.put(last, export_zip(last, [export_row(9_000_001, last)]), last + timedelta(hours=25))
+    s = gb.GdeltBulkLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
+    assert s.late_days == [DAY.isoformat()]
+    assert {v[1:3] for v in features(engine).values()} == {(DAY + timedelta(days=2),) * 2}
+
+
+def test_release_day_is_never_the_observed_day():
+    d = date(2026, 11, 15)
+    assert gb.release_day(d, datetime(2026, 11, 15, 23, 34, tzinfo=UTC)) == date(2026, 11, 16)
+    assert gb.release_day(d, datetime(2026, 11, 14, 23, 0, tzinfo=UTC)) == date(2026, 11, 16)
+    assert gb.release_day(d, datetime(2026, 11, 17, 0, 5, tzinfo=UTC)) == date(2026, 11, 17)
 
 
 def test_without_last_modified_the_fetch_instant_dates_the_day(engine):
@@ -348,8 +366,8 @@ def test_an_existing_point_for_the_same_vintage_is_kept_and_reported(engine):
     with engine.begin() as conn:
         src, ids = loader._registry(conn)
         conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
-                          "source_priority_used) VALUES (:f, :d, :d, :d, 1.0, :s)"),
-                     {"f": ids["gdelt_conflict_count"], "d": DAY, "s": src})
+                          "source_priority_used) VALUES (:f, :d, :k, :k, 1.0, :s)"),
+                     {"f": ids["gdelt_conflict_count"], "d": DAY, "k": DAY + timedelta(days=1), "s": src})
     s = loader.run(write=True, budget_seconds=None)
     assert s.features_written == 11 and s.features_skipped_existing == 1
     assert features(engine)["gdelt_conflict_count"][3] == 1.0
