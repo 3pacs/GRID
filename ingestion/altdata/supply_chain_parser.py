@@ -391,6 +391,16 @@ def company_key(name: str) -> str:
     return re.sub(r"\s+", " ", _LEGAL_SUFFIX.sub(" ", s)).strip()
 
 
+def ensure_checkpoint_dir(path: Path) -> None:
+    """Create the directory ``path`` is written into.
+
+    ``outputs/supply_chain`` is a tracked symlink into ``/data/grid/outputs``
+    so checkpoints outlive release swaps; ``mkdir`` on the link itself fails
+    while its target is missing, so the target is created instead.
+    """
+    path.parent.resolve().mkdir(parents=True, exist_ok=True)
+
+
 def _clean_name(raw: str) -> str:
     name = raw.strip()
     name = re.sub(r"[\s]+", " ", name)
@@ -1000,7 +1010,7 @@ class SupplyChain10KParser:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
             }
-            _CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            ensure_checkpoint_dir(_CHECKPOINT_PATH)
             tmp = _CHECKPOINT_PATH.with_name(_CHECKPOINT_PATH.name + ".tmp")
             tmp.write_text(json.dumps(payload, indent=2))
             tmp.replace(_CHECKPOINT_PATH)  # atomic: a crash mid-write never loses the progress

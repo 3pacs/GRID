@@ -647,10 +647,14 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # DAILY_INTEL_HOLD_REASONS entry: the task is held (not in
         # DAILY_INTEL_INITIAL_ALLOWLIST), so nothing new runs until the owner
         # releases it.
+        # Then afc60c8e -> c119f620 (2026-11-16, feat/release-supply-chain-8k-20261116,
+        # 3pacs/GRID#1180): the owner releases supply_chain_8k — its name moves
+        # from DAILY_INTEL_HOLD_REASONS into DAILY_INTEL_INITIAL_ALLOWLIST with
+        # a comment; no code path changes.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','afc60c8e00f280b0428b29e8dd8ca653c99493696e6c6b10148c5f4a2df7ff75'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','c119f62092a283f880ad9d63ce90ab0a2e3944478178e9115b8d543c46730a60'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
