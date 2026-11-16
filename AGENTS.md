@@ -489,6 +489,28 @@ See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits
 - No production/holdout access, provider request, credential/service change,
   merge or apply. Anik retains release authority.
 
+### Same task - close the real PostgreSQL and HTTP qualification gaps
+
+- Reconciled retained Claude ACCEPT_WITH_NOTES and green exact-head CI on
+  9efefc1b. Fresh main c24b418b and current #1226 216714b7 each gave clean
+  non-mutating merge-tree analysis; no combined #1226 changes were published.
+- A real run in a uniquely named database on an already-running local test
+  PostgreSQL container reached Surfacer after passing migration retry,
+  producer upsert, legacy preservation and resolved lineage. It exposed a
+  fixture-only missing created_at column (present in the declared schema).
+  Added that column to the fixture. The failed run and verified database
+  cleanup are retained in the v3 qualification evidence, not overwritten.
+- Added six in-process ASGI HTTP regressions. All six pass with outbound
+  socket connections blocked. The earlier hang was independently reproduced
+  by a trivial worker-thread control: the restrictive sandbox denies AsyncIO's
+  self-pipe socket.send. HTTP runs outside that restriction need no server.
+  Successful-auth routing uses a synthetic override; unauthenticated routing
+  is tested without it. Deployed app/auth-store acceptance remains separate.
+- Qualification-only tests/documentation delta; no provider or IV calculation
+  implementation, migration DDL, historical data or holdout changes. New-head
+  CI and the existing verifier's updated disposition remain separate from the
+  old accepted-head evidence. No new Claude handoff or release action.
+
 ## 2026-11-14 — Integrate accepted offline NVDA desk report
 
 Additive #1085 report mode joins the existing frozen ledger, historical cash

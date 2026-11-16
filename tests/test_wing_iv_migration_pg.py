@@ -46,6 +46,7 @@ def test_nullable_migration_and_actual_producer_upsert_preserve_legacy(capture_p
                 total_volume BIGINT, near_expiry DATE, spot_price DOUBLE PRECISION,
                 iv_atm DOUBLE PRECISION, iv_25d_put DOUBLE PRECISION, iv_25d_call DOUBLE PRECISION,
                 term_structure_slope DOUBLE PRECISION, oi_concentration DOUBLE PRECISION,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(ticker, signal_date))""")
             conn.exec_driver_sql("""CREATE TABLE resolved_series (
                 feature_id INTEGER, obs_date DATE, release_date DATE, vintage_date DATE,

@@ -135,6 +135,15 @@ and the actual producer upsert against a randomly scoped, disposable loopback
 PostgreSQL schema, proving old values survive. It only accepts an explicit
 `GRID_WING_IV_TEST_DSN` for a database named `grid_wing_iv_test_*`.
 
+`tests/test_wing_iv_http.py` exercises the registered FastAPI HTTP route,
+synchronous dependencies/endpoint, auth rejection and JSON response through
+an in-process ASGI transport, with outbound socket connections blocked. Its
+successful-auth case uses an explicit synthetic dependency override; it does
+not exercise a real user store, app startup, proxy or deployed service. AsyncIO
+requires its local self-pipe IPC: a sandbox that denies even that `socket.send`
+will stall the worker-thread completion, independently of this endpoint. Run
+that test in an environment permitting local IPC; no HTTP server is required.
+
 Anik applies releases. After review, the additive migration must precede code
 that selects/writes the new columns; deploy API and UI together. A pre-migration
 API query fails unavailable instead of substituting legacy wings. Rollback may
