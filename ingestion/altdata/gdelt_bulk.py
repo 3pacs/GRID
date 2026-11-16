@@ -109,6 +109,9 @@ COL_NUMSOURCES = 32
 COL_NUMARTICLES = 33
 COL_AVGTONE = 34
 COL_DATEADDED = 59
+#: GDELT 1.0 daily export (history): 58 columns, DATEADDED (YYYYMMDD) in col 56.
+V1_EXPORT_COLUMNS = 58
+V1_COL_DATEADDED = 56
 
 #: Feature suffix -> CAMEO actor country code. Actor*CountryCode holds CAMEO
 #: three-letter codes ("USA"); scripts/parse_gdelt.py compared them with
@@ -254,22 +257,47 @@ def _float(raw: str) -> float | None:
         return None
 
 
+def _zip_member(data: bytes, label: str) -> bytes:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+        members = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+        if len(members) != 1:
+            raise GdeltBulkError(f"{label}: expected one CSV member, found {members}")
+        return archive.read(members[0])
+    except zipfile.BadZipFile as exc:
+        raise GdeltBulkError(f"{label}: not a zip archive ({exc})") from exc
+
+
 def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
     """Rows for ``gdelt_events`` and the file's aggregate.
 
     Rows with the wrong column count, or an unreadable event id or SQLDATE,
     are rejected and counted. Duplicated event ids keep their first row.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-        members = [n for n in archive.namelist() if n.lower().endswith(".csv")]
-        if len(members) != 1:
-            raise GdeltBulkError(f"{format_stamp(stamp)}: expected one CSV member, found {members}")
-        payload = archive.read(members[0])
-    except zipfile.BadZipFile as exc:
-        raise GdeltBulkError(f"{format_stamp(stamp)}: not a zip archive ({exc})") from exc
+    payload = _zip_member(data, format_stamp(stamp))
+    return _parse_events(payload, columns=EXPORT_COLUMNS, dateadded_col=COL_DATEADDED,
+                         dateadded_text=format_stamp(stamp), date_added=stamp, keep_rows=True)
 
-    stamp_text = format_stamp(stamp)
+
+def parse_daily_v1(data: bytes, day: date) -> ParsedFile:
+    """Aggregate of a GDELT 1.0 daily export (``YYYYMMDD.export.CSV.zip``), no rows kept.
+
+    GDELT 1.0 rows have 58 columns: the 2.0 layout up to AvgTone (col 34),
+    one ADM2 code fewer in each of the three geography blocks, DATEADDED
+    (``YYYYMMDD``) in col 56. Measured 2026-11-16 on 2016-03-15, 2025-06-10
+    and 2026-11-15: the daily file for D holds exactly the events of the 96
+    GDELT 2.0 files stamped D (239,103 / 140,233 / 61,540 ids, none extra on
+    either side), so a day built from it continues the loader's day without a
+    seam.
+    """
+    payload = _zip_member(data, day.strftime("%Y%m%d"))
+    return _parse_events(payload, columns=V1_EXPORT_COLUMNS, dateadded_col=V1_COL_DATEADDED,
+                         dateadded_text=day.strftime("%Y%m%d"), date_added=None, keep_rows=False)
+
+
+def _parse_events(payload: bytes, *, columns: int, dateadded_col: int, dateadded_text: str,
+                  date_added: datetime | None, keep_rows: bool) -> ParsedFile:
+    stamp_text = dateadded_text
     rows: list[dict[str, Any]] = []
     seen: set[int] = set()
     agg = FileAggregate()
@@ -277,7 +305,7 @@ def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
     reader = csv.reader(io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8", errors="replace"),
                         delimiter="\t", quoting=csv.QUOTE_NONE)
     for rec in reader:
-        if len(rec) != EXPORT_COLUMNS:
+        if len(rec) != columns:
             rejected += 1
             continue
         event_id = _int(rec[COL_GLOBALEVENTID])
@@ -291,7 +319,7 @@ def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
         if event_id in seen:
             continue
         seen.add(event_id)
-        if rec[COL_DATEADDED] != stamp_text:
+        if rec[dateadded_col] != stamp_text:
             mismatch += 1
         a1 = rec[COL_ACTOR1COUNTRYCODE][:3] or None
         a2 = rec[COL_ACTOR2COUNTRYCODE][:3] or None
@@ -299,14 +327,15 @@ def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
         goldstein = _float(rec[COL_GOLDSTEINSCALE])
         mentions = _int(rec[COL_NUMMENTIONS])
         tone = _float(rec[COL_AVGTONE])
-        rows.append({
-            "global_event_id": event_id, "event_date": event_date,
-            "actor1_country": a1, "actor2_country": a2,
-            "event_root_code": rec[COL_EVENTROOTCODE][:4] or None,
-            "quad_class": quad, "goldstein_scale": goldstein, "num_mentions": mentions,
-            "num_sources": _int(rec[COL_NUMSOURCES]), "num_articles": _int(rec[COL_NUMARTICLES]),
-            "avg_tone": tone, "date_added": stamp,
-        })
+        if keep_rows:
+            rows.append({
+                "global_event_id": event_id, "event_date": event_date,
+                "actor1_country": a1, "actor2_country": a2,
+                "event_root_code": rec[COL_EVENTROOTCODE][:4] or None,
+                "quad_class": quad, "goldstein_scale": goldstein, "num_mentions": mentions,
+                "num_sources": _int(rec[COL_NUMSOURCES]), "num_articles": _int(rec[COL_NUMARTICLES]),
+                "avg_tone": tone, "date_added": date_added,
+            })
         agg.events += 1
         if quad in (3, 4):
             agg.conflict += 1

@@ -1,6 +1,6 @@
 # GDELT event features: historical rows to correct (proposal, nothing written)
 
-Status: **proposal, awaiting Anik's choice.** Nothing below has been written. The measurements were read-only against griddb on grid-svr, 2026-11-16 (PGOPTIONS `default_transaction_read_only=on`).
+Status: **Anik chose option B (2026-11-16).** The script is `scripts/rebuild_gdelt_history.py` (`plan` is read-only; `apply` snapshots, copies, deletes and rebuilds in one transaction). Nothing is written until `apply` runs on Anik's word. Measured since: GDELT 1.0's daily file equals the day's 96 GDELT 2.0 files on 2016-03-15 (239,103 ids) and 2025-06-10 (140,233) as well as 2026-11-15; GDELT published nothing from 2025-06-14 17:45 to 2025-07-01, so those days stay empty. The measurements were read-only against griddb on grid-svr, 2026-11-16 (PGOPTIONS `default_transaction_read_only=on`).
 
 Context: slice 2 of moving GDELT onto its bulk files. Slice 1 (3pacs/GRID#1232) loads 2026-03-20 onward, dated by publication. This document covers the rows already in `resolved_series`.
 
