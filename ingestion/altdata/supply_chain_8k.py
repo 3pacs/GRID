@@ -99,9 +99,6 @@ _FINANCIAL_PARTY = re.compile(
 KIND_RELATIONSHIP = {"supply": "component", "services": "component", "manufacturing": "contract_mfg",
                      "distribution": "distribution", "license": "licensor"}
 _THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
-_LEGAL_SUFFIX = re.compile(
-    r"\b(inc|incorporated|corp|corporation|co|company|companies|ltd|limited|plc|llc|lp|l p|holdings?|group|"
-    r"s a s|sas|s a|sa|n v|nv|ag|se|pbc|the)\b")
 
 PROMPT_SYSTEM = (
     "You read the Item 1.01 section of an SEC 8-K. Reply with ONE JSON object and nothing else: "
@@ -199,10 +196,7 @@ def parse_ticker_list(resp: Any) -> list[tuple[str, str, str]]:
     return out
 
 
-def company_key(name: str) -> str:
-    """Comparable company name: ``The Boeing Company`` and ``BOEING CO`` both give ``boeing``."""
-    s = re.sub(r"[^a-z0-9&]+", " ", (name or "").lower().replace("\u2019", "'").replace("'s", "s"))
-    return re.sub(r"\s+", " ", _LEGAL_SUFFIX.sub(" ", s)).strip()
+company_key = scp.company_key  # shared with the 10-K parser
 
 
 def _norm(s: str) -> str:

@@ -133,6 +133,7 @@ def job(monkeypatch, tmp_path):
     parser = scp.SupplyChain10KParser.__new__(scp.SupplyChain10KParser)
     parser.seed_node_ids = {"dal", "ba", "akam"}
     parser.name_to_node_id = {}
+    parser._name_keys, parser._name_key_is_ticker = {}, {}
     parser._ticker_to_node = {"DAL": "dal", "BA": "ba", "AKAM": "akam"}
     parser._upsert_node = MagicMock(return_value=True)
     parser._upsert_edge = MagicMock(return_value=True)
