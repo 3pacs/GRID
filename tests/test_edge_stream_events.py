@@ -77,9 +77,27 @@ def ec1_item(tickers=TICKERS, lane="history") -> dict:
     return {"family": "EC1", "group": "sp500_events", "instruments": tuple(tickers), "lane": lane}
 
 
-def v1_payload() -> dict:
-    """The policy before this change: no sp500_events group, tier or multiday section."""
+V2_RULE = ("per calendar year (UTC): q_year over at most max_registrations stage-1 registrations; "
+           "each look alpha_per_look, Bonferroni over its trials; abandoned registrations count; "
+           "confirmations (forward, after a stage-1 PASS) at confirm_alpha/k outside the yearly count")
+
+
+def v2_payload() -> dict:
+    """Policy 2: the single 0.00125 stage-1 bar, before the two-stage evidence bar."""
     pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    pol.pop("owner_decisions")
+    pol.pop("evidence_bar")
+    pol["budget"].update(alpha_per_look=0.00125, rule=V2_RULE)
+    for k in ("largest_year_out", "year_out_n_min", "noise_unit"):
+        pol["pass_test"].pop(k)
+    pol["promotion"] = "never: a confirmed PASS is a candidate report; trading needs Anik's explicit go"
+    pol["policy_version"] = "edge-stream-policy/2"
+    return pol
+
+
+def v1_payload() -> dict:
+    """Policy 1: policy 2 without the sp500_events group, its tier and the multiday section."""
+    pol = v2_payload()
     names = set(pol["groups"].pop("sp500_events"))
     pol["liquidity"] = {t: v for t, v in pol["liquidity"].items() if t not in names}
     pol["cost_floors"].pop("large_cap")
@@ -113,13 +131,15 @@ def test_universe_is_the_membership_file_on_its_date_minus_the_stated_names():
 
 
 def test_v2_only_tightens_v1_and_loosening_is_named():
-    old, new = v1_payload(), P.policy_payload()
+    old, new = v1_payload(), v2_payload()
     assert P.tightening_violations(old, new) == []
     assert "policy_version unchanged" in P.tightening_violations(new, new)
+    # the live ledger's genesis policy and the policy 2 of this branch's parent, byte for byte
+    assert L.sha256_bytes(P.canonical_bytes(old)).startswith("c1005e96")
 
     def changed(**edit):
         pol = json.loads(P.canonical_bytes(new))
-        pol["policy_version"] = "edge-stream-policy/3"
+        pol["policy_version"] = "edge-stream-policy/9"
         for path, value in edit.items():
             node = pol
             *head, last = path.split("__")
@@ -164,7 +184,7 @@ def test_amendment_is_recorded_once_and_registrations_follow_it(monkeypatch):
 def test_a_loosening_code_policy_is_refused_and_nothing_registers(monkeypatch, tmp_path):
     led = L.memory()
     loose = json.loads(P.canonical_bytes(P.policy_payload()))
-    loose["policy_version"] = "edge-stream-policy/3"
+    loose["policy_version"] = "edge-stream-policy/4"
     loose["budget"]["alpha_per_look"] = 0.05
     monkeypatch.setattr(P, "policy_payload", lambda: loose)
     with pytest.raises(L.StreamRefused, match="loosens the policy"):
@@ -193,6 +213,168 @@ def test_cycle_amends_the_live_v1_ledger_before_it_registers(monkeypatch, tmp_pa
     assert s["registered"][0]["proposal_id"] == "EC1-v1:sp500_events:history:2026-01-02"
     kinds = [r.get("kind") for r in led.records[1:]]
     assert kinds == [L.POLICY_KIND, L.AMENDMENT_KIND, L.REGISTRATION_KIND]
+
+
+# --- policy 3: the two-stage evidence bar (owner decision GRID#1213) ------------------
+
+
+def test_policy_3_changes_only_what_the_owner_decision_waives():
+    new = P.policy_payload()
+    assert new["policy_version"] == "edge-stream-policy/3" and new["evidence_bar"]["version"] == P.EVIDENCE_BAR
+    b = new["budget"]
+    assert b["alpha_per_look"] == pytest.approx(0.025)
+    assert b["max_registrations_per_year"] * b["alpha_per_look"] * b["confirm_alpha"] == pytest.approx(b["q_year"])
+    for old in (v1_payload(), v2_payload()):  # the live ledger is on 1; this branch's parent is 2
+        assert sorted(P.tightening_violations(old, new)) == [
+            "budget.alpha_per_look raised or missing", "budget.rule changed", "promotion changed"]
+        assert P.amendment_violations(old, new) == []
+    decision, = new["owner_decisions"]
+    assert decision["id"] == "GRID#1213" and sorted(decision["waives"]) == [
+        "budget.alpha_per_look", "budget.rule", "promotion"]
+
+
+def test_an_owner_decision_cannot_be_stretched():
+    old = v2_payload()
+
+    def refused(mutate) -> list[str]:
+        pol = json.loads(P.canonical_bytes(P.policy_payload()))
+        mutate(pol)
+        return P.amendment_violations(old, pol)
+
+    # the same change without the decision is a loosening
+    assert "budget.alpha_per_look raised or missing" in refused(lambda p: p.pop("owner_decisions"))
+    # a decision waives only what it names, and can only name the few waivable fields
+    assert refused(lambda p: p["cost_floors"].update(liquid={"usd": 0.0, "bp": 0.0})) == [
+        "cost floor liquid lowered or removed"]
+    assert refused(lambda p: p["budget"].update(max_registrations_per_year=80)) == [
+        "budget.max_registrations_per_year raised or missing",
+        "budget: max_registrations x alpha_per_look x confirm_alpha exceeds q_year"]
+    assert refused(lambda p: p["owner_decisions"][0]["waives"].append("cost_floors")) == [
+        "owner decision GRID#1213 waives what no decision can change: cost_floors",
+        "budget.alpha_per_look raised or missing", "budget.rule changed", "promotion changed"]
+    assert "owner decision GRID#1213 is incomplete" in refused(lambda p: p["owner_decisions"][0].pop("url"))
+    assert "owner decision GRID#1213 is incomplete" in refused(
+        lambda p: p["owner_decisions"][0].update(text_sha256="not-a-hash"))
+    # the yearly budget holds whatever a decision waives
+    assert refused(lambda p: p["budget"].update(alpha_per_look=0.05)) == [
+        "budget: max_registrations x alpha_per_look x confirm_alpha exceeds q_year"]
+    # once recorded, a decision is never edited or dropped, and a later version needs its own
+    cur = P.policy_payload()
+    later = json.loads(P.canonical_bytes(cur))
+    later["policy_version"] = "edge-stream-policy/4"
+    assert P.amendment_violations(cur, later) == []
+    later["owner_decisions"] = []
+    assert P.amendment_violations(cur, later) == ["an owner decision was removed or edited"]
+    later = json.loads(P.canonical_bytes(cur))
+    later["policy_version"] = "edge-stream-policy/4"
+    later["budget"]["alpha_per_look"] = 0.03  # the recorded decision does not cover a second loosening
+    assert "budget.alpha_per_look raised or missing" in P.amendment_violations(cur, later)
+
+
+def test_registrations_sealed_under_policy_1_replay_on_their_own_terms(monkeypatch):
+    old = v1_payload()
+    with monkeypatch.context() as m:  # a stage-1 registration and its look, sealed at 0.00125
+        m.setattr(P, "policy_payload", lambda: old)
+        m.setattr(P, "policy_sha256", lambda: L.sha256_bytes(P.canonical_bytes(old)))
+        m.setattr(P, "ALPHA_PER_LOOK", 0.00125)
+        m.setattr(P, "EVIDENCE_BAR", None)
+        led = L.memory("2026-11-13T06:27:00+00:00")
+        prop = F.build_proposal({"family": "IM1", "group": "metals", "instruments": ("GLD", "SLV"),
+                                 "lane": "history"}, date(2026, 11, 13))
+        prop.pop("evidence_bar")
+        report = S.check(prop, L.load_state(led), date(2026, 11, 13))
+        assert S.passed(report), report
+        old_sha = L.append_registration(led, {**prop, "sanity": report, "recorded_at": "2026-11-13T11:05:00+00:00"})
+        L.append_look(led, old_sha, {"verdict": "FAIL", "trials": [{"trial_id": "pooled", "verdict": "FAIL"}],
+                                     "data": {"window_end": "2026-11-13"}, "report_sha256": "0" * 64})
+    assert L.amend_policy(led, "code policy edge-stream-policy/3", NOW.isoformat())
+    state = L.load_state(led)  # the 0.00125 registration is still valid under the policy it was sealed with
+    assert state.registrations[old_sha]["alpha_look"] == pytest.approx(0.00125)
+    assert state.policy["policy_version"] == "edge-stream-policy/3" and state.closed_families() == {}
+    new = F.build_proposal({"family": "IM1", "group": "energy", "instruments": ("USO", "UNG"), "lane": "history"},
+                           TODAY)
+    report = S.check(new, state, TODAY)
+    assert S.passed(report), report
+    sha = L.append_registration(led, {**new, "sanity": report, "recorded_at": NOW.isoformat()})
+    reg = L.load_state(led).registrations[sha]
+    assert reg["alpha_look"] == pytest.approx(0.025) and reg["evidence_bar"] == P.EVIDENCE_BAR
+    # a registration at the retired level, or without the bar in force, is refused from here on
+    again = F.build_proposal({"family": "IM1", "group": "fx", "instruments": ("FXE", "FXY", "UUP"),
+                              "lane": "history"}, TODAY + timedelta(days=1))
+    stamp = {"sanity": {"G": "ok"}, "recorded_at": (NOW + timedelta(days=1)).isoformat()}
+    with pytest.raises(L.StreamRefused, match="wrong alpha for stage 1"):
+        L.append_registration(led, {**again, **stamp, "alpha_look": 0.00125, "alpha_trial": 0.00125})
+    with pytest.raises(L.StreamRefused, match="evidence bar in force"):
+        L.append_registration(led, {**again, **stamp, "evidence_bar": None})
+
+
+def test_a_missed_confirmation_closes_the_family_in_that_group():
+    led = L.memory()
+    item = {"family": "IM1", "group": "metals", "instruments": ("GLD", "SLV"), "lane": "history"}
+    day = date(2026, 11, 13)
+
+    def seal(prop, today):
+        report = S.check(prop, L.load_state(led), today)
+        assert S.passed(report), report
+        return L.append_registration(led, {**prop, "sanity": report,
+                                           "recorded_at": f"{today.isoformat()}T12:00:00+00:00"})
+
+    def look(sha, verdict, end):
+        L.append_look(led, sha, {"verdict": verdict, "trials": [{"trial_id": "pooled", "verdict": verdict}],
+                                 "data": {"window_end": end}, "report_sha256": "0" * 64})
+
+    parent = seal(F.build_proposal(item, day), day)
+    look(parent, "PASS", day.isoformat())
+    forward = {**item, "lane": "forward"}
+    confirm = seal(F.build_proposal(forward, day, proposer="confirmation", confirms=parent, stage=2), day)
+    assert L.load_state(led).closed_families() == {}  # open: nothing is closed yet
+    look(confirm, "FAIL", "2027-04-09")
+    state = L.load_state(led)
+    closed = state.closed_families()
+    assert list(closed) == [("IM1", "metals")] and "confirms-" in closed[("IM1", "metals")]
+    later = date(2027, 4, 12)  # fresh forward nights, same family, same group: a rescue cut
+    retry = F.build_proposal(forward, later)
+    assert "family closed in this group" in S.check(retry, state, later)["G8_budget"]
+    with pytest.raises(L.StreamRefused, match="IM1 is closed in metals"):
+        L.append_registration(led, {**retry, "sanity": {"G": "ok"}, "recorded_at": "2027-04-12T12:00:00+00:00"})
+    other = F.build_proposal({"family": "IM1", "group": "energy", "instruments": ("USO", "UNG"), "lane": "history"},
+                             later)
+    assert S.check(other, state, later)["G8_budget"] == "ok"  # the same family elsewhere is untouched
+
+
+def test_an_abandoned_confirmation_closes_nothing_and_cannot_be_repeated():
+    led = L.memory()
+    item = {"family": "IM1", "group": "metals", "instruments": ("GLD", "SLV"), "lane": "history"}
+    day = date(2026, 11, 13)
+    stamp = {"sanity": {"G": "ok"}, "recorded_at": f"{day.isoformat()}T12:00:00+00:00"}
+    parent = L.append_registration(led, {**F.build_proposal(item, day), **stamp})
+    L.append_look(led, parent, {"verdict": "PASS", "trials": [{"trial_id": "pooled", "verdict": "PASS"}],
+                                "data": {"window_end": day.isoformat()}, "report_sha256": "0" * 64})
+    forward = {**item, "lane": "forward"}
+    confirm = L.append_registration(led, {**F.build_proposal(forward, day, proposer="confirmation",
+                                                             confirms=parent, stage=2), **stamp})
+    L.append_abandoned(led, confirm, "code changed", "2026-12-01T12:00:00+00:00")
+    assert L.load_state(led).closed_families() == {}  # no look was run: not a miss
+    second = F.build_proposal(forward, date(2026, 12, 2), proposer="confirmation", confirms=parent, stage=2)
+    with pytest.raises(L.StreamRefused, match="confirmed twice"):
+        L.append_registration(led, {**second, "sanity": {"G": "ok"}, "recorded_at": "2026-12-02T12:00:00+00:00"})
+
+
+def test_an_episode_is_not_confirmed(tmp_path, monkeypatch):
+    """A discovery carried by one year is recorded EPISODE and registers no confirmation."""
+    from alpha_research.edge_stream import stats as ST
+
+    real = ST.largest_year_out
+    monkeypatch.setattr(ST, "largest_year_out", lambda trades: {**real(trades), "status": "disappears"})
+    led, s2 = run_two_cycles(0.04, tmp_path, monkeypatch)
+    assert s2["looks"][0]["verdict"] == "EPISODE"
+    state = L.load_state(led)
+    look, = state.looks.values()
+    assert look["trials"][0]["largest_year_out"]["status"] == "disappears"
+    assert not [r for r in state.registrations.values() if r["stage"] == 2]
+    status = json.loads((tmp_path / "status.json").read_bytes())
+    assert status["verdicts"]["EPISODE"] == 1 and status["verdicts"]["PASS"] == 0 and status["candidates"] == []
+    assert "EPISODE 1" in (tmp_path / "DIGEST.md").read_text()
 
 
 # --- filings and daily bars -----------------------------------------------------------
@@ -470,7 +652,9 @@ def test_planted_drift_passes_and_registers_a_year_long_forward_confirmation(tmp
     assert all(t["entry_day"] > t["reaction_day"] for t in report["trades"]) and report["promotion_allowed"] is False
     confirm = [r for r in state.registrations.values() if r.get("confirms") == reg_sha]
     assert len(confirm) == 1 and confirm[0]["lane"] == "forward" and confirm[0]["window"]["n_target_sessions"] == 250
-    assert confirm[0]["alpha_look"] == P.CONFIRM_ALPHA
+    assert confirm[0]["alpha_look"] == P.CONFIRM_ALPHA and confirm[0]["evidence_bar"] == P.EVIDENCE_BAR
+    # every EC1 trade is in 2026: the largest-year refit is recorded as not possible and the verdict stands
+    assert look["trials"][0]["largest_year_out"]["status"] == "not_possible"
     with pytest.raises(L.StreamRefused):
         L.append_look(led, reg_sha, look)                              # one look per registration
 

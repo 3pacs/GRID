@@ -8,9 +8,10 @@ adds its own record kinds on a dedicated ledger (a placeholder S11 catalog satis
 genesis; no S11 allocation ever runs on it):
 
 ``edge_policy``        seq 1, once: the frozen :func:`policy.policy_payload` and its sha256.
-``edge_policy_amendment``  a later policy that only tightens the one before it
-                       (:func:`policy.tightening_violations`); registrations after it are
-                       sealed under its sha256.
+``edge_policy_amendment``  a later policy that only tightens the one before it, except
+                       where a recorded owner decision says otherwise
+                       (:func:`policy.amendment_violations`); registrations after it are
+                       sealed under its sha256 and checked against its numbers.
 ``edge_registration``  sealed before the look's data is read; its line sha256 is the seal.
 ``edge_look``          the one look of a registration (verdicts + report sha); SPENT.
 ``edge_abandoned``     a registration closed without a look; its alpha stays spent.
@@ -43,7 +44,8 @@ PLACEHOLDER_CATALOG = Catalog(
     classes=(("none|x", "edge_looks_only"),),
 )
 
-VERDICTS = ("PASS", "FAIL", "UNDERPOWERED")
+#: EPISODE: a stage-1 discovery that did not survive its largest year left out (policy 3 on).
+VERDICTS = ("PASS", "FAIL", "UNDERPOWERED", "EPISODE")
 
 
 class StreamRefused(ValueError):
@@ -114,6 +116,23 @@ class StreamState:
             1 for r in self.registrations.values()
             if r["stage"] == 1 and r["recorded_at"][:10] == day.isoformat()
         )
+
+    def closed_families(self) -> dict[tuple[str, str], str]:
+        """(family, group) -> the confirmation that closed it.
+
+        Under the two-stage bar a confirmation is run once: a look that did not PASS
+        closes the family in that group (no rescue cuts). An abandoned confirmation has
+        no look and closes nothing: its window stays consumed and its discovery stays
+        unconfirmed. Confirmations sealed under an earlier policy close nothing.
+        """
+        out: dict[tuple[str, str], str] = {}
+        for sha, reg in self.registrations.items():
+            if reg["stage"] != 2 or not reg.get("evidence_bar"):
+                continue
+            look = self.looks.get(sha)
+            if look is not None and look["verdict"] != "PASS":
+                out.setdefault((reg["family"], reg["group"]), reg["proposal_id"])
+        return out
 
     def proposal_ids(self) -> set[str]:
         return {r["proposal_id"] for r in self.registrations.values()}
@@ -216,17 +235,26 @@ def _check_registration(state: StreamState, reg: dict) -> None:
     _require(reg.get("lane") in ("history", "forward"), f"record {seq}: bad lane")
     _require(reg.get("horizon") in P.HORIZONS, f"record {seq}: bad horizon")
     _require(reg["proposal_id"] not in state.proposal_ids(), f"record {seq}: proposal registered twice")
+    # numbers are the ones of the policy in force when the record was sealed (state.policy), so a
+    # registration made under an earlier version replays on the terms it was sealed with
+    budget = state.policy["budget"]
+    max_trials, max_year = budget["max_trials_per_look"], budget["max_registrations_per_year"]
+    two_stage = (state.policy.get("evidence_bar") or {}).get("version")
+    _require(reg.get("evidence_bar") == two_stage, f"record {seq}: registration does not carry the evidence bar in force")
     trials = reg.get("trials") or []
-    _require(1 <= len(trials) <= P.MAX_TRIALS_PER_LOOK and reg.get("k") == len(trials),
-             f"record {seq}: k must equal the number of trials (1..{P.MAX_TRIALS_PER_LOOK})")
+    _require(1 <= len(trials) <= max_trials and reg.get("k") == len(trials),
+             f"record {seq}: k must equal the number of trials (1..{max_trials})")
     sanity = reg.get("sanity") or {}
     _require(bool(sanity) and all(v == "ok" for v in sanity.values()),
              f"record {seq}: registration without a clean sanity report")
     if reg["stage"] == 1:
         _require(reg.get("confirms") is None, f"record {seq}: a stage-1 registration confirms nothing")
-        _require(state.stage1_count(reg["epoch"]) < P.MAX_REGISTRATIONS_PER_YEAR,
-                 f"record {seq}: the {reg['epoch']} budget of {P.MAX_REGISTRATIONS_PER_YEAR} looks is spent")
-        _require(abs(reg["alpha_look"] - P.ALPHA_PER_LOOK) < 1e-15, f"record {seq}: wrong alpha for stage 1")
+        _require(state.stage1_count(reg["epoch"]) < max_year,
+                 f"record {seq}: the {reg['epoch']} budget of {max_year} looks is spent")
+        _require(abs(reg["alpha_look"] - budget["alpha_per_look"]) < 1e-15, f"record {seq}: wrong alpha for stage 1")
+        closed = state.closed_families().get((reg["family"], reg["group"]))
+        _require(closed is None, f"record {seq}: {reg['family']} is closed in {reg['group']}: "
+                                 f"its confirmation {closed} did not pass")
         _require(reg["epoch"] == int(reg["recorded_at"][:4]), f"record {seq}: epoch is the registration year")
     else:
         parent = state.registrations.get(reg.get("confirms"))
@@ -236,7 +264,7 @@ def _check_registration(state: StreamState, reg: dict) -> None:
         _require(reg["lane"] == "forward", f"record {seq}: confirmations are forward")
         _require(not any(r.get("confirms") == reg["confirms"] for r in state.registrations.values()),
                  f"record {seq}: confirmed twice")
-        _require(abs(reg["alpha_look"] - P.CONFIRM_ALPHA) < 1e-15, f"record {seq}: wrong alpha for stage 2")
+        _require(abs(reg["alpha_look"] - budget["confirm_alpha"]) < 1e-15, f"record {seq}: wrong alpha for stage 2")
     _require(abs(reg["alpha_trial"] - reg["alpha_look"] / reg["k"]) < 1e-15, f"record {seq}: alpha_trial != alpha/k")
     w = reg["window"]
     if reg["lane"] == "history":
@@ -258,7 +286,7 @@ def _check_amendment(state: StreamState, rec: dict) -> None:
              f"record {seq}: amendment does not follow the policy in force")
     _require(rec["policy_sha256"] != state.policy_sha256, f"record {seq}: amendment changes nothing")
     _require(bool(rec.get("reason")), f"record {seq}: amendment without a reason")
-    bad = P.tightening_violations(state.policy, rec["policy"])
+    bad = P.amendment_violations(state.policy, rec["policy"])
     _require(not bad, f"record {seq}: amendment loosens the policy: " + "; ".join(bad[:5]))
 
 
@@ -287,8 +315,9 @@ def amend_policy(ledger: Ledger, reason: str, recorded_at: str | None = None) ->
     """Record the code's policy as an amendment when it differs from the one in force.
 
     Returns the amendment's sha256, or ``None`` when the ledger already carries this
-    policy. A code policy that loosens anything is refused (:class:`StreamRefused`), and
-    then no registration can be sealed until the code is put right.
+    policy. A code policy that loosens anything a recorded owner decision does not waive
+    is refused (:class:`StreamRefused`), and then no registration can be sealed until the
+    code is put right.
     """
     state = load_state(ledger)
     new = P.policy_payload()

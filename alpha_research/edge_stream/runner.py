@@ -6,7 +6,8 @@ Order inside a cycle (under an exclusive lock on the data dir):
    registration only counts the sessions whose bars exist (presence, never a price
    compared) and gets its look once ``n_target_sessions`` are in or ``max_sessions``
    weekdays have passed;
-2. a stage-1 PASS registers its forward confirmation (stage 2, alpha 0.05/k);
+2. a stage-1 PASS (a discovery that survived its largest year left out) registers its one
+   forward confirmation (stage 2, alpha 0.05/k);
 3. at most one new stage-1 registration per weekday, from :data:`families.QUEUE`, then
    ``inbox/*.json`` proposals, each through :func:`sanity.check` first;
 4. ``status.json`` (machine-readable state) and ``DIGEST.md`` are rewritten.
@@ -71,6 +72,11 @@ def _read(reg: dict, source: BarSource, today: date) -> tuple[dict, date, date]:
     return bars, start, end
 
 
+def _discovery(reg: dict) -> bool:
+    """A stage-1 look sealed under the two-stage bar: refitted with its largest year left out."""
+    return reg["stage"] == 1 and bool(reg.get("evidence_bar"))
+
+
 def _is_event(family) -> bool:
     return getattr(family, "kind", "session") == "event"
 
@@ -118,7 +124,8 @@ def _event_look(reg_sha: str, reg: dict, family, today: date, extras: dict | Non
         end = date.fromisoformat(prog["window_end"])
     got = family.collect(list(reg["instruments"]), start, end, daily, events)
     trades = got["trades"]
-    result = {"trial_id": reg["trials"][0]["trial_id"], **judge(trades, reg["alpha_trial"], reg["directional"])}
+    result = {"trial_id": reg["trials"][0]["trial_id"],
+              **judge(trades, reg["alpha_trial"], reg["directional"], discovery=_discovery(reg))}
     manifest = sha256_bytes(P.canonical_bytes(got["used"]))
     data = {"source": f"{type(daily).__name__} + {type(events).__name__}", "manifest_sha256": manifest,
             "window_start": start.isoformat(), "window_end": end.isoformat(),
@@ -167,7 +174,8 @@ def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date,
         skipped[t] = n_skip
     trades.sort(key=lambda x: (x["session"], x["instrument"]))
     trial = reg["trials"][0]
-    result = {"trial_id": trial["trial_id"], **judge(trades, reg["alpha_trial"], reg["directional"])}
+    result = {"trial_id": trial["trial_id"],
+              **judge(trades, reg["alpha_trial"], reg["directional"], discovery=_discovery(reg))}
     per_instrument = {
         t: {k: v for k, v in judge([x for x in trades if x["instrument"] == t], reg["alpha_trial"],
                                    reg["directional"]).items() if k not in ("bootstrap_b", "bootstrap_seed")}
@@ -207,7 +215,7 @@ def _finish(reg_sha: str, reg: dict, result: dict, per_instrument: dict, data: d
         "verdict": result["verdict"],
         "trials": [{k: result.get(k) for k in ("trial_id", "verdict", "n", "n_long", "n_short", "sessions",
                                                "mean_net", "mean_long", "mean_short", "bootstrap_lower", "t_lower",
-                                               "always_long_mean_net", "reasons")}],
+                                               "always_long_mean_net", "largest_year_out", "reasons")}],
         "data": {"manifest_sha256": data["manifest_sha256"], "window_start": data["window_start"],
                  "window_end": data["window_end"]},
         "code_sha256": reg["code_sha256"],
@@ -548,7 +556,7 @@ def digest(status: dict) -> str:
         f"{status['generated_at'][:16]}Z · ledger head `{status['ledger_head_sha256'][:12]}` · "
         f"{e['year']} looks {e['registrations']}/{e['max']} (alpha {e['alpha_per_look']:g} each) · "
         f"open {status['open']} · PASS {status['verdicts']['PASS']} FAIL {status['verdicts']['FAIL']} "
-        f"UNDERPOWERED {status['verdicts']['UNDERPOWERED']}",
+        f"UNDERPOWERED {status['verdicts']['UNDERPOWERED']} EPISODE {status['verdicts']['EPISODE']}",
         "",
         "Machine-readable source: `status.json` (this file is a view of it). Nothing here is a trade; "
         "a confirmed PASS is a candidate for Anik's decision only.",

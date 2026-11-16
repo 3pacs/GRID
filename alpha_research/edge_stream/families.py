@@ -451,6 +451,7 @@ def build_proposal(item: dict, today: date, proposer: str = "template", confirms
         "n_side_min": P.N_SIDE_MIN,
         "max_fires_per_session": family.max_fires_per_session,
         "pass_test": "policy.pass_test",
+        "evidence_bar": P.EVIDENCE_BAR,
         **({"kind": "event", "hedge": {"instrument": family.hedge, "tier": P.LIQUIDITY[family.hedge],
                                        **P.COST_FLOORS[P.LIQUIDITY[family.hedge]],
                                        "note": "equal-notional hedge leg and reaction-day market return; "
