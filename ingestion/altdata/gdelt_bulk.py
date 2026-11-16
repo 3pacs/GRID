@@ -25,12 +25,14 @@ When a day is known (PIT)
 A file's publication instant is its HTTP ``Last-Modified`` header (measured:
 a median of 11 minutes *before* the stamp, but one file of 2026-11-15 went up
 98 minutes after it), else the instant GRID fetched it, which is never
-earlier. A day is known when its last file is published, so its summary and
-features carry ``release_date = vintage_date =`` the UTC date of the latest
-publication instant among its files -- never ``obs_date`` copied over. That
-is usually D itself (the 23:45 file goes up near 23:35 UTC) and D+1 whenever a
-late file crosses midnight; ``store.pit`` reads a date as "known by the end of
-that UTC day".
+earlier. A day is known when its last file is published. ``store.pit`` reads
+a date as "known by the end of that UTC day", and GRID's rule for this source
+(Anik, 2026-11-16) is that ``release_date`` never equals ``obs_date``: a day's
+summary and features carry ``release_date = vintage_date =`` the later of D+1
+and the UTC date of the latest publication instant among its files. The 23:45
+file usually goes up near 23:35 UTC on D, so that is D+1; a file published two
+days late moves the day to D+2. GDELT 1.0's daily file for D, the history
+source, is published about 07:00 UTC on D+1, so both are dated alike.
 
 Idempotency and resume
 ----------------------
@@ -107,6 +109,9 @@ COL_NUMSOURCES = 32
 COL_NUMARTICLES = 33
 COL_AVGTONE = 34
 COL_DATEADDED = 59
+#: GDELT 1.0 daily export (history): 58 columns, DATEADDED (YYYYMMDD) in col 56.
+V1_EXPORT_COLUMNS = 58
+V1_COL_DATEADDED = 56
 
 #: Feature suffix -> CAMEO actor country code. Actor*CountryCode holds CAMEO
 #: three-letter codes ("USA"); scripts/parse_gdelt.py compared them with
@@ -192,6 +197,11 @@ def published_at(last_modified: str | None, fetched_at: datetime) -> tuple[datet
 # --- parsing --------------------------------------------------------------------------
 
 
+def release_day(obs_day: date, published: datetime) -> date:
+    """The date a day's points are known: the later of D+1 and the publication date, never D."""
+    return max(obs_day + timedelta(days=1), published.astimezone(timezone.utc).date())
+
+
 @dataclass
 class FileAggregate:
     """Sums over one export file's events; days add these up."""
@@ -247,22 +257,47 @@ def _float(raw: str) -> float | None:
         return None
 
 
+def _zip_member(data: bytes, label: str) -> bytes:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+        members = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+        if len(members) != 1:
+            raise GdeltBulkError(f"{label}: expected one CSV member, found {members}")
+        return archive.read(members[0])
+    except zipfile.BadZipFile as exc:
+        raise GdeltBulkError(f"{label}: not a zip archive ({exc})") from exc
+
+
 def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
     """Rows for ``gdelt_events`` and the file's aggregate.
 
     Rows with the wrong column count, or an unreadable event id or SQLDATE,
     are rejected and counted. Duplicated event ids keep their first row.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-        members = [n for n in archive.namelist() if n.lower().endswith(".csv")]
-        if len(members) != 1:
-            raise GdeltBulkError(f"{format_stamp(stamp)}: expected one CSV member, found {members}")
-        payload = archive.read(members[0])
-    except zipfile.BadZipFile as exc:
-        raise GdeltBulkError(f"{format_stamp(stamp)}: not a zip archive ({exc})") from exc
+    payload = _zip_member(data, format_stamp(stamp))
+    return _parse_events(payload, columns=EXPORT_COLUMNS, dateadded_col=COL_DATEADDED,
+                         dateadded_text=format_stamp(stamp), date_added=stamp, keep_rows=True)
 
-    stamp_text = format_stamp(stamp)
+
+def parse_daily_v1(data: bytes, day: date) -> ParsedFile:
+    """Aggregate of a GDELT 1.0 daily export (``YYYYMMDD.export.CSV.zip``), no rows kept.
+
+    GDELT 1.0 rows have 58 columns: the 2.0 layout up to AvgTone (col 34),
+    one ADM2 code fewer in each of the three geography blocks, DATEADDED
+    (``YYYYMMDD``) in col 56. Measured 2026-11-16 on 2016-03-15, 2025-06-10
+    and 2026-11-15: the daily file for D holds exactly the events of the 96
+    GDELT 2.0 files stamped D (239,103 / 140,233 / 61,540 ids, none extra on
+    either side), so a day built from it continues the loader's day without a
+    seam.
+    """
+    payload = _zip_member(data, day.strftime("%Y%m%d"))
+    return _parse_events(payload, columns=V1_EXPORT_COLUMNS, dateadded_col=V1_COL_DATEADDED,
+                         dateadded_text=day.strftime("%Y%m%d"), date_added=None, keep_rows=False)
+
+
+def _parse_events(payload: bytes, *, columns: int, dateadded_col: int, dateadded_text: str,
+                  date_added: datetime | None, keep_rows: bool) -> ParsedFile:
+    stamp_text = dateadded_text
     rows: list[dict[str, Any]] = []
     seen: set[int] = set()
     agg = FileAggregate()
@@ -270,7 +305,7 @@ def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
     reader = csv.reader(io.TextIOWrapper(io.BytesIO(payload), encoding="utf-8", errors="replace"),
                         delimiter="\t", quoting=csv.QUOTE_NONE)
     for rec in reader:
-        if len(rec) != EXPORT_COLUMNS:
+        if len(rec) != columns:
             rejected += 1
             continue
         event_id = _int(rec[COL_GLOBALEVENTID])
@@ -284,7 +319,7 @@ def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
         if event_id in seen:
             continue
         seen.add(event_id)
-        if rec[COL_DATEADDED] != stamp_text:
+        if rec[dateadded_col] != stamp_text:
             mismatch += 1
         a1 = rec[COL_ACTOR1COUNTRYCODE][:3] or None
         a2 = rec[COL_ACTOR2COUNTRYCODE][:3] or None
@@ -292,14 +327,15 @@ def parse_export(data: bytes, stamp: datetime) -> ParsedFile:
         goldstein = _float(rec[COL_GOLDSTEINSCALE])
         mentions = _int(rec[COL_NUMMENTIONS])
         tone = _float(rec[COL_AVGTONE])
-        rows.append({
-            "global_event_id": event_id, "event_date": event_date,
-            "actor1_country": a1, "actor2_country": a2,
-            "event_root_code": rec[COL_EVENTROOTCODE][:4] or None,
-            "quad_class": quad, "goldstein_scale": goldstein, "num_mentions": mentions,
-            "num_sources": _int(rec[COL_NUMSOURCES]), "num_articles": _int(rec[COL_NUMARTICLES]),
-            "avg_tone": tone, "date_added": stamp,
-        })
+        if keep_rows:
+            rows.append({
+                "global_event_id": event_id, "event_date": event_date,
+                "actor1_country": a1, "actor2_country": a2,
+                "event_root_code": rec[COL_EVENTROOTCODE][:4] or None,
+                "quad_class": quad, "goldstein_scale": goldstein, "num_mentions": mentions,
+                "num_sources": _int(rec[COL_NUMSOURCES]), "num_articles": _int(rec[COL_NUMARTICLES]),
+                "avg_tone": tone, "date_added": date_added,
+            })
         agg.events += 1
         if quad in (3, 4):
             agg.conflict += 1
@@ -384,7 +420,13 @@ class RunSummary:
 
 
 class GdeltBulkLoader:
-    """Incremental, resumable loader for GDELT 2.0 export files."""
+    """Incremental, resumable loader for GDELT 2.0 export files (``GkgLoader`` reads the GKG files)."""
+
+    KIND = "export"
+    LOCK = LOCK_KEY
+
+    def _url(self, stamp: datetime) -> str:
+        return export_url(stamp)
 
     def __init__(self, engine: Engine, fetch: Callable[[str], Fetched] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
@@ -416,13 +458,18 @@ class GdeltBulkLoader:
 
     # resume ----------------------------------------------------------------------
 
-    def _first_day(self, conn: Connection, since: date | None) -> date:
-        """Earliest day to consider: --since, else the ledger's first day, else after the legacy table."""
+    def _first_day(self, conn: Connection, since: date | None, newest: datetime) -> date:
+        """Earliest day to consider: --since, else the ledger's first day, else the kind's default."""
         if since is not None:
             return since
-        first = conn.execute(text("SELECT min(file_stamp) FROM gdelt_export_files")).scalar()
+        first = conn.execute(text("SELECT min(file_stamp) FROM gdelt_export_files WHERE kind = :kind"),
+                             {"kind": self.KIND}).scalar()
         if first is not None:
             return first.astimezone(timezone.utc).date()
+        return self._default_first_day(conn, newest)
+
+    def _default_first_day(self, conn: Connection, newest: datetime) -> date:
+        """Export files: the day after the legacy table's last day."""
         legacy = conn.execute(text("SELECT max(summary_date) FROM gdelt_daily_summary")).scalar()
         if legacy is not None:
             return legacy + timedelta(days=1)
@@ -434,9 +481,7 @@ class GdeltBulkLoader:
         last_full = (newest - (SLOTS_PER_DAY - 1) * SLOT).date()
         if last_full < first:
             return []
-        done = {r[0] for r in conn.execute(text(
-            "SELECT summary_date FROM gdelt_daily_summary WHERE summary_date BETWEEN :a AND :b"),
-            {"a": first, "b": last_full})}
+        done = self._done_days(conn, first, last_full)
         out, day = [], first
         while day <= last_full:
             if day not in done:
@@ -444,19 +489,23 @@ class GdeltBulkLoader:
             day += timedelta(days=1)
         return out
 
+    def _done_days(self, conn: Connection, first: date, last: date) -> set[date]:
+        return {r[0] for r in conn.execute(text(
+            "SELECT summary_date FROM gdelt_daily_summary WHERE summary_date BETWEEN :a AND :b"),
+            {"a": first, "b": last})}
+
     def _recorded(self, conn: Connection, day: date) -> dict[datetime, dict[str, Any]]:
         start = day_stamps(day)[0]
         rows = conn.execute(text(
             "SELECT file_stamp, status, published_at, aggregates FROM gdelt_export_files "
-            "WHERE file_stamp >= :a AND file_stamp < :b"),
-            {"a": start, "b": start + timedelta(days=1)}).mappings().all()
+            "WHERE kind = :kind AND file_stamp >= :a AND file_stamp < :b"),
+            {"kind": self.KIND, "a": start, "b": start + timedelta(days=1)}).mappings().all()
         return {r["file_stamp"].astimezone(timezone.utc): dict(r) for r in rows}
 
     # one file --------------------------------------------------------------------
 
     def _load_file(self, stamp: datetime, got: Fetched, summary: RunSummary, write: bool) -> None:
         parsed = parse_export(got.body, stamp)
-        when, basis = published_at(got.last_modified, got.fetched_at)
         summary.files_loaded += 1
         summary.events_parsed += len(parsed.rows)
         summary.rows_rejected += parsed.rejected
@@ -469,25 +518,31 @@ class GdeltBulkLoader:
                 stmt = (pg_insert(GDELT_EVENTS).on_conflict_do_nothing(index_elements=["global_event_id"])
                         .returning(GDELT_EVENTS.c.global_event_id))
                 inserted = len(conn.execute(stmt, parsed.rows).all())
-            conn.execute(text(
-                "INSERT INTO gdelt_export_files (file_stamp, url, status, published_at, published_basis, "
-                "fetched_at, md5, size_bytes, rows_parsed, rows_rejected, rows_inserted, aggregates) "
-                "VALUES (:stamp, :url, 'loaded', :pub, :basis, :fetched, :md5, :size, :parsed, :rejected, "
-                ":inserted, CAST(:agg AS JSONB)) ON CONFLICT (file_stamp) DO NOTHING"),
-                {"stamp": stamp, "url": export_url(stamp), "pub": when, "basis": basis,
-                 "fetched": got.fetched_at, "md5": hashlib.md5(got.body).hexdigest(),
-                 "size": len(got.body), "parsed": len(parsed.rows), "rejected": parsed.rejected,
-                 "inserted": inserted, "agg": json.dumps(asdict(parsed.aggregate))})
+            self._ledger_loaded(conn, stamp, got, parsed=len(parsed.rows), rejected=parsed.rejected,
+                                inserted=inserted, aggregate=asdict(parsed.aggregate))
         summary.events_inserted += inserted
+
+    def _ledger_loaded(self, conn: Connection, stamp: datetime, got: Fetched, *, parsed: int, rejected: int,
+                       inserted: int | None, aggregate: dict[str, Any]) -> None:
+        when, basis = published_at(got.last_modified, got.fetched_at)
+        conn.execute(text(
+            "INSERT INTO gdelt_export_files (kind, file_stamp, url, status, published_at, published_basis, "
+            "fetched_at, md5, size_bytes, rows_parsed, rows_rejected, rows_inserted, aggregates) "
+            "VALUES (:kind, :stamp, :url, 'loaded', :pub, :basis, :fetched, :md5, :size, :parsed, :rejected, "
+            ":inserted, CAST(:agg AS JSONB)) ON CONFLICT (kind, file_stamp) DO NOTHING"),
+            {"kind": self.KIND, "stamp": stamp, "url": self._url(stamp), "pub": when, "basis": basis,
+             "fetched": got.fetched_at, "md5": hashlib.md5(got.body).hexdigest(),
+             "size": len(got.body), "parsed": parsed, "rejected": rejected,
+             "inserted": inserted, "agg": json.dumps(aggregate)})
 
     def _record_missing(self, stamp: datetime, got: Fetched, write: bool) -> None:
         if not write:
             return
         with self.engine.begin() as conn:
             conn.execute(text(
-                "INSERT INTO gdelt_export_files (file_stamp, url, status, fetched_at) "
-                "VALUES (:stamp, :url, 'missing', :fetched) ON CONFLICT (file_stamp) DO NOTHING"),
-                {"stamp": stamp, "url": export_url(stamp), "fetched": got.fetched_at})
+                "INSERT INTO gdelt_export_files (kind, file_stamp, url, status, fetched_at) "
+                "VALUES (:kind, :stamp, :url, 'missing', :fetched) ON CONFLICT (kind, file_stamp) DO NOTHING"),
+                {"kind": self.KIND, "stamp": stamp, "url": self._url(stamp), "fetched": got.fetched_at})
 
     # one day ---------------------------------------------------------------------
 
@@ -521,9 +576,10 @@ class GdeltBulkLoader:
             summary.days_finalised.append(day.isoformat())
             if published is None:
                 return
-            known = published.astimezone(timezone.utc).date()
-            if known > day:
+            published_day = published.astimezone(timezone.utc).date()
+            if published_day > day:
                 summary.late_days.append(day.isoformat())
+            known = release_day(day, published)
             for name, value in values.items():
                 hit = conn.execute(text(
                     "INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
@@ -542,13 +598,13 @@ class GdeltBulkLoader:
         summary = RunSummary(write=write)
         deadline = None if budget_seconds is None else self.clock() + budget_seconds
         with self.engine.connect() as lock_conn:
-            if not lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": LOCK_KEY}).scalar():
-                summary.status, summary.detail = "locked", "another gdelt_bulk run holds the lock"
+            if not lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": self.LOCK}).scalar():
+                summary.status, summary.detail = "locked", f"another gdelt_bulk {self.KIND} run holds the lock"
                 return summary
             try:
                 self._run_locked(summary, write, since, until, deadline)
             finally:
-                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": LOCK_KEY})
+                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": self.LOCK})
                 lock_conn.commit()
         return summary
 
@@ -562,7 +618,7 @@ class GdeltBulkLoader:
         summary.newest_stamp = format_stamp(newest)
         with self.engine.begin() as conn:
             src_id, feat_ids = self._registry(conn) if write else (0, {})
-            first = self._first_day(conn, since)
+            first = self._first_day(conn, since, newest)
             days = self._pending_days(conn, first, newest)
         if until is not None:
             days = [d for d in days if d <= until]
@@ -577,7 +633,7 @@ class GdeltBulkLoader:
                 if deadline is not None and self.clock() >= deadline:
                     summary.status = "budget"
                     return
-                got = self.fetch(export_url(stamp))
+                got = self.fetch(self._url(stamp))
                 summary.files_fetched += 1
                 if got.status == 200:
                     try:
@@ -599,6 +655,272 @@ class GdeltBulkLoader:
             if write:
                 self._finalise(day, src_id, feat_ids, summary)
 
+
+
+# --- GKG files ----------------------------------------------------------------------------
+#
+# GDELT 2.0 publishes a GKG 2.1 file (``<stamp>.gkg.csv.zip``, 27 tab-separated
+# columns, one row per document) next to each export file. The GkgLoader below
+# reads them through the same ledger (``kind = 'gkg'``), keeps no documents,
+# and reduces each file to document counts and tone sums for fixed groups:
+# country pairs, persons, theme sets. Design and the measurements behind the
+# lists: docs/specs/2026-11-16-gdelt-gkg-design.md (3pacs/GRID#1234).
+
+GKG_COLUMNS = 27
+GKG_COL_RECORDID = 0
+GKG_COL_DATE = 1
+GKG_COL_THEMES = 7
+GKG_COL_LOCATIONS = 9
+GKG_COL_V2LOCATIONS = 10
+GKG_COL_PERSONS = 11
+GKG_COL_V2TONE = 15
+GKG_COL_ALLNAMES = 23
+GKG_SOURCE_NAME = "GDELT_GKG"
+GKG_LOCK_KEY = int.from_bytes(hashlib.sha256(b"grid:gdelt_bulk:gkg").digest()[:8], "big", signed=True)
+#: A weekday of GKG is ~105k documents in ~445 MB (2026-11-13); about a day per run.
+GKG_DAILY_BUDGET_SECONDS = 100
+
+#: Documents whose locations hold both FIPS 10-4 country codes (GKG uses FIPS, not CAMEO).
+#: Measured 2026-11-13 (one weekday): docs per day 591 (china_taiwan) .. 3,326 (us_china).
+GKG_PAIRS: dict[str, tuple[str, str]] = {
+    "us_china": ("US", "CH"), "us_russia": ("US", "RS"), "us_iran": ("US", "IR"),
+    "china_taiwan": ("CH", "TW"), "russia_ukraine": ("RS", "UP"), "israel_iran": ("IS", "IR"),
+    "india_china": ("IN", "CH"),
+}
+#: Exact lower-cased names in Persons, or the name as whole words in an AllNames entry. Measured 2026-11-13: putin 1,285 docs,
+#: bessent 341 (Treasury Secretary, replaces the DOC list's Yellen: Anik, 2026-11-16),
+#: xi 212 (only AllNames finds him: Persons had none), powell 10, lagarde 7.
+#: Bin Salman (0) and Ueda (1) were left out: a series of zero counts says nothing.
+GKG_PERSONS: dict[str, tuple[str, ...]] = {
+    "powell": ("jerome powell", "jay powell"),
+    "lagarde": ("christine lagarde",),
+    "xi": ("xi jinping", "president xi"),
+    "putin": ("vladimir putin",),
+    "bessent": ("scott bessent",),
+}
+#: A document matches a topic when it carries any of the topic's GKG theme codes.
+#: Chosen from the theme counts of 2026-11-13 (docs that day in brackets). The DOC
+#: topics recession, chip export controls and Taiwan strait have no theme code with
+#: 50 or more documents that day; Taiwan is covered by the china_taiwan pair.
+GKG_THEMES: dict[str, frozenset[str]] = {
+    "armed_conflict": frozenset({"ARMEDCONFLICT"}),                                      # 11,273
+    "inflation": frozenset({"ECON_INFLATION", "WB_442_INFLATION"}),                     # 2,307 / 2,167
+    "rates": frozenset({"ECON_INTEREST_RATES", "EPU_POLICY_INTEREST_RATE",
+                        "EPU_POLICY_INTEREST_RATES"}),                                  # 1,473 / 900 / 840
+    "fed": frozenset({"EPU_POLICY_FEDERAL_RESERVE"}),                                   # 825
+    "central_bank": frozenset({"ECON_CENTRALBANK", "WB_1235_CENTRAL_BANKS",
+                               "EPU_POLICY_CENTRAL_BANK"}),                             # 691 / 688 / 671
+    "sanctions": frozenset({"SANCTIONS"}),                                              # 1,132
+    "oil": frozenset({"ECON_OILPRICE", "ENV_OIL"}),                                     # 1,222 / 2,978
+    "currency": frozenset({"ECON_CURRENCY_EXCHANGE_RATE",
+                           "EPU_CATS_SOVEREIGN_DEBT_CURRENCY_CRISES"}),                 # 643 / 245
+    "trade_dispute": frozenset({"ECON_TRADE_DISPUTE"}),                                 # 102
+    "defense_spending": frozenset({"SLFID_MILITARY_SPENDING"}),                         # 142
+}
+GKG_GROUPS: tuple[str, ...] = (
+    *(f"pair_{k}" for k in GKG_PAIRS), *(f"person_{k}" for k in GKG_PERSONS), *(f"theme_{k}" for k in GKG_THEMES),
+)
+#: gkg_docs_total plus a _docs and a _tone series per group. model_eligible stays FALSE:
+#: nothing feeds a model until a hand-read of matched documents shows >= 90 % precision
+#: (Anik, 2026-11-16) and the series has 30 days.
+GKG_FEATURES: dict[str, str] = {"gkg_docs_total": "GDELT GKG documents per day"}
+for _group in GKG_GROUPS:
+    GKG_FEATURES[f"gkg_{_group}_docs"] = f"GDELT GKG documents per day, {_group}"
+    GKG_FEATURES[f"gkg_{_group}_tone"] = f"GDELT GKG mean document tone, {_group}"
+
+
+def gkg_url(stamp: datetime) -> str:
+    return f"{BASE_URL}{format_stamp(stamp)}.gkg.csv.zip"
+
+
+@dataclass
+class GkgAggregate:
+    """Document counts and tone sums over one GKG file; days add these up."""
+
+    docs: int = 0
+    groups: dict[str, list[float]] = field(default_factory=lambda: {g: [0, 0.0, 0] for g in GKG_GROUPS})
+
+    def add(self, other: GkgAggregate) -> None:
+        self.docs += other.docs
+        for g in GKG_GROUPS:
+            mine, theirs = self.groups[g], other.groups.get(g, [0, 0.0, 0])
+            for i in range(3):
+                mine[i] += theirs[i]
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> GkgAggregate:
+        agg = cls(docs=int(data.get("docs", 0)))
+        for g in GKG_GROUPS:
+            n, tone, tone_n = data.get("groups", {}).get(g, [0, 0.0, 0])
+            agg.groups[g] = [int(n), float(tone), int(tone_n)]
+        return agg
+
+
+@dataclass
+class ParsedGkg:
+    aggregate: GkgAggregate
+    rejected: int
+    date_mismatch: int
+
+
+def parse_gkg(data: bytes, stamp: datetime) -> ParsedGkg:
+    """One GKG 2.1 file -> its aggregate. Rows of another width are rejected; repeated record ids count once."""
+    payload = _zip_member(data, f"{format_stamp(stamp)} gkg")
+    agg = GkgAggregate()
+    seen: set[str] = set()
+    rejected = mismatch = 0
+    stamp_text = format_stamp(stamp)
+    for line in payload.split(b"\n"):
+        if not line.strip():
+            continue
+        rec = line.decode("utf-8", errors="replace").rstrip("\r").split("\t")
+        if len(rec) != GKG_COLUMNS or not rec[GKG_COL_RECORDID]:
+            rejected += 1
+            continue
+        if rec[GKG_COL_RECORDID] in seen:
+            continue
+        seen.add(rec[GKG_COL_RECORDID])
+        if rec[GKG_COL_DATE] != stamp_text:
+            mismatch += 1
+        agg.docs += 1
+        tone = _float(rec[GKG_COL_V2TONE].split(",", 1)[0])
+        for group in _gkg_groups(rec):
+            cell = agg.groups[group]
+            cell[0] += 1
+            if tone is not None:
+                cell[1] += tone
+                cell[2] += 1
+    return ParsedGkg(aggregate=agg, rejected=rejected, date_mismatch=mismatch)
+
+
+def _gkg_groups(rec: list[str]) -> list[str]:
+    out: list[str] = []
+    countries = {loc.split("#")[2] for loc in (rec[GKG_COL_V2LOCATIONS] or rec[GKG_COL_LOCATIONS]).split(";")
+                 if loc.count("#") >= 2}
+    out += [f"pair_{k}" for k, (a, b) in GKG_PAIRS.items() if a in countries and b in countries]
+    persons = {n.strip().lower() for n in rec[GKG_COL_PERSONS].split(";") if n.strip()}
+    # AllNames entries carry titles ("President Xi Jinping"): an alias matches as whole words.
+    allnames = [f" {' '.join(n.rsplit(',', 1)[0].lower().split())} " for n in rec[GKG_COL_ALLNAMES].split(";")
+                if n.strip()]
+    out += [f"person_{k}" for k, aliases in GKG_PERSONS.items()
+            if persons.intersection(aliases) or any(f" {a} " in n for a in aliases for n in allnames)]
+    themes = {t for t in rec[GKG_COL_THEMES].split(";") if t}
+    out += [f"theme_{k}" for k, codes in GKG_THEMES.items() if themes & codes]
+    return out
+
+
+def gkg_feature_values(agg: GkgAggregate) -> dict[str, float]:
+    """Daily values; a group's tone is omitted on a day with no matched document."""
+    values = {"gkg_docs_total": float(agg.docs)}
+    for g in GKG_GROUPS:
+        n, tone, tone_n = agg.groups[g]
+        values[f"gkg_{g}_docs"] = float(n)
+        if tone_n:
+            values[f"gkg_{g}_tone"] = tone / tone_n
+    return values
+
+
+class GkgLoader(GdeltBulkLoader):
+    """GDELT 2.0 GKG files: per-file aggregates in the ledger, one gdelt_gkg_daily row and gkg_* points per day.
+
+    Same stamps, fetch, Last-Modified dating, missing-file grace, budget and
+    resume as the export loader, under its own advisory lock. A day's points
+    are dated ``release_day(D, latest publication)``, never D. With no ledger
+    rows and no ``since`` the first run starts at the newest complete day:
+    the series start fresh (no GKG 2.1 history is stored on grid-svr).
+    """
+
+    KIND = "gkg"
+    LOCK = GKG_LOCK_KEY
+
+    def _url(self, stamp: datetime) -> str:
+        return gkg_url(stamp)
+
+    def _default_first_day(self, conn: Connection, newest: datetime) -> date:
+        return (newest - (SLOTS_PER_DAY - 1) * SLOT).date()
+
+    def _done_days(self, conn: Connection, first: date, last: date) -> set[date]:
+        return {r[0] for r in conn.execute(text(
+            "SELECT summary_date FROM gdelt_gkg_daily WHERE summary_date BETWEEN :a AND :b"),
+            {"a": first, "b": last})}
+
+    def _registry(self, conn: Connection) -> tuple[int, dict[str, int]]:
+        conn.execute(text(
+            "INSERT INTO source_catalog (name, base_url, cost_tier, latency_class, pit_available, "
+            "revision_behavior, trust_score, priority_rank) "
+            "VALUES (:name, 'https://data.gdeltproject.org', 'FREE', 'EOD', FALSE, 'NEVER', 'MED', 8) "
+            "ON CONFLICT (name) DO NOTHING"), {"name": GKG_SOURCE_NAME})
+        src = conn.execute(text("SELECT id FROM source_catalog WHERE name = :name"),
+                           {"name": GKG_SOURCE_NAME}).scalar_one()
+        ids: dict[str, int] = {}
+        for name, desc in GKG_FEATURES.items():
+            conn.execute(text(
+                "INSERT INTO feature_registry (name, family, description, transformation, "
+                "transformation_version, lag_days, normalization, missing_data_policy, "
+                "eligible_from_date, model_eligible) "
+                "VALUES (:name, 'sentiment', :desc, 'RAW', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2026-11-01', FALSE) "
+                "ON CONFLICT (name) DO NOTHING"), {"name": name, "desc": desc})
+            ids[name] = conn.execute(text("SELECT id FROM feature_registry WHERE name = :name"),
+                                     {"name": name}).scalar_one()
+        return src, ids
+
+    def _load_file(self, stamp: datetime, got: Fetched, summary: RunSummary, write: bool) -> None:
+        parsed = parse_gkg(got.body, stamp)
+        summary.files_loaded += 1
+        summary.events_parsed += parsed.aggregate.docs
+        summary.rows_rejected += parsed.rejected
+        summary.dateadded_mismatch += parsed.date_mismatch
+        if not write:
+            return
+        with self.engine.begin() as conn:
+            self._ledger_loaded(conn, stamp, got, parsed=parsed.aggregate.docs, rejected=parsed.rejected,
+                                inserted=None, aggregate=asdict(parsed.aggregate))
+
+    def _finalise(self, day: date, src_id: int, feat_ids: dict[str, int], summary: RunSummary) -> None:
+        with self.engine.begin() as conn:
+            recorded = self._recorded(conn, day)
+            if len(recorded) != SLOTS_PER_DAY:
+                return
+            loaded = [r for r in recorded.values() if r["status"] == "loaded"]
+            agg = GkgAggregate()
+            for r in loaded:
+                agg.add(GkgAggregate.from_json(r["aggregates"]))
+            published = max((r["published_at"] for r in loaded), default=None)
+            release = release_day(day, published) if published is not None else None
+            done = conn.execute(text(
+                "INSERT INTO gdelt_gkg_daily (summary_date, docs, aggregates, files_loaded, files_missing, "
+                "published_at, release_date) VALUES (:d, :docs, CAST(:agg AS JSONB), :loaded, :missing, :pub, :rel) "
+                "ON CONFLICT (summary_date) DO NOTHING RETURNING summary_date"),
+                {"d": day, "docs": agg.docs if loaded else None, "agg": json.dumps(asdict(agg)) if loaded else None,
+                 "loaded": len(loaded), "missing": SLOTS_PER_DAY - len(loaded), "pub": published,
+                 "rel": release}).scalar()
+            if done is None:
+                return
+            summary.days_finalised.append(day.isoformat())
+            if release is None:
+                return
+            if published.astimezone(timezone.utc).date() > day:
+                summary.late_days.append(day.isoformat())
+            for name, value in gkg_feature_values(agg).items():
+                hit = conn.execute(text(
+                    "INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
+                    "source_priority_used) VALUES (:fid, :od, :rel, :rel, :val, :src) "
+                    "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING RETURNING id"),
+                    {"fid": feat_ids[name], "od": day, "rel": release, "val": value, "src": src_id}).scalar()
+                if hit is None:
+                    summary.features_skipped_existing += 1
+                else:
+                    summary.features_written += 1
+
+
+def run_gkg_daily(db_engine: Engine, write: bool = True) -> dict[str, Any]:
+    """Hermes entry point for GKG files: load and finalise the next days within the daily budget."""
+    summary = GkgLoader(db_engine).run(write=write, budget_seconds=GKG_DAILY_BUDGET_SECONDS)
+    log.info("gdelt_bulk gkg: {s} {f} files ({m} missing), {n} documents, days {d}, {w} feature points{x}",
+             s=summary.status, f=summary.files_loaded, m=summary.files_missing, n=summary.events_parsed,
+             d=",".join(summary.days_finalised) or "-", w=summary.features_written,
+             x=f" ({summary.detail})" if summary.detail else "")
+    return asdict(summary)
 
 def run_daily(db_engine: Engine, write: bool = True) -> dict[str, Any]:
     """Hermes entry point: load and finalise the days since the last one, within the daily budget."""
@@ -622,8 +944,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--until", type=date.fromisoformat, help="last UTC day (default: newest complete day)")
     ap.add_argument("--budget", type=float, default=DAILY_BUDGET_SECONDS,
                     help="seconds before stopping between files; 0 = no limit")
+    ap.add_argument("--kind", choices=("export", "gkg"), default="export",
+                    help="export files (events, 12 gdelt_* features) or GKG files (gkg_* features)")
     args = ap.parse_args(list(argv) if argv is not None else None)
-    summary = GdeltBulkLoader(get_engine()).run(write=args.write, since=args.since, until=args.until,
+    loader = GkgLoader if args.kind == "gkg" else GdeltBulkLoader
+    summary = loader(get_engine()).run(write=args.write, since=args.since, until=args.until,
                                                 budget_seconds=args.budget or None)
     print(json.dumps(asdict(summary), indent=1, default=str))
     return 0 if summary.status in ("ok", "budget", "waiting") else 1

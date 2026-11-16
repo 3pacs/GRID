@@ -173,6 +173,15 @@ def test_a_day_with_no_tone_has_no_average_rather_than_zero():
 
 # --- database ---------------------------------------------------------------------------
 
+#: Every gdelt_bulk migration, in order.
+MIGRATIONS = ("gdelt_bulk_loader_20261116", "gdelt_gkg_20261116")
+
+
+def _migration_ddl() -> tuple[str, ...]:
+    return tuple(stmt for name in MIGRATIONS
+                 for stmt in importlib.import_module(f"migrations.versions.{name}").DDL)
+
+
 _CORE_DDL = (
     """CREATE TABLE source_catalog (
         id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, base_url TEXT NOT NULL,
@@ -193,6 +202,7 @@ _CORE_DDL = (
         resolution_version INTEGER NOT NULL DEFAULT 1)""",
     "CREATE UNIQUE INDEX uq_rs ON resolved_series (feature_id, obs_date, vintage_date)",
 )
+MIGRATION_DDL = _migration_ddl()
 
 
 @pytest.fixture
@@ -201,9 +211,8 @@ def engine(pg_engine):
         conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {SCHEMA}"))
     eng = create_engine(pg_engine.url, connect_args={"options": f"-csearch_path={SCHEMA}"})
-    migration = importlib.import_module("migrations.versions.gdelt_bulk_loader_20261116")
     with eng.begin() as conn:
-        for stmt in _CORE_DDL + migration.DDL:
+        for stmt in _CORE_DDL + MIGRATION_DDL:
             conn.execute(text(stmt))
     yield eng
     eng.dispose()
@@ -251,8 +260,8 @@ def test_a_full_day_loads_and_is_dated_by_its_last_publication(engine):
 
     got = features(engine)
     assert set(got) == set(gb.FEATURES)
-    # Every point: observed on D, known on the UTC date of D's last publication (here D itself).
-    assert {v[:3] for v in got.values()} == {(DAY, DAY, DAY)}
+    # Every point: observed on D, known on D+1 although D's last file went up on D (never release = obs).
+    assert {v[:3] for v in got.values()} == {(DAY, DAY + timedelta(days=1), DAY + timedelta(days=1))}
     assert got["gdelt_total_events"][3] == 192.0 and got["gdelt_events_cn"][3] == 96.0
     assert scalar(engine, "SELECT count(*) FROM gdelt_daily_summary WHERE summary_date < :d", d=DAY) == 1
 
@@ -267,6 +276,24 @@ def test_a_file_published_after_midnight_moves_the_whole_day_to_the_next_date(en
     s = gb.GdeltBulkLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
     assert s.late_days == [DAY.isoformat()]
     assert {v[1:3] for v in features(engine).values()} == {(DAY + timedelta(days=1),) * 2}
+
+
+def test_a_file_published_two_days_late_moves_the_day_to_that_date(engine):
+    legacy_day(engine, DAY - timedelta(days=1))
+    fake = FakeGdelt(NEWEST)
+    fake.add_day(DAY)
+    last = gb.day_stamps(DAY)[-1]
+    fake.put(last, export_zip(last, [export_row(9_000_001, last)]), last + timedelta(hours=25))
+    s = gb.GdeltBulkLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
+    assert s.late_days == [DAY.isoformat()]
+    assert {v[1:3] for v in features(engine).values()} == {(DAY + timedelta(days=2),) * 2}
+
+
+def test_release_day_is_never_the_observed_day():
+    d = date(2026, 11, 15)
+    assert gb.release_day(d, datetime(2026, 11, 15, 23, 34, tzinfo=UTC)) == date(2026, 11, 16)
+    assert gb.release_day(d, datetime(2026, 11, 14, 23, 0, tzinfo=UTC)) == date(2026, 11, 16)
+    assert gb.release_day(d, datetime(2026, 11, 17, 0, 5, tzinfo=UTC)) == date(2026, 11, 17)
 
 
 def test_without_last_modified_the_fetch_instant_dates_the_day(engine):
@@ -348,8 +375,8 @@ def test_an_existing_point_for_the_same_vintage_is_kept_and_reported(engine):
     with engine.begin() as conn:
         src, ids = loader._registry(conn)
         conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
-                          "source_priority_used) VALUES (:f, :d, :d, :d, 1.0, :s)"),
-                     {"f": ids["gdelt_conflict_count"], "d": DAY, "s": src})
+                          "source_priority_used) VALUES (:f, :d, :k, :k, 1.0, :s)"),
+                     {"f": ids["gdelt_conflict_count"], "d": DAY, "k": DAY + timedelta(days=1), "s": src})
     s = loader.run(write=True, budget_seconds=None)
     assert s.features_written == 11 and s.features_skipped_existing == 1
     assert features(engine)["gdelt_conflict_count"][3] == 1.0
@@ -412,3 +439,121 @@ def test_today_is_not_finalised_before_its_last_file(engine):
     fake.add_day(DAY)
     s = gb.GdeltBulkLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
     assert s.first_day is None and fake.export_calls() == []
+
+
+# --- GKG files ---------------------------------------------------------------------------
+
+
+def gkg_row(record: str, stamp: datetime, *, countries: tuple[str, ...] = (), persons: tuple[str, ...] = (),
+            allnames: tuple[str, ...] = (), themes: tuple[str, ...] = (), tone: str = "-2.5",
+            ncols: int = gb.GKG_COLUMNS) -> list[str]:
+    row = [""] * ncols
+    row[gb.GKG_COL_RECORDID] = record
+    if ncols > gb.GKG_COL_ALLNAMES:
+        row[gb.GKG_COL_DATE] = gb.format_stamp(stamp)
+        row[gb.GKG_COL_THEMES] = "".join(f"{t};" for t in themes)
+        row[gb.GKG_COL_V2LOCATIONS] = ";".join(f"1#Place#{c}#{c}##0#0#{c}#10" for c in countries)
+        row[gb.GKG_COL_PERSONS] = ";".join(persons)
+        row[gb.GKG_COL_V2TONE] = f"{tone},1,2,3,4,5,600"
+        row[gb.GKG_COL_ALLNAMES] = ";".join(f"{n},12" for n in allnames)
+    return row
+
+
+def gkg_zip(stamp: datetime, rows: list[list[str]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{gb.format_stamp(stamp)}.gkg.csv", "".join("\t".join(r) + "\n" for r in rows))
+    return buf.getvalue()
+
+
+def test_gkg_groups_match_fips_pairs_exact_names_and_theme_sets():
+    stamp = datetime(2026, 11, 13, 12, tzinfo=UTC)
+    rows = [
+        gkg_row("a", stamp, countries=("US", "CH"), persons=("vladimir putin",), themes=("ECON_INFLATION",), tone="-1"),
+        gkg_row("b", stamp, countries=("US",), allnames=("Chinese President Xi Jinping", "Maxi Jinpingo"), themes=("WB_442_INFLATION", "SANCTIONS"),
+                tone="-3"),
+        gkg_row("c", stamp, persons=("kimberly powell",), allnames=("Jerome Powells Bakery",),
+                countries=("CH", "TW", "US")),                     # neither is Jerome Powell
+        gkg_row("a", stamp, countries=("US", "CH")),                    # repeated record id: counted once
+        gkg_row("d", stamp, ncols=20),                                  # wrong width: rejected
+        gkg_row("e", stamp, tone="n/a", persons=("scott bessent",)),   # no tone: counted, not averaged
+    ]
+    parsed = gb.parse_gkg(gkg_zip(stamp, rows), stamp)
+    agg = parsed.aggregate
+    assert (agg.docs, parsed.rejected, parsed.date_mismatch) == (4, 1, 0)
+    assert agg.groups["pair_us_china"] == [2, -1.0 - 2.5, 2]
+    assert agg.groups["pair_china_taiwan"][0] == 1 and agg.groups["pair_us_russia"][0] == 0
+    assert agg.groups["person_putin"][0] == 1 and agg.groups["person_xi"][0] == 1
+    assert agg.groups["person_powell"][0] == 0 and agg.groups["person_bessent"] == [1, 0.0, 0]
+    assert agg.groups["theme_inflation"] == [2, -4.0, 2] and agg.groups["theme_sanctions"][0] == 1
+    values = gb.gkg_feature_values(agg)
+    assert values["gkg_docs_total"] == 4.0 and values["gkg_theme_inflation_tone"] == pytest.approx(-2.0)
+    assert values["gkg_person_bessent_docs"] == 1.0 and "gkg_person_bessent_tone" not in values
+    assert "gkg_person_yellen_docs" not in gb.GKG_FEATURES
+
+
+def test_gkg_aggregates_survive_json_and_add_up():
+    stamp = datetime(2026, 11, 13, 12, tzinfo=UTC)
+    a = gb.parse_gkg(gkg_zip(stamp, [gkg_row("a", stamp, themes=("SANCTIONS",), tone="-2")]), stamp).aggregate
+    total = gb.GkgAggregate.from_json(json.loads(json.dumps(a.__dict__)))
+    total.add(a)
+    assert total.docs == 2 and total.groups["theme_sanctions"] == [2, -4.0, 2]
+
+
+class FakeGkg(FakeGdelt):
+    def add_gkg_day(self, day: date, published_offset: timedelta = timedelta(minutes=-11)) -> None:
+        for i, stamp in enumerate(gb.day_stamps(day)):
+            rows = [gkg_row(f"{stamp:%Y%m%d%H%M}-1", stamp, countries=("US", "IR"), themes=("SANCTIONS",),
+                            tone="-4"),
+                    gkg_row(f"{stamp:%Y%m%d%H%M}-2", stamp, allnames=("Scott Bessent",), tone="1")]
+            self.files[gb.gkg_url(stamp)] = gb.Fetched(
+                200, gkg_zip(stamp, rows), format_datetime(stamp + published_offset, usegmt=True), self.fetched_at)
+
+
+def test_a_gkg_day_is_written_dated_after_the_day_and_never_model_eligible(engine):
+    fake = FakeGkg(NEWEST)
+    fake.add_gkg_day(DAY)
+    s = gb.GkgLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
+    assert s.status == "ok" and s.first_day == DAY.isoformat() and s.days_finalised == [DAY.isoformat()]
+    assert all(".gkg.csv.zip" in u for u in fake.calls if u != gb.LASTUPDATE_URL)
+    with engine.connect() as conn:
+        day = conn.execute(text("SELECT * FROM gdelt_gkg_daily")).mappings().one()
+        eligible = conn.execute(text("SELECT bool_or(model_eligible) FROM feature_registry "
+                                     "WHERE name LIKE 'gkg_%'")).scalar()
+    assert (day["docs"], day["files_loaded"], day["release_date"]) == (192, 96, DAY + timedelta(days=1))
+    assert eligible is False
+    got = features(engine)
+    assert {v[1:3] for v in got.values()} == {(DAY + timedelta(days=1),) * 2}
+    assert got["gkg_pair_us_iran_docs"][3] == 96.0 and got["gkg_pair_us_iran_tone"][3] == -4.0
+    assert got["gkg_person_bessent_docs"][3] == 96.0 and got["gkg_docs_total"][3] == 192.0
+    assert "gkg_person_xi_tone" not in got and got["gkg_person_xi_docs"][3] == 0.0
+
+    fake.calls.clear()
+    again = gb.GkgLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
+    assert again.days_finalised == [] and [u for u in fake.calls if u != gb.LASTUPDATE_URL] == []
+
+
+def test_export_and_gkg_files_of_one_stamp_are_separate_ledger_rows(engine):
+    legacy_day(engine, DAY - timedelta(days=1))
+    fake = FakeGkg(NEWEST)
+    fake.add_day(DAY)
+    fake.add_gkg_day(DAY)
+    gb.GdeltBulkLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
+    gb.GkgLoader(engine, fetch=fake).run(write=True, budget_seconds=None)
+    assert scalar(engine, "SELECT count(*) FROM gdelt_export_files WHERE kind = 'export'") == 96
+    assert scalar(engine, "SELECT count(*) FROM gdelt_export_files WHERE kind = 'gkg'") == 96
+    assert scalar(engine, "SELECT count(*) FROM gdelt_daily_summary WHERE summary_date = :d", d=DAY) == 1
+
+
+def test_gkg_runs_take_their_own_lock(engine):
+    fake = FakeGkg(NEWEST)
+    fake.add_gkg_day(DAY)
+    with engine.connect() as holder:
+        holder.execute(text("SELECT pg_advisory_lock(:k)"), {"k": gb.LOCK_KEY})
+        try:
+            assert gb.GkgLoader(engine, fetch=fake).run(write=True, budget_seconds=None).status == "ok"
+            holder.execute(text("SELECT pg_advisory_lock(:k)"), {"k": gb.GKG_LOCK_KEY})
+            assert gb.GkgLoader(engine, fetch=fake).run(write=False).status == "locked"
+        finally:
+            holder.execute(text("SELECT pg_advisory_unlock_all()"))
+            holder.commit()
