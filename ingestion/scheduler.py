@@ -686,6 +686,17 @@ def run_flow_materialize_daily(
 # pre-market as that new day's pull. A skip is logged; the next slot runs.
 DOMESTIC_SLOT_MAX_LATE_MINUTES = 90
 
+# The domestic morning slot follows New York, not UTC (2026-11-16, Anik). A fixed
+# 13:30Z slot was 09:30 EDT but 08:30 EST: from the 2026-11-01 clock change every
+# winter morning run fell before the open, its options pull skipped ("session has
+# not opened yet", 0/206 tickers) and the GEM capture, which waits for that pull's
+# completion by 10:05 New York, skipped every session from 2026-11-02. 09:30 New
+# York fires at 13:30Z in summer (unchanged) and 14:30Z in winter. The receipt
+# attribution keeps recording the UTC time the slot actually fired.
+DOMESTIC_MORNING_SLOT = "09:30"
+DOMESTIC_MORNING_SLOT_TZ = "America/New_York"
+DOMESTIC_UTC_SLOTS = ("16:00", "20:00", "22:00")
+
 
 def _scheduler_utc_now() -> datetime:
     """Aware UTC clock for call-time windows (a seam for tests)."""
@@ -706,12 +717,17 @@ def _routine_yfinance_start(now_utc: datetime | None = None) -> str:
     return (last_session - timedelta(days=YFINANCE_WINDOW_OVERLAP_DAYS)).isoformat()
 
 
-def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
+def _slot_lateness(slot_hhmm: str, now: datetime | None = None, tz: str | None = None) -> timedelta:
     """How long after the most recent HH:MM occurrence ``now`` is.
 
     ``now`` defaults to the host-local naive clock -- the same clock
-    ``schedule.every().<day>.at("HH:MM")`` (no tz argument) fires on.
+    ``schedule.every().<day>.at("HH:MM")`` (no tz argument) fires on. With
+    ``tz`` the slot is HH:MM on that zone's wall clock (``.at("HH:MM", tz)``)
+    and ``now`` (aware, default the UTC clock) is read in that zone.
     """
+    if tz is not None:
+        from zoneinfo import ZoneInfo
+        now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz))
     now = now or datetime.now()
     hh, mm = (int(x) for x in slot_hhmm.split(":"))
     slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -720,14 +736,21 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
     return now - slot
 
 
-# yfinance daily-close capture slots (all UTC).
+def _slot_utc_label(slot_hhmm: str, tz: str, now: datetime | None = None) -> str:
+    """The UTC HH:MM at which the most recent ``slot_hhmm`` (``tz`` wall clock) occurred."""
+    now = now or datetime.now(timezone.utc)
+    return (now - _slot_lateness(slot_hhmm, now, tz)).astimezone(timezone.utc).strftime("%H:%M")
+
+
+# yfinance daily-close capture slots (all UTC except the domestic morning slot).
 #
 # Generic supported US-listed daily captures become POLICY_ELIGIBLE after the
 # next New York midnight (04:00Z EDT / 05:00Z EST). SPY close preserves its
 # separate post-UTC-day-end contract. Eligibility is not provider finality.
 #   * 05:15Z targets the previous UTC day's US session, including Friday on
 #     Saturday, after both generic New York-midnight boundaries have elapsed.
-#   * 13:30Z is 09:30 EDT / 08:30 EST. It and 16:00Z/20:00Z/22:00Z retain raw
+#   * The morning slot is 09:30 New York (13:30Z EDT / 14:30Z EST; until
+#     2026-11-16 a fixed 13:30Z, 08:30 EST). It and 16:00Z/20:00Z/22:00Z retain raw
 #     snapshots; no slot promises an exchange-opening print or provider-final
 #     close. Supported same-day US-listed bars are INCOMPLETE; unsupported
 #     policy is UNKNOWN. Raw history and qualified-close selection differ.
@@ -1720,7 +1743,9 @@ def run_pushshift_backfill(data_dir: str = "/data/pushshift") -> dict[str, Any]:
 # ── Domestic pull functions ───────────────────────────────────────────
 
 
-def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = None) -> None:
+def run_daily_pulls(
+    start_date: str | date = "1990-01-01", slot: str | None = None, slot_tz: str | None = None,
+) -> None:
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
@@ -1737,13 +1762,15 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
               any. A slot released more than DOMESTIC_SLOT_MAX_LATE_MINUTES
               late (an earlier job held the single-threaded loop) is
               skipped rather than run as a mis-timed catch-up.
+        slot_tz: The zone ``slot`` is a wall-clock time in (the morning
+              slot: America/New_York); None means the UTC host clock.
     """
     from datetime import date as _date
 
     from ingestion.market_calendar import is_market_open
 
     if slot is not None:
-        late = _slot_lateness(slot)
+        late = _slot_lateness(slot) if slot_tz is None else _slot_lateness(slot, tz=slot_tz)
         if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
             log.warning(
                 "Skipping the {s} run_daily_pulls slot: released {m:.0f} min late "
@@ -1769,7 +1796,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
         _run_equity_pulls(
             start_date,
             yfinance_start=_routine_yfinance_start() if slot is not None else None,
-            yfinance_slot=slot,
+            yfinance_slot=(_slot_utc_label(slot, slot_tz) if slot is not None and slot_tz
+                           else slot),
         )
 
     # --- 24/7 pullers (crypto, OSINT, sentiment — always run) ---
@@ -2491,15 +2519,19 @@ def start_scheduler() -> None:
 
     # --- Domestic schedules ---
 
-    # Domestic clock slots stay fixed: 13:30/16:00/20:00/22:00 on the UTC host.
-    # 13:30 UTC is 09:30 EDT / 08:30 EST; there is no seasonal clock shift here.
+    # Domestic slots: 09:30 New York (13:30Z EDT / 14:30Z EST, see
+    # DOMESTIC_MORNING_SLOT), then 16:00/20:00/22:00 fixed on the UTC host.
     # yfinance runs in every slot as raw snapshots, without an opening-print
     # promise. The 05:15 morning slot targets the prior session separately.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
                 "saturday", "sunday"]:
-        for utc_time in ["13:30", "16:00", "20:00", "22:00"]:
+        getattr(schedule.every(), day).at(DOMESTIC_MORNING_SLOT, DOMESTIC_MORNING_SLOT_TZ).do(
+            run_daily_pulls, start_date=ongoing_start,
+            slot=DOMESTIC_MORNING_SLOT, slot_tz=DOMESTIC_MORNING_SLOT_TZ,
+        )
+        for utc_time in DOMESTIC_UTC_SLOTS:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )
