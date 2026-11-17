@@ -94,7 +94,8 @@ def _24x7_pullers_ran(world: _World) -> None:
     mods = world.modules
     mods["ingestion.coingecko"].CoinGeckoPuller.return_value.pull_all.assert_called_once()
     mods["ingestion.altdata.google_trends"].GoogleTrendsPuller.return_value.pull_all.assert_called_once()
-    mods["ingestion.crucix_bridge"].CrucixBridgePuller.return_value.pull_all.assert_called_once()
+    # Crucix left run_daily_pulls on 2026-11-17 (grid-intelligence runs it every 15 min).
+    mods["ingestion.crucix_bridge"].CrucixBridgePuller.assert_not_called()
     mods["ingestion.ml.finbert_scorer"].FinBERTScorer.return_value.score_all_sources.assert_called_once()
     mods["scripts.auto_regime"].run.assert_called_once()
 

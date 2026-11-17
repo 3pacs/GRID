@@ -131,3 +131,32 @@ def test_zero_row_daily_runs_record_smart_scheduler_markers(
     from ingestion.source_freshness import RUN_NO_NEW_DATA, RUN_SKIPPED, run_outcome
     expected = RUN_SKIPPED if outcome == "SKIPPED" else RUN_NO_NEW_DATA
     assert run_outcome(row["status"], row["rows_inserted"], row["error_message"]) == expected
+
+
+def test_daily_group_does_not_run_crucix(monkeypatch):
+    """grid-intelligence (every 15 min) and SmartScheduler (hourly) run the Crucix
+    bridge; grid-scheduler's copies only re-inserted deduplicated news."""
+    import ingestion.scheduler as sched
+
+    constructed = _stub_registration_imports(monkeypatch)
+    names = [entry[0] for entry in sched._get_pullers_for_group("daily", None, {})]
+
+    assert names, "registration produced no pullers; the stubbing is broken"
+    assert "Crucix" not in names
+    assert "CrucixBridgePuller" not in constructed
+
+
+def test_run_daily_pulls_does_not_call_crucix():
+    source = (ROOT / "ingestion/scheduler.py").read_text(encoding="utf-8")
+    node = next(n for n in ast.parse(source).body
+                if isinstance(n, ast.FunctionDef) and n.name == "run_daily_pulls")
+    imported = {alias.name for n in ast.walk(node) if isinstance(n, ast.ImportFrom)
+                for alias in n.names}
+    assert "CrucixBridgePuller" not in imported
+
+
+def test_crucix_still_runs_elsewhere():
+    intel = (ROOT / "intelligence/scheduler.py").read_text(encoding="utf-8")
+    smart = (ROOT / "ingestion/smart_scheduler.py").read_text(encoding="utf-8")
+    assert "_sched.every(15).minutes.do(_crucix_ingest)" in intel
+    assert '"crucix_bridge"' in smart and '"ingestion.crucix_bridge"' in smart
