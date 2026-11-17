@@ -12,7 +12,8 @@ import pathlib
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -21,6 +22,7 @@ import tests.test_godview_no_incident_imports as guard
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 UNIT_DIR = REPO / "deploy" / "systemd"
+_ET = ZoneInfo("America/New_York")
 
 
 # ── arguments and code sha ────────────────────────────────────────────────
@@ -263,7 +265,14 @@ def test_service_unit_runs_the_runner_from_the_release_tree(pillar):
     "pillar,calendars",
     [
         ("fed", ["Thu *-*-* 17:30:00 America/New_York", "Fri *-*-* 09:00:00 America/New_York"]),
-        ("cftc", ["Fri *-*-* 16:00:00 America/New_York", "Sat *-*-* 14:00:00 America/New_York"]),
+        (
+            "cftc",
+            [
+                "Fri *-*-* 16:00:00 America/New_York",
+                "Sat *-*-* 14:00:00 America/New_York",
+                "Mon,Tue *-*-* 17:00:00 America/New_York",
+            ],
+        ),
     ],
 )
 def test_timer_schedule(pillar, calendars):
@@ -273,6 +282,61 @@ def test_timer_schedule(pillar, calendars):
     assert t["Unit"] == f"grid-godview-{pillar}.service"
     assert t["Persistent"] == "true"
     assert timer["Install"]["WantedBy"] == "timers.target"
+
+
+_DOW = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+_CAL_RE = re.compile(r"^([A-Za-z,]+) \*-\*-\* (\d\d):(\d\d):(\d\d) America/New_York$")
+
+
+def _timer_fires_after(pillar: str, after: datetime, horizon_days: int = 14) -> datetime:
+    """First instant (UTC) the timer's OnCalendar entries fire strictly after ``after``.
+
+    Understands only the ``<Days> *-*-* HH:MM:SS America/New_York`` form the
+    god view timers use (anything else fails the regex, so a new form needs
+    this helper extended rather than being silently ignored).
+    """
+    t = _unit(f"grid-godview-{pillar}.timer")["Timer"]
+    specs = []
+    for key, value in t.items():
+        if not key.startswith("OnCalendar"):
+            continue
+        m = _CAL_RE.match(value)
+        assert m, value
+        days = {_DOW[d] for d in m.group(1).split(",")}
+        specs.append((days, time(int(m.group(2)), int(m.group(3)), int(m.group(4)))))
+    start_day = after.astimezone(_ET).date()
+    fires = []
+    for k in range(horizon_days):
+        d = start_day + timedelta(days=k)
+        for days, at in specs:
+            if d.weekday() in days:
+                fire = datetime.combine(d, at, tzinfo=_ET).astimezone(timezone.utc)
+                if fire > after:
+                    fires.append(fire)
+    assert fires, f"{pillar} timer never fires within {horizon_days} days of {after}"
+    return min(fires)
+
+
+def test_cftc_timer_runs_soon_after_every_scheduled_release_including_holiday_weeks():
+    """Every Tuesday report 2024-2030: the writer runs within 2 hours of the
+    puller's earliest pull (release + 15 min), holiday-shifted weeks included.
+
+    Pins the 2026-11 gap: the 2026-11-10 report (Veterans Day week) was
+    released Mon 11-16 15:30 ET, after that week's Fri and Sat runs; a
+    Fri/Sat-only timer left it unwritten until Fri 11-20.
+    """
+    from ingestion.altdata.cftc_markets import compute_release
+
+    d = date(2024, 1, 2)  # a Tuesday
+    shifted_seen = 0
+    while d.year <= 2030:
+        rel = compute_release(d)
+        pullable = rel.release_at + timedelta(minutes=15)
+        fire = _timer_fires_after("cftc", pullable)
+        assert fire - pullable <= timedelta(hours=2), (d, rel.release_at, fire)
+        shifted_seen += rel.holiday_shifted
+        d += timedelta(days=7)
+    assert shifted_seen >= 20  # the loop really covered holiday weeks
 
 
 def test_units_are_templates_not_installed_by_any_workflow():
