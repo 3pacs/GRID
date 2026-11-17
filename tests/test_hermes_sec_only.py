@@ -631,6 +631,12 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # timeout_s 600, TIINGO_API_KEY, with a 2-line comment) and its
         # REGISTRY_CATALOG_NAMES alias finra_dix -> FINRA_SHORT_VOLUME. Needs
         # reviewer acceptance like the prior pins.
+        # SCHED re-pinned 01432bbd -> 8bb8a00f (2026-11-17,
+        # claude/scheduler-retire-dead-pullers-20261117): the only scheduler
+        # edits are dated hold_reason values on the existing prediction_odds
+        # and cloudflare_radar PULLER_REGISTRY entries (both never wrote a
+        # row); no other field, entry or code changes. Needs reviewer
+        # acceptance like the prior pins.
         # OPER re-pinned 69b8efc2 -> de4a1205 (2026-11-15, PR1219):
         # only Oracle startup sync failure logging changes DEBUG message text
         # to WARNING with safe class/SQLSTATE. SEC behavior is unchanged.
@@ -684,7 +690,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','8bb8a00fcaaa1c741e4bcd6dadf760faf15d240a87e0e928ca3daf7e080a67a8')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

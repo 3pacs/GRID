@@ -36,6 +36,8 @@ def _stub_registration_imports(monkeypatch, users: dict[str, list] | None = None
 
     def fixture_class(name):
         class FixturePuller:
+            BLS_API_KEY = None  # read off the stubbed config.settings
+
             def __init__(self, *args, **kwargs):
                 constructed.append(name)
                 self.kwargs = kwargs
@@ -198,7 +200,7 @@ _PRODUCING = [
     "Fed_Liquidity", "SEC_XBRL_Financials", "ETF_Flows", "News_Scraper_RSS",
     "Analyst_Ratings", "DeFi_Llama", "Etherscan", "FMP_Earnings",
     "Wikipedia_Pageviews", "Wikipedia_Topic_Pageviews", "yfinance_Earnings",
-    "NASA_FIRMS", "Tiingo_News", "CBOE_Indices", "StockTwits",
+    "NASA_FIRMS", "Tiingo_News", "BLS", "CBOE_Indices", "StockTwits",
     "SEC_EDGAR_Fundamentals", "MarketWatch_News", "Google_Trends_Daily",
     "EIA_Energy", "NOAA_Space_Weather", "NASA_Fire", "Open_Meteo", "nowcast",
     "USASpending", "FINRA_Margin", "LittleSis", "Wikidata_Relations",
