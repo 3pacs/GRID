@@ -71,12 +71,37 @@ component, a legacy-row collision, or a too-early ``as_of_ts`` all mean the
 candidate Wednesday is skipped and the reason is recorded on its
 ``RowResult`` -- never a hard-coded WALCL/TGA value like the untracked
 incident materializer used (see ``godview/__init__.py``).
+
+RRP on a holiday Wednesday (2026-11-17)
+---------------------------------------
+RRPONTSYD has no observation on a Federal Reserve holiday (no operation is
+held), so before this rule a Wednesday holiday -- Veterans Day 2026-11-11,
+Christmas / New Year's Day / Juneteenth / Independence Day on a Wednesday --
+never got a row at all (``missing_rrp``), although WALCL and WTREGEN for it
+are published on the usual H.4.1. ``select_rrp_observation`` now uses the
+last RRP observation before such a Wednesday, under three conditions:
+
+* the Wednesday itself is not a Federal Reserve business day. A missing RRP
+  on a business day is not a holiday gap: before 2013 RRPONTSYD is sparse
+  (no observation means no operation that day), and carrying a value over
+  those days would invent a level that was never reported. Those Wednesdays
+  stay ``missing_rrp`` exactly as before;
+* the carried observation is at most ``RRP_CARRY_MAX_BUSINESS_DAYS`` Federal
+  Reserve business days older than the Wednesday (otherwise ``missing_rrp``);
+* point in time: its own same-day release (``RRP_RELEASE_TIME_ET``) and its
+  ``pull_timestamp`` are both at or before the run's ``as_of_ts``.
+
+A carried value is recorded on the row: the RRP entry of ``source_ref.inputs``
+carries the observation date actually used and ``carried_forward: true``, and
+``source_ref.rrp_carry_forward`` names the rule, both dates and the staleness.
+Rows whose RRP is the exact Wednesday keep exactly the ``source_ref`` they had.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
@@ -174,6 +199,16 @@ SKIP_BEFORE_RELEASE = "before_scheduled_release"
 SKIP_MISSING_PULL_TIMESTAMP = "missing_pull_timestamp"
 SKIP_BLOCKED_BY_LEGACY_ROW = "blocked_by_legacy_row_requires_a2_archive"
 
+#: Holiday carry-forward of RRPONTSYD (see the module docstring). RRP results
+#: are published the same day, ~13:15 ET (newyorkfed.org reverse repo
+#: operation results); that instant is the carried value's own release time.
+RRP_CARRY_FORWARD_RULE_ID = "rrp_holiday_carry_forward_v1"
+RRP_CARRY_MAX_BUSINESS_DAYS = 5
+RRP_RELEASE_TIME_ET = time(13, 15)
+#: How far before ``start`` the RRP read reaches, so a carried value just
+#: before ``start`` is still found. Covers 5 business days plus holidays.
+_RRP_CARRY_LOOKBACK_DAYS = 14
+
 
 # ---------------------------------------------------------------------------
 # Federal Reserve holiday calendar (H.4.1 release-schedule shift only)
@@ -233,11 +268,26 @@ def federal_reserve_holidays(year: int) -> frozenset[date]:
     return frozenset(holidays)
 
 
+def is_federal_reserve_business_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in federal_reserve_holidays(d.year)
+
+
 def _next_federal_business_day(d: date) -> date:
     """``d`` if it is already a Federal Reserve business day, else the next one."""
-    while d.weekday() >= 5 or d in federal_reserve_holidays(d.year):
+    while not is_federal_reserve_business_day(d):
         d += timedelta(days=1)
     return d
+
+
+def federal_reserve_business_days_after(earlier: date, later: date) -> int:
+    """Federal Reserve business days ``d`` with ``earlier < d <= later``."""
+    n = 0
+    d = earlier + timedelta(days=1)
+    while d <= later:
+        if is_federal_reserve_business_day(d):
+            n += 1
+        d += timedelta(days=1)
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +329,47 @@ def compute_release_at(obs_date: date) -> tuple[datetime | None, str]:
             f"obs_date + {FED_RELEASE_LAG_DAYS}d 16:30 America/New_York ({_H41_URL})"
         )
     return release_at, note
+
+
+def select_rrp_observation(
+    rrp_obs: Sequence,
+    obs_date: date,
+    reference_ts: datetime,
+    *,
+    max_business_days: int = RRP_CARRY_MAX_BUSINESS_DAYS,
+):
+    """The RRPONTSYD observation to use for ``obs_date``, and its staleness.
+
+    ``rrp_obs`` are ``store.observations`` rows sorted by ``obs_date``
+    ascending (``read_window``'s order). Returns ``(observation,
+    business_days_stale)``:
+
+    * ``(obs, None)`` -- an observation exists for ``obs_date`` itself
+      (unchanged behaviour, no carry);
+    * ``(obs, n)`` -- carried forward from ``obs.obs_date``, ``n`` Federal
+      Reserve business days earlier. Only when ``obs_date`` is not itself a
+      Federal Reserve business day, ``n <= max_business_days``, and the
+      carried value was both released (same day, ``RRP_RELEASE_TIME_ET``)
+      and pulled at or before ``reference_ts``;
+    * ``(None, None)`` -- nothing usable: the Wednesday stays ``missing_rrp``.
+    """
+    idx = bisect_right(rrp_obs, obs_date, key=lambda o: o.obs_date)
+    if idx == 0:
+        return None, None
+    candidate = rrp_obs[idx - 1]
+    if candidate.obs_date == obs_date:
+        return candidate, None
+    if is_federal_reserve_business_day(obs_date):
+        return None, None
+    stale = federal_reserve_business_days_after(candidate.obs_date, obs_date)
+    if stale > max_business_days:
+        return None, None
+    reference_ts = _ensure_aware_utc(reference_ts)
+    if datetime.combine(candidate.obs_date, RRP_RELEASE_TIME_ET, tzinfo=_ET) > reference_ts:
+        return None, None
+    if candidate.pull_timestamp is None or _ensure_aware_utc(candidate.pull_timestamp) > reference_ts:
+        return None, None
+    return candidate, stale
 
 
 def compute_net_liquidity_millions(
@@ -395,6 +486,7 @@ class RowResult:
     availability_basis: str | None = None
     release_at: datetime | None = None
     inputs: tuple[InputProvenance, ...] = ()
+    rrp_carried_from: date | None = None  # set when RRP was carried forward over a holiday
 
 
 @dataclass(frozen=True)
@@ -548,9 +640,11 @@ def _log_row(row: RowResult, *, code_sha: str, run_id: str) -> None:
     if row.status in ("written", "noop"):
         log.info(
             "godview.fed_liquidity {label} obs_date={obs_date} net_liquidity_usd_m={nl} "
-            "availability_basis={basis} release_at={release_at} code_sha={sha} run_id={run_id} inputs={inputs}",
+            "availability_basis={basis} release_at={release_at} rrp_carried_from={carried} "
+            "code_sha={sha} run_id={run_id} inputs={inputs}",
             label="WRITTEN" if row.status == "written" else "UNCHANGED",
             obs_date=row.obs_date,
+            carried=row.rrp_carried_from,
             nl=row.net_liquidity_usd_m,
             basis=row.availability_basis,
             release_at=row.release_at,
@@ -622,8 +716,11 @@ def materialize_fed_liquidity(
             wtregen_obs = obs_store.read_window(
                 conn, WTREGEN_SERIES_ID, source=SOURCE_NAME, start=start, as_of=as_of, as_of_ts=as_of_ts
             )
+            # RRP reaches a little before ``start`` so a holiday Wednesday at
+            # the start of the range can still find the value it carries.
+            rrp_start = start - timedelta(days=_RRP_CARRY_LOOKBACK_DAYS) if start is not None else None
             rrp_obs = obs_store.read_window(
-                conn, RRP_SERIES_ID, source=SOURCE_NAME, start=start, as_of=as_of, as_of_ts=as_of_ts
+                conn, RRP_SERIES_ID, source=SOURCE_NAME, start=rrp_start, as_of=as_of, as_of_ts=as_of_ts
             )
 
             if not walcl_obs and not wtregen_obs and not rrp_obs:
@@ -636,7 +733,7 @@ def materialize_fed_liquidity(
             candidate_dates = sorted(
                 d
                 for d in (set(walcl_by_date) | set(wtregen_by_date) | set(rrp_by_date))
-                if d.weekday() == _WEDNESDAY
+                if d.weekday() == _WEDNESDAY and (start is None or d >= start)
             )
 
             written: list[RowResult] = []
@@ -646,7 +743,11 @@ def materialize_fed_liquidity(
             for obs_date in candidate_dates:
                 walcl_o = walcl_by_date.get(obs_date)
                 wtregen_o = wtregen_by_date.get(obs_date)
-                rrp_o = rrp_by_date.get(obs_date)  # exact Wednesday only -- no nearest-day fallback
+                # Exact Wednesday, or (only on a Fed holiday Wednesday) the
+                # last earlier RRP within the staleness bound -- never a
+                # nearest-day fallback on a business day.
+                rrp_o, rrp_stale = select_rrp_observation(rrp_obs, obs_date, reference_ts)
+                rrp_carried = rrp_stale is not None
 
                 if walcl_o is None:
                     skipped.append(RowResult(obs_date=obs_date, status="skipped", reason=SKIP_MISSING_WALCL))
@@ -749,12 +850,21 @@ def materialize_fed_liquidity(
                         },
                         {
                             "series_id": RRP_SERIES_ID,
-                            "obs_date": obs_date.isoformat(),
+                            "obs_date": rrp_o.obs_date.isoformat(),
                             "pull_timestamp": rrp_o.pull_timestamp.isoformat() if rrp_o.pull_timestamp else None,
                             "source": rrp_o.source,
+                            **({"carried_forward": True} if rrp_carried else {}),
                         },
                     ]
                 }
+                if rrp_carried:
+                    source_ref["rrp_carry_forward"] = {
+                        "rule": RRP_CARRY_FORWARD_RULE_ID,
+                        "rrp_obs_date": rrp_o.obs_date.isoformat(),
+                        "target_obs_date": obs_date.isoformat(),
+                        "business_days_stale": rrp_stale,
+                        "max_business_days": RRP_CARRY_MAX_BUSINESS_DAYS,
+                    }
 
                 upsert_result = conn.execute(
                     _UPSERT_SQL,
@@ -781,7 +891,7 @@ def materialize_fed_liquidity(
                 inputs = (
                     InputProvenance(WALCL_SERIES_ID, obs_date, walcl_o.value, walcl_o.pull_timestamp, walcl_o.source),
                     InputProvenance(WTREGEN_SERIES_ID, obs_date, wtregen_o.value, wtregen_o.pull_timestamp, wtregen_o.source),
-                    InputProvenance(RRP_SERIES_ID, obs_date, rrp_o.value, rrp_o.pull_timestamp, rrp_o.source),
+                    InputProvenance(RRP_SERIES_ID, rrp_o.obs_date, rrp_o.value, rrp_o.pull_timestamp, rrp_o.source),
                 )
                 # rowcount is 0 when the upsert's own "IS DISTINCT FROM" WHERE
                 # clause found nothing to change (a re-run with unchanged input
@@ -796,6 +906,7 @@ def materialize_fed_liquidity(
                     availability_basis=basis,
                     release_at=release_at,
                     inputs=inputs,
+                    rrp_carried_from=rrp_o.obs_date if rrp_carried else None,
                 )
                 if actually_changed:
                     written.append(row)

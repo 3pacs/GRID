@@ -516,3 +516,60 @@ def test_runner_sets_transaction_timeouts(gv):
 def test_runner_empty_upstream_exit_code(gv):
     code, summary = runner.run(_args(), gv)
     assert code == runner.EXIT_EMPTY and summary["status"] == cp.STATUS_EMPTY
+
+
+# ── holiday week: late release picked up by the Mon/Tue runs, idempotently ──
+
+
+def test_holiday_week_report_is_written_by_the_monday_run_and_tuesday_is_a_noop(gv):
+    """Veterans Day week 2026: the 11-10 report is released Mon 11-16 15:30 ET
+    (after that week's Fri and Sat timer runs) and pulled ~16:00 ET. The Fri
+    and Sat runs find nothing new (noop), the Mon 17:00 ET run writes exactly
+    that report, and the Tue 17:00 ET run is a clean noop that touches no row.
+    """
+    holiday_report = date(2026, 11, 10)
+    release = compute_release(holiday_report)
+    assert release.holiday_shifted
+    assert release.release_at == datetime(2026, 11, 16, 20, 30, tzinfo=timezone.utc)  # Mon 15:30 EST
+
+    prior_report = holiday_report - timedelta(days=7)
+    with gv.begin() as conn:
+        _insert_history(conn, ES, 159, start=prior_report - timedelta(days=7 * 158))
+    first = cp.materialize_cftc_positioning(
+        gv, code_sha=_CODE_SHA, as_of_ts=datetime(2026, 11, 6, 21, 0, tzinfo=timezone.utc), market_codes=[ES]
+    )
+    assert first.rows_written == 159
+
+    fri = datetime(2026, 11, 13, 21, 0, tzinfo=timezone.utc)  # Fri 16:00 EST
+    sat = datetime(2026, 11, 14, 19, 0, tzinfo=timezone.utc)  # Sat 14:00 EST
+    for ts in (fri, sat):
+        res = cp.materialize_cftc_positioning(gv, code_sha=_CODE_SHA, as_of_ts=ts, market_codes=[ES])
+        assert res.status == cp.STATUS_SUCCESS_NOOP and res.rows_written == 0 and res.rows_skipped == 0
+    with gv.begin() as conn:
+        assert _row(conn, holiday_report) is None
+
+    monday_pull = datetime(2026, 11, 16, 21, 3, tzinfo=timezone.utc)
+    with gv.begin() as conn:
+        _insert_week(conn, ES, holiday_report, net=7, pull=monday_pull)
+
+    mon = datetime(2026, 11, 16, 22, 0, tzinfo=timezone.utc)  # Mon 17:00 EST
+    res_mon = cp.materialize_cftc_positioning(gv, code_sha=_CODE_SHA, as_of_ts=mon, market_codes=[ES])
+    assert res_mon.status == cp.STATUS_SUCCESS and res_mon.rows_written == 1
+    with gv.begin() as conn:
+        row = _row(conn, holiday_report)
+        runs_before = _count(conn, "godview_runs")
+        rows_before = _count(conn, "cftc_positioning_daily")
+    assert row["release_at"] == release.release_at
+    assert row["available_at"] == monday_pull
+    assert row["availability_basis"] == "observed_acquisition"
+
+    tue = datetime(2026, 11, 17, 22, 0, tzinfo=timezone.utc)  # Tue 17:00 EST
+    res_tue = cp.materialize_cftc_positioning(gv, code_sha="other-sha", as_of_ts=tue, market_codes=[ES])
+    assert res_tue.status == cp.STATUS_SUCCESS_NOOP and res_tue.rows_written == 0 and res_tue.rows_skipped == 0
+    with gv.begin() as conn:
+        after = _row(conn, holiday_report)
+        assert _ledger(conn, res_tue.run_id)["status"] == "noop"
+        assert _count(conn, "godview_runs") == runs_before + 1  # only the run's own ledger row
+        assert _count(conn, "cftc_positioning_daily") == rows_before
+    assert after["run_id"] == row["run_id"] and after["code_sha"] == _CODE_SHA
+    assert after["updated_at"] == row["updated_at"]
