@@ -670,10 +670,14 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # the owner released gdelt_bulk_events and gdelt_gkg_daily ("1-4 for
         # gdelt"): both move from DAILY_INTEL_HOLD_REASONS into
         # DAILY_INTEL_INITIAL_ALLOWLIST with a comment each; no code changes.
+        # Then edfaf95e -> 46709a4a (2026-11-17, claude/hermes-postmortem-last-20261117):
+        # postmortem_batch moves from fifth to last in DAILY_INTEL_TASKS (it
+        # always overruns its 180 s budget) and the ordering comment above the
+        # tuple gains a paragraph; no wrapper, budget or allow-list change.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','edfaf95e3b9f1ca79d66dcd5f54ca38b73e31f074fb4d78a8adba2b03b0f226e'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','46709a4ab1a4f2ec097f3b8c0e6018a89fa0c4fd9aa62860ef6d9824e603a6b3'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
