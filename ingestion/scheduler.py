@@ -165,6 +165,7 @@ _SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "Tiingo_Prices": ("TIINGO",),
     "USASpending": ("USASPENDING_GOV",),
     "Wikipedia_Pageviews": ("wikipedia_pageviews",),
+    "Wikipedia_Topic_Pageviews": ("wikipedia_pageviews",),
     "WorldNews": ("WorldNewsAPI",),
     "yfinance_Earnings": ("yfinance_earnings",),
 }
@@ -1056,12 +1057,13 @@ def _get_pullers_for_group(
             pullers.append(("OFR", OFRPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("OFR puller init failed: {err}", err=str(exc))
-        # JQuants — Japanese market indices (daily)
-        try:
-            from ingestion.international.jquants import JQuantsPuller
-            pullers.append(("JQuants", JQuantsPuller(db_engine), "pull_all", {}))
-        except Exception as exc:
-            log.warning("JQuants puller init failed: {err}", err=str(exc))
+        # JQuants (Japanese indices) is not run here (retired 2026-11-17, owner):
+        # no raw_series row ever under its source_catalog row (JQuants, id 213)
+        # since its 2026-05-27 registration; runs FAILED on a RetryError until
+        # 11-05, then logged "SKIPPED: JQUANTS_API_KEY not configured". It is
+        # not in SmartScheduler's registry, so there is no hold to lift: re-add
+        # this registration (ingestion.international.jquants.JQuantsPuller,
+        # "pull_all") once a key is configured.
         # EDINET — Japanese corporate filings (daily)
         try:
             from ingestion.international.edinet import EDINETPuller
@@ -1103,10 +1105,17 @@ def _get_pullers_for_group(
             pullers.append(("Unusual_Whales", UnusualWhalesPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Unusual Whales puller init failed: {err}", err=str(exc))
-        # Polymarket prediction market rapid-change detector (daily)
+        # Polymarket prediction market rapid-change detector (daily). Honors the
+        # SmartScheduler registry hold (retired 2026-11-17: no PREDICTION:* row
+        # or signal ever written), so lifting it there brings it back here too.
         try:
-            from ingestion.altdata.prediction_odds import PredictionOddsPuller
-            pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _pred_odds_hold = hold_reason_for("prediction_odds")
+            if _pred_odds_hold:
+                log.info("Prediction Odds held: {r}", r=_pred_odds_hold)
+            else:
+                from ingestion.altdata.prediction_odds import PredictionOddsPuller
+                pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Prediction Odds puller init failed: {err}", err=str(exc))
         # Social smart money — Reddit (SEC Form-4 insider tracking is separate)
@@ -1115,16 +1124,27 @@ def _get_pullers_for_group(
             pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Smart Money puller init failed: {err}", err=str(exc))
-        # Telegram Solana memecoin scanner (daily batch)
+        # Telegram / Discord Solana memecoin scanners (daily batch). Only run
+        # when users are configured (2026-11-17): every run since 2026-05-27
+        # logged "SKIPPED: No ... users configured" and sources 510/511 have
+        # no raw_series rows. Setting TELEGRAM_USERS / DISCORD_USERS (or the
+        # single-user env vars each scanner reads) brings them back.
         try:
             from ingestion.altdata.telegram_scanner import TelegramScanner
-            pullers.append(("Telegram_Solana_Scanner", TelegramScanner(db_engine), "pull_all", {}))
+            _tg_users = TelegramScanner._load_users_from_config()
+            if _tg_users:
+                pullers.append(("Telegram_Solana_Scanner", TelegramScanner(db_engine, users=_tg_users), "pull_all", {}))
+            else:
+                log.info("Telegram Scanner not run: no Telegram users configured")
         except Exception as exc:
             log.warning("Telegram Scanner init failed: {err}", err=str(exc))
-        # Discord Solana memecoin scanner (daily batch)
         try:
             from ingestion.altdata.discord_scanner import DiscordScanner
-            pullers.append(("Discord_Solana_Scanner", DiscordScanner(db_engine), "pull_all", {}))
+            _dc_users = DiscordScanner._load_users_from_config()
+            if _dc_users:
+                pullers.append(("Discord_Solana_Scanner", DiscordScanner(db_engine, users=_dc_users), "pull_all", {}))
+            else:
+                log.info("Discord Scanner not run: no Discord users configured")
         except Exception as exc:
             log.warning("Discord Scanner init failed: {err}", err=str(exc))
         # Fed liquidity equation — net liquidity = WALCL - TGA - RRP (daily RRP)
@@ -1203,10 +1223,19 @@ def _get_pullers_for_group(
             pullers.append(("Wikipedia_Pageviews", WikipediaPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikipedia puller init failed: {err}", err=str(exc))
-        # Cloudflare Radar — internet traffic, DDoS, anomalies (daily, no key)
+        # Cloudflare Radar — internet traffic, DDoS, anomalies (daily; needs a
+        # token). Registered once (it was also registered a second time below).
+        # Honors the SmartScheduler registry hold (retired 2026-11-17: no token
+        # configured, no raw_series row ever), so lifting it there brings it
+        # back here too.
         try:
-            from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
-            pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _cf_radar_hold = hold_reason_for("cloudflare_radar")
+            if _cf_radar_hold:
+                log.info("Cloudflare Radar held: {r}", r=_cf_radar_hold)
+            else:
+                from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
+                pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Cloudflare Radar puller init failed: {err}", err=str(exc))
         # Earnings via yfinance — EPS, surprise %, beats/misses (daily)
@@ -1215,18 +1244,17 @@ def _get_pullers_for_group(
             pullers.append(("yfinance_Earnings", EarningsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("yfinance Earnings puller init failed: {err}", err=str(exc))
-        # CryptoQuant — exchange flows, miner flows, SOPR, NUPL, funding (daily)
-        try:
-            from ingestion.altdata.cryptoquant_puller import CryptoQuantPuller
-            pullers.append(("CryptoQuant", CryptoQuantPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("CryptoQuant puller init failed: {err}", err=str(exc))
-        # Polygon.io — options Greeks, stock snapshots, dividends (daily)
-        try:
-            from ingestion.altdata.polygon_puller import PolygonPuller
-            pullers.append(("Polygon", PolygonPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Polygon puller init failed: {err}", err=str(exc))
+        # CryptoQuant and Polygon are not run here (retired 2026-11-17, owner).
+        # Neither is in SmartScheduler's registry, so there is no hold to lift:
+        # re-add the registration when the plan covers the endpoints.
+        #  - CryptoQuant (ingestion.altdata.cryptoquant_puller.CryptoQuantPuller,
+        #    "pull"): no raw_series row ever under source 720 since 2026-05-27;
+        #    runs FAILED auth_failed, then "SKIPPED: ... plan not entitled (HTTP 403)".
+        #  - Polygon (ingestion.altdata.polygon_puller.PolygonPuller, "pull"):
+        #    no raw_series row ever under source 722; options snapshots are not
+        #    in the plan (HTTP 403, then "30 of 30 tickers failed"). Only this
+        #    registration is retired: gex and research read Polygon minute
+        #    history through their own code paths, and the module stays.
         # NASA FIRMS — active fire/thermal anomaly detection (daily)
         try:
             from ingestion.altdata.nasa_firms_puller import NASAFirmsPuller
@@ -1292,12 +1320,10 @@ def _get_pullers_for_group(
             pullers.append(("SEC_EDGAR_Fundamentals", SECEdgarCompanyPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("SEC EDGAR company puller init failed: {err}", err=str(exc))
-        # MarketWatch RSS news (daily)
-        try:
-            from ingestion.altdata.marketwatch_news import MarketWatchNewsPuller
-            pullers.append(("MarketWatch_News", MarketWatchNewsPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("MarketWatch news puller init failed: {err}", err=str(exc))
+        # MarketWatch RSS news: registered once, below, with "pull_all"
+        # (2026-11-17). This copy ran "pull", which reports SUCCESS even when a
+        # feed fails; the later "pull_all" copy then found every article already
+        # stored. pull_all's per-feed results record a failed feed as PARTIAL.
         # Google Trends (daily)
         try:
             from ingestion.altdata.google_trends import GoogleTrendsPuller
@@ -1328,24 +1354,24 @@ def _get_pullers_for_group(
             pullers.append(("Open_Meteo", WeatherPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Open-Meteo init failed: {err}", err=str(exc))
-        # Atlanta Fed GDPNow (daily)
-        try:
-            from ingestion.nowcast_puller import NowcastPuller
-            pullers.append(("Nowcast_GDPNow", NowcastPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Nowcast init failed: {err}", err=str(exc))
+        # Atlanta Fed GDPNow: registered once, below, as "nowcast" (2026-11-17).
+        # "Nowcast_GDPNow" ran the same NowcastPuller.pull first, so the
+        # "nowcast" run never wrote a row. "nowcast" is the pull_log name the
+        # freshness readers match by name (source_freshness pairs it with
+        # SmartScheduler's "nowcast" entry and its catalog row).
         # USASpending.gov (daily)
         try:
             from ingestion.altdata.usaspending_puller import USASpendingPuller
             pullers.append(("USASpending", USASpendingPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("USASpending init failed: {err}", err=str(exc))
-        # USPTO patent search (daily)
-        try:
-            from ingestion.altdata.uspto_puller import USPTOPuller
-            pullers.append(("USPTO_Patents", USPTOPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("USPTO init failed: {err}", err=str(exc))
+        # USPTO_Patents is not run here (retired 2026-11-17, owner): no
+        # raw_series row ever under its catalog row (USPTO_PV, id 628) since its
+        # 2026-05-27 registration; every run logged "NO_NEW_DATA ... 0 rows".
+        # It is not in SmartScheduler's registry, so there is no hold to lift:
+        # re-add ingestion.altdata.uspto_puller.USPTOPuller ("pull") once it is
+        # fixed. The annual group's USPTO_PV (ingestion.physical.patents) is a
+        # different puller and is unchanged.
         # FINRA margin statistics (daily)
         try:
             from ingestion.altdata.finra_margin_puller import FINRAMarginPuller
@@ -1366,10 +1392,13 @@ def _get_pullers_for_group(
             log.warning("Wikidata init failed: {err}", err=str(exc))
         # Fed Speeches — canonical puller registered below (fed_speeches.FedSpeechPuller).
         # Wave 3 dedupe 2026-04-13: deleted fed_speeches_puller.py (orphaned output).
-        # Wikipedia pageviews — anomaly detection on financial topics (daily)
+        # Wikipedia pageviews — anomaly detection on financial topics (daily).
+        # A different puller from WikipediaPuller above (wikipedia.<topic>.views
+        # series, not wiki:<company>), and both write rows. It logged under the
+        # same pull_log name until 2026-11-17; it has its own name now.
         try:
             from ingestion.altdata.wikipedia_pageviews_puller import WikipediaPageviewsPuller
-            pullers.append(("Wikipedia_Pageviews", WikipediaPageviewsPuller(db_engine), "pull", {}))
+            pullers.append(("Wikipedia_Topic_Pageviews", WikipediaPageviewsPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikipedia pageviews init failed: {err}", err=str(exc))
         # GDELT News puller removed in Wave 1 dedupe — canonical gdelt.py is registered above.
@@ -1390,11 +1419,8 @@ def _get_pullers_for_group(
             pullers.append(("nowcast", NowcastPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Nowcast puller init failed: {err}", err=str(exc))
-        try:
-            from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
-            pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Cloudflare Radar puller init failed: {err}", err=str(exc))
+        # Cloudflare_Radar's second registration removed 2026-11-17; the one
+        # above carries the registry hold.
         try:
             from ingestion.altdata.kalshi_markets import KalshiMarketsPuller
             pullers.append(("Kalshi_Markets", KalshiMarketsPuller(db_engine), "pull_all", {}))
@@ -2491,7 +2517,7 @@ def start_scheduler() -> None:
       inside the sequential loop; see start_tiingo_prices_worker)
 
     International/trade/physical:
-    - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, JQuants, EDINET, etc.)
+    - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, EDINET, etc.)
     - Weekly on Sundays at 3:00 AM (OECD, BIS, IMF, etc.)
     - Monthly on the 2nd at 06:00 UTC (Comtrade, Eurostat, NOAA, VIIRS, CEPII)
     - Annual on Jan 15 at 06:30 UTC (Atlas ECI, WIOD, EU KLEMS, Patents)
