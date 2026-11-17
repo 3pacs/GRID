@@ -961,3 +961,40 @@ def sync_all(engine: Engine) -> dict[str, Any]:
         n=total, s=results["status"],
     )
     return results
+
+
+def run_cli(engine: Engine | None = None) -> int:
+    """Run ``sync_all`` for the systemd unit and return a process exit code.
+
+    FAILED (every table errored) returns 1 so the oneshot unit is marked
+    failed and its ExecStartPost health ping is skipped. PARTIAL returns 0
+    (the next 30-minute run retries the failed tables) but is logged loudly
+    with the failing table names. Statement timeouts are not handled here.
+    """
+    if engine is None:
+        from db import get_engine
+
+        engine = get_engine()
+    results = sync_all(engine)
+    print(results)
+    status = results.get("status")
+    failed = [e.get("table") for e in results.get("errors", [])]
+    if status == "FAILED":
+        log.error(
+            "flow_materializer: status=FAILED, all tables errored ({t}) — exiting 1",
+            t=", ".join(map(str, failed)),
+        )
+        return 1
+    if status == "PARTIAL":
+        log.warning(
+            "flow_materializer: status=PARTIAL, {n} table(s) failed ({t}); "
+            "exit 0, next run retries",
+            n=len(failed), t=", ".join(map(str, failed)),
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(run_cli())
