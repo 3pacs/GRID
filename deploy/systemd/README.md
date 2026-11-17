@@ -385,7 +385,7 @@ GRID env file `/home/grid/grid_v4/grid_repo/.env`, under a shared
 
 | Timer | Calendar (America/New_York) | UTC (EDT / EST) | Why |
 |---|---|---|---|
-| `grid-godview-fed.timer` | Thu 17:30, retry Fri 09:00 | 21:30 / 22:30 | H.4.1 publishes Thu ~16:30 ET; FRED lands WALCL/WTREGEN ~30 min later |
+| `grid-godview-fed.timer` | Thu 17:30, retry Fri 09:00; Fri 18:30 | 21:30 / 22:30; 22:30 / 23:30 | H.4.1 publishes Thu ~16:30 ET; FRED lands WALCL/WTREGEN ~30 min later. A Thursday Fed holiday (Thanksgiving) moves H.4.1 to Fri 16:30 ET; the Fri 18:30 run writes that week, and is a `noop` otherwise |
 | `grid-godview-cftc.timer` | Fri 16:00, retry Sat 14:00; Mon + Tue 17:00 | 20:00 / 21:00; 21:00 / 22:00 | COT publishes Fri 15:30 ET; the puller moves to Fri >= 19:45 UTC + a Saturday retry (plan A1). Holiday weeks publish on the next federal business day after the Friday (usually Monday); the Mon/Tue runs pick those up, and are a `noop` in an ordinary week |
 
 Every run writes a `godview_runs` row (`complete`, `noop`,

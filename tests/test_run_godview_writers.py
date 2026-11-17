@@ -264,7 +264,14 @@ def test_service_unit_runs_the_runner_from_the_release_tree(pillar):
 @pytest.mark.parametrize(
     "pillar,calendars",
     [
-        ("fed", ["Thu *-*-* 17:30:00 America/New_York", "Fri *-*-* 09:00:00 America/New_York"]),
+        (
+            "fed",
+            [
+                "Thu *-*-* 17:30:00 America/New_York",
+                "Fri *-*-* 09:00:00 America/New_York",
+                "Fri *-*-* 18:30:00 America/New_York",
+            ],
+        ),
         (
             "cftc",
             [
@@ -337,6 +344,32 @@ def test_cftc_timer_runs_soon_after_every_scheduled_release_including_holiday_we
         shifted_seen += rel.holiday_shifted
         d += timedelta(days=7)
     assert shifted_seen >= 20  # the loop really covered holiday weeks
+
+
+def test_fed_timer_runs_after_every_h41_release_including_thursday_holidays():
+    """Every Wednesday 2024-2030: after the first 22:00 UTC scheduler pull slot
+    at or after the H.4.1 release (``ingestion/scheduler.py``
+    DOMESTIC_UTC_SLOTS, where the FRED legs land), the writer runs within a day.
+
+    A Thursday Fed holiday (Thanksgiving 2026-11-26) moves the release to Fri
+    16:30 ET; with only Thu 17:30 / Fri 09:00 the next run after it was the
+    following Thursday.
+    """
+    from godview.fed_liquidity import compute_release_at
+
+    d = date(2024, 1, 3)  # a Wednesday
+    shifted_seen = 0
+    while d.year <= 2030:
+        release_at, _ = compute_release_at(d)
+        release_utc = release_at.astimezone(timezone.utc)
+        slot = release_utc.replace(hour=22, minute=0, second=0, microsecond=0)
+        if slot < release_utc:
+            slot += timedelta(days=1)
+        fire = _timer_fires_after("fed", slot)
+        assert fire - slot <= timedelta(hours=24), (d, release_at, fire)
+        shifted_seen += release_at.date() != d + timedelta(days=1)
+        d += timedelta(days=7)
+    assert shifted_seen >= 7  # Thanksgiving every year, plus other Thursday holidays
 
 
 def test_units_are_templates_not_installed_by_any_workflow():
