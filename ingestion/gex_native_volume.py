@@ -15,8 +15,18 @@ Payload (``grid.native-volume.v1``), regular session only, completed bars only:
 * ``cumulative_shares``: sum of today's completed exchange regular-session bar volumes.
   A bar counts as completed once ``RECEIPT_GUARD_S`` seconds past its end at
   receipt (the reader requires ``latest_receipt_at >= end + 5``).
-* ``bar_vwap_estimate``: sum(HLC3 x volume) / sum(volume) over those bars, never
-  exact trade VWAP (``exact_trade_vwap`` False).
+* ``bar_vwap_estimate``: sum(HLC3 x weight) / sum(weight) over those bars, never
+  exact trade VWAP (``exact_trade_vwap`` False). Each bar's weight is its volume
+  scaled by how much the quote's consolidated day counter rose over the trailing
+  ``QUOTE_SCALE_BARS`` completed minutes, against the bars' own volume over the
+  same minutes (``quote_scaled_weights``). The bars miss a share of the tape that
+  moves through the day (2026-11-16: 10-36 % per half hour), and plain bar
+  weights let that drift into the VWAP: +$0.26 against Polygon's consolidated
+  bars at 15:59 on a day SPY fell $9, all of it weighting, none of it price.
+  Scaled the same way that day, every minute stayed within $0.04. The quote marks
+  come from earlier runs (``scripts/gex_native_volume_snapshot.py`` keeps them);
+  a bar no mark covers keeps its own volume. ``cumulative_shares`` and ``rvol``
+  stay on the bars' own volume.
 * ``rvol``: ``cumulative_shares / baseline_median_shares`` exactly, where the
   baseline is the median cumulative through the same minute of the previous
   ``BASELINE_SESSIONS`` expected exchange sessions in the same response.
@@ -71,7 +81,10 @@ CALENDAR_VERSION = (f"manifest:{CALENDAR_SHA256}:exchange_calendars:4.11.2:panda
 # Must match gex-watch grid_native_volume (VWAP_BASIS, RVOL_BASIS, INTEGRITY_SCOPE,
 # and this producer's entry in its accepted producer set).
 PRODUCER = "GRID Schwab pricehistory snapshot"
-VWAP_BASIS = "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+VWAP_BASIS = ("HLC3 of native one-minute OHLCV weighted by bar volume scaled to the quote day counter "
+              "over the trailing five minutes; not trade VWAP")
+QUOTE_SCALE_BARS = 5                # trailing completed minutes per scale factor (chosen on 2026-11-16, see above)
+QUOTE_SCALE_LIMITS = (0.5, 3.0)     # a factor outside these is a counter glitch: the bar keeps its own volume
 RVOL_BASIS = "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
 INTEGRITY_SCOPE = "content integrity only; trust requires verified local producer and owner-only custody"
 BASELINE_SESSIONS = 10
@@ -159,16 +172,50 @@ def _payload(now: float, status: str, reason: str | None, **fields: Any) -> dict
     return base
 
 
+def quote_scaled_weights(volumes: list[int], marks: list[tuple[int, int]]) -> tuple[list[float], int]:
+    """Weights for today's completed regular bars (``volumes``, oldest first).
+
+    ``marks`` are (completed_minutes, quote day counter) pairs from runs of this
+    session, including the current one. Bar ``m`` takes the first mark ``e`` that
+    had seen it (``e.n >= m + 1``) and the latest mark ``s`` at least
+    ``QUOTE_SCALE_BARS`` bars before ``e``; its factor is the counter's rise from
+    ``s`` to ``e`` over the bars' volume ``s.n .. e.n - 1``. Only earlier or equal
+    marks are used, so nothing after the current run is read. -> (weights, bars
+    scaled).
+    """
+    by_n: dict[int, int] = {}
+    for n, q in marks:
+        if type(n) is int and type(q) is int and 1 <= n <= len(volumes) and q > 0:
+            by_n[n] = q
+    ns = sorted(by_n)
+    lo, hi = QUOTE_SCALE_LIMITS
+    weights: list[float] = []
+    scaled = 0
+    for m, v in enumerate(volumes):
+        e = next((x for x in ns if x >= m + 1), None)
+        s = next((x for x in reversed(ns) if e is not None and x <= e - QUOTE_SCALE_BARS), None)
+        f = 1.0
+        if e is not None and s is not None:
+            dq, db = by_n[e] - by_n[s], sum(volumes[s:e])
+            if dq > 0 and db > 0 and lo <= dq / db <= hi:
+                f = dq / db
+                scaled += 1
+        weights.append(v * f)
+    return weights, scaled
+
+
 def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: float,
-            receipt_at: float) -> tuple[dict[str, Any], dict[str, Any]]:
+            receipt_at: float, quote_marks: list[tuple[int, int]] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Schwab body + quote + verified local calendar -> (payload, info).
 
-    ``info`` carries the scope-gap reconciliation and the bars consulted (for
-    the envelope's provenance); neither is part of the payload.
+    ``quote_marks``: (completed_minutes, quote day counter) from earlier runs of
+    this session (the runner keeps them); the current run's pair is added here.
+    ``info`` carries the scope-gap reconciliation, the VWAP scaling count and the
+    bars consulted (for the envelope's provenance); none is part of the payload.
     """
     now, receipt_at = _micro(now), _micro(receipt_at)
     bars = _bars(history)
-    info: dict[str, Any] = {"bars": bars, "reconciliation": None}
+    info: dict[str, Any] = {"bars": bars, "reconciliation": None, "quote_mark": None, "vwap_scaled_bars": 0}
     today = _session(now)
     try:
         _, current, expected = calendar_window(now)
@@ -198,7 +245,12 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
     cum = sum(b[4] for b in today_reg)
     if cum <= 0:
         return _payload(now, "unavailable", "zero_volume"), info
-    vwap = sum((b[1] + b[2] + b[3]) / 3.0 * b[4] for b in today_reg) / cum
+    marks: list[tuple[int, int]] = [(x[0], x[1]) for x in (quote_marks or [])]
+    if type(quote_total_volume) is int and quote_total_volume > 0:
+        marks.append((len(today_reg), quote_total_volume))
+        info["quote_mark"] = (len(today_reg), quote_total_volume)
+    weights, info["vwap_scaled_bars"] = quote_scaled_weights([b[4] for b in today_reg], marks)
+    vwap = sum((b[1] + b[2] + b[3]) / 3.0 * w for b, w in zip(today_reg, weights)) / sum(weights)
 
     # Calendar-selected sessions, never the newest ten nonempty data dates.
     # An early close is comparable only while every exact prior session can

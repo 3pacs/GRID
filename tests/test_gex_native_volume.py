@@ -75,7 +75,8 @@ def test_ready_payload_is_exactly_the_readers_contract():
     for k in ("historical_request", "signal_confirmation", "exact_trade_vwap", "cross_source_reconciled", "live"):
         assert p[k] is False, k
     assert p["baseline_errors"] == {}
-    assert p["vwap_basis"] == "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+    assert p["vwap_basis"] == ("HLC3 of native one-minute OHLCV weighted by bar volume scaled to the quote day counter "
+                               "over the trailing five minutes; not trade VWAP")
     assert p["rvol_basis"] == "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
     assert p["cumulative_shares"] == 60 * 150_000 and type(p["cumulative_shares"]) is int
     assert p["completed_minutes"] == 60 and len(p["source_revisions"]) == 60
@@ -499,3 +500,95 @@ def test_runner_open_session_still_uses_one_quote_and_one_history_call(monkeypat
     env, _ = snap.run_once(FakeClient(), None)
     assert env["payload"]["status"] == "ready"
     assert calls == [("quotes", "SPY"), ("history", "SPY", nv.history_params(NOW))]
+
+
+# ---- quote-scaled VWAP weights (2026-11-17): bars miss a moving share of the tape; the quote counter does not
+
+def test_without_marks_every_bar_keeps_its_own_volume():
+    w, scaled = nv.quote_scaled_weights([100, 200, 300], [])
+    assert (w, scaled) == ([100, 200, 300], 0)
+
+
+def test_a_bar_is_scaled_by_the_counter_rise_over_the_trailing_five_minutes():
+    vols = [100] * 10
+    w, scaled = nv.quote_scaled_weights(vols, [(5, 10_000), (10, 10_000 + 750)])
+    assert w[:5] == [100] * 5                    # no mark five bars before their first mark: unscaled
+    assert w[5:] == [150.0] * 5                  # counter rose 750 while the bars carried 500
+    assert scaled == 5
+
+
+def test_marks_beyond_the_completed_bars_are_never_read():
+    vols = [100] * 10
+    assert nv.quote_scaled_weights(vols, [(5, 10_000), (12, 99_999)]) == ([100] * 10, 0)
+
+
+@pytest.mark.parametrize("rise", [0, -50, 10_000])   # flat, falling or absurd counter: a glitch, not a factor
+def test_a_counter_glitch_leaves_the_bars_unscaled(rise):
+    w, scaled = nv.quote_scaled_weights([100] * 10, [(5, 10_000), (10, 10_000 + rise)])
+    assert (w, scaled) == ([100] * 10, 0)
+
+
+def test_scaling_moves_vwap_toward_the_undercounted_minutes_and_leaves_shares_alone():
+    hist = _history()
+    for c in hist["candles"]:
+        if _ts(TODAY, 10, 0) <= c["datetime"] / 1000 < _ts(TODAY, 10, 30):
+            c.update(open=740.0, high=740.3, low=739.7, close=740.1)
+    quote = _quote(60 * 150_000)
+    plain, _ = nv.compute(hist, quote, now=NOW, receipt_at=RECEIPT)
+    # the counter says the 10:00-10:29 half hour traded twice what its bars show, the first half hour as shown
+    base = quote - 30 * 150_000 - 30 * 300_000
+    def counter(n: int) -> int:
+        return base + 150_000 * min(n, 30) + 300_000 * max(n - 30, 0)
+
+    marks = [(n, counter(n)) for n in range(5, 60, 5)]
+    scaled, info = nv.compute(hist, quote, now=NOW, receipt_at=RECEIPT, quote_marks=marks)
+    assert scaled["status"] == plain["status"] == "ready"
+    assert scaled["bar_vwap_estimate"] < plain["bar_vwap_estimate"] - 1.0
+    assert (scaled["cumulative_shares"], scaled["rvol"]) == (plain["cumulative_shares"], plain["rvol"])
+    assert info["quote_mark"] == (60, quote) and info["vwap_scaled_bars"] > 0
+
+
+def test_runner_keeps_this_sessions_marks_privately_and_reads_them_back(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import scripts.gex_native_volume_snapshot as snap
+
+    class FakeClient:
+        def quotes(self, symbol):
+            return {symbol: SimpleNamespace(total_volume=_quote(60 * 150_000))}
+
+        def price_history(self, symbol, **params):
+            return _history()
+
+    directory = tmp_path / "nv"
+    directory.mkdir(mode=0o700)
+    out = directory / "snapshot.json"
+    monkeypatch.setattr(snap.time, "time", lambda: NOW)
+    snap.run_once(FakeClient(), out)
+    marks_file = directory / snap.MARKS_NAME
+    assert stat.S_IMODE(marks_file.stat().st_mode) == 0o600
+    body = json.loads(marks_file.read_text())
+    assert body == {"session": TODAY.isoformat(), "marks": [[60, _quote(60 * 150_000)]]}
+    assert snap.read_marks(marks_file, TODAY.isoformat()) == [(60, _quote(60 * 150_000))]
+    assert snap.read_marks(marks_file, "2026-11-09") == []          # another session's marks are never used
+    marks_file.chmod(0o644)
+    assert snap.read_marks(marks_file, TODAY.isoformat()) == []     # not private: ignored
+
+
+def test_print_and_dry_runs_keep_no_marks(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import scripts.gex_native_volume_snapshot as snap
+
+    class FakeClient:
+        def quotes(self, symbol):
+            return {symbol: SimpleNamespace(total_volume=_quote(60 * 150_000))}
+
+        def price_history(self, symbol, **params):
+            return _history()
+
+    monkeypatch.setattr(snap.time, "time", lambda: NOW)
+    monkeypatch.chdir(tmp_path)
+    env, info = snap.run_once(FakeClient(), None)
+    assert env["payload"]["status"] == "ready" and info["quote_mark"] == (60, _quote(60 * 150_000))
+    assert not list(tmp_path.iterdir())

@@ -50,6 +50,35 @@ def write_private(path: Path, data: dict) -> None:
             os.unlink(tmp)
 
 
+MARKS_NAME = "quote-marks.json"     # beside the snapshot: this session's (completed_minutes, quote counter) pairs
+MAX_MARKS = 450
+
+
+def read_marks(path: Path, session: str) -> list[tuple[int, int]]:
+    """This session's quote marks, or [] (missing, unreadable, another day, or not ours and private)."""
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            return []
+        body = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(body, dict) or body.get("session") != session or not isinstance(body.get("marks"), list):
+        return []
+    return [(m[0], m[1]) for m in body["marks"]
+            if isinstance(m, list) and len(m) == 2 and type(m[0]) is int and type(m[1]) is int]
+
+
+def keep_mark(path: Path, session: str, marks: list[tuple[int, int]], mark: tuple[int, int] | None) -> None:
+    """Add this run's mark (the latest counter per completed-minute count wins) and write the file privately."""
+    if mark is None:
+        return
+    by_n = dict(marks)
+    by_n[mark[0]] = mark[1]
+    kept = sorted(by_n.items())[-MAX_MARKS:]
+    write_private(path, {"session": session, "marks": [[n, q] for n, q in kept]})
+
+
 def run_once(client, out: Path | None) -> tuple[dict, dict]:
     now = time.time()
     try:
@@ -61,13 +90,19 @@ def run_once(client, out: Path | None) -> tuple[dict, dict]:
         # write (the private reader lets the previous snapshot age out).
         payload, info = nv.compute({}, None, now=now, receipt_at=now)
         return nv.envelope(payload, nv.provenance([])), info
+    session = current.opens.astimezone(nv.ET).date().isoformat()
+    marks_path = out.parent / MARKS_NAME if out is not None else None
+    marks = read_marks(marks_path, session) if marks_path is not None else []
     quote = client.quotes(nv.SYMBOL).get(nv.SYMBOL)
     history = client.price_history(nv.SYMBOL, **nv.history_params(now))
     receipt = time.time()
-    payload, info = nv.compute(history, getattr(quote, "total_volume", None), now=time.time(), receipt_at=receipt)
+    payload, info = nv.compute(history, getattr(quote, "total_volume", None), now=time.time(), receipt_at=receipt,
+                               quote_marks=marks)
     env = nv.envelope(payload, nv.provenance(info["bars"]))
     if out is not None:
         write_private(out, env)
+    if marks_path is not None:
+        keep_mark(marks_path, session, marks, info.get("quote_mark"))
     return env, info
 
 
@@ -94,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
             line = (f"{env['generated_at']} {pl['status']} {pl.get('reason') or '-'} "
                     f"bars={r.get('bars_total_volume')} quote={r.get('quote_total_volume')} "
                     f"diff={r.get('relative_difference')}")
+            # The first line keeps its exact form (the burn-in grader's journal pattern ends at diff=).
+            if info.get("quote_mark") is not None and not args.print:
+                line += f"\n{env['generated_at']} vwap-scaled {info.get('vwap_scaled_bars')} of {pl.get('completed_minutes')}"
             print(json.dumps(env, indent=1) if args.print else line, flush=True)
             rc = 0
         except SchwabError as exc:
