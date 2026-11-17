@@ -763,7 +763,6 @@ class TestRealTaskTableSanity:
             "source_audit",
             "flow_materialize",
             "backtest_scan",
-            "postmortem_batch",
             "options_improvement",
             "hypothesis_review",
             "hypothesis_discovery",
@@ -783,8 +782,14 @@ class TestRealTaskTableSanity:
             "insight_cleanup",
             "briefing_cleanup",
             "errors_jsonl_cleanup",
+            "postmortem_batch",
         ]
         assert [t.name for t in ho.DAILY_INTEL_TASKS] == expected_order
+
+    def test_postmortem_batch_is_last(self) -> None:
+        # It always overruns its 180 s budget (345-467 s real); last, the
+        # overrun cannot push gdelt_gkg_daily / sleuth_dispatch to catch-up.
+        assert ho.DAILY_INTEL_TASKS[-1].name == "postmortem_batch"
 
 
 # ─── Allow-list classification (review amendment, deliverable 1) ────────

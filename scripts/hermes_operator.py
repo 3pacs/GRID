@@ -2191,12 +2191,22 @@ class DailyIntelTask(NamedTuple):
 # capital_flow_rollups, fundamental_divergence and holder_deal_overlap
 # above — they assume the tasks before them in this tuple already ran
 # this period.
+#
+# postmortem_batch is deliberately LAST (2026-11-17). The cycle budget
+# (DAILY_INTEL_CYCLE_BUDGET_SECONDS) is only checked before a task starts,
+# and postmortem_batch really runs 345-467 s (median ~440 s, 11-10..11-16)
+# against its 180 s budget, so it timed out and burned 180 s every night;
+# with supply_chain_8k and gdelt_bulk_events released the 11-17 window pass
+# used 489.7 s and pushed gdelt_gkg_daily and sleuth_dispatch to catch-up.
+# Last, its overrun can only delay itself. Order-safe: it reads
+# options_recommendations / oracle_predictions / options_daily_signals /
+# capital_flow_snapshots / decision_journal and writes only trade_postmortems,
+# which no task in this table reads; nothing earlier depends on its output.
 DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("storage_maintenance_subagent", _daily_intel_storage_maintenance, DAILY_INTEL_DISPATCH_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("source_audit", _daily_intel_source_audit, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("flow_materialize", _daily_intel_flow_materialize, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("backtest_scan", _daily_intel_backtest_scan, DAILY_INTEL_LLM_TASK_BUDGET_S),
-    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
     DailyIntelTask("options_improvement", _daily_intel_options_improvement, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("hypothesis_review", _daily_intel_hypothesis_review, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("hypothesis_discovery", _daily_intel_hypothesis_discovery, DAILY_INTEL_LLM_TASK_BUDGET_S),
@@ -2216,6 +2226,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
 )
 
 
