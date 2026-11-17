@@ -293,3 +293,29 @@ def test_sector_health_timeout_is_a_positive_int_independent_of_intelligence_bud
     assert "SECTOR_HEALTH_TIMEOUT_SECONDS" in src, (
         "the sector-health dispatch must actually use the constant"
     )
+
+
+def _task(name: str):
+    return next(t for t in ho.DAILY_INTEL_TASKS if t.name == name)
+
+
+def test_corporate_actions_and_fundamental_divergence_have_own_budgets() -> None:
+    """2026-11-17: both ran ~100 s / ~128-217 s against the shared 60 s SQL
+    default and were done_late (and blacklisted for 24h) every night. They
+    now carry their own budgets, wired through DailyIntelTask.budget_s (the
+    value _run_daily_intel_block passes to _run_with_timeout), and sit above
+    the slowest observed runtimes."""
+    corp = _task("corporate_actions")
+    div = _task("fundamental_divergence")
+    assert corp.budget_s == ho.DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S == 150
+    assert div.budget_s == ho.DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S == 300
+    assert corp.budget_s > 104 and div.budget_s > 217
+    # still a per-task knob: the shared SQL default stays 60 for the rest.
+    assert ho.DAILY_INTEL_SQL_TASK_BUDGET_S == 60
+    for name in ("icij_linking", "attention_anomaly", "holder_deal_overlap", "sleuth_dispatch"):
+        assert _task(name).budget_s == ho.DAILY_INTEL_SQL_TASK_BUDGET_S
+
+
+def test_cycle_budget_unchanged_and_each_task_fits_in_it() -> None:
+    assert ho.DAILY_INTEL_CYCLE_BUDGET_SECONDS == 480
+    assert max(t.budget_s for t in ho.DAILY_INTEL_TASKS) < ho.DAILY_INTEL_CYCLE_BUDGET_SECONDS

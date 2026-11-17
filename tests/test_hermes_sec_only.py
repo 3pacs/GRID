@@ -674,10 +674,17 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # postmortem_batch moves from fifth to last in DAILY_INTEL_TASKS (it
         # always overruns its 180 s budget) and the ordering comment above the
         # tuple gains a paragraph; no wrapper, budget or allow-list change.
+        # Then 46709a4a -> 413b8e70 (2026-11-17, claude/hermes-late-task-budgets-20261117):
+        # corporate_actions and fundamental_divergence get their own budgets
+        # (DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S 150, DAILY_INTEL_FUNDAMENTAL_
+        # DIVERGENCE_BUDGET_S 60 -> 300; both ran past 60 s nightly and were
+        # done_late) plus a comment block; the corporate_actions DAILY_INTEL_
+        # TASKS entry names the new constant. No wrapper, cycle-budget,
+        # allow-list or ordering change.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','46709a4ab1a4f2ec097f3b8c0e6018a89fa0c4fd9aa62860ef6d9824e603a6b3'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
