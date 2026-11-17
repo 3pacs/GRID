@@ -1171,10 +1171,18 @@ def _get_pullers_for_group(
             pullers.append(("DeFi_Llama", DefiLlamaPuller(db_engine), "pull_all", {}))  # pull_all confirmed
         except Exception as exc:
             log.warning("DeFi Llama puller init failed: {err}", err=str(exc))
-        # Dune Analytics — smart money, CEX flows, narrative heat (6h cadence, API key)
+        # Dune Analytics. Honors the SmartScheduler registry hold (retired
+        # 2026-11-04, commit 17889eec: the three saved DUNE_QUERY_* queries
+        # were never created, so every run here logged "SKIPPED: all 3 items
+        # skipped: not_configured"; last raw_series row 2026-05-01).
         try:
-            from ingestion.altdata.dune_puller import DunePuller
-            pullers.append(("Dune_Analytics", DunePuller(db_engine), "pull_all", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _dune_hold = hold_reason_for("dune")
+            if _dune_hold:
+                log.info("Dune Analytics held: {r}", r=_dune_hold)
+            else:
+                from ingestion.altdata.dune_puller import DunePuller
+                pullers.append(("Dune_Analytics", DunePuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Dune puller init failed: {err}", err=str(exc))
         # Etherscan — ETH price, gas, whale balances, token supplies (daily)
