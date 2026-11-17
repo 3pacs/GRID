@@ -1405,11 +1405,10 @@ def _get_pullers_for_group(
             pullers.append(("FedSpeeches", FedSpeechPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Fed Speeches puller init failed: {err}", err=str(exc))
-        try:
-            from ingestion.crucix_bridge import CrucixBridgePuller
-            pullers.append(("Crucix", CrucixBridgePuller(db_engine), "pull_all", {}))
-        except Exception as exc:
-            log.warning("Crucix bridge puller init failed: {err}", err=str(exc))
+        # Crucix is not run here (2026-11-17): grid-intelligence bridges it every
+        # 15 min (intelligence/scheduler.py _crucix_ingest) and SmartScheduler runs
+        # crucix_bridge hourly with its own pull_log row. This copy only re-inserted
+        # deduplicated news and logged 0 rows.
 
     elif group_name == "weekly":
         try:
@@ -1835,21 +1834,9 @@ def run_daily_pulls(
     except Exception as exc:
         log.warning("Google Trends pull failed: {err}", err=str(exc))
 
-    # Crucix bridge — 25+ intelligence sources (OSINT is 24/7)
-    try:
-        from ingestion.crucix_bridge import CrucixBridgePuller
-        from db import get_engine
-
-        engine = get_engine()
-        crucix = CrucixBridgePuller(db_engine=engine)
-        result = crucix.pull_all()
-        log.info(
-            "Crucix bridge — {rows} rows from {src} sources",
-            rows=result["rows_inserted"],
-            src=result["sources_processed"],
-        )
-    except Exception as exc:
-        log.warning("Crucix bridge failed: {err}", err=str(exc))
+    # Crucix: not run from the daily pulls (2026-11-17). grid-intelligence bridges it
+    # every 15 min and SmartScheduler hourly, so its news is already fresh for the
+    # FinBERT step below.
 
     # FinBERT sentiment scoring (runs after text sources are fresh)
     try:
