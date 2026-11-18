@@ -2468,9 +2468,10 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Reads:** `__future__`, `analysis`, `calendar`, `config`, `datetime`, `hashlib`, `importlib`, `ingestion`, `inspect`, `json`, `loguru`, `math`, `os`, `re`, `scripts`, `socket`, `sqlalchemy`, `stat`, `sys`, `threading`, `time`, `types`, `typing`, `zoneinfo`
 **Imported by:** `ingestion/scheduler.py`, `ingestion/source_freshness.py`
 
-#### `ingestion/social_sentiment.py` — 479 LOC
+#### `ingestion/social_sentiment.py` — 952 LOC
 **Docstring:** Social sentiment ingestor — Reddit, Bluesky, Google Trends.
-**Functions:** `SocialSentimentPuller`
+**Functions:** `SocialSentimentPuller`, `series_watchlist`, `has_cashtag`
+**Notes:** Two SmartScheduler jobs share the `SocialSentiment` catalog row. `social_sentiment` (`pull_all`, 12 h) stores one JSON scan per day. `social_ticker_series` (`pull_ticker_series`, 12 h, 2026-11-17) stores numbers per UTC fetch date: `BSKY:<T>:posts_per_hour` / `posts_24h` / `engagement_24h` / `finbert_compound` (cashtag `$<T>` only, one logged-out search page because cursor pages answer 403), `APEWISDOM:<board>:<T>:mentions_24h` / `upvotes_24h` and board totals, and `REDDIT:<sub>:*` from the Data API only when an owner app exists (`REDDIT:<sub>:active_users` / `subscribers` feed the March `reddit_<sub>` / `reddit_<sub>_subs` features via entity_map). Logged-out Reddit `.json` is 403 and `.rss` 404 since 2026-11-17 ~17:50Z. Sentiment is local FinBERT (`ingestion/ml/finbert_scorer.py`), no LLM.
 **Reads:** `__future__`, `datetime`, `html`, `ingestion`, `json`, `loguru`, `pytrends`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `intelligence/post_query_scanner.py`, `intelligence/scheduler.py`, `ollama/market_briefing.py`
 
