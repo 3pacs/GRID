@@ -19,6 +19,7 @@ summary dict with row counts per table plus any errors encountered.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, timedelta
 from typing import Any
 
@@ -164,12 +165,116 @@ _DDL_STATEMENTS: list[str] = [
 ]
 
 
-def _ensure_tables(engine: Engine) -> None:
-    """Create all materialized target tables if they do not exist."""
+# Every statement above takes a table lock before its IF NOT EXISTS check:
+# ADD COLUMN takes ACCESS EXCLUSIVE and CREATE INDEX takes SHARE, even when
+# the column or index is already there. Run on every pass (once per sync
+# function, five times a pass) they queued behind readers of the target
+# tables and hit statement_timeout: 19 timeouts on
+# ``ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS filing_date`` in the
+# 2026-11-15..17 journal, 3 FAILED and 1 PARTIAL passes, all of them this one
+# statement (including the junction_point_readings "failures"). So the
+# catalog is read first (no lock on the target tables) and only a statement
+# whose object is missing runs, under a short lock_timeout so a needed DDL
+# fails fast instead of queueing everyone behind it. The check runs once per
+# process (schema_guard.ensure_once), i.e. once per systemd pass.
+#
+# The tables stay bootstrapped here, not in alembic: live
+# junction_point_readings has this file's shape (series_key/label/z_score_2y),
+# while revision f1a2b3c4d5e6 declares a different one (junction_id/source),
+# so its IF NOT EXISTS create was a no-op in prod. Moving the DDL to a
+# migration needs that drift reconciled first.
+
+_DDL_LOCK_TIMEOUT = "5s"
+
+_TABLE_RE = re.compile(r"^CREATE TABLE IF NOT EXISTS (\w+)\b")
+_COLUMN_RE = re.compile(r"^ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+)\b")
+_INDEX_RE = re.compile(r"^CREATE INDEX IF NOT EXISTS (\w+) ON (\w+)\b")
+
+
+def _ddl_requirement(stmt: str) -> tuple[str, str]:
+    """Return the catalog object a DDL statement creates, as (kind, name).
+
+    kind is ``table``, ``column`` (name ``table.column``) or ``index``.
+    Raises ValueError for a statement shape this gate cannot check, so a new
+    unconditional DDL cannot slip back onto the per-pass path.
+    """
+    s = " ".join(stmt.split())
+    if m := _TABLE_RE.match(s):
+        return ("table", m.group(1))
+    if m := _COLUMN_RE.match(s):
+        return ("column", f"{m.group(1)}.{m.group(2)}")
+    if m := _INDEX_RE.match(s):
+        return ("index", m.group(1))
+    raise ValueError(f"flow_materializer: uncheckable DDL statement: {s[:80]}")
+
+
+_DDL_STEPS: list[tuple[tuple[str, str], str]] = [
+    (_ddl_requirement(stmt), stmt.strip()) for stmt in _DDL_STATEMENTS
+]
+_DDL_TABLES: list[str] = sorted(
+    {name.split(".")[0] for (kind, name), _ in _DDL_STEPS if kind != "index"}
+)
+_DDL_INDEXES: list[str] = sorted(
+    {name for (kind, name), _ in _DDL_STEPS if kind == "index"}
+)
+
+# Catalog reads only: no lock is taken on the target tables themselves.
+_CATALOG_SQL = """
+    SELECT 'table' AS kind, c.relname AS name
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = current_schema()
+       AND c.relkind IN ('r', 'p')
+       AND c.relname = ANY(:tables)
+    UNION ALL
+    SELECT 'column', a.table_name || '.' || a.column_name
+      FROM information_schema.columns a
+     WHERE a.table_schema = current_schema()
+       AND a.table_name = ANY(:tables)
+    UNION ALL
+    SELECT 'index', i.indexname
+      FROM pg_indexes i
+     WHERE i.schemaname = current_schema()
+       AND i.indexname = ANY(:indexes)
+"""
+
+
+def _missing_ddl(conn: Any) -> list[str]:
+    """Return the DDL statements whose object is absent from the catalog."""
+    present = {
+        (row[0], row[1])
+        for row in conn.execute(
+            text(_CATALOG_SQL),
+            {"tables": _DDL_TABLES, "indexes": _DDL_INDEXES},
+        ).fetchall()
+    }
+    return [stmt for req, stmt in _DDL_STEPS if req not in present]
+
+
+def _ensure_tables_now(engine: Engine) -> None:
+    """Create whatever target tables, columns and indexes are missing."""
     with engine.begin() as conn:
-        for stmt in _DDL_STATEMENTS:
-            conn.execute(text(stmt.strip()))
-    log.debug("flow_materializer: target tables ensured")
+        missing = _missing_ddl(conn)
+        if not missing:
+            log.debug("flow_materializer: target schema current, no DDL")
+            return
+        conn.execute(text(f"SET LOCAL lock_timeout = '{_DDL_LOCK_TIMEOUT}'"))
+        for stmt in missing:
+            conn.execute(text(stmt))
+    log.info(
+        "flow_materializer: applied {n} missing DDL statement(s)", n=len(missing),
+    )
+
+
+def _ensure_tables(engine: Engine) -> None:
+    """Ensure the materialized target tables exist, once per process.
+
+    A failure (for example a lock_timeout on a DDL that is actually needed)
+    propagates and is not remembered, so the next sync retries it.
+    """
+    from schema_guard import ensure_once
+
+    ensure_once("flow_materializer.tables", lambda: _ensure_tables_now(engine))
 
 
 def _is_statement_timeout(exc: Exception) -> bool:
