@@ -594,6 +594,12 @@ def _wiring_grid_scheduler(label: str, mod: str, cls: str, method: str, journal:
     assert _source_name(mod, cls) == journal
 
 
+def _retired_from_grid_scheduler(label: str, mod: str, cls: str, journal: str) -> None:
+    """Retired from grid-scheduler's daily group (2026-11-17); the module stays."""
+    assert f'("{label}", {cls}(db_engine)' not in _SCHEDULER_SRC
+    assert _source_name(mod, cls) == journal
+
+
 # (journal source name, wiring check, happy-path run)
 JOURNAL_SOURCES: list[tuple[str, Callable[[], None], Callable[[], tuple[dict, int]]]] = [
     ("FARA_DOJ",
@@ -612,8 +618,10 @@ JOURNAL_SOURCES: list[tuple[str, Callable[[], None], Callable[[], tuple[dict, in
                            "OpenCorporatesPuller", "pull_all", "OpenCorporates"),
      _happy_opencorporates),
     ("polygon",
-     lambda: _wiring_grid_scheduler("Polygon", "ingestion.altdata.polygon_puller",
-                                    "PolygonPuller", "pull", "polygon"),
+     # grid-scheduler's Polygon registration was retired 2026-11-17 (never
+     # wrote a row); the puller's write contract is still checked here.
+     lambda: _retired_from_grid_scheduler("Polygon", "ingestion.altdata.polygon_puller",
+                                          "PolygonPuller", "polygon"),
      _happy_polygon),
     ("wikidata_persons",
      lambda: _wiring_smart("wikidata_persons", "ingestion.altdata.wikidata_persons",
