@@ -93,6 +93,9 @@ _INCREMENTAL_LOCK = threading.Lock()
 # no routine close, so Sleuth's insider-only control was 65% untestable.
 INSIDER_BUYER_DAYS = 90
 INSIDER_MIN_BUYERS = 2
+SUPPLY_CHAIN_NODE_IDS_SQL = (
+    "SELECT upstream_id FROM supply_chain_edges UNION SELECT downstream_id FROM supply_chain_edges"
+)
 INSIDER_MAX_TICKERS = 1000
 INSIDER_BUYER_TICKERS_SQL = """
     SELECT t FROM (
@@ -619,6 +622,28 @@ class TiingoPuller(BasePuller):
         return [t for t in tickers if is_tiingo_equity(t)]
 
     @staticmethod
+    def supply_chain_tickers(db_engine: Engine) -> list[str]:
+        """US symbols of every supply-chain graph node that has an edge, equities only.
+
+        Source of truth: ``intelligence.supply_chain_symbols.symbol_for`` (the one
+        node -> symbol rule the edge validator and contagion use). 2026-11-16: 29 of
+        203 graph symbols (GLW, HON, SWKS, WDC, ...) had no close since April
+        because no other list held them, so their edges were measured on stale
+        prices. Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.supply_chain_symbols import load_node_types, symbol_for
+
+            with db_engine.connect() as conn:
+                ids = [r[0] for r in conn.execute(text(SUPPLY_CHAIN_NODE_IDS_SQL)) if r[0]]
+                types = load_node_types(conn, ids)
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: supply-chain universe unavailable: {e}", e=str(exc))
+            return []
+        symbols = {t.symbol for t in (symbol_for(i, types.get(str(i).lower())) for i in ids) if t.symbol}
+        return sorted(t for t in symbols if is_tiingo_equity(t))
+
+    @staticmethod
     def insider_buyer_tickers(db_engine: Engine, today: date | None = None) -> list[str]:
         """Listed equities with 2+ open-market insider buyers (see INSIDER_BUYER_TICKERS_SQL).
 
@@ -652,7 +677,9 @@ class TiingoPuller(BasePuller):
         (:meth:`hypothesis_tickers`; 2026-11-07: 36 of 115 Sleuth lead tickers
         had no routine close), and so is every ticker with 2+ open-market
         insider buyers (:meth:`insider_buyer_tickers`; 2026-11-08: 287 of 332
-        had no routine close).
+        had no routine close), and so is every listed supply-chain graph node
+        (:meth:`supply_chain_tickers`; 2026-11-16: 29 of 203 had no close since
+        April).
 
         Sector-map tickers go through ``analysis.sector_map.price_tickers``:
         renamed symbols are swapped for their successor and acquired,
@@ -667,6 +694,7 @@ class TiingoPuller(BasePuller):
             all_tickers.update(TiingoPuller.oracle_tickers(db_engine))
             all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
             all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
+            all_tickers.update(TiingoPuller.supply_chain_tickers(db_engine))
         try:
             from analysis.sector_map import price_ticker, price_tickers
             all_tickers.update(price_tickers())

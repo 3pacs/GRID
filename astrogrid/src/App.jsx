@@ -101,7 +101,7 @@ const appStyles = {
         letterSpacing: '1px',
         color: status === 'connected' ? tokens.green : status === 'demo' ? tokens.gold : tokens.text,
         background: 'rgba(15, 25, 45, 0.72)',
-    },
+    }),
 };
 
 function App() {

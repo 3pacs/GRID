@@ -93,7 +93,10 @@ jobs:
 
       - name: Install existing project test dependencies
         timeout-minutes: 10
-        run: python -m pip install -r requirements.txt
+        # The HOLD checkout is the rollback target and installs nothing of its own, so its requirements go in
+        # too: a rollback runs HOLD on whatever the forward release left installed. (HOLD still imports
+        # python-jose; the forward tree moved to PyJWT.)
+        run: python -m pip install -r requirements.txt -r ../hold/requirements.txt
 
       - name: Generate ephemeral job-only database credentials
         timeout-minutes: 1

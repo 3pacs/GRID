@@ -160,6 +160,18 @@ def test_v2_only_tightens_v1_and_loosening_is_named():
     assert changed(accounts__robinhood_agentic__shares_short=True) == ["accounts changed"]
 
 
+def test_g11_cost_gate_does_not_run_on_an_event_family(monkeypatch):
+    """G11 prices a session family's session_trade on minute bars; EC1 has none to price."""
+    class Untouchable:
+        def sessions(self, *a, **k):
+            raise AssertionError("G11 read bars for an event family")
+
+    monkeypatch.setattr(S, "_feasibility_source", Untouchable())
+    led = L.memory()
+    report = S.check(F.build_proposal(ec1_item(), TODAY), L.load_state(led), TODAY)
+    assert "G11_cost_feasible" not in report and S.passed(report), report
+
+
 # --- the amendment record -------------------------------------------------------------
 
 

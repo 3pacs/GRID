@@ -356,13 +356,17 @@ def scan_thresholds(
         tripped=(regime.regime == "SHORT_GAMMA"),
     ))
 
-    # 3. Put wall proximity — below spot, structural support but slingshot risk if broken
+    # 3. Put wall breach proximity — requires spot strictly below the wall.
     put_wall_dist = None
     if regime.put_wall and regime.spot > 0:
         put_wall_dist = abs(regime.spot - regime.put_wall) / regime.spot * 100.0
     thresholds.append(ForcedFlowThreshold(
         name="put_wall_proximity",
-        description=f"Spot within {WALL_PROXIMITY_PCT}% of SPY put wall (break = short-gamma)",
+        description=(
+            f"Spot strictly below SPY put wall AND absolute distance <= {WALL_PROXIMITY_PCT}% "
+            f"of spot (spot={regime.spot!r}, put_wall={regime.put_wall!r}); "
+            "proximity alone does not trip this check"
+        ),
         current_value=put_wall_dist,
         threshold_value=WALL_PROXIMITY_PCT,
         tripped=(put_wall_dist is not None and put_wall_dist <= WALL_PROXIMITY_PCT

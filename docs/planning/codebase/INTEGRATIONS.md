@@ -120,7 +120,7 @@
 - **Token delivery:** `Authorization: Bearer <token>` header or `?token=` query param
 - **Rate limiting:** In-memory dict, 5 attempts per 60s per IP — resets on restart, no multi-instance support (`grid/api/auth.py:118-128`)
 - **WebSocket auth:** Token via query parameter `?token=` — leaks to logs/proxies (`grid/api/main.py:202-209`)
-- **Dependencies:** `python-jose` (JWT), `passlib` (bcrypt)
+- **Dependencies:** `PyJWT` (JWT), `passlib` (bcrypt)
 
 ## Internal Services
 
