@@ -227,7 +227,9 @@ def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> 
     fit inside the step budget.
 
     The scorer runs first and the daily-intel block (DAILY_INTEL_TASKS,
-    executed by _run_daily_intel_block) runs last inside the same step; if
+    executed by _run_daily_intel_block) runs right after it, ahead of every
+    4h/6h task, inside the same step (2026-11-18; it used to run last and
+    the trust cycle ahead of it starved it); if
     their combined worst case exceeds the step cap, the daily block is
     starved of any turn at all on the cycles that matter.
 
@@ -250,6 +252,23 @@ def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> 
         "turn (regression of 2026-05-15, re-created one level down before this "
         "fix)."
     )
+
+
+def test_trust_cycle_step_budget_nests_inside_its_timeout_and_the_cycle() -> None:
+    """The trust cycle runs as its own step since 2026-11-18 (it used to sit
+    inside intelligence_tasks and take ~39 min, starving the daily-intel
+    block). Its cooperative per-pass budget plus the work that cannot stop
+    at the budget must fit inside the step's hard timeout, so the normal
+    exit is a clean pause, not an orphaned worker. The step must also fit
+    inside the cycle watchdog."""
+    assert (
+        ho.TRUST_CYCLE_BUDGET_SECONDS + ho.TRUST_CYCLE_TAIL_SECONDS
+        <= ho.TRUST_CYCLE_TIMEOUT_SECONDS
+    )
+    assert ho.TRUST_CYCLE_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
+    import inspect
+    src = inspect.getsource(ho._run_trust_cycle_step)
+    assert "TRUST_CYCLE_TIMEOUT_SECONDS" in src and "TRUST_CYCLE_BUDGET_SECONDS" in src
 
 
 def test_active_hypo_scorer_alone_is_strictly_inside_step_budget() -> None:

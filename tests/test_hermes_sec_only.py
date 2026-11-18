@@ -687,6 +687,15 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # done_late) plus a comment block; the corporate_actions DAILY_INTEL_
         # TASKS entry names the new constant. No wrapper, cycle-budget,
         # allow-list or ordering change.
+        # Then 413b8e70 -> 7a85e9a0 (2026-11-18, claude/hermes-intel-starvation-20261117):
+        # the trust cycle leaves run_intelligence_tasks for its own step
+        # (_run_trust_cycle_step, dispatched in run_cycle after
+        # _run_sector_and_intelligence_steps; TRUST_CYCLE_* budgets, in-flight
+        # guard, resumable progress). The daily-intel block moves up to run
+        # right after active-hypothesis scoring. The TimesFM forecasts and
+        # thesis snapshot keep their place on the forecasts' own 4h gate. No
+        # SEC, FINRA or dispatch-prefix change. Needs reviewer acceptance like
+        # the prior pins.
         # SCHED re-pinned 8bb8a00f -> 9aeee49b (2026-11-18, rebased onto #1249's
         # registry holds; branch alone was 01432bbd -> a907c59b) (2026-11-17,
         # claude/social-reddit-bluesky-20261117): the only scheduler edits are
@@ -705,7 +714,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','7a85e9a0a9cd25723384357ded951f455c63884647ec357226b5e3dc4057027e'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
