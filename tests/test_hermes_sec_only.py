@@ -695,10 +695,17 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # with a 4-line comment) and its REGISTRY_CATALOG_NAMES alias
         # social_ticker_series -> SocialSentiment. No SEC, FINRA or dispatch
         # code changes. Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned 9aeee49b -> 08c0356f (2026-11-18,
+        # claude/social-free-reddit-apis-20261117): the only scheduler edits
+        # are PULLER_REGISTRY data -- smart_money freq_h 0.167 -> 1 (Reddit now
+        # read from the free Arctic Shift API, hourly) and the trailing
+        # comments of smart_money / social_sentiment plus the 4-line comment
+        # above social_ticker_series. No SEC, FINRA or dispatch code changes.
+        # Needs reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','9aeee49bbcb838dca02f7b8322662b37d3ee92b429a38b3af3ed531a0b5be2d0')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

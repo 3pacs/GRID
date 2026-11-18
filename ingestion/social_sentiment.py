@@ -4,10 +4,11 @@ Social sentiment ingestor — Reddit, Bluesky, Google Trends.
 Reads public social media for sentiment signals around tracked
 tickers, themes, and product launches. No API keys or logins:
 
-- Reddit hot posts: one combined RSS feed (``/r/a+b+c/hot.rss``) for every
-  tracked board, through ``ingestion/altdata/reddit_rss.py`` (the ``.json``
-  listing returns 403 from grid-svr; RSS allows about one request per minute
-  per IP, which that module shares across pullers).
+- Reddit posts: the newest posts of every tracked board from the Arctic
+  Shift archive API (``ingestion/altdata/arctic_shift.py``, free, no key).
+  Reddit itself answers logged-out ``.json`` with 403 and, since about
+  17:50Z 2026-11-17, every ``.rss`` feed with 404, so the RSS feed this used
+  (``reddit_rss.py``) is gone.
 - Reddit-wide ticker mention counts from ApeWisdom's free public API
   (https://apewisdom.io/api/): mentions, upvotes and rank now vs 24h ago,
   aggregated across the stock and crypto subreddits.
@@ -46,7 +47,7 @@ from typing import Any
 import requests
 from loguru import logger as log
 
-from ingestion.altdata import reddit_rss
+from ingestion.altdata import arctic_shift
 
 
 # Tracked subreddits by theme
@@ -57,7 +58,8 @@ SUBREDDITS = {
     "macro": ["economics", "finance", "personalfinance"],
 }
 
-REDDIT_RSS_LIMIT = 100  # posts in the combined feed, across all boards
+REDDIT_POSTS_PER_BOARD = 10  # newest posts per board (14 boards; RSS used to give 100 in all)
+REDDIT_POSTS_WINDOW_H = 24
 BLUESKY_SEARCH_URL = "https://api.bsky.app/xrpc/app.bsky.feed.searchPosts"
 APEWISDOM_URL = "https://apewisdom.io/api/v1.0/filter/{filter}/page/1"
 APEWISDOM_PAGE_URL = "https://apewisdom.io/api/v1.0/filter/{filter}/page/{page}"
@@ -104,6 +106,22 @@ DEFAULT_TARGET_TICKERS = [
 #                               ApeWisdom's 24 h Reddit counts per board
 #   APEWISDOM:<board>:total_mentions_24h / :tickers_mentioned
 #                               every ranked ticker on the board, all pages
+#   ARCTICSHIFT:<sub>:posts_per_hour / :posts_24h
+#                               posts created on the board in the 24 h before the fetch,
+#                               counted from Arctic Shift (posts_24h only when the pages
+#                               reached back 24 h; otherwise the rate over the span covered)
+#   ARCTICSHIFT:<sub>:comments_per_hour / :comments_24h
+#                               from one page of the board's newest comments (24 h count
+#                               only when the page held the whole day)
+#   ARCTICSHIFT:<sub>:<T>:posts_24h
+#                               posts naming $<T> or <T> in capitals (complete boards only;
+#                               zero is a measured zero there)
+#   ARCTICSHIFT:<T>:finbert_compound
+#                               mean FinBERT over those posts' title + body, all boards
+#   TRADESTIE:wallstreetbets:top50_comments / :<T>:comments / :<T>:sentiment_score
+#                               Tradestie's r/wallstreetbets top-50 tickers for the previous
+#                               US/Eastern day (their comment counts and their own sentiment
+#                               score, not FinBERT); stored once per Tradestie day
 #   REDDIT:<sub>:subscribers / :active_users / :posts_24h / :comments_24h
 #                               Reddit Data API (OAuth) only; see below
 #
@@ -118,7 +136,13 @@ DEFAULT_TARGET_TICKERS = [
 # app (ingestion/altdata/reddit_oauth.py); until REDDIT_CLIENT_ID/SECRET exist
 # the REDDIT:* series are skipped with that reason and nothing is sent.
 # ApeWisdom (https://apewisdom.io/api/, free, no key) still publishes per-board
-# Reddit ticker counts and is the working Reddit-derived feed.
+# Reddit ticker counts. Raw posts and comments come from Arctic Shift
+# (ingestion/altdata/arctic_shift.py), a free community archive API that was
+# minutes behind Reddit on 2026-11-18, and per-ticker r/wallstreetbets comment
+# sentiment from Tradestie's free API (https://tradestie.com/apps/reddit/api/,
+# 20 requests/min anonymous; one request per run here). Candidates rejected the
+# same day: PullPush (429 "does not provide free scraping resources for
+# agents"), SwaggyStocks (no public API), Apify/RapidAPI wrappers (account).
 SERIES_WATCHLIST_EXTRA = ["QQQ", "GLD", "TLT", "XLE", "XLF", "XLV"]  # StockTwits' list
 SERIES_WINDOW_H = 24
 BLUESKY_PAGE_LIMIT = 100
@@ -133,6 +157,14 @@ BLUESKY_REQUEST_GAP_S = 0.5     # AppView allows thousands of reads per 5 min pe
 APEWISDOM_BOARDS = ["wallstreetbets", "stocks", "investing", "options", "CryptoCurrency"]
 APEWISDOM_MAX_PAGES = 15
 APEWISDOM_REQUEST_GAP_S = 1.0
+ARCTIC_BOARDS = ["wallstreetbets", "stocks", "investing", "options", "economics", "CryptoCurrency"]
+ARCTIC_MAX_PAGES = 8            # 800 newest posts; r/wallstreetbets had ~420 in 24 h on 2026-11-18
+ARCTIC_MIN_SPAN_H = 0.25        # a sample covering less than this yields no rate
+ARCTIC_FINBERT_CHARS = 1000     # title + body characters scored per post
+TRADESTIE_URL = "https://tradestie.com/api/v1/apps/reddit"
+TRADESTIE_MAX_BYTES = 200_000   # 50 rows are ~4.5 KB
+TRADESTIE_TZ = "America/New_York"
+_TRADESTIE_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 REDDIT_API_SUBS = [
     "wallstreetbets", "stocks", "investing", "options", "economics",
     "cryptocurrency", "bitcoin",
@@ -220,6 +252,26 @@ def has_cashtag(text_: str, ticker: str) -> bool:
                      re.IGNORECASE) is not None
 
 
+def mentions_ticker(text_: str, ticker: str) -> bool:
+    """True for the cashtag ``$<ticker>`` (any case) or the bare symbol in capitals.
+
+    Reddit posts often skip the ``$``; requiring capitals keeps words like
+    "meta" or "sol" from counting.
+    """
+    return has_cashtag(text_, ticker) or re.search(
+        r"(?<![A-Za-z0-9$])" + re.escape(ticker) + r"(?![A-Za-z0-9])", text_ or "") is not None
+
+
+def _payload_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    try:
+        out = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return out if isinstance(out, dict) else {}
+
+
 def _iso_z(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -263,15 +315,18 @@ class SocialSentimentPuller:
 
         succeeded = 0
 
-        # Reddit: every tracked board in one feed (RSS allows ~1 request/minute)
+        # Reddit: newest posts of every tracked board (Arctic Shift, one request each)
         attempts += 1
         all_subs = [sub for subs in SUBREDDITS.values() for sub in subs]
         try:
-            result["reddit"] = self._reddit_hot_all(all_subs)
+            result["reddit"], board_failures = self._reddit_hot_all(all_subs)
             succeeded += 1
+            if board_failures:
+                failures.append(f"reddit: {len(board_failures)} of {len(all_subs)} boards "
+                                f"failed: {board_failures[0]}")
         except Exception as exc:
-            failures.append(f"reddit rss: {exc}")
-            log.debug("Reddit RSS failed: {e}", e=str(exc))
+            failures.append(f"reddit (arctic shift): {exc}")
+            log.debug("Reddit via Arctic Shift failed: {e}", e=str(exc))
 
         # Reddit-wide ticker mention counts (ApeWisdom)
         for label, flt in APEWISDOM_FILTERS.items():
@@ -385,28 +440,39 @@ class SocialSentimentPuller:
             result["error"] = failure_note
         return result
 
-    def _reddit_hot_all(self, subreddits: list[str]) -> dict[str, list[dict]]:
-        """Hot posts for every board from one combined RSS feed, keyed by board.
+    def _reddit_hot_all(
+        self, subreddits: list[str], now: datetime | None = None,
+    ) -> tuple[dict[str, list[dict]], list[str]]:
+        """Newest posts of every board (Arctic Shift), keyed by board, and per-board failures.
 
-        RSS carries title, body and publish time but no vote or comment counts;
-        ApeWisdom's per-ticker upvotes cover engagement instead.
+        Arctic Shift has no "hot" ranking and settles vote counts only ~36 h
+        after a post, so this is the newest ``REDDIT_POSTS_PER_BOARD`` posts of
+        the last ``REDDIT_POSTS_WINDOW_H`` hours; ApeWisdom's per-ticker
+        upvotes cover engagement. Raises when every board failed.
         """
-        entries = reddit_rss.fetch_feed(
-            f"/r/{'+'.join(subreddits)}/hot.rss", {"limit": REDDIT_RSS_LIMIT},
-            session=self._session,
-        )
-        canonical = {s.lower(): s for s in subreddits}
+        until = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        since = until - timedelta(hours=REDDIT_POSTS_WINDOW_H)
         posts: dict[str, list[dict]] = {}
-        for entry in entries:
-            sub = canonical.get(entry.subreddit.lower(), entry.subreddit)
-            posts.setdefault(sub, []).append({
-                "title": entry.title,
-                "text": entry.body[:2000],
-                "created": entry.published.isoformat() if entry.published else "",
-                "subreddit": sub,
-                "id": entry.id,
-            })
-        return posts
+        failures: list[str] = []
+        for sub in subreddits:
+            try:
+                rows, _ = arctic_shift.recent_posts(
+                    sub, since=since, until=until, max_pages=1,
+                    page_limit=REDDIT_POSTS_PER_BOARD, session=self._session)
+            except Exception as exc:
+                failures.append(f"reddit r/{sub} (arctic shift): {exc}")
+                continue
+            for p in rows:
+                posts.setdefault(sub, []).append({
+                    "title": p["title"],
+                    "text": p["selftext"][:2000],
+                    "created": datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).isoformat(),
+                    "subreddit": sub,
+                    "id": f"t3_{p['id']}",
+                })
+        if subreddits and len(failures) == len(subreddits):
+            raise RuntimeError(failures[0])
+        return posts, failures
 
     def _reddit_mentions(self, api_filter: str) -> list[dict]:
         """Top Reddit tickers for one ApeWisdom filter (page 1, ranked by mentions)."""
@@ -618,7 +684,8 @@ class SocialSentimentPuller:
                 watch.append(t)
         result: dict[str, Any] = {
             "date": obs.isoformat(), "fetched_at": fetched_at.isoformat(),
-            "bluesky": {}, "apewisdom": {}, "reddit": {}, "already_stored": [],
+            "bluesky": {}, "apewisdom": {}, "arcticshift": {}, "tradestie": {},
+            "reddit": {}, "already_stored": [],
         }
         if not self.engine:
             result.update(status="SKIPPED", rows_inserted=0,
@@ -708,6 +775,116 @@ class SocialSentimentPuller:
                 rows.append((f"APEWISDOM:{board}:{t}:mentions_24h", float(r["mentions"]), extra))
                 rows.append((f"APEWISDOM:{board}:{t}:upvotes_24h", float(r["upvotes"]), extra))
 
+        # Reddit posts and comments via Arctic Shift (free archive API, no key)
+        since = fetched_at - timedelta(hours=SERIES_WINDOW_H)
+        arctic_texts: dict[str, list[tuple[float, str]]] = {t: [] for t in watch}
+        arctic_boards: list[str] = []
+        for board in ARCTIC_BOARDS:
+            if time.monotonic() > deadline:
+                failures.append(f"time budget spent before arctic shift r/{board}")
+                break
+            if self._has_row(f"ARCTICSHIFT:{board}:posts_per_hour", src, obs):
+                result["already_stored"].append(f"arcticshift:{board}")
+                continue
+            attempts += 1
+            try:
+                posts, complete = arctic_shift.recent_posts(
+                    board, since=since, until=fetched_at, max_pages=ARCTIC_MAX_PAGES,
+                    session=self._session, max_wait_s=self._wait_budget(deadline))
+            except Exception as exc:
+                failures.append(f"arctic shift r/{board} posts: {exc}")
+                continue
+            succeeded += 1
+            arctic_boards.append(board)
+            base = {"subreddit": board, "basis": "created_utc", "source": "arctic-shift",
+                    **window, "complete": complete}
+            covered = float(SERIES_WINDOW_H)
+            if not complete:
+                oldest = min((p["created_utc"] for p in posts), default=fetched_at.timestamp())
+                covered = round((fetched_at.timestamp() - oldest) / 3600.0, 4)
+            if covered >= ARCTIC_MIN_SPAN_H:
+                rows.append((f"ARCTICSHIFT:{board}:posts_per_hour",
+                             round(len(posts) / covered, 6), {**base, "covered_hours": covered}))
+            if complete:
+                rows.append((f"ARCTICSHIFT:{board}:posts_24h", float(len(posts)), base))
+            for t in watch:
+                hits = [p for p in posts if mentions_ticker(f"{p['title']} {p['selftext']}", t)]
+                arctic_texts[t].extend(
+                    (p["created_utc"], f"{p['title']}. {p['selftext']}"[:ARCTIC_FINBERT_CHARS])
+                    for p in hits)
+                if complete:
+                    rows.append((f"ARCTICSHIFT:{board}:{t}:posts_24h", float(len(hits)), base))
+            info: dict[str, Any] = {"posts": len(posts), "complete": complete}
+            attempts += 1
+            try:
+                comments, c_complete = arctic_shift.newest_comments(
+                    board, since=since, until=fetched_at,
+                    session=self._session, max_wait_s=self._wait_budget(deadline))
+            except Exception as exc:
+                failures.append(f"arctic shift r/{board} comments: {exc}")
+            else:
+                succeeded += 1
+                info["comments_sample"] = len(comments)
+                c_base = {**base, "complete": c_complete, "sample": len(comments)}
+                if c_complete:
+                    rows.append((f"ARCTICSHIFT:{board}:comments_24h", float(len(comments)), c_base))
+                    rows.append((f"ARCTICSHIFT:{board}:comments_per_hour",
+                                 round(len(comments) / SERIES_WINDOW_H, 6), c_base))
+                elif comments:
+                    span = (fetched_at.timestamp() - min(c["created_utc"] for c in comments)) / 3600.0
+                    if span >= ARCTIC_MIN_SPAN_H:
+                        rows.append((f"ARCTICSHIFT:{board}:comments_per_hour",
+                                     round(len(comments) / span, 6),
+                                     {**c_base, "covered_hours": round(span, 4)}))
+            result["arcticshift"][board] = info
+
+        if arctic_boards:
+            texts = [(t, [{"text": txt} for _, txt in sorted(v, key=lambda x: -x[0])], {})
+                     for t, v in arctic_texts.items()]
+            a_scores, a_error = self._finbert_by_ticker(texts)
+            if a_error:
+                failures.append(f"finbert (arctic shift): {a_error}")
+            for t, sc in a_scores.items():
+                rows.append((f"ARCTICSHIFT:{t}:finbert_compound", sc["compound"],
+                             {**window, "boards": arctic_boards, "model": "ProsusAI/finbert",
+                              "n_texts": sc["n_texts"], "source": "arctic-shift"}))
+
+        # Tradestie: r/wallstreetbets top-50 tickers, previous US/Eastern day
+        if time.monotonic() > deadline:
+            failures.append("time budget spent before tradestie")
+        elif self._has_row("TRADESTIE:wallstreetbets:top50_comments", src, obs):
+            result["already_stored"].append("tradestie")
+        else:
+            day = self._tradestie_day(fetched_at)
+            attempts += 1
+            try:
+                t_rows = self._tradestie(day)
+            except Exception as exc:
+                failures.append(f"tradestie {day.isoformat()}: {exc}")
+            else:
+                succeeded += 1
+                result["tradestie"] = {"date": day.isoformat(), "tickers": len(t_rows)}
+                if t_rows and self._last_tradestie_day(src) != day.isoformat():
+                    t_base = {"tradestie_date": day.isoformat(), "subreddit": "wallstreetbets",
+                              "fetched_at": fetched_at.isoformat(),
+                              "scope": "Tradestie top 50 tickers by comments, US/Eastern day"}
+                    rows.append(("TRADESTIE:wallstreetbets:top50_comments",
+                                 float(sum(r["comments"] for r in t_rows)),
+                                 {**t_base, "tickers": len(t_rows)}))
+                    by_t = {}
+                    for r in t_rows:
+                        by_t.setdefault(r["ticker"], r)
+                    for t in watch:
+                        r = by_t.get(t)
+                        if r is None:
+                            continue  # outside the top 50 is not a measured zero
+                        extra = {**t_base, "rank": r["rank"], "sentiment": r["sentiment"]}
+                        rows.append((f"TRADESTIE:wallstreetbets:{t}:comments",
+                                     float(r["comments"]), extra))
+                        if r["score"] is not None:
+                            rows.append((f"TRADESTIE:wallstreetbets:{t}:sentiment_score",
+                                         r["score"], extra))
+
         # Reddit Data API (owner-registered app only)
         client, reason = self._reddit_api_client()
         if client is None:
@@ -749,12 +926,72 @@ class SocialSentimentPuller:
             result["error"] = failure_note
         log.info(
             "Social ticker series: {n} rows ({b} Bluesky tickers, {a} ApeWisdom boards, "
-            "reddit api: {r}){f}",
+            "{s} Arctic Shift boards, Tradestie {td}, reddit api: {r}){f}",
             n=inserted, b=len(result["bluesky"]), a=len(result["apewisdom"]),
+            s=len(result["arcticshift"]), td=result["tradestie"].get("date", "-"),
             r=result["reddit"].get("skipped") or f"{len(result['reddit'])} boards",
             f=f"; {failure_note}" if failure_note else "",
         )
         return result
+
+    @staticmethod
+    def _wait_budget(deadline: float) -> float:
+        """Seconds an Arctic Shift call may wait for its slot before the fetch deadline."""
+        return max(1.0, min(arctic_shift.DEFAULT_MAX_WAIT_S, deadline - time.monotonic()))
+
+    @staticmethod
+    def _tradestie_day(fetched_at: datetime) -> date:
+        """The US/Eastern calendar day before the fetch: a finished Tradestie day."""
+        from zoneinfo import ZoneInfo
+        return fetched_at.astimezone(ZoneInfo(TRADESTIE_TZ)).date() - timedelta(days=1)
+
+    def _tradestie(self, day: date) -> list[dict]:
+        """Tradestie's r/wallstreetbets rows for ``day``, validated; [] when none were published.
+
+        Weekends and holidays answer an empty list. Redirects are refused and
+        the body is capped; a row with an odd ticker or count is dropped.
+        """
+        resp = self._session.get(TRADESTIE_URL, params={"date": day.isoformat()}, timeout=15,
+                                 allow_redirects=False, stream=True,
+                                 headers={"Accept": "application/json"})
+        try:
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            data = arctic_shift.read_json_bounded(resp, TRADESTIE_MAX_BYTES)
+        finally:
+            close = getattr(resp, "close", None)
+            if callable(close):
+                close()
+        if not isinstance(data, list):
+            raise ValueError("answer is not a list")
+        rows: list[dict] = []
+        for rank, r in enumerate(data[:100], start=1):
+            if not isinstance(r, dict):
+                continue
+            ticker = r.get("ticker")
+            comments = r.get("no_of_comments")
+            if (not isinstance(ticker, str) or not _TRADESTIE_TICKER_RE.match(ticker)
+                    or isinstance(comments, bool) or not isinstance(comments, int) or comments < 0):
+                continue
+            score = r.get("sentiment_score")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) \
+                    or not -1.0 <= float(score) <= 1.0:
+                score = None
+            sentiment = r.get("sentiment")
+            rows.append({"ticker": ticker, "rank": rank, "comments": comments,
+                         "score": None if score is None else float(score),
+                         "sentiment": sentiment if sentiment in ("Bullish", "Bearish") else ""})
+        return rows
+
+    def _last_tradestie_day(self, source_id: int) -> str | None:
+        """The Tradestie day of the newest stored top50 row (one row per Tradestie day)."""
+        from sqlalchemy import text
+        with self.engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT raw_payload FROM raw_series WHERE series_id = :sid AND source_id = :src "
+                "AND pull_status = 'SUCCESS' ORDER BY obs_date DESC LIMIT 1"
+            ), {"sid": "TRADESTIE:wallstreetbets:top50_comments", "src": source_id}).fetchone()
+        return _payload_dict(row[0]).get("tradestie_date") if row else None
 
     def _has_row(self, series_id: str, source_id: int, obs_date: date) -> bool:
         with self.engine.connect() as conn:
