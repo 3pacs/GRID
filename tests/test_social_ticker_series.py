@@ -1,8 +1,9 @@
 """Per-ticker social series: SocialSentimentPuller.pull_ticker_series (2026-11-17).
 
 No network: HTTP goes through a stubbed session, sockets are refused, and the
-database is in-memory SQLite. Fixture shapes follow what api.bsky.app and
-apewisdom.io returned on 2026-11-18 (fields trimmed to the ones read).
+database is in-memory SQLite. Fixture shapes follow what api.bsky.app,
+apewisdom.io, arctic-shift.photon-reddit.com and tradestie.com returned on
+2026-11-18 (fields trimmed to the ones read).
 """
 
 from __future__ import annotations
@@ -20,19 +21,24 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 
 import ingestion.social_sentiment as mod
-from ingestion.altdata import reddit_oauth
+from ingestion.altdata import arctic_shift, reddit_oauth
+from tests.arctic_shift_fakes import COMMENTS_URL, POSTS_URL, FakeArctic, FakeResp
+from tests.arctic_shift_fakes import comment as a_comment
+from tests.arctic_shift_fakes import post as a_post
 
 FETCH = datetime(2026, 11, 17, 1, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture(autouse=True)
-def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
+def _offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     def _refuse(*_a: Any, **_k: Any) -> None:
         raise AssertionError("network access in a unit test")
     monkeypatch.setattr(socket.socket, "connect", _refuse)
     monkeypatch.setattr(mod, "BLUESKY_REQUEST_GAP_S", 0.0)
     monkeypatch.setattr(mod, "APEWISDOM_REQUEST_GAP_S", 0.0)
     monkeypatch.setattr(reddit_oauth, "reddit_credentials_configured", lambda: False)
+    monkeypatch.setenv(arctic_shift.LOCK_PATH_ENV, str(tmp_path / "arctic.lock"))
+    monkeypatch.setattr(arctic_shift, "MIN_INTERVAL_S", 0.0)
 
 
 @pytest.fixture()
@@ -101,20 +107,59 @@ _APE = {
 }
 
 
+FT = FETCH.timestamp()
+
+# Tradestie's answer for 2026-11-16 (the US/Eastern day before the fetch), trimmed.
+_TRADESTIE = [
+    {"no_of_comments": 255, "sentiment": "Bullish", "sentiment_score": 0.042, "ticker": "NVDA"},
+    {"no_of_comments": 27, "sentiment": "Bearish", "sentiment_score": -0.006, "ticker": "SPY"},
+    {"no_of_comments": 9, "sentiment": "Bullish", "sentiment_score": 7.5, "ticker": "AMD"},
+    {"no_of_comments": "12", "sentiment": "Bullish", "sentiment_score": 0.1, "ticker": "AAPL"},
+    {"no_of_comments": 3, "sentiment": "Bullish", "sentiment_score": 0.1, "ticker": "<script>"},
+]
+
+
+def _arctic() -> FakeArctic:
+    h = 3600
+    posts = [
+        a_post("w1", "wallstreetbets", FT - 1 * h, "NVDA calls into earnings", "loading up"),
+        a_post("w2", "wallstreetbets", FT - 2 * h, "Bought $nvda calls", ""),
+        a_post("w3", "wallstreetbets", FT - 3 * h, "nvidia and meta", "lowercase nvda"),
+        a_post("w4", "wallstreetbets", FT - 5 * h, "Short NVDA, long SPY calls", ""),
+        a_post("w5", "wallstreetbets", FT - 30 * h, "NVDA from yesterday", ""),
+        a_post("s1", "stocks", FT - 4 * h, "SPY at highs?", ""),
+    ]
+    comments = [a_comment(f"c{i}", "w1", FT - 60 * (i + 1), body="calls", sub="wallstreetbets")
+                for i in range(3)]
+    return FakeArctic(posts=posts, comments=comments)
+
+
 class Router:
     """Stub session: answers by URL and records every request."""
 
     def __init__(self, bsky: dict[str, Any] | None = None, fail: set[str] = frozenset(),
-                 refuse_cursor: bool = False) -> None:
+                 refuse_cursor: bool = False, arctic: FakeArctic | None = None,
+                 tradestie: Any = None) -> None:
         self.bsky = bsky if bsky is not None else {"$NVDA": [_bsky_nvda()]}
         self.fail = fail
         self.refuse_cursor = refuse_cursor
+        self.arctic = arctic if arctic is not None else _arctic()
+        if "arctic" in fail:
+            self.arctic.fail = {"posts", "comments"}
+        self.tradestie = _TRADESTIE if tradestie is None else tradestie
         self.calls: list[tuple[str, dict]] = []
 
-    def get(self, url: str, params: dict | None = None, timeout: Any = None) -> MagicMock:
+    def get(self, url: str, params: dict | None = None, **kwargs: Any) -> Any:
         self.calls.append((url, dict(params or {})))
+        if self.arctic.handles(url):
+            return self.arctic.get(url, params, **kwargs)
         if "reddit.com" in url:
             raise AssertionError("reddit.com must not be contacted")
+        if url == mod.TRADESTIE_URL:
+            assert kwargs.get("allow_redirects") is False
+            if "tradestie" in self.fail:
+                return FakeResp({"error": "down"}, status=503)
+            return FakeResp(self.tradestie)
         if url == mod.BLUESKY_SEARCH_URL:
             if "bluesky" in self.fail or (self.refuse_cursor and "cursor" in params):
                 return _resp(status=403)
@@ -250,6 +295,95 @@ class TestPullTickerSeries:
         assert "APEWISDOM:stocks:NVDA:mentions_24h" not in rows
         assert "reddit api not configured" in out["reddit"]["skipped"]
         assert not any(k.startswith("REDDIT:") for k in rows)
+        assert rows["ARCTICSHIFT:wallstreetbets:posts_24h"][0] == 4
+        assert rows["ARCTICSHIFT:wallstreetbets:NVDA:posts_24h"][0] == 3
+
+    def test_arctic_shift_board_counts_and_finbert(self, engine: Any) -> None:
+        router = Router()
+        out = _puller(engine, router).pull_ticker_series(tickers=["NVDA", "SPY", "META"],
+                                                         now=FETCH)
+        rows = _rows(engine)
+        assert out["status"] == "SUCCESS"
+        # The 30 h old post is outside the window; obs_date is the fetch date.
+        assert rows["ARCTICSHIFT:wallstreetbets:posts_24h"][0] == 4
+        assert rows["ARCTICSHIFT:wallstreetbets:posts_24h"][1] == "2026-11-17"
+        assert rows["ARCTICSHIFT:wallstreetbets:posts_per_hour"][0] == pytest.approx(4 / 24, abs=1e-6)
+        # Capitals or a cashtag count; "nvidia", lowercase "nvda" and "meta" do not.
+        assert rows["ARCTICSHIFT:wallstreetbets:NVDA:posts_24h"][0] == 3
+        assert rows["ARCTICSHIFT:wallstreetbets:META:posts_24h"][0] == 0
+        assert rows["ARCTICSHIFT:stocks:SPY:posts_24h"][0] == 1
+        assert rows["ARCTICSHIFT:investing:NVDA:posts_24h"][0] == 0  # measured zero
+        assert rows["ARCTICSHIFT:wallstreetbets:comments_24h"][0] == 3
+        nvda = rows["ARCTICSHIFT:NVDA:finbert_compound"]
+        assert nvda[0] == pytest.approx((0.6 + 0.6 + 0.6) / 3)  # all three say "calls"
+        assert nvda[2]["n_texts"] == 3 and nvda[2]["boards"] == mod.ARCTIC_BOARDS
+        assert "ARCTICSHIFT:SPY:finbert_compound" not in rows  # 2 texts < FINBERT_MIN_TEXTS
+        # One posts page and one comments page per board; every request bounded in time.
+        assert router.arctic.count(POSTS_URL) == len(mod.ARCTIC_BOARDS)
+        assert router.arctic.count(COMMENTS_URL) == len(mod.ARCTIC_BOARDS)
+        assert all(kw["allow_redirects"] is False for _, _, kw in router.arctic.calls)
+
+    def test_a_board_that_needs_more_pages_than_allowed_gets_a_rate(
+            self, engine: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mod, "ARCTIC_MAX_PAGES", 1)
+        posts = [a_post(f"p{i}", "wallstreetbets", FT - 90 * (i + 1), f"take {i}")
+                 for i in range(150)]
+        comments = [a_comment(f"c{i}", "p1", FT - 36 * (i + 1)) for i in range(120)]
+        router = Router(arctic=FakeArctic(posts=posts, comments=comments))
+        _puller(engine, router).pull_ticker_series(tickers=["NVDA"], now=FETCH)
+        rows = _rows(engine)
+        assert "ARCTICSHIFT:wallstreetbets:posts_24h" not in rows
+        assert "ARCTICSHIFT:wallstreetbets:NVDA:posts_24h" not in rows  # not a measured zero
+        rate = rows["ARCTICSHIFT:wallstreetbets:posts_per_hour"]
+        assert rate[0] == pytest.approx(100 / 2.5) and rate[2]["complete"] is False
+        assert "ARCTICSHIFT:wallstreetbets:comments_24h" not in rows
+        assert rows["ARCTICSHIFT:wallstreetbets:comments_per_hour"][0] == pytest.approx(100 / 1.0)
+
+    def test_tradestie_previous_eastern_day(self, engine: Any) -> None:
+        router = Router()
+        _puller(engine, router).pull_ticker_series(tickers=["NVDA", "SPY", "AMD", "AAPL", "TSLA"],
+                                                   now=FETCH)
+        rows = _rows(engine)
+        # 01:00Z on 11-17 is 20:00 on 11-16 in New York: the finished day is 11-15.
+        calls = [p for u, p in router.calls if u == mod.TRADESTIE_URL]
+        assert calls == [{"date": "2026-11-15"}]
+        assert rows["TRADESTIE:wallstreetbets:NVDA:comments"][0] == 255
+        assert rows["TRADESTIE:wallstreetbets:NVDA:sentiment_score"][0] == pytest.approx(0.042)
+        assert rows["TRADESTIE:wallstreetbets:SPY:comments"][2]["sentiment"] == "Bearish"
+        assert rows["TRADESTIE:wallstreetbets:SPY:comments"][2]["tradestie_date"] == "2026-11-15"
+        # Out-of-range score kept out; malformed rows dropped; absent ticker not a zero.
+        assert rows["TRADESTIE:wallstreetbets:AMD:comments"][0] == 9
+        assert "TRADESTIE:wallstreetbets:AMD:sentiment_score" not in rows
+        assert "TRADESTIE:wallstreetbets:AAPL:comments" not in rows
+        assert "TRADESTIE:wallstreetbets:TSLA:comments" not in rows
+        assert rows["TRADESTIE:wallstreetbets:top50_comments"][0] == 255 + 27 + 9
+        assert rows["TRADESTIE:wallstreetbets:top50_comments"][1] == "2026-11-17"
+
+    def test_tradestie_day_is_stored_once(self, engine: Any) -> None:
+        # 06:00Z on 11-17 and 02:00Z on 11-18 are both on 11-17 in New York, so
+        # both ask for 11-16: the second (next UTC day) stores no Tradestie row.
+        first = datetime(2026, 11, 17, 6, 0, tzinfo=timezone.utc)
+        _puller(engine, Router()).pull_ticker_series(tickers=["NVDA"], now=first)
+        out = _puller(engine, Router()).pull_ticker_series(
+            tickers=["NVDA"], now=first + timedelta(hours=20))
+        assert out["tradestie"] == {"date": "2026-11-16", "tickers": 3}
+        with engine.connect() as conn:
+            n = conn.execute(text("SELECT COUNT(*) FROM raw_series WHERE series_id = "
+                                  "'TRADESTIE:wallstreetbets:top50_comments'")).scalar()
+        assert n == 1
+
+    def test_tradestie_weekend_is_empty_not_failed(self, engine: Any) -> None:
+        out = _puller(engine, Router(tradestie=[])).pull_ticker_series(tickers=["NVDA"], now=FETCH)
+        assert out["status"] == "SUCCESS" and out["tradestie"]["tickers"] == 0
+        assert not any(k.startswith("TRADESTIE:") for k in _rows(engine))
+
+    def test_arctic_shift_down_is_partial_others_still_stored(self, engine: Any) -> None:
+        out = _puller(engine, Router(fail={"arctic"})).pull_ticker_series(
+            tickers=["NVDA"], now=FETCH)
+        rows = _rows(engine)
+        assert out["status"] == "PARTIAL" and "arctic shift r/wallstreetbets posts" in out["error"]
+        assert not any(k.startswith("ARCTICSHIFT:") for k in rows)
+        assert "BSKY:NVDA:posts_24h" in rows and "TRADESTIE:wallstreetbets:NVDA:comments" in rows
 
     def test_capped_ticker_gets_a_rate_not_a_24h_count(self, engine: Any) -> None:
         page = {"posts": [_post(f"at://c/{i}", f"$AAPL take {i}",
@@ -300,7 +434,7 @@ class TestPullTickerSeries:
         assert "APEWISDOM:wallstreetbets:NVDA:mentions_24h" in rows
 
     def test_everything_down_is_failed_and_writes_nothing(self, engine: Any) -> None:
-        out = _puller(engine, Router(fail={"bluesky", "apewisdom"})).pull_ticker_series(
+        out = _puller(engine, Router(fail={"bluesky", "apewisdom", "arctic", "tradestie"})).pull_ticker_series(
             tickers=["NVDA"], now=FETCH)
         assert out["status"] == "FAILED" and out["rows_inserted"] == 0
         assert _rows(engine) == {}
