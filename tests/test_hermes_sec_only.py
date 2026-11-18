@@ -687,10 +687,18 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # done_late) plus a comment block; the corporate_actions DAILY_INTEL_
         # TASKS entry names the new constant. No wrapper, cycle-budget,
         # allow-list or ordering change.
+        # SCHED re-pinned 8bb8a00f -> 9aeee49b (2026-11-18, rebased onto #1249's
+        # registry holds; branch alone was 01432bbd -> a907c59b) (2026-11-17,
+        # claude/social-reddit-bluesky-20261117): the only scheduler edits are
+        # a new social_ticker_series PULLER_REGISTRY entry
+        # (SocialSentimentPuller.pull_ticker_series, freq_h 12, timeout_s 900,
+        # with a 4-line comment) and its REGISTRY_CATALOG_NAMES alias
+        # social_ticker_series -> SocialSentiment. No SEC, FINRA or dispatch
+        # code changes. Needs reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','8bb8a00fcaaa1c741e4bcd6dadf760faf15d240a87e0e928ca3daf7e080a67a8')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','413b8e703f7d87df8a4885ffac597a6fc62c69b027eeab3522b5c05cec8da02f'),(SCHED,'\nimport calendar\n','9aeee49bbcb838dca02f7b8322662b37d3ee92b429a38b3af3ed531a0b5be2d0')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

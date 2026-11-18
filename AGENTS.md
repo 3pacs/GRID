@@ -453,3 +453,21 @@ No recognition/valuation/trade result is fabricated: seven candidates remain
 unusable. Frozen v2, legacy scenarios and the Nov18 comparison are unchanged.
 See docs/research/r3-nvda/desk-report-v1.md. Full CI pending; Claude verifies final
 kit and Anik applies releases. No production or holdout changes.
+
+## 2026-11-17 - per-ticker social series: Bluesky cashtags, ApeWisdom Reddit boards, dormant Reddit Data API (source only)
+
+What was done:
+
+- `SocialSentimentPuller.pull_ticker_series` and a SmartScheduler entry `social_ticker_series` (12 h, timeout 900 s, catalog row `SocialSentiment`). It writes numeric `BSKY:*`, `APEWISDOM:*` and (with an owner app) `REDDIT:*` raw_series per UTC fetch date; FinBERT (local) scores up to 100 cashtag posts per ticker.
+- entity_map: `REDDIT:<sub>:active_users` / `subscribers` map to the 2026-03-21 `reddit_<sub>` / `reddit_<sub>_subs` features. `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Reddit closed logged-out access on 2026-11-17 (~17:50Z): `.rss` answers an Atom "Not Found" (404), `.json` 403, old.reddit redirects to login; seen from grid-svr and a second network. smart_money and reddit_options_pulse have failed since. No scraping workaround: the Data API (owner app) is the only sanctioned route; ApeWisdom is the working Reddit-derived feed.
+- Bluesky logged-out `searchPosts` refuses every cursor page with 403 "forbidden by administrative rules". The puller reads one page and does not slice by `until` to get around it; a page that fills inside 24 h is stored as a rate (`posts_per_hour`) over its span, never as a 24 h count.
+- Bluesky search ignores `$` (a `$KO` query returned no Coca-Cola posts), so only literal cashtags count.
+
+Broken or TBD:
+
+- Needs merge + deploy; the job then runs on the next SmartScheduler tick. Reddit board stats need REDDIT_CLIENT_ID/SECRET from an owner-registered app.
+- smart_money / reddit_options_pulse / social_port_activity Reddit legs stay dead until the Data API is configured; not changed here.

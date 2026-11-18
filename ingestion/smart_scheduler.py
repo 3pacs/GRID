@@ -1416,6 +1416,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY", "api_key_mode": "env"},
     {"name": "fear_greed",        "mod": "ingestion.altdata.fear_greed",      "cls": "FearGreedPuller",          "method": "pull_all",      "freq_h": 12, "timeout_s": 30},
     {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 240},  # Reddit RSS slot wait ≤150s
+    # Per-ticker Bluesky cashtag counts + FinBERT, ApeWisdom Reddit board counts, Reddit Data API
+    # board stats when an app is registered. ~60 Bluesky + ~25 ApeWisdom requests; CPU FinBERT on
+    # <= 100 posts per ticker. Budgets itself to SERIES_TIME_BUDGET_S (780 s). One row per series
+    # per UTC day, so the second run of a day only fills what the first missed.
+    {"name": "social_ticker_series", "mod": "ingestion.social_sentiment",     "cls": "SocialSentimentPuller",    "method": "pull_ticker_series", "freq_h": 12, "timeout_s": 900},
     {"name": "polymarket",        "mod": "ingestion.altdata.polymarket",      "cls": "PolymarketPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
 
@@ -1565,6 +1570,7 @@ REGISTRY_CATALOG_NAMES: dict[str, str] = {
     "edgar":                  "SEC_EDGAR",
     "world_news":             "WorldNewsAPI",
     "social_sentiment":       "SocialSentiment",
+    "social_ticker_series":   "SocialSentiment",     # same hand-rolled catalog row as social_sentiment
     "wiki_history":           "WikiHistory",
     "kalshi_markets":         "KALSHI",
     "fed_speeches":           "FedSpeeches",
