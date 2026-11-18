@@ -14,7 +14,8 @@ Without the three `EDGE_STREAM_*` variables it does nothing. The cycle, under `c
    registrations only count sessions whose bars exist until `n_target_sessions` (100) or `max_sessions` (250);
 2. a stage-1 PASS registers its forward confirmation (stage 2, alpha 0.05/k);
 3. registers at most one new stage-1 proposal per weekday (queue in `families.QUEUE`, then `inbox/*.json`),
-   each after the sanity gate (`sanity.check`, G1–G10); rejections go to `rejections.jsonl`;
+   each after the sanity gate (`sanity.check`, G1–G11); rejections go to `rejections.jsonl` and a refused
+   queue item is checked again the next weekday;
 4. rewrites `status.json` (machine-readable, schema `edge-stream-status/1`) and `DIGEST.md` (a view of it).
 
 Look reports: `looks/<registration sha[:16]>.json` (0444, schema `edge-look-report/1`, every trade included).
@@ -30,6 +31,7 @@ Look reports: `looks/<registration sha[:16]>.json` (0444, schema `edge-look-repo
 | forward windows start after registration; no outcome computed before the look | `runner.forward_progress` (presence only) |
 | look runs only on the registered family code (`code_sha256`), else abandoned | `runner.compute_look` |
 | bars after the decision minute never reach the rule | `families.decision_bars` / `assert_no_lookahead` |
+| a stage-1 trial must be able to pay its costs: pooled break-even hit rate (1 + round-trip cost floor / mean \|move\|) / 2 ≤ 0.60, measured on the ~13–16 sessions **before** the window (unsigned sizes only) | `sanity` G11 (bar source set by the CLI; `sanity` is not hashed, so the gate never abandons an open registration) |
 | expectancy test: n ≥ 100, ≥ 50 a side, both sides > 0, session bootstrap LB at 1−alpha/k > 0, beats always-long, 2 of 3 thirds | `stats.judge` |
 
 ## Families

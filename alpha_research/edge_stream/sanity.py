@@ -9,19 +9,109 @@ G3 directional rules trade and are judged on both sides · G4 costs at least the
 policy floor · G5 the judged exit is one the account can take (the edge6 lesson: a
 SPY fly that pays only held to settlement is not a rule for an account that must
 close at 15:45) · G6 the window can supply n · G7 the data is fresh · G8 budget ·
-G9 decision before entry, lookahead-guarded harness · G10 instruments on the liquid list.
+G9 decision before entry, lookahead-guarded harness · G10 instruments on the liquid list ·
+G11 the trade can pay its costs.
+
+G11 (session families; an event family has no session trade to price) is the one check that
+reads bars, and only bars from **before** the window: on those
+sessions it takes the family's entry and exit prices for every instrument and compares the
+policy cost floor (round trip) with the mean unsigned move between them. A directional rule
+that is right a fraction p of the time earns about (2p - 1) x mean |move| before costs, so
+it breaks even at p* = (1 + cost / mean |move|) / 2. The trial is pooled, so p* is taken
+over all instruments' sessions together, and the proposal is refused when it exceeds
+:data:`MAX_BREAKEVEN_HIT` (per-instrument figures are reported beside it). No direction, side or outcome is read, and
+no window session is touched, so the look still sees its window for the first time.
 """
 
 from __future__ import annotations
 
 from datetime import date, timedelta
+from itertools import pairwise
 
 from . import policy as P
+from .data import RETENTION_DAYS, SourceError
 from .families import FAMILIES, _plus1
 from .ledger import StreamState, conflicts
 from .stats import bootstrap_b
 
 MIN_MECHANISM_CHARS = 80
+
+#: G11. Calendar days before the window start whose sessions are measured (clamped to
+#: Polygon's retention; the first fetched session only supplies a prior close). A history
+#: window starts 700 days back, so it gets ~13 sessions; a forward window ~16.
+PREWINDOW_DAYS = 24
+PREWINDOW_MIN_TRADES = 10
+#: The pooled hit rate a directional rule would need to break even. Set after the first
+#: three stream looks (IM1 metals, energy, intl_equity, all FAIL): on their windows the
+#: pooled break-even was 0.69 / 1.18 / 0.95, and the best gross edge any of their nine
+#: instruments showed was 0.21 x mean |move| (GLD), an effective hit rate of ~0.60. The
+#: gate only refuses; it can never pass a rule, so setting it from spent looks costs no
+#: false positive.
+MAX_BREAKEVEN_HIT = 0.60
+
+_feasibility_source = None
+
+
+def set_feasibility_source(source) -> None:
+    """The bar source G11 reads; the CLI sets it for a cycle and clears it after.
+
+    Not an argument of :func:`check` on purpose: the runner is a hashed evaluation module
+    (``families.EVALUATION_MODULES``), so threading a source through it would change the
+    code hash of every open registration and abandon it on deploy. With no source set
+    (unit tests of the runner) G11 is not run.
+    """
+    global _feasibility_source
+    _feasibility_source = source
+
+
+def breakeven_hits(proposal: dict, source, today: date) -> dict[str, dict]:
+    """From the sessions before the window, per instrument and ``"pooled"``: trades, mean
+    |move|, mean round-trip cost and the break-even hit rate. Unsigned sizes only."""
+    family = FAMILIES[proposal["family"]]
+    start = date.fromisoformat(proposal["window"]["start"])
+    first = max(start - timedelta(days=PREWINDOW_DAYS), today - timedelta(days=RETENTION_DAYS - 1))
+    per, all_moves, all_costs = {}, [], []
+    for t in proposal["instruments"]:
+        bars = source.sessions(t, first, start)  # end exclusive: no window session
+        days = [d for d in sorted(bars) if d < start.isoformat()]
+        moves, costs = [], []
+        for prev, day in pairwise(days):
+            tr = family.session_trade(bars[prev], bars[day], t, day)
+            if tr is None:
+                continue
+            moves.append(abs(tr["exit"] / tr["entry"] - 1.0))
+            costs.append(tr["cost_rt"])
+        per[t] = _summary(moves, costs, days[1] if len(days) > 1 else None, days[-1] if days else None)
+        all_moves += moves
+        all_costs += costs
+    froms = [v["from"] for v in per.values() if v["from"]]
+    tos = [v["to"] for v in per.values() if v["to"]]
+    per["pooled"] = _summary(all_moves, all_costs, min(froms, default=None), max(tos, default=None))
+    return per
+
+
+def _summary(moves: list[float], costs: list[float], first: str | None, last: str | None) -> dict:
+    mean_move = sum(moves) / len(moves) if moves else 0.0
+    mean_cost = sum(costs) / len(costs) if costs else 0.0
+    hit = (1.0 + mean_cost / mean_move) / 2.0 if mean_move > 0 else float("inf")
+    return {"n": len(moves), "mean_abs_move_bp": round(mean_move * 1e4, 2), "cost_rt_bp": round(mean_cost * 1e4, 2),
+            "breakeven_hit": round(hit, 3), "from": first, "to": last}
+
+
+def _g11(proposal: dict, source, today: date) -> str:
+    try:
+        m = breakeven_hits(proposal, source, today)
+    except SourceError as exc:
+        return f"bar source: {exc}"
+    pooled = m["pooled"]
+    if pooled["n"] < PREWINDOW_MIN_TRADES:
+        return f"fewer than {PREWINDOW_MIN_TRADES} pre-window trades ({pooled['n']})"
+    if pooled["breakeven_hit"] <= MAX_BREAKEVEN_HIT:
+        return "ok"
+    return (f"pooled break-even hit rate {pooled['breakeven_hit']} above {MAX_BREAKEVEN_HIT} at the policy cost floor "
+            f"(cost {pooled['cost_rt_bp']} bp vs mean |move| {pooled['mean_abs_move_bp']} bp, "
+            f"{pooled['from']}..{pooled['to']}): " + "; ".join(
+                f"{t} {v['breakeven_hit']}" for t, v in m.items() if t != "pooled"))
 
 
 def _weekdays(start: str, end: str) -> int:
@@ -152,6 +242,15 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
     # G10 liquid list
     missing = [t for t in instruments if t not in P.LIQUIDITY]
     r["G10_liquid"] = "ok" if instruments and not missing else f"not on the liquid list: {missing}"
+
+    # G11 cost feasibility (stage 1 only: a confirmation follows a look judged net of costs).
+    # Session families only: it prices the family's own session_trade on minute bars. An event
+    # family (EC1: daily bars, a multi-day hedged hold) has no session trade to price; its look
+    # is judged net of its four cost floors and the short-leg carry.
+    if (_feasibility_source is not None and proposal["stage"] == 1 and family is not None
+            and getattr(family, "kind", "session") == "session"
+            and all(v == "ok" for v in r.values())):
+        r["G11_cost_feasible"] = _g11(proposal, _feasibility_source, today)
     return r
 
 

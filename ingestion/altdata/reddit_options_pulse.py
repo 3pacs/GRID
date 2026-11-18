@@ -19,22 +19,28 @@ Why it matters:
     * The 0DTE reference count is itself a leading indicator of intraday
       gamma squeezes and pin risk.
 
-Data source (2026-11-05):
+Data source (2026-11-18):
 
-    Reddit RSS feeds, no credentials (ingestion/altdata/reddit_rss.py, which
-    also spaces requests to Reddit's ~1/minute unauthenticated limit).
+    The Arctic Shift archive API, no credentials (ingestion/altdata/arctic_shift.py,
+    which spaces requests across GRID processes and treats answers as
+    untrusted). Reddit's own logged-out RSS feeds, used from 2026-11-05,
+    answer 404 since about 17:50Z 2026-11-17 (the 2026-11-16 thread was the
+    last one stored).
 
-    * GET https://www.reddit.com/r/wallstreetbets/hot.rss?limit=10
-      -> the pinned daily threads lead the hot listing.
-    * GET https://www.reddit.com/r/wallstreetbets/comments/<id>.rss?limit=500
-      -> the thread post plus up to ~500 comments (author + body).
+    * The newest r/wallstreetbets posts of the last THREAD_LOOKBACK_H hours,
+      paged newest first, and the pinned thread picked locally by title
+      prefix AND posting account (DAILY_THREAD_AUTHORS), oldest of its day:
+      Arctic Shift's full-text title search on this board answers "Timeout"
+      (HTTP 422) more often than not.
+    * GET /api/comments/search?link_id=<id> -> the thread's newest
+      THREAD_MAX_COMMENTS comments (author + body), the same cap the RSS
+      feed had (~500).
 
     Until 2026-11-05 this read r/options through the OAuth Data API. It never
     stored a row: no app credentials were set, and r/options has no daily
     discussion thread (its pinned post is a periodic "Safe Haven" megathread).
     The series keep their ``reddit_options:`` names; each row's payload names
-    the thread it came from. Search feeds lag by weeks, so the thread is taken
-    from the hot listing, not search.
+    the thread it came from.
 
 Failure modes — never crash, never write on failure:
 
@@ -57,14 +63,14 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from typing import Any, Callable, Iterable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable
 
 import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata import reddit_rss
+from ingestion.altdata import arctic_shift
 from ingestion.base import BasePuller
 
 # ── Configuration constants ──────────────────────────────────────────
@@ -76,6 +82,27 @@ DAILY_THREAD_QUERIES: tuple[str, ...] = (
     "daily discussion",
     "moves tomorrow",
 )
+# The pinned threads' titles start like this ("Daily Discussion Thread for
+# November 17, 2026", "What Are Your Moves Tomorrow, November 18, 2026"); a
+# user post that merely mentions the phrase is not the thread.
+DAILY_THREAD_TITLE_PREFIXES: tuple[str, ...] = (
+    "daily discussion thread",
+    "what are your moves tomorrow",
+)
+
+# Accounts that post the pinned threads. Checked read-only on 2026-11-18: the
+# last three ("Daily Discussion Thread for November 17", "What Are Your Moves
+# Tomorrow, November 17/18") were all posted by u/verified-trader, the
+# subreddit's moderator account (its "Moves Tomorrow" posts carry
+# distinguished="moderator"; the daily one carries none, and Arctic Shift
+# cannot return "stickied" as a requested field). AutoModerator posted them
+# in earlier years and is kept. A look-alike title from any other account is
+# never the thread.
+DAILY_THREAD_AUTHORS: frozenset[str] = frozenset({"verified-trader", "automoderator"})
+
+THREAD_LOOKBACK_H: int = 30      # the morning thread is <= ~16 h old at the 22:00 run
+THREAD_SEARCH_PAGES: int = 6     # 600 newest posts; r/wallstreetbets had ~420 per 24 h
+THREAD_MAX_COMMENTS: int = 500
 
 REDDIT_USER_AGENT: str = "grid-intelligence/0.1 (intelligence platform research)"
 
@@ -375,51 +402,62 @@ def _flatten_comments(thread_json: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _fetch_daily_thread(
-    fetch: Callable[..., list[reddit_rss.RssEntry]] | None = None,
+    session: Any = None,
+    now: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Find and fetch the newest pinned daily thread on REDDIT_SUBREDDIT.
 
-    Two feeds: the hot listing (pinned posts first), then the chosen thread's
-    comment feed. Returns ``{"post": <post fields>, "thread": [<comment>...]}``
-    in the shapes ``_aggregate_pulse`` / ``_flatten_comments`` read, or
-    ``None`` on any failure path.
+    Pages the board's newest posts (Arctic Shift), picks the thread by title,
+    then reads its newest comments. Returns ``{"post": <post fields>,
+    "thread": [<comment>...]}`` in the shapes ``_aggregate_pulse`` /
+    ``_flatten_comments`` read, or ``None`` on any failure path.
     """
-    fetch = fetch or reddit_rss.fetch_feed
+    until = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    since = until - timedelta(hours=THREAD_LOOKBACK_H)
     try:
-        listing = fetch(f"/r/{REDDIT_SUBREDDIT}/hot.rss", {"limit": 10})
-    except (reddit_rss.RedditRateLimited, requests.RequestException, ValueError) as exc:
-        log.warning("reddit_options_pulse: hot listing failed: {e}", e=str(exc))
+        posts, _ = arctic_shift.recent_posts(
+            REDDIT_SUBREDDIT, since=since, until=until,
+            max_pages=THREAD_SEARCH_PAGES, session=session)
+    except (arctic_shift.ArcticShiftError, requests.RequestException, ValueError) as exc:
+        log.warning("reddit_options_pulse: recent posts failed: {e}", e=str(exc))
         return None
 
+    pinned = [p for p in posts
+              if p["author"].lower() in DAILY_THREAD_AUTHORS
+              and p["title"].lower().startswith(DAILY_THREAD_TITLE_PREFIXES)]
     thread = None
     for fragment in DAILY_THREAD_QUERIES:
-        matches = [e for e in listing
-                   if e.kind == "t3" and fragment in e.title.lower() and e.published]
+        matches = [p for p in pinned if fragment in p["title"].lower()]
         if matches:
-            thread = max(matches, key=lambda e: e.published)
+            # The newest day's thread; within that day the first one posted
+            # (a later repost or duplicate never displaces it).
+            day = lambda p: datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).date()  # noqa: E731
+            latest = max(day(p) for p in matches)
+            thread = min((p for p in matches if day(p) == latest),
+                         key=lambda p: p["created_utc"])
             break
     if thread is None:
-        log.info("reddit_options_pulse: no pinned daily thread on r/{s}", s=REDDIT_SUBREDDIT)
+        log.info("reddit_options_pulse: no daily thread on r/{s} in the last {h} h",
+                 s=REDDIT_SUBREDDIT, h=THREAD_LOOKBACK_H)
         return None
 
     try:
-        entries = fetch(
-            f"/r/{REDDIT_SUBREDDIT}/comments/{thread.short_id}.rss", {"limit": 500},
-        )
-    except (reddit_rss.RedditRateLimited, requests.RequestException, ValueError) as exc:
-        log.warning("reddit_options_pulse: thread {t} failed: {e}", t=thread.short_id, e=str(exc))
+        comments = arctic_shift.thread_comments(
+            thread["id"], max_comments=THREAD_MAX_COMMENTS, session=session)
+    except (arctic_shift.ArcticShiftError, requests.RequestException, ValueError) as exc:
+        log.warning("reddit_options_pulse: thread {t} failed: {e}", t=thread["id"], e=str(exc))
         return None
 
     post = {
-        "id": thread.short_id,
-        "title": thread.title,
-        "selftext": thread.body,
-        "created_utc": thread.published.timestamp(),
-        "permalink": thread.link.removeprefix(REDDIT_BASE_URL),
+        "id": thread["id"],
+        "title": thread["title"],
+        "selftext": thread["selftext"],
+        "created_utc": thread["created_utc"],
+        "permalink": f"/r/{REDDIT_SUBREDDIT}/comments/{thread['id']}/",
     }
-    comments = [{"id": e.short_id, "body": e.body, "author": e.author}
-                for e in entries if e.kind == "t1" and e.body]
-    return {"post": post, "thread": comments}
+    return {"post": post,
+            "thread": [{"id": c["id"], "body": c["body"], "author": c["author"]}
+                       for c in comments if c["body"]]}
 
 
 # ── Aggregation ──────────────────────────────────────────────────────
@@ -717,6 +755,8 @@ def run_reddit_options_pulse_puller(engine: Engine) -> dict[str, Any]:
 __all__ = [
     "REDDIT_SUBREDDIT",
     "DAILY_THREAD_QUERIES",
+    "DAILY_THREAD_TITLE_PREFIXES",
+    "DAILY_THREAD_AUTHORS",
     "REDDIT_USER_AGENT",
     "BULLISH_TOKENS",
     "BEARISH_TOKENS",

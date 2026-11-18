@@ -1054,8 +1054,20 @@ def _warn_once(key: tuple[str, str], message: str, **kw: Any) -> None:
     log.warning(message, **kw)
 
 
+def _digest_paused() -> str | None:
+    """Why the digest must not run, or ``None`` when it may (``settings.OPTIONS_DIGEST_ENABLED``)."""
+    from config import settings
+
+    if getattr(settings, "OPTIONS_DIGEST_ENABLED", False):
+        return None
+    return "paused: OPTIONS_DIGEST_ENABLED is false (option-chain inputs untrusted since 2026-11-09)"
+
+
 def run_100x_digest(force: bool = False) -> dict[str, Any]:
     """Scan, gate, price, record and email options calls.
+
+    Returns at once with ``reason`` set when the digest is paused; ``force`` does not override a
+    pause (it only sends a digest that has nothing to report).
 
     1. Scanner rows sorted by score; ``_sanity_check`` drops garbage data.
     2. ``_selection_gate`` withholds the measured losers (100x tier, CALLs,
@@ -1069,6 +1081,11 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
 
     Returns summary dict.
     """
+    paused = _digest_paused()
+    if paused:
+        log.info("100x Digest: {r}; nothing scanned, recorded or sent", r=paused)
+        return {"sent": False, "reason": paused, "scanned": 0}
+
     engine = _get_engine()
     now = datetime.now(timezone.utc)
     today = now.date()  # UTC, like grid-svr's clock and the ledger timestamps
