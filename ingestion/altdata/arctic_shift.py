@@ -312,6 +312,9 @@ def post(raw: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any] 
         "created_utc": created,
         "score": _count(raw.get("score")) if settled else None,
         "num_comments": _count(raw.get("num_comments")) if settled else None,
+        # Reddit's mod/admin marker ("moderator", "admin") or None.
+        "distinguished": raw.get("distinguished") if raw.get("distinguished") in (
+            "moderator", "admin") else None,
     }
 
 
@@ -357,7 +360,8 @@ def recent_posts(
         batch = search("posts", {
             "subreddit": subreddit, "after": lo, "before": before,
             "limit": max(1, min(page_limit, PAGE_LIMIT)),
-            "sort": "desc", "fields": "id,subreddit,author,title,selftext,created_utc,score,num_comments",
+            "sort": "desc", "fields": ("id,subreddit,author,title,selftext,created_utc,score,"
+                                     "num_comments,distinguished"),
         }, session=session, max_wait_s=max_wait_s)
         oldest: float | None = None
         for raw in batch:

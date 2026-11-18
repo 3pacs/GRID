@@ -48,7 +48,7 @@ def test_one_request_per_board_mapped_to_post_fields(monkeypatch: pytest.MonkeyP
     assert {p["limit"] for _, p, _ in fake.calls} == {sm._MAX_HOT_POSTS}
     a1 = next(p for p in posts if p["title"] == "NVDA calls")
     # A 10-minute-old post has no settled score: the corroboration rule applies.
-    assert a1 == {"title": "NVDA calls", "selftext": "buying calls", "author": "trader",
+    assert a1 == {"id": "a1", "title": "NVDA calls", "selftext": "buying calls", "author": "trader",
                   "subreddit": "wallstreetbets", "created_utc": float(int(now - 600)),
                   "score": None, "num_comments": None, "upvote_ratio": None}
     assert {p["title"] for p in posts} == {"NVDA calls", "SPY puts"}
@@ -168,24 +168,103 @@ def test_distinct_authors_give_a_signal_kept_out_of_signal_sources(
     assert emitted == []  # not yet corroborated across runs
 
 
-@pytest.mark.parametrize("prior,promoted", [
-    ({"bear1", "old_bear"}, True),         # earlier run corroborated + a new author now
-    ({"bear1", "bear2"}, False),           # the same two authors again: nothing new
-    ({"old_bear"}, False),                 # one earlier author is not corroboration
-    (set(), False),
-])
-def test_promotion_needs_corroboration_across_runs(
-        monkeypatch: pytest.MonkeyPatch, prior: set, promoted: bool) -> None:
-    now = time.time()
-    posts = [post("d1", "stocks", now - 120, "TSLA puts, crash coming", author="bear1"),
-             post("d2", "stocks", now - 240, "TSLA puts, crash coming", author="bear2")]
+def _stored(author: str, pid: str, created: float, text_: str = "TSLA puts, crash coming",
+            ticker: str = "TSLA", direction: str = "BEARISH") -> tuple[str, dict]:
+    """A raw_series row as an earlier run wrote it (series_id, raw_payload)."""
+    from datetime import datetime, timezone
+    return (f"SOCIAL:reddit:{author}:{ticker}:{direction}",
+            {"post_id": pid, "post_hash": sm._text_hash(f"{text_} "),
+             "post_timestamp": datetime.fromtimestamp(created, tz=timezone.utc).isoformat()})
+
+
+class _PriorDb:
+    """Engine whose prior-run lookup returns ``rows``; records the query parameters."""
+
+    def __init__(self, rows: list[tuple[str, Any]]) -> None:
+        self.rows, self.params = rows, []
+        conn = MagicMock()
+
+        def execute(sql: Any, params: dict | None = None) -> Any:
+            self.params.append(params)
+            res = MagicMock()
+            res.fetchall.return_value = list(self.rows)
+            return res
+        conn.execute.side_effect = execute
+        self.engine = MagicMock()
+        self.engine.begin.return_value.__enter__.return_value = conn
+
+
+def _run_with_prior(monkeypatch: pytest.MonkeyPatch, posts: list[dict],
+                    prior: list[tuple[str, Any]]) -> tuple[list, list]:
     p, raw, emitted = _gate_puller(monkeypatch, posts)
-    p._prior_authors = lambda conn, ticker, direction, run_start: (
-        set(prior) if (ticker, direction) == ("TSLA", "BEARISH") else set())
+    p.engine = _PriorDb(prior).engine
     p.pull_reddit(["stocks"])
-    assert len(raw) == 2
-    assert {r["trust_tier"] for r in raw} == {"unscored_promoted" if promoted else "unscored"}
-    assert len(emitted) == (2 if promoted else 0)
+    return raw, emitted
+
+
+def test_re_pulling_the_same_posts_never_promotes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Run 1 stored bear1/bear2/bear3; hours later the same three posts are still in
+    # the 24 h window. All are already stored, so nothing is fresh: no promotion,
+    # however many earlier rows there are or how old their pull_timestamp is.
+    now = time.time()
+    posts = [post(f"d{i}", "stocks", now - 3600 * (8 + i), "TSLA puts, crash coming",
+                  author=f"bear{i}") for i in (1, 2, 3)]
+    prior = [_stored(f"bear{i}", f"d{i}", now - 3600 * (8 + i)) for i in (1, 2, 3)]
+    raw, emitted = _run_with_prior(monkeypatch, posts, prior)
+    assert {r["trust_tier"] for r in raw} == {"unscored"} and emitted == []
+
+
+def test_legacy_rows_without_post_ids_dedupe_by_author_and_text(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    posts = [post(f"d{i}", "stocks", now - 3600 * (8 + i), "TSLA puts, crash coming",
+                  author=f"bear{i}") for i in (1, 2, 3)]
+    prior = [(sid, {**pl, "post_id": ""}) for sid, pl in
+             (_stored(f"bear{i}", "", now - 3600 * (8 + i)) for i in (1, 2, 3))]
+    raw, emitted = _run_with_prior(monkeypatch, posts, prior)
+    assert emitted == []
+
+
+def test_old_authors_reposting_now_do_not_count_as_new(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    prior = [_stored("bear1", "o1", now - 20 * 3600), _stored("bear2", "o2", now - 20 * 3600)]
+    # New post ids and new text, but the same two authors: no new corroborator.
+    posts = [post("n1", "stocks", now - 600, "TSLA puts again, crash", author="bear1"),
+             post("n2", "stocks", now - 300, "still TSLA puts, crash", author="bear2")]
+    raw, emitted = _run_with_prior(monkeypatch, posts, prior)
+    assert emitted == []
+
+
+def test_prior_posts_must_predate_fresh_posts_by_the_minimum_age(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Earlier authors posted only 2 h before the new author: one burst, not corroboration.
+    now = time.time()
+    prior = [_stored("bear1", "o1", now - 3 * 3600), _stored("bear2", "o2", now - 3 * 3600)]
+    posts = [post("o1", "stocks", now - 3 * 3600, "TSLA puts, crash coming", author="bear1"),
+             post("n3", "stocks", now - 3600, "TSLA puts, crash coming", author="bear3")]
+    raw, emitted = _run_with_prior(monkeypatch, posts, prior)
+    assert emitted == []
+
+
+def test_genuinely_later_posts_from_new_authors_promote(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    prior = [_stored("bear1", "o1", now - 20 * 3600), _stored("bear2", "o2", now - 19 * 3600)]
+    posts = [post("o2", "stocks", now - 19 * 3600, "TSLA puts, crash coming", author="bear2"),
+             post("n3", "stocks", now - 1800, "TSLA puts, crash coming", author="bear3"),
+             post("n4", "stocks", now - 900, "TSLA puts, crash coming", author="bear4")]
+    raw, emitted = _run_with_prior(monkeypatch, posts, prior)
+    assert {r["trust_tier"] for r in raw} == {"unscored_promoted"}
+    assert {s["username"] for s in emitted} == {"bear2", "bear3", "bear4"}
+    assert {r["post_id"] for r in raw} == {"o2", "n3", "n4"}  # ids kept for the next run
+
+
+def test_one_prior_author_is_not_corroboration(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    prior = [_stored("bear1", "o1", now - 20 * 3600)]
+    posts = [post("n3", "stocks", now - 1800, "TSLA puts, crash coming", author="bear3"),
+             post("n4", "stocks", now - 900, "TSLA puts, crash coming", author="bear4")]
+    raw, emitted = _run_with_prior(monkeypatch, posts, prior)
+    assert emitted == []
 
 
 def test_promoted_signal_with_an_existing_row_still_emits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,19 +278,24 @@ def test_promoted_signal_with_an_existing_row_still_emits(monkeypatch: pytest.Mo
     assert raw == [] and len(emitted) == 1
 
 
-def test_prior_authors_query_and_parsing() -> None:
+def test_prior_posts_query_and_parsing() -> None:
     from datetime import datetime, timedelta, timezone
     p = _puller()
     p.source_id = 7
-    conn = MagicMock()
-    conn.execute.return_value.fetchall.return_value = [
-        ("SOCIAL:reddit:bear1:TSLA:BEARISH",), ("SOCIAL:reddit:bear_2:TSLA:BEARISH",),
-        ("SOCIAL:reddit:x:TSLAX:BEARISH",), ("garbage",)]
     run = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
-    assert p._prior_authors(conn, "TSLA", "BEARISH", run) == {"bear1", "bear_2"}
-    params = conn.execute.call_args.args[1]
+    db = _PriorDb([
+        ("SOCIAL:reddit:bear1:TSLA:BEARISH", {"post_id": "a1", "post_hash": "h",
+                                             "post_timestamp": "2026-11-18T01:00:00+00:00"}),
+        ("SOCIAL:reddit:bear_2:TSLA:BEARISH", '{"post_timestamp": "", "post_hash": "h2"}'),
+        ("SOCIAL:reddit:x:TSLAX:BEARISH", {}), ("garbage", {})])
+    conn = db.engine.begin.return_value.__enter__.return_value
+    got = p._prior_posts(conn, "TSLA", "BEARISH", run)
+    assert got == [
+        {"author": "bear1", "post_id": "a1", "post_hash": "h",
+         "created": datetime(2026, 11, 18, 1, tzinfo=timezone.utc).timestamp()},
+        {"author": "bear_2", "post_id": "", "post_hash": "h2", "created": None}]
+    params = db.params[0]
     assert params["pat"] == "SOCIAL:reddit:%:TSLA:BEARISH" and params["src"] == 7
-    assert params["hi"] == run - timedelta(hours=sm._PROMOTE_MIN_AGE_H)
-    assert params["lo"] == run - timedelta(hours=sm._PROMOTE_LOOKBACK_H)
+    assert params["hi"] == run and params["lo"] == run - timedelta(hours=sm._PROMOTE_LOOKBACK_H)
     conn.execute.side_effect = RuntimeError("db down")
-    assert p._prior_authors(conn, "TSLA", "BEARISH", run) == set()  # fails closed
+    assert p._prior_posts(conn, "TSLA", "BEARISH", run) == []  # fails closed

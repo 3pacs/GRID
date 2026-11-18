@@ -77,11 +77,17 @@ _MIN_UNSCORED_AUTHORS: int = 2
 
 # Unscored signals are recorded in raw_series (trust_tier "unscored") but kept
 # out of signal_sources -- the smart_money / social streams the convergence
-# scanner and downstream trading read -- until corroborated across runs:
-# rows from at least _MIN_UNSCORED_AUTHORS distinct authors stored by runs
-# _PROMOTE_MIN_AGE_H to _PROMOTE_LOOKBACK_H ago, plus at least one author in
-# this run who is not among them. A handful of throwaway accounts posting the
-# same ticker in one burst therefore never reaches signal_sources.
+# scanner and downstream trading read -- until corroborated across time, by
+# post creation time (never by when a row was pulled):
+#   * "fresh" posts are this pull's posts that no earlier run stored (by post
+#     id, or author + text hash for rows written before post ids were kept);
+#   * prior authors are those of stored posts created at least
+#     _PROMOTE_MIN_AGE_H before the earliest fresh post (and within
+#     _PROMOTE_LOOKBACK_H of the run);
+#   * promotion needs >= _MIN_UNSCORED_AUTHORS prior authors and a fresh
+#     post by an author who is not one of them.
+# Re-pulling the same posts never promotes them, and a burst of throwaway
+# accounts in one window never reaches signal_sources.
 # Arctic Shift exposes no account creation time, so no account-age gate.
 _PROMOTE_MIN_AGE_H: float = 6.0
 _PROMOTE_LOOKBACK_H: float = 48.0
@@ -360,6 +366,7 @@ class SmartMoneyPuller(BasePuller):
                 continue
             for p in rows:
                 posts.append({
+                    "id": p["id"],
                     "title": p["title"],
                     "selftext": p["selftext"],
                     "author": p["author"],
@@ -442,6 +449,8 @@ class SmartMoneyPuller(BasePuller):
                 "subreddit": subreddit,
                 "post_title": title[:200],
                 "post_hash": post_hash,
+                "post_id": str(post.get("id") or ""),
+                "created_utc": float(created_utc) if isinstance(created_utc, (int, float)) else None,
                 "post_score": post_score,
                 "post_timestamp": post_timestamp,
                 "trust_score": self._get_trust_score(username),
@@ -527,6 +536,7 @@ class SmartMoneyPuller(BasePuller):
                 "ticker": signal["ticker"],
                 "direction": signal["direction"],
                 "post_hash": signal.get("post_hash", ""),
+                "post_id": signal.get("post_id", ""),
                 "post_timestamp": signal.get("post_timestamp", ""),
                 "post_score": signal.get("post_score", 0),
                 "upvote_ratio": signal.get("upvote_ratio", 0),
@@ -566,17 +576,18 @@ class SmartMoneyPuller(BasePuller):
                 e=str(exc),
             )
 
-    def _prior_authors(self, conn: Any, ticker: str, direction: str,
-                       run_start: datetime) -> set[str]:
-        """Authors of unscored Reddit rows for (ticker, direction) stored by earlier runs.
+    def _prior_posts(self, conn: Any, ticker: str, direction: str,
+                     run_start: datetime) -> list[dict[str, Any]]:
+        """Reddit posts for (ticker, direction) stored by earlier runs (last _PROMOTE_LOOKBACK_H).
 
-        Window: ``_PROMOTE_LOOKBACK_H`` to ``_PROMOTE_MIN_AGE_H`` before
-        ``run_start``. Any failure returns an empty set (nothing promoted).
+        Each: ``author``, ``post_id`` ('' for rows written before ids were
+        kept), ``post_hash`` and ``created`` (the post's creation time, epoch
+        seconds, or None). Any failure returns [] (nothing promoted).
         """
         try:
             with conn.begin_nested():
                 rows = conn.execute(text(
-                    "SELECT series_id FROM raw_series "
+                    "SELECT series_id, raw_payload FROM raw_series "
                     "WHERE source_id = :src AND series_id LIKE :pat "
                     "AND pull_status = 'SUCCESS' "
                     "AND pull_timestamp >= :lo AND pull_timestamp < :hi"
@@ -584,29 +595,65 @@ class SmartMoneyPuller(BasePuller):
                     "src": self.source_id,
                     "pat": f"SOCIAL:reddit:%:{ticker}:{direction}",
                     "lo": run_start - timedelta(hours=_PROMOTE_LOOKBACK_H),
-                    "hi": run_start - timedelta(hours=_PROMOTE_MIN_AGE_H),
+                    "hi": run_start,
                 }).fetchall()
         except Exception as exc:
             log.debug("SmartMoney: prior-run lookup failed: {e}", e=str(exc))
-            return set()
-        authors: set[str] = set()
+            return []
+        out: list[dict[str, Any]] = []
         for row in rows or []:
             parts = str(row[0]).split(":")
-            if len(parts) == 5 and parts[3] == ticker and parts[4] == direction:
-                authors.add(parts[2])
-        return authors
+            if len(parts) != 5 or parts[3] != ticker or parts[4] != direction:
+                continue
+            payload = row[1] if isinstance(row[1], dict) else None
+            if payload is None:
+                try:
+                    payload = json.loads(row[1])
+                except (TypeError, ValueError):
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            created = None
+            ts = payload.get("post_timestamp")
+            if isinstance(ts, str) and ts:
+                try:
+                    parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    created = (parsed if parsed.tzinfo else
+                               parsed.replace(tzinfo=timezone.utc)).timestamp()
+                except ValueError:
+                    created = None
+            out.append({"author": parts[2], "post_id": str(payload.get("post_id") or ""),
+                        "post_hash": str(payload.get("post_hash") or ""), "created": created})
+        return out
 
     def _mark_promotions(self, conn: Any, signals: list[dict[str, Any]],
                          run_start: datetime) -> int:
-        """Set ``promoted`` on unscored signals corroborated across runs; groups promoted."""
-        groups: dict[tuple[str, str], set[str]] = {}
+        """Set ``promoted`` on unscored signals corroborated across time; groups promoted.
+
+        See the _PROMOTE_MIN_AGE_H comment: prior and fresh evidence are split
+        by post creation time, and posts an earlier run stored are never fresh.
+        """
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for sig in signals:
             if sig.get("post_score") is None:
-                groups.setdefault((sig["ticker"], sig["direction"]), set()).add(sig["username"])
+                groups.setdefault((sig["ticker"], sig["direction"]), []).append(sig)
         promoted: set[tuple[str, str]] = set()
-        for (ticker, direction), now_authors in groups.items():
-            prior = self._prior_authors(conn, ticker, direction, run_start)
-            if len(prior) >= _MIN_UNSCORED_AUTHORS and now_authors - prior:
+        oldest_ok = run_start.timestamp() - _PROMOTE_LOOKBACK_H * 3600
+        for (ticker, direction), sigs in groups.items():
+            prior = self._prior_posts(conn, ticker, direction, run_start)
+            stored_ids = {p["post_id"] for p in prior if p["post_id"]}
+            stored_text = {(p["author"], p["post_hash"]) for p in prior if p["post_hash"]}
+            fresh = [s for s in sigs
+                     if isinstance(s.get("created_utc"), (int, float))
+                     and not (s.get("post_id") and s["post_id"] in stored_ids)
+                     and (s["username"], s.get("post_hash", "")) not in stored_text]
+            if not fresh:
+                continue
+            cutoff = min(s["created_utc"] for s in fresh) - _PROMOTE_MIN_AGE_H * 3600
+            prior_authors = {p["author"] for p in prior
+                             if p["created"] is not None and oldest_ok <= p["created"] <= cutoff}
+            new_authors = {s["username"] for s in fresh} - prior_authors
+            if len(prior_authors) >= _MIN_UNSCORED_AUTHORS and new_authors:
                 promoted.add((ticker, direction))
         for sig in signals:
             if sig.get("post_score") is None:

@@ -28,7 +28,8 @@ Data source (2026-11-18):
     last one stored).
 
     * The newest r/wallstreetbets posts of the last THREAD_LOOKBACK_H hours,
-      paged newest first, and the pinned thread picked by title locally:
+      paged newest first, and the pinned thread picked locally by title
+      prefix AND posting account (DAILY_THREAD_AUTHORS), oldest of its day:
       Arctic Shift's full-text title search on this board answers "Timeout"
       (HTTP 422) more often than not.
     * GET /api/comments/search?link_id=<id> -> the thread's newest
@@ -88,6 +89,16 @@ DAILY_THREAD_TITLE_PREFIXES: tuple[str, ...] = (
     "daily discussion thread",
     "what are your moves tomorrow",
 )
+
+# Accounts that post the pinned threads. Checked read-only on 2026-11-18: the
+# last three ("Daily Discussion Thread for November 17", "What Are Your Moves
+# Tomorrow, November 17/18") were all posted by u/verified-trader, the
+# subreddit's moderator account (its "Moves Tomorrow" posts carry
+# distinguished="moderator"; the daily one carries none, and Arctic Shift
+# cannot return "stickied" as a requested field). AutoModerator posted them
+# in earlier years and is kept. A look-alike title from any other account is
+# never the thread.
+DAILY_THREAD_AUTHORS: frozenset[str] = frozenset({"verified-trader", "automoderator"})
 
 THREAD_LOOKBACK_H: int = 30      # the morning thread is <= ~16 h old at the 22:00 run
 THREAD_SEARCH_PAGES: int = 6     # 600 newest posts; r/wallstreetbets had ~420 per 24 h
@@ -412,12 +423,18 @@ def _fetch_daily_thread(
         return None
 
     pinned = [p for p in posts
-              if p["title"].lower().startswith(DAILY_THREAD_TITLE_PREFIXES)]
+              if p["author"].lower() in DAILY_THREAD_AUTHORS
+              and p["title"].lower().startswith(DAILY_THREAD_TITLE_PREFIXES)]
     thread = None
     for fragment in DAILY_THREAD_QUERIES:
         matches = [p for p in pinned if fragment in p["title"].lower()]
         if matches:
-            thread = max(matches, key=lambda p: p["created_utc"])
+            # The newest day's thread; within that day the first one posted
+            # (a later repost or duplicate never displaces it).
+            day = lambda p: datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).date()  # noqa: E731
+            latest = max(day(p) for p in matches)
+            thread = min((p for p in matches if day(p) == latest),
+                         key=lambda p: p["created_utc"])
             break
     if thread is None:
         log.info("reddit_options_pulse: no daily thread on r/{s} in the last {h} h",
@@ -739,6 +756,7 @@ __all__ = [
     "REDDIT_SUBREDDIT",
     "DAILY_THREAD_QUERIES",
     "DAILY_THREAD_TITLE_PREFIXES",
+    "DAILY_THREAD_AUTHORS",
     "REDDIT_USER_AGENT",
     "BULLISH_TOKENS",
     "BEARISH_TOKENS",

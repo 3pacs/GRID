@@ -540,11 +540,18 @@ class TestFetchDailyThreadArcticShift:
         now = datetime(2026, 11, 5, 22, tzinfo=timezone.utc)
         self.NOW = now
         t = lambda h: datetime(2026, 11, 5, h, tzinfo=timezone.utc).timestamp()  # noqa: E731
+        mod = "verified-trader"  # the board's moderator account (live check 2026-11-18)
         posts = [
-            post("moves", "wallstreetbets", t(20), "What Are Your Moves Tomorrow, November 06, 2026"),
+            post("moves", "wallstreetbets", t(20), "What Are Your Moves Tomorrow, November 06, 2026",
+                 author=mod),
             post("daily", "wallstreetbets", t(10), "Daily Discussion Thread for November 05, 2026",
-                 "Market open"),
+                 "Market open", author=mod),
             post("fake1", "wallstreetbets", t(21), "Is the daily discussion thread rigged?"),
+            # Look-alikes with the exact title, posted later by ordinary accounts.
+            post("spoof1", "wallstreetbets", t(15), "Daily Discussion Thread for November 05, 2026",
+                 "pump XYZ", author="totally_the_mods"),
+            post("spoof2", "wallstreetbets", t(21), "What Are Your Moves Tomorrow, November 06, 2026",
+                 author="AutoModerat0r"),
             post("dd", "wallstreetbets", t(12), "NVDA DD"),
         ]
         posts = [p for p in posts if p["id"] not in drop]
@@ -587,6 +594,32 @@ class TestFetchDailyThreadArcticShift:
             {"id": "c2", "body": "SPY puts 0dte", "author": "bob"},
             {"id": "c1", "body": "$NVDA calls, bullish", "author": "alice"},
         ]
+
+    def test_a_look_alike_from_another_account_is_ignored(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+
+        payload = _fetch_daily_thread(session=self._fake(), now=self.NOW)
+        assert payload["post"]["id"] == "daily"
+        # With the real threads gone only look-alikes remain: no thread at all.
+        assert _fetch_daily_thread(session=self._fake(drop={"daily", "moves"}),
+                                   now=self.NOW) is None
+
+    def test_automoderator_is_accepted_and_the_first_of_the_day_wins(self):
+        from datetime import datetime, timezone
+
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+        from tests.arctic_shift_fakes import FakeArctic, post
+
+        t = lambda d, h: datetime(2026, 11, d, h, tzinfo=timezone.utc).timestamp()  # noqa: E731
+        title = "Daily Discussion Thread for November 05, 2026"
+        fake = FakeArctic(posts=[
+            post("prev", "wallstreetbets", t(4, 10), "Daily Discussion Thread for November 04, 2026",
+                 author="AutoModerator"),
+            post("first", "wallstreetbets", t(5, 10), title, author="AutoModerator"),
+            post("repost", "wallstreetbets", t(5, 14), title, author="verified-trader"),
+        ])
+        now = datetime(2026, 11, 5, 22, tzinfo=timezone.utc)
+        assert _fetch_daily_thread(session=fake, now=now)["post"]["id"] == "first"
 
     def test_falls_back_to_moves_tomorrow(self):
         from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread

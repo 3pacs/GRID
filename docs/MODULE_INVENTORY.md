@@ -1323,7 +1323,7 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Functions:** `SupplierRecord`, `AppleSupplierListStats`, `AppleSupplierListPuller`, `run_annual`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `db`, `io`, `loguru`, `pypdf`, `re`, `requests`, `sqlalchemy`, `typing`
 
-#### `ingestion/altdata/arctic_shift.py` — 448 LOC
+#### `ingestion/altdata/arctic_shift.py` — 452 LOC
 **Docstring:** Reddit posts and comments from the Arctic Shift archive API (no login, no key).
 **Functions:** `ArcticShiftError`, `ArcticShiftBusy`, `search`, `post`, `comment`, `recent_posts`, `newest_comments`, `thread_comments`, `read_json_bounded`
 **Reads:** `__future__`, `collections`, `contextlib`, `datetime`, `fcntl`, `json`, `loguru`, `math`, `os`, `re`, `requests`, `stat`, `tempfile`, `time`, `typing`
@@ -1837,12 +1837,12 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Functions:** `RedditNotConfigured`, `RedditAPIError`, `reddit_credentials_configured`, `RedditAppClient`
 **Reads:** `__future__`, `config`, `loguru`, `os`, `requests`, `time`, `typing`
 
-#### `ingestion/altdata/reddit_options_pulse.py` — 759 LOC
+#### `ingestion/altdata/reddit_options_pulse.py` — 777 LOC
 **Docstring:** Reddit daily-discussion pulse — retail options positioning signal.
 **Functions:** `RedditOptionsPulse`, `extract_tickers`, `count_sentiment_tokens`, `compute_bull_bear_ratio`, `RedditOptionsPulsePuller`, `run_reddit_options_pulse_puller`
 **Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `ingestion`, `loguru`, `re`, `requests`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/scheduler.py`
-**Notes:** Since 2026-11-18 reads Arctic Shift (`arctic_shift.py`): pages the newest r/wallstreetbets posts of the last 30 h, picks the pinned "Daily Discussion Thread..." (else "What Are Your Moves Tomorrow...") by title prefix, then reads its newest 500 comments. Reddit RSS (the 2026-11-05 path) is 404 since 2026-11-17; the last stored thread was 2026-11-16.
+**Notes:** Since 2026-11-18 reads Arctic Shift (`arctic_shift.py`): pages the newest r/wallstreetbets posts of the last 30 h, picks the pinned "Daily Discussion Thread..." (else "What Are Your Moves Tomorrow...") by title prefix and posting account (u/verified-trader or AutoModerator), first of the newest day, then reads its newest 500 comments. Reddit RSS (the 2026-11-05 path) is 404 since 2026-11-17; the last stored thread was 2026-11-16.
 
 #### `ingestion/altdata/reddit_rss.py` — 252 LOC
 **Docstring:** Unauthenticated Reddit reads through RSS/Atom feeds, shared by every puller.
@@ -1930,12 +1930,12 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Reads:** `__future__`, `config`, `datetime`, `grid`, `ingestion`, `intelligence`, `json`, `loguru`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `intelligence/scheduler.py`
 
-#### `ingestion/altdata/smart_money.py` — 894 LOC
+#### `ingestion/altdata/smart_money.py` — 941 LOC
 **Docstring:** GRID Social Smart Money Tracker.
 **Functions:** `SmartMoneyPuller`
 **Reads:** `__future__`, `datetime`, `db`, `hashlib`, `ingestion`, `json`, `loguru`, `re`, `requests`, `sqlalchemy`, `typing`
 **Imported by:** `ingestion/scheduler.py`
-**Notes:** Since 2026-11-18 reads the newest 100 posts (last 24 h) of each target board from Arctic Shift (`arctic_shift.py`), SmartScheduler hourly (was 10 min on Reddit RSS, which is 404 since 2026-11-17). Posts younger than 36 h have no settled score, so the two-author corroboration rule screens them, and unscored signals stay out of `signal_sources` (raw_series `trust_tier: "unscored"`) until corroborated across runs (two or more authors stored 6 to 48 h earlier plus a new author now). One board failing is PARTIAL; all failing is FAILED.
+**Notes:** Since 2026-11-18 reads the newest 100 posts (last 24 h) of each target board from Arctic Shift (`arctic_shift.py`), SmartScheduler hourly (was 10 min on Reddit RSS, which is 404 since 2026-11-17). Posts younger than 36 h have no settled score, so the two-author corroboration rule screens them, and unscored signals stay out of `signal_sources` (raw_series `trust_tier: "unscored"`) until corroborated across time by post creation time: two or more authors of stored posts created at least 6 h before the earliest fresh post (not stored by an earlier run, deduped by post id), plus a fresh post by another author. One board failing is PARTIAL; all failing is FAILED.
 
 #### `ingestion/altdata/social_attention.py` — 966 LOC
 **Docstring:** GRID social attention data ingestion.
