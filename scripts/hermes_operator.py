@@ -324,7 +324,20 @@ DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_ma
 #   default; raising it without evidence is exactly what the controller
 #   said not to do, so it stays at 60s.
 DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S = 90
-DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S
+# 2026-11-17 amendment (hermes-late-task-budgets): the "UNCHANGED at 60s"
+# note on fundamental_divergence above is superseded. journalctl on grid-svr
+# shows both tasks timing out at 60 s and finishing as done_late EVERY night
+# (11-16 and 11-17; each timeout also blacklists the step for 24h):
+#   corporate_actions       ~103 s (11-16), ~104 s (11-17) — SEC filing fetch
+#                           for ~83 tickers, network-bound, stable run to run.
+#   fundamental_divergence  ~128 s (11-16), ~217 s (11-17) — ~1,121 rows
+#                           written; the 11-17 run overlapped other tasks.
+# The worker survives the wrapper timeout and completes, so the 60 s cap
+# only abandons a healthy worker (it keeps its DB connection and competes
+# with the next tasks). Sized ~1.45x the slowest observation each; the
+# cycle budget DAILY_INTEL_CYCLE_BUDGET_SECONDS is deliberately unchanged.
+DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S = 150
+DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = 300
 # gdelt_bulk_events: downloads GDELT 2.0 15-minute export files (~0.2 s each
 # measured from grid-svr 2026-11-16) and stops itself between files after
 # ingestion.altdata.gdelt_bulk.DAILY_BUDGET_SECONDS (100 s); 20 s headroom.
@@ -2215,7 +2228,7 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("icij_linking", _daily_intel_icij_linking, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
-    DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S),
     DailyIntelTask("supply_chain_8k", _daily_intel_supply_chain_8k, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
