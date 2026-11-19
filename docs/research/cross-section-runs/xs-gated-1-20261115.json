@@ -8,4 +8,4 @@
               "gate": {"market_phase": ["rising, speeding up", "rising, slowing"],
                        "sector_phase": ["rising, speeding up", "rising, slowing"], "groups": ["cyclical", "growth"]}}],
  "rankings": ["pooled", "within_sector"], "fractions": [0.1, 0.2], "cost_bp_per_side": 1.0, "alpha": 0.05,
- "perms": 10000, "seed": 20261107, "cards": 4}
+ "perms": 10000, "seed": 20261107, "cards": 4, "gates_chosen_after_seeing": true}

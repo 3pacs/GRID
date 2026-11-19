@@ -94,8 +94,8 @@ def test_run_declares_first_selects_the_planted_effect_and_feeds_the_evidence_ad
     assert set(card["sector"]) == set(SECTORS) and set(card["market_phase"]) == {"rising, slowing", "falling, slowing"}
     assert set(card["sector_phase"]) == {"rising, speeding up", "falling, slowing"}
     assert card["sector_vs_market"]["leading"]["nights"] > 100
-    # every field the desk evidence adapter reads is there; only the state label is new
-    raw = (tmp_path / "out" / "report.json").read_bytes().replace(b"CROSS_SECTION_DEV_RANKING_ONLY", b"INTRADAY_DEV_RANKING_ONLY")
+    # the desk evidence adapter reads the report as written (it admits the cross-section state)
+    raw = (tmp_path / "out" / "report.json").read_bytes()
     import hashlib
     now = datetime.now(UTC)
     cards = factory_report_cards(raw, expected_sha256=hashlib.sha256(raw).hexdigest(), receipt_id="r1", observed_at=now,
@@ -166,7 +166,7 @@ def test_a_failed_run_is_closed_as_abandoned_and_a_missing_state_record_is_refus
 
 def test_gates_trade_only_the_nights_and_sectors_they_name(tmp_path):
     build(tmp_path)
-    body = {**RUN, "min_ranked_gated": 10, "signals": [
+    body = {**RUN, "min_ranked_gated": 10, "gates_chosen_after_seeing": False, "signals": [
         {"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"]},
         {"name": "on21_rising", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"], "gate": {"market_phase": ["rising, slowing"]}},
         {"name": "on21_leaders", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"], "gate": {"sector_leading": True}},
@@ -187,9 +187,18 @@ def test_gates_trade_only_the_nights_and_sectors_they_name(tmp_path):
     no_def = res["on21_no_defensive|within_sector|q20|overnight"]
     assert np.isnan(no_def["per_sector"][:, 2]).all()                       # Utilities is defensive
     for change in ({"gate": {"weather": ["sunny"]}}, {"gate": {"groups": ["speculative"]}}, {"gate": {"sector_leading": "yes"}},
-                   {"gate": {"market_phase": []}}):
+                   {"gate": {"market_phase": []}}, {"gate": {"market_phase": ["rising slowly"]}},   # a typo traded nothing before
+                   {"gate": {"vix_third": ["scary"]}}, {"gate": {"spike_state": ["spike"]}}):
         with pytest.raises(X.RunFileError):
             X.RunFile.from_dict({**body, "signals": [{**body["signals"][0], **change}]})
+    gated = {k: v for k, v in body.items() if k != "gates_chosen_after_seeing"}
+    with pytest.raises(X.RunFileError, match="gates_chosen_after_seeing"):          # a gated run must say how its gates were picked
+        X.RunFile.from_dict(gated)
+    with pytest.raises(X.RunFileError):
+        X.RunFile.from_dict({**RUN, "gates_chosen_after_seeing": True})             # and an ungated one must not
+    for bad in (0, 64, 2.5):
+        with pytest.raises(X.RunFileError):
+            X.RunFile.from_dict({**RUN, "null_block_sessions": bad})
 
 
 def test_turnover_is_full_overnight_and_partial_for_a_slow_signal_held_close_to_close(tmp_path):
@@ -220,3 +229,103 @@ def test_sign_flip_bar():
     thin = np.full((100, 2), np.nan)
     thin[:10, 0] = 0.01
     assert not X.sign_flip_max_t(thin, 1000, 7, 0.05)["tested"].any()
+
+
+def test_block_flips_widen_the_null_for_clustered_nights():
+    rng = np.random.default_rng(5)
+    e = rng.normal(0, 0.01, 3000 + 19)
+    x = (np.convolve(e, np.ones(20) / 20, mode="valid") + 0.00016)[:, None]   # each night shares 19 of its 20 shocks
+    plain = X.sign_flip_max_t(x, 4000, 7, 0.05, block=1)
+    blocks = X.sign_flip_max_t(x, 4000, 7, 0.05, block=20)
+    assert plain["t"][0] == blocks["t"][0]                     # the statistic is the same; only its null changes
+    assert plain["p"][0] < 0.01 and blocks["p"][0] > 5 * plain["p"][0]
+    assert blocks["block"] == 20 and plain["block"] == 1
+    iid = rng.normal(0, 0.01, (3000, 1))                       # without clustering the two nulls agree closely
+    assert abs(X.sign_flip_max_t(iid, 4000, 7, 0.05, block=1)["critical_t"]
+               - X.sign_flip_max_t(iid, 4000, 7, 0.05, block=10)["critical_t"]) < 0.2
+
+
+def test_the_report_names_the_first_step_bar_and_the_lowest_passing_t(tmp_path):
+    build(tmp_path)
+    rep = X.run(write_run(tmp_path, RUN), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    mt = rep["max_t"]
+    assert mt["block_sessions"] == 10 and "blocks of 10" in mt["null"]
+    passing = [t["t"] for t in rep["ranking"] if t["passed_step_down"]]
+    assert mt["lowest_passing_t"] == min(passing) and rep["hypothesis_only"] is False
+    text = (tmp_path / "out" / "report.md").read_text()
+    assert "first step's bar" in text and f"{min(passing):.2f}" in text
+    assert all(0.0 <= t["dropped_pick_share"] <= 1.0 for t in rep["ranking"])
+
+
+def test_a_run_whose_gates_were_chosen_after_seeing_selects_nothing(tmp_path):
+    build(tmp_path)
+    body = {**RUN, "gates_chosen_after_seeing": True, "signals": [
+        {"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"], "gate": {"fed_balance_sheet": ["flat"]}}]}
+    ledger = ledger_at(tmp_path)
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    assert rep["hypothesis_only"] is True and rep["selected"] == []
+    assert any(t["passed_step_down"] for t in rep["ranking"]) and not any(t["selected"] for t in rep["ranking"])
+    assert set(rep["cards"]) >= {t["trial_id"] for t in rep["ranking"] if t["passed_step_down"]}
+    result = json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])
+    assert result["kind"] == lse.FACTORY_RESULT and result["selected_count"] == 0
+    assert "source of hypotheses only" in rep["note"] and "nothing here is selected" in (tmp_path / "out" / "report.md").read_text()
+
+
+def test_a_run_file_gets_one_look_per_ledger(tmp_path):
+    build(tmp_path, n_days=120)
+    ledger = ledger_at(tmp_path)
+    body = write_run(tmp_path, {**RUN, "last_session": "2015-05-29"})
+    X.run(body, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out1")
+    before = (tmp_path / "l.jsonl").read_text()
+    with pytest.raises(X.RunFileError, match="already declared"):
+        X.run(body, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out2")
+    renamed = write_run(tmp_path, {**RUN, "last_session": "2015-05-29", "run_id": "xs-test"})   # same id, same file
+    with pytest.raises(X.RunFileError, match="already declared"):
+        X.run(renamed, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out3")
+    assert (tmp_path / "l.jsonl").read_text() == before and not (tmp_path / "out2").exists()
+    (tmp_path / "taken").mkdir()
+    other = write_run(tmp_path, {**RUN, "last_session": "2015-05-29", "run_id": "xs-test-2"})
+    with pytest.raises(X.RunFileError, match="already exists"):                  # refused before anything is declared
+        X.run(other, tmp_path, tmp_path / "state.db", ledger, tmp_path / "taken")
+    assert (tmp_path / "l.jsonl").read_text() == before
+
+
+def test_an_interrupted_run_is_closed_as_abandoned(tmp_path, monkeypatch):
+    build(tmp_path, n_days=120)
+    ledger = ledger_at(tmp_path)
+
+    def stop(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(X, "load_panel", stop)
+    with pytest.raises(KeyboardInterrupt):
+        X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    last = json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])
+    assert last["kind"] == lse.FACTORY_ABANDONED and "KeyboardInterrupt" in last["reason"] and lse.factory_open_run(ledger) is None
+
+
+def test_a_pick_with_no_outcome_is_dropped_and_counted():
+    sig = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    tick = np.array(list("abcdef"), dtype=object)
+    y = np.array([0.01, np.nan, 0.0, 0.0, 0.03, 0.05])
+    v, _lo, _hi, dropped = X._spread(sig, tick, np.arange(6), 2, y)
+    assert dropped == 1 and v == pytest.approx(0.04 - 0.01)
+
+
+def test_a_state_record_that_changes_after_declaration_abandons_the_run(tmp_path, monkeypatch):
+    build(tmp_path, n_days=120)
+    ledger = ledger_at(tmp_path)
+    real = X.load_state
+
+    def load_then_append(path):
+        rows = real(path)
+        con = sqlite3.connect(path)
+        con.execute("INSERT INTO desk_state VALUES (?, ?)", ("2030-01-02", "{}"))
+        con.commit()
+        con.close()
+        return rows
+
+    monkeypatch.setattr(X, "load_state", load_then_append)
+    with pytest.raises(X.RunFileError, match="changed between"):
+        X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    assert json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])["kind"] == lse.FACTORY_ABANDONED

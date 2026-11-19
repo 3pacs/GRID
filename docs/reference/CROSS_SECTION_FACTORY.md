@@ -14,19 +14,35 @@ verdicts.
 
 ## What a run does
 
-1. Reads the run file and hashes every input file (the data manifest). Nothing is parsed yet.
+1. Reads the run file and hashes every input file (the data manifest). Nothing is parsed yet. A run id or run file
+   the ledger declared before is refused, and so is an output directory that already exists: one look per run file.
 2. Declares the run on a factory ledger (`record_factory_declared`): run file, manifest hash, trial count.
 3. Loads bars, **dropping every row after 2022-12-30**. A run file whose window leaves 2010-01-04 .. 2022-12-29 is
    refused. The later years are kept unread for a confirmation look.
 4. For each module (signal × ranking × fraction × horizon) computes one spread per night: mean outcome of the top
    fraction minus the bottom fraction, pooled or inside each sector (pick-weighted across sectors).
-5. Judges all modules together: each of `perms` draws flips the sign of every night's net spread, the same flip for
-   every module; the best flipped t of each draw sets the bar (step-down adjusted p, one-sided).
+5. Judges all modules together: each of `perms` draws flips the sign of blocks of `null_block_sessions`
+   consecutive nights (default 10), the same flips for every module, and modules pass by step-down adjusted p
+   (Westfall-Young, one-sided). The state record is hashed again after it is read; a change since declaration
+   abandons the run.
 6. Writes `discovery-frozen.json`, `report.json`, `report.md`, then closes the run on the ledger
-   (`record_factory_result`). Any failure closes it as abandoned.
+   (`record_factory_result`). Any failure, an interrupt included, closes it as abandoned.
 
 The SPY factory's null permutes the session order of the target, which asks whether a signal's timing matters. A
 long-short spread trades every night, so that permutation leaves its mean where it was. Sign flips test the mean.
+
+**Why blocks.** Flipping each night on its own assumes the nights are independent. Long-short spreads are not: they
+run in streaks (a factor episode, a crash year), and an independent flip then gives a null that is too narrow and
+p-values that are too small. Flipping whole blocks keeps each streak together, so a clustered result meets a wider
+null; on independent nights the two nulls agree. The test `test_block_flips_widen_the_null_for_clustered_nights`
+shows the size: a series whose nights share 19 of 20 shocks has p 0.0002 under single-night flips, 0.001 with
+10-night blocks and 0.011 with 20-night blocks, for the same t. A run file may set `null_block_sessions` from 1
+(single nights) to 63.
+
+**What the printed bar is.** `max_t.critical_t` is the first step's bar: the 1−alpha quantile of each draw's best
+flipped t. Later steps compare each module with the best flipped t of the modules ranked below it, so a module may
+pass with a t under that figure; `max_t.lowest_passing_t` gives the lowest t that passed. Multiplicity is counted
+within the run only (`max_t.multiplicity`): earlier runs and looks are not in it.
 
 ## Universe and timing (the same rules edge search 12 registered)
 
@@ -68,6 +84,18 @@ A signal may carry a `gate` on the state recorded the evening before the decisio
 | `sector_phase`, `groups` | each sector that night | a list of allowed values |
 | `sector_leading` | each sector that night | `true` or `false` |
 
+Values must be the state record's own words, or the run file is refused (a misspelled value used to trade no night
+at all): phases `rising, speeding up`, `rising, slowing`, `falling, speeding up`, `falling, slowing`; Fed balance
+sheet `expanding`, `flat`, `shrinking`; VIX third `calm`, `middling`, `fearful`; spike state `spike day`,
+`aftermath`, `normal`; groups `cyclical`, `growth`, `defensive`.
+
+**A gated run must say how its gates were chosen.** `gates_chosen_after_seeing` is required in any run file with a
+gate. `true` means a gate was picked after seeing an earlier result, so the step-down test does not count the search
+that chose it: the run becomes a source of hypotheses only. Its report sets `hypothesis_only`, selects no module
+(`selected` is empty, and so the evidence adapter reports none), and keeps `passed_step_down` on each row so a module
+that passed can be registered as a new hypothesis for fresh data. `false` is a statement that every gate was fixed
+before any result it could be tuned on was seen.
+
 A night the gate turns away is not traded and is not in the module's sample. With a sector gate only stocks of the
 sectors let through are ranked (at least `min_ranked_gated` of them). A gated signal is its own module, so the
 condition is judged against the run's bar with everything else instead of being read off a card afterwards.
@@ -92,8 +120,27 @@ python -m analysis.cross_section_factory run --run-file RUN.json --data-dir DIR 
 
 `report.json` carries the fields `analysis/desk_factory_report.py` reads, with `net_dollars` holding the net return
 per $1 a side per night (named in `target_unit`). Its `state` is `CROSS_SECTION_DEV_RANKING_ONLY`; the adapter
-accepts only `INTRADAY_DEV_RANKING_ONLY` today, so a cross-section report is refused until that file's owner admits
-the new state. The test proves every other field passes.
+admits it beside `INTRADAY_DEV_RANKING_ONLY` (since 1c02fb0f on main). The test feeds a report to the adapter as
+written.
+
+## Point-in-time check of the state record (2026-11-19)
+
+The gates and cards read `desk-sector-state/1` (#1209, `desk_state.py` in the gex desk tree), the record of
+sessions[r−1] for decision day r. Its fields use only what was known at that close: the VIX third ranks the close
+against the 252 closes before it, the spike state compares it with the median of the 63 before it, the Fed phase
+uses only balance-sheet weeks dated at least seven days before the close, and market and sector phases are trailing
+21- and 63-session curves. The one leak is shared with this factory: past members with no label are placed in a
+sector by correlation over the whole sample, so a sector's membership in 2010 uses later returns.
+
+## Known limits
+
+- A pick whose outcome bar is missing (a halt, a delisting, a bad print) is dropped from its side's mean, not charged
+  a loss; the data holds no delisting return. Each row's `dropped_pick_share` sizes it.
+- Names with no price file never enter, so if a delisted member's file is missing the universe is survivor-biased.
+- Sector labels are today's; past members without one are placed by correlation over the whole window (above).
+- Cost is a floor: a flat rate per side at the auctions, four sides a night, no borrow fee on the short side.
+- A night with fewer than `min_session_bars` priced names is dropped, so an overnight or close-to-close return after
+  it spans more than one session.
 
 ## Used data
 
@@ -152,3 +199,24 @@ Read these with three cautions.
 
 The overnight rule here is the one `overnight-shadow/1` records forward (#1215); its gross (5.64) matches the
 by-hand figure (5.63).
+
+## Re-run with the review fixes (2026-11-19, a new scratch ledger)
+
+The four run files were run again on grid-svr with the 10-session block null, on a fresh scratch ledger (the old one
+already declares these run ids, which the factory now refuses) and a fixed copy of the state record taken that day.
+Development days only, as before. The tables above were made with single-night flips and an earlier state record;
+these are the figures that stand.
+
+| Run | First-step bar | Passed step-down | Selected | Lowest passing t |
+|---|---|---|---|---|
+| `xs-overnight-persistence-20261115` | 2.30 (was 2.33) | 7 of 12 | 7 | 2.14 |
+| `xs-published-effects-1-20261115` | 2.19 (was 2.27) | 0 of 12 | 0 | — |
+| `xs-gated-1-20261115` (`gates_chosen_after_seeing: true`) | 2.50 (was 2.39) | 13 of 16 | 0: hypotheses only | 2.15 |
+| `xs-playbook-1-20261115` | 2.33 | 0 of 7 | 0 | — |
+
+Blocks of 10 nights moved the bars by less than 0.12: these spreads cluster less than feared, and the overnight
+modules' t values (4.33 at best) stand. The gated run now selects nothing; its 13 passing modules, among them the
+5-day reversal in falling markets (13.42 bp gross, 11.93 net, t 2.91, adjusted p 0.009), are hypotheses for the
+unread years only. Dropped picks are about 0.002 % of all picks in every module. With the newer state record the
+gated overnight module (within sector 20 %) reads 5.70 bp gross, 1.70 net, t 3.34 (was 5.64, 1.64, 3.19). Report
+sha256: overnight `8530bde4…`, published `0b8bda1f…`, gated `b0d6d7bb…`, playbook `faa61e09…`.
