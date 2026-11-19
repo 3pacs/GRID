@@ -20,7 +20,7 @@ from analysis import module_factory as mf
 from analysis.factory_stats import FactoryProtocol, cofiring, discover
 from analysis.offline_research_proof import digest
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "docs/reference/factory-run-files/factory2-price-class-20261119.json"
+EXAMPLE = Path(__file__).resolve().parents[1] / "docs/research/factory-runs/factory2-price-class-20261119.json"
 # per-minute step sd and the share of minutes with a trade (the thin ETFs skip minutes on Nasdaq)
 WALK = {"SPY": (400.0, 0.05, 1.0), "QQQ": (350.0, 0.06, 1.0), "RSP": (150.0, 0.02, 0.97),
         "HYG": (75.0, 0.01, 0.9), "VIXY": (20.0, 0.02, 0.75), "TLT": (90.0, 0.03, 1.0)}
