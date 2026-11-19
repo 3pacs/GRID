@@ -534,3 +534,16 @@ def test_spy_only_feature_set_is_unchanged():
     assert set(mf.OPTIONS_SPECS).isdisjoint(mf.SPECS) and mf.ALL_FEATURES == tuple(mf.SPECS)
     assert all(mf.FEATURE_CLASS[f] == "options" for f in mf.OPTIONS_SPECS)
     assert set(mf.FORWARD_ONLY).isdisjoint(mf.KNOWN_FEATURES)
+
+
+def test_options_registry_keeps_concentration_apart_from_assumed_gamma():
+    for f, spec in mf.OPTIONS_SPECS.items():
+        assert {"definition", "unit", "source", "live_source", "pit", "symbols", "basis", "measurement"} <= set(spec)
+        assert mf.REGISTRY[f]["class"] == "options" and spec["kind"] == "level"
+    basis = {f: s["basis"] for f, s in mf.OPTIONS_SPECS.items()}
+    assert {f for f, b in basis.items() if b == "oi-unsigned"} == {"OIR1", "OIS1", "OIMID", "OIR1A", "OIS1A"}
+    assert {f for f, b in basis.items() if b == "gamma-signed-assumed"} == {"FLIP", "NGEX"}
+    for f in ("CWALL", "PWALL", "HWALL", "FLIP", "NGEX"):
+        assert mf.OPTIONS_SPECS[f]["measurement"].startswith("measurement-unqualified")
+    for f in ("OIR1", "OIS1", "OIMID", "OIR1A", "OIS1A"):
+        assert "unsigned" in mf.OPTIONS_SPECS[f]["measurement"] and "gamma" not in mf.OPTIONS_SPECS[f]["basis"]
