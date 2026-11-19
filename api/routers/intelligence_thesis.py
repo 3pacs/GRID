@@ -411,41 +411,45 @@ def get_investigation_leads(
 ) -> dict[str, Any]:
     """Return investigation leads with optional filters.
 
-    Each lead carries ``declared_tests``: the stored tests that name it (the
+    Each lead carries ``declared_tests``: its verified stored tests (the
     reviewed test its verdict declared, and the baseline every lead gets),
-    with their pre-registered criteria and current trial state, plus
-    ``test_link_problems`` when a stored link does not resolve. A failed read
-    is HTTP 503 with ``available: false`` and ``leads: null``, never ``[]``.
+    with their pre-registered criteria and current trial state. Rows that
+    exist but fail verification (staged, orphaned, malformed) are listed in
+    ``unverified_tests`` and explained in ``test_link_problems``; they are not
+    declared tests. Page, total and tests come from one read snapshot. A
+    failed read is HTTP 503 with ``available: false`` and ``leads: null``,
+    never ``[]``.
     """
     try:
         from dataclasses import asdict
 
-        from intelligence.sleuth import Sleuth
-        from intelligence.sleuth_intersections import declared_tests_for_leads
+        from intelligence.sleuth_intersections import read_leads_page
 
-        engine = get_db_engine()
-        sleuth = Sleuth(engine, ensure_schema=False)
-        leads = sleuth.get_leads(status=status, category=category, limit=limit, offset=offset)
-        total = sleuth.count_leads(status=status, category=category)
-        tests = declared_tests_for_leads(engine, leads)
+        page = read_leads_page(get_db_engine(), status=status, category=category,
+                               limit=limit, offset=offset)
     except Exception as exc:
         log.warning("Sleuth leads query failed: {e}", e=str(exc))
         return _source_unreadable(
             "investigation_leads", exc, leads=None, total=None, limit=None, offset=None)
 
+    leads, total = page["leads"], page["total"]
     return {
         "available": True,
-        "leads": [
-            {**asdict(lead),
-             "declared_tests": tests[lead.id]["tests"],
-             "test_link_problems": tests[lead.id]["link_problems"]}
-            for lead in leads
-        ],
+        "leads": [_lead_with_tests(asdict, lead, page["tests"][lead.id]) for lead in leads],
         "total": total,
         "limit": limit,
         "offset": offset,
         "has_more": offset + len(leads) < total,
     }
+
+
+def _lead_with_tests(asdict: Any, lead: Any, tests: dict[str, Any]) -> dict[str, Any]:
+    """A lead with its verified tests, the rows that failed verification and
+    the reason each failed. Only ``declared_tests`` are declared tests."""
+    return {**asdict(lead),
+            "declared_tests": tests["tests"],
+            "unverified_tests": tests["unverified_tests"],
+            "test_link_problems": tests["link_problems"]}
 
 
 @router.get("/leads/{lead_id}")
@@ -461,24 +465,17 @@ def get_investigation_lead(
     try:
         from dataclasses import asdict
 
-        from intelligence.sleuth import Sleuth
-        from intelligence.sleuth_intersections import declared_tests_for_leads
+        from intelligence.sleuth_intersections import read_lead
 
-        engine = get_db_engine()
-        lead = Sleuth(engine, ensure_schema=False)._load_lead(lead_id)
-        tests = declared_tests_for_leads(engine, [lead]) if lead else {}
+        found = read_lead(get_db_engine(), lead_id)
     except Exception as exc:
         log.warning("Sleuth lead detail failed: {e}", e=str(exc))
         return _source_unreadable("investigation_leads", exc, lead=None)
 
-    if not lead:
+    if found is None:
         raise HTTPException(status_code=404, detail="Lead not found")
-    return {
-        "available": True,
-        "lead": {**asdict(lead),
-                 "declared_tests": tests[lead.id]["tests"],
-                 "test_link_problems": tests[lead.id]["link_problems"]},
-    }
+    return {"available": True,
+            "lead": _lead_with_tests(asdict, found["lead"], found["tests"])}
 
 
 @router.post("/leads/investigate")

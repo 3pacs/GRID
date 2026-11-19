@@ -400,15 +400,19 @@ class Sleuth:
                 "declared_hypothesis_id": lead.declared_hypothesis_id,
             })
 
-    def _load_lead(self, lead_id: str) -> Lead | None:
-        """Load a single lead from the database."""
-        with self.engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT id, question, category, priority, evidence, status, "
-                "findings, follow_up_leads, hypotheses, created_at, resolved_at, "
-                "origin, outcome, outcome_reason, declared_hypothesis_id "
-                "FROM investigation_leads WHERE id = :id"
-            ), {"id": lead_id}).fetchone()
+    def _load_lead(self, lead_id: str, conn: Any = None) -> Lead | None:
+        """Load a single lead. ``conn`` reads inside the caller's transaction."""
+        stmt = text(
+            "SELECT id, question, category, priority, evidence, status, "
+            "findings, follow_up_leads, hypotheses, created_at, resolved_at, "
+            "origin, outcome, outcome_reason, declared_hypothesis_id "
+            "FROM investigation_leads WHERE id = :id"
+        )
+        if conn is not None:
+            row = conn.execute(stmt, {"id": lead_id}).fetchone()
+        else:
+            with self.engine.connect() as own:
+                row = own.execute(stmt, {"id": lead_id}).fetchone()
         if not row:
             return None
         return Lead(
@@ -435,8 +439,11 @@ class Sleuth:
         category: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        conn: Any = None,
     ) -> list[Lead]:
-        """Query leads with optional filters."""
+        """Query leads with optional filters, in a total order (``id`` breaks
+        ties) so pages never repeat or skip a lead. ``conn`` reads inside the
+        caller's transaction."""
         params: dict[str, Any] = {
             "lim": limit,
             "off": offset,
@@ -444,17 +451,21 @@ class Sleuth:
             "category": category,
         }
 
-        with self.engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT id, question, category, priority, evidence, status, "
-                "findings, follow_up_leads, hypotheses, created_at, resolved_at, "
-                "origin, outcome, outcome_reason, declared_hypothesis_id "
-                "FROM investigation_leads "
-                "WHERE (:status IS NULL OR status = :status) "
-                "AND (:category IS NULL OR category = :category) "
-                "ORDER BY priority DESC, created_at DESC "
-                "LIMIT :lim OFFSET :off"
-            ), params).fetchall()
+        stmt = text(
+            "SELECT id, question, category, priority, evidence, status, "
+            "findings, follow_up_leads, hypotheses, created_at, resolved_at, "
+            "origin, outcome, outcome_reason, declared_hypothesis_id "
+            "FROM investigation_leads "
+            "WHERE (:status IS NULL OR status = :status) "
+            "AND (:category IS NULL OR category = :category) "
+            "ORDER BY priority DESC, created_at DESC, id ASC "
+            "LIMIT :lim OFFSET :off"
+        )
+        if conn is not None:
+            rows = conn.execute(stmt, params).fetchall()
+        else:
+            with self.engine.connect() as own:
+                rows = own.execute(stmt, params).fetchall()
 
         return [
             Lead(
@@ -475,15 +486,20 @@ class Sleuth:
             for r in rows
         ]
 
-    def count_leads(self, status: str | None = None, category: str | None = None) -> int:
+    def count_leads(self, status: str | None = None, category: str | None = None,
+                    conn: Any = None) -> int:
         """Count leads under the same filters ``get_leads`` applies."""
         params: dict[str, Any] = {"status": status, "category": category}
-        with self.engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT COUNT(*) FROM investigation_leads "
-                "WHERE (:status IS NULL OR status = :status) "
-                "AND (:category IS NULL OR category = :category)"
-            ), params).fetchone()
+        stmt = text(
+            "SELECT COUNT(*) FROM investigation_leads "
+            "WHERE (:status IS NULL OR status = :status) "
+            "AND (:category IS NULL OR category = :category)"
+        )
+        if conn is not None:
+            row = conn.execute(stmt, params).fetchone()
+        else:
+            with self.engine.connect() as own:
+                row = own.execute(stmt, params).fetchone()
         return row[0] if row else 0
 
     # ── Lead ID Generation ───────────────────────────────────────────────
