@@ -65,6 +65,7 @@ within the run only (`max_t.multiplicity`): earlier runs and looks are not in it
 | `momentum` | return over `lookback` sessions ending `skip` sessions before the close of d−1 |
 | `reversal` | the opposite of the last `lookback` sessions' return |
 | `high_52w` | close of d−1 over the highest close of the last `lookback` sessions |
+| `sector_momentum` | the equal-weighted mean `momentum` of the stock's sector's members (at least 5 that night); pooled ranking only |
 
 `"sign": -1` turns a signal around. Horizons: `overnight` (close of d to open of d+1), `intraday` (open to close of
 d+1), `close_1d` (close of d to close of d+1). Each signal lists its own horizons.
@@ -106,6 +107,27 @@ For the best `cards` modules and every selected one, `report.json` holds where t
 state recorded the evening before each decision day in the sector state record (`desk-sector-state/1`, #1209):
 market phase, Fed balance-sheet phase, VIX third, spike state, and for within-sector modules each sector, the three
 groups, the sector's own phase, and leading against lagging sectors. Cuts are descriptions of a searched sample.
+
+Every card also carries `where_it_paid` and `where_it_did_not`: each cut with at least 100 traded nights, split by
+the sign of its net return and sorted by size, and `report.md` prints the six largest of each. A run file may list
+`prior_dev_looks` (earlier development runs at the same effect); they are named in `max_t.multiplicity`.
+
+## The queue of published effects (#1212)
+
+`docs/research/cross-section-queue.json` is the file the factory takes its next run from
+(`analysis/cross_section_queue.py`). Each entry is a documented effect: the paper, its sample, the size it states and
+how that size was checked (`paper`, `secondary` with the source named, or `not_checked`), the mechanism, the data it
+needs, how this test departs from the paper, and the signal. `run` takes the first `queued` entry the ledger has not
+declared, writes its run file once, and runs it; `status` lists every entry and its run. An entry's run id carries its
+version (`xsq-<id>-v<version>`), so a changed entry is a new version and the factory's one-look rule holds per version.
+A `blocked` entry says what it waits for (post-earnings drift waits for earnings surprises by date, #1210); a
+`retired` entry says why (overnight persistence failed its confirmation look).
+
+```bash
+python -m analysis.cross_section_queue status [--ledger L.jsonl --anchor A.jsonl]
+python -m analysis.cross_section_queue run --data-dir DIR --state-db state.db --ledger L.jsonl --anchor A.jsonl \
+  --out-root ROOT                                        # add --genesis LEDGER_ID once to create the ledger
+```
 
 ## Run it
 
@@ -220,3 +242,32 @@ modules' t values (4.33 at best) stand. The gated run now selects nothing; its 1
 unread years only. Dropped picks are about 0.002 % of all picks in every module. With the newer state record the
 gated overnight module (within sector 20 %) reads 5.70 bp gross, 1.70 net, t 3.34 (was 5.64, 1.64, 3.19). Report
 sha256: overnight `8530bde4…`, published `0b8bda1f…`, gated `b0d6d7bb…`, playbook `faa61e09…`.
+
+## First three queue runs (2026-11-19, scratch ledger, development days only)
+
+`run` three times on grid-svr on a new scratch ledger, with the state record copied that day. One-session holds,
+1 bp a side, blocks of 10 nights. Report sha256: monthly reversal `6cb75e34…`, industry momentum `82c3c088…`,
+52-week high `9728a9fe…`.
+
+| Entry | Best module | Turnover | Gross bp | Net bp | t | Passed step-down |
+|---|---|---|---|---|---|---|
+| `short-term-reversal-monthly` (Jegadeesh 1990) | within sector 10 % | 0.23 | 4.43 | 3.53 | 2.17 | yes (adjusted p 0.015) |
+| `industry-momentum` (Moskowitz and Grinblatt 1999) | pooled 20 % | 0.09 | 0.37 | 0.00 | 0.00 | no |
+| `52-week-high` (George and Hwang 2004) | pooled 20 % | 0.11 | −0.98 | −1.41 | −0.59 | no |
+
+Where each card says it paid, cuts of 100+ nights, net bp:
+
+- **Monthly reversal.** It paid in 42 of 46 cuts.
+  - Largest: 2020 (+14.2), markets falling and speeding up (+13.5), VIX spike days (+11.8) and fearful VIX nights (+6.7).
+  - It did not pay in 2015 (−2.6) or 2017 (−2.3), or inside Energy (−0.9) and Utilities (−0.7).
+  - Eleven of thirteen years are positive. It is a candidate for one confirmation look, not a finding: like the 5-day reversal it earns most when markets are under stress.
+- **Industry momentum.** It is flat overall.
+  - Positive on spike days (+8.0) and in 2013, 2015 and 2017.
+  - Negative in 2019 (−9.0) and 2012 (−5.4), and while the Fed's balance sheet was shrinking (−3.3).
+  - Eleven sectors and one-session holds are a long way from the paper's 20 industries and monthly holds.
+- **52-week high.** It is negative in both rankings, as in the November 15 published-effects run.
+  - It paid only in 2015 (+9.7), 2022 (+4.2) and while the balance sheet was shrinking (+3.8).
+  - It lost most in falling, slowing markets (−10.5).
+
+Two entries stay queued (weekly reversal, 12-1 momentum, both seen before on development days), one is blocked
+(post-earnings drift) and one retired (overnight persistence).

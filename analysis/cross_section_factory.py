@@ -50,7 +50,8 @@ MIN_PRICE = 5.0
 MIN_DOLLAR_VOLUME = 10e6
 DOLLAR_VOLUME_WINDOW = 21
 SIDES = {"overnight": 4, "intraday": 4, "close_1d": 4}   # sides traded per night per $1 long and $1 short
-SIGNAL_KINDS = ("mean_overnight", "mean_intraday", "momentum", "reversal", "high_52w")
+SIGNAL_KINDS = ("mean_overnight", "mean_intraday", "momentum", "reversal", "high_52w", "sector_momentum")
+PAID_MIN_NIGHTS = 100   # a card cut with fewer traded nights is not named in where it paid or did not
 RANKINGS = ("pooled", "within_sector")
 GROUPS = {
     "cyclical": ("Energy", "Materials", "Industrials", "Financials", "Consumer Discretionary", "Real Estate"),
@@ -88,9 +89,10 @@ class RunFile:
     cards: int = 5
     null_block_sessions: int = 10
     gates_chosen_after_seeing: bool | None = None
+    prior_dev_looks: tuple = ()
     _keys = ("run_id", "first_session", "last_session", "signals", "rankings", "fractions", "cost_bp_per_side", "alpha",
              "perms", "seed", "min_ranked", "min_session_bars", "min_ranked_gated", "cards", "null_block_sessions",
-             "gates_chosen_after_seeing")
+             "gates_chosen_after_seeing", "prior_dev_looks")
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -98,7 +100,8 @@ class RunFile:
             raise RunFileError("unknown run-file keys")
         try:
             run = cls(**{**value, "signals": tuple(json.dumps(s, sort_keys=True) for s in value["signals"]),
-                         "rankings": tuple(value["rankings"]), "fractions": tuple(value["fractions"])})
+                         "rankings": tuple(value["rankings"]), "fractions": tuple(value["fractions"]),
+                         "prior_dev_looks": tuple(value.get("prior_dev_looks", ()))})
         except (KeyError, TypeError) as exc:
             raise RunFileError(f"malformed run file: {exc}") from exc
         run.validate()
@@ -136,6 +139,10 @@ class RunFile:
                     raise RunFileError(f"gate {key} needs a list of values")
                 elif set(allowed) - set(GATE_VALUES[key]):
                     raise RunFileError(f"gate {key} values must be among {list(GATE_VALUES[key])}")
+        if any(s["kind"] == "sector_momentum" for s in self.signal_specs()) and tuple(self.rankings) != ("pooled",):
+            raise RunFileError("sector_momentum gives every stock of a sector the same value, so it ranks pooled only")
+        if not all(isinstance(v, str) and v.strip() for v in self.prior_dev_looks):
+            raise RunFileError("prior_dev_looks lists the run ids of earlier development looks at the same effect")
         if not names or not self.rankings or set(self.rankings) - set(RANKINGS):
             raise RunFileError(f"rankings must be among {RANKINGS}")
         if not self.fractions or any(not (isinstance(q, float) and 0.01 <= q <= 0.5) for q in self.fractions):
@@ -321,8 +328,21 @@ def signal_matrix(panel: Panel, spec: dict) -> np.ndarray:
         s = adj.shift(1 + skip) / adj.shift(1 + skip + L) - 1
     elif kind == "reversal":          # the opposite of the last L sessions' return through the close of d-1
         s = -(adj.shift(1) / adj.shift(1 + L) - 1)
-    else:                             # high_52w: close of d-1 against the highest close of the L sessions through d-1
+    elif kind == "high_52w":          # close of d-1 against the highest close of the L sessions through d-1
         s = adj.shift(1) / adj.shift(1).rolling(L, min_periods=need).max()
+    else:                             # sector_momentum: the equal-weighted mean momentum of the stock's sector's members
+        own = (adj.shift(1 + skip) / adj.shift(1 + skip + L) - 1).values
+        inside = panel.member & ~np.isnan(own)
+        s = np.full_like(own, np.nan)
+        for k in range(len(panel.sectors)):
+            cols = panel.sector == k
+            if not cols.any():
+                continue
+            cnt = inside[:, cols].sum(axis=1)
+            tot = np.where(inside[:, cols], own[:, cols], 0.0).sum(axis=1)
+            mean = np.where(cnt >= 5, tot / np.where(cnt > 0, cnt, 1), np.nan)
+            s[:, cols] = mean[:, None]
+        s = pd.DataFrame(s)
     return (s * spec.get("sign", 1)).values
 
 
@@ -571,7 +591,23 @@ def card(panel: Panel, res: dict, states: States, cost: np.ndarray) -> dict:
         lead = np.vectorize(lambda v: v is True, otypes=[bool])(states.sector_leading)
         lag = np.vectorize(lambda v: v is False, otypes=[bool])(states.sector_leading)
         out["sector_vs_market"] = {"leading": pooled(lead), "lagging": pooled(lag)}
+    out["where_it_paid"], out["where_it_did_not"] = paid_split(out)
     return out
+
+
+def paid_split(c: dict) -> tuple[list, list]:
+    """Every card cut with at least PAID_MIN_NIGHTS traded nights, split by the sign of its net return and sorted by
+    size: where the module paid after cost and where it did not. A description of a searched sample, not a test."""
+    rows = []
+    for name, cells in c.items():
+        if name in ("overall", "state_rows_matched", "where_it_paid", "where_it_did_not") or not isinstance(cells, dict):
+            continue
+        for value, v in cells.items():
+            if isinstance(v, dict) and v.get("nights", 0) >= PAID_MIN_NIGHTS and "net_bp" in v:
+                rows.append({"cut": name, "value": value, "nights": v["nights"], "net_bp": v["net_bp"], "t_gross": v["t_gross"]})
+    paid = sorted((r for r in rows if r["net_bp"] > 0), key=lambda r: -r["net_bp"])
+    not_paid = sorted((r for r in rows if r["net_bp"] <= 0), key=lambda r: r["net_bp"])
+    return paid, not_paid
 
 
 # ── A run ─────────────────────────────────────────────────────────────────
@@ -644,7 +680,10 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
                                   "module with the best flipped t of the modules ranked below it, so a module may pass with "
                                   "a t under this figure",
                  "lowest_passing_t": min(passed_t) if passed_t else None,
-                 "multiplicity": "within this run only; earlier runs and earlier looks are not counted",
+                 "multiplicity": "within this run only; earlier runs and earlier looks are not counted"
+                                 + (f" (earlier development looks at this effect: {', '.join(spec.prior_dev_looks)})"
+                                    if spec.prior_dev_looks else ""),
+                 "prior_dev_looks": list(spec.prior_dev_looks),
                  "hypothesis_only": spec.hypothesis_only}
         payload = {"method": {"statistic": "t of the mean net spread per traded night", "selection": "max_t_sign_flip",
                               "cost_bp_per_side": spec.cost_bp_per_side, "sides_per_night": SIDES,
@@ -722,6 +761,11 @@ def report_markdown(rep: dict) -> str:
             for value, v in cells.items():
                 if "gross_bp" in v:
                     lines.append(f"| {name} | {value} | {v['nights']:,} | {v['gross_bp']:.2f} | {v['net_bp']:.2f} | {v['t_gross']} |")
+
+        def said(rows: list) -> str:
+            return "; ".join(f"{r['cut']} {r['value']} {r['net_bp']:+.2f} bp ({r['nights']:,} nights)" for r in rows[:6]) or "nowhere"
+        lines += ["", f"Paid after cost (cuts of {PAID_MIN_NIGHTS}+ nights, largest first): {said(c.get('where_it_paid', []))}.",
+                  f"Did not: {said(c.get('where_it_did_not', []))}."]
     return "\n".join(lines) + "\n"
 
 
