@@ -63,6 +63,8 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from itertools import pairwise
@@ -550,34 +552,98 @@ def sleuth_test_id(lead_id: str) -> str:
 
 
 _TEST_COLUMNS = (
-    "id", "test_criteria", "status", "created_at", "last_tested", "times_tested",
-    "times_correct", "kill_reason", "killed_at", "scoring_version",
+    "id", "pattern_type", "test_criteria", "status", "created_at", "last_tested",
+    "times_tested", "times_correct", "kill_reason", "killed_at", "scoring_version",
     "trial_p_value", "trial_q_value", "trial_ledger_sha256",
 )
+SLEUTH_SOURCE = "sleuth"          # test_criteria.source of a reviewed declaration
 TEST_ROLE_DECLARED = "declared"   # the reviewed test the lead's verdict declared
 TEST_ROLE_BASELINE = "baseline"   # the same criteria, declared for every lead without review
-TEST_LINK_MISSING = "declared_test_row_missing"
-TEST_LINK_MISMATCH = "declared_test_names_another_lead"
+TEST_LINK_MISSING = "declared_test_row_missing"            # the lead points at no row
+TEST_LINK_MISMATCH = "declared_test_names_another_lead"    # the row names another lead
+TEST_LINK_FOREIGN = "declared_pointer_is_not_this_leads_test"  # pointer is not the lead's own id
+TEST_ROW_STAGED = "test_row_staged_without_lead_pointer"   # row committed, lead still open
+TEST_ROW_ORPHANED = "test_row_orphaned_without_lead_pointer"  # row exists, a closed lead does not point at it
+TEST_ROW_MALFORMED = "test_row_malformed"                  # row is not the declaration it should be
+TEST_LEAD_DISAGREES = "lead_record_disagrees_with_test"    # the lead's own record says otherwise
+
+_DIRECTIONS = ("up", "down")
 
 
-def declared_tests_for_leads(engine: Engine, leads: list[Any]) -> dict[str, dict[str, Any]]:
+def _criteria_faults(criteria: Any) -> list[str]:
+    """What a forward test's stored criteria lack. Empty when it is scorable."""
+    if not isinstance(criteria, dict):
+        return ["criteria_not_an_object"]
+    faults: list[str] = []
+    ticker = criteria.get("ticker")
+    if not isinstance(ticker, str) or not is_testable_ticker(ticker):
+        faults.append("ticker")
+    if criteria.get("expected_direction") not in _DIRECTIONS:
+        faults.append("expected_direction")
+    window = criteria.get("window_days")
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        faults.append("window_days")
+    move = criteria.get("min_move_pct")
+    if (isinstance(move, bool) or not isinstance(move, (int, float))
+            or not math.isfinite(move) or move <= 0):
+        faults.append("min_move_pct")
+    return faults
+
+
+def _row_faults(row: dict[str, Any], criteria: Any, *, pattern: str, source: str) -> list[str]:
+    """Why a stored row is not the declaration (``pattern``, ``source``) it
+    should be. The lead it names is checked by the caller."""
+    faults: list[str] = []
+    if row["pattern_type"] != pattern:
+        faults.append("pattern_type")
+    if not isinstance(criteria, dict) or criteria.get("source") != source:
+        faults.append("source")
+    return faults + _criteria_faults(criteria)
+
+
+def _lead_terms_faults(lead: Any, test_id: str, criteria: dict[str, Any]) -> list[str]:
+    """Where the lead's own record of what it declared differs from the test
+    row. ``investigate_intersection_lead`` writes both; they must agree."""
+    if lead.outcome != OUTCOME_DECLARED:
+        return ["outcome"]
+    recorded = [h for h in (lead.hypotheses if isinstance(lead.hypotheses, list) else [])
+                if isinstance(h, dict) and h.get("id") == test_id]
+    if len(recorded) != 1:
+        return ["declared_terms_missing"]
+    terms = recorded[0]
+    return [name for name, key in (("ticker", "ticker"), ("direction", "expected_direction"),
+                                   ("window_days", "window_days"),
+                                   ("min_move_pct", "min_move_pct"))
+            if terms.get(name) != criteria.get(key)]
+
+
+def declared_tests_for_leads(source: Any, leads: list[Any]) -> dict[str, dict[str, Any]]:
     """Each lead's stored tests, read as they are now. One primary-key query.
 
-    A lead links to a test in two stored ways: ``declared_hypothesis_id`` on
-    the lead, and ``test_criteria.lead_id`` on the ``discovered_hypotheses``
-    row (the only link a baseline has). Test ids are deterministic from the
-    lead id, so both are found by key. The result says which links held:
+    ``source`` is an engine, or an open connection when the caller is reading
+    leads and tests in one snapshot (``read_leads_page``).
 
-    * ``tests``: the rows found, each with its role, criteria, status and
-      trial columns. ``test_criteria`` is the pre-registered test; nothing
-      here scores it.
-    * ``link_problems``: a stored link that does not resolve
-      (``declared_test_row_missing``) or resolves to a row naming another
-      lead (``declared_test_names_another_lead``). A lead with a problem has
-      no verified declared test; it is not the same as a lead with none.
+    Test ids are deterministic from the lead id, so a lead's two possible rows
+    are found by key, plus whatever ``declared_hypothesis_id`` points at. A
+    row is only called a declared test when every stored fact agrees:
 
-    These rows are updated in place by the trial scorer, so this is the
-    current state, not what was known at an earlier time.
+    * ``tests``: verified rows only. The reviewed test (``role: declared``)
+      needs the lead's pointer to name the lead's own test id, the row to be
+      a reviewed declaration (pattern, source) naming this lead with scorable
+      criteria, and the lead's own record of the declared terms to match.
+      The baseline (``role: baseline``) is checked on its own: its id,
+      pattern, source, lead and criteria. Neither depends on the other.
+    * ``unverified_tests``: rows that exist but did not pass, each with a
+      ``state`` and the ``faults`` found. A reviewed row whose lead does not
+      point at it is ``staged`` while the lead is still open (the row and the
+      pointer are committed separately) and ``orphaned`` once the lead is
+      closed. These are shown, never counted as declared.
+    * ``link_problems``: one entry per unverified row or unresolved pointer.
+      A lead with a problem has no verified test for that role; that is not
+      the same as a lead with none.
+
+    Rows are updated in place by the trial scorer, so this is the current
+    state, not what was known at an earlier time.
     """
     wanted: dict[str, list[str]] = {}
     for lead in leads:
@@ -586,55 +652,148 @@ def declared_tests_for_leads(engine: Engine, leads: list[Any]) -> dict[str, dict
             ids.append(lead.declared_hypothesis_id)
         wanted[lead.id] = list(dict.fromkeys(ids))
     out: dict[str, dict[str, Any]] = {
-        lead.id: {"tests": [], "link_problems": []} for lead in leads
+        lead.id: {"tests": [], "unverified_tests": [], "link_problems": []} for lead in leads
     }
     all_ids = sorted({i for ids in wanted.values() for i in ids})
     if not all_ids:
         return out
     stmt = text(
-        "SELECT id, test_criteria, status, created_at, last_tested, times_tested, "
-        "times_correct, kill_reason, killed_at, scoring_version, "
+        "SELECT id, pattern_type, test_criteria, status, created_at, last_tested, "
+        "times_tested, times_correct, kill_reason, killed_at, scoring_version, "
         "trial_p_value, trial_q_value, trial_ledger_sha256 "
         "FROM discovered_hypotheses WHERE id IN :ids"
     ).bindparams(bindparam("ids", expanding=True))
-    with engine.connect() as conn:
-        rows = {r[0]: dict(zip(_TEST_COLUMNS, r, strict=True))
-                for r in conn.execute(stmt, {"ids": all_ids})}
+    if isinstance(source, Engine):
+        with source.connect() as conn:
+            fetched = conn.execute(stmt, {"ids": all_ids}).fetchall()
+    else:
+        fetched = source.execute(stmt, {"ids": all_ids}).fetchall()
+    rows = {r[0]: dict(zip(_TEST_COLUMNS, r, strict=True)) for r in fetched}
+
     for lead in leads:
         entry = out[lead.id]
+        pointer = lead.declared_hypothesis_id
+        own_id, base_id = sleuth_test_id(lead.id), baseline_id(lead.id)
+
+        def unverified(kind: str, test_id: str, criteria: Any,
+                       faults: list[str] | None = None, *,
+                       entry: dict[str, Any] = entry, pointer: str | None = pointer) -> None:
+            entry["unverified_tests"].append(
+                _test_view(rows[test_id], criteria, role=None, linked=test_id == pointer)
+                | {"verified": False, "state": kind, "faults": faults or []})
+            entry["link_problems"].append(
+                {"problem": kind, "id": test_id} | ({"faults": faults} if faults else {}))
+
         for test_id in wanted[lead.id]:
             row = rows.get(test_id)
-            is_declared = test_id == lead.declared_hypothesis_id
             if row is None:
-                if is_declared:
+                if test_id == pointer:
                     entry["link_problems"].append({"problem": TEST_LINK_MISSING, "id": test_id})
                 continue
-            criteria = row["test_criteria"]
-            if isinstance(criteria, str):
-                criteria = json.loads(criteria)
-            criteria = criteria if isinstance(criteria, dict) else {}
-            if criteria.get("lead_id") != lead.id:
-                entry["link_problems"].append({"problem": TEST_LINK_MISMATCH, "id": test_id})
+            criteria = _criteria(row["test_criteria"])
+            if test_id == pointer and test_id != own_id:
+                # The pointer may only name the lead's own reviewed test.
+                unverified(TEST_LINK_FOREIGN, test_id, criteria)
                 continue
-            entry["tests"].append({
-                "id": test_id,
-                "role": (TEST_ROLE_BASELINE if criteria.get("source") == BASELINE_PATTERN
-                         else TEST_ROLE_DECLARED),
-                "linked_from_lead": is_declared,
-                "test_criteria": criteria,
-                "status": row["status"],
-                "created_at": _iso(row["created_at"]),
-                "last_tested": _iso(row["last_tested"]),
-                "times_tested": row["times_tested"],
-                "times_correct": row["times_correct"],
-                "kill_reason": row["kill_reason"],
-                "killed_at": _iso(row["killed_at"]),
-                "scoring_version": row["scoring_version"],
-                "trial_p_value": row["trial_p_value"],
-                "trial_q_value": row["trial_q_value"],
-                "trial_ledger_sha256": row["trial_ledger_sha256"],
-            })
+            if not isinstance(criteria, dict) or criteria.get("lead_id") != lead.id:
+                unverified(TEST_LINK_MISMATCH, test_id, criteria)
+                continue
+            if test_id == base_id:
+                faults = _row_faults(row, criteria, pattern=BASELINE_PATTERN,
+                                     source=BASELINE_PATTERN)
+                if faults:
+                    unverified(TEST_ROW_MALFORMED, test_id, criteria, faults)
+                else:
+                    entry["tests"].append(
+                        _test_view(row, criteria, role=TEST_ROLE_BASELINE, linked=False)
+                        | {"verified": True})
+                continue
+            # The lead's own reviewed test id.
+            faults = _row_faults(row, criteria, pattern=HYPOTHESIS_PATTERN, source=SLEUTH_SOURCE)
+            if faults:
+                unverified(TEST_ROW_MALFORMED, test_id, criteria, faults)
+            elif pointer != own_id:
+                unverified(TEST_ROW_STAGED if lead.status == "new" else TEST_ROW_ORPHANED,
+                           test_id, criteria)
+            elif terms := _lead_terms_faults(lead, test_id, criteria):
+                unverified(TEST_LEAD_DISAGREES, test_id, criteria, terms)
+            else:
+                entry["tests"].append(
+                    _test_view(row, criteria, role=TEST_ROLE_DECLARED, linked=True)
+                    | {"verified": True})
     return out
+
+
+def _criteria(raw: Any) -> Any:
+    """Stored criteria as an object, or None when the text is not JSON."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+    return raw
+
+
+def _test_view(row: dict[str, Any], criteria: Any, *, role: str | None,
+               linked: bool) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "role": role,
+        "linked_from_lead": linked,
+        "pattern_type": row["pattern_type"],
+        "test_criteria": criteria,
+        "status": row["status"],
+        "created_at": _iso(row["created_at"]),
+        "last_tested": _iso(row["last_tested"]),
+        "times_tested": row["times_tested"],
+        "times_correct": row["times_correct"],
+        "kill_reason": row["kill_reason"],
+        "killed_at": _iso(row["killed_at"]),
+        "scoring_version": row["scoring_version"],
+        "trial_p_value": row["trial_p_value"],
+        "trial_q_value": row["trial_q_value"],
+        "trial_ledger_sha256": row["trial_ledger_sha256"],
+    }
+
+
+@contextmanager
+def read_snapshot(engine: Engine) -> Iterator[Any]:
+    """One connection in one read-only transaction that sees a single version
+    of the database: PostgreSQL ``REPEATABLE READ READ ONLY``. Every statement
+    run on it agrees with the others, whatever commits meanwhile."""
+    options: dict[str, Any] = {}
+    if engine.dialect.name == "postgresql":
+        options = {"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
+    with engine.connect() as base:
+        conn = base.execution_options(**options) if options else base
+        with conn.begin():
+            yield conn
+
+
+def read_leads_page(engine: Engine, *, status: str | None = None, category: str | None = None,
+                    limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    """A page of leads, the matching total and each lead's tests, all read in
+    one snapshot so the three cannot contradict each other."""
+    from intelligence.sleuth import Sleuth
+
+    sleuth = Sleuth(engine, ensure_schema=False)
+    with read_snapshot(engine) as conn:
+        leads = sleuth.get_leads(status=status, category=category, limit=limit,
+                                 offset=offset, conn=conn)
+        total = sleuth.count_leads(status=status, category=category, conn=conn)
+        tests = declared_tests_for_leads(conn, leads)
+    return {"leads": leads, "total": total, "tests": tests}
+
+
+def read_lead(engine: Engine, lead_id: str) -> dict[str, Any] | None:
+    """One lead and its tests in one snapshot, or None when there is no such lead."""
+    from intelligence.sleuth import Sleuth
+
+    with read_snapshot(engine) as conn:
+        lead = Sleuth(engine, ensure_schema=False)._load_lead(lead_id, conn=conn)
+        if lead is None:
+            return None
+        return {"lead": lead, "tests": declared_tests_for_leads(conn, [lead])[lead.id]}
 
 
 def _iso(value: Any) -> str | None:
@@ -734,7 +893,7 @@ def declare_hypothesis(conn: Any, lead: Any, ticker: str, direction: str,
     hyp_id = sleuth_test_id(lead.id)
     criteria = {"ticker": ticker, "window_days": HYPOTHESIS_WINDOW_DAYS,
                 "min_move_pct": HYPOTHESIS_MIN_MOVE_PCT, "expected_direction": direction,
-                "source": "sleuth", "lead_id": lead.id}
+                "source": SLEUTH_SOURCE, "lead_id": lead.id}
     thesis = (f"{ticker} moves {direction} at least {HYPOTHESIS_MIN_MOVE_PCT:g}% over "
               f"{HYPOTHESIS_WINDOW_DAYS} days after independent sources agreed "
               f"({lead.question[:160]})")
