@@ -514,6 +514,44 @@ class BasePuller:
         rows = conn.execute(text(sql), params).fetchall()
         return {r[0] for r in rows}
 
+    def _latest_stored_values(
+        self,
+        series_id: str,
+        conn: Any,
+        start_date: date | None = None,
+    ) -> dict[date, float]:
+        """Latest SUCCESS value per obs_date this source stored for ``series_id``.
+
+        The vintage-aware alternative to :meth:`_row_exists`. A puller that
+        re-fetches a lookback window should insert a row only when the value
+        is new or revised (``stored.get(obs_date) != value``); the 1-hour
+        ``_row_exists`` window instead re-inserts every observation in the
+        window on every run. Measured on grid-svr 2026-11-09: ofr_fsi held
+        1,766,133 rows for 6,795 dates, brazil_credit_growth 95,650 for 441,
+        india_iip_yoy 2,626 for 218.
+
+        Parameters:
+            series_id: The series identifier.
+            conn: Active database connection.
+            start_date: If given, only consider obs_date >= start_date (the
+                caller's fetch window), so a long history is not scanned to
+                answer a short incremental pull.
+
+        Returns:
+            dict[date, float]: obs_date -> latest stored value.
+        """
+        sql = (
+            "SELECT DISTINCT ON (obs_date) obs_date, value FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src AND pull_status = 'SUCCESS'"
+        )
+        params: dict[str, Any] = {"sid": series_id, "src": self.source_id}
+        if start_date is not None:
+            sql += " AND obs_date >= :start_date"
+            params["start_date"] = start_date
+        sql += " ORDER BY obs_date, pull_timestamp DESC"
+        rows = conn.execute(text(sql), params).fetchall()
+        return {r[0]: float(r[1]) for r in rows if r[1] is not None}
+
     def _file_advisory_lock(self, conn: Any, *key_parts: Any) -> None:
         """Take a transaction-scoped advisory lock for one logical "file".
 

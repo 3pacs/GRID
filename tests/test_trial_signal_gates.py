@@ -163,16 +163,17 @@ def test_company_data_prefers_ticker_metrics_daily(monkeypatch: pytest.MonkeyPat
     assert "obs_date <= %s" in metrics_sql and params == ("ACME", TODAY)  # PIT-bounded, parameterised
 
 
-def test_company_data_falls_back_profile_then_tiingo_then_none(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_company_data_falls_back_profile_then_none(monkeypatch: pytest.MonkeyPatch) -> None:
     sig, _ = _company(monkeypatch, {"company_profiles": ({"market_cap": 800e6, "cash_runway_months": 9.5},)})
     data = sig._fetch_company_data("ACME")
     assert (data["market_cap_mm"], data["market_cap_source"], data["cash_runway_months"]) == (800.0, "company_profiles", 9.5)
 
+    # Tiingo fundamentals is retired (2026-11-08): a stored TIINGO_FUND cap is
+    # never read, so its last rows cannot be served as a current cap.
     sig, conn = _company(monkeypatch, {"raw_series": (3.0e9,)})
     data = sig._fetch_company_data("ACME", as_of=TODAY)
-    assert (data["market_cap_mm"], data["market_cap_source"]) == (3000.0, "tiingo_fundamentals")
-    tiingo_sql, params = next((s, p) for s, p in conn.executed if "raw_series" in s)
-    assert params[0] == "TIINGO_FUND:ACME:market_cap" and "obs_date <= %s" in tiingo_sql
+    assert data["market_cap_mm"] is None and data["market_cap_source"] is None
+    assert not any("TIINGO_FUND" in str(p) for _, p in conn.executed)
 
     sig, _ = _company(monkeypatch, {})
     data = sig._fetch_company_data("ACME")

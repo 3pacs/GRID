@@ -28,6 +28,11 @@ closed and prints one ``GEM_SKIP``/``GEM_FAILED``/``GEM_VALIDATE`` line:
   its stored rows equal the registered and reported counts, and its capture
   lies inside the New York session.
 
+After VALIDATE one ``GEM_RESULT PASS|PARTIAL|FAIL pass=N fail=M failed=[...]``
+line closes the run. The exit status is 0 for PASS and PARTIAL, and 1 only
+when no ticker passed, the result set is incomplete, or the run itself
+errored (``GEM_FAILED``).
+
 GEM batches are appended; nothing deletes or replaces another batch.
 """
 
@@ -428,6 +433,30 @@ def _validate_batch(conn, ticker: str, day: date, result: dict) -> bool:
             and start <= completed <= _utc_now() and in_session)
 
 
+def _record_result(day: date, verdicts: list[tuple[str, bool]]) -> int:
+    """Record one ``GEM_RESULT`` line for the run and return its exit code.
+
+    ``PASS`` when every ticker validated, ``PARTIAL`` when some did and some
+    did not, ``FAIL`` when none did. Only ``FAIL`` exits non-zero: a partial
+    run still published validated, replayable batches for the passing
+    tickers, and a unit that shows failed every day for one thin name hides
+    those captures and teaches everyone to ignore the failure (GLND,
+    2026-11-17/18: 7/8 PASS, exit 1). The per-ticker ``GEM_VALIDATE ... FAIL``
+    lines stay, and the ``failed=[...]`` list names them in one place.
+    """
+    failed = [ticker for ticker, ok in verdicts if not ok]
+    passed = len(verdicts) - len(failed)
+    if passed == 0:
+        status = "FAIL"
+    elif failed:
+        status = "PARTIAL"
+    else:
+        status = "PASS"
+    _record(day, f"GEM_RESULT {status} pass={passed} fail={len(failed)} "
+                 f"failed=[{','.join(failed)}]")
+    return 1 if status == "FAIL" else 0
+
+
 def main() -> int:
     now = _utc_now()
     day = now.date()
@@ -496,18 +525,18 @@ def main() -> int:
         if len(results) != len(GEM_TICKERS) or [r.get("ticker") for r in results] != list(GEM_TICKERS):
             _record(day, "GEM_FAILED incomplete result set")
             return 1
-        passed = []
+        verdicts: list[tuple[str, bool]] = []
         with engine.connect() as conn:
             conn.execute(text("SET statement_timeout = '20s'"))
             for result in results:
                 ticker = result["ticker"]
                 good = (result.get("status") == "SUCCESS"
                         and _validate_batch(conn, ticker, day, result))
-                passed.append(good)
+                verdicts.append((ticker, good))
                 _record(day, f"GEM_VALIDATE {ticker} {'PASS' if good else 'FAIL'} "
                              f"batch={result.get('capture_batch_id')} "
                              f"ordinal={result.get('capture_ordinal')}")
-        return 0 if all(passed) else 1
+        return _record_result(day, verdicts)
     except Exception as exc:  # noqa: BLE001 - process boundary; no secret-bearing text
         _record(day, f"GEM_FAILED {type(exc).__name__}")
         return 1

@@ -28,6 +28,9 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from ingestion.altdata import gdelt_doc
+from ingestion.altdata.gdelt_doc import GDELTRateLimited
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -36,8 +39,17 @@ POLL_INTERVAL_SECONDS = 60
 SPIKE_MULTIPLIER = 3.0          # articles must exceed baseline * multiplier
 COOLDOWN_SECONDS = 15 * 60      # 15 min cooldown per query after detection
 GDELT_TIMESPAN_MINUTES = 60
-GDELT_TIMEOUT_SECONDS = 10
-GDELT_REQUEST_SPACING = 12.0   # seconds between GDELT requests (defensive after sustained 429s)
+# GDELT takes 10-20 s to answer (429s included); a 10 s read timeout turned
+# most throttled answers into "Read timed out" (1,027 of them on 2026-11-08).
+GDELT_TIMEOUT_SECONDS = gdelt_doc.REQUEST_TIMEOUT
+# Requests go through the host-wide GDELT DOC gate (ingestion/altdata/gdelt_doc.py)
+# at low priority: at least this long after the previous DOC request ended,
+# so the scheduled GDELT puller takes the next slot when it is waiting.
+GDELT_REQUEST_SPACING = gdelt_doc.MIN_INTERVAL_S + gdelt_doc.LOW_PRIORITY_EXTRA_S
+# Longest one query waits for its slot before the cycle stops.
+GDELT_MAX_WAIT_SECONDS = 30.0
+# Longest the monitor sleeps for a host-wide GDELT cooldown between cycles.
+GDELT_MAX_COOLDOWN_SLEEP_SECONDS = gdelt_doc.MAX_COOLDOWN_S
 CACHE_INVALIDATION_FILE = Path("/tmp/grid_cache_invalidation")
 
 # Positive and negative keyword sets for rudimentary direction inference
@@ -91,9 +103,14 @@ WATCHLIST: list[dict[str, Any]] = [
 def check_gdelt(query: str, minutes: int = GDELT_TIMESPAN_MINUTES) -> int:
     """Hit GDELT DOC API and return article count in the last *minutes* minutes.
 
-    Returns 0 on any error (graceful degradation).
+    Returns 0 on network or parse errors (graceful degradation).
+
+    Raises:
+        GDELTRateLimited: GDELT answered 429 (the gate has started a host-wide
+            cooldown) or no slot came up within ``GDELT_MAX_WAIT_SECONDS``.
+            The caller stops its cycle: sending the next query into the
+            cooldown used to keep grid-svr's IP throttled all day.
     """
-    url = "https://api.gdeltproject.org/api/v2/doc/doc"
     # GDELT requires OR'd queries to be wrapped in parentheses.
     safe_query = f"({query})" if " OR " in query and not query.startswith("(") else query
     params = {
@@ -103,11 +120,14 @@ def check_gdelt(query: str, minutes: int = GDELT_TIMESPAN_MINUTES) -> int:
         "format": "json",
     }
     try:
-        resp = requests.get(url, params=params, timeout=GDELT_TIMEOUT_SECONDS)
-        if resp.status_code == 429:
-            log.warning("GDELT 429 rate-limited for '{q}' — backing off", q=query[:40])
-            time.sleep(GDELT_REQUEST_SPACING)
-            return 0
+        resp = gdelt_doc.doc_get(
+            params,
+            max_wait_s=GDELT_MAX_WAIT_SECONDS,
+            attempts=1,
+            priority="low",
+            timeout=GDELT_TIMEOUT_SECONDS,
+            caller="breaking_news",
+        )
         resp.raise_for_status()
         # GDELT sometimes returns text body even on 200 (e.g., 'Invalid mode.',
         # 'Timespan is too short.'). Detect that before json().
@@ -271,11 +291,19 @@ def run_monitor(interval: int = POLL_INTERVAL_SECONDS, once: bool = False) -> No
         n=len(WATCHLIST), s=interval, m=SPIKE_MULTIPLIER,
     )
 
+    # A cycle stopped by a GDELT 429 resumes at the query it stopped on, so
+    # the tail of the watchlist is not starved while GDELT throttles.
+    start_at = 0
+
     while True:
         cycle_start = time.monotonic()
         detections = 0
+        limited: GDELTRateLimited | None = None
+        n_items = len(WATCHLIST)
+        order = [(start_at + k) % n_items for k in range(n_items)] if n_items else []
 
-        for i, item in enumerate(WATCHLIST):
+        for pos, idx in enumerate(order):
+            item = WATCHLIST[idx]
             query = item["query"]
             now = time.time()
 
@@ -289,11 +317,17 @@ def run_monitor(interval: int = POLL_INTERVAL_SECONDS, once: bool = False) -> No
                 )
                 continue
 
-            # Rate limit: space out GDELT requests to stay under free tier
-            if i > 0:
-                time.sleep(GDELT_REQUEST_SPACING)
-
-            article_count = check_gdelt(query)
+            # Spacing and host-wide 429 cooldowns come from the shared gate.
+            try:
+                article_count = check_gdelt(query)
+            except GDELTRateLimited as exc:
+                limited = exc
+                start_at = idx
+                log.warning(
+                    "GDELT throttled ({e}); stopping this cycle with {n} watchlist "
+                    "queries unchecked", e=str(exc), n=n_items - pos,
+                )
+                break
             is_spike, ratio = detect_spike(article_count, item["baseline_per_hour"])
 
             if is_spike:
@@ -323,15 +357,20 @@ def run_monitor(interval: int = POLL_INTERVAL_SECONDS, once: bool = False) -> No
 
         elapsed = time.monotonic() - cycle_start
         log.info(
-            "Breaking news cycle complete — {d} detections in {t:.1f}s",
+            "Breaking news cycle {state} — {d} detections in {t:.1f}s",
+            state="stopped by GDELT throttling" if limited else "complete",
             d=detections, t=elapsed,
         )
 
         if once:
             break
 
-        # Sleep the remainder of the interval
+        # Sleep the remainder of the interval, or out the host-wide GDELT
+        # cooldown when that is longer: polling into it gains nothing.
         sleep_time = max(1.0, interval - elapsed)
+        if limited is not None and limited.retry_at:
+            cooldown_left = min(limited.retry_at - time.time(), GDELT_MAX_COOLDOWN_SLEEP_SECONDS)
+            sleep_time = max(sleep_time, cooldown_left)
         time.sleep(sleep_time)
 
 

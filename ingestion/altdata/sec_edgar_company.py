@@ -39,6 +39,8 @@ XBRL_CONCEPTS: dict[str, str] = {
 DEFAULT_TICKERS: list[str] = [
     "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "JPM", "UNH",
     "XOM", "JNJ", "V", "PG", "MA", "HD", "AVGO", "LLY", "MRK", "COST", "BAC", "BRK.B",
+    # analysis.thesis_scorer's valuation_compression basket also reads these.
+    "DIS", "MCD",
 ]
 
 _RATE_LIMIT_DELAY: float = 1.0

@@ -47,6 +47,21 @@ class TestResolvePriceSeriesId:
         assert resolve_price_series_id("hsy") == "YF:HSY:close"
         assert resolve_price_series_id("MDLZ") == "YF:MDLZ:close"
 
+    def test_equity_slugs_use_the_supply_chain_symbol_rule(self):
+        # Codex review of #1184: intel -> YF:INTEL:close, a symbol that does not exist
+        assert resolve_price_series_id("intel") == "YF:INTC:close"
+        assert resolve_price_series_id("tsmc") == "YF:TSM:close"
+        assert resolve_price_series_id("pxd") is None  # delisted
+        assert resolve_price_series_id("lonza") is None  # foreign listing
+
+    def test_typed_nodes_fail_closed(self):
+        assert resolve_price_series_id("hsy", "ticker") == "YF:HSY:close"
+        assert resolve_price_series_id("hsy", None) is None  # no node row
+        assert resolve_price_series_id("openai", "private_company") is None
+        assert resolve_price_series_id("cocoa", "commodity") == "YF:CC=F:close"
+        assert resolve_price_series_id("cocoa", None) == "YF:CC=F:close"
+        assert resolve_price_series_id("corn", "ticker") == "YF:CORN:close"  # the fund
+
     def test_non_ticker_returns_none(self):
         # Country / descriptor slugs shouldn't yield a series id
         assert resolve_price_series_id("west_africa_region") is None

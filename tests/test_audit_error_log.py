@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scripts.audit_error_log import _normalize, audit
 
@@ -165,3 +165,48 @@ def test_audit_fail_on_total_trips_when_count_exceeded(tmp_path, capsys):
     assert "5 total error rows" in err
 
     assert audit(log_path, cutoff=cutoff, top=5, fail_on_total=100) == 0
+
+
+def test_release_logs_reads_sibling_trees_and_counts_copies_once(tmp_path, capsys):
+    """grid-scheduler writes the errors.jsonl of its pinned (older) release tree."""
+    import os
+    import time
+
+    from scripts.audit_error_log import release_logs
+
+    releases = tmp_path / "grid_release.releases"
+    current = releases / "new" / ".server-logs"
+    pinned = releases / "old" / ".server-logs"
+    stale = releases / "older" / ".server-logs"
+    for d in (current, pinned, stale):
+        d.mkdir(parents=True)
+    now = datetime.now(timezone.utc)
+    shared = json.dumps({"ts": (now - timedelta(hours=1)).isoformat(), "level": "ERROR",
+                         "module": "api", "function": "f", "message": "copied line"})
+    sched = json.dumps({"ts": (now - timedelta(minutes=5)).isoformat(), "level": "ERROR",
+                        "module": "ingestion.ml.finbert_scorer", "function": "score_all_sources",
+                        "message": "FinBERT scoring failed"})
+    (current / "errors.jsonl").write_text(shared + "\n")
+    (pinned / "errors.jsonl").write_text(shared + "\n" + sched + "\n")
+    (stale / "errors.jsonl").write_text(shared + "\n")
+    old = time.time() - 3 * 86400
+    os.utime(stale / "errors.jsonl", (old, old))
+
+    live = tmp_path / "grid_release"
+    live.symlink_to(releases / "new")
+
+    cutoff = now - timedelta(hours=2)
+    paths = release_logs(live / ".server-logs" / "errors.jsonl", cutoff)
+    assert paths == [live / ".server-logs" / "errors.jsonl", pinned / "errors.jsonl"]
+
+    assert audit(paths, cutoff=cutoff, top=5) == 0
+    out = capsys.readouterr().out
+    assert "(2 entries" in out
+    assert "finbert_scorer" in out
+
+
+def test_release_logs_outside_a_release_tree_is_just_the_default(tmp_path):
+    from scripts.audit_error_log import release_logs
+
+    default = tmp_path / "repo" / ".server-logs" / "errors.jsonl"
+    assert release_logs(default, datetime.now(timezone.utc)) == [default]

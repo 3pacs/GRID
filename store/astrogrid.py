@@ -2650,7 +2650,17 @@ class AstroGridStore:
 
     def list_backtest_results(self, *, strategy_variant: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         # Results labelled '[' come from char-list legacy rows graded against SPY.
-        filters = ["br.target_symbol IS DISTINCT FROM :legacy_char_symbol"]
+        filters = [
+            "br.target_symbol IS DISTINCT FROM :legacy_char_symbol",
+            # A run listed in backtest_run_invalidation (e.g. the 242
+            # rotation_variant_* runs built on the mixed-basis _full price
+            # panel, docs/reference/PRICE_PANEL_BASIS.md) keeps its rows as
+            # history but is never listed as a result.
+            (
+                f"NOT EXISTS (SELECT 1 FROM {self.schema}.backtest_run_invalidation inv "
+                "WHERE inv.backtest_run_id = br.backtest_run_id)"
+            ),
+        ]
         params: dict[str, Any] = {"limit": limit, "legacy_char_symbol": LEGACY_CHAR_LIST_TARGET_SYMBOL}
         if strategy_variant:
             filters.append("br.strategy_variant = :strategy_variant")

@@ -476,6 +476,25 @@ def test_pending_rows_are_not_declared_until_they_expire(released: None) -> None
     assert out["pending"] == 2
 
 
+def test_pending_rows_at_the_head_do_not_use_up_the_batch(released: None) -> None:
+    # 2026-11-07: rows still pending stay active at the head of the oldest-first
+    # queue; capping by rows scanned stalled the batch behind them.
+    rows = [_row(f"young{i}", "convergence", CONV, 5) for i in range(5)] + [
+        _row(f"cat{i}", "volume_anomaly", {"watch_category": "x"}, 4) for i in range(3)
+    ]
+    engine = _engine(rows)
+    with patch.object(ht, "load_completed_closes", return_value={}):
+        out = ht.score_batch(engine, dry_run=True, evaluated_at=NOW, max_trials=2)
+    assert [t["hypothesis_id"] for t in out["record"]["trials"]] == ["cat0", "cat1"]
+    assert out["pending"] == 5 and out["capped"] is True
+
+
+def test_uncapped_batch_reports_not_capped() -> None:
+    engine = _engine([_row("cat", "volume_anomaly", {"watch_category": "x"}, 60)])
+    out = ht.score_batch(engine, dry_run=True, evaluated_at=NOW, max_trials=2)
+    assert out["declared"] == 1 and out["capped"] is False
+
+
 def test_already_ledgered_hypotheses_are_skipped() -> None:
     ledger = ht.dry_run_ledger()
     lse.record_hypothesis_batch(ledger, scorer_version="t", evaluated_at="x", trials=[_trial("cat", 1.0, status=ht.INELIGIBLE)])

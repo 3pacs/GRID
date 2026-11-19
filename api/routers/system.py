@@ -69,6 +69,7 @@ from store.availability_fields import (
     measured_field,
     unavailable_field,
 )
+from store.publication_review_status import review_chain_status
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
@@ -206,6 +207,18 @@ def health() -> HealthResponse:
             checks["recent_data"] = recent
             if not recent:
                 degraded_reasons.append("no data pulled in 7 days")
+
+            # Daily publication review chain (packet -> grader -> ingest). The
+            # domain module probes table existence first and never raises, so a
+            # host without the migration or the packet tree reports "not
+            # configured" instead of poisoning this connection.
+            try:
+                review = review_chain_status(conn)
+                checks["publication_review"] = review.as_check()
+                degraded_reasons.extend(review.degraded_reasons)
+            except Exception as exc:  # the module promises not to raise; health must not depend on that
+                log.debug("Health: publication review status failed: {e}", e=str(exc))
+                checks["publication_review"] = {"error": type(exc).__name__}
 
         # Connection pool details — shared helper so every process (API,
         # Hermes, ...) reports the same fields the same way instead of each

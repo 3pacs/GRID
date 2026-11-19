@@ -42,7 +42,7 @@ def test_delegates_to_the_ledgered_batch_scorer() -> None:
          patch.object(hypothesis_trials, "score_batch",
                       return_value=_batch_result(confirmed=1, invalidated=4, expired=2)) as sb:
         out = score_due_active_hypotheses(engine, batch_size=50, max_runtime_s=30)
-    sb.assert_called_once_with(engine, ledger="LEDGER", limit=50, max_runtime_s=30)
+    sb.assert_called_once_with(engine, ledger="LEDGER", max_trials=50, max_runtime_s=30)
     assert out["scanned"] == 12 and out["scored"] == 7 and out["pending"] == 3
     assert (out["confirmed"], out["invalidated"], out["expired"]) == (1, 4, 2)
     assert out["record_sha256"] == "abc"

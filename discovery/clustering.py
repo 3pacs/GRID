@@ -192,6 +192,10 @@ class ClusterDiscovery:
                 import tempfile
                 out_path = Path(tempfile.mkdtemp(prefix="clustering_"))
 
+        from discovery.output_retention import prune_outputs
+
+        prune_outputs(out_path)
+
         log.info(
             "Starting cluster discovery — n_components={nc}, as_of={d}",
             nc=n_components,

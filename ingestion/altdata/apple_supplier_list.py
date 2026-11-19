@@ -167,6 +167,9 @@ PUBLIC_TICKER_MAP: dict[str, str] = {
     # Misc published tier-1
     "jabil":                   "jbl",
     "flex":                    "flex",
+    # Look-alikes of the two above, also on the list
+    "flexium":                 "6269.tw",  # Flexium Interconnect (TWSE)
+    "unimicron":               "3037.tw",  # Unimicron Technology (TWSE)
     "stmicro":                 "stm",
     "amphenol":                "aph",
 }
@@ -577,13 +580,22 @@ def _extract_suppliers(pdf_text: str) -> list[SupplierRecord]:
 # ── Classification ───────────────────────────────────────────────────────────
 
 
+def _mentions(alias: str, lower: str) -> bool:
+    """``alias`` appears in ``lower`` as whole words.
+
+    A substring test put Unimicron on Micron's symbol and Flexium
+    Interconnect on Flex's, so each pair collapsed into one edge.
+    """
+    return re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", lower) is not None
+
+
 def _resolve_node_id(cleaned: str) -> tuple[str, str | None]:
     """Return (node_id, ticker_if_public). node_id is a ticker (lowercase)
     for public suppliers and a slug for private companies.
     """
     lower = cleaned.lower()
     for alias, tkr in PUBLIC_TICKER_MAP.items():
-        if alias in lower:
+        if _mentions(alias, lower):
             return tkr.lower(), tkr
     return _slug(cleaned), None
 
@@ -591,10 +603,10 @@ def _resolve_node_id(cleaned: str) -> tuple[str, str | None]:
 def _classify_relationship(cleaned: str) -> str:
     lower = cleaned.lower()
     for alias in CONTRACT_MFG_NAMES:
-        if alias in lower:
+        if _mentions(alias, lower):
             return "contract_mfg"
     for alias in CHIP_VENDORS:
-        if alias in lower:
+        if _mentions(alias, lower):
             return "raw_material"
     return "component"
 
@@ -602,7 +614,7 @@ def _classify_relationship(cleaned: str) -> str:
 def _apple_revenue_pct(cleaned: str) -> float | None:
     lower = cleaned.lower()
     for alias, pct in APPLE_REV_CONCENTRATION_PCT.items():
-        if alias in lower:
+        if _mentions(alias, lower):
             return pct
     return None
 

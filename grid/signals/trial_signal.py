@@ -17,8 +17,9 @@ Conforms to GRID signal interface:
 
 Company data is GRID-first (no paid quote API):
   ticker_metrics_daily.market_cap_usd → company_profiles.profile->>'market_cap'
-  → raw_series TIINGO_FUND:{T}:market_cap → FMP profile (only if FMP_API_KEY)
-  → None. Cash runway comes from company_profiles.profile (cash, quarterly_burn,
+  → FMP profile (only if FMP_API_KEY) → None. (The TIINGO_FUND market-cap
+  fallback was dropped when Tiingo fundamentals was retired on 2026-11-08: its
+  last rows would otherwise be read as current with no age bound.) Cash runway comes from company_profiles.profile (cash, quarterly_burn,
   cash_runway_months — written by ingestion.altdata.small_cap_enrichment).
 
 The mcap < $2B gate is ENFORCED: > $2B is skipped, unknown cap is capped at
@@ -638,16 +639,6 @@ class TrialGemSignal:
                 return {}
         return p if isinstance(p, dict) else {}
 
-    def _market_cap_from_tiingo(self, ticker: str, as_of: datetime.date) -> Optional[float]:
-        """Latest raw_series TIINGO_FUND:{T}:market_cap (USD) at or before ``as_of``."""
-        row = self._query_one(
-            "SELECT value FROM raw_series "
-            "WHERE series_id = %s AND pull_status = 'SUCCESS' AND obs_date <= %s "
-            "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1",
-            (f"TIINGO_FUND:{ticker}:market_cap", as_of),
-        )
-        return _pos_float(row[0]) if row else None
-
     def _market_cap_from_fmp(self, ticker: str) -> Optional[float]:
         """FMP profile ``mktCap`` (USD) — only when FMP_API_KEY is set, within budget."""
         key = _fmp_api_key()
@@ -673,7 +664,7 @@ class TrialGemSignal:
         """GRID-first market cap + cash runway for ``ticker``.
 
         Order: ticker_metrics_daily → company_profiles.profile.market_cap →
-        raw_series TIINGO_FUND market_cap → FMP profile (key required) → None.
+        FMP profile (key required) → None.
         Runway from company_profiles.profile (cash_runway_months, or
         cash / quarterly_burn * 3). Never raises.
         """
@@ -685,9 +676,6 @@ class TrialGemSignal:
         if mcap_usd is None:
             mcap_usd = _pos_float(profile.get("market_cap"))
             source = "company_profiles" if mcap_usd else None
-        if mcap_usd is None:
-            mcap_usd = self._market_cap_from_tiingo(ticker, as_of)
-            source = "tiingo_fundamentals" if mcap_usd else None
         if mcap_usd is None:
             mcap_usd = self._market_cap_from_fmp(ticker)
             source = "fmp" if mcap_usd else None

@@ -2196,6 +2196,15 @@ def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     Cached for 15 minutes. Synchronous database work runs in FastAPI's worker
     pool so a slow build cannot block the main request event loop.
     """
+    # Background job ``money_map`` (intelligence/api_precompute.py) keeps a
+    # stored copy; the live build below only runs before its first result.
+    from api.precompute_serving import read_precomputed
+
+    stored, meta = read_precomputed("flows.money_map")
+    if stored is not None:
+        stored["precompute"] = meta
+        return _with_provenance(stored, _PROV_MONEY_MAP)
+
     cached = _money_map_cache.get("money_map")
     if cached is not None:
         log.debug("Money map cache hit")

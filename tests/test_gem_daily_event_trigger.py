@@ -150,6 +150,80 @@ def test_main_triggers_on_completion_and_records_lag(armed, monkeypatch) -> None
     assert "GEM_SKIP append-only schema gate" in receipt
 
 
+class _CaptureConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, *_args, **_kwargs):
+        return None
+
+
+class _CaptureEngine:
+    def connect(self):
+        return _CaptureConn()
+
+
+def _capture_run(armed, monkeypatch, failing):
+    """Run main() through capture and VALIDATE; ``failing`` tickers fail."""
+    armed.items = [_event(_at(13, 30, 17), START_MSG), _event(_at(13, 57, 20), DONE_MSG)]
+    monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=_CaptureEngine))
+    monkeypatch.setattr(daily, "_append_only_schema_ok", lambda _e: True)
+
+    class _Puller:
+        def __init__(self, db_engine):
+            pass
+
+        def pull_all(self, tickers, **_kwargs):
+            return [{"ticker": t, "status": "FAILED" if t in failing else "SUCCESS",
+                     "capture_batch_id": None if t in failing else f"b-{t}",
+                     "capture_ordinal": None if t in failing else 7}
+                    for t in tickers]
+
+    monkeypatch.setitem(sys.modules, "ingestion.options", SimpleNamespace(OptionsPuller=_Puller))
+    monkeypatch.setattr(daily, "_validate_batch", lambda _c, t, _d, r: r["status"] == "SUCCESS")
+    return daily.main()
+
+
+def test_main_partial_capture_exits_zero_with_a_partial_record(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND"}) == 0
+    receipt = _receipt(armed)
+    assert "GEM_VALIDATE GLND FAIL batch=None ordinal=None" in receipt
+    assert receipt.count(" PASS batch=b-") == len(daily.GEM_TICKERS) - 1
+    assert (f"GEM_RESULT PARTIAL pass={len(daily.GEM_TICKERS) - 1} fail=1 failed=[GLND]"
+            in receipt)
+
+
+def test_main_all_tickers_failing_still_exits_non_zero(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, set(daily.GEM_TICKERS)) == 1
+    assert (f"GEM_RESULT FAIL pass=0 fail={len(daily.GEM_TICKERS)} "
+            f"failed=[{','.join(daily.GEM_TICKERS)}]") in _receipt(armed)
+
+
+def test_main_full_pass_records_pass_and_exits_zero(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, set()) == 0
+    assert f"GEM_RESULT PASS pass={len(daily.GEM_TICKERS)} fail=0 failed=[]" in _receipt(armed)
+
+
+def test_main_run_error_still_exits_non_zero(armed, monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise RuntimeError("provider down")
+    monkeypatch.setattr(daily, "_validate_batch", boom)
+    armed.items = [_event(_at(13, 30, 17), START_MSG), _event(_at(13, 57, 20), DONE_MSG)]
+    monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=_CaptureEngine))
+    monkeypatch.setattr(daily, "_append_only_schema_ok", lambda _e: True)
+    puller = SimpleNamespace(pull_all=lambda tickers, **_k: [
+        {"ticker": t, "status": "SUCCESS"} for t in tickers])
+    monkeypatch.setitem(sys.modules, "ingestion.options",
+                        SimpleNamespace(OptionsPuller=lambda db_engine: puller))
+    assert daily.main() == 1
+    receipt = _receipt(armed)
+    assert "GEM_FAILED RuntimeError" in receipt
+    assert "GEM_RESULT" not in receipt
+
+
 def test_main_timeout_records_skip_and_never_reaches_provider(armed, monkeypatch) -> None:
     armed.items = [_event(_at(13, 30), START_MSG)] + [("tick", 60)] * 40
     monkeypatch.setitem(sys.modules, "db", SimpleNamespace(

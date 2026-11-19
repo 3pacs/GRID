@@ -383,23 +383,38 @@ class GoogleTrendsPuller(BasePuller):
         (2026-04-13) so the canonical puller owns both the raw_series feature
         pipeline AND the attention_anomaly breakout feed.
 
+        Write contract (fixed 2026-11-09): grid-scheduler recorded every weekly
+        run FAILED "puller did not report committed write count" because this
+        returned only ``entities_pulled`` and ``breakouts`` (the 2026-11-08
+        03:18Z run scanned 48/48 entities and committed one attention_anomaly
+        row). It now returns ``status`` and ``rows_inserted`` (rows the INSERTs
+        added, counted after the transaction committed) plus
+        ``succeeded``/``total`` entity coverage. A breakout already stored for
+        the same entity and day is not stored again, so a same-day re-run
+        writes 0. Failed batches make the run PARTIAL (FAILED when no entity
+        returned data); a 429 stops the remaining batches for this run.
+
         Args:
             lookback_days: Days of history to analyze.
 
         Returns:
-            Dict with entities_pulled count and list of breakout dicts.
+            Write-contract summary with ``status``, ``rows_inserted``,
+            ``succeeded``/``total`` entities, ``entities_pulled`` and the
+            ``breakouts`` detected.
         """
         try:
             from pytrends.request import TrendReq
         except ImportError:
             log.warning("pytrends not installed — skipping watchlist breakouts")
-            return {"error": "pytrends not installed", "entities_pulled": 0}
+            return {"status": "FAILED", "rows_inserted": 0,
+                    "error": "pytrends not installed", "entities_pulled": 0}
 
         try:
             from ingestion.altdata.wikipedia_text import WATCHLIST
         except Exception as exc:
             log.warning("wikipedia_text WATCHLIST import failed: {e}", e=str(exc))
-            return {"error": "WATCHLIST import failed", "entities_pulled": 0}
+            return {"status": "FAILED", "rows_inserted": 0,
+                    "error": "WATCHLIST import failed", "entities_pulled": 0}
 
         from sqlalchemy import text as _text
 
@@ -411,6 +426,7 @@ class GoogleTrendsPuller(BasePuller):
         breakouts: list[dict[str, Any]] = []
         entities_pulled = 0
         entity_names = list(WATCHLIST.keys())
+        errors: list[str] = []
 
         # Google Trends API caps batch size at 5 entities
         for i in range(0, len(entity_names), 5):
@@ -419,6 +435,7 @@ class GoogleTrendsPuller(BasePuller):
                 pytrends.build_payload(batch, timeframe=timeframe)
                 df = pytrends.interest_over_time()
                 if df.empty:
+                    errors.append(f"no interest timeline for {batch}")
                     continue
 
                 for entity in batch:
@@ -441,37 +458,78 @@ class GoogleTrendsPuller(BasePuller):
                                 }
                             )
             except Exception as exc:
-                log.debug(
+                msg = str(exc)
+                log.warning(
                     "Google Trends watchlist batch failed for {b}: {e}",
                     b=batch,
-                    e=str(exc),
+                    e=msg,
                 )
+                errors.append(f"{batch}: {msg[:120]}")
+                if "429" in msg or "too many requests" in msg.lower():
+                    # Same hard backoff as pull_all: more calls only add 429s.
+                    remaining = len(entity_names) - (i + len(batch))
+                    if remaining:
+                        errors.append(f"rate limited: {remaining} entities not attempted")
+                    break
             time.sleep(_RATE_LIMIT_DELAY)
 
+        inserted = 0
         if breakouts:
             with self.engine.begin() as conn:
                 for b in breakouts:
-                    conn.execute(
+                    result = conn.execute(
                         _text(
+                            # attention_anomaly has no natural unique key:
+                            # skip a breakout already stored for this
+                            # entity and day (idx_attention_anomaly_entity).
                             "INSERT INTO attention_anomaly "
                             "(entity_name, anomaly_date, trends_breakout, "
                             "combined_score, source) "
-                            "VALUES (:name, :dt, :ratio, :score, 'trends')"
+                            "SELECT :name, :dt, :ratio, :score, 'trends' "
+                            "WHERE NOT EXISTS (SELECT 1 FROM attention_anomaly "
+                            "WHERE entity_name = :name AND anomaly_date = :dt "
+                            "AND source = 'trends')"
                         ),
                         {
                             "name": b["entity"],
-                            "dt": date.today(),
+                            "dt": end,
                             "ratio": b["breakout_ratio"],
                             "score": min(b["breakout_ratio"] * 25, 100),
                         },
                     )
+                    rowcount = getattr(result, "rowcount", None)
+                    if isinstance(rowcount, int) and rowcount > 0:
+                        inserted += rowcount
+        # Reached only after the transaction committed.
+
+        total = len(entity_names)
+        if not errors and entities_pulled < total:
+            errors.append(f"{total - entities_pulled} of {total} entities missing from the response")
+        if errors:
+            status = "PARTIAL" if entities_pulled else "FAILED"
+        else:
+            status = "SUCCESS"
 
         log.info(
-            "Google Trends watchlist breakouts — {e} entities scanned, {b} breakouts",
+            "Google Trends watchlist breakouts — {e}/{t} entities scanned, "
+            "{b} breakouts, {n} rows stored ({s})",
             e=entities_pulled,
+            t=total,
             b=len(breakouts),
+            n=inserted,
+            s=status,
         )
-        return {"entities_pulled": entities_pulled, "breakouts": breakouts}
+        summary: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": inserted,
+            "succeeded": entities_pulled,
+            "total": total,
+            "entities_pulled": entities_pulled,
+            "breakouts": breakouts,
+        }
+        if errors:
+            summary["error"] = f"{len(errors)} watchlist problems: " + "; ".join(errors[:3])
+        return summary
 
     # Backwards-compat alias so the scheduler's historical registration of
     # GoogleTrendsPuller.pull(...) (from google_trends_puller.py) keeps working.

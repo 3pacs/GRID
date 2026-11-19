@@ -43,13 +43,14 @@ from __future__ import annotations
 
 import json
 import time as _time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from analysis.sec_valuation import trailing_pe
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
 
 
@@ -1687,7 +1688,10 @@ def _score_fed_hawkishness(engine: Engine, accuracy: float) -> dict:
 
 
 def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
-    """Tiingo PE ratio momentum — is the market getting cheap or expensive?
+    """Trailing PE momentum — is the market getting cheap or expensive?
+
+    P/E is price over trailing diluted EPS from filed SEC reports
+    (analysis.sec_valuation; Tiingo fundamentals was retired 2026-11-08).
 
     Tracks aggregate PE ratio changes across major DOW stocks.
     PE expansion = investors paying more per dollar of earnings (risk of overvaluation).
@@ -1703,33 +1707,22 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
             pe_current = []
             pe_30d = []
 
+            today = date.today()
             for ticker in TICKERS:
-                sid = f"TIINGO_FUND:{ticker}:pe_ratio"
-                cur = conn.execute(text(
-                    "SELECT value, obs_date FROM raw_series "
-                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                    "AND value > 0 AND value < 500 "
-                    "ORDER BY obs_date DESC LIMIT 1"
-                ), {"sid": sid}).fetchone()
-
-                prior = conn.execute(text(
-                    "SELECT value FROM raw_series "
-                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                    "AND value > 0 AND value < 500 "
-                    "AND obs_date <= CURRENT_DATE - 30 "
-                    "ORDER BY obs_date DESC LIMIT 1"
-                ), {"sid": sid}).fetchone()
-
-                if cur and float(cur[0]) > 0:
-                    pe_current.append(float(cur[0]))
-                if prior and float(prior[0]) > 0:
-                    pe_30d.append(float(prior[0]))
+                cur = trailing_pe(conn, ticker, today)
+                prior = trailing_pe(conn, ticker, today - timedelta(days=30))
+                # Same 0-500 band as the old Tiingo reads: a near-zero EPS
+                # makes a P/E in the thousands that would swamp the average.
+                if cur is not None and cur.pe < 500:
+                    pe_current.append(cur.pe)
+                if prior is not None and prior.pe < 500:
+                    pe_30d.append(prior.pe)
 
             if len(pe_current) < 3:
                 return _verdict(
                     "valuation_compression", "Valuation Momentum",
                     0, 0, f"only {len(pe_current)} tickers with PE data", "",
-                    "Not enough Tiingo fundamentals data to assess valuations.",
+                    "Not enough filed SEC earnings and recent prices to assess valuations.",
                     status="no_data", historical_accuracy=accuracy,
                 )
 

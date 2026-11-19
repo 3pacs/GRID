@@ -29,7 +29,15 @@ BCB_SERIES: dict[int, str] = {
     # name was ever registered, so no resolved history is affected.
     1: "brazil_usd_brl_fx",      # USD/BRL commercial rate (sell), daily
     3545: "brazil_fx_reserves",  # international reserves, annual
-    7454: "brazil_trade_balance",
+    # 2026-11-09: SGS 7454 dropped. It was never a trade balance: its values
+    # are monthly percentages (0.25, 0.35, -0.10, ... for 2024) and the
+    # series stops at 2025-07-01 (``/dados/ultimos/2`` answered 2025-06 and
+    # 2025-07 on 2026-11-09), so every incremental run came back empty.
+    # SGS 22707 is the BCB's own "Balança comercial - Balanço de Pagamentos -
+    # mensal - saldo" (USD millions; 2026-09 = 6868.8). It is written under a
+    # new raw id so the 90,066 mislabeled 7454 rows already stored as
+    # brazil_trade_balance never mix with it (same rule as codes 1 and 3545).
+    22707: "brazil_trade_balance_bop",
     13761: "brazil_primary_balance_gdp",
 }
 
@@ -42,6 +50,11 @@ _RATE_LIMIT_DELAY: float = 1.0
 # grid-svr 2026-11-04). Daily series are fetched in <=10-year windows.
 _DAILY_SERIES: frozenset[int] = frozenset({1, 11})
 _REVISION_LOOKBACK_DAYS: int = 400
+# SGS answers HTTP 404 with this detail when the window simply holds no
+# observations (a monthly series asked for the last three weeks). Hermes'
+# repair pulls from a recent start, so this was logged as a failure for
+# every non-daily code on every retry (70 warnings/day, 2026-11-07).
+_NO_VALUES_MARKER = "Value(s) not found"
 _MAX_DAILY_WINDOW_YEARS: int = 10
 
 
@@ -94,6 +107,8 @@ class BCBPuller(BasePuller):
         if end_date:
             params["dataFinal"] = self._format_date_br(end_date)
         resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code == 404 and _NO_VALUES_MARKER in (resp.text or ""):
+            return []
         resp.raise_for_status()
         return resp.json()
 
@@ -145,6 +160,11 @@ class BCBPuller(BasePuller):
         try:
             data = self._fetch_windowed(series_code, start_date, end_date)
 
+            if isinstance(data, list) and not data:
+                # Nothing published in the window (SGS 404 "Value(s) not
+                # found", or an empty array): no new data, not a failure.
+                log.info("BCB {fn}: no observations since {sd}", fn=feature_name, sd=start_date)
+                return result
             if not data:
                 result["status"] = "PARTIAL"
                 result["errors"].append("No data returned")
@@ -167,6 +187,13 @@ class BCBPuller(BasePuller):
 
             inserted = 0
             with self.engine.begin() as conn:
+                # New or revised values only. The 1-hour _row_exists window
+                # re-inserted the whole revision lookback every 48h run
+                # (brazil_credit_growth: 95,650 rows for 441 dates,
+                # brazil_trade_balance 90,066 for 369, on 2026-11-09).
+                stored = self._latest_stored_values(
+                    feature_name, conn, start_date=date.fromisoformat(str(start_date)[:10]),
+                )
                 for record in data:
                     if not isinstance(record, dict):
                         # Defensive: skip stray non-dict entries (error
@@ -184,8 +211,9 @@ class BCBPuller(BasePuller):
                         obs_dt = datetime.strptime(date_str, "%d/%m/%Y").date()
                         value = float(valor.replace(",", "."))
 
-                        if self._row_exists(feature_name, obs_dt, conn):
+                        if stored.get(obs_dt) == value:
                             continue
+                        stored[obs_dt] = value
 
                         conn.execute(
                             text(

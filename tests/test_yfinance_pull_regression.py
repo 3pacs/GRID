@@ -773,6 +773,128 @@ def test_wild_ratio_guard_needs_minimum_overlap_before_judging(engine_recording_
     assert result["rows_inserted"] == 1
 
 
+def _split_case(conn, close_values, split_events, *, field="Close"):
+    """Pre-split stored rows (~210) vs a download on the same dates."""
+    dates = [date.today() - timedelta(days=9 - i) for i in range(8)]
+    frame = pd.DataFrame(
+        {field: close_values},
+        index=pd.DatetimeIndex([pd.Timestamp(d) for d in dates], name="Date"),
+    )
+    stored = 3_000_000.0 if field == "Volume" else 210.0
+    existing_rows = [(d, stored + i) for i, d in enumerate(dates)]
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        if "SELECT obs_date, value FROM raw_series" in str(statement):
+            result.fetchall.return_value = existing_rows
+        else:
+            result.fetchall.return_value = []
+        result.fetchone.return_value = None
+        return result
+
+    conn.execute.side_effect = execute
+    return dates, frame
+
+
+def test_wild_ratio_explained_by_a_recent_split_writes_and_records_it(engine_recording_inserts):
+    """ITA 3-for-1 on 2026-11-05: Yahoo's history is divided by 3, so the
+    download reads 0.333 of the stored pre-split prices. That is a split,
+    not a wrong instrument: write the rows and record the split."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    effective = date.today() - timedelta(days=3)
+    dates, frame = _split_case(conn, [(210.0 + i) / 3 for i in range(8)], None)
+    split_events = [(date(2020, 12, 7), 2.0), (effective, 3.0)]
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.YFinancePuller, "_fetch_split_events",
+                      return_value=split_events), \
+         patch.object(yfinance_pull.YFinancePuller, "pull_split_history") as record, \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker(
+            "ITA", start_date=dates[0].isoformat(),
+            end_date=(dates[-1] + timedelta(days=1)).isoformat(),
+        )
+
+    # Before the split, x3 restores as-traded prices (ratio 1 on 6 of the 8
+    # dates); the 2 dates on/after it are left alone, so the median is 1.
+    assert not any("wild median ratio" in e for e in result["errors"]), result["errors"]
+    assert result["rows_inserted"] == 8
+    record.assert_called_once_with("ITA", apply=True)
+
+
+def test_split_explains_volume_in_the_other_direction(engine_recording_inserts):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    effective = date.today()
+    dates, frame = _split_case(conn, [(3_000_000.0 + i) * 3 for i in range(8)], None,
+                               field="Volume")
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.YFinancePuller, "_fetch_split_events",
+                      return_value=[(effective, 3.0)]), \
+         patch.object(yfinance_pull.YFinancePuller, "pull_split_history"), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        result = yfinance_pull.YFinancePuller(engine).pull_ticker(
+            "ITA", start_date=dates[0].isoformat(),
+            end_date=(dates[-1] + timedelta(days=1)).isoformat(),
+        )
+
+    assert result["errors"] == []
+    assert result["rows_inserted"] == 8
+
+
+@pytest.mark.parametrize("splits", [
+    [],                                              # no split at all
+    [(date(2020, 12, 7), 2.0)],                      # only an old split
+    [(date.today() - timedelta(days=3), 2.0)],       # a split that does not match 0.333
+])
+def test_wild_ratio_without_a_matching_recent_split_is_still_refused(engine_recording_inserts, splits):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    dates, frame = _split_case(conn, [(210.0 + i) / 3 for i in range(8)], None)
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.YFinancePuller, "_fetch_split_events", return_value=splits), \
+         patch.object(yfinance_pull.YFinancePuller, "pull_split_history") as record, \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        result = yfinance_pull.YFinancePuller(engine).pull_ticker(
+            "ITA", start_date=dates[0].isoformat(),
+            end_date=(dates[-1] + timedelta(days=1)).isoformat(),
+        )
+
+    assert result["rows_inserted"] == 0
+    assert any("wild median ratio" in e for e in result["errors"])
+    record.assert_not_called()
+
+
+def test_split_lookup_failure_keeps_refusing(engine_recording_inserts):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    dates, frame = _split_case(conn, [(210.0 + i) / 3 for i in range(8)], None)
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.YFinancePuller, "_fetch_split_events",
+                      side_effect=RuntimeError("yahoo down")), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        result = yfinance_pull.YFinancePuller(engine).pull_ticker(
+            "ITA", start_date=dates[0].isoformat(),
+            end_date=(dates[-1] + timedelta(days=1)).isoformat(),
+        )
+
+    assert result["rows_inserted"] == 0
+    assert any("wild median ratio" in e for e in result["errors"])
+
+
 def test_pull_all_skips_when_pg_advisory_lock_held_by_another_process(engine_recording_inserts):
     """Cross-process guard (coordinator review of PR #672): pg_try_advisory_lock
     returning falsy (another OS process already holds it — grid-scheduler

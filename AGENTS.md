@@ -369,3 +369,176 @@ Not done here:
   in those rows is intact and small, only the appendix is large.
 - Not merged, not deployed. Takes effect for new briefings once the release tree is
   updated and grid-intelligence restarts.
+
+## 2026-11-08 — Daily review becomes machine-readable: `review.jsonl` ingest (Claude)
+
+Scope: `scripts/ingest_publication_review.py`, `migrations/versions/pub_review_ingest_20261108.py`
+(`publication_review_runs`, `publication_claim_verdicts`, append-only), unit templates
+`deploy/systemd/grid-publication-review-ingest.{service,timer}.template` (13:05Z),
+`tests/test_ingest_publication_review.py`, runbook section "Review ingest", `.env.example`
+(`GRID_PUBLICATION_REVIEW_ROOT`).
+
+Why: the Oct 5–22 daily reviews were documents in the grader's Library that the operator
+never saw and nothing in GRID consumed ("0 measured outcomes" every day). Operator
+direction 2026-11-07: "everything needs to be machine readable first … the machines will
+be doing the research." The deliverable is now one `review.jsonl` per day
+(`publication-review-verdicts-v1`), bound to the producer's packet by hash and to each
+publication by a verbatim span; this job verifies and ingests it. The file is treated as
+hostile input (another agent writes it): regular-file and size checks before reading,
+per-row isolation, no NUL/NaN/lone-surrogate content reaches the driver, receipts written
+through O_EXCL temp files, no look-ahead grading (evidence and horizons must predate
+`graded_at`).
+
+Decision: no projection into `thesis_postmortems`. An independent review of the first
+draft showed that table is the thesis tracker's wrong-thesis analysis (enum root causes,
+under `THESIS_SCORING_HELD`), and a grader row there would both pollute it and block the
+tracker's own postmortem for that snapshot. `publication_claim_verdicts` is the single
+record; wiring it into the thesis learning loop is the hold owner's decision.
+
+Verification and limits:
+
+- 101 offline tests (fake engine that enforces bind names, int4 range, jsonb validity, NUL,
+  span length and the UNIQUE review hash, with rollback on failure) + alembic single-head +
+  systemd invariants pass locally.
+- Not verified here: the grader's first `review.jsonl` (its owner adopts the schema), the
+  reverse mirror leg, the first scheduled ingest on grid-svr. Those are the runbook's
+  acceptance chain. No row is ever updated: a correction is a new review file.
+
+## 2026-11-08 — Daily review grader moves in-repo; chain reports on itself (Claude)
+
+Anik, after the whole packet → ingest chain was live but idle waiting for the external
+daily-review agent to be nudged: "what are the weak link bottle necks that we can harden so i
+dont need to nudge anything" → "yeah do that". The only link that needed a nudge was the only
+one that was not a scheduled job.
+
+Changes:
+
+- `scripts/grade_publication_review.py` (+ `tests/test_grade_publication_review.py`): the
+  grader is a oneshot on grid-svr (11:35Z, `deploy/systemd/grid-publication-review-grader.*`).
+  Deterministic core: thesis direction calls graded against SPY split-adjusted closes with the
+  thesis tracker's own 3-day/±0.5 % rule; records whose narrative was withheld get one
+  `unscorable` `data_quality` row (the real Nov 4–7 packets are 100 % such records for
+  briefings and the diary — that is now measured, not hidden). Records with a narrative go
+  through claim extraction on `llm.router` (tier configurable; "better models until the
+  workflow is tight" is an env var, not an agent); extracted direction/level claims are graded
+  from closes, causal/event stay unresolved. Every row is built to the ingest's contract and the
+  tests push each produced file through the real ingest validators. Re-grades for 10 days so
+  every horizon up to a week resolves; a file is rewritten only when verdicts change; the grader hands the file to
+  the ingest in-process. Smoke-run on the real Nov 7 packet: 31 rows, 0 rejected.
+  An independent review (code-reviewer subagent) found and this PR fixed before merge: the
+  narrative window cut at the generator's own narrative headings; level claims on index aliases
+  compared against ETF prices; list-valued model JSON crashing a day; a failed re-ingest never
+  retried; neutral-vs-move not matching the tracker's "partial"; week horizons outside the
+  lookback; a stale baseline close silently accepted; the cache never invalidating on model change.
+- `scripts/ingest_publication_review.py`: `MAX_PACKET_BYTES` (64 MB) for packet.json. The 8 MB
+  review-file cap also applied to packets and would have refused every real day (7–24 MB);
+  found by the smoke run above, never by the 101 fixture tests.
+- `store/publication_review_status.py` + `api/routers/system.py::health`:
+  `checks.publication_review` with the latest packet day on disk and the latest ingested review
+  day; a named `degraded_reasons` entry when either is older than two days. Table-existence
+  probe first, never raises, missing tree/table = not configured.
+- `scripts/check_systemd_unit_drift.sh` + a push-deploy step (`--sync --strict`): installed
+  units whose template opts in with `# deploy-sync: managed` and differ from it are reinstalled and
+  daemon-reloaded; every other installed unit is compared and reported only (grid-e2-scoreboard's
+  deliberate dedicated-user deviation stays). Never installs a new unit, never touches drop-ins,
+  never restarts a running service, reports `name@.service` without syncing; remaining drift is a
+  workflow warning.
+  Closes the class behind the packet unit running a day without its public-tree env.
+
+Decisions and limits: the external agent's reverse mirror leg (`grid-publication-review-push`)
+is retired — two writers of `review.jsonl` would race; the pull mirror is retired with it
+(agents read the public tree on grid-svr). First install of the grader timer is the operator's
+`sudo install` (unchanged rule). Not verified here: the first scheduled run on grid-svr, the
+LLM extraction path against a live provider (no narrative exists in any current packet to
+extract from), and the deploy-time unit sync on the real host.
+
+## 2026-11-09 — Review visible to every agent; briefing figures graded (Claude)
+
+Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/grade_publication_review.py`:
+
+- Visibility: the review root is under `/home/grid/research` (0700, home 0750), so Codex on
+  Alien could read the packets but never the review. The grader now copies `review.jsonl`,
+  `grader-receipt.json` and `ingest-receipt.json` (allow-list, bytes unchanged, 0644) to
+  `/data/grid/outputs/publication-reviews/<D>/` on every WRITTEN or UNCHANGED day. The 10-day
+  lookback re-publishes the backlog on the next scheduled run; no manual step.
+- Every briefing was unscorable: the narratives state current levels and never forecast
+  (gridz4 extraction returns `[]` correctly). Each stated level on a series the generator reads
+  is now a `data_quality` row graded against what GRID knew at the publication instant (the
+  generator's own Yahoo reader, `read_latest(as_of_ts=stated_at)` for FRED). Nov 4-7 narratives
+  carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
+  the wrong clock for grading a past publication.
+
+
+
+## 2026-11-09 - Bound Oracle actor evidence and preserve source lineage
+
+The actor bridge now rejects aggregate/feed identities, normalizes only explicit
+bull/bear directions, applies observation-date and ingestion-availability bounds,
+and selects one latest-date vote per actor/source channel. Unknown or conflicting
+latest-day directions withhold the group; zero-trust actors cannot add coherence
+votes. No historical rows or runtime settings are changed.
+
+Actor freshness remains unknown at exact-hour precision. Reports distinguish the
+stored observation DATE, calendar-age lower bound and ingestion availability.
+Used row/source refs and scoring effects are kept in a small receipt in the same
+signals JSON value that the existing upsert replaces atomically. Candidate detail
+is explicitly sampled, complete used support is bounded, and an oversized receipt
+fails closed before any weight mutation. The existing confidence/target upsert
+policy and other signal families' freshness behavior remain outside this patch.
+
+Synthetic regression coverage includes direction, repeated/conflicting rows,
+identifier rejection, clock boundaries, actual SQL selection, size limits,
+atomic no-mutation failure, scoring/coherence and insert/update receipt retention.
+Focused bridge/Oracle/report tests passed locally. Broader compatible Oracle tests
+also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
+No production access, send, generator, migration, service change, merge or deploy.
+See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.
+
+## 2026-11-14 — Integrate accepted offline NVDA desk report
+
+Additive #1085 report mode joins the existing frozen ledger, historical cash
+reconciliation and #1204 evidence labels. The accepted kit's five files are
+byte-identical; its bundle availability floor is preserved. 111 offline tests,
+Ruff and exact report reproduction pass on the integration base c19920e9.
+No recognition/valuation/trade result is fabricated: seven candidates remain
+unusable. Frozen v2, legacy scenarios and the Nov18 comparison are unchanged.
+See docs/research/r3-nvda/desk-report-v1.md. Full CI pending; Claude verifies final
+kit and Anik applies releases. No production or holdout changes.
+
+## 2026-11-17 - per-ticker social series: Bluesky cashtags, ApeWisdom Reddit boards, dormant Reddit Data API (source only)
+
+What was done:
+
+- `SocialSentimentPuller.pull_ticker_series` and a SmartScheduler entry `social_ticker_series` (12 h, timeout 900 s, catalog row `SocialSentiment`). It writes numeric `BSKY:*`, `APEWISDOM:*` and (with an owner app) `REDDIT:*` raw_series per UTC fetch date; FinBERT (local) scores up to 100 cashtag posts per ticker.
+- entity_map: `REDDIT:<sub>:active_users` / `subscribers` map to the 2026-03-21 `reddit_<sub>` / `reddit_<sub>_subs` features. `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Reddit closed logged-out access on 2026-11-17 (~17:50Z): `.rss` answers an Atom "Not Found" (404), `.json` 403, old.reddit redirects to login; seen from grid-svr and a second network. smart_money and reddit_options_pulse have failed since. No scraping workaround: the Data API (owner app) is the only sanctioned route; ApeWisdom is the working Reddit-derived feed.
+- Bluesky logged-out `searchPosts` refuses every cursor page with 403 "forbidden by administrative rules". The puller reads one page and does not slice by `until` to get around it; a page that fills inside 24 h is stored as a rate (`posts_per_hour`) over its span, never as a 24 h count.
+- Bluesky search ignores `$` (a `$KO` query returned no Coca-Cola posts), so only literal cashtags count.
+
+Broken or TBD:
+
+- Needs merge + deploy; the job then runs on the next SmartScheduler tick. Reddit board stats need REDDIT_CLIENT_ID/SECRET from an owner-registered app.
+- smart_money / reddit_options_pulse / social_port_activity Reddit legs stay dead until the Data API is configured; not changed here.
+
+## 2026-11-18 - Reddit back on free community APIs: Arctic Shift (posts/comments) + Tradestie (WSB sentiment) (source only)
+
+What was done:
+
+- New `ingestion/altdata/arctic_shift.py`: an HTTP-only client for the Arctic Shift archive API (free, no key, minutes behind Reddit when probed from grid-svr). Fixed host, redirects refused, 4 MB body cap, strict `{"data": [...]}`, typed and bounded fields, one cross-process lock spacing requests 2 s apart, a single bounded wait on 429 (`X-RateLimit-Reset`) and on the "Timeout" 422.
+- `smart_money` (SmartScheduler now hourly, was 10 min), `reddit_options_pulse` (daily thread + newest 500 comments) and `social_sentiment.pull_all` (10 newest posts per board) read Arctic Shift instead of the 404 Reddit RSS feeds.
+- `pull_ticker_series` gains `ARCTICSHIFT:*` (per-board posts/comments volume, per-board ticker post counts, FinBERT per ticker over Reddit posts) and `TRADESTIE:wallstreetbets:*` (Tradestie's top-50 comment counts and its own sentiment score for the previous US/Eastern day). `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Candidates checked from grid-svr on 2026-11-18: PullPush answers 429 "does not provide free scraping resources for agents" (rejected: it refuses this use); SwaggyStocks has no public API (a JS dashboard; scraping it would mean browser automation); Apify/RapidAPI wrappers need an account; GitHub "no auth Reddit" wrappers call the dead `.json` endpoints. Arctic Shift's aggregate endpoints read 0 for every recent hour (they lag days), so counts come from records; its full-text title search on r/wallstreetbets mostly times out, so the daily thread is picked from the newest posts by title prefix.
+- Arctic Shift re-reads scores about 36 h after a post; younger posts report `score` None rather than the archive's 0/1 (or an early large number), so no score logic ever sees an unsettled post. A security review flagged that this leaves smart_money's score gate inert (one throwaway account could seed a signal). Gates now: (a) at least two distinct authors per (ticker, direction) in the pull, and (d) unscored signals are stored in raw_series with `trust_tier: "unscored"` but kept out of `signal_sources` (the downstream smart_money / social streams) until corroborated across time (`trust_tier: "unscored_promoted"`). A second review found the first version split "prior" from "now" by row `pull_timestamp`, so re-pulled posts could count twice. Promotion now works on post creation time: fresh posts are this pull's posts no earlier run stored (by `post_id`, now kept in the payload, or author + text hash for older rows); prior authors come from stored posts created at least 6 h before the earliest fresh post (within 48 h); promotion needs two or more prior authors and a fresh post by someone else. Arctic Shift exposes no account creation time, so there is no account-age gate.
+- reddit_options_pulse picked the daily thread by title prefix alone, newest first, so a user post with the same title could be taken. It now also requires the posting account: u/verified-trader (the board's moderator account; live check 2026-11-18 showed it posted the last three daily threads, `distinguished="moderator"` on the "Moves Tomorrow" ones, none on the daily one) or AutoModerator (earlier years), and takes the first such post of the newest day. AutoModerator alone would match nothing today. `stickied` cannot be requested as a field from Arctic Shift, and `distinguished` is absent on the daily thread, so neither is required.
+- Tradestie is asked for the finished previous US/Eastern day and stored once per Tradestie day (`tradestie_date` in the payload); obs_date stays the fetch date.
+
+Broken or TBD:
+
+- Needs merge + deploy (SmartScheduler picks up smart_money's hourly cadence and the new legs; intelligence scheduler's 22:00 options pulse uses the new fetch). No activation step.
+- Arctic Shift publishes no uptime guarantee; a 429/422 burst shows as PARTIAL/FAILED in pull_log, never as zero rows passed off as data.

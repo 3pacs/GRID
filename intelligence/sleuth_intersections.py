@@ -14,8 +14,25 @@ alone is never a lead. Families (``classify_signal``):
 * ``insider``           Form 4 buys / sells (``insider``, ``quiverquant:insider``)
 * ``congress``          congressional trades
 * ``gov_contract``      contract awards (up)
-* ``retail_sentiment``  WSB / reddit positioning
-* ``price_move``        a robust excess-return anomaly vs SPY (``robust_z``)
+* ``retail_sentiment``  reddit positioning (``smart_money``); QuiverQuant WSB
+  is left out while its snapshot is frozen (``_FROZEN_SOURCES``)
+* ``price_move``        a robust excess-return anomaly vs SPY (``robust_z``);
+  context only, never one of the agreeing families (construction v2 below)
+
+Construction v2 (pre-registered 2026-11-08 22:22Z in the research-desk plan,
+after the first night's ten leads; every lead records it in its evidence):
+
+1. ``price_move`` is context: it neither makes nor blocks a lead. It is
+   usually the market's reaction to the other family (ADI, MSFT, CACI).
+2. QuiverQuant insider rows vote only for open-market purchases (code P, up)
+   and sales (code S, down), as the SEC feed already does. Grants,
+   exercises, tax withholding and gifts are not evidence: the insider "buys"
+   behind BAH and KBR were $0 stock grants (code A).
+3. One insider vote per (insider, day, direction), whichever feed carries
+   it and however many fills it has (one ADI sale was one SEC row and 20
+   QuiverQuant fills). The SEC puller's ``CLUSTER_BUY`` rows are summaries
+   of buys already counted, so they cast no vote (amendment registered
+   2026-11-08 before the first v2 run).
 
 Every observation carries its citation (table and row key) and was recorded
 by ``as_of`` (``created_at <= as_of``): rows dated in the future or written
@@ -28,6 +45,13 @@ Every investigation ends in a declared outcome (``investigate_intersection_lead`
   ``HYPOTHESIS_MIN_MOVE_PCT``), scored once by the v2 trial scorer
   (``intelligence.hypothesis_trials``, #1008) on data after it was declared
 * ``dead_end``             with its reason
+
+Every saved lead also gets an ``intersection_baseline`` hypothesis the moment it
+is saved, whatever its investigation decides (:func:`declare_missing_baselines`;
+hypothesis generator v2, replacing the legacy detectors in
+``intelligence.hypothesis_engine``). Same test, same window, no review: the
+baseline is the control that shows whether the LLM's choice of leads to declare
+beats declaring them all.
 
 The LLM may veto a lead (dead end, with a reason) or write its narrative. It
 never chooses the ticker, direction, window or threshold of the test.
@@ -48,11 +72,16 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from intelligence.actor_identity import is_placeholder_ticker
 
 # ── Constants (pre-registered; change only in a reviewed commit) ────────────
 
 WINDOW_DAYS = 7               # observations must fall inside the 7 days to as_of
 MIN_FAMILIES = 2              # independent families agreeing on a direction
+CONSTRUCTION = "v2"           # lead-construction rules; see the module docstring
+CONTEXT_FAMILIES = frozenset({"price_move"})  # cited, never counted for or against
 MAX_NEW_LEADS = 20            # per run; the daily budget for LLM investigations
 LEAD_COOLDOWN_DAYS = 7        # one open intersection lead per (ticker, direction)
 MAX_PRICE_CANDIDATES = 40     # tickers whose closes are read per run
@@ -68,6 +97,8 @@ MAX_PLAUSIBLE_DAILY_MOVE = 0.5  # |log return| above this is a data error, not a
 HYPOTHESIS_WINDOW_DAYS = 14   # the v2 ticker test's window (DEFAULT_WINDOW_DAYS)
 HYPOTHESIS_MIN_MOVE_PCT = 2.0  # the v2 ticker test's raw-move floor (DEFAULT_MIN_MOVE_PCT)
 HYPOTHESIS_PATTERN = "sleuth_intersection"
+BASELINE_PATTERN = "intersection_baseline"  # every lead, declared without review
+BASELINE_CATCHUP_DAYS = 3     # leads this recent get a missing baseline declared
 
 ORIGIN = "intersection"
 OUTCOME_DECLARED = "hypothesis_declared"
@@ -82,7 +113,7 @@ def is_testable_ticker(ticker: str) -> bool:
     """US-listed and not crypto: what the v2 ticker test can score."""
     return bool(_US_TICKER.match(ticker)) and not _CRYPTO_TICKER.match(ticker)
 
-_UP = {"BUY", "UNUSUAL_BUY", "CLUSTER_BUY", "INSIDER_BUY", "CONTRACT_AWARD", "WSB_BULLISH"}
+_UP = {"BUY", "UNUSUAL_BUY", "INSIDER_BUY", "CONTRACT_AWARD", "WSB_BULLISH"}
 _DOWN = {"SELL", "UNUSUAL_SELL", "INSIDER_SELL", "WSB_BEARISH"}
 _FAMILY_BY_SOURCE = {
     "options_flow": "options_flow",
@@ -91,9 +122,15 @@ _FAMILY_BY_SOURCE = {
     "congressional": "congress",
     "gov_contract": "gov_contract",
     "quiverquant:gov_contracts": "gov_contract",
-    "quiverquant:wsb": "retail_sentiment",
     "smart_money": "retail_sentiment",
 }
+# Sources that cast no vote because they carry no information. QuiverQuant's
+# /live/wallstreetbets has returned the same 307 records on every pull since
+# 2026-04-03 (one distinct snapshot over 133 signal dates, 0 day-to-day
+# changes); each pull is stamped with that day's date, so a fixed April
+# ticker list looked like fresh retail sentiment. It made 324 of the 348 Jun-Oct
+# backtest leads. Restore it here once its snapshots change from day to day.
+_FROZEN_SOURCES = frozenset({"quiverquant:wsb"})
 
 
 # ── Pure parts ─────────────────────────────────────────────────────────────
@@ -107,6 +144,7 @@ class Observation:
     obs_date: date
     citation: dict[str, Any]
     magnitude: float | None = None
+    actor: str | None = None  # insider filer, for one vote per (insider, day, direction)
 
 
 @dataclass(frozen=True)
@@ -142,6 +180,7 @@ class IntersectionLead:
     agree: list[FamilyVote]
     dissent: list[FamilyVote] = field(default_factory=list)
     split: list[FamilyVote] = field(default_factory=list)
+    context: list[FamilyVote] = field(default_factory=list)
 
     @property
     def families(self) -> list[str]:
@@ -167,15 +206,16 @@ class IntersectionLead:
     def evidence(self) -> list[dict[str, Any]]:
         """One summary row per family (its up/down counts), then up to
         ``MAX_CITATIONS_PER_FAMILY`` cited rows from each agreeing family."""
-        out: list[dict[str, Any]] = []
+        out: list[dict[str, Any]] = [{"role": "construction", "kind": "construction",
+                                       "version": CONSTRUCTION}]
         for role, votes in (("agrees", self.agree), ("dissents", self.dissent),
-                            ("split", self.split)):
+                            ("split", self.split), ("context", self.context)):
             for v in votes:
                 out.append({"role": role, "kind": "family_vote", "family": v.family,
                             "ticker": self.ticker,
                             "direction": self.direction if role == "agrees" else v.direction,
                             "up": v.up, "down": v.down})
-        for v in self.agree:
+        for v in self.agree + self.context:
             rows = sorted((o for o in v.rows if o.direction == self.direction),
                           key=lambda o: (o.obs_date, -abs(o.magnitude or 0)), reverse=True)
             for o in rows[:MAX_CITATIONS_PER_FAMILY]:
@@ -199,7 +239,15 @@ def classify_signal(source_type: str | None, signal_type: str | None,
         except (TypeError, ValueError):
             value = None
     stype = (signal_type or "").strip().upper()
-    if family == "options_flow":
+    if stype == "CLUSTER_BUY":
+        # A summary of insider buys whose own rows already vote (v2 rule 3).
+        return None
+    if (source_type or "").strip().lower() == "quiverquant:insider":
+        # Only open-market trades, as in the SEC feed (construction v2 rule 2).
+        code = (str(value.get("TransactionCode") or "").strip().upper()
+                if isinstance(value, dict) else "")
+        direction = {"P": "up", "S": "down"}.get(code)
+    elif family == "options_flow":
         raw = str((value or {}).get("direction", "")).upper() if isinstance(value, dict) else ""
         direction = {"CALL": "up", "PUT": "down"}.get(raw)
     elif family == "retail_sentiment" and stype not in _UP | _DOWN:
@@ -278,13 +326,16 @@ def price_observation(ticker: str, returns: list[tuple[date, float]],
 def find_intersections(observations: list[Observation], window_end: date,
                        min_families: int = MIN_FAMILIES) -> list[IntersectionLead]:
     """Tickers where ``min_families`` family votes agree on a direction and
-    outnumber the families voting the other way."""
+    outnumber the families voting the other way. ``CONTEXT_FAMILIES`` count
+    for neither side; their votes ride along as context."""
     by_ticker: dict[str, list[Observation]] = {}
     for o in observations:
         by_ticker.setdefault(o.ticker, []).append(o)
     leads: list[IntersectionLead] = []
     for ticker, obs in sorted(by_ticker.items()):
-        votes = family_votes(obs)
+        all_votes = family_votes(obs)
+        context = [v for v in all_votes if v.family in CONTEXT_FAMILIES]
+        votes = [v for v in all_votes if v.family not in CONTEXT_FAMILIES]
         split = [v for v in votes if v.direction is None]
         for direction in ("up", "down"):
             agree = [v for v in votes if v.direction == direction]
@@ -293,7 +344,7 @@ def find_intersections(observations: list[Observation], window_end: date,
                 continue
             leads.append(IntersectionLead(ticker=ticker, direction=direction,
                                           window_end=window_end, agree=agree,
-                                          dissent=dissent, split=split))
+                                          dissent=dissent, split=split, context=context))
     leads.sort(key=lambda lead: (-lead.priority, lead.ticker))
     return leads
 
@@ -315,7 +366,8 @@ def collect_signal_observations(conn: Any, window_start: date, window_end: date,
                                 as_of_ts: datetime) -> list[Observation]:
     """Directional ``signal_sources`` rows known by ``as_of_ts``. One
     observation per (family, ticker, direction) is enough for the
-    intersection; every row is kept as a citation."""
+    intersection; every row is kept as a citation, except that insider rows
+    collapse to one per (insider, day, direction) (:func:`dedupe_insider_rows`)."""
     rows = conn.execute(_SIGNALS_SQL, {
         "start": window_start, "end": window_end, "as_of_ts": as_of_ts,
         "sources": sorted(_FAMILY_BY_SOURCE),
@@ -324,7 +376,7 @@ def collect_signal_observations(conn: Any, window_start: date, window_end: date,
     for rid, source_type, source_id, ticker, sdate, stype, svalue in rows:
         cls = classify_signal(source_type, stype, svalue)
         tick = (ticker or "").strip().upper()
-        if cls is None or not tick:
+        if cls is None or is_placeholder_ticker(tick):  # Form 4 "NONE" rows before the puller fix
             continue
         family, direction = cls
         obs_date = sdate.date() if isinstance(sdate, datetime) else sdate
@@ -333,8 +385,46 @@ def collect_signal_observations(conn: Any, window_start: date, window_end: date,
             citation={"table": "signal_sources", "id": int(rid), "source_type": source_type,
                       "source_id": str(source_id) if source_id is not None else None,
                       "signal_type": stype},
+            actor=insider_actor(source_type, source_id, svalue) if family == "insider" else None,
         ))
-    return out
+    return dedupe_insider_rows(out)
+
+
+def insider_actor(source_type: str | None, source_id: Any, signal_value: Any) -> str | None:
+    """The filer's name, normalised so both feeds agree: the SEC feed keeps it
+    in ``source_id``, QuiverQuant in ``signal_value['Name']`` (its source_id is
+    a per-fill key). None when no name is recorded."""
+    if (source_type or "").strip().lower() == "quiverquant:insider":
+        value = signal_value
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                value = None
+        raw = value.get("Name") if isinstance(value, dict) else None
+    else:
+        raw = source_id
+    key = " ".join(re.sub(r"[^0-9a-z ]", " ", str(raw or "").casefold()).split())
+    return key or None
+
+
+def dedupe_insider_rows(observations: list[Observation]) -> list[Observation]:
+    """One insider observation per (ticker, insider, day, direction), the SEC
+    row first when both feeds carry it (construction v2 rule 3). Rows with no
+    filer name and other families pass through unchanged."""
+    def key(o: Observation) -> tuple[str, str, date, str] | None:
+        return (o.ticker, o.actor, o.obs_date, o.direction) if o.family == "insider" and o.actor else None
+
+    def rank(o: Observation) -> tuple[int, int]:
+        return (0 if o.citation.get("source_type") == "insider" else 1,
+                int(o.citation.get("id") or 0))
+
+    keep: dict[tuple[str, str, date, str], Observation] = {}
+    for o in observations:
+        k = key(o)
+        if k is not None and (k not in keep or rank(o) < rank(keep[k])):
+            keep[k] = o
+    return [o for o in observations if (k := key(o)) is None or keep[k] is o]
 
 
 def collect_price_observations(conn: Any, tickers: list[str], window_start: date,
@@ -422,9 +512,83 @@ def generate_intersection_leads(engine: Engine, as_of: datetime | None = None,
         ))
         seen.add((lead.ticker, lead.direction))
         saved.append(lead.lead_id)
-    log.info("Sleuth intersections: {n} candidates, {s} new leads (as_of {d})",
-             n=len(leads), s=len(saved), d=window_end)
+    try:
+        baselines = declare_missing_baselines(
+            engine, since=as_of_ts - timedelta(days=BASELINE_CATCHUP_DAYS))
+    except SQLAlchemyError as exc:
+        # The leads are saved (and in cooldown): their investigations must still
+        # be queued. The next run declares the missing baselines.
+        log.warning("Sleuth intersections: baseline declaration failed: {e}", e=str(exc))
+        baselines = []
+    log.info("Sleuth intersections: {n} candidates, {s} new leads, {b} baselines declared "
+             "(as_of {d})", n=len(leads), s=len(saved), b=len(baselines), d=window_end)
     return saved
+
+
+# ── Baseline: every lead declared, no review (hypothesis generator v2) ──────
+
+_RECENT_LEADS_SQL = text("""
+    SELECT id, question, evidence FROM investigation_leads
+    WHERE origin = :origin AND created_at >= :since
+    ORDER BY created_at ASC, id ASC
+""")
+
+
+def evidence_direction(evidence: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """(ticker, direction) a lead's agreeing evidence names, or None."""
+    pairs = {(str(e.get("ticker")), str(e.get("direction")))
+             for e in evidence if isinstance(e, dict) and e.get("role") == "agrees"}
+    return next(iter(pairs)) if len(pairs) == 1 else None
+
+
+def baseline_id(lead_id: str) -> str:
+    return f"hyp_base_{lead_id.removeprefix('LEAD-INTX-')}"
+
+
+def declare_baseline(conn: Any, lead_id: str, question: str,
+                     evidence: list[dict[str, Any]]) -> str | None:
+    """Insert the lead's unreviewed forward test, or None when the lead names no
+    single testable (ticker, direction). Idempotent: the id comes from the lead.
+    The test is the one a Sleuth declaration gets (ticker, the lead's direction,
+    ``HYPOTHESIS_WINDOW_DAYS``, ``HYPOTHESIS_MIN_MOVE_PCT``); ``created_at`` is now."""
+    pair = evidence_direction(evidence)
+    if pair is None or not is_testable_ticker(pair[0]):
+        return None
+    ticker, direction = pair
+    hyp_id = baseline_id(lead_id)
+    criteria = {"ticker": ticker, "window_days": HYPOTHESIS_WINDOW_DAYS,
+                "min_move_pct": HYPOTHESIS_MIN_MOVE_PCT, "expected_direction": direction,
+                "source": BASELINE_PATTERN, "lead_id": lead_id}
+    thesis = (f"BASELINE: {ticker} moves {direction} at least {HYPOTHESIS_MIN_MOVE_PCT:g}% "
+              f"over {HYPOTHESIS_WINDOW_DAYS} days after independent sources agreed, "
+              f"declared without review ({question[:160]})")
+    result = conn.execute(text("""
+        INSERT INTO discovered_hypotheses
+            (id, thesis, pattern_type, evidence, test_criteria,
+             invalidation, confidence, status, role, pair_id)
+        VALUES
+            (:id, :thesis, :ptype, CAST(:evidence AS JSONB), CAST(:criteria AS JSONB),
+             :inv, 0.5, 'active', 'thesis', :id)
+        ON CONFLICT (id) DO NOTHING
+    """), {"id": hyp_id, "thesis": thesis, "ptype": BASELINE_PATTERN,
+           "evidence": json.dumps(evidence, default=str),
+           "criteria": json.dumps(criteria),
+           "inv": "No move in the declared direction against the same-window crowd."})
+    return hyp_id if result.rowcount > 0 else None
+
+
+def declare_missing_baselines(engine: Engine, since: datetime) -> list[str]:
+    """Declare the baseline of every intersection lead saved since ``since`` that
+    has none yet. Returns the ids inserted."""
+    out: list[str] = []
+    with engine.begin() as conn:
+        for lead_id, question, evidence in conn.execute(
+                _RECENT_LEADS_SQL, {"origin": ORIGIN, "since": since}).fetchall():
+            items = evidence if isinstance(evidence, list) else json.loads(evidence or "[]")
+            hyp_id = declare_baseline(conn, str(lead_id), str(question or ""), items)
+            if hyp_id:
+                out.append(hyp_id)
+    return out
 
 
 # ── Investigation: every lead ends in a declared outcome ────────────────────
@@ -462,9 +626,7 @@ def _parse_verdict(response: str | None) -> dict[str, str] | None:
 
 def _lead_direction(lead: Any) -> tuple[str, str] | None:
     """(ticker, direction) the lead's agreeing evidence names, or None."""
-    pairs = {(str(e.get("ticker")), str(e.get("direction")))
-             for e in lead.evidence if isinstance(e, dict) and e.get("role") == "agrees"}
-    return next(iter(pairs)) if len(pairs) == 1 else None
+    return evidence_direction(lead.evidence)
 
 
 def declare_hypothesis(conn: Any, lead: Any, ticker: str, direction: str,

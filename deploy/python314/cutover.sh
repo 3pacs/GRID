@@ -26,6 +26,7 @@ UNITS=(
   grid-dollar-flows grid-e2-scoreboard grid-fleet-heartbeat grid-flow-materializer grid-gem-watchlist-coverage
   grid-godview-cftc grid-godview-fed grid-hypothesis-forward-log grid-market-diary grid-regime-state-vectors
   grid-spider grid-walk-forward-daily grid-walk-forward-weekly
+  grid-dealer-gex-daily grid-market-state
 )
 
 # Never restarted by this script: deploy.yml requires an explicit human acknowledgement before interrupting the

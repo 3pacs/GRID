@@ -88,15 +88,16 @@ class TestCadenceForSource:
 
 
 class TestIsExcluded:
-    def test_exclusion_set_starts_empty(self):
-        # No existing exclusion-hook mechanism was found in the codebase,
-        # so this fix leaves retired-row deactivation to the owner (audit
-        # §5 item 4) rather than inventing one and silently populating it.
-        assert cadence.RETIRED_SOURCE_EXCLUSIONS == frozenset()
+    def test_exclusion_set_holds_only_owner_retired_sources(self):
+        # Populated only with owner sign-off (audit §5 item 4):
+        # tiingo_fundamentals was retired by the owner on 2026-11-08.
+        assert cadence.RETIRED_SOURCE_EXCLUSIONS == frozenset({"tiingo_fundamentals"})
+        assert cadence.is_excluded(" TIINGO_FUNDAMENTALS ") is True
 
-    def test_nothing_is_excluded_by_default(self):
+    def test_nothing_else_is_excluded(self):
         assert cadence.is_excluded("GDELT_BULK") is False
         assert cadence.is_excluded("any_source") is False
+        assert cadence.is_excluded("TIINGO") is False
 
 
 class TestHfArchiveCadence:

@@ -28,15 +28,18 @@ def _names_registered_by_0063() -> set[str]:
 
 
 class TestCryptoSpotMappings:
-    def test_btc_and_eth_close_and_adj_close_are_mapped(self):
+    def test_btc_and_eth_close_are_mapped_and_adj_close_is_not(self):
         # Volume was mapped; price was not, so the daily close went nowhere.
+        # Since 2026-11-08 one price field feeds a feature: crypto has no
+        # corporate actions, so ``close`` is the basis and ``adj_close``
+        # (identical at Yahoo) is deliberately unmapped (PRICE BASIS POLICY).
         for sid, target in [
             ("YF:BTC-USD:close", "btc_usd_full"),
-            ("YF:BTC-USD:adj_close", "btc_usd_full"),
             ("YF:ETH-USD:close", "eth_usd_full"),
-            ("YF:ETH-USD:adj_close", "eth_usd_full"),
         ]:
             assert ALL_MAPPINGS.get(sid) == target, f"{sid} should map to {target}"
+        for sid in ("YF:BTC-USD:adj_close", "YF:ETH-USD:adj_close"):
+            assert sid not in ALL_MAPPINGS, f"{sid} would put a second basis into the feature"
 
     def test_volume_mappings_are_not_disturbed(self):
         assert ALL_MAPPINGS["YF:BTC-USD:volume"] == "btc_total_volume"

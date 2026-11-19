@@ -141,7 +141,6 @@ SOURCE_CADENCE_OVERRIDES: dict[str, Cadence] = {
     # 2D -- genuinely stale or broken writers (real cadence recorded so
     # they still trip the alert, honestly, instead of via the wrong reason)
     "open_meteo": DAILY,
-    "tiingo_fundamentals": DAILY,
     "finviz_fundamentals": DAILY,
     # Owner-approved archive: weekly revision checks, not live news.
     "hf_financial_news": WEEKLY,
@@ -168,7 +167,10 @@ SOURCE_CADENCE_OVERRIDES: dict[str, Cadence] = {
 # and is not populated by this change. An operator who gets owner sign-off
 # to suppress these from the alert (without flipping `active`) can list
 # their lowercased names here.
-RETIRED_SOURCE_EXCLUSIONS: frozenset[str] = frozenset()
+#
+# tiingo_fundamentals: retired by the owner 2026-11-08 (SmartScheduler
+# hold_reason); its rows stop on purpose, so staleness is not an alert.
+RETIRED_SOURCE_EXCLUSIONS: frozenset[str] = frozenset({"tiingo_fundamentals"})
 
 
 def cadence_for_source(

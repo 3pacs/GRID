@@ -202,8 +202,13 @@ class OpenSecretsPuller(BasePuller):
             Summary with counts per category.
         """
         if not self.api_key:
+            # Missing configuration is SKIPPED (pipeline-health skipped_config),
+            # not a FAILED run -- same contract as JQuants. The source is
+            # unscheduled since 2026-11-04 (owner retirement); this keeps a
+            # manual or revived run honest.
             log.warning("OPENSECRETS_API_KEY not configured — skipping pull")
-            return {"error": "no_api_key", "records": 0}
+            return {"status": "SKIPPED", "reason": "OPENSECRETS_API_KEY not configured",
+                    "records": 0, "rows_inserted": 0}
 
         today = date.today()
         records = 0
@@ -301,4 +306,4 @@ class OpenSecretsPuller(BasePuller):
             "OpenSecrets pull complete: {r} records, {e} errors",
             r=records, e=errors,
         )
-        return {"records": records, "errors": errors, "status": "SUCCESS"}
+        return {"records": records, "rows_inserted": records, "errors": errors, "status": "SUCCESS"}

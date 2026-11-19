@@ -193,6 +193,16 @@ def _isolated_scheduler_run_dates(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_gdelt_doc_gate(tmp_path, monkeypatch):
+    """Give each test its own GDELT DOC gate file (ingestion/altdata/gdelt_doc.py).
+
+    The real gate lives in /tmp and carries spacing and 429 cooldowns across
+    processes; a shared file would make one test wait out another's state.
+    """
+    monkeypatch.setenv("GRID_GDELT_DOC_LOCK", str(tmp_path / "gdelt-doc.lock"))
+
+
+@pytest.fixture(autouse=True)
 def _options_provider_offline_default(monkeypatch):
     """Pin OptionsPuller.pull_all to its Yahoo client, which tests replace.
 

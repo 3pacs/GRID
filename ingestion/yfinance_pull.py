@@ -111,6 +111,12 @@ _WILD_RATIO_HIGH = 2.0
 # Below this many overlapping dates, a ratio is too noisy to judge (a single
 # stale or off-by-one-day existing row could otherwise trip the guard).
 _WILD_RATIO_MIN_OVERLAP = 3
+# A wild ratio is a stock split, not a wrong instrument, when re-expressing
+# the download in as-traded shares (undoing the splits Yahoo divided out)
+# brings the median within this distance of 1. ITA's 3-for-1 on 2026-11-05
+# read 0.333 (prices) and 3.000 (volume) against the pre-split rows, and the
+# guard refused every ITA write for days (240 Hermes warnings in 24 h).
+_SPLIT_EXPLAINED_TOLERANCE = 0.05
 # How far back to compare — see _median_ratio_vs_existing's docstring for
 # why this must stay bounded (a full-history pull_all call would otherwise
 # make this guard's own lookup scan ~1.15M rows per field on a heavily
@@ -227,6 +233,26 @@ class YFinancePuller(BasePuller):
         super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
 
+    @staticmethod
+    def _fetch_split_events(yf_ticker: str) -> list[tuple[date, float]]:
+        """``yf.Ticker(t).splits`` as ``[(effective_date, new shares per old share)]``.
+
+        Unit, non-positive and unparseable entries are dropped. Provider
+        errors propagate; callers decide whether that is fatal.
+        """
+        raw = yf.Ticker(yf_ticker).splits
+        events: list[tuple[date, float]] = []
+        for idx, value in (raw.items() if raw is not None else []):
+            parsed = pd.to_datetime(idx, errors="coerce")
+            try:
+                factor = float(value)
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(parsed) or not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 1e-9:
+                continue
+            events.append((parsed.date(), factor))
+        return events
+
     def pull_split_history(self, ticker: str, *, apply: bool = False) -> dict[str, Any]:
         """Record ``ticker``'s split history as ``YF:{T}:split_factor`` rows.
 
@@ -245,22 +271,12 @@ class YFinancePuller(BasePuller):
             result["status"] = "SKIPPED"
             return result
         try:
-            raw = yf.Ticker(yf_ticker).splits
+            events = self._fetch_split_events(yf_ticker)
         except Exception as exc:  # noqa: BLE001 - any provider error: report, never crash
             log.warning("yfinance {t}: split history unavailable: {e}", t=yf_ticker, e=str(exc))
             result["status"] = "FAILED"
             result["error"] = str(exc)[:200]
             return result
-        events: list[tuple[date, float]] = []
-        for idx, value in (raw.items() if raw is not None else []):
-            parsed = pd.to_datetime(idx, errors="coerce")
-            try:
-                factor = float(value)
-            except (TypeError, ValueError):
-                continue
-            if pd.isna(parsed) or not math.isfinite(factor) or factor <= 0 or abs(factor - 1.0) < 1e-9:
-                continue
-            events.append((parsed.date(), factor))
         result["splits"] = [(d.isoformat(), f) for d, f in sorted(events)]
         if not apply or not events:
             return result
@@ -430,6 +446,43 @@ class YFinancePuller(BasePuller):
         )
         return median, len(ratios)
 
+    def _split_explains_ratio(
+        self,
+        yf_ticker: str,
+        series_id: str,
+        field_key: str,
+        values_by_date: dict[date, float],
+        conn: Any,
+        splits: list[tuple[date, float]],
+    ) -> tuple[float | None, list[tuple[date, float]]]:
+        """Median ratio after undoing recent splits, and the splits that explain it.
+
+        Yahoo's ``Close`` (``auto_adjust=False``) is split-adjusted for every
+        split up to the pull, while the rows already stored were pulled
+        before the split: a 3-for-1 makes the download read 1/3 of the
+        stored prices (and 3x the volume) on the same dates. Each download
+        value dated ``d`` is multiplied back by the splits dated in
+        ``(d, today]`` (volume divided), then compared again. Returns
+        ``(median, used)`` where ``used`` is non-empty only when the
+        re-expressed median is within ``_SPLIT_EXPLAINED_TOLERANCE`` of 1.
+        """
+        today = date.today()
+        floor = today - timedelta(days=_WILD_RATIO_LOOKBACK_DAYS)
+        recent = [(d, f) for d, f in splits if floor < d <= today]
+        if not recent or not values_by_date:
+            return None, []
+        as_traded: dict[date, float] = {}
+        for d, v in values_by_date.items():
+            factor = 1.0
+            for eff, f in recent:
+                if d < eff:
+                    factor *= f
+            as_traded[d] = v / factor if field_key == "volume" else v * factor
+        median, _n = self._median_ratio_vs_existing(series_id, as_traded, conn)
+        if median is None or abs(median - 1.0) > _SPLIT_EXPLAINED_TOLERANCE:
+            return median, []
+        return median, recent
+
     def pull_ticker(
         self,
         ticker: str,
@@ -557,6 +610,9 @@ class YFinancePuller(BasePuller):
 
             inserted = 0
             qualified_inserted = 0
+            # Split lookup is lazy: fetched only when the ratio guard trips.
+            split_events: list[tuple[date, float]] | None = None
+            splits_recorded = False
             capture_states_seen: set[str] = set()
 
             # yfinance's own `end` is exclusive (start="2026-09-10",
@@ -643,7 +699,31 @@ class YFinancePuller(BasePuller):
                     median_ratio, overlap_n = self._median_ratio_vs_existing(
                         series_id, guard_values_by_date, conn,
                     )
+                    split_used: list[tuple[date, float]] = []
                     if median_ratio is not None and not (
+                        _WILD_RATIO_LOW <= median_ratio <= _WILD_RATIO_HIGH
+                    ):
+                        if split_events is None:
+                            try:
+                                split_events = self._fetch_split_events(yf_ticker)
+                            except Exception as exc:  # noqa: BLE001 - no split evidence: keep refusing
+                                log.debug("yfinance {t}: split lookup failed: {e}", t=yf_ticker, e=str(exc))
+                                split_events = []
+                        _, split_used = self._split_explains_ratio(
+                            yf_ticker, series_id, field_key, guard_values_by_date, conn,
+                            split_events,
+                        )
+                    if split_used:
+                        if not splits_recorded:
+                            splits_recorded = True
+                            log.info(
+                                "yfinance {t}: median ratio {r:.3f} is the split(s) {s}, "
+                                "not a wrong instrument — writing and recording the split",
+                                t=yf_ticker, r=median_ratio,
+                                s=[(d.isoformat(), f) for d, f in split_used],
+                            )
+                            self.pull_split_history(yf_ticker, apply=True)
+                    elif median_ratio is not None and not (
                         _WILD_RATIO_LOW <= median_ratio <= _WILD_RATIO_HIGH
                     ):
                         log.warning(

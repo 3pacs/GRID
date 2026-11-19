@@ -9,6 +9,7 @@
 # week, so the packet runs daily; Sun/Mon report the diary stage as a verified
 # non-session (no generation scheduled), not as a gap.
 # If grid-market-diary.timer moves, move this timer with it.
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
 [Unit]
 Description=Produce the GRID daily publication packet for the previous UTC day
 

@@ -2,16 +2,25 @@
 # H.4.1 publishes Thursday ~16:30 ET; FRED's WALCL/WTREGEN land ~30 min later.
 # Calendar is anchored to America/New_York so it tracks DST:
 #   Thu 17:30 ET = 21:30 UTC (EDT) / 22:30 UTC (EST)
-#   Fri 09:00 ET retry (catches a late FRED pull or a holiday-shifted release)
+#   Fri 09:00 ET retry (catches a late FRED pull)
+#   Fri 18:30 ET: holiday weeks. When the Thursday is a Federal Reserve
+#   holiday (Thanksgiving every year; Juneteenth, July 4, Christmas, New
+#   Year's or Veterans Day when they fall on a Thursday) H.4.1 publishes Fri
+#   16:30 ET (fed_liquidity.compute_release_at); the writer refuses that
+#   Wednesday before then, so the Fri 09:00 run cannot write it and a
+#   Thu/Fri-morning-only timer waited a week. 18:30 ET = 22:30 / 23:30 UTC
+#   (EDT / EST), after the scheduler's 22:00 UTC daily pull slot.
 # The writer is idempotent: a retry with unchanged inputs is a no-op run.
 # Check on the host before enabling:
 #   systemd-analyze calendar 'Thu *-*-* 17:30:00 America/New_York'
+#   systemd-analyze calendar 'Fri *-*-* 18:30:00 America/New_York'
 [Unit]
 Description=Weekly GRID god view Fed net liquidity writer (after H.4.1)
 
 [Timer]
 OnCalendar=Thu *-*-* 17:30:00 America/New_York
 OnCalendar=Fri *-*-* 09:00:00 America/New_York
+OnCalendar=Fri *-*-* 18:30:00 America/New_York
 Persistent=true
 RandomizedDelaySec=120
 Unit=grid-godview-fed.service

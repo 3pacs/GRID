@@ -165,6 +165,7 @@ _SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "Tiingo_Prices": ("TIINGO",),
     "USASpending": ("USASPENDING_GOV",),
     "Wikipedia_Pageviews": ("wikipedia_pageviews",),
+    "Wikipedia_Topic_Pageviews": ("wikipedia_pageviews",),
     "WorldNews": ("WorldNewsAPI",),
     "yfinance_Earnings": ("yfinance_earnings",),
 }
@@ -686,6 +687,17 @@ def run_flow_materialize_daily(
 # pre-market as that new day's pull. A skip is logged; the next slot runs.
 DOMESTIC_SLOT_MAX_LATE_MINUTES = 90
 
+# The domestic morning slot follows New York, not UTC (2026-11-16, Anik). A fixed
+# 13:30Z slot was 09:30 EDT but 08:30 EST: from the 2026-11-01 clock change every
+# winter morning run fell before the open, its options pull skipped ("session has
+# not opened yet", 0/206 tickers) and the GEM capture, which waits for that pull's
+# completion by 10:05 New York, skipped every session from 2026-11-02. 09:30 New
+# York fires at 13:30Z in summer (unchanged) and 14:30Z in winter. The receipt
+# attribution keeps recording the UTC time the slot actually fired.
+DOMESTIC_MORNING_SLOT = "09:30"
+DOMESTIC_MORNING_SLOT_TZ = "America/New_York"
+DOMESTIC_UTC_SLOTS = ("16:00", "20:00", "22:00")
+
 
 def _scheduler_utc_now() -> datetime:
     """Aware UTC clock for call-time windows (a seam for tests)."""
@@ -706,12 +718,17 @@ def _routine_yfinance_start(now_utc: datetime | None = None) -> str:
     return (last_session - timedelta(days=YFINANCE_WINDOW_OVERLAP_DAYS)).isoformat()
 
 
-def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
+def _slot_lateness(slot_hhmm: str, now: datetime | None = None, tz: str | None = None) -> timedelta:
     """How long after the most recent HH:MM occurrence ``now`` is.
 
     ``now`` defaults to the host-local naive clock -- the same clock
-    ``schedule.every().<day>.at("HH:MM")`` (no tz argument) fires on.
+    ``schedule.every().<day>.at("HH:MM")`` (no tz argument) fires on. With
+    ``tz`` the slot is HH:MM on that zone's wall clock (``.at("HH:MM", tz)``)
+    and ``now`` (aware, default the UTC clock) is read in that zone.
     """
+    if tz is not None:
+        from zoneinfo import ZoneInfo
+        now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz))
     now = now or datetime.now()
     hh, mm = (int(x) for x in slot_hhmm.split(":"))
     slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -720,14 +737,21 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
     return now - slot
 
 
-# yfinance daily-close capture slots (all UTC).
+def _slot_utc_label(slot_hhmm: str, tz: str, now: datetime | None = None) -> str:
+    """The UTC HH:MM at which the most recent ``slot_hhmm`` (``tz`` wall clock) occurred."""
+    now = now or datetime.now(timezone.utc)
+    return (now - _slot_lateness(slot_hhmm, now, tz)).astimezone(timezone.utc).strftime("%H:%M")
+
+
+# yfinance daily-close capture slots (all UTC except the domestic morning slot).
 #
 # Generic supported US-listed daily captures become POLICY_ELIGIBLE after the
 # next New York midnight (04:00Z EDT / 05:00Z EST). SPY close preserves its
 # separate post-UTC-day-end contract. Eligibility is not provider finality.
 #   * 05:15Z targets the previous UTC day's US session, including Friday on
 #     Saturday, after both generic New York-midnight boundaries have elapsed.
-#   * 13:30Z is 09:30 EDT / 08:30 EST. It and 16:00Z/20:00Z/22:00Z retain raw
+#   * The morning slot is 09:30 New York (13:30Z EDT / 14:30Z EST; until
+#     2026-11-16 a fixed 13:30Z, 08:30 EST). It and 16:00Z/20:00Z/22:00Z retain raw
 #     snapshots; no slot promises an exchange-opening print or provider-final
 #     close. Supported same-day US-listed bars are INCOMPLETE; unsupported
 #     policy is UNKNOWN. Raw history and qualified-close selection differ.
@@ -1033,12 +1057,13 @@ def _get_pullers_for_group(
             pullers.append(("OFR", OFRPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("OFR puller init failed: {err}", err=str(exc))
-        # JQuants — Japanese market indices (daily)
-        try:
-            from ingestion.international.jquants import JQuantsPuller
-            pullers.append(("JQuants", JQuantsPuller(db_engine), "pull_all", {}))
-        except Exception as exc:
-            log.warning("JQuants puller init failed: {err}", err=str(exc))
+        # JQuants (Japanese indices) is not run here (retired 2026-11-17, owner):
+        # no raw_series row ever under its source_catalog row (JQuants, id 213)
+        # since its 2026-05-27 registration; runs FAILED on a RetryError until
+        # 11-05, then logged "SKIPPED: JQUANTS_API_KEY not configured". It is
+        # not in SmartScheduler's registry, so there is no hold to lift: re-add
+        # this registration (ingestion.international.jquants.JQuantsPuller,
+        # "pull_all") once a key is configured.
         # EDINET — Japanese corporate filings (daily)
         try:
             from ingestion.international.edinet import EDINETPuller
@@ -1080,10 +1105,17 @@ def _get_pullers_for_group(
             pullers.append(("Unusual_Whales", UnusualWhalesPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Unusual Whales puller init failed: {err}", err=str(exc))
-        # Polymarket prediction market rapid-change detector (daily)
+        # Polymarket prediction market rapid-change detector (daily). Honors the
+        # SmartScheduler registry hold (retired 2026-11-17: no PREDICTION:* row
+        # or signal ever written), so lifting it there brings it back here too.
         try:
-            from ingestion.altdata.prediction_odds import PredictionOddsPuller
-            pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _pred_odds_hold = hold_reason_for("prediction_odds")
+            if _pred_odds_hold:
+                log.info("Prediction Odds held: {r}", r=_pred_odds_hold)
+            else:
+                from ingestion.altdata.prediction_odds import PredictionOddsPuller
+                pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Prediction Odds puller init failed: {err}", err=str(exc))
         # Social smart money — Reddit (SEC Form-4 insider tracking is separate)
@@ -1092,16 +1124,27 @@ def _get_pullers_for_group(
             pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Smart Money puller init failed: {err}", err=str(exc))
-        # Telegram Solana memecoin scanner (daily batch)
+        # Telegram / Discord Solana memecoin scanners (daily batch). Only run
+        # when users are configured (2026-11-17): every run since 2026-05-27
+        # logged "SKIPPED: No ... users configured" and sources 510/511 have
+        # no raw_series rows. Setting TELEGRAM_USERS / DISCORD_USERS (or the
+        # single-user env vars each scanner reads) brings them back.
         try:
             from ingestion.altdata.telegram_scanner import TelegramScanner
-            pullers.append(("Telegram_Solana_Scanner", TelegramScanner(db_engine), "pull_all", {}))
+            _tg_users = TelegramScanner._load_users_from_config()
+            if _tg_users:
+                pullers.append(("Telegram_Solana_Scanner", TelegramScanner(db_engine, users=_tg_users), "pull_all", {}))
+            else:
+                log.info("Telegram Scanner not run: no Telegram users configured")
         except Exception as exc:
             log.warning("Telegram Scanner init failed: {err}", err=str(exc))
-        # Discord Solana memecoin scanner (daily batch)
         try:
             from ingestion.altdata.discord_scanner import DiscordScanner
-            pullers.append(("Discord_Solana_Scanner", DiscordScanner(db_engine), "pull_all", {}))
+            _dc_users = DiscordScanner._load_users_from_config()
+            if _dc_users:
+                pullers.append(("Discord_Solana_Scanner", DiscordScanner(db_engine, users=_dc_users), "pull_all", {}))
+            else:
+                log.info("Discord Scanner not run: no Discord users configured")
         except Exception as exc:
             log.warning("Discord Scanner init failed: {err}", err=str(exc))
         # Fed liquidity equation — net liquidity = WALCL - TGA - RRP (daily RRP)
@@ -1148,10 +1191,18 @@ def _get_pullers_for_group(
             pullers.append(("DeFi_Llama", DefiLlamaPuller(db_engine), "pull_all", {}))  # pull_all confirmed
         except Exception as exc:
             log.warning("DeFi Llama puller init failed: {err}", err=str(exc))
-        # Dune Analytics — smart money, CEX flows, narrative heat (6h cadence, API key)
+        # Dune Analytics. Honors the SmartScheduler registry hold (retired
+        # 2026-11-04, commit 17889eec: the three saved DUNE_QUERY_* queries
+        # were never created, so every run here logged "SKIPPED: all 3 items
+        # skipped: not_configured"; last raw_series row 2026-05-01).
         try:
-            from ingestion.altdata.dune_puller import DunePuller
-            pullers.append(("Dune_Analytics", DunePuller(db_engine), "pull_all", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _dune_hold = hold_reason_for("dune")
+            if _dune_hold:
+                log.info("Dune Analytics held: {r}", r=_dune_hold)
+            else:
+                from ingestion.altdata.dune_puller import DunePuller
+                pullers.append(("Dune_Analytics", DunePuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Dune puller init failed: {err}", err=str(exc))
         # Etherscan — ETH price, gas, whale balances, token supplies (daily)
@@ -1172,10 +1223,19 @@ def _get_pullers_for_group(
             pullers.append(("Wikipedia_Pageviews", WikipediaPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikipedia puller init failed: {err}", err=str(exc))
-        # Cloudflare Radar — internet traffic, DDoS, anomalies (daily, no key)
+        # Cloudflare Radar — internet traffic, DDoS, anomalies (daily; needs a
+        # token). Registered once (it was also registered a second time below).
+        # Honors the SmartScheduler registry hold (retired 2026-11-17: no token
+        # configured, no raw_series row ever), so lifting it there brings it
+        # back here too.
         try:
-            from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
-            pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _cf_radar_hold = hold_reason_for("cloudflare_radar")
+            if _cf_radar_hold:
+                log.info("Cloudflare Radar held: {r}", r=_cf_radar_hold)
+            else:
+                from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
+                pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Cloudflare Radar puller init failed: {err}", err=str(exc))
         # Earnings via yfinance — EPS, surprise %, beats/misses (daily)
@@ -1184,18 +1244,17 @@ def _get_pullers_for_group(
             pullers.append(("yfinance_Earnings", EarningsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("yfinance Earnings puller init failed: {err}", err=str(exc))
-        # CryptoQuant — exchange flows, miner flows, SOPR, NUPL, funding (daily)
-        try:
-            from ingestion.altdata.cryptoquant_puller import CryptoQuantPuller
-            pullers.append(("CryptoQuant", CryptoQuantPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("CryptoQuant puller init failed: {err}", err=str(exc))
-        # Polygon.io — options Greeks, stock snapshots, dividends (daily)
-        try:
-            from ingestion.altdata.polygon_puller import PolygonPuller
-            pullers.append(("Polygon", PolygonPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Polygon puller init failed: {err}", err=str(exc))
+        # CryptoQuant and Polygon are not run here (retired 2026-11-17, owner).
+        # Neither is in SmartScheduler's registry, so there is no hold to lift:
+        # re-add the registration when the plan covers the endpoints.
+        #  - CryptoQuant (ingestion.altdata.cryptoquant_puller.CryptoQuantPuller,
+        #    "pull"): no raw_series row ever under source 720 since 2026-05-27;
+        #    runs FAILED auth_failed, then "SKIPPED: ... plan not entitled (HTTP 403)".
+        #  - Polygon (ingestion.altdata.polygon_puller.PolygonPuller, "pull"):
+        #    no raw_series row ever under source 722; options snapshots are not
+        #    in the plan (HTTP 403, then "30 of 30 tickers failed"). Only this
+        #    registration is retired: gex and research read Polygon minute
+        #    history through their own code paths, and the module stays.
         # NASA FIRMS — active fire/thermal anomaly detection (daily)
         try:
             from ingestion.altdata.nasa_firms_puller import NASAFirmsPuller
@@ -1216,10 +1275,16 @@ def _get_pullers_for_group(
             pullers.append(("Tiingo_News", TiingoNewsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Tiingo news puller init failed: {err}", err=str(exc))
-        # Tiingo fundamentals (daily, paid API)
+        # Tiingo fundamentals (daily, paid API). Honors the SmartScheduler
+        # registry hold (retired 2026-11-08: DOW-30-only plan).
         try:
-            from ingestion.tiingo_fundamentals_pull import TiingoFundamentalsPuller
-            pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _tiingo_fund_hold = hold_reason_for("tiingo_fundamentals")
+            if _tiingo_fund_hold:
+                log.info("Tiingo fundamentals held: {r}", r=_tiingo_fund_hold)
+            else:
+                from ingestion.tiingo_fundamentals_pull import TiingoFundamentalsPuller
+                pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Tiingo fundamentals puller init failed: {err}", err=str(exc))
         # BLS (daily check, monthly release). Pass the registration key:
@@ -1255,12 +1320,10 @@ def _get_pullers_for_group(
             pullers.append(("SEC_EDGAR_Fundamentals", SECEdgarCompanyPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("SEC EDGAR company puller init failed: {err}", err=str(exc))
-        # MarketWatch RSS news (daily)
-        try:
-            from ingestion.altdata.marketwatch_news import MarketWatchNewsPuller
-            pullers.append(("MarketWatch_News", MarketWatchNewsPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("MarketWatch news puller init failed: {err}", err=str(exc))
+        # MarketWatch RSS news: registered once, below, with "pull_all"
+        # (2026-11-17). This copy ran "pull", which reports SUCCESS even when a
+        # feed fails; the later "pull_all" copy then found every article already
+        # stored. pull_all's per-feed results record a failed feed as PARTIAL.
         # Google Trends (daily)
         try:
             from ingestion.altdata.google_trends import GoogleTrendsPuller
@@ -1291,24 +1354,24 @@ def _get_pullers_for_group(
             pullers.append(("Open_Meteo", WeatherPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Open-Meteo init failed: {err}", err=str(exc))
-        # Atlanta Fed GDPNow (daily)
-        try:
-            from ingestion.nowcast_puller import NowcastPuller
-            pullers.append(("Nowcast_GDPNow", NowcastPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Nowcast init failed: {err}", err=str(exc))
+        # Atlanta Fed GDPNow: registered once, below, as "nowcast" (2026-11-17).
+        # "Nowcast_GDPNow" ran the same NowcastPuller.pull first, so the
+        # "nowcast" run never wrote a row. "nowcast" is the pull_log name the
+        # freshness readers match by name (source_freshness pairs it with
+        # SmartScheduler's "nowcast" entry and its catalog row).
         # USASpending.gov (daily)
         try:
             from ingestion.altdata.usaspending_puller import USASpendingPuller
             pullers.append(("USASpending", USASpendingPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("USASpending init failed: {err}", err=str(exc))
-        # USPTO patent search (daily)
-        try:
-            from ingestion.altdata.uspto_puller import USPTOPuller
-            pullers.append(("USPTO_Patents", USPTOPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("USPTO init failed: {err}", err=str(exc))
+        # USPTO_Patents is not run here (retired 2026-11-17, owner): no
+        # raw_series row ever under its catalog row (USPTO_PV, id 628) since its
+        # 2026-05-27 registration; every run logged "NO_NEW_DATA ... 0 rows".
+        # It is not in SmartScheduler's registry, so there is no hold to lift:
+        # re-add ingestion.altdata.uspto_puller.USPTOPuller ("pull") once it is
+        # fixed. The annual group's USPTO_PV (ingestion.physical.patents) is a
+        # different puller and is unchanged.
         # FINRA margin statistics (daily)
         try:
             from ingestion.altdata.finra_margin_puller import FINRAMarginPuller
@@ -1329,10 +1392,13 @@ def _get_pullers_for_group(
             log.warning("Wikidata init failed: {err}", err=str(exc))
         # Fed Speeches — canonical puller registered below (fed_speeches.FedSpeechPuller).
         # Wave 3 dedupe 2026-04-13: deleted fed_speeches_puller.py (orphaned output).
-        # Wikipedia pageviews — anomaly detection on financial topics (daily)
+        # Wikipedia pageviews — anomaly detection on financial topics (daily).
+        # A different puller from WikipediaPuller above (wikipedia.<topic>.views
+        # series, not wiki:<company>), and both write rows. It logged under the
+        # same pull_log name until 2026-11-17; it has its own name now.
         try:
             from ingestion.altdata.wikipedia_pageviews_puller import WikipediaPageviewsPuller
-            pullers.append(("Wikipedia_Pageviews", WikipediaPageviewsPuller(db_engine), "pull", {}))
+            pullers.append(("Wikipedia_Topic_Pageviews", WikipediaPageviewsPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikipedia pageviews init failed: {err}", err=str(exc))
         # GDELT News puller removed in Wave 1 dedupe — canonical gdelt.py is registered above.
@@ -1353,11 +1419,8 @@ def _get_pullers_for_group(
             pullers.append(("nowcast", NowcastPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Nowcast puller init failed: {err}", err=str(exc))
-        try:
-            from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
-            pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Cloudflare Radar puller init failed: {err}", err=str(exc))
+        # Cloudflare_Radar's second registration removed 2026-11-17; the one
+        # above carries the registry hold.
         try:
             from ingestion.altdata.kalshi_markets import KalshiMarketsPuller
             pullers.append(("Kalshi_Markets", KalshiMarketsPuller(db_engine), "pull_all", {}))
@@ -1368,11 +1431,10 @@ def _get_pullers_for_group(
             pullers.append(("FedSpeeches", FedSpeechPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Fed Speeches puller init failed: {err}", err=str(exc))
-        try:
-            from ingestion.crucix_bridge import CrucixBridgePuller
-            pullers.append(("Crucix", CrucixBridgePuller(db_engine), "pull_all", {}))
-        except Exception as exc:
-            log.warning("Crucix bridge puller init failed: {err}", err=str(exc))
+        # Crucix is not run here (2026-11-17): grid-intelligence bridges it every
+        # 15 min (intelligence/scheduler.py _crucix_ingest) and SmartScheduler runs
+        # crucix_bridge hourly with its own pull_log row. This copy only re-inserted
+        # deduplicated news and logged 0 rows.
 
     elif group_name == "weekly":
         try:
@@ -1714,7 +1776,9 @@ def run_pushshift_backfill(data_dir: str = "/data/pushshift") -> dict[str, Any]:
 # ── Domestic pull functions ───────────────────────────────────────────
 
 
-def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = None) -> None:
+def run_daily_pulls(
+    start_date: str | date = "1990-01-01", slot: str | None = None, slot_tz: str | None = None,
+) -> None:
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
@@ -1731,13 +1795,15 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
               any. A slot released more than DOMESTIC_SLOT_MAX_LATE_MINUTES
               late (an earlier job held the single-threaded loop) is
               skipped rather than run as a mis-timed catch-up.
+        slot_tz: The zone ``slot`` is a wall-clock time in (the morning
+              slot: America/New_York); None means the UTC host clock.
     """
     from datetime import date as _date
 
     from ingestion.market_calendar import is_market_open
 
     if slot is not None:
-        late = _slot_lateness(slot)
+        late = _slot_lateness(slot) if slot_tz is None else _slot_lateness(slot, tz=slot_tz)
         if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
             log.warning(
                 "Skipping the {s} run_daily_pulls slot: released {m:.0f} min late "
@@ -1763,7 +1829,8 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
         _run_equity_pulls(
             start_date,
             yfinance_start=_routine_yfinance_start() if slot is not None else None,
-            yfinance_slot=slot,
+            yfinance_slot=(_slot_utc_label(slot, slot_tz) if slot is not None and slot_tz
+                           else slot),
         )
 
     # --- 24/7 pullers (crypto, OSINT, sentiment — always run) ---
@@ -1793,21 +1860,9 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     except Exception as exc:
         log.warning("Google Trends pull failed: {err}", err=str(exc))
 
-    # Crucix bridge — 25+ intelligence sources (OSINT is 24/7)
-    try:
-        from ingestion.crucix_bridge import CrucixBridgePuller
-        from db import get_engine
-
-        engine = get_engine()
-        crucix = CrucixBridgePuller(db_engine=engine)
-        result = crucix.pull_all()
-        log.info(
-            "Crucix bridge — {rows} rows from {src} sources",
-            rows=result["rows_inserted"],
-            src=result["sources_processed"],
-        )
-    except Exception as exc:
-        log.warning("Crucix bridge failed: {err}", err=str(exc))
+    # Crucix: not run from the daily pulls (2026-11-17). grid-intelligence bridges it
+    # every 15 min and SmartScheduler hourly, so its news is already fresh for the
+    # FinBERT step below.
 
     # FinBERT sentiment scoring (runs after text sources are fresh)
     try:
@@ -2155,7 +2210,7 @@ def _run_yfinance_daily(
             alert_on_failure_with_fix("yfinance", str(exc), {
                 "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').info.get('regularMarketPrice'))\"",
                 "fix": "pip install --upgrade yfinance",
-                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
+                "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
                 "file": "grid/ingestion/yfinance_pull.py",
             })
         except Exception as exc2:
@@ -2201,7 +2256,7 @@ def _run_equity_pulls(
             alert_on_failure_with_fix("FRED", str(exc), {
                 "diagnose": 'curl -s "https://api.stlouisfed.org/fred/series?api_key=$FRED_API_KEY&series_id=DFF&file_type=json" | head -5',
                 "fix": "Check FRED_API_KEY in .env",
-                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
+                "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
                 "file": "grid/ingestion/fred.py",
             })
         except Exception as exc2:
@@ -2462,7 +2517,7 @@ def start_scheduler() -> None:
       inside the sequential loop; see start_tiingo_prices_worker)
 
     International/trade/physical:
-    - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, JQuants, EDINET, etc.)
+    - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, EDINET, etc.)
     - Weekly on Sundays at 3:00 AM (OECD, BIS, IMF, etc.)
     - Monthly on the 2nd at 06:00 UTC (Comtrade, Eurostat, NOAA, VIIRS, CEPII)
     - Annual on Jan 15 at 06:30 UTC (Atlas ECI, WIOD, EU KLEMS, Patents)
@@ -2485,15 +2540,19 @@ def start_scheduler() -> None:
 
     # --- Domestic schedules ---
 
-    # Domestic clock slots stay fixed: 13:30/16:00/20:00/22:00 on the UTC host.
-    # 13:30 UTC is 09:30 EDT / 08:30 EST; there is no seasonal clock shift here.
+    # Domestic slots: 09:30 New York (13:30Z EDT / 14:30Z EST, see
+    # DOMESTIC_MORNING_SLOT), then 16:00/20:00/22:00 fixed on the UTC host.
     # yfinance runs in every slot as raw snapshots, without an opening-print
     # promise. The 05:15 morning slot targets the prior session separately.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
                 "saturday", "sunday"]:
-        for utc_time in ["13:30", "16:00", "20:00", "22:00"]:
+        getattr(schedule.every(), day).at(DOMESTIC_MORNING_SLOT, DOMESTIC_MORNING_SLOT_TZ).do(
+            run_daily_pulls, start_date=ongoing_start,
+            slot=DOMESTIC_MORNING_SLOT, slot_tz=DOMESTIC_MORNING_SLOT_TZ,
+        )
+        for utc_time in DOMESTIC_UTC_SLOTS:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )

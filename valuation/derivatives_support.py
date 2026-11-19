@@ -22,12 +22,17 @@ derivatives positioning working against it?"
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from store.observations import read_latest
+
+# Oldest options-snapshot spot or close the spot fallback accepts (calendar days).
+SPOT_MAX_AGE_DAYS = 7
 
 
 @dataclass
@@ -435,19 +440,39 @@ class DerivativesSupportEngine:
         ]
 
     def _get_spot_price(self, ticker: str, as_of: date) -> float | None:
-        """Get latest spot price from FMP or Tiingo data."""
+        """Latest raw spot price at or before ``as_of``.
+
+        FMP price, then the options snapshot's spot, then Tiingo's raw close.
+        The old second source was ``TIINGO_FUND:{T}:market_cap`` -- a market
+        cap (~1e12 for AAPL) used as the spot, which put every wall distance
+        near 100%. That series stopped when Tiingo fundamentals was retired
+        (2026-11-08).
+        """
         with self.engine.connect() as conn:
-            for prefix in [f"fmp:{ticker}:price", f"TIINGO_FUND:{ticker}:market_cap"]:
-                row = conn.execute(
-                    text("""
-                        SELECT value FROM raw_series
-                        WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
-                        ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1
-                    """),
-                    {"sid": prefix, "as_of": as_of},
-                ).fetchone()
-                if row is not None:
-                    return row[0]
+            row = conn.execute(
+                text("""
+                    SELECT value FROM raw_series
+                    WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
+                    ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1
+                """),
+                {"sid": f"fmp:{ticker}:price", "as_of": as_of},
+            ).fetchone()
+            if row is not None:
+                return row[0]
+            row = conn.execute(
+                text("""
+                    SELECT spot_price FROM options_daily_signals
+                    WHERE ticker = :t AND spot_price > 0 AND signal_date <= :as_of
+                      AND signal_date >= :since
+                    ORDER BY signal_date DESC LIMIT 1
+                """),
+                {"t": ticker, "as_of": as_of, "since": as_of - timedelta(days=SPOT_MAX_AGE_DAYS)},
+            ).fetchone()
+            if row is not None:
+                return float(row[0])
+            obs = read_latest(conn, f"YF:{ticker}:close", source="TIINGO", as_of=as_of)
+            if obs is not None and obs.obs_date >= as_of - timedelta(days=SPOT_MAX_AGE_DAYS):
+                return obs.value
         return None
 
     def _get_short_positioning(self, ticker: str, as_of: date) -> ShortPositioning:

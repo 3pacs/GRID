@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import types
 import unittest
 
@@ -27,7 +28,7 @@ def row(source=1,hours=1,error='SYNTH_NEW',status='FAILED'):
 
 def projection(path):
  tree=ast.parse(path.read_bytes())
- projected=('_normalize_source_key','_classify_pull_failure','diagnose_and_fix_pulls')
+ projected=('_normalize_source_key','_classify_pull_failure','_recovered_after','_held_source_names','diagnose_and_fix_pulls')
  functions={n.name:n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in projected}
  if set(functions)!=set(projected):raise AssertionError('MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY')
 
@@ -37,7 +38,7 @@ def projection(path):
  if len(probe)!=1:raise AssertionError('MISSING_RELATION_PROBE')
  future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
  mod=ast.fix_missing_locations(ast.Module(body=[future,*probe,*(functions[name] for name in projected)],type_ignores=[]))
- log=Log();ns={'log':log,'json':json,'re':re};exec(compile(mod,str(path),'exec'),ns)
+ log=Log();ns={'log':log,'json':json,'re':re,'datetime':dt.datetime,'timezone':dt.timezone,'_REPAIR_SCHEDULE_LOCK':threading.Lock(),'_REPAIR_RECOVERED_AT':{}};exec(compile(mod,str(path),'exec'),ns)
  return ns['diagnose_and_fix_pulls'],log
 
 PROBE='SELECT to_regclass(:relation) IS NOT NULL'
@@ -136,8 +137,8 @@ class LatestFailureTests(unittest.TestCase):
   a,result,_=exercise([
    row(source=1,error='(psycopg2.OperationalError) remaining connection slots are reserved'),
    row(source=2,error='HTTP 429 Too Many Requests'),
-  ],catalog=((1,'FRED'),(2,'Baltic_Exchange')))
-  self.assertEqual(result['fix_actions'],{'fred':'CHECK_DB','baltic_exchange':'CHECK_KEY'})
+  ],catalog=((1,'SYNTH_DB'),(2,'FRED')))
+  self.assertEqual(result['fix_actions'],{'synth_db':'CHECK_DB','fred':'CHECK_KEY'})
   self.assertEqual(result['retried'],0);self.assertEqual(result['diagnosed'],0)
   self.assertEqual(len(a.raw_queries),1)
   self.assertTrue(all(query.startswith('SELECT ') for query in a.raw_queries))

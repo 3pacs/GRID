@@ -339,6 +339,7 @@ def test_dry_run_writes_nothing(job, tmp_path):
 
 
 def test_cli_default_day_is_previous_utc_day_and_refuses_open_window(job, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(job, "DEFAULT_PUBLIC_ROOT", tmp_path / "pub")  # never the real ~/research tree from a test
     monkeypatch.setattr(job, "systemd_unit_evidence", lambda *a, **k: {"available": False, "reason": "test"})
     monkeypatch.setattr(job, "AUDIO_DIR", tmp_path / "a")
     monkeypatch.setattr(job, "GROUNDING_DIR", tmp_path / "g")
@@ -371,3 +372,96 @@ def test_audio_metadata_and_grounding_are_read_bounded(job, tmp_path):
     briefing_row = next(r["record"] for r in capture["records"] if r["channel"] == "market_briefings")
     assert briefing_row["grounding_receipt"] == {"total_numbers": 2, "grounded_count": 2}
     assert result["channels"]["audio"]["count"] == 1
+
+
+# ── public screened tree (never capture.json) ───────────────────────────────
+
+def _public_files(public_root: Path) -> set[str]:
+    return {str(p.relative_to(public_root)) for p in public_root.rglob("*") if p.is_file()}
+
+
+def test_publish_copies_only_the_screened_allow_list(job, tmp_path):
+    public_root = tmp_path / "public"
+    result = _run(job, tmp_path, FakeEngine(_data()), public_root=public_root)
+    assert result["state"] == "PRODUCED"
+    day_dir = tmp_path / "packets" / DAY.isoformat()
+    assert (day_dir / "capture.json").is_file()
+    published = _public_files(public_root)
+    assert published == {f"{DAY}/packet.json", f"{DAY}/receipt.json", f"{DAY}/observation.json",
+                         f"{DAY}/receipts/diary_run.json", f"{DAY}/receipts/candidate.json",
+                         f"{DAY}/receipts/capture.json"}
+    assert "capture.json" not in {Path(p).name for p in published if "/receipts/" not in p}
+    for rel in published:
+        assert (public_root / rel).read_bytes() == (day_dir / Path(rel).relative_to(DAY.isoformat())).read_bytes()
+        assert oct((public_root / rel).stat().st_mode & 0o777) == "0o644"
+    assert oct((public_root / DAY.isoformat()).stat().st_mode & 0o777) == "0o755"
+    assert oct(day_dir.stat().st_mode & 0o777) == "0o700"
+    assert sorted(result["published"]["copied"]) == sorted(p.split("/", 1)[1] for p in published)
+
+
+def test_rerun_publishes_an_already_produced_day_without_rewriting(job, tmp_path):
+    first = _run(job, tmp_path, FakeEngine(_data()))  # no public_root: nothing published
+    assert first["published"] is None
+    public_root = tmp_path / "public"
+    second = _run(job, tmp_path, FakeEngine(_data()), public_root=public_root)
+    assert second["already_present"] and second["receipt_sha256"] == first["receipt_sha256"]
+    assert f"{DAY}/receipt.json" in _public_files(public_root) and f"{DAY}/capture.json" not in _public_files(public_root)
+    third = _run(job, tmp_path, FakeEngine(_data()), public_root=public_root)
+    assert third["published"]["copied"] == [] and len(third["published"]["unchanged"]) == 6
+
+
+def test_publish_refuses_the_private_capture_even_if_asked(job, tmp_path):
+    day_dir = tmp_path / "packets" / DAY.isoformat()
+    day_dir.mkdir(parents=True)
+    (day_dir / "capture.json").write_bytes(b"raw")
+    (day_dir / "receipt.json").write_bytes(b"{}")
+    public = tmp_path / "public" / DAY.isoformat()
+    job.publish_screened(day_dir, public)
+    assert _public_files(tmp_path / "public") == {f"{DAY}/receipt.json"}
+    with pytest.raises(RuntimeError):
+        job.PUBLIC_FILES = job.PUBLIC_FILES + ("capture.json",)
+        try:
+            job.publish_screened(day_dir, public)
+        finally:
+            job.PUBLIC_FILES = tuple(f for f in job.PUBLIC_FILES if f != "capture.json")
+    assert f"{DAY}/capture.json" not in _public_files(tmp_path / "public")
+
+
+def test_failed_run_publishes_its_failure_marker(job, tmp_path):
+    public_root = tmp_path / "public"
+    result = _run(job, tmp_path, FakeEngine(_data(), broken=True), public_root=public_root)
+    assert result["state"] == "FAILED"
+    names = {Path(p).name for p in _public_files(public_root)}
+    assert "observation.json" in names and any(n.startswith("FAILED-") for n in names)
+    assert "capture.json" not in names
+
+
+def test_publish_failure_never_blocks_production(job, tmp_path):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file where a directory should be")
+    result = _run(job, tmp_path, FakeEngine(_data()), public_root=blocked)
+    assert result["state"] == "PRODUCED" and result["published"]["error"]
+    assert (tmp_path / "packets" / DAY.isoformat() / "receipt.json").is_file()
+
+
+def test_dry_run_publishes_nothing(job, tmp_path):
+    public_root = tmp_path / "public"
+    result = _run(job, tmp_path, FakeEngine(_data()), public_root=public_root, dry_run=True)
+    assert result["published"] is None and not public_root.exists()
+
+
+def test_cli_no_publish_flag(job, tmp_path, monkeypatch):
+    monkeypatch.setattr(job, "systemd_unit_evidence", lambda *a, **k: {"available": False, "reason": "test"})
+    monkeypatch.setattr(job, "AUDIO_DIR", tmp_path / "a")
+    monkeypatch.setattr(job, "GROUNDING_DIR", tmp_path / "g")
+    rc = job.main(["--day", DAY.isoformat(), "--out-root", str(tmp_path / "packets"),
+                   "--public-root", str(tmp_path / "public"), "--no-publish"], engine=FakeEngine(_data()), now=NOW)
+    assert rc == 0 and not (tmp_path / "public").exists()
+    rc = job.main(["--day", DAY.isoformat(), "--out-root", str(tmp_path / "packets"),
+                   "--public-root", str(tmp_path / "public")], engine=FakeEngine(_data()), now=NOW)
+    assert rc == 0 and (tmp_path / "public" / DAY.isoformat() / "receipt.json").is_file()
+
+
+def test_service_template_sets_the_public_root():
+    text = (ROOT / "deploy" / "systemd" / "grid-publication-packet.service.template").read_text()
+    assert "GRID_PUBLICATION_PACKET_PUBLIC_ROOT=/data/grid/outputs/publication-packets" in text

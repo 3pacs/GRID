@@ -145,7 +145,7 @@ class TestSdmxJson:
             obs = sdmx_json.fetch_bis_series("WS_CREDIT_GAP", "Q.US.P.A.C", "2024")
         assert obs[0] == (date(2024, 1, 1), -11.0108)
         url = get.call_args.args[0]
-        assert url == "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CREDIT_GAP/1.0/Q.US.P.A.C"
+        assert url == "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CREDIT_GAP/~/Q.US.P.A.C"  # latest version (2026-11-09)
         assert get.call_args.kwargs["headers"]["Accept"] == sdmx_json.BIS_ACCEPT
         assert get.call_args.kwargs["params"] == {"startPeriod": "2024"}
 
@@ -365,6 +365,35 @@ class TestBCB:
             puller._fetch_series_data(11, "1994-01-01", None)
         assert get.call_count == 1
 
+    def test_empty_window_404_is_no_new_data(self, monkeypatch):
+        # Hermes' repair pulls from a recent start; a monthly series has no
+        # observation in that window and SGS answers 404 "Value(s) not found".
+        from ingestion.international import bcb
+
+        engine, _conn = _mock_engine()
+        puller = bcb.BCBPuller(engine)
+        monkeypatch.setattr(bcb.time, "sleep", lambda s: None)
+        resp = MagicMock(status_code=404, text='{"erro":{"statusCode":404,"detail":'
+                         '"br.gov.bcb.pec.sgs.comum.excecoes.SGSNegocioException: Value(s) not found"}}')
+        get = MagicMock(return_value=resp)
+        monkeypatch.setattr(bcb.requests, "get", get)
+        res = puller.pull_series(13522, "2026-10-17")
+        assert res["status"] == "SUCCESS" and res["rows_inserted"] == 0 and res["errors"] == []
+        assert get.call_count == 1
+        resp.raise_for_status.assert_not_called()
+
+    def test_other_404_still_fails(self, monkeypatch):
+        from ingestion.international import bcb
+
+        engine, _conn = _mock_engine()
+        puller = bcb.BCBPuller(engine)
+        monkeypatch.setattr(bcb.time, "sleep", lambda s: None)
+        resp = MagicMock(status_code=404, text="<html>Not Found</html>")
+        resp.raise_for_status.side_effect = _http_error(404)
+        monkeypatch.setattr(bcb.requests, "get", MagicMock(return_value=resp))
+        res = puller.pull_series(99999, "2026-10-17")
+        assert res["status"] == "FAILED"
+
     def test_incremental_start_uses_latest_obs_minus_lookback(self, monkeypatch):
         from ingestion.international import bcb
 
@@ -539,7 +568,7 @@ class TestGDELT:
             p.pull_all()
         pr.assert_called_once_with(
             days_back=1, max_theme_queries=4, include_actor_tones=False,
-            include_tensions=False, include_signals=False,
+            include_tensions=False, include_signals=False, run_budget_s=150,
         )
 
     def test_timeout_stops_remaining_theme_queries(self, monkeypatch):
@@ -559,21 +588,28 @@ class TestGDELT:
 
     def test_429_stops_remaining_theme_queries_and_is_recorded(self, monkeypatch):
         from ingestion.altdata import gdelt
+        from ingestion.altdata.gdelt_doc import GDELTRateLimited
 
         p, _ = self._puller()
         monkeypatch.setattr(gdelt.time, "sleep", lambda s: None)
-        fetch = MagicMock(return_value={"timeline": [], "status": "SKIPPED", "http_status": 429})
+        # The first query is refused (429 after the gate's retry); the second
+        # finds the doubled cooldown past the budget and stops the run unsent.
+        fetch = MagicMock(side_effect=[
+            GDELTRateLimited("HTTP 429", sent=True, retry_at=None),
+            GDELTRateLimited("cooling down", sent=False, retry_at=None),
+        ])
         monkeypatch.setattr(p, "_fetch_gdelt_api", fetch)
         res = p.pull_recent(days_back=1, max_theme_queries=4, include_actor_tones=False,
                             include_tensions=False, include_signals=False)
-        assert fetch.call_count == 1
+        assert fetch.call_count == 2
         assert "429" in res["errors"][0]
+        assert "3 DOC queries not attempted" in res["errors"][0]
+        assert res["status"] == "FAILED"
 
     def test_doc_api_read_timeout_is_longer_than_gdelts_429_latency(self, monkeypatch):
         from ingestion.altdata import gdelt
 
         p, _ = self._puller()
-        monkeypatch.setattr(p, "_acquire_doc_token", lambda: 0.0)
         resp = MagicMock(status_code=200)
         resp.json.return_value = {"timeline": []}
         with patch.object(gdelt.requests, "get", return_value=resp) as get:

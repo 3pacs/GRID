@@ -29,7 +29,9 @@ def _load(source: str | None = None):
              "_deterministic_skip_reason", "_record_deterministic_failure",
              "_is_deterministic_retry_error", "_cached_diagnosis", "_store_diagnosis",
              "_chat_kwargs_without_thinking", "_warn_throttled", "_run_bounded",
-             "note_repair_failure", "note_repair_recovered"}
+             "note_repair_failure", "note_repair_recovered",
+             # Held/recovered failed-list filter (2026-11-08).
+             "_recovered_after", "_held_source_names"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
     clock = SimpleNamespace(now=0.0)
@@ -53,7 +55,8 @@ def _load(source: str | None = None):
                  "_DETERMINISTIC_SKIPS": {}, "_DIAGNOSIS_CACHE": {}, "_THROTTLED_WARNINGS": {},
                  "_DETERMINISTIC_RETRY_ERRORS": (AttributeError, ImportError, NotImplementedError),
                  "_SIGNATURE_TYPEERROR_MARKERS": ("unexpected keyword argument",),
-                 "_REPEATED_FAILURES": {}, "REPEATED_FAILURE_THRESHOLD": 3,
+                 "_REPEATED_FAILURES": {}, "_REPAIR_RECOVERED_AT": {},
+                 "REPEATED_FAILURE_THRESHOLD": 3,
                  "REPEATED_FAILURE_COOLDOWN_SECONDS": 86400.0,
                  "REPEATED_FAILURE_MAX_COOLDOWN_SECONDS": 604800.0}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec",

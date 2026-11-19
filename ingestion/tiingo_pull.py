@@ -27,6 +27,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
 from ingestion.base import BasePuller
+from tiingo_symbol_contract import _ORACLE_NON_TIINGO, is_tiingo_equity  # noqa: F401 -- re-exported; readers share the rules
 from store.observations import split_series_id
 
 # Process-scoped circuit breaker for catastrophic DB index corruption.
@@ -69,6 +70,8 @@ _REQUEST_TIMEOUT = 30
 # made (GRID-TIINGO-DUPLICATES-20260929). _insert_rows therefore also takes
 # a per-ticker pg_advisory_xact_lock before its INSERT, on every path.
 ROUTINE_OVERLAP_DAYS = 10          # re-check this many days behind the latest stored session
+LAPSED_WINDOW_DAYS = 10            # a close this recent before the expected session = the ticker was live
+MAX_NAMED_TICKERS = 50             # tickers named per bucket in the pull summary and log
 NEW_TICKER_START = "2020-01-01"    # routine first pull for a ticker with no TIINGO rows (pull_ticker's default)
 EOD_READY_ET = dtime(18, 0)        # a session's EOD bar is treated as published from 18:00 America/New_York
 DEFAULT_MAX_WORKERS = 3            # concurrent HTTP fetches
@@ -81,18 +84,35 @@ _ET = ZoneInfo("America/New_York")
 # the lock must be module-level.
 _INCREMENTAL_LOCK = threading.Lock()
 
-# Oracle tickers Tiingo's daily equity endpoint cannot serve (crypto, the
-# dollar index); see TiingoPuller.oracle_tickers.
-_ORACLE_NON_TIINGO: frozenset[str] = frozenset({"BTC", "ETH", "SOL", "DXY"})
 
-
-def is_tiingo_equity(ticker: str) -> bool:
-    """False for symbols Tiingo's daily equity endpoint cannot serve."""
-    return (
-        ticker not in _ORACLE_NON_TIINGO
-        and not ticker.endswith("-USD")
-        and not ticker.startswith("^")
-    )
+# Tickers where 2+ different insiders bought on the open market (Form 4 code
+# P) in the last INSIDER_BUYER_DAYS. Counted per feed, so one person spelled
+# two ways by SEC and QuiverQuant is not two buyers. QuiverQuant's
+# insider_buy also covers grants and option exercises (any "A" code), so only
+# its TransactionCode P rows count. 2026-11-08: 332 tickers, 287 of them with
+# no routine close, so Sleuth's insider-only control was 65% untestable.
+INSIDER_BUYER_DAYS = 90
+INSIDER_MIN_BUYERS = 2
+SUPPLY_CHAIN_NODE_IDS_SQL = (
+    "SELECT upstream_id FROM supply_chain_edges UNION SELECT downstream_id FROM supply_chain_edges"
+)
+INSIDER_MAX_TICKERS = 1000
+INSIDER_BUYER_TICKERS_SQL = """
+    SELECT t FROM (
+        SELECT upper(trim(ticker)) AS t, source_type,
+               count(DISTINCT lower(coalesce(signal_value->>'Name', source_id))) AS n
+        FROM signal_sources
+        WHERE signal_date >= :since
+          AND ((source_type = 'insider' AND signal_type IN ('BUY', 'UNUSUAL_BUY'))
+            OR (source_type = 'quiverquant:insider'
+                AND signal_value->>'TransactionCode' = 'P'))
+        GROUP BY 1, 2
+    ) per_feed
+    WHERE n >= :min_buyers
+    GROUP BY t
+    ORDER BY max(n) DESC, t
+    LIMIT :cap
+"""
 
 
 def _stable_advisory_lock_key(name: str) -> int:
@@ -151,6 +171,36 @@ _FIELD_MAP: dict[str, str] = {
 }
 
 
+def is_mutual_fund_symbol(ticker: str) -> bool:
+    """Five letters ending in X: a mutual fund (NASDAQ fund-symbol convention).
+
+    Funds reach the daily list through insider filings (MOALX, TPYTX on
+    2026-11-10). Their NAV posts after the price slot, so they always look
+    lapsed to :func:`still_behind`. They stay readable (their TIINGO rows are
+    real NAVs); they are just not in the routine stock-close list.
+    """
+    return len(ticker) == 5 and ticker.isalpha() and ticker.isupper() and ticker.endswith("X")
+
+
+def still_behind(results: list[dict[str, Any]], expected: date) -> list[tuple[str, date | None]]:
+    """(ticker, latest close before the run) for every fetched ticker that
+    still has no close for ``expected``: no data, a failed fetch, or data
+    that stops earlier. A ticker last seen inside ``LAPSED_WINDOW_DAYS`` was
+    trading, so missing it now is a failure, not a delisting; the pull
+    reports PARTIAL and names it. Long-dead and never-served symbols (renamed
+    companies, FX, crypto) are counted but do not fail the run.
+    """
+    out: list[tuple[str, date | None]] = []
+    for r in results:
+        if r.get("status") not in ("SUCCESS", "PARTIAL", "FAILED"):
+            continue
+        before, got = r.get("last_before"), r.get("latest_obs")
+        latest = max((d for d in (before, got) if d is not None), default=None)
+        if latest is None or latest < expected:
+            out.append((r["ticker"], before))
+    return out
+
+
 def _tiingo_headers() -> dict[str, str]:
     return {
         "Content-Type": "application/json",
@@ -203,6 +253,12 @@ class TiingoPuller(BasePuller):
             "status": "SUCCESS",
             "errors": [],
         }
+
+        if not is_tiingo_equity(ticker):
+            # Never fetch: Tiingo would answer for an unrelated equity.
+            result["status"] = "PARTIAL"
+            result["errors"].append(f"{ticker} is not a Tiingo equity symbol")
+            return result
 
         # Clean ticker: Tiingo uses plain symbols, no ^ prefix
         clean_ticker = ticker.replace("^", "").replace("=F", "").replace("=X", "")
@@ -281,6 +337,8 @@ class TiingoPuller(BasePuller):
                          t=ticker, n=result["rows_would_insert"])
                 return result
 
+            closes = [r["od"] for r in rows_batch if r["sid"] == f"YF:{ticker}:close"]
+            result["latest_obs"] = max(closes) if closes else None
             if rows_batch:
                 inserted = self._insert_rows(rows_batch)
 
@@ -547,33 +605,106 @@ class TiingoPuller(BasePuller):
         return [t for t in tickers if is_tiingo_equity(t)]
 
     @staticmethod
+    def hypothesis_tickers(db_engine: Engine) -> list[str]:
+        """Tickers active ticker-move hypotheses will be scored on, equities only.
+
+        Source of truth: ``intelligence.hypothesis_trials.ticker_move_close_universe``.
+        Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.hypothesis_trials import ticker_move_close_universe
+
+            with db_engine.connect() as conn:
+                tickers = ticker_move_close_universe(conn)
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: hypothesis close universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for t in tickers if is_tiingo_equity(t)]
+
+    @staticmethod
+    def supply_chain_tickers(db_engine: Engine) -> list[str]:
+        """US symbols of every supply-chain graph node that has an edge, equities only.
+
+        Source of truth: ``intelligence.supply_chain_symbols.symbol_for`` (the one
+        node -> symbol rule the edge validator and contagion use). 2026-11-16: 29 of
+        203 graph symbols (GLW, HON, SWKS, WDC, ...) had no close since April
+        because no other list held them, so their edges were measured on stale
+        prices. Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.supply_chain_symbols import load_node_types, symbol_for
+
+            with db_engine.connect() as conn:
+                ids = [r[0] for r in conn.execute(text(SUPPLY_CHAIN_NODE_IDS_SQL)) if r[0]]
+                types = load_node_types(conn, ids)
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: supply-chain universe unavailable: {e}", e=str(exc))
+            return []
+        symbols = {t.symbol for t in (symbol_for(i, types.get(str(i).lower())) for i in ids) if t.symbol}
+        return sorted(t for t in symbols if is_tiingo_equity(t))
+
+    @staticmethod
+    def insider_buyer_tickers(db_engine: Engine, today: date | None = None) -> list[str]:
+        """Listed equities with 2+ open-market insider buyers (see INSIDER_BUYER_TICKERS_SQL).
+
+        Never raises; an unreachable DB yields ``[]`` and a warning.
+        """
+        try:
+            from intelligence.actor_identity import is_placeholder_ticker
+            from intelligence.sleuth_intersections import is_testable_ticker
+
+            since = (today or date.today()) - timedelta(days=INSIDER_BUYER_DAYS)  # noqa: DTZ011
+            with db_engine.connect() as conn:
+                rows = conn.execute(text(INSIDER_BUYER_TICKERS_SQL), {
+                    "since": since, "min_buyers": INSIDER_MIN_BUYERS, "cap": INSIDER_MAX_TICKERS,
+                }).fetchall()
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: insider buyer universe unavailable: {e}", e=str(exc))
+            return []
+        return [t for (t,) in rows
+                if t and not is_placeholder_ticker(t) and is_testable_ticker(t) and is_tiingo_equity(t)]
+
+    @staticmethod
     def default_tickers(db_engine: Engine | None = None) -> list[str]:
-        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle universe.
+        """YF_TICKER_LIST ∪ every sector-map ETF/actor ticker ∪ the oracle,
+        active-hypothesis and insider-buyer universes.
 
         With ``db_engine`` the oracle's close universe
         (:meth:`oracle_tickers`) is added, so every ticker the oracle predicts
         on gets a routine close (S15, 2026-11-06: ~45 biotech tickers had no
-        close since 2026-09-09 because neither static list held them).
+        close since 2026-09-09 because neither static list held them), and so
+        is every ticker an active hypothesis will be scored on
+        (:meth:`hypothesis_tickers`; 2026-11-07: 36 of 115 Sleuth lead tickers
+        had no routine close), and so is every ticker with 2+ open-market
+        insider buyers (:meth:`insider_buyer_tickers`; 2026-11-08: 287 of 332
+        had no routine close), and so is every listed supply-chain graph node
+        (:meth:`supply_chain_tickers`; 2026-11-16: 29 of 203 had no close since
+        April).
+
+        Sector-map tickers go through ``analysis.sector_map.price_tickers``:
+        renamed symbols are swapped for their successor and acquired,
+        delisted or foreign-listed ones are skipped (2026-11-08: 103 such
+        tickers were fetched for 0 rows). Everything is then filtered by
+        :func:`is_tiingo_equity`.
         """
         from ingestion.yfinance_pull import YF_TICKER_LIST
 
         all_tickers = set(YF_TICKER_LIST)
         if db_engine is not None:
             all_tickers.update(TiingoPuller.oracle_tickers(db_engine))
+            all_tickers.update(TiingoPuller.hypothesis_tickers(db_engine))
+            all_tickers.update(TiingoPuller.insider_buyer_tickers(db_engine))
+            all_tickers.update(TiingoPuller.supply_chain_tickers(db_engine))
         try:
-            from analysis.sector_map import SECTOR_MAP
-            for sector in SECTOR_MAP.values():
-                etf = sector.get("etf")
-                if etf:
-                    all_tickers.add(etf)
-                for sub in sector.get("subsectors", {}).values():
-                    for actor in sub.get("actors", []):
-                        t = actor.get("ticker")
-                        if t:
-                            all_tickers.add(t)
-        except Exception:
-            pass  # Graceful degradation if sector_map has an issue
-        return sorted(all_tickers)
+            from analysis.sector_map import price_ticker, price_tickers
+            all_tickers.update(price_tickers())
+            # The lifecycle sidecar applies to every source, not just the map:
+            # a stopped symbol from the oracle/insider lists would still get
+            # Tiingo's frozen rows and trip the lapse check.
+            all_tickers = {p for t in all_tickers if (p := price_ticker(t))}
+        except Exception as exc:  # noqa: BLE001 -- graceful degradation
+            log.warning("Tiingo: sector map tickers unavailable: {e}", e=str(exc))
+        return sorted(t for t in all_tickers if is_tiingo_equity(t) and not is_mutual_fund_symbol(t))
 
     def pull_incremental(
         self,
@@ -589,7 +720,9 @@ class TiingoPuller(BasePuller):
 
         See the module comment above ROUTINE_OVERLAP_DAYS. Returns a summary
         dict whose ``status`` is SUCCESS, PARTIAL (stopped by
-        ``should_continue`` or the index-corruption breaker), FAILED (most
+        ``should_continue`` or the index-corruption breaker, or a ticker that
+        was trading inside ``LAPSED_WINDOW_DAYS`` got no close for the expected
+        session: see :func:`still_behind`), FAILED (most
         fetches failed) or SKIPPED (another run holds the lock -- callers
         must not treat that as a completed pull).
         """
@@ -636,7 +769,9 @@ class TiingoPuller(BasePuller):
                 if last is not None and last >= expected:
                     return {"ticker": ticker, "status": "CURRENT",
                             "rows_inserted": 0, "errors": []}
-                return self.pull_ticker(ticker, start_date=start, limiter=limiter)
+                res = self.pull_ticker(ticker, start_date=start, limiter=limiter)
+                res["last_before"] = last
+                return res
 
             log.info(
                 "Tiingo incremental pull: {n} tickers, expecting session {d}, "
@@ -654,9 +789,13 @@ class TiingoPuller(BasePuller):
             failed = by_status.get("FAILED", 0)
             unattempted = by_status.get("UNATTEMPTED", 0)
             rows = sum(int(r.get("rows_inserted") or 0) for r in results)
+            behind = still_behind(results, expected)
+            lapsed = [t for t, before in behind
+                      if before is not None
+                      and before >= expected - timedelta(days=LAPSED_WINDOW_DAYS)]
             if fetched >= 10 and failed * 2 > fetched:
                 status = "FAILED"
-            elif unattempted or _INDEX_CORRUPTED_BREAKER:
+            elif unattempted or _INDEX_CORRUPTED_BREAKER or lapsed:
                 status = "PARTIAL"
             else:
                 status = "SUCCESS"
@@ -672,15 +811,29 @@ class TiingoPuller(BasePuller):
                 "unattempted": unattempted,
                 "rows_inserted": rows,
                 "failed_tickers": [r["ticker"] for r in results if r["status"] == "FAILED"][:50],
+                "no_data_tickers": [r["ticker"] for r in results
+                                    if r["status"] == "PARTIAL"][:MAX_NAMED_TICKERS],
+                "behind": len(behind),
+                "lapsed_tickers": lapsed[:MAX_NAMED_TICKERS],
             }
             if status == "FAILED":
                 summary["error"] = f"{failed}/{fetched} Tiingo fetches failed"
+            elif lapsed:
+                summary["error"] = (
+                    f"{len(lapsed)} ticker(s) with a close in the {LAPSED_WINDOW_DAYS} days "
+                    f"before {expected.isoformat()} got none for it: "
+                    + ", ".join(lapsed[:MAX_NAMED_TICKERS]))
             log.info(
                 "Tiingo incremental pull {s}: {c} current, {f} fetched, {ok} ok, "
                 "{nd} no data, {fl} failed, {u} unattempted, {r} rows",
                 s=status, c=summary["current"], f=fetched, ok=summary["succeeded"],
                 nd=summary["no_data"], fl=failed, u=unattempted, r=rows,
             )
+            if summary["no_data_tickers"]:
+                log.info("Tiingo returned no data for: {t}",
+                         t=", ".join(summary["no_data_tickers"]))
+            if lapsed:
+                log.warning("Tiingo incremental pull: {e}", e=summary["error"])
             return summary
         finally:
             if lock_conn is not None:

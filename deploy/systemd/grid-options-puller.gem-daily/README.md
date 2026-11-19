@@ -25,7 +25,8 @@ The runner is `scripts/gem_daily_capture.py`. Every gate fails closed.
    - calls and puts are both present, with 1–6 expiries;
    - the provider quote time is on the session day;
    - the capture falls inside the New York session.
-7. **CONTAIN.**
+7. **RESULT.** One `GEM_RESULT PASS|PARTIAL|FAIL pass=N fail=M failed=[T,…]` line closes every run that reached VALIDATE, in the log and the day's claim receipt. The runner exits 0 for `PASS` and `PARTIAL`, and 1 only for `FAIL` (no ticker passed), an incomplete result set or a run error (`GEM_FAILED …`). A ticker that fails VALIDATE keeps its own `GEM_VALIDATE <T> FAIL` line; it no longer turns the unit red on its own, so read `GEM_RESULT` (or grep `PARTIAL`) to see it.
+8. **CONTAIN.**
    - `Type=oneshot` with `TimeoutStartSec=55min` (09:31 arm to the 10:20 deadline is 49 min), so the timeout bounds the whole run, plus `KillMode=control-group`. The runner's own SIGALRM stops at 10:20 New York.
    - `ExecStopPost=-…/gem_daily_contain.py` appends `CONTAINED result=… status=…` to the day's claim receipt, whatever the outcome.
    - The timer uses `Persistent=false`, so there are no catch-up runs.
@@ -81,9 +82,34 @@ systemctl list-timers grid-options-puller.timer
 
 ## First-run check
 
-- Check `/var/log/grid-options-puller.log` for eight `GEM_VALIDATE … PASS` lines and one `GEM_CONTAIN result=success`.
+- Check `/var/log/grid-options-puller.log` for eight `GEM_VALIDATE … PASS` lines, one `GEM_RESULT PASS pass=8 fail=0 failed=[]` and one `GEM_CONTAIN result=success`. `GEM_RESULT PARTIAL` also ends in `result=success`; its `failed=[…]` list names the tickers to look at.
 - Check `/data/grid_v4/gem_daily/attempts/<day>`. It should hold `STARTED`, then `GEM_TRIGGER … lag_s=…` (or a `GEM_SKIP` with its reason), the `GEM_VALIDATE` lines, and finally `CONTAINED`.
 - Call `GET /api/v1/derivatives/options-batches/SPY?snap_date=<day>`. It should list the scheduler batch and the `gem` batch.
+
+## Re-pin (move a live, activated unit onto newer code)
+
+The timer and the `ACTIVATED` marker stay as they are; only the pin clone and the rendered `50-grid652-immutable-pin.conf` change. The runner checks that `ACTIVATED` exists, not which pin it names. `NEW` must be a merged main SHA that is deployed, so `/data/grid_v4/grid_release.releases/$NEW` exists. Do it outside 09:31–10:20 New York on a session day.
+
+```bash
+NEW=<40-hex deployed main SHA>
+P=/data/grid_v4/grid-options-puller-pins/$NEW
+sudo -u grid git clone --quiet /data/grid_v4/grid_release.releases/$NEW "$P"
+sudo -u grid git -C "$P" checkout --quiet --detach $NEW
+test "$(sudo -u grid git -C "$P" rev-parse HEAD)" = "$NEW"
+test -z "$(sudo -u grid git -C "$P" status --porcelain --untracked-files=all)"
+sudo -u grid git -C "$P" merge-base --is-ancestor 01b19194 $NEW
+OUT=/data/grid_v4/grid-options-puller-pins/gem-daily-units-$NEW
+sudo -u grid /data/grid_v4/venv/bin/python3 "$P/scripts/render_gem_daily_units.py" $NEW $OUT
+sudo diff -u /etc/systemd/system/grid-options-puller.service.d/99-grid652-quarantine.conf $OUT/grid-options-puller.service.d/99-grid652-quarantine.conf   # expect no output
+BK=/home/grid/backups/gem_daily_units_$(date -u +%Y%m%dT%H%M%SZ); sudo install -d -m 0700 "$BK"
+sudo cp -a /etc/systemd/system/grid-options-puller.service.d "$BK"/
+sudo install -m 0644 -o root -g root $OUT/grid-options-puller.service.d/50-grid652-immutable-pin.conf /etc/systemd/system/grid-options-puller.service.d/
+sudo systemctl daemon-reload
+systemctl cat grid-options-puller.service | grep -c "$NEW"   # expect 6 (the rendered drop-in names the pin six times)
+systemctl is-enabled grid-options-puller.timer; systemctl list-timers grid-options-puller.timer
+```
+
+Rollback: `sudo install -m 0644 -o root -g root $BK/grid-options-puller.service.d/50-grid652-immutable-pin.conf /etc/systemd/system/grid-options-puller.service.d/ && sudo systemctl daemon-reload`. The old pin clone stays on disk until the new one has passed a session.
 
 ## Kill switch
 

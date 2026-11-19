@@ -27,18 +27,26 @@ import json
 import os
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixtures as fx  # noqa: E402
+import spy  # noqa: E402
+import preload  # noqa: E402
 
-VALID_SCENARIOS = ("healthy", "partial", "empty")
+VALID_SCENARIOS = ("healthy", "partial", "empty", "unavailable", "error")
 
 # path-parameter routes: (compiled regex, handler(match, query, scenario) -> dict | None)
 _TICKER_RE = r"[A-Za-z0-9_.\-]+"
 
 ROUTES: list[tuple[str, re.Pattern, callable]] = [
+    ("GET", re.compile(r"^/api/v1/derivatives/vanna-charm/SPY$"), lambda m, q, s: {"ticker": "SPY", "error": "synthetic: vanna/charm unavailable"}),
+    ("GET", re.compile(r"^/api/v1/derivatives/flow-timeline/SPY$"), lambda m, q, s: {"ticker": "SPY", "history": [], "gamma_flip_crossings": []}),
+    ("GET", re.compile(r"^/api/v1/derivatives/gex/SPY$"), lambda m, q, s: spy.dealer_gex(s)),
+    ("GET", re.compile(r"^/api/v1/options/signals$"), lambda m, q, s: spy.options_signals()),
+    ("GET", re.compile(r"^/api/v1/options/(?:scan|100x)$"), lambda m, q, s: {"opportunities": []}),
     ("POST", re.compile(r"^/api/v1/auth/login$"), lambda m, q, s: fx.login_response()),
     ("GET", re.compile(r"^/api/v1/auth/verify$"), lambda m, q, s: fx.verify_response()),
 
@@ -155,7 +163,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         # Permissive CORS: this only ever serves synthetic fixtures on
         # localhost during development, never real data.
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Grid-Fixture-Journey")
         self.end_headers()
         self.wfile.write(body)
 
@@ -163,6 +171,14 @@ class FixtureHandler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         path = parts.path
         query = parse_qs(parts.query)
+        if (method == 'GET' and path == '/api/v1/gamma-watch/state'
+                and self.headers.get('X-Grid-Fixture-Journey') == 'spy-options'):
+            # Deliberately slow only this request, so the browser must prove
+            # its loading state before receiving data (including on polls).
+            time.sleep(1.5)
+            payload, status = spy.gamma_state(self.scenario, time.time())
+            self._send_json(payload, status)
+            return
         for route_method, pattern, handler in ROUTES:
             if route_method != method:
                 continue
@@ -174,6 +190,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": True, "message": f"fixture handler failed: {exc}"}, status=500)
                     return
                 self._send_json(result)
+                return
+        if method == 'GET':
+            omitted_preload = preload.unavailable(path)
+            if omitted_preload is not None:
+                self._send_json(omitted_preload, status=501)
                 return
         self._send_json(
             {"error": True, "status": 404, "message": f"no fixture route for {method} {path}"},
@@ -216,7 +237,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Grid-Fixture-Journey")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
 

@@ -812,6 +812,11 @@ def _kv_table(rows: list[tuple[str, str]]) -> str:
     return f'<table class="kv">{body}</table>'
 
 
+def _utc_today() -> date:
+    """The rendering date; the card ages its inputs against it (tests pin it)."""
+    return datetime.now(timezone.utc).date()
+
+
 def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     """One call: the exact contract, its quote, the math, and why — with dates.
 
@@ -820,7 +825,7 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     """
     ticker = opp["ticker"]
     direction = opp["direction"]
-    rendered_on = datetime.now(timezone.utc).date()
+    rendered_on = _utc_today()
     today = _calendar_date(opp.get("as_of")) or rendered_on
     spot = verification.get("live_spot") or opp.get("spot_price")
     spot_source = verification.get("spot_source") or (
@@ -1049,8 +1054,20 @@ def _warn_once(key: tuple[str, str], message: str, **kw: Any) -> None:
     log.warning(message, **kw)
 
 
+def _digest_paused() -> str | None:
+    """Why the digest must not run, or ``None`` when it may (``settings.OPTIONS_DIGEST_ENABLED``)."""
+    from config import settings
+
+    if getattr(settings, "OPTIONS_DIGEST_ENABLED", False):
+        return None
+    return "paused: OPTIONS_DIGEST_ENABLED is false (option-chain inputs untrusted since 2026-11-09)"
+
+
 def run_100x_digest(force: bool = False) -> dict[str, Any]:
     """Scan, gate, price, record and email options calls.
+
+    Returns at once with ``reason`` set when the digest is paused; ``force`` does not override a
+    pause (it only sends a digest that has nothing to report).
 
     1. Scanner rows sorted by score; ``_sanity_check`` drops garbage data.
     2. ``_selection_gate`` withholds the measured losers (100x tier, CALLs,
@@ -1064,6 +1081,11 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
 
     Returns summary dict.
     """
+    paused = _digest_paused()
+    if paused:
+        log.info("100x Digest: {r}; nothing scanned, recorded or sent", r=paused)
+        return {"sent": False, "reason": paused, "scanned": 0}
+
     engine = _get_engine()
     now = datetime.now(timezone.utc)
     today = now.date()  # UTC, like grid-svr's clock and the ledger timestamps

@@ -19,10 +19,21 @@ from ingestion.base import BasePuller
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Eurostat dataset/series mapping
+#
+# Checked against the live API from grid-svr 2026-11-07:
+# * prc_hicp_manr stopped at 2025-12 (last update 2026-02-06): Eurostat moved
+#   HICP to the ECOICOP ver.2 dataset prc_hicp_minr (unit RCH_A = annual rate,
+#   coicop18 TOTAL). geo=EA stays the changing-composition euro area.
+# * une_rt_m has no EA19 rows any more (euro area is EA21 from 2026) and
+#   carries two units, so unit=PC_ACT is required. eurozone_unemployment had
+#   never stored a row.
+# * sts_inpr_m renamed indic_bt PROD -> PRD and has no NSA rows for B-D;
+#   unit I21 (2021=100), seasonally and calendar adjusted. eu_industrial_output
+#   had never stored a row either.
 EUROSTAT_SERIES: dict[str, str] = {
-    "prc_hicp_manr?geo=EA&coicop=CP00&freq=M": "eurozone_hicp_yoy",
-    "une_rt_m?geo=EA19&sex=T&age=TOTAL&s_adj=NSA&freq=M": "eurozone_unemployment",
-    "sts_inpr_m?geo=EU27_2020&indic_bt=PROD&nace_r2=B-D&s_adj=NSA&freq=M": "eu_industrial_output",
+    "prc_hicp_minr?geo=EA&unit=RCH_A&coicop18=TOTAL&freq=M": "eurozone_hicp_yoy",
+    "une_rt_m?geo=EA21&sex=T&age=TOTAL&s_adj=SA&unit=PC_ACT&freq=M": "eurozone_unemployment",
+    "sts_inpr_m?geo=EU27_2020&indic_bt=PRD&nace_r2=B-D&s_adj=SCA&unit=I21&freq=M": "eu_industrial_output",
 }
 
 _EUROSTAT_BASE_URL = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
@@ -91,6 +102,18 @@ class EurostatPuller(BasePuller):
             pass
         return None
 
+    def _latest_stored_values(self, series_id: str, conn: Any) -> dict[date, float]:
+        """Latest SUCCESS value per obs_date this source stored for ``series_id``."""
+        rows = conn.execute(
+            text(
+                "SELECT DISTINCT ON (obs_date) obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src AND pull_status = 'SUCCESS' "
+                "ORDER BY obs_date, pull_timestamp DESC"
+            ),
+            {"sid": series_id, "src": self.source_id},
+        ).fetchall()
+        return {r[0]: float(r[1]) for r in rows if r[1] is not None}
+
     def pull_series(self, dataset_query: str, feature_name: str) -> dict[str, Any]:
         """Pull a single Eurostat series."""
         log.info("Pulling Eurostat {fn}", fn=feature_name)
@@ -111,8 +134,13 @@ class EurostatPuller(BasePuller):
 
             inserted = 0
             with self.engine.begin() as conn:
+                # Insert a vintage only when the value is new or revised. The
+                # 1-hour _row_exists window re-inserted the whole history on
+                # every run: eurozone_hicp_yoy held 85,608 rows for 348 dates
+                # on 2026-11-07.
+                stored = self._latest_stored_values(feature_name, conn)
                 for obs_date_val, value in observations:
-                    if self._row_exists(feature_name, obs_date_val, conn):
+                    if obs_date_val in stored and stored[obs_date_val] == value:
                         continue
                     conn.execute(
                         text(
@@ -128,7 +156,8 @@ class EurostatPuller(BasePuller):
             log.info("Eurostat {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("Eurostat pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
+            # Provider/network failure, reported in the result: not a GRID bug.
+            log.warning("Eurostat pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
