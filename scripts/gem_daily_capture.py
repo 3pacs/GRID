@@ -28,6 +28,16 @@ closed and prints one ``GEM_SKIP``/``GEM_FAILED``/``GEM_VALIDATE`` line:
   its stored rows equal the registered and reported counts, and its capture
   lies inside the New York session.
 
+RETRY: every ticker that fails VALIDATE gets one ``GEM_REASON`` line (the
+puller's own counts: failed fetches, undated quotes, empty expiries) and one
+more capture at 10:00 New York (at once if later, never at or after the
+10:05 latest start), validated the same way and recorded as
+``GEM_VALIDATE <T> PASS|FAIL ... attempt=2``. A thin name whose first
+regular-session trade comes after the 09:38 capture (GLND, 2026-11-17/18:
+the quote still carried the prior session's time, so the capture was
+correctly refused as undated) is captured again once it has traded; the
+retry's verdict is the ticker's verdict.
+
 After VALIDATE one ``GEM_RESULT PASS|PARTIAL|FAIL pass=N fail=M failed=[...]``
 line closes the run. The exit status is 0 for PASS and PARTIAL, and 1 only
 when no ticker passed, the result set is incomplete, or the run itself
@@ -69,6 +79,7 @@ _ACTIVATED = Path("/data/grid_v4/gem_daily/ACTIVATED")
 _PIN_ROOT = Path("/data/grid_v4/grid-options-puller-pins")
 _EARLIEST_START_NY = time(9, 30)   # captures must lie inside the NY session
 _LATEST_START_NY = time(10, 5)     # the old fixed start becomes the latest start
+_RETRY_AT_NY = time(10, 0)         # one more capture for tickers that failed VALIDATE
 _JOURNAL_LIMIT_BYTES = 5_000_000
 _SESSION_GUARD_COMMIT = "01b19194"  # #653: fail closed on non-session captures
 
@@ -93,6 +104,15 @@ def _session_deadline(day: date) -> datetime:
 
 def _latest_start(day: date) -> datetime:
     return datetime.combine(day, _LATEST_START_NY, _NY).astimezone(timezone.utc)
+
+
+def _retry_at(day: date) -> datetime:
+    return datetime.combine(day, _RETRY_AT_NY, _NY).astimezone(timezone.utc)
+
+
+def _sleep(seconds: float) -> None:
+    import time as _time
+    _time.sleep(seconds)
 
 
 def _scheduler_window_start(day: date) -> datetime:
@@ -433,6 +453,71 @@ def _validate_batch(conn, ticker: str, day: date, result: dict) -> bool:
             and start <= completed <= _utc_now() and in_session)
 
 
+_INCOMPLETE_RE = re.compile(
+    r"^incomplete options chain response: (\d+) failed expiry fetch\(es\), "
+    r"(\d+) undated quote\(s\), (\d+) empty of (\d+) expiries, (\d+) contracts, "
+    r"timed_out=(True|False)$")
+_KNOWN_ERRORS = {
+    "no data from options provider": "no_provider_data",
+    "options capture crossed session date or quote time is future": "session_or_future_quote",
+}
+_REASON_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _failure_reason(result: dict) -> str:
+    """One short, secret-free reason for a ticker that failed VALIDATE.
+
+    Only the puller's own fixed messages are decoded; any other error text
+    (driver or database messages) is reduced to ``error=other`` so nothing
+    provider- or connection-specific reaches the log or the receipt.
+    """
+    status = result.get("status")
+    status = status if isinstance(status, str) and status.isalpha() else "unknown"
+    if status == "SUCCESS":
+        return "status=SUCCESS reason=validate"
+    error = result.get("error")
+    if isinstance(error, str):
+        match = _INCOMPLETE_RE.match(error)
+        if match:
+            fetches, undated, empty, expiries, contracts, timed_out = match.groups()
+            return (f"status={status} reason=incomplete failed_fetches={fetches} "
+                    f"undated_quotes={undated} empty={empty}/{expiries} "
+                    f"contracts={contracts} timed_out={timed_out}")
+        return f"status={status} reason={_KNOWN_ERRORS.get(error, 'error=other')}"
+    reason = result.get("reason")
+    if isinstance(reason, str) and reason:
+        return f"status={status} reason={_REASON_TOKEN.sub('_', reason)[:60]}"
+    return f"status={status} reason=none"
+
+
+def _validate_results(conn, day: date, results, *, attempt: int) -> list[tuple[str, bool]]:
+    verdicts: list[tuple[str, bool]] = []
+    suffix = "" if attempt == 1 else f" attempt={attempt}"
+    for result in results:
+        ticker = result["ticker"]
+        good = (result.get("status") == "SUCCESS"
+                and _validate_batch(conn, ticker, day, result))
+        verdicts.append((ticker, good))
+        _record(day, f"GEM_VALIDATE {ticker} {'PASS' if good else 'FAIL'} "
+                     f"batch={result.get('capture_batch_id')} "
+                     f"ordinal={result.get('capture_ordinal')}{suffix}")
+        if not good:
+            _record(day, f"GEM_REASON {ticker} attempt={attempt} {_failure_reason(result)}")
+    return verdicts
+
+
+def _wait_for_retry(day: date) -> bool:
+    """Sleep until the 10:00 New York retry; False once the latest start is reached."""
+    target = _retry_at(day)
+    while True:
+        now = _utc_now()
+        if now >= _latest_start(day):
+            return False
+        if now >= target:
+            return True
+        _sleep(min((target - now).total_seconds(), 30.0))
+
+
 def _record_result(day: date, verdicts: list[tuple[str, bool]]) -> int:
     """Record one ``GEM_RESULT`` line for the run and return its exit code.
 
@@ -525,17 +610,29 @@ def main() -> int:
         if len(results) != len(GEM_TICKERS) or [r.get("ticker") for r in results] != list(GEM_TICKERS):
             _record(day, "GEM_FAILED incomplete result set")
             return 1
-        verdicts: list[tuple[str, bool]] = []
         with engine.connect() as conn:
             conn.execute(text("SET statement_timeout = '20s'"))
-            for result in results:
-                ticker = result["ticker"]
-                good = (result.get("status") == "SUCCESS"
-                        and _validate_batch(conn, ticker, day, result))
-                verdicts.append((ticker, good))
-                _record(day, f"GEM_VALIDATE {ticker} {'PASS' if good else 'FAIL'} "
-                             f"batch={result.get('capture_batch_id')} "
-                             f"ordinal={result.get('capture_ordinal')}")
+            verdicts = _validate_results(conn, day, results, attempt=1)
+        failed = [ticker for ticker, ok in verdicts if not ok]
+        if failed:
+            if not _wait_for_retry(day):
+                _record(day, f"GEM_RETRY SKIP latest start 10:05 New York reached "
+                             f"failed=[{','.join(failed)}]")
+            else:
+                _record(day, f"GEM_RETRY START tickers=[{','.join(failed)}]")
+                retried = OptionsPuller(db_engine=engine).pull_all(
+                    tickers=failed, include_catalyst_universe=False,
+                    max_expirations=GEM_MAX_EXPIRATIONS,
+                    should_continue=lambda: _utc_now() < _session_deadline(day),
+                    capture_source=GEM_CAPTURE_SOURCE,
+                )
+                if len(retried) != len(failed) or [r.get("ticker") for r in retried] != failed:
+                    _record(day, "GEM_RETRY FAIL incomplete result set")
+                else:
+                    with engine.connect() as conn:
+                        conn.execute(text("SET statement_timeout = '20s'"))
+                        second = dict(_validate_results(conn, day, retried, attempt=2))
+                    verdicts = [(t, second.get(t, ok)) for t, ok in verdicts]
         return _record_result(day, verdicts)
     except Exception as exc:  # noqa: BLE001 - process boundary; no secret-bearing text
         _record(day, f"GEM_FAILED {type(exc).__name__}")

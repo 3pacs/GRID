@@ -25,8 +25,17 @@ The runner is `scripts/gem_daily_capture.py`. Every gate fails closed.
    - calls and puts are both present, with 1–6 expiries;
    - the provider quote time is on the session day;
    - the capture falls inside the New York session.
-7. **RESULT.** One `GEM_RESULT PASS|PARTIAL|FAIL pass=N fail=M failed=[T,…]` line closes every run that reached VALIDATE, in the log and the day's claim receipt. The runner exits 0 for `PASS` and `PARTIAL`, and 1 only for `FAIL` (no ticker passed), an incomplete result set or a run error (`GEM_FAILED …`). A ticker that fails VALIDATE keeps its own `GEM_VALIDATE <T> FAIL` line; it no longer turns the unit red on its own, so read `GEM_RESULT` (or grep `PARTIAL`) to see it.
-8. **CONTAIN.**
+
+   For each ticker that fails, a `GEM_REASON <T> attempt=N status=… reason=…` line follows. It gives the puller's own counts (failed fetches, undated quotes, empty expiries, contracts, timed out). Any other error text is reduced to `reason=error=other`, so no driver or connection text reaches the log or the receipt.
+7. **RETRY.** The tickers that failed VALIDATE get exactly one more capture at **10:00 New York**. If the first pass ends later than that, the retry runs at once; it never starts at or after the 10:05 latest start. On the receipt:
+   - `GEM_RETRY START tickers=[…]` opens the retry;
+   - each retried ticker gets its own `GEM_VALIDATE <T> PASS|FAIL … attempt=2` line;
+   - `GEM_RETRY SKIP latest start 10:05 New York reached failed=[…]` means no retry ran.
+
+   The retry's verdict replaces the first one in `GEM_RESULT`.
+   Why: a thin name whose first regular-session trade comes after the early capture still carries the previous session's quote time. The capture is then correctly refused as undated. This is the likely cause for GLND on 2026-11-17/18, after Cboe became the primary provider. The retry captures it again once it has traded.
+8. **RESULT.** One `GEM_RESULT PASS|PARTIAL|FAIL pass=N fail=M failed=[T,…]` line closes every run that reached VALIDATE, in the log and the day's claim receipt. The runner exits 0 for `PASS` and `PARTIAL`, and 1 only for `FAIL` (no ticker passed), an incomplete result set or a run error (`GEM_FAILED …`). A ticker that fails VALIDATE keeps its own `GEM_VALIDATE <T> FAIL` line; it no longer turns the unit red on its own, so read `GEM_RESULT` (or grep `PARTIAL`) to see it.
+9. **CONTAIN.**
    - `Type=oneshot` with `TimeoutStartSec=55min` (09:31 arm to the 10:20 deadline is 49 min), so the timeout bounds the whole run, plus `KillMode=control-group`. The runner's own SIGALRM stops at 10:20 New York.
    - `ExecStopPost=-…/gem_daily_contain.py` appends `CONTAINED result=… status=…` to the day's claim receipt, whatever the outcome.
    - The timer uses `Persistent=false`, so there are no catch-up runs.
@@ -83,7 +92,7 @@ systemctl list-timers grid-options-puller.timer
 ## First-run check
 
 - Check `/var/log/grid-options-puller.log` for eight `GEM_VALIDATE … PASS` lines, one `GEM_RESULT PASS pass=8 fail=0 failed=[]` and one `GEM_CONTAIN result=success`. `GEM_RESULT PARTIAL` also ends in `result=success`; its `failed=[…]` list names the tickers to look at.
-- Check `/data/grid_v4/gem_daily/attempts/<day>`. It should hold `STARTED`, then `GEM_TRIGGER … lag_s=…` (or a `GEM_SKIP` with its reason), the `GEM_VALIDATE` lines, and finally `CONTAINED`.
+- Check `/data/grid_v4/gem_daily/attempts/<day>`. It should hold `STARTED`, then `GEM_TRIGGER … lag_s=…` (or a `GEM_SKIP` with its reason), the `GEM_VALIDATE` lines (with a `GEM_REASON` line for each failure, and `GEM_RETRY` plus `attempt=2` lines when a retry ran), `GEM_RESULT`, and finally `CONTAINED`.
 - Call `GET /api/v1/derivatives/options-batches/SPY?snap_date=<day>`. It should list the scheduler batch and the `gem` batch.
 
 ## Re-pin (move a live, activated unit onto newer code)
