@@ -260,7 +260,7 @@ def test_crash_replay_same_bytes_then_different_bytes(tmp_path):
 
 def test_forward_never_peeks_before_its_look(tmp_path, monkeypatch):
     led = L.memory()
-    item = dict(F.QUEUE[-1])
+    item = dict(next(q for q in F.QUEUE if q["lane"] == "forward"))
     prop = F.build_proposal(item, TODAY)
     prop["window"]["n_target_sessions"] = 30
     sha = register(led, prop)
@@ -384,8 +384,9 @@ def test_code_hash_ignores_docstrings_not_code(tmp_path):
 
 def test_same_family_forward_twice_on_a_group_is_refused():
     led = L.memory()
-    register(led, F.build_proposal(dict(F.QUEUE[-1]), TODAY))
-    again = F.build_proposal(dict(F.QUEUE[-1]), TODAY + timedelta(days=3))
+    forward = next(q for q in F.QUEUE if q["lane"] == "forward")
+    register(led, F.build_proposal(dict(forward), TODAY))
+    again = F.build_proposal(dict(forward), TODAY + timedelta(days=3))
     assert "reuses consumed data" in S.check(again, L.load_state(led), TODAY + timedelta(days=3))["G7_fresh"]
 
 
@@ -568,6 +569,7 @@ def test_cli_cycle_sets_and_clears_the_g11_source(tmp_path, monkeypatch):
         return {}
 
     monkeypatch.setattr(CLI, "PolygonMinuteSource", FakeSource)
+    monkeypatch.setattr(CLI, "_extras", lambda source, data: {})  # the event families' sources (EC1)
     monkeypatch.setattr(CLI, "run_cycle", fake_cycle)
     for k in ("EDGE_STREAM_LEDGER_PATH", "EDGE_STREAM_ANCHOR_PATH"):
         monkeypatch.delenv(k, raising=False)
