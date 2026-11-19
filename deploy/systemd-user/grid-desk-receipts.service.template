@@ -16,6 +16,10 @@
 #   cp deploy/systemd-user/grid-desk-receipts.timer.template ~/.config/systemd/user/grid-desk-receipts.timer
 #   systemctl --user daemon-reload && systemctl --user enable --now grid-desk-receipts.timer
 # Moving to a new commit: make a new pinned checkout, point @CODE@ at it, daemon-reload.
+# Make the checkout under `umask 022`. grid's default is 002, which leaves the pinned calendar
+# file group-writable; the job refuses a group-writable calendar and would then refuse every
+# session (exit 2, no receipt). Check: stat -c %a docs/reference/calendar-manifests/xnys-rth-*.json
+# must print 644.
 # The log folder never moves and is never recreated.
 [Unit]
 Description=GRID Research Desk source receipt (latest closed session, read-only on sources, append-only log)

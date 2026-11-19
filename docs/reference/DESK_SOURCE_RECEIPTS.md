@@ -78,6 +78,10 @@ source returned. `ReceiptLog.payload(sha)` returns those bytes after re-hashing 
    fallback to the scheduler's approximate helpers. A test walks every day the manifest
    covers and requires the helpers to give the same sessions and closes, so the two are
    reconciled, not assumed. After 2027-12-31 the job refuses until a new manifest is pinned.
+   The manifest file must not be group- or world-writable, or it is refused the same way.
+   On grid-svr the `grid` user's umask is 002, so a pinned checkout has to be made under
+   `umask 022` (the file should be mode 644). A checkout made the default way would refuse
+   every session with exit 2 and write no receipt.
 2. **Only the latest closed session can be recorded.** Not a session still open, and not
    an older one once a later session has closed. This is what stops a brief date from one
    day being paired with a cutoff from another.

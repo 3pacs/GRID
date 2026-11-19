@@ -23,5 +23,10 @@ cannot sit in the release-tree directory by accident.
 
 Nothing installs these. The header of each template has the install lines.
 
+Make a pinned checkout under `umask 022`. The `grid` user's default is 002, which leaves
+checked-out files group-writable. Code that reads a pinned manifest
+(`ingestion.market_calendar.ManifestCalendar`) refuses a group- or world-writable file, so a
+checkout made under 002 fails at the first read, not at install.
+
 * `grid-desk-receipts.{service,timer}`: the Research Desk source receipt after each session
   close. See `docs/reference/DESK_SOURCE_RECEIPTS.md`.
