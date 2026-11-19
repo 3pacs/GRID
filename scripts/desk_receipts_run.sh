@@ -16,7 +16,9 @@
 #
 # Delivery is separate from recording and can be retried. Every run posts each
 # receipt whose (session, head) has no delivery note, oldest first, and writes
-# the note only after the reporter exits 0. A post that fails leaves the
+# the note only after the reporter exits 0 and prints its "sent" line.
+# agent-report exits 0 when it merely spooled a post the hub refused; that is
+# not a delivery here. A post that fails leaves the
 # receipt as it is, leaves the head pending, and makes this run exit 5, so the
 # next run (19:20, or the evening check) posts the same session and the same
 # head again. A run that finds nothing new to record still delivers what is
@@ -47,12 +49,21 @@ REPORT="${DESK_RECEIPTS_REPORT-agent-report}"
 say() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] desk-receipts: $*"; }
 field() { "$PY" -c 'import json,sys; v=json.load(sys.stdin).get(sys.argv[1]); print(",".join(v) if isinstance(v,list) else ("" if v is None else v))' "$1"; }
 dsr() { "$PY" -m intelligence.desk_source_receipts "$@"; }
-post() {  # post <slug> <body-file>; 0 only when the reporter took it
+post() {  # post <slug> <body-file>; 0 only when the reporter says the hub took it
+  # agent-report is fail-soft: it exits 0 when the hub refused the post and it
+  # only spooled it for later. So the exit code is not enough. A delivery
+  # counts when the reporter exits 0 AND prints its "sent" line for this slug.
+  local out
   if ! command -v "$REPORT" >/dev/null 2>&1; then
     say "hub reporter '$REPORT' not found"
     return 1
   fi
-  "$REPORT" desk-receipts "$1" "$2" >/dev/null 2>&1
+  out="$("$REPORT" desk-receipts "$1" "$2" 2>&1)" || { say "hub reporter exited nonzero for $1"; return 1; }
+  case "$out" in
+    *"agent-report sent: desk-receipts/$1 "*) return 0 ;;
+  esac
+  say "hub reporter did not confirm $1 (spooled or unanswered)"
+  return 1
 }
 alert() {  # alert <slug> <body-file>; a failure notice, best effort
   if [ -n "$REPORT" ] && post "$1" "$2"; then

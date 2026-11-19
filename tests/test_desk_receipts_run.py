@@ -6,7 +6,8 @@
 * The script, with a stub recorder and a stub hub reporter: posts each pending
   head and notes the delivery only when the post succeeded; a failed post
   exits 5 and the same session and head are posted on the retry; a head once
-  delivered is not posted again; a crash or a broken log is a nonzero exit.
+  delivered is not posted again; a post the reporter only spooled is not a
+  delivery; a crash or a broken log is a nonzero exit.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ def run(tmp_path):
     def go(record_out: str, record_rc: int = 0, verify_out: str = VERIFY_OK, verify_rc: int = 0,
            reporter_on: bool = True, receipts: tuple[str, ...] = (ROW_18,),
            reporter_fails: int = 0, reporter: str | None = None, status_rc: int = 0,
-           mark_rc: int = 0):
+           mark_rc: int = 0, spool_only: bool = False):
         rows = tmp_path / "rows"
         rows.write_text("".join(row + "\n" for row in receipts), encoding="utf-8")
         stub_py = tmp_path / "py"
@@ -99,7 +100,11 @@ def run(tmp_path):
             "#!/usr/bin/env bash\n"
             f'echo "$2" >> "{calls}"\n'
             f'[ "$(wc -l < "{calls}")" -gt {reporter_fails} ] || exit 1\n'
-            f'cp "$3" "{posts}/$2.md"\n', encoding="utf-8")
+            f'if [ {int(spool_only)} -eq 1 ]; then echo "agent-report: hub POST failed for $1/$2; '
+            'spooled for retry (fail-soft)" >&2; exit 0; fi\n'
+            f'cp "$3" "{posts}/$2.md"\n'
+            'echo "[2026-11-19T21:20:05Z] agent-report sent: $1/$2 from grid-svr"\n',
+            encoding="utf-8")
         for path in (stub_py, stub_reporter):
             path.chmod(path.stat().st_mode | stat.S_IEXEC)
         if reporter is None:
@@ -205,6 +210,20 @@ def test_unreadable_witness_status_is_exit_5_not_a_quiet_pass(run):
 
     assert done.returncode == 5 and posts == {}
     assert "delivery not attempted" in done.stdout
+
+
+def test_a_post_the_reporter_only_spooled_is_not_a_delivery(run):
+    """The real agent-report exits 0 when the hub refused the post and it kept
+    the payload for later. That must not be noted as handed to the witness."""
+    done, posts = run(RECORD_WRITTEN, spool_only=True)
+
+    assert done.returncode == 5 and posts == {} and run.notes() == []
+    assert "did not confirm desk-receipt-2026-11-18" in done.stdout
+
+    retry, posts = run(RECORD_NOOP)
+
+    assert retry.returncode == 0 and list(posts) == ["desk-receipt-2026-11-18.md"]
+    assert run.notes() == [f"2026-11-18.{HEAD_18}"]
 
 
 def test_a_reporter_that_is_not_installed_is_a_failed_delivery(run):

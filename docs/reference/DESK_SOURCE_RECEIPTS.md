@@ -204,11 +204,15 @@ the agent hub, oldest first:
 | Recorder crashed | `desk-receipts-crash-<date>`, best effort | 3 |
 | Log failed verification | `desk-receipts-broken-<date>`, best effort | 4 |
 
-A post that fails is not a success. The run exits 5, the head stays `pending`, and the next
+A post that fails is not a success. `agent-report` is fail-soft: it exits 0 even when the hub
+refused the post and it only spooled it. So a delivery counts only when the reporter exits 0
+and prints its `agent-report sent: desk-receipts/<slug>` line. Otherwise the run exits 5, the head stays `pending`, and the next
 run (19:20, or the evening check's extra start) posts the same session and the same head. A
 run that records nothing new still delivers what is pending. A head already noted as
 delivered is not posted again. The text of a post depends only on the session and head, so
-a repeat is the same bytes. With `DESK_RECEIPTS_REPORT` empty, delivery is off: the run says
+a repeat is the same bytes. The hub de-duplicates on date, agent, host and slug, so a repeat on
+a later UTC date, or a spooled post flushed after a retry got through, can leave two hub
+entries for one head. They say the same thing; the earliest arrival is the witness time. With `DESK_RECEIPTS_REPORT` empty, delivery is off: the run says
 which sessions are pending and exits 0.
 
 A hub post is the log's off-host copy for now. The hub is on another host and is mirrored to
