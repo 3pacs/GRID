@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Write the GEX native-volume snapshot (``ingestion.gex_native_volume``).
 
-One Schwab ``/quotes`` and one ``/pricehistory`` call per run, read-only.
+One Schwab ``/quotes`` and one ``/pricehistory`` call per run, read-only. Each
+regular-session run also appends (receipt time, quote totalVolume) to a private
+per-session file beside the snapshot (``quote-samples-<session>.jsonl``, 0600),
+which the VWAP weighting reads back (see ``ingestion.gex_native_volume``).
 The snapshot is written atomically (mkstemp + fsync + os.replace) into a
 directory the operator created for it: owned by this uid, mode 0700. The file
 is mode 0600, which is what gex-watch's reader requires (both run as grid).
@@ -50,7 +53,34 @@ def write_private(path: Path, data: dict) -> None:
             os.unlink(tmp)
 
 
-def run_once(client, out: Path | None) -> tuple[dict, dict]:
+def samples_path(out: Path, session: str) -> Path:
+    return out.parent / f"quote-samples-{session}.jsonl"
+
+
+def load_samples(path: Path | None) -> list[tuple[float, int]]:
+    if path is None or not path.exists():
+        return []
+    got = []
+    for line in path.read_text().splitlines():
+        try:
+            r = json.loads(line)
+            got.append((float(r["t"]), int(r["q"])))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return got
+
+
+def append_sample(path: Path, t: float, q: int) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (json.dumps({"t": t, "q": q}) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def run_once(client, out: Path | None, memory: list[tuple[float, int]] | None = None) -> tuple[dict, dict]:
+    """``memory``: today's samples when nothing is written (--print / --dry-run loops keep them in memory)."""
     now = time.time()
     try:
         _, current, _ = nv.calendar_window(now)
@@ -64,8 +94,16 @@ def run_once(client, out: Path | None) -> tuple[dict, dict]:
     quote = client.quotes(nv.SYMBOL).get(nv.SYMBOL)
     history = client.price_history(nv.SYMBOL, **nv.history_params(now))
     receipt = time.time()
-    payload, info = nv.compute(history, getattr(quote, "total_volume", None), now=time.time(), receipt_at=receipt)
+    total = getattr(quote, "total_volume", None)
+    spath = samples_path(out, nv._session(now).isoformat()) if out is not None else None
+    earlier = load_samples(spath) if out is not None else list(memory or [])
+    payload, info = nv.compute(history, total, now=time.time(), receipt_at=receipt, quote_samples=earlier)
     env = nv.envelope(payload, nv.provenance(info["bars"]))
+    if type(total) is int and total > 0:
+        if out is not None:
+            append_sample(spath, nv._micro(receipt), total)
+        elif memory is not None:
+            memory.append((nv._micro(receipt), total))
     if out is not None:
         write_private(out, env)
     return env, info
@@ -86,9 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     client = SchwabMarketClient()
+    memory: list[tuple[float, int]] = []
     while True:
         try:
-            env, info = run_once(client, None if (args.print or args.dry_run) else args.out)
+            env, info = run_once(client, None if (args.print or args.dry_run) else args.out, memory)
             pl = env["payload"]
             r = info.get("reconciliation") or {}
             line = (f"{env['generated_at']} {pl['status']} {pl.get('reason') or '-'} "

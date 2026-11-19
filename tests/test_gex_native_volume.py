@@ -75,7 +75,8 @@ def test_ready_payload_is_exactly_the_readers_contract():
     for k in ("historical_request", "signal_confirmation", "exact_trade_vwap", "cross_source_reconciled", "live"):
         assert p[k] is False, k
     assert p["baseline_errors"] == {}
-    assert p["vwap_basis"] == "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+    assert p["vwap_basis"] == ("HLC3 of native one-minute bars weighted by Schwab quote totalVolume increments "
+                               "(bar volume where no earlier sample); not trade VWAP")
     assert p["rvol_basis"] == "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
     assert p["cumulative_shares"] == 60 * 150_000 and type(p["cumulative_shares"]) is int
     assert p["completed_minutes"] == 60 and len(p["source_revisions"]) == 60
@@ -499,3 +500,77 @@ def test_runner_open_session_still_uses_one_quote_and_one_history_call(monkeypat
     env, _ = snap.run_once(FakeClient(), None)
     assert env["payload"]["status"] == "ready"
     assert calls == [("quotes", "SPY"), ("history", "SPY", nv.history_params(NOW))]
+
+
+
+# ---------------------------------------------------------------- quote-volume weighting (2026-11-19)
+
+def _bar(d: date, hh: int, mm: int, v: int, px: float):
+    t = _ts(d, hh, mm)
+    return (t, px + 0.3, px - 0.3, px + 0.1, v)          # HLC3 = px + 1/30
+
+
+def test_without_earlier_samples_the_vwap_is_the_bar_weighted_one():
+    bars = [_bar(TODAY, 9, 30 + i, 100 + 50 * i, 700.0 + i) for i in range(5)]
+    vwap, used = nv.quote_weighted_vwap(bars, [(_ts(TODAY, 9, 35, 7), 10_000)])
+    bar_vwap = sum((b[1] + b[2] + b[3]) / 3 * b[4] for b in bars) / sum(b[4] for b in bars)
+    assert abs(vwap - bar_vwap) < 1e-12 and used == {"quote_weighted_blocks": 0, "bar_weighted_blocks": 1}
+
+
+def test_blocks_are_weighted_by_the_counters_rise_since_the_previous_run():
+    # runs at 09:31:07, 09:32:07, 09:33:07: bars 09:30, 09:31, 09:32 each complete in one run
+    bars = [_bar(TODAY, 9, 30, 100, 700.0), _bar(TODAY, 9, 31, 100, 701.0), _bar(TODAY, 9, 32, 100, 702.0)]
+    samples = [(_ts(TODAY, 9, 31, 7), 5_000), (_ts(TODAY, 9, 32, 7), 5_300), (_ts(TODAY, 9, 33, 7), 6_200)]
+    vwap, used = nv.quote_weighted_vwap(bars, samples)
+    p = [700.0 + 1 / 30, 701.0 + 1 / 30, 702.0 + 1 / 30]
+    want = (p[0] * 100 + p[1] * 300 + p[2] * 900) / 1300           # first block by its bar volume, then the rises
+    assert abs(vwap - want) < 1e-9 and used == {"quote_weighted_blocks": 2, "bar_weighted_blocks": 1}
+
+
+def test_a_missed_run_merges_its_bars_and_a_falling_counter_falls_back_to_bar_volume():
+    bars = [_bar(TODAY, 9, 30, 100, 700.0), _bar(TODAY, 9, 31, 300, 701.0), _bar(TODAY, 9, 32, 100, 702.0)]
+    samples = [(_ts(TODAY, 9, 31, 7), 5_000), (_ts(TODAY, 9, 33, 7), 4_000)]       # 09:32:07 missed; counter fell
+    vwap, used = nv.quote_weighted_vwap(bars, samples)
+    p1 = ((701.0 + 1 / 30) * 300 + (702.0 + 1 / 30) * 100) / 400
+    assert abs(vwap - ((700.0 + 1 / 30) * 100 + p1 * 400) / 500) < 1e-9 and used["bar_weighted_blocks"] == 2
+
+
+def test_compute_uses_the_samples_and_keeps_the_payload_contract():
+    hist = _history()
+    early = [(_ts(TODAY, 9, 30) + 60 * (i + 1) + 7, 1_000_000 + 200_000 * i) for i in range(59)]
+    pl, info = nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=RECEIPT, quote_samples=early)
+    assert pl["status"] == "ready" and set(pl) == READER_FIELDS and pl["vwap_basis"] == nv.VWAP_BASIS
+    assert info["vwap_weighting"]["quote_weighted_blocks"] >= 58
+
+
+def test_the_runner_keeps_todays_samples_privately_and_reads_them_back(tmp_path, monkeypatch):
+    import scripts.gex_native_volume_snapshot as snap
+    d = tmp_path / "snap"
+    d.mkdir(mode=0o700)
+    out = d / "snapshot.json"
+    clock = {"t": RECEIPT}
+
+    class Quote:
+        def __init__(self, v):
+            self.total_volume = v
+
+    class Client:
+        n = 0
+
+        def quotes(self, sym):
+            Client.n += 1
+            return {sym: Quote(_quote(60 * 150_000) + Client.n * 1000)}
+
+        def price_history(self, sym, **kw):
+            return _history()
+
+    monkeypatch.setattr(snap.time, "time", lambda: clock["t"])
+    snap.run_once(Client(), out)
+    clock["t"] += 60
+    env, info = snap.run_once(Client(), out)
+    path = d / f"quote-samples-{TODAY.isoformat()}.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    assert len(lines) == 2 and lines[1]["q"] - lines[0]["q"] == 1000 and stat.S_IMODE(path.stat().st_mode) == 0o600
+    memory = []
+    snap.run_once(Client(), None, memory)
+    assert len(memory) == 1
