@@ -4,7 +4,9 @@
 One Schwab ``/quotes`` and one ``/pricehistory`` call per run, read-only. Each
 regular-session run also appends (receipt time, quote totalVolume) to a private
 per-session file beside the snapshot (``quote-samples-<session>.jsonl``, 0600),
-which the VWAP weighting reads back (see ``ingestion.gex_native_volume``).
+which the VWAP weighting reads back (see ``ingestion.gex_native_volume``). The
+last run before the bell (within ``PRE_OPEN_WINDOW_S``) makes one ``/quotes``
+call only and appends that reading as the pre-open sample; it writes no snapshot.
 The snapshot is written atomically (mkstemp + fsync + os.replace) into a
 directory the operator created for it: owned by this uid, mode 0700. The file
 is mode 0600, which is what gex-watch's reader requires (both run as grid).
@@ -79,6 +81,26 @@ def append_sample(path: Path, t: float, q: int) -> None:
         os.close(fd)
 
 
+def pre_open_sample(client, out: Path | None, memory: list[tuple[float, int]] | None, now: float) -> bool:
+    """One quote call (no history, no snapshot) on the run just before the bell; True when a sample was kept."""
+    try:
+        session = nv.pre_open_session(now)
+    except (OSError, ValueError):
+        return False
+    if session is None or (out is None and memory is None):
+        return False
+    quote = client.quotes(nv.SYMBOL).get(nv.SYMBOL)
+    receipt = nv._micro(time.time())
+    total = getattr(quote, "total_volume", None)
+    if type(total) is not int or total <= 0 or receipt >= session.opens.timestamp():
+        return False
+    if out is not None:
+        append_sample(samples_path(out, nv._session(now).isoformat()), receipt, total)   # same file as the session's runs
+    else:
+        memory.append((receipt, total))
+    return True
+
+
 def run_once(client, out: Path | None, memory: list[tuple[float, int]] | None = None) -> tuple[dict, dict]:
     """``memory``: today's samples when nothing is written (--print / --dry-run loops keep them in memory)."""
     now = time.time()
@@ -88,8 +110,11 @@ def run_once(client, out: Path | None, memory: list[tuple[float, int]] | None = 
         current = None
     if current is None:
         # Known closure or unavailable pinned calendar: no Schwab calls and no
-        # write (the private reader lets the previous snapshot age out).
+        # write (the private reader lets the previous snapshot age out) -- except
+        # on the last run before today's bell, which takes one quote reading and
+        # keeps it as the pre-open sample (the scope gate's since-open base).
         payload, info = nv.compute({}, None, now=now, receipt_at=now)
+        info["pre_open_sample"] = pre_open_sample(client, out, memory, now)
         return nv.envelope(payload, nv.provenance([])), info
     quote = client.quotes(nv.SYMBOL).get(nv.SYMBOL)
     history = client.price_history(nv.SYMBOL, **nv.history_params(now))
@@ -133,6 +158,10 @@ def main(argv: list[str] | None = None) -> int:
             line = (f"{env['generated_at']} {pl['status']} {pl.get('reason') or '-'} "
                     f"bars={r.get('bars_total_volume')} quote={r.get('quote_total_volume')} "
                     f"diff={r.get('relative_difference')}")
+            if r.get("gate_basis") == "since_open" and pl["status"] != "ready":
+                line += f" since_open={r.get('since_open_difference')}"          # ready lines keep their exact form
+            if info.get("pre_open_sample"):
+                line += " pre_open_sample=kept"
             print(json.dumps(env, indent=1) if args.print else line, flush=True)
             rc = 0
         except SchwabError as exc:
