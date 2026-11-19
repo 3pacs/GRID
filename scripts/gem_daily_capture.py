@@ -518,6 +518,39 @@ def _wait_for_retry(day: date) -> bool:
         _sleep(min((target - now).total_seconds(), 30.0))
 
 
+def _retry_failed(day: date, engine, puller_cls, failed: list[str],
+                  verdicts: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    """One more capture for ``failed`` tickers; never worse than the first pass.
+
+    Any error in the retry (database, provider, or the 10:20 SIGALRM
+    ``TimeoutError`` while it waits or runs) is recorded as ``GEM_RETRY FAIL
+    <ExcName>`` and the first-pass verdicts stand, so a 7/8 day still ends in
+    ``GEM_RESULT PARTIAL`` instead of ``GEM_FAILED`` with no result line.
+    """
+    try:
+        if not _wait_for_retry(day):
+            _record(day, f"GEM_RETRY SKIP latest start 10:05 New York reached "
+                         f"failed=[{','.join(failed)}]")
+            return verdicts
+        _record(day, f"GEM_RETRY START tickers=[{','.join(failed)}]")
+        retried = puller_cls(db_engine=engine).pull_all(
+            tickers=failed, include_catalyst_universe=False,
+            max_expirations=GEM_MAX_EXPIRATIONS,
+            should_continue=lambda: _utc_now() < _session_deadline(day),
+            capture_source=GEM_CAPTURE_SOURCE,
+        )
+        if len(retried) != len(failed) or [r.get("ticker") for r in retried] != failed:
+            _record(day, "GEM_RETRY FAIL incomplete result set")
+            return verdicts
+        with engine.connect() as conn:
+            conn.execute(text("SET statement_timeout = '20s'"))
+            second = dict(_validate_results(conn, day, retried, attempt=2))
+    except Exception as exc:  # noqa: BLE001 - the retry must not undo the first pass
+        _record(day, f"GEM_RETRY FAIL {type(exc).__name__}")
+        return verdicts
+    return [(t, second.get(t, ok)) for t, ok in verdicts]
+
+
 def _record_result(day: date, verdicts: list[tuple[str, bool]]) -> int:
     """Record one ``GEM_RESULT`` line for the run and return its exit code.
 
@@ -615,24 +648,7 @@ def main() -> int:
             verdicts = _validate_results(conn, day, results, attempt=1)
         failed = [ticker for ticker, ok in verdicts if not ok]
         if failed:
-            if not _wait_for_retry(day):
-                _record(day, f"GEM_RETRY SKIP latest start 10:05 New York reached "
-                             f"failed=[{','.join(failed)}]")
-            else:
-                _record(day, f"GEM_RETRY START tickers=[{','.join(failed)}]")
-                retried = OptionsPuller(db_engine=engine).pull_all(
-                    tickers=failed, include_catalyst_universe=False,
-                    max_expirations=GEM_MAX_EXPIRATIONS,
-                    should_continue=lambda: _utc_now() < _session_deadline(day),
-                    capture_source=GEM_CAPTURE_SOURCE,
-                )
-                if len(retried) != len(failed) or [r.get("ticker") for r in retried] != failed:
-                    _record(day, "GEM_RETRY FAIL incomplete result set")
-                else:
-                    with engine.connect() as conn:
-                        conn.execute(text("SET statement_timeout = '20s'"))
-                        second = dict(_validate_results(conn, day, retried, attempt=2))
-                    verdicts = [(t, second.get(t, ok)) for t, ok in verdicts]
+            verdicts = _retry_failed(day, engine, OptionsPuller, failed, verdicts)
         return _record_result(day, verdicts)
     except Exception as exc:  # noqa: BLE001 - process boundary; no secret-bearing text
         _record(day, f"GEM_FAILED {type(exc).__name__}")

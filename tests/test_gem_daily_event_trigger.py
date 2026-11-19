@@ -176,7 +176,8 @@ UNDATED = ("incomplete options chain response: 0 failed expiry fetch(es), 1 unda
            "0 empty of 6 expiries, 0 contracts, timed_out=False")
 
 
-def _capture_run(armed, monkeypatch, failing, retry_failing=None, *, capture_minutes=0):
+def _capture_run(armed, monkeypatch, failing, retry_failing=None, *, capture_minutes=0,
+                 retry_raises=None):
     """Run main() through capture, VALIDATE and the retry.
 
     ``failing`` tickers fail the first capture; ``retry_failing`` (default:
@@ -196,6 +197,8 @@ def _capture_run(armed, monkeypatch, failing, retry_failing=None, *, capture_min
         def pull_all(self, tickers, **_kwargs):
             bad = plan[min(len(calls), 1)]
             calls.append((list(tickers), armed.clock.now))
+            if len(calls) == 2 and retry_raises is not None:
+                raise retry_raises
             if len(calls) == 1:
                 armed.clock.now += timedelta(minutes=capture_minutes)
             return [{"ticker": t, "status": "FAILED" if t in bad else "SUCCESS",
@@ -451,3 +454,28 @@ def test_no_retry_once_the_latest_start_has_passed(armed, monkeypatch) -> None:
 ])
 def test_failure_reason_is_short_and_secret_free(result, expected) -> None:
     assert daily._failure_reason(result) == expected
+
+
+@pytest.mark.parametrize("exc", [
+    TimeoutError("GEM absolute 10:20 New York containment"),  # SIGALRM during the retry
+    OSError("connection refused"),
+])
+def test_retry_error_keeps_the_first_pass_and_its_result_line(armed, monkeypatch, exc) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set(), retry_raises=exc) == 0
+    receipt = _receipt(armed)
+    assert f"GEM_RETRY FAIL {type(exc).__name__}" in receipt
+    assert "GEM_FAILED" not in receipt
+    assert (f"GEM_RESULT PARTIAL pass={len(daily.GEM_TICKERS) - 1} fail=1 failed=[GLND]"
+            in receipt)
+
+
+def test_alarm_while_waiting_for_the_retry_keeps_the_first_pass(armed, monkeypatch) -> None:
+    def _alarm(_seconds):
+        raise TimeoutError("GEM absolute 10:20 New York containment")
+
+    monkeypatch.setattr(daily, "_sleep", _alarm)
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set()) == 0
+    receipt = _receipt(armed)
+    assert len(armed.calls) == 1
+    assert "GEM_RETRY FAIL TimeoutError" in receipt
+    assert "GEM_RESULT PARTIAL" in receipt

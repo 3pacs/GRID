@@ -31,6 +31,7 @@ The runner is `scripts/gem_daily_capture.py`. Every gate fails closed.
    - `GEM_RETRY START tickers=[…]` opens the retry;
    - each retried ticker gets its own `GEM_VALIDATE <T> PASS|FAIL … attempt=2` line;
    - `GEM_RETRY SKIP latest start 10:05 New York reached failed=[…]` means no retry ran.
+   - `GEM_RETRY FAIL <reason>` means the retry itself errored (database, provider, or the 10:20 alarm while it waited or ran). The first-pass verdicts stand, and the run still ends in `GEM_RESULT`.
 
    The retry's verdict replaces the first one in `GEM_RESULT`.
    Why: a thin name whose first regular-session trade comes after the early capture still carries the previous session's quote time. The capture is then correctly refused as undated. This is the likely cause for GLND on 2026-11-17/18, after Cboe became the primary provider. The retry captures it again once it has traded.
