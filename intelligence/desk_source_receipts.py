@@ -75,6 +75,7 @@ import functools
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time as _time
@@ -83,6 +84,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from loguru import logger as log
@@ -124,6 +126,13 @@ THESIS_LOG_MISSING = (
     "no designated research-disposition log exists (3pacs/GRID#1165); "
     "thesis_snapshots is a market-direction table scored in place and is not it"
 )
+
+
+PANEL_TRIALS_NOT_NAMED = (
+    "no live trial ledger was named for this run (--panel-trials-db); "
+    "its head is unknown tonight, not unchanged"
+)
+PANEL_FACTORY_FAMILY = "panel-factory"
 
 
 class ReceiptError(RuntimeError):
@@ -338,6 +347,77 @@ def sleuth_leads_source(engine: Any, lookback_days: int = LEAD_LOOKBACK_DAYS) ->
                    "created_until": cutoff.isoformat(),
                    "snapshot": "one database snapshot for leads and tests",
                    "state": "as read; rows are changed in place after the close"})
+
+    return read
+
+
+def panel_trials_source(db: Path | None) -> Source:
+    """The live trial ledger: gex-signals' ``panel_trials`` table (SQLite), where
+    every forward test is registered before it records, and ``factory_looks``,
+    where a factory slot's one look is stored (3pacs/GRID#1162).
+
+    One read-only transaction. The payload holds the chain's head and row
+    count, the trials per family, each ``panel-factory`` slot's registration
+    hash, and the sha256 of each stored look. With the nightly hub post this
+    puts the head off-host every session, so a registration or a look that is
+    later edited or removed no longer matches a head this host cannot rewrite.
+
+    What is checked here: each row's ``prev_hash`` is the row before it. What
+    is not: a row's hash is not recomputed from its fields. That recipe lives
+    in gex-signals (``panel.verify_trials``) and is not copied into GRID.
+    """
+
+    def read(_cutoff: datetime) -> SourceRead:
+        if db is None:
+            raise SourceUnavailable(PANEL_TRIALS_NOT_NAMED)
+        try:
+            conn = sqlite3.connect(f"file:{quote(str(Path(db).absolute()))}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error as exc:
+            raise SourceUnavailable(f"the live trial ledger could not be opened ({type(exc).__name__})") from None
+        try:
+            conn.execute("BEGIN")
+            trials = conn.execute(
+                "SELECT seq, trial_id, family, registered_at, prev_hash, row_hash "
+                "FROM panel_trials ORDER BY seq"
+            ).fetchall()
+            has_looks = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'factory_looks'"
+            ).fetchone() is not None
+            looks = conn.execute(
+                "SELECT trial_id, looked_at, through_day, result FROM factory_looks ORDER BY trial_id"
+            ).fetchall() if has_looks else None
+        except sqlite3.Error as exc:
+            raise SourceUnavailable(f"the live trial ledger could not be read ({type(exc).__name__})") from None
+        finally:
+            conn.close()
+        previous = None
+        families: dict[str, int] = {}
+        for seq, _trial, family, _registered, prev_hash, row_hash in trials:
+            if prev_hash != previous or not (isinstance(row_hash, str) and len(row_hash) == 64):
+                raise SourceUnavailable(f"the live trial ledger's hash links are broken at row {seq}")
+            previous = row_hash
+            families[family or "none"] = families.get(family or "none", 0) + 1
+        payload = {
+            "store": "panel_trials",
+            "rows": len(trials),
+            "head": previous,
+            "links_checked": True,
+            "row_hashes_recomputed": False,
+            "families": dict(sorted(families.items())),
+            "factory_slots": [
+                {"trial_id": t[1], "registered_at": t[3], "row_hash": t[5]}
+                for t in trials if t[2] == PANEL_FACTORY_FAMILY
+            ],
+            "factory_looks": None if looks is None else [
+                {"trial_id": row[0], "looked_at": row[1], "through_day": row[2],
+                 "result_sha256": sha256_hex(str(row[3]).encode("utf-8"))}
+                for row in looks
+            ],
+        }
+        return SourceRead(payload=payload, rows=len(trials),
+                          scope={"database": Path(db).name, "snapshot": "one read-only transaction",
+                                 "state": "as read; not limited to the session close",
+                                 "row_hashes": "linked here; recomputed only by gex-signals"})
 
     return read
 
@@ -791,11 +871,13 @@ def _broken(n: int, index: int, detail: str) -> dict:
 # ── command line ────────────────────────────────────────────────────────────
 
 
-def default_sources(engine: Any, factory_ledger: Path, factory_anchor: Path) -> dict[str, Source]:
+def default_sources(engine: Any, factory_ledger: Path, factory_anchor: Path,
+                    panel_trials_db: Path | None = None) -> dict[str, Source]:
     return {
         "factory_ledger": factory_ledger_source(factory_ledger, factory_anchor),
         "sleuth_leads": sleuth_leads_source(engine),
         "thesis_log": thesis_log_source(),
+        "panel_trials": panel_trials_source(panel_trials_db),
     }
 
 
@@ -818,6 +900,8 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--dir", type=Path, required=True)
     rec.add_argument("--factory-ledger", type=Path, required=True)
     rec.add_argument("--factory-anchor", type=Path, required=True)
+    rec.add_argument("--panel-trials-db", type=Path,
+                     help="gex-signals signals.db; without it the live trial ledger is recorded as unknown")
     rec.add_argument("--session", type=date.fromisoformat)
     ver = sub.add_parser("verify", help="check the chain, anchors and payloads")
     ver.add_argument("--dir", type=Path, required=True)
@@ -866,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     from db import get_engine
 
-    sources = default_sources(get_engine(), args.factory_ledger, args.factory_anchor)
+    sources = default_sources(get_engine(), args.factory_ledger, args.factory_anchor, args.panel_trials_db)
     try:
         result = log.record(sources, session=args.session)
     except ReceiptError as exc:

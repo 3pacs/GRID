@@ -68,6 +68,16 @@ source returned. `ReceiptLog.payload(sha)` returns those bytes after re-hashing 
 | `factory_ledger` | One stable read of the module-factory ledger and its anchor (two passes that agree), then `verify(full=True)` and `summarize()` on those bytes only | Ledger id, head hash, file hashes, `summarize()`: all of one version |
 | `sleuth_leads` | Leads with `origin = 'intersection'` created in the 60 days up to the cutoff, with their tests, in one database snapshot | The rows, sorted by id, each with `declared_tests` (verified only), `unverified_tests` and `test_link_problems` |
 | `thesis_log` | Nothing: no log exists | None. Recorded as `unknown` on every receipt until #1165 lands |
+| `panel_trials` | gex-signals' live trial ledger (`signals.db`, read-only, one transaction): the `panel_trials` chain and the stored looks of factory slots (`factory_looks`) | Chain head, row count, trials per family, each `panel-factory` slot's registration hash, the sha256 of each stored look. `unknown` when no database is named (`--panel-trials-db`), the file or table cannot be read, or a row does not link to the one before it |
+
+`panel_trials` is the off-host witness of the live record that #1162 asks for. Every forward
+test is registered in that chain before it records, and a factory slot's one look is stored
+beside it. Once the nightly head is in a hub post, a registration or a look that is later
+edited or removed no longer matches a head grid-svr cannot rewrite. Two limits. The source
+checks that each row links to the one before it; it does not recompute a row's hash from
+its fields, because that recipe belongs to gex-signals (`panel.verify_trials`) and is not
+copied here. And it is a nightly reading, so a change made and undone between two closes is
+not seen.
 
 ## Rules
 
@@ -255,4 +265,9 @@ journalctl --user -u grid-desk-receipts -n 40
 - A receipt is not the native Factory report, not a research-disposition thesis row
   (#1165) and not a live Factory slot (#1161/#1162). Those stay unknown or not supplied.
 - The Desk brief does not read receipts yet. That adapter is in the consumer lane.
-- Live factory slots (#1161) are not a source yet; they do not exist.
+- The `panel_trials` source is in the code but not in the running copy, which is pinned to
+  an earlier commit. It starts when the owner moves the unit to a new pinned checkout. Until
+  then no receipt has a `panel_trials` entry.
+- The evening check on grid-svr treats any unknown source other than `thesis_log` as a
+  failure, so a new pinned checkout must set `DESK_PANEL_TRIALS_DB` (the template does).
+- No factory slot is registered (0 of 10), so the slots and looks in the payload are empty.
