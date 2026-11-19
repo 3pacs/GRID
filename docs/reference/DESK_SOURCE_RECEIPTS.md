@@ -121,8 +121,15 @@ host and is mirrored to the vault on GitHub, so each night's full head hash is h
 a timestamp, where grid-svr cannot rewrite it. It is weaker than a committed anchor file:
 a person compares it with `verify`; `verify --external-anchors` does not read it.
 
-Owner of failures: Claude (builder). Backup: Anik. A failed night cannot be made up after
-the next close, so a crash or broken-log post needs attention the same evening.
+A failed night cannot be made up after the next close, so a failure needs attention the
+same evening. Who hears about it: a second user timer on grid-svr,
+`grid-desk-receipts-check.timer` (weekdays 19:45 New York, after both attempts), checks
+that the latest closed session has a receipt, the log verifies, the hub holds the post and
+no source other than `thesis_log` is unknown. A good night is silent. A missing receipt
+gets one more start of the job. Anything still wrong is pushed to the owner's phone. That
+check lives outside this repo (`/data/agent-home/anikdang/desk-receipts/check/` on
+grid-svr) because it depends on the owner's push tool. Owner of failures: Anik, by that
+push. Builder to call on: Claude.
 
 To check it on grid-svr:
 
