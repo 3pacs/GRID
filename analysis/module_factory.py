@@ -29,9 +29,37 @@ closes at the decision time T, i.e. the bar stamped T-1):
 * ``F11``: position of SPY in the prior session's range;
 * ``F1_shift30``: change of ``F1`` over the last 30 minutes.
 
+Factory 2 (3pacs/GRID#1156) adds the rest of edge9's price/momentum class
+(:data:`PRICE_CLASS_SPECS`, edge9 ``dials_edge9.build_moments`` definitions
+with amendments 1-3), over SPY, QQQ, RSP, HYG, VIXY and TLT. The target is
+still SPY's move; the other five symbols enter only as features:
+
+* ``F2``: VIXY return since its prior close minus beta x SPY's (beta: OLS of
+  daily close-to-close returns over the previous ``beta_history`` sessions);
+* ``F3``: RSP return minus SPY return since the prior close;
+* ``F4``: HYG return minus beta x SPY's, as ``F2``;
+* ``F5``: TLT return since the prior close;
+* ``F6``: QQQ minus SPY return over the last 30 minutes;
+* ``S6``: month-end pressure: in a month's last 3 sessions, SPY minus TLT
+  month-to-date return to the prior close, else 0;
+* ``<dial>_shift30`` for F2..F6, F10 and F11: the dial at the bar closing at
+  T minus the dial 30 minutes earlier (as ``F1_shift30``).
+
+Every symbol's price is the close of its last bar stamped at or before T-1.
+A non-SPY price is missing when that bar is more than ``stale_minutes`` old
+(edge9 amendment 2), and a prior close is missing unless the prior session's
+last bar starts at or after 15:50. A feature built on a missing price is
+None (it never fires); nothing is filled. The flow dials (F7-F9, tape) and
+the FRED dials (S1-S5, macro) are later factory classes.
+
 Each is turned into a robust z against the same feature at the same decision
 time over the previous ``z_history`` eligible sessions (median / 1.4826 MAD,
 capped at +/-4), so a threshold never uses data after its decision.
+
+The report adds the co-firing matrix of the run's decision signals
+(``cofiring.json``, hashed into the report) and clusters built from fire
+overlap only, never from returns (:func:`analysis.factory_stats.cofiring`),
+with one representative per cluster: one idea, at most one live slot.
 
 Variables are locked to declared pieces: every feature has a spec
 (:data:`FEATURE_SPECS`: definition, unit, source, live source, point-in-time
@@ -76,10 +104,12 @@ from zoneinfo import ZoneInfo
 from analysis import ledger_steered_exploration as lse
 from analysis.factory_session_calendar import FactoryCalendar
 from analysis.factory_stats import (
+    COFIRING_MEASURES,
     FACTORY_ORIGIN,
     MAX_T_SELECTION,
     NET_WHEN_FIRES,
     FactoryProtocol,
+    cofiring,
     discover,
 )
 from analysis.offline_research_proof import digest, write_once
@@ -117,7 +147,93 @@ FEATURE_SPECS = {
         "pit": "bars stamped T-31 and T-1",
     },
 }
+# FEATURE_SPECS / FEATURES / raw_features stay the SPY-only factory 1 set: the
+# live parity check (#1160) compares exactly these against the live recorder.
 FEATURES = tuple(FEATURE_SPECS)
+SYMBOLS = ("SPY", "QQQ", "RSP", "HYG", "VIXY", "TLT")
+_DATA = "staged edge9/bars.db, {} 1-minute bars (Databento XNAS)"
+_SPY_LIVE = "gex-signals bars_1m_live, SPY (Schwab)"
+_NOT_LIVE = "none yet: {} not in the live RTD subscription (design gap 8); research-only until recorded live"
+_PIT_RET = ("bars stamped at or before T-1; a non-SPY price older than stale_minutes is missing; "
+            "prior closes from a last bar at or after 15:50")
+
+
+def _shift_spec(dial: str, spec: dict) -> dict:
+    return {
+        "definition": f"{dial} at the bar closing at T minus {dial} at the bar 30 minutes earlier",
+        "unit": spec["unit"],
+        "source": spec["source"],
+        "live_source": spec["live_source"],
+        "pit": spec["pit"] + "; the earlier value from bars stamped at or before T-31",
+        "symbols": spec["symbols"],
+    }
+
+
+_LEVELS = {
+    "F2": {
+        "definition": "VIXY return since its prior close - beta x SPY return since its prior close, at the bar "
+                      "closing at T; beta = OLS slope of VIXY on SPY daily close-to-close returns over the previous "
+                      "beta_history sessions with both closes",
+        "unit": "return (scale-free)",
+        "source": _DATA.format("SPY, VIXY"),
+        "live_source": _NOT_LIVE.format("VIXY"),
+        "pit": _PIT_RET + "; beta from sessions before today",
+        "symbols": ("SPY", "VIXY", "HYG"),  # the beta's sessions need all three closes (edge9 amendment 2)
+    },
+    "F3": {
+        "definition": "RSP return - SPY return, each since its prior close, at the bar closing at T",
+        "unit": "return (scale-free)",
+        "source": _DATA.format("SPY, RSP"),
+        "live_source": _NOT_LIVE.format("RSP"),
+        "pit": _PIT_RET,
+        "symbols": ("SPY", "RSP"),
+    },
+    "F4": {
+        "definition": "HYG return since its prior close - beta x SPY return since its prior close, at the bar "
+                      "closing at T; beta as F2, HYG on SPY",
+        "unit": "return (scale-free)",
+        "source": _DATA.format("SPY, HYG"),
+        "live_source": _NOT_LIVE.format("HYG"),
+        "pit": _PIT_RET + "; beta from sessions before today",
+        "symbols": ("SPY", "VIXY", "HYG"),
+    },
+    "F5": {
+        "definition": "TLT close at the bar closing at T / TLT prior close - 1",
+        "unit": "return (scale-free)",
+        "source": _DATA.format("TLT"),
+        "live_source": _NOT_LIVE.format("TLT"),
+        "pit": _PIT_RET,
+        "symbols": ("TLT",),
+    },
+    "F6": {
+        "definition": "QQQ return - SPY return over the 30 minutes to the bar closing at T",
+        "unit": "return (scale-free)",
+        "source": _DATA.format("SPY, QQQ"),
+        "live_source": _NOT_LIVE.format("QQQ"),
+        "pit": "bars stamped T-31 and T-1; a QQQ price older than stale_minutes is missing",
+        "symbols": ("SPY", "QQQ"),
+    },
+}
+PRICE_CLASS_SPECS = {
+    **_LEVELS,
+    "S6": {
+        "definition": "in the last 3 sessions of a month: SPY month-to-date return - TLT month-to-date return, both "
+                      "from the previous month's last close to the prior close; 0 on other sessions",
+        "unit": "return (scale-free)",
+        "source": _DATA.format("SPY, TLT"),
+        "live_source": _NOT_LIVE.format("TLT"),
+        "pit": "closes of the prior session and earlier; the month's last sessions from the pinned exchange calendar",
+        "symbols": ("SPY", "TLT"),
+    },
+    **{f"{d}_shift30": _shift_spec(d, spec) for d, spec in _LEVELS.items()},
+    **{
+        f"{d}_shift30": _shift_spec(d, {**FEATURE_SPECS[d], "symbols": ("SPY",)})
+        for d in ("F10", "F11")
+    },
+}
+SPECS = {**{f: {**s, "symbols": ("SPY",)} for f, s in FEATURE_SPECS.items()}, **PRICE_CLASS_SPECS}
+ALL_FEATURES = tuple(SPECS)
+LAST_BAR_FROM = "15:50"  # a prior close needs a last bar at or after this (edge9 amendment 2)
 TARGET_UNITS = ("vol", "bps", "dollars")
 SIDES = {"long": 1.0, "short": -1.0}
 Z_CAP = 4.0
@@ -148,6 +264,10 @@ class RunFile:
     symbol: str = "SPY"
     target_unit: str = "vol"
     vol_history: int = 20
+    stale_minutes: int = 10  # a non-SPY price older than this is missing (edge9 amendment 2)
+    beta_history: int = 60  # sessions in the F2 / F4 daily betas
+    cluster_by: str = "jaccard"  # co-firing similarity: "jaccard" or "phi"
+    cluster_threshold: float = 0.5  # signals linked at or above this share a cluster
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -172,7 +292,7 @@ class RunFile:
         if last < first:
             raise RunFileError("last_session is before first_session")
         if self.symbol != "SPY":
-            raise RunFileError("factory 1 runs SPY only")
+            raise RunFileError("the factory's target is SPY only; other symbols enter as features")
         for t in self.decision_times:
             hm = _minutes(t)
             if not 10 * 60 <= hm <= 15 * 60:
@@ -180,8 +300,8 @@ class RunFile:
         for h in self.horizons:
             if h != "close" and not (h.endswith("m") and h[:-1].isdigit() and 2 <= int(h[:-1]) <= 390):
                 raise RunFileError(f"horizon {h!r} is '<minutes>m' (at least 2m) or 'close'")
-        if set(self.features) - set(FEATURES):
-            raise RunFileError(f"unknown features {sorted(set(self.features) - set(FEATURES))}")
+        if set(self.features) - set(ALL_FEATURES):
+            raise RunFileError(f"unknown features {sorted(set(self.features) - set(ALL_FEATURES))}")
         if set(self.sides) - set(SIDES) or not self.sides:
             raise RunFileError("sides are 'long' and/or 'short'")
         if not self.z_thresholds or any(not (0 < k <= Z_CAP) for k in self.z_thresholds):
@@ -197,6 +317,10 @@ class RunFile:
             raise RunFileError("alpha in (0, 0.10], perms >= 99, min_n >= 30, z_history >= 20")
         if self.target_unit not in TARGET_UNITS or self.vol_history < 10:
             raise RunFileError(f"target_unit is one of {TARGET_UNITS}; vol_history >= 10")
+        if not 0 <= self.stale_minutes <= 60 or self.beta_history < 20:
+            raise RunFileError("stale_minutes in [0, 60]; beta_history >= 20")
+        if self.cluster_by not in COFIRING_MEASURES or not 0 < self.cluster_threshold <= 1:
+            raise RunFileError(f"cluster_by is one of {COFIRING_MEASURES}; cluster_threshold in (0, 1]")
         for t in self.decision_times:
             for h in self.horizons:
                 if h != "close" and _minutes(t) + int(h[:-1]) > 16 * 60:
@@ -217,6 +341,11 @@ class RunFile:
 
     def trial_count(self) -> int:
         return len(self.families()) * len(self.modules())
+
+    def symbols(self) -> tuple[str, ...]:
+        """The symbols whose bars the run's features read, SPY first."""
+        need = {s for f in self.features for s in SPECS[f]["symbols"]}
+        return tuple(s for s in SYMBOLS if s == "SPY" or s in need)
 
 
 def _minutes(hm: str) -> int:
@@ -260,9 +389,13 @@ class Session:
     def _at(self, hm):
         return bisect.bisect_right(self.hms, hm) - 1
 
-    def close(self, hm):
+    def close(self, hm, max_age=None):
+        """Close of the last bar stamped at or before ``hm``; None when there is none, or when it is
+        more than ``max_age`` minutes older than ``hm``."""
         i = self._at(hm)
-        return None if i < 0 else self.bars[self.hms[i]][3]
+        if i < 0 or (max_age is not None and _minutes(hm) - _minutes(self.hms[i]) > max_age):
+            return None
+        return self.bars[self.hms[i]][3]
 
     def hilo(self, hm):
         i = self._at(hm)
@@ -292,32 +425,154 @@ def raw_features(day: Session, prev: Session, bar: str) -> dict:
     return out
 
 
-def load_sessions(db_path: Path, run: RunFile) -> dict[str, Session]:
-    """{day: Session} for the run's window, read-only; refuses any day before dev."""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+def settled_close(session: Session | None):
+    """A session's close for the next day's returns: its last bar's close when that bar starts at or after
+    15:50 (edge9 amendment 2), else None."""
+    if session is None:
+        return None
+    i = session._at("15:59")
+    return session.bars[session.hms[i]][3] if i >= 0 and session.hms[i] >= LAST_BAR_FROM else None
+
+
+def ols_slope(xs, ys):
+    """OLS slope of ys on xs; None below two points or with no variance in xs (edge9). Pure."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    vx = sum((x - mx) ** 2 for x in xs)
+    if vx == 0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / vx
+
+
+def class_features(px: dict, prior_close: dict, betas: dict, bar: str, stale: int) -> dict:
+    """F2..F6 at the bar stamped ``bar`` (edge9 ``build_moments`` definitions). Pure.
+
+    ``px``: {symbol: today's Session or None}; ``prior_close``: {symbol: settled prior close or None};
+    ``betas``: {"VIXY": slope, "HYG": slope} from earlier sessions (missing until there are enough).
+    Only bars stamped at or before ``bar`` are read, for every symbol; a non-SPY price older than
+    ``stale`` minutes is missing, and a dial built on a missing price is None.
+    """
+    def price(sym, hm):
+        session = px.get(sym)
+        return None if session is None else session.close(hm, None if sym == "SPY" else stale)
+
+    def ret(sym):
+        c, pc = price(sym, bar), prior_close.get(sym)
+        return c / pc - 1 if c and pc else None
+
+    r = {sym: ret(sym) for sym in SYMBOLS}
+    out = dict.fromkeys(_LEVELS)
+    spy = r["SPY"]
+    if spy is not None:
+        if r["VIXY"] is not None and betas.get("VIXY") is not None:
+            out["F2"] = r["VIXY"] - betas["VIXY"] * spy
+        if r["RSP"] is not None:
+            out["F3"] = r["RSP"] - spy
+        if r["HYG"] is not None and betas.get("HYG") is not None:
+            out["F4"] = r["HYG"] - betas["HYG"] * spy
+    out["F5"] = r["TLT"]
+    earlier = _hm(_minutes(bar) - 30)
+    q, q0, c, c0 = price("QQQ", bar), price("QQQ", earlier), price("SPY", bar), price("SPY", earlier)
+    if q and q0 and c and c0:
+        out["F6"] = (q / q0 - 1) - (c / c0 - 1)
+    return out
+
+
+def month_end(day: str, sessions: list[str], closes: dict) -> float | None:
+    """S6 for ``day``: in a month's last 3 sessions, SPY minus TLT month-to-date return to the prior close,
+    else 0; None when a needed close is missing. ``sessions``: the exchange session list (pinned calendar);
+    ``closes``: {symbol: {day: settled close}} of earlier sessions only. Pure."""
+    i = bisect.bisect_left(sessions, day)
+    if i >= len(sessions) or sessions[i] != day:
+        return None
+    month = [d for d in sessions if d[:7] == day[:7]]
+    if day not in month[-3:]:
+        return 0.0
+    before = [d for d in sessions[:i] if d[:7] < day[:7]]
+    if i == 0 or not before:
+        return None
+    prior, base = sessions[i - 1], before[-1]
     try:
-        lo = con.execute("select min(day) from bars where sym = ?", (run.symbol,)).fetchone()[0]
-        if lo is None or lo < DEV_FIRST:
-            raise RunFileError(f"{db_path} holds sessions before dev ({lo}): holdout refused")
-        rows = con.execute(
-            "select day, hm, o, h, l, c, v from bars where sym = ? and day between ? and ? order by day, hm",
-            (run.symbol, run.first_session, run.last_session),
-        ).fetchall()
+        spy = closes["SPY"][prior] / closes["SPY"][base] - 1
+        tlt = closes["TLT"][prior] / closes["TLT"][base] - 1
+    except (KeyError, TypeError, ZeroDivisionError):
+        return None
+    return spy - tlt
+
+
+def load_bars(db_path: Path, run: RunFile, symbols: tuple[str, ...] | None = None) -> dict[str, dict[str, Session]]:
+    """{symbol: {day: Session}} for the run's window, read-only; refuses a symbol holding any day before dev."""
+    symbols = symbols or run.symbols()
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    out: dict[str, dict[str, Session]] = {}
+    try:
+        for sym in symbols:
+            lo = con.execute("select min(day) from bars where sym = ?", (sym,)).fetchone()[0]
+            if lo is None or lo < DEV_FIRST:
+                raise RunFileError(f"{db_path} holds {sym} sessions before dev ({lo}): holdout refused")
+            rows = con.execute(
+                "select day, hm, o, h, l, c, v from bars where sym = ? and day between ? and ? order by day, hm",
+                (sym, run.first_session, run.last_session),
+            ).fetchall()
+            by_day: dict[str, dict] = {}
+            for day, hm, o, h, low, c, v in rows:
+                by_day.setdefault(day, {})[hm] = (o, h, low, c, v)
+            out[sym] = {d: Session(b) for d, b in by_day.items()}
     finally:
         con.close()
-    by_day: dict[str, dict] = {}
-    for day, hm, o, h, low, c, v in rows:
-        by_day.setdefault(day, {})[hm] = (o, h, low, c, v)
-    return {d: Session(b) for d, b in by_day.items()}
+    return out
 
 
-def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCalendar | None = None) -> tuple[dict[str, list[dict]], dict]:
+def load_sessions(db_path: Path, run: RunFile) -> dict[str, Session]:
+    """{day: Session} of the target (SPY) for the run's window, read-only; refuses any day before dev."""
+    return load_bars(db_path, run, (run.symbol,))[run.symbol]
+
+
+def features_at(session: Session, prior: Session, px: dict, prior_close: dict, betas: dict, s6, bar: str,
+                wanted: tuple[str, ...], stale: int) -> dict:
+    """Every wanted feature at the bar stamped ``bar``: the SPY-only set through :func:`raw_features`, the
+    price/momentum class through :func:`class_features`, and their 30-minute shifts. Pure; reads no bar
+    stamped after ``bar`` for any symbol."""
+    out = raw_features(session, prior, bar)
+    earlier = _hm(_minutes(bar) - 30)
+    if any(f in wanted for f in ("F10_shift30", "F11_shift30")):
+        before = raw_features(session, prior, earlier)
+        for d in ("F10", "F11"):
+            a, b = out[d], before[d]
+            out[f"{d}_shift30"] = a - b if a is not None and b is not None else None
+    if any(f in _LEVELS or f[:-8] in _LEVELS for f in wanted):
+        now, then = class_features(px, prior_close, betas, bar, stale), class_features(px, prior_close, betas, earlier, stale)
+        for d in _LEVELS:
+            out[d] = now[d]
+            out[f"{d}_shift30"] = now[d] - then[d] if now[d] is not None and then[d] is not None else None
+    out["S6"] = s6
+    return {f: out.get(f) for f in wanted}
+
+
+def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCalendar | None = None,
+               cross: dict[str, dict[str, Session]] | None = None) -> tuple[dict[str, list[dict]], dict]:
     """Point-in-time rows per family, and a coverage summary.
 
     The z history of a (feature, decision time) holds only earlier eligible
     sessions' raw values, appended after the session's own z is taken.
+    ``cross``: {symbol: {day: Session}} for the run's non-SPY symbols (from
+    :func:`load_bars`). The daily betas use only sessions before the current
+    one, and every symbol's price comes from a bar stamped at or before T-1.
     """
     days = sorted(sessions)
+    cross = cross or {}
+    missing = [s for s in run.symbols() if s != run.symbol and s not in cross]
+    if missing:
+        raise RunFileError(f"the run's features need bars for {missing}")
+    bars_of = {run.symbol: sessions, **cross}
+    settled = {sym: {d: settled_close(by_day[d]) for d in by_day} for sym, by_day in bars_of.items()}
+    session_list = [s.key.split(":")[1] for s in calendar.sessions] if calendar is not None else days
+    pairs = deque(maxlen=run.beta_history)  # (SPY, VIXY, HYG) daily returns of earlier sessions
+    pending_pair = None
+    need_betas = any(f in run.features for f in ("F2", "F4", "F2_shift30", "F4_shift30"))
+    need_s6 = "S6" in run.features
     full_coverage = [d for d in days if len(sessions[d].hms) >= run.full_bars]
     eligible = set()
     history = {(f, t): deque(maxlen=run.z_history) for f in run.features for t in run.decision_times}
@@ -326,23 +581,32 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     families = {f: [] for f in run.families()}
     skipped_no_label = skipped_no_scale = 0
     diag = {(f, t): {"rows": 0, "z": 0, "raw_by_year": {}, "z_by_year": {}} for f in run.features for t in run.decision_times}
-    prev = None
+    prev_day = None
     for day in days:
         session = sessions[day]
-        prior, prev = prev, session  # fixture-only fallback; run() always supplies pinned calendar
+        prior_day, prev_day = prev_day, day  # fixture-only fallback; run() always supplies pinned calendar
+        if pending_pair is not None:  # the previous session's daily returns join the betas only now
+            pairs.append(pending_pair)
+            pending_pair = None
         schedule = None
         if calendar is not None:
             schedule = calendar.for_day(day)
             if schedule is None:
                 continue
             prior_day = calendar.previous_day(day)
+        if need_betas and prior_day is not None:
+            today = [settled[s].get(day) for s in ("SPY", "VIXY", "HYG")]
+            before = [settled[s].get(prior_day) for s in ("SPY", "VIXY", "HYG")]
+            if all(today) and all(before):
+                pending_pair = tuple(a / b - 1 for a, b in zip(today, before))
+        if calendar is not None:
             prior_schedule = calendar.for_day(prior_day)
             # Conservative protocol: shortened priors remain withheld even if
             # a vendor incorrectly supplies fabricated after-close minute bars.
             if (prior_schedule.closes - prior_schedule.opens).total_seconds() != 390 * 60:
                 skipped_no_label += len(run.families())
                 continue
-            prior = sessions.get(prior_day)
+        prior = sessions.get(prior_day) if prior_day is not None else None
         if prior is None:
             continue
         # Without an authenticated historical session calendar, a short prior
@@ -351,6 +615,14 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
         if set(prior.hms) != expected_prior:
             skipped_no_label += len(run.families())
             continue
+        px = {sym: by_day.get(day) for sym, by_day in bars_of.items()}
+        prior_close = {sym: (prior.last_close if sym == run.symbol else settled[sym].get(prior_day))
+                       for sym in bars_of}
+        betas = {}
+        if need_betas and len(pairs) == pairs.maxlen:
+            spy = [q[0] for q in pairs]
+            betas = {"VIXY": ols_slope(spy, [q[1] for q in pairs]), "HYG": ols_slope(spy, [q[2] for q in pairs])}
+        s6 = month_end(day, session_list, settled) if need_s6 else None
         for t in run.decision_times:
             if schedule is not None and _minutes(t) >= _minutes(schedule.closes.astimezone(NY).strftime('%H:%M')):
                 continue
@@ -362,7 +634,7 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
                 skipped_no_label += len(run.horizons)
                 continue
             eligible.add(day)
-            raw = raw_features(session, prior, bar)
+            raw = features_at(session, prior, px, prior_close, betas, s6, bar, run.features, run.stale_minutes)
             z = {f: robust_z(raw[f], history[(f, t)]) for f in run.features}
             for f in run.features:
                 d = diag[(f, t)]
@@ -425,6 +697,12 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
                 })
     coverage = {
         "sessions_read": len(days),
+        "symbols": {
+            sym: {"sessions": len(by_day), "first": min(by_day, default=None), "last": max(by_day, default=None),
+                  "median_bars": statistics.median(len(v.hms) for v in by_day.values()) if by_day else None}
+            for sym, by_day in bars_of.items()
+        },
+        "stale_minutes": run.stale_minutes,
         "sessions_eligible": len(eligible),
         "sessions_below_full_bars_diagnostic": len(days) - len(full_coverage),
         "full_bars_role": "retrospective coverage only; never eligibility",
@@ -512,12 +790,38 @@ def dollars_net(families: dict, trials: list[dict], cost: float) -> dict:
     return out
 
 
-def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int = 25) -> dict:
+def signal_name(family: str, feature: str) -> str:
+    """The decision signal a module trades: ``decision time|feature|z rule``. Its long and short sides and
+    its horizons share it, because they fire on the same decisions."""
+    t = family.split("|")[2].split("+")[0]
+    f, rule, _side = feature.split("|")
+    return f"{t}|{f}|{rule}"
+
+
+RANKED = ("trial_id", "family", "feature", "n", "r", "net_dollars", "t", "p", "adjusted_p", "selected")
+
+
+def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int = 25, cofire=None) -> dict:
+    """The run report. ``cofire``: :func:`analysis.factory_stats.cofiring`'s result (computed here if not
+    given); its matrix is written beside the report as ``cofiring.json`` and only its hash is held here."""
     payload = frozen["payload"]
     trials = payload["ledger"]
     dollars = dollars_net(families, trials, run.cost_per_share)
     for t in trials:
         t["net_dollars"] = dollars[t["trial_id"]]
+    matrix, clusters, membership = cofire or cofiring(
+        families, trials, signal_name, by=run.cluster_by, threshold=run.cluster_threshold)
+    for t in trials:
+        t["cluster"], t["representative"] = membership[t["trial_id"]]
+    by_id = {t["trial_id"]: t for t in trials}
+
+    def rep_row(trial_id):
+        if trial_id is None:
+            return None
+        t = by_id[trial_id]
+        return {**{k: t[k] for k in RANKED}, "live_source": SPECS[t["feature"].split("|")[0]]["live_source"]}
+
+    cluster_rows = [{**c, "representative": rep_row(c["representative"])} for c in clusters]
     tested = sorted((t for t in trials if t["status"] == "tested"), key=lambda t: -t["t"])
     return {
         "run_id": run.run_id,
@@ -526,7 +830,7 @@ def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int 
         "frozen_sha256": frozen["sha256"],
         "method": payload["method"],
         "target_unit": run.target_unit,
-        "feature_specs": {f: FEATURE_SPECS[f] for f in run.features},
+        "feature_specs": {f: SPECS[f] for f in run.features},
         "coverage": coverage,
         "trial_count": payload["trial_count"],
         "tested": len(tested),
@@ -534,10 +838,27 @@ def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int 
         "max_t": payload["max_t"],
         "selected": [t["trial_id"] for t in tested if t["selected"]],
         "ranking": [
-            {k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "t", "p", "adjusted_p", "selected")}
+            {**{k: t[k] for k in RANKED}, "cluster": t["cluster"], "representative": t["representative"]}
             for t in tested[:top]
         ],
-        "note": "dev ranking only; a selected module is a candidate for a panel-factory live slot, not a finding",
+        "cofiring": {
+            "file": "cofiring.json",
+            "sha256": digest(matrix),
+            "by": matrix["by"],
+            "threshold": matrix["threshold"],
+            "basis": matrix["basis"],
+            "linkage": "single (connected components): signals at or above the threshold share a cluster, "
+                       "so no two representatives co-fire at or above it",
+            "signals": len(matrix["signals"]),
+            "sessions": matrix["sessions"],
+            "clusters": len(clusters),
+            "clusters_with_tested_trials": sum(c["representative"] is not None for c in clusters),
+            "representatives_selected": sum(bool(c["representative"] and c["representative"]["selected"])
+                                            for c in cluster_rows),
+        },
+        "clusters": cluster_rows,
+        "note": "dev ranking only; a selected module is a candidate for a panel-factory live slot, not a finding; "
+                "one cluster takes at most one slot, through its representative",
     }
 
 
@@ -565,13 +886,34 @@ def report_markdown(rep: dict) -> str:
         "",
         f"Target unit: {rep['target_unit']}; mean net is in that unit, and also in dollars per share.",
         "",
-        f"| # | family | module | fires | mean net ({rep['target_unit']}) | $/share | t | p | adjusted p | selected |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        f"| # | family | module | fires | mean net ({rep['target_unit']}) | $/share | t | p | adjusted p | selected | cluster |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for i, r in enumerate(rep["ranking"], 1):
         lines.append(
             f"| {i} | {r['family']} | {r['feature']} | {r['n']} | {r['r']:+.4f} | {r['net_dollars']:+.4f} | "
-            f"{r['t']:.2f} | {r['p']:.4f} | {r['adjusted_p']:.4f} | {'yes' if r['selected'] else ''} |"
+            f"{r['t']:.2f} | {r['p']:.4f} | {r['adjusted_p']:.4f} | {'yes' if r['selected'] else ''} | "
+            f"{r['cluster']}{' (rep)' if r['representative'] else ''} |"
+        )
+    cf = rep["cofiring"]
+    lines += [
+        "",
+        f"Clusters by fire overlap ({cf['by']} >= {cf['threshold']:g}, {cf['linkage'].split(':')[0]}; returns never "
+        f"enter): {cf['clusters']} clusters over {cf['signals']} decision signals and {cf['sessions']} sessions; "
+        f"{cf['clusters_with_tested_trials']} hold a tested trial; {cf['representatives_selected']} representatives "
+        f"cleared the bar. Matrix: `{cf['file']}` (sha256 {cf['sha256'][:12]}).",
+        "",
+        "| cluster | signals | weakest pair | representative | fires | t | adjusted p | selected | live source |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for c in rep["clusters"][:25]:
+        r = c["representative"]
+        if r is None:
+            continue
+        shown = ", ".join(c["signals"][:4]) + (f" (+{len(c['signals']) - 4})" if len(c["signals"]) > 4 else "")
+        lines.append(
+            f"| {c['cluster']} | {shown} | {c['min_pair_similarity']} | {r['family']} {r['feature']} | {r['n']} | "
+            f"{r['t']:.2f} | {r['adjusted_p']:.4f} | {'yes' if r['selected'] else ''} | {r['live_source'].split(':')[0]} |"
         )
     lines += ["", "| feature @ time | coverage | z drift (max - min yearly median z) |", "|---|---|---|"]
     for name, f in rep["coverage"]["features"].items():
@@ -604,11 +946,15 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
     )
     try:
         verify_data(Path(data_dir), manifest)
-        sessions = load_sessions(Path(data_dir) / DATA_FILE, spec)
-        families, coverage = build_rows(sessions, spec, calendar=calendar)
+        bars = load_bars(Path(data_dir) / DATA_FILE, spec)
+        sessions = bars.pop(spec.symbol)
+        families, coverage = build_rows(sessions, spec, calendar=calendar, cross=bars)
         frozen = discover(protocol_for(spec), families)
         write_once(out / "discovery-frozen.json", frozen)
-        rep = report(spec, frozen, coverage, families)
+        cofire = cofiring(families, frozen["payload"]["ledger"], signal_name,
+                          by=spec.cluster_by, threshold=spec.cluster_threshold)
+        write_once(out / "cofiring.json", cofire[0])
+        rep = report(spec, frozen, coverage, families, cofire=cofire)
         write_once(out / "report.json", rep)
         with (out / "report.md").open("x", encoding="utf-8") as stream:
             stream.write(report_markdown(rep))
@@ -617,7 +963,7 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
         raise
     trials = [
         {k: t.get(k) for k in ("trial_id", "family", "feature", "status", "n", "r", "net_dollars", "t", "p",
-                               "adjusted_p", "selected")}
+                               "adjusted_p", "selected", "cluster", "representative")}
         for t in frozen["payload"]["ledger"]
     ]
     lse.record_factory_result(
