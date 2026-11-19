@@ -631,10 +631,90 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # timeout_s 600, TIINGO_API_KEY, with a 2-line comment) and its
         # REGISTRY_CATALOG_NAMES alias finra_dix -> FINRA_SHORT_VOLUME. Needs
         # reviewer acceptance like the prior pins.
+        # SCHED re-pinned 01432bbd -> 8bb8a00f (2026-11-17,
+        # claude/scheduler-retire-dead-pullers-20261117): the only scheduler
+        # edits are dated hold_reason values on the existing prediction_odds
+        # and cloudflare_radar PULLER_REGISTRY entries (both never wrote a
+        # row); no other field, entry or code changes. Needs reviewer
+        # acceptance like the prior pins.
+        # OPER re-pinned 69b8efc2 -> de4a1205 (2026-11-15, PR1219):
+        # only Oracle startup sync failure logging changes DEBUG message text
+        # to WARNING with safe class/SQLSTATE. SEC behavior is unchanged.
+        # Requires reviewer acceptance like prior pins.
+        # Then de4a1205 -> 58d56e41 (2026-11-15, merge of main into
+        # feat/supply-chain-weekly-20261113, 3pacs/GRID#1179/#1182): PR1219's
+        # edit plus #1182's two _run_intel_task calls appended to the Sunday
+        # weekly block (supply_chain_parser.run_weekly,
+        # supply_chain_edge_validator.run_weekly) with their comment.
+        # Then 58d56e41 -> afc60c8e (2026-11-15, feat/supply-chain-8k-20261113,
+        # 3pacs/GRID#1180/#1188): adds a _daily_intel_supply_chain_8k wrapper
+        # (calls ingestion.altdata.supply_chain_8k.run_daily), its
+        # DAILY_INTEL_TASKS entry after corporate_actions, and a
+        # DAILY_INTEL_HOLD_REASONS entry: the task is held (not in
+        # DAILY_INTEL_INITIAL_ALLOWLIST), so nothing new runs until the owner
+        # releases it.
+        # Then afc60c8e -> c119f620 (2026-11-16, feat/release-supply-chain-8k-20261116,
+        # 3pacs/GRID#1180): the owner releases supply_chain_8k — its name moves
+        # from DAILY_INTEL_HOLD_REASONS into DAILY_INTEL_INITIAL_ALLOWLIST with
+        # a comment; no code path changes.
+        # Then c119f620 -> c8cadc77 (2026-11-16, claude/gdelt-bulk-events-20261116):
+        # adds a _daily_intel_gdelt_bulk_events wrapper (calls
+        # ingestion.altdata.gdelt_bulk.run_daily), its budget constant
+        # DAILY_INTEL_GDELT_BULK_BUDGET_S, its DAILY_INTEL_TASKS entry after
+        # holder_deal_overlap, and a DAILY_INTEL_HOLD_REASONS entry: the task
+        # is held, so nothing new runs until the owner releases it. Its hold
+        # reason avoids naming the resolved table (schema-conformance guard).
+        # Then c8cadc77 -> 3b406bba (2026-11-16, claude/gdelt-release-next-day-20261116):
+        # the gdelt_bulk_events hold reason now says each day is dated D+1 or
+        # later; text only, the task stays held.
+        # Then 3b406bba -> 3b8fa7df (2026-11-16, claude/gdelt-gkg-loader-20261116):
+        # adds _daily_intel_gdelt_gkg_daily (calls ingestion.altdata.gdelt_bulk.
+        # run_gkg_daily), DAILY_INTEL_GDELT_GKG_BUDGET_S, its DAILY_INTEL_TASKS
+        # entry after gdelt_bulk_events and a DAILY_INTEL_HOLD_REASONS entry:
+        # held, nothing new runs until the owner releases it.
+        # Then 3b8fa7df -> edfaf95e (2026-11-16, claude/gdelt-release-tasks-20261116):
+        # the owner released gdelt_bulk_events and gdelt_gkg_daily ("1-4 for
+        # gdelt"): both move from DAILY_INTEL_HOLD_REASONS into
+        # DAILY_INTEL_INITIAL_ALLOWLIST with a comment each; no code changes.
+        # Then edfaf95e -> 46709a4a (2026-11-17, claude/hermes-postmortem-last-20261117):
+        # postmortem_batch moves from fifth to last in DAILY_INTEL_TASKS (it
+        # always overruns its 180 s budget) and the ordering comment above the
+        # tuple gains a paragraph; no wrapper, budget or allow-list change.
+        # Then 46709a4a -> 413b8e70 (2026-11-17, claude/hermes-late-task-budgets-20261117):
+        # corporate_actions and fundamental_divergence get their own budgets
+        # (DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S 150, DAILY_INTEL_FUNDAMENTAL_
+        # DIVERGENCE_BUDGET_S 60 -> 300; both ran past 60 s nightly and were
+        # done_late) plus a comment block; the corporate_actions DAILY_INTEL_
+        # TASKS entry names the new constant. No wrapper, cycle-budget,
+        # allow-list or ordering change.
+        # Then 413b8e70 -> 7a85e9a0 (2026-11-18, claude/hermes-intel-starvation-20261117):
+        # the trust cycle leaves run_intelligence_tasks for its own step
+        # (_run_trust_cycle_step, dispatched in run_cycle after
+        # _run_sector_and_intelligence_steps; TRUST_CYCLE_* budgets, in-flight
+        # guard, resumable progress). The daily-intel block moves up to run
+        # right after active-hypothesis scoring. The TimesFM forecasts and
+        # thesis snapshot keep their place on the forecasts' own 4h gate. No
+        # SEC, FINRA or dispatch-prefix change. Needs reviewer acceptance like
+        # the prior pins.
+        # SCHED re-pinned 8bb8a00f -> 9aeee49b (2026-11-18, rebased onto #1249's
+        # registry holds; branch alone was 01432bbd -> a907c59b) (2026-11-17,
+        # claude/social-reddit-bluesky-20261117): the only scheduler edits are
+        # a new social_ticker_series PULLER_REGISTRY entry
+        # (SocialSentimentPuller.pull_ticker_series, freq_h 12, timeout_s 900,
+        # with a 4-line comment) and its REGISTRY_CATALOG_NAMES alias
+        # social_ticker_series -> SocialSentiment. No SEC, FINRA or dispatch
+        # code changes. Needs reviewer acceptance like the prior pins.
+        # SCHED re-pinned 9aeee49b -> 08c0356f (2026-11-18,
+        # claude/social-free-reddit-apis-20261117): the only scheduler edits
+        # are PULLER_REGISTRY data -- smart_money freq_h 0.167 -> 1 (Reddit now
+        # read from the free Arctic Shift API, hourly) and the trailing
+        # comments of smart_money / social_sentiment plus the 4-line comment
+        # above social_ticker_series. No SEC, FINRA or dispatch code changes.
+        # Needs reviewer acceptance like the prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','69b8efc2c8f1dcbffcf0bd2ae7f4a9c0fdc861ccb5fb6914d0e76b20c6b2a84a'),(SCHED,'\nimport calendar\n','01432bbdda228aba13aad2a5bc5ceaf878b0270d948f69bad143cbf81bf4851d')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','7a85e9a0a9cd25723384357ded951f455c63884647ec357226b5e3dc4057027e'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

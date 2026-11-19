@@ -525,81 +525,130 @@ class TestConstants:
 
 
 # ---------------------------------------------------------------------------
-# RSS fetch (ingestion/altdata/reddit_rss.py feeds, stubbed)
+# Arctic Shift fetch (ingestion/altdata/arctic_shift.py, stubbed session)
 # ---------------------------------------------------------------------------
 
 
-def _entry(eid, title="", author="", body="", published=None, link=""):
-    from ingestion.altdata.reddit_rss import RssEntry
+class TestFetchDailyThreadArcticShift:
+    NOW = None
 
-    return RssEntry(id=eid, title=title, author=author, subreddit="wallstreetbets",
-                    published=published, body=body, link=link)
-
-
-class TestFetchDailyThreadRss:
-    def _listing(self):
+    def _fake(self, drop=(), fail=frozenset()):
         from datetime import datetime, timezone
 
-        t = lambda h: datetime(2026, 11, 5, h, tzinfo=timezone.utc)  # noqa: E731
-        return [
-            _entry("t3_moves", "What Are Your Moves Tomorrow, November 06, 2026", published=t(20),
-                   link="https://www.reddit.com/r/wallstreetbets/comments/moves/x/"),
-            _entry("t3_daily", "Daily Discussion Thread for November 05, 2026", published=t(10),
-                   body="Market open", link="https://www.reddit.com/r/wallstreetbets/comments/daily/y/"),
-            _entry("t3_dd", "NVDA DD", published=t(12)),
+        from tests.arctic_shift_fakes import FakeArctic, comment, post
+
+        now = datetime(2026, 11, 5, 22, tzinfo=timezone.utc)
+        self.NOW = now
+        t = lambda h: datetime(2026, 11, 5, h, tzinfo=timezone.utc).timestamp()  # noqa: E731
+        mod = "verified-trader"  # the board's moderator account (live check 2026-11-18)
+        posts = [
+            post("moves", "wallstreetbets", t(20), "What Are Your Moves Tomorrow, November 06, 2026",
+                 author=mod),
+            post("daily", "wallstreetbets", t(10), "Daily Discussion Thread for November 05, 2026",
+                 "Market open", author=mod),
+            post("fake1", "wallstreetbets", t(21), "Is the daily discussion thread rigged?"),
+            # Look-alikes with the exact title, posted later by ordinary accounts.
+            post("spoof1", "wallstreetbets", t(15), "Daily Discussion Thread for November 05, 2026",
+                 "pump XYZ", author="totally_the_mods"),
+            post("spoof2", "wallstreetbets", t(21), "What Are Your Moves Tomorrow, November 06, 2026",
+                 author="AutoModerat0r"),
+            post("dd", "wallstreetbets", t(12), "NVDA DD"),
         ]
+        posts = [p for p in posts if p["id"] not in drop]
+        comments = [
+            comment("c1", "daily", t(11), "$NVDA calls, bullish", "alice"),
+            comment("c2", "daily", t(12), "SPY puts 0dte", "bob"),
+            comment("c3", "daily", t(13), "[deleted]", "carol"),
+            comment("m1", "moves", t(21), "NVDA puts 0dte", "dave"),
+        ]
+        return FakeArctic(posts=posts, comments=comments, fail=fail)
+
+    @pytest.fixture(autouse=True)
+    def _slot(self, tmp_path, monkeypatch):
+        import socket
+
+        from ingestion.altdata import arctic_shift
+
+        def _refuse(*_a, **_k):
+            raise AssertionError("network access in a unit test")
+        monkeypatch.setattr(socket.socket, "connect", _refuse)
+        monkeypatch.setenv(arctic_shift.LOCK_PATH_ENV, str(tmp_path / "arctic.lock"))
+        monkeypatch.setattr(arctic_shift, "MIN_INTERVAL_S", 0.0)
 
     def test_picks_daily_discussion_and_shapes_payload(self):
-        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+        from ingestion.altdata.reddit_options_pulse import THREAD_LOOKBACK_H, _fetch_daily_thread
+        from tests.arctic_shift_fakes import COMMENTS_URL, POSTS_URL
 
-        calls = []
-        thread = [
-            _entry("t3_daily", "Daily Discussion Thread for November 05, 2026"),
-            _entry("t1_c1", author="alice", body="$NVDA calls, bullish"),
-            _entry("t1_c2", author="bob", body="SPY puts 0dte"),
-            _entry("t1_c3", author="carol", body=""),
-        ]
-
-        def fetch(path, params):
-            calls.append((path, params))
-            return self._listing() if path.endswith("hot.rss") else thread
-
-        payload = _fetch_daily_thread(fetch)
-        assert calls == [("/r/wallstreetbets/hot.rss", {"limit": 10}),
-                         ("/r/wallstreetbets/comments/daily.rss", {"limit": 500})]
+        fake = self._fake()
+        payload = _fetch_daily_thread(session=fake, now=self.NOW)
+        assert fake.count(POSTS_URL) == 1 and fake.count(COMMENTS_URL) == 1
+        first = fake.calls[0][1]
+        assert first["subreddit"] == "wallstreetbets"
+        assert first["after"] == int(self.NOW.timestamp()) - THREAD_LOOKBACK_H * 3600
+        assert fake.calls[1][1]["link_id"] == "daily"
         post = payload["post"]
         assert post["id"] == "daily" and post["selftext"] == "Market open"
-        assert post["permalink"] == "/r/wallstreetbets/comments/daily/y/"
+        assert post["permalink"] == "/r/wallstreetbets/comments/daily/"
+        # Newest first; deleted bodies dropped.
         assert payload["thread"] == [
-            {"id": "c1", "body": "$NVDA calls, bullish", "author": "alice"},
             {"id": "c2", "body": "SPY puts 0dte", "author": "bob"},
+            {"id": "c1", "body": "$NVDA calls, bullish", "author": "alice"},
         ]
+
+    def test_a_look_alike_from_another_account_is_ignored(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+
+        payload = _fetch_daily_thread(session=self._fake(), now=self.NOW)
+        assert payload["post"]["id"] == "daily"
+        # With the real threads gone only look-alikes remain: no thread at all.
+        assert _fetch_daily_thread(session=self._fake(drop={"daily", "moves"}),
+                                   now=self.NOW) is None
+
+    def test_automoderator_is_accepted_and_the_first_of_the_day_wins(self):
+        from datetime import datetime, timezone
+
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+        from tests.arctic_shift_fakes import FakeArctic, post
+
+        t = lambda d, h: datetime(2026, 11, d, h, tzinfo=timezone.utc).timestamp()  # noqa: E731
+        title = "Daily Discussion Thread for November 05, 2026"
+        fake = FakeArctic(posts=[
+            post("prev", "wallstreetbets", t(4, 10), "Daily Discussion Thread for November 04, 2026",
+                 author="AutoModerator"),
+            post("first", "wallstreetbets", t(5, 10), title, author="AutoModerator"),
+            post("repost", "wallstreetbets", t(5, 14), title, author="verified-trader"),
+        ])
+        now = datetime(2026, 11, 5, 22, tzinfo=timezone.utc)
+        assert _fetch_daily_thread(session=fake, now=now)["post"]["id"] == "first"
 
     def test_falls_back_to_moves_tomorrow(self):
         from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
 
-        listing = [e for e in self._listing() if e.id != "t3_daily"]
-        seen = []
-        _fetch_daily_thread(lambda path, params: seen.append(path) or (
-            listing if path.endswith("hot.rss") else []))
-        assert seen[-1] == "/r/wallstreetbets/comments/moves.rss"
+        fake = self._fake(drop={"daily"})
+        payload = _fetch_daily_thread(session=fake, now=self.NOW)
+        assert payload["post"]["id"] == "moves"
+        assert fake.calls[-1][1]["link_id"] == "moves"
 
-    def test_no_pinned_thread_is_none_after_one_request(self):
+    def test_a_user_post_naming_the_thread_is_not_the_thread(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+        from tests.arctic_shift_fakes import POSTS_URL
+
+        fake = self._fake(drop={"daily", "moves"})
+        assert _fetch_daily_thread(session=fake, now=self.NOW) is None
+        assert len(fake.calls) == fake.count(POSTS_URL) == 1
+
+    def test_archive_failure_is_none(self):
         from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
 
-        calls = []
-        assert _fetch_daily_thread(lambda path, params: calls.append(path) or
-                                   [_entry("t3_x", "random post")]) is None
-        assert len(calls) == 1
+        assert _fetch_daily_thread(session=self._fake(fail={"posts"}), now=self.NOW) is None
+        assert _fetch_daily_thread(session=self._fake(fail={"comments"}), now=self.NOW) is None
 
-    def test_rate_limited_is_none(self):
+    def test_reddit_is_never_contacted(self):
         from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
-        from ingestion.altdata.reddit_rss import RedditRateLimited
 
-        def fetch(path, params):
-            raise RedditRateLimited("slot past budget")
-
-        assert _fetch_daily_thread(fetch) is None
+        fake = self._fake()
+        _fetch_daily_thread(session=fake, now=self.NOW)
+        assert all(u.startswith("https://arctic-shift.photon-reddit.com/") for u, _, _ in fake.calls)
 
     def test_aggregates_into_a_pulse(self, mock_engine):
         from ingestion.altdata.reddit_options_pulse import (
@@ -608,13 +657,10 @@ class TestFetchDailyThreadRss:
             _flatten_comments,
         )
 
-        thread = [_entry("t1_c1", author="alice", body="$NVDA calls, bullish"),
-                  _entry("t1_c2", author="bob", body="NVDA puts 0dte")]
-        payload = _fetch_daily_thread(
-            lambda path, params: self._listing() if path.endswith("hot.rss") else thread)
+        payload = _fetch_daily_thread(session=self._fake(), now=self.NOW)
         pulse = _aggregate_pulse(payload["post"], _flatten_comments(payload["thread"]))
         assert pulse.thread_id == "daily" and pulse.comment_count == 2
         assert pulse.unique_authors == 2 and pulse.zero_dte_count == 1
-        assert pulse.top_tickers[0] == ("NVDA", 2)
-        assert pulse.thread_url == "https://www.reddit.com/r/wallstreetbets/comments/daily/y/"
+        assert ("NVDA", 1) in pulse.top_tickers
+        assert pulse.thread_url == "https://www.reddit.com/r/wallstreetbets/comments/daily/"
         assert str(pulse.thread_date) == "2026-11-05"

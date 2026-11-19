@@ -453,3 +453,41 @@ No recognition/valuation/trade result is fabricated: seven candidates remain
 unusable. Frozen v2, legacy scenarios and the Nov18 comparison are unchanged.
 See docs/research/r3-nvda/desk-report-v1.md. Full CI pending; Claude verifies final
 kit and Anik applies releases. No production or holdout changes.
+
+## 2026-11-17 - per-ticker social series: Bluesky cashtags, ApeWisdom Reddit boards, dormant Reddit Data API (source only)
+
+What was done:
+
+- `SocialSentimentPuller.pull_ticker_series` and a SmartScheduler entry `social_ticker_series` (12 h, timeout 900 s, catalog row `SocialSentiment`). It writes numeric `BSKY:*`, `APEWISDOM:*` and (with an owner app) `REDDIT:*` raw_series per UTC fetch date; FinBERT (local) scores up to 100 cashtag posts per ticker.
+- entity_map: `REDDIT:<sub>:active_users` / `subscribers` map to the 2026-03-21 `reddit_<sub>` / `reddit_<sub>_subs` features. `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Reddit closed logged-out access on 2026-11-17 (~17:50Z): `.rss` answers an Atom "Not Found" (404), `.json` 403, old.reddit redirects to login; seen from grid-svr and a second network. smart_money and reddit_options_pulse have failed since. No scraping workaround: the Data API (owner app) is the only sanctioned route; ApeWisdom is the working Reddit-derived feed.
+- Bluesky logged-out `searchPosts` refuses every cursor page with 403 "forbidden by administrative rules". The puller reads one page and does not slice by `until` to get around it; a page that fills inside 24 h is stored as a rate (`posts_per_hour`) over its span, never as a 24 h count.
+- Bluesky search ignores `$` (a `$KO` query returned no Coca-Cola posts), so only literal cashtags count.
+
+Broken or TBD:
+
+- Needs merge + deploy; the job then runs on the next SmartScheduler tick. Reddit board stats need REDDIT_CLIENT_ID/SECRET from an owner-registered app.
+- smart_money / reddit_options_pulse / social_port_activity Reddit legs stay dead until the Data API is configured; not changed here.
+
+## 2026-11-18 - Reddit back on free community APIs: Arctic Shift (posts/comments) + Tradestie (WSB sentiment) (source only)
+
+What was done:
+
+- New `ingestion/altdata/arctic_shift.py`: an HTTP-only client for the Arctic Shift archive API (free, no key, minutes behind Reddit when probed from grid-svr). Fixed host, redirects refused, 4 MB body cap, strict `{"data": [...]}`, typed and bounded fields, one cross-process lock spacing requests 2 s apart, a single bounded wait on 429 (`X-RateLimit-Reset`) and on the "Timeout" 422.
+- `smart_money` (SmartScheduler now hourly, was 10 min), `reddit_options_pulse` (daily thread + newest 500 comments) and `social_sentiment.pull_all` (10 newest posts per board) read Arctic Shift instead of the 404 Reddit RSS feeds.
+- `pull_ticker_series` gains `ARCTICSHIFT:*` (per-board posts/comments volume, per-board ticker post counts, FinBERT per ticker over Reddit posts) and `TRADESTIE:wallstreetbets:*` (Tradestie's top-50 comment counts and its own sentiment score for the previous US/Eastern day). `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Candidates checked from grid-svr on 2026-11-18: PullPush answers 429 "does not provide free scraping resources for agents" (rejected: it refuses this use); SwaggyStocks has no public API (a JS dashboard; scraping it would mean browser automation); Apify/RapidAPI wrappers need an account; GitHub "no auth Reddit" wrappers call the dead `.json` endpoints. Arctic Shift's aggregate endpoints read 0 for every recent hour (they lag days), so counts come from records; its full-text title search on r/wallstreetbets mostly times out, so the daily thread is picked from the newest posts by title prefix.
+- Arctic Shift re-reads scores about 36 h after a post; younger posts report `score` None rather than the archive's 0/1 (or an early large number), so no score logic ever sees an unsettled post. A security review flagged that this leaves smart_money's score gate inert (one throwaway account could seed a signal). Gates now: (a) at least two distinct authors per (ticker, direction) in the pull, and (d) unscored signals are stored in raw_series with `trust_tier: "unscored"` but kept out of `signal_sources` (the downstream smart_money / social streams) until corroborated across time (`trust_tier: "unscored_promoted"`). A second review found the first version split "prior" from "now" by row `pull_timestamp`, so re-pulled posts could count twice. Promotion now works on post creation time: fresh posts are this pull's posts no earlier run stored (by `post_id`, now kept in the payload, or author + text hash for older rows); prior authors come from stored posts created at least 6 h before the earliest fresh post (within 48 h); promotion needs two or more prior authors and a fresh post by someone else. Arctic Shift exposes no account creation time, so there is no account-age gate.
+- reddit_options_pulse picked the daily thread by title prefix alone, newest first, so a user post with the same title could be taken. It now also requires the posting account: u/verified-trader (the board's moderator account; live check 2026-11-18 showed it posted the last three daily threads, `distinguished="moderator"` on the "Moves Tomorrow" ones, none on the daily one) or AutoModerator (earlier years), and takes the first such post of the newest day. AutoModerator alone would match nothing today. `stickied` cannot be requested as a field from Arctic Shift, and `distinguished` is absent on the daily thread, so neither is required.
+- Tradestie is asked for the finished previous US/Eastern day and stored once per Tradestie day (`tradestie_date` in the payload); obs_date stays the fetch date.
+
+Broken or TBD:
+
+- Needs merge + deploy (SmartScheduler picks up smart_money's hourly cadence and the new legs; intelligence scheduler's 22:00 options pulse uses the new fetch). No activation step.
+- Arctic Shift publishes no uptime guarantee; a 429/422 burst shows as PARTIAL/FAILED in pull_log, never as zero rows passed off as data.

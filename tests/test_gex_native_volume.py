@@ -75,7 +75,8 @@ def test_ready_payload_is_exactly_the_readers_contract():
     for k in ("historical_request", "signal_confirmation", "exact_trade_vwap", "cross_source_reconciled", "live"):
         assert p[k] is False, k
     assert p["baseline_errors"] == {}
-    assert p["vwap_basis"] == "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+    assert p["vwap_basis"] == ("HLC3 of native one-minute bars weighted by Schwab quote totalVolume increments "
+                               "(bar volume where no earlier sample); not trade VWAP")
     assert p["rvol_basis"] == "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
     assert p["cumulative_shares"] == 60 * 150_000 and type(p["cumulative_shares"]) is int
     assert p["completed_minutes"] == 60 and len(p["source_revisions"]) == 60
@@ -499,3 +500,208 @@ def test_runner_open_session_still_uses_one_quote_and_one_history_call(monkeypat
     env, _ = snap.run_once(FakeClient(), None)
     assert env["payload"]["status"] == "ready"
     assert calls == [("quotes", "SPY"), ("history", "SPY", nv.history_params(NOW))]
+
+
+
+# ---------------------------------------------------------------- quote-volume weighting (2026-11-19)
+
+def _bar(d: date, hh: int, mm: int, v: int, px: float):
+    t = _ts(d, hh, mm)
+    return (t, px + 0.3, px - 0.3, px + 0.1, v)          # HLC3 = px + 1/30
+
+
+def test_without_earlier_samples_the_vwap_is_the_bar_weighted_one():
+    bars = [_bar(TODAY, 9, 30 + i, 100 + 50 * i, 700.0 + i) for i in range(5)]
+    vwap, used = nv.quote_weighted_vwap(bars, [(_ts(TODAY, 9, 35, 7), 10_000)])
+    bar_vwap = sum((b[1] + b[2] + b[3]) / 3 * b[4] for b in bars) / sum(b[4] for b in bars)
+    assert abs(vwap - bar_vwap) < 1e-12 and used == {"quote_weighted_blocks": 0, "bar_weighted_blocks": 1}
+
+
+def test_blocks_are_weighted_by_the_counters_rise_since_the_previous_run():
+    # runs at 09:31:07, 09:32:07, 09:33:07: bars 09:30, 09:31, 09:32 each complete in one run
+    bars = [_bar(TODAY, 9, 30, 100, 700.0), _bar(TODAY, 9, 31, 100, 701.0), _bar(TODAY, 9, 32, 100, 702.0)]
+    samples = [(_ts(TODAY, 9, 31, 7), 5_000), (_ts(TODAY, 9, 32, 7), 5_300), (_ts(TODAY, 9, 33, 7), 6_200)]
+    vwap, used = nv.quote_weighted_vwap(bars, samples)
+    p = [700.0 + 1 / 30, 701.0 + 1 / 30, 702.0 + 1 / 30]
+    want = (p[0] * 100 + p[1] * 300 + p[2] * 900) / 1300           # first block by its bar volume, then the rises
+    assert abs(vwap - want) < 1e-9 and used == {"quote_weighted_blocks": 2, "bar_weighted_blocks": 1}
+
+
+def test_a_missed_run_merges_its_bars_and_a_falling_counter_falls_back_to_bar_volume():
+    bars = [_bar(TODAY, 9, 30, 100, 700.0), _bar(TODAY, 9, 31, 300, 701.0), _bar(TODAY, 9, 32, 100, 702.0)]
+    samples = [(_ts(TODAY, 9, 31, 7), 5_000), (_ts(TODAY, 9, 33, 7), 4_000)]       # 09:32:07 missed; counter fell
+    vwap, used = nv.quote_weighted_vwap(bars, samples)
+    p1 = ((701.0 + 1 / 30) * 300 + (702.0 + 1 / 30) * 100) / 400
+    assert abs(vwap - ((700.0 + 1 / 30) * 100 + p1 * 400) / 500) < 1e-9 and used["bar_weighted_blocks"] == 2
+
+
+def test_compute_uses_the_samples_and_keeps_the_payload_contract():
+    hist = _history()
+    early = [(_ts(TODAY, 9, 30) + 60 * (i + 1) + 7, 1_000_000 + 200_000 * i) for i in range(59)]
+    pl, info = nv.compute(hist, _quote(60 * 150_000), now=NOW, receipt_at=RECEIPT, quote_samples=early)
+    assert pl["status"] == "ready" and set(pl) == READER_FIELDS and pl["vwap_basis"] == nv.VWAP_BASIS
+    assert info["vwap_weighting"]["quote_weighted_blocks"] >= 58
+
+
+def test_the_runner_keeps_todays_samples_privately_and_reads_them_back(tmp_path, monkeypatch):
+    import scripts.gex_native_volume_snapshot as snap
+    d = tmp_path / "snap"
+    d.mkdir(mode=0o700)
+    out = d / "snapshot.json"
+    clock = {"t": RECEIPT}
+
+    class Quote:
+        def __init__(self, v):
+            self.total_volume = v
+
+    class Client:
+        n = 0
+
+        def quotes(self, sym):
+            Client.n += 1
+            return {sym: Quote(_quote(60 * 150_000) + Client.n * 1000)}
+
+        def price_history(self, sym, **kw):
+            return _history()
+
+    monkeypatch.setattr(snap.time, "time", lambda: clock["t"])
+    snap.run_once(Client(), out)
+    clock["t"] += 60
+    env, info = snap.run_once(Client(), out)
+    path = d / f"quote-samples-{TODAY.isoformat()}.jsonl"
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    assert len(lines) == 2 and lines[1]["q"] - lines[0]["q"] == 1000 and stat.S_IMODE(path.stat().st_mode) == 0o600
+    memory = []
+    snap.run_once(Client(), None, memory)
+    assert len(memory) == 1
+
+
+# ---------------------------------------------------------------- scope gate since the open (2026-11-19)
+
+PRE_OPEN = (_ts(TODAY, 9, 29, 9), 5_000_000)     # the 09:29:08 run's reading: a large pre-open lump, as on 18 Nov
+CUM = 60 * 150_000
+
+
+def _since_open_quote(gap: float, pre: int = PRE_OPEN[1]) -> int:
+    return pre + round(CUM / (1 - gap))
+
+
+def test_a_pre_open_lump_fails_the_whole_day_gate_without_a_pre_open_sample():
+    p, info = nv.compute(_history(), _since_open_quote(0.15), now=NOW, receipt_at=RECEIPT)
+    assert (p["status"], p["reason"]) == ("unreconciled", "bars_missing_volume")
+    assert info["reconciliation"]["gate_basis"] == "whole_day" and info["reconciliation"]["relative_difference"] > 0.30
+
+
+def test_the_pre_open_sample_judges_the_volume_since_the_open():
+    q = _since_open_quote(0.15)
+    p, info = nv.compute(_history(), q, now=NOW, receipt_at=RECEIPT, quote_samples=[PRE_OPEN])
+    r = info["reconciliation"]
+    assert p["status"] == "ready" and set(p) == READER_FIELDS
+    assert r["gate_basis"] == "since_open" and r["scope_gap_band"] == [0.0, 0.30]
+    assert math.isclose(r["since_open_difference"], 0.15, abs_tol=1e-5)
+    assert math.isclose(r["relative_difference"], (q - CUM) / q, abs_tol=1e-5)    # the log's diff= stays whole-day
+    assert r["pre_open_quote_total_volume"] == PRE_OPEN[1]
+
+
+@pytest.mark.parametrize(("gap", "status", "reason"), [
+    (0.02, "ready", None),                                 # Schwab's opening-bar shortfall is small: floor 0
+    (0.0, "ready", None),
+    (-0.05, "unreconciled", "bars_at_or_above_quote_total"),   # bars above the counter still fail (Yahoo)
+    (0.45, "unreconciled", "bars_missing_volume"),
+])
+def test_the_since_open_band(gap, status, reason):
+    p, _ = nv.compute(_history(), _since_open_quote(gap), now=NOW, receipt_at=RECEIPT, quote_samples=[PRE_OPEN])
+    assert (p["status"], p["reason"]) == (status, reason)
+
+
+@pytest.mark.parametrize("sample", [
+    (_ts(TODAY, 9, 27, 0), 5_000_000),          # older than PRE_OPEN_MAX_AGE_S
+    (_ts(TODAY, 9, 30, 10), 5_000_000),         # the 09:30 run: in session, not pre-open
+    (_ts(TODAY, 9, 29, 9), 99_000_000),         # counter above the current one: did not rise
+])
+def test_an_unusable_pre_open_sample_leaves_the_whole_day_gate(sample):
+    q = _quote(CUM, 0.13)
+    p, info = nv.compute(_history(), q, now=NOW, receipt_at=RECEIPT, quote_samples=[sample])
+    assert p["status"] == "ready" and info["reconciliation"]["gate_basis"] == "whole_day"
+
+
+def test_split_samples_keeps_the_pre_open_base_and_drops_the_opening_minute_sample():
+    session = nv.calendar_window(NOW)[1]
+    samples = [(_ts(TODAY, 9, 20, 9), 1), PRE_OPEN, (_ts(TODAY, 9, 30, 10), 5_600_000), (_ts(TODAY, 9, 31, 7), 6_000_000)]
+    pre, kept = nv.split_samples(samples, session)
+    assert pre == PRE_OPEN and kept == [PRE_OPEN, (_ts(TODAY, 9, 31, 7), 6_000_000)]
+
+
+def test_the_opening_bar_is_weighted_from_the_pre_open_sample():
+    # The 09:30 run's counter already holds the opening cross; without dropping it the 09:30 bar would be
+    # weighted by 09:30:10..09:31:07 only.
+    bars = [_bar(TODAY, 9, 30, 100, 700.0), _bar(TODAY, 9, 31, 100, 701.0)]
+    pre = (PRE_OPEN[0], 5_000)
+    _, kept = nv.split_samples([pre, (_ts(TODAY, 9, 30, 10), 5_900), (_ts(TODAY, 9, 31, 7), 6_000),
+                                (_ts(TODAY, 9, 32, 7), 6_200)], nv.calendar_window(_ts(TODAY, 9, 32, 7))[1])
+    vwap, used = nv.quote_weighted_vwap(bars, kept)
+    want = ((700.0 + 1 / 30) * 1000 + (701.0 + 1 / 30) * 200) / 1200
+    assert abs(vwap - want) < 1e-9 and used == {"quote_weighted_blocks": 2, "bar_weighted_blocks": 0}
+
+
+@pytest.mark.parametrize(("hh", "mm", "ss", "expected"), [
+    (9, 29, 8, True), (9, 28, 31, True), (9, 28, 29, False), (9, 25, 8, False), (9, 30, 0, False)])
+def test_pre_open_session_is_only_the_last_run_before_the_bell(hh, mm, ss, expected):
+    assert (nv.pre_open_session(_ts(TODAY, hh, mm, ss)) is not None) is expected
+
+
+def test_no_pre_open_sample_on_a_closed_day():
+    assert nv.pre_open_session(_ts(date(2026, 11, 26), 9, 29, 8)) is None      # Thanksgiving
+
+
+def test_the_pre_open_run_makes_one_quote_call_and_writes_only_the_sample(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import scripts.gex_native_volume_snapshot as snap
+
+    calls = []
+
+    class Client:
+        def quotes(self, symbol):
+            calls.append("quotes")
+            return {symbol: SimpleNamespace(total_volume=5_000_000)}
+
+        def price_history(self, symbol, **kw):
+            pytest.fail("no bars before the bell")
+
+    d = tmp_path / "snap"
+    d.mkdir(mode=0o700)
+    out = d / "snapshot.json"
+    t = _ts(TODAY, 9, 29, 8)
+    monkeypatch.setattr(snap.time, "time", lambda: t)
+    env, info = snap.run_once(Client(), out)
+    assert calls == ["quotes"] and env["payload"]["status"] == "closed" and info["pre_open_sample"] is True
+    assert not out.exists()
+    path = d / f"quote-samples-{TODAY.isoformat()}.jsonl"
+    assert [json.loads(x)["q"] for x in path.read_text().splitlines()] == [5_000_000]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    calls.clear()
+    monkeypatch.setattr(snap.time, "time", lambda: _ts(TODAY, 9, 20, 8))     # an earlier pre-open run: no call
+    assert snap.run_once(Client(), out)[1]["pre_open_sample"] is False and calls == []
+
+
+def test_ready_log_lines_keep_the_form_the_burn_in_jobs_parse(monkeypatch, capsys):
+    import re
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    import scripts.gex_native_volume_snapshot as snap
+
+    class Client:
+        def quotes(self, symbol):
+            return {symbol: SimpleNamespace(total_volume=_quote(CUM))}
+
+        def price_history(self, symbol, **kw):
+            return _history()
+
+    fake = ModuleType("ingestion.schwab_market")     # the real one loads GRID config (needs the service .env)
+    fake.SchwabError, fake.SchwabMarketClient = RuntimeError, Client
+    monkeypatch.setitem(sys.modules, "ingestion.schwab_market", fake)
+    monkeypatch.setattr(snap.time, "time", lambda: NOW)
+    assert snap.main(["--dry-run"]) == 0
+    line = capsys.readouterr().out.strip()
+    assert re.match(r"^(\S+) ready - bars=(\d+) quote=(\d+) diff=([0-9.]+)$", line), line

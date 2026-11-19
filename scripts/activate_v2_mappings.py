@@ -5,8 +5,9 @@ then re-runs the resolver to process any previously-skipped raw_series.
 """
 from __future__ import annotations
 
+import os
 import sys
-sys.path.insert(0, "/data/grid_v4/grid_repo/grid")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import get_engine
 from sqlalchemy import text

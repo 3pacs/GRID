@@ -206,5 +206,45 @@ class FactoryDeskTest(unittest.TestCase):
         self.assertNotIn("BUY", json.dumps(self.adapt()))
 
 
+    def test_cross_section_state_preserved_without_promotion(self):
+        self.rep["state"] = "CROSS_SECTION_DEV_RANKING_ONLY"
+        self.rep["target_unit"] = "net return per $1 long and $1 short per traded night (fraction)"
+        self.rep["selected"] = ["trial-a"]
+        self.rep["ranking"][0]["selected"] = True
+        result = self.adapt()
+        self.assertEqual(result["source_state"], self.rep["state"])
+        self.assertEqual(result["target_unit"], self.rep["target_unit"])
+        self.assertEqual(result["ranking"][0]["forward_samples"], 0)
+        self.assertFalse(result["promotion_allowed"])
+        self.assertEqual(result["outcome"], "development_candidates_only")
+
+    def test_cross_section_negative_and_clocks_preserved(self):
+        self.rep["state"] = "CROSS_SECTION_DEV_RANKING_ONLY"
+        result = self.adapt(observed_at=None)
+        self.assertEqual(result["outcome"], "no_selected_candidates")
+        self.assertEqual(result["summary"]["quality"], "withheld")
+        self.assertEqual(result["ranking"][0]["reported_metrics"]["net_dollars"], -0.04)
+
+    def test_unadapted_coverage_explicit_without_copying_narrative(self):
+        self.rep.update(state="CROSS_SECTION_DEV_RANKING_ONLY",
+                        cards={"trial-a": {"note": "BUY NOW"}},
+                        method={"selection": "max_t_sign_flip"}, coverage={})
+        result = self.adapt()
+        self.assertEqual(result["adapter_scope"], "ranking_summary_only")
+        self.assertEqual(result["unadapted_report_fields"], ["cards", "coverage", "method"])
+        self.assertNotIn("BUY NOW", json.dumps(result))
+        self.assertNotIn("max_t_sign_flip", json.dumps(result))
+
+    def test_cross_section_still_requires_explicit_development_state(self):
+        for state in ("CROSS_SECTION_VALIDATED", "CROSS_SECTION", "", None, []):
+            self.rep["state"] = state
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                self.adapt()
+        self.rep["state"] = "CROSS_SECTION_DEV_RANKING_ONLY"
+        self.rep["promotion_allowed"] = True
+        with self.assertRaises(ValueError):
+            self.adapt()
+
+
 if __name__ == "__main__":
     unittest.main()

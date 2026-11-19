@@ -113,7 +113,7 @@ class TestComputeEdgeCorrelation:
 
         with patch(
             "intelligence.supply_chain_edge_validator.resolve_price_series_id",
-            side_effect=lambda s: f"YF:{s.upper()}:close",
+            side_effect=lambda s, *_: f"YF:{s.upper()}:close",
         ), patch(
             "intelligence.supply_chain_edge_validator.fetch_close_series",
             side_effect=[up_df, down_df],
@@ -142,7 +142,7 @@ class TestComputeEdgeCorrelation:
         up_df = _make_df([100.0 + i for i in range(60)])
         with patch(
             "intelligence.supply_chain_edge_validator.resolve_price_series_id",
-            side_effect=lambda s: f"YF:{s.upper()}:close",
+            side_effect=lambda s, *_: f"YF:{s.upper()}:close",
         ), patch(
             "intelligence.supply_chain_edge_validator.fetch_close_series",
             side_effect=[up_df, pd.DataFrame(columns=["obs_date", "value"])],
@@ -159,7 +159,7 @@ class TestComputeEdgeCorrelation:
         down_df = _make_df([50.0 + i for i in range(10)])
         with patch(
             "intelligence.supply_chain_edge_validator.resolve_price_series_id",
-            side_effect=lambda s: f"YF:{s.upper()}:close",
+            side_effect=lambda s, *_: f"YF:{s.upper()}:close",
         ), patch(
             "intelligence.supply_chain_edge_validator.fetch_close_series",
             side_effect=[up_df, down_df],

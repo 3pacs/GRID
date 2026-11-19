@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import ledger as L
+from . import sanity
 from .data import PolygonMinuteSource
 from .runner import build_status, run_cycle
 
@@ -53,9 +54,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "cycle" and led and anc:
         source = PolygonMinuteSource(data / "bars.sqlite3", max_requests=args.max_requests)
-        # opened inside the cycle lock, so a second process never works from a stale copy
-        summary = run_cycle(lambda: L.open_ledger(led, anc), source, data, dry_run=args.dry_run,
-                            register=not args.no_register)
+        sanity.set_feasibility_source(source)  # G11 reads pre-window bars through the same cache
+        try:
+            # opened inside the cycle lock, so a second process never works from a stale copy
+            summary = run_cycle(lambda: L.open_ledger(led, anc), source, data, dry_run=args.dry_run,
+                                register=not args.no_register)
+        finally:
+            sanity.set_feasibility_source(None)
         print(json.dumps(summary, indent=1, sort_keys=True, default=str))
         return 0
     if led and anc:
@@ -87,7 +92,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     source = PolygonMinuteSource(data / "bars.sqlite3", max_requests=args.max_requests)
-    summary = run_cycle(ledger, source, data, dry_run=args.dry_run, register=not args.no_register)
+    sanity.set_feasibility_source(source)
+    try:
+        summary = run_cycle(ledger, source, data, dry_run=args.dry_run, register=not args.no_register)
+    finally:
+        sanity.set_feasibility_source(None)
     print(json.dumps(summary, indent=1, sort_keys=True, default=str))
     return 0
 
