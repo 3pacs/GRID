@@ -435,13 +435,20 @@ class Sleuth:
         category: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        *,
+        origin: str | None = None,
+        created_since: datetime | None = None,
+        created_until: datetime | None = None,
     ) -> list[Lead]:
-        """Query leads with optional filters."""
+        """Query leads with optional filters. The created bounds are inclusive."""
         params: dict[str, Any] = {
             "lim": limit,
             "off": offset,
             "status": status,
             "category": category,
+            "origin": origin,
+            "since": created_since,
+            "until": created_until,
         }
 
         with self.engine.connect() as conn:
@@ -452,6 +459,9 @@ class Sleuth:
                 "FROM investigation_leads "
                 "WHERE (:status IS NULL OR status = :status) "
                 "AND (:category IS NULL OR category = :category) "
+                "AND (:origin IS NULL OR origin = :origin) "
+                "AND (:since IS NULL OR created_at >= :since) "
+                "AND (:until IS NULL OR created_at <= :until) "
                 "ORDER BY priority DESC, created_at DESC "
                 "LIMIT :lim OFFSET :off"
             ), params).fetchall()
