@@ -26,13 +26,17 @@ Look reports: `looks/<registration sha[:16]>.json` (0444, schema `edge-look-repo
 |---|---|
 | registration sealed (hash chain + anchor) before its data is read; looks happen in a later cycle | `ledger.append_registration`, `runner.run_cycle` step order |
 | one look per registration; an abandoned one keeps its alpha spent | `ledger.load_state` / `append_look` / `append_abandoned` |
-| 40 stage-1 registrations per calendar year (UTC), alpha 0.00125 each, Bonferroni over trials | `policy`, `ledger._check_registration` |
+| two-stage evidence bar (policy 3): at most 40 stage-1 registrations per calendar year (UTC), each a discovery at alpha 0.025, Bonferroni over trials; one confirmation look at 0.05/k; `40 x 0.025 x 0.05 <= q_year` | `policy`, `ledger._check_registration` |
+| a registration is checked against the numbers of the policy it was sealed under (a 0.00125 registration from policy 1 or 2 stays valid) | `ledger._check_registration` (`state.policy`) |
+| a discovery is refitted without its largest calendar year; an effect that disappears is `EPISODE` and is not confirmed | `stats.largest_year_out`, `stats.judge(discovery=True)` |
+| a confirmation look that does not PASS closes the family in that group, on every lane | `ledger.StreamState.closed_families`, `sanity` G8 |
+| noise is measured per day or ISO week; a finer unit in a trade's `session` is refused | `stats.judge` |
 | no reuse of (group, horizon class, period): prior consumption table + every registration | `ledger.conflicts` |
 | forward windows start after registration; no outcome computed before the look | `runner.forward_progress` (presence only) |
 | look runs only on the registered family code (`code_sha256`), else abandoned | `runner.compute_look` |
 | bars after the decision minute never reach the rule | `families.decision_bars` / `assert_no_lookahead` |
-| a stage-1 trial must be able to pay its costs: pooled break-even hit rate (1 + round-trip cost floor / mean \|move\|) / 2 ≤ 0.60, measured on the ~13–16 sessions **before** the window (unsigned sizes only) | `sanity` G11 (bar source set by the CLI; `sanity` is not hashed, so the gate never abandons an open registration) |
-| expectancy test: n ≥ 100, ≥ 50 a side, both sides > 0, session bootstrap LB at 1−alpha/k > 0, beats always-long, 2 of 3 thirds | `stats.judge` |
+| a stage-1 trial of a session family must be able to pay its costs: pooled break-even hit rate (1 + round-trip cost floor / mean \|move\|) / 2 ≤ 0.60, measured on the ~13–16 sessions **before** the window (unsigned sizes only); event families (EC1) are not priced by it | `sanity` G11 (bar source set by the CLI; `sanity` is not hashed, so the gate never abandons an open registration) |
+| expectancy test: n ≥ 100, ≥ 50 a side, both sides > 0, session bootstrap LB and clustered-t LB at 1−alpha/k > 0, beats always-long, 2 of 3 thirds | `stats.judge` |
 
 ## Families
 
@@ -49,12 +53,48 @@ without sealing or forming a trade:
 `python -m alpha_research.edge_stream cycle --dry-run --family EC1 --data-dir <scratch>` (prints sessions,
 filings found, companies left out, and the hour of day filings were accepted).
 
+## The evidence bar (policy 3, owner decision GRID#1213)
+
+Recorded by the owner on 2026-11-16
+([comment](https://github.com/3pacs/GRID/issues/1213#issuecomment-6932309442)); the policy carries the decision's
+id, link and the sha256 of its text in `owner_decisions`.
+
+| stage | what | level |
+|---|---|---|
+| 1, discovery | the pass test on the registered window, then the refit without the largest calendar year | 0.025 a look, Bonferroni over its trials |
+| 2, confirmation | one look on data the search never read (the stream's forward lane), registered before the data exists | 0.05 one-sided, Bonferroni over its trials |
+
+- **Why 0.025.** The yearly budget `q_year` 0.05 is unchanged and now covers both stages: if all 40 registrations
+  of a year were false, the expected number of false *confirmed* candidates is 40 x 0.025 x 0.05 = 0.05. The
+  retired 0.00125 bar put the whole budget on stage 1 and needed an annualised Sharpe near 2.6 on two years.
+- **Best of the shuffled searches.** A look's trials are fixed in its registration before any data is read, so
+  there is no search inside a look for a shuffle to price, and Bonferroni over the trials bounds that bar from
+  above. A family that searches cells before choosing one (as `analysis.factory_stats` max-T does) has to bring
+  its best-of-shuffled bar from its own discovery.
+- **Largest year left out.** The calendar year with the largest summed net is dropped; if the mean net of the
+  rest is not above zero the verdict is `EPISODE` (no confirmation is registered). With fewer than 50 trades
+  outside that year, which includes every one-year window such as EC1's 2026 history, the refit is recorded as
+  `not_possible` and the verdict stands; the forward confirmation is then the second period.
+- **A miss closes the family.** A confirmation look that is not `PASS` closes that family in that group for
+  good. An abandoned confirmation has no look: it closes nothing, its window stays consumed and the discovery
+  stays unconfirmed (a discovery is confirmed at most once).
+- **Before anything is acted on.** A confirmed `PASS` is a paper result until its cost has been measured against
+  real fills (GRID#1214); the stream still never trades.
+- **Not built.** Confirmation on unread *history* years, and confirmation-only entries for discoveries made
+  outside the stream. Stage 2 is forward only.
+
+To check the decision's hash: `gh api repos/3pacs/GRID/issues/comments/6932309442 --jq .body`, LF line ends,
+exactly one trailing newline, sha256 = `a4284cd5…68228f4` (`policy.OWNER_DECISIONS`).
+
 ## Changing the policy
 
 `policy.py` is the policy the code runs; the ledger holds the policy in force. When they differ the cycle appends
 an `edge_policy_amendment` record before it seals anything new, and only if the code's policy passes
-`policy.tightening_violations` (budget numbers may fall, sample and cost floors may rise, groups, instruments, cost
-tiers and prior consumption may be added; nothing else may change). A loosening policy is refused: the cycle
+`policy.amendment_violations`: the tightening rule (budget numbers may fall, sample and cost floors may rise,
+groups, instruments, cost tiers, pass-test conditions and prior consumption may be added; nothing else may
+change), except for the fields a new entry in `policy.OWNER_DECISIONS` waives. A decision can waive only
+`budget.alpha_per_look`, `budget.rule`, `promotion` and `evidence_bar`, must carry its link and text hash, is never
+edited or removed afterwards, and never lifts the yearly budget. Anything else that loosens is refused: the cycle
 reports it under `errors` and registers nothing until the code is put right.
 
 **Deploying any change to `families`, `stats`, `runner`, `data` or `policy` abandons the registration that is open
@@ -63,7 +103,8 @@ change when the open registration is the one you can best afford to lose, and sa
 
 Adding a family = a reviewed PR to `families.py` (its source is hashed into registrations). An inbox proposal
 (`{"family": "IM1", "group": "...", "instruments": [...], "lane": "history"|"forward", "proposer": "codex"}`) may only
-parameterise an existing family. Policy numbers change only by a new policy version that tightens.
+parameterise an existing family. Policy numbers change only by a new policy version that tightens, or by a
+recorded owner decision.
 
 ## Install on grid-svr (Anik; after the PR is merged and deployed)
 

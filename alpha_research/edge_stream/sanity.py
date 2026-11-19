@@ -216,8 +216,11 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
 
     # G8 budget
     epoch = proposal.get("epoch", today.year)
+    closed = state.closed_families().get((proposal.get("family"), proposal.get("group")))
     if proposal["stage"] == 1 and state.stage1_count(epoch) >= P.MAX_REGISTRATIONS_PER_YEAR:
         r["G8_budget"] = f"{epoch} budget of {P.MAX_REGISTRATIONS_PER_YEAR} looks spent"
+    elif proposal["stage"] == 1 and closed:
+        r["G8_budget"] = f"family closed in this group: its confirmation {closed} did not pass"
     else:
         try:
             bootstrap_b(proposal["alpha_trial"])

@@ -86,7 +86,7 @@ def test_policy_record_pins_the_policy():
     led = L.memory()
     rec = led.records[1]
     assert rec["kind"] == "edge_policy" and rec["policy_sha256"] == P.policy_sha256()
-    assert rec["policy"]["budget"]["alpha_per_look"] == pytest.approx(0.00125)
+    assert rec["policy"]["budget"]["alpha_per_look"] == pytest.approx(0.025)
     assert all(r["promotion_allowed"] is False for r in led.records)
 
 
@@ -174,13 +174,16 @@ def test_lookahead_guard():
         F.assert_no_lookahead(bars, "15:30")
 
 
-def _trades(effect, n_sessions=400, seed=1, both=True):
+def _trades(effect, n_sessions=400, seed=1, both=True, start=date(2025, 1, 2), effect_until=None):
+    """One trade a day from ``start``; the planted effect stops after ``effect_until`` (a day), if given."""
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n_sessions):
+        day = (start + timedelta(days=i)).isoformat()
         side = (1 if rng.random() < 0.5 else -1) if both else 1
-        move = side * effect + rng.normal(0, 0.001)
-        out.append({"session": f"s{i:04d}", "side": side, "net": side * move - 0.0003,
+        planted = effect if effect_until is None or day <= effect_until else -effect / 4
+        move = side * planted + rng.normal(0, 0.001)
+        out.append({"session": day, "side": side, "net": side * move - 0.0003,
                     "always_long_net": move - 0.0003})
     return out
 
@@ -191,6 +194,36 @@ def test_pass_fail_underpowered():
     assert ST.judge(_trades(0.001, n_sessions=60), P.ALPHA_PER_LOOK)["verdict"] == "UNDERPOWERED"
     one_sided = ST.judge(_trades(0.001, both=False), P.ALPHA_PER_LOOK)
     assert one_sided["verdict"] == "UNDERPOWERED" and "sides" in one_sided["reasons"][0]
+
+
+def test_discovery_is_refitted_without_its_largest_year():
+    # the effect holds in both years: the largest year goes and the rest still pays
+    both_years = ST.judge(_trades(0.001, n_sessions=700), P.ALPHA_PER_LOOK, discovery=True)
+    refit = both_years["largest_year_out"]
+    assert both_years["verdict"] == "PASS" and refit["status"] == "survives"
+    assert refit["years"] == ["2025", "2026"] and refit["n_left_out"] + refit["n_without"] == 700
+    # the effect lives in 2025 only: it clears the test on the whole window, and is an episode
+    trades = _trades(0.003, n_sessions=700, effect_until="2025-12-31")
+    assert ST.judge(trades, P.ALPHA_PER_LOOK)["verdict"] == "PASS"  # a confirmation look does not refit
+    one_year = ST.judge(trades, P.ALPHA_PER_LOOK, discovery=True)
+    assert one_year["verdict"] == "EPISODE" and one_year["largest_year_out"]["year_left_out"] == "2025"
+    assert one_year["largest_year_out"]["mean_net_without"] < 0 and "2025 left out" in one_year["reasons"][0]
+    # a window inside one calendar year has nothing to refit on: recorded, and the verdict stands
+    single = ST.judge(_trades(0.001, n_sessions=300), P.ALPHA_PER_LOOK, discovery=True)
+    assert single["verdict"] == "PASS" and single["largest_year_out"]["status"] == "not_possible"
+    assert single["largest_year_out"]["n_without"] == 0
+    # a trial that fails is not refitted at all
+    assert "largest_year_out" not in ST.judge(_trades(0.0), P.ALPHA_PER_LOOK, discovery=True)
+
+
+def test_noise_is_measured_per_day_or_week_and_a_finer_unit_is_refused():
+    rows = _trades(0.001, n_sessions=120)
+    weekly = [{**t, "session": F.iso_week(t["session"])} for t in rows]
+    assert ST.judge(weekly, P.ALPHA_PER_LOOK)["sessions"] < 120  # days of one week are resampled together
+    with pytest.raises(ValueError, match="a day or an ISO week"):
+        ST.judge([{**t, "session": t["session"] + "T15:30"} for t in rows], P.ALPHA_PER_LOOK)
+    with pytest.raises(ValueError, match="a day or an ISO week"):
+        ST.judge([{**t, "session": f"s{i}"} for i, t in enumerate(rows)], P.ALPHA_PER_LOOK)
 
 
 def test_bootstrap_is_seeded_and_resolvable():
