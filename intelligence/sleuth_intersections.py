@@ -70,7 +70,7 @@ from statistics import median
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -545,6 +545,104 @@ def baseline_id(lead_id: str) -> str:
     return f"hyp_base_{lead_id.removeprefix('LEAD-INTX-')}"
 
 
+def sleuth_test_id(lead_id: str) -> str:
+    return f"hyp_sleuth_{lead_id.removeprefix('LEAD-INTX-')}"
+
+
+_TEST_COLUMNS = (
+    "id", "test_criteria", "status", "created_at", "last_tested", "times_tested",
+    "times_correct", "kill_reason", "killed_at", "scoring_version",
+    "trial_p_value", "trial_q_value", "trial_ledger_sha256",
+)
+TEST_ROLE_DECLARED = "declared"   # the reviewed test the lead's verdict declared
+TEST_ROLE_BASELINE = "baseline"   # the same criteria, declared for every lead without review
+TEST_LINK_MISSING = "declared_test_row_missing"
+TEST_LINK_MISMATCH = "declared_test_names_another_lead"
+
+
+def declared_tests_for_leads(engine: Engine, leads: list[Any]) -> dict[str, dict[str, Any]]:
+    """Each lead's stored tests, read as they are now. One primary-key query.
+
+    A lead links to a test in two stored ways: ``declared_hypothesis_id`` on
+    the lead, and ``test_criteria.lead_id`` on the ``discovered_hypotheses``
+    row (the only link a baseline has). Test ids are deterministic from the
+    lead id, so both are found by key. The result says which links held:
+
+    * ``tests``: the rows found, each with its role, criteria, status and
+      trial columns. ``test_criteria`` is the pre-registered test; nothing
+      here scores it.
+    * ``link_problems``: a stored link that does not resolve
+      (``declared_test_row_missing``) or resolves to a row naming another
+      lead (``declared_test_names_another_lead``). A lead with a problem has
+      no verified declared test; it is not the same as a lead with none.
+
+    These rows are updated in place by the trial scorer, so this is the
+    current state, not what was known at an earlier time.
+    """
+    wanted: dict[str, list[str]] = {}
+    for lead in leads:
+        ids = [baseline_id(lead.id), sleuth_test_id(lead.id)]
+        if lead.declared_hypothesis_id:
+            ids.append(lead.declared_hypothesis_id)
+        wanted[lead.id] = list(dict.fromkeys(ids))
+    out: dict[str, dict[str, Any]] = {
+        lead.id: {"tests": [], "link_problems": []} for lead in leads
+    }
+    all_ids = sorted({i for ids in wanted.values() for i in ids})
+    if not all_ids:
+        return out
+    stmt = text(
+        "SELECT id, test_criteria, status, created_at, last_tested, times_tested, "
+        "times_correct, kill_reason, killed_at, scoring_version, "
+        "trial_p_value, trial_q_value, trial_ledger_sha256 "
+        "FROM discovered_hypotheses WHERE id IN :ids"
+    ).bindparams(bindparam("ids", expanding=True))
+    with engine.connect() as conn:
+        rows = {r[0]: dict(zip(_TEST_COLUMNS, r, strict=True))
+                for r in conn.execute(stmt, {"ids": all_ids})}
+    for lead in leads:
+        entry = out[lead.id]
+        for test_id in wanted[lead.id]:
+            row = rows.get(test_id)
+            is_declared = test_id == lead.declared_hypothesis_id
+            if row is None:
+                if is_declared:
+                    entry["link_problems"].append({"problem": TEST_LINK_MISSING, "id": test_id})
+                continue
+            criteria = row["test_criteria"]
+            if isinstance(criteria, str):
+                criteria = json.loads(criteria)
+            criteria = criteria if isinstance(criteria, dict) else {}
+            if criteria.get("lead_id") != lead.id:
+                entry["link_problems"].append({"problem": TEST_LINK_MISMATCH, "id": test_id})
+                continue
+            entry["tests"].append({
+                "id": test_id,
+                "role": (TEST_ROLE_BASELINE if criteria.get("source") == BASELINE_PATTERN
+                         else TEST_ROLE_DECLARED),
+                "linked_from_lead": is_declared,
+                "test_criteria": criteria,
+                "status": row["status"],
+                "created_at": _iso(row["created_at"]),
+                "last_tested": _iso(row["last_tested"]),
+                "times_tested": row["times_tested"],
+                "times_correct": row["times_correct"],
+                "kill_reason": row["kill_reason"],
+                "killed_at": _iso(row["killed_at"]),
+                "scoring_version": row["scoring_version"],
+                "trial_p_value": row["trial_p_value"],
+                "trial_q_value": row["trial_q_value"],
+                "trial_ledger_sha256": row["trial_ledger_sha256"],
+            })
+    return out
+
+
+def _iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
 def declare_baseline(conn: Any, lead_id: str, question: str,
                      evidence: list[dict[str, Any]]) -> str | None:
     """Insert the lead's unreviewed forward test, or None when the lead names no
@@ -633,7 +731,7 @@ def declare_hypothesis(conn: Any, lead: Any, ticker: str, direction: str,
                        verdict: dict[str, str]) -> str:
     """Insert the lead's forward test into ``discovered_hypotheses``. Its
     ``created_at`` is now, so the v2 scorer's holdout is data after this."""
-    hyp_id = f"hyp_sleuth_{lead.id.removeprefix('LEAD-INTX-')}"
+    hyp_id = sleuth_test_id(lead.id)
     criteria = {"ticker": ticker, "window_days": HYPOTHESIS_WINDOW_DAYS,
                 "min_move_pct": HYPOTHESIS_MIN_MOVE_PCT, "expected_direction": direction,
                 "source": "sleuth", "lead_id": lead.id}

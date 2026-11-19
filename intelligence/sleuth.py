@@ -350,9 +350,12 @@ def _parse_investigation_response(response: str) -> dict:
 class Sleuth:
     """Financial detective that follows leads and connects dots."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, *, ensure_schema: bool = True) -> None:
+        """``ensure_schema=False`` is for read paths: a GET must not run DDL,
+        and a missing table should surface as a read failure, not be created."""
         self.engine = engine
-        ensure_tables(engine)
+        if ensure_schema:
+            ensure_tables(engine)
 
     # ── Lead Persistence ─────────────────────────────────────────────────
 
@@ -472,13 +475,14 @@ class Sleuth:
             for r in rows
         ]
 
-    def count_leads(self, status: str | None = None) -> int:
-        """Count leads, optionally filtered by status."""
-        params: dict[str, Any] = {"status": status}
+    def count_leads(self, status: str | None = None, category: str | None = None) -> int:
+        """Count leads under the same filters ``get_leads`` applies."""
+        params: dict[str, Any] = {"status": status, "category": category}
         with self.engine.connect() as conn:
             row = conn.execute(text(
                 "SELECT COUNT(*) FROM investigation_leads "
-                "WHERE (:status IS NULL OR status = :status)"
+                "WHERE (:status IS NULL OR status = :status) "
+                "AND (:category IS NULL OR category = :category)"
             ), params).fetchone()
         return row[0] if row else 0
 
