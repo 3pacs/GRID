@@ -1,0 +1,29 @@
+# TEMPLATE. A copy of this unit runs on grid-svr as a `grid` USER unit since 2026-11-19, on the
+# owner's word, from a checkout pinned to one commit (docs/reference/DESK_SOURCE_RECEIPTS.md).
+# It records what the Research Desk's sources said after each session close. It reads the
+# database and the factory ledger and appends only to its own folder.
+# Install (as grid, no sudo; linger is on):
+#   sed "s#@CODE@#<pinned checkout>#g" deploy/systemd/grid-desk-receipts.service.template \
+#       > ~/.config/systemd/user/grid-desk-receipts.service
+#   cp deploy/systemd/grid-desk-receipts.timer.template ~/.config/systemd/user/grid-desk-receipts.timer
+#   systemctl --user daemon-reload && systemctl --user enable --now grid-desk-receipts.timer
+# Moving to a new commit: make a new pinned checkout, point @CODE@ at it, daemon-reload.
+# The log folder never moves and is never recreated.
+[Unit]
+Description=GRID Research Desk source receipt (latest closed session, read-only on sources, append-only log)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@CODE@
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DESK_RECEIPTS_DIR=/data/grid_ledgers/desk-receipts
+Environment=DESK_FACTORY_LEDGER=/data/grid_ledgers/factory/ledger/grid-module-factory.jsonl
+Environment=DESK_FACTORY_ANCHOR=/data/grid_ledgers/factory/anchor/grid-module-factory.anchors.jsonl
+Environment=DESK_RECEIPTS_PYTHON=/data/grid_v4/grid_venv-314/bin/python
+ExecStart=/usr/bin/flock -n /tmp/grid-desk-receipts.lock /bin/bash @CODE@/scripts/desk_receipts_run.sh
+TimeoutStartSec=10min
+Nice=10
+StandardOutput=journal
+StandardError=journal

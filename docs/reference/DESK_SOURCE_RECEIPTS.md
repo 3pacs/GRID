@@ -1,7 +1,12 @@
 # Desk source receipts
 
 Module: `intelligence/desk_source_receipts.py`. Tests: `tests/test_desk_source_receipts.py`.
-Part of 3pacs/GRID#1164. **Not running anywhere yet**: no unit, no timer, no Hermes step.
+Job: `scripts/desk_receipts_run.sh`, `deploy/systemd/grid-desk-receipts.{service,timer}.template`
+(tests: `tests/test_desk_receipts_run.py`). Part of 3pacs/GRID#1164.
+
+**Running on grid-svr since 2026-11-19**, on the owner's word, before review: a `grid` user
+timer, weekdays 16:20 and 19:20 New York, from a checkout pinned to one commit. Log folder
+`/data/grid_ledgers/desk-receipts`. First recorded session: 2026-11-18.
 
 ## Why it exists
 
@@ -97,12 +102,39 @@ python -m intelligence.desk_source_receipts export-anchors \
 ```
 
 `record` exits 0 when it wrote a receipt or the session already had one, and 2 when it
-refused (session not closed, or superseded). `verify` exits 1 on a broken log. The paths
-above are a proposal; nothing has created them.
+refused (session not closed, or superseded). `verify` exits 1 on a broken log.
+
+## The nightly job
+
+`scripts/desk_receipts_run.sh` runs `record`, then `verify`, then posts to the agent hub:
+
+| Outcome | Hub post | Exit |
+|---|---|---|
+| Receipt written | `desk-receipt-<session>`: cutoff, log head sha256, record count, sources recorded as unknown | 0 |
+| Session already recorded | none | 0 |
+| Refused (not closed, superseded) | none | 2 |
+| Recorder crashed | `desk-receipts-crash-<date>` | 3 |
+| Log failed verification | `desk-receipts-broken-<date>` | 4 |
+
+The post for a written receipt is the log's off-host copy for now. The hub is on another
+host and is mirrored to the vault on GitHub, so each night's full head hash is held, with
+a timestamp, where grid-svr cannot rewrite it. It is weaker than a committed anchor file:
+a person compares it with `verify`; `verify --external-anchors` does not read it.
+
+Owner of failures: Claude (builder). Backup: Anik. A failed night cannot be made up after
+the next close, so a crash or broken-log post needs attention the same evening.
+
+To check it on grid-svr:
+
+```bash
+systemctl --user list-timers grid-desk-receipts.timer
+journalctl --user -u grid-desk-receipts -n 40
+```
 
 ## Not done
 
-- No scheduled run. Starting one is the owner's decision.
-- No job commits and pushes the witness file.
+- No job commits and pushes the witness file. The hub post above stands in for it.
+- The running copy is ahead of review. A format change after review starts a second log;
+  this one is never rewritten.
 - The Desk brief does not read receipts yet. That adapter is in the consumer lane.
 - Live factory slots (#1161) are not a source yet; they do not exist.
