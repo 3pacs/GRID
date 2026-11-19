@@ -2292,7 +2292,10 @@ def summarize_factory(ledger: Ledger) -> dict:
         "candidates_selected": sum(bool(t["selected"]) for t in trials),
         "runs": [
             {"run_id": r["run_id"], "trial_count": r["trial_count"], "tested": r["tested_count"],
-             "selected": r["selected_count"], "critical_t": (r.get("max_t") or {}).get("critical_t")}
+             "selected": r["selected_count"], "critical_t": (r.get("max_t") or {}).get("critical_t"),
+             # fire-overlap clusters (factory 2); None for a run recorded before they existed
+             "clusters": len({t["cluster"] for t in r["trials"] if t.get("cluster")}) or None,
+             "representatives_selected": sum(bool(t.get("representative") and t["selected"]) for t in r["trials"])}
             for r in results
         ],
         "error_control": (
