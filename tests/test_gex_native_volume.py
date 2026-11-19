@@ -686,8 +686,9 @@ def test_the_pre_open_run_makes_one_quote_call_and_writes_only_the_sample(tmp_pa
 
 def test_ready_log_lines_keep_the_form_the_burn_in_jobs_parse(monkeypatch, capsys):
     import re
-    from types import SimpleNamespace
-    import ingestion.schwab_market as sm
+    import sys
+    from types import ModuleType, SimpleNamespace
+
     import scripts.gex_native_volume_snapshot as snap
 
     class Client:
@@ -697,7 +698,9 @@ def test_ready_log_lines_keep_the_form_the_burn_in_jobs_parse(monkeypatch, capsy
         def price_history(self, symbol, **kw):
             return _history()
 
-    monkeypatch.setattr(sm, "SchwabMarketClient", Client)
+    fake = ModuleType("ingestion.schwab_market")     # the real one loads GRID config (needs the service .env)
+    fake.SchwabError, fake.SchwabMarketClient = RuntimeError, Client
+    monkeypatch.setitem(sys.modules, "ingestion.schwab_market", fake)
     monkeypatch.setattr(snap.time, "time", lambda: NOW)
     assert snap.main(["--dry-run"]) == 0
     line = capsys.readouterr().out.strip()
