@@ -52,6 +52,31 @@ last bar starts at or after 15:50. A feature built on a missing price is
 None (it never fires); nothing is filled. The flow dials (F7-F9, tape) and
 the FRED dials (S1-S5, macro) are later factory classes.
 
+Factory 3 (3pacs/GRID#1157) adds two classes, SPY only (the live recorder
+holds SPY alone):
+
+* tape (:data:`TAPE_SPECS`), from 1-minute o/h/l/c/v bars: relative volume over
+  the last 30 minutes and since the open (``VR30``, ``VRDAY``), relative 30-minute
+  range (``RR30``), effort without result (``EWR30`` = VR30 / RR30, edge8's W1 idea
+  as a dial), the gap to the session VWAP (``VWAP``), and edge8's W1L / W1H
+  markers (``catalog_edge8.detect``'s W rule on bars) fired in the last 30
+  minutes. The staged research bars hold no bid/ask and no trade counts, and
+  there are no aggressor tags, so no spread feature and no buy/sell split exist;
+  edge9's flow dials F7-F9 (aggressor flow) are not rebuilt. Baselines are
+  medians over the previous ``tape_history`` sessions.
+* calendar (:data:`CALENDAR_SPECS`): weekday flags, monthly options expiration,
+  and FOMC / CPI / NFP days and the FOMC eve from the pinned event manifest
+  (:class:`analysis.factory_session_calendar.FactoryEvents`): an event counts
+  only when its date was public before the decision (``known_at`` < T). Time of
+  day is the decision time itself, so it is the family dimension, not a feature.
+
+Flags (:data:`FLAGS`: the W1 markers and every calendar feature) take the rule
+``on`` (the module fires when the flag is 1) and no z. ``class_shares`` in a run
+file states each class's share of the run's modules and is checked against the
+modules the run file implies; the report adds a class table and every bucket's
+hit rate against chance. ``skip_windows`` leaves out a decision window, such as
+15:00+60m, which is the same trade as 15:00+close.
+
 Each is turned into a robust z against the same feature at the same decision
 time over the previous ``z_history`` eligible sessions (median / 1.4826 MAD,
 capped at +/-4), so a threshold never uses data after its decision.
@@ -102,7 +127,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from analysis import ledger_steered_exploration as lse
-from analysis.factory_session_calendar import FactoryCalendar
+from analysis.factory_session_calendar import FactoryCalendar, FactoryEvents
 from analysis.factory_stats import (
     COFIRING_MEASURES,
     FACTORY_ORIGIN,
@@ -232,7 +257,102 @@ PRICE_CLASS_SPECS = {
     },
 }
 SPECS = {**{f: {**s, "symbols": ("SPY",)} for f, s in FEATURE_SPECS.items()}, **PRICE_CLASS_SPECS}
-ALL_FEATURES = tuple(SPECS)
+ALL_FEATURES = tuple(SPECS)  # the price/momentum class (factory 1 + 2)
+
+# Factory 3 (3pacs/GRID#1157): the tape and calendar classes. SPY only: the live recorder holds SPY alone.
+_TAPE_DATA = "staged edge9/bars.db, SPY 1-minute bars (Databento XNAS: o/h/l/c and Nasdaq-only volume)"
+_TAPE_V_LIVE = ("research-only: live SPY interval volume is withheld as unreconciled (gex-watch volume_quality: "
+                "VWAP, relative volume and volume spikes withheld); bars_1m_live v is a Schwab cumulative-volume "
+                "difference (consolidated, null on some minutes) while research v is Nasdaq-only, about 5x lower; "
+                "a ratio to each source's own history may agree, unproven (#1160)")
+_TAPE_HL_LIVE = ("gex-signals bars_1m_live, SPY h/l (Schwab); parity unchecked: live h/l come from about 9 sampled "
+                 "quotes a minute, so live ranges can read narrower than the trade tape (#1160)")
+_TAPE_PIT = "bars stamped at or before T-1; the baseline from earlier sessions only (tape_history)"
+TAPE_SPECS = {
+    "VR30": {
+        "definition": "SPY volume over the 30 bars stamped T-30..T-1 / median of the same over the previous "
+                      "tape_history sessions",
+        "unit": "ratio to the session-time baseline (scale-free)",
+        "live_source": _TAPE_V_LIVE,
+    },
+    "VRDAY": {
+        "definition": "SPY volume from 09:30 through the bar stamped T-1 / median of the same over the previous "
+                      "tape_history sessions",
+        "unit": "ratio to the session-time baseline (scale-free)",
+        "live_source": _TAPE_V_LIVE,
+    },
+    "RR30": {
+        "definition": "SPY high - low over the 30 bars stamped T-30..T-1 / median of the same over the previous "
+                      "tape_history sessions",
+        "unit": "ratio to the session-time baseline (scale-free)",
+        "live_source": _TAPE_HL_LIVE,
+    },
+    "EWR30": {
+        "definition": "effort without result (edge8 W1, continuous): VR30 / RR30",
+        "unit": "ratio (scale-free)",
+        "live_source": _TAPE_V_LIVE,
+    },
+    "VWAP": {
+        "definition": "SPY close at the bar stamped T-1 / session VWAP so far - 1; VWAP = sum((h+l+c)/3 x v) / "
+                      "sum(v) over bars 09:30..T-1",
+        "unit": "return (scale-free)",
+        "live_source": _TAPE_V_LIVE,
+    },
+    "W1L": {
+        "definition": "1 when edge8's W1L marker fired on a bar stamped T-30..T-1, else 0: the bar's volume >= 3x "
+                      "the median volume of that minute over the previous tape_history sessions, its range <= the "
+                      "median bar range of the session so far, and its close at the 30-bar closing low (edge8 "
+                      "catalog_edge8.detect, 09:45 onward)",
+        "unit": "flag (fires on 1)",
+        "live_source": _TAPE_V_LIVE,
+        "kind": "flag",
+    },
+    "W1H": {
+        "definition": "as W1L, with the close at the 30-bar closing high (edge8 W1H)",
+        "unit": "flag (fires on 1)",
+        "live_source": _TAPE_V_LIVE,
+        "kind": "flag",
+    },
+}
+for _spec in TAPE_SPECS.values():
+    _spec.update(source=_TAPE_DATA, pit=_TAPE_PIT, symbols=("SPY",))
+    _spec.setdefault("kind", "level")
+_CAL_LIVE = ("date and pinned manifests only, computable live once the XNYS and event manifests are extended "
+             "past 2026-11-10 with known_at (not done)")
+_EVENT_DEF = "1 on a session holding a scheduled {} whose date was public before T (known_at < T), else 0"
+CALENDAR_SPECS = {
+    **{
+        day: {"definition": f"1 on {name}s, else 0", "source": "the session date"}
+        for day, name in (("MON", "Monday"), ("TUE", "Tuesday"), ("WED", "Wednesday"), ("THU", "Thursday"),
+                          ("FRI", "Friday"))
+    },
+    "OPEX": {"definition": "1 on the monthly listed-options expiration session (the third Friday; the session "
+                           "before it when that Friday is an exchange holiday), else 0",
+             "source": "pinned XNYS sessions (analysis/factory_session_calendar.py)"},
+    "FOMC": {"definition": _EVENT_DEF.format("FOMC statement (14:00 ET)"),
+             "source": "pinned event manifest (factory-events/1)"},
+    "FOMC_EVE": {"definition": "1 on the session before a scheduled FOMC statement whose date was public before T, "
+                               "else 0", "source": "pinned event manifest and XNYS sessions"},
+    "CPI": {"definition": _EVENT_DEF.format("CPI release (08:30 ET)"),
+            "source": "pinned event manifest (factory-events/1)"},
+    "NFP": {"definition": _EVENT_DEF.format("Employment Situation release (08:30 ET)"),
+            "source": "pinned event manifest (factory-events/1)"},
+}
+for _spec in CALENDAR_SPECS.values():
+    _spec.update(unit="flag (fires on 1)", live_source=_CAL_LIVE, kind="flag", symbols=(),
+                 pit="the date, exchange sessions from the pinned calendar, and events only with known_at < T")
+WEEKDAYS = ("MON", "TUE", "WED", "THU", "FRI")
+FEATURE_CLASS = {**dict.fromkeys(SPECS, "price"), **dict.fromkeys(TAPE_SPECS, "tape"),
+                 **dict.fromkeys(CALENDAR_SPECS, "calendar")}
+REGISTRY = {**{f: {**s, "class": "price", "kind": "level"} for f, s in SPECS.items()},
+            **{f: {**s, "class": "tape"} for f, s in TAPE_SPECS.items()},
+            **{f: {**s, "class": "calendar"} for f, s in CALENDAR_SPECS.items()}}
+KNOWN_FEATURES = tuple(REGISTRY)
+FLAGS = frozenset(f for f, s in REGISTRY.items() if s["kind"] == "flag")
+CLASSES = ("price", "tape", "calendar")
+W1_VOLUME_MULTIPLE, W1_BARS, W1_FROM = 3.0, 30, "09:45"  # edge8 catalog_edge8.detect: W1 rule, 30-bar extremes
+TAPE_QUANTITIES = ("vol30", "cumvol", "range30")
+EVENT_FEATURES = frozenset(("FOMC", "FOMC_EVE", "CPI", "NFP"))
 LAST_BAR_FROM = "15:50"  # a prior close needs a last bar at or after this (edge9 amendment 2)
 TARGET_UNITS = ("vol", "bps", "dollars")
 SIDES = {"long": 1.0, "short": -1.0}
@@ -268,6 +388,9 @@ class RunFile:
     beta_history: int = 60  # sessions in the F2 / F4 daily betas
     cluster_by: str = "jaccard"  # co-firing similarity: "jaccard" or "phi"
     cluster_threshold: float = 0.5  # signals linked at or above this share a cluster
+    tape_history: int = 20  # sessions in the tape baselines (edge8 RV_LOOKBACK)
+    skip_windows: tuple[str, ...] = ()  # "<time>+<horizon>" windows left out (e.g. 15:00+60m, the same trade as close)
+    class_shares: dict | None = None  # {class: share of the run's modules}; checked against the modules implied
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -275,7 +398,7 @@ class RunFile:
         unknown = set(value) - known
         if unknown:
             raise RunFileError(f"unknown run file keys: {sorted(unknown)}")
-        tuples = ("decision_times", "horizons", "features", "z_thresholds", "sides")
+        tuples = ("decision_times", "horizons", "features", "z_thresholds", "sides", "skip_windows")
         run = cls(**{k: tuple(v) if k in tuples else v for k, v in value.items()})
         run.validate()
         return run
@@ -300,8 +423,8 @@ class RunFile:
         for h in self.horizons:
             if h != "close" and not (h.endswith("m") and h[:-1].isdigit() and 2 <= int(h[:-1]) <= 390):
                 raise RunFileError(f"horizon {h!r} is '<minutes>m' (at least 2m) or 'close'")
-        if set(self.features) - set(ALL_FEATURES):
-            raise RunFileError(f"unknown features {sorted(set(self.features) - set(ALL_FEATURES))}")
+        if set(self.features) - set(KNOWN_FEATURES):
+            raise RunFileError(f"unknown features {sorted(set(self.features) - set(KNOWN_FEATURES))}")
         if set(self.sides) - set(SIDES) or not self.sides:
             raise RunFileError("sides are 'long' and/or 'short'")
         if not self.z_thresholds or any(not (0 < k <= Z_CAP) for k in self.z_thresholds):
@@ -325,26 +448,61 @@ class RunFile:
             for h in self.horizons:
                 if h != "close" and _minutes(t) + int(h[:-1]) > 16 * 60:
                     raise RunFileError(f"{t} + {h} runs past the close")
+        windows = {f"{t}+{h}" for t in self.decision_times for h in self.horizons}
+        if set(self.skip_windows) - windows or len(set(self.skip_windows)) != len(self.skip_windows):
+            raise RunFileError(f"skip_windows must be unique windows of this run: {sorted(windows)}")
+        if not self.families():
+            raise RunFileError("skip_windows leaves no window")
+        if self.tape_history < 10:
+            raise RunFileError("tape_history >= 10")
+        if self.class_shares is not None:
+            self._check_class_shares()
+
+    def class_counts(self) -> dict[str, int]:
+        """Modules per feature class (every family holds the same modules)."""
+        out: dict[str, int] = {}
+        for name in self.modules():
+            cls = FEATURE_CLASS[name.split("|")[0]]
+            out[cls] = out.get(cls, 0) + len(self.families())
+        return out
+
+    def _check_class_shares(self) -> None:
+        shares = self.class_shares
+        counts = self.class_counts()
+        total = sum(counts.values())
+        if not isinstance(shares, dict) or set(shares) != set(counts):
+            raise RunFileError(f"class_shares names exactly the run's classes: {sorted(counts)}")
+        if any(not isinstance(v, (int, float)) or not 0 < v <= 1 for v in shares.values()) or \
+                abs(sum(shares.values()) - 1) > 1e-6:
+            raise RunFileError("class_shares are in (0, 1] and sum to 1")
+        actual = {c: n / total for c, n in counts.items()}
+        off = {c: round(actual[c], 4) for c in counts if abs(shares[c] - actual[c]) > 0.005}
+        if off:
+            raise RunFileError(f"class_shares do not match the modules the run file implies: actual {off}")
 
     def families(self) -> tuple[str, ...]:
-        return tuple(f"SPY|change|{t}+{h}" for t in self.decision_times for h in self.horizons)
+        skip = set(self.skip_windows)
+        return tuple(f"SPY|change|{t}+{h}" for t in self.decision_times for h in self.horizons
+                     if f"{t}+{h}" not in skip)
 
     def modules(self) -> tuple[str, ...]:
-        """Signal names, the same in every family: feature | z rule | side."""
-        return tuple(
-            f"{f}|z{op}{k:g}|{side}"
-            for f in self.features
-            for k in self.z_thresholds
-            for op in (">=", "<=")
-            for side in self.sides
-        )
+        """Signal names, the same in every family: feature | z rule | side; a flag feature's rule is ``on``
+        (it fires when the flag is 1)."""
+        out = []
+        for f in self.features:
+            if f in FLAGS:
+                out += [f"{f}|on|{side}" for side in self.sides]
+            else:
+                out += [f"{f}|z{op}{k:g}|{side}" for k in self.z_thresholds for op in (">=", "<=")
+                        for side in self.sides]
+        return tuple(out)
 
     def trial_count(self) -> int:
         return len(self.families()) * len(self.modules())
 
     def symbols(self) -> tuple[str, ...]:
         """The symbols whose bars the run's features read, SPY first."""
-        need = {s for f in self.features for s in SPECS[f]["symbols"]}
+        need = {s for f in self.features for s in REGISTRY[f]["symbols"]}
         return tuple(s for s in SYMBOLS if s == "SPY" or s in need)
 
 
@@ -502,6 +660,108 @@ def month_end(day: str, sessions: list[str], closes: dict) -> float | None:
     return spy - tlt
 
 
+def tape_window(day: Session, bar: str) -> dict:
+    """The tape quantities at the bar stamped ``bar``, from bars stamped 09:30..``bar`` only. Pure.
+
+    ``vol30`` / ``range30``: volume and high - low of the 30 bars stamped ``bar``-29..``bar`` (None unless
+    all 30 are there); ``cumvol``: volume since 09:30; ``vwap_gap``: close / session VWAP - 1 (typical
+    price (h+l+c)/3). A bar without a volume makes every volume quantity None: missing is never zero.
+    """
+    hms = day.hms[:day._at(bar) + 1]
+    start = _hm(_minutes(bar) - (W1_BARS - 1))
+    last = [h for h in hms if h >= start]
+    out = dict.fromkeys(("vol30", "cumvol", "range30", "vwap_gap"))
+    if not hms or hms[-1] != bar:
+        return out
+    if len(last) == W1_BARS:
+        out["range30"] = max(day.bars[h][1] for h in last) - min(day.bars[h][2] for h in last)
+    vols = [day.bars[h][4] for h in hms]
+    if any(v is None or v < 0 for v in vols):
+        return out
+    if len(last) == W1_BARS:
+        out["vol30"] = float(sum(vols[-W1_BARS:]))
+    out["cumvol"] = float(sum(vols))
+    if out["cumvol"] > 0:
+        vwap = sum((day.bars[h][1] + day.bars[h][2] + day.bars[h][3]) / 3 * day.bars[h][4] for h in hms) / out["cumvol"]
+        out["vwap_gap"] = day.bars[bar][3] / vwap - 1
+    return out
+
+
+def w1_events(day: Session, minute_base: dict | None, until: str) -> list[tuple[str, str]]:
+    """edge8 W1 markers ``[(hm, "W1L"|"W1H")]`` on bars stamped up to ``until`` (catalog_edge8.detect's W rule,
+    bars only: no flow, IV or gamma). ``minute_base``: {hm: median volume of that minute over earlier sessions}.
+    A marker at a bar reads only that bar and earlier ones. Pure."""
+    if not minute_base:
+        return []
+    hms = day.hms[:day._at(until) + 1]
+    ranges, out = [], []
+    for i, hm in enumerate(hms):
+        _o, h, low, c, v = day.bars[hm]
+        ranges.append(h - low)
+        if i < W1_BARS - 1 or hm < W1_FROM:
+            continue
+        base = minute_base.get(hm)
+        if not base or v is None or v / base < W1_VOLUME_MULTIPLE or (h - low) > statistics.median(ranges):
+            continue
+        closes = [day.bars[x][3] for x in hms[i - (W1_BARS - 1):i + 1]]
+        if c <= min(closes):
+            out.append((hm, "W1L"))
+        if c >= max(closes):
+            out.append((hm, "W1H"))
+    return out
+
+
+def tape_features(window: dict, base: dict, markers: list | None, bar: str) -> dict:
+    """VR30, VRDAY, RR30, EWR30, VWAP, W1L, W1H at the bar stamped ``bar``. ``window``: :func:`tape_window`;
+    ``base``: {"vol30", "cumvol", "range30"} medians of earlier sessions (None until there are enough);
+    ``markers``: :func:`w1_events` of the session (None without a volume base). Pure."""
+    def ratio(key):
+        x, b = window[key], base.get(key)
+        return x / b if x is not None and b else None
+
+    out = {"VR30": ratio("vol30"), "VRDAY": ratio("cumvol"), "RR30": ratio("range30"), "VWAP": window["vwap_gap"]}
+    out["EWR30"] = out["VR30"] / out["RR30"] if out["VR30"] is not None and out["RR30"] else None
+    start = _hm(_minutes(bar) - (W1_BARS - 1))
+    for name in ("W1L", "W1H"):
+        out[name] = None if markers is None else float(any(m == name and start <= hm <= bar for hm, m in markers))
+    return out
+
+
+def opex_days(sessions: list[str]) -> dict[str, str | None]:
+    """{month: its listed-options expiration session} over the months ``sessions`` covers in full: the third
+    Friday, or the last session before it when that Friday is not a session. None for a month whose third
+    Friday lies outside the covered dates. Pure."""
+    have = set(sessions)
+    out = {}
+    first, last = sessions[0], sessions[-1]
+    for month in sorted({d[:7] for d in sessions}):
+        y, m = int(month[:4]), int(month[5:])
+        fridays = [d for d in (date(y, m, k) for k in range(1, 22)) if d.weekday() == 4]
+        third = fridays[2].isoformat()
+        if not first <= third <= last:
+            out[month] = None
+            continue
+        before = [d for d in sessions if d[:7] == month and d <= third]
+        out[month] = third if third in have else (before[-1] if before else None)
+    return out
+
+
+def calendar_features(day: str, decided: datetime, nxt: str | None, opex: dict, events) -> dict:
+    """The calendar class for a decision at ``decided`` on session ``day``. ``nxt``: the next session (None
+    beyond the calendar); ``opex``: :func:`opex_days`; ``events``: :class:`FactoryEvents` or None. An event
+    counts only with known_at < ``decided``; outside the event manifest's coverage it is None, never 0. Pure."""
+    wd = date.fromisoformat(day).weekday()
+    out = {name: float(wd == i) for i, name in enumerate(WEEKDAYS)}
+    month = opex.get(day[:7])
+    out["OPEX"] = None if month is None else float(month == day)
+    known = events.known(day, decided) if events is not None else None
+    for name in ("FOMC", "CPI", "NFP"):
+        out[name] = None if known is None else float(name.lower() in known)
+    ahead = events.known(nxt, decided) if events is not None and nxt is not None else None
+    out["FOMC_EVE"] = None if ahead is None else float("fomc" in ahead)
+    return out
+
+
 def load_bars(db_path: Path, run: RunFile, symbols: tuple[str, ...] | None = None) -> dict[str, dict[str, Session]]:
     """{symbol: {day: Session}} for the run's window, read-only; refuses a symbol holding any day before dev."""
     symbols = symbols or run.symbols()
@@ -552,7 +812,8 @@ def features_at(session: Session, prior: Session, px: dict, prior_close: dict, b
 
 
 def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCalendar | None = None,
-               cross: dict[str, dict[str, Session]] | None = None) -> tuple[dict[str, list[dict]], dict]:
+               cross: dict[str, dict[str, Session]] | None = None,
+               events: FactoryEvents | None = None) -> tuple[dict[str, list[dict]], dict]:
     """Point-in-time rows per family, and a coverage summary.
 
     The z history of a (feature, decision time) holds only earlier eligible
@@ -560,6 +821,10 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     ``cross``: {symbol: {day: Session}} for the run's non-SPY symbols (from
     :func:`load_bars`). The daily betas use only sessions before the current
     one, and every symbol's price comes from a bar stamped at or before T-1.
+    The tape baselines (``tape_history``) hold earlier sessions only, as the z
+    history does; ``events`` (:class:`FactoryEvents`) answers which scheduled
+    events were known before each decision. Flags (:data:`FLAGS`) fire on 1
+    and take no z.
     """
     days = sorted(sessions)
     cross = cross or {}
@@ -577,7 +842,24 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     eligible = set()
     history = {(f, t): deque(maxlen=run.z_history) for f in run.features for t in run.decision_times}
     moves = {fam: deque(maxlen=run.vol_history) for fam in run.families()}  # |dollar change|, earlier sessions
+    price_wanted = tuple(f for f in run.features if FEATURE_CLASS[f] == "price")
+    need_tape = any(FEATURE_CLASS[f] == "tape" for f in run.features)
+    need_w1 = any(f in ("W1L", "W1H") for f in run.features)
+    need_cal = any(FEATURE_CLASS[f] == "calendar" for f in run.features)
+    if events is None and set(run.features) & EVENT_FEATURES:
+        raise RunFileError("the run's event features need the pinned event manifest")
+    tape_base = {(q, t): deque(maxlen=run.tape_history) for q in TAPE_QUANTITIES for t in run.decision_times}
+    minute_hist = deque(maxlen=run.tape_history)  # {hm: volume} of earlier sessions (edge8 vol_hist)
+    pending_minutes = None
+    last_bar = _hm(max(_minutes(t) for t in run.decision_times) - 1)
+    opex = opex_days(session_list) if need_cal else {}
+    following = dict(zip(session_list, list(session_list[1:]) + [None]))
+    skip = set(run.skip_windows)
     modules = run.modules()
+    parsed = []
+    for name in modules:
+        feature, rule, side = name.split("|")
+        parsed.append((name, feature, rule, side, None if rule == "on" else float(rule[3:]), rule[1:3] == ">="))
     families = {f: [] for f in run.families()}
     skipped_no_label = skipped_no_scale = 0
     diag = {(f, t): {"rows": 0, "z": 0, "raw_by_year": {}, "z_by_year": {}} for f in run.features for t in run.decision_times}
@@ -588,12 +870,17 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
         if pending_pair is not None:  # the previous session's daily returns join the betas only now
             pairs.append(pending_pair)
             pending_pair = None
+        if pending_minutes is not None:  # likewise the previous session's minute volumes join the tape base
+            minute_hist.append(pending_minutes)
+            pending_minutes = None
         schedule = None
         if calendar is not None:
             schedule = calendar.for_day(day)
             if schedule is None:
                 continue
             prior_day = calendar.previous_day(day)
+        if need_w1:
+            pending_minutes = {hm: b[4] for hm, b in session.bars.items()}
         if need_betas and prior_day is not None:
             today = [settled[s].get(day) for s in ("SPY", "VIXY", "HYG")]
             before = [settled[s].get(prior_day) for s in ("SPY", "VIXY", "HYG")]
@@ -623,6 +910,14 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
             spy = [q[0] for q in pairs]
             betas = {"VIXY": ols_slope(spy, [q[1] for q in pairs]), "HYG": ols_slope(spy, [q[2] for q in pairs])}
         s6 = month_end(day, session_list, settled) if need_s6 else None
+        markers = None
+        if need_w1 and len(minute_hist) == minute_hist.maxlen:
+            minute_base = {}
+            for hm in session.hms:
+                seen = [h[hm] for h in minute_hist if h.get(hm) is not None]
+                if hm <= last_bar and len(seen) >= minute_hist.maxlen // 2:  # edge8: >= 10 of 20
+                    minute_base[hm] = statistics.median(seen)
+            markers = w1_events(session, minute_base, last_bar)
         for t in run.decision_times:
             if schedule is not None and _minutes(t) >= _minutes(schedule.closes.astimezone(NY).strftime('%H:%M')):
                 continue
@@ -634,28 +929,45 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
                 skipped_no_label += len(run.horizons)
                 continue
             eligible.add(day)
-            raw = features_at(session, prior, px, prior_close, betas, s6, bar, run.features, run.stale_minutes)
-            z = {f: robust_z(raw[f], history[(f, t)]) for f in run.features}
+            decided = datetime.fromisoformat(f"{day}T{t}").replace(tzinfo=NY)
+            raw = features_at(session, prior, px, prior_close, betas, s6, bar, price_wanted, run.stale_minutes)
+            if need_tape:
+                window = tape_window(session, bar)
+                base = {}
+                for q in TAPE_QUANTITIES:
+                    past_q = tape_base[(q, t)]
+                    base[q] = statistics.median(past_q) if len(past_q) == past_q.maxlen else None
+                    if window[q] is not None:
+                        past_q.append(window[q])  # after use: a session never sets its own baseline
+                raw.update(tape_features(window, base, markers, bar))
+            if need_cal:
+                raw.update(calendar_features(day, decided, following.get(day), opex, events))
+            raw = {f: raw.get(f) for f in run.features}
+            z = {f: None if f in FLAGS else robust_z(raw[f], history[(f, t)]) for f in run.features}
             for f in run.features:
                 d = diag[(f, t)]
                 d["rows"] += 1
                 if raw[f] is not None:
-                    history[(f, t)].append(raw[f])
+                    if f not in FLAGS:
+                        history[(f, t)].append(raw[f])
                     d["raw_by_year"].setdefault(day[:4], []).append(raw[f])
-                if z[f] is not None:
+                if z[f] is not None or (f in FLAGS and raw[f] is not None):
                     d["z"] += 1
+                if z[f] is not None:
                     d["z_by_year"].setdefault(day[:4], []).append(z[f])
             entry_bar = _hm(_minutes(t) + 1)
             entry = session.bars[entry_bar][0] if entry_bar in session.bars else None
-            decided = datetime.fromisoformat(f"{day}T{t}").replace(tzinfo=NY)
             signals = {}
-            for name in modules:
-                feature, rule, side = name.split("|")
-                k = float(rule[3:])
-                zf = z[feature]
-                fires = zf is not None and (zf >= k if rule[1:3] == ">=" else zf <= -k)
+            for name, feature, rule, side, k, ge in parsed:
+                if k is None:
+                    fires = raw[feature] == 1.0
+                else:
+                    zf = z[feature]
+                    fires = zf is not None and (zf >= k if ge else zf <= -k)
                 signals[name] = {"value": SIDES[side] if fires else None, "known_at": decided.isoformat()}
             for h in run.horizons:
+                if f"{t}+{h}" in skip:
+                    continue
                 if h == "close":
                     exit_bar, ends = "15:59", decided.replace(hour=16, minute=0)
                 else:
@@ -703,6 +1015,9 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
             for sym, by_day in bars_of.items()
         },
         "stale_minutes": run.stale_minutes,
+        "tape_history": run.tape_history,
+        "skip_windows": list(run.skip_windows),
+        "event_calendar": events.version if events is not None else None,
         "sessions_eligible": len(eligible),
         "sessions_below_full_bars_diagnostic": len(days) - len(full_coverage),
         "full_bars_role": "retrospective coverage only; never eligibility",
@@ -799,6 +1114,67 @@ def signal_name(family: str, feature: str) -> str:
 
 
 RANKED = ("trial_id", "family", "feature", "n", "r", "net_dollars", "t", "p", "adjusted_p", "selected")
+MARGINAL = 0.05  # the bucket hit rate: share of tested modules with marginal p <= this (chance: about this)
+
+
+def buckets(run: RunFile, trials: list[dict]) -> dict:
+    """Every bucket of the run's tested modules: count, marginal p <= 0.05 against chance, best t and adjusted p.
+
+    Buckets: class, decision time (the time-of-day dimension), horizon, feature, z rule and side. Reported for
+    every bucket, never only the good ones; trials are correlated, so chance is a rough guide, not a test."""
+    keys = {
+        "class": lambda t: FEATURE_CLASS[t["feature"].split("|")[0]],
+        "decision_time": lambda t: t["family"].split("|")[2].split("+")[0],
+        "horizon": lambda t: t["family"].split("+")[1],
+        "feature": lambda t: t["feature"].split("|")[0],
+        "rule": lambda t: t["feature"].split("|")[1],
+        "side": lambda t: t["feature"].split("|")[2],
+    }
+    out = {}
+    for by, key in keys.items():
+        groups: dict[str, list] = {}
+        for t in trials:
+            groups.setdefault(key(t), []).append(t)
+        rows = {}
+        for name, members in groups.items():
+            tested = [t for t in members if t["status"] == "tested"]
+            hits = sum(t["p"] <= MARGINAL for t in tested)
+            rows[name] = {
+                "declared": len(members),
+                "tested": len(tested),
+                "p_le_05": hits,
+                "chance": round(MARGINAL * len(tested), 1),
+                "hit_rate": round(hits / len(tested), 4) if tested else None,
+                "positive_t": sum(t["t"] > 0 for t in tested),
+                "best_t": round(max(t["t"] for t in tested), 3) if tested else None,
+                "best_adjusted_p": round(min(t["adjusted_p"] for t in tested), 4) if tested else None,
+                "selected": sum(bool(t["selected"]) for t in tested),
+            }
+        out[by] = dict(sorted(rows.items()))
+    return out
+
+
+def class_table(run: RunFile, trials: list[dict]) -> dict:
+    """Per feature class: features, modules, the run file's declared share and the actual share of modules."""
+    counts = run.class_counts()
+    total = sum(counts.values())
+    declared = run.class_shares or {}
+    out = {}
+    for cls in CLASSES:
+        if cls not in counts:
+            continue
+        members = [t for t in trials if FEATURE_CLASS[t["feature"].split("|")[0]] == cls]
+        tested = [t for t in members if t["status"] == "tested"]
+        out[cls] = {
+            "features": [f for f in run.features if FEATURE_CLASS[f] == cls],
+            "modules": counts[cls],
+            "share": round(counts[cls] / total, 4),
+            "share_declared": declared.get(cls),
+            "tested": len(tested),
+            "share_of_tested": round(len(tested) / max(1, sum(t["status"] == "tested" for t in trials)), 4),
+            "selected": sum(bool(t["selected"]) for t in tested),
+        }
+    return out
 
 
 def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int = 25, cofire=None) -> dict:
@@ -813,13 +1189,15 @@ def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int 
         families, trials, signal_name, by=run.cluster_by, threshold=run.cluster_threshold)
     for t in trials:
         t["cluster"], t["representative"] = membership[t["trial_id"]]
+        t["class"] = FEATURE_CLASS[t["feature"].split("|")[0]]
     by_id = {t["trial_id"]: t for t in trials}
 
     def rep_row(trial_id):
         if trial_id is None:
             return None
         t = by_id[trial_id]
-        return {**{k: t[k] for k in RANKED}, "live_source": SPECS[t["feature"].split("|")[0]]["live_source"]}
+        return {**{k: t[k] for k in RANKED}, "class": t["class"],
+                "live_source": REGISTRY[t["feature"].split("|")[0]]["live_source"]}
 
     cluster_rows = [{**c, "representative": rep_row(c["representative"])} for c in clusters]
     tested = sorted((t for t in trials if t["status"] == "tested"), key=lambda t: -t["t"])
@@ -830,7 +1208,8 @@ def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int 
         "frozen_sha256": frozen["sha256"],
         "method": payload["method"],
         "target_unit": run.target_unit,
-        "feature_specs": {f: SPECS[f] for f in run.features},
+        "feature_specs": {f: REGISTRY[f] for f in run.features},
+        "classes": class_table(run, trials),
         "coverage": coverage,
         "trial_count": payload["trial_count"],
         "tested": len(tested),
@@ -838,9 +1217,11 @@ def report(run: RunFile, frozen: dict, coverage: dict, families: dict, top: int 
         "max_t": payload["max_t"],
         "selected": [t["trial_id"] for t in tested if t["selected"]],
         "ranking": [
-            {**{k: t[k] for k in RANKED}, "cluster": t["cluster"], "representative": t["representative"]}
+            {**{k: t[k] for k in RANKED}, "class": t["class"], "cluster": t["cluster"],
+             "representative": t["representative"]}
             for t in tested[:top]
         ],
+        "buckets": buckets(run, trials),
         "cofiring": {
             "file": "cofiring.json",
             "sha256": digest(matrix),
@@ -898,10 +1279,10 @@ def report_markdown(rep: dict) -> str:
     cf = rep["cofiring"]
     lines += [
         "",
-        f"Clusters by fire overlap ({cf['by']} >= {cf['threshold']:g}, {cf['linkage'].split(':')[0]}; returns never "
-        f"enter): {cf['clusters']} clusters over {cf['signals']} decision signals and {cf['sessions']} sessions; "
-        f"{cf['clusters_with_tested_trials']} hold a tested trial; {cf['representatives_selected']} representatives "
-        f"cleared the bar. Matrix: `{cf['file']}` (sha256 {cf['sha256'][:12]}).",
+        (f"Clusters by fire overlap ({cf['by']} >= {cf['threshold']:g}, {cf['linkage'].split(':')[0]}; returns never "
+         f"enter): {cf['clusters']} clusters over {cf['signals']} decision signals and {cf['sessions']} sessions; "
+         f"{cf['clusters_with_tested_trials']} hold a tested trial; {cf['representatives_selected']} representatives "
+         f"cleared the bar. Matrix: `{cf['file']}` (sha256 {cf['sha256'][:12]})."),
         "",
         "| cluster | signals | weakest pair | representative | fires | t | adjusted p | selected | live source |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -915,6 +1296,18 @@ def report_markdown(rep: dict) -> str:
             f"| {c['cluster']} | {shown} | {c['min_pair_similarity']} | {r['family']} {r['feature']} | {r['n']} | "
             f"{r['t']:.2f} | {r['adjusted_p']:.4f} | {'yes' if r['selected'] else ''} | {r['live_source'].split(':')[0]} |"
         )
+    lines += ["", "| class | features | modules | share | declared share | tested | selected |",
+              "|---|---|---|---|---|---|---|"]
+    for cls, c in rep["classes"].items():
+        lines.append(f"| {cls} | {len(c['features'])} | {c['modules']} | {c['share']:.3f} | "
+                     f"{'' if c['share_declared'] is None else c['share_declared']} | {c['tested']} | {c['selected']} |")
+    lines += ["", f"Buckets: tested modules with marginal p <= {MARGINAL} against chance (trials are correlated).", ""]
+    for by, rows in rep["buckets"].items():
+        lines += [f"| {by} | tested | p <= {MARGINAL} | chance | best t | best adjusted p |", "|---|---|---|---|---|---|"]
+        for name, b in rows.items():
+            lines.append(f"| {name} | {b['tested']} | {b['p_le_05']} | {b['chance']} | {b['best_t']} | "
+                         f"{b['best_adjusted_p']} |")
+        lines.append("")
     lines += ["", "| feature @ time | coverage | z drift (max - min yearly median z) |", "|---|---|---|"]
     for name, f in rep["coverage"]["features"].items():
         lines.append(f"| {name} | {f['coverage_z']} | {f['z_drift']} |")
@@ -937,6 +1330,7 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
     spec = RunFile.from_dict(body)
     calendar = FactoryCalendar()
     calendar.validate_window(spec.first_session, spec.last_session)
+    events = FactoryEvents() if set(spec.features) & EVENT_FEATURES else None  # pinned; checked before declaring
     manifest, manifest_sha = check_data(Path(data_dir))
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
@@ -948,7 +1342,7 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
         verify_data(Path(data_dir), manifest)
         bars = load_bars(Path(data_dir) / DATA_FILE, spec)
         sessions = bars.pop(spec.symbol)
-        families, coverage = build_rows(sessions, spec, calendar=calendar, cross=bars)
+        families, coverage = build_rows(sessions, spec, calendar=calendar, cross=bars, events=events)
         frozen = discover(protocol_for(spec), families)
         write_once(out / "discovery-frozen.json", frozen)
         cofire = cofiring(families, frozen["payload"]["ledger"], signal_name,
@@ -963,7 +1357,7 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
         raise
     trials = [
         {k: t.get(k) for k in ("trial_id", "family", "feature", "status", "n", "r", "net_dollars", "t", "p",
-                               "adjusted_p", "selected", "cluster", "representative")}
+                               "adjusted_p", "selected", "cluster", "representative", "class")}
         for t in frozen["payload"]["ledger"]
     ]
     lse.record_factory_result(
