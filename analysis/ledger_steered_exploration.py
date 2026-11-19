@@ -187,6 +187,17 @@ rank candidates for forward live recording; they draw nothing from the
 alpha-spending schedule and claim no discovery, but their trials count in
 :func:`declared_trial_count`, so the honest total of shots taken is always
 on the ledger.
+
+Live verdicts (3pacs/GRID#1162). A factory candidate is tested only forward,
+in a gex-signals ``panel-factory`` slot, by one look. That look's final
+verdict comes back as a ``factory_forward_outcome`` record
+(:func:`ingest_factory_verdicts`): ``pass``, ``fail`` or ``underpowered``
+(the deadline passed before 100 resolved fires: counted, not passed). The
+record must name a trial of a result record already on this ledger, by run
+id, trial id and the result line's sha256, and a trial takes one verdict
+only. It closes no run and opens none, so it may arrive while another run is
+open. It is not an S11 ``forward_outcome``: factory trials have no holdout
+survivor, allocation window or S11 identity, and none is invented for them.
 """
 
 from __future__ import annotations
@@ -237,7 +248,15 @@ FACTORY_PROGRAM = "module_factory"
 FACTORY_DECLARED = "factory_run_declared"
 FACTORY_RESULT = "factory_run_result"
 FACTORY_ABANDONED = "factory_run_abandoned"
-FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED)
+FACTORY_FORWARD = "factory_forward_outcome"
+FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED, FACTORY_FORWARD)
+FACTORY_VERDICT_SCHEMA = "panel-factory-verdict/1"   # the export line gex-signals writes; the only contract between the two
+FACTORY_VERDICT_FIELDS = (
+    "schema", "slot_trial_id", "family", "registered_at", "row_hash", "source", "rule", "verdict", "n", "mean_net",
+    "lower_bound", "alpha_per_test", "resolved_fires", "sessions", "looked_at", "through_day", "chain", "exported_at",
+)
+FACTORY_VERDICTS = {"PASS": "pass", "FAIL": "fail", "UNDERPOWERED": "underpowered"}
+FACTORY_MIN_N = 100   # resolved fires a slot's one look needs (panel-factory registration)
 FACTORY_SPENDING = "none: ranking runs claim no discovery; the evidence is forward live recording"
 REPO = Path(__file__).resolve().parent.parent
 MAX_Q = 0.10
@@ -915,7 +934,9 @@ class Ledger:
             raise ValueError(
                 f"a {'factory' if self.is_factory else 'S11'} ledger refuses {kind!r} records"
             )
-        if kind in FACTORY_KINDS:
+        if kind == FACTORY_FORWARD:
+            validate_factory_forward(record, factory_result_index(self), factory_forward_seen(self))
+        elif kind in FACTORY_KINDS:
             validate_factory_record(record, factory_open_run(self))
         if kind == HYPOTHESIS_BATCH_KIND:
             validate_hypothesis_batch(record, self.q, hypothesis_batch_trials(self))
@@ -1041,6 +1062,8 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     hypotheses_seen: set[str] = set()
     factory = False
     open_factory: tuple[dict, str] | None = None
+    factory_results: dict[str, dict] = {}
+    factory_forward: set[tuple[str, str]] = set()
 
     for seq, line in enumerate(lines):
         record = json.loads(line)
@@ -1056,9 +1079,14 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
         kind = record.get("kind")
         if seq and factory != (kind in FACTORY_KINDS):
             raise ValueError(f"record {seq}: {kind!r} does not belong on this ledger's program")
-        if kind in FACTORY_KINDS:
+        if kind == FACTORY_FORWARD:   # closes no run and opens none: the open run, if any, stays open
+            validate_factory_forward(record, factory_results, factory_forward)
+            factory_forward.add((record["run_id"], record["trial_id"]))
+        elif kind in FACTORY_KINDS:
             validate_factory_record(record, open_factory)
             open_factory = (record, sha256_bytes(line)) if kind == FACTORY_DECLARED else None
+            if kind == FACTORY_RESULT:
+                factory_results[sha256_bytes(line)] = record
         if kind == "genesis":
             factory = record.get("program") == FACTORY_PROGRAM
             if "catalog" in record:
@@ -2215,6 +2243,120 @@ def validate_factory_record(record: dict, open_run: tuple[dict, str] | None) -> 
         raise ValueError("an abandoned factory run states its reason")
 
 
+def factory_result_index(ledger: Ledger) -> dict[str, dict]:
+    """{line sha256: record} of every ``factory_run_result`` on the ledger."""
+    return {ledger.line_sha(r["seq"]): r for r in ledger.of_kind(FACTORY_RESULT)}
+
+
+def factory_forward_seen(ledger: Ledger) -> set[tuple[str, str]]:
+    """(run_id, trial_id) of every live verdict already on the ledger."""
+    return {(r["run_id"], r["trial_id"]) for r in ledger.of_kind(FACTORY_FORWARD)}
+
+
+def validate_factory_forward(record: dict, results: dict[str, dict], seen: set[tuple[str, str]]) -> None:
+    """A live verdict names one trial of a recorded result, once, with a verdict its counts allow."""
+    result = results.get(record.get("result_sha256") or "")
+    if result is None:
+        raise ValueError("a live verdict must name a factory_run_result on this ledger by its line sha256")
+    run_id, trial_id = record.get("run_id"), record.get("trial_id")
+    if result["run_id"] != run_id:
+        raise ValueError("a live verdict's run id is not the run of the result it names")
+    trial = next((t for t in result["trials"] if t["trial_id"] == trial_id), None)
+    if trial is None:
+        raise ValueError(f"trial {trial_id!r} is not a trial of run {run_id!r}")
+    if (run_id, trial_id) in seen:
+        raise ValueError("this trial already has a live verdict: a slot has one look")
+    verdict, n = record.get("verdict"), record.get("n")
+    if verdict not in FACTORY_VERDICTS.values():
+        raise ValueError("a live verdict is pass, fail or underpowered")
+    if type(n) is not int or n < 0:
+        raise ValueError("n must be a nonnegative integer")
+    lower = record.get("lower_bound")
+    if verdict == "underpowered":
+        if n >= FACTORY_MIN_N:
+            raise ValueError(f"underpowered means fewer than {FACTORY_MIN_N} resolved fires")
+    elif n < FACTORY_MIN_N or isinstance(lower, bool) or not isinstance(lower, (int, float)):
+        raise ValueError(f"pass and fail need {FACTORY_MIN_N} resolved fires and a lower bound")
+    elif (verdict == "pass") != (lower > 0):
+        raise ValueError("pass means the lower bound is above zero; fail means it is not")
+    if not isinstance(record.get("looked_at"), str):
+        raise ValueError("a live verdict carries the time of its look")
+    if stamp(record["looked_at"]) < stamp(result["recorded_at"]):
+        raise ValueError("a live verdict cannot predate the result it follows")
+    slot = record.get("slot")
+    slot_keys = ("trial_id", "family", "row_hash", "registered_at")
+    if not isinstance(slot, dict) or not all(isinstance(slot.get(k), str) and slot[k] for k in slot_keys):
+        raise ValueError("a live verdict carries its slot's trial id, family, registration hash and time")
+    chain = record.get("source_chain")
+    if not isinstance(chain, dict) or not isinstance(chain.get("head"), str) or type(chain.get("rows")) is not int:
+        raise ValueError("a live verdict carries the live trial ledger's head and row count")
+    if len(record.get("source_sha256") or "") != 64:
+        raise ValueError("a live verdict carries the sha256 of the export file it came from")
+
+
+def ingest_factory_verdicts(ledger: Ledger, path: str | Path, recorded_at: str | None = None) -> int:
+    """Append the final live verdicts in a gex-signals export (``panel-factory-verdict/1`` JSONL).
+
+    All lines are checked before any is appended. A line whose trial already
+    has its verdict on the ledger with the same content is skipped (a
+    re-import is not an error); a different verdict for that trial is
+    refused. Returns the number appended.
+    """
+    if not ledger.is_factory:
+        raise ValueError("live factory verdicts belong on a factory ledger")
+    raw = Path(path).read_bytes()
+    source_sha = sha256_bytes(raw)
+    results, seen = factory_result_index(ledger), factory_forward_seen(ledger)
+    have = {(r["run_id"], r["trial_id"]): r for r in ledger.of_kind(FACTORY_FORWARD)}
+    pending: list[dict] = []
+    for number, line in enumerate((x for x in raw.splitlines() if x.strip()), start=1):
+        entry = json.loads(line)
+        if set(entry) != set(FACTORY_VERDICT_FIELDS) or entry["schema"] != FACTORY_VERDICT_SCHEMA:
+            raise ValueError(f"line {number}: fields must be exactly {FACTORY_VERDICT_FIELDS} with schema {FACTORY_VERDICT_SCHEMA}")
+        if canonical(entry) != line.strip():
+            raise ValueError(f"line {number}: not canonical JSON")
+        if entry["verdict"] not in FACTORY_VERDICTS:
+            raise ValueError(f"line {number}: only final verdicts are exported ({', '.join(FACTORY_VERDICTS)})")
+        source = entry["source"] if isinstance(entry["source"], dict) else {}
+        record = _finite({
+            "kind": FACTORY_FORWARD,
+            "run_id": source.get("run_id"),
+            "trial_id": source.get("trial_id"),
+            "result_sha256": source.get("result_sha256"),
+            "verdict": FACTORY_VERDICTS[entry["verdict"]],
+            "n": entry["n"],
+            "mean_net": entry["mean_net"],
+            "lower_bound": entry["lower_bound"],
+            "alpha_per_test": entry["alpha_per_test"],
+            "resolved_fires": entry["resolved_fires"],
+            "sessions": entry["sessions"],
+            "looked_at": entry["looked_at"],
+            "through_day": entry["through_day"],
+            "rule": entry["rule"],
+            "slot": {"trial_id": entry["slot_trial_id"], "family": entry["family"], "row_hash": entry["row_hash"],
+                     "registered_at": entry["registered_at"]},
+            "source_chain": entry["chain"],
+            "export_schema": entry["schema"],
+            "exported_at": entry["exported_at"],
+            "source_sha256": source_sha,
+        })
+        key = (record["run_id"], record["trial_id"])
+        if key in have:
+            same = all(have[key].get(k) == record[k] for k in ("verdict", "n", "looked_at", "slot"))
+            if not same:
+                raise ValueError(f"line {number}: this trial already has a different live verdict on the ledger")
+            continue
+        try:
+            validate_factory_forward(record, results, seen | {(p["run_id"], p["trial_id"]) for p in pending})
+        except ValueError as exc:
+            raise ValueError(f"line {number}: {exc}") from None
+        pending.append(record)
+    stamp_now = recorded_at or now_iso()
+    for record in pending:
+        ledger._append({**record, "recorded_at": stamp_now})
+    return len(pending)
+
+
 def record_factory_declared(ledger, *, run_id, run_file, data_manifest_sha256, trial_count,
                             recorded_at=None) -> dict:
     """Declare a factory run before its data is read; returns ``{record, sha256}``."""
@@ -2285,6 +2427,33 @@ def _factory_classes(trials: list[dict]) -> dict | None:
     return dict(sorted(out.items()))
 
 
+def _factory_live(ledger: Ledger, trials: list[dict]) -> dict:
+    """Live verdicts on the ledger: how many candidates were sent live and looked at, and how the looks came out."""
+    forward = ledger.of_kind(FACTORY_FORWARD)
+    selected = {t["trial_id"] for t in trials if t.get("selected")}
+    class_of = {t["trial_id"]: t.get("class") or "unclassed" for t in trials}
+    by_class: dict[str, dict] = {}
+    for r in forward:
+        c = by_class.setdefault(class_of[r["trial_id"]], {"looked": 0, "passed": 0, "failed": 0, "underpowered": 0})
+        c["looked"] += 1
+        c[{"pass": "passed", "fail": "failed"}.get(r["verdict"], "underpowered")] += 1
+    return {
+        "looked": len(forward),
+        "passed": sum(r["verdict"] == "pass" for r in forward),
+        "failed": sum(r["verdict"] == "fail" for r in forward),
+        "underpowered": sum(r["verdict"] == "underpowered" for r in forward),
+        "looked_not_selected_in_run": sum(r["trial_id"] not in selected for r in forward),
+        "lapsed": None,   # the retirement checker (#1163) is not built
+        "by_class": dict(sorted(by_class.items())),   # feature class of the trial (factory 3); "unclassed" before classes
+        "verdicts": [
+            {"run_id": r["run_id"], "trial_id": r["trial_id"], "verdict": r["verdict"], "n": r["n"],
+             "lower_bound": r["lower_bound"], "looked_at": r["looked_at"], "slot": r["slot"]["trial_id"]}
+            for r in forward
+        ],
+        "note": "a pass is one forward look at alpha / k of its slot family; candidates still recording are not on this ledger",
+    }
+
+
 def summarize_factory(ledger: Ledger) -> dict:
     """Files-only status of a factory ledger: every run and every candidate it ever declared."""
     results = ledger.of_kind(FACTORY_RESULT)
@@ -2303,6 +2472,7 @@ def summarize_factory(ledger: Ledger) -> dict:
         "candidates_measured": len(trials),
         "candidates_tested": sum(t["status"] == "tested" for t in trials),
         "candidates_selected": sum(bool(t["selected"]) for t in trials),
+        "live": _factory_live(ledger, trials),
         "runs": [
             {"run_id": r["run_id"], "trial_count": r["trial_count"], "tested": r["tested_count"],
              "selected": r["selected_count"], "critical_t": (r.get("max_t") or {}).get("critical_t"),

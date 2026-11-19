@@ -1380,9 +1380,22 @@ def main(argv=None) -> int:
     s = sub.add_parser("summary")
     s.add_argument("--ledger", required=True, type=Path)
     s.add_argument("--anchor", required=True, type=Path)
+    v = sub.add_parser("verdicts", help="append the final live verdicts in a gex-signals panel-factory export (#1162)")
+    v.add_argument("--file", required=True, type=Path)
+    v.add_argument("--ledger", required=True, type=Path)
+    v.add_argument("--anchor", required=True, type=Path)
     a = ap.parse_args(argv)
     if a.cmd == "summary":
         print(json.dumps(lse.summarize(lse.Ledger(a.ledger, anchor=a.anchor)), indent=1))
+        return 0
+    if a.cmd == "verdicts":
+        try:
+            ledger = lse.Ledger(a.ledger, anchor=a.anchor)
+            appended = lse.ingest_factory_verdicts(ledger, a.file)
+        except (ValueError, OSError) as e:
+            print(json.dumps({"ok": False, "refused": str(e)}))
+            return 2
+        print(json.dumps({"ok": True, "appended": appended, "head_sha256": ledger.head, "live": lse.summarize(ledger)["live"]}))
         return 0
     try:
         ledger = open_ledger(a.ledger, a.anchor, a.genesis)
