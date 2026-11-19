@@ -1,12 +1,25 @@
 # Desk source receipts
 
 Module: `intelligence/desk_source_receipts.py`. Tests: `tests/test_desk_source_receipts.py`.
-Job: `scripts/desk_receipts_run.sh`, `deploy/systemd/grid-desk-receipts.{service,timer}.template`
-(tests: `tests/test_desk_receipts_run.py`). Part of 3pacs/GRID#1164.
+Job: `scripts/desk_receipts_run.sh`, `deploy/systemd-user/grid-desk-receipts.{service,timer}.template`
+(tests: `tests/test_desk_receipts_run.py`, `tests/test_systemd_user_template_invariants.py`). Part of 3pacs/GRID#1164.
 
 **Running on grid-svr since 2026-11-19**, on the owner's word, before review: a `grid` user
 timer, weekdays 16:20 and 19:20 New York, from a checkout pinned to one commit. Log folder
 `/data/grid_ledgers/desk-receipts`. First recorded session: 2026-11-18.
+
+The running copy is the commit it was pinned to. Nothing in this file changes it; a newer
+commit reaches grid-svr only when the owner points the unit at a new pinned checkout.
+
+**Why it is not a release-tree unit.** Every template in `deploy/systemd/` must run from
+`/data/grid_v4/grid_release`, which each deploy moves to `main`. This job appends to a log
+whose line format later readers verify, so its code must not change because `main` did. It
+runs from a checkout pinned to one reviewed commit, as a `grid` user unit. Its templates
+therefore live in `deploy/systemd-user/`, which has its own guard
+(`tests/test_systemd_user_template_invariants.py`): `@CODE@` for the working directory and
+every repository path, never the release tree, the usual `.env`, no `User=`. The
+release-tree guard is unchanged and still covers every template in `deploy/systemd/`, and a
+`@CODE@` template placed there fails.
 
 ## Why it exists
 
@@ -27,31 +40,44 @@ It cannot reach backwards. A session that was never recorded stays unknown.
 
 ```json
 {"kind": "receipt",
- "session": "2026-11-18",
- "evidence_cutoff": "2026-11-18T21:00:00+00:00",
+ "session": "2026-11-19",
+ "evidence_cutoff": "2026-11-19T21:00:00+00:00",
+ "calendar_sha256": "efa8897e...",
+ "state_as_of": "read",
  "read_started_at": "...", "read_finished_at": "...",
  "sources": {
-   "factory_ledger": {"status": "read", "rows": 3, "bytes": 1234,
-                      "payload_sha256": "...", "scope": {...}},
-   "sleuth_leads":   {"status": "read", "rows": 15, "payload_sha256": "...", "scope": {...}},
-   "thesis_log":     {"status": "unknown", "failure": "SourceUnavailable", "reason": "..."}},
+   "factory_ledger": {"status": "read", "rows": 3, "bytes": 1234, "payload_sha256": "...",
+                      "scope": {...}, "read_started_at": "...", "read_finished_at": "..."},
+   "sleuth_leads":   {"status": "read", "rows": 15, "payload_sha256": "...", "scope": {...},
+                      "read_started_at": "...", "read_finished_at": "..."},
+   "thesis_log":     {"status": "unknown", "failure": "SourceUnavailable", "reason": "...",
+                      "read_started_at": "...", "read_finished_at": "..."}},
  "promotion_allowed": false,
  "prev_sha256": "..."}
 ```
+
+`calendar_sha256`, `state_as_of` and the per-source clocks were added after the first
+receipt. The 2026-11-18 record has none of them and stays valid as written: `verify` checks
+them when present and does not require them.
 
 Each `payload_sha256` names a file `payloads/<sha256>.json` holding the canonical JSON the
 source returned. `ReceiptLog.payload(sha)` returns those bytes after re-hashing them.
 
 | Source | What is read | Payload |
 |---|---|---|
-| `factory_ledger` | The module-factory ledger, reopened through its anchor with `verify(full=True)` | Ledger id, head hash, file hashes, `summarize()` |
-| `sleuth_leads` | Leads with `origin = 'intersection'` created in the 60 days up to the cutoff, each with `declared_tests` and `test_link_problems` | The rows, sorted by id |
+| `factory_ledger` | One stable read of the module-factory ledger and its anchor (two passes that agree), then `verify(full=True)` and `summarize()` on those bytes only | Ledger id, head hash, file hashes, `summarize()`: all of one version |
+| `sleuth_leads` | Leads with `origin = 'intersection'` created in the 60 days up to the cutoff, with their tests, in one database snapshot | The rows, sorted by id, each with `declared_tests` (verified only), `unverified_tests` and `test_link_problems` |
 | `thesis_log` | Nothing: no log exists | None. Recorded as `unknown` on every receipt until #1165 lands |
 
 ## Rules
 
-1. **The cutoff is the session's close.** It is computed from the session
-   (`ingestion.market_calendar`, early closes included) and cannot be passed in.
+1. **The cutoff is the session's close.** It comes from the pinned XNYS manifest
+   `docs/reference/calendar-manifests/xnys-rth-20261001-20271231.json` (the one
+   `ingestion.gex_native_volume` pins, sha256 in `CALENDAR_SHA256`), early closes included,
+   and cannot be passed in. A date the manifest does not cover is refused; there is no
+   fallback to the scheduler's approximate helpers. A test walks every day the manifest
+   covers and requires the helpers to give the same sessions and closes, so the two are
+   reconciled, not assumed. After 2027-12-31 the job refuses until a new manifest is pinned.
 2. **Only the latest closed session can be recorded.** Not a session still open, and not
    an older one once a later session has closed. This is what stops a brief date from one
    day being paired with a cutoff from another.
@@ -67,9 +93,35 @@ source returned. `ReceiptLog.payload(sha)` returns those bytes after re-hashing 
 6. **No secrets on the record.** A failed read is recorded by exception type. Its message
    goes to the run log only.
 
+7. **One version per source.** See the table above. If the factory files change during every
+   read attempt, the source is `unknown`.
+8. **An interrupted write is finished, not redone.** The receipt line is written and synced
+   before its anchor line. A run that stops between the two leaves one append unanchored:
+   one record, or the header and first receipt with no anchor file yet. The next run appends
+   the missing anchor, marked `"recovered": true` (its `run_at` is the recovery), and writes
+   no receipt for a session that already has one. No line is rewritten. More than one
+   unanchored record, or a missing anchor file on a longer log, is not what an interruption
+   leaves: `verify` fails and nothing is appended until a person looks.
+
 `verify()` re-checks every one of these on the stored records, not only at write time: a
 record whose cutoff is not its session's close, a second record for a session, or sessions
 out of order all fail.
+
+## The four clocks
+
+A receipt is a read made after the close. It is not the state at the close.
+
+| Clock | Where it is | Who writes it |
+|---|---|---|
+| Session close | `evidence_cutoff` | Computed from the pinned calendar. It dates the session and bounds which leads are in scope by `created_at` |
+| Read | `read_started_at` / `read_finished_at`, on the receipt and on each source | This recorder. The payload is the source's state at these times |
+| Witness | The time the hub (or a pushed witness file) received the head | The witness. This log does not hold it and cannot vouch for it |
+| Consumer availability | When the Desk had both the capture and the witness | The consumer |
+
+Sleuth rows are changed in place and the factory ledger grows, so a payload can contain
+state from after the close. `state_as_of: "read"` says so on the record. A reader that needs
+"what was known when" must use the read clocks, and must not replay a payload as if it had
+been known at the cutoff.
 
 ## What a receipt proves
 
@@ -99,33 +151,77 @@ python -m intelligence.desk_source_receipts verify --dir /data/grid_ledgers/desk
 
 python -m intelligence.desk_source_receipts export-anchors \
     --dir /data/grid_ledgers/desk-receipts --vault-worktree <vault clone>
+
+python -m intelligence.desk_source_receipts witness-status --dir /data/grid_ledgers/desk-receipts \
+    [--pending] [--lines]
+
+python -m intelligence.desk_source_receipts witness-mark --dir /data/grid_ledgers/desk-receipts \
+    --session 2026-11-18 --head <full sha256> [--via hub|operator]
 ```
+
+`verify` prints `anchored_records`, `unanchored_records`, `witnessed_records` and
+`qualified`. `ok` means the chain and the anchors given are consistent. Whether the log can
+be used as evidence is `qualified`, in two parts that never stand in for each other:
+
+- `local_anchor`: every record is under this host's anchor.
+- `external_witness`: every record is under the off-host anchor copy passed with
+  `--external-anchors`. Without that argument it is `null`: unknown, not a pass.
+
+## Handing a head to the witness
+
+Each receipt has one head to witness: the sha256 of its own log line, with the log's length
+up to it. Both are fixed once written, so the pair (session, head) can be delivered again at
+any time, whatever was appended since.
+
+`witness-delivery/<session>.<head>.json` is this host's note that it handed that pair over.
+`witness-status` lists every receipt as `delivered` (a note exists) or `pending`.
+`witness-mark` writes the note; it refuses a head that is not exactly that session's, and a
+receipt not yet anchored on this host, and a second call for the same pair writes nothing.
+
+The note is the recorder's own bookkeeping. It exists so a failed delivery is retried and a
+good one is not repeated. It is not the witness: the recorder does not vouch for its own
+witness, and `qualified.external_witness` never reads these notes.
+
+Receipts written before notes existed (2026-11-18, and any night recorded by the earlier
+pinned commit) show as `pending` and would be posted once more by the first run of this
+version. To avoid that, the owner can run `witness-mark --via operator` for a head he has
+seen on the hub. The original hub post and its arrival time are untouched either way.
 
 `record` exits 0 when it wrote a receipt or the session already had one, and 2 when it
 refused (session not closed, or superseded). `verify` exits 1 on a broken log.
 
 ## The nightly job
 
-`scripts/desk_receipts_run.sh` runs `record`, then `verify`, then posts to the agent hub:
+`scripts/desk_receipts_run.sh` runs `record`, then `verify`, then hands every pending head to
+the agent hub, oldest first:
 
 | Outcome | Hub post | Exit |
 |---|---|---|
-| Receipt written | `desk-receipt-<session>`: cutoff, log head sha256, record count, sources recorded as unknown | 0 |
-| Session already recorded | none | 0 |
+| Receipt written or already there, every pending head posted | `desk-receipt-<session>` per pending head: session close, receipt head sha256, records up to it, sources recorded as unknown | 0 |
+| Receipt safe, a hub post failed or its note was refused | whatever did go through | 5 |
+| Nothing pending | none | 0 |
 | Refused (not closed, superseded) | none | 2 |
-| Recorder crashed | `desk-receipts-crash-<date>` | 3 |
-| Log failed verification | `desk-receipts-broken-<date>` | 4 |
+| Recorder crashed | `desk-receipts-crash-<date>`, best effort | 3 |
+| Log failed verification | `desk-receipts-broken-<date>`, best effort | 4 |
 
-The post for a written receipt is the log's off-host copy for now. The hub is on another
-host and is mirrored to the vault on GitHub, so each night's full head hash is held, with
-a timestamp, where grid-svr cannot rewrite it. It is weaker than a committed anchor file:
-a person compares it with `verify`; `verify --external-anchors` does not read it.
+A post that fails is not a success. The run exits 5, the head stays `pending`, and the next
+run (19:20, or the evening check's extra start) posts the same session and the same head. A
+run that records nothing new still delivers what is pending. A head already noted as
+delivered is not posted again. The text of a post depends only on the session and head, so
+a repeat is the same bytes. With `DESK_RECEIPTS_REPORT` empty, delivery is off: the run says
+which sessions are pending and exits 0.
+
+A hub post is the log's off-host copy for now. The hub is on another host and is mirrored to
+the vault on GitHub, so each receipt's full head hash is held, with the hub's arrival time,
+where grid-svr cannot rewrite it. It is weaker than a committed anchor file: a person
+compares it with `witness-status`; `verify --external-anchors` does not read it.
 
 A failed night cannot be made up after the next close, so a failure needs attention the
 same evening. Who hears about it: a second user timer on grid-svr,
 `grid-desk-receipts-check.timer` (weekdays 19:45 New York, after both attempts), checks
 that the latest closed session has a receipt, the log verifies, the hub holds the post and
-no source other than `thesis_log` is unknown. A good night is silent. A missing receipt
+no source other than `thesis_log` is unknown. That check predates exit code 5 and reads the
+hub itself; it does not yet read `witness-status`. A good night is silent. A missing receipt
 gets one more start of the job. Anything still wrong is pushed to the owner's phone. That
 check lives outside this repo (`/data/agent-home/anikdang/desk-receipts/check/` on
 grid-svr) because it depends on the owner's push tool. Owner of failures: Anik, by that
@@ -141,7 +237,14 @@ journalctl --user -u grid-desk-receipts -n 40
 ## Not done
 
 - No job commits and pushes the witness file. The hub post above stands in for it.
-- The running copy is ahead of review. A format change after review starts a second log;
-  this one is never rewritten.
+- The running copy is the first pinned commit and does not have the review fixes (pinned
+  calendar, one-version reads, interrupted-write recovery, retryable delivery). They reach
+  grid-svr when the owner applies a new pinned checkout. The fixes add optional fields and
+  an anchor flag; they do not change or invalidate the existing log, which is never
+  rewritten.
+- The seam check with the consumer uses the retained 2026-11-18 capture and the original
+  hub post, through the private handoff routes. No capture is re-run for it.
+- A receipt is not the native Factory report, not a research-disposition thesis row
+  (#1165) and not a live Factory slot (#1161/#1162). Those stay unknown or not supplied.
 - The Desk brief does not read receipts yet. That adapter is in the consumer lane.
 - Live factory slots (#1161) are not a source yet; they do not exist.

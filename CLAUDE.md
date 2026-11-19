@@ -219,4 +219,4 @@ Read the matching file only when the task calls for it — keep this core file l
 | Scoring, confirming or relabelling hypotheses (`discovered_hypotheses`, `hypothesis_registry`) | `docs/reference/HYPOTHESIS_SCORING_V2.md` (+ `intelligence/hypothesis_trials.py`) |
 | Registering or running edge-search looks (trading-rule hypotheses judged once on fresh data, Hermes edge stream) | `docs/reference/EDGE_STREAM.md` (+ `alpha_research/edge_stream/`) |
 | Conditioning on market state, regime, events or news; standardizing a variable against its own baseline | `docs/reference/MARKET_STATE_RECORD.md` (+ `intelligence/regime/market_state.py`, `baseline.py`) |
-| Proving what the Research Desk's sources said at a session close (leads, declared tests, factory ledger) | `docs/reference/DESK_SOURCE_RECEIPTS.md` (+ `intelligence/desk_source_receipts.py`) |
+| Proving what the Research Desk's sources said when read after a session close (leads, declared tests, factory ledger) | `docs/reference/DESK_SOURCE_RECEIPTS.md` (+ `intelligence/desk_source_receipts.py`) |

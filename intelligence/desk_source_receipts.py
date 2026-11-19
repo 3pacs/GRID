@@ -22,9 +22,21 @@ What a record proves, and what it does not
 Rules
 -----
 * **Session and cutoff.** A receipt belongs to one XNYS session. The evidence
-  cutoff is that session's close, computed from the session and never passed
-  in. Only the latest closed session can be recorded: not one whose close is
-  still ahead, and not an older one after a later session has closed.
+  cutoff is that session's close, taken from the pinned XNYS manifest
+  (``CALENDAR_SHA256``) and never passed in. A date outside the manifest is
+  refused. Only the latest closed session can be recorded: not one whose
+  close is still ahead, and not an older one after a later session has closed.
+* **A post-close read, not close-time state.** The cutoff dates the session.
+  The payloads are what the sources held when they were read, and each source
+  carries its own read clocks. Sleuth rows are changed in place and the
+  factory ledger grows, so a payload can hold state from after the close. A
+  reader must use the read clocks, not the cutoff, as the time the state was
+  known. When the witness received a head, and when a consumer had it, are
+  two further clocks kept by those parties, not by this log.
+* **One source, one version.** Each source is read as one consistent version:
+  the factory ledger and its anchor from one stable read of both files,
+  verified and summarized from those same bytes; Sleuth's leads and tests in
+  one database snapshot.
 * **One per session.** A second run for a recorded session writes nothing and
   returns the first record, whatever the sources say by then.
 * **Unreadable is not empty.** A source that raises is recorded as
@@ -34,6 +46,17 @@ Rules
 * **Append only.** Lines are canonical JSON chained by ``prev_sha256``; each
   append adds a chained anchor line. Nothing here rewrites or deletes a line,
   and payload files are created once.
+* **An interrupted write is finished, not redone.** The receipt line is
+  written before its anchor. If the process stops between the two, the next
+  run appends the missing anchor (marked ``recovered``) and writes nothing
+  else for that session. More than one unanchored record is not something an
+  interruption can leave, and is refused.
+* **Local anchoring and off-host witnessing are judged separately.** The
+  anchor file shows this host's own claim. A head is witnessed only when a
+  party other than this recorder holds it. ``witness-delivery/`` holds this
+  host's note that it handed a (session, head) to the witness; it lets a
+  failed delivery be retried without a second receipt, and it is not the
+  witness.
 * **No secrets on the record.** A failed read is recorded by exception type.
   Its message goes to the run log only.
 
@@ -48,10 +71,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import os
 import sys
+import tempfile
 import time as _time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
@@ -62,7 +87,7 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 
-from ingestion.market_calendar import is_market_open, market_close_time
+from ingestion.market_calendar import ManifestCalendar
 
 SCHEMA = "desk-source-receipt-v1"
 LOG_ID = "grid-desk-source-receipts"
@@ -71,6 +96,19 @@ ANCHOR_NAME = f"{LOG_ID}.anchors.jsonl"
 LOCK_NAME = f".{LOG_ID}.lock"
 PAYLOAD_DIR = "payloads"
 WITNESS_DIR = "05-GRID/Paper-Log/desk-receipts"
+DELIVERY_DIR = "witness-delivery"   # this host's notes of heads handed to the witness
+
+# The pinned XNYS session manifest (the one ``ingestion.gex_native_volume``
+# pins). Sessions and closes come from it alone; a date outside it is refused.
+CALENDAR_PATH = (Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests"
+                 / "xnys-rth-20261001-20271231.json")
+CALENDAR_SHA256 = "efa8897e2fd94afd4f9f9b29951f142b97aece83812aca7403026df1ec4eb8ad"
+STATE_AS_OF_READ = "read"           # payloads are the state at the read clocks, not at the close
+
+DELIVERED = "delivered"
+PENDING = "pending"
+VIA = ("hub", "operator")
+FACTORY_READ_ATTEMPTS = 3
 
 STATUS_READ = "read"
 STATUS_UNKNOWN = "unknown"
@@ -162,19 +200,39 @@ def check_anchors(path: Path, heads: list[str]) -> tuple[str | None, int]:
 # ── sessions ────────────────────────────────────────────────────────────────
 
 
+@functools.lru_cache(maxsize=1)
+def _calendar() -> ManifestCalendar:
+    return ManifestCalendar(CALENDAR_PATH, CALENDAR_SHA256)
+
+
 def session_cutoff(session: date) -> datetime:
-    """The session's regular close, in UTC. Raises on a closed day."""
-    if not is_market_open(session):
+    """The session's close from the pinned manifest, in UTC. Raises on a closed
+    day and on a date the manifest does not cover."""
+    try:
+        found = _calendar().for_date(session)
+    except (OSError, ValueError) as exc:
+        raise ReceiptError(
+            f"{session.isoformat()} cannot be checked against the pinned XNYS calendar "
+            f"({type(exc).__name__}: {exc})") from exc
+    if found is None:
         raise ReceiptError(f"{session.isoformat()} is not an XNYS session")
-    local = datetime.combine(session, market_close_time(session), tzinfo=_NY)
-    return local.astimezone(timezone.utc)
+    return found.closes.astimezone(timezone.utc)
+
+
+def _is_session(day: date) -> bool:
+    try:
+        return _calendar().for_date(day) is not None
+    except (OSError, ValueError) as exc:
+        raise ReceiptError(
+            f"{day.isoformat()} cannot be checked against the pinned XNYS calendar "
+            f"({type(exc).__name__}: {exc})") from exc
 
 
 def latest_closed_session(now: datetime) -> date:
     """The most recent session whose close is at or before ``now``."""
     day = now.astimezone(_NY).date()
     for _ in range(_SESSION_SEARCH_DAYS):
-        if is_market_open(day) and session_cutoff(day) <= now:
+        if _is_session(day) and session_cutoff(day) <= now:
             return day
         day -= timedelta(days=1)
     raise ReceiptError("no closed session found in the search window")
@@ -183,24 +241,59 @@ def latest_closed_session(now: datetime) -> date:
 # ── sources ─────────────────────────────────────────────────────────────────
 
 
+def _stable_read(paths: list[Path]) -> list[bytes]:
+    """The bytes of every file as they were at one instant.
+
+    Two full passes that agree mean no file changed between its first and
+    second read, and those intervals all overlap, so the first pass is the
+    files together at one moment. A writer that is mid-append makes the passes
+    differ; after a few tries the read is refused, not guessed.
+    """
+    for _ in range(FACTORY_READ_ATTEMPTS):
+        first = [Path(path).read_bytes() for path in paths]
+        if first == [Path(path).read_bytes() for path in paths]:
+            return first
+    raise SourceUnavailable("the factory ledger changed during every read attempt")
+
+
 def factory_ledger_source(ledger: Path, anchor: Path) -> Source:
-    """The module-factory ledger: verified through its anchor, then summarized."""
+    """The module-factory ledger: one stable read of the ledger and its anchor,
+    then verified and summarized from those bytes and no others.
+
+    The ledger reader works on paths and re-reads them, so the bytes are
+    written to a private folder and opened there. The live files are not read
+    again: the summary, the head and both file hashes describe one version.
+    The state is the ledger as read, which can be later than the session close.
+    """
 
     def read(_cutoff: datetime) -> SourceRead:
         from analysis import ledger_steered_exploration as lse
 
-        opened = lse.Ledger(ledger, anchor=anchor)
-        opened.verify(full=True)
-        summary = lse.summarize(opened)
+        ledger_bytes, anchor_bytes = _stable_read([Path(ledger), Path(anchor)])
+        with tempfile.TemporaryDirectory(prefix="desk-receipt-factory-") as scratch:
+            ledger_copy = Path(scratch) / Path(ledger).name
+            anchor_copy = Path(scratch) / Path(anchor).name
+            if ledger_copy == anchor_copy:
+                raise SourceUnavailable("the ledger and its anchor have the same file name")
+            ledger_copy.write_bytes(ledger_bytes)
+            anchor_copy.write_bytes(anchor_bytes)
+            opened = lse.Ledger(ledger_copy, anchor=anchor_copy)
+            opened.verify(full=True)
+            summary = lse.summarize(opened)
+            head = opened.head
+        if summary.get("head_sha256") != head:
+            raise SourceUnavailable("the factory summary names another head than the ledger read")
         payload = {
             "ledger_id": summary["ledger_id"],
-            "head_sha256": opened.head,
-            "ledger_file_sha256": sha256_hex(Path(ledger).read_bytes()),
-            "anchor_file_sha256": sha256_hex(Path(anchor).read_bytes()),
+            "head_sha256": head,
+            "ledger_file_sha256": sha256_hex(ledger_bytes),
+            "anchor_file_sha256": sha256_hex(anchor_bytes),
             "summary": summary,
         }
         return SourceRead(payload=payload, rows=int(summary["records"]),
-                          scope={"ledger": Path(ledger).name, "anchor": Path(anchor).name})
+                          scope={"ledger": Path(ledger).name, "anchor": Path(anchor).name,
+                                 "snapshot": "one stable read of both files",
+                                 "state": "as read; not limited to the session close"})
 
     return read
 
@@ -208,32 +301,43 @@ def factory_ledger_source(ledger: Path, anchor: Path) -> Source:
 def sleuth_leads_source(engine: Any, lookback_days: int = LEAD_LOOKBACK_DAYS) -> Source:
     """Intersection leads created up to the cutoff, each with its stored tests.
 
-    The rows are read as they are at read time. ``created_at <= cutoff`` keeps
-    later leads out; it does not undo in-place changes made after the cutoff
-    to a lead or test that already existed, which is why the read clocks are
-    part of the record.
+    Leads and tests are read in one database snapshot, as they are at read
+    time. ``created_at <= cutoff`` keeps later leads out; it does not undo
+    in-place changes made after the cutoff to a lead or test that already
+    existed, which is why the read clocks are part of the record. Only
+    ``declared_tests`` are verified tests; ``unverified_tests`` are rows that
+    exist and failed a check.
     """
 
     def read(cutoff: datetime) -> SourceRead:
         from intelligence.sleuth import Sleuth
-        from intelligence.sleuth_intersections import ORIGIN, declared_tests_for_leads
+        from intelligence.sleuth_intersections import (
+            ORIGIN,
+            declared_tests_for_leads,
+            read_snapshot,
+        )
 
         since = cutoff - timedelta(days=lookback_days)
-        leads = Sleuth(engine, ensure_schema=False).get_leads(
-            limit=LEAD_CAP, origin=ORIGIN, created_since=since, created_until=cutoff)
-        if len(leads) >= LEAD_CAP:
-            raise SourceUnavailable("lead scope reached the cap; refusing a truncated read")
-        tests = declared_tests_for_leads(engine, leads)
+        with read_snapshot(engine) as conn:
+            leads = Sleuth(engine, ensure_schema=False).get_leads(
+                limit=LEAD_CAP, origin=ORIGIN, created_since=since, created_until=cutoff,
+                conn=conn)
+            if len(leads) >= LEAD_CAP:
+                raise SourceUnavailable("lead scope reached the cap; refusing a truncated read")
+            tests = declared_tests_for_leads(conn, leads)
         rows = [
             {**asdict(lead),
              "declared_tests": tests[lead.id]["tests"],
+             "unverified_tests": tests[lead.id]["unverified_tests"],
              "test_link_problems": tests[lead.id]["link_problems"]}
             for lead in sorted(leads, key=lambda item: item.id)
         ]
         return SourceRead(
             payload={"leads": rows}, rows=len(rows),
             scope={"origin": ORIGIN, "created_since": since.isoformat(),
-                   "created_until": cutoff.isoformat()})
+                   "created_until": cutoff.isoformat(),
+                   "snapshot": "one database snapshot for leads and tests",
+                   "state": "as read; rows are changed in place after the close"})
 
     return read
 
@@ -259,6 +363,7 @@ class ReceiptLog:
         self.anchor_path = self.root / ANCHOR_NAME
         self.lock_path = self.root / LOCK_NAME
         self.payload_dir = self.root / PAYLOAD_DIR
+        self.delivery_dir = self.root / DELIVERY_DIR
 
     # -- reading (never writes, never creates) -------------------------------
 
@@ -284,7 +389,14 @@ class ReceiptLog:
 
         ``full`` also re-hashes every payload a record names. Returns
         ``{"ok", "records", "receipts", "head_sha256", "anchored_records",
-        "witnessed_records", "detail"}``.
+        "unanchored_records", "witnessed_records", "qualified", "detail"}``.
+
+        ``ok`` says the chain and every anchor given are consistent. It does
+        not say the log is evidence. ``qualified`` answers that in two parts
+        that do not stand in for each other: ``local_anchor`` (every record is
+        under this host's anchor) and ``external_witness`` (every record is
+        under the off-host copy; ``None`` when no copy was given, which is
+        unknown, not a pass).
         """
         lines = list(raw_lines(self.path))
         heads: list[str] = []
@@ -320,11 +432,9 @@ class ReceiptLog:
                             return _broken(len(lines), i, f"{name} payload: {type(exc).__name__}")
             previous = sha256_hex(line)
             heads.append(previous)
-        if lines and not self.anchor_path.exists():
-            return _broken(len(lines), len(lines), "anchor file missing")
         anchored = witnessed = 0
         for source in (self.anchor_path, external_anchors):
-            if source is None:
+            if source is None or (source == self.anchor_path and not self.anchor_path.exists()):
                 continue
             problem, count = check_anchors(Path(source), heads)
             if problem:
@@ -333,11 +443,23 @@ class ReceiptLog:
                 anchored = count
             else:
                 witnessed = count
-        # A crash between the two appends leaves an unanchored tail. It is
-        # reported, not refused: the next append's anchor covers it.
+        # The receipt line is written before its anchor, so a stopped process
+        # can leave one append unanchored: one record, or the header and the
+        # first receipt. That is reported and the next run anchors it. Anything
+        # more is not what an interruption leaves.
+        tail = len(lines) - anchored
+        if tail > 1 and not (anchored == 0 and len(lines) == 2):
+            return _broken(len(lines), anchored,
+                           f"{tail} records beyond the last anchor; an interrupted append leaves one")
         return {"ok": True, "records": len(lines), "receipts": len(sessions),
                 "head_sha256": previous, "anchored_records": anchored,
-                "witnessed_records": witnessed, "detail": None}
+                "unanchored_records": tail, "witnessed_records": witnessed,
+                "qualified": {
+                    "local_anchor": bool(lines) and tail == 0,
+                    "external_witness": (None if external_anchors is None
+                                         else bool(lines) and witnessed == len(lines)),
+                },
+                "detail": None}
 
     # -- writing (append only) ------------------------------------------------
 
@@ -345,8 +467,10 @@ class ReceiptLog:
                now: Clock = _now) -> dict:
         """Read every source once and append the session's receipt.
 
-        Returns ``{"written": bool, "record": dict}``. ``written`` is False
-        when the session already has a receipt.
+        Returns ``{"written": bool, "record": dict, "recovered_anchor":
+        bool}``. ``written`` is False when the session already has a receipt.
+        ``recovered_anchor`` is True when this run appended the anchor an
+        interrupted earlier run left out.
         """
         if not sources:
             raise ReceiptError("at least one source is required")
@@ -364,41 +488,78 @@ class ReceiptLog:
             check = self.verify()
             if not check["ok"]:
                 raise ReceiptError(f"receipt log is broken, refusing to append: {check['detail']}")
+            recovered = self._anchor_interrupted_tail(check, started)
             existing = self.receipt_for(session)
             if existing is not None:
-                return {"written": False, "record": existing}
+                return {"written": False, "record": existing, "recovered_anchor": recovered}
             entries: dict[str, dict] = {}
             for name in sorted(sources):
-                entries[name] = self._read(name, sources[name], cutoff)
+                entries[name] = self._read(name, sources[name], cutoff, now)
             body = {
                 "kind": "receipt",
                 "session": session.isoformat(),
                 "evidence_cutoff": cutoff.isoformat(),
+                "calendar_sha256": CALENDAR_SHA256,
+                "state_as_of": STATE_AS_OF_READ,
                 "read_started_at": started.isoformat(),
                 "read_finished_at": now().isoformat(),
                 "sources": entries,
                 "promotion_allowed": False,
             }
             written = self._append(body, started)
-        return {"written": True, "record": written}
+        return {"written": True, "record": written, "recovered_anchor": recovered}
 
-    def _read(self, name: str, source: Source, cutoff: datetime) -> dict:
+    def _read(self, name: str, source: Source, cutoff: datetime, now: Clock = _now) -> dict:
+        began = now()
+
+        def clocks() -> dict[str, str]:
+            return {"read_started_at": began.isoformat(), "read_finished_at": now().isoformat()}
+
         try:
             read = source(cutoff)
             raw = canonical(read.payload)
         except SourceUnavailable as exc:
             return {"status": STATUS_UNKNOWN, "failure": type(exc).__name__,
-                    "reason": str(exc)[:300]}
+                    "reason": str(exc)[:300], **clocks()}
         except Exception as exc:  # noqa: BLE001 - any failure is "unknown", by design
             # The record gets the type only: database errors can carry hosts
             # and statements. The detail goes to the run log.
             log.warning("desk receipts: source {n} could not be read: {e}", n=name, e=str(exc))
             return {"status": STATUS_UNKNOWN, "failure": type(exc).__name__,
-                    "reason": "the read raised; see the run log"}
+                    "reason": "the read raised; see the run log", **clocks()}
+        finished = clocks()
         digest = sha256_hex(raw)
         self._store_payload(digest, raw)
         return {"status": STATUS_READ, "rows": read.rows, "bytes": len(raw),
-                "payload_sha256": digest, "scope": dict(read.scope)}
+                "payload_sha256": digest, "scope": dict(read.scope), **finished}
+
+    def _anchor_interrupted_tail(self, check: dict, at: datetime) -> bool:
+        """Append the anchor an interrupted run left out. Call under the lock,
+        with ``check`` a passing ``verify()``. Adds one anchor line; rewrites
+        nothing. ``recovered`` on the line says it was written by a later run,
+        so its ``run_at`` is the recovery, not the original write."""
+        if not check["unanchored_records"]:
+            return False
+        self._append_anchor(check["records"], check["head_sha256"], at, recovered=True)
+        log.warning("desk receipts: anchored {n} record(s) an interrupted run left unanchored",
+                    n=check["unanchored_records"])
+        return True
+
+    def _append_anchor(self, records: int, head: str, at: datetime, *,
+                       recovered: bool = False) -> None:
+        anchors = list(raw_lines(self.anchor_path))
+        body: dict[str, Any] = {
+            "records": records,
+            "head_sha256": head,
+            "run_at": at.isoformat(),
+            "prev_anchor_sha256": sha256_hex(anchors[-1]) if anchors else None,
+        }
+        if recovered:
+            body["recovered"] = True
+        with open(self.anchor_path, "ab") as stream:
+            stream.write(canonical(body) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def _store_payload(self, digest: str, raw: bytes) -> None:
         self.payload_dir.mkdir(parents=True, exist_ok=True)
@@ -430,17 +591,7 @@ class ReceiptLog:
             stream.writelines(item + b"\n" for item in new)
             stream.flush()
             os.fsync(stream.fileno())
-        anchors = list(raw_lines(self.anchor_path))
-        anchor = canonical({
-            "records": len(lines) + len(new),
-            "head_sha256": sha256_hex(line),
-            "run_at": at.isoformat(),
-            "prev_anchor_sha256": sha256_hex(anchors[-1]) if anchors else None,
-        })
-        with open(self.anchor_path, "ab") as stream:
-            stream.write(anchor + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        self._append_anchor(len(lines) + len(new), sha256_hex(line), at)
         return json.loads(line)
 
     @contextlib.contextmanager
@@ -469,6 +620,94 @@ class ReceiptLog:
             yield
         finally:
             self.lock_path.unlink(missing_ok=True)
+
+    # -- handing heads to the witness ------------------------------------------
+
+    def witness_rows(self) -> list[dict]:
+        """Every receipt with the head to witness for it and whether this host
+        has noted handing that head over. Read-only.
+
+        A receipt's head is the hash of its own line, and ``records`` is the
+        log's length up to it. Both are fixed once written, so a delivery can
+        be retried for the same session and the same head however many
+        receipts follow. ``delivery`` is this host's note only: ``pending``
+        means no note, not that the witness lacks the head, and ``delivered``
+        is not proof the witness holds it.
+        """
+        check = self.verify()
+        if not check["ok"]:
+            raise ReceiptError(f"receipt log is broken: {check['detail']}")
+        rows: list[dict] = []
+        for index, line in enumerate(raw_lines(self.path)):
+            record = json.loads(line)
+            if record.get("kind") != "receipt":
+                continue
+            head = sha256_hex(line)
+            note = self._delivery_note(record["session"], head)
+            rows.append({
+                "session": record["session"],
+                "head_sha256": head,
+                "records": index + 1,
+                "evidence_cutoff": record["evidence_cutoff"],
+                "read_finished_at": record["read_finished_at"],
+                "unknown_sources": sorted(name for name, source in record["sources"].items()
+                                          if source["status"] == STATUS_UNKNOWN),
+                "locally_anchored": index + 1 <= check["anchored_records"],
+                "delivery": DELIVERED if note else PENDING,
+                "delivered_at": note["delivered_at"] if note else None,
+                "via": note["via"] if note else None,
+            })
+        return rows
+
+    def note_delivery(self, session: date, head_sha256: str, *, via: str = "hub",
+                      now: Clock = _now) -> dict:
+        """Note that the witness was handed this session's head. Idempotent.
+
+        Refuses a head that is not exactly this session's receipt, and a
+        receipt this host has not anchored yet. Returns ``{"written": bool,
+        "note": dict}``; a second call for the same pair writes nothing.
+        """
+        if via not in VIA:
+            raise ReceiptError(f"via must be one of {', '.join(VIA)}")
+        key = session.isoformat()
+        row = next((r for r in self.witness_rows() if r["session"] == key), None)
+        if row is None:
+            raise ReceiptError(f"session {key} has no receipt")
+        if row["head_sha256"] != head_sha256:
+            raise ReceiptError(f"session {key} has another head than the one delivered")
+        if not row["locally_anchored"]:
+            raise ReceiptError(f"session {key} is not anchored on this host yet")
+        if row["delivery"] == DELIVERED:
+            return {"written": False, "note": self._delivery_note(key, head_sha256)}
+        note = {"session": key, "head_sha256": head_sha256, "records": row["records"],
+                "delivered_at": now().isoformat(), "via": via}
+        self.delivery_dir.mkdir(parents=True, exist_ok=True)
+        path = self.delivery_dir / f"{key}.{head_sha256}.json"
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o640)
+        except FileExistsError:  # another run noted it between the check and here
+            return {"written": False, "note": self._delivery_note(key, head_sha256)}
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(canonical(note) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return {"written": True, "note": note}
+
+    def _delivery_note(self, session: str, head_sha256: str) -> dict | None:
+        path = self.delivery_dir / f"{session}.{head_sha256}.json"
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            note = json.loads(raw)
+        except ValueError:
+            note = None
+        if (not isinstance(note, dict) or note.get("session") != session
+                or note.get("head_sha256") != head_sha256 or note.get("via") not in VIA
+                or not isinstance(note.get("delivered_at"), str)):
+            raise ReceiptError(f"delivery note {path.name} does not say what its name says")
+        return note
 
     # -- off-host witness ------------------------------------------------------
 
@@ -521,6 +760,14 @@ def _check_receipt(record: dict, sessions: set[str], last_cutoff: str | None) ->
         return "no sources"
     for name, source in sources.items():
         status = source.get("status") if isinstance(source, dict) else None
+        if isinstance(source, dict) and ("read_started_at" in source or "read_finished_at" in source):
+            try:
+                began = datetime.fromisoformat(source["read_started_at"])
+                ended = datetime.fromisoformat(source["read_finished_at"])
+            except (KeyError, TypeError, ValueError):
+                return f"{name}: source read clocks are invalid"
+            if not started <= began <= ended <= finished:
+                return f"{name}: the source was not read inside the receipt's read window"
         if status == STATUS_READ:
             digest = source.get("payload_sha256")
             if not (isinstance(digest, str) and len(digest) == 64
@@ -536,7 +783,9 @@ def _check_receipt(record: dict, sessions: set[str], last_cutoff: str | None) ->
 
 def _broken(n: int, index: int, detail: str) -> dict:
     return {"ok": False, "records": n, "receipts": 0, "head_sha256": None,
-            "anchored_records": 0, "witnessed_records": 0, "detail": f"record {index}: {detail}"}
+            "anchored_records": 0, "unanchored_records": None, "witnessed_records": 0,
+            "qualified": {"local_anchor": False, "external_witness": False},
+            "detail": f"record {index}: {detail}"}
 
 
 # ── command line ────────────────────────────────────────────────────────────
@@ -576,8 +825,38 @@ def main(argv: list[str] | None = None) -> int:
     exp = sub.add_parser("export-anchors", help="append missing anchor lines to a vault worktree")
     exp.add_argument("--dir", type=Path, required=True)
     exp.add_argument("--vault-worktree", type=Path, required=True)
+    wst = sub.add_parser("witness-status",
+                         help="each receipt's head and whether this host noted handing it over")
+    wst.add_argument("--dir", type=Path, required=True)
+    wst.add_argument("--pending", action="store_true", help="only receipts with no delivery note")
+    wst.add_argument("--lines", action="store_true",
+                     help="one tab-separated line per receipt: session, head, records, cutoff, "
+                          "unknown sources (comma-separated, or -)")
+    wmk = sub.add_parser("witness-mark",
+                         help="note that the witness was handed one session's exact head")
+    wmk.add_argument("--dir", type=Path, required=True)
+    wmk.add_argument("--session", type=date.fromisoformat, required=True)
+    wmk.add_argument("--head", required=True)
+    wmk.add_argument("--via", choices=VIA, default="hub")
     args = parser.parse_args(argv)
     log = ReceiptLog(args.dir)
+    if args.command in ("witness-status", "witness-mark"):
+        try:
+            if args.command == "witness-mark":
+                print(json.dumps({"ok": True, **log.note_delivery(
+                    args.session, args.head, via=args.via)}))
+                return 0
+            rows = [r for r in log.witness_rows() if not args.pending or r["delivery"] == PENDING]
+        except ReceiptError as exc:
+            print(json.dumps({"ok": False, "refused": str(exc)}))
+            return 2
+        if args.lines:
+            for r in rows:
+                print("\t".join([r["session"], r["head_sha256"], str(r["records"]),
+                                 r["evidence_cutoff"], ",".join(r["unknown_sources"]) or "-"]))
+        else:
+            print(json.dumps({"ok": True, "receipts": rows}, indent=1))
+        return 0
     if args.command == "verify":
         check = log.verify(args.external_anchors, full=True)
         print(json.dumps(check, indent=1))
@@ -595,8 +874,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     unknown = sorted(n for n, s in result["record"]["sources"].items()
                      if s["status"] == STATUS_UNKNOWN)
-    print(json.dumps({"ok": True, "written": result["written"], "unknown_sources": unknown,
-                      **_summary(result["record"])}, indent=1))
+    print(json.dumps({"ok": True, "written": result["written"],
+                      "recovered_anchor": result["recovered_anchor"],
+                      "unknown_sources": unknown, **_summary(result["record"])}, indent=1))
     return 0
 
 

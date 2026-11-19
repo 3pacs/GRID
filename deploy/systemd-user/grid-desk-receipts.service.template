@@ -1,11 +1,19 @@
-# TEMPLATE. A copy of this unit runs on grid-svr as a `grid` USER unit since 2026-11-19, on the
-# owner's word, from a checkout pinned to one commit (docs/reference/DESK_SOURCE_RECEIPTS.md).
-# It records what the Research Desk's sources said after each session close. It reads the
-# database and the factory ledger and appends only to its own folder.
+# TEMPLATE. placement: pinned-checkout user unit (see deploy/systemd-user/README.md).
+# A copy of this unit runs on grid-svr as a `grid` USER unit since 2026-11-19, on the owner's
+# word. It records what the Research Desk's sources said after each session close. It reads
+# the database and the factory ledger and appends only to its own folder.
+#
+# It does NOT run from the release tree, on purpose. The release tree moves to `main` on every
+# deploy; this job writes an append-only log whose format must not change under it, so it runs
+# from a checkout pinned to one reviewed commit and moves only when a person moves it. That is
+# why it lives in deploy/systemd-user/ and not deploy/systemd/, whose templates must all run
+# from /data/grid_v4/grid_release (tests/test_systemd_template_invariants.py, unchanged).
+# This directory has its own guard: tests/test_systemd_user_template_invariants.py.
+#
 # Install (as grid, no sudo; linger is on):
-#   sed "s#@CODE@#<pinned checkout>#g" deploy/systemd/grid-desk-receipts.service.template \
+#   sed "s#@CODE@#<pinned checkout>#g" deploy/systemd-user/grid-desk-receipts.service.template \
 #       > ~/.config/systemd/user/grid-desk-receipts.service
-#   cp deploy/systemd/grid-desk-receipts.timer.template ~/.config/systemd/user/grid-desk-receipts.timer
+#   cp deploy/systemd-user/grid-desk-receipts.timer.template ~/.config/systemd/user/grid-desk-receipts.timer
 #   systemctl --user daemon-reload && systemctl --user enable --now grid-desk-receipts.timer
 # Moving to a new commit: make a new pinned checkout, point @CODE@ at it, daemon-reload.
 # The log folder never moves and is never recreated.
