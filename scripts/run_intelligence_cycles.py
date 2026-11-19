@@ -9,6 +9,7 @@ Targets:
 """
 
 import importlib.util
+import os
 import sys
 import json
 import traceback
@@ -25,7 +26,8 @@ from loguru import logger as log
 #
 # * ``find_spec("config") is None`` -- checked without importing anything,
 #   so it reflects whether the repo root is on sys.path *before* we commit
-#   to the hardcoded, potentially-stale fallback path. If it's already
+#   to the fallback (this file's own repo root; it used to be the
+#   hard-coded, stale /data/grid_v4/grid_repo checkout). If it's already
 #   importable (the normal case -- every current invocation already has the
 #   repo root on sys.path), this is false and sys.path is left untouched.
 # * ``__name__ == "__main__"`` -- never mutate sys.path just because this
@@ -41,7 +43,7 @@ from loguru import logger as log
 # exists -- including a stale legacy checkout -- mutated sys.path for the
 # rest of the process's lifetime.
 if __name__ == "__main__" and importlib.util.find_spec("config") is None:
-    sys.path.insert(0, "/data/grid_v4/grid_repo")
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import create_engine
 
