@@ -93,6 +93,19 @@ Quotes count from one minute after their mark and only up to T-1 minute; open in
 publication (see :mod:`analysis.factory_options`). Features that need live-only inputs (today's
 contract volume, recorded positions) are :data:`FORWARD_ONLY` and refused in a ranking run.
 
+Factory 5 (3pacs/GRID#1159) adds the macro class (:data:`MACRO_SPECS`), built by :mod:`analysis.factory_macro`
+from one frozen snapshot of GRID's FRED stores, pinned by ``macro_sha256`` in the run file (``--macro FILE``):
+
+* edge9's slow dials S1-S5: SPY trend and drawdown from its own settled closes, the VIX curve (VIXCLS / VXVCLS),
+  the 20-observation change of the high-yield OAS, and VIX minus SPY's 20-day realized vol;
+* FRED dailies as levels and changes: credit (HY OAS), VIX, the 2-year yield, the 10y-2y curve, the 10-year real
+  yield and breakeven, SOFR minus effective fed funds, the Fed's reverse repo, the yen, and the daily
+  uncertainty indexes (EPU, EMU) read through their ALFRED vintages.
+
+A macro value counts at T only when its publication rule (GRID's ``research_real_panel.PUBLICATIONS``) puts it
+strictly before T; a revised series counts only through its vintages, each from the day after its vintage date.
+Revised series without vintages (payrolls, CPI, GDP and the like) are not used.
+
 Each is turned into a robust z against the same feature at the same decision
 time over the previous ``z_history`` eligible sessions (median / 1.4826 MAD,
 capped at +/-4), so a threshold never uses data after its decision.
@@ -124,7 +137,7 @@ Ranking only: nothing here claims a discovery or promotes anything; the
 evidence is forward live recording in gex-signals ``panel-factory``.
 
   python -m analysis.module_factory run --run-file RUN.json --ledger L --anchor A --out DIR [--genesis ID]
-      [--oi-archive OI.db]
+      [--oi-archive OI.db] [--macro MACRO.db]
 """
 
 from __future__ import annotations
@@ -143,6 +156,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from analysis import factory_macro as fm
 from analysis import factory_options as fo
 from analysis import ledger_steered_exploration as lse
 from analysis.factory_session_calendar import FactoryCalendar, FactoryEvents
@@ -430,15 +444,77 @@ FORWARD_ONLY = {
     "POSREC": "the page's recorded position levels (gex-signals positions, from 2026-11-12): a live record, "
               "no history; the factory rebuilds positions from OCC OI instead",
 }
+
+# Factory 5 (3pacs/GRID#1159): the macro class, from a frozen snapshot of GRID's FRED stores (analysis.factory_macro).
+_FRED_LIVE = ("GRID raw_series FRED pull (ingestion/fred.py): the latest observation whose publication rule puts it "
+              "before T; parity unchecked (#1160)")
+_SPY_DAILY_LIVE = "SPY daily closes from gex-signals bars_1m_live; parity unchecked (#1160)"
+_MACRO_DEFS = {
+    "S1": ("SPY trend (edge9 S1): last settled close before the session / mean of the last 200 settled closes - 1",
+           "return (scale-free)", "trend", "spy-bars", _SPY_DAILY_LIVE),
+    "S2": ("SPY drawdown (edge9 S2): last settled close before the session / max of the last 252 settled closes - 1",
+           "return, <= 0 (scale-free)", "trend", "spy-bars", _SPY_DAILY_LIVE),
+    "S3": ("VIX curve (edge9 S3): VIXCLS / VXVCLS on the newest date both are known", "ratio (scale-free)", "vol",
+           "unrevised-latest", "none yet: VXVCLS is not in GRID's FRED pull list (staged file only); research-only"),
+    "S4": (("credit (edge9 S4): high-yield OAS (BAMLH0A0HYM2), newest known observation minus the one 20 "
+            "observations earlier"), "percentage points", "credit", "unrevised-latest", _FRED_LIVE),
+    "S5": (("vol premium (edge9 S5): VIXCLS on its newest known date o minus 100 x sqrt(252) x the stdev of SPY's "
+            "20 daily log returns ending at o's close"), "vol points", "vol", "unrevised-latest",
+           _FRED_LIVE + "; SPY closes from bars_1m_live"),
+    "HYOAS": ("high-yield OAS (BAMLH0A0HYM2), newest known observation", "percentage points", "credit",
+              "unrevised-latest", _FRED_LIVE),
+    "HYOAS_D1": ("high-yield OAS, newest known observation minus the one before", "percentage points", "credit",
+                 "unrevised-latest", _FRED_LIVE),
+    "VIX": ("VIXCLS, newest known observation", "index points", "vol", "unrevised-latest", _FRED_LIVE),
+    "VIX_D1": ("VIXCLS, newest known observation minus the one before", "index points", "vol", "unrevised-latest",
+               _FRED_LIVE),
+    "Y2_D1": ("2-year Treasury yield (DGS2), newest known observation minus the one before", "percentage points",
+              "rates", "unrevised-latest", _FRED_LIVE),
+    "Y2_D20": ("2-year Treasury yield, newest known observation minus the one 20 observations earlier",
+               "percentage points", "rates", "unrevised-latest", _FRED_LIVE),
+    "CURVE": ("10-year minus 2-year Treasury (T10Y2Y), newest known observation", "percentage points", "rates",
+              "unrevised-latest", _FRED_LIVE),
+    "REAL10_D20": ("10-year TIPS real yield (DFII10), 20-observation change", "percentage points", "rates",
+                   "unrevised-latest", _FRED_LIVE),
+    "BE10_D20": ("10-year breakeven inflation (T10YIE), 20-observation change", "percentage points", "rates",
+                 "unrevised-latest", _FRED_LIVE),
+    "SOFRFF": ("SOFR minus the effective fed funds rate (DFF) on SOFR's newest known date (both known)",
+               "percentage points", "funding", "unrevised-latest", _FRED_LIVE),
+    "RRP_D20": ("Fed overnight reverse repo (RRPONTSYD), 20-observation change", "$bn", "funding",
+                "unrevised-latest", _FRED_LIVE),
+    "JPY_D20": ("yen per dollar (DEXJPUS, H.10), 20-observation return", "return (scale-free)", "fx",
+                "unrevised-latest", _FRED_LIVE),
+    "EPU5": (("daily Economic Policy Uncertainty (USEPUINDXD): mean of the newest 5 known observations, each as "
+              "its newest vintage known before T"), "index points", "uncertainty", "alfred-vintage",
+             "GRID fred_vintages refresh (ingestion/fred_vintages.py), the same vintage rule; parity unchecked (#1160)"),
+    "EMU5": ("daily Equity Market Uncertainty (WLEMUINDXD): as EPU5", "index points", "uncertainty",
+             "alfred-vintage",
+             "GRID fred_vintages refresh (ingestion/fred_vintages.py), the same vintage rule; parity unchecked (#1160)"),
+}
+MACRO_SPECS = {}
+for _f, (_def, _unit, _group, _basis, _live) in _MACRO_DEFS.items():
+    _kind, _inputs = fm.FEATURES[_f]
+    MACRO_SPECS[_f] = {
+        "definition": _def, "unit": _unit, "group": _group, "basis": _basis, "live_source": _live,
+        "series": list(_inputs), "kind": "level", "symbols": ("SPY",) if _f in fm.SPY_FEATURES else (),
+        "source": "frozen factory-macro/1 snapshot pinned by macro_sha256: " + "; ".join(
+            f"{sid} from {fm.SERIES[sid]['origin']}" for sid in _inputs) + (
+            "; SPY settled closes from staged edge9/bars.db" if _f in fm.SPY_FEATURES else ""),
+        "pit": "; ".join([fm.rule_text(sid) for sid in _inputs] + (
+            ["SPY closes of sessions before the decision's session"] if _f in fm.SPY_FEATURES else [])
+            + [f"stale beyond macro_stale_days; revision: {', '.join(sorted({fm.SERIES[sid]['revision'] for sid in _inputs})) or 'none (SPY closes)'}"]),
+    }
 FEATURE_CLASS = {**dict.fromkeys(SPECS, "price"), **dict.fromkeys(TAPE_SPECS, "tape"),
-                 **dict.fromkeys(CALENDAR_SPECS, "calendar"), **dict.fromkeys(OPTIONS_SPECS, "options")}
+                 **dict.fromkeys(CALENDAR_SPECS, "calendar"), **dict.fromkeys(OPTIONS_SPECS, "options"),
+                 **dict.fromkeys(MACRO_SPECS, "macro")}
 REGISTRY = {**{f: {**s, "class": "price", "kind": "level"} for f, s in SPECS.items()},
             **{f: {**s, "class": "tape"} for f, s in TAPE_SPECS.items()},
             **{f: {**s, "class": "calendar"} for f, s in CALENDAR_SPECS.items()},
-            **{f: {**s, "class": "options"} for f, s in OPTIONS_SPECS.items()}}
+            **{f: {**s, "class": "options"} for f, s in OPTIONS_SPECS.items()},
+            **{f: {**s, "class": "macro"} for f, s in MACRO_SPECS.items()}}
 KNOWN_FEATURES = tuple(REGISTRY)
 FLAGS = frozenset(f for f, s in REGISTRY.items() if s["kind"] == "flag")
-CLASSES = ("price", "tape", "calendar", "options")
+CLASSES = ("price", "tape", "calendar", "options", "macro")
 W1_VOLUME_MULTIPLE, W1_BARS, W1_FROM = 3.0, 30, "09:45"  # edge8 catalog_edge8.detect: W1 rule, 30-bar extremes
 TAPE_QUANTITIES = ("vol30", "cumvol", "range30")
 EVENT_FEATURES = frozenset(("FOMC", "FOMC_EVE", "CPI", "NFP"))
@@ -481,6 +557,8 @@ class RunFile:
     skip_windows: tuple[str, ...] = ()  # "<time>+<horizon>" windows left out (e.g. 15:00+60m, the same trade as close)
     class_shares: dict | None = None  # {class: share of the run's modules}; checked against the modules implied
     oi_archive_sha256: str | None = None  # the frozen OCC archive copy the OI-archive features read (factory 4)
+    macro_sha256: str | None = None  # the frozen factory-macro/1 snapshot the macro features read (factory 5)
+    macro_stale_days: int = 7  # a macro value whose newest observation became known longer ago than this is None
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -556,6 +634,13 @@ class RunFile:
                 isinstance(sha, str) and len(sha) == 64 and all(c in "0123456789abcdef" for c in sha))):
             raise RunFileError("oi_archive_sha256 (64 hex) is required with, and only with, the OI-archive features "
                                f"{fo.ARCHIVE_FEATURES}")
+        macro = any(FEATURE_CLASS[f] == "macro" for f in self.features)
+        sha = self.macro_sha256
+        if macro != (sha is not None) or (sha is not None and not (
+                isinstance(sha, str) and len(sha) == 64 and all(c in "0123456789abcdef" for c in sha))):
+            raise RunFileError("macro_sha256 (64 hex) is required with, and only with, macro features")
+        if not isinstance(self.macro_stale_days, int) or not 1 <= self.macro_stale_days <= 30:
+            raise RunFileError("macro_stale_days in [1, 30]")
 
     def class_counts(self) -> dict[str, int]:
         """Modules per feature class (every family holds the same modules)."""
@@ -913,7 +998,8 @@ def features_at(session: Session, prior: Session, px: dict, prior_close: dict, b
 def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCalendar | None = None,
                cross: dict[str, dict[str, Session]] | None = None,
                events: FactoryEvents | None = None,
-               options: fo.OptionsInputs | None = None) -> tuple[dict[str, list[dict]], dict]:
+               options: fo.OptionsInputs | None = None,
+               macro: fm.MacroInputs | None = None) -> tuple[dict[str, list[dict]], dict]:
     """Point-in-time rows per family, and a coverage summary.
 
     The z history of a (feature, decision time) holds only earlier eligible
@@ -926,7 +1012,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     events were known before each decision. Flags (:data:`FLAGS`) fire on 1
     and take no z. ``options`` (:class:`analysis.factory_options.OptionsInputs`)
     supplies the options class: quotes up to T-1 minute and OI only after its
-    publication, one session at a time.
+    publication, one session at a time. ``macro`` (:class:`analysis.factory_macro.MacroInputs`) supplies the
+    macro class: each value only once its publication rule (or vintage) puts it before the decision.
     """
     days = sorted(sessions)
     cross = cross or {}
@@ -954,6 +1041,9 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     if options_wanted and (options is None or (options.gexhist is None and set(options_wanted) - set(fo.ARCHIVE_FEATURES))
                            or (options.archive is None and set(options_wanted) & set(fo.ARCHIVE_FEATURES))):
         raise RunFileError("the run's options features need the staged gexhist store (and the OCC archive copy)")
+    macro_wanted = tuple(f for f in run.features if FEATURE_CLASS[f] == "macro")
+    if macro_wanted and macro is None:
+        raise RunFileError("the run's macro features need the frozen macro snapshot")
     tape_base = {(q, t): deque(maxlen=run.tape_history) for q in TAPE_QUANTITIES for t in run.decision_times}
     minute_hist = deque(maxlen=run.tape_history)  # {hm: volume} of earlier sessions (edge8 vol_hist)
     pending_minutes = None
@@ -1050,6 +1140,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
                 raw.update(calendar_features(day, decided, following.get(day), opex, events))
             if options_wanted:
                 raw.update(options.features_at(day, session, t, decided, options_wanted))
+            if macro_wanted:
+                raw.update(macro.features_at(day, decided, macro_wanted, prior_day=prior_day))
             raw = {f: raw.get(f) for f in run.features}
             z = {f: None if f in FLAGS else robust_z(raw[f], history[(f, t)]) for f in run.features}
             for f in run.features:
@@ -1127,6 +1219,7 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
         "skip_windows": list(run.skip_windows),
         "event_calendar": events.version if events is not None else None,
         **({"options": options.coverage()} if options_wanted else {}),
+        **({"macro": macro.coverage()} if macro_wanted else {}),
         "sessions_eligible": len(eligible),
         "sessions_below_full_bars_diagnostic": len(days) - len(full_coverage),
         "full_bars_role": "retrospective coverage only; never eligibility",
@@ -1230,7 +1323,8 @@ def buckets(run: RunFile, trials: list[dict]) -> dict:
     """Every bucket of the run's tested modules: count, marginal p <= 0.05 against chance, best t and adjusted p.
 
     Buckets: class, decision time (the time-of-day dimension), horizon, feature, z rule and side, and for a run
-    with options features their measurement basis (oi-unsigned, gamma-unsigned, gamma-signed-assumed). Reported
+    with options features their measurement basis (oi-unsigned, gamma-unsigned, gamma-signed-assumed), and for a
+    run with macro features their basis (spy-bars, unrevised-latest, alfred-vintage) and group. Reported
     for every bucket, never only the good ones; trials are correlated, so chance is a rough guide, not a test."""
     keys = {
         "class": lambda t: FEATURE_CLASS[t["feature"].split("|")[0]],
@@ -1240,8 +1334,10 @@ def buckets(run: RunFile, trials: list[dict]) -> dict:
         "rule": lambda t: t["feature"].split("|")[1],
         "side": lambda t: t["feature"].split("|")[2],
     }
-    if any(FEATURE_CLASS[f] == "options" for f in run.features):
+    if any(FEATURE_CLASS[f] in ("options", "macro") for f in run.features):
         keys["basis"] = lambda t: REGISTRY[t["feature"].split("|")[0]].get("basis", FEATURE_CLASS[t["feature"].split("|")[0]])
+    if any(FEATURE_CLASS[f] == "macro" for f in run.features):
+        keys["group"] = lambda t: REGISTRY[t["feature"].split("|")[0]].get("group", FEATURE_CLASS[t["feature"].split("|")[0]])
     out = {}
     for by, key in keys.items():
         groups: dict[str, list] = {}
@@ -1429,6 +1525,22 @@ def report_markdown(rep: dict) -> str:
                        "measurement-unqualified diagnostics (#1132, #1108 open)."),
                   "", "| options input | count |", "|---|---|"]
         lines += [f"| {k} | {v} |" for k, v in opt["counts"].items()]
+    mac = rep["coverage"].get("macro")
+    if mac:
+        snap = mac["snapshot"]
+        lines += ["", (f"Macro class: snapshot {snap['schema']} (content sha256 {snap['content_sha256'][:12]}, "
+                       f"{snap['window']['first']}..{snap['window']['last']}); a value counts only when its "
+                       f"publication rule puts it before T, a revised series only through its vintages; stale "
+                       f"after {mac['stale_days']} days."),
+                  "", "| series | observations | first | last | revision | rule |", "|---|---|---|---|---|---|"]
+        for sid, m in mac["series"].items():
+            lines.append(f"| {sid} | {m['observations']} | {m['first']} | {m['last']} | {m['revision']} | "
+                         f"{m['rule'].split(';')[0]} |")
+        lines += ["", "| macro feature | decisions | value | not known | stale | history | missing | first value |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for f, c in mac["features"].items():
+            lines.append(f"| {f} | {c['decisions']} | {c['value']} | {c['not_known']} | {c['stale']} | "
+                         f"{c['history']} | {c['missing']} | {c['first_value']} |")
     lines += ["", "| feature @ time | coverage | z drift (max - min yearly median z) |", "|---|---|---|"]
     for name, f in rep["coverage"]["features"].items():
         lines.append(f"| {name} | {f['coverage_z']} | {f['z_drift']} |")
@@ -1445,11 +1557,13 @@ def open_ledger(ledger_path: Path, anchor_path: Path, genesis: str | None) -> ls
     return ledger
 
 
-def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path, oi_archive: Path | None = None) -> dict:
+def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path, oi_archive: Path | None = None,
+        macro_snapshot: Path | None = None) -> dict:
     """One factory run, declared on ``ledger`` before any data is read. Returns the report.
 
     ``oi_archive``: the frozen OCC archive copy, for runs with OI-archive features; its sha256 must equal the run
-    file's ``oi_archive_sha256`` (checked after the declaration and before it is read)."""
+    file's ``oi_archive_sha256`` (checked after the declaration and before it is read). ``macro_snapshot``: the
+    frozen factory-macro/1 snapshot, for runs with macro features, checked the same way against ``macro_sha256``."""
     body = json.loads(Path(run_file).read_text())
     spec = RunFile.from_dict(body)
     calendar = FactoryCalendar()
@@ -1459,6 +1573,8 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path, oi_archiv
     levels = fo.load_levels() if options_wanted else None  # vendored and hash-pinned; checked before declaring
     if bool(spec.oi_archive_sha256) != (oi_archive is not None):
         raise RunFileError("an OCC archive copy is passed with, and only with, a run file's oi_archive_sha256")
+    if bool(spec.macro_sha256) != (macro_snapshot is not None):
+        raise RunFileError("a macro snapshot is passed with, and only with, a run file's macro_sha256")
     manifest, manifest_sha = check_data(Path(data_dir))
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
@@ -1478,8 +1594,15 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path, oi_archiv
                 fo.OIArchive(Path(oi_archive)) if oi_archive is not None else None, levels=levels)
         bars = load_bars(Path(data_dir) / DATA_FILE, spec)
         sessions = bars.pop(spec.symbol)
+        macro = None
+        if spec.macro_sha256:
+            if sha256_file(Path(macro_snapshot)) != spec.macro_sha256:
+                raise RunFileError("the macro snapshot does not match the run file's macro_sha256")
+            macro = fm.MacroInputs(fm.MacroSnapshot(Path(macro_snapshot)),
+                                   {d: settled_close(s) for d, s in sessions.items()},
+                                   stale_days=spec.macro_stale_days)
         families, coverage = build_rows(sessions, spec, calendar=calendar, cross=bars, events=events,
-                                        options=options)
+                                        options=options, macro=macro)
         frozen = discover(protocol_for(spec), families)
         write_once(out / "discovery-frozen.json", frozen)
         cofire = cofiring(families, frozen["payload"]["ledger"], signal_name,
@@ -1515,6 +1638,7 @@ def main(argv=None) -> int:
     r.add_argument("--out", required=True, type=Path)
     r.add_argument("--genesis", metavar="LEDGER_ID", help="create the factory ledger first (once)")
     r.add_argument("--oi-archive", type=Path, help="frozen OCC archive copy (runs with OI-archive features)")
+    r.add_argument("--macro", type=Path, help="frozen factory-macro/1 snapshot (runs with macro features)")
     s = sub.add_parser("summary")
     s.add_argument("--ledger", required=True, type=Path)
     s.add_argument("--anchor", required=True, type=Path)
@@ -1524,8 +1648,8 @@ def main(argv=None) -> int:
         return 0
     try:
         ledger = open_ledger(a.ledger, a.anchor, a.genesis)
-        rep = run(a.run_file, a.data_dir, ledger, a.out, oi_archive=a.oi_archive)
-    except (RunFileError, fo.OptionsDataError) as e:
+        rep = run(a.run_file, a.data_dir, ledger, a.out, oi_archive=a.oi_archive, macro_snapshot=a.macro)
+    except (RunFileError, fo.OptionsDataError, fm.MacroDataError) as e:
         print(json.dumps({"ok": False, "refused": str(e)}))
         return 2
     print(json.dumps({"ok": True, "run_id": rep["run_id"], "trials": rep["trial_count"], "tested": rep["tested"],
