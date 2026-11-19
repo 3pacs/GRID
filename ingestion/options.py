@@ -285,6 +285,19 @@ def _regular_market_time(quote: Any, session_day: date) -> datetime | None:
         return None
     return reported
 
+
+def _page_quote_time(page: Any, session_day: date) -> datetime | None:
+    """Quote time of one provider page if it dates the page to ``session_day``.
+
+    None is the "undated quote" verdict ``_pull_ticker`` refuses a capture on.
+    ``CboeFirstOptionsClient`` asks the same question of Cboe's first page to
+    decide whether to try Yahoo, so the two can never disagree.
+    """
+    if not isinstance(page, dict):
+        return None
+    return _regular_market_time(page.get("quote"), session_day)
+
+
 # Catalyst-universe coverage (2026-09-10).
 #
 # EQUITY_TICKERS above is 41 hand-listed mega caps. Measured on 2026-09-10,
@@ -688,9 +701,16 @@ class CboeFirstOptionsClient:
 
     The provider that served a ticker's first page serves all its expiry
     pages, so a batch never mixes vendors. Yahoo is initialised lazily (its
-    crumb handshake costs two requests) and only when Cboe fails in transport
-    for a ticker; a Cboe "no listed options" answer is authoritative (Cboe
-    carries the consolidated OPRA chain) and is not retried on Yahoo.
+    crumb handshake costs two requests) and only when Cboe cannot serve a
+    ticker: Cboe fails in transport, or Cboe's first page carries a quote
+    that does not date to today's session (``_page_quote_time``). The second
+    case is Cboe's ~15 min delay at the open: at the GEM 09:38 New York
+    capture the underlying's last trade can still be the previous session's,
+    so every Cboe ticker would be refused as undated (2026-11-19: 8/8). Yahoo
+    is kept only when its first page is dated; otherwise Cboe's undated page
+    is returned and the capture is refused exactly as before. A Cboe "no
+    listed options" answer is authoritative (Cboe carries the consolidated
+    OPRA chain) and is not retried on Yahoo.
     """
 
     is_available = True
@@ -725,8 +745,29 @@ class CboeFirstOptionsClient:
                 log.info("{t}: Cboe chain unavailable, falling back to Yahoo", t=ticker)
                 self._active = yahoo
                 first = yahoo.get_options(ticker)
+        elif first is not NO_CHAIN:
+            # Same session day _pull_ticker dates pages against (it refuses a
+            # capture whose UTC and New York dates differ).
+            session_day = _utc_now().astimezone(_EQUITY_TZ).date()
+            if _page_quote_time(first, session_day) is None:
+                first = self._fresher_yahoo_first_page(ticker, first, session_day)
         self.provider_by_ticker[ticker] = getattr(self._active, "provider", "yahoo")
         return first
+
+    def _fresher_yahoo_first_page(self, ticker: str, cboe_first: Any, session_day: date) -> Any:
+        """Yahoo's first page if it dates to ``session_day``, else Cboe's."""
+        yahoo = self._fallback()
+        if yahoo is None:
+            return cboe_first
+        log.info("{t}: Cboe quote not dated to today's session (delayed feed), trying Yahoo", t=ticker)
+        page = yahoo.get_options(ticker)
+        if page and _page_quote_time(page, session_day) is not None:
+            self._active = yahoo
+            return page
+        # Yahoo failed, has no chain, or is undated too: keep Cboe's answer so
+        # the capture is refused as undated, exactly as without the retry.
+        log.info("{t}: Yahoo did not serve a dated chain either; keeping Cboe", t=ticker)
+        return cboe_first
 
 
 class OptionsPuller(BasePuller):
@@ -1057,7 +1098,7 @@ class OptionsPuller(BasePuller):
                     complete = False
                     failed_fetches += 1
                     continue
-                provider_regular_market_at = _regular_market_time(chain_data.get("quote"), session_day)
+                provider_regular_market_at = _page_quote_time(chain_data, session_day)
                 if provider_regular_market_at is None:
                     complete = False
                     undated_quotes += 1
