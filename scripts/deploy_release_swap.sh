@@ -455,6 +455,17 @@ refresh_runtime_release_dirs() {
         ExecMainPID) exec_pid="$value" ;;
       esac
     done <<< "$details"
+    # A retired unit whose file is gone but which another unit still names
+    # (After=/Before=) stays listed by list-units --all as not-found. With no
+    # process, no cgroup, no working directory and inactive/dead it has no
+    # runtime and nothing to protect (2026-11-19: grid-llamacpp.service, named
+    # by grid-hermes.service's After=, failed every deploy). Anything else that
+    # is not loaded -- including a not-found unit still running -- stays ambiguous.
+    if [ "$load" = not-found ] && [ "$pid" = 0 ] && [ "$exec_pid" = 0 ] &&
+       [ "$cgroup_seen" = 1 ] && [ -z "$cgroup" ] && [ "$workdir_seen" = 1 ] && [ -z "$workdir" ] &&
+       [ "$state" = inactive ] && [ "$substate" = dead ]; then
+      continue
+    fi
     if [ "$load" != loaded ] || [[ ! "$pid" =~ ^[0-9]+$ ]] ||
        [ "$workdir_seen" != 1 ] || [ "$cgroup_seen" != 1 ] || [ -z "$state" ] ||
        [ -z "$substate" ] || [ -z "$type" ] || [[ ! "$remain" =~ ^(yes|no)$ ]] ||
