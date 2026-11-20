@@ -330,6 +330,17 @@ def test_generate_briefing_withholds_hedging_claim_before_persistence(
     monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
     monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
 
+    # Assembly timestamps are not financial claims. A real timestamp containing
+    # 38.960504 made the literal "8.96" leak assertion fail intermittently in CI.
+    # Pin only this test's clock; retain all numeric and persistence assertions.
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = cls(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+            return fixed.replace(tzinfo=None) if tz is None else fixed.astimezone(tz)
+
+    monkeypatch.setattr("ollama.market_briefing.datetime", FixedDateTime)
+
     class RecordingConnection(_FakeConnection):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
