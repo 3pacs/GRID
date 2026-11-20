@@ -100,16 +100,31 @@ NO_CHAIN = _NoChain()
 
 
 class OptionsSourceAccessDenied(Exception):
-    """Explicit HTTP refusal, not a diagnosis of its cause or optionability.
+    """The options source refused us; not a diagnosis of optionability.
 
-    The provider may conceal a missing/unsupported symbol behind 403. That
-    ambiguity is not proof of no listed options or permission to fall back.
+    Raised only on evidence of a refusal (``_is_access_denial``): any 401, or
+    a 403 for a hand-listed known-optionable ticker. Cboe's CDN also answers
+    403 for symbols with no listed options, so a 403 for any other symbol is
+    ``NO_CHAIN``, not a denial.
     """
 
     def __init__(self, provider: str, http_status: int) -> None:
         self.provider = provider
         self.http_status = http_status
         super().__init__(f"{provider} access denied (HTTP {http_status})")
+
+
+def _is_access_denial(ticker: str, http_status: int) -> bool:
+    """True when ``http_status`` for ``ticker`` means the source refused us.
+
+    401 always does. 403 does only for a hand-listed ``EQUITY_TICKERS`` name
+    (e.g. SPY): those are known optionable, so a 403 there cannot mean "no
+    listed options". For any other symbol Cboe's 403 is its routine answer
+    for a symbol without a chain.
+    """
+    if http_status == 401:
+        return True
+    return http_status == 403 and ticker in EQUITY_TICKERS
 
 
 def _no_options_cached(ticker: str) -> bool:
@@ -685,13 +700,17 @@ class CboeOptionsClient:
         except Exception as exc:  # noqa: BLE001 -- transport failure, caller may fall back
             log.warning("Cboe options {t}: {kind}", t=ticker, kind=type(exc).__name__)
             return None
-        if resp.status_code in (401, 403):
-            # A refusal does not prove this symbol has no listed options.
-            # Latch for this client/run; do not retry another symbol, serve
-            # cached pages or turn an explicit denial into a vendor fallback.
+        if _is_access_denial(ticker, resp.status_code):
+            # Evidence that Cboe is refusing us, not that the symbol lacks a
+            # chain. Latch for this client/run; do not retry another symbol,
+            # serve cached pages or turn the denial into a vendor fallback.
             self._denied_status = resp.status_code
             raise OptionsSourceAccessDenied(self.provider, resp.status_code)
-        if resp.status_code == 404:
+        if resp.status_code in (403, 404):
+            # Cboe's CDN answers S3 AccessDenied (403) for a document symbol
+            # with no listed options (verified 2026-11-06 on ZZZZQ, and on
+            # BRK-B/BRKB in place of BRK.B); about 35 catalyst names hit it a
+            # run. Only a known-optionable name turns 403 into a denial, above.
             log.debug("Cboe options {t}: HTTP {s} (no chain)", t=ticker, s=resp.status_code)
             return NO_CHAIN
         if resp.status_code != 200:
@@ -734,7 +753,8 @@ class CboeFirstOptionsClient:
     is returned and the capture is refused exactly as before. A Cboe "no
     listed options" answer is authoritative (Cboe carries the consolidated
     OPRA chain) and is not retried on Yahoo.
-    Explicit 401/403 access denials propagate instead of invoking fallback.
+    Explicit access denials (see ``CboeOptionsClient.get_options``) propagate
+    instead of invoking fallback.
     """
 
     is_available = True

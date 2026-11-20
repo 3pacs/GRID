@@ -530,10 +530,13 @@ def test_clock_metadata_does_not_reinterpret_unexpected_raw_clock_types():
     assert chain["quote"]["clockMetadata"]["synchronization"] == "unknown"
 
 
-@pytest.mark.parametrize("status", [401, 403])
-def test_access_denial_is_latched_without_fallback(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+@pytest.mark.parametrize(("status", "first"), [(401, "NUOX"), (403, "SPY")])
+def test_access_denial_is_latched_without_fallback(
+    monkeypatch: pytest.MonkeyPatch, status: int, first: str,
+) -> None:
+    # 401 is a denial for any symbol; 403 only for a known-optionable one.
     client, made = _composite(monkeypatch, _Resp(status))
-    for ticker, expiry in [("NUOX", None), ("KO", None), ("NUOX", NOV06)]:
+    for ticker, expiry in [(first, None), ("KO", None), ("NUOX", NOV06)]:
         with pytest.raises(options.OptionsSourceAccessDenied) as caught:
             client.get_options(ticker, expiry)
         assert caught.value.provider == "cboe"
@@ -613,13 +616,14 @@ def test_denial_never_serves_a_previously_cached_chain(status: int) -> None:
     assert len(session.urls) == 2
 
 
-@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("status", [401])
 def test_catalyst_tail_refusal_keeps_complete_core_partial_on_each_new_run(
     monkeypatch: pytest.MonkeyPatch, status: int,
 ) -> None:
     # One representative core ticker, then the actual default-universe
-    # assembly path (not an explicit tickers override). A symbol possibly
-    # hidden behind 403 is deliberately NOT treated as confirmed absent.
+    # assembly path (not an explicit tickers override). A 401 on a catalyst
+    # name is a refusal, not an absent chain. (A 403 there is Cboe's routine
+    # optionless answer: see the test below.)
     monkeypatch.delenv("GRID_OPTIONS_PRIMARY_PROVIDER", raising=False)
     monkeypatch.setattr(options, "EQUITY_TICKERS", ["KO"])
     monkeypatch.setattr(options, "_NO_OPTIONS_UNTIL", {})
@@ -662,3 +666,40 @@ def test_catalyst_tail_refusal_keeps_complete_core_partial_on_each_new_run(
         assert len(puller.engine.rows) == run * 7
         assert puller.engine.batches[:len(prior_batches)] == prior_batches
     assert universe_calls == [True, True]
+
+
+def test_cboe_403_for_unlisted_symbol_is_no_chain_and_does_not_latch() -> None:
+    # Cboe's CDN answers 403 for symbols with no listed options; only a 403
+    # for a hand-listed known-optionable ticker is a refusal.
+    session = _Session(_Resp(403), _Resp(200, _doc()))
+    client = options.CboeOptionsClient(session=session)
+    assert client.get_options("NUOX") is options.NO_CHAIN
+    assert client.get_options("KO") is not None  # the next symbol is still requested
+    assert [url.rsplit("/", 1)[-1] for url in session.urls] == ["NUOX.json", "KO.json"]
+
+
+def test_routine_403_in_catalyst_tail_does_not_stop_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The default run reaches ~35 optionless catalyst names a run; their 403s
+    # must not end the run or withhold the rest of the tail.
+    monkeypatch.delenv("GRID_OPTIONS_PRIMARY_PROVIDER", raising=False)
+    monkeypatch.setattr(options, "EQUITY_TICKERS", ["KO"])
+    monkeypatch.setattr(options, "_NO_OPTIONS_UNTIL", {})
+    puller = options.OptionsPuller.__new__(options.OptionsPuller)
+    puller.engine = _DB()
+    monkeypatch.setattr(options, "catalyst_options_universe",
+                        lambda *_a, **_kw: ["NUOX", "VXRT"])
+    client, made = _composite(monkeypatch, _Resp(200, _doc()), _Resp(403), _Resp(403))
+    monkeypatch.setattr(options, "CboeFirstOptionsClient", lambda: client)
+    monkeypatch.setattr(options.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(puller, "_push_to_resolved", lambda *_a, **_kw: 0)
+
+    results = puller.pull_all()
+
+    assert [r["ticker"] for r in results] == ["KO", "NUOX", "VXRT"]
+    assert results[0]["status"] == "SUCCESS"
+    for r in results[1:]:
+        assert r["status"] == "NO_NEW_DATA" and r["no_options"] is True
+    assert [url.rsplit("/", 1)[-1] for url in client.cboe.session.urls] == ["KO.json", "NUOX.json", "VXRT.json"]
+    assert "access denied" not in (results.summary.get("error") or "")
+    assert results.summary["tickers_no_options"] == 2
+    assert made == []  # an optionless answer is authoritative; no Yahoo retry
