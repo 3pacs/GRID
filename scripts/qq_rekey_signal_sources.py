@@ -95,7 +95,7 @@ re-keyed rows involved (``in_extractor_window``); ``--before`` leaves them out o
 Usage (grid-svr; see the PR for the run procedure)
 --------------------------------------------------
     cd /data/grid_v4/grid_release
-    set -a; . /home/grid/grid_v4/grid_repo/.env; set +a
+    set -a; . /etc/grid/grid.env; set +a
     PY=/home/grid/grid_v4/venv/bin/python
     $PY -m scripts.qq_rekey_signal_sources                                    # dry run
     $PY -m scripts.qq_rekey_signal_sources --apply --before <today-45d> \\

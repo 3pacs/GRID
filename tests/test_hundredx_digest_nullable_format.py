@@ -181,6 +181,7 @@ def _stub_llm(monkeypatch, verdicts: str):
 
 def _run_digest_with(monkeypatch, opportunities):
     """Drive ``run_100x_digest`` with scanner/DB/yfinance/email stubbed out."""
+    monkeypatch.setattr(hx, "_digest_paused", lambda: None)
     import discovery.options_scanner as scanner_mod
 
     class _Scanner:

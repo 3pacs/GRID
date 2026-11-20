@@ -18,10 +18,27 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+import numpy as np
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 
 from api.auth import require_auth
+
+
+def _increments(series: pd.Series) -> pd.Series:
+    """Hurst is estimated on increments, not levels.
+
+    R/S on a price *level* returns H close to 1 for any random walk, so the
+    API reported every series as "trending". Positive series use log returns
+    (as features/lab.py does); series that cross zero (spreads) use first
+    differences.
+    """
+    s = series.astype(float).dropna()
+    if (s > 0).all():
+        return np.log(s).diff().dropna()
+    return s.diff().dropna()
+
 
 router = APIRouter(
     prefix="/api/v1/physics",
@@ -136,13 +153,17 @@ def ou_parameters(
     and half-life in trading days.
     """
     from db import get_engine
-    from features.lab import FeatureLab
+    from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS, FeatureLab
     from physics.transforms import estimate_ou_parameters
     from store.pit import PITStore
 
     engine = get_engine()
     pit = PITStore(engine)
-    lab = FeatureLab(engine, pit)
+    lab = FeatureLab(
+        engine, pit,
+        max_input_age_days=DEFAULT_INPUT_MAX_AGE_DAYS,
+        input_age_overrides=DEFAULT_INPUT_AGE_OVERRIDES,
+    )
 
     series = lab._get_pit_series(feature, date.today(), lookback_days=window * 2)
     if series is None or len(series) < 30:
@@ -168,13 +189,17 @@ def hurst(
     H < 0.5: mean-reverting, H = 0.5: random walk, H > 0.5: trending.
     """
     from db import get_engine
-    from features.lab import FeatureLab
+    from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS, FeatureLab
     from physics.transforms import hurst_exponent
     from store.pit import PITStore
 
     engine = get_engine()
     pit = PITStore(engine)
-    lab = FeatureLab(engine, pit)
+    lab = FeatureLab(
+        engine, pit,
+        max_input_age_days=DEFAULT_INPUT_MAX_AGE_DAYS,
+        input_age_overrides=DEFAULT_INPUT_AGE_OVERRIDES,
+    )
 
     series = lab._get_pit_series(feature, date.today(), lookback_days=504)
     if series is None or len(series) < 50:
@@ -183,7 +208,7 @@ def hurst(
             detail=f"Insufficient data for feature '{feature}'",
         )
 
-    h = hurst_exponent(series, max_lag)
+    h = hurst_exponent(_increments(series), max_lag)
     interpretation = "random walk"
     if h < 0.45:
         interpretation = "mean-reverting"
@@ -206,13 +231,17 @@ def energy_decomposition(
 ) -> dict[str, Any]:
     """Compute kinetic/potential/total energy decomposition for a feature."""
     from db import get_engine
-    from features.lab import FeatureLab
+    from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS, FeatureLab
     from physics.transforms import kinetic_energy, potential_energy, total_energy
     from store.pit import PITStore
 
     engine = get_engine()
     pit = PITStore(engine)
-    lab = FeatureLab(engine, pit)
+    lab = FeatureLab(
+        engine, pit,
+        max_input_age_days=DEFAULT_INPUT_MAX_AGE_DAYS,
+        input_age_overrides=DEFAULT_INPUT_AGE_OVERRIDES,
+    )
 
     series = lab._get_pit_series(feature, date.today(), lookback_days=long_window * 2)
     if series is None or len(series) < long_window:
@@ -288,7 +317,7 @@ def physics_dashboard(
         as_of: Decision date in ISO format (default today).
     """
     from db import get_engine
-    from features.lab import FeatureLab
+    from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS, FeatureLab
     from physics.news_energy import NewsEnergyEngine
     from physics.transforms import (
         estimate_ou_parameters,
@@ -302,10 +331,16 @@ def physics_dashboard(
 
     engine = get_engine()
     pit = PITStore(engine)
-    lab = FeatureLab(engine, pit)
+    lab = FeatureLab(
+        engine, pit,
+        max_input_age_days=DEFAULT_INPUT_MAX_AGE_DAYS,
+        input_age_overrides=DEFAULT_INPUT_AGE_OVERRIDES,
+    )
 
     # Key market features to profile
-    key_features = ["sp500", "vix", "us_treasury_10y", "us_treasury_2y", "dxy_index"]
+    # Registered names entity_map writes (sp500/vix stopped 2026-03/04;
+    # us_treasury_10y/us_treasury_2y were never registered).
+    key_features = ["sp500_full", "vix_spot", "treasury_10y", "yc_2y", "dxy_index"]
 
     # 1. Market energy state
     market_energy: dict[str, Any] = {}
@@ -346,7 +381,7 @@ def physics_dashboard(
             hurst_results[feat_name] = {"hurst": None, "interpretation": "insufficient_data"}
             continue
 
-        h = hurst_exponent(series, max_lag=100)
+        h = hurst_exponent(_increments(series), max_lag=100)
         if h != h:  # NaN check
             hurst_results[feat_name] = {"hurst": None, "interpretation": "computation_failed"}
         else:

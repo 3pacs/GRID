@@ -15,10 +15,13 @@ Opportunities scoring >= 7/10 with potential payoff >= 100x are flagged.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
@@ -34,15 +37,16 @@ def _nullable_float(value: Any) -> float | None:
     whole scan down with it. NaN is treated as missing too — pandas/numpy
     aggregations upstream produce NaN for an empty slice, and a NaN in a
     DOUBLE PRECISION column reads back as a number that fails every
-    comparison. Both become NULL, which is what "we do not have this" means.
+    comparison. Nonfinite values and booleans become NULL, which is what "we do not have
+    this measurement" means.
     """
-    if value is None:
+    if value is None or isinstance(value, (bool, np.bool_)):
         return None
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if out != out:  # NaN
+    if not math.isfinite(out):  # NaN and infinities are not measurements
         return None
     return out
 

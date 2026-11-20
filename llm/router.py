@@ -51,13 +51,18 @@ class Tier(str, Enum):
              (news sentiment, tagging) on a small fast model; primary is
              threadripper's 8–14B llama-server (``llamacpp_threadripper``)
     REASON — analysis, synthesis, regime detection, postmortems
-    ORACLE — debates, high-stakes signals, sleuth investigations
+    ORACLE — debates, high-stakes signals
+    RESEARCH — the research desk: Sleuth investigations, the research agent,
+             postmortems, backtest review. Primary is x99-hex's 27B
+             (``llamacpp_x99``, 2 slots), so it stays off the 3090's single
+             oracle slot (plan item 0.2, 2026-11-09)
     DEFAULT — alias for REASON (backwards compat during migration)
     """
     LOCAL = "local"
     QUICK = "quick"
     REASON = "reason"
     ORACLE = "oracle"
+    RESEARCH = "research"
     BATCH = "batch"
     DEFAULT = "reason"  # alias — existing get_llm() calls keep working
 
@@ -193,6 +198,37 @@ def _build_client(provider: str) -> Any:
     return client
 
 
+def get_provider_client(provider: str) -> Any | None:
+    """Return the client for exactly ``provider``, or ``None`` — never a fallback.
+
+    ``get_llm(provider=...)`` walks the tier's fallback chain when the named
+    provider is down, so its caller cannot tell which node answered. A caller
+    that spreads work over several nodes itself (the LLM task queue's
+    background rotation) needs the opposite: this node or nothing, so it can
+    move on to the next node in its own list.
+
+    Shares ``get_llm``'s client cache and refusal cooldown, so a dark node
+    costs one connect timeout per ``LLM_PROVIDER_COOLDOWN_SECONDS``.
+
+    Args:
+        provider: Router provider name (``llamacpp``, ``llamacpp_x99``, ...).
+
+    Returns:
+        An available client, or ``None`` when the provider is disabled,
+        unconfigured, cooling down, or failed its health probe.
+    """
+    if _provider_in_backoff(provider):
+        return None
+    cached = _client_cache.get(provider)
+    if cached is not None and getattr(cached, "is_available", True):
+        return cached
+    client = _build_client(provider)
+    if client is not None and getattr(client, "is_available", False):
+        _client_cache[provider] = client
+        return client
+    return None
+
+
 # (provider, fallback) pairs already warned in this process. A dead primary
 # (LLM_LOCAL_PROVIDER=llamacpp_quick pointing at a retired host) made every
 # get_llm() call log "LLM provider ... unavailable, falling back to ..."
@@ -296,6 +332,12 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     elif tier == Tier.ORACLE:
         chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "llamacpp_x99",
                  "gemini", "openrouter", "openai"]
+    elif tier == Tier.RESEARCH:
+        # x99-hex first (idle 2-slot 27B, measured 22 tok/s from grid-svr
+        # 2026-11-09), then the gridz4 proxy; the 3090 is the last local
+        # choice so research never queues ahead of the oracle.
+        chain = ["llamacpp_x99", "llamacpp", "llamacpp_z4", "llamacpp_oracle", "ollama",
+                 "gemini", "openrouter", "openai"]
     elif tier == Tier.BATCH:
         chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "gemini", "openrouter", "openai"]
     else:
@@ -340,6 +382,8 @@ def get_llm(
         elif tier == Tier.ORACLE:
             provider = getattr(settings, "LLM_ORACLE_PROVIDER", None) \
                 or getattr(settings, "LLM_DEEP_PROVIDER", "openrouter")
+        elif tier == Tier.RESEARCH:
+            provider = getattr(settings, "LLM_RESEARCH_PROVIDER", None) or "llamacpp_x99"
         elif tier == Tier.BATCH:
             provider = getattr(settings, "LLM_BATCH_PROVIDER", None) or "llamacpp_batch"
         else:

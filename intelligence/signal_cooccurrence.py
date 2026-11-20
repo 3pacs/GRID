@@ -48,7 +48,7 @@ key unique and cuts storage in half.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from typing import Any
 
@@ -69,6 +69,21 @@ MIN_LIFT_MULTIPLIER: float = 0.75
 """Hard floor on redundancy penalty."""
 
 COOCCURRENCE_MIN_SHAPLEY: float = 0.1
+# Pair stats not updated within this many days are treated as uncalibrated.
+# Nothing in production refreshes signal_cooccurrence_history: its 490 rows
+# were written by one bootstrap on 2026-05-17, and that frozen lift still moved
+# live conviction by up to +/-25% six months later (2026-11-11). A stale pair
+# now contributes nothing until a refresh lands.
+COOCCURRENCE_MAX_STALE_DAYS: int = 30
+
+
+def _is_fresh(stats: "CooccurrenceStats", now: datetime) -> bool:
+    ts = stats.last_updated
+    if ts is None:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return now - ts <= timedelta(days=COOCCURRENCE_MAX_STALE_DAYS)
 """A signal must contribute at least 10% of the Shapley weight to
 count as 'firing' for co-occurrence tracking."""
 
@@ -572,7 +587,8 @@ def get_lift_multiplier(
 
     1. Filters ``signal_contributions`` to the firing set via
        :func:`get_firing_signals`.
-    2. Looks up every pair's calibrated stats from the DB.
+    2. Looks up every pair's calibrated stats from the DB, ignoring pairs
+       not updated within ``COOCCURRENCE_MAX_STALE_DAYS``.
     3. Averages lift across calibrated pairs using
        :func:`compute_pair_lift_multiplier`.
 
@@ -585,13 +601,24 @@ def get_lift_multiplier(
         if len(firing) < 2:
             return 1.0
 
+        now = datetime.now(timezone.utc)
         stats_lookup: dict[SignalPair, CooccurrenceStats] = {}
+        stale = 0
         for a, b in combinations(sorted(firing), 2):
             if a == b:
                 continue
             stats = get_cooccurrence_stats(engine, a, b)
-            if stats is not None:
-                stats_lookup[stats.pair] = stats
+            if stats is None:
+                continue
+            if not _is_fresh(stats, now):
+                stale += 1
+                continue
+            stats_lookup[stats.pair] = stats
+        if stale and not stats_lookup:
+            log.debug(
+                "get_lift_multiplier: {n} pair(s) older than {d}d ignored; neutral 1.0",
+                n=stale, d=COOCCURRENCE_MAX_STALE_DAYS,
+            )
 
         return compute_pair_lift_multiplier(firing, stats_lookup)
     except Exception as exc:

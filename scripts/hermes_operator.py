@@ -194,6 +194,11 @@ ORACLE_CYCLE_TIMEOUT_SECONDS = 4000           # oracle.run_cycle: 41 tickers x ~
 # Admission reserve for timeout/report bookkeeping and cycle cleanup. Do not
 # shrink the oracle's quality budget to fit a cycle delayed by ingestion.
 ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS = 300
+# The initial measured cohort is two liquid tickers, without model evolution.
+# Its own bound does not reduce the broad Oracle API's historical budget.
+ORACLE_FORWARD_TIMEOUT_SECONDS = 300
+ORACLE_FORWARD_TICKERS = ("SPY", "QQQ")
+ORACLE_FORWARD_ATTEMPT_NOTE = "oracle_forward_v2:SPY_QQQ:1d:attempt;evolution_held"
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
@@ -228,6 +233,21 @@ DAILY_INTEL_BATCH_OBSERVED_S = 360            # HISTORICAL — observed run leng
 INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget plus the daily-intel block's own per-cycle budget (plus headroom for the earnings-sync bookkeeping ahead of both) exceeds this cap, the step times out before the daily block ever gets a turn. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward, and — after the 2026-09-10 raise — the still-unbounded daily block re-created the same starvation one level down (fable-daily-intel-resumable, 2026-09-20: the block itself, not just the scorer, could run unbounded and get orphaned mid-list every cycle after 02:00Z). The per-task/per-cycle budgets on DAILY_INTEL_TASKS + DAILY_INTEL_CYCLE_BUDGET_SECONDS below fix that. tests/test_hermes_timeout_budgets.py pins the invariant.
 SECTOR_HEALTH_TIMEOUT_SECONDS = 120           # whole sector-health snapshot step (scripts/hermes_operator.py::_run_sector_health_step), split out of run_intelligence_tasks on 2026-09-19 into its own dispatch with its own timeout. Observed run time for ~20 sectors is 3-8s; 120s is generous headroom, not a sized budget like INTELLIGENCE_TASKS_TIMEOUT_SECONDS above. Deliberately independent of that 900s budget: production traces show intelligence_tasks times out on essentially every cycle (the daily block runs with catch_up=True every cycle, so it never reaches state.last_daily_intel = now, and the sector-health call used to run AFTER that point — i.e. never). Giving this step its own short timeout, dispatched before intelligence_tasks, makes it reachable regardless of whether intelligence_tasks times out. See docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md ("Parent-timeout blocker and own-step fix").
 POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
+
+# Trust cycle: its own run_cycle step since 2026-11-18. It used to run
+# inside intelligence_tasks, ahead of the daily-intel block. On grid-svr a
+# full cycle took ~39 min (propagating ~13.6k sources, ~1M signal_sources
+# rows, twice), so the 900 s step timed out on every 4-hourly trust cycle.
+# On 2026-11-18 that starved the daily-intel block for the whole 02:00Z
+# night. state.last_trust_cycle was only set after the orphaned worker
+# finished, so the next cycle started a second trust cycle beside it.
+# See _run_trust_cycle_step for the step's rules.
+# tests/test_hermes_timeout_budgets.py pins
+# TRUST_CYCLE_BUDGET_SECONDS + TRUST_CYCLE_TAIL_SECONDS <= TRUST_CYCLE_TIMEOUT_SECONDS < CYCLE_TIMEOUT_SECONDS.
+TRUST_CYCLE_INTERVAL_HOURS = 4
+TRUST_CYCLE_BUDGET_SECONDS = 480              # cooperative: propagation stops between sources once a pass has run this long, then the next cycle resumes it
+TRUST_CYCLE_TAIL_SECONDS = 300                # work that cannot stop at the budget: the source being written, then convergence + the report's LLM narrative on the final pass
+TRUST_CYCLE_TIMEOUT_SECONDS = 780             # hard cap for the trust_cycle step
 
 # Active-hypothesis scoring — periodic batch that closes the loop on the
 # auto_discover() pipeline. The bottleneck is per-row score_hypothesis()
@@ -319,7 +339,28 @@ DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_ma
 #   default; raising it without evidence is exactly what the controller
 #   said not to do, so it stays at 60s.
 DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S = 90
-DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S
+# 2026-11-17 amendment (hermes-late-task-budgets): the "UNCHANGED at 60s"
+# note on fundamental_divergence above is superseded. journalctl on grid-svr
+# shows both tasks timing out at 60 s and finishing as done_late EVERY night
+# (11-16 and 11-17; each timeout also blacklists the step for 24h):
+#   corporate_actions       ~103 s (11-16), ~104 s (11-17) — SEC filing fetch
+#                           for ~83 tickers, network-bound, stable run to run.
+#   fundamental_divergence  ~128 s (11-16), ~217 s (11-17) — ~1,121 rows
+#                           written; the 11-17 run overlapped other tasks.
+# The worker survives the wrapper timeout and completes, so the 60 s cap
+# only abandons a healthy worker (it keeps its DB connection and competes
+# with the next tasks). Sized ~1.45x the slowest observation each; the
+# cycle budget DAILY_INTEL_CYCLE_BUDGET_SECONDS is deliberately unchanged.
+DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S = 150
+DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = 300
+# gdelt_bulk_events: downloads GDELT 2.0 15-minute export files (~0.2 s each
+# measured from grid-svr 2026-11-16) and stops itself between files after
+# ingestion.altdata.gdelt_bulk.DAILY_BUDGET_SECONDS (100 s); 20 s headroom.
+DAILY_INTEL_GDELT_BULK_BUDGET_S = 120
+# gdelt_gkg_daily: GDELT 2.0 GKG files (~4.6 MB each on a weekday, 2026-11-13)
+# stop between files after ingestion.altdata.gdelt_bulk.GKG_DAILY_BUDGET_SECONDS
+# (100 s); 20 s headroom.
+DAILY_INTEL_GDELT_GKG_BUDGET_S = 120
 
 # Sector health snapshot — daily due-period scheduling (2026-09-19). Was
 # "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
@@ -471,6 +512,177 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         state.cooldowns.record_attempt(name, success=False, error=str(exc))
         ex.shutdown(wait=False, cancel_futures=True)
         return None, False
+
+
+def _oracle_forward_regular_session(now: datetime) -> bool:
+    """Only the actual NY cash session, including holiday early closes."""
+    from datetime import time as wall_time
+    from zoneinfo import ZoneInfo
+    from ingestion.market_calendar import is_market_open, market_close_time
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        return False
+    local = now.astimezone(ZoneInfo("America/New_York"))
+    return (is_market_open(local.date())
+            and wall_time(9, 30) <= local.time() < market_close_time(local.date()))
+
+
+def _run_oracle_forward_pass(engine: Any, *, should_continue: Callable[[], bool]) -> dict[str, Any]:
+    """Existing Oracle measurement, serialized and throttled across restarts.
+
+    The durable iteration row records an attempt, never success. The session
+    advisory lock stays owned by this worker even if the outer wait times out;
+    cooperative checks prevent an abandoned worker from starting later stages.
+    """
+    from ingestion.options import OptionsPuller, automatic_options_capture_guard
+    from oracle.engine import OracleEngine
+
+    started = datetime.now(timezone.utc)
+    policy = {"mode": "forward_measurement", "tickers": list(ORACLE_FORWARD_TICKERS),
+              "horizon_days": 1, "evolution": "held", "model_inference": "not_requested"}
+
+    def check():
+        if (not should_continue()
+                or not _oracle_forward_regular_session(datetime.now(timezone.utc))):
+            raise TimeoutError("Forward measurement deadline elapsed or equity session closed")
+
+    check()
+    oracle = OracleEngine(db_engine=engine)
+    with engine.connect() as lease:
+        locked = lease.execute(text(
+            "SELECT pg_try_advisory_lock(hashtext('oracle_forward_v2'), hashtext('SPY_QQQ_1d'))"
+        )).scalar_one()
+        if not locked:
+            return {"status": "deferred", "reason": "forward_pass_in_flight", **policy}
+        try:
+            last = lease.execute(text("""
+                SELECT MAX(iteration_at) FROM oracle_iterations WHERE notes = :note
+            """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE}).scalar_one()
+            lease.commit()  # Session lock remains held across this commit.
+            check()
+            if last is not None and (datetime.now(timezone.utc) - last).total_seconds() < 3600:
+                return {"status": "deferred", "reason": "hourly_attempt_already_recorded", **policy}
+            # Commit the attempt before any provider request; retries/restarts
+            # cannot turn an unsuccessful attempt into repeated hourly work.
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO oracle_iterations
+                    (iteration_at, models_updated, predictions_scored, notes)
+                    VALUES (clock_timestamp(), 0, 0, :note)
+                """), {"note": ORACLE_FORWARD_ATTEMPT_NOTE})
+            check()
+            scoring = oracle.score_expired_predictions()
+            check()
+            guarded = automatic_options_capture_guard(engine)
+            if guarded is not None:
+                return {"status": "deferred", "reason": "options_writer_policy",
+                        "scoring": scoring, **policy}
+            capture = OptionsPuller(db_engine=engine).pull_all(
+                list(ORACLE_FORWARD_TICKERS), capture_source="oracle_forward",
+                should_continue=should_continue,
+            )
+            check()
+            captured = [ticker for ticker in ORACLE_FORWARD_TICKERS
+                        if any(row.get("ticker") == ticker and row.get("status") == "SUCCESS"
+                               for row in capture)]
+            if not captured:
+                return {"status": "abstained", "reason": "no_fresh_cohort_capture",
+                        "new_predictions": 0, "scoring": scoring, **policy}
+            # No run_cycle/evolve_weights/ModelEvolver/TraceEvolver or fresh
+            # TimesFM inference in this initial observation-only cohort.
+            predictions = oracle.generate_predictions(
+                captured, horizon_days=1, should_continue=should_continue,
+            )
+            check()
+            counts = oracle._last_store_counts
+            result = {
+                **policy,
+                "status": ("partial" if len(captured) < len(ORACLE_FORWARD_TICKERS)
+                           or counts.get("failed_tickers", 0) else "completed"),
+                "cycle_started_at": started.isoformat(),
+                "cycle_completed_at": datetime.now(timezone.utc).isoformat(),
+                "scoring": scoring, "evolution": {"mode": "held", "changes": {}},
+                "trace_evolution": {"mode": "held"},
+                "new_predictions": len(predictions),
+                "distinct_positions_written": counts.get("qualified", 0),
+                "new_abstentions": counts.get("abstentions", 0),
+                "new_record_rows": counts.get("inserted", 0),
+                "duplicates": counts.get("duplicates", 0),
+                "unchanged_forecasts": counts.get("duplicates", 0),
+                "rejected": counts.get("rejected", 0),
+                "rejected_models": counts.get("rejected", 0),
+                "failed_tickers": counts.get("failed_tickers", 0),
+                "positions_updated": counts.get("updated", 0),
+                "upsert_statements": counts.get("upsert_statements", 0),
+                "captured_tickers": captured,
+                "top_predictions": [p.to_dict() for p in predictions[:10]],
+                "leaderboard": oracle._get_leaderboard(),
+                "hallucination_guard": {},
+            }
+            return result
+        finally:
+            # Roll back any failed catalogue read before releasing the session
+            # lock; returning a locked connection to the pool would leak it.
+            lease.rollback()
+            lease.execute(text(
+                "SELECT pg_advisory_unlock(hashtext('oracle_forward_v2'), hashtext('SPY_QQQ_1d'))"
+            ))
+            lease.commit()
+
+
+def _run_oracle_forward_step(
+    engine: Any, state: OperatorState, dry_run: bool,
+    cycle_result: dict[str, Any], cycle_deadline: float,
+) -> None:
+    """Hourly regular-session admission in the existing Hermes Oracle slot."""
+    now = datetime.now(timezone.utc)
+    if not _oracle_forward_regular_session(now):
+        cycle_result["oracle"] = {"status": "deferred", "reason": "regular_session_closed"}
+        return
+    if state.last_oracle_cycle is not None and (now - state.last_oracle_cycle).total_seconds() < 3600:
+        cycle_result["oracle"] = {"status": "deferred", "reason": "hourly_cadence"}
+        return
+    if not state.cooldowns.can_retry("oracle_cycle"):
+        cycle_result["oracle"] = {"status": "deferred", "reason": "timeout_or_failure_cooldown"}
+        return
+    budget_left = cycle_deadline - time.monotonic()
+    needed = ORACLE_FORWARD_TIMEOUT_SECONDS + ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS
+    if budget_left < needed:
+        cycle_result["oracle"] = {"status": "deferred", "reason": "insufficient_cycle_budget",
+                                  "budget_left_s": round(budget_left, 1), "required_s": needed}
+        return
+    if dry_run:
+        cycle_result["oracle"] = {"status": "deferred", "reason": "dry_run"}
+        return
+    state.current_step = "oracle_cycle"
+    state.last_oracle_cycle = now
+    cancelled = threading.Event()
+    deadline = min(cycle_deadline - ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS,
+                   time.monotonic() + ORACLE_FORWARD_TIMEOUT_SECONDS)
+
+    def should_continue():
+        return (not cancelled.is_set() and time.monotonic() < deadline
+                and _oracle_forward_regular_session(datetime.now(timezone.utc)))
+
+    try:
+        result, ok = _run_with_timeout(
+            "oracle_cycle",
+            lambda: _run_oracle_forward_pass(engine, should_continue=should_continue),
+            ORACLE_FORWARD_TIMEOUT_SECONDS, state,
+        )
+        if not ok or not result:
+            cycle_result["oracle"] = {"status": "failed", "reason": "timeout_or_worker_failure"}
+            return
+        cycle_result["oracle"] = result
+        if result.get("status") in {"completed", "partial"}:
+            state.cooldowns.record_attempt("oracle_cycle", success=True)
+            if result.get("new_predictions", 0) > 0:
+                from oracle.report import send_oracle_report
+                send_oracle_report(result)
+    finally:
+        # Covers timeout, errors and successful return; orphan callbacks never
+        # regain admission on a later cycle or after a wall-clock rollback.
+        cancelled.set()
 
 
 class _AutoresearchGenerationTracker:
@@ -1522,6 +1734,162 @@ def _run_sector_and_intelligence_steps(
         log.warning("Intelligence tasks failed: {e}", e=str(exc))
 
 
+# ─── Trust cycle — own step, bounded and resumable (2026-11-18) ──────────
+#
+# Progress of the current trust cycle (intelligence.trust_scorer.
+# run_trust_cycle's caller-owned ``progress`` dict) and the identity of the
+# thread running it. Process-local on purpose: a restart loses only the
+# propagation cursor, and the next pass starts the cycle again from the
+# beginning. Every write it repeats is an idempotent UPDATE.
+_TRUST_CYCLE_PROGRESS: dict[str, Any] = {}
+_TRUST_CYCLE_WORKER: dict[str, Any] = {"thread": None}
+_TRUST_CYCLE_LOCK = threading.Lock()
+
+
+def _trust_cycle_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Small, JSON-safe view of a run_trust_cycle result for cycle_result.
+
+    cycle_result is persisted as the hermes_operator snapshot payload, so the
+    ~13.6k-entry source list and the report text stay out of it.
+    """
+    scoring = result.get("scoring") or {}
+    summary = {
+        "complete": bool(result.get("complete", True)),
+        "passes": result.get("passes"),
+        "scored": scoring.get("scored") if isinstance(scoring, dict) else None,
+    }
+    if summary["complete"]:
+        summary["sources"] = (result.get("trust_update") or {}).get("total")
+        summary["convergence_count"] = result.get("convergence_count")
+        summary["actor_trust_synced"] = result.get("actor_trust_synced")
+    else:
+        summary["propagated_sources"] = result.get("propagated_sources")
+        summary["resume_after"] = result.get("resume_after")
+    return summary
+
+
+def _run_trust_cycle_step(
+    engine: Any,
+    state: OperatorState,
+    dry_run: bool,
+    cycle_result: dict[str, Any],
+) -> None:
+    """Run (or resume) the trust cycle as its own ``run_cycle`` step.
+
+    Dispatched after ``intelligence_tasks``. Until 2026-11-18 the trust cycle
+    ran inside that step ahead of the daily-intel block. A full cycle took
+    ~39 min on grid-svr (2026-11-18 02:24:49 to 03:03:35, "completed in
+    2326.2s"), so the 900 s step timed out on every 4-hourly trust cycle,
+    and that night the daily-intel block never got a turn.
+
+    Rules:
+
+    * Due when ``state.last_trust_cycle`` is ``TRUST_CYCLE_INTERVAL_HOURS``
+      old, or when a cycle paused at its budget is waiting to resume.
+    * One pass runs ``run_trust_cycle`` with ``should_continue`` set to a
+      ``TRUST_CYCLE_BUDGET_SECONDS`` deadline. Propagation stops between
+      sources at the deadline, and the next cycle resumes from the saved
+      key instead of starting over.
+    * Under ``_run_with_timeout(..., TRUST_CYCLE_TIMEOUT_SECONDS)``.
+    * Completion sets ``state.last_trust_cycle = now``.
+    * A timeout or an exception also sets ``state.last_trust_cycle = now``
+      and holds any paused cycle until the interval has passed. A failed
+      pass waits a full interval and is not due on every cycle. Before this
+      step existed, ``last_trust_cycle`` was set only after the orphaned
+      worker finished, so the next cycle started a second trust cycle
+      beside it (2026-11-18 02:24:49 and 02:51:04).
+    * In flight: a pass is skipped while the thread of an earlier pass that
+      ``_run_with_timeout`` abandoned is still alive. Two trust cycles never
+      write signal_sources at once.
+
+    ``state.cooldowns.can_retry("trust_cycle")`` is deliberately not
+    consulted. The rules above are this step's throttle. The 24 h timeout
+    blacklist would stop trust scoring for a day after one slow pass. For
+    the same reason the ``intelligence_tasks`` step has never consulted it
+    (see ``_run_sector_and_intelligence_steps``): the "blacklisting for 24h"
+    log line on that step changes nothing.
+    """
+    if dry_run:
+        return
+
+    now = datetime.now(timezone.utc)
+    with _TRUST_CYCLE_LOCK:
+        worker = _TRUST_CYCLE_WORKER.get("thread")
+        if worker is not None and _daily_intel_thread_alive(worker):
+            log.warning(
+                "trust_cycle: an earlier pass's worker is still running — "
+                "skipping this cycle"
+            )
+            cycle_result["trust_cycle"] = {"skipped": "in_flight"}
+            return
+        resuming = _TRUST_CYCLE_PROGRESS.get("stage") == "propagate"
+        held = bool(_TRUST_CYCLE_PROGRESS.get("held_after_failure"))
+    interval_passed = _hours_since(state.last_trust_cycle) >= TRUST_CYCLE_INTERVAL_HOURS
+    if not (interval_passed or (resuming and not held)):
+        return
+    _TRUST_CYCLE_PROGRESS.pop("held_after_failure", None)
+
+    def _pass() -> dict[str, Any]:
+        from intelligence.trust_scorer import run_trust_cycle
+
+        me = threading.get_ident()
+        with _TRUST_CYCLE_LOCK:
+            _TRUST_CYCLE_WORKER["thread"] = me
+        deadline = time.monotonic() + TRUST_CYCLE_BUDGET_SECONDS
+        try:
+            return run_trust_cycle(
+                engine,
+                should_continue=lambda: time.monotonic() < deadline,
+                progress=_TRUST_CYCLE_PROGRESS,
+            )
+        finally:
+            with _TRUST_CYCLE_LOCK:
+                if _TRUST_CYCLE_WORKER.get("thread") == me:
+                    _TRUST_CYCLE_WORKER["thread"] = None
+
+    try:
+        state.current_step = "trust_cycle"
+        t0 = time.monotonic()
+        result, ok = _run_with_timeout(
+            "trust_cycle", _pass, TRUST_CYCLE_TIMEOUT_SECONDS, state,
+        )
+        elapsed = time.monotonic() - t0
+    except Exception as exc:  # noqa: BLE001 — never let this step end the cycle
+        log.warning("Trust cycle step failed: {e}", e=str(exc))
+        result, ok, elapsed = None, False, 0.0
+
+    if not ok:
+        state.last_trust_cycle = now
+        if _TRUST_CYCLE_PROGRESS.get("stage") == "propagate":
+            _TRUST_CYCLE_PROGRESS["held_after_failure"] = True
+        state.record_task("trust_cycle", success=False, duration_s=elapsed,
+                          error="timeout or error")
+        cycle_result["trust_cycle"] = {"ok": False}
+        return
+
+    result = result or {}
+    summary = _trust_cycle_summary(result)
+    cycle_result["trust_cycle"] = summary
+    state.record_task("trust_cycle", success=True, duration_s=elapsed)
+    if not summary["complete"]:
+        log.info(
+            "Trust cycle paused after {t:.0f}s at its {b}s budget; resumes next cycle",
+            t=elapsed, b=TRUST_CYCLE_BUDGET_SECONDS,
+        )
+        return
+
+    state.last_trust_cycle = now
+    log.info("Intel task 'trust_cycle' completed in {t:.1f}s", t=elapsed)
+    # Mirror to Obsidian session log (best-effort).
+    try:
+        from intelligence.obsidian_log import log_trust_cycle
+        scoring = result.get("scoring") or {}
+        if isinstance(scoring, dict):
+            log_trust_cycle(scoring)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Obsidian log_trust_cycle skipped: {e}", e=str(exc))
+
+
 # ─── Daily intelligence batch — task table (fable-daily-intel-resumable) ──
 #
 # Each function below is one step of the old monolithic 02:00 UTC daily
@@ -1786,6 +2154,42 @@ def _daily_intel_corporate_actions(
     )
 
 
+def _daily_intel_supply_chain_8k(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Supplier/customer links from 8-K Item 1.01 filings (3pacs/GRID#1180):
+    EDGAR's daily form index, keyword screen, local-GPU extraction, cited
+    'derived' edges that contagion uses only after validation. Stops within
+    its own 150 s budget and resumes from its checkpoint."""
+    from ingestion.altdata.supply_chain_8k import run_daily
+
+    results["supply_chain_8k"] = run_daily(engine)
+
+
+def _daily_intel_gdelt_bulk_events(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """GDELT 2.0 15-minute export files into gdelt_events, gdelt_daily_summary
+    and the 12 gdelt_* daily features, dated by when GDELT published each day's
+    last file. Resumes from its file ledger (gdelt_export_files) and stops
+    within its own 100 s budget. No LLM."""
+    from ingestion.altdata.gdelt_bulk import run_daily
+
+    results["gdelt_bulk_events"] = run_daily(engine)
+
+
+def _daily_intel_gdelt_gkg_daily(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """GDELT 2.0 GKG files into per-file ledger aggregates, gdelt_gkg_daily and
+    the gkg_* daily features (registered not model-eligible), dated D+1 or
+    later. Resumes from its file ledger and stops within its own 100 s budget.
+    No LLM."""
+    from ingestion.altdata.gdelt_bulk import run_gkg_daily
+
+    results["gdelt_gkg_daily"] = run_gkg_daily(engine)
+
+
 def _daily_intel_capital_flow_rollups(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -1971,12 +2375,22 @@ class DailyIntelTask(NamedTuple):
 # capital_flow_rollups, fundamental_divergence and holder_deal_overlap
 # above — they assume the tasks before them in this tuple already ran
 # this period.
+#
+# postmortem_batch is deliberately LAST (2026-11-17). The cycle budget
+# (DAILY_INTEL_CYCLE_BUDGET_SECONDS) is only checked before a task starts,
+# and postmortem_batch really runs 345-467 s (median ~440 s, 11-10..11-16)
+# against its 180 s budget, so it timed out and burned 180 s every night;
+# with supply_chain_8k and gdelt_bulk_events released the 11-17 window pass
+# used 489.7 s and pushed gdelt_gkg_daily and sleuth_dispatch to catch-up.
+# Last, its overrun can only delay itself. Order-safe: it reads
+# options_recommendations / oracle_predictions / options_daily_signals /
+# capital_flow_snapshots / decision_journal and writes only trade_postmortems,
+# which no task in this table reads; nothing earlier depends on its output.
 DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("storage_maintenance_subagent", _daily_intel_storage_maintenance, DAILY_INTEL_DISPATCH_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("source_audit", _daily_intel_source_audit, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("flow_materialize", _daily_intel_flow_materialize, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("backtest_scan", _daily_intel_backtest_scan, DAILY_INTEL_LLM_TASK_BUDGET_S),
-    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
     DailyIntelTask("options_improvement", _daily_intel_options_improvement, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("hypothesis_review", _daily_intel_hypothesis_review, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("hypothesis_discovery", _daily_intel_hypothesis_discovery, DAILY_INTEL_LLM_TASK_BUDGET_S),
@@ -1985,14 +2399,18 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("icij_linking", _daily_intel_icij_linking, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
-    DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S),
+    DailyIntelTask("supply_chain_8k", _daily_intel_supply_chain_8k, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
     DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("gdelt_bulk_events", _daily_intel_gdelt_bulk_events, DAILY_INTEL_GDELT_BULK_BUDGET_S),
+    DailyIntelTask("gdelt_gkg_daily", _daily_intel_gdelt_gkg_daily, DAILY_INTEL_GDELT_GKG_BUDGET_S),
     DailyIntelTask("sleuth_dispatch", _daily_intel_sleuth_dispatch, DAILY_INTEL_SQL_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
 )
 
 
@@ -2068,6 +2486,32 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # explain a miss, they no longer feed learning (lessons now come from
     # official verdicts, both sides; intelligence/reasoning_bank.py).
     "postmortem_batch",
+    # ingestion/altdata/supply_chain_8k.py::run_daily -- a local GPU model
+    # (never a paid provider) reads 8-K Item 1.01 text for who supplies whom
+    # and upserts supply_chain_nodes/edges as confidence 'derived', each
+    # citing its filing URL and a verbatim quote; contagion ignores them
+    # until the edge validator has measured them. Released 2026-11-16 by
+    # the owner ("release the supply_chain_8k task", 3pacs/GRID#1180). Its
+    # only caller is this task; the weekly 10-K parser writes the same
+    # tables through ON CONFLICT upserts on a different (form) key, and its
+    # checkpoint lives in outputs/supply_chain, a symlink into /data that
+    # outlives release swaps.
+    "supply_chain_8k",
+    # ingestion/altdata/gdelt_bulk.py::run_daily -- no LLM -- GDELT 2.0
+    # 15-minute export files into gdelt_events (duplicates skipped),
+    # gdelt_export_files, gdelt_daily_summary and the 12 gdelt_* daily
+    # features, each dated D+1 or later. Released 2026-11-16 by the owner
+    # ("1-4 for gdelt") after one grid-svr run of 2026-03-20 matched GDELT
+    # 1.0's daily file (116,574 events) and was dated 2026-03-21. Its only
+    # other caller is the operator CLI, serialised with it by a pg advisory
+    # lock; it stops between files within its own 100 s budget.
+    "gdelt_bulk_events",
+    # ingestion/altdata/gdelt_bulk.py::run_gkg_daily -- no LLM -- GDELT 2.0
+    # GKG files into per-file ledger aggregates, gdelt_gkg_daily and the
+    # gkg_* daily features, registered not model-eligible until a >= 90 %
+    # precision hand-read, each dated D+1 or later. Released 2026-11-16 by
+    # the owner with gdelt_bulk_events. Own advisory lock, 100 s budget.
+    "gdelt_gkg_daily",
     # NOTE: the three filesystem cleanups (insight_cleanup,
     # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
     # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
@@ -2917,7 +3361,8 @@ def run_intelligence_tasks(
 
     Schedule:
         Every 4 hours:
-            - trust_scorer.run_trust_cycle
+            - trust_scorer.run_trust_cycle — moved out to its own run_cycle
+              step on 2026-11-18 (see _run_trust_cycle_step); not run here
             - options_recommender.generate_recommendations
             - cross_reference.run_all_checks (checks only, no LLM narrative)
 
@@ -2926,7 +3371,8 @@ def run_intelligence_tasks(
             - lever_pullers.identify_lever_pullers
             - actor_network.track_wealth_migration
 
-        Daily at 2:00 AM:
+        Daily at 2:00 AM (runs right after active-hypothesis scoring,
+        ahead of every 4h/6h task, since 2026-11-18):
             - source_audit.run_full_audit
             - backtest_scanner.run_full_scan (with LLM sanity check)
             - postmortem.batch_postmortem
@@ -2945,6 +3391,20 @@ def run_intelligence_tasks(
     if dry_run:
         log.info("[DRY RUN] Would run intelligence tasks")
         return {"skipped": "dry_run"}
+
+    # ── Edge stream: one register-and-look cycle a day (detached child) ──
+    # First in this step because it only spawns a process and returns: the
+    # cycle (Polygon fetches, bootstrap) runs outside Hermes under its own
+    # lock and wall clock. Inert without the EDGE_STREAM_* env (drop-in
+    # zz-edge-stream.conf); see docs/reference/EDGE_STREAM.md.
+    try:
+        from alpha_research.edge_stream.hermes import maybe_spawn_cycle
+        spawned = maybe_spawn_cycle(now)
+        if spawned:
+            results["edge_stream"] = spawned
+            log.info("edge_stream cycle spawned (pid {p})", p=spawned.get("pid"))
+    except Exception as exc:
+        log.warning("edge_stream spawn failed: {e}", e=str(exc))
 
     # ── Earnings events → earnings_calendar back-compat sync ────────
     # Cheap (~50ms single SQL call) so runs FIRST — before the
@@ -3006,45 +3466,61 @@ def run_intelligence_tasks(
             log.warning("Active hypothesis scoring failed: {e}", e=str(exc))
         state.last_active_hypo_scoring = now
 
+    # ── Daily at 2:00 AM (with catch-up) ─────────────────────────────
+    # Runs here, right after active-hypothesis scoring and ahead of every
+    # 4h/6h task, since 2026-11-18. Only the earnings sync and the
+    # active-hypothesis scorer come first, which is what the
+    # ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS
+    # + 60 <= INTELLIGENCE_TASKS_TIMEOUT_SECONDS pin assumes. When it sat at
+    # the end of this function, the trust cycle (then run here) used up the
+    # whole 900 s step and starved it all night on 2026-11-18.
+    # Fires if (a) we're in the 2:00-2:10 UTC window, OR (b) we're past 2 AM
+    # UTC today and haven't run yet today (catches restarts, cycle timeouts,
+    # long cycles, or any case where the 10-minute window was missed).
+    # The _hours_since(last_daily_intel) >= 20 guard prevents double-runs.
+
+    is_daily_window = (now.hour == 2 and now.minute < 10)
+    is_catch_up = (
+        now.hour >= 2
+        and (state.last_daily_intel is None or state.last_daily_intel.date() < now.date())
+    )
+    daily_due = (is_daily_window or is_catch_up) and _hours_since(state.last_daily_intel) >= 20
+
+    if daily_due:
+        log.info(
+            "Running daily intelligence batch (window={w} catch_up={c})",
+            w=is_daily_window, c=(is_catch_up and not is_daily_window),
+        )
+        _run_daily_intel_block(engine, state, now, results)
+
     # ── Every 4 hours ────────────────────────────────────────────────
+    # The trust cycle itself runs as its own run_cycle step since 2026-11-18
+    # (_run_trust_cycle_step, after this step). The TimesFM signal forecasts
+    # and the thesis snapshot used to ride on its 4h gate. They now run on
+    # the forecasts' own 4h gate, so the thesis reads the latest completed
+    # trust scores.
 
-    if _hours_since(state.last_trust_cycle) >= 4:
+    thesis_due = _hours_since(state.last_signal_forecasts) >= 4
+    # TimesFM signal forecasts: run before thesis scorer so forecasts are fresh
+    if thesis_due:
         try:
-            from intelligence.trust_scorer import run_trust_cycle
-            tc_result = _run_intel_task(
-                "trust_cycle", run_trust_cycle, state, engine,
-            )
-            results["trust_cycle"] = tc_result
-            # Mirror to Obsidian session log (best-effort).
-            try:
-                from intelligence.obsidian_log import log_trust_cycle
-                scoring = (tc_result or {}).get("scoring") or {}
-                if isinstance(scoring, dict):
-                    log_trust_cycle(scoring)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("Obsidian log_trust_cycle skipped: {e}", e=str(exc))
+            from inference.timesfm_service import forecast_signals
+            fc_results = forecast_signals(engine, horizon=30)
+            results["signal_forecasts"] = {
+                "forecasted": len(fc_results),
+                "directions": {
+                    "UP": sum(1 for f in fc_results if f.direction == "UP"),
+                    "DOWN": sum(1 for f in fc_results if f.direction == "DOWN"),
+                    "FLAT": sum(1 for f in fc_results if f.direction == "FLAT"),
+                },
+            }
+            log.info("TimesFM forecasted {n} signals", n=len(fc_results))
         except Exception as exc:
-            log.warning("Trust cycle import failed: {e}", e=str(exc))
+            log.warning("TimesFM forecast cycle failed: {e}", e=str(exc))
+        state.last_signal_forecasts = now
 
-        # TimesFM signal forecasts: run before thesis scorer so forecasts are fresh
-        if _hours_since(state.last_signal_forecasts) >= 4:
-            try:
-                from inference.timesfm_service import forecast_signals
-                fc_results = forecast_signals(engine, horizon=30)
-                results["signal_forecasts"] = {
-                    "forecasted": len(fc_results),
-                    "directions": {
-                        "UP": sum(1 for f in fc_results if f.direction == "UP"),
-                        "DOWN": sum(1 for f in fc_results if f.direction == "DOWN"),
-                        "FLAT": sum(1 for f in fc_results if f.direction == "FLAT"),
-                    },
-                }
-                log.info("TimesFM forecasted {n} signals", n=len(fc_results))
-            except Exception as exc:
-                log.warning("TimesFM forecast cycle failed: {e}", e=str(exc))
-            state.last_signal_forecasts = now
-
-        # Thesis snapshot: score current thesis and persist for accuracy tracking
+    # Thesis snapshot: score current thesis and persist for accuracy tracking
+    if thesis_due:
         try:
             from analysis.thesis_scorer import score_thesis, snapshot_thesis
             thesis = score_thesis(engine)
@@ -3059,8 +3535,6 @@ def run_intelligence_tasks(
                      d=thesis["direction"], s=thesis["score"], id=snap_id)
         except Exception as exc:
             log.warning("Thesis snapshot failed: {e}", e=str(exc))
-
-        state.last_trust_cycle = now
 
     if _hours_since(state.last_options_recommendations) >= 4:
         try:
@@ -3146,25 +3620,11 @@ def run_intelligence_tasks(
 
         state.last_actor_wealth = now
 
-    # ── Daily at 2:00 AM (with catch-up) ─────────────────────────────
-    # Fires if (a) we're in the 2:00-2:10 UTC window, OR (b) we're past 2 AM
-    # UTC today and haven't run yet today (catches restarts, cycle timeouts,
-    # long cycles, or any case where the 10-minute window was missed).
-    # The _hours_since(last_daily_intel) >= 20 guard prevents double-runs.
-
-    is_daily_window = (now.hour == 2 and now.minute < 10)
-    is_catch_up = (
-        now.hour >= 2
-        and (state.last_daily_intel is None or state.last_daily_intel.date() < now.date())
-    )
-    daily_due = (is_daily_window or is_catch_up) and _hours_since(state.last_daily_intel) >= 20
-
-    if daily_due:
-        log.info(
-            "Running daily intelligence batch (window={w} catch_up={c})",
-            w=is_daily_window, c=(is_catch_up and not is_daily_window),
-        )
-        _run_daily_intel_block(engine, state, now, results)
+    # The daily-intel block ("Daily at 2:00 AM (with catch-up)") used to
+    # sit here, after every 4h/6h task. It now runs right after
+    # active-hypothesis scoring near the top of this function (2026-11-18).
+    # The two notes below still apply; "the daily-due block above" in them
+    # meant this old position.
 
     # NOTE (2026-09-19): the daily sector-health snapshot used to run here,
     # AFTER the daily-due block above. It now has its own dispatch and its
@@ -3340,6 +3800,38 @@ def run_intelligence_tasks(
             )
         except Exception as exc:
             log.warning("Actor report import failed: {e}", e=str(exc))
+
+        # Supply-chain graph upkeep (3pacs/GRID#1179). The graph had no new
+        # edge after 2026-07-14: both jobs existed (_SOURCE_EXTRAS lists them)
+        # but nothing ran them. The 10-K parser is deterministic regex mining
+        # of SEC filings (no LLM; edges upsert as confidence 'derived'), SEC
+        # rate-limited, 15 minutes a week, resuming its pass from a persistent
+        # checkpoint. The validator then re-checks every edge against prices.
+        try:
+            from ingestion.altdata.supply_chain_parser import (
+                run_weekly as run_supply_chain_parser,
+            )
+            results["weekly_supply_chain_parser"] = _run_intel_task(
+                "weekly_supply_chain_parser",
+                run_supply_chain_parser,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Supply-chain parser import failed: {e}", e=str(exc))
+
+        try:
+            from intelligence.supply_chain_edge_validator import (
+                run_weekly as run_supply_chain_edge_validator,
+            )
+            results["weekly_supply_chain_edge_validator"] = _run_intel_task(
+                "weekly_supply_chain_edge_validator",
+                run_supply_chain_edge_validator,
+                state,
+                engine,
+            )
+        except Exception as exc:
+            log.warning("Supply-chain edge validator import failed: {e}", e=str(exc))
 
         state.last_weekly_intel = now
 
@@ -4239,64 +4731,13 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("AstroGrid celestial cycle failed: {e}", e=str(exc))
 
-    # 7d. Oracle prediction cycle (every 6 hours)
+    # 7d. Bounded prospective cohort: hourly, regular session only. Model
+    # evolution/promotion stays held; hourly cron independently grades expiry.
     try:
-        now = datetime.now(timezone.utc)
-        hours_since_oracle = 999
-        if state.last_oracle_cycle is not None:
-            hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
-        if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
-            budget_left = cycle_deadline - time.monotonic()
-            needed = ORACLE_CYCLE_TIMEOUT_SECONDS + ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS
-            if budget_left < needed:
-                log.info(
-                    "Oracle cycle deferred — {b:.0f}s of cycle budget left, needs {n}s including cleanup",
-                    b=budget_left, n=needed,
-                )
-                cycle_result["oracle"] = {
-                    "deferred": "insufficient_cycle_budget",
-                    "budget_left_s": round(budget_left, 1),
-                    "required_s": needed,
-                }
-            else:
-                state.current_step = "oracle_cycle"
-                log.info("Running Oracle prediction cycle...")
-                # Record start only after admission: an orphan can still write
-                # predictions after its inner timeout, so an actual dispatch
-                # must not refire for 6h. A budget deferral leaves this untouched.
-                state.last_oracle_cycle = now
-                if not dry_run:
-                    from oracle.engine import OracleEngine
-                    from oracle.report import send_oracle_report
-
-                    def _oracle_call():
-                        oracle = OracleEngine(db_engine=engine)
-                        return oracle.run_cycle()
-
-                    oracle_result, ok = _run_with_timeout(
-                        "oracle_cycle", _oracle_call,
-                        ORACLE_CYCLE_TIMEOUT_SECONDS, state,
-                    )
-                    if ok and oracle_result:
-                        cycle_result["oracle"] = {
-                            "predictions": oracle_result["new_predictions"],
-                            "scoring": oracle_result["scoring"],
-                            "leaderboard": oracle_result.get("leaderboard", [])[:3],
-                        }
-                        if oracle_result["new_predictions"] > 0:
-                            send_oracle_report(oracle_result)
-                        state.last_oracle_cycle = now
-                        state.cooldowns.record_attempt("oracle_cycle", success=True)
-                else:
-                    log.info("[DRY RUN] Would run Oracle cycle")
-        elif hours_since_oracle >= 6:
-            log.info(
-                "Skipping oracle_cycle — blacklisted (timed out previously, "
-                "blacklist clears in {h}h)",
-                h=TIMEOUT_BLACKLIST_HOURS,
-            )
+        _run_oracle_forward_step(engine, state, dry_run, cycle_result, cycle_deadline)
     except Exception as exc:
-        log.warning("Oracle cycle failed: {e}", e=str(exc))
+        log.warning("Oracle forward measurement failed: {e}", e=str(exc))
+        cycle_result["oracle"] = {"status": "failed", "reason": "forward_step_error"}
         state.cooldowns.record_attempt("oracle_cycle", success=False, error=str(exc))
 
     # 7d-ii. TimesFM forecast cycle (every 6 hours, alongside oracle)
@@ -4560,6 +5001,11 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     #     new sector-health step deliberately does not consult the cooldown
     #     retry-eligibility check that a few other steps use.
     _run_sector_and_intelligence_steps(engine, state, dry_run, cycle_result)
+
+    # 7f'. Trust cycle — own step, after intelligence_tasks, bounded and
+    #      resumable (2026-11-18). It used to run inside intelligence_tasks
+    #      and starve the daily-intel block; see _run_trust_cycle_step.
+    _run_trust_cycle_step(engine, state, dry_run, cycle_result)
 
     # 7g. Rotation paper trading — daily after 17:00 UTC (market close)
     try:
@@ -4927,7 +5373,12 @@ def main(args: list[str] | None = None) -> None:
         from oracle.model_factory import migrate_default_models
         migrate_default_models(_get_engine_for_migrate())
     except Exception as exc:
-        log.debug("migrate_default_models: {e}", e=str(exc))
+        # Visible at normal journal level; do not log SQL/parameters or credentials.
+        log.warning(
+            "migrate_default_models failed: type={t} pgcode={c}; subscriptions unverified",
+            t=type(exc).__name__,
+            c=getattr(getattr(exc, "orig", exc), "pgcode", None),
+        )
 
     if opts.once:
         result = run_cycle(state, dry_run=opts.dry_run)

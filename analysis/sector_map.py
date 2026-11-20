@@ -23,6 +23,13 @@ The YAML document has a thin wrapper:
 Callers should treat the loaded dicts as byte-identical replacements for the
 old Python literals — same shape, same keys, same values.
 
+``TICKER_STATUS`` is loaded from the sidecar ``sector_map_ticker_status.yaml``:
+lifecycle markers (renamed -> successor, acquired, delisted, foreign listing)
+for map tickers that no longer trade under that symbol. It lives outside the
+map because ``analysis/panel_insider_density.py`` pins the map's sha256, and
+dead actors stay in the map so historical panels are free of survivorship
+bias. ``price_tickers()`` is what a price list should fetch today.
+
 Loader uses ``yaml.CSafeLoader`` when libyaml is available (~150 ms cold) and
 falls back to the pure-Python loader otherwise. The result is cached at the
 module level, so the cost is paid exactly once per process.
@@ -41,6 +48,10 @@ except ImportError:  # pragma: no cover - libyaml is standard on grid-svr
     from yaml import SafeLoader as _SafeLoader  # type: ignore[assignment]
 
 _YAML_PATH = Path(__file__).parent / "sector_map_data.yaml"
+_STATUS_PATH = Path(__file__).parent / "sector_map_ticker_status.yaml"
+
+#: Allowed ``status`` values in sector_map_ticker_status.yaml.
+TICKER_STATES: frozenset[str] = frozenset({"renamed", "acquired", "delisted", "foreign_listing"})
 
 
 def _load_sector_map_document() -> dict[str, Any]:
@@ -72,6 +83,35 @@ SECTOR_MAP: dict[str, dict] = _DOC["SECTOR_MAP"]
 #: etc.). These are the "junction points" where liquidity enters or exits the
 #: system.
 JUNCTION_POINTS: dict[str, dict] = _DOC["JUNCTION_POINTS"]
+
+
+def _load_ticker_status(path: Path = _STATUS_PATH) -> dict[str, dict[str, Any]]:
+    """Read and validate the lifecycle sidecar (see its header)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = yaml.load(fh, Loader=_SafeLoader)
+    status = doc.get("TICKER_STATUS") if isinstance(doc, dict) else None
+    if not isinstance(status, dict):
+        raise ValueError(f"{path.name}: missing top-level mapping 'TICKER_STATUS'")
+    for ticker, entry in status.items():
+        state = entry.get("status") if isinstance(entry, dict) else None
+        if state not in TICKER_STATES:
+            raise ValueError(f"{path.name}: {ticker}: unknown status {state!r}")
+        if (state == "renamed") != bool(entry.get("successor")):
+            raise ValueError(f"{path.name}: {ticker}: 'successor' is required for, and only for, status renamed")
+    for ticker in status:
+        seen = {ticker}
+        nxt = status[ticker].get("successor")
+        while nxt in status and status[nxt]["status"] == "renamed":
+            nxt = status[nxt]["successor"]
+            if nxt in seen:
+                raise ValueError(f"{path.name}: {ticker}: successor cycle")
+            seen.add(nxt)
+    return status
+
+
+#: ``ticker -> {status, successor | acquirer, last_session, note}`` for map
+#: tickers that no longer trade under that symbol.
+TICKER_STATUS: dict[str, dict[str, Any]] = _load_ticker_status()
 
 
 # -----------------------------------------------------------------------------
@@ -129,12 +169,41 @@ def get_junction_point(junction_id: str) -> dict | None:
     return JUNCTION_POINTS.get(junction_id)
 
 
+def price_ticker(ticker: str) -> str | None:
+    """The symbol carrying ``ticker``'s prices today; None if nothing does.
+
+    Renamed symbols follow their successor chain; acquired, delisted and
+    foreign-listed symbols give None; unlisted tickers are returned as is.
+    """
+    while ticker in TICKER_STATUS:
+        entry = TICKER_STATUS[ticker]
+        if entry["status"] != "renamed":
+            return None
+        ticker = entry["successor"]
+    return ticker
+
+
+def price_tickers() -> list[str]:
+    """Sector ETFs and actor tickers to fetch prices for, via :func:`price_ticker`."""
+    out: set[str] = set()
+    for sector in SECTOR_MAP.values():
+        tickers = [sector.get("etf")]
+        for sub in sector.get("subsectors", {}).values():
+            tickers.extend(actor.get("ticker") for actor in sub.get("actors", []))
+        out.update(p for t in tickers if t and (p := price_ticker(t)))
+    return sorted(out)
+
+
 __all__ = [
     "SECTOR_MAP",
     "JUNCTION_POINTS",
+    "TICKER_STATUS",
+    "TICKER_STATES",
     "get_sector_features",
     "get_actor_influence",
     "get_all_sectors",
     "get_junction_points_for_sector",
     "get_junction_point",
+    "price_ticker",
+    "price_tickers",
 ]
