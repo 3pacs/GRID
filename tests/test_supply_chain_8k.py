@@ -133,6 +133,7 @@ def job(monkeypatch, tmp_path):
     parser = scp.SupplyChain10KParser.__new__(scp.SupplyChain10KParser)
     parser.seed_node_ids = {"dal", "ba", "akam"}
     parser.name_to_node_id = {}
+    parser._name_keys, parser._name_key_is_ticker = {}, {}
     parser._ticker_to_node = {"DAL": "dal", "BA": "ba", "AKAM": "akam"}
     parser._upsert_node = MagicMock(return_value=True)
     parser._upsert_edge = MagicMock(return_value=True)
@@ -480,6 +481,19 @@ def test_a_subsidiary_resolves_to_its_listed_parent():
     assert s8._parent("apple hospitality reit", {"apple": "aapl"}) is None  # one-word keys never claim
 
 
+def test_a_listed_company_named_like_a_graph_company_is_not_its_subsidiary():
+    j = universe_job()
+    j.sec_listing = lambda: [("KO", "0000021344", "COCA COLA CO"),
+                             ("COKE", "0000317540", "COCA COLA CONSOLIDATED, INC.")]
+    j.engine.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = [
+        ("ko", "ticker", "Coca-Cola")]
+    j.filer_universe()
+    nid, node = j.resolve_counterparty("Coca-Cola Consolidated, Inc.")
+    assert nid == "coke" and node.type == "ticker"  # its own filer, not KO
+    assert j.resolve_counterparty("The Coca-Cola Company") == ("ko", None)
+    assert j.resolve_counterparty("Coca-Cola Refreshments USA, Inc.") == ("ko", None)  # no filer: the parent
+
+
 # --- Codex recheck of 0240544f (pickup sha256 3aa1c7e5) -------------------------------
 
 
@@ -543,3 +557,21 @@ def test_more_than_2000_given_up_filings_all_survive_save_reload_and_a_run(job):
     kept = json.loads(s8.CHECKPOINT_PATH.read_text())["gave_up"]
     assert s.checkpoint_advanced and s.gave_up == 2500
     assert len(kept) == 2500 and kept[0]["accession"] == "0000000001-26-000000"  # the oldest stays
+
+
+def test_checkpoint_follows_a_symlinked_dir_whose_target_is_missing(monkeypatch, tmp_path):
+    # outputs/supply_chain is a tracked symlink into /data; the first save on a
+    # new host must create the target, not fail on the dangling link.
+    link = tmp_path / "outputs" / "supply_chain"
+    link.parent.mkdir()
+    link.symlink_to(tmp_path / "persist" / "supply_chain")
+    monkeypatch.setattr(s8, "CHECKPOINT_PATH", link / "8k_checkpoint.json")
+    s8.EightKSupplyLinks.save_checkpoint(date(2026, 11, 13), ["a"])
+    assert json.loads((tmp_path / "persist" / "supply_chain" / "8k_checkpoint.json").read_text())["last_day"] == "2026-11-13"
+
+
+def test_checkpoints_live_outside_the_release_tree():
+    from pathlib import Path
+
+    link = Path(scp.__file__).resolve().parents[2] / "outputs" / "supply_chain"
+    assert link.is_symlink() and str(link.readlink()) == "/data/grid/outputs/supply_chain"

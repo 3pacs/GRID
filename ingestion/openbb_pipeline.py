@@ -14,13 +14,14 @@ Run once:  python ingestion/openbb_pipeline.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any
 
-sys.path.insert(0, "/home/grid/grid_v4/grid_repo/grid")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loguru import logger as log
 from sqlalchemy import text

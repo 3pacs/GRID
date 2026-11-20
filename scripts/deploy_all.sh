@@ -77,13 +77,10 @@ ok "EIA parsed"
 
 # ── Step 4: Parse GDELT ────────────────────────────────────────
 
-if [ -d "/data/grid/bulk/gdelt" ] && ls /data/grid/bulk/gdelt/*.{zip,csv,CSV} 1>/dev/null 2>&1; then
-    log "Step 4: Parsing GDELT events..."
-    python3 "$SCRIPTS/parse_gdelt.py" 2>&1 | tee "$LOG_DIR/parse_gdelt.log"
-    ok "GDELT parsed"
-else
-    warn "Step 4: Skipping GDELT — no bulk data at /data/grid/bulk/gdelt/"
-fi
+# scripts/parse_gdelt.py is retired (2026-11-16). GDELT events load
+# incrementally through Hermes' daily-intel task gdelt_bulk_events
+# (ingestion/altdata/gdelt_bulk.py); nothing to do here.
+warn "Step 4: Skipping GDELT — loaded by Hermes gdelt_bulk_events (ingestion/altdata/gdelt_bulk.py)"
 
 # ── Step 5: Pull Options Chains ────────────────────────────────
 

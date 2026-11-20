@@ -128,7 +128,13 @@ def armed(tmp_path, monkeypatch):
     monkeypatch.setattr(daily, "_disarm_deadline", lambda: None)
     clock = _Clock(_at(13, 31))
     monkeypatch.setattr(daily, "_utc_now", clock)
-    state = SimpleNamespace(clock=clock, items=[], confirm=None, tmp=tmp_path)
+    state = SimpleNamespace(clock=clock, items=[], confirm=None, tmp=tmp_path, slept=[])
+
+    def _fake_sleep(seconds):
+        state.slept.append(seconds)
+        clock.now += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(daily, "_sleep", _fake_sleep)
     monkeypatch.setattr(daily, "_follow_scheduler_journal", lambda _day: _stream(clock, state.items))
     monkeypatch.setattr(daily, "_read_scheduler_journal",
                         lambda _day, _now: state.confirm if state.confirm is not None else [
@@ -148,6 +154,100 @@ def test_main_triggers_on_completion_and_records_lag(armed, monkeypatch) -> None
     receipt = _receipt(armed)
     assert "GEM_TRIGGER scheduler_options_complete=2026-10-01T13:57:20+00:00 lag_s=0.0" in receipt
     assert "GEM_SKIP append-only schema gate" in receipt
+
+
+class _CaptureConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, *_args, **_kwargs):
+        return None
+
+
+class _CaptureEngine:
+    def connect(self):
+        return _CaptureConn()
+
+
+UNDATED = ("incomplete options chain response: 0 failed expiry fetch(es), 1 undated quote(s), "
+           "0 empty of 6 expiries, 0 contracts, timed_out=False")
+
+
+def _capture_run(armed, monkeypatch, failing, retry_failing=None, *, capture_minutes=0,
+                 retry_raises=None):
+    """Run main() through capture, VALIDATE and the retry.
+
+    ``failing`` tickers fail the first capture; ``retry_failing`` (default:
+    the same set) fail the 10:00 retry. ``capture_minutes`` is how long the
+    first capture takes on the fake clock.
+    """
+    armed.items = [_event(_at(13, 30, 17), START_MSG), _event(_at(13, 57, 20), DONE_MSG)]
+    monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=_CaptureEngine))
+    monkeypatch.setattr(daily, "_append_only_schema_ok", lambda _e: True)
+    calls = armed.calls = []
+    plan = [set(failing), set(failing if retry_failing is None else retry_failing)]
+
+    class _Puller:
+        def __init__(self, db_engine):
+            pass
+
+        def pull_all(self, tickers, **_kwargs):
+            bad = plan[min(len(calls), 1)]
+            calls.append((list(tickers), armed.clock.now))
+            if len(calls) == 2 and retry_raises is not None:
+                raise retry_raises
+            if len(calls) == 1:
+                armed.clock.now += timedelta(minutes=capture_minutes)
+            return [{"ticker": t, "status": "FAILED" if t in bad else "SUCCESS",
+                     "error": UNDATED if t in bad else None,
+                     "capture_batch_id": None if t in bad else f"b{len(calls)}-{t}",
+                     "capture_ordinal": None if t in bad else 7 + len(calls)}
+                    for t in tickers]
+
+    monkeypatch.setitem(sys.modules, "ingestion.options", SimpleNamespace(OptionsPuller=_Puller))
+    monkeypatch.setattr(daily, "_validate_batch", lambda _c, t, _d, r: r["status"] == "SUCCESS")
+    return daily.main()
+
+
+def test_main_partial_capture_exits_zero_with_a_partial_record(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND"}) == 0
+    receipt = _receipt(armed)
+    assert "GEM_VALIDATE GLND FAIL batch=None ordinal=None" in receipt
+    assert receipt.count(" PASS batch=b1-") == len(daily.GEM_TICKERS) - 1
+    assert "GEM_VALIDATE GLND FAIL batch=None ordinal=None attempt=2" in receipt
+    assert (f"GEM_RESULT PARTIAL pass={len(daily.GEM_TICKERS) - 1} fail=1 failed=[GLND]"
+            in receipt)
+
+
+def test_main_all_tickers_failing_still_exits_non_zero(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, set(daily.GEM_TICKERS)) == 1
+    assert (f"GEM_RESULT FAIL pass=0 fail={len(daily.GEM_TICKERS)} "
+            f"failed=[{','.join(daily.GEM_TICKERS)}]") in _receipt(armed)
+
+
+def test_main_full_pass_records_pass_and_exits_zero(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, set()) == 0
+    assert f"GEM_RESULT PASS pass={len(daily.GEM_TICKERS)} fail=0 failed=[]" in _receipt(armed)
+
+
+def test_main_run_error_still_exits_non_zero(armed, monkeypatch) -> None:
+    def boom(*_a, **_k):
+        raise RuntimeError("provider down")
+    monkeypatch.setattr(daily, "_validate_batch", boom)
+    armed.items = [_event(_at(13, 30, 17), START_MSG), _event(_at(13, 57, 20), DONE_MSG)]
+    monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=_CaptureEngine))
+    monkeypatch.setattr(daily, "_append_only_schema_ok", lambda _e: True)
+    puller = SimpleNamespace(pull_all=lambda tickers, **_k: [
+        {"ticker": t, "status": "SUCCESS"} for t in tickers])
+    monkeypatch.setitem(sys.modules, "ingestion.options",
+                        SimpleNamespace(OptionsPuller=lambda db_engine: puller))
+    assert daily.main() == 1
+    receipt = _receipt(armed)
+    assert "GEM_FAILED RuntimeError" in receipt
+    assert "GEM_RESULT" not in receipt
 
 
 def test_main_timeout_records_skip_and_never_reaches_provider(armed, monkeypatch) -> None:
@@ -298,3 +398,84 @@ def test_follow_splits_partial_lines_and_cleans_up_the_child(monkeypatch, mode) 
         assert got == ['{"a": 1}', '{"b": 2}']
         stream.close()
         assert procs[0].poll() is not None  # journalctl child terminated on close
+
+
+def test_retry_captures_a_failed_ticker_again_at_ten_new_york(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set()) == 0
+    receipt = _receipt(armed)
+    first, retry = armed.calls
+    assert first[0] == list(daily.GEM_TICKERS)
+    assert retry == (["GLND"], daily._retry_at(DAY))  # 10:00 New York, one ticker
+    assert ("GEM_REASON GLND attempt=1 status=FAILED reason=incomplete failed_fetches=0 "
+            "undated_quotes=1 empty=0/6 contracts=0 timed_out=False") in receipt
+    assert "GEM_RETRY START tickers=[GLND]" in receipt
+    assert "GEM_VALIDATE GLND PASS batch=b2-GLND ordinal=9 attempt=2" in receipt
+    assert f"GEM_RESULT PASS pass={len(daily.GEM_TICKERS)} fail=0 failed=[]" in receipt
+
+
+def test_retry_that_fails_again_stays_partial(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND", "OPCH"}, {"GLND"}) == 0
+    receipt = _receipt(armed)
+    assert armed.calls[1][0] == ["OPCH", "GLND"]  # GEM order, failed tickers only
+    assert "GEM_VALIDATE OPCH PASS batch=b2-OPCH ordinal=9 attempt=2" in receipt
+    assert "GEM_REASON GLND attempt=2 status=FAILED reason=incomplete" in receipt
+    assert (f"GEM_RESULT PARTIAL pass={len(daily.GEM_TICKERS) - 1} fail=1 failed=[GLND]"
+            in receipt)
+
+
+def test_retry_runs_at_once_after_ten_but_never_after_the_latest_start(armed, monkeypatch) -> None:
+    # First capture ends 10:01 New York: retry immediately, no sleep.
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set(), capture_minutes=4) == 0
+    assert armed.calls[1][1] == _at(14, 1, 20) and armed.slept == []
+    assert "GEM_RESULT PASS" in _receipt(armed)
+
+
+def test_no_retry_once_the_latest_start_has_passed(armed, monkeypatch) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set(), capture_minutes=9) == 0
+    receipt = _receipt(armed)
+    assert len(armed.calls) == 1
+    assert "GEM_RETRY SKIP latest start 10:05 New York reached failed=[GLND]" in receipt
+    assert "GEM_RESULT PARTIAL" in receipt
+
+
+@pytest.mark.parametrize("result, expected", [
+    ({"status": "SUCCESS"}, "status=SUCCESS reason=validate"),
+    ({"status": "FAILED", "error": UNDATED},
+     "status=FAILED reason=incomplete failed_fetches=0 undated_quotes=1 empty=0/6 "
+     "contracts=0 timed_out=False"),
+    ({"status": "FAILED", "error": "no data from options provider"},
+     "status=FAILED reason=no_provider_data"),
+    ({"status": "FAILED", "error": "connection to server at 10.0.0.1 password=x failed"},
+     "status=FAILED reason=error=other"),
+    ({"status": "SKIPPED", "reason": "no dated regular-market price"},
+     "status=SKIPPED reason=no_dated_regular-market_price"),
+    ({"status": "DEFERRED", "reason": "time budget"}, "status=DEFERRED reason=time_budget"),
+    ({}, "status=unknown reason=none"),
+])
+def test_failure_reason_is_short_and_secret_free(result, expected) -> None:
+    assert daily._failure_reason(result) == expected
+
+
+@pytest.mark.parametrize("exc", [
+    TimeoutError("GEM absolute 10:20 New York containment"),  # SIGALRM during the retry
+    OSError("connection refused"),
+])
+def test_retry_error_keeps_the_first_pass_and_its_result_line(armed, monkeypatch, exc) -> None:
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set(), retry_raises=exc) == 0
+    receipt = _receipt(armed)
+    assert f"GEM_RETRY FAIL {type(exc).__name__}" in receipt
+    assert "GEM_FAILED" not in receipt
+    assert (f"GEM_RESULT PARTIAL pass={len(daily.GEM_TICKERS) - 1} fail=1 failed=[GLND]"
+            in receipt)
+
+
+def test_alarm_while_waiting_for_the_retry_keeps_the_first_pass(armed, monkeypatch) -> None:
+    def _alarm(_seconds):
+        raise TimeoutError("GEM absolute 10:20 New York containment")
+
+    monkeypatch.setattr(daily, "_sleep", _alarm)
+    assert _capture_run(armed, monkeypatch, {"GLND"}, set()) == 0
+    receipt = _receipt(armed)
+    assert len(armed.calls) == 1
+    assert "GEM_RETRY FAIL TimeoutError" in receipt
+    assert "GEM_RESULT PARTIAL" in receipt

@@ -99,9 +99,6 @@ _FINANCIAL_PARTY = re.compile(
 KIND_RELATIONSHIP = {"supply": "component", "services": "component", "manufacturing": "contract_mfg",
                      "distribution": "distribution", "license": "licensor"}
 _THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
-_LEGAL_SUFFIX = re.compile(
-    r"\b(inc|incorporated|corp|corporation|co|company|companies|ltd|limited|plc|llc|lp|l p|holdings?|group|"
-    r"s a s|sas|s a|sa|n v|nv|ag|se|pbc|the)\b")
 
 PROMPT_SYSTEM = (
     "You read the Item 1.01 section of an SEC 8-K. Reply with ONE JSON object and nothing else: "
@@ -199,10 +196,7 @@ def parse_ticker_list(resp: Any) -> list[tuple[str, str, str]]:
     return out
 
 
-def company_key(name: str) -> str:
-    """Comparable company name: ``The Boeing Company`` and ``BOEING CO`` both give ``boeing``."""
-    s = re.sub(r"[^a-z0-9&]+", " ", (name or "").lower().replace("\u2019", "'").replace("'s", "s"))
-    return re.sub(r"\s+", " ", _LEGAL_SUFFIX.sub(" ", s)).strip()
+company_key = scp.company_key  # shared with the 10-K parser
 
 
 def _norm(s: str) -> str:
@@ -338,12 +332,21 @@ class EightKSupplyLinks:
         return out
 
     def resolve_counterparty(self, name: str) -> tuple[str, scp.DerivedNode | None]:
-        """Graph node by name, else an SEC-listed company (its node, or a new ``ticker`` node), else private."""
+        """Graph node by name, else an SEC-listed company (its node, or a new ``ticker`` node), else private.
+
+        Exact names come before parents: "Coca-Cola Consolidated" is its own
+        SEC filer (COKE), not a subsidiary of the graph's Coca-Cola (KO).
+        """
         key = company_key(name)
-        node = self._graph_names.get(key) or _parent(key, self._graph_names)
+        node = self._graph_names.get(key)
         if node:
             return node, None
-        cik = self._by_name.get(key) or _parent(key, self._by_name)
+        cik = self._by_name.get(key)
+        if not (cik and cik in self._universe):
+            node = _parent(key, self._graph_names)
+            if node:
+                return node, None
+            cik = _parent(key, self._by_name)
         if cik and cik in self._universe:
             sym, nid, in_graph = self._universe[cik]
             return nid, None if in_graph else scp.DerivedNode(id=nid, name=_display(self._titles.get(cik, name)),
@@ -497,7 +500,7 @@ class EightKSupplyLinks:
         payload = {"last_day": last_day.isoformat(), "seen": seen[-SEEN_KEEP:],
                    "attempts": dict(attempts or {}), "gave_up": list(gave_up or []),  # never truncated: each is a recoverable failure
                    "updated_at": datetime.now(timezone.utc).isoformat()}
-        CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        scp.ensure_checkpoint_dir(CHECKPOINT_PATH)
         tmp = CHECKPOINT_PATH.with_name(CHECKPOINT_PATH.name + ".tmp")
         tmp.write_text(json.dumps(payload, indent=1))
         tmp.replace(CHECKPOINT_PATH)

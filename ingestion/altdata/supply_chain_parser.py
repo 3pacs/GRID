@@ -380,6 +380,27 @@ def _slug(name: str) -> str:
     return s
 
 
+_LEGAL_SUFFIX = re.compile(
+    r"\b(inc|incorporated|corp|corporation|co|company|companies|ltd|limited|plc|llc|lp|l p|holdings?|group|"
+    r"s a s|sas|s a|sa|n v|nv|ag|se|pbc|the)\b")
+
+
+def company_key(name: str) -> str:
+    """Comparable company name: ``The Boeing Company`` and ``BOEING CO`` both give ``boeing``."""
+    s = re.sub(r"[^a-z0-9&]+", " ", (name or "").lower().replace("\u2019", "'").replace("'s", "s"))
+    return re.sub(r"\s+", " ", _LEGAL_SUFFIX.sub(" ", s)).strip()
+
+
+def ensure_checkpoint_dir(path: Path) -> None:
+    """Create the directory ``path`` is written into.
+
+    ``outputs/supply_chain`` is a tracked symlink into ``/data/grid/outputs``
+    so checkpoints outlive release swaps; ``mkdir`` on the link itself fails
+    while its target is missing, so the target is created instead.
+    """
+    path.parent.resolve().mkdir(parents=True, exist_ok=True)
+
+
 def _clean_name(raw: str) -> str:
     name = raw.strip()
     name = re.sub(r"[\s]+", " ", name)
@@ -478,6 +499,10 @@ class SupplyChain10KParser:
         self.name_to_node_id: dict[str, str] = {}
         self._cik_cache: dict[str, str] = {}
         self._ticker_to_node: dict[str, str] = {}
+        # company_key(node name) -> node id, so "Walmart Inc." finds the
+        # "Walmart" node instead of minting a private walmart_inc node.
+        self._name_keys: dict[str, str | None] = {}
+        self._name_key_is_ticker: dict[str, bool] = {}
         self._load_node_catalog()
 
     # ── Node catalog ──────────────────────────────────────────────────────
@@ -494,6 +519,7 @@ class SupplyChain10KParser:
                 self.seed_node_ids.add(nid)
                 if node_name:
                     self.name_to_node_id[node_name.lower().strip()] = nid
+                    self._add_name_key(node_name, nid, node_type == "ticker")
                 # Handle ticker-type nodes — id is already the lowercase ticker
                 if node_type == "ticker":
                     self._ticker_to_node[nid.upper()] = nid
@@ -529,6 +555,26 @@ class SupplyChain10KParser:
             time.sleep(_RATE_LIMIT_SLEEP)
         except Exception as exc:
             log.error("SEC ticker map fetch failed: {e}", e=str(exc))
+
+    def _add_name_key(self, name: str, node_id: str, is_ticker: bool) -> None:
+        """Index ``name`` by its company_key; a listed node beats an unlisted one.
+
+        Two nodes of the same kind with one key are ambiguous: the key then
+        resolves to nothing, and the name falls through to the old paths.
+        """
+        key = company_key(name)
+        if not key:
+            return
+        if key not in self._name_keys:
+            self._name_keys[key], self._name_key_is_ticker[key] = node_id, is_ticker
+            return
+        held, held_ticker = self._name_keys[key], self._name_key_is_ticker[key]
+        if held == node_id or (held_ticker and not is_ticker):
+            return
+        if is_ticker and not held_ticker:
+            self._name_keys[key], self._name_key_is_ticker[key] = node_id, True
+        else:
+            self._name_keys[key] = None
 
     def _resolve_cik(self, ticker: str) -> str | None:
         self._fetch_cik_map()
@@ -661,6 +707,12 @@ class SupplyChain10KParser:
             return "", None
 
         lower = cleaned.lower()
+        key = company_key(cleaned)
+        keyed = self._name_keys.get(key)
+        # A listed company under any legal form wins over an exact-name
+        # match to an unlisted node ("Walmart Inc" private vs "Walmart").
+        if keyed and self._name_key_is_ticker.get(key):
+            return keyed, None
         # Direct lookup by name
         if lower in self.name_to_node_id:
             return self.name_to_node_id[lower], None
@@ -668,6 +720,9 @@ class SupplyChain10KParser:
         tkr_guess = cleaned.upper()
         if tkr_guess in self._ticker_to_node:
             return self._ticker_to_node[tkr_guess], None
+        # Same company, different legal form
+        if keyed:
+            return keyed, None
 
         # Common short-form fuzzy rules
         aliases = {
@@ -678,6 +733,7 @@ class SupplyChain10KParser:
             "foxconn": "foxconn",
             "hon hai": "foxconn",
             "hon hai precision": "foxconn",
+            "wal-mart": "wmt",
         }
         for alias, node_id in aliases.items():
             if alias in lower and node_id in self.seed_node_ids:
@@ -954,7 +1010,7 @@ class SupplyChain10KParser:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
             }
-            _CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            ensure_checkpoint_dir(_CHECKPOINT_PATH)
             tmp = _CHECKPOINT_PATH.with_name(_CHECKPOINT_PATH.name + ".tmp")
             tmp.write_text(json.dumps(payload, indent=2))
             tmp.replace(_CHECKPOINT_PATH)  # atomic: a crash mid-write never loses the progress
@@ -1091,6 +1147,7 @@ class SupplyChain10KParser:
                     inserted_nodes += 1
                     self.seed_node_ids.add(node.id)
                     self.name_to_node_id[node.name.lower().strip()] = node.id
+                    self._add_name_key(node.name, node.id, node.type == "ticker")
 
             # Also ensure the downstream ticker has a node entry
             if downstream_id not in self.seed_node_ids:
