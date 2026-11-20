@@ -4,7 +4,7 @@ Scope: source audit on 2026-11-09. GRID base 2945e95cacb29cd9c9a880c87bc5346fc1b
 
 ## Finding
 
-GRID is the intended API base and GEX its dashboard, but today's implementation is partly segregated. GEX gex-watch computes the level book, applies publication guards, and reads Muse tape.db plus gex-signals signals.db. GRID's derivatives API separately runs DealerGammaEngine against options capture tables. The existing GRID gamma-watch bridge only exposes state, journal, contracts and archive. Shared host or input providers do not establish equivalent validation, calculation, storage or deployment.
+GRID is the intended API base and GEX its dashboard, but today's implementation is partly segregated. GEX gex-watch computes the level book, applies publication guards, and reads Muse tape.db plus gex-signals signals.db. GRID's derivatives API separately runs DealerGammaEngine against options capture tables. At the 2026-11-09 audit the GRID gamma-watch bridge exposed only state, journal, contracts and archive. Since then (2026-11-10 onward) main also serves a GRID-native private Gamma Board on the same router (`/board/{symbol}`, `/intraday/{symbol}`, `/time-map/{symbol}`, `/spy-band-flags`; admin-only, behind `SCHWAB_PRIVATE_GEX_BOARD_ENABLED`), computed by `api/gamma_board*.py` from GRID captures or the Schwab reader. That board is a separate GRID calculation, not these GEX projections; its heat maps are not parity evidence for `heatmap`/`heatmap_live` below. Shared host or input providers do not establish equivalent validation, calculation, storage or deployment.
 
 | Improvement | GEX source | GRID status before this patch |
 | --- | --- | --- |
