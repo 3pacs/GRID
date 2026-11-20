@@ -103,13 +103,13 @@ Companies that qualify on the last session of each year (`counts`):
 
 | Floors | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 |
 |---|---|---|---|---|---|---|---|
-| $2 and $1M a day (proposed) | 2,758 | 2,806 | 2,726 | 2,748 | 3,121 | 3,360 | 2,805 |
+| $2 and $1M a day (owner decision, 2026-11-20) | 2,758 | 2,806 | 2,726 | 2,748 | 3,121 | 3,360 | 2,805 |
 | $5 and $10M a day (the factory's default) | 1,556 | 1,618 | 1,667 | 1,607 | 1,846 | 1,960 | 1,661 |
 
-So the proposed floors add about 1,100 to 1,400 companies a year below the default ones. These counts are of
+So these floors add about 1,100 to 1,400 companies a year below the default ones. These counts are of
 companies with prices; the missing quarter of ended companies is not in them.
 
-**Load check.** The factory change in draft PR #1291 loaded this panel (bars and the universe mask only:
+**Load check.** The factory change in PR #1291 loaded this panel (bars and the universe mask only:
 no signal, no outcome, no ledger): 9,471 price files, 3,524 sessions from 2009-01-02 to 2022-12-30, no
 sector labels, 316 seconds and 6.9 GB of memory at peak. Its count of rankable companies at $2 and $1M
 equals `counts` on the last session of every year from 2009 to 2022. The first attempt failed: the
@@ -165,14 +165,17 @@ served are never ranked by mistake. A second build removes a panel file whose co
 
 - **The factory on main cannot load this store.** It stops with an error when `sectors.csv` has no labels,
   and its floors are constants ($5 and $10M a day). The change is drafted on its own branch,
-  `claude/xs-factory-floors-nosector-20261120` (draft PR #1291, 2026-11-20, not merged): floors become
+  `claude/xs-factory-floors-nosector-20261120` (PR #1291, 2026-11-20, ready for review, not merged): floors become
   optional run-file fields, and a header-only `sectors.csv` loads as "no labels", pooled rankings only. A
   run file without the new fields gives a byte-identical report. A panel built here ran through that
   draft end to end on a test store, and the real panel loads in it (above). No signal has been run on
   real small-cap data. The 2016 start needs no change.
 - No sector source, so no within-sector ranking, sector gate or sector card for small caps yet.
 - The factory's default cost is 1 bp a side, set for index members. A small-cap run file must set its
-  own figure, measured on real tickets the way #1214 does for index members.
+  own figure. Owner decision, 2026-11-20: the first run file assumes 25 bp a side. That is a stand-in
+  from a rough spread estimate on the daily bars (about 34 bp a side for stocks trading $1M to $3M a day,
+  22 bp for $3M to $10M, 18 bp for $10M to $50M, 8 bp above; single years read from zero to 48 bp for
+  the whole universe). It is not measured. Real tickets, the way #1214 does for index members, replace it.
 - Share-kind filtering is by name. It has not been checked against a list of security types.
 
 ## Where the data is
