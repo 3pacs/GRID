@@ -748,7 +748,7 @@ def plan_feature(
     # dark dates instead: the on-basis raw series must agree with itself, so a
     # junk print inside the span is still caught.
     candidate_ref = NeighbourReference.from_values({
-        d: max(raw[target][d], key=lambda c: c.pull_date).value
+        d: max(raw[target][d], key=candidate_order).value
         for d in dark if raw.get(target, {}).get(d) and d in raw.get("close", {})
         and (inception is None or d >= inception)
     })

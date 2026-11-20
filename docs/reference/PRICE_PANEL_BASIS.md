@@ -121,7 +121,7 @@ wrong, and the follow-up takes the ticker from the entity-map feed instead
 |---|---|---|
 | `OUT_OF_SCOPE` | `btc_full`, `eth_full`, `sol_full` (Binance/CoinGecko), anything whose static feed is not one `YF:<T>:<basis field>` series | never fed by the two yfinance fields, so the alternating-basis defect cannot exist there; a same-named yfinance ticker (bare `BTC`/`ETH` pulled as equities 2025-11..2026-05) is unrelated. The r1 run planned 96-97 % retraction and left them dark |
 | `NO_BASIS_SPLIT` | `RAW_CLOSE_FULL_FEATURES` except `spy_full`: `gold_full` (`GC=F`), `sp500_full`, `btc_usd_full`, `eth_usd_full`, `sol_usd_full` | no corporate actions, `adj_close == close`; a value matching one field only is pull-timing drift on a 24/7 or settlement bar, not a basis flip (r1 would have retracted 2,058 `eth_usd_full` rows for nothing). `gold_full` in r1 was compared against ticker `GOLD` = Barrick: 100 % retract, after-ratio 1.12 = Barrick, before-ratio 3.65 = gold |
-| `NEEDS_BACKFILL` | in scope, but more than `--coverage-floor` (1 %) of today's served cells would have no on-basis raw row to re-vintage from: `acn_full`, `hon_full` (Tiingo `adj_close` starts 2021-04-01, ~half of the 2010+ cells) | **backfill first, repair second.** A backfill writes `YF:<T>:adj_close` rows with the backfill day's pull date; re-running the plan then re-vintages every dark cell from them. Until then these features are internally consistent raw-close series (the panel no longer runs the heuristic adjuster, so the residual error is dividend-sized). The JSON carries `backfill_hint` with the obs_date range |
+| `NEEDS_BACKFILL` | in scope, but more than `--coverage-floor` (1 %) of today's served cells would have no on-basis raw row to re-vintage from: `acn_full`, `hon_full` (Tiingo `adj_close` starts 2021-04-01, ~half of the 2010+ cells) | **backfill first, repair second.** A backfill writes `YF:<T>:adj_close` rows with the backfill day's pull date; re-running the plan then lists a re-vintage for every dark cell from them (review manifest only: applying it needs the future executor below). Until then these features are internally consistent raw-close series (the panel no longer runs the heuristic adjuster, so the residual error is dividend-sized). The JSON carries `backfill_hint` with the obs_date range |
 | `EXCLUDED` | named with `--exclude` | operator's call, reported, never read or written |
 
 Dark-cell accounting, per feature: `cells_dark_before` (no visible row today: every row
@@ -174,7 +174,13 @@ many of them can be re-vintaged from an on-basis raw row. Reads are bounded (res
 `feature_id`; raw by `(series_id, obs_date)` yearly chunks), READ ONLY, with a statement
 timeout, and refused inside the 03:30-10:30 UTC DB window unless `--allow-db-window`.
 
-**2026-11-09 safety boundary: apply is disabled.** CLI `--apply`, `run(apply=True)`
+**Apply is disabled from this change on.** The earlier per-feature executor was used in
+production for every in-scope feature before it was removed: run tags
+`full-basis-20261109` (99 features, 2026-11-09), `full-basis-20261110-nine` (the nine
+`NEEDS_BACKFILL` features after the ACN/HON backfill and the 30-day guard fix) and
+`full-basis-20261110-xlre` (`xlre_full`, after the pre-inception fix). Those retractions are
+append-only rows in `resolved_series_retractions`, keyed by `run_tag`; nothing here touches
+them. From now on CLI `--apply`, `run(apply=True)`
 and direct `apply_plan` all refuse before opening a connection. The previous
 unreviewed per-feature executor and `ON CONFLICT DO NOTHING` writes were removed.
 A run tag is not admission. No current manifest, including r1/r2, authorizes repair.
@@ -277,7 +283,7 @@ The same list is in the script's JSON output under `downstream`.
 |---|---|---|
 | `YF:HON:adj_close` has no SUCCESS row since **2026-04-17** while `YF:HON:close` continues | grid-svr read 2026-11-08: 1,267 rows 2021-04-01..2026-04-17, source TIINGO | puller: find why Tiingo's adj_close for HON stopped; check `pull_log` for every ticker whose `adj_close` max(obs_date) lags its `close`. Under the one-basis policy `hon_full` gets no new vintages until fixed |
 | Barrick (`GOLD`) in the Tiingo daily list has fed `gold_full` since **2025-12-02** | `YF:GOLD:adj_close` 3,500 rows 2025-12-02..2026-11-06 (TIINGO); `YF:GOLD:close` 10,840 rows since 1985 (KAGGLE_BULK, TIINGO) | the fallback guard stops new rows; `gold_full` rows dated 2025-12 onward whose latest vintage is a Barrick value (~$20-40 against ~$4,000 futures) still need a targeted retraction (own run tag, `resolved_series_retractions`), not this script |
-| `acn_full`, `hon_full` and any other `NEEDS_BACKFILL` feature | Tiingo `adj_close` backfill starts 2021-04-01 | backfill `YF:<T>:adj_close` 2010-01-01..2021-03-31 (Tiingo `tiingo-backfill`), then re-run the plan |
+| `acn_full`, `hon_full` and any other `NEEDS_BACKFILL` feature | Tiingo `adj_close` backfill starts 2021-04-01 | backfill `YF:<T>:adj_close` 2010-01-01..2021-03-31 (Tiingo `tiingo-backfill`), then re-run the plan. Done for ACN/HON 2010-01-04..2014-03-26 and applied under `full-basis-20261110-nine`; `acn_full` still has no cells 2014-03..2021-03. Any further repair needs the qualified executor (apply is disabled) |
 | the 150-cell dark group shared by `qqq_full`, `dia_full`, `xle_full`, `xlv_full`, `xlu_full` (r2) | one obs_date range with no `adj_close` raw row on every SPDR/QQQ | the follow-up script reports it as `cells_newly_dark` with the range (≈ 3 % of cells, above the 1 % floor → `NEEDS_BACKFILL`) or as `cells_dark_before`; backfill that range if the former |
 | r2 left the four headline features untouched: `xlp_full`, `xlb_full`, `xlre_full`, `xli_full` served the 2010-01-01 holiday junk print first before AND after (xlp 0.7245 → 90.08, ratio 124, 301 jumps) | the dark holiday cell was re-vintaged from the junk print itself | fixed in the follow-up (re-vintage guard, `cells_phantom_cleared`); r3 must show `served_after.first` on a trading day for all four and `after_first_not_trading_day` empty in the report |
 | `xle_full` last served cell 2026-11-06 = 61.62 (XLE was ~$90 in 2025) | r2 served_after; the 150-cell dark group also sits on XLE | glance at `YF:XLE:close` / `adj_close` 2026 raw rows when the 150-cell range is read; a wrong last cell makes the 3.57 ratio wrong too |
