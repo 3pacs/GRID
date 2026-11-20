@@ -220,3 +220,4 @@ Read the matching file only when the task calls for it — keep this core file l
 | Ranking an index's stocks on a signal (cross-section factory: discovery runs, sector-aware cards, the queue of published effects) | `docs/reference/CROSS_SECTION_FACTORY.md` (+ `analysis/cross_section_factory.py`, `analysis/cross_section_queue.py`, `docs/research/cross-section-queue.json`) |
 | Registering or running edge-search looks (trading-rule hypotheses judged once on fresh data, Hermes edge stream) | `docs/reference/EDGE_STREAM.md` (+ `alpha_research/edge_stream/`) |
 | Conditioning on market state, regime, events or news; standardizing a variable against its own baseline | `docs/reference/MARKET_STATE_RECORD.md` (+ `intelligence/regime/market_state.py`, `baseline.py`) |
+| Proving what the Research Desk's sources said when read after a session close (leads, declared tests, factory ledger) | `docs/reference/DESK_SOURCE_RECEIPTS.md` (+ `intelligence/desk_source_receipts.py`) |

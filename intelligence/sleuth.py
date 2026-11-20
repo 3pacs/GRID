@@ -439,16 +439,23 @@ class Sleuth:
         category: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        *,
+        origin: str | None = None,
+        created_since: datetime | None = None,
+        created_until: datetime | None = None,
         conn: Any = None,
     ) -> list[Lead]:
         """Query leads with optional filters, in a total order (``id`` breaks
-        ties) so pages never repeat or skip a lead. ``conn`` reads inside the
-        caller's transaction."""
+        ties) so pages never repeat or skip a lead. The created bounds are
+        inclusive. ``conn`` reads inside the caller's transaction."""
         params: dict[str, Any] = {
             "lim": limit,
             "off": offset,
             "status": status,
             "category": category,
+            "origin": origin,
+            "since": created_since,
+            "until": created_until,
         }
 
         stmt = text(
@@ -458,6 +465,9 @@ class Sleuth:
             "FROM investigation_leads "
             "WHERE (:status IS NULL OR status = :status) "
             "AND (:category IS NULL OR category = :category) "
+            "AND (:origin IS NULL OR origin = :origin) "
+            "AND (:since IS NULL OR created_at >= :since) "
+            "AND (:until IS NULL OR created_at <= :until) "
             "ORDER BY priority DESC, created_at DESC, id ASC "
             "LIMIT :lim OFFSET :off"
         )
