@@ -1659,7 +1659,25 @@ def main(argv=None) -> int:
                    help="record count of a head of this ledger, at or after the registration, that was recorded off-host")
     p.add_argument("--witness-head", required=True, help="that head's sha256")
     p.add_argument("--witness-where", required=True, help="where the off-host copy is (for example the Desk receipt hub post)")
+    w = sub.add_parser("verdicts-witness", help="mark live verdicts as witnessed by a Desk receipt that read the same stored look")
+    w.add_argument("--payload", required=True, type=Path, help="the receipt's panel_trials payload file")
+    w.add_argument("--receipt-session", required=True)
+    w.add_argument("--receipt-head", required=True, help="the receipt record's head sha256, as posted off-host")
+    w.add_argument("--ledger", required=True, type=Path)
+    w.add_argument("--anchor", required=True, type=Path)
     a = ap.parse_args(argv)
+    if a.cmd == "verdicts-witness":
+        try:
+            ledger = lse.Ledger(a.ledger, anchor=a.anchor)
+            appended = lse.witness_factory_verdicts(ledger, a.payload.read_bytes(), receipt_session=a.receipt_session,
+                                                    receipt_head_sha256=a.receipt_head)
+        except (ValueError, OSError) as e:
+            print(json.dumps({"ok": False, "refused": str(e)}))
+            return 2
+        live = lse.summarize(ledger)["live"]
+        print(json.dumps({"ok": True, "witnessed_now": appended, "witnessed": live["witnessed"], "unwitnessed": live["unwitnessed"],
+                          "head_sha256": ledger.head}))
+        return 0
     if a.cmd in ("prescreen", "prescreen-register"):
         from analysis import factory_prescreen  # imported here: that module imports this one
 
