@@ -452,6 +452,28 @@ is retired — two writers of `review.jsonl` would race; the pull mirror is reti
 LLM extraction path against a live provider (no narrative exists in any current packet to
 extract from), and the deploy-time unit sync on the real host.
 
+## 2026-11-09 - Offline company document intake
+
+Added ingestion/company_documents.py, a bounded no-network raw-document archive,
+plus scripts/ingest_company_document.py and an explicit consumer/runbook contract.
+This complements existing SEC financial and AV transcript work without modifying
+those collectors. Every snapshot binds raw bytes, metadata, parsed text and parser
+version; atomic no-replace publication preserves revisions and supports retries.
+Publication time remains distinct from retrieval and unknown timestamps stay unknown.
+Unsupported PDF/encoding and empty text are visible missingness, not usable evidence.
+
+Validation: 39 offline intake tests pass, including concurrent capture, corruption,
+PIT boundaries and CLI roundtrip; changed Python Ruff passes. No live downloads,
+paid providers, production DB, schedule, migration, repair, merge or deployment.
+Document authenticity, complete coverage and semantic fact extraction remain outside
+this primitive. Full repository CI has not been run for this local candidate.
+
+Integrated the separate evidence-quality gate and archive-verified reader wrapper.
+Combined final local validation: 62 tests and 9 subtests passed, including true
+archive-to-quality roundtrip, tamper rejection and high-precision numeric conflict
+regressions. Independent intake review found no critical defect under the documented
+trusted-archive assumption. Quality is not truth/authenticity or complete coverage.
+
 ## 2026-11-09 — Review visible to every agent; briefing figures graded (Claude)
 
 Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/grade_publication_review.py`:
@@ -468,7 +490,34 @@ Anik: "yeah fix it, codex still cant see it". Two causes, two fixes in `scripts/
   carry 59 such figures. `oracle/claim_verifier.py` was not reused: it reads the latest value,
   the wrong clock for grading a past publication.
 
+## 2026-11-09 - Deterministic briefing guard regression clock
 
+Full Python 3.14 CI found a pre-existing test false positive: forbidden financial
+text 8.96 happened to occur inside assembly timestamp 08:16:38.960504. Pin the
+single regression's briefing clock while preserving all numeric, semantic, file
+and DB-persistence assertions. No production code or guard changes.
+
+Local Windows run: 241 briefing tests passed; 15 cannot execute because the
+existing social sentiment import requires Unix fcntl. The targeted regression
+is among those platform-blocked tests. Hosted Linux full CI is the acceptance
+check. Company intake/quality remains 62 tests and 9 subtests passing.
+
+
+## 2026-11-09 - prepare private GEX projection parity in GRID (not activated)
+
+- Audited the GEX dashboard/GRID API split and documented it in `docs/reference/GEX_GRID_API_PARITY.md`. Shared hosts and raw stores do not make publication guards universal.
+- Added a default-off, admin-only nine-view read bridge under `/api/v1/gamma-watch/private/{view}`. It preserves upstream guarded payloads and source clocks, rejects unknown view/schema/status, and exposes no private state, raw contracts or write route. No production setting or service was changed.
+- Hardened the shared upstream JSON reader against finite-token overflow such as `1e400`.
+- Validation: 121 focused synthetic bridge/private-auth tests passed, changed-file E/W/F and repository blocking Ruff passed with Python 3.11 target. Full backend/PostgreSQL, live parity, entitlement review, browser checks and release remain unrun.
+- Next: verify actual private audience and paired endpoint evidence before activation; consolidate quality/calculation contracts behind GRID and migrate GEX consumers incrementally, retaining volume containment and existing release ownership.
+
+
+## 2026-11-09 - reconcile and qualify the private GEX API bridge locally
+
+- Direct GitHub main check confirms base 2945e95c is current; no rebase is required. Open PR search found no overlapping bridge owner; #982 is separate browser acceptance.
+- Require the literal boolean True for the private-views gate, because mutable Settings assignment is not validated; add the disabled flag to .env.example and negative controls. Disabled or failed reads now have a null receipt timestamp, separate from bridge evaluation time.
+- Final relevant offline validation: 1,139 passed, no skips, after supplying the existing historical engine-reference commit. Python outbound sockets were blocked and no live DB was used. Python 3.11-target lint, wikilink and whitespace checks pass. Exact CI-default Ruff has two pre-existing BaseExceptionGroup target errors in an unchanged test file. Bandit is absent; full backend/PG, browser, entitlement and live parity gates remain unrun.
+- Local branch/commit and draft PR text only. Publication needs user approval; no push, merge, deployment or feature activation.
 
 ## 2026-11-09 - Bound Oracle actor evidence and preserve source lineage
 
