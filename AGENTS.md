@@ -573,6 +573,74 @@ also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
 No production access, send, generator, migration, service change, merge or deploy.
 See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.
 
+## 2026-11-16 - Version and label fixed-moneyness IV wings (source only)
+
+- Replaced misleading future `iv_25d_*` writes with shared, explicitly named
+  90%/110%-spot band-mean proxies. Added nullable method/expiry/provider/spot,
+  capture and sample lineage on daily signals and each primary resolved value.
+  Original legacy columns, registry history and research are not rewritten.
+- Term structure uses the observed spot from one immutable capture; Watchlist
+  and derivatives expose deprecated 25d keys as NULL and use the proxy names.
+  Unknown legacy values remain separately labeled. Mixed/unknown methods,
+  providers and tenors cannot enter the new spread percentile; missing wings
+  stay missing. Bulk writes new raw IDs with payload lineage, kept unmapped
+  until a lineage-aware resolver is reviewed. New primary features are not
+  model-eligible and do not forward-fill. Surfacer clears incompatible wings.
+- Separately labeled the existing ATM-IV Black-Scholes delta-strike surface
+  approximation, removed its silent fixed-wing fallback and out-of-support
+  clamping, and propagated its method to scanner receipts/digest descriptions.
+  Existing scanner thresholds are unchanged; loaded legacy wings are not scored.
+- Verification: 455 offline tests passed with outbound sockets blocked; one
+  disposable-PostgreSQL test skipped (no dedicated DSN). Shared helper coverage
+  100%. E/W/F lint (excluding E501/E402), compilation, single Alembic head and
+  derivatives production build passed. API functions and JSON serialization
+  were tested; sandbox ASGI TestClient hung, so full HTTP acceptance is unproven.
+- Added `docs/reference/OPTIONS_WING_IV_METHODS.md` with compatibility/release
+  boundaries and an opt-in PostgreSQL migration/upsert/lineage preservation test.
+  Dedicated source branch only. No provider request, production query, data
+  repair, holdout access, service/schedule change, merge or deploy. Anik alone
+  applies releases; migration precedes code and API/UI ship together.
+
+### Same task - exact schema conformance and retained-review follow-up
+
+- Both backend CI jobs on a0a13c3a failed only the exact resolved-series column
+  pin (21,545 passed in each). Added the nullable `options_iv_metadata` column
+  explicitly to that exact set, preserved the equality assertion, tested its
+  JSONB/no-default declaration against the real migration operation, and added
+  the options publisher to guarded SQL modules with mandatory SQL coverage.
+- Read Claude's exact-head REQUEST_CHANGES before editing. Preserved that
+  verdict and v1 kit. Also retained existing BRK-B bulk IDs for untouched
+  metrics and tested their preservation; clarified latest-capture abstention,
+  unknown-provider missingness and the sector analytics legacy-suffix boundary.
+- Expanded offline selection includes the schema guard: 480 passed, one
+  explicit disposable-PostgreSQL skip; shared helper still 100% covered. No
+  claim that old-head CI or the old REQUEST_CHANGES verdict is cleared by this
+  local result. The same draft PR needs new-head CI and retained verification.
+- No production/holdout access, provider request, credential/service change,
+  merge or apply. Anik retains release authority.
+
+### Same task - close the real PostgreSQL and HTTP qualification gaps
+
+- Reconciled retained Claude ACCEPT_WITH_NOTES and green exact-head CI on
+  9efefc1b. Fresh main c24b418b and current #1226 216714b7 each gave clean
+  non-mutating merge-tree analysis; no combined #1226 changes were published.
+- A real run in a uniquely named database on an already-running local test
+  PostgreSQL container reached Surfacer after passing migration retry,
+  producer upsert, legacy preservation and resolved lineage. It exposed a
+  fixture-only missing created_at column (present in the declared schema).
+  Added that column to the fixture. The failed run and verified database
+  cleanup are retained in the v3 qualification evidence, not overwritten.
+- Added six in-process ASGI HTTP regressions. All six pass with outbound
+  socket connections blocked. The earlier hang was independently reproduced
+  by a trivial worker-thread control: the restrictive sandbox denies AsyncIO's
+  self-pipe socket.send. HTTP runs outside that restriction need no server.
+  Successful-auth routing uses a synthetic override; unauthenticated routing
+  is tested without it. Deployed app/auth-store acceptance remains separate.
+- Qualification-only tests/documentation delta; no provider or IV calculation
+  implementation, migration DDL, historical data or holdout changes. New-head
+  CI and the existing verifier's updated disposition remain separate from the
+  old accepted-head evidence. No new Claude handoff or release action.
+
 ## 2026-11-14 — Integrate accepted offline NVDA desk report
 
 Additive #1085 report mode joins the existing frozen ledger, historical cash

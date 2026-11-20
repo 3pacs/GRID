@@ -208,7 +208,6 @@ def puller(monkeypatch: pytest.MonkeyPatch) -> options.OptionsPuller:
     monkeypatch.setattr(options, "compute_max_pain", lambda *_args: 100.0)
     monkeypatch.setattr(options, "compute_iv_skew", lambda *_args: 0.0)
     monkeypatch.setattr(options, "_compute_atm_iv", lambda *_args: 0.2)
-    monkeypatch.setattr(options, "_compute_wing_iv", lambda *_args, **_kwargs: 0.2)
     monkeypatch.setattr(options, "_compute_oi_concentration", lambda *_args: 0.5)
     return obj
 
