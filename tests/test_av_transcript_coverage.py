@@ -122,7 +122,6 @@ def puller(tmp_path, monkeypatch):
     monkeypatch.setattr("ingestion.earnings_events_puller.time.sleep", lambda _: None)
     p = EarningsEventsPuller(MagicMock(), av_api_key="synthetic-secret", av_max_calls=2,
                              av_state_path=tmp_path / "state.db")
-    monkeypatch.setattr(p, "_classify_transcript_sentiment", lambda _: (None, None))
     return p
 
 

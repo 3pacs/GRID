@@ -87,7 +87,6 @@ def puller(engine, tmp_path, monkeypatch):
                           "(1,'earnings_events'),(2,'SEC_EDGAR_Fundamentals'),(3,'other')"))
     p = EarningsEventsPuller(engine, av_api_key="synthetic-test-key", av_max_calls=1,
                              av_state_path=tmp_path / "state.db")
-    monkeypatch.setattr(p, "_classify_transcript_sentiment", lambda _: (None, None))
     return p
 
 

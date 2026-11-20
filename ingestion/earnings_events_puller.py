@@ -374,7 +374,8 @@ class EarningsEventsPuller(BasePuller):
                     continue
                 entries = payload["transcript"]
                 summary, full_text, sent_label = self._summarize_transcript(entries)
-                llm_label, llm_conf = self._classify_transcript_sentiment(full_text)
+                # AV-derived label at a flat 0.8 confidence: the LLM classifier
+                # module never existed (see SENTIMENT_NOTICE).
                 inserted = self._upsert_event(
                     ticker=ticker, cik=cik_map.get(ticker), event_type="EARNINGS_CALL",
                     # This is the matched SEC filing date, NOT an invented call date.
@@ -384,15 +385,15 @@ class EarningsEventsPuller(BasePuller):
                     url=f"{AV_URL}?function=EARNINGS_CALL_TRANSCRIPT&symbol={ticker}&quarter={period.quarter}",
                     title=f"{ticker} Earnings Call Transcript {period.quarter}",
                     summary=summary, full_text=full_text,
-                    sentiment=llm_label if llm_label is not None else sent_label,
-                    confidence=float(llm_conf) if llm_conf is not None else 0.8,
+                    sentiment=sent_label,
+                    confidence=0.8,
                     raw_payload={"symbol": ticker, "quarter": period.quarter,
                                  "entry_count": len(entries),
                                  "fiscal_period_source": "SEC_EDGAR_Fundamentals",
                                  "fiscal_period_accession": period.accession,
                                  "filing_date_basis": "matched_sec_filing_not_call_date",
                                  "observed_at": datetime.now(timezone.utc).isoformat(),
-                                 "sentiment_source": "llm" if llm_label is not None else "alphavantage_avg"},
+                                 "sentiment_source": SENTIMENT_SOURCE},
                     source="ALPHAVANTAGE",
                 )
                 if inserted:
@@ -737,6 +738,8 @@ class EarningsEventsPuller(BasePuller):
                 )
 
         av_calls, transcripts_inserted = self._pull_planned_transcripts(plans, per_ticker, cik_map)
+        # Every planned transcript carries the AV-average label only.
+        transcripts_av_sentiment_only = transcripts_inserted
 
         # Update last_pull_at in source_catalog
         try:
