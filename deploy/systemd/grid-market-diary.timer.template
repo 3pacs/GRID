@@ -18,6 +18,7 @@
 # Tue..Sat because the previous session of Tue..Fri is Mon..Thu and of Sat is
 # Fri; Sun/Mon mornings have no new session to report. Holidays are handled by
 # the runner (last_trading_day), not the timer.
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
 [Unit]
 Description=Run the GRID market diary writer each morning for the previous US session
 

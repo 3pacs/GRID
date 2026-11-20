@@ -15,7 +15,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from features.lab import FeatureLab
+from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS, FeatureLab
 from store.pit import PITStore
 
 
@@ -40,7 +40,12 @@ class LiveInference:
         """
         self.engine = db_engine
         self.pit_store = pit_store
-        self.feature_lab = FeatureLab(db_engine, pit_store)
+        # Stale inputs read as missing, never as today's value.
+        self.feature_lab = FeatureLab(
+            db_engine, pit_store,
+            max_input_age_days=DEFAULT_INPUT_MAX_AGE_DAYS,
+            input_age_overrides=DEFAULT_INPUT_AGE_OVERRIDES,
+        )
 
         # TurboQuant KV cache manager
         self.kv_cache = None

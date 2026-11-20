@@ -12,9 +12,11 @@ per username that decays over time and is boosted by accurate calls.
 Series stored:
 - SOCIAL:{platform}:{username}:{ticker}:{direction}
 
-Source: Reddit hot-post RSS feed (no credentials; see
-ingestion/altdata/reddit_rss.py). Finviz is retired.
-Schedule: Daily
+Source: the newest posts of each target board from the Arctic Shift archive
+API (no credentials; see ingestion/altdata/arctic_shift.py). Reddit's own
+logged-out RSS feeds answer 404 since about 17:50Z 2026-11-17 (every run
+FAILED from 17:52Z on). Finviz is retired.
+Schedule: hourly (SmartScheduler)
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -30,7 +32,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata import reddit_rss
+from ingestion.altdata import arctic_shift
 from ingestion.base import BasePuller, retry_on_failure
 
 # ── Configuration ────────────────────────────────────────────────────
@@ -46,10 +48,10 @@ TARGET_SUBREDDITS: list[str] = [
     "thetagang",
 ]
 
-# Reddit is read from one combined hot-post RSS feed for every target board
-# (ingestion/altdata/reddit_rss.py). The .json listings return "403 Blocked"
-# from grid-svr and no Data API app was registered, so the OAuth path
-# (reddit_oauth.py) left this source dead from 2026-05-28 to 2026-11-05.
+# Reddit is read from Arctic Shift, one request per target board
+# (ingestion/altdata/arctic_shift.py). The .json listings return "403 Blocked"
+# from grid-svr, no Data API app was registered (reddit_oauth.py), and the
+# hot-post RSS feed used from 2026-11-05 answers 404 since 2026-11-17.
 
 # Minimum trust score to track a user (0-1 scale)
 _MIN_TRUST_SCORE: float = 0.3
@@ -61,15 +63,34 @@ _DEFAULT_TRUST_SCORE: float = 0.5
 _MIN_ACCOUNT_AGE_DAYS: int = 90
 
 # Minimum post score (upvotes - downvotes) to consider, when a score is known.
-# RSS carries no score; there the hot listing itself is the traction filter.
+# Arctic Shift settles scores only ~36 h after a post, so posts inside the
+# window carry none and the corroboration rule below screens them instead.
 _MIN_POST_SCORE: int = 10
 
-# Posts in the combined hot feed, across all target boards
+# Newest posts per target board, from the last _POST_WINDOW_H hours
 _MAX_HOT_POSTS: int = 100
+_POST_WINDOW_H: int = 24
 
 # Without a vote score one post must not become a signal on its own: an
 # unscored (ticker, direction) needs this many distinct authors in the pull.
 _MIN_UNSCORED_AUTHORS: int = 2
+
+# Unscored signals are recorded in raw_series (trust_tier "unscored") but kept
+# out of signal_sources -- the smart_money / social streams the convergence
+# scanner and downstream trading read -- until corroborated across time, by
+# post creation time (never by when a row was pulled):
+#   * "fresh" posts are this pull's posts that no earlier run stored (by post
+#     id, or author + text hash for rows written before post ids were kept);
+#   * prior authors are those of stored posts created at least
+#     _PROMOTE_MIN_AGE_H before the earliest fresh post (and within
+#     _PROMOTE_LOOKBACK_H of the run);
+#   * promotion needs >= _MIN_UNSCORED_AUTHORS prior authors and a fresh
+#     post by an author who is not one of them.
+# Re-pulling the same posts never promotes them, and a burst of throwaway
+# accounts in one window never reaches signal_sources.
+# Arctic Shift exposes no account creation time, so no account-age gate.
+_PROMOTE_MIN_AGE_H: float = 6.0
+_PROMOTE_LOOKBACK_H: float = 48.0
 
 # Finviz insider trading page
 _FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrading.ashx"
@@ -178,8 +199,8 @@ def _text_hash(text_content: str) -> str:
 def _corroborate_unscored(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep scored signals; keep unscored ones only when several authors agree.
 
-    RSS posts carry no vote score, so the minimum-score gate cannot screen
-    them. An unscored (ticker, direction) survives only when at least
+    Posts younger than ~36 h carry no settled vote score (Arctic Shift), so
+    the minimum-score gate cannot screen them. An unscored (ticker, direction) survives only when at least
     ``_MIN_UNSCORED_AUTHORS`` distinct authors posted it in the same pull.
     """
     authors: dict[tuple[str, str], set[str]] = {}
@@ -320,32 +341,44 @@ class SmartMoneyPuller(BasePuller):
     # ------------------------------------------------------------------ #
 
     def _fetch_hot_posts(self, subreddits: list[str]) -> list[dict[str, Any]]:
-        """Hot posts for every target board from one combined RSS feed.
+        """Newest posts of every target board from Arctic Shift (one request each).
 
         Shaped like the Data API post fields ``_parse_reddit_post`` reads.
-        RSS carries no score, comment count or upvote ratio, so those are None.
+        Score and comment count are None until the archive settles them (36 h),
+        so inside the 24 h window they are None. Boards that fail are listed
+        in ``self._fetch_failures``.
 
         Raises:
-            reddit_rss.RedditRateLimited, requests.RequestException: no feed.
+            arctic_shift.ArcticShiftError, requests.RequestException: every board failed.
         """
-        entries = reddit_rss.fetch_feed(
-            f"/r/{'+'.join(subreddits)}/hot.rss", {"limit": _MAX_HOT_POSTS},
-        )
-        canonical = {s.lower(): s for s in subreddits}
-        posts = []
-        for entry in entries:
-            if entry.kind != "t3":
+        until = datetime.now(timezone.utc)
+        since = until - timedelta(hours=_POST_WINDOW_H)
+        posts: list[dict[str, Any]] = []
+        failures: list[str] = []
+        last_exc: Exception | None = None
+        for sub in subreddits:
+            try:
+                rows, _ = arctic_shift.recent_posts(
+                    sub, since=since, until=until, max_pages=1, page_limit=_MAX_HOT_POSTS)
+            except Exception as exc:
+                failures.append(f"r/{sub}: {exc}")
+                last_exc = exc
                 continue
-            posts.append({
-                "title": entry.title,
-                "selftext": entry.body,
-                "author": entry.author,
-                "subreddit": canonical.get(entry.subreddit.lower(), entry.subreddit),
-                "created_utc": entry.published.timestamp() if entry.published else None,
-                "score": None,
-                "num_comments": None,
-                "upvote_ratio": None,
-            })
+            for p in rows:
+                posts.append({
+                    "id": p["id"],
+                    "title": p["title"],
+                    "selftext": p["selftext"],
+                    "author": p["author"],
+                    "subreddit": sub,
+                    "created_utc": p["created_utc"],
+                    "score": p["score"],
+                    "num_comments": p["num_comments"],
+                    "upvote_ratio": None,
+                })
+        self._fetch_failures = failures
+        if subreddits and len(failures) == len(subreddits) and last_exc is not None:
+            raise last_exc
         return posts
 
     def _parse_reddit_post(
@@ -416,6 +449,8 @@ class SmartMoneyPuller(BasePuller):
                 "subreddit": subreddit,
                 "post_title": title[:200],
                 "post_hash": post_hash,
+                "post_id": str(post.get("id") or ""),
+                "created_utc": float(created_utc) if isinstance(created_utc, (int, float)) else None,
                 "post_score": post_score,
                 "post_timestamp": post_timestamp,
                 "trust_score": self._get_trust_score(username),
@@ -464,8 +499,11 @@ class SmartMoneyPuller(BasePuller):
 
         Writes the raw_series row first (always), then emits the
         downstream signal_sources rows for trust scoring + convergence
-        detection. A signal_sources write failure is logged at WARN but
-        does not drop the raw_series row.
+        detection -- only for a scored signal or an unscored one marked
+        ``promoted`` (see _PROMOTE_MIN_AGE_H). A promoted signal whose
+        raw_series row already exists still emits (the upsert is idempotent).
+        A signal_sources write failure is logged at WARN but does not drop
+        the raw_series row.
 
         Parameters:
             conn: Active database connection (within a transaction).
@@ -480,7 +518,11 @@ class SmartMoneyPuller(BasePuller):
             f":{signal['ticker']}:{signal['direction']}"
         )
 
+        scored = signal.get("post_score") is not None
+        emit = scored or bool(signal.get("promoted"))
         if self._row_exists(series_id, obs_date, conn):
+            if emit and not scored:
+                self._emit_guarded(conn, signal, obs_date)
             return False
 
         self._insert_raw(
@@ -494,6 +536,7 @@ class SmartMoneyPuller(BasePuller):
                 "ticker": signal["ticker"],
                 "direction": signal["direction"],
                 "post_hash": signal.get("post_hash", ""),
+                "post_id": signal.get("post_id", ""),
                 "post_timestamp": signal.get("post_timestamp", ""),
                 "post_score": signal.get("post_score", 0),
                 "upvote_ratio": signal.get("upvote_ratio", 0),
@@ -502,11 +545,19 @@ class SmartMoneyPuller(BasePuller):
                 "subreddit": signal.get("subreddit", ""),
                 "relationship": signal.get("relationship", ""),
                 "trade_value": signal.get("trade_value", 0),
+                "trust_tier": "scored" if scored else (
+                    "unscored_promoted" if emit else "unscored"),
             },
         )
 
         # Emit signal_sources rows AFTER the raw_series write so the
         # raw ingest is never dropped due to a signal-source write fault.
+        if emit:
+            self._emit_guarded(conn, signal, obs_date)
+        return True
+
+    def _emit_guarded(self, conn: Any, signal: dict[str, Any], obs_date: date) -> None:
+        """``_emit_signal_sources`` in its own savepoint; a failure is logged, not raised."""
         try:
             # Own savepoint, so a signal_sources fault cannot abort the
             # enclosing transaction and take the raw_series row with it.
@@ -524,7 +575,90 @@ class SmartMoneyPuller(BasePuller):
                 t=signal.get("ticker", "?"),
                 e=str(exc),
             )
-        return True
+
+    def _prior_posts(self, conn: Any, ticker: str, direction: str,
+                     run_start: datetime) -> list[dict[str, Any]]:
+        """Reddit posts for (ticker, direction) stored by earlier runs (last _PROMOTE_LOOKBACK_H).
+
+        Each: ``author``, ``post_id`` ('' for rows written before ids were
+        kept), ``post_hash`` and ``created`` (the post's creation time, epoch
+        seconds, or None). Any failure returns [] (nothing promoted).
+        """
+        try:
+            with conn.begin_nested():
+                rows = conn.execute(text(
+                    "SELECT series_id, raw_payload FROM raw_series "
+                    "WHERE source_id = :src AND series_id LIKE :pat "
+                    "AND pull_status = 'SUCCESS' "
+                    "AND pull_timestamp >= :lo AND pull_timestamp < :hi"
+                ), {
+                    "src": self.source_id,
+                    "pat": f"SOCIAL:reddit:%:{ticker}:{direction}",
+                    "lo": run_start - timedelta(hours=_PROMOTE_LOOKBACK_H),
+                    "hi": run_start,
+                }).fetchall()
+        except Exception as exc:
+            log.debug("SmartMoney: prior-run lookup failed: {e}", e=str(exc))
+            return []
+        out: list[dict[str, Any]] = []
+        for row in rows or []:
+            parts = str(row[0]).split(":")
+            if len(parts) != 5 or parts[3] != ticker or parts[4] != direction:
+                continue
+            payload = row[1] if isinstance(row[1], dict) else None
+            if payload is None:
+                try:
+                    payload = json.loads(row[1])
+                except (TypeError, ValueError):
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            created = None
+            ts = payload.get("post_timestamp")
+            if isinstance(ts, str) and ts:
+                try:
+                    parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    created = (parsed if parsed.tzinfo else
+                               parsed.replace(tzinfo=timezone.utc)).timestamp()
+                except ValueError:
+                    created = None
+            out.append({"author": parts[2], "post_id": str(payload.get("post_id") or ""),
+                        "post_hash": str(payload.get("post_hash") or ""), "created": created})
+        return out
+
+    def _mark_promotions(self, conn: Any, signals: list[dict[str, Any]],
+                         run_start: datetime) -> int:
+        """Set ``promoted`` on unscored signals corroborated across time; groups promoted.
+
+        See the _PROMOTE_MIN_AGE_H comment: prior and fresh evidence are split
+        by post creation time, and posts an earlier run stored are never fresh.
+        """
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for sig in signals:
+            if sig.get("post_score") is None:
+                groups.setdefault((sig["ticker"], sig["direction"]), []).append(sig)
+        promoted: set[tuple[str, str]] = set()
+        oldest_ok = run_start.timestamp() - _PROMOTE_LOOKBACK_H * 3600
+        for (ticker, direction), sigs in groups.items():
+            prior = self._prior_posts(conn, ticker, direction, run_start)
+            stored_ids = {p["post_id"] for p in prior if p["post_id"]}
+            stored_text = {(p["author"], p["post_hash"]) for p in prior if p["post_hash"]}
+            fresh = [s for s in sigs
+                     if isinstance(s.get("created_utc"), (int, float))
+                     and not (s.get("post_id") and s["post_id"] in stored_ids)
+                     and (s["username"], s.get("post_hash", "")) not in stored_text]
+            if not fresh:
+                continue
+            cutoff = min(s["created_utc"] for s in fresh) - _PROMOTE_MIN_AGE_H * 3600
+            prior_authors = {p["author"] for p in prior
+                             if p["created"] is not None and oldest_ok <= p["created"] <= cutoff}
+            new_authors = {s["username"] for s in fresh} - prior_authors
+            if len(prior_authors) >= _MIN_UNSCORED_AUTHORS and new_authors:
+                promoted.add((ticker, direction))
+        for sig in signals:
+            if sig.get("post_score") is None:
+                sig["promoted"] = (sig["ticker"], sig["direction"]) in promoted
+        return len(promoted)
 
     # ------------------------------------------------------------------ #
     # signal_sources emission (smart_money + social heat)
@@ -670,18 +804,20 @@ class SmartMoneyPuller(BasePuller):
         today = date.today()
         self._load_trust_scores()
 
+        self._fetch_failures = []
         try:
             posts = self._fetch_hot_posts(subreddits)
         except Exception as exc:
-            log.warning("SmartMoney: Reddit RSS pull failed: {e}", e=str(exc))
+            log.warning("SmartMoney: Reddit (Arctic Shift) pull failed: {e}", e=str(exc))
             return {
                 "source": "reddit",
                 "status": "FAILED",
-                "error": f"reddit rss fetch failed: {exc}",
+                "error": f"reddit fetch failed (arctic shift): {exc}",
                 "signals_found": 0,
                 "rows_inserted": 0,
             }
-        log.debug("SmartMoney: fetched {n} hot posts from {k} boards",
+        fetch_failures = list(getattr(self, "_fetch_failures", []) or [])
+        log.debug("SmartMoney: fetched {n} recent posts from {k} boards",
                   n=len(posts), k=len(subreddits))
 
         all_signals: list[dict[str, Any]] = []
@@ -689,8 +825,11 @@ class SmartMoneyPuller(BasePuller):
             all_signals.extend(self._parse_reddit_post(post, post["subreddit"]))
         all_signals = _corroborate_unscored(all_signals)
 
-        status = "SUCCESS"
+        status = "PARTIAL" if fetch_failures else "SUCCESS"
         partial_note: dict[str, str] = {}
+        if fetch_failures:
+            partial_note = {"error": f"{len(fetch_failures)} of {len(subreddits)} boards "
+                                     f"failed: {fetch_failures[0]}"}
 
         if not all_signals:
             log.info("SmartMoney: no Reddit signals found")
@@ -704,7 +843,9 @@ class SmartMoneyPuller(BasePuller):
 
         inserted = 0
         store_failures = 0
+        run_start = datetime.now(timezone.utc)
         with self.engine.begin() as conn:
+            self._mark_promotions(conn, all_signals, run_start)
             for signal in all_signals:
                 try:
                     # A savepoint per signal: on PostgreSQL a failed statement
@@ -728,7 +869,8 @@ class SmartMoneyPuller(BasePuller):
 
         if store_failures:
             status = "PARTIAL"
-            partial_note = {"error": f"{store_failures} of {len(all_signals)} signals failed to store"}
+            note = f"{store_failures} of {len(all_signals)} signals failed to store"
+            partial_note = {"error": "; ".join(filter(None, [partial_note.get("error"), note]))}
         return {
             "source": "reddit",
             "status": status,

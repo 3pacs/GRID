@@ -84,6 +84,17 @@ _SPY_PRIMARY = "spy_full"
 _SPY_ENTITY_KEY = "YF:SPY:adj_close"
 _SPY_FALLBACK = "sp500_full"
 
+#: Paper strategies whose trades are not a usable record and must stay out
+#: of every performance figure. Their rows are kept in paper_trades as
+#: history. adaptive_rotation_live (wallet grid_rotation_paper_7913a6f5)
+#: traded off build_price_panel while the ``_full`` panel mixed raw and
+#: adjusted vintages (docs/reference/PRICE_PANEL_BASIS.md; repaired
+#: 2026-11-09/10) and filled 19 of its 23 trades at a stale flat price. It
+#: was the only paper_trades input, so it alone was the "paper" track record.
+INVALID_PAPER_STRATEGIES: dict[str, str] = {
+    "adaptive_rotation_live": "signals from the mixed-basis _full price panel; 19 of 23 fills at a stale price",
+}
+
 _LONG_ALIASES = frozenset({"LONG", "BUY", "UP", "BULLISH", "CALL"})
 _SHORT_ALIASES = frozenset({"SHORT", "SELL", "DOWN", "BEARISH", "PUT"})
 
@@ -520,9 +531,10 @@ def _collect_paper_trades(engine: Engine, as_of: date) -> list[TradeRow]:
                 WHERE entry_date <= :as_of
                   AND entry_price IS NOT NULL
                   AND entry_price > 0
+                  AND (strategy_id IS NULL OR NOT (strategy_id = ANY(:invalid_strategies)))
                 ORDER BY entry_date, id
             """),
-            {"as_of": as_of},
+            {"as_of": as_of, "invalid_strategies": sorted(INVALID_PAPER_STRATEGIES)},
         ).fetchall()
 
     out: list[TradeRow] = []

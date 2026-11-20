@@ -10,8 +10,22 @@
 
 set -o pipefail
 
-REPO=/data/grid_v4/grid_repo
+# The tree this script sits in (the release tree on grid-svr), not the old
+# /data/grid_v4/grid_repo checkout, which is being retired.
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_PY=/data/grid_v4/venv/bin/python
+# GRID_ENV_FILE wins; else /etc/grid/grid.env (the shared env file since
+# 2026-11-17); else the old checkout path, now a symlink to it.
+if [[ -z "${GRID_ENV_FILE:-}" ]]; then
+    for _f in /etc/grid/grid.env /home/grid/grid_v4/grid_repo/.env; do
+        if [[ -r "${_f}" ]]; then GRID_ENV_FILE="${_f}"; break; fi
+    done
+fi
+if [[ -z "${GRID_ENV_FILE:-}" || ! -r "${GRID_ENV_FILE}" ]]; then
+    echo "regression-eval: GRID env file missing or unreadable: ${GRID_ENV_FILE:-<none>} (set GRID_ENV_FILE)" >&2
+    exit 2
+fi
+export GRID_ENV_FILE
 TREND=${HOME}/.grid-regression-trend.jsonl
 ART=${HOME}/.grid-regression-trend
 mkdir -p "${ART}"
@@ -23,7 +37,7 @@ cd "${REPO}"
 eval "$("${VENV_PY}" -c "
 from dotenv import dotenv_values
 import shlex
-for k, v in dotenv_values('.env').items():
+for k, v in dotenv_values('${GRID_ENV_FILE}').items():
     if v is None: continue
     print(f'export {k}={shlex.quote(v)}')
 ")"

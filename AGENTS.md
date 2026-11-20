@@ -319,6 +319,57 @@ Verification and limits:
   own stages) is recorded in the runbook's consumer checklist; the producer cannot
   supply those receipts. Gemini/provider input remains the daily review's own gate.
 
+## 2026-11-07 - market_briefings 5007: 1.5 MB hourly briefing was an unbounded evidence appendix
+
+Cause:
+
+- `ollama/market_briefing.py::_publication_evidence_footer` (added 2026-10-26 in
+  54c1c6e9) appends a "Feature evidence declarations" JSON block to every briefing with
+  one ~1.5 KB declaration record per snapshot feature whose latest value equals a number
+  in the narrative. `_publication_stage_diagnostics` listed every equal-value match per
+  mention across three roles. With ~2,700 model-eligible features in the snapshot, a
+  value shared by many features fans out without bound.
+- Row 5007 (hourly, 2026-11-06 14:27:48Z): narrative 1,617 chars; `0%` matched 961
+  zero-valued features, `0.6` matched 40, `0.54` matched 12 (two mentions) -> 1,005
+  records, 1,527,952 chars of `content`, 30.8 MB `snapshot_data` text (1.5 MB TOASTed).
+  Not an LLM loop (num_predict=800), not a retry, not a grounding dump.
+- Same mechanism, smaller: 69 rows over 100 KB between ids 4731 and 5035 (2026-10-26 to the
+  2026-11-07 20:42Z read, only 5007 over 1 MiB); typical hourly 210-550 KB with 125-346 records, e.g. 4984 at 555 KB had `0.125`
+  matching 189 features). Before 2026-10-26 the daily max was 15 KB.
+
+Fix (writer, this branch):
+
+- `_publication_stage_diagnostics(..., match_list_cap=8)`: every match is still counted
+  (`snapshot_match_count`), at most 8 listed per mention, `snapshot_matches_complete`
+  flag. Cap is a keyword default, not a module constant, so the AST-loaded contract
+  tests still execute the function.
+- `_publication_evidence_footer`: an incomplete listing gets
+  `attribution: "ambiguity_overflow"`, its match count, and NO records (equal-value
+  coincidence with that many observations is not attribution). New `rendering`
+  metadata. Backstop `rendered_cap_bytes=262_144`: an appendix still over the cap is
+  withheld whole with a declared one-line note and a `log.warning`; records stay in the
+  stored payload. The narrative is never cut. Mentions with <=8 matches render exactly
+  as before.
+- Tests: `tests/test_market_briefing_evidence_footer_bound.py` (11, real module, no
+  network/DB/model; reproduces the 5007 shape: 961 zero features + `0%`, content <10 KB,
+  snapshot <150 KB). Related suites: 534 passed, 21 skipped; ruff E/W/F clean.
+
+Packet cap decision:
+
+- `scripts/daily_publication_packet.py::TEXT_FIELD_CAP_BYTES` stays 1 MiB (comment added
+  at the constant). A legitimate briefing is now <=15 KB narrative + <=256 KiB appendix;
+  raising the cap would admit the runaway shape, not a real briefing. Row 5007 and any
+  other pre-fix row over the cap remain EXCLUDED_TEXT_OVER_FIELD_CAP by id/hash.
+
+Not done here:
+
+- Row 5007 and the other oversized rows are untouched (read-only inspection via
+  `psql -d griddb` with `default_transaction_read_only=on`). Whether to compact or
+  re-render historical appendices is an owner decision; the data summary / narrative
+  in those rows is intact and small, only the appendix is large.
+- Not merged, not deployed. Takes effect for new briefings once the release tree is
+  updated and grid-intelligence restarts.
+
 ## 2026-11-08 — Daily review becomes machine-readable: `review.jsonl` ingest (Claude)
 
 Scope: `scripts/ingest_publication_review.py`, `migrations/versions/pub_review_ingest_20261108.py`
@@ -450,3 +501,77 @@ Local Windows run: 241 briefing tests passed; 15 cannot execute because the
 existing social sentiment import requires Unix fcntl. The targeted regression
 is among those platform-blocked tests. Hosted Linux full CI is the acceptance
 check. Company intake/quality remains 62 tests and 9 subtests passing.
+
+
+## 2026-11-09 - Bound Oracle actor evidence and preserve source lineage
+
+The actor bridge now rejects aggregate/feed identities, normalizes only explicit
+bull/bear directions, applies observation-date and ingestion-availability bounds,
+and selects one latest-date vote per actor/source channel. Unknown or conflicting
+latest-day directions withhold the group; zero-trust actors cannot add coherence
+votes. No historical rows or runtime settings are changed.
+
+Actor freshness remains unknown at exact-hour precision. Reports distinguish the
+stored observation DATE, calendar-age lower bound and ingestion availability.
+Used row/source refs and scoring effects are kept in a small receipt in the same
+signals JSON value that the existing upsert replaces atomically. Candidate detail
+is explicitly sampled, complete used support is bounded, and an oversized receipt
+fails closed before any weight mutation. The existing confidence/target upsert
+policy and other signal families' freshness behavior remain outside this patch.
+
+Synthetic regression coverage includes direction, repeated/conflicting rows,
+identifier rejection, clock boundaries, actual SQL selection, size limits,
+atomic no-mutation failure, scoring/coherence and insert/update receipt retention.
+Focused bridge/Oracle/report tests passed locally. Broader compatible Oracle tests
+also passed; full Linux/PostgreSQL CI remains the aggregate acceptance check.
+No production access, send, generator, migration, service change, merge or deploy.
+See docs/reference/ORACLE_ACTOR_EVIDENCE.md for the explicit contract and limits.
+
+## 2026-11-14 — Integrate accepted offline NVDA desk report
+
+Additive #1085 report mode joins the existing frozen ledger, historical cash
+reconciliation and #1204 evidence labels. The accepted kit's five files are
+byte-identical; its bundle availability floor is preserved. 111 offline tests,
+Ruff and exact report reproduction pass on the integration base c19920e9.
+No recognition/valuation/trade result is fabricated: seven candidates remain
+unusable. Frozen v2, legacy scenarios and the Nov18 comparison are unchanged.
+See docs/research/r3-nvda/desk-report-v1.md. Full CI pending; Claude verifies final
+kit and Anik applies releases. No production or holdout changes.
+
+## 2026-11-17 - per-ticker social series: Bluesky cashtags, ApeWisdom Reddit boards, dormant Reddit Data API (source only)
+
+What was done:
+
+- `SocialSentimentPuller.pull_ticker_series` and a SmartScheduler entry `social_ticker_series` (12 h, timeout 900 s, catalog row `SocialSentiment`). It writes numeric `BSKY:*`, `APEWISDOM:*` and (with an owner app) `REDDIT:*` raw_series per UTC fetch date; FinBERT (local) scores up to 100 cashtag posts per ticker.
+- entity_map: `REDDIT:<sub>:active_users` / `subscribers` map to the 2026-03-21 `reddit_<sub>` / `reddit_<sub>_subs` features. `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Reddit closed logged-out access on 2026-11-17 (~17:50Z): `.rss` answers an Atom "Not Found" (404), `.json` 403, old.reddit redirects to login; seen from grid-svr and a second network. smart_money and reddit_options_pulse have failed since. No scraping workaround: the Data API (owner app) is the only sanctioned route; ApeWisdom is the working Reddit-derived feed.
+- Bluesky logged-out `searchPosts` refuses every cursor page with 403 "forbidden by administrative rules". The puller reads one page and does not slice by `until` to get around it; a page that fills inside 24 h is stored as a rate (`posts_per_hour`) over its span, never as a 24 h count.
+- Bluesky search ignores `$` (a `$KO` query returned no Coca-Cola posts), so only literal cashtags count.
+
+Broken or TBD:
+
+- Needs merge + deploy; the job then runs on the next SmartScheduler tick. Reddit board stats need REDDIT_CLIENT_ID/SECRET from an owner-registered app.
+- smart_money / reddit_options_pulse / social_port_activity Reddit legs stay dead until the Data API is configured; not changed here.
+
+## 2026-11-18 - Reddit back on free community APIs: Arctic Shift (posts/comments) + Tradestie (WSB sentiment) (source only)
+
+What was done:
+
+- New `ingestion/altdata/arctic_shift.py`: an HTTP-only client for the Arctic Shift archive API (free, no key, minutes behind Reddit when probed from grid-svr). Fixed host, redirects refused, 4 MB body cap, strict `{"data": [...]}`, typed and bounded fields, one cross-process lock spacing requests 2 s apart, a single bounded wait on 429 (`X-RateLimit-Reset`) and on the "Timeout" 422.
+- `smart_money` (SmartScheduler now hourly, was 10 min), `reddit_options_pulse` (daily thread + newest 500 comments) and `social_sentiment.pull_all` (10 newest posts per board) read Arctic Shift instead of the 404 Reddit RSS feeds.
+- `pull_ticker_series` gains `ARCTICSHIFT:*` (per-board posts/comments volume, per-board ticker post counts, FinBERT per ticker over Reddit posts) and `TRADESTIE:wallstreetbets:*` (Tradestie's top-50 comment counts and its own sentiment score for the previous US/Eastern day). `tests/test_hermes_sec_only.py` scheduler tail re-pinned with a lineage comment.
+
+Non-obvious decisions:
+
+- Candidates checked from grid-svr on 2026-11-18: PullPush answers 429 "does not provide free scraping resources for agents" (rejected: it refuses this use); SwaggyStocks has no public API (a JS dashboard; scraping it would mean browser automation); Apify/RapidAPI wrappers need an account; GitHub "no auth Reddit" wrappers call the dead `.json` endpoints. Arctic Shift's aggregate endpoints read 0 for every recent hour (they lag days), so counts come from records; its full-text title search on r/wallstreetbets mostly times out, so the daily thread is picked from the newest posts by title prefix.
+- Arctic Shift re-reads scores about 36 h after a post; younger posts report `score` None rather than the archive's 0/1 (or an early large number), so no score logic ever sees an unsettled post. A security review flagged that this leaves smart_money's score gate inert (one throwaway account could seed a signal). Gates now: (a) at least two distinct authors per (ticker, direction) in the pull, and (d) unscored signals are stored in raw_series with `trust_tier: "unscored"` but kept out of `signal_sources` (the downstream smart_money / social streams) until corroborated across time (`trust_tier: "unscored_promoted"`). A second review found the first version split "prior" from "now" by row `pull_timestamp`, so re-pulled posts could count twice. Promotion now works on post creation time: fresh posts are this pull's posts no earlier run stored (by `post_id`, now kept in the payload, or author + text hash for older rows); prior authors come from stored posts created at least 6 h before the earliest fresh post (within 48 h); promotion needs two or more prior authors and a fresh post by someone else. Arctic Shift exposes no account creation time, so there is no account-age gate.
+- reddit_options_pulse picked the daily thread by title prefix alone, newest first, so a user post with the same title could be taken. It now also requires the posting account: u/verified-trader (the board's moderator account; live check 2026-11-18 showed it posted the last three daily threads, `distinguished="moderator"` on the "Moves Tomorrow" ones, none on the daily one) or AutoModerator (earlier years), and takes the first such post of the newest day. AutoModerator alone would match nothing today. `stickied` cannot be requested as a field from Arctic Shift, and `distinguished` is absent on the daily thread, so neither is required.
+- Tradestie is asked for the finished previous US/Eastern day and stored once per Tradestie day (`tradestie_date` in the payload); obs_date stays the fetch date.
+
+Broken or TBD:
+
+- Needs merge + deploy (SmartScheduler picks up smart_money's hourly cadence and the new legs; intelligence scheduler's 22:00 options pulse uses the new fetch). No activation step.
+- Arctic Shift publishes no uptime guarantee; a 429/422 burst shows as PARTIAL/FAILED in pull_log, never as zero rows passed off as data.

@@ -532,12 +532,10 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
 ):
     """The hold on the path Hermes actually calls automatically.
 
-    scripts/score_oracle_trades.py (test 3, above) is a manual CLI -- not
-    invoked by any systemd unit, timer, cron entry or by Hermes. The
-    prediction -> outcome -> score cycle that runs on its own is Hermes's
-    oracle step calling ``OracleEngine.score_expired_predictions()``
-    directly (``hermes_operator.py:3964``: ``from oracle.engine import
-    OracleEngine``). The historical-write hold has to hold there too: two
+    scripts/score_oracle_trades.py (test 3, above) is also invoked by the
+    hourly catch-up cron. Hermes independently calls the engine's scoring
+    method; both now share the completed-close policy. The historical-write
+    hold has to hold on the engine path too: two
     legacy pending rows (entry_price=0.0, non-null confidence) survive
     byte-identical; a MARKED new-policy NULL-entry row (null_write_policy =
     NULL_WRITE_POLICY) is closed to 'no_data' with the shared reason; an
@@ -593,14 +591,12 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
     # registry -- unrelated to this test and unneeded against a live,
     # already-bootstrapped table. Bypassed the same way
     # tests/test_oracle_null_readers.py::TestEngineScoringLoopEntryPrice.
-    # _engine_under_test does. The price lookup is stubbed for our own
-    # ticker only -- no network access, and every other ticker's expired
-    # row in this shared table is left alone (None -> skipped, not scored).
+    # _engine_under_test does. These entries are all invalid, so no price
+    # lookup is needed. This suite must use a disposable test database.
     oe = object.__new__(OracleEngine)
     oe.engine = pg_engine
     oe.models = []
     oe._last_guard_verdicts = []
-    oe._get_price_at_date = lambda t, _expiry: 999.0 if t == ticker else None
 
     results = oe.score_expired_predictions()
 
@@ -807,8 +803,20 @@ def test_store_predictions_stamps_the_policy_on_a_real_row(
         model_version="packet2a_pg_test-v1",
     )
 
-    oe._store_predictions([prediction])
-
+    # Admission is explicit even for an input-failure abstention.
+    model_name = pred_id + "_model"
+    prediction.model_name = model_name
+    with pg_engine.begin() as conn:
+        conn.execute(text("INSERT INTO oracle_models (name, active) VALUES (:name, TRUE)"),
+                     {"name": model_name})
+    try:
+        committed = oe._store_predictions([prediction])
+    finally:
+        with pg_engine.begin() as conn:
+            conn.execute(text("DELETE FROM oracle_models WHERE name = :name"), {"name": model_name})
+    assert len(committed) == 1
+    pred_id = committed[0].id
+    test_ids.append(pred_id)
     row = _fetch_row(pg_engine, pred_id)
     assert row is not None
     assert row["entry_price"] is None

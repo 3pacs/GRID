@@ -363,6 +363,10 @@ def _store_one_fixture_prediction(monkeypatch) -> dict[str, Any]:
 
     import oracle.prediction_context as pc
     from oracle.engine import OracleEngine, OraclePrediction, PredictionType, Signal
+    from oracle.model_factory import ModelFactory
+    import oracle.entry_price_policy as policy
+    monkeypatch.setattr(ModelFactory, "active_model_names", lambda *a, **k: {"fixture_model"})
+    monkeypatch.setattr(policy, "validate_quote_reference", lambda *a, **k: None)
 
     monkeypatch.setattr(pc, "fetch_liquidity_regime", lambda *a, **k: "NEUTRAL")
     monkeypatch.setattr(pc, "fetch_fci_regime", lambda *a, **k: "NEUTRAL")
@@ -392,9 +396,11 @@ def _store_one_fixture_prediction(monkeypatch) -> dict[str, Any]:
         model_version="v1",
         model_weights={"fixture_model": 1.2, "other_model": 0.9},
         horizon_days=7,
+        flow_context={"regime": "NEUTRAL", "fci_regime": "NEUTRAL", "vix_level": 18.0,
+                      "entry_price_basis": {"price": 600.0}},
     )
     eng._store_predictions([pred])
-    inserts = [p for p in rec.params if p.get("id") == "fixture-1"]
+    inserts = [p for p in rec.params if "sig" in p]
     assert len(inserts) == 1
     return inserts[0]
 

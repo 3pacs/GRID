@@ -18,7 +18,7 @@ Uses batch inserts and skips dates only when both raw and resolved records
 already exist.
 
 Usage:
-    cd /data/grid_v4/grid_repo/grid
+    cd /data/grid_v4/grid_release   # or any GRID checkout root
     python scripts/backfill_celestial_ephemeris.py
 """
 

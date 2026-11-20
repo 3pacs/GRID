@@ -134,9 +134,11 @@ const s = {
         padding: '3px 10px', borderRadius: '4px',
         fontSize: '11px', fontWeight: 700, fontFamily: mono,
         background: verdict === 'hit' ? colors.greenBg :
-                    verdict === 'partial' ? colors.yellowBg : colors.redBg,
+                    verdict === 'partial' ? colors.yellowBg :
+                    verdict === 'miss' ? colors.redBg : colors.bg,
         color: verdict === 'hit' ? colors.green :
-               verdict === 'partial' ? colors.yellow : colors.red,
+               verdict === 'partial' ? colors.yellow :
+               verdict === 'miss' ? colors.red : colors.textMuted,
     }),
 
     // Track record
@@ -367,8 +369,11 @@ export function PredictionCard({ pred }) {
         : Math.round(pred.confidence * 100);
     const signals = pred.signals || [];
     const antiSignals = pred.anti_signals || [];
-    const bullSignals = signals.filter(s => s.direction === 'bullish');
-    const bearSignals = signals.filter(s => s.direction === 'bearish');
+    const isDirectional = isCall || pred.direction === 'PUT' || pred.direction === 'SHORT';
+    const confirmingSignals = isDirectional
+        ? signals.filter(s => s.direction === (isCall ? 'bullish' : 'bearish')) : [];
+    const opposingSignals = isDirectional
+        ? signals.filter(s => s.direction === (isCall ? 'bearish' : 'bullish')) : [];
 
     const expiryStr = pred.days_left != null
         ? pred.days_left > 0 ? `${pred.days_left}d left` : 'expired'
@@ -381,15 +386,15 @@ export function PredictionCard({ pred }) {
         <div style={s.predCard} onClick={() => setExpanded(!expanded)}>
             <div style={s.predHeader}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span style={s.tickerBadge(isCall)}>
-                        {isCall ? '\u25B2' : '\u25BC'} {pred.ticker}
+                    <span style={isDirectional ? s.tickerBadge(isCall) : { ...s.tickerBadge(false), color: colors.textMuted, background: colors.bg }}>
+                        {isDirectional ? (isCall ? '\u25B2' : '\u25BC') : '—'} {pred.ticker}
                     </span>
                     <span style={{ fontSize: '11px', color: colors.textMuted, fontFamily: mono }}>
                         {(pred.model_name || '').replace(/_/g, ' ')}
                     </span>
                     {pred.verdict && pred.verdict !== 'pending' && (
                         <span style={s.verdictBadge(pred.verdict)}>
-                            {pred.verdict.toUpperCase()}
+                            {pred.verdict === 'no_data' ? 'UNSCORABLE' : pred.verdict.toUpperCase()}
                         </span>
                     )}
                 </div>
@@ -403,7 +408,7 @@ export function PredictionCard({ pred }) {
                     }} title={confPct == null ? 'No confidence was stated for this prediction' : undefined}>
                         {confPct == null ? 'unscored' : `${confPct}%`}
                     </div>
-                    <div style={{ fontSize: '9px', color: colors.textMuted, letterSpacing: '1px' }}>CONF</div>
+                    <div style={{ fontSize: '9px', color: colors.textMuted, letterSpacing: '1px' }}>STATED CONF</div>
                 </div>
             </div>
 
@@ -427,7 +432,7 @@ export function PredictionCard({ pred }) {
                     <div style={s.predMetricVal}>
                         {pred.entry_price == null ? '---' : `$${pred.entry_price.toFixed(2)}`}
                     </div>
-                    <div style={s.predMetricLbl}>ENTRY</div>
+                    <div style={s.predMetricLbl}>REFERENCE ENTRY</div>
                 </div>
                 <div style={s.predMetric}>
                     <div style={s.predMetricVal}>${pred.target_price?.toFixed(2) || '---'}</div>
@@ -436,7 +441,7 @@ export function PredictionCard({ pred }) {
                 <div style={s.predMetric}>
                     <div style={{
                         ...s.predMetricVal,
-                        color: isCall ? colors.green : colors.red,
+                        color: isDirectional ? (isCall ? colors.green : colors.red) : colors.textMuted,
                     }}>
                         {pred.expected_move_pct ? `${pred.expected_move_pct > 0 ? '+' : ''}${pred.expected_move_pct.toFixed(1)}%` : '---'}
                     </div>
@@ -451,7 +456,7 @@ export function PredictionCard({ pred }) {
                         <div style={{ ...s.predMetricVal, color: pnlColor }}>
                             {trackingPnl > 0 ? '+' : ''}{trackingPnl.toFixed(1)}%
                         </div>
-                        <div style={s.predMetricLbl}>P&L</div>
+                        <div style={s.predMetricLbl}>REFERENCE MOVE</div>
                     </div>
                 )}
                 {pred.pnl_pct != null && (
@@ -467,30 +472,53 @@ export function PredictionCard({ pred }) {
                 )}
             </div>
 
+            <div style={{ marginTop: '8px', fontSize: '11px', color: colors.textDim }}>
+                <strong>{pred.recording_policy === 'oracle_forward_v2' ? 'PROSPECTIVE OBSERVED REFERENCE'
+                    : pred.recording_policy === 'oracle_external_v2' ? 'EXTERNAL RESEARCH' : 'LEGACY / UNQUALIFIED'}</strong>
+                <div>Recorded decision: {pred.created_at || 'unknown'}</div>
+                {pred.entry_price_basis?.status === 'measured' && pred.entry_price_basis?.market_at ? (
+                    <div>Entry quote: {pred.entry_price_basis.provider} · observed {pred.entry_price_basis.market_at}
+                        {' · registered '}{pred.entry_price_basis.registered_at || pred.entry_price_basis.available_at}
+                        {' · read by '}{pred.entry_price_basis.read_observed_at || 'unknown'}. Delayed reference; not an executable fill.</div>
+                ) : <div>{pred.entry_price_basis?.reason || 'Entry quote source and exact observation time are unqualified.'}</div>}
+                {pred.verdict === 'pending' && <div>{pred.tracking_pnl_basis || 'Tracking return is unavailable.'}</div>}
+                {pred.tracking_quote?.market_at && <div>Tracking quote: ${pred.tracking_quote.price?.toFixed(2)}
+                    {' · '}{pred.tracking_quote.provider} · observed {pred.tracking_quote.market_at}
+                    {' · registered '}{pred.tracking_quote.registered_at || pred.tracking_quote.available_at}
+                    {' · read by '}{pred.tracking_quote.read_observed_at || 'unknown'}</div>}
+            </div>
+
+            {(pred.verdict === 'no_data' || (pred.verdict === 'pending' && pred.days_left <= 0)) && (
+                <div style={{ marginTop: '8px', fontSize: '12px', color: colors.textDim }}>
+                    {pred.verdict === 'no_data' ? 'Unscorable: ' : 'Awaiting score: '}
+                    {pred.score_notes || 'No reason has been recorded.'}
+                </div>
+            )}
+
             {expanded && (
                 <div style={{ marginTop: '10px', borderTop: `1px solid ${colors.borderSubtle}`, paddingTop: '8px' }}>
-                    {bullSignals.length > 0 && (
+                    {confirmingSignals.length > 0 && (
                         <>
                             <div style={{ fontSize: '9px', fontWeight: 700, color: colors.green, letterSpacing: '1px', marginBottom: '4px' }}>
-                                CONFIRMING SIGNALS ({bullSignals.length})
+                                CONFIRMING SIGNALS ({confirmingSignals.length})
                             </div>
                             <div style={s.signalRow}>
-                                {bullSignals.slice(0, 6).map((sig, i) => (
-                                    <span key={i} style={s.signalChip('bull')}>
+                                {confirmingSignals.slice(0, 6).map((sig, i) => (
+                                    <span key={i} style={s.signalChip(isCall ? 'bull' : 'bear')}>
                                         {sig.name} z={sig.z_score?.toFixed(1)}
                                     </span>
                                 ))}
                             </div>
                         </>
                     )}
-                    {bearSignals.length > 0 && (
+                    {opposingSignals.length > 0 && (
                         <>
                             <div style={{ fontSize: '9px', fontWeight: 700, color: colors.red, letterSpacing: '1px', marginTop: '8px', marginBottom: '4px' }}>
-                                OPPOSING SIGNALS ({bearSignals.length})
+                                OPPOSING SIGNALS ({opposingSignals.length})
                             </div>
                             <div style={s.signalRow}>
-                                {bearSignals.slice(0, 6).map((sig, i) => (
-                                    <span key={i} style={s.signalChip('bear')}>
+                                {opposingSignals.slice(0, 6).map((sig, i) => (
+                                    <span key={i} style={s.signalChip(isCall ? 'bear' : 'bull')}>
                                         {sig.name} z={sig.z_score?.toFixed(1)}
                                     </span>
                                 ))}
@@ -522,14 +550,12 @@ export function PredictionCard({ pred }) {
 
 
 // ── Evidence by model ─────────────────────────────────────────────────────
-// Replaces the hit-rate "tournament": predictions that expire on the same
-// date are one market bet, so evidence is counted in independent expiry
-// windows and judged on return in excess of same-direction calls.
+// A historical relative comparison, not a forward trading-edge qualification.
 
 const VERDICT_LABEL = {
-    edge: { text: 'EDGE', color: colors.green },
-    no_edge: { text: 'NO EDGE', color: colors.red },
-    insufficient_windows: { text: 'TOO FEW WINDOWS', color: colors.textMuted },
+    relative_advantage: { text: 'RELATIVE ADVANTAGE', color: colors.text },
+    no_relative_advantage: { text: 'NO RELATIVE ADVANTAGE', color: colors.textMuted },
+    insufficient_windows: { text: 'TOO FEW CLUSTERS', color: colors.textMuted },
 };
 
 const pct = (v, digits = 2) => (v == null ? 'N/A' : `${v > 0 ? '+' : ''}${v.toFixed(digits)}%`);
@@ -539,38 +565,44 @@ export function EvidencePanel({ evidence }) {
     const sm = evidence.summary;
     const method = evidence.method || {};
     const models = evidence.models || [];
-    const headline = sm.models_with_edge > 0
-        ? `${sm.models_with_edge} of ${sm.models_tested} testable model${sm.models_tested === 1 ? '' : 's'} show an edge.`
-        : `No model has shown an edge. ${sm.models_tested} model${sm.models_tested === 1 ? ' has' : 's have'} enough independent windows (${method.min_windows}+) to test.`;
+    const relativeCount = sm.models_with_relative_advantage;
+    const headline = Number.isInteger(relativeCount) && Number.isInteger(sm.models_tested)
+        ? `${relativeCount} of ${sm.models_tested} testable models show a relative advantage. Financial edge is not demonstrated.`
+        : 'Relative comparison count unavailable.';
     return (
         <div style={{ ...shared.card, padding: '14px 16px', marginBottom: '12px' }}>
-            <div style={s.sectionTitle}>EVIDENCE BY MODEL</div>
-            <div data-testid="evidence-headline" style={{ fontSize: '13px', fontWeight: 700, color: sm.models_with_edge > 0 ? colors.green : colors.text, marginBottom: '6px' }}>
+            <div style={s.sectionTitle}>EXPLORATORY MODEL COMPARISON</div>
+            <div data-testid="evidence-headline" style={{ fontSize: '13px', fontWeight: 700, color: colors.text, marginBottom: '6px' }}>
                 {headline}
             </div>
             <div style={{ fontSize: '11px', color: colors.textDim, fontFamily: mono, lineHeight: 1.5, marginBottom: '10px' }}>
-                {sm.outcomes} outcomes over {sm.windows} expiry dates. Official verdicts end {sm.official_last_expiry || 'N/A'};
+                {sm.outcomes} outcomes over {sm.windows} expiry-date clusters. Official verdicts end {sm.official_last_expiry || 'N/A'};
                 {' '}{sm.corrected_outcomes} more are corrected rescores (hindsight, through {sm.corrected_last_expiry || 'N/A'}).
-                {' '}Excess = return minus same-direction calls on the same expiry. Lower bound: expiry-clustered bootstrap.
+                {' '}Gross excess = return minus same-direction calls on the same expiry. Lower bound: expiry-clustered bootstrap.
+                {' '}Overlapping horizons may remain dependent. This mixes historical and hindsight outcomes; relative advantage can still lose money and does not establish prospective trading performance.
                 {sm.excluded_implausible > 0 && ` ${sm.excluded_implausible} implausible outcomes (price/split errors) excluded.`}
                 {sm.models_hidden_small > 0 && ` ${sm.models_hidden_small} models with <${method.min_outcomes_shown} outcomes not listed.`}
             </div>
+            <details>
+                <summary style={{ cursor: 'pointer', fontSize: '12px', color: colors.textDim, padding: '6px 0' }}>
+                    View {models.length} model comparisons
+                </summary>
             <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: mono, fontSize: '11px' }}>
                     <thead>
                         <tr style={{ color: colors.textMuted, textAlign: 'right' }}>
                             <th style={{ textAlign: 'left', padding: '4px' }}>MODEL</th>
                             <th style={{ padding: '4px' }}>CALLS</th>
-                            <th style={{ padding: '4px' }}>WINDOWS</th>
-                            <th style={{ padding: '4px' }}>RAW</th>
-                            <th style={{ padding: '4px' }}>EXCESS</th>
+                            <th style={{ padding: '4px' }}>CLUSTERS</th>
+                            <th style={{ padding: '4px' }}>GROSS</th>
+                            <th style={{ padding: '4px' }}>RELATIVE</th>
                             <th style={{ padding: '4px' }}>LOWER BOUND</th>
                             <th style={{ padding: '4px' }}>VERDICT</th>
                         </tr>
                     </thead>
                     <tbody>
                         {models.map(m => {
-                            const v = VERDICT_LABEL[m.verdict] || VERDICT_LABEL.insufficient_windows;
+                            const v = VERDICT_LABEL[m.verdict] || { text: 'UNCLASSIFIED', color: colors.textMuted };
                             return (
                                 <tr key={m.name} style={{ borderTop: `1px solid ${colors.borderSubtle}`, textAlign: 'right', color: colors.textDim }}>
                                     <td style={{ textAlign: 'left', padding: '4px', color: colors.text }} title={`${m.first_created?.slice(0, 10)} to ${m.last_created?.slice(0, 10)}`}>
@@ -588,6 +620,7 @@ export function EvidencePanel({ evidence }) {
                     </tbody>
                 </table>
             </div>
+            </details>
         </div>
     );
 }
@@ -595,12 +628,27 @@ export function EvidencePanel({ evidence }) {
 
 // ── Main View ─────────────────────────────────────────────────────────────
 
+const PREDICTION_TABS = {
+    active: { status: 'active', label: 'Active' },
+    awaiting: { status: 'expired', label: 'Awaiting score' },
+    unscorable: { status: 'unscorable', label: 'Unscorable' },
+    scored: { status: 'scored', label: 'Scored' },
+    other: { status: 'other', label: 'Void / other' },
+};
+const PAGE_SIZE = 100;
+
 export default function Predictions() {
     const [tab, setTab] = useState('active');
     const [predictions, setPredictions] = useState([]);
     const [filterTicker, setFilterTicker] = useState('');
     const [filterModel, setFilterModel] = useState('');
+    const [cohort, setCohort] = useState('prospective');
     const [predTotal, setPredTotal] = useState(0);
+    const [predLoading, setPredLoading] = useState(true);
+    const [predError, setPredError] = useState(null);
+    const [predOffset, setPredOffset] = useState(0);
+    const [hasMore, setHasMore] = useState(false);
+    const predictionRequest = useRef(0);
 
     const { data: scoreData, loading, error, refetch: loadScoreboard } = useAsyncData(async () => {
         const [scoreboardRes, latestRes] = await Promise.all([
@@ -613,41 +661,56 @@ export default function Predictions() {
     }, { fallback: { scoreboard: null, latest: null } });
     const scoreboard = scoreData.scoreboard;
     const latest = scoreData.latest;
-    const { data: evidenceRes } = useAsyncData(async () => {
+    const { data: evidenceRes, error: evidenceError, loading: evidenceLoading, refetch: loadEvidence } = useAsyncData(async () => {
         const res = await api.getOracleEvidence();
-        return res?.error ? null : res;
+        if (res?.error) throw new Error(res.message || 'Model evidence unavailable');
+        if (!res?.summary) throw new Error('Model evidence response is incomplete');
+        return res;
     }, { fallback: null });
 
     const fetchPredictions = useCallback(async (status) => {
+        const request = ++predictionRequest.current;
+        setPredLoading(true);
+        setPredError(null);
+        setPredictions([]);
+        setPredTotal(0);
+        setHasMore(false);
         try {
-            const params = { status, limit: '100' };
+            const params = { status, cohort, limit: String(PAGE_SIZE), offset: String(predOffset) };
             if (filterTicker) params.ticker = filterTicker;
             if (filterModel) params.model = filterModel;
             const data = await api.getOraclePredictions(params);
+            if (request !== predictionRequest.current) return;
+            if (data?.error) throw new Error(data.message || 'Predictions unavailable');
+            if (!Array.isArray(data?.predictions)) throw new Error('Prediction response is incomplete');
             setPredictions(data.predictions || []);
             setPredTotal(data.total || 0);
+            setHasMore(data.has_more === true);
         } catch (e) {
-            console.warn('Predictions fetch failed:', e);
-            setPredictions([]);
+            if (request === predictionRequest.current) setPredError(e);
+        } finally {
+            if (request === predictionRequest.current) setPredLoading(false);
         }
-    }, [filterTicker, filterModel]);
+    }, [filterTicker, filterModel, predOffset, cohort]);
 
     useEffect(() => {
-        const statusMap = { active: 'active', scored: 'scored', expired: 'expired' };
-        if (statusMap[tab]) {
-            fetchPredictions(statusMap[tab]);
-        }
-    }, [tab, filterTicker, filterModel]);
+        const selected = PREDICTION_TABS[tab];
+        if (selected) fetchPredictions(selected.status);
+        return () => { predictionRequest.current += 1; };
+    }, [tab, fetchPredictions]);
 
     const overall = scoreboard?.overall || {};
     const models = scoreboard?.models || [];
     const byTicker = scoreboard?.by_ticker || [];
     const calibration = scoreboard?.calibration || {};
+    const prospective = scoreboard?.recording_cohorts?.oracle_forward_v2;
+    const legacy = scoreboard?.recording_cohorts?.legacy;
     const streak = latest?.streak || {};
     const recentScored = latest?.recent_scored || [];
 
     const accuracy = overall.accuracy || 0;
     const scored = overall.scored || 0;
+    const meanReturn = overall.mean_signed_return_pct;
     const accColor = accuracy > 0.55 ? colors.green : accuracy > 0.45 ? colors.yellow : colors.red;
 
     return (
@@ -678,18 +741,26 @@ export default function Predictions() {
             ) : (
             <>
             {/* ── Scoreboard Header ─────────────────────────────── */}
+            <div style={{ ...shared.card, padding: '12px', marginBottom: '12px' }}>
+                <div style={s.sectionTitle}>PROSPECTIVE OBSERVED REFERENCES</div>
+                <div>{prospective?.total ?? '—'} recorded · {prospective?.pending ?? '—'} pending · {prospective?.unscorable ?? '—'} abstained / unscorable · {prospective?.scored ?? '—'} scored</div>
+                <div style={s.subStat}>Immutable forecasts with a stated quote basis. Cboe quotes can be delayed; these are not executable fills or financial-edge evidence.</div>
+                <div style={s.subStat}>{legacy?.total ?? '—'} legacy records remain separate. The historical aggregate below includes all recording policies.</div>
+            </div>
             <div style={s.scoreboardRow}>
                 <div style={s.scoreCard}>
-                    <RingChart value={accuracy} color={accColor} />
-                    <div style={{ ...s.bigLabel, marginTop: '4px' }}>HIT RATE (OFFICIAL)</div>
-                    <div style={s.subStat}>{scored} official verdicts, not independent</div>
+                    {scored > 0 ? <RingChart value={accuracy} color={accColor} /> : <div style={s.bigNumber}>—</div>}
+                    <div style={{ ...s.bigLabel, marginTop: '4px' }}>WEIGHTED OUTCOME SCORE</div>
+                    <div style={s.subStat}>{scored} official verdicts; hit=1, partial=0.5, miss=0</div>
+                    <div style={s.subStat}>Forecasts are not independent</div>
                 </div>
                 <div style={s.scoreCard}>
-                    <div style={{ ...s.bigNumber, color: overall.total_pnl > 0 ? colors.green : overall.total_pnl < 0 ? colors.red : colors.text }}>
-                        {overall.total_pnl > 0 ? '+' : ''}{(overall.total_pnl || 0).toFixed(1)}%
+                    <div style={{ ...s.bigNumber, color: meanReturn > 0 ? colors.green : meanReturn < 0 ? colors.red : colors.text }}>
+                        {meanReturn == null ? '—' : `${meanReturn > 0 ? '+' : ''}${meanReturn.toFixed(2)}%`}
                     </div>
-                    <div style={s.bigLabel}>CUMULATIVE P&L</div>
-                    <div style={s.subStat}>avg {(overall.avg_pnl || 0).toFixed(2)}% per trade</div>
+                    <div style={s.bigLabel}>MEAN SIGNED FORECAST RETURN</div>
+                    <div style={s.subStat}>Gross official outcomes; costs excluded</div>
+                    <div style={s.subStat}>Not portfolio P&L or executed trades</div>
                 </div>
                 <div style={s.scoreCard}>
                     {calibration?.label ? (
@@ -699,10 +770,13 @@ export default function Predictions() {
                     ) : (
                         <span style={{ fontSize: '12px', color: colors.textMuted }}>---</span>
                     )}
-                    <div style={{ ...s.bigLabel, marginTop: '8px' }}>CALIBRATION</div>
-                    {calibration?.brier_score != null && (
+                    <div style={{ ...s.bigLabel, marginTop: '8px' }}>HISTORICAL STRICT-HIT CALIBRATION</div>
+                    <div style={s.subStat}>Diagnostic of stated confidence; not validated probabilities</div>
+                    <div style={s.subStat}>Strict hit: correct direction and at least half the stated expected move. Partial and miss count as 0.</div>
+                    {calibration?.total_predictions > 0 && calibration?.brier_score != null && (
                         <div style={s.subStat}>Brier: {calibration.brier_score.toFixed(3)}</div>
                     )}
+                    {calibration?.total_predictions === 0 && <div style={s.subStat}>No measured strict-hit outcomes for calibration.</div>}
                 </div>
             </div>
 
@@ -710,44 +784,56 @@ export default function Predictions() {
             <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' }}>
                 {[
                     { label: 'TOTAL', value: overall.total_predictions, color: colors.text },
-                    { label: 'HITS', value: overall.hits, color: colors.green },
-                    { label: 'PARTIAL', value: overall.partials, color: colors.yellow },
-                    { label: 'MISS', value: overall.misses, color: colors.red },
-                    { label: 'PENDING', value: overall.pending, color: colors.accent },
+                    { label: 'ACTIVE', value: overall.active, color: colors.accent },
+                    { label: 'AWAITING SCORE', value: overall.awaiting_score, color: colors.yellow },
+                    { label: 'UNSCORABLE', value: overall.unscorable, color: colors.textMuted },
+                    { label: 'SCORED', value: overall.scored, color: colors.text },
+                    { label: 'VOID / OTHER', key: 'other', value: overall.other, color: colors.textMuted },
                 ].map(st => (
-                    <div key={st.label} style={{ ...shared.card, padding: '6px 12px', flex: '1 1 60px', textAlign: 'center', marginBottom: 0 }}>
-                        <div style={{ fontSize: '16px', fontWeight: 700, fontFamily: mono, color: st.color }}>{st.value || 0}</div>
+                    <div key={st.label} data-testid={`lifecycle-${st.key || st.label.toLowerCase().replaceAll(' ', '-')}`} style={{ ...shared.card, padding: '6px 12px', flex: '1 1 60px', textAlign: 'center', marginBottom: 0 }}>
+                        <div style={{ fontSize: '16px', fontWeight: 700, fontFamily: mono, color: st.color }}>{st.value ?? '—'}</div>
                         <div style={{ fontSize: '8px', fontWeight: 700, letterSpacing: '1px', color: colors.textMuted }}>{st.label}</div>
                     </div>
                 ))}
             </div>
 
-            {/* ── Evidence by model (replaces the hit-rate tournament) ── */}
-            <EvidencePanel evidence={evidenceRes} />
+            <div style={s.subStat}>{overall.hits ?? '—'} hits / {overall.partials ?? '—'} partial / {overall.misses ?? '—'} misses. Awaiting score includes expiry dates through {overall.lifecycle_as_of || 'the current date'}; the session may not have closed yet.</div>
+
+            {/* Evidence failures remain visible beside the historic headline. */}
+            {evidenceError ? <ErrorState error={evidenceError} onRetry={loadEvidence} title="Model evidence unavailable" />
+                : evidenceLoading ? <LoadingSkeleton variant="card" count={1} />
+                    : <EvidencePanel evidence={evidenceRes} />}
 
             {/* ── Tabs ─────────────────────────────────────────── */}
             <div style={s.tabs}>
-                {['active', 'scored', 'track_record', 'calibration'].map(t => (
-                    <button key={t} style={s.tab(tab === t)} onClick={() => setTab(t)}>
-                        {t === 'active' ? 'Active' : t === 'scored' ? 'Scored' : t === 'track_record' ? 'Track Record' : 'Calibration'}
+                {[...Object.keys(PREDICTION_TABS), 'track_record', 'calibration'].map(t => (
+                    <button key={t} style={s.tab(tab === t)} onClick={() => { setPredOffset(0); setTab(t); }}>
+                        {PREDICTION_TABS[t]?.label || (t === 'track_record' ? 'Track Record' : 'Calibration')}
                     </button>
                 ))}
             </div>
 
             {/* ── Active / Scored Predictions ──────────────────── */}
-            {(tab === 'active' || tab === 'scored') && (
+            {PREDICTION_TABS[tab] && (
                 <>
                     <div style={s.filterRow}>
+                        <select aria-label="Recording cohort" style={s.filterSelect} value={cohort}
+                            onChange={e => { setPredOffset(0); setCohort(e.target.value); }}>
+                            <option value="prospective">Prospective references</option>
+                            <option value="legacy">Legacy / unqualified</option>
+                            <option value="external">External research</option>
+                            <option value="all">All recording policies</option>
+                        </select>
                         <input
                             style={s.filterSelect}
                             placeholder="Ticker..."
                             value={filterTicker}
-                            onChange={e => setFilterTicker(e.target.value.toUpperCase())}
+                            onChange={e => { setPredOffset(0); setFilterTicker(e.target.value.toUpperCase()); }}
                         />
                         <select
                             style={s.filterSelect}
                             value={filterModel}
-                            onChange={e => setFilterModel(e.target.value)}
+                            onChange={e => { setPredOffset(0); setFilterModel(e.target.value); }}
                         >
                             <option value="">All Models</option>
                             {models.map(m => (
@@ -757,12 +843,14 @@ export default function Predictions() {
                             ))}
                         </select>
                         <span style={{ fontSize: '11px', color: colors.textMuted, fontFamily: mono }}>
-                            {predTotal} result{predTotal !== 1 ? 's' : ''}
+                            {!predLoading && !predError && `${predTotal} result${predTotal !== 1 ? 's' : ''}`}
                         </span>
                     </div>
-                    {predictions.length === 0 ? (
+                    {predLoading ? <LoadingSkeleton variant="card" count={2} />
+                        : predError ? <ErrorState error={predError} onRetry={() => fetchPredictions(PREDICTION_TABS[tab].status)} title="Predictions unavailable" />
+                        : predictions.length === 0 ? (
                         <div style={s.emptyState}>
-                            No {tab} predictions found.
+                            No {PREDICTION_TABS[tab].label.toLowerCase()} predictions found.
                         </div>
                     ) : (
                         predictions.map((pred, i) => (
@@ -770,6 +858,13 @@ export default function Predictions() {
                                 <PredictionCard pred={pred} />
                             </div>
                         ))
+                    )}
+                    {!predLoading && !predError && (predOffset > 0 || hasMore) && (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <button style={shared.buttonSmall} disabled={predOffset === 0} onClick={() => setPredOffset(Math.max(0, predOffset - PAGE_SIZE))}>Previous</button>
+                            <span style={s.subStat}>{predOffset + 1}–{predOffset + predictions.length} of {predTotal}</span>
+                            <button style={shared.buttonSmall} disabled={!hasMore} onClick={() => setPredOffset(predOffset + PAGE_SIZE)}>Next</button>
+                        </div>
                     )}
                 </>
             )}
@@ -828,7 +923,7 @@ export default function Predictions() {
                                     { label: 'BRIER SCORE', value: calibration.brier_score?.toFixed(3), desc: '0 = perfect' },
                                     { label: 'CAL ERROR (ECE)', value: calibration.calibration_error?.toFixed(3), desc: 'Lower = better' },
                                     { label: 'SHARPNESS', value: calibration.sharpness?.toFixed(3), desc: 'Confidence spread' },
-                                    { label: 'OVERALL ACC', value: `${(calibration.overall_accuracy * 100).toFixed(1)}%`, desc: `${calibration.total_predictions} predictions` },
+                                    { label: 'STRICT-HIT RATE', value: `${(calibration.overall_accuracy * 100).toFixed(1)}%`, desc: `${calibration.total_predictions} predictions; partial = 0` },
                                 ].map(m => (
                                     <div key={m.label} style={{ ...shared.card, flex: '1 1 120px', textAlign: 'center', padding: '10px', marginBottom: 0 }}>
                                         <div style={{ fontSize: '18px', fontWeight: 700, fontFamily: mono, color: '#E8F0F8' }}>{m.value}</div>

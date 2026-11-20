@@ -563,6 +563,23 @@ class TestGetLiftMultiplier:
         )
         assert result == 1.0
 
+    def test_stale_pair_stats_are_ignored(self) -> None:
+        """2026-11-11: the table was last written 2026-05-17 and nothing
+        refreshes it. Stats older than COOCCURRENCE_MAX_STALE_DAYS must not
+        move live conviction."""
+        from datetime import timedelta
+
+        from intelligence import signal_cooccurrence as sc
+
+        engine = FakeEngine()
+        _saturate_pair(engine, "a", "b", hits=12, total=15)
+        assert get_lift_multiplier(engine, {"a": 0.4, "b": 0.4}) > 1.0
+
+        old = datetime.utcnow() - timedelta(days=sc.COOCCURRENCE_MAX_STALE_DAYS + 1)
+        for row in engine.pairs.values():
+            row["last_updated"] = old
+        assert get_lift_multiplier(engine, {"a": 0.4, "b": 0.4}) == 1.0
+
 
 # ── ensure_cooccurrence_table ────────────────────────────────────────────
 

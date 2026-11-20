@@ -712,3 +712,17 @@ class TestChatPanelRenderer:
         src = path.read_text(encoding="utf-8")
         assert "node.confidence || 0.5" not in src
         assert "data.influence_score || 0.3" not in src
+
+
+def test_oracle_calibration_uses_binary_strict_hit_not_half_credit():
+    from unittest.mock import MagicMock
+    from oracle.calibration import compute_calibration
+
+    engine = MagicMock()
+    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchall.return_value = [(0.9, 'hit'), (0.9, 'partial')]
+    report = compute_calibration(engine)
+    assert report.brier_score == pytest.approx((0.1 ** 2 + 0.9 ** 2) / 2)
+    assert report.overall_accuracy == 0.5
+    assert report.to_dict()['target_event'] == 'strict_hit'
+    assert report.to_dict()['outcome_rule'] == 'hit=1; partial=0; miss=0'

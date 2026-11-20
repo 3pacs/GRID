@@ -78,6 +78,7 @@ The default batch-1 acceptance set (`--journeys` not passed):
 | operator | `#/operator` | admin |
 | snapshots | `#/snapshots` | admin |
 | ten-year | `#/ten-year` | admin, contributor |
+| spy-options | `#/options`, then the **Dealer Flow** and **Gamma Watch** tab buttons | admin |
 
 `home` (`#/home`, admin + contributor) is **excluded from the default set** —
 it is opt-in only, via `--journeys home` (comma-separated if naming more than
@@ -89,6 +90,13 @@ table above for why: it is not about the request guard or the rate limit —
 compose POST regardless (no journey gets a special case in the guard — see
 `installRequestGuard`). The batch-1 acceptance set simply stays DDL-free by
 default; run `--journeys home` deliberately if you want `home` covered too.
+
+**`spy-options` (M1, #959)** is the production counterpart of the fixture journey in `spy_journey.mjs`. The steps live in `probe_steps.mjs`.
+- **What it does:** it opens `#/options` and clicks the in-page **Dealer Flow** and **Gamma Watch** tab buttons. It saves `spy-options.png` / `.text.txt`, `spy-options.spy-dealer-flow.*` and `spy-options.gamma-result.*`.
+- **What it never touches:** Refresh, the external full-Gamma-Watch link, or anything that asks the server to compute.
+- **Read-only:** every request it causes is a GET. That was checked against `api/routers/options.py`, `derivatives.py` and `gamma_watch.py`; recommendations, scan and 100x read saved or precomputed results. The request guard still aborts any non-GET.
+- **No assertions:** a missing button or a view still loading after 15 s is recorded in `step_notes`.
+- **Checklist:** its `operator_checklist` adds `sources_kept_distinct`, `provider_and_receipt_clocks_shown` and `missing_differs_from_zero`.
 
 ## Running it
 

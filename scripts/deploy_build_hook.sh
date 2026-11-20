@@ -41,6 +41,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # checkout).
 bash "${SCRIPT_DIR}/deploy_pin_candidate_sha.sh" "$CANDIDATE_DIR" "$SRC_URL" "$EXPECTED_SHA"
 
+# Keep the strict manifest reader: normalize only hash-verified candidate files.
+# Before dependencies/migrations and activation; never operates on the live alias.
+python3 "${SCRIPT_DIR}/prepare_factory_calendars.py" "$CANDIDATE_DIR"
+
 cd "$CANDIDATE_DIR"
 
 pip install -r requirements.txt
@@ -66,8 +70,12 @@ if [ "$SKIP_MIGRATIONS" = "true" ]; then
   exit 0
 fi
 
+# /etc/grid/grid.env is the shared env file since 2026-11-17; the old
+# grid_repo checkout paths stay as fallbacks (grid_repo/.env is now a symlink
+# to it).
 for f in \
   "${CANDIDATE_DIR}/.env" \
+  /etc/grid/grid.env \
   /home/grid/grid_v4/grid_repo/.env \
   /home/grid/grid_v4/grid_repo/grid/.env
 do

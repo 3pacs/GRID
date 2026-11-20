@@ -1,0 +1,2154 @@
+{
+ "_comment": "S&P 500 members by date (start set + dated changes) from fja05680/sp500 (MIT). Regenerate: python scripts/build_sp500_membership.py. Read by ingestion/altdata/finra_dix.py.",
+ "version": "sp500-membership/1",
+ "source": "https://raw.githubusercontent.com/fja05680/sp500/master/S%26P%20500%20Historical%20Components%20%26%20Changes%20(Updated).csv",
+ "generated_at": "2026-11-13T05:00:14+00:00",
+ "base_date": "2016-12-30",
+ "base_members": [
+  "A",
+  "AABA",
+  "AAL",
+  "AAP",
+  "AAPL",
+  "ABBV",
+  "ABC",
+  "ABT",
+  "ACN",
+  "ADBE",
+  "ADI",
+  "ADM",
+  "ADP",
+  "ADS",
+  "ADSK",
+  "AEE",
+  "AEP",
+  "AES",
+  "AET",
+  "AFL",
+  "AGN",
+  "AIG",
+  "AIV",
+  "AIZ",
+  "AJG",
+  "AKAM",
+  "ALB",
+  "ALK",
+  "ALL",
+  "ALLE",
+  "ALXN",
+  "AMAT",
+  "AME",
+  "AMG",
+  "AMGN",
+  "AMP",
+  "AMT",
+  "AMZN",
+  "AN",
+  "ANDV",
+  "ANTM",
+  "AON",
+  "APA",
+  "APC",
+  "APD",
+  "APH",
+  "APTV",
+  "ARNC",
+  "ATVI",
+  "AVB",
+  "AVGO",
+  "AVY",
+  "AWK",
+  "AXP",
+  "AYI",
+  "AZO",
+  "BA",
+  "BAC",
+  "BAX",
+  "BBBY",
+  "BBT",
+  "BBY",
+  "BCR",
+  "BDX",
+  "BEN",
+  "BF.B",
+  "BHGE",
+  "BIIB",
+  "BK",
+  "BKNG",
+  "BLK",
+  "BLL",
+  "BMY",
+  "BRK.B",
+  "BSX",
+  "BWA",
+  "BXP",
+  "C",
+  "CA",
+  "CAG",
+  "CAH",
+  "CAT",
+  "CB",
+  "CBRE",
+  "CBS",
+  "CCI",
+  "CCL",
+  "CELG",
+  "CERN",
+  "CF",
+  "CFG",
+  "CHD",
+  "CHK",
+  "CHRW",
+  "CHTR",
+  "CI",
+  "CINF",
+  "CL",
+  "CLX",
+  "CMA",
+  "CMCSA",
+  "CME",
+  "CMG",
+  "CMI",
+  "CMS",
+  "CNC",
+  "CNP",
+  "COF",
+  "COG",
+  "COL",
+  "COO",
+  "COP",
+  "COST",
+  "COTY",
+  "CPB",
+  "CPRI",
+  "CRM",
+  "CSCO",
+  "CSRA",
+  "CSX",
+  "CTAS",
+  "CTL",
+  "CTSH",
+  "CTXS",
+  "CVS",
+  "CVX",
+  "CXO",
+  "D",
+  "DAL",
+  "DD",
+  "DE",
+  "DFS",
+  "DG",
+  "DGX",
+  "DHI",
+  "DHR",
+  "DIS",
+  "DISCA",
+  "DISCK",
+  "DLR",
+  "DLTR",
+  "DNB",
+  "DOV",
+  "DOW",
+  "DRI",
+  "DTE",
+  "DUK",
+  "DVA",
+  "DVN",
+  "EA",
+  "EBAY",
+  "ECL",
+  "ED",
+  "EFX",
+  "EIX",
+  "EL",
+  "EMN",
+  "EMR",
+  "ENDP",
+  "EOG",
+  "EQIX",
+  "EQR",
+  "EQT",
+  "ES",
+  "ESRX",
+  "ESS",
+  "ETFC",
+  "ETN",
+  "ETR",
+  "EVHC",
+  "EW",
+  "EXC",
+  "EXPD",
+  "EXPE",
+  "EXR",
+  "F",
+  "FAST",
+  "FB",
+  "FBHS",
+  "FCX",
+  "FDX",
+  "FE",
+  "FFIV",
+  "FIS",
+  "FISV",
+  "FITB",
+  "FL",
+  "FLIR",
+  "FLR",
+  "FLS",
+  "FMC",
+  "FOX",
+  "FOXA",
+  "FRT",
+  "FSLR",
+  "FTI",
+  "FTR",
+  "FTV",
+  "GD",
+  "GE",
+  "GGP",
+  "GILD",
+  "GIS",
+  "GLW",
+  "GM",
+  "GOOG",
+  "GOOGL",
+  "GPC",
+  "GPN",
+  "GPS",
+  "GRMN",
+  "GS",
+  "GT",
+  "GWW",
+  "HAL",
+  "HAR",
+  "HAS",
+  "HBAN",
+  "HBI",
+  "HCA",
+  "HCP",
+  "HD",
+  "HES",
+  "HIG",
+  "HOG",
+  "HOLX",
+  "HON",
+  "HP",
+  "HPE",
+  "HPQ",
+  "HRB",
+  "HRL",
+  "HRS",
+  "HSIC",
+  "HST",
+  "HSY",
+  "HUM",
+  "IBM",
+  "ICE",
+  "IFF",
+  "ILMN",
+  "INTC",
+  "INTU",
+  "IP",
+  "IPG",
+  "IR",
+  "IRM",
+  "ISRG",
+  "ITW",
+  "IVZ",
+  "JBHT",
+  "JCI",
+  "JEC",
+  "JEF",
+  "JNJ",
+  "JNPR",
+  "JPM",
+  "JWN",
+  "K",
+  "KDP",
+  "KEY",
+  "KHC",
+  "KIM",
+  "KLAC",
+  "KMB",
+  "KMI",
+  "KMX",
+  "KO",
+  "KORS",
+  "KR",
+  "KSS",
+  "KSU",
+  "L",
+  "LB",
+  "LEG",
+  "LEN",
+  "LH",
+  "LKQ",
+  "LLL",
+  "LLTC",
+  "LLY",
+  "LMT",
+  "LNC",
+  "LNT",
+  "LOW",
+  "LRCX",
+  "LUV",
+  "LVLT",
+  "LYB",
+  "M",
+  "MA",
+  "MAA",
+  "MAC",
+  "MAR",
+  "MAS",
+  "MAT",
+  "MCD",
+  "MCHP",
+  "MCK",
+  "MCO",
+  "MDLZ",
+  "MDT",
+  "MET",
+  "MHK",
+  "MJN",
+  "MKC",
+  "MLM",
+  "MMC",
+  "MMM",
+  "MNK",
+  "MNST",
+  "MO",
+  "MON",
+  "MOS",
+  "MPC",
+  "MRK",
+  "MRO",
+  "MS",
+  "MSFT",
+  "MSI",
+  "MTB",
+  "MTD",
+  "MU",
+  "MUR",
+  "MYL",
+  "NAVI",
+  "NBL",
+  "NDAQ",
+  "NEE",
+  "NEM",
+  "NFLX",
+  "NFX",
+  "NI",
+  "NKE",
+  "NLSN",
+  "NOC",
+  "NOV",
+  "NRG",
+  "NSC",
+  "NTAP",
+  "NTRS",
+  "NUE",
+  "NVDA",
+  "NWL",
+  "NWS",
+  "NWSA",
+  "O",
+  "OKE",
+  "OMC",
+  "ORCL",
+  "ORLY",
+  "OXY",
+  "PAYX",
+  "PBCT",
+  "PBI",
+  "PCAR",
+  "PCG",
+  "PDCO",
+  "PEG",
+  "PEP",
+  "PFE",
+  "PFG",
+  "PG",
+  "PGR",
+  "PH",
+  "PHM",
+  "PKI",
+  "PLD",
+  "PM",
+  "PNC",
+  "PNR",
+  "PNW",
+  "PPG",
+  "PPL",
+  "PRGO",
+  "PRU",
+  "PSA",
+  "PSX",
+  "PVH",
+  "PWR",
+  "PX",
+  "PXD",
+  "PYPL",
+  "QCOM",
+  "QRVO",
+  "R",
+  "RAI",
+  "RCL",
+  "REGN",
+  "RF",
+  "RHI",
+  "RHT",
+  "RIG",
+  "RL",
+  "ROK",
+  "ROP",
+  "ROST",
+  "RRC",
+  "RSG",
+  "RTN",
+  "SBUX",
+  "SCG",
+  "SCHW",
+  "SE",
+  "SEE",
+  "SHW",
+  "SIG",
+  "SJM",
+  "SLB",
+  "SLG",
+  "SNA",
+  "SNI",
+  "SO",
+  "SPG",
+  "SPGI",
+  "SPLS",
+  "SRCL",
+  "SRE",
+  "STI",
+  "STJ",
+  "STT",
+  "STX",
+  "STZ",
+  "SWK",
+  "SWKS",
+  "SWN",
+  "SYF",
+  "SYK",
+  "SYMC",
+  "SYY",
+  "T",
+  "TAP",
+  "TDC",
+  "TDG",
+  "TEL",
+  "TGNA",
+  "TGT",
+  "TIF",
+  "TJX",
+  "TMK",
+  "TMO",
+  "TPR",
+  "TRIP",
+  "TROW",
+  "TRV",
+  "TSCO",
+  "TSN",
+  "TSS",
+  "TWX",
+  "TXN",
+  "TXT",
+  "UA",
+  "UAA",
+  "UAL",
+  "UDR",
+  "UHS",
+  "ULTA",
+  "UNH",
+  "UNM",
+  "UNP",
+  "UPS",
+  "URBN",
+  "URI",
+  "USB",
+  "UTX",
+  "V",
+  "VAR",
+  "VFC",
+  "VIAB",
+  "VLO",
+  "VMC",
+  "VNO",
+  "VRSK",
+  "VRSN",
+  "VRTX",
+  "VTR",
+  "VZ",
+  "WAT",
+  "WBA",
+  "WDC",
+  "WEC",
+  "WELL",
+  "WFC",
+  "WFM",
+  "WHR",
+  "WLTW",
+  "WM",
+  "WMB",
+  "WMT",
+  "WRK",
+  "WU",
+  "WY",
+  "WYND",
+  "WYNN",
+  "XEC",
+  "XEL",
+  "XL",
+  "XLNX",
+  "XOM",
+  "XRAY",
+  "XRX",
+  "XYL",
+  "YUM",
+  "ZBH",
+  "ZION",
+  "ZTS"
+ ],
+ "changes": [
+  {
+   "date": "2017-01-05",
+   "add": [
+    "IDXX"
+   ],
+   "remove": [
+    "STJ"
+   ]
+  },
+  {
+   "date": "2017-02-27",
+   "add": [],
+   "remove": [
+    "SE"
+   ]
+  },
+  {
+   "date": "2017-02-28",
+   "add": [
+    "INCY"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2017-03-01",
+   "add": [
+    "CBOE"
+   ],
+   "remove": [
+    "PBI"
+   ]
+  },
+  {
+   "date": "2017-03-02",
+   "add": [
+    "REG"
+   ],
+   "remove": [
+    "ENDP"
+   ]
+  },
+  {
+   "date": "2017-03-13",
+   "add": [
+    "DISH"
+   ],
+   "remove": [
+    "HAR",
+    "LLTC"
+   ]
+  },
+  {
+   "date": "2017-03-16",
+   "add": [
+    "SNPS"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2017-03-20",
+   "add": [
+    "AMD",
+    "ARE",
+    "RJF"
+   ],
+   "remove": [
+    "FSLR",
+    "FTR",
+    "URBN"
+   ]
+  },
+  {
+   "date": "2017-04-04",
+   "add": [
+    "DXC"
+   ],
+   "remove": [
+    "SWN"
+   ]
+  },
+  {
+   "date": "2017-04-05",
+   "add": [
+    "IT"
+   ],
+   "remove": [
+    "DNB"
+   ]
+  },
+  {
+   "date": "2017-06-02",
+   "add": [
+    "INFO"
+   ],
+   "remove": [
+    "TGNA"
+   ]
+  },
+  {
+   "date": "2017-06-15",
+   "add": [],
+   "remove": [
+    "MJN"
+   ]
+  },
+  {
+   "date": "2017-06-19",
+   "add": [
+    "ALGN",
+    "ANSS",
+    "HLT",
+    "RE"
+   ],
+   "remove": [
+    "AABA",
+    "R",
+    "TDC"
+   ]
+  },
+  {
+   "date": "2017-07-25",
+   "add": [],
+   "remove": [
+    "RAI"
+   ]
+  },
+  {
+   "date": "2017-07-26",
+   "add": [
+    "AOS",
+    "DRE",
+    "MGM",
+    "PKG",
+    "RMD"
+   ],
+   "remove": [
+    "BBBY",
+    "MNK",
+    "MUR",
+    "RIG"
+   ]
+  },
+  {
+   "date": "2017-08-07",
+   "add": [
+    "BHF"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2017-08-08",
+   "add": [],
+   "remove": [
+    "AN"
+   ]
+  },
+  {
+   "date": "2017-08-28",
+   "add": [],
+   "remove": [
+    "WFM"
+   ]
+  },
+  {
+   "date": "2017-08-29",
+   "add": [
+    "IQV"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2017-09-01",
+   "add": [
+    "DWDP",
+    "SBAC"
+   ],
+   "remove": [
+    "DD",
+    "DOW"
+   ]
+  },
+  {
+   "date": "2017-09-13",
+   "add": [],
+   "remove": [
+    "SPLS"
+   ]
+  },
+  {
+   "date": "2017-09-18",
+   "add": [
+    "CDNS"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2017-10-13",
+   "add": [
+    "NCLH"
+   ],
+   "remove": [
+    "LVLT"
+   ]
+  },
+  {
+   "date": "2017-12-29",
+   "add": [],
+   "remove": [
+    "BCR"
+   ]
+  },
+  {
+   "date": "2018-01-03",
+   "add": [
+    "HII"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2018-03-07",
+   "add": [
+    "IPGP"
+   ],
+   "remove": [
+    "SNI"
+   ]
+  },
+  {
+   "date": "2018-03-19",
+   "add": [
+    "NKTR",
+    "SIVB",
+    "TTWO"
+   ],
+   "remove": [
+    "CHK",
+    "PDCO",
+    "SIG"
+   ]
+  },
+  {
+   "date": "2018-04-04",
+   "add": [
+    "MSCI"
+   ],
+   "remove": [
+    "CSRA"
+   ]
+  },
+  {
+   "date": "2018-05-31",
+   "add": [
+    "ABMD"
+   ],
+   "remove": [
+    "WYND"
+   ]
+  },
+  {
+   "date": "2018-06-05",
+   "add": [
+    "EVRG"
+   ],
+   "remove": [
+    "NAVI"
+   ]
+  },
+  {
+   "date": "2018-06-07",
+   "add": [
+    "TWTR"
+   ],
+   "remove": [
+    "MON"
+   ]
+  },
+  {
+   "date": "2018-06-15",
+   "add": [],
+   "remove": [
+    "TWX"
+   ]
+  },
+  {
+   "date": "2018-06-18",
+   "add": [
+    "BR",
+    "HFC"
+   ],
+   "remove": [
+    "AYI",
+    "RRC"
+   ]
+  },
+  {
+   "date": "2018-06-20",
+   "add": [
+    "FLT"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2018-07-02",
+   "add": [
+    "CPRT"
+   ],
+   "remove": [
+    "KDP"
+   ]
+  },
+  {
+   "date": "2018-08-28",
+   "add": [
+    "ANET"
+   ],
+   "remove": [
+    "GGP"
+   ]
+  },
+  {
+   "date": "2018-09-12",
+   "add": [],
+   "remove": [
+    "XL"
+   ]
+  },
+  {
+   "date": "2018-09-17",
+   "add": [
+    "WCG"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2018-09-19",
+   "add": [],
+   "remove": [
+    "KORS"
+   ]
+  },
+  {
+   "date": "2018-10-01",
+   "add": [
+    "ROL"
+   ],
+   "remove": [
+    "ANDV"
+   ]
+  },
+  {
+   "date": "2018-10-11",
+   "add": [
+    "FTNT"
+   ],
+   "remove": [
+    "EVHC"
+   ]
+  },
+  {
+   "date": "2018-10-31",
+   "add": [],
+   "remove": [
+    "PX"
+   ]
+  },
+  {
+   "date": "2018-11-06",
+   "add": [
+    "KEYS",
+    "LIN"
+   ],
+   "remove": [
+    "CA"
+   ]
+  },
+  {
+   "date": "2018-11-13",
+   "add": [
+    "JKHY"
+   ],
+   "remove": [
+    "EQT"
+   ]
+  },
+  {
+   "date": "2018-11-27",
+   "add": [],
+   "remove": [
+    "COL"
+   ]
+  },
+  {
+   "date": "2018-11-29",
+   "add": [],
+   "remove": [
+    "AET"
+   ]
+  },
+  {
+   "date": "2018-12-03",
+   "add": [
+    "FANG",
+    "LW",
+    "MXIM"
+   ],
+   "remove": [
+    "SRCL"
+   ]
+  },
+  {
+   "date": "2018-12-21",
+   "add": [],
+   "remove": [
+    "ESRX"
+   ]
+  },
+  {
+   "date": "2018-12-24",
+   "add": [
+    "CE"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2019-01-02",
+   "add": [
+    "FRC"
+   ],
+   "remove": [
+    "SCG"
+   ]
+  },
+  {
+   "date": "2019-01-18",
+   "add": [
+    "TFX"
+   ],
+   "remove": [
+    "PCG"
+   ]
+  },
+  {
+   "date": "2019-02-15",
+   "add": [
+    "ATO"
+   ],
+   "remove": [
+    "NFX"
+   ]
+  },
+  {
+   "date": "2019-02-27",
+   "add": [
+    "WAB"
+   ],
+   "remove": [
+    "GT"
+   ]
+  },
+  {
+   "date": "2019-04-02",
+   "add": [
+    "DOW"
+   ],
+   "remove": [
+    "BHF"
+   ]
+  },
+  {
+   "date": "2019-06-01",
+   "add": [
+    "LHX"
+   ],
+   "remove": [
+    "HRS"
+   ]
+  },
+  {
+   "date": "2019-06-03",
+   "add": [
+    "CTVA",
+    "DD"
+   ],
+   "remove": [
+    "DWDP",
+    "FLR"
+   ]
+  },
+  {
+   "date": "2019-06-07",
+   "add": [
+    "AMCR"
+   ],
+   "remove": [
+    "MAT"
+   ]
+  },
+  {
+   "date": "2019-07-01",
+   "add": [
+    "MKTX"
+   ],
+   "remove": [
+    "LLL"
+   ]
+  },
+  {
+   "date": "2019-07-15",
+   "add": [
+    "TMUS"
+   ],
+   "remove": [
+    "RHT"
+   ]
+  },
+  {
+   "date": "2019-08-08",
+   "add": [
+    "GL"
+   ],
+   "remove": [
+    "TMK"
+   ]
+  },
+  {
+   "date": "2019-08-09",
+   "add": [
+    "IEX",
+    "LDOS"
+   ],
+   "remove": [
+    "APC",
+    "FL"
+   ]
+  },
+  {
+   "date": "2019-09-23",
+   "add": [
+    "CDW"
+   ],
+   "remove": [
+    "TSS"
+   ]
+  },
+  {
+   "date": "2019-09-26",
+   "add": [
+    "NVR"
+   ],
+   "remove": [
+    "JEF"
+   ]
+  },
+  {
+   "date": "2019-10-03",
+   "add": [
+    "LVS"
+   ],
+   "remove": [
+    "NKTR"
+   ]
+  },
+  {
+   "date": "2019-10-18",
+   "add": [
+    "BKR"
+   ],
+   "remove": [
+    "BHGE"
+   ]
+  },
+  {
+   "date": "2019-11-05",
+   "add": [
+    "NLOK",
+    "PEAK"
+   ],
+   "remove": [
+    "HCP",
+    "SYMC"
+   ]
+  },
+  {
+   "date": "2019-11-21",
+   "add": [
+    "NOW"
+   ],
+   "remove": [
+    "CELG"
+   ]
+  },
+  {
+   "date": "2019-12-05",
+   "add": [
+    "VIAC",
+    "WRB"
+   ],
+   "remove": [
+    "CBS",
+    "VIAB"
+   ]
+  },
+  {
+   "date": "2019-12-09",
+   "add": [
+    "ODFL",
+    "TFC"
+   ],
+   "remove": [
+    "BBT",
+    "STI"
+   ]
+  },
+  {
+   "date": "2019-12-10",
+   "add": [
+    "J"
+   ],
+   "remove": [
+    "JEC"
+   ]
+  },
+  {
+   "date": "2019-12-23",
+   "add": [
+    "LYV",
+    "STE",
+    "ZBRA"
+   ],
+   "remove": [
+    "AMG",
+    "MAC",
+    "TRIP"
+   ]
+  },
+  {
+   "date": "2020-01-28",
+   "add": [
+    "PAYC"
+   ],
+   "remove": [
+    "WCG"
+   ]
+  },
+  {
+   "date": "2020-03-03",
+   "add": [
+    "TT"
+   ],
+   "remove": [
+    "XEC"
+   ]
+  },
+  {
+   "date": "2020-04-03",
+   "add": [
+    "CARR",
+    "OTIS",
+    "RTX"
+   ],
+   "remove": [
+    "UTX"
+   ]
+  },
+  {
+   "date": "2020-04-06",
+   "add": [
+    "HWM"
+   ],
+   "remove": [
+    "ARNC",
+    "M",
+    "RTN"
+   ]
+  },
+  {
+   "date": "2020-05-12",
+   "add": [
+    "DPZ",
+    "DXCM"
+   ],
+   "remove": [
+    "AGN",
+    "CPRI"
+   ]
+  },
+  {
+   "date": "2020-05-22",
+   "add": [
+    "WST"
+   ],
+   "remove": [
+    "HP"
+   ]
+  },
+  {
+   "date": "2020-06-22",
+   "add": [
+    "BIO",
+    "TDY",
+    "TYL"
+   ],
+   "remove": [
+    "ADS",
+    "HOG",
+    "JWN"
+   ]
+  },
+  {
+   "date": "2020-09-18",
+   "add": [
+    "LUMN"
+   ],
+   "remove": [
+    "CTL"
+   ]
+  },
+  {
+   "date": "2020-09-21",
+   "add": [
+    "CTLT",
+    "ETSY",
+    "TER"
+   ],
+   "remove": [
+    "COTY",
+    "HRB",
+    "KSS"
+   ]
+  },
+  {
+   "date": "2020-10-07",
+   "add": [
+    "POOL"
+   ],
+   "remove": [
+    "ETFC"
+   ]
+  },
+  {
+   "date": "2020-10-12",
+   "add": [
+    "VNT"
+   ],
+   "remove": [
+    "NBL"
+   ]
+  },
+  {
+   "date": "2020-11-17",
+   "add": [
+    "VTRS"
+   ],
+   "remove": [
+    "MYL"
+   ]
+  },
+  {
+   "date": "2020-12-21",
+   "add": [
+    "TSLA"
+   ],
+   "remove": [
+    "AIV"
+   ]
+  },
+  {
+   "date": "2021-01-07",
+   "add": [
+    "ENPH"
+   ],
+   "remove": [
+    "TIF"
+   ]
+  },
+  {
+   "date": "2021-01-21",
+   "add": [
+    "TRMB"
+   ],
+   "remove": [
+    "CXO"
+   ]
+  },
+  {
+   "date": "2021-02-12",
+   "add": [
+    "MPWR"
+   ],
+   "remove": [
+    "FTI"
+   ]
+  },
+  {
+   "date": "2021-03-22",
+   "add": [
+    "CZR",
+    "GNRC",
+    "NXPI",
+    "PENN"
+   ],
+   "remove": [
+    "FLS",
+    "SLG",
+    "VNT",
+    "XRX"
+   ]
+  },
+  {
+   "date": "2021-04-20",
+   "add": [
+    "PTC"
+   ],
+   "remove": [
+    "VAR"
+   ]
+  },
+  {
+   "date": "2021-05-14",
+   "add": [
+    "CRL"
+   ],
+   "remove": [
+    "FLIR"
+   ]
+  },
+  {
+   "date": "2021-06-04",
+   "add": [
+    "OGN"
+   ],
+   "remove": [
+    "HFC"
+   ]
+  },
+  {
+   "date": "2021-07-21",
+   "add": [
+    "MRNA"
+   ],
+   "remove": [
+    "ALXN"
+   ]
+  },
+  {
+   "date": "2021-08-03",
+   "add": [
+    "BBWI"
+   ],
+   "remove": [
+    "LB"
+   ]
+  },
+  {
+   "date": "2021-08-30",
+   "add": [
+    "TECH"
+   ],
+   "remove": [
+    "MXIM"
+   ]
+  },
+  {
+   "date": "2021-09-20",
+   "add": [
+    "BRO",
+    "CDAY",
+    "MTCH"
+   ],
+   "remove": [
+    "NOV",
+    "PRGO",
+    "UNM"
+   ]
+  },
+  {
+   "date": "2021-10-04",
+   "add": [
+    "CTRA"
+   ],
+   "remove": [
+    "COG"
+   ]
+  },
+  {
+   "date": "2021-12-14",
+   "add": [
+    "EPAM"
+   ],
+   "remove": [
+    "KSU"
+   ]
+  },
+  {
+   "date": "2021-12-20",
+   "add": [
+    "FDS",
+    "SBNY",
+    "SEDG"
+   ],
+   "remove": [
+    "HBI",
+    "LEG",
+    "WU"
+   ]
+  },
+  {
+   "date": "2022-01-10",
+   "add": [
+    "WTW"
+   ],
+   "remove": [
+    "WLTW"
+   ]
+  },
+  {
+   "date": "2022-02-02",
+   "add": [
+    "CEG"
+   ],
+   "remove": [
+    "GPS"
+   ]
+  },
+  {
+   "date": "2022-02-15",
+   "add": [
+    "NDSN"
+   ],
+   "remove": [
+    "XLNX"
+   ]
+  },
+  {
+   "date": "2022-02-17",
+   "add": [
+    "PARA"
+   ],
+   "remove": [
+    "VIAC"
+   ]
+  },
+  {
+   "date": "2022-03-02",
+   "add": [
+    "MOH"
+   ],
+   "remove": [
+    "INFO"
+   ]
+  },
+  {
+   "date": "2022-04-04",
+   "add": [
+    "CPT"
+   ],
+   "remove": [
+    "PBCT"
+   ]
+  },
+  {
+   "date": "2022-04-11",
+   "add": [
+    "WBD"
+   ],
+   "remove": [
+    "DISCA",
+    "DISCK"
+   ]
+  },
+  {
+   "date": "2022-05-10",
+   "add": [
+    "BALL"
+   ],
+   "remove": [
+    "BLL"
+   ]
+  },
+  {
+   "date": "2022-06-08",
+   "add": [
+    "VICI"
+   ],
+   "remove": [
+    "CERN"
+   ]
+  },
+  {
+   "date": "2022-06-09",
+   "add": [
+    "META"
+   ],
+   "remove": [
+    "FB"
+   ]
+  },
+  {
+   "date": "2022-06-21",
+   "add": [
+    "KDP",
+    "ON"
+   ],
+   "remove": [
+    "IPGP",
+    "UA",
+    "UAA"
+   ]
+  },
+  {
+   "date": "2022-06-28",
+   "add": [
+    "ELV"
+   ],
+   "remove": [
+    "ANTM"
+   ]
+  },
+  {
+   "date": "2022-09-19",
+   "add": [
+    "CSGP",
+    "INVH"
+   ],
+   "remove": [
+    "PENN",
+    "PVH"
+   ]
+  },
+  {
+   "date": "2022-10-03",
+   "add": [
+    "EQT",
+    "PCG"
+   ],
+   "remove": [
+    "CTXS",
+    "DRE"
+   ]
+  },
+  {
+   "date": "2022-10-12",
+   "add": [
+    "TRGP"
+   ],
+   "remove": [
+    "NLSN"
+   ]
+  },
+  {
+   "date": "2022-11-01",
+   "add": [
+    "ACGL"
+   ],
+   "remove": [
+    "TWTR"
+   ]
+  },
+  {
+   "date": "2022-11-08",
+   "add": [
+    "GEN"
+   ],
+   "remove": [
+    "NLOK"
+   ]
+  },
+  {
+   "date": "2022-12-19",
+   "add": [
+    "FSLR"
+   ],
+   "remove": [
+    "FBHS"
+   ]
+  },
+  {
+   "date": "2022-12-22",
+   "add": [
+    "STLD"
+   ],
+   "remove": [
+    "ABMD"
+   ]
+  },
+  {
+   "date": "2023-01-04",
+   "add": [
+    "GEHC"
+   ],
+   "remove": [
+    "VNO"
+   ]
+  },
+  {
+   "date": "2023-03-15",
+   "add": [
+    "BG",
+    "PODD"
+   ],
+   "remove": [
+    "SBNY",
+    "SIVB"
+   ]
+  },
+  {
+   "date": "2023-03-20",
+   "add": [
+    "FICO"
+   ],
+   "remove": [
+    "LUMN"
+   ]
+  },
+  {
+   "date": "2023-05-04",
+   "add": [
+    "AXON"
+   ],
+   "remove": [
+    "FRC"
+   ]
+  },
+  {
+   "date": "2023-05-16",
+   "add": [
+    "RVTY"
+   ],
+   "remove": [
+    "PKI"
+   ]
+  },
+  {
+   "date": "2023-06-07",
+   "add": [
+    "FI"
+   ],
+   "remove": [
+    "FISV"
+   ]
+  },
+  {
+   "date": "2023-06-20",
+   "add": [
+    "PANW"
+   ],
+   "remove": [
+    "DISH"
+   ]
+  },
+  {
+   "date": "2023-07-10",
+   "add": [
+    "EG"
+   ],
+   "remove": [
+    "RE"
+   ]
+  },
+  {
+   "date": "2023-08-25",
+   "add": [
+    "KVUE"
+   ],
+   "remove": [
+    "AAP"
+   ]
+  },
+  {
+   "date": "2023-08-30",
+   "add": [
+    "COR"
+   ],
+   "remove": [
+    "ABC"
+   ]
+  },
+  {
+   "date": "2023-09-18",
+   "add": [
+    "ABNB",
+    "BX"
+   ],
+   "remove": [
+    "LNC",
+    "NWL"
+   ]
+  },
+  {
+   "date": "2023-10-02",
+   "add": [
+    "VLTO"
+   ],
+   "remove": [
+    "DXC"
+   ]
+  },
+  {
+   "date": "2023-10-18",
+   "add": [
+    "HUBB",
+    "LULU"
+   ],
+   "remove": [
+    "ATVI",
+    "OGN"
+   ]
+  },
+  {
+   "date": "2023-12-18",
+   "add": [
+    "BLDR",
+    "JBL",
+    "UBER"
+   ],
+   "remove": [
+    "ALK",
+    "SEDG",
+    "SEE"
+   ]
+  },
+  {
+   "date": "2024-02-01",
+   "add": [
+    "DAY"
+   ],
+   "remove": [
+    "CDAY"
+   ]
+  },
+  {
+   "date": "2024-03-04",
+   "add": [
+    "DOC"
+   ],
+   "remove": [
+    "PEAK"
+   ]
+  },
+  {
+   "date": "2024-03-18",
+   "add": [
+    "DECK",
+    "SMCI"
+   ],
+   "remove": [
+    "WHR",
+    "ZION"
+   ]
+  },
+  {
+   "date": "2024-03-25",
+   "add": [
+    "CPAY"
+   ],
+   "remove": [
+    "FLT"
+   ]
+  },
+  {
+   "date": "2024-04-01",
+   "add": [
+    "SOLV"
+   ],
+   "remove": [
+    "VFC"
+   ]
+  },
+  {
+   "date": "2024-04-02",
+   "add": [
+    "GEV"
+   ],
+   "remove": [
+    "XRAY"
+   ]
+  },
+  {
+   "date": "2024-05-08",
+   "add": [
+    "VST"
+   ],
+   "remove": [
+    "PXD"
+   ]
+  },
+  {
+   "date": "2024-06-24",
+   "add": [
+    "CRWD",
+    "GDDY",
+    "KKR"
+   ],
+   "remove": [
+    "CMA",
+    "ILMN",
+    "RHI"
+   ]
+  },
+  {
+   "date": "2024-07-08",
+   "add": [
+    "SW"
+   ],
+   "remove": [
+    "WRK"
+   ]
+  },
+  {
+   "date": "2024-09-23",
+   "add": [
+    "DELL",
+    "ERIE",
+    "PLTR"
+   ],
+   "remove": [
+    "AAL",
+    "BIO",
+    "ETSY"
+   ]
+  },
+  {
+   "date": "2024-09-30",
+   "add": [
+    "AMTM"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2024-10-01",
+   "add": [],
+   "remove": [
+    "BBWI"
+   ]
+  },
+  {
+   "date": "2024-11-26",
+   "add": [
+    "TPL"
+   ],
+   "remove": [
+    "MRO"
+   ]
+  },
+  {
+   "date": "2024-12-23",
+   "add": [
+    "APO",
+    "LII",
+    "WDAY"
+   ],
+   "remove": [
+    "AMTM",
+    "CTLT",
+    "QRVO"
+   ]
+  },
+  {
+   "date": "2025-03-24",
+   "add": [
+    "DASH",
+    "EXE",
+    "TKO",
+    "WSM"
+   ],
+   "remove": [
+    "BWA",
+    "CE",
+    "FMC",
+    "TFX"
+   ]
+  },
+  {
+   "date": "2025-05-19",
+   "add": [
+    "COIN"
+   ],
+   "remove": [
+    "DFS"
+   ]
+  },
+  {
+   "date": "2025-07-09",
+   "add": [
+    "DDOG"
+   ],
+   "remove": [
+    "JNPR"
+   ]
+  },
+  {
+   "date": "2025-07-18",
+   "add": [
+    "TTD"
+   ],
+   "remove": [
+    "ANSS"
+   ]
+  },
+  {
+   "date": "2025-07-23",
+   "add": [
+    "XYZ"
+   ],
+   "remove": [
+    "HES"
+   ]
+  },
+  {
+   "date": "2025-08-08",
+   "add": [
+    "PSKY"
+   ],
+   "remove": [
+    "PARA"
+   ]
+  },
+  {
+   "date": "2025-08-28",
+   "add": [
+    "IBKR"
+   ],
+   "remove": [
+    "WBA"
+   ]
+  },
+  {
+   "date": "2025-09-22",
+   "add": [
+    "APP",
+    "EME",
+    "HOOD"
+   ],
+   "remove": [
+    "CZR",
+    "ENPH",
+    "MKTX"
+   ]
+  },
+  {
+   "date": "2025-10-30",
+   "add": [
+    "SOLS"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2025-10-31",
+   "add": [],
+   "remove": [
+    "KMX"
+   ]
+  },
+  {
+   "date": "2025-11-03",
+   "add": [
+    "Q"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2025-11-04",
+   "add": [],
+   "remove": [
+    "EMN"
+   ]
+  },
+  {
+   "date": "2025-11-11",
+   "add": [
+    "FISV"
+   ],
+   "remove": [
+    "FI"
+   ]
+  },
+  {
+   "date": "2025-11-28",
+   "add": [
+    "SNDK"
+   ],
+   "remove": [
+    "IPG"
+   ]
+  },
+  {
+   "date": "2025-12-11",
+   "add": [
+    "ARES"
+   ],
+   "remove": [
+    "K"
+   ]
+  },
+  {
+   "date": "2025-12-22",
+   "add": [
+    "CRH",
+    "CVNA",
+    "FIX"
+   ],
+   "remove": [
+    "LKQ",
+    "MHK",
+    "SOLS"
+   ]
+  },
+  {
+   "date": "2026-01-14",
+   "add": [
+    "MRSH"
+   ],
+   "remove": [
+    "MMC"
+   ]
+  },
+  {
+   "date": "2026-02-09",
+   "add": [
+    "CIEN"
+   ],
+   "remove": [
+    "DAY"
+   ]
+  },
+  {
+   "date": "2026-03-23",
+   "add": [
+    "COHR",
+    "LITE",
+    "SATS",
+    "VRT"
+   ],
+   "remove": [
+    "LW",
+    "MOH",
+    "MTCH",
+    "PAYC"
+   ]
+  },
+  {
+   "date": "2026-04-09",
+   "add": [
+    "CASY"
+   ],
+   "remove": [
+    "HOLX"
+   ]
+  },
+  {
+   "date": "2026-05-07",
+   "add": [
+    "VEEV"
+   ],
+   "remove": [
+    "CTRA"
+   ]
+  },
+  {
+   "date": "2026-05-21",
+   "add": [
+    "BNY"
+   ],
+   "remove": [
+    "BK"
+   ]
+  },
+  {
+   "date": "2026-06-01",
+   "add": [
+    "FDXF"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2026-06-02",
+   "add": [],
+   "remove": [
+    "EPAM"
+   ]
+  },
+  {
+   "date": "2026-06-22",
+   "add": [
+    "FLEX",
+    "MRVL"
+   ],
+   "remove": [
+    "CPB",
+    "POOL"
+   ]
+  },
+  {
+   "date": "2026-06-24",
+   "add": [
+    "ECHO"
+   ],
+   "remove": [
+    "SATS"
+   ]
+  },
+  {
+   "date": "2026-06-29",
+   "add": [
+    "HONA"
+   ],
+   "remove": []
+  },
+  {
+   "date": "2026-06-30",
+   "add": [],
+   "remove": [
+    "CAG"
+   ]
+  },
+  {
+   "date": "2026-08-05",
+   "add": [
+    "FERG"
+   ],
+   "remove": [
+    "EA"
+   ]
+  },
+  {
+   "date": "2026-08-18",
+   "add": [
+    "RDDT",
+    "VMRK"
+   ],
+   "remove": [
+    "AVB",
+    "EQR"
+   ]
+  }
+ ],
+ "covers_to": "2026-08-18",
+ "last_count": 503
+}

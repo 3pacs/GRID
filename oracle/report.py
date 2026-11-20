@@ -64,6 +64,20 @@ def _scoring_summary(scoring: dict[str, Any]) -> str:
     return f"{total:,} scored this cycle: {hits:,} hits / {partials:,} partial / {misses:,} misses."
 
 
+
+def _signal_age(signal: dict[str, Any]) -> str:
+    """Distinguish exact event age, observation DATE and ingestion availability."""
+    p = signal.get("provenance") or {}
+    if p.get("event_time_basis") == "signal_date_date_only":
+        return (
+            "exact source age unknown; observation date: "
+            f"{escape(str(p.get('signal_date') or 'unknown'))} (DATE only); "
+            f"calendar date age: {_number(p.get('date_age_days'), '.0f', suffix='d')}; "
+            f"observation-date age lower bound (UTC calendar): {_number(p.get('freshness_hours_lower_bound'), '.1f', suffix='h')}; "
+            f"ingested: {escape(_timestamp(p.get('available_at')))}"
+        )
+    return f"source age at generation: {_number(signal.get('freshness_hours'), '.1f', suffix='h')}"
+
 def _prediction_section(pred: dict[str, Any], today: date) -> dict[str, Any]:
     ticker = escape(str(pred.get("ticker") or "unknown"))
     direction = escape(str(pred.get("direction") or "unknown"))
@@ -93,7 +107,8 @@ def _prediction_section(pred: dict[str, Any], today: date) -> dict[str, Any]:
         f"<td>{_number(pred.get('confidence'), '.0%')}</td></tr></table>"
         '<p>Confidence is a model score, not an established probability of profit.</p>'
     )
-    signals = pred.get("signals") or []
+    signal_payload = pred.get("signals") or []
+    signals = signal_payload.get("items", []) if isinstance(signal_payload, dict) else signal_payload
     antis = pred.get("anti_signals") or []
     bull = sum(s.get("direction") == "bullish" for s in signals)
     bear = sum(s.get("direction") == "bearish" for s in signals)
@@ -102,9 +117,32 @@ def _prediction_section(pred: dict[str, Any], today: date) -> dict[str, Any]:
         body += "<ul>" + "".join(
             f"<li>{escape(str(s.get('name', 'unknown')))}: "
             f"{escape(str(s.get('direction', 'unknown')))}, z={_number(s.get('z_score'), '.1f')}; "
-            f"source age at generation: {_number(s.get('freshness_hours'), '.1f', suffix='h')}</li>"
+            f"{_signal_age(s)}</li>"
             for s in signals
         ) + "</ul>"
+    actor_audit = (signal_payload.get("actor_evidence") if isinstance(signal_payload, dict)
+                   else (pred.get("flow_context") or {}).get("actor_evidence"))
+    if isinstance(actor_audit, dict):
+        if not actor_audit.get("complete"):
+            body += (
+                "<p>Actor evidence unavailable; no actor votes used: "
+                f"{escape(str(actor_audit.get('reason') or 'unknown'))}.</p>"
+            )
+        else:
+            candidate_count = _count(actor_audit.get("observation_count"))
+            sample = actor_audit.get("observations")
+            sample_count = len(sample) if isinstance(sample, list) else 0
+            count_label = str(candidate_count) if candidate_count is not None else "unknown"
+            detail_status = "complete" if actor_audit.get("observations_complete") is True else "sampled/truncated"
+            body += (
+                f"<p>Actor evidence: {len(actor_audit.get('direct_vote_row_ids', []))} direct votes "
+                f"from {count_label} candidate observations. "
+                "Repeated actor/channel observations are not independent confirmations; "
+                "latest-day conflicting or unknown directions are withheld. "
+                "Actor observations have DATE precision; exact event age is unknown. "
+                f"Stored candidate detail: {sample_count}/{count_label} ({detail_status}); "
+                "used support references are complete.</p>"
+            )
     if antis:
         body += "<p><strong>Anti-signals</strong></p><ul>" + "".join(
             f"<li>{escape(str(a.get('name', 'unknown')))}: z={_number(a.get('z_score'), '.1f')}; "
@@ -127,12 +165,26 @@ def build_oracle_report(cycle_result: dict[str, Any], *, now: datetime | None = 
     inserted = _count(cycle_result.get("distinct_positions_written"))
     updated = _count(cycle_result.get("positions_updated"))
     writes = _count(cycle_result.get("upsert_statements"))
+    forward_record = "new_abstentions" in cycle_result
+    abstentions = _count(cycle_result.get("new_abstentions"))
+    unchanged = _count(cycle_result.get("unchanged_forecasts"))
     # Update operations can touch the same row repeatedly. Incomplete RETURNING
     # counts cannot establish a distinct-row total; never substitute model votes.
-    if writes is not None and (inserted is None or updated is None or inserted + updated != writes):
+    if forward_record:
+        if (None in (inserted, abstentions, unchanged, writes) or updated != 0
+                or inserted + abstentions + unchanged != writes):
+            inserted = updated = None
+    elif writes is not None and (inserted is None or updated is None or inserted + updated != writes):
         inserted = updated = None
     headline = f"{inserted:,} New prediction rows" if inserted is not None else "New rows unknown"
     vote_label = f"{votes:,} model votes" if votes is not None else "model votes unknown"
+    if forward_record:
+        vote_label = f"{votes:,} accepted forecasts" if votes is not None else "accepted count unknown"
+    admission_note = (
+        f"<p>{abstentions:,} new abstention records; {unchanged:,} prior forecasts preserved unchanged. "
+        "Abstentions are excluded from new forecast counts and top calls.</p>"
+        if forward_record and abstentions is not None and unchanged is not None else ""
+    )
     subject = f"GRID Oracle - {headline} | {vote_label}"
     scoring = cycle_result.get("scoring") or {}
     summary = _scoring_summary(scoring)
@@ -151,6 +203,7 @@ def build_oracle_report(cycle_result: dict[str, Any], *, now: datetime | None = 
             f"<p>{vote_label}; "
             + (f"{updated:,} update operations" if updated is not None else "update count unknown")
             + ". Updates are not distinct positions or executed trades.</p>"
+            + admission_note +
             f"<p><strong>{summary}</strong><br>{exceptions}. "
             "These counts describe this scoring pass, not the entire pending backlog.</p>"
             f"<p>{len(preds)} supplied prediction details below; {len(changes)} model weight changes. "
