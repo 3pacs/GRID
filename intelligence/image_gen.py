@@ -28,7 +28,26 @@ from loguru import logger as log
 # ── Configuration ─────────────────────────────────────────────────
 
 _API_KEY = os.getenv("GEMINI_API_KEY", "")
-_OUTPUT_DIR = Path("/data/grid_v4/grid_repo/outputs/generated_images")
+# Writable output dir, outside any code checkout on grid-svr: the shared
+# /data/grid/outputs root the release tree's outputs/* symlinks already point
+# into. It used to be the old /data/grid_v4/grid_repo checkout, which is being
+# retired. GRID_GENERATED_IMAGES_DIR overrides; a host without /data/grid/outputs
+# (a dev checkout) writes to this repo's own outputs/generated_images.
+_SHARED_OUTPUTS_ROOT = Path("/data/grid/outputs")
+_CHECKOUT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs" / "generated_images"
+
+
+def generated_images_dir(*, shared_root: Path = _SHARED_OUTPUTS_ROOT) -> Path:
+    """Directory generated images are written to (see the comment above)."""
+    configured = os.getenv("GRID_GENERATED_IMAGES_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    if shared_root.is_dir():
+        return shared_root / "generated_images"
+    return _CHECKOUT_OUTPUT_DIR
+
+
+_OUTPUT_DIR = generated_images_dir()
 
 # Model tiers: fast for iteration, standard for production, ultra for hero images
 MODELS = {

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run batch forensics for SPY, BTC, ETH, QQQ, AAPL with threshold=0.015."""
 
+import os
 import sys
-sys.path.insert(0, "/data/grid_v4/grid_repo")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import create_engine
 from intelligence.forensics import batch_forensics

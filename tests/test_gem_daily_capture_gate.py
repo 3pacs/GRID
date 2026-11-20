@@ -180,3 +180,18 @@ def test_validate_batch(monkeypatch, overrides, ok) -> None:
     result = {"capture_batch_id": "b", "capture_ordinal": 42, "snapshots_inserted": 100}
     assert daily._validate_batch(_Conn(_batch_row(**overrides)), "SPY", DAY, result) is ok
     assert daily._validate_batch(_Conn(None), "SPY", DAY, result) is False
+
+
+@pytest.mark.parametrize("verdicts,code,line", [
+    ([("SPY", True), ("QQQ", True)], 0, "GEM_RESULT PASS pass=2 fail=0 failed=[]"),
+    ([("OPCH", True), ("GLND", False), ("SPY", True)], 0,
+     "GEM_RESULT PARTIAL pass=2 fail=1 failed=[GLND]"),
+    ([("GLND", False), ("SPY", False)], 1, "GEM_RESULT FAIL pass=0 fail=2 failed=[GLND,SPY]"),
+])
+def test_run_result_is_partial_not_failed_when_some_tickers_pass(
+        tmp_path, monkeypatch, capsys, verdicts, code, line) -> None:
+    monkeypatch.setattr(daily, "_ATTEMPTS", tmp_path)
+    assert daily._claim_day(DAY)
+    assert daily._record_result(DAY, verdicts) == code
+    assert line in (tmp_path / DAY.isoformat()).read_text()
+    assert line in capsys.readouterr().out

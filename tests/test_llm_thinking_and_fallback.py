@@ -98,7 +98,7 @@ def test_task_queue_disables_thinking_for_structured_tasks(monkeypatch, task_typ
             return "RESULT"
 
     queue = tq.LLMTaskQueue(engine=MagicMock())
-    monkeypatch.setattr(queue, "_get_client", lambda task_type=None: Client())
+    monkeypatch.setattr(queue, "_get_client", lambda task_type=None, priority=None: Client())
     monkeypatch.setattr(queue, "_record_done", lambda task: None)
     queue.enqueue(task_type, "prompt", priority=3)
     task = queue.process_next()
@@ -117,7 +117,7 @@ def test_task_queue_works_with_clients_without_the_keyword(monkeypatch):
             return "LEGACY"
 
     queue = tq.LLMTaskQueue(engine=MagicMock())
-    monkeypatch.setattr(queue, "_get_client", lambda task_type=None: Legacy())
+    monkeypatch.setattr(queue, "_get_client", lambda task_type=None, priority=None: Legacy())
     monkeypatch.setattr(queue, "_record_done", lambda task: None)
     queue.enqueue("earnings_preview", "prompt", priority=3)
     assert queue.process_next().result == "LEGACY"

@@ -1,0 +1,10 @@
+{"run_id": "xs-playbook-1-20261115", "first_session": "2010-01-04", "last_session": "2022-12-29",
+ "signals": [{"name": "overnight_persistence", "kind": "mean_overnight", "lookback": 252, "horizons": ["overnight"]},
+             {"name": "overnight_fade", "kind": "mean_overnight", "lookback": 252, "sign": -1, "horizons": ["intraday"]},
+             {"name": "reversal_5d", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]},
+             {"name": "reversal_2d", "kind": "reversal", "lookback": 2, "horizons": ["close_1d"]},
+             {"name": "momentum_12_1", "kind": "momentum", "lookback": 231, "skip": 21, "horizons": ["close_1d"]},
+             {"name": "near_52w_high", "kind": "high_52w", "lookback": 252, "horizons": ["close_1d"]},
+             {"name": "far_from_52w_high", "kind": "high_52w", "lookback": 252, "sign": -1, "horizons": ["close_1d"]}],
+ "rankings": ["within_sector"], "fractions": [0.2], "cost_bp_per_side": 1.0, "alpha": 0.05,
+ "perms": 10000, "seed": 20261107, "cards": 50}

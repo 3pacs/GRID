@@ -4,16 +4,27 @@
 # retry. Calendar is anchored to America/New_York so it tracks DST:
 #   Fri 16:00 ET = 20:00 UTC (EDT) / 21:00 UTC (EST)
 #   Sat 14:00 ET retry, after the puller's Saturday retry
-# A holiday-shifted release (Mon-Thu) is written on the next Friday run; the
-# writer is idempotent, a retry with unchanged inputs is a no-op run.
+#   Mon 17:00 ET and Tue 17:00 ET: holiday weeks. When a federal holiday
+#   falls Tue-Fri, CFTC publishes on the next federal business day after the
+#   Friday (cftc_markets.compute_release), usually Monday 15:30 ET (Tuesday
+#   when that Monday is a holiday too). The puller follows that shifted
+#   release (due from release + 15 min, retried through the next ET day); a
+#   Fri/Sat-only writer left those reports unwritten until the next Friday
+#   (report of 2026-11-10 published Mon 11-16; 2026-10-13 waited to 10-23).
+#   Mon/Tue 17:00 ET = 21:00 / 22:00 UTC (EDT / EST).
+# The writer is idempotent: a run with unchanged inputs writes no data row
+# (the upsert's IS DISTINCT FROM guard) and records one `noop` godview_runs
+# row, so the extra runs in an ordinary week are harmless (~30 s each).
 # Check on the host before enabling:
 #   systemd-analyze calendar 'Fri *-*-* 16:00:00 America/New_York'
+#   systemd-analyze calendar 'Mon,Tue *-*-* 17:00:00 America/New_York'
 [Unit]
 Description=Weekly GRID god view CFTC positioning writer (after the COT release)
 
 [Timer]
 OnCalendar=Fri *-*-* 16:00:00 America/New_York
 OnCalendar=Sat *-*-* 14:00:00 America/New_York
+OnCalendar=Mon,Tue *-*-* 17:00:00 America/New_York
 Persistent=true
 RandomizedDelaySec=120
 Unit=grid-godview-cftc.service

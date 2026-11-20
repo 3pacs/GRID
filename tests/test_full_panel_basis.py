@@ -107,7 +107,10 @@ class TestEntityMapBasisPolicy:
         from price_close_contract import SPY_CLOSE_FEATURE, SPY_CLOSE_SERIES
 
         assert SPY_CLOSE_FEATURE == "spy_full"
-        assert SEED_MAPPINGS[SPY_CLOSE_SERIES] == "spy_full"
+        # YF:SPY:close lives in NEW_MAPPINGS_V2, merged into SEED_MAPPINGS only
+        # once an EntityMap is built in the process (the parametrized test above
+        # does that), so under xdist this test must read the effective mapping.
+        assert _mappings()[SPY_CLOSE_SERIES] == "spy_full"
         assert "YF:SPY:adj_close" not in _mappings()
         assert "spy_full" in RAW_CLOSE_FULL_FEATURES
 

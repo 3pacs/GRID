@@ -104,6 +104,21 @@ class ActorImpact:
 
 # ── Query helpers ────────────────────────────────────────────────────────────
 
+# 3pacs/GRID#1180: a derived edge joins the contagion graph only after the
+# weekly validator has measured it (last_validation_at) and not flagged it
+# weak. Curated tiers (confirmed, inferred, derived_from_backtest) are
+# unchanged. The validator can only price edges between two listed nodes, so
+# an 8-K edge (ingestion/altdata/supply_chain_8k.py: a verbatim quote checked
+# against the filing, and its URL) with a private or other non-ticker end
+# joins on that citation; 10-K/10-Q regex edges to private nodes stay out.
+VALIDATED_DERIVED_GATE = (
+    " AND NOT (confidence = 'derived'"
+    " AND (last_validation_at IS NULL OR COALESCE(relationship_weak, FALSE))"
+    " AND NOT (source LIKE '8-K % Item 1.01 https://www.sec.gov/%'"
+    " AND EXISTS (SELECT 1 FROM supply_chain_nodes gate_n"
+    " WHERE gate_n.id IN (upstream_id, downstream_id) AND gate_n.type <> 'ticker')))"
+)
+
 _EDGE_COLS = (
     "upstream_id, downstream_id, relationship, input_type, annual_usd, "
     "pct_downstream_cogs, chokepoint_score"
@@ -124,7 +139,7 @@ def _fetch_downstream_edges(conn: Any, node_id: str) -> list[dict[str, Any]]:
     # _EDGE_COLS is a module constant
     edge_sql = (
         "SELECT " + _EDGE_COLS + " FROM supply_chain_edges "
-        "WHERE upstream_id = :n"
+        "WHERE upstream_id = :n" + VALIDATED_DERIVED_GATE
     )
     try:
         rows = conn.execute(text(edge_sql), {"n": node_id}).fetchall()

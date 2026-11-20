@@ -12,6 +12,13 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _admit_synthetic_models(monkeypatch):
+    """These math fixtures supply explicitly active synthetic model heads."""
+    monkeypatch.setattr("oracle.model_factory.ModelFactory.active_model_names",
+                        lambda conn, names, **kw: set(names))
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_sweep_multipliers():
     """No-op SWEEP multipliers so liquidity-specific tests see only liquidity."""
     fci_stub = MagicMock()

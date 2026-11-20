@@ -1,0 +1,946 @@
+{
+  "schema": "r3-nvda-health/1",
+  "rubric": {
+    "path": "docs/research/r3-nvda/health-rubric-v0.md",
+    "sha256": "5e11a86e02cef71a14be3abb403ffe04c35c9011d911e52f74b1b926984c909c",
+    "written_at": "2026-11-13T00:51:54Z",
+    "first_health_download_at": "2026-11-13T00:53:01Z",
+    "note": "rubric text unchanged from v0 (written before any health data). Its literal 'one distress signal' clause is NOT tightened after seeing results; the lenient reading is shown alongside instead."
+  },
+  "assessments": [
+    {
+      "company": "OpenAI Group PBC",
+      "grade": "UNKNOWN",
+      "grade_rule": "AMBER: dependent on new external financing to meet stated commitments (primary-disclosed compute contracts alone exceed the disclosed funding round several times) and at least one distress signal (April 2026 withdrawal from Stargate Norway and Stargate UK). This is a FLOOR: runway, cash and burn are UNKNOWN (no primary OpenAI data), so RED cannot be ruled out and GREEN is not supportable.",
+      "metrics": {
+        "runway_months": null,
+        "cash_bn": null,
+        "debt_bn": null,
+        "maturities_12m_bn": null,
+        "interest_coverage": null,
+        "revenue_run_rate_bn": null,
+        "cash_burn_bn": null,
+        "primary_compute_commitments_bn": {
+          "microsoft_azure_incremental": 250,
+          "aws_original": 38.0,
+          "aws_expansion": 100.0,
+          "coreweave_sept2025_order": 6.5,
+          "note": "Only contracts with a dollar amount in a primary source; Oracle (not named in its 10-Q), NVIDIA 10 GW LOI (non-binding), AMD and Broadcom programmes and PORTS-Pike leases have no primary dollar figure here. Not summed in records."
+        },
+        "primary_funding_bn": {
+          "financing_round_announced_feb_2026": 122,
+          "amazon_series_c_funded": 50.0,
+          "softbank_2026_follow_on_funded": 30.0,
+          "microsoft_total_funding_commitment": 13.0,
+          "microsoft_funded_to_date": 12.0
+        },
+        "microsoft_revenue_from_openai_q3_bn": 10.0,
+        "microsoft_receivable_from_openai_bn": {
+          "2026-06-30": 6.0,
+          "2026-09-30": 7.2
+        },
+        "softbank_fair_value_bn": 99.6
+      },
+      "distress_signals": [
+        "April 2026: OpenAI withdrew from Stargate Norway and Stargate UK; Microsoft took the Norway capacity (Nscale S-1/A, primary)",
+        "SoftBank SB7 took a $3.73B loss realigning power-equipment procurement for U.S. AI data centers including PORTS-Pike (primary; the project affected is not named)",
+        "August 2026: SoftBank Energy Global warrants to OpenAI amended and partly forfeited alongside new data-center leases (restructuring of lease incentives; primary)",
+        "Oracle-OpenAI Abilene expansion cancelled (March 2026; Bloomberg, secondary, from cp-records)",
+        "Reported cut of compute target to ~$600B through 2030 from $1.4T (secondary only)",
+        "Reported NVIDIA reduction of the Ohio/PORTS-Pike guarantee (secondary only; no NVIDIA 8-K found; unconfirmed)"
+      ],
+      "positive_signals": [
+        "Amazon fully funded its $50.0B Series C commitment by Q3 2026; SoftBank fully funded $30.0B by 2026-10-01",
+        "SoftBank kept OpenAI at an unchanged $99.6B fair value at 2026-09-30 (no down round)",
+        "Microsoft booked $272M of net gains (HLBV) from OpenAI in the quarter, after $4.1B of losses a year earlier"
+      ],
+      "nvidia_exposure_note": "Largest single exposure: up to $105B guarantee cap on PORTS-Pike leases (from FY2029, triggered by OpenAI default) = long-dated tail, outside the 4-quarter window. In-window exposure is indirect: OpenAI is the end customer behind Oracle, CoreWeave, Microsoft and AWS capacity that buys NVIDIA systems (Microsoft alone booked $10.0B of OpenAI revenue in one quarter), plus the reported ~$30B NVIDIA equity stake (secondary).",
+      "evidence_ids": [
+        "health-openai-amzn-50b-series-c",
+        "health-openai-aws-100b-expansion",
+        "health-openai-compute-target-600b-secondary",
+        "health-openai-crwv-credit-risk",
+        "health-openai-msft-24pct-funding",
+        "health-openai-msft-azure-250b",
+        "health-openai-msft-oie-gain",
+        "health-openai-msft-revenue-ar",
+        "health-openai-nscale-stargate-withdrawal",
+        "health-openai-nvda-ohio-guarantee-cut-secondary",
+        "health-openai-orcl-not-named",
+        "health-openai-own-site-unverifiable",
+        "health-openai-revenue-2b-month-secondary",
+        "health-openai-sbg-122b-round",
+        "health-openai-sbg-30b-complete",
+        "health-openai-sbg-fair-value-unchanged",
+        "health-openai-sbg-openai-share-loan",
+        "health-openai-sbg-sb7-procurement-loss",
+        "health-openai-sbg-warrants-leases"
+      ],
+      "missing": [
+        "cash and equivalents",
+        "cash burn / operating cash flow",
+        "GAAP revenue or primary run-rate",
+        "total debt and facilities",
+        "total compute commitments (OpenAI-stated)",
+        "Oracle contract size and prepayment terms",
+        "OpenAI financial statements (no S-1 on EDGAR as of 2026-11-13)",
+        "openai.com newsroom (HTTP 403, UNVERIFIABLE)"
+      ],
+      "reasoning": "Primary evidence about OpenAI comes only from counterparties. It shows heavy, growing spend: $10.0B of Microsoft revenue in one quarter and receivables up $1.2B. Primary-disclosed compute contracts with a dollar amount (Azure +$250B, AWS $38B +$100B, CoreWeave $6.5B) are several times the $122B round SoftBank cites. So meeting commitments needs continued external financing, which is the AMBER rule. Capital access in 2026 was strong: Amazon and SoftBank funded $80B in cash, and the valuation is held flat. The retreat from Stargate Norway/UK and SoftBank's PORTS-Pike-linked procurement write-down are distress signals. No liquidity or burn figure is primary, so the rubric's \"UNKNOWN does not count as GREEN\" applies to runway. Treat OpenAI's 4-quarter cash health as not supported by evidence; AMBER is the lowest grade the primary data supports.",
+      "owner_v1_corrections": [
+        "graded UNKNOWN (rubric: no primary cash, burn, revenue or debt data). v0's 'AMBER floor' is withdrawn. The SB7 loss is removed from OpenAI's distress signals (SoftBank says it is unrelated). 'At least $394.5B of compute contracts vs a $122B round' compares multi-year contract totals with one funding round and ignores revenue; reported as context only."
+      ],
+      "grade_v0": "AMBER"
+    },
+    {
+      "company": "Anthropic, PBC",
+      "grade": "GREEN",
+      "grade_rule": "GREEN: self-funding (positive operating cash flow of $6.6B and positive OCF minus capex and equipment prepayments for 9M 2026); 12-month contractual obligations ($70.7B) are covered by cash plus short-term investments ($131.9B) before IPO proceeds; revolver undrawn and covenants met; no going-concern or material-weakness language; no customer >10% of revenue.",
+      "metrics": {
+        "runway_months": null,
+        "runway_note": "Not meaningful: 9M 2026 OCF (+6,569M) exceeds capex (925M) plus equipment prepayments (1,955M), so there is no burn to divide by",
+        "cash_bn": 95.6,
+        "short_term_investments_bn": 36.3,
+        "undrawn_facilities_bn": 14.8,
+        "debt_bn": 6.2,
+        "debt_note": "Amazon Notes principal, expected to settle in shares; A&R revolver $0 drawn; convertible notes carried at $130.5B fair value mostly convert at IPO",
+        "maturities_12m_bn": null,
+        "interest_coverage": null,
+        "ocf_9m_bn": 6.569,
+        "capex_9m_bn": 0.925,
+        "equipment_prepayments_9m_bn": 1.955,
+        "revenue_9m_bn": 33.242,
+        "run_rate_revenue_bn_2026_10_31": 81,
+        "operating_loss_9m_bn": -1.26,
+        "commitments_total_bn": 900.9,
+        "commitments_due_12m_bn": 70.7,
+        "commitments_before_2031_bn": 451.6,
+        "ipo": "roadshow launched 2026-11-10, 801.4M primary shares at $70-78; $26.0B concurrent private placement incl. NVIDIA; not priced as of 2026-11-13",
+        "credit_rating": null
+      },
+      "distress_signals": [],
+      "watch_items": [
+        "$900.9B of compute/infrastructure commitments (about $451.6B before 2031) far exceed liquidity. The S-1/A says meeting them depends on significant revenue growth. Long-dated tail, not a 4-quarter issue.",
+        "Cross-default: a default under certain commercial agreements could accelerate the credit agreement and convertible notes (risk factor)",
+        "The IPO is not yet closed. Liquidity figures above exclude IPO proceeds."
+      ],
+      "nvidia_exposure_note": "NVIDIA has committed up to $10B of investment and joins the $26.0B IPO private placement (circular). Anthropic buys NVIDIA-GPU capacity through Microsoft (at least $47.2B, 2026-2033), SpaceXAI (up to $120.5B, cancellable on 90 days after Jan/Mar 2027), Nscale ($44.6B) and Lambda ($41.3B). Its health supports collections at those NVIDIA customers.",
+      "evidence_ids": [
+        "health-anthropic-amazon-notes-6.2b",
+        "health-anthropic-amzn-20b-facility",
+        "health-anthropic-amzn-mark-92.5b",
+        "health-anthropic-capex-9m",
+        "health-anthropic-cash-st-inv-facility",
+        "health-anthropic-commitments-12m-70.7b",
+        "health-anthropic-commitments-900.9b",
+        "health-anthropic-commitments-depend-on-growth",
+        "health-anthropic-credit-facility-undrawn",
+        "health-anthropic-goog-not-named",
+        "health-anthropic-liquidity-sufficient-12m",
+        "health-anthropic-microsoft-47.2b",
+        "health-anthropic-no-customer-over-10pct",
+        "health-anthropic-nscale-lambda-nvidia",
+        "health-anthropic-ocf-positive-9m",
+        "health-anthropic-private-placement-26b",
+        "health-anthropic-revenue-9m",
+        "health-anthropic-run-rate-81b",
+        "health-anthropic-s1a-ipo-filed",
+        "health-anthropic-series-h-65b",
+        "health-anthropic-spacexai-120.5b"
+      ],
+      "missing": [
+        "credit rating",
+        "quarter-only (Q3) cash flow",
+        "IPO final pricing and proceeds",
+        "split of 12-month obligations by counterparty",
+        "NVIDIA share of the $26.0B placement"
+      ],
+      "reasoning": "Anthropic filed an S-1 (amendment 2 on 2026-11-10) with audited and interim statements, so its health rests on primary data. Revenue was $33.2B for 9M 2026, with run-rate revenue at $81B on 2026-10-31. Operating cash flow turned positive ($6.6B for 9M), and liquidity is $131.9B plus a $14.8B undrawn revolver, before the IPO; the S-1/A shows cash, cash equivalents and short-term investments of $212.7B pro forma as adjusted for the offering and the $26B placement. The S-1 states 12-month liquidity sufficiency, and 12-month obligations are about half of current liquidity. The risk is long-dated and very large: $900.9B of commitments depend on continued revenue growth. That belongs in the tail-risk section, not the 4-quarter grade."
+    },
+    {
+      "company": "Space Exploration Technologies Corp. (SpaceX)",
+      "grade": "GREEN",
+      "grade_rule": "GREEN (borderline): runway at the latest (Q3 2026) burn is 27.1 months (>= 24), counting cash and marketable securities only. No maturity wall: $2.7B short-term portion; SpaceX Notes are due from 2031. Covenants met at 2026-09-30. The February 2026 technical default was waived on 2026-03-02 and is counted as resolved, not current. The largest customer is unnamed; the 424B4 identifies the SI cloud customer as Anthropic, graded GREEN, so the concentration rule does not trigger AMBER. At the 9M-average burn, runway is 23.1 months, just under 24.",
+      "metrics": {
+        "runway_months": 27.1,
+        "runway_months_derivation": "(cash 51294 + marketable securities 38561) / Q3 burn 3321.0/month; Q3 OCF 9631 = 9M 13097 - H1 3466; Q3 capex 19593. At 9M-average burn (3886.0/month) runway is 23.1 months; adding undrawn facilities (5250) gives 24.5 months",
+        "cash_bn": 51.294,
+        "marketable_securities_bn": 38.561,
+        "undrawn_facilities_bn": 5.25,
+        "debt_bn": 38.006,
+        "maturities_12m_bn": 2.698,
+        "maturities_12m_note": "short-term portion of debt and finance leases; 10-Q says no material SpaceX Notes principal due until 2031-07-15",
+        "interest_coverage": 4.1,
+        "interest_coverage_derivation": "Q3 income from operations 2791 / interest expense 675; Adjusted EBITDA/interest = 13.1",
+        "ocf_9m_bn": 13.097,
+        "capex_9m_bn": 48.069,
+        "capex_q3_bn": 19.593,
+        "revenue_q3_bn": 14.6,
+        "unconditional_obligations_bn": 37.84,
+        "unconditional_obligations_2027_bn": 25.569,
+        "largest_customer_share_q3_pct": 34.5,
+        "credit_rating": null
+      },
+      "listing": "Listed on Nasdaq as SPCX (IPO June 2026; 424B4 2026-06-12); files 10-Q/8-K with the SEC (CIK 1181412)",
+      "distress_signals": [
+        "RESOLVED: technical default under the SpaceX Credit Facility on the 2026-02-02 xAI acquisition; waiver and amendment 2026-03-02"
+      ],
+      "watch_items": [
+        "SI capex of $16.4B in Q3 2026 alone; 9M capex $48.1B against OCF of $13.1B. Funded by $85.7B of IPO proceeds and $25B of notes.",
+        "Customer B was 34.5% of Q3 revenue (SI segment). SI cloud agreements are terminable on 90 days notice after initial periods; Anthropic's up-to-$120.5B SpaceXAI arrangements become cancellable after Jan/Mar 2027.",
+        "A $40B Apollo GPU finance lease is under a binding commitment letter, with closing conditions and a 1H 2027 commencement: new external financing for further GPU build-out.",
+        "Non-cancelable obligations of $37.8B, with $25.6B due in 2027"
+      ],
+      "nvidia_exposure_note": "NVIDIA held a $21.0B SpaceX Class A stake at 2026-06-30 (mark-to-market). SpaceX/SpaceXAI is a large NVIDIA-system buyer: SI capex was $40.0B over 9M 2026, and the Anthropic capacity alone is about 325,000 NVIDIA GPUs. A $40B GPU lease is being arranged for 2027 deliveries. The collection risk on NVIDIA-related revenue is low given SpaceX's liquidity.",
+      "evidence_ids": [
+        "health-spacex-anthropic-1.25b-month-90day",
+        "health-spacex-apollo-40b-gpu-lease",
+        "health-spacex-capex-q3-total",
+        "health-spacex-customer-b-concentration",
+        "health-spacex-debt-20260930",
+        "health-spacex-debt-shortterm-portion",
+        "health-spacex-interest-expense-q3",
+        "health-spacex-ipo-proceeds",
+        "health-spacex-liquidity-20260930",
+        "health-spacex-liquidity-sufficient-12m",
+        "health-spacex-listed-nasdaq-spcx",
+        "health-spacex-nameplate-1.7gw",
+        "health-spacex-notes-25b-coupon",
+        "health-spacex-ocf-9m",
+        "health-spacex-ocf-h1",
+        "health-spacex-revenue-q3",
+        "health-spacex-technical-default-waived",
+        "health-spacex-unconditional-obligations"
+      ],
+      "missing": [
+        "credit rating (release says \"investment-grade balance sheet\" but no agency rating is stated in the filings read)",
+        "quarter-only OCF (derived as 9M minus H1)",
+        "capex guidance for Q4 2026 / 2027",
+        "identity of Customer B in the 10-Q",
+        "GPU vendor split of capex and purchase obligations"
+      ],
+      "reasoning": "SpaceX is public and has a Q3 2026 10-Q. It holds $89.9B of cash and marketable securities after an $85.7B IPO and $25B of 5.855% notes. Debt is $38.0B, with nothing material due before 2031. Q3 operating income covered interest 4.1x. Burn is large ($48.1B of capex in 9M) and the Q3 burn rate gives about 27 months of runway, so this is GREEN by the runway rule, but only just: at the 9M-average burn runway is about 23 months. Revenue quality is the soft spot. 34.5% of revenue came from one SI customer, and the contracts are cancellable on 90 days notice from early 2027."
+    },
+    {
+      "company": "xAI (X.AI Holdings Corp.; now SpaceXAI, a wholly owned subsidiary of SpaceX)",
+      "grade": "GREEN",
+      "grade_rule": "GREEN by consolidation: xAI has been a wholly owned subsidiary of SpaceX since 2026-02-02, with no separate reporting. Its high-cost debt (12.5% notes, term loans) was repaid in March 2026, and the parent (SpaceX, GREEN) guarantees the group debt. Standalone, the SI segment is not self-funding (Q3 SI Adjusted EBITDA $5.0B vs SI capex $16.4B). It depends on the parent's balance sheet.",
+      "metrics": {
+        "runway_months": null,
+        "runway_note": "No standalone cash or debt; see SpaceX",
+        "cash_bn": null,
+        "debt_bn": null,
+        "maturities_12m_bn": null,
+        "interest_coverage": null,
+        "si_revenue_q3_bn": 7.6,
+        "si_adj_ebitda_q3_bn": 4.953,
+        "si_capex_q3_bn": 16.444,
+        "si_capex_9m_bn": 39.995,
+        "nameplate_compute_gw": 1.7,
+        "legacy_debt_prepayment_penalties_m": {
+          "xai_12.5pct_notes": 518,
+          "xai_term_loans": 221
+        }
+      },
+      "distress_signals": [],
+      "watch_items": [
+        "Grok image-generation lawsuits and an NAACP suit named in Note 16 (outcome not estimable)",
+        "SI revenue concentration on cloud-services customers with 90-day termination rights"
+      ],
+      "nvidia_exposure_note": "The xAI investment amount is undisclosed. Exposure now runs through SpaceX: NVIDIA's SpaceX stake and GPU sales to SpaceXAI's COLOSSUS/COLOSSUS II.",
+      "evidence_ids": [
+        "health-xai-12.5pct-notes-repaid",
+        "health-xai-cloud-terminable-90d",
+        "health-xai-merged-into-spacex",
+        "health-xai-si-adj-ebitda-capex",
+        "health-xai-si-segment-q3",
+        "health-xai-spacexai-renamed"
+      ],
+      "missing": [
+        "standalone xAI cash, burn and debt (not reported after the merger)",
+        "NVIDIA's pre-merger xAI investment amount"
+      ],
+      "reasoning": "The question \"is xAI part of SpaceX\" is settled by the 10-Q. SpaceX acquired X.AI Holdings on 2026-02-02, and X.AI LLC was renamed SpaceXAI LLC. xAI's expensive 2025 debt was refinanced through a SpaceX bridge loan and then investment-grade-style notes, at $739M of prepayment penalties. Health follows the parent."
+    },
+    {
+      "company": "CoreWeave, Inc.",
+      "grade": "RED",
+      "deciding_rule": "RED: runway < 12 months (cash / (capex - operating cash flow) at the latest quarter's burn = 1.66 months)",
+      "metrics": {
+        "runway_months": 1.66,
+        "runway_months_incl_undrawn_facilities": 3.95,
+        "runway_months_9m_burn": 2.07,
+        "cash_bn": 4.122,
+        "total_liquidity_bn": 9.837,
+        "debt_bn": 47.505,
+        "maturities_12m_bn": 10.572,
+        "interest_coverage": 0.45,
+        "interest_coverage_adj_ebitda": 2.67,
+        "interest_coverage_gaap_operating_income": 0.24,
+        "operating_cash_flow_q3_bn": 1.975,
+        "capex_cash_q3_bn": 9.441,
+        "capex_guide_fy2026_bn": [
+          37,
+          39
+        ],
+        "interest_expense_guide_q4_2026_bn": [
+          1.05,
+          1.15
+        ],
+        "rpo_bn": 132.3,
+        "top_two_customers_q3_revenue_pct": [
+          30,
+          24
+        ],
+        "leases_not_commenced_bn": 47.4,
+        "revenue_q3_bn": 3.661
+      },
+      "distress_signals": [
+        "Material weaknesses in ICFR continued to exist at 2026-09-30; disclosure controls not effective (health-coreweave-q3-material-weakness)",
+        "$1.9B of deferred revenue reclassified to customer liabilities 'as contracts became cancellable during the quarter' (health-coreweave-q3-contracts-became-cancellable)",
+        "Third-party data center delivery delays announced November 2025; DDTL 4.0 has early-amortization terms for delayed sites (health-coreweave-datacenter-delays)",
+        "Securities class action (filed 2026-01-12) and stayed derivative suits (health-coreweave-securities-class-action)",
+        "Interest expense $846M in Q3 exceeds adjusted operating income $379M; Q4 interest guided to $1.05-1.15B",
+        "High-cost 2026 debt: 9.75% and 9.625% senior notes, DDTL 5.5 at SOFR+5.50% (health-coreweave-2026-high-yield-pricing)"
+      ],
+      "nvidia_exposure_note": "NVIDIA residual-capacity order form: initial value $6.3B, NVIDIA obligated to buy unsold capacity through 2032-04-13 (8-K 2025-09-15). The Q3 2026 10-Q does not mention the order at all, so how much NVIDIA has paid is unknown. NVIDIA bought ~23M shares for $2.0B in January 2026. All CoreWeave GPUs are NVIDIA; NVIDIA's receivables from CoreWeave are not disclosed by CoreWeave. If CoreWeave capacity goes unsold (e.g. the $1.9B of contracts that became cancellable), the buy-back is the channel that turns into an NVIDIA cash call inside 4 quarters.",
+      "evidence_ids": [
+        "health-coreweave-2026-high-yield-pricing",
+        "health-coreweave-2033-convertible-notes",
+        "health-coreweave-atm-unused",
+        "health-coreweave-datacenter-delays",
+        "health-coreweave-fy26-capex-guide",
+        "health-coreweave-nvidia-capacity-order-2025",
+        "health-coreweave-nvidia-private-placement-2026",
+        "health-coreweave-q3-12m-sufficiency-no-going-concern",
+        "health-coreweave-q3-adjusted-operating-income",
+        "health-coreweave-q3-capex-cash",
+        "health-coreweave-q3-cash-and-securities",
+        "health-coreweave-q3-contracts-became-cancellable",
+        "health-coreweave-q3-covenant-compliance",
+        "health-coreweave-q3-customer-concentration",
+        "health-coreweave-q3-debt-principal-schedule",
+        "health-coreweave-q3-interest-expense",
+        "health-coreweave-q3-leases-not-commenced",
+        "health-coreweave-q3-material-weakness",
+        "health-coreweave-q3-nvidia-order-not-updated",
+        "health-coreweave-q3-operating-cash-flow",
+        "health-coreweave-q3-other-purchase-commitments",
+        "health-coreweave-q3-recourse-debt-current",
+        "health-coreweave-q3-revenue",
+        "health-coreweave-q3-rpo",
+        "health-coreweave-q3-total-liquidity",
+        "health-coreweave-q4-interest-guide",
+        "health-coreweave-securities-class-action"
+      ],
+      "missing": [
+        "Credit rating and outlook (not in the 10-Q or release)",
+        "Amount NVIDIA has purchased or owes under the $6.3B residual-capacity order (not disclosed in the Q3 10-Q)",
+        "Identity of the two customers at 30% and 24% of Q3 revenue",
+        "Why $1.9B of contracts became cancellable, and whether any were cancelled",
+        "Exact principal due in the 12 months to 2027-09-30 (only calendar buckets and balance-sheet current debt given)",
+        "Undrawn amount per facility and how much is restricted to specific contract builds",
+        "Status of the delayed third-party data centers",
+        "Earnings call transcript (not fetched)"
+      ],
+      "reasoning": "Runway arithmetic (USD M): Q3 2026 burn = capex 9,441 - operating cash flow 1,975 = 7,466 per quarter = 2488.7 per month; cash 4,122 / 2488.7 = 1.66 months. Including undrawn secured facilities (total liquidity 9,837): 9,837 / 2488.7 = 3.95 months. Nine-month burn = 23,558 - 5,638 = 17,920 / 9 = 1991.1 per month; 4,122 / 1991.1 = 2.07 months. All readings are far under 12 months, so the rubric's RED runway rule decides. 12-month maturities proxy = balance-sheet current debt 9,183 recourse + 1,389 non-recourse = 10572 (=$10.57B); calendar schedule: $2,433M rest of 2026, $10,974M in 2027. Coverage: adjusted operating income 379 / interest 846 = 0.45x (adjusted EBITDA 2,256 / 846 = 2.67x; GAAP operating income 207 / 846 = 0.24x). Caveat for the caller: the burn is almost all growth capex funded by contract-backed DDTLs, notes and customer prepayments; management states liquidity is sufficient for 12 months including current capex commitments, and no going-concern language appears. If capex were excluded from burn the company is operating-cash-flow positive, but it would still be AMBER, not GREEN: it depends on new external financing for $37-39B 2026 capex and shows several distress signals (material weakness, contracts turned cancellable, site delays).",
+      "owner_v1_corrections": [
+        "coverage: adjusted operating income ($379M) is 0.45x interest expense ($846M); interest is about 2.2x adjusted operating income. The Q3 10-Q states cash, short-term investments and amounts available under its debt agreements 'will be sufficient to meet our obligations' for one year; no going-concern language."
+      ]
+    },
+    {
+      "company": "Nebius Group N.V.",
+      "grade": "RED",
+      "deciding_rule": "RED: runway < 12 months (cash / (capex - operating cash flow) at the Q3 2026 burn = 2.94 months)",
+      "metrics": {
+        "runway_months": 2.94,
+        "runway_months_9m_burn": 5.97,
+        "runway_months_incl_citi_facility": 4.33,
+        "cash_bn": 7.426,
+        "debt_bn": 16.478,
+        "debt_carrying_bn": 14.1628,
+        "maturities_12m_bn": 0.1595,
+        "cash_requirements_12m_bn": 1.2855,
+        "short_dated_facility_bn": 3.5,
+        "interest_coverage": 0.45,
+        "interest_coverage_adj_ebitda": 4.14,
+        "operating_cash_flow_q3_bn": -0.273,
+        "capex_q3_bn": 7.3004,
+        "capex_guide_fy2026_bn": 27,
+        "capex_outlook_fy2027_bn": [
+          40,
+          45
+        ],
+        "rpo_bn": 38.7,
+        "largest_receivable_customer_pct_ar": 75,
+        "revenue_q3_bn": 0.9808
+      },
+      "distress_signals": [
+        "Delayed sites: remaining Microsoft New Jersey tranches moved to 2Q27; several colocation sites shifted into 1H27 (health-nebius-site-delays-microsoft-nj)",
+        "FY2026 revenue guidance cut to the low end of $3.0-3.4B; ARR target pushed about two months (health-nebius-2026-guidance-cut)"
+      ],
+      "nvidia_exposure_note": "NVIDIA holds $2.0B of pre-funded warrants for 21,065,936 Class A shares (March 2026; exercise price $0.0001; equity-classified) — mark-to-market exposure, not a cash obligation. Nebius is a GPU buyer (Vera Rubin, Vera CPUs, Groq 3 LPX named) but the filings give no NVIDIA purchase-commitment amount and no NVIDIA capacity buy-back. The 9.3% stake in the ledger is not stated in the Nebius documents fetched.",
+      "evidence_ids": [
+        "health-nebius-12m-cash-requirements",
+        "health-nebius-2026-guidance-cut",
+        "health-nebius-2027-capex-funding",
+        "health-nebius-9m-ocf-prepayments",
+        "health-nebius-abs-term-loan",
+        "health-nebius-atm-q3",
+        "health-nebius-aug-2026-convertibles",
+        "health-nebius-citi-364-day-facility",
+        "health-nebius-going-concern-basis",
+        "health-nebius-nvidia-prefunded-warrants",
+        "health-nebius-q3-adjusted-ebitda",
+        "health-nebius-q3-capex",
+        "health-nebius-q3-cash",
+        "health-nebius-q3-customer-concentration",
+        "health-nebius-q3-operating-cash-flow",
+        "health-nebius-q3-operating-income-vs-interest",
+        "health-nebius-q3-revenue",
+        "health-nebius-q3-rpo",
+        "health-nebius-q3-total-debt",
+        "health-nebius-site-delays-microsoft-nj",
+        "health-nebius-term-loan-covenants"
+      ],
+      "missing": [
+        "ICFR / material weakness status (Q3 6-K does not cover it; 2025 Form 20-F not checked)",
+        "Credit rating and outlook",
+        "Amount drawn on the $3.5B 364-day Citi Facility",
+        "Identities of Customers C/D/E (D = 75% of receivables)",
+        "Current contract values for Microsoft and Meta (only '>$40 billion of similar committed revenue' is stated)",
+        "Committed vs uncommitted share of the asset-backed financing for 2027 capex",
+        "Any NVIDIA purchase commitments by amount"
+      ],
+      "reasoning": "Runway arithmetic (USD M): Q3 2026 burn = capex 7,300.4 - operating cash flow (-273.0) = 7,573.4 per quarter = 2524.5 per month; cash 7,425.6 / 2524.5 = 2.94 months. Nine-month burn = 15,430.7 - 4,231.1 = 11,199.6 / 9 = 1244.4 per month; 7,425.6 / 1244.4 = 5.97 months. Adding the post-quarter $3.5B Citi facility: (7,425.6 + 3,500) / 2524.5 = 4.33 months. All under 12 months, so the RED runway rule decides. FY2026 capex guide ~27,000 minus nine-month capex 15,430.7 implies ~11569 of Q4 capex against 7,425.6 cash plus the 3,500 Citi line. Debt: principal 16,478.0 (carrying 14,162.8), all convertibles maturing 2029-2034 plus a 2030 term loan; current debt 159.5 (note) / 187.5 (balance sheet); stated 12-month cash requirements 1,285.5, but the 364-day Citi facility adds up to 3,500 due inside 12 months if drawn. Coverage: Q3 operating income 50.4 / interest expense 112.5 = 0.45x (adjusted EBITDA 465.8 / 112.5 = 4.14x). Caveat for the caller: as with CoreWeave, the burn is growth capex; operating cash flow is boosted by prepayments ($7.8B deferred-revenue increase in 9M) and no substantial-doubt language appears. Excluding capex from burn, it would be AMBER (2027 capex $40-45B with 15-25% not covered by named sources, so it needs new external financing; plus delayed sites and a guidance cut), not GREEN."
+    },
+    {
+      "company": "Nscale plc",
+      "grade": "RED",
+      "deciding_rule": "RED: going-concern language (substantial doubt raised, alleviated only by a plan to defer/cancel capex); independently, runway < 12 months (5.75 months) and a material contract termination ($3.22B Microsoft SOW)",
+      "metrics": {
+        "runway_months": 5.75,
+        "cash_bn": 1.4784,
+        "debt_bn": 0.1374,
+        "debt_note": "June 30, 2026 balance sheet (current 41.4 + noncurrent 96.0); excludes post-June DDTLs and $3.36B Convertible Loan Notes",
+        "maturities_12m_bn": 0.0414,
+        "interest_coverage": null,
+        "interest_coverage_note": "Operating loss (492.0) vs interest expense, net 95.1 in H1 2026: not meaningful (negative)",
+        "operating_cash_flow_h1_bn": 1.6861,
+        "capex_h1_bn": 3.2301,
+        "net_loss_h1_bn": -1.0201,
+        "technology_equipment_commitments_bn": 24.0,
+        "data_center_build_commitments_bn": 3.5,
+        "leases_not_commenced_bn": 1.4,
+        "largest_customer_h1_revenue_pct": 52,
+        "tcv_bn": 105.8
+      },
+      "distress_signals": [
+        "Going-concern language: substantial doubt initially raised by reliance on uncommitted financing; alleviated only by a capex defer/cancel plan (health-nscale-going-concern-language)",
+        "Must obtain additional financing to meet forecast 2027 obligations; some commitments cannot be deferred or cancelled (health-nscale-2027-financing-required)",
+        "Material contract termination: $3.22B Microsoft SOW terminated after the Loughton, UK power allocation was withdrawn (health-nscale-microsoft-sow-terminated)",
+        "No binding financing yet for the $44.6B Anthropic agreements, which let Anthropic terminate late tranches without liability (health-nscale-anthropic-financing-not-committed)",
+        "Material weaknesses in ICFR (health-nscale-material-weaknesses)",
+        "OpenAI withdrew from Stargate UK in April 2026 (health-nscale-openai-left-stargate-uk)"
+      ],
+      "nvidia_exposure_note": "NVIDIA buys $1.2B of reserved GPU cluster capacity from Nscale under the July 2025 NVIDIA MSA (12-48 month terms). NVIDIA guarantees up to $860.3M of Nscale's Ward County, Texas lease for its first five years; Nscale keeps $470.0M in escrow as NVIDIA's recourse, so NVIDIA's uncovered guarantee exposure is about $390M (860.3 - 470.0, computed here). NVIDIA equity: $300.0M SAFE + $477.4M Series C + $1.0B Convertible Loan Notes + $1.0B NVIDIA Sale closing ~2026-11-16 = $2.78B (computed here; the ledger's ~$2.9B is the same order). Nscale's 52% customer is Microsoft-scale; the Anthropic tranches use NVIDIA Vera Rubin NVL72 and are unfunded. The IPO is the conversion trigger for the notes and the funding route for 2027 obligations.",
+      "evidence_ids": [
+        "health-nscale-2027-financing-required",
+        "health-nscale-anthropic-financing-not-committed",
+        "health-nscale-capital-raised-to-date",
+        "health-nscale-convertible-loan-notes",
+        "health-nscale-customer-concentration",
+        "health-nscale-going-concern-language",
+        "health-nscale-h1-capex",
+        "health-nscale-h1-cash",
+        "health-nscale-h1-debt-current",
+        "health-nscale-h1-net-loss-interest",
+        "health-nscale-h1-operating-cash-flow",
+        "health-nscale-material-weaknesses",
+        "health-nscale-microsoft-sow-terminated",
+        "health-nscale-nvidia-lease-guarantee",
+        "health-nscale-nvidia-msa",
+        "health-nscale-nvidia-series-c",
+        "health-nscale-openai-left-stargate-uk",
+        "health-nscale-tech-equipment-commitments",
+        "health-nscale-use-of-proceeds"
+      ],
+      "missing": [
+        "Q3 2026 (2026-09-30) financials: the S-1/A's latest interim period is H1 2026",
+        "Cash after June 30, 2026 and draws on the post-June facilities",
+        "IPO price range and net proceeds (blank in this amendment)",
+        "Which customer is 52% of H1 revenue (Microsoft is implied by context but not named in that sentence)",
+        "Termination date of the $3.22B SOW and whether NVIDIA GPUs ordered for it are redeployed",
+        "Split of the $24.0B technology-equipment commitments by supplier and by year",
+        "Revenue recognized from NVIDIA under the $1.2B MSA",
+        "Corporate credit rating (only facility-level investment-grade ratings are stated)"
+      ],
+      "reasoning": "Runway arithmetic (USD M): H1 2026 burn = capex 3,230.1 - operating cash flow 1,686.1 = 1,544.0 per six months = 257.3 per month; cash 1,478.4 / 257.3 = 5.75 months. Operating cash flow is itself mostly $2.3B of customer prepayments. Commitments at 2026-06-30: technology equipment 24,000 + data center build 3,500 + leases not yet commenced 1,400 = 28900, about 20x cash. The rubric names going-concern language as a RED trigger; the S-1/A says substantial doubt was raised and was alleviated only by management's ability to defer, reduce or cancel capex, while also saying some new commitments cannot be deferred or cancelled and that 2027 obligations need new financing. Runway < 12 months and the $3.22B Microsoft SOW termination are independent RED triggers (whether the terminated SOW was NVIDIA hardware is not stated, so that trigger is weaker). Debt on the 2026-06-30 balance sheet is small (137.4) but is followed by about $4.9B of GPU DDTL commitments, $790M Kvandal South and $331.9M Macquarie Iceland facilities and $3.36B of Convertible Loan Notes that convert at the IPO.",
+      "owner_v1_corrections": [
+        "going-concern: the S-1/A says reliance on uncommitted financing 'initially raised substantial doubt' and that management's capex-deferral plan would 'alleviate the substantial doubt'. RED under the literal rubric rests on that language."
+      ]
+    },
+    {
+      "company": "Oracle Corporation",
+      "grade": "AMBER",
+      "deciding_rule": "AMBER: 'dependent on new external financing to meet stated commitments', and runway 12-24 months on cash at the latest reported burn (20.6 months). Not RED: no going-concern language, covenants in compliance at FY26 year-end, November 2026 financings completed.",
+      "metrics": {
+        "runway_months": 20.6,
+        "runway_months_incl_undrawn_19.7bn": 31.6,
+        "runway_months_ex_prepayment_burn_cash_only": 6.6,
+        "cash_bn": 37.077,
+        "undrawn_revolver_and_cp_bn": 19.7,
+        "debt_bn": 125.337,
+        "debt_bn_as_adjusted_nov2026_notes": 135.288,
+        "maturities_12m_bn": 7.625,
+        "interest_coverage": 4.71,
+        "q1fy27_ocf_bn": 23.103,
+        "q1fy27_capex_bn": 28.499,
+        "q1fy27_fcf_bn": -5.396,
+        "fy26_fcf_bn": -23.686,
+        "customer_prepayments_q1fy27_bn": 11.4,
+        "rpo_bn": 664,
+        "leases_not_commenced_bn": 288,
+        "unconditional_purchase_obligations_bn": 34.15,
+        "capital_raised_since_2026-06_bn": "19.9 ATM (Q1) + 10 common stock + 10 notes (Nov 2026)",
+        "expected_ratings": "Baa2 (negative) / BBB- (stable) / BBB (stable)",
+        "new_notes_2029_yield_pct": 7.062
+      },
+      "distress_signals": [],
+      "warning_signs_not_counted_as_distress": [
+        "Moody's outlook negative (Baa2) per Oracle's own Nov 2 term sheet; S&P at BBB-, one notch above high yield",
+        "New 3-year notes priced at +240 bp / 7.062%; 2046 notes at 8.650% coupon: expensive for investment grade",
+        "Q1 operating cash flow included a one-off-looking $11.4B customer prepayment; without it Q1 burn would be about $16.8B",
+        "Oracle itself guides negative FCF until 2H FY28 and needs vendor financing, customer-provided hardware and prepayments"
+      ],
+      "nvidia_exposure_note": "Large NVIDIA GPU buyer (300,000+ GPUs delivered in Q1 FY27; Vera Rubin multi-GW plan). 4-quarter exposure = NVIDIA receivables/extended payment terms and order pace. Oracle says vendor financing will reduce upfront cash needs but never names the vendor; NVIDIA is not mentioned in the 10-Q, 10-K, Q1 release or Investor Day release. Whether any NVIDIA extended-term receivables sit with Oracle is not disclosed by either side in the documents read here.",
+      "evidence_ids": [
+        "health-oracle-10q-q1fy27-cash-mktsec",
+        "health-oracle-10q-q1fy27-debt-current",
+        "health-oracle-424b2-capitalization-total-debt",
+        "health-oracle-10q-q1fy27-fcf",
+        "health-oracle-10q-q1fy27-customer-prepayments",
+        "health-oracle-10q-q1fy27-rpo",
+        "health-oracle-10q-q1fy27-rpo-driver-unnamed",
+        "health-oracle-10q-q1fy27-leases-not-commenced",
+        "health-oracle-10q-q1fy27-unconditional-obligations",
+        "health-oracle-10q-q1fy27-interest-expense",
+        "health-oracle-10q-q1fy27-operating-income",
+        "health-oracle-10q-q1fy27-liquidity-statement",
+        "health-oracle-10q-q1fy27-atm-equity",
+        "health-oracle-10k-fy26-no-10pct-customer",
+        "health-oracle-10k-fy26-large-customer-risk",
+        "health-oracle-10k-fy26-fcf",
+        "health-oracle-10k-fy26-principal-schedule",
+        "health-oracle-10k-fy26-covenants",
+        "health-oracle-10k-fy26-revolver-cp",
+        "health-oracle-424b2-undrawn-capacity",
+        "health-oracle-fwp-expected-ratings",
+        "health-oracle-fwp-2029-yield",
+        "health-oracle-8k-20261104-notes",
+        "health-oracle-8k-20261104-equity",
+        "health-oracle-investorday-funding-cap",
+        "health-oracle-investorday-vendor-financing",
+        "health-oracle-investorday-fcf-timeline",
+        "health-oracle-investorday-net-debt-target",
+        "health-oracle-q1fy27-er-capital-plan"
+      ],
+      "missing": [
+        "OpenAI's share of the $664B RPO: not disclosed anywhere in Oracle's filings or releases read (the word 'OpenAI' does not appear)",
+        "Identity of the vendor(s) providing vendor financing, and amounts",
+        "FY27 capex dollar guidance (10-Q only says higher than FY26's $55.7B; Investor Day release gives no number)",
+        "Investor Day slide deck (not fetched; only the 8-K press release)",
+        "Rating-agency releases themselves (only the expected ratings printed in Oracle's term sheet)",
+        "Covenant compliance as of 2026-08-31 (only stated for 2026-05-31)"
+      ],
+      "reasoning": "Liquidity: cash + marketable securities $37.077B (2026-08-31); undrawn revolver + CP $19.7B. Latest burn = Q1 FY27 FCF -$5.396B/quarter = $1.799B/month. Runway = 37.077 / 1.799 = 20.6 months (cash only), (37.077 + 19.7) / 1.799 = 31.6 months with undrawn lines. But Q1 OCF $23.103B includes $11.4B of customer prepayments; ex-prepayment FCF = 23.103 - 11.4 - 28.499 = -$16.796B/quarter = $5.6B/month, giving 37.077 / 5.6 = 6.6 months cash-only, 10.1 months with undrawn lines, 13.7 months adding the ~$20B gross raised in November. FY26 FCF -$23.686B gives 18.8 months. Debt: total debt $125.337B ($135.288B after the Nov notes); current portion $7.625B vs $37.1B cash, so no 12-month maturity wall. Coverage: Q1 operating income $6.728B / interest expense $1.428B = 4.7x. Obligations vs funding: $288B of leases not yet commenced (Q2 FY27-FY29 start) and $34.15B unconditional purchase obligations against negative FCF until 2H FY28 by Oracle's own guidance; Oracle plans $20B more capital (10 equity / 10 debt) plus vendor financing, customer-provided hardware and prepayments. That is the 'dependent on new external financing to meet stated commitments' rule, so AMBER. Revenue concentration cannot be tested: no customer >=10% of FY26 revenue, and the RPO counterparties are unnamed, so the 'concentration on an AMBER/RED customer' rule cannot be applied from Oracle's documents."
+    },
+    {
+      "company": "SoftBank Group Corp. (incl. SB Energy / PORTS-Pike as reported by SBG)",
+      "grade": "AMBER",
+      "deciding_rule": "AMBER: one distress signal (the $3.73B loss on non-refundable advance payments and contract modifications for US power-generation equipment, i.e. a write-down tied to its AI data-centre programme) plus dependence on new external financing (PORTS-Pike to be funded by project finance not yet disclosed; OpenAI tranches funded with a bridge loan, term loan, an SBG-guaranteed loan using OpenAI shares, Arm margin loans and prepaid forwards). Not RED: LTV 15.9% vs 25% policy, cash position 3.2x two years of bond redemptions, no going-concern item.",
+      "metrics": {
+        "runway_months": null,
+        "cash_bn": 32.0,
+        "cash_position_definition": "SBG stand-alone; includes $3.25B undrawn commitment line; excludes SB Northstar PB loan",
+        "debt_bn": null,
+        "debt_jpy_bn_standalone_interest_bearing": 23949.1,
+        "maturities_12m_bn": null,
+        "bond_redemptions_next_2y_bn": 10.0,
+        "bond_redemptions_yr1_jpy_tn_chart": 1.0,
+        "bond_redemptions_yr2_jpy_tn_chart": 0.6,
+        "interest_coverage": null,
+        "ltv_pct_2026-09-30": 15.9,
+        "ltv_policy_pct": 25,
+        "ltv_pct_implied_proforma_2026-11-09": 20.2,
+        "nav_jpy_tn_2026-09-30": 59.8,
+        "nav_jpy_tn_proforma_2026-11-09": 44.7,
+        "openai_cumulative_investment_bn": 64.6,
+        "openai_ownership_pct": 13,
+        "q2_capital_raised_bn": 56.5,
+        "h1_net_loss_bn": 4.8,
+        "sb7_loss_bn": 3.73,
+        "sb7_advance_payments_balance_bn": 6.6,
+        "sb7_to_be_recouped_from_ports_pike_bn": 5.6
+      },
+      "distress_signals": [
+        "$3.73B loss (H1 FY2026) on SB7 non-refundable advance payments and contract modifications for US AI data-centre power equipment (SBG says unrelated to PORTS-Pike)"
+      ],
+      "warning_signs_not_counted_as_distress": [
+        "H1 net loss ¥0.8T ($4.8B)",
+        "NAV fell from ¥59.8T (Sep 30) to ¥44.7T pro forma (Nov 9) on Arm, SBKK and Intel prices; implied pro forma LTV ~20.2% (derived, not stated)",
+        "Heavy use of asset-backed and share-backed borrowing: Arm margin loan ¥3,896.9B, loan using OpenAI shares $10.0B (SBG-guaranteed)",
+        "$5.6B of SB7 equipment advances expected to be recouped from the PORTS-Pike power project (3.4 near term, 2.2 by end 2027)"
+      ],
+      "nvidia_exposure_note": "SB Energy is lessor/developer at PORTS-Pike (OpenAI offtaker, 20-year lease, 8.0 GW-IT). NVIDIA's credit support covers land, power and shell for the first 4.25 GW-IT (option for 3.75 GW more): this guarantee starts after the 4-quarter window (FY2029) and is long-dated tail risk. NVIDIA committed $3.0B to SB Energy ($1.5B funded: $1.5B prepaid forward + $1.5B new shares) per SBG, vs $1.5B in the R3 ledger. SBG is OpenAI's largest outside funder ($64.6B, ~13%), so SBG's financing capacity is part of OpenAI's ability to pay Oracle/CoreWeave/Microsoft/AWS for NVIDIA capacity.",
+      "evidence_ids": [
+        "health-softbank-ltv-sep2026",
+        "health-softbank-cash-position",
+        "health-softbank-bond-redemptions-2y",
+        "health-softbank-interest-bearing-debt",
+        "health-softbank-q2-raised",
+        "health-softbank-openai-cumulative",
+        "health-softbank-openai-third-tranche",
+        "health-softbank-loan-using-openai-shares",
+        "health-softbank-arm-margin-loan",
+        "health-softbank-intel-prepaid-forward",
+        "health-softbank-sb7-loss",
+        "health-softbank-sb7-portspike-recoup",
+        "health-softbank-portspike-funding-model",
+        "health-softbank-portspike-nvidia-equity",
+        "health-softbank-portspike-nvidia-credit-support",
+        "health-softbank-going-concern",
+        "health-softbank-h1-net-loss",
+        "health-softbank-financial-policy"
+      ],
+      "missing": [
+        "Operating cash flow / FCF runway is not meaningful for a holding company and SBG does not present one; runway_months left null",
+        "Loan maturity schedule (term loan, margin loans, OpenAI-share loan) within 12 months: not in the slides read",
+        "Interest coverage: not stated",
+        "SB Energy's own financials and PORTS-Pike project-finance size/terms: SB Energy filed an S-1 (dated Aug 31, 2026 per SBG); not fetched in this pass",
+        "SBG credit ratings: not in documents read",
+        "Stated pro forma LTV at Nov 9 (only NAV given; 20.2% is my derivation)"
+      ],
+      "reasoning": "LTV 15.9% at 2026-09-30 against a 25% normal ceiling; implied pro forma at Nov 9 = net debt ¥11.3T / (NAV ¥44.7T + ¥11.3T) = 20.2% (derived), still under 25% but with ~5 points of headroom. Cash position $32B (¥5.0T) vs bond redemptions of ¥1.6T ($10B) over 2 years: 3.2x; year-1 bonds about ¥1.0T (~$6.4B at ¥157.35). Stand-alone interest-bearing debt ¥23,949.1B (~$152B derived), up ¥5,179.4B in the quarter. Distress signal: $3.73B loss on SB7 power-equipment advances = one signal -> AMBER. External-financing dependence: Q2 raised $56.5B across a term loan, bonds, a loan using OpenAI shares, an Arm margin-loan increase and Intel prepaid forwards to repay the bridge and fund OpenAI; PORTS-Pike is to be funded by non-recourse project finance plus offtaker-provided IT equipment, with no committed financing amount disclosed. Not RED: no going-concern item ('There are no applicable items'), LTV inside policy, OpenAI commitment ($30B follow-on) now fully funded.",
+      "owner_v1_corrections": [
+        "SoftBank's earnings presentation says the $3.7B Silver Bands 7 loss is 'completely unrelated to PORTS-Pike'; $5.6B of the remaining advances are to be recouped from the PORTS-Pike power project. v0's 'tied in part to PORTS-Pike' is withdrawn."
+      ]
+    },
+    {
+      "company": "Intel Corporation",
+      "grade": "AMBER",
+      "deciding_rule": "AMBER under the literal 'one distress signal' rule: $3.9B non-cash goodwill impairment (Mobileye) in 2026. On liquidity alone Intel would be GREEN (self-funding: 9M FCF +$3.0B; cash $54.0B > debt $50.1B). NVIDIA exposure is mark-to-market only, so this grade does not enter the 4-quarter FCF test.",
+      "metrics": {
+        "runway_months": null,
+        "self_funding": true,
+        "cash_bn": 54.005,
+        "debt_bn": 50.134,
+        "maturities_12m_bn": 3.817,
+        "interest_coverage": null,
+        "ocf_9m_bn": 13.184,
+        "capex_9m_bn": 10.216,
+        "fcf_9m_bn": 2.968,
+        "equity_raised_q3_2026_bn": 22.6,
+        "capex_and_purchase_commitments_bn": "19.6 capex + 9.8 other",
+        "net_loss_9m_bn": -11.609
+      },
+      "distress_signals": [
+        "$3.9B non-cash goodwill impairment (Mobileye reporting unit), first nine months of 2026"
+      ],
+      "warning_signs_not_counted_as_distress": [
+        "9M net loss $11.6B, mostly a $12.6B non-cash mark-to-market loss on Escrowed Shares; restructuring and other charges $4.0B"
+      ],
+      "nvidia_exposure_note": "NVIDIA bought 215M Intel shares for $5.0B (completed 2025-12-26); the ledger's $30.0B is market value. Exposure is mark-to-market only; no receivable, guarantee or buy-back.",
+      "evidence_ids": [
+        "health-intel-10q-q3-cash-sti",
+        "health-intel-10q-q3-debt",
+        "health-intel-10q-q3-ocf-capex",
+        "health-intel-10q-q3-goodwill-impairment",
+        "health-intel-10q-q3-equity-raise",
+        "health-intel-10q-q3-liquidity-statement",
+        "health-intel-10q-q3-nvidia-placement",
+        "health-intel-10q-q3-commitments"
+      ],
+      "missing": [
+        "Interest coverage (not computed)",
+        "Credit ratings (not in documents read)"
+      ],
+      "reasoning": "9M 2026 OCF $13.184B - capex $10.216B = +$2.968B (+$3.183B with $0.215B government incentives), so self-funding; runway not applicable. Cash + short-term investments $54.005B vs total debt $50.134B; short-term debt $3.817B, so no maturity wall. Q3 equity offering raised $22.6B net. Management: 'sufficient sources of funding ... for the next 12 months and in the longer term'; no going-concern language. The only rubric distress signal is the $3.9B goodwill impairment, which mechanically makes it AMBER."
+    },
+    {
+      "company": "Microsoft Corporation",
+      "grade": "GREEN",
+      "deciding_rule": "GREEN: self-funding (Q1 FY27 FCF +$18.6B), no 12-month maturity wall ($4.4B current debt vs $64.5B cash), no distress signal found.",
+      "metrics": {
+        "runway_months": null,
+        "self_funding": true,
+        "cash_bn": 64.5,
+        "debt_bn": 35.481,
+        "maturities_12m_bn": 4.391,
+        "interest_coverage": null,
+        "q_ocf_bn": 58.0,
+        "q_capex_bn": 39.367,
+        "q_fcf_bn": 18.633,
+        "leases_not_commenced_bn": 364.6,
+        "rpo_bn": 683,
+        "openai_q_revenue_bn": 10.0,
+        "openai_ar_bn": 7.2,
+        "openai_share_of_q_revenue_pct_derived": 10.8,
+        "new_notes_nov_2026": "10 tranches ($1.0B-$4.0B each), closed 2026-11-04"
+      },
+      "distress_signals": [],
+      "warning_signs_not_counted_as_distress": [
+        "OpenAI is ~10.8% of quarterly revenue ($10.0B of $92.3B, derived) and $7.2B of receivables; OpenAI's own grade is outside this file (if OpenAI is AMBER/RED, the 'concentration on an AMBER/RED customer' rule could apply)",
+        "$364.6B of datacenter leases not yet commenced (FY27-FY34); first debt issuance since 2023 in Nov 2026"
+      ],
+      "nvidia_exposure_note": "Largest-tier NVIDIA customer; Microsoft also resells NVIDIA capacity to OpenAI and Anthropic. No statement in the 10-Q about slowing AI capex or moving to Maia/Cobalt; the release defers guidance to the call (not a filed document).",
+      "evidence_ids": [
+        "health-msft-10q-cash",
+        "health-msft-10q-debt",
+        "health-msft-10q-ocf",
+        "health-msft-10q-capex",
+        "health-msft-10q-openai-revenue-ar",
+        "health-msft-10q-leases-not-commenced",
+        "health-msft-10q-rpo",
+        "health-msft-10q-capex-risk",
+        "health-msft-8k-20261104-notes"
+      ],
+      "missing": [
+        "Capex guidance (given on earnings call only; transcript not fetched)",
+        "Interest coverage",
+        "OpenAI share of RPO"
+      ],
+      "reasoning": "OCF $58.000B - additions to P&E $39.367B = +$18.633B in the quarter: self-funding. Cash + short-term investments $64.5B; total debt $35.481B with $4.391B current. No going-concern, impairment or layoff language found in the 10-Q (headcount down 2% is not described as a layoff). GREEN."
+    },
+    {
+      "company": "Meta Platforms, Inc.",
+      "grade": "AMBER",
+      "deciding_rule": "AMBER under the literal 'one distress signal' rule: layoffs (May 2026 headcount reduction of ~8,000 employees, $1.18B severance). On liquidity alone Meta is GREEN (runway 117 months at the Q3 burn; 9M FCF +$11.0B).",
+      "metrics": {
+        "runway_months": 116.7,
+        "cash_bn": 82.45,
+        "debt_bn": 84.0,
+        "maturities_12m_bn": null,
+        "maturities_calendar_2027_bn": 2.75,
+        "interest_coverage": null,
+        "q3_ocf_bn": 32.786,
+        "q3_capex_incl_finance_lease_principal_bn": 34.906,
+        "q3_fcf_bn": -2.12,
+        "fcf_9m_bn": 11.049,
+        "capex_guidance_2026_bn": "135-145 (incl. finance lease principal)",
+        "leases_not_commenced_bn": 355.73,
+        "noncancelable_commitments_bn": 454.52,
+        "dc_venture_residual_value_guarantees_bn": 41.493,
+        "new_financing_oct_nov_2026": "6.50% mandatory convertible preferred (250M depositary shares); USD notes (5 tranches); EUR notes (6 tranches)"
+      },
+      "distress_signals": [
+        "Layoffs: May 2026 headcount reduction of approximately 8,000 employees ($1.18B severance); headcount -15% YoY"
+      ],
+      "warning_signs_not_counted_as_distress": [
+        "Q3 2026 FCF negative (-$2.12B)",
+        "$9.89B attorneys-general settlement charge in Q3",
+        "Funding capex partly with new debt and a mandatory convertible preferred; 10-Q: 'expect to seek to raise additional capital through debt, equity, or other financing arrangements'",
+        "$41.5B maximum residual value guarantees to unconsolidated data-centre ventures"
+      ],
+      "nvidia_exposure_note": "Major NVIDIA customer (direct and via ventures). No MTIA/in-house-chip, AMD or capex-cut statement found in the 10-Q or release; 2026 capex guidance narrowed upward at the low end to $135-145B.",
+      "evidence_ids": [
+        "health-meta-10q-cash",
+        "health-meta-10q-notes-principal",
+        "health-meta-er-fcf",
+        "health-meta-er-capex-guidance",
+        "health-meta-10q-leases-not-commenced",
+        "health-meta-10q-dc-venture-rvg",
+        "health-meta-10q-external-capital",
+        "health-meta-er-legal-charge",
+        "health-meta-10q-headcount-reduction",
+        "health-meta-8k-20261029-mcps",
+        "health-meta-8k-20261105-usd-notes",
+        "health-meta-8k-20261112-eur-notes"
+      ],
+      "missing": [
+        "Exact debt maturing within 12 months of 2026-09-30 (only calendar-year buckets: $0 remainder of 2026, $2.75B in 2027)",
+        "Interest coverage",
+        "Gross proceeds of the mandatory convertible preferred (not stated in the 8-K text read)"
+      ],
+      "reasoning": "Q3 FCF = OCF $32.786B - P&E $33.942B - finance-lease principal $0.964B = -$2.120B, i.e. $0.707B/month; runway = 82.45 / 0.707 = 116.7 months (>=24). 9M FCF +$11.049B. Notes principal $84.0B; nothing due in the rest of 2026, $2.75B in 2027: no wall. The only rubric distress signal is the 8,000-person headcount reduction, which mechanically makes it AMBER; economically it is an efficiency cut, not distress. Caller should decide whether the rubric's 'layoffs' was meant to catch this."
+    },
+    {
+      "company": "Alphabet Inc.",
+      "grade": "GREEN",
+      "deciding_rule": "GREEN: runway >= 24 months at the latest burn (87.7 months), no 12-month maturity wall ($1.0B current notes), no distress signal found.",
+      "metrics": {
+        "runway_months": 87.7,
+        "cash_bn": 265.098,
+        "debt_bn": 127.485,
+        "maturities_12m_bn": 1.016,
+        "interest_coverage": null,
+        "undrawn_revolver_bn": 10.0,
+        "cp_program_bn": 25.0,
+        "q3_ocf_bn": 42.29,
+        "q3_capex_bn": 51.355,
+        "q3_fcf_bn": -9.065,
+        "q2_fcf_bn": -5.855,
+        "ttm_fcf_bn": 19.747,
+        "capex_9m_bn": 132.0,
+        "external_capital_2026_bn": "45.0 USD notes + 35.8 non-USD notes (9M) + EUR 6 (Nov) + 20.5 common + 10.0 Berkshire placement + 19.0 mandatory convertible + 12.4 ATM",
+        "leases_not_commenced_bn": 130.5
+      },
+      "distress_signals": [],
+      "warning_signs_not_counted_as_distress": [
+        "Two consecutive negative FCF quarters (Q2 -$5.9B, Q3 -$9.1B); the cash pile was built with ~$140B+ of 2026 external capital (not summed in records)",
+        "Alphabet now sells TPU systems to third parties for on-premises use (revenue began Q2 2026, mostly recognised in 2027) and reports 'strong demand for our TPU systems across a wide range of customers': a direct substitute for NVIDIA systems"
+      ],
+      "nvidia_exposure_note": "NVIDIA customer (Google Cloud GPUs) and now a merchant competitor via TPU system sales. Health is not the risk; share of wallet is.",
+      "evidence_ids": [
+        "health-googl-10q-cash",
+        "health-googl-10q-debt",
+        "health-googl-er-fcf",
+        "health-googl-10q-capex",
+        "health-googl-10q-2026-notes",
+        "health-googl-10q-equity-raise",
+        "health-googl-10q-tpu-supply",
+        "health-googl-er-tpu-demand",
+        "health-googl-10q-leases-not-commenced",
+        "health-googl-8k-20261105-eur-notes"
+      ],
+      "missing": [
+        "FY2026/FY2027 capex dollar guidance (10-Q says only 'significantly increase'; call not fetched)",
+        "Interest coverage",
+        "TPU contract values and customers"
+      ],
+      "reasoning": "Q3 FCF -$9.065B = $3.022B/month; runway = 265.098 / 3.022 = 87.7 months (cash + marketable securities only; plus $10B undrawn revolvers). Long-term debt face $127.485B, current portion $1.016B. Management states liquidity sufficient for 12 months and beyond. GREEN by the runway rule, with the caveat that the 2026 balance sheet is externally financed."
+    },
+    {
+      "company": "Amazon.com, Inc.",
+      "grade": "AMBER",
+      "deciding_rule": "AMBER, borderline RED: runway at the latest quarter's burn is 10.2 months on cash + marketable securities and 12.0 months adding the $20B committed revolvers (the rubric counts undrawn facilities), i.e. at the 12-month line; and Amazon depends on new external financing for its stated $220B 2026 capex (TTM FCF -$42.4B; $112B net new long-term debt in 9M (derived: $115.1B proceeds - $2.8B repayments); up to ~$80B supplier loan facility from 2027). On Amazon's own TTM FCF the runway is 32.4 months.",
+      "metrics": {
+        "runway_months": 12.0,
+        "runway_months_cash_only_latest_quarter": 10.2,
+        "runway_months_ttm_burn": 32.4,
+        "cash_bn": 114.226,
+        "undrawn_revolver_bn": 20.0,
+        "cp_program_bn": 30.0,
+        "debt_bn": 180.887,
+        "maturities_12m_bn": 6.827,
+        "interest_coverage": null,
+        "q3_ocf_bn": 42.422,
+        "q3_capex_net_bn": 75.878,
+        "q3_fcf_bn_derived": -33.456,
+        "ttm_fcf_bn": -42.357,
+        "capex_guidance_2026_bn": 220,
+        "supplier_loan_facility_bn": 80.0,
+        "term_loan_bn": 17.5,
+        "openai_series_c_investment_bn": 50.0,
+        "leases_not_commenced_bn": 164.922
+      },
+      "distress_signals": [],
+      "warning_signs_not_counted_as_distress": [
+        "Latest-quarter burn -$33.5B (derived) vs $114.2B cash + marketable securities",
+        "Supplier financing (secured loan facility up to ~$80B, Q1 2027-Q3 2028) and extended payment terms up to one year on technology-infrastructure purchase orders: vendor-financed capex; vendor not named",
+        "$50.0B equity in OpenAI fully funded; AWS's OpenAI and Anthropic deals (+$100B each) are tied to AWS chips (Trainium), i.e. in-house silicon"
+      ],
+      "nvidia_exposure_note": "Large NVIDIA customer. Extended payment terms 'up to one year' on infrastructure purchase orders mirror NVIDIA's own 90-day-to-one-year terms for investment-grade customers, so some NVIDIA receivables may be among these payables (vendor not named). The OpenAI and Anthropic expansions explicitly include 'contractual obligations related to the performance of AWS chips': demand partly routed to Trainium rather than NVIDIA.",
+      "evidence_ids": [
+        "health-amzn-10q-cash",
+        "health-amzn-10q-debt",
+        "health-amzn-10q-ttm-fcf",
+        "health-amzn-10q-q3-ocf-capex",
+        "health-amzn-er-capex-guidance",
+        "health-amzn-10q-supplier-loan-facility",
+        "health-amzn-10q-extended-payment-terms",
+        "health-amzn-10q-openai-investment",
+        "health-amzn-10q-openai-aws-commitment",
+        "health-amzn-10q-leases-not-commenced",
+        "health-amzn-10q-liquidity-statement",
+        "health-amzn-8k-20260914-gbp-notes"
+      ],
+      "missing": [
+        "Q4 2026 OCF (seasonally strongest quarter) - not yet reported",
+        "Interest coverage",
+        "Identity of the supplier(s) behind the ~$80B Loan Facility and extended payment terms",
+        "Whether the $220B capex guide is gross or net of incentives (implied Q4 net capex ~$47.8B if net)"
+      ],
+      "reasoning": "Q3 FCF (derived) = OCF $42.422B - (P&E $77.259B - proceeds $1.381B) = -$33.456B = $11.152B/month. Runway = 114.226 / 11.152 = 10.2 months on cash + marketable securities; (114.226 + 20.0 committed revolvers) / 11.152 = 12.0 months. On reported TTM FCF -$42.357B ($3.530B/month): 114.226 / 3.530 = 32.4 months. Current debt $6.827B: no maturity wall. No going-concern or distress language; management states liquidity is sufficient for 12 months including 'borrowing arrangements and other financing activities'. Graded AMBER (12-24 months with facilities, and dependent on external financing), flagged borderline RED because cash-only latest-quarter runway is under 12 months.",
+      "owner_v1_corrections": [
+        "its ~$80B facility is a secured loan facility (drawn Q1 2027 .. Q3 2028, each borrowing maturing in five years, booked as long-term debt). It is not receivable terms, and NVIDIA's commitments note discloses no such lending; v0's suggestion that NVIDIA may carry half of it is withdrawn."
+      ]
+    }
+  ],
+  "readings": {
+    "literal": {
+      "rule": "rubric exactly as written",
+      "red_4q": [
+        "CoreWeave",
+        "Nebius",
+        "Nscale"
+      ],
+      "hyperscalers": {
+        "Microsoft": "GREEN",
+        "Alphabet": "GREEN",
+        "Meta": "AMBER",
+        "Amazon": "AMBER"
+      },
+      "result": "DOWNGRADED",
+      "unknown": [
+        "OpenAI"
+      ]
+    },
+    "lenient": {
+      "rule": "growth capex excluded from neocloud burn; Meta's efficiency layoff not counted as distress; Amazon judged on trailing-12-month burn",
+      "red_4q": [
+        "Nscale (going-concern doubt 'initially raised', stated as alleviated by a capex-deferral plan)"
+      ],
+      "amber_4q": [
+        "CoreWeave",
+        "Nebius",
+        "Oracle",
+        "SoftBank"
+      ],
+      "hyperscalers": {
+        "Microsoft": "GREEN",
+        "Alphabet": "GREEN",
+        "Meta": "GREEN",
+        "Amazon": "GREEN on liquidity, but dependent on external and supplier financing"
+      },
+      "result": "DOWNGRADED (one RED remains)",
+      "unknown": [
+        "OpenAI"
+      ]
+    }
+  },
+  "decision": {
+    "result": "DOWNGRADED by the rubric's any-RED rule (literal: CoreWeave, Nebius, Nscale; lenient: Nscale only). No base-case assumption is shown to fail, and the size of the effect on FCF is not established.",
+    "robust_to_rubric_readings": true,
+    "openai": "UNKNOWN: the OpenAI part of the base case is not supported by evidence either way (rubric: neither STANDS nor DOWNGRADED for that part)",
+    "red_exposure_size": "Nscale's 4-quarter cash exposure to NVIDIA is about $0.4B of lease guarantee not covered by escrow, plus a $1.2B MSA in which NVIDIA is the payer, plus about $2.8B of equity at mark. Revenue at risk through its NVIDIA purchases (e.g. the $44.6B Anthropic Vera Rubin agreements, with no committed financing) is not quantified.",
+    "aggregate_amber_fcf_test": "NOT COMPUTED: the vendors behind Oracle's 'vendor financing' are not named, and Amazon's facility is a secured loan, not receivable terms. The rubric's ~$46B threshold therefore cannot be applied.",
+    "assumptions": {
+      "A1_customers_keep_buying_4q": {
+        "verdict": "SUPPORTED, with named risks",
+        "why": "Hyperscaler 2026 capex guides are being funded (Microsoft FCF positive; Alphabet $265.1B cash; Oracle, Meta, Alphabet, Amazon all placed new debt or equity in Oct-Nov 2026); Anthropic self-funding with $131.9B cash+ST investments; SpaceX $89.9B cash+securities. Risks: neocloud funding (CoreWeave/Nebius RED-literal, Nscale going concern), Nebius 2026 guide cut and Microsoft-site slip to 2Q27, substitution (Alphabet selling TPU systems, Anthropic on four chip families, AMD warrants to OpenAI and Meta)."
+      },
+      "A2_fcf_margin_about_40pct": {
+        "verdict": "NOT ESTABLISHED EITHER WAY",
+        "why": "Observed FCF/revenue: Q4 FY26 51%, Q1 FY27 59%, Q2 FY27 22%; H1 FY27 39.3%; trailing three quarters 42.6%. So 40% is close to the observed half-year level. Q2's 22% reflects a DSO step from 45 to 60 days (about $16B on one quarter's revenue, a level change that need not repeat) and two federal tax payments against none in Q1 (nvda-10q-q2fy27-federal-tax-payments-timing; CFO: 'working capital adjustments and cash taxes'). NVIDIA says the extended 90-day-to-one-year terms went to 'investment-grade customers', so the RED neoclouds are not shown to be behind the receivables. The v0 statements '22-30% is the evidence-backed range' and 'better supported than 40%' are withdrawn."
+      },
+      "A3_no_material_cash_call_4q": {
+        "verdict": "MOSTLY SUPPORTED, size of residual unknown",
+        "why": "PORTS-Pike guarantees phase in from FY2029 (outside the window). Nscale lease guarantee up to $860M is ~$470M escrow-backed. CoreWeave capacity buy-back runs to 2032 and its Q3 10-Q no longer describes it; $1.9B of CoreWeave contracts 'became cancellable' in Q3, which would raise unsold capacity NVIDIA must buy. Amount unknown."
+      }
+    },
+    "sensitivity": "scenarios-v1.json sensitivity_q2_cash_conversion_persists: the Q2 22% margin for four quarters gives $118.70/share (-28.6% vs $166.19). It requires about $80B more working capital than the H1 FY27 level, i.e. receivables of roughly 123 days of revenue (+63 days) if all of it sat in receivables. It is a sensitivity, not a health result."
+  },
+  "limits": [
+    "health records were quote-checked by script against raw downloads but did not get a separate independent critic pass",
+    "the burn definition (OCF minus capex) treats loan-funded growth capex as burn; both readings are shown and the decision is the same",
+    "Oracle documents never name OpenAI; the ledger does not attribute Oracle RPO to OpenAI",
+    "health facts had no separate critic pass at build; the independent review on #1150 re-fetched their documents and matched quotes and hashes but did not re-derive every grade",
+    "the literal 'one distress signal' clause grades Meta (efficiency layoff) and Intel (goodwill impairment) AMBER; kept as written, lenient reading shown"
+  ],
+  "supersedes": {
+    "file": "docs/research/r3-nvda/health-v0.json",
+    "sha256": "35f5e4ffd337c7d4c69e7d518421528816a3b8af133658d2b5d7cd0e12c8bad4",
+    "why": "independent review on #1150 (Fable, REQUEST_CHANGES): v0 overstated the FCF finding, mis-stated three facts and graded OpenAI against the rubric"
+  }
+}

@@ -107,7 +107,8 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
 
     calls: list[int] = []
 
-    def _fake_score_one_chunk(_conn, *, engine, prices, today, chunk_size, now, after, splits=None):
+    def _fake_score_one_chunk(_conn, *, engine, prices, today, chunk_size, now, after, splits=None,
+                             verdicts_after_commit=None):
         calls.append(1)
         if len(calls) == 1:
             # Every key score_one_chunk's real counters dict can carry,
@@ -136,3 +137,37 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
     sot.main(["--chunk-size", "500"])
 
     assert len(calls) == 2, "expected exactly one scored chunk then one empty chunk"
+
+
+def test_main_never_emits_lesson_when_chunk_commit_fails(monkeypatch):
+    import pytest
+    from oracle.engine import OracleEngine
+
+    pending = [('p-1', 'AAA', 'CALL', 100.0, date(2026, 9, 1), date(2026, 9, 20), None)]
+
+    class FailedCommit(_Conn):
+        def __exit__(self, *exc):
+            raise RuntimeError('synthetic commit failure')
+
+    class Engine(_Engine):
+        begins = 0
+
+        def begin(self):
+            self.begins += 1
+            return FailedCommit(self._pending_rows) if self.begins == 2 else _Conn(self._pending_rows)
+
+    engine = Engine(pending)
+    emitted = []
+    monkeypatch.setattr(sot, 'create_engine', lambda *a, **kw: engine)
+    monkeypatch.setattr(sot, 'load_expiry_closes', lambda *a, **kw: {})
+    monkeypatch.setattr(sot, 'load_split_book', lambda *a, **kw: {})
+    monkeypatch.setattr(OracleEngine, '_write_verdict_lessons', lambda self, rows: emitted.extend(rows))
+
+    def score(conn, **kwargs):
+        kwargs['verdicts_after_commit'].append({'prediction_id': 'p-1', 'verdict': 'miss'})
+        return {'scored': 1, 'misses': 1, 'fetched': 1, 'cursor': None}
+
+    monkeypatch.setattr(sot, 'score_one_chunk', score)
+    with pytest.raises(RuntimeError, match='synthetic commit failure'):
+        sot.main(['--chunk-size', '500'])
+    assert emitted == []

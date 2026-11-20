@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     # credentials or the network. Turning it on is an operator decision made in a
     # reviewed change; Schwab data is private and may not be redistributed.
     SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
+    # Allows the separate admin-only SPX/SPY/QQQ board to read option chains.
+    SCHWAB_PRIVATE_GEX_BOARD_ENABLED: bool = False
 
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
@@ -656,6 +658,7 @@ class Settings(BaseSettings):
         "GRID_TRUST_PRUNE_NO_EDGE",
         "GRID_API_PRECOMPUTE_ENABLED",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
+        "SCHWAB_PRIVATE_GEX_BOARD_ENABLED",
         mode="before",
     )
     @classmethod
@@ -746,6 +749,16 @@ class Settings(BaseSettings):
     # Tier.QUICK primary (short classification/extraction). Distinct from the
     # legacy LLM_QUICK_PROVIDER below, which is LOCAL's fallback key.
     LLM_QUICK_TIER_PROVIDER: str = "llamacpp_threadripper"
+    # LLM task queue: background (priority-3) tasks whose tier is REASON are
+    # handed round-robin to these providers instead of LLM_REASON_PROVIDER.
+    # grid-hermes pins REASON to the RTX 3090, and on 2026-11-12 its background
+    # queue alone kept that single slot generating ~94% of the day while
+    # gridz4 sat at 4% and x99-hex near 0. ``llamacpp`` is the gridz4 :8086
+    # proxy; both nodes serve the same Qwen3.8-27B. A provider that is off or
+    # not answering is skipped; if none answers the task uses its own tier as
+    # before. Blank restores the old routing. Realtime and scheduled tasks
+    # (priority 1-2) and LOCAL/ORACLE-tier tasks are never rerouted.
+    LLM_TASKQUEUE_BACKGROUND_PROVIDERS: str = "llamacpp,llamacpp_x99"
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
     LLM_DEFAULT_PROVIDER: str = "llamacpp"
     LLM_QUICK_PROVIDER: str = "llamacpp"
@@ -934,6 +947,12 @@ class Settings(BaseSettings):
 
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
+    # "GRID Options — N calls" (alerts/hundredx_digest.py). Paused 2026-11-14: from 2026-11-09 the
+    # option chains it scores changed character (zero-volume rows 7 % -> 65 %, the IV-skew vote on
+    # 50 of 50 calls since, 4 of 8 before), and it quoted "BUY @ ask" with the market closed. While
+    # False the digest neither records a call nor sends one. Turn it back on only after the chain
+    # feed is diagnosed and the rows written since 2026-11-09 are rebuilt.
+    OPTIONS_DIGEST_ENABLED: bool = False
     # Research newsletter only. Supply a JSON array of two approved addresses
     # at deployment; an empty/invalid audience fails closed without falling
     # back to ALERT_EMAIL_TO. Other alert categories retain their own routing.

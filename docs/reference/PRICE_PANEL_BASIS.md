@@ -194,6 +194,28 @@ After applying, re-run the dry run: `served_after` ratios should be plausible an
 match Tiingo `adj_close` read through `store.observations.read_window` to within the
 first-pull dividend drift above.
 
+## Pre-inception cells and the trading-day test (2026-11-10)
+
+`xlre_full` was excluded from the 2026-11-09/10 repair runs: it serves a 2010-01-01 cell and
+others dated before XLRE was listed (2015-10-08), valued ~1.0339 in **both** raw fields, so
+the classifier calls them AMBIGUOUS (kept) and the neighbouring junk cells anchor the outlier
+median. `INCEPTION_DATES` in `scripts/repair_full_panel_vintages.py` is an explicit override
+map (XLRE 2015-10-08, XLC 2018-06-19; first NYSE Arca trading day per the SSGA fund pages,
+cited in the code), never a data heuristic. A row dated before the ticker's date is classed
+`PRE_INCEPTION`: retracted under its own reason, never re-vintaged, never a neighbour for the
+outlier reference; its cell going dark is `cells_phantom_cleared` (also counted in
+`cells_pre_inception_cleared`), never against the coverage floor. Add a ticker to the map only
+with a primary-source date.
+
+`after_first_on_trading_day` and the newly-dark / phantom split no longer use "a raw close row
+exists" as the test for a trading day (it flagged `nasdaq_full`, `russell2000_full`,
+`pypl_full`, `rxt_full` on ordinary Mondays, and hid a served trading-day cell with a missing
+raw row as phantom). They use `is_trading_day` (`ingestion/market_calendar.is_market_open`
+plus two corrections it lacks: Juneteenth is a market holiday only from 2022, and the one-off
+closures 2012-10-29/30, 2018-12-05, 2025-01-09). A closed-day cell whose only raw close print
+is itself a junk outlier (0.9-1.0 prints stamped on the 2018-12-05 and 2025-01-09 days of
+mourning) is phantom too.
+
 ## Downstream records to re-label as invalid (owners act; the script touches none)
 
 | record | producer | why | action |

@@ -1,0 +1,16 @@
+[
+  {"path":"/api/v1/watchlist/prices","source":"api/routers/watchlist_core.py","handler":"get_watchlist_prices","facade":"api/routers/watchlist.py","registry_module":"api.routers.watchlist"},
+  {"path":"/api/v1/watchlist/enriched","source":"api/routers/watchlist_core.py","handler":"list_watchlist_enriched","facade":"api/routers/watchlist.py","registry_module":"api.routers.watchlist"},
+  {"path":"/api/v1/intelligence/thesis","source":"api/routers/intelligence_thesis.py","handler":"get_unified_thesis","facade":"api/routers/intelligence.py","registry_module":"api.routers.intelligence"},
+  {"path":"/api/v1/intelligence/risk-map","source":"api/routers/intelligence_risk.py","handler":"get_risk_map","facade":"api/routers/intelligence.py","registry_module":"api.routers.intelligence"},
+  {"path":"/api/v1/intelligence/actor-network","source":"api/routers/intelligence_actors.py","handler":"get_actor_network","facade":"api/routers/intelligence.py","registry_module":"api.routers.intelligence"},
+  {"path":"/api/v1/intelligence/levers","source":"api/routers/intelligence_deepdive.py","handler":"get_levers","facade":"api/routers/intelligence.py","registry_module":"api.routers.intelligence"},
+  {"path":"/api/v1/flows/aggregated","source":"api/routers/flows.py","handler":"get_aggregated_flows","registry_module":"api.routers.flows"},
+  {"path":"/api/v1/flows/money-map","source":"api/routers/flows.py","handler":"get_money_map","registry_module":"api.routers.flows"},
+  {"path":"/api/v1/flows/sankey","source":"api/routers/flows.py","handler":"get_sankey_data","registry_module":"api.routers.flows"},
+  {"path":"/api/v1/signals","source":"api/routers/signals.py","handler":"get_signals","registry_module":"api.routers.signals"},
+  {"path":"/api/v1/signals/snapshot","source":"api/routers/signals.py","handler":"get_snapshot","registry_module":"api.routers.signals"},
+  {"path":"/api/v1/discovery/smart-heatmap","source":"api/routers/discovery.py","handler":"smart_heatmap","registry_module":"api.routers.discovery"},
+  {"path":"/api/v1/associations/correlation-matrix","source":"api/routers/associations.py","handler":"get_correlation_matrix","registry_module":"api.routers.associations"},
+  {"path":"/api/v1/system/architecture","source":"api/routers/system.py","handler":"architecture","registry_module":"api.routers.system"}
+]
