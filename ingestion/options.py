@@ -99,6 +99,34 @@ class _NoChain:
 NO_CHAIN = _NoChain()
 
 
+class OptionsSourceAccessDenied(Exception):
+    """The options source refused us; not a diagnosis of optionability.
+
+    Raised only on evidence of a refusal (``_is_access_denial``): any 401, or
+    a 403 for a hand-listed known-optionable ticker. Cboe's CDN also answers
+    403 for symbols with no listed options, so a 403 for any other symbol is
+    ``NO_CHAIN``, not a denial.
+    """
+
+    def __init__(self, provider: str, http_status: int) -> None:
+        self.provider = provider
+        self.http_status = http_status
+        super().__init__(f"{provider} access denied (HTTP {http_status})")
+
+
+def _is_access_denial(ticker: str, http_status: int) -> bool:
+    """True when ``http_status`` for ``ticker`` means the source refused us.
+
+    401 always does. 403 does only for a hand-listed ``EQUITY_TICKERS`` name
+    (e.g. SPY): those are known optionable, so a 403 there cannot mean "no
+    listed options". For any other symbol Cboe's 403 is its routine answer
+    for a symbol without a chain.
+    """
+    if http_status == 401:
+        return True
+    return http_status == 403 and ticker in EQUITY_TICKERS
+
+
 def _no_options_cached(ticker: str) -> bool:
     until = _NO_OPTIONS_UNTIL.get(ticker)
     if until is None:
@@ -205,6 +233,9 @@ class OptionsPullResults(list[dict[str, Any]]):
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
         else:
             status, note = "SUCCESS", "full default universe captured"
+        denied = next((r for r in self if r.get("reason") == "source_access_denied"), None)
+        if denied is not None and status in ("PARTIAL", "FAILED"):
+            note = f"{denied['error']}; remaining tickers not requested"
         return {
             "status": status, "rows_inserted": rows,
             "scope": "full_universe" if self.full_universe else "subset",
@@ -642,6 +673,7 @@ class CboeOptionsClient:
         self.last_no_chain = False
         self._ticker: str | None = None
         self._chain: dict[str, Any] | None = None
+        self._denied_status: int | None = None
 
     def _page(self, chain: dict[str, Any], expiry_ts: int) -> dict[str, Any] | None:
         page = chain["pages"].get(expiry_ts)
@@ -654,6 +686,8 @@ class CboeOptionsClient:
 
     def get_options(self, ticker: str, expiry_ts: int | None = None) -> Any:
         self.last_no_chain = False
+        if self._denied_status is not None:
+            raise OptionsSourceAccessDenied(self.provider, self._denied_status)
         if expiry_ts is not None:
             if self._ticker != ticker or self._chain is None:
                 return None
@@ -666,9 +700,17 @@ class CboeOptionsClient:
         except Exception as exc:  # noqa: BLE001 -- transport failure, caller may fall back
             log.warning("Cboe options {t}: {kind}", t=ticker, kind=type(exc).__name__)
             return None
+        if _is_access_denial(ticker, resp.status_code):
+            # Evidence that Cboe is refusing us, not that the symbol lacks a
+            # chain. Latch for this client/run; do not retry another symbol,
+            # serve cached pages or turn the denial into a vendor fallback.
+            self._denied_status = resp.status_code
+            raise OptionsSourceAccessDenied(self.provider, resp.status_code)
         if resp.status_code in (403, 404):
-            # The CDN answers S3 AccessDenied for symbols with no listed
-            # options (verified 2026-11-06 for ZZZZQ, BRK-B, BRKB).
+            # Cboe's CDN answers S3 AccessDenied (403) for a document symbol
+            # with no listed options (verified 2026-11-06 on ZZZZQ, and on
+            # BRK-B/BRKB in place of BRK.B); about 35 catalyst names hit it a
+            # run. Only a known-optionable name turns 403 into a denial, above.
             log.debug("Cboe options {t}: HTTP {s} (no chain)", t=ticker, s=resp.status_code)
             return NO_CHAIN
         if resp.status_code != 200:
@@ -711,6 +753,8 @@ class CboeFirstOptionsClient:
     is returned and the capture is refused exactly as before. A Cboe "no
     listed options" answer is authoritative (Cboe carries the consolidated
     OPRA chain) and is not retried on Yahoo.
+    Explicit access denials (see ``CboeOptionsClient.get_options``) propagate
+    instead of invoking fallback.
     """
 
     is_available = True
@@ -848,6 +892,13 @@ class OptionsPuller(BasePuller):
             capture_source: Writer label recorded on each registered batch
                 in ``options_capture_batches`` (e.g. "gem_daily").
 
+        A 401/403 stops this entire run, including when it first occurs in
+        the catalyst tail after every core ticker succeeds. Earlier complete
+        captures remain, but coverage is PARTIAL and source freshness is not
+        published. No absence cache is inferred from refusal. A later call
+        creates a new client and can repeat this partial outcome; this is not
+        a persistent rights gate or permission to run the collector.
+
         Returns:
             OptionsPullResults: List-compatible results with a source-wide
                 summary. Only a complete default-universe SUCCESS bumps the
@@ -919,6 +970,15 @@ class OptionsPuller(BasePuller):
                 ticker_kwargs["capture_source"] = capture_source
             result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
+            if result.get("reason") == "source_access_denied":
+                results.extend(
+                    {"ticker": t, "status": "SKIPPED", "rows_inserted": 0,
+                     "reason": "source_access_denied_before_request",
+                     "provider": result["provider"],
+                     "blocked_by_http_status": result["http_status"]}
+                    for t in tickers[idx + 1:]
+                )
+                break
             if result["status"] == "DEFERRED":
                 results.extend(
                     {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
@@ -1411,6 +1471,11 @@ class OptionsPuller(BasePuller):
                 },
             }
 
+        except OptionsSourceAccessDenied as exc:
+            log.warning("{t}: {e}; options run stopped", t=ticker, e=exc)
+            return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
+                    "reason": "source_access_denied", "error": str(exc),
+                    "provider": exc.provider, "http_status": exc.http_status}
         except _OptionsBudgetExpired:
             return {"ticker": ticker, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
         except Exception as e:
