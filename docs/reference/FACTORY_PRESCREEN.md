@@ -13,6 +13,21 @@ fires. Measured on the factory ledger (runs 1 to 5, 15,740 tested modules), the 
 slots. The pre-screen gives a selected candidate a first test in minutes, on sessions the
 factory has never read, so slots go to rules that held up somewhere else first.
 
+## It changes a rule of the factory design
+
+The factory design of 2026-11-12 said this store "is never copied or read" (decision Q1, and
+the load-bearing rules of the parent issue, #1153). The pre-screen is the one exception, by
+the owner's amendment of 2026-11-20 (amendment 1 of the design, kept with the design in the
+gex repository). The exception is this module and nothing else:
+
+- Discovery still reads the development window only. `module_factory`'s three "holdout
+  refused" guards are unchanged, so no ranking run can reach the older store.
+- The live slot is still the only test that counts.
+- Only SPY rows are staged. No other code path, and no one by hand, reads the store.
+
+The amendment came after the code and after the data was staged, and it records that order.
+No look had been run and no registration was on the ledger when it was made.
+
 ## What it is and is not
 
 - It is the factory's own row builder (`module_factory.build_rows`) run for the one
