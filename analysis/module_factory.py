@@ -77,6 +77,22 @@ modules the run file implies; the report adds a class table and every bucket's
 hit rate against chance. ``skip_windows`` leaves out a decision window, such as
 15:00+60m, which is the same trade as 15:00+close.
 
+Factory 4 (3pacs/GRID#1158) adds the options-positioning class (:data:`OPTIONS_SPECS`), built by
+:mod:`analysis.factory_options` through the live GEX Levels page's own book function (gex
+``levels.horizon_book`` / ``levels.position_levels``, vendored byte for byte and hash-pinned):
+
+* OI levels by the page's level rule (``nearest-position/1``) on the 0DTE book: the distance to the
+  nearest OI ceiling and floor (``OIR1``, ``OIS1``) and spot's place between them (``OIMID``);
+* walls and the modeled dealer gamma on the same book, gamma rebuilt from the staged gexhist 5-minute
+  quotes: call, put and hedge walls (``CWALL``, ``PWALL``, ``HWALL``), the gamma flip (``FLIP``) and
+  the net share of gross modeled gamma (``NGEX``); ``measurement-unqualified`` (#1132, #1108 open);
+* OI levels over every expiry from a frozen copy of the OCC open-interest archive (``OIR1A``,
+  ``OIS1A``; the archive's trailing year only), pinned by ``oi_archive_sha256`` in the run file.
+
+Quotes count from one minute after their mark and only up to T-1 minute; open interest only after its
+publication (see :mod:`analysis.factory_options`). Features that need live-only inputs (today's
+contract volume, recorded positions) are :data:`FORWARD_ONLY` and refused in a ranking run.
+
 Each is turned into a robust z against the same feature at the same decision
 time over the previous ``z_history`` eligible sessions (median / 1.4826 MAD,
 capped at +/-4), so a threshold never uses data after its decision.
@@ -108,6 +124,7 @@ Ranking only: nothing here claims a discovery or promotes anything; the
 evidence is forward live recording in gex-signals ``panel-factory``.
 
   python -m analysis.module_factory run --run-file RUN.json --ledger L --anchor A --out DIR [--genesis ID]
+      [--oi-archive OI.db]
 """
 
 from __future__ import annotations
@@ -126,6 +143,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from analysis import factory_options as fo
 from analysis import ledger_steered_exploration as lse
 from analysis.factory_session_calendar import FactoryCalendar, FactoryEvents
 from analysis.factory_stats import (
@@ -342,14 +360,85 @@ for _spec in CALENDAR_SPECS.values():
     _spec.update(unit="flag (fires on 1)", live_source=_CAL_LIVE, kind="flag", symbols=(),
                  pit="the date, exchange sessions from the pinned calendar, and events only with known_at < T")
 WEEKDAYS = ("MON", "TUE", "WED", "THU", "FRI")
+
+# Factory 4 (3pacs/GRID#1158): the options-positioning class, through gex levels.horizon_book (analysis.factory_options).
+_UNQUALIFIED = ("measurement-unqualified: the wall measurement contract (#1132) and canonical snapshots (#1108) are "
+                "open; a diagnostic feature, not a qualified wall")
+_OI_OBSERVED = "observed OCC open interest (unsigned); no dealer sign, no gamma model; not a wall measurement"
+_DTE0_SRC = ("staged edge2/gexhist.db (Databento OPRA.PILLAR: OCC open interest stat_type 9 and 5-minute cbbo-1m "
+             "marks) for SPY options expiring that session, $1 strikes within 8% of its open; SPY bars from "
+             "edge9/bars.db")
+_LIVE_LEVELS = ("gex-watch level book {}, the Levels page's {} horizon (same function, vendored); live OI is OCC "
+                "(occ-oi/1, since 2026-11-17) with RTD streamed OI winning; parity unchecked: research ends "
+                "2026-11-09 and the page's books are not recorded per decision time (#1160)")
+_LIVE_GAMMA = ("gex-watch level book {} (dte0); live gamma is the provider's where present, else BS from IV, "
+               "research is always BS from the 5-minute mark's IV; parity unchecked (#1160); " + _UNQUALIFIED)
+_PIT_DTE0 = ("spot: bar stamped T-1; quotes: the latest 5-minute mark m <= T-2 minutes (m known at m+1), IV at the "
+             "spot of the bar stamped m; OI: the session's OCC release, only after 07:30 ET that day")
+OPTIONS_SPECS = {
+    "OIR1": {"definition": "(R1 - spot) / spot; R1 = the nearest strike above spot holding >= 0.5 x the largest call "
+                           "OI within 5% of spot (gex levels.position_levels, nearest-position/1), 0DTE book",
+             "unit": "distance, share of spot (scale-free)", "basis": "oi-unsigned", "measurement": _OI_OBSERVED,
+             "live_source": _LIVE_LEVELS.format("position_levels", "0DTE")},
+    "OIS1": {"definition": "(spot - S1) / spot; S1 = the nearest strike below spot holding >= 0.5 x the largest put "
+                           "OI within 5% of spot (nearest-position/1), 0DTE book",
+             "unit": "distance, share of spot (scale-free)", "basis": "oi-unsigned", "measurement": _OI_OBSERVED,
+             "live_source": _LIVE_LEVELS.format("position_levels", "0DTE")},
+    "OIMID": {"definition": "(spot - S1) / (R1 - S1): spot's place between the 0DTE OI floor (0) and ceiling (1)",
+              "unit": "position between levels, 0..1 (scale-free)", "basis": "oi-unsigned",
+              "measurement": _OI_OBSERVED, "live_source": _LIVE_LEVELS.format("position_levels", "0DTE")},
+    "CWALL": {"definition": "(call wall - spot) / spot; call wall = the strike with the largest modeled call gamma "
+                            "x OI (horizon_book call_wall), 0DTE book",
+              "unit": "distance, share of spot (scale-free)", "basis": "gamma-unsigned", "measurement": _UNQUALIFIED,
+              "live_source": _LIVE_GAMMA.format("call_wall")},
+    "PWALL": {"definition": "(spot - put wall) / spot; put wall = the strike with the largest modeled put gamma x OI "
+                            "(horizon_book put_wall), 0DTE book",
+              "unit": "distance, share of spot (scale-free)", "basis": "gamma-unsigned", "measurement": _UNQUALIFIED,
+              "live_source": _LIVE_GAMMA.format("put_wall")},
+    "HWALL": {"definition": "(hedge wall - spot) / spot; hedge wall = the strike with the largest |call| + |put| "
+                            "modeled gamma x OI (horizon_book hedge_wall), 0DTE book",
+              "unit": "signed distance, share of spot (scale-free)", "basis": "gamma-unsigned",
+              "measurement": _UNQUALIFIED, "live_source": _LIVE_GAMMA.format("hedge_wall")},
+    "FLIP": {"definition": "(spot - gamma flip) / spot; flip = the zero crossing of the assumed-sign net gamma profile "
+                           "nearest spot (horizon_book gamma_flip), 0DTE book; None without a crossing",
+             "unit": "signed distance, share of spot (scale-free)", "basis": "gamma-signed-assumed",
+             "measurement": _UNQUALIFIED, "live_source": _LIVE_GAMMA.format("gamma_flip")},
+    "NGEX": {"definition": "sum of per-strike net modeled GEX / sum of per-strike |call| + |put| GEX (dealers assumed "
+                           "long calls, short puts), 0DTE book",
+             "unit": "share of gross modeled gamma, -1..1 (scale-free)", "basis": "gamma-signed-assumed",
+             "measurement": _UNQUALIFIED, "live_source": _LIVE_GAMMA.format("net_gex_at_spot_m")},
+    "OIR1A": {"definition": "as OIR1, from the OI of every unexpired expiry (the page's ALL horizon)",
+              "unit": "distance, share of spot (scale-free)", "basis": "oi-unsigned", "measurement": _OI_OBSERVED,
+              "live_source": _LIVE_LEVELS.format("position_levels", "ALL")},
+    "OIS1A": {"definition": "as OIS1, from the OI of every unexpired expiry (the page's ALL horizon)",
+              "unit": "distance, share of spot (scale-free)", "basis": "oi-unsigned", "measurement": _OI_OBSERVED,
+              "live_source": _LIVE_LEVELS.format("position_levels", "ALL")},
+}
+for _f, _spec in OPTIONS_SPECS.items():
+    _archive = _f in fo.ARCHIVE_FEATURES
+    _spec.update(kind="level", symbols=("SPY",), function="gex levels.horizon_book", formula=fo.FORMULA["id"],
+                 source=("frozen copy of the OCC open-interest archive (gex-oi-capture oi.db, Databento "
+                         "OPRA.PILLAR statistics), SPY, every expiry; pinned by oi_archive_sha256") if _archive
+                 else _DTE0_SRC,
+                 pit=("spot: bar stamped T-1; OI: the session's OCC release, only after 07:30 ET that day or its "
+                      "archive published_at when later") if _archive else _PIT_DTE0)
+# Live-only inputs: no history exists, so these cannot be ranked; they may only record forward (factory 7).
+FORWARD_ONLY = {
+    "FLOWC1": "today's contract volume at strike (levels flow_today, flow-today/1): live brokerage volume only, "
+              "recorded from 2026-11-12; gexhist and the OCC archive hold no option volume",
+    "FLOWP1": "as FLOWC1, puts",
+    "POSREC": "the page's recorded position levels (gex-signals positions, from 2026-11-12): a live record, "
+              "no history; the factory rebuilds positions from OCC OI instead",
+}
 FEATURE_CLASS = {**dict.fromkeys(SPECS, "price"), **dict.fromkeys(TAPE_SPECS, "tape"),
-                 **dict.fromkeys(CALENDAR_SPECS, "calendar")}
+                 **dict.fromkeys(CALENDAR_SPECS, "calendar"), **dict.fromkeys(OPTIONS_SPECS, "options")}
 REGISTRY = {**{f: {**s, "class": "price", "kind": "level"} for f, s in SPECS.items()},
             **{f: {**s, "class": "tape"} for f, s in TAPE_SPECS.items()},
-            **{f: {**s, "class": "calendar"} for f, s in CALENDAR_SPECS.items()}}
+            **{f: {**s, "class": "calendar"} for f, s in CALENDAR_SPECS.items()},
+            **{f: {**s, "class": "options"} for f, s in OPTIONS_SPECS.items()}}
 KNOWN_FEATURES = tuple(REGISTRY)
 FLAGS = frozenset(f for f, s in REGISTRY.items() if s["kind"] == "flag")
-CLASSES = ("price", "tape", "calendar")
+CLASSES = ("price", "tape", "calendar", "options")
 W1_VOLUME_MULTIPLE, W1_BARS, W1_FROM = 3.0, 30, "09:45"  # edge8 catalog_edge8.detect: W1 rule, 30-bar extremes
 TAPE_QUANTITIES = ("vol30", "cumvol", "range30")
 EVENT_FEATURES = frozenset(("FOMC", "FOMC_EVE", "CPI", "NFP"))
@@ -391,6 +480,7 @@ class RunFile:
     tape_history: int = 20  # sessions in the tape baselines (edge8 RV_LOOKBACK)
     skip_windows: tuple[str, ...] = ()  # "<time>+<horizon>" windows left out (e.g. 15:00+60m, the same trade as close)
     class_shares: dict | None = None  # {class: share of the run's modules}; checked against the modules implied
+    oi_archive_sha256: str | None = None  # the frozen OCC archive copy the OI-archive features read (factory 4)
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -423,6 +513,9 @@ class RunFile:
         for h in self.horizons:
             if h != "close" and not (h.endswith("m") and h[:-1].isdigit() and 2 <= int(h[:-1]) <= 390):
                 raise RunFileError(f"horizon {h!r} is '<minutes>m' (at least 2m) or 'close'")
+        if set(self.features) & set(FORWARD_ONLY):
+            f = sorted(set(self.features) & set(FORWARD_ONLY))[0]
+            raise RunFileError(f"{f} is forward-only (no history to rank): {FORWARD_ONLY[f]}")
         if set(self.features) - set(KNOWN_FEATURES):
             raise RunFileError(f"unknown features {sorted(set(self.features) - set(KNOWN_FEATURES))}")
         if set(self.sides) - set(SIDES) or not self.sides:
@@ -457,6 +550,12 @@ class RunFile:
             raise RunFileError("tape_history >= 10")
         if self.class_shares is not None:
             self._check_class_shares()
+        archive = bool(set(self.features) & set(fo.ARCHIVE_FEATURES))
+        sha = self.oi_archive_sha256
+        if archive != (sha is not None) or (sha is not None and not (
+                isinstance(sha, str) and len(sha) == 64 and all(c in "0123456789abcdef" for c in sha))):
+            raise RunFileError("oi_archive_sha256 (64 hex) is required with, and only with, the OI-archive features "
+                               f"{fo.ARCHIVE_FEATURES}")
 
     def class_counts(self) -> dict[str, int]:
         """Modules per feature class (every family holds the same modules)."""
@@ -813,7 +912,8 @@ def features_at(session: Session, prior: Session, px: dict, prior_close: dict, b
 
 def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCalendar | None = None,
                cross: dict[str, dict[str, Session]] | None = None,
-               events: FactoryEvents | None = None) -> tuple[dict[str, list[dict]], dict]:
+               events: FactoryEvents | None = None,
+               options: fo.OptionsInputs | None = None) -> tuple[dict[str, list[dict]], dict]:
     """Point-in-time rows per family, and a coverage summary.
 
     The z history of a (feature, decision time) holds only earlier eligible
@@ -824,7 +924,9 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     The tape baselines (``tape_history``) hold earlier sessions only, as the z
     history does; ``events`` (:class:`FactoryEvents`) answers which scheduled
     events were known before each decision. Flags (:data:`FLAGS`) fire on 1
-    and take no z.
+    and take no z. ``options`` (:class:`analysis.factory_options.OptionsInputs`)
+    supplies the options class: quotes up to T-1 minute and OI only after its
+    publication, one session at a time.
     """
     days = sorted(sessions)
     cross = cross or {}
@@ -848,6 +950,10 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
     need_cal = any(FEATURE_CLASS[f] == "calendar" for f in run.features)
     if events is None and set(run.features) & EVENT_FEATURES:
         raise RunFileError("the run's event features need the pinned event manifest")
+    options_wanted = tuple(f for f in run.features if FEATURE_CLASS[f] == "options")
+    if options_wanted and (options is None or (options.gexhist is None and set(options_wanted) - set(fo.ARCHIVE_FEATURES))
+                           or (options.archive is None and set(options_wanted) & set(fo.ARCHIVE_FEATURES))):
+        raise RunFileError("the run's options features need the staged gexhist store (and the OCC archive copy)")
     tape_base = {(q, t): deque(maxlen=run.tape_history) for q in TAPE_QUANTITIES for t in run.decision_times}
     minute_hist = deque(maxlen=run.tape_history)  # {hm: volume} of earlier sessions (edge8 vol_hist)
     pending_minutes = None
@@ -942,6 +1048,8 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
                 raw.update(tape_features(window, base, markers, bar))
             if need_cal:
                 raw.update(calendar_features(day, decided, following.get(day), opex, events))
+            if options_wanted:
+                raw.update(options.features_at(day, session, t, decided, options_wanted))
             raw = {f: raw.get(f) for f in run.features}
             z = {f: None if f in FLAGS else robust_z(raw[f], history[(f, t)]) for f in run.features}
             for f in run.features:
@@ -1018,6 +1126,7 @@ def build_rows(sessions: dict[str, Session], run: RunFile, calendar: FactoryCale
         "tape_history": run.tape_history,
         "skip_windows": list(run.skip_windows),
         "event_calendar": events.version if events is not None else None,
+        **({"options": options.coverage()} if options_wanted else {}),
         "sessions_eligible": len(eligible),
         "sessions_below_full_bars_diagnostic": len(days) - len(full_coverage),
         "full_bars_role": "retrospective coverage only; never eligibility",
@@ -1120,8 +1229,9 @@ MARGINAL = 0.05  # the bucket hit rate: share of tested modules with marginal p 
 def buckets(run: RunFile, trials: list[dict]) -> dict:
     """Every bucket of the run's tested modules: count, marginal p <= 0.05 against chance, best t and adjusted p.
 
-    Buckets: class, decision time (the time-of-day dimension), horizon, feature, z rule and side. Reported for
-    every bucket, never only the good ones; trials are correlated, so chance is a rough guide, not a test."""
+    Buckets: class, decision time (the time-of-day dimension), horizon, feature, z rule and side, and for a run
+    with options features their measurement basis (oi-unsigned, gamma-unsigned, gamma-signed-assumed). Reported
+    for every bucket, never only the good ones; trials are correlated, so chance is a rough guide, not a test."""
     keys = {
         "class": lambda t: FEATURE_CLASS[t["feature"].split("|")[0]],
         "decision_time": lambda t: t["family"].split("|")[2].split("+")[0],
@@ -1130,6 +1240,8 @@ def buckets(run: RunFile, trials: list[dict]) -> dict:
         "rule": lambda t: t["feature"].split("|")[1],
         "side": lambda t: t["feature"].split("|")[2],
     }
+    if any(FEATURE_CLASS[f] == "options" for f in run.features):
+        keys["basis"] = lambda t: REGISTRY[t["feature"].split("|")[0]].get("basis", FEATURE_CLASS[t["feature"].split("|")[0]])
     out = {}
     for by, key in keys.items():
         groups: dict[str, list] = {}
@@ -1308,6 +1420,15 @@ def report_markdown(rep: dict) -> str:
             lines.append(f"| {name} | {b['tested']} | {b['p_le_05']} | {b['chance']} | {b['best_t']} | "
                          f"{b['best_adjusted_p']} |")
         lines.append("")
+    opt = rep["coverage"].get("options")
+    if opt:
+        pin = opt["levels_function"]
+        lines += ["", (f"Options class: {pin['function']} from {pin['repo']} {pin['commit'][:8]} (levels.py sha256 "
+                       f"{pin['files']['levels.py']['sha256'][:12]}), level rule {opt['level_rule']['rule']}; gamma "
+                       f"{opt['formula']['id']} ({opt['formula']['unit']}). Walls and signed gamma are "
+                       "measurement-unqualified diagnostics (#1132, #1108 open)."),
+                  "", "| options input | count |", "|---|---|"]
+        lines += [f"| {k} | {v} |" for k, v in opt["counts"].items()]
     lines += ["", "| feature @ time | coverage | z drift (max - min yearly median z) |", "|---|---|---|"]
     for name, f in rep["coverage"]["features"].items():
         lines.append(f"| {name} | {f['coverage_z']} | {f['z_drift']} |")
@@ -1324,13 +1445,20 @@ def open_ledger(ledger_path: Path, anchor_path: Path, genesis: str | None) -> ls
     return ledger
 
 
-def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
-    """One factory run, declared on ``ledger`` before any data is read. Returns the report."""
+def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path, oi_archive: Path | None = None) -> dict:
+    """One factory run, declared on ``ledger`` before any data is read. Returns the report.
+
+    ``oi_archive``: the frozen OCC archive copy, for runs with OI-archive features; its sha256 must equal the run
+    file's ``oi_archive_sha256`` (checked after the declaration and before it is read)."""
     body = json.loads(Path(run_file).read_text())
     spec = RunFile.from_dict(body)
     calendar = FactoryCalendar()
     calendar.validate_window(spec.first_session, spec.last_session)
     events = FactoryEvents() if set(spec.features) & EVENT_FEATURES else None  # pinned; checked before declaring
+    options_wanted = {f for f in spec.features if FEATURE_CLASS[f] == "options"}
+    levels = fo.load_levels() if options_wanted else None  # vendored and hash-pinned; checked before declaring
+    if bool(spec.oi_archive_sha256) != (oi_archive is not None):
+        raise RunFileError("an OCC archive copy is passed with, and only with, a run file's oi_archive_sha256")
     manifest, manifest_sha = check_data(Path(data_dir))
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
@@ -1339,10 +1467,19 @@ def run(run_file: Path, data_dir: Path, ledger: lse.Ledger, out: Path) -> dict:
         trial_count=spec.trial_count(),
     )
     try:
-        verify_data(Path(data_dir), manifest)
+        need_gexhist = bool(options_wanted - set(fo.ARCHIVE_FEATURES))
+        verify_data(Path(data_dir), manifest, needed=(DATA_FILE, fo.DATA_FILE) if need_gexhist else (DATA_FILE,))
+        options = None
+        if options_wanted:
+            if oi_archive is not None and sha256_file(Path(oi_archive)) != spec.oi_archive_sha256:
+                raise RunFileError("the OCC archive copy does not match the run file's oi_archive_sha256")
+            options = fo.OptionsInputs(
+                fo.GexHist(Path(data_dir) / fo.DATA_FILE, spec.decision_times) if need_gexhist else None,
+                fo.OIArchive(Path(oi_archive)) if oi_archive is not None else None, levels=levels)
         bars = load_bars(Path(data_dir) / DATA_FILE, spec)
         sessions = bars.pop(spec.symbol)
-        families, coverage = build_rows(sessions, spec, calendar=calendar, cross=bars, events=events)
+        families, coverage = build_rows(sessions, spec, calendar=calendar, cross=bars, events=events,
+                                        options=options)
         frozen = discover(protocol_for(spec), families)
         write_once(out / "discovery-frozen.json", frozen)
         cofire = cofiring(families, frozen["payload"]["ledger"], signal_name,
@@ -1377,6 +1514,7 @@ def main(argv=None) -> int:
     r.add_argument("--anchor", required=True, type=Path)
     r.add_argument("--out", required=True, type=Path)
     r.add_argument("--genesis", metavar="LEDGER_ID", help="create the factory ledger first (once)")
+    r.add_argument("--oi-archive", type=Path, help="frozen OCC archive copy (runs with OI-archive features)")
     s = sub.add_parser("summary")
     s.add_argument("--ledger", required=True, type=Path)
     s.add_argument("--anchor", required=True, type=Path)
@@ -1386,8 +1524,8 @@ def main(argv=None) -> int:
         return 0
     try:
         ledger = open_ledger(a.ledger, a.anchor, a.genesis)
-        rep = run(a.run_file, a.data_dir, ledger, a.out)
-    except RunFileError as e:
+        rep = run(a.run_file, a.data_dir, ledger, a.out, oi_archive=a.oi_archive)
+    except (RunFileError, fo.OptionsDataError) as e:
         print(json.dumps({"ok": False, "refused": str(e)}))
         return 2
     print(json.dumps({"ok": True, "run_id": rep["run_id"], "trials": rep["trial_count"], "tested": rep["tested"],

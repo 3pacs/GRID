@@ -444,7 +444,8 @@ def test_adding_the_classes_changes_no_price_row(tmp_path):
 
 
 def test_feature_registry_tags_every_class_honestly():
-    assert set(mf.REGISTRY) == set(mf.SPECS) | set(mf.TAPE_SPECS) | set(mf.CALENDAR_SPECS)
+    # factory 4 (#1158) adds the options class; it is tagged in tests/test_module_factory_options.py
+    assert set(mf.REGISTRY) == set(mf.SPECS) | set(mf.TAPE_SPECS) | set(mf.CALENDAR_SPECS) | set(mf.OPTIONS_SPECS)
     assert not set(mf.TAPE_SPECS) & {"F7", "F8", "F9"}  # aggressor-flow dials are not rebuilt
     for f, spec in mf.REGISTRY.items():
         assert {"definition", "unit", "source", "live_source", "pit", "symbols", "class", "kind"} <= set(spec), f
