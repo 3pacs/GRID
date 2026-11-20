@@ -22,16 +22,23 @@ PINS = (
         "f82a4f593d3625ee1ff6a2732795cf7d3400fe112fcead67e47546c683bba9b4",
     ),
 )
+# PINS lists every part (scripts/prepare_factory_calendars.py normalizes all of them in a deploy
+# candidate); research runs read the first two only. The third is the forward part (#1161).
+RESEARCH_PINS = PINS[:2]
 
 
 class FactoryCalendar:
-    def __init__(self, root=None):
+    """Research reads ``RESEARCH_PINS`` (so a recorded run reproduces byte for byte); the live
+    recorder and the parity check pass ``pins=PINS``, the research parts plus the forward part."""
+
+    def __init__(self, root=None, pins=None):
+        pins = pins or RESEARCH_PINS
         root = (
             root
             or Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests"
         )
         self.parts = tuple(
-            ManifestCalendar(Path(root) / name, sha) for name, sha in PINS
+            ManifestCalendar(Path(root) / name, sha) for name, sha in pins
         )
         if any(
             b.start != a.end + timedelta(days=1)
@@ -41,7 +48,7 @@ class FactoryCalendar:
         self.sessions = tuple(s for p in self.parts for s in p.sessions)
         self.by_day = {s.key.split(":")[1]: s for s in self.sessions}
         self.index = {s.key.split(":")[1]: i for i, s in enumerate(self.sessions)}
-        self.version = "pinned XNYS: " + ",".join(sha for _, sha in PINS)
+        self.version = "pinned XNYS: " + ",".join(sha for _, sha in pins)
 
     def for_day(self, day):
         d = date.fromisoformat(day)
@@ -81,7 +88,7 @@ FORWARD_EVENT_PIN = (
     "factory-events-2026-11-11-2026-12-31.json",
     "058fa247f0bba3419284ecda8549ecef996d954fb20abaf2d5630cde7d5c65b0",
 )
-EVENT_PINS = (EVENT_PIN, FORWARD_EVENT_PIN)
+EVENT_PINS = (EVENT_PIN, FORWARD_EVENT_PIN)  # live; research reads EVENT_PIN alone
 EVENT_SOURCE = "config/econ_release_dates.json"
 EVENT_SCHEMA = "factory-events/1"
 EVENT_COVERAGE = ("2022-11-01", "2026-11-10")
@@ -148,14 +155,15 @@ class FactoryEvents:
 
     ``known(day, decided)``: the events on ``day`` whose known_at is strictly before ``decided``, or None
     when ``day`` is outside the parts' joint coverage: an empty answer means "none known" only inside it
-    (an empty covered calendar never proves a quiet day for another source). Research and the live
-    recorder read the same parts (``EVENT_PINS``), so a forward part changes no earlier day's answer.
+    (an empty covered calendar never proves a quiet day for another source). Research reads ``EVENT_PIN``
+    (the default, so a recorded run reproduces byte for byte); the live recorder passes
+    ``pins=EVENT_PINS``, which adds forward parts and changes no earlier day's answer.
     """
 
     def __init__(self, root=None, pin=None, doc=None, pins=None):
         if doc is None:
             root = root or Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests"
-            pins = (pin,) if pin is not None else (pins or EVENT_PINS)
+            pins = (pin,) if pin is not None else (pins or (EVENT_PIN,))
             docs, names = [], []
             for name, expected in pins:
                 raw = (Path(root) / name).read_bytes()

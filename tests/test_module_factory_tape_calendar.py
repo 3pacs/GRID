@@ -485,7 +485,8 @@ def test_forward_xnys_part_is_the_live_recorder_manifest_sliced(tmp_path):
     research = json.loads((MANIFESTS / fc.PINS[-2][0]).read_bytes())
     shared = [s for s in json.loads(live)["sessions"] if s["key"].split(":")[1] <= research["end"]]
     assert shared and shared == [s for s in research["sessions"] if s["key"].split(":")[1] >= "2026-10-01"]
-    cal = fc.FactoryCalendar(private_calendars(tmp_path))
+    assert fc.FactoryCalendar(private_calendars(tmp_path)).sessions[-1].key == "XNYS:2026-11-10:RTH"  # research
+    cal = fc.FactoryCalendar(private_calendars(tmp_path), pins=fc.PINS)
     assert cal.previous_day("2026-11-11") == "2026-11-10"
     assert cal.for_day("2026-11-26") is None  # Thanksgiving
     assert cal.previous_day("2026-11-27") == "2026-11-25"
@@ -497,8 +498,9 @@ def test_forward_xnys_part_is_the_live_recorder_manifest_sliced(tmp_path):
 
 
 def test_forward_event_part_extends_without_moving_an_earlier_answer():
-    both = fc.FactoryEvents()
-    first = fc.FactoryEvents(pin=fc.EVENT_PIN)
+    both = fc.FactoryEvents(pins=fc.EVENT_PINS)
+    first = fc.FactoryEvents()
+    assert first.version == fc.FactoryEvents(pin=fc.EVENT_PIN).version and fc.FORWARD_EVENT_PIN[1] not in first.version
     assert (both.start, both.end) == ("2022-11-01", "2026-12-31")
     assert fc.EVENT_PIN[1] in both.version and fc.FORWARD_EVENT_PIN[1] in both.version
     noon = lambda d: datetime.fromisoformat(f"{d}T12:00").replace(tzinfo=ET)
