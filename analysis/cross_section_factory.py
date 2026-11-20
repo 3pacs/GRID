@@ -19,6 +19,11 @@ years after stay unread for a confirmation look. A selected module is a candidat
 
 ``DIR`` holds ``prices/<TICKER>.csv`` (Tiingo daily columns), ``members.csv`` (date, tickers), ``sectors.csv``
 (Symbol, GICS Sector) and ``renames.json``. ``state.db`` is the sector state record (desk-sector-state/1).
+
+Two things a run on another universe may change. The price and dollar-volume floors are run-file fields
+(``min_price``, ``min_dollar_volume``) that default to ``MIN_PRICE`` and ``MIN_DOLLAR_VOLUME``. A ``sectors.csv`` that
+holds its header and no rows says the store has no sector labels: the run ranks pooled, and a run file that asks for
+a sector ranking, a sector gate or ``sector_momentum`` is refused.
 """
 from __future__ import annotations
 
@@ -90,9 +95,11 @@ class RunFile:
     null_block_sessions: int = 10
     gates_chosen_after_seeing: bool | None = None
     prior_dev_looks: tuple = ()
+    min_price: float = MIN_PRICE                      # prior close a stock needs to be ranked
+    min_dollar_volume: float = MIN_DOLLAR_VOLUME      # median daily dollar volume it needs over the window before
     _keys = ("run_id", "first_session", "last_session", "signals", "rankings", "fractions", "cost_bp_per_side", "alpha",
              "perms", "seed", "min_ranked", "min_session_bars", "min_ranked_gated", "cards", "null_block_sessions",
-             "gates_chosen_after_seeing", "prior_dev_looks")
+             "gates_chosen_after_seeing", "prior_dev_looks", "min_price", "min_dollar_volume")
 
     @classmethod
     def from_dict(cls, value: dict) -> RunFile:
@@ -153,6 +160,10 @@ class RunFile:
             raise RunFileError("min_ranked and min_session_bars at least 20, min_ranked_gated at least 10, cards 0 .. 50")
         if type(self.null_block_sessions) is not int or not 1 <= self.null_block_sessions <= 63:
             raise RunFileError("null_block_sessions is 1 .. 63 consecutive sessions")
+        for name, low, high in (("min_price", 1.0, 10_000.0), ("min_dollar_volume", 1e5, 1e10)):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int | float) or not low <= v <= high:
+                raise RunFileError(f"{name} must be a number from {low:,.0f} to {high:,.0f}")
         gated = any(s.get("gate") for s in self.signal_specs())
         if gated and type(self.gates_chosen_after_seeing) is not bool:
             raise RunFileError("a run with gates must say gates_chosen_after_seeing (true when a gate was picked after "
@@ -163,6 +174,18 @@ class RunFile:
     @property
     def hypothesis_only(self) -> bool:
         return self.gates_chosen_after_seeing is True
+
+    @property
+    def default_floors(self) -> bool:
+        return (self.min_price, self.min_dollar_volume) == (MIN_PRICE, MIN_DOLLAR_VOLUME)
+
+    def sector_uses(self) -> list[str]:
+        """What in this run file needs sector labels; empty for a run that ranks pooled with no sector condition."""
+        specs = self.signal_specs()
+        uses = ["the within_sector ranking"] if "within_sector" in self.rankings else []
+        uses += [f"signal {s['name']} (sector_momentum)" for s in specs if s["kind"] == "sector_momentum"]
+        uses += [f"gate {k} on signal {s['name']}" for s in specs for k in SECTOR_GATES if k in s.get("gate", {})]
+        return uses
 
     def modules(self) -> list[dict]:
         out = []
@@ -250,14 +273,21 @@ def load_panel(data_dir: Path, run: RunFile) -> Panel:
         member[r, last_cols] = True
 
     dollar = (f["close"] * f["volume"]).rolling(DOLLAR_VOLUME_WINDOW, min_periods=10).median().shift(1)
-    base = member & ok.values & (f["close"].shift(1) >= MIN_PRICE).values & (dollar >= MIN_DOLLAR_VOLUME).values
+    base = member & ok.values & (f["close"].shift(1) >= run.min_price).values & (dollar >= run.min_dollar_volume).values
 
     with open(Path(data_dir) / "sectors.csv", newline="") as fh:
         labels = {r["Symbol"].strip(): r["GICS Sector"].strip() for r in csv.DictReader(fh)}
     sectors = sorted(set(labels.values()))
     if set(sectors) - set(GROUP_OF):
         raise RunFileError(f"sectors without a group: {sorted(set(sectors) - set(GROUP_OF))}")
-    code, how = assign_sectors(cc.values, member, cols, labels, sectors)
+    if sectors:
+        code, how = assign_sectors(cc.values, member, cols, labels, sectors)
+    else:   # a sectors.csv with its header and no rows: the store has no labels, so nothing may depend on a sector
+        if run.sector_uses():
+            raise RunFileError(f"this store has no sector labels, so the run cannot use {'; '.join(run.sector_uses())}")
+        code = np.full(len(cols), -1)
+        how = {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None, "placed_by_correlation": 0,
+               "unplaced": int(member.any(axis=0).sum())}
     return Panel(sessions, cols, on.values, intra.values, cc.values, f["adjClose"].values, base, member, code, sectors, how)
 
 
@@ -696,13 +726,19 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
         carded = [t["trial_id"] for t in tested_rows[:spec.cards]]
         carded += [t["trial_id"] for t in tested_rows if t["passed_step_down"] and t["trial_id"] not in carded]
         member_days = panel.member[[r for r, d in enumerate(panel.sessions) if spec.first_session <= d <= spec.last_session]]
+        # A run file that sets its own floors has them written beside the coverage; one on the defaults reads as before.
+        floors = {} if spec.default_floors else {"floors": {"min_price": spec.min_price, "min_dollar_volume": spec.min_dollar_volume,
+                                                            "dollar_volume_window": DOLLAR_VOLUME_WINDOW}}
+        sector_limit = (("sector labels are today's; past members without a label are placed by correlation over "
+                         "the whole window, so a within-sector module's grouping uses later returns") if panel.sectors else
+                        "this store has no sector labels: every module ranks pooled, and no card is cut by sector")
         rep = {
             "run_id": spec.run_id, "state": STATE, "promotion_allowed": False, "frozen_sha256": frozen["sha256"],
             "method": payload["method"], "target_unit": "net return per $1 long and $1 short per traded night (fraction)",
             "coverage": {"sessions": len(panel.sessions), "first": panel.sessions[0], "last": panel.sessions[-1],
                          "price_files": len(panel.cols), "members_mean": float(member_days.sum(axis=1).mean()),
                          "sector_assignment": panel.assignment, "state_rows_matched": states.matched,
-                         "data_manifest_sha256": man_sha},
+                         "data_manifest_sha256": man_sha, **floors},
             "trial_count": len(trials), "tested": len(tested_rows), "untestable": payload["untestable_count"], "max_t": max_t,
             "selected": [t["trial_id"] for t in tested_rows if t["selected"]],
             "ranking": [{k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "gross_bp", "turnover",
@@ -717,8 +753,7 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
                      "is selected; a module that passed it may be registered as a new hypothesis for fresh data"),
             "known_limits": [("a pick whose outcome bar is missing (halt, delisting, bad print) is dropped, not charged a "
                               "loss; dropped_pick_share sizes it"),
-                             ("sector labels are today's; past members without a label are placed by correlation over "
-                              "the whole window, so a within-sector module's grouping uses later returns"),
+                             sector_limit,
                              "cost is sides x cost x turnover at a flat rate per side, with no borrow fee on the short side"],
         }
         write_once(out / "report.json", rep)

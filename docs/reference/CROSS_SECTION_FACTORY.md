@@ -50,11 +50,22 @@ within the run only (`max_t.multiplicity`): earlier runs and looks are not in it
 - A stock is ranked on day d if it has a valid bar on d, its unadjusted close on d−1 is at least $5, and its median
   dollar volume over the 21 sessions ending d−1 is at least $10M. The floor also screens out price files that hold
   another company (Tiingo reuses tickers).
+- A run file may set its own floors: `min_price` ($1 to $10,000) and `min_dollar_volume` ($100,000 to $10 billion).
+  Left out, they are $5 and $10M, and the run and its report are byte for byte what they were before the fields
+  existed. A run that sets either has both written under `coverage.floors` in its report. Lower floors are only safe
+  on a store whose price files are keyed by a permanent company id, because the default floor is also what screens
+  out a reused ticker.
 - Every signal uses only what is known before the close of d: closes through d−1, plus the open of d for the
   overnight mean. Outcomes start at the close of d.
 - A day with fewer than `min_ranked` ranked stocks is skipped.
 - Sector: `sectors.csv` (today's GICS label). A member with no label takes the labelled sector its daily returns
   follow most closely; the report gives that method's accuracy on labelled names (77 % on the first run).
+- A store with no sector labels says so with a `sectors.csv` that holds its header (`Symbol,GICS Sector`) and no
+  rows. Such a run ranks pooled only. A run file that asks for the `within_sector` ranking, a sector gate
+  (`sector_phase`, `sector_leading`, `groups`) or a `sector_momentum` signal is refused, and its cards have no sector
+  cuts. The refusal comes when the data is loaded, which is after the run is declared, so the ledger records that run
+  as abandoned: check the run file against the store before running on the shared ledger. A missing `sectors.csv`
+  still stops the run with a file-not-found error before anything is declared, as it did before.
 
 ## Signals and horizons
 
@@ -137,6 +148,7 @@ python -m analysis.cross_section_factory run --run-file RUN.json --data-dir DIR 
 ```
 
 `DIR` holds `prices/<TICKER>.csv` (Tiingo daily columns), `members.csv`, `sectors.csv`, `renames.json`.
+A price file may be named by any key the members file uses, a permanent company id included.
 
 ## Evidence adapter
 
@@ -160,6 +172,8 @@ sector by correlation over the whole sample, so a sector's membership in 2010 us
   a loss; the data holds no delisting return. Each row's `dropped_pick_share` sizes it.
 - Names with no price file never enter, so if a delisted member's file is missing the universe is survivor-biased.
 - Sector labels are today's; past members without one are placed by correlation over the whole window (above).
+- The flat cost per side was set for index members at the auctions. A run with lower floors ranks stocks that cost
+  more to trade, so its run file should set `cost_bp_per_side` to a measured figure; the default 1 bp is not one.
 - Cost is a floor: a flat rate per side at the auctions, four sides a night, no borrow fee on the short side.
 - A night with fewer than `min_session_bars` priced names is dropped, so an overnight or close-to-close return after
   it spans more than one session.

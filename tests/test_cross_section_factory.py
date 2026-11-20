@@ -329,3 +329,105 @@ def test_a_state_record_that_changes_after_declaration_abandons_the_run(tmp_path
     with pytest.raises(X.RunFileError, match="changed between"):
         X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
     assert json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])["kind"] == lse.FACTORY_ABANDONED
+
+
+def _rescale(root, sym, price=1.0, volume=1.0):
+    p = root / "prices" / f"{sym}.csv"
+    df = pd.read_csv(p)
+    df[["open", "close", "high", "low", "adjOpen", "adjClose", "adjHigh", "adjLow"]] *= price
+    df[["volume", "adjVolume"]] = (df[["volume", "adjVolume"]] * volume).round()
+    df.to_csv(p, index=False)
+
+
+def test_floors_default_to_the_constants_and_a_run_file_may_set_them(tmp_path):
+    build(tmp_path, n_days=120)
+    _rescale(tmp_path, "S0N00", price=0.03)                     # about $3 a share, $6M a day
+    _rescale(tmp_path, "S0N01", volume=0.0025)                  # about $100 a share, $0.5M a day
+    body = {**RUN, "last_session": "2015-05-29"}
+    default = X.RunFile.from_dict(body)
+    assert (default.min_price, default.min_dollar_volume) == (X.MIN_PRICE, X.MIN_DOLLAR_VOLUME) == (5.0, 10e6)
+    panel = X.load_panel(tmp_path, default)
+    at = {c: j for j, c in enumerate(panel.cols)}
+    assert not panel.base[:, at["S0N00"]].any() and not panel.base[:, at["S0N01"]].any() and panel.base[:, at["S0N02"]].any()
+
+    low = X.RunFile.from_dict({**body, "min_price": 2, "min_dollar_volume": 250_000})
+    wide = X.load_panel(tmp_path, low)
+    assert wide.base[:, at["S0N00"]].any() and wide.base[:, at["S0N01"]].any()
+    others = [j for c, j in at.items() if c not in ("S0N00", "S0N01")]
+    np.testing.assert_array_equal(wide.base[:, others], panel.base[:, others])   # a floor moves only the names near it
+    price_only = X.load_panel(tmp_path, X.RunFile.from_dict({**body, "min_price": 2.0}))
+    assert price_only.base[:, at["S0N00"]].sum() == 0           # $6M a day is still under the default $10M
+    assert X.load_panel(tmp_path, X.RunFile.from_dict({**body, "min_price": 2.0, "min_dollar_volume": 5e6})).base[:, at["S0N00"]].any()
+
+    # the report names the floors only when the run file set them, so a run on the defaults reads as it did before
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    assert "floors" not in rep["coverage"]
+    low_body = {**body, "run_id": "xs-low", "min_price": 2, "min_dollar_volume": 250_000}
+    rep2 = X.run(write_run(tmp_path, low_body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path, "l2"), tmp_path / "out2")
+    assert rep2["coverage"]["floors"] == {"min_price": 2, "min_dollar_volume": 250_000, "dollar_volume_window": 21}
+
+
+@pytest.mark.parametrize("change", [
+    {"min_price": 0.5}, {"min_price": True}, {"min_price": "5"}, {"min_price": float("nan")}, {"min_price": None},
+    {"min_dollar_volume": 10}, {"min_dollar_volume": 1e12}, {"min_dollar_volume": [1e6]},
+])
+def test_floors_it_refuses(change):
+    with pytest.raises(X.RunFileError, match="min_"):
+        X.RunFile.from_dict({**RUN, **change})
+
+
+def test_a_store_with_no_sector_labels_ranks_pooled_and_refuses_anything_that_needs_a_sector(tmp_path):
+    build(tmp_path, n_days=120)
+    body = {**RUN, "last_session": "2015-05-29", "rankings": ["pooled"]}
+    run = X.RunFile.from_dict(body)
+    state = X.load_state(tmp_path / "state.db")
+    labelled = X.load_panel(tmp_path, run)
+    with_labels = X.evaluate(labelled, run, X.state_arrays(labelled, state))
+
+    (tmp_path / "sectors.csv").write_text("Symbol,GICS Sector\n")          # the header alone: no labels
+    panel = X.load_panel(tmp_path, run)
+    assert panel.sectors == [] and (panel.sector == -1).all()
+    assert panel.assignment == {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None,
+                                "placed_by_correlation": 0, "unplaced": len(panel.cols)}
+    np.testing.assert_array_equal(panel.base, labelled.base)
+    states = X.state_arrays(panel, state)
+    without = X.evaluate(panel, run, states)
+    assert set(without) == set(with_labels) == {"on21|pooled|q20|overnight", "mom63|pooled|q20|close_1d"}
+    for tid in without:                                                      # a pooled ranking never read a sector
+        np.testing.assert_array_equal(without[tid]["gross"], with_labels[tid]["gross"])
+        np.testing.assert_array_equal(without[tid]["turnover"], with_labels[tid]["turnover"])
+
+    night = X.RunFile.from_dict({**body, "gates_chosen_after_seeing": False,   # a gate on the night still works
+                                 "signals": [{**RUN["signals"][0], "gate": {"market_phase": ["rising, slowing"]}}]})
+    g = X.evaluate(panel, night, states)["on21|pooled|q20|overnight"]["gross"]
+    assert 20 < (~np.isnan(g)).sum() < (~np.isnan(without["on21|pooled|q20|overnight"]["gross"])).sum()
+
+    for change, word in (
+        ({"rankings": ["pooled", "within_sector"]}, "within_sector ranking"),
+        ({"gates_chosen_after_seeing": False, "signals": [{**RUN["signals"][0], "gate": {"groups": ["growth"]}}]}, "gate groups on signal on21"),
+        ({"gates_chosen_after_seeing": False, "signals": [{**RUN["signals"][0], "gate": {"sector_leading": True}}]}, "gate sector_leading"),
+        ({"signals": [{"name": "sm", "kind": "sector_momentum", "lookback": 63, "horizons": ["close_1d"]}]}, "signal sm"),
+    ):
+        with pytest.raises(X.RunFileError, match=f"no sector labels.*{word}"):
+            X.load_panel(tmp_path, X.RunFile.from_dict({**body, **change}))
+    assert run.sector_uses() == [] and X.RunFile.from_dict(RUN).sector_uses() == ["the within_sector ranking"]
+
+    ledger = ledger_at(tmp_path)
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    assert rep["trial_count"] == 2 and rep["coverage"]["sector_assignment"]["labels"] == "none"
+    assert any("no sector labels" in limit for limit in rep["known_limits"])
+    assert not any("today's" in limit for limit in rep["known_limits"])
+    for c in rep["cards"].values():
+        assert "market_phase" in c and "sector" not in c and "group" not in c
+    assert "Development ranking only" in (tmp_path / "out" / "report.md").read_text()
+    refused = write_run(tmp_path, {**body, "run_id": "xs-needs-sectors", "rankings": ["within_sector"]})
+    with pytest.raises(X.RunFileError, match="no sector labels"):          # found on load, so the declared run is closed
+        X.run(refused, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out-refused")
+    assert json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])["kind"] == lse.FACTORY_ABANDONED
+    assert lse.factory_open_run(ledger) is None
+
+
+def test_a_labelled_store_reports_its_sector_limit_as_before(tmp_path):
+    build(tmp_path, n_days=120)
+    rep = X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    assert rep["known_limits"][1].startswith("sector labels are today's") and "labels" not in rep["coverage"]["sector_assignment"]
