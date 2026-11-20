@@ -1116,6 +1116,17 @@ NEW_MAPPINGS_V2: dict[str, str] = {
         "GLD", "SLV", "USO", "UNG",
         "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
     ]},
+    # Reddit board stats (2026-11-17): the reddit_<sub> ("active users") and
+    # reddit_<sub>_subs ("subscribers") features registered by the one-shot
+    # 2026-03-21 scripts/load_alt_data.py run, fed again by
+    # SocialSentimentPuller.pull_ticker_series from the Reddit Data API once
+    # an owner-registered app exists (ingestion/altdata/reddit_oauth.py).
+    **{f"REDDIT:{sub}:active_users": f"reddit_{sub}" for sub in [
+        "wallstreetbets", "bitcoin", "cryptocurrency", "stocks", "economics",
+    ]},
+    **{f"REDDIT:{sub}:subscribers": f"reddit_{sub}_subs" for sub in [
+        "wallstreetbets", "bitcoin", "cryptocurrency", "stocks", "economics",
+    ]},
 }
 
 

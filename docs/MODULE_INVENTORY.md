@@ -1323,6 +1323,13 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Functions:** `SupplierRecord`, `AppleSupplierListStats`, `AppleSupplierListPuller`, `run_annual`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `db`, `io`, `loguru`, `pypdf`, `re`, `requests`, `sqlalchemy`, `typing`
 
+#### `ingestion/altdata/arctic_shift.py` — 452 LOC
+**Docstring:** Reddit posts and comments from the Arctic Shift archive API (no login, no key).
+**Functions:** `ArcticShiftError`, `ArcticShiftBusy`, `search`, `post`, `comment`, `recent_posts`, `newest_comments`, `thread_comments`, `read_json_bounded`
+**Reads:** `__future__`, `collections`, `contextlib`, `datetime`, `fcntl`, `json`, `loguru`, `math`, `os`, `re`, `requests`, `stat`, `tempfile`, `time`, `typing`
+**Imported by:** `ingestion/altdata/reddit_options_pulse.py`, `ingestion/altdata/smart_money.py`, `ingestion/social_sentiment.py`
+**Notes:** Added 2026-11-18 after Reddit's logged-out `.rss` started answering 404 (about 17:50Z 2026-11-17; `.json` was already 403). Free community archive (github.com/ArthurHeitmann/arctic_shift), minutes behind Reddit when probed from grid-svr. HTTP data source only: fixed host, redirects refused, 4 MB body cap, `{"data": [...]}` required, typed fields with bounded text. One lock file spaces every GRID process's requests 2 s apart; a 429 waits for `X-RateLimit-Reset` once, a "Timeout" 422 is retried once. Scores settle about 36 h after a post, so `post()` reports `score`/`num_comments` as None before that. Aggregate endpoints lag hours to days and are not used.
+
 #### `ingestion/altdata/asset_registries.py` — 840 LOC
 **Docstring:** GRID Asset Registry ingestion module.
 **Functions:** `AssetRegistryPuller`
@@ -1830,16 +1837,18 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Functions:** `RedditNotConfigured`, `RedditAPIError`, `reddit_credentials_configured`, `RedditAppClient`
 **Reads:** `__future__`, `config`, `loguru`, `os`, `requests`, `time`, `typing`
 
-#### `ingestion/altdata/reddit_options_pulse.py` — 737 LOC
+#### `ingestion/altdata/reddit_options_pulse.py` — 777 LOC
 **Docstring:** Reddit daily-discussion pulse — retail options positioning signal.
 **Functions:** `RedditOptionsPulse`, `extract_tickers`, `count_sentiment_tokens`, `compute_bull_bear_ratio`, `RedditOptionsPulsePuller`, `run_reddit_options_pulse_puller`
 **Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `ingestion`, `loguru`, `re`, `requests`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/scheduler.py`
+**Notes:** Since 2026-11-18 reads Arctic Shift (`arctic_shift.py`): pages the newest r/wallstreetbets posts of the last 30 h, picks the pinned "Daily Discussion Thread..." (else "What Are Your Moves Tomorrow...") by title prefix and posting account (u/verified-trader or AutoModerator), first of the newest day, then reads its newest 500 comments. Reddit RSS (the 2026-11-05 path) is 404 since 2026-11-17; the last stored thread was 2026-11-16.
 
 #### `ingestion/altdata/reddit_rss.py` — 252 LOC
 **Docstring:** Unauthenticated Reddit reads through RSS/Atom feeds, shared by every puller.
 **Functions:** `RedditRateLimited`, `RssEntry`, `body_text`, `parse_feed`, `fetch_feed`
 **Reads:** `__future__`, `collections`, `contextlib`, `dataclasses`, `datetime`, `fcntl`, `html`, `loguru`, `os`, `re`, `requests`, `stat`, `tempfile`, `time`, `typing`, `xml`
+**Notes:** No caller since 2026-11-18: Reddit answers every logged-out `.rss` with 404 since about 17:50Z 2026-11-17. `smart_money`, `reddit_options_pulse` and `social_sentiment` read `arctic_shift.py` instead. Kept for the day the feeds return.
 
 #### `ingestion/altdata/redfin_puller.py` — 547 LOC
 **Docstring:** GRID Redfin Housing Data ingestion module.
@@ -1921,11 +1930,12 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Reads:** `__future__`, `config`, `datetime`, `grid`, `ingestion`, `intelligence`, `json`, `loguru`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `intelligence/scheduler.py`
 
-#### `ingestion/altdata/smart_money.py` — 799 LOC
+#### `ingestion/altdata/smart_money.py` — 941 LOC
 **Docstring:** GRID Social Smart Money Tracker.
 **Functions:** `SmartMoneyPuller`
 **Reads:** `__future__`, `datetime`, `db`, `hashlib`, `ingestion`, `json`, `loguru`, `re`, `requests`, `sqlalchemy`, `typing`
 **Imported by:** `ingestion/scheduler.py`
+**Notes:** Since 2026-11-18 reads the newest 100 posts (last 24 h) of each target board from Arctic Shift (`arctic_shift.py`), SmartScheduler hourly (was 10 min on Reddit RSS, which is 404 since 2026-11-17). Posts younger than 36 h have no settled score, so the two-author corroboration rule screens them, and unscored signals stay out of `signal_sources` (raw_series `trust_tier: "unscored"`) until corroborated across time by post creation time: two or more authors of stored posts created at least 6 h before the earliest fresh post (not stored by an earlier run, deduped by post id), plus a fresh post by another author. One board failing is PARTIAL; all failing is FAILED.
 
 #### `ingestion/altdata/social_attention.py` — 966 LOC
 **Docstring:** GRID social attention data ingestion.
@@ -2468,9 +2478,10 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Reads:** `__future__`, `analysis`, `calendar`, `config`, `datetime`, `hashlib`, `importlib`, `ingestion`, `inspect`, `json`, `loguru`, `math`, `os`, `re`, `scripts`, `socket`, `sqlalchemy`, `stat`, `sys`, `threading`, `time`, `types`, `typing`, `zoneinfo`
 **Imported by:** `ingestion/scheduler.py`, `ingestion/source_freshness.py`
 
-#### `ingestion/social_sentiment.py` — 479 LOC
+#### `ingestion/social_sentiment.py` — 1189 LOC
 **Docstring:** Social sentiment ingestor — Reddit, Bluesky, Google Trends.
-**Functions:** `SocialSentimentPuller`
+**Functions:** `SocialSentimentPuller`, `series_watchlist`, `has_cashtag`
+**Notes:** Two SmartScheduler jobs share the `SocialSentiment` catalog row. `social_sentiment` (`pull_all`, 12 h) stores one JSON scan per day. `social_ticker_series` (`pull_ticker_series`, 12 h, 2026-11-17) stores numbers per UTC fetch date: `BSKY:<T>:posts_per_hour` / `posts_24h` / `engagement_24h` / `finbert_compound` (cashtag `$<T>` only, one logged-out search page because cursor pages answer 403), `APEWISDOM:<board>:<T>:mentions_24h` / `upvotes_24h` and board totals, `ARCTICSHIFT:<sub>:posts_per_hour` / `posts_24h` / `comments_per_hour` / `comments_24h`, `ARCTICSHIFT:<sub>:<T>:posts_24h` and `ARCTICSHIFT:<T>:finbert_compound` (Reddit posts and comments from Arctic Shift, 2026-11-18; a ticker counts as `$<T>` or `<T>` in capitals), `TRADESTIE:wallstreetbets:top50_comments` / `<T>:comments` / `<T>:sentiment_score` (Tradestie's free WSB API, previous US/Eastern day, stored once per Tradestie day; the score is Tradestie's, not FinBERT), and `REDDIT:<sub>:*` from the Data API only when an owner app exists (`REDDIT:<sub>:active_users` / `subscribers` feed the March `reddit_<sub>` / `reddit_<sub>_subs` features via entity_map). Logged-out Reddit `.json` is 403 and `.rss` 404 since 2026-11-17 ~17:50Z; `pull_all`'s Reddit posts now come from Arctic Shift (10 newest per board). Sentiment is local FinBERT (`ingestion/ml/finbert_scorer.py`), no LLM.
 **Reads:** `__future__`, `datetime`, `html`, `ingestion`, `json`, `loguru`, `pytrends`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `intelligence/post_query_scanner.py`, `intelligence/scheduler.py`, `ollama/market_briefing.py`
 

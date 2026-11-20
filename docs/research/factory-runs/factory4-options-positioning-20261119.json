@@ -1,0 +1,23 @@
+{
+ "run_id": "factory4-options-positioning-20261119",
+ "first_session": "2022-11-14",
+ "last_session": "2026-11-10",
+ "decision_times": ["10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00"],
+ "horizons": ["15m", "30m", "60m", "close"],
+ "skip_windows": ["15:00+60m"],
+ "features": ["OIR1", "OIS1", "OIMID", "CWALL", "PWALL", "HWALL", "FLIP", "NGEX", "OIR1A", "OIS1A"],
+ "class_shares": {"options": 1.0},
+ "z_thresholds": [1.0, 2.0],
+ "sides": ["long", "short"],
+ "cost_per_share": 0.04,
+ "alpha": 0.05,
+ "perms": 10000,
+ "seed": 20261121,
+ "min_n": 30,
+ "z_history": 60,
+ "target_unit": "vol",
+ "vol_history": 20,
+ "cluster_by": "jaccard",
+ "cluster_threshold": 0.5,
+ "oi_archive_sha256": "8e5e6c23bfa8113c492d162a972c6c94d7d2630c5c09f2c1adc929a02b5899e6"
+}

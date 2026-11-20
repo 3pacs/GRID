@@ -227,7 +227,9 @@ def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> 
     fit inside the step budget.
 
     The scorer runs first and the daily-intel block (DAILY_INTEL_TASKS,
-    executed by _run_daily_intel_block) runs last inside the same step; if
+    executed by _run_daily_intel_block) runs right after it, ahead of every
+    4h/6h task, inside the same step (2026-11-18; it used to run last and
+    the trust cycle ahead of it starved it); if
     their combined worst case exceeds the step cap, the daily block is
     starved of any turn at all on the cycles that matter.
 
@@ -250,6 +252,23 @@ def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> 
         "turn (regression of 2026-05-15, re-created one level down before this "
         "fix)."
     )
+
+
+def test_trust_cycle_step_budget_nests_inside_its_timeout_and_the_cycle() -> None:
+    """The trust cycle runs as its own step since 2026-11-18 (it used to sit
+    inside intelligence_tasks and take ~39 min, starving the daily-intel
+    block). Its cooperative per-pass budget plus the work that cannot stop
+    at the budget must fit inside the step's hard timeout, so the normal
+    exit is a clean pause, not an orphaned worker. The step must also fit
+    inside the cycle watchdog."""
+    assert (
+        ho.TRUST_CYCLE_BUDGET_SECONDS + ho.TRUST_CYCLE_TAIL_SECONDS
+        <= ho.TRUST_CYCLE_TIMEOUT_SECONDS
+    )
+    assert ho.TRUST_CYCLE_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
+    import inspect
+    src = inspect.getsource(ho._run_trust_cycle_step)
+    assert "TRUST_CYCLE_TIMEOUT_SECONDS" in src and "TRUST_CYCLE_BUDGET_SECONDS" in src
 
 
 def test_active_hypo_scorer_alone_is_strictly_inside_step_budget() -> None:
@@ -293,3 +312,29 @@ def test_sector_health_timeout_is_a_positive_int_independent_of_intelligence_bud
     assert "SECTOR_HEALTH_TIMEOUT_SECONDS" in src, (
         "the sector-health dispatch must actually use the constant"
     )
+
+
+def _task(name: str):
+    return next(t for t in ho.DAILY_INTEL_TASKS if t.name == name)
+
+
+def test_corporate_actions_and_fundamental_divergence_have_own_budgets() -> None:
+    """2026-11-17: both ran ~100 s / ~128-217 s against the shared 60 s SQL
+    default and were done_late (and blacklisted for 24h) every night. They
+    now carry their own budgets, wired through DailyIntelTask.budget_s (the
+    value _run_daily_intel_block passes to _run_with_timeout), and sit above
+    the slowest observed runtimes."""
+    corp = _task("corporate_actions")
+    div = _task("fundamental_divergence")
+    assert corp.budget_s == ho.DAILY_INTEL_CORPORATE_ACTIONS_BUDGET_S == 150
+    assert div.budget_s == ho.DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S == 300
+    assert corp.budget_s > 104 and div.budget_s > 217
+    # still a per-task knob: the shared SQL default stays 60 for the rest.
+    assert ho.DAILY_INTEL_SQL_TASK_BUDGET_S == 60
+    for name in ("icij_linking", "attention_anomaly", "holder_deal_overlap", "sleuth_dispatch"):
+        assert _task(name).budget_s == ho.DAILY_INTEL_SQL_TASK_BUDGET_S
+
+
+def test_cycle_budget_unchanged_and_each_task_fits_in_it() -> None:
+    assert ho.DAILY_INTEL_CYCLE_BUDGET_SECONDS == 480
+    assert max(t.budget_s for t in ho.DAILY_INTEL_TASKS) < ho.DAILY_INTEL_CYCLE_BUDGET_SECONDS

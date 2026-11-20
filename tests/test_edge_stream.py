@@ -86,7 +86,7 @@ def test_policy_record_pins_the_policy():
     led = L.memory()
     rec = led.records[1]
     assert rec["kind"] == "edge_policy" and rec["policy_sha256"] == P.policy_sha256()
-    assert rec["policy"]["budget"]["alpha_per_look"] == pytest.approx(0.00125)
+    assert rec["policy"]["budget"]["alpha_per_look"] == pytest.approx(0.025)
     assert all(r["promotion_allowed"] is False for r in led.records)
 
 
@@ -174,13 +174,16 @@ def test_lookahead_guard():
         F.assert_no_lookahead(bars, "15:30")
 
 
-def _trades(effect, n_sessions=400, seed=1, both=True):
+def _trades(effect, n_sessions=400, seed=1, both=True, start=date(2025, 1, 2), effect_until=None):
+    """One trade a day from ``start``; the planted effect stops after ``effect_until`` (a day), if given."""
     rng = np.random.default_rng(seed)
     out = []
     for i in range(n_sessions):
+        day = (start + timedelta(days=i)).isoformat()
         side = (1 if rng.random() < 0.5 else -1) if both else 1
-        move = side * effect + rng.normal(0, 0.001)
-        out.append({"session": f"s{i:04d}", "side": side, "net": side * move - 0.0003,
+        planted = effect if effect_until is None or day <= effect_until else -effect / 4
+        move = side * planted + rng.normal(0, 0.001)
+        out.append({"session": day, "side": side, "net": side * move - 0.0003,
                     "always_long_net": move - 0.0003})
     return out
 
@@ -191,6 +194,36 @@ def test_pass_fail_underpowered():
     assert ST.judge(_trades(0.001, n_sessions=60), P.ALPHA_PER_LOOK)["verdict"] == "UNDERPOWERED"
     one_sided = ST.judge(_trades(0.001, both=False), P.ALPHA_PER_LOOK)
     assert one_sided["verdict"] == "UNDERPOWERED" and "sides" in one_sided["reasons"][0]
+
+
+def test_discovery_is_refitted_without_its_largest_year():
+    # the effect holds in both years: the largest year goes and the rest still pays
+    both_years = ST.judge(_trades(0.001, n_sessions=700), P.ALPHA_PER_LOOK, discovery=True)
+    refit = both_years["largest_year_out"]
+    assert both_years["verdict"] == "PASS" and refit["status"] == "survives"
+    assert refit["years"] == ["2025", "2026"] and refit["n_left_out"] + refit["n_without"] == 700
+    # the effect lives in 2025 only: it clears the test on the whole window, and is an episode
+    trades = _trades(0.003, n_sessions=700, effect_until="2025-12-31")
+    assert ST.judge(trades, P.ALPHA_PER_LOOK)["verdict"] == "PASS"  # a confirmation look does not refit
+    one_year = ST.judge(trades, P.ALPHA_PER_LOOK, discovery=True)
+    assert one_year["verdict"] == "EPISODE" and one_year["largest_year_out"]["year_left_out"] == "2025"
+    assert one_year["largest_year_out"]["mean_net_without"] < 0 and "2025 left out" in one_year["reasons"][0]
+    # a window inside one calendar year has nothing to refit on: recorded, and the verdict stands
+    single = ST.judge(_trades(0.001, n_sessions=300), P.ALPHA_PER_LOOK, discovery=True)
+    assert single["verdict"] == "PASS" and single["largest_year_out"]["status"] == "not_possible"
+    assert single["largest_year_out"]["n_without"] == 0
+    # a trial that fails is not refitted at all
+    assert "largest_year_out" not in ST.judge(_trades(0.0), P.ALPHA_PER_LOOK, discovery=True)
+
+
+def test_noise_is_measured_per_day_or_week_and_a_finer_unit_is_refused():
+    rows = _trades(0.001, n_sessions=120)
+    weekly = [{**t, "session": F.iso_week(t["session"])} for t in rows]
+    assert ST.judge(weekly, P.ALPHA_PER_LOOK)["sessions"] < 120  # days of one week are resampled together
+    with pytest.raises(ValueError, match="a day or an ISO week"):
+        ST.judge([{**t, "session": t["session"] + "T15:30"} for t in rows], P.ALPHA_PER_LOOK)
+    with pytest.raises(ValueError, match="a day or an ISO week"):
+        ST.judge([{**t, "session": f"s{i}"} for i, t in enumerate(rows)], P.ALPHA_PER_LOOK)
 
 
 def test_bootstrap_is_seeded_and_resolvable():
@@ -260,7 +293,7 @@ def test_crash_replay_same_bytes_then_different_bytes(tmp_path):
 
 def test_forward_never_peeks_before_its_look(tmp_path, monkeypatch):
     led = L.memory()
-    item = dict(F.QUEUE[-1])
+    item = dict(next(q for q in F.QUEUE if q["lane"] == "forward"))
     prop = F.build_proposal(item, TODAY)
     prop["window"]["n_target_sessions"] = 30
     sha = register(led, prop)
@@ -384,8 +417,9 @@ def test_code_hash_ignores_docstrings_not_code(tmp_path):
 
 def test_same_family_forward_twice_on_a_group_is_refused():
     led = L.memory()
-    register(led, F.build_proposal(dict(F.QUEUE[-1]), TODAY))
-    again = F.build_proposal(dict(F.QUEUE[-1]), TODAY + timedelta(days=3))
+    forward = next(q for q in F.QUEUE if q["lane"] == "forward")
+    register(led, F.build_proposal(dict(forward), TODAY))
+    again = F.build_proposal(dict(forward), TODAY + timedelta(days=3))
     assert "reuses consumed data" in S.check(again, L.load_state(led), TODAY + timedelta(days=3))["G7_fresh"]
 
 
@@ -439,3 +473,139 @@ def test_clustered_t_floor_matches_the_textbook_bound_and_gates_the_verdict():
     assert ST.session_t_lower(sess, vals, 0.01) == pytest.approx(want, rel=1e-9)
     out = ST.judge(_trades(0.001), P.ALPHA_PER_LOOK)
     assert out["verdict"] == "PASS" and out["t_lower"] > 0
+
+
+# --- G11 cost feasibility -------------------------------------------------------------
+
+
+@pytest.fixture
+def g11_source():
+    """Set the G11 bar source for one test and always clear it (it is module state)."""
+    def use(src):
+        S.set_feasibility_source(src)
+        return src
+    yield use
+    S.set_feasibility_source(None)
+
+
+class _Recording(StaticSource):
+    def __init__(self, bars, today):
+        super().__init__(bars, today=today)
+        self.calls = []
+
+    def sessions(self, ticker, start, end, require_complete=False):
+        self.calls.append((ticker, start, end))
+        return super().sessions(ticker, start, end, require_complete)
+
+
+def _two_regime_bars(pre_effect, window_effect, window_start):
+    """Pre-window sessions drift by ``pre_effect``, window sessions by ``window_effect``."""
+    pre = synthetic_bars(("GLD", "SLV"), date(2024, 11, 1), window_start, pre_effect, seed=3)
+    win = synthetic_bars(("GLD", "SLV"), window_start, TODAY, window_effect, seed=4)
+    return {t: {**pre[t], **win[t]} for t in pre}
+
+
+def test_g11_refuses_when_cost_swamps_the_move(g11_source):
+    prop = metals_proposal()
+    g11_source(metals_source(0.0))  # |move| ~8 bp vs a 3 bp round trip: break-even ~0.69
+    r = S.check(prop, L.load_state(L.memory()), TODAY)
+    assert r["G11_cost_feasible"].startswith("pooled break-even hit rate")
+    assert "GLD" in r["G11_cost_feasible"] and not S.passed(r)
+
+
+def test_g11_passes_when_the_move_dwarfs_the_cost(g11_source):
+    g11_source(metals_source(0.004))
+    r = S.check(metals_proposal(), L.load_state(L.memory()), TODAY)
+    assert r["G11_cost_feasible"] == "ok" and S.passed(r)
+
+
+def test_g11_judges_the_pooled_trial_not_each_instrument(g11_source):
+    bars = synthetic_bars(("GLD",), date(2024, 11, 1), TODAY, 0.0)               # p* ~0.75 alone
+    bars.update(synthetic_bars(("SLV",), date(2024, 11, 1), TODAY, 0.01, seed=5))  # p* ~0.51 alone
+    g11_source(StaticSource(bars, today=TODAY))
+    prop = metals_proposal()
+    m = S.breakeven_hits(prop, S._feasibility_source, TODAY)
+    assert m["GLD"]["breakeven_hit"] > S.MAX_BREAKEVEN_HIT >= m["pooled"]["breakeven_hit"]
+    assert S.check(prop, L.load_state(L.memory()), TODAY)["G11_cost_feasible"] == "ok"
+
+
+def test_g11_reads_only_sessions_before_the_window(g11_source):
+    prop = metals_proposal()
+    start = date.fromisoformat(prop["window"]["start"])
+    # cheap-to-trade window, expensive pre-window: only the pre-window may decide
+    src = g11_source(_Recording(_two_regime_bars(0.0, 0.01, start), TODAY))
+    r = S.check(prop, L.load_state(L.memory()), TODAY)
+    assert r["G11_cost_feasible"] != "ok"
+    assert src.calls and all(end <= start for _, _, end in src.calls)
+    m = S.breakeven_hits(prop, src, TODAY)
+    assert all(v["to"] < start.isoformat() for v in m.values())
+    assert m["pooled"]["n"] == m["GLD"]["n"] + m["SLV"]["n"] >= S.PREWINDOW_MIN_TRADES
+
+
+def test_g11_stays_inside_polygon_retention(g11_source):
+    prop = metals_proposal()
+    src = g11_source(_Recording(metals_source(0.004).bars, TODAY))
+    S.check(prop, L.load_state(L.memory()), TODAY)
+    assert min(s for _, s, _ in src.calls) >= TODAY - timedelta(days=D.RETENTION_DAYS - 1)
+
+
+def test_g11_not_run_without_a_source_or_for_a_confirmation(g11_source):
+    assert "G11_cost_feasible" not in S.check(metals_proposal(), L.load_state(L.memory()), TODAY)
+    g11_source(metals_source(0.0))
+    assert "G11_cost_feasible" not in S.check(metals_proposal(stage=2), L.load_state(L.memory()), TODAY)
+
+
+def test_g11_skipped_when_an_earlier_check_already_failed(g11_source):
+    src = g11_source(_Recording({}, TODAY))
+    r = S.check(metals_proposal(sides="long"), L.load_state(L.memory()), TODAY)
+    assert "G11_cost_feasible" not in r and not src.calls
+
+
+def test_g11_too_few_sessions_and_source_errors_refuse(g11_source):
+    g11_source(StaticSource({}, today=TODAY))
+    assert S.check(metals_proposal(), L.load_state(L.memory()), TODAY)["G11_cost_feasible"] == \
+        "fewer than 10 pre-window trades (0)"
+
+    class Down:
+        def sessions(self, *a, **k):
+            raise D.SourceError("polygon 503")
+    g11_source(Down())
+    assert S.check(metals_proposal(), L.load_state(L.memory()), TODAY)["G11_cost_feasible"] == "bar source: polygon 503"
+
+
+def test_g11_refusal_lets_the_next_queue_item_register(tmp_path, g11_source):
+    bars = synthetic_bars(("GLD", "SLV"), date(2024, 11, 1), TODAY, 0.0)
+    bars.update(synthetic_bars(("USO", "UNG"), date(2024, 11, 1), TODAY, 0.004, seed=9))
+    src = g11_source(StaticSource(bars, today=TODAY))
+    s = R.run_cycle(L.memory(), src, tmp_path, now=NOW)
+    assert s["rejected"][0]["proposal_id"].startswith("IM1-v1:metals")
+    assert "G11_cost_feasible" in s["rejected"][0]["failed"]
+    assert s["registered"][0]["proposal_id"].startswith("IM1-v1:energy")
+
+
+def test_g11_does_not_change_the_code_hash():
+    assert "sanity" not in F.EVALUATION_MODULES  # installing the gate abandons no open registration
+
+
+def test_cli_cycle_sets_and_clears_the_g11_source(tmp_path, monkeypatch):
+    from alpha_research.edge_stream import __main__ as CLI
+
+    seen = {}
+
+    class FakeSource:
+        def __init__(self, *a, **k):
+            pass
+
+    def fake_cycle(ledger, source, data, **kw):
+        seen["source"] = S._feasibility_source
+        seen["passed"] = source
+        return {}
+
+    monkeypatch.setattr(CLI, "PolygonMinuteSource", FakeSource)
+    monkeypatch.setattr(CLI, "_extras", lambda source, data: {})  # the event families' sources (EC1)
+    monkeypatch.setattr(CLI, "run_cycle", fake_cycle)
+    for k in ("EDGE_STREAM_LEDGER_PATH", "EDGE_STREAM_ANCHOR_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    assert CLI.main(["cycle", "--dry-run", "--data-dir", str(tmp_path)]) == 0
+    assert isinstance(seen["source"], FakeSource) and seen["source"] is seen["passed"]
+    assert S._feasibility_source is None

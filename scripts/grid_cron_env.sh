@@ -6,17 +6,32 @@
 # (/data/grid_v4/grid_release -> grid_release.releases/<sha>). A release tree
 # has no .env, and config.py only auto-loads the .env that sits next to it, so
 # every cron entry point has to load the GRID env file itself. The default is
-# the file the release systemd units already name in EnvironmentFile=
-# (grid-api, grid-hermes, grid-scheduler, the godview writers). Moving that
-# file is a separate, owner-gated step (OPS-W1 .env plan, after OPS-SEC's
-# rotation runbook). Until then, point GRID_ENV_FILE somewhere else to override.
+# /etc/grid/grid.env, where the shared env file lives since 2026-11-17. The old
+# checkout path /home/grid/grid_v4/grid_repo/.env is now a symlink to it (the
+# release systemd units still name that path in EnvironmentFile=) and stays as
+# a fallback for hosts that have not moved the file. GRID_ENV_FILE overrides
+# both.
 #
 # Functions:
 #   grid_cron_load_env   source the env file (fail closed), pin PYTHONPATH
 #   grid_cron_python     print the interpreter to use (GRID_PYTHON override)
 # ============================================================
 
-GRID_ENV_FILE_DEFAULT="/home/grid/grid_v4/grid_repo/.env"
+GRID_ENV_FILE_DEFAULT="/etc/grid/grid.env"
+GRID_ENV_FILE_LEGACY="/home/grid/grid_v4/grid_repo/.env"
+
+# Print the env file to load: GRID_ENV_FILE when set, else the default when it
+# is readable, else the legacy checkout path (which may itself be missing; the
+# caller fails closed on that).
+grid_cron_env_file() {
+    if [[ -n "${GRID_ENV_FILE:-}" ]]; then
+        echo "$GRID_ENV_FILE"
+    elif [[ -r "$GRID_ENV_FILE_DEFAULT" ]]; then
+        echo "$GRID_ENV_FILE_DEFAULT"
+    else
+        echo "$GRID_ENV_FILE_LEGACY"
+    fi
+}
 
 # Load the GRID env file into the environment, then pin PYTHONPATH to
 # GRID_ROOT so a job can never import modules from a different tree (for
@@ -24,7 +39,8 @@ GRID_ENV_FILE_DEFAULT="/home/grid/grid_v4/grid_repo/.env"
 # missing or unreadable: running without it would fail later in a less
 # obvious way (empty DB_PASSWORD, missing GRID_JWT_SECRET).
 grid_cron_load_env() {
-    local env_file="${GRID_ENV_FILE:-$GRID_ENV_FILE_DEFAULT}"
+    local env_file
+    env_file="$(grid_cron_env_file)"
     if [[ -z "${GRID_ROOT:-}" ]]; then
         echo "[$(date -Is)] ERROR: GRID_ROOT is not set before grid_cron_load_env" >&2
         return 78
