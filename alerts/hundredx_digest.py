@@ -646,7 +646,7 @@ def _signal_text(name: str, sig: dict, spot: float | None) -> str | None:
         if meta.get("calendar_violations"):
             bits.append(f"{meta['calendar_violations']} calendar")
         fs = meta.get("front_skew")
-        tail = f", front 25-delta skew {fs:+.3f}" if isinstance(fs, (int, float)) else ""
+        tail = f", front modeled skew proxy {fs:+.3f}" if isinstance(fs, (int, float)) else ""
         # Measured 2026-09-04..11-03: violations on 99.85% of scanned rows
         # (median 21), so this fires on nearly every name.
         return (f"SVI surface: {' / '.join(bits) or 'no'} arbitrage violations{tail} "
