@@ -202,12 +202,22 @@ survivor, allocation window or S11 identity, and none is invented for them.
 Older-data pre-screen (owner's decision, 2026-11-20). Before a selected
 candidate takes one of the ten live slots it gets one registered look on
 sessions older than the development window, which the factory itself never
-reads (:mod:`analysis.factory_prescreen`). The look is recorded as a
-``factory_prescreen_outcome``: it names a selected trial of a recorded result,
-the registration file's sha256 and the data file's sha256; a trial takes one
-look, and one store takes at most :data:`PRESCREEN_MAX_LOOKS`, ever. A pass
-is not evidence that the rule works now. It earns the candidate a live slot,
-and the live look stays the test.
+reads (:mod:`analysis.factory_prescreen`). Two records, in this order:
+
+* ``factory_prescreen_registered``, appended before any older data is read
+  for the rule: the selected trial, the registration file's sha256, the store
+  and the data file's sha256. The hash chain, not a timestamp in a file, is
+  what puts the registration before the look. A trial is registered once, and
+  one store takes at most :data:`PRESCREEN_MAX_LOOKS` registrations, ever.
+* ``factory_prescreen_outcome``, the look: it names its registration record
+  by line sha256, and a ledger head at or after that registration which the
+  operator states was recorded off-host before the look
+  (``registration_witness``; the ledger checks that head against its own
+  lines, a person checks the off-host copy).
+
+A pass is a screen on older data that has been looked at before. It is not
+independent evidence and not evidence that the rule works now. It earns the
+candidate a live slot, and the live look stays the test.
 """
 
 from __future__ import annotations
@@ -260,10 +270,13 @@ FACTORY_RESULT = "factory_run_result"
 FACTORY_ABANDONED = "factory_run_abandoned"
 FACTORY_FORWARD = "factory_forward_outcome"
 FACTORY_PRESCREEN = "factory_prescreen_outcome"
-FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED, FACTORY_FORWARD, FACTORY_PRESCREEN)
+FACTORY_PRESCREEN_REGISTERED = "factory_prescreen_registered"
+FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED, FACTORY_FORWARD, FACTORY_PRESCREEN,
+                 FACTORY_PRESCREEN_REGISTERED)
 PRESCREEN_MAX_LOOKS = 10      # looks one older-data store takes, ever; also the k its alpha is split over
 PRESCREEN_ALPHA = 0.05        # across the store's looks: PRESCREEN_ALPHA / PRESCREEN_MAX_LOOKS per look
 PRESCREEN_MIN_FIRES = 40      # below this the bootstrap bound passes noise two to three times too often (measured)
+PRESCREEN_EVIDENCE = "screen on previously exposed older data; not independent evidence"
 FACTORY_VERDICT_SCHEMA = "panel-factory-verdict/1"   # the export line gex-signals writes; the only contract between the two
 FACTORY_VERDICT_FIELDS = (
     "schema", "slot_trial_id", "family", "registered_at", "row_hash", "source", "rule", "verdict", "n", "mean_net",
@@ -950,8 +963,12 @@ class Ledger:
             )
         if kind == FACTORY_FORWARD:
             validate_factory_forward(record, factory_result_index(self), factory_forward_seen(self))
+        elif kind == FACTORY_PRESCREEN_REGISTERED:
+            validate_factory_prescreen_registered(record, factory_result_index(self),
+                                                  self.of_kind(FACTORY_PRESCREEN_REGISTERED))
         elif kind == FACTORY_PRESCREEN:
-            validate_factory_prescreen(record, factory_result_index(self), self.of_kind(FACTORY_PRESCREEN))
+            validate_factory_prescreen(record, factory_result_index(self), factory_prescreen_registrations(self),
+                                       self.of_kind(FACTORY_PRESCREEN), [self.line_sha(i) for i in range(len(self._lines))])
         elif kind in FACTORY_KINDS:
             validate_factory_record(record, factory_open_run(self))
         if kind == HYPOTHESIS_BATCH_KIND:
@@ -1081,6 +1098,8 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     factory_results: dict[str, dict] = {}
     factory_forward: set[tuple[str, str]] = set()
     factory_prescreens: list[dict] = []
+    factory_registrations: dict[str, dict] = {}
+    line_shas: list[str] = []
 
     for seq, line in enumerate(lines):
         record = json.loads(line)
@@ -1099,8 +1118,11 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
         if kind == FACTORY_FORWARD:   # closes no run and opens none: the open run, if any, stays open
             validate_factory_forward(record, factory_results, factory_forward)
             factory_forward.add((record["run_id"], record["trial_id"]))
-        elif kind == FACTORY_PRESCREEN:   # like a live verdict: the open run, if any, stays open
-            validate_factory_prescreen(record, factory_results, factory_prescreens)
+        elif kind == FACTORY_PRESCREEN_REGISTERED:   # like a live verdict: the open run, if any, stays open
+            validate_factory_prescreen_registered(record, factory_results, list(factory_registrations.values()))
+            factory_registrations[sha256_bytes(line)] = record
+        elif kind == FACTORY_PRESCREEN:
+            validate_factory_prescreen(record, factory_results, factory_registrations, factory_prescreens, line_shas)
             factory_prescreens.append(record)
         elif kind in FACTORY_KINDS:
             validate_factory_record(record, open_factory)
@@ -1151,6 +1173,7 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
 
         records.append(record)
         previous = sha256_bytes(line)
+        line_shas.append(previous)
     return records
 
 
@@ -2322,8 +2345,8 @@ def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def check_factory_prescreen_target(record: dict, results: dict[str, dict], earlier: list[dict]) -> dict:
-    """What can be checked before any older data is read: the trial, the store and the registration. Returns the result."""
+def _prescreen_trial(record: dict, results: dict[str, dict]) -> dict:
+    """The recorded result a pre-screen record names; its trial must be a selected representative."""
     result = results.get(record.get("result_sha256") or "")
     if result is None:
         raise ValueError("a pre-screen must name a factory_run_result on this ledger by its line sha256")
@@ -2335,25 +2358,64 @@ def check_factory_prescreen_target(record: dict, results: dict[str, dict], earli
         raise ValueError(f"trial {trial_id!r} is not a trial of run {run_id!r}")
     if not trial.get("selected") or trial.get("representative") is False:
         raise ValueError("only a selected trial, the representative of its cluster, takes a pre-screen look")
-    if any((r["run_id"], r["trial_id"]) == (run_id, trial_id) for r in earlier):
-        raise ValueError("this trial already had its pre-screen look")
+    rule = record.get("rule")
+    if not isinstance(rule, dict) or (rule.get("family"), rule.get("feature")) != (trial["family"], trial["feature"]):
+        raise ValueError("a pre-screen carries the rule of its trial, unchanged")
     store = record.get("store")
     if not isinstance(store, dict) or not isinstance(store.get("id"), str) or not store["id"] \
             or not _hex64(store.get("data_sha256")):
         raise ValueError("a pre-screen names its store and the sha256 of the data file it read")
-    same_store = [r for r in earlier if r["store"]["id"] == store["id"]]
-    if len(same_store) >= PRESCREEN_MAX_LOOKS:
-        raise ValueError(f"store {store['id']!r} has had its {PRESCREEN_MAX_LOOKS} looks")
-    if any(r["store"]["data_sha256"] != store["data_sha256"] for r in same_store):
-        raise ValueError("a store's data file cannot change between looks")
     if not _hex64(record.get("registration_sha256")):
         raise ValueError("a pre-screen carries the sha256 of its registration file")
     return result
 
 
-def validate_factory_prescreen(record: dict, results: dict[str, dict], earlier: list[dict]) -> None:
-    """One registered older-data look: a selected trial of a recorded result, once, on a store with looks left."""
-    result = check_factory_prescreen_target(record, results, earlier)
+def validate_factory_prescreen_registered(record: dict, results: dict[str, dict], earlier: list[dict]) -> None:
+    """A registration: a selected representative, once, on a store that has registrations left."""
+    result = _prescreen_trial(record, results)
+    if any((r["run_id"], r["trial_id"]) == (record["run_id"], record["trial_id"]) for r in earlier):
+        raise ValueError("this trial is already registered for a pre-screen look")
+    store = record["store"]
+    same_store = [r for r in earlier if r["store"]["id"] == store["id"]]
+    if len(same_store) >= PRESCREEN_MAX_LOOKS:
+        raise ValueError(f"store {store['id']!r} has had its {PRESCREEN_MAX_LOOKS} registrations")
+    if any(r["store"]["data_sha256"] != store["data_sha256"] for r in same_store):
+        raise ValueError("a store's data file cannot change between looks")
+    if not _hex64(record.get("terms_sha256")) or not isinstance(record.get("version"), str) or not record["version"]:
+        raise ValueError("a registration carries the version and the sha256 of the terms it was written under")
+    if not isinstance(record.get("prior_use"), str) or len(record["prior_use"].strip()) < 40:
+        raise ValueError("a registration states, in words, what its store has already been looked at for")
+    if not isinstance(record.get("registered_at"), str) or stamp(record["registered_at"]) < stamp(result["recorded_at"]):
+        raise ValueError("a registration cannot predate the result it follows")
+
+
+def factory_prescreen_registrations(ledger: Ledger) -> dict[str, dict]:
+    """{line sha256: record} of every pre-screen registration on the ledger."""
+    return {ledger.line_sha(r["seq"]): r for r in ledger.of_kind(FACTORY_PRESCREEN_REGISTERED)}
+
+
+def validate_factory_prescreen(record: dict, results: dict[str, dict], registrations: dict[str, dict],
+                               earlier: list[dict], line_shas: list[str]) -> None:
+    """The look of one registration: bound to it, once, with a verdict its numbers allow."""
+    result = _prescreen_trial(record, results)
+    registered = registrations.get(record.get("registered_sha256") or "")
+    if registered is None:
+        raise ValueError("a look must name its registration record on this ledger by its line sha256")
+    for key in ("run_id", "trial_id", "result_sha256", "registration_sha256", "rule", "version", "terms_sha256"):
+        if record.get(key) != registered.get(key):
+            raise ValueError(f"the look's {key} is not its registration's")
+    if record["store"].get("id") != registered["store"]["id"] \
+            or record["store"].get("data_sha256") != registered["store"]["data_sha256"]:
+        raise ValueError("the look's store or data file is not its registration's")
+    if any(r["registered_sha256"] == record["registered_sha256"] for r in earlier):
+        raise ValueError("this registration already had its look")
+    witness = record.get("registration_witness")
+    count = witness.get("ledger_records") if isinstance(witness, dict) else None
+    if type(count) is not int or not registered["seq"] < count <= len(line_shas) \
+            or line_shas[count - 1] != witness.get("ledger_head_sha256") \
+            or not isinstance(witness.get("where"), str) or len(witness["where"].strip()) < 10:
+        raise ValueError("a look names a head of this ledger at or after its registration that was recorded off-host "
+                         "first (registration_witness: ledger_records, ledger_head_sha256, where)")
     if record.get("alpha_per_test") != PRESCREEN_ALPHA / PRESCREEN_MAX_LOOKS:
         raise ValueError(f"the per-look alpha is fixed at {PRESCREEN_ALPHA} / {PRESCREEN_MAX_LOOKS}")
     verdict, n = record.get("verdict"), record.get("n")
@@ -2361,18 +2423,29 @@ def validate_factory_prescreen(record: dict, results: dict[str, dict], earlier: 
         raise ValueError("a pre-screen verdict is pass, fail or underpowered")
     if type(n) is not int or n < 0:
         raise ValueError("n must be a nonnegative integer")
-    lower, excess = record.get("lower_bound"), record.get("excess_lower_bound")
+    bounds = [record.get(k) for k in ("lower_bound", "excess_lower_bound", "trimmed_mean_net")]
     if verdict == "underpowered":
         if n >= PRESCREEN_MIN_FIRES:
             raise ValueError(f"underpowered means fewer than {PRESCREEN_MIN_FIRES} fires")
-    elif n < PRESCREEN_MIN_FIRES or not _number(lower) or not _number(excess):
-        raise ValueError(f"pass and fail need {PRESCREEN_MIN_FIRES} fires and both lower bounds")
-    elif (verdict == "pass") != (lower > 0 and excess > 0):
-        raise ValueError("pass means both lower bounds are above zero; fail means at least one is not")
+    elif n < PRESCREEN_MIN_FIRES or not all(_number(x) for x in bounds):
+        raise ValueError(f"pass and fail need {PRESCREEN_MIN_FIRES} fires, both lower bounds and the trimmed mean")
+    elif (verdict == "pass") != all(x > 0 for x in bounds):
+        raise ValueError("pass means both lower bounds and the trimmed mean are above zero; fail means one is not")
+    if record.get("evidence") != PRESCREEN_EVIDENCE:
+        raise ValueError(f"a look is labelled {PRESCREEN_EVIDENCE!r}")
     if not isinstance(record.get("looked_at"), str):
         raise ValueError("a pre-screen carries the time of its look")
-    if stamp(record["looked_at"]) < stamp(result["recorded_at"]):
-        raise ValueError("a pre-screen cannot predate the result it follows")
+    if stamp(record["looked_at"]) < stamp(result["recorded_at"]) or stamp(record["looked_at"]) < stamp(registered["recorded_at"]):
+        raise ValueError("a pre-screen cannot predate the result it follows or its own registration")
+
+
+def record_factory_prescreen_registered(ledger: Ledger, registration: dict, recorded_at: str | None = None) -> dict:
+    """Append one pre-screen registration; returns ``{record, sha256}``. No older data is read to make it."""
+    if not ledger.is_factory:
+        raise ValueError("pre-screen registrations belong on a factory ledger")
+    record = _finite({**registration, "kind": FACTORY_PRESCREEN_REGISTERED, "recorded_at": recorded_at or now_iso()})
+    appended, sha = ledger._append(record)
+    return {"record": appended, "sha256": sha}
 
 
 def record_factory_prescreen(ledger: Ledger, outcome: dict, recorded_at: str | None = None) -> dict:
@@ -2546,24 +2619,29 @@ def _factory_live(ledger: Ledger, trials: list[dict]) -> dict:
 
 
 def _factory_prescreen(ledger: Ledger) -> dict:
-    """Older-data looks on the ledger: how many, how they came out, and how many each store has left."""
-    looks = ledger.of_kind(FACTORY_PRESCREEN)
+    """Older-data pre-screens on the ledger: registered, looked at, how they came out, what each store has left."""
+    registered, looks = ledger.of_kind(FACTORY_PRESCREEN_REGISTERED), ledger.of_kind(FACTORY_PRESCREEN)
     stores: dict[str, int] = {}
-    for r in looks:
+    for r in registered:
         stores[r["store"]["id"]] = stores.get(r["store"]["id"], 0) + 1
+    looked = {r["registered_sha256"] for r in looks}
     return {
+        "registered": len(registered),
+        "registered_not_looked": sum(ledger.line_sha(r["seq"]) not in looked for r in registered),
         "looked": len(looks),
         "passed": sum(r["verdict"] == "pass" for r in looks),
         "failed": sum(r["verdict"] == "fail" for r in looks),
         "underpowered": sum(r["verdict"] == "underpowered" for r in looks),
-        "stores": {k: {"looks": n, "left": PRESCREEN_MAX_LOOKS - n} for k, n in sorted(stores.items())},
+        "stores": {k: {"registered": n, "left": PRESCREEN_MAX_LOOKS - n} for k, n in sorted(stores.items())},
         "verdicts": [
             {"run_id": r["run_id"], "trial_id": r["trial_id"], "verdict": r["verdict"], "n": r["n"],
              "lower_bound": r["lower_bound"], "excess_lower_bound": r["excess_lower_bound"],
-             "store": r["store"]["id"], "looked_at": r["looked_at"]}
+             "trimmed_mean_net": r["trimmed_mean_net"], "store": r["store"]["id"], "looked_at": r["looked_at"]}
             for r in looks
         ],
-        "note": "a pass held on older sessions the factory never read; it earns a live slot and is not the live test",
+        "evidence": PRESCREEN_EVIDENCE,
+        "note": "a pass held on older sessions the factory never read but another search has; it earns a live slot "
+                "and is not the live test",
     }
 
 

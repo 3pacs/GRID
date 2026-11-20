@@ -1646,25 +1646,42 @@ def main(argv=None) -> int:
     v.add_argument("--file", required=True, type=Path)
     v.add_argument("--ledger", required=True, type=Path)
     v.add_argument("--anchor", required=True, type=Path)
-    p = sub.add_parser("prescreen", help="the one registered older-data look of a selected candidate, appended to the ledger")
+    g = sub.add_parser("prescreen-register", help="append a pre-screen registration to the ledger; reads no older data")
+    g.add_argument("--registration", required=True, type=Path)
+    g.add_argument("--ledger", required=True, type=Path)
+    g.add_argument("--anchor", required=True, type=Path)
+    p = sub.add_parser("prescreen", help="the one older-data look of a registration already on the ledger")
     p.add_argument("--registration", required=True, type=Path)
     p.add_argument("--data", required=True, type=Path, help="the older-data bars file named by the registration's sha256")
     p.add_argument("--ledger", required=True, type=Path)
     p.add_argument("--anchor", required=True, type=Path)
+    p.add_argument("--witness-records", required=True, type=int,
+                   help="record count of a head of this ledger, at or after the registration, that was recorded off-host")
+    p.add_argument("--witness-head", required=True, help="that head's sha256")
+    p.add_argument("--witness-where", required=True, help="where the off-host copy is (for example the Desk receipt hub post)")
     a = ap.parse_args(argv)
-    if a.cmd == "prescreen":
+    if a.cmd in ("prescreen", "prescreen-register"):
         from analysis import factory_prescreen  # imported here: that module imports this one
 
         try:
             ledger = lse.Ledger(a.ledger, anchor=a.anchor)
-            done = factory_prescreen.prescreen(a.registration, a.data, ledger)["record"]
+            if a.cmd == "prescreen-register":
+                done = factory_prescreen.register(a.registration, ledger)
+                print(json.dumps({"ok": True, "registered_sha256": done["sha256"], "seq": done["record"]["seq"],
+                                  "head_sha256": ledger.head, "records": len(ledger.records),
+                                  "rule": done["record"]["rule"], "store": done["record"]["store"]["id"],
+                                  "next": "the look needs a head at or after this record that was recorded off-host"}))
+                return 0
+            witness = {"ledger_records": a.witness_records, "ledger_head_sha256": a.witness_head, "where": a.witness_where}
+            done = factory_prescreen.prescreen(a.registration, a.data, ledger, witness)["record"]
         except (ValueError, OSError) as e:
             print(json.dumps({"ok": False, "refused": str(e)}))
             return 2
         left = lse.summarize(ledger)["live"]["prescreen"]["stores"][done["store"]["id"]]["left"]
-        print(json.dumps({"ok": True, "looks_left": left, "head_sha256": ledger.head,
+        print(json.dumps({"ok": True, "registrations_left": left, "head_sha256": ledger.head,
                           **{k: done[k] for k in ("verdict", "n", "mean_net", "lower_bound", "baseline", "excess_mean",
-                                                  "excess_lower_bound", "by_year", "rule")}}))
+                                                  "excess_lower_bound", "trimmed_mean_net", "top_share", "by_year",
+                                                  "rule", "evidence")}}))
         return 0
     if a.cmd == "summary":
         print(json.dumps(lse.summarize(lse.Ledger(a.ledger, anchor=a.anchor)), indent=1))

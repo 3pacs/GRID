@@ -2,7 +2,7 @@
 
 Why it exists (owner's decision, 2026-11-20). A factory candidate's evidence
 is its live slot: one look at 100 resolved fires. Measured on the ledger, the
-rules the factory ranks fire on 5 to 30% of sessions, so a slot takes one to
+rules the factory ranks fire on 5 to 40% of sessions, so a slot takes one to
 five years to reach that look, and there are ten slots. This module gives a
 selected candidate a first, fast test on sessions the factory has never read:
 the store behind edge search 9, 2018-05-01 to 2022-11-11, older than the
@@ -11,10 +11,26 @@ stays the test.
 
 What it is not. A pass is "held on older data", not "works now": the window
 is 2019's rise, the 2020 crash and recovery, 2021's rise and the 2022 fall.
-The store is not untouched either: edge search 9 spent one look on it for
-three other rules. Every registration must say so (``prior_use``), a trial
-takes one look, and the store takes ten looks, ever
+The store has been looked at before: edge search 9 spent one look on it for
+three other rules. So a pass is a screen on previously exposed data and is
+recorded as that (``evidence``), never as independent evidence. Every
+registration must say what the store was used for (``prior_use``); a trial
+is registered once; the store takes ten registrations, ever
 (:data:`analysis.ledger_steered_exploration.PRESCREEN_MAX_LOOKS`).
+
+Two steps, two ledger records
+-----------------------------
+1. :func:`register` appends ``factory_prescreen_registered`` for one
+   registration file. It reads the ledger and the file, and no older data.
+   The hash chain puts the registration before the look; a timestamp inside
+   a file could not.
+2. :func:`prescreen` runs the look for a registration already on the ledger
+   and appends ``factory_prescreen_outcome``. It must be given a ledger head
+   at or after the registration that was recorded off-host before the look
+   (``witness``: the Desk source receipt's nightly hub post carries the
+   factory ledger's head). The ledger checks that head against its own lines.
+   Whether the off-host copy exists is checked by a person, and the record
+   says so.
 
 How a look is computed
 ----------------------
@@ -25,31 +41,48 @@ How a look is computed
   complete, every minute from 09:30 to the decision), the same entry (open of
   the minute after the decision) and exit (close of the horizon's last
   minute). The target unit is dollars a share, as in the live look.
+* **One window, no skipped windows.** The declared run's ``skip_windows``
+  only remove whole (decision time, horizon) windows from that run. A window
+  that was skipped has no trial, so a registered rule's window was never one
+  of them; the reduced run therefore carries none. A registration whose
+  window is in the declared ``skip_windows`` is refused. A skipped window
+  changes no other window's eligibility, history or labels (tested).
 * **A pinned calendar.** XNYS sessions for 2018-04-02 to 2022-11-11
   (:data:`PINS`), built with ``scripts/build_factory_calendar_manifest.py``
   from the library version the factory's other manifests name. No observed-day
   fallback.
 * **Warm-up.** Sessions before :data:`FIRES_FROM` (2019-01-02) only fill the
   histories; no fire before it counts (edge search 9's split).
-* **The test.** PASS needs both, each at 0.05 / 10:
-  the seeded bootstrap lower bound of the mean net of the fires is above zero
-  (the live look's statistic), and so is the bound of that mean minus the mean
-  net of taking the same side at the same time on every eligible session, so
-  a long rule cannot pass on a rising market alone. Fewer than 40 fires is
-  UNDERPOWERED. Anything else is FAIL. Means by year are reported, not tested.
+* **The test.** PASS needs all three:
+
+  1. the lower bound of the mean net of the fires is above zero;
+  2. the lower bound of that mean minus the mean net of taking the same side
+     at the same time on every eligible session is above zero, so a long rule
+     cannot pass on a rising market alone;
+  3. the mean net of the fires without the five largest is above zero, so a
+     pass cannot rest on a handful of sessions.
+
+  Both bounds are at 0.05 / 10 and come from one seeded circular block
+  bootstrap over the eligible sessions in date order (blocks of
+  :data:`BLOCK` sessions), so fires on neighbouring days are resampled
+  together and not treated as independent. Fewer than 40 fires is
+  UNDERPOWERED. Anything else is FAIL. Means by year and the share of the
+  total net from the five largest fires are reported, not tested.
 
 Guards
 ------
-* :func:`load_older` refuses a data file whose sha256 is not the registered
-  one and a file holding any session on or after the development window. The
-  factory's own loader refuses the opposite; neither can read the other's
+* :func:`load_older` reads the data file's bytes once, checks their sha256
+  against the registration, and queries those same bytes (an in-memory copy):
+  what is hashed is what is read. A ``-wal``, ``-shm`` or ``-journal`` file
+  beside it, or a file in WAL mode, is refused. So is a file holding any
+  session on or after the development window, or two rows for one minute.
+  The factory's own loader refuses the opposite; neither can read the other's
   data.
 * Only SPY-only price features and tape features are supported: the older
   store has no complete bars for the other symbols and no event, options or
   macro history.
-* The trial, the store's remaining looks and the registration are checked
-  before the data file is opened; the outcome is appended to the factory
-  ledger (``factory_prescreen_outcome``), which re-checks it on every reopen.
+* The trial, the registration and the witnessed head are checked before the
+  data file is opened; the ledger re-checks every record on every reopen.
 
 Registrations name a selected rule, so they are kept out of this public
 repository; this module reads one by path and records its sha256.
@@ -62,16 +95,18 @@ import hashlib
 import json
 import random
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+
+import numpy as np
 
 from analysis import ledger_steered_exploration as lse
 from analysis import module_factory as mf
 from analysis.factory_session_calendar import FactoryCalendar
 from ingestion.market_calendar import ManifestCalendar
 
-VERSION = "factory-prescreen/1"
+VERSION = "factory-prescreen/2"
 SCHEMA = "factory-prescreen-registration/1"
 STORE_ID = "edge9-older-2018-2022"
 FIRST_SESSION = "2018-05-01"
@@ -79,6 +114,8 @@ LAST_SESSION = "2022-11-11"
 FIRES_FROM = "2019-01-02"
 BOOT_B = 10000
 BOOT_SEED = 20261120
+BLOCK = 5    # eligible sessions resampled together: fires on neighbouring days are not independent
+TRIM = 5     # the largest fires left out of the concentration check
 PINS = (
     ("prescreen-xnys-2018-04-02-2020-12-31.json", "88312f9a547c809737a8c94b5d9b51e0e5f38117cb51ecaec2bd639ced7138ba"),
     ("prescreen-xnys-2021-01-01-2022-11-11.json", "aee287ed567cf53c072d2378aa6437fe9bfcbbe8b6186fcc8bf4ab6109bc4dc5"),
@@ -96,8 +133,13 @@ TERMS = {
     "min_fires": lse.PRESCREEN_MIN_FIRES,
     "boot_b": BOOT_B,
     "boot_seed": BOOT_SEED,
-    "pass": "bound(mean net of fires) > 0 and bound(mean net of fires - mean net of always taking the side) > 0",
+    "block_sessions": BLOCK,
+    "trim_fires": TRIM,
+    "pass": ("block-bootstrap bound(mean net of fires) > 0 and bound(mean net of fires - mean net of always taking "
+             "the side) > 0 and mean net of fires without the largest trim_fires > 0"),
+    "evidence": lse.PRESCREEN_EVIDENCE,
 }
+TERMS_SHA256 = hashlib.sha256(lse.canonical(TERMS)).hexdigest()
 REGISTRATION_FIELDS = ("schema", "candidate", "data_sha256", "terms", "prior_use", "registered_at")
 CANDIDATE_FIELDS = ("run_id", "trial_id", "result_sha256", "family", "feature")
 
@@ -164,6 +206,8 @@ def candidate_run(ledger: lse.Ledger, candidate: dict) -> tuple[mf.RunFile, str,
     if mf.FEATURE_CLASS.get(feature) not in CLASSES:
         raise PrescreenError(f"{feature} is a {mf.FEATURE_CLASS.get(feature)} feature: the older store cannot supply it")
     body = dict(declared["run_file"])
+    if f"{decision}+{horizon}" in (body.get("skip_windows") or ()):
+        raise PrescreenError(f"{decision}+{horizon} is a skipped window of its run: it has no trial to pre-screen")
     for key in ("class_shares", "oi_archive_sha256", "macro_sha256"):
         body.pop(key, None)
     body.update(run_id=f"prescreen-{candidate['trial_id'][:12]}", features=[feature], decision_times=[decision],
@@ -182,19 +226,53 @@ def candidate_run(ledger: lse.Ledger, candidate: dict) -> tuple[mf.RunFile, str,
     return dataclasses.replace(run, first_session=FIRST_SESSION, last_session=LAST_SESSION), module, family
 
 
-def load_older(db_path: Path, data_sha256: str, symbol: str = "SPY") -> dict[str, mf.Session]:
-    """{day: Session} of the older store, read-only. Refuses another file, and any development session in it."""
-    if sha256_file(db_path) != data_sha256:
+SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def _sealed(db_path: Path, data_sha256: str) -> sqlite3.Connection:
+    """A connection onto the exact bytes whose sha256 is registered: what is hashed is what is queried."""
+    path = Path(db_path)
+    present = [suffix for suffix in SIDECARS if Path(str(path) + suffix).exists()]
+    if present:
+        raise PrescreenError(f"a sidecar file sits beside the data file ({', '.join(present)}): refused")
+    raw = path.read_bytes()   # the only read of the path
+    if hashlib.sha256(raw).hexdigest() != data_sha256:
         raise PrescreenError("the data file is not the registered one (sha256 differs)")
-    con = sqlite3.connect(f"file:{quote(str(Path(db_path).absolute()))}?mode=ro", uri=True)
+    if raw[:16] != b"SQLite format 3\x00" or raw[18:20] != b"\x01\x01":
+        raise PrescreenError("the data file is not a rollback-journal SQLite file (WAL mode or another format): refused")
+    con = sqlite3.connect(":memory:")
+    if hasattr(con, "deserialize"):
+        con.deserialize(raw)
+        return con
+    con.close()   # Python 3.10: a private copy of the same bytes, opened immutable, removed once loaded
+    with tempfile.TemporaryDirectory(prefix="prescreen-sealed-") as scratch:
+        copy = Path(scratch) / "bars.db"
+        copy.write_bytes(raw)
+        disk = sqlite3.connect(f"file:{copy}?mode=ro&immutable=1", uri=True)
+        memory = sqlite3.connect(":memory:")
+        disk.backup(memory)
+        disk.close()
+    return memory
+
+
+def load_older(db_path: Path, data_sha256: str, symbol: str = "SPY") -> dict[str, mf.Session]:
+    """{day: Session} of the older store. Refuses another file, a sidecar, a development session, a repeated minute."""
+    con = _sealed(db_path, data_sha256)
     try:
         hi = con.execute("select max(day) from bars where sym = ?", (symbol,)).fetchone()[0]
         if hi is None or hi >= mf.DEV_FIRST:
             raise PrescreenError(f"the data file holds {symbol} sessions up to {hi}: development sessions refused")
+        twice = con.execute(
+            "select day, hm from bars where sym = ? group by day, hm having count(*) > 1 limit 1", (symbol,)
+        ).fetchone()
+        if twice:
+            raise PrescreenError(f"the data file holds two rows for {symbol} {twice[0]} {twice[1]}: refused, not overwritten")
         rows = con.execute(
             "select day, hm, o, h, l, c, v from bars where sym = ? and day between ? and ? order by day, hm",
             (symbol, FIRST_SESSION, LAST_SESSION),
         ).fetchall()
+    except sqlite3.Error as exc:
+        raise PrescreenError(f"the data file could not be read ({type(exc).__name__})") from None
     finally:
         con.close()
     by_day: dict[str, dict] = {}
@@ -224,40 +302,35 @@ def session_rows(run: mf.RunFile, module: str, family: str, sessions: dict[str, 
     return rows, coverage
 
 
-def _quantile(values: list[float], alpha: float) -> float:
-    values.sort()
-    return values[max(0, int(alpha * len(values)) - 1)]
+def block_bounds(rows: list[dict], alpha: float, b: int = BOOT_B, seed: int = BOOT_SEED,
+                 block: int = BLOCK) -> tuple[float, float]:
+    """(lower bound of the mean net of the fires, lower bound of that mean minus the mean net of every session).
 
-
-def boot_lower(nets: list[float], alpha: float, b: int = BOOT_B, seed: int = BOOT_SEED) -> float:
-    """One-sided lower bound of the mean at ``alpha``. The live look's bound (gex-signals ``factory_slots.boot_lower``)."""
-    rnd, n = random.Random(seed), len(nets)
-    return _quantile([sum(nets[rnd.randrange(n)] for _ in range(n)) / n for _ in range(b)], alpha)
-
-
-def boot_excess_lower(rows: list[dict], alpha: float, b: int = BOOT_B, seed: int = BOOT_SEED + 1) -> float:
-    """Lower bound of (mean net of the fires) - (mean net of every eligible session), resampling whole sessions.
-
-    A resample without a fire counts as minus infinity: it cannot help a pass.
+    One circular moving-block bootstrap over the eligible sessions in date order: each resample is
+    ``ceil(n / block)`` runs of ``block`` consecutive sessions. A resample without a fire counts as minus
+    infinity for both: it cannot help a pass. The block starts come from Python's seeded generator.
     """
-    rnd, n = random.Random(seed), len(rows)
-    pairs = [(r["net"], r["fired"]) for r in rows]
-    draws = []
-    for _ in range(b):
-        total = fired_total = 0.0
-        fired = 0
-        for _ in range(n):
-            net, f = pairs[rnd.randrange(n)]
-            total += net
-            if f:
-                fired_total += net
-                fired += 1
-        draws.append(fired_total / fired - total / n if fired else float("-inf"))
-    return _quantile(draws, alpha)
+    n = len(rows)
+    blocks = -(-n // block)
+    net = np.array([r["net"] for r in rows], dtype=float)
+    fired = np.array([1.0 if r["fired"] else 0.0 for r in rows])
+
+    def prefix(x: np.ndarray) -> np.ndarray:   # prefix sums of the series wrapped once, so a block may run past the end
+        return np.concatenate(([0.0], np.cumsum(np.concatenate((x, x[:block])))))
+
+    rnd = random.Random(seed)
+    starts = np.array([rnd.randrange(n) for _ in range(b * blocks)], dtype=np.int64).reshape(b, blocks)
+    total, fired_total, fired_count = ((c[starts + block] - c[starts]).sum(axis=1)
+                                       for c in (prefix(net), prefix(net * fired), prefix(fired)))
+    some = fired_count > 0.5
+    fired_mean = np.where(some, fired_total / np.where(some, fired_count, 1.0), -np.inf)
+    excess = np.where(some, fired_mean - total / (blocks * block), -np.inf)
+    q = max(0, int(alpha * b) - 1)
+    return float(np.sort(fired_mean)[q]), float(np.sort(excess)[q])
 
 
 def look(rows: list[dict], b: int = BOOT_B) -> dict:
-    """The verdict of one look on :func:`session_rows`. Pure and seeded: the same rows give the same bytes."""
+    """The verdict of one look on :func:`session_rows`. Pure and seeded: the same rows give the same numbers."""
     alpha = lse.PRESCREEN_ALPHA / lse.PRESCREEN_MAX_LOOKS
     nets = [r["net"] for r in rows if r["fired"]]
     n = len(nets)
@@ -269,62 +342,97 @@ def look(rows: list[dict], b: int = BOOT_B) -> dict:
         "n": n,
         "alpha_per_test": alpha,
         "sessions_eligible": len(rows),
-        "mean_net": sum(nets) / n if n else None,
-        "baseline": {"n": len(rows), "mean_net": sum(r["net"] for r in rows) / len(rows) if rows else None},
+        "mean_net": round(sum(nets) / n, 6) if n else None,
+        "baseline": {"n": len(rows), "mean_net": round(sum(r["net"] for r in rows) / len(rows), 6) if rows else None},
         "by_year": {y: {"n": len(v), "mean_net": round(sum(v) / len(v), 6)} for y, v in sorted(by_year.items())},
         "first_fire": min((r["day"] for r in rows if r["fired"]), default=None),
         "last_fire": max((r["day"] for r in rows if r["fired"]), default=None),
         "lower_bound": None,
         "excess_mean": None,
         "excess_lower_bound": None,
+        "trimmed_mean_net": None,
+        "top_share": None,
+        "evidence": lse.PRESCREEN_EVIDENCE,
     }
     if n < lse.PRESCREEN_MIN_FIRES:
         return {**out, "verdict": "underpowered"}
-    out["lower_bound"] = round(boot_lower(nets, alpha, b), 6)
-    out["excess_mean"] = round(out["mean_net"] - out["baseline"]["mean_net"], 6)
-    out["excess_lower_bound"] = round(boot_excess_lower(rows, alpha, b), 6)
-    out["mean_net"] = round(out["mean_net"], 6)
-    out["baseline"]["mean_net"] = round(out["baseline"]["mean_net"], 6)
-    passed = out["lower_bound"] > 0 and out["excess_lower_bound"] > 0
+    lower, excess = block_bounds(rows, alpha, b)
+    kept = sorted(nets)[:-TRIM]
+    total = sum(nets)
+    out.update(
+        lower_bound=round(lower, 6),
+        excess_mean=round(sum(nets) / n - sum(r["net"] for r in rows) / len(rows), 6),
+        excess_lower_bound=round(excess, 6),
+        trimmed_mean_net=round(sum(kept) / len(kept), 6),
+        # share of the total net from the TRIM largest fires; None when the total is not positive
+        top_share=round(sum(sorted(nets)[-TRIM:]) / total, 4) if total > 0 else None,
+    )
+    passed = out["lower_bound"] > 0 and out["excess_lower_bound"] > 0 and out["trimmed_mean_net"] > 0
     return {**out, "verdict": "pass" if passed else "fail"}
 
 
-def prescreen(registration: Path, data: Path, ledger: lse.Ledger, *, calendar: FactoryCalendar | None = None,
-              looked_at: str | None = None) -> dict:
-    """Run the one registered look and append it to ``ledger``. Returns ``{record, sha256}``.
+def _target(reg: dict, reg_sha: str, module: str, family: str) -> dict:
+    candidate = reg["candidate"]
+    return {
+        "run_id": candidate["run_id"],
+        "trial_id": candidate["trial_id"],
+        "result_sha256": candidate["result_sha256"],
+        "registration_sha256": reg_sha,
+        "rule": {"family": family, "feature": module},
+        "store": {"id": STORE_ID, "data_sha256": reg["data_sha256"], "first_session": FIRST_SESSION,
+                  "last_session": LAST_SESSION, "fires_from": FIRES_FROM, "previously_exposed": True},
+        "version": VERSION,
+        "terms_sha256": TERMS_SHA256,
+    }
 
-    Order: the registration, the trial and the store's remaining looks are checked before the data file is opened.
+
+def register(registration: Path, ledger: lse.Ledger, *, recorded_at: str | None = None) -> dict:
+    """Append the registration to ``ledger`` before any older data is read. Returns ``{record, sha256}``.
+
+    It opens the registration file and the ledger, and nothing else: no data path is taken.
+    """
+    if not ledger.is_factory:
+        raise PrescreenError("pre-screen registrations belong on a factory ledger")
+    reg, reg_sha = load_registration(registration)
+    _run, module, family = candidate_run(ledger, reg["candidate"])
+    record = {**_target(reg, reg_sha, module, family), "prior_use": reg["prior_use"], "registered_at": reg["registered_at"]}
+    return lse.record_factory_prescreen_registered(ledger, record, recorded_at=recorded_at)
+
+
+def prescreen(registration: Path, data: Path, ledger: lse.Ledger, witness: dict, *,
+              calendar: FactoryCalendar | None = None, looked_at: str | None = None) -> dict:
+    """Run the look of a registration that is already on ``ledger`` and append it. Returns ``{record, sha256}``.
+
+    ``witness``: ``{ledger_records, ledger_head_sha256, where}``, a head of this ledger at or after the registration
+    that was recorded off-host before the look, and where (for example the Desk receipt's hub post of that night).
+    Order: the registration record, the trial and the witnessed head are checked before the data file is opened.
     A refusal raises :class:`PrescreenError` or ``ValueError`` and appends nothing.
     """
     if not ledger.is_factory:
         raise PrescreenError("pre-screen looks belong on a factory ledger")
     reg, reg_sha = load_registration(registration)
-    candidate = reg["candidate"]
-    target = {
-        "run_id": candidate["run_id"],
-        "trial_id": candidate["trial_id"],
-        "result_sha256": candidate["result_sha256"],
-        "registration_sha256": reg_sha,
-        "store": {"id": STORE_ID, "data_sha256": reg["data_sha256"], "first_session": FIRST_SESSION,
-                  "last_session": LAST_SESSION, "fires_from": FIRES_FROM},
-    }
-    result = lse.check_factory_prescreen_target(target, lse.factory_result_index(ledger),
-                                                ledger.of_kind(lse.FACTORY_PRESCREEN))
-    if lse.stamp(reg["registered_at"]) < lse.stamp(result["recorded_at"]):
-        raise PrescreenError("the registration predates the result it names")
-    run, module, family = candidate_run(ledger, candidate)
+    run, module, family = candidate_run(ledger, reg["candidate"])
+    registrations = lse.factory_prescreen_registrations(ledger)
+    registered_sha = next((sha for sha, r in registrations.items() if r["registration_sha256"] == reg_sha), None)
+    if registered_sha is None:
+        raise PrescreenError("this registration is not on the ledger: register it first, before any look")
+    looked_at = looked_at or datetime.now(timezone.utc).isoformat()
+    target = {**_target(reg, reg_sha, module, family), "registered_sha256": registered_sha,
+              "registration_witness": {**witness, "checked": "consistent with this ledger; the off-host copy is checked by a person"}}
+    # every rule of the ledger that does not need the data, before the data: a provisional underpowered look
+    provisional = {**target, "verdict": "underpowered", "n": 0, "alpha_per_test": lse.PRESCREEN_ALPHA / lse.PRESCREEN_MAX_LOOKS,
+                   "evidence": lse.PRESCREEN_EVIDENCE, "looked_at": looked_at}
+    lse.validate_factory_prescreen(provisional, lse.factory_result_index(ledger), registrations,
+                                   ledger.of_kind(lse.FACTORY_PRESCREEN), [ledger.line_sha(r["seq"]) for r in ledger.records])
     calendar = calendar or OlderCalendar()
     sessions = load_older(Path(data), reg["data_sha256"], run.symbol)
     rows, coverage = session_rows(run, module, family, sessions, calendar)
-    outcome = look(rows)
     record = {
         **target,
-        **outcome,
-        "rule": {"family": family, "feature": module},
-        "version": VERSION,
-        "boot": {"b": BOOT_B, "seed": BOOT_SEED},
+        **look(rows),
+        "boot": {"b": BOOT_B, "seed": BOOT_SEED, "block_sessions": BLOCK},
         "calendar": calendar.version,
         "coverage": {k: coverage[k] for k in ("sessions_read", "sessions_eligible", "first_eligible", "last_eligible")},
-        "looked_at": looked_at or datetime.now(timezone.utc).isoformat(),
+        "looked_at": looked_at,
     }
-    return lse.record_factory_prescreen(ledger, record, recorded_at=record["looked_at"])
+    return lse.record_factory_prescreen(ledger, record, recorded_at=looked_at)

@@ -4,8 +4,10 @@ Synthetic bars only, laid on the pinned 2018-2022 calendar. No real older data i
 
 * the look is the factory's own arithmetic on the older window, for the one registered module;
 * a planted effect passes, noise does not, and a rule that only rides a rising market fails the baseline test;
-* the trial, the store's looks and the registration are checked before the data file is opened;
-* a trial takes one look, a store takes ten, and the ledger re-checks every look on reopen;
+* a registration goes on the ledger first, reading no data; the look names it and a witnessed head;
+* the data file's bytes are hashed once and those bytes are what is queried; sidecars and repeated minutes are refused;
+* fires on neighbouring days are resampled together, and a pass cannot rest on five fires;
+* a trial is registered once, a store ten times, and the ledger re-checks every record on reopen;
 * seam: a rule selected by a real factory run on development bars is pre-screened from the ledger alone.
 """
 from __future__ import annotations
@@ -119,12 +121,20 @@ def registration(tmp_path, result_sha, data_sha, name="reg.json", **over):
     return path
 
 
+def witness(ledger, **over):
+    """The ledger's head now, as the operator would state it after seeing it off-host."""
+    return {"ledger_records": len(ledger.records), "ledger_head_sha256": ledger.head,
+            "where": "test fixture: no off-host copy exists", **over}
+
+
 def run_look(tmp_path, stores, which, ledger=None, result_sha=None, **over):
+    """Register, then look. Returns (look, ledger, registration path, registration record)."""
     if ledger is None:
         ledger, result_sha = ledger_with()
     path, data_sha = stores[which]
     reg = registration(tmp_path, result_sha, data_sha, **over)
-    return fp.prescreen(reg, path, ledger, looked_at=LOOKED), ledger, reg
+    registered = fp.register(reg, ledger, recorded_at=REGISTERED)
+    return fp.prescreen(reg, path, ledger, witness(ledger), looked_at=LOOKED), ledger, reg, registered
 
 
 # --- the calendar and the terms -------------------------------------------------------------------
@@ -145,12 +155,14 @@ def test_the_older_calendar_is_pinned_and_knows_the_closures():
 def test_the_terms_are_the_ledgers_terms():
     assert (fp.TERMS["alpha"], fp.TERMS["looks"], fp.TERMS["min_fires"]) == (0.05, 10, 40)
     assert (lse.PRESCREEN_ALPHA, lse.PRESCREEN_MAX_LOOKS, lse.PRESCREEN_MIN_FIRES) == (0.05, 10, 40)
+    assert (fp.TERMS["block_sessions"], fp.TERMS["trim_fires"], fp.TERMS["evidence"]) == (5, 5, lse.PRESCREEN_EVIDENCE)
+    assert fp.TERMS_SHA256 == hashlib.sha256(lse.canonical(fp.TERMS)).hexdigest() and fp.VERSION == "factory-prescreen/2"
 
 
-# --- the look -------------------------------------------------------------------------------------
+# --- registration first, then the look ------------------------------------------------------------
 
 
-def test_a_planted_effect_passes_and_is_on_the_ledger(tmp_path, stores):
+def test_a_planted_effect_passes_and_both_records_are_on_the_ledger(tmp_path, stores):
     lp, ap = file_ledger(tmp_path)
     ledger = lse.Ledger(lp, anchor=ap)
     lse.record_factory_declared(ledger, run_id="dev-run", run_file=DEV_RUN, data_manifest_sha256="0" * 64, trial_count=1,
@@ -158,28 +170,66 @@ def test_a_planted_effect_passes_and_is_on_the_ledger(tmp_path, stores):
     sha = lse.record_factory_result(ledger, trials=[{"trial_id": T1, "family": FAMILY, "feature": MODULE, "status": "tested",
                                                      "selected": True, "representative": True}],
                                     max_t={}, report_sha256="1" * 64, frozen_sha256="2" * 64, recorded_at=RECORDED)["sha256"]
-    out, _, reg = run_look(tmp_path, stores, "planted", ledger=ledger, result_sha=sha)
+    out, _, reg, registered = run_look(tmp_path, stores, "planted", ledger=ledger, result_sha=sha)
 
-    r = out["record"]
-    assert r["verdict"] == "pass" and r["n"] >= 40
-    assert r["lower_bound"] > 0 and r["excess_lower_bound"] > 0 and r["mean_net"] > r["baseline"]["mean_net"]
-    assert r["alpha_per_test"] == 0.005 and r["boot"] == {"b": 10000, "seed": fp.BOOT_SEED}
-    assert r["registration_sha256"] == hashlib.sha256(reg.read_bytes()).hexdigest()
+    g, r = registered["record"], out["record"]
+    assert (g["kind"], g["seq"], r["kind"], r["seq"]) == (lse.FACTORY_PRESCREEN_REGISTERED, 3, lse.FACTORY_PRESCREEN, 4)
+    assert g["registration_sha256"] == hashlib.sha256(reg.read_bytes()).hexdigest() == r["registration_sha256"]
+    assert g["prior_use"] == PRIOR_USE and g["terms_sha256"] == fp.TERMS_SHA256 and g["version"] == fp.VERSION
+    assert r["registered_sha256"] == registered["sha256"]
+    assert r["registration_witness"]["ledger_records"] == 4 and "checked by a person" in r["registration_witness"]["checked"]
+    assert r["verdict"] == "pass" and r["n"] >= 40 and r["evidence"] == lse.PRESCREEN_EVIDENCE
+    assert r["lower_bound"] > 0 and r["excess_lower_bound"] > 0 and r["trimmed_mean_net"] > 0
+    assert r["mean_net"] > r["trimmed_mean_net"] and 0 < r["top_share"] < 1 and r["mean_net"] > r["baseline"]["mean_net"]
+    assert r["alpha_per_test"] == 0.005 and r["boot"] == {"b": 10000, "seed": fp.BOOT_SEED, "block_sessions": 5}
     assert r["store"] == {"id": fp.STORE_ID, "data_sha256": stores["planted"][1], "first_session": "2018-05-01",
-                          "last_session": "2022-11-11", "fires_from": FIRES_FROM_TEST}   # the split it used, on the record
-    assert r["rule"] == {"family": FAMILY, "feature": MODULE}
+                          "last_session": "2022-11-11", "fires_from": FIRES_FROM_TEST, "previously_exposed": True}
+    assert r["rule"] == {"family": FAMILY, "feature": MODULE} == g["rule"]
     assert sum(y["n"] for y in r["by_year"].values()) == r["n"] and r["first_fire"] >= FIRES_FROM_TEST
-    assert r["calendar"] == fp.OlderCalendar().version
 
-    reopened = lse.Ledger(lp, anchor=ap)   # the chain and the look's rules re-verify from the file
+    reopened = lse.Ledger(lp, anchor=ap)   # the chain and both records' rules re-verify from the file
     pre = lse.summarize(reopened)["live"]["prescreen"]
-    assert (pre["looked"], pre["passed"], pre["failed"], pre["underpowered"]) == (1, 1, 0, 0)
-    assert pre["stores"] == {fp.STORE_ID: {"looks": 1, "left": 9}}
+    assert (pre["registered"], pre["registered_not_looked"], pre["looked"], pre["passed"]) == (1, 0, 1, 1)
+    assert pre["stores"] == {fp.STORE_ID: {"registered": 1, "left": 9}} and pre["evidence"] == lse.PRESCREEN_EVIDENCE
     assert lse.summarize(reopened)["live"]["looked"] == 0   # an older-data look is not a live verdict
 
 
+def test_registering_reads_no_data_and_a_look_needs_its_registration(tmp_path, stores, monkeypatch):
+    ledger, sha = ledger_with()
+    reg = registration(tmp_path, sha, stores["noise"][1])
+    with pytest.raises(fp.PrescreenError, match="register it first"):
+        fp.prescreen(reg, stores["noise"][0], ledger, witness(ledger))
+    monkeypatch.setattr(fp, "load_older", lambda *a, **k: pytest.fail("a registration opened the data"))
+    monkeypatch.setattr(fp, "_sealed", lambda *a, **k: pytest.fail("a registration opened the data"))
+    done = fp.register(reg, ledger)
+    assert done["record"]["kind"] == lse.FACTORY_PRESCREEN_REGISTERED
+    assert lse.summarize(ledger)["live"]["prescreen"]["registered_not_looked"] == 1
+    with pytest.raises(ValueError, match="already registered"):
+        fp.register(registration(tmp_path, sha, stores["noise"][1], name="again.json", prior_use=PRIOR_USE + " Again."), ledger)
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"ledger_head_sha256": "9" * 64}, "recorded off-host"),            # not a head of this ledger
+    ({"ledger_records": 3}, "recorded off-host"),                       # a head from before the registration
+    ({"ledger_records": 99}, "recorded off-host"),
+    ({"where": ""}, "recorded off-host"),
+])
+def test_a_look_needs_a_head_at_or_after_its_registration(tmp_path, change, message):
+    ledger, sha = ledger_with()
+    reg = registration(tmp_path, sha, "5" * 64)
+    fp.register(reg, ledger)
+    seen = witness(ledger)
+    if change.get("ledger_records") == 3:
+        seen = {**seen, "ledger_records": 3, "ledger_head_sha256": ledger.line_sha(2)}   # the result record: a true, earlier head
+    else:
+        seen = {**seen, **change}
+    with pytest.raises(ValueError, match=message):
+        fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger, seen)   # refused before the data is opened
+    assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
+
+
 def test_noise_does_not_pass(tmp_path, stores):
-    out, ledger, _ = run_look(tmp_path, stores, "noise")
+    out, ledger, _, _ = run_look(tmp_path, stores, "noise")
     assert out["record"]["verdict"] in ("fail", "underpowered")
     assert lse.summarize(ledger)["live"]["prescreen"]["passed"] == 0
 
@@ -194,9 +244,12 @@ def test_a_rule_that_only_rides_a_rising_market_fails_the_baseline(tmp_path, sto
 def test_the_same_inputs_give_the_same_look(tmp_path, stores):
     a = run_look(tmp_path, stores, "planted")[0]["record"]
     b = run_look(tmp_path, stores, "planted")[0]["record"]
-    own = ("seq", "prev_sha256", "result_sha256", "registration_sha256")   # each test ledger has its own genesis time
+    own = ("seq", "prev_sha256", "result_sha256", "registration_sha256", "registered_sha256", "registration_witness")
     assert lse.canonical({k: v for k, v in a.items() if k not in own}) == lse.canonical({k: v for k, v in b.items() if k not in own})
     assert a["lower_bound"] == b["lower_bound"] and a["excess_lower_bound"] == b["excess_lower_bound"]
+
+
+# --- the arithmetic -------------------------------------------------------------------------------
 
 
 def test_the_rows_are_the_factorys_rows(stores):
@@ -242,47 +295,90 @@ def test_a_volume_rule_is_computed_as_the_factory_computes_it(tmp_path):
     assert 5 <= sum(r["fired"] for r in rows) < len(rows) / 2   # a quiet half hour is the minority of sessions
 
 
-def test_the_bound_is_the_live_looks_bound():
-    nets = [0.1 * ((i * 7) % 11 - 4) + 0.05 for i in range(60)]
-    # gex-signals factory_slots.boot_lower(nets, 0.005, b=2000, seed=20261120), run 2026-11-20
-    assert fp.boot_lower(nets, 0.005, b=2000, seed=20261120) == 0.04499999999999999
+def test_a_skipped_window_of_the_run_changes_no_other_window_and_has_no_trial(stores):
+    """The declared run's skip_windows drop whole windows. The reduced run carries none: nothing else depends on them."""
+    skipping = {**DEV_RUN, "horizons": ["60m", "close"], "skip_windows": ["14:00+close"]}
+    ledger, sha = ledger_with(run_body=skipping)
+    cand = {"run_id": "dev-run", "trial_id": T1, "result_sha256": sha, "family": FAMILY, "feature": MODULE}
+    run, module, family = fp.candidate_run(ledger, cand)
+    assert run.skip_windows == () and run.horizons == ("60m",)
+    sessions = fp.load_older(*stores["planted"])
+    rows, _ = fp.session_rows(run, module, family, sessions, fp.OlderCalendar())
+    for body in (skipping, {**skipping, "skip_windows": []}):   # the full run with and without its skipped window
+        full = dataclasses.replace(mf.RunFile.from_dict({**body, "target_unit": "dollars"}),
+                                   first_session=fp.FIRST_SESSION, last_session=fp.LAST_SESSION)
+        families, _ = mf.build_rows(sessions, full, calendar=fp.OlderCalendar())
+        want = [(r["decision_at"][:10], r["features"][MODULE]["value"] is not None, r["target_dollars"] - 0.04)
+                for r in families[FAMILY] if r["decision_at"][:10] >= FIRES_FROM_TEST]
+        assert [(r["day"], r["fired"], r["net"]) for r in rows] == want
+    skipped, sha2 = ledger_with([{"trial_id": T1, "family": "SPY|change|14:00+close", "feature": MODULE, "status": "tested",
+                                  "selected": True, "representative": True}], run_body=skipping)
+    with pytest.raises(fp.PrescreenError, match="skipped window"):
+        fp.candidate_run(skipped, {**cand, "result_sha256": sha2, "family": "SPY|change|14:00+close"})
+
+
+# --- the look's statistics ------------------------------------------------------------------------
 
 
 def test_fewer_than_forty_fires_is_underpowered_whatever_they_made():
     rows = [{"day": f"2019-01-{i % 28 + 1:02d}", "fired": i < 39, "net": 5.0 if i < 39 else 0.0} for i in range(300)]
     out = fp.look(rows, b=200)
-    assert (out["verdict"], out["n"], out["lower_bound"], out["excess_lower_bound"]) == ("underpowered", 39, None, None)
+    assert (out["verdict"], out["n"], out["lower_bound"], out["excess_lower_bound"], out["trimmed_mean_net"]) == (
+        "underpowered", 39, None, None, None)
+
+
+def test_five_large_fires_cannot_carry_a_pass():
+    rows = [{"day": "2019-01-02", "fired": i % 5 == 0, "net": 0.0} for i in range(300)]   # 60 fires
+    fires = [r for r in rows if r["fired"]]
+    for i, r in enumerate(fires):
+        r["net"] = 50.0 if i % 12 == 0 else -0.05   # five big winners spread through the window, the rest lose a little
+    out = fp.look(rows, b=300)
+    assert out["n"] == 60 and out["mean_net"] > 4 and out["trimmed_mean_net"] == -0.05 and out["top_share"] > 1
+    assert out["verdict"] == "fail"
+
+
+def test_fires_on_neighbouring_days_are_resampled_together():
+    rnd = random.Random(3)
+    weeks = [rnd.gauss(0.3, 1.0) for _ in range(80)]   # one shock a week, shared by its five sessions
+    rows = [{"day": "2019-01-02", "fired": True, "net": weeks[i // 5]} for i in range(400)]
+    together = fp.block_bounds(rows, 0.05, b=2000, block=5)[0]
+    apart = fp.block_bounds(rows, 0.05, b=2000, block=1)[0]     # the same sessions treated as independent
+    mean = sum(r["net"] for r in rows) / len(rows)
+    assert together < apart < mean and (mean - together) > 1.7 * (mean - apart)   # about sqrt(5) wider
 
 
 def test_noise_passes_no_more_often_than_stated():
     passes = 0
     for seed in range(100):
         rnd = random.Random(seed)
-        rows = [{"day": "2019-01-02", "fired": i < 50, "net": rnd.gauss(0.0, 1.0)} for i in range(250)]
+        rows = [{"day": "2019-01-02", "fired": i % 5 == 0, "net": rnd.gauss(0.0, 1.0)} for i in range(250)]
         passes += fp.look(rows, b=300)["verdict"] == "pass"
-    assert passes <= 2   # two conditions at 0.005 each: about 0.5 expected in 100
+    assert passes <= 2   # three conditions, the bounds at 0.005 each: about 0.5 expected in 100
 
 
 # --- refusals, before any data is read ------------------------------------------------------------
 
 
 @pytest.mark.parametrize("change, message", [
-    ({"result_sha256": "9" * 64}, "must name a factory_run_result"),
-    ({"trial_id": "7" * 64}, "is not a trial of run"),
+    ({"result_sha256": "9" * 64}, "not on this ledger"),
+    ({"trial_id": "7" * 64}, "not in that result"),
     ({"feature": "F1|z>=1|long"}, "not the rule of that trial"),
     ({"terms": {**fp.TERMS, "min_fires": 20}}, "terms"),
     ({"terms": {**fp.TERMS, "alpha": 0.5}}, "terms"),
+    ({"terms": {**fp.TERMS, "version": "factory-prescreen/1"}}, "terms"),
     ({"prior_use": "none"}, "prior_use"),
     ({"schema": "factory-prescreen-registration/2"}, "schema"),
-    ({"registered_at": "2026-11-19T00:00:00+00:00"}, "predates the result"),
+    ({"registered_at": "2026-11-19T00:00:00+00:00"}, "cannot predate the result"),
     ({"data_sha256": "abc"}, "data_sha256"),
 ])
-def test_refused_before_the_data_file_is_opened(tmp_path, change, message):
+def test_a_bad_registration_is_refused_and_nothing_is_appended(tmp_path, change, message):
     ledger, sha = ledger_with()
     reg = registration(tmp_path, sha, "5" * 64, **change)
     with pytest.raises(ValueError, match=message):
-        fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger)   # a read would raise FileNotFoundError
-    assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
+        fp.register(reg, ledger)
+    with pytest.raises(ValueError):
+        fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger, witness(ledger))   # a read would raise OSError
+    assert len(ledger.records) == 3
 
 
 @pytest.mark.parametrize("trial, message", [
@@ -292,7 +388,7 @@ def test_refused_before_the_data_file_is_opened(tmp_path, change, message):
     ({"feature": "VIX|z>=1|long"}, "the older store cannot supply it"),
     ({"family": "XS|close_1d", "feature": "reversal_21d|within_sector|q10"}, "not a SPY intraday module"),
 ])
-def test_only_a_selected_representative_of_a_supported_class_gets_a_look(tmp_path, trial, message):
+def test_only_a_selected_representative_of_a_supported_class_is_registered(tmp_path, trial, message):
     body = {"trial_id": T1, "family": FAMILY, "feature": MODULE, "status": "tested", "selected": True,
             "representative": True, **trial}
     name = body["feature"].split("|")[0]
@@ -300,24 +396,71 @@ def test_only_a_selected_representative_of_a_supported_class_gets_a_look(tmp_pat
     ledger, sha = ledger_with([body], run_body=run_body)
     reg = registration(tmp_path, sha, "5" * 64, feature=body["feature"], family=body["family"])
     with pytest.raises(ValueError, match=message):
-        fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger)
+        fp.register(reg, ledger)
+    assert len(ledger.records) == 3
 
 
-def test_the_data_file_must_be_the_registered_one_and_hold_no_development_session(tmp_path, stores):
+# --- the data file --------------------------------------------------------------------------------
+
+
+def registered_ledger(tmp_path, data_sha, name="reg.json"):
     ledger, sha = ledger_with()
-    path = stores["noise"][0]
-    with pytest.raises(fp.PrescreenError, match="not the registered one"):
-        fp.prescreen(registration(tmp_path, sha, "5" * 64), path, ledger)
+    reg = registration(tmp_path, sha, data_sha, name=name)
+    fp.register(reg, ledger)
+    return ledger, reg
+
+
+def test_the_bytes_that_are_hashed_are_the_bytes_that_are_queried(tmp_path, stores, monkeypatch):
+    path, data_sha = stores["noise"]
+    ledger, reg = registered_ledger(tmp_path, data_sha)
+    opened = []
+    real = fp.sqlite3.connect
+    monkeypatch.setattr(fp.sqlite3, "connect", lambda target, *a, **k: (opened.append(str(target)), real(target, *a, **k))[1])
+    fp.prescreen(reg, path, ledger, witness(ledger), looked_at=LOOKED)
+    assert opened and all(str(path) not in target for target in opened)   # never a second open of the path
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_a_sidecar_beside_the_data_file_is_refused(tmp_path, suffix):
+    db = tmp_path / "bars.db"
+    data_sha = make_older(db, older_days(3))
+    (tmp_path / f"bars.db{suffix}").write_bytes(b"x")
+    with pytest.raises(fp.PrescreenError, match="sidecar"):
+        fp.load_older(db, data_sha)
+
+
+def test_a_wal_mode_file_a_repeated_minute_and_a_development_session_are_refused(tmp_path):
+    wal = tmp_path / "wal.db"
+    make_older(wal, older_days(3))
+    con = sqlite3.connect(wal)
+    con.execute("pragma journal_mode=wal")
+    con.execute("insert into bars values ('SPY', '2018-05-04', '09:30', 1, 1, 1, 1, 1)")
+    con.commit()
+    con.close()   # the last connection checkpoints and removes the sidecars; the header still says WAL
+    assert not (tmp_path / "wal.db-wal").exists()
+    with pytest.raises(fp.PrescreenError, match="WAL mode"):
+        fp.load_older(wal, hashlib.sha256(wal.read_bytes()).hexdigest())
+
+    twice = tmp_path / "twice.db"
+    con = sqlite3.connect(twice)
+    con.execute("create table bars (sym text, day text, hm text, o real, h real, l real, c real, v integer)")   # no key
+    for close in (1.0, 2.0):
+        con.execute("insert into bars values ('SPY', '2018-05-01', '09:30', 1, 1, 1, ?, 1)", (close,))
+    con.commit()
+    con.close()
+    with pytest.raises(fp.PrescreenError, match="two rows for SPY 2018-05-01 09:30"):
+        fp.load_older(twice, hashlib.sha256(twice.read_bytes()).hexdigest())
+
     dev = tmp_path / "dev.db"
     make_older(dev, older_days(3))
     con = sqlite3.connect(dev)
     con.execute("insert into bars values ('SPY', '2022-11-14', '09:30', 1, 1, 1, 1, 1)")
     con.commit()
     con.close()
-    dev_sha = hashlib.sha256(dev.read_bytes()).hexdigest()
     with pytest.raises(fp.PrescreenError, match="development sessions refused"):
-        fp.prescreen(registration(tmp_path, sha, dev_sha, name="dev.json"), dev, ledger)
-    assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
+        fp.load_older(dev, hashlib.sha256(dev.read_bytes()).hexdigest())
+    with pytest.raises(fp.PrescreenError, match="not the registered one"):
+        fp.load_older(dev, "5" * 64)
 
 
 def test_the_factory_still_refuses_the_older_window():
@@ -325,22 +468,14 @@ def test_the_factory_still_refuses_the_older_window():
         mf.RunFile.from_dict({**DEV_RUN, "first_session": fp.FIRST_SESSION})
 
 
-def test_a_trial_takes_one_look(tmp_path, stores):
-    out, ledger, _ = run_look(tmp_path, stores, "noise")
-    sha = out["record"]["result_sha256"]
-    with pytest.raises(ValueError, match="already had its pre-screen look"):
-        fp.prescreen(registration(tmp_path, sha, stores["planted"][1], name="again.json"), stores["planted"][0], ledger)
+def test_a_registration_takes_one_look(tmp_path, stores):
+    out, ledger, reg, _ = run_look(tmp_path, stores, "noise")
+    with pytest.raises(ValueError, match="already had its look"):
+        fp.prescreen(reg, stores["noise"][0], ledger, witness(ledger))
     assert len(ledger.of_kind(lse.FACTORY_PRESCREEN)) == 1
 
 
 # --- the ledger's own rules -----------------------------------------------------------------------
-
-
-def outcome(result_sha, trial_id, **over):
-    return {"run_id": "dev-run", "trial_id": trial_id, "result_sha256": result_sha, "registration_sha256": "3" * 64,
-            "store": {"id": fp.STORE_ID, "data_sha256": "4" * 64}, "verdict": "fail", "n": 60, "mean_net": 0.01,
-            "lower_bound": -0.2, "excess_mean": 0.0, "excess_lower_bound": -0.3, "alpha_per_test": 0.005,
-            "looked_at": LOOKED, **over}
 
 
 def many_trials(n):
@@ -348,40 +483,59 @@ def many_trials(n):
             for i in range(1, n + 1)]
 
 
-def test_a_store_takes_ten_looks_ever():
+def reg_record(result_sha, trial_id, **over):
+    return {"run_id": "dev-run", "trial_id": trial_id, "result_sha256": result_sha, "registration_sha256": "3" * 64,
+            "rule": {"family": FAMILY, "feature": MODULE}, "store": {"id": fp.STORE_ID, "data_sha256": "4" * 64},
+            "version": fp.VERSION, "terms_sha256": fp.TERMS_SHA256, "prior_use": PRIOR_USE, "registered_at": REGISTERED, **over}
+
+
+def outcome(ledger, registered, **over):
+    g = registered["record"]
+    base = {k: g[k] for k in ("run_id", "trial_id", "result_sha256", "registration_sha256", "rule", "store", "version", "terms_sha256")}
+    return {**base, "registered_sha256": registered["sha256"], "registration_witness": witness(ledger), "verdict": "fail",
+            "n": 60, "mean_net": 0.01, "lower_bound": -0.2, "excess_mean": 0.0, "excess_lower_bound": -0.3,
+            "trimmed_mean_net": -0.01, "alpha_per_test": 0.005, "evidence": lse.PRESCREEN_EVIDENCE, "looked_at": LOOKED, **over}
+
+
+def test_a_store_takes_ten_registrations_ever():
     ledger, sha = ledger_with(many_trials(12))
     for i in range(1, 11):
-        lse.record_factory_prescreen(ledger, outcome(sha, f"{i:064x}"))
-    with pytest.raises(ValueError, match="has had its 10 looks"):
-        lse.record_factory_prescreen(ledger, outcome(sha, f"{11:064x}"))
-    assert lse.summarize(ledger)["live"]["prescreen"]["stores"][fp.STORE_ID] == {"looks": 10, "left": 0}
-    lse.record_factory_prescreen(ledger, outcome(sha, f"{11:064x}", store={"id": "another-store", "data_sha256": "6" * 64}))
+        lse.record_factory_prescreen_registered(ledger, reg_record(sha, f"{i:064x}"))
+    with pytest.raises(ValueError, match="has had its 10 registrations"):
+        lse.record_factory_prescreen_registered(ledger, reg_record(sha, f"{11:064x}"))
+    assert lse.summarize(ledger)["live"]["prescreen"]["stores"][fp.STORE_ID] == {"registered": 10, "left": 0}
+    lse.record_factory_prescreen_registered(
+        ledger, reg_record(sha, f"{11:064x}", store={"id": "another-store", "data_sha256": "6" * 64}))
+    with pytest.raises(ValueError, match="cannot change between looks"):
+        ledger2, sha2 = ledger_with(many_trials(2))
+        lse.record_factory_prescreen_registered(ledger2, reg_record(sha2, f"{1:064x}"))
+        lse.record_factory_prescreen_registered(
+            ledger2, reg_record(sha2, f"{2:064x}", store={"id": fp.STORE_ID, "data_sha256": "8" * 64}))
 
 
 @pytest.mark.parametrize("change, message", [
-    ({"verdict": "pass"}, "both lower bounds are above zero"),
-    ({"verdict": "pass", "lower_bound": 0.1}, "both lower bounds are above zero"),
-    ({"lower_bound": 0.1, "excess_lower_bound": 0.1}, "both lower bounds are above zero"),
+    ({"verdict": "pass"}, "both lower bounds and the trimmed mean are above zero"),
+    ({"verdict": "pass", "lower_bound": 0.1, "excess_lower_bound": 0.1}, "trimmed mean are above zero"),   # rests on five fires
+    ({"verdict": "pass", "lower_bound": 0.1, "trimmed_mean_net": 0.1}, "above zero"),                      # no better than always-on
+    ({"lower_bound": 0.1, "excess_lower_bound": 0.1, "trimmed_mean_net": 0.1}, "above zero"),               # a pass called a fail
     ({"verdict": "underpowered"}, "fewer than 40"),
     ({"n": 39}, "need 40 fires"),
-    ({"excess_lower_bound": None}, "need 40 fires and both lower bounds"),
+    ({"trimmed_mean_net": None}, "need 40 fires, both lower bounds and the trimmed mean"),
     ({"alpha_per_test": 0.05}, "per-look alpha is fixed"),
-    ({"store": {"id": fp.STORE_ID, "data_sha256": "xyz"}}, "sha256 of the data file"),
-    ({"registration_sha256": None}, "registration file"),
-    ({"looked_at": "2026-11-19T00:00:00+00:00"}, "cannot predate"),
+    ({"evidence": "independent evidence"}, "is labelled"),
+    ({"registered_sha256": "9" * 64}, "must name its registration record"),
+    ({"registration_sha256": "9" * 64}, "is not its registration's"),
+    ({"rule": {"family": FAMILY, "feature": "F1|z>=1|long"}}, "rule of its trial"),
+    ({"store": {"id": fp.STORE_ID, "data_sha256": "8" * 64}}, "store or data file is not its registration's"),
+    ({"looked_at": "2026-11-20T02:59:59+00:00"}, "cannot predate"),
 ])
 def test_the_ledger_refuses_a_look_that_breaks_the_rules(change, message):
     ledger, sha = ledger_with()
+    registered = lse.record_factory_prescreen_registered(ledger, reg_record(sha, T1), recorded_at=REGISTERED)
     with pytest.raises(ValueError, match=message):
-        lse.record_factory_prescreen(ledger, outcome(sha, T1, **change))
+        lse.record_factory_prescreen(ledger, outcome(ledger, registered, **change))
     assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
-
-
-def test_a_stores_data_file_cannot_change_between_looks():
-    ledger, sha = ledger_with(many_trials(2))
-    lse.record_factory_prescreen(ledger, outcome(sha, f"{1:064x}"))
-    with pytest.raises(ValueError, match="cannot change between looks"):
-        lse.record_factory_prescreen(ledger, outcome(sha, f"{2:064x}", store={"id": fp.STORE_ID, "data_sha256": "8" * 64}))
+    lse.record_factory_prescreen(ledger, outcome(ledger, registered))   # and the honest look is taken
 
 
 def test_reopening_applies_the_rules_not_only_the_hash_chain(tmp_path, monkeypatch):
@@ -391,39 +545,49 @@ def test_reopening_applies_the_rules_not_only_the_hash_chain(tmp_path, monkeypat
                                 recorded_at="2026-11-19T15:57:57+00:00")
     sha = lse.record_factory_result(ledger, trials=many_trials(1), max_t={}, report_sha256="1" * 64,
                                     frozen_sha256="2" * 64, recorded_at=RECORDED)["sha256"]
+    registered = lse.record_factory_prescreen_registered(ledger, reg_record(sha, f"{1:064x}"), recorded_at=REGISTERED)
+    lse.Ledger(lp, anchor=ap)   # a registration alone reopens
     with monkeypatch.context() as patch:   # a writer that skipped the rules: the chain and anchor are valid
         patch.setattr(lse, "validate_factory_prescreen", lambda *a, **k: None)
-        lse.record_factory_prescreen(ledger, outcome(sha, f"{1:064x}", verdict="pass"))
-    with pytest.raises(ValueError, match="both lower bounds are above zero"):
+        lse.record_factory_prescreen(ledger, outcome(ledger, registered, verdict="pass"))
+    with pytest.raises(ValueError, match="above zero"):
         lse.Ledger(lp, anchor=ap)
 
 
-def test_an_s11_ledger_takes_no_look():
+def test_an_s11_ledger_takes_no_registration_and_no_look():
     s11 = lse.Ledger.create(None, catalog=lse.synthetic_catalog(), ledger_id="s11-test")
     with pytest.raises(ValueError, match="factory ledger"):
-        lse.record_factory_prescreen(s11, outcome("9" * 64, T1))
+        lse.record_factory_prescreen_registered(s11, reg_record("9" * 64, T1))
+    with pytest.raises(ValueError, match="factory ledger"):
+        lse.record_factory_prescreen(s11, {"kind": lse.FACTORY_PRESCREEN})
 
 
-# --- seam: a real factory run on development bars, then the look, from the ledger alone -----------------
+# --- seam: a real factory run on development bars, then register and look, by the commands alone ---------
 
 
-def test_a_rule_the_factory_selected_is_prescreened_from_the_ledger(tmp_path, stores, capsys):
+def test_a_rule_the_factory_selected_is_registered_and_prescreened_by_command(tmp_path, stores, capsys):
     data, days = staged(tmp_path, plant=0.9)
     rf, _ = run_file(tmp_path, days)
     lp, ap = file_ledger(tmp_path)
     rep = mf.run(rf, data, lse.Ledger(lp, anchor=ap), tmp_path / "out")
     top = rep["ranking"][0]
     assert top["selected"] and (top["family"], top["feature"]) == (FAMILY, MODULE)
-    ledger = lse.Ledger(lp, anchor=ap)
-    result_sha = next(iter(lse.factory_result_index(ledger)))
+    result_sha = next(iter(lse.factory_result_index(lse.Ledger(lp, anchor=ap))))
     path, data_sha = stores["planted"]
     reg = registration(tmp_path, result_sha, data_sha, run_id="factory-test-1", trial_id=top["trial_id"],
                        registered_at="2100-01-01T00:00:00+00:00")
+    paths = ["--registration", str(reg), "--ledger", str(lp), "--anchor", str(ap)]
+    look_args = ["prescreen", *paths, "--data", str(path), "--witness-where", "test fixture: no off-host copy"]
 
-    args = ["prescreen", "--registration", str(reg), "--data", str(path), "--ledger", str(lp), "--anchor", str(ap)]
-    assert mf.main(args) == 0
+    assert mf.main([*look_args, "--witness-records", "3", "--witness-head", "0" * 64]) == 2   # not registered yet
+    assert "register it first" in json.loads(capsys.readouterr().out)["refused"]
+    assert mf.main(["prescreen-register", *paths]) == 0
+    done = json.loads(capsys.readouterr().out)
+    assert done["ok"] and done["seq"] == 3 and done["records"] == 4 and done["rule"] == {"family": FAMILY, "feature": MODULE}
+    seen = ["--witness-records", str(done["records"]), "--witness-head", done["head_sha256"]]
+    assert mf.main([*look_args, *seen]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["ok"] and out["verdict"] == "pass" and out["looks_left"] == 9
-    assert mf.main(args) == 2   # a second look at the same trial is refused
-    assert "already had its pre-screen look" in json.loads(capsys.readouterr().out)["refused"]
+    assert out["ok"] and out["verdict"] == "pass" and out["registrations_left"] == 9 and out["evidence"] == lse.PRESCREEN_EVIDENCE
+    assert mf.main([*look_args, *seen]) == 2   # a second look at the same registration is refused
+    assert "already had its look" in json.loads(capsys.readouterr().out)["refused"]
     assert lse.summarize(lse.Ledger(lp, anchor=ap))["live"]["prescreen"]["passed"] == 1
