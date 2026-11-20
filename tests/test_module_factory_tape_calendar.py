@@ -485,8 +485,9 @@ def test_forward_xnys_part_is_the_live_recorder_manifest_sliced(tmp_path):
     research = json.loads((MANIFESTS / fc.PINS[-2][0]).read_bytes())
     shared = [s for s in json.loads(live)["sessions"] if s["key"].split(":")[1] <= research["end"]]
     assert shared and shared == [s for s in research["sessions"] if s["key"].split(":")[1] >= "2026-10-01"]
-    assert fc.FactoryCalendar(private_calendars(tmp_path)).sessions[-1].key == "XNYS:2026-11-10:RTH"  # research
-    cal = fc.FactoryCalendar(private_calendars(tmp_path), pins=fc.PINS)
+    calendars = private_calendars(tmp_path)
+    assert fc.FactoryCalendar(calendars).sessions[-1].key == "XNYS:2026-11-10:RTH"  # research default
+    cal = fc.FactoryCalendar(calendars, pins=fc.PINS)
     assert cal.previous_day("2026-11-11") == "2026-11-10"
     assert cal.for_day("2026-11-26") is None  # Thanksgiving
     assert cal.previous_day("2026-11-27") == "2026-11-25"
