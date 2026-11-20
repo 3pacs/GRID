@@ -133,6 +133,12 @@ PANEL_TRIALS_NOT_NAMED = (
     "its head is unknown tonight, not unchanged"
 )
 PANEL_FACTORY_FAMILY = "panel-factory"
+# Receipt versions. A receipt without ``receipt_version`` is version 1: the three original sources, the shape the
+# first consumer reads strictly. Version 2 adds the ``panel_trials`` source and says so on the record, so a consumer
+# can tell the two apart and one log can hold both.
+RECEIPT_V2 = 2
+V2_SOURCES = frozenset({"panel_trials"})
+FACTORY_TABLES = ("factory_feature_values", "factory_fires", "factory_outcomes", "factory_looks")
 
 
 class ReceiptError(RuntimeError):
@@ -351,20 +357,43 @@ def sleuth_leads_source(engine: Any, lookback_days: int = LEAD_LOOKBACK_DAYS) ->
     return read
 
 
-def panel_trials_source(db: Path | None) -> Source:
+def panel_chain_extends(previous: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
+    """True when ``current``'s trial chain is ``previous``'s chain with rows added at the end, or nothing changed.
+
+    The head of the live trial ledger moves when a trial is registered. That is a verified relationship only when
+    every row hash the earlier receipt read is still there, in the same order, at the start of the chain.
+    """
+    if previous is None:
+        return True
+    before, now = previous.get("row_hashes"), current.get("row_hashes")
+    return isinstance(before, list) and isinstance(now, list) and now[:len(before)] == before
+
+
+def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any] | None] | None = None) -> Source:
     """The live trial ledger: gex-signals' ``panel_trials`` table (SQLite), where
     every forward test is registered before it records, and ``factory_looks``,
     where a factory slot's one look is stored (3pacs/GRID#1162).
 
-    One read-only transaction. The payload holds the chain's head and row
-    count, the trials per family, each ``panel-factory`` slot's registration
-    hash, and the sha256 of each stored look. With the nightly hub post this
-    puts the head off-host every session, so a registration or a look that is
-    later edited or removed no longer matches a head this host cannot rewrite.
+    One read-only transaction. The payload holds the chain's head, row count
+    and every row hash, the trials per family, each ``panel-factory`` slot's
+    registration hash, and for each stored look its time, last day and the
+    sha256 of its exact stored text. That digest and the registration hash are
+    what a slot's exported verdict is joined on; the head is only where the
+    chain stood. With the nightly hub post this puts all of it off-host every
+    session.
 
-    What is checked here: each row's ``prev_hash`` is the row before it. What
-    is not: a row's hash is not recomputed from its fields. That recipe lives
-    in gex-signals (``panel.verify_trials``) and is not copied into GRID.
+    What is proved, and it is limited (``proof: row_links_only``): each row's
+    ``prev_hash`` is the row before it. A row's hash is not recomputed from its
+    fields; that recipe lives in gex-signals (``panel.verify_trials``) and is
+    not copied into GRID.
+
+    Unknown, never a guessed head, when: no database is named; the file or
+    table cannot be read; a row does not link to the one before it; some
+    factory tables exist and ``factory_looks`` does not (a generation that has
+    the tables has all of them); or the chain no longer starts with the rows
+    the last receipt read (``previous``: the last recorded payload).
+    A database from before the factory tables has ``factory_looks_table:
+    "absent"``, which is not the same as a table that is there and empty.
     """
 
     def read(_cutoff: datetime) -> SourceRead:
@@ -380,9 +409,8 @@ def panel_trials_source(db: Path | None) -> Source:
                 "SELECT seq, trial_id, family, registered_at, prev_hash, row_hash "
                 "FROM panel_trials ORDER BY seq"
             ).fetchall()
-            has_looks = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'factory_looks'"
-            ).fetchone() is not None
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            has_looks = "factory_looks" in tables
             looks = conn.execute(
                 "SELECT trial_id, looked_at, through_day, result FROM factory_looks ORDER BY trial_id"
             ).fetchall() if has_looks else None
@@ -390,17 +418,21 @@ def panel_trials_source(db: Path | None) -> Source:
             raise SourceUnavailable(f"the live trial ledger could not be read ({type(exc).__name__})") from None
         finally:
             conn.close()
-        previous = None
+        if not has_looks and any(name in tables for name in FACTORY_TABLES):
+            raise SourceUnavailable("some factory tables are there and factory_looks is not: an incomplete generation")
+        previous_hash = None
         families: dict[str, int] = {}
         for seq, _trial, family, _registered, prev_hash, row_hash in trials:
-            if prev_hash != previous or not (isinstance(row_hash, str) and len(row_hash) == 64):
+            if prev_hash != previous_hash or not (isinstance(row_hash, str) and len(row_hash) == 64):
                 raise SourceUnavailable(f"the live trial ledger's hash links are broken at row {seq}")
-            previous = row_hash
+            previous_hash = row_hash
             families[family or "none"] = families.get(family or "none", 0) + 1
         payload = {
             "store": "panel_trials",
             "rows": len(trials),
-            "head": previous,
+            "head": previous_hash,
+            "row_hashes": [t[5] for t in trials],
+            "proof": "row_links_only",
             "links_checked": True,
             "row_hashes_recomputed": False,
             "families": dict(sorted(families.items())),
@@ -408,16 +440,19 @@ def panel_trials_source(db: Path | None) -> Source:
                 {"trial_id": t[1], "registered_at": t[3], "row_hash": t[5]}
                 for t in trials if t[2] == PANEL_FACTORY_FAMILY
             ],
+            "factory_looks_table": "present" if has_looks else "absent",
             "factory_looks": None if looks is None else [
                 {"trial_id": row[0], "looked_at": row[1], "through_day": row[2],
                  "result_sha256": sha256_hex(str(row[3]).encode("utf-8"))}
                 for row in looks
             ],
         }
+        if previous is not None and not panel_chain_extends(previous(), payload):
+            raise SourceUnavailable("the live trial ledger no longer starts with the rows the last receipt read")
         return SourceRead(payload=payload, rows=len(trials),
                           scope={"database": Path(db).name, "snapshot": "one read-only transaction",
                                  "state": "as read; not limited to the session close",
-                                 "row_hashes": "linked here; recomputed only by gex-signals"})
+                                 "proof": "row links only; row hashes are recomputed only by gex-signals"})
 
     return read
 
@@ -455,6 +490,14 @@ class ReceiptLog:
         for record in self.records():
             if record.get("kind") == "receipt" and record.get("session") == key:
                 return record
+        return None
+
+    def last_payload(self, source: str) -> dict | None:
+        """The payload of ``source`` in the latest receipt that read it; None when no receipt has."""
+        for record in reversed(self.records()):
+            entry = (record.get("sources") or {}).get(source) if record.get("kind") == "receipt" else None
+            if isinstance(entry, dict) and entry.get("status") == STATUS_READ:
+                return json.loads(self.payload(entry["payload_sha256"]))
         return None
 
     def payload(self, sha256: str) -> bytes:
@@ -586,6 +629,8 @@ class ReceiptLog:
                 "sources": entries,
                 "promotion_allowed": False,
             }
+            if V2_SOURCES & set(entries):
+                body["receipt_version"] = RECEIPT_V2
             written = self._append(body, started)
         return {"written": True, "record": written, "recovered_anchor": recovered}
 
@@ -838,6 +883,14 @@ def _check_receipt(record: dict, sessions: set[str], last_cutoff: str | None) ->
     sources = record.get("sources")
     if not isinstance(sources, dict) or not sources:
         return "no sources"
+    version = record.get("receipt_version")
+    if version is None:
+        if V2_SOURCES & set(sources):
+            return "a version 1 receipt carries a version 2 source"
+    elif version != RECEIPT_V2:
+        return f"unknown receipt version {version!r}"
+    elif not V2_SOURCES & set(sources):
+        return "a version 2 receipt without its version 2 source"
     for name, source in sources.items():
         status = source.get("status") if isinstance(source, dict) else None
         if isinstance(source, dict) and ("read_started_at" in source or "read_finished_at" in source):
@@ -872,13 +925,17 @@ def _broken(n: int, index: int, detail: str) -> dict:
 
 
 def default_sources(engine: Any, factory_ledger: Path, factory_anchor: Path,
-                    panel_trials_db: Path | None = None) -> dict[str, Source]:
-    return {
+                    panel_trials_db: Path | None = None,
+                    previous_panel: Callable[[], Mapping[str, Any] | None] | None = None) -> dict[str, Source]:
+    """The version 1 sources; with ``panel_trials_db``, the version 2 set (a fourth source, marked on the record)."""
+    sources = {
         "factory_ledger": factory_ledger_source(factory_ledger, factory_anchor),
         "sleuth_leads": sleuth_leads_source(engine),
         "thesis_log": thesis_log_source(),
-        "panel_trials": panel_trials_source(panel_trials_db),
     }
+    if panel_trials_db is not None:
+        sources["panel_trials"] = panel_trials_source(panel_trials_db, previous_panel)
+    return sources
 
 
 def _summary(record: dict) -> dict:
@@ -901,7 +958,8 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--factory-ledger", type=Path, required=True)
     rec.add_argument("--factory-anchor", type=Path, required=True)
     rec.add_argument("--panel-trials-db", type=Path,
-                     help="gex-signals signals.db; without it the live trial ledger is recorded as unknown")
+                     help="gex-signals signals.db; with it the receipt is version 2 (a fourth source, panel_trials); "
+                          "without it the receipt is version 1, as before")
     rec.add_argument("--session", type=date.fromisoformat)
     ver = sub.add_parser("verify", help="check the chain, anchors and payloads")
     ver.add_argument("--dir", type=Path, required=True)
@@ -950,7 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     from db import get_engine
 
-    sources = default_sources(get_engine(), args.factory_ledger, args.factory_anchor, args.panel_trials_db)
+    sources = default_sources(get_engine(), args.factory_ledger, args.factory_anchor, args.panel_trials_db,
+                              lambda: log.last_payload("panel_trials"))
     try:
         result = log.record(sources, session=args.session)
     except ReceiptError as exc:

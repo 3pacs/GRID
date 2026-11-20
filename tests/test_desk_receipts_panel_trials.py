@@ -69,6 +69,8 @@ def test_the_head_the_families_the_slots_and_the_looks_are_read(tmp_path):
     assert (look["trial_id"], look["looked_at"], look["through_day"]) == ("T-PF-01", "2027-03-01T21:10:00+00:00", "2027-03-01")
     assert look["result_sha256"] == hashlib.sha256(b'{"n": 100, "verdict": "PASS"}').hexdigest()
     assert p["links_checked"] is True and p["row_hashes_recomputed"] is False   # says what was not checked
+    assert p["proof"] == "row_links_only" and "row links only" in read.scope["proof"]
+    assert p["row_hashes"] == [_hash(1), _hash(2), _hash(3)] and p["factory_looks_table"] == "present"
     assert read.scope["database"] == "signals.db"
 
 
@@ -78,8 +80,18 @@ def test_an_empty_ledger_is_a_read_of_zero_rows(tmp_path):
     assert read.rows == 0 and read.payload["head"] is None and read.payload["factory_looks"] == []
 
 
-def test_a_database_from_before_the_looks_table_says_the_looks_are_not_there(tmp_path):
-    assert _read(_db(tmp_path / "signals.db", looks=None)).payload["factory_looks"] is None
+def test_a_missing_looks_table_is_not_an_empty_one(tmp_path):
+    before = _read(_db(tmp_path / "before.db", looks=None)).payload      # a database from before the factory tables
+    empty = _read(_db(tmp_path / "empty.db", looks=False)).payload       # the table is there and holds nothing
+    assert (before["factory_looks_table"], before["factory_looks"]) == ("absent", None)
+    assert (empty["factory_looks_table"], empty["factory_looks"]) == ("present", [])
+    half = _db(tmp_path / "half.db", looks=None)                         # a generation with factory tables but not this one
+    conn = sqlite3.connect(half)
+    conn.execute("CREATE TABLE factory_fires (trial_id TEXT, day TEXT)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(dsr.SourceUnavailable, match="incomplete generation"):
+        _read(half)
 
 
 @pytest.mark.parametrize("damage", [
@@ -138,14 +150,82 @@ def test_a_new_registration_changes_the_head_the_next_receipt_holds(tmp_path):
     assert log.verify(full=True)["ok"]
 
 
-def test_without_a_named_database_the_receipt_says_unknown(tmp_path):
-    sources = dsr.default_sources(None, tmp_path / "l.jsonl", tmp_path / "a.jsonl")
-    assert list(sources) == ["factory_ledger", "sleuth_leads", "thesis_log", "panel_trials"]
+def test_a_rewritten_chain_is_unknown_and_an_extended_one_is_read(tmp_path):
+    db = _db(tmp_path / "signals.db")
+    log = dsr.ReceiptLog(tmp_path / "log")
+    source = dsr.panel_trials_source(db, lambda: log.last_payload("panel_trials"))
+    assert log.last_payload("panel_trials") is None
+    first = log.record({"panel_trials": source}, now=lambda: WED_CLOSE + timedelta(minutes=30))["record"]
+    assert first["sources"]["panel_trials"]["status"] == "read" and log.last_payload("panel_trials")["head"] == _hash(3)
+
+    conn = sqlite3.connect(db)   # the last row replaced by another: same length, a different chain
+    conn.execute("UPDATE panel_trials SET row_hash = ? WHERE seq = 3", (_hash(99),))
+    conn.commit()
+    conn.close()
+    second = log.record({"panel_trials": source}, now=lambda: THU_CLOSE + timedelta(minutes=30))["record"]["sources"]["panel_trials"]
+    assert second["status"] == "unknown" and "no longer starts with the rows the last receipt read" in second["reason"]
+    assert log.last_payload("panel_trials")["head"] == _hash(3)   # the last head that was read, not a guess
+    assert log.verify(full=True)["ok"]
+
+
+def test_chain_extension_is_a_prefix_relation():
+    a = {"row_hashes": ["1", "2"]}
+    assert dsr.panel_chain_extends(None, a) and dsr.panel_chain_extends(a, a)
+    assert dsr.panel_chain_extends(a, {"row_hashes": ["1", "2", "3"]})
+    assert not dsr.panel_chain_extends(a, {"row_hashes": ["1", "9", "3"]})    # a row replaced
+    assert not dsr.panel_chain_extends(a, {"row_hashes": ["1"]})              # a row removed
+    assert not dsr.panel_chain_extends(a, {"head": "x"})                      # a payload without the hashes
+
+
+def test_the_fourth_source_makes_a_version_2_receipt_and_one_log_replays_both(tmp_path):
+    db = _db(tmp_path / "signals.db")
+    v1 = dsr.default_sources(None, tmp_path / "l.jsonl", tmp_path / "a.jsonl")
+    v2 = dsr.default_sources(None, tmp_path / "l.jsonl", tmp_path / "a.jsonl", db)
+    assert list(v1) == ["factory_ledger", "sleuth_leads", "thesis_log"]                    # exactly what version 1 always had
+    assert list(v2) == ["factory_ledger", "sleuth_leads", "thesis_log", "panel_trials"]
+    log = dsr.ReceiptLog(tmp_path / "log")
+    fri_close = datetime(2026, 11, 20, 21, 0, tzinfo=UTC)
+    keep = ("thesis_log", "panel_trials")   # the two that need no database or ledger file
+
+    def record(sources, close):
+        at = close + timedelta(minutes=30)
+        return log.record({k: v for k, v in sources.items() if k in keep}, now=lambda: at)["record"]
+
+    one, two, three = record(v1, WED_CLOSE), record(v2, THU_CLOSE), record(v1, fri_close)   # the source off, on, off again
+    assert "receipt_version" not in one and "receipt_version" not in three and two["receipt_version"] == 2
+    assert set(one["sources"]) == set(three["sources"]) == {"thesis_log"} and set(two["sources"]) == {"thesis_log", "panel_trials"}
+    check = log.verify(full=True)
+    assert check["ok"] and check["receipts"] == 3
+    # what a strict version 1 consumer needs: a receipt without receipt_version never carries the new source
+    for record_ in log.records():
+        if record_.get("kind") == "receipt" and "receipt_version" not in record_:
+            assert "panel_trials" not in record_["sources"]
+
+
+@pytest.mark.parametrize("forge, detail", [
+    (lambda body: body.pop("receipt_version"), "a version 1 receipt carries a version 2 source"),
+    (lambda body: body.update(receipt_version=3), "unknown receipt version 3"),
+    (lambda body: body["sources"].pop("panel_trials"), "a version 2 receipt without its version 2 source"),
+])
+def test_a_receipt_whose_version_and_sources_disagree_fails_verification(tmp_path, monkeypatch, forge, detail):
+    db = _db(tmp_path / "signals.db")
+    log = dsr.ReceiptLog(tmp_path / "log")
+    real = log._append
+
+    def forged(body, at):
+        forge(body)
+        return real(body, at)
+    monkeypatch.setattr(log, "_append", forged)
+    at = WED_CLOSE + timedelta(minutes=30)
+    log.record({"panel_trials": dsr.panel_trials_source(db), "thesis_log": dsr.thesis_log_source()}, now=lambda: at)
+    check = log.verify()
+    assert not check["ok"] and detail in check["detail"]
+
+
+def test_an_unnamed_database_is_unknown_when_the_source_is_asked_for_directly(tmp_path):
     log = dsr.ReceiptLog(tmp_path / "log")
     at = WED_CLOSE + timedelta(minutes=30)
-
-    entry = log.record({"panel_trials": sources["panel_trials"]}, now=lambda: at)["record"]["sources"]["panel_trials"]
-
+    entry = log.record({"panel_trials": dsr.panel_trials_source(None)}, now=lambda: at)["record"]["sources"]["panel_trials"]
     assert entry["status"] == "unknown" and entry["failure"] == "SourceUnavailable" and "--panel-trials-db" in entry["reason"]
     assert "payload_sha256" not in entry
 
