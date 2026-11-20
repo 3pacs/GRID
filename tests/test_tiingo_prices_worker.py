@@ -78,7 +78,8 @@ class _FakeIncremental(TiingoPuller):
         time.sleep(self.fetch_delay_s)
         with self._mu:
             self.in_flight -= 1
-        return {"ticker": ticker, "status": "SUCCESS", "rows_inserted": 6, "errors": []}
+        return {"ticker": ticker, "status": "SUCCESS", "rows_inserted": 6, "errors": [],
+                "latest_obs": _SESSION}
 
 
 # Tuesday 2026-09-29, 20:00 ET (EDT): that day's EOD bar should exist.
@@ -359,7 +360,7 @@ def test_tiingo_has_its_own_weekday_utc_slot(monkeypatch) -> None:
     assert len(daily_groups) == 5
     domestic = [j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls]
     assert len(domestic) == 28
-    assert {j.job_func.keywords["slot"] for j in domestic} == {"13:30", "16:00", "20:00", "22:00"}
+    assert {j.job_func.keywords["slot"] for j in domestic} == {"09:30", "16:00", "20:00", "22:00"}
 
 
 def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) -> None:
@@ -367,7 +368,7 @@ def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) 
     jobs = _registered_jobs(monkeypatch)
     tiingo_job = next(j for j in jobs.jobs if j.job_func.func is sched.start_tiingo_prices_worker)
     options_job = next(j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls
-                       and j.job_func.keywords["slot"] == "13:30")
+                       and j.job_func.keywords["slot"] == "09:30")
     group_job = next(j for j in jobs.jobs if j.job_func.func is sched.run_pull_group
                      and j.job_func.args[0] == "daily")
     release = threading.Event()
@@ -383,7 +384,7 @@ def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) 
     monkeypatch.setattr(sched, "run_tiingo_prices",
                         lambda engine, puller=None: _SlowTiingo().pull_incremental())
     monkeypatch.setattr(sched, "run_daily_pulls",
-                        lambda start_date=None, slot=None: ran.append(f"domestic@{slot}"))
+                        lambda start_date=None, slot=None, slot_tz=None: ran.append(f"domestic@{slot}"))
     monkeypatch.setattr(sched, "run_pull_group",
                         lambda group, engine, **_kw: ran.append(f"group:{group}"))
     monkeypatch.setattr(sched, "_tiingo_worker", None)
@@ -396,7 +397,7 @@ def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) 
     assert started.wait(2)                       # and Tiingo really is running
     sched.run_daily_pulls(**options_job.job_func.keywords)
     sched.run_pull_group("daily", group_job.job_func.args[1])
-    assert ran == ["domestic@13:30", "group:daily"]
+    assert ran == ["domestic@09:30", "group:daily"]
     assert sched._tiingo_worker.is_alive()       # still mid-pull while they ran
     # A second slot while the first worker is alive starts nothing.
     assert sched.start_tiingo_prices_worker(tiingo_job.job_func.args[0]) is False

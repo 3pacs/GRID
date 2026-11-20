@@ -83,6 +83,7 @@ import { mkdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import readline from 'node:readline';
+import { spyOptionsSteps } from './probe_steps.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -262,6 +263,14 @@ function journeysFor(ticker) {
         { name: 'snapshots', hash: '#/snapshots', roles: ['admin'] },
         // Dad-mode-reachable journey, run under contributor too when available
         { name: 'ten-year', hash: '#/ten-year', roles: ['admin', 'contributor'] },
+        // (f) M1 SPY Options -> Dealer Flow -> Gamma Watch (#959). Same views as
+        // tests/browser/spy_journey.mjs on fixtures, but capture-only here: it
+        // clicks the two in-page tab buttons and never Refresh, the external
+        // full-Gamma-Watch link, or anything that asks the server to compute.
+        // Every request it causes is a GET (checked against api/routers:
+        // options, derivatives, gamma_watch); the request guard still aborts
+        // any non-GET regardless.
+        { name: 'spy-options', hash: '#/options', roles: ['admin'], steps: (page, capture) => spyOptionsSteps(page, capture, apiGate) },
     ];
     return all.filter((j) => !OPT_IN_JOURNEYS.has(j.name) || REQUESTED_JOURNEYS.has(j.name));
 }
@@ -477,14 +486,35 @@ async function runRole(browser, role, password, username, ticker, outRoot, netwo
             const bodyText = await page.evaluate(() => document.body.innerText);
             writeFileSync(path.join(outDir, `${journey.name}.text.txt`), bodyText);
 
+            let stepNotes;
+            let stepCrash = false;
+            if (journey.steps) {
+                const capture = async (label) => {
+                    await page.screenshot({ path: path.join(outDir, `${journey.name}.${label}.png`), fullPage: true });
+                    const t = await page.evaluate(() => document.body.innerText);
+                    writeFileSync(path.join(outDir, `${journey.name}.${label}.text.txt`), t);
+                    stepCrash = stepCrash || detectCrash(t);
+                };
+                stepNotes = await journey.steps(page, capture);
+            }
+
             summary.journeys[journey.name] = {
-                crashed: detectCrash(bodyText),
+                crashed: detectCrash(bodyText) || stepCrash,
+                ...(journey.steps ? { step_notes: stepNotes } : {}),
                 // The operator fills these in by eye against the saved
                 // screenshot/text — this script only captures, never asserts:
                 operator_checklist: {
                     honest_unavailable_states: null, // true/false/'n/a'
                     no_invented_numbers: null,
                     data_ages_shown: null,
+                    ...(journey.name === 'spy-options' ? {
+                        // Gamma Watch: public, delayed, frozen-research and RTD
+                        // states each carry their own label and clock, and a
+                        // missing value reads Unavailable rather than 0.
+                        sources_kept_distinct: null,
+                        provider_and_receipt_clocks_shown: null,
+                        missing_differs_from_zero: null,
+                    } : {}),
                     notes: '',
                 },
             };

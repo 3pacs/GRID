@@ -300,6 +300,31 @@ def test_scorer_split_adjusts_a_prediction_spanning_the_split():
     assert sot.SPLIT_RULE not in rows["after"][4]
 
 
+def test_scheduled_scorer_preserves_source_vintage_for_split_rebasing():
+    """A later yfinance pull already reflects a split after the expiry date."""
+    eng = _pred_engine()
+    expiry = date(2024, 6, 7)
+    with eng.begin() as c:
+        _pred(c, "vintage", "NVDA", expiry, entry=1224.40,
+              created="2024-06-05 15:00:00", direction="CALL")
+        _raw(c, "YF:NVDA:close", 2, expiry, 120.888,
+             datetime(2024, 6, 12, 23, tzinfo=UTC))
+        _raw(c, split_series_id("NVDA"), 1, NVDA_SPLIT, 10.0,
+             datetime(2024, 6, 10, 23, tzinfo=UTC))
+    obj = object.__new__(oracle.engine.OracleEngine)
+    obj.engine = eng
+    obj._write_verdict_lessons = lambda rows: 0
+    counts = obj.score_expired_predictions(now=datetime(2024, 6, 13, tzinfo=UTC))
+    assert counts["misses"] == 1
+    with eng.connect() as c:
+        actual, move, notes = c.execute(text(
+            "SELECT actual_price, actual_move_pct, score_notes FROM oracle_predictions"
+        )).one()
+    assert actual == pytest.approx(1208.88)
+    assert move == pytest.approx(-1.27, abs=0.01)
+    assert "yfinance" in notes and "x10 split" in notes
+
+
 def test_scorer_reverse_split_and_no_split_tickers():
     splits = {"RVS": REV}
     res = sot.ExpiryClose("priced", price=9.50, session_date=date(2025, 3, 5), source="TIINGO")

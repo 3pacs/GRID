@@ -7,7 +7,13 @@ conflict/cooperation counts, Goldstein scale, tone, and per-country event counts
 
 Pushes 12 features to resolved_series.
 
-Run: python3 parse_gdelt.py
+RETIRED 2026-11-16: ``main`` refuses to run. ``ingestion/altdata/gdelt_bulk.py``
+loads GDELT 2.0 export files incrementally instead. This script's summary
+rebuild (``ON CONFLICT DO UPDATE``, grouped by SQLDATE) would overwrite the
+loader's rows, its ``push_to_resolved`` dates every point
+``release_date = vintage_date = obs_date`` although a day's file is published
+only after the day ends, and its country counts compare CAMEO codes ("USA")
+with "US", so every ``gdelt_events_*`` value it wrote is 0.
 """
 
 import os
@@ -293,6 +299,9 @@ def push_to_resolved(cur):
 
 
 def main():
+    log.error("scripts/parse_gdelt.py is retired (see its docstring); "
+              "run python -m ingestion.altdata.gdelt_bulk instead")
+    sys.exit(2)
     if not BULK_DIR.exists():
         log.error("GDELT bulk directory not found: {d}", d=BULK_DIR)
         sys.exit(1)

@@ -164,6 +164,9 @@ class OrthogonalityAudit:
             os.rename(out_path, backup)
             out_path.mkdir(parents=True, exist_ok=True)
 
+        from discovery.output_retention import prune_outputs
+
+        prune_outputs(out_path)
         log.info("Starting orthogonality audit — as_of={d}, output={o}", d=as_of_date, o=output_dir)
 
         # Step a: Load feature matrix

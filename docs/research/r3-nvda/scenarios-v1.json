@@ -1,0 +1,146 @@
+{
+  "schema": "r3-nvda-scenarios/1",
+  "label": "Conditional calculations on a dated basis, not forecasts. Every assumption carries its reason; observed inputs cite ledger ids. v1: the v0 'base_health_adjusted' scenario is withdrawn (it implied an unstated receivables forecast); replaced by a plain sensitivity that prints its implied working-capital build.",
+  "basis": {
+    "price": {
+      "assumption": 166.19,
+      "why": "NVDA regular-session close used for the freeze",
+      "as_of": "2026-11-12",
+      "source": "griddb raw_series YF:NVDA:close (pull 2026-11-12 23:33Z); unqualified price input per #1085"
+    },
+    "diluted_shares": {
+      "observed": "nvda-pr-q2fy27-diluted-shares"
+    },
+    "cash_and_securities": {
+      "observed": "nvda-10q-q2fy27-cash-marketable"
+    },
+    "total_debt": {
+      "observed": "nvda-10q-q2fy27-debt"
+    },
+    "base_quarter_revenue": {
+      "observed": "nvda-pr-q2fy27-revenue"
+    }
+  },
+  "excluded_from_net_cash": [
+    "nvda-10q-q2fy27-equity-investments-99b: equity stakes are not counted as cash (sensitivity only)",
+    "nvda-10q-q2fy27-guarantee-total: guarantees are contingent, not debt (sensitivity only)"
+  ],
+  "scenarios": {
+    "bear": {
+      "qoq_growth": [
+        {
+          "assumption": 0.099968,
+          "why": "Q3 at the low end of the $108.0B ±2% guide (nvda-pr-q3fy27-outlook-no-china)"
+        },
+        {
+          "assumption": 0.0,
+          "why": "digestion: no growth while the CEO search runs and customers re-plan"
+        },
+        {
+          "assumption": -0.05,
+          "why": "commitment slippage: announced intentions/capacity plans convert later than planned"
+        },
+        {
+          "assumption": -0.1,
+          "why": "a down quarter of the size seen in prior semiconductor digestion cycles (illustrative, not measured)"
+        }
+      ],
+      "fcf_margin": {
+        "assumption": 0.22,
+        "why": "Q2 FY27 level persists: FCF $21.3B / revenue $96.2B (nvda-pr-q2fy27-fcf, nvda-pr-q2fy27-revenue), working-capital drag from 60-day DSO and supply prepayments"
+      },
+      "fcf_multiple": {
+        "assumption": 20.0,
+        "why": "de-rated multiple on forward FCF; assumption, not measured"
+      }
+    },
+    "base": {
+      "qoq_growth": [
+        {
+          "assumption": 0.122416,
+          "why": "Q3 at the $108.0B guide midpoint (nvda-pr-q3fy27-outlook-no-china)"
+        },
+        {
+          "assumption": 0.06,
+          "why": "growth slows from the guide pace; assumption"
+        },
+        {
+          "assumption": 0.04,
+          "why": "assumption"
+        },
+        {
+          "assumption": 0.03,
+          "why": "assumption"
+        }
+      ],
+      "fcf_margin": {
+        "assumption": 0.4,
+        "why": "between Q2 FY27 (22%) and Q1 FY27 (48.6/81.6 = 59%) and Q4 FY26 (34.9/68.1 = 51%) (nvda-pr-q1fy27-fcf, nvda-pr-q1fy27-revenue, nvda-pr-q4fy26-fcf, nvda-pr-q4fy26-revenue) v1 note: 40% is close to the observed H1 FY27 level (39.3%) and below the trailing-three-quarter level (42.6%)."
+      },
+      "fcf_multiple": {
+        "assumption": 28.0,
+        "why": "assumption, not measured"
+      }
+    },
+    "bull": {
+      "qoq_growth": [
+        {
+          "assumption": 0.178537,
+          "why": "Q3 beats the guide by 5%, similar to Q2 (96.2 vs 91.0 guide, +5.7%) and Q1 (81.6 vs 78.0, +4.6%) (nvda-pr-q2fy27-outlook-given-in-q1, nvda-pr-q1fy27-outlook-given-in-q4)"
+        },
+        {
+          "assumption": 0.1,
+          "why": "PORTS-Pike / AI-cloud commitments start converting; assumption"
+        },
+        {
+          "assumption": 0.08,
+          "why": "assumption"
+        },
+        {
+          "assumption": 0.06,
+          "why": "assumption"
+        }
+      ],
+      "fcf_margin": {
+        "assumption": 0.52,
+        "why": "working capital normalises toward Q4 FY26 (51%) and Q1 FY27 (59%) levels"
+      },
+      "fcf_multiple": {
+        "assumption": 35.0,
+        "why": "assumption, not measured"
+      }
+    },
+    "sensitivity_q2_cash_conversion_persists": {
+      "qoq_growth": [
+        {
+          "assumption": 0.122416,
+          "why": "Q3 at the $108.0B guide midpoint (nvda-pr-q3fy27-outlook-no-china)"
+        },
+        {
+          "assumption": 0.06,
+          "why": "growth slows from the guide pace; assumption"
+        },
+        {
+          "assumption": 0.04,
+          "why": "assumption"
+        },
+        {
+          "assumption": 0.03,
+          "why": "assumption"
+        }
+      ],
+      "fcf_margin": {
+        "assumption": 0.22,
+        "why": "sensitivity, not a health result: the Q2 FY27 FCF margin (21.3/96.2, nvda-pr-q2fy27-fcf) held for four quarters. Q2 was depressed by a DSO step from 45 to 60 days and two federal tax payments (nvda-10q-q2fy27-federal-tax-payments-timing, nvda-cfo-q2fy27-ocf-decrease-drivers)"
+      },
+      "fcf_multiple": {
+        "assumption": 28.0,
+        "why": "assumption, not measured"
+      },
+      "reference_fcf_margin": {
+        "assumption": 0.393,
+        "why": "observed H1 FY27 FCF margin, (48.554+21.341)/(81.615+96.221) from nvda-pr-q1fy27-fcf, nvda-pr-q2fy27-fcf, nvda-pr-q1fy27-revenue, nvda-pr-q2fy27-revenue; the trailing-three-quarter level is 42.6%"
+      }
+    }
+  }
+}

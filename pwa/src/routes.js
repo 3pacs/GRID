@@ -216,6 +216,15 @@ export const routes = [
         nav: 'drawer',
         desc: 'Sector & asset heatmap',
     },
+    {
+        id: 'gamma-board',
+        label: 'Gamma Board',
+        icon: Grid3X3,
+        component: './views/GammaBoard.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'SPX, SPY and QQQ gamma walls and expiry heatmaps',
+    },
     /*
      * God view (G9): Fed net liquidity, CFTC positioning and modeled SPY
      * dealer gamma, each with its own availability state and provenance.
@@ -654,6 +663,7 @@ const MAIN_DRAWER_SECTION_IDS = {
         'regime',
         'signals',
         'heatmap',
+        'gamma-board',
         'god-view',
         'options',
         'flows',

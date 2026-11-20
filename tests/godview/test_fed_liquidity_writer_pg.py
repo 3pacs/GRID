@@ -770,3 +770,131 @@ def test_rerun_with_unchanged_inputs_is_a_noop(godview_engine):
     second = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of_ts=as_of_ts)
     assert second.status == "SUCCESS_NOOP"
     assert second.rows_written == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Holiday week: no RRP on a holiday Wednesday (Veterans Day 2026-11-11)
+# ══════════════════════════════════════════════════════════════════════════
+
+_VETERANS_DAY = date(2026, 11, 11)  # Wednesday, Federal Reserve holiday, no RRP operation
+
+
+def _pulled_same_day(d: date) -> datetime:
+    return datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=20)
+
+
+def _insert_holiday_weeks(conn, *, rrp_skip: tuple[date, ...] = (_VETERANS_DAY,)) -> dict[date, float]:
+    """H.4.1 legs for the Wednesdays 10-28 .. 11-18 and a daily RRP on every
+    weekday 10-26 .. 11-20 except ``rrp_skip``; returns RRP billions by date."""
+    rrp_values: dict[date, float] = {}
+    d = date(2026, 10, 26)
+    i = 0
+    while d <= date(2026, 11, 20):
+        if d.weekday() < 5 and d not in rrp_skip:
+            rrp_values[d] = 2.0 + i
+            _insert_component(conn, RRP_SERIES_ID, d, rrp_values[d], pull_timestamp=_pulled_same_day(d))
+        if d.weekday() == 2:
+            release_at, _ = compute_release_at(d)
+            pulled = release_at + timedelta(minutes=30)
+            _insert_component(conn, WALCL_SERIES_ID, d, 6_600_000.0 + 1_000.0 * i, pull_timestamp=pulled)
+            _insert_component(conn, WTREGEN_SERIES_ID, d, 850_000.0, pull_timestamp=pulled)
+        d += timedelta(days=1)
+        i += 1
+    return rrp_values
+
+
+def test_holiday_wednesday_uses_the_previous_rrp_and_records_the_carry(godview_engine):
+    engine = godview_engine
+    with engine.begin() as conn:
+        rrp_values = _insert_holiday_weeks(conn)
+
+    # The fed timer's Thursday run after the 11-11 H.4.1 (Thu 11-12 17:30 ET).
+    thursday_run = datetime(2026, 11, 12, 22, 30, tzinfo=timezone.utc)
+    result = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of=date(2026, 11, 12), as_of_ts=thursday_run)
+
+    holiday = next(r for r in result.rows if r.obs_date == _VETERANS_DAY)
+    assert holiday.status == "written"
+    assert holiday.rrp_carried_from == date(2026, 11, 10)
+    assert not any(r.reason == SKIP_MISSING_RRP for r in result.rows)
+
+    with engine.begin() as conn:
+        row = _row(conn, _VETERANS_DAY)
+        prior = _row(conn, date(2026, 11, 4))
+    # The Tuesday's RRP, never the Thursday's (11-12 is after the obs date).
+    assert row["reverse_repo_rrp"] == pytest.approx(rrp_values[date(2026, 11, 10)] * 1000.0)
+    assert row["fed_assets_walcl"] - row["treasury_tga_wtregen"] - row["reverse_repo_rrp"] == pytest.approx(
+        row["net_liquidity_usd_m"]
+    )
+    rrp_input = next(i for i in row["source_ref"]["inputs"] if i["series_id"] == RRP_SERIES_ID)
+    assert rrp_input["obs_date"] == "2026-11-10" and rrp_input["carried_forward"] is True
+    carry = row["source_ref"]["rrp_carry_forward"]
+    assert carry["rrp_obs_date"] == "2026-11-10" and carry["target_obs_date"] == "2026-11-11"
+    assert carry["business_days_stale"] == 0 and carry["max_business_days"] == 5
+    assert carry["rule"] == "rrp_holiday_carry_forward_v1"
+    # An exact-date row keeps its source_ref shape (no carry markers).
+    assert "rrp_carry_forward" not in prior["source_ref"]
+    assert all("carried_forward" not in i for i in prior["source_ref"]["inputs"])
+
+    # The Friday retry with nothing new is a clean noop.
+    friday_retry = datetime(2026, 11, 13, 14, 0, tzinfo=timezone.utc)
+    again = materialize_fed_liquidity(engine, code_sha="other-sha", as_of=date(2026, 11, 13), as_of_ts=friday_retry)
+    assert again.status == "SUCCESS_NOOP" and again.rows_written == 0 and again.rows_skipped == 0
+    with engine.begin() as conn:
+        assert _row(conn, _VETERANS_DAY)["code_sha"] == _CODE_SHA
+
+
+def test_week_after_the_holiday_gets_its_1w_delta(godview_engine):
+    engine = godview_engine
+    with engine.begin() as conn:
+        _insert_holiday_weeks(conn)
+    after_next_h41 = datetime(2026, 11, 19, 22, 30, tzinfo=timezone.utc)
+    materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of=date(2026, 11, 19), as_of_ts=after_next_h41)
+    with engine.begin() as conn:
+        holiday = _row(conn, _VETERANS_DAY)
+        nxt = _row(conn, date(2026, 11, 18))
+    assert nxt["delta_1w_m"] == pytest.approx(nxt["net_liquidity_usd_m"] - holiday["net_liquidity_usd_m"])
+
+
+def test_holiday_wednesday_with_too_stale_rrp_stays_missing(godview_engine):
+    """No RRP from Tue 11-03 on: the last one (Mon 11-02) is 6 business days
+    before the holiday, beyond RRP_CARRY_MAX_BUSINESS_DAYS (5). (Wed 11-04 is
+    a business day and stays missing too.)"""
+    engine = godview_engine
+    gap = tuple(date(2026, 11, d) for d in (3, 4, 5, 6, 9, 10, 11))
+    with engine.begin() as conn:
+        _insert_holiday_weeks(conn, rrp_skip=gap)
+    thursday_run = datetime(2026, 11, 12, 22, 30, tzinfo=timezone.utc)
+    result = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of=date(2026, 11, 12), as_of_ts=thursday_run)
+    assert any(r.obs_date == _VETERANS_DAY and r.reason == SKIP_MISSING_RRP for r in result.rows)
+    with engine.begin() as conn:
+        assert _row(conn, _VETERANS_DAY) is None
+        assert _run_ledger_row(conn, result.run_id)["reasons"] == {SKIP_MISSING_RRP: 2}
+
+
+def test_business_day_wednesday_missing_rrp_is_not_carried(godview_engine):
+    """Wed 11-04 is a business day: a missing RRP there is not a holiday gap,
+    so Tue 11-03's value is not used and the date stays missing."""
+    engine = godview_engine
+    with engine.begin() as conn:
+        _insert_holiday_weeks(conn, rrp_skip=(date(2026, 11, 4), _VETERANS_DAY))
+    thursday_run = datetime(2026, 11, 12, 22, 30, tzinfo=timezone.utc)
+    result = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of=date(2026, 11, 12), as_of_ts=thursday_run)
+    assert any(r.obs_date == date(2026, 11, 4) and r.reason == SKIP_MISSING_RRP for r in result.rows)
+    assert any(r.obs_date == _VETERANS_DAY and r.status == "written" for r in result.rows)
+    with engine.begin() as conn:
+        assert _row(conn, date(2026, 11, 4)) is None
+
+
+def test_start_on_the_holiday_still_finds_the_rrp_before_it(godview_engine):
+    """The backfill command uses --start 2026-11-11: the RRP read reaches back
+    before start, but no Wednesday before start is written."""
+    engine = godview_engine
+    with engine.begin() as conn:
+        _insert_holiday_weeks(conn)
+    thursday_run = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+    result = materialize_fed_liquidity(
+        engine, code_sha=_CODE_SHA, as_of=date(2026, 11, 17), as_of_ts=thursday_run, start=_VETERANS_DAY
+    )
+    assert [(r.obs_date, r.status) for r in result.rows] == [(_VETERANS_DAY, "written")]
+    with engine.begin() as conn:
+        assert _row(conn, date(2026, 11, 4)) is None

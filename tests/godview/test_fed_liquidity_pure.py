@@ -25,6 +25,7 @@ from godview.availability_basis import (
 )
 from godview.fed_liquidity import (
     RELEASE_RULE_ID,
+    RRP_CARRY_MAX_BUSINESS_DAYS,
     RRPONTSYD_TO_MILLIONS,
     classify_liquidity_regime,
     compute_net_liquidity_millions,
@@ -34,7 +35,9 @@ from godview.fed_liquidity import (
     federal_reserve_holidays,
     find_nearest_prior,
     rrp_billions_to_stored_millions,
+    select_rrp_observation,
 )
+from store.observations import Observation
 
 # ══════════════════════════════════════════════════════════════════════════
 # Release schedule (H.4.1 Wednesday -> Thursday 16:30 ET) / publication lag
@@ -247,6 +250,81 @@ def test_availability_basis_inferred_when_pulled_long_after_release():
 def test_availability_basis_unknown_with_no_release_schedule():
     basis, _ = classify_availability_basis(None, datetime(2026, 9, 17, tzinfo=timezone.utc))
     assert basis == AVAILABILITY_BASIS_UNKNOWN
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RRP on a holiday Wednesday: carry the last earlier observation, bounded
+# ══════════════════════════════════════════════════════════════════════════
+
+_VETERANS_DAY_2026 = date(2026, 11, 11)  # a Wednesday, Federal Reserve holiday
+_AFTER_H41 = datetime(2026, 11, 12, 22, 30, tzinfo=timezone.utc)  # Thu 17:30 ET, the fed timer
+
+
+def _rrp(d: date, value: float = 5.0, pulled: datetime | None = None) -> Observation:
+    if pulled is None:
+        pulled = datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=20)
+    return Observation("RRPONTSYD", d, value, pulled, "FRED")
+
+
+def test_rrp_on_the_wednesday_itself_is_used_without_carry():
+    obs = [_rrp(date(2026, 11, 3)), _rrp(date(2026, 11, 4), 7.0)]
+    chosen, stale = select_rrp_observation(obs, date(2026, 11, 4), _AFTER_H41)
+    assert chosen.obs_date == date(2026, 11, 4) and stale is None
+
+
+def test_holiday_wednesday_carries_the_previous_business_day():
+    """Veterans Day 2026: no RRP on Wed 11-11; Tue 11-10's value is used."""
+    obs = [_rrp(date(2026, 11, 9)), _rrp(date(2026, 11, 10), 3.0), _rrp(date(2026, 11, 12), 9.0)]
+    chosen, stale = select_rrp_observation(obs, _VETERANS_DAY_2026, _AFTER_H41)
+    assert chosen.obs_date == date(2026, 11, 10)
+    assert chosen.value == 3.0  # never the later Thursday value
+    assert stale == 0  # the only day skipped is the holiday itself
+
+
+def test_holiday_carry_respects_the_staleness_bound():
+    target = _VETERANS_DAY_2026
+    # Last RRP 5 business days before the target (Tue 11-10, Mon 11-09,
+    # Fri 11-06, Thu 11-05, Wed 11-04 missing): still within the bound.
+    chosen, stale = select_rrp_observation([_rrp(date(2026, 11, 3))], target, _AFTER_H41)
+    assert chosen is not None and stale == RRP_CARRY_MAX_BUSINESS_DAYS == 5
+    # One business day older: beyond the bound, stays missing.
+    chosen, stale = select_rrp_observation([_rrp(date(2026, 11, 2))], target, _AFTER_H41)
+    assert chosen is None and stale is None
+    # The bound is a parameter.
+    chosen, _ = select_rrp_observation([_rrp(date(2026, 11, 9))], target, _AFTER_H41, max_business_days=0)
+    assert chosen is None
+
+
+def test_missing_rrp_on_a_business_day_wednesday_is_never_carried():
+    """Pre-2013 RRPONTSYD is sparse: no observation on a business day means no
+    operation that day, not a holiday. 2003-04-09 (gap of one business day in
+    production) must stay missing."""
+    chosen, stale = select_rrp_observation(
+        [_rrp(date(2003, 4, 8))], date(2003, 4, 9), datetime(2003, 4, 11, tzinfo=timezone.utc)
+    )
+    assert chosen is None and stale is None
+
+
+def test_holiday_carry_is_point_in_time():
+    tuesday = date(2026, 11, 10)
+    # Pulled after the as-of instant: not knowable then.
+    late_pull = [_rrp(tuesday, pulled=_AFTER_H41 + timedelta(hours=1))]
+    assert select_rrp_observation(late_pull, _VETERANS_DAY_2026, _AFTER_H41) == (None, None)
+    # Unknown pull time: no proof it was known.
+    unknown = [Observation("RRPONTSYD", tuesday, 3.0, None, "FRED")]
+    assert select_rrp_observation(unknown, _VETERANS_DAY_2026, _AFTER_H41) == (None, None)
+    # Before the carried value's own same-day release (13:15 ET = 18:15 UTC).
+    leaked = [_rrp(tuesday, pulled=datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc))]
+    assert select_rrp_observation(
+        leaked, _VETERANS_DAY_2026, datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc)
+    ) == (None, None)
+    chosen, _ = select_rrp_observation(leaked, _VETERANS_DAY_2026, datetime(2026, 11, 10, 18, 20, tzinfo=timezone.utc))
+    assert chosen is not None
+
+
+def test_nothing_before_the_wednesday_is_missing():
+    assert select_rrp_observation([_rrp(date(2026, 11, 12))], _VETERANS_DAY_2026, _AFTER_H41) == (None, None)
+    assert select_rrp_observation([], _VETERANS_DAY_2026, _AFTER_H41) == (None, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════

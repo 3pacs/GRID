@@ -1,0 +1,13 @@
+# TEMPLATE — NOT INSTALLED. See grid-dealer-gex-daily.service.template.
+# Weekdays 23:05Z for the prior session: its capture (~22:15-23:30Z) completed the day before.
+[Unit]
+Description=Run the GRID dealer_gex_daily writer once a weekday evening
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 23:05:00 UTC
+RandomizedDelaySec=3min
+Persistent=true
+Unit=grid-dealer-gex-daily.service
+
+[Install]
+WantedBy=timers.target

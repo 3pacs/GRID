@@ -67,6 +67,10 @@ class OracleCalibrationReport:
             "label": self.label,
             "total_predictions": self.total_predictions,
             "overall_accuracy": round(self.overall_accuracy, 4),
+            "target_event": "strict_hit",
+            "target_definition": "Correct direction and at least half the stated expected move",
+            "outcome_rule": "hit=1; partial=0; miss=0",
+            "evidence_class": "historical_calibration_diagnostic",
         }
 
 
@@ -120,11 +124,14 @@ def compute_calibration(
         )
 
     confidences = []
-    outcomes = []  # 1 = hit, 0.5 = partial, 0 = miss
+    # Match confidence_reliability_curves' binary strict-hit event. A
+    # partial is a directional success, but not success on this magnitude
+    # threshold. Half credit is a weighted score, not a Bernoulli outcome.
+    outcomes = []
     for r in rows:
         conf = float(r[0])
         verdict = r[1]
-        outcome = 1.0 if verdict == "hit" else 0.5 if verdict == "partial" else 0.0
+        outcome = 1.0 if verdict == "hit" else 0.0
         confidences.append(conf)
         outcomes.append(outcome)
 
@@ -137,7 +144,7 @@ def compute_calibration(
     # Sharpness = variance of predicted probabilities
     sharpness = float(np.var(confidences))
 
-    # Overall accuracy (hits + 0.5 * partials) / total
+    # Strict-hit frequency; directional success is a separate target event.
     overall_accuracy = float(np.mean(outcomes))
 
     # Bin predictions into calibration buckets

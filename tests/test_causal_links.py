@@ -32,6 +32,17 @@ def _earn(ticker, d, reported=True, eps_actual=1.1, eps_estimate=1.0):
     }
 
 
+def _synthetic_events(rows):
+    """Explicit edge-unit-test witnesses, not production calendar admission."""
+    return [cl.AntecedentEvent(
+        kind="earnings", ticker=row["ticker"],
+        key=f"earnings:{row['ticker']}:{row['earnings_date']}",
+        event_date=row["earnings_date"], known_at=cl.end_of_day(row["earnings_date"]),
+        known_at_basis="synthetic_test_witness", window_days=cl.EARNINGS_WINDOW_DAYS,
+        description="synthetic event", evidence={"synthetic": True},
+    ) for row in rows]
+
+
 def _form4(trade_day=date(2026, 9, 15), created=datetime(2026, 9, 17, 3, 0, tzinfo=UTC)):
     return _sig(1, "insider", "Cutt Timothy J.", "gpor", "SELL", trade_day, created)
 
@@ -141,7 +152,7 @@ def test_backfilled_contracts_are_not_events():
 
 def test_events_disclosed_on_or_after_the_trade_day_are_never_linked():
     (action,) = cl.canonical_actions([_form4()], AS_OF)  # trade 2026-09-15
-    events = cl.earnings_events([
+    events = _synthetic_events([
         _earn("GPOR", date(2026, 9, 10)),   # public end of 09-10: linked
         _earn("GPOR", date(2026, 9, 14)),   # public 00:00 09-15 = trade start: linked
         _earn("GPOR", date(2026, 9, 15)),   # same day: timing unknown -> not linked
@@ -168,7 +179,7 @@ def test_contract_first_seen_after_trade_is_not_linked_even_if_start_date_before
 
 def test_edge_keys_are_stable_and_distinct_per_event():
     (action,) = cl.canonical_actions([_form4()], AS_OF)
-    events = cl.earnings_events([_earn("GPOR", date(2026, 9, 10)), _earn("GPOR", date(2026, 9, 1))])
+    events = _synthetic_events([_earn("GPOR", date(2026, 9, 10)), _earn("GPOR", date(2026, 9, 1))])
     first = cl.build_edges([action], events)
     again = cl.build_edges([action], events + events)
     assert [e.edge_key for e in first] == [e.edge_key for e in again]
@@ -177,7 +188,7 @@ def test_edge_keys_are_stable_and_distinct_per_event():
 
 def test_edge_row_records_claim_and_score_method():
     (action,) = cl.canonical_actions([_form4()], AS_OF)
-    (edge,) = cl.build_edges([action], cl.earnings_events([_earn("GPOR", date(2026, 9, 10))]))
+    (edge,) = cl.build_edges([action], _synthetic_events([_earn("GPOR", date(2026, 9, 10))]))
     row = edge.to_row()
     assert row["score_method"] == cl.SCORE_METHOD
     assert row["cause_type"] == "earnings"

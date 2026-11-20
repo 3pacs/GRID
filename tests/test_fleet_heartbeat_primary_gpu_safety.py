@@ -186,7 +186,7 @@ def test_existing_cooldown_cap_and_futile_gates(monkeypatch, fenced, age, count,
     assert result['alerts'] == 1
 
 
-@pytest.mark.parametrize('entity,kind', [('ordinary-unit', 'unit'), ('redbox:gpu', 'gpu'), ('grid-api', 'endpoint')])
+@pytest.mark.parametrize('entity,kind', [('ordinary-unit', 'unit'), ('gridz4:gpu', 'gpu'), ('grid-api', 'endpoint')])
 def test_nonpertinent_explicit_heals_are_preserved(monkeypatch, fenced, entity, kind):
     engine = bad_sweep(monkeypatch, entity, kind)
     result = mod.run_fleet_heartbeat(engine, do_heal=True)
@@ -329,3 +329,38 @@ def test_v2_valid_remote_gpu_heals_preserved(monkeypatch, fenced, host, sweep):
     else:
         assert mod._heal('fresh-remote:gpu', 'gpu', '')[0] is True
     assert len(fenced[0]) == 1 and fenced[0][0][0:2] == ('ssh', host)
+
+
+# ---------------------------------------------------------------------------
+# Roster (2026-11-14): only machines that exist, probed where they listen
+# ---------------------------------------------------------------------------
+
+
+def test_roster_holds_only_live_nodes_with_their_real_gpu_counts():
+    import importlib
+
+    fresh = importlib.reload(mod)
+    try:
+        assert set(fresh.FLEET) == {'grid-svr', 'gridz4'}
+        assert all(cfg['gpu'] == 1 for cfg in fresh.FLEET.values())
+        assert not {'redbox', 'koala', 'ocr-node', 'z400', 'p9d'} & set(fresh.FLEET)
+    finally:
+        importlib.reload(mod)
+
+
+def test_oracle_probe_targets_the_live_port_and_stays_protected():
+    import importlib
+
+    fresh = importlib.reload(mod)
+    try:
+        url, kind, unit = fresh.ENDPOINTS['oracle-27b']
+        assert url == 'http://localhost:18081/health' and kind == 'llamacpp'
+        assert unit == 'grid-hermes-3090-oracle'
+        # Neither the endpoint, its owning unit, nor any other endpoint on that port may be auto-healed.
+        assert 'primary GPU' in fresh._heal_refusal('oracle-27b', 'endpoint')
+        assert fresh._heal_refusal('grid-hermes-3090-oracle', 'unit') is not None
+        assert fresh._protected_gpu_unit('grid-hermes-3090-oracle.service')
+        fresh.ENDPOINTS['other-on-oracle-port'] = ('http://127.0.0.1:18081/health', 'llamacpp', 'ordinary-unit')
+        assert 'primary GPU endpoint' in fresh._heal_refusal('other-on-oracle-port', 'endpoint')
+    finally:
+        importlib.reload(mod)
