@@ -923,7 +923,7 @@ def test_read_vintages_returns_every_accepted_vintage_bounded():
 def test_grade_day_publishes_review_and_receipts_but_not_the_cache(tmp_path, closes, monkeypatch):
     packet_root, review_root, _ = _day_fixture(tmp_path)
     public = tmp_path / "public"
-    monkeypatch.setattr(grader, "run_ingest", lambda *a: {"state": "INGESTED", "run_id": 1})
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: successful_ingest(*a[1:], run_id=1))
     receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
                                client_factory=lambda: None, public_root=public)
     folder = review_root / DAY.isoformat()
@@ -931,6 +931,7 @@ def test_grade_day_publishes_review_and_receipts_but_not_the_cache(tmp_path, clo
     (folder / "extractions").mkdir(exist_ok=True)
     out = public / DAY.isoformat()
     assert receipt["published"]["files"] == ["review.jsonl", "grader-receipt.json"]
+    assert "ingest_confirmation_error" not in receipt and receipt["ingest_confirmation"]["run_id"] == 1
     assert (out / "review.jsonl").read_bytes() == (folder / "review.jsonl").read_bytes()
     assert (out / "review.jsonl").stat().st_mode & 0o777 == 0o644 and out.stat().st_mode & 0o777 == 0o755
     assert public.stat().st_mode & 0o777 == 0o755
