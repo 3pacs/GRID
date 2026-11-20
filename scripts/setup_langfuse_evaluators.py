@@ -38,7 +38,17 @@ import requests
 
 # ── env loading ─────────────────────────────────────────────────────────────
 
-ENV_PATH = Path("/data/grid_v4/grid_repo/.env")
+# GRID_ENV_FILE wins; else /etc/grid/grid.env (the shared env file since
+# 2026-11-17); else the old grid_repo checkout path, now a symlink to it.
+_ENV_CANDIDATES = (
+    Path("/etc/grid/grid.env"),
+    Path("/data/grid_v4/grid_repo/.env"),
+)
+ENV_PATH = (
+    Path(os.environ["GRID_ENV_FILE"])
+    if os.environ.get("GRID_ENV_FILE")
+    else next((p for p in _ENV_CANDIDATES if p.exists()), _ENV_CANDIDATES[0])
+)
 
 
 def _load_env() -> dict[str, str]:

@@ -920,7 +920,10 @@ class VolSurfaceEngine:
     ) -> pd.DataFrame:
         """Query options_snapshots for a ticker.
 
-        Tries exact snap_date first, falls back to most recent available.
+        Require the exact requested snapshot date. A missing/invalid session
+        stays unavailable: substituting another date would mix chain and spot
+        clocks and can leak future snapshots into a historical request.
+        This date bound alone does not prove publication-time availability.
 
         Parameters:
             ticker: Underlying ticker symbol.
@@ -946,17 +949,6 @@ class VolSurfaceEngine:
             ).fetchall()
 
         if not rows:
-            # Fall back to most recent snap_date
-            with self.engine.connect() as conn:
-                latest = conn.execute(
-                    text(
-                        "SELECT MAX(snap_date) FROM options_snapshots "
-                        "WHERE ticker = :t"
-                    ),
-                    {"t": ticker},
-                ).fetchone()
-                if latest and latest[0] and latest[0] != as_of_date:
-                    return self._get_options_data(ticker, latest[0])
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=[
@@ -969,7 +961,11 @@ class VolSurfaceEngine:
     def _get_spot_price(
         self, ticker: str, as_of_date: date | None = None,
     ) -> float:
-        """Get spot price from options_daily_signals or resolved_series.
+        """Get a positive finite recorded price, never an option-strike proxy.
+
+        Tries options_daily_signals, then resolved_series. These date-bounded
+        legacy readers do not establish intraday freshness or point-in-time
+        publication availability; that still requires the D2 panel contract.
 
         Parameters:
             ticker: Underlying ticker symbol.
@@ -981,6 +977,15 @@ class VolSurfaceEngine:
         if as_of_date is None:
             as_of_date = date.today()
 
+        def recorded_price(row: Any) -> float | None:
+            if row is None or row[0] is None or isinstance(row[0], (bool, np.bool_)):
+                return None
+            try:
+                value = float(row[0])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return value if math.isfinite(value) and value > 0 else None
+
         with self.engine.connect() as conn:
             # Try options_daily_signals first (has spot_price)
             row = conn.execute(
@@ -991,8 +996,9 @@ class VolSurfaceEngine:
                 """),
                 {"ticker": ticker, "d": as_of_date},
             ).fetchone()
-            if row and row[0]:
-                return float(row[0])
+            price = recorded_price(row)
+            if price is not None:
+                return price
 
             # Try resolved_series (yfinance close)
             row = conn.execute(
@@ -1009,19 +1015,14 @@ class VolSurfaceEngine:
                     "d": as_of_date,
                 },
             ).fetchone()
-            if row:
-                return float(row[0])
+            price = recorded_price(row)
+            if price is not None:
+                return price
 
-            # Fallback: ATM strike from options chain by max OI
-            row = conn.execute(
-                text("""
-                    SELECT strike FROM options_snapshots
-                    WHERE ticker = :t AND snap_date = :d AND opt_type = 'call'
-                    ORDER BY open_interest DESC LIMIT 1
-                """),
-                {"t": ticker, "d": as_of_date},
-            ).fetchone()
-            return float(row[0]) if row else 0.0
+            # A heavily held option strike is not an observed underlying price.
+            # Preserve the consumers' existing unavailable path instead of
+            # fabricating moneyness, Greeks and skew from open interest.
+            return 0.0
 
     def _compute_forward(
         self, spot: float, rate: float, dte: float,

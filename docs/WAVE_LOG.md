@@ -28,3 +28,10 @@ Append-only record of dispatched agent tasks.
 - **2026-09-10T05:06:07.293451+00:00** — task #24 — concept: `hold validation` — coverage: new — files: 2
 - **2026-09-10T06:43:34.845860+00:00** — task #27 — concept: `long horizon plays` — coverage: new — files: 7
 - **2026-09-10T07:30:46.594601+00:00** — task #28 — concept: `sponsor ticker resolver` — coverage: extend — files: 11
+- **2026-11-10T17:40:28.674329+00:00** — task #11101 — concept: `oracle scoring expiry close` — coverage: new — files: 1
+- **2026-11-10T17:40:29.361745+00:00** — task #11102 — concept: `oracle predictions scoreboard` — coverage: new — files: 3
+- **2026-11-10T17:46:43.529961+00:00** — task #11103 — concept: `forecaster identity PostgreSQL` — coverage: new — files: 1
+- **2026-11-10T17:53:46.437690+00:00** — task #11104 — concept: `oracle dedup immutable forecast` — coverage: new — files: 3
+- **2026-11-10T17:54:09.564144+00:00** — task #11105 — concept: `oracle model admission` — coverage: new — files: 1
+- **2026-11-10T17:56:41.277265+00:00** — task #11106 — concept: `oracle entry price admission` — coverage: new — files: 4
+- **2026-11-10T18:07:18.367224+00:00** — task #11107 — concept: `oracle bounded forward cycle` — coverage: new — files: 1

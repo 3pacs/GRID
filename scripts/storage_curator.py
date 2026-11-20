@@ -351,7 +351,7 @@ def assess_gdelt(
 
     if parser_files and full_v1_files and full_v1_files > parser_files:
         assessment.recommendations.append(
-            "scripts/parse_gdelt.py only reads /data/grid/bulk/gdelt; /data/gdelt/v1/events has more files and needs parser coverage or a curated ingest symlink."
+            "scripts/parse_gdelt.py (retired) only read /data/grid/bulk/gdelt; /data/gdelt/v1/events has more files and needs parser coverage or a curated ingest symlink."
         )
     if full_v2_files:
         assessment.recommendations.append(
@@ -407,11 +407,12 @@ def build_ingest_plan(gdelt: GdeltAssessment) -> list[dict[str, Any]]:
     if gdelt.ingest_status in {"archives_present_db_tables_missing", "tables_empty"}:
         plan.append({
             "action": "run_gdelt_parser_smoke",
-            "command": "python3 scripts/parse_gdelt.py",
-            "current_parser_root": "/data/grid/bulk/gdelt",
+            # Dry run by default: fetches GDELT 2.0 export files, writes nothing.
+            "command": "python3 -m ingestion.altdata.gdelt_bulk",
+            "current_parser_root": "https://data.gdeltproject.org/gdeltv2/",
             "blocked_by": (
-                "Parser currently ignores /data/gdelt/v1/events and GDELT v2 roots; "
-                "extend parser or intentionally symlink a bounded subset first."
+                "The loader reads GDELT's live export files, not /data/gdelt/v1/events "
+                "or the local GDELT v2 roots; history before its resume point is a separate step."
             ),
         })
     return plan
