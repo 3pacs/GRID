@@ -290,13 +290,15 @@ def test_refused_before_the_data_file_is_opened(tmp_path, change, message):
     ({"representative": False}, "only a selected trial"),
     ({"feature": "FOMC|on|long"}, "the older store cannot supply it"),
     ({"feature": "VIX|z>=1|long"}, "the older store cannot supply it"),
+    ({"family": "XS|close_1d", "feature": "reversal_21d|within_sector|q10"}, "not a SPY intraday module"),
 ])
 def test_only_a_selected_representative_of_a_supported_class_gets_a_look(tmp_path, trial, message):
     body = {"trial_id": T1, "family": FAMILY, "feature": MODULE, "status": "tested", "selected": True,
             "representative": True, **trial}
-    run_body = {**DEV_RUN, "features": sorted({*DEV_RUN["features"], body["feature"].split("|")[0]})}
+    name = body["feature"].split("|")[0]
+    run_body = {**DEV_RUN, "features": sorted({*DEV_RUN["features"], *([name] if name in mf.KNOWN_FEATURES else [])})}
     ledger, sha = ledger_with([body], run_body=run_body)
-    reg = registration(tmp_path, sha, "5" * 64, feature=body["feature"])
+    reg = registration(tmp_path, sha, "5" * 64, feature=body["feature"], family=body["family"])
     with pytest.raises(ValueError, match=message):
         fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger)
 

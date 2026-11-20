@@ -157,9 +157,10 @@ def candidate_run(ledger: lse.Ledger, candidate: dict) -> tuple[mf.RunFile, str,
         raise PrescreenError("the registered rule is not the rule of that trial")
     declared = next(r for r in ledger.of_kind(lse.FACTORY_DECLARED) if r["run_id"] == result["run_id"])
     family, module = trial["family"], trial["feature"]
-    feature, rule, side = module.split("|")
-    window = family.split("|")[-1]
-    decision, horizon = window.split("+")
+    parts, window = module.split("|"), family.split("|")[-1].split("+")
+    if len(parts) != 3 or len(window) != 2 or not family.startswith("SPY|change|"):
+        raise PrescreenError(f"{family} {module} is not a SPY intraday module: the pre-screen cannot compute it")
+    (feature, rule, side), (decision, horizon) = parts, window
     if mf.FEATURE_CLASS.get(feature) not in CLASSES:
         raise PrescreenError(f"{feature} is a {mf.FEATURE_CLASS.get(feature)} feature: the older store cannot supply it")
     body = dict(declared["run_file"])
