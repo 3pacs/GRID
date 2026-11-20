@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import os
 import re
 import sys
 from pathlib import Path
@@ -50,6 +51,9 @@ from pathlib import Path
 import pytest
 
 _LEGACY_CHECKOUT_PATH = "/data/grid_v4/grid_repo"
+# The guarded fallback now inserts the script's own repo root (grid_repo is
+# being retired on grid-svr); the legacy path must still never appear.
+_REPO_ROOT_EXPR = "os.path.dirname(os.path.dirname(os.path.abspath(__file__)))"
 
 # Every first-party module this regression cares about: the one this module
 # imports directly at module level (config), plus the four it imports
@@ -255,8 +259,7 @@ def test_guard_precedes_every_first_party_import_in_source():
             and isinstance(node.func.value.value, ast.Name)
             and node.func.value.value.id == "sys"
             and len(node.args) == 2
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == _LEGACY_CHECKOUT_PATH
+            and ast.unparse(node.args[1]) == _REPO_ROOT_EXPR
         )
 
     guard_if = None
@@ -269,7 +272,7 @@ def test_guard_precedes_every_first_party_import_in_source():
 
     assert guard_if is not None, (
         "Expected a module-level `if ...: sys.path.insert(0, "
-        f'"{_LEGACY_CHECKOUT_PATH}")` guard in run_intelligence_cycles.py; '
+        f"{_REPO_ROOT_EXPR})` guard in run_intelligence_cycles.py; "
         "if it was removed entirely, this test (and its guard-ordering "
         "concern) no longer applies and should be deleted instead."
     )
@@ -330,7 +333,7 @@ def test_running_as_main_skips_the_fallback_when_repo_already_importable(
     source = path.read_text(encoding="utf-8")
     insert_match = re.search(
         r'if __name__ == "__main__" and importlib\.util\.find_spec\("config"\) is None:\n'
-        r'    sys\.path\.insert\(0, "/data/grid_v4/grid_repo"\)\n',
+        r'    sys\.path\.insert\(0, os\.path\.dirname\(os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\)\)\n',
         source,
     )
     assert insert_match is not None, (
@@ -338,7 +341,10 @@ def test_running_as_main_skips_the_fallback_when_repo_already_importable(
         "exact text changed, update this test's pattern."
     )
 
-    namespace = {"__name__": "__main__", "sys": sys, "importlib": importlib}
+    namespace = {
+        "__name__": "__main__", "sys": sys, "importlib": importlib, "os": os,
+        "__file__": str(path),
+    }
     exec(compile(insert_match.group(0), "<guard-block>", "exec"), namespace)
 
     # config is already importable via the real repo root the whole time

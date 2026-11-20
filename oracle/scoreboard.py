@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from loguru import logger as log
@@ -37,6 +38,8 @@ def _ticker_filter_sql(tickers: list[str] | None) -> tuple[str, dict[str, Any]]:
 
 def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> dict[str, Any]:
     where_sql, params = _ticker_filter_sql(tickers)
+    today = date.today()
+    params["today"] = today
     with engine.connect() as conn:
         row = conn.execute(
             text(
@@ -48,7 +51,10 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
                     SUM(CASE WHEN verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
                     SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END) AS pending,
                     AVG(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct END) AS avg_pnl,
-                    SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl
+                    SUM(CASE WHEN verdict IN ('hit','miss','partial') THEN pnl_pct ELSE 0 END) AS total_pnl,
+                    SUM(CASE WHEN verdict = 'pending' AND expiry > :today THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN verdict = 'pending' AND expiry <= :today THEN 1 ELSE 0 END) AS awaiting_score,
+                    SUM(CASE WHEN verdict = 'no_data' THEN 1 ELSE 0 END) AS unscorable
                 FROM oracle_predictions
                 {where_sql}
                 """
@@ -64,6 +70,9 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
     avg_pnl = _coerce_float(row[5] if row else None)
     total_pnl = _coerce_float(row[6] if row else None) or 0.0
     scored = hits + misses + partials
+    active = _coerce_int(row[7] if row else 0)
+    awaiting_score = _coerce_int(row[8] if row else 0)
+    unscorable = _coerce_int(row[9] if row else 0)
 
     return {
         "total_predictions": total,
@@ -72,6 +81,14 @@ def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> di
         "hits": hits,
         "misses": misses,
         "partials": partials,
+        "active": active,
+        "awaiting_score": awaiting_score,
+        "unscorable": unscorable,
+        # Include unknown verdicts and pending rows without an expiry instead
+        # of silently dropping them from the operator's lifecycle totals.
+        "other": total - scored - active - awaiting_score - unscorable,
+        "lifecycle_as_of": today.isoformat(),
+        "mean_signed_return_pct": round(avg_pnl, 2) if avg_pnl is not None else None,
         "accuracy": _prediction_accuracy(hits, misses, partials),
         "avg_pnl": round(avg_pnl, 2) if avg_pnl is not None else 0.0,
         "total_pnl": round(total_pnl, 2),
@@ -237,6 +254,30 @@ def build_oracle_ticker_rollup(
     }
 
 
+def _fetch_recording_cohorts(engine: Engine) -> dict[str, dict[str, Any]]:
+    """Keep newly recorded reference forecasts apart from unqualified history."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT recording_policy, COUNT(*),
+                   SUM(CASE WHEN verdict = 'pending' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN verdict = 'no_data' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN verdict IN ('hit', 'partial', 'miss') THEN 1 ELSE 0 END),
+                   AVG(CASE WHEN verdict IN ('hit', 'partial', 'miss') THEN pnl_pct END)
+            FROM oracle_predictions WHERE dedup_keep = TRUE GROUP BY recording_policy
+        """)).fetchall()
+    cohorts = {key: {"total": 0, "pending": 0, "unscorable": 0, "scored": 0,
+                     "other": 0, "mean_signed_return_pct": None}
+               for key in ("oracle_forward_v2", "oracle_external_v2", "legacy")}
+    for row in rows:
+        total, pending, unavailable, scored = (_coerce_int(row[i]) for i in range(1, 5))
+        cohorts[row[0] if row[0] is not None else "legacy"] = {
+            "total": total, "pending": pending, "unscorable": unavailable, "scored": scored,
+            "other": total - pending - unavailable - scored,
+            "mean_signed_return_pct": _coerce_float(row[5]),
+        }
+    return cohorts
+
+
 def build_oracle_scoreboard(engine: Engine, ticker_limit: int = 30) -> dict[str, Any]:
     calibration_data = None
     try:
@@ -252,4 +293,5 @@ def build_oracle_scoreboard(engine: Engine, ticker_limit: int = 30) -> dict[str,
         "models": _fetch_model_rows(engine),
         "by_ticker": ticker_rollup["by_ticker"],
         "calibration": calibration_data,
+        "recording_cohorts": _fetch_recording_cohorts(engine),
     }

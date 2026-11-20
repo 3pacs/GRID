@@ -139,31 +139,41 @@ _COMMODITY_SLUG_TO_TICKER: dict[str, str] = {
     "lumber": "LBR=F",
     "platinum": "PL=F",
     "palladium": "PA=F",
-    # Non-commodity aliases: supplier slugs whose equity trades under a
-    # different ticker than the slug itself.
-    "tsmc": "TSM",
+    # Equity slugs (tsmc -> TSM, intel -> INTC) live in
+    # intelligence.supply_chain_symbols.NODE_SYMBOLS, the one rule for equities.
 }
 
 
-def resolve_price_series_id(node_id: str) -> str | None:
+UNTYPED = object()  # caller has no supply_chain_nodes type for the id
+
+
+def resolve_price_series_id(node_id: str, node_type: Any = UNTYPED) -> str | None:
     """Resolve a supply_chain node id to a raw_series YF close series id.
 
     Lookup order:
-        1. ``_COMMODITY_SLUG_TO_TICKER`` for known commodity slugs.
-        2. Uppercase the node_id as if it were a ticker (``hsy`` -> ``HSY``).
-        3. Return None if the node looks like something that won't have
-           price data (country code, utility name, etc.).
+        1. ``_COMMODITY_SLUG_TO_TICKER`` for known commodity slugs, unless
+           the node is typed ``ticker`` (a fund named like the commodity).
+        2. Equities go through
+           :func:`intelligence.supply_chain_symbols.symbol_for`: curated
+           aliases (``tsmc`` -> TSM, ``intel`` -> INTC), delisted and foreign
+           companies untradable, non-ticker types untradable, and the id
+           upper-cased only for a node typed ``ticker``.
+        3. ``node_type`` None means the id has no ``supply_chain_nodes`` row:
+           fail closed (no series) for anything but a commodity slug.
+
+    Callers that have not loaded node types (``UNTYPED``) get the aliases and
+    the delisted/foreign rules with the id treated as a ticker, never a raw
+    upper-casing of a company name.
     """
     if not node_id:
         return None
     key = node_id.strip().lower()
-    if key in _COMMODITY_SLUG_TO_TICKER:
+    if key in _COMMODITY_SLUG_TO_TICKER and node_type != "ticker":
         return f"YF:{_COMMODITY_SLUG_TO_TICKER[key]}:close"
-    # Heuristic: a ticker-looking id is uppercase/alnum with <= 5 chars.
-    upper = node_id.strip().upper()
-    if 1 <= len(upper) <= 6 and upper.replace(".", "").replace("-", "").isalnum():
-        return f"YF:{upper}:close"
-    return None
+    from intelligence.supply_chain_symbols import symbol_for
+
+    symbol = symbol_for(node_id, "ticker" if node_type is UNTYPED else node_type).symbol
+    return f"YF:{symbol}:close" if symbol else None
 
 
 def fetch_close_series(

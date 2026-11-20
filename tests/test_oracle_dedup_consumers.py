@@ -82,7 +82,9 @@ def test_direct_oracle_prediction_writers_use_natural_key_upsert() -> None:
                     "(COALESCE(model_version, ''))",
                     "created_at AT TIME ZONE 'UTC'",
                     "WHERE dedup_keep = TRUE",
-                    "DO UPDATE SET",
+                    "DO NOTHING",
+                    "model_name",
+                    "recording_policy",
                 )
             ):
                 missing.append(relpath)
@@ -95,7 +97,7 @@ def test_oracle_engine_bootstrap_defines_dedup_keep_and_unique_index() -> None:
     source = (ROOT / "oracle/engine.py").read_text()
 
     assert "dedup_keep BOOLEAN NOT NULL DEFAULT TRUE" in source
-    assert "oracle_predictions_dedup_unique" in source
+    assert "ensure_dedup_index_on_connection" in source
     assert "created_at AT TIME ZONE 'UTC'" in source
 
 

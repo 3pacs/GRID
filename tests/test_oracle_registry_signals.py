@@ -51,3 +51,16 @@ def test_registry_empty_returns_empty():
             "AAPL", SimpleNamespace(name="m1"))
 
     assert sigs == []
+
+
+def test_disabled_spec_returns_no_signals_without_database_read():
+    from datetime import datetime, timezone
+    from oracle.model_factory import ModelFactory, ModelSpec
+
+    factory = ModelFactory.__new__(ModelFactory)
+    factory.engine = MagicMock()
+    factory.get_model_spec = lambda name: ModelSpec(
+        name=name, active=False, signal_sources=["fixture"],
+    )
+    assert factory.get_signals_for_model("disabled", datetime.now(timezone.utc)) == []
+    factory.engine.connect.assert_not_called()

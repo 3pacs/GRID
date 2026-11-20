@@ -7,15 +7,8 @@
  * logs as files under `--out`, because the browser tool available to the
  * lead cannot save images.
  *
- * IMPORTANT — not run by the harness build itself:
- *   This script was written to spec but has NOT been executed in this
- *   session. The task that built this harness (tests/browser/fixture_api/*)
- *   was explicitly told not to install or drive a browser itself, because
- *   only one browser is available on this machine and it is driven live by
- *   the lead — the same constraint applies to launching Chrome/Edge via
- *   puppeteer-core, so this script was authored but never run, `npm ci`
- *   was never run in this directory, and no tests/browser/evidence/ output
- *   was generated or committed by that session. Run it yourself:
+ * Local synthetic source acceptance only; not production/deploy acceptance.
+ * See M1-SPY-JOURNEY.md for the current scope and legacy receipt limitations.
  *
  *     cd tests/browser
  *     npm ci
@@ -23,7 +16,8 @@
  *
  * Usage:
  *   node run_evidence.mjs --tree-label <sha-or-label> \
- *     [--pwa-dir <path>] [--scenarios healthy,partial,empty] \
+ *     [--pwa-dir <path>] [--browser-executable <path>] \
+ *     [--scenarios healthy,partial,empty,unavailable,error] \
  *     [--roles admin,contributor] [--journeys home,ticker-lookup,...] \
  *     [--out tests/browser/evidence/<tree-label>/]
  *
@@ -50,15 +44,20 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, existsSync, read
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveBrowserExecutable, sourceIdentity, classifyApiFailures, classifyRequestFailures, parseChoiceList, hasCompleteResultMatrix } from './harness_config.mjs';
+import { runSpyJourney } from './spy_journey.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..'); // this harness worktree root
+const PRELOAD_COVERAGE = JSON.parse(readFileSync(path.join(__dirname, 'fixture_api', 'preload_coverage.json'), 'utf8'));
+const OMITTED_PRELOAD_PATHS = new Set(PRELOAD_COVERAGE.map(row => row.path));
 
 // ── CLI args ──────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
     const args = {
         'pwa-dir': path.join(REPO_ROOT, 'pwa'),
+        'browser-executable': null,
         scenarios: 'healthy,partial,empty',
         roles: 'admin,contributor',
         journeys: null, // null = all journeys for the role (default)
@@ -87,8 +86,8 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 const PWA_DIR = path.resolve(args['pwa-dir']);
 const TREE_LABEL = args['tree-label'];
-const SCENARIOS = args.scenarios.split(',').map((s) => s.trim()).filter(Boolean);
-const ROLES = args.roles.split(',').map((s) => s.trim()).filter(Boolean);
+const SCENARIOS = parseChoiceList(args.scenarios, 'scenarios', ['healthy', 'partial', 'empty', 'unavailable', 'error']);
+const ROLES = parseChoiceList(args.roles, 'roles', ['admin', 'contributor']);
 const JOURNEY_FILTER = args.journeys
     ? new Set(args.journeys.split(',').map((s) => s.trim()).filter(Boolean))
     : null;
@@ -101,48 +100,10 @@ const OUT_ROOT = path.join(path.resolve(args.out), `run-${RUN_STAMP}`);
 const FIXTURE_PORT = 8001;
 const PWA_PORT = 5174;
 const FIXTURE_BASE = `http://127.0.0.1:${FIXTURE_PORT}`;
-const PWA_BASE = `http://localhost:${PWA_PORT}`;
+const PWA_BASE = `http://127.0.0.1:${PWA_PORT}`;
 
 // ── Browser executable ──────────────────────────────────────────────
 // No browser download: point puppeteer-core at the system install.
-
-const BROWSER_CANDIDATES = {
-    linux: [
-        '/usr/bin/google-chrome',
-        '/usr/bin/google-chrome-stable',
-        '/opt/google/chrome/chrome',
-        '/usr/bin/chromium',
-        '/usr/bin/chromium-browser',
-        '/snap/bin/chromium',
-        '/usr/bin/microsoft-edge',
-    ],
-    darwin: [
-        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        '/Applications/Chromium.app/Contents/MacOS/Chromium',
-        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-    ],
-    win32: [
-        'C:/Program Files/Google/Chrome/Application/chrome.exe',
-        'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
-        'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
-        'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
-    ],
-};
-
-function resolveBrowserExecutable(env = process.env, platform = process.platform, exists = existsSync) {
-    const override = env.CHROME_PATH;
-    if (override) {
-        if (exists(override)) return override;
-        throw new Error(`CHROME_PATH=${override} does not exist.`);
-    }
-    const candidates = BROWSER_CANDIDATES[platform] || BROWSER_CANDIDATES.linux;
-    const found = candidates.find((p) => exists(p));
-    if (found) return found;
-    throw new Error(
-        `No Chrome/Chromium/Edge found (checked: ${candidates.join(', ')}). ` +
-        'This runner does not download a browser — install one or set CHROME_PATH.'
-    );
-}
 
 const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 
@@ -156,6 +117,7 @@ const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 
 
 const JOURNEYS = {
     admin: [
+        { name: 'spy-options', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/, run: runSpyJourney },
         { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?', ready: /Your read|Start over|Here's (how|what)/ },
         { name: 'ticker-lookup', hash: '#/ticker-lookup', ready: /GOLD VERDICT/ },
         { name: 'watchlist-analysis', hash: '#/watchlist/TEST1', ready: /INSIDER EDGE|AI OVERVIEW/ },
@@ -335,10 +297,9 @@ function startFixtureServer(scenario, role) {
 }
 
 function startPwaDevServer() {
-    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     const child = spawn(
-        npmCmd,
-        ['run', 'dev', '--', '--port', String(PWA_PORT), '--strictPort'],
+        process.execPath,
+        [path.join(PWA_DIR, 'node_modules', 'vite', 'bin', 'vite.js'), '--host', '127.0.0.1', '--port', String(PWA_PORT), '--strictPort'],
         {
             cwd: PWA_DIR,
             env: {
@@ -347,9 +308,6 @@ function startPwaDevServer() {
                 GRID_WS_PROXY_TARGET: `ws://127.0.0.1:${FIXTURE_PORT}`,
             },
             stdio: ['ignore', 'pipe', 'pipe'],
-            // Node >= 20.12 refuses to spawn a .cmd shim without a shell (EINVAL);
-            // stopChild's taskkill /T reaps the whole shell tree on Windows.
-            shell: process.platform === 'win32',
             detached: process.platform !== 'win32',
         }
     );
@@ -450,7 +408,7 @@ function detectCrash(bodyText) {
 
 // ── Main per-(role, scenario) run ────────────────────────────────────
 
-async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode: null }) {
+async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode: null }, requestFailureControl = null) {
     mkdirSync(outDir, { recursive: true });
     const consoleLogPath = path.join(outDir, 'console.jsonl');
     const networkLogPath = path.join(outDir, 'network.jsonl');
@@ -462,12 +420,55 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
         role,
         scenario,
         started_at: new Date().toISOString(),
+        mode: 'local synthetic fixtures / Vite development modules; no deployment identity',
+        source_before: sourceIdentity(REPO_ROOT, ['tests/browser']),
+        pwa_source_before: sourceIdentity(PWA_DIR, ['src']),
         journeys: {},
     };
 
     const userDataDir = mkdtempSync(path.join(tmpdir(), `grid-evidence-${role}-${scenario}-`));
     const page = await browser.newPage();
+    // Capture actual responses rather than service-worker-owned fetches. This
+    // is a source journey, not a service-worker/offline-cache qualification.
+    await page.setBypassServiceWorker(true);
     await page.setViewport({ width: 1280, height: 900 });
+    // Fail closed on external requests, including links/providers accidentally
+    // introduced by a view. Only the two runner-owned loopback servers are allowed.
+    const blockedRequests = [];
+    const requestFailures = [];
+    let tearingDown = false;
+    let activeJourney = 'bootstrap';
+    const requestJourneys = new WeakMap();
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+        requestJourneys.set(request, activeJourney);
+        const url = new URL(request.url());
+        const controlFailure = requestFailureControl?.(url);
+        if (controlFailure) { request.abort(controlFailure); return; }
+        if (['data:', 'blob:', 'about:'].includes(url.protocol) ||
+            [PWA_BASE, FIXTURE_BASE].includes(url.origin)) {
+            // Select the SPY matrix contract without changing #977's public/
+            // legacy Gamma fixtures used by its separate existing journey.
+            request.continue(url.pathname.startsWith('/api/') ? {
+                headers: { ...request.headers(), 'x-grid-fixture-journey': activeJourney },
+            } : undefined);
+        }
+        else { blockedRequests.push(request.url()); request.abort(); }
+    });
+    const moduleResponses = [];
+    const fixtureResponses = [];
+
+    page.on('requestfailed', request => {
+        const url = new URL(request.url());
+        if (![PWA_BASE, FIXTURE_BASE].includes(url.origin) || !url.pathname.startsWith('/api/')) return;
+        const failure = {
+            ts: new Date().toISOString(), method: request.method(), url: request.url(),
+            journey: requestJourneys.get(request) || 'bootstrap', active_journey: activeJourney,
+            error_text: request.failure()?.errorText || 'unknown request failure', teardown: tearingDown,
+        };
+        requestFailures.push(failure);
+        appendFileSync(path.join(outDir, 'requestfailed.jsonl'), JSON.stringify(failure) + '\n');
+    });
 
     page.on('console', (msg) => {
         const type = msg.type();
@@ -479,7 +480,16 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
     });
     page.on('response', (res) => {
         const url = res.url();
+        if (url.startsWith(PWA_BASE) && /\/(src|@vite)\//.test(url)) {
+            moduleResponses.push(res.buffer().then(bytes => {
+                return import('node:crypto').then(({ createHash }) => ({ url, status: res.status(), sha256: createHash('sha256').update(bytes).digest('hex') }));
+            }).catch(() => ({ url, error: 'body unavailable' })));
+        }
         if (url.includes('/api/')) {
+            if (res.status() >= 300 || /\/gamma-watch\/state|\/derivatives\/(?:gex|vanna-charm|flow-timeline)\/SPY/.test(url)) {
+                const journey = requestJourneys.get(res.request()) || 'bootstrap';
+                fixtureResponses.push(res.json().then(body => ({ url, status: res.status(), journey, body })).catch(() => ({ url, status: res.status(), journey, error: 'body unavailable' })));
+            }
             appendFileSync(networkLogPath, JSON.stringify({
                 ts: new Date().toISOString(), role, scenario,
                 method: res.request().method(), url, status: res.status(),
@@ -496,6 +506,7 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
         (j) => !JOURNEY_FILTER || JOURNEY_FILTER.has(j.name)
     );
     for (const journey of journeyList) {
+        activeJourney = journey.name;
         const journeyErrorCountBefore = countJsonlLines(consoleLogPath, (l) => l.type === 'error');
         const apiCallsBefore = readJsonl(networkLogPath).length;
 
@@ -510,6 +521,12 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 await waitSettled(page);
             }
             const readiness = await waitForReady(page, journey);
+            if (readiness.ready === 'timeout' && journey.run) throw new Error('Initial view not ready');
+            const capture = async name => {
+                await page.screenshot({ path: path.join(outDir, `${journey.name}.${name}.png`), fullPage: true });
+                writeFileSync(path.join(outDir, `${journey.name}.${name}.text.txt`), await page.evaluate(() => document.body.innerText));
+            };
+            const checks = journey.run ? await journey.run(page, scenario, capture) : [];
 
             // Desktop screenshot
             await page.setViewport({ width: 1280, height: 900 });
@@ -535,6 +552,8 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 console_errors: errorsAfter - journeyErrorCountBefore,
                 api_non_2xx: nonTwoXx,
                 allow_crash: !!journey.allowCrash,
+                checks,
+                final_url: page.url(),
                 ready: readiness.ready,
                 ready_wait_ms: readiness.ready_wait_ms,
                 label_checks: evaluateChecks(journey, scenario, bodyText),
@@ -546,11 +565,32 @@ async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode
                 console_errors: null,
                 api_non_2xx: null,
                 runner_error: String(err && err.message || err),
+                checks: err.checks || [],
             };
+            await page.screenshot({ path: path.join(outDir, `${journey.name}.failure.png`), fullPage: true }).catch(() => {});
+            writeFileSync(path.join(outDir, `${journey.name}.failure.text.txt`), await page.evaluate(() => document.body.innerText).catch(() => ''));
         }
     }
 
+    summary.served_modules = await Promise.all(moduleResponses);
+    summary.fixture_responses = await Promise.all(fixtureResponses);
+    // Observe requestfailed through page closure before calculating verdicts.
+    // Only ERR_ABORTED during this explicit teardown is an expected abort.
+    tearingDown = true;
     await page.close();
+    summary.api_failures = classifyApiFailures(summary.fixture_responses, scenario, OMITTED_PRELOAD_PATHS);
+    summary.unexpected_api_failures = summary.api_failures.filter(r => r.classification === 'unexpected_api_failure');
+    summary.request_failures = classifyRequestFailures(requestFailures);
+    summary.unexpected_request_failures = summary.request_failures.filter(r => r.classification === 'unexpected_request_failure');
+    summary.preload_fixture_coverage = PRELOAD_COVERAGE;
+    summary.spy_network_gate_passed = !summary.journeys['spy-options'] ||
+        ![...summary.unexpected_api_failures, ...summary.unexpected_request_failures].some(r => ['bootstrap', 'spy-options'].includes(r.journey));
+    summary.transport_evidence_complete = !summary.journeys['spy-options'] ||
+        summary.fixture_responses.some(r => r.url.endsWith('/gamma-watch/state') && r.body);
+    summary.blocked_requests = blockedRequests;
+    summary.source_after = sourceIdentity(REPO_ROOT, ['tests/browser']);
+    summary.pwa_source_after = sourceIdentity(PWA_DIR, ['src']);
+    summary.source_unchanged = summary.source_before.sha256 === summary.source_after.sha256 && summary.pwa_source_before.sha256 === summary.pwa_source_after.sha256;
     summary.finished_at = new Date().toISOString();
     writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summary, null, 2));
     return summary;
@@ -570,7 +610,7 @@ function countJsonlLines(p, predicate) {
 
 // ── Entry point ───────────────────────────────────────────────────────
 
-async function main() {
+export async function main({ requestFailureControl = null } = {}) {
     let puppeteer;
     try {
         puppeteer = await import('puppeteer-core');
@@ -581,7 +621,11 @@ async function main() {
         process.exit(1);
     }
 
-    const executablePath = resolveBrowserExecutable();
+    const executablePath = resolveBrowserExecutable(args['browser-executable']);
+    for (const role of ROLES) {
+        if (!JOURNEYS[role]) throw new Error(`Unknown role: ${role}`);
+        if (JOURNEY_FILTER && !JOURNEYS[role].some(j => JOURNEY_FILTER.has(j.name))) throw new Error(`No requested journey for ${role}`);
+    }
     mkdirSync(OUT_ROOT, { recursive: true });
 
     const results = [];
@@ -591,6 +635,12 @@ async function main() {
             await assertPortsFree([FIXTURE_PORT, PWA_PORT]);
             const fixtureChild = startFixtureServer(scenario, role);
             const pwaChild = startPwaDevServer();
+            const serverLogDir = path.join(OUT_ROOT, `${role}-${scenario}`);
+            mkdirSync(serverLogDir, { recursive: true });
+            for (const [name, child] of [['fixture', fixtureChild], ['vite', pwaChild]]) {
+                for (const stream of ['stdout', 'stderr']) child[stream].on('data', chunk => appendFileSync(path.join(serverLogDir, `${name}.log`), chunk));
+                child.on('error', error => appendFileSync(path.join(serverLogDir, `${name}.log`), String(error)));
+            }
             let browserInstance = null;
             try {
                 const fixtureUp = await waitForHttp(`${FIXTURE_BASE}/api/v1/auth/verify`, { timeoutMs: 15000 });
@@ -606,7 +656,7 @@ async function main() {
                 });
 
                 const outDir = path.join(OUT_ROOT, `${role}-${scenario}`);
-                const summary = await runOne(browserInstance, role, scenario, outDir, fixtureChild);
+                const summary = await runOne(browserInstance, role, scenario, outDir, fixtureChild, requestFailureControl);
                 results.push(summary);
             } catch (err) {
                 console.error(`role=${role} scenario=${scenario} failed: ${err}`);
@@ -620,17 +670,22 @@ async function main() {
         }
     }
 
+    const matrixComplete = hasCompleteResultMatrix(results, ROLES, SCENARIOS);
     writeFileSync(path.join(OUT_ROOT, 'run_index.json'), JSON.stringify({
         tree_label: TREE_LABEL,
         pwa_dir: PWA_DIR,
         generated_at: new Date().toISOString(),
+        matrix_complete: matrixComplete,
         results,
     }, null, 2));
 
     console.log(`\nDone. Evidence written under ${OUT_ROOT}`);
+    if (!matrixComplete || results.some(r => r.error || !r.source_unchanged || !r.transport_evidence_complete || !r.spy_network_gate_passed || !Object.keys(r.journeys || {}).length || Object.values(r.journeys || {}).some(j => j.runner_error || j.crashed || j.ready === 'timeout' || j.label_checks?.pass === false || j.checks?.some(c => !c.passed)))) {
+        process.exitCode = 1;
+    }
 }
 
-main().catch((err) => {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch((err) => {
     console.error(err);
     process.exit(1);
 });

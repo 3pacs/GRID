@@ -496,6 +496,8 @@ SEED_MAPPINGS: dict[str, str] = {
     "finra:short_volume_agg:spy_ratio": "finra_short_volume_ratio_spy",
     "finra:short_volume_agg:qqq_ratio": "finra_short_volume_ratio_qqq",
     "finra:short_volume_agg:iwm_ratio": "finra_short_volume_ratio_iwm",
+    # DIX (ingestion/altdata/finra_dix.py; migration finra_dix_feature_20261113)
+    "finra:dix_sp500": "finra_dix_sp500",
 
     # ── WorldNews series (wn_*) ──────────────────────────────────────────
     "wn_geopolitical_article_count": "wn_geopolitical_article_count",
@@ -860,6 +862,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # 2021-11-19); registered by migrations/versions/ghost_features_20261104.py.
     "CBOE:COR3M": "implied_correlation_3m",
     "CBOE:SKEW": "skew_index",
+    # ingestion/altdata/cboe_indices.py writes SKEW with the feature name as
+    # series_id (like vvix). Only the one-off bulk pull wrote CBOE:SKEW, so
+    # without this the daily rows never resolved and skew_index stopped at
+    # 2026-03-25 (D0 gap G11, #1129).
+    "skew_index": "skew_index",
 
     # Binance crypto (bulk ZIP)
     "BINANCE:BTCUSDT:close": "btc_full",       # TYPO-FIX: btc_close not in registry, btc_full exists
@@ -1108,6 +1115,17 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     **{f"YF:{t}:adj_close": f"{t.lower()}_full" for t in [
         "GLD", "SLV", "USO", "UNG",
         "TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "MUB",
+    ]},
+    # Reddit board stats (2026-11-17): the reddit_<sub> ("active users") and
+    # reddit_<sub>_subs ("subscribers") features registered by the one-shot
+    # 2026-03-21 scripts/load_alt_data.py run, fed again by
+    # SocialSentimentPuller.pull_ticker_series from the Reddit Data API once
+    # an owner-registered app exists (ingestion/altdata/reddit_oauth.py).
+    **{f"REDDIT:{sub}:active_users": f"reddit_{sub}" for sub in [
+        "wallstreetbets", "bitcoin", "cryptocurrency", "stocks", "economics",
+    ]},
+    **{f"REDDIT:{sub}:subscribers": f"reddit_{sub}_subs" for sub in [
+        "wallstreetbets", "bitcoin", "cryptocurrency", "stocks", "economics",
     ]},
 }
 

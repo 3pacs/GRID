@@ -252,12 +252,15 @@ def forecast_to_prediction(
         "forecaster_adapter",
     )
 
-    # Expiry from horizon
-    expiry = date.today() + timedelta(days=forecast_result.horizon)
-
-    # Build prediction ID
+    # Use one UTC decision clock for the day, expiry and stored timestamp.
+    # A same-day direction or model-version change is a different natural
+    # key in oracle_predictions. Reusing the old ticker/day/horizon ID for
+    # that key raised a primary-key conflict and rolled back the whole cycle.
+    now = datetime.now(timezone.utc)
+    expiry = now.date() + timedelta(days=forecast_result.horizon)
     pred_id = hashlib.sha256(
-        f"timesfm:{ticker}:{date.today().isoformat()}:{forecast_result.horizon}".encode()
+        f"timesfm:v2:{ticker}:{now.date().isoformat()}:{expiry.isoformat()}:"
+        f"{direction}:{forecast_result.model_version}".encode()
     ).hexdigest()[:16]
 
     # Compute signal strength
@@ -278,7 +281,7 @@ def forecast_to_prediction(
 
     return OraclePrediction(
         id=pred_id,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=now,
         ticker=ticker,
         prediction_type=PredictionType.DIRECTION,
         direction=direction,

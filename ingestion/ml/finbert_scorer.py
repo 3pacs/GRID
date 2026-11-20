@@ -13,6 +13,7 @@ to avoid redundant work on subsequent runs.
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import date
 from typing import Any
@@ -34,8 +35,30 @@ SOURCE_TEXT_KEYS: dict[str, list[str]] = {
 }
 
 MODEL_NAME = "ProsusAI/finbert"
-# Cache dir follows existing model path pattern
-MODEL_CACHE_DIR = "/data/grid_v4/grid_repo/grid/models/finbert"
+# Weights live with the other local models, outside any code checkout, so a
+# release or checkout move never loses them. They used to sit inside the old
+# /data/grid_v4/grid_repo checkout, which is being retired; that path is used
+# only while it still holds the cache and the new one does not exist yet.
+# GRID_FINBERT_CACHE_DIR overrides both.
+FINBERT_CACHE_DIR_DEFAULT = "/data/models/finbert"
+FINBERT_CACHE_DIR_LEGACY = "/data/grid_v4/grid_repo/grid/models/finbert"
+
+
+def finbert_cache_dir(
+    *,
+    default: str = FINBERT_CACHE_DIR_DEFAULT,
+    legacy: str = FINBERT_CACHE_DIR_LEGACY,
+) -> str:
+    """Directory FinBERT weights are cached in (see the comment above)."""
+    configured = os.environ.get("GRID_FINBERT_CACHE_DIR", "").strip()
+    if configured:
+        return configured
+    if not os.path.isdir(default) and os.path.isdir(legacy):
+        return legacy
+    return default
+
+
+MODEL_CACHE_DIR = finbert_cache_dir()
 
 # Process-scoped breaker for fatal FinBERT load failures (missing wheel,
 # corrupted cache, OOM during init). Each cycle iterates every source —

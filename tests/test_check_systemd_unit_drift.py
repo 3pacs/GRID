@@ -109,3 +109,30 @@ def test_bad_arguments_and_missing_dirs(tmp_path):
     assert missing.returncode == 64 and "templates dir not found" in missing.stderr
     bogus = subprocess.run(["bash", str(SCRIPT), "--what"], capture_output=True, text=True, check=False)
     assert bogus.returncode == 64
+
+
+REPO_TEMPLATES = SCRIPT.parents[1] / "deploy" / "systemd"
+
+
+def test_every_shipped_template_with_the_marker_is_managed(tmp_path):
+    """The marker in the real templates carries a trailing explanation; the script must still see it.
+
+    2026-11-09: the exact-line match never matched the shipped marker, so no unit was ever
+    synced and the grader kept running without its new Environment= line.
+    """
+    marked = [p for p in REPO_TEMPLATES.iterdir()
+              if p.is_file() and p.name.endswith((".service.template", ".timer.template", ".service", ".timer"))
+              and "deploy-sync: managed" in p.read_text()]
+    assert len(marked) >= 6
+    system = tmp_path / "system"
+    system.mkdir()
+    for template in marked:
+        unit = template.name.removesuffix(".template")
+        (system / unit).write_text("[Unit]\nDescription=stale\n")
+    result = run(REPO_TEMPLATES, system, "--sync")
+    for template in marked:
+        unit = template.name.removesuffix(".template")
+        assert f"SYNCED {unit}" in result.stdout, result.stdout
+        assert (system / unit).read_text() == template.read_text()
+    assert f"synced={len(marked)}" in result.stdout
+
