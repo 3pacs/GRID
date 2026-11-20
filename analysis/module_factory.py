@@ -1646,7 +1646,26 @@ def main(argv=None) -> int:
     v.add_argument("--file", required=True, type=Path)
     v.add_argument("--ledger", required=True, type=Path)
     v.add_argument("--anchor", required=True, type=Path)
+    p = sub.add_parser("prescreen", help="the one registered older-data look of a selected candidate, appended to the ledger")
+    p.add_argument("--registration", required=True, type=Path)
+    p.add_argument("--data", required=True, type=Path, help="the older-data bars file named by the registration's sha256")
+    p.add_argument("--ledger", required=True, type=Path)
+    p.add_argument("--anchor", required=True, type=Path)
     a = ap.parse_args(argv)
+    if a.cmd == "prescreen":
+        from analysis import factory_prescreen  # imported here: that module imports this one
+
+        try:
+            ledger = lse.Ledger(a.ledger, anchor=a.anchor)
+            done = factory_prescreen.prescreen(a.registration, a.data, ledger)["record"]
+        except (ValueError, OSError) as e:
+            print(json.dumps({"ok": False, "refused": str(e)}))
+            return 2
+        left = lse.summarize(ledger)["live"]["prescreen"]["stores"][done["store"]["id"]]["left"]
+        print(json.dumps({"ok": True, "looks_left": left, "head_sha256": ledger.head,
+                          **{k: done[k] for k in ("verdict", "n", "mean_net", "lower_bound", "baseline", "excess_mean",
+                                                  "excess_lower_bound", "by_year", "rule")}}))
+        return 0
     if a.cmd == "summary":
         print(json.dumps(lse.summarize(lse.Ledger(a.ledger, anchor=a.anchor)), indent=1))
         return 0
