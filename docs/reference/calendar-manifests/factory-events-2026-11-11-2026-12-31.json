@@ -1,0 +1,48 @@
+{
+ "coverage": {
+  "complete": true,
+  "end": "2026-12-31",
+  "events": [
+   "fomc",
+   "cpi",
+   "nfp"
+  ],
+  "start": "2026-11-11"
+ },
+ "derived_from": {
+  "generated_at": "2026-11-13T04:12:15+00:00",
+  "path": "config/econ_release_dates.json",
+  "sha256": "fed7698d061c5fe504a57efc601e9966f3e7e567095b5c8d7e2d1fbbfcffc6a3",
+  "version": "econ-release-dates/1"
+ },
+ "events": [
+  {
+   "basis": "release_day_bound",
+   "day": "2026-12-04",
+   "event": "nfp",
+   "known_at": "2026-12-04T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-12-09",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-12-10",
+   "event": "cpi",
+   "known_at": "2026-12-10T00:00:00-05:00",
+   "time_et": "08:30"
+  }
+ ],
+ "excluded": [],
+ "known_at_rules": {
+  "cpi": "release_day_bound: BLS announces every release date before its release day (the 2025 and 2026 shutdown reschedules included), but the as-published annual schedule is not captured here; so a date counts only from 00:00 ET on its own day, never the day before.",
+  "fomc": "fed_schedule_prior_year: the Fed publishes a year's scheduled meetings during the year before (the 2026-11-13 source snapshot already lists 2027's); bound: 00:00 ET on Dec 31 of the prior year. Unscheduled meetings are not in the source and never count.",
+  "nfp": "release_day_bound: as cpi."
+ },
+ "schema": "factory-events/1"
+}

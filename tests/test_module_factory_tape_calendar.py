@@ -11,6 +11,7 @@ import json
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
@@ -456,3 +457,94 @@ def test_feature_registry_tags_every_class_honestly():
         assert mf.REGISTRY[f]["live_source"].startswith("research-only")
     assert "bars_1m_live" in mf.REGISTRY["RR30"]["live_source"]
     assert mf.FLAGS == {"W1L", "W1H", *mf.CALENDAR_SPECS}
+
+
+# ── forward parts (factory 7 prerequisite, #1161) ──────────────────────────────
+
+MANIFESTS = ROOT / "docs/reference/calendar-manifests"
+ET = ZoneInfo("America/New_York")
+
+
+def private_calendars(tmp_path):
+    """Pinned XNYS bytes copied into private files (the reader refuses group-writable ones)."""
+    out = tmp_path / "calendars"
+    out.mkdir()
+    for name, _ in fc.PINS:
+        (out / name).write_bytes((MANIFESTS / name).read_bytes())
+        (out / name).chmod(0o600)
+    return out
+
+
+def test_forward_xnys_part_is_the_live_recorder_manifest_sliced(tmp_path):
+    live = (MANIFESTS / fc.LIVE_XNYS[0]).read_bytes()
+    assert hashlib.sha256(live).hexdigest() == fc.LIVE_XNYS[1]
+    name, sha = fc.PINS[-1]
+    assert fc.slice_xnys(live, fc.FORWARD_START, "2027-12-31") == (MANIFESTS / name).read_bytes()
+    assert hashlib.sha256((MANIFESTS / name).read_bytes()).hexdigest() == sha
+    # the live manifest and the research part agree on every session they share
+    research = json.loads((MANIFESTS / fc.PINS[-2][0]).read_bytes())
+    shared = [s for s in json.loads(live)["sessions"] if s["key"].split(":")[1] <= research["end"]]
+    assert shared and shared == [s for s in research["sessions"] if s["key"].split(":")[1] >= "2026-10-01"]
+    cal = fc.FactoryCalendar(private_calendars(tmp_path))
+    assert cal.previous_day("2026-11-11") == "2026-11-10"
+    assert cal.for_day("2026-11-26") is None  # Thanksgiving
+    assert cal.previous_day("2026-11-27") == "2026-11-25"
+    assert cal.for_day("2027-12-31") is not None
+    with pytest.raises(ValueError, match="outside qualified"):
+        cal.for_day("2028-01-03")
+    with pytest.raises(ValueError, match="outside"):
+        fc.slice_xnys(live, "2026-09-30", "2026-12-31")
+
+
+def test_forward_event_part_extends_without_moving_an_earlier_answer():
+    both = fc.FactoryEvents()
+    first = fc.FactoryEvents(pin=fc.EVENT_PIN)
+    assert (both.start, both.end) == ("2022-11-01", "2026-12-31")
+    assert fc.EVENT_PIN[1] in both.version and fc.FORWARD_EVENT_PIN[1] in both.version
+    noon = lambda d: datetime.fromisoformat(f"{d}T12:00").replace(tzinfo=ET)
+    d = date(2022, 11, 1)
+    while d.isoformat() <= "2026-11-10":
+        assert both.known(d.isoformat(), noon(d)) == first.known(d.isoformat(), noon(d))
+        d += timedelta(days=1)
+    at = lambda s: datetime.fromisoformat(s).replace(tzinfo=ET)
+    assert both.known("2026-12-10", at("2026-12-10T09:00")) == {"cpi"}
+    assert both.known("2026-12-10", at("2026-12-09T23:59")) == frozenset()  # BLS dates count from their own day
+    assert both.known("2026-12-09", at("2026-12-09T10:00")) == {"fomc"}
+    assert both.known("2026-12-04", at("2026-12-04T10:00")) == {"nfp"}
+    assert both.known("2026-11-20", at("2026-11-20T10:00")) == frozenset()
+    assert both.known("2027-01-04", at("2027-01-04T10:00")) is None  # past the forward part: unknown, not quiet
+    assert first.known("2026-12-10", at("2026-12-10T09:00")) is None
+
+
+def test_forward_event_part_is_derived_and_bounded_by_its_source():
+    raw = (MANIFESTS / fc.FORWARD_EVENT_PIN[0]).read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == fc.FORWARD_EVENT_PIN[1]
+    doc = json.loads(raw)
+    assert doc["coverage"]["start"] == fc.FORWARD_START
+    src = (ROOT / fc.EVENT_SOURCE).read_bytes()
+    if hashlib.sha256(src).hexdigest() != doc["derived_from"]["sha256"]:
+        pytest.skip("config/econ_release_dates.json was regenerated; check_forward_events compares instead")
+    econ = json.loads(src)
+    sha = doc["derived_from"]["sha256"]
+    assert fc.event_manifest_bytes(fc.derive_forward_events(econ, sha, fc.FORWARD_START, "2026-12-31")) == raw
+    assert fc.forward_event_end_bound(econ) == "2026-12-31"
+    with pytest.raises(ValueError, match="only through"):
+        fc.derive_forward_events(econ, sha, fc.FORWARD_START, "2027-01-31")
+    assert fc.check_forward_events(econ, sha) == []
+    moved = copy.deepcopy(econ)  # a shutdown-style reschedule after the part was pinned
+    moved["events"]["cpi"] = [d for d in moved["events"]["cpi"] if d != "2026-12-10"] + ["2026-12-18"]
+    assert fc.check_forward_events(moved, sha) == [
+        {"part": fc.FORWARD_EVENT_PIN[0], "event": "cpi", "day": "2026-12-10", "change": "removed"},
+        {"part": fc.FORWARD_EVENT_PIN[0], "event": "cpi", "day": "2026-12-18", "change": "added"},
+    ]
+
+
+def test_event_parts_must_be_contiguous(tmp_path):
+    for name, _ in fc.EVENT_PINS:
+        (tmp_path / name).write_bytes((MANIFESTS / name).read_bytes())
+    gap = json.loads((tmp_path / fc.FORWARD_EVENT_PIN[0]).read_bytes())
+    gap["coverage"]["start"] = "2026-11-12"
+    raw = fc.event_manifest_bytes(gap)
+    (tmp_path / "gap.json").write_bytes(raw)
+    with pytest.raises(ValueError, match="contiguous"):
+        fc.FactoryEvents(tmp_path, pins=(fc.EVENT_PIN, ("gap.json", hashlib.sha256(raw).hexdigest())))

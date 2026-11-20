@@ -66,7 +66,7 @@ def test_real_git_checkout_under_umask002(tmp_path):
         FactoryCalendar(checkout / "docs/reference/calendar-manifests")
     M.prepare(checkout)
     assert all(mode(p) == 0o644 for p in files)
-    assert len(FactoryCalendar(checkout / "docs/reference/calendar-manifests").sessions) == 1010
+    assert len(FactoryCalendar(checkout / "docs/reference/calendar-manifests").sessions) == 1010 + 286  # research parts + the forward part (#1161)
 
 
 @pytest.mark.parametrize("kind", ["hash", "missing", "symlink", "hardlink", "directory"])
