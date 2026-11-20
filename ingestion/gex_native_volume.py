@@ -15,8 +15,18 @@ Payload (``grid.native-volume.v1``), regular session only, completed bars only:
 * ``cumulative_shares``: sum of today's completed exchange regular-session bar volumes.
   A bar counts as completed once ``RECEIPT_GUARD_S`` seconds past its end at
   receipt (the reader requires ``latest_receipt_at >= end + 5``).
-* ``bar_vwap_estimate``: sum(HLC3 x volume) / sum(volume) over those bars, never
-  exact trade VWAP (``exact_trade_vwap`` False).
+* ``bar_vwap_estimate``: the bars' HLC3, weighted by Schwab's quote ``totalVolume``
+  increments, never exact trade VWAP (``exact_trade_vwap`` False). The bars carry
+  only ~81-88 % of the day's volume and miss it unevenly (about two-thirds of the
+  last half hour, in lumps), so bar volume under-weights late minutes: measured
+  2026-11-13..17, the bar-weighted figure sat up to $0.28 from Polygon's
+  consolidated VWAP, all of it from weights and none from prices. Each run the
+  runner keeps the quote's day counter; the bars that first became complete in a
+  run form a block whose weight is the counter's rise since the previous run and
+  whose price is the bars' own volume-weighted HLC3. On 2026-11-17 that matched
+  Polygon within $0.004 at every checkpoint. A block with no earlier sample (the
+  day's first, or after a gap with a falling or missing counter) is weighted by
+  its bar volume instead (``WEIGHTING`` in the module).
 * ``rvol``: ``cumulative_shares / baseline_median_shares`` exactly, where the
   baseline is the median cumulative through the same minute of the previous
   ``BASELINE_SESSIONS`` expected exchange sessions in the same response.
@@ -43,6 +53,26 @@ minute). The pinned offline XNYS manifest defines sessions, holidays, DST and
 early closes. Unknown calendar coverage fails closed. An early-close baseline
 that cannot supply the current elapsed window is unavailable, never rescaled
 or replaced. Signals never read this (``signal_confirmation`` False).
+
+Since the open (2026-11-19). The quote counter starts before the bars do:
+Schwab's extended-hours bars begin at 07:00 ET, while the counter at 09:31
+matched Polygon's whole tape from 04:00 (16-17 Nov, within 4 %), and on
+2026-11-18 it held ~1.4 M shares more than that tape (cause not established).
+Over the small total at the open those shares pushed the whole-day gap to 0.30
+(17 Nov) and 0.57 (18 Nov: 28 minutes ``bars_missing_volume``). So the runner
+samples the quote once on its last run before the bell, and the gate judges the
+volume since that sample against the regular bars:
+``(quote - pre_open_quote - regular bars) / (quote - pre_open_quote)`` in
+``SCOPE_GAP_MIN_SINCE_OPEN``..``SCOPE_GAP_MAX``. The floor is 0: with no
+pre-07:00 shares in it, the gap at the open is Schwab's opening-bar shortfall
+(about 5-10 %), and bars above the counter (Yahoo's failure) still fail. Without
+a usable pre-open sample (missed run, older than ``PRE_OPEN_MAX_AGE_S``, or a
+counter that did not rise) the whole-day gate above applies, unchanged. The
+whole-day figure stays ``relative_difference`` (the operator log's ``diff=``);
+the since-open one is ``since_open_difference`` and ``gate_basis`` says which
+judged. The same sample is the base of the first block's VWAP weight, and
+in-session samples taken before the first bar can complete (the 09:30 run's,
+which already contains the opening cross) are not used for weighting.
 """
 
 from __future__ import annotations
@@ -71,13 +101,18 @@ CALENDAR_VERSION = (f"manifest:{CALENDAR_SHA256}:exchange_calendars:4.11.2:panda
 # Must match gex-watch grid_native_volume (VWAP_BASIS, RVOL_BASIS, INTEGRITY_SCOPE,
 # and this producer's entry in its accepted producer set).
 PRODUCER = "GRID Schwab pricehistory snapshot"
-VWAP_BASIS = "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"
+VWAP_BASIS = ("HLC3 of native one-minute bars weighted by Schwab quote totalVolume increments "
+              "(bar volume where no earlier sample); not trade VWAP")
+VWAP_BASIS_V1 = "Volume-weighted HLC3 of native one-minute OHLCV; not trade VWAP"   # before 2026-11-19
 RVOL_BASIS = "Cumulative shares / median same-elapsed shares of exact prior ten sessions"
 INTEGRITY_SCOPE = "content integrity only; trust requires verified local producer and owner-only custody"
 BASELINE_SESSIONS = 10
 HISTORY_CALENDAR_DAYS = 21          # >= 10 prior sessions plus holidays
 SCOPE_GAP_MIN = 0.05                # (quote totalVolume - bars) / totalVolume, see the module docstring
 SCOPE_GAP_MAX = 0.30
+SCOPE_GAP_MIN_SINCE_OPEN = 0.0      # since the bell there are no pre-07:00 shares in the counter, see "Since the open"
+PRE_OPEN_WINDOW_S = 90              # the runner's last run before the bell (timer at :08 -> 09:29:08) samples the quote
+PRE_OPEN_MAX_AGE_S = 120            # a pre-open sample counts only if taken this close before the bell
 BAR_SECONDS = 60
 RECEIPT_GUARD_S = 5                 # reader: latest_receipt_at >= end_of_completed_window + 5
 MAX_AGE_S = 120                     # reader: receipt and event ages within 120 s of as_of
@@ -135,6 +170,30 @@ def calendar_window(now: float) -> tuple[ManifestCalendar, MarketSession | None,
     return calendar, current, calendar.prior_sessions(current.key, BASELINE_SESSIONS)
 
 
+def pre_open_session(now: float) -> MarketSession | None:
+    """Today's session when its bell is at most ``PRE_OPEN_WINDOW_S`` away (the runner's pre-open quote sample).
+
+    Raises like ``calendar_window`` on an unverified calendar; the runner then makes no call."""
+    session = _calendar().for_date(_session(now))
+    if session is None or not 0 < session.opens.timestamp() - now <= PRE_OPEN_WINDOW_S:
+        return None
+    return session
+
+
+def split_samples(samples: list[tuple[float, int]], session: MarketSession) -> tuple[tuple[float, int] | None, list[tuple[float, int]]]:
+    """(the pre-open sample or None, the samples the VWAP weighting uses).
+
+    The pre-open sample is the latest valid one in [bell - ``PRE_OPEN_MAX_AGE_S``, bell). Weighting uses it plus the
+    in-session samples taken once the first bar can be complete; earlier in-session ones would split the opening
+    minute (the 09:30 run's counter already holds the opening cross, which belongs to the 09:30 bar)."""
+    opens = session.opens.timestamp()
+    valid = sorted(s for s in samples if type(s[1]) is int and s[1] > 0)
+    pre = [s for s in valid if opens - PRE_OPEN_MAX_AGE_S <= s[0] < opens]
+    first = opens + BAR_SECONDS + RECEIPT_GUARD_S
+    pre_sample = pre[-1] if pre else None
+    return pre_sample, ([pre_sample] if pre_sample else []) + [s for s in valid if s[0] >= first]
+
+
 def _session(ts: float) -> date:
     return datetime.fromtimestamp(ts, ET).date()
 
@@ -159,12 +218,49 @@ def _payload(now: float, status: str, reason: str | None, **fields: Any) -> dict
     return base
 
 
+def quote_weighted_vwap(bars: list[tuple[float, float, float, float, int]], samples: list[tuple[float, int]]) -> tuple[float, dict[str, int]]:
+    """VWAP of ``bars`` (today's completed regular bars) with each block of bars weighted by the quote counter's rise.
+
+    ``samples``: (receipt time, quote totalVolume) of today's runs, oldest first, the current run last. A bar
+    belongs to the first sample taken at least ``RECEIPT_GUARD_S`` after its end (the run in which it first
+    counted as complete). A block's price is its bars' volume-weighted HLC3; its weight is the counter's rise
+    since the previous sample, or its bar volume when there is no earlier sample or the counter did not rise.
+    Pure."""
+    blocks: list[list] = []
+    j = 0
+    samples = sorted(s for s in samples if type(s[1]) is int and s[1] > 0)
+    for b in bars:
+        done = b[0] + BAR_SECONDS + RECEIPT_GUARD_S
+        while j < len(samples) and samples[j][0] < done:
+            j += 1
+        key = j if j < len(samples) else None
+        if not blocks or blocks[-1][0] != key:
+            blocks.append([key, []])
+        blocks[-1][1].append(b)
+    num = den = 0.0
+    used = {"quote_weighted_blocks": 0, "bar_weighted_blocks": 0}
+    for key, bs in blocks:
+        vol = sum(x[4] for x in bs)
+        price = (sum((x[1] + x[2] + x[3]) / 3.0 * x[4] for x in bs) / vol) if vol > 0 else sum((x[1] + x[2] + x[3]) / 3.0 for x in bs) / len(bs)
+        rise = samples[key][1] - samples[key - 1][1] if key is not None and key >= 1 else None
+        if rise is not None and rise > 0:
+            w = float(rise)
+            used["quote_weighted_blocks"] += 1
+        else:
+            w = float(vol)
+            used["bar_weighted_blocks"] += 1
+        num += price * w
+        den += w
+    return (num / den if den > 0 else float("nan")), used
+
+
 def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: float,
-            receipt_at: float) -> tuple[dict[str, Any], dict[str, Any]]:
+            receipt_at: float, quote_samples: list[tuple[float, int]] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Schwab body + quote + verified local calendar -> (payload, info).
 
-    ``info`` carries the scope-gap reconciliation and the bars consulted (for
-    the envelope's provenance); neither is part of the payload.
+    ``quote_samples``: today's earlier (receipt time, quote totalVolume) pairs kept by the runner; this run's quote
+    is added to them. ``info`` carries the scope-gap reconciliation, the VWAP weighting used and the bars consulted
+    (for the envelope's provenance); none of it is part of the payload.
     """
     now, receipt_at = _micro(now), _micro(receipt_at)
     bars = _bars(history)
@@ -198,7 +294,14 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
     cum = sum(b[4] for b in today_reg)
     if cum <= 0:
         return _payload(now, "unavailable", "zero_volume"), info
-    vwap = sum((b[1] + b[2] + b[3]) / 3.0 * b[4] for b in today_reg) / cum
+    samples = list(quote_samples or [])
+    if type(quote_total_volume) is int and quote_total_volume > 0:
+        samples.append((receipt_at, quote_total_volume))
+    pre_open, weighting_samples = split_samples(samples, current)
+    vwap, weighting = quote_weighted_vwap(today_reg, weighting_samples)
+    info["vwap_weighting"] = weighting
+    if not math.isfinite(vwap):
+        return _payload(now, "unavailable", "zero_volume"), info
 
     # Calendar-selected sessions, never the newest ten nonempty data dates.
     # An early close is comparable only while every exact prior session can
@@ -245,13 +348,21 @@ def compute(history: Mapping[str, Any], quote_total_volume: int | None, *, now: 
 
     day_bars = sum(b[4] for b in today_all)
     recon = {"quote_total_volume": quote_total_volume, "bars_total_volume": day_bars,
-             "scope_gap_band": [SCOPE_GAP_MIN, SCOPE_GAP_MAX], "relative_difference": None}
+             "scope_gap_band": [SCOPE_GAP_MIN, SCOPE_GAP_MAX], "relative_difference": None,
+             "gate_basis": "whole_day", "pre_open_quote_total_volume": None, "since_open_difference": None}
     info["reconciliation"] = recon
     if type(quote_total_volume) is not int or quote_total_volume <= 0:
         return _payload(now, "unreconciled", "quote_total_volume_unavailable", **fields), info
     gap = (quote_total_volume - day_bars) / quote_total_volume
     recon["relative_difference"] = round(gap, 6)
-    if gap < SCOPE_GAP_MIN:
+    low = SCOPE_GAP_MIN
+    if pre_open is not None and quote_total_volume - pre_open[1] > 0:
+        since = quote_total_volume - pre_open[1]
+        gap = (since - cum) / since
+        low = SCOPE_GAP_MIN_SINCE_OPEN
+        recon.update(gate_basis="since_open", pre_open_quote_total_volume=pre_open[1],
+                     since_open_difference=round(gap, 6), scope_gap_band=[low, SCOPE_GAP_MAX])
+    if gap < low:
         return _payload(now, "unreconciled", "bars_at_or_above_quote_total", **fields), info
     if gap > SCOPE_GAP_MAX:
         return _payload(now, "unreconciled", "bars_missing_volume", **fields), info

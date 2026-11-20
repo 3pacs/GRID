@@ -315,6 +315,169 @@ def test_pull_all_defaults_to_cboe_first(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(seen[0], options.CboeFirstOptionsClient)
 
 
+# ── Cboe delayed at the open: Yahoo for an undated first page ────────────
+#
+# 2026-11-19 09:38 New York: Cboe's ~15 min delayed underlying quote still
+# carried the previous session's time, so every GEM ticker was refused as
+# undated while Yahoo (not delayed) had served the same names on 11-17/11-18.
+
+
+def _stale_doc() -> dict[str, Any]:
+    doc = _doc()
+    doc["data"]["last_trade_time"] = "2026-11-04T15:59:59"  # previous session
+    return doc
+
+
+# 16:00 ET on the fixture session, before SESSION_NOW and the publish clock.
+_FRESH_TIME = int(datetime(2026, 11, 5, 21, 0, tzinfo=timezone.utc).timestamp())
+_PREVIOUS_SESSION_TIME = int(datetime(2026, 11, 4, 21, 0, tzinfo=timezone.utc).timestamp())
+
+
+class _DatedYahoo(_FakeYahoo):
+    """Yahoo double serving a two-expiry chain with a chosen quote time."""
+
+    def __init__(self, quote_time: int | None = _FRESH_TIME, available: bool = True) -> None:
+        super().__init__()
+        self.quote_time = quote_time
+        self.is_available = available
+
+    def get_options(self, ticker: str, expiry_ts: int | None = None) -> dict:
+        self.calls.append((ticker, expiry_ts))
+        expiry = NOV06 if expiry_ts is None else expiry_ts
+        strike = 95.0 if expiry == NOV06 else 100.0
+        return {
+            "expirations": [NOV06, NOV13], "strikes": [strike],
+            "calls": [{"strike": strike, "openInterest": 10, "volume": 2, "impliedVolatility": 0.2,
+                       "lastPrice": 1.0, "bid": 0.9, "ask": 1.1, "inTheMoney": False}],
+            "puts": [{"strike": strike, "openInterest": 12, "volume": 3, "impliedVolatility": 0.21,
+                      "lastPrice": 1.2, "bid": 1.1, "ask": 1.3, "inTheMoney": True}],
+            "quote": {"regularMarketPrice": 95.5, "regularMarketTime": self.quote_time},
+        }
+
+
+def _stale_puller(monkeypatch: pytest.MonkeyPatch, yahoo: Any) -> tuple[Any, _Session, list[Any]]:
+    """A puller whose Cboe answer is undated; ``yahoo`` is what YahooOptionsClient builds."""
+    puller = options.OptionsPuller.__new__(options.OptionsPuller)
+    puller.engine = _DB()
+    monkeypatch.setattr(puller, "_push_to_resolved", lambda *_a, **_k: 0)
+    monkeypatch.setattr(options.time, "sleep", lambda _s: None)
+    made: list[Any] = []
+
+    def _yahoo() -> Any:
+        made.append(yahoo)
+        return yahoo
+
+    monkeypatch.setattr(options, "YahooOptionsClient", _yahoo)
+    session = _Session(_Resp(200, _stale_doc()))
+    client = options.CboeFirstOptionsClient()
+    client.cboe = options.CboeOptionsClient(session=session)
+    puller._yahoo = client
+    return puller, session, made
+
+
+def test_cboe_stale_yahoo_fresh_yahoo_serves_the_whole_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    yahoo = _DatedYahoo()
+    puller, session, made = _stale_puller(monkeypatch, yahoo)
+
+    result = puller._pull_ticker("KO", "2026-11-05")
+
+    assert result["status"] == "SUCCESS", result
+    assert len(session.urls) == 1 and made == [yahoo]
+    # One provider per ticker capture: Yahoo serves every expiry page.
+    assert yahoo.calls == [("KO", None), ("KO", NOV13)]
+    assert puller._yahoo.provider_by_ticker == {"KO": "yahoo"}
+    db = puller.engine
+    assert len(db.batches) == 1
+    batch = db.batches[0]
+    assert batch["spot_provider"] == "yahoo"
+    assert batch["spot"] == pytest.approx(95.5)
+    assert batch["spot_market_at"] == datetime.fromtimestamp(_FRESH_TIME, timezone.utc)
+    assert batch["clock_metadata"] is None  # no Cboe document clocks on a Yahoo batch
+    assert {r["expiry"] for r in db.rows} == {"2026-11-06", "2026-11-13"}
+    assert all(r["provider_regular_market_at"] == datetime.fromtimestamp(_FRESH_TIME, timezone.utc)
+               for r in db.rows)
+
+
+@pytest.mark.parametrize("yahoo", [
+    _DatedYahoo(quote_time=_PREVIOUS_SESSION_TIME),  # Yahoo undated too
+    _DatedYahoo(quote_time=None),                    # Yahoo quote carries no time
+    _DatedYahoo(available=False),                    # crumb handshake failed
+], ids=["yahoo-stale", "yahoo-no-time", "yahoo-unavailable"])
+def test_cboe_stale_without_a_dated_yahoo_page_is_refused_as_undated(
+        monkeypatch: pytest.MonkeyPatch, yahoo: _DatedYahoo) -> None:
+    puller, session, made = _stale_puller(monkeypatch, yahoo)
+
+    result = puller._pull_ticker("KO", "2026-11-05")
+
+    assert result["status"] == "FAILED"
+    assert "incomplete options chain response" in result["error"]
+    assert "1 undated quote(s)" in result["error"]
+    assert len(session.urls) == 1 and made == [yahoo]
+    assert yahoo.calls == ([] if not yahoo.is_available else [("KO", None)])
+    # Cboe's answer is the one kept, so no Yahoo page ever joins the capture.
+    assert puller._yahoo.provider_by_ticker == {"KO": "cboe"}
+    assert puller.engine.batches == [] and puller.engine.rows == []
+
+
+def test_cboe_stale_yahoo_failed_fetch_keeps_cboe(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FailingYahoo(_DatedYahoo):
+        def get_options(self, ticker: str, expiry_ts: int | None = None) -> Any:
+            self.calls.append((ticker, expiry_ts))
+            return None
+
+    yahoo = _FailingYahoo()
+    client, _made = _composite(monkeypatch, _Resp(200, _stale_doc()))
+    monkeypatch.setattr(options, "YahooOptionsClient", lambda: yahoo)
+    first = client.get_options("KO")
+    assert first is not None and first["quote"]["regularMarketTime"] is not None
+    assert options._page_quote_time(first, date(2026, 11, 5)) is None
+    assert client.provider_by_ticker == {"KO": "cboe"}
+    # Later pages still come from the Cboe download, never from Yahoo.
+    assert client.get_options("KO", NOV13) is not None
+    assert yahoo.calls == [("KO", None)]
+
+
+def test_cboe_fresh_never_initialises_yahoo_through_pull_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    puller, _stale_session, made = _stale_puller(monkeypatch, _DatedYahoo())
+    puller._yahoo.cboe = options.CboeOptionsClient(session=_Session(_Resp(200, _doc())))
+    monkeypatch.setattr(options, "YahooOptionsClient",
+                        lambda: pytest.fail("Yahoo must not initialise for a dated Cboe chain"))
+
+    result = puller._pull_ticker("KO", "2026-11-05")
+
+    assert result["status"] == "SUCCESS", result
+    assert puller.engine.batches[0]["spot_provider"] == "cboe"
+    assert made == []
+
+
+def test_cboe_no_chain_never_tries_yahoo_even_for_staleness(monkeypatch: pytest.MonkeyPatch) -> None:
+    puller, _session, made = _stale_puller(monkeypatch, _DatedYahoo())
+    puller._yahoo.cboe = options.CboeOptionsClient(session=_Session(_Resp(403)))
+    monkeypatch.setattr(options, "YahooOptionsClient",
+                        lambda: pytest.fail("a Cboe no-chain answer is authoritative"))
+    monkeypatch.setattr(options, "_NO_OPTIONS_UNTIL", {})
+
+    result = puller._pull_ticker("NUOX", "2026-11-05")
+
+    assert result["status"] == "NO_NEW_DATA" and result["no_options"] is True
+    assert made == []
+
+
+def test_stale_fallback_logs_one_distinct_info_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines: list[str] = []
+    monkeypatch.setattr(options.log, "info", lambda msg, **kw: lines.append(msg.format(**kw)))
+    client, _made = _composite(monkeypatch, _Resp(200, _stale_doc()))
+    monkeypatch.setattr(options, "YahooOptionsClient", _DatedYahoo)
+    client.get_options("KO")
+    assert lines == ["KO: Cboe quote not dated to today's session (delayed feed), trying Yahoo"]
+    assert client.provider_by_ticker == {"KO": "yahoo"}
+
+    lines.clear()
+    client.cboe = options.CboeOptionsClient(session=_Session(_Resp(429)))
+    client.get_options("PEP")
+    assert lines == ["PEP: Cboe chain unavailable, falling back to Yahoo"]
+
+
 def test_cboe_clock_metadata_keeps_unknown_quote_time():
     doc = _doc()
     doc["data"]["last_trade_time"] = "2026-11-05T19:00:00"

@@ -19,6 +19,12 @@ factory builds on it from here instead.
   never claims a discovery from them (forward live recording is the test).
 * Origin ``intraday_dev_ranking``: rows built by ``analysis.module_factory``
   from staged dev bars; its state marks every result as dev ranking only.
+* :func:`cofiring` (factory 2, 3pacs/GRID#1156): the co-firing matrix of a
+  run's decision signals and their clusters, built from fire overlap only
+  (which decisions fire together), never from returns. Single linkage at the
+  run file's threshold, so two signals in different clusters always co-fire
+  below it; one representative per cluster (its best-ranked tested trial).
+  One cluster is one idea and takes at most one live slot (design Q6).
 
 Row validation, block choice and permutations are the offline proof's own
 (:func:`~analysis.offline_research_proof.validate_rows`,
@@ -290,11 +296,131 @@ def discover(protocol, discovery_rows, panel=None):
     return {"payload": payload, "sha256": orp.digest(payload)}
 
 
+COFIRING_MEASURES = ("jaccard", "phi")
+
+
+def _similarity(both, fires, sessions, by):
+    """signals x signals similarity of fire sets: Jaccard, or phi (correlation of the 0/1 fire indicators)."""
+    n_i, n_j = fires[:, None], fires[None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if by == "jaccard":
+            sim = both / (n_i + n_j - both)
+        else:
+            sim = (sessions * both - n_i * n_j) / np.sqrt(n_i * (sessions - n_i) * n_j * (sessions - n_j))
+    return np.nan_to_num(sim, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def cofiring(families, trials, signal_of, by="jaccard", threshold=0.5):
+    """Co-firing matrix and fire-overlap clusters of a run's signals; returns are never read.
+
+    ``families``: {family: rows} as tested; ``trials``: the frozen ledger.
+    ``signal_of(family, feature)`` names the decision signal a trial trades:
+    trials sharing a name fire on the same decisions (the long and short side
+    of one rule, or one rule judged at several horizons). A signal fires on a
+    session when any of its trials' rows fires there.
+
+    Similarity of two signals: ``jaccard`` (both / either) or ``phi`` (the
+    correlation of their 0/1 fire indicators over the run's sessions). Signals
+    are linked at similarity >= ``threshold`` and clusters are the connected
+    components (single linkage), so any two signals that co-fire at or above
+    the threshold share a cluster and two representatives never do. A
+    cluster's representative is its tested trial with the highest t (ties:
+    ledger order); a cluster with no tested trial has none.
+
+    Returns ``(matrix, clusters, membership)``: ``matrix`` holds the signal
+    names, their fire counts and the sessions x both-fire counts; ``clusters``
+    is ordered by representative t (best first); ``membership`` maps each
+    trial id to ``(cluster id, is representative)``.
+    """
+    if by not in COFIRING_MEASURES:
+        raise ValueError(f"co-firing measure is one of {COFIRING_MEASURES}")
+    if not 0 < threshold <= 1:
+        raise ValueError("co-firing threshold lies in (0, 1]")
+    sessions = sorted({row["decision_at"][:10] for rows in families.values() for row in rows})
+    at = {d: i for i, d in enumerate(sessions)}
+    names, fired = [], {}
+    signal = {}
+    for trial in trials:
+        name = signal_of(trial["family"], trial["feature"])
+        signal[trial["trial_id"]] = name
+        if name not in fired:
+            names.append(name)
+            fired[name] = set()
+        fired[name].update(
+            at[row["decision_at"][:10]]
+            for row in families[trial["family"]]
+            if row["features"][trial["feature"]]["value"] is not None
+        )
+    x = np.zeros((len(sessions), len(names)), dtype=np.float32)
+    for j, name in enumerate(names):
+        x[sorted(fired[name]), j] = 1.0
+    both = np.rint(x.T @ x).astype(np.int64)
+    fires = np.diag(both).astype(float)
+    sim = _similarity(both.astype(float), fires, float(len(sessions)), by)
+    parent = list(range(len(names)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    linked = (sim >= threshold - 1e-12) & (fires[:, None] > 0) & (fires[None, :] > 0)
+    for i, j in zip(*np.nonzero(np.triu(linked, k=1))):
+        a, b = root(int(i)), root(int(j))
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    groups = {}
+    for j in range(len(names)):
+        groups.setdefault(root(j), []).append(j)
+    best = {}
+    index = {name: j for j, name in enumerate(names)}
+    member_trials = {g: [] for g in groups}
+    for order, trial in enumerate(trials):
+        member_trials[root(index[signal[trial["trial_id"]]])].append((order, trial))
+    for g, members in member_trials.items():
+        tested = [(o, t) for o, t in members if t["status"] == "tested" and t.get("t") is not None]
+        best[g] = max(tested, key=lambda ot: (ot[1]["t"], -ot[0]))[1] if tested else None
+    ordered = sorted(groups, key=lambda g: (best[g] is None, -(best[g]["t"] if best[g] else 0.0), names[groups[g][0]]))
+    clusters, membership = [], {}
+    for k, g in enumerate(ordered, 1):
+        cid = f"c{k}"
+        rep = best[g]
+        members = member_trials[g]
+        for _, trial in members:
+            membership[trial["trial_id"]] = (cid, rep is not None and trial["trial_id"] == rep["trial_id"])
+        idx = groups[g]
+        inside = sim[np.ix_(idx, idx)][np.triu_indices(len(idx), k=1)]
+        clusters.append({
+            "cluster": cid,
+            "signals": [names[j] for j in idx],
+            "fires": [int(fires[j]) for j in idx],
+            # single linkage chains: the weakest pair inside shows how far it chained
+            "min_pair_similarity": round(float(inside.min()), 4) if inside.size else None,
+            "trials": len(members),
+            "tested": sum(t["status"] == "tested" for _, t in members),
+            "selected": sum(bool(t.get("selected")) for _, t in members),
+            "representative": rep["trial_id"] if rep else None,
+        })
+    matrix = {
+        "by": by,
+        "threshold": threshold,
+        "basis": "fire overlap of decision signals; returns never enter",
+        "sessions": len(sessions),
+        "signals": names,
+        "fires": [int(v) for v in fires],
+        "both": both.tolist(),
+    }
+    return matrix, clusters, membership
+
+
 __all__ = [
+    "COFIRING_MEASURES",
     "FACTORY_ORIGIN",
     "FactoryProtocol",
     "MAX_T_SELECTION",
     "NET_WHEN_FIRES",
+    "cofiring",
     "discover",
     "max_t_adjusted",
     "measure_net",

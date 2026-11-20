@@ -49,6 +49,8 @@ NODE_SYMBOLS: dict[str, str] = {
     "cameco": "CCJ",
     "canadian_solar": "CSIQ",
     "cloudflare": "NET",
+    "coca_cola_consolidated": "COKE",  # listed; was filed as a private company (2026-11-16)
+    "coca_cola_europacific_partners": "CCEP",  # listed; was filed as a private company (2026-11-16)
     "coherent": "COHR",
     "corning": "GLW",
     "crown_holdings": "CCK",
@@ -58,25 +60,39 @@ NODE_SYMBOLS: dict[str, str] = {
     "intel": "INTC",
     "international_paper": "IP",
     "kfc_parent": "YUM",
+    "knowles": "KN",  # listed; was filed as a private company (2026-11-16)
+    "lattice_semiconductor": "LSCC",  # listed; was filed as a private company (2026-11-16)
     "linde": "LIN",
     "lumentum": "LITE",
     "micron": "MU",
     "mp_materials": "MP",
     "nextdecade": "NEXT",
     "oi_glass": "OI",
+    "on_semiconductor": "ON",  # listed; was filed as a private company (2026-11-16)
     "packaging_corp": "PKG",
     "post_holdings": "POST",
+    "power_integrations": "POWI",  # listed; was filed as a private company (2026-11-16)
     "sq": "XYZ",  # Block renamed its symbol from SQ
+    "synaptics": "SYNA",  # listed; was filed as a private company (2026-11-16)
     "sysco": "SYY",
-    "treehouse": "THS",
+    "td_synnex": "SNX",  # listed; was filed as a private company (2026-11-16)
+    "the_chemours": "CC",  # listed; was filed as a private company (2026-11-16)
     "tsmc": "TSM",  # NYSE ADR
     "tyson": "TSN",
     "venture_global": "VG",
+    "vertex": "VRTX",  # listed; was filed as a private company (2026-11-16)
+    "viavi_solutions": "VIAV",  # listed; was filed as a private company (2026-11-16)
     "westrock": "SW",  # merged into Smurfit Westrock
 }
 
 DELISTED: dict[str, str] = {
     "catalent": "acquired by Novo Holdings (2024)",
+    # Checked 2026-11-16: no SEC ticker and no close since the date shown
+    # (K, THS, WBA match analysis/sector_map_ticker_status.yaml).
+    "k": "Kellanova, acquired by Mars (last close 2025-12-11)",
+    "qrvo": "Qorvo, no SEC ticker and no close after 2026-09-25",
+    "treehouse": "TreeHouse Foods, acquired by Investindustrial (last close 2026-02-11)",
+    "wba": "Walgreens Boots Alliance, acquired by Sycamore Partners (last close 2025-08-28)",
     "livent": "merged into Arcadium Lithium, since acquired",
     "pfpt": "Proofpoint, taken private (2021)",
     "pxd": "Pioneer, acquired by ExxonMobil (2024)",
@@ -86,7 +102,9 @@ DELISTED: dict[str, str] = {
 
 # Foreign companies whose slug looks like a US symbol (no YF close series under it, 2026-11-13).
 FOREIGN_SLUGS: dict[str, str] = {
+    "byd": "BYD Company (Hong Kong / Shenzhen); US BYD is Boyd Gaming",
     "cmoc": "CMOC Group (Shanghai / Hong Kong)",
+    "csl": "CSL Limited (ASX); US CSL is Carlisle Companies",
     "divis": "Divi's Laboratories (India)",
     "jinko": "JinkoSolar (Shanghai; US ADR delisted)",
     "jsr": "JSR Corporation (Tokyo; taken private)",

@@ -1,10 +1,13 @@
-"""Source parsing for ingestion/social_sentiment.py (Reddit RSS, ApeWisdom, Bluesky).
+"""Source parsing for ingestion/social_sentiment.py (Reddit via Arctic Shift, ApeWisdom, Bluesky).
 
-All HTTP is stubbed. Fixtures mirror the shapes grid-svr received on 2026-11-05.
+All HTTP is stubbed. ApeWisdom and Bluesky fixtures mirror what grid-svr
+received on 2026-11-05; Arctic Shift records follow its 2026-11-18 answers.
 """
 
 from __future__ import annotations
 
+import socket
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -12,32 +15,30 @@ import pytest
 import requests
 
 import ingestion.social_sentiment as mod
-from ingestion.altdata import reddit_rss
+from ingestion.altdata import arctic_shift
+from tests.arctic_shift_fakes import POSTS_URL, FakeArctic, post
 
 
 @pytest.fixture(autouse=True)
-def _isolated_reddit_slot(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(reddit_rss.LOCK_PATH_ENV, str(tmp_path / "reddit.lock"))
-    monkeypatch.setattr(reddit_rss, "MIN_INTERVAL_S", 0.0)
+def _isolated_arctic_slot(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _refuse(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("network access in a unit test")
+    monkeypatch.setattr(socket.socket, "connect", _refuse)
+    monkeypatch.setenv(arctic_shift.LOCK_PATH_ENV, str(tmp_path / "arctic.lock"))
+    monkeypatch.setattr(arctic_shift, "MIN_INTERVAL_S", 0.0)
 
-_RSS = """<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry>
-    <author><name>/u/someone</name></author>
-    <category term="wallstreetbets" label="r/wallstreetbets"/>
-    <content type="html">&lt;!-- SC_OFF --&gt;&lt;div class="md"&gt;&lt;p&gt;Loading NVDA calls &amp;amp; riding the breakout&lt;/p&gt;&lt;/div&gt;&lt;!-- SC_ON --&gt; &amp;#32; submitted by &amp;#32; &lt;a href="https://www.reddit.com/user/someone"&gt; /u/someone &lt;/a&gt; &lt;span&gt;&lt;a href="x"&gt;[comments]&lt;/a&gt;&lt;/span&gt;</content>
-    <id>t3_aaa111</id>
-    <published>2026-11-05T14:00:00+00:00</published>
-    <title>NVDA earnings play</title>
-  </entry>
-  <entry>
-    <category term="Bitcoin" label="r/Bitcoin"/>
-    <content type="html">&lt;table&gt;&lt;tr&gt;&lt;td&gt;submitted by /u/x [link] [comments]&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;</content>
-    <id>t3_bbb222</id>
-    <published>2026-11-05T15:00:00+00:00</published>
-    <title>BTC dump incoming</title>
-  </entry>
-</feed>"""
+
+NOW = datetime(2026, 11, 5, 16, 0, tzinfo=timezone.utc)
+_T = NOW.timestamp()
+
+
+def _arctic() -> FakeArctic:
+    return FakeArctic(posts=[
+        post("aaa111", "wallstreetbets", _T - 7200, "NVDA earnings play",
+             "Loading NVDA calls &amp; riding the breakout", author="someone"),
+        post("bbb222", "Bitcoin", _T - 3600, "BTC dump incoming", "", author="x"),
+    ])
+
 
 _APE = {"count": 2, "pages": 1, "current_page": 1, "results": [
     {"rank": 1, "ticker": "MU", "name": "Micron Technology", "mentions": 616,
@@ -64,31 +65,37 @@ def _puller(get_side_effect: Any) -> mod.SocialSentimentPuller:
     return puller
 
 
-class TestRedditRss:
-    def test_one_combined_request_for_every_board(self) -> None:
-        puller = _puller([_resp(content=_RSS.encode())])
-        posts = puller._reddit_hot_all(["wallstreetbets", "bitcoin", "stocks"])
-        assert puller._session.get.call_count == 1
-        url = puller._session.get.call_args.args[0]
-        assert url == "https://www.reddit.com/r/wallstreetbets+bitcoin+stocks/hot.rss"
-        assert puller._session.get.call_args.kwargs["params"] == {"limit": mod.REDDIT_RSS_LIMIT}
-        # Feed case ("Bitcoin") maps back to the configured board name.
+class TestRedditArcticShift:
+    def test_one_request_per_board_on_arctic_shift(self) -> None:
+        fake = _arctic()
+        puller = _puller(fake.get)
+        posts, failures = puller._reddit_hot_all(["wallstreetbets", "bitcoin", "stocks"], now=NOW)
+        assert failures == [] and fake.count(POSTS_URL) == 3
+        params = [p for _, p, _ in fake.calls]
+        assert [p["subreddit"] for p in params] == ["wallstreetbets", "bitcoin", "stocks"]
+        assert {p["limit"] for p in params} == {mod.REDDIT_POSTS_PER_BOARD}
+        assert all(not url.startswith("https://www.reddit.com") for url, _, _ in fake.calls)
+        # Archive case ("Bitcoin") maps back to the configured board name.
         assert sorted(posts) == ["bitcoin", "wallstreetbets"]
 
-    def test_entry_fields_and_self_post_body(self) -> None:
-        posts = _puller([_resp(content=_RSS.encode())])._reddit_hot_all(["wallstreetbets", "bitcoin"])
+    def test_post_fields(self) -> None:
+        posts, _ = _puller(_arctic().get)._reddit_hot_all(["wallstreetbets", "bitcoin"], now=NOW)
         wsb = posts["wallstreetbets"][0]
         assert wsb["title"] == "NVDA earnings play"
-        assert wsb["text"] == "Loading NVDA calls & riding the breakout"
+        assert wsb["text"] == "Loading NVDA calls &amp; riding the breakout"
         assert wsb["created"] == "2026-11-05T14:00:00+00:00"
         assert wsb["id"] == "t3_aaa111" and wsb["subreddit"] == "wallstreetbets"
-        # Link posts carry only the footer, which is not post text.
         assert posts["bitcoin"][0]["text"] == ""
 
-    def test_second_429_raises(self) -> None:
-        puller = _puller([_resp(status=429), _resp(status=429)])
-        with pytest.raises(requests.exceptions.HTTPError):
-            puller._reddit_hot_all(["stocks"])
+    def test_one_board_down_is_reported_every_board_down_raises(self) -> None:
+        fake = _arctic()
+        fake.fail = {"posts:stocks"}
+        posts, failures = _puller(fake.get)._reddit_hot_all(["wallstreetbets", "stocks"], now=NOW)
+        assert list(posts) == ["wallstreetbets"] and len(failures) == 1
+        assert "r/stocks" in failures[0]
+        fake.fail = {"posts"}
+        with pytest.raises(RuntimeError, match="HTTP 500"):
+            _puller(fake.get)._reddit_hot_all(["wallstreetbets", "stocks"], now=NOW)
 
 
 class TestApeWisdom:
@@ -123,22 +130,26 @@ class TestBluesky:
 
 
 class TestPullAll:
-    def _run(self, rss: Any, ape: Any, bsky: Any) -> dict:
-        def get(url: str, **_kw: Any) -> MagicMock:
+    def _run(self, arctic: FakeArctic, ape: Any, bsky: Any) -> dict:
+        def get(url: str, *args: Any, **kw: Any) -> Any:
+            if arctic.handles(url):
+                return arctic.get(url, *args, **kw)
             if "reddit.com" in url:
-                return rss
+                raise AssertionError("reddit.com must not be contacted")
             if "apewisdom" in url:
                 return ape
             return bsky
 
         puller = _puller(get)
         puller._google_trends = lambda kw: {}
-        with patch.object(mod.time, "sleep"):
+        # The fixtures are dated 2026-11-05; the scan reads the 24 h before "now".
+        with patch.object(mod.time, "sleep"), patch.object(
+                mod, "datetime", wraps=datetime) as dt:
+            dt.now.return_value = NOW
             return puller.pull_all()
 
     def test_all_sources_feed_the_scan(self) -> None:
-        out = self._run(_resp(content=_RSS.encode()), _resp(payload=_APE),
-                        _resp(payload={"posts": []}))
+        out = self._run(_arctic(), _resp(payload=_APE), _resp(payload={"posts": []}))
         assert set(out["reddit"]) == {"wallstreetbets", "bitcoin"}
         assert [r["ticker"] for r in out["reddit_mentions"]["stocks"]] == ["MU", "SPY"]
         nvda = out["ticker_sentiment"]["NVDA"]
@@ -150,8 +161,7 @@ class TestPullAll:
     def test_reddit_wide_counts_attach_to_scored_tickers(self) -> None:
         ape = {"results": [{"rank": 4, "ticker": "NVDA", "name": "NVIDIA", "mentions": 386,
                             "upvotes": 1749, "rank_24h_ago": 8, "mentions_24h_ago": 27}]}
-        out = self._run(_resp(content=_RSS.encode()), _resp(payload=ape),
-                        _resp(payload={"posts": []}))
+        out = self._run(_arctic(), _resp(payload=ape), _resp(payload={"posts": []}))
         nvda = out["ticker_sentiment"]["NVDA"]
         assert (nvda["reddit_mentions_24h"], nvda["reddit_mentions_prior_24h"],
                 nvda["reddit_rank"]) == (386, 27, 4)
