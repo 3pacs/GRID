@@ -1057,14 +1057,18 @@ def step_deploy_tree(release_dir: str) -> StepResult:
 
     data: dict[str, Any] = {}
     notes = []
+    git_failed = False
     try:
         log_proc = subprocess.run(
             ["git", "-C", str(release_path), "log", "-1", "--oneline"],
             capture_output=True, text=True, timeout=15, check=False,
         )
+        if log_proc.returncode != 0:
+            raise RuntimeError(f"git log exited {log_proc.returncode}")
         data["git_log"] = log_proc.stdout.strip()
         notes.append(f"HEAD={log_proc.stdout.strip()}")
     except Exception as exc:
+        git_failed = True
         notes.append(f"git log failed: {exc}")
 
     try:
@@ -1072,10 +1076,17 @@ def step_deploy_tree(release_dir: str) -> StepResult:
             ["git", "-C", str(release_path), "status", "--short"],
             capture_output=True, text=True, timeout=15, check=False,
         )
-        dirty_count = len([ln for ln in status_proc.stdout.splitlines() if ln.strip()])
+        if status_proc.returncode != 0:
+            raise RuntimeError(f"git status exited {status_proc.returncode}")
+        dirty_entries = [ln for ln in status_proc.stdout.splitlines() if ln.strip()]
+        dirty_count = len(dirty_entries)
+        # Names/status only: never include file contents in diagnostic artifacts.
+        data["dirty_entries"] = [redact_secrets(ln[:300]) for ln in dirty_entries[:50]]
+        data["dirty_entries_truncated"] = dirty_count > 50
         data["dirty_files"] = dirty_count
         notes.append(f"dirty_files={dirty_count}")
     except Exception as exc:
+        git_failed = True
         notes.append(f"git status failed: {exc}")
         dirty_count = None
 
@@ -1091,6 +1102,7 @@ def step_deploy_tree(release_dir: str) -> StepResult:
             data["pwa_dist_matches_canonical"] = match
             notes.append(f"pwa_dist matches canonical: {match}")
         else:
+            data["canonical_comparison"] = "unavailable"
             notes.append("no pwa_dist_canonical directory — skipped comparison")
     else:
         notes.append("release pwa_dist/index.html not found")
@@ -1100,6 +1112,8 @@ def step_deploy_tree(release_dir: str) -> StepResult:
         status = "degraded"
     if not index_path.is_file():
         status = "degraded"
+    if git_failed:
+        status = "blocked"
     return StepResult("deploy_tree", status, None, "; ".join(notes), data)
 
 

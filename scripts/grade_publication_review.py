@@ -702,29 +702,86 @@ def extract_figures(window: str) -> list[StatedFigure]:
     return found
 
 
-def figure_at(conn: Any, series_id: str, at: datetime) -> Any | None:
-    """The value GRID's briefing generator would have read for ``series_id`` at ``at``.
+# ── truth of a stated level at the instant it was stated ───────────────────────────────
+#
+# A briefing that says "the VIX stands at 26.9" at 20:00Z is making a claim about the market
+# at 20:00Z, not about GRID's last completed close. So the grader looks at every capture GRID
+# holds for that instrument around the statement (intraday pulls, the completed close, the
+# session's high and low, later revisions) and asks whether the number was real:
+#
+#   during a session : between GRID's captures bracketing the instant -> confirmed;
+#                      equal to the previous completed close           -> confirmed;
+#                      only inside the session's high/low              -> partially_confirmed;
+#   after a close    : equal to the newest completed close at that time -> confirmed (whether or
+#                      not GRID had pulled it yet: the market had printed it);
+#                      equal to an older close while a newer one was known -> partially_confirmed
+#                      (stale); inside the session's range or equal to an intraday capture
+#                      -> partially_confirmed;
+#   FRED rates       : the same newest-vs-stale rule over observation dates;
+#   otherwise        : refuted, with the nearest captures and the range as evidence.
 
-    Yahoo series go through the generator's own reader (policy-eligible completed captures);
-    FRED series through the accepted-only latest read. Both bounded by pull time <= ``at``.
-    Returns an object with ``value``, ``obs_date``, ``source`` or None.
-    """
-    if series_id.startswith("YF:"):
-        from ollama.market_briefing import _read_yf_snapshot_value
-        entry = _read_yf_snapshot_value(conn, series_id, at)
-        if not entry:
-            return None
-        return _FigureValue(float(entry["value"]), str(entry["date"]), str(entry.get("source") or "yfinance"))
-    from store.observations import read_latest
-    obs = read_latest(conn, series_id, as_of=at.date(), as_of_ts=at)
-    return None if obs is None else _FigureValue(float(obs.value), obs.obs_date.isoformat(), obs.source or "raw_series")
+SESSION_OPEN = (9, 30)
+BRACKET_WINDOW = timedelta(minutes=90)   # a capture further from the statement does not pin its level
 
 
-@dataclass(frozen=True)
-class _FigureValue:
-    value: float
-    obs_date: str
-    source: str
+def session_open_utc(session: date) -> datetime:
+    return datetime(session.year, session.month, session.day, *SESSION_OPEN, tzinfo=NY).astimezone(timezone.utc)
+
+
+def previous_session(d: date) -> date:
+    d -= timedelta(days=1)
+    while not _is_market_open(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _vintages(conn: Any, series_id: str, start: date, end: date) -> list[Any]:
+    from store.observations import read_vintages
+    return [o for o in read_vintages(conn, series_id, start=start, end=end)
+            if o.pull_timestamp is not None and math.isfinite(o.value)]
+
+
+@dataclass
+class Facts:
+    """What GRID holds for one instrument around one instant."""
+
+    series_id: str
+    intraday: date | None = None               # the session in progress at the instant, if any
+    sessions: list[date] = field(default_factory=list)   # completed sessions considered, newest first
+    by_date: dict[date, list[Any]] = field(default_factory=dict)   # close vintages per label, oldest pull first
+    low: dict[date, float] = field(default_factory=dict)
+    high: dict[date, float] = field(default_factory=dict)
+
+
+def gather_facts(conn: Any, fig: Figure, at: datetime) -> Facts:
+    facts = Facts(series_id=fig.series_id)
+    if fig.series_id.startswith("YF:"):
+        today = ny_date(at)
+        if _is_market_open(today) and session_open_utc(today) <= at < session_close_utc(today):
+            facts.intraday = today
+        s1 = today if _is_market_open(today) and at >= session_close_utc(today) else previous_session(today)
+        facts.sessions = [s1, previous_session(s1)]
+        start, end = facts.sessions[-1], facts.intraday or s1
+        rows = _vintages(conn, fig.series_id, start, end)
+        stem = fig.series_id.rsplit(":", 1)[0]
+        for name, target in ((f"{stem}:low", facts.low), (f"{stem}:high", facts.high)):
+            for o in _vintages(conn, name, start, end):
+                target[o.obs_date] = o.value          # oldest pull first: the last write is the newest
+    else:
+        rows = _vintages(conn, fig.series_id, at.date() - timedelta(days=14), at.date())
+        facts.sessions = sorted({o.obs_date for o in rows}, reverse=True)
+    for o in rows:
+        facts.by_date.setdefault(o.obs_date, []).append(o)
+    return facts
+
+
+def _completed_close(facts: Facts, session: date) -> Any | None:
+    """The newest capture of ``session`` taken after its close (Yahoo); any capture (FRED)."""
+    rows = facts.by_date.get(session, [])
+    if not facts.series_id.startswith("YF:"):
+        return rows[-1] if rows else None
+    after = [o for o in rows if o.pull_timestamp >= session_close_utc(session)]
+    return after[-1] if after else None
 
 
 def figure_matches(stated: float, decimals: int, observed: float) -> bool:
@@ -734,30 +791,111 @@ def figure_matches(stated: float, decimals: int, observed: float) -> bool:
     return abs(stated - observed) <= tolerance
 
 
+def _within(stated: float, decimals: int, lo: float, hi: float) -> bool:
+    tolerance = 0.5 * 10 ** (-decimals) + 0.0005 * max(abs(lo), abs(hi))
+    return lo - tolerance <= stated <= hi + tolerance
+
+
+@dataclass
+class Judgment:
+    verdict: str
+    evidence: list[dict[str, Any]]
+    root_cause: str | None
+    knowable: bool | None
+    confidence: float
+
+
+def _ev(source: str, observed: str, as_of: datetime) -> dict[str, Any]:
+    return {"source": source, "observed": observed, "as_of": iso(as_of), "url": None}
+
+
+def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | None:
+    """None when GRID holds nothing for the instrument around ``at`` (unscorable)."""
+    fig, value, dec = stated.figure, stated.stated, stated.decimals
+    unit = "%" if fig.pct else ""
+    src = f"raw_series {fig.series_id}"
+    if not any(facts.by_date.values()):
+        return None
+    # 1. during a session: GRID's captures that bracket the instant
+    if facts.intraday is not None:
+        # only captures taken during the session and near the statement pin a level to the instant
+        close = session_close_utc(facts.intraday)
+        rows = [o for o in facts.by_date.get(facts.intraday, [])
+                if o.pull_timestamp < close and abs(o.pull_timestamp - at) <= BRACKET_WINDOW]
+        before = [o for o in rows if o.pull_timestamp <= at]
+        after = [o for o in rows if o.pull_timestamp > at]
+        bracket = before[-1:] + after[:1]
+        if bracket and _within(value, dec, min(o.value for o in bracket), max(o.value for o in bracket)):
+            ev = [_ev(f"{o.source} {fig.series_id}", f"{o.value:g}{unit} captured {iso(o.pull_timestamp)}",
+                      o.pull_timestamp) for o in bracket]
+            known = bool(before) and figure_matches(value, dec, before[-1].value)
+            return Judgment("confirmed", ev, None, known, 0.9)
+    # 2. a completed close
+    closes = [(s, _completed_close(facts, s)) for s in facts.sessions]
+    closes = [(s, o) for s, o in closes if o is not None]
+    known_at = [(s, o) for s, o in closes if o.pull_timestamp <= at]
+    newest_known = known_at[0][0] if known_at else None
+    for s, o in closes:
+        if not figure_matches(value, dec, o.value):
+            continue
+        ev = [_ev(f"{o.source} {fig.series_id}", f"{o.value:g}{unit} close {s} (captured {iso(o.pull_timestamp)})",
+                  o.pull_timestamp)]
+        if newest_known is not None and s < newest_known:
+            newer = dict(known_at)[newest_known]
+            ev.append(_ev(f"{newer.source} {fig.series_id}", f"{newer.value:g}{unit} close {newest_known} "
+                          f"(captured {iso(newer.pull_timestamp)}, before the statement)", newer.pull_timestamp))
+            return Judgment("partially_confirmed", ev,
+                            f"stale: {stated.span!r} is the {s} close; the {newest_known} close "
+                            f"({newer.value:g}{unit}) was already known", True, 0.9)
+        if s == facts.sessions[0] or newest_known is None or s >= newest_known:
+            return Judgment("confirmed", ev, None, o.pull_timestamp <= at, 0.9)
+    # 3. inside a session's traded range, or equal to an intraday capture
+    for s in ([facts.intraday] if facts.intraday else []) + facts.sessions[:1]:
+        lo, hi = facts.low.get(s), facts.high.get(s)
+        if lo is not None and hi is not None and _within(value, dec, lo, hi):
+            return Judgment("partially_confirmed",
+                            [_ev(f"raw_series {fig.series_id.rsplit(':', 1)[0]}:low/high",
+                                 f"session {s} range {lo:g}-{hi:g}{unit}", at)],
+                            f"{stated.span!r} lies inside the {s} range {lo:g}-{hi:g}{unit}, but no capture "
+                            f"pins it to the statement time", None, 0.6)
+        hit = next((o for o in facts.by_date.get(s, []) if figure_matches(value, dec, o.value)), None)
+        if hit is not None:
+            return Judgment("partially_confirmed",
+                            [_ev(f"{hit.source} {fig.series_id}", f"{hit.value:g}{unit} intraday capture "
+                                 f"{iso(hit.pull_timestamp)}", hit.pull_timestamp)],
+                            f"{stated.span!r} equals an intraday capture of {s}, not a close", None, 0.6)
+    # 4. nothing supports it
+    ev: list[dict[str, Any]] = []
+    for s in ([facts.intraday] if facts.intraday else []) + facts.sessions[:2]:
+        rows = facts.by_date.get(s, [])
+        if rows:
+            near = min(rows, key=lambda o: abs((o.pull_timestamp - at).total_seconds()))
+            ev.append(_ev(f"{near.source} {fig.series_id}", f"{near.value:g}{unit} captured "
+                          f"{iso(near.pull_timestamp)} (label {s})", near.pull_timestamp))
+        if s in facts.low and s in facts.high:
+            ev.append(_ev(src + " low/high", f"session {s} range {facts.low[s]:g}-{facts.high[s]:g}{unit}", at))
+    known_vals = ", ".join(e["observed"].split(" ")[0] for e in ev if "captured" in e["observed"])
+    return Judgment("refuted", ev[:6],
+                    f"stated {fig.label} {value:g}{unit}; GRID's captures around the statement were {known_vals or 'other values'}"
+                    + (" and the value is outside the session range" if any("range" in e["observed"] for e in ev) else ""),
+                    True, 0.85)
+
+
 def grade_figure(conn: Any, pub: Publication, stated: StatedFigure) -> dict[str, Any]:
     fig = stated.figure
     horizon = iso(pub.published_at + FIGURE_HORIZON)
     try:
-        observed = figure_at(conn, fig.series_id, pub.published_at)
-    except Exception as exc:  # a reader fault (mixed sources, bad row) is this claim's reason, not the day's
+        facts = gather_facts(conn, fig, pub.published_at)
+        judgment = judge_level(stated, pub.published_at, facts)
+    except Exception as exc:  # a reader fault is this claim's reason, not the day's
         return unscorable(pub, stated.span, "data_quality",
-                          f"{fig.label}: {fig.series_id} unreadable at stated_at ({type(exc).__name__})",
-                          horizon_end=horizon)
-    if observed is None or not math.isfinite(observed.value):
+                          f"{fig.label}: {fig.series_id} unreadable ({type(exc).__name__})", horizon_end=horizon)
+    if judgment is None:
         return unscorable(pub, stated.span, "data_quality",
-                          f"{fig.label}: no accepted {fig.series_id} value known at stated_at", horizon_end=horizon)
-    holds = figure_matches(stated.stated, stated.decimals, observed.value)
-    unit = "%" if fig.pct else ""
-    evidence = [{"source": f"{observed.source} {fig.series_id}",
-                 "observed": f"{observed.value:g}{unit} obs_date {observed.obs_date} (latest known at stated_at)",
-                 "as_of": iso(pub.published_at), "url": None},
-                {"source": "grader", "observed": f"stated {stated.stated:g}{unit} vs known {observed.value:g}{unit}",
-                 "as_of": iso(pub.published_at), "url": None}]
-    root_cause = None if holds else (f"stated {fig.label} {stated.stated:g}{unit}; GRID's {fig.series_id} at the "
-                                     f"publication instant was {observed.value:g}{unit} ({observed.obs_date})")
+                          f"{fig.label}: GRID holds no {fig.series_id} capture around the statement", horizon_end=horizon)
     return _row(pub, stated.span, "data_quality", instrument=_instrument_for(fig), horizon_end=horizon,
-                verdict="confirmed" if holds else "refuted", evidence=evidence, knowable_at_stated_at=True,
-                root_cause=root_cause, grader_confidence=0.9)
+                verdict=judgment.verdict, evidence=judgment.evidence, knowable_at_stated_at=judgment.knowable,
+                root_cause=judgment.root_cause, grader_confidence=judgment.confidence)
 
 
 def _instrument_for(fig: Figure) -> str:

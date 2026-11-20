@@ -13,6 +13,8 @@ from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.quiverquant_identity import calendar_dated_leftover_sql
+
 from .helpers import (
     _get_series_latest,
     dominant_confidence,
@@ -236,12 +238,15 @@ def _build_qq_gov_contracts(engine: Engine, as_of: date) -> FlowNode:
 
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
+            # Rows the fiscal re-date left at the calendar quarter end are a
+            # second copy of a quarter (or that quarter one slot late): not counted.
+            row = conn.execute(text(f"""
                 SELECT COUNT(*),
                        SUM((signal_value->>'Amount')::float)
                 FROM signal_sources
                 WHERE source_type = 'quiverquant:gov_contracts'
                   AND signal_date >= :d90
+                  AND NOT {calendar_dated_leftover_sql()}
             """), {"d90": lookback}).fetchone()
             if row:
                 count = int(row[0]) if row[0] else 0

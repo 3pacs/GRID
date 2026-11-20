@@ -86,7 +86,7 @@ Safety
 Usage (grid-svr; see the PR for the run procedure)
 --------------------------------------------------
     cd /data/grid_v4/grid_release
-    set -a; . /home/grid/grid_v4/grid_repo/.env; set +a
+    set -a; . /etc/grid/grid.env; set +a
     /home/grid/grid_v4/venv/bin/python -m scripts.qq_gov_contracts_redate           # dry run
     /home/grid/grid_v4/venv/bin/python -m scripts.qq_gov_contracts_redate --apply \\
         --audit-log ~/research/qq_gov_redate_audit_YYYYMMDD.jsonl

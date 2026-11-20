@@ -366,6 +366,45 @@ def calendar_quarter_end(year: int, qtr: int) -> date | None:
         return None
 
 
+def is_calendar_dated_leftover(signal_date: date | None, payload: Any) -> bool:
+    """A ``quiverquant:gov_contracts`` row the fiscal re-date could not move.
+
+    True when the row is still dated at its payload quarter's *calendar* end
+    (what #694 wrote) and that is not its fiscal end. The 2026-11-07 re-date
+    (``scripts/qq_gov_contracts_redate.py``) moved every such row it could; the
+    rest collide on the unique key: a stale copy of a quarter whose fiscal row
+    exists, or a quarter whose fiscal slot another row holds. Either way the
+    row sits one quarter late, often in the future, and reads as the next
+    quarter's aggregate. The fiscal writer only writes fiscal ends, so this set
+    only shrinks: a pull that overwrites the slot with the right quarter clears it.
+    """
+    if signal_date is None:
+        return False
+    year_qtr = parse_year_qtr(parse_payload(payload))
+    if year_qtr is None:
+        return False
+    calendar = calendar_quarter_end(*year_qtr)
+    return calendar is not None and signal_date == calendar and signal_date != fiscal_quarter_end(*year_qtr)
+
+
+def calendar_dated_leftover_sql(date_column: str = "signal_date", value_column: str = "signal_value") -> str:
+    """PostgreSQL mirror of :func:`is_calendar_dated_leftover`, for ``AND NOT (...)``.
+
+    Callers pair it with ``source_type = 'quiverquant:gov_contracts'``. A payload
+    without an integer ``Year`` and a ``Qtr`` of 1-4 is never flagged. No ``%``
+    and no bind-looking ``:name``, like :func:`feed_source_id_sql`. (A calendar
+    end is never the same quarter's fiscal end, so the second test is implied.)
+    """
+    year = f"({value_column}->>'Year')"
+    qtr = f"({value_column}->>'Qtr')"
+    return (
+        f"COALESCE({year} ~ '^[0-9]{{4}}$' AND {qtr} IN ('1', '2', '3', '4') AND {date_column} = "
+        f"(make_date(CASE WHEN {year} ~ '^[0-9]{{4}}$' THEN {year}::int END, "
+        f"CASE WHEN {qtr} IN ('1', '2', '3', '4') THEN {qtr}::int * 3 END, 1) "
+        f"+ INTERVAL '1 month' - INTERVAL '1 day')::date, FALSE)"
+    )
+
+
 # ── transition guard ───────────────────────────────────────────────────────
 
 MARKER_FILE_ENV = "GRID_QQ_TRANSITION_DONE_FILE"

@@ -124,8 +124,7 @@ def print_open_trades(conn) -> None:
 
 def run_pnl_review(engine) -> None:
     """Main P&L review: compute unrealized P&L and close stale trades."""
-    # Import PaperTradingEngine
-    sys.path.insert(0, "/data/grid_v4/grid_repo")
+    # Import PaperTradingEngine (the repo root is already on sys.path; see top)
     from trading.paper_engine import PaperTradingEngine
 
     pte = PaperTradingEngine(engine)

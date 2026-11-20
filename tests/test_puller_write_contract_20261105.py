@@ -397,8 +397,8 @@ def _run_social(
     import ingestion.social_sentiment as mod
 
     puller = mod.SocialSentimentPuller(db_engine=engine)
-    # One combined RSS request returns every board; the stub serves r/stocks.
-    puller._reddit_hot_all = lambda subs: {"stocks": reddit("stocks")}
+    # Every board is read (Arctic Shift); the stub serves r/stocks.
+    puller._reddit_hot_all = lambda subs: ({"stocks": reddit("stocks")}, [])
     puller._reddit_mentions = mentions
     puller._bluesky_search = bluesky
     puller._google_trends = lambda kw: {}
@@ -415,10 +415,16 @@ def _http403(*_a: Any) -> list:
 class TestSocialSentiment:
     def test_success_persists_scan_and_reports_one_row(self) -> None:
         engine = _social_engine()
+        # Bracket the run: the series id carries the run's date, and a run
+        # that starts before midnight UTC and stores after it is still right
+        # (CI failed on 2026-11-10 00:05Z against the 23:52Z import-time date).
+        before = date.today()  # noqa: DTZ011 -- the puller dates the scan with date.today()
         out = _run_social(engine, lambda sub: list(_POSTS), lambda term: [])
+        after = date.today()  # noqa: DTZ011
         assert out["status"] == "SUCCESS" and out["rows_inserted"] == 1
         rows = engine.conn.inserts("raw_series")
-        assert len(rows) == 1 and rows[0]["sid"] == f"social_sentiment_{_TODAY.isoformat()}"
+        assert len(rows) == 1
+        assert rows[0]["sid"] in {f"social_sentiment_{d.isoformat()}" for d in (before, after)}
         # The stored payload is the scan, not the write-contract envelope.
         assert '"status"' not in rows[0]["payload"]
         assert _classify_outcome(out) == ("SUCCESS", 1, None)
@@ -430,7 +436,7 @@ class TestSocialSentiment:
         assert _classify_outcome(out) == ("NO_NEW_DATA", 0, "run completed, 0 rows written")
 
     def test_every_source_403_is_failed_with_reason_and_no_write(self) -> None:
-        # 1 Reddit RSS + 2 ApeWisdom + 5 Bluesky requests, all refused.
+        # Reddit (Arctic Shift, every board) + 2 ApeWisdom + 5 Bluesky requests, all refused.
         engine = _social_engine()
         out = _run_social(engine, _http403, _http403, _http403)
         assert out["status"] == "FAILED" and out["rows_inserted"] == 0
@@ -588,6 +594,12 @@ def _wiring_grid_scheduler(label: str, mod: str, cls: str, method: str, journal:
     assert _source_name(mod, cls) == journal
 
 
+def _retired_from_grid_scheduler(label: str, mod: str, cls: str, journal: str) -> None:
+    """Retired from grid-scheduler's daily group (2026-11-17); the module stays."""
+    assert f'("{label}", {cls}(db_engine)' not in _SCHEDULER_SRC
+    assert _source_name(mod, cls) == journal
+
+
 # (journal source name, wiring check, happy-path run)
 JOURNAL_SOURCES: list[tuple[str, Callable[[], None], Callable[[], tuple[dict, int]]]] = [
     ("FARA_DOJ",
@@ -606,8 +618,10 @@ JOURNAL_SOURCES: list[tuple[str, Callable[[], None], Callable[[], tuple[dict, in
                            "OpenCorporatesPuller", "pull_all", "OpenCorporates"),
      _happy_opencorporates),
     ("polygon",
-     lambda: _wiring_grid_scheduler("Polygon", "ingestion.altdata.polygon_puller",
-                                    "PolygonPuller", "pull", "polygon"),
+     # grid-scheduler's Polygon registration was retired 2026-11-17 (never
+     # wrote a row); the puller's write contract is still checked here.
+     lambda: _retired_from_grid_scheduler("Polygon", "ingestion.altdata.polygon_puller",
+                                          "PolygonPuller", "polygon"),
      _happy_polygon),
     ("wikidata_persons",
      lambda: _wiring_smart("wikidata_persons", "ingestion.altdata.wikidata_persons",

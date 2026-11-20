@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from loguru import logger as log
@@ -216,12 +216,19 @@ class JupiterClient:
         self,
         order: SwapOrder,
         wallet: "Any",
+        *,
+        verify: Callable[[SwapOrder, str], Any] | None = None,
     ) -> dict[str, Any]:
-        """Sign and submit an Ultra swap order.
+        """Check, sign and submit an Ultra swap order.
 
         Args:
             order: the unsigned :class:`SwapOrder` from :meth:`get_order`.
             wallet: a :class:`trading.solana.wallet.SolanaWallet` instance.
+            verify: called as ``verify(order, wallet.address)`` before the
+                signature is applied; it must raise to refuse the order.
+                Required: an order is never signed unchecked (#1143). Use
+                :func:`trading.solana.presign_check.verify_order_before_signing`
+                with a :class:`~trading.solana.solana_rpc.SolanaRPC`.
 
         Returns:
             The execute-endpoint response JSON, which contains either a
@@ -230,6 +237,8 @@ class JupiterClient:
         Raises:
             WalletUnavailableError: if the Solana SDK is not installed.
             JupiterError: on any HTTP failure.
+            PresignCheckFailed: if ``verify`` refuses the order, or no
+                ``verify`` was supplied.
         """
         # Imported lazily so importing this module never fails when the
         # heavy ``solders`` SDK is absent.
@@ -237,6 +246,14 @@ class JupiterClient:
 
         if not isinstance(wallet, SolanaWallet):
             raise ValueError("wallet must be a SolanaWallet instance")
+
+        from trading.solana.presign_check import PresignCheckFailed
+
+        if verify is None:
+            raise PresignCheckFailed(
+                "execute_swap requires a pre-sign verifier; refusing to sign unchecked"
+            )
+        verify(order, wallet.address)
 
         signed_tx = wallet.sign_base64_transaction(order.transaction)
 

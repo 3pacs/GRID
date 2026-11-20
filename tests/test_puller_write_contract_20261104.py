@@ -390,12 +390,12 @@ def test_smart_money_reddit_feed_failure_is_failed() -> None:
     p._load_trust_scores = lambda: None
 
     def blocked(subs: list[str]) -> list:
-        raise sm.reddit_rss.RedditRateLimited("slot past budget")
+        raise sm.arctic_shift.ArcticShiftBusy("slot past budget")
 
     p._fetch_hot_posts = blocked
     out = p.pull_all()
     assert [r["status"] for r in out] == ["FAILED"]
-    assert "reddit rss fetch failed" in out[0]["error"]
+    assert "reddit fetch failed (arctic shift)" in out[0]["error"]
     assert _classify_outcome(out)[:2] == ("FAILED", 0)
 
 

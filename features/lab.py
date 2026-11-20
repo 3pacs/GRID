@@ -26,6 +26,14 @@ from sqlalchemy.engine import Engine
 from store.pit import PITStore
 from utils.ttl_cache import TTLCache
 
+# Input staleness limits for consumers that report derived values as current
+# (live inference, the physics API, the analytics snapshot job). An input whose
+# newest PIT observation is older than this is treated as missing rather than
+# reported as today's value -- the 2026-03 derived-feature freeze was invisible
+# because the lab returned March rows as "latest" for eight months.
+DEFAULT_INPUT_MAX_AGE_DAYS = 10
+DEFAULT_INPUT_AGE_OVERRIDES: dict[str, int] = {"cpi_yoy": 75}  # monthly, ~6-week lag
+
 
 # ---------------------------------------------------------------------------
 # Transformation functions
@@ -350,9 +358,11 @@ class FeatureLab:
         else:
             results["hy_spread_3m_chg"] = None
 
-        # copper_gold_ratio: HG=F close / GC=F close
-        copper = self._get_pit_series("copper_futures_close", as_of_date)
-        gold = self._get_pit_series("gold_futures_close", as_of_date)
+        # copper_gold_ratio: HG=F close / GC=F close. entity_map writes
+        # YF:HG=F:close as "copper" and YF:GC=F:close as "gold_full"; the old
+        # *_futures_close names were never registered, so this was always None.
+        copper = self._get_pit_series("copper", as_of_date)
+        gold = self._get_pit_series("gold_full", as_of_date)
         if copper is not None and gold is not None:
             cg_ratio = ratio(copper, gold)
             val = zscore_normalize(cg_ratio).dropna()
@@ -371,7 +381,10 @@ class FeatureLab:
             results["copper_gold_slope"] = None
 
         # sp500_mom_12_1: (close[t-21] / close[t-252]) - 1
-        sp500 = self._get_pit_series("sp500_close", as_of_date, lookback_days=600)
+        # entity_map writes YF:^GSPC:close as "sp500_full"; "sp500_close" was
+        # never registered, so every sp500_* value below (and the physics
+        # block that reuses this series) was None on every run.
+        sp500 = self._get_pit_series("sp500_full", as_of_date, lookback_days=600)
         if sp500 is not None and len(sp500) > 252:
             mom = (sp500.shift(21) / sp500.shift(252)) - 1
             val = zscore_normalize(mom).dropna()
@@ -401,17 +414,13 @@ class FeatureLab:
         else:
             results["real_ffr"] = None
 
-        # vix_3m_ratio: VIX / VIX3M
-        vix = self._get_pit_series("vix_spot", as_of_date)
-        vix3m = self._get_pit_series("vix_3m_ratio", as_of_date)
-        if vix is not None and vix3m is not None:
-            common = vix.index.intersection(vix3m.index)
-            if len(common) > 0:
-                vr = ratio(vix.loc[common], vix3m.loc[common])
-                val = zscore_normalize(vr).dropna()
-                results["vix_3m_ratio"] = float(val.iloc[-1]) if not val.empty else None
-            else:
-                results["vix_3m_ratio"] = None
+        # vix_3m_ratio: VIX / VIX3M, stored by scripts/compute_derived_features.py.
+        # This used to divide vix_spot by that stored ratio, which is VIX3M
+        # itself (VIX / (VIX / VIX3M)), so the feature was a VIX3M z-score.
+        vr = self._get_pit_series("vix_3m_ratio", as_of_date)
+        if vr is not None and len(vr) > 0:
+            val = zscore_normalize(vr).dropna()
+            results["vix_3m_ratio"] = float(val.iloc[-1]) if not val.empty else None
         else:
             results["vix_3m_ratio"] = None
 

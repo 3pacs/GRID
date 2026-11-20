@@ -13,8 +13,12 @@ Bridge to API (task #154):
     process re-reads the freshly persisted actors and connections into
     its in-memory ``GraphEngine``. The ping is best-effort: a failure
     only logs a warning. Set ``GRID_SPIDER_API_URL`` to override the
-    default (http://127.0.0.1:8000) and ``GRID_SPIDER_API_TOKEN`` for
-    the bearer token.
+    default (http://127.0.0.1:8000). The endpoint sits behind
+    ``api.auth.require_auth`` (a JWT signed with ``GRID_JWT_SECRET``), so
+    the bearer is ``GRID_SPIDER_API_TOKEN`` / ``GRID_API_TOKEN`` when set,
+    otherwise a 15-minute JWT minted from the ``GRID_JWT_SECRET`` the
+    spider shares with the API via the same EnvironmentFile. The token is
+    never logged.
 """
 
 from __future__ import annotations
@@ -27,10 +31,24 @@ from typing import Any
 from loguru import logger as log
 
 
+def _api_reload_bearer() -> str | None:
+    """Bearer for the reload ping: explicit env token, else a minted JWT."""
+    token = os.getenv("GRID_SPIDER_API_TOKEN") or os.getenv("GRID_API_TOKEN")
+    if token:
+        return token
+    try:
+        from api.auth import create_token
+
+        return create_token(role="contributor", username="grid-spider", expires_hours=0.25)
+    except Exception as exc:  # noqa: BLE001 - fall through to an unauthenticated ping.
+        log.warning("Spider bridge: could not sign the reload JWT ({e})", e=type(exc).__name__)
+        return None
+
+
 def _ping_api_reload() -> None:
     """Best-effort notify the API process to refresh its in-memory graph."""
     url = os.getenv("GRID_SPIDER_API_URL", "http://127.0.0.1:8000").rstrip("/")
-    token = os.getenv("GRID_SPIDER_API_TOKEN") or os.getenv("GRID_API_TOKEN")
+    token = _api_reload_bearer()
     endpoint = f"{url}/api/v1/intelligence/spider/graph/reload"
     try:
         import urllib.request

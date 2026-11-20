@@ -95,6 +95,12 @@ class PostMortem:
 
 # ── Table Setup ───────────────────────────────────────────────────────────
 
+
+# Output cap for the two postmortem LLM calls. They used to inherit the 3090
+# client's 6000-token default; on the RESEARCH tier (x99-hex, 512 default)
+# they would silently be cut, so the cap is explicit.
+POSTMORTEM_NUM_PREDICT = 2000
+
 def _ensure_tables(engine: Engine) -> None:
     """Create the trade_postmortems table if it does not exist."""
     with engine.begin() as conn:
@@ -1637,7 +1643,7 @@ def _get_llm_postmortem(
 
     try:
         from llm.router import get_llm, Tier
-        llm = get_llm(Tier.REASON)
+        llm = get_llm(Tier.RESEARCH)
         if not llm.is_available:
             return defaults
     except Exception:
@@ -1730,6 +1736,7 @@ def _get_llm_postmortem(
             prompt=prompt,
             system="Identify the ROOT CAUSE using LEVER→CONDITION separation. LEVER: [Who] did [what] affecting [which liquidity valve]. CONDITION: [Environmental factor] that amplified/dampened the lever — conditions alone are NOT causes. State the INVALIDATION signal we missed. Label each finding confirmed/derived/estimated. Be specific and concise.",
             temperature=0.3,
+            num_predict=POSTMORTEM_NUM_PREDICT,
         )
 
         if not response:
@@ -1768,7 +1775,7 @@ def _get_llm_lessons_learned(
     """
     try:
         from llm.router import get_llm, Tier
-        llm = get_llm(Tier.REASON)
+        llm = get_llm(Tier.RESEARCH)
         if not llm.is_available:
             return None
     except Exception:
@@ -1822,6 +1829,7 @@ def _get_llm_lessons_learned(
             prompt=prompt,
             system="Synthesize root causes into actionable fixes using LEVER→CONDITION causation. Each recommendation must identify: LEVER ([Who] did [what] affecting [which valve]), CONDITION (amplifier/dampener — NOT a cause), and what INVALIDATION signal we missed. Never present conditions alone as causes. Label confidence: confirmed/derived/estimated.",
             temperature=0.3,
+            num_predict=POSTMORTEM_NUM_PREDICT,
         )
         if not response:
             return None

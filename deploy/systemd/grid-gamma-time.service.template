@@ -1,0 +1,22 @@
+[Unit]
+Description=GRID private intraday gamma strike history
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=SCHWAB_PRIVATE_GEX_BOARD_ENABLED=true
+Environment=GRID_GAMMA_RELEASE_PATH=/data/grid_v4/grid_release
+ExecStart=/data/grid_v4/grid_venv-314/bin/python -m scripts.record_gamma_time
+Restart=always
+RestartSec=5
+StateDirectory=grid-gamma-time
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
