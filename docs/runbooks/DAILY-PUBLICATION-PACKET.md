@@ -284,14 +284,25 @@ ingest enforces; the grader constructs rows so they pass by construction):
   T10Y3M, DFF, DGS2, DGS5) becomes a `data_quality` row judged on whether the number was real
   at the instant it was stated, from every capture GRID holds around it
   (`store.observations.read_vintages`: intraday pulls, the completed close, the session's
-  high/low, later revisions). During a session: confirmed when it lies between the in-session
-  captures within 90 minutes of the statement, or equals the previous completed close;
-  partially confirmed when it is only inside the session's high/low. After a close: confirmed
-  when it equals the newest completed close (even one GRID pulled after the statement:
-  `knowable_at_stated_at` says which); partially confirmed as stale when it equals an older
-  close while a newer one was already known. FRED rates use the same newest-vs-stale rule over
-  observation dates. Anything else is refuted, with the nearest captures and the range as
-  evidence. Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
+  high/low, later revisions). During a session: nearby captures (within 90 minutes) and
+  session ranges provide only `partially_confirmed` corroboration. A pull timestamp is
+  not a market-event timestamp, even when the value matches. The present observation
+  schema cannot confirm the exact-time intraday claim. Yesterday's close cannot confirm
+  today's current level. Only a complete same-session low/high from the same source and retrieval timestamp, captured after the close
+  can refute an out-of-range value; sparse mismatching samples are `unscorable`, not
+  refutation. Range evidence retains each actual retrieval timestamp, and later complete
+  ranges have `knowable_at_stated_at=false`. Nearby corroboration has availability
+  unknown for the claimed exact-time fact, not a fabricated `true`.
+  After-close and FRED rules are unchanged: newest completed close matches can confirm;
+  older known closes are stale/partial. These retain the prior limitation that release
+  timing/revisions and explicit "current" versus "close" wording require further work.
+  Grader confidence remains a heuristic, not a calibrated accuracy probability.
+  Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
+- Grader `v2-corroboration` changes verdict semantics only. Regrading follows the existing
+  append-only run/supersession path; it does not delete prior runs, alter original packets,
+  write model scores, or retroactively claim publication-time knowledge. Prior database
+  runs remain append-only; the per-day working review file is still replaced as before. Deployment and
+  any intentional historical regrade remain separate operator actions.
 - A day whose verdict rows and header (packet sha, models) did not change is left alone
   (`UNCHANGED`); a change rewrites the file and the ingest records a new run that supersedes the
   previous one. A hand-off that failed (database down) is retried on the next run until the
