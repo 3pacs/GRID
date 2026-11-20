@@ -132,6 +132,7 @@ def test_cycle_exposes_source_times_and_clears_prior_write_counts(monkeypatch):
     engine._last_store_counts = {"inserted": 999, "updated": 1000, "upsert_statements": 1999}
     monkeypatch.setattr(engine, "score_expired_predictions", lambda: {"total": 0})
     monkeypatch.setattr(engine, "evolve_weights", lambda: {})
+    monkeypatch.setattr(engine, "_load_models", lambda: [])
     monkeypatch.setattr(engine, "generate_predictions", lambda *a, **k: [])
     monkeypatch.setattr(engine, "_get_leaderboard", lambda: [])
     engine.engine = None
@@ -211,3 +212,15 @@ def test_reference_guard_failure_does_not_break_report(capture, monkeypatch):
     monkeypatch.setitem(sys.modules, "verification.ref_extractor", SimpleNamespace(extract_refs=unavailable))
     report.send_oracle_report(payload())
     assert "At a glance" in capture.call_args.args[2]
+
+
+def test_forward_report_separates_accepted_abstained_and_unchanged_records():
+    data = payload(new_predictions=2, distinct_positions_written=2,
+                   positions_updated=0, upsert_statements=10,
+                   new_abstentions=3, unchanged_forecasts=5, new_record_rows=5)
+    subject, _, plain = report.build_oracle_report(data)
+    assert '2 New prediction rows' in subject
+    assert '2 accepted forecasts' in plain
+    assert '3 new abstention records' in plain
+    assert '5 prior forecasts preserved unchanged' in plain
+    assert 'New rows unknown' not in plain

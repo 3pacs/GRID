@@ -16,7 +16,23 @@ alone is never a lead. Families (``classify_signal``):
 * ``gov_contract``      contract awards (up)
 * ``retail_sentiment``  reddit positioning (``smart_money``); QuiverQuant WSB
   is left out while its snapshot is frozen (``_FROZEN_SOURCES``)
-* ``price_move``        a robust excess-return anomaly vs SPY (``robust_z``)
+* ``price_move``        a robust excess-return anomaly vs SPY (``robust_z``);
+  context only, never one of the agreeing families (construction v2 below)
+
+Construction v2 (pre-registered 2026-11-08 22:22Z in the research-desk plan,
+after the first night's ten leads; every lead records it in its evidence):
+
+1. ``price_move`` is context: it neither makes nor blocks a lead. It is
+   usually the market's reaction to the other family (ADI, MSFT, CACI).
+2. QuiverQuant insider rows vote only for open-market purchases (code P, up)
+   and sales (code S, down), as the SEC feed already does. Grants,
+   exercises, tax withholding and gifts are not evidence: the insider "buys"
+   behind BAH and KBR were $0 stock grants (code A).
+3. One insider vote per (insider, day, direction), whichever feed carries
+   it and however many fills it has (one ADI sale was one SEC row and 20
+   QuiverQuant fills). The SEC puller's ``CLUSTER_BUY`` rows are summaries
+   of buys already counted, so they cast no vote (amendment registered
+   2026-11-08 before the first v2 run).
 
 Every observation carries its citation (table and row key) and was recorded
 by ``as_of`` (``created_at <= as_of``): rows dated in the future or written
@@ -47,6 +63,8 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from itertools import pairwise
@@ -54,7 +72,7 @@ from statistics import median
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -64,6 +82,8 @@ from intelligence.actor_identity import is_placeholder_ticker
 
 WINDOW_DAYS = 7               # observations must fall inside the 7 days to as_of
 MIN_FAMILIES = 2              # independent families agreeing on a direction
+CONSTRUCTION = "v2"           # lead-construction rules; see the module docstring
+CONTEXT_FAMILIES = frozenset({"price_move"})  # cited, never counted for or against
 MAX_NEW_LEADS = 20            # per run; the daily budget for LLM investigations
 LEAD_COOLDOWN_DAYS = 7        # one open intersection lead per (ticker, direction)
 MAX_PRICE_CANDIDATES = 40     # tickers whose closes are read per run
@@ -95,7 +115,7 @@ def is_testable_ticker(ticker: str) -> bool:
     """US-listed and not crypto: what the v2 ticker test can score."""
     return bool(_US_TICKER.match(ticker)) and not _CRYPTO_TICKER.match(ticker)
 
-_UP = {"BUY", "UNUSUAL_BUY", "CLUSTER_BUY", "INSIDER_BUY", "CONTRACT_AWARD", "WSB_BULLISH"}
+_UP = {"BUY", "UNUSUAL_BUY", "INSIDER_BUY", "CONTRACT_AWARD", "WSB_BULLISH"}
 _DOWN = {"SELL", "UNUSUAL_SELL", "INSIDER_SELL", "WSB_BEARISH"}
 _FAMILY_BY_SOURCE = {
     "options_flow": "options_flow",
@@ -126,6 +146,7 @@ class Observation:
     obs_date: date
     citation: dict[str, Any]
     magnitude: float | None = None
+    actor: str | None = None  # insider filer, for one vote per (insider, day, direction)
 
 
 @dataclass(frozen=True)
@@ -161,6 +182,7 @@ class IntersectionLead:
     agree: list[FamilyVote]
     dissent: list[FamilyVote] = field(default_factory=list)
     split: list[FamilyVote] = field(default_factory=list)
+    context: list[FamilyVote] = field(default_factory=list)
 
     @property
     def families(self) -> list[str]:
@@ -186,15 +208,16 @@ class IntersectionLead:
     def evidence(self) -> list[dict[str, Any]]:
         """One summary row per family (its up/down counts), then up to
         ``MAX_CITATIONS_PER_FAMILY`` cited rows from each agreeing family."""
-        out: list[dict[str, Any]] = []
+        out: list[dict[str, Any]] = [{"role": "construction", "kind": "construction",
+                                       "version": CONSTRUCTION}]
         for role, votes in (("agrees", self.agree), ("dissents", self.dissent),
-                            ("split", self.split)):
+                            ("split", self.split), ("context", self.context)):
             for v in votes:
                 out.append({"role": role, "kind": "family_vote", "family": v.family,
                             "ticker": self.ticker,
                             "direction": self.direction if role == "agrees" else v.direction,
                             "up": v.up, "down": v.down})
-        for v in self.agree:
+        for v in self.agree + self.context:
             rows = sorted((o for o in v.rows if o.direction == self.direction),
                           key=lambda o: (o.obs_date, -abs(o.magnitude or 0)), reverse=True)
             for o in rows[:MAX_CITATIONS_PER_FAMILY]:
@@ -218,7 +241,15 @@ def classify_signal(source_type: str | None, signal_type: str | None,
         except (TypeError, ValueError):
             value = None
     stype = (signal_type or "").strip().upper()
-    if family == "options_flow":
+    if stype == "CLUSTER_BUY":
+        # A summary of insider buys whose own rows already vote (v2 rule 3).
+        return None
+    if (source_type or "").strip().lower() == "quiverquant:insider":
+        # Only open-market trades, as in the SEC feed (construction v2 rule 2).
+        code = (str(value.get("TransactionCode") or "").strip().upper()
+                if isinstance(value, dict) else "")
+        direction = {"P": "up", "S": "down"}.get(code)
+    elif family == "options_flow":
         raw = str((value or {}).get("direction", "")).upper() if isinstance(value, dict) else ""
         direction = {"CALL": "up", "PUT": "down"}.get(raw)
     elif family == "retail_sentiment" and stype not in _UP | _DOWN:
@@ -297,13 +328,16 @@ def price_observation(ticker: str, returns: list[tuple[date, float]],
 def find_intersections(observations: list[Observation], window_end: date,
                        min_families: int = MIN_FAMILIES) -> list[IntersectionLead]:
     """Tickers where ``min_families`` family votes agree on a direction and
-    outnumber the families voting the other way."""
+    outnumber the families voting the other way. ``CONTEXT_FAMILIES`` count
+    for neither side; their votes ride along as context."""
     by_ticker: dict[str, list[Observation]] = {}
     for o in observations:
         by_ticker.setdefault(o.ticker, []).append(o)
     leads: list[IntersectionLead] = []
     for ticker, obs in sorted(by_ticker.items()):
-        votes = family_votes(obs)
+        all_votes = family_votes(obs)
+        context = [v for v in all_votes if v.family in CONTEXT_FAMILIES]
+        votes = [v for v in all_votes if v.family not in CONTEXT_FAMILIES]
         split = [v for v in votes if v.direction is None]
         for direction in ("up", "down"):
             agree = [v for v in votes if v.direction == direction]
@@ -312,7 +346,7 @@ def find_intersections(observations: list[Observation], window_end: date,
                 continue
             leads.append(IntersectionLead(ticker=ticker, direction=direction,
                                           window_end=window_end, agree=agree,
-                                          dissent=dissent, split=split))
+                                          dissent=dissent, split=split, context=context))
     leads.sort(key=lambda lead: (-lead.priority, lead.ticker))
     return leads
 
@@ -334,7 +368,8 @@ def collect_signal_observations(conn: Any, window_start: date, window_end: date,
                                 as_of_ts: datetime) -> list[Observation]:
     """Directional ``signal_sources`` rows known by ``as_of_ts``. One
     observation per (family, ticker, direction) is enough for the
-    intersection; every row is kept as a citation."""
+    intersection; every row is kept as a citation, except that insider rows
+    collapse to one per (insider, day, direction) (:func:`dedupe_insider_rows`)."""
     rows = conn.execute(_SIGNALS_SQL, {
         "start": window_start, "end": window_end, "as_of_ts": as_of_ts,
         "sources": sorted(_FAMILY_BY_SOURCE),
@@ -352,8 +387,46 @@ def collect_signal_observations(conn: Any, window_start: date, window_end: date,
             citation={"table": "signal_sources", "id": int(rid), "source_type": source_type,
                       "source_id": str(source_id) if source_id is not None else None,
                       "signal_type": stype},
+            actor=insider_actor(source_type, source_id, svalue) if family == "insider" else None,
         ))
-    return out
+    return dedupe_insider_rows(out)
+
+
+def insider_actor(source_type: str | None, source_id: Any, signal_value: Any) -> str | None:
+    """The filer's name, normalised so both feeds agree: the SEC feed keeps it
+    in ``source_id``, QuiverQuant in ``signal_value['Name']`` (its source_id is
+    a per-fill key). None when no name is recorded."""
+    if (source_type or "").strip().lower() == "quiverquant:insider":
+        value = signal_value
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                value = None
+        raw = value.get("Name") if isinstance(value, dict) else None
+    else:
+        raw = source_id
+    key = " ".join(re.sub(r"[^0-9a-z ]", " ", str(raw or "").casefold()).split())
+    return key or None
+
+
+def dedupe_insider_rows(observations: list[Observation]) -> list[Observation]:
+    """One insider observation per (ticker, insider, day, direction), the SEC
+    row first when both feeds carry it (construction v2 rule 3). Rows with no
+    filer name and other families pass through unchanged."""
+    def key(o: Observation) -> tuple[str, str, date, str] | None:
+        return (o.ticker, o.actor, o.obs_date, o.direction) if o.family == "insider" and o.actor else None
+
+    def rank(o: Observation) -> tuple[int, int]:
+        return (0 if o.citation.get("source_type") == "insider" else 1,
+                int(o.citation.get("id") or 0))
+
+    keep: dict[tuple[str, str, date, str], Observation] = {}
+    for o in observations:
+        k = key(o)
+        if k is not None and (k not in keep or rank(o) < rank(keep[k])):
+            keep[k] = o
+    return [o for o in observations if (k := key(o)) is None or keep[k] is o]
 
 
 def collect_price_observations(conn: Any, tickers: list[str], window_start: date,
@@ -474,6 +547,261 @@ def baseline_id(lead_id: str) -> str:
     return f"hyp_base_{lead_id.removeprefix('LEAD-INTX-')}"
 
 
+def sleuth_test_id(lead_id: str) -> str:
+    return f"hyp_sleuth_{lead_id.removeprefix('LEAD-INTX-')}"
+
+
+_TEST_COLUMNS = (
+    "id", "pattern_type", "test_criteria", "status", "created_at", "last_tested",
+    "times_tested", "times_correct", "kill_reason", "killed_at", "scoring_version",
+    "trial_p_value", "trial_q_value", "trial_ledger_sha256",
+)
+SLEUTH_SOURCE = "sleuth"          # test_criteria.source of a reviewed declaration
+TEST_ROLE_DECLARED = "declared"   # the reviewed test the lead's verdict declared
+TEST_ROLE_BASELINE = "baseline"   # the same criteria, declared for every lead without review
+TEST_LINK_MISSING = "declared_test_row_missing"            # the lead points at no row
+TEST_LINK_MISMATCH = "declared_test_names_another_lead"    # the row names another lead
+TEST_LINK_FOREIGN = "declared_pointer_is_not_this_leads_test"  # pointer is not the lead's own id
+TEST_ROW_STAGED = "test_row_staged_without_lead_pointer"   # row committed, lead still open
+TEST_ROW_ORPHANED = "test_row_orphaned_without_lead_pointer"  # row exists, a closed lead does not point at it
+TEST_ROW_MALFORMED = "test_row_malformed"                  # row is not the declaration it should be
+TEST_LEAD_DISAGREES = "lead_record_disagrees_with_test"    # the lead's own record says otherwise
+
+_DIRECTIONS = ("up", "down")
+
+
+def _criteria_faults(criteria: Any) -> list[str]:
+    """What a forward test's stored criteria lack. Empty when it is scorable."""
+    if not isinstance(criteria, dict):
+        return ["criteria_not_an_object"]
+    faults: list[str] = []
+    ticker = criteria.get("ticker")
+    if not isinstance(ticker, str) or not is_testable_ticker(ticker):
+        faults.append("ticker")
+    if criteria.get("expected_direction") not in _DIRECTIONS:
+        faults.append("expected_direction")
+    window = criteria.get("window_days")
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        faults.append("window_days")
+    move = criteria.get("min_move_pct")
+    if (isinstance(move, bool) or not isinstance(move, (int, float))
+            or not math.isfinite(move) or move <= 0):
+        faults.append("min_move_pct")
+    return faults
+
+
+def _row_faults(row: dict[str, Any], criteria: Any, *, pattern: str, source: str) -> list[str]:
+    """Why a stored row is not the declaration (``pattern``, ``source``) it
+    should be. The lead it names is checked by the caller."""
+    faults: list[str] = []
+    if row["pattern_type"] != pattern:
+        faults.append("pattern_type")
+    if not isinstance(criteria, dict) or criteria.get("source") != source:
+        faults.append("source")
+    return faults + _criteria_faults(criteria)
+
+
+def _lead_terms_faults(lead: Any, test_id: str, criteria: dict[str, Any]) -> list[str]:
+    """Where the lead's own record of what it declared differs from the test
+    row. ``investigate_intersection_lead`` writes both; they must agree."""
+    if lead.outcome != OUTCOME_DECLARED:
+        return ["outcome"]
+    recorded = [h for h in (lead.hypotheses if isinstance(lead.hypotheses, list) else [])
+                if isinstance(h, dict) and h.get("id") == test_id]
+    if len(recorded) != 1:
+        return ["declared_terms_missing"]
+    terms = recorded[0]
+    return [name for name, key in (("ticker", "ticker"), ("direction", "expected_direction"),
+                                   ("window_days", "window_days"),
+                                   ("min_move_pct", "min_move_pct"))
+            if terms.get(name) != criteria.get(key)]
+
+
+def declared_tests_for_leads(source: Any, leads: list[Any]) -> dict[str, dict[str, Any]]:
+    """Each lead's stored tests, read as they are now. One primary-key query.
+
+    ``source`` is an engine, or an open connection when the caller is reading
+    leads and tests in one snapshot (``read_leads_page``).
+
+    Test ids are deterministic from the lead id, so a lead's two possible rows
+    are found by key, plus whatever ``declared_hypothesis_id`` points at. A
+    row is only called a declared test when every stored fact agrees:
+
+    * ``tests``: verified rows only. The reviewed test (``role: declared``)
+      needs the lead's pointer to name the lead's own test id, the row to be
+      a reviewed declaration (pattern, source) naming this lead with scorable
+      criteria, and the lead's own record of the declared terms to match.
+      The baseline (``role: baseline``) is checked on its own: its id,
+      pattern, source, lead and criteria. Neither depends on the other.
+    * ``unverified_tests``: rows that exist but did not pass, each with a
+      ``state`` and the ``faults`` found. A reviewed row whose lead does not
+      point at it is ``staged`` while the lead is still open (the row and the
+      pointer are committed separately) and ``orphaned`` once the lead is
+      closed. These are shown, never counted as declared.
+    * ``link_problems``: one entry per unverified row or unresolved pointer.
+      A lead with a problem has no verified test for that role; that is not
+      the same as a lead with none.
+
+    Rows are updated in place by the trial scorer, so this is the current
+    state, not what was known at an earlier time.
+    """
+    wanted: dict[str, list[str]] = {}
+    for lead in leads:
+        ids = [baseline_id(lead.id), sleuth_test_id(lead.id)]
+        if lead.declared_hypothesis_id:
+            ids.append(lead.declared_hypothesis_id)
+        wanted[lead.id] = list(dict.fromkeys(ids))
+    out: dict[str, dict[str, Any]] = {
+        lead.id: {"tests": [], "unverified_tests": [], "link_problems": []} for lead in leads
+    }
+    all_ids = sorted({i for ids in wanted.values() for i in ids})
+    if not all_ids:
+        return out
+    stmt = text(
+        "SELECT id, pattern_type, test_criteria, status, created_at, last_tested, "
+        "times_tested, times_correct, kill_reason, killed_at, scoring_version, "
+        "trial_p_value, trial_q_value, trial_ledger_sha256 "
+        "FROM discovered_hypotheses WHERE id IN :ids"
+    ).bindparams(bindparam("ids", expanding=True))
+    if isinstance(source, Engine):
+        with source.connect() as conn:
+            fetched = conn.execute(stmt, {"ids": all_ids}).fetchall()
+    else:
+        fetched = source.execute(stmt, {"ids": all_ids}).fetchall()
+    rows = {r[0]: dict(zip(_TEST_COLUMNS, r, strict=True)) for r in fetched}
+
+    for lead in leads:
+        entry = out[lead.id]
+        pointer = lead.declared_hypothesis_id
+        own_id, base_id = sleuth_test_id(lead.id), baseline_id(lead.id)
+
+        def unverified(kind: str, test_id: str, criteria: Any,
+                       faults: list[str] | None = None, *,
+                       entry: dict[str, Any] = entry, pointer: str | None = pointer) -> None:
+            entry["unverified_tests"].append(
+                _test_view(rows[test_id], criteria, role=None, linked=test_id == pointer)
+                | {"verified": False, "state": kind, "faults": faults or []})
+            entry["link_problems"].append(
+                {"problem": kind, "id": test_id} | ({"faults": faults} if faults else {}))
+
+        for test_id in wanted[lead.id]:
+            row = rows.get(test_id)
+            if row is None:
+                if test_id == pointer:
+                    entry["link_problems"].append({"problem": TEST_LINK_MISSING, "id": test_id})
+                continue
+            criteria = _criteria(row["test_criteria"])
+            if test_id == pointer and test_id != own_id:
+                # The pointer may only name the lead's own reviewed test.
+                unverified(TEST_LINK_FOREIGN, test_id, criteria)
+                continue
+            if not isinstance(criteria, dict) or criteria.get("lead_id") != lead.id:
+                unverified(TEST_LINK_MISMATCH, test_id, criteria)
+                continue
+            if test_id == base_id:
+                faults = _row_faults(row, criteria, pattern=BASELINE_PATTERN,
+                                     source=BASELINE_PATTERN)
+                if faults:
+                    unverified(TEST_ROW_MALFORMED, test_id, criteria, faults)
+                else:
+                    entry["tests"].append(
+                        _test_view(row, criteria, role=TEST_ROLE_BASELINE, linked=False)
+                        | {"verified": True})
+                continue
+            # The lead's own reviewed test id.
+            faults = _row_faults(row, criteria, pattern=HYPOTHESIS_PATTERN, source=SLEUTH_SOURCE)
+            if faults:
+                unverified(TEST_ROW_MALFORMED, test_id, criteria, faults)
+            elif pointer != own_id:
+                unverified(TEST_ROW_STAGED if lead.status == "new" else TEST_ROW_ORPHANED,
+                           test_id, criteria)
+            elif terms := _lead_terms_faults(lead, test_id, criteria):
+                unverified(TEST_LEAD_DISAGREES, test_id, criteria, terms)
+            else:
+                entry["tests"].append(
+                    _test_view(row, criteria, role=TEST_ROLE_DECLARED, linked=True)
+                    | {"verified": True})
+    return out
+
+
+def _criteria(raw: Any) -> Any:
+    """Stored criteria as an object, or None when the text is not JSON."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+    return raw
+
+
+def _test_view(row: dict[str, Any], criteria: Any, *, role: str | None,
+               linked: bool) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "role": role,
+        "linked_from_lead": linked,
+        "pattern_type": row["pattern_type"],
+        "test_criteria": criteria,
+        "status": row["status"],
+        "created_at": _iso(row["created_at"]),
+        "last_tested": _iso(row["last_tested"]),
+        "times_tested": row["times_tested"],
+        "times_correct": row["times_correct"],
+        "kill_reason": row["kill_reason"],
+        "killed_at": _iso(row["killed_at"]),
+        "scoring_version": row["scoring_version"],
+        "trial_p_value": row["trial_p_value"],
+        "trial_q_value": row["trial_q_value"],
+        "trial_ledger_sha256": row["trial_ledger_sha256"],
+    }
+
+
+@contextmanager
+def read_snapshot(engine: Engine) -> Iterator[Any]:
+    """One connection in one read-only transaction that sees a single version
+    of the database: PostgreSQL ``REPEATABLE READ READ ONLY``. Every statement
+    run on it agrees with the others, whatever commits meanwhile."""
+    options: dict[str, Any] = {}
+    if engine.dialect.name == "postgresql":
+        options = {"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
+    with engine.connect() as base:
+        conn = base.execution_options(**options) if options else base
+        with conn.begin():
+            yield conn
+
+
+def read_leads_page(engine: Engine, *, status: str | None = None, category: str | None = None,
+                    limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    """A page of leads, the matching total and each lead's tests, all read in
+    one snapshot so the three cannot contradict each other."""
+    from intelligence.sleuth import Sleuth
+
+    sleuth = Sleuth(engine, ensure_schema=False)
+    with read_snapshot(engine) as conn:
+        leads = sleuth.get_leads(status=status, category=category, limit=limit,
+                                 offset=offset, conn=conn)
+        total = sleuth.count_leads(status=status, category=category, conn=conn)
+        tests = declared_tests_for_leads(conn, leads)
+    return {"leads": leads, "total": total, "tests": tests}
+
+
+def read_lead(engine: Engine, lead_id: str) -> dict[str, Any] | None:
+    """One lead and its tests in one snapshot, or None when there is no such lead."""
+    from intelligence.sleuth import Sleuth
+
+    with read_snapshot(engine) as conn:
+        lead = Sleuth(engine, ensure_schema=False)._load_lead(lead_id, conn=conn)
+        if lead is None:
+            return None
+        return {"lead": lead, "tests": declared_tests_for_leads(conn, [lead])[lead.id]}
+
+
+def _iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
 def declare_baseline(conn: Any, lead_id: str, question: str,
                      evidence: list[dict[str, Any]]) -> str | None:
     """Insert the lead's unreviewed forward test, or None when the lead names no
@@ -562,10 +890,10 @@ def declare_hypothesis(conn: Any, lead: Any, ticker: str, direction: str,
                        verdict: dict[str, str]) -> str:
     """Insert the lead's forward test into ``discovered_hypotheses``. Its
     ``created_at`` is now, so the v2 scorer's holdout is data after this."""
-    hyp_id = f"hyp_sleuth_{lead.id.removeprefix('LEAD-INTX-')}"
+    hyp_id = sleuth_test_id(lead.id)
     criteria = {"ticker": ticker, "window_days": HYPOTHESIS_WINDOW_DAYS,
                 "min_move_pct": HYPOTHESIS_MIN_MOVE_PCT, "expected_direction": direction,
-                "source": "sleuth", "lead_id": lead.id}
+                "source": SLEUTH_SOURCE, "lead_id": lead.id}
     thesis = (f"{ticker} moves {direction} at least {HYPOTHESIS_MIN_MOVE_PCT:g}% over "
               f"{HYPOTHESIS_WINDOW_DAYS} days after independent sources agreed "
               f"({lead.question[:160]})")

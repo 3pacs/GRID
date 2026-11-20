@@ -45,11 +45,19 @@ from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
 
-# LLM-based sentiment classifier (Task #175). Imported lazily inside
-# _classify_transcript_sentiment so a misconfigured Ollama endpoint or a
-# transient import error never breaks the rest of the puller. The
-# classifier hits qwen2.5:14b on p9d via Ollama and returns
-# label + confidence + signed score; falls back gracefully on failure.
+# Transcript sentiment is the AlphaVantage per-entry average only. The
+# Task #175 LLM classifier (ingestion.ml.earnings_sentiment_llm, qwen2.5:14b
+# via Ollama) was wired in by #207 but the module was never committed to this
+# repository, so every transcript logged an import warning and fell back to
+# the AV label. The dead call was removed; restoring an LLM classifier needs a
+# GPU-local client that honours GRID_ALLOW_PAID_LLM and is a separate change.
+SENTIMENT_SOURCE = "alphavantage_avg"
+SENTIMENT_NOTICE = (
+    "earnings_events: LLM transcript sentiment is not available "
+    "(ingestion.ml.earnings_sentiment_llm was never committed); "
+    "transcripts carry the AlphaVantage average label only "
+    "(sentiment_source=alphavantage_avg)"
+)
 
 
 SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -274,10 +282,8 @@ class EarningsEventsPuller(BasePuller):
         """Build a compact summary, full_text concat, and rough AV-derived label.
 
         This is the cheap pass: averages AV's per-entry sentiment numbers
-        into a coarse positive/neutral/negative label. The LLM classifier
-        (_classify_transcript_sentiment) runs alongside it at insert time
-        and overwrites label + confidence with higher-quality values.
-        Kept as a fallback for the case where the LLM endpoint is down.
+        into a coarse positive/neutral/negative label. This is the only
+        transcript sentiment stored (see SENTIMENT_NOTICE).
         """
         sentiments: list[float] = []
         chunks: list[str] = []
@@ -304,35 +310,6 @@ class EarningsEventsPuller(BasePuller):
         else:
             label = "neutral"
         return summary, full_text, label
-
-    @staticmethod
-    def _classify_transcript_sentiment(full_text: str) -> tuple[str | None, float | None]:
-        """Run the LLM sentiment classifier on a full transcript / filing text.
-
-        Returns (label, confidence). label is "positive" / "neutral" /
-        "negative" to match the existing column convention. Returns
-        (None, None) if the classifier is unreachable or the text is
-        empty, so callers can fall back to the AV-derived label.
-
-        Task #175 — wires the +0.2 cross-class confirmation leg for the
-        filings lane (#167) by giving it a real |score| signal instead
-        of the previous flat confidence 0.8 across every call.
-        """
-        if not full_text or not full_text.strip():
-            return None, None
-        try:
-            # Lazy import to keep the puller boot fast and avoid pulling
-            # the LLM client into test runs that don't need it.
-            from ingestion.ml.earnings_sentiment_llm import classify_or_none
-        except Exception as exc:  # pragma: no cover - import smoke
-            log.warning("sentiment classifier import failed: {e}", e=exc)
-            return None, None
-        try:
-            label, confidence, _ = classify_or_none(full_text)
-            return label, confidence
-        except Exception as exc:  # pragma: no cover - network / model
-            log.warning("sentiment classifier raised: {e}", e=str(exc)[:200])
-            return None, None
 
     # ------------------------------------------------------------------
     # Upsert
@@ -457,7 +434,7 @@ class EarningsEventsPuller(BasePuller):
     # spends AV calls on tickers whose freshest transcript is older
     # than ``incremental_max_age_days``. Daily call budget capped via
     # ``av_max_calls`` (default 400 — leaves 100 budget for retries
-    # and the SEC sentiment LLM fallback).
+    # and retries).
     INCREMENTAL_DEFAULT_MAX_AGE_DAYS = 90
 
     def _load_last_transcript_dates(
@@ -579,6 +556,7 @@ class EarningsEventsPuller(BasePuller):
         filings_seen = 0
         filings_inserted = 0
         transcripts_inserted = 0
+        transcripts_av_sentiment_only = 0
         per_ticker: dict[str, dict[str, int]] = {}
         av_calls = 0
         av_skipped_fresh = 0
@@ -683,18 +661,12 @@ class EarningsEventsPuller(BasePuller):
                     if not entries:
                         continue
                     summary, full_text, sent_label = self._summarize_transcript(entries)
-                    # Task #175: replace coarse AV label with LLM classifier
-                    # output when reachable. Falls back to AV-derived label
-                    # at confidence 0.8 if the LLM call fails.
-                    llm_label, llm_conf = self._classify_transcript_sentiment(full_text)
-                    if llm_label is not None and llm_conf is not None:
-                        final_label = llm_label
-                        final_confidence = float(llm_conf)
-                        sentiment_source = "qwen2.5:14b"
-                    else:
-                        final_label = sent_label
-                        final_confidence = 0.8
-                        sentiment_source = "alphavantage_avg"
+                    # Sentiment is the AV-derived label at a flat 0.8
+                    # confidence; the LLM classifier does not exist (see
+                    # SENTIMENT_NOTICE). Counted so the run summary shows it.
+                    final_label = sent_label
+                    final_confidence = 0.8
+                    sentiment_source = SENTIMENT_SOURCE
                     try:
                         # Quarter -> period_end approximation:
                         # last day of fiscal quarter.
@@ -736,6 +708,7 @@ class EarningsEventsPuller(BasePuller):
                     if inserted:
                         counts["transcripts_inserted"] += 1
                         transcripts_inserted += 1
+                        transcripts_av_sentiment_only += 1
 
             per_ticker[ticker] = counts
             if (
@@ -762,6 +735,11 @@ class EarningsEventsPuller(BasePuller):
         except Exception as exc:
             log.debug("source_catalog touch failed: {e}", e=str(exc))
 
+        if transcripts_av_sentiment_only:
+            log.warning(
+                "{notice}: {n} transcript(s) stored this run",
+                notice=SENTIMENT_NOTICE, n=transcripts_av_sentiment_only,
+            )
         log.info(
             "earnings_events: {fi} new filings, {tr} new transcripts "
             "across {n} tickers ({fs} filings seen, {av} AV calls, "
@@ -775,6 +753,7 @@ class EarningsEventsPuller(BasePuller):
             "filings_seen": filings_seen,
             "filings_inserted": filings_inserted,
             "transcripts_inserted": transcripts_inserted,
+            "transcripts_av_sentiment_only": transcripts_av_sentiment_only,
             "av_calls": av_calls,
             "av_skipped_fresh": av_skipped_fresh,
             "mode": mode_norm,
@@ -810,7 +789,7 @@ def main() -> None:
     parser.add_argument("--av-max-calls", type=int, default=400,
                         help="Cap on AlphaVantage calls per run (default 400 — "
                              "AV free tier is 500/day, leave 100 budget for "
-                             "retries + LLM sentiment fallback)")
+                             "retries)")
     parser.add_argument("--mode", choices=["full", "incremental"],
                         default="incremental",
                         help="incremental (default) only pulls AV transcripts "

@@ -17,7 +17,7 @@ import os
 import sys
 
 # Allow running from the live server tree or a dev checkout.
-for _candidate in ("/data/grid_v4/astrogrid_dedup", "/data/grid_v4/grid_repo"):
+for _candidate in ("/data/grid_v4/astrogrid_dedup",):
     if os.path.isdir(_candidate) and _candidate not in sys.path:
         sys.path.insert(0, _candidate)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

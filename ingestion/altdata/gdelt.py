@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -28,6 +29,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from ingestion.altdata import gdelt_doc
+from ingestion.altdata.gdelt_doc import GDELTRateLimited
 from ingestion.base import BasePuller
 
 # ── GDELT query definitions (original + enhanced) ──────────────────────
@@ -134,83 +137,70 @@ _GDELT_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "g
 
 # CAMEO conflict event codes (14-20: protest, force, assault, fight, etc.)
 _CONFLICT_CODES = {14, 15, 16, 17, 18, 19, 20}
-_RATE_LIMIT_DELAY: float = 1.0
 
-# DOC API (connect, read) timeouts. GDELT routinely takes 10-13 s just to
-# answer a request with HTTP 429 (probed from grid-svr 2026-11-04), so the
-# old flat 10 s read timeout turned every throttled request into a
-# "Read timed out" warning instead of a clean 429.
-_DOC_API_TIMEOUT: tuple[float, float] = (10.0, 30.0)
-
-# GDELT DOC API rate limit. The public DOC 2.0 endpoint starts returning
-# HTTP 429 above ~12 requests / 60s. We enforce that sustained rate with a
-# shared token bucket (≈ 5s between requests, small burst allowance) across
-# every DOC-API call — theme queries, actor tones, and tension scores —
-# regardless of which loop or retry attempt issues the request.
-_GDELT_DOC_MAX_PER_WINDOW: int = 12
-_GDELT_DOC_WINDOW_SECONDS: float = 60.0
+# DOC API pacing lives in ingestion/altdata/gdelt_doc.py: one host-wide gate
+# for GRID's GDELT callers (this puller, the breaking-news monitor, the
+# spider) with a shared cooldown after any HTTP 429. This puller used to
+# keep a per-instance token bucket, which could not see the other callers on
+# the same IP, and it abandoned the whole run on the first 429.
+_DOC_API_TIMEOUT: tuple[float, float] = gdelt_doc.REQUEST_TIMEOUT
+# Part of a run budget kept for the request itself when turning the budget
+# into a slot wait (GDELT takes 10-20 s to answer; the read timeout is 40 s).
+_DOC_REQUEST_RESERVE_S: float = 45.0
+# grid-scheduler's daily pull_recent has no outer timeout; bound it here.
+_DEFAULT_RUN_BUDGET_S: float = 600.0
 
 
-class _TokenBucket:
-    """Thread-unsafe token-bucket throttle for sustained request spacing.
+@dataclass
+class _DocRun:
+    """DOC API accounting for one pull run.
 
-    Refills ``rate`` tokens per second up to ``capacity``. ``acquire()``
-    blocks (via the injected ``sleep`` callable) until a token is available,
-    then consumes one. The clock and sleep are injectable so the throttle can
-    be unit-tested deterministically without real time.
+    A query GDELT refused with 429 (after the gate's cooldown retry) is
+    counted in ``refused`` and the run moves on: the next query waits out
+    the host-wide cooldown, which doubles with each 429. Once the cooldown
+    no longer fits the remaining budget the gate raises without sending,
+    and the run stops (``limited``).
 
-    Parameters:
-        max_per_window: Tokens allowed per ``window_seconds`` (sustained rate).
-        window_seconds: Length of the rate window.
-        capacity: Max burst size (defaults to a single request — strict
-            spacing, which is what GDELT needs).
-        clock: Monotonic time source (default ``time.monotonic``).
-        sleep: Blocking sleep callable (default ``time.sleep``).
+    Attributes:
+        deadline: ``time.monotonic()`` value after which no new request starts.
+        sent: Requests this run put on the wire (429s included).
+        answered: Non-429 answers.
+        refused: Queries that ended in HTTP 429.
+        limited: The no-slot stop that ended the run's DOC work.
+        not_attempted: DOC queries the run skipped after that stop.
+        retry_at: When the host may send again, from the last rate-limit stop.
     """
 
-    def __init__(
-        self,
-        max_per_window: int = _GDELT_DOC_MAX_PER_WINDOW,
-        window_seconds: float = _GDELT_DOC_WINDOW_SECONDS,
-        capacity: float = 1.0,
-        clock: Any = time.monotonic,
-        sleep: Any = time.sleep,
-    ) -> None:
-        if max_per_window <= 0 or window_seconds <= 0:
-            raise ValueError("max_per_window and window_seconds must be > 0")
-        self._rate: float = max_per_window / window_seconds  # tokens/sec
-        self._capacity: float = max(1.0, capacity)
-        self._tokens: float = self._capacity
-        self._clock = clock
-        self._sleep = sleep
-        self._last: float = clock()
+    deadline: float
+    sent: int = 0
+    answered: int = 0
+    refused: int = 0
+    limited: GDELTRateLimited | None = None
+    not_attempted: int = 0
+    retry_at: float | None = None
 
-    def _refill(self) -> None:
-        now = self._clock()
-        elapsed = now - self._last
-        if elapsed > 0:
-            self._tokens = min(
-                self._capacity, self._tokens + elapsed * self._rate
-            )
-            self._last = now
+    @classmethod
+    def with_budget(cls, budget_s: float | None) -> _DocRun:
+        budget = _DEFAULT_RUN_BUDGET_S if budget_s is None else max(0.0, float(budget_s))
+        return cls(deadline=time.monotonic() + budget)
 
-    def acquire(self) -> float:
-        """Block until a token is available, then consume it.
+    def slot_wait_s(self) -> float:
+        """How long the next request may wait for a slot (negative: no time left)."""
+        return self.deadline - time.monotonic() - _DOC_REQUEST_RESERVE_S
 
-        Returns:
-            Seconds spent sleeping (0.0 if a token was immediately available).
+    def rate_limited(self, exc: GDELTRateLimited, remaining: int) -> bool:
+        """Record a rate-limit answer; True when the run must stop sending.
+
+        ``remaining`` counts the current query and those after it in the loop.
         """
-        self._refill()
-        slept = 0.0
-        if self._tokens < 1.0:
-            deficit = 1.0 - self._tokens
-            wait_s = deficit / self._rate
-            if wait_s > 0:
-                self._sleep(wait_s)
-                slept = wait_s
-            self._refill()
-        self._tokens -= 1.0
-        return slept
+        self.retry_at = exc.retry_at or self.retry_at
+        if exc.sent:
+            self.refused += 1
+            return False
+        if self.limited is None:
+            self.limited = exc
+        self.not_attempted += max(0, remaining)
+        return True
 
 
 class GDELTPuller(BasePuller):
@@ -230,16 +220,33 @@ class GDELTPuller(BasePuller):
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         os.makedirs(_GDELT_DATA_DIR, exist_ok=True)
-        # Shared throttle for all DOC-API requests so we stay under GDELT's
-        # ~12 req/60s ceiling even across retries and the three query loops.
-        self._doc_throttle = _TokenBucket()
         log.info("GDELTPuller initialised — source_id={sid}", sid=self.source_id)
 
-    def _acquire_doc_token(self) -> float:
-        """Consume a GDELT DOC API token, creating the throttle for test shims."""
-        if not hasattr(self, "_doc_throttle"):
-            self._doc_throttle = _TokenBucket()
-        return self._doc_throttle.acquire()
+    def _doc_request(self, params: dict[str, Any], run: _DocRun) -> requests.Response:
+        """One DOC API GET through the host-wide gate, counted against ``run``.
+
+        Raises:
+            GDELTRateLimited: No slot within the run's budget, or HTTP 429 after
+                the gate's retry. ``exc.sent`` says whether anything was sent.
+        """
+        wait = run.slot_wait_s()
+        if wait < 0:
+            raise GDELTRateLimited(
+                "GDELT run budget spent before the next DOC slot", sent=False, retry_at=None,
+            )
+        try:
+            resp = gdelt_doc.doc_get(params, max_wait_s=wait, timeout=_DOC_API_TIMEOUT,
+                                     caller="gdelt_puller")
+        except GDELTRateLimited as exc:
+            if exc.sent:
+                run.sent += 1
+            raise
+        except requests.RequestException:
+            run.sent += 1
+            raise
+        run.sent += 1
+        run.answered += 1
+        return resp
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_gkg_day(self, target_date: date) -> pd.DataFrame | None:
@@ -370,8 +377,14 @@ class GDELTPuller(BasePuller):
             "total": len(results),
         }
 
-    def _fetch_gdelt_api(self, query: str, mode: str, timespan: str) -> dict:
-        """Fetch a bounded thematic timeline from GDELT DOC API."""
+    def _fetch_gdelt_api(
+        self, query: str, mode: str, timespan: str, run: _DocRun | None = None,
+    ) -> dict:
+        """Fetch a bounded thematic timeline from GDELT DOC API.
+
+        HTTP 429 is not answered here: the gate cools the host down and
+        retries, then raises ``GDELTRateLimited`` for the run to stop on.
+        """
         params = {
             "query": query,
             "mode": mode.lower(),
@@ -379,9 +392,8 @@ class GDELTPuller(BasePuller):
             "format": "json",
             "maxrecords": 250,
         }
-        self._acquire_doc_token()
-        resp = requests.get(_GDELT_API_URL, params=params, timeout=_DOC_API_TIMEOUT)
-        if resp.status_code in {400, 403, 404, 429, 500, 502, 503, 504}:
+        resp = self._doc_request(params, run if run is not None else _DocRun.with_budget(None))
+        if resp.status_code in {400, 403, 404, 500, 502, 503, 504}:
             log.info(
                 "GDELT query skipped status={status} query={query}",
                 status=resp.status_code,
@@ -393,19 +405,23 @@ class GDELTPuller(BasePuller):
 
     # ── Actor-level tone tracking ──────────────────────────────────────
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_gdelt_doc_api(
         self,
         query: str,
         mode: str = "timelinetone",
         timespan: str = "30d",
+        run: _DocRun | None = None,
     ) -> dict:
         """Fetch from GDELT DOC 2.0 API (broader than TV API).
+
+        No tenacity retry: re-sending on a 429 only extends the throttle. The
+        gate retries a 429 once after the host-wide cooldown.
 
         Parameters:
             query: Search query string.
             mode: Response mode (timelinetone, timelinevolinfo, etc.).
             timespan: Time span for results.
+            run: The pull run's DOC accounting (a fresh one if omitted).
 
         Returns:
             Parsed JSON response.
@@ -417,29 +433,34 @@ class GDELTPuller(BasePuller):
             "format": "json",
             "maxrecords": 250,
         }
-        self._doc_throttle.acquire()
-        resp = requests.get(GDELT_DOC_API_URL, params=params, timeout=30)
+        resp = self._doc_request(params, run if run is not None else _DocRun.with_budget(None))
         resp.raise_for_status()
         return resp.json()
 
-    def _pull_actor_tones(self) -> int:
+    def _pull_actor_tones(self, run: _DocRun | None = None) -> int:
         """Pull tone data for tracked geopolitical actors.
 
         Queries GDELT DOC API for each named actor and stores the
-        daily average tone as a time series.
+        daily average tone as a time series. Stops at the first rate-limit
+        stop (recorded on ``run``) instead of sending into a cooldown.
 
         Returns:
             Number of rows inserted.
         """
         inserted = 0
+        run = run if run is not None else _DocRun.with_budget(None)
+        if run.limited is not None:
+            run.not_attempted += len(GDELT_ACTOR_QUERIES)
+            return 0
 
-        for actor_def in GDELT_ACTOR_QUERIES:
+        for a_idx, actor_def in enumerate(GDELT_ACTOR_QUERIES):
             try:
                 query = f'"{actor_def["actor"]}" {actor_def["context"]}'
                 data = self._fetch_gdelt_doc_api(
                     query=query,
                     mode="timelinetone",
                     timespan="30d",
+                    run=run,
                 )
 
                 feature = actor_def["feature"]
@@ -474,6 +495,11 @@ class GDELTPuller(BasePuller):
                             except (ValueError, TypeError):
                                 continue
 
+            except GDELTRateLimited as exc:
+                if run.rate_limited(exc, len(GDELT_ACTOR_QUERIES) - a_idx):
+                    log.info("GDELT actor tones stopped: {e}", e=str(exc))
+                    break
+                log.info("GDELT actor tone refused for {a}: {e}", a=actor_def["actor"], e=str(exc))
             except Exception as exc:
                 log.warning(
                     "GDELT actor tone query failed for {actor}: {err}",
@@ -481,31 +507,34 @@ class GDELTPuller(BasePuller):
                     err=str(exc),
                 )
 
-            time.sleep(_RATE_LIMIT_DELAY)
-
         log.info("GDELT actor tones: {n} rows inserted", n=inserted)
         return inserted
 
     # ── Country-pair tension scoring ────────────────────────────────────
 
-    def _pull_tension_scores(self) -> int:
+    def _pull_tension_scores(self, run: _DocRun | None = None) -> int:
         """Pull bilateral tension scores for tracked country pairs.
 
         Uses GDELT DOC API with tone mode to measure negative sentiment
         volume between country pairs. Negative tone + high volume =
-        elevated tension.
+        elevated tension. Stops at the first rate-limit stop (on ``run``).
 
         Returns:
             Number of rows inserted.
         """
         inserted = 0
+        run = run if run is not None else _DocRun.with_budget(None)
+        if run.limited is not None:
+            run.not_attempted += len(GDELT_TENSION_PAIRS)
+            return 0
 
-        for pair_def in GDELT_TENSION_PAIRS:
+        for p_idx, pair_def in enumerate(GDELT_TENSION_PAIRS):
             try:
                 data = self._fetch_gdelt_doc_api(
                     query=pair_def["pair"],
                     mode="timelinetone",
                     timespan="30d",
+                    run=run,
                 )
 
                 feature = pair_def["feature"]
@@ -541,14 +570,17 @@ class GDELTPuller(BasePuller):
                             except (ValueError, TypeError):
                                 continue
 
+            except GDELTRateLimited as exc:
+                if run.rate_limited(exc, len(GDELT_TENSION_PAIRS) - p_idx):
+                    log.info("GDELT tension scores stopped: {e}", e=str(exc))
+                    break
+                log.info("GDELT tension query refused for {p}: {e}", p=pair_def["pair"], e=str(exc))
             except Exception as exc:
                 log.warning(
                     "GDELT tension query failed for {pair}: {err}",
                     pair=pair_def["pair"],
                     err=str(exc),
                 )
-
-            time.sleep(_RATE_LIMIT_DELAY)
 
         log.info("GDELT tension scores: {n} rows inserted", n=inserted)
         return inserted
@@ -641,14 +673,43 @@ class GDELTPuller(BasePuller):
 
     # ── Main pull methods ───────────────────────────────────────────────
 
+    @staticmethod
+    def _apply_rate_limit_outcome(result: dict[str, Any], run: _DocRun) -> None:
+        """Turn a run's 429s and rate-limit stop into an honest status (see pull_recent)."""
+        if run.limited is None and run.refused == 0:
+            return
+        parts = []
+        if run.refused:
+            parts.append(f"rate-limited (HTTP 429) on {run.refused} DOC queries")
+        if run.limited is not None:
+            parts.append(f"{run.not_attempted} DOC queries not attempted "
+                         "(no request slot within the run budget)")
+        note = "GDELT DOC API " + "; ".join(parts)
+        if run.retry_at:
+            resume = datetime.fromtimestamp(run.retry_at, timezone.utc)
+            note += f"; host may send again at {resume:%H:%M:%S}Z"
+        result["doc_requests_sent"] = run.sent
+        result["doc_queries_refused"] = run.refused
+        result["doc_queries_not_attempted"] = run.not_attempted
+        if (run.sent == 0 and run.refused == 0 and result["total_rows"] == 0
+                and not result["errors"]):
+            result["status"] = "DEFERRED"
+            result["reason"] = (f"{note}; nothing was sent this run, and the next run "
+                                "reads the same rolling window")
+            return
+        result["errors"].append(note)
+        result["status"] = ("PARTIAL" if result["total_rows"] > 0 or run.answered > 0
+                            else "FAILED")
+
     def pull_all(self, **kwargs: Any) -> dict[str, Any]:
         """Bounded recent pull -- the entry point generic callers expect.
 
         ``scripts/hermes_fixers.py`` retries a failed source via
         ``pull_all()``; GDELTPuller had none, so every GDELT repair attempt
         failed with ``AttributeError`` (6 warnings/day). Defaults mirror the
-        SmartScheduler "gdelt" entry: one day, four theme queries, no actor
-        or tension fan-out.
+        SmartScheduler "gdelt" entry (one day, four theme queries, no actor
+        or tension fan-out), with a 150 s DOC budget for repair callers that
+        pass no deadline.
         """
         params: dict[str, Any] = {
             "days_back": 1,
@@ -656,6 +717,7 @@ class GDELTPuller(BasePuller):
             "include_actor_tones": False,
             "include_tensions": False,
             "include_signals": False,
+            "run_budget_s": 150,
         }
         params.update(kwargs)
         return self.pull_recent(**params)
@@ -667,13 +729,40 @@ class GDELTPuller(BasePuller):
         include_actor_tones: bool = True,
         include_tensions: bool = True,
         include_signals: bool = True,
+        run_budget_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> dict[str, Any]:
         """Pull recent GDELT data using the 2.0 API.
 
         Enhanced to include actor tones, country tensions, and
         geopolitical event signals alongside the original queries.
+
+        Every DOC request goes through the host-wide gate
+        (``ingestion/altdata/gdelt_doc.py``). A 429 cools the whole host
+        down and is retried once at the next slot; a query still refused
+        is recorded and the run moves on to the next one, which waits out
+        the (doubling) cooldown. When no slot comes up within the run
+        budget the run stops sending. Outcome:
+
+        - nothing sent at all (the host was cooling down or busy, the run
+          had no slot): ``DEFERRED``. No data is lost: every query reads a
+          rolling window (``days_back`` for themes, 30 days for actors and
+          tensions), so the next run reads the same dates.
+        - some queries refused or not attempted, some answered: ``PARTIAL``.
+        - every request that was sent got 429: ``FAILED``.
+
+        Parameters:
+            run_budget_s: Seconds this run may spend on DOC requests, slot
+                waits included (default ``_DEFAULT_RUN_BUDGET_S``). Keep it
+                under the caller's own timeout.
+            deadline_at: ``time.monotonic()`` instant no request may start
+                after; SmartScheduler passes its cooperative deadline
+                (timeout_s minus the stop margin).
         """
         log.info("Pulling GDELT recent data (last {d} days)", d=days_back)
+        run = _DocRun.with_budget(run_budget_s)
+        if deadline_at is not None:
+            run.deadline = min(run.deadline, float(deadline_at))
         result: dict[str, Any] = {
             "source": "GDELT",
             "total_rows": 0,
@@ -696,22 +785,9 @@ class GDELTPuller(BasePuller):
                     query_def["query"],
                     query_def["mode"],
                     f"{days_back}d",
+                    run=run,
                 )
                 feature = query_def["feature"]
-                if data.get("http_status") == 429:
-                    # GDELT is throttling this host: more queries this run
-                    # only deepen the penalty. Stop and let the scheduler's
-                    # failure cooldown space the next attempt.
-                    remaining = len(theme_queries) - q_idx - 1
-                    log.info(
-                        "GDELT DOC API rate-limited (429); skipping the remaining "
-                        "{n} theme queries this run",
-                        n=remaining,
-                    )
-                    result["errors"].append(
-                        f"GDELT DOC API rate-limited (HTTP 429); {remaining} theme queries not attempted"
-                    )
-                    break
 
                 # Parse timeline data. The DOC API always wraps points one
                 # level deeper than they look: ``timeline`` is a list of
@@ -750,6 +826,14 @@ class GDELTPuller(BasePuller):
                             except (ValueError, TypeError):
                                 continue
 
+            except GDELTRateLimited as exc:
+                # A refused query (429 after the cooldown retry) moves on: the
+                # next one waits out the doubled host-wide cooldown. No slot
+                # within the budget stops the run without sending.
+                if run.rate_limited(exc, len(theme_queries) - q_idx):
+                    log.info("GDELT theme queries stopped: {e}", e=str(exc))
+                    break
+                log.info("GDELT theme query refused ({f}): {e}", f=query_def["feature"], e=str(exc))
             except (requests.Timeout, requests.ConnectionError) as exc:
                 # One unreachable/overloaded DOC API answer stands for the
                 # whole run: log once, stop, and let the cooldown back off.
@@ -771,14 +855,12 @@ class GDELTPuller(BasePuller):
                 )
                 result["errors"].append(str(exc))
 
-            time.sleep(_RATE_LIMIT_DELAY)
-
         result["total_rows"] = inserted
 
         # 2. Actor-level tone tracking
         if include_actor_tones:
             try:
-                actor_rows = self._pull_actor_tones()
+                actor_rows = self._pull_actor_tones(run=run)
                 result["actor_rows"] = actor_rows
                 result["total_rows"] += actor_rows
             except Exception as exc:
@@ -788,7 +870,7 @@ class GDELTPuller(BasePuller):
         # 3. Country-pair tension scores
         if include_tensions:
             try:
-                tension_rows = self._pull_tension_scores()
+                tension_rows = self._pull_tension_scores(run=run)
                 result["tension_rows"] = tension_rows
                 result["total_rows"] += tension_rows
             except Exception as exc:
@@ -803,6 +885,8 @@ class GDELTPuller(BasePuller):
             except Exception as exc:
                 log.warning("GDELT signal emission failed: {err}", err=str(exc))
                 result["errors"].append(f"signals: {exc}")
+
+        self._apply_rate_limit_outcome(result, run)
 
         log.info(
             "GDELT recent: {n} total rows (themes={t}, actors={a}, tension={ten}), "

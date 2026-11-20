@@ -36,11 +36,12 @@ def _fresh_process_warning_memory(monkeypatch):
 
 
 # A real mapping whose target is deliberately absent from the fixture
-# registry below — the live shape of the miss (YF:IEF:close -> ief_full,
+# registry below — the live shape of the miss (YF:IEF:adj_close -> ief_full,
 # mapped but never registered). It arrives via NEW_MAPPINGS_V2, which
 # EntityMap.__init__ merges into SEED_MAPPINGS, so it is only visible
-# after an EntityMap has been constructed.
-MAPPED_BUT_UNREGISTERED = "YF:IEF:close"
+# after an EntityMap has been constructed. (adj_close, not close: since
+# 2026-11-08 only adj_close feeds a ``_full`` feature.)
+MAPPED_BUT_UNREGISTERED = "YF:IEF:adj_close"
 
 
 @pytest.fixture

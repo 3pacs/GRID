@@ -31,11 +31,18 @@ from ingestion.base import BasePuller
 # * OECD/KEI, BDF/BP and Bundesbank/BBDP1 404 with no DBnomics replacement,
 #   so germany_cli_dbnomics, france_current_account and germany_cpi_dbnomics
 #   are dropped. None of the five had ever stored a row.
+#
+# 2026-11-09 (fetch-only probe of the 2026-11-07 list):
+# * us_mmkt_rate_imf dropped: the IMF retired IFS, and the DBnomics IMF/IFS
+#   mirror of M.US.FIMM_PA.USD ends at 2021-08-01 (806 observations, the
+#   same 2021-08-01 maximum already stored). It also cost ~17 s per fetch.
+#   The US overnight rate is read from FRED and the OFR repo series.
+# * us_credit_gdp_bis moved to ingestion/international/bis.py (BIS direct,
+#   WS_TC 2.0): the DBnomics BIS/WS_TC mirror stops at 2024-Q4 while BIS
+#   publishes to 2026-Q1. It had never stored a row under DBnomics.
 DBNOMICS_SERIES: dict[str, str] = {
     "ECB/IRS/M.IT.L.L40.CI.0000.EUR.N.Z": "italy_10y_ecb_dbnomics",
     "ECB/IRS/M.FR.L.L40.CI.0000.EUR.N.Z": "france_10y_yield",
-    "IMF/IFS/M.US.FIMM_PA.USD": "us_mmkt_rate_imf",
-    "BIS/WS_TC/Q.US.P.A.M.770.A": "us_credit_gdp_bis",
 }
 
 _RATE_LIMIT_DELAY: float = 2.0

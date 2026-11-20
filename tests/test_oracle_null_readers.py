@@ -523,7 +523,7 @@ class TestEngineScoringLoopEntryPrice:
     ZeroDivisionError, and the one that has to settle both before dividing.
     """
 
-    def _engine_under_test(self, engine, prices: dict):
+    def _engine_under_test(self, engine, prices: dict, monkeypatch):
         from oracle.engine import OracleEngine
 
         # __init__ runs 8+ CREATE TABLE statements in Postgres dialect and
@@ -533,7 +533,12 @@ class TestEngineScoringLoopEntryPrice:
         oe.engine = engine
         oe.models = []
         oe._last_guard_verdicts = []
-        oe._get_price_at_date = lambda ticker, _expiry: prices.get(ticker)
+        expiry = date.today() - timedelta(days=1)
+        session = sot.expiry_session_date("SPY", expiry)
+        monkeypatch.setattr(sot, "load_expiry_closes", lambda *a, **k: _book({
+            ticker: {session: price} for ticker, price in prices.items()
+        }))
+        monkeypatch.setattr(sot, "load_split_book", lambda *a, **k: {})
         return oe
 
     def _seed(self, engine) -> date:
@@ -569,7 +574,7 @@ class TestEngineScoringLoopEntryPrice:
         return today
 
     def test_unusable_entries_are_closed_or_held_by_the_hold_policy(
-        self, engine,
+        self, engine, monkeypatch,
     ):
         """A MARKED NULL is closed with a reason; a non-null invalid entry,
         and an UNMARKED NULL, are held.
@@ -593,7 +598,7 @@ class TestEngineScoringLoopEntryPrice:
             engine, {
                 "AAA": 110.0, "BBB": 110.0, "CCC": 110.0, "DDD": 110.0,
                 "EEE": 110.0,
-            },
+            }, monkeypatch,
         )
 
         # No TypeError on the NULL, no ZeroDivisionError on the measured 0.
@@ -633,7 +638,7 @@ class TestEngineScoringLoopEntryPrice:
         assert rows["normal"][0] == "hit"
         assert rows["normal"][2] == pytest.approx(10.0)
 
-    def test_a_zero_entry_never_reaches_a_division(self, engine):
+    def test_a_zero_entry_never_reaches_a_division(self, engine, monkeypatch):
         """A zero entry must be settled *before* the divide, not caught after.
 
         Driven by making any arithmetic against the fetched price raise: if
@@ -655,7 +660,7 @@ class TestEngineScoringLoopEntryPrice:
             conn.execute(text(
                 "DELETE FROM oracle_predictions WHERE id <> 'zero-entry'"
             ))
-        oe = self._engine_under_test(engine, {"BBB": _Exploding(110.0)})
+        oe = self._engine_under_test(engine, {"BBB": _Exploding(110.0)}, monkeypatch)
         results = oe.score_expired_predictions()
         assert results["unscorable_entry_price"] == 0
         assert results["held_legacy_entry_price"] == 1
@@ -696,11 +701,15 @@ class TestEntryPricePolicy:
         assert is_divisible_entry_price(None) is False
 
     def test_a_reason_is_never_a_substitute_price(self):
-        """Nothing in the policy hands back a number to divide by."""
+        """A refusal reason cannot be consumed as a stand-in price.
+
+        The shared module also owns a quote-age duration; that is not a
+        substitute price. Check the actual exported reason constants.
+        """
         from oracle import entry_price_policy
 
         for name in dir(entry_price_policy):
-            if name.startswith("_"):
+            if not name.startswith(("SCORE_NOTE_", "PNL_BASIS_")):
                 continue
             value = getattr(entry_price_policy, name)
             assert not isinstance(value, (int, float)), (

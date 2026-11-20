@@ -125,7 +125,6 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "ollama/market_briefing.py": 4,
     "oracle/astrogrid_universe.py": 1,
     "oracle/claim_verifier.py": 3,
-    "oracle/engine.py": 1,
     "oracle/psi_model.py": 2,
     "orchestration/grid_worker.py": 3,
     "orchestration/llm_task_workers.py": 5,

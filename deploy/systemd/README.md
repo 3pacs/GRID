@@ -1,7 +1,27 @@
 # GRID systemd units
 
-This directory ships systemd unit templates. None of them is installed by
-any code path, CI job or deploy workflow.
+This directory ships systemd unit templates. None of them is INSTALLED by
+any code path, CI job or deploy workflow: the first install of a unit is always
+an operator's `sudo install` (each template's header has the lines). Once a
+unit is installed, a push deploy keeps it in sync with its template:
+`scripts/check_systemd_unit_drift.sh --sync --strict` (the "Sync installed
+systemd units" step of `.github/workflows/deploy.yml`) reinstalls any installed
+unit whose template carries the line `# deploy-sync: managed` and whose
+non-comment lines differ from the shipped file, then runs `daemon-reload`.
+Templates without that line are compared and reported only, so a deliberate
+local deviation (e.g. `grid-e2-scoreboard` running as a dedicated user) is
+never reverted by a deploy. It never installs a new unit, never touches
+`<unit>.d/` drop-ins, never restarts a running service (the deploy's own
+restart steps or the operator do that) and reports templated instance units
+(`name@.service`) without syncing them. Remaining drift is a workflow warning. Run it by hand to see drift without changing anything:
+
+```bash
+bash scripts/check_systemd_unit_drift.sh            # report (unit names + differing-line counts)
+bash scripts/check_systemd_unit_drift.sh --verbose  # also the differing lines, Environment= values redacted
+bash scripts/check_systemd_unit_drift.sh --sync     # reinstall drifted managed units
+```
+
+The deploy step never passes `--verbose`: unit contents must not land in CI logs.
 
 * `grid-goal-worker@.service`: the idle-fleet goal worker (Day 1 of
   `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
@@ -365,8 +385,8 @@ GRID env file `/home/grid/grid_v4/grid_repo/.env`, under a shared
 
 | Timer | Calendar (America/New_York) | UTC (EDT / EST) | Why |
 |---|---|---|---|
-| `grid-godview-fed.timer` | Thu 17:30, retry Fri 09:00 | 21:30 / 22:30 | H.4.1 publishes Thu ~16:30 ET; FRED lands WALCL/WTREGEN ~30 min later |
-| `grid-godview-cftc.timer` | Fri 16:00, retry Sat 14:00 | 20:00 / 21:00 | COT publishes Fri 15:30 ET; the puller moves to Fri >= 19:45 UTC + a Saturday retry (plan A1) |
+| `grid-godview-fed.timer` | Thu 17:30, retry Fri 09:00; Fri 18:30 | 21:30 / 22:30; 22:30 / 23:30 | H.4.1 publishes Thu ~16:30 ET; FRED lands WALCL/WTREGEN ~30 min later. A Thursday Fed holiday (Thanksgiving) moves H.4.1 to Fri 16:30 ET; the Fri 18:30 run writes that week, and is a `noop` otherwise |
+| `grid-godview-cftc.timer` | Fri 16:00, retry Sat 14:00; Mon + Tue 17:00 | 20:00 / 21:00; 21:00 / 22:00 | COT publishes Fri 15:30 ET; the puller moves to Fri >= 19:45 UTC + a Saturday retry (plan A1). Holiday weeks publish on the next federal business day after the Friday (usually Monday); the Mon/Tue runs pick those up, and are a `noop` in an ordinary week |
 
 Every run writes a `godview_runs` row (`complete`, `noop`,
 `partial_blocked_by_legacy`, `inputs_missing` or `failed`); exit codes are in

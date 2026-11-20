@@ -23,12 +23,43 @@ CQ_BASE = "https://api.cryptoquant.com/v1"
 
 
 class CryptoQuantAuthError(RuntimeError):
-    """Raised on 403 — key is invalid or not entitled for this endpoint.
+    """Raised on 401/403 — key rejected, or its plan not entitled.
 
     Deliberately outside the retry decorator's retryable tuple so the
     decorator won't retry-and-ERROR-log. Caller treats it as
     pull-cycle-terminal (every subsequent metric will 403 the same way).
+    Either way the fix is the owner's (renew the key or change the plan),
+    so ``pull`` reports SKIPPED with this message as the reason, never
+    FAILED. 5xx and network errors are not this class and stay failures.
+
+    Measured on grid-svr 2026-11-09: the configured key is accepted (no
+    key answers 401 "Token does not exists") but every metric answers 403
+    "This data (window: day) is only available on the Professional plan
+    and above" -- hour/week/month/block windows need Advanced/Premium.
     """
+
+    def __init__(self, status_code: int, endpoint: str, detail: str = "") -> None:
+        self.status_code = status_code
+        self.endpoint = endpoint
+        self.detail = detail
+        if status_code == 401:
+            what = f"CRYPTOQUANT_API_KEY rejected (HTTP 401) on {endpoint} -- renew the key"
+        else:
+            what = (
+                f"CRYPTOQUANT_API_KEY plan not entitled (HTTP 403) on {endpoint} -- "
+                "upgrade the CryptoQuant plan or retire the source"
+            )
+        super().__init__(f"{what}: {detail}" if detail else what)
+
+
+def _cq_error_detail(resp: requests.Response) -> str:
+    """The API's own explanation (status.description), bounded; never the key."""
+    try:
+        status = (resp.json() or {}).get("status") or {}
+        detail = str(status.get("description") or status.get("message") or "")
+    except ValueError:
+        detail = ""
+    return detail[:200]
 
 
 class CryptoQuantRateLimitedError(RuntimeError):
@@ -104,8 +135,8 @@ class CryptoQuantPuller(BasePuller):
         """Make a CryptoQuant API call.
 
         Raises:
-            CryptoQuantAuthError: On 403 (invalid key or unentitled
-                endpoint). Non-retryable — caller aborts the rest of
+            CryptoQuantAuthError: On 401 (key rejected) or 403 (plan not
+                entitled). Non-retryable — caller aborts the rest of
                 the pull cycle.
             CryptoQuantRateLimitedError: On 429. Non-retryable — caller
                 aborts the rest of the pull cycle.
@@ -113,10 +144,8 @@ class CryptoQuantPuller(BasePuller):
         url = f"{CQ_BASE}/{endpoint}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         resp = requests.get(url, headers=headers, params=params or {}, timeout=30)
-        if resp.status_code == 403:
-            raise CryptoQuantAuthError(
-                f"403 on {endpoint} — key invalid or endpoint unentitled"
-            )
+        if resp.status_code in (401, 403):
+            raise CryptoQuantAuthError(resp.status_code, endpoint, _cq_error_detail(resp))
         if resp.status_code == 429:
             raise CryptoQuantRateLimitedError(f"429 on {endpoint}")
         resp.raise_for_status()
@@ -143,16 +172,33 @@ class CryptoQuantPuller(BasePuller):
         """Pull all tracked metrics for BTC, ETH, and stablecoins.
 
         Returns:
-            Summary with metric counts and anomalies.
+            Summary with metric counts, anomalies and ``rows_inserted``
+            (the committed write count the scheduler contract reads).
+            A missing, rejected or unentitled key is ``status: SKIPPED``
+            with the reason; per-metric 5xx/network failures are listed
+            in ``errors`` (all failed -> FAILED, some -> PARTIAL).
         """
         if not self.api_key:
-            return {"error": "CRYPTOQUANT_API_KEY not configured"}
+            return {"status": "SKIPPED", "rows_inserted": 0,
+                    "reason": "CRYPTOQUANT_API_KEY not configured"}
 
         all_metrics = BTC_METRICS + ETH_METRICS + STABLE_METRICS
         total_stored = 0
         total_metrics = 0
         anomalies: list[dict[str, Any]] = []
         api_calls = 0
+        failed_metrics: list[str] = []
+
+        def _summary(**extra: Any) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "metrics_pulled": total_metrics,
+                "data_points_stored": total_stored,
+                "rows_inserted": total_stored,
+                "anomalies": anomalies,
+                "api_calls": api_calls,
+            }
+            out.update(extra)
+            return out
 
         for metric in all_metrics:
             try:
@@ -217,41 +263,27 @@ class CryptoQuantPuller(BasePuller):
                             })
 
             except CryptoQuantAuthError as exc:
-                log.warning(
-                    "CryptoQuant auth failure ({e}); aborting pull cycle. "
-                    "Check CRYPTOQUANT_API_KEY entitlements.",
-                    e=str(exc),
-                )
-                return {
-                    "metrics_pulled": total_metrics,
-                    "data_points_stored": total_stored,
-                    "anomalies": anomalies,
-                    "api_calls": api_calls,
-                    "error": "auth_failed",
-                }
+                # A configuration problem for the owner, not a run failure:
+                # SKIPPED (PARTIAL if earlier metrics already committed rows).
+                log.warning("CryptoQuant {e}; aborting pull cycle", e=str(exc))
+                return _summary(status="SKIPPED", reason=str(exc))
             except CryptoQuantRateLimitedError as exc:
                 log.warning(
                     "CryptoQuant rate-limited ({e}); aborting pull cycle",
                     e=str(exc),
                 )
-                return {
-                    "metrics_pulled": total_metrics,
-                    "data_points_stored": total_stored,
-                    "anomalies": anomalies,
-                    "api_calls": api_calls,
-                    "error": "rate_limited",
-                }
+                return _summary(error="rate_limited")
             except Exception as exc:
-                log.debug("CryptoQuant metric {m} failed: {e}", m=metric, e=str(exc))
+                failed_metrics.append(f"{metric}: {type(exc).__name__}")
+                log.warning("CryptoQuant metric {m} failed: {e}", m=metric, e=str(exc))
 
         log.info(
             "CryptoQuant: {m} metrics, {s} data points, {a} anomalies, {api} API calls",
             m=total_metrics, s=total_stored, a=len(anomalies), api=api_calls,
         )
 
-        return {
-            "metrics_pulled": total_metrics,
-            "data_points_stored": total_stored,
-            "anomalies": anomalies,
-            "api_calls": api_calls,
-        }
+        if failed_metrics:
+            # 5xx / network: a real failure (or PARTIAL beside committed rows).
+            return _summary(errors=failed_metrics[:10],
+                            error=f"{len(failed_metrics)} of {len(all_metrics)} metrics failed")
+        return _summary()

@@ -15,6 +15,11 @@ so none of their 72 backtest trials could be scored. default_tickers also adds
 intelligence.hypothesis_trials.ticker_move_close_universe (every ticker an
 active ticker-move hypothesis will be scored on).
 
+And for insider buying (2026-11-08): 287 of the 332 tickers with 2+
+open-market insider buyers in 90 days had no routine close, so Sleuth's
+insider-only control was 65% untestable. default_tickers adds
+TiingoPuller.insider_buyer_tickers.
+
 All engines here are local SQLite or fakes and all HTTP is mocked.
 """
 
@@ -62,9 +67,10 @@ class _FakeConn:
     """Answers the universe queries by SQL text."""
 
     def __init__(self, active: list[Any], pending: list[Any],
-                 hypotheses: list[Any] | None = None) -> None:
+                 hypotheses: list[Any] | None = None, insiders: list[Any] | None = None) -> None:
         self.by_sql = {ORACLE_ACTIVE_TICKERS_SQL: active, ORACLE_PENDING_TICKERS_SQL: pending,
-                       ACTIVE_TICKER_MOVE_TICKERS_SQL: hypotheses or []}
+                       ACTIVE_TICKER_MOVE_TICKERS_SQL: hypotheses or [],
+                       tp.INSIDER_BUYER_TICKERS_SQL: insiders or []}
 
     def execute(self, clause: Any, params: Any = None) -> Any:
         rows = self.by_sql[str(clause)]
@@ -241,6 +247,73 @@ def test_hypothesis_tickers_degrade_when_db_unreachable() -> None:
     eng = MagicMock()
     eng.connect.side_effect = RuntimeError("db down")
     assert TiingoPuller.hypothesis_tickers(eng) == []
+
+
+# ── insider-buyer universe (2026-11-08) ──────────────────────────────────
+
+TODAY = date(2026, 11, 8)
+
+
+def _sqlite_insiders(rows: list[tuple[str, str, str, str, int, dict]]) -> Any:
+    """rows: (source_type, source_id, ticker, signal_type, days_ago, signal_value)."""
+    import json
+
+    eng = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE signal_sources (source_type TEXT, source_id TEXT, ticker TEXT, "
+                       "signal_type TEXT, signal_date DATE, signal_value TEXT)"))
+        for st, sid, t, sty, ago, val in rows:
+            c.execute(text("INSERT INTO signal_sources VALUES (:a, :b, :c, :d, :e, :f)"),
+                      {"a": st, "b": sid, "c": t, "d": sty,
+                       "e": (TODAY - timedelta(days=ago)).isoformat(), "f": json.dumps(val)})
+    return eng
+
+
+def _sec(name: str, ticker: str, kind: str = "BUY", ago: int = 5) -> tuple:
+    return ("insider", name, ticker, kind, ago, {"transaction_code": "P"})
+
+
+def _qq(name: str, ticker: str, code: str = "P", ago: int = 5) -> tuple:
+    return ("quiverquant:insider", f"qq_insider_trading:{name.lower()}|{code.lower()}|1|1", ticker,
+            "insider_buy", ago, {"Name": name, "TransactionCode": code, "AcquiredDisposedCode": "A"})
+
+
+def test_insider_universe_needs_two_open_market_buyers_in_one_feed() -> None:
+    eng = _sqlite_insiders([
+        _sec("Doe Jane", "ACME"), _sec("Roe Rick", "acme ", "UNUSUAL_BUY"),   # 2 SEC buyers
+        _sec("Doe Jane", "SOLO"), _sec("Doe Jane", "SOLO", ago=20),           # one buyer twice
+        _sec("Doe Jane", "XFED"), _qq("Doe Jane", "XFED"),                    # same person, two feeds
+        _qq("Ann Lee", "QQP"), _qq("Bo Kim", "QQP"),                          # 2 QQ open-market buyers
+        _qq("Ann Lee", "GRNT", "A"), _qq("Bo Kim", "GRNT", "M"),              # grants/exercises, not buys
+        _sec("Doe Jane", "SELLR", "SELL"), _sec("Roe Rick", "SELLR", "SELL"),
+        _sec("Doe Jane", "OLD", ago=91), _sec("Roe Rick", "OLD", ago=91),     # outside the window
+        _sec("cluster_none", "NONE", "CLUSTER_BUY"),
+        _sec("Fund A", "NONE"), _sec("Fund B", "NONE"),                       # unlisted issuers
+        _sec("A1", "HEI, HEI.A"), _sec("A2", "HEI, HEI.A"),                   # malformed symbol
+    ])
+    assert TiingoPuller.insider_buyer_tickers(eng, today=TODAY) == ["ACME", "QQP"]
+
+
+def test_insider_universe_ranks_by_buyers_and_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    eng = _sqlite_insiders([_sec(f"B{i}", "WIDE") for i in range(4)]
+                           + [_sec("B1", "NARR"), _sec("B2", "NARR")])
+    assert TiingoPuller.insider_buyer_tickers(eng, today=TODAY) == ["WIDE", "NARR"]
+    monkeypatch.setattr(tp, "INSIDER_MAX_TICKERS", 1)
+    assert TiingoPuller.insider_buyer_tickers(eng, today=TODAY) == ["WIDE"]
+
+
+def test_default_tickers_union_insider_buyers() -> None:
+    eng = _FakeEngine(_FakeConn(active=["ERAS"], pending=[], hypotheses=["GRRR"],
+                                insiders=["ACME", "BTC-USD", "NONE"]))
+    tickers = set(TiingoPuller.default_tickers(eng))
+    assert {"ERAS", "GRRR", "ACME"} <= tickers
+    assert "NONE" not in tickers
+
+
+def test_insider_tickers_degrade_when_db_unreachable() -> None:
+    eng = MagicMock()
+    eng.connect.side_effect = RuntimeError("db down")
+    assert TiingoPuller.insider_buyer_tickers(eng) == []
 
 
 # ── pull_ticker dry run ──────────────────────────────────────────────────

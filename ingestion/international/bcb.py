@@ -29,7 +29,15 @@ BCB_SERIES: dict[int, str] = {
     # name was ever registered, so no resolved history is affected.
     1: "brazil_usd_brl_fx",      # USD/BRL commercial rate (sell), daily
     3545: "brazil_fx_reserves",  # international reserves, annual
-    7454: "brazil_trade_balance",
+    # 2026-11-09: SGS 7454 dropped. It was never a trade balance: its values
+    # are monthly percentages (0.25, 0.35, -0.10, ... for 2024) and the
+    # series stops at 2025-07-01 (``/dados/ultimos/2`` answered 2025-06 and
+    # 2025-07 on 2026-11-09), so every incremental run came back empty.
+    # SGS 22707 is the BCB's own "Balança comercial - Balanço de Pagamentos -
+    # mensal - saldo" (USD millions; 2026-09 = 6868.8). It is written under a
+    # new raw id so the 90,066 mislabeled 7454 rows already stored as
+    # brazil_trade_balance never mix with it (same rule as codes 1 and 3545).
+    22707: "brazil_trade_balance_bop",
     13761: "brazil_primary_balance_gdp",
 }
 
@@ -179,6 +187,13 @@ class BCBPuller(BasePuller):
 
             inserted = 0
             with self.engine.begin() as conn:
+                # New or revised values only. The 1-hour _row_exists window
+                # re-inserted the whole revision lookback every 48h run
+                # (brazil_credit_growth: 95,650 rows for 441 dates,
+                # brazil_trade_balance 90,066 for 369, on 2026-11-09).
+                stored = self._latest_stored_values(
+                    feature_name, conn, start_date=date.fromisoformat(str(start_date)[:10]),
+                )
                 for record in data:
                     if not isinstance(record, dict):
                         # Defensive: skip stray non-dict entries (error
@@ -196,8 +211,9 @@ class BCBPuller(BasePuller):
                         obs_dt = datetime.strptime(date_str, "%d/%m/%Y").date()
                         value = float(valor.replace(",", "."))
 
-                        if self._row_exists(feature_name, obs_dt, conn):
+                        if stored.get(obs_dt) == value:
                             continue
+                        stored[obs_dt] = value
 
                         conn.execute(
                             text(

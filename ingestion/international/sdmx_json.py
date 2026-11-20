@@ -179,8 +179,14 @@ def fetch_sdmx_json(
     return resp.json()
 
 
-def bis_series_url(flow: str, key: str, version: str = "1.0") -> str:
-    """Return the BIS SDMX v2 data URL for one dataflow key."""
+def bis_series_url(flow: str, key: str, version: str = "~") -> str:
+    """Return the BIS SDMX v2 data URL for one dataflow key.
+
+    ``version`` defaults to ``~`` (the latest dataflow version). Pinning
+    ``1.0`` broke on flows BIS has re-versioned: WS_TC is at 2.0 and
+    ``WS_TC/1.0/...`` answers 404 "No structures match query parameters"
+    (probed 2026-11-09); ``~`` serves the same data as ``2.0``.
+    """
     return f"{BIS_DATA_URL}/{flow}/{version}/{key}"
 
 

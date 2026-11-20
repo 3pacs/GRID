@@ -42,6 +42,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 _NO_SOURCE_NAME_ATTR = {
     "coingecko": "coingecko",          # writes features directly; catalog row "coingecko"
     "social_sentiment": "SocialSentiment",  # hand-rolled INSERT INTO source_catalog
+    "social_ticker_series": "SocialSentiment",  # same puller, same catalog row
     "wiki_history": "WikiHistory",          # hand-rolled INSERT INTO source_catalog
     "sec_ftd": "SEC_FTD",                   # adapter over SECFTDPuller.SOURCE_NAME
 }

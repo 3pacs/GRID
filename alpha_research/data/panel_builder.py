@@ -4,14 +4,23 @@ Build PIT-correct ticker panel data from GRID's resolved_series.
 GRID stores close prices as {ticker}_full features and volume as {ticker}_avg_volume.
 This module builds the multi-ticker DataFrames that signals operate on.
 
-All price panels are automatically split-adjusted via the universal
-split adjuster. This is a top-level data concern — every downstream
-consumer (signals, backtest, models, scanners) gets clean data.
+Price basis (docs/reference/PRICE_PANEL_BASIS.md, 2026-11-08): a ``_full``
+feature is fed by exactly one raw price field -- ``YF:<T>:adj_close`` for
+equities and ETFs (split- and dividend-adjusted as of each vintage's pull),
+the as-traded close only for instruments without corporate actions and for
+``spy_full`` (pinned to the receipted unadjusted SPY close by contract).
+``build_price_panel`` therefore no longer runs the heuristic split adjuster
+(``alpha_research.data.split_adjuster.adjust_panel``), which read every
+-40 % day as a split and compounded the raw/adjusted vintage flips of the
+old mixed-basis panel into first-to-last ratios of 10^201 (XLP). Instead it
+re-bases each cell from its own vintage's share basis to ``as_of_date``'s
+with the *recorded* split events (``YF:<T>:split_factor`` rows via
+``store.observations.read_splits``), which is exact, idempotent and PIT.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Sequence
 
 import pandas as pd
@@ -19,7 +28,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from alpha_research.data.split_adjuster import adjust_panel
+from store.observations import SplitEvent, cumulative_split_factor, read_splits
 from store.pit import PITStore, retraction_cutoff
 
 #: Exact feature_registry name for the CBOE VIX close/spot (~11-20 scale).
@@ -73,6 +82,80 @@ def _ids_for_names(engine: Engine, names: list[str], pit: PITStore | None) -> di
     return {fid: name for name, fid in pit.feature_ids_by_name(names).items()}
 
 
+def _capped_start_date(start_date: date, end_date: date) -> date:
+    """``PITStore.get_feature_matrix``'s GRID_PIT_MAX_YEARS cap, kept here
+    because the panel reads vintages through ``get_pit`` directly."""
+    import os
+
+    max_years = int(os.getenv("GRID_PIT_MAX_YEARS", "10"))
+    if (end_date - start_date).days / 365.25 > max_years:
+        capped = date(end_date.year - max_years, end_date.month, end_date.day)
+        log.warning(
+            "Price panel date range {sd} to {ed} exceeds GRID_PIT_MAX_YEARS={cap}. "
+            "Truncating start_date to {capped}.",
+            sd=start_date, ed=end_date, cap=max_years, capped=capped,
+        )
+        return capped
+    return start_date
+
+
+def _read_recorded_splits(
+    engine: Engine, ticker: str, start_date: date, as_of_date: date,
+) -> list[SplitEvent]:
+    """Recorded ``YF:<ticker>:split_factor`` events known by ``as_of_date``.
+
+    Best effort: a reader without ``raw_series`` (a stub engine, a snapshot
+    replay) yields no events, which means "no re-basing", never a guess.
+    """
+    try:
+        with engine.connect() as conn:
+            return read_splits(
+                conn, ticker, start=start_date, end=as_of_date,
+                as_of_ts=retraction_cutoff(as_of_date),
+            )
+    except Exception as exc:  # noqa: BLE001 -- degrade to "no recorded splits"
+        log.warning("Recorded splits unavailable for {t}: {e}", t=ticker, e=str(exc))
+        return []
+
+
+def rebase_vintages_to_as_of(
+    values: pd.Series,
+    vintages: pd.Series,
+    splits: Sequence[SplitEvent],
+    as_of_date: date,
+) -> pd.Series:
+    """Express every cell in ``as_of_date``'s share basis using recorded splits.
+
+    A ``_full`` value written from a pull dated ``v`` (its ``vintage_date``)
+    is adjusted for every split effective on or before ``v`` -- Tiingo's
+    ``adjClose`` and Yahoo's ``Adj Close`` are re-adjusted at each pull. A
+    split effective in ``(v, as_of_date]`` is not in it yet, so the cell is
+    divided by the product of those ratios (``cumulative_split_factor``).
+    Cells whose vintage already carries every split are unchanged, so the
+    transform is idempotent per vintage: no price jump is ever inferred
+    from the prices themselves.
+
+    ``values`` and ``vintages`` share an index (obs_date); ``vintages`` holds
+    ``date`` objects. Without splits the input is returned as a float copy.
+    """
+    out = values.astype(float).copy()
+    if not splits or out.empty:
+        return out
+    # psycopg hands back ``date``; a cache or a fake may hand back a
+    # datetime/Timestamp (a ``date`` subclass, and datetime64 once inside a
+    # Series), so normalise every vintage to a plain date first.
+    vdates = pd.Series(
+        [v.date() if isinstance(v, datetime) else v for v in vintages.tolist()],
+        index=vintages.index, dtype=object,
+    )
+    factors: dict[date, float] = {
+        vd: cumulative_split_factor(splits, vd, as_of_date)
+        for vd in set(vdates.dropna().tolist())
+    }
+    f = vdates.map(factors).astype(float).fillna(1.0)
+    return out / f.to_numpy()
+
+
 def build_price_panel(
     engine: Engine,
     tickers: Sequence[str] | None = None,
@@ -81,6 +164,7 @@ def build_price_panel(
     as_of_date: date | None = None,
     *,
     pit: PITStore | None = None,
+    split_rebase: bool = True,
 ) -> pd.DataFrame:
     """
     Build a dates x tickers close-price panel from resolved_series.
@@ -94,6 +178,12 @@ def build_price_panel(
     row Postgres happened to return first, non-reproducibly).
     Returns DataFrame with DatetimeIndex and uppercase ticker columns.
 
+    Basis: each cell is the ``adj_close`` (or, for RAW_CLOSE_FULL_FEATURES,
+    the as-traded close) its vintage carried, re-based to ``as_of_date``'s
+    share count with the recorded split events when ``split_rebase`` is
+    True (see ``rebase_vintages_to_as_of``). No heuristic split detection
+    runs here any more -- see the module docstring for why.
+
     ``pit`` (optional) is the PIT reader to use; default ``PITStore(engine)``.
     A ``store.pit.PITWindowCache`` answers repeated reads over one window
     from memory with identical results (rotation backtests, W2-7).
@@ -104,6 +194,7 @@ def build_price_panel(
         end_date = as_of_date
     if start_date is None:
         start_date = end_date - timedelta(days=365 * 5)
+    start_date = _capped_start_date(start_date, end_date)
 
     if tickers:
         names = [f"{t.lower()}_full" for t in tickers]
@@ -120,21 +211,44 @@ def build_price_panel(
 
     id_to_ticker = {fid: _feature_name_to_ticker(name) for fid, name in id_to_ticker.items()}
 
-    matrix = (pit or PITStore(engine)).get_feature_matrix(
+    pit_df = (pit or PITStore(engine)).get_pit(
         list(id_to_ticker),
-        start_date,
-        end_date,
         as_of_date,
         vintage_policy="LATEST_AS_OF",
+        start_date=start_date,
+        end_date=end_date,
     )
-    if matrix.empty:
+    if pit_df.empty:
+        return pd.DataFrame()
+    pit_df = pit_df[
+        (pit_df["obs_date"] >= start_date) & (pit_df["obs_date"] <= end_date)
+    ]
+    if pit_df.empty:
         return pd.DataFrame()
 
-    panel = matrix.rename(columns=id_to_ticker)
-    panel.sort_index(inplace=True)
+    values = pit_df.pivot_table(
+        index="obs_date", columns="feature_id", values="value", aggfunc="first",
+    )
+    vintages = pit_df.pivot_table(
+        index="obs_date", columns="feature_id", values="vintage_date", aggfunc="first",
+    )
+    values.index = pd.DatetimeIndex(values.index, name="obs_date")
+    vintages.index = values.index
 
-    # Universal split adjustment — every downstream consumer gets clean data
-    panel = adjust_panel(panel)
+    panel = values.rename(columns=id_to_ticker).sort_index()
+    vintages = vintages.rename(columns=id_to_ticker).sort_index()
+
+    if split_rebase:
+        for ticker in panel.columns:
+            splits = _read_recorded_splits(engine, ticker, start_date, as_of_date)
+            if not splits:
+                continue
+            col = panel[ticker]
+            mask = col.notna()
+            panel.loc[mask, ticker] = rebase_vintages_to_as_of(
+                col[mask], vintages.loc[mask, ticker], splits, as_of_date,
+            ).to_numpy()
+            log.debug("Re-based {t} with {n} recorded split(s)", t=ticker, n=len(splits))
 
     return panel
 

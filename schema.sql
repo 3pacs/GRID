@@ -753,7 +753,8 @@ IF to_regclass('options_snapshots') IS NULL THEN
         capture_ordinal BIGINT,
         capture_started_at TIMESTAMPTZ,
         capture_completed_at TIMESTAMPTZ,
-        provider_regular_market_at TIMESTAMPTZ
+        provider_regular_market_at TIMESTAMPTZ,
+        clock_metadata JSONB
     );
     CREATE INDEX idx_opts_snap_ticker_date ON options_snapshots_all (ticker, snap_date);
     CREATE UNIQUE INDEX options_snapshots_all_batch_contract_key
@@ -768,6 +769,9 @@ IF to_regclass('options_snapshots') IS NULL THEN
         capture_completed_at TIMESTAMPTZ NOT NULL,
         row_count            INTEGER NOT NULL CHECK (row_count > 0),
         spot_price           DOUBLE PRECISION,
+        provider_regular_market_at TIMESTAMPTZ,
+        spot_provider        TEXT,
+        clock_metadata       JSONB,
         capture_source       TEXT NOT NULL,
         backfilled           BOOLEAN NOT NULL DEFAULT false,
         registered_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),

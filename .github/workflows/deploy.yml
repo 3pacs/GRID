@@ -208,6 +208,21 @@ jobs:
             "${{ github.sha }}" \
             "${{ inputs.skip_migrations }}"
 
+      # Installed units silently kept stale ExecStart/Environment lines after a
+      # deploy until 2026-11-08 (grid-publication-packet.service ran a day
+      # without the public-tree env). Only units ALREADY installed whose
+      # template opts in ("# deploy-sync: managed") are reinstalled from the
+      # release tree; nothing new is installed, unmanaged units are only
+      # reported, no running service is restarted here. --strict turns any
+      # remaining drift into a non-zero exit, which the || below makes a
+      # workflow warning, not a failed deploy.
+      - name: Sync installed systemd units with their shipped templates
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          bash "$DEPLOY_PATH/scripts/check_systemd_unit_drift.sh" --sync --strict --templates "$DEPLOY_PATH/deploy/systemd" \
+            || echo "::warning::some installed units still differ from their templates (see above)"
+
       - name: Restart grid-api
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |

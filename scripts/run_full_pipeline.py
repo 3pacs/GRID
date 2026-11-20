@@ -31,40 +31,40 @@ _FIX_COMMANDS: dict[str, dict[str, str]] = {
     "FRED": {
         "diagnose": 'curl -s "https://api.stlouisfed.org/fred/series?api_key=$FRED_API_KEY&series_id=DFF&file_type=json" | head -5',
         "fix": "Check FRED_API_KEY in .env — get one at https://fred.stlouisfed.org/docs/api/api_key.html",
-        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
+        "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
         "file": "grid/ingestion/fred.py",
     },
     "yfinance": {
         "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').info.get('regularMarketPrice'))\"",
         "fix": "pip install --upgrade yfinance",
-        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
+        "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
         "file": "grid/ingestion/yfinance_pull.py",
     },
     "EDGAR": {
         "diagnose": 'curl -s "https://efts.sec.gov/LATEST/search-index?q=form-type%3D%224%22&dateRange=custom&startdt=$(date -d yesterday +%Y-%m-%d)&enddt=$(date +%Y-%m-%d)" | head -5',
-        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.edgar import EDGARPuller; from db import get_engine; EDGARPuller(get_engine()).pull_form4_transactions()"',
+        "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.edgar import EDGARPuller; from db import get_engine; EDGARPuller(get_engine()).pull_form4_transactions()"',
         "file": "grid/ingestion/edgar.py",
     },
     "BLS": {
         "diagnose": 'curl -s "https://api.bls.gov/publicAPI/v2/timeseries/data/LNS14000000" | head -5',
-        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.bls import BLSPuller; from db import get_engine; BLSPuller(get_engine()).pull_series()"',
+        "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.bls import BLSPuller; from db import get_engine; BLSPuller(get_engine()).pull_series()"',
         "file": "grid/ingestion/bls.py",
     },
     "Options": {
         "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').options)\"",
-        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.options import OptionsPuller; from db import get_engine; OptionsPuller(get_engine()).pull_all()"',
+        "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.options import OptionsPuller; from db import get_engine; OptionsPuller(get_engine()).pull_all()"',
         "file": "grid/ingestion/options.py",
     },
     "Crucix": {
         "diagnose": "curl -s http://localhost:3117/api/health | head -5",
         "fix": "Check Crucix service: sudo systemctl status grid-crucix",
-        "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.crucix_bridge import CrucixBridgePuller; from db import get_engine; CrucixBridgePuller(get_engine()).pull_all()"',
+        "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.crucix_bridge import CrucixBridgePuller; from db import get_engine; CrucixBridgePuller(get_engine()).pull_all()"',
         "file": "grid/ingestion/crucix_bridge.py",
     },
     "PostgreSQL": {
         "diagnose": "pg_isready -h localhost -p 5432 -U grid",
         "fix": "sudo systemctl restart postgresql",
-        "retry": "cd /data/grid_v4/grid_repo/grid && python scripts/run_full_pipeline.py",
+        "retry": "cd /data/grid_v4/grid_release && python scripts/run_full_pipeline.py",
         "file": "grid/db.py",
     },
 }
@@ -79,8 +79,8 @@ def _get_fix_commands(label: str) -> dict[str, str]:
         if key.lower() in label.lower():
             return cmds
     return {
-        "diagnose": 'cd /data/grid_v4/grid_repo/grid && python -c "from db import get_engine; print(get_engine().connect().execute(text(\'SELECT 1\')).scalar())"',
-        "retry": "cd /data/grid_v4/grid_repo/grid && python scripts/run_full_pipeline.py",
+        "diagnose": 'cd /data/grid_v4/grid_release && python -c "from db import get_engine; print(get_engine().connect().execute(text(\'SELECT 1\')).scalar())"',
+        "retry": "cd /data/grid_v4/grid_release && python scripts/run_full_pipeline.py",
         "file": "grid/scripts/run_full_pipeline.py",
     }
 

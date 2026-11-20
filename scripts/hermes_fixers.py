@@ -237,6 +237,12 @@ _DIAGNOSIS_CACHE: dict[str, tuple[float, str, str]] = {}
 _THROTTLED_WARNINGS: dict[str, float] = {}
 # source_key -> [normalized reason, consecutive count, long skips so far].
 _REPEATED_FAILURES: dict[str, list[Any]] = {}
+# source_key -> UTC time a repair last completed a check of the source (a
+# fresh pull or NO_NEW_DATA). pull_log records scheduler runs only, so the
+# failed-source query cannot see these; without this a source Hermes had
+# already repaired was diagnosed and retried until its next scheduled run
+# (OppInsights and Unusual_Whales, 2026-11-08).
+_REPAIR_RECOVERED_AT: dict[str, datetime] = {}
 
 # Exception classes that mean "this retry will fail the same way next time"
 # (a code or wiring defect, not a transient provider condition). TypeError
@@ -385,8 +391,52 @@ def note_repair_failure(source_name: str, reason: str) -> bool:
 
 
 def note_repair_recovered(source_name: str) -> None:
+    key = _normalize_source_key(source_name)
     with _REPAIR_SCHEDULE_LOCK:
-        _REPEATED_FAILURES.pop(_normalize_source_key(source_name), None)
+        _REPEATED_FAILURES.pop(key, None)
+        _REPAIR_RECOVERED_AT[key] = datetime.now(timezone.utc)
+
+
+def _recovered_after(source_name: str, last_fail: Any) -> bool:
+    """True when a repair completed a check of the source after ``last_fail``."""
+    with _REPAIR_SCHEDULE_LOCK:
+        recovered = _REPAIR_RECOVERED_AT.get(_normalize_source_key(source_name))
+    if recovered is None or last_fail is None:
+        return False
+    if isinstance(last_fail, str):
+        try:
+            last_fail = datetime.fromisoformat(last_fail)
+        except ValueError:
+            return False
+    if not isinstance(last_fail, datetime):
+        return False
+    if last_fail.tzinfo is None:
+        last_fail = last_fail.replace(tzinfo=timezone.utc)
+    return recovered > last_fail
+
+
+def _held_source_names() -> dict[str, str]:
+    """Normalized source names of held (retired) registry entries -> reason.
+
+    A held puller never runs again, so its last failures cannot be repaired
+    and must not be retried, diagnosed or key-checked (TIINGO_FUNDAMENTALS
+    stayed on the failed list for a day after its 2026-11-08 retirement).
+    """
+    try:
+        from ingestion.smart_scheduler import (
+            PULLER_REGISTRY, SMART_PULL_LOG_PREFIX, catalog_name_for,
+        )
+    except Exception:
+        return {}
+    held: dict[str, str] = {}
+    for entry in PULLER_REGISTRY:
+        reason = entry.get("hold_reason")
+        if not reason:
+            continue
+        name = entry["name"]
+        for alias in (name, catalog_name_for(name), SMART_PULL_LOG_PREFIX + name):
+            held[_normalize_source_key(alias)] = reason
+    return held
 
 
 def repair_deterministically_blocked(source_name: str) -> str | None:
@@ -2356,6 +2406,18 @@ def diagnose_and_fix_pulls(
                     "ORDER BY fail_count DESC"
                 )
             ).fetchall()
+
+    held = _held_source_names()
+    not_held = [r for r in failed if _normalize_source_key(r[0] or "") not in held]
+    still_failed = [r for r in not_held if not _recovered_after(r[0] or "", r[2])]
+    if len(still_failed) < len(failed):
+        log.info(
+            "Not repairing held sources {h} or sources a repair already "
+            "recovered since their last failure {r}",
+            h=sorted({r[0] for r in failed} - {r[0] for r in not_held}),
+            r=sorted({r[0] for r in not_held} - {r[0] for r in still_failed}),
+        )
+    failed = still_failed
 
     if not pull_log_available:
         # Partial coverage: pull_log failures are unknown, not zero.

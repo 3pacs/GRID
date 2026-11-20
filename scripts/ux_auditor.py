@@ -155,10 +155,12 @@ def _get_auth_token(base_url: str = BASE_URL) -> str | None:
     """Login as master password and return JWT token."""
     try:
         import os
+        # config.Settings stores only GRID_MASTER_PASSWORD_HASH; the plain
+        # password exists only when the operator exports it for this run.
         password = os.getenv("GRID_MASTER_PASSWORD", "")
         if not password:
-            from config import settings
-            password = settings.GRID_MASTER_PASSWORD
+            log.info("UX Auditor: GRID_MASTER_PASSWORD not set — skipping login")
+            return None
         resp = requests.post(
             f"{base_url}/api/v1/auth/login",
             json={"password": password},

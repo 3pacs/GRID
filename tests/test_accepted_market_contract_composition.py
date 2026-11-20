@@ -381,7 +381,7 @@ def _isolated_payload(*, example: bool = False) -> dict:
                 self.assertIn("requires operator handling", explicit.records[0][7])
                 self.assertEqual(len(emails), 2)
                 # Positive control: the fake command collector detects a permitted remote heal.
-                F.probe_gpus = lambda: [("redbox:gpu", "gpu", "down", "synthetic remote", 17)]
+                F.probe_gpus = lambda: [("gridz4:gpu", "gpu", "down", "synthetic remote", 17)]
                 default_remote = F.run_fleet_heartbeat(FakeEngine())
                 self.assertEqual(default_remote["heals"], 0)
                 self.assertEqual(commands, [])
