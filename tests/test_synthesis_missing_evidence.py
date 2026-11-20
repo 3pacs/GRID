@@ -4,7 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from intelligence.decision_gateway import _run_red_team, combine_verdict, should_i_trade
+import intelligence.decision_gateway as gateway
+from intelligence.decision_gateway import _run_red_team, combine_verdict
 from intelligence.freshness_guard import check_freshness
 
 
@@ -51,21 +52,22 @@ def test_red_team_exception_is_unknown():
 
 def test_partial_gateway_cannot_issue_ticket():
     with (
-        patch(
-            "intelligence.decision_gateway._run_prediction",
-            return_value=(SimpleNamespace(), None),
+        # Patch the module object this test imported, not whatever sits in
+        # sys.modules: tests/test_pair_conviction.py swaps and pops that entry,
+        # and a string-target patch would then miss should_i_trade's globals
+        # and run the real stack (including a live red-team LLM call).
+        patch.object(
+            gateway, "_run_prediction", return_value=(SimpleNamespace(), None),
         ),
-        patch(
-            "intelligence.decision_gateway._run_red_team",
-            return_value=(None, None, "offline"),
+        patch.object(
+            gateway, "_run_red_team", return_value=(None, None, "offline"),
         ),
-        patch(
-            "intelligence.decision_gateway._run_pattern_library",
-            return_value=(None, None, "offline"),
+        patch.object(
+            gateway, "_run_pattern_library", return_value=(None, None, "offline"),
         ),
         patch("trading.trade_ticket_generator.generate_ticket") as ticket,
     ):
-        result = should_i_trade(
+        result = gateway.should_i_trade(
             MagicMock(), "NVDA", account_size_usd=100, current_price=20
         )
     assert result.unified_verdict == "no_trade"
@@ -98,16 +100,14 @@ def test_missing_pattern_is_not_agreement():
 )
 def test_invalid_adapter_value_blocks_ticket(field, value):
     with (
-        patch(
-            "intelligence.decision_gateway._run_prediction",
-            return_value=(SimpleNamespace(), None),
+        patch.object(
+            gateway, "_run_prediction", return_value=(SimpleNamespace(), None),
         ),
-        patch(
-            "intelligence.decision_gateway._run_red_team",
-            return_value=(SimpleNamespace(), 0.1, None),
+        patch.object(
+            gateway, "_run_red_team", return_value=(SimpleNamespace(), 0.1, None),
         ),
-        patch(
-            "intelligence.decision_gateway._run_provenance",
+        patch.object(
+            gateway, "_run_provenance",
             return_value=(SimpleNamespace(verdict="high"), None),
         ),
         patch(
@@ -125,7 +125,7 @@ def test_invalid_adapter_value_blocks_ticket(field, value):
         ),
         patch("trading.trade_ticket_generator.generate_ticket") as ticket,
     ):
-        result = should_i_trade(
+        result = gateway.should_i_trade(
             MagicMock(), "NVDA", account_size_usd=100, current_price=20
         )
     assert result.unified_verdict == "no_trade"
