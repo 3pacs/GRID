@@ -47,6 +47,7 @@ within the run only (`max_t.multiplicity`): earlier runs and looks are not in it
 ## Universe and timing (the same rules edge search 12 registered)
 
 - Members by date from `members.csv` (start set plus dated rows), through `renames.json`.
+  A row may list thousands of members: the read allows a field of up to 16 MB.
 - A stock is ranked on day d if it has a valid bar on d, its unadjusted close on d−1 is at least $5, and its median
   dollar volume over the 21 sessions ending d−1 is at least $10M. The floor also screens out price files that hold
   another company (Tiingo reuses tickers).

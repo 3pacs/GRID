@@ -431,3 +431,19 @@ def test_a_labelled_store_reports_its_sector_limit_as_before(tmp_path):
     build(tmp_path, n_days=120)
     rep = X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
     assert rep["known_limits"][1].startswith("sector labels are today's") and "labels" not in rep["coverage"]["sector_assignment"]
+
+
+def test_a_members_row_longer_than_the_csv_default_field_limit_loads(tmp_path):
+    build(tmp_path, n_days=120)
+    run = X.RunFile.from_dict({**RUN, "last_session": "2015-05-29"})
+    before = X.load_panel(tmp_path, run)
+    with open(tmp_path / "members.csv", newline="") as fh:
+        date, tickers = list(csv.reader(fh))[1]
+    absent = ",".join(f"US{n:012d}" for n in range(10_000))               # ids with no price file: 150,000 characters
+    with open(tmp_path / "members.csv", "w", newline="") as fh:
+        csv.writer(fh).writerows([["date", "tickers"], [date, f"{tickers},{absent}"]])
+    assert len(f"{tickers},{absent}") > csv.field_size_limit() == 131_072
+    after = X.load_panel(tmp_path, run)
+    np.testing.assert_array_equal(after.member, before.member)
+    np.testing.assert_array_equal(after.base, before.base)
+    assert csv.field_size_limit() == 131_072                              # the wider limit does not outlive the read

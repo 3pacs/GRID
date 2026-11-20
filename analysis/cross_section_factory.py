@@ -54,6 +54,7 @@ SIGNAL_CLIP = 0.10
 MIN_PRICE = 5.0
 MIN_DOLLAR_VOLUME = 10e6
 DOLLAR_VOLUME_WINDOW = 21
+MEMBERS_FIELD_LIMIT = 16 * 1024 * 1024   # one members.csv row lists every member; csv's default field limit is 131,072
 SIDES = {"overnight": 4, "intraday": 4, "close_1d": 4}   # sides traded per night per $1 long and $1 short
 SIGNAL_KINDS = ("mean_overnight", "mean_intraday", "momentum", "reversal", "high_52w", "sector_momentum")
 PAID_MIN_NIGHTS = 100   # a card cut with fewer traded nights is not named in where it paid or did not
@@ -258,8 +259,12 @@ def load_panel(data_dir: Path, run: RunFile) -> Panel:
     cc = (f["adjClose"] / f["adjClose"].shift(1) - 1).where(ok & prev_ok)
     cols = list(on.columns)
 
-    with open(Path(data_dir) / "members.csv", newline="") as fh:
-        rows = sorted((r["date"], frozenset(t.strip() for t in r["tickers"].split(",") if t.strip())) for r in csv.DictReader(fh))
+    limit = csv.field_size_limit(MEMBERS_FIELD_LIMIT)   # a universe of thousands writes a row longer than csv's default
+    try:
+        with open(Path(data_dir) / "members.csv", newline="") as fh:
+            rows = sorted((r["date"], frozenset(t.strip() for t in r["tickers"].split(",") if t.strip())) for r in csv.DictReader(fh))
+    finally:
+        csv.field_size_limit(limit)
     mdates = [d for d, _ in rows]
     renames = dict(json.loads((Path(data_dir) / "renames.json").read_text())["renames"])
     at = {c: j for j, c in enumerate(cols)}
