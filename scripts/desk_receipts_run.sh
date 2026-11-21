@@ -31,6 +31,8 @@
 #   DESK_RECEIPTS_DIR      the log folder (required)
 #   DESK_FACTORY_LEDGER    module-factory ledger file (required)
 #   DESK_FACTORY_ANCHOR    its anchor file (required)
+#   DESK_PANEL_TRIALS_DB   gex-signals signals.db, read-only (optional). Unset:
+#                          the live trial ledger is recorded as unknown.
 #   DESK_RECEIPTS_PYTHON   interpreter (default: python3)
 #   DESK_RECEIPTS_REPORT   hub reporter (default: agent-report). Empty turns
 #                          delivery off: heads stay pending and the run says so.
@@ -76,8 +78,9 @@ alert() {  # alert <slug> <body-file>; a failure notice, best effort
 body="$(mktemp)"; trap 'rm -f "$body"' EXIT
 host="$(hostname -s 2>/dev/null || hostname)"
 
+panel=(); [ -n "${DESK_PANEL_TRIALS_DB:-}" ] && panel=(--panel-trials-db "$DESK_PANEL_TRIALS_DB")
 out="$("$PY" -m intelligence.desk_source_receipts record --dir "$DESK_RECEIPTS_DIR" \
-        --factory-ledger "$DESK_FACTORY_LEDGER" --factory-anchor "$DESK_FACTORY_ANCHOR")"
+        --factory-ledger "$DESK_FACTORY_LEDGER" --factory-anchor "$DESK_FACTORY_ANCHOR" "${panel[@]}")"
 rc=$?
 echo "$out"
 if [ "$rc" -eq 2 ]; then
