@@ -322,9 +322,14 @@ class SECVelocityPuller(BasePuller):
                 year_start = date(year, 1, 1)
                 year_end = date(year, 12, 31) if year < date.today().year else date.today()
 
+                # Module-level get_filings takes ``filing_date``
+                # ("YYYY-MM-DD:YYYY-MM-DD"), not ``date`` (that keyword exists
+                # only on Company.get_filings), in edgartools 5.x and 6.x
+                # alike. ``date=`` raised TypeError for every year, so this
+                # backfill wrote nothing.
                 filings = get_filings(
                     form="8-K",
-                    date=f"{year_start}:{year_end}",
+                    filing_date=f"{year_start}:{year_end}",
                 )
                 if filings is None:
                     continue
