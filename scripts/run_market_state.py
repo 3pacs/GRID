@@ -81,7 +81,7 @@ def readiness(record: dict, target: date) -> dict:
         "dealer_target_ready": dealer_ready,
         "dealer_observation_date": gamma.get("obs_date"),
         "dealer_reason": None if dealer_ready else gamma.get("reason", "no exact target-session dealer row"),
-        "variable_status": {k: {a: v.get(a) for a in ("status", "obs_date", "age_days", "reason")}
+        "variable_status": {k: {a: v.get(a) for a in ("status", "obs_date", "age_days", "freshness", "reason")}
                             for k, v in variables.items()},
         "analysis_gaps": sorted(k for k, v in variables.items() if v.get("status") != "ok"),
         "event_status": (record.get("events") or {}).get("status", "unknown"),
