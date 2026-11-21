@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 from loguru import logger as log
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import LATEST_DAILY_SIGNALS, visible_sql
 
 
 class _NumpyEncoder(json.JSONEncoder):
@@ -650,10 +650,8 @@ class CapitalFlowResearchEngine:
                     visible_sql(
                         "SELECT ticker, put_call_ratio, iv_atm, max_pain, "
                         "spot_price, total_oi, signal_date "
-                        "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                        "WHERE signal_date = ("
-                        "  SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_2"
-                        ") ORDER BY ticker"
+                        "FROM " + LATEST_DAILY_SIGNALS + " ods "
+                        "ORDER BY ticker"
                     )
                 ).fetchall()
 

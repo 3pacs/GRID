@@ -7,7 +7,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth, viewer_is_admin
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import LATEST_DAILY_SIGNALS, visible_sql
 from api.dependencies import get_db_engine
 from api.schemas.watchlist import WatchlistItemCreate
 from api.routers.watchlist_helpers import (
@@ -397,9 +397,8 @@ def list_watchlist_enriched(
         with engine.connect() as conn:
             opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest) "
-                "AND ticker = ANY(:tickers)",
+                "FROM " + LATEST_DAILY_SIGNALS + " ods "
+                "WHERE ticker = ANY(:tickers)",
                 include_schwab,
             ), {"tickers": tickers}).fetchall()
             for o in opts:

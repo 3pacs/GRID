@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Date, text
+from sqlalchemy import Date
 from sqlalchemy.engine import Engine
 
 from ingestion.market_calendar import is_market_open
@@ -57,6 +57,7 @@ from paper_log.gex_levels.tested_walls import (
     aggregate_per_strike_gex,
     select_tested_walls,
 )
+from store.options_provenance import VISIBLE_CAPTURE_BATCH_DAYS, VISIBLE_SNAPSHOTS_ALL, visible_sql
 
 REPLAY_KIND = "preopen_replay"
 
@@ -78,24 +79,24 @@ class CaptureBatch:
     backfilled: bool
 
 
-_BATCH_QUERY = text(
+_BATCH_QUERY = visible_sql(
     """
     SELECT b.capture_batch_id, b.capture_ordinal, b.ticker, b.snap_date,
            b.capture_started_at, b.capture_completed_at, b.row_count,
            b.capture_source, b.backfilled,
-           (SELECT COUNT(*) FROM options_snapshots_all s
+           (SELECT COUNT(*) FROM """ + VISIBLE_SNAPSHOTS_ALL + """ s
              WHERE s.capture_batch_id = b.capture_batch_id
                AND s.capture_ordinal = b.capture_ordinal
                AND s.ticker = b.ticker AND s.snap_date = b.snap_date) AS stored_rows
-    FROM options_capture_batches b
+    FROM """ + VISIBLE_CAPTURE_BATCH_DAYS + """ b
     WHERE b.capture_batch_id = :batch
     """
 ).columns(snap_date=Date())
 
-_BATCH_CHAIN_QUERY = text(
+_BATCH_CHAIN_QUERY = visible_sql(
     """
     SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility, expiry
-    FROM options_snapshots_all
+    FROM """ + VISIBLE_SNAPSHOTS_ALL + """ s
     WHERE capture_batch_id = :batch AND capture_ordinal = :ordinal
       AND ticker = :ticker AND snap_date = :snap_date
       AND open_interest > 0 AND implied_vol > 0

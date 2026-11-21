@@ -24,6 +24,7 @@ from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
 from store.availability import unavailable
 from store.options_provenance import (
+    LATEST_SIGNAL_EACH_TICKER,
     VISIBLE_CAPTURE_BATCHES,
     VISIBLE_DAILY_SIGNALS,
     VISIBLE_SNAPSHOTS,
@@ -107,7 +108,7 @@ def get_overview(include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, A
             rows = conn.execute(visible_sql(
                 "SELECT DISTINCT ON (ticker) ticker, signal_date, put_call_ratio, "
                 "max_pain, iv_skew, iv_atm, total_oi, total_volume, spot_price "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                "FROM " + LATEST_SIGNAL_EACH_TICKER + " ods "
                 "ORDER BY ticker, signal_date DESC "
                 "LIMIT 20",
                 include_schwab,
@@ -840,7 +841,7 @@ def get_signals(
                 "SELECT DISTINCT ON (ticker) ticker, signal_date, put_call_ratio, "
                 "max_pain, iv_skew, total_oi, total_volume, near_expiry, "
                 "spot_price, iv_atm, term_structure_slope, oi_concentration "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                "FROM " + LATEST_SIGNAL_EACH_TICKER + " ods "
                 "ORDER BY ticker, signal_date DESC",
                 include_schwab,
             )).fetchall()

@@ -16,7 +16,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
-from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+from store.options_provenance import LATEST_DAILY_SIGNALS, visible_sql
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
@@ -168,9 +168,8 @@ def _compute_sectors_payload() -> dict[str, Any]:
         with engine.connect() as conn:
             opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price, total_oi "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest)"
-            )).fetchall()  # cached for every viewer: never a Schwab day
+                "FROM " + LATEST_DAILY_SIGNALS + " ods"
+            )).fetchall()  # cached for every viewer: each ticker's latest non-Schwab day
             for o in opts:
                 opts_map[o[0]] = {
                     "pcr": o[1], "iv": o[2], "max_pain": o[3],
@@ -672,9 +671,8 @@ def get_sector_detail(
         with engine.connect() as conn:
             opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price, total_oi "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest)"
-            )).fetchall()  # cached for every viewer: never a Schwab day
+                "FROM " + LATEST_DAILY_SIGNALS + " ods"
+            )).fetchall()  # cached for every viewer: each ticker's latest non-Schwab day
             for o in opts:
                 opts_map[o[0]] = {
                     "pcr": o[1], "iv": o[2], "max_pain": o[3],
@@ -1846,9 +1844,8 @@ def get_sankey_data(
         with engine.connect() as conn:
             opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price "
-                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest)"
-            )).fetchall()  # cached for every viewer: never a Schwab day
+                "FROM " + LATEST_DAILY_SIGNALS + " ods"
+            )).fetchall()  # cached for every viewer: each ticker's latest non-Schwab day
             for o in opts:
                 opts_map[o[0]] = {"pcr": o[1], "iv": o[2], "max_pain": o[3], "spot": o[4]}
     except Exception as exc:

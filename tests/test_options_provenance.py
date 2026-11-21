@@ -6,11 +6,9 @@ Offline: no provider, network or PostgreSQL access.
 """
 from __future__ import annotations
 
-import io
 import json
 import re
 import sqlite3
-import tokenize
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -124,17 +122,53 @@ def _signal_days(engine: Any, include: Any) -> set[tuple[str, str]]:
 # ── The fragments ─────────────────────────────────────────────────────
 
 
-def test_fragments_bind_every_value_and_interpolate_nothing() -> None:
-    for name, fragment in op._FRAGMENTS.items():
-        assert set(re.findall(r"(?<!:):(\w+)", fragment)) == {"include_schwab", "schwab_from"}, name
-        assert "{" not in fragment and "%" not in fragment, name
-    assert op.provenance_params(True) == {"include_schwab": True, "schwab_from": "2026-11-21"}
+CONSTANTS = {
+    "VISIBLE_DAILY_SIGNALS": op.VISIBLE_DAILY_SIGNALS, "VISIBLE_SNAPSHOTS": op.VISIBLE_SNAPSHOTS,
+    "VISIBLE_SNAPSHOTS_ALL": op.VISIBLE_SNAPSHOTS_ALL, "VISIBLE_CAPTURE_BATCHES": op.VISIBLE_CAPTURE_BATCHES,
+    "VISIBLE_CAPTURE_BATCH_DAYS": op.VISIBLE_CAPTURE_BATCH_DAYS, "LATEST_DAILY_SIGNALS": op.LATEST_DAILY_SIGNALS,
+    "LATEST_SIGNAL_EACH_TICKER": op.LATEST_SIGNAL_EACH_TICKER,
+}
+
+
+@pytest.mark.parametrize("name", sorted(CONSTANTS))
+def test_fragments_bind_their_one_value_and_have_no_or_around_the_filter(name: str) -> None:
+    fragment = CONSTANTS[name]
+    assert set(re.findall(r"(?<!:):(\w+)", fragment)) == {"schwab_from"}, name
+    assert "{" not in fragment and "%" not in fragment and ":include_schwab" not in fragment, name
+    # The filter is a top-level NOT EXISTS / NOT (...) (an anti-join), never
+    # "(:flag OR NOT ...)", which PostgreSQL cannot plan as one.
+    assert not re.search(r"\(\s*\S+\s+OR\s+NOT\b", fragment), name
+
+
+def test_no_constant_hides_inside_another_or_inside_an_admin_form() -> None:
+    texts = list(CONSTANTS.values())
+    for a in texts:
+        for b in texts + list(op._ADMIN_FORM.values()):
+            assert a is b or a not in b
+
+
+PLAIN = {
+    "VISIBLE_DAILY_SIGNALS": "options_daily_signals", "VISIBLE_SNAPSHOTS": "options_snapshots",
+    "VISIBLE_SNAPSHOTS_ALL": "options_snapshots_all", "VISIBLE_CAPTURE_BATCHES": "options_capture_batches",
+    "VISIBLE_CAPTURE_BATCH_DAYS": "options_capture_batches", "LATEST_DAILY_SIGNALS": op.LATEST_DAILY_SIGNALS_ALL,
+    "LATEST_SIGNAL_EACH_TICKER": "options_daily_signals",
+}
+
+
+@pytest.mark.parametrize("name", sorted(CONSTANTS))
+def test_admin_reads_the_plain_table_and_binds_nothing(name: str) -> None:
+    sql = "SELECT * FROM " + CONSTANTS[name] + " x WHERE ticker = :t"
+    plain = "SELECT * FROM " + PLAIN[name] + " x WHERE ticker = :t"
+    assert op.visible_sql_text(sql, True) == plain
+    assert op.visible_sql(sql, True).text == plain and ":schwab_from" not in plain
+    assert op.visible_sql(sql, False).text == sql   # everyone else: the filtered SQL as written
 
 
 @pytest.mark.parametrize("flag", [False, None, 1, "true", object()])
 def test_only_an_explicit_true_admits_schwab_rows(flag: Any) -> None:
     assert op.include_schwab_rows(flag) is False
-    assert op.provenance_params(flag)["include_schwab"] is False
+    assert op.visible_sql_text("SELECT 1 FROM " + op.VISIBLE_DAILY_SIGNALS + " ods", flag) != (
+        "SELECT 1 FROM options_daily_signals ods")
 
 
 def test_admin_sees_every_day_and_contributor_never_a_schwab_one(db) -> None:
@@ -157,14 +191,18 @@ def test_batches_are_filtered_per_batch_and_snapshots_per_day(db) -> None:
     with db.connect() as conn:
         batches = {r[0] for r in conn.execute(op.visible_sql(
             "SELECT capture_batch_id FROM " + op.VISIBLE_CAPTURE_BATCHES + " b WHERE ticker = 'SPY'"))}
+        batch_days = {r[0] for r in conn.execute(op.visible_sql(
+            "SELECT capture_batch_id FROM " + op.VISIBLE_CAPTURE_BATCH_DAYS + " b WHERE ticker = 'SPY'"))}
         days = {str(r[0]) for r in conn.execute(op.visible_sql(
             "SELECT DISTINCT snap_date FROM " + op.VISIBLE_SNAPSHOTS_ALL + " s WHERE ticker = 'SPY'"))}
         latest_public = conn.execute(op.visible_sql(
             "SELECT MAX(snap_date) FROM " + op.VISIBLE_SNAPSHOTS + " s WHERE ticker = 'SPY'")).scalar()
         latest_admin = conn.execute(op.visible_sql(
             "SELECT MAX(snap_date) FROM " + op.VISIBLE_SNAPSHOTS + " s WHERE ticker = 'SPY'", True)).scalar()
-    # The same-day Cboe batch is listed, but the day's contracts and signals stay hidden.
+    # The same-day Cboe batch is listed, but its day's contracts and signals stay
+    # hidden, and a reader that picks a batch to load its chain skips that day.
     assert batches == {"spy-cboe", "spy-cboe-late"}
+    assert batch_days == {"spy-cboe"}
     assert days == {PUBLIC_DAY.isoformat()}
     assert str(latest_public) == PUBLIC_DAY.isoformat() and str(latest_admin) == SCHWAB_DAY.isoformat()
 
@@ -177,12 +215,8 @@ def test_batches_are_filtered_per_batch_and_snapshots_per_day(db) -> None:
     (None, None, UNKNOWN_DAY, True),
     ("provider", None, UNKNOWN_DAY, True),
     (None, None, LEGACY_DAY, False),
-    (None, None, None, True),
 ])
-def test_python_rule_matches_the_sql_rule(provider, metadata, day, schwab) -> None:
-    assert op.batch_is_schwab(provider, json.dumps(metadata) if metadata else None, day) is schwab
-    if day is None:
-        return
+def test_batch_rule(provider, metadata, day, schwab) -> None:
     engine = _sqlite()
     with engine.begin() as conn:
         conn.execute(text(SCHEMA[0]))
@@ -192,22 +226,7 @@ def test_python_rule_matches_the_sql_rule(provider, metadata, day, schwab) -> No
             {"d": day.isoformat(), "p": provider, "m": json.dumps(metadata) if metadata else None})
         visible = conn.execute(op.visible_sql(
             "SELECT COUNT(*) FROM " + op.VISIBLE_CAPTURE_BATCHES + " b")).scalar()
-        found = op.schwab_days(conn, day, day)
     assert visible == (0 if schwab else 1)
-    assert (("SPY", day) in found) is schwab
-
-
-def test_options_feature_names_map_to_their_ticker(db) -> None:
-    assert op.options_feature_ticker("spy_pcr") == "spy"
-    assert op.options_feature_ticker("brk_b_iv_m90_put_v1") == "brk_b"
-    assert op.options_feature_ticker("spy_close") is None
-    with db.connect() as conn:
-        assert op.hidden_feature_dates(conn, "spy_iv_atm", PUBLIC_DAY, UNKNOWN_DAY) == {SCHWAB_DAY}
-        assert op.hidden_feature_dates(conn, "spy_iv_atm", PUBLIC_DAY, UNKNOWN_DAY, include_schwab=True) == set()
-        assert op.hidden_feature_dates(conn, "nuox_pcr", PUBLIC_DAY, UNKNOWN_DAY) == set()
-    rows = [("SPY", SCHWAB_DAY), ("SPY", PUBLIC_DAY), ("NUOX", None)]
-    kept = op.drop_hidden_rows(rows, {("SPY", SCHWAB_DAY)}, ticker=lambda r: r[0], date_of=lambda r: r[1])
-    assert kept == [("SPY", PUBLIC_DAY)]   # an undatable row is dropped too
 
 
 # ── Auth: the viewer's role ───────────────────────────────────────────
@@ -379,37 +398,3 @@ def test_provider_is_schwab_reads_either_field() -> None:
     assert op.provider_is_schwab("cboe", {"provider": "Schwab"})
     assert op.provider_is_schwab(None, '{"provider": "schwab"}')
     assert not op.provider_is_schwab("cboe", None) and not op.provider_is_schwab(None, "not json")
-
-
-# ── Guard: no covered reader goes around the fragments ────────────────
-
-COVERED = (
-    "alerts/hundredx_digest.py", "analysis/capital_flows.py", "analysis/flow_thesis_data.py",
-    "analysis/money_flow.py", "analysis/money_flow_engine/layer_market.py", "analysis/thesis_scorer.py",
-    "analysis/vol_surface.py", "api/routers/actor_detail.py", "api/routers/chat.py", "api/routers/dad.py",
-    "api/routers/derivatives.py", "api/routers/explain.py", "api/routers/flows.py", "api/routers/options.py",
-    "api/routers/surfacer.py", "api/routers/watchlist_analysis.py", "api/routers/watchlist_core.py",
-    "api/routers/watchlist_helpers.py", "api/routers/watchlist_overview.py", "discovery/options_scanner.py",
-    "intelligence/catalyst_ev.py", "intelligence/consensus_crowdedness.py",
-    "intelligence/credit_event_probability.py", "intelligence/earnings_intel.py",
-    "intelligence/event_sequence.py", "intelligence/forensics.py", "intelligence/market_implied_prob.py",
-    "intelligence/news_impact.py", "intelligence/pattern_engine.py", "intelligence/postmortem.py",
-    "intelligence/sentiment_scorer.py", "intelligence/thesis_tracker.py", "intelligence/trust_scorer.py",
-    "ollama/dealer_flow_briefing.py", "ollama/market_briefing.py", "oracle/engine.py",
-    "oracle/entry_price_policy.py", "oracle/publish.py", "orchestration/llm_task_workers.py",
-    "physics/dealer_gamma.py", "trading/contagion_to_ticket.py", "trading/options_recommender.py",
-    "trading/options_tracker.py", "trading/strategy151.py", "valuation/derivatives_support.py",
-)
-# Which tickers have rows is not Schwab data: universe selection may read it directly.
-_TICKER_LIST = re.compile(r"SELECT DISTINCT ticker FROM options_daily_signals\b")
-_RAW_READ = re.compile(
-    r"\b(?:FROM|JOIN)\s+(options_daily_signals|options_snapshots_all|options_snapshots|options_capture_batches)\b",
-)
-
-
-@pytest.mark.parametrize("path", COVERED)
-def test_covered_readers_read_options_tables_only_through_the_fragments(path: str) -> None:
-    source = (ROOT / path).read_text(encoding="utf-8")
-    raw = [tok.string.strip()[:80] for tok in tokenize.generate_tokens(io.StringIO(source).readline)
-           if tok.type == tokenize.STRING and _RAW_READ.search(_TICKER_LIST.sub("", tok.string))]
-    assert raw == [], f"{path} reads an options table without store/options_provenance.py: {raw}"

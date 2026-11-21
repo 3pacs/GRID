@@ -76,6 +76,7 @@ from ingestion.market_calendar import is_market_open, last_trading_day
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
 from store.options_provenance import (
+    VISIBLE_CAPTURE_BATCH_DAYS,
     VISIBLE_CAPTURE_BATCHES,
     VISIBLE_SNAPSHOTS,
     VISIBLE_SNAPSHOTS_ALL,
@@ -646,9 +647,15 @@ class DealerGammaEngine:
         Registration time is a necessary exclusion bound, not proof that the
         transaction had committed or was observable at the cutoff. This live
         selector does not establish historical point-in-time admission.
+
+        Unless the engine admits Schwab rows, a day with a Schwab batch is
+        skipped as a whole (``VISIBLE_CAPTURE_BATCH_DAYS``), the same
+        day-level rule ``_load_chain`` applies to the contracts, so a
+        same-day Cboe batch is never chosen only for its chain to be hidden;
+        the read falls back to the latest non-Schwab day.
         """
         query = visible_sql("""
-            SELECT snap_date, capture_batch_id FROM """ + VISIBLE_CAPTURE_BATCHES + """ b
+            SELECT snap_date, capture_batch_id FROM """ + VISIBLE_CAPTURE_BATCH_DAYS + """ b
             WHERE ticker = :ticker
               AND snap_date <= :on_or_before
               AND capture_completed_at <= :cutoff

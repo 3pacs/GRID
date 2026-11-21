@@ -89,7 +89,13 @@ def guard_engine():
         conn.execute(text(
             "CREATE TABLE options_daily_signals (ticker TEXT, signal_date DATE, "
             "put_call_ratio DOUBLE PRECISION, spot_price DOUBLE PRECISION, "
-            "max_pain DOUBLE PRECISION, iv_atm DOUBLE PRECISION)"
+            "max_pain DOUBLE PRECISION, iv_atm DOUBLE PRECISION, wing_iv_metadata JSONB)"
+        ))
+        # Options readers go through store/options_provenance.py, which looks
+        # up each row's capture batch. Empty: no batch, so no row is Schwab.
+        conn.execute(text(
+            "CREATE TABLE options_capture_batches (capture_batch_id TEXT PRIMARY KEY, ticker TEXT, "
+            "snap_date DATE, spot_provider TEXT, clock_metadata JSONB)"
         ))
         conn.execute(text(
             "CREATE TABLE dollar_flows (source_type TEXT, actor_name TEXT, ticker TEXT, "
