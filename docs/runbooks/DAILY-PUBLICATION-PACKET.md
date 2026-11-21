@@ -288,8 +288,13 @@ ingest enforces; the grader constructs rows so they pass by construction):
   session ranges provide only `partially_confirmed` corroboration. A pull timestamp is
   not a market-event timestamp, even when the value matches. The present observation
   schema cannot confirm the exact-time intraday claim. Yesterday's close cannot confirm
-  today's current level. Only a complete same-session low/high from the same source and retrieval timestamp, captured after the close
-  can refute an out-of-range value; sparse mismatching samples are `unscorable`, not
+  today's current level. A session low and high count as one range only when one pull
+  wrote both: same source and the same `raw_payload.pull_run_id` (stamped by
+  `ingestion/yfinance_pull.py` per `pull_ticker` call since grader `v3-range-pairing`), or,
+  for older rows without a run id, retrieval timestamps at most 5 s apart. Differing run
+  ids, a run id on only one leg, or a different source never pair. The newest such pair
+  corroborates a value inside it; only a pair captured after the close can refute an
+  out-of-range value (and a newer single-leg capture can only widen that range); sparse mismatching samples are `unscorable`, not
   refutation. Range evidence retains each actual retrieval timestamp, and later complete
   ranges have `knowable_at_stated_at=false`. Nearby corroboration has availability
   unknown for the claimed exact-time fact, not a fabricated `true`.
@@ -298,6 +303,8 @@ ingest enforces; the grader constructs rows so they pass by construction):
   timing/revisions and explicit "current" versus "close" wording require further work.
   Grader confidence remains a heuristic, not a calibrated accuracy probability.
   Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
+- Grader `v3-range-pairing` (after `v2-corroboration`) changes verdict semantics only; the version
+  bump changes every review header, so the next run rewrites each day in the lookback window.
 - Grader `v2-corroboration` changes verdict semantics only. Regrading follows the existing
   append-only run/supersession path; it does not delete prior runs, alter original packets,
   write model scores, or retroactively claim publication-time knowledge. Prior database

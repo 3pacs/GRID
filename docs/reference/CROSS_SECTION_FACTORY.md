@@ -14,10 +14,13 @@ verdicts.
 
 ## What a run does
 
-1. Reads the run file and hashes every input file (the data manifest). Nothing is parsed yet. A run id or run file
-   the ledger declared before is refused, and so is an output directory that already exists: one look per run file.
+1. Reads the run file and hashes every input file (the data manifest). No price, member or state row is parsed
+   yet. A run id or run file the ledger declared before is refused, and so is an output directory that already
+   exists: one look per run file. A store that is a completed export is checked against its own manifest here, and a
+   window that starts before the export's discovery start is refused (see "A completed export" below).
 2. Declares the run on a factory ledger (`record_factory_declared`): run file, manifest hash, trial count.
-3. Loads bars, **dropping every row after 2022-12-30**. A run file whose window leaves 2010-01-04 .. 2022-12-29 is
+3. Loads bars, **dropping every row after 2022-12-30**. Each input file is read once and its bytes must hash to what
+   step 1 declared; a file replaced, added or removed since then abandons the run. A run file whose window leaves 2010-01-04 .. 2022-12-29 is
    refused. The later years are kept unread for a confirmation look.
 4. For each module (signal × ranking × fraction × horizon) computes one spread per night: mean outcome of the top
    fraction minus the bottom fraction, pooled or inside each sector (pick-weighted across sectors).
@@ -47,14 +50,75 @@ within the run only (`max_t.multiplicity`): earlier runs and looks are not in it
 ## Universe and timing (the same rules edge search 12 registered)
 
 - Members by date from `members.csv` (start set plus dated rows), through `renames.json`.
+  A row may list thousands of members: the read allows a field of up to 16 MB.
 - A stock is ranked on day d if it has a valid bar on d, its unadjusted close on d−1 is at least $5, and its median
   dollar volume over the 21 sessions ending d−1 is at least $10M. The floor also screens out price files that hold
   another company (Tiingo reuses tickers).
+- A run file may set its own floors: `min_price` ($1 to $10,000) and `min_dollar_volume` ($100,000 to $10 billion).
+  Left out, they are $5 and $10M, and the run and its report are byte for byte what they were before the fields
+  existed. A run that sets either has both written under `coverage.floors` in its report. Lower floors are only safe
+  on a store whose price files are keyed by a permanent company id, because the default floor is also what screens
+  out a reused ticker.
 - Every signal uses only what is known before the close of d: closes through d−1, plus the open of d for the
   overnight mean. Outcomes start at the close of d.
 - A day with fewer than `min_ranked` ranked stocks is skipped.
 - Sector: `sectors.csv` (today's GICS label). A member with no label takes the labelled sector its daily returns
   follow most closely; the report gives that method's accuracy on labelled names (77 % on the first run).
+- A store with no sector labels says so with a `sectors.csv` that holds its header (`Symbol,GICS Sector`) and no
+  rows. Such a run ranks pooled only. A run file that asks for the `within_sector` ranking, a sector gate
+  (`sector_phase`, `sector_leading`, `groups`) or a `sector_momentum` signal is refused, and its cards have no sector
+  cuts. The refusal comes when the data is loaded, which is after the run is declared, so the ledger records that run
+  as abandoned: check the run file against the store before running on the shared ledger. A missing `sectors.csv`
+  still stops the run with a file-not-found error before anything is declared, as it did before.
+- A store with no sector labels must be a completed export. Without `panel-manifest.json` the run is refused before
+  anything is declared.
+
+## A completed export (2026-11-21)
+
+Review of #1291 found two gaps. The run hashed every input file before declaring, but the load then read the files
+again from disk without checking them, so a store being rewritten file by file could put two versions under one run
+id. And nothing tied a store to the first day discovery may use on it: the small-cap store's 2016 start was a line
+in a document.
+
+**Every read is checked.** `load_panel` now takes the declared file table. It reads each file's bytes once, compares
+their hash with the declared one, and parses those bytes. A file that changed, appeared or went missing between the
+declaration and the read stops the run with "changed between the run's declaration and its read", and the ledger
+records it as abandoned. This holds for every store, labelled or not. A run on an unchanged store gives the same
+four output files byte for byte (checked against main on a plain and a gated run, 2026-11-21).
+
+**An export is a directory written once.** `seal_export(dir, discovery_first_session=..., source=...)` writes
+`panel-manifest.json` over a finished directory and refuses to write it twice:
+
+| Field | Meaning |
+|---|---|
+| `schema` | `cross-section-panel-export/1` |
+| `complete` | `true`; anything else is refused |
+| `discovery_first_session` | The first day a discovery window may start on this store |
+| `source` | Where the files came from: provider, requested start, vintage |
+| `files` | Every panel file with its size and sha256 |
+| `generation` | `g-` and the first 16 hex digits of the hash of every other field |
+
+Before declaring, the factory reads that manifest and refuses the run when:
+
+- the manifest is not complete, or its generation id is not the hash of its own content (an edited manifest);
+- the directory's files are not exactly the ones listed, by name and by hash;
+- the run file's `first_session` is earlier than `discovery_first_session`.
+
+Nothing is declared in any of those cases. Otherwise the manifest's hash, generation and discovery start go into the
+data manifest under `panel_export`, so the declared `data_manifest_sha256` binds them, and the report repeats them
+under `coverage.panel_export`. A store without `panel-manifest.json` has no `panel_export` entry and its manifest
+hash is what it was.
+
+**One definition of the universe.** `universe(dir, min_session_bars=..., min_price=..., min_dollar_volume=...)`
+answers which stock may be ranked on which session. `load_panel` builds on it and the small-cap builder's `counts`
+calls it, so a count and a run cannot disagree. "The session before" is the store's previous session, not the
+stock's previous bar: a stock with no bar on that session has no prior close and is out. A valid bar needs positive
+adjusted open and close as well as the unadjusted checks.
+
+Tests (synthetic stores only, no run on real data): a no-label store without an export refused before declaration;
+an export dated 2016-01-04 refusing a 2015 window; a window one session early refused; a replaced, added or removed
+file and an edited manifest refused before declaration; a price file, `members.csv` or `sectors.csv` changed after
+declaration abandoning the run; a missing session and a zero adjusted close taking a stock out of the universe.
 
 ## Signals and horizons
 
@@ -137,6 +201,7 @@ python -m analysis.cross_section_factory run --run-file RUN.json --data-dir DIR 
 ```
 
 `DIR` holds `prices/<TICKER>.csv` (Tiingo daily columns), `members.csv`, `sectors.csv`, `renames.json`.
+A price file may be named by any key the members file uses, a permanent company id included.
 
 ## Evidence adapter
 
@@ -160,6 +225,8 @@ sector by correlation over the whole sample, so a sector's membership in 2010 us
   a loss; the data holds no delisting return. Each row's `dropped_pick_share` sizes it.
 - Names with no price file never enter, so if a delisted member's file is missing the universe is survivor-biased.
 - Sector labels are today's; past members without one are placed by correlation over the whole window (above).
+- The flat cost per side was set for index members at the auctions. A run with lower floors ranks stocks that cost
+  more to trade, so its run file should set `cost_bp_per_side` to a measured figure; the default 1 bp is not one.
 - Cost is a floor: a flat rate per side at the auctions, four sides a night, no borrow fee on the short side.
 - A night with fewer than `min_session_bars` priced names is dropped, so an overnight or close-to-close return after
   it spans more than one session.

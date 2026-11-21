@@ -124,6 +124,10 @@ class Observation:
     # declared publication lag ("modeled_lag").
     known_at: date | None = None
     known_at_basis: str | None = None
+    # Set only by read_vintages: the writer's per-call pull identity
+    # (raw_payload ->> 'pull_run_id', stamped by ingestion/yfinance_pull.py since
+    # 2026-11-21). None on older rows and on writers that do not stamp one.
+    pull_run_id: str | None = None
 
     @property
     def age_days(self) -> int:
@@ -296,7 +300,8 @@ def read_latest(
 
 
 _VINTAGES_SQL = (
-    "SELECT r.obs_date, r.value, r.pull_timestamp, sc.name FROM raw_series r "
+    "SELECT r.obs_date, r.value, r.pull_timestamp, sc.name, "
+    "r.raw_payload ->> 'pull_run_id' AS pull_run_id FROM raw_series r "
     "JOIN source_catalog sc ON sc.id = r.source_id "
     "WHERE r.series_id = :sid AND r.pull_status = :ok "
     "  AND r.obs_date >= :start AND r.obs_date <= :end "
@@ -329,7 +334,9 @@ def read_vintages(
     for row in rows:
         if row[1] is None or is_foreign_tiingo_row(series_id, row[3], _coerce_date(row[0])):
             continue
-        out.append(Observation(series_id, _coerce_date(row[0]), float(row[1]), _coerce_ts(row[2]), row[3]))
+        run_id = row[4] if len(row) > 4 and isinstance(row[4], str) and row[4] else None
+        out.append(Observation(series_id, _coerce_date(row[0]), float(row[1]), _coerce_ts(row[2]), row[3],
+                               pull_run_id=run_id))
     return out
 
 
