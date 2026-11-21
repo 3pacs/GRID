@@ -69,7 +69,12 @@ Allowed shared inputs are declared in:
 **Run tables**
 - **`persona_run`:** on-demand until 2026-05-01, written only by `POST /astrogrid/interpret`. The scheduled cycle has written it since 2026-09-15 (`save_interpretation` always writes the persona row).
 - **`seer_run`:** empty before the scheduled cycle, because an interpret request without a `snapshot` skips the Seer row. The cycle has written it since 2026-09-15; its holes match the sky_snapshot gaps.
-- **`engine_run` has no producer.** Rows come only from `engine_outputs` in an interpret request. The scheduled cycle sends none, and no client in this repo does either. So the table is empty by construction (this is read from the code; the table's row count was not re-checked), and every Seer row's `source_engine_runs` is `[]`. That breaks the "every Seer row cites source engine runs" law above until the lens engines run on the server.
+- **`engine_run`:** written two ways.
+  - **Interpret requests.** `POST /astrogrid/interpret` stores the `engine_outputs` a client sends. The scheduled cycle sends none. The browser page (`astrogrid_web/app.js`) sends them only for a signed-in viewer. Whether any of those rows landed has not been checked against the table.
+  - **Scheduled producer (off by default).** Set `ASTROGRID_ENGINE_RUNS_ENABLED=true` to turn it on. The hourly cycle then runs the twelve shipped lens engines (`astrogrid_shared/prophecy.js`, under Node via `scripts/astrogrid_engine_outputs.mjs`) over today's snapshot. It stores them once per `sky_snapshot` row; `raw_output.producer = 'astrogrid_cycle'` marks them, and they also carry the JS `code_sha256` and `snapshot_built_at`. It runs only for today's date and never back-computes.
+    - The engines' `timestamp` is pinned to the day's 12:00Z, so reruns agree.
+    - Those outputs are **not** fed to the interpretation, so scheduled Seer rows still cite `[]`. Twelve outputs grow the prompt about fivefold, past the 3090 oracle's 8192-token context. Citing runs the Seer never read would be false provenance.
+    - The "every Seer row cites source engine runs" law above stays unmet until someone decides how the Seer should read them.
 
 ## Migration
 Fresh install:

@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     DB_USER: str = "grid_user"
     DB_PASSWORD: str = ""
     ASTROGRID_DB_SCHEMA: str = "astrogrid"
+    # Scheduled lens-engine producer (oracle/astrogrid_engines.py). Off by
+    # default: while False the hourly celestial cycle writes no engine_run
+    # rows and never starts Node. When True, the cycle runs the shipped JS
+    # engines (astrogrid_shared/prophecy.js) under ASTROGRID_NODE_BIN once per
+    # stored sky_snapshot, for today's date only.
+    ASTROGRID_ENGINE_RUNS_ENABLED: bool = False
+    ASTROGRID_NODE_BIN: str = "node"
 
     # API Keys — core
     FRED_API_KEY: str = ""
