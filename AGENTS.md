@@ -344,6 +344,63 @@ Verification and limits:
 - No production writes, paid API calls, push, PR, merge, deployment, or scheduler
   changes. Legacy date semantics, metadata breadth and shared budgets remain gates.
 
+## 2026-11-07 - SEC financial duration prevention (source-only candidate)
+
+- Reproduced the NVDA quarter/YTD collision: the old form-only classifier and
+  input-order tie breaker admitted a six-month amount as a quarter. Added
+  explicit duration admission and exact filing/period/tag provenance.
+- Quarterly/annual facts are selected deterministically; missing, unsupported
+  and conflicting contexts remain unavailable. Debt netting requires matching
+  reported contexts and resolves amendments before positive-inflow filtering.
+- Added a versioned source marker and bounded replacement of newly validated
+  economic keys, without sweeping unmarked legacy rows or changing schema.
+- Offline parser, provenance, writer and adjacent-reader tests use synthetic
+  inputs, in-memory SQLite or mocks with sockets and PostgreSQL blocked.
+- Production repair is not done. Legacy rows, omitted/withdrawn revisions,
+  structured revision identity, PostgreSQL validation and dependent rollup
+  reconciliation are explicit rollout gates in
+  `docs/reference/SEC_FINANCIAL_PERIOD_INTEGRITY.md`. No provider calls, DB
+  corrections, publication, merge or deployment.
+
+
+## 2026-11-07 - qualify SEC snapshots and historical reconciliation proposal
+
+- Continued the isolated period candidate with original archived SEC Company
+  Facts for NVDA, Apple and TSMC plus the NVDA filing. Real source bytes confirm
+  $96.221B quarter versus $177.837B six-month revenue, a 371-day Apple fiscal year,
+  a 98-day Apple quarter and explicitly limited IFRS annual coverage.
+- Added content-bound source snapshots, a separate current pointer, strict
+  admission and an actor-serialized transactional projection writer. Valid
+  empty/unsupported current projections remove only this producer's old marked
+  rows. Failed captures and older/regressed revisions cannot replace current data.
+  Original bytes, normalized outputs, FX inputs and receipt times are preserved.
+- Added proposed evidence/head tables without historical rewrites. Application
+  archive writes are append-only; actual deployment ownership/default/inherited
+  grants still require review. Downgrade deliberately retains evidence.
+- Distinguished attempted versus successful checkpoint progress, so a permanently
+  failing issuer cannot starve later tickers or freeze healthy revision refreshes.
+- Prepared a local-only, no-execution reconciliation manifest from a frozen
+  read-only export of 798 NVDA rows: 252 value differences, 338 provenance-only
+  review cases and 208 unavailable cases. These are review groups, not approved
+  corrections. Exact IDs and lossless before-image hashes guard a future repair.
+  Private operational artifacts remain outside git; public SEC fixtures are saved.
+
+Verification and limits:
+
+- 270 selected offline tests passed, 3 dependency-limited tests deselected; 14
+  real PostgreSQL tests passed on a new disposable native PostgreSQL 15.19 cluster.
+  Checked actual uniqueness, rollback, archive bytes, idempotency, empty updates,
+  concurrent capture ordering and clean-role evidence UPDATE/DELETE/TRUNCATE denial.
+- Private cluster was stopped and removed. No existing database/service or denied
+  WSL instance was accessed. No production writes, migration, checkpoint changes,
+  paid-provider calls, external-agent communication, push, PR, merge or deployment.
+- Independent review findings on malformed source admission, Decimal preservation
+  and failed-issuer liveness were fixed and regression-tested; final review found
+  no additional actionable source defect. Ruff, compilation and diff checks passed.
+- Full CI, deployment schema/permissions, legacy reconciliation, dependent rollup
+  invalidation and consumer acceptance remain required. Existing FX/concept/sign
+  and fiscal-label policies are not made authoritative by this duration fix.
+  See docs/reference/SEC_FINANCIAL_PERIOD_INTEGRITY.md for evidence and repair gates.
 ## 2026-11-07 - daily publication packet: in-repo producer replaces the per-day capture ceremony
 
 What was done:
@@ -459,6 +516,99 @@ Not done here:
 - 157 focused offline tests including both repository-wide guard scans passed
   with outbound sockets blocked. New full CI remains pending after draft push.
 
+
+## 2026-11-08 - SEC current-consumer integrity continuation (draft only)
+
+- Integrated main 3102e7b0, resolving the independent digest-clock test conflict
+  through main's clock seam while retaining fresh and stale coverage (49 tests).
+- Added a snapshot-aware read projection: supported direct financial facts must
+  match the current normalized evidence; missing facts cannot resurrect legacy,
+  seed or actor-case variants. Direct annual/quarter facts are deduplicated before
+  aggregation. Original ledger rows and evidence remain unchanged.
+- Bound TTM visibility and recompute state to the current SEC snapshot identity.
+  First empty heads and same-values/new-identity captures trigger reconciliation.
+  A controlled real PostgreSQL overlap proves a late old rollup is hidden until
+  the next current recompute, without relying on wall-clock timestamps.
+- Fixed downstream missing-as-zero ratios and financial scores. Incomplete
+  fundamental scores do not emit new trading verdicts; explicit zeros remain valid.
+- 418 selected offline tests passed, 8 optional/integration skips, 2 subtests;
+  24 tests passed in a fresh private PostgreSQL cluster that was stopped/removed.
+  Independent review, changed-file Ruff, compilation and diff checks passed.
+- Public NVDA fixture: 587 qualified rows beside 587 synthetic legacy duplicates;
+  final relational evidence join annual aggregate about 17 ms locally. This is
+  not production-scale qualification. No production database or provider access.
+- Remaining gates: exact-head full CI, deployed schema/ownership/grants and query
+  plans, persisted fundamental-divergence and report invalidation, TTL-cache
+  invalidation, reviewed historical repair. No repair executor, merge, deployment,
+  production migration, historical correction or production rollup was performed.
+
+
+### SEC continuation CI correction
+
+- Clean replay exposed the separate raw-SQL capital_flows dependency. The new
+  migration now creates that canonical empty ledger only if absent; it does not
+  run raw 0024's historical backfill or deduplication against existing data.
+- Parallel test collection exposed one unordered parameter set. Sorted it and
+  verified all 98 missing-value test IDs match across three Python hash seeds.
+- 25 disposable PostgreSQL tests pass, including empty-schema initialization,
+  grid-role view/insert access and populated-ledger preservation. Fresh head CI
+  remains required; no production state changed.
+
+
+## 2026-11-08 - Source-bound report and cache continuation (draft only)
+
+- Added SEC/TTM global generation binding and current views for divergence and
+  sector-health reports. Legacy/stale report rows remain retained evidence.
+  Computations check before/after reads; gated writes and current views reject
+  stale publication, including a late writer after a newer source commits.
+- Capital-flow, sector-health, divergence and percentile TTL caches validate
+  generation on every hit/build, isolate engines and fail closed on source churn.
+- Disabled new divergence signal fanout. Existing signal source families,
+  registry/materialized outputs and journal rows still require end-to-end
+  provenance/invalidation before rollout is complete. No evidence was erased.
+- Missing current-generation historical baselines produce unavailable trends,
+  never a fabricated stable trend. Regular source reobservations make historical
+  trends generally unavailable until explicitly rebound/recomputed.
+- 398 offline financial/scheduler tests passed (9 optional skips); 35 isolated PostgreSQL tests
+  passed with role grants, raw preservation, peer/TTM invalidation and a real
+  late-writer race. Full exact-head CI remains required after the draft push.
+- No production access, mutation, historical repair executor, deployment or merge.
+  Remaining operational gates are documented in SEC_FINANCIAL_PERIOD_INTEGRITY.md.
+
+- Independent review caught retry-status ambiguity: source-version failures and
+  rejected writes now raise retryable errors rather than marking Hermes due work
+  done as empty/superseded. Postcommit checks and 22 dedicated regressions cover it.
+
+
+## 2026-11-08 - First derived-signal containment slice (draft only)
+
+- Added an explicitly incomplete source inventory and staged non-destructive
+  lineage/quarantine plan, including executable proof of lost ancestry.
+- Blocked financial event replay at all three SignalFired handlers before any
+  DB/provider effects. Existing producer suppression remains active.
+- Guarded 12 current regime/feedback reads against explicit provisional journal
+  records. Original history, operator actions and outcomes remain unchanged.
+  Empty synthesis returns 503 before LLM use, rather than inventing a regime.
+- 676 offline tests passed (9 optional skips); 71 private PostgreSQL tests passed,
+  including 36 actual-predicate and raw-evidence preservation cases. Lint,
+  compilation and diff checks passed. A date-sensitive test uses the existing
+  UTC seam; production clock behavior is unchanged.
+- Mixed historical registry/prediction/materialized/learned state still needs
+  qualified publications and clean learning epochs. This is not complete repair.
+  No production access, migration, deletion, merge or deployment. Remote
+  exact-head qualification remains required after any draft publication.
+
+
+### Derived-signal qualification correction
+
+The first G3/G5 run correctly rejected an outdated forward thesis digest before
+executing tests. The 12 guarded reads now use fixed-column SQLAlchemy clauses and
+bound values, preserving predicate/history semantics. Only the forward thesis
+pin and new helper dependency are updated; all 14 HOLD seals, other forward
+seals, test counts, isolation and rollback checks stay unchanged. Expanded local
+validation passes 759 offline tests (9 optional skips) and 71 disposable PG tests.
+All 15 forward and 14 HOLD source blobs verify. Fresh exact-head CI is required;
+the failed predecessor is not accepted. No production access or deployment.
 ## 2026-11-08 — Daily review becomes machine-readable: `review.jsonl` ingest (Claude)
 
 Scope: `scripts/ingest_publication_review.py`, `migrations/versions/pub_review_ingest_20261108.py`
@@ -818,3 +968,57 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Shared-account budgeting, delayed-dispatch pacing, historical reconciliation,
   metadata breadth and separate canary approval remain rollout gates. No provider
   calls, production access, scheduler changes, merge to main or deployment.
+
+## 2026-11-21 — SEC #1050 applied-FX identity correction (Codex)
+
+- Owner-directed source-only continuation from `1d0b3a1b`; merged main
+  `427dbc247` with main's append-only entries first and recomputed 16 forward
+  pins. All 14 HOLD pins remain unchanged. No other PR or runtime was touched.
+- Snapshot identity now retains only supplied FX rates the normalizer applies.
+  USD bypasses FX; foreign conversion, fallback confidence and overflow replay
+  retain their existing behavior. Unrelated rate movement is identity-neutral.
+- 56 snapshot/admission/manifest tests passed with the requested light venv,
+  serial nice priority and two-thread BLAS limits. Fixtures only; no providers,
+  SSH, production access, PR merge or deployment.
+- The supplied worktree's shared Git metadata is read-only. Task Git metadata
+  is isolated in `.codex-task-git` inside this worktree; use
+  `git --git-dir=.codex-task-git` here to inspect the actual task branch.
+- Generation identity and the migration-head join remain for the next commits;
+  Claude reviews the pushed head before Anik decides whether to merge.
+
+### SEC #1050 content generation correction
+
+- Generation now hashes ordered actor/snapshot identities and TTM source IDs /
+  quarter fingerprints. Request/receipt/compute times remain metadata. Identical
+  reobservations and TTM recomputation preserve the generation; changed content,
+  peer membership and readiness still invalidate reports and caches.
+- Updated the old reobservation/compute-time expectations and added a private-PG
+  regression proving an unchanged refetch with moving unused FX advances head
+  metadata without duplicating the archive or hiding either current report.
+- Focused output/cache/PG files: 38 passed, 194 PostgreSQL tests skipped locally.
+  A local test fence blocks sockets and PostgreSQL connections. Native SQL/view
+  execution remains for CI, as requested. No assertions were relaxed for the
+  light venv's out-of-range SQLAlchemy 2.1.8.
+
+### SEC #1050 migration join and local qualification
+
+- Added the requested no-op join of `sec_pub_merge_20261109` with
+  `merge_av_wing_20261120`. Fetched main `427dbc247` already included its child
+  `research_findings_20261121`, so a second no-op join leaves exactly one head:
+  `merge_sec_main_20261121`. All IDs fit 32 characters. The graph regression
+  checks one head and retained ancestry without pinning a particular tip.
+- Ran all 26 PR test files plus `tests/test_alembic_single_head.py`, serially
+  with `nice -n 10`, two-thread BLAS limits and socket/PG fences. The supplied
+  dependency path shadows the venv's SQLAlchemy 2.1.8 with 2.1.9 and caused 35
+  SQL-text assertion failures. No assertions or installed packages were changed.
+- Re-ran the same 27 files using existing cached SQLAlchemy 2.0.58, within the
+  repository's `<2.1` constraint: 679 passed, 201 skipped, one missing-yfinance
+  failure in `TestTiingoNews::test_default_tickers_drop_untaggable_symbols`.
+  PostgreSQL tests intentionally skip; actual database/view behavior remains
+  for exact-head CI. No provider call or network dependency installation.
+- Final strengthened migration-edge checks and all single-head/version/logging
+  tests: 4 passed. Changed-file Ruff, Python parsing, all 16 forward / 14 HOLD
+  source digests and `git diff --check` passed. Original base ancestry retained.
+- Remaining review gates: Claude reviews the pushed head; Anik alone decides
+  merge. No PR merge, deployment, production access, historical repair, SSH,
+  outside-worktree report or coordination write was performed in this run.

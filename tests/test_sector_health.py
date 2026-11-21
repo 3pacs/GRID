@@ -22,6 +22,11 @@ import pytest
 
 from intelligence import sector_health as sh
 
+@pytest.fixture(autouse=True)
+def stable_source_generation(monkeypatch):
+    monkeypatch.setattr(sh, "get_financial_generation", lambda conn: "a" * 32)
+
+
 # ─────────────────────────────────────────────────────────────────
 # Mock engine helpers
 # ─────────────────────────────────────────────────────────────────
@@ -126,8 +131,8 @@ def test_compute_sector_health_full_data_returns_0_to_100():
     for k, v in result["components"].items():
         assert 0.0 <= v <= 1.0, f"{k} out of range: {v}"
     assert isinstance(result["narrative"], str) and len(result["narrative"]) > 0
-    # trend defaults to stable when there's no prior snapshot
-    assert result["trend_30d"] == "stable"
+    # No qualified prior observation means trend unavailable.
+    assert result["trend_30d"] is None
     # Full-data scenario should be clearly above neutral (50)
     assert result["score"] > 55.0
 
@@ -248,6 +253,7 @@ def test_snapshot_all_sectors_explicit_snapshot_date_used_for_upsert(monkeypatch
         sh, "compute_sector_health",
         lambda _engine, name: {
             "score": 60.0, "trend_30d": 0.0, "components": {"stub": True},
+            "sec_generation": "a" * 32,
         },
     )
 
@@ -263,11 +269,15 @@ def test_snapshot_all_sectors_explicit_snapshot_date_used_for_upsert(monkeypatch
         def execute(self, stmt):
             compiled = stmt.compile()
             captured_dates.append(dict(compiled.params)["d"])
-            return MagicMock()
+            result = MagicMock()
+            result.rowcount = 1
+            return result
 
     class _FakeEngine:
         def begin(self):
             return _FakeConn()
+
+        connect = begin
 
     forced_date = date(2026, 1, 5)
     out = sh.snapshot_all_sectors(_FakeEngine(), snapshot_date=forced_date)
@@ -289,6 +299,7 @@ def test_snapshot_all_sectors_counts_upsert_failures(monkeypatch):
         sh, "compute_sector_health",
         lambda _engine, name: {
             "score": 60.0, "trend_30d": 0.0, "components": {"stub": True},
+            "sec_generation": "a" * 32,
         },
     )
 
@@ -304,6 +315,8 @@ def test_snapshot_all_sectors_counts_upsert_failures(monkeypatch):
 def test_endpoint_does_not_cache_unavailable(monkeypatch):
 
     from api.routers import sector_health as router_mod
+
+    monkeypatch.setattr("utils.financial_cache.get_financial_generation", lambda conn: "a" * 32)
 
     router_mod._CACHE.clear()
     monkeypatch.setattr(
@@ -362,7 +375,7 @@ def test_trend_from_snapshots_improving_and_deteriorating():
     engine, conn = _make_router_engine(no_prior)
     with engine.connect() as c:
         trend = sh._trend_from_snapshots(c, "Technology", latest_score=55.0)
-    assert trend == "stable"
+    assert trend is None
 
 
 def test_narrative_template_mentions_score_and_trend_and_levers():
@@ -386,6 +399,8 @@ def test_endpoint_shape_and_unknown_sector(monkeypatch):
     from fastapi import HTTPException
 
     from api.routers import sector_health as router_mod
+
+    monkeypatch.setattr("utils.financial_cache.get_financial_generation", lambda conn: "a" * 32)
 
     # Avoid the real DB engine and the TTL cache keeping stale values
     # across the two assertions below.
