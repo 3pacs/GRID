@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime
@@ -58,8 +59,13 @@ def _utc(day, hm, second=0):
     return datetime.fromisoformat(f"{day}T{hm}:{second:02d}").replace(tzinfo=NY).astimezone(UTC).isoformat()
 
 
-def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None):
-    """``backstop``: {(day, hm): (bar, "HH:MM" New York time it was first seen that day)}; None = no such table."""
+MATCHING_TERMS = "match"
+
+
+def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None, terms=MATCHING_TERMS):
+    """``backstop``: {(day, hm): (bar, "HH:MM" New York time it was first seen that day)}; None = no such table.
+    ``terms``: the lost-minute terms the recorder wrote per day. Default: these terms, every day. None = no such
+    table. A dict {day: [terms text, ...]} overrides the days it names."""
     con = sqlite3.connect(path)
     con.execute("create table bars_1m_live (symbol text, ts_utc text, src text, day text, o real, h real, "
                 "l real, c real, v integer, primary key (symbol, ts_utc))")
@@ -67,6 +73,14 @@ def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None):
         for hm, b in session.items():
             con.execute("insert into bars_1m_live values ('SPY', ?, ?, ?, ?, ?, ?, ?, ?)",
                         (_utc(day, hm), src_of(day, hm), day, *b))
+    if terms is not None:
+        con.execute("create table factory_gap_terms (day text, sha256 text, terms text, first_recorded_at text, "
+                    "primary key (day, sha256))")
+        override = {} if terms == MATCHING_TERMS else terms
+        for day in bars:
+            for text in override.get(day, [flp.LIVE_RULE_TERMS_JSON]):
+                con.execute("insert into factory_gap_terms values (?, ?, ?, ?)",
+                            (day, hashlib.sha256(text.encode()).hexdigest(), text, _utc(day, "09:30")))
     if backstop is not None:
         con.execute("create table factory_backstop_bars (symbol text, ts_utc text, day text, source text, o real, "
                     "h real, l real, c real, v integer, fetch_started_at text, first_seen_at text, "
@@ -252,16 +266,90 @@ def test_research_keeps_the_strict_rule():
     assert flp.live_signal_reasons(bars, "2026-11-04", "15:00") == []
 
 
-def test_a_feature_with_no_value_on_either_side_by_definition_agrees(run):
-    """F1_shift30 at 10:00 needs the bar 30 minutes earlier, which is before the open. It blocked the feature in version 1."""
-    doc = run(_days(), _days(), decisions=("10:00", "15:00"))
+def test_a_value_that_does_not_exist_by_definition_is_not_applicable_and_never_a_match(run):
+    """F1_shift30 at 10:00 needs the bar 30 minutes earlier, which is before the open."""
+    assert flp.structurally_undefined("F1_shift30", "10:00") and not flp.structurally_undefined("F1_shift30", "10:30")
+    assert not any(flp.structurally_undefined(f, "10:00") for f in ("F1", "F10", "F11"))
 
-    assert doc["live_ready"] == sorted(mf.FEATURES)
-    shift = doc["comparison"]["features"]["F1_shift30"]
-    assert shift["matched_sessions"] == 6 and shift["values_compared"] == 6            # the 10:00 rows have no value
-    live = _days()
-    del live["2026-11-05"]["09:59"]                        # a value on one side only is still a disagreement
-    assert "F1_shift30" in run(_days(), live, decisions=("10:00", "15:00"))["research_only"]
+    only_1000 = run(_days(), _days(), decisions=("10:00",))
+
+    shift = only_1000["comparison"]["features"]["F1_shift30"]
+    assert only_1000["live_ready"] == ["F1", "F10", "F11"]                 # identical recordings, and still:
+    assert shift["status"] == "research_only" and shift["matched_sessions"] == 0
+    assert shift["reasons"] == ["no_applicable_decision_time", "insufficient_matched_sessions"]
+    assert shift["values_compared"] == 0 and shift["values_matched"] == 0 and shift["values_required"] == 0
+    assert shift["applicable_decision_times"] == []
+    rows = [r for r in only_1000["comparison"]["value_rows"] if r["feature"] == "F1_shift30"]
+    assert rows and all(r["applicable"] is False and r["matched"] is None for r in rows)
+
+    both = run(_days(), _days(), decisions=("10:00", "15:00"))
+
+    shift = both["comparison"]["features"]["F1_shift30"]
+    assert both["live_ready"] == sorted(mf.FEATURES)
+    assert shift["matched_sessions"] == 6 and shift["applicable_decision_times"] == ["15:00"]
+    assert shift["values_required"] == 7 and shift["values_matched"] == 6      # the first session has no prior
+    f1 = both["comparison"]["features"]["F1"]
+    assert f1["values_required"] == 14 and f1["values_matched"] == 12          # both decision times, every session
+
+
+def test_two_missing_values_on_an_applicable_row_are_a_failure_not_an_agreement(run):
+    flat = _days()
+    flat["2026-11-05"] = {hm: (710.0, 710.0, 710.0, 710.0, 1000) for hm in FULL}   # no range: F10 has no value
+
+    doc = run(flat, flat)
+
+    f10 = doc["comparison"]["features"]["F10"]
+    assert f10["status"] == "research_only" and f10["eligible_rows_with_no_value"] == 1
+    assert f10["matched_sessions"] == 5 and f10["values_matched"] == 5 and f10["values_required"] == 7
+    row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F10" and r["day"] == "2026-11-05")
+    assert row["research"] is None and row["live"] is None and row["both_eligible"] and row["matched"] is False
+    assert "F1" in doc["live_ready"]
+
+
+def test_the_terms_text_and_its_sha256_are_the_pinned_ones():
+    """The same text and digest are pinned in gex-signals' tests (factory_slots.GAP_TERMS). Change both or neither."""
+    assert flp.LIVE_RULE_TERMS_JSON == (
+        '{"backstop_clock":"first_seen_at <= decision time","backstop_fields":["h","l"],"backstop_settle_s":30,'
+        '"backstop_source":"yahoo-1m","feature_reads":{"F1":null,"F10":"todays_range","F11":"prior_range",'
+        '"F1_shift30":"bar_30_minutes_before"},"gap_max":2,"prior_last_bar":"15:59","terms":"panel-factory-gaps/1"}')
+    assert flp.LIVE_RULE_TERMS_SHA256 == "31e017f78c4d676ce6e405b1beb708cde9fbc370448a4a6c923b3e39db4b50d9"
+
+
+def test_no_session_counts_unless_the_recorder_recorded_these_exact_terms_that_day(run):
+    without = run(_days(), _days(), terms=None)                       # a recording made before the rule shipped
+
+    assert without["live_ready"] == [] and without["live_rule"]["terms_table"] is False
+    f1 = without["comparison"]["features"]["F1"]
+    assert f1["reasons"] == [flp.RULE_NOT_RECORDED, "insufficient_matched_sessions"]
+    assert f1["values_compared"] == 6 and f1["values_out_of_tolerance"] == 0 and f1["values_matched"] == 0
+    assert without["comparison"]["sessions_not_recorded_under_the_rule"] == SESSIONS
+
+    other = flp.LIVE_RULE_TERMS_JSON.replace('"gap_max":2', '"gap_max":3')
+    cases = {
+        "other terms": [other],
+        "two sets of terms in one session": [flp.LIVE_RULE_TERMS_JSON, other],
+        "no row that day": [],
+    }
+    for what, texts in cases.items():
+        doc = run(_days(), _days(), terms={"2026-11-06": texts})
+        assert doc["live_ready"] == [], what
+        assert doc["comparison"]["sessions_not_recorded_under_the_rule"] == ["2026-11-06"], what
+        assert doc["comparison"]["features"]["F1"]["matched_sessions"] == 5, what
+    assert run(_days(), _days())["live_rule"]["terms_recorded"]["2026-11-06"] == [flp.LIVE_RULE_TERMS_SHA256]
+
+
+def test_a_terms_row_whose_text_is_not_its_own_digest_does_not_count(tmp_path):
+    db = _live_db(tmp_path / "l.db", _days())
+    con = sqlite3.connect(db)
+    con.execute("update factory_gap_terms set terms = ? where day = '2026-11-06'", ('{"gap_max":99}',))
+    con.commit()
+    con.close()
+
+    days = flp.load_rule_terms(db, SESSIONS[0], SESSIONS[-1])
+
+    assert days["2026-11-06"] == [f"corrupt:{flp.LIVE_RULE_TERMS_SHA256}"]
+    assert not flp.recorded_under_the_rule(days, "2026-11-06") and flp.recorded_under_the_rule(days, "2026-11-05")
+    assert not flp.recorded_under_the_rule(None, "2026-11-05")
 
 
 def test_a_value_outside_tolerance_is_counted_and_blocks_the_feature(run):
