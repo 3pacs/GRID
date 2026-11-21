@@ -32,6 +32,10 @@ def _hash(n: int) -> str:
 
 
 LOOK_1 = json.dumps({"verdict": "PASS", "n": 100}, sort_keys=True)
+# gex-signals' panel_trials columns (panel.py), without its NOT NULL clauses so a test can write a short row.
+TRIALS_DDL = ("CREATE TABLE panel_trials (seq INTEGER PRIMARY KEY AUTOINCREMENT, trial_id TEXT, kind TEXT, name TEXT, "
+              "registered_at TEXT, hypothesis TEXT, metric TEXT, horizon_min INTEGER, min_n INTEGER, alpha REAL, family TEXT, "
+              "family_k INTEGER, in_sample_sessions TEXT, params TEXT, prev_hash TEXT, row_hash TEXT NOT NULL)")
 OTHER_FACTORY_TABLES = [t for t in dsr.FACTORY_TABLES if t != "factory_looks"]
 
 
@@ -40,8 +44,7 @@ def _db(path, trials=(("T-1", "panel-rules-b"), ("T-PF-01", "panel-factory"), ("
     """A signals.db as gex-signals makes it: the trial chain and the factory tables. ``looks=None`` is a database from
     before the factory (none of its tables). ``tables`` names the other factory tables to create beside the looks."""
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE panel_trials (seq INTEGER PRIMARY KEY AUTOINCREMENT, trial_id TEXT, family TEXT, "
-                 "registered_at TEXT, params TEXT, prev_hash TEXT, row_hash TEXT NOT NULL)")
+    conn.execute(TRIALS_DDL)
     previous = None
     for i, (trial, family) in enumerate(trials, start=1):
         conn.execute("INSERT INTO panel_trials (trial_id, family, registered_at, params, prev_hash, row_hash) "
@@ -79,6 +82,11 @@ def test_the_head_the_families_the_slots_and_the_looks_are_read(tmp_path):
     assert p["links_checked"] is True and p["row_hashes_recomputed"] is False   # says what was not checked
     assert p["proof"] == "row_links_only" and "row links only" in read.scope["proof"]
     assert p["row_hashes"] == [_hash(1), _hash(2), _hash(3)] and p["factory_looks_table"] == "present"
+    assert [t["trial_id"] for t in p["trials"]] == ["T-1", "T-PF-01", "T-PF-02"] and set(p["trials"][0]) == set(dsr.TRIAL_KEPT)
+    assert p["trial_content_columns"] == list(dsr.TRIAL_CONTENT_COLUMNS) and "row_hash" not in dsr.TRIAL_CONTENT_COLUMNS
+    slot = p["factory_slots"][0]
+    assert slot["params"] == "{}" and slot["content_sha256"] == p["trials"][1]["content_sha256"] and len(slot["content_sha256"]) == 64
+    assert len({t["content_sha256"] for t in p["trials"]}) == 3
     assert read.scope["database"] == "signals.db"
 
 
@@ -228,6 +236,42 @@ def test_a_removed_or_altered_look_is_unknown_while_every_trial_hash_is_unchange
     assert log.verify(full=True)["ok"]
 
 
+@pytest.mark.parametrize("change", [
+    "UPDATE panel_trials SET registered_at = '2020-01-01T00:00:00+00:00' WHERE trial_id = 'T-PF-01'",
+    "UPDATE panel_trials SET params = '{\"k\":999}' WHERE trial_id = 'T-PF-01'",
+    "UPDATE panel_trials SET hypothesis = 'another claim' WHERE trial_id = 'T-1'",
+    "UPDATE panel_trials SET family = 'panel-rules-b' WHERE trial_id = 'T-PF-02'",
+    "UPDATE panel_trials SET min_n = 5 WHERE trial_id = 'T-PF-01'",
+])
+def test_a_registration_changed_under_unchanged_row_hashes_is_unknown_not_an_extension(tmp_path, change):
+    """Codex on 0bdeba34: a changed registration time or params, with every row_hash and prev_hash kept, still read
+    as extends_last_receipt."""
+    log, second = _two_receipts(tmp_path, [change])
+
+    assert second["status"] == "unknown"
+    assert "a registration the last receipt read has changed under an unchanged row hash" in second["reason"]
+    kept = log.last_payload("panel_trials")
+    assert kept["row_hashes"] == [_hash(1), _hash(2), _hash(3)] and kept["factory_slots"][0]["params"] == "{}"
+    assert kept["factory_slots"][0]["registered_at"] == "2026-12-02T22:00:00+00:00"       # what was registered is still on the record
+
+
+def test_the_trial_table_must_hold_every_registration_column(tmp_path):
+    db = tmp_path / "short.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE panel_trials (seq INTEGER PRIMARY KEY, trial_id TEXT, family TEXT, registered_at TEXT, "
+                 "params TEXT, prev_hash TEXT, row_hash TEXT NOT NULL)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(dsr.SourceUnavailable, match="lacks registration columns: kind, name, hypothesis"):
+        _read(db)
+    wider = _db(tmp_path / "wider.db")
+    conn = sqlite3.connect(wider)
+    conn.execute("ALTER TABLE panel_trials ADD COLUMN added_by_a_later_generation TEXT DEFAULT 'x'")
+    conn.commit()
+    conn.close()
+    assert _read(wider).payload["trials"] == _read(_db(tmp_path / "plain.db")).payload["trials"]    # a new column moves no digest
+
+
 def test_an_added_look_and_an_added_trial_extend_the_last_receipt(tmp_path):
     log, second = _two_receipts(tmp_path, [
         "INSERT INTO factory_looks VALUES ('T-PF-02', '2027-04-01T21:10:00+00:00', '2027-04-01', '{\"n\": 100, \"verdict\": \"FAIL\"}')",
@@ -257,25 +301,31 @@ def test_a_last_payload_that_is_not_the_bytes_its_hash_names_is_unknown(tmp_path
 
 def test_history_is_append_only_for_trials_and_for_looks():
     look = {"trial_id": "T", "looked_at": "t", "through_day": "d", "result": "{}", "result_sha256": "s"}
-    a = {"row_hashes": ["1", "2"], "factory_looks_table": "present", "factory_looks": [look]}
+    trial = lambda n: {"seq": n, "trial_id": f"T{n}", "family": "f", "registered_at": "r", "row_hash": str(n), "content_sha256": f"c{n}"}
+    a = {"row_hashes": ["1", "2"], "trials": [trial(1), trial(2)], "factory_looks_table": "present", "factory_looks": [look]}
     assert dsr.panel_history_break(None, a) is None and dsr.panel_history_break(a, a) is None
-    more = {**a, "row_hashes": ["1", "2", "3"], "factory_looks": [look, {**look, "trial_id": "U"}]}
+    more = {**a, "row_hashes": ["1", "2", "3"], "trials": [trial(1), trial(2), trial(3)], "factory_looks": [look, {**look, "trial_id": "U"}]}
     assert dsr.panel_history_break(a, more) is None
+    for key, value in (("content_sha256", "other"), ("registered_at", "earlier"), ("family", "g"), ("trial_id", "X")):
+        assert "changed under an unchanged row hash" in dsr.panel_history_break(a, {**a, "trials": [trial(1), {**trial(2), key: value}]})
+    assert "contents cannot be compared" in dsr.panel_history_break({k: v for k, v in a.items() if k != "trials"}, a)   # the payload of 0bdeba34
+    assert "contents cannot be compared" in dsr.panel_history_break(a, {**a, "trials": [trial(1)]})
     assert "is gone" in dsr.panel_history_break(a, {**a, "factory_looks": []})
     assert "has changed" in dsr.panel_history_break(a, {**a, "factory_looks": [{**look, "result_sha256": "x"}]})
     assert "has changed" in dsr.panel_history_break(a, {**a, "factory_looks": [{**look, "result": "{ }"}]})
     assert "are gone" in dsr.panel_history_break(a, {**a, "factory_looks_table": "absent", "factory_looks": None})
     assert "cannot be compared" in dsr.panel_history_break({"row_hashes": ["1", "2"]}, a)        # an older payload shape
-    before = {"row_hashes": ["1"], "factory_looks_table": "absent", "factory_looks": None}
+    before = {"row_hashes": ["1"], "trials": [trial(1)], "factory_looks_table": "absent", "factory_looks": None}
     assert dsr.panel_history_break(before, a) is None                                            # the factory arrived since
 
 
 def test_chain_extension_is_a_prefix_relation():
-    a = {"row_hashes": ["1", "2"], "factory_looks_table": "absent", "factory_looks": None}
+    t = lambda h: {"seq": 0, "trial_id": h, "family": "f", "registered_at": "r", "row_hash": h, "content_sha256": h}
+    a = {"row_hashes": ["1", "2"], "trials": [t("1"), t("2")], "factory_looks_table": "absent", "factory_looks": None}
     assert dsr.panel_chain_extends(None, a) and dsr.panel_chain_extends(a, a)
-    assert dsr.panel_chain_extends(a, {**a, "row_hashes": ["1", "2", "3"]})
-    assert not dsr.panel_chain_extends(a, {**a, "row_hashes": ["1", "9", "3"]})    # a row replaced
-    assert not dsr.panel_chain_extends(a, {**a, "row_hashes": ["1"]})              # a row removed
+    assert dsr.panel_chain_extends(a, {**a, "row_hashes": ["1", "2", "3"], "trials": [t("1"), t("2"), t("3")]})
+    assert not dsr.panel_chain_extends(a, {**a, "row_hashes": ["1", "9", "3"], "trials": [t("1"), t("9"), t("3")]})    # a row replaced
+    assert not dsr.panel_chain_extends(a, {**a, "row_hashes": ["1"], "trials": [t("1")]})                              # a row removed
     assert not dsr.panel_chain_extends(a, {"head": "x"})                      # a payload without the hashes
 
 

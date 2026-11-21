@@ -99,6 +99,12 @@ only where the chain stood.
   tables that has gone away. `continuity` in the payload says which check was made
   (`first_read`, `extends_last_receipt`, or `not_checked` when the source was asked without
   a log to compare with).
+- **Registrations are bound by content, not only by hash.** The payload keeps a digest of
+  every registration row's contents (`trials`: the registration columns named in
+  `TRIAL_CONTENT_COLUMNS`, canonical JSON, sha256) and each factory slot's exact parameter
+  text. The next receipt must find every one unchanged; a registration whose time,
+  parameters or any other registration column was changed under an unchanged row hash is
+  `unknown`. What a row held before any receipt first read it is not known.
 - **The look itself is in the payload**: its exact stored text beside the text's sha256, so
   a consumer recomputes the digest and reads the look's own verdict and numbers from the
   receipt, not from an export.

@@ -139,6 +139,11 @@ PANEL_FACTORY_FAMILY = "panel-factory"
 RECEIPT_V2 = 2
 V2_SOURCES = frozenset({"panel_trials"})
 FACTORY_TABLES = ("factory_feature_values", "factory_fires", "factory_outcomes", "factory_looks")
+# What a registration row is, in gex-signals' panel_trials: every column but the row's own hash. A row's content
+# digest is taken over exactly these, so a column a later generation adds does not move it.
+TRIAL_CONTENT_COLUMNS = ("seq", "trial_id", "kind", "name", "registered_at", "hypothesis", "metric", "horizon_min", "min_n",
+                         "alpha", "family", "family_k", "in_sample_sessions", "params", "prev_hash")
+TRIAL_KEPT = ("seq", "trial_id", "family", "registered_at", "row_hash", "content_sha256")
 
 
 class ReceiptError(RuntimeError):
@@ -362,7 +367,9 @@ def panel_history_break(previous: Mapping[str, Any] | None, current: Mapping[str
 
     Two histories are append-only in the live trial ledger, and both are held to that:
 
-    * the trial chain: every row hash the earlier receipt read is still there, in the same order, at the start;
+    * the trial chain: every row hash the earlier receipt read is still there, in the same order, at the start,
+      and so is every registration row's content: its time, family, parameters and every other registration
+      column, by digest. A row whose hash is unchanged and whose contents are not is a rewritten registration;
     * the stored looks: every look the earlier receipt read is still there with the same time, last day and the
       same exact text. A look may be added. One that is gone or changed is a rewritten record, even when the
       trial chain is untouched.
@@ -376,6 +383,12 @@ def panel_history_break(previous: Mapping[str, Any] | None, current: Mapping[str
         return "the last receipt's trial chain cannot be compared with this read"
     if now[:len(before)] != before:
         return "the live trial ledger no longer starts with the rows the last receipt read"
+    was_trials, trials = previous.get("trials"), current.get("trials")
+    if not (isinstance(was_trials, list) and isinstance(trials, list)) or len(was_trials) != len(before) or len(trials) != len(now):
+        return "the last receipt's registration contents cannot be compared with this read"
+    for old, new in zip(was_trials, trials):
+        if not (isinstance(old, dict) and isinstance(new, dict)) or any(old.get(k) != new.get(k) for k in TRIAL_KEPT):
+            return "a registration the last receipt read has changed under an unchanged row hash"
     was, held = previous.get("factory_looks_table"), previous.get("factory_looks")
     if was not in ("present", "absent") or (was == "present") != isinstance(held, list):
         return "the last receipt's looks cannot be compared with this read"
@@ -427,14 +440,24 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
     incomplete generation and is unknown. A look must belong to a registered
     ``panel-factory`` slot.
 
-    What is proved, and it is limited (``proof: row_links_only``): each row's
-    ``prev_hash`` is the row before it. A row's hash is not recomputed from its
-    fields; that recipe lives in gex-signals (``panel.verify_trials``) and is
-    not copied into GRID.
+    What is proved about the hashes, and it is limited (``proof:
+    row_links_only``): each row's ``prev_hash`` is the row before it. A row's
+    hash is not recomputed from its fields; that recipe lives in gex-signals
+    (``panel.verify_trials``) and is not copied into GRID. So the hashes alone
+    do not show a registration was left alone. What does: the payload keeps a
+    digest of every registration row's contents (``trials``: the columns in
+    ``TRIAL_CONTENT_COLUMNS``, canonical JSON, sha256), and for each factory
+    slot its exact parameter text. The next receipt must find every one of
+    them unchanged. A registration whose time or parameters were changed under
+    an unchanged row hash is unknown, not an extension. The limit that remains
+    is the first reading: what a row held before any receipt read it is not
+    known.
 
     Unknown, never a guessed head, when: no database is named; the file or
     table cannot be read; a row does not link to the one before it; some but
-    not all factory tables exist; a look names no registered factory slot; the
+    not all factory tables exist; the trial table lacks a registration column;
+    a registration the last receipt read has changed; a look names no
+    registered factory slot; the
     chain no longer starts with the rows the last receipt read; a look the
     last receipt read is gone or changed; or the last receipt's payload cannot
     be read back as the bytes its hash names.
@@ -451,10 +474,9 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             raise SourceUnavailable(f"the live trial ledger could not be opened ({type(exc).__name__})") from None
         try:
             conn.execute("BEGIN")
-            trials = conn.execute(
-                "SELECT seq, trial_id, family, registered_at, prev_hash, row_hash "
-                "FROM panel_trials ORDER BY seq"
-            ).fetchall()
+            cursor = conn.execute("SELECT * FROM panel_trials ORDER BY seq")
+            columns = [d[0] for d in cursor.description]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             there = [name for name in FACTORY_TABLES if name in tables]
             if there and len(there) != len(FACTORY_TABLES):
@@ -468,25 +490,39 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             raise SourceUnavailable(f"the live trial ledger could not be read ({type(exc).__name__})") from None
         finally:
             conn.close()
+        lacking = [c for c in (*TRIAL_CONTENT_COLUMNS, "row_hash") if c not in columns]
+        if lacking:
+            raise SourceUnavailable(f"the live trial ledger lacks registration columns: {', '.join(lacking)}")
         previous_hash = None
         families: dict[str, int] = {}
-        for seq, _trial, family, _registered, prev_hash, row_hash in trials:
-            if prev_hash != previous_hash or not (isinstance(row_hash, str) and len(row_hash) == 64):
+        trials = []
+        for row in rows:
+            seq, family, row_hash = row["seq"], row["family"], row["row_hash"]
+            if row["prev_hash"] != previous_hash or not (isinstance(row_hash, str) and len(row_hash) == 64):
                 raise SourceUnavailable(f"the live trial ledger's hash links are broken at row {seq}")
             previous_hash = row_hash
             families[family or "none"] = families.get(family or "none", 0) + 1
+            try:
+                content = sha256_hex(canonical({c: row[c] for c in TRIAL_CONTENT_COLUMNS}))
+            except (TypeError, ValueError):
+                raise SourceUnavailable(f"registration row {seq} holds a value that cannot be put on the record") from None
+            trials.append({"seq": seq, "trial_id": row["trial_id"], "family": family, "registered_at": row["registered_at"],
+                           "row_hash": row_hash, "content_sha256": content, "params": row["params"]})
         payload = {
             "store": "panel_trials",
             "rows": len(trials),
             "head": previous_hash,
-            "row_hashes": [t[5] for t in trials],
+            "row_hashes": [t["row_hash"] for t in trials],
             "proof": "row_links_only",
             "links_checked": True,
             "row_hashes_recomputed": False,
+            "trial_content_columns": list(TRIAL_CONTENT_COLUMNS),
+            "trials": [{k: t[k] for k in TRIAL_KEPT} for t in trials],
             "families": dict(sorted(families.items())),
             "factory_slots": [
-                {"trial_id": t[1], "registered_at": t[3], "row_hash": t[5]}
-                for t in trials if t[2] == PANEL_FACTORY_FAMILY
+                {"trial_id": t["trial_id"], "registered_at": t["registered_at"], "row_hash": t["row_hash"],
+                 "content_sha256": t["content_sha256"], "params": t["params"]}
+                for t in trials if t["family"] == PANEL_FACTORY_FAMILY
             ],
             "factory_looks_table": "present" if has_looks else "absent",
             "factory_looks": None if looks is None else [
@@ -505,7 +541,7 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             raise SourceUnavailable(broken)
         payload["continuity"] = ("not_checked" if previous is None else
                                  "first_read" if earlier is None else "extends_last_receipt")
-        return SourceRead(payload=payload, rows=len(trials),
+        return SourceRead(payload=payload, rows=len(rows),
                           scope={"database": Path(db).name, "snapshot": "one read-only transaction",
                                  "state": "as read; not limited to the session close",
                                  "proof": "row links only; row hashes are recomputed only by gex-signals",
