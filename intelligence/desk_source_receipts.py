@@ -357,16 +357,46 @@ def sleuth_leads_source(engine: Any, lookback_days: int = LEAD_LOOKBACK_DAYS) ->
     return read
 
 
-def panel_chain_extends(previous: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
-    """True when ``current``'s trial chain is ``previous``'s chain with rows added at the end, or nothing changed.
+def panel_history_break(previous: Mapping[str, Any] | None, current: Mapping[str, Any]) -> str | None:
+    """Why ``current`` is not ``previous`` with history only added; None when it is, or when there is no ``previous``.
 
-    The head of the live trial ledger moves when a trial is registered. That is a verified relationship only when
-    every row hash the earlier receipt read is still there, in the same order, at the start of the chain.
+    Two histories are append-only in the live trial ledger, and both are held to that:
+
+    * the trial chain: every row hash the earlier receipt read is still there, in the same order, at the start;
+    * the stored looks: every look the earlier receipt read is still there with the same time, last day and the
+      same exact text. A look may be added. One that is gone or changed is a rewritten record, even when the
+      trial chain is untouched.
+
+    The factory tables cannot go away either. A ``previous`` that cannot be compared is a break, not a pass.
     """
     if previous is None:
-        return True
+        return None
     before, now = previous.get("row_hashes"), current.get("row_hashes")
-    return isinstance(before, list) and isinstance(now, list) and now[:len(before)] == before
+    if not (isinstance(before, list) and isinstance(now, list)):
+        return "the last receipt's trial chain cannot be compared with this read"
+    if now[:len(before)] != before:
+        return "the live trial ledger no longer starts with the rows the last receipt read"
+    was, held = previous.get("factory_looks_table"), previous.get("factory_looks")
+    if was not in ("present", "absent") or (was == "present") != isinstance(held, list):
+        return "the last receipt's looks cannot be compared with this read"
+    if was == "absent":
+        return None
+    if current.get("factory_looks_table") != "present" or not isinstance(current.get("factory_looks"), list):
+        return "the factory tables the last receipt read are gone"
+    kept = {look.get("trial_id"): look for look in current["factory_looks"] if isinstance(look, dict)}
+    for look in held:
+        same = kept.get(look.get("trial_id")) if isinstance(look, dict) else None
+        if same is None:
+            return "a stored look the last receipt read is gone"
+        if any(same.get(k) != look.get(k) for k in ("looked_at", "through_day", "result_sha256")) \
+                or ("result" in look and same.get("result") != look["result"]):
+            return "a stored look the last receipt read has changed"
+    return None
+
+
+def panel_chain_extends(previous: Mapping[str, Any] | None, current: Mapping[str, Any]) -> bool:
+    """True when ``current`` is ``previous`` with trials and looks only added (see :func:`panel_history_break`)."""
+    return panel_history_break(previous, current) is None
 
 
 def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any] | None] | None = None) -> Source:
@@ -376,11 +406,26 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
 
     One read-only transaction. The payload holds the chain's head, row count
     and every row hash, the trials per family, each ``panel-factory`` slot's
-    registration hash, and for each stored look its time, last day and the
-    sha256 of its exact stored text. That digest and the registration hash are
-    what a slot's exported verdict is joined on; the head is only where the
-    chain stood. With the nightly hub post this puts all of it off-host every
-    session.
+    registration hash, and for each stored look its time, last day, its exact
+    stored text and that text's sha256. The digest and the registration hash
+    are what a slot's exported verdict is joined on, and the text is the look
+    itself, so a consumer can recompute the digest and read the look's own
+    numbers from the receipt. The head is only where the chain stood. With the
+    nightly hub post this puts all of it off-host every session.
+
+    History is append-only and is checked against the last receipt that read
+    this source (``previous``: the last recorded payload, whose bytes are
+    checked against the hash that names them): the trial rows it read are
+    still the start of the chain, and every look it read is still there,
+    unchanged. A removed or altered look is unknown even when no trial row
+    moved. ``continuity`` says which check was made: ``first_read``,
+    ``extends_last_receipt``, or ``not_checked`` when no earlier payload was
+    supplied to compare with.
+
+    The factory tables come as a set (``FACTORY_TABLES``). A database has all
+    of them or none; any other layout, the looks table alone included, is an
+    incomplete generation and is unknown. A look must belong to a registered
+    ``panel-factory`` slot.
 
     What is proved, and it is limited (``proof: row_links_only``): each row's
     ``prev_hash`` is the row before it. A row's hash is not recomputed from its
@@ -388,10 +433,11 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
     not copied into GRID.
 
     Unknown, never a guessed head, when: no database is named; the file or
-    table cannot be read; a row does not link to the one before it; some
-    factory tables exist and ``factory_looks`` does not (a generation that has
-    the tables has all of them); or the chain no longer starts with the rows
-    the last receipt read (``previous``: the last recorded payload).
+    table cannot be read; a row does not link to the one before it; some but
+    not all factory tables exist; a look names no registered factory slot; the
+    chain no longer starts with the rows the last receipt read; a look the
+    last receipt read is gone or changed; or the last receipt's payload cannot
+    be read back as the bytes its hash names.
     A database from before the factory tables has ``factory_looks_table:
     "absent"``, which is not the same as a table that is there and empty.
     """
@@ -410,7 +456,11 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
                 "FROM panel_trials ORDER BY seq"
             ).fetchall()
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            has_looks = "factory_looks" in tables
+            there = [name for name in FACTORY_TABLES if name in tables]
+            if there and len(there) != len(FACTORY_TABLES):
+                lacking = ", ".join(name for name in FACTORY_TABLES if name not in tables)
+                raise SourceUnavailable(f"an incomplete generation: some factory tables are there and these are not: {lacking}")
+            has_looks = bool(there)
             looks = conn.execute(
                 "SELECT trial_id, looked_at, through_day, result FROM factory_looks ORDER BY trial_id"
             ).fetchall() if has_looks else None
@@ -418,8 +468,6 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             raise SourceUnavailable(f"the live trial ledger could not be read ({type(exc).__name__})") from None
         finally:
             conn.close()
-        if not has_looks and any(name in tables for name in FACTORY_TABLES):
-            raise SourceUnavailable("some factory tables are there and factory_looks is not: an incomplete generation")
         previous_hash = None
         families: dict[str, int] = {}
         for seq, _trial, family, _registered, prev_hash, row_hash in trials:
@@ -443,16 +491,26 @@ def panel_trials_source(db: Path | None, previous: Callable[[], Mapping[str, Any
             "factory_looks_table": "present" if has_looks else "absent",
             "factory_looks": None if looks is None else [
                 {"trial_id": row[0], "looked_at": row[1], "through_day": row[2],
-                 "result_sha256": sha256_hex(str(row[3]).encode("utf-8"))}
+                 "result": row[3], "result_sha256": sha256_hex(str(row[3]).encode("utf-8"))}
                 for row in looks
             ],
         }
-        if previous is not None and not panel_chain_extends(previous(), payload):
-            raise SourceUnavailable("the live trial ledger no longer starts with the rows the last receipt read")
+        slots = {slot["trial_id"] for slot in payload["factory_slots"]}
+        for look in payload["factory_looks"] or []:
+            if look["trial_id"] not in slots or not isinstance(look["result"], str):
+                raise SourceUnavailable("a stored look names no registered factory slot, or its text is not text")
+        earlier = previous() if previous is not None else None
+        broken = panel_history_break(earlier, payload)
+        if broken:
+            raise SourceUnavailable(broken)
+        payload["continuity"] = ("not_checked" if previous is None else
+                                 "first_read" if earlier is None else "extends_last_receipt")
         return SourceRead(payload=payload, rows=len(trials),
                           scope={"database": Path(db).name, "snapshot": "one read-only transaction",
                                  "state": "as read; not limited to the session close",
-                                 "proof": "row links only; row hashes are recomputed only by gex-signals"})
+                                 "proof": "row links only; row hashes are recomputed only by gex-signals",
+                                 "history": "trial rows and stored looks only added since the last receipt"
+                                            if payload["continuity"] == "extends_last_receipt" else payload["continuity"]})
 
     return read
 

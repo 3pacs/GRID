@@ -91,12 +91,21 @@ only where the chain stood.
 - **The proof is limited** (`proof: row_links_only`): each row links to the one before it.
   A row's hash is not recomputed from its fields; that recipe is gex-signals'
   (`panel.verify_trials`) and is not copied here.
-- **The head may only move forward.** The source compares the chain with the last payload
-  the log holds: the rows read then must still be the first rows now. If not, the source is
-  `unknown` for the session, with that reason.
-- **A missing table is not an empty one.** `factory_looks_table` is `absent` on a database
-  from before the factory tables and `present` otherwise; some factory tables without
-  `factory_looks` is `unknown` (an incomplete generation).
+- **History may only be added to, for trials and for looks.** The source compares what it
+  reads with the last payload the log holds (read back as the bytes its hash names). The
+  trial rows read then must still be the first rows now, and every stored look read then
+  must still be there with the same time, last day and exact text. A look that is gone or
+  changed is `unknown` for the session even when no trial row moved; so is a set of factory
+  tables that has gone away. `continuity` in the payload says which check was made
+  (`first_read`, `extends_last_receipt`, or `not_checked` when the source was asked without
+  a log to compare with).
+- **The look itself is in the payload**: its exact stored text beside the text's sha256, so
+  a consumer recomputes the digest and reads the look's own verdict and numbers from the
+  receipt, not from an export.
+- **The factory tables come as a set.** `factory_looks_table` is `absent` on a database
+  from before the factory and `present` when all of `FACTORY_TABLES` are there. Any other
+  layout, the looks table alone included, is `unknown` (an incomplete generation). A look
+  must belong to a registered `panel-factory` slot.
 - It is a nightly reading: a change made and undone between two closes is not seen.
 
 ## Rules
