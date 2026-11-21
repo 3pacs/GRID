@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
+from store.options_iv import public_wing_fields
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_pit_store
@@ -396,7 +397,8 @@ def get_ticker_analysis(
                 text(
                     "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                     "total_oi, total_volume, spot_price, iv_atm, "
-                    "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration "
+                    "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration, "
+                    "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata "
                     "FROM options_daily_signals "
                     "WHERE ticker = :ticker "
                     "ORDER BY signal_date DESC LIMIT 5"
@@ -408,7 +410,8 @@ def get_ticker_analysis(
                     "date": str(r[0]),
                     "put_call_ratio": r[1], "max_pain": r[2], "iv_skew": r[3],
                     "total_oi": r[4], "total_volume": r[5], "spot_price": r[6],
-                    "iv_atm": r[7], "iv_25d_put": r[8], "iv_25d_call": r[9],
+                    "iv_atm": r[7],
+                    **public_wing_fields(r[12], r[13], r[14], r[8], r[9]),
                     "term_slope": r[10], "oi_concentration": r[11],
                 }
                 for r in opts

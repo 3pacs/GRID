@@ -1660,17 +1660,17 @@ def main(argv=None) -> int:
     p.add_argument("--witness-head", required=True, help="that head's sha256")
     p.add_argument("--witness-where", required=True, help="where the off-host copy is (for example the Desk receipt hub post)")
     w = sub.add_parser("verdicts-witness", help="mark live verdicts as witnessed by a Desk receipt that read the same stored look")
-    w.add_argument("--payload", required=True, type=Path, help="the receipt's panel_trials payload file")
-    w.add_argument("--receipt-session", required=True)
-    w.add_argument("--receipt-head", required=True, help="the receipt record's head sha256, as posted off-host")
+    w.add_argument("--receipts", required=True, type=Path, help="the Desk receipt log's folder; it is opened and verified")
+    w.add_argument("--external-anchors", required=True, type=Path,
+                   help="the anchor copy held outside the log (the vault's witness file); a person checks it is that copy")
+    w.add_argument("--session", required=True, help="the receipt's session, YYYY-MM-DD")
     w.add_argument("--ledger", required=True, type=Path)
     w.add_argument("--anchor", required=True, type=Path)
     a = ap.parse_args(argv)
     if a.cmd == "verdicts-witness":
         try:
             ledger = lse.Ledger(a.ledger, anchor=a.anchor)
-            appended = lse.witness_factory_verdicts(ledger, a.payload.read_bytes(), receipt_session=a.receipt_session,
-                                                    receipt_head_sha256=a.receipt_head)
+            appended = lse.witness_factory_verdicts(ledger, a.receipts, a.external_anchors, a.session)
         except (ValueError, OSError) as e:
             print(json.dumps({"ok": False, "refused": str(e)}))
             return 2

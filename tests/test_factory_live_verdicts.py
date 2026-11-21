@@ -11,20 +11,39 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, timedelta
 
 import pytest
 
+from analysis import desk_receipt_witness as drw
 from analysis import ledger_steered_exploration as lse
 from analysis import module_factory as mf
+from intelligence import desk_source_receipts as dsr
 
 T1, T2, T3 = "a" * 64, "b" * 64, "c" * 64
 RECORDED = "2026-11-20T02:00:00+00:00"
 LOOKED = "2027-03-01T21:10:00+00:00"
 RULE = {"feature": "F1", "op": ">=", "k": 1.5, "side": "long", "decision": "15:00", "horizon": "close"}
 FAMILY, FEATURE = "SPY|change|15:00+close", "F1|z>=1.5|long"
-LOOK = {T1: "1" * 64, T2: "2" * 64, T3: "3" * 64}     # digest of each slot's stored look
 ROW = {T1: "e" * 64, T2: "d" * 64, T3: "f" * 64}      # each slot's registration hash
 SLOT = {T1: "T-PF-01", T2: "T-PF-02", T3: "T-PF-03"}
+
+
+def look_text(trial, verdict="PASS", n=100, mean=0.0456, lower=0.0123, resolved=104):
+    """A slot's stored look exactly as gex-signals writes it (factory_slots.look: sorted-key JSON)."""
+    if verdict == "UNDERPOWERED":
+        res = {"trial_id": SLOT[trial], "verdict": verdict, "resolved_fires": n, "min_n": 100, "sessions": 500,
+               "note": "the deadline passed before min_n resolved fires: closed, counted, not passed"}
+    else:
+        res = {"trial_id": SLOT[trial], "verdict": verdict, "n": n, "mean_net": mean, "lower_bound": lower, "alpha_per_test": 0.005,
+               "b": 10000, "seed": 20261119, "hit_rate": 0.58, "resolved_fires": resolved}
+    res.update(version="panel-factory/2", looked_at=LOOKED, through_day="2027-03-01", row_hash=ROW[trial])
+    return json.dumps(res, sort_keys=True)
+
+
+# The three looks the tests import: slot 1 passed, slot 2 failed, slot 3 closed underpowered.
+LOOK_TEXT = {T1: look_text(T1), T2: look_text(T2, "FAIL", lower=-0.01), T3: look_text(T3, "UNDERPOWERED", n=41)}
+LOOK = {t: hashlib.sha256(text.encode()).hexdigest() for t, text in LOOK_TEXT.items()}     # digest of each stored look
 
 # One export line exactly as gex-signals writes it. The same text and hash are pinned in gex
 # (signals-20261023/tests/test_factory_export.py): if either side changes the format, its pin fails.
@@ -87,20 +106,45 @@ def export(tmp_path, *lines, name="verdicts.jsonl"):
     return path
 
 
-def receipt_payload(*trials, **change):
-    """The panel_trials payload of a nightly Desk receipt that read these slots and their stored looks."""
-    body = {"store": "panel_trials", "rows": 21, "head": "d" * 64,
+def receipt_body(*trials, continuity="extends_last_receipt", texts=None, **change):
+    """The panel_trials payload of a nightly Desk receipt that read these slots and retains their stored looks."""
+    texts = texts or LOOK_TEXT
+    body = {"store": "panel_trials", "rows": 21, "head": "d" * 64, "continuity": continuity, "factory_looks_table": "present",
             "factory_slots": [{"trial_id": SLOT[t], "registered_at": "2026-12-01T22:00:00+00:00", "row_hash": ROW[t]} for t in trials],
-            "factory_looks": [{"trial_id": SLOT[t], "looked_at": LOOKED, "through_day": "2027-03-01", "result_sha256": LOOK[t]}
-                              for t in trials]}
+            "factory_looks": [{"trial_id": SLOT[t], "looked_at": LOOKED, "through_day": "2027-03-01", "result": texts[t],
+                               "result_sha256": hashlib.sha256(texts[t].encode()).hexdigest()} for t in trials]}
     for key, value in change.items():
         for item in body["factory_looks"]:
             item[key] = value
-    return lse.canonical(body)
+    return body
 
 
-def witness(ledger, payload, session="2027-03-01", at="2027-03-02T00:20:05+00:00"):
-    return lse.witness_factory_verdicts(ledger, payload, receipt_session=session, receipt_head_sha256="7" * 64, witnessed_at=at)
+def receipts(tmp_path, body, session="2027-03-01", name="desk", export_anchors=True):
+    """A real receipt log whose ``session`` receipt read ``body`` as its panel_trials source, and the anchor copy
+    exported to a vault folder. Returns (log folder, the anchor copy's path, the log)."""
+    log = dsr.ReceiptLog(tmp_path / name / "log")
+    read_at = dsr.session_cutoff(date.fromisoformat(session)) + timedelta(minutes=20)
+    out = log.record({"panel_trials": lambda _cutoff: dsr.SourceRead(payload=body, rows=body.get("rows", 0), scope={"database": "signals.db"})},
+                     now=lambda: read_at)
+    assert out["written"] and out["record"]["sources"]["panel_trials"]["status"] == "read"
+    vault = tmp_path / name / "vault"
+    if export_anchors:
+        log.export_anchors(vault)
+    return log.root, vault / dsr.WITNESS_DIR / dsr.ANCHOR_NAME, log
+
+
+def witness(ledger, tmp_path, body, session="2027-03-01", at="2027-03-02T00:20:05+00:00", name="desk"):
+    """Build that night's receipt log and present it. The witness's own clock reads ``at``."""
+    root, anchors, _log = receipts(tmp_path, body, session, name)
+    return witness_from(ledger, root, anchors, session, at)
+
+
+def witness_from(ledger, root, anchors, session="2027-03-01", at="2027-03-02T00:20:05+00:00"):
+    clock, lse.now_iso = lse.now_iso, lambda: at
+    try:
+        return lse.witness_factory_verdicts(ledger, root, anchors, session)
+    finally:
+        lse.now_iso = clock
 
 
 def test_the_export_line_is_the_pinned_contract():
@@ -194,51 +238,153 @@ def test_another_writer_between_load_and_append_stops_the_batch_and_a_rerun_comp
 # --- the witness ------------------------------------------------------------------------------
 
 
-def test_a_receipt_that_read_the_same_stored_look_witnesses_the_verdict(tmp_path):
+def test_a_receipt_that_retains_the_same_stored_look_witnesses_the_verdict(tmp_path):
     lp, ap = paths(tmp_path)
     ledger = lse.Ledger.create_factory(lp, ledger_id="factory-test", anchor=ap)
     sha = run(ledger)
     lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha), line(sha, T2, "FAIL", lower=-0.01)),
                                 recorded_at="2027-03-01T22:00:00+00:00")
-    payload = receipt_payload(T1)          # that night's receipt read slot 1's look; slot 2's is not in it
-    assert witness(ledger, payload) == 1 and witness(ledger, payload) == 0   # once
+    root, anchors, log = receipts(tmp_path, receipt_body(T1))      # that night's receipt read slot 1's look; slot 2's is not in it
+    assert witness_from(ledger, root, anchors) == 1 and witness_from(ledger, root, anchors) == 0   # once
 
     live = lse.summarize(lse.Ledger(lp, anchor=ap))["live"]
     assert (live["witnessed"], live["unwitnessed"]) == (1, 1)
     first, second = live["verdicts"]
-    assert first["witness"] == {"status": "witnessed", "receipt_session": "2027-03-01", "receipt_head_sha256": "7" * 64,
+    receipt_line = list(dsr.raw_lines(log.path))[1]
+    assert first["witness"] == {"status": "witnessed", "receipt_session": "2027-03-01",
+                                "receipt_head_sha256": hashlib.sha256(receipt_line).hexdigest(),
                                 "witnessed_at": "2027-03-02T00:20:05+00:00"}
     assert first["arrived_at"] == "2027-03-01T22:00:00+00:00"   # when the verdict arrived and when its witness did stay separate
     assert second["witness"] == {"status": "unwitnessed"}
     record = lse.Ledger(lp, anchor=ap).of_kind(lse.FACTORY_FORWARD_WITNESS)[0]
-    assert record["receipt"]["payload_sha256"] == hashlib.sha256(payload).hexdigest() and record["look_sha256"] == LOOK[T1]
+    stored = json.loads(receipt_line)["sources"]["panel_trials"]
+    assert record["receipt"]["payload_sha256"] == stored["payload_sha256"] and record["look_sha256"] == LOOK[T1]
+    assert record["receipt"]["read_finished_at"] == stored["read_finished_at"] and record["receipt"]["log_records"] == 2
+    assert record["receipt"]["external_anchor"] == {"file": dsr.ANCHOR_NAME, "sha256": hashlib.sha256(anchors.read_bytes()).hexdigest(),
+                                                    "witnessed_records": 2}
+    assert record["look_recomputed"] is True
+    assert record["checked"] == {"by_code": list(drw.BY_CODE), "by_a_person": drw.BY_A_PERSON}   # says what it did not check
+    assert "held off-host" in record["checked"]["by_a_person"]
 
 
-@pytest.mark.parametrize("change", [
-    {"result_sha256": "4" * 64},                 # the receipt read another stored look
-    {"looked_at": "2027-03-01T21:11:00+00:00"},  # another look time
-    {"through_day": "2027-02-28"},               # another last day
-])
-def test_a_receipt_with_another_look_witnesses_nothing(tmp_path, change):
+def test_a_receipt_that_retains_another_look_witnesses_nothing(tmp_path):
     ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
     lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
-    assert witness(ledger, receipt_payload(T1, **change)) == 0
-    body = json.loads(receipt_payload(T1))
-    body["factory_slots"][0]["row_hash"] = "5" * 64          # the same look under another registration row
-    assert witness(ledger, lse.canonical(body)) == 0
-    assert witness(ledger, lse.canonical({"store": "panel_trials", "factory_slots": [], "factory_looks": None})) == 0   # no look table
+    other = {T1: look_text(T1, mean=0.0457)}                                  # the receipt retains another stored look
+    cases = {
+        "another look": receipt_body(T1, texts=other),
+        "another look time": receipt_body(T1, looked_at="2027-03-01T21:11:00+00:00"),
+        "another last day": receipt_body(T1, through_day="2027-02-28"),
+        "no looks table": {**receipt_body(T1), "factory_looks_table": "absent", "factory_looks": None},
+    }
+    under_another_row = receipt_body(T1)
+    under_another_row["factory_slots"][0]["row_hash"] = "5" * 64              # the same look under another registration row
+    cases["another registration row"] = under_another_row
+    for name, body in cases.items():
+        assert witness(ledger, tmp_path, body, name=name.replace(" ", "-")) == 0, name
     assert lse.summarize(ledger)["live"]["unwitnessed"] == 1 and ledger.of_kind(lse.FACTORY_FORWARD_WITNESS) == []
+
+
+def test_a_receipt_identity_that_is_only_asserted_is_refused(tmp_path):
+    """Codex on 30778727: a fabricated receipt id and a non-date session reached the append boundary."""
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
+    root, anchors, log = receipts(tmp_path, receipt_body(T1))
+    fake = tmp_path / "fake-anchors.jsonl"
+    fake.write_bytes(lse.canonical({"records": 2, "head_sha256": "7" * 64, "prev_anchor_sha256": None}) + b"\n")
+    refusals = [
+        ((tmp_path / "no-such-log", anchors, "2027-03-01"), "no receipt log"),
+        ((root, anchors, "the night of the look"), "an ISO date"),
+        ((root, anchors, "2027-03-02"), "no receipt for session"),
+        ((root, log.anchor_path, "2027-03-01"), "other than the receipt log's own anchors"),   # local-head-only evidence
+        ((root, tmp_path / "missing-anchors.jsonl", "2027-03-01"), "other than the receipt log's own anchors"),
+        ((root, fake, "2027-03-01"), "does not verify"),                                       # a head nobody recorded
+    ]
+    for args, message in refusals:
+        with pytest.raises(drw.WitnessError, match=message):
+            witness_from(ledger, *args)
+    assert ledger.of_kind(lse.FACTORY_FORWARD_WITNESS) == []
+
+
+def test_a_receipt_the_outside_copy_does_not_cover_is_refused(tmp_path):
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
+    root, anchors, log = receipts(tmp_path, {"store": "panel_trials", "continuity": "first_read", "factory_slots": [],
+                                             "factory_looks_table": "present", "factory_looks": []}, session="2027-02-26")
+    read_at = dsr.session_cutoff(date(2027, 3, 1)) + timedelta(minutes=20)
+    body = receipt_body(T1)
+    log.record({"panel_trials": lambda _c: dsr.SourceRead(payload=body, rows=21, scope={})}, now=lambda: read_at)
+    with pytest.raises(drw.WitnessError, match="not under the anchor copy presented"):
+        witness_from(ledger, root, anchors)                 # the copy was exported before this receipt existed
+    log.export_anchors(anchors.parents[3])
+    assert witness_from(ledger, root, anchors) == 1
+
+
+def test_a_payload_that_is_not_the_bytes_the_receipt_names_is_refused(tmp_path):
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
+    root, anchors, log = receipts(tmp_path, receipt_body(T1))
+    stored = next(log.payload_dir.iterdir())
+    stored.chmod(0o600)
+    stored.write_bytes(stored.read_bytes().replace(b"0.0456", b"0.0999"))
+    with pytest.raises(drw.WitnessError, match="does not verify"):
+        witness_from(ledger, root, anchors)
+    assert ledger.of_kind(lse.FACTORY_FORWARD_WITNESS) == []
+
+
+@pytest.mark.parametrize("field, over", [
+    ("mean_net", {"mean": 0.0999}),
+    ("lower_bound", {"lower": 0.02}),
+    ("resolved_fires", {"resolved_fires": 150}),
+    ("verdict", {"verdict": "FAIL", "lower": -0.01}),
+])
+def test_a_verdict_that_names_the_retained_look_and_differs_from_it_is_refused(tmp_path, field, over):
+    """One altered field in the import, with the true look digest: the import is not that look."""
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger), **over)))     # the ledger cannot know yet
+    with pytest.raises(ValueError, match="differs from the look the receipt retains") as refused:
+        witness(ledger, tmp_path, receipt_body(T1))
+    assert field in str(refused.value)
+    assert ledger.of_kind(lse.FACTORY_FORWARD_WITNESS) == [] and lse.summarize(ledger)["live"]["unwitnessed"] == 1
+
+
+def test_an_underpowered_look_and_a_failed_one_are_compared_field_by_field_too(tmp_path):
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    sha = run(ledger, trials=((T1, True), (T2, True), (T3, True)))
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha, T2, "FAIL", lower=-0.01), underpowered(sha)))
+    assert witness(ledger, tmp_path, receipt_body(T2, T3)) == 2
+    assert lse.factory_look_differs(json.loads(LOOK_TEXT[T3]), {**next(iter(lse.factory_forward_index(ledger).values())), "n": 1}) != []
+
+
+def test_a_look_text_that_is_not_its_digest_or_a_payload_read_without_history_is_refused(tmp_path):
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
+    with pytest.raises(ValueError, match="not the text its digest names"):
+        witness(ledger, tmp_path, receipt_body(T1, result=look_text(T1, mean=0.0999)), name="edited-text")
+    with pytest.raises(ValueError, match="not read against the receipt log's own history"):
+        witness(ledger, tmp_path, receipt_body(T1, continuity="not_checked"), name="no-history")
+    old_shape = receipt_body(T1)
+    del old_shape["continuity"]
+    for look in old_shape["factory_looks"]:
+        del look["result"]                                   # the payload of 778d8bb1: a digest and no text
+    with pytest.raises(ValueError, match="not read against the receipt log's own history"):
+        witness(ledger, tmp_path, old_shape, name="old-shape")
 
 
 def test_a_witness_can_arrive_long_after_the_verdict_and_never_before_it(tmp_path):
     ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
     sha = run(ledger)
-    assert witness(ledger, receipt_payload(T1)) == 0          # nothing imported yet: nothing to witness
+    assert witness(ledger, tmp_path, receipt_body(T1), name="early") == 0          # nothing imported yet: nothing to witness
     lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha)), recorded_at="2027-03-01T22:00:00+00:00")
     assert lse.summarize(ledger)["live"]["verdicts"][0]["witness"] == {"status": "unwitnessed"}
-    assert witness(ledger, receipt_payload(T1), session="2027-03-09", at="2027-03-10T00:20:00+00:00") == 1   # a late receipt
+    assert witness(ledger, tmp_path, receipt_body(T1), session="2027-03-09", at="2027-03-10T00:20:00+00:00", name="late") == 1
     entry = lse.summarize(ledger)["live"]["verdicts"][0]
     assert entry["witness"]["receipt_session"] == "2027-03-09" and entry["arrived_at"] < entry["witness"]["witnessed_at"]
+    root, anchors, _log = receipts(tmp_path, receipt_body(T1), name="clock")
+    other = lse.Ledger.create_factory(None, ledger_id="factory-test-2")
+    lse.ingest_factory_verdicts(other, export(tmp_path, line(run(other)), name="v2.jsonl"))
+    with pytest.raises(ValueError, match="before its receipt was read"):
+        witness_from(other, root, anchors, at="2027-03-01T21:00:00+00:00")       # the witness's clock is behind the receipt's
 
 
 @pytest.mark.parametrize("change, message", [
@@ -246,14 +392,23 @@ def test_a_witness_can_arrive_long_after_the_verdict_and_never_before_it(tmp_pat
     ({"look_sha256": "4" * 64}, "another stored look"),
     ({"trial_id": T2}, "another verdict"),
     ({"receipt": {"session": "2027-03-01", "head_sha256": "x", "payload_sha256": "7" * 64}}, "names its receipt"),
+    ({"receipt": {"session": "2027-03-01", "head_sha256": "7" * 64, "payload_sha256": "8" * 64}}, "anchor copy that covered"),   # the old shape
+    ({"receipt": {"session": "the night of the look"}}, "names its receipt"),
+    ({"receipt": {"session": "the night of the look", "head_sha256": "7" * 64, "payload_sha256": "8" * 64}}, "ISO date"),
+    ({"checked": {"by_code": ["everything"], "by_a_person": ""}}, "what a person must check"),
     ({"witnessed_at": "2027-03-02T00:20:05"}, "timezone"),
+    ({"witnessed_at": "2027-03-01T21:00:00+00:00"}, "before its receipt was read"),
 ])
 def test_the_ledger_refuses_a_witness_that_is_not_for_this_verdict(tmp_path, change, message):
     ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
     lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
     forward_sha = next(iter(lse.factory_forward_index(ledger)))
     good = {"kind": lse.FACTORY_FORWARD_WITNESS, "run_id": "r1", "trial_id": T1, "forward_sha256": forward_sha,
-            "look_sha256": LOOK[T1], "receipt": {"session": "2027-03-01", "head_sha256": "7" * 64, "payload_sha256": "8" * 64},
+            "look_sha256": LOOK[T1],
+            "receipt": {"session": "2027-03-01", "head_sha256": "7" * 64, "payload_sha256": "8" * 64, "log_records": 2,
+                        "read_finished_at": "2027-03-01T21:20:00+00:00",
+                        "external_anchor": {"file": "a.jsonl", "sha256": "6" * 64, "witnessed_records": 2}},
+            "checked": {"by_code": list(drw.BY_CODE), "by_a_person": drw.BY_A_PERSON},
             "witnessed_at": "2027-03-02T00:20:05+00:00", "recorded_at": "2027-03-02T00:20:06+00:00"}
     with pytest.raises(ValueError, match=message):
         ledger._append({**good, **change})
@@ -271,7 +426,7 @@ def test_a_verdict_does_not_close_or_block_an_open_run(tmp_path):
     sha = run(ledger)
     lse.record_factory_declared(ledger, run_id="r2", run_file={"run_id": "r2"}, data_manifest_sha256="0" * 64, trial_count=1)
     assert lse.ingest_factory_verdicts(ledger, export(tmp_path, line(sha))) == 1
-    assert witness(ledger, receipt_payload(T1)) == 1
+    assert witness(ledger, tmp_path, receipt_body(T1)) == 1
     reloaded = lse.Ledger(lp, anchor=ap)
     assert lse.summarize(reloaded)["run_open"] == "r2"
     lse.record_factory_result(reloaded, trials=[trial(T2)], max_t={}, report_sha256="3" * 64, frozen_sha256="4" * 64)
@@ -343,7 +498,7 @@ def test_only_a_factory_ledger_takes_live_verdicts(tmp_path):
     with pytest.raises(ValueError, match="factory ledger"):
         lse.ingest_factory_verdicts(s11, export(tmp_path, line("9" * 64)))
     with pytest.raises(ValueError, match="factory ledger"):
-        lse.witness_factory_verdicts(s11, receipt_payload(T1), receipt_session="2027-03-01", receipt_head_sha256="7" * 64)
+        lse.witness_factory_verdicts(s11, tmp_path / "log", tmp_path / "anchors.jsonl", "2027-03-01")
     with pytest.raises(ValueError, match="refuses"):
         s11._append({"kind": lse.FACTORY_FORWARD, "recorded_at": RECORDED})
 
@@ -368,7 +523,7 @@ def test_reverification_applies_the_rules_not_only_the_hash_chain(tmp_path, monk
         lse.Ledger(lp, anchor=ap)
 
 
-def test_the_commands_import_once_witness_once_and_report_a_refusal(tmp_path, capsys):
+def test_the_commands_import_once_witness_once_and_report_a_refusal(tmp_path, capsys, monkeypatch):
     lp, ap = paths(tmp_path)
     sha = run(lse.Ledger.create_factory(lp, ledger_id="factory-test", anchor=ap))
     args = ["verdicts", "--ledger", str(lp), "--anchor", str(ap), "--file"]
@@ -382,10 +537,17 @@ def test_the_commands_import_once_witness_once_and_report_a_refusal(tmp_path, ca
     assert "lower bound" in json.loads(capsys.readouterr().out)["refused"]
     assert mf.main(args + [str(tmp_path / "missing.jsonl")]) == 2
     capsys.readouterr()
-    payload = tmp_path / "payload.json"
-    payload.write_bytes(receipt_payload(T1))
-    seen = ["verdicts-witness", "--ledger", str(lp), "--anchor", str(ap), "--payload", str(payload),
-            "--receipt-session", "2027-03-01", "--receipt-head", "7" * 64]
+    root, anchors, log = receipts(tmp_path, receipt_body(T1))
+    seen = ["verdicts-witness", "--ledger", str(lp), "--anchor", str(ap), "--receipts", str(root),
+            "--external-anchors", str(anchors), "--session", "2027-03-01"]
+    assert mf.main(seen[:-1] + ["2027-03-02"]) == 2                               # no receipt for that session
+    assert "no receipt for session" in json.loads(capsys.readouterr().out)["refused"]
+    assert mf.main(seen[:-3] + [str(log.anchor_path), "--session", "2027-03-01"]) == 2    # the log's own anchors are not a witness
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        mf.main(seen + ["--receipt-head", "7" * 64])                              # a head is not something the caller supplies
+    capsys.readouterr()
+    monkeypatch.setattr(lse, "now_iso", lambda: "2027-03-02T00:20:05+00:00")
     assert mf.main(seen) == 0
     assert json.loads(capsys.readouterr().out) | {"head_sha256": None} == {
         "ok": True, "witnessed_now": 1, "witnessed": 1, "unwitnessed": 0, "head_sha256": None}

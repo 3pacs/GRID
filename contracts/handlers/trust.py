@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from loguru import logger as log
 from sqlalchemy import text
 
+from contracts.financial_signal_guard import is_financial_divergence_signal
+
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
@@ -115,6 +117,11 @@ def on_signal_fired(
     Best-effort: ``register_signal`` already swallows DB failures and
     returns ``None`` on unrecognised source types.
     """
+    # Block delayed/replayed financial events before imports or side effects.
+    # Producer suppression alone cannot stop already-created contracts.
+    if is_financial_divergence_signal(evt):
+        return
+
     from intelligence.trust_scorer import register_signal
 
     source = getattr(evt, "source", "") or ""

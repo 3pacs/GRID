@@ -221,3 +221,5 @@ Read the matching file only when the task calls for it — keep this core file l
 | Registering or running edge-search looks (trading-rule hypotheses judged once on fresh data, Hermes edge stream) | `docs/reference/EDGE_STREAM.md` (+ `alpha_research/edge_stream/`) |
 | Testing a module-factory candidate on older data before a live slot (the one registered pre-screen look) | `docs/reference/FACTORY_PRESCREEN.md` (+ `analysis/factory_prescreen.py`, the `factory_prescreen_outcome` record in `analysis/ledger_steered_exploration.py`) |
 | Conditioning on market state, regime, events or news; standardizing a variable against its own baseline | `docs/reference/MARKET_STATE_RECORD.md` (+ `intelligence/regime/market_state.py`, `baseline.py`) |
+| Checking whether a trading rule was already tested (desk / GEX results, verdicts, data spent) | `docs/reference/RESEARCH_FINDINGS.md` (+ `analysis/research_findings.py`, `GET /api/v1/research/findings`) |
+| Proving what the Research Desk's sources said when read after a session close (leads, declared tests, factory ledger) | `docs/reference/DESK_SOURCE_RECEIPTS.md` (+ `intelligence/desk_source_receipts.py`) |

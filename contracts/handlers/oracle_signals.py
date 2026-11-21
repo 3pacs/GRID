@@ -20,6 +20,9 @@ projection:
     chokepoint_crossing         → source_type = 'chokepoint_crossing'      (SYNTH-C / SYNTH-34)
     contagion_trigger           → source_type = 'news_trigger'             (SYNTH-C / SYNTH-38)
 
+Financial-divergence events are quarantined before projection, including
+historical/delayed delivery, until downstream invalidation is qualified.
+
 Any other ``signal_type`` is silently ignored so adding new detectors
 later does not accidentally double-fire here.
 """
@@ -31,6 +34,8 @@ from typing import TYPE_CHECKING
 
 from loguru import logger as log
 from sqlalchemy import text
+
+from contracts.financial_signal_guard import is_financial_divergence_signal
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
@@ -61,6 +66,11 @@ def on_signal_fired(evt: "SignalFired", *, engine: "Engine") -> None:
     flowing (consumer failures bubble up as dead-letter rows via the
     dispatcher).
     """
+    # Block delayed/replayed financial events before imports or side effects.
+    # Producer suppression alone cannot stop already-created contracts.
+    if is_financial_divergence_signal(evt):
+        return
+
     signal_type = getattr(evt, "signal_type", None)
     if signal_type not in _OWNED_SIGNAL_TYPES:
         return

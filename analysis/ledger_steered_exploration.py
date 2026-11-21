@@ -206,11 +206,19 @@ re-import whose substance is unchanged (same look digest, rule, verdict,
 counts, mean, bound, days) adds nothing even if its export time or file
 differ; a changed substance for the same trial is refused as a conflict.
 
-An imported verdict is unwitnessed until a nightly Desk receipt that read the
-same stored look is presented (:func:`witness_factory_verdicts`). The witness
-is its own record, ``factory_forward_witness``, so the time the verdict
-arrived and the time its witness arrived stay separate, and ``summarize()``
-never shows an unwitnessed verdict as witnessed.
+An imported verdict is unwitnessed until a nightly Desk receipt that retains
+the same stored look is verified (:func:`witness_factory_verdicts`). Nothing
+about the receipt is taken from the caller: the receipt log is opened, its
+chain, payload files and anchors are checked, an anchor copy held outside the
+log must cover the receipt, and the ``panel_trials`` payload is read from the
+log. The look's digest is recomputed from the look's exact text in that
+payload, and the imported verdict, n, mean, bound, alpha and resolved-fire
+count must equal the stored look's; an import that names the look and differs
+from it is refused. The witness is its own record, ``factory_forward_witness``,
+so the time the verdict arrived and the time its witness arrived stay
+separate, and ``summarize()`` never shows an unwitnessed verdict as witnessed.
+The record says what code checked and what a person must: that the anchor
+copy presented is the one held off-host.
 
 Older-data pre-screen (owner's decision, 2026-11-20). Before a selected
 candidate takes one of the ten live slots it gets one registered look on
@@ -239,7 +247,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -2395,7 +2403,13 @@ def validate_factory_forward(record: dict, results: dict[str, dict], seen: set[t
 
 
 def validate_factory_forward_witness(record: dict, forward: dict[str, dict], earlier: list[dict]) -> None:
-    """A witness names one live verdict on this ledger and the receipt that read the same stored look. Once."""
+    """A witness names one live verdict on this ledger and the verified receipt that retains the same look. Once.
+
+    The ledger cannot open the receipt log again on a reload, so what it holds to here is the record's own shape:
+    the receipt's session is a date, its head, its payload and the anchor copy are named by sha256, the anchor copy
+    covered the receipt, the witness arrived after the receipt was read, and the record says in words what code
+    checked and what a person must. A record without those is not a witness.
+    """
     verdict = forward.get(record.get("forward_sha256") or "")
     if verdict is None:
         raise ValueError("a witness must name a live verdict on this ledger by its line sha256")
@@ -2405,43 +2419,109 @@ def validate_factory_forward_witness(record: dict, forward: dict[str, dict], ear
     if any(w["forward_sha256"] == record["forward_sha256"] for w in earlier):
         raise ValueError("this verdict already has its witness")
     receipt = record.get("receipt")
-    if not isinstance(receipt, dict) or not isinstance(receipt.get("session"), str) or not receipt["session"] \
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("session"), str) \
             or not _hex64(receipt.get("head_sha256")) or not _hex64(receipt.get("payload_sha256")):
         raise ValueError("a witness names its receipt: session, receipt head sha256 and payload sha256")
-    if not isinstance(record.get("witnessed_at"), str):
-        raise ValueError("a witness carries the time it arrived")
-    stamp(record["witnessed_at"])
+    try:
+        date.fromisoformat(receipt["session"])
+    except ValueError:
+        raise ValueError("a witness names its receipt: the session is an ISO date") from None
+    outside = receipt.get("external_anchor")
+    records = receipt.get("log_records")
+    if not isinstance(outside, dict) or not _hex64(outside.get("sha256")) or not isinstance(records, int) or records < 2 \
+            or not isinstance(outside.get("witnessed_records"), int) or outside["witnessed_records"] < records:
+        raise ValueError("a witness names the anchor copy that covered its receipt (external_anchor: sha256, "
+                         "witnessed_records at or beyond the receipt's place in the log)")
+    checked = record.get("checked")
+    if not isinstance(checked, dict) or not isinstance(checked.get("by_code"), list) or not checked["by_code"] \
+            or not isinstance(checked.get("by_a_person"), str) or len(checked["by_a_person"].strip()) < 20:
+        raise ValueError("a witness says what code checked and what a person must check (checked: by_code, by_a_person)")
+    if not isinstance(record.get("witnessed_at"), str) or not isinstance(receipt.get("read_finished_at"), str):
+        raise ValueError("a witness carries the time it arrived and the time its receipt was read")
+    if stamp(record["witnessed_at"]) < stamp(receipt["read_finished_at"]):
+        raise ValueError("a witness cannot arrive before its receipt was read")
 
 
-def witness_factory_verdicts(ledger: Ledger, payload: bytes, *, receipt_session: str, receipt_head_sha256: str,
-                             witnessed_at: str | None = None) -> int:
-    """Append a witness for every unwitnessed live verdict whose stored look a Desk receipt read.
+def factory_look_differs(stored: dict, verdict: dict) -> list[str]:
+    """The fields in which an imported verdict differs from the look gex-signals stored (its exact text, parsed).
 
-    ``payload``: the bytes of the receipt's ``panel_trials`` payload file. A verdict is witnessed only when the
-    payload holds the same slot registration (trial id and row hash) and the same look: trial id, digest, look
-    time and last day. Anything less leaves the verdict unwitnessed. Returns the number appended.
+    The stored look is the original: its verdict, n, mean, bound, alpha and resolved-fire count are what was
+    decided, for this slot and registration row, at this time. ``sessions`` is counted at export and is not in it.
+    """
+    slot = verdict["slot"]
+    final = FACTORY_VERDICTS.get(stored.get("verdict"))
+    differs = [name for name, ours, theirs in (
+        ("slot_trial_id", slot["trial_id"], stored.get("trial_id")),
+        ("row_hash", slot["row_hash"], stored.get("row_hash")),
+        ("looked_at", verdict["looked_at"], stored.get("looked_at")),
+        ("through_day", verdict["through_day"], stored.get("through_day")),
+        ("verdict", verdict["verdict"], final),
+        ("resolved_fires", verdict["resolved_fires"], stored.get("resolved_fires")),
+    ) if ours != theirs]
+    if stored.get("verdict") == "UNDERPOWERED":
+        expected = (("n", stored.get("resolved_fires")), ("mean_net", None), ("lower_bound", None))
+    else:
+        expected = (("n", stored.get("n")), ("mean_net", stored.get("mean_net")), ("lower_bound", stored.get("lower_bound")),
+                    ("alpha_per_test", stored.get("alpha_per_test")))
+    return differs + [name for name, theirs in expected if verdict.get(name) != theirs]
+
+
+def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anchors: str | Path, session: str) -> int:
+    """Append a witness for every unwitnessed live verdict whose stored look a verified Desk receipt retains.
+
+    Nothing is taken on the caller's word. The receipt log at ``receipts`` is opened and verified against the anchor
+    copy at ``external_anchors`` (:func:`analysis.desk_receipt_witness.verified_receipt`); the ``panel_trials``
+    payload is read from the log, not handed in. A verdict is witnessed only when that payload, read against the
+    log's own history, holds the same slot registration and a look with the same digest, time and last day; the
+    digest is recomputed from the look's exact text in the payload; and the imported verdict, n, mean, bound, alpha
+    and resolved-fire count equal the stored look's. A verdict whose look the receipt does not hold stays
+    unwitnessed. A verdict that names the same look and differs from it is refused, and names the fields.
+    Returns the number appended.
     """
     if not ledger.is_factory:
         raise ValueError("live factory verdicts belong on a factory ledger")
-    body = json.loads(payload)
-    slots = {(x.get("trial_id"), x.get("row_hash")) for x in body.get("factory_slots") or [] if isinstance(x, dict)}
-    looks = {(x.get("trial_id"), x.get("result_sha256"), x.get("looked_at"), x.get("through_day"))
-             for x in body.get("factory_looks") or [] if isinstance(x, dict)}
+    from analysis.desk_receipt_witness import verified_receipt
+
+    receipt = verified_receipt(Path(receipts), Path(external_anchors), session, "panel_trials")
+    body = json.loads(receipt["payload"])
+    if not isinstance(body, dict) or body.get("store") != "panel_trials" \
+            or body.get("continuity") not in ("first_read", "extends_last_receipt"):
+        raise ValueError("that receipt's panel_trials payload was not read against the receipt log's own history")
+    slots = {x.get("trial_id"): x for x in body.get("factory_slots") or [] if isinstance(x, dict)}
+    looks = {x.get("trial_id"): x for x in body.get("factory_looks") or [] if isinstance(x, dict)}
     done = {w["forward_sha256"] for w in ledger.of_kind(FACTORY_FORWARD_WITNESS)}
-    appended = 0
+    pending = []
     for sha, v in factory_forward_index(ledger).items():
         slot = v["slot"]
-        if sha in done or (slot["trial_id"], slot["row_hash"]) not in slots \
-                or (slot["trial_id"], v["look_sha256"], v["looked_at"], v["through_day"]) not in looks:
+        held, look = slots.get(slot["trial_id"]), looks.get(slot["trial_id"])
+        if sha in done or held is None or held.get("row_hash") != slot["row_hash"] or look is None:
             continue
+        text = look.get("result")
+        if not isinstance(text, str) or sha256_bytes(text.encode("utf-8")) != look.get("result_sha256"):
+            raise ValueError(f"the receipt's look for slot {slot['trial_id']} is not the text its digest names")
+        if (look["result_sha256"], look.get("looked_at"), look.get("through_day")) != (
+                v["look_sha256"], v["looked_at"], v["through_day"]):
+            continue   # the receipt retains another look than the one this verdict names: unwitnessed, not witnessed
+        try:
+            stored = json.loads(text)
+        except ValueError:
+            raise ValueError(f"the receipt's look for slot {slot['trial_id']} is not JSON") from None
+        differs = factory_look_differs(stored if isinstance(stored, dict) else {}, v)
+        if differs:
+            raise ValueError(f"the verdict imported for slot {slot['trial_id']} differs from the look the receipt "
+                             f"retains in {differs}: the import is not that look")
+        pending.append((sha, v))
+    at = now_iso()
+    for sha, v in pending:
         ledger._append({
             "kind": FACTORY_FORWARD_WITNESS, "run_id": v["run_id"], "trial_id": v["trial_id"], "forward_sha256": sha,
             "look_sha256": v["look_sha256"],
-            "receipt": {"session": receipt_session, "head_sha256": receipt_head_sha256, "payload_sha256": sha256_bytes(payload)},
-            "witnessed_at": witnessed_at or now_iso(), "recorded_at": now_iso(),
+            "receipt": {k: receipt[k] for k in ("session", "head_sha256", "log_records", "read_finished_at",
+                                                 "payload_sha256", "external_anchor")},
+            "checked": receipt["checked"], "look_recomputed": True,
+            "witnessed_at": at, "recorded_at": at,
         })
-        appended += 1
-    return appended
+    return len(pending)
 
 
 def _prescreen_trial(record: dict, results: dict[str, dict]) -> dict:
