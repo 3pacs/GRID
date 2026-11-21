@@ -172,7 +172,7 @@ class FactoryEvents:
         if doc is None:
             root = root or Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests"
             pins = (pin,) if pin is not None else (pins or (EVENT_PIN,))
-            docs, names = [], []
+            docs, names, pinned = [], [], []
             for name, expected in pins:
                 raw = (Path(root) / name).read_bytes()
                 sha = hashlib.sha256(raw).hexdigest()
@@ -180,9 +180,11 @@ class FactoryEvents:
                     raise ValueError(f"event manifest {name} does not match its pinned sha256")
                 docs.append(json.loads(raw))
                 names.append(f"{name} {sha}")
+                pinned.append(name)
             self.version = f"{EVENT_SCHEMA}: " + ", ".join(names)
         else:
             docs = list(doc) if isinstance(doc, (list, tuple)) else [doc]
+            pinned = None
             self.version = f"{EVENT_SCHEMA}: unpinned document"
         self.parts = []
         for k, d in enumerate(docs):
@@ -205,8 +207,17 @@ class FactoryEvents:
                 if known.utcoffset() is None:
                     raise ValueError("event known_at must carry its offset")
                 by_day.setdefault(e["day"], []).append((e["event"], known if avail is None else max(known, avail)))
+            # Pin order is availability order (review of a92dbbdb): every part after the first becomes available
+            # strictly after every part pinned before it, corrections included. A new part therefore answers
+            # only decisions later than anything already pinned, and no earlier (day, decided) answer can move.
+            prior = [q["available_at"] for q in self.parts if q["available_at"] is not None]
+            if avail is not None and prior and not avail > max(prior):
+                raise ValueError("each part must become available after every part pinned before it")
+            sup = d.get("supersedes") or []
+            if sup and pinned is not None and not set(sup) <= set(pinned[:k]):
+                raise ValueError("a correction may supersede only parts pinned before it")
             self.parts.append({"start": cov["start"], "end": cov["end"], "available_at": avail,
-                               "correction": bool(d.get("supersedes")), "by_day": by_day})
+                               "correction": bool(sup), "by_day": by_day})
         base = [q for q in self.parts if not q["correction"]]
         if not base or self.parts[0]["correction"]:
             raise ValueError("the first part must be a base part")
@@ -219,8 +230,8 @@ class FactoryEvents:
                 continue
             if not (self.start <= q["start"] <= q["end"] <= self.end):
                 raise ValueError("a correction must lie inside the base coverage")
-            under = [b for b in self.parts if b is not q and not b["correction"] and b["start"] <= q["end"] and q["start"] <= b["end"]]
-            if any(b["available_at"] is not None and b["available_at"] >= q["available_at"] for b in under):
+            under = [b for b in self.parts[:self.parts.index(q)] if b["start"] <= q["end"] and q["start"] <= b["end"]]
+            if not under or any(b["available_at"] is not None and b["available_at"] >= q["available_at"] for b in under):
                 raise ValueError("a correction must become available after every part it overlays")
         self.by_day = self._merged()   # the latest answer per day (inspection only; known() is as-of)
 
@@ -289,8 +300,11 @@ def _month_end(day: str) -> str:
 
 def forward_event_end_bound(econ: dict) -> str:
     """The last day an events part derived from ``econ`` may cover."""
-    bls = min(_month_end(max(econ["events"][name])) for name in ("cpi", "nfp"))
-    fomc = max(econ["events"]["fomc"])
+    lists = [econ["events"].get(name) or [] for name in ("cpi", "nfp", "fomc")]
+    if not all(lists):
+        return ""   # a source missing CPI, NFP or FOMC dates supports no forward day at all
+    bls = min(_month_end(max(days)) for days in lists[:2])
+    fomc = max(lists[2])
     return min(bls, (date.fromisoformat(fomc) - timedelta(days=1)).isoformat())
 
 
@@ -330,7 +344,8 @@ def _event_key(e):
 
 def check_forward_events(econ: dict, source_sha256: str, root=None, pins=None) -> list:
     """Differences between each pinned forward part and the same part re-derived from ``econ``: the pinned
-    digest, the coverage, events added or removed, and same-day changes of time_et, known_at or basis.
+    digest, the coverage, a source horizon that no longer reaches the part's end ("horizon"), events added or
+    removed, and same-day changes of time_et, known_at or basis.
     An empty list means every forward part still matches the refreshed source. Pure but for the file reads."""
     root = Path(root or Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests")
     out = []
@@ -342,6 +357,9 @@ def check_forward_events(econ: dict, source_sha256: str, root=None, pins=None) -
         doc = json.loads(raw)
         start, end = doc["coverage"]["start"], doc["coverage"]["end"]
         fresh = derive_events(econ, source_sha256, start, end)
+        bound = forward_event_end_bound(econ)
+        if end > bound:   # the refreshed source no longer lists BLS/FOMC dates through this part's end
+            out.append({"part": name, "event": None, "day": None, "change": "horizon", "old": end, "new": bound})
         if fresh["coverage"] != doc["coverage"]:
             out.append({"part": name, "event": None, "day": None, "change": "coverage", "old": doc["coverage"], "new": fresh["coverage"]})
         if doc.get("available_at") is None:

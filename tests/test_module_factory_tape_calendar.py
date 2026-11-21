@@ -660,3 +660,66 @@ def test_check_forward_events_reports_digest_coverage_and_same_day_changes(tmp_p
     raw = fc.event_manifest_bytes(cov); (tmp_path / "cov.json").write_bytes(raw)
     rows = fc.check_forward_events(src, sha, root=tmp_path, pins=(fc.EVENT_PIN, ("cov.json", hashlib.sha256(raw).hexdigest())))
     assert "coverage" in [r["change"] for r in rows]
+
+
+# ── re-review of #1293 at a92dbbdb (2026-11-21): correction order, contracted source horizon ──
+
+def _fomc_moved(src, day):
+    out = copy.deepcopy(src)
+    out["events"]["fomc"] = sorted([d for d in out["events"]["fomc"] if d != "2026-12-09"] + [day])
+    return out
+
+
+def test_a_later_pinned_correction_cannot_predate_the_one_it_supersedes(tmp_path):
+    research, forward = _forward_parts()
+    src = json.loads((ROOT / fc.EVENT_SOURCE).read_bytes()); sha = forward["derived_from"]["sha256"]
+    c1 = fc.derive_correction(_fomc_moved(src, "2026-12-10"), sha, "2026-12-01", "2026-12-31", "2026-12-01T15:00:00+00:00", [fc.FORWARD_EVENT_PIN[0]])
+    c2 = fc.derive_correction(_fomc_moved(src, "2026-12-11"), sha, "2026-12-01", "2026-12-31", "2026-11-20T15:00:00+00:00", ["c1.json"])
+    decided = datetime(2026, 11, 25, 15, 0, tzinfo=UTC_)
+    three = fc.FactoryEvents(doc=[research, forward, c1])
+    assert three.known("2026-12-09", decided) == {"fomc"}
+    with pytest.raises(ValueError, match="after every part pinned before it"):
+        fc.FactoryEvents(doc=[research, forward, c1, c2])      # Codex's witness: it would turn {"fomc"} into {}
+    # equal availability is refused too, and so is a later base part that predates a pinned correction
+    with pytest.raises(ValueError, match="after every part pinned before it"):
+        fc.FactoryEvents(doc=[research, forward, c1, {**c2, "available_at": c1["available_at"]}])
+    # pinned files: a correction may supersede only parts pinned before it
+    files = {fc.EVENT_PIN[0]: (MANIFESTS / fc.EVENT_PIN[0]).read_bytes(), fc.FORWARD_EVENT_PIN[0]: (MANIFESTS / fc.FORWARD_EVENT_PIN[0]).read_bytes(),
+             "c1.json": fc.event_manifest_bytes(c1),
+             "c3.json": fc.event_manifest_bytes({**c1, "available_at": "2026-12-02T15:00:00+00:00", "supersedes": ["not-pinned.json"]})}
+    for n, raw in files.items():
+        (tmp_path / n).write_bytes(raw)
+    pin = lambda n: (n, hashlib.sha256(files[n]).hexdigest())
+    ok = fc.FactoryEvents(tmp_path, pins=(pin(fc.EVENT_PIN[0]), pin(fc.FORWARD_EVENT_PIN[0]), pin("c1.json")))
+    assert ok.known("2026-12-10", datetime(2026, 12, 10, 15, 0, tzinfo=UTC_)) == {"fomc"}
+    with pytest.raises(ValueError, match="supersede only parts pinned before it"):
+        fc.FactoryEvents(tmp_path, pins=(pin(fc.EVENT_PIN[0]), pin(fc.FORWARD_EVENT_PIN[0]), pin("c1.json"), pin("c3.json")))
+
+
+def test_appending_a_valid_part_never_changes_an_earlier_answer():
+    research, forward = _forward_parts()
+    src = json.loads((ROOT / fc.EVENT_SOURCE).read_bytes()); sha = forward["derived_from"]["sha256"]
+    c1 = fc.derive_correction(_fomc_moved(src, "2026-12-10"), sha, "2026-12-01", "2026-12-31", "2026-12-01T15:00:00+00:00", [fc.FORWARD_EVENT_PIN[0]])
+    c2 = fc.derive_correction(_fomc_moved(src, "2026-12-11"), sha, "2026-12-01", "2026-12-31", "2026-12-05T15:00:00+00:00", ["c1.json"])
+    a, b = fc.FactoryEvents(doc=[research, forward, c1]), fc.FactoryEvents(doc=[research, forward, c1, c2])
+    t = datetime(2026, 11, 13, 5, 0, tzinfo=UTC_)
+    while t < datetime(2026, 12, 5, 15, 0, tzinfo=UTC_):
+        for d in ("2026-12-09", "2026-12-10", "2026-12-11"):
+            assert a.known(d, t) == b.known(d, t), (d, t)
+        t += timedelta(hours=7)
+    assert b.known("2026-12-11", datetime(2026, 12, 11, 15, 0, tzinfo=UTC_)) == {"fomc"}
+
+
+def test_check_reports_a_contracted_source_horizon():
+    src = json.loads((ROOT / fc.EVENT_SOURCE).read_bytes())
+    _, forward = _forward_parts(); sha = forward["derived_from"]["sha256"]
+    if hashlib.sha256((ROOT / fc.EVENT_SOURCE).read_bytes()).hexdigest() != sha:
+        pytest.skip("config/econ_release_dates.json was regenerated")
+    short = copy.deepcopy(src)   # Codex's witness: the refreshed source keeps FOMC 12-09 but nothing later
+    short["events"]["fomc"] = [d for d in short["events"]["fomc"] if d <= "2026-12-09"]
+    assert fc.forward_event_end_bound(short) == "2026-12-08"
+    rows = fc.check_forward_events(short, sha)
+    assert [(r["change"], r["old"], r["new"]) for r in rows if r["change"] == "horizon"] == [("horizon", "2026-12-31", "2026-12-08")]
+    empty = copy.deepcopy(src); empty["events"]["nfp"] = []
+    assert fc.forward_event_end_bound(empty) == ""
+    assert "horizon" in [r["change"] for r in fc.check_forward_events(empty, sha)]
