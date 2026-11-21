@@ -40,11 +40,21 @@ recorded. The constants and reason strings below are the recorder's; a change
 there must be made here too. A signals database without the backstop table
 (recorded before the rule shipped) simply has no fills.
 
-A feature is ``live_ready`` only with at least ``MIN_SESSIONS`` overlapping
-sessions on which both sides were eligible and every value was in tolerance,
-no value out of tolerance on any overlapping session, and no overlapping
-session where the two sides disagreed about that feature's availability.
-Anything else is ``research_only`` with its reasons and the counts behind them.
+A feature is ``live_ready`` only when each of the most recent ``MIN_SESSIONS``
+overlapping sessions is a matched one: at every decision time both sides were
+eligible and the value was in tolerance. So in those sessions no value is out
+of tolerance and the two sides never disagree about that feature's
+availability. Anything else is ``research_only`` with its reasons and the
+counts behind them.
+
+The verdict is taken on the most recent sessions, not on every session in the
+window (version 3). In version 2 one bad session anywhere in the window kept a
+feature ``research_only`` for as long as the window included it, and a window
+that began before the recorder stored the last minute could never pass. Now a
+bad session costs the next ``MIN_SESSIONS`` sessions and no more. The number is
+fixed here, not an argument: a verdict must not depend on a window chosen after
+the fact. The whole-window counts are still reported beside the verdict, so an
+older failure stays visible.
 
 Read-only: both databases are opened ``mode=ro``. Nothing here scores a module
 or registers anything. Five matching sessions are evidence about the source
@@ -73,8 +83,8 @@ from analysis.module_factory import (
 )
 from ingestion.market_calendar import is_market_open, market_close_time
 
-SCHEMA = "factory-live-parity-v2"
-MIN_SESSIONS = 5
+SCHEMA = "factory-live-parity-v3"
+MIN_SESSIONS = 5                  # the verdict: each of the most recent MIN_SESSIONS overlapping sessions matched
 OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
 
@@ -406,7 +416,8 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
     days = sorted(d for d in set(research) & set(live) if close_minute(d) is not None)
     rows = []
     per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0,
-                       "out_of_tolerance": 0, "max_abs_diff": None} for f in FEATURES}
+                       "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None}
+                   for f in FEATURES}
     availability_mismatch = []
     label_rows = []
     for day in days:
@@ -433,6 +444,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                     stat["max_abs_diff"] = diff if stat["max_abs_diff"] is None else max(stat["max_abs_diff"], diff)
                     if not within:
                         stat["out_of_tolerance"] += 1
+                        stat["out_of_tolerance_by_day"][day] += 1
                 if both_eligible and (within or undefined):
                     stat["matched_sessions"].add(day)
                 else:
@@ -456,21 +468,29 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                                    "within_tolerance": None if change_diff is None
                                    else change_diff <= LABEL_TOLERANCE_DOLLARS})
     features = {}
+    recent = days[-MIN_SESSIONS:]            # the sessions the verdict is taken on
     for f in FEATURES:
         stat = per_feature[f]
         matched = sorted(stat["matched_sessions"] - stat["bad_sessions"])
+        recent_matched = [d for d in recent if d in matched]
+        recent_out = sum(stat["out_of_tolerance_by_day"][d] for d in recent)
+        recent_disagreed = sorted({m["day"] for m in availability_mismatch if f in m["features"] and m["day"] in recent})
         reasons = []
-        if len(matched) < MIN_SESSIONS:
+        if len(recent_matched) < MIN_SESSIONS:
             reasons.append("insufficient_matched_sessions")
-        if stat["out_of_tolerance"]:
+        if recent_out:
             reasons.append("value_out_of_tolerance")
-        if any(f in m["features"] for m in availability_mismatch):
+        if recent_disagreed:
             reasons.append("availability_mismatch")
         features[f] = {
             "type": FEATURE_TYPE[f], "tolerance": TOLERANCE[FEATURE_TYPE[f]],
             "live_source_tag": FEATURE_SPECS[f]["live_source"],
             "status": "research_only" if reasons else "live_ready",
             "reasons": reasons,
+            "verdict_on": {"sessions": recent, "matched": len(recent_matched), "required": MIN_SESSIONS,
+                           "values_out_of_tolerance": recent_out, "sessions_with_an_availability_disagreement": recent_disagreed},
+            "whole_window": {"sessions_with_an_availability_disagreement":
+                             len({m["day"] for m in availability_mismatch if f in m["features"]})},
             "matched_sessions": len(matched), "required_sessions": MIN_SESSIONS,
             "overlapping_sessions": len(days),
             "values_compared": stat["compared"], "values_out_of_tolerance": stat["out_of_tolerance"],
@@ -521,7 +541,8 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "research_only": sorted(f for f, s in statuses.items() if s == "research_only"),
         "promotion_allowed": False,
         "note": ("matching sessions are evidence about the source and the implementation, "
-                 "not about any edge; no feature becomes live-ready by back-filling"),
+                 "not about any edge; no feature becomes live-ready by back-filling; the verdict is taken on the "
+                 f"most recent {MIN_SESSIONS} overlapping sessions and the whole-window counts are reported beside it"),
     }
 
 

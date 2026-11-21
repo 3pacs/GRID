@@ -5,6 +5,8 @@
   tolerance and no session where the two sides disagree about availability.
 * A live recording with a missing read bar, or more than two lost minutes, fails:
   values that agree are not parity when live would abstain.
+* Version 3: the verdict is taken on the five most recent overlapping sessions.
+  An older bad session stays in the whole-window counts and no longer blocks.
 * Version 2: the live side is judged by the live recorder's lost-minute rule.
   Up to two lost minutes leave the return features exact; a range feature needs
   each lost minute's backstop bar, first seen at or before the decision time.
@@ -83,11 +85,11 @@ def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None):
 def run(tmp_path):
     calls = []
 
-    def go(research, live, decisions=("15:00",), **kwargs):
+    def go(research, live, decisions=("15:00",), last=SESSIONS[-1], **kwargs):
         calls.append(1)                                   # a test may build more than one pair of databases
         r, lv = tmp_path / f"r{len(calls)}.db", tmp_path / f"l{len(calls)}.db"
         return flp.report(_research_db(r, research), _live_db(lv, live, **kwargs),
-                          first=SESSIONS[0], last=SESSIONS[-1], decisions=list(decisions), horizons=["close"])
+                          first=SESSIONS[0], last=last, decisions=list(decisions), horizons=["close"])
     return go
 
 
@@ -156,7 +158,7 @@ def test_three_lost_morning_minutes_withhold_that_day_and_the_next(run):
     assert doc["live_availability"]["signal_eligible"] == 4
     assert doc["comparison"]["features"]["F1"]["matched_sessions"] == 4
     assert doc["research_only"] == sorted(mf.FEATURES)
-    assert doc["schema"] == "factory-live-parity-v2"
+    assert doc["schema"] == "factory-live-parity-v3"
 
 
 def test_one_lost_minute_keeps_the_return_features_and_withholds_the_range_that_reads_it(run):
@@ -175,7 +177,8 @@ def test_one_lost_minute_keeps_the_return_features_and_withholds_the_range_that_
     assert doc["live_ready"] == ["F1", "F1_shift30"]
     features = doc["comparison"]["features"]
     assert features["F1"]["matched_sessions"] == 6 and features["F1"]["max_abs_diff"] == 0
-    assert features["F10"]["reasons"] == ["availability_mismatch"] and features["F10"]["matched_sessions"] == 5
+    assert features["F10"]["reasons"] == ["insufficient_matched_sessions", "availability_mismatch"]
+    assert features["F10"]["matched_sessions"] == 5 and features["F10"]["verdict_on"]["matched"] == 4
     assert features["F10"]["values_out_of_tolerance"] == 0 and features["F10"]["values_compared"] == 5
     mismatch = {m["day"]: (m["features"], m["live"]) for m in doc["comparison"]["availability_mismatch"]}
     assert mismatch == {"2026-11-04": (["F10"], {"F10": [flp.GAP_UNFILLED]}),
@@ -273,7 +276,8 @@ def test_a_value_outside_tolerance_is_counted_and_blocks_the_feature(run):
 
     f1 = doc["comparison"]["features"]["F1"]
     assert f1["values_out_of_tolerance"] == 1 and f1["matched_sessions"] == 5
-    assert f1["status"] == "research_only" and f1["reasons"] == ["value_out_of_tolerance"]
+    assert f1["status"] == "research_only"
+    assert f1["reasons"] == ["insufficient_matched_sessions", "value_out_of_tolerance"]
     assert f1["max_abs_diff"] > flp.TOLERANCE["return"]
     bad = [r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["within_tolerance"] is False]
     assert [r["day"] for r in bad] == ["2026-11-05"]
@@ -335,3 +339,55 @@ def test_command_writes_the_report_once_and_exits_1_when_not_ready(tmp_path, cap
     assert json.loads(out.read_text())["live_availability"]["rows"]            # the file keeps the detail
     with pytest.raises(FileExistsError):
         flp.main(args)
+
+
+LONGER = SESSIONS + ["2026-11-11", "2026-11-12"]
+
+
+def test_the_verdict_is_taken_on_the_five_most_recent_sessions_and_an_older_failure_stays_on_the_report(run):
+    live = _days(LONGER)
+    for hm in ("10:01", "10:02", "11:15"):
+        del live["2026-11-03"][hm]                         # withholds 11-03, and 11-04 through its prior session
+
+    doc = run(_days(LONGER), live, last=LONGER[-1])
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert doc["live_ready"] == sorted(mf.FEATURES)
+    assert f1["verdict_on"] == {"sessions": LONGER[-5:], "matched": 5, "required": 5, "values_out_of_tolerance": 0,
+                                "sessions_with_an_availability_disagreement": []}
+    assert f1["matched_sessions"] == 6 and f1["overlapping_sessions"] == 9             # the whole window, as before
+    assert f1["whole_window"] == {"sessions_with_an_availability_disagreement": 2}
+    assert {m["day"] for m in doc["comparison"]["availability_mismatch"]} == {"2026-11-03", "2026-11-04"}
+
+    earlier = run(_days(LONGER), live, last="2026-11-10")   # the same recording, judged two sessions earlier
+    f1 = earlier["comparison"]["features"]["F1"]
+    assert earlier["live_ready"] == [] and f1["verdict_on"]["matched"] == 4
+    assert f1["verdict_on"]["sessions_with_an_availability_disagreement"] == ["2026-11-04"]
+    assert f1["reasons"] == ["insufficient_matched_sessions", "availability_mismatch"]
+
+
+def test_an_old_value_out_of_tolerance_is_still_counted_and_a_recent_one_still_blocks(run):
+    live = _days(LONGER)
+    o, h, low, c, v = live["2026-11-04"]["14:59"]
+    live["2026-11-04"]["14:59"] = (o, h, low, c + 0.30, v)
+
+    doc = run(_days(LONGER), live, last=LONGER[-1])
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert f1["status"] == "live_ready" and f1["values_out_of_tolerance"] == 1         # counted, outside the verdict
+    assert f1["verdict_on"]["values_out_of_tolerance"] == 0
+
+    o, h, low, c, v = live["2026-11-12"]["14:59"]
+    live["2026-11-12"]["14:59"] = (o, h, low, c + 0.30, v)
+    f1 = run(_days(LONGER), live, last=LONGER[-1])["comparison"]["features"]["F1"]
+    assert f1["status"] == "research_only" and f1["verdict_on"]["values_out_of_tolerance"] == 1
+    assert f1["reasons"] == ["insufficient_matched_sessions", "value_out_of_tolerance"]
+
+
+def test_fewer_than_five_recent_sessions_is_never_ready_and_the_number_is_not_an_argument(run):
+    few = SESSIONS[:5]
+    doc = run({d: _days()[d] for d in few}, {d: _days()[d] for d in few})
+
+    assert doc["comparison"]["features"]["F1"]["verdict_on"]["matched"] == 4 and doc["live_ready"] == []
+    with pytest.raises(SystemExit):
+        flp.main(["--research-db", "r", "--signals-db", "l", "--first", few[0], "--last", few[-1], "--min-sessions", "1"])
