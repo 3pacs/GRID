@@ -22,15 +22,15 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from analysis import desk_brief as B  # noqa: E402
-from analysis import desk_brief_sources as S  # noqa: E402
+from analysis import desk_brief as B
+from analysis import desk_brief_sources as S
 
 
 def _code_version() -> str | None:
@@ -56,7 +56,8 @@ def pick_session(kind: str, now: datetime, cal) -> date:
 
 def collect(kind: str, session: B.SessionTimes, prev_day: date, as_of: datetime, cfg: dict, engine) -> tuple[list, list]:
     sections, trials = [], []
-    ms = S.market_state(engine, kind, session, as_of) if engine is not None else B.Section(
+    expected = prev_day if kind == "post_close" else S.previous_session(prev_day)
+    ms = S.market_state(engine, kind, session, as_of, expected) if engine is not None else B.Section(
         "market_state", "Market state", "unknown", "griddb market_state_daily", problems=("no database configured",))
     sections.append(ms)
     sections.append(S.calendar(session, as_of, market_events=(ms.facts or {}).get("events")))
@@ -107,7 +108,7 @@ def run(args) -> int:
     from analysis.factory_session_calendar import PINS, FactoryCalendar
 
     cal = FactoryCalendar(pins=PINS)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     kind = args.kind
     day = date.fromisoformat(args.session) if args.session else pick_session(kind, now, cal)
     session = S.session_times(day, calendar=cal)
@@ -126,7 +127,7 @@ def run(args) -> int:
     cfg = S.load_config(Path(args.config))
     sections, trials = collect(kind, session, prev_day, as_of, cfg, None if args.no_db else _engine())
     brief = B.build_brief(kind, session, as_of, sections, trials, as_of_registered=registered,
-                          generated_at=datetime.now(timezone.utc), code_version=_code_version())
+                          generated_at=datetime.now(UTC), code_version=_code_version())
     if args.narrate:
         brief["narrative"] = B.narrate(brief, url=args.llm_url, model=args.llm_model)
     md = B.render_markdown(brief)

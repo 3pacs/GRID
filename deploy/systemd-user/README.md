@@ -30,3 +30,5 @@ checkout made under 002 fails at the first read, not at install.
 
 * `grid-desk-receipts.{service,timer}`: the Research Desk source receipt after each session
   close. See `docs/reference/DESK_SOURCE_RECEIPTS.md`.
+* `grid-desk-brief-{pre-open,post-close}.{service,timer}`: the daily desk brief, one private
+  file per session and kind. See `docs/reference/DESK_BRIEF.md`. Not installed.

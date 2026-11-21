@@ -33,9 +33,10 @@ import json
 import re
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, Iterable
+from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from analysis.desk_evidence import DeskEvidence, EvidenceKind, evidence_card
@@ -55,14 +56,14 @@ LOCAL_LLM_HOSTS = frozenset({"gridz4:8080", "127.0.0.1:18081"})
 FINDING_WORDS = re.compile(
     r"\b(edge|alpha|proven|profitable|significant|validated|confirmed|outperform\w*|guarantee\w*|"
     r"recommend\w*|should (?:buy|sell)|buy now|sell now)\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 
 def _aware(value: datetime, what: str) -> datetime:
     if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError(f"{what} must be a timezone-aware datetime")
-    return value.astimezone(timezone.utc)
+    return value.astimezone(UTC)
 
 
 def parse_clock(value: Any) -> datetime | None:
@@ -70,19 +71,19 @@ def parse_clock(value: Any) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc) if value.utcoffset() is not None else None
+        return value.astimezone(UTC) if value.utcoffset() is not None else None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        return datetime.fromtimestamp(float(value), tz=UTC)
     try:
         s = str(value).strip().replace("Z", "+00:00")
         d = datetime.fromisoformat(s)
     except ValueError:
         return None
-    return d.astimezone(timezone.utc) if d.utcoffset() is not None else None
+    return d.astimezone(UTC) if d.utcoffset() is not None else None
 
 
 def iso(value: datetime | None) -> str | None:
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if value else None
+    return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z") if value else None
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,7 @@ def default_as_of(kind: str, session: SessionTimes) -> datetime:
     if kind == "pre_open":
         return session.opens - PRE_OPEN_LEAD
     if kind == "post_close":
-        return datetime.combine(session.day, POST_CLOSE_AT, tzinfo=NY).astimezone(timezone.utc)
+        return datetime.combine(session.day, POST_CLOSE_AT, tzinfo=NY).astimezone(UTC)
     raise ValueError(f"brief kind must be one of {KINDS}")
 
 
@@ -144,9 +145,15 @@ class Trial:
     decides: str | None = None         # when it decides (pre-open: not yet decided)
     max_age_days: int = 5
     live: bool = False                 # read from a live endpoint at run time (see LIVE_GRACE)
+    daily: bool = True                 # False: the source keeps counts only, no per-session row
+    counts_in: str | None = None       # its look counts are kept under another record (named here)
 
     def card(self, as_of: datetime) -> dict:
         """The desk_evidence label at the brief's clock. No counts or no clock: labelled, never a finding."""
+        if self.status == "SPENT":
+            return {"label": "look spent; its result is on the Records page, not repeated here", "reasons": []}
+        if self.counts_in:
+            return {"label": f"counts kept under {self.counts_in}", "reasons": []}
         if self.have is None or self.need is None or self.need <= 0:
             return {"label": "unproven; registered count not supplied", "reasons": ["count_not_supplied"]}
         item = DeskEvidence(item_id=self.trial_id[:512], kind=EvidenceKind.FORWARD, receipt_id=self.source[:512],
@@ -159,12 +166,12 @@ class Trial:
         return {"id": self.trial_id, "name": self.name, "source": self.source, "registration": self.registration,
                 "have": self.have, "need": self.need, "unit": self.unit, "today": self.today,
                 "withheld": self.withheld, "status": self.status, "clock": iso(self.clock),
-                "decides": self.decides, "evidence": self.card(as_of)}
+                "decides": self.decides, "daily": self.daily, "evidence": self.card(as_of)}
 
 
 def clocked(section: Section, as_of: datetime, live_grace: timedelta = LIVE_GRACE) -> Section:
     """Apply the brief's clock to a section: later than the as-of is ``after_clock`` and loses its figures."""
-    if section.status in ("unknown", "not_supplied", "after_clock"):
+    if section.status in ("unknown", "not_supplied", "after_clock", "empty"):
         return section
     if section.source_clock is None:
         return Section(section.key, section.title, "unknown", section.source, None, (),
@@ -172,8 +179,8 @@ def clocked(section: Section, as_of: datetime, live_grace: timedelta = LIVE_GRAC
     late = section.source_clock - as_of
     if section.facts.get("live") and timedelta(0) < late <= live_grace:
         return Section(section.key, section.title, section.status, section.source, section.source_clock,
-                       section.lines, section.facts,
-                       section.problems + (f"read live {int(late.total_seconds())} s after the brief's clock",))
+                       section.lines + (f"read live {int(late.total_seconds())} s after the brief's clock",),
+                       section.facts, section.problems)
     if section.source_clock > as_of:
         return Section(section.key, section.title, "after_clock", section.source, section.source_clock, (),
                        {}, section.problems + (f"written at {iso(section.source_clock)}, after the brief's clock; not used",))
@@ -187,7 +194,7 @@ def trial_clocked(trial: Trial, as_of: datetime, live_grace: timedelta = LIVE_GR
     if trial.clock is not None and trial.clock > as_of:
         return Trial(trial.trial_id, trial.name, trial.source, trial.registration, None, trial.need, trial.unit,
                      None, f"read at {iso(trial.clock)}, after the brief's clock; not used", trial.status, None,
-                     trial.decides, trial.max_age_days, trial.live)
+                     trial.decides, trial.max_age_days, trial.live, trial.daily, trial.counts_in)
     return trial
 
 
@@ -211,7 +218,8 @@ def build_brief(kind: str, session: SessionTimes, as_of: datetime, sections: Ite
             problems.extend({"source": s.key, "status": "reported", "detail": p} for p in s.problems)
     for t in trs:
         reasons = t.card(as_of)["reasons"]
-        bad = [r for r in reasons if r in ("stale_observation", "missing_clock", "future_evidence")]
+        bad = [r for r in reasons if r in ("stale_observation", "missing_clock", "future_evidence")
+               and not (r == "missing_clock" and t.have == 0)]   # nothing recorded yet is not a clock fault
         if bad:
             problems.append({"source": t.trial_id, "status": "trial", "detail": ", ".join(bad)})
     return {
@@ -265,7 +273,9 @@ def render_markdown(brief: dict) -> str:
             "| Trial | Session | Counts toward its look | Label | Look status | Source |",
             "|---|---|---|---|---|---|"]
     for t in brief["trials"]:
-        if t["today"]:
+        if not t.get("daily", True):
+            day = "counts only (no per-session row)"
+        elif t["today"]:
             day = t["today"]
         elif t["withheld"]:
             day = f"withheld: {t['withheld']}"
@@ -278,6 +288,8 @@ def render_markdown(brief: dict) -> str:
         have = "?" if t["have"] is None else t["have"]
         need = "?" if t["need"] is None else t["need"]
         counts = f"{have} of {need} {t['unit']}".strip()
+        if t["have"] is None and t["need"] is None and t["evidence"]["label"].startswith("counts kept under"):
+            counts = "see the record named in Label"
         out.append(f"| {_cell(t['name'])} | {_cell(day)} | {_cell(counts)} | {_cell(t['evidence']['label'])} | "
                    f"{_cell(t['status'] or '')} | `{_cell(t['source'])}` |")
     out += ["", "## Known data problems", ""]
@@ -309,7 +321,8 @@ def narrate(brief: dict, *, url: str, model: str, timeout: float = 120.0,
         return {"text": None, "withheld": f"host {host or url!r} is not a local GPU model host", "model": model}
     basis = render_markdown({**brief, "narrative": None})
     prompt = ("Summarise this trading-desk brief in 3 to 5 plain sentences for its owner. Use only facts and numbers "
-              "that appear in it. Do not predict, advise, rank or judge any trial; a count toward a look is not a "
+              "that appear in it, and copy every number exactly as written, sign included (write -2.2%, not 'fell 2.2%'). "
+              "Do not predict, advise, rank or judge any trial; a count toward a look is not a "
               "result. Say plainly what is missing or withheld.\n\n" + basis)
     body = json.dumps({"model": model, "temperature": 0, "max_tokens": 400,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
@@ -319,7 +332,7 @@ def narrate(brief: dict, *, url: str, model: str, timeout: float = 120.0,
         text = json.loads(raw)["choices"][0]["message"]["content"]
     except Exception as exc:  # noqa: BLE001 - the deterministic brief must stand without the model
         return {"text": None, "withheld": f"model call failed ({type(exc).__name__})", "model": model, "host": host}
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL).strip()
     if not text:
         return {"text": None, "withheld": "model returned no text", "model": model, "host": host}
     word = FINDING_WORDS.search(text)
@@ -337,5 +350,5 @@ def narrate(brief: dict, *, url: str, model: str, timeout: float = 120.0,
 
 def _post(url: str, body: bytes, timeout: float) -> bytes:
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 - host checked against LOCAL_LLM_HOSTS
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()

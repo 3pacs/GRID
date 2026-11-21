@@ -1,0 +1,16 @@
+# TEMPLATE. See grid-desk-brief-post-close.service.template.
+# Weekdays 22:21 New York, one minute after the brief's clock (22:20). By then the shadow graders
+# (21:10-21:40 UTC), the evening text (22:05 and 23:35 UTC) and the 01:50 UTC overnight
+# plays and forecast grades have run. 22:21 ET is 03:21 UTC in winter and 02:21 UTC in summer: outside
+# the 02:00-02:15 UTC Hermes window either way. On a holiday the latest closed session is already
+# written and the run writes nothing.
+[Unit]
+Description=Write the GRID post-close desk brief
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 22:21:00 America/New_York
+Persistent=false
+Unit=grid-desk-brief-post-close.service
+
+[Install]
+WantedBy=timers.target

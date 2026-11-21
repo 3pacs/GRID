@@ -30,9 +30,9 @@ import json
 import re
 import sqlite3
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -46,7 +46,7 @@ Fetch = Callable[[str, float], bytes]
 
 
 def _fetch(url: str, timeout: float) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 - config-supplied local URLs
+    with urllib.request.urlopen(url, timeout=timeout) as r:
         return r.read()
 
 
@@ -74,7 +74,7 @@ def session_times(day: date, *, calendar=None) -> SessionTimes:
     s = cal.for_day(day.isoformat())
     if s is None:
         raise ValueError(f"{day} is not an XNYS session")
-    return SessionTimes(day=day, opens=s.opens.astimezone(timezone.utc), closes=s.closes.astimezone(timezone.utc))
+    return SessionTimes(day=day, opens=s.opens.astimezone(UTC), closes=s.closes.astimezone(UTC))
 
 
 def previous_session(day: date, *, calendar=None) -> date:
@@ -90,7 +90,10 @@ _MS_SQL = text("SELECT as_of_date, computed_at, rule, record FROM market_state_d
                "WHERE as_of_date <= :d ORDER BY as_of_date DESC LIMIT 10")
 
 
-def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: datetime) -> Section:
+def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: datetime,
+                 expected: date | None = None) -> Section:
+    """``expected``: the newest session the writer normally has computed by the brief's clock (it writes a session's
+    record the evening after it). An older record is a data problem; the expected lag is only stated."""
     title, key = "Market state", "market_state"
     src = "griddb market_state_daily (market-state/1)"
     last = session.day - timedelta(days=1) if kind == "pre_open" else session.day
@@ -107,7 +110,7 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
     chosen = None
     for r in rows:
         computed = r[1] if isinstance(r[1], datetime) else datetime.fromisoformat(str(r[1]))
-        computed = computed.replace(tzinfo=timezone.utc) if computed.utcoffset() is None else computed
+        computed = computed.replace(tzinfo=UTC) if computed.utcoffset() is None else computed
         if computed <= as_of:
             chosen = (r, computed)
             break
@@ -142,8 +145,8 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
     ns = rec.get("news_shock") or {}
     if ns:
         lines.append(f"news uncertainty ({ns.get('obs_date')}): {ns.get('kind')}; attribution {ns.get('news_attribution')}")
-    if rec_day != last.isoformat():
-        problems.append(f"latest record is for {rec_day}; none yet for {last.isoformat()}")
+    if expected is not None and rec_day < expected.isoformat():
+        problems.append(f"latest record is for {rec_day}; the writer normally has {expected.isoformat()} by now")
     return Section(key, title, "ok", src, computed, tuple(lines),
                    {"record_date": rec_day, "computed_at": iso(computed), "notable": notable,
                     "events": rec.get("events"), "pending": sorted((rec.get("pending") or {}).keys())},
@@ -154,7 +157,13 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
 
 def calendar(session: SessionTimes, as_of: datetime, *, market_events: dict | None = None,
              events=None, xnys=None, horizon: int = 5) -> Section:
-    from analysis.factory_session_calendar import EVENT_PINS, EVENT_TIME, PINS, FactoryCalendar, FactoryEvents
+    from analysis.factory_session_calendar import (
+        EVENT_PINS,
+        EVENT_TIME,
+        PINS,
+        FactoryCalendar,
+        FactoryEvents,
+    )
 
     title, key = "Event calendar", "calendar"
     src = "pinned XNYS and factory-events parts (analysis/factory_session_calendar.py)"
@@ -209,7 +218,7 @@ def records(url: str, as_of: datetime, *, fetch: Fetch = _fetch, timeout: float 
             trial_id=str(f.get("id")), name=str(f.get("name") or f.get("id")), source=f"records:{f.get('source')}",
             registration=f.get("doc") or f.get("registered_at"), have=have if isinstance(have, int) else None,
             need=need if isinstance(need, int) else None, unit=str(f.get("unit") or ""),
-            status=f.get("status"), clock=clock, live=True))
+            status=f.get("status"), clock=clock, live=True, daily=False))
     counts = d.get("counts") or {}
     lines = ["forward records by look status: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())),
              f"looks already spent: {len(d.get('spent') or [])} (results are on the Records page, not repeated here)"]
@@ -227,7 +236,7 @@ def _cols(con: sqlite3.Connection, table: str) -> set[str]:
         raise ValueError(f"bad table name {table!r}")
     if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
         raise LookupError(f"no table {table}")
-    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}  # noqa: S608 - checked identifier
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
 
 
 def _select(con: sqlite3.Connection, table: str, columns: list[str]) -> list[sqlite3.Row]:
@@ -236,7 +245,7 @@ def _select(con: sqlite3.Connection, table: str, columns: list[str]) -> list[sql
         if not IDENT.match(c) or c not in have:
             raise LookupError(f"{table} has no column {c!r}")
     con.row_factory = sqlite3.Row
-    return con.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()  # noqa: S608 - checked identifiers
+    return con.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()
 
 
 def ledger_trial(spec: dict, kind: str, session: SessionTimes, prev_day: date, as_of: datetime) -> Trial:
@@ -287,8 +296,13 @@ def ledger_trial(spec: dict, kind: str, session: SessionTimes, prev_day: date, a
         if str(r[spec["day"]]) != want:
             continue
         c = parse_clock(r[spec["clock"]])
-        if c is None or c > as_of:
-            withheld = "the session's row was written after the brief's clock" if c else "the session's row has no clock"
+        if c is None:
+            withheld = "the session's row has no clock"
+            break
+        if c > as_of:
+            # Not yet written at the brief's clock. Before the session decides, that is the normal state.
+            if not (kind == "pre_open" and spec.get("decision") != "previous_session"):
+                withheld = f"not yet recorded at the brief's clock (written {iso(c)})"
             break
         row_clock = c
         st = r[spec["status"]]
@@ -304,8 +318,6 @@ def ledger_trial(spec: dict, kind: str, session: SessionTimes, prev_day: date, a
     note = []
     if unclocked:
         note.append(f"{unclocked} row(s) without a readable clock not counted")
-    if late:
-        note.append(f"{late} row(s) after the brief's clock not counted")
     if note:
         withheld = "; ".join(([withheld] if withheld else []) + note)
     return Trial(have=len(have), today=today, withheld=withheld, clock=row_clock or newest, **base)
@@ -374,8 +386,8 @@ def plays(spec: dict, kind: str, session: SessionTimes, prev_day: date, as_of: d
 def trader_day(spec: dict, kind: str, session: SessionTimes, as_of: datetime) -> Trial:
     """gex-trader (shadow): the session's day state and shadow intents. Counts toward Stage 0 come from records."""
     base = dict(trial_id=spec["id"], name=spec["name"], source=f"{spec['db']}:day_state",
-                registration=spec.get("registration"), need=None, unit="(counts: see trader-stage0)",
-                decides=spec.get("decides"))
+                registration=spec.get("registration"), need=None, unit="",
+                decides=spec.get("decides"), counts_in=spec.get("counts_in", "trader-stage0 (Records)"))
     try:
         con = ro_sqlite(spec["db"])
         ds = _select(con, "day_state", ["day", "mode", "breaker", "entries", "halt", "session_result", "updated_at"])
