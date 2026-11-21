@@ -1,0 +1,15 @@
+# TEMPLATE. See grid-desk-receipts.service.template.
+# Weekdays 16:20 New York: twenty minutes after the regular close (an early 13:00 close is
+# already past by then). 19:20 is a second attempt; when the session is already recorded it
+# writes nothing. On a holiday both runs find the prior session recorded and write nothing.
+[Unit]
+Description=Record the GRID Research Desk source receipt after each session close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:20:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 19:20:00 America/New_York
+Persistent=true
+Unit=grid-desk-receipts.service
+
+[Install]
+WantedBy=timers.target

@@ -354,7 +354,7 @@ class OptionsScanner:
         # 8. Vol surface arbitrage + extreme skew (ALPHA-1: wires
         #    analysis/vol_surface.py into the scanner). Pulls a fresh SVI
         #    fit per expiry, runs detect_arbitrage, scores butterfly /
-        #    calendar violations directly + extreme 25-delta skew as
+        #    calendar violations directly + extreme ATM-IV delta-strike proxy skew as
         #    mispricing flags. Direction inferred from skew sign.
         vs_score, vs_direction, vs_meta = self._score_vol_surface(ticker, scan_date)
         signals["vol_surface"] = {
@@ -630,7 +630,7 @@ class OptionsScanner:
 
         Pulls a fresh SVI fit per expiry via VolSurfaceEngine.build_surface(),
         runs detect_arbitrage() to flag butterfly/calendar violations, and
-        reads compute_skew() to detect extreme 25-delta skew. The score is
+        reads compute_skew() to detect extreme ATM-IV delta-strike proxy skew. The score is
         capped at 10 and direction is inferred from the front-month skew sign.
 
         Returns:
@@ -679,8 +679,11 @@ class OptionsScanner:
             meta["front_skew"] = round(front_skew, 4)
             meta["front_butterfly"] = round(front_butterfly, 4)
             meta["front_atm_iv"] = round(front_atm, 4)
+            meta["front_skew_method"] = front.get("method", "unknown_legacy")
+            meta["front_skew_expiry"] = front.get("expiry")
+            meta["front_skew_dte"] = front.get("dte")
 
-            # Steep put skew (put_25d_iv >> call_25d_iv) → tail-hedging panic →
+            # Steep modeled proxy skew (put IV >> call IV) → tail-hedging panic →
             # contrarian CALL. Flat skew → complacency → PUT.
             if front_skew >= 0.10:
                 score += 2.0

@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 from loguru import logger as log
 from sqlalchemy import text
 
+from contracts.financial_signal_guard import is_financial_divergence_signal
+
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
@@ -43,6 +45,11 @@ def on_signal_fired(evt: "SignalFired", *, engine: "Engine") -> None:
     All DB errors are logged at ``warning`` and swallowed — emitters
     must never observe a failure here.
     """
+    # Block delayed/replayed financial events before imports or side effects.
+    # Producer suppression alone cannot stop already-created contracts.
+    if is_financial_divergence_signal(evt):
+        return
+
     strength = float(getattr(evt, "strength", 0.0) or 0.0)
     if abs(strength) <= PROVISIONAL_STRENGTH_THRESHOLD:
         return

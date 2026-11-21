@@ -33,6 +33,7 @@ from sqlalchemy.pool import NullPool
 
 from ingestion.base import BasePuller
 from ingestion.market_calendar import is_market_open
+from store.options_iv import CALL_WING, PUT_WING, fixed_moneyness_wings
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -97,6 +98,34 @@ class _NoChain:
 
 
 NO_CHAIN = _NoChain()
+
+
+class OptionsSourceAccessDenied(Exception):
+    """The options source refused us; not a diagnosis of optionability.
+
+    Raised only on evidence of a refusal (``_is_access_denial``): any 401, or
+    a 403 for a hand-listed known-optionable ticker. Cboe's CDN also answers
+    403 for symbols with no listed options, so a 403 for any other symbol is
+    ``NO_CHAIN``, not a denial.
+    """
+
+    def __init__(self, provider: str, http_status: int) -> None:
+        self.provider = provider
+        self.http_status = http_status
+        super().__init__(f"{provider} access denied (HTTP {http_status})")
+
+
+def _is_access_denial(ticker: str, http_status: int) -> bool:
+    """True when ``http_status`` for ``ticker`` means the source refused us.
+
+    401 always does. 403 does only for a hand-listed ``EQUITY_TICKERS`` name
+    (e.g. SPY): those are known optionable, so a 403 there cannot mean "no
+    listed options". For any other symbol Cboe's 403 is its routine answer
+    for a symbol without a chain.
+    """
+    if http_status == 401:
+        return True
+    return http_status == 403 and ticker in EQUITY_TICKERS
 
 
 def _no_options_cached(ticker: str) -> bool:
@@ -205,6 +234,9 @@ class OptionsPullResults(list[dict[str, Any]]):
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
         else:
             status, note = "SUCCESS", "full default universe captured"
+        denied = next((r for r in self if r.get("reason") == "source_access_denied"), None)
+        if denied is not None and status in ("PARTIAL", "FAILED"):
+            note = f"{denied['error']}; remaining tickers not requested"
         return {
             "status": status, "rows_inserted": rows,
             "scope": "full_universe" if self.full_universe else "subset",
@@ -642,6 +674,7 @@ class CboeOptionsClient:
         self.last_no_chain = False
         self._ticker: str | None = None
         self._chain: dict[str, Any] | None = None
+        self._denied_status: int | None = None
 
     def _page(self, chain: dict[str, Any], expiry_ts: int) -> dict[str, Any] | None:
         page = chain["pages"].get(expiry_ts)
@@ -654,6 +687,8 @@ class CboeOptionsClient:
 
     def get_options(self, ticker: str, expiry_ts: int | None = None) -> Any:
         self.last_no_chain = False
+        if self._denied_status is not None:
+            raise OptionsSourceAccessDenied(self.provider, self._denied_status)
         if expiry_ts is not None:
             if self._ticker != ticker or self._chain is None:
                 return None
@@ -666,9 +701,17 @@ class CboeOptionsClient:
         except Exception as exc:  # noqa: BLE001 -- transport failure, caller may fall back
             log.warning("Cboe options {t}: {kind}", t=ticker, kind=type(exc).__name__)
             return None
+        if _is_access_denial(ticker, resp.status_code):
+            # Evidence that Cboe is refusing us, not that the symbol lacks a
+            # chain. Latch for this client/run; do not retry another symbol,
+            # serve cached pages or turn the denial into a vendor fallback.
+            self._denied_status = resp.status_code
+            raise OptionsSourceAccessDenied(self.provider, resp.status_code)
         if resp.status_code in (403, 404):
-            # The CDN answers S3 AccessDenied for symbols with no listed
-            # options (verified 2026-11-06 for ZZZZQ, BRK-B, BRKB).
+            # Cboe's CDN answers S3 AccessDenied (403) for a document symbol
+            # with no listed options (verified 2026-11-06 on ZZZZQ, and on
+            # BRK-B/BRKB in place of BRK.B); about 35 catalyst names hit it a
+            # run. Only a known-optionable name turns 403 into a denial, above.
             log.debug("Cboe options {t}: HTTP {s} (no chain)", t=ticker, s=resp.status_code)
             return NO_CHAIN
         if resp.status_code != 200:
@@ -711,6 +754,8 @@ class CboeFirstOptionsClient:
     is returned and the capture is refused exactly as before. A Cboe "no
     listed options" answer is authoritative (Cboe carries the consolidated
     OPRA chain) and is not retried on Yahoo.
+    Explicit access denials (see ``CboeOptionsClient.get_options``) propagate
+    instead of invoking fallback.
     """
 
     is_available = True
@@ -809,6 +854,9 @@ class OptionsPuller(BasePuller):
                     iv_atm          DOUBLE PRECISION,
                     iv_25d_put      DOUBLE PRECISION,
                     iv_25d_call     DOUBLE PRECISION,
+                    iv_m90_put_v1   DOUBLE PRECISION,
+                    iv_m110_call_v1 DOUBLE PRECISION,
+                    wing_iv_metadata JSONB,
                     term_structure_slope DOUBLE PRECISION,
                     oi_concentration     DOUBLE PRECISION,
                     created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -847,6 +895,13 @@ class OptionsPuller(BasePuller):
                 ticker and reports it and the remaining tickers as DEFERRED.
             capture_source: Writer label recorded on each registered batch
                 in ``options_capture_batches`` (e.g. "gem_daily").
+
+        A 401/403 stops this entire run, including when it first occurs in
+        the catalyst tail after every core ticker succeeds. Earlier complete
+        captures remain, but coverage is PARTIAL and source freshness is not
+        published. No absence cache is inferred from refusal. A later call
+        creates a new client and can repeat this partial outcome; this is not
+        a persistent rights gate or permission to run the collector.
 
         Returns:
             OptionsPullResults: List-compatible results with a source-wide
@@ -919,6 +974,15 @@ class OptionsPuller(BasePuller):
                 ticker_kwargs["capture_source"] = capture_source
             result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
+            if result.get("reason") == "source_access_denied":
+                results.extend(
+                    {"ticker": t, "status": "SKIPPED", "rows_inserted": 0,
+                     "reason": "source_access_denied_before_request",
+                     "provider": result["provider"],
+                     "blocked_by_http_status": result["http_status"]}
+                    for t in tickers[idx + 1:]
+                )
+                break
             if result["status"] == "DEFERRED":
                 results.extend(
                     {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
@@ -1316,9 +1380,14 @@ class OptionsPuller(BasePuller):
                 # ATM IV
                 iv_atm = _compute_atm_iv(near_calls_df, near_puts_df, spot_price)
 
-                # 25-delta wings
-                iv_25d_put = _compute_wing_iv(near_puts_df, spot_price, delta_strike_pct=0.90)
-                iv_25d_call = _compute_wing_iv(near_calls_df, spot_price, delta_strike_pct=1.10)
+                # Versioned fixed-moneyness proxies, never 25-delta IV.
+                wings = fixed_moneyness_wings(
+                    near_calls_df.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    near_puts_df.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    spot_price, expiry=near_expiry, snap_date=today_str,
+                    source=spot_provider, capture_batch_id=batch_id,
+                    spot_observed_at=spot_market_at.isoformat() if spot_market_at else None,
+                )
 
                 # Term structure slope (IV of far expiry - near expiry)
                 term_slope = None
@@ -1335,9 +1404,9 @@ class OptionsPuller(BasePuller):
                         "INSERT INTO options_daily_signals "
                         "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
                         "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
-                        "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration) "
+                        "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
                         "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
-                        ":iv_atm, :iv_25d_put, :iv_25d_call, :ts_slope, :oi_conc) "
+                        ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
                         "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
                         "put_call_ratio = EXCLUDED.put_call_ratio, "
                         "max_pain = EXCLUDED.max_pain, "
@@ -1347,8 +1416,9 @@ class OptionsPuller(BasePuller):
                         "near_expiry = EXCLUDED.near_expiry, "
                         "spot_price = EXCLUDED.spot_price, "
                         "iv_atm = EXCLUDED.iv_atm, "
-                        "iv_25d_put = EXCLUDED.iv_25d_put, "
-                        "iv_25d_call = EXCLUDED.iv_25d_call, "
+                        "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
+                        "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
+                        "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
                         "term_structure_slope = EXCLUDED.term_structure_slope, "
                         "oi_concentration = EXCLUDED.oi_concentration"
                     ),
@@ -1357,8 +1427,9 @@ class OptionsPuller(BasePuller):
                         "pcr": put_call_ratio, "mp": max_pain, "ivs": iv_skew,
                         "oi": total_oi, "vol": total_volume,
                         "ne": near_expiry, "spot": spot_price,
-                        "iv_atm": iv_atm, "iv_25d_put": iv_25d_put,
-                        "iv_25d_call": iv_25d_call,
+                        "iv_atm": iv_atm, PUT_WING: wings[PUT_WING],
+                        CALL_WING: wings[CALL_WING],
+                        "wing_meta": json.dumps(wings["wing_iv_metadata"]),
                         "ts_slope": term_slope, "oi_conc": oi_conc,
                     },
                 )
@@ -1371,11 +1442,11 @@ class OptionsPuller(BasePuller):
                     "total_oi": ("sentiment", f"{ticker} Total Open Interest", total_oi),
                     "opt_vol": ("sentiment", f"{ticker} Total Options Volume", total_volume),
                     "iv_atm": ("vol", f"{ticker} ATM Implied Volatility", iv_atm),
-                    "iv_25d_put": ("vol", f"{ticker} 25-Delta Put IV", iv_25d_put),
-                    "iv_25d_call": ("vol", f"{ticker} 25-Delta Call IV", iv_25d_call),
+                    PUT_WING: ("vol", f"{ticker} Put IV proxy: 87-93% spot mean v1", wings[PUT_WING]),
+                    CALL_WING: ("vol", f"{ticker} Call IV proxy: 107-113% spot mean v1", wings[CALL_WING]),
                     "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
                     "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                }, should_continue=should_continue)
+                }, should_continue=should_continue, wing_metadata=wings["wing_iv_metadata"])
                 _check_budget(should_continue)
                 signals_written = _affected_rows(signal_write)
                 rows_inserted = (
@@ -1411,6 +1482,11 @@ class OptionsPuller(BasePuller):
                 },
             }
 
+        except OptionsSourceAccessDenied as exc:
+            log.warning("{t}: {e}; options run stopped", t=ticker, e=exc)
+            return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
+                    "reason": "source_access_denied", "error": str(exc),
+                    "provider": exc.provider, "http_status": exc.http_status}
         except _OptionsBudgetExpired:
             return {"ticker": ticker, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
         except Exception as e:
@@ -1425,6 +1501,7 @@ class OptionsPuller(BasePuller):
         signals: dict[str, tuple[str, str, Any]],
         *,
         should_continue: Callable[[], bool] | None = None,
+        wing_metadata: dict | None = None,
     ) -> int | None:
         """Push computed signals to feature_registry + resolved_series."""
         prefix = ticker.lower().replace("-", "_")
@@ -1450,10 +1527,13 @@ class OptionsPuller(BasePuller):
                     "transformation_version, lag_days, normalization, "
                     "missing_data_policy, eligible_from_date, model_eligible) "
                     "VALUES (:name, :fam, :desc, 'RAW', 1, 0, 'ZSCORE', "
-                    "'FORWARD_FILL', '2024-04-01', TRUE) "
+                    ":missing_policy, :eligible_from, :model_eligible) "
                     "ON CONFLICT (name) DO NOTHING RETURNING id"
                 ),
-                {"name": feat_name, "fam": family, "desc": desc},
+                {"name": feat_name, "fam": family, "desc": desc,
+                 "missing_policy": "NAN" if suffix in (PUT_WING, CALL_WING) else "FORWARD_FILL",
+                 "eligible_from": today_str if suffix in (PUT_WING, CALL_WING) else "2024-04-01",
+                 "model_eligible": suffix not in (PUT_WING, CALL_WING)},
             ).fetchone()
 
             if row:
@@ -1472,13 +1552,14 @@ class OptionsPuller(BasePuller):
                 text(
                     "INSERT INTO resolved_series "
                     "(feature_id, obs_date, release_date, vintage_date, value, "
-                    "source_priority_used) "
-                    "VALUES (:fid, :od, :rd, :vd, :val, :src) "
+                    "source_priority_used, options_iv_metadata) "
+                    "VALUES (:fid, :od, :rd, :vd, :val, :src, CAST(:wing_meta AS JSONB)) "
                     "ON CONFLICT DO NOTHING"
                 ),
                 {
                     "fid": fid, "od": today_str, "rd": today_str,
                     "vd": today_str, "val": float(val), "src": self.source_id,
+                    "wing_meta": json.dumps(wing_metadata) if suffix in (PUT_WING, CALL_WING) else None,
                 },
             )
             count = _affected_rows(written)
@@ -1567,25 +1648,6 @@ def _compute_atm_iv(
     iv = atm["impliedVolatility"].mean()
     return float(iv) if pd.notna(iv) else None
 
-
-def _compute_wing_iv(
-    df: pd.DataFrame, spot_price: float, delta_strike_pct: float
-) -> float | None:
-    """Compute average IV around a specific strike level (e.g. 90% or 110% of spot)."""
-    if df.empty or "impliedVolatility" not in df.columns:
-        return None
-
-    target = spot_price * delta_strike_pct
-    band = spot_price * 0.03
-    wing = df[
-        (df["strike"] >= target - band) &
-        (df["strike"] <= target + band)
-    ]
-    if wing.empty:
-        return None
-
-    iv = wing["impliedVolatility"].mean()
-    return float(iv) if pd.notna(iv) else None
 
 
 def _compute_oi_concentration(

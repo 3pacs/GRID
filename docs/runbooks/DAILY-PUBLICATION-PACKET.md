@@ -284,14 +284,25 @@ ingest enforces; the grader constructs rows so they pass by construction):
   T10Y3M, DFF, DGS2, DGS5) becomes a `data_quality` row judged on whether the number was real
   at the instant it was stated, from every capture GRID holds around it
   (`store.observations.read_vintages`: intraday pulls, the completed close, the session's
-  high/low, later revisions). During a session: confirmed when it lies between the in-session
-  captures within 90 minutes of the statement, or equals the previous completed close;
-  partially confirmed when it is only inside the session's high/low. After a close: confirmed
-  when it equals the newest completed close (even one GRID pulled after the statement:
-  `knowable_at_stated_at` says which); partially confirmed as stale when it equals an older
-  close while a newer one was already known. FRED rates use the same newest-vs-stale rule over
-  observation dates. Anything else is refuted, with the nearest captures and the range as
-  evidence. Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
+  high/low, later revisions). During a session: nearby captures (within 90 minutes) and
+  session ranges provide only `partially_confirmed` corroboration. A pull timestamp is
+  not a market-event timestamp, even when the value matches. The present observation
+  schema cannot confirm the exact-time intraday claim. Yesterday's close cannot confirm
+  today's current level. Only a complete same-session low/high from the same source and retrieval timestamp, captured after the close
+  can refute an out-of-range value; sparse mismatching samples are `unscorable`, not
+  refutation. Range evidence retains each actual retrieval timestamp, and later complete
+  ranges have `knowable_at_stated_at=false`. Nearby corroboration has availability
+  unknown for the claimed exact-time fact, not a fabricated `true`.
+  After-close and FRED rules are unchanged: newest completed close matches can confirm;
+  older known closes are stale/partial. These retain the prior limitation that release
+  timing/revisions and explicit "current" versus "close" wording require further work.
+  Grader confidence remains a heuristic, not a calibrated accuracy probability.
+  Derived quantities (z-scores, momentum, ratios, moves in %) are skipped.
+- Grader `v2-corroboration` changes verdict semantics only. Regrading follows the existing
+  append-only run/supersession path; it does not delete prior runs, alter original packets,
+  write model scores, or retroactively claim publication-time knowledge. Prior database
+  runs remain append-only; the per-day working review file is still replaced as before. Deployment and
+  any intentional historical regrade remain separate operator actions.
 - A day whose verdict rows and header (packet sha, models) did not change is left alone
   (`UNCHANGED`); a change rewrites the file and the ingest records a new run that supersedes the
   previous one. A hand-off that failed (database down) is retried on the next run until the
@@ -344,3 +355,30 @@ Historical days: Nov 4–6 packets are produced by hand from the same job (late
 captures, flagged `late_capture: true`). They are real captures of the retained
 rows, not manufactured success receipts; the old lineage's Nov 3 r13 candidate
 stays sealed and unadmitted.
+
+
+### Grader ingest confirmation and historical reconciliation
+
+A grader success binds the actual `review_sha256`, `packet_sha256` and positive database
+`run_id` returned by the ingest. It stores these as `ingest_confirmation` with schema
+`publication-review-ingest-confirmation-v1`. A successful status alone, a different file
+hash, rejected rows or missing count reconciliation is not a confirmation; the grader
+records `ingest_confirmation_error`, returns exit 3 and retries the hand-off on the next
+normal run. This catches replacement of `review.jsonl` between grading and ingest reading
+it. Each confirmation describes exact bytes, not an unlocked file's future contents.
+
+Older `ingested_review_sha256` fields without this bound confirmation are untrusted: the
+former unchanged `--no-ingest` path could invent that field even after a failed hand-off.
+The next naturally scheduled run within the existing lookback reconciles an unchanged
+review through the existing idempotent ingest. Its unique review hash yields `PRESENT`
+when that exact review already exists; a missing review is ingested normally. A
+`--no-ingest` run neither reconciles nor upgrades legacy claims. New genuine confirmations
+can be retained for the same review and packet without another database round trip.
+
+Do not delete old receipts or rewrite database history to make a day appear successful.
+Retain prior evidence through the existing custody process. Historical days outside the
+configured lookback remain unreconciled until the existing owner admits a bounded check;
+this fix does not expand the schedule, launch a backfill or certify historical acceptance.
+If overlapping writers are detected, retain both reported hash identities and resolve
+ownership before further manual work. A hash mismatch is a visible failure, not permission
+to launch another consumer.

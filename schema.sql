@@ -139,7 +139,8 @@ CREATE TABLE IF NOT EXISTS resolved_series (
     source_priority_used  INTEGER NOT NULL REFERENCES source_catalog(id),
     conflict_flag         BOOLEAN NOT NULL DEFAULT FALSE,
     conflict_detail       JSONB,
-    resolution_version    INTEGER NOT NULL DEFAULT 1
+    resolution_version    INTEGER NOT NULL DEFAULT 1,
+    options_iv_metadata   JSONB
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_resolved_series_composite
@@ -849,6 +850,9 @@ CREATE TABLE IF NOT EXISTS options_daily_signals (
     iv_atm                  DOUBLE PRECISION,
     iv_25d_put              DOUBLE PRECISION,
     iv_25d_call             DOUBLE PRECISION,
+    iv_m90_put_v1           DOUBLE PRECISION,
+    iv_m110_call_v1         DOUBLE PRECISION,
+    wing_iv_metadata       JSONB,
     term_structure_slope    DOUBLE PRECISION,
     oi_concentration        DOUBLE PRECISION,
     created_at              TIMESTAMPTZ DEFAULT NOW(),
