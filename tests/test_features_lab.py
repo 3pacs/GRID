@@ -673,9 +673,9 @@ class TestComputeDerivedFeatures:
         gold = pd.Series([1800.0 + i * 0.5 for i in range(n)], index=dates)
 
         def mock_pit(name, as_of, lookback_days=504):
-            if name == "copper_futures_close":
+            if name == "copper":
                 return copper
-            if name == "gold_futures_close":
+            if name == "gold_full":
                 return gold
             return None
 
@@ -745,7 +745,7 @@ class TestComputeDerivedFeatures:
         sp500 = pd.Series([4000.0 + i for i in range(n)], index=dates)
 
         def mock_pit(name, as_of, lookback_days=504):
-            if name == "sp500_close":
+            if name == "sp500_full":
                 return sp500
             return None
 
@@ -755,6 +755,34 @@ class TestComputeDerivedFeatures:
 
         assert result["sp500_mom_3m"] is not None
         assert isinstance(result["sp500_mom_3m"], float)
+
+    def test_vix_3m_ratio_is_zscore_of_stored_ratio_not_vix3m(self):
+        """The stored vix_3m_ratio is VIX/VIX3M. Dividing VIX by it again gave
+        VIX3M back, so the feature tracked the 3-month vol level instead of
+        the term structure. Here VIX3M is constant while the ratio rises: the
+        old formula returned a z-score of a constant (None); the fix reads the
+        ratio itself, whose last value is well above its mean."""
+        engine, conn = _make_mock_engine()
+        conn.execute.return_value.fetchone.return_value = None
+        pit = MagicMock(spec=PITStore)
+        lab = FeatureLab(engine, pit)
+        lab.compute_feature = MagicMock(return_value=None)
+
+        n = 120
+        dates = [date(2024, 1, 1) + timedelta(days=i) for i in range(n)]
+        vix3m = 20.0
+        ratio_vals = [0.8 + 0.004 * i for i in range(n)]
+        stored_ratio = pd.Series(ratio_vals, index=dates)
+        vix = pd.Series([r * vix3m for r in ratio_vals], index=dates)
+
+        def mock_pit(name, as_of, lookback_days=504):
+            return {"vix_3m_ratio": stored_ratio, "vix_spot": vix}.get(name)
+
+        lab._get_pit_series = mock_pit
+        result = lab.compute_derived_features(date(2024, 4, 30))
+
+        assert result["vix_3m_ratio"] is not None
+        assert result["vix_3m_ratio"] > 1.0
 
     def test_options_features_all_none_when_no_data(self):
         lab = self._lab_all_none()

@@ -6,9 +6,11 @@ models views read, and nothing else:
 
     feature_engineering   derived macro/options features (FeatureLab)
     orthogonality         correlation / PCA dimensionality audit
-    clustering            global unsupervised clustering (GMM on PCA)
+    clustering            global unsupervised clustering (GMM on PCA) --
+                          on request only (--steps), not in the daily run
     clustering_sector     the same clustering, one run per sector of
-                          analysis/sector_map.py (subcategory = sector)
+                          analysis/sector_map.py (subcategory = sector) --
+                          on request only
     feature_importance    importance report for the PRODUCTION model
     options_scan          summary of the latest options_mispricing_scans
 
@@ -88,8 +90,10 @@ RESOLVER_CANARY_FEATURE = "spy_full"
 MAX_STALENESS_DAYS = 10
 # FeatureLab inputs: daily series must be this fresh; monthly releases get a
 # publication-lag allowance instead of being reported as today's value.
-FEATURE_INPUT_MAX_AGE_DAYS = 10
-FEATURE_INPUT_AGE_OVERRIDES = {"cpi_yoy": 75}
+from features.lab import DEFAULT_INPUT_AGE_OVERRIDES, DEFAULT_INPUT_MAX_AGE_DAYS  # noqa: E402
+
+FEATURE_INPUT_MAX_AGE_DAYS = DEFAULT_INPUT_MAX_AGE_DAYS
+FEATURE_INPUT_AGE_OVERRIDES = DEFAULT_INPUT_AGE_OVERRIDES
 # options_mispricing_scans older than this is not summarised as current.
 OPTIONS_SCAN_MAX_AGE_DAYS = 4
 OPTIONS_TOP_N = 10
@@ -127,6 +131,14 @@ ALL_STEPS = (
     "feature_importance",
     "options_scan",
 )
+
+# The daily timer runs these. clustering / clustering_sector stay runnable on
+# request (--steps clustering) but are off the schedule (2026-11-12): nothing
+# that makes a decision reads them -- regime calls come from
+# scripts/auto_regime.py, which the journal grades -- and the global run
+# clustered 19 FX/crypto features because weekday series failed a calendar-day
+# missingness filter, with cluster ids refit (relabelled) every day.
+DEFAULT_STEPS = tuple(s for s in ALL_STEPS if s not in {"clustering", "clustering_sector"})
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +628,7 @@ def summarize_options_scans(engine: Any, as_of: date) -> dict[str, Any]:
 def run(
     engine: Any,
     as_of: date,
-    steps: tuple[str, ...] = ALL_STEPS,
+    steps: tuple[str, ...] = DEFAULT_STEPS,
     dry_run: bool = False,
     skip_gate: bool = False,
     gate_fn: Callable[..., dict[str, Any]] = check_readiness,
@@ -652,8 +664,9 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--as-of", type=date.fromisoformat, default=None,
                    help="as-of date (default: today, UTC)")
-    p.add_argument("--steps", default=",".join(ALL_STEPS),
-                   help="comma-separated subset of: " + ", ".join(ALL_STEPS))
+    p.add_argument("--steps", default=",".join(DEFAULT_STEPS),
+                   help="comma-separated subset of: " + ", ".join(ALL_STEPS)
+                   + " (default: " + ", ".join(DEFAULT_STEPS) + ")")
     p.add_argument("--dry-run", action="store_true", help="compute but write nothing")
     p.add_argument("--check-only", action="store_true", help="evaluate the readiness gate and exit")
     p.add_argument("--no-readiness-gate", action="store_true",

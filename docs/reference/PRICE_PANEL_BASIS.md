@@ -121,7 +121,7 @@ wrong, and the follow-up takes the ticker from the entity-map feed instead
 |---|---|---|
 | `OUT_OF_SCOPE` | `btc_full`, `eth_full`, `sol_full` (Binance/CoinGecko), anything whose static feed is not one `YF:<T>:<basis field>` series | never fed by the two yfinance fields, so the alternating-basis defect cannot exist there; a same-named yfinance ticker (bare `BTC`/`ETH` pulled as equities 2025-11..2026-05) is unrelated. The r1 run planned 96-97 % retraction and left them dark |
 | `NO_BASIS_SPLIT` | `RAW_CLOSE_FULL_FEATURES` except `spy_full`: `gold_full` (`GC=F`), `sp500_full`, `btc_usd_full`, `eth_usd_full`, `sol_usd_full` | no corporate actions, `adj_close == close`; a value matching one field only is pull-timing drift on a 24/7 or settlement bar, not a basis flip (r1 would have retracted 2,058 `eth_usd_full` rows for nothing). `gold_full` in r1 was compared against ticker `GOLD` = Barrick: 100 % retract, after-ratio 1.12 = Barrick, before-ratio 3.65 = gold |
-| `NEEDS_BACKFILL` | in scope, but more than `--coverage-floor` (1 %) of today's served cells would have no on-basis raw row to re-vintage from: `acn_full`, `hon_full` (Tiingo `adj_close` starts 2021-04-01, ~half of the 2010+ cells) | **backfill first, repair second.** A backfill writes `YF:<T>:adj_close` rows with the backfill day's pull date; re-running the plan then re-vintages every dark cell from them. Until then these features are internally consistent raw-close series (the panel no longer runs the heuristic adjuster, so the residual error is dividend-sized). The JSON carries `backfill_hint` with the obs_date range |
+| `NEEDS_BACKFILL` | in scope, but more than `--coverage-floor` (1 %) of today's served cells would have no on-basis raw row to re-vintage from: `acn_full`, `hon_full` (Tiingo `adj_close` starts 2021-04-01, ~half of the 2010+ cells) | **backfill first, repair second.** A backfill writes `YF:<T>:adj_close` rows with the backfill day's pull date; re-running the plan then lists a re-vintage for every dark cell from them (review manifest only: applying it needs the future executor below). Until then these features are internally consistent raw-close series (the panel no longer runs the heuristic adjuster, so the residual error is dividend-sized). The JSON carries `backfill_hint` with the obs_date range |
 | `EXCLUDED` | named with `--exclude` | operator's call, reported, never read or written |
 
 Dark-cell accounting, per feature: `cells_dark_before` (no visible row today: every row
@@ -174,14 +174,64 @@ many of them can be re-vintaged from an on-basis raw row. Reads are bounded (res
 `feature_id`; raw by `(series_id, obs_date)` yearly chunks), READ ONLY, with a statement
 timeout, and refused inside the 03:30-10:30 UTC DB window unless `--allow-db-window`.
 
-`--apply --run-tag <tag>` (only on Anik's explicit word; Root/Anik decide):
+**Apply is disabled from this change on.** The earlier per-feature executor was used in
+production for every in-scope feature before it was removed: run tags
+`full-basis-20261109` (99 features, 2026-11-09), `full-basis-20261110-nine` (the nine
+`NEEDS_BACKFILL` features after the ACN/HON backfill and the 30-day guard fix) and
+`full-basis-20261110-xlre` (`xlre_full`, after the pre-inception fix). Those retractions are
+append-only rows in `resolved_series_retractions`, keyed by `run_tag`; nothing here touches
+them. From now on CLI `--apply`, `run(apply=True)`
+and direct `apply_plan` all refuse before opening a connection. The previous
+unreviewed per-feature executor and `ON CONFLICT DO NOTHING` writes were removed.
+A run tag is not admission. No current manifest, including r1/r2, authorizes repair.
+No corrected production r3 or historical repair is verified by this code change.
 
-1. inserts one `resolved_series_retractions` row per OFF_BASIS/OUTLIER row (append-only;
-   the FK keeps the retracted row; reads with `as_of` before the retraction day are
-   unchanged, reads from that day on no longer see it);
-2. for a cell left without a visible vintage, inserts ONE new `resolved_series` row dated
-   the repair day with the latest on-basis raw value (`ON CONFLICT DO NOTHING`);
-3. nothing is UPDATEd or DELETEd; a cell with no on-basis raw row stays dark and is counted.
+The report keeps the existing `features` summaries and count fields. Its new
+`manifest` contains a canonical SHA-256 identity and a review-only payload with:
+
+- Every exact proposed retraction (resolved ID/key/value/class/reason), every
+  re-vintage (key/value/source/pull date), and rejected candidates, without truncation.
+- Feature identity and feed, requested feature scope, completion/stopped/error state,
+  repair day, run tag, start bound, policy settings and relevant source-file hashes.
+- A canonical fingerprint and row counts over the complete **observed planner
+  inputs**, including resolved retraction flags and raw source/value/pull timestamps.
+  Fingerprints preserve duplicates and ignore row arrival order. Full source tables
+  are not duplicated in the artifact. The hash is not a PostgreSQL snapshot ID.
+
+`validate_review_manifest` checks a separately supplied reviewed digest against the
+artifact and a freshly reconstructed manifest. It rejects changed inputs, actions,
+code, policy, day or requested scope, incomplete/error manifests, unsafe features,
+and duplicate action keys. This is **offline identity validation only**, not proof
+of operator approval or an execution capability. `applicable` remains a planning
+summary for compatibility; it never means execution is enabled.
+
+A first served cell without raw close evidence now has `UNSAFE_FIRST_CELL` status,
+not a warning. Missing/unknown first-cell evidence never makes a plan applicable.
+Non-finite inputs and duplicate resolved identities fail planning. Same-time raw
+candidate conflicts use deterministic ordering for reproducible review, are disclosed
+in `candidate_ties`, and make the plan non-applicable; the ordering is not authority
+for choosing a source. Repair-day key collisions are reported rather than overwritten.
+
+`--out` uses exclusive creation and refuses to overwrite an existing review file.
+Retain the exact artifact and its digest separately in an operator-private location.
+The artifact is content-addressed/tamper-evident, not filesystem-immutable or signed.
+Input fingerprinting also temporarily materializes one feature's observed input rows
+and canonical JSON; it is not a streaming or constant-memory implementation.
+It can be large because all proposed actions are retained; review bounded feature
+batches rather than printing a multi-million-action artifact into public logs.
+
+**Remaining executor gate:** qualify snapshot acquisition and atomic change detection
+against concurrent inserts/retractions (including previously absent keys), enforce
+reviewed repair day and identity, and roll back the entire approved unit on conflict.
+Require append-only preservation of every original row, exact inserted action counts,
+atomic rollback (never silent conflict skipping), replay/idempotency, repair-day
+collision handling and reproducible pre-retraction PIT reads. The former simple
+apply/idempotency test is replaced by refusal tests, not evidence for these gates.
+Exercise adversarial races and PIT semantics in disposable PostgreSQL first, then
+obtain operational review and explicit production authorization. Chunked read-only
+transactions do not establish one snapshot, a re-read followed by a write has a race,
+and ordinary row locks do not protect absent keys. This patch introduces no broad
+production table locks and makes no concurrency-safety claim for a future executor.
 
 Reads: resolved rows by `feature_id` in one READ ONLY transaction, raw rows per
 `(series_id, calendar-year)` chunk each in its own short READ ONLY transaction (r1 held one
@@ -189,10 +239,32 @@ connection 60-70 s per large feature). `--exclude <feature>` is repeatable;
 `--coverage-floor` defaults to 0.01. A plan whose status is not `IN_SCOPE` is never
 applied, whatever flags are passed.
 
-After applying, re-run the dry run: `served_after` ratios should be plausible and
+After a future qualified and separately authorized repair, re-run the dry run: `served_after` ratios should be plausible and
 `jumps_gt_10pct` near zero; then `build_price_panel` for the 30-ticker universe should
 match Tiingo `adj_close` read through `store.observations.read_window` to within the
 first-pull dividend drift above.
+
+## Pre-inception cells and the trading-day test (2026-11-10)
+
+`xlre_full` was excluded from the 2026-11-09/10 repair runs: it serves a 2010-01-01 cell and
+others dated before XLRE was listed (2015-10-08), valued ~1.0339 in **both** raw fields, so
+the classifier calls them AMBIGUOUS (kept) and the neighbouring junk cells anchor the outlier
+median. `INCEPTION_DATES` in `scripts/repair_full_panel_vintages.py` is an explicit override
+map (XLRE 2015-10-08, XLC 2018-06-19; first NYSE Arca trading day per the SSGA fund pages,
+cited in the code), never a data heuristic. A row dated before the ticker's date is classed
+`PRE_INCEPTION`: retracted under its own reason, never re-vintaged, never a neighbour for the
+outlier reference; its cell going dark is `cells_phantom_cleared` (also counted in
+`cells_pre_inception_cleared`), never against the coverage floor. Add a ticker to the map only
+with a primary-source date.
+
+`after_first_on_trading_day` and the newly-dark / phantom split no longer use "a raw close row
+exists" as the test for a trading day (it flagged `nasdaq_full`, `russell2000_full`,
+`pypl_full`, `rxt_full` on ordinary Mondays, and hid a served trading-day cell with a missing
+raw row as phantom). They use `is_trading_day` (`ingestion/market_calendar.is_market_open`
+plus two corrections it lacks: Juneteenth is a market holiday only from 2022, and the one-off
+closures 2012-10-29/30, 2018-12-05, 2025-01-09). A closed-day cell whose only raw close print
+is itself a junk outlier (0.9-1.0 prints stamped on the 2018-12-05 and 2025-01-09 days of
+mourning) is phantom too.
 
 ## Downstream records to re-label as invalid (owners act; the script touches none)
 
@@ -211,7 +283,7 @@ The same list is in the script's JSON output under `downstream`.
 |---|---|---|
 | `YF:HON:adj_close` has no SUCCESS row since **2026-04-17** while `YF:HON:close` continues | grid-svr read 2026-11-08: 1,267 rows 2021-04-01..2026-04-17, source TIINGO | puller: find why Tiingo's adj_close for HON stopped; check `pull_log` for every ticker whose `adj_close` max(obs_date) lags its `close`. Under the one-basis policy `hon_full` gets no new vintages until fixed |
 | Barrick (`GOLD`) in the Tiingo daily list has fed `gold_full` since **2025-12-02** | `YF:GOLD:adj_close` 3,500 rows 2025-12-02..2026-11-06 (TIINGO); `YF:GOLD:close` 10,840 rows since 1985 (KAGGLE_BULK, TIINGO) | the fallback guard stops new rows; `gold_full` rows dated 2025-12 onward whose latest vintage is a Barrick value (~$20-40 against ~$4,000 futures) still need a targeted retraction (own run tag, `resolved_series_retractions`), not this script |
-| `acn_full`, `hon_full` and any other `NEEDS_BACKFILL` feature | Tiingo `adj_close` backfill starts 2021-04-01 | backfill `YF:<T>:adj_close` 2010-01-01..2021-03-31 (Tiingo `tiingo-backfill`), then re-run the plan |
+| `acn_full`, `hon_full` and any other `NEEDS_BACKFILL` feature | Tiingo `adj_close` backfill starts 2021-04-01 | backfill `YF:<T>:adj_close` 2010-01-01..2021-03-31 (Tiingo `tiingo-backfill`), then re-run the plan. Done for ACN/HON 2010-01-04..2014-03-26 and applied under `full-basis-20261110-nine`; `acn_full` still has no cells 2014-03..2021-03. Any further repair needs the qualified executor (apply is disabled) |
 | the 150-cell dark group shared by `qqq_full`, `dia_full`, `xle_full`, `xlv_full`, `xlu_full` (r2) | one obs_date range with no `adj_close` raw row on every SPDR/QQQ | the follow-up script reports it as `cells_newly_dark` with the range (≈ 3 % of cells, above the 1 % floor → `NEEDS_BACKFILL`) or as `cells_dark_before`; backfill that range if the former |
 | r2 left the four headline features untouched: `xlp_full`, `xlb_full`, `xlre_full`, `xli_full` served the 2010-01-01 holiday junk print first before AND after (xlp 0.7245 → 90.08, ratio 124, 301 jumps) | the dark holiday cell was re-vintaged from the junk print itself | fixed in the follow-up (re-vintage guard, `cells_phantom_cleared`); r3 must show `served_after.first` on a trading day for all four and `after_first_not_trading_day` empty in the report |
 | `xle_full` last served cell 2026-11-06 = 61.62 (XLE was ~$90 in 2025) | r2 served_after; the 150-cell dark group also sits on XLE | glance at `YF:XLE:close` / `adj_close` 2026 raw rows when the 150-cell range is read; a wrong last cell makes the 3.57 ratio wrong too |

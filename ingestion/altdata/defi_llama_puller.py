@@ -33,7 +33,8 @@ from intelligence.actor_ingest import ingest_actors_batch
 
 # ---- API URLs ----
 _BASE_URL: str = "https://api.llama.fi"
-_PROTOCOLS_URL: str = f"{_BASE_URL}/v2/protocols"
+# Protocol lists are unversioned; /v2/protocols returns HTTP 404.
+_PROTOCOLS_URL: str = f"{_BASE_URL}/protocols"
 _CHAINS_URL: str = f"{_BASE_URL}/v2/chains"
 _HISTORICAL_CHAIN_TVL_URL: str = f"{_BASE_URL}/v2/historicalChainTvl"
 # The free OpenAPI operation overrides the TVL server for stablecoins.

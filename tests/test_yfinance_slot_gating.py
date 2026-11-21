@@ -94,7 +94,8 @@ def _24x7_pullers_ran(world: _World) -> None:
     mods = world.modules
     mods["ingestion.coingecko"].CoinGeckoPuller.return_value.pull_all.assert_called_once()
     mods["ingestion.altdata.google_trends"].GoogleTrendsPuller.return_value.pull_all.assert_called_once()
-    mods["ingestion.crucix_bridge"].CrucixBridgePuller.return_value.pull_all.assert_called_once()
+    # Crucix left run_daily_pulls on 2026-11-17 (grid-intelligence runs it every 15 min).
+    mods["ingestion.crucix_bridge"].CrucixBridgePuller.assert_not_called()
     mods["ingestion.ml.finbert_scorer"].FinBERTScorer.return_value.score_all_sources.assert_called_once()
     mods["scripts.auto_regime"].run.assert_called_once()
 
@@ -365,8 +366,43 @@ def test_domestic_slots_are_unchanged_and_the_morning_slot_is_not_one_of_them(mo
 
     domestic = [j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls]
     assert len(domestic) == 28
-    assert {j.job_func.keywords["slot"] for j in domestic} == {"13:30", "16:00", "20:00", "22:00"}
-    assert not hasattr(sched, "YFINANCE_SKIP_SLOTS")  # 13:30 keeps yfinance
+    assert {j.job_func.keywords["slot"] for j in domestic} == {"09:30", "16:00", "20:00", "22:00"}
+    assert not hasattr(sched, "YFINANCE_SKIP_SLOTS")  # the morning slot keeps yfinance
+
+
+def test_domestic_morning_slot_is_0930_new_york_in_both_seasons(monkeypatch) -> None:
+    """2026-11-16: a fixed 13:30Z slot was 08:30 EST, before the open, all winter."""
+    jobs = _registered_jobs(monkeypatch)
+    morning = [j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls
+               and j.job_func.keywords["slot"] == "09:30"]
+    assert len(morning) == 7
+    for j in morning:
+        assert j.at_time.strftime("%H:%M") == "09:30"
+        assert str(j.at_time_zone) == "America/New_York"
+        assert j.job_func.keywords["slot_tz"] == "America/New_York"
+    others = [j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls
+              and j.job_func.keywords["slot"] != "09:30"]
+    assert all(j.at_time_zone is None and "slot_tz" not in j.job_func.keywords for j in others)
+
+
+@pytest.mark.parametrize("now_utc, late_min, label", [
+    (datetime(2026, 11, 23, 14, 30, 44, tzinfo=timezone.utc), 0, "14:30"),   # EST: 09:30 New York
+    (datetime(2027, 6, 7, 13, 30, 44, tzinfo=timezone.utc), 0, "13:30"),     # EDT: unchanged 13:30Z
+    (datetime(2026, 11, 23, 16, 5, 0, tzinfo=timezone.utc), 95, "14:30"),    # released 95 min late
+])
+def test_new_york_slot_lateness_and_utc_label(now_utc, late_min, label) -> None:
+    late = sched._slot_lateness("09:30", now_utc, "America/New_York")
+    assert int(late.total_seconds() // 60) == late_min
+    assert sched._slot_utc_label("09:30", "America/New_York", now_utc) == label
+
+
+def test_a_late_new_york_morning_slot_is_skipped(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(sched, "_slot_lateness",
+                        lambda slot, now=None, tz=None: calls.append((slot, tz)) or timedelta(minutes=91))
+    monkeypatch.setattr(sched, "_run_equity_pulls", lambda *a, **k: calls.append("equity"))
+    sched.run_daily_pulls(start_date="2026-11-23", slot="09:30", slot_tz="America/New_York")
+    assert calls == [("09:30", "America/New_York")]
 
 
 # ── D3: the expected SPY provisional-close refusal is not an item failure ──

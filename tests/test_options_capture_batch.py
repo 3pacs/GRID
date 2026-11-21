@@ -121,6 +121,8 @@ class _Transaction:
 
 
 class _Yahoo:
+    provider = "yahoo"
+
     def __init__(self, expirations: list[int], strikes: list[float], *, fail_second: bool = False) -> None:
         self.expirations = expirations
         self.strikes = strikes
@@ -156,7 +158,6 @@ def puller(monkeypatch: pytest.MonkeyPatch) -> options.OptionsPuller:
     monkeypatch.setattr(options, "compute_max_pain", lambda *_args: 100.0)
     monkeypatch.setattr(options, "compute_iv_skew", lambda *_args: 0.0)
     monkeypatch.setattr(options, "_compute_atm_iv", lambda *_args: 0.2)
-    monkeypatch.setattr(options, "_compute_wing_iv", lambda *_args, **_kwargs: 0.2)
     monkeypatch.setattr(options, "_compute_oi_concentration", lambda *_args: 0.5)
     return obj
 
@@ -201,6 +202,34 @@ def test_completed_batch_time_follows_final_provider_response(
     (batch,) = db.batches
     assert batch["row_count"] == 4 and batch["source"] == "options_puller"
     assert batch["batch_id"] == result["capture_batch_id"]
+    assert batch["spot_provider"] == "yahoo"
+    assert batch["spot_market_at"] == SESSION_NOW - timedelta(hours=2)
+
+
+def test_header_price_clock_is_first_page_even_when_first_expiry_is_empty(puller):
+    """A later contract clock cannot be substituted for the header's spot."""
+    class Pages(_Yahoo):
+        provider_by_ticker = {"SPY": "cboe"}
+
+        def get_options(self, ticker, expiry=None):
+            page = super().get_options(ticker, expiry)
+            if self.calls == 1:
+                page["calls"] = page["puts"] = []
+                page["quote"]["regularMarketPrice"] = 101.0
+            else:
+                page["quote"]["regularMarketTime"] += 600
+                page["quote"]["regularMarketPrice"] = 105.0
+            return page
+
+    expirations = [int((SESSION_NOW + timedelta(days=d)).timestamp()) for d in (10, 20)]
+    puller._yahoo = Pages(expirations, [100.0])
+    result = puller._pull_ticker("SPY", SESSION_NOW.date().isoformat())
+    assert result["status"] == "SUCCESS"
+    batch = puller.engine.batches[0]
+    assert batch["spot"] == 101.0
+    assert batch["spot_provider"] == "cboe"
+    assert batch["spot_market_at"] == SESSION_NOW - timedelta(hours=2)
+    assert all(r["provider_regular_market_at"] != batch["spot_market_at"] for r in puller.engine.rows)
 
 
 def test_cancel_before_publish_does_not_write_or_advance_freshness(puller):

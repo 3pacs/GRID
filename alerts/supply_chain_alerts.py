@@ -25,6 +25,10 @@ Trigger conditions
 7. **New chain contagion risk** — if ``intelligence.chain_contagion`` is
    importable and a new edge has ``chokepoint_score >= 0.8``, run a
    contagion simulation and attach the top-3 downstream victims.
+8. **Stale graph** (3pacs/GRID#1179) — no edge created in the last
+   ``stale_days`` (30). Alerted once per ISO week while it lasts; the
+   payload carries :func:`graph_freshness` (edges added in 7 and 30 days,
+   edges validated in 7 days, the newest edge).
 
 State
 -----
@@ -74,6 +78,7 @@ DEFAULT_HIGH_CHOKE_THRESHOLD: float = 0.7
 DEFAULT_CONTAGION_TRIGGER: float = 0.8
 DEFAULT_MIN_ACQ_USD: float = 5e9
 DEFAULT_GEO_MIN_NODES: int = 3
+DEFAULT_STALE_DAYS: int = 30
 
 CANVAS_LINK_BASE: str = "https://grid.stepdad.finance/#/canvas"
 
@@ -726,8 +731,61 @@ DETECTOR_ORDER: tuple[str, ...] = (
     "new_high_chokepoints",
     "geographic_spikes",
     "large_acquisitions",
+    "graph_stale",
     "contagion_risk",
 )
+
+
+def graph_freshness(conn: Any) -> dict[str, Any]:
+    """Edges added (7 / 30 days), edges validated (7 days) and the newest edge. Read-only."""
+    row = conn.execute(text(
+        """
+        SELECT COUNT(*) AS edges,
+               MAX(created_at) AS newest_created,
+               COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS added_7d,
+               COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') AS added_30d,
+               COUNT(*) FILTER (WHERE last_validation_at > NOW() - INTERVAL '7 days') AS validated_7d,
+               MAX(last_validation_at) AS last_validation
+        FROM supply_chain_edges
+        """
+    )).mappings().fetchone()
+    out = dict(row) if row else {}
+    for k in ("newest_created", "last_validation"):
+        if out.get(k) is not None:
+            out[k] = out[k].isoformat()
+    return {k: (int(v) if isinstance(v, int) else v) for k, v in out.items()}
+
+
+def detect_graph_stale(engine: Engine, stale_days: int = DEFAULT_STALE_DAYS) -> list[dict[str, Any]]:
+    """One finding per ISO week while no edge has been created for ``stale_days``."""
+    with engine.connect() as conn:
+        fresh = graph_freshness(conn)
+        newest = fresh.get("newest_created")
+        if fresh.get("edges") and newest:
+            age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(newest)).total_seconds() / 86400
+        else:
+            age_days = None
+        if age_days is not None and age_days < stale_days:
+            return []
+        year, week, _ = datetime.now(timezone.utc).isocalendar()
+        key = f"graph_stale:{year}-W{week:02d}"
+        if _already_alerted(conn, "graph_stale", key):
+            return []
+    age = "no edges at all" if age_days is None else f"no new edge in {age_days:.0f} days"
+    return [Finding(
+        alert_type="graph_stale",
+        key=key,
+        entity="supply_chain_edges",
+        headline=f"Supply-chain graph is stale: {age}",
+        delta=f"+{fresh.get('added_30d', 0)} edges in 30 days",
+        context=(
+            f"{fresh.get('edges', 0)} edges; newest created {newest or 'never'}; "
+            f"{fresh.get('added_7d', 0)} added in 7 days, {fresh.get('validated_7d', 0)} validated in 7 days. "
+            "The weekly 10-K parser and edge validator should be adding and checking edges."
+        ),
+        deep_link=CANVAS_LINK_BASE,
+        payload=fresh,
+    ).as_dict()]
 
 
 def run_all(
@@ -789,6 +847,13 @@ def run_all(
         log.warning("large_acquisitions detector failed: {e}", e=str(exc))
         findings["large_acquisitions"] = []
         failed_detectors.append("large_acquisitions")
+
+    try:
+        findings["graph_stale"] = detect_graph_stale(engine)
+    except Exception as exc:  # noqa: BLE001 - same isolation as every detector above
+        log.warning("graph_stale detector failed: {e}", e=str(exc))
+        findings["graph_stale"] = []
+        failed_detectors.append("graph_stale")
 
     try:
         findings["contagion_risk"] = detect_contagion_risk(engine)
@@ -864,6 +929,7 @@ _SECTION_TITLES: dict[str, tuple[str, str]] = {
     "new_high_chokepoints":   ("New High Chokepoints",           "red"),
     "geographic_spikes":      ("Geographic Concentration Spikes", "amber"),
     "large_acquisitions":     ("Large Acquisitions",             "purple"),
+    "graph_stale":            ("Stale Supply-Chain Graph",       "amber"),
     "contagion_risk":         ("Contagion Risk",                 "red"),
 }
 
@@ -1017,6 +1083,8 @@ __all__ = [
     "detect_geographic_spikes",
     "detect_large_acquisitions",
     "detect_contagion_risk",
+    "detect_graph_stale",
+    "graph_freshness",
     "refresh_snapshots",
     "run_all",
     "render_digest_html",

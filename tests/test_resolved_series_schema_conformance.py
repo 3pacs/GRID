@@ -8,9 +8,10 @@ execution, and was logged at debug — so nothing in CI or in the logs said a
 word for five and a half months.
 
 This module re-reads ``schema.sql`` and checks every SQL literal that names
-``resolved_series`` in the four modules that write or read it outside the API
+``resolved_series`` in the guarded modules that write or read it outside the API
 layer — ``scripts/hermes_operator.py``, ``normalization/resolver.py``,
-``scripts/hermes_fixers.py`` and ``ingestion/scheduler.py``:
+``scripts/hermes_fixers.py``, ``ingestion/scheduler.py`` and the options publisher
+``ingestion/options.py``:
 
   * every column named in an INSERT column list is a real column;
   * every ``alias.column`` reference bound to resolved_series is real;
@@ -36,13 +37,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
 # The pipeline modules whose resolved_series SQL is schema-checked: the
-# resolver (the only writer), the two Hermes-side readers, and the operator
-# itself.
+# resolver, the options publisher, the two Hermes-side readers, and the operator.
 GUARDED_MODULES = (
     "scripts/hermes_operator.py",
     "normalization/resolver.py",
     "scripts/hermes_fixers.py",
     "ingestion/scheduler.py",
+    "ingestion/options.py",
 )
 
 # Of those, the ones that must actually yield SQL literals. A module here
@@ -53,6 +54,7 @@ GUARDED_MODULES = (
 MODULES_REQUIRING_SQL = (
     "normalization/resolver.py",
     "scripts/hermes_fixers.py",
+    "ingestion/options.py",
 )
 # ingestion/scheduler.py stays guarded but no longer yields resolved_series
 # SQL: its only literal was the stale-price lookup feeding the retired
@@ -255,8 +257,27 @@ class TestSchemaIntrospection:
         assert columns == {
             "id", "feature_id", "obs_date", "release_date", "vintage_date",
             "value", "source_priority_used", "conflict_flag",
-            "conflict_detail", "resolution_version",
+            "conflict_detail", "resolution_version", "options_iv_metadata",
         }
+
+    def test_options_iv_metadata_is_nullable_jsonb_without_default(self, monkeypatch):
+        """Fresh schema and migration must agree on nullable JSONB metadata."""
+        import importlib
+        from types import SimpleNamespace
+
+        declarations = re.findall(
+            r"^\s*options_iv_metadata\s+([^,\n]+)",
+            SCHEMA_PATH.read_text(), re.M,
+        )
+        assert declarations == ["JSONB"]
+        migration = importlib.import_module("migrations.versions.wing_iv_proxy_20261116")
+        statements = []
+        monkeypatch.setattr(migration, "op", SimpleNamespace(execute=statements.append))
+        migration.upgrade()
+        resolved_ddl = [sql for sql in statements if "ALTER TABLE resolved_series" in sql]
+        assert resolved_ddl == [
+            "ALTER TABLE resolved_series ADD COLUMN IF NOT EXISTS options_iv_metadata JSONB",
+        ]
 
     def test_columns_the_2026_03_regression_invented_do_not_exist(self, schema):
         columns, _, _ = schema

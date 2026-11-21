@@ -27,13 +27,18 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger as log
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata.quiverquant_identity import feed_source_id, feed_source_id_sql
+from ingestion.altdata.quiverquant_identity import (
+    calendar_dated_leftover_sql,
+    feed_source_id,
+    feed_source_id_sql,
+    is_calendar_dated_leftover,
+)
 from ingestion.altdata import quiverquant_transactions as tx
 
 
@@ -674,7 +679,7 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "scored": 0, "correct": 0, "wrong": 0, "expired": 0,
         "skipped_no_price": 0, "skipped_unpriceable": 0,
-        "skipped_unknown_direction": 0,
+        "skipped_unknown_direction": 0, "skipped_qq_gov_leftover": 0,
     }
 
     # One price lookup per (ticker, date) per cycle, and once a ticker has
@@ -712,6 +717,13 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             # Determine evaluation window for this source type
             eval_days = EVALUATION_WINDOWS.get(src_type, 7)
             signal_dt = signal_date if isinstance(signal_date, date) else signal_date.date()
+
+            # A gov_contracts row the fiscal re-date could not move sits one
+            # quarter late (often in the future) and would be scored as the
+            # next quarter's award: never score it, never expire it.
+            if src_type == QQ_GOV_CONTRACTS and is_calendar_dated_leftover(signal_dt, signal_value):
+                summary["skipped_qq_gov_leftover"] += 1
+                continue
 
             # Not enough time has passed yet
             if (today - signal_dt).days < eval_days:
@@ -917,30 +929,45 @@ def rescore_source_type(
 # dead band), INELIGIBLE and not-yet-scored rows count as neither.
 OUTCOME_BASIS_LEGACY = "legacy:signal_sources.outcome"
 
-_LEGACY_SCORED_ROWS_SQL = """
+QQ_GOV_CONTRACTS = "quiverquant:gov_contracts"
+
+
+def _not_qq_gov_leftover(alias: str = "") -> str:
+    """``NOT (...)`` for the gov_contracts rows the fiscal re-date left one
+    quarter late (``is_calendar_dated_leftover``): duplicates of a quarter that
+    already has its fiscal row, or a quarter whose fiscal slot is held. Their
+    outcomes, scored at the wrong date, are not trust evidence."""
+    return (f"NOT ({alias}source_type = '{QQ_GOV_CONTRACTS}' AND "
+            f"{calendar_dated_leftover_sql(f'{alias}signal_date', f'{alias}signal_value')})")
+
+
+_LEGACY_SCORED_ROWS_SQL = f"""
             SELECT source_type, source_id, outcome, outcome_return, signal_date, ticker
             FROM signal_sources
             WHERE outcome IN ('CORRECT', 'WRONG')
+              AND {_not_qq_gov_leftover()}
             ORDER BY source_type, source_id, signal_date DESC
         """
 
-_CORRECTED_SCORED_ROWS_SQL = """
+_CORRECTED_SCORED_ROWS_SQL = f"""
             SELECT s.source_type, s.source_id, o.outcome, o.raw_return, o.signal_date, s.ticker
             FROM signal_source_outcomes o
             JOIN signal_sources s ON s.id = o.signal_source_id
             WHERE o.evaluation_version = :version
               AND o.outcome IN ('CORRECT', 'WRONG')
+              AND {_not_qq_gov_leftover("s.")}
             ORDER BY s.source_type, s.source_id, o.signal_date DESC
         """
 
 # Neither-hit-nor-miss outcomes, per raw source_id: a source with only these
 # still gets a (prior) trust score instead of keeping a stale legacy one.
-_CORRECTED_NEUTRAL_COUNTS_SQL = """
+_CORRECTED_NEUTRAL_COUNTS_SQL = f"""
             SELECT s.source_type, s.source_id, o.outcome, COUNT(*), MAX(o.signal_date)
             FROM signal_source_outcomes o
             JOIN signal_sources s ON s.id = o.signal_source_id
             WHERE o.evaluation_version = :version
               AND o.outcome IN ('NO_MOVE', 'INELIGIBLE')
+              AND {_not_qq_gov_leftover("s.")}
             GROUP BY s.source_type, s.source_id, o.outcome
         """
 
@@ -1190,7 +1217,16 @@ def _propagate_trust(engine: Engine, entry: dict[str, Any]) -> int:
     return propagated
 
 
-def update_trust_scores(engine: Engine) -> dict[str, Any]:
+def _trust_source_key(entry: dict[str, Any]) -> tuple[str, str]:
+    return (str(entry["source_type"]), str(entry["source_id"]))
+
+
+def update_trust_scores(
+    engine: Engine,
+    *,
+    should_continue: Callable[[], bool] | None = None,
+    resume_after: tuple[str, str] | list[str] | None = None,
+) -> dict[str, Any]:
     """Recompute trust scores (``compute_trust_scores``) and propagate them.
 
     Updates the trust aggregates (``trust_score``, ``hit_count``,
@@ -1199,11 +1235,36 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
     ``GRID_TRUST_USE_CORRECTED_OUTCOMES``.
 
     Returns ranked list of source dicts.
+
+    Resumable mode (``should_continue`` or ``resume_after`` given; Hermes,
+    2026-11-18): propagation walks sources in ``(source_type, source_id)``
+    order, skips every key ``<= resume_after``, and checks
+    ``should_continue()`` before each source. When it returns False the walk
+    stops and the result carries ``complete=False`` plus ``resume_after``
+    (the last key written), so the next call carries on from there. At
+    ~13.6k sources the full walk takes ~12-14 min on grid-svr, longer than
+    the Hermes step that used to wrap it. ``sources`` then holds only the
+    sources written by this call, ranked; ``ranked_sources`` holds the full
+    ranked list. With neither argument the behaviour is unchanged: every
+    source, in rank order.
     """
     _ensure_tables(engine)
     result = compute_trust_scores(engine)
+    resumable = should_continue is not None or resume_after is not None
+    after = tuple(resume_after) if resume_after else None
+    todo = result["sources"]
+    if resumable:
+        todo = sorted(
+            (s for s in todo if after is None or _trust_source_key(s) > after),
+            key=_trust_source_key,
+        )
+    complete = True
+    last_key = after
     sources_updated: list[dict[str, Any]] = []
-    for entry in result["sources"]:
+    for entry in todo:
+        if should_continue is not None and not should_continue():
+            complete = False
+            break
         try:
             entry["propagated_rows"] = _propagate_trust(engine, entry)
         except Exception as exc:
@@ -1213,6 +1274,24 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
             )
             raise
         sources_updated.append(entry)
+        last_key = _trust_source_key(entry)
+
+    if resumable:
+        sources_updated.sort(key=lambda s: s.get("rank", 0))
+        log.info(
+            "Trust scores propagated for {n} sources this pass ({b}); "
+            "complete={c}, {left} left",
+            n=len(sources_updated), b=result["outcome_basis"], c=complete,
+            left=len(todo) - len(sources_updated),
+        )
+        return {
+            "sources": sources_updated,
+            "total": len(sources_updated),
+            "outcome_basis": result["outcome_basis"],
+            "complete": complete,
+            "resume_after": None if complete else (list(last_key) if last_key else None),
+            "ranked_sources": result["sources"],
+        }
 
     log.info(
         "Trust scores updated for {n} sources ({b}). "
@@ -1817,7 +1896,12 @@ def detect_convergence(
 
 # ── 6. Generate Trust Report ──────────────────────────────────────────────
 
-def generate_trust_report(engine: Engine) -> str:
+def generate_trust_report(
+    engine: Engine,
+    *,
+    trust_result: dict[str, Any] | None = None,
+    convergence: list[dict[str, Any]] | None = None,
+) -> str:
     """Generate a human-readable trust scoring report.
 
     Includes:
@@ -1825,18 +1909,26 @@ def generate_trust_report(engine: Engine) -> str:
       - Bottom 10 (consistently wrong — contrarian indicator candidates)
       - Convergence events in last 7 days
       - LLM narrative if available
+
+    ``trust_result`` / ``convergence``: a caller that has just run
+    ``update_trust_scores`` / ``detect_convergence`` (``run_trust_cycle``)
+    passes their output so the report does not run them a second time.
+    Before 2026-11-18 every trust cycle propagated all ~13.6k sources twice
+    (~12 min each on grid-svr), once for the cycle and once here.
     """
     _ensure_tables(engine)
 
     # Get all scored sources
-    trust_result = update_trust_scores(engine)
+    if trust_result is None:
+        trust_result = update_trust_scores(engine)
     all_sources = trust_result.get("sources", [])
 
     top_10 = all_sources[:10]
     bottom_10 = list(reversed(all_sources[-10:])) if len(all_sources) >= 10 else list(reversed(all_sources))
 
     # Convergence events
-    convergence = detect_convergence(engine)
+    if convergence is None:
+        convergence = detect_convergence(engine)
     recent_convergence = [
         e for e in convergence
         if e.get("detected_at", "") >= (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -2006,60 +2098,150 @@ def _score_forward_outcomes(engine: Engine) -> dict[str, Any]:
         return {"error": str(exc)}
 
 
-def run_trust_cycle(engine: Engine) -> dict[str, Any]:
+def _sync_actor_trust(engine: Engine) -> int:
+    try:
+        from intelligence.actor_signal_bridge import sync_actor_trust_to_signal_sources
+        return sync_actor_trust_to_signal_sources(engine)
+    except Exception as exc:
+        log.debug("Actor trust sync skipped: {e}", e=str(exc))
+        return 0
+
+
+def run_trust_cycle(
+    engine: Engine,
+    *,
+    should_continue: Callable[[], bool] | None = None,
+    progress: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Orchestrate the full trust scoring cycle.
 
     Steps:
       1. Score pending signals against actual price outcomes
-      2. Update trust scores with Bayesian recency weighting
-      3. Detect convergence events
-      4. Generate human-readable report
+      2. Sync actor trust scores into signal_sources
+      3. Update trust scores with Bayesian recency weighting
+      4. Detect convergence events
+      5. Generate human-readable report (from steps 3 and 4)
 
     Designed to be called by hermes_operator on a recurring schedule.
 
+    Order and end state (2026-11-18). Before this change the order was
+    score, propagate, convergence, actor sync, then a report that called
+    ``update_trust_scores`` again. That second propagation overwrote the
+    actor-sync values on every propagated row, so the end state of
+    ``signal_sources.trust_score`` was the computed trust. Running the actor
+    sync before the one propagation gives the same end state with one
+    ~12-14 min propagation instead of two. Convergence still reads the
+    computed values.
+
+    Resumable (``should_continue`` and/or ``progress`` given, as Hermes
+    does): ``progress`` is a caller-owned dict that carries the cycle across
+    calls. A call with an empty ``progress`` scores pending signals, writes
+    forward outcomes and syncs actor trust, then starts propagation. When
+    ``should_continue()`` turns False mid-propagation, the call returns
+    ``{"complete": False, ...}``, and ``progress`` keeps the scoring result
+    and the last propagated key. The next call skips straight to propagation
+    from that key. When propagation finishes, convergence and the report run,
+    ``progress`` is cleared, and the result carries ``complete=True``.
+    ``should_continue`` is checked between sources only, so the pre-
+    propagation steps and one source's pages always run to completion.
+    With neither argument the cycle runs to completion in one call.
+
     Returns:
-        dict with scoring, trust_update, convergence, and report.
+        dict with scoring, trust_update, convergence, report and complete.
     """
-    log.info("=== Trust Scoring Cycle Starting ===")
+    if progress is None:
+        progress = {}
 
-    # 1. Score pending signals
-    scoring = score_pending_signals(engine)
+    if progress.get("stage") != "propagate":
+        log.info("=== Trust Scoring Cycle Starting ===")
 
-    # 1b. Corrected outcomes (additive table; legacy column untouched).
-    forward_outcomes = _score_forward_outcomes(engine)
+        # 1. Score pending signals
+        scoring = score_pending_signals(engine)
 
-    # 2. Update trust scores
-    trust_update = update_trust_scores(engine)
+        # 1b. Corrected outcomes (additive table; legacy column untouched).
+        forward_outcomes = _score_forward_outcomes(engine)
 
-    # 3. Detect convergence
+        # 2. Sync actor trust scores back to signal_sources (see docstring
+        #    for why this now precedes propagation).
+        actor_sync_count = _sync_actor_trust(engine)
+
+        progress.clear()
+        progress.update({
+            "stage": "propagate",
+            "resume_after": None,
+            "passes": 0,
+            "propagated_sources": 0,
+            "scoring": scoring,
+            "forward_outcomes": forward_outcomes,
+            "actor_trust_synced": actor_sync_count,
+        })
+    else:
+        log.info(
+            "=== Trust Scoring Cycle resuming propagation after {k} (pass {p}) ===",
+            k=progress.get("resume_after"), p=int(progress.get("passes", 0)) + 1,
+        )
+
+    progress["passes"] = int(progress.get("passes", 0)) + 1
+    resumable = should_continue is not None or progress.get("resume_after") is not None
+
+    # 3. Update trust scores
+    if resumable:
+        trust_update = update_trust_scores(
+            engine,
+            should_continue=should_continue,
+            resume_after=progress.get("resume_after"),
+        )
+    else:
+        trust_update = update_trust_scores(engine)
+    progress["propagated_sources"] = (
+        int(progress.get("propagated_sources", 0)) + int(trust_update.get("total", 0))
+    )
+    scoring = progress.get("scoring") or {}
+
+    if not trust_update.get("complete", True):
+        progress["resume_after"] = trust_update.get("resume_after")
+        log.info(
+            "=== Trust Scoring Cycle paused: {n} sources propagated so far "
+            "(pass {p}), resumes after {k} ===",
+            n=progress["propagated_sources"], p=progress["passes"],
+            k=progress["resume_after"],
+        )
+        return {
+            "complete": False,
+            "passes": progress["passes"],
+            "propagated_sources": progress["propagated_sources"],
+            "resume_after": progress["resume_after"],
+            "scoring": scoring,
+        }
+
+    ranked = trust_update.pop("ranked_sources", None)
+    report_input = {"sources": ranked if ranked is not None else trust_update.get("sources", [])}
+
+    # 4. Detect convergence
     convergence = detect_convergence(engine)
 
-    # 3.5. Sync actor trust scores back to signal_sources
-    actor_sync_count = 0
-    try:
-        from intelligence.actor_signal_bridge import sync_actor_trust_to_signal_sources
-        actor_sync_count = sync_actor_trust_to_signal_sources(engine)
-    except Exception as exc:
-        log.debug("Actor trust sync skipped: {e}", e=str(exc))
-
-    # 4. Generate report
-    report = generate_trust_report(engine)
+    # 5. Generate report from the propagation and convergence just done
+    report = generate_trust_report(engine, trust_result=report_input, convergence=convergence)
 
     result = {
+        "complete": True,
+        "passes": progress.get("passes", 1),
         "scoring": scoring,
-        "forward_outcomes": forward_outcomes,
+        "forward_outcomes": progress.get("forward_outcomes"),
         "trust_update": trust_update,
         "convergence": convergence,
         "convergence_count": len(convergence),
-        "actor_trust_synced": actor_sync_count,
+        "actor_trust_synced": progress.get("actor_trust_synced", 0),
         "report": report,
     }
+    sources_total = len(report_input["sources"])
+    progress.clear()
 
     log.info(
         "=== Trust Scoring Cycle Complete: "
         "{s} scored, {t} sources updated, {c} convergence events ===",
         s=scoring.get("scored", 0),
-        t=trust_update.get("total", 0),
+        t=sources_total,
         c=len(convergence),
     )
     return result

@@ -89,6 +89,8 @@ from typing import Any, Iterable
 
 from sqlalchemy import text
 
+from tiingo_symbol_contract import is_foreign_tiingo_row, tiingo_cutoff
+
 SUCCESS = "SUCCESS"
 
 
@@ -160,6 +162,8 @@ def _dedup_latest_vintage(rows: Iterable[tuple], series_id: str) -> list[Observa
         if value is None:
             continue
         d = _coerce_date(obs_date)
+        if is_foreign_tiingo_row(series_id, source_name, d):
+            continue  # another instrument's price (tiingo_symbol_contract)
         if seen is not None and d == seen:
             continue  # older vintage of the same observation date
         seen = d
@@ -275,9 +279,58 @@ def read_latest(
         text(_LATEST_SQL),
         {"sid": series_id, "ok": SUCCESS, "source": source, "as_of": as_of, "as_of_ts": as_of_ts},
     ).fetchone()
+    if row is not None and is_foreign_tiingo_row(series_id, row[3], _coerce_date(row[0])):
+        # The newest row is another instrument's price: read again up to the
+        # last date TIINGO can be trusted for (none for a non-Tiingo symbol).
+        cutoff = tiingo_cutoff(series_id)
+        if cutoff is None or cutoff == date.min:
+            return None
+        bound = cutoff if as_of is None else min(as_of, cutoff)
+        row = conn.execute(
+            text(_LATEST_SQL),
+            {"sid": series_id, "ok": SUCCESS, "source": source, "as_of": bound, "as_of_ts": as_of_ts},
+        ).fetchone()
     if row is None or row[1] is None:
         return None
     return Observation(series_id, _coerce_date(row[0]), float(row[1]), _coerce_ts(row[2]), row[3])
+
+
+_VINTAGES_SQL = (
+    "SELECT r.obs_date, r.value, r.pull_timestamp, sc.name FROM raw_series r "
+    "JOIN source_catalog sc ON sc.id = r.source_id "
+    "WHERE r.series_id = :sid AND r.pull_status = :ok "
+    "  AND r.obs_date >= :start AND r.obs_date <= :end "
+    "ORDER BY r.obs_date ASC, r.pull_timestamp ASC LIMIT :limit"
+)
+MAX_VINTAGES = 5000
+
+
+def read_vintages(
+    conn: Any,
+    series_id: str,
+    *,
+    start: date,
+    end: date,
+    limit: int = MAX_VINTAGES,
+) -> list[Observation]:
+    """Every accepted vintage of ``series_id`` labelled in ``[start, end]``, every source,
+    oldest label then oldest pull first.
+
+    Unlike :func:`read_window` nothing is deduplicated: intraday captures, the completed
+    close and later revisions all come back with their pull times. For checking a
+    statement made at a known instant ("was VIX really 26.9 then?"), where the latest
+    vintage alone answers a different question. Bounded by the label window and ``limit``.
+    """
+    rows = conn.execute(
+        text(_VINTAGES_SQL),
+        {"sid": series_id, "ok": SUCCESS, "start": start, "end": end, "limit": int(limit)},
+    ).fetchall()
+    out: list[Observation] = []
+    for row in rows:
+        if row[1] is None or is_foreign_tiingo_row(series_id, row[3], _coerce_date(row[0])):
+            continue
+        out.append(Observation(series_id, _coerce_date(row[0]), float(row[1]), _coerce_ts(row[2]), row[3]))
+    return out
 
 
 def read_latest_n(
@@ -620,6 +673,8 @@ def read_completed_closes(
     names: dict[date, set[str]] = {}
     for d, value, ts, name, payload in rows:
         obs = _coerce_date(d)
+        if is_foreign_tiingo_row(series_id, name, obs):
+            continue  # another instrument's price (tiingo_symbol_contract)
         pulled = _coerce_ts(ts)
         edge = boundary(obs)
         if edge is None or pulled is None or pulled.tzinfo is None or pulled < edge:

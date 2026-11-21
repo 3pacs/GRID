@@ -1293,10 +1293,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "insider_filings",   "mod": "ingestion.altdata.insider_filings",   "cls": "InsiderFilingsPuller",     "method": "pull_all",      "freq_h": 12, "timeout_s": 120},
     {"name": "congressional",     "mod": "ingestion.altdata.congressional",     "cls": "CongressionalTradingPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
     {"name": "unusual_whales",    "mod": "ingestion.altdata.unusual_whales",    "cls": "UnusualWhalesPuller",      "method": "pull_all",      "freq_h": 12, "timeout_s": 240},  # 30 tickers at ~4 s each; 60 s timed out every run (2026-11-08)
-    {"name": "prediction_odds",   "mod": "ingestion.altdata.prediction_odds",   "cls": "PredictionOddsPuller",     "method": "pull_all",      "freq_h": 0.167, "timeout_s": 240},  # 10 min — critical for breaking events; Reddit RSS slot wait ≤150s
+    {"name": "prediction_odds",   "mod": "ingestion.altdata.prediction_odds",   "cls": "PredictionOddsPuller",     "method": "pull_all",      "freq_h": 0.167, "timeout_s": 240,  # 10 min — critical for breaking events; Reddit RSS slot wait ≤150s
+     "hold_reason": "Retired 2026-11-17 (owner): no rapid-shift row ever (0 PREDICTION:* raw_series rows, 0 prediction_market signal_sources rows) across every run since 2026-05-27; suspected cause: the CLOB price history is requested by conditionId, so no prior price is found. Fix that, then lift this hold"},
     {"name": "kalshi",            "mod": "ingestion.altdata.kalshi",            "cls": "KalshiPuller",             "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "prediction_pmxt",   "mod": "ingestion.altdata.prediction_pmxt",   "cls": "PmxtPredictionPuller",     "method": "pull",          "freq_h": 12, "timeout_s": 120},
-    {"name": "smart_money",       "mod": "ingestion.altdata.smart_money",       "cls": "SmartMoneyPuller",         "method": "pull_all",      "freq_h": 0.167, "timeout_s": 240},  # 10 min — critical for breaking events; Reddit RSS slot wait ≤150s
+    {"name": "smart_money",       "mod": "ingestion.altdata.smart_money",       "cls": "SmartMoneyPuller",         "method": "pull_all",      "freq_h": 1, "timeout_s": 240},  # hourly: 5 Arctic Shift reads per run (free community API; Reddit RSS 404 since 2026-11-17)
     {"name": "fed_liquidity",     "mod": "ingestion.altdata.fed_liquidity",     "cls": "FedLiquidityPuller",       "method": "pull_all",      "freq_h": 12, "timeout_s": 60, "api_key": "FRED_API_KEY"},
     {"name": "etf_flows",         "mod": "ingestion.altdata.institutional_flows","cls": "InstitutionalFlowsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120},
     {"name": "analyst_ratings",   "mod": "ingestion.altdata.analyst_ratings",   "cls": "AnalystRatingsPuller",     "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
@@ -1414,7 +1415,13 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Sentiment / alt ──
     {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY", "api_key_mode": "env"},
     {"name": "fear_greed",        "mod": "ingestion.altdata.fear_greed",      "cls": "FearGreedPuller",          "method": "pull_all",      "freq_h": 12, "timeout_s": 30},
-    {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 240},  # Reddit RSS slot wait ≤150s
+    {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 240},  # 14 Arctic Shift board reads, 2 s apart
+    # Per-ticker Bluesky cashtag counts + FinBERT, ApeWisdom Reddit board counts, Arctic Shift
+    # Reddit posts/comments per board + FinBERT, Tradestie WSB sentiment, Reddit Data API board
+    # stats when an app is registered. ~20 Bluesky + ~25 ApeWisdom + ~20 Arctic Shift + 1
+    # Tradestie requests; FinBERT on <= 100 posts per ticker per source. Budgets itself to SERIES_TIME_BUDGET_S (780 s). One row per series
+    # per UTC day, so the second run of a day only fills what the first missed.
+    {"name": "social_ticker_series", "mod": "ingestion.social_sentiment",     "cls": "SocialSentimentPuller",    "method": "pull_ticker_series", "freq_h": 12, "timeout_s": 900},
     {"name": "polymarket",        "mod": "ingestion.altdata.polymarket",      "cls": "PolymarketPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
 
@@ -1424,7 +1431,8 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
 
     # ── Previously unscheduled sources (Phase 1 fix, 2026-04-07) ──
     {"name": "aaii_sentiment",        "mod": "ingestion.altdata.aaii_sentiment",          "cls": "AAIISentimentPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
-    {"name": "cloudflare_radar",      "mod": "ingestion.altdata.cloudflare_radar_puller", "cls": "CloudflareRadarPuller",     "method": "pull",      "freq_h": 24,  "timeout_s": 120},
+    {"name": "cloudflare_radar",      "mod": "ingestion.altdata.cloudflare_radar_puller", "cls": "CloudflareRadarPuller",     "method": "pull",      "freq_h": 24,  "timeout_s": 120,
+     "hold_reason": "Retired 2026-11-17 (owner): no Cloudflare Radar token is configured, so every run is SKIPPED; no raw_series row ever (source 718). Configure a token, then lift this hold"},
     {"name": "marketwatch_news",      "mod": "ingestion.altdata.marketwatch_news",        "cls": "MarketWatchNewsPuller",     "method": "pull_all",  "freq_h": 6,   "timeout_s": 60},
     {"name": "nowcast",               "mod": "ingestion.nowcast_puller",                  "cls": "NowcastPuller",             "method": "pull",      "freq_h": 168, "timeout_s": 60},
     {"name": "sec_edgar_fundamentals","mod": "ingestion.altdata.sec_edgar_company",       "cls": "SECEdgarCompanyPuller",     "method": "pull_all",  "freq_h": 168, "timeout_s": 180},
@@ -1498,6 +1506,9 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "eia",                "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
     {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume_agg", "cls": "FINRAShortVolumeAggPuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
     {"name": "sec_ftd",            "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
+    # DIX (finra:dix_sp500): the S&P 500 dollar-weighted dark-pool short ratio from the same FINRA file plus one
+    # Tiingo close per member (~500 requests, a few minutes), hence its own entry and timeout.
+    {"name": "finra_dix",          "mod": "ingestion.altdata.finra_dix",       "cls": "FINRADixPuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 600, "api_key": "TIINGO_API_KEY", "api_key_mode": "env", "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
 ]
 
 # ── Registry name → source_catalog name ─────────────────────────────────
@@ -1529,6 +1540,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
 # several entries share one catalog row (FRED, yfinance, Kalshi,
 # polymarket) and a shared row cannot say when each job last ran.
 REGISTRY_CATALOG_NAMES: dict[str, str] = {
+    "finra_dix":              "FINRA_SHORT_VOLUME",   # DIX rows ride the FINRA file's own catalog row
     "options":                "YFINANCE_OPTIONS",
     "insider_filings":        "SEC_INSIDER",
     "congressional":          "CONGRESS_TRADING",
@@ -1559,6 +1571,7 @@ REGISTRY_CATALOG_NAMES: dict[str, str] = {
     "edgar":                  "SEC_EDGAR",
     "world_news":             "WorldNewsAPI",
     "social_sentiment":       "SocialSentiment",
+    "social_ticker_series":   "SocialSentiment",     # same hand-rolled catalog row as social_sentiment
     "wiki_history":           "WikiHistory",
     "kalshi_markets":         "KALSHI",
     "fed_speeches":           "FedSpeeches",

@@ -7,14 +7,18 @@ import os
 import sqlite3
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlencode
 
+from fastapi import Path as ApiPath
+from pydantic import BaseModel, StrictBool
+from fastapi import HTTPException
 from fastapi import APIRouter, Depends, Query, Response
 
-from api.auth import require_auth
+from api.gamma_board_symbols import SYMBOL_PATTERN
+from api.auth import require_auth, require_role
 
 router = APIRouter(prefix="/api/v1/gamma-watch", tags=["gamma-watch"],
                    dependencies=[Depends(require_auth)])
@@ -33,6 +37,13 @@ def _reject_constant(value):
     raise ValueError("Non-finite JSON number")
 
 
+def _finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite JSON number")
+    return number
+
+
 def _read_upstream(path: str) -> dict:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     req = urllib.request.Request(UPSTREAM + path, headers={"Accept": "application/json"})
@@ -40,7 +51,7 @@ def _read_upstream(path: str) -> dict:
         body = stream.read(MAX_BYTES + 1)
     if len(body) > MAX_BYTES:
         raise ValueError("Snapshot too large")
-    data = json.loads(body, parse_constant=_reject_constant)
+    data = json.loads(body, parse_constant=_reject_constant, parse_float=_finite_float)
     if not isinstance(data, dict):
         raise ValueError("Invalid snapshot")
     return data
@@ -145,3 +156,148 @@ def get_archive(response: Response, stream: Literal["artifacts", "events", "samp
     except (OSError, sqlite3.Error, ValueError):
         response.status_code = 503
         return {"status": "unavailable", "records": None, "reason": "Gamma Watch journal unavailable or invalid."}
+
+
+# These projections can contain private Schwab-derived values. They must never
+# inherit the ordinary contributor-access /state bridge's audience. Importing
+# this code neither enables the private bridge nor changes any existing route.
+PRIVATE_VIEWS = {
+    "levels": None,  # The existing level book has no schema tag.
+    "context": "gex-context/1",
+    "confirmations": "gex-confirmations/1",
+    "scoreboard": "gex-scoreboard/1",
+    "panel": "gex-panel/1",
+    "trail": "gex-trail/1",
+    "heatmap": "gex-heatmap/1",
+    "heatmap_live": "gex-heatmap/1",
+    "records": "gex-records/1",
+}
+PrivateView = Literal[
+    "levels", "context", "confirmations", "scoreboard", "panel", "trail",
+    "heatmap", "heatmap_live", "records",
+]
+
+
+def _private_views_enabled() -> bool:
+    from config import settings
+
+    # Settings assignment through the admin config API is not type-validated.
+    # A raw string such as "false" must never enable private data transport.
+    return settings.GAMMA_WATCH_PRIVATE_VIEWS_ENABLED is True
+
+
+@router.get("/private/{view}", dependencies=[Depends(require_role("admin"))])
+def get_private_view(view: PrivateView, response: Response) -> dict:
+    """Read an existing GEX projection without reinterpreting or promoting it.
+
+    This is transport parity, not a new calculation, provider fetch, storage
+    writer or freshness decision. All clocks, provenance, unavailable values,
+    volume containment and historical labels remain inside the untouched data.
+    The upstream HTTP handler only reads the existing projection. Private state,
+    raw contracts, scenarios and arbitrary upstream paths are not routable.
+    """
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    now = datetime.now(timezone.utc).isoformat()
+    envelope = {"schema": "grid-gex-private-bridge/1", "audience": "private",
+                "redistribution": "prohibited", "view": view,
+                "bridge_evaluated_at": now, "bridge_received_at": None}
+    reason = "Private GEX views are disabled (GAMMA_WATCH_PRIVATE_VIEWS_ENABLED=false)."
+    if _private_views_enabled():
+        reason = UNAVAILABLE_REASON
+        try:
+            # The enum is also checked here so direct Python calls cannot add an
+            # upstream path. No caller query parameter is forwarded.
+            expected = PRIVATE_VIEWS[view]
+            data = _read_upstream("/api/" + view)
+            if expected is not None and data.get("schema") != expected:
+                raise ValueError("Unexpected projection schema")
+            statuses = ("observed", "unavailable") if view == "confirmations" else ("ok", "degraded", "unavailable")
+            if data.get("status") not in statuses:
+                raise ValueError("Projection status missing or invalid")
+            # Receipt is measured after the read. Never replace an upstream
+            # source clock or claim that receipt makes old evidence current.
+            envelope["bridge_received_at"] = datetime.now(timezone.utc).isoformat()
+            return {**envelope, "status": data["status"],
+                    "transport_status": "available", "data": data,
+                    "note": "Existing GEX projection, unchanged. Transport receipt does not validate inputs, freshness, signals or trading edge."}
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                reason = ROUTE_NOT_SERVED_REASON
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+            pass
+    response.status_code = 503
+    return {**envelope, "status": "unavailable", "transport_status": "unavailable",
+            "data": None, "reason": reason}
+
+
+@router.get("/board/{symbol}", dependencies=[Depends(require_role("admin"))])
+def instrument_board(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max_length=5)], response: Response) -> dict:
+    """Admin-only, same-origin GEX board. Provider access requires the board-specific flag."""
+    from api.gamma_board import read_panel
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    return read_panel(symbol, settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED)
+
+
+@router.get("/intraday/{symbol}", dependencies=[Depends(require_role("admin"))])
+def instrument_intraday(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN)], response: Response) -> dict:
+    """Completed cash-session bars used by the private Gamma Board."""
+    from api.gamma_board_intraday import read_intraday
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    return read_intraday(symbol, settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED)
+
+
+@router.get("/time-map/{symbol}", dependencies=[Depends(require_role("admin"))])
+def instrument_time_map(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max_length=5)], response: Response,
+                        session_date: date | None = Query(default=None)) -> dict:
+    """Read recorded strike exposures for a single cash session."""
+    from api.gamma_time_store import read_time_map
+    from api.gamma_time_watchlist import is_tracked
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    if not settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED:
+        return {"symbol":symbol,"status":"unavailable","reason":"Private board disabled.",
+                "times":[],"strikes":[],"values":[],"spot":[],"tracking":False}
+    return {**read_time_map(symbol,session_date), "tracking":is_tracked(symbol)}
+
+
+class TrackingRequest(BaseModel):
+    enabled: StrictBool
+
+
+@router.post("/time-map/{symbol}/tracking", dependencies=[Depends(require_role("admin"))])
+def set_time_tracking(symbol: Annotated[str, ApiPath(pattern=SYMBOL_PATTERN, max_length=5)],
+                      request: TrackingRequest, response: Response) -> dict:
+    from api.gamma_time_watchlist import TrackingLimit, set_tracking
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    if not settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED:
+        raise HTTPException(status_code=503, detail="Private GEX recorder is disabled.")
+    try:
+        return {"symbol": symbol, "tracking": set_tracking(symbol, request.enabled)}
+    except TrackingLimit as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except (OSError, sqlite3.Error):
+        raise HTTPException(status_code=503, detail="GEX recording settings unavailable.") from None
+
+
+@router.get("/spy-band-flags", dependencies=[Depends(require_role("admin"))])
+def spy_band_flags(response: Response, session_date: date | None = Query(default=None)) -> dict:
+    """Read the private prospective SPY flag journal and its two scorecards."""
+    from api.gamma_band_store import snapshot
+    from config import settings
+
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-GRID-Audience"] = "private"
+    if not settings.SCHWAB_PRIVATE_GEX_BOARD_ENABLED:
+        return {"status": "unavailable", "reason": "Private board disabled.", "events": [], "stats": []}
+    return snapshot(session_date)

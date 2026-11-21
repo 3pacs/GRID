@@ -363,7 +363,7 @@ def _card_inputs():
     (8, "; STALE at rendering (5d old)"),
 ])
 def test_card_states_the_exact_call(monkeypatch, rendered_day, stale_note):
-    # Pin main's clock seam while retaining both fresh and stale regressions.
+    # Use main's rendering clock and retain fresh/stale regression coverage.
     monkeypatch.setattr(hx, "_utc_today", lambda: date(2026, 11, rendered_day))
     opp, v = _card_inputs()
     card = hx._format_opportunity_card(opp, v, 1)

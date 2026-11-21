@@ -62,11 +62,16 @@ if str(_ROOT) not in sys.path:
 JOB = "grade_publication_review"
 REVIEW_SCHEMA = "publication-review-verdicts-v1"
 RECEIPT_SCHEMA = "publication-review-grader-receipt-v1"
-GRADER_VERSION = "grid/grade_publication_review-v1"
+GRADER_VERSION = "grid/grade_publication_review-v2-corroboration"
 DEFAULT_PACKET_ROOT = Path(os.environ.get(
     "GRID_PUBLICATION_PACKET_PUBLIC_ROOT",
     os.environ.get("GRID_PUBLICATION_PACKET_ROOT", "~/research/publication-packets"))).expanduser()
 DEFAULT_REVIEW_ROOT = Path(os.environ.get("GRID_PUBLICATION_REVIEW_ROOT", "~/research/publication-reviews")).expanduser()
+#: World-readable copy of each day's review and receipts, next to the public packet tree, so any
+#: fleet agent can read it (the review root lives under the grid user's 0700 home).
+DEFAULT_PUBLIC_ROOT = Path(os.environ.get("GRID_PUBLICATION_REVIEW_PUBLIC_ROOT",
+                                          "~/research/publication-reviews-public")).expanduser()
+PUBLIC_REVIEW_FILES = ("review.jsonl", "grader-receipt.json", "ingest-receipt.json")
 DEFAULT_LOOKBACK_DAYS = 10         # longest horizon is "week" (+7 calendar days, rolled to a session: <= D+9)
 DEFAULT_TIER = os.environ.get("GRID_PUBLICATION_GRADER_TIER", "reason")
 DEFAULT_PROVIDER = os.environ.get("GRID_PUBLICATION_GRADER_PROVIDER") or None
@@ -116,6 +121,49 @@ INSTRUMENT_ALIASES: dict[str, str] = {
     "TREASURIES": "TLT", "LONG BONDS": "TLT", "GOLD": "GLD", "SILVER": "SLV", "OIL": "USO", "CRUDE": "USO",
     "WTI": "USO", "NATURAL GAS": "UNG", "HIGH YIELD": "HYG", "CREDIT": "HYG",
 }
+
+
+#: Current-state figures the briefing generator states, mapped to the raw_series ids it reads
+#: them from (ollama/market_briefing.py ``key_series``). ``pct`` marks a rate quoted with "%".
+#: A narrative briefing is mostly sentences like "The VIX stands at 28.18": no forecast, but a
+#: checkable statement of what GRID's data said at the publication instant.
+@dataclass(frozen=True)
+class Figure:
+    series_id: str
+    label: str
+    names: str          # regex alternation, case-insensitive, matched on word boundaries
+    pct: bool = False
+
+
+FIGURES: tuple[Figure, ...] = (
+    Figure("YF:^VIX9D:close", "VIX 9-day", r"VIX9D|9-day VIX|VIX 9-day(?: tenor)?|9-day tenor"),
+    Figure("YF:^VIX3M:close", "VIX 3-month", r"VIX3M|3-month VIX|VIX 3-month(?: tenor)?"),
+    Figure("YF:^VIX:close", "VIX", r"VIX(?![ -]?(?:9|3M|9-day|3-month))"),
+    Figure("YF:^GSPC:close", "S&P 500", r"S&P 500|S&P|SPX|\^GSPC"),
+    Figure("YF:^IXIC:close", "Nasdaq Composite", r"Nasdaq(?: Composite)?|\^IXIC"),
+    Figure("YF:^DJI:close", "Dow Jones", r"Dow Jones|Dow|\^DJI"),
+    Figure("YF:^RUT:close", "Russell 2000", r"Russell 2000|\^RUT"),
+    Figure("YF:HYG:close", "HYG", r"HYG"),
+    Figure("YF:LQD:close", "LQD", r"LQD"),
+    Figure("YF:JNK:close", "JNK", r"JNK"),
+    Figure("YF:EMB:close", "EMB", r"EMB"),
+    Figure("YF:GLD:close", "GLD", r"GLD"),
+    Figure("YF:UUP:close", "UUP", r"UUP"),
+    Figure("T10Y2Y", "10Y-2Y spread", r"10Y-2Y(?: yield curve)?(?: spread)?|2s10s|10-year minus 2-year", pct=True),
+    Figure("T10Y3M", "10Y-3M spread", r"10Y-3M(?: spread)?|10-year minus 3-month", pct=True),
+    Figure("DFF", "fed funds rate", r"(?:effective )?fed funds(?: rate)?", pct=True),
+    Figure("DGS2", "2-year Treasury yield", r"2-year (?:Treasury )?yield", pct=True),
+    Figure("DGS5", "5-year Treasury yield", r"5-year (?:Treasury )?yield", pct=True),
+)
+#: Between the name and the number: a short run of words with no digit, ending in a level verb.
+#: Anything naming a derived quantity (z-score, momentum, ratio, change ...) is not a level claim.
+_FIGURE_GAP = r"(?P<gap>[^0-9\n.;()\[\]]{0,48}?)\b(?:stands at|stood at|is at|was at|closed at|at|of|is|was|=)\s*"
+_FIGURE_NUMBER = r"(?P<num>\$?[0-9][0-9,]*(?:\.[0-9]+)?)(?P<pct>\s?%)?"
+_DERIVED = re.compile(r"z-score|\bz\b|momentum|ratio|change|volume|percentile|score|return|breadth|ma\b|average|"
+                      r"put/call|spread change|week|day move|bps", re.IGNORECASE)
+_FIGURE_RES = tuple((fig, re.compile(rf"(?<![A-Za-z0-9^])(?P<name>{fig.names})(?![A-Za-z0-9]){_FIGURE_GAP}{_FIGURE_NUMBER}",
+                                     re.IGNORECASE)) for fig in FIGURES)
+FIGURE_HORIZON = timedelta(minutes=1)   # a current-state figure is checkable at once; the ingest wants horizon > stated
 
 
 # ── small helpers (same conventions as the producer and the ingest) ────────────────────
@@ -616,6 +664,270 @@ def horizon_session_for(pub: Publication, horizon: str | None) -> date:
     return d
 
 
+@dataclass(frozen=True)
+class StatedFigure:
+    figure: Figure
+    span: str
+    stated: float
+    decimals: int
+
+
+def extract_figures(window: str) -> list[StatedFigure]:
+    """Deterministic: "<instrument name> ... at <number>" level statements in a narrative window."""
+    found: list[StatedFigure] = []
+    taken: list[tuple[int, int]] = []
+    for fig, pattern in _FIGURE_RES:
+        for m in pattern.finditer(window):
+            start, end = m.start("name"), m.end("num") + (len(m.group("pct")) if m.group("pct") else 0)
+            if any(a < end and start < b for a, b in taken):
+                continue                        # a more specific figure already claimed this text
+            if _DERIVED.search(m.group("gap") or ""):
+                continue
+            if bool(m.group("pct")) != fig.pct:
+                continue                        # "S&P 500 at -2.68%" is a move, "spread at 0.38" is not a rate
+            raw = m.group("num").lstrip("$").replace(",", "")
+            try:
+                stated = float(raw)
+            except ValueError:
+                continue
+            if not math.isfinite(stated):
+                continue
+            span = window[start:end].strip()
+            if not MIN_SPAN_CHARS <= len(span) <= MAX_SPAN_CHARS or span not in window:
+                continue
+            decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
+            taken.append((start, end))
+            found.append(StatedFigure(fig, span, stated, decimals))
+    found.sort(key=lambda f: window.find(f.span))
+    return found
+
+
+# ── truth of a stated level at the instant it was stated ───────────────────────────────
+#
+# A briefing that says "the VIX stands at 26.9" at 20:00Z is making a claim about the market
+# at 20:00Z, not about GRID's last completed close. So the grader looks at every capture GRID
+# holds for that instrument around the statement (intraday pulls, the completed close, the
+# session's high and low, later revisions) and asks whether the number was real:
+#
+# Intraday pulls are receipt-time evidence, not timestamped market prints. Nearby
+# values/ranges can corroborate a claim but cannot confirm its exact-time value.
+# Only a complete same-session range can refute an intraday value outside it.
+# Close/FRED semantics below are unchanged; grader confidence is not calibrated.
+
+SESSION_OPEN = (9, 30)
+BRACKET_WINDOW = timedelta(minutes=90)   # a capture further from the statement does not pin its level
+
+
+def session_open_utc(session: date) -> datetime:
+    return datetime(session.year, session.month, session.day, *SESSION_OPEN, tzinfo=NY).astimezone(timezone.utc)
+
+
+def previous_session(d: date) -> date:
+    d -= timedelta(days=1)
+    while not _is_market_open(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _vintages(conn: Any, series_id: str, start: date, end: date) -> list[Any]:
+    from store.observations import read_vintages
+    return [o for o in read_vintages(conn, series_id, start=start, end=end)
+            if o.pull_timestamp is not None and math.isfinite(o.value)]
+
+
+@dataclass
+class Facts:
+    """What GRID holds for one instrument around one instant."""
+
+    series_id: str
+    intraday: date | None = None               # the session in progress at the instant, if any
+    sessions: list[date] = field(default_factory=list)   # completed sessions considered, newest first
+    by_date: dict[date, list[Any]] = field(default_factory=dict)   # close vintages per label, oldest pull first
+    low: dict[date, float] = field(default_factory=dict)
+    high: dict[date, float] = field(default_factory=dict)
+    range_captured: dict[tuple[date, str], datetime] = field(default_factory=dict)
+    range_source: dict[tuple[date, str], str | None] = field(default_factory=dict)
+
+
+def gather_facts(conn: Any, fig: Figure, at: datetime) -> Facts:
+    facts = Facts(series_id=fig.series_id)
+    if fig.series_id.startswith("YF:"):
+        today = ny_date(at)
+        if _is_market_open(today) and session_open_utc(today) <= at < session_close_utc(today):
+            facts.intraday = today
+        s1 = today if _is_market_open(today) and at >= session_close_utc(today) else previous_session(today)
+        facts.sessions = [s1, previous_session(s1)]
+        start, end = facts.sessions[-1], facts.intraday or s1
+        rows = _vintages(conn, fig.series_id, start, end)
+        stem = fig.series_id.rsplit(":", 1)[0]
+        for name, target in ((f"{stem}:low", facts.low), (f"{stem}:high", facts.high)):
+            for o in _vintages(conn, name, start, end):
+                target[o.obs_date] = o.value          # oldest pull first: the last write is the newest
+                facts.range_captured[(o.obs_date, name.rsplit(":", 1)[1])] = o.pull_timestamp
+                facts.range_source[(o.obs_date, name.rsplit(":", 1)[1])] = o.source
+    else:
+        rows = _vintages(conn, fig.series_id, at.date() - timedelta(days=14), at.date())
+        facts.sessions = sorted({o.obs_date for o in rows}, reverse=True)
+    for o in rows:
+        facts.by_date.setdefault(o.obs_date, []).append(o)
+    return facts
+
+
+def _completed_close(facts: Facts, session: date) -> Any | None:
+    """The newest capture of ``session`` taken after its close (Yahoo); any capture (FRED)."""
+    rows = facts.by_date.get(session, [])
+    if not facts.series_id.startswith("YF:"):
+        return rows[-1] if rows else None
+    after = [o for o in rows if o.pull_timestamp >= session_close_utc(session)]
+    return after[-1] if after else None
+
+
+def figure_matches(stated: float, decimals: int, observed: float) -> bool:
+    """Stated equals observed at the precision the briefing printed (half a unit of its last digit,
+    plus 0.05 % for a value the briefing rounded before printing)."""
+    tolerance = 0.5 * 10 ** (-decimals) + 0.0005 * abs(observed)
+    return abs(stated - observed) <= tolerance
+
+
+def _within(stated: float, decimals: int, lo: float, hi: float) -> bool:
+    tolerance = 0.5 * 10 ** (-decimals) + 0.0005 * max(abs(lo), abs(hi))
+    return lo - tolerance <= stated <= hi + tolerance
+
+
+@dataclass
+class Judgment:
+    verdict: str
+    evidence: list[dict[str, Any]]
+    root_cause: str | None
+    knowable: bool | None
+    confidence: float
+
+
+def _ev(source: str, observed: str, as_of: datetime) -> dict[str, Any]:
+    return {"source": source, "observed": observed, "as_of": iso(as_of), "url": None}
+
+
+def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | None:
+    """None when GRID holds nothing for the instrument around ``at`` (unscorable)."""
+    fig, value, dec = stated.figure, stated.stated, stated.decimals
+    unit = "%" if fig.pct else ""
+    src = f"raw_series {fig.series_id}"
+    if not any(facts.by_date.values()):
+        return None
+    # Intraday current-level claims require market event times for confirmation.
+    # Observation currently has only pull_timestamp: never relabel it as event time.
+    if facts.intraday is not None:
+        session = facts.intraday
+        close = session_close_utc(session)
+        rows = [o for o in facts.by_date.get(session, [])
+                if session_open_utc(session) <= o.pull_timestamp < close
+                and abs(o.pull_timestamp - at) <= BRACKET_WINDOW]
+        before = [o for o in rows if o.pull_timestamp <= at]
+        after = [o for o in rows if o.pull_timestamp > at]
+        bracket = before[-1:] + after[:1]
+        if bracket and _within(value, dec, min(o.value for o in bracket), max(o.value for o in bracket)):
+            ev = [_ev(f"{o.source} {fig.series_id}",
+                      f"{o.value:g}{unit} retrieved {iso(o.pull_timestamp)}; market event time unknown",
+                      o.pull_timestamp) for o in bracket]
+            return Judgment("partially_confirmed", ev,
+                            "nearby captures corroborate plausibility, not the value at the statement instant; "
+                            "retrieval time is not market event time", None, 0.6)
+        lo, hi = facts.low.get(session), facts.high.get(session)
+        low_at = facts.range_captured.get((session, "low"))
+        high_at = facts.range_captured.get((session, "high"))
+        low_source = facts.range_source.get((session, "low"))
+        high_source = facts.range_source.get((session, "high"))
+        coherent_range = bool(low_source) and low_source == high_source and low_at == high_at
+        if lo is not None and hi is not None and lo <= hi and low_at and high_at and coherent_range:
+            ev = [_ev(f"{low_source} {fig.series_id.rsplit(':', 1)[0]}:{name}",
+                      f"session {session} {name} {v:g}{unit}; retrieved {iso(pulled)}", pulled)
+                  for name, v, pulled in (("low", lo, low_at), ("high", hi, high_at))]
+            if _within(value, dec, lo, hi):
+                return Judgment("partially_confirmed", ev,
+                                "inside the session range; no market-time observation pins the stated instant",
+                                None, 0.6)
+            if low_at >= close and high_at >= close:
+                return Judgment("refuted", ev,
+                                f"stated {fig.label} {value:g}{unit} is outside the complete {session} "
+                                f"session range {lo:g}-{hi:g}{unit}", False, 0.85)
+        # Sparse samples cannot disprove a transient price. A prior close is not
+        # evidence of today's current price either. Keep the claim unscorable.
+        return Judgment("unscorable", [],
+                        "no market-time observation or complete same-session range establishes or contradicts "
+                        "the stated intraday level; sparse captures are not refutation", None, 0.0)
+    # 2. a completed close
+    closes = [(s, _completed_close(facts, s)) for s in facts.sessions]
+    closes = [(s, o) for s, o in closes if o is not None]
+    known_at = [(s, o) for s, o in closes if o.pull_timestamp <= at]
+    newest_known = known_at[0][0] if known_at else None
+    for s, o in closes:
+        if not figure_matches(value, dec, o.value):
+            continue
+        ev = [_ev(f"{o.source} {fig.series_id}", f"{o.value:g}{unit} close {s} (captured {iso(o.pull_timestamp)})",
+                  o.pull_timestamp)]
+        if newest_known is not None and s < newest_known:
+            newer = dict(known_at)[newest_known]
+            ev.append(_ev(f"{newer.source} {fig.series_id}", f"{newer.value:g}{unit} close {newest_known} "
+                          f"(captured {iso(newer.pull_timestamp)}, before the statement)", newer.pull_timestamp))
+            return Judgment("partially_confirmed", ev,
+                            f"stale: {stated.span!r} is the {s} close; the {newest_known} close "
+                            f"({newer.value:g}{unit}) was already known", True, 0.9)
+        if s == facts.sessions[0] or newest_known is None or s >= newest_known:
+            return Judgment("confirmed", ev, None, o.pull_timestamp <= at, 0.9)
+    # 3. inside a session's traded range, or equal to an intraday capture
+    for s in ([facts.intraday] if facts.intraday else []) + facts.sessions[:1]:
+        lo, hi = facts.low.get(s), facts.high.get(s)
+        if lo is not None and hi is not None and _within(value, dec, lo, hi):
+            return Judgment("partially_confirmed",
+                            [_ev(f"raw_series {fig.series_id.rsplit(':', 1)[0]}:low/high",
+                                 f"session {s} range {lo:g}-{hi:g}{unit}", at)],
+                            f"{stated.span!r} lies inside the {s} range {lo:g}-{hi:g}{unit}, but no capture "
+                            f"pins it to the statement time", None, 0.6)
+        hit = next((o for o in facts.by_date.get(s, []) if figure_matches(value, dec, o.value)), None)
+        if hit is not None:
+            return Judgment("partially_confirmed",
+                            [_ev(f"{hit.source} {fig.series_id}", f"{hit.value:g}{unit} intraday capture "
+                                 f"{iso(hit.pull_timestamp)}", hit.pull_timestamp)],
+                            f"{stated.span!r} equals an intraday capture of {s}, not a close", None, 0.6)
+    # 4. nothing supports it
+    ev: list[dict[str, Any]] = []
+    for s in ([facts.intraday] if facts.intraday else []) + facts.sessions[:2]:
+        rows = facts.by_date.get(s, [])
+        if rows:
+            near = min(rows, key=lambda o: abs((o.pull_timestamp - at).total_seconds()))
+            ev.append(_ev(f"{near.source} {fig.series_id}", f"{near.value:g}{unit} captured "
+                          f"{iso(near.pull_timestamp)} (label {s})", near.pull_timestamp))
+        if s in facts.low and s in facts.high:
+            ev.append(_ev(src + " low/high", f"session {s} range {facts.low[s]:g}-{facts.high[s]:g}{unit}", at))
+    known_vals = ", ".join(e["observed"].split(" ")[0] for e in ev if "captured" in e["observed"])
+    return Judgment("refuted", ev[:6],
+                    f"stated {fig.label} {value:g}{unit}; GRID's captures around the statement were {known_vals or 'other values'}"
+                    + (" and the value is outside the session range" if any("range" in e["observed"] for e in ev) else ""),
+                    True, 0.85)
+
+
+def grade_figure(conn: Any, pub: Publication, stated: StatedFigure) -> dict[str, Any]:
+    fig = stated.figure
+    horizon = iso(pub.published_at + FIGURE_HORIZON)
+    try:
+        facts = gather_facts(conn, fig, pub.published_at)
+        judgment = judge_level(stated, pub.published_at, facts)
+    except Exception as exc:  # a reader fault is this claim's reason, not the day's
+        return unscorable(pub, stated.span, "data_quality",
+                          f"{fig.label}: {fig.series_id} unreadable ({type(exc).__name__})", horizon_end=horizon)
+    if judgment is None:
+        return unscorable(pub, stated.span, "data_quality",
+                          f"{fig.label}: GRID holds no {fig.series_id} capture around the statement", horizon_end=horizon)
+    return _row(pub, stated.span, "data_quality", instrument=_instrument_for(fig), horizon_end=horizon,
+                verdict=judgment.verdict, evidence=judgment.evidence, knowable_at_stated_at=judgment.knowable,
+                root_cause=judgment.root_cause, grader_confidence=judgment.confidence)
+
+
+def _instrument_for(fig: Figure) -> str:
+    sid = fig.series_id
+    return (sid.split(":")[1] if sid.startswith("YF:") else sid)[:32]
+
+
 def grade_briefing(conn: Any, pub: Publication, graded_at: datetime, folder: Path, client_factory: Any,
                    *, persist: bool = True) -> tuple[list[dict[str, Any]], str | None]:
     """Rows for a briefing/diary record plus the extraction model used (None when no model was needed)."""
@@ -625,12 +937,15 @@ def grade_briefing(conn: Any, pub: Publication, graded_at: datetime, folder: Pat
                            "no narrative to grade: the record says its AI narrative was withheld or unavailable "
                            "(data summary only)")], None
     opening = first_sentence_span(pub.text)
+    figure_rows = [grade_figure(conn, pub, f) for f in extract_figures(narrative_window(pub.text))]
     extraction = cached_extraction(folder, pub, client_factory, persist=persist)
     if extraction.error:
+        if figure_rows:
+            return figure_rows, extraction.model
         rows = [] if opening is None else [unscorable(pub, opening, "data_quality",
                                                       f"claim extraction unavailable: {extraction.error}")]
         return rows, extraction.model
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = list(figure_rows)
     for claim in extraction.claims:
         span, kind = claim["span"], claim["claim_type"]
         ticker = resolve_instrument(claim["instrument"])
@@ -738,9 +1053,25 @@ def verdict_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def confirmed_ingest(receipt: dict[str, Any], review_sha: str, packet_sha: str) -> dict[str, Any] | None:
+    """Only v2 evidence copied from the ingest's actual byte identity can skip a hand-off.
+
+    Legacy ingested_review_sha256 alone was fabricated by --no-ingest in v1. It is
+    not evidence. The next normal run reconciles it through the idempotent ingest.
+    """
+    confirmation = receipt.get("ingest_confirmation")
+    if (isinstance(confirmation, dict)
+            and confirmation.get("schema") == "publication-review-ingest-confirmation-v1"
+            and confirmation.get("review_sha256") == review_sha
+            and confirmation.get("packet_sha256") == packet_sha
+            and type(confirmation.get("run_id")) is int and confirmation["run_id"] > 0):
+        return dict(confirmation)
+    return None
+
+
 def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT, review_root: Path = DEFAULT_REVIEW_ROOT,
               dry_run: bool = False, now: datetime | None = None, client_factory: Any = None,
-              ingest: bool = True, force: bool = False) -> dict[str, Any]:
+              ingest: bool = True, force: bool = False, public_root: Path | None = None) -> dict[str, Any]:
     """Grade one publication day; returns the grader receipt (also written to ``<review_root>/<D>/grader-receipt.json``)."""
     graded_at = now or datetime.now(timezone.utc)
     folder = review_root / day.isoformat()
@@ -789,7 +1120,8 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             receipt["review_sha256"] = sha256(before[0])
             # The file on disk is current; make sure the database agrees. A hand-off that failed
             # on an earlier run (database down, module error) is retried here, not forgotten.
-            if ingest and previous_receipt(folder).get("ingested_review_sha256") != receipt["review_sha256"]:
+            prior_confirmation = confirmed_ingest(previous_receipt(folder), receipt["review_sha256"], packet.sha256)
+            if ingest and prior_confirmation is None:
                 receipt["ingest"] = run_ingest(engine, day, review_root, packet_root)
         else:
             write_file(path, payload)
@@ -797,10 +1129,26 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             receipt["superseded_previous"] = before is not None
             if ingest:
                 receipt["ingest"] = run_ingest(engine, day, review_root, packet_root)
-        if receipt.get("ingest", {}).get("state") in {"INGESTED", "PRESENT"}:
-            receipt["ingested_review_sha256"] = receipt["review_sha256"]
-        elif "ingest" not in receipt and receipt["state"] == "UNCHANGED":
-            receipt["ingested_review_sha256"] = receipt["review_sha256"]   # confirmed by the previous receipt
+        result = receipt.get("ingest", {})
+        if result.get("state") in {"INGESTED", "PRESENT"}:
+            # The ingest reopens the file. Another invocation could have replaced it
+            # after our write/read: certify its returned bytes, never just its status.
+            if (result.get("review_sha256") != receipt["review_sha256"]
+                    or result.get("packet_sha256") != packet.sha256
+                    or type(result.get("run_id")) is not int or result["run_id"] <= 0):
+                receipt["ingest_confirmation_error"] = "ingest result does not bind the expected review, packet and run"
+            elif result.get("rejected_rows") != 0 or result.get("declared_mismatch") != []:
+                receipt["ingest_confirmation_error"] = "ingest result is incomplete or has rejected rows"
+            else:
+                receipt["ingest_confirmation"] = {
+                    "schema": "publication-review-ingest-confirmation-v1",
+                    "review_sha256": result["review_sha256"], "packet_sha256": result["packet_sha256"],
+                    "run_id": result["run_id"],
+                }
+        elif "ingest" not in receipt and unchanged and prior_confirmation is not None:
+            receipt["ingest_confirmation"] = prior_confirmation
+        if "ingest_confirmation" in receipt:
+            receipt["ingested_review_sha256"] = receipt["ingest_confirmation"]["review_sha256"]
     except Refused as exc:
         receipt.update(state="REFUSED", reason=str(exc))
     except Exception as exc:  # the receipt must exist; the type is the public reason
@@ -811,6 +1159,8 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             write_file(folder / "grader-receipt.json", json.dumps(receipt, indent=2, sort_keys=True, default=str).encode("utf-8"))
         except OSError as exc:
             receipt["receipt_write_error"] = type(exc).__name__
+        if public_root is not None and receipt.get("state") in {"WRITTEN", "UNCHANGED"}:
+            receipt["published"] = publish_review(folder, public_root / day.isoformat())
     return receipt
 
 
@@ -826,7 +1176,37 @@ def run_ingest(engine: Any, day: date, review_root: Path, packet_root: Path) -> 
         traceback.print_exc(file=sys.stderr)
         return {"state": "FAILED", "reason": f"hand-off: {type(exc).__name__}"}
     return {key: result.get(key) for key in ("state", "reason", "run_id", "accepted_rows", "rejected_rows",
-                                              "declared_mismatch", "receipt_file")}
+                                              "declared_mismatch", "receipt_file", "review_sha256", "packet_sha256")}
+
+
+def publish_review(folder: Path, public_dir: Path) -> dict[str, Any]:
+    """Copy the day's review and receipts (allow-list, bytes unchanged) into the public tree.
+
+    Dirs 0755, files 0644, never through a symlink at either end; only changed files are
+    rewritten. Best effort: a failure is reported, never raised (the review is already written).
+    """
+    out: dict[str, Any] = {"public_dir": str(public_dir), "files": []}
+    try:
+        if public_dir.is_symlink() or public_dir.parent.is_symlink():
+            raise OSError("public review dir is a symlink")
+        public_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(public_dir.parent, 0o755)
+        os.chmod(public_dir, 0o755)
+        for name in PUBLIC_REVIEW_FILES:
+            src = folder / name
+            if not src.is_file() or src.is_symlink():
+                continue
+            data = read_regular_file(src, MAX_FILE_BYTES)
+            dst = public_dir / name
+            if dst.is_file() and not dst.is_symlink() and read_regular_file(dst, MAX_FILE_BYTES) == data:
+                out["files"].append(name)
+                continue
+            write_file(dst, data, 0o644)
+            out["files"].append(name)
+    except (OSError, Refused) as exc:
+        out["error"] = type(exc).__name__
+        print(f"{JOB}: could not publish review to {public_dir}: {type(exc).__name__}", file=sys.stderr)
+    return out
 
 
 def _ingest_module() -> Any:
@@ -855,7 +1235,8 @@ def exit_code(receipts: list[dict[str, Any]]) -> int:
         return 1
     for r in receipts:
         ing = r.get("ingest") or {}
-        if ing.get("state") in {"REFUSED", "FAILED"} or ing.get("rejected_rows") or ing.get("declared_mismatch"):
+        if (r.get("ingest_confirmation_error") or ing.get("state") in {"REFUSED", "FAILED"}
+                or ing.get("rejected_rows") or ing.get("declared_mismatch")):
             return 3
     return 0
 
@@ -875,6 +1256,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="grade and report; write nothing, ingest nothing")
     parser.add_argument("--no-ingest", action="store_true", help="write review.jsonl but leave the ingest to its timer")
     parser.add_argument("--force", action="store_true", help="rewrite review.jsonl even when the verdict rows are unchanged")
+    parser.add_argument("--public-root", default=str(DEFAULT_PUBLIC_ROOT),
+                        help="world-readable copy of review.jsonl + receipts per day (default from "
+                             "GRID_PUBLICATION_REVIEW_PUBLIC_ROOT)")
+    parser.add_argument("--no-publish", action="store_true", help="do not copy the review into the public tree")
     parser.add_argument("--json", action="store_true", help="print the receipts as JSON")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
@@ -891,7 +1276,8 @@ def main(argv: list[str] | None = None) -> int:
     for day in days:
         receipt = grade_day(engine, day, packet_root=Path(args.packet_root).expanduser(),
                             review_root=Path(args.review_root).expanduser(), dry_run=args.dry_run, now=now,
-                            ingest=not args.no_ingest, force=args.force)
+                            ingest=not args.no_ingest, force=args.force,
+                            public_root=None if args.no_publish else Path(args.public_root).expanduser())
         if receipt.get("state") == "REFUSED" and not args.day and "not present" in str(receipt.get("reason")):
             continue  # a lookback day without a packet is not news
         receipts.append(receipt)

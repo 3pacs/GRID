@@ -203,14 +203,24 @@ def ask_ollama(req: AskRequest) -> dict[str, Any]:
         knowledge_context = get_context_for_prompt(req.question, limit=5)
     except Exception as exc:
         log.debug("Knowledge context retrieval skipped: {e}", e=str(exc))
+    # What the Research Desk has tested on the same subject, with verdicts and numbers as recorded
+    findings_context = ""
+    try:
+        from analysis.research_findings import context_for_prompt as findings_for_prompt
+        from api.dependencies import get_db_engine
+        findings_context = findings_for_prompt(get_db_engine(), req.question, limit=5)
+    except Exception as exc:
+        log.debug("Research findings context skipped: {e}", e=str(exc))
 
     messages = []
-    # Build system context: user-provided + institutional memory
+    # Build system context: user-provided + institutional memory + tested findings
     system_parts = []
     if req.context:
         system_parts.append(req.context)
     if knowledge_context:
         system_parts.append(knowledge_context)
+    if findings_context:
+        system_parts.append(findings_context)
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
     messages.append({"role": "user", "content": req.question})

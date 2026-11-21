@@ -16,7 +16,10 @@ Pipeline for each ticker:
 
   1. Resolve CIK via the SEC company_tickers.json cache.
   2. Pull ``data.sec.gov/submissions/CIK{cik}.json`` and locate the
-     most recent 10-K entry (latest accession + primary document).
+     most recent 10-K entry (latest accession + primary document). 10-Qs
+     are not read (:data:`FORMS_READ`): on 2026-11-13, 32 newer 10-Qs across
+     40 priority tickers yielded 0 relationships (33 10-Ks yielded 3), and
+     each would cost a fetch inside the weekly budget (3pacs/GRID#1180).
   3. Fetch the primary document from the SEC Archives and run it
      through BeautifulSoup to strip XBRL inline-tag noise.
   4. Extract the Item 1 and Item 1A sections via regex anchors.
@@ -25,11 +28,20 @@ Pipeline for each ticker:
   6. For every (supplier, buyer, relationship) triple, resolve the
      counterparty to an existing node id or slug a new one.
   7. Upsert the edge into ``supply_chain_edges`` and any new node
-     into ``supply_chain_nodes`` using parameterized SQL.
+     into ``supply_chain_nodes`` using parameterized SQL. Every edge's
+     ``source`` names the form, year, ticker and section and ends with the
+     filing's SEC Archives URL, so each edge cites the document it came from.
 
-Checkpointing: the parser writes ``/tmp/grid_10k_parser_checkpoint.json``
-so it can be resumed across runs. The total wall-clock budget is
-capped at 1 hour per invocation.
+Checkpointing: the parser writes its progress to
+``$GRID_SUPPLY_CHAIN_CHECKPOINT`` (default
+``outputs/supply_chain/10k_parser_checkpoint.json`` in the repo; it was
+``/tmp``, which a reboot or a private tmp wipes), so it resumes across runs.
+Once every ticker in the universe is done, the next run starts a new pass
+(``cycle`` + 1), so a weekly schedule keeps re-reading the universe and picks
+up new 10-Ks (3pacs/GRID#1179); edges upsert, so a re-read never duplicates.
+The total wall-clock budget is capped at 1 hour per invocation; the Hermes
+weekly run uses :data:`WEEKLY_BUDGET_SECONDS` (it runs inline in the Hermes
+loop).
 
 Rate limit: the SEC Fair Access guideline caps traffic at 10 req/sec.
 We sleep ~120 ms between requests and send a descriptive User-Agent.
@@ -65,7 +77,16 @@ _COMPANY_TICKERS_URL: str = "https://www.sec.gov/files/company_tickers.json"
 _SUBMISSIONS_URL: str = "https://data.sec.gov/submissions/CIK{cik}.json"
 _ARCHIVES_BASE: str = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{doc}"
 
-_CHECKPOINT_PATH: Path = Path("/tmp/grid_10k_parser_checkpoint.json")
+import os as _os
+
+_CHECKPOINT_PATH: Path = Path(
+    _os.environ.get(
+        "GRID_SUPPLY_CHAIN_CHECKPOINT",
+        str(Path(__file__).resolve().parents[2] / "outputs" / "supply_chain" / "10k_parser_checkpoint.json"),
+    )
+)
+FORMS_READ: tuple[str, ...] = ("10-K",)  # 10-Q measured and dropped, see the module docstring
+WEEKLY_BUDGET_SECONDS: int = 900  # Hermes runs weekly tasks inline: 15 minutes, then resume next week
 _DEFAULT_RUN_BUDGET_SECONDS: int = 3600  # 1 hour hard cap
 _MAX_DOC_BYTES: int = 12 * 1024 * 1024   # 12 MB cap per 10-K doc
 
@@ -359,6 +380,27 @@ def _slug(name: str) -> str:
     return s
 
 
+_LEGAL_SUFFIX = re.compile(
+    r"\b(inc|incorporated|corp|corporation|co|company|companies|ltd|limited|plc|llc|lp|l p|holdings?|group|"
+    r"s a s|sas|s a|sa|n v|nv|ag|se|pbc|the)\b")
+
+
+def company_key(name: str) -> str:
+    """Comparable company name: ``The Boeing Company`` and ``BOEING CO`` both give ``boeing``."""
+    s = re.sub(r"[^a-z0-9&]+", " ", (name or "").lower().replace("\u2019", "'").replace("'s", "s"))
+    return re.sub(r"\s+", " ", _LEGAL_SUFFIX.sub(" ", s)).strip()
+
+
+def ensure_checkpoint_dir(path: Path) -> None:
+    """Create the directory ``path`` is written into.
+
+    ``outputs/supply_chain`` is a tracked symlink into ``/data/grid/outputs``
+    so checkpoints outlive release swaps; ``mkdir`` on the link itself fails
+    while its target is missing, so the target is created instead.
+    """
+    path.parent.resolve().mkdir(parents=True, exist_ok=True)
+
+
 def _clean_name(raw: str) -> str:
     name = raw.strip()
     name = re.sub(r"[\s]+", " ", name)
@@ -457,6 +499,10 @@ class SupplyChain10KParser:
         self.name_to_node_id: dict[str, str] = {}
         self._cik_cache: dict[str, str] = {}
         self._ticker_to_node: dict[str, str] = {}
+        # company_key(node name) -> node id, so "Walmart Inc." finds the
+        # "Walmart" node instead of minting a private walmart_inc node.
+        self._name_keys: dict[str, str | None] = {}
+        self._name_key_is_ticker: dict[str, bool] = {}
         self._load_node_catalog()
 
     # ── Node catalog ──────────────────────────────────────────────────────
@@ -473,6 +519,7 @@ class SupplyChain10KParser:
                 self.seed_node_ids.add(nid)
                 if node_name:
                     self.name_to_node_id[node_name.lower().strip()] = nid
+                    self._add_name_key(node_name, nid, node_type == "ticker")
                 # Handle ticker-type nodes — id is already the lowercase ticker
                 if node_type == "ticker":
                     self._ticker_to_node[nid.upper()] = nid
@@ -509,12 +556,36 @@ class SupplyChain10KParser:
         except Exception as exc:
             log.error("SEC ticker map fetch failed: {e}", e=str(exc))
 
+    def _add_name_key(self, name: str, node_id: str, is_ticker: bool) -> None:
+        """Index ``name`` by its company_key; a listed node beats an unlisted one.
+
+        Two nodes of the same kind with one key are ambiguous: the key then
+        resolves to nothing, and the name falls through to the old paths.
+        """
+        key = company_key(name)
+        if not key:
+            return
+        if key not in self._name_keys:
+            self._name_keys[key], self._name_key_is_ticker[key] = node_id, is_ticker
+            return
+        held, held_ticker = self._name_keys[key], self._name_key_is_ticker[key]
+        if held == node_id or (held_ticker and not is_ticker):
+            return
+        if is_ticker and not held_ticker:
+            self._name_keys[key], self._name_key_is_ticker[key] = node_id, True
+        else:
+            self._name_keys[key] = None
+
     def _resolve_cik(self, ticker: str) -> str | None:
         self._fetch_cik_map()
         return self._cik_cache.get(ticker.upper())
 
     def _latest_10k_meta(self, cik: str) -> dict[str, Any] | None:
         """Return {accession, primary_doc, filing_date} for the latest 10-K."""
+        return self._latest_filing_meta(cik, "10-K")
+
+    def _latest_filing_meta(self, cik: str, form_wanted: str) -> dict[str, Any] | None:
+        """Return {accession, primary_doc, filing_date, form} for the latest ``form_wanted``."""
         try:
             url = _SUBMISSIONS_URL.format(cik=cik)
             resp = self.session.get(url, timeout=_REQUEST_TIMEOUT)
@@ -533,7 +604,7 @@ class SupplyChain10KParser:
         primaries = recent.get("primaryDocument", [])
 
         for i, form in enumerate(forms):
-            if form != "10-K":
+            if form != form_wanted:
                 continue
             acc = accessions[i] if i < len(accessions) else ""
             prim = primaries[i] if i < len(primaries) else ""
@@ -548,16 +619,21 @@ class SupplyChain10KParser:
                 "accession": acc,
                 "primary_doc": prim,
                 "filing_date": fdate,
+                "form": form_wanted,
             }
         return None
 
-    def _fetch_10k_text(self, cik: str, meta: dict[str, Any]) -> str | None:
-        """Fetch and BeautifulSoup-strip a 10-K primary document."""
-        cik_no_pad = cik.lstrip("0") or "0"
-        acc_clean = meta["accession"].replace("-", "")
-        url = _ARCHIVES_BASE.format(
-            cik=cik_no_pad, acc=acc_clean, doc=meta["primary_doc"]
+    @staticmethod
+    def _filing_url(cik: str, meta: dict[str, Any]) -> str:
+        return _ARCHIVES_BASE.format(
+            cik=cik.lstrip("0") or "0",
+            acc=meta["accession"].replace("-", ""),
+            doc=meta["primary_doc"],
         )
+
+    def _fetch_10k_text(self, cik: str, meta: dict[str, Any]) -> str | None:
+        """Fetch and BeautifulSoup-strip a 10-K (or 10-Q) primary document."""
+        url = self._filing_url(cik, meta)
         try:
             resp = self.session.get(url, timeout=_REQUEST_TIMEOUT, stream=True)
             resp.raise_for_status()
@@ -631,6 +707,12 @@ class SupplyChain10KParser:
             return "", None
 
         lower = cleaned.lower()
+        key = company_key(cleaned)
+        keyed = self._name_keys.get(key)
+        # A listed company under any legal form wins over an exact-name
+        # match to an unlisted node ("Walmart Inc" private vs "Walmart").
+        if keyed and self._name_key_is_ticker.get(key):
+            return keyed, None
         # Direct lookup by name
         if lower in self.name_to_node_id:
             return self.name_to_node_id[lower], None
@@ -638,6 +720,9 @@ class SupplyChain10KParser:
         tkr_guess = cleaned.upper()
         if tkr_guess in self._ticker_to_node:
             return self._ticker_to_node[tkr_guess], None
+        # Same company, different legal form
+        if keyed:
+            return keyed, None
 
         # Common short-form fuzzy rules
         aliases = {
@@ -648,6 +733,7 @@ class SupplyChain10KParser:
             "foxconn": "foxconn",
             "hon hai": "foxconn",
             "hon hai precision": "foxconn",
+            "wal-mart": "wmt",
         }
         for alias, node_id in aliases.items():
             if alias in lower and node_id in self.seed_node_ids:
@@ -669,6 +755,8 @@ class SupplyChain10KParser:
         section_text: str,
         section_label: str,
         filing_date: date,
+        form: str = "10-K",
+        url: str = "",
     ) -> tuple[list[DerivedEdge], list[DerivedNode]]:
         edges: list[DerivedEdge] = []
         new_nodes: list[DerivedNode] = []
@@ -712,7 +800,10 @@ class SupplyChain10KParser:
                     upstream_id=upstream,
                     downstream_id=downstream,
                     relationship=relationship,
-                    source=f"10-K {filing_date.year} {ticker.upper()} {section_label}",
+                    source=(
+                        f"{form} {filing_date.year} {ticker.upper()} {section_label}"
+                        + (f" {url}" if url else "")
+                    ),
                     as_of=filing_date,
                     input_type=input_type,
                     pct_upstream_revenue=pct_upstream_rev,
@@ -907,10 +998,11 @@ class SupplyChain10KParser:
         except Exception:
             return {"done": [], "stats": {}}
 
-    def _save_checkpoint(self, done: list[str]) -> None:
+    def _save_checkpoint(self, done: list[str], cycle: int = 1) -> None:
         try:
             payload = {
                 "done": done,
+                "cycle": cycle,
                 "stats": {
                     "edges": self.stats.edges_created,
                     "nodes": self.stats.nodes_created,
@@ -918,9 +1010,12 @@ class SupplyChain10KParser:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
             }
-            _CHECKPOINT_PATH.write_text(json.dumps(payload, indent=2))
+            ensure_checkpoint_dir(_CHECKPOINT_PATH)
+            tmp = _CHECKPOINT_PATH.with_name(_CHECKPOINT_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.replace(_CHECKPOINT_PATH)  # atomic: a crash mid-write never loses the progress
         except Exception as exc:
-            log.debug("checkpoint save failed: {e}", e=str(exc))
+            log.warning("checkpoint save failed: {e}", e=str(exc))
 
     # ── Ticker universe ──────────────────────────────────────────────────
 
@@ -956,63 +1051,75 @@ class SupplyChain10KParser:
 
     # ── Orchestration ────────────────────────────────────────────────────
 
+    def _filings_to_read(self, cik: str) -> list[dict[str, Any]]:
+        """The latest filing of each form in :data:`FORMS_READ`, newest first.
+
+        Newest first, so when two filings disclose the same relationship the
+        edge dedup keeps the newer filing's figure and citation.
+        """
+        found = [m for form in FORMS_READ if (m := self._latest_filing_meta(cik, form))]
+        return sorted(found, key=lambda m: m["filing_date"], reverse=True)
+
     def process_ticker(self, ticker: str) -> int:
-        """Process a single ticker. Returns number of edges created."""
+        """Process a single ticker's latest filings (:data:`FORMS_READ`). Returns edges created."""
         cik = self._resolve_cik(ticker)
         if not cik:
             self.stats.tickers_skipped += 1
             log.debug("No CIK for {t}", t=ticker)
             return 0
 
-        meta = self._latest_10k_meta(cik)
-        if not meta:
+        filings = self._filings_to_read(cik)
+        if not filings:
             self.stats.tickers_skipped += 1
-            log.debug("No 10-K meta for {t} cik={c}", t=ticker, c=cik)
+            log.debug("No {f} meta for {t} cik={c}", f="/".join(FORMS_READ), t=ticker, c=cik)
             return 0
-
-        full_text = self._fetch_10k_text(cik, meta)
-        if not full_text:
-            self.stats.filings_failed += 1
-            return 0
-        self.stats.filings_fetched += 1
 
         # Slug the ticker downstream id. Parser uses lowercase to match seed.
         downstream_id = ticker.lower()
-
-        item1 = self._extract_section(full_text, _ITEM_1_RE)
-        item1a = self._extract_section(full_text, _ITEM_1A_RE)
-        concentration = self._extract_concentration_notes(full_text)
-        # Scan the whole document too — the principal-customer disclosure
-        # sometimes lives in segment / MD&A narratives far from Item 1.
-        # We rely on the customer-context filter to suppress drug/segment
-        # false positives.
-
         all_edges: list[DerivedEdge] = []
         all_nodes: list[DerivedNode] = []
-
-        for section_text, label in (
-            (item1, "Item 1"),
-            (item1a, "Item 1A"),
-            (concentration, "Concentration Notes"),
-            (full_text, "Full Text"),
-        ):
-            if not section_text:
+        latest = filings[0]
+        for meta in filings:
+            full_text = self._fetch_10k_text(cik, meta)
+            if not full_text:
+                self.stats.filings_failed += 1
                 continue
-            try:
-                edges, nodes = self._extract_edges(
-                    ticker=ticker,
-                    downstream_id=downstream_id,
-                    section_text=section_text,
-                    section_label=label,
-                    filing_date=meta["filing_date"],
-                )
-                all_edges.extend(edges)
-                all_nodes.extend(nodes)
-            except Exception as exc:
-                log.warning(
-                    "parse error {t} {lbl}: {e}",
-                    t=ticker, lbl=label, e=str(exc),
-                )
+            self.stats.filings_fetched += 1
+            url = self._filing_url(cik, meta)
+            form = meta.get("form", "10-K")
+            item1 = self._extract_section(full_text, _ITEM_1_RE)
+            item1a = self._extract_section(full_text, _ITEM_1A_RE)
+            concentration = self._extract_concentration_notes(full_text)
+            # Scan the whole document too — the principal-customer disclosure
+            # sometimes lives in segment / MD&A narratives far from Item 1.
+            # We rely on the customer-context filter to suppress drug/segment
+            # false positives.
+            for section_text, label in (
+                (item1, "Item 1"),
+                (item1a, "Item 1A"),
+                (concentration, "Concentration Notes"),
+                (full_text, "Full Text"),
+            ):
+                if not section_text:
+                    continue
+                try:
+                    edges, nodes = self._extract_edges(
+                        ticker=ticker,
+                        downstream_id=downstream_id,
+                        section_text=section_text,
+                        section_label=label,
+                        filing_date=meta["filing_date"],
+                        form=form,
+                        url=url,
+                    )
+                    all_edges.extend(edges)
+                    all_nodes.extend(nodes)
+                except Exception as exc:
+                    log.warning(
+                        "parse error {t} {f} {lbl}: {e}",
+                        t=ticker, f=form, lbl=label, e=str(exc),
+                    )
+        meta = latest
 
         if not all_edges:
             return 0
@@ -1040,6 +1147,7 @@ class SupplyChain10KParser:
                     inserted_nodes += 1
                     self.seed_node_ids.add(node.id)
                     self.name_to_node_id[node.name.lower().strip()] = node.id
+                    self._add_name_key(node.name, node.id, node.type == "ticker")
 
             # Also ensure the downstream ticker has a node entry
             if downstream_id not in self.seed_node_ids:
@@ -1090,6 +1198,7 @@ class SupplyChain10KParser:
 
         checkpoint = self._load_checkpoint()
         done: list[str] = list(checkpoint.get("done", []))
+        cycle = int(checkpoint.get("cycle", 1) or 1)
         done_set = set(done)
 
         if tickers is None:
@@ -1098,6 +1207,13 @@ class SupplyChain10KParser:
             universe = [t.upper() for t in tickers]
 
         queued = [t for t in universe if t not in done_set]
+        if not queued and universe and tickers is None:
+            # Pass complete: start the next one so a weekly schedule keeps
+            # re-reading 10-Ks instead of idling forever (3pacs/GRID#1179).
+            cycle += 1
+            done, done_set = [], set()
+            queued = list(universe)
+            log.info("SupplyChain10KParser: universe done, starting pass {c}", c=cycle)
         if limit is not None:
             queued = queued[:limit]
 
@@ -1124,9 +1240,9 @@ class SupplyChain10KParser:
             done_set.add(ticker)
             # Checkpoint every 10 tickers to survive interruptions
             if len(done) % 10 == 0:
-                self._save_checkpoint(done)
+                self._save_checkpoint(done, cycle)
 
-        self._save_checkpoint(done)
+        self._save_checkpoint(done, cycle)
 
         summary = {
             "tickers_processed": self.stats.tickers_processed,
@@ -1137,6 +1253,9 @@ class SupplyChain10KParser:
             "nodes_created": self.stats.nodes_created,
             "pattern_hits": self.stats.pattern_hits,
             "elapsed_seconds": round(time.monotonic() - started, 1),
+            "cycle": cycle,
+            "universe": len(universe),
+            "remaining_in_pass": len([t for t in universe if t not in done_set]),
         }
         log.info("SupplyChain10KParser done: {s}", s=summary)
         return summary
@@ -1145,8 +1264,14 @@ class SupplyChain10KParser:
 # ── Hermes entrypoint (weekly) ────────────────────────────────────────────────
 
 
-def run_weekly(db_engine: Engine | None = None) -> dict[str, Any]:
-    """Hermes operator entrypoint. Runs once a week for 1 hour max."""
+def run_weekly(
+    db_engine: Engine | None = None, budget_seconds: int = WEEKLY_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """Hermes operator entrypoint: once a week, ``budget_seconds`` (15 min) per run.
+
+    Hermes runs it inline in its loop, so the budget is short; the
+    checkpoint carries the pass across weeks.
+    """
     if db_engine is None:
         from db import get_engine
 
@@ -1154,7 +1279,7 @@ def run_weekly(db_engine: Engine | None = None) -> dict[str, Any]:
     parser = SupplyChain10KParser(db_engine=db_engine)
     return parser.run(
         limit=None,
-        budget_seconds=_DEFAULT_RUN_BUDGET_SECONDS,
+        budget_seconds=budget_seconds,
     )
 
 
