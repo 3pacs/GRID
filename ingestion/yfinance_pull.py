@@ -14,6 +14,7 @@ import logging
 import math
 import re
 import threading
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -40,6 +41,24 @@ from store.observations import split_series_id
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# One id per pull_ticker call, stored in raw_payload on every generic row that call
+# writes. Rows of one call come from one yf.download frame, so a reader can tell a
+# session low and high that were downloaded together (scripts/grade_publication_review.py
+# pairs them on it) from two pulls' rows. It is provenance only: the unchanged-capture
+# skip below compares payloads without it, so it never causes an extra write.
+PULL_RUN_ID_KEY = "pull_run_id"
+
+
+def _new_pull_run_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _sans_run_id(payload: Any) -> Any:
+    if isinstance(payload, dict) and PULL_RUN_ID_KEY in payload:
+        return {k: v for k, v in payload.items() if k != PULL_RUN_ID_KEY}
+    return payload
 
 # GRID-YF-CLOSE-REPAIR-20260926 root-cause fix: the smart scheduler
 # (ingestion/smart_scheduler.py) runs YFinancePuller.pull_all in a daemon
@@ -610,6 +629,7 @@ class YFinancePuller(BasePuller):
 
             inserted = 0
             qualified_inserted = 0
+            pull_run_id = _new_pull_run_id()
             # Split lookup is lazy: fetched only when the ratio guard trips.
             split_events: list[tuple[date, float]] | None = None
             splits_recorded = False
@@ -888,7 +908,8 @@ class YFinancePuller(BasePuller):
                                     latest_payload = json.loads(latest_payload)
                                 except (TypeError, ValueError):
                                     latest_payload = None
-                            if latest_payload == payload and latest[2] is not None and float(latest[2]) == float_val:
+                            if (_sans_run_id(latest_payload) == payload and latest[2] is not None
+                                    and float(latest[2]) == float_val):
                                 continue
                         conn.execute(
                             text(
@@ -900,7 +921,8 @@ class YFinancePuller(BasePuller):
                             ),
                             {"sid": series_id, "src": self.source_id,
                              "od": obs_date_val, "pulled_at": captured_at,
-                             "val": float_val, "payload": json.dumps(payload)},
+                             "val": float_val,
+                             "payload": json.dumps({**payload, PULL_RUN_ID_KEY: pull_run_id})},
                         )
                         inserted += 1
                         if state == "POLICY_ELIGIBLE":

@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     DB_USER: str = "grid_user"
     DB_PASSWORD: str = ""
     ASTROGRID_DB_SCHEMA: str = "astrogrid"
+    # Scheduled lens-engine producer (oracle/astrogrid_engines.py). Off by
+    # default: while False the hourly celestial cycle writes no engine_run
+    # rows and never starts Node. When True, the cycle runs the shipped JS
+    # engines (astrogrid_shared/prophecy.js) under ASTROGRID_NODE_BIN once per
+    # stored sky_snapshot, for today's date only.
+    ASTROGRID_ENGINE_RUNS_ENABLED: bool = False
+    ASTROGRID_NODE_BIN: str = "node"
 
     # API Keys — core
     FRED_API_KEY: str = ""
@@ -67,11 +74,21 @@ class Settings(BaseSettings):
     SCHWAB_APP_SECRET: str = ""
     SCHWAB_TOKEN_FILE: str = "~/.config/grid/schwab/tokens.json"
     SCHWAB_CREDENTIALS_FILE: str = "~/.config/grid/schwab/credentials.env"
+    # End-of-day option-chain archive from Databento OPRA history
+    # (ingestion/options_eod_databento.py). The key file must be owner-only
+    # (0600) and is read only when the capture runs; the key never goes in
+    # .env. The store is one SQLite file; nothing reads it into the live
+    # options tables.
+    DATABENTO_API_KEY_FILE: str = "~/.config/databento/api-key"
+    OPTIONS_EOD_STORE: str = "/data/grid_ledgers/options-eod"
     # Private admin-only quote endpoint (api/routers/schwab_private.py). Off by
     # default: while False the router answers 503 and never touches the reader,
     # credentials or the network. Turning it on is an operator decision made in a
     # reviewed change; Schwab data is private and may not be redistributed.
     SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
+    # Existing GEX dashboard projections through GRID, admin-only and default-off.
+    # Enable only after private audience/entitlement and live parity review.
+    GAMMA_WATCH_PRIVATE_VIEWS_ENABLED: bool = False
     # Allows the separate admin-only SPX/SPY/QQQ board to read option chains.
     SCHWAB_PRIVATE_GEX_BOARD_ENABLED: bool = False
 
@@ -658,6 +675,7 @@ class Settings(BaseSettings):
         "GRID_TRUST_PRUNE_NO_EDGE",
         "GRID_API_PRECOMPUTE_ENABLED",
         "SCHWAB_PRIVATE_QUOTES_ENABLED",
+        "GAMMA_WATCH_PRIVATE_VIEWS_ENABLED",
         "SCHWAB_PRIVATE_GEX_BOARD_ENABLED",
         mode="before",
     )

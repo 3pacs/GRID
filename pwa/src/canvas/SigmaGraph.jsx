@@ -1,39 +1,123 @@
 /**
- * SigmaGraph — WebGL graph renderer using Sigma.js v3 + Graphology.
+ * SigmaGraph — WebGL graph renderer using Sigma.js v4 + Graphology.
  * Core rendering component for the Gotham Canvas.
  *
- * Uses @react-sigma/core for React integration.
+ * Uses @react-sigma/core (v6) for React integration.
  * ForceAtlas2 runs in bounded scheduled batches with persistent matrix state.
+ *
+ * Sigma v4 notes (see https://www.sigmajs.org/how-to/technical/migration-v3-v4/):
+ * - Appearance comes from declarative `styles`, not settings. Reducers are
+ *   constructor options only (no `setSetting('nodeReducer')`), so hover/select
+ *   focus is pushed through custom graph state and read by static reducers.
+ * - The `hidden` attribute is no longer read by sigma; the styles below map it
+ *   to `visibility` so the depth filter in CanvasStore keeps working.
+ * - `highlighted` (activity pulse) maps to a forced label, as v3 drew it.
+ * - Do not import from 'sigma' here: its module init touches
+ *   WebGL2RenderingContext, which jsdom tests do not have.
  */
 
 import React, { useEffect, useCallback, useState } from 'react';
 import { SigmaContainer, useRegisterEvents, useSigma, useLoadGraph } from '@react-sigma/core';
-import EdgeCurveProgram from '@sigma/edge-curve';
 import { startIncrementalLayout } from './incrementalLayout.js';
 import '@react-sigma/core/lib/style.css';
 import useCanvasStore from './CanvasStore.js';
 import CommunityHulls from './CommunityHulls.jsx';
 
-// ── Sigma settings ──
-const SIGMA_SETTINGS = {
-    defaultNodeColor: '#4A5568',
-    defaultEdgeColor: '#1A2332',
-    labelFont: 'IBM Plex Mono',
-    labelColor: { color: '#8AA0B8' },
-    labelSize: 12,
-    labelRenderedSizeThreshold: 6,
-    edgeProgramClasses: { curved: EdgeCurveProgram },
-    allowInvalidContainer: true,
-    renderLabels: true,
-    enableEdgeEvents: true,
-    zIndex: true,
-    // Performance
-    hideEdgesOnMove: true,
-    hideLabelsOnMove: false,
-    renderEdgeLabels: false,
-    // Anti-aliasing
-    labelDensity: 0.07,
-    labelGridCellSize: 60,
+const DIM_COLOR = '#1A2332';
+
+// ── Sigma styles (v4) ──
+// A user `styles.nodes` / `styles.edges` replaces sigma's DEFAULT_STYLES
+// wholesale, so the defaults we rely on (x/y, hover depth, hover backdrop) are
+// restated here alongside the v3-era look (colours, label font).
+const hiddenByAttribute = { whenData: { hidden: true }, then: 'hidden', else: { whenState: 'isHidden', then: 'hidden', else: 'visible' } };
+
+export const SIGMA_STYLES = {
+    nodes: {
+        depth: { whenState: 'isHovered', then: 'topNodes', else: 'nodes' },
+        x: { attribute: 'x' },
+        y: { attribute: 'y' },
+        size: { attribute: 'size', defaultValue: 10 },
+        color: { attribute: 'color', defaultValue: '#4A5568' },
+        label: { attribute: 'label' },
+        labelColor: '#8AA0B8',
+        labelFont: 'IBM Plex Mono',
+        labelSize: 12,
+        visibility: hiddenByAttribute,
+        labelVisibility: { whenState: 'isHovered', then: 'visible', else: { whenData: { highlighted: true }, then: 'visible', else: 'auto' } },
+        backdropVisibility: { whenState: 'isHovered', then: 'visible', else: 'hidden' },
+        backdropColor: '#ffffff',
+        backdropShadowColor: 'rgba(0, 0, 0, 0.5)',
+        backdropShadowBlur: 12,
+        backdropPadding: 6,
+    },
+    edges: {
+        depth: { whenState: ['isHighlighted', 'isHovered'], then: 'topEdges', else: 'edges' },
+        size: { attribute: 'size', defaultValue: 1 },
+        color: { attribute: 'color', defaultValue: DIM_COLOR },
+        label: { attribute: 'label' },
+        visibility: hiddenByAttribute,
+    },
+};
+
+// ── Focus (hover / selection) via graph state + static reducers ──
+// graphState.hoverFocus / selectFocus: { id, neighbors: Set<string> } | null.
+// Hover wins over selection while the pointer is on a node.
+export const CUSTOM_GRAPH_STATE = { hoverFocus: null, selectFocus: null };
+
+export function focusNodeReducer(key, data, attrs, state, graphState) {
+    const hover = graphState?.hoverFocus;
+    const focus = hover || graphState?.selectFocus;
+    if (!focus) return {};
+    if (!hover && key === focus.id) {
+        return { highlighted: true, labelVisibility: 'visible', depth: 'topNodes', zIndex: 2, size: data.size * 1.3 };
+    }
+    if (focus.neighbors.has(key)) return { depth: 'topNodes', zIndex: 1 };
+    return { color: DIM_COLOR, labelVisibility: 'hidden', depth: 'nodes', zIndex: 0 };
+}
+
+export function focusEdgeReducer(key, data, attrs, state, graphState, graph) {
+    const hover = graphState?.hoverFocus;
+    const focus = hover || graphState?.selectFocus;
+    if (!focus) return {};
+    const src = graph.source(key);
+    const tgt = graph.target(key);
+    if (!hover && (src === focus.id || tgt === focus.id)) {
+        return { visibility: 'visible', size: data.size * 1.5, depth: 'topEdges', zIndex: 1 };
+    }
+    if (focus.neighbors.has(src) && focus.neighbors.has(tgt)) {
+        return { visibility: 'visible', depth: hover ? 'topEdges' : 'edges', zIndex: hover ? 1 : 0 };
+    }
+    return { visibility: 'hidden', zIndex: 0 };
+}
+
+function focusOf(graph, id) {
+    const neighbors = new Set(graph.neighbors(id));
+    neighbors.add(id);
+    return { id, neighbors };
+}
+
+// Module-level so @react-sigma's options equality check never rebuilds sigma.
+export const SIGMA_OPTIONS = {
+    settings: {
+        allowInvalidContainer: true,
+        renderLabels: true,
+        enableEdgeEvents: true,
+        // v3 sized nodes/edges in screen pixels; v4 defaults to graph positions.
+        itemSizesReference: 'screen',
+        // Right-click is the node context menu; v4 binds right-drag to rotation.
+        enableCameraMouseRotation: false,
+        // Performance
+        hideEdgesOnMove: true,
+        hideLabelsOnMove: false,
+        renderEdgeLabels: false,
+        labelRenderedSizeThreshold: 6,
+        labelDensity: 0.07,
+        labelGridCellSize: 60,
+    },
+    styles: SIGMA_STYLES,
+    customGraphState: CUSTOM_GRAPH_STATE,
+    nodeReducer: focusNodeReducer,
+    edgeReducer: focusEdgeReducer,
 };
 
 // ── ForceAtlas2 settings ──
@@ -128,35 +212,12 @@ function GraphEvents() {
             },
             enterNode: ({ node }) => {
                 hoverNode(node);
-                // Highlight neighbors
-                const graph = sigma.getGraph();
-                const neighbors = new Set(graph.neighbors(node));
-                neighbors.add(node);
-
-                sigma.setSetting('nodeReducer', (n, data) => {
-                    if (neighbors.has(n)) {
-                        return { ...data, zIndex: 1 };
-                    }
-                    return { ...data, color: '#1A2332', label: null, zIndex: 0 };
-                });
-
-                sigma.setSetting('edgeReducer', (edge, data) => {
-                    const graph = sigma.getGraph();
-                    const src = graph.source(edge);
-                    const tgt = graph.target(edge);
-                    if (neighbors.has(src) && neighbors.has(tgt)) {
-                        return { ...data, hidden: false, zIndex: 1 };
-                    }
-                    return { ...data, hidden: true, zIndex: 0 };
-                });
-
-                sigma.refresh();
+                // Highlight neighbors (read by focusNodeReducer/focusEdgeReducer)
+                sigma.setGraphState({ hoverFocus: focusOf(sigma.getGraph(), node) });
             },
             leaveNode: () => {
                 hoverNode(null);
-                sigma.setSetting('nodeReducer', null);
-                sigma.setSetting('edgeReducer', null);
-                sigma.refresh();
+                sigma.setGraphState({ hoverFocus: null });
             },
             rightClickNode: ({ node, event }) => {
                 event.original.preventDefault();
@@ -187,42 +248,10 @@ function GraphEvents() {
         const graph = sigma.getGraph();
         if (!graph.hasNode(selectedNode.id)) return;
 
-        const neighbors = new Set(graph.neighbors(selectedNode.id));
-        neighbors.add(selectedNode.id);
-
-        sigma.setSetting('nodeReducer', (n, data) => {
-            if (n === selectedNode.id) {
-                return {
-                    ...data,
-                    highlighted: true,
-                    zIndex: 2,
-                    size: data.size * 1.3,
-                };
-            }
-            if (neighbors.has(n)) {
-                return { ...data, zIndex: 1 };
-            }
-            return { ...data, color: '#1A2332', label: null, zIndex: 0 };
-        });
-
-        sigma.setSetting('edgeReducer', (edge, data) => {
-            const src = graph.source(edge);
-            const tgt = graph.target(edge);
-            if (src === selectedNode.id || tgt === selectedNode.id) {
-                return { ...data, hidden: false, size: data.size * 1.5, zIndex: 1 };
-            }
-            if (neighbors.has(src) && neighbors.has(tgt)) {
-                return { ...data, hidden: false, zIndex: 0 };
-            }
-            return { ...data, hidden: true, zIndex: 0 };
-        });
-
-        sigma.refresh();
+        sigma.setGraphState({ selectFocus: focusOf(graph, selectedNode.id) });
 
         return () => {
-            sigma.setSetting('nodeReducer', null);
-            sigma.setSetting('edgeReducer', null);
-            sigma.refresh();
+            sigma.setGraphState({ selectFocus: null });
         };
     }, [selectedNode, sigma]);
 
@@ -245,7 +274,7 @@ export default function SigmaGraph({ style, communities, communityColors, commun
     return (
         <SigmaContainer
             style={containerStyle}
-            settings={SIGMA_SETTINGS}
+            options={SIGMA_OPTIONS}
             className="gotham-sigma"
         >
             <GraphLoader />

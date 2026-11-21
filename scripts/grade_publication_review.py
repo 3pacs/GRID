@@ -62,7 +62,7 @@ if str(_ROOT) not in sys.path:
 JOB = "grade_publication_review"
 REVIEW_SCHEMA = "publication-review-verdicts-v1"
 RECEIPT_SCHEMA = "publication-review-grader-receipt-v1"
-GRADER_VERSION = "grid/grade_publication_review-v1"
+GRADER_VERSION = "grid/grade_publication_review-v3-range-pairing"
 DEFAULT_PACKET_ROOT = Path(os.environ.get(
     "GRID_PUBLICATION_PACKET_PUBLIC_ROOT",
     os.environ.get("GRID_PUBLICATION_PACKET_ROOT", "~/research/publication-packets"))).expanduser()
@@ -709,19 +709,25 @@ def extract_figures(window: str) -> list[StatedFigure]:
 # holds for that instrument around the statement (intraday pulls, the completed close, the
 # session's high and low, later revisions) and asks whether the number was real:
 #
-#   during a session : between GRID's captures bracketing the instant -> confirmed;
-#                      equal to the previous completed close           -> confirmed;
-#                      only inside the session's high/low              -> partially_confirmed;
-#   after a close    : equal to the newest completed close at that time -> confirmed (whether or
-#                      not GRID had pulled it yet: the market had printed it);
-#                      equal to an older close while a newer one was known -> partially_confirmed
-#                      (stale); inside the session's range or equal to an intraday capture
-#                      -> partially_confirmed;
-#   FRED rates       : the same newest-vs-stale rule over observation dates;
-#   otherwise        : refuted, with the nearest captures and the range as evidence.
+# Intraday pulls are receipt-time evidence, not timestamped market prints. Nearby
+# values/ranges can corroborate a claim but cannot confirm its exact-time value.
+# Only a complete same-session range can refute an intraday value outside it.
+# Close/FRED semantics below are unchanged; grader confidence is not calibrated.
 
 SESSION_OPEN = (9, 30)
 BRACKET_WINDOW = timedelta(minutes=90)   # a capture further from the statement does not pin its level
+
+# A session low and high are one range only when one pull wrote both (see pair_range).
+# ingestion/yfinance_pull.py::pull_ticker writes every field of one ticker from one
+# yf.download frame inside one transaction, High loop before Low loop, stamping each row
+# with its own _utc_now(). Rows of one call are therefore milliseconds apart: between
+# High(D) and Low(D) sit at most ~5 dates x <=4 local round trips. Two calls for the same
+# ticker are a whole pull_all (dozens of provider downloads) or a schedule slot apart.
+# Rows stamped with a pull_run_id pair on it; legacy rows without one pair only inside
+# RANGE_PAIR_TOLERANCE. A stall longer than that (advisory-lock wait, lazy split lookup)
+# makes a legacy pair unscorable, never confirmed.
+RANGE_PAIR_TOLERANCE = timedelta(seconds=5)
+RANGE_RUN_MAX_SPAN = timedelta(minutes=10)   # one run id across a longer span is not one pull
 
 
 def session_open_utc(session: date) -> datetime:
@@ -751,6 +757,53 @@ class Facts:
     by_date: dict[date, list[Any]] = field(default_factory=dict)   # close vintages per label, oldest pull first
     low: dict[date, float] = field(default_factory=dict)
     high: dict[date, float] = field(default_factory=dict)
+    range_rows: dict[tuple[date, str], list[Any]] = field(default_factory=dict)   # every vintage, oldest first
+
+
+@dataclass
+class RangePair:
+    """One session low and high that a single pull wrote."""
+
+    low: Any
+    high: Any
+    basis: str          # "pull_run_id" or "retrieval_tolerance"
+
+
+def _run_id(o: Any) -> str | None:
+    rid = getattr(o, "pull_run_id", None)
+    return rid if isinstance(rid, str) and rid else None
+
+
+def same_pull(lo: Any, hi: Any) -> str | None:
+    """How ``lo`` and ``hi`` are known to come from one pull, or None when they are not.
+
+    Fail closed: a differing source never pairs; two run ids pair only when equal (and not
+    stretched over RANGE_RUN_MAX_SPAN); a run id on one row only means two writer versions,
+    hence two pulls; rows without run ids pair only within RANGE_PAIR_TOLERANCE.
+    """
+    if not lo.source or lo.source != hi.source or lo.pull_timestamp is None or hi.pull_timestamp is None:
+        return None
+    gap = abs(lo.pull_timestamp - hi.pull_timestamp)
+    lo_run, hi_run = _run_id(lo), _run_id(hi)
+    if lo_run is not None and hi_run is not None:
+        return "pull_run_id" if lo_run == hi_run and gap <= RANGE_RUN_MAX_SPAN else None
+    if lo_run is not None or hi_run is not None:
+        return None
+    return "retrieval_tolerance" if gap <= RANGE_PAIR_TOLERANCE else None
+
+
+def pair_range(facts: "Facts", session: date) -> RangePair | None:
+    """The newest low/high of ``session`` written by one pull, or None."""
+    best: RangePair | None = None
+    for lo in facts.range_rows.get((session, "low"), []):
+        for hi in facts.range_rows.get((session, "high"), []):
+            basis = same_pull(lo, hi)
+            if basis is None or lo.value > hi.value:
+                continue
+            newest = max(lo.pull_timestamp, hi.pull_timestamp)
+            if best is None or newest > max(best.low.pull_timestamp, best.high.pull_timestamp):
+                best = RangePair(lo, hi, basis)
+    return best
 
 
 def gather_facts(conn: Any, fig: Figure, at: datetime) -> Facts:
@@ -767,6 +820,7 @@ def gather_facts(conn: Any, fig: Figure, at: datetime) -> Facts:
         for name, target in ((f"{stem}:low", facts.low), (f"{stem}:high", facts.high)):
             for o in _vintages(conn, name, start, end):
                 target[o.obs_date] = o.value          # oldest pull first: the last write is the newest
+                facts.range_rows.setdefault((o.obs_date, name.rsplit(":", 1)[1]), []).append(o)
     else:
         rows = _vintages(conn, fig.series_id, at.date() - timedelta(days=14), at.date())
         facts.sessions = sorted({o.obs_date for o in rows}, reverse=True)
@@ -816,20 +870,54 @@ def judge_level(stated: StatedFigure, at: datetime, facts: Facts) -> Judgment | 
     src = f"raw_series {fig.series_id}"
     if not any(facts.by_date.values()):
         return None
-    # 1. during a session: GRID's captures that bracket the instant
+    # Intraday current-level claims require market event times for confirmation.
+    # Observation currently has only pull_timestamp: never relabel it as event time.
     if facts.intraday is not None:
-        # only captures taken during the session and near the statement pin a level to the instant
-        close = session_close_utc(facts.intraday)
-        rows = [o for o in facts.by_date.get(facts.intraday, [])
-                if o.pull_timestamp < close and abs(o.pull_timestamp - at) <= BRACKET_WINDOW]
+        session = facts.intraday
+        close = session_close_utc(session)
+        rows = [o for o in facts.by_date.get(session, [])
+                if session_open_utc(session) <= o.pull_timestamp < close
+                and abs(o.pull_timestamp - at) <= BRACKET_WINDOW]
         before = [o for o in rows if o.pull_timestamp <= at]
         after = [o for o in rows if o.pull_timestamp > at]
         bracket = before[-1:] + after[:1]
         if bracket and _within(value, dec, min(o.value for o in bracket), max(o.value for o in bracket)):
-            ev = [_ev(f"{o.source} {fig.series_id}", f"{o.value:g}{unit} captured {iso(o.pull_timestamp)}",
+            ev = [_ev(f"{o.source} {fig.series_id}",
+                      f"{o.value:g}{unit} retrieved {iso(o.pull_timestamp)}; market event time unknown",
                       o.pull_timestamp) for o in bracket]
-            known = bool(before) and figure_matches(value, dec, before[-1].value)
-            return Judgment("confirmed", ev, None, known, 0.9)
+            return Judgment("partially_confirmed", ev,
+                            "nearby captures corroborate plausibility, not the value at the statement instant; "
+                            "retrieval time is not market event time", None, 0.6)
+        # The newest low and high that one pull wrote (pair_range); a low from one pull
+        # and a high from another are not one range.
+        pair = pair_range(facts, session)
+        if pair is not None:
+            lo, hi = pair.low.value, pair.high.value
+            low_at, high_at = pair.low.pull_timestamp, pair.high.pull_timestamp
+            paired = ("same pull run" if pair.basis == "pull_run_id"
+                      else f"retrieved within {int(RANGE_PAIR_TOLERANCE.total_seconds())} s")
+            ev = [_ev(f"{o.source} {fig.series_id.rsplit(':', 1)[0]}:{name}",
+                      f"session {session} {name} {o.value:g}{unit}; retrieved {iso(o.pull_timestamp)}; "
+                      f"paired: {paired}", o.pull_timestamp)
+                  for name, o in (("low", pair.low), ("high", pair.high))]
+            if _within(value, dec, lo, hi):
+                return Judgment("partially_confirmed", ev,
+                                "inside the session range; no market-time observation pins the stated instant",
+                                None, 0.6)
+            # A newer single-leg capture (another pull) can only widen what is known to have traded.
+            hull_lo = min([lo] + [o.value for o in facts.range_rows.get((session, "low"), [])
+                                  if o.pull_timestamp >= close])
+            hull_hi = max([hi] + [o.value for o in facts.range_rows.get((session, "high"), [])
+                                  if o.pull_timestamp >= close])
+            if low_at >= close and high_at >= close and not _within(value, dec, hull_lo, hull_hi):
+                return Judgment("refuted", ev,
+                                f"stated {fig.label} {value:g}{unit} is outside the complete {session} "
+                                f"session range {lo:g}-{hi:g}{unit}", False, 0.85)
+        # Sparse samples cannot disprove a transient price. A prior close is not
+        # evidence of today's current price either. Keep the claim unscorable.
+        return Judgment("unscorable", [],
+                        "no market-time observation or complete same-session range establishes or contradicts "
+                        "the stated intraday level; sparse captures are not refutation", None, 0.0)
     # 2. a completed close
     closes = [(s, _completed_close(facts, s)) for s in facts.sessions]
     closes = [(s, o) for s, o in closes if o is not None]
@@ -1028,6 +1116,22 @@ def verdict_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def confirmed_ingest(receipt: dict[str, Any], review_sha: str, packet_sha: str) -> dict[str, Any] | None:
+    """Only v2 evidence copied from the ingest's actual byte identity can skip a hand-off.
+
+    Legacy ingested_review_sha256 alone was fabricated by --no-ingest in v1. It is
+    not evidence. The next normal run reconciles it through the idempotent ingest.
+    """
+    confirmation = receipt.get("ingest_confirmation")
+    if (isinstance(confirmation, dict)
+            and confirmation.get("schema") == "publication-review-ingest-confirmation-v1"
+            and confirmation.get("review_sha256") == review_sha
+            and confirmation.get("packet_sha256") == packet_sha
+            and type(confirmation.get("run_id")) is int and confirmation["run_id"] > 0):
+        return dict(confirmation)
+    return None
+
+
 def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT, review_root: Path = DEFAULT_REVIEW_ROOT,
               dry_run: bool = False, now: datetime | None = None, client_factory: Any = None,
               ingest: bool = True, force: bool = False, public_root: Path | None = None) -> dict[str, Any]:
@@ -1079,7 +1183,8 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             receipt["review_sha256"] = sha256(before[0])
             # The file on disk is current; make sure the database agrees. A hand-off that failed
             # on an earlier run (database down, module error) is retried here, not forgotten.
-            if ingest and previous_receipt(folder).get("ingested_review_sha256") != receipt["review_sha256"]:
+            prior_confirmation = confirmed_ingest(previous_receipt(folder), receipt["review_sha256"], packet.sha256)
+            if ingest and prior_confirmation is None:
                 receipt["ingest"] = run_ingest(engine, day, review_root, packet_root)
         else:
             write_file(path, payload)
@@ -1087,10 +1192,26 @@ def grade_day(engine: Any, day: date, *, packet_root: Path = DEFAULT_PACKET_ROOT
             receipt["superseded_previous"] = before is not None
             if ingest:
                 receipt["ingest"] = run_ingest(engine, day, review_root, packet_root)
-        if receipt.get("ingest", {}).get("state") in {"INGESTED", "PRESENT"}:
-            receipt["ingested_review_sha256"] = receipt["review_sha256"]
-        elif "ingest" not in receipt and receipt["state"] == "UNCHANGED":
-            receipt["ingested_review_sha256"] = receipt["review_sha256"]   # confirmed by the previous receipt
+        result = receipt.get("ingest", {})
+        if result.get("state") in {"INGESTED", "PRESENT"}:
+            # The ingest reopens the file. Another invocation could have replaced it
+            # after our write/read: certify its returned bytes, never just its status.
+            if (result.get("review_sha256") != receipt["review_sha256"]
+                    or result.get("packet_sha256") != packet.sha256
+                    or type(result.get("run_id")) is not int or result["run_id"] <= 0):
+                receipt["ingest_confirmation_error"] = "ingest result does not bind the expected review, packet and run"
+            elif result.get("rejected_rows") != 0 or result.get("declared_mismatch") != []:
+                receipt["ingest_confirmation_error"] = "ingest result is incomplete or has rejected rows"
+            else:
+                receipt["ingest_confirmation"] = {
+                    "schema": "publication-review-ingest-confirmation-v1",
+                    "review_sha256": result["review_sha256"], "packet_sha256": result["packet_sha256"],
+                    "run_id": result["run_id"],
+                }
+        elif "ingest" not in receipt and unchanged and prior_confirmation is not None:
+            receipt["ingest_confirmation"] = prior_confirmation
+        if "ingest_confirmation" in receipt:
+            receipt["ingested_review_sha256"] = receipt["ingest_confirmation"]["review_sha256"]
     except Refused as exc:
         receipt.update(state="REFUSED", reason=str(exc))
     except Exception as exc:  # the receipt must exist; the type is the public reason
@@ -1118,7 +1239,7 @@ def run_ingest(engine: Any, day: date, review_root: Path, packet_root: Path) -> 
         traceback.print_exc(file=sys.stderr)
         return {"state": "FAILED", "reason": f"hand-off: {type(exc).__name__}"}
     return {key: result.get(key) for key in ("state", "reason", "run_id", "accepted_rows", "rejected_rows",
-                                              "declared_mismatch", "receipt_file")}
+                                              "declared_mismatch", "receipt_file", "review_sha256", "packet_sha256")}
 
 
 def publish_review(folder: Path, public_dir: Path) -> dict[str, Any]:
@@ -1177,7 +1298,8 @@ def exit_code(receipts: list[dict[str, Any]]) -> int:
         return 1
     for r in receipts:
         ing = r.get("ingest") or {}
-        if ing.get("state") in {"REFUSED", "FAILED"} or ing.get("rejected_rows") or ing.get("declared_mismatch"):
+        if (r.get("ingest_confirmation_error") or ing.get("state") in {"REFUSED", "FAILED"}
+                or ing.get("rejected_rows") or ing.get("declared_mismatch")):
             return 3
     return 0
 

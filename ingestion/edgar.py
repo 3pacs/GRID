@@ -76,6 +76,69 @@ def resolve_sec_identity(identity: str | None = None) -> str:
     return DEFAULT_SEC_IDENTITY
 
 
+# Form 4 transaction codes for open-market trades (P = purchase, S = sale).
+# Everything else (A award, M exercise, F tax withholding, G gift, ...) is a
+# non-market transaction that moves share counts without an insider choosing
+# to trade at the market price.
+FORM4_OPEN_MARKET_CODES: frozenset[str] = frozenset({"P", "S"})
+
+
+def form4_nonderivative_transactions(f4: Any) -> pd.DataFrame | None:
+    """Return a Form 4's non-derivative transactions table, or ``None``.
+
+    edgartools' ``Form4`` has no ``transactions`` attribute (4.6.3, 5.62.1 and
+    6.3.0 alike). The transactions live in
+    ``f4.non_derivative_table.transactions.data``: one row per
+    ``nonDerivativeTransaction``, with columns ``Code``, ``AcquiredDisposed``
+    (``A``/``D``), ``Shares`` and ``Price``. Derivative transactions (options,
+    RSUs) are left out: their share counts are underlying-share units.
+    Returns ``None`` for a filing with no non-derivative transactions.
+    """
+    table = getattr(f4, "non_derivative_table", None)
+    transactions = getattr(table, "transactions", None) if table is not None else None
+    data = getattr(transactions, "data", None) if transactions is not None else None
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return None
+    return data
+
+
+def aggregate_form4_transactions(data: pd.DataFrame) -> dict[str, float]:
+    """Net shares, net value and count for one filing's transactions.
+
+    Sign convention: ``AcquiredDisposed == "D"`` is negative, anything else
+    is positive. Value is signed shares times price, with a missing price
+    counted as 0. ``open_mkt_*`` repeats the sums over open-market trades only
+    (codes P and S).
+    """
+    def column(name: str) -> pd.Series:
+        if name in data.columns:
+            return data[name]
+        return pd.Series([None] * len(data), index=data.index, dtype=object)
+
+    raw_shares = column("Shares")
+    shares = pd.to_numeric(raw_shares, errors="coerce")
+    coerced = int((shares.isna() & raw_shares.notna()).sum())
+    if coerced:
+        log.warning(
+            "Form 4: {n} transaction share value(s) not numeric, counted as 0",
+            n=coerced,
+        )
+    shares = shares.fillna(0.0).astype(float)
+    price = pd.to_numeric(column("Price"), errors="coerce").fillna(0.0).astype(float)
+    sign = column("AcquiredDisposed").astype(str).str.strip().str.upper().eq("D")
+    signed = shares.where(~sign, -shares)
+    value = signed * price
+    open_mkt = column("Code").astype(str).str.strip().str.upper().isin(FORM4_OPEN_MARKET_CODES)
+    return {
+        "net_shares": float(signed.sum()),
+        "net_value": float(value.sum()),
+        "txn_count": float(len(data)),
+        "open_mkt_net_shares": float(signed[open_mkt].sum()),
+        "open_mkt_net_value": float(value[open_mkt].sum()),
+        "open_mkt_txn_count": float(open_mkt.sum()),
+    }
+
+
 class EDGARPuller(BasePuller):
     """Pulls SEC filing data from EDGAR into ``raw_series``.
 
@@ -314,10 +377,14 @@ class EDGARPuller(BasePuller):
     ) -> dict[str, Any]:
         """Pull Form 4 insider transactions for tracked companies.
 
-        Stores daily aggregated insider activity:
-        - FORM4:{ticker}:NET_SHARES — net shares bought/sold
-        - FORM4:{ticker}:NET_VALUE — net dollar value of transactions
+        Stores insider activity aggregated by filing date (``obs_date`` is
+        the date the Form 4 was filed, when it became public), over each
+        filing's non-derivative transactions:
+        - FORM4:{ticker}:NET_SHARES — net shares acquired (+) / disposed (-)
+        - FORM4:{ticker}:NET_VALUE — net signed shares x price
         - FORM4:{ticker}:TXN_COUNT — number of transactions
+        - FORM4:{ticker}:OPEN_MKT_NET_SHARES / _NET_VALUE / _TXN_COUNT — the
+          same over open-market trades only (codes P and S)
 
         Parameters:
             tickers: Company tickers to track. Defaults to major indices components.
@@ -362,31 +429,19 @@ class EDGARPuller(BasePuller):
                             break
 
                         f4 = filing.obj()
-                        if not hasattr(f4, "transactions") or f4.transactions is None:
+                        # Form4 never had a ``transactions`` attribute, so the
+                        # old ``hasattr(f4, "transactions")`` check skipped
+                        # every filing and this pull never wrote a row.
+                        txns = form4_nonderivative_transactions(f4)
+                        if txns is None:
                             continue
 
-                        txns = f4.transactions
-                        if hasattr(txns, "empty") and txns.empty:
-                            continue
-
-                        if filing_date not in daily_agg:
-                            daily_agg[filing_date] = {
-                                "net_shares": 0.0,
-                                "net_value": 0.0,
-                                "txn_count": 0.0,
-                            }
-
-                        for _, txn in txns.iterrows():
-                            shares = float(txn.get("shares", txn.get("transactionShares", 0)) or 0)
-                            price = float(txn.get("pricePerShare", txn.get("price", 0)) or 0)
-                            acq_disp = str(txn.get("acquiredDisposedCode", txn.get("acquired_disposed", "A")))
-
-                            if acq_disp == "D":
-                                shares = -shares
-
-                            daily_agg[filing_date]["net_shares"] += shares
-                            daily_agg[filing_date]["net_value"] += shares * price
-                            daily_agg[filing_date]["txn_count"] += 1
+                        agg = aggregate_form4_transactions(txns)
+                        day = daily_agg.setdefault(
+                            filing_date, {key: 0.0 for key in agg}
+                        )
+                        for key, val in agg.items():
+                            day[key] += val
 
                     except Exception as exc:
                         log.debug(
@@ -403,6 +458,9 @@ class EDGARPuller(BasePuller):
                             f"FORM4:{ticker}:NET_SHARES": agg["net_shares"],
                             f"FORM4:{ticker}:NET_VALUE": agg["net_value"],
                             f"FORM4:{ticker}:TXN_COUNT": agg["txn_count"],
+                            f"FORM4:{ticker}:OPEN_MKT_NET_SHARES": agg["open_mkt_net_shares"],
+                            f"FORM4:{ticker}:OPEN_MKT_NET_VALUE": agg["open_mkt_net_value"],
+                            f"FORM4:{ticker}:OPEN_MKT_TXN_COUNT": agg["open_mkt_txn_count"],
                         }
                         for sid, val in metrics.items():
                             if not self._row_exists(sid, fdate, conn):

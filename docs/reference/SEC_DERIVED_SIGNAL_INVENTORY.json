@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "basis_commit": "43c6ab5423e6bf1c3fbcca9b2287f2eb13e232c1",
+  "coverage_complete": false,
+  "production_inventory_performed": false,
+  "affected_row_counts": null,
+  "scope": "Source-reviewed first slice only. Guarded means the stated subpath, never whole module or transitive closure.",
+  "entries": [
+    {
+      "id": "signal_event_fanout",
+      "kind": "event_replay",
+      "paths": [
+        "contracts/handlers/oracle_signals.py",
+        "contracts/handlers/trust.py",
+        "contracts/handlers/journal.py"
+      ],
+      "inputs": [
+        "financial_divergence_report"
+      ],
+      "outputs": [
+        "signal_sources",
+        "decision_journal"
+      ],
+      "status": "guarded_this_slice",
+      "limitation": "Explicit event type, source family or producer marker; no automatic rebinding."
+    },
+    {
+      "id": "journal_current_regime",
+      "kind": "current_read",
+      "paths": [
+        "oracle/engine.py",
+        "oracle/trace_evolver.py",
+        "analysis/thesis_scorer.py",
+        "intelligence/sentiment_scorer.py",
+        "api/routers/regime.py",
+        "api/routers/watchlist_overview.py",
+        "api/routers/dad.py"
+      ],
+      "inputs": [
+        "decision_journal"
+      ],
+      "outputs": [
+        "current_regime_context",
+        "confidence_feedback"
+      ],
+      "status": "guarded_this_slice",
+      "limitation": "Exclude explicit provisional/financial signal journal markers; other rows are not certified financially clean."
+    },
+    {
+      "id": "journal_history",
+      "kind": "historical_read",
+      "paths": [
+        "api/routers/journal.py"
+      ],
+      "inputs": [
+        "decision_journal"
+      ],
+      "outputs": [
+        "journal_history"
+      ],
+      "status": "preserved",
+      "limitation": "Raw history, actual decisions and outcomes remain unchanged."
+    },
+    {
+      "id": "signal_extractor",
+      "kind": "materialization",
+      "paths": [
+        "intelligence/signal_extractor.py"
+      ],
+      "inputs": [
+        "signal_sources"
+      ],
+      "outputs": [
+        "signal_data"
+      ],
+      "status": "open",
+      "limitation": "Source family survives; original row identity and SEC generation do not."
+    },
+    {
+      "id": "trust_convergence_registry",
+      "kind": "mixed_materialization",
+      "paths": [
+        "intelligence/adapters/trust_scorer_adapter.py"
+      ],
+      "inputs": [
+        "signal_sources"
+      ],
+      "outputs": [
+        "signal_registry"
+      ],
+      "status": "open",
+      "limitation": "Convergence loses contributor identities; direct source summaries may retain metadata.source_type."
+    },
+    {
+      "id": "lever_puller_registry",
+      "kind": "materialization",
+      "paths": [
+        "intelligence/adapters/lever_pullers_adapter.py"
+      ],
+      "inputs": [
+        "signal_sources"
+      ],
+      "outputs": [
+        "signal_registry"
+      ],
+      "status": "open",
+      "limitation": "Explicit metadata.source_type permits direct attribution; current reads still need qualification."
+    },
+    {
+      "id": "registry_publication",
+      "kind": "publication",
+      "paths": [
+        "intelligence/signal_registry.py",
+        "intelligence/adapters/base.py"
+      ],
+      "inputs": [
+        "signal_registry"
+      ],
+      "outputs": [
+        "current_registered_signals"
+      ],
+      "status": "open",
+      "limitation": "Empty refresh does not withdraw prior publication; run/scope publication identity required."
+    },
+    {
+      "id": "oracle_prediction",
+      "kind": "mixed_materialization",
+      "paths": [
+        "oracle/engine.py",
+        "oracle/model_factory.py"
+      ],
+      "inputs": [
+        "signal_registry",
+        "decision_journal",
+        "learning_state"
+      ],
+      "outputs": [
+        "oracle_predictions"
+      ],
+      "status": "open",
+      "limitation": "Contributor IDs lost, payload truncated, historical maximum confidence retained."
+    },
+    {
+      "id": "sentiment_snapshot",
+      "kind": "mixed_materialization",
+      "paths": [
+        "intelligence/sentiment_scorer.py",
+        "api/routers/briefing.py"
+      ],
+      "inputs": [
+        "signal_sources",
+        "decision_journal"
+      ],
+      "outputs": [
+        "sentiment_snapshots"
+      ],
+      "status": "open",
+      "limitation": "New regime subread guarded; raw-signal input and previously persisted outputs remain unqualified."
+    },
+    {
+      "id": "thesis_snapshot",
+      "kind": "mixed_materialization",
+      "paths": [
+        "analysis/thesis_scorer.py"
+      ],
+      "inputs": [
+        "signal_sources",
+        "decision_journal",
+        "learning_state"
+      ],
+      "outputs": [
+        "thesis_snapshots"
+      ],
+      "status": "open",
+      "limitation": "New regime subread guarded; convergence and persisted outputs remain unqualified."
+    },
+    {
+      "id": "journal_pattern_sleuth",
+      "kind": "mixed_materialization",
+      "paths": [
+        "intelligence/event_sequence.py",
+        "intelligence/pattern_engine.py",
+        "intelligence/sleuth.py",
+        "intelligence/adapters/pattern_adapter.py",
+        "intelligence/adapters/sleuth_adapter.py"
+      ],
+      "inputs": [
+        "decision_journal",
+        "signal_data"
+      ],
+      "outputs": [
+        "event_sequences",
+        "patterns",
+        "sleuth_leads",
+        "signal_registry"
+      ],
+      "status": "open",
+      "limitation": "Generic events and truncated lead evidence can lose financial ancestry."
+    },
+    {
+      "id": "trust_cache",
+      "kind": "cache",
+      "paths": [
+        "intelligence/trust_scorer.py"
+      ],
+      "inputs": [
+        "signal_sources"
+      ],
+      "outputs": [
+        "source_trust_scores_cached"
+      ],
+      "status": "open",
+      "limitation": "Age alone does not qualify stored source-trust aggregates."
+    },
+    {
+      "id": "paper_trade_sizing",
+      "kind": "historical_execution",
+      "paths": [
+        "trading/signal_executor.py"
+      ],
+      "inputs": [
+        "trust_convergence"
+      ],
+      "outputs": [
+        "paper_trades"
+      ],
+      "status": "open",
+      "limitation": "Sizing lacks contributor IDs; preserve actual execution facts, qualify evaluative reuse separately."
+    },
+    {
+      "id": "hypothesis_materialization",
+      "kind": "mixed_materialization",
+      "paths": [
+        "intelligence/hypothesis_engine.py"
+      ],
+      "inputs": [
+        "oracle_predictions"
+      ],
+      "outputs": [
+        "discovered_hypotheses"
+      ],
+      "status": "open",
+      "limitation": "Names/date do not reconstruct parent prediction identities."
+    },
+    {
+      "id": "learned_state",
+      "kind": "learning",
+      "paths": [
+        "oracle/engine.py"
+      ],
+      "inputs": [
+        "oracle_predictions",
+        "decision_journal"
+      ],
+      "outputs": [
+        "oracle_models",
+        "confidence_bucket_history",
+        "meta_learning_matrix",
+        "signal_cooccurrence_history"
+      ],
+      "status": "open",
+      "limitation": "New independently qualified learning epochs required; a fresh output timestamp is insufficient."
+    }
+  ]
+}

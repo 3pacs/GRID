@@ -33,6 +33,7 @@ from sqlalchemy.pool import NullPool
 
 from ingestion.base import BasePuller
 from ingestion.market_calendar import is_market_open
+from store.options_iv import CALL_WING, PUT_WING, fixed_moneyness_wings
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -108,10 +109,30 @@ class OptionsSourceAccessDenied(Exception):
     ``NO_CHAIN``, not a denial.
     """
 
+    reason = "source_access_denied"
+
     def __init__(self, provider: str, http_status: int) -> None:
         self.provider = provider
         self.http_status = http_status
         super().__init__(f"{provider} access denied (HTTP {http_status})")
+
+
+class OptionsSourceStopped(OptionsSourceAccessDenied):
+    """The source must not be asked again this run; not a refusal of access.
+
+    Raised by a provider that shares a request allowance (Schwab,
+    ``ingestion/options_schwab.py``) on a rate limit, an outage or an expired
+    login. The run stops exactly as it does for an access denial, so later
+    tickers are not requested, but the result says what happened.
+    """
+
+    reason = "source_stopped"
+
+    def __init__(self, provider: str, http_status: int, why: str) -> None:
+        self.provider = provider
+        self.http_status = http_status
+        Exception.__init__(self, f"{provider} {why}" + (f" (HTTP {http_status})" if http_status else ""))
+
 
 
 def _is_access_denial(ticker: str, http_status: int) -> bool:
@@ -187,6 +208,10 @@ class OptionsPullResults(list[dict[str, Any]]):
         "no expirations", "no chain listed", "no dated regular-market price",
     })
     _CORE_TICKERS: frozenset[str] = frozenset(EQUITY_TICKERS)
+    # Per-ticker ``reason`` values that end a run without requesting later
+    # tickers: a refusal of access, or a source that must not be asked again
+    # (``OptionsSourceStopped``).
+    _RUN_STOP_REASONS: frozenset[str] = frozenset({"source_access_denied", "source_stopped"})
 
     def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
         super().__init__(items)
@@ -233,9 +258,15 @@ class OptionsPullResults(list[dict[str, Any]]):
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
         else:
             status, note = "SUCCESS", "full default universe captured"
-        denied = next((r for r in self if r.get("reason") == "source_access_denied"), None)
+        denied = next((r for r in self if r.get("reason") in self._RUN_STOP_REASONS), None)
         if denied is not None and status in ("PARTIAL", "FAILED"):
             note = f"{denied['error']}; remaining tickers not requested"
+        elif status in ("PARTIAL", "FAILED"):
+            # A rate limit on the last name asked leaves no later name to stop
+            # on; say so here or the run reads as an ordinary incomplete chain.
+            limited = next((r.get("rate_limited") for r in self if r.get("rate_limited")), None)
+            if limited is not None:
+                note = f"{note}; {limited}"
         return {
             "status": status, "rows_inserted": rows,
             "scope": "full_universe" if self.full_universe else "subset",
@@ -403,6 +434,11 @@ class YahooOptionsClient:
         self.crumb: str | None = None
         # True after get_options() saw a clean empty chain (no such symbol).
         self.last_no_chain = False
+        # HTTP status of the latest chain request (None before one, and after a
+        # transport failure), so a caller can tell a 429 from other failures.
+        self.last_status: int | None = None
+        # HTTP status of the crumb request in the handshake (None when it never answered).
+        self.init_status: int | None = None
         self._init_session()
 
     def _init_session(self) -> None:
@@ -419,6 +455,7 @@ class YahooOptionsClient:
             resp = self.session.get(
                 "https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10,
             )
+            self.init_status = resp.status_code
             if resp.status_code == 200 and resp.text:
                 self.crumb = resp.text
                 log.info("Yahoo options client initialised — crumb obtained")
@@ -447,8 +484,10 @@ class YahooOptionsClient:
         if expiry_ts is not None:
             params["date"] = expiry_ts
 
+        self.last_status = None
         try:
             resp = self.session.get(url, params=params, timeout=15)
+            self.last_status = resp.status_code
             if resp.status_code != 200:
                 log.warning("Yahoo options {t}: HTTP {s}", t=ticker, s=resp.status_code)
                 return None
@@ -733,9 +772,23 @@ class CboeOptionsClient:
 
 
 def options_primary_provider() -> str:
-    """``cboe`` (default) or ``yahoo``, from GRID_OPTIONS_PRIMARY_PROVIDER."""
+    """``cboe`` (default), ``yahoo`` or ``schwab``, from GRID_OPTIONS_PRIMARY_PROVIDER.
+
+    ``schwab`` reads the hand-listed core through the owner's Schwab app and
+    every other ticker from Yahoo (``ingestion/options_schwab.py``), and only
+    when ``GRID_OPTIONS_SCHWAB_READERS=admin-only`` states that non-admin
+    readers leave Schwab-provider rows out; anything else is ``cboe``.
+    """
     value = os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "cboe").strip().lower()
-    return "yahoo" if value == "yahoo" else "cboe"
+    if value == "schwab" and os.getenv("GRID_OPTIONS_SCHWAB_READERS", "").strip().lower() != "admin-only":
+        # Schwab data may not be redistributed, and the options tables feed
+        # contributor routes, e-mail digests and oracle publication (review of
+        # #1299, item 3). Until those leave Schwab-provider rows out, the
+        # operator has not set GRID_OPTIONS_SCHWAB_READERS=admin-only and the
+        # default path runs instead.
+        log.warning("GRID_OPTIONS_PRIMARY_PROVIDER=schwab ignored: GRID_OPTIONS_SCHWAB_READERS is not 'admin-only'")
+        return "cboe"
+    return value if value in ("yahoo", "schwab") else "cboe"
 
 
 class CboeFirstOptionsClient:
@@ -853,6 +906,9 @@ class OptionsPuller(BasePuller):
                     iv_atm          DOUBLE PRECISION,
                     iv_25d_put      DOUBLE PRECISION,
                     iv_25d_call     DOUBLE PRECISION,
+                    iv_m90_put_v1   DOUBLE PRECISION,
+                    iv_m110_call_v1 DOUBLE PRECISION,
+                    wing_iv_metadata JSONB,
                     term_structure_slope DOUBLE PRECISION,
                     oi_concentration     DOUBLE PRECISION,
                     created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -943,7 +999,47 @@ class OptionsPuller(BasePuller):
         # (operator rollback knob; the test suite pins it so no test reaches
         # Cboe unless it opts in). ``_yahoo`` keeps its historical attribute
         # name: callers and tests inject any ``get_options`` client there.
-        if options_primary_provider() == "yahoo":
+        primary = options_primary_provider()
+        core_block: str | None = None
+        # Schwab mode only: why the Yahoo-served names are not requested, and
+        # their smaller expiry cap. None / the run's own cap on every other path.
+        tail_block: str | None = None
+        tail_expirations = max_expirations
+        if primary == "schwab":
+            # Owner-selected source for the hand-listed core (2026-11-21);
+            # every other ticker is read from Yahoo. Schwab shares its app
+            # allowance with the live recorder and dates a price only inside
+            # the regular session, so the core is not requested after the
+            # cash close, or while the shared call ledger shows a recent
+            # refusal or a recent capture by this same writer.
+            from ingestion.options_schwab import (
+                YAHOO_MAX_EXPIRATIONS,
+                SchwabFirstOptionsClient,
+                schwab_core_block,
+                schwab_post_session,
+                yahoo_tail_hold,
+            )
+
+            if schwab_post_session(now):
+                # Neither source is asked after the cash close: Schwab cannot
+                # date a price then, and the evening slot must not spend Yahoo
+                # requests on names whose quotes stopped at the close.
+                log.info("Options pull skipped: the regular session has closed (schwab mode)")
+                return OptionsPullResults([
+                    {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": "post-session",
+                     "provider": "schwab" if ticker in EQUITY_TICKERS else "yahoo"} for ticker in tickers
+                ], full_universe=full_universe)
+            if any(ticker in EQUITY_TICKERS for ticker in tickers):
+                core_block = schwab_core_block(now, writer=capture_source)
+                if core_block is not None:
+                    log.info("Options pull: Schwab core not requested ({why})", why=core_block)
+            if any(ticker not in EQUITY_TICKERS for ticker in tickers):
+                tail_block = yahoo_tail_hold(now.timestamp())
+                if tail_block is not None:
+                    log.info("Options pull: Yahoo names not requested ({why})", why=tail_block)
+            tail_expirations = min(max_expirations, YAHOO_MAX_EXPIRATIONS)
+            self._yahoo = SchwabFirstOptionsClient(writer=capture_source)
+        elif primary == "yahoo":
             self._yahoo = YahooOptionsClient()
         else:
             self._yahoo = CboeFirstOptionsClient()
@@ -961,19 +1057,35 @@ class OptionsPuller(BasePuller):
                     for t in tickers[idx:]
                 )
                 break
+            if core_block is not None and ticker in EQUITY_TICKERS:
+                # Not requested from Schwab this run: counted as not captured.
+                results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                                "reason": core_block, "provider": "schwab"})
+                continue
+            in_tail = primary == "schwab" and ticker not in EQUITY_TICKERS
+            if in_tail and tail_block is None and getattr(self._yahoo, "yahoo_budget_spent", False):
+                tail_block = "yahoo_request_budget"
+            if in_tail and tail_block is not None:
+                results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                                "reason": tail_block, "provider": "yahoo"})
+                continue
             ticker_kwargs: dict[str, Any] = {
-                "max_expirations": max_expirations, "should_continue": should_continue,
+                "max_expirations": tail_expirations if in_tail else max_expirations,
+                "should_continue": should_continue,
             }
             if capture_source != DEFAULT_CAPTURE_SOURCE:
                 # Only non-default writers pass a label; the default call
                 # shape stays what existing wrappers and doubles expect.
                 ticker_kwargs["capture_source"] = capture_source
+            limited_before = getattr(self._yahoo, "yahoo_rate_limited", False)
             result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
+            if in_tail and not limited_before and getattr(self._yahoo, "yahoo_rate_limited", False):
+                result["rate_limited"] = "yahoo rate limited (HTTP 429)"
             results.append(result)
-            if result.get("reason") == "source_access_denied":
+            if result.get("reason") in OptionsPullResults._RUN_STOP_REASONS:
                 results.extend(
                     {"ticker": t, "status": "SKIPPED", "rows_inserted": 0,
-                     "reason": "source_access_denied_before_request",
+                     "reason": f"{result['reason']}_before_request",
                      "provider": result["provider"],
                      "blocked_by_http_status": result["http_status"]}
                     for t in tickers[idx + 1:]
@@ -1376,9 +1488,14 @@ class OptionsPuller(BasePuller):
                 # ATM IV
                 iv_atm = _compute_atm_iv(near_calls_df, near_puts_df, spot_price)
 
-                # 25-delta wings
-                iv_25d_put = _compute_wing_iv(near_puts_df, spot_price, delta_strike_pct=0.90)
-                iv_25d_call = _compute_wing_iv(near_calls_df, spot_price, delta_strike_pct=1.10)
+                # Versioned fixed-moneyness proxies, never 25-delta IV.
+                wings = fixed_moneyness_wings(
+                    near_calls_df.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    near_puts_df.rename(columns={"impliedVolatility": "iv"}).to_dict("records"),
+                    spot_price, expiry=near_expiry, snap_date=today_str,
+                    source=spot_provider, capture_batch_id=batch_id,
+                    spot_observed_at=spot_market_at.isoformat() if spot_market_at else None,
+                )
 
                 # Term structure slope (IV of far expiry - near expiry)
                 term_slope = None
@@ -1395,9 +1512,9 @@ class OptionsPuller(BasePuller):
                         "INSERT INTO options_daily_signals "
                         "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
                         "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
-                        "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration) "
+                        "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
                         "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
-                        ":iv_atm, :iv_25d_put, :iv_25d_call, :ts_slope, :oi_conc) "
+                        ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
                         "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
                         "put_call_ratio = EXCLUDED.put_call_ratio, "
                         "max_pain = EXCLUDED.max_pain, "
@@ -1407,8 +1524,9 @@ class OptionsPuller(BasePuller):
                         "near_expiry = EXCLUDED.near_expiry, "
                         "spot_price = EXCLUDED.spot_price, "
                         "iv_atm = EXCLUDED.iv_atm, "
-                        "iv_25d_put = EXCLUDED.iv_25d_put, "
-                        "iv_25d_call = EXCLUDED.iv_25d_call, "
+                        "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
+                        "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
+                        "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
                         "term_structure_slope = EXCLUDED.term_structure_slope, "
                         "oi_concentration = EXCLUDED.oi_concentration"
                     ),
@@ -1417,8 +1535,9 @@ class OptionsPuller(BasePuller):
                         "pcr": put_call_ratio, "mp": max_pain, "ivs": iv_skew,
                         "oi": total_oi, "vol": total_volume,
                         "ne": near_expiry, "spot": spot_price,
-                        "iv_atm": iv_atm, "iv_25d_put": iv_25d_put,
-                        "iv_25d_call": iv_25d_call,
+                        "iv_atm": iv_atm, PUT_WING: wings[PUT_WING],
+                        CALL_WING: wings[CALL_WING],
+                        "wing_meta": json.dumps(wings["wing_iv_metadata"]),
                         "ts_slope": term_slope, "oi_conc": oi_conc,
                     },
                 )
@@ -1431,11 +1550,11 @@ class OptionsPuller(BasePuller):
                     "total_oi": ("sentiment", f"{ticker} Total Open Interest", total_oi),
                     "opt_vol": ("sentiment", f"{ticker} Total Options Volume", total_volume),
                     "iv_atm": ("vol", f"{ticker} ATM Implied Volatility", iv_atm),
-                    "iv_25d_put": ("vol", f"{ticker} 25-Delta Put IV", iv_25d_put),
-                    "iv_25d_call": ("vol", f"{ticker} 25-Delta Call IV", iv_25d_call),
+                    PUT_WING: ("vol", f"{ticker} Put IV proxy: 87-93% spot mean v1", wings[PUT_WING]),
+                    CALL_WING: ("vol", f"{ticker} Call IV proxy: 107-113% spot mean v1", wings[CALL_WING]),
                     "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
                     "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                }, should_continue=should_continue)
+                }, should_continue=should_continue, wing_metadata=wings["wing_iv_metadata"])
                 _check_budget(should_continue)
                 signals_written = _affected_rows(signal_write)
                 rows_inserted = (
@@ -1474,7 +1593,7 @@ class OptionsPuller(BasePuller):
         except OptionsSourceAccessDenied as exc:
             log.warning("{t}: {e}; options run stopped", t=ticker, e=exc)
             return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
-                    "reason": "source_access_denied", "error": str(exc),
+                    "reason": exc.reason, "error": str(exc),
                     "provider": exc.provider, "http_status": exc.http_status}
         except _OptionsBudgetExpired:
             return {"ticker": ticker, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
@@ -1490,6 +1609,7 @@ class OptionsPuller(BasePuller):
         signals: dict[str, tuple[str, str, Any]],
         *,
         should_continue: Callable[[], bool] | None = None,
+        wing_metadata: dict | None = None,
     ) -> int | None:
         """Push computed signals to feature_registry + resolved_series."""
         prefix = ticker.lower().replace("-", "_")
@@ -1515,10 +1635,13 @@ class OptionsPuller(BasePuller):
                     "transformation_version, lag_days, normalization, "
                     "missing_data_policy, eligible_from_date, model_eligible) "
                     "VALUES (:name, :fam, :desc, 'RAW', 1, 0, 'ZSCORE', "
-                    "'FORWARD_FILL', '2024-04-01', TRUE) "
+                    ":missing_policy, :eligible_from, :model_eligible) "
                     "ON CONFLICT (name) DO NOTHING RETURNING id"
                 ),
-                {"name": feat_name, "fam": family, "desc": desc},
+                {"name": feat_name, "fam": family, "desc": desc,
+                 "missing_policy": "NAN" if suffix in (PUT_WING, CALL_WING) else "FORWARD_FILL",
+                 "eligible_from": today_str if suffix in (PUT_WING, CALL_WING) else "2024-04-01",
+                 "model_eligible": suffix not in (PUT_WING, CALL_WING)},
             ).fetchone()
 
             if row:
@@ -1537,13 +1660,14 @@ class OptionsPuller(BasePuller):
                 text(
                     "INSERT INTO resolved_series "
                     "(feature_id, obs_date, release_date, vintage_date, value, "
-                    "source_priority_used) "
-                    "VALUES (:fid, :od, :rd, :vd, :val, :src) "
+                    "source_priority_used, options_iv_metadata) "
+                    "VALUES (:fid, :od, :rd, :vd, :val, :src, CAST(:wing_meta AS JSONB)) "
                     "ON CONFLICT DO NOTHING"
                 ),
                 {
                     "fid": fid, "od": today_str, "rd": today_str,
                     "vd": today_str, "val": float(val), "src": self.source_id,
+                    "wing_meta": json.dumps(wing_metadata) if suffix in (PUT_WING, CALL_WING) else None,
                 },
             )
             count = _affected_rows(written)
@@ -1632,25 +1756,6 @@ def _compute_atm_iv(
     iv = atm["impliedVolatility"].mean()
     return float(iv) if pd.notna(iv) else None
 
-
-def _compute_wing_iv(
-    df: pd.DataFrame, spot_price: float, delta_strike_pct: float
-) -> float | None:
-    """Compute average IV around a specific strike level (e.g. 90% or 110% of spot)."""
-    if df.empty or "impliedVolatility" not in df.columns:
-        return None
-
-    target = spot_price * delta_strike_pct
-    band = spot_price * 0.03
-    wing = df[
-        (df["strike"] >= target - band) &
-        (df["strike"] <= target + band)
-    ]
-    if wing.empty:
-        return None
-
-    iv = wing["impliedVolatility"].mean()
-    return float(iv) if pd.notna(iv) else None
 
 
 def _compute_oi_concentration(

@@ -16,10 +16,17 @@ pandas>=2.1.0
 numpy>=1.26.0
 duckdb>=1.5.5
 fedfred>=1.2.9
-yfinance>=1.5.1
+yfinance>=1.8.0
 requests>=2.34.2
 beautifulsoup4>=4.14.3
-edgartools>=4.6.3
+# edgartools 6.x requires Python >=3.11. deploy_build_hook.sh still installs
+# requirements.txt into grid-svr's Python 3.10 interpreter (kept current so
+# deploy/python314/cutover.sh rollback works), so 3.10 stays on 5.x. The 3.11+
+# floor is 6.3.0, not 6.2.0: its changelog fixes a circular ImportError that
+# 6.1.0/6.2.0 raised on a fresh process's first fund import or Filing.obj().
+# deploy/python314/constraints-3.14.txt pins the exact version; bump both together.
+edgartools>=4.6.3; python_version < "3.11"
+edgartools>=6.3.0; python_version >= "3.11"
 # strategy.portfolio_workbook_plan imports openpyxl at module load (Workbook,
 # load_workbook, styles), and pandas .to_excel/.read_excel paths in
 # ingestion/altdata (aaii_sentiment, nyfed_gscpi) + ingestion/trade (wiod)
@@ -50,7 +57,7 @@ schedule>=1.2.0
 pytz>=2024.1  # schedule.at(..., "UTC") timezone support
 pydantic>=2.13.4
 pydantic-settings>=2.1.0
-eval_type_backport>=0.2.0
+eval_type_backport>=0.4.0
 loguru>=0.7.2
 
 # Hyperspace (OpenAI-compatible API client) + Hermes analyst bridge
@@ -75,7 +82,7 @@ comtradeapicall>=0.1.4
 # It is not used by the current runtime code, and its hishel dependency range
 # is incompatible with edgartools, which is used by SEC ingestion.
 # If patent-client is needed later, install it in an isolated environment.
-boto3>=1.43.118
+boto3>=1.44.3
 
 # Utilities (extended)
 tqdm>=4.70.1
@@ -116,7 +123,7 @@ minio>=7.2.20
 prefect>=3.7.0
 
 # Testing
-pytest>=9.1.0
+pytest>=9.2.0
 pytest-timeout>=2.4.0
 pytest-xdist>=3.8.0
 pytrends>=4.9.0

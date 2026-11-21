@@ -19,6 +19,7 @@ from ingestion.market_calendar import (
     market_close_time,
 )
 from ingestion.schwab_market import SchwabMarketClient
+from ingestion import schwab_usage
 from utils.single_flight import single_flight
 from utils.ttl_cache import TTLCache
 
@@ -62,7 +63,7 @@ def _admit():
 
 def _history(symbol, start, cutoff):
     with requests.Session() as http:
-        reader = SchwabMarketClient(session=http, timeout=8, max_retries=0)
+        reader = SchwabMarketClient(session=http, timeout=8, max_retries=0, client=schwab_usage.client_name() + "/gamma_board_intraday")
         return reader.price_history(
             provider_symbol(symbol),
             periodType="day",

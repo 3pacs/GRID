@@ -22,8 +22,9 @@ from features import lab as rp
 
 
 @pytest.fixture(autouse=True)
-def clear_percentile_cache():
+def clear_percentile_cache(monkeypatch):
     """Isolate every test from the 1h snapshot cache."""
+    monkeypatch.setattr("utils.financial_cache.get_financial_generation", lambda conn: "a" * 32)
     rp.clear_cache()
     yield
     rp.clear_cache()

@@ -1,0 +1,14 @@
+{
+  "kind": "fetched-current-companyfacts-snapshot",
+  "url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0001046179.json",
+  "retrieved_at_utc": "2026-11-07T21:07:49.465832+00:00",
+  "sha256": "d3ebb91e3ad78c9482e238c4db36df60b295a3b49ca137774706f4f5e526044a",
+  "bytes": 911248,
+  "filename": "tsm.companyfacts.json.gz",
+  "status": 200,
+  "response_date": "Sat, 07 Nov 2026 21:07:53 GMT",
+  "last_modified": null,
+  "user_agent": "GRID Intelligence ops@stepdad.finance",
+  "storage_encoding": "gzip",
+  "stored_bytes": 42869
+}

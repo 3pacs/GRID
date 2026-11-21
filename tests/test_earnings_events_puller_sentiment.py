@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
 
 from loguru import logger
 
 from ingestion import earnings_events_puller as mod
+from ingestion.av_transcript_plan import TranscriptPeriod
 from ingestion.earnings_events_puller import (
     SENTIMENT_NOTICE,
     SENTIMENT_SOURCE,
@@ -33,17 +35,22 @@ def test_no_import_of_nonexistent_llm_module():
     assert not hasattr(EarningsEventsPuller, "_classify_transcript_sentiment")
 
 
-def _run_pull(monkeypatch):
-    p = EarningsEventsPuller.__new__(EarningsEventsPuller)
-    p.engine = MagicMock()
-    p.av_api_key = "x"
-    p.av_max_calls = 5
+def _run_pull(monkeypatch, tmp_path):
+    monkeypatch.setattr("ingestion.base.BasePuller._resolve_source_id", lambda self: 1)
+    monkeypatch.setattr("ingestion.earnings_events_puller.time.sleep", lambda _: None)
+    p = EarningsEventsPuller(MagicMock(), av_api_key="x", av_max_calls=5,
+                             av_state_path=tmp_path / "state.db")
     monkeypatch.setattr(p, "_load_universe", lambda *a, **k: ["AAPL", "MSFT"])
     monkeypatch.setattr(p, "load_cik_map", lambda: {})
-    monkeypatch.setattr(p, "_load_last_transcript_dates", lambda u: {})
+    monkeypatch.setattr(
+        p, "_load_verified_periods",
+        lambda t, f: [TranscriptPeriod("2026Q3", date(2026, 6, 27), date(2026, 7, 31),
+                                       "0000000001-26-000001")],
+    )
+    monkeypatch.setattr(p, "_stored_transcript_periods", lambda t, periods: (set(), set()))
     monkeypatch.setattr(
         p, "fetch_av_transcript",
-        lambda t, q: {"symbol": t, "transcript": [
+        lambda t, q: {"symbol": t, "quarter": q, "transcript": [
             {"speaker": "CEO", "content": "great quarter", "sentiment": "0.5"}]},
     )
     upserts = []
@@ -57,8 +64,8 @@ def _run_pull(monkeypatch):
     return result, upserts, msgs
 
 
-def test_pull_stores_av_sentiment_and_counts_and_warns_once(monkeypatch):
-    result, upserts, msgs = _run_pull(monkeypatch)
+def test_pull_stores_av_sentiment_and_counts_and_warns_once(monkeypatch, tmp_path):
+    result, upserts, msgs = _run_pull(monkeypatch, tmp_path)
     assert upserts, "transcripts should still be stored"
     for u in upserts:
         assert u["sentiment"] == "positive"
