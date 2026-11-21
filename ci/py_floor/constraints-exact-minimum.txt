@@ -5,4 +5,4 @@
 # are a coherent, installable minimum. Used by the manual workflow_dispatch job only.
 tsfresh==0.21.2
 python-dotenv==1.2.4
-boto3==1.43.103
+boto3==1.44.3
