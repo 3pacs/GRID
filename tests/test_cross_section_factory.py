@@ -589,3 +589,75 @@ def test_the_universe_uses_the_store_s_sessions_and_the_adjusted_bar_checks(tmp_
     np.testing.assert_array_equal(panel.base, u.base)
     assert panel.sessions == u.sessions and panel.cols == u.cols
     assert np.isnan(panel.cc[bad, b]) and np.isnan(panel.cc[bad + 1, b]) and np.isnan(panel.cc[gap + 1, a])
+
+
+PRICES = ("open", "high", "low", "close", "adjOpen", "adjHigh", "adjLow", "adjClose")
+
+
+def _edit_row(root, sym, day, **cells):
+    """Rewrite one served row of a price file, cell by cell as text; every other row keeps its bytes."""
+    p = root / "prices" / f"{sym}.csv"
+    lines = p.read_text().splitlines()
+    n = next(i for i, line in enumerate(lines) if line.startswith(day + ","))
+    row = lines[n].split(",")
+    for name, text in cells.items():
+        row[HEADER.index(name)] = text
+    lines[n] = ",".join(row)
+    p.write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("volume", [0, 2_000_000])
+@pytest.mark.parametrize("field", PRICES)
+def test_a_row_with_any_one_of_its_eight_prices_blank_is_not_a_valid_bar(tmp_path, field, volume):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    floors = {"min_session_bars": 20, "min_price": 5.0, "min_dollar_volume": 10e6}
+    whole = X.universe(tmp_path, **floors)
+    sym, r = "S1N04", 40
+    j = whole.cols.index(sym)
+    assert whole.ok.iloc[r, j] and whole.base[r, j]
+    _edit_row(tmp_path, sym, days[r], **{field: "", "volume": str(volume), "adjVolume": str(volume)})
+    u = X.universe(tmp_path, **floors)
+    assert u.sessions == whole.sessions == days and u.cols == whole.cols
+    assert np.isnan(u.frames[field].iloc[r, j])                              # the blank is read as served, not filled
+    assert all(u.frames[k].iloc[r, j] > 0 for k in PRICES if k != field)     # and it is the row's only blank
+    assert not u.ok.iloc[r, j] and not u.base[r, j]
+    assert u.ok.iloc[r - 1, j] and u.base[r - 1, j]
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.ok.values[:, others], whole.ok.values[:, others])
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+    panel = X.load_panel(tmp_path, X.RunFile.from_dict({**RUN, "min_session_bars": 20}))
+    np.testing.assert_array_equal(panel.base, u.base)
+    assert not panel.base[r, j] and np.isnan(panel.intra[r, j]) and np.isnan(panel.cc[r, j]) and np.isnan(panel.on[r, j])
+
+
+def test_a_sealed_export_with_a_row_blank_only_in_its_adjusted_high_is_out_that_session(tmp_path):
+    # 25 companies, 60 weekday sessions from 2016-02-01, $20 bars, $2M a day, no sector labels; sealed directly with
+    # seal_export, which hashes the files and never parses a row
+    days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2016-02-01", periods=60)]
+    syms = [f"C{i:02d}" for i in range(25)]
+    witness = "2016-04-01,20,21,19,20,0,20,,19,20,0,0,1"
+    (tmp_path / "prices").mkdir()
+    for sym in syms:
+        rows = [witness if (sym, d) == ("C07", "2016-04-01") else f"{d},20,21,19,20,100000,20,21,19,20,100000,0,1" for d in days]
+        (tmp_path / "prices" / f"{sym}.csv").write_text("\n".join([",".join(HEADER), *rows]) + "\n")
+    (tmp_path / "members.csv").write_text(f'date,tickers\n2016-01-04,"{",".join(syms)}"\n')
+    (tmp_path / "sectors.csv").write_text("Symbol,GICS Sector\n")
+    (tmp_path / "renames.json").write_text(json.dumps({"renames": {}}))
+    sealed = X.seal_export(tmp_path, discovery_first_session="2016-02-01", source={"provider": "synthetic"})
+    files = X.input_files(tmp_path)
+    assert X.read_export(tmp_path, files)["generation"] == sealed["generation"]
+    assert (witness + "\n").encode() in (tmp_path / "prices" / "C07.csv").read_bytes()
+
+    u = X.universe(tmp_path, min_session_bars=20, min_price=1.0, min_dollar_volume=1e6, files=files)
+    r, j = u.sessions.index("2016-04-01"), u.cols.index("C07")
+    assert (r, len(u.sessions), len(u.cols)) == (44, 60, 25)
+    assert not u.ok.iloc[r, j] and not u.base[r, j]
+    assert u.ok.iloc[r - 1, j] and u.base[r - 1, j] and u.ok.iloc[r + 1, j] and u.base[r + 1, j]   # one session, not the company
+    others = [k for k in range(25) if k != j]
+    assert u.ok.values[:, others].all() and u.base[r, others].all()
+    run = X.RunFile.from_dict({**RUN, "first_session": "2016-03-01", "last_session": "2016-04-20", "rankings": ["pooled"],
+                               "min_ranked": 20, "min_session_bars": 20, "min_price": 1, "min_dollar_volume": 1_000_000})
+    panel = X.load_panel(tmp_path, run, files)                              # the verified read a run makes
+    np.testing.assert_array_equal(panel.base, u.base)
+    assert not panel.base[r, j] and panel.base[r, others].all()
+    assert np.isnan(panel.cc[r, j]) and np.isnan(panel.cc[r + 1, j])        # no return into or out of the blank session

@@ -314,7 +314,7 @@ class Universe:
     sessions: list
     cols: list
     frames: dict              # one frame per bar field, indexed by session, one column per price file
-    ok: pd.DataFrame          # a valid bar: positive unadjusted and adjusted prices, open and close inside the day's range
+    ok: pd.DataFrame          # a valid bar: all eight prices present and positive, open and close inside the day's range
     member: np.ndarray
     base: np.ndarray          # member, valid bar, price and liquidity floors
 
@@ -342,13 +342,15 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
     d when it is a member, has a valid bar on d, closed at ``min_price`` or more on the session before, and its median
     dollar volume over the ``DOLLAR_VOLUME_WINDOW`` sessions ending the session before is at least
     ``min_dollar_volume``. "The session before" is the store's previous session, not the stock's previous bar: a
-    stock with no bar on it has no prior close and is out. Bars after ``DEV_LAST_BAR`` are dropped."""
+    stock with no bar on it has no prior close and is out. A valid bar has all eight prices of the row (open, high,
+    low, close and their adjusted values) present and positive. Bars after ``DEV_LAST_BAR`` are dropped."""
     data_dir = Path(data_dir)
     on_disk = sorted(str(p.relative_to(data_dir)) for p in sorted((data_dir / "prices").glob("*.csv")))
     names = on_disk if files is None else sorted(n for n in files if n.startswith("prices/"))
     if names != on_disk:
         raise RunFileError("the price files changed between the run's declaration and its read; read a fixed copy")
-    cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "volume")}
+    cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "adjHigh",
+                                                  "adjLow", "volume")}
     for name in names:
         df = pd.read_csv(io.BytesIO(_read(data_dir, name, files)), usecols=["date", *cols_data])
         if df.empty:
@@ -364,7 +366,9 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
         raise RunFileError("no development sessions in the data")
     f = {k: v.reindex(sessions) for k, v in f.items()}
     lo, hi = f["low"] * (1 - BAR_TOL), f["high"] * (1 + BAR_TOL)
+    # all eight prices of the row: a blank in any one of them, adjHigh and adjLow included, is not a valid bar
     ok = ((f["open"] > 0) & (f["close"] > 0) & (f["high"] > 0) & (f["low"] > 0) & (f["adjOpen"] > 0) & (f["adjClose"] > 0)
+          & (f["adjHigh"] > 0) & (f["adjLow"] > 0)
           & (f["open"] >= lo) & (f["open"] <= hi) & (f["close"] >= lo) & (f["close"] <= hi))
     cols = list(ok.columns)
 

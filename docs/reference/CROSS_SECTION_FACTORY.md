@@ -54,6 +54,8 @@ within the run only (`max_t.multiplicity`): earlier runs and looks are not in it
 - A stock is ranked on day d if it has a valid bar on d, its unadjusted close on d−1 is at least $5, and its median
   dollar volume over the 21 sessions ending d−1 is at least $10M. The floor also screens out price files that hold
   another company (Tiingo reuses tickers).
+- A valid bar has all eight prices of its row present and positive (open, high, low, close and the four adjusted
+  values), with the open and the close inside the day's range (see "All eight prices" below).
 - A run file may set its own floors: `min_price` ($1 to $10,000) and `min_dollar_volume` ($100,000 to $10 billion).
   Left out, they are $5 and $10M, and the run and its report are byte for byte what they were before the fields
   existed. A run that sets either has both written under `coverage.floors` in its report. Lower floors are only safe
@@ -113,12 +115,56 @@ hash is what it was.
 answers which stock may be ranked on which session. `load_panel` builds on it and the small-cap builder's `counts`
 calls it, so a count and a run cannot disagree. "The session before" is the store's previous session, not the
 stock's previous bar: a stock with no bar on that session has no prior close and is out. A valid bar needs positive
-adjusted open and close as well as the unadjusted checks.
+adjusted prices as well as the unadjusted checks.
 
 Tests (synthetic stores only, no run on real data): a no-label store without an export refused before declaration;
 an export dated 2016-01-04 refusing a 2015 window; a window one session early refused; a replaced, added or removed
 file and an edited manifest refused before declaration; a price file, `members.csv` or `sectors.csv` changed after
 declaration abandoning the run; a missing session and a zero adjusted close taking a stock out of the universe.
+
+## All eight prices (2026-11-21)
+
+**The rule.** A Tiingo daily row carries eight prices: `open`, `high`, `low`, `close`, `adjOpen`, `adjHigh`, `adjLow`,
+`adjClose`. `universe()` reads all eight, and a row is a valid bar only when every one of them is present and
+positive. A blank in any one takes that stock out of `universe.ok`, `universe.base` and `load_panel(...).base` for
+that session, and no return is computed into or out of it. Files are still read as served: a blank is never filled.
+
+**The reason.** Until this change the reader took six prices and never opened `adjHigh` or `adjLow`. A row whose
+only blank was one of those two was a valid, rankable bar. Review of the small-cap builder (#1294) reproduced it on
+two paths that builder does not guard: a directory sealed directly with `seal_export`, and an older sealed generation
+read back. The builder refuses such a row when it fetches, binds or builds, but the rule belongs in the one
+definition of the universe, where every store and every caller meets it. Tiingo does serve blank prices on some days
+without a trade, so the case is real on thinly traded names.
+
+**What it changes on the index store: nothing.** The three cross-section runs on the factory ledger declared one data
+manifest (`31513c21…`, 814 price files), and the nine scratch runs that wrote a manifest list the same files. The
+store was checked against that manifest by hash, then every row was counted, read-only, on 2026-11-21:
+
+| Measure | Count |
+|---|---|
+| Rows read (814 files, through each file's last row) | 2,867,858 |
+| Rows on or before 2022-12-30, the ones a run loads | 2,224,008 |
+| Rows blank in `adjHigh` or `adjLow` with the other six prices present | 0 |
+| Rows valid under the six-price rule and not valid under the eight-price rule | 0 |
+| Blank cells in any of the eight price columns | 0 |
+
+The count read price cells in rows after 2022-12-30 for presence and sign only; no return was computed from them.
+With main's reader and the changed one, `universe` and `load_panel` on that store give the same `ok`, `base`,
+overnight, intraday and close-to-close arrays, adjusted closes and sector placement (compared by hash; 3,357
+sessions, 814 files, 1,563,261 rankable stock-sessions). No ledgered result can move.
+
+A run on an unchanged store gives the same `report.json`, `discovery-frozen.json`, `report.md` and
+`data-manifest.json` byte for byte on main's factory (f8a2425b) and the changed one: checked on the synthetic test
+store with a plain run and a gated run.
+
+**What it costs.** Two more columns per file. On the index store, four loads each: `universe()` took 20.9 s against
+18.4 s (+2.5 s, 14 %), peak memory 905 MB against 823 MB (+82 MB, 10 %), and the bar frames it returns hold 188 MB
+against 146 MB.
+
+Tests (synthetic stores only): each of the eight prices blank on its own, at volume 0 and at a positive volume, is
+out of `ok` and `base` in `universe` and `load_panel` for that session and back the session before; a 25-company
+store with one row blank only in `adjHigh`, sealed directly with `seal_export` and read through the verified path,
+loses that company for that session only.
 
 ## Signals and horizons
 
