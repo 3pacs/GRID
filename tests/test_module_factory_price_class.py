@@ -180,6 +180,29 @@ def test_example_run_file_is_the_full_price_class():
     assert spec.first_session >= mf.DEV_FIRST
 
 
+def test_frequent_run_file_is_the_four_live_features_at_low_thresholds():
+    """Plan stage 1 (#1153): the same windows as factory 3, only the features a live slot records,
+    thresholds low enough that a rule fires on a large share of sessions."""
+    runs = EXAMPLE.parent
+    body = json.loads((runs / "factory-frequent-price-20261120.json").read_text())
+    spec = mf.RunFile.from_dict(body)
+    assert spec.run_id == "factory-frequent-price-20261120"
+    assert spec.features == mf.FEATURES == ("F1", "F10", "F11", "F1_shift30") and spec.symbols() == ("SPY",)
+    assert spec.z_thresholds == (0.25, 0.5) and spec.sides == ("long", "short")
+    assert spec.class_shares == {"price": 1.0} and spec.class_counts() == {"price": 1376}
+    assert len(spec.families()) == 11 * 4 - 1 and "SPY|change|15:00+60m" not in spec.families()
+    assert len(spec.modules()) == 4 * 2 * 2 * 2 and spec.trial_count() == 43 * 32 == 1376
+    assert "F1|z>=0.25|long" in spec.modules() and "F1_shift30|z<=0.5|short" in spec.modules()
+    # every other setting is factory 3's; the seed is used by no other run file
+    factory3 = json.loads((runs / "factory3-tape-calendar-20261119.json").read_text())
+    differs = {"run_id", "features", "class_shares", "z_thresholds", "seed"}
+    assert set(body) == set(factory3)
+    assert {k: v for k, v in body.items() if k not in differs} == \
+        {k: v for k, v in factory3.items() if k not in differs}
+    seeds = [json.loads(f.read_text())["seed"] for f in sorted(runs.glob("*.json"))]
+    assert seeds.count(body["seed"]) == 1
+
+
 def test_run_file_refuses_bad_factory2_settings(tmp_path):
     days = sessions(5)
     for over in ({"cluster_by": "returns"}, {"cluster_threshold": 0}, {"cluster_threshold": 1.5},
