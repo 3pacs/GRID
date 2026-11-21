@@ -1011,3 +1011,129 @@ def test_mixed_range_cannot_refute_current_level(vintages, mixed):
         "another-source" if mixed == "source" else "yfinance")]
     row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
     assert row["verdict"] == "unscorable"
+
+
+# ── session low/high pairing (#1101 follow-up) ─────────────────────────────────────────
+# yfinance_pull writes each row with its own _utc_now(), so a low and a high from one pull
+# never share a pull_timestamp. They pair on a shared pull_run_id, or, for legacy rows
+# without one, within RANGE_PAIR_TOLERANCE; never across sources.
+
+def _ro(field: str, value: float, pulled: datetime, source: str = "yfinance", run: str | None = None):
+    return Observation(f"YF:^VIX:{field}", FRI, value, pulled, source, pull_run_id=run)
+
+
+def _set_range(table, lows, highs):
+    table["YF:^VIX:low"] = list(lows)
+    table["YF:^VIX:high"] = list(highs)
+
+
+AFTER_CLOSE = _z(FRI, 21, 20)
+
+
+@pytest.mark.parametrize("gap_s, verdict", [(0, "refuted"), (3, "refuted"), (5, "refuted"),
+                                            (6, "unscorable"), (120, "unscorable")])
+def test_legacy_range_pairs_only_within_the_tolerance(vintages, gap_s, verdict):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + timedelta(seconds=gap_s))],
+               [_ro("high", 27.0, AFTER_CLOSE)])
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == verdict
+    if verdict == "refuted":
+        assert row["knowable_at_stated_at"] is False
+        assert all("retrieved within 5 s" in e["observed"] for e in row["evidence"])
+
+
+def test_legacy_rows_3s_apart_partially_confirm_inside_the_range(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, _z(FRI, 18, 30) + timedelta(seconds=3))], [_ro("high", 27.0, _z(FRI, 18, 30))])
+    row = _judge("The VIX at 26.5 now.", _z(FRI, 19))
+    # the bracket rule answers first only when a capture brackets the value; 26.5 is not 26.0
+    assert row["verdict"] == "partially_confirmed" and "inside the session range" in row["root_cause"]
+    assert row["knowable_at_stated_at"] is None
+
+
+@pytest.mark.parametrize("gap_s", [3, 120])
+def test_different_sources_never_pair(vintages, gap_s):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + timedelta(seconds=gap_s), source="cboe")],
+               [_ro("high", 27.0, AFTER_CLOSE)])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_different_sources_never_pair_even_with_the_same_run_id(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE, source="cboe", run="r1")],
+               [_ro("high", 27.0, AFTER_CLOSE, run="r1")])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_shared_run_id_pairs_beyond_the_tolerance(vintages):
+    # a stall inside one pull (advisory-lock wait, split lookup) still pairs on the run id
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + timedelta(seconds=40), run="r1")],
+               [_ro("high", 27.0, AFTER_CLOSE, run="r1")])
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "refuted" and row["knowable_at_stated_at"] is False
+    assert all("paired: same pull run" in e["observed"] for e in row["evidence"])
+
+
+@pytest.mark.parametrize("low_run, high_run, gap", [("r1", "r2", timedelta(0)),          # two pulls, same instant
+                                                     ("r1", None, timedelta(seconds=1)),  # mixed writer versions
+                                                     (None, "r2", timedelta(seconds=1)),
+                                                     ("r1", "r1", timedelta(minutes=11))])  # stretched id
+def test_run_ids_that_disagree_never_fall_back_to_the_tolerance(vintages, low_run, high_run, gap):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + gap, run=low_run)],
+               [_ro("high", 27.0, AFTER_CLOSE, run=high_run)])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_the_newest_coherent_pair_is_used_and_a_newer_single_leg_only_widens(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    # pull A wrote both legs after the close; pull B (later) rewrote only the high, at 28.5
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE, run="A")],
+               [_ro("high", 27.0, AFTER_CLOSE, run="A"), _ro("high", 28.5, AFTER_CLOSE + timedelta(hours=8), run="B")])
+    # 28.0 lies outside pull A's 16-27 but inside what pull B saw trade: not refuted
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+    # 30.0 is outside both: refuted on pull A's coherent pair
+    row = _judge("The VIX at 30.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "refuted"
+    assert all(e["as_of"] == grader.iso(AFTER_CLOSE) for e in row["evidence"])
+
+
+def test_pre_close_pair_can_corroborate_but_never_refute(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, _z(FRI, 18), run="r1")], [_ro("high", 27.0, _z(FRI, 18), run="r1")])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_inverted_pair_is_ignored(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 30.0, AFTER_CLOSE, run="r1")], [_ro("high", 27.0, AFTER_CLOSE, run="r1")])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_read_vintages_carries_the_pull_run_id_only_as_a_string():
+    import store.observations as obs_mod
+
+    class Conn:
+        def execute(self, clause, params):
+            self.sql = str(clause)
+
+            class R:
+                @staticmethod
+                def fetchall():
+                    return [(FRI, 16.0, _z(FRI, 21, 20), "yfinance", "abc123"),
+                            (FRI, 16.1, _z(FRI, 21, 21), "yfinance", None),
+                            (FRI, 16.2, _z(FRI, 21, 22), "yfinance", {"not": "a string"}),
+                            (FRI, 16.3, _z(FRI, 21, 23), "yfinance")]          # legacy 4-column fake
+            return R()
+
+    conn = Conn()
+    out = obs_mod.read_vintages(conn, "YF:^VIX:low", start=FRI, end=FRI)
+    assert "raw_payload ->> 'pull_run_id'" in conn.sql
+    assert [o.pull_run_id for o in out] == ["abc123", None, None, None]
+
+
+def test_grader_version_moved_with_the_pairing_rule():
+    assert grader.GRADER_VERSION == "grid/grade_publication_review-v3-range-pairing"

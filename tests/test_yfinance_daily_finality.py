@@ -420,5 +420,37 @@ class RawCompatibilityTests(unittest.TestCase):
                 self.assertEqual(observations.read_daily_policy_n(db,sid,1,start=DAY),[])
             self.assertTrue(contract.is_daily_policy_capture(payload,sid,DAY,LATE))
 
+
+class PullRunIdTests(unittest.TestCase):
+    """#1101 follow-up: one id per pull_ticker call, so a reader can pair a session's low and high."""
+    def frame(self,lo,hi,day=DAY):
+        return pd.DataFrame({'High':[hi],'Low':[lo],'Close':[(lo+hi)/2]},index=pd.DatetimeIndex([pd.Timestamp(day)]))
+    def test_one_call_stamps_one_id_and_the_next_call_another(self):
+        db=MemoryDB();pull(db,ticker='^VIX',now=EARLY,frame=self.frame(16.,27.))
+        ids={r['payload'][yf.PULL_RUN_ID_KEY] for r in db.rows}
+        self.assertEqual(len(db.rows),3);self.assertEqual(len(ids),1)
+        [first]=ids;self.assertRegex(first,r'^[0-9a-f]{32}$')
+        pull(db,ticker='^VIX',now=EARLY+timedelta(hours=1),frame=self.frame(15.,29.))
+        second={r['payload'][yf.PULL_RUN_ID_KEY] for r in db.rows[3:]}
+        self.assertEqual(len(db.rows),6);self.assertEqual(len(second),1);self.assertNotEqual(second,ids)
+    def test_run_id_never_defeats_the_unchanged_capture_skip(self):
+        db=MemoryDB();pull(db,ticker='^VIX',now=EARLY,frame=self.frame(16.,27.))
+        again=pull(db,ticker='^VIX',now=EARLY+timedelta(minutes=30),frame=self.frame(16.,27.))
+        self.assertEqual(again['rows_inserted'],0);self.assertEqual(again['outcome'],'duplicate_only');self.assertEqual(len(db.rows),3)
+    def test_only_changed_fields_are_rewritten_under_the_new_id(self):
+        db=MemoryDB();pull(db,ticker='^VIX',now=EARLY,frame=self.frame(16.,27.))
+        pull(db,ticker='^VIX',now=EARLY+timedelta(minutes=30),frame=self.frame(16.,28.))
+        new=db.rows[3:]
+        self.assertEqual(sorted(r['sid'] for r in new),['YF:^VIX:close','YF:^VIX:high'])
+        self.assertNotEqual(new[0]['payload'][yf.PULL_RUN_ID_KEY],db.rows[0]['payload'][yf.PULL_RUN_ID_KEY])
+    def test_legacy_row_without_an_id_still_counts_as_unchanged(self):
+        db=MemoryDB();pull(db,ticker='^VIX',now=EARLY,frame=self.frame(16.,27.))
+        for r in db.rows:r['payload'].pop(yf.PULL_RUN_ID_KEY)
+        again=pull(db,ticker='^VIX',now=EARLY+timedelta(minutes=30),frame=self.frame(16.,27.))
+        self.assertEqual(again['rows_inserted'],0)
+    def test_spy_close_contract_payload_is_unchanged(self):
+        db=MemoryDB();pull(db,ticker='SPY',now=LATE,fields=frozenset({'close'}))
+        self.assertTrue(db.rows);self.assertNotIn(yf.PULL_RUN_ID_KEY,db.rows[0]['payload'])
+
 if __name__=='__main__':
     unittest.main(argv=[sys.argv[0]]+sys.argv[1:],verbosity=2)
