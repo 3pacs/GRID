@@ -34,6 +34,7 @@ exploratory hindsight, never official) and never updates oracle_predictions.
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -95,8 +96,10 @@ from store.observations import (
 # after it, not just the first one (reproduced: ModuleNotFoundError on
 # oracle.entry_price_policy during pytest collection, and separately on
 # scripts/score_oracle_trades.py's own real scorer-path PostgreSQL proof).
+# The fallback is now this file's own repo root, never a hard-coded
+# checkout: grid_repo is being retired (moved aside) on grid-svr.
 if __name__ == "__main__" and importlib.util.find_spec("config") is None:
-    sys.path.insert(0, "/data/grid_v4/grid_repo")
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Ticker → yfinance-style symbol used in the ``YF:{symbol}:close`` series id.
 YF_MAP = {

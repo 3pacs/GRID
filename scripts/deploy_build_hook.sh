@@ -70,8 +70,12 @@ if [ "$SKIP_MIGRATIONS" = "true" ]; then
   exit 0
 fi
 
+# /etc/grid/grid.env is the shared env file since 2026-11-17; the old
+# grid_repo checkout paths stay as fallbacks (grid_repo/.env is now a symlink
+# to it).
 for f in \
   "${CANDIDATE_DIR}/.env" \
+  /etc/grid/grid.env \
   /home/grid/grid_v4/grid_repo/.env \
   /home/grid/grid_v4/grid_repo/grid/.env
 do

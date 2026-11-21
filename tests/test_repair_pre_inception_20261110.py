@@ -18,6 +18,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from pathlib import Path
 
+import pytest
+
 import scripts.repair_full_panel_vintages as rep
 from ingestion.market_calendar import is_market_open
 
@@ -121,36 +123,21 @@ class TestPreInception:
         assert plan.cells_dark_before == 1
         assert plan.cells_pre_inception_cleared == len(junk_days) - 1
 
-    def test_apply_writes_retractions_with_the_pre_inception_reason(self) -> None:
+    def test_plan_carries_pre_inception_reason_and_apply_stays_disabled(self) -> None:
         junk_days, _, rows, raw = _xlre_fixture()
         plan = rep.plan_feature("xlre_full", rows, raw, repair_day=REPAIR_DAY, feature_id=7)
-
-        class _Res:
-            rowcount = 1
-
-        calls: list[dict] = []
-
-        class _Conn:
-            def execute(self, sql, params=None):
-                if params and "reason" in params:
-                    calls.append(params)
-                else:
-                    return type("S", (), {"scalar": lambda self: True})()
-                return _Res()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
+        reasons = [r["reason"] for r in plan.retract]
+        assert sum("pre-inception" in reason for reason in reasons) == len(junk_days)
 
         class _Engine:
             def begin(self):
-                return _Conn()
+                raise AssertionError("apply opened a connection")
 
-        done = rep.apply_plan(_Engine(), plan, run_tag="t", timeout_ms=1000)  # type: ignore[arg-type]
-        assert done["retracted"] == len(plan.retract)
-        assert sum("pre-inception" in c["reason"] for c in calls) == len(junk_days)
+            def connect(self):
+                raise AssertionError("apply opened a connection")
+
+        with pytest.raises(RuntimeError, match="apply disabled"):
+            rep.apply_plan(_Engine(), plan, run_tag="t", timeout_ms=1000)  # type: ignore[arg-type]
 
 
 class TestTradingDayFlag:

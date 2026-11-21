@@ -20,6 +20,8 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from intelligence.sector_health import FinancialGenerationRetry
+from utils.financial_cache import FinancialCacheUnavailable, get_cached_financial
 from utils.ttl_cache import TTLCache
 from utils.single_flight import single_flight
 
@@ -35,10 +37,6 @@ def get_sector_health(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the sector health composite score + components."""
-    cached = _CACHE.get(sector_name)
-    if cached is not None:
-        return cached
-
     from analysis.sector_map import SECTOR_MAP
     if sector_name not in SECTOR_MAP:
         raise HTTPException(
@@ -48,7 +46,13 @@ def get_sector_health(
     try:
         from intelligence.sector_health import compute_sector_health
         engine = get_db_engine()
-        result = compute_sector_health(engine, sector_name)
+        return get_cached_financial(
+            _CACHE, sector_name, engine,
+            lambda: compute_sector_health(engine, sector_name),
+            cache_if=lambda result: result.get("status") != "unavailable",
+        )
+    except (FinancialCacheUnavailable, FinancialGenerationRetry) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -59,11 +63,3 @@ def get_sector_health(
         raise HTTPException(
             status_code=500, detail="Failed to compute sector health",
         ) from exc
-
-    if result.get("status") == "unavailable":
-        # Serve the honest unavailable payload but do not pin it in the
-        # 10-minute cache: the next request should retry the computation.
-        return result
-
-    _CACHE.set(sector_name, result)
-    return result

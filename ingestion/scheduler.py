@@ -2210,7 +2210,7 @@ def _run_yfinance_daily(
             alert_on_failure_with_fix("yfinance", str(exc), {
                 "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').info.get('regularMarketPrice'))\"",
                 "fix": "pip install --upgrade yfinance",
-                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
+                "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
                 "file": "grid/ingestion/yfinance_pull.py",
             })
         except Exception as exc2:
@@ -2256,7 +2256,7 @@ def _run_equity_pulls(
             alert_on_failure_with_fix("FRED", str(exc), {
                 "diagnose": 'curl -s "https://api.stlouisfed.org/fred/series?api_key=$FRED_API_KEY&series_id=DFF&file_type=json" | head -5',
                 "fix": "Check FRED_API_KEY in .env",
-                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
+                "retry": 'cd /data/grid_v4/grid_release && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
                 "file": "grid/ingestion/fred.py",
             })
         except Exception as exc2:

@@ -26,12 +26,13 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.financial_cache import FinancialCacheUnavailable, get_cached_financial
 from utils.fx import convert_to_usd
 from utils.ttl_cache import TTLCache
 from utils.single_flight import single_flight
@@ -272,7 +273,7 @@ WITH ranked AS (
                 END,
                 as_of DESC NULLS LAST
         ) AS rk
-    FROM capital_flows
+    FROM capital_flows_current
     WHERE actor_id = :aid
       AND period_type = :pt
       AND fiscal_period = ANY(:fps)
@@ -295,7 +296,7 @@ SELECT
     source_filing,
     confidence,
     as_of
-FROM capital_flows
+FROM capital_flows_current
 WHERE actor_id = :aid
   AND period_type = 'announcement'
   AND flow_type = :ft
@@ -387,7 +388,7 @@ def _load_rows(engine: Any, actor_id: str, period_type: str, n: int) -> list[dic
                 return []
             recent = conn.execute(
                 text(
-                    "SELECT DISTINCT fiscal_period FROM capital_flows "
+                    "SELECT DISTINCT fiscal_period FROM capital_flows_current "
                     "WHERE actor_id = :aid AND period_type = :pt "
                     "AND fiscal_period IS NOT NULL "
                     "ORDER BY fiscal_period DESC LIMIT :lim"
@@ -556,9 +557,12 @@ def _build_period(
         "inflows": inflows,
         "outflows": outflows,
         "totals": {
-            "inflow_usd": round(inflow_total, 2),
-            "outflow_usd": round(outflow_total, 2),
-            "net_usd": round(inflow_total - outflow_total, 2),
+            "inflow_usd": round(inflow_total, 2) if inflows_raw else None,
+            "outflow_usd": round(outflow_total, 2) if outflows_raw else None,
+            "net_usd": (
+                round(inflow_total - outflow_total, 2)
+                if inflows_raw and outflows_raw else None
+            ),
         },
         "ratios": ratios,
         "_amounts": amounts,  # internal; stripped before return
@@ -586,13 +590,14 @@ def _compute_ratios(
     )
 
     dividend_payout: float | None = None
-    if div is not None and rev is not None and cogs is not None:
-        ni_proxy = rev - cogs - (opex or 0.0) - (tax or 0.0)
+    # Every term must be reported. An omitted/withdrawn fact is not zero.
+    if all(value is not None for value in (div, rev, cogs, opex, tax)):
+        ni_proxy = rev - cogs - opex - tax
         dividend_payout = _safe_div(div, ni_proxy)
 
     fcf_conv: float | None = None
-    if rev is not None and cogs is not None:
-        fcf_conv = _safe_div(rev - cogs - (opex or 0.0) - (capex or 0.0), rev)
+    if all(value is not None for value in (rev, cogs, opex, capex)):
+        fcf_conv = _safe_div(rev - cogs - opex - capex, rev)
 
     # New efficiency ratios
     rev_per_capex: float | None = None
@@ -600,12 +605,12 @@ def _compute_ratios(
         rev_per_capex = _safe_div(rev, capex)
 
     shareholder_yield: float | None = None
-    if rev is not None and (div is not None or buy is not None):
-        shareholder_yield = _safe_div((div or 0.0) + (buy or 0.0), rev)
+    if rev is not None and div is not None and buy is not None:
+        shareholder_yield = _safe_div(div + buy, rev)
 
     reinvestment_ratio: float | None = None
-    if rev is not None and (capex is not None or rnd is not None):
-        reinvestment_ratio = _safe_div((capex or 0.0) + (rnd or 0.0), rev)
+    if rev is not None and capex is not None and rnd is not None:
+        reinvestment_ratio = _safe_div(capex + rnd, rev)
 
     # Canonical buyback_yield is buybacks / market_cap. When market_cap
     # is missing (older period, no XBRL shares, non-ticker) fall back to
@@ -757,14 +762,15 @@ def _compute_summary(periods: list[dict[str, Any]]) -> dict[str, Any]:
 
     # Shareholder return: USD total (back-compat) + 3y avg yield (new).
     shareholder_total = 0.0
-    shareholder_seen = False
+    shareholder_complete = True
     sy_ratios: list[float] = []
     for p in window:
         for ft in ("dividends", "buybacks"):
             v = p["_amounts"].get(ft)
             if v is not None:
                 shareholder_total += float(v)
-                shareholder_seen = True
+            else:
+                shareholder_complete = False
         sy = p["ratios"].get("shareholder_yield")
         if sy is not None:
             sy_ratios.append(float(sy))
@@ -807,7 +813,7 @@ def _compute_summary(periods: list[dict[str, Any]]) -> dict[str, Any]:
         "latest_revenue_usd": latest_revenue,
         "revenue_3y_cagr": _round5(cagr),
         "capex_3y_avg_intensity": _round5(capex_3y_avg),
-        "shareholder_return_3y_total_usd": round(shareholder_total, 2) if shareholder_seen else None,
+        "shareholder_return_3y_total_usd": round(shareholder_total, 2) if shareholder_complete else None,
         "top_use_of_capital_3y": top_use,
         # new fields
         "gross_margin_latest": latest["ratios"].get("gross_margin"),
@@ -1016,17 +1022,22 @@ def get_capital_flow(
     # Strip canvas graph node-id prefixes (e.g. "a:corp_KO" → "KO").
     actor_id = _strip_canvas_prefix(actor_id)
 
+    engine = get_db_engine()
+    try:
+        return get_cached_financial(
+            _CACHE, f"{actor_id}|{periods}|{period_type}", engine,
+            lambda: _build_capital_flow(engine, actor_id, periods, period_type),
+        )
+    except FinancialCacheUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _build_capital_flow(engine: Any, actor_id: str, periods: int, period_type: str) -> dict:
+    """Build without a TTL lookup; the caller validates its source generation."""
     # Normalize id: seed data stores lowercase tickers; sector_map uses uppercase.
     id_variants = [actor_id, actor_id.lower(), actor_id.upper()]
     id_variants = list(dict.fromkeys(v for v in id_variants if v))
-
-    cache_key = f"{actor_id}|{periods}|{period_type}"
-    cached = _CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
     actor_meta = _lookup_actor(actor_id)
-    engine = get_db_engine()
     rows: list[dict] = []
     for variant in id_variants:
         rows = _load_rows(engine, variant, period_type, periods)
@@ -1034,7 +1045,6 @@ def get_capital_flow(
             break
     if not rows:
         payload = _fallback_payload(actor_meta, period_type)
-        _CACHE.set(cache_key, payload)
         return payload
 
     grouped: dict[Any, list[dict[str, Any]]] = {}
@@ -1133,5 +1143,4 @@ def get_capital_flow(
         },
     }
 
-    _CACHE.set(cache_key, payload)
     return payload

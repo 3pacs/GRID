@@ -105,21 +105,16 @@ class TestOracleSignalsHandler:
         assert params["d"] == "BUY"
         assert params["p"] == pytest.approx(1.0)
 
-    def test_handler_routes_fundamental_divergence(
-        self, fundamental_signal, mock_engine,
+    def test_handler_quarantines_fundamental_divergence_replay(
+        self, fundamental_signal,
     ):
         from contracts.handlers import oracle_signals
 
-        oracle_signals.on_signal_fired(fundamental_signal, engine=mock_engine)
+        engine = MagicMock()
+        oracle_signals.on_signal_fired(fundamental_signal, engine=engine)
 
-        conn = mock_engine.begin.return_value.__enter__.return_value
-        assert conn.execute.call_count == 1
-        args, kwargs = conn.execute.call_args
-        params = args[1] if len(args) > 1 else kwargs
-        assert params["st"] == "fundamental_divergence"
-        assert params["t"] == "NVDA"
-        assert params["d"] == "SELL"
-        assert params["p"] == pytest.approx(0.6)
+        engine.begin.assert_not_called()
+        engine.connect.assert_not_called()
 
     def test_handler_ignores_unrelated_types(
         self, unrelated_signal, mock_engine,
@@ -468,7 +463,7 @@ class TestHolderOverlapEmit:
 
 
 class TestFundamentalDivergenceEmit:
-    def test_short_candidate_emits_negative_strength(self, monkeypatch):
+    def test_short_candidate_emission_is_suppressed(self, monkeypatch):
         from intelligence.fundamental_divergence import _emit_divergence_signal
 
         captured: list[SignalFired] = []
@@ -489,12 +484,9 @@ class TestFundamentalDivergenceEmit:
             "classification": "short_candidate",
         })
 
-        assert len(captured) == 1
-        c = captured[0]
-        assert c.signal_type == "fundamental_divergence"
-        assert c.ticker == "TSLA"
-        assert c.strength < 0
-        assert c.strength == pytest.approx(-0.55)
+        # The downstream signal/registry/journal paths do not yet invalidate
+        # financial generations. Do not create new unbound evidence.
+        assert captured == []
 
     def test_aligned_classification_does_not_emit(self, monkeypatch):
         from intelligence.fundamental_divergence import _emit_divergence_signal
