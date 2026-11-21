@@ -217,10 +217,10 @@ A second review, at `7b1113a9`, accepted those four and found two more, fixed th
 Tests are on synthetic stores only (`tests/test_smallcap_universe.py`): no request to Tiingo, no read of
 the real store, no run.
 
-**The store on grid-svr predates these fixes.** It has no `fetch-state.json`, its requests carried no
-`endDate`, and its `panel/` is the old in-place layout, which nothing reads now. Before any run it needs
-`bind-existing` (start 2009-01-02; the vintage is its last bar, 2026-11-19), which checks every price file
-on disk and asks Tiingo nothing, and then `build`. The counts and the load check recorded above were made
+**The store on grid-svr predates these fixes.** It was pulled without `fetch-state.json`, its requests
+carried no `endDate`, and its `panel/` was the old in-place layout, which nothing reads now. Before any run
+it needed `bind-existing` (start 2009-01-02; the vintage is its last bar, 2026-11-19), which checks every
+price file on disk and asks Tiingo nothing, and then `build`. Both are done (below). The counts and the load check recorded above were made
 on the old layout on 2026-11-20; the load check compared them with the factory's own count at $2 and $1M
 on the last session of each year and they were equal, but they have not been re-made through the shared
 function.
@@ -235,8 +235,8 @@ company has either a price file or a no-prices mark (9,576 and 6,895).
 The check now takes a row with a blank price as served, on one condition. The row is kept unchanged, the
 factory reads the blank as a missing value, so that day is not a valid bar for that company, and `build`
 reports the count (`rows_with_a_blank_price`, `price_files_with_a_blank_price`). A blank volume, adjusted
-volume, dividend, split factor or date is still refused. The store is still not bound and not rebuilt:
-that waits for this change to be reviewed.
+volume, dividend, split factor or date is still refused. The store stayed unbound until this change had
+been reviewed.
 
 **The condition (review of `addfd43f`).** The factory's valid-bar rule reads six of the eight prices:
 close, high, low, open, adjusted close and adjusted open. It does not read the adjusted high or the
@@ -254,14 +254,37 @@ the company out of the factory's universe that day, in `universe`, `universe_on`
 the served row unchanged in the panel; a lone blank in the adjusted high or low is refused and nothing is
 bound, built or left behind.
 
+**The store is bound and built (2026-11-21, code at `7c998c7a`).** After that head was accepted in review:
+
+| Step | Result |
+|---|---|
+| `bind-existing`, start 2009-01-02, vintage 2026-11-19 | All 9,576 price files pass the whole-file check; `fetch-state.json` written. 7 minutes |
+| `build` | Generation `g-55610e7331c3126c`: 9,471 price files, `members.csv`, `renames.json`, `sectors.csv`, 2.2 GB, nothing in it writable. Discovery starts 2016-01-04. 8 minutes |
+| The pull as the manifest records it | 16,471 included companies: 9,576 with prices, 6,895 confirmed no prices, none unresolved |
+| Blank prices | 2,238 rows in 10 files, kept as served |
+| `counts` at $2 and $1M, and at $5 and $10M | Equal to the table above on the last session of every year from 2016 to 2022. About 5 minutes each |
+
+The generation's files are byte for byte the old in-place panel's: the same 9,471 price files and the same
+three other files. So the load check of 2026-11-20 was made on the same bars this generation holds. The
+counts are now the factory's own `universe` on the sealed generation, which also gives the years before
+2016: 1,969 to 2,681 companies at $2 and $1M on the last session of 2009 to 2015, and 956 to 1,502 at $5
+and $10M. Those years are before the discovery start and are read only for a signal's lookback.
+
+No Tiingo key was set for any of this and nothing was asked of the provider. No signal was run. The old
+in-place files under `panel/` are still there beside the generation; nothing reads them.
+
 ## What is not done
 
 - **The factory change is merged (PR #1291, 2026-11-21).** Floors are optional run-file fields; a
   header-only `sectors.csv` loads as "no labels", pooled rankings only; a no-label store must be a sealed
   export; and every file a run reads is checked against the hashes it declared. `counts` and `build` here
   call its `universe` and `seal_export`. No signal has been run on real small-cap data.
-- The store on grid-svr has not been bound and rebuilt (above), so no sealed generation of the real data
-  exists yet.
+- The review accepted the source code. It did not check the survey of the real store or this build, and a
+  sealed generation is not permission to run anything on it.
+- The factory itself still counts a row blank only in the adjusted high or low as a valid bar. This
+  builder refuses such a row, so no generation it builds holds one, but a directory sealed some other way
+  could. Making the factory require all eight prices is a change to the shared factory, proposed as its own
+  PR and not started.
 - No sector source, so no within-sector ranking, sector gate or sector card for small caps yet.
 - The factory's default cost is 1 bp a side, set for index members. A small-cap run file must set its
   own figure. Owner decision, 2026-11-20: the first run file assumes 25 bp a side. That is a stand-in
@@ -275,6 +298,7 @@ bound, built or left behind.
 
 grid-svr, the `smallcap-data/` directory of the research data home: `raw/` (the company list as served, the
 ended-company sample, SEC's quarterly indexes and the two comparison files), `prices/` (as served),
-`no-prices/` (one mark per id Tiingo has no bars for), `panel/` (the old in-place layout until the store is
-rebuilt; then one directory per generation and `CURRENT`), `companies.csv`, `universe-report.json`,
-`fetch-log.jsonl`, `code/` (the `analysis/` copy that ran) and `run-fetch.sh`.
+`no-prices/` (one mark per id Tiingo has no bars for), `fetch-state.json` (the pull), `panel/` (one directory
+per generation, `CURRENT` naming the latest, and the old in-place files nothing reads), `companies.csv`,
+`universe-report.json`, `fetch-log.jsonl`, `code-7c998c7a/` (the `analysis/` copy that bound and built it) and
+`run-rebuild-20261121.sh`.
