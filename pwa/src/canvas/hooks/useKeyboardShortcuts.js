@@ -69,7 +69,7 @@ export function useKeyboardShortcuts({
                 } else if (sigmaRef?.current) {
                     const sigma = sigmaRef.current;
                     const camera = sigma.getCamera();
-                    camera.animatedReset({ duration: 300 });
+                    camera.reset({ duration: 300 }); // sigma v4: animatedReset → reset
                 }
                 break;
             }
