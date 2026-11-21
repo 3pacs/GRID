@@ -30,6 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.pit import PITStore
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +123,9 @@ class Strategy151Engine:
     ) -> pd.DataFrame:
         """Load implied volatility from ``options_daily_signals``."""
         start_date = as_of_date - timedelta(days=lookback_days)
-        query = text("""
+        query = visible_sql("""
             SELECT ticker, signal_date, iv_atm
-            FROM options_daily_signals
+            FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = ANY(:tickers)
               AND signal_date BETWEEN :start AND :end
             ORDER BY signal_date

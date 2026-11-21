@@ -270,6 +270,24 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
 
+      # #1322: Schwab-captured options rows reach admin requests only. The
+      # LATERAL fragments and the GEX batch-then-chain read run on real
+      # PostgreSQL only; a skip must fail this step.
+      - name: Options Schwab-provenance PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_OPTIONS_PROVENANCE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_options_provenance_pg.py -q -rA | tee /tmp/grid-options-provenance-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-options-provenance-pg.txt; then
+            echo "::error::Options Schwab-provenance PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # QuiverQuant gov_contracts rows the 2026-11-07 fiscal re-date could not
       # move: the SQL mirror must flag what the Python helper flags, and the
       # trust inputs and the corporate money-flow layer must leave them out.

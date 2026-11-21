@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from loguru import logger as log
 from sqlalchemy import text
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
@@ -239,8 +240,8 @@ def _ticker_signals(engine: Any, ticker: str) -> dict[str, Any]:
                     for r in rows
                 ]
             if _table_exists(conn, "options_daily_signals"):
-                row = conn.execute(text(
-                    "SELECT put_call_ratio, iv_atm FROM options_daily_signals "
+                row = conn.execute(visible_sql(
+                    "SELECT put_call_ratio, iv_atm FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :t AND signal_date <= CURRENT_DATE "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ), {"t": ticker}).fetchone()

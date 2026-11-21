@@ -23,6 +23,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, visible_sql
+
 
 # ── Constants ──────────────────────────────────────────────────────────
 
@@ -575,8 +577,8 @@ def _get_price_at_date(engine: Engine, ticker: str, target_date: date) -> float 
     """
     with engine.connect() as conn:
         # 1. Try options_daily_signals
-        row = conn.execute(text("""
-            SELECT spot_price FROM options_daily_signals
+        row = conn.execute(visible_sql("""
+            SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
             ORDER BY signal_date DESC LIMIT 1
         """), {"t": ticker, "d": target_date}).fetchone()
@@ -840,8 +842,8 @@ def _settlement_spot(
     """
     upper = min(expiry, as_of)
     with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT spot_price, signal_date FROM options_daily_signals
+        row = conn.execute(visible_sql("""
+            SELECT spot_price, signal_date FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND signal_date <= :hi AND signal_date >= :lo
               AND spot_price > 0
             ORDER BY signal_date DESC LIMIT 1
@@ -858,8 +860,8 @@ def _contract_mark(
 ) -> tuple[float, date] | None:
     """Latest bid/ask mid for the exact contract between ``since`` and ``as_of``."""
     with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT bid, ask, snap_date FROM options_snapshots
+        row = conn.execute(visible_sql("""
+            SELECT bid, ask, snap_date FROM """ + VISIBLE_SNAPSHOTS + """ s
             WHERE ticker = :t AND expiry = :e AND opt_type = :o AND strike = :k
               AND snap_date >= :since AND snap_date <= :as_of
               AND bid IS NOT NULL AND ask IS NOT NULL AND ask > 0

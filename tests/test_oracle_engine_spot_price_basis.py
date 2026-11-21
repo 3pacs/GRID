@@ -20,7 +20,7 @@ def oracle(monkeypatch):
             ticker TEXT, spot_price REAL, provider_regular_market_at TEXT, spot_provider TEXT,
             capture_batch_id TEXT, capture_source TEXT, capture_started_at TEXT,
             capture_completed_at TEXT, registered_at TEXT, snap_date TEXT,
-            backfilled BOOLEAN, capture_ordinal INTEGER)"""))
+            backfilled BOOLEAN, capture_ordinal INTEGER, clock_metadata TEXT)"""))
         # Populate the retired sources with plausible but different prices so a
         # reintroduced fallback is distinguishable from a measured spot.
         conn.execute(text("""CREATE TABLE options_daily_signals (
@@ -48,7 +48,7 @@ def _insert_capture(engine, quote_time):
     with engine.engine.begin() as conn:
         conn.execute(text("""INSERT INTO options_capture_batches VALUES
             ('AAPL',182,:quote,'cboe','capture-1','oracle_forward',:started,
-             :completed,:registered,'2026-11-10',FALSE,1)"""),
+             :completed,:registered,'2026-11-10',FALSE,1,NULL)"""),
             {"quote": quote_time, "started": DECISION - timedelta(minutes=2),
              "completed": DECISION - timedelta(minutes=1),
              "registered": DECISION - timedelta(seconds=30)})

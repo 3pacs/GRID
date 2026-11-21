@@ -26,7 +26,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+
+from store.options_provenance import VISIBLE_CAPTURE_BATCHES, visible_sql
 
 # ── score_notes (persisted by the scorers) ─────────────────────────────────
 SCORE_NOTE_ENTRY_NULL = "No entry price was measured at publish time"
@@ -199,11 +200,11 @@ def load_quote_reference(conn: Any, ticker: str, *, as_of: datetime) -> dict[str
     cutoff = _aware_clock(as_of)
     if cutoff is None:
         return receipt | {"reason": "decision clock is missing or unzoned"}
-    row = conn.execute(text("""
+    row = conn.execute(visible_sql("""
         SELECT spot_price, provider_regular_market_at, spot_provider,
                capture_batch_id, capture_source, capture_started_at,
                capture_completed_at, registered_at, snap_date, backfilled
-        FROM options_capture_batches
+        FROM """ + VISIBLE_CAPTURE_BATCHES + """ b
         WHERE ticker = :ticker AND capture_completed_at <= :as_of
           AND registered_at <= :as_of
         ORDER BY capture_ordinal DESC LIMIT 1

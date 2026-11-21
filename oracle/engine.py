@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
@@ -953,10 +955,10 @@ class OracleEngine:
             """), {"fams": families}).fetchall()
 
             # Add options signals if available
-            opt_row = conn.execute(text("""
+            opt_row = conn.execute(visible_sql("""
                 SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
                        total_oi, term_structure_slope, oi_concentration
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND total_oi >= 1000 AND (iv_atm IS NULL OR iv_atm >= 0.03)
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()

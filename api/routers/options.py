@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from loguru import logger as log
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
 from api.precompute_serving import serve_precomputed
 
@@ -365,32 +365,40 @@ def get_options_signals(
     ticker: str | None = Query(None, description="Filter by ticker"),
     limit: int = Query(50, ge=1, le=500),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
-    """Return latest options daily signals."""
-    from sqlalchemy import text
+    """Return latest options daily signals.
+
+    Days captured from Schwab are shown to admins only
+    (``store/options_provenance.py``); other viewers get the latest
+    non-Schwab days.
+    """
+    from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
     engine = get_db_engine()
     with engine.connect() as conn:
         if ticker:
             rows = conn.execute(
-                text(
+                visible_sql(
                     "SELECT ticker, signal_date, put_call_ratio, max_pain, "
                     "iv_skew, total_oi, total_volume, near_expiry, spot_price, "
                     "iv_atm, term_structure_slope, oi_concentration "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker "
-                    "ORDER BY signal_date DESC LIMIT :lim"
+                    "ORDER BY signal_date DESC LIMIT :lim",
+                    include_schwab,
                 ),
                 {"ticker": ticker, "lim": limit},
             ).fetchall()
         else:
             rows = conn.execute(
-                text(
+                visible_sql(
                     "SELECT ticker, signal_date, put_call_ratio, max_pain, "
                     "iv_skew, total_oi, total_volume, near_expiry, spot_price, "
                     "iv_atm, term_structure_slope, oi_concentration "
-                    "FROM options_daily_signals "
-                    "ORDER BY signal_date DESC, ticker LIMIT :lim"
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "ORDER BY signal_date DESC, ticker LIMIT :lim",
+                    include_schwab,
                 ),
                 {"lim": limit},
             ).fetchall()

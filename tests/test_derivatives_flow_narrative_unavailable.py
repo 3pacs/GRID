@@ -69,7 +69,7 @@ def test_missing_spot_returns_unavailable_without_false_narrative(
     monkeypatch.setattr(
         derivatives,
         "_get_gex_engine",
-        lambda: _GEX({
+        lambda *_a, **_k: _GEX({
             "available": False,
             "status": "unavailable",
             "reason": "no measured close for SPY in resolved_series",
@@ -101,7 +101,7 @@ def test_measured_spot_still_builds_inline_narrative(
     monkeypatch.setattr(
         derivatives,
         "_get_gex_engine",
-        lambda: _GEX({
+        lambda *_a, **_k: _GEX({
             **_dated_spy(),
             "gex_aggregate": 1_000_000.0,
             "regime": "LONG_GAMMA",
@@ -128,7 +128,7 @@ def test_legacy_error_profile_without_availability_fields_stays_unavailable(
     monkeypatch.setattr(
         derivatives,
         "_get_gex_engine",
-        lambda: _GEX({"error": "No options chain for SPY", "ticker": "SPY"}),
+        lambda *_a, **_k: _GEX({"error": "No options chain for SPY", "ticker": "SPY"}),
     )
 
     result = derivatives.get_flow_narrative()
@@ -158,7 +158,7 @@ def test_unverified_saved_briefing_cannot_bypass_missing_spot(
     monkeypatch.setattr(
         derivatives,
         "_get_gex_engine",
-        lambda: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
+        lambda *_a, **_k: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
     )
 
     result = derivatives.get_flow_narrative()
@@ -185,7 +185,7 @@ def test_source_guarded_saved_briefing_is_retained(
     monkeypatch.setattr(
         derivatives,
         "_get_gex_engine",
-        lambda: pytest.fail("source-guarded saved briefing should not recompute GEX"),
+        lambda *_a, **_k: pytest.fail("source-guarded saved briefing should not recompute GEX"),
     )
 
     assert derivatives.get_flow_narrative() is saved
@@ -207,7 +207,7 @@ def test_stale_saved_briefing_falls_back_to_current_unavailable_state(
     monkeypatch.setattr(
         derivatives,
         "_get_gex_engine",
-        lambda: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
+        lambda *_a, **_k: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
     )
 
     result = derivatives.get_flow_narrative()

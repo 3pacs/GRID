@@ -48,10 +48,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
-from sqlalchemy import Date, text
+from sqlalchemy import Date
 from sqlalchemy.engine import Engine
 
 from physics.dealer_gamma import DEALER_CALL_SIGN, DEALER_PUT_SIGN, bs_gamma
+from store.options_provenance import VISIBLE_SNAPSHOTS, visible_sql
 
 # Matches DealerGammaEngine's own default (physics/dealer_gamma.py).
 DEFAULT_RISK_FREE_RATE = 0.05
@@ -64,10 +65,10 @@ DEFAULT_RISK_FREE_RATE = 0.05
 # tests), and computing it in Python needs no dialect-specific SQL at all.
 # `.columns(expiry=Date())` makes that subtraction well-typed regardless
 # of dialect, the same technique `chain.py` uses for its own query.
-_CHAIN_QUERY = text(
+_CHAIN_QUERY = visible_sql(
     """
     SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility, expiry
-    FROM options_snapshots
+    FROM """ + VISIBLE_SNAPSHOTS + """ s
     WHERE ticker = :ticker AND snap_date = :snap_date
     AND open_interest > 0 AND implied_vol > 0
     AND expiry > :snap_date

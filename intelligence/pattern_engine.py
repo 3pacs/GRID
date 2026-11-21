@@ -32,6 +32,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ---------------------------------------------------------------------------
@@ -204,9 +205,9 @@ def _get_price_after(
 
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("""
+            rows = conn.execute(visible_sql("""
                 SELECT signal_date, spot_price
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t
                   AND signal_date >= :s
                   AND signal_date <= :e

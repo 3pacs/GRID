@@ -52,7 +52,7 @@ def _profile() -> dict:
 
 
 def _engine(monkeypatch: pytest.MonkeyPatch, profile: dict) -> None:
-    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda: SimpleNamespace(
+    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda *_a, **_k: SimpleNamespace(
         compute_gex_profile=lambda _ticker: profile,
     ))
 

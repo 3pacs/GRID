@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db import get_engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 UNIVERSE_CSV = ROOT / "data" / "tiingo_universe_tiered.csv"
@@ -349,7 +350,7 @@ def _materialize_signal_calibration(conn: Any) -> int:
 
 def _materialize_options_coverage(conn: Any) -> int:
     conn.execute(text("TRUNCATE TABLE surfacer_options_coverage"))
-    result = conn.execute(text("""
+    result = conn.execute(visible_sql("""
         INSERT INTO surfacer_options_coverage (
             ticker, latest_signal_date, rows_available, avg_total_volume, avg_total_oi,
             latest_total_volume, latest_total_oi, latest_iv_atm, latest_spot_price,
@@ -367,7 +368,7 @@ def _materialize_options_coverage(conn: Any) -> int:
                 tv.volume_rank,
                 tv.dollar_volume,
                 ROW_NUMBER() OVER (PARTITION BY UPPER(o.ticker) ORDER BY o.signal_date DESC NULLS LAST) AS rn
-            FROM options_daily_signals o
+            FROM """ + VISIBLE_DAILY_SIGNALS + """ o
             JOIN surfacer_top_volume_universe tv ON tv.ticker = UPPER(o.ticker)
         ),
         agg AS (

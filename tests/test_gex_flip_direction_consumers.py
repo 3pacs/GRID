@@ -40,7 +40,7 @@ def test_timeline_calls_dated_sign_change_a_sign_change_not_a_price_flip(
     gex = MagicMock()
     gex.compute_gex_profile.side_effect = lambda _ticker, snap_date: profiles[snap_date]
     monkeypatch.setattr(derivatives, "get_db_engine", lambda: db)
-    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda: gex)
+    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda *_a, **_k: gex)
     monkeypatch.setattr(derivatives, "_generate_opex_calendar", lambda *_args: [])
     monkeypatch.setattr(derivatives, "_generate_catalysts", lambda *_args: [])
 

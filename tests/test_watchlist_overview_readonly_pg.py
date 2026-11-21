@@ -38,7 +38,12 @@ def test_overview_populated_then_failed_price_read_uses_live_and_keeps_options_w
             ticker TEXT, signal_date DATE, put_call_ratio DOUBLE PRECISION,
             max_pain DOUBLE PRECISION, iv_atm DOUBLE PRECISION,
             iv_skew DOUBLE PRECISION, spot_price DOUBLE PRECISION,
-            total_oi DOUBLE PRECISION)"""))
+            total_oi DOUBLE PRECISION, wing_iv_metadata JSONB)"""))
+        # Options readers look up each row's capture batch
+        # (store/options_provenance.py); empty, so no row is Schwab-captured.
+        conn.execute(text("""CREATE TABLE options_capture_batches (
+            capture_batch_id TEXT PRIMARY KEY, ticker TEXT, snap_date DATE,
+            spot_provider TEXT, clock_metadata JSONB)"""))
         conn.execute(text("""CREATE TABLE decision_journal (
             inferred_state TEXT, state_confidence DOUBLE PRECISION,
             grid_recommendation TEXT, decision_timestamp TIMESTAMPTZ)"""))

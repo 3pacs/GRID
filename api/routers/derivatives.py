@@ -4,6 +4,11 @@ GRID API — Derivatives / Dealer Flow Intelligence endpoints.
 Exposes dealer gamma exposure (GEX), vol surface, term structure,
 OI heatmaps, skew curves, and flow narrative data from the
 DealerGammaEngine and options_snapshots tables.
+
+Options rows captured from Schwab (owner-private, #1299) are served to admin
+requests only: every route takes ``include_schwab`` from ``viewer_is_admin``
+and reads through ``store/options_provenance.py``; any other viewer gets the
+latest non-Schwab capture.
 """
 
 from __future__ import annotations
@@ -14,11 +19,18 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from loguru import logger as log
-from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
 from api.dependencies import get_db_engine
 from store.availability import unavailable
+from store.options_provenance import (
+    LATEST_SIGNAL_EACH_TICKER,
+    VISIBLE_CAPTURE_BATCHES,
+    VISIBLE_DAILY_SIGNALS,
+    VISIBLE_SNAPSHOTS,
+    VISIBLE_SNAPSHOTS_ALL,
+    visible_sql,
+)
 from store.options_iv import fixed_moneyness_wings, positive_finite, public_wing_fields
 
 router = APIRouter(
@@ -28,10 +40,10 @@ router = APIRouter(
 )
 
 
-def _get_gex_engine():
-    """Lazily import and instantiate DealerGammaEngine."""
+def _get_gex_engine(include_schwab: bool = False):
+    """Lazily import and instantiate DealerGammaEngine (Schwab chains for admins only)."""
     from physics.dealer_gamma import DealerGammaEngine
-    return DealerGammaEngine(get_db_engine())
+    return DealerGammaEngine(get_db_engine(), include_schwab=include_schwab is True)
 
 
 def _utc_day() -> date:
@@ -79,7 +91,7 @@ def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
 # ── GET /overview ────────────────────────────────────────────────────
 
 @router.get("/overview")
-def get_overview() -> dict[str, Any]:
+def get_overview(include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Market-wide dealer positioning summary.
 
     Calls DealerGammaEngine.get_market_gex_summary() for SPY and
@@ -87,18 +99,19 @@ def get_overview() -> dict[str, Any]:
     and top signals from options_daily_signals.
     """
     try:
-        engine_gex = _get_gex_engine()
+        engine_gex = _get_gex_engine(include_schwab)
         summary = engine_gex.get_market_gex_summary()
 
         # Fetch latest daily signals for top tickers
         db = get_db_engine()
         with db.connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT DISTINCT ON (ticker) ticker, signal_date, put_call_ratio, "
                 "max_pain, iv_skew, iv_atm, total_oi, total_volume, spot_price "
-                "FROM options_daily_signals "
+                "FROM " + LATEST_SIGNAL_EACH_TICKER + " ods "
                 "ORDER BY ticker, signal_date DESC "
-                "LIMIT 20"
+                "LIMIT 20",
+                include_schwab,
             )).fetchall()
 
         top_signals = [
@@ -145,6 +158,7 @@ def get_gex(
         None, min_length=1, max_length=64,
         description="Replay this registered capture batch instead of the day's latest",
     ),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Full GEX profile for a single ticker.
 
@@ -160,7 +174,7 @@ def get_gex(
     if args is None:
         return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
-        engine_gex = _get_gex_engine()
+        engine_gex = _get_gex_engine(include_schwab)
         result = _read_profile(engine_gex, ticker.upper(), args)
         if capture_batch_id is not None and isinstance(result, dict):
             result = {**result, "replayed_batch": True}
@@ -176,6 +190,7 @@ def get_gex(
 def get_options_batches(
     ticker: str,
     snap_date: date = Query(..., description="Chain day to list capture batches for"),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Every registered complete capture batch for a ticker/day, oldest first.
 
@@ -184,12 +199,13 @@ def get_options_batches(
     """
     try:
         with get_db_engine().connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT capture_batch_id, capture_ordinal, capture_started_at, "
                 "capture_completed_at, row_count, capture_source, backfilled "
-                "FROM options_capture_batches "
+                "FROM " + VISIBLE_CAPTURE_BATCHES + " b "
                 "WHERE ticker = :ticker AND snap_date = :snap_date "
-                "ORDER BY capture_ordinal"
+                "ORDER BY capture_ordinal",
+                include_schwab,
             ), {"ticker": ticker.upper(), "snap_date": snap_date}).fetchall()
     except Exception as exc:
         log.warning("Options batch listing failed for {t}: {e}", t=ticker, e=type(exc).__name__)
@@ -210,14 +226,14 @@ def get_options_batches(
 # ── GET /regime ──────────────────────────────────────────────────────
 
 @router.get("/regime")
-def get_regime() -> dict[str, Any]:
+def get_regime(include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Estimated SPY gamma regime with source and model provenance.
 
     Computes SPY GEX and returns regime classification plus explanation
     of what it means for market dynamics.
     """
     try:
-        engine_gex = _get_gex_engine()
+        engine_gex = _get_gex_engine(include_schwab)
         spy = engine_gex.compute_gex_profile("SPY")
 
         if spy.get("error") or not _verified_gex_profile(spy):
@@ -278,6 +294,7 @@ def get_walls(
         None, min_length=1, max_length=64,
         description="Replay this registered capture batch instead of the day's latest",
     ),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Support/resistance levels derived from gamma walls.
 
@@ -291,7 +308,7 @@ def get_walls(
     if args is None:
         return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
-        engine_gex = _get_gex_engine()
+        engine_gex = _get_gex_engine(include_schwab)
         result = _read_profile(engine_gex, ticker.upper(), args)
         if result.get("error"):
             return {
@@ -323,14 +340,14 @@ def get_walls(
 # ── GET /vanna-charm/{ticker} ───────────────────────────────────────
 
 @router.get("/vanna-charm/{ticker}")
-def get_vanna_charm(ticker: str) -> dict[str, Any]:
+def get_vanna_charm(ticker: str, include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Estimated vanna and charm with dated chain/spot provenance.
 
     Returns modeled sensitivities and per-strike decomposition. It does not
     infer required hedge orders from open interest.
     """
     try:
-        engine_gex = _get_gex_engine()
+        engine_gex = _get_gex_engine(include_schwab)
         result = engine_gex.compute_gex_profile(ticker.upper())
 
         if result.get("error") or not _verified_gex_profile(result):
@@ -406,7 +423,7 @@ def get_vanna_charm(ticker: str) -> dict[str, Any]:
 # ── GET /vol-surface/{ticker} ───────────────────────────────────────
 
 @router.get("/vol-surface/{ticker}")
-def get_vol_surface(ticker: str) -> dict[str, Any]:
+def get_vol_surface(ticker: str, include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Volatility surface data: IV grid by strike x expiry.
 
     Returns array of {strike, expiry, dte, iv, oi, volume, type} from
@@ -416,8 +433,9 @@ def get_vol_surface(ticker: str) -> dict[str, Any]:
         db = get_db_engine()
         with db.connect() as conn:
             # Get latest snap_date for ticker
-            latest = conn.execute(text(
-                "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
+            latest = conn.execute(visible_sql(
+                "SELECT MAX(snap_date) FROM " + VISIBLE_SNAPSHOTS + " s WHERE ticker = :t",
+                include_schwab,
             ), {"t": ticker.upper()}).fetchone()
 
             if not latest or not latest[0]:
@@ -425,14 +443,15 @@ def get_vol_surface(ticker: str) -> dict[str, Any]:
 
             snap_date = latest[0]
 
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
                 "implied_volatility, open_interest, volume, opt_type "
-                "FROM options_snapshots "
+                "FROM " + VISIBLE_SNAPSHOTS + " s "
                 "WHERE ticker = :t AND snap_date = :sd "
                 "AND implied_volatility > 0 AND open_interest > 0 "
                 "AND expiry > :sd "
-                "ORDER BY expiry, strike"
+                "ORDER BY expiry, strike",
+                include_schwab,
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
         surface = [
@@ -462,7 +481,7 @@ def get_vol_surface(ticker: str) -> dict[str, Any]:
 # ── GET /skew/{ticker} ──────────────────────────────────────────────
 
 @router.get("/skew/{ticker}")
-def get_skew(ticker: str) -> dict[str, Any]:
+def get_skew(ticker: str, include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Skew curves: IV at each strike for each expiry.
 
     Returns array of {expiry, dte, strikes: [{strike, call_iv, put_iv}]}.
@@ -470,8 +489,9 @@ def get_skew(ticker: str) -> dict[str, Any]:
     try:
         db = get_db_engine()
         with db.connect() as conn:
-            latest = conn.execute(text(
-                "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
+            latest = conn.execute(visible_sql(
+                "SELECT MAX(snap_date) FROM " + VISIBLE_SNAPSHOTS + " s WHERE ticker = :t",
+                include_schwab,
             ), {"t": ticker.upper()}).fetchone()
 
             if not latest or not latest[0]:
@@ -479,13 +499,14 @@ def get_skew(ticker: str) -> dict[str, Any]:
 
             snap_date = latest[0]
 
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
                 "implied_volatility, opt_type "
-                "FROM options_snapshots "
+                "FROM " + VISIBLE_SNAPSHOTS + " s "
                 "WHERE ticker = :t AND snap_date = :sd "
                 "AND implied_volatility > 0 AND expiry > :sd "
-                "ORDER BY expiry, strike"
+                "ORDER BY expiry, strike",
+                include_schwab,
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
         # Group by expiry
@@ -527,7 +548,7 @@ def get_skew(ticker: str) -> dict[str, Any]:
 # ── GET /term-structure/{ticker} ─────────────────────────────────────
 
 @router.get("/term-structure/{ticker}")
-def get_term_structure(ticker: str) -> dict[str, Any]:
+def get_term_structure(ticker: str, include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """ATM term structure with versioned fixed-moneyness wing IV proxies.
 
     Uses one immutable capture and its observed spot; no strike-derived spot.
@@ -536,26 +557,29 @@ def get_term_structure(ticker: str) -> dict[str, Any]:
     try:
         db = get_db_engine()
         with db.connect() as conn:
-            latest = conn.execute(text(
-                "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
+            latest = conn.execute(visible_sql(
+                "SELECT MAX(snap_date) FROM " + VISIBLE_SNAPSHOTS + " s WHERE ticker = :t",
+                include_schwab,
             ), {"t": ticker.upper()}).fetchone()
             if not latest or not latest[0]:
                 return {"ticker": ticker.upper(), "term_structure": [], "error": "No data"}
             snap_date = latest[0]
-            batch = conn.execute(text(
+            batch = conn.execute(visible_sql(
                 "SELECT capture_batch_id, spot_price, spot_provider, provider_regular_market_at, backfilled "
-                "FROM options_capture_batches WHERE ticker = :t AND snap_date = :sd "
-                "ORDER BY capture_ordinal DESC LIMIT 1"
+                "FROM " + VISIBLE_CAPTURE_BATCHES + " b WHERE ticker = :t AND snap_date = :sd "
+                "ORDER BY capture_ordinal DESC LIMIT 1",
+                include_schwab,
             ), {"t": ticker.upper(), "sd": snap_date}).fetchone()
             if not batch or batch[4] or positive_finite(batch[1]) is None:
                 return {"ticker": ticker.upper(), "snap_date": str(snap_date),
                         "term_structure": [], "error": "Observed capture spot unavailable"}
             batch_id, spot, source, spot_at, _backfilled = batch
             spot = float(spot)
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, implied_vol, opt_type "
-                "FROM options_snapshots_all WHERE ticker = :t AND snap_date = :sd "
-                "AND capture_batch_id = :batch AND expiry > :sd ORDER BY expiry, strike"
+                "FROM " + VISIBLE_SNAPSHOTS_ALL + " s WHERE ticker = :t AND snap_date = :sd "
+                "AND capture_batch_id = :batch AND expiry > :sd ORDER BY expiry, strike",
+                include_schwab,
             ), {"t": ticker.upper(), "sd": snap_date, "batch": batch_id}).fetchall()
 
         from collections import defaultdict
@@ -588,7 +612,7 @@ def get_term_structure(ticker: str) -> dict[str, Any]:
 # ── GET /oi-heatmap/{ticker} ────────────────────────────────────────
 
 @router.get("/oi-heatmap/{ticker}")
-def get_oi_heatmap(ticker: str) -> dict[str, Any]:
+def get_oi_heatmap(ticker: str, include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Open interest heatmap: OI by strike x expiry.
 
     Returns grid of [{strike, expiry, call_oi, put_oi, call_vol, put_vol}].
@@ -596,8 +620,9 @@ def get_oi_heatmap(ticker: str) -> dict[str, Any]:
     try:
         db = get_db_engine()
         with db.connect() as conn:
-            latest = conn.execute(text(
-                "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
+            latest = conn.execute(visible_sql(
+                "SELECT MAX(snap_date) FROM " + VISIBLE_SNAPSHOTS + " s WHERE ticker = :t",
+                include_schwab,
             ), {"t": ticker.upper()}).fetchone()
 
             if not latest or not latest[0]:
@@ -605,13 +630,14 @@ def get_oi_heatmap(ticker: str) -> dict[str, Any]:
 
             snap_date = latest[0]
 
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT strike, expiry, opt_type, open_interest, "
                 "COALESCE(volume, 0) AS volume "
-                "FROM options_snapshots "
+                "FROM " + VISIBLE_SNAPSHOTS + " s "
                 "WHERE ticker = :t AND snap_date = :sd "
                 "AND open_interest > 0 AND expiry > :sd "
-                "ORDER BY expiry, strike"
+                "ORDER BY expiry, strike",
+                include_schwab,
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
         # Aggregate into strike x expiry cells
@@ -654,7 +680,7 @@ def get_oi_heatmap(ticker: str) -> dict[str, Any]:
 # ── GET /flow-narrative ──────────────────────────────────────────────
 
 @router.get("/flow-narrative")
-def get_flow_narrative() -> dict[str, Any]:
+def get_flow_narrative(include_schwab: bool = Depends(viewer_is_admin)) -> dict[str, Any]:
     """Latest dealer flow narrative briefing (LLM-powered).
 
     Returns the most recent Cem-Karsan-style briefing covering gamma
@@ -690,7 +716,7 @@ def get_flow_narrative() -> dict[str, Any]:
 
     # Fallback: quick inline narrative from live GEX
     try:
-        engine_gex = _get_gex_engine()
+        engine_gex = _get_gex_engine(include_schwab)
         spy = engine_gex.compute_gex_profile("SPY")
 
         spot = spy.get("spot")
@@ -805,17 +831,19 @@ def generate_flow_narrative() -> dict[str, Any]:
 @router.get("/signals")
 def get_signals(
     limit: int = Query(50, ge=1, le=500),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Latest options daily signals for all tickers."""
     try:
         db = get_db_engine()
         with db.connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT DISTINCT ON (ticker) ticker, signal_date, put_call_ratio, "
                 "max_pain, iv_skew, total_oi, total_volume, near_expiry, "
                 "spot_price, iv_atm, term_structure_slope, oi_concentration "
-                "FROM options_daily_signals "
-                "ORDER BY ticker, signal_date DESC"
+                "FROM " + LATEST_SIGNAL_EACH_TICKER + " ods "
+                "ORDER BY ticker, signal_date DESC",
+                include_schwab,
             )).fetchall()
 
         signals = [
@@ -843,13 +871,14 @@ def get_signals(
 @router.get("/scan")
 def get_scan(
     min_score: float = Query(5.0, ge=0, le=10),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Run options scanner with dealer context."""
     try:
         from discovery.options_scanner import OptionsScanner
 
         db = get_db_engine()
-        scanner = OptionsScanner(db)
+        scanner = OptionsScanner(db, include_schwab=include_schwab is True)
         opps = scanner.scan_all(min_score=min_score)
 
         results = [
@@ -1000,6 +1029,7 @@ def _generate_catalysts(start_date: date, end_date: date, ticker: str) -> list[d
 def get_flow_timeline(
     ticker: str,
     days: int = Query(90, ge=7, le=365),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Historical GEX timeline with OpEx calendar and catalysts.
 
@@ -1022,16 +1052,17 @@ def get_flow_timeline(
     # ── Try options_daily_signals first for stored data ──
     try:
         with db.connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT signal_date, spot_price, iv_atm, put_call_ratio, total_oi "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE ticker = :t "
                 "AND signal_date >= :start AND signal_date <= :end "
-                "ORDER BY signal_date ASC"
+                "ORDER BY signal_date ASC",
+                include_schwab,
             ), {"t": ticker, "start": start_date, "end": end_date}).fetchall()
 
         if rows:
-            engine_gex = _get_gex_engine()
+            engine_gex = _get_gex_engine(include_schwab)
             prev_gex = None
 
             for r in rows:
@@ -1077,7 +1108,7 @@ def get_flow_timeline(
     # ── Fallback: compute from latest snapshot ──
     if not history:
         try:
-            engine_gex = _get_gex_engine()
+            engine_gex = _get_gex_engine(include_schwab)
             result = engine_gex.compute_gex_profile(ticker)
             if not result.get("error") and all(
                 result.get(field) is not None
@@ -1123,19 +1154,21 @@ def get_flow_timeline(
 def get_history(
     ticker: str,
     days: int = Query(30, ge=1, le=365),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict[str, Any]:
     """Historical GEX-related data from options_daily_signals time series."""
     try:
         db = get_db_engine()
         with db.connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                 "total_oi, total_volume, spot_price, iv_atm, "
                 "term_structure_slope, oi_concentration "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE ticker = :t "
                 "AND signal_date >= CURRENT_DATE - make_interval(days => :days) "
-                "ORDER BY signal_date ASC"
+                "ORDER BY signal_date ASC",
+                include_schwab,
             ), {"t": ticker.upper(), "days": days}).fetchall()
 
         history = [

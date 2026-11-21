@@ -43,6 +43,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.observations import read_latest
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 # ── Domain constants ─────────────────────────────────────────────────────
 
@@ -328,8 +329,8 @@ def _read_equity_vol(engine: Engine, ticker: str) -> float | None:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text(
-                    "SELECT iv_atm FROM options_daily_signals "
+                visible_sql(
+                    "SELECT iv_atm FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :t AND iv_atm IS NOT NULL "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ),

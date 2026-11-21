@@ -17,6 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -511,8 +512,8 @@ def _get_dealer_gamma_state(engine: Engine) -> dict[str, Any]:
     """Fetch SPY GEX regime from options_daily_signals."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT put_call_ratio, spot_price FROM options_daily_signals
+            row = conn.execute(visible_sql("""
+                SELECT put_call_ratio, spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = 'SPY' AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """)).fetchone()
@@ -539,8 +540,8 @@ def _get_vanna_charm_state(engine: Engine) -> dict[str, Any]:
     """Assess vanna/charm pressure from max pain vs spot."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT max_pain, spot_price, signal_date FROM options_daily_signals
+            row = conn.execute(visible_sql("""
+                SELECT max_pain, spot_price, signal_date FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0
                 AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
