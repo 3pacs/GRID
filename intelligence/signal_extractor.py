@@ -41,6 +41,27 @@ EXTRACTOR_LOOKBACK_DAYS: int = int(os.environ.get("GRID_EXTRACTOR_LOOKBACK_DAYS"
 EXTRACTOR_FULL_SWEEP_DAYS: int = int(os.environ.get("GRID_EXTRACTOR_FULL_SWEEP_DAYS", "730"))
 
 
+def _parse_form4_series_id(sid: str) -> dict:
+    """Parse a FORM4:* raw_series id into signal_data fields.
+
+    ``FORM4:{ticker}:{metric}`` (three parts) is a per-ticker aggregate
+    written by ``ingestion/edgar.py``, such as ``FORM4:AAPL:NET_SHARES``. It
+    names no insider and carries no direction in its id, so it returns
+    ``ticker=None`` and the extractor skips it. Otherwise it would become an
+    "insider" signal with actor "Net Shares", always BEAR. Other shapes parse
+    as before.
+    """
+    parts = sid.split(":")
+    if len(parts) == 3:
+        return {"parts": parts, "actor": None, "ticker": None, "direction": None}
+    return {
+        "parts": parts,
+        "actor": parts[2].replace("_", " ").title() if len(parts) > 2 else None,
+        "ticker": parts[1] if len(parts) > 1 else None,
+        "direction": "BULL" if "purchase" in sid.lower() or "buy" in sid.lower() else "BEAR",
+    }
+
+
 def _since(lookback_days: int) -> date:
     return date.today() - timedelta(days=max(int(lookback_days), 1))
 
@@ -99,12 +120,7 @@ EXTRACTORS = [
     {
         "pattern": "FORM4:%",
         "signal_type": "insider",
-        "parse": lambda sid: {
-            "parts": sid.split(":"),
-            "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
-            "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "BULL" if "purchase" in sid.lower() or "buy" in sid.lower() else "BEAR",
-        },
+        "parse": lambda sid: _parse_form4_series_id(sid),
     },
     {
         # INSIDER:ACAD:kihara_james:SELL → actor=Kihara James, ticker=ACAD
