@@ -24,7 +24,7 @@ class _Engine:
 
 def _patched(monkeypatch) -> _Engine:
     engine = _Engine()
-    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda: engine)
+    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda *_a, **_k: engine)
     return engine
 
 

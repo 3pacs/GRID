@@ -29,6 +29,12 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.options_iv import positive_finite, wing_comparison_key
+from store.options_provenance import (
+    VISIBLE_DAILY_SIGNALS,
+    VISIBLE_SNAPSHOTS,
+    include_schwab_rows,
+    visible_sql,
+)
 
 from physics.dealer_gamma import (
     _d1,
@@ -117,11 +123,14 @@ class VolSurfaceEngine:
 
     Parameters:
         db_engine: SQLAlchemy engine for reading options_snapshots and signals.
+        include_schwab: read Schwab-captured days too (admin requests only;
+            ``store/options_provenance.py``). Default: non-Schwab days only.
     """
 
-    def __init__(self, db_engine: Engine) -> None:
+    def __init__(self, db_engine: Engine, *, include_schwab: bool = False) -> None:
         self.engine = db_engine
         self.r = RISK_FREE_RATE
+        self._include_schwab = include_schwab_rows(include_schwab)
 
     # ── Core: build_surface ──────────────────────────────────────────
 
@@ -710,14 +719,14 @@ class VolSurfaceEngine:
 
         with self.engine.connect() as conn:
             rows = conn.execute(
-                text("""
+                visible_sql("""
                     SELECT signal_date, iv_atm, iv_m90_put_v1, iv_m110_call_v1,
                            term_structure_slope, wing_iv_metadata
-                    FROM options_daily_signals
+                    FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :ticker
                     AND signal_date >= :start AND signal_date <= :end
                     ORDER BY signal_date
-                """),
+                """, self._include_schwab),
                 {"ticker": ticker, "start": start_date, "end": as_of_date},
             ).fetchall()
 
@@ -962,16 +971,16 @@ class VolSurfaceEngine:
         """
         with self.engine.connect() as conn:
             rows = conn.execute(
-                text("""
+                visible_sql("""
                     SELECT strike, opt_type, open_interest, implied_vol,
                            expiry, (expiry - :snap_date) AS dte,
                            last_price, bid, ask, volume
-                    FROM options_snapshots
+                    FROM """ + VISIBLE_SNAPSHOTS + """ s
                     WHERE ticker = :ticker AND snap_date = :snap_date
                     AND open_interest > 0 AND implied_vol > 0
                     AND expiry > :snap_date
                     ORDER BY expiry, strike
-                """),
+                """, self._include_schwab),
                 {"ticker": ticker, "snap_date": as_of_date},
             ).fetchall()
 
@@ -1016,11 +1025,11 @@ class VolSurfaceEngine:
         with self.engine.connect() as conn:
             # Try options_daily_signals first (has spot_price)
             row = conn.execute(
-                text("""
-                    SELECT spot_price FROM options_daily_signals
+                visible_sql("""
+                    SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :ticker AND signal_date <= :d
                     ORDER BY signal_date DESC LIMIT 1
-                """),
+                """, self._include_schwab),
                 {"ticker": ticker, "d": as_of_date},
             ).fetchone()
             price = recorded_price(row)

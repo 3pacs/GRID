@@ -64,9 +64,10 @@ Clocks: the underlying's ``last`` and its ``tradeTime`` date the capture (the
 same reading the Cboe client takes); every contract keeps the provider's own
 quote and last-trade times. Schwab data may not be redistributed: rows are
 labelled ``audience: private`` in the batch clock metadata. That label is not
-access control. Until the readers that serve contributors, the e-mail digests
-and oracle publication leave Schwab-provider rows out, this provider must stay
-switched off (review of #1299, item 3).
+access control; ``store/options_provenance.py`` is: readers that serve
+contributors, the e-mail digests, chat context and oracle publication leave
+Schwab-provider rows out (admin requests see them), and a Schwab capture is
+never written to ``resolved_series`` (review of #1299, item 3).
 """
 
 from __future__ import annotations

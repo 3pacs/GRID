@@ -25,6 +25,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
@@ -342,9 +343,9 @@ def _collect_options(conn: Any, ticker: str, start: date, end: date) -> list[dic
         return []
     try:
         rows = conn.execute(
-            text(
+            visible_sql(
                 "SELECT signal_date, put_call_ratio, iv_atm, iv_skew "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE ticker = :t AND signal_date BETWEEN :s AND :e "
                 "ORDER BY signal_date DESC LIMIT 5"
             ),

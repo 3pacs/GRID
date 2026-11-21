@@ -10,7 +10,8 @@ from fastapi import APIRouter, Depends
 from loguru import logger as log
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from api.dependencies import get_db_engine
 from api.routers.watchlist_helpers import (
     _fetch_live_price,
@@ -159,13 +160,13 @@ def get_ticker_overview(
 
         # Options (latest)
         try:
-            opt_row = conn.execute(text(
+            opt_row = conn.execute(visible_sql(
                 "SELECT signal_date, put_call_ratio, max_pain, iv_atm, iv_skew, "
                 "spot_price, total_oi "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE ticker = :ticker "
                 "ORDER BY signal_date DESC LIMIT 1"
-            ), {"ticker": ticker_upper}).fetchone()
+            ), {"ticker": ticker_upper}).fetchone()  # feeds the LLM: never Schwab
             if opt_row:
                 options_info = {
                     "date": str(opt_row[0]),
@@ -469,6 +470,7 @@ def get_ticker_overview(
 def get_ticker_quote(
     ticker: str,
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
     """Fast, LLM-free price/options snapshot for a single ticker.
 
@@ -535,10 +537,11 @@ def get_ticker_quote(
             _log_query_failure(f"Quote price query for {ticker_upper}", exc)
 
         try:
-            opt = conn.execute(text(
+            opt = conn.execute(visible_sql(
                 "SELECT put_call_ratio, max_pain, iv_atm, signal_date "
-                "FROM options_daily_signals WHERE ticker = :ticker "
-                "ORDER BY signal_date DESC LIMIT 1"
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods WHERE ticker = :ticker "
+                "ORDER BY signal_date DESC LIMIT 1",
+                include_schwab,
             ), {"ticker": ticker_upper}).fetchone()
             if opt:
                 put_call_ratio, max_pain, iv_atm = opt[0], opt[1], opt[2]

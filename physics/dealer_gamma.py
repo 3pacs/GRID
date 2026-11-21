@@ -63,7 +63,6 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -76,6 +75,13 @@ from ingestion.market_calendar import is_market_open, last_trading_day
 # with any external caller still importing them by name.
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
+from store.options_provenance import (
+    VISIBLE_CAPTURE_BATCHES,
+    VISIBLE_SNAPSHOTS,
+    VISIBLE_SNAPSHOTS_ALL,
+    include_schwab_rows,
+    visible_sql,
+)
 
 _EQUITY_TZ = ZoneInfo("America/New_York")
 
@@ -157,11 +163,18 @@ class DealerGammaEngine:
     Parameters:
         db_engine: SQLAlchemy engine for reading options_snapshots.
         risk_free_rate: Annual risk-free rate (default 5%).
+        include_schwab: read chains captured from Schwab too. Only an admin
+            request passes True; every other caller (contributor requests,
+            scanners, briefings, digests) reads non-Schwab captures only, and
+            a day with a Schwab capture is then not available to it
+            (``store/options_provenance.py``).
     """
 
-    def __init__(self, db_engine: Engine, risk_free_rate: float = 0.05) -> None:
+    def __init__(self, db_engine: Engine, risk_free_rate: float = 0.05, *,
+                 include_schwab: bool = False) -> None:
         self.engine = db_engine
         self.r = risk_free_rate
+        self._include_schwab = include_schwab_rows(include_schwab)
 
     def compute_gex_profile(
         self,
@@ -634,15 +647,15 @@ class DealerGammaEngine:
         transaction had committed or was observable at the cutoff. This live
         selector does not establish historical point-in-time admission.
         """
-        query = text("""
-            SELECT snap_date, capture_batch_id FROM options_capture_batches
+        query = visible_sql("""
+            SELECT snap_date, capture_batch_id FROM """ + VISIBLE_CAPTURE_BATCHES + """ b
             WHERE ticker = :ticker
               AND snap_date <= :on_or_before
               AND capture_completed_at <= :cutoff
               AND registered_at <= :cutoff
             ORDER BY snap_date DESC, capture_ordinal DESC
             LIMIT 1
-            """)
+            """, self._include_schwab)
         try:
             with self.engine.connect() as conn:
                 row = conn.execute(query, {"ticker": ticker, "on_or_before": on_or_before,
@@ -681,28 +694,28 @@ class DealerGammaEngine:
             return pd.DataFrame()
         params = {"ticker": ticker, "snap_date": snap_date}
         if capture_batch_id is None:
-            query = text("""
+            query = visible_sql("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte, created_at,
                        capture_batch_id, capture_ordinal,
                        capture_started_at, capture_completed_at, provider_regular_market_at,
                        NULL AS registered_row_count
-                FROM options_snapshots
+                FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
-                """)
+                """, self._include_schwab)
         else:
             if not isinstance(capture_batch_id, str) or not capture_batch_id:
                 return pd.DataFrame()
             params["batch"] = capture_batch_id
-            query = text("""
+            query = visible_sql("""
                 SELECT s.strike, s.opt_type, s.open_interest, s.implied_vol AS implied_volatility,
                        s.expiry, (s.expiry - :snap_date) AS dte, s.created_at,
                        s.capture_batch_id, s.capture_ordinal,
                        s.capture_started_at, s.capture_completed_at,
                        s.provider_regular_market_at, b.row_count AS registered_row_count
-                FROM options_snapshots_all s
-                JOIN options_capture_batches b
+                FROM """ + VISIBLE_SNAPSHOTS_ALL + """ s
+                JOIN """ + VISIBLE_CAPTURE_BATCHES + """ b
                   ON b.capture_batch_id = s.capture_batch_id
                  AND b.capture_ordinal = s.capture_ordinal
                  AND b.ticker = s.ticker AND b.snap_date = s.snap_date
@@ -711,7 +724,7 @@ class DealerGammaEngine:
                 WHERE s.ticker = :ticker AND s.snap_date = :snap_date
                   AND s.capture_batch_id = :batch
                 ORDER BY s.expiry, s.strike, s.opt_type
-                """)
+                """, self._include_schwab)
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(query, params).fetchall()

@@ -23,6 +23,7 @@ from sqlalchemy.engine import Engine
 
 from ingestion.market_calendar import is_market_open
 from store.availability import unavailable
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 SPOT_CONTRACT = "spy_receipt_chain_batch_quote_day_pit_v6"
 _EQUITY_TZ = ZoneInfo("America/New_York")
@@ -235,12 +236,12 @@ def _gather_positioning_data(engine: Engine) -> dict[str, Any]:
     # ── Top ticker options signals ───────────────────────────────────
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_skew, iv_atm, "
                 "       total_oi, spot_price "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE signal_date = ("
-                "  SELECT MAX(signal_date) FROM options_daily_signals"
+                "  SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest"
                 ") "
                 "ORDER BY total_oi DESC "
                 "LIMIT 10"

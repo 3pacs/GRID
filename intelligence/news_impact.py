@@ -31,6 +31,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -485,8 +486,8 @@ class PriceDecomposer:
             with self.engine.connect() as conn:
                 # Try options_daily_signals first
                 rows = conn.execute(
-                    text(
-                        "SELECT obs_date, close_price FROM options_daily_signals "
+                    visible_sql(
+                        "SELECT obs_date, close_price FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                         "WHERE ticker = :t AND obs_date > CURRENT_DATE - :d "
                         "ORDER BY obs_date ASC"
                     ),
@@ -527,8 +528,8 @@ class PriceDecomposer:
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(
-                    text(
-                        "SELECT obs_date, close_price FROM options_daily_signals "
+                    visible_sql(
+                        "SELECT obs_date, close_price FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                         "WHERE ticker = :t AND obs_date BETWEEN :s AND :d "
                         "ORDER BY obs_date ASC"
                     ),

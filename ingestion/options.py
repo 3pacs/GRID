@@ -34,6 +34,7 @@ from sqlalchemy.pool import NullPool
 from ingestion.base import BasePuller
 from ingestion.market_calendar import is_market_open
 from store.options_iv import CALL_WING, PUT_WING, fixed_moneyness_wings
+from store.options_provenance import provider_is_schwab
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -1496,19 +1497,28 @@ class OptionsPuller(BasePuller):
                     },
                 )
 
-                # Push to resolved_series for PIT access
-                resolved_inserted = self._push_to_resolved(conn, ticker, today_str, {
-                    "pcr": ("sentiment", f"{ticker} Put/Call Ratio", put_call_ratio),
-                    "max_pain": ("sentiment", f"{ticker} Max Pain Strike", max_pain),
-                    "iv_skew": ("vol", f"{ticker} IV Skew (OTM/ATM)", iv_skew),
-                    "total_oi": ("sentiment", f"{ticker} Total Open Interest", total_oi),
-                    "opt_vol": ("sentiment", f"{ticker} Total Options Volume", total_volume),
-                    "iv_atm": ("vol", f"{ticker} ATM Implied Volatility", iv_atm),
-                    PUT_WING: ("vol", f"{ticker} Put IV proxy: 87-93% spot mean v1", wings[PUT_WING]),
-                    CALL_WING: ("vol", f"{ticker} Call IV proxy: 107-113% spot mean v1", wings[CALL_WING]),
-                    "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
-                    "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                }, should_continue=should_continue, wing_metadata=wings["wing_iv_metadata"])
+                # Push to resolved_series for PIT access. Not for a Schwab
+                # capture: resolved_series feeds every point-in-time reader
+                # (feature matrices, models, chat context, contributor routes)
+                # and has no per-viewer filter, while Schwab data is the
+                # owner's alone (store/options_provenance.py). The batch, its
+                # contracts and the daily signals above stay, for admin reads.
+                if provider_is_schwab(spot_provider, quote.get("clockMetadata")):
+                    log.info("{t}: Schwab capture kept out of resolved_series", t=ticker)
+                    resolved_inserted = 0
+                else:
+                    resolved_inserted = self._push_to_resolved(conn, ticker, today_str, {
+                        "pcr": ("sentiment", f"{ticker} Put/Call Ratio", put_call_ratio),
+                        "max_pain": ("sentiment", f"{ticker} Max Pain Strike", max_pain),
+                        "iv_skew": ("vol", f"{ticker} IV Skew (OTM/ATM)", iv_skew),
+                        "total_oi": ("sentiment", f"{ticker} Total Open Interest", total_oi),
+                        "opt_vol": ("sentiment", f"{ticker} Total Options Volume", total_volume),
+                        "iv_atm": ("vol", f"{ticker} ATM Implied Volatility", iv_atm),
+                        PUT_WING: ("vol", f"{ticker} Put IV proxy: 87-93% spot mean v1", wings[PUT_WING]),
+                        CALL_WING: ("vol", f"{ticker} Call IV proxy: 107-113% spot mean v1", wings[CALL_WING]),
+                        "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
+                        "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
+                    }, should_continue=should_continue, wing_metadata=wings["wing_iv_metadata"])
                 _check_budget(should_continue)
                 signals_written = _affected_rows(signal_write)
                 rows_inserted = (

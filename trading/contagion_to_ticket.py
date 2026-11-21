@@ -52,6 +52,7 @@ from trading.options_recommender import (
     pick_expiry,
     pick_strike,
 )
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 # ── Contagion-specific tunables ────────────────────────────────────────────
 
@@ -160,11 +161,11 @@ def _load_options_signal(engine: Engine, ticker: str) -> dict[str, Any] | None:
     """Latest row from ``options_daily_signals`` for a ticker."""
     with engine.connect() as conn:
         row = conn.execute(
-            text(
+            visible_sql(
                 """
                 SELECT ticker, signal_date, put_call_ratio, max_pain,
                        iv_skew, spot_price, iv_atm, near_expiry
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE LOWER(ticker) = LOWER(:t)
                 ORDER BY signal_date DESC
                 LIMIT 1

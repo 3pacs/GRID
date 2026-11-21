@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from loguru import logger as log
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, viewer_is_admin
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from api.dependencies import get_db_engine
 from api.schemas.watchlist import WatchlistItemCreate
 from api.routers.watchlist_helpers import (
@@ -341,6 +342,7 @@ def get_portfolio(
 def list_watchlist_enriched(
     limit: int = Query(default=20, ge=1, le=50),
     _token: str = Depends(require_auth),
+    include_schwab: bool = Depends(viewer_is_admin),
 ) -> dict:
     """Return watchlist items enriched with sector context, options, z-scores, and insight.
 
@@ -393,11 +395,12 @@ def list_watchlist_enriched(
     opts_map: dict[str, dict] = {}
     try:
         with engine.connect() as conn:
-            opts = conn.execute(text(
+            opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price "
-                "FROM options_daily_signals "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM options_daily_signals) "
-                "AND ticker = ANY(:tickers)"
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest) "
+                "AND ticker = ANY(:tickers)",
+                include_schwab,
             ), {"tickers": tickers}).fetchall()
             for o in opts:
                 opts_map[o[0]] = {"pcr": o[1], "iv": o[2], "max_pain": o[3], "spot": o[4]}

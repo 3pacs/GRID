@@ -204,7 +204,9 @@ def api_engine(batch=None):
         result = MagicMock()
         if "MAX(snap_date)" in sql:
             result.fetchone.return_value = (day,)
-        elif "FROM options_capture_batches" in sql:
+        elif sql.lstrip().startswith("SELECT capture_batch_id, spot_price"):
+            # The batch header read (every options read also names
+            # options_capture_batches in its Schwab-provenance subquery).
             result.fetchone.return_value = batch
         else:
             assert "capture_batch_id = :batch" in sql and params["batch"] == "batch-1"

@@ -16,6 +16,7 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
@@ -165,11 +166,11 @@ def _compute_sectors_payload() -> dict[str, Any]:
     opts_map: dict[str, dict] = {}
     try:
         with engine.connect() as conn:
-            opts = conn.execute(text(
+            opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price, total_oi "
-                "FROM options_daily_signals "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM options_daily_signals)"
-            )).fetchall()
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest)"
+            )).fetchall()  # cached for every viewer: never a Schwab day
             for o in opts:
                 opts_map[o[0]] = {
                     "pcr": o[1], "iv": o[2], "max_pain": o[3],
@@ -669,11 +670,11 @@ def get_sector_detail(
     opts_map: dict[str, dict] = {}
     try:
         with engine.connect() as conn:
-            opts = conn.execute(text(
+            opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price, total_oi "
-                "FROM options_daily_signals "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM options_daily_signals)"
-            )).fetchall()
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest)"
+            )).fetchall()  # cached for every viewer: never a Schwab day
             for o in opts:
                 opts_map[o[0]] = {
                     "pcr": o[1], "iv": o[2], "max_pain": o[3],
@@ -1843,11 +1844,11 @@ def get_sankey_data(
     opts_map: dict[str, dict] = {}
     try:
         with engine.connect() as conn:
-            opts = conn.execute(text(
+            opts = conn.execute(visible_sql(
                 "SELECT ticker, put_call_ratio, iv_atm, max_pain, spot_price "
-                "FROM options_daily_signals "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM options_daily_signals)"
-            )).fetchall()
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                "WHERE signal_date = (SELECT MAX(signal_date) FROM " + VISIBLE_DAILY_SIGNALS + " ods_latest)"
+            )).fetchall()  # cached for every viewer: never a Schwab day
             for o in opts:
                 opts_map[o[0]] = {"pcr": o[1], "iv": o[2], "max_pain": o[3], "spot": o[4]}
     except Exception as exc:

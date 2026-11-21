@@ -52,6 +52,7 @@ from sqlalchemy.engine import Engine
 
 from analysis.sec_valuation import trailing_pe
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Constants ───────────────────────────────────────────────────────────
@@ -231,9 +232,9 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
     """
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(
+            row = conn.execute(visible_sql(
                 "SELECT put_call_ratio, spot_price, signal_date "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE ticker = 'SPY' AND put_call_ratio IS NOT NULL "
                 "ORDER BY signal_date DESC LIMIT 1"
             )).fetchone()
@@ -300,9 +301,9 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
     """
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(
+            row = conn.execute(visible_sql(
                 "SELECT max_pain, spot_price, signal_date "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0 "
                 "ORDER BY signal_date DESC LIMIT 1"
             )).fetchone()

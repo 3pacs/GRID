@@ -51,6 +51,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Global Central Banks Registry ─────────────────────────────────────
@@ -465,8 +466,8 @@ def _get_put_call_ratio(engine: Engine, ticker: str) -> str | None:
     """Get the current GEX regime for a ticker from options_daily_signals."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT put_call_ratio FROM options_daily_signals
+            row = conn.execute(visible_sql("""
+                SELECT put_call_ratio FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()
@@ -558,8 +559,8 @@ def _get_whale_flow(engine: Engine, ticker: str) -> str | None:
     """Infer whale flow from options daily signals (put/call ratio)."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT pcr, total_volume FROM options_daily_signals
+            row = conn.execute(visible_sql("""
+                SELECT pcr, total_volume FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()

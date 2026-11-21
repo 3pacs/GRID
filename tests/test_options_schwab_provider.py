@@ -448,6 +448,22 @@ def test_pull_ticker_publishes_a_schwab_batch(monkeypatch: pytest.MonkeyPatch) -
     assert db.signals
 
 
+def test_a_schwab_capture_is_never_written_to_resolved_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    # resolved_series feeds every point-in-time reader with no viewer filter
+    # (store/options_provenance.py), so the batch and signals are kept for
+    # admin reads but the options features are not pushed.
+    puller = _puller(monkeypatch)
+    pushed: list[Any] = []
+    monkeypatch.setattr(puller, "_push_to_resolved", lambda *a, **_k: pushed.append(a) or 0)
+    puller._yahoo, _market, _sleeps = _client(_body(), max_expirations=2)
+
+    result = puller._pull_ticker("KO", "2026-11-05")
+
+    assert result["status"] == "SUCCESS", result
+    assert puller.engine.batches and puller.engine.signals
+    assert pushed == []
+
+
 def test_previous_session_underlying_trade_is_refused_as_undated(monkeypatch: pytest.MonkeyPatch) -> None:
     puller = _puller(monkeypatch)
     body = _body()
