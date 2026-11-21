@@ -18,6 +18,8 @@ from __future__ import annotations
 import math
 from typing import Iterable
 
+from ingestion.av_transcript_plan import AV_TRANSCRIPT_NOT_SUPERSEDED_SQL
+
 import numpy as np
 
 
@@ -397,6 +399,9 @@ def earnings_proximity_gems(cur) -> list[dict]:
     # computed downstream in Python because ticker_metrics_daily only stores
     # close (no high/low) — we approximate ATR(20) via average abs daily
     # close-to-close change over the prior 20 trading rows.
+    # Superseded pre-#1051 AV transcript rows (same fiscal quarter as a
+    # verified row, filing_date = a calendar-approximated, possibly future
+    # period end) must not set has_call or MAX(filing_date).
     cur.execute(
         """
         WITH recent_filings AS (
@@ -409,9 +414,10 @@ def earnings_proximity_gems(cur) -> list[dict]:
                    array_agg(DISTINCT url) FILTER (WHERE url IS NOT NULL) AS urls,
                    array_agg(DISTINCT accession) FILTER (WHERE accession IS NOT NULL) AS accessions,
                    MAX(confidence) AS max_conf
-              FROM earnings_events
+              FROM earnings_events e
              WHERE filing_date > CURRENT_DATE - INTERVAL '7 days'
                AND ticker IS NOT NULL
+        """ + AV_TRANSCRIPT_NOT_SUPERSEDED_SQL + """
              GROUP BY ticker
         ),
         insider_window AS (

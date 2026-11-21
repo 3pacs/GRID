@@ -36,6 +36,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
+from ingestion.av_transcript_plan import AV_TRANSCRIPT_NOT_SUPERSEDED_SQL
+
 # ---------------------------------------------------------------------------
 # Ticker extraction
 # ---------------------------------------------------------------------------
@@ -387,12 +389,14 @@ def _score_filings(cur, ticker: str, start, end) -> tuple[float, dict]:
       * +0.2 if EARNINGS_CALL with sentiment magnitude > 0.5
       * cap at 1.0
     """
+    # A superseded pre-#1051 AV transcript row is the same call as its
+    # verified twin: counting both doubles n_call (ingestion/av_transcript_plan.py).
     cur.execute(
-        """SELECT event_type, raw_payload, sentiment, confidence
-             FROM earnings_events
-            WHERE upper(ticker) = upper(%s)
-              AND filing_date >= %s
-              AND filing_date <= %s""",
+        """SELECT e.event_type, e.raw_payload, e.sentiment, e.confidence
+             FROM earnings_events e
+            WHERE upper(e.ticker) = upper(%s)
+              AND e.filing_date >= %s
+              AND e.filing_date <= %s""" + AV_TRANSCRIPT_NOT_SUPERSEDED_SQL,
         (ticker, start.date(), end.date()),
     )
     rows = cur.fetchall() or []
