@@ -54,7 +54,12 @@ def _by(result: dict[str, Any], expiry: str, opt_type: str, strike: float) -> di
 
 def test_time_runs_from_this_close_to_the_expiry_close() -> None:
     result = g.chain_greeks(_chain(("2026-11-20", "2026-12-18")), RATE)
-    assert result["as_of"] == "2026-11-19T21:00:00Z"
+    assert result["quotes_at"] == "2026-11-19T21:00:00Z" and "as_of" not in result
+    assert result["known_at"] is None   # this chain carries no fetch clock
+    parts = {"oi": {"status": "ok", "known_at": "2026-11-20T11:40:02Z"},
+             "close": {"status": "ok", "known_at": "2026-11-21T10:03:47Z"},
+             "bars": {"status": "error", "known_at": None}}
+    assert g.chain_greeks({**_chain(), "parts": parts}, RATE)["known_at"] == "2026-11-21T10:03:47Z"
     assert result["expiries"]["2026-11-20"]["t_years"] == pytest.approx(1.0 / 365.0)
     assert result["expiries"]["2026-12-18"]["t_years"] == pytest.approx(29.0 / 365.0)
     # 2026-11-27 closes at 13:00 New York: three hours less than a full day count.

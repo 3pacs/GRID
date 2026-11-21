@@ -48,7 +48,10 @@ clock, not ``day``.
 Spend: every request is priced first with the free ``metadata.get_cost``. The
 run's running total of estimates may not pass ``--cap-usd`` (default 0.00, so
 free data only); a priced part is logged ``priced`` and never fetched, so a
-lapsed plan fails closed. A part whose window Databento does not serve yet is
+lapsed plan fails closed. The cap must be a finite amount from 0 to
+:data:`HARD_CAP_USD`, a ceiling fixed in code that no command-line value can
+pass. A price that is not a finite, non-negative number is an error and the
+part is not fetched. A part whose window Databento does not serve yet is
 left for a later run. ``ok`` and ``no_data`` parts are never fetched again.
 
 Store: one SQLite file (``OPTIONS_EOD_STORE``/chains.db, directory 0700). The
@@ -96,6 +99,12 @@ DEFAULT_LOOKBACK_SESSIONS = 5
 REQUEST_TIMEOUT_SECONDS = 300
 RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 4
+# No run may estimate more than this, whatever --cap-usd says. Raising it is a code change.
+HARD_CAP_USD = 5.0
+NO_INSTRUMENTS = "no instruments for the root"
+# One part's failure never stops the rest: transport errors (a stream cut mid-body is a
+# ChunkedEncodingError), a body that is not the expected JSON or CSV, a missing field.
+PART_ERRORS: tuple[type[Exception], ...] = (requests.RequestException, ValueError, KeyError, csv.Error)
 
 DDL = """
 create table if not exists contracts (
@@ -290,7 +299,8 @@ class DatabentoHistorical:
                     )
             except requests.RequestException as exc:
                 problem = f"network ({type(exc).__name__})"
-                self._sleep(10.0 * (attempt + 1))
+                if attempt + 1 < MAX_ATTEMPTS:
+                    self._sleep(10.0 * (attempt + 1))
                 continue
             if resp.status_code == 200:
                 return resp
@@ -389,6 +399,9 @@ def capture(api: Any, con: sqlite3.Connection, tickers: Iterable[str], days: Ite
 
     One failed part never stops the rest; it is logged ``error`` and stays retryable.
     """
+    if (isinstance(cap_usd, bool) or not isinstance(cap_usd, (int, float)) or not math.isfinite(cap_usd)
+            or not 0 <= cap_usd <= HARD_CAP_USD):
+        raise ValueError(f"cap_usd must be a finite amount from 0 to {HARD_CAP_USD:.2f}")
     done = {(d, r, p) for d, r, p, s in con.execute("select day, root, part, status from fetch_log") if s in FINAL}
     summary: collections.Counter[str] = collections.Counter()
     spent = 0.0
@@ -405,6 +418,9 @@ def capture(api: Any, con: sqlite3.Connection, tickers: Iterable[str], days: Ite
                         summary["pending"] += 1   # not served yet; a later run picks it up
                         continue
                     cost = api.cost(schema, root, start, end)
+                    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
+                        # NaN compares False against any cap and a negative price would lower the total.
+                        raise ValueError("price estimate is not a finite, non-negative number")
                     if spent + cost > cap_usd + 1e-12:
                         summary["priced"] += 1
                         out(f"{day_text} {root} {part} priced ${cost:.4f} (cap ${cap_usd:.2f}): not fetched")
@@ -431,15 +447,25 @@ def capture(api: Any, con: sqlite3.Connection, tickers: Iterable[str], days: Ite
                         # A served day with no listed instruments for the root: final, like no rows.
                         if fetch:
                             with con:
-                                _log(con, day_text, root, part, "no_data", detail="no instruments for the root", now=now)
+                                _log(con, day_text, root, part, "no_data", detail=NO_INSTRUMENTS, now=now)
                         summary["no_data"] += 1
+                        out(f"{day_text} {root} {part} no_data ({NO_INSTRUMENTS}; not fetched again)")
                         continue
-                    summary["error"] += 1
-                    log.warning("options EOD {d} {r} {p}: {e}", d=day_text, r=root, p=part, e=str(exc))
-                    if fetch:
-                        with con:
-                            _log(con, day_text, root, part, "error", detail=str(exc)[:200], now=now)
+                    _part_failed(con, summary, day_text, root, part, str(exc), fetch, now)
+                except PART_ERRORS as exc:
+                    # The exception text can quote a URL or a body, so only its type is kept.
+                    _part_failed(con, summary, day_text, root, part, type(exc).__name__, fetch, now)
     return {"counts": dict(summary), "estimated_usd": round(spent, 4), "cap_usd": cap_usd}
+
+
+def _part_failed(con: sqlite3.Connection, summary: collections.Counter[str], day: str, root: str, part: str,
+                 what: str, fetch: bool, now: Callable[[], datetime]) -> None:
+    """Record one part's failure as ``error`` (retried by a later run) and carry on."""
+    summary["error"] += 1
+    log.warning("options EOD {d} {r} {p}: {e}", d=day, r=root, p=part, e=what)
+    if fetch:
+        with con:
+            _log(con, day, root, part, "error", detail=what[:200], now=now)
 
 
 def read_chain(con: sqlite3.Connection, day: date, ticker: str) -> dict[str, Any]:
@@ -459,7 +485,7 @@ def read_chain(con: sqlite3.Connection, day: date, ticker: str) -> dict[str, Any
     return {"ticker": ticker, "day": day_text, "provider": "databento", "dataset": DATASET,
             "audience": "private", "parts": parts, "contracts": contracts,
             "oi_basis": "OCC open interest published the morning of the session (the prior close)",
-            "implied_vol": "not supplied by the source and not computed"}
+            "implied_vol": "not stored; derived at read by analysis.options_eod_greeks.chain_greeks"}
 
 
 def status(con: sqlite3.Connection) -> dict[str, Any]:
@@ -468,7 +494,23 @@ def status(con: sqlite3.Connection) -> dict[str, Any]:
     first, last, days = con.execute(
         "select min(day), max(day), count(distinct day) from fetch_log where status = 'ok'").fetchone()
     contracts = con.execute("select count(*) from contracts").fetchone()[0]
-    return {"parts": by_status, "first_day": first, "last_day": last, "days": days, "contracts": contracts}
+    # Final without a fetch: Databento listed no instrument for the root that day. Shown so a
+    # wrong root (never refetched) is visible rather than counted among ordinary empty parts.
+    no_instruments = [f"{day} {root} {part}" for day, root, part in con.execute(
+        "select day, root, part from fetch_log where status = 'no_data' and detail = ? order by 1, 2, 3",
+        (NO_INSTRUMENTS,))]
+    return {"parts": by_status, "first_day": first, "last_day": last, "days": days, "contracts": contracts,
+            "no_instruments": no_instruments}
+
+
+def _cap_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a number") from None
+    if not math.isfinite(value) or not 0 <= value <= HARD_CAP_USD:
+        raise argparse.ArgumentTypeError(f"must be a finite amount from 0 to {HARD_CAP_USD:.2f}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -477,7 +519,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--day", type=date.fromisoformat, help="one session day")
     parser.add_argument("--since", type=date.fromisoformat, help="every session from this day to yesterday")
     parser.add_argument("--tickers", help="comma-separated; default is the hand-listed core")
-    parser.add_argument("--cap-usd", type=float, default=0.0)
+    parser.add_argument("--cap-usd", type=_cap_arg, default=0.0,
+                        help=f"most this run may estimate; 0 to {HARD_CAP_USD:.2f} (a ceiling fixed in code)")
     parser.add_argument("--store")
     args = parser.parse_args(argv)
 

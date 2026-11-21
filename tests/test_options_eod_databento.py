@@ -175,7 +175,7 @@ def test_free_day_is_stored_once_and_read_back_with_its_clocks(tmp_path: Path) -
          "quote_ts": "2026-11-20T20:59:40.000000000Z", "last_price": None, "last_ts": None, "volume": None},
     ]
     assert chain["provider"] == "databento" and chain["audience"] == "private"
-    assert "not computed" in chain["implied_vol"]
+    assert "derived at read" in chain["implied_vol"]
     detail = con.execute("select detail from fetch_log where part = 'oi'").fetchone()[0]
     assert detail == "1 contract(s) with differing values"
 
@@ -183,7 +183,7 @@ def test_free_day_is_stored_once_and_read_back_with_its_clocks(tmp_path: Path) -
     result, _con, _lines = _run(again, tmp_path)
     assert result["counts"] == {"already": 3} and again.priced == [] and again.fetched == []
     assert eod.status(con) == {"parts": {"bars:ok": 1, "close:ok": 1, "oi:ok": 1}, "first_day": "2026-11-20",
-                               "last_day": "2026-11-20", "days": 1, "contracts": 2}
+                               "last_day": "2026-11-20", "days": 1, "contracts": 2, "no_instruments": []}
 
 
 def test_a_priced_part_is_never_fetched_and_is_retried_later(tmp_path: Path) -> None:
@@ -226,9 +226,11 @@ def test_a_window_databento_does_not_serve_yet_is_left_for_a_later_run(tmp_path:
 def test_no_rows_and_no_instruments_are_final_and_an_error_is_retryable(tmp_path: Path) -> None:
     api = _Api(rows={"statistics": [], "cbbo-1m": eod.DatabentoError(422, "symbology_invalid_request"),
                      "ohlcv-1d": eod.DatabentoError(503, "error")})
-    result, con, _lines = _run(api, tmp_path)
+    result, con, lines = _run(api, tmp_path)
     assert result["counts"] == {"no_data": 2, "error": 1}
     assert dict(con.execute("select part, status from fetch_log")) == {"oi": "no_data", "close": "no_data", "bars": "error"}
+    assert "2026-11-20 KO close no_data (no instruments for the root; not fetched again)" in lines
+    assert eod.status(con)["no_instruments"] == ["2026-11-20 KO close"]   # the empty oi part is not listed
 
     retry = _Api()
     assert _run(retry, tmp_path)[0]["counts"] == {"already": 2, "ok": 1}
@@ -343,7 +345,7 @@ def test_client_retries_gateway_errors_then_reports_a_code_without_the_body() ->
     client, _session, sleeps = _client(*[requests.ConnectionError("boom")] * 4)
     with pytest.raises(eod.DatabentoError, match="network"):
         client.cost("statistics", "KO", start, end)
-    assert len(sleeps) == 4
+    assert sleeps == [10.0, 20.0, 30.0]   # no wait after the last attempt
 
 
 # ── key file and command line ────────────────────────────────────────────
@@ -384,3 +386,78 @@ def test_command_line_runs_a_capture_into_the_given_store(tmp_path: Path, capsys
     assert len(eod.read_chain(eod.open_store(tmp_path), DAY, "KO")["contracts"]) == 2
     monkeypatch.setattr(eod, "DatabentoHistorical", lambda _key: _Api(costs={"statistics": 1.0}))
     assert eod.main(["run", "--store", str(tmp_path), "--day", "2026-11-19", "--tickers", "KO"]) == 1  # a priced part
+
+
+# ── spend cap and per-part failures (review of 663ba264) ─────────────────
+
+
+@pytest.mark.parametrize("cap", [float("nan"), float("inf"), -0.01, 5.01, 1e9, True, "1", None])
+def test_cap_must_be_finite_and_inside_the_hard_ceiling(tmp_path: Path, cap: Any) -> None:
+    api = _Api()
+    with pytest.raises(ValueError, match="cap_usd must be a finite amount from 0 to 5.00"):
+        eod.capture(api, eod.open_store(tmp_path), ["KO"], [DAY], cap_usd=cap, out=lambda _line: None)
+    assert api.priced == [] and api.fetched == []
+
+
+def test_the_hard_ceiling_itself_is_allowed(tmp_path: Path) -> None:
+    api = _Api(costs={"statistics": 2.0, "cbbo-1m": 2.0, "ohlcv-1d": 2.0})
+    result, _con, _lines = _run(api, tmp_path, cap_usd=eod.HARD_CAP_USD)
+    assert result["counts"] == {"ok": 2, "priced": 1} and result["estimated_usd"] == 4.0
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf"), -1.0, None, "0", True])
+def test_an_unusable_price_is_an_error_and_nothing_is_fetched(tmp_path: Path, cost: Any) -> None:
+    api = _Api(costs={"cbbo-1m": cost})
+    result, con, _lines = _run(api, tmp_path, cap_usd=5.0)
+    assert result["counts"] == {"ok": 2, "error": 1} and result["estimated_usd"] == 0.0
+    assert [f[0] for f in api.fetched] == ["statistics", "ohlcv-1d"]
+    assert con.execute("select status, detail from fetch_log where part = 'close'").fetchone() == ("error", "ValueError")
+
+
+def _cut_mid_stream() -> Any:
+    yield _close()[0]
+    raise requests.exceptions.ChunkedEncodingError("https://example.invalid/?key=synthetic-key connection broken")
+
+
+@pytest.mark.parametrize(("failure", "kind"), [
+    (_cut_mid_stream, "ChunkedEncodingError"),
+    (lambda: (_ for _ in ()).throw(eod.csv.Error("line contains NUL")), "Error"),
+    (lambda: (_ for _ in ()).throw(KeyError("symbol")), "KeyError"),
+    (lambda: (_ for _ in ()).throw(ValueError("not JSON")), "ValueError"),
+], ids=["stream-cut", "csv", "missing-field", "bad-body"])
+def test_one_broken_part_is_logged_and_the_rest_of_the_run_continues(tmp_path: Path, failure: Any, kind: str) -> None:
+    class _Broken(_Api):
+        def rows(self, schema: str, root: str, start: datetime, end: datetime) -> Any:
+            if (schema, root) == ("cbbo-1m", "KO"):
+                self.fetched.append((schema, root, start, end))
+                return failure()
+            return super().rows(schema, root, start, end)
+
+    api = _Broken(rows={"statistics": _oi("PEP"), "cbbo-1m": _close("PEP"), "ohlcv-1d": _bars("PEP")})
+    result, con, _lines = _run(api, tmp_path, tickers=["KO", "PEP"])
+
+    assert result["counts"]["error"] == 1 and result["counts"]["ok"] == 3   # all of PEP still captured
+    status, detail = con.execute("select status, detail from fetch_log where root = 'KO' and part = 'close'").fetchone()
+    assert (status, detail) == ("error", kind) and "synthetic-key" not in detail
+    # Nothing from the half-read part was stored: the write happens only after the whole part parses.
+    assert con.execute("select count(*) from contracts where root = 'KO' and bid is not null").fetchone()[0] == 0
+    assert len(eod.read_chain(con, DAY, "PEP")["contracts"]) == 2
+
+
+def test_a_malformed_range_answer_fails_parts_not_the_run(tmp_path: Path) -> None:
+    class _NoRange(_Api):
+        def dataset_end(self, _schema: str) -> datetime:
+            raise KeyError("end")
+
+    result, con, _lines = _run(_NoRange(), tmp_path)
+    assert result["counts"] == {"error": 3}
+    assert {d for (d,) in con.execute("select detail from fetch_log")} == {"KeyError"}
+
+
+@pytest.mark.parametrize("cap", ["nan", "inf", "-1", "5.01", "ten"])
+def test_command_line_refuses_a_cap_outside_the_ceiling(tmp_path: Path, capsys, monkeypatch, cap: str) -> None:
+    monkeypatch.setattr(eod, "load_key", lambda: pytest.fail("no key is read for a refused cap"))
+    with pytest.raises(SystemExit) as stopped:
+        eod.main(["run", "--store", str(tmp_path), "--day", "2026-11-20", f"--cap-usd={cap}"])
+    assert stopped.value.code == 2
+    assert "--cap-usd" in capsys.readouterr().err

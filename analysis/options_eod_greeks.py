@@ -24,6 +24,10 @@ Method (fixed here; a change is a new method name):
 * **Greeks.** The repository's closed forms (``physics.greeks.black_scholes``)
   at ``S*``: delta and gamma are per $1 of ``S*``, vega per one volatility
   point, theta per calendar day.
+* **Clocks.** ``quotes_at`` is the session close the quotes describe.
+  ``known_at`` is the latest fetch time of the chain's parts, i.e. when GRID
+  could first have computed this; it is None when the chain carries no fetch
+  log. A point-in-time reader must use ``known_at``.
 * **Time.** ``T`` runs from the session's cash close (the minute the quotes
   were taken) to the cash close of the expiry date, in calendar years of 365
   days. A contract expiring at this close has no time left and gets no value.
@@ -111,7 +115,9 @@ def chain_greeks(chain: dict[str, Any], rate: float) -> dict[str, Any]:
     if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or not -0.05 <= rate <= 0.25:
         raise ValueError("rate must be an annual decimal between -0.05 and 0.25")
     day = date.fromisoformat(chain["day"])
-    as_of = _close_utc(day)
+    as_of = _close_utc(day)   # when the quotes were taken; not when GRID knew them
+    known = [str(part["known_at"]) for part in (chain.get("parts") or {}).values()
+             if isinstance(part, dict) and part.get("known_at")]
 
     by_expiry: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for contract in chain.get("contracts", []):
@@ -176,7 +182,10 @@ def chain_greeks(chain: dict[str, Any], rate: float) -> dict[str, Any]:
     return {
         "ticker": chain.get("ticker"), "day": chain["day"], "provider": chain.get("provider"),
         "audience": chain.get("audience"), "parts": chain.get("parts"),
-        "method": METHOD, "rate": float(rate), "as_of": as_of.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "method": METHOD, "rate": float(rate),
+        # Two clocks, never one: the minute the quotes describe, and the latest fetch of any part
+        # (the archive's known-at clock). A point-in-time reader uses known_at.
+        "quotes_at": as_of.strftime("%Y-%m-%dT%H:%M:%SZ"), "known_at": max(known) if known else None,
         "units": {"delta": "per $1 of the dividend-adjusted spot", "gamma": "per $1 of the dividend-adjusted spot",
                   "vega": "per one volatility point", "theta": "per calendar day", "implied_vol": "annual decimal"},
         "limits": list(LIMITS), "expiries": expiries, "contracts": out,
