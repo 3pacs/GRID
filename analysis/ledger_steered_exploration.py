@@ -2429,7 +2429,8 @@ def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anch
     Nothing is taken on the caller's word. The receipt log at ``receipts`` is opened and verified against the anchor
     copy at ``external_anchors`` (:func:`analysis.desk_receipt_witness.verified_receipt`); the ``panel_trials``
     payload is read from the log, not handed in. A verdict is witnessed only when that payload, read against the
-    log's own history, holds the same slot registration and a look with the same digest, time and last day; the
+    log's own history, holds the same slot registration (row hash and time, with its contents bound by digest in
+    the receipt) and a look with the same digest, time and last day; the
     digest is recomputed from the look's exact text in the payload; and the imported verdict, n, mean, bound, alpha
     and resolved-fire count equal the stored look's. A verdict whose look the receipt does not hold stays
     unwitnessed. A verdict that names the same look and differs from it is refused, and names the fields.
@@ -2444,6 +2445,8 @@ def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anch
     if not isinstance(body, dict) or body.get("store") != "panel_trials" \
             or body.get("continuity") not in ("first_read", "extends_last_receipt"):
         raise ValueError("that receipt's panel_trials payload was not read against the receipt log's own history")
+    if not isinstance(body.get("trials"), list) or not body["trials"]:
+        raise ValueError("that receipt's panel_trials payload does not bind its registrations by content")
     slots = {x.get("trial_id"): x for x in body.get("factory_slots") or [] if isinstance(x, dict)}
     looks = {x.get("trial_id"): x for x in body.get("factory_looks") or [] if isinstance(x, dict)}
     done = {w["forward_sha256"] for w in ledger.of_kind(FACTORY_FORWARD_WITNESS)}
@@ -2453,6 +2456,11 @@ def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anch
         held, look = slots.get(slot["trial_id"]), looks.get(slot["trial_id"])
         if sha in done or held is None or held.get("row_hash") != slot["row_hash"] or look is None:
             continue
+        # The registration itself, as the receipt retains it: the same row must carry the same registration time,
+        # and its contents must be bound by digest (the receipt source refuses a row whose contents later change).
+        if held.get("registered_at") != slot["registered_at"] or not _hex64(held.get("content_sha256")):
+            raise ValueError(f"the receipt retains slot {slot['trial_id']}'s registration row with another time, "
+                             "or without its content digest: the import is not that registration")
         text = look.get("result")
         if not isinstance(text, str) or sha256_bytes(text.encode("utf-8")) != look.get("result_sha256"):
             raise ValueError(f"the receipt's look for slot {slot['trial_id']} is not the text its digest names")
@@ -2467,12 +2475,12 @@ def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anch
         if differs:
             raise ValueError(f"the verdict imported for slot {slot['trial_id']} differs from the look the receipt "
                              f"retains in {differs}: the import is not that look")
-        pending.append((sha, v))
+        pending.append((sha, v, held["content_sha256"]))
     at = now_iso()
-    for sha, v in pending:
+    for sha, v, registration in pending:
         ledger._append({
             "kind": FACTORY_FORWARD_WITNESS, "run_id": v["run_id"], "trial_id": v["trial_id"], "forward_sha256": sha,
-            "look_sha256": v["look_sha256"],
+            "look_sha256": v["look_sha256"], "registration_content_sha256": registration,
             "receipt": {k: receipt[k] for k in ("session", "head_sha256", "log_records", "read_finished_at",
                                                  "payload_sha256", "external_anchor")},
             "checked": receipt["checked"], "look_recomputed": True,
