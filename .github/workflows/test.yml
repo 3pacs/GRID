@@ -280,7 +280,13 @@ jobs:
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
-        run: python -m pytest tests/test_options_provenance_pg.py -q -rA
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_options_provenance_pg.py -q -rA | tee /tmp/grid-options-provenance-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-options-provenance-pg.txt; then
+            echo "::error::Options Schwab-provenance PostgreSQL contract was skipped"
+            exit 1
+          fi
 
       # QuiverQuant gov_contracts rows the 2026-11-07 fiscal re-date could not
       # move: the SQL mirror must flag what the Python helper flags, and the
