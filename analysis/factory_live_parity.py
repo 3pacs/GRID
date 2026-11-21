@@ -36,9 +36,25 @@ the decision, when the bars that feature reads are there:
 
 This module applies that rule to the live side, so availability is judged per
 feature, and the live value it compares is the value the recorder would have
-recorded. The constants and reason strings below are the recorder's; a change
-there must be made here too. A signals database without the backstop table
-(recorded before the rule shipped) simply has no fills.
+recorded. A signals database without the backstop table simply has no fills.
+
+Applying the rule here does not show the recorder ran it. The recorder writes
+the terms it recorded under, once per session, in ``factory_gap_terms``
+(canonical JSON and its sha256: the lost-minute limit, the read bars, the
+backstop source, its settle time, its clock and the fields used). A session
+counts toward readiness only if exactly one terms row exists for that day and
+its sha256 is ``LIVE_RULE_TERMS_SHA256`` below. A database without the table,
+a day without a row, or a day with other terms is ``live_rule_not_recorded``:
+the comparison is still shown, and no feature is ready on it. The same terms
+text and sha256 are pinned in the tests of both repositories.
+
+A value that does not exist by definition is not a match. ``F1_shift30`` reads
+the bar 30 minutes before the decision, which at 10:00 is before the open:
+that row is **not applicable** and counts for nothing. Every other row needs a
+number on both sides, in tolerance; two missing values are a failure, not an
+agreement. A session is matched for a feature only if it has at least one
+applicable decision time and every applicable one matched, so a feature with
+no applicable decision time can never be ready.
 
 A feature is ``live_ready`` only when each of the most recent ``MIN_SESSIONS``
 overlapping sessions is a matched one: at every decision time both sides were
@@ -46,6 +62,12 @@ eligible and the value was in tolerance. So in those sessions no value is out
 of tolerance and the two sides never disagree about that feature's
 availability. Anything else is ``research_only`` with its reasons and the
 counts behind them.
+
+The verdict sessions are the five most recent sessions the exchange calendar
+says had closed when the report was made (its ``as_of``, read from the clock,
+not an argument). They are not the five most recent dates the two sides happen
+to share: a session that research or live lacks is ``session_missing`` and the
+feature is not ready, whether it is the newest session or one in the middle.
 
 The verdict is taken on the most recent sessions, not on every session in the
 window (version 3). In version 2 one bad session anywhere in the window kept a
@@ -64,6 +86,7 @@ and the implementation, not about any edge.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 import sys
@@ -112,6 +135,21 @@ BACKSTOP_SOURCE = "yahoo-1m"
 GAP_UNFILLED = "gap_not_backstopped"
 READ_BAR_MISSING = "feature_bar_missing"
 FEATURE_READS = {"F1": None, "F1_shift30": "bar_30_minutes_before", "F10": "todays_range", "F11": "prior_range"}
+# The terms the recorder must have recorded under, session by session (gex-signals factory_slots.GAP_TERMS).
+LIVE_RULE_TERMS = {
+    "terms": "panel-factory-gaps/1",
+    "gap_max": GAP_MAX,
+    "prior_last_bar": PRIOR_LAST_BAR,
+    "backstop_source": BACKSTOP_SOURCE,
+    "backstop_settle_s": 30,
+    "backstop_clock": "first_seen_at <= decision time",
+    "backstop_fields": ["h", "l"],
+    "feature_reads": FEATURE_READS,
+}
+LIVE_RULE_TERMS_JSON = json.dumps(LIVE_RULE_TERMS, sort_keys=True, separators=(",", ":"))
+LIVE_RULE_TERMS_SHA256 = hashlib.sha256(LIVE_RULE_TERMS_JSON.encode()).hexdigest()
+RULE_NOT_RECORDED = "live_rule_not_recorded"
+SESSION_MISSING = "session_missing"       # an expected recent session is absent from research, from live, or from both
 
 Bars = dict[str, dict[str, tuple]]
 Backstop = dict[str, dict[str, tuple]]   # {day: {hm: ((o, h, l, c, v), first seen, aware datetime)}}
@@ -197,6 +235,34 @@ def load_backstop(db: Path, symbol: str, first: str, last: str) -> Backstop | No
     return out
 
 
+def load_rule_terms(db: Path, first: str, last: str) -> dict[str, list[str]] | None:
+    """{day: [sha256 of each set of lost-minute terms the recorder recorded under that day]}; None without the table."""
+    con = _connect(db)
+    try:
+        if not con.execute("select 1 from sqlite_master where type = 'table' and name = 'factory_gap_terms'").fetchone():
+            return None
+        rows = con.execute("select day, sha256, terms from factory_gap_terms where day between ? and ? order by day, sha256",
+                           (first, last)).fetchall()
+    finally:
+        con.close()
+    out: dict[str, list[str]] = {}
+    for day, sha, terms in rows:
+        # A row whose text is not its own sha256 is not evidence of anything: it is kept, under a name that cannot match.
+        honest = hashlib.sha256(terms.encode()).hexdigest() == sha
+        out.setdefault(day, []).append(sha if honest else f"corrupt:{sha}")
+    return out
+
+
+def recorded_under_the_rule(rule_days: dict[str, list[str]] | None, day: str) -> bool:
+    """True only when the recorder wrote exactly these terms, and no others, for that session."""
+    return rule_days is not None and rule_days.get(day) == [LIVE_RULE_TERMS_SHA256]
+
+
+def structurally_undefined(feature: str, decision: str) -> bool:
+    """True where the feature has no value by definition: the bar 30 minutes before the decision is before the open."""
+    return FEATURE_READS[feature] == "bar_30_minutes_before" and _minutes(decision) - 31 < OPEN_MIN
+
+
 # ── the session calendar ────────────────────────────────────────────────────
 
 
@@ -212,6 +278,41 @@ def close_minute(day: str) -> int | None:
 def expected_minutes(day: str) -> frozenset[str]:
     close = close_minute(day)
     return frozenset() if close is None else frozenset(_hm(i) for i in range(OPEN_MIN, close))
+
+
+def _clock() -> datetime:
+    """The one clock read. A report's as-of time is the time it was made; it is not an argument."""
+    return datetime.now(NY)
+
+
+def session_closes(day: str) -> datetime | None:
+    close = close_minute(day)
+    if close is None:
+        return None
+    return datetime.fromisoformat(f"{day}T{close // 60:02d}:{close % 60:02d}:00").replace(tzinfo=NY)
+
+
+def expected_recent_sessions(as_of: datetime, n: int = MIN_SESSIONS) -> list[str]:
+    """The ``n`` most recent exchange sessions that had closed by ``as_of``, oldest first."""
+    d = as_of.astimezone(NY).date()
+    out: list[str] = []
+    for _ in range(n * 7 + 14):               # more than enough calendar days for n sessions
+        closes = session_closes(d.isoformat())
+        if closes is not None and closes <= as_of:
+            out.append(d.isoformat())
+            if len(out) == n:
+                break
+        d -= timedelta(days=1)
+    return sorted(out)
+
+
+def expected_sessions_between(first: str, last: str) -> list[str]:
+    d, end, out = date.fromisoformat(first), date.fromisoformat(last), []
+    while d <= end:
+        if is_market_open(d):
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
 
 
 def previous_session(day: str) -> str:
@@ -405,19 +506,27 @@ def feature_values(bars: Bars, day: str, decision: str) -> dict[str, float | Non
 
 
 def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str],
-            backstop: Backstop | None = None) -> dict:
+            backstop: Backstop | None, rule_days: dict[str, list[str]] | None, verdict_sessions: list[str]) -> dict:
     """Availability agreement and value differences on the sessions both sides hold.
 
     Research is judged by the research rule, live by the live recorder's rule, feature by feature. The live value
     compared is the one the recorder would have recorded. On a session the recorder withholds as a whole, the value
     its bars alone would give is still compared, as in version 1: a wrong value there is a finding about the source.
-    A feature with no value on either side by definition (``F1_shift30`` at 10:00) agrees.
+
+    A row matches only with both sides eligible, a number on both sides, in tolerance, on a session the recorder
+    recorded under these exact terms. A row with no value by definition is not applicable and counts for nothing.
+
+    ``verdict_sessions`` are the sessions the verdict is taken on. They come from the exchange calendar and a clock
+    (``expected_recent_sessions``), never from what the two sides happen to hold: a session either side lacks is
+    missing, it is not skipped. The argument has no default, so no caller gets a verdict on the data's own dates.
     """
     days = sorted(d for d in set(research) & set(live) if close_minute(d) is not None)
     rows = []
-    per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0,
+    per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0, "matched_values": 0,
+                       "applicable": Counter(), "matched": Counter(), "no_value": 0, "no_value_by_day": Counter(),
                        "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None}
                    for f in FEATURES}
+    not_recorded = [d for d in days if not recorded_under_the_rule(rule_days, d)]
     availability_mismatch = []
     label_rows = []
     for day in days:
@@ -438,20 +547,31 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                 both_eligible = not r_why and not l_why[f]
                 diff = None if a is None or b is None else abs(a - b)
                 within = diff is not None and diff <= TOLERANCE[FEATURE_TYPE[f]]
-                undefined = a is None and b is None and both_eligible
+                applicable = not structurally_undefined(f, decision)
                 if diff is not None:
                     stat["compared"] += 1
                     stat["max_abs_diff"] = diff if stat["max_abs_diff"] is None else max(stat["max_abs_diff"], diff)
                     if not within:
                         stat["out_of_tolerance"] += 1
                         stat["out_of_tolerance_by_day"][day] += 1
-                if both_eligible and (within or undefined):
-                    stat["matched_sessions"].add(day)
+                if not applicable:
+                    matched = None                        # no value exists by definition: neither a match nor a failure,
+                    if a is not None or b is not None:    # unless a side produced one anyway
+                        stat["bad_sessions"].add(day)
                 else:
-                    stat["bad_sessions"].add(day)
+                    stat["applicable"][day] += 1
+                    stat["no_value"] += both_eligible and diff is None
+                    stat["no_value_by_day"][day] += both_eligible and diff is None
+                    matched = bool(both_eligible and within and day not in not_recorded)
+                    if matched:
+                        stat["matched"][day] += 1
+                        stat["matched_values"] += 1
+                    else:
+                        stat["bad_sessions"].add(day)
                 rows.append({"day": day, "decision": decision, "feature": f, "research": a, "live": b,
                              "abs_diff": diff, "within_tolerance": within if diff is not None else None,
                              "both_eligible": both_eligible, "live_withheld": l_why[f],
+                             "applicable": applicable, "matched": matched,
                              "backstop_minutes": [list(u) for u in l_used[f]]})
             for horizon in horizons:
                 entry, exit_bar, _ = label_bars(decision, horizon)
@@ -468,18 +588,32 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                                    "within_tolerance": None if change_diff is None
                                    else change_diff <= LABEL_TOLERANCE_DOLLARS})
     features = {}
-    recent = days[-MIN_SESSIONS:]            # the sessions the verdict is taken on
+    recent = list(verdict_sessions)          # the sessions the verdict is taken on: expected by the calendar, not by the data
+    missing = {"research": [d for d in recent if not research.get(d)], "live": [d for d in recent if not live.get(d)]}
     for f in FEATURES:
         stat = per_feature[f]
+        # A matched session has at least one applicable decision time, and a number in tolerance at every one of them.
+        stat["matched_sessions"] = {d for d, n in stat["applicable"].items() if n and stat["matched"][d] == n}
         matched = sorted(stat["matched_sessions"] - stat["bad_sessions"])
+        applicable_times = [t for t in decisions if not structurally_undefined(f, t)]
         recent_matched = [d for d in recent if d in matched]
         recent_out = sum(stat["out_of_tolerance_by_day"][d] for d in recent)
+        recent_no_value = sum(stat["no_value_by_day"][d] for d in recent)
         recent_disagreed = sorted({m["day"] for m in availability_mismatch if f in m["features"] and m["day"] in recent})
+        recent_not_recorded = [d for d in recent if d in not_recorded]
         reasons = []
+        if not applicable_times:
+            reasons.append("no_applicable_decision_time")
+        if len(recent) < MIN_SESSIONS or missing["research"] or missing["live"]:
+            reasons.append(SESSION_MISSING)
+        if recent_not_recorded:
+            reasons.append(RULE_NOT_RECORDED)
         if len(recent_matched) < MIN_SESSIONS:
             reasons.append("insufficient_matched_sessions")
         if recent_out:
             reasons.append("value_out_of_tolerance")
+        if recent_no_value:
+            reasons.append("value_missing")           # both sides eligible, a value defined, and no number to compare
         if recent_disagreed:
             reasons.append("availability_mismatch")
         features[f] = {
@@ -488,12 +622,16 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             "status": "research_only" if reasons else "live_ready",
             "reasons": reasons,
             "verdict_on": {"sessions": recent, "matched": len(recent_matched), "required": MIN_SESSIONS,
-                           "values_out_of_tolerance": recent_out, "sessions_with_an_availability_disagreement": recent_disagreed},
+                           "missing": missing, "not_recorded_under_the_rule": recent_not_recorded,
+                           "values_out_of_tolerance": recent_out, "eligible_rows_with_no_value": recent_no_value,
+                           "sessions_with_an_availability_disagreement": recent_disagreed},
             "whole_window": {"sessions_with_an_availability_disagreement":
                              len({m["day"] for m in availability_mismatch if f in m["features"]})},
             "matched_sessions": len(matched), "required_sessions": MIN_SESSIONS,
             "overlapping_sessions": len(days),
             "values_compared": stat["compared"], "values_out_of_tolerance": stat["out_of_tolerance"],
+            "values_matched": stat["matched_values"], "values_required": sum(stat["applicable"].values()),
+            "eligible_rows_with_no_value": stat["no_value"], "applicable_decision_times": applicable_times,
             "max_abs_diff": stat["max_abs_diff"],
         }
     labels_compared = [r for r in label_rows if r["within_tolerance"] is not None]
@@ -501,6 +639,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
         "overlapping_sessions": days,
         "features": features,
         "availability_mismatch": availability_mismatch,
+        "sessions_not_recorded_under_the_rule": not_recorded,
         "labels": {"rows": len(label_rows), "compared": len(labels_compared),
                    "out_of_tolerance": sum(not r["within_tolerance"] for r in labels_compared),
                    "missing_on_a_side": len(label_rows) - len(labels_compared),
@@ -515,12 +654,21 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
     research = load_research(research_db, symbol, first, last)
     live, sources = load_live(signals_db, symbol, first, last)
     backstop = load_backstop(signals_db, symbol, first, last)
+    rule_days = load_rule_terms(signals_db, first, last)
     live_days = sorted(d for d in live if close_minute(d) is not None)
+    as_of = _clock()
+    verdict_sessions = expected_recent_sessions(as_of)
+    # Every session the calendar expects in the window, up to the newest one closed at the as-of time.
+    in_window = [d for d in expected_sessions_between(first, last) if verdict_sessions and d <= verdict_sessions[-1]]
     # The first recorded session has no recorded prior; it is counted and its reason shown.
-    compared = compare(research, live, decisions, horizons, backstop)
+    compared = compare(research, live, decisions, horizons, backstop, rule_days, verdict_sessions)
     statuses = {f: v["status"] for f, v in compared["features"].items()}
     return {
         "schema": SCHEMA,
+        "as_of": as_of.astimezone(NY).isoformat(timespec="seconds"),
+        "verdict_sessions": verdict_sessions,
+        "expected_sessions_missing": {"research": [d for d in in_window if not research.get(d)],
+                                      "live": [d for d in in_window if not live.get(d)]},
         "symbol": symbol, "window": {"first": first, "last": last},
         "decision_times": decisions, "horizons": horizons,
         "research_sessions": len(research), "live_sessions": len(live_days),
@@ -529,7 +677,9 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "live_last_session": max(live_days) if live_days else None,
         "live_sources_per_day": sources,
         "live_missing_minutes": {d: sorted(expected_minutes(d) - set(live[d])) for d in live_days},
-        "live_rule": {"gap_max": GAP_MAX, "backstop_source": BACKSTOP_SOURCE,
+        "live_rule": {"terms": LIVE_RULE_TERMS, "terms_sha256": LIVE_RULE_TERMS_SHA256,
+                      "terms_table": rule_days is not None, "terms_recorded": rule_days or {},
+                      "gap_max": GAP_MAX, "backstop_source": BACKSTOP_SOURCE,
                       "backstop_table": backstop is not None,
                       "backstop_bars": sum(len(v) for v in (backstop or {}).values()),
                       "note": ("live features are judged by the live recorder's lost-minute rule, research by the "
