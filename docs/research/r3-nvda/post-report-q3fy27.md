@@ -34,17 +34,21 @@ The frozen reference is `synthesis-v2.md` §5 and `ledger-v2.jsonl` on origin/ma
     multi-year memory procurement.
   - The AI-cloud agreements now go by "Neocloud agreements", at **$32B** (was $36B).
   - Cloud service agreements are **$28B** (was $29B).
-  - The maximum guarantee exposure is **$118.0B** (was a $108.5B cap). The increase is a new
-    $9.5B line of "Power and systems credit support guarantees". The $3.5B neocloud line and
-    the $105B SB Energy line are unchanged.
+  - The **maximum gross guarantee exposure** is **$118.0B** (was a $108.5B maximum). The
+    increase is a new $9.5B line of "Power and systems credit support guarantees". The $3.5B
+    neocloud line and the $105B SB Energy line are unchanged. The $118.0B is the maximum
+    gross guarantee exposure only. It is not committed cash, not a liability presently due,
+    and not past-due receivables.
   - NVIDIA says it has made no payments under its guarantees. The commentary does not give
     an "in force" amount, which needs the 10-Q.
   - Equity-investment commitments still outstanding are $20B (was $25B). The funded
     cumulative total is not reported.
 - **The Q4 FY27 outlook includes an extra week.**
   - Revenue $130.0B ±3%, again with no China Data Center compute assumed.
-  - GAAP and non-GAAP gross margin 71.0%–72.0%. That is about 300 bp lower than this
-    quarter's guide midpoint.
+  - GAAP and non-GAAP gross margin 71.0%–72.0%. The midpoint is **250 bp below the prior
+    guide midpoint (74.0% to 71.5%)**. Measured against Q3 actual margins instead, a different
+    comparison, the midpoint is 330 bp below Q3 GAAP actual (74.8%) and 340 bp below Q3
+    non-GAAP actual (74.9%).
   - Opex about $11.0B GAAP and $10.7B non-GAAP.
 - **On the CEO transition, NVIDIA said little.** Colette Kress signs as "Interim Chief
   Executive Officer, Executive Vice President and Chief Financial Officer". The
@@ -104,13 +108,13 @@ separated by `|`.
 | Supply commitments: cancellability | cancellable only "in certain instances", share not disclosed (`nvda-10q-q2fy27-supply-commitments-text`) | not reported yet (needs 10-Q) | n/a | n/a | The CFO commentary does not say whether these commitments can be cancelled |
 | AI-cloud buy-back agreements (now "Neocloud agreements") | $36B (`nvda-10q-q2fy27-ai-cloud-agreements`) | $32B | CFO: "Neocloud agreements (1) \| $ \| — \| ... \| 32"; "(1)Formerly referred to as "AI cloud agreements"" | −$4B | Renamed. NVIDIA says commitments "take effect only if the neoclouds secure financing ... and the related compute capacity is deployed, made operational, and accepted by us" |
 | R&D cloud service agreements | $29B (`nvda-10q-q2fy27-cloud-service-agreements`) | $28B | CFO table: "Cloud service agreements \| 2 \| ... \| 28" | −$1B | CFO: cloud service plus DC lease commitments together are "$102 billion, an increase from last quarter's $74 billion". DC leases not yet commenced are $74B |
-| Guarantees: maximum | $108.5B cap (`nvda-10q-q2fy27-guarantee-total`) | $118.0B | CFO: "Land, power, and shell guarantees for neoclouds \| $ \| 3.5"; "SB Energy Corp. credit support guarantees \| 105.0"; "Power and systems credit support guarantees \| 9.5"; "Total \| $ \| 118.0" | +$9.5B | The new line is "Power and systems credit support guarantees". Its counterparties are not named. CFO: "To date, we have not made any payments related to our guarantees." |
+| Guarantees: maximum gross exposure | $108.5B maximum (`nvda-10q-q2fy27-guarantee-total`) | $118.0B | CFO: "Land, power, and shell guarantees for neoclouds \| $ \| 3.5"; "SB Energy Corp. credit support guarantees \| 105.0"; "Power and systems credit support guarantees \| 9.5"; "Total \| $ \| 118.0" | +$9.5B | Maximum gross guarantee exposure only: not committed cash, not a liability presently due, not past-due receivables. The new line is "Power and systems credit support guarantees". Its counterparties are not named. CFO: "To date, we have not made any payments related to our guarantees." |
 | Guarantees: in force | $3.5B at 2026-07-26 (`nvda-10q-q2fy27-guarantee-total`) | not reported yet (needs 10-Q) | n/a | n/a | The CFO table shows "maximum gross exposure" only. For SB Energy: "The first is expected in fiscal 2029." |
 | Equity investments funded | $99B (`nvda-10q-q2fy27-equity-investments-99b`) | not reported yet (needs 10-Q) | n/a | n/a | SUPP rollforward: non-marketable equity "Net additions \| 15,431" in Q3, ending balance $61,650M. That is a balance-sheet figure, not the cumulative funded total, so it is not comparable |
 | Equity investments committed | $25B (`nvda-10q-q2fy27-equity-investment-commitments`) | $20B | CFO table: "Equity investments \| 5 \| \| \| 11 \| \| \| 2 \| \| \| 2 \| ... \| 20" | −$5B | A smaller outstanding commitment is consistent with funding during the quarter. The split is not given |
 | Largest direct customer share | 16% (`nvda-10q-q2fy27-customer-concentration`) | 14% | SUPP: "For the third quarter of fiscal year 2027, three direct customers represented 14%, 11%, and 11% of total revenue" | −2 pp | Three customers at ≥10% this quarter. Nine months: 13%, 12%, 12%, 11% |
 | CEO change: cancellation or counterparty statement | none found as of 11-12 (`nvda-8k-20261112-ceo-resignation`, `nvda-8k-20261112-ex991-commitments-continue`) | none in these documents | PR: Kress quoted as "interim CEO"; forward-looking statements cover "NVIDIA's leadership transition and the search for a new chief executive officer" and "the ongoing investigation by an independent committee of NVIDIA's board of directors" | no change | No new 8-K since 11-12 other than this one |
-| Q4 FY27 outlook (new) | n/a | revenue $130.0B ±3%; GM 71.0%–72.0%; opex ≈$11.0B GAAP / $10.7B non-GAAP | PR: "NVIDIA's outlook for the fourth quarter of fiscal 2027, which includes an additional week"; "Revenue is expected to be $130.0 billion, plus or minus 3%. NVIDIA is not assuming any Data Center compute revenue from China in its outlook."; "GAAP and non-GAAP gross margins are expected to be between 71.0% and 72.0%." | GM guide midpoint −250 bp vs Q3 guide; −340 bp vs reported Q3 non-GAAP | Q4 has 14 weeks. The commentary gives no reason for the lower margin guide |
+| Q4 FY27 outlook (new) | n/a | revenue $130.0B ±3%; GM 71.0%–72.0%; opex ≈$11.0B GAAP / $10.7B non-GAAP | PR: "NVIDIA's outlook for the fourth quarter of fiscal 2027, which includes an additional week"; "Revenue is expected to be $130.0 billion, plus or minus 3%. NVIDIA is not assuming any Data Center compute revenue from China in its outlook."; "GAAP and non-GAAP gross margins are expected to be between 71.0% and 72.0%." | GM guide midpoint 71.5%: −250 bp vs the prior (Q3) guide midpoint of 74.0%. Different comparison, vs Q3 actuals: −330 bp vs GAAP 74.8%, −340 bp vs non-GAAP 74.9% | Q4 has 14 weeks. The commentary gives no reason for the lower margin guide |
 | Share repurchase authorization (context) | Q2 buyback record (`nvda-pr-q2fy27-buyback`) | +$150B authorization; $227.3B remaining | PR: "approved an increase of $150 billion to the company's share repurchase authorization, without expiration"; CFO: "$227.3 billion of share repurchase authorization remaining which we plan to utilize through fiscal 2028." | n/a | Q3 capital returned: $28.1B |
 
 ## What waits for the 10-Q
@@ -123,5 +127,5 @@ information:
 - the cumulative equity investments funded;
 - the dollar amount of the federal tax timing effect;
 - the extended-payment-terms disclosure;
-- receivables aging;
+- receivables aging (not reported in these documents; this file makes no claim about it);
 - who the counterparties to the new $9.5B power-and-systems guarantees are.
