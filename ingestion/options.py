@@ -428,6 +428,9 @@ class YahooOptionsClient:
         self.crumb: str | None = None
         # True after get_options() saw a clean empty chain (no such symbol).
         self.last_no_chain = False
+        # HTTP status of the latest chain request (None before one, and after a
+        # transport failure), so a caller can tell a 429 from other failures.
+        self.last_status: int | None = None
         self._init_session()
 
     def _init_session(self) -> None:
@@ -472,8 +475,10 @@ class YahooOptionsClient:
         if expiry_ts is not None:
             params["date"] = expiry_ts
 
+        self.last_status = None
         try:
             resp = self.session.get(url, params=params, timeout=15)
+            self.last_status = resp.status_code
             if resp.status_code != 200:
                 log.warning("Yahoo options {t}: HTTP {s}", t=ticker, s=resp.status_code)
                 return None
@@ -987,6 +992,10 @@ class OptionsPuller(BasePuller):
         # name: callers and tests inject any ``get_options`` client there.
         primary = options_primary_provider()
         core_block: str | None = None
+        # Schwab mode only: why the Yahoo-served names are not requested, and
+        # their smaller expiry cap. None / the run's own cap on every other path.
+        tail_block: str | None = None
+        tail_expirations = max_expirations
         if primary == "schwab":
             # Owner-selected source for the hand-listed core (2026-11-21);
             # every other ticker is read from Yahoo. Schwab shares its app
@@ -995,14 +1004,31 @@ class OptionsPuller(BasePuller):
             # cash close, or while the shared call ledger shows a recent
             # refusal or a recent capture by this same writer.
             from ingestion.options_schwab import (
+                YAHOO_MAX_EXPIRATIONS,
                 SchwabFirstOptionsClient,
                 schwab_core_block,
+                schwab_post_session,
+                yahoo_tail_hold,
             )
 
+            if schwab_post_session(now):
+                # Neither source is asked after the cash close: Schwab cannot
+                # date a price then, and the evening slot must not spend Yahoo
+                # requests on names whose quotes stopped at the close.
+                log.info("Options pull skipped: the regular session has closed (schwab mode)")
+                return OptionsPullResults([
+                    {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": "post-session",
+                     "provider": "schwab" if ticker in EQUITY_TICKERS else "yahoo"} for ticker in tickers
+                ], full_universe=full_universe)
             if any(ticker in EQUITY_TICKERS for ticker in tickers):
                 core_block = schwab_core_block(now, writer=capture_source)
                 if core_block is not None:
                     log.info("Options pull: Schwab core not requested ({why})", why=core_block)
+            if any(ticker not in EQUITY_TICKERS for ticker in tickers):
+                tail_block = yahoo_tail_hold(now.timestamp())
+                if tail_block is not None:
+                    log.info("Options pull: Yahoo names not requested ({why})", why=tail_block)
+            tail_expirations = min(max_expirations, YAHOO_MAX_EXPIRATIONS)
             self._yahoo = SchwabFirstOptionsClient(writer=capture_source)
         elif primary == "yahoo":
             self._yahoo = YahooOptionsClient()
@@ -1027,8 +1053,16 @@ class OptionsPuller(BasePuller):
                 results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                                 "reason": core_block, "provider": "schwab"})
                 continue
+            in_tail = primary == "schwab" and ticker not in EQUITY_TICKERS
+            if in_tail and tail_block is None and getattr(self._yahoo, "yahoo_budget_spent", False):
+                tail_block = "yahoo_request_budget"
+            if in_tail and tail_block is not None:
+                results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                                "reason": tail_block, "provider": "yahoo"})
+                continue
             ticker_kwargs: dict[str, Any] = {
-                "max_expirations": max_expirations, "should_continue": should_continue,
+                "max_expirations": tail_expirations if in_tail else max_expirations,
+                "should_continue": should_continue,
             }
             if capture_source != DEFAULT_CAPTURE_SOURCE:
                 # Only non-default writers pass a label; the default call
