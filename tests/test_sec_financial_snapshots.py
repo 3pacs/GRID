@@ -41,11 +41,57 @@ def test_capture_identity_preserves_original_bytes_and_excludes_repeated_receipt
     validate_snapshot(s)
 
 
-def test_capture_id_binds_exact_source_bytes_fx_inputs_and_normalized_values():
+def test_capture_id_binds_exact_source_bytes_and_normalized_values():
     s = prepared()
     assert prepared(source_body=json.dumps(payload(), indent=2).encode()).snapshot_id != s.snapshot_id
-    assert prepared(fx_rates={'USD': 1, 'EUR': 1.1}).snapshot_id != s.snapshot_id
     assert prepared(payload(1)).snapshot_id != s.snapshot_id
+
+
+def test_usd_only_capture_identity_ignores_moving_fx_rates():
+    first = prepared(fx_rates={'USD': 1.0, 'EUR': 1.1, 'JPY': 0.007})
+    later = prepared(fx_rates={'USD': 1.0, 'EUR': 1.2, 'JPY': 0.008},
+                     request_started_at=AT+timedelta(days=1),
+                     received_at=AT+timedelta(days=1, seconds=2))
+    assert later.snapshot_id == first.snapshot_id == prepared().snapshot_id
+    assert later.normalized_json == first.normalized_json
+    assert first.fx_json == later.fx_json == '{}'
+    validate_snapshot(later)
+
+
+def test_foreign_capture_identity_binds_only_applied_fx_rates():
+    data = payload(100)
+    units = data['facts']['us-gaap']['Revenues']['units']
+    units['EUR'] = units.pop('USD')
+    first = prepared(data, fx_rates={'EUR': 1.1, 'JPY': 0.007})
+    unused_changed = prepared(data, fx_rates={'EUR': 1.1, 'JPY': 0.008})
+    applied_changed = prepared(data, fx_rates={'EUR': 1.2, 'JPY': 0.007})
+    assert json.loads(first.fx_json) == {'EUR': 1.1}
+    assert unused_changed.snapshot_id == first.snapshot_id
+    assert applied_changed.snapshot_id != first.snapshot_id
+    assert applied_changed.rows[0]['amount_usd'] == 120
+    validate_snapshot(first)
+    validate_snapshot(applied_changed)
+
+
+def test_foreign_fallback_preserves_confidence_and_replays_without_unused_inputs():
+    data = payload(100)
+    units = data['facts']['us-gaap']['Revenues']['units']
+    units['EUR'] = units.pop('USD')
+    first = prepared(data, fx_rates={'EUR': 0, 'JPY': 0.007})
+    assert first.fx_json == '{}'
+    assert first.snapshot_id == prepared(data, fx_rates={}).snapshot_id
+    assert first.rows[0]['confidence'] == 'estimated'
+    validate_snapshot(first)
+
+
+def test_applied_overflow_rate_is_retained_for_write_boundary_replay():
+    data = payload(1e100)
+    units = data['facts']['us-gaap']['Revenues']['units']
+    units['EUR'] = units.pop('USD')
+    capture = prepared(data, fx_rates={'EUR': 1e300, 'JPY': 0.007})
+    assert capture.rows == []
+    assert json.loads(capture.fx_json) == {'EUR': 1e300}
+    validate_snapshot(capture)
 
 
 @pytest.mark.parametrize('changes', [dict(snapshot_id='0'*64), dict(actor_id='aapl'),

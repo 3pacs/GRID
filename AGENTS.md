@@ -968,3 +968,20 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
 - Shared-account budgeting, delayed-dispatch pacing, historical reconciliation,
   metadata breadth and separate canary approval remain rollout gates. No provider
   calls, production access, scheduler changes, merge to main or deployment.
+
+## 2026-11-21 — SEC #1050 applied-FX identity correction (Codex)
+
+- Owner-directed source-only continuation from `1d0b3a1b`; merged main
+  `427dbc247` with main's append-only entries first and recomputed 16 forward
+  pins. All 14 HOLD pins remain unchanged. No other PR or runtime was touched.
+- Snapshot identity now retains only supplied FX rates the normalizer applies.
+  USD bypasses FX; foreign conversion, fallback confidence and overflow replay
+  retain their existing behavior. Unrelated rate movement is identity-neutral.
+- 56 snapshot/admission/manifest tests passed with the requested light venv,
+  serial nice priority and two-thread BLAS limits. Fixtures only; no providers,
+  SSH, production access, PR merge or deployment.
+- The supplied worktree's shared Git metadata is read-only. Task Git metadata
+  is isolated in `.codex-task-git` inside this worktree; use
+  `git --git-dir=.codex-task-git` here to inspect the actual task branch.
+- Generation identity and the migration-head join remain for the next commits;
+  Claude reviews the pushed head before Anik decides whether to merge.

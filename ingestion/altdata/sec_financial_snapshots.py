@@ -51,6 +51,26 @@ def _unique_object(pairs):
     return result
 
 
+class _AppliedFxRates(dict):
+    """Retain only supplied rates actually used by the normalizer.
+
+    USD bypasses the rate map. Missing/nonpositive rates use the normalizer's
+    versioned fallback policy, so they are not applied rate inputs either.
+    Track lookups rather than output rows: even a conversion rejected for
+    overflow must replay identically at the write-boundary validation.
+    """
+
+    def __init__(self, rates):
+        super().__init__(rates)
+        self.applied = {}
+
+    def get(self, key, default=None):
+        rate = super().get(key, default)
+        if rate is not None and rate > 0:
+            self.applied[key] = rate
+        return rate
+
+
 @dataclass(frozen=True)
 class FinancialSnapshot:
     snapshot_id: str
@@ -143,8 +163,9 @@ def prepare_snapshot(*, source_body: bytes, actor_id: str, cik: str,
                     # require a start and a reporting end not after filing.
                     if tag_name in mapped_tags[taxonomy] and (start is None or filed < end):
                         raise ValueError("Invalid mapped financial-flow duration")
-    fx_json = _json(fx_rates)
-    rows = _collect_all_flows(payload, json.loads(fx_json))
+    rates = _AppliedFxRates(json.loads(_json(fx_rates)))
+    rows = _collect_all_flows(payload, rates)
+    fx_json = _json(rates.applied)
     normalized_json = _json(sorted(rows, key=lambda r: (r['fiscal_period'], r['period_type'], r['flow_type'])))
     source_hash, normalized_hash = _sha(source_body), _sha(normalized_json.encode('utf-8'))
     identity = _json(dict(actor_id=actor_id, cik=cik, source_sha256=source_hash,

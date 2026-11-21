@@ -41,8 +41,11 @@ establish the fiscal quarter of every comparative fact.
 
 `sec_financial_snapshots` preserves original response bytes as deterministic
 gzip, source URL/hash, request/receipt timestamps, normalized JSON/hash, FX inputs,
-actor/CIK and normalizer version. Content identity binds all normalization inputs
-and output. `sec_financial_snapshot_heads` is the separate current pointer.
+actor/CIK and normalizer version. Content identity binds the source bytes,
+normalizer version, normalized output and only supplied FX rates actually applied
+to this issuer's facts. USD facts bypass FX; unrelated rate changes do not create
+a new snapshot. Versioned fallback conversion and confidence stay unchanged.
+`sec_financial_snapshot_heads` is the separate current pointer.
 Identical content is idempotent; repeat captures advance the head's observation
 times without overwriting the first archived capture. This is application-level
 append-only behavior, not a tamper-proof archive or complete request-event log.
