@@ -329,10 +329,46 @@ def test_interpret_route_path_still_writes_client_engine_outputs_and_cites_them(
 
     engine_rows = db.inserts("engine_run")
     assert [r["engine_key"] for r in engine_rows] == ["western"]
-    assert "producer" not in json.loads(engine_rows[0]["raw_output"])
+    from store.astrogrid import CLIENT_PRODUCER
+
+    assert json.loads(engine_rows[0]["raw_output"])["producer"] == CLIENT_PRODUCER
     seer_rows = db.inserts("seer_run")
     assert json.loads(seer_rows[0]["source_engine_runs"]) == [101]
     assert ids["seer_run_id"] == 102
+
+
+def test_client_cannot_claim_the_scheduled_producers_provenance() -> None:
+    """A browser-sent output naming the server producer is restamped as client.
+
+    Otherwise it would match save_engine_runs' once-per-snapshot dedupe
+    (raw_output->>'producer') and the day's server run would be skipped,
+    leaving client output passed off as server-computed.
+    """
+    from oracle.astrogrid_engines import ENGINE_PRODUCER
+    from store.astrogrid import CLIENT_PRODUCER
+
+    db = _FakeDB()
+    store = _store(db)
+    store.save_snapshot = lambda snapshot: 42  # type: ignore[method-assign]
+    store.ensure_lens_set = lambda mode, lens_ids: 7  # type: ignore[method-assign]
+    spoofed = {**_engine_output("western"), "producer": ENGINE_PRODUCER,
+               "code_sha256": {"prophecy.js": "f" * 64}, "snapshot_built_at": "2026-11-21T12:00:00Z"}
+
+    store.save_interpretation(
+        {"snapshot": {"date": "2026-11-21"}, "engine_outputs": [spoofed]},
+        {"seer": {"reading": "r", "prediction": "p"}, "summary": "s"},
+    )
+
+    raw = json.loads(db.inserts("engine_run")[0]["raw_output"])
+    assert raw["producer"] == CLIENT_PRODUCER != ENGINE_PRODUCER
+    assert "code_sha256" not in raw and "snapshot_built_at" not in raw
+    assert spoofed["producer"] == ENGINE_PRODUCER  # caller's dict not mutated
+
+
+def test_non_mapping_client_output_is_stored_as_an_empty_client_row() -> None:
+    from store.astrogrid import CLIENT_PRODUCER, _client_engine_output
+
+    assert _client_engine_output("junk") == {"producer": CLIENT_PRODUCER}
 
 
 # ---------------------------------------------------------------------------

@@ -501,6 +501,23 @@ def _dominant_driver_labels(payload: Mapping[str, Any] | None, keys: list[str]) 
     return drivers[:5]
 
 
+# Provenance keys only the server-side producer (save_engine_runs) may set.
+# A client-sent engine output carrying them could pre-empt the scheduled
+# producer's once-per-snapshot dedupe (raw_output->>'producer') and pass off
+# browser output as server-computed. Client rows are stamped CLIENT_PRODUCER.
+SERVER_PROVENANCE_KEYS: tuple[str, ...] = ("producer", "code_sha256", "snapshot_built_at")
+CLIENT_PRODUCER = "client_interpret_request"
+
+
+def _client_engine_output(engine_output: Any) -> dict[str, Any]:
+    """A client engine output with server-only provenance keys replaced."""
+    base = dict(engine_output) if isinstance(engine_output, Mapping) else {}
+    for key in SERVER_PROVENANCE_KEYS:
+        base.pop(key, None)
+    base["producer"] = CLIENT_PRODUCER
+    return base
+
+
 class AstroGridStore:
     """Persist AstroGrid runs and snapshots into the dedicated schema."""
 
@@ -823,7 +840,7 @@ class AstroGridStore:
                 if snapshot_id is not None:
                     for engine_output in list(request_payload.get("engine_outputs") or [])[:12]:
                         engine_run_id = self._insert_engine_run(
-                            conn, snapshot_id, lens_set_id, engine_output
+                            conn, snapshot_id, lens_set_id, _client_engine_output(engine_output)
                         )
                         if engine_run_id is not None:
                             engine_run_ids.append(engine_run_id)
