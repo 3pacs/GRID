@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Response
 from loguru import logger as log
 from sqlalchemy import text
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from sqlalchemy.engine import Engine
 
 from api.auth import require_auth
@@ -545,11 +546,11 @@ def _fetch_options_context(conn: Any, ticker: str) -> dict[str, Any]:
         return {}
     try:
         row = conn.execute(
-            text(
+            visible_sql(
                 """
                 SELECT signal_date, put_call_ratio, max_pain, iv_skew,
                        total_oi, total_volume, near_expiry, spot_price, iv_atm
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :ticker
                 ORDER BY signal_date DESC NULLS LAST
                 LIMIT 1

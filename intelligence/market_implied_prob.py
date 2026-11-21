@@ -37,8 +37,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 @dataclass(frozen=True)
@@ -149,10 +149,10 @@ def options_implied_probability(
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text(
+                visible_sql(
                     """
                     SELECT spot_price, iv_atm, signal_date
-                    FROM options_daily_signals
+                    FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :t
                       AND iv_atm IS NOT NULL
                       AND spot_price IS NOT NULL

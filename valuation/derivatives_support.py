@@ -30,6 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.observations import read_latest
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 # Oldest options-snapshot spot or close the spot fallback accepts (calendar days).
 SPOT_MAX_AGE_DAYS = 7
@@ -460,8 +461,8 @@ class DerivativesSupportEngine:
             if row is not None:
                 return row[0]
             row = conn.execute(
-                text("""
-                    SELECT spot_price FROM options_daily_signals
+                visible_sql("""
+                    SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :t AND spot_price > 0 AND signal_date <= :as_of
                       AND signal_date >= :since
                     ORDER BY signal_date DESC LIMIT 1
@@ -551,10 +552,10 @@ class DerivativesSupportEngine:
 
         with self.engine.connect() as conn:
             row = conn.execute(
-                text("""
+                visible_sql("""
                     SELECT put_call_ratio, iv_skew, iv_atm, max_pain,
                            total_oi, spot_price
-                    FROM options_daily_signals
+                    FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                     WHERE ticker = :ticker AND signal_date <= :as_of
                     ORDER BY signal_date DESC LIMIT 1
                 """),

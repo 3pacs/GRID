@@ -21,14 +21,15 @@ def registry():
     with engine.begin() as conn:
         conn.execute(text("""CREATE TABLE options_capture_batches (
             ticker TEXT, snap_date DATE, capture_batch_id TEXT,
-            capture_ordinal INTEGER, capture_completed_at TEXT, registered_at TEXT)"""))
+            capture_ordinal INTEGER, capture_completed_at TEXT, registered_at TEXT,
+            spot_provider TEXT, clock_metadata TEXT)"""))
     yield engine
     engine.dispose()
 
 
 def insert(engine, batch, ordinal, registered, *, day=DAY, completed=None, ticker="SPY"):
     with engine.begin() as conn:
-        conn.execute(text("INSERT INTO options_capture_batches VALUES (:ticker,:day,:batch,:ordinal,:completed,:registered)"),
+        conn.execute(text("INSERT INTO options_capture_batches (ticker, snap_date, capture_batch_id, capture_ordinal, capture_completed_at, registered_at) VALUES (:ticker,:day,:batch,:ordinal,:completed,:registered)"),
                      dict(ticker=ticker, day=day, batch=batch, ordinal=ordinal,
                           completed=completed or CUTOFF - timedelta(minutes=5), registered=registered))
 

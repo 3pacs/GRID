@@ -168,7 +168,16 @@ def test_forensics_get_does_not_create_or_store_reports():
             ))
             conn.execute(text("""
                 CREATE TABLE options_daily_signals (
-                    ticker TEXT, signal_date DATE, spot_price DOUBLE PRECISION
+                    ticker TEXT, signal_date DATE, spot_price DOUBLE PRECISION,
+                    wing_iv_metadata JSONB
+                )
+            """))
+            # Options readers look up each row's capture batch
+            # (store/options_provenance.py); empty, so no row is Schwab-captured.
+            conn.execute(text("""
+                CREATE TABLE options_capture_batches (
+                    capture_batch_id TEXT PRIMARY KEY, ticker TEXT, snap_date DATE,
+                    spot_provider TEXT, clock_metadata JSONB
                 )
             """))
             conn.execute(text("""

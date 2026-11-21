@@ -19,8 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, text
+from sqlalchemy import Date, DateTime
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_SNAPSHOTS, visible_sql
 
 
 @dataclass(frozen=True)
@@ -29,10 +30,10 @@ class ChainSelection:
     created_at: datetime  # MAX(created_at) across that snap_date's rows
 
 
-_SELECT_LATEST_COMPLETE_BATCH = text(
+_SELECT_LATEST_COMPLETE_BATCH = visible_sql(
     """
     SELECT snap_date, MAX(created_at) AS batch_created_at
-    FROM options_snapshots
+    FROM """ + VISIBLE_SNAPSHOTS + """ s
     WHERE ticker = :ticker
     GROUP BY snap_date
     HAVING MAX(created_at) < :run_at

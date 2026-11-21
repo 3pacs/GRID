@@ -143,7 +143,11 @@ def test_track_record_queries_run_on_postgres(scratch):
     _run(scratch, "upgrade")
     with scratch.begin() as conn:
         conn.execute(text("CREATE TABLE options_daily_signals (ticker TEXT, signal_date DATE, "
-                          "spot_price DOUBLE PRECISION)"))
+                          "spot_price DOUBLE PRECISION, wing_iv_metadata JSONB)"))
+        # The tracker reads through store/options_provenance.py, which looks up
+        # each row's capture batch; empty, so no row is Schwab-captured.
+        conn.execute(text("CREATE TABLE IF NOT EXISTS options_capture_batches (capture_batch_id TEXT "
+                          "PRIMARY KEY, ticker TEXT, snap_date DATE, spot_provider TEXT, clock_metadata JSONB)"))
         conn.execute(text("CREATE TABLE options_snapshots (ticker TEXT, snap_date DATE, expiry DATE, "
                           "opt_type TEXT, strike DOUBLE PRECISION, bid DOUBLE PRECISION, "
                           "ask DOUBLE PRECISION)"))

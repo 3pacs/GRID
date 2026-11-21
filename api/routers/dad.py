@@ -23,6 +23,8 @@ from fastapi.responses import StreamingResponse
 from loguru import logger as log
 from sqlalchemy import text
 
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+
 from api.auth import require_auth, require_stream_auth
 from api.dependencies import get_db_engine
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
@@ -1009,10 +1011,10 @@ def _latest_options_context(engine: Any, ticker: str) -> dict[str, Any] | None:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text(
+                visible_sql(
                     "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                     "total_oi, total_volume, spot_price, iv_atm, term_structure_slope, oi_concentration "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ),
@@ -1046,10 +1048,10 @@ def _options_history_context(engine: Any, ticker: str, *, days: int = 90, limit:
     try:
         with engine.connect() as conn:
             result = conn.execute(
-                text(
+                visible_sql(
                     "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                     "total_oi, total_volume, spot_price, iv_atm, term_structure_slope, oi_concentration "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker "
                     "AND signal_date >= :cutoff "
                     "ORDER BY signal_date DESC "

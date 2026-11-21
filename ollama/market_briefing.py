@@ -988,10 +988,12 @@ class MarketBriefingEngine:
                     "source": "spy_pcr",
                 }
 
+            from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+
             row = conn.execute(
-                text(
+                visible_sql(
                     "SELECT put_call_ratio, signal_date "
-                    "FROM options_daily_signals "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                     "WHERE ticker = :ticker AND put_call_ratio IS NOT NULL "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ),

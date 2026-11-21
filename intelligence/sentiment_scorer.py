@@ -40,6 +40,7 @@ from sqlalchemy.engine import Engine
 
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 from store.observations import read_latest, read_latest_n, read_window
+from store.options_provenance import LATEST_DAILY_SIGNALS, visible_sql
 
 
 def _recent_closes(conn: Any, series_id: str, n: int) -> list[Any]:
@@ -494,9 +495,8 @@ def _score_put_call_ratio(engine: Engine) -> SentimentComponent:
     """Put/call ratio from options data — high = fear (contrarian bullish)."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT AVG(put_call_ratio) FROM options_daily_signals "
-                "WHERE signal_date = (SELECT MAX(signal_date) FROM options_daily_signals)"
+            row = conn.execute(visible_sql(
+                "SELECT AVG(put_call_ratio) FROM " + LATEST_DAILY_SIGNALS + " ods"
             )).scalar()
             if row:
                 pcr = float(row)

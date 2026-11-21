@@ -309,14 +309,14 @@ def test_loader_does_not_read_a_capture_registered_after_cutoff_or_infer_a_missi
             ticker TEXT, spot_price REAL, provider_regular_market_at TEXT, spot_provider TEXT,
             capture_batch_id TEXT, capture_source TEXT, capture_started_at TEXT,
             capture_completed_at TEXT, registered_at TEXT, snap_date TEXT,
-            backfilled BOOLEAN, capture_ordinal INTEGER)"""))
+            backfilled BOOLEAN, capture_ordinal INTEGER, clock_metadata TEXT)"""))
         for ordinal, registered, quote in [
             (1, DECISION - timedelta(minutes=1), None),
             (2, DECISION + timedelta(seconds=1), DECISION - timedelta(minutes=2)),
         ]:
             conn.execute(text("""INSERT INTO options_capture_batches VALUES
                 ('SPY', 100, :quote, 'cboe', :batch, 'options_puller', :started,
-                 :completed, :registered, '2026-11-10', FALSE, :ordinal)"""),
+                 :completed, :registered, '2026-11-10', FALSE, :ordinal, NULL)"""),
                 {"quote": quote, "batch": str(ordinal), "started": DECISION - timedelta(minutes=2),
                  "completed": DECISION - timedelta(minutes=1), "registered": registered, "ordinal": ordinal})
         receipt = load_quote_reference(conn, "SPY", as_of=DECISION)

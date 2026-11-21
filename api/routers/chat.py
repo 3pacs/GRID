@@ -619,14 +619,15 @@ def _gather_lever_pullers() -> tuple[str, str]:
 
 
 def _gather_options_context(ticker: str | None) -> tuple[str, str]:
-    """Return options signals from DB."""
+    """Return options signals from DB (never a Schwab-captured day: chat context is not admin-only)."""
     try:
         engine = _get_db_engine()
-        from sqlalchemy import text
+
+        from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
         with engine.connect() as conn:
-            rows = conn.execute(text(
+            rows = conn.execute(visible_sql(
                 "SELECT ticker, signal_type, direction, confidence, detail, signal_date "
-                "FROM options_daily_signals "
+                "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
                 "WHERE (:t IS NULL OR ticker = :t) "
                 "ORDER BY signal_date DESC LIMIT :lim"
             ), {"t": ticker, "lim": 8}).fetchall()
@@ -646,7 +647,7 @@ def _gather_gex(ticker: str | None) -> tuple[str, str]:
     try:
         engine = _get_db_engine()
         from physics.dealer_gamma import DealerGammaEngine
-        dge = DealerGammaEngine(engine)
+        dge = DealerGammaEngine(engine, include_schwab=False)  # LLM context: no Schwab chains
         target = ticker or "SPY"
         profile = dge.compute_gex_profile(target)
         if profile and isinstance(profile, dict) and "error" not in profile:

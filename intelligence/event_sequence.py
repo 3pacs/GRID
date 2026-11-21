@@ -32,6 +32,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -246,9 +247,9 @@ def _get_price_series(
 
     with engine.connect() as conn:
         # Try options_daily_signals first (has spot_price)
-        rows = conn.execute(text("""
+        rows = conn.execute(visible_sql("""
             SELECT signal_date, spot_price
-            FROM options_daily_signals
+            FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND signal_date >= :c AND spot_price > 0
             ORDER BY signal_date
         """), {"t": ticker, "c": cutoff.date()}).fetchall()
@@ -380,10 +381,10 @@ def _pull_options_events(
     events: list[Event] = []
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("""
+            rows = conn.execute(visible_sql("""
                 SELECT signal_date, put_call_ratio, max_pain, iv_skew,
                        total_oi, total_volume, spot_price, iv_atm
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :t AND signal_date >= :c
                 ORDER BY signal_date DESC
                 LIMIT :lim

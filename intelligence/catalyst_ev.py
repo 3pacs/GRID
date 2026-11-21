@@ -85,6 +85,7 @@ from typing import Any, Callable, Sequence, TypeVar
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 T = TypeVar("T")
 
@@ -753,10 +754,10 @@ _PROFILE_SQL = text(
     """
 )
 
-_OPTIONS_SNAPSHOT_SQL = text(
+_OPTIONS_SNAPSHOT_SQL = visible_sql(
     """
     SELECT DISTINCT ON (ticker) ticker, spot_price, iv_atm, signal_date
-    FROM options_daily_signals
+    FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
     WHERE ticker = ANY(:tickers)
       AND signal_date >= :start
       AND signal_date <= :as_of

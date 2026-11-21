@@ -29,6 +29,7 @@ import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, VISIBLE_SNAPSHOTS, visible_sql
 
 
 # ── Canonical pricing/sizing utilities ──────────────────────────────
@@ -1015,9 +1016,9 @@ class OptionsRecommender:
         opt_type = "call" if direction == "CALL" else "put"
 
         with db.connect() as conn:
-            row = conn.execute(text("""
+            row = conn.execute(visible_sql("""
                 SELECT bid, ask, last_price
-                FROM options_snapshots
+                FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker
                   AND strike = :strike
                   AND expiry = :expiry
@@ -1255,9 +1256,9 @@ class OptionsRecommender:
         opt_type = "call" if rec.direction == "CALL" else "put"
 
         with db.connect() as conn:
-            row = conn.execute(text("""
+            row = conn.execute(visible_sql("""
                 SELECT implied_vol, open_interest, bid, ask
-                FROM options_snapshots
+                FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker
                   AND strike = :strike
                   AND opt_type = :opt_type
@@ -1588,13 +1589,13 @@ Respond with ONLY the JSON object."""
     def _load_chain(self, db: Engine, ticker: str) -> pd.DataFrame:
         """Load options chain from database (latest snap_date)."""
         with db.connect() as conn:
-            rows = conn.execute(text("""
+            rows = conn.execute(visible_sql("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - snap_date) AS dte, bid, ask
-                FROM options_snapshots
+                FROM """ + VISIBLE_SNAPSHOTS + """ s
                 WHERE ticker = :ticker
                   AND snap_date = (
-                      SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :ticker
+                      SELECT MAX(snap_date) FROM """ + VISIBLE_SNAPSHOTS + """ s_latest WHERE ticker = :ticker
                   )
                   AND open_interest > 0
                   AND expiry > CURRENT_DATE
@@ -1630,9 +1631,9 @@ Respond with ONLY the JSON object."""
     def _get_atm_iv(self, db: Engine, ticker: str) -> float | None:
         """Get ATM implied volatility from latest options signals."""
         with db.connect() as conn:
-            row = conn.execute(text("""
+            row = conn.execute(visible_sql("""
                 SELECT iv_atm
-                FROM options_daily_signals
+                FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
                 WHERE ticker = :ticker
                 ORDER BY signal_date DESC
                 LIMIT 1

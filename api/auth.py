@@ -287,6 +287,25 @@ def require_role(*roles: str) -> Callable:
     return _check_role
 
 
+def token_role(token: Optional[str]) -> str:
+    """The role a token carries; ``contributor`` when it is missing or invalid."""
+    payload = decode_token(token) if token else None
+    return str((payload or {}).get("role") or "contributor")
+
+
+async def viewer_is_admin(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> bool:
+    """FastAPI dependency: True only when the request's bearer token has role ``admin``.
+
+    Not an auth gate (pair it with ``require_auth``); it tells a reader whether
+    the viewer may see owner-private rows, such as options captured from Schwab
+    (``store/options_provenance.py``). Missing, invalid or non-admin -> False.
+    """
+    token = credentials.credentials if credentials else None
+    return bool(token) and token_role(token) == "admin"
+
+
 # ── Stream tickets (EventSource auth without a JWT in the URL) ─────────
 #
 # ``EventSource`` cannot send an Authorization header, so the browser used to

@@ -40,6 +40,7 @@ from ingestion.altdata.quiverquant_identity import (
     is_calendar_dated_leftover,
 )
 from ingestion.altdata import quiverquant_transactions as tx
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -580,8 +581,8 @@ def _get_price_near_date(
     """
     as_of = as_of or datetime.now(timezone.utc)
     with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT spot_price FROM options_daily_signals
+        row = conn.execute(visible_sql("""
+            SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
             ORDER BY signal_date DESC LIMIT 1
         """), {"t": ticker, "d": target_date}).fetchone()

@@ -93,7 +93,7 @@ class _Engine:
 
 def _patched(monkeypatch: pytest.MonkeyPatch, **kw) -> _Engine:
     engine = _Engine(**kw)
-    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda: engine)
+    monkeypatch.setattr(derivatives, "_get_gex_engine", lambda *_a, **_k: engine)
     return engine
 
 

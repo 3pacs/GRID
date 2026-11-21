@@ -34,6 +34,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from oracle.entry_price_policy import entry_price_score_note
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 
 
 # Lessons come from official verdicts (oracle.engine.score_expired_predictions),
@@ -1164,10 +1165,10 @@ def _reconstruct_decision_data(
 
     with engine.connect() as conn:
         # Options scanner signals near decision date
-        opt_row = conn.execute(text("""
+        opt_row = conn.execute(visible_sql("""
             SELECT put_call_ratio, iv_atm, iv_skew, max_pain, spot_price,
                    total_oi, term_structure_slope, oi_concentration, signal_date
-            FROM options_daily_signals
+            FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND signal_date <= :d
             ORDER BY signal_date DESC LIMIT 1
         """), {"t": ticker, "d": as_of}).fetchone()
@@ -1248,8 +1249,8 @@ def _load_price_path(
 
     with engine.connect() as conn:
         # Try options_daily_signals first
-        rows = conn.execute(text("""
-            SELECT signal_date, spot_price FROM options_daily_signals
+        rows = conn.execute(visible_sql("""
+            SELECT signal_date, spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
             WHERE ticker = :t AND signal_date >= :s AND signal_date <= :e
               AND spot_price > 0
             ORDER BY signal_date
