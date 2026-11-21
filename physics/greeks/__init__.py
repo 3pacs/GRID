@@ -16,7 +16,9 @@ from physics.greeks.black_scholes import (
     delta,
     gamma,
     speed,
+    theta,
     vanna,
+    vega,
     vomma,
     zomma,
 )
@@ -26,6 +28,8 @@ __all__ = [
     "d2",
     "delta",
     "gamma",
+    "vega",
+    "theta",
     "vanna",
     "charm",
     "vomma",
