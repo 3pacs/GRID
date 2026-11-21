@@ -14,11 +14,10 @@ GENERATION_SQL = """
 CREATE OR REPLACE VIEW sec_financial_generation AS
 SELECT md5(jsonb_build_object(
     'heads', COALESCE((SELECT jsonb_agg(jsonb_build_array(
-        actor_id, snapshot_id, request_started_at AT TIME ZONE 'UTC',
-        received_at AT TIME ZONE 'UTC') ORDER BY actor_id)
+        actor_id, snapshot_id) ORDER BY actor_id)
         FROM sec_financial_snapshot_heads), '[]'::jsonb),
     'ttm', COALESCE((SELECT jsonb_agg(jsonb_build_array(
-        actor_id, sec_snapshot_id, quarter_fingerprint, computed_at AT TIME ZONE 'UTC')
+        actor_id, sec_snapshot_id, quarter_fingerprint)
         ORDER BY actor_id) FROM capital_flows_ttm_state), '[]'::jsonb)
 )::text) AS generation
 """

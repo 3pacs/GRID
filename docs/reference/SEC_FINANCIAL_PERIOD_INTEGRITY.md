@@ -265,22 +265,25 @@ generation are excluded, never relabelled or deleted by the migration. Missing
 raw report tables are bootstrapped empty for clean Alembic replay; existing tables
 and values are preserved. The application role receives read access to views.
 
-The generation includes every snapshot head, observation request/receipt time,
-and TTM publication identity/fingerprint/time. Global scope is deliberate:
-sector ranks and peer-relative outputs depend on other actors. A same-content
-new observation also invalidates results, preventing a normal A-to-B-to-A
-source cycle from reviving old cache entries. UTC-normalized timestamp encoding
-keeps the token stable across session timezones. This is SEC/TTM binding, not
+The generation includes each actor's current snapshot identity and TTM source
+identity/quarter fingerprint, ordered by actor. Request, receipt and TTM compute
+timestamps remain operational metadata and do not participate. An unchanged
+refetch or identical TTM recomputation keeps the same generation, so current
+divergence/sector-health reports and caches remain current between SEC runs.
+Changed source content, peer membership or TTM readiness still invalidates them.
+Global scope is deliberate: sector ranks and peer-relative outputs depend on
+other actors. Returning to exactly the same SEC/TTM content restores the same
+generation. This is SEC/TTM binding, not
 versioning of prices, insider/news data, FX policy, or all legacy ledger writers.
 
 Report computation verifies the generation before and after its multiple reads.
 Writers accept only the captured current generation. Current-report views also
 hide a late old write that began before a newer head committed. Readers never
 fall back to raw historical reports. A missing qualified prior sector snapshot
-returns an unavailable 30-day trend, not a fabricated stable trend. With regular
-SEC reobservations, historical baselines generally will not share the current
-generation, so 30-day trends remain unavailable unless a current-source historical
-baseline is rebuilt. This is a functional limitation of the conservative binding,
+returns an unavailable 30-day trend, not a fabricated stable trend. After SEC/TTM
+content changes, historical baselines may not share the current generation, so
+30-day trends remain unavailable unless a current-source historical baseline is
+rebuilt. This is a functional limitation of the conservative binding,
 not an automatic recovery promised by the next ingestion. Oracle sector
 routing omits unavailable historical multipliers.
 

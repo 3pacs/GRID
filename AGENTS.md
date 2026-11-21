@@ -985,3 +985,17 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   `git --git-dir=.codex-task-git` here to inspect the actual task branch.
 - Generation identity and the migration-head join remain for the next commits;
   Claude reviews the pushed head before Anik decides whether to merge.
+
+### SEC #1050 content generation correction
+
+- Generation now hashes ordered actor/snapshot identities and TTM source IDs /
+  quarter fingerprints. Request/receipt/compute times remain metadata. Identical
+  reobservations and TTM recomputation preserve the generation; changed content,
+  peer membership and readiness still invalidate reports and caches.
+- Updated the old reobservation/compute-time expectations and added a private-PG
+  regression proving an unchanged refetch with moving unused FX advances head
+  metadata without duplicating the archive or hiding either current report.
+- Focused output/cache/PG files: 38 passed, 194 PostgreSQL tests skipped locally.
+  A local test fence blocks sockets and PostgreSQL connections. Native SQL/view
+  execution remains for CI, as requested. No assertions were relaxed for the
+  light venv's out-of-range SQLAlchemy 2.1.8.

@@ -3,6 +3,7 @@
 The global identity intentionally invalidates peer-relative financial reports
 when any contributing issuer changes. It is not a version of market prices or
 nonfinancial source tables. No engine/default database discovery occurs here.
+Observation and compute timestamps do not change the content generation.
 """
 from __future__ import annotations
 

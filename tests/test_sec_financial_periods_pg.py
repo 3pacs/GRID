@@ -780,7 +780,7 @@ def test_pg_output_generation_tracks_heads_reobservations_and_peers(output_db):
     assert again.snapshot_id == first.snapshot_id
     write_snapshot(output_db, again)
     repeated_generation = _generation(output_db)
-    assert repeated_generation != first_generation
+    assert repeated_generation == first_generation
     # Ignored old observations must not perturb current cache/report identity.
     assert write_snapshot(output_db, first)["status"] == "ignored_older_capture"
     assert _generation(output_db) == repeated_generation
@@ -815,6 +815,44 @@ def test_pg_output_generation_tracks_same_values_new_identity(output_db):
     assert _generation(output_db) != before
 
 
+def test_pg_unchanged_refetch_with_moving_fx_keeps_reports_current(output_db):
+    import json
+    from datetime import timedelta
+    from ingestion.altdata.sec_financial_snapshots import prepare_snapshot
+    from intelligence.fundamental_divergence import _upsert_divergence_chunk
+    from store.sec_financial_snapshots import write_snapshot
+
+    first = snapshot()
+    write_snapshot(output_db, first)
+    generation = _generation(output_db)
+    with output_db.begin() as conn:
+        assert _upsert_divergence_chunk(conn, [_divergence_candidate(generation)]) == 1
+        conn.execute(text("""INSERT INTO sector_health_snapshots
+            (sector_name,snapshot_date,score,sec_generation)
+            VALUES ('Technology','2026-11-01',70,:generation)"""),
+            {"generation": generation})
+
+    later = prepare_snapshot(
+        source_body=first.source_body, actor_id=first.actor_id, cik=first.cik,
+        request_started_at=first.request_started_at+timedelta(days=1),
+        received_at=first.received_at+timedelta(days=1),
+        fx_rates={"USD": 1.0, "EUR": 1.2, "JPY": 0.008},
+    )
+    assert later.snapshot_id == first.snapshot_id
+    result = write_snapshot(output_db, later)
+    assert result["status"] == "unchanged"
+    assert result["rows_written"] == 0
+    assert _generation(output_db) == generation
+    head = current_head(output_db)
+    assert head["request_started_at"] == later.request_started_at
+    assert head["received_at"] == later.received_at
+    assert json.loads(later.fx_json) == {}
+    with output_db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM sec_financial_snapshots")).scalar_one() == 1
+        assert conn.execute(text("SELECT ticker FROM fundamental_divergence_current")).scalar_one() == "NVDA"
+        assert conn.execute(text("SELECT sector_name FROM sector_health_snapshots_current")).scalar_one() == "Technology"
+
+
 def test_pg_output_generation_tracks_ttm_publication_without_head_change(output_db):
     from store.sec_financial_snapshots import write_snapshot
     from intelligence.company_financial_rollups import compute_ttm
@@ -827,10 +865,13 @@ def test_pg_output_generation_tracks_ttm_publication_without_head_change(output_
     assert after_generation != before_generation
     compute_ttm(output_db)
     assert _generation(output_db) == after_generation
+    # Recomputing identical content only advances operational metadata.
+    with output_db.begin() as conn:
+        conn.execute(text("UPDATE capital_flows_ttm_state SET computed_at=computed_at + interval '1 second'"))
+    assert _generation(output_db) == after_generation
     # Every mutable readiness dimension participates, including old late work.
     for assignment in (
         "quarter_fingerprint='changed-test-fingerprint'",
-        "computed_at=computed_at + interval '1 second'",
         "sec_snapshot_id=NULL",
     ):
         before_generation = _generation(output_db)
