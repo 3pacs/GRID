@@ -349,6 +349,22 @@ def test_5xx_backoff_exhausted(client: SchwabMarketClient, session, sleeps, log_
     assert sum("WARNING" in line or "retry" in line for line in log_lines) >= 3
 
 
+def test_errors_carry_the_http_status_that_ended_the_call(client: SchwabMarketClient, session, sleeps) -> None:
+    # A caller sharing the app's allowance tells a 429 from an outage by attribute, not message text.
+    session.get_queue += [FakeResponse(429)] * 4
+    with pytest.raises(SchwabTransientError) as limited:
+        client.quotes("SPY")
+    assert limited.value.status == 429
+    session.get_queue.append(FakeResponse(400))
+    with pytest.raises(SchwabError) as refused:
+        client.quotes("SPY")
+    assert refused.value.status == 400
+    session.get_queue += [requests.ConnectionError("boom")] * 4
+    with pytest.raises(SchwabTransientError) as network:
+        client.quotes("SPY")
+    assert network.value.status is None
+
+
 def test_network_error_retried(client: SchwabMarketClient, session, sleeps) -> None:
     session.get_queue += [requests.ConnectionError("boom"), FakeResponse(200, SPY_BODY)]
     assert "SPY" in client.quotes("SPY")

@@ -127,6 +127,10 @@ _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 class SchwabError(RuntimeError):
     """Base class for errors raised by this module. Never carries secrets."""
 
+    # HTTP status that ended a market-data GET, when one did (2026-11-21: a caller that
+    # shares the app's allowance must tell a 429 from an outage without reading the text).
+    status: int | None = None
+
 
 class SchwabConfigError(SchwabError):
     """App key / secret or token file not available or not private."""
@@ -639,9 +643,11 @@ class SchwabMarketClient:
                 continue
             if status == 429 or 500 <= status < 600:
                 if attempt >= self._max_retries:
-                    raise SchwabTransientError(
+                    exhausted = SchwabTransientError(
                         f"Schwab GET {path} returned HTTP {status} after {attempt + 1} attempts"
                     )
+                    exhausted.status = status
+                    raise exhausted
                 delay = self._backoff(attempt, resp.headers.get("Retry-After"))
                 log.warning(
                     "Schwab GET {path} returned HTTP {status}; retry {n} in {d:.1f}s",
@@ -651,7 +657,9 @@ class SchwabMarketClient:
                 attempt += 1
                 continue
             # Other 4xx: caller error, no retry. Never echo the body or headers.
-            raise SchwabError(f"Schwab GET {path} returned HTTP {status}")
+            refused = SchwabError(f"Schwab GET {path} returned HTTP {status}")
+            refused.status = status
+            raise refused
 
     # -- public read-only surface -----------------------------------------
 
