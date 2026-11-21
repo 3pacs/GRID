@@ -11,6 +11,7 @@ import requests
 from api.gamma_board_symbols import provider_symbol
 from ingestion.market_calendar import is_market_open, market_close_time
 from ingestion.schwab_market import SchwabMarketClient
+from ingestion import schwab_usage
 
 NY = ZoneInfo("America/New_York")
 OCC = re.compile(r"([A-Z]+) *(\d{6})([CP])(\d{8})\Z")
@@ -260,7 +261,7 @@ def _one_expiry(symbol, chain, day):
 def read_board(symbol: str, *, now: datetime, time_map: bool = False) -> dict:
     day = now.astimezone(NY).date()
     with requests.Session() as http:
-        reader = SchwabMarketClient(session=http, timeout=12, max_retries=0)
+        reader = SchwabMarketClient(session=http, timeout=12, max_retries=0, client=schwab_usage.client_name() + "/gamma_board_schwab")
         chain = reader.option_chain(
             provider_symbol(symbol),
             contractType="ALL",

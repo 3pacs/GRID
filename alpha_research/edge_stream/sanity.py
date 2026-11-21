@@ -12,7 +12,8 @@ close at 15:45) · G6 the window can supply n · G7 the data is fresh · G8 budg
 G9 decision before entry, lookahead-guarded harness · G10 instruments on the liquid list ·
 G11 the trade can pay its costs.
 
-G11 is the one check that reads bars, and only bars from **before** the window: on those
+G11 (session families; an event family has no session trade to price) is the one check that
+reads bars, and only bars from **before** the window: on those
 sessions it takes the family's entry and exit prices for every instrument and compares the
 policy cost floor (round trip) with the mean unsigned move between them. A directional rule
 that is right a fraction p of the time earns about (2p - 1) x mean |move| before costs, so
@@ -168,6 +169,13 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
            if P.LIQUIDITY.get(t) is None
            or (proposal["costs"].get(t) or {}).get("usd", 0) < P.COST_FLOORS[P.LIQUIDITY[t]]["usd"]
            or (proposal["costs"].get(t) or {}).get("bp", 0) < P.COST_FLOORS[P.LIQUIDITY[t]]["bp"]]
+    hedge = proposal.get("hedge")
+    if hedge is not None:
+        tier = P.LIQUIDITY.get(hedge.get("instrument"))
+        if hedge.get("instrument") != P.HEDGE_INSTRUMENT or tier is None \
+                or hedge.get("usd", 0) < P.COST_FLOORS[tier]["usd"] or hedge.get("bp", 0) < P.COST_FLOORS[tier]["bp"] \
+                or proposal.get("short_carry_annual", 0) < P.SHORT_CARRY_ANNUAL:
+            bad.append("hedge leg / short carry")
     r["G4_costs"] = "ok" if instruments and not bad else f"costs below the policy floor for {bad}"
 
     # G5 executable exit
@@ -208,8 +216,11 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
 
     # G8 budget
     epoch = proposal.get("epoch", today.year)
+    closed = state.closed_families().get((proposal.get("family"), proposal.get("group")))
     if proposal["stage"] == 1 and state.stage1_count(epoch) >= P.MAX_REGISTRATIONS_PER_YEAR:
         r["G8_budget"] = f"{epoch} budget of {P.MAX_REGISTRATIONS_PER_YEAR} looks spent"
+    elif proposal["stage"] == 1 and closed:
+        r["G8_budget"] = f"family closed in this group: its confirmation {closed} did not pass"
     else:
         try:
             bootstrap_b(proposal["alpha_trial"])
@@ -220,6 +231,12 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
     # G9 decision before entry, guarded harness
     if family is None:
         r["G9_no_lookahead"] = "no family"
+    elif getattr(family, "kind", "session") == "event":
+        # decided at the reaction day's close, entered at the next session's open; the family's
+        # decide() refuses any bar after the reaction day (LookaheadError)
+        ok = (family.decision, family.entry) == ("reaction-day close", "next session open") \
+            and hasattr(family, "decide") and hasattr(family, "event_trade")
+        r["G9_no_lookahead"] = "ok" if ok else "entry is not after the decision"
     else:
         # the entry price is the close of the entry bar: it must not be earlier than the decision
         ok = _plus1(family.entry_hm) >= family.decision_hm and hasattr(family, "session_trade")
@@ -229,8 +246,12 @@ def check(proposal: dict, state: StreamState, today: date) -> dict[str, str]:
     missing = [t for t in instruments if t not in P.LIQUIDITY]
     r["G10_liquid"] = "ok" if instruments and not missing else f"not on the liquid list: {missing}"
 
-    # G11 cost feasibility (stage 1 only: a confirmation follows a look judged net of costs)
+    # G11 cost feasibility (stage 1 only: a confirmation follows a look judged net of costs).
+    # Session families only: it prices the family's own session_trade on minute bars. An event
+    # family (EC1: daily bars, a multi-day hedged hold) has no session trade to price; its look
+    # is judged net of its four cost floors and the short-leg carry.
     if (_feasibility_source is not None and proposal["stage"] == 1 and family is not None
+            and getattr(family, "kind", "session") == "session"
             and all(v == "ok" for v in r.values())):
         r["G11_cost_feasible"] = _g11(proposal, _feasibility_source, today)
     return r
