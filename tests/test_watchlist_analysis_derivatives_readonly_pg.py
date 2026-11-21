@@ -40,6 +40,8 @@ def test_analysis_and_flow_keep_measured_data_without_get_writes():
             total_oi DOUBLE PRECISION, total_volume DOUBLE PRECISION,
             spot_price DOUBLE PRECISION, iv_atm DOUBLE PRECISION,
             iv_25d_put DOUBLE PRECISION, iv_25d_call DOUBLE PRECISION,
+            iv_m90_put_v1 DOUBLE PRECISION, iv_m110_call_v1 DOUBLE PRECISION,
+            wing_iv_metadata JSONB,
             term_structure_slope DOUBLE PRECISION, oi_concentration DOUBLE PRECISION)"""))
         conn.execute(text("""CREATE TABLE decision_journal (
             inferred_state TEXT, state_confidence DOUBLE PRECISION,

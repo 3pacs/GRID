@@ -222,6 +222,8 @@ def scratch_pg14(monkeypatch):
                     near_expiry DATE, spot_price DOUBLE PRECISION,
                     iv_atm DOUBLE PRECISION, iv_25d_put DOUBLE PRECISION,
                     iv_25d_call DOUBLE PRECISION, term_structure_slope DOUBLE PRECISION,
+                    iv_m90_put_v1 DOUBLE PRECISION, iv_m110_call_v1 DOUBLE PRECISION,
+                    wing_iv_metadata JSONB,
                     oi_concentration DOUBLE PRECISION, UNIQUE (ticker, signal_date)
                 )
             """)
@@ -295,7 +297,6 @@ def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14,
     monkeypatch.setattr(options, "compute_max_pain", lambda *_args: 100.0)
     monkeypatch.setattr(options, "compute_iv_skew", lambda *_args: 0.0)
     monkeypatch.setattr(options, "_compute_atm_iv", lambda *_args: 0.2)
-    monkeypatch.setattr(options, "_compute_wing_iv", lambda *_args, **_kwargs: 0.2)
     monkeypatch.setattr(options, "_compute_oi_concentration", lambda *_args: 0.5)
 
     with engine.begin() as conn:
