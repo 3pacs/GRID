@@ -38,6 +38,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.av_transcript_plan import AV_TRANSCRIPT_NOT_SUPERSEDED_SQL
+
 
 # ── Catalyst types ─────────────────────────────────────────────────────────
 
@@ -184,18 +186,21 @@ def _read_earnings_events(
     # Additive: pull filings-level events from earnings_events that the
     # calendar puller hasn't materialised yet.  Use period_end as the
     # canonical "earnings event date" — same semantic as earnings_date.
+    # A pre-#1051 AV transcript row whose fiscal quarter now has a verified
+    # row is the same call at a calendar-approximated period_end: skip it
+    # (ingestion/av_transcript_plan.py), or the quarter appears twice.
     try:
         with engine.connect() as conn:
             ev_rows = conn.execute(
                 text(
                     """
-                    SELECT ticker, period_end, fiscal_quarter, event_type
-                    FROM earnings_events
-                    WHERE event_type IN ('10-K', '10-Q', 'EARNINGS_CALL')
-                      AND period_end BETWEEN :s AND :e
-                      AND ticker IS NOT NULL
-                      AND period_end IS NOT NULL
-                    """
+                    SELECT e.ticker, e.period_end, e.fiscal_quarter, e.event_type
+                    FROM earnings_events e
+                    WHERE e.event_type IN ('10-K', '10-Q', 'EARNINGS_CALL')
+                      AND e.period_end BETWEEN :s AND :e
+                      AND e.ticker IS NOT NULL
+                      AND e.period_end IS NOT NULL
+                    """ + AV_TRANSCRIPT_NOT_SUPERSEDED_SQL
                 ).bindparams(s=start, e=end),
             ).fetchall()
     except Exception as exc:  # noqa: BLE001
