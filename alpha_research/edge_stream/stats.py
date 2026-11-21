@@ -4,12 +4,18 @@ Expectancy after costs, never win rate: mean net > 0 overall and on each side,
 a session-resampled percentile bootstrap lower bound at ``1 - alpha_trial`` above
 zero, mean net above always-long on the same trades, and positive in at least two
 of three equal time thirds. Trades on the same session are resampled together
-(pooled instruments share a session's market).
+(pooled instruments share a session's market): the session, a day or an ISO week,
+is the unit noise is measured in, and a finer unit is refused.
+
+A stage-1 look is a *discovery* (policy ``evidence_bar``): a trial that clears the
+test is refitted without its largest calendar year, and one whose effect disappears
+is an ``EPISODE``, not a ``PASS``.
 """
 
 from __future__ import annotations
 
 import math
+import re
 
 import numpy as np
 
@@ -65,8 +71,48 @@ def _f(x) -> float | None:
     return None if not math.isfinite(x) else round(x, 10)
 
 
-def judge(trades: list[dict], alpha_trial: float, directional: bool = True) -> dict:
-    """Verdict of one trial. ``trades`` rows: session, side (+1/-1), net, gross_long_net."""
+_NOISE_UNIT = re.compile("|".join(f"(?:{pattern})" for pattern in P.NOISE_UNITS.values()))
+
+
+def largest_year_out(trades: list[dict]) -> dict:
+    """The refit of a discovery without its largest calendar year.
+
+    The largest year is the one with the largest summed net (ties: the earliest).
+    ``status`` is ``survives`` when the mean net of the remaining trades is still above
+    zero, ``disappears`` when it is not, and ``not_possible`` when fewer than
+    ``policy.YEAR_OUT_N_MIN`` trades remain (a one-year window leaves none).
+    """
+    by_year: dict[str, list[float]] = {}
+    for t in trades:
+        by_year.setdefault(t["session"][:4], []).append(float(t["net"]))
+    sums = {year: math.fsum(values) for year, values in by_year.items()}
+    year = min(sums, key=lambda y: (-sums[y], y))
+    rest = [x for y, values in by_year.items() if y != year for x in values]
+    total = math.fsum(sums.values())
+    out = {
+        "years": sorted(by_year),
+        "year_left_out": year,
+        "n_left_out": len(by_year[year]),
+        "share_of_summed_net": _f(sums[year] / total) if total > 0 else None,
+        "n_without": len(rest),
+        "mean_net_without": _f(math.fsum(rest) / len(rest)) if rest else None,
+    }
+    if len(rest) < P.YEAR_OUT_N_MIN:
+        out["status"] = "not_possible"
+    else:
+        out["status"] = "survives" if math.fsum(rest) / len(rest) > 0 else "disappears"
+    return out
+
+
+def judge(trades: list[dict], alpha_trial: float, directional: bool = True, discovery: bool = False) -> dict:
+    """Verdict of one trial. ``trades`` rows: session, side (+1/-1), net, always_long_net.
+
+    ``discovery`` (a stage-1 look under the two-stage bar): a trial that would PASS is
+    refitted by :func:`largest_year_out` and is an EPISODE when its effect disappears.
+    """
+    unit = sorted({str(t["session"]) for t in trades if not _NOISE_UNIT.fullmatch(str(t["session"]))})
+    if unit:
+        raise ValueError(f"a trade's session must be a day or an ISO week, not {unit[0]!r}")
     n = len(trades)
     longs = [t for t in trades if t["side"] > 0]
     shorts = [t for t in trades if t["side"] < 0]
@@ -118,4 +164,9 @@ def judge(trades: list[dict], alpha_trial: float, directional: bool = True) -> d
         fails.append("does not beat always-long on the same trades")
     if sum(1 for x in thirds if x > 0) < P.THIRDS_REQUIRED:
         fails.append(f"positive in fewer than {P.THIRDS_REQUIRED} of 3 thirds")
+    if discovery and not fails:
+        out["largest_year_out"] = refit = largest_year_out(trades)
+        if refit["status"] == "disappears":
+            return {**out, "verdict": "EPISODE",
+                    "reasons": [f"mean net <= 0 with {refit['year_left_out']} left out"]}
     return {**out, "verdict": "FAIL" if fails else "PASS", "reasons": fails}

@@ -28,6 +28,8 @@ from scipy.stats import norm
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.options_iv import positive_finite, wing_comparison_key
+
 from physics.dealer_gamma import (
     _d1,
     bs_charm,
@@ -316,8 +318,10 @@ class VolSurfaceEngine:
     ) -> list[dict[str, Any]]:
         """Compute IV skew metrics for each expiry.
 
-        For each expiry: 25-delta put IV, ATM IV, 25-delta call IV, and
-        derived skew, risk reversal, and butterfly spread.
+        For each expiry: ATM-IV Black-Scholes delta-strike proxies and their
+        skew, reversal and butterfly. These are not smile-consistent 25-delta
+        IVs and are separate from persisted fixed-moneyness wings. No fixed
+        strike fallback or out-of-range clamping is permitted.
 
         Parameters:
             ticker: Underlying ticker symbol.
@@ -341,6 +345,12 @@ class VolSurfaceEngine:
 
         for expiry in sorted(chain["expiry"].unique()):
             exp_data = chain[chain["expiry"] == expiry]
+            exp_data = exp_data[
+                np.isfinite(exp_data["strike"]) & (exp_data["strike"] > 0)
+                & np.isfinite(exp_data["iv"]) & (exp_data["iv"] > 0)
+            ]
+            if exp_data.empty:
+                continue
             dte = int(exp_data["dte"].iloc[0])
             if dte <= 0:
                 continue
@@ -379,13 +389,6 @@ class VolSurfaceEngine:
             call_25d_iv = self._interpolate_iv(calls, call_25d_strike)
 
             if put_25d_iv is None or call_25d_iv is None:
-                # Fallback: use 90% and 110% moneyness
-                put_wing = puts[(puts["strike"] >= spot * 0.88) & (puts["strike"] <= spot * 0.92)]
-                call_wing = calls[(calls["strike"] >= spot * 1.08) & (calls["strike"] <= spot * 1.12)]
-                put_25d_iv = float(put_wing["iv"].mean()) if not put_wing.empty else None
-                call_25d_iv = float(call_wing["iv"].mean()) if not call_wing.empty else None
-
-            if put_25d_iv is None or call_25d_iv is None:
                 continue
 
             skew = put_25d_iv - call_25d_iv
@@ -396,8 +399,19 @@ class VolSurfaceEngine:
                 "expiry": str(expiry),
                 "dte": dte,
                 "atm_iv": round(atm_iv, 4),
-                "put_25d_iv": round(put_25d_iv, 4),
-                "call_25d_iv": round(call_25d_iv, 4),
+                "put_25d_iv": None, "call_25d_iv": None,
+                "put_delta_strike_proxy_iv": round(put_25d_iv, 4),
+                "call_delta_strike_proxy_iv": round(call_25d_iv, 4),
+                "method": "bs_atm_iv_delta_strike_proxy_v1",
+                "method_detail": {"delta_convention": "unadjusted_spot_zero_dividend",
+                                  "target_abs_delta": .25, "rate": self.r,
+                                  "strike_iv": atm_iv, "spot": spot,
+                                  "put_target_strike": put_25d_strike,
+                                  "call_target_strike": call_25d_strike,
+                                  "chain_source": "options_snapshots_view",
+                                  "provider": None, "capture_batch_id": None,
+                                  "spot_source": "date_bounded_legacy_reader",
+                                  "snapshot_date": str(as_of_date)},
                 "skew": round(skew, 4),
                 "risk_reversal": round(risk_reversal, 4),
                 "butterfly": round(butterfly, 4),
@@ -697,8 +711,8 @@ class VolSurfaceEngine:
         with self.engine.connect() as conn:
             rows = conn.execute(
                 text("""
-                    SELECT signal_date, iv_atm, iv_25d_put, iv_25d_call,
-                           term_structure_slope
+                    SELECT signal_date, iv_atm, iv_m90_put_v1, iv_m110_call_v1,
+                           term_structure_slope, wing_iv_metadata
                     FROM options_daily_signals
                     WHERE ticker = :ticker
                     AND signal_date >= :start AND signal_date <= :end
@@ -716,13 +730,13 @@ class VolSurfaceEngine:
             }
 
         df = pd.DataFrame(rows, columns=[
-            "signal_date", "iv_atm", "iv_25d_put", "iv_25d_call",
-            "term_structure_slope",
+            "signal_date", "iv_atm", "iv_m90_put_v1", "iv_m110_call_v1",
+            "term_structure_slope", "wing_iv_metadata",
         ])
 
         # Current values (latest row)
         current = df.iloc[-1]
-        history = df.iloc[:-1] if len(df) > 1 else df
+        history = df.iloc[:-1]
 
         result: dict[str, Any] = {"ticker": ticker, "as_of_date": str(as_of_date)}
 
@@ -751,19 +765,32 @@ class VolSurfaceEngine:
             result["iv_rank"] = None
             result["z_score"] = None
 
-        # Skew percentile (25d put - 25d call)
-        put_iv = current["iv_25d_put"]
-        call_iv = current["iv_25d_call"]
-        if pd.notna(put_iv) and pd.notna(call_iv):
-            current_skew = float(put_iv) - float(call_iv)
-            hist_skew = (history["iv_25d_put"] - history["iv_25d_call"]).dropna()
-            if not hist_skew.empty:
-                result["skew_current"] = round(current_skew, 4)
-                result["skew_percentile"] = round(float((hist_skew < current_skew).mean() * 100), 1)
-            else:
-                result["skew_percentile"] = None
-        else:
-            result["skew_percentile"] = None
+        # Versioned fixed-moneyness spread. Unknown legacy, provider changes
+        # and different calendar tenors never enter this distribution.
+        metadata = current["wing_iv_metadata"]
+        key = wing_comparison_key(metadata)
+        def spread(row):
+            if wing_comparison_key(row["wing_iv_metadata"]) != key or key is None:
+                return None
+            if str(row["signal_date"]) != row["wing_iv_metadata"].get("snap_date"):
+                return None
+            put = positive_finite(row["iv_m90_put_v1"])
+            call = positive_finite(row["iv_m110_call_v1"])
+            return put - call if put is not None and call is not None else None
+
+        current_skew = spread(current)
+        hist_skew = [value for _, row in history.iterrows() if (value := spread(row)) is not None]
+        result.update({
+            "skew_current": round(current_skew, 4) if current_skew is not None else None,
+            "skew_percentile": None, "skew_history_count": len(hist_skew),
+            "skew_history_excluded": len(history) - len(hist_skew),
+            "skew_method": metadata.get("method") if isinstance(metadata, dict) else "unknown_legacy",
+            "skew_lineage": metadata,
+            "skew_unavailable_reason": "current_wings_or_method_unavailable" if current_skew is None else "insufficient_compatible_history",
+        })
+        if current_skew is not None and len(hist_skew) >= 2:
+            result["skew_percentile"] = round(sum(v < current_skew for v in hist_skew) / len(hist_skew) * 100, 1)
+            result["skew_unavailable_reason"] = None
 
         # Term structure slope percentile
         ts_slope = current["term_structure_slope"]
@@ -1095,10 +1122,14 @@ class VolSurfaceEngine:
         strikes = sorted_slice["strike"].values
         ivs = sorted_slice["iv"].values
 
-        # Clamp to bounds
-        if target_strike <= strikes[0]:
+        # Interpolate only inside finite positive observed support.
+        if not np.isfinite(strikes).all() or not np.isfinite(ivs).all() or (ivs <= 0).any():
+            return None
+        if target_strike < strikes[0] or target_strike > strikes[-1]:
+            return None
+        if target_strike == strikes[0]:
             return float(ivs[0])
-        if target_strike >= strikes[-1]:
+        if target_strike == strikes[-1]:
             return float(ivs[-1])
 
         # Find bracketing strikes and interpolate

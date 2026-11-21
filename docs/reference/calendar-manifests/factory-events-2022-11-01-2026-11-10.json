@@ -1,0 +1,951 @@
+{
+ "coverage": {
+  "complete": true,
+  "end": "2026-11-10",
+  "events": [
+   "fomc",
+   "cpi",
+   "nfp"
+  ],
+  "start": "2022-11-01"
+ },
+ "derived_from": {
+  "generated_at": "2026-11-13T04:12:15+00:00",
+  "path": "config/econ_release_dates.json",
+  "sha256": "fed7698d061c5fe504a57efc601e9966f3e7e567095b5c8d7e2d1fbbfcffc6a3",
+  "version": "econ-release-dates/1"
+ },
+ "events": [
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2022-11-02",
+   "event": "fomc",
+   "known_at": "2021-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2022-11-04",
+   "event": "nfp",
+   "known_at": "2022-11-04T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2022-11-10",
+   "event": "cpi",
+   "known_at": "2022-11-10T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2022-12-02",
+   "event": "nfp",
+   "known_at": "2022-12-02T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2022-12-13",
+   "event": "cpi",
+   "known_at": "2022-12-13T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2022-12-14",
+   "event": "fomc",
+   "known_at": "2021-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-01-06",
+   "event": "nfp",
+   "known_at": "2023-01-06T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-01-12",
+   "event": "cpi",
+   "known_at": "2023-01-12T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-02-01",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-02-03",
+   "event": "nfp",
+   "known_at": "2023-02-03T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-02-14",
+   "event": "cpi",
+   "known_at": "2023-02-14T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-03-10",
+   "event": "nfp",
+   "known_at": "2023-03-10T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-03-14",
+   "event": "cpi",
+   "known_at": "2023-03-14T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-03-22",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-04-07",
+   "event": "nfp",
+   "known_at": "2023-04-07T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-04-12",
+   "event": "cpi",
+   "known_at": "2023-04-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-05-03",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-05-05",
+   "event": "nfp",
+   "known_at": "2023-05-05T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-05-10",
+   "event": "cpi",
+   "known_at": "2023-05-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-06-02",
+   "event": "nfp",
+   "known_at": "2023-06-02T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-06-13",
+   "event": "cpi",
+   "known_at": "2023-06-13T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-06-14",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-07-07",
+   "event": "nfp",
+   "known_at": "2023-07-07T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-07-12",
+   "event": "cpi",
+   "known_at": "2023-07-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-07-26",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-08-04",
+   "event": "nfp",
+   "known_at": "2023-08-04T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-08-10",
+   "event": "cpi",
+   "known_at": "2023-08-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-09-01",
+   "event": "nfp",
+   "known_at": "2023-09-01T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-09-13",
+   "event": "cpi",
+   "known_at": "2023-09-13T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-09-20",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-10-06",
+   "event": "nfp",
+   "known_at": "2023-10-06T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-10-12",
+   "event": "cpi",
+   "known_at": "2023-10-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-11-01",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-11-03",
+   "event": "nfp",
+   "known_at": "2023-11-03T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-11-14",
+   "event": "cpi",
+   "known_at": "2023-11-14T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-12-08",
+   "event": "nfp",
+   "known_at": "2023-12-08T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2023-12-12",
+   "event": "cpi",
+   "known_at": "2023-12-12T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2023-12-13",
+   "event": "fomc",
+   "known_at": "2022-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-01-05",
+   "event": "nfp",
+   "known_at": "2024-01-05T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-01-11",
+   "event": "cpi",
+   "known_at": "2024-01-11T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-01-31",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-02-02",
+   "event": "nfp",
+   "known_at": "2024-02-02T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-02-13",
+   "event": "cpi",
+   "known_at": "2024-02-13T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-03-08",
+   "event": "nfp",
+   "known_at": "2024-03-08T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-03-12",
+   "event": "cpi",
+   "known_at": "2024-03-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-03-20",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-04-05",
+   "event": "nfp",
+   "known_at": "2024-04-05T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-04-10",
+   "event": "cpi",
+   "known_at": "2024-04-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-05-01",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-05-03",
+   "event": "nfp",
+   "known_at": "2024-05-03T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-05-15",
+   "event": "cpi",
+   "known_at": "2024-05-15T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-06-07",
+   "event": "nfp",
+   "known_at": "2024-06-07T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-06-12",
+   "event": "cpi",
+   "known_at": "2024-06-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-06-12",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-07-05",
+   "event": "nfp",
+   "known_at": "2024-07-05T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-07-11",
+   "event": "cpi",
+   "known_at": "2024-07-11T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-07-31",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-08-02",
+   "event": "nfp",
+   "known_at": "2024-08-02T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-08-14",
+   "event": "cpi",
+   "known_at": "2024-08-14T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-09-06",
+   "event": "nfp",
+   "known_at": "2024-09-06T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-09-11",
+   "event": "cpi",
+   "known_at": "2024-09-11T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-09-18",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-10-04",
+   "event": "nfp",
+   "known_at": "2024-10-04T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-10-10",
+   "event": "cpi",
+   "known_at": "2024-10-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-11-01",
+   "event": "nfp",
+   "known_at": "2024-11-01T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-11-07",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-11-13",
+   "event": "cpi",
+   "known_at": "2024-11-13T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-12-06",
+   "event": "nfp",
+   "known_at": "2024-12-06T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2024-12-11",
+   "event": "cpi",
+   "known_at": "2024-12-11T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2024-12-18",
+   "event": "fomc",
+   "known_at": "2023-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-01-10",
+   "event": "nfp",
+   "known_at": "2025-01-10T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-01-15",
+   "event": "cpi",
+   "known_at": "2025-01-15T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-01-29",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-02-07",
+   "event": "nfp",
+   "known_at": "2025-02-07T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-02-12",
+   "event": "cpi",
+   "known_at": "2025-02-12T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-03-07",
+   "event": "nfp",
+   "known_at": "2025-03-07T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-03-12",
+   "event": "cpi",
+   "known_at": "2025-03-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-03-19",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-04-04",
+   "event": "nfp",
+   "known_at": "2025-04-04T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-04-10",
+   "event": "cpi",
+   "known_at": "2025-04-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-05-02",
+   "event": "nfp",
+   "known_at": "2025-05-02T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-05-07",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-05-13",
+   "event": "cpi",
+   "known_at": "2025-05-13T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-06-06",
+   "event": "nfp",
+   "known_at": "2025-06-06T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-06-11",
+   "event": "cpi",
+   "known_at": "2025-06-11T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-06-18",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-07-03",
+   "event": "nfp",
+   "known_at": "2025-07-03T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-07-15",
+   "event": "cpi",
+   "known_at": "2025-07-15T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-07-30",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-08-01",
+   "event": "nfp",
+   "known_at": "2025-08-01T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-08-12",
+   "event": "cpi",
+   "known_at": "2025-08-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-09-05",
+   "event": "nfp",
+   "known_at": "2025-09-05T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-09-11",
+   "event": "cpi",
+   "known_at": "2025-09-11T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-09-17",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-10-24",
+   "event": "cpi",
+   "known_at": "2025-10-24T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-10-29",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-11-20",
+   "event": "nfp",
+   "known_at": "2025-11-20T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2025-12-10",
+   "event": "fomc",
+   "known_at": "2024-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-12-16",
+   "event": "nfp",
+   "known_at": "2025-12-16T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2025-12-18",
+   "event": "cpi",
+   "known_at": "2025-12-18T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-01-09",
+   "event": "nfp",
+   "known_at": "2026-01-09T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-01-13",
+   "event": "cpi",
+   "known_at": "2026-01-13T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-01-28",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-02-11",
+   "event": "nfp",
+   "known_at": "2026-02-11T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-02-13",
+   "event": "cpi",
+   "known_at": "2026-02-13T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-03-06",
+   "event": "nfp",
+   "known_at": "2026-03-06T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-03-11",
+   "event": "cpi",
+   "known_at": "2026-03-11T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-03-18",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-04-03",
+   "event": "nfp",
+   "known_at": "2026-04-03T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-04-10",
+   "event": "cpi",
+   "known_at": "2026-04-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-04-29",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-05-08",
+   "event": "nfp",
+   "known_at": "2026-05-08T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-05-12",
+   "event": "cpi",
+   "known_at": "2026-05-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-06-05",
+   "event": "nfp",
+   "known_at": "2026-06-05T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-06-10",
+   "event": "cpi",
+   "known_at": "2026-06-10T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-06-17",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-07-02",
+   "event": "nfp",
+   "known_at": "2026-07-02T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-07-14",
+   "event": "cpi",
+   "known_at": "2026-07-14T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-07-29",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-08-07",
+   "event": "nfp",
+   "known_at": "2026-08-07T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-08-12",
+   "event": "cpi",
+   "known_at": "2026-08-12T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-09-04",
+   "event": "nfp",
+   "known_at": "2026-09-04T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-09-11",
+   "event": "cpi",
+   "known_at": "2026-09-11T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-09-16",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-10-02",
+   "event": "nfp",
+   "known_at": "2026-10-02T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-10-14",
+   "event": "cpi",
+   "known_at": "2026-10-14T00:00:00-04:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "fed_schedule_prior_year",
+   "day": "2026-10-28",
+   "event": "fomc",
+   "known_at": "2025-12-31T00:00:00-05:00",
+   "time_et": "14:00"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-11-06",
+   "event": "nfp",
+   "known_at": "2026-11-06T00:00:00-05:00",
+   "time_et": "08:30"
+  },
+  {
+   "basis": "release_day_bound",
+   "day": "2026-11-10",
+   "event": "cpi",
+   "known_at": "2026-11-10T00:00:00-05:00",
+   "time_et": "08:30"
+  }
+ ],
+ "excluded": [
+  {
+   "day": "2023-02-10",
+   "event": "cpi",
+   "reason": "CPI seasonal-factor revision; January's CPI came out 2023-02-14"
+  },
+  {
+   "day": "2024-02-09",
+   "event": "cpi",
+   "reason": "CPI seasonal-factor revision; January's CPI came out 2024-02-13"
+  },
+  {
+   "day": "2024-01-10",
+   "event": "nfp",
+   "reason": "a second Employment Situation date; December's report came out 2024-01-05"
+  },
+  {
+   "day": "2024-08-21",
+   "event": "nfp",
+   "reason": "the preliminary benchmark revision; July's report came out 2024-08-02"
+  }
+ ],
+ "known_at_rules": {
+  "cpi": "release_day_bound: BLS announces every release date before its release day (the 2025 and 2026 shutdown reschedules included), but the as-published annual schedule is not captured here; so a date counts only from 00:00 ET on its own day, never the day before.",
+  "fomc": "fed_schedule_prior_year: the Fed publishes a year's scheduled meetings during the year before (the 2026-11-13 source snapshot already lists 2027's); bound: 00:00 ET on Dec 31 of the prior year. Unscheduled meetings are not in the source and never count.",
+  "nfp": "release_day_bound: as cpi."
+ },
+ "schema": "factory-events/1"
+}

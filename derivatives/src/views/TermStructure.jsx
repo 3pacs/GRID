@@ -64,7 +64,7 @@ function TermStructure() {
                 {!loading && !error && (
                     <>
                         <div style={styles.chartPlaceholder}>
-                            Term Structure Curve — {points.length} expiries
+                            Term Structure Curve — {points.length} expiries; wing means within ±3% of spot around each target
                         </div>
                         {points.length > 0 && (
                             <div style={{ overflowX: 'auto' }}>
@@ -74,8 +74,8 @@ function TermStructure() {
                                             <th style={{ ...styles.th, textAlign: 'left' }}>Expiry</th>
                                             <th style={styles.th}>DTE</th>
                                             <th style={styles.th}>IV ATM</th>
-                                            <th style={styles.th}>25d Put</th>
-                                            <th style={styles.th}>25d Call</th>
+                                            <th style={styles.th}>Put 90% spot proxy</th>
+                                            <th style={styles.th}>Call 110% spot proxy</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -89,10 +89,10 @@ function TermStructure() {
                                                     {p.iv_atm != null ? (p.iv_atm * 100).toFixed(1) + '%' : '--'}
                                                 </td>
                                                 <td style={styles.td}>
-                                                    {p.iv_25d_put != null ? (p.iv_25d_put * 100).toFixed(1) + '%' : '--'}
+                                                    {p.iv_m90_put_v1 != null ? (p.iv_m90_put_v1 * 100).toFixed(1) + '%' : '--'}
                                                 </td>
                                                 <td style={styles.td}>
-                                                    {p.iv_25d_call != null ? (p.iv_25d_call * 100).toFixed(1) + '%' : '--'}
+                                                    {p.iv_m110_call_v1 != null ? (p.iv_m110_call_v1 * 100).toFixed(1) + '%' : '--'}
                                                 </td>
                                             </tr>
                                         ))}
