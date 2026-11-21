@@ -33,6 +33,7 @@ import urllib.request
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -508,10 +509,62 @@ def receipts(folder: str, prev_day: date, as_of: datetime) -> Section:
 
 # ── the paper record (D4, 3pacs/GRID#14) ─────────────────────────────────────
 
-def paper_record(path: str | None, kind: str) -> Section:
+PAPER_SCHEMA = "desk-paper-summary/1"
+PAPER_STALE = timedelta(hours=36)
+LOOK_WORDS = {"LOOK DUE": "LOOK DUE: the owner runs the registered look once (not a pass)",
+              "NO LOOK": "NO LOOK: description, not evidence", "COLLECTING": "COLLECTING", "SPENT": "SPENT"}
+
+
+def _r(v: Any) -> str:
+    return f"{v:+.3f}" if isinstance(v, (int, float)) else "n/a"
+
+
+def paper_record(path: str | None, kind: str, as_of: datetime | None = None) -> Section:
+    """The D4 paper record's summary (desk-paper-summary/1, written by the paper-record job, 3pacs/gex).
+
+    Read format agreed with its owner (side-session note paper-record-read-format-20261121.md): the summary file
+    only, never its ledger. The summary has already applied each registration's disclosure rule: ``stats`` is
+    null unless the registration allows interim outcomes or the look is SPENT. The brief copies ``stats`` when it is
+    non-null and never derives a mean, sign or hit rate from counts. Gross-only stats (before costs) are not shown.
+    """
     title, key = "Graded paper calls (R after costs vs the null)", "paper_record"
     if not path:
         return Section(key, title, "not_supplied", "paper record (D4 #14)",
                        problems=("the graded paper record does not exist yet; no call is graded in R here",))
-    return Section(key, title, "not_supplied", path,
-                   problems=("the paper record's reader is not written yet (format agreed with its owner first)",))
+    p = Path(path)
+    if not p.is_file():
+        return Section(key, title, "not_supplied", path,
+                       problems=("the paper record's summary is not written yet; no call is graded in R here",))
+    try:
+        d = json.loads(p.read_text())
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", path, problems=(f"summary unreadable ({type(exc).__name__})",))
+    if d.get("schema") != PAPER_SCHEMA:
+        return Section(key, title, "unknown", path, problems=(f"schema {d.get('schema')!r}, expected {PAPER_SCHEMA}",))
+    if d.get("paper_only") is not True:
+        return Section(key, title, "unknown", path, problems=("summary does not declare paper_only; not used",))
+    clock = parse_clock(d.get("as_of"))
+    problems = [f"{k}: {v} (its modules were not refreshed)" for k, v in sorted((d.get("errors") or {}).items())]
+    if clock is not None and as_of is not None and as_of - clock > PAPER_STALE:
+        problems.append(f"summary as of {iso(clock)} is older than 36 h")
+    lines = [f"grade run {d.get('run_id')}, as of {iso(clock)}"]
+    for m in d.get("modules") or []:
+        look = m.get("look") or {}
+        status = LOOK_WORDS.get(look.get("status"), str(look.get("status")))
+        g = m.get("grades") or {}
+        line = (f"{m.get('name') or m.get('module_id')}: {status}; {look.get('have')} of {look.get('need')} "
+                f"{look.get('unit') or ''}".rstrip() + f"; graded {g.get('graded', 0)}, no trade {g.get('no_trade', 0)}")
+        st = m.get("stats")
+        if isinstance(st, dict):
+            line += (f"; R after costs (registration allows display): n {st.get('n')}, mean {_r(st.get('mean_r'))} "
+                     f"vs null {_r(st.get('null_mean_r'))}, excess {_r(st.get('excess_mean_r'))}")
+            if look.get("status") == "SPENT" and look.get("result"):
+                line += f"; look result {look.get('result')}"
+        elif m.get("stats_withheld"):
+            line += f"; outcomes withheld ({m['stats_withheld']})"
+        lines.append(line)
+    desk = d.get("desk") or {}
+    if desk:
+        looks = ", ".join(f"{k} {v}" for k, v in sorted((desk.get("looks") or {}).items()))
+        lines.append(f"desk: {desk.get('modules')} modules, {desk.get('graded')} graded calls; looks {looks or 'none'}")
+    return Section(key, title, "ok", path, clock, tuple(lines), {"run_id": d.get("run_id")}, tuple(problems))

@@ -295,9 +295,54 @@ def test_gex_withheld_is_a_problem_scheduled_stop_is_not():
     assert S.gex_state("u", POST, fetch=state("strike_window")).problems == ("current GEX withheld: strike_window",)
 
 
-def test_paper_record_not_supplied():
+def test_paper_record_not_supplied(tmp_path):
     sec = S.paper_record(None, "post_close")
     assert sec.status == "not_supplied" and "no call is graded in R" in sec.problems[0]
+    missing = S.paper_record(str(tmp_path / "summary.json"), "post_close", POST)
+    assert missing.status == "not_supplied"
+
+
+def _paper(tmp_path, **over):
+    doc = {"schema": "desk-paper-summary/1", "run_id": "r1", "as_of": "2026-11-20T21:50:30Z", "paper_only": True,
+           "errors": {"selector": "ledger locked"},
+           "modules": [
+               {"module_id": "fly-shadow/1", "name": "Fly", "look": {"status": "COLLECTING", "have": 6, "need": 100,
+                "unit": "traded sessions"}, "grades": {"graded": 6, "no_trade": 1}, "stats": None,
+                "stats_withheld": "registration: one look at 100", "stats_gross_only": {"mean_r": 9.9}},
+               {"module_id": "x/1", "name": "Open one", "look": {"status": "LOOK DUE", "have": 30, "need": 30},
+                "grades": {"graded": 30}, "stats": {"n": 30, "mean_r": 0.125, "null_mean_r": -0.05,
+                                                     "excess_mean_r": 0.175}},
+               {"module_id": "selector/llm", "name": "LLM chooser", "look": {"status": "NO LOOK"}, "grades": {},
+                "stats": None}],
+           "desk": {"modules": 3, "graded": 36, "looks": {"COLLECTING": 1, "LOOK DUE": 1, "NO LOOK": 1}}}
+    doc.update(over)
+    p = tmp_path / "summary.json"
+    p.write_text(json.dumps(doc))
+    return str(p)
+
+
+def test_paper_record_follows_its_disclosure(tmp_path):
+    sec = S.paper_record(_paper(tmp_path), "post_close", POST)
+    text_ = "\n".join(sec.lines)
+    assert sec.status == "ok" and sec.source_clock == z("2026-11-20T21:50:30Z")
+    assert "outcomes withheld (registration: one look at 100)" in text_ and "9.9" not in text_   # no gross-only
+    assert "mean +0.125 vs null -0.050" in text_                     # stats copied only where supplied
+    assert "the owner runs the registered look once (not a pass)" in text_
+    assert "description, not evidence" in text_
+    assert any("selector: ledger locked" in p for p in sec.problems)
+
+
+def test_paper_record_after_clock_and_stale(tmp_path):
+    late = S.paper_record(_paper(tmp_path, as_of="2026-11-21T07:40:00Z"), "post_close", POST)
+    b = B.build_brief("post_close", SESSION, POST, [late], [], as_of_registered=True, generated_at=POST)
+    assert b["sections"][0]["status"] == "after_clock" and b["sections"][0]["lines"] == []
+    old = S.paper_record(_paper(tmp_path, as_of="2026-11-18T21:50:00Z"), "post_close", POST)
+    assert any("older than 36 h" in p for p in old.problems)
+
+
+def test_paper_record_refuses_wrong_schema_or_not_paper(tmp_path):
+    assert S.paper_record(_paper(tmp_path, schema="other/1"), "post_close", POST).status == "unknown"
+    assert S.paper_record(_paper(tmp_path, paper_only=False), "post_close", POST).status == "unknown"
 
 
 # ── market state (sqlite engine: same table and writer as production) ────────

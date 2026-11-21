@@ -11,8 +11,10 @@ not installed).
 It computes no metric, ranks nothing and promotes nothing. It places, stages and simulates no order. A forward
 trial's line is a count toward its one look ("unproven, n of N", from `analysis/desk_evidence.py`); the brief never
 shows an interim hit rate, mean or P&L, whatever the trial's registration would allow. Outcomes in R appear only
-from the paper record (D4, 3pacs/GRID#14), which carries its own disclosure rule. Until that record exists, the
-post-close brief says it does not grade any call in R.
+from the paper record (D4, 3pacs/GRID#14), whose summary has already applied each registration's disclosure rule:
+its `stats` block is null unless the registration allows interim display or the look is SPENT. The brief copies
+`stats` only when present, never derives a mean or sign from counts, and does not show gross-only (pre-cost) stats.
+Until the summary file exists, the post-close brief says it does not grade any call in R.
 
 ## Clock
 
@@ -53,7 +55,7 @@ Rules, each tested (`tests/test_desk_brief.py`):
 | Source receipt | `/data/grid_ledgers/desk-receipts` (#1272) | the session's receipt: factory ledger and Sleuth leads row counts (leads are not findings), thesis log status |
 | GEX site state | gex-watch `/api/state` | current GEX served or withheld, and why; a withheld reason other than the scheduled stop is a data problem |
 | Desk health | desk-state `desk-health/1` files | the latest health line and its problems |
-| Paper record | D4 #14 | not supplied until it exists. Proposed format: side-session note `desk-brief-record-contract-20261121.md` |
+| Paper record | D4 #14: `/data/agent-home/anikdang/desk-paper-data/summary.json` (desk-paper-summary/1, written by the paper-record job in 3pacs/gex) | the summary only, never its ledger: per module the look status and counts, and `stats` where the registration allows; LOOK DUE reads "the owner runs the registered look once (not a pass)", NO LOOK reads "description, not evidence"; `errors` and a summary older than 36 h are data problems. Not supplied until the file exists. Format agreed with its owner on 2026-11-21 (side-session note `paper-record-read-format-20261121.md`). |
 
 Identifiers in ledger SQL come from the reviewed config, are checked against `[a-z_][a-z0-9_]*` and against the
 table's own columns. Every value is a bound parameter. The config holds each registration's look count (`need`);
@@ -78,7 +80,7 @@ cd <checkout>   # made under umask 022: the pinned calendars refuse group-writab
 
 ## Not yet
 
-- The paper record reader (format to be agreed with the D4 owner).
+- The paper record job itself (D4, another session; not deployed): until it writes its summary the section reads not supplied.
 - Factory live slots appear through the Records page's `panel-factory` block (feature history, counts only). A
   slot's per-session say appears when the slot owner publishes it.
 - The thesis log (#1165) does not exist; the receipt records it as unknown and the brief repeats that.

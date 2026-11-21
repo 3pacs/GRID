@@ -6,7 +6,7 @@
   "desk_health_dir": "/data/agent-home/anikdang/desk-health-data",
   "desk_evening_dir": "/data/agent-home/anikdang/desk-evening-data",
   "receipts_dir": "/data/grid_ledgers/desk-receipts",
-  "paper_record": null,
+  "paper_record": "/data/agent-home/anikdang/desk-paper-data/summary.json",
   "ledgers": [
     {
       "id": "fly-shadow/1", "name": "15:00 SPY 0DTE iron fly, shadow (X2 exit)",

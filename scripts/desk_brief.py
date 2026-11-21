@@ -62,7 +62,7 @@ def collect(kind: str, session: B.SessionTimes, prev_day: date, as_of: datetime,
     sections.append(ms)
     sections.append(S.calendar(session, as_of, market_events=(ms.facts or {}).get("events")))
     if kind == "post_close":
-        sections.append(S.paper_record(cfg.get("paper_record"), kind))
+        sections.append(S.paper_record(cfg.get("paper_record"), kind, as_of))
     sections.append(S.desk_evening(cfg["desk_evening_dir"], kind, session, prev_day, as_of))
     sec, tr = S.records(cfg["records_url"], as_of)
     sections.append(sec)
