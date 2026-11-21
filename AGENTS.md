@@ -999,3 +999,26 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   A local test fence blocks sockets and PostgreSQL connections. Native SQL/view
   execution remains for CI, as requested. No assertions were relaxed for the
   light venv's out-of-range SQLAlchemy 2.1.8.
+
+### SEC #1050 migration join and local qualification
+
+- Added the requested no-op join of `sec_pub_merge_20261109` with
+  `merge_av_wing_20261120`. Fetched main `427dbc247` already included its child
+  `research_findings_20261121`, so a second no-op join leaves exactly one head:
+  `merge_sec_main_20261121`. All IDs fit 32 characters. The graph regression
+  checks one head and retained ancestry without pinning a particular tip.
+- Ran all 26 PR test files plus `tests/test_alembic_single_head.py`, serially
+  with `nice -n 10`, two-thread BLAS limits and socket/PG fences. The supplied
+  dependency path shadows the venv's SQLAlchemy 2.1.8 with 2.1.9 and caused 35
+  SQL-text assertion failures. No assertions or installed packages were changed.
+- Re-ran the same 27 files using existing cached SQLAlchemy 2.0.58, within the
+  repository's `<2.1` constraint: 679 passed, 201 skipped, one missing-yfinance
+  failure in `TestTiingoNews::test_default_tickers_drop_untaggable_symbols`.
+  PostgreSQL tests intentionally skip; actual database/view behavior remains
+  for exact-head CI. No provider call or network dependency installation.
+- Final strengthened migration-edge checks and all single-head/version/logging
+  tests: 4 passed. Changed-file Ruff, Python parsing, all 16 forward / 14 HOLD
+  source digests and `git diff --check` passed. Original base ancestry retained.
+- Remaining review gates: Claude reviews the pushed head; Anik alone decides
+  merge. No PR merge, deployment, production access, historical repair, SSH,
+  outside-worktree report or coordination write was performed in this run.

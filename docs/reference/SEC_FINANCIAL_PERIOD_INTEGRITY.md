@@ -332,3 +332,17 @@ nonprovisional-journal filters for reviewed current regime/feedback reads. Raw
 history is unchanged. See SEC_DERIVED_SIGNAL_INVALIDATION_PLAN.md and
 SEC_DERIVED_SIGNAL_INVENTORY.json for exact scope and unresolved transitive
 serving/learning dependencies. These guards do not close the broader rollout gate.
+
+### 2026-11-21 source-only identity corrections
+
+Snapshot FX identity excludes rates never applied to the issuer, including all
+rates for USD-only facts. Report generation excludes request, receipt and TTM
+compute times. The observation metadata and revision-order checks remain intact.
+Private-PG regressions cover report visibility after an unchanged refetch and
+content-versus-time changes in TTM state; they remain for CI on this laptop.
+
+The no-op `merge_sec_av_wing_20261121` revision joins `sec_pub_merge_20261109`
+and `merge_av_wing_20261120`. Fetched main also contains the subsequent
+`research_findings_20261121` revision, so `merge_sec_main_20261121` joins that
+lineage with the requested SEC/wing merge. Both retain existing revision IDs and
+operations, and all revision IDs fit Alembic's 32-character version column.
