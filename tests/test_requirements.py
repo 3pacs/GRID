@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from sqlalchemy import create_engine
 
 
@@ -93,3 +94,73 @@ def test_fastapi_upper_bound_blocks_unreviewed_route_introspection_drift() -> No
             "highest release whose router/introspection behavior has actually "
             "been verified against GRID's facade routers and /ws auth."
         )
+
+
+CONSTRAINTS_314_PATH = (
+    Path(__file__).resolve().parents[1] / "deploy" / "python314" / "constraints-3.14.txt"
+)
+
+
+def _marker_env(python_version: str) -> dict[str, str]:
+    return {
+        "python_version": python_version,
+        "python_full_version": f"{python_version}.0",
+        "sys_platform": "linux",
+        "platform_system": "Linux",
+        "platform_machine": "x86_64",
+        "os_name": "posix",
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+    }
+
+
+def _active_requirements(path: Path, python_version: str) -> list[Requirement]:
+    env = _marker_env(python_version)
+    active = []
+    for line in _read_non_comment_lines(path):
+        req = Requirement(line.split(" #", 1)[0].strip())
+        if req.marker is None or req.marker.evaluate(env):
+            active.append(req)
+    return active
+
+
+def _lock_pins(path: Path) -> dict[str, str]:
+    pins = {}
+    for line in _read_non_comment_lines(path):
+        name, sep, version = line.partition("==")
+        assert sep, f"{path.name}: not an exact pin: {line!r}"
+        pins[canonicalize_name(name)] = version.split(";", 1)[0].strip()
+    return pins
+
+
+def test_edgartools_6_only_where_python_supports_it() -> None:
+    # edgartools 6.x declares Requires-Python >=3.11. deploy_build_hook.sh runs
+    # `pip install -r requirements.txt` on grid-svr's Python 3.10 interpreter
+    # before the 3.14 venv, so an unconditional 6.x floor fails every deploy
+    # with "No matching distribution found" (Dependabot #1261's py3.10 CI cells).
+    def edgartools(python_version: str) -> Requirement:
+        reqs = [r for r in _active_requirements(REQUIREMENTS_PATH, python_version)
+                if r.name == "edgartools"]
+        assert len(reqs) == 1, (python_version, reqs)
+        return reqs[0]
+
+    assert "5.62.1" in edgartools("3.10").specifier
+    for python_version in ("3.11", "3.12", "3.14"):
+        spec = edgartools(python_version).specifier
+        assert "6.3.0" in spec, python_version
+        assert "6.2.0" not in spec, python_version
+        assert "5.62.1" not in spec, python_version
+
+
+def test_py314_lock_satisfies_requirements() -> None:
+    # The 3.14 lock is installed as a constraints file together with
+    # requirements.txt (CI's Python 3.14 job and deploy_build_hook.sh). A floor
+    # raised in requirements.txt without the matching pin bump is a
+    # ResolutionImpossible on both; catch it here instead.
+    pins = _lock_pins(CONSTRAINTS_314_PATH)
+    mismatches = []
+    for req in _active_requirements(REQUIREMENTS_PATH, "3.14"):
+        pinned = pins.get(canonicalize_name(req.name))
+        if pinned is not None and not req.specifier.contains(pinned, prereleases=True):
+            mismatches.append(f"{req} vs lock {req.name}=={pinned}")
+    assert not mismatches, mismatches
