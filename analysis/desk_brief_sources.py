@@ -1,0 +1,505 @@
+"""Read-only adapters for the desk brief (3pacs/GRID#1164). Each returns ``Section`` or ``Trial`` values.
+
+Every adapter reads a record another job already keeps and copies what it says, with that record's own clock:
+
+* ``market_state``: the latest ``market_state_daily`` row (market-state/1, #1191) for an earlier session, computed
+  before the brief's clock. Read-only transaction, parameterized SQL. ``computed_at`` is a naive TIMESTAMP written
+  with CURRENT_TIMESTAMP; it is read as UTC only when the session's TimeZone is UTC, otherwise the section is unknown.
+* ``calendar``: the pinned XNYS parts and the pinned event parts (``analysis/factory_session_calendar``, forward
+  parts from #1293), asked "what was known at the brief's clock" (``FactoryEvents.known``). A day the parts do not
+  answer is unknown, never quiet. The market-state record's own event list (GDP, PCE, ...) is copied beside it.
+* ``records``: gex-watch's gex-records/1 block: every gex-signals trial, the factory slots' feature history, the
+  shadow trader and GEX levels v1, counts only, as that page publishes them.
+* ``ledger_trials``: the shadow ledgers (sqlite, opened ``mode=ro``) named in ``config/desk_brief_sources.json``:
+  the session's row (status and reason) and the number of rows that count toward the registered look.
+* ``selector``, ``plays``, ``trader_day``: the session's choices from the selector, the overnight plays table and
+  the shadow trader's day state. Choices only; no expected values or P&L.
+* ``desk_health`` / ``desk_evening``: the desk-state jobs' own daily files (desk-health/1, desk-evening/1).
+* ``gex_state``: gex-watch ``/api/state``: whether current GEX is served or withheld, and why.
+* ``receipts``: the Desk source receipt for the latest closed session (``intelligence/desk_source_receipts``).
+* ``paper_record``: the graded paper record (D4, 3pacs/GRID#14), when it exists. Until then: not supplied.
+
+Identifiers in ledger SQL come from the reviewed config and are checked against ``IDENT`` and the table's own
+columns; every value is a bound parameter. A row whose clock cannot be read as an aware instant is not counted, and
+the section says how many were dropped.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+from analysis.desk_brief import Section, SessionTimes, Trial, iso, parse_clock
+
+IDENT = re.compile(r"^[a-z_][a-z0-9_]{0,63}$")
+SOURCES_SCHEMA = "desk-brief-sources/1"
+NOTABLE_LABELS = ("high", "low", "above", "below")
+Fetch = Callable[[str, float], bytes]
+
+
+def _fetch(url: str, timeout: float) -> bytes:
+    with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 - config-supplied local URLs
+        return r.read()
+
+
+def load_config(path: Path) -> dict:
+    cfg = json.loads(Path(path).read_text())
+    if cfg.get("schema") != SOURCES_SCHEMA:
+        raise ValueError(f"{path}: schema must be {SOURCES_SCHEMA}")
+    return cfg
+
+
+def ro_sqlite(path: str | Path) -> sqlite3.Connection:
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    return sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+
+
+# ── session ──────────────────────────────────────────────────────────────────
+
+def session_times(day: date, *, calendar=None) -> SessionTimes:
+    """The session's open and close from the pinned XNYS parts (forward part included). Closed day: ValueError."""
+    from analysis.factory_session_calendar import PINS, FactoryCalendar
+
+    cal = calendar or FactoryCalendar(pins=PINS)
+    s = cal.for_day(day.isoformat())
+    if s is None:
+        raise ValueError(f"{day} is not an XNYS session")
+    return SessionTimes(day=day, opens=s.opens.astimezone(timezone.utc), closes=s.closes.astimezone(timezone.utc))
+
+
+def previous_session(day: date, *, calendar=None) -> date:
+    from analysis.factory_session_calendar import PINS, FactoryCalendar
+
+    cal = calendar or FactoryCalendar(pins=PINS)
+    return date.fromisoformat(cal.previous_day(day.isoformat()))
+
+
+# ── market state (#1191) ─────────────────────────────────────────────────────
+
+_MS_SQL = text("SELECT as_of_date, computed_at, rule, record FROM market_state_daily "
+               "WHERE as_of_date <= :d ORDER BY as_of_date DESC LIMIT 10")
+
+
+def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: datetime) -> Section:
+    title, key = "Market state", "market_state"
+    src = "griddb market_state_daily (market-state/1)"
+    last = session.day - timedelta(days=1) if kind == "pre_open" else session.day
+    try:
+        with engine.connect() as conn:
+            if conn.dialect.name == "postgresql":
+                conn.execute(text("SET TRANSACTION READ ONLY"))
+                tz = conn.execute(text("SHOW TimeZone")).scalar()
+                if str(tz) not in ("UTC", "Etc/UTC", "GMT"):
+                    return Section(key, title, "unknown", src, problems=(f"session TimeZone {tz}; computed_at not readable as UTC",))
+            rows = conn.execute(_MS_SQL, {"d": last}).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    chosen = None
+    for r in rows:
+        computed = r[1] if isinstance(r[1], datetime) else datetime.fromisoformat(str(r[1]))
+        computed = computed.replace(tzinfo=timezone.utc) if computed.utcoffset() is None else computed
+        if computed <= as_of:
+            chosen = (r, computed)
+            break
+    if chosen is None:
+        return Section(key, title, "empty", src, problems=("no record computed before the brief's clock",))
+    r, computed = chosen
+    rec = r[3] if isinstance(r[3], dict) else json.loads(r[3])
+    lines, problems = [], []
+    rec_day = str(r[0])
+    lines.append(f"record for session {rec_day} (rule {r[2]}), computed {iso(computed)}")
+    cov = rec.get("coverage") or {}
+    if cov:
+        lines.append("coverage: " + ", ".join(f"{k} {v}" for k, v in sorted(cov.items())))
+    notable, unavailable = [], []
+    for name, v in sorted((rec.get("variables") or {}).items()):
+        if not isinstance(v, dict):
+            continue
+        if v.get("status") != "ok":
+            unavailable.append(f"{name} ({v.get('status')})")
+            continue
+        if v.get("label") in NOTABLE_LABELS:
+            z = v.get("robust_z")
+            ztxt = f"z {z:+.2f}" if isinstance(z, (int, float)) else "no z"
+            notable.append(f"{name} {v['label']} ({ztxt}, observed {v.get('obs_date')})")
+    lines.append("away from normal: " + ("; ".join(notable) if notable else "none"))
+    if unavailable:
+        lines.append("not usable: " + "; ".join(unavailable))
+    g = rec.get("gamma_state") or {}
+    if g:
+        lines.append(f"dealer gamma ({g.get('obs_date')}): {g.get('regime')}, spot {g.get('spot_vs_flip')} the flip"
+                     if g.get("status") == "ok" else f"dealer gamma: {g.get('status')}")
+    ns = rec.get("news_shock") or {}
+    if ns:
+        lines.append(f"news uncertainty ({ns.get('obs_date')}): {ns.get('kind')}; attribution {ns.get('news_attribution')}")
+    if rec_day != last.isoformat():
+        problems.append(f"latest record is for {rec_day}; none yet for {last.isoformat()}")
+    return Section(key, title, "ok", src, computed, tuple(lines),
+                   {"record_date": rec_day, "computed_at": iso(computed), "notable": notable,
+                    "events": rec.get("events"), "pending": sorted((rec.get("pending") or {}).keys())},
+                   tuple(problems))
+
+
+# ── event calendar (#1293 forward parts) ─────────────────────────────────────
+
+def calendar(session: SessionTimes, as_of: datetime, *, market_events: dict | None = None,
+             events=None, xnys=None, horizon: int = 5) -> Section:
+    from analysis.factory_session_calendar import EVENT_PINS, EVENT_TIME, PINS, FactoryCalendar, FactoryEvents
+
+    title, key = "Event calendar", "calendar"
+    src = "pinned XNYS and factory-events parts (analysis/factory_session_calendar.py)"
+    try:
+        ev = events or FactoryEvents(pins=EVENT_PINS)
+        cal = xnys or FactoryCalendar(pins=PINS)
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"pinned parts did not load ({type(exc).__name__}: {exc})",))
+    lines, facts, problems = [], {"days": []}, []
+    day = session.day
+    for i in range(horizon):
+        d = day.isoformat()
+        known = ev.known(d, as_of)
+        if known is None:
+            lines.append(f"{d}: the pinned event parts do not answer for this day at this clock (unknown, not quiet)")
+            problems.append(f"no event part answers for {d}")
+        else:
+            names = sorted(known)
+            when = ", ".join(f"{n.upper()} {EVENT_TIME.get(n, '?')} ET" for n in names)
+            lines.append(f"{d}{' (this session)' if i == 0 else ''}: {when or 'no FOMC, CPI or NFP'}")
+        facts["days"].append({"day": d, "known": None if known is None else sorted(known)})
+        try:
+            nxt = cal.sessions[cal.index[d] + 1].key.split(":")[1]
+        except (KeyError, IndexError):
+            problems.append(f"the pinned XNYS parts end at {d}")
+            break
+        day = date.fromisoformat(nxt)
+    lines.append(f"session {session.day}: opens {iso(session.opens)}, closes {iso(session.closes)}")
+    if market_events:
+        within = market_events.get("within_14d") or []
+        listed = ", ".join(f"{e.get('event')} {e.get('date')}" for e in within) or "none"
+        lines.append(f"market-state record's release list (FRED dates, no known-at): {listed}")
+        facts["market_state_events"] = within
+    return Section(key, title, "ok", src, as_of, tuple(lines), facts, tuple(problems))
+
+
+# ── gex-records/1 (gex-watch Records page) ───────────────────────────────────
+
+def records(url: str, as_of: datetime, *, fetch: Fetch = _fetch, timeout: float = 15.0) -> tuple[Section, list[Trial]]:
+    title, key, src = "GEX lane records (gex-records/1)", "records", url
+    try:
+        d = json.loads(fetch(url, timeout))
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",)), []
+    if d.get("schema") != "gex-records/1":
+        return Section(key, title, "unknown", src, problems=(f"schema {d.get('schema')!r}, expected gex-records/1",)), []
+    clock = parse_clock(d.get("generated_at"))
+    trials = []
+    for f in d.get("forward") or []:
+        have, need = f.get("have"), f.get("need")
+        trials.append(Trial(
+            trial_id=str(f.get("id")), name=str(f.get("name") or f.get("id")), source=f"records:{f.get('source')}",
+            registration=f.get("doc") or f.get("registered_at"), have=have if isinstance(have, int) else None,
+            need=need if isinstance(need, int) else None, unit=str(f.get("unit") or ""),
+            status=f.get("status"), clock=clock, live=True))
+    counts = d.get("counts") or {}
+    lines = ["forward records by look status: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())),
+             f"looks already spent: {len(d.get('spent') or [])} (results are on the Records page, not repeated here)"]
+    if (d.get("ledger") or {}).get("chain_ok") is False:
+        lines.append("trials ledger hash chain: BROKEN")
+    problems = tuple(f"{k}: {v}" for k, v in sorted((d.get("errors") or {}).items()))
+    return Section(key, title, "ok" if d.get("status") == "ok" else "unknown", src, clock, tuple(lines),
+                   {"counts": counts, "live": True}, problems), trials
+
+
+# ── shadow ledgers (sqlite, read-only) ───────────────────────────────────────
+
+def _cols(con: sqlite3.Connection, table: str) -> set[str]:
+    if not IDENT.match(table):
+        raise ValueError(f"bad table name {table!r}")
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+        raise LookupError(f"no table {table}")
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}  # noqa: S608 - checked identifier
+
+
+def _select(con: sqlite3.Connection, table: str, columns: list[str]) -> list[sqlite3.Row]:
+    have = _cols(con, table)
+    for c in columns:
+        if not IDENT.match(c) or c not in have:
+            raise LookupError(f"{table} has no column {c!r}")
+    con.row_factory = sqlite3.Row
+    return con.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall()  # noqa: S608 - checked identifiers
+
+
+def ledger_trial(spec: dict, kind: str, session: SessionTimes, prev_day: date, as_of: datetime) -> Trial:
+    """One registered shadow record: the session's row, and the rows that count toward its look.
+
+    spec keys: id, name, db, table, day, clock, status, reason, counts (status values that count), need, unit,
+    count_from, registration, decides, decision ("session" or "previous_session"), and optionally count_table /
+    count_day / count_clock / count_status when the graded rows live in another table.
+    """
+    tid, name = spec["id"], spec["name"]
+    src = f"{spec['db']}:{spec['table']}"
+    base = dict(trial_id=tid, name=name, source=src, registration=spec.get("registration"),
+                need=spec.get("need"), unit=spec.get("unit", ""), decides=spec.get("decides"))
+    try:
+        con = ro_sqlite(spec["db"])
+    except Exception as exc:  # noqa: BLE001
+        return Trial(have=None, withheld=f"ledger unreadable ({type(exc).__name__})", **base)
+    try:
+        cols = [spec["day"], spec["clock"], spec["status"]] + ([spec["reason"]] if spec.get("reason") else [])
+        rows = _select(con, spec["table"], cols)
+        ct = spec.get("count_table", spec["table"])
+        cday, cclock, cstat = (spec.get("count_day", spec["day"]), spec.get("count_clock", spec["clock"]),
+                               spec.get("count_status", spec["status"]))
+        crows = rows if ct == spec["table"] and (cday, cclock, cstat) == (spec["day"], spec["clock"], spec["status"]) \
+            else _select(con, ct, [cday, cclock, cstat])
+    except Exception as exc:  # noqa: BLE001
+        return Trial(have=None, withheld=f"ledger read failed ({type(exc).__name__}: {exc})", **base)
+    finally:
+        con.close()
+    counting = set(spec.get("counts") or [])
+    start = spec.get("count_from") or "0000-00-00"
+    have, newest, unclocked, late = set(), None, 0, 0
+    for r in crows:
+        c = parse_clock(r[cclock])
+        if c is None:
+            unclocked += 1
+            continue
+        if c > as_of:
+            late += 1
+            continue
+        newest = c if newest is None or c > newest else newest
+        if r[cstat] in counting and str(r[cday]) >= start:
+            have.add(str(r[cday]))
+    want = (prev_day if spec.get("decision") == "previous_session" else session.day).isoformat()
+    today = withheld = None
+    row_clock = None
+    for r in rows:
+        if str(r[spec["day"]]) != want:
+            continue
+        c = parse_clock(r[spec["clock"]])
+        if c is None or c > as_of:
+            withheld = "the session's row was written after the brief's clock" if c else "the session's row has no clock"
+            break
+        row_clock = c
+        st = r[spec["status"]]
+        reason = r[spec["reason"]] if spec.get("reason") else None
+        label = spec.get("status_words", {}).get(str(st), str(st))
+        if st in counting:
+            today = f"{label} ({want})" if want != session.day.isoformat() else label
+        else:
+            withheld = f"{label}: {reason}" if reason else label
+        break
+    if today is None and withheld is None and not (kind == "pre_open" and spec.get("decision") != "previous_session"):
+        withheld = f"no row for {want}"
+    note = []
+    if unclocked:
+        note.append(f"{unclocked} row(s) without a readable clock not counted")
+    if late:
+        note.append(f"{late} row(s) after the brief's clock not counted")
+    if note:
+        withheld = "; ".join(([withheld] if withheld else []) + note)
+    return Trial(have=len(have), today=today, withheld=withheld, clock=row_clock or newest, **base)
+
+
+def selector(spec: dict, kind: str, session: SessionTimes, as_of: datetime) -> Trial:
+    """selector/1: each chooser's choice for the session (no outcomes), and the graded days so far."""
+    base = dict(trial_id=spec["id"], name=spec["name"], source=f"{spec['db']}:decisions",
+                registration=spec.get("registration"), need=spec.get("need"), unit=spec.get("unit", "graded sessions"),
+                decides=spec.get("decides"))
+    try:
+        con = ro_sqlite(spec["db"])
+        dec = _select(con, "decisions", ["day", "chooser", "choice", "decided_at"])
+        out = _select(con, "outcomes", ["day", "graded_at"])
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        return Trial(have=None, withheld=f"ledger unreadable ({type(exc).__name__})", **base)
+    graded = {r["day"] for r in out if (c := parse_clock(r["graded_at"])) and c <= as_of}
+    day = session.day.isoformat()
+    picks = sorted((r["chooser"], r["choice"]) for r in dec
+                   if r["day"] == day and (c := parse_clock(r["decided_at"])) and c <= as_of)
+    today = "; ".join(f"{ch}: {choice}" for ch, choice in picks) or None
+    withheld = None if today or kind == "pre_open" else f"no decision recorded for {day}"
+    clocks = [c for r in dec if (c := parse_clock(r["decided_at"])) and c <= as_of]
+    return Trial(have=len(graded), today=today, withheld=withheld, clock=max(clocks) if clocks else None, **base)
+
+
+def plays(spec: dict, kind: str, session: SessionTimes, prev_day: date, as_of: datetime) -> Trial:
+    """The overnight plays table: which plays it switched on for the night (names only), and nights graded."""
+    base = dict(trial_id=spec["id"], name=spec["name"], source=f"{spec['db']}:nights",
+                registration=spec.get("registration"), need=spec.get("need"), unit=spec.get("unit", "nights graded"),
+                decides=spec.get("decides"))
+    try:
+        con = ro_sqlite(spec["db"])
+        nights = _select(con, "nights", ["decision_date", "recorded_at", "choices_json"])
+        out = _select(con, "outcomes", ["decision_date", "graded_at"])
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        return Trial(have=None, withheld=f"ledger unreadable ({type(exc).__name__})", **base)
+    graded = {r["decision_date"] for r in out if (c := parse_clock(r["graded_at"])) and c <= as_of}
+    want = (prev_day if kind == "pre_open" else session.day).isoformat()
+    today = withheld = clock = None
+    for r in nights:
+        if r["decision_date"] != want:
+            continue
+        c = parse_clock(r["recorded_at"])
+        if c is None or c > as_of:
+            withheld = f"the {want} night was recorded after the brief's clock"
+            break
+        clock = c
+        try:
+            choices = json.loads(r["choices_json"])
+        except ValueError:
+            withheld = "choices unreadable"
+            break
+        on = sorted(str(x.get("play")) for x in choices if x.get("on"))
+        held = sorted(f"{x.get('play')} ({x.get('held_back')})" for x in choices if not x.get("on") and x.get("held_back"))
+        today = f"night of {want}: on " + (", ".join(on) or "none")
+        if held:
+            withheld = "held back: " + "; ".join(held)
+    if today is None and withheld is None:
+        withheld = f"no night recorded for {want}"
+    return Trial(have=len(graded), today=today, withheld=withheld, clock=clock, **base)
+
+
+def trader_day(spec: dict, kind: str, session: SessionTimes, as_of: datetime) -> Trial:
+    """gex-trader (shadow): the session's day state and shadow intents. Counts toward Stage 0 come from records."""
+    base = dict(trial_id=spec["id"], name=spec["name"], source=f"{spec['db']}:day_state",
+                registration=spec.get("registration"), need=None, unit="(counts: see trader-stage0)",
+                decides=spec.get("decides"))
+    try:
+        con = ro_sqlite(spec["db"])
+        ds = _select(con, "day_state", ["day", "mode", "breaker", "entries", "halt", "session_result", "updated_at"])
+        it = _select(con, "intents", ["day", "created_at", "mode", "call", "trigger"])
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        return Trial(have=None, withheld=f"ledger unreadable ({type(exc).__name__})", **base)
+    day = session.day.isoformat()
+    today = withheld = clock = None
+    for r in ds:
+        if r["day"] != day:
+            continue
+        c = parse_clock(r["updated_at"])
+        if c is None or c > as_of:
+            break
+        clock = c
+        intents = [f"{x['call']} on {x['trigger']} ({x['mode']})" for x in it
+                   if x["day"] == day and (ci := parse_clock(x["created_at"])) and ci <= as_of]
+        today = f"{len(intents)} shadow intent(s)" + (": " + "; ".join(intents) if intents else "")
+        if r["halt"]:
+            withheld = f"halted: {r['halt']}"
+        elif r["breaker"] != "CLOSED":
+            withheld = f"breaker {r['breaker']}"
+    if today is None and kind == "post_close":
+        withheld = f"no day state for {day}"
+    return Trial(have=None, today=today, withheld=withheld, clock=clock, **base)
+
+
+# ── desk-state daily files ───────────────────────────────────────────────────
+
+def _latest_file(folder: Path, last: date, clock_key: str, as_of: datetime) -> tuple[dict, datetime] | None:
+    for p in sorted(folder.glob("????-??-??.json"), reverse=True):
+        if p.stem > last.isoformat():
+            continue
+        d = json.loads(p.read_text())
+        c = parse_clock(d.get(clock_key))
+        if c is not None and c <= as_of:
+            return d, c
+    return None
+
+
+def desk_health(folder: str, session: SessionTimes, as_of: datetime) -> Section:
+    title, key, src = "Desk jobs' health line (desk-health/1)", "desk_health", folder
+    try:
+        got = _latest_file(Path(folder), session.day, "checked_at", as_of)
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    if got is None:
+        return Section(key, title, "empty", src, problems=("no health line checked before the brief's clock",))
+    d, c = got
+    lines = [f"session {d.get('day')}: {len(d.get('ok') or [])} of {d.get('checks')} checks ok"]
+    lines += [f"note: {n}" for n in d.get("notes") or []]
+    return Section(key, title, "ok", src, c, tuple(lines), {"day": d.get("day"), "ok": d.get("ok")},
+                   tuple(f"{d.get('day')}: {p}" for p in d.get("problems") or []))
+
+
+def desk_evening(folder: str, kind: str, session: SessionTimes, prev_day: date, as_of: datetime) -> Section:
+    title, key, src = "The session in prices (desk-evening/1)", "desk_evening", folder
+    last = prev_day if kind == "pre_open" else session.day
+    try:
+        got = _latest_file(Path(folder), last, "computed_at", as_of)
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    if got is None:
+        return Section(key, title, "empty", src, problems=(f"no evening text for {last} before the brief's clock",))
+    d, c = got
+    body = ((d.get("text") or {}).get("body") or "").splitlines()
+    problems = [f"missing at send: {m}" for m in d.get("missing") or []]
+    if d.get("day") != last.isoformat():
+        problems.append(f"latest evening text is for {d.get('day')}, not {last}")
+    return Section(key, title, "ok", src, c, tuple(x for x in body if x.strip()), {"day": d.get("day")},
+                   tuple(problems))
+
+
+# ── live GEX state (withheld or served) ──────────────────────────────────────
+
+def gex_state(url: str, as_of: datetime, *, fetch: Fetch = _fetch, timeout: float = 15.0) -> Section:
+    title, key, src = "GEX site state", "gex_state", url
+    try:
+        d = json.loads(fetch(url, timeout))
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    clock = parse_clock(d.get("served_at"))
+    cur, dly = d.get("current_gex") or {}, d.get("delayed_gex") or {}
+    lines = [f"current GEX: {cur.get('status')}" + (f" ({cur.get('reason')})" if cur.get("reason") else ""),
+             f"delayed GEX: {dly.get('status')}" + (f", {int(dly['age_seconds'] // 60)} min old"
+                                                    if isinstance(dly.get("age_seconds"), (int, float)) else "")]
+    problems = []
+    if cur.get("status") != "ok" and cur.get("reason") not in (None, "scheduled_stop"):
+        problems.append(f"current GEX withheld: {cur.get('reason')}")
+    return Section(key, title, "ok", src, clock, tuple(lines),
+                   {"current": cur.get("status"), "reason": cur.get("reason"), "live": True}, tuple(problems))
+
+
+# ── Desk source receipts (#1272) ─────────────────────────────────────────────
+
+def receipts(folder: str, prev_day: date, as_of: datetime) -> Section:
+    from intelligence.desk_source_receipts import ReceiptLog
+
+    title, key, src = "Desk source receipt (leads, factory ledger, thesis log)", "receipts", folder
+    try:
+        rec = ReceiptLog(Path(folder)).receipt_for(prev_day)
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", src, problems=(f"read failed ({type(exc).__name__})",))
+    if rec is None:
+        return Section(key, title, "empty", src, problems=(f"no receipt for session {prev_day}",))
+    clock = parse_clock(rec.get("read_finished_at"))
+    lines = [f"session {rec.get('session')}, sources read {rec.get('read_started_at')} to {rec.get('read_finished_at')}"]
+    problems = []
+    for name, entry in sorted((rec.get("sources") or {}).items()):
+        st = entry.get("status")
+        if st == "read":
+            lines.append(f"{name}: read, {entry.get('rows')} row(s)" + (" (research leads; not findings)" if name == "sleuth_leads" else ""))
+        else:
+            problems.append(f"{name}: {st} ({entry.get('reason') or entry.get('failure')})")
+    return Section(key, title, "ok", src, clock, tuple(lines), {"session": rec.get("session")}, tuple(problems))
+
+
+# ── the paper record (D4, 3pacs/GRID#14) ─────────────────────────────────────
+
+def paper_record(path: str | None, kind: str) -> Section:
+    title, key = "Graded paper calls (R after costs vs the null)", "paper_record"
+    if not path:
+        return Section(key, title, "not_supplied", "paper record (D4 #14)",
+                       problems=("the graded paper record does not exist yet; no call is graded in R here",))
+    return Section(key, title, "not_supplied", path,
+                   problems=("the paper record's reader is not written yet (format agreed with its owner first)",))

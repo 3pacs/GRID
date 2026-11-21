@@ -1,0 +1,79 @@
+{
+  "schema": "desk-brief-sources/1",
+  "note": "Sources the desk brief reads on grid-svr (3pacs/GRID#1164). Read-only. 'need' is each registration's own look count; null where none is registered. Changing a path or count is a reviewed change.",
+  "records_url": "http://127.0.0.1:8769/api/records",
+  "gex_state_url": "http://127.0.0.1:8769/api/state",
+  "desk_health_dir": "/data/agent-home/anikdang/desk-health-data",
+  "desk_evening_dir": "/data/agent-home/anikdang/desk-evening-data",
+  "receipts_dir": "/data/grid_ledgers/desk-receipts",
+  "paper_record": null,
+  "ledgers": [
+    {
+      "id": "fly-shadow/1", "name": "15:00 SPY 0DTE iron fly, shadow (X2 exit)",
+      "db": "/data/agent-home/anikdang/fly-shadow-data/ledger.db", "table": "fly_days",
+      "day": "day", "clock": "graded_at", "status": "status", "reason": "reason",
+      "counts": ["traded"], "count_from": "2026-11-12", "need": 100, "unit": "traded sessions",
+      "decides": "15:00 ET", "registration": "3pacs/gex agentic-20261105/fly-shadow/FLY-SHADOW-REGISTRATION-20261112.md"
+    },
+    {
+      "id": "fly-shadow/1-a2-gate", "name": "Fly, amendment 2: implied-vs-realised gate",
+      "db": "/data/agent-home/anikdang/fly-shadow-data/ledger.db", "table": "fly_gate",
+      "day": "day", "clock": "graded_at", "status": "status", "reason": "reason",
+      "counts": ["graded"], "count_from": "2026-11-13", "need": 100, "unit": "graded sessions (look over the X2 look's sessions)",
+      "decides": "15:00 ET", "registration": "3pacs/gex agentic-20261105/fly-shadow/FLY-SHADOW-AMENDMENT-2-20261113.md"
+    },
+    {
+      "id": "fly-shadow/1-a1-x4", "name": "Fly, amendment 1: share-hedged exit (X4)",
+      "db": "/data/agent-home/anikdang/fly-shadow-data/ledger.db", "table": "fly_x4",
+      "day": "day", "clock": "graded_at", "status": "status", "reason": "reason",
+      "counts": ["graded"], "count_from": "2026-11-12", "need": 100, "unit": "graded sessions",
+      "decides": "15:00 ET", "registration": "3pacs/gex agentic-20261105/fly-shadow/FLY-SHADOW-AMENDMENT-1-20261112.md"
+    },
+    {
+      "id": "fly-shadow/1-a3-netgamma", "name": "Fly, amendment 3: net-gamma arm",
+      "db": "/data/agent-home/anikdang/fly-shadow-data/ledger.db", "table": "fly_netgamma",
+      "day": "day", "clock": "graded_at", "status": "status", "reason": "reason",
+      "counts": ["graded"], "count_from": "2026-11-19", "need": 100, "unit": "graded sessions (look over the X2 look's sessions)",
+      "decides": "15:00 ET (graded 01:40 UTC)", "registration": "3pacs/gex fly-shadow fly_netgamma.py (fly-shadow/1-a3-netgamma)"
+    },
+    {
+      "id": "bounce-shadow/1", "name": "15:30 negative-gamma late bounce, shadow",
+      "db": "/data/agent-home/anikdang/bounce-shadow-data/ledger.db", "table": "days",
+      "day": "day", "clock": "graded_at", "status": "status", "reason": "reason",
+      "counts": ["traded"], "count_from": "2026-11-12", "need": 50, "unit": "traded sessions",
+      "decides": "15:30 ET", "registration": "3pacs/gex agentic-20261105/bounce-shadow/BOUNCE-SHADOW-REGISTRATION-20261112.md"
+    },
+    {
+      "id": "forecast-record/1", "name": "Gamma-conditioned close and range forecast",
+      "db": "/data/agent-home/anikdang/forecast-record-data/ledger.db", "table": "forecast_rows",
+      "day": "day", "clock": "graded_at", "status": "status", "reason": "reason",
+      "counts": ["graded"], "count_from": "2026-11-20", "need": 120, "unit": "graded sessions",
+      "decides": "10:00-15:30 ET lines (graded 01:50 UTC)", "registration": "forecast_record.py forecast-record/1 (LOOK_N 120)"
+    },
+    {
+      "id": "overnight-shadow/1", "name": "Overnight sector-aware winners, shadow",
+      "db": "/data/agent-home/anikdang/overnight-shadow-data/ledger.db", "table": "nights",
+      "day": "decision_date", "clock": "recorded_at", "status": "traded", "reason": "reason",
+      "status_words": {"1": "traded the night", "0": "not traded"},
+      "counts": [1], "count_table": "outcomes", "count_day": "decision_date", "count_clock": "graded_at", "count_status": "traded",
+      "count_from": "2026-11-16", "need": 250, "unit": "traded nights graded",
+      "decision": "previous_session", "decides": "after the close (01:30 UTC)",
+      "registration": "overnight-shadow REGISTRATION-overnight-shadow-1-20261115.md"
+    }
+  ],
+  "selector": {
+    "id": "selector/1", "name": "Afternoon play selector (four choosers), shadow",
+    "db": "/data/agent-home/anikdang/selector-shadow-data/ledger.db", "need": null, "unit": "graded sessions",
+    "decides": "14:46 ET", "registration": "3pacs/gex agentic-20261105/selector/selector.py (selector/1)"
+  },
+  "plays": {
+    "id": "desk-plays", "name": "Overnight plays table (ten plays)",
+    "db": "/data/agent-home/anikdang/desk-state-data/plays.db", "need": null, "unit": "nights graded",
+    "decides": "after the close (01:50 UTC)", "registration": "desk-state plays_recorder.py"
+  },
+  "trader": {
+    "id": "gex-trader-day", "name": "Shadow trader, the session's day state",
+    "db": "/data/agent-home/anikdang/gex-trader-data/ledger.db",
+    "decides": "from 09:25 ET", "registration": "3pacs/gex agentic-20261105/PREREGISTRATION.md (Stage 0)"
+  }
+}
