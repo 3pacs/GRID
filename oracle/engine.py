@@ -37,6 +37,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
@@ -1201,7 +1202,7 @@ class OracleEngine:
                 row = conn.execute(
                     text(
                         "SELECT score, snapshot_date "
-                        "FROM sector_health_snapshots "
+                        "FROM sector_health_snapshots_current "
                         "WHERE sector_name = :s "
                         "ORDER BY snapshot_date DESC LIMIT 1"
                     ).bindparams(s=sector),
@@ -1316,14 +1317,17 @@ class OracleEngine:
         """
         try:
             with self.engine.connect() as conn:
-                rows = conn.execute(text("""
-                    SELECT grid_recommendation, verdict
-                    FROM decision_journal
-                    WHERE decision_timestamp >= NOW() - INTERVAL '30 days'
-                      AND verdict IS NOT NULL
-                    ORDER BY decision_timestamp DESC
-                    LIMIT 50
-                """)).fetchall()
+                rows = conn.execute(
+                    non_provisional_journal_select(
+                        "grid_recommendation", "verdict",
+                    )
+                    .where(
+                        DECISION_JOURNAL.c.decision_timestamp >= text("NOW() - INTERVAL '30 days'"),
+                        DECISION_JOURNAL.c.verdict.is_not(None),
+                    )
+                    .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+                    .limit(50)
+                ).fetchall()
             if not rows or len(rows) < 5:
                 return {}
             hits = sum(1 for r in rows if r[1] == "HELPED")
@@ -1365,10 +1369,13 @@ class OracleEngine:
                         context["flow_narrative"] = str(row[1])[:200]
 
                 # Get regime
-                row = conn.execute(text("""
-                    SELECT inferred_state, state_confidence, transition_probability
-                    FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1
-                """)).fetchone()
+                row = conn.execute(
+                    non_provisional_journal_select(
+                        "inferred_state", "state_confidence", "transition_probability",
+                    )
+                    .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+                    .limit(1)
+                ).fetchone()
                 if row:
                     context["regime"] = row[0]
                     context["regime_confidence"] = row[1]

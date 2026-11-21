@@ -13,6 +13,7 @@ from typing import Any
 from loguru import logger as log
 from utils.ttl_cache import TTLCache
 from sqlalchemy import text
+from store.options_iv import public_wing_fields
 
 from api.dependencies import get_db_engine
 
@@ -21,6 +22,10 @@ from api.dependencies import get_db_engine
 # inserted via .format()).  Ordered so the first match wins.
 
 _FEATURE_DISPLAY: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^(.+)_iv_25d_put$"), "{} Legacy Put IV (method unknown)"),
+    (re.compile(r"^(.+)_iv_25d_call$"), "{} Legacy Call IV (method unknown)"),
+    (re.compile(r"^(.+)_iv_m90_put_v1$"), "{} Put IV proxy (87-93% spot mean v1)"),
+    (re.compile(r"^(.+)_iv_m110_call_v1$"), "{} Call IV proxy (107-113% spot mean v1)"),
     (re.compile(r"^(.+)_fifty_day_avg$"), "{} 50-Day Average"),
     (re.compile(r"^(.+)_two_hundred_avg$"), "{} 200-Day Average"),
     (re.compile(r"^(.+)_fifty_two_high$"), "{} 52-Week High"),
@@ -521,7 +526,8 @@ def _preload_one(tk: str) -> str | None:
                     text(
                         "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
                         "total_oi, total_volume, spot_price, iv_atm, "
-                        "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration "
+                        "iv_25d_put, iv_25d_call, term_structure_slope, oi_concentration, "
+                        "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata "
                         "FROM options_daily_signals "
                         "WHERE ticker = :ticker "
                         "ORDER BY signal_date DESC LIMIT 5"
@@ -533,7 +539,8 @@ def _preload_one(tk: str) -> str | None:
                         "date": str(r[0]),
                         "put_call_ratio": r[1], "max_pain": r[2], "iv_skew": r[3],
                         "total_oi": r[4], "total_volume": r[5], "spot_price": r[6],
-                        "iv_atm": r[7], "iv_25d_put": r[8], "iv_25d_call": r[9],
+                        "iv_atm": r[7],
+                        **public_wing_fields(r[12], r[13], r[14], r[8], r[9]),
                         "term_slope": r[10], "oi_concentration": r[11],
                     }
                     for r in opts

@@ -57,6 +57,10 @@ _FROM_RAW = re.compile(r"from\s+raw_series\b", re.I)
 # unfiltered occurrence instead of sharing last_observation's), so no baseline
 # number changed here; this note exists only so the next reader does not
 # mistake "count stayed 2" for "nothing changed".
+# 2026-11-08: analyzer's removed entry was a prose/docstring match, not SQL.
+# Its executable EDGAR query already filters SUCCESS. AV consumer documentation
+# no longer contains that unfiltered-looking prose; do not retain a spare slot
+# that would permit a new unfiltered query. Scanner and enforcement are unchanged.
 LEGACY_UNFILTERED_READS: dict[str, int] = {
     "analysis/money_flow.py": 1,
     "analysis/thesis_scorer.py": 2,
@@ -65,7 +69,6 @@ LEGACY_UNFILTERED_READS: dict[str, int] = {
     "api/routers/system.py": 6,
     "intelligence/actor_discovery.py": 1,
     "intelligence/dollar_flows.py": 3,
-    "intelligence/earnings_transcript_analyzer.py": 1,
     "intelligence/global_levers.py": 1,
     "intelligence/pattern_library.py": 1,
     "intelligence/sentiment_scorer.py": 1,

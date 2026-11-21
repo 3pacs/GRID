@@ -91,11 +91,13 @@ def schema_engine(pg_engine):
                         components      JSONB,
                         snapshot_date   DATE NOT NULL,
                         as_of           TIMESTAMPTZ DEFAULT NOW(),
+                        sec_generation  TEXT,
                         UNIQUE (sector_name, snapshot_date)
                     )
                     """
                 )
             )
+            conn.execute(text("CREATE VIEW sec_financial_generation AS SELECT repeat('a',32)::text AS generation"))
         yield engine
     finally:
         try:
@@ -122,6 +124,7 @@ def _rows(engine, snapshot_date: date) -> dict[str, tuple[float, datetime]]:
 def _stub(score: float):
     return lambda engine, name: {
         "score": score, "trend_30d": 0.0, "components": {"stub": True},
+        "sec_generation": "a" * 32,
     }
 
 
@@ -155,8 +158,8 @@ class TestOldAttemptPausedNewerCommitsFirst:
             if r == "old":
                 old_started.set()
                 assert release_old.wait(timeout=10), "release_old never signalled"
-                return {"score": 41.0, "trend_30d": 0.0, "components": {"stub": True}}
-            return {"score": 77.0, "trend_30d": 0.0, "components": {"stub": True}}
+                return {"score": 41.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32}
+            return {"score": 77.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32}
 
         monkeypatch.setattr(sh, "compute_sector_health", _compute)
 
@@ -265,8 +268,8 @@ class TestEqualAsOfTieRule:
             if r == "old":
                 started.set()
                 assert release.wait(timeout=10)
-                return {"score": 41.0, "trend_30d": 0.0, "components": {"stub": True}}
-            return {"score": 77.0, "trend_30d": 0.0, "components": {"stub": True}}
+                return {"score": 41.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32}
+            return {"score": 77.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32}
 
         monkeypatch.setattr(sh, "compute_sector_health", _compute)
 

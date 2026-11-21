@@ -544,6 +544,11 @@ class TestSectorHealthCrossCycleRace:
 # ─── snapshot_all_sectors idempotency: real upsert path, fake engine ────
 
 
+@pytest.fixture(autouse=True)
+def stable_financial_generation(monkeypatch):
+    monkeypatch.setattr("intelligence.sector_health.get_financial_generation", lambda conn: "a" * 32)
+
+
 class _FakeCompiledConn:
     """Minimal stand-in for a SQLAlchemy connection that supports the
     single ``INSERT ... ON CONFLICT (sector_name, snapshot_date) DO
@@ -587,6 +592,8 @@ class _FakeEngine:
     def begin(self) -> _FakeCompiledConn:
         return _FakeCompiledConn(self.store)
 
+    connect = begin
+
 
 class TestSnapshotAllSectorsIdempotency:
     def test_two_executions_in_the_same_due_period_write_no_duplicate_rows(
@@ -600,6 +607,7 @@ class TestSnapshotAllSectorsIdempotency:
                 "score": 55.0,
                 "trend_30d": 0.0,
                 "components": {"stub": True},
+                "sec_generation": "a" * 32,
             }
 
         monkeypatch.setattr(sh, "compute_sector_health", _fake_compute)
