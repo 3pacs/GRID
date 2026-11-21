@@ -719,7 +719,17 @@ def test_names_past_the_run_budget_are_skipped_not_started(monkeypatch: pytest.M
         ("ACIU", "SKIPPED", "yahoo_request_budget"), ("AGEN", "SKIPPED", "yahoo_request_budget")]
     assert len(yahoo.calls) == 4 and {t for t, _e in yahoo.calls} == {"OLMA", "NUOX"}
     assert results.summary["status"] == "PARTIAL"
-    assert options_schwab.YAHOO_RUN_REQUEST_BUDGET == 3 and options_schwab.SchwabFirstOptionsClient is not None
+
+
+def test_the_default_budget_covers_a_full_run_of_non_core_names() -> None:
+    # About 160 catalyst names at six expiries each (re-review of #1299: 600 forced every full run PARTIAL).
+    assert options_schwab.YAHOO_RUN_REQUEST_BUDGET == 1000
+    assert options_schwab.YAHOO_RUN_REQUEST_BUDGET >= 160 * options_schwab.YAHOO_MAX_EXPIRATIONS
+    client = options_schwab.SchwabFirstOptionsClient(_client()[0])
+    client.yahoo_requests = 999
+    assert client.yahoo_budget_spent is False
+    client.yahoo_requests = 1000
+    assert client.yahoo_budget_spent is True
 
 
 def test_non_core_names_are_read_to_six_expiries_and_the_core_to_the_run_cap(monkeypatch: pytest.MonkeyPatch) -> None:

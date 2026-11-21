@@ -17,8 +17,9 @@ default path Yahoo serves only fallbacks; here it serves every non-core name
 
 * requests to Yahoo are at least ``YAHOO_MIN_REQUEST_INTERVAL_SECONDS`` apart;
 * a non-core name is read to ``YAHOO_MAX_EXPIRATIONS`` expiries, not twelve;
-* a run sends at most about ``YAHOO_RUN_REQUEST_BUDGET`` requests; names past
-  it are SKIPPED ``yahoo_request_budget``;
+* a run sends at most about ``YAHOO_RUN_REQUEST_BUDGET`` requests (1,000, enough
+  for about 160 names at six expiries); names past it are SKIPPED
+  ``yahoo_request_budget``. The caller's time budget can end a run sooner;
 * a 429 latches for the run: the remaining expiries of that ticker are not
   requested (its capture is refused as incomplete) and the next non-core name
   stops the run (``OptionsSourceStopped("yahoo", 429)``);
@@ -109,7 +110,11 @@ PROVIDER = "schwab"
 CLIENT_NAME = "grid-options"
 REFUSAL_STATUSES: frozenset[int] = frozenset({401, 403})
 YAHOO_MIN_REQUEST_INTERVAL_SECONDS = 1.0
-YAHOO_RUN_REQUEST_BUDGET = 600
+# About 160 non-core names at YAHOO_MAX_EXPIRATIONS is up to 960 requests, so 1,000 lets a full run
+# finish on requests. At one request a second that tail alone is about 16 minutes, which is longer
+# than the 900 s the smart scheduler gives the options job (ingestion/smart_scheduler.py); under
+# that job the time budget ends the run first and the remaining names are DEFERRED.
+YAHOO_RUN_REQUEST_BUDGET = 1000
 YAHOO_MAX_EXPIRATIONS = 6
 YAHOO_RATE_LIMIT_HOLD_SECONDS = 30 * 60
 # GRID's per-user state directory (the scheduler and the AV transcript ledger keep theirs there).
