@@ -760,10 +760,20 @@ class CboeOptionsClient:
 def options_primary_provider() -> str:
     """``cboe`` (default), ``yahoo`` or ``schwab``, from GRID_OPTIONS_PRIMARY_PROVIDER.
 
-    ``schwab`` reads the hand-listed core only, through the owner's Schwab
-    app (``ingestion/options_schwab.py``); anything else is ``cboe``.
+    ``schwab`` reads the hand-listed core through the owner's Schwab app and
+    every other ticker from Yahoo (``ingestion/options_schwab.py``), and only
+    when ``GRID_OPTIONS_SCHWAB_READERS=admin-only`` states that non-admin
+    readers leave Schwab-provider rows out; anything else is ``cboe``.
     """
     value = os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "cboe").strip().lower()
+    if value == "schwab" and os.getenv("GRID_OPTIONS_SCHWAB_READERS", "").strip().lower() != "admin-only":
+        # Schwab data may not be redistributed, and the options tables feed
+        # contributor routes, e-mail digests and oracle publication (review of
+        # #1299, item 3). Until those leave Schwab-provider rows out, the
+        # operator has not set GRID_OPTIONS_SCHWAB_READERS=admin-only and the
+        # default path runs instead.
+        log.warning("GRID_OPTIONS_PRIMARY_PROVIDER=schwab ignored: GRID_OPTIONS_SCHWAB_READERS is not 'admin-only'")
+        return "cboe"
     return value if value in ("yahoo", "schwab") else "cboe"
 
 
@@ -976,24 +986,24 @@ class OptionsPuller(BasePuller):
         # Cboe unless it opts in). ``_yahoo`` keeps its historical attribute
         # name: callers and tests inject any ``get_options`` client there.
         primary = options_primary_provider()
+        core_block: str | None = None
         if primary == "schwab":
-            # Owner-selected source for the hand-listed core (2026-11-21). It
-            # shares the Schwab app's allowance with the live recorder, so a
-            # run does not start while the shared call ledger shows a recent
-            # refusal or a recent capture by this client.
+            # Owner-selected source for the hand-listed core (2026-11-21);
+            # every other ticker is read from Yahoo. Schwab shares its app
+            # allowance with the live recorder and dates a price only inside
+            # the regular session, so the core is not requested after the
+            # cash close, or while the shared call ledger shows a recent
+            # refusal or a recent capture by this same writer.
             from ingestion.options_schwab import (
-                SchwabOptionsClient,
-                schwab_capture_hold,
+                SchwabFirstOptionsClient,
+                schwab_core_block,
             )
 
-            hold = schwab_capture_hold()
-            if hold is not None:
-                log.info("Options pull skipped: {why}", why=hold)
-                return OptionsPullResults([
-                    {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
-                     "reason": hold, "provider": "schwab"} for ticker in tickers
-                ], full_universe=full_universe)
-            self._yahoo = SchwabOptionsClient()
+            if any(ticker in EQUITY_TICKERS for ticker in tickers):
+                core_block = schwab_core_block(now, writer=capture_source)
+                if core_block is not None:
+                    log.info("Options pull: Schwab core not requested ({why})", why=core_block)
+            self._yahoo = SchwabFirstOptionsClient(writer=capture_source)
         elif primary == "yahoo":
             self._yahoo = YahooOptionsClient()
         else:
@@ -1012,11 +1022,10 @@ class OptionsPuller(BasePuller):
                     for t in tickers[idx:]
                 )
                 break
-            if primary == "schwab" and ticker not in EQUITY_TICKERS:
-                # Never requested from Schwab: counted as not captured, so the
-                # run is PARTIAL and publishes no freshness for these names.
+            if core_block is not None and ticker in EQUITY_TICKERS:
+                # Not requested from Schwab this run: counted as not captured.
                 results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
-                                "reason": "provider_core_list_only", "provider": "schwab"})
+                                "reason": core_block, "provider": "schwab"})
                 continue
             ticker_kwargs: dict[str, Any] = {
                 "max_expirations": max_expirations, "should_continue": should_continue,

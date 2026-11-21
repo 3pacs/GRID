@@ -16,11 +16,19 @@ from typing import Any, Self
 import pytest
 
 from ingestion import options, options_schwab, schwab_market, schwab_usage
+from tests.test_schwab_market import (
+    FAKE_KEY,
+    FAKE_SECRET,
+    NOW,
+    FakeResponse,
+    FakeSession,
+    write_token_file,
+)
 
-# 16:30 ET on Thursday 2026-11-05.
-SESSION_NOW = datetime(2026, 11, 5, 21, 30, tzinfo=timezone.utc)
+# 15:30 ET on Thursday 2026-11-05, inside the regular session (cash close 21:00Z).
+SESSION_NOW = datetime(2026, 11, 5, 20, 30, tzinfo=timezone.utc)
 TODAY = date(2026, 11, 5)
-LAST_TRADE_MS = int(datetime(2026, 11, 5, 20, 59, 59, tzinfo=timezone.utc).timestamp() * 1000)
+LAST_TRADE_MS = int(datetime(2026, 11, 5, 20, 29, 59, tzinfo=timezone.utc).timestamp() * 1000)
 QUOTE_MS = LAST_TRADE_MS + 500
 NOV06 = int(datetime(2026, 11, 6, tzinfo=timezone.utc).timestamp())
 NOV13 = int(datetime(2026, 11, 13, tzinfo=timezone.utc).timestamp())
@@ -115,6 +123,10 @@ def test_chain_pages_keep_standard_contracts_of_live_expiries() -> None:
     chain = options_schwab.schwab_chain_pages([body], "KO", TODAY)
 
     assert chain is not None and chain["expirations"] == [NOV06, NOV13]  # 11-04 already expired
+    nov06["85.0"] = [_entry("KO", date(2026, 11, 6), "C", 87.5)]    # sits in another strike's bucket
+    assert options_schwab.schwab_chain_pages([body], "KO", TODAY)["skipped"] == 5
+    del nov06["85.0"]
+    chain = options_schwab.schwab_chain_pages([body], "KO", TODAY)
     assert chain["skipped"] == 4
     calls = {c["strike"]: c for c in chain["pages"][NOV06]["calls"]}
     assert sorted(calls) == list(STRIKES) and len(chain["pages"][NOV06]["puts"]) == 5
@@ -132,7 +144,7 @@ def test_chain_pages_keep_standard_contracts_of_live_expiries() -> None:
     assert clocks["schema_version"] == 2 and clocks["provider"] == "schwab"
     assert clocks["bid_ask_updated_at"] is None and clocks["bid_ask_freshness"] == "per_contract_quote_time"
     assert clocks["audience"] == "private" and clocks["redistribution"] == "prohibited"
-    assert clocks["provider_delayed"] is False
+    assert clocks["provider_delayed"] is False and clocks["underlying_trade_in_regular_session"] is True
 
 
 def test_chain_pages_join_two_windows_and_flag_a_delayed_body() -> None:
@@ -154,9 +166,11 @@ def _duplicate() -> dict[str, Any]:
     [_body(underlying=None)], [_body(underlying={"symbol": "PEP", "last": 70.2, "tradeTime": LAST_TRADE_MS})],
     [_body(callExpDateMap=None, putExpDateMap=None)], [_body(callExpDateMap=[])],
     [_body(callExpDateMap={"next friday": {}})], [_body(callExpDateMap={"2026-11-06:1": {"70.0": "x"}})],
+    [_body(callExpDateMap={"2026-11-06:1": {"seventy": []}})],
     [_duplicate()], [_body(), _body()],
 ], ids=["none", "not-a-mapping", "failed", "other-symbol", "truncated", "no-underlying", "other-underlying",
-        "no-maps", "map-not-mapping", "bad-expiry-key", "bad-strike-bucket", "duplicate", "repeat-across-windows"])
+        "no-maps", "map-not-mapping", "bad-expiry-key", "bad-strike-bucket", "bad-strike-key", "duplicate",
+        "repeat-across-windows"])
 def test_chain_pages_refuse_incomplete_or_ambiguous_bodies(bodies: list[Any]) -> None:
     assert options_schwab.schwab_chain_pages(bodies, "KO", TODAY) is None
 
@@ -170,6 +184,30 @@ def test_missing_underlying_clock_leaves_the_capture_undated() -> None:
     assert options._page_quote_time(page, TODAY) is None  # the puller refuses it as undated
 
 
+@pytest.mark.parametrize(("when", "in_session"), [
+    (datetime(2026, 11, 5, 14, 29, 59, tzinfo=timezone.utc), False),   # 09:29:59 New York: pre-market
+    (datetime(2026, 11, 5, 14, 30, 0, tzinfo=timezone.utc), True),     # the open
+    (datetime(2026, 11, 5, 21, 0, 0, tzinfo=timezone.utc), True),      # the cash close
+    (datetime(2026, 11, 5, 21, 0, 1, tzinfo=timezone.utc), False),     # one second into extended hours
+    (datetime(2026, 11, 5, 22, 41, 7, tzinfo=timezone.utc), False),    # an evening print
+    (datetime(2026, 11, 4, 20, 59, 59, tzinfo=timezone.utc), False),   # the previous session
+], ids=["pre-market", "open", "close", "after-close", "evening", "previous-session"])
+def test_only_a_regular_session_trade_dates_the_spot_price(when: datetime, in_session: bool) -> None:
+    body = _body()
+    body["underlying"]["tradeTime"] = int(when.timestamp() * 1000)
+    quote = options_schwab.schwab_chain_pages([body], "KO", TODAY)["quote"]
+    assert (quote["regularMarketTime"] is not None) is in_session
+    assert quote["clockMetadata"]["underlying_trade_in_regular_session"] is in_session
+    assert quote["clockMetadata"]["underlying_last_trade_raw"] == str(int(when.timestamp() * 1000))  # kept either way
+
+
+def test_half_day_session_ends_at_the_early_close() -> None:
+    day = date(2026, 11, 27)   # 13:00 New York close
+    opened, closed = options_schwab.regular_session(day)
+    assert (opened, closed) == (datetime(2026, 11, 27, 14, 30, tzinfo=timezone.utc),
+                                datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc))
+
+
 # ── client ───────────────────────────────────────────────────────────────
 
 
@@ -181,6 +219,7 @@ def test_one_request_when_the_first_window_holds_enough_expiries() -> None:
     assert client.get_options("PEP", NOV13) is None  # another ticker is never served from this download
     assert market.calls == [("KO", {"contractType": "ALL", "includeUnderlyingQuote": "true", "strategy": "SINGLE",
                                     "fromDate": "2026-11-05", "toDate": "2026-12-16"})]
+    assert client.client_name == "grid-options/options_puller"
     assert sleeps == [] and client.requests_made == 1
 
 
@@ -251,7 +290,46 @@ def test_default_client_never_retries_inside_the_shared_allowance(monkeypatch: p
     monkeypatch.setattr(schwab_market, "SchwabMarketClient", lambda **kw: built.append(kw) or _Market(_body()))
     client = options_schwab.SchwabOptionsClient(sleep=lambda _s: None, max_expirations=2)
     assert client.get_options("KO")
-    assert built == [{"client": "grid-options", "max_retries": 0}]
+    assert built == [{"client": "grid-options/options_puller", "max_retries": 0}]
+    built.clear()
+    gem = options_schwab.SchwabOptionsClient(sleep=lambda _s: None, max_expirations=2, writer="gem_daily")
+    assert gem.get_options("KO") and built == [{"client": "grid-options/gem_daily", "max_retries": 0}]
+
+
+def _real_client(tmp_path: Path, session: FakeSession) -> options_schwab.SchwabOptionsClient:
+    token_file = tmp_path / "tokens.json"
+    write_token_file(token_file, access_expires_at=NOW + 1500, refresh_expires_at=NOW + 5 * 86400)
+    market = schwab_market.SchwabMarketClient(
+        app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=token_file, session=session,
+        sleep=lambda _s: None, now=lambda: NOW, client="grid-options/options_puller", max_retries=0)
+    return options_schwab.SchwabOptionsClient(market, sleep=lambda _s: None)
+
+
+@pytest.mark.parametrize(("status", "calls"), [(401, ["GET", "POST", "GET"]), (403, ["GET"])])
+def test_a_lasting_refusal_through_the_real_client_stops_the_run(tmp_path: Path, status: int, calls: list[str]) -> None:
+    # The real client raises a plain SchwabError for a 401 that survives its one refresh and for any
+    # 403 (review of #1299, item 2). With a dead login every ticker used to refresh the shared token file.
+    session = FakeSession()
+    session.get_queue += [FakeResponse(status)] * 10
+    session.post_queue += [FakeResponse(200, {"access_token": f"new{i}", "expires_in": 1800}) for i in range(10)]
+    client = _real_client(tmp_path, session)
+
+    with pytest.raises(options.OptionsSourceStopped) as caught:
+        client.get_options("SPY")
+    assert str(caught.value) == f"schwab refused access (HTTP {status})" and caught.value.http_status == status
+    for ticker in ("QQQ", "IWM"):
+        with pytest.raises(options.OptionsSourceStopped):
+            client.get_options(ticker)
+    assert [c["method"] for c in session.calls] == calls   # nothing after the first ticker
+
+
+def test_another_4xx_through_the_real_client_fails_one_ticker_only(tmp_path: Path) -> None:
+    session = FakeSession()
+    session.get_queue += [FakeResponse(400), FakeResponse(200, _body("PEP"))]
+    client = options_schwab.SchwabOptionsClient(
+        _real_client(tmp_path, session)._market, sleep=lambda _s: None, max_expirations=2)
+    assert client.get_options("KO") is None
+    assert client.get_options("PEP")["calls"]
 
 
 # ── the shared call ledger holds a run back ──────────────────────────────
@@ -266,12 +344,32 @@ def test_capture_hold_reads_the_shared_ledger(tmp_path: Path) -> None:
     assert hold() is None  # no ledger yet
     schwab_usage.record(tmp_path, "gex-watch", "GET", "/quotes", 200, now - 5)
     schwab_usage.record(tmp_path, "gex-watch", "GET", "/quotes", 429, now - options_schwab.RATE_LIMIT_HOLD_SECONDS - 5)
-    schwab_usage.record(tmp_path, "grid-options", "GET", "/chains", 200, now - options_schwab.MIN_RUN_GAP_SECONDS - 5)
+    mine = "grid-options/options_puller"
+    schwab_usage.record(tmp_path, mine, "GET", "/chains", 200, now - options_schwab.MIN_RUN_GAP_SECONDS - 5)
+    schwab_usage.record(tmp_path, "grid-options-shape-probe", "GET", "/chains", 200, now - 20)
     assert hold() is None  # another client's ordinary calls, an old refusal and an old capture do not hold
-    schwab_usage.record(tmp_path, "grid-options", "GET", "/chains", 200, now - 60)
+    schwab_usage.record(tmp_path, mine, "GET", "/chains", 200, now - 60)
     assert hold() == "schwab_recent_capture"
+    # The gap is per writer: the scheduler's pull does not hold GEM or the oracle pass, and each holds itself.
+    for writer in ("gem_daily", "oracle"):
+        assert options_schwab.schwab_capture_hold(now, writer=writer, usage_dir=tmp_path, configured=lambda: True) is None
+    schwab_usage.record(tmp_path, "grid-options/gem_daily", "GET", "/chains", 200, now - 10)
+    assert options_schwab.schwab_capture_hold(now, writer="gem_daily", usage_dir=tmp_path, configured=lambda: True) == "schwab_recent_capture"
+    assert options_schwab.schwab_capture_hold(now, writer="oracle", usage_dir=tmp_path, configured=lambda: True) is None
     schwab_usage.record(tmp_path, "gex-watch", "GET", "/quotes", 429, now - 30)
     assert hold() == "schwab_recent_rate_limit"  # anyone's refusal outranks our own pacing
+    assert options_schwab.schwab_capture_hold(now, writer="oracle", usage_dir=tmp_path, configured=lambda: True) == "schwab_recent_rate_limit"
+
+
+def test_core_is_not_requested_after_the_cash_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(options_schwab, "schwab_capture_hold", lambda *_a, **_kw: None)
+    block = options_schwab.schwab_core_block
+    assert block(datetime(2026, 11, 5, 20, 59, 59, tzinfo=timezone.utc)) is None
+    assert block(datetime(2026, 11, 5, 21, 0, 0, tzinfo=timezone.utc)) is None
+    assert block(datetime(2026, 11, 5, 21, 0, 1, tzinfo=timezone.utc)) == "post-session"
+    assert block(datetime(2026, 11, 27, 18, 30, tzinfo=timezone.utc)) == "post-session"   # half day
+    monkeypatch.setattr(options_schwab, "schwab_capture_hold", lambda _t, *, writer=None: f"held:{writer}")
+    assert block(SESSION_NOW, writer="gem_daily") == "held:gem_daily"
 
 
 # ── end to end through the capture guards ────────────────────────────────
@@ -362,46 +460,107 @@ def test_previous_session_underlying_trade_is_refused_as_undated(monkeypatch: py
     assert puller.engine.batches == [] and puller.engine.rows == []
 
 
-def _schwab_run(monkeypatch: pytest.MonkeyPatch, tickers: list[str], catalysts: list[str], *answers: Any,
-                hold: str | None = None) -> tuple[Any, _Market, Any]:
+class _FakeYahoo:
+    """Yahoo stand-in: a dated two-expiry chain for any ticker except the ones it has no chain for."""
+
+    provider = "yahoo"
+    remote_expiry_pages = True
+    last_no_chain = False
+
+    def __init__(self, *, available: bool = True, no_chain: tuple[str, ...] = ()) -> None:
+        self.is_available = available
+        self.no_chain = set(no_chain)
+        self.calls: list[tuple[str, int | None]] = []
+
+    def get_options(self, ticker: str, expiry_ts: int | None = None) -> Any:
+        self.calls.append((ticker, expiry_ts))
+        if ticker in self.no_chain:
+            return options.NO_CHAIN
+        chain = options_schwab.schwab_chain_pages([_body(ticker)], ticker, TODAY)
+        page = chain["pages"][expiry_ts if expiry_ts is not None else chain["expirations"][0]]
+        return {"expirations": list(chain["expirations"]), "strikes": list(STRIKES),
+                "calls": list(page["calls"]), "puts": list(page["puts"]),
+                "quote": {"regularMarketPrice": 70.2, "regularMarketTime": LAST_TRADE_MS / 1000.0}}
+
+
+def _schwab_run(monkeypatch: pytest.MonkeyPatch, core: list[str], catalysts: list[str], *answers: Any,
+                block: str | None = None, yahoo: _FakeYahoo | None = None, publish: bool = False,
+                **pull_kw: Any) -> tuple[Any, _Market, _FakeYahoo, Any]:
     monkeypatch.setenv("GRID_OPTIONS_PRIMARY_PROVIDER", "schwab")
-    monkeypatch.setattr(options, "EQUITY_TICKERS", tickers)
+    monkeypatch.setenv("GRID_OPTIONS_SCHWAB_READERS", "admin-only")
+    monkeypatch.setattr(options, "EQUITY_TICKERS", core)
     monkeypatch.setattr(options, "catalyst_options_universe", lambda *_a, **_kw: catalysts)
-    monkeypatch.setattr(options_schwab, "schwab_capture_hold", lambda: hold)
-    client, market, _sleeps = _client(*answers, max_expirations=2)
-    monkeypatch.setattr(options_schwab, "SchwabOptionsClient", lambda: client)
-    for name in ("YahooOptionsClient", "CboeFirstOptionsClient"):
-        monkeypatch.setattr(options, name, lambda name=name: pytest.fail(f"{name} must not be built under schwab"))
+    writers: list[str | None] = []
+    monkeypatch.setattr(options_schwab, "schwab_core_block",
+                        lambda _now, *, writer=None: writers.append(writer) or block)
+    schwab, market, _sleeps = _client(*answers, max_expirations=2)
+    monkeypatch.setattr(options_schwab, "SchwabOptionsClient", lambda **_kw: schwab)
+    yahoo = yahoo if yahoo is not None else _FakeYahoo()
+    monkeypatch.setattr(options, "YahooOptionsClient", lambda: yahoo)
+    monkeypatch.setattr(options, "CboeFirstOptionsClient",
+                        lambda: pytest.fail("the Cboe client must not be built under schwab"))
     puller = _puller(monkeypatch)
-    monkeypatch.setattr(puller, "_mark_catalog_pulled",
-                        lambda **_kw: pytest.fail("a core-only run must not publish source freshness"))
-    return puller, market, puller.pull_all()
+    published: list[bool] = []
+    monkeypatch.setattr(puller, "_mark_catalog_pulled", lambda **_kw: (
+        published.append(True) or True) if publish else pytest.fail("this run must not publish source freshness"))
+    results = puller.pull_all(**pull_kw)
+    puller.writers, puller.published = writers, published
+    return puller, market, yahoo, results
 
 
-def test_primary_provider_knob_accepts_schwab(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_schwab_is_selected_only_with_the_reader_acknowledgement(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GRID_OPTIONS_PRIMARY_PROVIDER", " Schwab ")
+    monkeypatch.delenv("GRID_OPTIONS_SCHWAB_READERS", raising=False)
+    assert options.options_primary_provider() == "cboe"   # Schwab rows would reach non-admin readers
+    monkeypatch.setenv("GRID_OPTIONS_SCHWAB_READERS", "yes")
+    assert options.options_primary_provider() == "cboe"
+    monkeypatch.setenv("GRID_OPTIONS_SCHWAB_READERS", " Admin-Only ")
     assert options.options_primary_provider() == "schwab"
     monkeypatch.delenv("GRID_OPTIONS_PRIMARY_PROVIDER")
     assert options.options_primary_provider() == "cboe"  # the default is unchanged
 
 
-def test_default_run_reads_the_core_and_never_requests_catalyst_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    puller, market, results = _schwab_run(monkeypatch, ["KO"], ["NUOX", "OLMA"], _body())
+def test_without_the_acknowledgement_a_schwab_setting_runs_the_default_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GRID_OPTIONS_PRIMARY_PROVIDER", "schwab")
+    monkeypatch.delenv("GRID_OPTIONS_SCHWAB_READERS", raising=False)
+    built: list[str] = []
+    monkeypatch.setattr(options, "CboeFirstOptionsClient", lambda: built.append("cboe") or _FakeYahoo())
+    monkeypatch.setattr(options_schwab, "SchwabFirstOptionsClient",
+                        lambda **_kw: pytest.fail("Schwab must not be used without the acknowledgement"))
+    monkeypatch.setattr(options_schwab, "schwab_core_block", lambda *_a, **_kw: pytest.fail("no ledger read either"))
+    puller = _puller(monkeypatch)
+    results = puller.pull_all(tickers=["KO"], max_expirations=6)
+    assert built == ["cboe"] and results[0]["status"] == "SUCCESS"
+    assert puller.engine.batches[0]["spot_provider"] == "yahoo"   # the stand-in's label, not schwab
 
-    assert [r["status"] for r in results] == ["SUCCESS", "SKIPPED", "SKIPPED"]
-    assert results[1] == {"ticker": "NUOX", "status": "SKIPPED", "rows_inserted": 0,
-                          "reason": "provider_core_list_only", "provider": "schwab"}
-    assert [c[0] for c in market.calls] == ["KO"]
-    assert results.summary["status"] == "PARTIAL"
-    assert "2 tickers not captured (NUOX, OLMA)" in results.summary["error"]
-    assert results.summary["tickers_no_options"] == results.summary["tickers_no_chain"] == 0
-    assert options._NO_OPTIONS_UNTIL == {}  # not requested is not "has no options"
-    assert len(puller.engine.batches) == 1
+
+def test_core_goes_to_schwab_and_every_other_name_to_yahoo_and_the_run_is_complete(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    puller, market, yahoo, results = _schwab_run(
+        monkeypatch, ["KO"], ["NUOX", "OLMA"], _body(), yahoo=_FakeYahoo(no_chain=("NUOX",)), publish=True)
+
+    assert [(r["ticker"], r["status"]) for r in results] == [("KO", "SUCCESS"), ("NUOX", "NO_NEW_DATA"), ("OLMA", "SUCCESS")]
+    assert [c[0] for c in market.calls] == ["KO"]                          # catalyst names never reach Schwab
+    assert {t for t, _e in yahoo.calls} == {"NUOX", "OLMA"}                # and the core never reaches Yahoo
+    assert puller._yahoo.provider_by_ticker == {"KO": "schwab", "NUOX": "yahoo", "OLMA": "yahoo"}
+    by_ticker = {b["ticker"]: b["spot_provider"] for b in puller.engine.batches}
+    assert by_ticker == {"KO": "schwab", "OLMA": "yahoo"}                  # one provider per batch
+    assert results.summary["status"] == "SUCCESS" and results.summary["tickers_no_options"] == 1
+    assert puller.published == [True]                                       # freshness moves again
+    assert puller.writers == ["options_puller"]
 
 
-def test_rate_limit_stops_the_run_and_keeps_the_completed_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    puller, market, results = _schwab_run(
-        monkeypatch, ["KO", "PEP", "PG"], [], _body(), _error(schwab_market.SchwabTransientError, 429))
+def test_yahoo_being_unavailable_fails_only_the_names_it_serves(monkeypatch: pytest.MonkeyPatch) -> None:
+    _puller, market, yahoo, results = _schwab_run(
+        monkeypatch, ["KO"], ["OLMA"], _body(), yahoo=_FakeYahoo(available=False))
+    assert [(r["ticker"], r["status"]) for r in results] == [("KO", "SUCCESS"), ("OLMA", "FAILED")]
+    assert yahoo.calls == [] and len(market.calls) == 1
+    assert results.summary["status"] == "PARTIAL" and "1 tickers not captured (OLMA)" in results.summary["error"]
+
+
+def test_rate_limit_stops_the_run_for_every_remaining_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    puller, market, yahoo, results = _schwab_run(
+        monkeypatch, ["KO", "PEP", "PG"], ["OLMA"], _body(), _error(schwab_market.SchwabTransientError, 429))
 
     assert results[0]["status"] == "SUCCESS"
     assert results[1] == {"ticker": "PEP", "status": "FAILED", "rows_inserted": 0, "reason": "source_stopped",
@@ -409,17 +568,38 @@ def test_rate_limit_stops_the_run_and_keeps_the_completed_capture(monkeypatch: p
     assert results[2] == {"ticker": "PG", "status": "SKIPPED", "rows_inserted": 0,
                           "reason": "source_stopped_before_request", "provider": "schwab",
                           "blocked_by_http_status": 429}
-    assert len(market.calls) == 2  # PG is never requested
+    assert results[3]["ticker"] == "OLMA" and results[3]["reason"] == "source_stopped_before_request"
+    assert len(market.calls) == 2 and yahoo.calls == []   # PG and the Yahoo name are never requested
     assert results.summary["status"] == "PARTIAL"
     assert results.summary["error"] == "schwab rate limited (HTTP 429); remaining tickers not requested"
     assert len(puller.engine.batches) == 1 and options._NO_OPTIONS_UNTIL == {}
 
 
-def test_a_held_run_makes_no_request_and_builds_no_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    _puller, market, results = _schwab_run(monkeypatch, ["KO", "PEP"], ["NUOX"], hold="schwab_recent_rate_limit")
+@pytest.mark.parametrize("block", ["post-session", "schwab_recent_rate_limit", "schwab_recent_capture"])
+def test_a_blocked_core_makes_no_schwab_request_while_other_names_are_still_read(
+        monkeypatch: pytest.MonkeyPatch, block: str) -> None:
+    _puller, market, yahoo, results = _schwab_run(monkeypatch, ["KO", "PEP"], ["OLMA"], block=block)
 
     assert market.calls == []
-    assert all(r == {"ticker": r["ticker"], "status": "SKIPPED", "rows_inserted": 0,
-                     "reason": "schwab_recent_rate_limit", "provider": "schwab"} for r in results)
-    assert [r["ticker"] for r in results] == ["KO", "PEP", "NUOX"]
-    assert results.summary["status"] == "SKIPPED" and "schwab_recent_rate_limit" in results.summary["reason"]
+    assert results[:2] == [{"ticker": t, "status": "SKIPPED", "rows_inserted": 0, "reason": block,
+                            "provider": "schwab"} for t in ("KO", "PEP")]
+    assert results[2]["status"] == "SUCCESS" and {t for t, _e in yahoo.calls} == {"OLMA"}
+    assert results.summary["status"] == "PARTIAL" and "2 tickers not captured (KO, PEP)" in results.summary["error"]
+    assert options._NO_OPTIONS_UNTIL == {}   # not requested is not "has no options"
+
+
+def test_a_run_without_core_names_never_consults_the_schwab_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    # GEM passes its own tickers and its own writer label; none is a core name.
+    puller, market, _yahoo, results = _schwab_run(
+        monkeypatch, ["KO"], [], block="schwab_recent_rate_limit",
+        tickers=["OLMA", "NUOX"], max_expirations=6, capture_source="gem_daily")
+    assert puller.writers == [] and market.calls == []
+    assert [r["status"] for r in results] == ["SUCCESS", "SUCCESS"]
+    assert {b["spot_provider"] for b in puller.engine.batches} == {"yahoo"}
+    assert {b["source"] for b in puller.engine.batches} == {"gem_daily"}
+
+
+def test_the_writer_label_reaches_the_ledger_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    puller, _market, _yahoo, _results = _schwab_run(
+        monkeypatch, ["KO"], [], _body(), tickers=["KO"], capture_source="daily_scheduler")
+    assert puller.writers == ["daily_scheduler"]
