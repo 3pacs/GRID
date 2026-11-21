@@ -5,7 +5,6 @@ import Graph from 'graphology';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 const renderer=vi.hoisted(()=>({load:vi.fn(),sigma:{refresh:vi.fn()}}));
 vi.mock('@react-sigma/core',()=>({SigmaContainer:({children})=><div>{children}</div>,useLoadGraph:()=>renderer.load,useSigma:()=>renderer.sigma,useRegisterEvents:()=>vi.fn()}));
-vi.mock('@sigma/edge-curve',()=>({default:class {}}));
 vi.mock('../canvas/CommunityHulls.jsx',()=>({default:()=>null}));
 import { GraphLoader } from '../canvas/SigmaGraph.jsx';
 import useCanvasStore from '../canvas/CanvasStore.js';

@@ -22,6 +22,7 @@ import { api } from '../api.js';
 import { buildRouteHash } from '../routing.js';
 import useCanvasStore from './CanvasStore.js';
 import SigmaGraph from './SigmaGraph.jsx';
+import GraphErrorBoundary from './GraphErrorBoundary.jsx';
 import DetailPanel from './panels/DetailPanel.jsx';
 import SweepPanel from './panels/SweepPanel.jsx';
 import ContextMenu from './ContextMenu.jsx';
@@ -1461,13 +1462,15 @@ export default function GothamCanvas() {
                 <div style={{ ...S.graphContainer, visibility: lens === LENS_GRAPH ? 'visible' : 'hidden' }}>
                     {nodeCount > 0 ? (
                         <>
-                            <SigmaGraph
-                                ref={sigmaRef}
-                                communities={communities}
-                                communityColors={communityColors}
-                                communityLabels={communityLabels}
-                                showCommunities={showCommunities}
-                            />
+                            <GraphErrorBoundary>
+                                <SigmaGraph
+                                    ref={sigmaRef}
+                                    communities={communities}
+                                    communityColors={communityColors}
+                                    communityLabels={communityLabels}
+                                    showCommunities={showCommunities}
+                                />
+                            </GraphErrorBoundary>
                             {!isMobile && edgeCount > 0 && <EdgeLegend />}
                         </>
                     ) : !loading ? (
