@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -86,7 +86,7 @@ EVENT_PIN = (
 )
 FORWARD_EVENT_PIN = (
     "factory-events-2026-11-11-2026-12-31.json",
-    "058fa247f0bba3419284ecda8549ecef996d954fb20abaf2d5630cde7d5c65b0",
+    "20d8c4c502709cc905f935273002c280b100c3f10dcbd281b78b40313baa6c6b",
 )
 EVENT_PINS = (EVENT_PIN, FORWARD_EVENT_PIN)  # live; research reads EVENT_PIN alone
 EVENT_SOURCE = "config/econ_release_dates.json"
@@ -153,11 +153,19 @@ def event_manifest_bytes(doc: dict) -> bytes:
 class FactoryEvents:
     """Scheduled events known at a decision, from the pinned manifest parts (or a given document, for tests).
 
-    ``known(day, decided)``: the events on ``day`` whose known_at is strictly before ``decided``, or None
-    when ``day`` is outside the parts' joint coverage: an empty answer means "none known" only inside it
-    (an empty covered calendar never proves a quiet day for another source). Research reads ``EVENT_PIN``
-    (the default, so a recorded run reproduces byte for byte); the live recorder passes
-    ``pins=EVENT_PINS``, which adds forward parts and changes no earlier day's answer.
+    ``known(day, decided)``: the events on ``day`` known strictly before ``decided``, or None when no part
+    answers for that day at that time: an empty answer means "none known" only where a part answers (an
+    empty covered calendar never proves a quiet day for another source). Research reads ``EVENT_PIN``
+    (the default, so a recorded run reproduces byte for byte); the live recorder passes ``pins=EVENT_PINS``.
+
+    As-of (2026-11-21, review of #1293 at 91299cf5). The first part is the historical reconstruction and
+    answers at any decision time. Every later part must carry ``available_at``: the instant its source
+    snapshot existed. Before that instant the part does not answer at all (None, never "quiet"), and an
+    event in it counts only from the later of its own known_at and the part's available_at. A part with
+    ``supersedes`` is a prospective correction: it overlays days the base parts already cover and answers
+    only for decisions after its own (later) available_at, so every earlier decision keeps its answer.
+    For a (day, decided) pair the answering part is the one, among those covering the day and available
+    before ``decided``, with the latest available_at.
     """
 
     def __init__(self, root=None, pin=None, doc=None, pins=None):
@@ -174,31 +182,74 @@ class FactoryEvents:
                 names.append(f"{name} {sha}")
             self.version = f"{EVENT_SCHEMA}: " + ", ".join(names)
         else:
-            docs = [doc]
+            docs = list(doc) if isinstance(doc, (list, tuple)) else [doc]
             self.version = f"{EVENT_SCHEMA}: unpinned document"
-        for d in docs:
+        self.parts = []
+        for k, d in enumerate(docs):
             if d.get("schema") != EVENT_SCHEMA or not d.get("coverage", {}).get("complete"):
                 raise ValueError("a complete factory-events/1 document is required")
-        for a, b in zip(docs, docs[1:]):
-            if date.fromisoformat(b["coverage"]["start"]) != date.fromisoformat(a["coverage"]["end"]) + timedelta(days=1):
-                raise ValueError("event manifest parts must have contiguous date coverage")
-        self.start, self.end = docs[0]["coverage"]["start"], docs[-1]["coverage"]["end"]
-        self.by_day = {}
-        for d in docs:
+            avail = d.get("available_at")
+            if avail is None:
+                if k:
+                    raise ValueError("every part after the first must carry available_at (when its source existed)")
+            else:
+                avail = datetime.fromisoformat(avail)
+                if avail.utcoffset() is None:
+                    raise ValueError("available_at must carry its offset")
+            cov = d["coverage"]
+            by_day = {}
             for e in d["events"]:
-                if not d["coverage"]["start"] <= e["day"] <= d["coverage"]["end"]:
+                if not cov["start"] <= e["day"] <= cov["end"]:
                     raise ValueError("event outside its part's coverage")
                 known = datetime.fromisoformat(e["known_at"])
                 if known.utcoffset() is None:
                     raise ValueError("event known_at must carry its offset")
-                self.by_day.setdefault(e["day"], []).append((e["event"], known))
+                by_day.setdefault(e["day"], []).append((e["event"], known if avail is None else max(known, avail)))
+            self.parts.append({"start": cov["start"], "end": cov["end"], "available_at": avail,
+                               "correction": bool(d.get("supersedes")), "by_day": by_day})
+        base = [q for q in self.parts if not q["correction"]]
+        if not base or self.parts[0]["correction"]:
+            raise ValueError("the first part must be a base part")
+        for a, b in zip(base, base[1:]):
+            if date.fromisoformat(b["start"]) != date.fromisoformat(a["end"]) + timedelta(days=1):
+                raise ValueError("event manifest parts must have contiguous date coverage")
+        self.start, self.end = base[0]["start"], base[-1]["end"]
+        for q in self.parts:
+            if not q["correction"]:
+                continue
+            if not (self.start <= q["start"] <= q["end"] <= self.end):
+                raise ValueError("a correction must lie inside the base coverage")
+            under = [b for b in self.parts if b is not q and not b["correction"] and b["start"] <= q["end"] and q["start"] <= b["end"]]
+            if any(b["available_at"] is not None and b["available_at"] >= q["available_at"] for b in under):
+                raise ValueError("a correction must become available after every part it overlays")
+        self.by_day = self._merged()   # the latest answer per day (inspection only; known() is as-of)
+
+    def _merged(self):
+        out = {}
+        for q in sorted(self.parts, key=lambda q: (q["available_at"] is not None, q["available_at"] or datetime.min.replace(tzinfo=timezone.utc))):
+            for day in [d for d in out if q["start"] <= d <= q["end"]]:
+                del out[day]
+            out.update({d: list(v) for d, v in q["by_day"].items()})
+        return out
+
+    def _part(self, day, decided):
+        best = None
+        for q in self.parts:
+            if not q["start"] <= day <= q["end"]:
+                continue
+            if q["available_at"] is not None and not q["available_at"] < decided:
+                continue
+            if best is None or (q["available_at"] is not None and (best["available_at"] is None or q["available_at"] > best["available_at"])):
+                best = q
+        return best
 
     def known(self, day, decided):
         if decided.utcoffset() is None:
             raise ValueError("decision time must be timezone aware")
-        if not self.start <= day <= self.end:
+        q = self._part(day, decided)
+        if q is None:
             return None
-        return frozenset(name for name, known in self.by_day.get(day, ()) if known < decided)
+        return frozenset(name for name, known in q["by_day"].get(day, ()) if known < decided)
 
 
 # ── factory 7 prerequisite (3pacs/GRID#1161): forward parts ────────────────────
@@ -216,7 +267,10 @@ class FactoryEvents:
 # live module must not decide. A scheduled date can still move after a part is pinned
 # (the 2025 shutdown did); ``check_forward_events`` re-derives each forward part from a
 # refreshed source and lists what moved. A part whose days have started is never
-# rewritten; a move on a day still ahead needs a replacement part pinned before it.
+# rewritten; a move on a day still ahead is a prospective correction (``derive_correction``): a new pinned
+# part with a later available_at that answers only for later decisions, so effective history never changes.
+# Every forward part carries available_at, the instant its source snapshot existed; before it the part
+# answers None (2026-11-21, review of #1293: the 11-11 part's source was generated 11-13 04:12Z).
 #
 # The XNYS forward part is a slice of the live recorder's pinned
 # ``xnys-rth-20261001-20271231.json`` (same exchange_calendars build), re-serialized
@@ -240,27 +294,68 @@ def forward_event_end_bound(econ: dict) -> str:
     return min(bls, (date.fromisoformat(fomc) - timedelta(days=1)).isoformat())
 
 
-def derive_forward_events(econ: dict, source_sha256: str, start: str, end: str) -> dict:
+def _available_at(econ: dict, available_at) -> str:
+    src = econ.get("generated_at")
+    if not src:
+        raise ValueError("the source carries no generated_at, so when it existed is unknown")
+    at = datetime.fromisoformat(available_at or src)
+    if at.utcoffset() is None:
+        raise ValueError("available_at must carry its offset")
+    if at < datetime.fromisoformat(src):
+        raise ValueError("a part cannot be available before its source snapshot was generated")
+    return at.isoformat()
+
+
+def derive_forward_events(econ: dict, source_sha256: str, start: str, end: str, available_at=None) -> dict:
+    """A forward events part. ``available_at`` (default: the source's generated_at) is the instant from which
+    the part answers; before it ``FactoryEvents.known`` returns None for every day the part covers."""
     if end > forward_event_end_bound(econ):
         raise ValueError(f"source lists BLS/FOMC dates only through {forward_event_end_bound(econ)}")
     if start > end:
         raise ValueError("empty forward part")
-    return derive_events(econ, source_sha256, start, end)
+    return {**derive_events(econ, source_sha256, start, end), "available_at": _available_at(econ, available_at)}
+
+
+def derive_correction(econ: dict, source_sha256: str, start: str, end: str, available_at: str, supersedes) -> dict:
+    """A prospective correction part: re-derived [start, end] from a refreshed source, answering only for
+    decisions after ``available_at`` (which must be later than every part it overlays). Earlier decisions keep
+    the answer the superseded part gave them; pin it like any part, after the parts it supersedes."""
+    doc = derive_forward_events(econ, source_sha256, start, end, available_at)
+    return {**doc, "supersedes": sorted(supersedes)}
+
+
+def _event_key(e):
+    return (e["event"], e["day"])
 
 
 def check_forward_events(econ: dict, source_sha256: str, root=None, pins=None) -> list:
-    """Differences between each pinned forward part and the same part re-derived from ``econ``."""
+    """Differences between each pinned forward part and the same part re-derived from ``econ``: the pinned
+    digest, the coverage, events added or removed, and same-day changes of time_et, known_at or basis.
+    An empty list means every forward part still matches the refreshed source. Pure but for the file reads."""
     root = Path(root or Path(__file__).resolve().parents[1] / "docs/reference/calendar-manifests")
     out = []
-    for name, _ in (pins or EVENT_PINS)[1:]:
-        doc = json.loads((root / name).read_bytes())
+    for name, expected in (pins or EVENT_PINS)[1:]:
+        raw = (root / name).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected:
+            out.append({"part": name, "event": None, "day": None, "change": "digest",
+                        "old": expected, "new": hashlib.sha256(raw).hexdigest()})
+        doc = json.loads(raw)
         start, end = doc["coverage"]["start"], doc["coverage"]["end"]
         fresh = derive_events(econ, source_sha256, start, end)
-        old = {(e["event"], e["day"]) for e in doc["events"]}
-        new = {(e["event"], e["day"]) for e in fresh["events"]}
-        out += [{"part": name, "event": ev, "day": day, "change": "removed"} for ev, day in sorted(old - new)]
-        out += [{"part": name, "event": ev, "day": day, "change": "added"} for ev, day in sorted(new - old)]
-    return sorted(out, key=lambda r: (r["day"], r["event"]))
+        if fresh["coverage"] != doc["coverage"]:
+            out.append({"part": name, "event": None, "day": None, "change": "coverage", "old": doc["coverage"], "new": fresh["coverage"]})
+        if doc.get("available_at") is None:
+            out.append({"part": name, "event": None, "day": None, "change": "no_available_at", "old": None, "new": None})
+        old = {_event_key(e): e for e in doc["events"]}
+        new = {_event_key(e): e for e in fresh["events"]}
+        out += [{"part": name, "event": k[0], "day": k[1], "change": "removed", "old": old[k], "new": None} for k in sorted(old.keys() - new.keys())]
+        out += [{"part": name, "event": k[0], "day": k[1], "change": "added", "old": None, "new": new[k]} for k in sorted(new.keys() - old.keys())]
+        for k in sorted(old.keys() & new.keys()):
+            a = {f: old[k].get(f) for f in ("time_et", "known_at", "basis")}
+            b = {f: new[k].get(f) for f in ("time_et", "known_at", "basis")}
+            if a != b:
+                out.append({"part": name, "event": k[0], "day": k[1], "change": "changed", "old": a, "new": b})
+    return sorted(out, key=lambda r: (r["day"] or "", r["event"] or "", r["change"]))
 
 
 def slice_xnys(raw: bytes, start: str, end: str) -> bytes:

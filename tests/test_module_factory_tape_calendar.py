@@ -9,7 +9,7 @@ import copy
 import hashlib
 import json
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -516,6 +516,10 @@ def test_forward_event_part_extends_without_moving_an_earlier_answer():
     assert both.known("2026-12-04", at("2026-12-04T10:00")) == {"nfp"}
     assert both.known("2026-11-20", at("2026-11-20T10:00")) == frozenset()
     assert both.known("2027-01-04", at("2027-01-04T10:00")) is None  # past the forward part: unknown, not quiet
+    # the forward part answers only once its source existed (2026-11-13 04:12:15Z): the first days it covers
+    # were unknown, not quiet, at their own decision times
+    assert both.known("2026-11-11", at("2026-11-11T10:00")) is None
+    assert both.known("2026-11-12", at("2026-11-12T15:00")) is None
     assert first.known("2026-12-10", at("2026-12-10T09:00")) is None
 
 
@@ -536,10 +540,12 @@ def test_forward_event_part_is_derived_and_bounded_by_its_source():
     assert fc.check_forward_events(econ, sha) == []
     moved = copy.deepcopy(econ)  # a shutdown-style reschedule after the part was pinned
     moved["events"]["cpi"] = [d for d in moved["events"]["cpi"] if d != "2026-12-10"] + ["2026-12-18"]
-    assert fc.check_forward_events(moved, sha) == [
-        {"part": fc.FORWARD_EVENT_PIN[0], "event": "cpi", "day": "2026-12-10", "change": "removed"},
-        {"part": fc.FORWARD_EVENT_PIN[0], "event": "cpi", "day": "2026-12-18", "change": "added"},
+    rows = fc.check_forward_events(moved, sha)
+    assert [(r["part"], r["event"], r["day"], r["change"]) for r in rows] == [
+        (fc.FORWARD_EVENT_PIN[0], "cpi", "2026-12-10", "removed"),
+        (fc.FORWARD_EVENT_PIN[0], "cpi", "2026-12-18", "added"),
     ]
+    assert doc["available_at"] == econ["generated_at"]
 
 
 def test_event_parts_must_be_contiguous(tmp_path):
@@ -551,3 +557,106 @@ def test_event_parts_must_be_contiguous(tmp_path):
     (tmp_path / "gap.json").write_bytes(raw)
     with pytest.raises(ValueError, match="contiguous"):
         fc.FactoryEvents(tmp_path, pins=(fc.EVENT_PIN, ("gap.json", hashlib.sha256(raw).hexdigest())))
+
+
+# ── review of #1293 at 91299cf5 (2026-11-21): as-of availability, corrections, full forward check ──
+
+UTC_ = timezone.utc
+
+
+def _forward_parts():
+    research = json.loads((MANIFESTS / fc.EVENT_PIN[0]).read_bytes())
+    forward = json.loads((MANIFESTS / fc.FORWARD_EVENT_PIN[0]).read_bytes())
+    return research, forward
+
+
+def test_forward_part_is_unknown_before_its_source_existed_across_the_nov_11_13_boundary():
+    ev = fc.FactoryEvents(pins=fc.EVENT_PINS)
+    avail = datetime(2026, 11, 13, 4, 12, 15, tzinfo=UTC_)
+    eps = timedelta(seconds=1)
+    for day in ("2026-11-11", "2026-11-12", "2026-11-13", "2026-12-03", "2026-12-04", "2026-12-09"):
+        assert ev.known(day, avail - eps) is None, day
+        assert ev.known(day, avail) is None, "strictly after, as known_at"
+    assert ev.known("2026-11-13", avail + eps) == frozenset()          # a quiet day, now known quiet
+    assert ev.known("2026-12-03", avail + eps) == frozenset()
+    # FOMC's rule says known from 2025-12-31, but this part could not know it before 11-13 04:12:15Z
+    assert ev.known("2026-12-09", avail + eps) == {"fomc"}
+    # NFP / CPI still count only from their own day, after availability too
+    assert ev.known("2026-12-04", avail + eps) == frozenset()
+    assert ev.known("2026-12-04", datetime(2026, 12, 4, 0, 0, 1, tzinfo=ET)) == {"nfp"}
+    # the research part is a historical reconstruction: it answers at any time, unchanged
+    assert ev.known("2026-11-10", datetime(2026, 11, 10, 10, 0, tzinfo=ET)) == fc.FactoryEvents().known("2026-11-10", datetime(2026, 11, 10, 10, 0, tzinfo=ET))
+
+
+def test_research_defaults_are_frozen():
+    first = fc.FactoryEvents()
+    assert first.version == f"{fc.EVENT_SCHEMA}: {fc.EVENT_PIN[0]} {fc.EVENT_PIN[1]}"
+    assert len(first.parts) == 1 and first.parts[0]["available_at"] is None
+    assert fc.RESEARCH_PINS == fc.PINS[:2]
+
+
+def test_a_part_after_the_first_must_say_when_it_became_available():
+    research, forward = _forward_parts()
+    with pytest.raises(ValueError, match="available_at"):
+        fc.FactoryEvents(doc=[research, {k: v for k, v in forward.items() if k != "available_at"}])
+    with pytest.raises(ValueError, match="offset"):
+        fc.FactoryEvents(doc=[research, {**forward, "available_at": "2026-11-13T04:12:15"}])
+
+
+def test_a_prospective_correction_never_rewrites_an_earlier_decision():
+    research, forward = _forward_parts()
+    src = json.loads((ROOT / fc.EVENT_SOURCE).read_bytes())
+    sha = forward["derived_from"]["sha256"]
+    moved = copy.deepcopy(src)   # NFP moves 12-04 -> 12-11, learned on 12-01
+    moved["events"]["nfp"] = [d for d in moved["events"]["nfp"] if d != "2026-12-04"] + ["2026-12-11"]
+    fix = fc.derive_correction(moved, sha, "2026-12-01", "2026-12-31", "2026-12-01T15:00:00+00:00", [fc.FORWARD_EVENT_PIN[0]])
+    ev = fc.FactoryEvents(doc=[research, forward, fix])
+    before, after = datetime(2026, 12, 1, 14, 59, tzinfo=UTC_), datetime(2026, 12, 1, 15, 1, tzinfo=UTC_)
+    late = datetime(2026, 12, 11, 9, 0, tzinfo=ET)
+    assert ev.known("2026-12-09", before) == {"fomc"} == ev.known("2026-12-09", after)
+    assert ev.known("2026-12-11", before) == frozenset() and ev.known("2026-12-11", late) == {"nfp"}
+    assert ev.known("2026-12-04", datetime(2026, 12, 4, 9, 0, tzinfo=ET)) == frozenset()   # moved away
+    # a decision made before the correction keeps its answer: as-of queries are a pure function of (day, decided)
+    old = fc.FactoryEvents(doc=[research, forward])
+    t = datetime(2026, 11, 30, 15, 0, tzinfo=UTC_)
+    for d in ("2026-12-04", "2026-12-09", "2026-12-11"):
+        assert ev.known(d, t) == old.known(d, t)
+    # a correction must come after what it overlays, and stay inside the base coverage
+    with pytest.raises(ValueError, match="after every part"):
+        fc.FactoryEvents(doc=[research, forward, {**fix, "available_at": "2026-11-13T04:12:15+00:00"}])
+    with pytest.raises(ValueError, match="inside the base"):
+        fc.FactoryEvents(doc=[research, forward, {**fix, "coverage": {**fix["coverage"], "end": "2027-01-31"}}])
+    with pytest.raises(ValueError, match="before its source"):
+        fc.derive_correction(moved, sha, "2026-12-01", "2026-12-31", "2026-11-01T00:00:00+00:00", [fc.FORWARD_EVENT_PIN[0]])
+
+
+def test_check_forward_events_reports_digest_coverage_and_same_day_changes(tmp_path):
+    src = json.loads((ROOT / fc.EVENT_SOURCE).read_bytes())
+    _, forward = _forward_parts()
+    sha = forward["derived_from"]["sha256"]
+    if hashlib.sha256((ROOT / fc.EVENT_SOURCE).read_bytes()).hexdigest() != sha:
+        pytest.skip("config/econ_release_dates.json was regenerated")
+    for name, _ in fc.EVENT_PINS:
+        (tmp_path / name).write_bytes((MANIFESTS / name).read_bytes())
+    assert fc.check_forward_events(src, sha, root=tmp_path) == []
+    # same date, changed time: the part says 08:30, a refreshed source would derive 10:00
+    changed = json.loads((tmp_path / fc.FORWARD_EVENT_PIN[0]).read_bytes())
+    for e in changed["events"]:
+        if e["event"] == "cpi":
+            e["time_et"] = "10:00"
+    raw = fc.event_manifest_bytes(changed); (tmp_path / "changed.json").write_bytes(raw)
+    rows = fc.check_forward_events(src, sha, root=tmp_path, pins=(fc.EVENT_PIN, ("changed.json", hashlib.sha256(raw).hexdigest())))
+    assert [(r["event"], r["day"], r["change"]) for r in rows] == [("cpi", "2026-12-10", "changed")]
+    assert rows[0]["old"]["time_et"] == "10:00" and rows[0]["new"]["time_et"] == "08:30"
+    # a changed known_at on the same date is reported too
+    changed["events"] = [dict(e, known_at="2026-12-09T00:00:00-05:00") if e["event"] == "cpi" else e for e in json.loads((tmp_path / fc.FORWARD_EVENT_PIN[0]).read_bytes())["events"]]
+    raw = fc.event_manifest_bytes(changed); (tmp_path / "changed.json").write_bytes(raw)
+    rows = fc.check_forward_events(src, sha, root=tmp_path, pins=(fc.EVENT_PIN, ("changed.json", hashlib.sha256(raw).hexdigest())))
+    assert [(r["day"], r["change"]) for r in rows] == [("2026-12-10", "changed")] and rows[0]["old"]["known_at"] == "2026-12-09T00:00:00-05:00"
+    # a file that no longer matches its pin, and a changed coverage
+    rows = fc.check_forward_events(src, sha, root=tmp_path, pins=(fc.EVENT_PIN, ("changed.json", "0" * 64)))
+    assert ("digest" in [r["change"] for r in rows])
+    cov = json.loads((tmp_path / fc.FORWARD_EVENT_PIN[0]).read_bytes()); cov["coverage"]["events"] = ["cpi", "nfp"]
+    raw = fc.event_manifest_bytes(cov); (tmp_path / "cov.json").write_bytes(raw)
+    rows = fc.check_forward_events(src, sha, root=tmp_path, pins=(fc.EVENT_PIN, ("cov.json", hashlib.sha256(raw).hexdigest())))
+    assert "coverage" in [r["change"] for r in rows]
