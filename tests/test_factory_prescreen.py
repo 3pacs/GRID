@@ -279,6 +279,38 @@ def test_a_head_the_caller_states_is_not_a_witness(tmp_path):
     assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
 
 
+def test_a_receipt_replaced_after_it_was_verified_does_not_pass_the_access_gate(tmp_path, monkeypatch):
+    """Codex on b3e0c117: the log was verified, then reopened; a replaced receipt line reached the data loader."""
+    ledger, sha = ledger_with()
+    reg = registration(tmp_path, sha, "5" * 64)
+    fp.register(reg, ledger)
+    log, anchors = receipt_log(ledger)
+    genuine = list(dsr.raw_lines(log.path))
+    real = dsr.ReceiptLog.verify
+
+    def verify_then_replace(self, *args, **kwargs):
+        out = real(self, *args, **kwargs)
+        record = json.loads(genuine[1])
+        record["sources"]["factory_ledger"]["read_finished_at"] = "2026-11-20T21:22:00+00:00"
+        log.path.write_bytes(genuine[0] + b"\n" + dsr.canonical(record) + b"\n")     # the live log, after the verifier returned
+        return out
+
+    monkeypatch.setattr(dsr.ReceiptLog, "verify", verify_then_replace)
+    seen = fp.ledger_witness(ledger, log.root, anchors, SESSION)
+    monkeypatch.setattr(dsr.ReceiptLog, "verify", real)
+
+    replaced = list(dsr.raw_lines(log.path))
+    assert replaced[1] != genuine[1]
+    assert seen["receipt"]["head_sha256"] == hashlib.sha256(genuine[1]).hexdigest()       # the head that was verified
+    assert seen["receipt"]["read_finished_at"] == json.loads(genuine[1])["sources"]["factory_ledger"]["read_finished_at"]
+    assert not dsr.ReceiptLog(log.root).verify(anchors)["ok"]
+    monkeypatch.setattr(fp, "load_older", lambda *a, **k: pytest.fail("the gate let a replaced receipt through to the data"))
+    with pytest.raises(drw.WitnessError, match="does not verify"):                        # the replacement, presented as the witness
+        fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger,
+                     {"receipts": log.root, "external_anchors": anchors, "session": SESSION})
+    assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
+
+
 def test_the_receipt_must_have_read_this_ledger_at_or_after_the_registration(tmp_path):
     ledger, sha = ledger_with()
     before = witness(ledger)                                    # that night's receipt read the ledger before the registration
