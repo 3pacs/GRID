@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     SCHWAB_APP_SECRET: str = ""
     SCHWAB_TOKEN_FILE: str = "~/.config/grid/schwab/tokens.json"
     SCHWAB_CREDENTIALS_FILE: str = "~/.config/grid/schwab/credentials.env"
+    # End-of-day option-chain archive from Databento OPRA history
+    # (ingestion/options_eod_databento.py). The key file must be owner-only
+    # (0600) and is read only when the capture runs; the key never goes in
+    # .env. The store is one SQLite file; nothing reads it into the live
+    # options tables.
+    DATABENTO_API_KEY_FILE: str = "~/.config/databento/api-key"
+    OPTIONS_EOD_STORE: str = "/data/grid_ledgers/options-eod"
     # Private admin-only quote endpoint (api/routers/schwab_private.py). Off by
     # default: while False the router answers 503 and never touches the reader,
     # credentials or the network. Turning it on is an operator decision made in a
