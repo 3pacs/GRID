@@ -1655,10 +1655,11 @@ def main(argv=None) -> int:
     p.add_argument("--data", required=True, type=Path, help="the older-data bars file named by the registration's sha256")
     p.add_argument("--ledger", required=True, type=Path)
     p.add_argument("--anchor", required=True, type=Path)
-    p.add_argument("--witness-records", required=True, type=int,
-                   help="record count of a head of this ledger, at or after the registration, that was recorded off-host")
-    p.add_argument("--witness-head", required=True, help="that head's sha256")
-    p.add_argument("--witness-where", required=True, help="where the off-host copy is (for example the Desk receipt hub post)")
+    p.add_argument("--receipts", required=True, type=Path,
+                   help="the Desk receipt log's folder: the receipt that read this ledger at or after the registration is verified there")
+    p.add_argument("--external-anchors", required=True, type=Path,
+                   help="the anchor copy held outside that log (the vault's witness file); a person checks it is that copy")
+    p.add_argument("--session", required=True, help="that receipt's session, YYYY-MM-DD")
     w = sub.add_parser("verdicts-witness", help="mark live verdicts as witnessed by a Desk receipt that read the same stored look")
     w.add_argument("--receipts", required=True, type=Path, help="the Desk receipt log's folder; it is opened and verified")
     w.add_argument("--external-anchors", required=True, type=Path,
@@ -1688,9 +1689,10 @@ def main(argv=None) -> int:
                 print(json.dumps({"ok": True, "registered_sha256": done["sha256"], "seq": done["record"]["seq"],
                                   "head_sha256": ledger.head, "records": len(ledger.records),
                                   "rule": done["record"]["rule"], "store": done["record"]["store"]["id"],
-                                  "next": "the look needs a head at or after this record that was recorded off-host"}))
+                                  "next": "the look needs a Desk receipt that read this ledger at or after this record, "
+                                          "under an anchor copy held outside the receipt log"}))
                 return 0
-            witness = {"ledger_records": a.witness_records, "ledger_head_sha256": a.witness_head, "where": a.witness_where}
+            witness = {"receipts": a.receipts, "external_anchors": a.external_anchors, "session": a.session}
             done = factory_prescreen.prescreen(a.registration, a.data, ledger, witness)["record"]
         except (ValueError, OSError) as e:
             print(json.dumps({"ok": False, "refused": str(e)}))

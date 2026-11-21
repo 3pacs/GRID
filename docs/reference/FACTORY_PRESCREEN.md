@@ -48,12 +48,27 @@ No look had been run and no registration was on the ledger when it was made.
    rule, the registration file's sha256, the terms' sha256, the store and the data file's
    sha256. It reads the registration and the ledger, and no older data. The hash chain is
    what puts the registration before the look. A timestamp in a file is not.
-2. **Look.** `prescreen` needs a head of the ledger at or after the registration that was
-   recorded off-host before the look, and where (`--witness-records`, `--witness-head`,
-   `--witness-where`). The nightly Desk source receipt reads the factory ledger and its hub
-   post carries the head, so the natural order is: register, wait for that night's receipt,
-   look the next day. The ledger checks the head against its own lines. Whether the off-host
-   copy exists is checked by a person, and the record says so.
+2. **Look.** `prescreen` needs an independent witness that the registration existed first:
+   the nightly Desk source receipt, which reads the factory ledger and records its head in a
+   hash-chained log of its own. The look is given three things and no others: the receipt
+   log's folder (`--receipts`), an anchor copy held outside that log (`--external-anchors`,
+   the vault's witness file) and the session (`--session`). The natural order is: register,
+   wait for that night's receipt, look the next day.
+
+What the look checks itself, before the data file is opened (`analysis/desk_receipt_witness.py`,
+`factory_prescreen.ledger_witness`): the receipt log's chain, every payload file against its
+hash and the log's local anchors; that the anchor copy is another file than the log's own and
+covers that session's receipt; that the receipt read the factory ledger; and that the payload
+names a line of this ledger as its head. The ledger then requires that head to be at or after
+the registration, and the three times to be in order: registered, receipt read, looked.
+
+What it does not accept: a head, a record count or a place stated by the caller, and a time
+for the look. The look's time is the module's own clock.
+
+What code cannot check, and the record says so in words instead of claiming it: that the
+anchor copy presented is the one held off-host. A person checks that against the vault's
+pushed file or the hub post of that session. The record carries the copy's sha256 and the
+receipt's head for that comparison.
 
 ## The look
 
@@ -95,7 +110,8 @@ or labels (tested with and without).
 | Only a selected trial, the representative of its cluster | ledger rule |
 | One registration per trial; ten per store; a store's data file cannot change | ledger rule |
 | A look names its registration record, matches it field for field, and is its only look | ledger rule |
-| A look names a head of the ledger at or after its registration, stated as recorded off-host | ledger rule (consistency with the ledger's own lines) |
+| A look names a head of the ledger at or after its registration, taken from a verified Desk receipt, with the receipt, the anchor copy that covered it, and what a person must still check | `ledger_witness` at the look; ledger rule on append and reopen (shape, the ledger's own lines, the order of the three times) |
+| A head stated by the caller, or a time for the look, is refused | `prescreen()`; the command has no such arguments |
 | Pass means both bounds and the trimmed mean above zero; under 40 fires is underpowered | ledger rule, on append and on every reopen |
 | Everything that does not need the data is checked before the data file is opened | `prescreen()` |
 | SPY-only price features and tape features only | `candidate_run` (the store has no complete bars for other symbols, no events, options or macro history) |
@@ -118,7 +134,8 @@ python -m analysis.module_factory prescreen-register --registration REG.json \
 # ... the night's Desk receipt posts the ledger head off-host ...
 python -m analysis.module_factory prescreen --registration REG.json --data bars.db \
     --ledger grid-module-factory.jsonl --anchor grid-module-factory.anchors.jsonl \
-    --witness-records N --witness-head SHA256 --witness-where "desk-receipt <session>, hub post"
+    --receipts /data/grid_ledgers/desk-receipts --external-anchors VAULT/05-GRID/Paper-Log/desk-receipts/grid-desk-source-receipts.anchors.jsonl \
+    --session YYYY-MM-DD
 ```
 
 Each appends one record and prints it. A refusal prints the reason, exits 2 and appends
@@ -145,7 +162,9 @@ the slot.
 ## Not done
 
 - No registration is on the ledger and no look has been run.
-- The off-host copy of the witnessed head is not checked by code.
+- That the anchor copy is the one held off-host is not checked by code; the record says a person must.
+- The witness needs the receipt log's anchors exported to the vault file (`ReceiptLog.export_anchors`) and that
+  file committed and pushed. The nightly job posts each head to the hub; it does not export the anchors.
 - Calendar-flag, cross-symbol, options and macro features cannot be pre-screened.
 - The block bootstrap handles neighbouring days. Dependence across longer stretches (a whole
   regime) is not modelled; the by-year means are there to be read.

@@ -16,14 +16,20 @@ import dataclasses
 import hashlib
 import json
 import random
+import shutil
 import sqlite3
+import tempfile
+from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from analysis import desk_receipt_witness as drw
 from analysis import factory_prescreen as fp
 from analysis import ledger_steered_exploration as lse
 from analysis import module_factory as mf
+from intelligence import desk_source_receipts as dsr
 from tests.test_module_factory import file_ledger, run_file, staged
 
 FAMILY, MODULE = "SPY|change|14:00+60m", "F10|z>=1|long"
@@ -121,10 +127,42 @@ def registration(tmp_path, result_sha, data_sha, name="reg.json", **over):
     return path
 
 
-def witness(ledger, **over):
-    """The ledger's head now, as the operator would state it after seeing it off-host."""
-    return {"ledger_records": len(ledger.records), "ledger_head_sha256": ledger.head,
-            "where": "test fixture: no off-host copy exists", **over}
+SESSION = "2026-11-20"      # its receipt is read at 21:20Z: after REGISTERED, before LOOKED
+
+
+@pytest.fixture(autouse=True)
+def clocks(monkeypatch):
+    """A registration made without a time is made at REGISTERED; every look is taken at LOOKED. Neither is an argument."""
+    monkeypatch.setattr(lse, "now_iso", lambda: REGISTERED)
+    monkeypatch.setattr(fp, "_clock", lambda: LOOKED)
+    yield
+    while _RECEIPT_ROOTS:
+        shutil.rmtree(_RECEIPT_ROOTS.pop(), ignore_errors=True)
+
+
+_RECEIPT_ROOTS: list[Path] = []
+
+
+def receipt_log(ledger, session=SESSION, export_anchors=True, **payload):
+    """A real Desk receipt log whose ``session`` receipt read ``ledger`` as it is now. Returns (log, anchor copy path)."""
+    root = Path(tempfile.mkdtemp(prefix="prescreen-receipts-"))
+    _RECEIPT_ROOTS.append(root)
+    body = {"ledger_id": ledger.genesis["ledger_id"], "head_sha256": ledger.head,
+            "summary": {"records": len(ledger.records), "head_sha256": ledger.head}, **payload}
+    log = dsr.ReceiptLog(root / "log")
+    read_at = dsr.session_cutoff(date.fromisoformat(session)) + timedelta(minutes=20)
+    rows = (body.get("summary") or {}).get("records") or 0
+    out = log.record({"factory_ledger": lambda _cutoff: dsr.SourceRead(payload=body, rows=rows, scope={})}, now=lambda: read_at)
+    assert out["written"]
+    if export_anchors:
+        log.export_anchors(root / "vault")
+    return log, root / "vault" / dsr.WITNESS_DIR / dsr.ANCHOR_NAME
+
+
+def witness(ledger, session=SESSION, **payload):
+    """Where the look finds its witness: that night's receipt log, the anchor copy held outside it, and the session."""
+    log, anchors = receipt_log(ledger, session, **payload)
+    return {"receipts": log.root, "external_anchors": anchors, "session": session}
 
 
 def run_look(tmp_path, stores, which, ledger=None, result_sha=None, **over):
@@ -134,7 +172,7 @@ def run_look(tmp_path, stores, which, ledger=None, result_sha=None, **over):
     path, data_sha = stores[which]
     reg = registration(tmp_path, result_sha, data_sha, **over)
     registered = fp.register(reg, ledger, recorded_at=REGISTERED)
-    return fp.prescreen(reg, path, ledger, witness(ledger), looked_at=LOOKED), ledger, reg, registered
+    return fp.prescreen(reg, path, ledger, witness(ledger)), ledger, reg, registered
 
 
 # --- the calendar and the terms -------------------------------------------------------------------
@@ -177,7 +215,11 @@ def test_a_planted_effect_passes_and_both_records_are_on_the_ledger(tmp_path, st
     assert g["registration_sha256"] == hashlib.sha256(reg.read_bytes()).hexdigest() == r["registration_sha256"]
     assert g["prior_use"] == PRIOR_USE and g["terms_sha256"] == fp.TERMS_SHA256 and g["version"] == fp.VERSION
     assert r["registered_sha256"] == registered["sha256"]
-    assert r["registration_witness"]["ledger_records"] == 4 and "checked by a person" in r["registration_witness"]["checked"]
+    seen = r["registration_witness"]
+    assert seen["ledger_records"] == 4 and seen["kind"] == "desk-source-receipt" and seen["receipt"]["session"] == SESSION
+    assert seen["ledger_head_sha256"] == ledger.line_sha(3) and seen["receipt"]["external_anchor"]["witnessed_records"] == 2
+    assert seen["checked"]["by_a_person"] == drw.BY_A_PERSON and len(seen["checked"]["by_code"]) == len(drw.BY_CODE) + 1
+    assert r["looked_at"] == LOOKED            # this module's clock, not an argument
     assert r["verdict"] == "pass" and r["n"] >= 40 and r["evidence"] == lse.PRESCREEN_EVIDENCE
     assert r["lower_bound"] > 0 and r["excess_lower_bound"] > 0 and r["trimmed_mean_net"] > 0
     assert r["mean_net"] > r["trimmed_mean_net"] and 0 < r["top_share"] < 1 and r["mean_net"] > r["baseline"]["mean_net"]
@@ -208,24 +250,63 @@ def test_registering_reads_no_data_and_a_look_needs_its_registration(tmp_path, s
         fp.register(registration(tmp_path, sha, stores["noise"][1], name="again.json", prior_use=PRIOR_USE + " Again."), ledger)
 
 
-@pytest.mark.parametrize("change, message", [
-    ({"ledger_head_sha256": "9" * 64}, "recorded off-host"),            # not a head of this ledger
-    ({"ledger_records": 3}, "recorded off-host"),                       # a head from before the registration
-    ({"ledger_records": 99}, "recorded off-host"),
-    ({"where": ""}, "recorded off-host"),
-])
-def test_a_look_needs_a_head_at_or_after_its_registration(tmp_path, change, message):
+def test_a_head_the_caller_states_is_not_a_witness(tmp_path):
+    """Codex on 14dd1b3b: local-head-only evidence must fail the independent gate."""
     ledger, sha = ledger_with()
     reg = registration(tmp_path, sha, "5" * 64)
     fp.register(reg, ledger)
-    seen = witness(ledger)
-    if change.get("ledger_records") == 3:
-        seen = {**seen, "ledger_records": 3, "ledger_head_sha256": ledger.line_sha(2)}   # the result record: a true, earlier head
-    else:
-        seen = {**seen, **change}
-    with pytest.raises(ValueError, match=message):
-        fp.prescreen(reg, tmp_path / "there-is-no-such-file.db", ledger, seen)   # refused before the data is opened
+    nowhere = tmp_path / "there-is-no-such-file.db"            # every refusal below comes before the data is opened
+    stated = {"ledger_records": len(ledger.records), "ledger_head_sha256": ledger.head, "where": "the hub post of that night"}
+    good = witness(ledger)
+    for bad in (stated, {**good, **stated}, {**good, "looked_at": LOOKED}, {"session": SESSION}, None):
+        with pytest.raises(fp.PrescreenError, match="where its witness is and nothing else"):
+            fp.prescreen(reg, nowhere, ledger, bad)
+    with pytest.raises(TypeError):
+        fp.prescreen(reg, nowhere, ledger, good, looked_at=LOOKED)       # the look's time is not an argument
+    log, anchors = receipt_log(ledger)
+    refusals = [
+        ({"receipts": log.root, "external_anchors": log.anchor_path, "session": SESSION}, "other than the receipt log's own anchors"),
+        ({"receipts": tmp_path / "no-log", "external_anchors": anchors, "session": SESSION}, "no receipt log"),
+        ({"receipts": log.root, "external_anchors": anchors, "session": "2026-11-19"}, "no receipt for session"),
+        ({"receipts": log.root, "external_anchors": anchors, "session": "that night"}, "an ISO date"),
+    ]
+    for where, message in refusals:
+        with pytest.raises(drw.WitnessError, match=message):
+            fp.prescreen(reg, nowhere, ledger, where)
+    unexported, missing = receipt_log(ledger, export_anchors=False)
+    with pytest.raises(drw.WitnessError, match="other than the receipt log's own anchors"):
+        fp.prescreen(reg, nowhere, ledger, {"receipts": unexported.root, "external_anchors": missing, "session": SESSION})
     assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
+
+
+def test_the_receipt_must_have_read_this_ledger_at_or_after_the_registration(tmp_path):
+    ledger, sha = ledger_with()
+    before = witness(ledger)                                    # that night's receipt read the ledger before the registration
+    reg = registration(tmp_path, sha, "5" * 64)
+    fp.register(reg, ledger)
+    nowhere = tmp_path / "there-is-no-such-file.db"
+    with pytest.raises(ValueError, match="at or after its registration"):
+        fp.prescreen(reg, nowhere, ledger, before)
+    for payload in ({"head_sha256": "9" * 64}, {"ledger_id": "another-ledger"},
+                    {"summary": {"records": 99}}, {"summary": {"records": 0}}, {"summary": None}):
+        with pytest.raises(fp.PrescreenError, match="not a head of this ledger"):
+            fp.prescreen(reg, nowhere, ledger, witness(ledger, **payload))
+    assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
+
+
+def test_the_three_times_are_in_order_registered_then_read_then_looked(tmp_path, monkeypatch):
+    ledger, sha = ledger_with()
+    reg = registration(tmp_path, sha, "5" * 64)
+    fp.register(reg, ledger, recorded_at="2026-11-20T22:00:00+00:00")           # after that session's receipt was read
+    nowhere = tmp_path / "there-is-no-such-file.db"
+    with pytest.raises(ValueError, match="read before the registration"):
+        fp.prescreen(reg, nowhere, ledger, witness(ledger))
+    ledger2, sha2 = ledger_with()
+    reg2 = registration(tmp_path, sha2, "5" * 64, name="reg2.json")
+    fp.register(reg2, ledger2)
+    monkeypatch.setattr(fp, "_clock", lambda: "2026-11-20T21:00:00+00:00")       # the look's clock is behind the receipt's
+    with pytest.raises(ValueError, match="cannot come before the receipt"):
+        fp.prescreen(reg2, nowhere, ledger2, witness(ledger2))
 
 
 def test_noise_does_not_pass(tmp_path, stores):
@@ -416,7 +497,7 @@ def test_the_bytes_that_are_hashed_are_the_bytes_that_are_queried(tmp_path, stor
     opened = []
     real = fp.sqlite3.connect
     monkeypatch.setattr(fp.sqlite3, "connect", lambda target, *a, **k: (opened.append(str(target)), real(target, *a, **k))[1])
-    fp.prescreen(reg, path, ledger, witness(ledger), looked_at=LOOKED)
+    fp.prescreen(reg, path, ledger, witness(ledger))
     assert opened and all(str(path) not in target for target in opened)   # never a second open of the path
 
 
@@ -492,7 +573,8 @@ def reg_record(result_sha, trial_id, **over):
 def outcome(ledger, registered, **over):
     g = registered["record"]
     base = {k: g[k] for k in ("run_id", "trial_id", "result_sha256", "registration_sha256", "rule", "store", "version", "terms_sha256")}
-    return {**base, "registered_sha256": registered["sha256"], "registration_witness": witness(ledger), "verdict": "fail",
+    return {**base, "registered_sha256": registered["sha256"], "registration_witness": fp.ledger_witness(ledger, **witness(ledger)),
+            "verdict": "fail",
             "n": 60, "mean_net": 0.01, "lower_bound": -0.2, "excess_mean": 0.0, "excess_lower_bound": -0.3,
             "trimmed_mean_net": -0.01, "alpha_per_test": 0.005, "evidence": lse.PRESCREEN_EVIDENCE, "looked_at": LOOKED, **over}
 
@@ -527,11 +609,19 @@ def test_a_store_takes_ten_registrations_ever():
     ({"registration_sha256": "9" * 64}, "is not its registration's"),
     ({"rule": {"family": FAMILY, "feature": "F1|z>=1|long"}}, "rule of its trial"),
     ({"store": {"id": fp.STORE_ID, "data_sha256": "8" * 64}}, "store or data file is not its registration's"),
-    ({"looked_at": "2026-11-20T02:59:59+00:00"}, "cannot predate"),
+    ({"looked_at": "2026-11-20T02:59:59+00:00"}, "cannot come before the receipt"),
+    ({"registration_witness": {"ledger_records": 4, "ledger_head_sha256": "HEAD", "where": "the hub post of that night"}},
+     "names its receipt"),                                                                                  # a stated head, as in 14dd1b3b
+    ({"registration_witness": {"ledger_records": 4, "ledger_head_sha256": "HEAD",
+                               "receipt": {"session": SESSION, "head_sha256": "7" * 64, "payload_sha256": "8" * 64}}},
+     "anchor copy that covered"),
 ])
 def test_the_ledger_refuses_a_look_that_breaks_the_rules(change, message):
     ledger, sha = ledger_with()
     registered = lse.record_factory_prescreen_registered(ledger, reg_record(sha, T1), recorded_at=REGISTERED)
+    stated = change.get("registration_witness")
+    if stated and stated.get("ledger_head_sha256") == "HEAD":
+        change = {**change, "registration_witness": {**stated, "ledger_head_sha256": ledger.head}}
     with pytest.raises(ValueError, match=message):
         lse.record_factory_prescreen(ledger, outcome(ledger, registered, **change))
     assert ledger.of_kind(lse.FACTORY_PRESCREEN) == []
@@ -577,14 +667,25 @@ def test_a_rule_the_factory_selected_is_registered_and_prescreened_by_command(tm
     reg = registration(tmp_path, result_sha, data_sha, run_id="factory-test-1", trial_id=top["trial_id"],
                        registered_at="2100-01-01T00:00:00+00:00")
     paths = ["--registration", str(reg), "--ledger", str(lp), "--anchor", str(ap)]
-    look_args = ["prescreen", *paths, "--data", str(path), "--witness-where", "test fixture: no off-host copy"]
+    look_args = ["prescreen", *paths, "--data", str(path)]
 
-    assert mf.main([*look_args, "--witness-records", "3", "--witness-head", "0" * 64]) == 2   # not registered yet
+    def where(ledger):
+        w = witness(ledger)
+        return ["--receipts", str(w["receipts"]), "--external-anchors", str(w["external_anchors"]), "--session", w["session"]]
+
+    early = where(lse.Ledger(lp, anchor=ap))
+    assert mf.main([*look_args, *early]) == 2   # not registered yet
     assert "register it first" in json.loads(capsys.readouterr().out)["refused"]
     assert mf.main(["prescreen-register", *paths]) == 0
     done = json.loads(capsys.readouterr().out)
     assert done["ok"] and done["seq"] == 3 and done["records"] == 4 and done["rule"] == {"family": FAMILY, "feature": MODULE}
-    seen = ["--witness-records", str(done["records"]), "--witness-head", done["head_sha256"]]
+    assert mf.main([*look_args, *early]) == 2   # that night's receipt read the ledger before the registration
+    assert "at or after its registration" in json.loads(capsys.readouterr().out)["refused"]
+    with pytest.raises(SystemExit):
+        mf.main([*look_args, "--witness-records", str(done["records"]), "--witness-head", done["head_sha256"],
+                 "--witness-where", "the hub post"])                 # a stated head is not an argument any more
+    capsys.readouterr()
+    seen = where(lse.Ledger(lp, anchor=ap))
     assert mf.main([*look_args, *seen]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] and out["verdict"] == "pass" and out["registrations_left"] == 9 and out["evidence"] == lse.PRESCREEN_EVIDENCE

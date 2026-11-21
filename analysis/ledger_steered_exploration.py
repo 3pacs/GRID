@@ -231,10 +231,14 @@ reads (:mod:`analysis.factory_prescreen`). Two records, in this order:
   what puts the registration before the look. A trial is registered once, and
   one store takes at most :data:`PRESCREEN_MAX_LOOKS` registrations, ever.
 * ``factory_prescreen_outcome``, the look: it names its registration record
-  by line sha256, and a ledger head at or after that registration which the
-  operator states was recorded off-host before the look
-  (``registration_witness``; the ledger checks that head against its own
-  lines, a person checks the off-host copy).
+  by line sha256, and a ledger head at or after that registration that a
+  verified nightly Desk receipt read (``registration_witness``). The look
+  opens the receipt log, checks it against an anchor copy held outside it,
+  and takes the head from the receipt's own payload; the ledger checks that
+  head against its own lines and the order of the three times (registered,
+  receipt read, looked). A head stated by the caller is not accepted. That
+  the anchor copy is the one held off-host is a person's check, and the
+  record says so.
 
 A pass is a screen on older data that has been looked at before. It is not
 independent evidence and not evidence that the rule works now. It earns the
@@ -2402,6 +2406,34 @@ def validate_factory_forward(record: dict, results: dict[str, dict], seen: set[t
         raise ValueError("a live verdict carries the sha256 of the export file it came from")
 
 
+def validate_receipt_reference(receipt, checked) -> None:
+    """The shape a record's reference to a verified Desk receipt must have (see ``analysis.desk_receipt_witness``).
+
+    The session is a date; the receipt's head, its payload and the anchor copy are named by sha256; the anchor copy
+    covered the receipt; the receipt's read time is there; and the record says in words what code checked and what a
+    person must. A bare head hash, a free-text location or a caller's statement is not this.
+    """
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("session"), str) \
+            or not _hex64(receipt.get("head_sha256")) or not _hex64(receipt.get("payload_sha256")):
+        raise ValueError("a witness names its receipt: session, receipt head sha256 and payload sha256")
+    try:
+        date.fromisoformat(receipt["session"])
+    except ValueError:
+        raise ValueError("a witness names its receipt: the session is an ISO date") from None
+    outside = receipt.get("external_anchor")
+    records = receipt.get("log_records")
+    if not isinstance(outside, dict) or not _hex64(outside.get("sha256")) or not isinstance(records, int) or records < 2 \
+            or not isinstance(outside.get("witnessed_records"), int) or outside["witnessed_records"] < records:
+        raise ValueError("a witness names the anchor copy that covered its receipt (external_anchor: sha256, "
+                         "witnessed_records at or beyond the receipt's place in the log)")
+    if not isinstance(checked, dict) or not isinstance(checked.get("by_code"), list) or not checked["by_code"] \
+            or not isinstance(checked.get("by_a_person"), str) or len(checked["by_a_person"].strip()) < 20:
+        raise ValueError("a witness says what code checked and what a person must check (checked: by_code, by_a_person)")
+    if not isinstance(receipt.get("read_finished_at"), str):
+        raise ValueError("a witness carries the time it arrived and the time its receipt was read")
+    stamp(receipt["read_finished_at"])
+
+
 def validate_factory_forward_witness(record: dict, forward: dict[str, dict], earlier: list[dict]) -> None:
     """A witness names one live verdict on this ledger and the verified receipt that retains the same look. Once.
 
@@ -2419,24 +2451,8 @@ def validate_factory_forward_witness(record: dict, forward: dict[str, dict], ear
     if any(w["forward_sha256"] == record["forward_sha256"] for w in earlier):
         raise ValueError("this verdict already has its witness")
     receipt = record.get("receipt")
-    if not isinstance(receipt, dict) or not isinstance(receipt.get("session"), str) \
-            or not _hex64(receipt.get("head_sha256")) or not _hex64(receipt.get("payload_sha256")):
-        raise ValueError("a witness names its receipt: session, receipt head sha256 and payload sha256")
-    try:
-        date.fromisoformat(receipt["session"])
-    except ValueError:
-        raise ValueError("a witness names its receipt: the session is an ISO date") from None
-    outside = receipt.get("external_anchor")
-    records = receipt.get("log_records")
-    if not isinstance(outside, dict) or not _hex64(outside.get("sha256")) or not isinstance(records, int) or records < 2 \
-            or not isinstance(outside.get("witnessed_records"), int) or outside["witnessed_records"] < records:
-        raise ValueError("a witness names the anchor copy that covered its receipt (external_anchor: sha256, "
-                         "witnessed_records at or beyond the receipt's place in the log)")
-    checked = record.get("checked")
-    if not isinstance(checked, dict) or not isinstance(checked.get("by_code"), list) or not checked["by_code"] \
-            or not isinstance(checked.get("by_a_person"), str) or len(checked["by_a_person"].strip()) < 20:
-        raise ValueError("a witness says what code checked and what a person must check (checked: by_code, by_a_person)")
-    if not isinstance(record.get("witnessed_at"), str) or not isinstance(receipt.get("read_finished_at"), str):
+    validate_receipt_reference(receipt, record.get("checked"))
+    if not isinstance(record.get("witnessed_at"), str):
         raise ValueError("a witness carries the time it arrived and the time its receipt was read")
     if stamp(record["witnessed_at"]) < stamp(receipt["read_finished_at"]):
         raise ValueError("a witness cannot arrive before its receipt was read")
@@ -2591,10 +2607,17 @@ def validate_factory_prescreen(record: dict, results: dict[str, dict], registrat
     witness = record.get("registration_witness")
     count = witness.get("ledger_records") if isinstance(witness, dict) else None
     if type(count) is not int or not registered["seq"] < count <= len(line_shas) \
-            or line_shas[count - 1] != witness.get("ledger_head_sha256") \
-            or not isinstance(witness.get("where"), str) or len(witness["where"].strip()) < 10:
-        raise ValueError("a look names a head of this ledger at or after its registration that was recorded off-host "
-                         "first (registration_witness: ledger_records, ledger_head_sha256, where)")
+            or line_shas[count - 1] != witness.get("ledger_head_sha256"):
+        raise ValueError("a look names a head of this ledger at or after its registration that a Desk receipt read "
+                         "(registration_witness: ledger_records, ledger_head_sha256)")
+    # A head the caller states, with a place in words, is not a witness: the look names the verified receipt that
+    # read that head, and the anchor copy that covered it (analysis.factory_prescreen.ledger_witness).
+    validate_receipt_reference(witness.get("receipt"), witness.get("checked"))
+    read_at = stamp(witness["receipt"]["read_finished_at"])
+    if read_at < stamp(registered["recorded_at"]):
+        raise ValueError("the receipt was read before the registration it is said to cover")
+    if not isinstance(record.get("looked_at"), str) or stamp(record["looked_at"]) < read_at:
+        raise ValueError("a look cannot come before the receipt that witnesses its registration was read")
     if record.get("alpha_per_test") != PRESCREEN_ALPHA / PRESCREEN_MAX_LOOKS:
         raise ValueError(f"the per-look alpha is fixed at {PRESCREEN_ALPHA} / {PRESCREEN_MAX_LOOKS}")
     verdict, n = record.get("verdict"), record.get("n")

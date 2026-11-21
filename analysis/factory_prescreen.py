@@ -25,12 +25,15 @@ Two steps, two ledger records
    The hash chain puts the registration before the look; a timestamp inside
    a file could not.
 2. :func:`prescreen` runs the look for a registration already on the ledger
-   and appends ``factory_prescreen_outcome``. It must be given a ledger head
-   at or after the registration that was recorded off-host before the look
-   (``witness``: the Desk source receipt's nightly hub post carries the
-   factory ledger's head). The ledger checks that head against its own lines.
-   Whether the off-host copy exists is checked by a person, and the record
-   says so.
+   and appends ``factory_prescreen_outcome``. It needs an independent witness
+   that the registration existed before the look: the nightly Desk source
+   receipt, which reads the factory ledger and records its head in a log of
+   its own (:func:`ledger_witness`). The look is told where that log is, where
+   an anchor copy held outside it is, and which session. It opens and verifies
+   them itself and takes the ledger head from the receipt's payload; it
+   accepts no head, count or place stated by the caller. The look's time is
+   this module's clock, not an argument. What code cannot check is said on
+   the record and not claimed: that the anchor copy is the one held off-host.
 
 How a look is computed
 ----------------------
@@ -81,8 +84,8 @@ Guards
 * Only SPY-only price features and tape features are supported: the older
   store has no complete bars for the other symbols and no event, options or
   macro history.
-* The trial, the registration and the witnessed head are checked before the
-  data file is opened; the ledger re-checks every record on every reopen.
+* The trial, the registration and the witness are checked before the data
+  file is opened; the ledger re-checks every record on every reopen.
 
 Registrations name a selected rule, so they are kept out of this public
 repository; this module reads one by path and records its sha256.
@@ -101,6 +104,7 @@ from pathlib import Path
 
 import numpy as np
 
+from analysis import desk_receipt_witness
 from analysis import ledger_steered_exploration as lse
 from analysis import module_factory as mf
 from analysis.factory_session_calendar import FactoryCalendar
@@ -399,13 +403,44 @@ def register(registration: Path, ledger: lse.Ledger, *, recorded_at: str | None 
     return lse.record_factory_prescreen_registered(ledger, record, recorded_at=recorded_at)
 
 
+def _clock() -> str:
+    """The time of a look: one clock read. It is not an argument of :func:`prescreen`."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ledger_witness(ledger: lse.Ledger, receipts: Path, external_anchors: Path, session: str) -> dict:
+    """A head of ``ledger`` that a verified Desk receipt read, as the ``registration_witness`` of a look.
+
+    The receipt log is opened and verified against the anchor copy (``desk_receipt_witness.verified_receipt``), and
+    the head and record count are taken from the receipt's ``factory_ledger`` payload, never from the caller. The
+    payload must be about this ledger and name one of its own lines. Whether that head is at or after the
+    registration is the ledger's rule.
+    """
+    receipt = desk_receipt_witness.verified_receipt(Path(receipts), Path(external_anchors), session, "factory_ledger")
+    body = json.loads(receipt["payload"])
+    summary = body.get("summary") if isinstance(body, dict) else None
+    records = summary.get("records") if isinstance(summary, dict) else None
+    if not isinstance(body, dict) or body.get("ledger_id") != ledger.genesis["ledger_id"] or type(records) is not int \
+            or not 0 < records <= len(ledger.records) or ledger.line_sha(records - 1) != body.get("head_sha256"):
+        raise PrescreenError("that receipt's factory-ledger read is not a head of this ledger")
+    return {
+        "kind": "desk-source-receipt", "ledger_records": records, "ledger_head_sha256": body["head_sha256"],
+        "receipt": {k: receipt[k] for k in ("session", "head_sha256", "log_records", "read_finished_at", "payload_sha256",
+                                             "external_anchor")},
+        "checked": {"by_code": [*receipt["checked"]["by_code"],
+                                "the receipt's factory-ledger payload names a line of this ledger as its head"],
+                    "by_a_person": receipt["checked"]["by_a_person"]},
+    }
+
+
 def prescreen(registration: Path, data: Path, ledger: lse.Ledger, witness: dict, *,
-              calendar: FactoryCalendar | None = None, looked_at: str | None = None) -> dict:
+              calendar: FactoryCalendar | None = None) -> dict:
     """Run the look of a registration that is already on ``ledger`` and append it. Returns ``{record, sha256}``.
 
-    ``witness``: ``{ledger_records, ledger_head_sha256, where}``, a head of this ledger at or after the registration
-    that was recorded off-host before the look, and where (for example the Desk receipt's hub post of that night).
-    Order: the registration record, the trial and the witnessed head are checked before the data file is opened.
+    ``witness``: where the independent witness is, ``{receipts, external_anchors, session}``: the Desk receipt
+    log's folder, an anchor copy held outside it, and the session whose receipt read this ledger at or after the
+    registration. Nothing else is accepted in it: a head, a count or a place stated by the caller is refused.
+    Order: the registration record, the trial and the witness are checked before the data file is opened.
     A refusal raises :class:`PrescreenError` or ``ValueError`` and appends nothing.
     """
     if not ledger.is_factory:
@@ -416,9 +451,11 @@ def prescreen(registration: Path, data: Path, ledger: lse.Ledger, witness: dict,
     registered_sha = next((sha for sha, r in registrations.items() if r["registration_sha256"] == reg_sha), None)
     if registered_sha is None:
         raise PrescreenError("this registration is not on the ledger: register it first, before any look")
-    looked_at = looked_at or datetime.now(timezone.utc).isoformat()
-    target = {**_target(reg, reg_sha, module, family), "registered_sha256": registered_sha,
-              "registration_witness": {**witness, "checked": "consistent with this ledger; the off-host copy is checked by a person"}}
+    if not isinstance(witness, dict) or set(witness) != {"receipts", "external_anchors", "session"}:
+        raise PrescreenError("a look is told where its witness is and nothing else: receipts, external_anchors, session")
+    seen = ledger_witness(ledger, witness["receipts"], witness["external_anchors"], witness["session"])
+    looked_at = _clock()
+    target = {**_target(reg, reg_sha, module, family), "registered_sha256": registered_sha, "registration_witness": seen}
     # every rule of the ledger that does not need the data, before the data: a provisional underpowered look
     provisional = {**target, "verdict": "underpowered", "n": 0, "alpha_per_test": lse.PRESCREEN_ALPHA / lse.PRESCREEN_MAX_LOOKS,
                    "evidence": lse.PRESCREEN_EVIDENCE, "looked_at": looked_at}
