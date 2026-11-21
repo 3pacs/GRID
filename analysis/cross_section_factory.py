@@ -24,6 +24,13 @@ Two things a run on another universe may change. The price and dollar-volume flo
 (``min_price``, ``min_dollar_volume``) that default to ``MIN_PRICE`` and ``MIN_DOLLAR_VOLUME``. A ``sectors.csv`` that
 holds its header and no rows says the store has no sector labels: the run ranks pooled, and a run file that asks for
 a sector ranking, a sector gate or ``sector_momentum`` is refused.
+
+A store may be a completed export: a directory that is written once and carries ``panel-manifest.json``
+(``seal_export``), which lists every file's hash and names the first day discovery may use on it. The factory checks
+the directory against that manifest before it declares a run, refuses a window that starts earlier, and binds the
+manifest into the declared data manifest. A store with no sector labels must be such an export. Every input file is
+read once, and its bytes are checked against the hash the run declared, so a file replaced after the declaration
+closes the run as abandoned and two versions of a store never mix under one run id.
 """
 from __future__ import annotations
 
@@ -31,12 +38,14 @@ import argparse
 import bisect
 import csv
 import hashlib
+import io
 import json
 import math
 import sqlite3
 import sys
 import warnings
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +64,9 @@ MIN_PRICE = 5.0
 MIN_DOLLAR_VOLUME = 10e6
 DOLLAR_VOLUME_WINDOW = 21
 MEMBERS_FIELD_LIMIT = 16 * 1024 * 1024   # one members.csv row lists every member; csv's default field limit is 131,072
+EXPORT_MANIFEST = "panel-manifest.json"   # a completed export's own manifest, written once by seal_export
+EXPORT_SCHEMA = "cross-section-panel-export/1"
+_EXPORT_KEYS = {"schema", "complete", "generation", "discovery_first_session", "source", "files"}
 SIDES = {"overnight": 4, "intraday": 4, "close_1d": 4}   # sides traded per night per $1 long and $1 short
 SIGNAL_KINDS = ("mean_overnight", "mean_intraday", "momentum", "reversal", "high_52w", "sector_momentum")
 PAID_MIN_NIGHTS = 100   # a card cut with fewer traded nights is not named in where it paid or did not
@@ -205,17 +217,80 @@ class RunFile:
 
 # ── Data ──────────────────────────────────────────────────────────────────
 
-def manifest(data_dir: Path, state_db: Path) -> tuple[dict, str]:
-    """Name, size and sha256 of every input file. Hashing is the only read before the run is declared."""
+def input_files(data_dir: Path) -> dict:
+    """Name, size and sha256 of every panel file under ``data_dir``."""
+    data_dir = Path(data_dir)
     files = {}
-    for p in sorted([*Path(data_dir).glob("prices/*.csv"), *(Path(data_dir) / n for n in ("members.csv", "sectors.csv", "renames.json"))]):
+    for p in sorted([*data_dir.glob("prices/*.csv"), *(data_dir / n for n in ("members.csv", "sectors.csv", "renames.json"))]):
         files[str(p.relative_to(data_dir))] = {"bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
     if len(files) < 4:
         raise RunFileError("data directory needs prices/*.csv, members.csv, sectors.csv and renames.json")
+    return files
+
+
+def _is_day(value: object) -> bool:
+    try:
+        return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def seal_export(data_dir: Path, *, discovery_first_session: str, source: dict) -> dict:
+    """Close a finished panel directory as an export: write ``panel-manifest.json``, once, over the files as they are.
+
+    ``discovery_first_session`` is the first day a discovery window may start on this store. ``source`` says where the
+    files came from (provider, requested start, vintage). The generation id is the hash of everything else in the
+    manifest, so a directory whose files or terms differ carries a different id. Nothing may change afterwards."""
+    if not _is_day(discovery_first_session):
+        raise RunFileError("discovery_first_session must be a day, YYYY-MM-DD")
+    core = {"schema": EXPORT_SCHEMA, "complete": True, "discovery_first_session": discovery_first_session,
+            "source": source, "files": input_files(data_dir)}
+    body = {**core, "generation": "g-" + digest(core)[:16]}
+    write_once(Path(data_dir) / EXPORT_MANIFEST, body)
+    return body
+
+
+def read_export(data_dir: Path, files: dict) -> dict | None:
+    """The export manifest of ``data_dir`` checked against ``files`` (from ``input_files``), or None when the
+    directory carries none. Refuses an unfinished export, a manifest whose generation id is not its own hash, and a
+    directory whose files are not exactly the ones the manifest lists."""
+    path = Path(data_dir) / EXPORT_MANIFEST
+    if not path.is_file():
+        return None
+    raw = path.read_bytes()
+    try:
+        exp = json.loads(raw)
+        generation = "g-" + digest({k: v for k, v in exp.items() if k != "generation"})[:16]
+    except (ValueError, AttributeError) as exc:
+        raise RunFileError(f"{EXPORT_MANIFEST} cannot be read as an export manifest") from exc
+    if exp.get("schema") != EXPORT_SCHEMA or exp.get("complete") is not True:
+        raise RunFileError(f"{EXPORT_MANIFEST} is not a completed export ({EXPORT_SCHEMA})")
+    if set(exp) != _EXPORT_KEYS or exp["generation"] != generation or not _is_day(exp["discovery_first_session"]):
+        raise RunFileError(f"{EXPORT_MANIFEST} does not carry its own generation id and a discovery start day")
+    listed = exp["files"] if isinstance(exp["files"], dict) else {}
+    if listed != files:
+        differ = sorted(n for n in set(listed) | set(files) if listed.get(n) != files.get(n))
+        raise RunFileError(f"the data directory is not the export its manifest describes: {len(differ)} file(s) differ, "
+                           f"first {differ[:3]}")
+    return {"file": EXPORT_MANIFEST, "sha256": hashlib.sha256(raw).hexdigest(), "generation": generation,
+            "discovery_first_session": exp["discovery_first_session"]}
+
+
+def manifest(data_dir: Path, state_db: Path) -> tuple[dict, str]:
+    """Name, size and sha256 of every input file, and the export manifest when the store is an export.
+
+    Before the run is declared the factory hashes the files, reads the export manifest, and looks at whether
+    ``sectors.csv`` has any row. No price, member or state row is parsed until after the declaration."""
+    files = input_files(data_dir)
     if not Path(state_db).is_file():
         raise RunFileError("the sector state record (--state-db) is missing")
     body = {"schema": "cross-section-data-manifest/2", "files": files,
             "state_db": {"bytes": Path(state_db).stat().st_size, "sha256": hashlib.sha256(Path(state_db).read_bytes()).hexdigest()}}
+    export = read_export(data_dir, files)
+    if export:
+        body["panel_export"] = export
+    elif not any(line.strip() for line in (Path(data_dir) / "sectors.csv").read_bytes().splitlines()[1:]):
+        raise RunFileError(f"a store with no sector labels must be a completed export: {EXPORT_MANIFEST} is missing")
     return body, digest(body)
 
 
@@ -234,39 +309,73 @@ class Panel:
     assignment: dict = field(default_factory=dict)
 
 
-def load_panel(data_dir: Path, run: RunFile) -> Panel:
+@dataclass
+class Universe:
+    sessions: list
+    cols: list
+    frames: dict              # one frame per bar field, indexed by session, one column per price file
+    ok: pd.DataFrame          # a valid bar: positive unadjusted and adjusted prices, open and close inside the day's range
+    member: np.ndarray
+    base: np.ndarray          # member, valid bar, price and liquidity floors
+
+
+def _read(data_dir: Path, name: str, files: dict | None) -> bytes:
+    """One input file's bytes. With ``files`` (the declared manifest's file table) the bytes must hash to what was
+    declared, so a file replaced since then is never parsed."""
+    try:
+        raw = (Path(data_dir) / name).read_bytes()
+    except FileNotFoundError:
+        if files is None:
+            raise
+        raw = None
+    if files is not None and (raw is None or hashlib.sha256(raw).hexdigest() != files.get(name, {}).get("sha256")):
+        raise RunFileError(f"{name} changed between the run's declaration and its read; read a fixed copy")
+    return raw
+
+
+def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dollar_volume: float,
+             files: dict | None = None) -> Universe:
+    """Which stock may be ranked on which session. This is the one definition: ``load_panel`` builds on it, and a
+    tool that counts a store's universe (``analysis/smallcap_universe.py``) calls it, so the two cannot disagree.
+
+    A session is a day on which at least ``min_session_bars`` price files have a bar. A stock may be ranked on session
+    d when it is a member, has a valid bar on d, closed at ``min_price`` or more on the session before, and its median
+    dollar volume over the ``DOLLAR_VOLUME_WINDOW`` sessions ending the session before is at least
+    ``min_dollar_volume``. "The session before" is the store's previous session, not the stock's previous bar: a
+    stock with no bar on it has no prior close and is out. Bars after ``DEV_LAST_BAR`` are dropped."""
+    data_dir = Path(data_dir)
+    on_disk = sorted(str(p.relative_to(data_dir)) for p in sorted((data_dir / "prices").glob("*.csv")))
+    names = on_disk if files is None else sorted(n for n in files if n.startswith("prices/"))
+    if names != on_disk:
+        raise RunFileError("the price files changed between the run's declaration and its read; read a fixed copy")
     cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "volume")}
-    for p in sorted((Path(data_dir) / "prices").glob("*.csv")):
-        df = pd.read_csv(p, usecols=["date", *cols_data])
+    for name in names:
+        df = pd.read_csv(io.BytesIO(_read(data_dir, name, files)), usecols=["date", *cols_data])
         if df.empty:
             continue
         df["date"] = df["date"].str[:10]
         df = df[df["date"] <= DEV_LAST_BAR].drop_duplicates("date").set_index("date")   # nothing later is ever held
         for k, store in cols_data.items():
-            store[p.stem] = df[k]
+            store[Path(name).stem] = df[k]
     f = {k: pd.DataFrame(v).sort_index() for k, v in cols_data.items()}
     counts = f["close"].notna().sum(axis=1)
-    sessions = [d for d, n in counts.items() if n >= run.min_session_bars]
+    sessions = [d for d, n in counts.items() if n >= min_session_bars]
     if not sessions or sessions[-1] > DEV_LAST_BAR:
         raise RunFileError("no development sessions in the data")
     f = {k: v.reindex(sessions) for k, v in f.items()}
     lo, hi = f["low"] * (1 - BAR_TOL), f["high"] * (1 + BAR_TOL)
     ok = ((f["open"] > 0) & (f["close"] > 0) & (f["high"] > 0) & (f["low"] > 0) & (f["adjOpen"] > 0) & (f["adjClose"] > 0)
           & (f["open"] >= lo) & (f["open"] <= hi) & (f["close"] >= lo) & (f["close"] <= hi))
-    prev_ok = ok.shift(1, fill_value=False)
-    on = (f["adjOpen"] / f["adjClose"].shift(1) - 1).where(ok & prev_ok)
-    intra = (f["close"] / f["open"] - 1).where(ok)
-    cc = (f["adjClose"] / f["adjClose"].shift(1) - 1).where(ok & prev_ok)
-    cols = list(on.columns)
+    cols = list(ok.columns)
 
     limit = csv.field_size_limit(MEMBERS_FIELD_LIMIT)   # a universe of thousands writes a row longer than csv's default
     try:
-        with open(Path(data_dir) / "members.csv", newline="") as fh:
+        with io.StringIO(_read(data_dir, "members.csv", files).decode(), newline="") as fh:
             rows = sorted((r["date"], frozenset(t.strip() for t in r["tickers"].split(",") if t.strip())) for r in csv.DictReader(fh))
     finally:
         csv.field_size_limit(limit)
     mdates = [d for d, _ in rows]
-    renames = dict(json.loads((Path(data_dir) / "renames.json").read_text())["renames"])
+    renames = dict(json.loads(_read(data_dir, "renames.json", files))["renames"])
     at = {c: j for j, c in enumerate(cols)}
     member = np.zeros((len(sessions), len(cols)), dtype=bool)
     last_i, last_cols = None, []
@@ -278,9 +387,22 @@ def load_panel(data_dir: Path, run: RunFile) -> Panel:
         member[r, last_cols] = True
 
     dollar = (f["close"] * f["volume"]).rolling(DOLLAR_VOLUME_WINDOW, min_periods=10).median().shift(1)
-    base = member & ok.values & (f["close"].shift(1) >= run.min_price).values & (dollar >= run.min_dollar_volume).values
+    base = member & ok.values & (f["close"].shift(1) >= min_price).values & (dollar >= min_dollar_volume).values
+    return Universe(sessions, cols, f, ok, member, base)
 
-    with open(Path(data_dir) / "sectors.csv", newline="") as fh:
+
+def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel:
+    """The bars a run evaluates. ``files`` is the declared manifest's file table; ``run`` always passes it, so every
+    file parsed is the one that was hashed before the declaration."""
+    u = universe(data_dir, min_session_bars=run.min_session_bars, min_price=run.min_price,
+                 min_dollar_volume=run.min_dollar_volume, files=files)
+    f, ok, cols, member = u.frames, u.ok, u.cols, u.member
+    prev_ok = ok.shift(1, fill_value=False)
+    on = (f["adjOpen"] / f["adjClose"].shift(1) - 1).where(ok & prev_ok)
+    intra = (f["close"] / f["open"] - 1).where(ok)
+    cc = (f["adjClose"] / f["adjClose"].shift(1) - 1).where(ok & prev_ok)
+
+    with io.StringIO(_read(data_dir, "sectors.csv", files).decode(), newline="") as fh:
         labels = {r["Symbol"].strip(): r["GICS Sector"].strip() for r in csv.DictReader(fh)}
     sectors = sorted(set(labels.values()))
     if set(sectors) - set(GROUP_OF):
@@ -293,7 +415,7 @@ def load_panel(data_dir: Path, run: RunFile) -> Panel:
         code = np.full(len(cols), -1)
         how = {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None, "placed_by_correlation": 0,
                "unplaced": int(member.any(axis=0).sum())}
-    return Panel(sessions, cols, on.values, intra.values, cc.values, f["adjClose"].values, base, member, code, sectors, how)
+    return Panel(u.sessions, cols, on.values, intra.values, cc.values, f["adjClose"].values, u.base, member, code, sectors, how)
 
 
 def assign_sectors(cc: np.ndarray, member: np.ndarray, cols: list, labels: dict, sectors: list) -> tuple[np.ndarray, dict]:
@@ -668,12 +790,16 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
     if out.exists():
         raise RunFileError(f"output directory {out} already exists")
     man, man_sha = manifest(Path(data_dir), Path(state_db))
+    export = man.get("panel_export")
+    if export and spec.first_session < export["discovery_first_session"]:
+        raise RunFileError(f"discovery on this export starts {export['discovery_first_session']}; the run file's window "
+                           f"starts {spec.first_session}")
     lse.record_factory_declared(ledger, run_id=spec.run_id, run_file=body, data_manifest_sha256=man_sha,
                                 trial_count=spec.trial_count())
     try:
         out.mkdir(parents=True, exist_ok=False)
         write_once(out / "data-manifest.json", man)
-        panel = load_panel(Path(data_dir), spec)
+        panel = load_panel(Path(data_dir), spec, man["files"])
         state_rows = load_state(Path(state_db))
         if hashlib.sha256(Path(state_db).read_bytes()).hexdigest() != man["state_db"]["sha256"]:
             raise RunFileError("the state record changed between the run's declaration and its read; read a fixed copy")
@@ -743,7 +869,9 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
             "coverage": {"sessions": len(panel.sessions), "first": panel.sessions[0], "last": panel.sessions[-1],
                          "price_files": len(panel.cols), "members_mean": float(member_days.sum(axis=1).mean()),
                          "sector_assignment": panel.assignment, "state_rows_matched": states.matched,
-                         "data_manifest_sha256": man_sha, **floors},
+                         "data_manifest_sha256": man_sha, **floors,
+                         **({"panel_export": {k: export[k] for k in ("generation", "discovery_first_session", "sha256")}}
+                            if export else {})},
             "trial_count": len(trials), "tested": len(tested_rows), "untestable": payload["untestable_count"], "max_t": max_t,
             "selected": [t["trial_id"] for t in tested_rows if t["selected"]],
             "ranking": [{k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "gross_bp", "turnover",
