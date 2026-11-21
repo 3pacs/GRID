@@ -68,7 +68,7 @@ applicable decision time and every applicable one matched, so a feature with
 no applicable decision time can never be ready.
 
 A feature is ``live_ready`` only when each of the most recent ``MIN_SESSIONS``
-overlapping sessions is a matched one: at every decision time both sides were
+sessions the exchange calendar expects is a matched one: at every decision time both sides were
 eligible and the value was in tolerance. So in those sessions no value is out
 of tolerance and the two sides never disagree about that feature's
 availability. Anything else is ``research_only`` with its reasons and the
@@ -118,7 +118,7 @@ from analysis.module_factory import (
 from ingestion.market_calendar import is_market_open, market_close_time
 
 SCHEMA = "factory-live-parity-v3"
-MIN_SESSIONS = 5                  # the verdict: each of the most recent MIN_SESSIONS overlapping sessions matched
+MIN_SESSIONS = 5                  # the verdict: each of the most recent MIN_SESSIONS expected closed exchange sessions matched
 OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
 
@@ -745,7 +745,8 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "promotion_allowed": False,
         "note": ("matching sessions are evidence about the source and the implementation, "
                  "not about any edge; no feature becomes live-ready by back-filling; the verdict is taken on the "
-                 f"most recent {MIN_SESSIONS} overlapping sessions and the whole-window counts are reported beside it"),
+                 f"most recent {MIN_SESSIONS} closed exchange sessions the calendar expects (a session either side lacks is "
+                 "missing, not skipped) and the whole-window counts are reported beside it"),
     }
 
 

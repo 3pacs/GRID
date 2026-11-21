@@ -5,7 +5,8 @@
   tolerance and no session where the two sides disagree about availability.
 * A live recording with a missing read bar, or more than two lost minutes, fails:
   values that agree are not parity when live would abstain.
-* Version 3: the verdict is taken on the five most recent overlapping sessions.
+* Version 3: the verdict is taken on the five most recent closed exchange sessions the
+  calendar expects; a session either side lacks is missing, not skipped.
   An older bad session stays in the whole-window counts and no longer blocks.
 * Version 2: the live side is judged by the live recorder's lost-minute rule.
   Up to two lost minutes leave the return features exact; a range feature needs
