@@ -135,3 +135,50 @@ class TranscriptState:
             conn.execute("UPDATE state SET cursor=?, day=?, calls=?, next_at=? WHERE id=1",
                          (key, day, calls + 1, scheduled + self.interval))
             return key, scheduled - now
+
+
+# ── legacy vs verified transcript rows (#1051 follow-up) ─────────────────────────────────
+#
+# Before #1051 the puller asked AlphaVantage for the current and previous *calendar*
+# quarter labels ("2026Q3") and stored them with a calendar-quarter-end period_end and
+# filing_date = period_end. AV reads `quarter` as the issuer's *fiscal* quarter, so the
+# text is that fiscal quarter's call under the same label a verified row now carries.
+# A verified row (filing_date = matched SEC filing date, real fiscal period_end) has a
+# different (ticker, event_type, filing_date, fiscal_quarter) upsert key, so both rows
+# persist and a reader that counts EARNINGS_CALL rows counts that call twice.
+#
+# A legacy row is superseded when a verified row of the same ticker and fiscal_quarter
+# exists. Readers drop superseded legacy rows (AV_TRANSCRIPT_NOT_SUPERSEDED_SQL); legacy
+# rows with no verified twin stay, as they are still the only copy. Nothing is deleted
+# or rewritten here: scripts/reconcile_av_transcripts.py records supersessions in a
+# separate append-only table, and readers do not depend on that table.
+#
+# Both fragments are fixed SQL text (no values interpolated). The reader must alias
+# earnings_events as ``e``; the twin is ``v``.
+
+AV_VERIFIED_PROVENANCE_SQL = (
+    "v.event_type = 'EARNINGS_CALL' AND v.source = 'ALPHAVANTAGE' "
+    "AND v.raw_payload ->> 'filing_date_basis' = 'matched_sec_filing_not_call_date' "
+    "AND v.raw_payload ->> 'fiscal_period_source' = 'SEC_EDGAR_Fundamentals' "
+    "AND COALESCE(v.raw_payload ->> 'fiscal_period_accession', '') <> '' "
+    "AND v.raw_payload ->> 'quarter' = v.fiscal_quarter "
+    "AND v.full_text IS NOT NULL AND length(trim(v.full_text)) > 0"
+)
+
+AV_LEGACY_ROW_SQL = (
+    "e.event_type = 'EARNINGS_CALL' AND e.source = 'ALPHAVANTAGE' "
+    "AND COALESCE(e.raw_payload ->> 'filing_date_basis', '') <> 'matched_sec_filing_not_call_date'"
+)
+
+AV_TWIN_JOIN_SQL = (
+    "v.ticker = e.ticker AND v.fiscal_quarter = e.fiscal_quarter AND v.id <> e.id AND "
+    + AV_VERIFIED_PROVENANCE_SQL
+)
+
+AV_TRANSCRIPT_SUPERSEDED_SQL = (
+    "(" + AV_LEGACY_ROW_SQL
+    + " AND EXISTS (SELECT 1 FROM earnings_events v WHERE " + AV_TWIN_JOIN_SQL + "))"
+)
+
+#: Append to a reader's WHERE clause (it already has one): drops superseded legacy rows only.
+AV_TRANSCRIPT_NOT_SUPERSEDED_SQL = " AND NOT " + AV_TRANSCRIPT_SUPERSEDED_SQL + " "

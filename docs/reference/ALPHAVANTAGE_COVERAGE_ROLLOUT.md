@@ -323,3 +323,22 @@ with outbound sockets blocked. A fresh full CI run is required for this fix.
 - Shared-account budgeting, delayed-dispatch pacing, historical reconciliation,
   metadata breadth and separate canary approval remain rollout gates. No provider
   calls, production access, scheduler changes, merge to main or deployment.
+
+## Legacy/verified transcript twins, 2026-11-21 (draft source only)
+
+Pre-#1051 rows asked AV for calendar labels, which AV reads as fiscal, so a legacy row
+and a verified #1051 row of the same ticker and `fiscal_quarter` hold the same call.
+Their `filing_date` differs (calendar quarter end vs matched SEC filing), so the upsert
+key never collides and both persist. Readers that counted `EARNINGS_CALL` rows saw the
+call twice: `intelligence/catalyst_aggregator.py` (an extra catalyst at the fabricated
+calendar `period_end`) and `gem_hunter/cross_class.py` (`n_call`). `gem_hunter/gem_rules.py`
+let the legacy copy set `has_call` and `MAX(filing_date)`. The transcript analyzer already
+rejects legacy rows; `event_sequence` and `causal_links` withhold earnings rows.
+
+- Readers now append `AV_TRANSCRIPT_NOT_SUPERSEDED_SQL` (`ingestion/av_transcript_plan.py`):
+  a legacy AV row is dropped only when a verified twin exists. A legacy row with no
+  twin stays, because it is still the only copy.
+- `scripts/reconcile_av_transcripts.py` reports superseded legacy rows as JSON (read-only).
+  `--apply --run-tag TAG` appends one record per row to `earnings_event_supersessions`
+  (created if absent, `ON CONFLICT DO NOTHING`). It never updates or deletes
+  `earnings_events` and never rewrites a record. Readers do not depend on that table.
