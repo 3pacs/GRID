@@ -82,6 +82,9 @@ def _ensure_columns(cur: Any) -> int:
     cur.execute("ALTER TABLE options_daily_signals ADD COLUMN IF NOT EXISTS iv_25d_call DOUBLE PRECISION")
     cur.execute("ALTER TABLE options_daily_signals ADD COLUMN IF NOT EXISTS term_structure_slope DOUBLE PRECISION")
     cur.execute("ALTER TABLE options_daily_signals ADD COLUMN IF NOT EXISTS oi_concentration DOUBLE PRECISION")
+    cur.execute("ALTER TABLE options_daily_signals ADD COLUMN IF NOT EXISTS iv_m90_put_v1 DOUBLE PRECISION")
+    cur.execute("ALTER TABLE options_daily_signals ADD COLUMN IF NOT EXISTS iv_m110_call_v1 DOUBLE PRECISION")
+    cur.execute("ALTER TABLE options_daily_signals ADD COLUMN IF NOT EXISTS wing_iv_metadata JSONB")
     cur.execute(
         "INSERT INTO source_catalog (name,base_url,cost_tier,latency_class,pit_available,"
         "revision_behavior,trust_score,priority_rank) "
@@ -272,6 +275,9 @@ def _pull_one(
             spot_price=EXCLUDED.spot_price,
             iv_atm=EXCLUDED.iv_atm,
             term_structure_slope=EXCLUDED.term_structure_slope,
+            iv_m90_put_v1=NULL,
+            iv_m110_call_v1=NULL,
+            wing_iv_metadata=NULL,
             created_at=NOW()
         """,
         (

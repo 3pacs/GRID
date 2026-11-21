@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse
 from api.auth import require_role
 from config import log, settings
 from ingestion.schwab_market import SchwabError
+from ingestion import schwab_usage
 from ingestion.schwab_private_store import SCHEMA as VIEW_SCHEMA
 from ingestion.schwab_private_store import PrivateQuoteStore, ProvenanceError
 from ingestion.schwab_quote_path import (
@@ -115,7 +116,7 @@ def _quote_source() -> QuoteSource:
     if not is_configured():
         raise HTTPException(status_code=503, detail="Schwab reader is not configured on this host")
     try:
-        return SchwabMarketClient()
+        return SchwabMarketClient(client=schwab_usage.client_name() + "/schwab_private")
     except SchwabConfigError as exc:
         raise HTTPException(status_code=503, detail="Schwab reader is not configured on this host") from exc
 

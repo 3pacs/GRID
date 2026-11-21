@@ -19,6 +19,7 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from store.availability import unavailable
+from store.options_iv import fixed_moneyness_wings, positive_finite, public_wing_fields
 
 router = APIRouter(
     prefix="/api/v1/derivatives",
@@ -527,10 +528,10 @@ def get_skew(ticker: str) -> dict[str, Any]:
 
 @router.get("/term-structure/{ticker}")
 def get_term_structure(ticker: str) -> dict[str, Any]:
-    """ATM IV term structure across expiries.
+    """ATM term structure with versioned fixed-moneyness wing IV proxies.
 
-    Returns [{expiry, dte, iv_atm, iv_25d_put, iv_25d_call}].
-    ATM is approximated as the strike closest to spot.
+    Uses one immutable capture and its observed spot; no strike-derived spot.
+    Deprecated iv_25d_* keys are null. Legacy chains without lineage abstain.
     """
     try:
         db = get_db_engine()
@@ -538,89 +539,47 @@ def get_term_structure(ticker: str) -> dict[str, Any]:
             latest = conn.execute(text(
                 "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
             ), {"t": ticker.upper()}).fetchone()
-
             if not latest or not latest[0]:
                 return {"ticker": ticker.upper(), "term_structure": [], "error": "No data"}
-
             snap_date = latest[0]
-
-            # Get spot price approximation (highest OI call strike)
-            spot_row = conn.execute(text(
-                "SELECT strike FROM options_snapshots "
-                "WHERE ticker = :t AND snap_date = :sd AND opt_type = 'call' "
-                "ORDER BY open_interest DESC LIMIT 1"
+            batch = conn.execute(text(
+                "SELECT capture_batch_id, spot_price, spot_provider, provider_regular_market_at, backfilled "
+                "FROM options_capture_batches WHERE ticker = :t AND snap_date = :sd "
+                "ORDER BY capture_ordinal DESC LIMIT 1"
             ), {"t": ticker.upper(), "sd": snap_date}).fetchone()
-
-            spot = float(spot_row[0]) if spot_row else 0
-
+            if not batch or batch[4] or positive_finite(batch[1]) is None:
+                return {"ticker": ticker.upper(), "snap_date": str(snap_date),
+                        "term_structure": [], "error": "Observed capture spot unavailable"}
+            batch_id, spot, source, spot_at, _backfilled = batch
+            spot = float(spot)
             rows = conn.execute(text(
-                "SELECT strike, expiry, (expiry - :sd) AS dte, "
-                "implied_volatility, opt_type, open_interest "
-                "FROM options_snapshots "
-                "WHERE ticker = :t AND snap_date = :sd "
-                "AND implied_volatility > 0 AND expiry > :sd "
-                "ORDER BY expiry, strike"
-            ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
+                "SELECT strike, expiry, (expiry - :sd) AS dte, implied_vol, opt_type "
+                "FROM options_snapshots_all WHERE ticker = :t AND snap_date = :sd "
+                "AND capture_batch_id = :batch AND expiry > :sd ORDER BY expiry, strike"
+            ), {"t": ticker.upper(), "sd": snap_date, "batch": batch_id}).fetchall()
 
-        # Group by expiry, find ATM and 25-delta approximations
         from collections import defaultdict
         expiry_data: dict[str, list] = defaultdict(list)
         for r in rows:
-            expiry_data[str(r[1])].append({
-                "strike": float(r[0]),
-                "dte": r[2].days if hasattr(r[2], 'days') else int(r[2]),
-                "iv": float(r[3]),
-                "type": r[4],
-                "oi": int(r[5]),
-            })
-
+            expiry_data[str(r[1])].append({"strike": r[0], "iv": r[3], "type": r[4]})
         term_structure = []
-        for expiry, strikes_list in sorted(expiry_data.items()):
-            if not strikes_list:
-                continue
-
-            dte = strikes_list[0]["dte"]
-
-            # ATM: strike closest to spot
-            calls = [s for s in strikes_list if s["type"] == "call"]
-            puts = [s for s in strikes_list if s["type"] == "put"]
-
-            atm_iv = None
-            if calls and spot > 0:
-                atm_call = min(calls, key=lambda s: abs(s["strike"] - spot))
-                atm_iv = atm_call["iv"]
-
-            # 25-delta approximations (roughly 5-8% OTM for typical vols)
-            otm_pct = 0.05
-            iv_25d_put = None
-            iv_25d_call = None
-
-            if puts and spot > 0:
-                target_put = spot * (1 - otm_pct)
-                nearest_put = min(puts, key=lambda s: abs(s["strike"] - target_put))
-                iv_25d_put = nearest_put["iv"]
-
-            if calls and spot > 0:
-                target_call = spot * (1 + otm_pct)
-                nearest_call = min(calls, key=lambda s: abs(s["strike"] - target_call))
-                iv_25d_call = nearest_call["iv"]
-
+        for expiry, contracts in sorted(expiry_data.items()):
+            calls = [c for c in contracts if c["type"] == "call"]
+            puts = [c for c in contracts if c["type"] == "put"]
+            wings = fixed_moneyness_wings(
+                calls, puts, spot, expiry=expiry, snap_date=snap_date, source=source,
+                capture_batch_id=batch_id,
+                spot_observed_at=spot_at.isoformat() if spot_at else None,
+            )
+            valid_calls = [c for c in calls if positive_finite(c["strike"]) and positive_finite(c["iv"])]
+            atm = min(valid_calls, key=lambda c: abs(float(c["strike"]) - spot)) if valid_calls else None
             term_structure.append({
-                "expiry": expiry,
-                "dte": dte,
-                "iv_atm": round(atm_iv, 4) if atm_iv else None,
-                "iv_25d_put": round(iv_25d_put, 4) if iv_25d_put else None,
-                "iv_25d_call": round(iv_25d_call, 4) if iv_25d_call else None,
+                "expiry": expiry, "dte": wings["wing_iv_metadata"]["dte"],
+                "iv_atm": round(float(atm["iv"]), 4) if atm else None,
+                **public_wing_fields(wings["iv_m90_put_v1"], wings["iv_m110_call_v1"], wings["wing_iv_metadata"]),
             })
-
-        term_structure.sort(key=lambda x: x["dte"])
-
-        return {
-            "ticker": ticker.upper(),
-            "snap_date": str(snap_date),
-            "spot": spot,
-            "term_structure": term_structure,
-        }
+        return {"ticker": ticker.upper(), "snap_date": str(snap_date), "spot": spot,
+                "capture_batch_id": batch_id, "term_structure": term_structure}
     except Exception as exc:
         log.warning("Term structure failed for {t}: {e}", t=ticker, e=str(exc))
         return {"error": str(exc), "ticker": ticker.upper(), "term_structure": []}

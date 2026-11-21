@@ -300,7 +300,6 @@ class TestOracleSignalsSwitch:
         "signal_type, expected_source_type",
         [
             ("holder_overlap", "holder_overlap"),
-            ("fundamental_divergence", "fundamental_divergence"),
             ("contagion_ranked_impact", "contagion"),
             ("chokepoint_crossing", "chokepoint_crossing"),
             ("contagion_trigger", "news_trigger"),
@@ -320,6 +319,16 @@ class TestOracleSignalsSwitch:
         args, kwargs = conn.execute.call_args
         params = args[1] if len(args) > 1 else kwargs
         assert params["st"] == expected_source_type
+
+    def test_financial_type_replay_is_quarantined(self):
+        from contracts.handlers import oracle_signals
+
+        engine = MagicMock()
+        oracle_signals.on_signal_fired(
+            self._evt("fundamental_divergence"), engine=engine,
+        )
+        engine.begin.assert_not_called()
+        engine.connect.assert_not_called()
 
     def test_unknown_type_ignored(self, mock_engine):
         from contracts.handlers import oracle_signals

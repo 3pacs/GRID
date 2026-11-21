@@ -289,11 +289,23 @@ def _publication_lineage_assessment(info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str, Any],
-                                 *, narrative_span: tuple[int, int] | None = None) -> dict[str, Any]:
+                                 *, narrative_span: tuple[int, int] | None = None,
+                                 rendered_cap_bytes: int = 262_144) -> dict[str, Any]:
     """Present declared metadata for displayed numeric feature candidates only.
 
     This post-grounding appendix is data, never an evidence producer, verifier,
     freshness classifier, selector, or an additional grounding pool.
+
+    Bounded output. A numeric mention whose equal-value match listing in the
+    stage diagnostics is incomplete (more retained observations matched than
+    ``_publication_stage_diagnostics`` lists; see its ``match_list_cap``) gets
+    ``attribution: "ambiguity_overflow"`` and NO declaration records: a value
+    shared by dozens or hundreds of features (``0``, ``0.5``, ``1.0``) carries
+    no attribution, and rendering one ~1.5 KB record per coincidental feature
+    is what wrote a 1.5 MB ``market_briefings`` row (id 5007, 2026-11-06:
+    ``0%`` matched 961 zero-valued features). If the encoded appendix still
+    exceeds ``rendered_cap_bytes`` the whole appendix is withheld and a short
+    declared note is rendered instead; the narrative is never cut.
     """
     features = snapshot.get("features")
     features = features if isinstance(features, dict) else {}
@@ -303,11 +315,22 @@ def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str
                   and all(type(offset) is int for offset in narrative_span)
                   and 0 <= narrative_span[0] <= narrative_span[1])
     mappings = []
+    overflow = []
     for mention in mentions:
         start, end = mention.get("start"), mention.get("end")
         if type(start) is not int or type(end) is not int or start < 0 or end <= start:
             continue
         if not valid_span or not (narrative_span[0] <= start < end <= narrative_span[1]):
+            continue
+        if mention.get("snapshot_matches_complete") is False:
+            # Listing was cut at the diagnostics cap: equal-value coincidence
+            # with that many retained observations is not attribution.
+            count = mention.get("snapshot_match_count")
+            mappings.append({"start": start, "end": end, "feature_paths": [],
+                             "attribution": "ambiguity_overflow",
+                             "numeric_context_match": mention.get("generation_context_numeric_match") is True,
+                             "snapshot_match_count": count if type(count) is int else None})
+            overflow.append((start, end, count))
             continue
         matched = sorted({match.get("path") for match in mention.get("snapshot_matches", [])
                           if isinstance(match, dict) and match.get("path") in paths})
@@ -376,23 +399,59 @@ def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str
     # identifiers; do not let metadata create markdown instructions or HTML.
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, allow_nan=False)
     encoded = encoded.replace("`", "\\u0060").replace("<", "\\u003c").replace(">", "\\u003e")
-    payload["rendered_text"] = (
-        "\n\n---\n### Feature evidence declarations\n"
-        "Declared metadata only; provider truth and freshness remain unknown. "
-        "Equal-value matches are candidates, not unique attribution.\n"
-        "```json\n" + encoded + "\n```\n"
-    ) if records else ""
+    if overflow:
+        log.warning(
+            "Publication evidence footer: {n} numeric mention(s) equal-value-matched more "
+            "retained observations than the diagnostics list; no feature attribution "
+            "rendered for them (offset, count): {spans}",
+            n=len(overflow), spans=[(s, e, c) for s, e, c in overflow],
+        )
+    rendering = {"cap_bytes": rendered_cap_bytes, "encoded_bytes": len(encoded),
+                 "record_count": len(records), "overflow_mentions": len(overflow),
+                 "status": "rendered" if records else "empty"}
+    if records and len(encoded) > rendered_cap_bytes:
+        # Refuse the appendix as a whole, declared in place; never trim records
+        # silently and never touch the narrative above it.
+        rendering["status"] = "withheld_over_cap"
+        log.warning(
+            "Publication evidence footer withheld: {n} declaration records encode to "
+            "{b} bytes, over the {cap}-byte appendix cap",
+            n=len(records), b=len(encoded), cap=rendered_cap_bytes,
+        )
+        payload["rendered_text"] = (
+            "\n\n---\n### Feature evidence declarations\n"
+            f"Appendix withheld: {len(records)} declaration records encode to {len(encoded)} bytes, "
+            f"over the {rendered_cap_bytes}-byte cap. Declared metadata remains in the stored "
+            "snapshot; the narrative above is unmodified.\n"
+        )
+    else:
+        payload["rendered_text"] = (
+            "\n\n---\n### Feature evidence declarations\n"
+            "Declared metadata only; provider truth and freshness remain unknown. "
+            "Equal-value matches are candidates, not unique attribution.\n"
+            "```json\n" + encoded + "\n```\n"
+        ) if records else ""
+    payload["rendering"] = rendering
     return payload
 
 
 def _publication_stage_diagnostics(candidate: str | None, grounding_input: str,
                                    emitted: str, data_context: str,
-                                   snapshot: dict[str, Any], fallback: str | None) -> dict[str, Any]:
+                                   snapshot: dict[str, Any], fallback: str | None,
+                                   *, match_list_cap: int = 8) -> dict[str, Any]:
     """Trace existing numeric/context scopes without adding evidence to the pool.
 
     Digests and offsets bind each exact stage. Snapshot presence is only a
     diagnostic use of the SAME numeric matcher, never authority for semantics,
     source truth, freshness, PIT, or the existing grounding result.
+
+    Bounded listing. Every retained observation is still matched and counted
+    (``snapshot_match_count``), but at most ``match_list_cap`` matches are
+    listed per mention; ``snapshot_matches_complete`` says whether the list is
+    the whole set. With ~2,700 model-eligible features a value like ``0`` or
+    ``0.5`` matches hundreds of them, and listing each (times three roles)
+    wrote 30 MB ``snapshot_data`` rows. The cap is a keyword default rather
+    than a module constant so the AST-loaded contract tests see it too.
     """
     from ollama.number_grounding import _is_grounded, extract_numeric_mentions
 
@@ -427,20 +486,27 @@ def _publication_stage_diagnostics(candidate: str | None, grounding_input: str,
         entries = []
         for mention in extract_numeric_mentions(text):
             matches = []
+            match_count = 0
             for path, pool, metadata, display in observations:
-                if _is_grounded(mention, pool):
+                if not _is_grounded(mention, pool):
+                    continue
+                match_count += 1
+                if len(matches) < match_list_cap:
                     matches.append({"path": path, "semantic_metadata": metadata,
                                     "displayed_fallback_origin": bool(
                                         role != "candidate" and fallback is not None and display in fallback)})
             entries.append({"start": mention.start, "end": mention.end,
                             "generation_context_numeric_match": _is_grounded(mention, context_pool),
-                            "retained_snapshot_presence": "present" if matches else "unknown",
+                            "retained_snapshot_presence": "present" if match_count else "unknown",
                             "snapshot_matches": matches,
+                            "snapshot_match_count": match_count,
+                            "snapshot_matches_complete": match_count <= match_list_cap,
                             "source_truth": "unknown", "freshness": "unknown",
                             "semantic_authority_from_numeric_match": False})
         roles[role] = {"digest": digest, "numeric_mentions": entries,
                        "availability": "full_in_memory", "span_binding": role}
     return {"schema": "grid.publication_stage_diagnostics.v1", "roles": roles,
+            "snapshot_match_list_cap": match_list_cap,
             "generation_context_digest": asdict(_publication_digest(data_context)),
             "numeric_pool": "original_generation_data_context_only",
             "snapshot_presence_is_grounding_permission": False,

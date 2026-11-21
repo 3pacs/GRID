@@ -186,7 +186,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.1),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.1),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
@@ -225,7 +225,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.9),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.9),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
@@ -277,7 +277,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.1),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.1),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
@@ -315,7 +315,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.1),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.1),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
@@ -350,7 +350,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.1),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.1),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
@@ -375,8 +375,8 @@ class TestShouldITrade:
 
         assert response.pattern_report is None
         assert "pattern_library" in response.stage_errors
-        # High verdict preserved — no pattern confidence to downgrade on
-        assert response.unified_verdict == "high"
+        # A failed pattern stage is not genuine optional missing evidence.
+        assert response.unified_verdict == "no_trade"  # Failed evidence check now fails closed.
 
     def test_missing_current_price_blocks_ticket(self):
         engine = MagicMock()
@@ -389,7 +389,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.1),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.1),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
@@ -423,7 +423,7 @@ class TestShouldITrade:
             "oracle.engine.EnsemblePredictor"
         ) as MockPredictor, patch(
             "intelligence.llm_red_team.red_team_prediction",
-            return_value=SimpleNamespace(epistemic_risk_score=0.1),
+            return_value=SimpleNamespace(counters=("fixture counterargument",), epistemic_risk_score=0.1),
         ), patch(
             "intelligence.signal_provenance.build_provenance_report",
             return_value=prov,
