@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
-from edgar import get_filings, set_identity
+from edgar import Company, get_filings, set_identity
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -107,6 +108,147 @@ def _sic_to_broad_sector(sic_code: str | int) -> str:
     return "UNKNOWN"
 
 
+# ── SIC resolution ──────────────────────────────────────────────────────────
+#
+# edgartools' Filing (5.62.1 and 6.3.0) has no ``sic`` attribute, so every 8-K
+# used to land in SEC_VELOCITY:UNKNOWN. SIC now comes from:
+#   1. griddb's own ``edgar_submissions`` (scripts/parse_edgar.py, from SEC's
+#      XBRL financial-statement bulk files, about 2009-2022 filers). The SIC
+#      on the CIK's latest submission filed on or before ``as_of``, so a
+#      historical year is labelled with the SIC known at the time. One query
+#      per load, never per filing. A missing table or failed read gives {}.
+#   2. On a miss only: ``edgar.Company(cik).sic`` (one GET of SEC's
+#      submissions JSON per CIK). This is the CIK's *current* SIC, cached for
+#      the run and capped at SIC_FALLBACK_MAX_LOOKUPS. After
+#      SIC_FALLBACK_MAX_CONSECUTIVE_FAILURES errors in a row the fallback
+#      stops for the run, so an SEC outage costs a few requests, not 200
+#      retry loops.
+# Anything unresolved stays UNKNOWN. A lookup failure never aborts the run.
+SIC_FALLBACK_MAX_LOOKUPS: int = 200
+SIC_FALLBACK_MAX_CONSECUTIVE_FAILURES: int = 3
+
+_LOCAL_SIC_SQL = text(
+    "SELECT DISTINCT ON (cik) cik, sic FROM edgar_submissions "
+    "WHERE sic IS NOT NULL AND filed <= :as_of "
+    "ORDER BY cik, filed DESC"
+)
+
+
+def _normalize_sic(raw: Any) -> str | None:
+    """Return a SIC code as a digit string, or ``None`` when absent or invalid."""
+    if raw is None:
+        return None
+    text_value = str(raw).strip()
+    if text_value.endswith(".0"):
+        text_value = text_value[:-2]
+    if not text_value.isdigit() or int(text_value) == 0:
+        return None
+    return text_value
+
+
+class SICResolver:
+    """CIK -> SIC for one velocity run: the local table first, SEC on a miss."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        company_factory: Callable[[int], Any] | None = None,
+        max_lookups: int | None = None,
+        max_consecutive_failures: int | None = None,
+    ) -> None:
+        self.engine = engine
+        self._company_factory = company_factory or (lambda cik: Company(cik))
+        self.max_lookups = (
+            SIC_FALLBACK_MAX_LOOKUPS if max_lookups is None else max_lookups
+        )
+        self.max_consecutive_failures = (
+            SIC_FALLBACK_MAX_CONSECUTIVE_FAILURES
+            if max_consecutive_failures is None
+            else max_consecutive_failures
+        )
+        self.local: dict[int, str] = {}
+        self._fallback: dict[int, str | None] = {}
+        self.fallback_lookups = 0
+        self._consecutive_failures = 0
+        self._cap_logged = False
+        self._breaker_logged = False
+
+    def load_local(self, as_of: date) -> None:
+        """Read edgar_submissions once into ``self.local`` (SIC as of ``as_of``)."""
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(_LOCAL_SIC_SQL, {"as_of": as_of}).fetchall()
+        except Exception as exc:  # table absent, timeout, ...: fall through to SEC
+            log.warning(
+                "SEC velocity: edgar_submissions SIC read failed, using fallback only: {e}",
+                e=exc,
+            )
+            self.local = {}
+            return
+        local: dict[int, str] = {}
+        for cik, sic in rows:
+            norm = _normalize_sic(sic)
+            if norm is not None and cik is not None:
+                local[int(cik)] = norm
+        self.local = local
+        log.info(
+            "SEC velocity: {n} CIK SIC codes from edgar_submissions (as of {d})",
+            n=len(local), d=as_of,
+        )
+
+    def _fallback_sic(self, cik: int) -> str | None:
+        if cik in self._fallback:
+            return self._fallback[cik]
+        if self._consecutive_failures >= self.max_consecutive_failures:
+            if not self._breaker_logged:
+                log.warning(
+                    "SEC velocity: SIC fallback stopped after {n} consecutive errors; "
+                    "remaining misses stay UNKNOWN",
+                    n=self._consecutive_failures,
+                )
+                self._breaker_logged = True
+            return None
+        if self.fallback_lookups >= self.max_lookups:
+            if not self._cap_logged:
+                log.warning(
+                    "SEC velocity: SIC fallback cap of {n} lookups reached; "
+                    "remaining misses stay UNKNOWN",
+                    n=self.max_lookups,
+                )
+                self._cap_logged = True
+            return None
+        self.fallback_lookups += 1
+        try:
+            sic = _normalize_sic(self._company_factory(cik).sic)
+        except Exception as exc:
+            self._consecutive_failures += 1
+            log.warning("SEC velocity: SIC lookup failed for CIK {c}: {e}", c=cik, e=exc)
+            # Not cached: a transient error may succeed later in the run.
+            return None
+        self._consecutive_failures = 0
+        self._fallback[cik] = sic
+        return sic
+
+    def resolve(self, filing: Any) -> tuple[str | None, str]:
+        """Return ``(sic, source)``, with source ``local``, ``sec`` or ``unknown``."""
+        try:
+            cik = int(getattr(filing, "cik"))
+        except (AttributeError, TypeError, ValueError):
+            return None, "unknown"
+        sic = self.local.get(cik)
+        if sic is not None:
+            return sic, "local"
+        sic = self._fallback_sic(cik)
+        if sic is not None:
+            return sic, "sec"
+        return None, "unknown"
+
+
+def _sector_for(resolver: SICResolver, filing: Any) -> tuple[str, str]:
+    sic, source = resolver.resolve(filing)
+    return (_sic_to_broad_sector(sic) if sic is not None else "UNKNOWN"), source
+
+
 class SECVelocityPuller(BasePuller):
     """Counts 8-K filings by SIC sector code per week.
 
@@ -183,6 +325,9 @@ class SECVelocityPuller(BasePuller):
 
         # Collect filings with their SIC codes
         sector_week_counts: dict[tuple[str, date], int] = {}
+        sic_sources: dict[tuple[str, date], Counter] = {}
+        resolver = SICResolver(self.engine)
+        resolver.load_local(as_of=date.today())
 
         try:
             filings = get_filings(form="8-K")
@@ -205,21 +350,14 @@ class SECVelocityPuller(BasePuller):
                     if filing_date < cutoff:
                         break
 
-                    # Get SIC code from the filing's company
-                    sic_code = getattr(filing, "sic", None)
-                    if sic_code is None:
-                        # Try to get from company info
-                        sic_code = getattr(filing, "sic_code", "0000")
-                    if sic_code is None:
-                        sic_code = "0000"
-
-                    sector = _sic_to_broad_sector(sic_code)
+                    sector, source = _sector_for(resolver, filing)
 
                     # Compute ISO week start (Monday)
                     week_start = filing_date - timedelta(days=filing_date.weekday())
 
                     key = (sector, week_start)
                     sector_week_counts[key] = sector_week_counts.get(key, 0) + 1
+                    sic_sources.setdefault(key, Counter())[source] += 1
 
                 except Exception as exc:
                     log.debug("Could not process 8-K filing: {e}", e=str(exc))
@@ -269,6 +407,7 @@ class SECVelocityPuller(BasePuller):
                                 "sector": sector,
                                 "week_start": str(week_start),
                                 "filing_count": count,
+                                "sic_sources": dict(sic_sources.get((sector, week_start), {})),
                             }),
                         },
                     )
@@ -314,6 +453,9 @@ class SECVelocityPuller(BasePuller):
 
         total_inserted = 0
         all_errors: list[str] = []
+        # One resolver for the run: the SEC fallback cache and cap span all
+        # years; the local table is re-read per year, as of that year's end.
+        resolver = SICResolver(self.engine)
 
         for year in range(start_year, end_year + 1):
             log.info("Processing year {y}", y=year)
@@ -334,7 +476,9 @@ class SECVelocityPuller(BasePuller):
                 if filings is None:
                     continue
 
+                resolver.load_local(as_of=year_end)
                 sector_week_counts: dict[tuple[str, date], int] = {}
+                sic_sources: dict[tuple[str, date], Counter] = {}
 
                 for filing in filings:
                     try:
@@ -343,14 +487,11 @@ class SECVelocityPuller(BasePuller):
                             if isinstance(filing.filing_date, date)
                             else pd.Timestamp(filing.filing_date).date()
                         )
-                        sic_code = getattr(filing, "sic", getattr(filing, "sic_code", "0000"))
-                        if sic_code is None:
-                            sic_code = "0000"
-
-                        sector = _sic_to_broad_sector(sic_code)
+                        sector, source = _sector_for(resolver, filing)
                         week_start = filing_date - timedelta(days=filing_date.weekday())
                         key = (sector, week_start)
                         sector_week_counts[key] = sector_week_counts.get(key, 0) + 1
+                        sic_sources.setdefault(key, Counter())[source] += 1
                     except Exception as exc:
                         log.warning("SEC velocity filing parse failed: {e}", e=exc)
                         continue
@@ -389,6 +530,9 @@ class SECVelocityPuller(BasePuller):
                                         "sector": sector,
                                         "week_start": str(week_start),
                                         "year": year,
+                                        "sic_sources": dict(
+                                            sic_sources.get((sector, week_start), {})
+                                        ),
                                     }),
                                 },
                             )
