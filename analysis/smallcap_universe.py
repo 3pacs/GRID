@@ -57,7 +57,9 @@ NO_PRICES_BODIES = (b"[]", PRICE_HEADER)
 DEFAULT_START = "2009-01-02"
 PANEL = "panel"          # holds one directory per built generation, and CURRENT naming the latest
 CURRENT = "CURRENT"
-DISCOVERY_FIRST = "2016-01-04"   # owner decision 2026-11-20: Tiingo is missing most companies that ended before 2016
+# Owner decision 2026-11-20: Tiingo is missing most companies that ended before 2016. This is a floor, not a default:
+# build seals a later day when asked, never an earlier one.
+DISCOVERY_FIRST = "2016-01-04"
 SESSION_BARS = 300       # the factory's default: a day is a session when at least this many price files have a bar
 ENDED_GAP_SESSIONS = 5   # a company whose last bar is more than this many sessions before the store's last has ended
 KINDS = ("common", "unit", "warrant", "right", "preferred", "spac", "fund")
@@ -285,6 +287,22 @@ def _raw_files(data_dir: Path, companies: list[Company]) -> list[Path]:
     return raw_files
 
 
+def collection(data_dir: Path, companies: list[Company]) -> dict:
+    """How the pull ended for every included company: ids with a price file, ids Tiingo confirmed it has no bars
+    for (a no-prices mark), and ids with neither. An id with neither was never asked, or its request failed; that is
+    not the same as "no prices", and a store holding one is not a finished pull."""
+    data_dir = Path(data_dir)
+    included = {c.perma for c in companies if c.included}
+    with_prices = {p.stem for p in _raw_files(data_dir, companies)}
+    marks = {p.name for p in (data_dir / "no-prices").iterdir()} if (data_dir / "no-prices").is_dir() else set()
+    if marks - included:
+        raise UniverseError(f"no-prices marks for ids the company list does not include: {sorted(marks - included)[:5]}")
+    if marks & with_prices:
+        raise UniverseError(f"ids with both a price file and a no-prices mark: {sorted(marks & with_prices)[:5]}")
+    return {"included": len(included), "with_prices": len(with_prices), "confirmed_no_prices": len(marks),
+            "unresolved": sorted(included - with_prices - marks)}
+
+
 def bind_existing(meta_path: Path, data_dir: Path, *, start: str, vintage: str) -> dict:
     """Give a store pulled before ``fetch-state.json`` existed its record, without asking Tiingo for anything.
 
@@ -372,10 +390,16 @@ def universe_on(data_dir: Path, day: str, min_price: float, min_dollar_volume: f
 def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRST) -> dict:
     """Write one panel generation for the factory, and ``companies.csv`` and ``universe-report.json`` beside it.
 
+    Refused before anything is written: a discovery start earlier than ``DISCOVERY_FIRST`` (a later one is allowed),
+    and a pull that is not finished, meaning an included id with neither a price file nor a no-prices mark. Build
+    never asks Tiingo for anything.
+
     The generation is assembled in a hidden directory, sealed with the factory's export manifest, and renamed to
     ``panel/g-<id>`` in one step. Its id is the hash of its content, so the same inputs give the same generation
     and an existing one is never written again. Nothing in a generation is edited after the rename."""
     data_dir = Path(data_dir)
+    if _day(discovery_first, "discovery-first") < DISCOVERY_FIRST:
+        raise UniverseError(f"discovery on this source starts no earlier than {DISCOVERY_FIRST}; {discovery_first} is refused")
     companies = load_companies(meta_path)
     raw_files = _raw_files(data_dir, companies)
     if not raw_files:
@@ -383,6 +407,10 @@ def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRS
     state = fetch_state(data_dir)
     if state["company_list_sha256"] != sha256_file(meta_path):
         raise UniverseError("the company list is not the one this store was pulled with")
+    pulled = collection(data_dir, companies)
+    if pulled["unresolved"]:               # a failed or unasked request is not "no prices": the pull is not finished
+        raise UniverseError(f"the pull is not finished: {len(pulled['unresolved'])} included id(s) have neither a price "
+                            f"file nor a no-prices mark, first {pulled['unresolved'][:5]}; run fetch again")
     panel = data_dir / PANEL
     work = panel / f".building-{os.getpid()}-{time.time_ns()}"
     (work / "prices").mkdir(parents=True)
@@ -410,9 +438,10 @@ def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRS
             w.writerow([sessions[0], ",".join(sorted(p for p, (_, _, n) in spans.items() if n))])
         (work / "renames.json").write_text(json.dumps({"renames": {}}) + "\n")
         (work / "sectors.csv").write_text("Symbol,GICS Sector\n")     # the header alone: this store has no sector labels
-        sealed = xs.seal_export(work, discovery_first_session=_day(discovery_first, "discovery-first"), source={
+        sealed = xs.seal_export(work, discovery_first_session=discovery_first, source={
             "provider": "tiingo", "endpoint": "daily prices by permanent id", "start": state["start"],
-            "vintage": state["vintage"], "company_list_sha256": state["company_list_sha256"], "builder": SCHEMA})
+            "vintage": state["vintage"], "company_list_sha256": state["company_list_sha256"], "builder": SCHEMA,
+            "collection": {k: pulled[k] for k in ("included", "with_prices", "confirmed_no_prices")}})
         generation = sealed["generation"]
         gen_dir = panel / generation
         unchanged = gen_dir.is_dir()
@@ -448,7 +477,8 @@ def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRS
         "schema": SCHEMA, "store_last_bar": store_last, "companies": len(companies), "adr": sum(c.adr for c in companies),
         "kinds": dict(sorted(kinds.items())), "included": len(included), "included_with_prices": len(spans),
         "included_with_prices_never_traded": sum(1 for _, _, n in spans.values() if not n),
-        "included_without_prices": len(included) - len(spans),
+        "included_without_prices": pulled["confirmed_no_prices"],   # each one a confirmed "no prices" answer
+        "included_unresolved": 0,                                   # a build with any unresolved id is refused above
         "included_active_without_prices": sum(1 for c in included if c.active and c.perma not in spans),
         "ended_by_last_bar_year": dict(sorted(ended_by_year.items())),
         "first_bar_year": dict(sorted(started_by_year.items())),

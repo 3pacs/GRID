@@ -280,7 +280,8 @@ def test_build_writes_what_the_factory_reads_and_counts_ended_names(tmp_path):
     assert exp["schema"] == X.EXPORT_SCHEMA and exp["complete"] is True and exp["generation"] == panel.name
     assert exp["discovery_first_session"] == "2016-01-04"
     assert exp["source"] == {"provider": "tiingo", "endpoint": "daily prices by permanent id", "start": START, "vintage": VINTAGE,
-                             "company_list_sha256": U.sha256_file(m), "builder": "smallcap-universe/1"}
+                             "company_list_sha256": U.sha256_file(m), "builder": "smallcap-universe/1",
+                             "collection": {"included": 2, "with_prices": 2, "confirmed_no_prices": 0}}
     assert exp["files"] == X.input_files(panel) and set(exp["files"]) == {
         f"prices/{A}.csv", f"prices/{B}.csv", "members.csv", "renames.json", "sectors.csv"}
     assert X.read_export(panel, X.input_files(panel))["generation"] == panel.name
@@ -427,6 +428,8 @@ def test_the_factory_runs_the_built_export_and_holds_it_to_its_2016_start(tmp_pa
             "signals": [{"name": "rev5", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]}]}
     ledger = X.open_ledger(tmp_path / "l.jsonl", tmp_path / "l.anchors.jsonl", "xs-smallcap-test-ledger")
     before = (tmp_path / "l.jsonl").read_text()
+    assert U.DISCOVERY_FIRST == "2016-01-04" and json.loads((panel / X.EXPORT_MANIFEST).read_text())["source"]["collection"] == {
+        "included": 25, "with_prices": 25, "confirmed_no_prices": 0}
     early = tmp_path / "early.json"
     early.write_text(json.dumps({**body, "run_id": "xs-early", "first_session": "2015-12-31"}))
     with pytest.raises(X.RunFileError, match="discovery on this export starts 2016-01-04; the run file's window starts 2015-12-31"):
@@ -441,3 +444,74 @@ def test_the_factory_runs_the_built_export_and_holds_it_to_its_2016_start(tmp_pa
     assert cov["sector_assignment"]["labels"] == "none" and cov["price_files"] == 25 and cov["first"] == d[0]
     assert cov["floors"] == {"min_price": 2, "min_dollar_volume": 1e6, "dollar_volume_window": 21}
     assert report["trial_count"] == 1 and report["tested"] == 1 and report["ranking"][0]["n"] > 90
+
+
+def test_the_builder_cannot_seal_a_discovery_start_before_2016(tmp_path):
+    d = days(150, "2015-01-02")                                           # a store whose bars would support a 2015 window
+    m, out, _ = many(tmp_path, d)
+    for early in ("2015-01-02", "2015-12-31", "2016-01-03"):
+        with pytest.raises(U.UniverseError, match=f"starts no earlier than 2016-01-04; {early} is refused"):
+            U.build(m, out, discovery_first=early)
+    assert not (out / "panel").exists()                                   # nothing was sealed, so the factory has nothing to read
+    assert U.main(["build", "--meta", str(m), "--data-dir", str(out), "--discovery-first", "2015-01-02"]) == 2
+    assert not (out / "panel").exists()
+    with pytest.raises(U.UniverseError, match="must be a day"):
+        U.build(m, out, discovery_first="2016")
+
+    rep = U.build(m, out)                                                 # the default is the floor itself
+    panel = generation(out)
+    assert rep["discovery_first_session"] == "2016-01-04"
+    con = sqlite3.connect(tmp_path / "state.db")
+    con.execute("CREATE TABLE desk_state (data_through TEXT PRIMARY KEY, record_json TEXT)")
+    con.commit()
+    con.close()
+    body = {"run_id": "xs-2015-window", "first_session": "2015-03-02", "last_session": d[-2], "rankings": ["pooled"],
+            "fractions": [0.2], "perms": 1000, "min_session_bars": 20, "min_ranked": 20, "min_price": 2, "min_dollar_volume": 1e6,
+            "signals": [{"name": "rev5", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]}]}
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps(body))
+    ledger = X.open_ledger(tmp_path / "l.jsonl", tmp_path / "l.anchors.jsonl", "xs-smallcap-cutoff-ledger")
+    before = (tmp_path / "l.jsonl").read_text()
+    with pytest.raises(X.RunFileError, match="discovery on this export starts 2016-01-04; the run file's window starts 2015-03-02"):
+        X.run(run_file, panel, tmp_path / "state.db", ledger, tmp_path / "out")     # the review's 2015 run, end to end
+    assert (tmp_path / "l.jsonl").read_text() == before and not (tmp_path / "out").exists()   # refused before any declaration
+
+    later = tmp_path / "later"
+    later.mkdir()
+    m2, out2, _ = many(later, d)
+    assert U.build(m2, out2, discovery_first="2016-06-01")["discovery_first_session"] == "2016-06-01"   # later is allowed
+    assert json.loads((generation(out2) / X.EXPORT_MANIFEST).read_text())["discovery_first_session"] == "2016-06-01"
+
+
+def test_a_pull_with_a_failed_or_unasked_company_is_never_sealed(tmp_path):
+    m = meta(tmp_path)
+    cs = U.load_companies(m)
+    out = tmp_path / "store"
+    answers = {A: (200, bars(days(40), 10.0)), B: (500, b"")}             # the review's probe: A answers, B fails
+    get = lambda url: answers[next(p for p in answers if p in url)]
+    assert fetch(cs, out, get, m) == {"prices": 1, "failed": 1, "not_included": 3}
+    assert U.collection(out, cs) == {"included": 2, "with_prices": 1, "confirmed_no_prices": 0, "unresolved": [B]}
+    with pytest.raises(U.UniverseError, match=rf"the pull is not finished: 1 included id\(s\) have neither.*first \['{B}'\]; run fetch again"):
+        U.build(m, out)
+    assert not (out / "panel").exists() and not (out / "universe-report.json").exists()   # nothing sealed, nothing reported
+    assert U.main(["build", "--meta", str(m), "--data-dir", str(out)]) == 2
+
+    interrupted = tmp_path / "interrupted"                                # stopped before B was asked at all
+    fetch([c for c in cs if c.perma != B], interrupted, get, m)
+    with pytest.raises(U.UniverseError, match="the pull is not finished"):
+        U.build(m, interrupted)
+
+    answers[B] = (200, b"[]")                                             # Tiingo confirms it holds no bars for B
+    assert fetch(cs, out, get, m) == {"already_done": 1, "no_prices": 1, "not_included": 3}
+    rep = U.build(m, out)
+    assert rep["included_without_prices"] == 1 and rep["included_unresolved"] == 0 and rep["included_with_prices"] == 1
+    exp = json.loads((generation(out) / X.EXPORT_MANIFEST).read_text())
+    assert exp["complete"] is True and exp["source"]["collection"] == {"included": 2, "with_prices": 1, "confirmed_no_prices": 1}
+
+    (out / "no-prices" / A).touch()                                       # a mark beside a price file contradicts it
+    with pytest.raises(U.UniverseError, match="both a price file and a no-prices mark"):
+        U.build(m, out)
+    (out / "no-prices" / A).unlink()
+    (out / "no-prices" / D).touch()                                       # a mark for a company the list leaves out
+    with pytest.raises(U.UniverseError, match="no-prices marks for ids the company list does not include"):
+        U.build(m, out)

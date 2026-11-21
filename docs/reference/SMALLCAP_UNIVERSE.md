@@ -175,8 +175,18 @@ are the factory's: days on which at least `min_session_bars` price files have a 
 - `renames.json`: empty, because ids do not change.
 - `sectors.csv`: the header alone, which the factory reads as "no sector labels".
 - `panel-manifest.json`: the factory's export manifest (`seal_export`): every file's size and hash, the
-  pull it came from, and `discovery_first_session`, 2016-01-04 unless `--discovery-first` says otherwise.
-  The factory refuses a run whose window starts earlier, before it declares anything.
+  pull it came from with how it ended (companies with prices, companies confirmed to have none), and
+  `discovery_first_session`. The factory refuses a run whose window starts earlier, before it declares
+  anything.
+
+**2016-01-04 is a floor.** `--discovery-first` may name a later day and never an earlier one: `build`
+refuses an earlier day before it writes anything, so no generation of this source can carry one.
+
+**Only a finished pull is sealed.** Every included company must have ended one of two ways: a price
+file, or a no-prices mark, which `fetch` writes only for Tiingo's two "no bars" answers. A company with
+neither was never asked or its request failed. `build` refuses the store while one remains, names the
+first few, and asks Tiingo nothing itself; `fetch` is run again until none is left. A mark beside a price
+file, or a mark for a company the list leaves out, is refused too.
 
 **A generation is published whole and never edited.** `build` assembles it in a hidden directory, seals
 it, and renames it to `panel/g-<id>` in one step, then marks every file and directory read-only. The id
@@ -196,6 +206,13 @@ Review of #1294 at `e5796b2c` found four things, all fixed above:
 | A 200 answer holding `date,error` and a malformed row was written as a price file and skipped on resume | Whole-body check before anything is written |
 | A resume was not tied to the start or vintage it began with | `fetch-state.json`; the vintage is in every request |
 | `build` replaced panel files one at a time in place | One sealed generation per build, renamed into place, read-only |
+
+A second review, at `7b1113a9`, accepted those four and found two more, fixed the same day:
+
+| Finding | Fix |
+|---|---|
+| `--discovery-first` could seal a day before 2016, and the factory then ran a 2015 window on it | 2016-01-04 is a floor in `build`; a later day is allowed |
+| A company whose request failed had no file and no mark, and `build` still sealed the panel as complete | `build` refuses a pull with any unresolved company; the manifest records how the pull ended |
 
 Tests are on synthetic stores only (`tests/test_smallcap_universe.py`): no request to Tiingo, no read of
 the real store, no run.
