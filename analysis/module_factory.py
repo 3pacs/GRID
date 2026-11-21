@@ -1646,6 +1646,20 @@ def main(argv=None) -> int:
     v.add_argument("--file", required=True, type=Path)
     v.add_argument("--ledger", required=True, type=Path)
     v.add_argument("--anchor", required=True, type=Path)
+    g = sub.add_parser("prescreen-register", help="append a pre-screen registration to the ledger; reads no older data")
+    g.add_argument("--registration", required=True, type=Path)
+    g.add_argument("--ledger", required=True, type=Path)
+    g.add_argument("--anchor", required=True, type=Path)
+    p = sub.add_parser("prescreen", help="the one older-data look of a registration already on the ledger")
+    p.add_argument("--registration", required=True, type=Path)
+    p.add_argument("--data", required=True, type=Path, help="the older-data bars file named by the registration's sha256")
+    p.add_argument("--ledger", required=True, type=Path)
+    p.add_argument("--anchor", required=True, type=Path)
+    p.add_argument("--receipts", required=True, type=Path,
+                   help="the Desk receipt log's folder: the receipt that read this ledger at or after the registration is verified there")
+    p.add_argument("--external-anchors", required=True, type=Path,
+                   help="the anchor copy held outside that log (the vault's witness file); a person checks it is that copy")
+    p.add_argument("--session", required=True, help="that receipt's session, YYYY-MM-DD")
     w = sub.add_parser("verdicts-witness", help="mark live verdicts as witnessed by a Desk receipt that read the same stored look")
     w.add_argument("--receipts", required=True, type=Path, help="the Desk receipt log's folder; it is opened and verified")
     w.add_argument("--external-anchors", required=True, type=Path,
@@ -1664,6 +1678,30 @@ def main(argv=None) -> int:
         live = lse.summarize(ledger)["live"]
         print(json.dumps({"ok": True, "witnessed_now": appended, "witnessed": live["witnessed"], "unwitnessed": live["unwitnessed"],
                           "head_sha256": ledger.head}))
+        return 0
+    if a.cmd in ("prescreen", "prescreen-register"):
+        from analysis import factory_prescreen  # imported here: that module imports this one
+
+        try:
+            ledger = lse.Ledger(a.ledger, anchor=a.anchor)
+            if a.cmd == "prescreen-register":
+                done = factory_prescreen.register(a.registration, ledger)
+                print(json.dumps({"ok": True, "registered_sha256": done["sha256"], "seq": done["record"]["seq"],
+                                  "head_sha256": ledger.head, "records": len(ledger.records),
+                                  "rule": done["record"]["rule"], "store": done["record"]["store"]["id"],
+                                  "next": "the look needs a Desk receipt that read this ledger at or after this record, "
+                                          "under an anchor copy held outside the receipt log"}))
+                return 0
+            witness = {"receipts": a.receipts, "external_anchors": a.external_anchors, "session": a.session}
+            done = factory_prescreen.prescreen(a.registration, a.data, ledger, witness)["record"]
+        except (ValueError, OSError) as e:
+            print(json.dumps({"ok": False, "refused": str(e)}))
+            return 2
+        left = lse.summarize(ledger)["live"]["prescreen"]["stores"][done["store"]["id"]]["left"]
+        print(json.dumps({"ok": True, "registrations_left": left, "head_sha256": ledger.head,
+                          **{k: done[k] for k in ("verdict", "n", "mean_net", "lower_bound", "baseline", "excess_mean",
+                                                  "excess_lower_bound", "trimmed_mean_net", "top_share", "by_year",
+                                                  "rule", "evidence")}}))
         return 0
     if a.cmd == "summary":
         print(json.dumps(lse.summarize(lse.Ledger(a.ledger, anchor=a.anchor)), indent=1))
