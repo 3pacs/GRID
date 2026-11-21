@@ -1,4 +1,4 @@
-"""scripts/repair_full_panel_vintages.py on PostgreSQL: dry run writes nothing, apply appends only.
+"""scripts/repair_full_panel_vintages.py on PostgreSQL: dry run writes nothing; every apply entry point is disabled.
 
 Same fixture discipline as tests/test_audit_backdated_vintages_pg.py: only
 ``GRID_TEST_DB_URL`` (a disposable ``*_test`` database; production names are
@@ -77,7 +77,7 @@ def pg_engine():
             pytest.fail("REQUIRE_FULL_PANEL_REPAIR_PG=1 but GRID_TEST_DB_URL is unset")
         pytest.skip("GRID_TEST_DB_URL unset")
     name = (make_url(url).database or "").lower()
-    if not name.endswith("_test") and (name in _PROD_NAMES or name.startswith("grid") or not name):
+    if not name.endswith("_test"):
         pytest.fail(f"refusing scratch schemas in {name!r}: not a *_test database")
     try:
         admin = create_engine(url, pool_pre_ping=True)
@@ -176,41 +176,22 @@ def test_dry_run_plans_and_writes_nothing(pg_engine):
     assert report["complete"] is True and report["errors"] == 0 and report["mode"] == "dry_run"
 
 
-def test_apply_appends_only_and_is_idempotent(pg_engine):
+def test_apply_is_disabled_and_writes_nothing(pg_engine):
     _seed(pg_engine)
     before = _counts(pg_engine)
-    report = rep.run(pg_engine, FEATURES, start=date(2010, 1, 1), apply=True, run_tag="pgtest", clock=_OK_CLOCK)
-    xlp, hon, gold = report["features"]
-    assert xlp["applied"] == {"retracted": 10, "revintaged": 1}
-    assert hon["applied"] is None and gold["applied"] is None  # NEEDS_BACKFILL / skipped: untouched
-    after = _counts(pg_engine)
-    assert after["retractions"] == before["retractions"] + 10
-    assert after["resolved"] == before["resolved"] + 1
-    with pg_engine.connect() as conn:
-        # every original row is still there with its original value (checksum over the original ids)
-        orig = conn.execute(text("SELECT coalesce(sum(value * id), 0) FROM resolved_series WHERE id <= :n"),
-                            {"n": before["resolved"]}).scalar()
-        assert orig == pytest.approx(before["resolved_checksum"])
-        new = conn.execute(text("SELECT feature_id, obs_date, vintage_date, value FROM resolved_series "
-                                "WHERE id > :n"), {"n": before["resolved"]}).fetchall()
-        assert [(r[0], r[1], r[2], r[3]) for r in new] == [(XLP, DAYS[6], date(2026, 11, 10), 76.0)]
-        tags = conn.execute(text("SELECT DISTINCT run_tag, feature_id FROM resolved_series_retractions")).fetchall()
-        assert [tuple(t) for t in tags] == [("pgtest", XLP)]
-        reasons = conn.execute(text("SELECT DISTINCT reason FROM resolved_series_retractions")).fetchall()
-        assert len(reasons) == 1 and "YF:XLP:close" in reasons[0][0] and "YF:XLP:adj_close" in reasons[0][0]
-    # second pass: every wrong row is ALREADY_RETRACTED, nothing applicable, nothing written
-    again = rep.run(pg_engine, ["xlp_full"], start=date(2010, 1, 1), apply=True, run_tag="pgtest2", clock=_OK_CLOCK)
-    x2 = again["features"][0]
-    assert x2["by_class"][rep.ALREADY_RETRACTED] == 10 and x2["retract"] == 0 and x2["revintage"] == 0
-    assert x2["applicable"] is False and x2["applied"] is None
-    assert x2["served_after"]["ratio"] == pytest.approx(76.0 / 70.0)
-    assert _counts(pg_engine) == after
+    with pytest.raises(RuntimeError, match="apply disabled"):
+        rep.run(pg_engine, FEATURES, start=date(2010, 1, 1), apply=True, run_tag="pgtest", clock=_OK_CLOCK)
+    plan = rep.plan_feature_db(pg_engine, "xlp_full", start=date(2010, 1, 1),
+                               repair_day=date(2026, 11, 10), timeout_ms=5000)
+    with pytest.raises(RuntimeError, match="apply disabled"):
+        rep.apply_plan(pg_engine, plan, run_tag="pgtest", timeout_ms=5000)
+    assert _counts(pg_engine) == before
 
 
 def test_exclude_keeps_an_in_scope_feature_untouched(pg_engine):
     _seed(pg_engine)
     before = _counts(pg_engine)
-    report = rep.run(pg_engine, ["xlp_full"], start=date(2010, 1, 1), apply=True, run_tag="t",
+    report = rep.run(pg_engine, ["xlp_full"], start=date(2010, 1, 1), apply=False, run_tag="t",
                      exclude=["xlp_full"], clock=_OK_CLOCK)
     assert report["features"][0]["status"] == rep.EXCLUDED and report["features"][0]["rows"] == 0
     assert _counts(pg_engine) == before
@@ -238,9 +219,8 @@ def test_missing_retractions_table_refuses_apply_per_feature(pg_engine):
     _seed(pg_engine)
     with pg_engine.begin() as conn:
         conn.execute(text("DROP TABLE resolved_series_retractions"))
-    report = rep.run(pg_engine, ["xlp_full"], start=date(2010, 1, 1), apply=True, run_tag="t", clock=_OK_CLOCK)
-    x = report["features"][0]
-    assert x["applied"] is None and "resolved_series_retractions does not exist" in (x["error"] or "")
+    with pytest.raises(RuntimeError, match="apply disabled"):
+        rep.run(pg_engine, ["xlp_full"], start=date(2010, 1, 1), apply=True, run_tag="t", clock=_OK_CLOCK)
     with pg_engine.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM resolved_series WHERE vintage_date = '2026-11-10'")).scalar() == 0
 

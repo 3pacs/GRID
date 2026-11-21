@@ -37,7 +37,7 @@ cat > "$box/bin/systemctl" <<'SH'
 case "$*" in
   'list-unit-files --no-legend --no-pager grid-*.service'|'list-units --all --plain --no-legend --no-pager grid-*.service')
     [ "${TEST_INVENTORY_FAIL:-0}" != 1 ] || exit 1
-    printf '%s\n' grid-scheduler.service grid-realtime.service grid-db.service grid-worker@.service ;;
+    printf '%s\n' grid-scheduler.service grid-realtime.service grid-db.service grid-worker@.service grid-retired.service ;;
   'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-scheduler.service')
     printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=active\nControlGroup=/scheduler\nSubState=running\nType=simple\nRemainAfterExit=no\nExecMainPID=%s\n' "$TEST_SCHEDULER_PID" "$TEST_SCHEDULER_WORKDIR" "$TEST_SCHEDULER_PID" ;;
   'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-realtime.service')
@@ -49,6 +49,11 @@ case "$*" in
     printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=%s\nControlGroup=%s\nSubState=running\nType=simple\nRemainAfterExit=no\nExecMainPID=%s\n' "$TEST_REALTIME_PID" "$TEST_REALTIME_WORKDIR" "$TEST_REALTIME_STATE" "$TEST_REALTIME_CGROUP" "${TEST_REALTIME_EXEC_PID:-$TEST_REALTIME_PID}" ;;
   'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-db.service')
     printf 'LoadState=loaded\nMainPID=0\nWorkingDirectory=\nActiveState=active\nControlGroup=\nSubState=%s\nType=%s\nRemainAfterExit=%s\nExecMainPID=0\n' "${TEST_DB_SUBSTATE-exited}" "${TEST_DB_TYPE-oneshot}" "${TEST_DB_REMAIN-yes}" ;;
+  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-retired.service')
+    # systemd 249's exact answer for a unit whose file is gone (grid-svr 2026-11-19).
+    printf 'Type=\nRemainAfterExit=no\nMainPID=%s\nExecMainPID=%s\nControlGroup=%s\nWorkingDirectory=%s\nLoadState=%s\nActiveState=%s\nSubState=%s\n' \
+      "${TEST_RETIRED_PID-0}" "${TEST_RETIRED_PID-0}" "${TEST_RETIRED_CGROUP-}" "${TEST_RETIRED_WORKDIR-}" \
+      "${TEST_RETIRED_LOAD-not-found}" "${TEST_RETIRED_STATE-inactive}" "${TEST_RETIRED_SUBSTATE-dead}" ;;
   'show -p MainPID --value grid-scheduler') printf '%s\n' "$TEST_SCHEDULER_PID" ;;
   'show -p WorkingDirectory --value grid-scheduler') printf '%s\n' "$TEST_SCHEDULER_WORKDIR" ;;
   *) exit 1 ;;
@@ -185,6 +190,15 @@ TEST_REALTIME_CGROUP=/linked fail_without_swap "$root/current" linked-cgroup
 mkdir "$box/cgroup/empty"
 touch "$box/cgroup/empty/cgroup.procs"
 TEST_REALTIME_PID=0 TEST_REALTIME_CGROUP=/empty fail_without_swap "$root/current" empty-active-cgroup
+
+# A not-found unit is skipped only with no runtime at all; every other shape stays ambiguous.
+TEST_RETIRED_STATE=active TEST_RETIRED_SUBSTATE=running fail_without_swap "$root/current" retired-still-active
+TEST_RETIRED_PID=4242 fail_without_swap "$root/current" retired-with-pid
+TEST_RETIRED_CGROUP=/retired fail_without_swap "$root/current" retired-with-cgroup
+TEST_RETIRED_WORKDIR=/srv/old fail_without_swap "$root/current" retired-with-workdir
+TEST_RETIRED_SUBSTATE=failed fail_without_swap "$root/current" retired-not-dead
+TEST_RETIRED_LOAD=masked fail_without_swap "$root/current" masked-unit
+TEST_RETIRED_LOAD=error fail_without_swap "$root/current" load-error-unit
 
 # An existing candidate that is a retained runtime must never be erased.
 set +e

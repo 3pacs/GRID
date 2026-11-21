@@ -47,6 +47,14 @@ Idempotency:
     - Re-running this puller will UPDATE existing rows with the latest
       amount + as_of timestamp; it will never create duplicates.
 
+Period integrity:
+    Classifies facts from their explicit start/end duration, not form/fp.
+    Only quarter/year durations are supported; cumulative YTD and missing
+    contexts are omitted. Source strings retain interval/accession/filing/tag.
+    This changes source keys, not legacy rows: rollout requires a separately
+    approved historical reconciliation and dependent-rollup rebuild. Merely
+    deploying this code or rerunning ingestion does not repair old rows.
+
 Checkpointing:
     Progress is written to ``/tmp/grid_xbrl_checkpoint.json`` after every
     ticker. Resume logic: on startup we read the checkpoint and skip any
@@ -61,6 +69,8 @@ Runtime safety:
 from __future__ import annotations
 
 import json
+import math
+import re
 import os
 import time
 from datetime import date, datetime, timezone
@@ -243,6 +253,8 @@ _QUARTER_FORMS: frozenset[str] = frozenset(
     {"10-Q", "10-Q/A", "6-K", "6-K/A"}
 )
 
+_PERIOD_SOURCE_MARKER = "[SEC-XBRL-PERIOD-V1]"
+
 # Preferred currency order when a fact has multiple ``units`` entries.
 # USD wins; then common reporting currencies.
 _PREFERRED_CURRENCIES: tuple[str, ...] = (
@@ -388,59 +400,52 @@ def _fetch_ticker_to_cik_map() -> dict[str, str]:
 # ── Company Facts fetch ─────────────────────────────────────────────────
 
 
-# CIKs whose companyfacts answered 404 on their latest fetch in this process.
-# SEC serves 404 when an issuer has never filed XBRL -- e.g. CIK 0001445162
-# (BYD CO LTD, BYDDF) and 0001420798 (RECKITT BENCKISER, RBGLY), whose only
-# filings are F-6 ADR registrations (checked 2026-11-09). That is "nothing
-# to read", not an unavailable source; 403/5xx/network/parse stay failures.
 _COMPANY_FACTS_NOT_FOUND: set[str] = set()
 
 
 def company_facts_not_found(cik_padded: str) -> bool:
-    """True when the latest companyfacts fetch for this CIK was an HTTP 404."""
+    """Whether the latest fetch returned HTTP 404 (no XBRL facts)."""
     return cik_padded in _COMPANY_FACTS_NOT_FOUND
 
 
-def _fetch_company_facts(cik_padded: str) -> dict[str, Any] | None:
-    """Fetch Company Facts JSON for a zero-padded CIK.
+def _fetch_company_facts_response(cik_padded: str) -> tuple[bytes, datetime, datetime] | None:
+    """Capture original successful response bytes and actual request boundaries."""
+    from ingestion.altdata.sec_financial_snapshots import MAX_SOURCE_BYTES
 
-    Returns:
-        Parsed JSON dict, or None on 404/403/parse failure (caller should
-        log and continue). ``company_facts_not_found(cik)`` tells a 404
-        (issuer files no XBRL) apart from the other None causes.
-    """
     url = _COMPANY_FACTS_URL.format(cik=cik_padded)
     _COMPANY_FACTS_NOT_FOUND.discard(cik_padded)
+    started = datetime.now(timezone.utc)
     try:
-        resp = requests.get(
-            url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS
-        )
+        resp = requests.get(url, headers=_SEC_HEADERS, timeout=_REQUEST_TIMEOUT_SECS)
     except requests.RequestException as exc:
-        log.warning("SEC companyfacts CIK={c} network error: {e}",
-                    c=cik_padded, e=str(exc))
+        log.warning("SEC companyfacts CIK={c} network failure: {e}",
+                    c=cik_padded, e=type(exc).__name__)
         return None
-
+    received = datetime.now(timezone.utc)
     if resp.status_code == 404:
-        # Permanent for a non-XBRL filer; INFO so the same CIKs do not add
-        # a warning on every run.
         _COMPANY_FACTS_NOT_FOUND.add(cik_padded)
-        log.info("SEC companyfacts CIK={c} HTTP 404 (no XBRL facts filed)",
-                 c=cik_padded)
-        return None
-    if resp.status_code == 403:
-        log.warning("SEC companyfacts CIK={c} HTTP {s}",
-                    c=cik_padded, s=resp.status_code)
+        log.info("SEC companyfacts CIK={c} HTTP 404 (no XBRL facts filed)", c=cik_padded)
         return None
     if resp.status_code != 200:
-        log.warning("SEC companyfacts CIK={c} HTTP {s}",
-                    c=cik_padded, s=resp.status_code)
+        log.warning("SEC companyfacts CIK={c} HTTP {s}", c=cik_padded, s=resp.status_code)
         return None
+    body = resp.content
+    if not isinstance(body, bytes) or not 0 < len(body) <= MAX_SOURCE_BYTES:
+        log.warning("SEC companyfacts CIK={c} invalid/oversized response body", c=cik_padded)
+        return None
+    return body, started, received
 
+
+def _fetch_company_facts(cik_padded: str) -> dict[str, Any] | None:
+    """Compatibility JSON reader shared with the independent shares puller."""
+    captured = _fetch_company_facts_response(cik_padded)
+    if captured is None:
+        return None
     try:
-        return resp.json()
-    except ValueError as exc:
-        log.warning("SEC companyfacts CIK={c} JSON parse: {e}",
-                    c=cik_padded, e=str(exc))
+        payload = json.loads(captured[0])
+        return payload if isinstance(payload, dict) else None
+    except (UnicodeError, ValueError):
+        log.warning("SEC companyfacts CIK={c} invalid JSON", c=cik_padded)
         return None
 
 
@@ -583,36 +588,102 @@ def _extract_entries(
     return None, None, None
 
 
-def _pick_period_type(form: str) -> str | None:
-    """Map SEC form string to period_type. Returns None for unusable forms."""
-    if form in _ANNUAL_FORMS:
-        return "annual"
-    if form in _QUARTER_FORMS:
+def _pick_period_type(start: date, end: date) -> str | None:
+    """Classify a reported duration, never its containing filing's form/fp.
+
+    Inclusive bounds admit calendar quarters/years and 52/53-week fiscal
+    calendars (including 14-week quarters). Other durations, including
+    six-/nine-month YTD and transition periods, are unsupported here. Do not
+    divide cumulative values or infer an unreported standalone quarter.
+    """
+    days = (end - start).days + 1
+    if 80 <= days <= 100:
         return "quarter"
+    if 350 <= days <= 380:
+        return "annual"
     return None
 
 
-def _normalize_entry(
-    entry: dict[str, Any],
-) -> tuple[date, str, str] | None:
-    """Return (fiscal_period, period_type, source_filing) for a USD fact.
+def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate duration and filing provenance for a monetary flow fact.
 
-    ``source_filing`` is ``"{form} {fp}"`` (e.g. "10-K FY", "10-Q Q3").
-    Returns None if the entry is missing required fields or the form
-    is not 10-K/10-Q.
+    ``fp`` describes the containing filing, not necessarily this fact's fiscal
+    quarter. Keep it only as source metadata. Instant facts, unsupported
+    durations, and facts without traceable filing/date metadata are omitted.
     """
     form = str(entry.get("form") or "")
-    period_type = _pick_period_type(form)
-    if period_type is None:
+    if form not in _ANNUAL_FORMS | _QUARTER_FORMS:
         return None
-    end_str = str(entry.get("end") or "")
     try:
-        fp = date.fromisoformat(end_str)
+        start = date.fromisoformat(str(entry.get("start") or ""))
+        end = date.fromisoformat(str(entry.get("end") or ""))
+        filed = date.fromisoformat(str(entry.get("filed") or ""))
     except ValueError:
         return None
+    period_type = _pick_period_type(start, end)
+    accession = str(entry.get("accn") or "")
+    if (period_type is None or filed < end
+            or not re.fullmatch(r"[0-9]{10}-[0-9]{2}-[0-9]{6}", accession)):
+        return None
     fp_label = str(entry.get("fp") or "")
-    source_filing = f"{form} {fp_label}".strip()
-    return fp, period_type, source_filing
+    return {
+        "period_start": start,
+        "fiscal_period": end,
+        "period_type": period_type,
+        "filed_date": filed,
+        "accession": accession,
+        "source_filing": (
+            f"{form} {_PERIOD_SOURCE_MARKER} filing_fp={fp_label or 'unknown'} "
+            f"accn={accession} filed={filed.isoformat()} "
+            f"period={start.isoformat()}/{end.isoformat()}"
+        ),
+    }
+
+
+def _fact_amount(entry: dict[str, Any]) -> float | None:
+    """Retain the existing flow-magnitude convention, rejecting invalid values."""
+    value = entry.get("val")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = abs(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if math.isfinite(amount) else None
+
+
+def _select_flow_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Select one current fact per end/type, without input-order tie breaking.
+
+    Tag preference is preserved, then the latest filed date wins. If equally
+    ranked facts disagree on duration, currency or amount, omit that period
+    rather than inventing a preference. A different form/fp is not a second
+    economic period. This is a current normalized snapshot, not a PIT archive.
+    """
+    groups: dict[tuple[date, str], list[dict[str, Any]]] = {}
+    for row in candidates:
+        groups.setdefault((row["fiscal_period"], row["period_type"]), []).append(row)
+    out: list[dict[str, Any]] = []
+    for key in sorted(groups):
+        group = groups[key]
+        rank = max((r["_tag_priority"], r["filed_date"]) for r in group)
+        best = [r for r in group if (r["_tag_priority"], r["filed_date"]) == rank]
+        if any(r.get("_unavailable") for r in best):
+            log.warning("SEC_XBRL: incomplete/conflicting {f} facts for {p}; omitted",
+                        f=best[0]["flow_type"], p=key[0])
+            continue
+        contexts = {(r["period_start"], r["currency"], r["amount_local"])
+                    for r in best}
+        if len(contexts) != 1:
+            log.warning("SEC_XBRL: conflicting {f} facts for {p}; omitted",
+                        f=best[0]["flow_type"], p=key[0])
+            continue
+        # Equal values and contexts are duplicates; provenance selection is
+        # deterministic even when Company Facts changes its array order.
+        row = dict(max(best, key=lambda r: r["source_filing"]))
+        row.pop("_tag_priority")
+        out.append(row)
+    return out
 
 
 def _iter_tagged_entries(
@@ -645,86 +716,52 @@ def _collect_simple_flow(
     ifrs_tags: list[str],
     fx_rates: dict[str, float],
 ) -> list[dict[str, Any]]:
-    """Return capital_flows row dicts for a single-tag flow_type.
+    """Collect only supported, explicitly dated monetary flow contexts.
 
-    Tries us-gaap first. Only falls back to ifrs-full if us-gaap
-    produced zero entries (foreign private issuers file 20-F under
-    ifrs-full and have no us-gaap facts at all). When a tag's units
-    dict has multiple currencies, the preferred-currency picker in
-    ``_extract_entries`` selects one; we then FX-convert the amount
-    to USD via ``fx_rates``.
-
-    Deduplicates by (fiscal_period, period_type, source_filing). When
-    multiple tags cover the same period, priority goes to:
-      1. Higher tag priority (later tags = newer taxonomy).
-      2. Later ``filed`` date for the same tag.
+    Prefer us-gaap then IFRS. Retain exact duration, filing and tag provenance
+    in ``source_filing`` so the existing writer persists it without a schema
+    change. YTD-only cash-flow facts remain missing, never quarterly guesses.
     """
-    # Try us-gaap first.
-    tagged = _iter_tagged_entries(facts, usgaap_tags, "us-gaap")
-    if not tagged:
-        tagged = _iter_tagged_entries(facts, ifrs_tags, "ifrs-full")
-    if not tagged:
-        return []
+    for taxonomy, tags in (("us-gaap", usgaap_tags), ("ifrs-full", ifrs_tags)):
+        candidates: list[dict[str, Any]] = []
+        for priority, tag, currency, entry in _iter_tagged_entries(facts, tags, taxonomy):
+            normalized = _normalize_entry(entry)
+            amount_local = _fact_amount(entry)
+            if normalized is None:
+                continue
+            if amount_local is None:
+                candidates.append({
+                    **normalized, "flow_type": flow_type,
+                    "_tag_priority": priority, "_unavailable": True,
+                })
+                continue
+            amount_usd, used_fallback = _convert_to_usd(amount_local, currency, fx_rates)
+            if not math.isfinite(amount_usd):
+                continue
+            candidates.append({
+                **normalized,
+                "flow_type": flow_type,
+                "direction": direction,
+                "amount_usd": amount_usd,
+                "amount_local": amount_local,
+                "currency": currency,
+                "confidence": "estimated" if used_fallback else "confirmed",
+                "source_filing": f"{normalized['source_filing']} tag={taxonomy}:{tag}",
+                "xbrl_tag": tag,
+                "taxonomy": taxonomy,
+                "_tag_priority": priority,
+            })
+        if candidates:
+            # Conflicting preferred-taxonomy facts do not license a fallback.
+            return _select_flow_rows(candidates)
+    return []
 
-    rows: dict[tuple[date, str, str], dict[str, Any]] = {}
-    for tag_priority, tag, currency, entry in tagged:
-        normalized = _normalize_entry(entry)
-        if normalized is None:
-            continue
-        fp, period_type, source_filing = normalized
-        val = entry.get("val")
-        if val is None:
-            continue
-        try:
-            amount_local = abs(float(val))
-        except (TypeError, ValueError):
-            continue
-        amount_usd, used_fallback = _convert_to_usd(
-            amount_local, currency, fx_rates
-        )
-        confidence = "estimated" if used_fallback else "confirmed"
-        filed = str(entry.get("filed") or "")
-        key = (fp, period_type, source_filing)
-        existing = rows.get(key)
-        if existing is None:
-            rows[key] = {
-                "fiscal_period": fp,
-                "period_type": period_type,
-                "flow_type": flow_type,
-                "direction": direction,
-                "amount_usd": amount_usd,
-                "amount_local": amount_local,
-                "currency": currency,
-                "confidence": confidence,
-                "source_filing": source_filing,
-                "xbrl_tag": tag,
-                "_filed": filed,
-                "_tag_priority": tag_priority,
-            }
-            continue
-        existing_priority = int(existing.get("_tag_priority", -1))
-        if tag_priority > existing_priority or (
-            tag_priority == existing_priority
-            and filed > existing.get("_filed", "")
-        ):
-            rows[key] = {
-                "fiscal_period": fp,
-                "period_type": period_type,
-                "flow_type": flow_type,
-                "direction": direction,
-                "amount_usd": amount_usd,
-                "amount_local": amount_local,
-                "currency": currency,
-                "confidence": confidence,
-                "source_filing": source_filing,
-                "xbrl_tag": tag,
-                "_filed": filed,
-                "_tag_priority": tag_priority,
-            }
-    for r in rows.values():
-        r.pop("_filed", None)
-        r.pop("_tag_priority", None)
-    return list(rows.values())
+
+def _debt_context(normalized: dict[str, Any]) -> tuple[Any, ...]:
+    """Both operands must describe the same interval in the same filing."""
+    return (normalized["period_start"], normalized["fiscal_period"],
+            normalized["period_type"], normalized["accession"],
+            normalized["filed_date"])
 
 
 def _collect_net_debt_issuance_one(
@@ -733,76 +770,74 @@ def _collect_net_debt_issuance_one(
     repay_tag: str,
     fx_rates: dict[str, float],
 ) -> list[dict[str, Any]]:
-    """Net debt issuance for ONE taxonomy's tag pair (us-gaap or IFRS)."""
-    p_entries, _p_tax, p_ccy = _extract_entries(facts, proceeds_tag)
-    r_entries, _r_tax, r_ccy = _extract_entries(facts, repay_tag)
-    if not p_entries:
-        return []
-    p_currency = p_ccy or "USD"
-    r_currency = r_ccy or p_currency
+    """Net debt only when both reported operands share period/filing/unit.
 
-    repay_idx: dict[tuple[date, str, str], float] = {}
-    if r_entries:
-        for entry in r_entries:
+    Absence of a matching repayment is unknown, not zero. A reported zero is
+    valid. Do not subtract YTD repayments from quarterly proceeds, or combine
+    values from different filings, currencies or taxonomies.
+    """
+    p_entries, p_tax, p_ccy = _extract_entries(facts, proceeds_tag)
+    r_entries, r_tax, r_ccy = _extract_entries(facts, repay_tag)
+    if not p_entries and not r_entries:
+        return []
+    if p_entries and r_entries and (p_tax != r_tax or p_ccy != r_ccy):
+        return []
+    taxonomy, currency = p_tax or r_tax, p_ccy or r_ccy
+    contexts: dict[tuple[Any, ...], dict[str, Any]] = {}
+    # Use the union, not just proceeds: repayment-only amendments and invalid
+    # operands must be able to block an older positive result symmetrically.
+    for side, entries in (("proceeds", p_entries), ("repayments", r_entries)):
+        for entry in entries or []:
             normalized = _normalize_entry(entry)
             if normalized is None:
                 continue
-            val = entry.get("val")
-            if val is None:
-                continue
-            try:
-                repay_idx[normalized] = abs(float(val))
-            except (TypeError, ValueError):
-                continue
+            context = contexts.setdefault(_debt_context(normalized), {
+                "normalized": normalized, "proceeds": set(), "repayments": set(),
+                "invalid": False,
+            })
+            if normalized["source_filing"] > context["normalized"]["source_filing"]:
+                context["normalized"] = normalized
+            amount = _fact_amount(entry)
+            if amount is None:
+                context["invalid"] = True
+            else:
+                context[side].add(amount)
 
-    rows: dict[tuple[date, str, str], dict[str, Any]] = {}
-    for entry in p_entries:
-        normalized = _normalize_entry(entry)
-        if normalized is None:
+    candidates: list[dict[str, Any]] = []
+    for context in contexts.values():
+        normalized = context["normalized"]
+        if (context["invalid"] or len(context["proceeds"]) != 1
+                or len(context["repayments"]) != 1):
+            candidates.append({
+                **normalized, "flow_type": "debt_issuance",
+                "_tag_priority": 0, "_unavailable": True,
+            })
             continue
-        val = entry.get("val")
-        if val is None:
+        net_local = next(iter(context["proceeds"])) - next(iter(context["repayments"]))
+        net_usd, used_fallback = _convert_to_usd(net_local, currency, fx_rates)
+        if not math.isfinite(net_usd):
+            candidates.append({
+                **normalized, "flow_type": "debt_issuance",
+                "_tag_priority": 0, "_unavailable": True,
+            })
             continue
-        try:
-            p_amount = abs(float(val))
-        except (TypeError, ValueError):
-            continue
-        r_amount = repay_idx.get(normalized, 0.0)
-        # Both sides assumed to be in the proceeds currency — SEC
-        # companyfacts almost always reports proceeds/repayments in the
-        # same unit. If currencies do mismatch, keep the proceeds-side
-        # unit and accept the small error (flagged below).
-        net_local = p_amount - r_amount
-        if net_local <= 0:
-            continue
-        net_usd, used_fallback = _convert_to_usd(
-            net_local, p_currency, fx_rates
-        )
-        currency_mismatch = (r_currency != p_currency)
-        confidence = (
-            "estimated" if (used_fallback or currency_mismatch) else "confirmed"
-        )
-        fp, period_type, source_filing = normalized
-        filed = str(entry.get("filed") or "")
-        key = (fp, period_type, source_filing)
-        existing = rows.get(key)
-        if existing is None or filed > existing.get("_filed", ""):
-            rows[key] = {
-                "fiscal_period": fp,
-                "period_type": period_type,
-                "flow_type": "debt_issuance",
-                "direction": "in",
-                "amount_usd": net_usd,
-                "amount_local": net_local,
-                "currency": p_currency,
-                "confidence": confidence,
-                "source_filing": source_filing,
-                "xbrl_tag": f"{proceeds_tag}-{repay_tag}",
-                "_filed": filed,
-            }
-    for r in rows.values():
-        r.pop("_filed", None)
-    return list(rows.values())
+        tag = f"{proceeds_tag}-{repay_tag}"
+        candidates.append({
+            **normalized,
+            "flow_type": "debt_issuance",
+            "direction": "in",
+            "amount_usd": net_usd,
+            "amount_local": net_local,
+            "currency": currency,
+            "confidence": "estimated" if used_fallback else "confirmed",
+            "source_filing": f"{normalized['source_filing']} tag={taxonomy}:{tag}",
+            "xbrl_tag": tag,
+            "taxonomy": taxonomy,
+            "_tag_priority": 0,
+        })
+    # Resolve contradictory/current facts before filtering the positive-inflow
+    # view: a newer zero/negative net must not resurrect an older positive one.
+    return [row for row in _select_flow_rows(candidates) if row["amount_local"] > 0]
 
 
 def _collect_net_debt_issuance(
@@ -810,11 +845,13 @@ def _collect_net_debt_issuance(
     fx_rates: dict[str, float],
 ) -> list[dict[str, Any]]:
     """Net debt issuance, trying us-gaap then ifrs-full."""
-    out = _collect_net_debt_issuance_one(
-        facts, _DEBT_PROCEEDS_TAG, _DEBT_REPAY_TAG, fx_rates,
-    )
-    if out:
-        return out
+    # An unavailable or nonpositive preferred-taxonomy result is not
+    # permission to replace it with a contradictory fallback inflow.
+    if (_extract_entries(facts, _DEBT_PROCEEDS_TAG)[0]
+            or _extract_entries(facts, _DEBT_REPAY_TAG)[0]):
+        return _collect_net_debt_issuance_one(
+            facts, _DEBT_PROCEEDS_TAG, _DEBT_REPAY_TAG, fx_rates,
+        )
     return _collect_net_debt_issuance_one(
         facts, _IFRS_DEBT_PROCEEDS_TAG, _IFRS_DEBT_REPAY_TAG, fx_rates,
     )
@@ -845,7 +882,13 @@ def _collect_all_flows(
 # ── DB writer ───────────────────────────────────────────────────────────
 
 
-# Deletes the exact (actor, fp, period_type, flow_type, source_filing)
+# For an emitted duration-validated row, replace earlier validated sources for
+# the same actor/end/type/flow/NULL-counterparty key, even after accession/tag
+# changes. The marker must be the second token after a recognized form; legacy
+# unmarked rows are not swept. This is NOT a complete snapshot replacement:
+# omitted/withdrawn/nonpositive revisions still need controlled reconciliation.
+# Historical repair and rollup invalidation remain prerequisites for rollout.
+# Otherwise deletes the exact (actor, fp, period_type, flow_type, source_filing)
 # row with NULL counterparty *before* insert, so re-runs never create
 # duplicates even though PG treats NULL as distinct in UNIQUE keys.
 # Migration 0024 ALSO rebuilds the UNIQUE key with NULLS NOT DISTINCT,
@@ -860,7 +903,17 @@ _DELETE_BEFORE_INSERT_SQL = text(
       AND period_type = :period_type
       AND flow_type = :flow_type
       AND counterparty_id IS NULL
-      AND source_filing = :source_filing
+      AND (
+          source_filing = :source_filing
+          OR (
+              :replace_validated
+              AND split_part(source_filing, ' ', 1) IN (
+                  '10-K', '10-K/A', '10-Q', '10-Q/A', '20-F', '20-F/A',
+                  '40-F', '40-F/A', '6-K', '6-K/A'
+              )
+              AND split_part(source_filing, ' ', 2) = :validated_marker
+          )
+      )
     """
 )
 
@@ -890,21 +943,6 @@ _INSERT_SQL = text(
     """
 )
 
-# Pre-0024 DBs don't have the ``currency`` column. Keep a legacy
-# insert statement available so the puller still works against a
-# schema that hasn't had migration 0024 applied yet.
-_LEGACY_INSERT_SQL = text(
-    """
-    INSERT INTO capital_flows (
-        actor_id, fiscal_period, period_type, flow_type, direction,
-        amount_usd, counterparty_id, source_filing, confidence, as_of
-    ) VALUES (
-        :actor_id, :fiscal_period, :period_type, :flow_type, :direction,
-        :amount_usd, NULL, :source_filing, :confidence, NOW()
-    )
-    """
-)
-
 
 def _write_rows(
     engine: Engine,
@@ -913,57 +951,37 @@ def _write_rows(
 ) -> int:
     """Upsert rows into capital_flows. Returns number written.
 
-    Strategy: DELETE any existing (actor_id, fp, period_type, flow_type,
-    source_filing) row with NULL counterparty, then INSERT. This is
+    Strategy: replace the emitted validated economic key (or, for legacy
+    callers, only the exact source key) with NULL counterparty, then INSERT. This is
     necessary because the original migration 0021 unique index treats
     NULLs as DISTINCT, so ON CONFLICT can't match NULL counterparties.
-    Migration 0024 rebuilds the index with NULLS NOT DISTINCT; once
-    that's applied we still run the DELETE (cheap) but ON CONFLICT also
-    kicks in as a safety net.
+    Current schema is required; any SQL failure rolls back the transaction.
+    Normal ingestion uses the immutable snapshot writer instead.
     """
     if not rows:
         return 0
-    written = 0
     with engine.begin() as conn:
         for r in rows:
             params = {
-                "actor_id": actor_id,
-                "fiscal_period": r["fiscal_period"],
-                "period_type": r["period_type"],
-                "flow_type": r["flow_type"],
-                "direction": r["direction"],
-                "amount_usd": r["amount_usd"],
+                "actor_id": actor_id, "fiscal_period": r["fiscal_period"],
+                "period_type": r["period_type"], "flow_type": r["flow_type"],
+                "direction": r["direction"], "amount_usd": r["amount_usd"],
                 "source_filing": r["source_filing"],
                 "confidence": r.get("confidence") or "confirmed",
                 "currency": r.get("currency") or "USD",
             }
-            try:
-                conn.execute(_DELETE_BEFORE_INSERT_SQL, {
-                    "actor_id": params["actor_id"],
-                    "fiscal_period": params["fiscal_period"],
-                    "period_type": params["period_type"],
-                    "flow_type": params["flow_type"],
-                    "source_filing": params["source_filing"],
-                })
-                try:
-                    conn.execute(_INSERT_SQL, params)
-                except Exception:
-                    # Column ``currency`` missing → pre-0024 schema.
-                    # Drop it and retry with the legacy insert.
-                    legacy_params = {
-                        k: v for k, v in params.items() if k != "currency"
-                    }
-                    conn.execute(_LEGACY_INSERT_SQL, legacy_params)
-                written += 1
-            except Exception as exc:
-                log.warning(
-                    "capital_flows upsert failed for {a} {f} {ft}: {e}",
-                    a=actor_id,
-                    f=r.get("fiscal_period"),
-                    ft=r.get("flow_type"),
-                    e=str(exc),
-                )
-    return written
+            parts = params["source_filing"].split(" ", 2)
+            conn.execute(_DELETE_BEFORE_INSERT_SQL, {
+                **params,
+                "replace_validated": (len(parts) >= 2 and parts[0] in _ANNUAL_FORMS | _QUARTER_FORMS
+                                      and parts[1] == _PERIOD_SOURCE_MARKER),
+                "validated_marker": _PERIOD_SOURCE_MARKER,
+            })
+            # Current schema is required. Do not catch SQL failures inside a
+            # transaction or retry on an already-aborted PostgreSQL connection.
+            conn.execute(_INSERT_SQL, params)
+    return len(rows)
+
 
 
 # ── Checkpoint ──────────────────────────────────────────────────────────
@@ -981,12 +999,16 @@ def _load_checkpoint() -> dict[str, Any]:
 
 
 def _save_checkpoint(
-    completed: list[str], last_ticker: str, total_rows: int,
+    completed: list[str], last_ticker: str, total_rows: int, attempted: list[str],
 ) -> None:
     """Atomically write checkpoint to /tmp."""
+    from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION
+
     payload = {
+        "normalizer_version": NORMALIZER_VERSION,
         "last_ticker": last_ticker,
         "completed": completed,
+        "attempted": attempted,
         "total_rows": total_rows,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1028,8 +1050,9 @@ class SECXBRLFinancialsPuller:
 
         Parameters:
             limit: Maximum tickers to process this invocation (None = all).
-            resume: If True, skip tickers already recorded in the
-                checkpoint. Set False to force full re-run.
+            resume: If True, resume the current attempt sweep. Successful and
+                failed attempts are distinct; every issuer is retried on the
+                next sweep. Set False to force a new sweep.
             tickers: If provided, restrict the universe to these tickers
                 only (case-insensitive). Useful for targeted re-runs of
                 foreign-issuer IFRS filers.
@@ -1054,8 +1077,19 @@ class SECXBRLFinancialsPuller:
             extras = sorted(allowed - universe_set)
             universe = base + extras
 
+        from ingestion.altdata.sec_financial_snapshots import NORMALIZER_VERSION, prepare_snapshot
+        from store.sec_financial_snapshots import write_snapshot
+
         checkpoint = _load_checkpoint() if resume else {}
+        if checkpoint.get("normalizer_version") != NORMALIZER_VERSION:
+            checkpoint = {}
         already_done: set[str] = set(checkpoint.get("completed") or [])
+        already_attempted: set[str] = set(checkpoint.get("attempted") or already_done)
+        if set(universe).issubset(already_attempted):
+            # Failed issuers must not freeze successful issuers indefinitely.
+            # Start another sweep after every issuer was attempted, not only
+            # after every issuer succeeded. Failure never means completion.
+            checkpoint, already_done, already_attempted = {}, set(), set()
         total_rows_before: int = int(checkpoint.get("total_rows") or 0)
 
         # Pre-load FX rates once so every ticker's facts can convert
@@ -1078,7 +1112,15 @@ class SECXBRLFinancialsPuller:
         results: list[dict[str, Any]] = []
         processed = 0
         rows_this_run = 0
-        completed_list: list[str] = list(already_done)
+        completed_list: list[str] = sorted(already_done)
+        attempted_list: list[str] = sorted(already_attempted)
+
+        def record_attempt(ticker: str, *, success: bool = False) -> None:
+            attempted_list.append(ticker)
+            if success:
+                completed_list.append(ticker)
+            _save_checkpoint(completed_list.copy(), ticker, total_rows_before + rows_this_run,
+                             attempted_list.copy())
 
         for ticker in universe:
             if limit is not None and processed >= limit:
@@ -1088,7 +1130,7 @@ class SECXBRLFinancialsPuller:
                 log.warning("SEC_XBRL: runtime cap reached — stopping")
                 break
 
-            if ticker in already_done:
+            if ticker in already_attempted:
                 continue
 
             actor_id = ticker.lower()
@@ -1098,46 +1140,45 @@ class SECXBRLFinancialsPuller:
                 results.append({
                     "ticker": ticker, "status": "NO_CIK", "rows": 0,
                 })
-                completed_list.append(ticker)
                 processed += 1
-                _save_checkpoint(
-                    completed_list, ticker, total_rows_before + rows_this_run,
-                )
+                record_attempt(ticker)
                 continue
 
-            facts = _fetch_company_facts(cik_padded)
+            captured = _fetch_company_facts_response(cik_padded)
             time.sleep(_RATE_LIMIT_DELAY_SECS)
-            if facts is None:
-                results.append({
-                    "ticker": ticker, "status": "NO_FACTS", "rows": 0,
-                })
-                completed_list.append(ticker)
-                processed += 1
-                _save_checkpoint(
-                    completed_list, ticker, total_rows_before + rows_this_run,
-                )
-                continue
-
-            flow_rows = _collect_all_flows(facts, fx_rates)
-            written = _write_rows(self.engine, actor_id, flow_rows)
-            rows_this_run += written
-
-            log.info(
-                "SEC_XBRL: {t} CIK={c} → {w} rows ({f} flow records)",
-                t=ticker, c=cik_padded, w=written, f=len(flow_rows),
-            )
-            results.append({
-                "ticker": ticker,
-                "cik": cik_padded,
-                "status": "SUCCESS" if written > 0 else "NO_FLOWS",
-                "rows": written,
-                "candidates": len(flow_rows),
-            })
-            completed_list.append(ticker)
             processed += 1
-            _save_checkpoint(
-                completed_list, ticker, total_rows_before + rows_this_run,
-            )
+            if captured is None:
+                results.append({
+                    "ticker": ticker, "status": "FAILED", "rows": 0,
+                    "error": "No successful complete SEC response; prior projection retained",
+                })
+                record_attempt(ticker)
+                continue
+            try:
+                snapshot = prepare_snapshot(
+                    source_body=captured[0], actor_id=actor_id, cik=cik_padded,
+                    request_started_at=captured[1], received_at=captured[2], fx_rates=fx_rates,
+                )
+                outcome = write_snapshot(self.engine, snapshot)
+                if outcome["status"] == "rejected_revision_regression":
+                    raise ValueError("New capture regressed an existing filed revision; projection retained")
+            except Exception as exc:
+                # The transactional writer already rolled back any SQL failure.
+                # Never checkpoint failed admission as a completed ticker.
+                reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                log.warning("SEC_XBRL: {t} snapshot not admitted: {e}", t=ticker, e=reason)
+                results.append({"ticker": ticker, "status": "FAILED", "rows": 0,
+                                "error": reason})
+                record_attempt(ticker)
+                continue
+            written = outcome["rows_written"]
+            rows_this_run += written
+            results.append({
+                "ticker": ticker, "cik": cik_padded, "status": "SUCCESS", "rows": written,
+                "candidates": len(snapshot.rows), "snapshot_id": snapshot.snapshot_id,
+                "snapshot_status": outcome["status"], "rows_removed": outcome.get("rows_removed", 0),
+            })
+            record_attempt(ticker, success=True)
 
         elapsed = time.monotonic() - start_ts
         log.info(

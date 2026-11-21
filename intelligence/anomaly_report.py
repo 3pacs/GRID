@@ -94,7 +94,7 @@ MAX_EPISODES_LISTED = 8
 
 COUNT_SUFFIXES = ("_opt_vol", "_total_oi")
 OPTIONS_DERIVED_SUFFIXES = (
-    "_max_pain", "_oi_conc", "_pcr", "_iv_atm", "_term_slope", "_iv_25d_put", "_iv_25d_call", "_iv_skew",
+    "_max_pain", "_oi_conc", "_pcr", "_iv_atm", "_term_slope", "_iv_25d_put", "_iv_25d_call", "_iv_m90_put_v1", "_iv_m110_call_v1", "_iv_m90_m110_spread_v1", "_iv_skew",
 )
 PRICE_SUFFIXES = ("_usd_full", "_full", "_close")
 PRICE_FAMILIES = frozenset({"equity", "breadth", "commodity", "fx", "crypto", "credit"})
@@ -103,8 +103,11 @@ DEFAULT_TARGET = "spy_full"
 _SUFFIX_LABEL = {
     "_opt_vol": "options volume", "_total_oi": "open interest", "_max_pain": "max-pain strike",
     "_oi_conc": "open-interest concentration", "_pcr": "put/call ratio", "_iv_atm": "at-the-money implied vol",
-    "_term_slope": "implied-vol term slope", "_iv_25d_put": "25-delta put implied vol",
-    "_iv_25d_call": "25-delta call implied vol", "_iv_skew": "implied-vol skew",
+    "_term_slope": "implied-vol term slope", "_iv_25d_put": "legacy put IV (method unknown; not verified 25-delta)",
+    "_iv_25d_call": "legacy call IV (method unknown; not verified 25-delta)", "_iv_skew": "implied-vol skew",
+    "_iv_m90_put_v1": "put IV proxy (87-93% spot mean v1)",
+    "_iv_m110_call_v1": "call IV proxy (107-113% spot mean v1)",
+    "_iv_m90_m110_spread_v1": "fixed-moneyness put-minus-call IV spread v1",
 }
 _GROUP_LABEL = {"_opt_vol": "Options volume feed", "_total_oi": "Open interest feed"}
 

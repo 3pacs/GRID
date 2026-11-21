@@ -11,7 +11,8 @@ Goes beyond header-level extraction to analyze:
     - Comparison with prior quarter tone (tone shift detection)
     - Q&A sentiment (analyst bear/bull question ratio)
 
-Sources: raw_series where series_id LIKE 'edgar:8k:%' (from edgar_transcripts.py)
+Sources: EDGAR raw_series plus provenance-verified AV earnings_events.
+AV analysis is read-through, never written into the legacy ticker/date table.
 Schedule: Daily (runs after edgar_transcripts puller)
 """
 
@@ -348,6 +349,8 @@ class EarningsTranscriptAnalyzer:
         ticker: str,
         filing_date: date,
         transcript_text: str,
+        *,
+        compare_prior: bool = True,
     ) -> TranscriptAnalysis | None:
         """Run full analysis on a single transcript.
 
@@ -380,7 +383,7 @@ class EarningsTranscriptAnalyzer:
         hedge_phrases = self.extractor.extract_hedges(transcript_text)
 
         # Get prior quarter tone for shift detection
-        prior_tone = self._get_prior_tone(ticker, filing_date)
+        prior_tone = self._get_prior_tone(ticker, filing_date) if compare_prior else None
         tone_shift = None
         if prior_tone is not None:
             tone_shift = round(overall_scores["tone"] - prior_tone, 4)
@@ -508,6 +511,99 @@ class EarningsTranscriptAnalyzer:
             )
             return False
 
+    def run_av_analysis(
+        self,
+        tickers: list[str] | None = None,
+        days_back: int = 90,
+        *,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Read-through AV analysis using retrieval availability, not fiscal dates.
+
+        The legacy earnings_analysis table has a unique ticker/filing_date key
+        and cannot retain this source/period/known-at contract. Never write AV
+        results there. Historical as_of requests recompute from currently stored
+        evidence; they do not claim the analysis existed at that earlier time.
+        Unknown call dates stay null. A matched SEC filing is not the call date.
+        """
+        now = datetime.now(timezone.utc)
+        as_of = now if as_of is None else as_of
+        if as_of.tzinfo is None or as_of.utcoffset() is None or as_of > now:
+            raise ValueError("as_of must be timezone-aware and not in the future")
+        if days_back < 0:
+            raise ValueError("days_back must be nonnegative")
+        cutoff = as_of - timedelta(days=days_back)
+        wanted = {t.upper() for t in tickers} if tickers else None
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT id, ticker, filing_date, period_end, fiscal_quarter,
+                           full_text, raw_payload, created_at
+                    FROM earnings_events
+                    WHERE event_type = 'EARNINGS_CALL' AND source = 'ALPHAVANTAGE'
+                      AND full_text IS NOT NULL AND created_at <= :as_of
+                """), {"as_of": as_of}).fetchall()
+        except Exception as exc:
+            log.warning("AV transcript analysis unavailable ({kind})", kind=type(exc).__name__)
+            return {"status": "unavailable", "analyses": [], "stored": 0}
+
+        candidates = {}
+        rejected = 0
+        for event_id, ticker, filed, end, quarter, body, raw, created in rows:
+            if wanted is not None and ticker not in wanted:
+                continue
+            try:
+                payload = json.loads(raw) if isinstance(raw, str) else raw
+                observed = datetime.fromisoformat(payload["observed_at"])
+                if (observed.tzinfo is None or observed.utcoffset() is None
+                        or not isinstance(created, datetime) or created.tzinfo is None
+                        or created.utcoffset() is None):
+                    raise ValueError("unknown availability")
+                known_at = max(observed, created)
+                if (payload.get("filing_date_basis") != "matched_sec_filing_not_call_date"
+                        or payload.get("fiscal_period_source") != "SEC_EDGAR_Fundamentals"
+                        or not isinstance(payload.get("fiscal_period_accession"), str)
+                        or not payload["fiscal_period_accession"].strip()
+                        or payload.get("symbol") != ticker or payload.get("quarter") != quarter
+                        or not isinstance(end, date) or not isinstance(filed, date)
+                        or not isinstance(quarter, str) or not re.fullmatch(r"[0-9]{4}Q[1-4]", quarter)
+                        or not end <= filed <= observed.astimezone(timezone.utc).date()
+                        or not cutoff <= known_at <= as_of
+                        or not isinstance(body, str) or len(body.strip()) < 200):
+                    raise ValueError("unverified or unavailable transcript")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                rejected += 1
+                continue
+            key = (ticker, quarter, end)
+            candidate = (event_id, ticker, filed, end, quarter, body, payload, known_at)
+            # Multiple ingested copies of a period must not become extra votes.
+            if key not in candidates or (known_at, event_id) > (candidates[key][7], candidates[key][0]):
+                candidates[key] = candidate
+
+        analyses = []
+        for event_id, ticker, filed, end, quarter, body, payload, known_at in sorted(
+                candidates.values(), key=lambda r: (r[1], r[3], r[7])):
+            analysis = self.analyze_transcript(ticker, filed, body, compare_prior=False)
+            if analysis is None:
+                continue
+            result = analysis.to_dict()
+            # Source and event identity cannot collide with EDGAR's ticker/date ID.
+            result["analysis_id"] = hashlib.sha256(
+                f"av-transcript:{event_id}:{hashlib.sha256(body.encode()).hexdigest()}".encode()
+            ).hexdigest()[:20]
+            result.update({
+                "source": "ALPHAVANTAGE", "event_id": event_id,
+                "period_end": end.isoformat(), "fiscal_quarter": quarter,
+                "call_date": None, "call_date_basis": "unknown",
+                "filing_date_basis": "matched_sec_filing_not_call_date",
+                "fiscal_period_accession": payload["fiscal_period_accession"],
+                "known_at": known_at.isoformat(), "as_of": as_of.isoformat(),
+                "analysis_basis": "recomputed_from_current_stored_evidence",
+            })
+            analyses.append(result)
+        return {"status": "ok", "analyses": analyses, "stored": 0,
+                "rejected": rejected, "as_of": as_of.isoformat()}
+
     def run_analysis(
         self,
         tickers: list[str] | None = None,
@@ -515,8 +611,9 @@ class EarningsTranscriptAnalyzer:
     ) -> dict[str, Any]:
         """Run transcript analysis for all recent filings.
 
-        Fetches transcript text from raw_series (stored by edgar_transcripts
-        puller) and runs tone/phrase analysis.
+        Keeps the EDGAR persistence flow and adds a separately labeled AV
+        read-through result. Top-level analyzed/stored counts remain EDGAR-only;
+        AV results carry their own availability/provenance and are not persisted.
 
         Args:
             tickers: Optional ticker list. If None, discovers from raw_series.
@@ -542,7 +639,7 @@ class EarningsTranscriptAnalyzer:
                 ).fetchall()
         except Exception as exc:
             log.warning("Transcript analysis query failed: {e}", e=str(exc))
-            return {"error": str(exc)}
+            return {"error": str(exc), "av": self.run_av_analysis(tickers, days_back)}
 
         analyzed = 0
         stored = 0
@@ -572,6 +669,7 @@ class EarningsTranscriptAnalyzer:
             "filings_found": len(rows),
             "analyzed": analyzed,
             "stored": stored,
+            "av": self.run_av_analysis(tickers, days_back),
         }
 
         log.info(
