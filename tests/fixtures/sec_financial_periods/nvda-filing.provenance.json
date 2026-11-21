@@ -1,0 +1,12 @@
+{
+  "kind": "immutable-accession-filing-document",
+  "url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+  "retrieved_at_utc": "2026-11-07T21:09:12.866238+00:00",
+  "status": 200,
+  "user_agent": "GRID Intelligence ops@stepdad.finance",
+  "filename": "nvda-20260726.htm.gz",
+  "sha256": "318cab6d5d4180917258f9678db08e618ad37c233902ba9a3330fc2d05b63b82",
+  "bytes": 1517157,
+  "storage_encoding": "gzip",
+  "stored_bytes": 94604
+}

@@ -1,0 +1,23 @@
+{
+ "run_id": "factory-frequent-price-20261120",
+ "first_session": "2022-11-14",
+ "last_session": "2026-11-10",
+ "decision_times": ["10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00"],
+ "horizons": ["15m", "30m", "60m", "close"],
+ "skip_windows": ["15:00+60m"],
+ "features": ["F1", "F10", "F11", "F1_shift30"],
+ "class_shares": {"price": 1.0},
+ "z_thresholds": [0.25, 0.5],
+ "sides": ["long", "short"],
+ "cost_per_share": 0.04,
+ "alpha": 0.05,
+ "perms": 10000,
+ "seed": 20261123,
+ "min_n": 30,
+ "z_history": 60,
+ "target_unit": "vol",
+ "vol_history": 20,
+ "tape_history": 20,
+ "cluster_by": "jaccard",
+ "cluster_threshold": 0.5
+}
