@@ -232,12 +232,27 @@ check did not allow: a blank low and adjusted low, on days without a trade. 2,23
 it. Every other row passes: every date is a day alone, the last day is 2026-11-19, and every included
 company has either a price file or a no-prices mark (9,576 and 6,895).
 
-The check now takes a blank in any of the eight price fields as served. The row is kept unchanged, the
-factory reads the field as a missing value, so that day is not a valid bar for that company, and `build`
+The check now takes a row with a blank price as served, on one condition. The row is kept unchanged, the
+factory reads the blank as a missing value, so that day is not a valid bar for that company, and `build`
 reports the count (`rows_with_a_blank_price`, `price_files_with_a_blank_price`). A blank volume, adjusted
-volume, dividend, split factor or date is still refused. With that change all 9,576 files pass the check
-(dry run, nothing written). The store is still not bound and not rebuilt: that waits for this change to be
-reviewed.
+volume, dividend, split factor or date is still refused. The store is still not bound and not rebuilt:
+that waits for this change to be reviewed.
+
+**The condition (review of `addfd43f`).** The factory's valid-bar rule reads six of the eight prices:
+close, high, low, open, adjusted close and adjusted open. It does not read the adjusted high or the
+adjusted low. The first version of this change took a blank in any of the eight, so a row blank only in
+the adjusted high or low would have been sealed and still ranked as a valid bar. Now at least one blank
+must be in a price the factory reads; a row blank only in the adjusted high or low is refused, by `fetch`,
+`bind-existing` and `build` alike. The rows on grid-svr are blank in the low and the adjusted low
+together, so they pass: a read-only dry run of this rule over all 9,576 files refused none and counted
+2,238 rows with a blank price in 10 files (2026-11-21, nothing written). If Tiingo ever serves the other kind, the pull stops there and the rule is decided
+then: the alternative is to make the factory read and require all eight, which is a change to the shared
+factory and belongs in its own PR.
+
+Tests cover each price on its own, at zero and at positive volume: a lone blank in each of the six takes
+the company out of the factory's universe that day, in `universe`, `universe_on` and `load_panel`, with
+the served row unchanged in the panel; a lone blank in the adjusted high or low is refused and nothing is
+bound, built or left behind.
 
 ## What is not done
 

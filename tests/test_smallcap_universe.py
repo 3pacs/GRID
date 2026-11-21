@@ -167,6 +167,12 @@ GOOD = "2020-01-02,5.0,5.0,5.0,5.0,100,5.0,5.0,5.0,5.0,100,0.0,1.0\n"
     ((HEADER + "\n" + GOOD.replace(",0.0,1.0", ",,1.0")).encode(), "cannot be read"),               # a blank dividend
     ((HEADER + "\n" + GOOD.replace(",0.0,1.0", ",0.0,")).encode(), "cannot be read"),               # a blank split factor
     ((HEADER + "\n" + GOOD.replace("2020-01-02", "")).encode(), "13 fields"),                       # a blank date
+    # a review's witnesses: blank only in adjHigh or adjLow, which the factory does not read, at zero and positive volume
+    ((HEADER + "\n2016-04-04,20,21,19,20,0,20,,19,20,0,0,1\n").encode(), "blank only in adjHigh or adjLow"),
+    ((HEADER + "\n2016-04-04,20,21,19,20,0,20,21,,20,0,0,1\n").encode(), "blank only in adjHigh or adjLow"),
+    ((HEADER + "\n2016-04-04,20,21,19,20,100000,20,,19,20,100000,0,1\n").encode(), "blank only in adjHigh or adjLow"),
+    ((HEADER + "\n2016-04-04,20,21,19,20,100000,20,21,,20,100000,0,1\n").encode(), "blank only in adjHigh or adjLow"),
+    ((HEADER + "\n2016-04-04,20,21,19,20,100000,20,,,20,100000,0,1\n").encode(), "blank only in adjHigh or adjLow"),
 ])
 def test_a_200_that_is_not_a_whole_daily_file_is_never_written_or_taken_as_done(tmp_path, body, why):
     m = meta(tmp_path)
@@ -198,10 +204,18 @@ def test_a_blank_price_is_kept_as_served_and_reported_but_other_blank_fields_are
     assert rows[1][2] == blank_low.encode()                                 # the line is not rewritten
     body, first, last, n, cut = U.traded_life(raw, START, VINTAGE)
     assert body == raw and (first, last, n, cut) == ("2020-01-02", "2020-01-06", 2, 0)   # a no-trade day inside the life stays
-    for i in (1, 2, 3, 4, 6, 7, 8, 9):                                      # any of the eight prices may be blank
+    names = HEADER.split(",")
+    for i in (1, 2, 3, 4, 6, 7, 8, 9):                                      # each of the eight prices, blank on its own
         fields = GOOD.strip().split(",")
         fields[i] = ""
-        assert U.price_rows((HEADER + "\n" + ",".join(fields) + "\n").encode(), START, VINTAGE)[0][3] is True
+        one = (HEADER + "\n" + ",".join(fields) + "\n").encode()
+        if names[i] in ("adjHigh", "adjLow"):                               # the factory would not see it: refused
+            with pytest.raises(U.UniverseError, match="blank only in adjHigh or adjLow"):
+                U.price_rows(one, START, VINTAGE)
+        else:
+            assert U.price_rows(one, START, VINTAGE)[0][3] is True
+    assert [names[1 + i] for i in U._BAR_FIELDS] == ["close", "high", "low", "open", "adjClose", "adjOpen"]
+    assert [names[1 + i] for i in U._PRICE_FIELDS] == ["close", "high", "low", "open", "adjClose", "adjHigh", "adjLow", "adjOpen"]
     m = meta(tmp_path)
     cs = [c for c in U.load_companies(m) if c.perma == A]
     out = tmp_path / "store"
@@ -547,3 +561,62 @@ def test_a_pull_with_a_failed_or_unasked_company_is_never_sealed(tmp_path):
     (out / "no-prices" / D).touch()                                       # a mark for a company the list leaves out
     with pytest.raises(U.UniverseError, match="no-prices marks for ids the company list does not include"):
         U.build(m, out)
+
+
+@pytest.mark.parametrize("volume", [0, 100_000])
+def test_a_blank_in_any_price_the_builder_accepts_is_never_a_valid_bar_in_the_factory(tmp_path, volume):
+    # One store, one session, six companies: each has exactly one price blank, a different one each. Every price the
+    # builder accepts a lone blank in must take the company out of the factory's universe that day. The two prices
+    # the factory does not read (adjHigh, adjLow) are refused by the builder instead, tested with the other bodies.
+    d = days(60, "2016-02-01")
+    day = 44
+    names = HEADER.split(",")
+
+    def blank_one(field):
+        def edit(lines):
+            f = lines[day + 1].rstrip(b"\n").split(b",")
+            f[5] = f[10] = str(volume).encode()
+            f[names.index(field)] = b""
+            return [*lines[:day + 1], b",".join(f) + b"\n", *lines[day + 2:]]
+        return edit
+
+    accepted = [names[1 + i] for i in U._BAR_FIELDS]
+    m, out, ids = many(tmp_path, d, edits={i: blank_one(field) for i, field in enumerate(accepted)})
+    rep = U.build(m, out)
+    assert rep["rows_with_a_blank_price"] == 6 and rep["price_files_with_a_blank_price"] == 6
+    panel = generation(out)
+    u = X.universe(panel, min_session_bars=19, min_price=2.0, min_dollar_volume=1e6, files=X.input_files(panel))
+    r = u.sessions.index(d[day])
+    for i, field in enumerate(accepted):
+        col = u.cols.index(ids[i])
+        assert not u.ok.values[r, col] and not u.base[r, col], field           # not a valid bar, not rankable
+        assert u.ok.values[r - 1, col] and u.base[r - 1, col], field           # and it was the day before
+        served = (out / "prices" / f"{ids[i]}.csv").read_bytes().splitlines()[day + 1]
+        assert (panel / "prices" / f"{ids[i]}.csv").read_bytes().splitlines()[day + 1] == served and b",," in served + b","
+    untouched = [u.cols.index(c) for c in ids[6:]]
+    assert u.ok.values[r, untouched].all() and u.base[r, untouched].all()
+    assert U.universe_on(out, d[day], 2.0, 1e6, min_session_bars=19) == sorted(ids[6:])
+    run = X.RunFile.from_dict({"run_id": "blank", "first_session": d[0], "last_session": d[-2], "rankings": ["pooled"],
+                               "fractions": [0.2], "min_session_bars": 20, "min_ranked": 20, "min_price": 2, "min_dollar_volume": 1e6,
+                               "signals": [{"name": "rev5", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]}]})
+    loaded = X.load_panel(panel, run, X.input_files(panel))                 # a run reads the same mask
+    assert not loaded.base[loaded.sessions.index(d[day]), [loaded.cols.index(c) for c in ids[:6]]].any()
+
+    # the two prices the factory does not read: a store holding such a row cannot be bound or built at all
+    for field in ("adjHigh", "adjLow"):
+        root = tmp_path / field
+        root.mkdir()
+        mm = meta(root, [{"permaTicker": f"US{100 + i:012d}", "ticker": f"c{i}", "name": f"Company {i}", "isActive": True, "isADR": False}
+                         for i in range(25)])
+        store_dir = root / "store"
+        (store_dir / "prices").mkdir(parents=True)
+        for perma in ids:
+            raw = (out / "prices" / f"{perma}.csv").read_bytes()
+            (store_dir / "prices" / f"{perma}.csv").write_bytes(
+                b"".join(blank_one(field)(bars(d, 20.0).splitlines(keepends=True))) if perma == ids[7] else raw)
+        with pytest.raises(U.UniverseError, match=rf"{ids[7]}.csv: line {day + 2} is blank only in adjHigh or adjLow"):
+            U.bind_existing(mm, store_dir, start=START, vintage=VINTAGE)
+        (store_dir / "fetch-state.json").write_text((out / "fetch-state.json").read_text())   # even a store bound some other way
+        with pytest.raises(U.UniverseError, match="blank only in adjHigh or adjLow"):
+            U.build(mm, store_dir)
+        assert not (store_dir / "panel").exists()

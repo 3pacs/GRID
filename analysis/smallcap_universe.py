@@ -66,9 +66,13 @@ KINDS = ("common", "unit", "warrant", "right", "preferred", "spac", "fund")
 _PERMA = re.compile(r"^[A-Z]{2}\d{12}$")
 _GENERATION = re.compile(r"^g-[0-9a-f]{16}$")
 _ROW_DAY = re.compile(rb"^(\d{4}-\d{2}-\d{2})(T[0-9:.]{8,12}Z)?$")
-# Fields that may be blank in a row Tiingo serves: the eight prices (close, high, low, open and their adjusted
-# forms), by position after the date. Volume, adjusted volume, dividend and split factor may not.
+# A row Tiingo serves may have a blank price, by position after the date: close, high, low, open, adjClose, adjHigh,
+# adjLow, adjOpen. Volume, adjusted volume, dividend and split factor may not be blank.
 _PRICE_FIELDS = (0, 1, 2, 3, 5, 6, 7, 8)
+# The six of those the factory's valid-bar rule reads (``cross_section_factory.universe``): close, high, low, open,
+# adjClose, adjOpen. A blank in one of them makes the day an invalid bar there. The factory does not read adjHigh or
+# adjLow, so a row blank only in those would still rank as a valid bar: such a row is refused here.
+_BAR_FIELDS = (0, 1, 2, 3, 5, 8)
 _NAME_KINDS = (   # first match wins; checked against the lower-cased name
     ("unit", re.compile(r"\bunits?\b")),
     ("warrant", re.compile(r"\bwarrants?\b|\bwts?\b")),
@@ -168,9 +172,11 @@ def price_rows(raw: bytes, start: str, vintage: str) -> list[tuple[str, float, b
     and a day outside ``start`` .. ``vintage``.
 
     One thing Tiingo does serve is a blank price: on some days without a trade the low is empty (seen in 10 of the
-    9,576 files pulled 2026-11-20, 2,238 rows, always the low and the adjusted low). A blank price field is kept as
-    served and reported; the factory reads it as a missing value, so that day is not a valid bar. A blank volume,
-    adjusted volume, dividend or split factor is still refused."""
+    9,576 files pulled 2026-11-20, 2,238 rows, always the low and the adjusted low together). Such a row is kept as
+    served and reported, on one condition: at least one of its blanks is in a price the factory's valid-bar rule
+    reads (``_BAR_FIELDS``), so the factory sees a missing value and the day is never a valid bar. A row blank only
+    in adjHigh or adjLow, which the factory does not read, is refused. So is a blank volume, adjusted volume,
+    dividend or split factor."""
     lines = raw.splitlines(keepends=True)
     if not lines or lines[0].strip(b"\r\n") != PRICE_HEADER:
         raise UniverseError("does not start with Tiingo's daily header")
@@ -188,6 +194,9 @@ def price_rows(raw: bytes, start: str, vintage: str) -> list[tuple[str, float, b
             raise UniverseError(f"line {n} holds a date or a number that cannot be read") from exc
         if not all(math.isfinite(x) for i, x in enumerate(numbers) if i not in blank) or numbers[4] < 0:
             raise UniverseError(f"line {n} holds a number that is not finite, or a negative volume")
+        if blank and not set(blank) & set(_BAR_FIELDS):
+            raise UniverseError(f"line {n} is blank only in adjHigh or adjLow, which the factory does not read: the "
+                                "day would rank as a valid bar")
         if day <= prev:
             raise UniverseError(f"line {n} is out of date order or repeats a day")
         if not start <= day <= vintage:
@@ -467,6 +476,10 @@ def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRS
             gen_dir.chmod(0o555)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        try:
+            panel.rmdir()                      # a refused first build leaves no empty panel directory behind
+        except OSError:
+            pass                               # it holds a generation: leave it
     _write_whole(panel / CURRENT, (generation + "\n").encode())
     current_panel(data_dir)                    # the generation CURRENT now names is whole, or this build fails here
 
