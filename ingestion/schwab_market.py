@@ -81,6 +81,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from config import log, settings
+from ingestion import schwab_usage
 
 try:  # POSIX advisory locks; absent on Windows.
     import fcntl
@@ -392,6 +393,7 @@ class SchwabMarketClient:
         backoff_cap: float = DEFAULT_BACKOFF_CAP,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
+        client: str | None = None,
     ) -> None:
         self._app_key, self._app_secret = load_credentials(
             app_key, app_secret, credentials_file
@@ -407,6 +409,10 @@ class SchwabMarketClient:
         self._sleep = sleep
         self._now = now
         self._tokens: dict[str, Any] | None = None
+        # schwab-usage/1 (2026-11-21): every request is one line in the shared call ledger beside the token file, so a 429
+        # shows which client spent the app's allowance (ingestion/schwab_usage.py). Never raises into a call.
+        self._client = schwab_usage.client_name(client)
+        self._usage_dir = schwab_usage.usage_dir(self._token_file)
 
     # -- token file ---------------------------------------------------------
 
@@ -508,12 +514,14 @@ class SchwabMarketClient:
                 timeout=self._timeout,
             )
         except requests.RequestException as exc:
+            schwab_usage.record(self._usage_dir, self._client, "POST", "oauth/token", "net", self._now())
             # ``from None``: the transport exception text may echo request
             # details and must not surface in tracebacks.
             log.warning("Schwab token refresh network error: {err}", err=type(exc).__name__)
             raise SchwabTransientError("Schwab token refresh failed (network)") from None
 
         status = int(resp.status_code)
+        schwab_usage.record(self._usage_dir, self._client, "POST", "oauth/token", status, self._now())
         if status in (400, 401):
             log.warning(
                 "Schwab token refresh rejected with HTTP {status}; weekly login required",
@@ -600,6 +608,7 @@ class SchwabMarketClient:
                     timeout=self._timeout,
                 )
             except requests.RequestException as exc:
+                schwab_usage.record(self._usage_dir, self._client, "GET", path, "net", self._now())
                 if attempt >= self._max_retries:
                     raise SchwabTransientError(
                         f"Schwab GET {path} failed after {attempt + 1} attempts "
@@ -615,6 +624,7 @@ class SchwabMarketClient:
                 continue
 
             status = int(resp.status_code)
+            schwab_usage.record(self._usage_dir, self._client, "GET", path, status, self._now())
             if status == 200:
                 try:
                     return resp.json()
