@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 from datetime import datetime
@@ -59,13 +58,15 @@ def _utc(day, hm, second=0):
     return datetime.fromisoformat(f"{day}T{hm}:{second:02d}").replace(tzinfo=NY).astimezone(UTC).isoformat()
 
 
-MATCHING_TERMS = "match"
+AS_THE_RULE_GIVES = "as the rule gives"
 
 
-def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None, terms=MATCHING_TERMS):
+def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None, recorded=AS_THE_RULE_GIVES, decisions=("15:00",)):
     """``backstop``: {(day, hm): (bar, "HH:MM" New York time it was first seen that day)}; None = no such table.
-    ``terms``: the lost-minute terms the recorder wrote per day. Default: these terms, every day. None = no such
-    table. A dict {day: [terms text, ...]} overrides the days it names."""
+    ``recorded``: the recorder's own rows. Default: for every session and decision, the value these terms give on
+    these bars, each bound to the terms with the value's own stamp. None = no such tables. A function gets the rows
+    (dicts with day, decision, feature, raw, eligible, recorded_at, terms_sha256, terms_recorded_at) and may change
+    them; a row whose terms_sha256 is None is written with no binding."""
     con = sqlite3.connect(path)
     con.execute("create table bars_1m_live (symbol text, ts_utc text, src text, day text, o real, h real, "
                 "l real, c real, v integer, primary key (symbol, ts_utc))")
@@ -73,14 +74,6 @@ def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None, terms=M
         for hm, b in session.items():
             con.execute("insert into bars_1m_live values ('SPY', ?, ?, ?, ?, ?, ?, ?, ?)",
                         (_utc(day, hm), src_of(day, hm), day, *b))
-    if terms is not None:
-        con.execute("create table factory_gap_terms (day text, sha256 text, terms text, first_recorded_at text, "
-                    "primary key (day, sha256))")
-        override = {} if terms == MATCHING_TERMS else terms
-        for day in bars:
-            for text in override.get(day, [flp.LIVE_RULE_TERMS_JSON]):
-                con.execute("insert into factory_gap_terms values (?, ?, ?, ?)",
-                            (day, hashlib.sha256(text.encode()).hexdigest(), text, _utc(day, "09:30")))
     if backstop is not None:
         con.execute("create table factory_backstop_bars (symbol text, ts_utc text, day text, source text, o real, "
                     "h real, l real, c real, v integer, fetch_started_at text, first_seen_at text, "
@@ -90,6 +83,32 @@ def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None, terms=M
                         (_utc(day, hm), day, *b, _utc(day, seen), _utc(day, seen, 2)))
     con.commit()
     con.close()
+    if recorded is not None:
+        first, last = min(bars), max(bars)
+        live, _ = flp.load_live(path, "SPY", first, last)
+        held = flp.load_backstop(path, "SPY", first, last)
+        rows = []
+        for day in sorted(live):
+            for decision in decisions:
+                values, why, _used = flp.live_features(live, held, day, decision)
+                at = _utc(day, decision, 20)
+                rows += [{"day": day, "decision": decision, "feature": f, "raw": values[f], "eligible": int(not why[f]),
+                          "recorded_at": at, "terms_sha256": flp.LIVE_RULE_TERMS_SHA256, "terms_recorded_at": at} for f in mf.FEATURES]
+        if recorded != AS_THE_RULE_GIVES:
+            recorded(rows)
+        con = sqlite3.connect(path)
+        con.execute("create table factory_feature_values (day text, decision text, feature text, raw real, eligible integer, "
+                    "reasons text, recorded_at text, primary key (day, decision, feature))")
+        con.execute("create table factory_feature_terms (day text, decision text, feature text, terms_sha256 text, "
+                    "recorded_at text, primary key (day, decision, feature))")
+        for r in rows:
+            con.execute("insert into factory_feature_values values (?, ?, ?, ?, ?, '[]', ?)",
+                        (r["day"], r["decision"], r["feature"], r["raw"], r["eligible"], r["recorded_at"]))
+            if r["terms_sha256"] is not None:
+                con.execute("insert into factory_feature_terms values (?, ?, ?, ?, ?)",
+                            (r["day"], r["decision"], r["feature"], r["terms_sha256"], r["terms_recorded_at"]))
+        con.commit()
+        con.close()
     return path
 
 
@@ -100,7 +119,7 @@ def run(tmp_path):
     def go(research, live, decisions=("15:00",), **kwargs):
         calls.append(1)                                   # a test may build more than one pair of databases
         r, lv = tmp_path / f"r{len(calls)}.db", tmp_path / f"l{len(calls)}.db"
-        return flp.report(_research_db(r, research), _live_db(lv, live, **kwargs),
+        return flp.report(_research_db(r, research), _live_db(lv, live, decisions=decisions, **kwargs),
                           first=SESSIONS[0], last=SESSIONS[-1], decisions=list(decisions), horizons=["close"])
     return go
 
@@ -315,41 +334,75 @@ def test_the_terms_text_and_its_sha256_are_the_pinned_ones():
     assert flp.LIVE_RULE_TERMS_SHA256 == "31e017f78c4d676ce6e405b1beb708cde9fbc370448a4a6c923b3e39db4b50d9"
 
 
-def test_no_session_counts_unless_the_recorder_recorded_these_exact_terms_that_day(run):
-    without = run(_days(), _days(), terms=None)                       # a recording made before the rule shipped
+def test_without_the_recorders_own_rows_nothing_is_ready(run):
+    without = run(_days(), _days(), recorded=None)                    # a recording made before the recorder wrote values
 
-    assert without["live_ready"] == [] and without["live_rule"]["terms_table"] is False
+    assert without["live_ready"] == [] and without["live_rule"]["recorded_values_table"] is False
     f1 = without["comparison"]["features"]["F1"]
     assert f1["reasons"] == [flp.RULE_NOT_RECORDED, "insufficient_matched_sessions"]
     assert f1["values_compared"] == 6 and f1["values_out_of_tolerance"] == 0 and f1["values_matched"] == 0
-    assert without["comparison"]["sessions_not_recorded_under_the_rule"] == SESSIONS
+    assert f1["values_not_bound"] == 7 and without["comparison"]["sessions_not_recorded_under_the_rule"] == SESSIONS
+    rows = [r for r in without["comparison"]["value_rows"] if r["feature"] == "F1"]
+    assert {r["binding"] for r in rows} == {"no_recorded_value"} and all(r["recorded_value"] is None for r in rows)
 
-    other = flp.LIVE_RULE_TERMS_JSON.replace('"gap_max":2', '"gap_max":3')
-    cases = {
-        "other terms": [other],
-        "two sets of terms in one session": [flp.LIVE_RULE_TERMS_JSON, other],
-        "no row that day": [],
-    }
-    for what, texts in cases.items():
-        doc = run(_days(), _days(), terms={"2026-11-06": texts})
-        assert doc["live_ready"] == [], what
-        assert doc["comparison"]["sessions_not_recorded_under_the_rule"] == ["2026-11-06"], what
-        assert doc["comparison"]["features"]["F1"]["matched_sessions"] == 5, what
-    assert run(_days(), _days())["live_rule"]["terms_recorded"]["2026-11-06"] == [flp.LIVE_RULE_TERMS_SHA256]
+    bound = run(_days(), _days())
+    assert bound["live_ready"] == sorted(mf.FEATURES)
+    assert bound["live_rule"]["recorded_values"] == 28 and bound["live_rule"]["recorded_values_bound_to_these_terms"] == 28
+    assert {r["binding"] for r in bound["comparison"]["value_rows"]} == {"bound_to_these_terms"}
 
 
-def test_a_terms_row_whose_text_is_not_its_own_digest_does_not_count(tmp_path):
-    db = _live_db(tmp_path / "l.db", _days())
-    con = sqlite3.connect(db)
-    con.execute("update factory_gap_terms set terms = ? where day = '2026-11-06'", ('{"gap_max":99}',))
-    con.commit()
-    con.close()
+def _only(day, feature, **change):
+    def tamper(rows):
+        for r in rows:
+            if r["day"] == day and r["feature"] == feature:
+                r.update(change)
+    return tamper
 
-    days = flp.load_rule_terms(db, SESSIONS[0], SESSIONS[-1])
 
-    assert days["2026-11-06"] == [f"corrupt:{flp.LIVE_RULE_TERMS_SHA256}"]
-    assert not flp.recorded_under_the_rule(days, "2026-11-06") and flp.recorded_under_the_rule(days, "2026-11-05")
-    assert not flp.recorded_under_the_rule(None, "2026-11-05")
+@pytest.mark.parametrize("change, binding, reason", [
+    # Codex's witness on 09bd974c: an old 15:00 value of 999999.0, and the terms stamped at 15:01
+    ({"raw": 999999.0, "terms_recorded_at": "2026-11-06T20:01:00+00:00"}, "binding_not_written_with_the_value", "live_rule_not_recorded"),
+    ({"terms_recorded_at": "2026-11-06T20:01:00+00:00"}, "binding_not_written_with_the_value", "live_rule_not_recorded"),
+    ({"raw": 999999.0, "terms_sha256": None}, "value_not_bound_to_any_terms", "live_rule_not_recorded"),     # an older generation's row
+    ({"terms_sha256": None}, "value_not_bound_to_any_terms", "live_rule_not_recorded"),
+    ({"terms_sha256": "f" * 64}, "value_bound_to_other_terms", "live_rule_not_recorded"),
+    ({"raw": 999999.0}, "bound_to_these_terms", "recorded_value_differs_from_bars"),                         # bound, and not what the bars give
+    ({"eligible": 0, "raw": None}, "bound_to_these_terms", "recorded_value_differs_from_bars"),              # the recorder withheld it
+])
+def test_a_value_counts_only_on_its_own_binding_and_only_if_it_is_what_the_bars_give(run, change, binding, reason):
+    doc = run(_days(), _days(), recorded=_only("2026-11-06", "F1", **change))
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert "F1" not in doc["live_ready"] and doc["live_ready"] == ["F10", "F11", "F1_shift30"]    # the other features' rows are their own
+    assert reason in f1["reasons"] and f1["matched_sessions"] == 5
+    row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == "2026-11-06")
+    assert row["binding"] == binding and row["matched"] is False
+    assert row["within_tolerance"] is True               # the bars agree with research, and that is not enough
+    assert row["recorded_value"] == change.get("raw", row["live"])
+
+
+def test_a_session_that_changed_generation_part_way_is_mixed_decision_by_decision(run):
+    def restart(rows):                                   # 10:00 was recorded by an older generation; 15:00 by this one
+        for r in rows:
+            if r["decision"] == "10:00":
+                r["terms_sha256"] = None
+
+    doc = run(_days(), _days(), decisions=("10:00", "15:00"), recorded=restart)
+
+    assert doc["live_ready"] == ["F1_shift30"]           # its only applicable decision time is 15:00
+    f1 = doc["comparison"]["features"]["F1"]
+    assert f1["values_not_bound"] == 7 and f1["values_bound_to_the_terms"] == 7 and f1["matched_sessions"] == 0
+    assert f1["reasons"] == [flp.RULE_NOT_RECORDED, "insufficient_matched_sessions"]
+    by_decision = {(r["decision"], r["binding"]) for r in doc["comparison"]["value_rows"] if r["feature"] == "F1"}
+    assert by_decision == {("10:00", "value_not_bound_to_any_terms"), ("15:00", "bound_to_these_terms")}
+
+
+def test_what_a_binding_must_be():
+    good = {"raw": 0.1, "eligible": True, "recorded_at": "t", "terms_sha256": flp.LIVE_RULE_TERMS_SHA256, "terms_recorded_at": "t"}
+    assert flp.binding_problem(good) is None and flp.binding_problem(None) == "no_recorded_value"
+    assert flp.binding_problem({**good, "terms_sha256": None}) == "value_not_bound_to_any_terms"
+    assert flp.binding_problem({**good, "terms_sha256": "0" * 64}) == "value_bound_to_other_terms"
+    assert flp.binding_problem({**good, "terms_recorded_at": "later"}) == "binding_not_written_with_the_value"
 
 
 def test_a_value_outside_tolerance_is_counted_and_blocks_the_feature(run):
