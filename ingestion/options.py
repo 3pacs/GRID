@@ -109,10 +109,30 @@ class OptionsSourceAccessDenied(Exception):
     ``NO_CHAIN``, not a denial.
     """
 
+    reason = "source_access_denied"
+
     def __init__(self, provider: str, http_status: int) -> None:
         self.provider = provider
         self.http_status = http_status
         super().__init__(f"{provider} access denied (HTTP {http_status})")
+
+
+class OptionsSourceStopped(OptionsSourceAccessDenied):
+    """The source must not be asked again this run; not a refusal of access.
+
+    Raised by a provider that shares a request allowance (Schwab,
+    ``ingestion/options_schwab.py``) on a rate limit, an outage or an expired
+    login. The run stops exactly as it does for an access denial, so later
+    tickers are not requested, but the result says what happened.
+    """
+
+    reason = "source_stopped"
+
+    def __init__(self, provider: str, http_status: int, why: str) -> None:
+        self.provider = provider
+        self.http_status = http_status
+        Exception.__init__(self, f"{provider} {why}" + (f" (HTTP {http_status})" if http_status else ""))
+
 
 
 def _is_access_denial(ticker: str, http_status: int) -> bool:
@@ -188,6 +208,10 @@ class OptionsPullResults(list[dict[str, Any]]):
         "no expirations", "no chain listed", "no dated regular-market price",
     })
     _CORE_TICKERS: frozenset[str] = frozenset(EQUITY_TICKERS)
+    # Per-ticker ``reason`` values that end a run without requesting later
+    # tickers: a refusal of access, or a source that must not be asked again
+    # (``OptionsSourceStopped``).
+    _RUN_STOP_REASONS: frozenset[str] = frozenset({"source_access_denied", "source_stopped"})
 
     def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
         super().__init__(items)
@@ -234,7 +258,7 @@ class OptionsPullResults(list[dict[str, Any]]):
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
         else:
             status, note = "SUCCESS", "full default universe captured"
-        denied = next((r for r in self if r.get("reason") == "source_access_denied"), None)
+        denied = next((r for r in self if r.get("reason") in self._RUN_STOP_REASONS), None)
         if denied is not None and status in ("PARTIAL", "FAILED"):
             note = f"{denied['error']}; remaining tickers not requested"
         return {
@@ -734,9 +758,23 @@ class CboeOptionsClient:
 
 
 def options_primary_provider() -> str:
-    """``cboe`` (default) or ``yahoo``, from GRID_OPTIONS_PRIMARY_PROVIDER."""
+    """``cboe`` (default), ``yahoo`` or ``schwab``, from GRID_OPTIONS_PRIMARY_PROVIDER.
+
+    ``schwab`` reads the hand-listed core through the owner's Schwab app and
+    every other ticker from Yahoo (``ingestion/options_schwab.py``), and only
+    when ``GRID_OPTIONS_SCHWAB_READERS=admin-only`` states that non-admin
+    readers leave Schwab-provider rows out; anything else is ``cboe``.
+    """
     value = os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "cboe").strip().lower()
-    return "yahoo" if value == "yahoo" else "cboe"
+    if value == "schwab" and os.getenv("GRID_OPTIONS_SCHWAB_READERS", "").strip().lower() != "admin-only":
+        # Schwab data may not be redistributed, and the options tables feed
+        # contributor routes, e-mail digests and oracle publication (review of
+        # #1299, item 3). Until those leave Schwab-provider rows out, the
+        # operator has not set GRID_OPTIONS_SCHWAB_READERS=admin-only and the
+        # default path runs instead.
+        log.warning("GRID_OPTIONS_PRIMARY_PROVIDER=schwab ignored: GRID_OPTIONS_SCHWAB_READERS is not 'admin-only'")
+        return "cboe"
+    return value if value in ("yahoo", "schwab") else "cboe"
 
 
 class CboeFirstOptionsClient:
@@ -947,7 +985,26 @@ class OptionsPuller(BasePuller):
         # (operator rollback knob; the test suite pins it so no test reaches
         # Cboe unless it opts in). ``_yahoo`` keeps its historical attribute
         # name: callers and tests inject any ``get_options`` client there.
-        if options_primary_provider() == "yahoo":
+        primary = options_primary_provider()
+        core_block: str | None = None
+        if primary == "schwab":
+            # Owner-selected source for the hand-listed core (2026-11-21);
+            # every other ticker is read from Yahoo. Schwab shares its app
+            # allowance with the live recorder and dates a price only inside
+            # the regular session, so the core is not requested after the
+            # cash close, or while the shared call ledger shows a recent
+            # refusal or a recent capture by this same writer.
+            from ingestion.options_schwab import (
+                SchwabFirstOptionsClient,
+                schwab_core_block,
+            )
+
+            if any(ticker in EQUITY_TICKERS for ticker in tickers):
+                core_block = schwab_core_block(now, writer=capture_source)
+                if core_block is not None:
+                    log.info("Options pull: Schwab core not requested ({why})", why=core_block)
+            self._yahoo = SchwabFirstOptionsClient(writer=capture_source)
+        elif primary == "yahoo":
             self._yahoo = YahooOptionsClient()
         else:
             self._yahoo = CboeFirstOptionsClient()
@@ -965,6 +1022,11 @@ class OptionsPuller(BasePuller):
                     for t in tickers[idx:]
                 )
                 break
+            if core_block is not None and ticker in EQUITY_TICKERS:
+                # Not requested from Schwab this run: counted as not captured.
+                results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                                "reason": core_block, "provider": "schwab"})
+                continue
             ticker_kwargs: dict[str, Any] = {
                 "max_expirations": max_expirations, "should_continue": should_continue,
             }
@@ -974,10 +1036,10 @@ class OptionsPuller(BasePuller):
                 ticker_kwargs["capture_source"] = capture_source
             result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
-            if result.get("reason") == "source_access_denied":
+            if result.get("reason") in OptionsPullResults._RUN_STOP_REASONS:
                 results.extend(
                     {"ticker": t, "status": "SKIPPED", "rows_inserted": 0,
-                     "reason": "source_access_denied_before_request",
+                     "reason": f"{result['reason']}_before_request",
                      "provider": result["provider"],
                      "blocked_by_http_status": result["http_status"]}
                     for t in tickers[idx + 1:]
@@ -1485,7 +1547,7 @@ class OptionsPuller(BasePuller):
         except OptionsSourceAccessDenied as exc:
             log.warning("{t}: {e}; options run stopped", t=ticker, e=exc)
             return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
-                    "reason": "source_access_denied", "error": str(exc),
+                    "reason": exc.reason, "error": str(exc),
                     "provider": exc.provider, "http_status": exc.http_status}
         except _OptionsBudgetExpired:
             return {"ticker": ticker, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
