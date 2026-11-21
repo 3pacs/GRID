@@ -23,10 +23,14 @@ default path Yahoo serves only fallbacks; here it serves every non-core name
 * a 429 latches for the run: the remaining expiries of that ticker are not
   requested (its capture is refused as incomplete) and the next non-core name
   stops the run (``OptionsSourceStopped("yahoo", 429)``);
-* a 429 writes a "held until" time to an owner-only marker in GRID's state
-  directory and no run asks Yahoo again before it, ``YAHOO_RATE_LIMIT_HOLD_SECONDS``
-  later (SKIPPED ``yahoo_recent_rate_limit``). An unreadable or corrupt marker
-  is logged and treated as not held;
+* a 429, on a chain request or on Yahoo's crumb handshake, writes a "held
+  until" time to a marker file in GRID's state directory and no run asks
+  Yahoo again before it, ``YAHOO_RATE_LIMIT_HOLD_SECONDS`` later (SKIPPED
+  ``yahoo_recent_rate_limit``). The file is created 0600 and holds a time and
+  a status code only. Its directory is shared with other GRID state: it is
+  created 0700 when missing and an existing one is left as it is. A marker
+  that cannot be read or parsed, whatever is in it, is logged and treated as
+  not held;
 * after the cash close nothing is requested from either source.
 
 What Schwab serves: ``ingestion.options.EQUITY_TICKERS`` only (the hand-listed
@@ -322,7 +326,9 @@ def yahoo_hold_file() -> Path:
 def record_yahoo_rate_limit(now_epoch: float, path: str | Path | None = None) -> bool:
     """Write the marker: a UTC "held until" time and the status code, nothing else.
 
-    Owner-only (mkstemp creates it 0600), replaced atomically. True when written; never raises.
+    The file is owner-only (mkstemp creates it 0600) and replaced atomically. The directory is
+    created 0700 only when it does not exist; an existing shared state directory keeps its mode.
+    True when written; never raises.
     """
     target = Path(path) if path is not None else yahoo_hold_file()
     until = datetime.fromtimestamp(now_epoch + YAHOO_RATE_LIMIT_HOLD_SECONDS, timezone.utc)
@@ -345,24 +351,27 @@ def record_yahoo_rate_limit(now_epoch: float, path: str | Path | None = None) ->
 def yahoo_tail_hold(now_epoch: float | None = None, path: str | Path | None = None) -> str | None:
     """``yahoo_recent_rate_limit`` until the marker's "held until" time, else None.
 
-    Fails open: no marker is no hold, and an unreadable or corrupt marker is logged and treated as
-    not held, so a bad file can never block options for good (the in-run latch still applies). A
-    "held until" further ahead than one hold from now is not one this code wrote and is ignored.
+    Fails open: no marker is no hold, and a marker that cannot be read or parsed (unreadable,
+    not UTF-8, not JSON, nested past the parser's depth, wrong shape) is logged and treated as
+    not held, so a bad file can never block options or abort a run (the in-run latch still
+    applies). A "held until" further ahead than one hold from now is not one this code wrote
+    and is ignored.
     """
     now = time.time() if now_epoch is None else now_epoch
     target = Path(path) if path is not None else yahoo_hold_file()
     try:
-        text = target.read_text()
+        raw = target.read_bytes()
     except FileNotFoundError:
         return None
     except OSError as exc:
         log.warning("options: Yahoo rate-limit marker unreadable ({kind}); treated as not held", kind=type(exc).__name__)
         return None
     try:
-        held_until = datetime.strptime(json.loads(text)["held_until"], "%Y-%m-%dT%H:%M:%SZ").replace(
+        held_until = datetime.strptime(json.loads(raw.decode("utf-8"))["held_until"], "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=timezone.utc).timestamp()
-    except (ValueError, KeyError, TypeError):
-        log.warning("options: Yahoo rate-limit marker is not in the expected form; treated as not held")
+    except Exception as exc:  # noqa: BLE001 -- any content at all must fail open (UnicodeDecodeError, RecursionError, ...)
+        log.warning("options: Yahoo rate-limit marker is not in the expected form ({kind}); treated as not held",
+                    kind=type(exc).__name__)
         return None
     return "yahoo_recent_rate_limit" if 0 < held_until - now <= YAHOO_RATE_LIMIT_HOLD_SECONDS else None
 
@@ -534,15 +543,22 @@ class SchwabFirstOptionsClient:
         return getattr(self._active, "remote_expiry_pages", True)
 
     @property
+    def yahoo_rate_limited(self) -> bool:
+        """True once Yahoo answered 429 in this run (a chain request or the crumb handshake)."""
+        return self._yahoo_limited
+
+    def _yahoo_limit_seen(self, where: str) -> None:
+        self._yahoo_limited = True
+        record_yahoo_rate_limit(self._now())
+        log.warning("Yahoo options: HTTP 429 ({where}); no further Yahoo request this run", where=where)
+
+    @property
     def yahoo_budget_spent(self) -> bool:
         """True once this run has sent its budget of Yahoo requests; later names are not started."""
         return self.yahoo_requests >= YAHOO_RUN_REQUEST_BUDGET
 
     def _yahoo_request(self, ticker: str, expiry_ts: int | None) -> Any:
         if self._yahoo_limited:
-            if expiry_ts is None:
-                # The next name after a 429: the run ends here, nothing is sent.
-                raise _options.OptionsSourceStopped("yahoo", 429, "rate limited")
             return None   # the rest of the limited ticker: no request, its capture stays incomplete
         if self._yahoo_last is not None:
             wait = YAHOO_MIN_REQUEST_INTERVAL_SECONDS - (self._monotonic() - self._yahoo_last)
@@ -552,9 +568,7 @@ class SchwabFirstOptionsClient:
         self.yahoo_requests += 1
         page = self._yahoo.get_options(ticker, expiry_ts)
         if getattr(self._yahoo, "last_status", None) == 429:
-            self._yahoo_limited = True
-            record_yahoo_rate_limit(self._now())
-            log.warning("Yahoo options {t}: HTTP 429; no further Yahoo request this run", t=ticker)
+            self._yahoo_limit_seen(f"chain request for {ticker}")
             return None
         return page
 
@@ -568,8 +582,14 @@ class SchwabFirstOptionsClient:
             self.provider_by_ticker[ticker] = PROVIDER
             return self.schwab.get_options(ticker)
         self.provider_by_ticker[ticker] = "yahoo"
+        if self._yahoo_limited:
+            # The next name after a 429: the run ends here, nothing is sent.
+            raise _options.OptionsSourceStopped("yahoo", 429, "rate limited")
         if self._yahoo is None:
             self._yahoo = _options.YahooOptionsClient()
+            if not self._yahoo.is_available and getattr(self._yahoo, "init_status", None) == 429:
+                # Refused at the crumb handshake, the likeliest place to meet Yahoo's block.
+                self._yahoo_limit_seen("crumb handshake")
         if not self._yahoo.is_available:
             self._active = self.schwab   # nothing to page through; the ticker is a failed fetch
             return None

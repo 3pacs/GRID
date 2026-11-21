@@ -471,8 +471,9 @@ class _FakeYahoo:
     last_no_chain = False
 
     def __init__(self, *, available: bool = True, no_chain: tuple[str, ...] = (),
-                 limited_at_request: int | None = None) -> None:
+                 limited_at_request: int | None = None, init_status: int | None = 200) -> None:
         self.is_available = available
+        self.init_status = init_status
         self.no_chain = set(no_chain)
         self.limited_at_request = limited_at_request   # 1-based request number answered 429
         self.last_status: int | None = None
@@ -654,7 +655,8 @@ def test_a_429_latches_for_the_run_and_writes_the_marker(monkeypatch: pytest.Mon
     assert len(yahoo.calls) == 2 and client.yahoo_requests == 2
     marker = tmp_path / "state" / "hold.json"
     assert json.loads(marker.read_text()) == {"held_until": "2026-11-05T21:00:00Z", "status": 429}
-    assert marker.stat().st_mode & 0o777 == 0o600 and marker.parent.stat().st_mode & 0o777 == 0o700
+    assert marker.stat().st_mode & 0o777 == 0o600
+    assert marker.parent.stat().st_mode & 0o777 == 0o700   # only because this run created the directory
     assert options_schwab.yahoo_tail_hold(SESSION_NOW.timestamp()) == "yahoo_recent_rate_limit"
 
 
@@ -669,13 +671,15 @@ def test_cross_run_hold_lasts_thirty_minutes_and_fails_open(tmp_path: Path, monk
     assert hold(now) == hold(now + 1799) == "yahoo_recent_rate_limit"
     assert hold(now + 1800) is None and hold(now + 86400) is None
     assert hold(now - 600) is None                          # a "held until" too far ahead was not written by this code
-    for bad in ("", "not json", "[]", '{"held_until": 5}', '{"held_until": "tomorrow"}', '{"status": 429}'):
-        marker.write_text(bad)
-        assert hold(now) is None                            # a corrupt marker never blocks
-    assert len(warnings) == 6 and all("treated as not held" in w for w in warnings)
+    nested = b"[" * 200_000 + b"]" * 200_000               # past the JSON parser's depth: RecursionError
+    for bad in (b"", b"not json", b"[]", b'{"held_until": 5}', b'{"held_until": "tomorrow"}', b'{"status": 429}',
+                b"\xff", b"\xff\xfe\x00", nested, b"null", b'"2026-11-05T21:00:00Z"'):
+        marker.write_bytes(bad)
+        assert hold(now) is None                            # whatever is in it, a bad marker never blocks
+    assert len(warnings) == 11 and all("treated as not held" in w for w in warnings)
     marker.unlink()
     marker.mkdir()                                          # unreadable as a file
-    assert hold(now) is None and len(warnings) == 7
+    assert hold(now) is None and len(warnings) == 12
     assert options_schwab.record_yahoo_rate_limit(now, tmp_path / "hold.json" / "x" / "y") in (True, False)  # never raises
 
 
@@ -777,3 +781,68 @@ def test_the_default_path_keeps_twelve_expiries_and_no_yahoo_limits(monkeypatch:
     monkeypatch.setattr(puller, "_mark_catalog_pulled", lambda **_kw: True)
     puller.pull_all()
     assert seen == {"KO": 12, "OLMA": 12}
+
+
+# ── review of 0305998e ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("content", [b"\xff", b"\xff\xfe\x00", b"[" * 200_000 + b"]" * 200_000],
+                         ids=["not-utf8", "not-utf8-bom", "nested"])
+def test_a_garbled_marker_never_aborts_a_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: bytes) -> None:
+    # F1: this used to raise out of pull_all before any ticker, core included, on every run.
+    marker = tmp_path / "hold.json"
+    marker.write_bytes(content)
+    monkeypatch.setenv("GRID_OPTIONS_YAHOO_HOLD_FILE", str(marker))
+    puller, market, yahoo, results = _schwab_run(monkeypatch, ["KO"], ["OLMA"], _body(), publish=True)
+    assert [r["status"] for r in results] == ["SUCCESS", "SUCCESS"] and len(market.calls) == 1
+    assert {t for t, _e in yahoo.calls} == {"OLMA"} and puller.published == [True]
+
+
+def test_a_429_on_the_crumb_handshake_latches_and_writes_the_hold(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # F2: the handshake is the likeliest place to meet Yahoo's block.
+    marker = tmp_path / "hold.json"
+    monkeypatch.setenv("GRID_OPTIONS_YAHOO_HOLD_FILE", str(marker))
+    yahoo = _FakeYahoo(available=False, init_status=429)
+    puller, market, _yahoo, results = _schwab_run(monkeypatch, ["KO"], ["OLMA", "NUOX", "ACIU"], _body(), yahoo=yahoo)
+
+    assert yahoo.calls == [] and len(market.calls) == 1
+    assert results[1]["ticker"] == "OLMA" and results[1]["status"] == "FAILED"
+    assert results[1]["rate_limited"] == "yahoo rate limited (HTTP 429)"
+    assert results[2]["reason"] == "source_stopped" and results[2]["error"] == "yahoo rate limited (HTTP 429)"
+    assert results[3]["reason"] == "source_stopped_before_request"
+    assert json.loads(marker.read_text()) == {"held_until": "2026-11-05T21:00:00Z", "status": 429}
+    assert puller._yahoo.yahoo_rate_limited is True
+
+
+@pytest.mark.parametrize("status", [None, 401, 503])
+def test_another_handshake_failure_writes_no_hold(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: Any) -> None:
+    marker = tmp_path / "hold.json"
+    monkeypatch.setenv("GRID_OPTIONS_YAHOO_HOLD_FILE", str(marker))
+    yahoo = _FakeYahoo(available=False, init_status=status)
+    puller, _market, _yahoo, results = _schwab_run(monkeypatch, ["KO"], ["OLMA", "NUOX"], _body(), yahoo=yahoo)
+    assert [r["status"] for r in results] == ["SUCCESS", "FAILED", "FAILED"]   # not a stop: just unavailable
+    assert not marker.exists() and puller._yahoo.yahoo_rate_limited is False
+
+
+def test_an_existing_shared_state_directory_keeps_its_mode(tmp_path: Path) -> None:
+    # F3: ~/.local/state/grid already holds scheduler and AV state; the marker must not tighten it.
+    shared = tmp_path / "state"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+    marker = shared / "options_yahoo_hold.json"
+    assert options_schwab.record_yahoo_rate_limit(SESSION_NOW.timestamp(), marker) is True
+    assert shared.stat().st_mode & 0o777 == 0o755 and marker.stat().st_mode & 0o777 == 0o600
+    assert sorted(p.name for p in shared.iterdir()) == ["options_yahoo_hold.json"]   # no temp file left behind
+
+
+def test_a_429_on_the_last_name_shows_in_the_run_summary(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # F4: with no later name to stop on, the summary used to read as an ordinary incomplete chain.
+    monkeypatch.setenv("GRID_OPTIONS_YAHOO_HOLD_FILE", str(tmp_path / "hold.json"))
+    yahoo = _FakeYahoo(limited_at_request=4)        # the second expiry of the second, and last, name
+    _puller, _market, _yahoo, results = _schwab_run(monkeypatch, ["KO"], ["OLMA", "NUOX"], _body(), yahoo=yahoo)
+
+    assert [r["status"] for r in results] == ["SUCCESS", "SUCCESS", "FAILED"]
+    assert results[2]["rate_limited"] == "yahoo rate limited (HTTP 429)" and "rate_limited" not in results[1]
+    assert results.summary["status"] == "PARTIAL"
+    assert results.summary["error"].endswith("1 tickers not captured (NUOX); yahoo rate limited (HTTP 429)")
+    assert (tmp_path / "hold.json").exists()

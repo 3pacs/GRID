@@ -261,6 +261,12 @@ class OptionsPullResults(list[dict[str, Any]]):
         denied = next((r for r in self if r.get("reason") in self._RUN_STOP_REASONS), None)
         if denied is not None and status in ("PARTIAL", "FAILED"):
             note = f"{denied['error']}; remaining tickers not requested"
+        elif status in ("PARTIAL", "FAILED"):
+            # A rate limit on the last name asked leaves no later name to stop
+            # on; say so here or the run reads as an ordinary incomplete chain.
+            limited = next((r.get("rate_limited") for r in self if r.get("rate_limited")), None)
+            if limited is not None:
+                note = f"{note}; {limited}"
         return {
             "status": status, "rows_inserted": rows,
             "scope": "full_universe" if self.full_universe else "subset",
@@ -431,6 +437,8 @@ class YahooOptionsClient:
         # HTTP status of the latest chain request (None before one, and after a
         # transport failure), so a caller can tell a 429 from other failures.
         self.last_status: int | None = None
+        # HTTP status of the crumb request in the handshake (None when it never answered).
+        self.init_status: int | None = None
         self._init_session()
 
     def _init_session(self) -> None:
@@ -447,6 +455,7 @@ class YahooOptionsClient:
             resp = self.session.get(
                 "https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10,
             )
+            self.init_status = resp.status_code
             if resp.status_code == 200 and resp.text:
                 self.crumb = resp.text
                 log.info("Yahoo options client initialised — crumb obtained")
@@ -1068,7 +1077,10 @@ class OptionsPuller(BasePuller):
                 # Only non-default writers pass a label; the default call
                 # shape stays what existing wrappers and doubles expect.
                 ticker_kwargs["capture_source"] = capture_source
+            limited_before = getattr(self._yahoo, "yahoo_rate_limited", False)
             result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
+            if in_tail and not limited_before and getattr(self._yahoo, "yahoo_rate_limited", False):
+                result["rate_limited"] = "yahoo rate limited (HTTP 429)"
             results.append(result)
             if result.get("reason") in OptionsPullResults._RUN_STOP_REASONS:
                 results.extend(
