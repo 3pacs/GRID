@@ -9,21 +9,42 @@ reports whether the two agree.
 
 Two questions, kept apart because they fail differently:
 
-* **Availability.** Under the research rules, would this session have produced
-  a signal and a label at all? Research needs the prior session complete, the
-  bars from 09:30 to T-1 complete, the entry bar and the exit bar
-  (``module_factory.build_rows``). A live recording with a missing minute fails
-  those rules on days when research, on complete vendor bars, passes them.
+* **Availability.** Would this session have produced a signal and a label at
+  all? Research needs the prior session complete, the bars from 09:30 to T-1
+  complete, the entry bar and the exit bar (``module_factory.build_rows``).
   Values that match on the days both sides have are not parity if live abstains
   on most days.
 * **Values.** Where both sides can compute a feature at a decision time, do the
   numbers agree within a tolerance for that feature's type?
 
+The two sides do not use the same availability rule (version 2). Research bars
+have no gaps, so research keeps the rule above. The live recording loses a
+minute when its quote source is refused, and the live recorder (gex-signals
+``factory_slots.py``, ``panel-factory/2``) records a feature with up to
+``GAP_MAX`` minutes missing from the prior session and from the minutes before
+the decision, when the bars that feature reads are there:
+
+* every feature reads the bar closing at the decision time and the prior
+  session's last bar; without either, or with more minutes missing, the session
+  is withheld as in research;
+* ``F1`` and ``F1_shift30`` read nothing else (``F1_shift30`` also the bar 30
+  minutes earlier): their live value is the value complete bars would give;
+* ``F10`` and ``F11`` read a range. They are eligible only when every lost
+  minute of their window has a backstop bar (``factory_backstop_bars``: a second
+  source's minute, kept as first seen) first seen at or before the decision
+  time. Only that bar's high and low are used.
+
+This module applies that rule to the live side, so availability is judged per
+feature, and the live value it compares is the value the recorder would have
+recorded. The constants and reason strings below are the recorder's; a change
+there must be made here too. A signals database without the backstop table
+(recorded before the rule shipped) simply has no fills.
+
 A feature is ``live_ready`` only with at least ``MIN_SESSIONS`` overlapping
 sessions on which both sides were eligible and every value was in tolerance,
 no value out of tolerance on any overlapping session, and no overlapping
-session where the two sides disagreed about availability. Anything else is
-``research_only`` with its reasons and the counts behind them.
+session where the two sides disagreed about that feature's availability.
+Anything else is ``research_only`` with its reasons and the counts behind them.
 
 Read-only: both databases are opened ``mode=ro``. Nothing here scores a module
 or registers anything. Five matching sessions are evidence about the source
@@ -52,7 +73,7 @@ from analysis.module_factory import (
 )
 from ingestion.market_calendar import is_market_open, market_close_time
 
-SCHEMA = "factory-live-parity-v1"
+SCHEMA = "factory-live-parity-v2"
 MIN_SESSIONS = 5
 OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
@@ -74,7 +95,16 @@ ENTRY_MISSING = "entry_bar_missing"
 EXIT_MISSING = "exit_bar_missing"
 EXIT_AFTER_CLOSE = "horizon_ends_after_close"
 
+# The live recorder's lost-minute rule (gex-signals factory_slots.py). Live only: research bars have no gaps.
+GAP_MAX = 2                       # minutes that may be missing from the prior session, and before the decision
+PRIOR_LAST_BAR = "15:59"          # read by every feature (the prior close): never one of the tolerated gaps
+BACKSTOP_SOURCE = "yahoo-1m"
+GAP_UNFILLED = "gap_not_backstopped"
+READ_BAR_MISSING = "feature_bar_missing"
+FEATURE_READS = {"F1": None, "F1_shift30": "bar_30_minutes_before", "F10": "todays_range", "F11": "prior_range"}
+
 Bars = dict[str, dict[str, tuple]]
+Backstop = dict[str, dict[str, tuple]]   # {day: {hm: ((o, h, l, c, v), first seen, aware datetime)}}
 
 
 class ParityError(ValueError):
@@ -135,6 +165,28 @@ def load_live(db: Path, symbol: str, first: str, last: str) -> tuple[Bars, dict[
     return bars, {day: dict(sorted(count.items())) for day, count in sources.items()}
 
 
+def load_backstop(db: Path, symbol: str, first: str, last: str) -> Backstop | None:
+    """The live recorder's first-seen second-source bars; None when the database has no such table."""
+    con = _connect(db)
+    try:
+        if not con.execute("select 1 from sqlite_master where type = 'table' and name = 'factory_backstop_bars'").fetchone():
+            return None
+        rows = con.execute(
+            "select day, ts_utc, o, h, l, c, v, first_seen_at from factory_backstop_bars "
+            "where symbol = ? and source = ? and day between ? and ? order by ts_utc",
+            (symbol, BACKSTOP_SOURCE, first, last),
+        ).fetchall()
+    finally:
+        con.close()
+    out: Backstop = {}
+    for day, ts, o, h, low, c, v, seen in rows:
+        local = datetime.fromisoformat(ts).astimezone(NY)
+        hm = local.strftime("%H:%M")
+        if local.date().isoformat() == day and hm in expected_minutes(day):
+            out.setdefault(day, {})[hm] = ((o, h, low, c, v), datetime.fromisoformat(seen))
+    return out
+
+
 # ── the session calendar ────────────────────────────────────────────────────
 
 
@@ -186,6 +238,78 @@ def signal_reasons(bars: Bars, day: str, decision: str) -> list[str]:
     return reasons
 
 
+# ── availability and values under the live recorder's rule ──────────────────
+
+
+def live_gaps(bars: Bars, day: str, decision: str) -> tuple[list[str], list[str]]:
+    """(minutes before ``decision`` missing from the day's live bars, minutes missing from the prior session's)."""
+    prior_day = previous_session(day)
+    required = {_hm(i) for i in range(OPEN_MIN, _minutes(decision))}
+    return (sorted(required - set(bars.get(day, {}))),
+            sorted(expected_minutes(prior_day) - set(bars.get(prior_day) or {})))
+
+
+def live_signal_reasons(bars: Bars, day: str, decision: str) -> list[str]:
+    """Why the live recorder withholds the whole session at ``decision``, for every feature; [] when it does not."""
+    close = close_minute(day)
+    if close is None or _minutes(decision) >= close:
+        return [AFTER_CLOSE]
+    reasons = []
+    prior_day = previous_session(day)
+    missing_today, missing_prior = live_gaps(bars, day, decision)
+    if bars.get(prior_day) is None:
+        reasons.append(PRIOR_MISSING)
+    elif (close_minute(prior_day) or 0) - OPEN_MIN != FULL_SESSION_MIN:
+        reasons.append(PRIOR_SHORT)
+    elif len(missing_prior) > GAP_MAX or PRIOR_LAST_BAR in missing_prior:
+        reasons.append(PRIOR_INCOMPLETE)
+    if len(missing_today) > GAP_MAX or _hm(_minutes(decision) - 1) in missing_today:
+        reasons.append(PREFIX_INCOMPLETE)
+    return reasons
+
+
+def live_features(bars: Bars, backstop: Backstop | None, day: str, decision: str) -> tuple[dict, dict, dict]:
+    """(values, reasons, used) per feature: what the live recorder would have recorded at ``decision``.
+
+    ``reasons[f]`` is [] when the feature is eligible. ``used[f]`` lists the backstop minutes its value took, as
+    ("today" | "prior", "HH:MM"). A backstop bar counts only when first seen at or before the decision time, only
+    for a lost minute, and only in the two range features.
+    """
+    session = live_signal_reasons(bars, day, decision)
+    nothing = {f: [] for f in FEATURES}
+    if session:
+        return dict.fromkeys(FEATURES), {f: list(session) for f in FEATURES}, nothing
+    prior_day = previous_session(day)
+    today, prior = bars[day], bars[prior_day]
+    bar = _hm(_minutes(decision) - 1)
+    exact = raw_features(Session(today), Session(prior), bar)
+    missing_today, missing_prior = live_gaps(bars, day, decision)
+    if not missing_today and not missing_prior:
+        return exact, nothing, nothing
+    known_by = datetime.fromisoformat(f"{day}T{decision}").replace(tzinfo=NY)
+
+    def fills(of_day: str, missing: list[str]) -> dict[str, tuple]:
+        held = (backstop or {}).get(of_day, {})
+        return {m: held[m][0] for m in missing if m in held and held[m][1] <= known_by}
+
+    use_today, use_prior = fills(day, missing_today), fills(prior_day, missing_prior)
+    filled = raw_features(Session({**today, **use_today}), Session({**prior, **use_prior}), bar)
+    values, reasons, used = {}, {}, {}
+    for f in FEATURES:
+        reads, why, took = FEATURE_READS[f], [], []
+        if reads == "bar_30_minutes_before" and _hm(_minutes(decision) - 31) in missing_today:
+            why = [READ_BAR_MISSING]
+        elif reads == "todays_range":
+            why = [GAP_UNFILLED] if len(use_today) < len(missing_today) else []
+            took = [("today", m) for m in sorted(use_today)]
+        elif reads == "prior_range":
+            why = [GAP_UNFILLED] if len(use_prior) < len(missing_prior) else []
+            took = [("prior", m) for m in sorted(use_prior)]
+        values[f] = None if why else (filled[f] if took else exact[f])
+        reasons[f], used[f] = why, ([] if why else took)
+    return values, reasons, used
+
+
 def label_bars(decision: str, horizon: str) -> tuple[str, str, int]:
     """(entry bar, exit bar, minute the label ends) for a decision time and horizon."""
     entry = _hm(_minutes(decision) + 1)
@@ -210,15 +334,28 @@ def label_reasons(bars: Bars, day: str, decision: str, horizon: str) -> list[str
     return reasons
 
 
-def availability(bars: Bars, days: list[str], decisions: list[str], horizons: list[str]) -> dict:
-    """Per-session availability and its totals, with a denominator for every count."""
+def availability(bars: Bars, days: list[str], decisions: list[str], horizons: list[str],
+                 backstop: Backstop | None = None) -> dict:
+    """The live recording's availability under the live recorder's rule, with a denominator for every count.
+
+    ``signal_*`` counts sessions the recorder does not withhold as a whole; ``feature_*`` counts each feature, which
+    may still be withheld for a lost minute it reads.
+    """
     rows = []
     why_signal: Counter = Counter()
     why_label: Counter = Counter()
+    why_feature = {f: Counter() for f in FEATURES}
+    n_feature = dict.fromkeys(FEATURES, 0)
+    backstopped = dict.fromkeys(FEATURES, 0)
     n_signal = n_label = n_both = 0
     for day in days:
         for decision in decisions:
-            s = signal_reasons(bars, day, decision)
+            s = live_signal_reasons(bars, day, decision)
+            _, per_feature, used = live_features(bars, backstop, day, decision)
+            for f in FEATURES:
+                why_feature[f].update(per_feature[f])
+                n_feature[f] += not per_feature[f]
+                backstopped[f] += bool(used[f])
             why_signal.update(s)
             n_signal += not s
             for horizon in horizons:
@@ -227,7 +364,8 @@ def availability(bars: Bars, days: list[str], decisions: list[str], horizons: li
                 n_label += not lab
                 n_both += not s and not lab
                 rows.append({"day": day, "decision": decision, "horizon": horizon,
-                             "signal_withheld": s, "label_missing": lab})
+                             "signal_withheld": s, "label_missing": lab,
+                             "feature_withheld": {} if s else {f: r for f, r in per_feature.items() if r}})
     signals = len(days) * len(decisions)
     labels = signals * len(horizons)
     return {
@@ -236,6 +374,9 @@ def availability(bars: Bars, days: list[str], decisions: list[str], horizons: li
         "label_rows": labels, "label_available": n_label,
         "signal_and_label": n_both,
         "signal_withheld_reasons": dict(sorted(why_signal.items())),
+        "feature_eligible": n_feature,
+        "feature_withheld_reasons": {f: dict(sorted(c.items())) for f, c in why_feature.items()},
+        "feature_values_using_the_backstop": backstopped,
         "label_missing_reasons": dict(sorted(why_label.items())),
         "rows": rows,
     }
@@ -253,8 +394,15 @@ def feature_values(bars: Bars, day: str, decision: str) -> dict[str, float | Non
     return raw_features(Session(today), Session(prior), _hm(_minutes(decision) - 1))
 
 
-def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str]) -> dict:
-    """Availability agreement and value differences on the sessions both sides hold."""
+def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str],
+            backstop: Backstop | None = None) -> dict:
+    """Availability agreement and value differences on the sessions both sides hold.
+
+    Research is judged by the research rule, live by the live recorder's rule, feature by feature. The live value
+    compared is the one the recorder would have recorded. On a session the recorder withholds as a whole, the value
+    its bars alone would give is still compared, as in version 1: a wrong value there is a finding about the source.
+    A feature with no value on either side by definition (``F1_shift30`` at 10:00) agrees.
+    """
     days = sorted(d for d in set(research) & set(live) if close_minute(d) is not None)
     rows = []
     per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0,
@@ -264,30 +412,35 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
     for day in days:
         for decision in decisions:
             r_why = signal_reasons(research, day, decision)
-            l_why = signal_reasons(live, day, decision)
-            agreed = (not r_why) == (not l_why)
-            if not agreed:
-                availability_mismatch.append({"day": day, "decision": decision,
-                                              "research": r_why, "live": l_why})
+            l_session = live_signal_reasons(live, day, decision)
+            l_val, l_why, l_used = live_features(live, backstop, day, decision)
+            if l_session:
+                l_val = feature_values(live, day, decision)
+            disagree = [f for f in FEATURES if (not r_why) != (not l_why[f])]
+            if disagree:
+                availability_mismatch.append({"day": day, "decision": decision, "features": disagree,
+                                              "research": r_why, "live": {f: l_why[f] for f in disagree}})
             r_val = feature_values(research, day, decision)
-            l_val = feature_values(live, day, decision)
             for f in FEATURES:
                 a, b = r_val[f], l_val[f]
                 stat = per_feature[f]
+                both_eligible = not r_why and not l_why[f]
                 diff = None if a is None or b is None else abs(a - b)
                 within = diff is not None and diff <= TOLERANCE[FEATURE_TYPE[f]]
+                undefined = a is None and b is None and both_eligible
                 if diff is not None:
                     stat["compared"] += 1
                     stat["max_abs_diff"] = diff if stat["max_abs_diff"] is None else max(stat["max_abs_diff"], diff)
                     if not within:
                         stat["out_of_tolerance"] += 1
-                if within and not r_why and not l_why:
+                if both_eligible and (within or undefined):
                     stat["matched_sessions"].add(day)
                 else:
                     stat["bad_sessions"].add(day)
                 rows.append({"day": day, "decision": decision, "feature": f, "research": a, "live": b,
                              "abs_diff": diff, "within_tolerance": within if diff is not None else None,
-                             "both_eligible": not r_why and not l_why})
+                             "both_eligible": both_eligible, "live_withheld": l_why[f],
+                             "backstop_minutes": [list(u) for u in l_used[f]]})
             for horizon in horizons:
                 entry, exit_bar, _ = label_bars(decision, horizon)
                 prices = {}
@@ -311,7 +464,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             reasons.append("insufficient_matched_sessions")
         if stat["out_of_tolerance"]:
             reasons.append("value_out_of_tolerance")
-        if availability_mismatch:
+        if any(f in m["features"] for m in availability_mismatch):
             reasons.append("availability_mismatch")
         features[f] = {
             "type": FEATURE_TYPE[f], "tolerance": TOLERANCE[FEATURE_TYPE[f]],
@@ -341,9 +494,10 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
     """The parity report: live availability on every recorded session, then the overlap comparison."""
     research = load_research(research_db, symbol, first, last)
     live, sources = load_live(signals_db, symbol, first, last)
+    backstop = load_backstop(signals_db, symbol, first, last)
     live_days = sorted(d for d in live if close_minute(d) is not None)
     # The first recorded session has no recorded prior; it is counted and its reason shown.
-    compared = compare(research, live, decisions, horizons)
+    compared = compare(research, live, decisions, horizons, backstop)
     statuses = {f: v["status"] for f, v in compared["features"].items()}
     return {
         "schema": SCHEMA,
@@ -355,7 +509,13 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "live_last_session": max(live_days) if live_days else None,
         "live_sources_per_day": sources,
         "live_missing_minutes": {d: sorted(expected_minutes(d) - set(live[d])) for d in live_days},
-        "live_availability": availability(live, live_days, decisions, horizons),
+        "live_rule": {"gap_max": GAP_MAX, "backstop_source": BACKSTOP_SOURCE,
+                      "backstop_table": backstop is not None,
+                      "backstop_bars": sum(len(v) for v in (backstop or {}).values()),
+                      "note": ("live features are judged by the live recorder's lost-minute rule, research by the "
+                               "research rule; a range feature needs each lost minute's backstop bar first seen "
+                               "at or before the decision time")},
+        "live_availability": availability(live, live_days, decisions, horizons, backstop),
         "comparison": compared,
         "live_ready": sorted(f for f, s in statuses.items() if s == "live_ready"),
         "research_only": sorted(f for f, s in statuses.items() if s == "research_only"),
