@@ -691,7 +691,7 @@ def test_a_later_pinned_correction_cannot_predate_the_one_it_supersedes(tmp_path
         (tmp_path / n).write_bytes(raw)
     pin = lambda n: (n, hashlib.sha256(files[n]).hexdigest())
     ok = fc.FactoryEvents(tmp_path, pins=(pin(fc.EVENT_PIN[0]), pin(fc.FORWARD_EVENT_PIN[0]), pin("c1.json")))
-    assert ok.known("2026-12-10", datetime(2026, 12, 10, 15, 0, tzinfo=UTC_)) == {"fomc"}
+    assert ok.known("2026-12-10", datetime(2026, 12, 10, 15, 0, tzinfo=UTC_)) == {"fomc", "cpi"}   # CPI is on 12-10 too
     with pytest.raises(ValueError, match="supersede only parts pinned before it"):
         fc.FactoryEvents(tmp_path, pins=(pin(fc.EVENT_PIN[0]), pin(fc.FORWARD_EVENT_PIN[0]), pin("c1.json"), pin("c3.json")))
 
