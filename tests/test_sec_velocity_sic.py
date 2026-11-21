@@ -232,7 +232,7 @@ def test_no_db_query_per_filing(monkeypatch):
 
 def test_historical_reads_local_table_once_per_year_as_of_year_end(monkeypatch):
     engine = FakeEngine(local_rows=[(320193, 3571)])
-    calls = _company_stub(monkeypatch, {7: "6021"})
+    calls = _company_stub(monkeypatch, {7: "6021"})  # would resolve, if asked
 
     def fake_get_filings(form, filing_date):
         year = int(filing_date[:4])
@@ -244,11 +244,38 @@ def test_historical_reads_local_table_once_per_year_as_of_year_end(monkeypatch):
     assert [p for _sql, p in engine.read_calls] == [
         {"as_of": date(2018, 12, 31)}, {"as_of": date(2019, 12, 31)},
     ]
-    assert calls == [7]  # the SEC cache spans years within one run
+    assert calls == []  # no SEC fallback in the backfill (lookahead)
     assert out["errors"] == []
     inserted = [p for sql, p in engine.write_calls if "INSERT INTO raw_series" in sql]
-    assert {p["sid"] for p in inserted} == {"SEC_VELOCITY:MANUFACTURING", "SEC_VELOCITY:FIRE"}
+    assert {p["sid"] for p in inserted} == {"SEC_VELOCITY:MANUFACTURING", "SEC_VELOCITY:UNKNOWN"}
     assert len(inserted) == 4  # 2 sectors x 2 years
+    unknown = [p for p in inserted if p["sid"] == "SEC_VELOCITY:UNKNOWN"]
+    assert all(p["val"] == 2.0 for p in unknown)
+    assert all(json.loads(p["payload"])["sic_sources"] == {"unknown": 2} for p in unknown)
+
+
+def test_historical_backfill_makes_zero_company_lookups(monkeypatch):
+    engine = FakeEngine()  # empty local table: every filing is a miss
+    calls = _company_stub(monkeypatch, {c: "6021" for c in range(1, 31)})
+    monkeypatch.setattr(
+        sec_velocity, "get_filings",
+        lambda form, filing_date: _filings(*range(1, 31), filed=date(int(filing_date[:4]), 6, 1)),
+    )
+    out = _puller(monkeypatch, engine).pull_historical_velocity(start_year=2005, end_year=2007)
+
+    assert calls == []
+    assert out["errors"] == []
+    inserted = [p for sql, p in engine.write_calls if "INSERT INTO raw_series" in sql]
+    assert {p["sid"] for p in inserted} == {"SEC_VELOCITY:UNKNOWN"}
+    assert len(engine.read_calls) == 3  # one local read per year
+
+
+def test_weekly_still_uses_the_fallback():
+    resolver = sec_velocity.SICResolver(
+        FakeEngine(), company_factory=lambda cik: SimpleNamespace(sic="6021")
+    )
+    assert resolver.allow_fallback is True
+    assert resolver.resolve(SimpleNamespace(cik=9)) == ("6021", "sec")
 
 
 @pytest.mark.parametrize(

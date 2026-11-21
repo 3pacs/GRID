@@ -117,9 +117,11 @@ def _sic_to_broad_sector(sic_code: str | int) -> str:
 #      on the CIK's latest submission filed on or before ``as_of``, so a
 #      historical year is labelled with the SIC known at the time. One query
 #      per load, never per filing. A missing table or failed read gives {}.
-#   2. On a miss only: ``edgar.Company(cik).sic`` (one GET of SEC's
-#      submissions JSON per CIK). This is the CIK's *current* SIC, cached for
-#      the run and capped at SIC_FALLBACK_MAX_LOOKUPS. After
+#   2. On a miss, weekly run only: ``edgar.Company(cik).sic`` (one GET of
+#      SEC's submissions JSON per CIK). This is the CIK's *current* SIC, so
+#      the historical backfill never uses it: a current SIC applied to a past
+#      year is lookahead. Cached for the run and capped at
+#      SIC_FALLBACK_MAX_LOOKUPS. After
 #      SIC_FALLBACK_MAX_CONSECUTIVE_FAILURES errors in a row the fallback
 #      stops for the run, so an SEC outage costs a few requests, not 200
 #      retry loops.
@@ -155,8 +157,10 @@ class SICResolver:
         company_factory: Callable[[int], Any] | None = None,
         max_lookups: int | None = None,
         max_consecutive_failures: int | None = None,
+        allow_fallback: bool = True,
     ) -> None:
         self.engine = engine
+        self.allow_fallback = allow_fallback
         self._company_factory = company_factory or (lambda cik: Company(cik))
         self.max_lookups = (
             SIC_FALLBACK_MAX_LOOKUPS if max_lookups is None else max_lookups
@@ -197,6 +201,8 @@ class SICResolver:
         )
 
     def _fallback_sic(self, cik: int) -> str | None:
+        if not self.allow_fallback:
+            return None
         if cik in self._fallback:
             return self._fallback[cik]
         if self._consecutive_failures >= self.max_consecutive_failures:
@@ -453,9 +459,10 @@ class SECVelocityPuller(BasePuller):
 
         total_inserted = 0
         all_errors: list[str] = []
-        # One resolver for the run: the SEC fallback cache and cap span all
-        # years; the local table is re-read per year, as of that year's end.
-        resolver = SICResolver(self.engine)
+        # Point-in-time: the local table only, re-read per year as of that
+        # year's end. No SEC fallback: Company(cik).sic is today's SIC, and
+        # applying it to a past year is lookahead. Misses stay UNKNOWN.
+        resolver = SICResolver(self.engine, allow_fallback=False)
 
         for year in range(start_year, end_year + 1):
             log.info("Processing year {y}", y=year)
