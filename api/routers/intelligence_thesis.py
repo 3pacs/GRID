@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from loguru import logger as log
 
 from api.auth import require_auth
@@ -18,6 +19,23 @@ from api.lf_helpers import (
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
+
+
+def _source_unreadable(source: str, exc: Exception, **fields: Any) -> JSONResponse:
+    """A source read that failed: HTTP 503 and the unavailable payload.
+
+    An unreadable source is not an empty one. The measured fields are ``null``
+    (never ``[]`` or ``0``), so a reader cannot take a failed read for "no
+    leads" or "no thesis change" (``docs/reference/AVAILABILITY_CONTRACT.md``).
+    The exception text stays in the server log, not in the response.
+    """
+    from store.availability import unavailable
+
+    return JSONResponse(
+        status_code=503,
+        content=unavailable(
+            f"{source} could not be read ({type(exc).__name__})", source=source, **fields),
+    )
 
 
 def _postmortems_as_of(postmortems: list[dict[str, Any]]) -> dict[str, Any]:
@@ -125,6 +143,13 @@ async def get_unified_thesis(
 
 # ── Thesis Tracker Endpoints ─────────────────────────────────────────────
 
+_THESIS_HISTORY_NOTE = (
+    "Market-direction snapshots. Rows are scored in place, and scoring is held "
+    "for look-ahead (item #16), so outcome fields are a frozen record that "
+    "stops in April 2026. This is not a log of research decisions on leads "
+    "or tests, and a row here is not proof of what was known at its timestamp."
+)
+
 
 @router.get("/thesis/history")
 def get_thesis_history_endpoint(
@@ -137,18 +162,23 @@ def get_thesis_history_endpoint(
     along with whether each thesis was correct, wrong, or partial.
     """
     try:
-        from intelligence.thesis_tracker import get_thesis_history
+        from intelligence.thesis_tracker import THESIS_SCORING_HELD, get_thesis_history
 
         engine = get_db_engine()
         snapshots = get_thesis_history(engine, days=days)
         return {
+            "available": True,
             "snapshots": [s.to_dict() for s in snapshots],
             "count": len(snapshots),
             "days": days,
+            # Newest snapshot in the data, not the time of this read.
+            "as_of": snapshots[0].timestamp if snapshots else None,
+            "scoring_held": THESIS_SCORING_HELD,
+            "note": _THESIS_HISTORY_NOTE,
         }
     except Exception as exc:
         log.warning("Thesis history failed: {e}", e=str(exc))
-        return {"snapshots": [], "count": 0, "error": str(exc)}
+        return _source_unreadable("thesis_snapshots", exc, snapshots=None, count=None, days=None)
 
 
 @router.get("/thesis/accuracy")
@@ -379,25 +409,47 @@ def get_investigation_leads(
     offset: int = Query(0, ge=0),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return investigation leads with optional filters."""
+    """Return investigation leads with optional filters.
+
+    Each lead carries ``declared_tests``: its verified stored tests (the
+    reviewed test its verdict declared, and the baseline every lead gets),
+    with their pre-registered criteria and current trial state. Rows that
+    exist but fail verification (staged, orphaned, malformed) are listed in
+    ``unverified_tests`` and explained in ``test_link_problems``; they are not
+    declared tests. Page, total and tests come from one read snapshot. A
+    failed read is HTTP 503 with ``available: false`` and ``leads: null``,
+    never ``[]``.
+    """
     try:
-        from intelligence.sleuth import Sleuth
         from dataclasses import asdict
 
-        engine = get_db_engine()
-        sleuth = Sleuth(engine)
-        leads = sleuth.get_leads(status=status, category=category, limit=limit, offset=offset)
-        total = sleuth.count_leads(status=status)
+        from intelligence.sleuth_intersections import read_leads_page
 
-        return {
-            "leads": [asdict(l) for l in leads],
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-        }
+        page = read_leads_page(get_db_engine(), status=status, category=category,
+                               limit=limit, offset=offset)
     except Exception as exc:
         log.warning("Sleuth leads query failed: {e}", e=str(exc))
-        return {"leads": [], "total": 0, "error": str(exc)}
+        return _source_unreadable(
+            "investigation_leads", exc, leads=None, total=None, limit=None, offset=None)
+
+    leads, total = page["leads"], page["total"]
+    return {
+        "available": True,
+        "leads": [_lead_with_tests(asdict, lead, page["tests"][lead.id]) for lead in leads],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(leads) < total,
+    }
+
+
+def _lead_with_tests(asdict: Any, lead: Any, tests: dict[str, Any]) -> dict[str, Any]:
+    """A lead with its verified tests, the rows that failed verification and
+    the reason each failed. Only ``declared_tests`` are declared tests."""
+    return {**asdict(lead),
+            "declared_tests": tests["tests"],
+            "unverified_tests": tests["unverified_tests"],
+            "test_link_problems": tests["link_problems"]}
 
 
 @router.get("/leads/{lead_id}")
@@ -405,22 +457,25 @@ def get_investigation_lead(
     lead_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return a single investigation lead with full detail."""
+    """Return a single investigation lead with its declared tests.
+
+    404 when the lead does not exist; 503 with ``available: false`` when the
+    read failed. The two are different answers.
+    """
     try:
-        from intelligence.sleuth import Sleuth
         from dataclasses import asdict
 
-        engine = get_db_engine()
-        sleuth = Sleuth(engine)
-        lead = sleuth._load_lead(lead_id)
+        from intelligence.sleuth_intersections import read_lead
 
-        if not lead:
-            return {"error": "Lead not found", "lead_id": lead_id}
-
-        return {"lead": asdict(lead)}
+        found = read_lead(get_db_engine(), lead_id)
     except Exception as exc:
         log.warning("Sleuth lead detail failed: {e}", e=str(exc))
-        return {"error": str(exc), "lead_id": lead_id}
+        return _source_unreadable("investigation_leads", exc, lead=None)
+
+    if found is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"available": True,
+            "lead": _lead_with_tests(asdict, found["lead"], found["tests"])}
 
 
 @router.post("/leads/investigate")

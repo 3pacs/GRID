@@ -26,8 +26,8 @@ bcrypt==4.0.1
 beartype==0.23.1
 beautifulsoup4==4.15.0
 bitarray==3.12.3
-boto3==1.43.123
-botocore==1.43.123
+boto3==1.44.9
+botocore==1.44.9
 burner-redis==0.1.7
 cachetools==5.5.2
 cattrs==26.2.1

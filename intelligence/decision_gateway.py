@@ -40,6 +40,10 @@ Inputs:
 
 Rule:
   - If provenance.verdict == 'no_trade' → 'no_trade'
+  - Missing/invalid red-team or stress checks → 'no_trade'.
+  - Invalid supplied pattern confidence → 'no_trade'; an explicitly absent
+    pattern estimate is optional and never described as agreement.
+  - Any failed orchestration check blocks ticket generation.
   - If red_team_risk >= 0.8 → 'no_trade' (LLM vetoed)
   - If stress.robustness_label == 'fragile' AND stress.robustness_score < 0.5
       → downgrade one level (high→medium, medium→low, low→no_trade)
@@ -56,13 +60,13 @@ Rule:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy.engine import Engine
-
 
 # ── Unified verdict helpers (pure, deterministic) ────────────────────────
 
@@ -84,7 +88,7 @@ def combine_verdict(
     pattern_confidence: float | None,
     stress_label: str | None,
     stress_score: float | None,
-    red_team_risk: float,
+    red_team_risk: float | None,
 ) -> tuple[str, list[str]]:
     """Apply the unified verdict rule. Returns (final_verdict, reasons)
     where reasons documents every downgrade applied.
@@ -97,6 +101,18 @@ def combine_verdict(
     if verdict == "no_trade":
         reasons.append("provenance verdict is no_trade")
         return "no_trade", reasons
+
+    # Missing, malformed and nonfinite checks never count as agreement.
+    def valid_probability(value: Any) -> bool:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and 0.0 <= value <= 1.0 and math.isfinite(value))
+
+    if not valid_probability(red_team_risk):
+        return "no_trade", ["red-team risk missing or invalid"]
+    if stress_label not in ("robust", "moderate", "fragile") or not valid_probability(stress_score):
+        return "no_trade", ["counterfactual stress missing or invalid"]
+    if pattern_confidence is not None and not valid_probability(pattern_confidence):
+        return "no_trade", ["pattern confidence invalid"]
 
     if red_team_risk >= 0.8:
         reasons.append(
@@ -129,7 +145,10 @@ def combine_verdict(
         verdict = new_verdict
 
     if not reasons:
-        reasons.append("all conviction layers align with provenance verdict")
+        if pattern_confidence is None or pattern_confidence == 0.0:
+            reasons.append("available checks retain provenance verdict; pattern evidence unavailable")
+        else:
+            reasons.append("all conviction layers align with provenance verdict")
     return verdict, reasons
 
 
@@ -196,9 +215,9 @@ def _run_prediction(engine: Engine, ticker: str, horizon_days: int) -> tuple[Any
         return None, err
 
 
-def _run_red_team(prediction: Any, *, llm_client: Any = None) -> tuple[Any | None, float, str | None]:
+def _run_red_team(prediction: Any, *, llm_client: Any = None) -> tuple[Any | None, float | None, str | None]:
     if prediction is None:
-        return None, 0.0, "skipped — no prediction"
+        return None, None, "skipped — no prediction"
     try:
         from intelligence.llm_red_team import red_team_prediction
 
@@ -221,22 +240,33 @@ def _run_red_team(prediction: Any, *, llm_client: Any = None) -> tuple[Any | Non
             score=float(getattr(prediction, "confidence", 0.0) or 0.0),
             signal_summaries=signal_summaries,
             llm_client=llm_client,
+            strict_scores=True,
         )
-        risk = float(getattr(report, "epistemic_risk_score", 0.0) or 0.0)
-        return report, risk, None
+        # llm_red_team deliberately returns an empty zero-risk report on
+        # outage/parse failure. Zero alone is not evidence of a completed check.
+        counters = getattr(report, "counters", None)
+        if not isinstance(counters, (tuple, list)) or not counters:
+            return report, None, "red-team counterarguments unavailable"
+        risk = getattr(report, "epistemic_risk_score", None)
+        if (isinstance(risk, bool) or not isinstance(risk, (int, float))
+                or not 0.0 <= risk <= 1.0 or not math.isfinite(risk)):
+            return report, None, "red-team risk missing or invalid"
+        return report, float(risk), None
     except Exception as exc:  # noqa: BLE001
         err = f"llm_red_team failed: {exc}"
         log.debug("decision_gateway: {e}", e=err)
-        return None, 0.0, err
+        return None, None, err
 
 
 def _run_provenance(
     engine: Engine,
     prediction: Any,
-    red_team_risk: float,
+    red_team_risk: float | None,
 ) -> tuple[Any | None, str | None]:
     if prediction is None:
         return None, "skipped — no prediction"
+    if red_team_risk is None:
+        return None, "skipped — red-team risk unavailable"
     try:
         from intelligence.signal_provenance import build_provenance_report
         return build_provenance_report(
@@ -259,6 +289,8 @@ def _run_pattern_library(
         report = build_pattern_match_report(engine, ticker=ticker)
         confidence = getattr(report, "confidence_signal", None)
         if confidence is not None:
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+                raise ValueError("pattern confidence must be numeric, not boolean")
             confidence = float(confidence)
         return report, confidence, None
     except Exception as exc:  # noqa: BLE001
@@ -278,6 +310,8 @@ def _run_stress_test(
         label = getattr(report, "robustness_label", None)
         score = getattr(report, "robustness_score", None)
         if score is not None:
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                raise ValueError("stress score must be numeric, not boolean")
             score = float(score)
         return report, label, score, None
     except Exception as exc:  # noqa: BLE001
@@ -368,6 +402,10 @@ def should_i_trade(
         stress_score,
         red_team_risk,
     )
+
+    if stage_errors:
+        unified_verdict = "no_trade"
+        reasons.append("required check failed: " + ", ".join(sorted(stage_errors)))
 
     ticket, err = _run_trade_ticket(
         provenance_report,

@@ -33,6 +33,8 @@ import threading
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Self
+import pytest
+
 from unittest.mock import MagicMock
 
 from scripts import hermes_operator as ho
@@ -248,6 +250,11 @@ class TestSectorHealthDoesNotConsultTheCooldownBlacklist:
 # ─── 4. DB-row protection: snapshot_all_sectors with a fake engine ────────
 
 
+@pytest.fixture(autouse=True)
+def stable_financial_generation(monkeypatch):
+    monkeypatch.setattr("intelligence.sector_health.get_financial_generation", lambda conn: "a" * 32)
+
+
 class _RowcountConn:
     """Fake connection whose upsert result's rowcount is controlled by the
     test (``next_rowcount``), exercising the REAL SQL text/bindparams in
@@ -264,6 +271,10 @@ class _RowcountConn:
         return False
 
     def execute(self, stmt: Any) -> MagicMock:
+        if str(stmt).startswith("SELECT sec_generation"):
+            result = MagicMock()
+            result.scalar_one_or_none.return_value = "a" * 32
+            return result
         compiled = stmt.compile()
         params = dict(compiled.params)
         self._recorder.append(params)
@@ -280,6 +291,8 @@ class _RowcountEngine:
     def begin(self) -> _RowcountConn:
         return _RowcountConn(self.recorded, self._rowcounts)
 
+    connect = begin
+
 
 class TestSnapshotAllSectorsAsOfGuard:
     def test_upsert_sql_has_the_as_of_guard_and_binds_as_of(self, monkeypatch) -> None:
@@ -287,7 +300,7 @@ class TestSnapshotAllSectorsAsOfGuard:
 
         monkeypatch.setattr(
             sh, "compute_sector_health",
-            lambda _engine, name: {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}},
+            lambda _engine, name: {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32},
         )
 
         captured_sql: list[str] = []
@@ -311,6 +324,8 @@ class TestSnapshotAllSectorsAsOfGuard:
             def begin(self) -> _SqlCapturingConn:
                 return _SqlCapturingConn()
 
+            connect = begin
+
         computed_at = datetime(2026, 9, 19, 3, 0, tzinfo=timezone.utc)
         out = sh.snapshot_all_sectors(
             _SqlCapturingEngine(), snapshot_date=date(2026, 9, 19), computed_at=computed_at,
@@ -327,7 +342,7 @@ class TestSnapshotAllSectorsAsOfGuard:
 
         monkeypatch.setattr(
             sh, "compute_sector_health",
-            lambda _engine, name: {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}},
+            lambda _engine, name: {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32},
         )
 
         n = len(SECTOR_MAP)
@@ -344,7 +359,7 @@ class TestSnapshotAllSectorsAsOfGuard:
 
         monkeypatch.setattr(
             sh, "compute_sector_health",
-            lambda _engine, name: {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}},
+            lambda _engine, name: {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32},
         )
 
         engine = _RowcountEngine(rowcounts=[])
@@ -381,7 +396,7 @@ class TestSnapshotAllSectorsAsOfGuard:
             if call_count["n"] == 2:
                 # Simulate attempt 2 starting while attempt 1 is mid-loop.
                 state.sector_health_attempt_token = 2
-            return {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}}
+            return {"score": 60.0, "trend_30d": 0.0, "components": {"stub": True}, "sec_generation": "a" * 32}
 
         monkeypatch.setattr(sh, "compute_sector_health", _compute)
 

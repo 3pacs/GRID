@@ -487,11 +487,18 @@ def _day_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     return packet_root, review_root, digest
 
 
+def successful_ingest(day, review_root, packet_root, **extra):
+    return {"state": "INGESTED", "run_id": 7, "accepted_rows": 4, "rejected_rows": 0,
+            "declared_mismatch": [],
+            "review_sha256": grader.sha256((review_root / day.isoformat() / "review.jsonl").read_bytes()),
+            "packet_sha256": grader.load_packet(packet_root, day).sha256, **extra}
+
+
 def test_grade_day_writes_a_file_the_ingest_accepts_and_hands_it_over(tmp_path, closes, monkeypatch):
     packet_root, review_root, digest = _day_fixture(tmp_path)
     handed = []
     monkeypatch.setattr(grader, "run_ingest", lambda engine, day, rr, pr: handed.append((day, rr, pr)) or
-                        {"state": "INGESTED", "run_id": 7, "accepted_rows": 4, "rejected_rows": 0, "declared_mismatch": []})
+                        successful_ingest(day, rr, pr))
     receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
                                client_factory=lambda: None)
     assert receipt["state"] == "WRITTEN" and receipt["rows"] == 4 and receipt["superseded_previous"] is False
@@ -514,7 +521,7 @@ def test_grade_day_writes_a_file_the_ingest_accepts_and_hands_it_over(tmp_path, 
 def test_grade_day_is_unchanged_when_verdicts_do_not_move_and_rewrites_when_they_do(tmp_path, closes, monkeypatch):
     packet_root, review_root, _ = _day_fixture(tmp_path)
     calls = []
-    monkeypatch.setattr(grader, "run_ingest", lambda *a: calls.append(a) or {"state": "INGESTED"})
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: calls.append(a) or successful_ingest(*a[1:]))
     first = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_EARLY,
                              client_factory=lambda: None)
     assert first["state"] == "WRITTEN" and first["verdicts"] == {"unresolved": 2, "unscorable": 2}
@@ -551,7 +558,7 @@ def test_failed_hand_off_is_retried_on_the_next_unchanged_run(tmp_path, closes, 
     def fake_ingest(*a):
         calls.append(a)
         nxt = next(outcomes)
-        return nxt() if callable(nxt) else nxt
+        return nxt() if callable(nxt) else (successful_ingest(*a[1:], **nxt) if nxt.get("state") == "INGESTED" else nxt)
 
     monkeypatch.setattr(grader, "run_ingest", fake_ingest)
     first = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
@@ -648,13 +655,15 @@ def test_run_ingest_loads_the_sibling_module_and_passes_roots_through(tmp_path, 
         def ingest(engine, day, *, review_root, packet_root):
             seen.update(day=day, review_root=review_root, packet_root=packet_root)
             return {"state": "INGESTED", "run_id": 3, "accepted_rows": 4, "rejected_rows": 0, "declared_mismatch": [],
-                    "receipt_file": "ingest-receipt.json", "extra": "dropped"}
+                    "receipt_file": "ingest-receipt.json", "extra": "dropped",
+                    "review_sha256": "b" * 64, "packet_sha256": "c" * 64}
 
     monkeypatch.setattr(grader, "_ingest_module", lambda: Module)
     out = grader.run_ingest(FakeEngine(), DAY, review_root, packet_root)
     assert seen == {"day": DAY, "review_root": review_root, "packet_root": packet_root}
     assert out == {"state": "INGESTED", "reason": None, "run_id": 3, "accepted_rows": 4, "rejected_rows": 0,
-                   "declared_mismatch": [], "receipt_file": "ingest-receipt.json"}
+                   "declared_mismatch": [], "receipt_file": "ingest-receipt.json",
+                   "review_sha256": "b" * 64, "packet_sha256": "c" * 64}
 
 
 def test_real_ingest_module_is_loadable_by_path():
@@ -680,7 +689,7 @@ def test_lookback_days_end_yesterday():
 
 def test_main_day_and_lookback(tmp_path, closes, monkeypatch, capsys):
     packet_root, review_root, _ = _day_fixture(tmp_path)
-    monkeypatch.setattr(grader, "run_ingest", lambda *a: {"state": "INGESTED", "rejected_rows": 0})
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: successful_ingest(*a[1:]))
     monkeypatch.setattr(grader, "default_client_factory", lambda: None)
     import types
     monkeypatch.setitem(sys.modules, "db", types.SimpleNamespace(get_engine=lambda: FakeEngine()))
@@ -783,12 +792,12 @@ def _judge(text: str, at: datetime):
     return grader.grade_figure(object(), p, stated)
 
 
-def test_intraday_spike_is_confirmed_by_the_captures_around_the_statement(vintages):
+def test_intraday_bracket_only_corroborates_the_statement(vintages):
     # the old reader compared 26.9 with the last completed close (16.61) and refuted a true statement
     _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 21.0, _z(FRI, 15)), (FRI, 26.5, _z(FRI, 18, 30)),
          (FRI, 27.4, _z(FRI, 19, 30)))
     row = _judge("The VIX of 26.9 shows the spike.", _z(FRI, 19))          # 14:00 ET, session open
-    assert row["verdict"] == "confirmed" and row["root_cause"] is None
+    assert row["verdict"] == "partially_confirmed" and row["knowable_at_stated_at"] is None
     assert [e["observed"].split(" ")[0] for e in row["evidence"]] == ["26.5", "27.4"]
 
 
@@ -822,15 +831,16 @@ def test_inside_the_range_without_a_pinning_capture_is_partial(vintages):
          (FRI, 29.0, _z(FRI, 21, 20)))
     _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
     row = _judge("The VIX of 26.9 shows the spike.", _z(FRI, 19))
-    assert row["verdict"] == "partially_confirmed" and "inside the 2026-11-06 range 16-30" in row["root_cause"]
+    assert row["verdict"] == "partially_confirmed" and "inside the session range" in row["root_cause"]
 
 
 def test_a_value_the_market_never_printed_is_refuted_with_evidence(vintages):
     _vix(vintages, (THU, 16.61, _z(FRI, 4)), (FRI, 26.0, _z(FRI, 18)), (FRI, 27.0, _z(FRI, 20)))
     _range(vintages, FRI, 16.0, 30.0, _z(FRI, 21, 20))
     row = _judge("The VIX of 40.1 is a panic.", _z(FRI, 19))
-    assert row["verdict"] == "refuted" and "outside the session range" in row["root_cause"]
-    assert any("range 16-30" in e["observed"] for e in row["evidence"])
+    assert row["verdict"] == "refuted" and "outside the complete" in row["root_cause"]
+    assert any("low 16" in e["observed"] for e in row["evidence"])
+    assert any("high 30" in e["observed"] for e in row["evidence"])
     assert all(e["as_of"] <= grader.iso(GRADED_LATE) for e in row["evidence"])
 
 
@@ -914,7 +924,7 @@ def test_read_vintages_returns_every_accepted_vintage_bounded():
 def test_grade_day_publishes_review_and_receipts_but_not_the_cache(tmp_path, closes, monkeypatch):
     packet_root, review_root, _ = _day_fixture(tmp_path)
     public = tmp_path / "public"
-    monkeypatch.setattr(grader, "run_ingest", lambda *a: {"state": "INGESTED", "run_id": 1})
+    monkeypatch.setattr(grader, "run_ingest", lambda *a: successful_ingest(*a[1:], run_id=1))
     receipt = grader.grade_day(FakeEngine(), DAY, packet_root=packet_root, review_root=review_root, now=GRADED_LATE,
                                client_factory=lambda: None, public_root=public)
     folder = review_root / DAY.isoformat()
@@ -922,6 +932,7 @@ def test_grade_day_publishes_review_and_receipts_but_not_the_cache(tmp_path, clo
     (folder / "extractions").mkdir(exist_ok=True)
     out = public / DAY.isoformat()
     assert receipt["published"]["files"] == ["review.jsonl", "grader-receipt.json"]
+    assert "ingest_confirmation_error" not in receipt and receipt["ingest_confirmation"]["run_id"] == 1
     assert (out / "review.jsonl").read_bytes() == (folder / "review.jsonl").read_bytes()
     assert (out / "review.jsonl").stat().st_mode & 0o777 == 0o644 and out.stat().st_mode & 0o777 == 0o755
     assert public.stat().st_mode & 0o777 == 0o755
@@ -950,3 +961,179 @@ def test_publish_is_skipped_on_dry_run_and_refusal_and_never_follows_a_symlink(t
                                client_factory=lambda: None, ingest=False, public_root=public)
     assert receipt["state"] == "WRITTEN" and receipt["published"]["error"] == "OSError"
     assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("offset", [-30, 0, 30])
+def test_equal_pull_is_not_an_exact_market_time_observation(vintages, offset):
+    at = _z(FRI, 19)
+    _vix(vintages, (FRI, 26.9, at + timedelta(minutes=offset)))
+    row = _judge("The VIX at 26.9 now.", at)
+    assert row["verdict"] == "partially_confirmed"
+    assert row["knowable_at_stated_at"] is None
+    assert row["evidence"][0]["as_of"] == grader.iso(at + timedelta(minutes=offset))
+    assert "market event time unknown" in row["evidence"][0]["observed"]
+
+
+def test_sparse_mismatching_pulls_cannot_refute_a_transient_level(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)), (FRI, 27.0, _z(FRI, 20)))
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable" and row["evidence"] == []
+
+
+def test_previous_close_cannot_confirm_current_intraday_level(vintages):
+    _vix(vintages, (THU, 16.61, _z(THU, 21, 20)))
+    row = _judge("The VIX at 16.61 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable"
+
+
+def test_incomplete_session_range_cannot_refute_later_price(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _range(vintages, FRI, 16.0, 27.0, _z(FRI, 18))
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable"
+
+
+def test_complete_range_refutation_preserves_actual_availability(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _range(vintages, FRI, 16.0, 27.0, _z(FRI, 21, 20))
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "refuted"
+    assert row["knowable_at_stated_at"] is False
+    assert all(e["as_of"] == grader.iso(_z(FRI, 21, 20)) for e in row["evidence"])
+
+
+@pytest.mark.parametrize("mixed", ["source", "retrieval_time"])
+def test_mixed_range_cannot_refute_current_level(vintages, mixed):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _range(vintages, FRI, 16.0, 27.0, _z(FRI, 21, 20))
+    vintages["YF:^VIX:high"] = [_o("YF:^VIX:high", FRI, 27.0,
+        _z(FRI, 21, 21) if mixed == "retrieval_time" else _z(FRI, 21, 20),
+        "another-source" if mixed == "source" else "yfinance")]
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "unscorable"
+
+
+# ── session low/high pairing (#1101 follow-up) ─────────────────────────────────────────
+# yfinance_pull writes each row with its own _utc_now(), so a low and a high from one pull
+# never share a pull_timestamp. They pair on a shared pull_run_id, or, for legacy rows
+# without one, within RANGE_PAIR_TOLERANCE; never across sources.
+
+def _ro(field: str, value: float, pulled: datetime, source: str = "yfinance", run: str | None = None):
+    return Observation(f"YF:^VIX:{field}", FRI, value, pulled, source, pull_run_id=run)
+
+
+def _set_range(table, lows, highs):
+    table["YF:^VIX:low"] = list(lows)
+    table["YF:^VIX:high"] = list(highs)
+
+
+AFTER_CLOSE = _z(FRI, 21, 20)
+
+
+@pytest.mark.parametrize("gap_s, verdict", [(0, "refuted"), (3, "refuted"), (5, "refuted"),
+                                            (6, "unscorable"), (120, "unscorable")])
+def test_legacy_range_pairs_only_within_the_tolerance(vintages, gap_s, verdict):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + timedelta(seconds=gap_s))],
+               [_ro("high", 27.0, AFTER_CLOSE)])
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == verdict
+    if verdict == "refuted":
+        assert row["knowable_at_stated_at"] is False
+        assert all("retrieved within 5 s" in e["observed"] for e in row["evidence"])
+
+
+def test_legacy_rows_3s_apart_partially_confirm_inside_the_range(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, _z(FRI, 18, 30) + timedelta(seconds=3))], [_ro("high", 27.0, _z(FRI, 18, 30))])
+    row = _judge("The VIX at 26.5 now.", _z(FRI, 19))
+    # the bracket rule answers first only when a capture brackets the value; 26.5 is not 26.0
+    assert row["verdict"] == "partially_confirmed" and "inside the session range" in row["root_cause"]
+    assert row["knowable_at_stated_at"] is None
+
+
+@pytest.mark.parametrize("gap_s", [3, 120])
+def test_different_sources_never_pair(vintages, gap_s):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + timedelta(seconds=gap_s), source="cboe")],
+               [_ro("high", 27.0, AFTER_CLOSE)])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_different_sources_never_pair_even_with_the_same_run_id(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE, source="cboe", run="r1")],
+               [_ro("high", 27.0, AFTER_CLOSE, run="r1")])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_shared_run_id_pairs_beyond_the_tolerance(vintages):
+    # a stall inside one pull (advisory-lock wait, split lookup) still pairs on the run id
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + timedelta(seconds=40), run="r1")],
+               [_ro("high", 27.0, AFTER_CLOSE, run="r1")])
+    row = _judge("The VIX at 28.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "refuted" and row["knowable_at_stated_at"] is False
+    assert all("paired: same pull run" in e["observed"] for e in row["evidence"])
+
+
+@pytest.mark.parametrize("low_run, high_run, gap", [("r1", "r2", timedelta(0)),          # two pulls, same instant
+                                                     ("r1", None, timedelta(seconds=1)),  # mixed writer versions
+                                                     (None, "r2", timedelta(seconds=1)),
+                                                     ("r1", "r1", timedelta(minutes=11))])  # stretched id
+def test_run_ids_that_disagree_never_fall_back_to_the_tolerance(vintages, low_run, high_run, gap):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE + gap, run=low_run)],
+               [_ro("high", 27.0, AFTER_CLOSE, run=high_run)])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_the_newest_coherent_pair_is_used_and_a_newer_single_leg_only_widens(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    # pull A wrote both legs after the close; pull B (later) rewrote only the high, at 28.5
+    _set_range(vintages, [_ro("low", 16.0, AFTER_CLOSE, run="A")],
+               [_ro("high", 27.0, AFTER_CLOSE, run="A"), _ro("high", 28.5, AFTER_CLOSE + timedelta(hours=8), run="B")])
+    # 28.0 lies outside pull A's 16-27 but inside what pull B saw trade: not refuted
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+    # 30.0 is outside both: refuted on pull A's coherent pair
+    row = _judge("The VIX at 30.0 now.", _z(FRI, 19))
+    assert row["verdict"] == "refuted"
+    assert all(e["as_of"] == grader.iso(AFTER_CLOSE) for e in row["evidence"])
+
+
+def test_pre_close_pair_can_corroborate_but_never_refute(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 16.0, _z(FRI, 18), run="r1")], [_ro("high", 27.0, _z(FRI, 18), run="r1")])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_inverted_pair_is_ignored(vintages):
+    _vix(vintages, (FRI, 26.0, _z(FRI, 18)))
+    _set_range(vintages, [_ro("low", 30.0, AFTER_CLOSE, run="r1")], [_ro("high", 27.0, AFTER_CLOSE, run="r1")])
+    assert _judge("The VIX at 28.0 now.", _z(FRI, 19))["verdict"] == "unscorable"
+
+
+def test_read_vintages_carries_the_pull_run_id_only_as_a_string():
+    import store.observations as obs_mod
+
+    class Conn:
+        def execute(self, clause, params):
+            self.sql = str(clause)
+
+            class R:
+                @staticmethod
+                def fetchall():
+                    return [(FRI, 16.0, _z(FRI, 21, 20), "yfinance", "abc123"),
+                            (FRI, 16.1, _z(FRI, 21, 21), "yfinance", None),
+                            (FRI, 16.2, _z(FRI, 21, 22), "yfinance", {"not": "a string"}),
+                            (FRI, 16.3, _z(FRI, 21, 23), "yfinance")]          # legacy 4-column fake
+            return R()
+
+    conn = Conn()
+    out = obs_mod.read_vintages(conn, "YF:^VIX:low", start=FRI, end=FRI)
+    assert "raw_payload ->> 'pull_run_id'" in conn.sql
+    assert [o.pull_run_id for o in out] == ["abc123", None, None, None]
+
+
+def test_grader_version_moved_with_the_pairing_rule():
+    assert grader.GRADER_VERSION == "grid/grade_publication_review-v3-range-pairing"

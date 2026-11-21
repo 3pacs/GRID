@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
@@ -20,6 +20,7 @@ from api.schemas.regime import (
     RegimeTransition,
     RegimeTransitionsResponse,
 )
+from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
 router = APIRouter(prefix="/api/v1/regime", tags=["regime"])
 
@@ -52,10 +53,11 @@ def get_weights(_token: str = Depends(require_auth)) -> dict:
     confidence = None
     with engine.connect() as conn:
         row = conn.execute(
-            text(
-                "SELECT inferred_state, state_confidence, counterfactual "
-                "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+            non_provisional_journal_select(
+                "inferred_state", "state_confidence", "counterfactual",
             )
+            .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+            .limit(1)
         ).fetchone()
         if row:
             regime_state = row[0]
@@ -184,14 +186,14 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
 
         if prod is not None:
             latest = conn.execute(
-                text(
-                    "SELECT inferred_state, state_confidence, transition_probability, "
-                    "contradiction_flags, grid_recommendation, baseline_recommendation, "
-                    "decision_timestamp "
-                    "FROM decision_journal "
-                    "WHERE model_version_id = :mid "
-                    "ORDER BY decision_timestamp DESC LIMIT 1"
-                ),
+                non_provisional_journal_select(
+                    "inferred_state", "state_confidence", "transition_probability",
+                    "contradiction_flags", "grid_recommendation", "baseline_recommendation",
+                    "decision_timestamp",
+                )
+                .where(DECISION_JOURNAL.c.model_version_id == bindparam("mid"))
+                .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+                .limit(1),
                 {"mid": prod[0]},
             ).fetchone()
         else:
@@ -200,13 +202,13 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
         # Fall back to most recent journal entry regardless of model
         if latest is None:
             latest = conn.execute(
-                text(
-                    "SELECT inferred_state, state_confidence, transition_probability, "
-                    "contradiction_flags, grid_recommendation, baseline_recommendation, "
-                    "decision_timestamp "
-                    "FROM decision_journal "
-                    "ORDER BY decision_timestamp DESC LIMIT 1"
+                non_provisional_journal_select(
+                    "inferred_state", "state_confidence", "transition_probability",
+                    "contradiction_flags", "grid_recommendation", "baseline_recommendation",
+                    "decision_timestamp",
                 )
+                .order_by(DECISION_JOURNAL.c.decision_timestamp.desc())
+                .limit(1)
             ).fetchone()
 
     if latest is None:
@@ -273,12 +275,14 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
     with engine.connect() as conn:
         # Get the latest entry for each distinct regime state
         rows = conn.execute(
-            text(
-                "SELECT DISTINCT ON (inferred_state) "
-                "inferred_state, state_confidence, transition_probability, "
-                "contradiction_flags, grid_recommendation, decision_timestamp "
-                "FROM decision_journal "
-                "ORDER BY inferred_state, decision_timestamp DESC"
+            non_provisional_journal_select(
+                "inferred_state", "state_confidence", "transition_probability",
+                "contradiction_flags", "grid_recommendation", "decision_timestamp",
+            )
+            .distinct(DECISION_JOURNAL.c.inferred_state)
+            .order_by(
+                DECISION_JOURNAL.c.inferred_state,
+                DECISION_JOURNAL.c.decision_timestamp.desc(),
             )
         ).fetchall()
 
@@ -360,13 +364,20 @@ def get_synthesis(_token: str = Depends(require_auth)) -> dict:
     # Gather all regime data
     with engine.connect() as conn:
         regime_rows = conn.execute(
-            text(
-                "SELECT DISTINCT ON (inferred_state) "
-                "inferred_state, state_confidence, grid_recommendation "
-                "FROM decision_journal "
-                "ORDER BY inferred_state, decision_timestamp DESC"
+            non_provisional_journal_select(
+                "inferred_state", "state_confidence", "grid_recommendation",
+            )
+            .distinct(DECISION_JOURNAL.c.inferred_state)
+            .order_by(
+                DECISION_JOURNAL.c.inferred_state,
+                DECISION_JOURNAL.c.decision_timestamp.desc(),
             )
         ).fetchall()
+        if not regime_rows:
+            raise HTTPException(
+                status_code=503,
+                detail="No non-provisional regime readings available",
+            )
 
         # Top movers
         mover_rows = conn.execute(
