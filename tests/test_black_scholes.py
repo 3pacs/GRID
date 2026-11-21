@@ -25,7 +25,9 @@ from physics.greeks.black_scholes import (
     delta,
     gamma,
     speed,
+    theta,
     vanna,
+    vega,
     vomma,
     zomma,
 )
@@ -284,3 +286,48 @@ def test_vectorized_charm_matches_scalar():
     for i, s in enumerate(S_arr):
         scalar_val = charm(float(s), K0, T0, R0, SIG0, Q0, True)
         assert vec_charm[i] == pytest.approx(scalar_val, abs=1e-12)
+
+
+# ── vega and theta (added 2026-11-21) ────────────────────────────────
+
+
+def _price(S, K, T, r, sigma, q, is_call):
+    """Closed-form Black-Scholes price with math.erf, independent of the module under test."""
+    cdf = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    d1_ = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2_ = d1_ - sigma * math.sqrt(T)
+    if is_call:
+        return S * math.exp(-q * T) * cdf(d1_) - K * math.exp(-r * T) * cdf(d2_)
+    return K * math.exp(-r * T) * cdf(-d2_) - S * math.exp(-q * T) * cdf(-d1_)
+
+
+@pytest.mark.parametrize(("S", "K", "T", "r", "sigma", "q"), [
+    (100.0, 100.0, 0.25, 0.05, 0.20, 0.0), (733.0, 700.0, 0.08, 0.04, 0.25, 0.012),
+    (70.0, 75.0, 1.1, 0.04, 0.18, 0.03), (250.0, 180.0, 0.02, 0.05, 0.60, 0.0),
+])
+@pytest.mark.parametrize("is_call", [True, False])
+def test_vega_and_theta_match_finite_differences_of_the_price(S, K, T, r, sigma, q, is_call):
+    h_sigma, h_t = 1e-5, 1e-6
+    fd_vega = (_price(S, K, T, r, sigma + h_sigma, q, is_call) - _price(S, K, T, r, sigma - h_sigma, q, is_call)) / (2 * h_sigma)
+    # theta is the change per year as calendar time passes, i.e. as T shrinks.
+    fd_theta = (_price(S, K, T - h_t, r, sigma, q, is_call) - _price(S, K, T + h_t, r, sigma, q, is_call)) / (2 * h_t)
+    assert vega(S, K, T, r, sigma, q) == pytest.approx(fd_vega, rel=1e-6, abs=1e-8)
+    assert theta(S, K, T, r, sigma, q, is_call=is_call) == pytest.approx(fd_theta, rel=1e-5, abs=1e-7)
+
+
+def test_vega_and_theta_reference_scenario_and_shapes():
+    assert vega(S0, K0, T0, R0, SIG0, Q0) == pytest.approx(19.644000472368965, abs=1e-9)
+    assert theta(S0, K0, T0, R0, SIG0, Q0) == pytest.approx(-10.474151034, abs=1e-6)
+    assert isinstance(vega(S0, K0, T0, R0, SIG0), float) and isinstance(theta(S0, K0, T0, R0, SIG0), float)
+    strikes = np.array([90.0, 100.0, 110.0])
+    both = theta(S0, strikes, T0, R0, SIG0, 0.0, is_call=np.array([True, False, True]))
+    assert both.shape == (3,) and vega(S0, strikes, T0, R0, SIG0).shape == (3,)
+    assert both[1] == pytest.approx(theta(S0, 100.0, T0, R0, SIG0, is_call=False))
+    assert vega(S0, strikes, T0, R0, SIG0)[1] == pytest.approx(vega(S0, 100.0, T0, R0, SIG0))
+
+
+def test_vega_and_theta_are_zero_for_unusable_inputs():
+    for bad in ((S0, K0, 0.0, R0, SIG0), (S0, K0, T0, R0, 0.0), (0.0, K0, T0, R0, SIG0), (S0, 0.0, T0, R0, SIG0)):
+        assert vega(*bad) == 0.0 and theta(*bad) == 0.0
+    out = vega(S0, K0, np.array([0.0, T0]), R0, SIG0)
+    assert out[0] == 0.0 and out[1] > 0 and not np.isnan(out).any()

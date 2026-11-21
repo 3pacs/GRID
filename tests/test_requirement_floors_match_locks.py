@@ -18,13 +18,16 @@ from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements.txt"
+# Each lock with the Python versions it is installed under (deploy/CI), so
+# requirement markers such as python_version are evaluated per version.
 LOCKS = [
-    ROOT / "deploy" / "python314" / "constraints-3.14.txt",
-    ROOT / "ci" / "py_floor" / "constraints-exact-minimum.txt",
+    (ROOT / "deploy" / "python314" / "constraints-3.14.txt", ("3.14",)),
+    (ROOT / "ci" / "py_floor" / "constraints-exact-minimum.txt", ("3.10", "3.11")),
 ]
 
 
-def _requirements(path: Path) -> dict[str, Requirement]:
+def _requirements(path: Path, python_version: str) -> dict[str, Requirement]:
+    """Requirements whose markers apply on ``python_version``."""
     out: dict[str, Requirement] = {}
     for raw in path.read_text().splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -33,6 +36,8 @@ def _requirements(path: Path) -> dict[str, Requirement]:
         try:
             req = Requirement(line)
         except InvalidRequirement:
+            continue
+        if req.marker is not None and not req.marker.evaluate({"python_version": python_version}):
             continue
         out[canonicalize_name(req.name)] = req
     return out
@@ -54,11 +59,15 @@ def _pins(path: Path) -> dict[str, Version]:
     return out
 
 
-@pytest.mark.parametrize("lock", LOCKS, ids=lambda p: p.name)
-def test_every_lock_pin_satisfies_requirements(lock: Path) -> None:
+@pytest.mark.parametrize(
+    ("lock", "python_version"),
+    [(lock, py) for lock, versions in LOCKS for py in versions],
+    ids=lambda v: v.name if isinstance(v, Path) else v,
+)
+def test_every_lock_pin_satisfies_requirements(lock: Path, python_version: str) -> None:
     if not lock.exists():
         pytest.skip(f"{lock} not present")
-    reqs = _requirements(REQUIREMENTS)
+    reqs = _requirements(REQUIREMENTS, python_version)
     pins = _pins(lock)
     bad = [
         f"{name}=={pins[name]} not in requirements.txt '{reqs[name].specifier}'"
@@ -69,7 +78,13 @@ def test_every_lock_pin_satisfies_requirements(lock: Path) -> None:
 
 
 def test_parser_reads_the_real_files() -> None:
-    reqs = _requirements(REQUIREMENTS)
-    pins = _pins(LOCKS[0])
+    reqs = _requirements(REQUIREMENTS, "3.14")
+    pins = _pins(LOCKS[0][0])
     assert "boto3" in reqs and "boto3" in pins
     assert len(set(reqs) & set(pins)) >= 10
+
+
+def test_markers_pick_the_line_for_each_python() -> None:
+    # requirements.txt splits edgartools by python_version: 3.10 keeps 5.x.
+    assert str(_requirements(REQUIREMENTS, "3.10")["edgartools"].specifier) == ">=4.6.3"
+    assert str(_requirements(REQUIREMENTS, "3.14")["edgartools"].specifier) == ">=6.3.0"

@@ -329,3 +329,263 @@ def test_a_state_record_that_changes_after_declaration_abandons_the_run(tmp_path
     with pytest.raises(X.RunFileError, match="changed between"):
         X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
     assert json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])["kind"] == lse.FACTORY_ABANDONED
+
+
+def _rescale(root, sym, price=1.0, volume=1.0):
+    p = root / "prices" / f"{sym}.csv"
+    df = pd.read_csv(p)
+    df[["open", "close", "high", "low", "adjOpen", "adjClose", "adjHigh", "adjLow"]] *= price
+    df[["volume", "adjVolume"]] = (df[["volume", "adjVolume"]] * volume).round()
+    df.to_csv(p, index=False)
+
+
+def test_floors_default_to_the_constants_and_a_run_file_may_set_them(tmp_path):
+    build(tmp_path, n_days=120)
+    _rescale(tmp_path, "S0N00", price=0.03)                     # about $3 a share, $6M a day
+    _rescale(tmp_path, "S0N01", volume=0.0025)                  # about $100 a share, $0.5M a day
+    body = {**RUN, "last_session": "2015-05-29"}
+    default = X.RunFile.from_dict(body)
+    assert (default.min_price, default.min_dollar_volume) == (X.MIN_PRICE, X.MIN_DOLLAR_VOLUME) == (5.0, 10e6)
+    panel = X.load_panel(tmp_path, default)
+    at = {c: j for j, c in enumerate(panel.cols)}
+    assert not panel.base[:, at["S0N00"]].any() and not panel.base[:, at["S0N01"]].any() and panel.base[:, at["S0N02"]].any()
+
+    low = X.RunFile.from_dict({**body, "min_price": 2, "min_dollar_volume": 250_000})
+    wide = X.load_panel(tmp_path, low)
+    assert wide.base[:, at["S0N00"]].any() and wide.base[:, at["S0N01"]].any()
+    others = [j for c, j in at.items() if c not in ("S0N00", "S0N01")]
+    np.testing.assert_array_equal(wide.base[:, others], panel.base[:, others])   # a floor moves only the names near it
+    price_only = X.load_panel(tmp_path, X.RunFile.from_dict({**body, "min_price": 2.0}))
+    assert price_only.base[:, at["S0N00"]].sum() == 0           # $6M a day is still under the default $10M
+    assert X.load_panel(tmp_path, X.RunFile.from_dict({**body, "min_price": 2.0, "min_dollar_volume": 5e6})).base[:, at["S0N00"]].any()
+
+    # the report names the floors only when the run file set them, so a run on the defaults reads as it did before
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    assert "floors" not in rep["coverage"]
+    low_body = {**body, "run_id": "xs-low", "min_price": 2, "min_dollar_volume": 250_000}
+    rep2 = X.run(write_run(tmp_path, low_body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path, "l2"), tmp_path / "out2")
+    assert rep2["coverage"]["floors"] == {"min_price": 2, "min_dollar_volume": 250_000, "dollar_volume_window": 21}
+
+
+@pytest.mark.parametrize("change", [
+    {"min_price": 0.5}, {"min_price": True}, {"min_price": "5"}, {"min_price": float("nan")}, {"min_price": None},
+    {"min_dollar_volume": 10}, {"min_dollar_volume": 1e12}, {"min_dollar_volume": [1e6]},
+])
+def test_floors_it_refuses(change):
+    with pytest.raises(X.RunFileError, match="min_"):
+        X.RunFile.from_dict({**RUN, **change})
+
+
+def test_a_store_with_no_sector_labels_ranks_pooled_and_refuses_anything_that_needs_a_sector(tmp_path):
+    build(tmp_path, n_days=120)
+    body = {**RUN, "last_session": "2015-05-29", "rankings": ["pooled"]}
+    run = X.RunFile.from_dict(body)
+    state = X.load_state(tmp_path / "state.db")
+    labelled = X.load_panel(tmp_path, run)
+    with_labels = X.evaluate(labelled, run, X.state_arrays(labelled, state))
+
+    (tmp_path / "sectors.csv").write_text("Symbol,GICS Sector\n")          # the header alone: no labels
+    panel = X.load_panel(tmp_path, run)
+    assert panel.sectors == [] and (panel.sector == -1).all()
+    assert panel.assignment == {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None,
+                                "placed_by_correlation": 0, "unplaced": len(panel.cols)}
+    np.testing.assert_array_equal(panel.base, labelled.base)
+    states = X.state_arrays(panel, state)
+    without = X.evaluate(panel, run, states)
+    assert set(without) == set(with_labels) == {"on21|pooled|q20|overnight", "mom63|pooled|q20|close_1d"}
+    for tid in without:                                                      # a pooled ranking never read a sector
+        np.testing.assert_array_equal(without[tid]["gross"], with_labels[tid]["gross"])
+        np.testing.assert_array_equal(without[tid]["turnover"], with_labels[tid]["turnover"])
+
+    night = X.RunFile.from_dict({**body, "gates_chosen_after_seeing": False,   # a gate on the night still works
+                                 "signals": [{**RUN["signals"][0], "gate": {"market_phase": ["rising, slowing"]}}]})
+    g = X.evaluate(panel, night, states)["on21|pooled|q20|overnight"]["gross"]
+    assert 20 < (~np.isnan(g)).sum() < (~np.isnan(without["on21|pooled|q20|overnight"]["gross"])).sum()
+
+    for change, word in (
+        ({"rankings": ["pooled", "within_sector"]}, "within_sector ranking"),
+        ({"gates_chosen_after_seeing": False, "signals": [{**RUN["signals"][0], "gate": {"groups": ["growth"]}}]}, "gate groups on signal on21"),
+        ({"gates_chosen_after_seeing": False, "signals": [{**RUN["signals"][0], "gate": {"sector_leading": True}}]}, "gate sector_leading"),
+        ({"signals": [{"name": "sm", "kind": "sector_momentum", "lookback": 63, "horizons": ["close_1d"]}]}, "signal sm"),
+    ):
+        with pytest.raises(X.RunFileError, match=f"no sector labels.*{word}"):
+            X.load_panel(tmp_path, X.RunFile.from_dict({**body, **change}))
+    assert run.sector_uses() == [] and X.RunFile.from_dict(RUN).sector_uses() == ["the within_sector ranking"]
+
+    ledger = ledger_at(tmp_path)
+    declared = len((tmp_path / "l.jsonl").read_text().splitlines())
+    with pytest.raises(X.RunFileError, match="must be a completed export"):   # refused before anything is declared
+        X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    assert len((tmp_path / "l.jsonl").read_text().splitlines()) == declared and not (tmp_path / "out").exists()
+    sealed = X.seal_export(tmp_path, discovery_first_session="2015-03-02", source={"provider": "synthetic"})
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    assert rep["coverage"]["panel_export"]["generation"] == sealed["generation"]
+    assert rep["trial_count"] == 2 and rep["coverage"]["sector_assignment"]["labels"] == "none"
+    assert any("no sector labels" in limit for limit in rep["known_limits"])
+    assert not any("today's" in limit for limit in rep["known_limits"])
+    for c in rep["cards"].values():
+        assert "market_phase" in c and "sector" not in c and "group" not in c
+    assert "Development ranking only" in (tmp_path / "out" / "report.md").read_text()
+    refused = write_run(tmp_path, {**body, "run_id": "xs-needs-sectors", "rankings": ["within_sector"]})
+    with pytest.raises(X.RunFileError, match="no sector labels"):          # found on load, so the declared run is closed
+        X.run(refused, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out-refused")
+    assert json.loads((tmp_path / "l.jsonl").read_text().splitlines()[-1])["kind"] == lse.FACTORY_ABANDONED
+    assert lse.factory_open_run(ledger) is None
+
+
+def test_a_labelled_store_reports_its_sector_limit_as_before(tmp_path):
+    build(tmp_path, n_days=120)
+    rep = X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    assert rep["known_limits"][1].startswith("sector labels are today's") and "labels" not in rep["coverage"]["sector_assignment"]
+    assert "panel_export" not in rep["coverage"] and "panel_export" not in json.loads((tmp_path / "out" / "data-manifest.json").read_text())
+
+
+def test_a_members_row_longer_than_the_csv_default_field_limit_loads(tmp_path):
+    build(tmp_path, n_days=120)
+    run = X.RunFile.from_dict({**RUN, "last_session": "2015-05-29"})
+    before = X.load_panel(tmp_path, run)
+    with open(tmp_path / "members.csv", newline="") as fh:
+        date, tickers = list(csv.reader(fh))[1]
+    absent = ",".join(f"US{n:012d}" for n in range(10_000))               # ids with no price file: 150,000 characters
+    with open(tmp_path / "members.csv", "w", newline="") as fh:
+        csv.writer(fh).writerows([["date", "tickers"], [date, f"{tickers},{absent}"]])
+    assert len(f"{tickers},{absent}") > csv.field_size_limit() == 131_072
+    after = X.load_panel(tmp_path, run)
+    np.testing.assert_array_equal(after.member, before.member)
+    np.testing.assert_array_equal(after.base, before.base)
+    assert csv.field_size_limit() == 131_072                              # the wider limit does not outlive the read
+
+
+def _ledger_lines(root, name="l"):
+    return (root / f"{name}.jsonl").read_text().splitlines()
+
+
+def test_an_export_binds_its_manifest_and_its_discovery_start_before_the_run_is_declared(tmp_path):
+    body = {**RUN, "last_session": "2015-05-29", "rankings": ["pooled"]}
+    # a store whose export says discovery starts 2016-01-04 refuses any earlier window, and declares nothing
+    late = tmp_path / "late"
+    late.mkdir()
+    build(late, n_days=120)
+    (late / "sectors.csv").write_text("Symbol,GICS Sector\n")
+    X.seal_export(late, discovery_first_session="2016-01-04", source={"provider": "synthetic"})
+    ledger = ledger_at(late)
+    before = _ledger_lines(late)
+    with pytest.raises(X.RunFileError, match="discovery on this export starts 2016-01-04; the run file's window starts 2015-03-02"):
+        X.run(write_run(late, body), late, late / "state.db", ledger, late / "out")
+    assert _ledger_lines(late) == before and not (late / "out").exists()
+
+    root = tmp_path / "store"
+    root.mkdir()
+    build(root, n_days=120)
+    sealed = X.seal_export(root, discovery_first_session="2015-04-01", source={"provider": "synthetic", "start": "2015-01-02"})
+    assert sealed["complete"] is True and sealed["generation"].startswith("g-") and len(sealed["files"]) == 63
+    with pytest.raises(FileExistsError):                                    # an export is sealed once
+        X.seal_export(root, discovery_first_session="2015-04-01", source={})
+    ledger = ledger_at(root)
+    before = _ledger_lines(root)
+    with pytest.raises(X.RunFileError, match="starts 2015-04-01"):          # one session early is still early
+        X.run(write_run(root, {**body, "first_session": "2015-03-31"}), root, root / "state.db", ledger, root / "early")
+    assert _ledger_lines(root) == before
+    rep = X.run(write_run(root, {**body, "first_session": "2015-04-01"}), root, root / "state.db", ledger, root / "out")
+    man = json.loads((root / "out" / "data-manifest.json").read_text())
+    raw = (root / X.EXPORT_MANIFEST).read_bytes()
+    import hashlib
+    assert man["panel_export"] == {"file": "panel-manifest.json", "sha256": hashlib.sha256(raw).hexdigest(),
+                                   "generation": sealed["generation"], "discovery_first_session": "2015-04-01"}
+    assert rep["coverage"]["panel_export"] == {k: man["panel_export"][k] for k in ("generation", "discovery_first_session", "sha256")}
+    declared = json.loads(_ledger_lines(root)[-2])                          # the declaration carries the bound manifest
+    assert declared["kind"] == lse.FACTORY_DECLARED and declared["data_manifest_sha256"] == X.digest(man)
+    with pytest.raises(X.RunFileError, match="must be a day"):
+        X.seal_export(late, discovery_first_session="2016-1-4", source={})
+
+
+def test_a_directory_that_is_not_the_export_its_manifest_describes_is_refused_before_declaration(tmp_path):
+    build(tmp_path, n_days=120)
+    X.seal_export(tmp_path, discovery_first_session="2015-03-02", source={"provider": "synthetic"})
+    ledger = ledger_at(tmp_path)
+    body = write_run(tmp_path, {**RUN, "last_session": "2015-05-29"})
+    before = _ledger_lines(tmp_path)
+    manifest_path, price = tmp_path / X.EXPORT_MANIFEST, tmp_path / "prices" / "S0N03.csv"
+    sealed_text, price_bytes = manifest_path.read_text(), price.read_bytes()
+    sealed = json.loads(sealed_text)
+
+    def refused(match):
+        with pytest.raises(X.RunFileError, match=match):
+            X.run(body, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+        assert _ledger_lines(tmp_path) == before and not (tmp_path / "out").exists()
+
+    price.write_bytes(price_bytes.replace(b"2000000", b"2000001", 1))       # one file replaced in place
+    refused(r"not the export its manifest describes: 1 file\(s\) differ, first \['prices/S0N03.csv'\]")
+    price.write_bytes(price_bytes)
+    (tmp_path / "prices" / "EXTRA.csv").write_bytes(price_bytes)            # a file the export never listed
+    refused("1 file")
+    (tmp_path / "prices" / "EXTRA.csv").unlink()
+    price.unlink()                                                          # a listed file gone
+    refused("1 file")
+    price.write_bytes(price_bytes)
+    for change, match in (({"complete": False}, "not a completed export"), ({"schema": "something-else/1"}, "not a completed export"),
+                          ({"generation": "g-0000000000000000"}, "own generation id"),
+                          ({"discovery_first_session": "2015-01-02"}, "own generation id"),   # edited without a new id
+                          ({"extra": 1}, "own generation id")):
+        manifest_path.write_text(json.dumps({**sealed, **change}))
+        refused(match)
+    manifest_path.write_text("not json")
+    refused("cannot be read")
+    manifest_path.write_text(sealed_text)
+    rep = X.run(body, tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")   # restored, the export runs
+    assert rep["coverage"]["panel_export"]["generation"] == sealed["generation"]
+
+
+@pytest.mark.parametrize("change", ["replace", "add", "remove", "members", "sectors"])
+def test_an_input_file_that_changes_after_declaration_abandons_the_run(tmp_path, monkeypatch, change):
+    build(tmp_path, n_days=120)
+    if change in ("add", "remove"):
+        X.seal_export(tmp_path, discovery_first_session="2015-03-02", source={"provider": "synthetic"})   # holds for an export too
+    ledger = ledger_at(tmp_path)
+    real = lse.record_factory_declared
+
+    def declare_then_change(*a, **k):
+        out = real(*a, **k)
+        price = tmp_path / "prices" / "S1N07.csv"
+        if change == "replace":                                             # a new version of one file under the same name
+            price.write_bytes(price.read_bytes().replace(b"2000000", b"2000001", 1))
+        elif change == "add":
+            (tmp_path / "prices" / "ZZNEW.csv").write_bytes(price.read_bytes())
+        elif change == "remove":
+            price.unlink()
+        elif change == "members":
+            (tmp_path / "members.csv").write_text("date,tickers\n2014-01-02,S0N00\n")
+        else:
+            (tmp_path / "sectors.csv").write_text("Symbol,GICS Sector\nS0N00,Energy\n")
+        return out
+
+    monkeypatch.setattr(lse, "record_factory_declared", declare_then_change)
+    with pytest.raises(X.RunFileError, match="changed between the run's declaration and its read"):
+        X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    assert json.loads(_ledger_lines(tmp_path)[-1])["kind"] == lse.FACTORY_ABANDONED and lse.factory_open_run(ledger) is None
+    assert not (tmp_path / "out" / "report.json").exists()
+
+
+def test_the_universe_uses_the_store_s_sessions_and_the_adjusted_bar_checks(tmp_path):
+    days, _ = build(tmp_path, n_days=120)
+    floors = {"min_session_bars": 40, "min_price": 5.0, "min_dollar_volume": 10e6}
+    whole = X.universe(tmp_path, **floors)
+    gap, bad = 60, 80
+    for sym, edit in (("S0N02", lambda df: df[df["date"] != days[gap]]),                      # no bar on one session
+                      ("S0N03", lambda df: df.assign(adjClose=df["adjClose"].where(df["date"] != days[bad], 0.0)))):   # a zero adjusted close
+        df = pd.read_csv(tmp_path / "prices" / f"{sym}.csv")
+        edit(df).to_csv(tmp_path / "prices" / f"{sym}.csv", index=False)
+    u = X.universe(tmp_path, **floors)
+    at = {c: j for j, c in enumerate(u.cols)}
+    assert u.sessions == whole.sessions == days                             # the session calendar is the store's, not one stock's
+    a, b = at["S0N02"], at["S0N03"]
+    # the stock's own previous row (session gap-1) closed above the floor, but the session before gap+1 has no bar: out
+    assert whole.base[gap:gap + 2, a].all() and not u.base[gap, a] and not u.base[gap + 1, a] and u.base[gap + 2, a]
+    assert whole.base[bad, b] and not u.base[bad, b] and u.base[bad + 1, b]   # the adjusted bar is checked like the raw one
+    others = [j for c, j in at.items() if c not in ("S0N02", "S0N03")]
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+    run = X.RunFile.from_dict({**RUN, "last_session": "2015-05-29"})
+    panel = X.load_panel(tmp_path, run)                                     # the run's universe is this one, by construction
+    np.testing.assert_array_equal(panel.base, u.base)
+    assert panel.sessions == u.sessions and panel.cols == u.cols
+    assert np.isnan(panel.cc[bad, b]) and np.isnan(panel.cc[bad + 1, b]) and np.isnan(panel.cc[gap + 1, a])

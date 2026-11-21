@@ -33,6 +33,9 @@ Environment=PYTHONUNBUFFERED=1
 Environment=DESK_RECEIPTS_DIR=/data/grid_ledgers/desk-receipts
 Environment=DESK_FACTORY_LEDGER=/data/grid_ledgers/factory/ledger/grid-module-factory.jsonl
 Environment=DESK_FACTORY_ANCHOR=/data/grid_ledgers/factory/anchor/grid-module-factory.anchors.jsonl
+# The live trial ledger (gex-signals), opened read-only. The copy running since 2026-11-19 predates this
+# line: it takes effect when the owner moves the unit to a pinned checkout that has the source (#1162).
+Environment=DESK_PANEL_TRIALS_DB=/data/agent-home/anikdang/gex-signals-data/signals.db
 Environment=DESK_RECEIPTS_PYTHON=/data/grid_v4/grid_venv-314/bin/python
 ExecStart=/usr/bin/flock -n /tmp/grid-desk-receipts.lock /bin/bash @CODE@/scripts/desk_receipts_run.sh
 TimeoutStartSec=10min

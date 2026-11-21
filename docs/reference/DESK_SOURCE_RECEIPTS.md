@@ -68,6 +68,51 @@ source returned. `ReceiptLog.payload(sha)` returns those bytes after re-hashing 
 | `factory_ledger` | One stable read of the module-factory ledger and its anchor (two passes that agree), then `verify(full=True)` and `summarize()` on those bytes only | Ledger id, head hash, file hashes, `summarize()`: all of one version |
 | `sleuth_leads` | Leads with `origin = 'intersection'` created in the 60 days up to the cutoff, with their tests, in one database snapshot | The rows, sorted by id, each with `declared_tests` (verified only), `unverified_tests` and `test_link_problems` |
 | `thesis_log` | Nothing: no log exists | None. Recorded as `unknown` on every receipt until #1165 lands |
+| `panel_trials` (version 2 receipts only) | gex-signals' live trial ledger (`signals.db`, read-only, one transaction): the `panel_trials` chain and the stored looks of factory slots (`factory_looks`) | Chain head, row count, every row hash, trials per family, each `panel-factory` slot's registration hash, and for each stored look its time, last day and the sha256 of its exact stored text |
+
+### Receipt versions
+
+A receipt without `receipt_version` is version 1: the three original sources, the shape the
+first consumer reads strictly. With `--panel-trials-db` the receipt carries
+`"receipt_version": 2` and a fourth source, `panel_trials`. Without the option the receipt
+is version 1 exactly as before: the new source is not added as `unknown`, it is not there.
+`verify` refuses a version 1 receipt that carries the new source, a version 2 receipt
+without it, and any other version number. One log can hold both (tested: version 1, then
+2, then 1 again). A consumer that only knows version 1 should refuse, or skip, any receipt
+with `receipt_version`.
+
+### What `panel_trials` is for, and its limits
+
+It is the off-host witness of the live record that #1162 asks for. A slot's exported verdict
+is joined to a receipt on the slot's registration hash and the stored look's digest, time
+and last day (`ledger_steered_exploration.witness_factory_verdicts`); the chain head is
+only where the chain stood.
+
+- **The proof is limited** (`proof: row_links_only`): each row links to the one before it.
+  A row's hash is not recomputed from its fields; that recipe is gex-signals'
+  (`panel.verify_trials`) and is not copied here.
+- **History may only be added to, for trials and for looks.** The source compares what it
+  reads with the last payload the log holds (read back as the bytes its hash names). The
+  trial rows read then must still be the first rows now, and every stored look read then
+  must still be there with the same time, last day and exact text. A look that is gone or
+  changed is `unknown` for the session even when no trial row moved; so is a set of factory
+  tables that has gone away. `continuity` in the payload says which check was made
+  (`first_read`, `extends_last_receipt`, or `not_checked` when the source was asked without
+  a log to compare with).
+- **Registrations are bound by content, not only by hash.** The payload keeps a digest of
+  every registration row's contents (`trials`: the registration columns named in
+  `TRIAL_CONTENT_COLUMNS`, canonical JSON, sha256) and each factory slot's exact parameter
+  text. The next receipt must find every one unchanged; a registration whose time,
+  parameters or any other registration column was changed under an unchanged row hash is
+  `unknown`. What a row held before any receipt first read it is not known.
+- **The look itself is in the payload**: its exact stored text beside the text's sha256, so
+  a consumer recomputes the digest and reads the look's own verdict and numbers from the
+  receipt, not from an export.
+- **The factory tables come as a set.** `factory_looks_table` is `absent` on a database
+  from before the factory and `present` when all of `FACTORY_TABLES` are there. Any other
+  layout, the looks table alone included, is `unknown` (an incomplete generation). A look
+  must belong to a registered `panel-factory` slot.
+- It is a nightly reading: a change made and undone between two closes is not seen.
 
 ## Rules
 
@@ -255,4 +300,11 @@ journalctl --user -u grid-desk-receipts -n 40
 - A receipt is not the native Factory report, not a research-disposition thesis row
   (#1165) and not a live Factory slot (#1161/#1162). Those stay unknown or not supplied.
 - The Desk brief does not read receipts yet. That adapter is in the consumer lane.
-- Live factory slots (#1161) are not a source yet; they do not exist.
+- The `panel_trials` source is in the code but not in the running copy, which is pinned to
+  an earlier commit and writes version 1 receipts. Version 2 starts when the owner moves the
+  unit to a new pinned checkout whose unit sets `DESK_PANEL_TRIALS_DB` (the template does).
+- The evening check on grid-svr treats any unknown source other than `thesis_log` as a
+  failure. That is the wanted behaviour for `panel_trials` once it is on.
+- The consumer of receipts must learn `receipt_version` before version 2 receipts are read
+  into a brief.
+- No factory slot is registered (0 of 10), so the slots and looks in the payload are empty.
