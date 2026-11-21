@@ -288,6 +288,47 @@ def gamma(S, K, T, r, sigma, q: float = 0.0):
     return math.exp(-q_f * T_safe) * _norm_pdf_scalar(d1_val) / (S_f * sigma_f * sqrt_T)
 
 
+def _vega_theta(S, K, T, r, sigma, q, is_call):
+    """(vega, theta) as float64 arrays; 0.0 where T, sigma or S is not positive. Requires numpy."""
+    S_, K_, T_, r_, sigma_, q_ = _as_array(S, K, T, r, sigma, q)
+    bad = (T_ <= 0) | (sigma_ <= 0) | (S_ <= 0) | (K_ <= 0)
+    T_safe = _np.maximum(T_, T_MIN)
+    sigma_safe = _np.where(sigma_ > 0, sigma_, 1.0)
+    S_safe = _np.where(S_ > 0, S_, 1.0)
+    K_safe = _np.where(K_ > 0, K_, 1.0)
+    sqrt_T = _np.sqrt(T_safe)
+    d1_val = (_np.log(S_safe / K_safe) + (r_ - q_ + 0.5 * sigma_safe ** 2) * T_safe) / (sigma_safe * sqrt_T)
+    d2_val = d1_val - sigma_safe * sqrt_T
+    carry_S = S_safe * _np.exp(-q_ * T_safe)
+    disc_K = K_safe * _np.exp(-r_ * T_safe)
+    pdf = _np.exp(-0.5 * d1_val * d1_val) / _SQRT_2PI
+    decay = -carry_S * pdf * sigma_safe / (2.0 * sqrt_T)
+    call = decay - r_ * disc_K * _norm_cdf(d2_val) + q_ * carry_S * _norm_cdf(d1_val)
+    put = decay + r_ * disc_K * _norm_cdf(-d2_val) - q_ * carry_S * _norm_cdf(-d1_val)
+    theta_val = _np.where(_np.asarray(is_call, dtype=bool), call, put)
+    return _np.where(bad, 0.0, carry_S * pdf * sqrt_T), _np.where(bad, 0.0, theta_val)
+
+
+def vega(S, K, T, r, sigma, q: float = 0.0):
+    """Option vega = dPrice/dSigma, per 1.00 of volatility (same for call and put).
+
+    vega = S * e^(-qT) * n(d1) * sqrt(T). Divide by 100 for one volatility point.
+    """
+    out = _vega_theta(S, K, T, r, sigma, q, True)[0]
+    return out if _any_array(S, K, T, r, sigma, q) else float(out)
+
+
+def theta(S, K, T, r, sigma, q: float = 0.0, is_call=True):
+    """Option theta = dPrice/dt, per YEAR of calendar time (negative for decay).
+
+    call: -S e^(-qT) n(d1) sigma / (2 sqrt(T)) - r K e^(-rT) N(d2) + q S e^(-qT) N(d1)
+    put:  -S e^(-qT) n(d1) sigma / (2 sqrt(T)) + r K e^(-rT) N(-d2) - q S e^(-qT) N(-d1)
+    Divide by 365 for one calendar day. ``is_call`` may be a bool or a bool array.
+    """
+    out = _vega_theta(S, K, T, r, sigma, q, is_call)[1]
+    return out if _any_array(S, K, T, r, sigma, q) or _is_array(is_call) else float(out)
+
+
 # ── second-order & cross Greeks ─────────────────────────────────────
 
 def vanna(S, K, T, r, sigma, q: float = 0.0):
@@ -556,6 +597,8 @@ __all__ = [
     "d2",
     "delta",
     "gamma",
+    "vega",
+    "theta",
     "vanna",
     "charm",
     "vomma",
