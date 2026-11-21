@@ -7,12 +7,14 @@ These files feed the D0 admission verifier, `analysis/d0_admission.py` (contract
 
 A hypothesis is admitted only when all of these hold:
 1. `VERIFIER_ACCEPTED` is `True` in `analysis/d0_admission.py`. It is flipped only after the reviewer accepts the verifier, in its own commit.
-2. The manifest carries everything the verifier lists for that hypothesis:
-   - `required_inputs`, each one admitted;
-   - `coverage` with a receipt;
-   - `blocking_gaps`, all closed;
-   - `admission.signed_at`.
-3. Both principals have signed the hypothesis's statement.
+2. The hypothesis is one of the supported ones in `FROZEN_SPEC` (`analysis/d0_admission.py`, pinned in `FROZEN_SPEC_SHA256`). Its required inputs, floors, level, window, coverage scope and blocking gaps come from that frozen spec, never from the manifest, and the manifest's copies must agree with it.
+3. The manifest carries everything the verifier lists for that hypothesis:
+   - `required_inputs`: exactly the frozen ids, each one admitted;
+   - `coverage.measured_n` and a typed coverage receipt (`d0-coverage-receipt/1`: hypothesis, frozen scope, unit, inputs, the same count; D1 adds per-horizon cells and the G15 closure hash);
+   - `blocking_gaps`, including every frozen gap, each with a typed `closure` (`state: "CLOSED"`, `closed_at`, an `evidence` receipt of a `d0-gap-closure/1` file). A `status` string never closes a gap. G15's evidence also carries the typed price-only exception;
+   - `admission.signed_at`;
+   - `reviewer.signed` exactly `true`, with `manifest_sha256`.
+4. Both principals have signed the hypothesis's statement.
 
 ## Signing one hypothesis
 

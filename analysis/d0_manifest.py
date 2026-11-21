@@ -1,8 +1,10 @@
 """D0 manifest checker (#1129, #1142): labels, the contract body pin and admission.
 
 :func:`validate` is the single entry point. It checks the status labels, the owner-signed
-contract body pin (:func:`contract_pin_errors`), and every ``ADMITTED`` label through
-the authenticated verifier in ``analysis/d0_admission.py`` (gap G14). That verifier is
+contract body pin (:func:`contract_pin_errors`), the frozen per-hypothesis admission spec
+(``d0_admission.FROZEN_SPEC``: its pin, and that the manifest's floors, levels, windows,
+required inputs and blocking gaps have not drifted from it), and every ``ADMITTED`` label
+through the authenticated verifier in ``analysis/d0_admission.py`` (gap G14). That verifier is
 fail-closed: nothing is admitted until the reviewer has accepted it, and until the
 reviewer and the operator have signed with keys registered in ``allowed_signers``.
 
@@ -116,6 +118,8 @@ def validate(manifest: dict[str, Any], repo_root: Path = REPO) -> list[str]:
         if status not in allowed:
             errs.append(f"{inp.get('id')}: admission_status {status!r} not in admission_status_values")
     errs += contract_pin_errors(manifest, repo_root=repo_root)
+    errs += d0_admission.frozen_spec_errors()
+    errs += d0_admission.frozen_drift_errors(manifest)
     errs += d0_admission.admission_errors(manifest, repo_root=repo_root)
     return errs
 

@@ -13,24 +13,33 @@ that verifier. It is fail-closed in three independent ways:
 3. Every other prerequisite is checked against bytes on disk, not against strings that
    claim them.
 
-What a hypothesis labelled ``ADMITTED`` must carry:
-- ``n_floor``: a positive integer (never a bool).
-- ``required_inputs``: a non-empty list of unique input ids. Every id must exist in the
-  manifest (unknown dependencies are refused), and every input must itself pass
-  :func:`input_errors`.
-- ``coverage``: ``{"measured_n": int >= n_floor, "receipt": <file receipt>}``.
-- ``blocking_gaps``: a list (possibly empty) of gap ids. Each must exist and be closed
-  (its ``status`` starts with ``"closed"``).
+What a hypothesis labelled ``ADMITTED`` must carry (review of bc52a40c):
+- It must be one of the supported hypotheses in :data:`FROZEN_SPEC`. Its required inputs,
+  sample floors, level, window, coverage scope and blocking gaps are read from that frozen
+  spec, transcribed from the owner-signed contract body and pinned in
+  :data:`FROZEN_SPEC_SHA256`, never from the mutable manifest. The manifest's own copies
+  (``n_floor``, ``required_inputs``, ``blocking_gaps``, ``window``, ``one_sided_level``,
+  ``track``) must agree with the frozen spec; any drift is refused.
+- ``required_inputs``: exactly the frozen input ids. Every id must exist in the manifest
+  (unknown dependencies are refused) and pass :func:`input_errors`.
+- ``coverage``: ``{"measured_n": int >= the frozen floor, "receipt": <file receipt>}``. The
+  receipt file is typed JSON (:func:`coverage_receipt_errors`): its hypothesis, scope,
+  unit, inputs and count must match the frozen spec and ``measured_n``, and a judged
+  historical D1 receipt must name the frozen G15 closure it was measured under.
+- ``blocking_gaps``: a list of gap ids that includes every frozen blocking gap. Each must
+  carry a typed closure whose evidence file is verified (:func:`gap_closure_errors`); a
+  ``status`` string never closes a gap. G15 needs the typed price-only exception fields.
 - ``admission``: ``{"signed_at": "YYYY-MM-DD"}``, a real calendar date, not before the
   owner's signature and not in the future.
+- ``reviewer.signed`` must be exactly ``true`` (contract §8), with ``manifest_sha256``.
 
 The manifest as a whole must be owner-signed with the pinned contract body
 (``analysis/d0_manifest.contract_pin_errors``). If ``reviewer.signed`` is true,
 ``reviewer.manifest_sha256`` must equal :func:`manifest_digest`.
 
 What each signature covers: :func:`admission_statement`. This is canonical JSON of the
-contract id, the pinned body hash, the hypothesis id, its admission date and the manifest
-digest. The digest is canonical JSON of the whole manifest except ``reviewer.signed``,
+contract id, the pinned body hash, the frozen spec hash, the hypothesis id, its admission
+date and the manifest digest. The digest is canonical JSON of the whole manifest except ``reviewer.signed``,
 ``reviewer.signed_at`` and ``reviewer.manifest_sha256``, so recording the result after
 signing does not change what was signed (no self-referential field). Any other manifest
 edit after signing invalidates every signature.
@@ -71,6 +80,127 @@ VISIBILITY_STATES = VISIBILITY_OK | {"applicable"}
 #: own reviewed commit on the operator's go. Until then nothing can be ADMITTED.
 VERIFIER_ACCEPTED = False
 
+#: Frozen admission spec per supported hypothesis, transcribed from the owner-signed contract
+#: body (pinned in ``analysis/d0_manifest.D0_CONTRACT_BODY_SHA256``). The verifier reads the
+#: required inputs, floors, level, window, coverage scope and blocking gaps from here, never
+#: from the manifest. ``tests/test_d0_admission.py`` checks each number against the body text.
+#: Input ids not yet in the manifest (``sec.edgar.8k_acceptance``, ``tiingo.eod_incl_delisted``,
+#: the D2-H1 holdout fetches, ``ledger.fly_shadow_1.fly_days``) are refused as unknown
+#: dependencies until they are registered with receipts. Any edit here is a reviewed code
+#: change and needs a new :data:`FROZEN_SPEC_SHA256`.
+FROZEN_SPEC: dict[str, Any] = {
+    "schema": "d0-frozen-admission-spec/1",
+    "hypotheses": {
+        "D1-F1": {
+            "basis": "contract §5.1 (sources, universe, prices), §5.2 holdout, §5.3 level and floor, §9 G2 G3 G15",
+            "track": "D1",
+            "window": {"dev": ["2012-01-01", "2018-12-31"], "holdout": ["2019-01-01", "2025-12-31"]},
+            "scope": "holdout",
+            "one_sided_level": 0.9875,
+            "n_floor": 200,
+            "coverage_unit": "top_quintile_events",
+            "cells": ["+5", "+20"],
+            "cell_floors": {"top_quintile_events": 200, "distinct_event_weeks": 60},
+            "required_inputs": ["sec.edgar.8k_acceptance", "tiingo.eod_incl_delisted",
+                                "universe.liquid_us_equity_pit"],
+            "blocking_gaps": ["G15", "G2", "G3"],
+            "judged_historical_d1": True,
+        },
+        "D1-F2": {
+            "basis": "contract §5.1 (sources, universe, prices), §5.2 holdout, §5.3 level and floor, §9 G2 G3 G15",
+            "track": "D1",
+            "window": {"dev": ["2012-01-01", "2018-12-31"], "holdout": ["2019-01-01", "2025-12-31"]},
+            "scope": "holdout",
+            "one_sided_level": 0.9875,
+            "n_floor": 200,
+            "coverage_unit": "top_quintile_events",
+            "cells": ["+5", "+20"],
+            "cell_floors": {"top_quintile_events": 200, "distinct_event_weeks": 60},
+            "required_inputs": ["sec.edgar.8k_acceptance", "tiingo.eod_incl_delisted",
+                                "universe.liquid_us_equity_pit"],
+            "blocking_gaps": ["G15", "G2", "G3"],
+            "judged_historical_d1": True,
+        },
+        "D2-H1a": {
+            "basis": "contract §6.2 (OPRA cbbo-1m plus SPY 1-minute bars, 2018-01-02 .. 2022-11-11), §6.4, §9 G4 G5",
+            "track": "D2",
+            "window": {"holdout": ["2018-01-02", "2022-11-11"]},
+            "scope": "holdout",
+            "one_sided_level": 0.975,
+            "n_floor": 300,
+            "coverage_unit": "sessions",
+            "cells": [],
+            "cell_floors": {},
+            "required_inputs": ["research.opra.cbbo_1m.SPY_0dte_d2h1_holdout", "research.spy_1min.d2h1_holdout"],
+            "blocking_gaps": ["G4", "G5"],
+            "judged_historical_d1": False,
+        },
+        "D2-H1b": {
+            "basis": "contract §6.2 (OPRA cbbo-1m plus SPY 1-minute bars, 2018-01-02 .. 2022-11-11), §6.4, §9 G4 G5",
+            "track": "D2",
+            "window": {"holdout": ["2018-01-02", "2022-11-11"]},
+            "scope": "holdout",
+            "one_sided_level": 0.975,
+            "n_floor": 300,
+            "coverage_unit": "sessions",
+            "cells": [],
+            "cell_floors": {},
+            "required_inputs": ["research.opra.cbbo_1m.SPY_0dte_d2h1_holdout", "research.spy_1min.d2h1_holdout"],
+            "blocking_gaps": ["G4", "G5"],
+            "judged_historical_d1": False,
+        },
+        "D2-H2": {
+            "basis": "contract §6.2 (live Schwab chain, ledger fly_days, forward from 2026-11-12), §6.4",
+            "track": "D2",
+            "window": {"forward_from": "2026-11-12"},
+            "scope": "forward_from",
+            "one_sided_level": 0.95,
+            "n_floor": 100,
+            "coverage_unit": "traded_sessions",
+            "cells": [],
+            "cell_floors": {},
+            "required_inputs": ["ledger.fly_shadow_1.fly_days", "live.schwab.chains_quotes_bars"],
+            "blocking_gaps": [],
+            "judged_historical_d1": False,
+        },
+        "D2-H3": {
+            "basis": "contract §6.2 (live dte0 regime plus bars, forward from 2026-11-12), §6.4",
+            "track": "D2",
+            "window": {"forward_from": "2026-11-12"},
+            "scope": "forward_from",
+            "one_sided_level": 0.95,
+            "n_floor": 50,
+            "coverage_unit": "qualifying_sessions",
+            "cells": [],
+            "cell_floors": {},
+            "required_inputs": ["live.schwab.chains_quotes_bars"],
+            "blocking_gaps": [],
+            "judged_historical_d1": False,
+        },
+    },
+    # contract §5.1 and §9 G15: a price-only exception tied to a named source, version and basis
+    # and to retained evidence; it states the clocks it does not establish and the claims it
+    # forbids, and is qualified before any judged look; no clock backfill and no outcome read.
+    "g15_closure": {
+        "exception": "price_only",
+        "non_empty_strings": ["source", "source_version", "price_basis"],
+        "non_empty_string_lists": ["clocks_not_established", "forbidden_claims"],
+        "non_empty_receipt_lists": ["retained_evidence"],
+        "exactly_true": ["qualified"],
+        "exactly_false": ["clock_backfill", "outcome_read"],
+        "qualified_by": "reviewer",
+    },
+}
+
+#: sha256 of :func:`canonical` (:data:`FROZEN_SPEC`). Refused at runtime if it does not match.
+FROZEN_SPEC_SHA256 = "dc09f57d01c886f60ff16fc1609ec56bd71558b4630c5d0f05f715b61ec857d0"
+
+COVERAGE_RECEIPT_SCHEMA = "d0-coverage-receipt/1"
+GAP_CLOSURE_SCHEMA = "d0-gap-closure/1"
+CLOSED = "CLOSED"
+#: Manifest hypothesis fields that must equal the frozen spec wherever the manifest carries them.
+_FROZEN_SCALARS: tuple[str, ...] = ("track", "window", "one_sided_level", "n_floor")
+
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -107,6 +237,57 @@ def manifest_digest(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(canonical(m)).hexdigest()
 
 
+def frozen_spec_digest(spec: dict[str, Any] | None = None) -> str:
+    return hashlib.sha256(canonical(FROZEN_SPEC if spec is None else spec)).hexdigest()
+
+
+def frozen_spec_errors() -> list[str]:
+    """Refuse everything if the frozen spec in this module no longer hashes to its pin."""
+    actual = frozen_spec_digest()
+    if actual != FROZEN_SPEC_SHA256:
+        return [f"frozen spec digest {actual} != pinned {FROZEN_SPEC_SHA256} (a frozen-spec edit needs review)"]
+    return []
+
+
+def frozen_hypothesis(hypothesis_id: Any) -> dict[str, Any] | None:
+    return (FROZEN_SPEC.get("hypotheses") or {}).get(hypothesis_id) if isinstance(hypothesis_id, str) else None
+
+
+def frozen_drift_errors(manifest: dict[str, Any]) -> list[str]:
+    """Where the manifest's copy of a supported hypothesis disagrees with the frozen spec.
+
+    Checked for every supported hypothesis, admitted or not, so the manifest cannot drift
+    silently. Fields the manifest omits are not drift here; admission requires them.
+    """
+    errs: list[str] = []
+    hyps = {h.get("id"): h for h in manifest.get("hypotheses") or [] if isinstance(h, dict)}
+    for hid, spec in (FROZEN_SPEC.get("hypotheses") or {}).items():
+        hyp = hyps.get(hid)
+        if hyp is None:
+            errs.append(f"{hid}: supported hypothesis missing from the manifest")
+        else:
+            errs += hypothesis_drift_errors(hid, hyp, spec)
+    return errs
+
+
+def hypothesis_drift_errors(hid: str, hyp: dict[str, Any], spec: dict[str, Any]) -> list[str]:
+    """Where one manifest hypothesis disagrees with its frozen spec (omitted fields are not drift)."""
+    errs: list[str] = []
+    for key in _FROZEN_SCALARS:
+        if key in hyp and hyp[key] != spec[key]:
+            errs.append(f"{hid}: manifest {key} {hyp[key]!r} differs from the frozen spec {spec[key]!r}")
+    req = hyp.get("required_inputs")
+    if isinstance(req, list) and sorted(map(str, req)) != sorted(spec["required_inputs"]):
+        errs.append(f"{hid}: manifest required_inputs {req!r} differ from the frozen required inputs "
+                    f"{spec['required_inputs']!r}")
+    gaps = hyp.get("blocking_gaps")
+    if isinstance(gaps, list):
+        for gid in spec["blocking_gaps"]:
+            if gid not in gaps:
+                errs.append(f"{hid}: manifest blocking_gaps omits frozen blocking gap {gid}")
+    return errs
+
+
 def admission_statement(manifest: dict[str, Any], hypothesis_id: str) -> bytes:
     """The exact bytes each principal signs to admit one hypothesis."""
     hyp = next((h for h in manifest.get("hypotheses") or [] if h.get("id") == hypothesis_id), None)
@@ -116,6 +297,7 @@ def admission_statement(manifest: dict[str, Any], hypothesis_id: str) -> bytes:
     return canonical({
         "contract": manifest.get("contract"),
         "contract_body_sha256": M.D0_CONTRACT_BODY_SHA256,
+        "frozen_spec_sha256": FROZEN_SPEC_SHA256,
         "hypothesis": hypothesis_id,
         "admission_signed_at": admission.get("signed_at"),
         "manifest_sha256": manifest_digest(manifest),
@@ -140,6 +322,162 @@ def file_receipt_errors(rec: Any, repo_root: Path, label: str) -> list[str]:
     if hashlib.sha256(full.read_bytes()).hexdigest() != want:
         return [f"{label}: file {path} does not hash to its recorded sha256"]
     return []
+
+
+def receipt_json(rec: Any, repo_root: Path, label: str) -> tuple[dict[str, Any] | None, list[str]]:
+    """A verified file receipt's content as a JSON object; (None, reasons) when it is not one."""
+    errs = file_receipt_errors(rec, repo_root, label)
+    if errs:
+        return None, errs
+    try:
+        body = json.loads((Path(repo_root).resolve() / rec["path"]).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, [f"{label}: file {rec['path']} is not JSON ({exc.__class__.__name__})"]
+    if not isinstance(body, dict):
+        return None, [f"{label}: file {rec['path']} is not a JSON object"]
+    return body, []
+
+
+def _non_empty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def g15_exception_errors(body: dict[str, Any], repo_root: Path, label: str) -> list[str]:
+    """The typed price-only exception that closes G15 (frozen in ``FROZEN_SPEC['g15_closure']``)."""
+    req = FROZEN_SPEC["g15_closure"]
+    errs: list[str] = []
+    if body.get("exception") != req["exception"]:
+        errs.append(f"{label}: exception must be exactly {req['exception']!r}")
+    for key in req["non_empty_strings"]:
+        if not _non_empty_str(body.get(key)):
+            errs.append(f"{label}: {key} must be a non-empty string")
+    for key in req["non_empty_string_lists"]:
+        val = body.get(key)
+        if not (isinstance(val, list) and val and all(_non_empty_str(v) for v in val)):
+            errs.append(f"{label}: {key} must be a non-empty list of non-empty strings")
+    for key in req["non_empty_receipt_lists"]:
+        val = body.get(key)
+        if not (isinstance(val, list) and val):
+            errs.append(f"{label}: {key} must be a non-empty list of file receipts")
+        else:
+            for n, rec in enumerate(val):
+                errs += file_receipt_errors(rec, repo_root, f"{label}: {key}[{n}]")
+    for key in req["exactly_true"]:
+        if body.get(key) is not True:
+            errs.append(f"{label}: {key} must be exactly true (a number or string is not a boolean)")
+    for key in req["exactly_false"]:
+        if body.get(key) is not False:
+            errs.append(f"{label}: {key} must be exactly false")
+    if body.get("qualified_by") != req["qualified_by"]:
+        errs.append(f"{label}: qualified_by must be {req['qualified_by']!r}")
+    return errs
+
+
+def gap_closure_errors(gid: str, gap: dict[str, Any], repo_root: Path, admitted_on: date,
+                       today: date) -> tuple[str | None, list[str]]:
+    """Why gap ``gid`` is not closed by typed evidence; also the closure evidence sha256 when it is.
+
+    A closure is ``gap.closure = {"state": "CLOSED", "closed_at": "YYYY-MM-DD", "evidence":
+    <file receipt>}``. The evidence file is JSON ``{"schema": "d0-gap-closure/1", "gap": gid,
+    "state": "CLOSED", "closed_at": <same date>, ...}``; for G15 it also carries the typed
+    price-only exception. The ``status`` string is never read: no prefix closes a gap. The
+    closure must predate (or equal) the admission date, so it is frozen before the look.
+    """
+    label = f"blocking gap {gid} is not closed"
+    closure = gap.get("closure")
+    if not isinstance(closure, dict):
+        return None, [f"{label}: no typed closure (a status string never closes a gap)"]
+    errs: list[str] = []
+    if closure.get("state") != CLOSED:
+        errs.append(f"{label}: closure.state must be exactly {CLOSED!r}")
+    closed_at = parse_date(closure.get("closed_at"))
+    if closed_at is None:
+        errs.append(f"{label}: closure.closed_at is not a real YYYY-MM-DD date")
+    elif closed_at > today:
+        errs.append(f"{label}: closure.closed_at is in the future")
+    elif closed_at > admitted_on:
+        errs.append(f"{label}: closure.closed_at is after the admission date (not frozen before the look)")
+    body, rerrs = receipt_json(closure.get("evidence"), repo_root, f"{label}: closure evidence")
+    if rerrs:
+        return None, errs + rerrs
+    assert body is not None
+    if body.get("schema") != GAP_CLOSURE_SCHEMA:
+        errs.append(f"{label}: closure evidence schema must be {GAP_CLOSURE_SCHEMA!r}")
+    if body.get("gap") != gid:
+        errs.append(f"{label}: closure evidence is for gap {body.get('gap')!r}, not {gid}")
+    if body.get("state") != CLOSED:
+        errs.append(f"{label}: closure evidence state must be exactly {CLOSED!r}")
+    if body.get("closed_at") != closure.get("closed_at"):
+        errs.append(f"{label}: closure evidence closed_at differs from the manifest's")
+    if gid == "G15":
+        errs += g15_exception_errors(body, repo_root, f"{label}: G15 exception")
+    return (None if errs else closure["evidence"]["sha256"]), errs
+
+
+def coverage_receipt_errors(hid: str, spec: dict[str, Any], cov: dict[str, Any], repo_root: Path,
+                            today: date, g15_sha256: str | None) -> list[str]:
+    """The coverage receipt's content must be the frozen count and scope, not only authentic bytes.
+
+    The receipt file is JSON ``{"schema": "d0-coverage-receipt/1", "hypothesis": hid,
+    "scope": {"window": <frozen scope key>, "range": <frozen window value>}, "unit": <frozen
+    unit>, "inputs": <frozen required inputs>, "measured_n": <= coverage.measured_n>,
+    "measured_at": "YYYY-MM-DD"}``. D1 receipts add ``cells`` (one per frozen horizon, each
+    with the frozen cell floors met, and ``measured_n`` = the smallest top-quintile count) and
+    ``g15_closure_sha256``, the evidence hash of the typed G15 closure it was measured under.
+    """
+    label = f"{hid}: coverage receipt"
+    body, errs = receipt_json(cov.get("receipt"), repo_root, label)
+    if body is None:
+        return errs
+    if body.get("schema") != COVERAGE_RECEIPT_SCHEMA:
+        errs.append(f"{label}: schema must be {COVERAGE_RECEIPT_SCHEMA!r}")
+    if body.get("hypothesis") != hid:
+        errs.append(f"{label}: measured for hypothesis {body.get('hypothesis')!r}, not {hid}")
+    want_scope = {"window": spec["scope"], "range": spec["window"][spec["scope"]]}
+    if body.get("scope") != want_scope:
+        errs.append(f"{label}: scope {body.get('scope')!r} is not the frozen scope {want_scope!r}")
+    if body.get("unit") != spec["coverage_unit"]:
+        errs.append(f"{label}: unit {body.get('unit')!r} is not the frozen unit {spec['coverage_unit']!r}")
+    inputs = body.get("inputs")
+    if not (isinstance(inputs, list) and sorted(map(str, inputs)) == sorted(spec["required_inputs"])):
+        errs.append(f"{label}: inputs {inputs!r} are not the frozen required inputs")
+    n = body.get("measured_n")
+    if not _is_int(n):
+        errs.append(f"{label}: measured_n must be an integer")
+    else:
+        if n != cov.get("measured_n"):
+            errs.append(f"{label}: receipt count {n} does not match coverage measured_n {cov.get('measured_n')!r}")
+        if n < spec["n_floor"]:
+            errs.append(f"{label}: receipt count {n} is below the frozen sample floor {spec['n_floor']}")
+    measured_at = parse_date(body.get("measured_at"))
+    if measured_at is None:
+        errs.append(f"{label}: measured_at is not a real YYYY-MM-DD date")
+    elif measured_at > today:
+        errs.append(f"{label}: measured_at is in the future")
+    if spec["cells"]:
+        cells = body.get("cells")
+        if not (isinstance(cells, dict) and sorted(cells) == sorted(spec["cells"])):
+            errs.append(f"{label}: cells must be exactly the frozen horizons {spec['cells']!r}")
+        else:
+            tops: list[int] = []
+            for cell in spec["cells"]:
+                rec = cells[cell] if isinstance(cells[cell], dict) else {}
+                for key, floor in spec["cell_floors"].items():
+                    val = rec.get(key)
+                    if not _is_int(val):
+                        errs.append(f"{label}: cell {cell} {key} must be an integer")
+                    elif val < floor:
+                        errs.append(f"{label}: cell {cell} {key} {val} is below the frozen floor {floor}")
+                if _is_int(rec.get(spec["coverage_unit"])):
+                    tops.append(rec[spec["coverage_unit"]])
+            if _is_int(n) and len(tops) == len(spec["cells"]) and n != min(tops):
+                errs.append(f"{label}: measured_n {n} is not the smallest cell count {min(tops)}")
+    if spec["judged_historical_d1"]:
+        if g15_sha256 is None:
+            errs.append(f"{label}: a judged historical D1 result requires the frozen G15 closure")
+        elif body.get("g15_closure_sha256") != g15_sha256:
+            errs.append(f"{label}: g15_closure_sha256 does not name the frozen G15 closure evidence")
+    return errs
 
 
 def query_receipt_errors(rec: Any, repo_root: Path, label: str) -> list[str]:
@@ -190,10 +528,17 @@ def _owner_errors(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     if parse_date(manifest.get("signed_at")) is None:
         errs.append("manifest signed_at is not a real YYYY-MM-DD date")
     reviewer = manifest.get("reviewer") if isinstance(manifest.get("reviewer"), dict) else {}
-    if reviewer.get("signed") is True and reviewer.get("manifest_sha256") != manifest_digest(manifest):
-        errs.append("reviewer.manifest_sha256 does not equal the manifest digest")
-    elif reviewer.get("signed") not in (True, False):
-        errs.append("reviewer.signed must be exactly true or false")
+    signed = reviewer.get("signed")
+    # type check, not equality: 0 == False and 1 == True, so `in (True, False)` let 0 and 1 through
+    if type(signed) is not bool:
+        errs.append("reviewer.signed must be exactly true or false (a number or string is not a boolean)")
+    elif signed is not True:
+        errs.append("the reviewer has not signed the manifest (contract §8: reviewer.signed must be exactly true)")
+    else:
+        if reviewer.get("manifest_sha256") != manifest_digest(manifest):
+            errs.append("reviewer.manifest_sha256 does not equal the manifest digest")
+        if parse_date(reviewer.get("signed_at")) is None:
+            errs.append("reviewer.signed_at is not a real YYYY-MM-DD date")
     return errs
 
 
@@ -269,42 +614,21 @@ def verify_signature(statement: bytes, sig: Path, principal: str, signers: Path)
 
 def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: Path,
                       today: date | None = None) -> list[str]:
+    """Why one ADMITTED hypothesis is not authenticated, judged against its frozen spec."""
     hid = hyp.get("id", "<no id>")
     today = today or _today()
-    errs = [f"{hid}: {e}" for e in _owner_errors(manifest, repo_root)]
+    errs = [f"{hid}: {e}" for e in frozen_spec_errors() + _owner_errors(manifest, repo_root)]
+    spec = frozen_hypothesis(hid)
+    if spec is None:
+        errs.append(f"{hid}: not a supported hypothesis (no frozen admission spec; contract §5.1, §6.2)")
+        spec = {"track": None, "window": None, "one_sided_level": None, "n_floor": None, "scope": None,
+                "coverage_unit": None, "cells": [], "cell_floors": {}, "required_inputs": [],
+                "blocking_gaps": [], "judged_historical_d1": False}
+    else:
+        errs += hypothesis_drift_errors(hid, hyp, spec)
     floor = hyp.get("n_floor")
     if not (_is_int(floor) and floor > 0):
         errs.append(f"{hid}: n_floor must be a positive integer")
-    inputs = {i.get("id"): i for i in manifest.get("inputs") or []}
-    req = hyp.get("required_inputs")
-    if not (isinstance(req, list) and req and all(isinstance(r, str) for r in req) and len(set(req)) == len(req)):
-        errs.append(f"{hid}: required_inputs must be a non-empty list of unique input ids")
-    else:
-        for rid in req:
-            if rid not in inputs:
-                errs.append(f"{hid}: unknown dependency {rid!r}")
-            else:
-                errs += [f"{hid}: {e}" for e in input_errors(inputs[rid], repo_root)]
-    cov = hyp.get("coverage") if isinstance(hyp.get("coverage"), dict) else None
-    if cov is None:
-        errs.append(f"{hid}: coverage not measured")
-    else:
-        n = cov.get("measured_n")
-        if not _is_int(n):
-            errs.append(f"{hid}: coverage measured_n must be an integer")
-        elif _is_int(floor) and n < floor:
-            errs.append(f"{hid}: coverage {n} is below the sample floor {floor}")
-        errs += file_receipt_errors(cov.get("receipt"), repo_root, f"{hid}: coverage receipt")
-    gaps = {g.get("id"): g for g in manifest.get("gaps") or []}
-    blocking = hyp.get("blocking_gaps")
-    if not (isinstance(blocking, list) and all(isinstance(g, str) for g in blocking)):
-        errs.append(f"{hid}: blocking_gaps must be a list of gap ids (empty if none)")
-    else:
-        for gid in blocking:
-            if gid not in gaps:
-                errs.append(f"{hid}: unknown blocking gap {gid!r}")
-            elif not str(gaps[gid].get("status") or "").lower().startswith("closed"):
-                errs.append(f"{hid}: blocking gap {gid} is not closed")
     adm = hyp.get("admission") if isinstance(hyp.get("admission"), dict) else {}
     when, owner_when = parse_date(adm.get("signed_at")), parse_date(manifest.get("signed_at"))
     if when is None:
@@ -313,6 +637,55 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
         errs.append(f"{hid}: admission.signed_at is in the future")
     elif owner_when is not None and when < owner_when:
         errs.append(f"{hid}: admission.signed_at is before the owner's signature")
+    admitted_on = when if when is not None and when <= today else today
+
+    # dependencies: the frozen required inputs, never the manifest's list
+    inputs = {i.get("id"): i for i in manifest.get("inputs") or []}
+    req = hyp.get("required_inputs")
+    if not (isinstance(req, list) and req and all(isinstance(r, str) for r in req) and len(set(req)) == len(req)):
+        errs.append(f"{hid}: required_inputs must be a non-empty list of unique input ids")
+    else:
+        errs += [f"{hid}: unknown dependency {rid!r}" for rid in req
+                 if rid not in inputs and rid not in spec["required_inputs"]]
+    for rid in spec["required_inputs"]:
+        if rid not in inputs:
+            errs.append(f"{hid}: unknown dependency {rid!r} (frozen required input not in the manifest)")
+        else:
+            errs += [f"{hid}: {e}" for e in input_errors(inputs[rid], repo_root)]
+
+    # gaps: every frozen blocking gap plus any the manifest adds, each closed by typed evidence
+    gaps = {g.get("id"): g for g in manifest.get("gaps") or [] if isinstance(g, dict)}
+    blocking = hyp.get("blocking_gaps")
+    listed: list[str] = []
+    if not (isinstance(blocking, list) and all(isinstance(g, str) for g in blocking)):
+        errs.append(f"{hid}: blocking_gaps must be a list of gap ids (empty if none)")
+    else:
+        listed = list(blocking)
+    g15_sha256: str | None = None
+    for gid in sorted(set(spec["blocking_gaps"]) | set(listed)):
+        if gid not in gaps:
+            errs.append(f"{hid}: unknown blocking gap {gid!r}")
+            continue
+        sha, gerrs = gap_closure_errors(gid, gaps[gid], repo_root, admitted_on, today)
+        errs += [f"{hid}: {e}" for e in gerrs]
+        if gid == "G15":
+            g15_sha256 = sha
+
+    # coverage: the measured count against the frozen floor, and the receipt's typed content
+    cov = hyp.get("coverage") if isinstance(hyp.get("coverage"), dict) else None
+    if cov is None:
+        errs.append(f"{hid}: coverage not measured")
+    else:
+        n = cov.get("measured_n")
+        if not _is_int(n):
+            errs.append(f"{hid}: coverage measured_n must be an integer")
+        elif _is_int(spec["n_floor"]) and n < spec["n_floor"]:
+            errs.append(f"{hid}: coverage {n} is below the sample floor {spec['n_floor']} (frozen)")
+        if spec["scope"] is not None:
+            errs += coverage_receipt_errors(hid, spec, cov, repo_root, today, g15_sha256)
+        else:
+            errs += file_receipt_errors(cov.get("receipt"), repo_root, f"{hid}: coverage receipt")
+
     statement = admission_statement(manifest, hid)
     root = Path(repo_root)
     for principal in REQUIRED_PRINCIPALS:
@@ -335,8 +708,9 @@ def admission_errors(manifest: dict[str, Any], repo_root: Path = M.REPO, today: 
         if accepted is not True:
             errs.append(f"{hid}: ADMITTED refused: the G14 verifier is not yet accepted by the reviewer")
         errs += hypothesis_errors(h, manifest, repo_root, today)
-        if isinstance(h.get("required_inputs"), list):
-            covered.update(r for r in h["required_inputs"] if isinstance(r, str))
+        spec = frozen_hypothesis(hid)  # frozen dependencies only; the manifest's list covers nothing
+        if spec is not None:
+            covered.update(spec["required_inputs"])
     for inp in manifest.get("inputs") or []:
         if inp.get("admission_status") == "ADMITTED":
             iid = inp.get("id")
