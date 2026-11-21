@@ -1,7 +1,10 @@
-"""Small-cap universe: permanent ids as keys, share-kind filter, resumable fetch, the factory's floor rule by hand."""
+"""Small-cap universe: permanent ids as keys, share-kind filter, a pull bound to its start and vintage, whole-file
+checks before anything is written, panel generations that are never edited, and the factory's own universe."""
 import csv
 import json
+import sqlite3
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -10,6 +13,7 @@ from analysis import smallcap_universe as U
 
 HEADER = "date,close,high,low,open,volume,adjClose,adjHigh,adjLow,adjOpen,adjVolume,divCash,splitFactor"
 A, B, C, D, E = (f"US{n:012d}" for n in (1, 2, 3, 4, 5))
+START, VINTAGE, TODAY = "2009-01-02", "2022-12-30", "2023-01-03"
 
 
 def meta(tmp_path, rows=None):
@@ -34,6 +38,26 @@ def bars(days, close, volume=100_000):
 
 def days(n, start="2020-01-02"):
     return [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, periods=n)]
+
+
+def fetch(cs, out, get, m, **kw):
+    return U.fetch_prices(cs, out, get=get, sleep=lambda s: None, today=TODAY,
+                          **{"vintage": VINTAGE, "company_list_sha256": U.sha256_file(m), **kw})
+
+
+def store(tmp_path, files, rows=None):
+    """A data directory holding ``files`` (id -> bytes as served), bound to the test pull."""
+    m = meta(tmp_path, rows)
+    out = tmp_path / "store"
+    (out / "prices").mkdir(parents=True)
+    for perma, raw in files.items():
+        (out / "prices" / f"{perma}.csv").write_bytes(raw)
+    U.bind_existing(m, out, start=START, vintage=VINTAGE)
+    return m, out
+
+
+def generation(out):
+    return out / "panel" / (out / "panel" / "CURRENT").read_text().strip()
 
 
 @pytest.mark.parametrize("name,ticker,kind", [
@@ -72,7 +96,8 @@ def test_load_companies_refuses_a_repeated_or_malformed_id(tmp_path):
 
 
 def test_fetch_asks_by_id_writes_whole_files_and_resumes(tmp_path):
-    cs = U.load_companies(meta(tmp_path))
+    m = meta(tmp_path)
+    cs = U.load_companies(m)
     asked = []
     answers = {A: (200, bars(days(3), 10.0)), B: (500, b"")}
 
@@ -81,41 +106,137 @@ def test_fetch_asks_by_id_writes_whole_files_and_resumes(tmp_path):
         return answers[next(p for p in answers if p in url)]
 
     out = tmp_path / "store"
-    tally = U.fetch_prices(cs, out, get=get, sleep=lambda s: None)
+    tally = fetch(cs, out, get, m)
     assert tally == {"prices": 1, "failed": 1, "not_included": 3}
     assert all("/tiingo/daily/US" in u and "PARA" not in u.upper().replace("PRICES", "") for u in asked)
+    assert all(f"startDate={START}&endDate={VINTAGE}&" in u for u in asked)   # every file is asked for the same days
     assert (out / "prices" / f"{A}.csv").read_bytes() == answers[A][1]
     assert not list((out / "prices").glob("*.part"))
     assert not (out / "prices" / f"{B}.csv").exists()               # a failure leaves nothing, so it is asked again
 
     asked.clear()
     answers[B] = (200, b'{"detail": "over your hourly allocation"}')   # a 200 that is not the empty answer
-    assert U.fetch_prices(cs, out, get=get, sleep=lambda s: None) == {"already_done": 1, "failed": 1, "not_included": 3}
+    assert fetch(cs, out, get, m) == {"already_done": 1, "failed": 1, "not_included": 3}
     assert not (out / "no-prices" / B).exists()                     # never mistaken for "this company has no prices"
 
     asked.clear()
     answers[B] = (200, b"[]")                                       # Tiingo's answer for an id with no bars
-    tally = U.fetch_prices(cs, out, get=get, sleep=lambda s: None)
+    tally = fetch(cs, out, get, m)
     assert tally == {"already_done": 1, "no_prices": 1, "not_included": 3}
     assert len(asked) == 1 and B in asked[0]
     assert (out / "no-prices" / B).exists()
 
     asked.clear()
-    assert U.fetch_prices(cs, out, get=get, sleep=lambda s: None) == {"already_done": 2, "not_included": 3}
+    assert fetch(cs, out, get, m) == {"already_done": 2, "not_included": 3}
     assert asked == []
     log = [json.loads(line) for line in (out / "fetch-log.jsonl").read_text().splitlines()]
     assert [(r["perma"], r["outcome"]) for r in log] == [(A, "prices"), (B, "failed"), (B, "failed"), (B, "no_prices")]
+    assert "header" in log[2]["refused"]
 
 
 def test_fetch_takes_the_header_alone_as_no_prices_but_not_a_cut_header(tmp_path):
-    cs = [c for c in U.load_companies(meta(tmp_path)) if c.included]
+    m = meta(tmp_path)
+    cs = [c for c in U.load_companies(m) if c.included]
     answers = {A: (200, HEADER.encode() + b"\n"), B: (200, HEADER.encode()[:-5] + b"\n")}
     out = tmp_path / "store"
-    tally = U.fetch_prices(cs, out, get=lambda url: answers[next(p for p in answers if p in url)], sleep=lambda s: None)
+    tally = fetch(cs, out, lambda url: answers[next(p for p in answers if p in url)], m)
     assert tally == {"no_prices": 1, "failed": 1}
     assert (out / "no-prices" / A).exists() and not (out / "no-prices" / B).exists()
     assert not list((out / "prices").iterdir())
     assert HEADER.encode() == U.PRICE_HEADER
+
+
+GOOD = "2020-01-02,5.0,5.0,5.0,5.0,100,5.0,5.0,5.0,5.0,100,0.0,1.0\n"
+
+
+@pytest.mark.parametrize("body,why", [
+    (b"date,error\n2020-01-02,ticker not found\n", "header"),                           # the stub a review probe served
+    ((HEADER + "\n" + GOOD + "2020-01-03,oops\n").encode(), "13 fields"),               # a malformed row after a good one
+    ((HEADER + "\n" + GOOD.replace("5.0,5.0,5.0,5.0,100", "5.0,5.0,5.0,five,100")).encode(), "cannot be read"),
+    ((HEADER + "\n" + GOOD.replace(",100,", ",nan,", 1)).encode(), "not finite"),
+    ((HEADER + "\n" + GOOD.replace(",100,", ",-1,", 1)).encode(), "negative volume"),
+    ((HEADER + "\n" + GOOD.replace("2020-01-02", "2020-13-45")).encode(), "cannot be read"),
+    ((HEADER + "\n" + GOOD.replace("2020-01-02", "Jan 2 2020")).encode(), "13 fields"),
+    ((HEADER + "\n" + GOOD + GOOD).encode(), "repeats a day"),
+    ((HEADER + "\n" + GOOD.replace("2020-01-02", "2020-01-03") + GOOD).encode(), "out of date order"),
+    ((HEADER + "\n" + GOOD.replace("2020-01-02", "2008-12-31")).encode(), "outside the pull"),   # before the requested start
+    ((HEADER + "\n" + GOOD.replace("2020-01-02", "2022-12-31")).encode(), "outside the pull"),   # after the vintage
+    ((HEADER + "\n" + GOOD + "\n" + GOOD.replace("2020-01-02", "2020-01-03")).encode(), "13 fields"),   # a blank line inside
+    ((HEADER + ",extra\n" + GOOD).encode(), "header"),
+])
+def test_a_200_that_is_not_a_whole_daily_file_is_never_written_or_taken_as_done(tmp_path, body, why):
+    m = meta(tmp_path)
+    cs = [c for c in U.load_companies(m) if c.perma == A]
+    out = tmp_path / "store"
+    asked = []
+
+    def get(url):
+        asked.append(url)
+        return 200, body
+
+    assert fetch(cs, out, get, m) == {"failed": 1}
+    assert not list((out / "prices").iterdir()) and not list((out / "no-prices").iterdir())
+    assert fetch(cs, out, get, m) == {"failed": 1} and len(asked) == 2      # not resumable: it is asked again
+    log = [json.loads(line) for line in (out / "fetch-log.jsonl").read_text().splitlines()]
+    assert all(r["outcome"] == "failed" and why in r["refused"] for r in log)
+    with pytest.raises(U.UniverseError, match=why):
+        U.price_rows(body, START, VINTAGE)
+    with pytest.raises(U.UniverseError, match=why):                         # build checks a file on disk the same way
+        U.traded_life(body, START, VINTAGE)
+
+
+def test_a_resume_is_bound_to_the_start_the_vintage_and_the_company_list(tmp_path):
+    m = meta(tmp_path)
+    cs = [c for c in U.load_companies(m) if c.included]
+    out = tmp_path / "store"
+    served = bars(days(3), 10.0)
+    fetch(cs[:1], out, lambda url: (200, served), m)
+    state = json.loads((out / "fetch-state.json").read_text())
+    assert state == {"schema": "smallcap-fetch/1", "start": START, "vintage": VINTAGE, "company_list_sha256": U.sha256_file(m)}
+    never = lambda url: pytest.fail("a refused resume asks nothing")
+    with pytest.raises(U.UniverseError, match="holds another pull .start differ"):
+        fetch(cs, out, never, m, start="2012-01-03")
+    with pytest.raises(U.UniverseError, match="holds another pull .vintage differ"):
+        fetch(cs, out, never, m, vintage="2022-12-29")
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(U.UniverseError, match="company_list_sha256 differ"):
+        fetch(cs, out, never, meta(other, [{"permaTicker": A, "ticker": "a", "name": "A", "isActive": True, "isADR": False}]))
+    assert json.loads((out / "fetch-state.json").read_text()) == state     # a refusal changes nothing
+    assert fetch(cs, out, lambda url: (200, served), m) == {"already_done": 1, "prices": 1}   # the same pull resumes
+
+    fresh = tmp_path / "fresh"
+    for vintage, match in ((TODAY, "finished day"), ("2023-02-01", "finished day"), ("2023-1-2", "must be a day")):
+        with pytest.raises(U.UniverseError, match=match):
+            fetch(cs, fresh, never, m, vintage=vintage)
+    with pytest.raises(U.UniverseError, match="start is after the vintage"):
+        fetch(cs, fresh, never, m, start="2022-12-31")
+    assert not (fresh / "fetch-state.json").exists()
+
+
+def test_a_store_without_a_fetch_record_is_refused_until_it_is_bound(tmp_path):
+    m = meta(tmp_path)
+    cs = [c for c in U.load_companies(m) if c.included]
+    out = tmp_path / "store"
+    (out / "prices").mkdir(parents=True)
+    (out / "prices" / f"{A}.csv").write_bytes(bars(days(30), 10.0))        # pulled before the record existed
+    never = lambda url: pytest.fail("nothing is asked")
+    with pytest.raises(U.UniverseError, match="no fetch-state.json: record the start and vintage"):
+        fetch(cs, out, never, m)
+    with pytest.raises(U.UniverseError, match="no fetch-state.json"):
+        U.build(m, out)
+    with pytest.raises(U.UniverseError, match=rf"{A}.csv: line 2 is dated 2020-01-02, outside the pull"):
+        U.bind_existing(m, out, start=START, vintage="2019-12-31")           # the files say otherwise
+    assert not (out / "fetch-state.json").exists()
+    bound = U.bind_existing(m, out, start=START, vintage=VINTAGE)
+    assert bound["price_files_checked"] == 1 and U.fetch_state(out)["vintage"] == VINTAGE
+    with pytest.raises(U.UniverseError, match="already has"):
+        U.bind_existing(m, out, start=START, vintage=VINTAGE)
+    assert fetch(cs, out, lambda url: (200, b"[]"), m) == {"already_done": 1, "no_prices": 1}
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(U.UniverseError, match="not the one this store was pulled with"):
+        U.build(meta(other, [{"permaTicker": A, "ticker": "a", "name": "A", "isActive": True, "isADR": False}]), out)
 
 
 def test_fetch_needs_a_key_and_sends_it_in_a_header(monkeypatch):
@@ -126,36 +247,21 @@ def test_fetch_needs_a_key_and_sends_it_in_a_header(monkeypatch):
     assert "token" not in U.PRICES_URL.lower()
 
 
-def test_qualifies_is_the_factory_rule_with_the_floors_as_arguments():
-    d = days(40)
-    close = [3.0] * 25 + [1.5] * 15          # falls under a $2 floor from the 26th session
-    df = pd.read_csv(pd.io.common.BytesIO(bars(d, close, volume=500_000)))
-    df["date"] = df["date"].str[:10]
-    df = df.set_index("date")
-    q = U.qualifies(df, min_price=2.0, min_dollar_volume=1e6)
-    assert not q.iloc[:10].any()             # fewer than 10 prior sessions of dollar volume: not judged yet
-    assert q.iloc[10:26].all()               # $1.5M a day, prior close $3
-    assert not q.iloc[26:].any()             # prior close $1.50
-    assert not U.qualifies(df, 2.0, 2e6).any()   # median dollar volume is $1.5M
-    assert X.DOLLAR_VOLUME_WINDOW == 21 and X.BAR_TOL == 0.005   # the constants this rule is defined by
-
-
 def test_build_writes_what_the_factory_reads_and_counts_ended_names(tmp_path):
-    m = meta(tmp_path)
-    out = tmp_path / "store"
-    (out / "prices").mkdir(parents=True)
     long = days(300, "2015-01-02")
     stale = b"".join(f"{d},10.0,10.0,10.0,10.0,0,10.0,10.0,10.0,10.0,0,0.0,1.0\n".encode() for d in long[100:])
-    (out / "prices" / f"{A}.csv").write_bytes(bars(long[:100], 10.0) + stale)   # stops trading in 2015, then flat no-volume bars
-    (out / "prices" / f"{B}.csv").write_bytes(bars(long, 20.0, volume=200_000))
+    m, out = store(tmp_path, {A: bars(long[:100], 10.0) + stale,              # stops trading in 2015, then flat no-volume bars
+                              B: bars(long, 20.0, volume=200_000)})
     rep = U.build(m, out)
+    panel = generation(out)
     assert rep["included"] == 2 and rep["included_with_prices"] == 2
     assert rep["ended_by_last_bar_year"] == {"2015": 1}
     assert rep["tickers_shared_by_included_companies"] == 1
     assert rep["kinds"] == {"common": 3, "spac": 1, "unit": 1}
-    assert rep["price_files_cut"] == 1 and rep["rows_cut_outside_traded_life"] == 200 and rep["panel"] == "panel"
+    assert rep["price_files_cut"] == 1 and rep["rows_cut_outside_traded_life"] == 200
+    assert rep["panel"] == f"panel/{panel.name}" and rep["generation"] == panel.name and rep["generation_already_built"] is False
+    assert rep["discovery_first_session"] == "2016-01-04" and rep["fetch"] == {"start": START, "vintage": VINTAGE}
 
-    panel = out / "panel"
     with open(panel / "members.csv", newline="") as fh:                   # read the way the factory reads it
         rows = [(r["date"], [t for t in r["tickers"].split(",") if t]) for r in csv.DictReader(fh)]
     assert rows == [(long[0], [A, B])]
@@ -169,12 +275,25 @@ def test_build_writes_what_the_factory_reads_and_counts_ended_names(tmp_path):
     assert table[A]["ended"] == "1" and table[A]["last_bar"] == long[99]
     assert table[B]["ended"] == "0" and table[C]["included"] == "0" and table[C]["bars"] == "0"
 
-    assert U.universe_on(out, long[50], 2.0, 1e6) == [A, B]
-    assert U.universe_on(out, long[99], 2.0, 1e6) == [A, B]               # its last traded day
-    assert U.universe_on(out, long[100], 2.0, 1e6) == [B]                 # gone the next session, not carried as a flat bar
-    assert U.universe_on(out, long[150], 2.0, 1e6) == [B]
-    counts = U.daily_counts(out, 2.0, 1e6)
-    assert counts[long[50]] == 2 and counts[long[150]] == 1 and long[5] not in counts
+    # the export the factory binds: complete, hashed, dated, and carrying the pull it came from
+    exp = json.loads((panel / X.EXPORT_MANIFEST).read_text())
+    assert exp["schema"] == X.EXPORT_SCHEMA and exp["complete"] is True and exp["generation"] == panel.name
+    assert exp["discovery_first_session"] == "2016-01-04"
+    assert exp["source"] == {"provider": "tiingo", "endpoint": "daily prices by permanent id", "start": START, "vintage": VINTAGE,
+                             "company_list_sha256": U.sha256_file(m), "builder": "smallcap-universe/1"}
+    assert exp["files"] == X.input_files(panel) and set(exp["files"]) == {
+        f"prices/{A}.csv", f"prices/{B}.csv", "members.csv", "renames.json", "sectors.csv"}
+    assert X.read_export(panel, X.input_files(panel))["generation"] == panel.name
+
+    on = lambda day: U.universe_on(out, day, 2.0, 1e6, min_session_bars=1)
+    assert on(long[50]) == [A, B]
+    assert on(long[99]) == [A, B]                                         # its last traded day
+    assert on(long[100]) == [B]                                           # gone the next session, not carried as a flat bar
+    assert on(long[150]) == [B] and on("2015-01-01") == []
+    counts = U.daily_counts(out, 2.0, 1e6, min_session_bars=1)
+    assert counts[long[50]] == 2 and counts[long[150]] == 1 and counts[long[5]] == 0 and list(counts) == long
+    with pytest.raises(U.UniverseError, match="no development sessions"):  # the factory's session rule, at its default
+        U.daily_counts(out, 2.0, 1e6)
 
 
 def test_traded_life_cuts_both_ends_keeps_a_halt_and_refuses_what_it_cannot_read():
@@ -192,22 +311,41 @@ def test_traded_life_cuts_both_ends_keeps_a_halt_and_refuses_what_it_cannot_read
         U.traded_life((HEADER + "\n" + flat.format(d[1], 1, 1) + flat.format(d[0], 1, 1)).encode())
 
 
-def test_build_drops_a_panel_file_whose_company_no_longer_has_traded_bars_and_counts_need_a_build(tmp_path):
-    m = meta(tmp_path)
-    out = tmp_path / "store"
-    (out / "prices").mkdir(parents=True)
+def test_a_generation_is_published_whole_and_never_edited(tmp_path):
     d = days(40)
-    (out / "prices" / f"{A}.csv").write_bytes(bars(d, 10.0))
-    (out / "prices" / f"{B}.csv").write_bytes(bars(d, 20.0))
+    m, out = store(tmp_path, {A: bars(d, 10.0), B: bars(d, 20.0)})
     with pytest.raises(U.UniverseError, match="run build first"):         # the files as served are never ranked
-        U.universe_on(out, d[30], 2.0, 1e5)
-    U.build(m, out)
-    assert sorted(f.name for f in (out / "panel" / "prices").iterdir()) == [f"{A}.csv", f"{B}.csv"]
-    (out / "prices" / f"{A}.csv").write_bytes(bars(d, 10.0, volume=0))    # a later pull holds no traded day for it
+        U.universe_on(out, d[30], 2.0, 1e5, min_session_bars=1)
+    first = U.build(m, out)
+    one = generation(out)
+    assert sorted(f.name for f in (one / "prices").iterdir()) == [f"{A}.csv", f"{B}.csv"]
+    assert not [p for p in (out / "panel").iterdir() if p.name.startswith(".building")]   # nothing half-built is left
+    assert all(not p.stat().st_mode & 0o222 for p in [one, *one.rglob("*")])              # nothing in it is writable
+    again = U.build(m, out)                                               # the same inputs are the same generation
+    assert again["generation"] == first["generation"] and again["generation_already_built"] is True
+    assert [p.name for p in (out / "panel").iterdir() if p.is_dir()] == [one.name]
+    before = {p.name: p.read_bytes() for p in [*one.rglob("*.csv"), *one.glob("*.json")]}
+
+    (out / "prices" / f"{A}.csv").write_bytes(bars(d, 10.0, volume=0))    # other inputs: A holds no traded day now
     rep = U.build(m, out)
-    assert sorted(f.name for f in (out / "panel" / "prices").iterdir()) == [f"{B}.csv"]
-    assert rep["included_with_prices_never_traded"] == 1
-    assert U.universe_on(out, d[30], 2.0, 1e5) == [B]
+    two = generation(out)
+    assert two.name != one.name and rep["generation"] == two.name and rep["included_with_prices_never_traded"] == 1
+    assert sorted(f.name for f in (two / "prices").iterdir()) == [f"{B}.csv"]
+    assert {p.name: p.read_bytes() for p in [*one.rglob("*.csv"), *one.glob("*.json")]} == before   # the old one is untouched
+    assert X.read_export(one, X.input_files(one))["generation"] == one.name
+    assert U.universe_on(out, d[30], 2.0, 1e5, min_session_bars=1) == [B]
+
+    target = two / "prices" / f"{B}.csv"                                  # someone edits a file inside the generation
+    (two / "prices").chmod(0o755)
+    target.chmod(0o644)
+    target.write_bytes(target.read_bytes().replace(b"20.0", b"21.0", 1))
+    with pytest.raises(U.UniverseError, match="not a whole export.*1 file"):
+        U.universe_on(out, d[30], 2.0, 1e5, min_session_bars=1)
+    with pytest.raises(U.UniverseError, match="not a whole export"):
+        U.daily_counts(out, 2.0, 1e5, min_session_bars=1)
+    (out / "panel" / "CURRENT").write_text("g-0000000000000000\n")
+    with pytest.raises(U.UniverseError, match="does not name a built generation"):
+        U.universe_on(out, d[30], 2.0, 1e5, min_session_bars=1)
 
 
 def test_build_refuses_a_price_file_the_list_does_not_include(tmp_path):
@@ -218,3 +356,88 @@ def test_build_refuses_a_price_file_the_list_does_not_include(tmp_path):
         U.build(meta(tmp_path), out)
     with pytest.raises(U.UniverseError, match="run fetch first"):
         U.build(meta(tmp_path), tmp_path / "nothing")
+
+
+def many(tmp_path, d, n=25, edits=None):
+    """``n`` companies on a random walk near $20, $2M a day; ``edits`` maps a company index to a change of its lines."""
+    rng = np.random.default_rng(11)
+    ids = [f"US{100 + i:012d}" for i in range(n)]
+    rows = [{"permaTicker": perma, "ticker": f"c{i}", "name": f"Company {i}", "isActive": True, "isADR": False}
+            for i, perma in enumerate(ids)]
+    files = {}
+    for i, perma in enumerate(ids):
+        close = list(np.round(20.0 * np.cumprod(1 + rng.normal(0, 0.01, len(d))), 4))
+        lines = bars(d, close).splitlines(keepends=True)
+        files[perma] = b"".join((edits or {}).get(i, lambda x: x)(lines))
+    m, out = store(tmp_path, files, rows)
+    return m, out, ids
+
+
+def test_counts_are_the_factory_s_universe_on_a_missing_session_and_an_invalid_adjusted_bar(tmp_path):
+    d = days(60, "2016-02-01")
+    gap, bad = 30, 40
+
+    def zero_adjusted_close(lines):
+        f = lines[bad + 1].split(b",")
+        f[6] = b"0.0"
+        return [*lines[:bad + 1], b",".join(f), *lines[bad + 2:]]
+
+    m, out, ids = many(tmp_path, d, edits={3: lambda lines: [*lines[:gap + 1], *lines[gap + 2:]],   # no bar on session `gap`
+                                           4: zero_adjusted_close})
+    U.build(m, out)
+    on = lambda day: U.universe_on(out, day, 2.0, 1e6, min_session_bars=20)
+    everyone = sorted(ids)
+    assert on(d[gap - 1]) == everyone
+    assert on(d[gap]) == sorted(set(ids) - {ids[3]})                      # no bar that day
+    # The review's probe. The company's own previous row (session gap-1) closed near $20, so reading adjacent rows of
+    # its file would admit it on gap+1. The session before gap+1 has no bar for it, so the factory does not.
+    assert on(d[gap + 1]) == sorted(set(ids) - {ids[3]})
+    assert on(d[gap + 2]) == everyone
+    assert on(d[bad]) == sorted(set(ids) - {ids[4]}) and on(d[bad + 1]) == everyone   # a zero adjusted close is not a bar
+
+    panel = generation(out)
+    run = X.RunFile.from_dict({"run_id": "parity", "first_session": d[0], "last_session": d[-2], "rankings": ["pooled"],
+                               "fractions": [0.2], "min_session_bars": 20, "min_ranked": 20, "min_price": 2, "min_dollar_volume": 1e6,
+                               "signals": [{"name": "rev5", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]}]})
+    loaded = X.load_panel(panel, run, X.input_files(panel))               # what a run would rank
+    counts = U.daily_counts(out, 2.0, 1e6, min_session_bars=20)
+    assert list(counts) == loaded.sessions == d
+    assert list(counts.values()) == loaded.base.sum(axis=1).tolist()
+    for r, day in enumerate(d):
+        assert on(day) == sorted(c for c, x in zip(loaded.cols, loaded.base[r], strict=True) if x)
+    assert counts[d[9]] == 0 and counts[d[10]] == 25                      # ten sessions of dollar volume before the first count
+
+
+def test_the_factory_runs_the_built_export_and_holds_it_to_its_2016_start(tmp_path):
+    d = days(150, "2015-11-02")                                           # 2015-11-02 .. 2016-05-27
+    m, out, _ = many(tmp_path, d)
+    rep = U.build(m, out)
+    panel = generation(out)
+    con = sqlite3.connect(tmp_path / "state.db")
+    con.execute("CREATE TABLE desk_state (data_through TEXT PRIMARY KEY, record_json TEXT)")
+    for day in d:
+        con.execute("INSERT INTO desk_state VALUES (?, ?)", (day, json.dumps({
+            "market": {"phase": "rising, slowing"}, "fed_balance_sheet": {"phase": "flat"},
+            "vix": {"third": "calm", "spike_state": "normal"}, "sectors": {}})))
+    con.commit()
+    con.close()
+    body = {"run_id": "xs-smallcap-synthetic", "first_session": "2016-01-04", "last_session": d[-2], "rankings": ["pooled"],
+            "fractions": [0.2], "perms": 1000, "min_session_bars": 20, "min_ranked": 20, "cards": 1,
+            "min_price": 2, "min_dollar_volume": 1e6, "cost_bp_per_side": 25.0,
+            "signals": [{"name": "rev5", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]}]}
+    ledger = X.open_ledger(tmp_path / "l.jsonl", tmp_path / "l.anchors.jsonl", "xs-smallcap-test-ledger")
+    before = (tmp_path / "l.jsonl").read_text()
+    early = tmp_path / "early.json"
+    early.write_text(json.dumps({**body, "run_id": "xs-early", "first_session": "2015-12-31"}))
+    with pytest.raises(X.RunFileError, match="discovery on this export starts 2016-01-04; the run file's window starts 2015-12-31"):
+        X.run(early, panel, tmp_path / "state.db", ledger, tmp_path / "out-early")
+    assert (tmp_path / "l.jsonl").read_text() == before and not (tmp_path / "out-early").exists()   # nothing was declared
+
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps(body))
+    report = X.run(run_file, panel, tmp_path / "state.db", ledger, tmp_path / "out")
+    cov = report["coverage"]
+    assert cov["panel_export"]["generation"] == rep["generation"] and cov["panel_export"]["discovery_first_session"] == "2016-01-04"
+    assert cov["sector_assignment"]["labels"] == "none" and cov["price_files"] == 25 and cov["first"] == d[0]
+    assert cov["floors"] == {"min_price": 2, "min_dollar_volume": 1e6, "dollar_volume_window": 21}
+    assert report["trial_count"] == 1 and report["tested"] == 1 and report["ranking"][0]["n"] > 90

@@ -99,7 +99,7 @@ After 2022 the count mixes real endings with stale files: 717 companies Tiingo s
 history that stops in 2023 to 2026 (405 of them in 2026). That is after the discovery window. It has to be
 settled before any confirmation look uses those years.
 
-Companies that qualify on the last session of each year (`counts`):
+Companies that qualify on the last session of each year (`counts`, as it was on 2026-11-20):
 
 | Floors | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 |
 |---|---|---|---|---|---|---|---|
@@ -109,7 +109,7 @@ Companies that qualify on the last session of each year (`counts`):
 So these floors add about 1,100 to 1,400 companies a year below the default ones. These counts are of
 companies with prices; the missing quarter of ended companies is not in them.
 
-**Load check.** The factory change in PR #1291 loaded this panel (bars and the universe mask only:
+**Load check (2026-11-20, the old in-place panel).** The factory change in PR #1291 loaded this panel (bars and the universe mask only:
 no signal, no outcome, no ledger): 9,471 price files, 3,524 sessions from 2009-01-02 to 2022-12-30, no
 sector labels, 316 seconds and 6.9 GB of memory at peak. Its count of rankable companies at $2 and $1M
 equals `counts` on the last session of every year from 2009 to 2022. The first attempt failed: the
@@ -120,56 +120,105 @@ the PR now raises for that read.
 
 | Command | Reads | Writes |
 |---|---|---|
-| `fetch` | The company list; Tiingo by permanent id | `prices/<id>.csv`, `no-prices/<id>`, `fetch-log.jsonl` |
-| `build` | The company list; the price files | `companies.csv`, `universe-report.json`, and `panel/` for the factory |
-| `counts` | `panel/` | Qualifying companies on the last session of each year, for given floors |
+| `fetch` | The company list; Tiingo by permanent id | `fetch-state.json`, `prices/<id>.csv`, `no-prices/<id>`, `fetch-log.jsonl` |
+| `bind-existing` | The company list; the price files on disk | `fetch-state.json` for a store pulled before that record existed |
+| `build` | The company list; the price files; `fetch-state.json` | One panel generation `panel/g-<id>/`, `panel/CURRENT`, `companies.csv`, `universe-report.json` |
+| `counts` | The current generation | Companies the factory would rank on the last session of each year, for given floors |
 
 **Which companies are included.** Common shares only. Left out: depositary receipts (Tiingo's flag), and
 by name or ticker suffix: units, warrants, rights, preferreds, funds and blank-check shells (a name with
 "acquisition"). `companies.csv` lists every company with its kind, so the choice can be checked and
 changed. A company with no name is taken as common shares.
 
+**One pull per store.** A pull is a start day and a vintage, the last day asked for. Both go into every
+request (`startDate`, `endDate`), so a file asked for today and one asked for a week later hold the same
+rows. The vintage must be a finished day. `fetch-state.json` records the start, the vintage and the hash
+of the company list. A resume that asks for another start, vintage or company list is refused before any
+request is made: a different pull needs its own data directory.
+
 **Fetch.** One request per included company, key in a header, about one request a second. It can be
-stopped and started: an id with a price file or a no-prices mark is skipped. Tiingo has two answers for an
-id with no bars, and only those count as "no prices": an empty list (`[]`), or the column header alone
-(seen for Merrill Lynch and Aleris International, among others). Any other answer without bars is a
-failure and is asked again.
+stopped and started inside one pull: an id with a price file or a no-prices mark is skipped. Tiingo has
+two answers for an id with no bars, and only those count as "no prices": an empty list (`[]`), or the
+column header alone (seen for Merrill Lynch and Aleris International, among others).
+
+**An answer is written only when all of it is a daily file.** `price_rows` checks the whole body first:
+the exact header, thirteen fields on every row, a date that is a day, eleven prices and factors that are
+finite numbers, a volume that is not negative, days in order with none repeated, and every day inside the
+start and the vintage. Anything else, a `date,error` body or one bad row after a thousand good ones, is
+logged as failed with the reason, leaves no file, and is asked again on the next run. The file is written
+to a temporary name and renamed, so a price file on disk is always a whole checked answer. `build` and
+`bind-existing` run the same check on every file they read.
 
 **Life of a company.** First and last bar are the first and last day with volume above zero. A company
 has ended when its last traded day is more than 5 sessions before the store's last.
 
-**The floor rule** is the factory's own, with the two floors as arguments: a valid bar on day d, the
-unadjusted close on d−1 at least the price floor, and the median dollar volume over the 21 sessions
-ending d−1 at least the dollar floor. `universe_on(data_dir, day, min_price, min_dollar_volume)` answers
-"which companies are in the universe on day D".
+**Who is in the universe on a day** is not decided here. `counts` and `universe_on` call the factory's
+`universe` on the current generation, the function `load_panel` itself builds on, so a count and a run
+cannot disagree. Its rule: a valid bar on session d (positive unadjusted and adjusted open and close,
+open and close inside the day's range), the unadjusted close on the store's previous session at least
+the price floor, and the median dollar volume over the 21 sessions ending there at least the dollar
+floor. A company with no bar on the previous session is out, whatever its own last row says. Sessions
+are the factory's: days on which at least `min_session_bars` price files have a bar (300 unless
+`--min-session-bars` says otherwise), and no bar after its last development bar, 2022-12-30.
 
-**What the factory gets** is the directory `panel/`, not the files as served:
+**What the factory gets** is one generation, `panel/g-<id>/`, not the files as served:
 
-- `panel/prices/<id>.csv`: each price file cut to the company's traded life, from its first day with volume
+- `prices/<id>.csv`: each price file cut to the company's traded life, from its first day with volume
   to its last. This matters. Tiingo's flat no-volume bars after a delisting pass the factory's valid-bar
   rule, and the dollar-volume median takes 11 sessions to fall to zero, so on the files as served an ended
   company stays rankable for 11 sessions with a return of exactly zero (measured on a test store,
   2026-11-20). Cut, it leaves the day after its last trade, and a pick held into that day is dropped and
   counted by the factory (`dropped_pick_share`). A day without volume inside a company's life (a halt) is
   kept.
-- `panel/members.csv`: one row with every included id that ever traded. The factory already requires a
+- `members.csv`: one row with every included id that ever traded. The factory already requires a
   valid bar on the day, so a company is in on the days it trades and out otherwise.
-- `panel/renames.json`: empty, because ids do not change.
-- `panel/sectors.csv`: the header alone, which the factory reads as "no sector labels" once the change
-  below is in.
+- `renames.json`: empty, because ids do not change.
+- `sectors.csv`: the header alone, which the factory reads as "no sector labels".
+- `panel-manifest.json`: the factory's export manifest (`seal_export`): every file's size and hash, the
+  pull it came from, and `discovery_first_session`, 2016-01-04 unless `--discovery-first` says otherwise.
+  The factory refuses a run whose window starts earlier, before it declares anything.
 
-`counts` and `universe_on` read the panel and refuse a store that has not been built, so the files as
-served are never ranked by mistake. A second build removes a panel file whose company no longer has bars.
+**A generation is published whole and never edited.** `build` assembles it in a hidden directory, seals
+it, and renames it to `panel/g-<id>` in one step, then marks every file and directory read-only. The id
+is the hash of the manifest's content, so the same inputs give the same generation and a build that
+finds it already there writes nothing into it. Other inputs give another generation beside the first;
+the first stays as it was. `panel/CURRENT` names the latest and is replaced in one step. `counts` and
+`universe_on` read the generation `CURRENT` names, check every file against its manifest, and refuse a
+store that has not been built or a generation that has been touched.
+
+## Review fixes (2026-11-21)
+
+Review of #1294 at `e5796b2c` found four things, all fixed above:
+
+| Finding | Fix |
+|---|---|
+| `counts` read each company's own adjacent rows, so with a session missing it admitted a company the factory rejects, and it did not check the adjusted bar | `counts` and `universe_on` call the factory's `universe`; the copy of the rule is gone |
+| A 200 answer holding `date,error` and a malformed row was written as a price file and skipped on resume | Whole-body check before anything is written |
+| A resume was not tied to the start or vintage it began with | `fetch-state.json`; the vintage is in every request |
+| `build` replaced panel files one at a time in place | One sealed generation per build, renamed into place, read-only |
+
+Tests are on synthetic stores only (`tests/test_smallcap_universe.py`): no request to Tiingo, no read of
+the real store, no run.
+
+**The store on grid-svr predates these fixes.** It has no `fetch-state.json`, its requests carried no
+`endDate`, and its `panel/` is the old in-place layout, which nothing reads now. Before any run it needs
+`bind-existing` (start 2009-01-02; the vintage is its last bar, 2026-11-19), which checks every price file
+on disk and asks Tiingo nothing, and then `build`. Neither has been done. The counts and the load check
+recorded above were made on the old layout on 2026-11-20; the load check compared them with the factory's
+own count at $2 and $1M on the last session of each year and they were equal, but they have not been
+re-made through the shared function.
 
 ## What is not done
 
 - **The factory on main cannot load this store.** It stops with an error when `sectors.csv` has no labels,
-  and its floors are constants ($5 and $10M a day). The change is drafted on its own branch,
-  `claude/xs-factory-floors-nosector-20261120` (PR #1291, 2026-11-20, ready for review, not merged): floors become
-  optional run-file fields, and a header-only `sectors.csv` loads as "no labels", pooled rankings only. A
-  run file without the new fields gives a byte-identical report. A panel built here ran through that
-  draft end to end on a test store, and the real panel loads in it (above). No signal has been run on
-  real small-cap data. The 2016 start needs no change.
+  and its floors are constants ($5 and $10M a day). The change is on its own branch,
+  `claude/xs-factory-floors-nosector-20261120` (PR #1291, not merged): floors become optional run-file
+  fields; a header-only `sectors.csv` loads as "no labels", pooled rankings only; a no-label store must be
+  a sealed export; and every file a run reads is checked against the hashes it declared. This branch is
+  stacked on that one, because `counts` and `build` call its `universe` and `seal_export`. A run file
+  without the new fields gives a byte-identical report on a store without an export. No signal has been
+  run on real small-cap data.
+- The store on grid-svr has not been bound and rebuilt (above).
 - No sector source, so no within-sector ranking, sector gate or sector card for small caps yet.
 - The factory's default cost is 1 bp a side, set for index members. A small-cap run file must set its
   own figure. Owner decision, 2026-11-20: the first run file assumes 25 bp a side. That is a stand-in
@@ -177,10 +226,13 @@ served are never ranked by mistake. A second build removes a panel file whose co
   22 bp for $3M to $10M, 18 bp for $10M to $50M, 8 bp above; single years read from zero to 48 bp for
   the whole universe). It is not measured. Real tickets, the way #1214 does for index members, replace it.
 - Share-kind filtering is by name. It has not been checked against a list of security types.
+- Whether Tiingo's daily file writes a date as a day alone or with a time is taken either way; the check
+  has not been run against the files on grid-svr.
 
 ## Where the data is
 
 grid-svr, the `smallcap-data/` directory of the research data home: `raw/` (the company list as served, the
 ended-company sample, SEC's quarterly indexes and the two comparison files), `prices/` (as served),
-`no-prices/` (one mark per id Tiingo has no bars for), `panel/` (what the factory reads), `companies.csv`,
-`universe-report.json`, `fetch-log.jsonl`, `code/` (the `analysis/` copy that ran) and `run-fetch.sh`.
+`no-prices/` (one mark per id Tiingo has no bars for), `panel/` (the old in-place layout until the store is
+rebuilt; then one directory per generation and `CURRENT`), `companies.csv`, `universe-report.json`,
+`fetch-log.jsonl`, `code/` (the `analysis/` copy that ran) and `run-fetch.sh`.
