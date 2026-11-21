@@ -109,8 +109,12 @@ def export(tmp_path, *lines, name="verdicts.jsonl"):
 def receipt_body(*trials, continuity="extends_last_receipt", texts=None, **change):
     """The panel_trials payload of a nightly Desk receipt that read these slots and retains their stored looks."""
     texts = texts or LOOK_TEXT
+    content = {t: hashlib.sha256(f"registration of {SLOT[t]}".encode()).hexdigest() for t in trials}
     body = {"store": "panel_trials", "rows": 21, "head": "d" * 64, "continuity": continuity, "factory_looks_table": "present",
-            "factory_slots": [{"trial_id": SLOT[t], "registered_at": "2026-12-01T22:00:00+00:00", "row_hash": ROW[t]} for t in trials],
+            "trials": [{"seq": i, "trial_id": SLOT[t], "family": "panel-factory", "registered_at": "2026-12-01T22:00:00+00:00",
+                        "row_hash": ROW[t], "content_sha256": content[t]} for i, t in enumerate(trials, start=1)],
+            "factory_slots": [{"trial_id": SLOT[t], "registered_at": "2026-12-01T22:00:00+00:00", "row_hash": ROW[t],
+                               "content_sha256": content[t], "params": "{}"} for t in trials],
             "factory_looks": [{"trial_id": SLOT[t], "looked_at": LOOKED, "through_day": "2027-03-01", "result": texts[t],
                                "result_sha256": hashlib.sha256(texts[t].encode()).hexdigest()} for t in trials]}
     for key, value in change.items():
@@ -263,6 +267,7 @@ def test_a_receipt_that_retains_the_same_stored_look_witnesses_the_verdict(tmp_p
     assert record["receipt"]["external_anchor"] == {"file": dsr.ANCHOR_NAME, "sha256": hashlib.sha256(anchors.read_bytes()).hexdigest(),
                                                     "witnessed_records": 2}
     assert record["look_recomputed"] is True
+    assert record["registration_content_sha256"] == hashlib.sha256(b"registration of T-PF-01").hexdigest()
     assert record["checked"] == {"by_code": list(drw.BY_CODE), "by_a_person": drw.BY_A_PERSON}   # says what it did not check
     assert "held off-host" in record["checked"]["by_a_person"]
 
@@ -327,9 +332,73 @@ def test_a_payload_that_is_not_the_bytes_the_receipt_names_is_refused(tmp_path):
     stored = next(log.payload_dir.iterdir())
     stored.chmod(0o600)
     stored.write_bytes(stored.read_bytes().replace(b"0.0456", b"0.0999"))
-    with pytest.raises(drw.WitnessError, match="does not verify"):
+    with pytest.raises(drw.WitnessError, match="not the bytes its hash names"):
         witness_from(ledger, root, anchors)
     assert ledger.of_kind(lse.FACTORY_FORWARD_WITNESS) == []
+
+
+def _replace_receipt_after_verification(monkeypatch, log, source, field="read_finished_at", value="2027-03-01T21:22:00+00:00"):
+    """Make the real verifier succeed, then rewrite the live receipt line before the caller can go back for it."""
+    real = dsr.ReceiptLog.verify
+    genuine = list(dsr.raw_lines(log.path))
+
+    def verify_then_replace(self, *args, **kwargs):
+        out = real(self, *args, **kwargs)
+        record = json.loads(genuine[1])
+        record["sources"][source][field] = value
+        log.path.write_bytes(genuine[0] + b"\n" + dsr.canonical(record) + b"\n")
+        return out
+
+    monkeypatch.setattr(dsr.ReceiptLog, "verify", verify_then_replace)
+    return genuine, real
+
+
+def test_a_receipt_replaced_after_it_was_verified_cannot_supply_the_witness(tmp_path, monkeypatch):
+    """Codex on 3a958111: the log was verified, then reopened, and a replacement line gave an unanchored head."""
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
+    root, anchors, log = receipts(tmp_path, receipt_body(T1))
+    genuine, real = _replace_receipt_after_verification(monkeypatch, log, "panel_trials")
+
+    assert witness_from(ledger, root, anchors) == 1
+
+    replaced = list(dsr.raw_lines(log.path))
+    assert replaced[1] != genuine[1]                                    # the live log was replaced under the witness
+    record = ledger.of_kind(lse.FACTORY_FORWARD_WITNESS)[0]["receipt"]
+    assert record["head_sha256"] == hashlib.sha256(genuine[1]).hexdigest() != hashlib.sha256(replaced[1]).hexdigest()
+    assert record["read_finished_at"] == json.loads(genuine[1])["sources"]["panel_trials"]["read_finished_at"]
+    assert record["external_anchor"]["sha256"] == hashlib.sha256(anchors.read_bytes()).hexdigest()
+    monkeypatch.setattr(dsr.ReceiptLog, "verify", real)
+    assert not dsr.ReceiptLog(root).verify(anchors)["ok"]              # the replacement itself never verifies:
+    other = lse.Ledger.create_factory(None, ledger_id="factory-test-2")
+    lse.ingest_factory_verdicts(other, export(tmp_path, line(run(other)), name="again.jsonl"))
+    with pytest.raises(drw.WitnessError, match="does not verify"):      # presented from the start, it is refused
+        witness_from(other, root, anchors)
+    assert other.of_kind(lse.FACTORY_FORWARD_WITNESS) == []
+
+
+def test_the_three_live_files_are_each_read_exactly_once(tmp_path, monkeypatch):
+    ledger = lse.Ledger.create_factory(None, ledger_id="factory-test")
+    lse.ingest_factory_verdicts(ledger, export(tmp_path, line(run(ledger))))
+    root, anchors, log = receipts(tmp_path, receipt_body(T1))
+    live = {str(log.path): "log", str(log.anchor_path): "local anchors", str(anchors): "anchor copy"}
+    reads = []
+    real_read, real_open = type(log.path).read_bytes, open
+
+    def counting_read(self):
+        reads.append(live.get(str(self)))
+        return real_read(self)
+
+    def counting_open(file, *args, **kwargs):
+        reads.append(live.get(str(file)))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(type(log.path), "read_bytes", counting_read)
+    monkeypatch.setattr("builtins.open", counting_open)
+    receipt = drw.verified_receipt(root, anchors, "2027-03-01", "panel_trials")
+    monkeypatch.undo()
+    assert sorted(x for x in reads if x) == ["anchor copy", "local anchors", "log"]      # verification ran on private copies
+    assert receipt["log_records"] == 2
 
 
 @pytest.mark.parametrize("field, over", [
@@ -363,6 +432,16 @@ def test_a_look_text_that_is_not_its_digest_or_a_payload_read_without_history_is
         witness(ledger, tmp_path, receipt_body(T1, result=look_text(T1, mean=0.0999)), name="edited-text")
     with pytest.raises(ValueError, match="not read against the receipt log's own history"):
         witness(ledger, tmp_path, receipt_body(T1, continuity="not_checked"), name="no-history")
+    for name, strip in (("no-trials", lambda b: b.pop("trials")), ("empty-trials", lambda b: b.update(trials=[]))):
+        unbound = receipt_body(T1)
+        strip(unbound)                                       # the payload of 0bdeba34: registrations by row hash only
+        with pytest.raises(ValueError, match="does not bind its registrations by content"):
+            witness(ledger, tmp_path, unbound, name=name)
+    for name, change in (("another-time", {"registered_at": "2020-01-01T00:00:00+00:00"}), ("no-digest", {"content_sha256": None})):
+        moved = receipt_body(T1)
+        moved["factory_slots"][0].update(change)             # the same row hash, another registration
+        with pytest.raises(ValueError, match="the import is not that registration"):
+            witness(ledger, tmp_path, moved, name=name)
     old_shape = receipt_body(T1)
     del old_shape["continuity"]
     for look in old_shape["factory_looks"]:
