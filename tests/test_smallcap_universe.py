@@ -163,6 +163,10 @@ GOOD = "2020-01-02,5.0,5.0,5.0,5.0,100,5.0,5.0,5.0,5.0,100,0.0,1.0\n"
     ((HEADER + "\n" + GOOD.replace("2020-01-02", "2022-12-31")).encode(), "outside the pull"),   # after the vintage
     ((HEADER + "\n" + GOOD + "\n" + GOOD.replace("2020-01-02", "2020-01-03")).encode(), "13 fields"),   # a blank line inside
     ((HEADER + ",extra\n" + GOOD).encode(), "header"),
+    ((HEADER + "\n" + GOOD.replace(",100,", ",,", 1)).encode(), "cannot be read"),                 # a blank volume
+    ((HEADER + "\n" + GOOD.replace(",0.0,1.0", ",,1.0")).encode(), "cannot be read"),               # a blank dividend
+    ((HEADER + "\n" + GOOD.replace(",0.0,1.0", ",0.0,")).encode(), "cannot be read"),               # a blank split factor
+    ((HEADER + "\n" + GOOD.replace("2020-01-02", "")).encode(), "13 fields"),                       # a blank date
 ])
 def test_a_200_that_is_not_a_whole_daily_file_is_never_written_or_taken_as_done(tmp_path, body, why):
     m = meta(tmp_path)
@@ -183,6 +187,26 @@ def test_a_200_that_is_not_a_whole_daily_file_is_never_written_or_taken_as_done(
         U.price_rows(body, START, VINTAGE)
     with pytest.raises(U.UniverseError, match=why):                         # build checks a file on disk the same way
         U.traded_life(body, START, VINTAGE)
+
+
+def test_a_blank_price_is_kept_as_served_and_reported_but_other_blank_fields_are_refused(tmp_path):
+    # Tiingo serves a blank low on some days without a trade (10 of the 9,576 files pulled 2026-11-20).
+    blank_low = "2020-01-03,5.0,5.0,,5.0,0,5.0,5.0,,5.0,0,0.0,1.0\n"
+    raw = (HEADER + "\n" + GOOD + blank_low + GOOD.replace("2020-01-02", "2020-01-06")).encode()
+    rows = U.price_rows(raw, START, VINTAGE)
+    assert [(r[0], r[1], r[3]) for r in rows] == [("2020-01-02", 100.0, False), ("2020-01-03", 0.0, True), ("2020-01-06", 100.0, False)]
+    assert rows[1][2] == blank_low.encode()                                 # the line is not rewritten
+    body, first, last, n, cut = U.traded_life(raw, START, VINTAGE)
+    assert body == raw and (first, last, n, cut) == ("2020-01-02", "2020-01-06", 2, 0)   # a no-trade day inside the life stays
+    for i in (1, 2, 3, 4, 6, 7, 8, 9):                                      # any of the eight prices may be blank
+        fields = GOOD.strip().split(",")
+        fields[i] = ""
+        assert U.price_rows((HEADER + "\n" + ",".join(fields) + "\n").encode(), START, VINTAGE)[0][3] is True
+    m = meta(tmp_path)
+    cs = [c for c in U.load_companies(m) if c.perma == A]
+    out = tmp_path / "store"
+    assert fetch(cs, out, lambda url: (200, raw), m) == {"prices": 1}       # written: it is a whole daily file
+    assert (out / "prices" / f"{A}.csv").read_bytes() == raw
 
 
 def test_a_resume_is_bound_to_the_start_the_vintage_and_the_company_list(tmp_path):
@@ -376,7 +400,12 @@ def many(tmp_path, d, n=25, edits=None):
 
 def test_counts_are_the_factory_s_universe_on_a_missing_session_and_an_invalid_adjusted_bar(tmp_path):
     d = days(60, "2016-02-01")
-    gap, bad = 30, 40
+    gap, bad, blank = 30, 40, 45
+
+    def blank_low(lines):
+        f = lines[blank + 1].split(b",")
+        f[3] = f[8] = b""
+        return [*lines[:blank + 1], b",".join(f), *lines[blank + 2:]]
 
     def zero_adjusted_close(lines):
         f = lines[bad + 1].split(b",")
@@ -384,8 +413,9 @@ def test_counts_are_the_factory_s_universe_on_a_missing_session_and_an_invalid_a
         return [*lines[:bad + 1], b",".join(f), *lines[bad + 2:]]
 
     m, out, ids = many(tmp_path, d, edits={3: lambda lines: [*lines[:gap + 1], *lines[gap + 2:]],   # no bar on session `gap`
-                                           4: zero_adjusted_close})
-    U.build(m, out)
+                                           4: zero_adjusted_close, 5: blank_low})
+    rep = U.build(m, out)
+    assert rep["rows_with_a_blank_price"] == 1 and rep["price_files_with_a_blank_price"] == 1
     on = lambda day: U.universe_on(out, day, 2.0, 1e6, min_session_bars=20)
     everyone = sorted(ids)
     assert on(d[gap - 1]) == everyone
@@ -395,6 +425,8 @@ def test_counts_are_the_factory_s_universe_on_a_missing_session_and_an_invalid_a
     assert on(d[gap + 1]) == sorted(set(ids) - {ids[3]})
     assert on(d[gap + 2]) == everyone
     assert on(d[bad]) == sorted(set(ids) - {ids[4]}) and on(d[bad + 1]) == everyone   # a zero adjusted close is not a bar
+    assert on(d[blank]) == sorted(set(ids) - {ids[5]}) and on(d[blank + 1]) == everyone   # nor is a day with a blank low
+    assert b",," in (generation(out) / "prices" / f"{ids[5]}.csv").read_bytes()         # the panel keeps the row as served
 
     panel = generation(out)
     run = X.RunFile.from_dict({"run_id": "parity", "first_session": d[0], "last_session": d[-2], "rankings": ["pooled"],

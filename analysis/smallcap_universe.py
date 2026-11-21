@@ -66,6 +66,9 @@ KINDS = ("common", "unit", "warrant", "right", "preferred", "spac", "fund")
 _PERMA = re.compile(r"^[A-Z]{2}\d{12}$")
 _GENERATION = re.compile(r"^g-[0-9a-f]{16}$")
 _ROW_DAY = re.compile(rb"^(\d{4}-\d{2}-\d{2})(T[0-9:.]{8,12}Z)?$")
+# Fields that may be blank in a row Tiingo serves: the eight prices (close, high, low, open and their adjusted
+# forms), by position after the date. Volume, adjusted volume, dividend and split factor may not.
+_PRICE_FIELDS = (0, 1, 2, 3, 5, 6, 7, 8)
 _NAME_KINDS = (   # first match wins; checked against the lower-cased name
     ("unit", re.compile(r"\bunits?\b")),
     ("warrant", re.compile(r"\bwarrants?\b|\bwts?\b")),
@@ -157,12 +160,17 @@ def _day(value: str, what: str) -> str:
     raise UniverseError(f"{what} must be a day, YYYY-MM-DD")
 
 
-def price_rows(raw: bytes, start: str, vintage: str) -> list[tuple[str, float, bytes]]:
-    """One Tiingo daily file checked whole: (day, volume, line as served) per row.
+def price_rows(raw: bytes, start: str, vintage: str) -> list[tuple[str, float, bytes, bool]]:
+    """One Tiingo daily file checked whole: (day, volume, line as served, has a blank price) per row.
 
     Refuses anything that is not exactly the daily file: another header, a row without thirteen fields, a date that
     is not a day, a number that does not parse or is not finite, a negative volume, days out of order or repeated,
-    and a day outside ``start`` .. ``vintage``."""
+    and a day outside ``start`` .. ``vintage``.
+
+    One thing Tiingo does serve is a blank price: on some days without a trade the low is empty (seen in 10 of the
+    9,576 files pulled 2026-11-20, 2,238 rows, always the low and the adjusted low). A blank price field is kept as
+    served and reported; the factory reads it as a missing value, so that day is not a valid bar. A blank volume,
+    adjusted volume, dividend or split factor is still refused."""
     lines = raw.splitlines(keepends=True)
     if not lines or lines[0].strip(b"\r\n") != PRICE_HEADER:
         raise UniverseError("does not start with Tiingo's daily header")
@@ -172,18 +180,19 @@ def price_rows(raw: bytes, start: str, vintage: str) -> list[tuple[str, float, b
         m = _ROW_DAY.match(fields[0])
         if len(fields) != 13 or not m:
             raise UniverseError(f"line {n} is not a daily row of 13 fields")
+        blank = [i for i in _PRICE_FIELDS if not fields[1 + i].strip()]
         try:
             day = date.fromisoformat(m.group(1).decode()).isoformat()
-            numbers = [float(x) for x in fields[1:]]
+            numbers = [float("nan") if i in blank else float(x) for i, x in enumerate(fields[1:])]
         except ValueError as exc:
             raise UniverseError(f"line {n} holds a date or a number that cannot be read") from exc
-        if not all(math.isfinite(x) for x in numbers) or numbers[4] < 0:
+        if not all(math.isfinite(x) for i, x in enumerate(numbers) if i not in blank) or numbers[4] < 0:
             raise UniverseError(f"line {n} holds a number that is not finite, or a negative volume")
         if day <= prev:
             raise UniverseError(f"line {n} is out of date order or repeats a day")
         if not start <= day <= vintage:
             raise UniverseError(f"line {n} is dated {day}, outside the pull {start} .. {vintage}")
-        rows.append((day, numbers[4], line))
+        rows.append((day, numbers[4], line, bool(blank)))
         prev = day
     return rows
 
@@ -324,19 +333,21 @@ def bind_existing(meta_path: Path, data_dir: Path, *, start: str, vintage: str) 
     return {**state, "price_files_checked": len(files)}
 
 
+def _life(header: bytes, rows: list[tuple[str, float, bytes, bool]]) -> tuple[bytes, str, str, int, int]:
+    traded = [i for i, row in enumerate(rows) if row[1] > 0]
+    if not traded:
+        return b"", "", "", 0, len(rows)
+    a, b = traded[0], traded[-1]
+    return (header + b"".join(row[2] for row in rows[a:b + 1]), rows[a][0], rows[b][0], len(traded),
+            len(rows) - (b + 1 - a))
+
+
 def traded_life(raw: bytes, start: str = "0001-01-01", vintage: str = "9999-12-31") -> tuple[bytes, str, str, int, int]:
     """One price file cut to its traded life: (bytes, first traded day, last traded day, traded days, rows cut).
 
     The file is checked whole first (``price_rows``). Rows before the first day with volume and after the last are
     removed; a day without volume in between (a halt) stays. A file with no traded day gives empty bytes."""
-    rows = price_rows(raw, start, vintage)
-    traded = [i for i, (_, volume, _) in enumerate(rows) if volume > 0]
-    if not traded:
-        return b"", "", "", 0, len(rows)
-    a, b = traded[0], traded[-1]
-    header = raw.splitlines(keepends=True)[0]
-    return (header + b"".join(line for _, _, line in rows[a:b + 1]), rows[a][0], rows[b][0], len(traded),
-            len(rows) - (b + 1 - a))
+    return _life(raw.splitlines(keepends=True)[0] if raw else b"", price_rows(raw, start, vintage))
 
 
 def current_panel(data_dir: Path) -> tuple[Path, dict, dict]:
@@ -416,14 +427,18 @@ def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRS
     (work / "prices").mkdir(parents=True)
     spans: dict[str, tuple[str, str, int]] = {}
     seen_days: set[str] = set()
-    cut_rows = cut_files = 0
+    cut_rows = cut_files = blank_rows = blank_files = 0
     try:
         for p in raw_files:
             # Tiingo carries an ended company forward as flat bars with no volume; only traded days mark its life.
+            raw = p.read_bytes()
             try:
-                body, first, last, n, cut = traded_life(p.read_bytes(), state["start"], state["vintage"])
+                rows = price_rows(raw, state["start"], state["vintage"])
             except UniverseError as e:
                 raise UniverseError(f"{p.name}: {e}") from e
+            body, first, last, n, cut = _life(raw.splitlines(keepends=True)[0], rows)
+            blank = sum(row[3] for row in rows)
+            blank_rows, blank_files = blank_rows + blank, blank_files + bool(blank)
             spans[p.stem] = (first, last, n)
             cut_rows, cut_files = cut_rows + cut, cut_files + bool(cut)
             if n:
@@ -487,6 +502,7 @@ def build(meta_path: Path, data_dir: Path, discovery_first: str = DISCOVERY_FIRS
         "generation_already_built": unchanged, "discovery_first_session": discovery_first,
         "fetch": {"start": state["start"], "vintage": state["vintage"]},
         "price_files_cut": cut_files, "rows_cut_outside_traded_life": cut_rows,
+        "price_files_with_a_blank_price": blank_files, "rows_with_a_blank_price": blank_rows,   # as served, cut rows included
     }
     _write_whole(data_dir / "universe-report.json", (json.dumps(report, indent=2) + "\n").encode())
     return report

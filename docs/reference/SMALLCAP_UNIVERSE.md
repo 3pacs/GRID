@@ -144,7 +144,7 @@ column header alone (seen for Merrill Lynch and Aleris International, among othe
 **An answer is written only when all of it is a daily file.** `price_rows` checks the whole body first:
 the exact header, thirteen fields on every row, a date that is a day, eleven prices and factors that are
 finite numbers, a volume that is not negative, days in order with none repeated, and every day inside the
-start and the vintage. Anything else, a `date,error` body or one bad row after a thousand good ones, is
+start and the vintage. One thing is allowed because Tiingo serves it: a blank price (below). Anything else, a `date,error` body or one bad row after a thousand good ones, is
 logged as failed with the reason, leaves no file, and is asked again on the next run. The file is written
 to a temporary name and renamed, so a price file on disk is always a whole checked answer. `build` and
 `bind-existing` run the same check on every file they read.
@@ -220,22 +220,33 @@ the real store, no run.
 **The store on grid-svr predates these fixes.** It has no `fetch-state.json`, its requests carried no
 `endDate`, and its `panel/` is the old in-place layout, which nothing reads now. Before any run it needs
 `bind-existing` (start 2009-01-02; the vintage is its last bar, 2026-11-19), which checks every price file
-on disk and asks Tiingo nothing, and then `build`. Neither has been done. The counts and the load check
-recorded above were made on the old layout on 2026-11-20; the load check compared them with the factory's
-own count at $2 and $1M on the last session of each year and they were equal, but they have not been
-re-made through the shared function.
+on disk and asks Tiingo nothing, and then `build`. The counts and the load check recorded above were made
+on the old layout on 2026-11-20; the load check compared them with the factory's own count at $2 and $1M
+on the last session of each year and they were equal, but they have not been re-made through the shared
+function.
+
+**First attempt on the real store, 2026-11-21: refused, and why.** After both PRs were accepted in
+review, `bind-existing` ran on the store and stopped at the first file with a row it could not read. It
+wrote nothing. A read-only pass over all 9,576 price files (22,319,270 rows) found one kind of row the
+check did not allow: a blank low and adjusted low, on days without a trade. 2,238 rows in 10 files have
+it. Every other row passes: every date is a day alone, the last day is 2026-11-19, and every included
+company has either a price file or a no-prices mark (9,576 and 6,895).
+
+The check now takes a blank in any of the eight price fields as served. The row is kept unchanged, the
+factory reads the field as a missing value, so that day is not a valid bar for that company, and `build`
+reports the count (`rows_with_a_blank_price`, `price_files_with_a_blank_price`). A blank volume, adjusted
+volume, dividend, split factor or date is still refused. With that change all 9,576 files pass the check
+(dry run, nothing written). The store is still not bound and not rebuilt: that waits for this change to be
+reviewed.
 
 ## What is not done
 
-- **The factory on main cannot load this store.** It stops with an error when `sectors.csv` has no labels,
-  and its floors are constants ($5 and $10M a day). The change is on its own branch,
-  `claude/xs-factory-floors-nosector-20261120` (PR #1291, not merged): floors become optional run-file
-  fields; a header-only `sectors.csv` loads as "no labels", pooled rankings only; a no-label store must be
-  a sealed export; and every file a run reads is checked against the hashes it declared. This branch is
-  stacked on that one, because `counts` and `build` call its `universe` and `seal_export`. A run file
-  without the new fields gives a byte-identical report on a store without an export. No signal has been
-  run on real small-cap data.
-- The store on grid-svr has not been bound and rebuilt (above).
+- **The factory change is merged (PR #1291, 2026-11-21).** Floors are optional run-file fields; a
+  header-only `sectors.csv` loads as "no labels", pooled rankings only; a no-label store must be a sealed
+  export; and every file a run reads is checked against the hashes it declared. `counts` and `build` here
+  call its `universe` and `seal_export`. No signal has been run on real small-cap data.
+- The store on grid-svr has not been bound and rebuilt (above), so no sealed generation of the real data
+  exists yet.
 - No sector source, so no within-sector ranking, sector gate or sector card for small caps yet.
 - The factory's default cost is 1 bp a side, set for index members. A small-cap run file must set its
   own figure. Owner decision, 2026-11-20: the first run file assumes 25 bp a side. That is a stand-in
@@ -243,8 +254,7 @@ re-made through the shared function.
   22 bp for $3M to $10M, 18 bp for $10M to $50M, 8 bp above; single years read from zero to 48 bp for
   the whole universe). It is not measured. Real tickets, the way #1214 does for index members, replace it.
 - Share-kind filtering is by name. It has not been checked against a list of security types.
-- Whether Tiingo's daily file writes a date as a day alone or with a time is taken either way; the check
-  has not been run against the files on grid-svr.
+- The check takes a date as a day alone or with a time. Every row pulled so far is a day alone.
 
 ## Where the data is
 
