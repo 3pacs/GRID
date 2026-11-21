@@ -727,3 +727,20 @@ receipts detect wrong-byte hand-off but do not serialize concurrent writers.
   1000px and 390px retained recap bullets, purple accents and no overflow.
 - No production query, SMTP send, service restart, PR merge or deployment.
   The new draft head requires its own hosted CI and later delivery validation.
+
+## 2026-11-09 — Fail closed on incomplete gateway evidence (Codex)
+
+- Extended existing decision_gateway and freshness_guard; no new pipeline.
+- Failed/invalid red-team or stress checks and failed gateway stages cannot
+  produce a positive verdict or ticket. Empty red-team fallback reports no
+  longer turn model failure into zero risk. Valid zero-risk counterarguments
+  and sufficient-data behavior remain supported.
+- Future observations are INVALID rather than FRESH. Existing callers only log
+  this status; end-to-end source admission remains unqualified.
+- Gateway opts into strict raw counter-score parsing; other consumers retain
+  legacy tolerant defaults. Model-supplied grade overrides are ignored there.
+- 252 relevant mocked/injected-client tests passed before publication; full remote
+  CI and runtime acceptance remain separate. No live providers, production DB,
+  scheduler, migration, deployment or trading changes.
+- See docs/reference/SYNTHESIS_EVIDENCE_FAILURE_BOUNDARY.md for the contract,
+  limits and relationship to #1083/#1090/#960.
