@@ -61,7 +61,8 @@ version-tolerant column access, graceful fallback where a live path feeds tradin
   Accessors: `get_revenue/get_net_income/get_total_assets/get_shareholders_equity`,
   `get_ttm_revenue`, `shares_outstanding`, `public_float`, `calculate_ratios`.
 - Raw escape hatch: `edgar.entity.entity_facts.download_company_facts_from_sec(cik: int)`
-  returns the raw `{"facts": {"us-gaap": {...}}}` dict (raises `NoCompanyFactsFound`).
+  returns the raw `{"facts": {"us-gaap": {...}}}` dict (raises `CompanyFactsNotFoundError`;
+  the old `NoCompanyFactsFound` alias is gone in 6.0).
 - Identity is mandatory: call `edgar.set_identity(...)` once (env `SEC_USER_AGENT`).
 
 ## Version caveat
@@ -71,3 +72,10 @@ lowercase `holdings["value"]`, which breaks under 5.x** (5.x emits `Value`). The
 runs 4.6.3 today where it works. If/when the pin moves to 5.x, audit `ingestion/edgar.py`
 and `ingestion/sec_velocity.py` for the column-casing change. New rebuilds should be
 version-tolerant from the start (see PR #260's converter).
+
+**6.x (2026-11-21):** requirements.txt pins `edgartools>=6.3.0` on Python 3.11+ and keeps
+5.x on 3.10 (6.x requires 3.11). Every API named above exists unchanged in 6.3.0 (checked
+offline). 6.0 behaviour that matters to rebuilds: `filing.obj()` raises `DataObjectError`
+where 5.x returned `None`, network failures raise `edgar.exceptions.TransportError`, and
+`find(accession)` resolves through full-text search (issuer-first on multi-filer filings).
+See edgartools `docs/upgrade/6.0.md`.

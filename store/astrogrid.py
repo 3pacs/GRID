@@ -501,6 +501,23 @@ def _dominant_driver_labels(payload: Mapping[str, Any] | None, keys: list[str]) 
     return drivers[:5]
 
 
+# Provenance keys only the server-side producer (save_engine_runs) may set.
+# A client-sent engine output carrying them could pre-empt the scheduled
+# producer's once-per-snapshot dedupe (raw_output->>'producer') and pass off
+# browser output as server-computed. Client rows are stamped CLIENT_PRODUCER.
+SERVER_PROVENANCE_KEYS: tuple[str, ...] = ("producer", "code_sha256", "snapshot_built_at")
+CLIENT_PRODUCER = "client_interpret_request"
+
+
+def _client_engine_output(engine_output: Any) -> dict[str, Any]:
+    """A client engine output with server-only provenance keys replaced."""
+    base = dict(engine_output) if isinstance(engine_output, Mapping) else {}
+    for key in SERVER_PROVENANCE_KEYS:
+        base.pop(key, None)
+    base["producer"] = CLIENT_PRODUCER
+    return base
+
+
 class AstroGridStore:
     """Persist AstroGrid runs and snapshots into the dedicated schema."""
 
@@ -661,6 +678,144 @@ class AstroGridStore:
             log.warning("AstroGrid lens-set persistence failed: {e}", e=str(exc))
             return None
 
+    def _insert_engine_run(
+        self,
+        conn: Any,
+        snapshot_id: int,
+        lens_set_id: int | None,
+        engine_output: Mapping[str, Any],
+    ) -> int | None:
+        """Append one ``engine_run`` row and return its id.
+
+        Shared by the interpret route (lens outputs a client sent) and the
+        scheduled producer (:meth:`save_engine_runs`), so both write the same
+        columns the same way.
+        """
+        row = conn.execute(
+            text(
+                f"""
+                INSERT INTO {self.schema}.engine_run (
+                    sky_snapshot_id,
+                    lens_set_id,
+                    engine_key,
+                    engine_family,
+                    provider_mode,
+                    model_name,
+                    direction_label,
+                    confidence,
+                    horizon_label,
+                    reading,
+                    omen,
+                    prediction,
+                    claim_payload,
+                    rationale_payload,
+                    contradiction_payload,
+                    feature_trace,
+                    citation_payload,
+                    raw_output
+                )
+                VALUES (
+                    :sky_snapshot_id,
+                    :lens_set_id,
+                    :engine_key,
+                    :engine_family,
+                    :provider_mode,
+                    :model_name,
+                    :direction_label,
+                    :confidence,
+                    :horizon_label,
+                    :reading,
+                    :omen,
+                    :prediction,
+                    CAST(:claim_payload AS jsonb),
+                    CAST(:rationale_payload AS jsonb),
+                    CAST(:contradiction_payload AS jsonb),
+                    CAST(:feature_trace AS jsonb),
+                    CAST(:citation_payload AS jsonb),
+                    CAST(:raw_output AS jsonb)
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "sky_snapshot_id": snapshot_id,
+                "lens_set_id": lens_set_id,
+                "engine_key": engine_output.get("engine_id") or "unknown",
+                "engine_family": engine_output.get("family") or "unknown",
+                "provider_mode": "deterministic",
+                "model_name": None,
+                "direction_label": engine_output.get("direction_label"),
+                "confidence": _coerce_confidence(engine_output.get("confidence")),
+                "horizon_label": engine_output.get("horizon"),
+                "reading": engine_output.get("reading") or "",
+                "omen": engine_output.get("omen"),
+                "prediction": engine_output.get("prediction"),
+                "claim_payload": _safe_json(engine_output.get("claims") or []),
+                "rationale_payload": _safe_json(engine_output.get("rationale") or []),
+                "contradiction_payload": _safe_json(engine_output.get("contradictions") or []),
+                "feature_trace": _safe_json(engine_output.get("feature_trace") or {}),
+                "citation_payload": _safe_json(engine_output.get("citations") or []),
+                "raw_output": _safe_json(engine_output),
+            },
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def save_engine_runs(
+        self,
+        snapshot_id: int,
+        lens_set_id: int | None,
+        engine_outputs: list[Mapping[str, Any]],
+        *,
+        producer: str,
+    ) -> dict[str, Any]:
+        """Append a producer's lens-engine rows for one stored sky snapshot.
+
+        At most once per ``(sky_snapshot_id, producer)``: when rows from this
+        producer already cite the snapshot, their ids are returned and nothing
+        is written. The hourly celestial cycle reuses one ``sky_snapshot`` row
+        per day, so without this it would append twelve identical rows an
+        hour. Append-only either way: an existing row is never updated.
+
+        ``producer`` is stamped into each row's ``raw_output`` so scheduled
+        rows stay distinguishable from rows a browser client sent through
+        ``POST /astrogrid/interpret``.
+
+        Returns ``{"engine_run_ids": [...], "reused": bool}``, plus ``error``
+        when persistence failed (logged at warning, never raised).
+        """
+        existing_sql = text(
+            f"""
+            SELECT id
+            FROM {self.schema}.engine_run
+            WHERE sky_snapshot_id = :sky_snapshot_id
+              AND raw_output->>'producer' = :producer
+            ORDER BY id
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                existing = conn.execute(
+                    existing_sql,
+                    {"sky_snapshot_id": snapshot_id, "producer": producer},
+                ).fetchall()
+                if existing:
+                    return {
+                        "engine_run_ids": [int(row[0]) for row in existing],
+                        "reused": True,
+                    }
+                ids: list[int] = []
+                for engine_output in list(engine_outputs)[:12]:
+                    stamped = {**dict(engine_output), "producer": producer}
+                    engine_run_id = self._insert_engine_run(
+                        conn, snapshot_id, lens_set_id, stamped
+                    )
+                    if engine_run_id is not None:
+                        ids.append(engine_run_id)
+                return {"engine_run_ids": ids, "reused": False}
+        except Exception as exc:
+            log.warning("AstroGrid engine-run persistence failed: {e}", e=str(exc))
+            return {"engine_run_ids": [], "reused": False, "error": str(exc)}
+
     def save_interpretation(self, request_payload: dict[str, Any], response_payload: dict[str, Any]) -> dict[str, int | None]:
         """Persist engine, Seer, and persona runs for an interpretation call."""
         snapshot = request_payload.get("snapshot") or {}
@@ -684,75 +839,11 @@ class AstroGridStore:
                 seer_run_id = None
                 if snapshot_id is not None:
                     for engine_output in list(request_payload.get("engine_outputs") or [])[:12]:
-                        row = conn.execute(
-                            text(
-                                f"""
-                                INSERT INTO {self.schema}.engine_run (
-                                    sky_snapshot_id,
-                                    lens_set_id,
-                                    engine_key,
-                                    engine_family,
-                                    provider_mode,
-                                    model_name,
-                                    direction_label,
-                                    confidence,
-                                    horizon_label,
-                                    reading,
-                                    omen,
-                                    prediction,
-                                    claim_payload,
-                                    rationale_payload,
-                                    contradiction_payload,
-                                    feature_trace,
-                                    citation_payload,
-                                    raw_output
-                                )
-                                VALUES (
-                                    :sky_snapshot_id,
-                                    :lens_set_id,
-                                    :engine_key,
-                                    :engine_family,
-                                    :provider_mode,
-                                    :model_name,
-                                    :direction_label,
-                                    :confidence,
-                                    :horizon_label,
-                                    :reading,
-                                    :omen,
-                                    :prediction,
-                                    CAST(:claim_payload AS jsonb),
-                                    CAST(:rationale_payload AS jsonb),
-                                    CAST(:contradiction_payload AS jsonb),
-                                    CAST(:feature_trace AS jsonb),
-                                    CAST(:citation_payload AS jsonb),
-                                    CAST(:raw_output AS jsonb)
-                                )
-                                RETURNING id
-                                """
-                            ),
-                            {
-                                "sky_snapshot_id": snapshot_id,
-                                "lens_set_id": lens_set_id,
-                                "engine_key": engine_output.get("engine_id") or "unknown",
-                                "engine_family": engine_output.get("family") or "unknown",
-                                "provider_mode": "deterministic",
-                                "model_name": None,
-                                "direction_label": engine_output.get("direction_label"),
-                                "confidence": _coerce_confidence(engine_output.get("confidence")),
-                                "horizon_label": engine_output.get("horizon"),
-                                "reading": engine_output.get("reading") or "",
-                                "omen": engine_output.get("omen"),
-                                "prediction": engine_output.get("prediction"),
-                                "claim_payload": _safe_json(engine_output.get("claims") or []),
-                                "rationale_payload": _safe_json(engine_output.get("rationale") or []),
-                                "contradiction_payload": _safe_json(engine_output.get("contradictions") or []),
-                                "feature_trace": _safe_json(engine_output.get("feature_trace") or {}),
-                                "citation_payload": _safe_json(engine_output.get("citations") or []),
-                                "raw_output": _safe_json(engine_output),
-                            },
-                        ).fetchone()
-                        if row:
-                            engine_run_ids.append(int(row[0]))
+                        engine_run_id = self._insert_engine_run(
+                            conn, snapshot_id, lens_set_id, _client_engine_output(engine_output)
+                        )
+                        if engine_run_id is not None:
+                            engine_run_ids.append(engine_run_id)
 
                     seer_row = conn.execute(
                         text(

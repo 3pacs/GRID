@@ -187,6 +187,38 @@ rank candidates for forward live recording; they draw nothing from the
 alpha-spending schedule and claim no discovery, but their trials count in
 :func:`declared_trial_count`, so the honest total of shots taken is always
 on the ledger.
+
+Live verdicts (3pacs/GRID#1162). A factory candidate is tested only forward,
+in a gex-signals ``panel-factory`` slot, by one look. That look's final
+verdict comes back as a ``factory_forward_outcome`` record
+(:func:`ingest_factory_verdicts`): ``pass``, ``fail`` or ``underpowered``
+(the deadline passed before 100 resolved fires: counted, not passed). The
+record must name a trial of a result record already on this ledger, by run
+id, trial id and the result line's sha256, and a trial takes one verdict
+only. It closes no run and opens none, so it may arrive while another run is
+open. It is not an S11 ``forward_outcome``: factory trials have no holdout
+survivor, allocation window or S11 identity, and none is invented for them.
+
+What identifies a live verdict is the slot's registration hash and the
+digest of the exact stored look (``look_sha256``), not the live trial
+ledger's head, which only says where that chain stood at export time. A
+re-import whose substance is unchanged (same look digest, rule, verdict,
+counts, mean, bound, days) adds nothing even if its export time or file
+differ; a changed substance for the same trial is refused as a conflict.
+
+An imported verdict is unwitnessed until a nightly Desk receipt that retains
+the same stored look is verified (:func:`witness_factory_verdicts`). Nothing
+about the receipt is taken from the caller: the receipt log is opened, its
+chain, payload files and anchors are checked, an anchor copy held outside the
+log must cover the receipt, and the ``panel_trials`` payload is read from the
+log. The look's digest is recomputed from the look's exact text in that
+payload, and the imported verdict, n, mean, bound, alpha and resolved-fire
+count must equal the stored look's; an import that names the look and differs
+from it is refused. The witness is its own record, ``factory_forward_witness``,
+so the time the verdict arrived and the time its witness arrived stay
+separate, and ``summarize()`` never shows an unwitnessed verdict as witnessed.
+The record says what code checked and what a person must: that the anchor
+copy presented is the one held off-host.
 """
 
 from __future__ import annotations
@@ -195,7 +227,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -237,7 +269,22 @@ FACTORY_PROGRAM = "module_factory"
 FACTORY_DECLARED = "factory_run_declared"
 FACTORY_RESULT = "factory_run_result"
 FACTORY_ABANDONED = "factory_run_abandoned"
-FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED)
+FACTORY_FORWARD = "factory_forward_outcome"
+FACTORY_FORWARD_WITNESS = "factory_forward_witness"
+FACTORY_KINDS = (FACTORY_DECLARED, FACTORY_RESULT, FACTORY_ABANDONED, FACTORY_FORWARD, FACTORY_FORWARD_WITNESS)
+FACTORY_VERDICT_SCHEMA = "panel-factory-verdict/2"   # the export line gex-signals writes; the only contract between the two
+FACTORY_VERDICT_FIELDS = (
+    "schema", "slot_trial_id", "family", "registered_at", "row_hash", "source", "rule", "verdict", "n", "mean_net",
+    "lower_bound", "alpha_per_test", "resolved_fires", "sessions", "looked_at", "through_day", "look_sha256", "chain",
+    "exported_at",
+)
+FACTORY_SLOT_FAMILY = "panel-factory"
+FACTORY_SLOT_ALPHA = 0.05 / 10    # the slot family's alpha over its ten slots, fixed at registration
+# What a live verdict IS. Two imports that agree on all of these are the same verdict, whatever file or time carried them.
+FACTORY_FORWARD_SUBSTANCE = ("result_sha256", "look_sha256", "slot", "rule", "verdict", "n", "mean_net", "lower_bound",
+                             "alpha_per_test", "resolved_fires", "sessions", "looked_at", "through_day")
+FACTORY_VERDICTS = {"PASS": "pass", "FAIL": "fail", "UNDERPOWERED": "underpowered"}
+FACTORY_MIN_N = 100   # resolved fires a slot's one look needs (panel-factory registration)
 FACTORY_SPENDING = "none: ranking runs claim no discovery; the evidence is forward live recording"
 REPO = Path(__file__).resolve().parent.parent
 MAX_Q = 0.10
@@ -915,7 +962,11 @@ class Ledger:
             raise ValueError(
                 f"a {'factory' if self.is_factory else 'S11'} ledger refuses {kind!r} records"
             )
-        if kind in FACTORY_KINDS:
+        if kind == FACTORY_FORWARD:
+            validate_factory_forward(record, factory_result_index(self), factory_forward_seen(self))
+        elif kind == FACTORY_FORWARD_WITNESS:
+            validate_factory_forward_witness(record, factory_forward_index(self), self.of_kind(FACTORY_FORWARD_WITNESS))
+        elif kind in FACTORY_KINDS:
             validate_factory_record(record, factory_open_run(self))
         if kind == HYPOTHESIS_BATCH_KIND:
             validate_hypothesis_batch(record, self.q, hypothesis_batch_trials(self))
@@ -1041,6 +1092,10 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
     hypotheses_seen: set[str] = set()
     factory = False
     open_factory: tuple[dict, str] | None = None
+    factory_results: dict[str, dict] = {}
+    factory_forward: set[tuple[str, str]] = set()
+    factory_forward_lines: dict[str, dict] = {}
+    factory_witnesses: list[dict] = []
 
     for seq, line in enumerate(lines):
         record = json.loads(line)
@@ -1056,9 +1111,18 @@ def verify_chain(lines: list[bytes]) -> list[dict]:
         kind = record.get("kind")
         if seq and factory != (kind in FACTORY_KINDS):
             raise ValueError(f"record {seq}: {kind!r} does not belong on this ledger's program")
-        if kind in FACTORY_KINDS:
+        if kind == FACTORY_FORWARD:   # closes no run and opens none: the open run, if any, stays open
+            validate_factory_forward(record, factory_results, factory_forward)
+            factory_forward.add((record["run_id"], record["trial_id"]))
+            factory_forward_lines[sha256_bytes(line)] = record
+        elif kind == FACTORY_FORWARD_WITNESS:
+            validate_factory_forward_witness(record, factory_forward_lines, factory_witnesses)
+            factory_witnesses.append(record)
+        elif kind in FACTORY_KINDS:
             validate_factory_record(record, open_factory)
             open_factory = (record, sha256_bytes(line)) if kind == FACTORY_DECLARED else None
+            if kind == FACTORY_RESULT:
+                factory_results[sha256_bytes(line)] = record
         if kind == "genesis":
             factory = record.get("program") == FACTORY_PROGRAM
             if "catalog" in record:
@@ -2215,6 +2279,289 @@ def validate_factory_record(record: dict, open_run: tuple[dict, str] | None) -> 
         raise ValueError("an abandoned factory run states its reason")
 
 
+def factory_result_index(ledger: Ledger) -> dict[str, dict]:
+    """{line sha256: record} of every ``factory_run_result`` on the ledger."""
+    return {ledger.line_sha(r["seq"]): r for r in ledger.of_kind(FACTORY_RESULT)}
+
+
+def factory_forward_seen(ledger: Ledger) -> set[tuple[str, str]]:
+    """(run_id, trial_id) of every live verdict already on the ledger."""
+    return {(r["run_id"], r["trial_id"]) for r in ledger.of_kind(FACTORY_FORWARD)}
+
+
+def _hex64(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def factory_rule_names(rule) -> tuple[str, str] | None:
+    """(family, feature) as the factory names a slot's rule; None when the rule is not a complete slot rule."""
+    try:
+        if rule["op"] not in (">=", "<=") or rule["side"] not in ("long", "short") or not _number(rule["k"]):
+            return None
+        return (f"SPY|change|{rule['decision']}+{rule['horizon']}", f"{rule['feature']}|z{rule['op']}{rule['k']:g}|{rule['side']}")
+    except (KeyError, TypeError):
+        return None
+
+
+def factory_forward_index(ledger: Ledger) -> dict[str, dict]:
+    """{line sha256: record} of every live verdict on the ledger."""
+    return {ledger.line_sha(r["seq"]): r for r in ledger.of_kind(FACTORY_FORWARD)}
+
+
+def validate_factory_forward(record: dict, results: dict[str, dict], seen: set[tuple[str, str]]) -> None:
+    """A live verdict names one trial of a recorded result, once, for that trial's rule, with numbers its verdict allows."""
+    result = results.get(record.get("result_sha256") or "")
+    if result is None:
+        raise ValueError("a live verdict must name a factory_run_result on this ledger by its line sha256")
+    run_id, trial_id = record.get("run_id"), record.get("trial_id")
+    if result["run_id"] != run_id:
+        raise ValueError("a live verdict's run id is not the run of the result it names")
+    trial = next((t for t in result["trials"] if t["trial_id"] == trial_id), None)
+    if trial is None:
+        raise ValueError(f"trial {trial_id!r} is not a trial of run {run_id!r}")
+    if (run_id, trial_id) in seen:
+        raise ValueError("this trial already has a live verdict: a slot has one look")
+    slot = record.get("slot")
+    if not isinstance(slot, dict) or not all(isinstance(slot.get(k), str) and slot[k] for k in ("trial_id", "registered_at")) \
+            or slot.get("family") != FACTORY_SLOT_FAMILY or not _hex64(slot.get("row_hash")):
+        raise ValueError(f"a live verdict carries its slot's trial id, the {FACTORY_SLOT_FAMILY} family, registration hash and time")
+    if factory_rule_names(record.get("rule")) != (trial.get("family"), trial.get("feature")):
+        raise ValueError("the verdict's rule is not the rule of the trial it names")
+    if not _hex64(record.get("look_sha256")):
+        raise ValueError("a live verdict carries the sha256 of the exact stored look")
+    if record.get("alpha_per_test") != FACTORY_SLOT_ALPHA:
+        raise ValueError(f"the per-slot alpha is fixed at {FACTORY_SLOT_ALPHA}")
+    verdict, n, fires, sessions = (record.get(k) for k in ("verdict", "n", "resolved_fires", "sessions"))
+    if verdict not in FACTORY_VERDICTS.values():
+        raise ValueError("a live verdict is pass, fail or underpowered")
+    if any(type(x) is not int or x < 0 for x in (n, fires, sessions)) or fires < n or sessions < fires:
+        raise ValueError("n, resolved_fires and sessions are nonnegative integers with n <= resolved_fires <= sessions")
+    lower, mean = record.get("lower_bound"), record.get("mean_net")
+    if verdict == "underpowered":
+        if n >= FACTORY_MIN_N or n != fires or lower is not None or mean is not None:
+            raise ValueError(f"underpowered means fewer than {FACTORY_MIN_N} resolved fires, all counted, and no mean or bound")
+    elif n != FACTORY_MIN_N or not _number(lower) or not _number(mean):
+        raise ValueError(f"pass and fail are decided on exactly {FACTORY_MIN_N} resolved fires, with a finite mean and lower bound")
+    elif (verdict == "pass") != (lower > 0):
+        raise ValueError("pass means the lower bound as recorded is above zero; fail means it is not")
+    if not isinstance(record.get("looked_at"), str) or not isinstance(record.get("through_day"), str):
+        raise ValueError("a live verdict carries the time of its look and the last day it covers")
+    if stamp(record["looked_at"]) < stamp(result["recorded_at"]) or stamp(record["looked_at"]) < stamp(slot["registered_at"]):
+        raise ValueError("a live verdict cannot predate the result it follows or its slot's registration")
+    chain = record.get("source_chain")
+    if not isinstance(chain, dict) or not isinstance(chain.get("head"), str) or type(chain.get("rows")) is not int:
+        raise ValueError("a live verdict carries the live trial ledger's head and row count")
+    if not _hex64(record.get("source_sha256")):
+        raise ValueError("a live verdict carries the sha256 of the export file it came from")
+
+
+def validate_factory_forward_witness(record: dict, forward: dict[str, dict], earlier: list[dict]) -> None:
+    """A witness names one live verdict on this ledger and the verified receipt that retains the same look. Once.
+
+    The ledger cannot open the receipt log again on a reload, so what it holds to here is the record's own shape:
+    the receipt's session is a date, its head, its payload and the anchor copy are named by sha256, the anchor copy
+    covered the receipt, the witness arrived after the receipt was read, and the record says in words what code
+    checked and what a person must. A record without those is not a witness.
+    """
+    verdict = forward.get(record.get("forward_sha256") or "")
+    if verdict is None:
+        raise ValueError("a witness must name a live verdict on this ledger by its line sha256")
+    if (record.get("run_id"), record.get("trial_id"), record.get("look_sha256")) != (
+            verdict["run_id"], verdict["trial_id"], verdict["look_sha256"]):
+        raise ValueError("the witness is for another verdict or another stored look")
+    if any(w["forward_sha256"] == record["forward_sha256"] for w in earlier):
+        raise ValueError("this verdict already has its witness")
+    receipt = record.get("receipt")
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("session"), str) \
+            or not _hex64(receipt.get("head_sha256")) or not _hex64(receipt.get("payload_sha256")):
+        raise ValueError("a witness names its receipt: session, receipt head sha256 and payload sha256")
+    try:
+        date.fromisoformat(receipt["session"])
+    except ValueError:
+        raise ValueError("a witness names its receipt: the session is an ISO date") from None
+    outside = receipt.get("external_anchor")
+    records = receipt.get("log_records")
+    if not isinstance(outside, dict) or not _hex64(outside.get("sha256")) or not isinstance(records, int) or records < 2 \
+            or not isinstance(outside.get("witnessed_records"), int) or outside["witnessed_records"] < records:
+        raise ValueError("a witness names the anchor copy that covered its receipt (external_anchor: sha256, "
+                         "witnessed_records at or beyond the receipt's place in the log)")
+    checked = record.get("checked")
+    if not isinstance(checked, dict) or not isinstance(checked.get("by_code"), list) or not checked["by_code"] \
+            or not isinstance(checked.get("by_a_person"), str) or len(checked["by_a_person"].strip()) < 20:
+        raise ValueError("a witness says what code checked and what a person must check (checked: by_code, by_a_person)")
+    if not isinstance(record.get("witnessed_at"), str) or not isinstance(receipt.get("read_finished_at"), str):
+        raise ValueError("a witness carries the time it arrived and the time its receipt was read")
+    if stamp(record["witnessed_at"]) < stamp(receipt["read_finished_at"]):
+        raise ValueError("a witness cannot arrive before its receipt was read")
+
+
+def factory_look_differs(stored: dict, verdict: dict) -> list[str]:
+    """The fields in which an imported verdict differs from the look gex-signals stored (its exact text, parsed).
+
+    The stored look is the original: its verdict, n, mean, bound, alpha and resolved-fire count are what was
+    decided, for this slot and registration row, at this time. ``sessions`` is counted at export and is not in it.
+    """
+    slot = verdict["slot"]
+    final = FACTORY_VERDICTS.get(stored.get("verdict"))
+    differs = [name for name, ours, theirs in (
+        ("slot_trial_id", slot["trial_id"], stored.get("trial_id")),
+        ("row_hash", slot["row_hash"], stored.get("row_hash")),
+        ("looked_at", verdict["looked_at"], stored.get("looked_at")),
+        ("through_day", verdict["through_day"], stored.get("through_day")),
+        ("verdict", verdict["verdict"], final),
+        ("resolved_fires", verdict["resolved_fires"], stored.get("resolved_fires")),
+    ) if ours != theirs]
+    if stored.get("verdict") == "UNDERPOWERED":
+        expected = (("n", stored.get("resolved_fires")), ("mean_net", None), ("lower_bound", None))
+    else:
+        expected = (("n", stored.get("n")), ("mean_net", stored.get("mean_net")), ("lower_bound", stored.get("lower_bound")),
+                    ("alpha_per_test", stored.get("alpha_per_test")))
+    return differs + [name for name, theirs in expected if verdict.get(name) != theirs]
+
+
+def witness_factory_verdicts(ledger: Ledger, receipts: str | Path, external_anchors: str | Path, session: str) -> int:
+    """Append a witness for every unwitnessed live verdict whose stored look a verified Desk receipt retains.
+
+    Nothing is taken on the caller's word. The receipt log at ``receipts`` is opened and verified against the anchor
+    copy at ``external_anchors`` (:func:`analysis.desk_receipt_witness.verified_receipt`); the ``panel_trials``
+    payload is read from the log, not handed in. A verdict is witnessed only when that payload, read against the
+    log's own history, holds the same slot registration (row hash and time, with its contents bound by digest in
+    the receipt) and a look with the same digest, time and last day; the
+    digest is recomputed from the look's exact text in the payload; and the imported verdict, n, mean, bound, alpha
+    and resolved-fire count equal the stored look's. A verdict whose look the receipt does not hold stays
+    unwitnessed. A verdict that names the same look and differs from it is refused, and names the fields.
+    Returns the number appended.
+    """
+    if not ledger.is_factory:
+        raise ValueError("live factory verdicts belong on a factory ledger")
+    from analysis.desk_receipt_witness import verified_receipt
+
+    receipt = verified_receipt(Path(receipts), Path(external_anchors), session, "panel_trials")
+    body = json.loads(receipt["payload"])
+    if not isinstance(body, dict) or body.get("store") != "panel_trials" \
+            or body.get("continuity") not in ("first_read", "extends_last_receipt"):
+        raise ValueError("that receipt's panel_trials payload was not read against the receipt log's own history")
+    if not isinstance(body.get("trials"), list) or not body["trials"]:
+        raise ValueError("that receipt's panel_trials payload does not bind its registrations by content")
+    slots = {x.get("trial_id"): x for x in body.get("factory_slots") or [] if isinstance(x, dict)}
+    looks = {x.get("trial_id"): x for x in body.get("factory_looks") or [] if isinstance(x, dict)}
+    done = {w["forward_sha256"] for w in ledger.of_kind(FACTORY_FORWARD_WITNESS)}
+    pending = []
+    for sha, v in factory_forward_index(ledger).items():
+        slot = v["slot"]
+        held, look = slots.get(slot["trial_id"]), looks.get(slot["trial_id"])
+        if sha in done or held is None or held.get("row_hash") != slot["row_hash"] or look is None:
+            continue
+        # The registration itself, as the receipt retains it: the same row must carry the same registration time,
+        # and its contents must be bound by digest (the receipt source refuses a row whose contents later change).
+        if held.get("registered_at") != slot["registered_at"] or not _hex64(held.get("content_sha256")):
+            raise ValueError(f"the receipt retains slot {slot['trial_id']}'s registration row with another time, "
+                             "or without its content digest: the import is not that registration")
+        text = look.get("result")
+        if not isinstance(text, str) or sha256_bytes(text.encode("utf-8")) != look.get("result_sha256"):
+            raise ValueError(f"the receipt's look for slot {slot['trial_id']} is not the text its digest names")
+        if (look["result_sha256"], look.get("looked_at"), look.get("through_day")) != (
+                v["look_sha256"], v["looked_at"], v["through_day"]):
+            continue   # the receipt retains another look than the one this verdict names: unwitnessed, not witnessed
+        try:
+            stored = json.loads(text)
+        except ValueError:
+            raise ValueError(f"the receipt's look for slot {slot['trial_id']} is not JSON") from None
+        differs = factory_look_differs(stored if isinstance(stored, dict) else {}, v)
+        if differs:
+            raise ValueError(f"the verdict imported for slot {slot['trial_id']} differs from the look the receipt "
+                             f"retains in {differs}: the import is not that look")
+        pending.append((sha, v, held["content_sha256"]))
+    at = now_iso()
+    for sha, v, registration in pending:
+        ledger._append({
+            "kind": FACTORY_FORWARD_WITNESS, "run_id": v["run_id"], "trial_id": v["trial_id"], "forward_sha256": sha,
+            "look_sha256": v["look_sha256"], "registration_content_sha256": registration,
+            "receipt": {k: receipt[k] for k in ("session", "head_sha256", "log_records", "read_finished_at",
+                                                 "payload_sha256", "external_anchor")},
+            "checked": receipt["checked"], "look_recomputed": True,
+            "witnessed_at": at, "recorded_at": at,
+        })
+    return len(pending)
+
+
+def ingest_factory_verdicts(ledger: Ledger, path: str | Path, recorded_at: str | None = None) -> int:
+    """Append the final live verdicts in a gex-signals export (``panel-factory-verdict/2`` JSONL).
+
+    All lines are checked before any is appended. A line whose trial already has its verdict with the same substance
+    (:data:`FACTORY_FORWARD_SUBSTANCE`) is skipped, whatever export time, chain head or file carried it: a re-import
+    or a repackaged export is not an error. A different substance for that trial is refused as a conflict and names
+    the fields that differ. Returns the number appended.
+
+    Writer control: every append re-checks that the ledger file is byte for byte what this object loaded and then
+    re-applies the record's rules. If another writer got in first, the append raises and this batch stops; the lines
+    already appended stay, and running the same import again on a reopened ledger completes it.
+    """
+    if not ledger.is_factory:
+        raise ValueError("live factory verdicts belong on a factory ledger")
+    raw = Path(path).read_bytes()
+    source_sha = sha256_bytes(raw)
+    results, seen = factory_result_index(ledger), factory_forward_seen(ledger)
+    have = {(r["run_id"], r["trial_id"]): r for r in ledger.of_kind(FACTORY_FORWARD)}
+    pending: list[dict] = []
+    for number, line in enumerate((x for x in raw.splitlines() if x.strip()), start=1):
+        entry = json.loads(line)
+        if not isinstance(entry, dict) or set(entry) != set(FACTORY_VERDICT_FIELDS) or entry["schema"] != FACTORY_VERDICT_SCHEMA:
+            raise ValueError(f"line {number}: fields must be exactly {FACTORY_VERDICT_FIELDS} with schema {FACTORY_VERDICT_SCHEMA}")
+        if canonical(entry) != line.strip():
+            raise ValueError(f"line {number}: not canonical JSON")
+        if entry["verdict"] not in FACTORY_VERDICTS:
+            raise ValueError(f"line {number}: only final verdicts are exported ({', '.join(FACTORY_VERDICTS)})")
+        source = entry["source"] if isinstance(entry["source"], dict) else {}
+        record = {
+            "kind": FACTORY_FORWARD,
+            "run_id": source.get("run_id"),
+            "trial_id": source.get("trial_id"),
+            "result_sha256": source.get("result_sha256"),
+            "look_sha256": entry["look_sha256"],
+            "verdict": FACTORY_VERDICTS[entry["verdict"]],
+            "n": entry["n"],
+            "mean_net": entry["mean_net"],
+            "lower_bound": entry["lower_bound"],
+            "alpha_per_test": entry["alpha_per_test"],
+            "resolved_fires": entry["resolved_fires"],
+            "sessions": entry["sessions"],
+            "looked_at": entry["looked_at"],
+            "through_day": entry["through_day"],
+            "rule": entry["rule"],
+            "slot": {"trial_id": entry["slot_trial_id"], "family": entry["family"], "row_hash": entry["row_hash"],
+                     "registered_at": entry["registered_at"]},
+            "source_chain": entry["chain"],
+            "export_schema": entry["schema"],
+            "exported_at": entry["exported_at"],
+            "source_sha256": source_sha,
+        }
+        key = (record["run_id"], record["trial_id"])
+        earlier = have.get(key) or next((p for p in pending if (p["run_id"], p["trial_id"]) == key), None)
+        if earlier is not None:
+            differs = [k for k in FACTORY_FORWARD_SUBSTANCE if earlier.get(k) != record[k]]
+            if differs:
+                raise ValueError(f"line {number}: this trial already has a live verdict that differs in {differs}: "
+                                 "a conflict, not a retry")
+            continue
+        try:
+            validate_factory_forward(record, results, seen | {(p["run_id"], p["trial_id"]) for p in pending})
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"line {number}: {exc}") from None
+        pending.append(record)
+    stamp_now = recorded_at or now_iso()
+    for done, record in enumerate(pending):
+        try:
+            ledger._append({**record, "recorded_at": stamp_now})
+        except ValueError as exc:
+            raise ValueError(f"{done} of {len(pending)} verdicts appended, then: {exc}") from None
+    return len(pending)
+
+
 def record_factory_declared(ledger, *, run_id, run_file, data_manifest_sha256, trial_count,
                             recorded_at=None) -> dict:
     """Declare a factory run before its data is read; returns ``{record, sha256}``."""
@@ -2285,6 +2632,43 @@ def _factory_classes(trials: list[dict]) -> dict | None:
     return dict(sorted(out.items()))
 
 
+def _factory_live(ledger: Ledger, trials: list[dict]) -> dict:
+    """Live verdicts on the ledger: how many candidates were sent live and looked at, how the looks came out, and
+    which of them a nightly receipt has witnessed."""
+    forward = factory_forward_index(ledger)
+    witness = {w["forward_sha256"]: w for w in ledger.of_kind(FACTORY_FORWARD_WITNESS)}
+    selected = {t["trial_id"] for t in trials if t.get("selected")}
+    class_of = {t["trial_id"]: t.get("class") or "unclassed" for t in trials}
+    by_class: dict[str, dict] = {}
+    for r in forward.values():
+        c = by_class.setdefault(class_of[r["trial_id"]], {"looked": 0, "passed": 0, "failed": 0, "underpowered": 0})
+        c["looked"] += 1
+        c[{"pass": "passed", "fail": "failed"}.get(r["verdict"], "underpowered")] += 1
+    return {
+        "looked": len(forward),
+        "passed": sum(r["verdict"] == "pass" for r in forward.values()),
+        "failed": sum(r["verdict"] == "fail" for r in forward.values()),
+        "underpowered": sum(r["verdict"] == "underpowered" for r in forward.values()),
+        "witnessed": sum(sha in witness for sha in forward),
+        "unwitnessed": sum(sha not in witness for sha in forward),
+        "looked_not_selected_in_run": sum(r["trial_id"] not in selected for r in forward.values()),
+        "lapsed": None,   # the retirement checker (#1163) is not built
+        "by_class": dict(sorted(by_class.items())),   # feature class of the trial (factory 3); "unclassed" before classes
+        "verdicts": [
+            {"run_id": r["run_id"], "trial_id": r["trial_id"], "verdict": r["verdict"], "n": r["n"],
+             "lower_bound": r["lower_bound"], "looked_at": r["looked_at"], "slot": r["slot"]["trial_id"],
+             "look_sha256": r["look_sha256"], "arrived_at": r["recorded_at"],
+             "witness": ({"status": "witnessed", "receipt_session": witness[sha]["receipt"]["session"],
+                          "receipt_head_sha256": witness[sha]["receipt"]["head_sha256"],
+                          "witnessed_at": witness[sha]["witnessed_at"]}
+                         if sha in witness else {"status": "unwitnessed"})}
+            for sha, r in forward.items()
+        ],
+        "note": "a pass is one forward look at alpha / k of its slot family; candidates still recording are not on this "
+                "ledger; an unwitnessed verdict has not been matched to a nightly receipt and is not independently confirmed",
+    }
+
+
 def summarize_factory(ledger: Ledger) -> dict:
     """Files-only status of a factory ledger: every run and every candidate it ever declared."""
     results = ledger.of_kind(FACTORY_RESULT)
@@ -2303,6 +2687,7 @@ def summarize_factory(ledger: Ledger) -> dict:
         "candidates_measured": len(trials),
         "candidates_tested": sum(t["status"] == "tested" for t in trials),
         "candidates_selected": sum(bool(t["selected"]) for t in trials),
+        "live": _factory_live(ledger, trials),
         "runs": [
             {"run_id": r["run_id"], "trial_count": r["trial_count"], "tested": r["tested_count"],
              "selected": r["selected_count"], "critical_t": (r.get("max_t") or {}).get("critical_t"),

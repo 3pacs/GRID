@@ -44,6 +44,7 @@ def run_celestial_cycle(
     target: date | None = None,
     persist: bool = True,
     interpret: bool = True,
+    engine_runs: bool | None = None,
 ) -> dict[str, Any]:
     """Produce one celestial cycle: sky snapshot, then interpretation.
 
@@ -57,6 +58,12 @@ def run_celestial_cycle(
             interpretation. The Hermes dry run passes ``False`` for both: it
             exercises the deterministic build, which is sub-second and has no
             side effects, without spending a local-LLM call on a rehearsal.
+        engine_runs: Run the twelve lens engines over the snapshot and store
+            them as ``astrogrid.engine_run`` rows (see
+            :mod:`oracle.astrogrid_engines`). ``None`` reads
+            ``settings.ASTROGRID_ENGINE_RUNS_ENABLED``, which defaults off.
+            Only for today's date: a past ``target`` would be a back-computed
+            row, and the #500 decision is forward-only.
 
     Returns:
         A summary dict with ``date``, ``snapshot_id``, ``interpretation_ids``,
@@ -103,6 +110,20 @@ def run_celestial_cycle(
         except Exception as exc:
             log.warning("AstroGrid celestial snapshot persist failed: {e}", e=str(exc))
             summary["errors"].append(f"snapshot_persist: {exc}")
+
+    if engine_runs is None:
+        from config import settings
+
+        engine_runs = bool(settings.ASTROGRID_ENGINE_RUNS_ENABLED)
+    if engine_runs:
+        summary["engine_runs"] = _run_engines(
+            snapshot,
+            evaluation_date=evaluation_date,
+            store=store,
+            snapshot_id=summary["snapshot_id"],
+        )
+        if summary["engine_runs"].get("error"):
+            summary["errors"].append(f"engine_runs: {summary['engine_runs']['error']}")
 
     # The interpretation is fed the snapshot we just built, so the seer reads
     # the same sky that was stored rather than recomputing a drifted one.
@@ -154,3 +175,53 @@ def run_celestial_cycle(
         e=len(summary["errors"]),
     )
     return summary
+
+
+def _run_engines(
+    snapshot: dict[str, Any],
+    *,
+    evaluation_date: date,
+    store: Any,
+    snapshot_id: int | None,
+) -> dict[str, Any]:
+    """Run the lens engines and store them against the day's sky_snapshot.
+
+    The outputs are deliberately NOT added to the interpretation request.
+    Twelve compacted outputs grow the interpretation prompt about fivefold
+    (~5.5k to ~25k characters measured on 2026-11-21), which with
+    ``num_predict=1200`` overruns the 3090 oracle's 8192-token context. So the
+    Seer row keeps citing ``[]`` until someone decides how the Seer should
+    read them; citing runs it never saw would be false provenance.
+    """
+    from oracle.astrogrid_engines import ENGINE_PRODUCER, compute_engine_outputs
+
+    report: dict[str, Any] = {"engine_run_ids": [], "reused": False, "error": None}
+    if evaluation_date != date.today():
+        report["skipped"] = "not_today"
+        return report
+
+    computed = compute_engine_outputs(snapshot, mode=SCHEDULED_MODE)
+    report["engines"] = len(computed["engine_outputs"])
+    report["code_sha256"] = computed.get("code_sha256") or {}
+    if computed.get("error"):
+        report["error"] = computed["error"]
+        return report
+
+    if store is None or snapshot_id is None:
+        # persist=False, or the snapshot row could not be written: an
+        # engine_run row must cite a stored sky_snapshot, so write nothing.
+        report["skipped"] = "no_stored_snapshot"
+        return report
+
+    lens_set_id = store.ensure_lens_set(SCHEDULED_MODE, [])
+    saved = store.save_engine_runs(
+        snapshot_id,
+        lens_set_id,
+        computed["engine_outputs"],
+        producer=ENGINE_PRODUCER,
+    )
+    report["engine_run_ids"] = list(saved.get("engine_run_ids") or [])
+    report["reused"] = bool(saved.get("reused"))
+    if saved.get("error"):
+        report["error"] = f"persist: {saved['error']}"
+    return report
