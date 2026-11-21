@@ -5,6 +5,9 @@
   tolerance and no session where the two sides disagree about availability.
 * A live recording with a missing read bar, or more than two lost minutes, fails:
   values that agree are not parity when live would abstain.
+* Version 3: the verdict is taken on the five most recent closed exchange sessions the
+  calendar expects; a session either side lacks is missing, not skipped.
+  An older bad session stays in the whole-window counts and no longer blocks.
 * Version 2: the live side is judged by the live recorder's lost-minute rule.
   Up to two lost minutes leave the return features exact; a range feature needs
   each lost minute's backstop bar, first seen at or before the decision time.
@@ -112,15 +115,20 @@ def _live_db(path, bars, src_of=lambda day, hm: "schwab", backstop=None, recorde
     return path
 
 
+def _after_close(day):
+    return datetime.fromisoformat(f"{day}T17:00:00").replace(tzinfo=NY)
+
+
 @pytest.fixture
-def run(tmp_path):
+def run(tmp_path, monkeypatch):
     calls = []
 
-    def go(research, live, decisions=("15:00",), **kwargs):
+    def go(research, live, decisions=("15:00",), last=SESSIONS[-1], clock=None, **kwargs):
         calls.append(1)                                   # a test may build more than one pair of databases
         r, lv = tmp_path / f"r{len(calls)}.db", tmp_path / f"l{len(calls)}.db"
+        monkeypatch.setattr(flp, "_clock", lambda: clock or _after_close(last))     # the report is made after that close
         return flp.report(_research_db(r, research), _live_db(lv, live, decisions=decisions, **kwargs),
-                          first=SESSIONS[0], last=SESSIONS[-1], decisions=list(decisions), horizons=["close"])
+                          first=SESSIONS[0], last=last, decisions=list(decisions), horizons=["close"])
     return go
 
 
@@ -147,7 +155,7 @@ def test_identical_complete_recordings_are_live_ready(run):
 def test_four_matched_sessions_are_not_enough(run):
     few = SESSIONS[:5]                                    # five sessions, four with a prior
 
-    doc = run({d: _days()[d] for d in few}, {d: _days()[d] for d in few})
+    doc = run({d: _days()[d] for d in few}, {d: _days()[d] for d in few}, last=few[-1])
 
     f1 = doc["comparison"]["features"]["F1"]
     assert f1["matched_sessions"] == 4 and f1["status"] == "research_only"
@@ -189,7 +197,7 @@ def test_three_lost_morning_minutes_withhold_that_day_and_the_next(run):
     assert doc["live_availability"]["signal_eligible"] == 4
     assert doc["comparison"]["features"]["F1"]["matched_sessions"] == 4
     assert doc["research_only"] == sorted(mf.FEATURES)
-    assert doc["schema"] == "factory-live-parity-v2"
+    assert doc["schema"] == "factory-live-parity-v3"
 
 
 def test_one_lost_minute_keeps_the_return_features_and_withholds_the_range_that_reads_it(run):
@@ -208,7 +216,8 @@ def test_one_lost_minute_keeps_the_return_features_and_withholds_the_range_that_
     assert doc["live_ready"] == ["F1", "F1_shift30"]
     features = doc["comparison"]["features"]
     assert features["F1"]["matched_sessions"] == 6 and features["F1"]["max_abs_diff"] == 0
-    assert features["F10"]["reasons"] == ["availability_mismatch"] and features["F10"]["matched_sessions"] == 5
+    assert features["F10"]["reasons"] == ["insufficient_matched_sessions", "availability_mismatch"]
+    assert features["F10"]["matched_sessions"] == 5 and features["F10"]["verdict_on"]["matched"] == 4
     assert features["F10"]["values_out_of_tolerance"] == 0 and features["F10"]["values_compared"] == 5
     mismatch = {m["day"]: (m["features"], m["live"]) for m in doc["comparison"]["availability_mismatch"]}
     assert mismatch == {"2026-11-04": (["F10"], {"F10": [flp.GAP_UNFILLED]}),
@@ -414,7 +423,8 @@ def test_a_value_outside_tolerance_is_counted_and_blocks_the_feature(run):
 
     f1 = doc["comparison"]["features"]["F1"]
     assert f1["values_out_of_tolerance"] == 1 and f1["matched_sessions"] == 5
-    assert f1["status"] == "research_only" and f1["reasons"] == ["value_out_of_tolerance"]
+    assert f1["status"] == "research_only"
+    assert f1["reasons"] == ["insufficient_matched_sessions", "value_out_of_tolerance"]
     assert f1["max_abs_diff"] > flp.TOLERANCE["return"]
     bad = [r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["within_tolerance"] is False]
     assert [r["day"] for r in bad] == ["2026-11-05"]
@@ -476,3 +486,162 @@ def test_command_writes_the_report_once_and_exits_1_when_not_ready(tmp_path, cap
     assert json.loads(out.read_text())["live_availability"]["rows"]            # the file keeps the detail
     with pytest.raises(FileExistsError):
         flp.main(args)
+
+
+LONGER = SESSIONS + ["2026-11-11", "2026-11-12"]
+
+
+def test_the_verdict_is_taken_on_the_five_most_recent_sessions_and_an_older_failure_stays_on_the_report(run):
+    live = _days(LONGER)
+    for hm in ("10:01", "10:02", "11:15"):
+        del live["2026-11-03"][hm]                         # withholds 11-03, and 11-04 through its prior session
+
+    doc = run(_days(LONGER), live, last=LONGER[-1])
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert doc["live_ready"] == sorted(mf.FEATURES)
+    assert f1["verdict_on"] == {"sessions": LONGER[-5:], "matched": 5, "required": 5,
+                                "missing": {"research": [], "live": []}, "not_recorded_under_the_rule": [],
+                                "recorded_values_differ_from_the_bars": [],
+                                "values_out_of_tolerance": 0, "eligible_rows_with_no_value": 0,
+                                "sessions_with_an_availability_disagreement": []}
+    assert doc["verdict_sessions"] == LONGER[-5:] and doc["as_of"] == "2026-11-12T17:00:00-05:00"
+    assert f1["matched_sessions"] == 6 and f1["overlapping_sessions"] == 9             # the whole window, as before
+    assert f1["whole_window"] == {"sessions_with_an_availability_disagreement": 2}
+    assert {m["day"] for m in doc["comparison"]["availability_mismatch"]} == {"2026-11-03", "2026-11-04"}
+
+    earlier = run(_days(LONGER), live, last="2026-11-10")   # the same recording, judged two sessions earlier
+    f1 = earlier["comparison"]["features"]["F1"]
+    assert earlier["live_ready"] == [] and f1["verdict_on"]["matched"] == 4
+    assert f1["verdict_on"]["sessions_with_an_availability_disagreement"] == ["2026-11-04"]
+    assert f1["reasons"] == ["insufficient_matched_sessions", "availability_mismatch"]
+
+
+def test_an_old_value_out_of_tolerance_is_still_counted_and_a_recent_one_still_blocks(run):
+    live = _days(LONGER)
+    o, h, low, c, v = live["2026-11-04"]["14:59"]
+    live["2026-11-04"]["14:59"] = (o, h, low, c + 0.30, v)
+
+    doc = run(_days(LONGER), live, last=LONGER[-1])
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert f1["status"] == "live_ready" and f1["values_out_of_tolerance"] == 1         # counted, outside the verdict
+    assert f1["verdict_on"]["values_out_of_tolerance"] == 0
+
+    o, h, low, c, v = live["2026-11-12"]["14:59"]
+    live["2026-11-12"]["14:59"] = (o, h, low, c + 0.30, v)
+    f1 = run(_days(LONGER), live, last=LONGER[-1])["comparison"]["features"]["F1"]
+    assert f1["status"] == "research_only" and f1["verdict_on"]["values_out_of_tolerance"] == 1
+    assert f1["reasons"] == ["insufficient_matched_sessions", "value_out_of_tolerance"]
+
+
+def test_fewer_than_five_recent_sessions_is_never_ready_and_the_number_is_not_an_argument(run):
+    few = SESSIONS[:5]
+    doc = run({d: _days()[d] for d in few}, {d: _days()[d] for d in few}, last=few[-1])
+
+    assert doc["comparison"]["features"]["F1"]["verdict_on"]["matched"] == 4 and doc["live_ready"] == []
+    with pytest.raises(SystemExit):
+        flp.main(["--research-db", "r", "--signals-db", "l", "--first", few[0], "--last", few[-1], "--min-sessions", "1"])
+
+
+def test_the_verdict_sessions_come_from_the_calendar_and_the_clock_not_from_the_data():
+    assert flp.expected_recent_sessions(_after_close("2026-11-12")) == LONGER[-5:]
+    before_the_close = datetime.fromisoformat("2026-11-12T15:59:00").replace(tzinfo=NY)
+    assert flp.expected_recent_sessions(before_the_close) == LONGER[-6:-1]                 # 11-12 has not closed yet
+    saturday = datetime.fromisoformat("2026-11-14T10:00:00").replace(tzinfo=NY)
+    assert flp.expected_recent_sessions(saturday)[-1] == "2026-11-13"
+    after_thanksgiving = datetime.fromisoformat("2026-11-27T13:00:00").replace(tzinfo=NY)   # the 13:00 close has passed
+    assert flp.expected_recent_sessions(after_thanksgiving)[-2:] == ["2026-11-25", "2026-11-27"]
+    with pytest.raises(TypeError):
+        flp.compare({}, {}, ["15:00"], ["close"], None, None)                              # no verdict on the data's own dates
+
+
+def test_a_feed_that_lacks_the_newest_session_is_not_ready_on_five_older_ones(run):
+    """Codex on 4a6f1039: the missing date left the intersection and five older overlaps still passed."""
+    for side in ("research", "live"):
+        research, live = _days(LONGER), _days(LONGER)
+        del {"research": research, "live": live}[side]["2026-11-12"]
+
+        doc = run(research, live, last=LONGER[-1])
+
+        f1 = doc["comparison"]["features"]["F1"]
+        assert doc["live_ready"] == [], side
+        assert f1["reasons"] == [flp.SESSION_MISSING, "insufficient_matched_sessions"], side
+        assert f1["verdict_on"]["missing"][side] == ["2026-11-12"] and f1["verdict_on"]["matched"] == 4, side
+        assert doc["expected_sessions_missing"][side] == ["2026-11-12"], side
+        assert f1["matched_sessions"] == 7, side              # seven older sessions match, and it is still not ready
+
+
+def test_a_feed_that_lacks_a_session_in_the_middle_is_not_ready_on_non_consecutive_ones(run):
+    research, live = _days(LONGER), _days(LONGER)
+    del live["2026-11-10"]                                    # inside the five; its absence also costs 11-11 its prior
+
+    doc = run(research, live, last=LONGER[-1])
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert doc["live_ready"] == []
+    assert f1["verdict_on"]["missing"] == {"research": [], "live": ["2026-11-10"]}
+    assert f1["verdict_on"]["matched"] == 3 and flp.SESSION_MISSING in f1["reasons"]
+    assert doc["expected_sessions_missing"] == {"research": [], "live": ["2026-11-10"]}
+
+    older = _days(LONGER)
+    del older["2026-11-04"]                                   # outside the five: reported, and it does not block
+    doc = run(_days(LONGER), older, last=LONGER[-1])
+    assert doc["expected_sessions_missing"]["live"] == ["2026-11-04"] and doc["live_ready"] == sorted(mf.FEATURES)
+
+
+def test_a_report_made_days_later_is_judged_on_the_sessions_expected_then(run):
+    """Complete, identical recordings through 11-12, read on 11-17: three expected sessions are missing on both sides."""
+    doc = run(_days(LONGER), _days(LONGER), last="2026-11-17", clock=_after_close("2026-11-17"))
+
+    assert doc["verdict_sessions"] == ["2026-11-11", "2026-11-12", "2026-11-13", "2026-11-16", "2026-11-17"]
+    assert doc["live_ready"] == []
+    f1 = doc["comparison"]["features"]["F1"]
+    assert f1["verdict_on"]["missing"]["live"] == ["2026-11-13", "2026-11-16", "2026-11-17"] and f1["verdict_on"]["matched"] == 2
+
+
+def test_the_as_of_time_is_not_an_argument_and_the_zero_evidence_gate_carries_over(run):
+    with pytest.raises(SystemExit):
+        flp.main(["--research-db", "r", "--signals-db", "l", "--first", "2026-11-02", "--last", "2026-11-12",
+                  "--as-of", "2026-11-12T17:00:00-05:00"])
+
+    doc = run(_days(LONGER), _days(LONGER), decisions=("10:00",), last=LONGER[-1])
+    shift = doc["comparison"]["features"]["F1_shift30"]
+    assert doc["live_ready"] == ["F1", "F10", "F11"]
+    assert shift["reasons"] == ["no_applicable_decision_time", "insufficient_matched_sessions"]
+    assert shift["verdict_on"]["matched"] == 0 and shift["values_matched"] == 0
+
+
+def test_the_binding_gate_is_applied_to_the_verdict_sessions(run):
+    """Codex on c4511aca: complete matching bars, a pre-existing 15:00 F1 value of 999999.0, terms stamped at 15:01."""
+    def late_marker(rows):
+        for r in rows:
+            if r["feature"] == "F1":
+                r["raw"], r["terms_recorded_at"] = 999999.0, r["recorded_at"].replace(":00:20", ":01:00")
+
+    doc = run(_days(LONGER), _days(LONGER), last=LONGER[-1], recorded=late_marker)
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert doc["live_ready"] == ["F10", "F11", "F1_shift30"]
+    assert f1["verdict_on"]["matched"] == 0 and f1["verdict_on"]["not_recorded_under_the_rule"] == LONGER[-5:]
+    assert f1["reasons"] == [flp.RULE_NOT_RECORDED, "insufficient_matched_sessions"]
+    assert doc["comparison"]["sessions_not_recorded_under_the_rule"] == LONGER
+
+    def old_generation_until(day):
+        def older(rows):
+            for r in rows:
+                if r["day"] < day:
+                    r["terms_sha256"] = None
+        return older
+
+    recent_only = run(_days(LONGER), _days(LONGER), last=LONGER[-1], recorded=old_generation_until(LONGER[-5]))
+    assert recent_only["live_ready"] == sorted(mf.FEATURES)          # the five verdict sessions are this generation's own
+    assert recent_only["comparison"]["features"]["F1"]["values_not_bound"] == 4
+    one_short = run(_days(LONGER), _days(LONGER), last=LONGER[-1], recorded=old_generation_until(LONGER[-4]))
+    assert one_short["live_ready"] == []
+    assert one_short["comparison"]["features"]["F1"]["verdict_on"]["not_recorded_under_the_rule"] == [LONGER[-5]]
+
+    wrong = run(_days(LONGER), _days(LONGER), last=LONGER[-1], recorded=_only(LONGER[-2], "F10", raw=0.123456))
+    f10 = wrong["comparison"]["features"]["F10"]
+    assert "F10" not in wrong["live_ready"] and f10["verdict_on"]["recorded_values_differ_from_the_bars"] == [LONGER[-2]]
+    assert flp.RECORDED_DIFFERS in f10["reasons"]

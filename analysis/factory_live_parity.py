@@ -67,11 +67,27 @@ agreement. A session is matched for a feature only if it has at least one
 applicable decision time and every applicable one matched, so a feature with
 no applicable decision time can never be ready.
 
-A feature is ``live_ready`` only with at least ``MIN_SESSIONS`` overlapping
-sessions on which both sides were eligible and every value was in tolerance,
-no value out of tolerance on any overlapping session, and no overlapping
-session where the two sides disagreed about that feature's availability.
-Anything else is ``research_only`` with its reasons and the counts behind them.
+A feature is ``live_ready`` only when each of the most recent ``MIN_SESSIONS``
+sessions the exchange calendar expects is a matched one: at every decision time both sides were
+eligible and the value was in tolerance. So in those sessions no value is out
+of tolerance and the two sides never disagree about that feature's
+availability. Anything else is ``research_only`` with its reasons and the
+counts behind them.
+
+The verdict sessions are the five most recent sessions the exchange calendar
+says had closed when the report was made (its ``as_of``, read from the clock,
+not an argument). They are not the five most recent dates the two sides happen
+to share: a session that research or live lacks is ``session_missing`` and the
+feature is not ready, whether it is the newest session or one in the middle.
+
+The verdict is taken on the most recent sessions, not on every session in the
+window (version 3). In version 2 one bad session anywhere in the window kept a
+feature ``research_only`` for as long as the window included it, and a window
+that began before the recorder stored the last minute could never pass. Now a
+bad session costs the next ``MIN_SESSIONS`` sessions and no more. The number is
+fixed here, not an argument: a verdict must not depend on a window chosen after
+the fact. The whole-window counts are still reported beside the verdict, so an
+older failure stays visible.
 
 Read-only: both databases are opened ``mode=ro``. Nothing here scores a module
 or registers anything. Five matching sessions are evidence about the source
@@ -101,8 +117,8 @@ from analysis.module_factory import (
 )
 from ingestion.market_calendar import is_market_open, market_close_time
 
-SCHEMA = "factory-live-parity-v2"
-MIN_SESSIONS = 5
+SCHEMA = "factory-live-parity-v3"
+MIN_SESSIONS = 5                  # the verdict: each of the most recent MIN_SESSIONS expected closed exchange sessions matched
 OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
 
@@ -144,6 +160,7 @@ LIVE_RULE_TERMS = {
 LIVE_RULE_TERMS_JSON = json.dumps(LIVE_RULE_TERMS, sort_keys=True, separators=(",", ":"))
 LIVE_RULE_TERMS_SHA256 = hashlib.sha256(LIVE_RULE_TERMS_JSON.encode()).hexdigest()
 RULE_NOT_RECORDED = "live_rule_not_recorded"
+SESSION_MISSING = "session_missing"       # an expected recent session is absent from research, from live, or from both
 RECORDED_DIFFERS = "recorded_value_differs_from_bars"
 
 Bars = dict[str, dict[str, tuple]]
@@ -295,6 +312,41 @@ def close_minute(day: str) -> int | None:
 def expected_minutes(day: str) -> frozenset[str]:
     close = close_minute(day)
     return frozenset() if close is None else frozenset(_hm(i) for i in range(OPEN_MIN, close))
+
+
+def _clock() -> datetime:
+    """The one clock read. A report's as-of time is the time it was made; it is not an argument."""
+    return datetime.now(NY)
+
+
+def session_closes(day: str) -> datetime | None:
+    close = close_minute(day)
+    if close is None:
+        return None
+    return datetime.fromisoformat(f"{day}T{close // 60:02d}:{close % 60:02d}:00").replace(tzinfo=NY)
+
+
+def expected_recent_sessions(as_of: datetime, n: int = MIN_SESSIONS) -> list[str]:
+    """The ``n`` most recent exchange sessions that had closed by ``as_of``, oldest first."""
+    d = as_of.astimezone(NY).date()
+    out: list[str] = []
+    for _ in range(n * 7 + 14):               # more than enough calendar days for n sessions
+        closes = session_closes(d.isoformat())
+        if closes is not None and closes <= as_of:
+            out.append(d.isoformat())
+            if len(out) == n:
+                break
+        d -= timedelta(days=1)
+    return sorted(out)
+
+
+def expected_sessions_between(first: str, last: str) -> list[str]:
+    d, end, out = date.fromisoformat(first), date.fromisoformat(last), []
+    while d <= end:
+        if is_market_open(d):
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
 
 
 def previous_session(day: str) -> str:
@@ -488,7 +540,7 @@ def feature_values(bars: Bars, day: str, decision: str) -> dict[str, float | Non
 
 
 def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str],
-            backstop: Backstop | None = None, recorded: dict | None = None) -> dict:
+            backstop: Backstop | None, recorded: dict | None, verdict_sessions: list[str]) -> dict:
     """Availability agreement and value differences on the sessions both sides hold.
 
     Research is judged by the research rule, live by the live recorder's rule, feature by feature. The live value
@@ -498,13 +550,18 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
     A row matches only with both sides eligible, a number on both sides, in tolerance, and the recorder's own row
     for it: bound to these exact terms when it was written, and equal to what the terms give on the recorded bars.
     A row with no value by definition is not applicable and counts for nothing.
+
+    ``verdict_sessions`` are the sessions the verdict is taken on. They come from the exchange calendar and a clock
+    (``expected_recent_sessions``), never from what the two sides happen to hold: a session either side lacks is
+    missing, it is not skipped. The argument has no default, so no caller gets a verdict on the data's own dates.
     """
     days = sorted(d for d in set(research) & set(live) if close_minute(d) is not None)
     rows = []
     per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0, "matched_values": 0,
-                       "applicable": Counter(), "matched": Counter(), "no_value": 0,
+                       "applicable": Counter(), "matched": Counter(), "no_value": 0, "no_value_by_day": Counter(),
                        "unbound": Counter(), "differs": Counter(), "bound_values": 0,
-                       "out_of_tolerance": 0, "max_abs_diff": None} for f in FEATURES}
+                       "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None}
+                   for f in FEATURES}
     availability_mismatch = []
     label_rows = []
     for day in days:
@@ -535,6 +592,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                     stat["max_abs_diff"] = diff if stat["max_abs_diff"] is None else max(stat["max_abs_diff"], diff)
                     if not within:
                         stat["out_of_tolerance"] += 1
+                        stat["out_of_tolerance_by_day"][day] += 1
                 if not applicable:
                     matched = None                        # no value exists by definition: neither a match nor a failure,
                     if a is not None or b is not None:    # unless a side produced one anyway
@@ -542,6 +600,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                 else:
                     stat["applicable"][day] += 1
                     stat["no_value"] += both_eligible and diff is None
+                    stat["no_value_by_day"][day] += both_eligible and diff is None
                     stat["unbound"][day] += unbound is not None
                     stat["differs"][day] += unbound is None and not agrees
                     stat["bound_values"] += unbound is None
@@ -574,32 +633,49 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                                    "within_tolerance": None if change_diff is None
                                    else change_diff <= LABEL_TOLERANCE_DOLLARS})
     features = {}
+    recent = list(verdict_sessions)          # the sessions the verdict is taken on: expected by the calendar, not by the data
+    missing = {"research": [d for d in recent if not research.get(d)], "live": [d for d in recent if not live.get(d)]}
     for f in FEATURES:
         stat = per_feature[f]
         # A matched session has at least one applicable decision time, and a number in tolerance at every one of them.
         stat["matched_sessions"] = {d for d, n in stat["applicable"].items() if n and stat["matched"][d] == n}
         matched = sorted(stat["matched_sessions"] - stat["bad_sessions"])
         applicable_times = [t for t in decisions if not structurally_undefined(f, t)]
+        recent_matched = [d for d in recent if d in matched]
+        recent_out = sum(stat["out_of_tolerance_by_day"][d] for d in recent)
+        recent_no_value = sum(stat["no_value_by_day"][d] for d in recent)
+        recent_disagreed = sorted({m["day"] for m in availability_mismatch if f in m["features"] and m["day"] in recent})
+        recent_not_recorded = [d for d in recent if stat["unbound"][d]]      # a required value without its own binding
+        recent_differs = [d for d in recent if stat["differs"][d]]            # a bound value the bars do not give
         reasons = []
         if not applicable_times:
             reasons.append("no_applicable_decision_time")
-        if sum(stat["unbound"].values()):
+        if len(recent) < MIN_SESSIONS or missing["research"] or missing["live"]:
+            reasons.append(SESSION_MISSING)
+        if recent_not_recorded:
             reasons.append(RULE_NOT_RECORDED)
-        if sum(stat["differs"].values()):
+        if recent_differs:
             reasons.append(RECORDED_DIFFERS)
-        if len(matched) < MIN_SESSIONS:
+        if len(recent_matched) < MIN_SESSIONS:
             reasons.append("insufficient_matched_sessions")
-        if stat["out_of_tolerance"]:
+        if recent_out:
             reasons.append("value_out_of_tolerance")
-        if stat["no_value"]:
+        if recent_no_value:
             reasons.append("value_missing")           # both sides eligible, a value defined, and no number to compare
-        if any(f in m["features"] for m in availability_mismatch):
+        if recent_disagreed:
             reasons.append("availability_mismatch")
         features[f] = {
             "type": FEATURE_TYPE[f], "tolerance": TOLERANCE[FEATURE_TYPE[f]],
             "live_source_tag": FEATURE_SPECS[f]["live_source"],
             "status": "research_only" if reasons else "live_ready",
             "reasons": reasons,
+            "verdict_on": {"sessions": recent, "matched": len(recent_matched), "required": MIN_SESSIONS,
+                           "missing": missing, "not_recorded_under_the_rule": recent_not_recorded,
+                           "recorded_values_differ_from_the_bars": recent_differs,
+                           "values_out_of_tolerance": recent_out, "eligible_rows_with_no_value": recent_no_value,
+                           "sessions_with_an_availability_disagreement": recent_disagreed},
+            "whole_window": {"sessions_with_an_availability_disagreement":
+                             len({m["day"] for m in availability_mismatch if f in m["features"]})},
             "matched_sessions": len(matched), "required_sessions": MIN_SESSIONS,
             "overlapping_sessions": len(days),
             "values_compared": stat["compared"], "values_out_of_tolerance": stat["out_of_tolerance"],
@@ -631,11 +707,19 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
     backstop = load_backstop(signals_db, symbol, first, last)
     recorded = load_recorded(signals_db, first, last)
     live_days = sorted(d for d in live if close_minute(d) is not None)
+    as_of = _clock()
+    verdict_sessions = expected_recent_sessions(as_of)
+    # Every session the calendar expects in the window, up to the newest one closed at the as-of time.
+    in_window = [d for d in expected_sessions_between(first, last) if verdict_sessions and d <= verdict_sessions[-1]]
     # The first recorded session has no recorded prior; it is counted and its reason shown.
-    compared = compare(research, live, decisions, horizons, backstop, recorded)
+    compared = compare(research, live, decisions, horizons, backstop, recorded, verdict_sessions)
     statuses = {f: v["status"] for f, v in compared["features"].items()}
     return {
         "schema": SCHEMA,
+        "as_of": as_of.astimezone(NY).isoformat(timespec="seconds"),
+        "verdict_sessions": verdict_sessions,
+        "expected_sessions_missing": {"research": [d for d in in_window if not research.get(d)],
+                                      "live": [d for d in in_window if not live.get(d)]},
         "symbol": symbol, "window": {"first": first, "last": last},
         "decision_times": decisions, "horizons": horizons,
         "research_sessions": len(research), "live_sessions": len(live_days),
@@ -660,7 +744,9 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "research_only": sorted(f for f, s in statuses.items() if s == "research_only"),
         "promotion_allowed": False,
         "note": ("matching sessions are evidence about the source and the implementation, "
-                 "not about any edge; no feature becomes live-ready by back-filling"),
+                 "not about any edge; no feature becomes live-ready by back-filling; the verdict is taken on the "
+                 f"most recent {MIN_SESSIONS} closed exchange sessions the calendar expects (a session either side lacks is "
+                 "missing, not skipped) and the whole-window counts are reported beside it"),
     }
 
 
