@@ -49,6 +49,7 @@ from tests.test_panel_insider_density_v8_stop import (
     V8_REGISTERED_CODE,
 )
 from tests.test_panel_insider_density_v9 import (
+    SYNTH_HOLDOUT_OVERLAP_RULING,
     V6_STOP_LINE,
     _build_synthetic_probe_dir,
     _pin_probe_triple,
@@ -79,6 +80,10 @@ def test_sectors_v7_prereg_body_hash_one_byte_change_refuses_and_clauses(tmp_pat
         "@@V9_REGISTRATION_HEAD_SHA256@@",
         "@@V8_STOP_HEAD_SHA256@@",
         "@@SECTORS_V6_STOP_HEAD_SHA256@@",
+        "@@OWNER_RULING_HOLDOUT_OVERLAP@@",
+        "gemini-ic1-form4-insider-2010-2018",
+        "insider-buying-smallcap-2010-2022",
+        "2020-01-01..2022-12-30",
         "STOP_SUPERSEDED_BY_V9_UNOPENED",
         "STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED",
         "vs1-xnys-2007-11-01-2026-06-30.json",
@@ -386,6 +391,7 @@ def _bind_v9_and_s7(monkeypatch, tmp_path: Path):
         "@@OWNER_RULING_R9_FILE_SHA256@@": SYNTH_R9_SHA,
         "@@V8_STOP_HEAD_SHA256@@": v8_stop_head,
         "@@SECTORS_V6_STOP_HEAD_SHA256@@": s6_stop_head,
+        "@@OWNER_RULING_HOLDOUT_OVERLAP@@": SYNTH_HOLDOUT_OVERLAP_RULING,
     }.items():
         v9_text = v9_text.replace(old, new)
     v9_filled = tmp_path / "vs1-v9-prereg.md"
@@ -415,6 +421,7 @@ def _bind_v9_and_s7(monkeypatch, tmp_path: Path):
         "@@V9_REGISTRATION_HEAD_SHA256@@": v9_heads[1],
         "@@V8_STOP_HEAD_SHA256@@": v8_stop_head,
         "@@SECTORS_V6_STOP_HEAD_SHA256@@": s6_stop_head,
+        "@@OWNER_RULING_HOLDOUT_OVERLAP@@": SYNTH_HOLDOUT_OVERLAP_RULING,
     }.items():
         s7_text = s7_text.replace(old, new)
     s7_filled = tmp_path / "vs1-sectors-v7-prereg.md"
