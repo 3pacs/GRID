@@ -419,6 +419,21 @@ def trader_day(spec: dict, kind: str, session: SessionTimes, as_of: datetime) ->
 
 # ── factory live slots (panel-factory/1, gex-signals; slot owner: the factory-slot session) ──────────────────
 
+# Slot states as the slot owner defines them (live: collecting .. underpowered; additive drafts gex#26/#29/#32/#38:
+# retirement_check_due, lapsed). Only a slot whose record says ``citable`` may be cited; a passed slot that is not
+# citable (re-check owed, lapsed, calendar ended) is never shown as a plain pass.
+SLOT_STATE_WORDS = {
+    "collecting": "collecting",
+    "look_due": "look due: the owner runs the one look",
+    "underpowered_due": "deadline passed short of its count: the owner's look is owed",
+    "pass": "passed its look",
+    "fail": "failed its look",
+    "underpowered": "underpowered at its look",
+    "retirement_check_due": "passed, re-check owed",
+    "lapsed": "passed, then lapsed",
+}
+SLOT_COUNTING = ("collecting", "look_due", "underpowered_due")   # still "unproven, n of N"
+
 _FIRES_SQL = ("SELECT trial_id, decision, z, fired, side, abstain, recorded_at FROM factory_fires WHERE day = ?")
 _FEATURES_SQL = ("SELECT eligible, recorded_at FROM factory_feature_values WHERE day = ?")
 
@@ -436,9 +451,9 @@ def factory_slots(panel_path: str, signals_db: str | None, kind: str, session: S
         return Section(key, title, "unknown", panel_path, problems=(f"panel unreadable ({type(exc).__name__})",)), []
     f = panel.get("factory")
     clock = parse_clock(panel.get("generated_at"))
-    if not isinstance(f, dict) or f.get("version") != "panel-factory/1":
+    if not isinstance(f, dict) or not str(f.get("version") or "").startswith("panel-factory/"):
         return Section(key, title, "unknown", panel_path, clock,
-                       problems=("the panel has no panel-factory/1 block",)), []
+                       problems=("the panel has no panel-factory block",)), []
     fam, feats, slots = f.get("family") or {}, f.get("features") or {}, f.get("slots") or []
     lines, problems = [], []
     if slots:
@@ -447,8 +462,14 @@ def factory_slots(panel_path: str, signals_db: str | None, kind: str, session: S
         lines.append(f"no slot registered (0 of {fam.get('k')})")
     lines.append(f"feature history: {feats.get('z_history_have_min')} of {feats.get('z_history_needed')} sessions "
                  "(the fewest at any decision time)")
-    if f.get("status") != "ok":
-        problems.append(f"factory block status {f.get('status')}")
+    status = f.get("status")
+    exhausted = status == "calendar_exhausted"
+    if exhausted:
+        last = (f.get("calendar") or {}).get("last_day")
+        lines.append(f"calendar ended {last}: nothing recorded since, nothing citable")
+        problems.append(f"the slots' pinned calendar ended {last}; nothing recorded since")
+    elif status != "ok":
+        problems.append(f"factory block status {status}" + (f": {f['error']}" if f.get("error") else ""))
     fires: dict[str, Any] = {}
     if signals_db:
         day = session.day.isoformat()
@@ -482,12 +503,19 @@ def factory_slots(panel_path: str, signals_db: str | None, kind: str, session: S
             else:
                 withheld = f"no fire at {r['decision']}" + (f": {r['abstain']}" if r["abstain"] else "")
         have, need = sl.get("resolved_fires"), sl.get("min_n")
+        state = str(sl.get("state") or "")
+        citable = bool(sl.get("citable")) and state == "pass" and not exhausted
+        label = None
+        if not citable and state not in SLOT_COUNTING:
+            label = SLOT_STATE_WORDS.get(state, state or "state not supplied") + "; not citable"
+            if sl.get("citable_withheld"):
+                label += f" ({sl['citable_withheld']})"
         trials.append(Trial(
             trial_id=tid, name=str(sl.get("name") or tid), source=f"{panel_path}:factory", registration=sl.get("rule"),
             have=have if isinstance(have, int) else None, need=need if isinstance(need, int) else None,
-            unit="resolved fires", today=today, withheld=withheld, status=sl.get("state"), clock=clock, live=True,
-            decides="10:00-15:00 ET decision times", counts_in=None,
-            citable=bool(sl.get("citable"))))
+            unit="resolved fires", today=today, withheld=withheld, status=SLOT_STATE_WORDS.get(state, state or None),
+            clock=clock, live=True, decides="10:00-15:00 ET decision times", counts_in=None,
+            citable=citable, label=label))
     return Section(key, title, "ok", panel_path, clock, tuple(lines),
                    {"slots": len(slots), "k": fam.get("k"), "live": True}, tuple(problems)), trials
 
