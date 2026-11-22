@@ -284,3 +284,19 @@ def test_writer_with_only_bad_rows_writes_nothing() -> None:
     assert inserted == [] and out["status"] == "NO_DATA"
     with pytest.raises(ValueError):
         puller.pull_for_date(datetime(2026, 11, 20, 16))
+
+
+def test_numeric_expiries_are_refused_not_read_as_dates() -> None:
+    from ingestion.options_rates_vol import _as_date
+
+    for bad in (20261210, 20261210.0, 1765324800, "20261210", "Dec 10 2026", True):
+        with pytest.raises(ValueError):
+            _as_date(bad)
+    assert _as_date("2026-12-10") == date(2026, 12, 10)
+    assert _as_date("2026-12-10T00:00:00") == date(2026, 12, 10)
+    assert _as_date(datetime(2026, 12, 10, 16)) == date(2026, 12, 10)
+
+    rows = [(20261210, t, 82.0, 1.4, 1.5, 0.16, "b-1", None) for t in ("call", "put")]
+    puller, inserted = _writer({"TLT": rows, "IEF": rows})
+    out = puller.pull_for_date(SNAP)
+    assert inserted == [] and out["rejected"]["TLT"]["bad_expiry"] == 2
