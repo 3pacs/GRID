@@ -19,7 +19,11 @@ def staged(tmp_path):
     shutil.copyfile(ROOT / "analysis/factory_session_calendar.py", root / "analysis/factory_session_calendar.py")
     dest = root / "docs/reference/calendar-manifests"
     dest.mkdir(parents=True)
-    for source in sorted((ROOT / "docs/reference/calendar-manifests").glob("*-xnys-*.json")):  # factory + prescreen
+    sources = sorted(
+        p for pat in ("factory-xnys-*.json", "prescreen-xnys-*.json")
+        for p in (ROOT / "docs/reference/calendar-manifests").glob(pat)
+    )
+    for source in sources:  # factory + prescreen
         shutil.copyfile(source, dest / source.name)
         (dest / source.name).chmod(0o664)
     return root, sorted(dest.glob("*.json"))
