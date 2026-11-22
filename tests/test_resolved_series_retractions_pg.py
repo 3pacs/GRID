@@ -358,7 +358,8 @@ def test_direct_pit_readers_honour_retractions(seeded):
     series_now = credit_cycle._get_feature_series(engine, spy, D_OBS, today)
     series_then = credit_cycle._get_feature_series(engine, spy, D_OBS, yesterday)
     assert sorted(series_now.tolist()) == [100.0]
-    assert sorted(series_then.tolist()) == [100.0, 101.0, 102.0]
+    # One value per obs_date: the latest vintage (D_OBS: V2's 101 over V1's 100).
+    assert series_then.tolist() == [101.0, 102.0]
 
     lookback = (today - D_OBS).days + 1
     assert prediction_context._latest_feature_value(

@@ -1,6 +1,7 @@
 """Cross-section factory: declared before data, development days only, by-hand arithmetic, the sign-flip bar."""
 import csv
 import json
+import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -10,14 +11,19 @@ import pytest
 
 from analysis import cross_section_factory as X
 from analysis import ledger_steered_exploration as lse
+from analysis.desk_conditional_cards import conditional_factory_cards
 from analysis.desk_factory_report import factory_report_cards
 
 SECTORS = ("Energy", "Information Technology", "Utilities")
 HEADER = ["date", "close", "high", "low", "open", "volume", "adjClose", "adjHigh", "adjLow", "adjOpen", "adjVolume", "divCash", "splitFactor"]
 
 
-def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False):
-    """Synthetic bars: every stock has its own steady overnight tilt that it gives back during the day."""
+def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False, revert=0.0, volume_of=None, tilt_of=None):
+    """Synthetic bars: every stock has its own steady overnight tilt that it gives back during the day.
+
+    ``revert`` adds a one-month reversal: each day's intraday return gives back that share of the stock's return over
+    the 21 sessions before. ``volume_of(sym)`` sets a stock's daily volume, ``tilt_of(sym)`` scales its tilt. The
+    defaults draw the same random numbers as before."""
     rng = np.random.default_rng(seed)
     days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2015-01-02", periods=n_days)]
     (root / "prices").mkdir(parents=True)
@@ -26,13 +32,16 @@ def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False):
         for i in range(n_per):
             sym = f"S{s}N{i:02d}"
             syms.append((sym, sector))
-            tilt[sym] = rng.normal(0, 0.002)
+            tilt[sym] = rng.normal(0, 0.002) * (tilt_of(sym) if tilt_of else 1.0)
     for sym, _ in syms:
-        prev, rows = 100.0, []
+        prev, rows, closes = 100.0, [], []
+        vol = volume_of(sym) if volume_of else 2_000_000
         for d in days:
+            back = revert * (prev / closes[-21] - 1) if revert and len(closes) >= 21 else 0.0
             o = prev * (1 + tilt[sym] + rng.normal(0, 0.003))
-            c = o * (1 - tilt[sym] + rng.normal(0, 0.003))
-            rows.append([d, c, max(o, c) * 1.001, min(o, c) * 0.999, o, 2_000_000, c, max(o, c) * 1.001, min(o, c) * 0.999, o, 2_000_000, 0.0, 1.0])
+            c = o * (1 - tilt[sym] + rng.normal(0, 0.003) - back)
+            rows.append([d, c, max(o, c) * 1.001, min(o, c) * 0.999, o, vol, c, max(o, c) * 1.001, min(o, c) * 0.999, o, vol, 0.0, 1.0])
+            closes.append(prev)
             prev = c
         if extra_late_bar:
             rows.append(["2023-01-03", prev, prev * 1.01, prev * 0.99, prev, 2_000_000, prev, prev * 1.01, prev * 0.99, prev, 2_000_000, 0.0, 1.0])
@@ -589,3 +598,182 @@ def test_the_universe_uses_the_store_s_sessions_and_the_adjusted_bar_checks(tmp_
     np.testing.assert_array_equal(panel.base, u.base)
     assert panel.sessions == u.sessions and panel.cols == u.cols
     assert np.isnan(panel.cc[bad, b]) and np.isnan(panel.cc[bad + 1, b]) and np.isnan(panel.cc[gap + 1, a])
+
+
+# ── The residual card ──────────────────────────────────────────────────────
+
+def _parts(m):
+    att = m["attribution_bp"]
+    return sum(att[f] for f in X.FACTORS) + att["sector"] + att["unidentified"] + att["residual"]
+
+
+def test_the_residual_card_splits_each_spread_exactly_and_never_reaches_the_bar(tmp_path, monkeypatch):
+    build(tmp_path)
+    rep = X.run(write_run(tmp_path, RUN), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    res = rep["residual"]
+    assert res["schema"] == X.RESIDUAL_SCHEMA and set(res["factors"]) == set(X.FACTORS)
+    assert set(res["modules"]) == set(rep["cards"])
+    for tid, m in res["modules"].items():
+        att = m["attribution_bp"]
+        assert m["nights"] == rep["cards"][tid]["overall"]["nights"]          # every traded night was fitted
+        assert att["gross"] == pytest.approx(rep["cards"][tid]["overall"]["gross_bp"], abs=1e-3)
+        assert _parts(m) == pytest.approx(att["gross"], abs=0.01)             # factors + sector + residual = the spread
+        assert m["fit"]["identified"] == m["nights"] and att["unidentified"] == 0.0   # independent factors: every night
+        assert m["residual"]["gross_bp"] == pytest.approx(att["residual"], abs=1e-3)
+        top = [n["bp"] for n in m["names"]["top"]]
+        assert len(top) <= X.TOP_NAMES and top == sorted(top, reverse=True) and all(b > 0 for b in top)
+        assert m["names"]["gross_without_top_bp"] == pytest.approx(att["gross"] - sum(top), abs=0.02)
+        assert m["factor_known_share"]["momentum_12_1"] == 0.0 and m["exposure"]["momentum_12_1"] == 0.0   # 220 days: none
+        if "within_sector" in tid:
+            assert abs(att["sector"]) < 1e-6                                   # a book balanced inside each sector
+    corr = res["correlation"]
+    for a, row in corr.items():
+        assert a not in row and all(v is None or -1 <= v <= 1 for v in row.values())
+        assert all(corr[b][a] == v for b, v in row.items())
+    assert corr["on21|pooled|q20|overnight"]["on21|within_sector|q20|overnight"] > 0.5
+    assert "## Residual cards" in (tmp_path / "out" / "report.md").read_text()
+
+    # the same run with no residual card: the frozen discovery and every other report field are byte for byte the same
+    other = tmp_path / "again"
+    other.mkdir()
+    monkeypatch.setattr(X, "residual_cards", lambda *a, **k: {})
+    rep2 = X.run(write_run(other, RUN), tmp_path, tmp_path / "state.db", ledger_at(other), other / "out")
+    assert (tmp_path / "out" / "discovery-frozen.json").read_bytes() == (other / "out" / "discovery-frozen.json").read_bytes()
+    assert {k: v for k, v in rep.items() if k != "residual"} == {k: v for k, v in rep2.items() if k != "residual"}
+
+    # the desk evidence and conditional-card adapters still read the report as written
+    import hashlib
+    raw = (tmp_path / "out" / "report.json").read_bytes()
+    now = datetime.now(UTC)
+    args = {"expected_sha256": hashlib.sha256(raw).hexdigest(), "receipt_id": "r1", "observed_at": now,
+            "available_at": now, "as_of": now, "max_age": timedelta(days=1)}
+    assert factory_report_cards(raw, **args)["tested_trials"] == 4
+    conditional = conditional_factory_cards(raw, **args)
+    assert {c["trial_id"] for c in conditional["cards"]} == set(rep["cards"])
+    assert conditional["promotion_allowed"] is False
+
+
+def test_a_module_that_is_a_known_factor_is_explained_by_it_and_a_new_effect_is_not(tmp_path):
+    build(tmp_path, revert=0.15)
+    body = {**RUN, "signals": [{"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["overnight"]},
+                               {"name": "rev21", "kind": "reversal", "lookback": 21, "horizons": ["close_1d"]}],
+            "rankings": ["pooled"]}
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    rev, on = rep["residual"]["modules"]["rev21|pooled|q20|close_1d"], rep["residual"]["modules"]["on21|pooled|q20|overnight"]
+    assert rev["attribution_bp"]["gross"] > 20                                 # the planted reversal pays
+    assert rev["exposure"]["reversal_21"] > 0.75                               # its book is the factor's top and bottom fifth
+    assert rev["attribution_bp"]["reversal_21"] > 0.6 * rev["attribution_bp"]["gross"]
+    assert abs(rev["attribution_bp"]["residual"]) < 0.35 * rev["attribution_bp"]["gross"]
+    assert on["attribution_bp"]["gross"] > 20                                  # the overnight tilt is no factor in the set
+    assert on["attribution_bp"]["residual"] > 0.8 * on["attribution_bp"]["gross"]
+
+
+def test_liquidity_halves_rank_again_inside_each_half(tmp_path):
+    liquid = {f"S{s}N{i:02d}" for s in range(len(SECTORS)) for i in range(0, 20, 2)}
+    build(tmp_path, volume_of=lambda sym: 8_000_000 if sym in liquid else 2_000_000,
+          tilt_of=lambda sym: 0.0 if sym in liquid else 1.0)                   # only the less liquid half has a tilt
+    body = {**RUN, "signals": RUN["signals"][:1], "rankings": ["pooled"]}
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    halves = rep["residual"]["modules"]["on21|pooled|q20|overnight"]["liquidity_halves"]
+    assert halves["liquid"]["nights"] == halves["other"]["nights"] > 100
+    assert halves["other"]["gross_bp"] > 20 and abs(halves["liquid"]["gross_bp"]) < 5
+    # longs and shorts both come from the less liquid half, so the book's liquidity gap (longs minus shorts) stays small
+    assert abs(rep["residual"]["modules"]["on21|pooled|q20|overnight"]["exposure"]["liquidity_21"]) < 0.2
+
+
+def test_each_liquidity_half_pays_for_its_own_turnover(tmp_path):
+    liquid = {f"S{s}N{i:02d}" for s in range(len(SECTORS)) for i in range(0, 20, 2)}
+    full = tmp_path / "full"
+    full.mkdir()
+    build(full, volume_of=lambda sym: 8_000_000 if sym in liquid else 2_000_000,
+          tilt_of=lambda sym: 3.0 if sym in liquid else 0.0)                   # liquid ranks hold still, the others churn
+    # the less liquid half sits below the median every night, so it is also a store of its own
+    alone = tmp_path / "alone"
+    shutil.copytree(full, alone)
+    for sym in liquid:
+        (alone / "prices" / f"{sym}.csv").unlink()
+    for name in ("members.csv", "sectors.csv"):
+        with open(alone / name, newline="") as fh:
+            rows = list(csv.reader(fh))
+        if name == "members.csv":
+            rows[1][1] = ",".join(s for s in rows[1][1].split(",") if s not in liquid)
+        else:
+            rows = [r for r in rows if r[0] not in liquid]
+        with open(alone / name, "w", newline="") as fh:
+            csv.writer(fh).writerows(rows)
+
+    body = {**RUN, "signals": [{"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["close_1d"]}],
+            "rankings": ["pooled"]}
+    tid = "on21|pooled|q20|close_1d"
+    rep = X.run(write_run(full, body), full, full / "state.db", ledger_at(full), full / "out")
+    halves = rep["residual"]["modules"][tid]["liquidity_halves"]
+    liq, oth = halves["liquid"], halves["other"]
+    run = X.RunFile.from_dict(body)
+    panel = X.load_panel(full, run)
+    parent = X.evaluate(panel, run, X.state_arrays(panel, X.load_state(full / "state.db")))[tid]["turnover"]
+    assert oth["turnover"] > 3 * liq["turnover"] and oth["turnover"] > 2 * float(np.nanmean(parent))
+    for h in (liq, oth):                                       # net = gross - 4 sides x 1 bp x that half's own turnover
+        assert h["net_bp"] == pytest.approx(h["gross_bp"] - 4 * run.cost_bp_per_side * h["turnover"], abs=2e-3)
+
+    # ranked on its own, the less liquid half trades the same books on the same nights
+    run_alone = X.RunFile.from_dict({**body, "min_ranked": 20, "min_session_bars": 20})   # 30 names, every day
+    p_alone = X.load_panel(alone, run_alone)
+    res = X.evaluate(p_alone, run_alone, X.state_arrays(p_alone, X.load_state(alone / "state.db")))[tid]
+    keep = ~np.isnan(res["gross"])
+    assert oth["nights"] == int(keep.sum())
+    assert oth["gross_bp"] == pytest.approx(round(float(res["gross"][keep].mean()) * 1e4, 3), abs=1e-3)
+    assert oth["turnover"] == pytest.approx(float(res["turnover"][keep].mean()), abs=1e-4)
+    assert "Other half: " in (full / "out" / "report.md").read_text() and "turnover" in (full / "out" / "report.md").read_text()
+
+
+def test_the_identification_check_names_collinear_factors():
+    rng = np.random.default_rng(0)
+    n = 200
+    x = rng.uniform(-0.5, 0.5, (n, 3))
+    d = np.column_stack([np.arange(n) % 4 == s for s in range(4)]).astype(float)
+    status, cond = X._identified(x, d)
+    assert status == X.IDENTIFIED and cond < 3
+    assert X._identified(np.column_stack([x, x[:, 0]]), d) == (X.RANK_DEFICIENT, None)               # a factor twice
+    assert X._identified(np.column_stack([x, x[:, 0] - 2 * x[:, 1]]), d) == (X.RANK_DEFICIENT, None) # a mix of two
+    assert X._identified(np.column_stack([x, d @ [-0.3, -0.1, 0.1, 0.3]]), d) == (X.RANK_DEFICIENT, None)  # the sectors
+    status, cond = X._identified(np.column_stack([x, x[:, 0] + 1e-3 * rng.normal(size=n)]), d)
+    assert status == X.ILL_CONDITIONED and cond > X.MAX_CONDITION                                    # nearly a twin
+    assert X._identified(np.column_stack([x, np.zeros(n)]), d)[0] == X.IDENTIFIED                    # absent: left out
+    assert X._identified(np.zeros((n, 2)), d) == (X.IDENTIFIED, None)
+    assert X._identified(x, None)[0] == X.IDENTIFIED                                                 # no sector labels
+
+
+def test_twin_factors_leave_the_named_split_unidentified_and_the_spread_still_adds_up(tmp_path, monkeypatch):
+    build(tmp_path)
+    body = {**RUN, "signals": RUN["signals"][:1], "rankings": ["pooled"]}
+    tid = "on21|pooled|q20|overnight"
+    plain = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    plain = plain["residual"]["modules"][tid]
+    real = X.factor_matrices
+
+    def twin(panel):                                       # momentum (absent in 220 days) becomes a copy of reversal
+        pos, fac = real(panel)
+        fac["momentum_12_1"] = fac["reversal_21"].copy()
+        return pos, fac
+
+    monkeypatch.setattr(X, "factor_matrices", twin)
+    other = tmp_path / "twin"
+    other.mkdir()
+    rep = X.run(write_run(other, body), tmp_path, tmp_path / "state.db", ledger_at(other), other / "out")
+    m = rep["residual"]["modules"][tid]
+    att = m["attribution_bp"]
+    assert m["fit"]["rank_deficient"] == m["nights"] == plain["nights"] and m["fit"]["identified"] == 0
+    assert all(att[f] == 0.0 for f in X.FACTORS) and att["sector"] == 0.0     # nothing is credited to a named part
+    assert att["unidentified"] == pytest.approx(att["gross"] - att["residual"], abs=2e-3)
+    assert _parts(m) == pytest.approx(att["gross"], abs=0.01)
+    assert att["residual"] == pytest.approx(plain["attribution_bp"]["residual"], abs=1e-3)   # the residual is unchanged
+    assert m["exposure"]["momentum_12_1"] == m["exposure"]["reversal_21"]     # exposure is a fact about the book
+    assert f"Named split identified on 0 of {m['nights']:,} nights" in (other / "out" / "report.md").read_text()
+
+
+def test_a_run_with_nothing_carded_has_an_empty_residual_section(tmp_path):
+    build(tmp_path)
+    body = {**RUN, "signals": RUN["signals"][1:], "cards": 0}
+    rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
+    assert rep["cards"] == {} and rep["residual"]["modules"] == {} and rep["residual"]["correlation"] == {}
+    assert "Residual cards" not in (tmp_path / "out" / "report.md").read_text()

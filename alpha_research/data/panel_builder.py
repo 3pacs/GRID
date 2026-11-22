@@ -263,7 +263,12 @@ def build_volume_panel(
     """
     Build a dates x tickers volume panel from resolved_series.
 
-    Uses {ticker}_avg_volume features.
+    Uses {ticker}_avg_volume features. PIT: a row is read only when both its
+    ``release_date`` and its ``vintage_date`` are <= ``as_of_date`` (a
+    vintage written after ``as_of_date`` was not held on it, whatever
+    release it claims -- E1-V7c), retractions honoured, and one value per
+    (ticker, obs_date): the latest such vintage (store/pit.py's LATEST_AS_OF
+    pick; ``DataFrame.pivot`` below refuses duplicate cells).
     """
     if as_of_date is None:
         as_of_date = date.today()
@@ -272,35 +277,36 @@ def build_volume_panel(
     if start_date is None:
         start_date = end_date - timedelta(days=365 * 5)
 
-    ticker_filter = ""
+    names = [f"{t.lower()}_avg_volume" for t in tickers] if tickers else None
     params: dict = {
         "start": start_date,
         "end": end_date,
         "as_of": as_of_date,
         "retraction_cutoff": retraction_cutoff(as_of_date),
+        "names": names,
     }
 
-    if tickers:
-        names = [f"{t.lower()}_avg_volume" for t in tickers]
-        ticker_filter = "AND fr.name = ANY(:names)"
-        params["names"] = names
-
-    query = text(f"""
-        SELECT fr.name, rs.obs_date, rs.value
-        FROM resolved_series rs
-        JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name LIKE '%%_avg_volume'
-          AND rs.obs_date BETWEEN :start AND :end
-          AND rs.release_date <= :as_of
-          AND NOT EXISTS (
-              SELECT 1 FROM resolved_series_retractions rr
-              WHERE rr.feature_id = rs.feature_id
-                AND rr.obs_date = rs.obs_date
-                AND rr.vintage_date = rs.vintage_date
-                AND rr.retracted_at <= :retraction_cutoff
-          )
-          {ticker_filter}
-        ORDER BY rs.obs_date, fr.name
+    query = text("""
+        SELECT name, obs_date, value FROM (
+            SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
+                fr.name, rs.obs_date, rs.value
+            FROM resolved_series rs
+            JOIN feature_registry fr ON rs.feature_id = fr.id
+            WHERE fr.name LIKE '%%_avg_volume'
+              AND (CAST(:names AS text[]) IS NULL OR fr.name = ANY(CAST(:names AS text[])))
+              AND rs.obs_date BETWEEN :start AND :end
+              AND rs.release_date <= :as_of
+              AND rs.vintage_date <= :as_of
+              AND NOT EXISTS (
+                  SELECT 1 FROM resolved_series_retractions rr
+                  WHERE rr.feature_id = rs.feature_id
+                    AND rr.obs_date = rs.obs_date
+                    AND rr.vintage_date = rs.vintage_date
+                    AND rr.retracted_at <= :retraction_cutoff
+              )
+            ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date DESC
+        ) latest
+        ORDER BY obs_date, name
     """)
 
     with engine.connect() as conn:
