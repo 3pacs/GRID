@@ -567,7 +567,14 @@ sudo -u grid sh -c 'set -a; . /home/grid/grid_v4/grid_repo/.env; set +a; \
 # without GRID_OPTIONS_DEDICATED_TIMER=1: OPTIONS_DEDICATED {"reason": "dedicated timer not declared: ...", "status": "REFUSED"}
 ```
 
-Install the units. Until the flag is set, the timer fires and every run refuses:
+Do these steps in this order. Each scheduler process reads the flag once, when it
+starts. The dedicated unit reads the `.env` on every run. If the timer is enabled
+while either scheduler still runs without the flag, that scheduler's 16:00Z or
+20:00Z slot runs the full universe itself, and the 16:10Z or 20:10Z dedicated run
+starts on top of it. Neither the per-writer Schwab hold nor the capture guard
+catches that overlap.
+
+1. Install the units, but do not enable the timer yet:
 
 ```bash
 sudo install -m 0644 deploy/systemd/grid-options-dedicated.service.template \
@@ -576,13 +583,11 @@ sudo install -m 0644 deploy/systemd/grid-options-dedicated.timer.template \
     /etc/systemd/system/grid-options-dedicated.timer
 sudo systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/grid-options-dedicated.service /etc/systemd/system/grid-options-dedicated.timer
-sudo systemctl enable --now grid-options-dedicated.timer
-systemctl list-timers grid-options-dedicated.timer      # NEXT: a weekday 16:10 or 20:10 UTC
 ```
 
-Hand off: set `GRID_OPTIONS_DEDICATED_TIMER=1` in `/home/grid/grid_v4/grid_repo/.env`
-(schwab mode must already be on). Then restart the two scheduler processes so
-they read it:
+2. Hand off. Set `GRID_OPTIONS_DEDICATED_TIMER=1` in
+`/home/grid/grid_v4/grid_repo/.env` (schwab mode must already be on). Then restart
+both scheduler processes so they read it:
 
 ```bash
 sudo systemctl restart grid-hermes                       # smart scheduler (options job)
@@ -591,7 +596,12 @@ sudo systemctl restart grid-hermes                       # smart scheduler (opti
 sudo systemctl restart grid-scheduler
 ```
 
-The dedicated unit reads the `.env` on every run, so it needs no restart.
+3. Only after both restarts, enable the timer:
+
+```bash
+sudo systemctl enable --now grid-options-dedicated.timer
+systemctl list-timers grid-options-dedicated.timer      # NEXT: a weekday 16:10 or 20:10 UTC
+```
 
 First-run check, after a 16:10Z slot:
 
@@ -603,7 +613,14 @@ journalctl -u grid-hermes --since today | grep -E 'options skipped .*dedicated_o
 
 ### Roll back
 
-To roll back, remove `GRID_OPTIONS_DEDICATED_TIMER` from the `.env` (or set it to
-anything but `1`) and restart grid-hermes and grid-scheduler as above. The
-schedulers take the run back, and the timer's runs refuse. To remove the unit
-too, run `sudo systemctl disable --now grid-options-dedicated.timer`.
+Disable the timer first, so no dedicated run can overlap a scheduler that has
+already taken the run back:
+
+```bash
+sudo systemctl disable --now grid-options-dedicated.timer
+```
+
+Then remove `GRID_OPTIONS_DEDICATED_TIMER` from the `.env` (or set it to anything
+but `1`) and restart grid-hermes and grid-scheduler as above. Until both restarts,
+the 16:00Z and 20:00Z slots are still handed off and the timer is off, so those
+slots skip. That leaves a gap, not a double run.
