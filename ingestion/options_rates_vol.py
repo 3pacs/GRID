@@ -58,6 +58,7 @@ except tests.
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -243,12 +244,23 @@ def interpolate_constant_maturity_iv(
     return None
 
 
+_ISO_DATE_PREFIX = re.compile(r"\d{4}-\d{2}-\d{2}(?:$|[T ])")
+
+
 def _as_date(value: Any) -> date:
+    """A database expiry as a ``date``; ``ValueError`` for numbers and non-ISO text.
+
+    Only a ``date``/``datetime`` or a string starting ``YYYY-MM-DD`` is read: a
+    number such as ``20261210`` (which ``date.fromisoformat`` would accept once
+    turned into text) or an epoch count is refused, never converted.
+    """
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
-    return date.fromisoformat(str(value)[:10])
+    if isinstance(value, str) and _ISO_DATE_PREFIX.match(value.strip()):
+        return date.fromisoformat(value.strip()[:10])
+    raise ValueError(f"expiry {value!r} is not a date or an ISO YYYY-MM-DD string")
 
 
 class OptionsRatesVolPuller(BasePuller):

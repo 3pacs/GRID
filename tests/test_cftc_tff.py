@@ -241,8 +241,8 @@ def test_out_of_range_positions_skip_the_row(field: str, value: str, detail: str
     assert out.reports == [] and out.skipped[0]["detail"] == detail
 
 
-@pytest.mark.parametrize("raw_rd", ["", "NaT", "nat", "garbage", "2026-13-01", True, float("nan"), 20261117],
-                         ids=repr)
+@pytest.mark.parametrize("raw_rd", ["", "NaT", "nat", "garbage", "2026-13-01", True, float("nan"), 20261117,
+                                    20261117.0, "20261117", "Nov 17 2026"], ids=repr)
 def test_bad_report_dates_skip_the_row(raw_rd: Any) -> None:
     # pandas parses "" and "NaT" to NaT; that is not a date and must not reach a write.
     out = parse_tff_records("043602", [_row(report_date=raw_rd)])

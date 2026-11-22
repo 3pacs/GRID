@@ -414,3 +414,76 @@ def test_naive_labels_are_session_dates_whatever_the_time_of_day() -> None:
     b = compute_true_breadth_panel(stamped, members_on=lambda _d: members)
     assert list(a.index) == list(b.index) == [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
     pd.testing.assert_frame_equal(a, b)
+
+
+# ── Numeric index labels are refused before any conversion (Codex, 73224e95) ─
+# pd.to_datetime([0, 86400000000000]) silently reads nanoseconds since 1970.
+
+_EPOCH_NS = [0, 86_400_000_000_000]
+
+
+def _numeric_frames() -> dict[str, pd.DataFrame]:
+    values = {f"T{i}": [100.0, 101.0] for i in range(20)}
+    return {
+        "int64": pd.DataFrame(values, index=pd.Index(_EPOCH_NS, dtype="int64")),
+        "float": pd.DataFrame(values, index=pd.Index([float(v) for v in _EPOCH_NS], dtype="float64")),
+        "object": pd.DataFrame(values, index=pd.Index(_EPOCH_NS, dtype=object)),
+        "range": pd.DataFrame(values),                                   # built without an index
+        "bool": pd.DataFrame(values, index=pd.Index([False, True])),
+        "numpy-int-object": pd.DataFrame(values, index=pd.Index([np.int64(v) for v in _EPOCH_NS], dtype=object)),
+    }
+
+
+@pytest.mark.parametrize("kind", list(_numeric_frames()))
+def test_numeric_index_labels_are_refused(kind: str) -> None:
+    px = _numeric_frames()[kind]
+    if kind in ("int64", "float", "object", "numpy-int-object"):  # what pandas alone would do
+        assert list(pd.to_datetime(px.index).year) == [1970, 1970]
+    members = frozenset(px.columns)
+    with pytest.raises(ValueError, match="numeric"):
+        compute_true_breadth_panel(px, members_on=lambda _d: members)
+    with pytest.raises(ValueError, match="numeric"):
+        compute_sector_dispersion_iqr(px)
+
+
+def test_a_single_range_index_row_is_refused_too() -> None:
+    # One row of RangeIndex used to become 1970-01-01 without tripping the duplicate check.
+    px = pd.DataFrame({f"T{i}": [100.0] for i in range(20)})
+    with pytest.raises(ValueError, match="numeric"):
+        compute_true_breadth_panel(px, members_on=lambda _d: frozenset(px.columns))
+
+
+@pytest.mark.parametrize("bad", [5, 5.0, np.int64(5), np.float32(5.0), True, None, "20260107", "Jan 7 2026"],
+                         ids=repr)
+def test_one_bad_label_among_dates_is_refused_by_name(bad) -> None:
+    labels = [pd.Timestamp("2026-01-05"), date(2026, 1, 6), bad]
+    px = pd.DataFrame({f"T{i}": [100.0, 101.0, 102.0] for i in range(20)}, index=pd.Index(labels, dtype=object))
+    with pytest.raises(ValueError, match="session dates") as exc:
+        compute_true_breadth_panel(px, members_on=lambda _d: frozenset(px.columns))
+    assert repr(bad) in str(exc.value)
+    with pytest.raises(ValueError, match="session dates"):
+        compute_sector_dispersion_iqr(px)
+
+
+def test_date_datetime_and_iso_string_indexes_give_identical_results() -> None:
+    px = _prices(n_tickers=30, n_days=60)
+    members = frozenset(px.columns)
+    as_dates = px.set_axis(pd.Index([ts.date() for ts in px.index], dtype=object))
+    as_iso = px.set_axis([ts.strftime("%Y-%m-%d") for ts in px.index])
+    as_np = px.set_axis(pd.Index([np.datetime64(ts.date()) for ts in px.index], dtype=object))
+    base = compute_true_breadth_panel(px, members_on=lambda _d: members)          # naive DatetimeIndex
+    for other in (as_dates, as_iso, as_np):
+        pd.testing.assert_frame_equal(base, compute_true_breadth_panel(other, members_on=lambda _d: members))
+    pd.testing.assert_series_equal(compute_sector_dispersion_iqr(px.iloc[:, :8]),
+                                   compute_sector_dispersion_iqr(as_dates.iloc[:, :8]))
+
+
+@pytest.mark.parametrize("field,value", [("base_date", 20260102), ("covers_to", "20260107"),
+                                         ("covers_to", 1.5)], ids=repr)
+def test_membership_file_dates_must_be_iso_strings(tmp_path: Path, field: str, value) -> None:
+    path = _membership_file(tmp_path)
+    doc = json.loads(path.read_text())
+    doc[field] = value
+    path.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match=field):
+        sp500_members_on(path)
