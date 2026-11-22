@@ -1,0 +1,16 @@
+# TEMPLATE — NOT INSTALLED, DISABLED BY DEFAULT. The operator installs it; see
+# grid-market-state-provisional.service.template. Display only (#1312).
+# Weekdays 21:15Z: after every XNYS close (21:00Z in winter, 20:00Z in summer, 18:00Z or 17:00Z on an early close),
+# and before the 22:20 America/New_York post-close desk brief. Persistent=false: a run missed while the host was
+# down is not caught up, because after midnight UTC the writer targets the next day and refuses (exit 2).
+[Unit]
+Description=Run the GRID provisional market-state record once a weekday at the close (display only)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 21:15:00 UTC
+RandomizedDelaySec=2min
+Persistent=false
+Unit=grid-market-state-provisional.service
+
+[Install]
+WantedBy=timers.target
