@@ -342,12 +342,15 @@ def test_chat_adds_report_context_for_admin_only(monkeypatch):
     monkeypatch.setattr(O, "_get_client", lambda: client)
     import knowledge.tree as tree
     monkeypatch.setattr(tree, "get_context_for_prompt", lambda q, limit=5: "")
-    monkeypatch.setattr(tree, "store_qa", lambda **kw: None)
+    stored = []
+    monkeypatch.setattr(tree, "store_qa", lambda **kw: stored.append(kw["question"]))
     monkeypatch.setattr(tree, "get_related", lambda q, limit=3: [])
     import api.dependencies as deps
     monkeypatch.setattr(deps, "get_db_engine", lambda: object())
 
     O.ask_ollama(O.AskRequest(question="what happened to the puller"), token=create_token(role="contributor", expires_hours=1))
     assert calls == [] and not any(m["content"] == "REPORTS" for m in client.messages)
+    assert stored == ["what happened to the puller"]                              # a contributor's Q&A is kept
     O.ask_ollama(O.AskRequest(question="what happened to the puller"), token=create_token(role="admin", expires_hours=1))
     assert calls == ["what happened to the puller"] and any(m["content"] == "REPORTS" for m in client.messages)
+    assert stored == ["what happened to the puller"]                              # the report-informed answer is not

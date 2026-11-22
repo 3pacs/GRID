@@ -244,11 +244,12 @@ def ask_ollama(req: AskRequest, token: str = Depends(require_auth)) -> dict[str,
         system_knowledge=["01_grid_overview", "06_market_analysis_framework"],
     )
 
-    # Store the Q&A in the knowledge tree
+    # Store the Q&A in the knowledge tree, unless it drew on agent reports: the tree is shared with contributors
+    # and report-informed answers are admin-only, so they are not persisted there.
     stored = None
     try:
         from knowledge.tree import store_qa
-        stored = store_qa(
+        stored = None if reports_context else store_qa(
             question=req.question,
             answer=response or "",
             model=client.model or "unknown",
