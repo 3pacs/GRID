@@ -56,6 +56,7 @@ from __future__ import annotations
 import re
 import math
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Literal
@@ -777,6 +778,18 @@ def _actor_clause_supported(clause: str, evidence: list[dict[str, Any]]) -> bool
     return False
 
 
+def _structure_clause_nonclaim(clause: str) -> bool:
+    """Whole bounded measurement caveats/hypotheses about structure subjects."""
+    clause = clause.strip()
+    subject = (r"(?:bid depth|order[- ]book depth|informed participant exits|insider distribution|"
+               r"gamma[- ]driven moves|gamma exposure|tail risk mispricing)")
+    return bool(
+        re.fullmatch(subject + r"\s+(?:is|are|remains?)\s+(?:unknown|unmeasured|unverified|unavailable|not established)", clause)
+        or re.fullmatch(r"(?:prices|counts|pcr|ratios|vix|these data)(?: alone)?\s+(?:cannot|do not|does not) establish\s+" + subject, clause)
+        or re.fullmatch(r"hypothesis:\s*(?:informed participants (?:may|might|could) be exiting|gamma[- ]driven moves (?:may|might|could) occur)(?:\s+\(unverified\))?", clause)
+    )
+
+
 def _publication_structure_reasons(clause: str, context: set[str]) -> set[str]:
     """Reject bounded proxy-to-motive/depth/mechanism upgrades, not the nouns.
 
@@ -790,13 +803,7 @@ def _publication_structure_reasons(clause: str, context: set[str]) -> set[str]:
     gamma = bool(re.search(r"\bgamma\b", clause))
     tail = bool(re.search(r"\btail[\s\u2010-\u2015-]+risk\b", clause))
     context.update(k for k, present in (("actor", actor), ("book", book), ("gamma", gamma), ("tail", tail)) if present)
-    subject = (r"(?:bid depth|order[- ]book depth|informed participant exits|insider distribution|"
-               r"gamma[- ]driven moves|gamma exposure|tail risk mispricing)")
-    if re.fullmatch(subject + r"\s+(?:is|are|remains?)\s+(?:unknown|unmeasured|unverified|unavailable|not established)", clause.strip()):
-        return set()
-    if re.fullmatch(r"(?:prices|counts|pcr|ratios|vix|these data)(?: alone)?\s+(?:cannot|do not|does not) establish\s+" + subject, clause.strip()):
-        return set()
-    if re.fullmatch(r"hypothesis:\s*(?:informed participants (?:may|might|could) be exiting|gamma[- ]driven moves (?:may|might|could) occur)(?:\s+\(unverified\))?", clause.strip()):
+    if _structure_clause_nonclaim(clause):
         return set()
     pronoun = bool(re.match(r"^\s*(?:(?:but|and|however|yet|whereas)\s+)?(?:it|they|this|that|these|those|is|are)\b", clause))
     reasons: set[str] = set()
@@ -820,17 +827,62 @@ def _publication_structure_reasons(clause: str, context: set[str]) -> set[str]:
     return reasons
 
 
+# Named participant groups. An explicit one opens the actor context for the
+# rest of the text (see test_context_still_binds_pronouns_and_bare_predicates).
+_ACTOR_SUBJECT_RE = re.compile(
+    r"\b(?:institution(?:al|s)?|retail|smart money|professional investors|"
+    r"informed (?:participants?|sell\w*|buy\w*|traders?|trading|money|investors?|caution\w*|positioning)|"
+    r"large[- ](?:players?|participants?|holders?))\b")
+# Participant posture read off aggregate ratios, price proxies or scores.
+_POSTURE_RE = re.compile(
+    r"\b(?:defensive|risk[- ]off|cautious)\s+positioning\b|"
+    r"\bpositioning\s+(?:is|remains|looks|appears|was)\s+(?:defensive|risk[- ]off|cautious)\b|"
+    r"\b(?:signal\w*|suggest\w*|indicat\w*|point\w*\s+to|consistent\s+with|associated\s+with|"
+    r"correlat\w*\s+with|reflect\w*)\s+(?:\w+\s+)?caution\b")
+# GRID's own proxy component labels (market_briefing._PROXY_COMPONENT_LABELS)
+# are nouns, not participant positioning. Normalization strips the label text
+# only; any actor word or posture in the same clause is still checked.
+_PROXY_LABEL_RE = re.compile(
+    r"\b(?:(?:computed\s+)?(?:sentiment|equity)\s+)?(?:positioning|etf activity|dark pool)\s?prox(?:y|ies)\b")
+# The label's direction word is the score sign the prompt asks for. It binds to
+# the label only when the clause also carries that signed score and no actor.
+_PROXY_SCORE_RE = re.compile(r"(?<![\w.])[+-]\d+(?:\.\d+)?\b")
+_CONTRACT_POSITIONING_RE = re.compile(r"\b(?:relative\s+)?(?:put\s+|call\s+)?contract\s+positioning\b")
+_PAREN_RE = re.compile(r"\([^()\n]{0,80}\)")
+
+
+def _strip_proxy_labels(clause: str) -> str:
+    """Remove GRID proxy labels and an open-interest description, never a claim."""
+    labelled = bool(_PROXY_LABEL_RE.search(clause))
+    stripped = _CONTRACT_POSITIONING_RE.sub("", _PROXY_LABEL_RE.sub("", clause))
+    if labelled and _PROXY_SCORE_RE.search(stripped) and not _ACTOR_SUBJECT_RE.search(stripped):
+        stripped = re.sub(r"\b(?:un)?supportive\b", "", stripped)
+    return stripped
+
+
 def _publication_inference_nonclaim(clause: str) -> bool:
     """Whole measurement denials only, never a denial of observed activity.
 
     No amounts, causal tails or free-form descriptions enter this grammar.
     In particular, 'institutions are not buying puts' still asserts actor side.
     """
-    target = (r"(?:institutional (?:distribution|positioning)|hedg(?:e|ing) intent|"
-              r"hedging|distribution|buyer initiation|fear|protection buying)")
-    targets = target + r"(?:\s+or\s+" + target + r"){0,3}"
+    target = (r"(?:institutional (?:distribution|positioning|conviction|accumulation)|hedg(?:e|ing) intent|"
+              r"hedging(?: activity)?|distribution|accumulation|buyer (?:initiation|intent)|"
+              r"(?:buyer|seller)/(?:buyer|seller) initiation|intent|fear|protection buying|"
+              r"dealer (?:positioning|side|inventory)|informed trading|(?:defensive|risk-off) positioning)")
+    targets = r"(?:specific\s+)?" + target + r"(?:\s+or\s+(?:specific\s+)?" + target + r"){0,3}"
+    # Denial forms the model actually writes (retained 2026-11-04 rejected
+    # drafts). Whole-clause only: a subject outside this closed list, or any
+    # trailing words, still fail closed.
+    lead = (r"(?:(?:though|but|yet)\s+)?(?:(?:it|this|this metric|this ratio|the ratio|"
+            r"the (?:spy )?put/call ratio|these|they|the insider/congressional ratios(?: \([^()]*\))?)\s+)?")
     return bool(
-        re.fullmatch(r"not (?:a measure|evidence) of\s+" + targets, clause)
+        re.fullmatch(lead + r"(?:does not|do not|cannot)\s+(?:measure|confirm|establish|prove)\s+" + targets, clause)
+        or re.fullmatch(r"not\s+" + targets, clause)
+        or re.fullmatch(r"no (?:specific )?(?:source-bound evidence supports (?:specific )?)?"
+                        r"institutional distribution or accumulation"
+                        r"(?: is (?:established|evidenced))?(?: by (?:the )?(?:supplied )?data)?", clause)
+        or re.fullmatch(r"not (?:a (?:direct )?measure|evidence) of\s+" + targets, clause)
         or re.fullmatch(r"(?:it|this proxy)\s+(?:does not|cannot) (?:prove|confirm)\s+" + targets, clause)
         or re.fullmatch(r"so it cannot be used to claim\s+" + targets, clause)
         or clause in {"not a measured flow", "no positioning instructions are provided"}
@@ -860,12 +912,21 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
     """
     normalized = _strip_publication_disclosures(_publication_normalized(text))
     reasons: set[str] = set()
+    # Clause-level hit counts per reason code (observability only; no text).
+    reason_counts: Counter[str] = Counter()
     reported = [e for e in (flow_edges or []) if flow_evidence_kind(e) == "reported_flow"]
     # Bind each clause independently. Decimal dots are never boundaries.
     # Commas in numbers are thousands separators, not clause separators.
+    # A short parenthetical such as "(21% and 25% buy ratios)" is one noun
+    # phrase, not two clauses: never split inside it. Matching only; every
+    # word stays in the clause it belongs to.
+    normalized = _PAREN_RE.sub(lambda m: re.sub(r"\s+and\s+", " & ", m.group(0)).replace(",", " /"), normalized)
     sentences = re.split(r"([.!?]+(?:\s+|$)|[;\n]+|,(?!\d)\s*|\s+(?:and|while|but|whereas|however)\s+)", normalized)
     flow_clause_context = False
     actor_context = False
+    # A denied intent ("not a measure of hedging intent") can still be the
+    # antecedent of a later elided assertion ("it is occurring").
+    intent_context = False
     sentiment_subject = False
     structure_context: set[str] = set()
     for index in range(0, len(sentences), 2):
@@ -873,15 +934,16 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
             flow_clause_context = False
             sentiment_subject = False
         sentence = sentences[index]
+        found: set[str] = set()
         # Remove only fixed nonclaim phrases, never a whole sentence containing
         # an unmeasured/unavailable adjective (which can precede a false claim).
         sentence = re.sub(r"\b(?:transfer amount (?:unmeasured|unavailable)|(?:unmeasured|unavailable) transfer amount|hedging intent unmeasured|realized vol(?:atility)? (?:is )?(?:unavailable|unmeasured)|hedge funds?|inflation hedge|(?:operating|free) cash flows?|(?:money )?flow engine)\b", "", sentence)
+        sentence = _strip_proxy_labels(sentence)
         if not sentence.strip():
             continue
         # A model observation never erases an earlier protected actor. Its
         # exception applies only to this whole bounded clause, not later prose.
-        actor_explicit = bool(re.search(
-            r"\b(?:institution(?:al|s)?|retail|smart money|professional investors)\b", sentence))
+        actor_explicit = bool(_ACTOR_SUBJECT_RE.search(sentence))
         inference_nonclaim = _publication_inference_nonclaim(sentence.strip())
         actor_context = actor_context or actor_explicit
         model_nonclaim = _publication_explicit_nonactor_subject(sentence.strip())
@@ -895,31 +957,46 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
             # A denial can still be the antecedent of a later unsupported
             # assertion. It grants no permission to a following amount/claim.
             flow_clause_context = flow_clause_context or bool(re.search(r"\bflow\b", sentence))
+            intent_context = intent_context or bool(re.search(r"\b(?:hedg\w*|intent|initiation|protection)\b", sentence))
             continue
-        reasons.update(_publication_structure_reasons(sentence, structure_context))
+        if intent_context and re.match(
+            r"^\s*(?:(?:but|and|however|yet|whereas)\s+)?(?:it|they|this|that|these|those|is|are)\b", sentence
+        ) and re.search(r"\b(?:occur\w*|happening|underway)\b", sentence):
+            found.add("unsupported_options_intent")
+        found.update(_publication_structure_reasons(sentence, structure_context))
+        if _POSTURE_RE.search(sentence):
+            # Aggregate ratios, price proxies and model scores never establish
+            # what participants are positioned for or feel (with or without a
+            # named actor). Removed only by a whole-clause denial above.
+            found.add("unsupported_positioning_posture")
         if (actor_context
-                and re.search(r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*|conviction|euphori\w*|exit\w*)\b", sentence)
+                and re.search(r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*|conviction|euphori\w*|exit\w*|caution\w*|cautious|defensiv\w*)\b", sentence)
                 and not _actor_clause_nonclaim(sentence.strip())
+                and not _structure_clause_nonclaim(sentence)
                 and not model_nonclaim and not sentiment_continuation
                 and not _actor_clause_supported(sentence.strip(), actor_evidence if isinstance(actor_evidence, list) else [])):
-            reasons.add("unsupported_actor_interpretation")
+            found.add("unsupported_actor_interpretation")
         commercial_hedge_subject = (
             re.search(r"\b(?:fuel (?:costs?|prices?)|inflation|currency fluctuations?|foreign exchange|interest rates?)\b", sentence)
             and not re.search(r"\b(?:pcr|put/call|puts?|calls?|options?|dealers?|protection)\b", sentence)
         )
         options_sentence = re.sub(r"\bhedg\w*\b", "", sentence) if commercial_hedge_subject else sentence
         if re.search(r"\b(?:hedg\w*|(?:buy\w*|bought|purchas\w*|sell\w*|writ\w*)\s+(?:[\w'-]+\s+){0,5}(?:downside\s+protection|puts?|calls?)|(?:puts?|calls?)\s+(?:buy\w*|bought|purchas\w*|sell\w*)|downside\s+protection|signed\s+(?:dealer\s+)?gamma)\b", options_sentence):
-            reasons.add("unsupported_options_intent")
+            found.add("unsupported_options_intent")
         if re.search(r"\breali[sz]ed\s+vol(?:atility)?\b", sentence):
-            reasons.add("unsupported_realized_volatility")
+            found.add("unsupported_realized_volatility")
         flow_claim = re.search(r"\b(?:(?:in|out)?flows?|flowed|transfer(?:red|s)?|wired|money\s+(?:is\s+)?flowing|capital\s+(?:moved|rotat\w*|flight)|(?:moved|poured|rotated|drained|siphoned)\s+(?:directly\s+)?(?:from|into|out))\b", sentence)
         # An isolated currency price is not a transfer. An additional amount
         # in the same flow statement still needs its own source receipt.
         if flow_claim or (flow_clause_context and _DOLLAR_RE.fullmatch(sentence.strip())):
             if not _reported_flow_clause_supported(sentence.strip(), reported):
-                reasons.add("unsupported_money_transfer")
+                found.add("unsupported_money_transfer")
         flow_clause_context = bool(flow_claim) or flow_clause_context
-    return {"passed": not reasons, "reasons": sorted(reasons), "scope": "bounded_publication_claims_v1"}
+        # Every early `continue` above precedes any finding in this clause.
+        reasons.update(found)
+        reason_counts.update(found)
+    return {"passed": not reasons, "reasons": sorted(reasons),
+            "reason_counts": dict(sorted(reason_counts.items())), "scope": "bounded_publication_claims_v1"}
 
 # ── Configuration ────────────────────────────────────────────────────────
 # Public so callers (and tests) can reference or override it explicitly —
