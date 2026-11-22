@@ -306,6 +306,12 @@ def open_asks(engine: Engine, since: date) -> list[dict]:
     return sorted(asks.values(), key=lambda a: a["created_at"], reverse=True)
 
 
+def is_current(a: dict) -> bool:
+    """A check counts only if it was made after the latest report that makes the ask: a repeated ask reopens."""
+    chk = a.get("check")
+    return chk is not None and chk.checked_at >= a["created_at"]
+
+
 def candidates(ask: str, later: list, limit: int = 6) -> list:
     """Later reads sharing at least two words with the ask, most overlap first, then newest."""
     t = _terms(ask)
@@ -318,7 +324,9 @@ def candidates(ask: str, later: list, limit: int = 6) -> list:
     return [r for _, r in scored[:limit]]
 
 
-_GRID_PR = re.compile(r"(?<![A-Za-z]#)(?<![a-z])(?:GRID\s*)?#(\d{3,5})\b")
+_GRID_REF = re.compile(r"(?:\bGRID\s*(?:PR\s*)?#|github\.com/3pacs/GRID/pull/)(\d{3,5})\b", re.I)
+_BARE_REF = re.compile(r"(?<![\w/#])#(\d{3,5})\b")
+_OTHER_REPO = re.compile(r"\w#\d|\w+/\w+#\d|\bgex\b|\bobsidian\b|\bvault\b", re.I)
 _MERGE_ASK = re.compile(r"\bmerg", re.I)
 _OTHER_ACTION = re.compile(r"\b(?:run|runs|install\w*|load|cron|timer|look|registration|register|deploy\w*|apply|"
                            r"applied|activat\w*|holdout|sign-?off|committed|backfill|restart)\b", re.I)
@@ -326,8 +334,12 @@ GITHUB_PR = "https://api.github.com/repos/3pacs/GRID/pulls/{n}"
 
 
 def grid_prs(ask: str) -> list[str]:
-    """GRID PR numbers an ask names (#1267, GRID #1267); numbers written as gex#47 or other repos are left out."""
-    return sorted(set(m.group(1) for m in _GRID_PR.finditer(ask) if not ask[max(0, m.start() - 4):m.start()].lower().endswith("gex")))
+    """GRID PR numbers an ask names. Explicit references (GRID #1267, GRID#1267, .../3pacs/GRID/pull/1267) always
+    count; a bare #1267 counts only when the ask names no other repository (gex#47, owner/repo#3, gex, vault)."""
+    explicit = {m.group(1) for m in _GRID_REF.finditer(ask)}
+    rest = _GRID_REF.sub(" ", ask)
+    bare = set() if _OTHER_REPO.search(rest) else {m.group(1) for m in _BARE_REF.finditer(rest)}
+    return sorted(explicit | bare)
 
 
 def pr_state(n: str, cache: dict) -> str | None:
@@ -351,10 +363,11 @@ def settled_on_github(ask: str, cache: dict) -> str | None:
     if not _MERGE_ASK.search(ask) or _OTHER_ACTION.search(ask):
         return None          # asks for more than a merge: the model weighs the PR states with the later reports
     prs = grid_prs(ask)
-    if not prs:
-        return None
+    every = {m.group(1) for m in _GRID_REF.finditer(ask)} | {m.group(1) for m in _BARE_REF.finditer(_GRID_REF.sub(" ", ask))}
+    if not prs or set(prs) != every:
+        return None          # a number it cannot attribute to GRID for certain: the model decides instead
     states = {n: pr_state(n, cache) for n in prs}
-    if all(v in ("merged", "closed") for v in states.values()):
+    if all(v == "merged" for v in states.values()):          # closed without merging settles nothing
         return "github: " + ", ".join(f"#{n} {v}" for n, v in states.items())
     return None
 
@@ -384,7 +397,7 @@ def settle_asks(engine: Engine, client: Any | None, *, since: date, limit: int =
     counts = {"open": 0, "checked": 0, "settled": 0, "settled_on_github": 0, "no_new_reports": 0, "failed": 0}
     out, gh_cache = [], {}
     for a in open_asks(engine, since):
-        chk = a["check"]
+        chk = a["check"] if is_current(a) else None
         if chk is not None and chk.settled:
             continue
         counts["open"] += 1
@@ -447,9 +460,10 @@ def digest(engine: Engine, day: date, max_items: int = 10) -> str:
     with engine.connect() as conn:
         unreadable = conn.execute(q, {"d": day}).fetchall()
     asks = open_asks(engine, day - timedelta(days=ASK_WINDOW_DAYS - 1))
-    still = [a for a in asks if not (a["check"] is not None and a["check"].settled)]
-    settled_recently = [a for a in asks if a["check"] is not None and a["check"].settled
-                        and a["check"].checked_at.date() >= day]
+    done = lambda a: is_current(a) and a["check"].settled  # noqa: E731
+    on_github = [a for a in asks if done(a) and (a["check"].how or "").startswith("github:")]
+    probably = [a for a in asks if done(a) and not (a["check"].how or "").startswith("github:")]
+    still = [a for a in asks if not done(a)]
     lines = [f"Reports {day.isoformat()}: {c['received']} in, {c['read']} read, {c['unread']} unread, "
              f"{c['unreadable']} unreadable."]
     if still:
@@ -459,8 +473,14 @@ def digest(engine: Engine, day: date, max_items: int = 10) -> str:
             lines.append(f"- {a['date'][5:]} {a['agent']}: {_one_line(a['ask'], 160)}{since}")
         if len(still) > max_items:
             lines.append(f"- and {len(still) - max_items} more")
-    if settled_recently:
-        lines.append(f"Settled by later reports: {len(settled_recently)}.")
+    if probably:   # a model's reading of later reports: shown, never silently dropped
+        lines.append(f"Probably settled, check ({len(probably)}):")
+        for a in probably[:max_items]:
+            lines.append(f"- {a['date'][5:]} {a['agent']}: {_one_line(a['ask'], 110)} [{_one_line(a['check'].how, 50)}]")
+        if len(probably) > max_items:
+            lines.append(f"- and {len(probably) - max_items} more")
+    if on_github:
+        lines.append(f"Settled on GitHub (merged): {len(on_github)}.")
     if unreadable:
         lines.append("Unreadable: " + "; ".join(f"{r.agent}: {r.title[:60]}" for r in unreadable[:4]))
     return "\n".join(lines)

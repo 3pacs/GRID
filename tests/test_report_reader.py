@@ -198,7 +198,9 @@ class Later:
 
 class Check:
     def __init__(self, settled, later_seen):
-        self.settled, self.later_seen = settled, later_seen
+        from datetime import datetime, timezone
+        self.settled, self.later_seen, self.how = settled, later_seen, ""
+        self.checked_at = datetime(2026, 11, 22, tzinfo=timezone.utc)          # after the asks (2026-11-21)
 
 
 class AskConn:
@@ -256,15 +258,54 @@ def test_settle_asks(monkeypatch):
 
 
 def test_merge_asks_settle_on_github(monkeypatch):
-    assert RR.grid_prs("Merging GRID #1267 and #1142 waits on Anik; gex#47 too") == ["1142", "1267"]
-    states = {"1267": "merged", "1142": "open", "1335": "merged"}
+    assert RR.grid_prs("Merging GRID #1267 and #1142 waits on Anik") == ["1142", "1267"]
+    assert RR.grid_prs("Merging GRID #1267; gex#47 too") == ["1267"]                  # bare numbers dropped beside another repo
+    assert RR.grid_prs("Merge gex #1300 and vault #1301") == []
+    assert RR.grid_prs("Merge 3pacs/gex#1300") == []
+    assert RR.grid_prs("see https://github.com/3pacs/GRID/pull/1335") == ["1335"]
+    states = {"1267": "merged", "1142": "open", "1335": "merged", "1400": "closed"}
     monkeypatch.setattr(RR, "pr_state", lambda n, cache: states.get(n))
     assert RR.settled_on_github("Merging GRID #1267 is waiting on Anik.", {}) == "github: #1267 merged"
     assert RR.settled_on_github("Merge #1267 and #1142: Anik's word.", {}) is None      # one still open
     assert RR.settled_on_github("Review #1267 please", {}) is None                       # not a merge ask
+    assert RR.settled_on_github("Merge #1400: Anik's word.", {}) is None                 # closed unmerged settles nothing
+    assert RR.settled_on_github("Merge gex#38, GRID#1335, #1142: Anik's word.", {}) is None   # #1142 unattributable
     assert RR.settled_on_github("The run: needs #1267 merged, the run file committed, and the owner's word.", {}) is None
     eng = AskEngine([])
     monkeypatch.setattr(RR, "open_asks", lambda engine, since: [ask("m", "Merge #1335: Anik's word.")])
     out = RR.settle_asks(eng, None, since=None)                                         # no model needed
     assert out["settled_on_github"] == 1 and eng.rows[0]["how"] == "github: #1335 merged"
     assert eng.rows[0]["settled_by"] is None
+
+
+def test_repeated_ask_reopens_and_digest_never_drops_a_model_verdict(monkeypatch):
+    from datetime import date, datetime, timezone
+
+    class Chk:
+        def __init__(self, settled, how, at):
+            self.settled, self.how, self.later_seen = settled, how, 1
+            self.checked_at = datetime(2026, 11, 22, at, tzinfo=timezone.utc)
+
+    def a(key, line, chk, created_hour):
+        x = ask(key, line, chk)
+        x["created_at"] = datetime(2026, 11, 22, created_hour, tzinfo=timezone.utc)
+        x["date"] = x["first_date"] = "2026-11-22"
+        return x
+
+    asks = [a("g", "Merge GRID #1335.", Chk(True, "github: #1335 merged", 5), 4),
+            a("m", "Install the cron: Anik's word.", Chk(True, "Anik ran the installer", 5), 4),
+            a("r", "Deploy at close: Anik's word.", Chk(True, "deployed", 5), 6),       # repeated after the check
+            a("o", "Pick a slice: Anik.", None, 4)]
+    assert not RR.is_current(asks[2]) and RR.is_current(asks[1])
+    monkeypatch.setattr(RR, "open_asks", lambda engine, since: asks)
+    monkeypatch.setattr(RR, "coverage", lambda engine, since: [])
+
+    class E:
+        def connect(self):
+            return AskConn(AskEngine([]))
+
+    text = RR.digest(E(), date(2026, 11, 22))
+    waiting = text.split("Waiting on you")[1].split("Probably settled")[0]
+    assert "Deploy at close" in waiting and "Pick a slice" in waiting                   # reopened + never checked
+    assert "Probably settled, check (1):" in text and "Install the cron" in text         # model verdict still shown
+    assert "Settled on GitHub (merged): 1." in text and "Merge GRID #1335" not in text
