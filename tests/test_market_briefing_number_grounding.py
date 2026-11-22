@@ -990,6 +990,9 @@ def _generate_basis(response, snapshot, context="Synthetic data with unknown sou
     return engine, result
 
 
+_CLAIM_GUARD_WITHHELD_VECTORS = {"F2-N4": {"unsupported_positioning_posture"}}
+
+
 @pytest.mark.parametrize("vector,kind,text,reasons", _BASIS_CASES, ids=[case[0] for case in _BASIS_CASES])
 def test_four_basis_vectors_real_guard_and_generation(vector, kind, text, reasons):
     import hashlib
@@ -1013,8 +1016,14 @@ def test_four_basis_vectors_real_guard_and_generation(vector, kind, text, reason
     engine, result = _generate_basis(text, deepcopy(snapshot))
     assert reasons <= set(result["publication_context_guard"]["reasons"])
     assert result["publication_status"]["source_evidence_status"] == "unknown"
-    assert result["publication_status"]["content_kind"] == "narrative"
-    assert result["publication_claim_guard"]["passed"]
+    if vector in _CLAIM_GUARD_WITHHELD_VECTORS:
+        # Participant posture read off a ratio is a withholding claim since the
+        # 2026-11-21 posture rule; the context guard still omits it as well.
+        assert result["publication_status"]["content_kind"] == "data_summary"
+        assert _CLAIM_GUARD_WITHHELD_VECTORS[vector] <= set(result["publication_claim_guard"]["reasons"])
+    else:
+        assert result["publication_status"]["content_kind"] == "narrative"
+        assert result["publication_claim_guard"]["passed"]
     diagnostics = result["publication_stage_diagnostics"]
     assert diagnostics["roles"]["candidate"]["digest"]["sha256"] == hashlib.sha256(text.encode()).hexdigest()
     assert diagnostics["roles"]["emitted"]["digest"]["sha256"] == hashlib.sha256(result["content"].encode()).hexdigest()
@@ -1428,3 +1437,41 @@ def test_publication_transaction_counts_exclude_unrelated_connection_commits(pre
     assert conn.commit_count == (3 if prepared else 2), "UNRELATED_COMMITS_MUST_REMAIN_VISIBLE"
     assert conn.rollback_count == (0 if prepared else 1)
     assert any("INSERT INTO market_briefings" in sql for sql in conn.executed) is prepared
+
+
+def test_withheld_narrative_logs_reason_codes_and_counts_not_draft_text(tmp_path, monkeypatch):
+    from loguru import logger
+
+    import config  # noqa: F401  - resets loguru handlers on first import; import before adding a sink
+    import ollama.market_briefing  # noqa: F401
+
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+    try:
+        candidate = "## What's Happening Now\nDirectional flows are bullish. Institutions are buying.\n"
+        _, result = _run_with_sentiment(tmp_path, monkeypatch, candidate)
+    finally:
+        try:
+            logger.remove(sink)
+        except ValueError:  # an imported module may reset loguru handlers
+            pass
+    guard = result["publication_claim_guard"]
+    assert guard["passed"] is False and guard["rejected_candidate"] == candidate
+    withheld = [m for m in messages if "claim guard withheld" in m]
+    assert len(withheld) == 1
+    assert "reasons=unsupported_actor_interpretation,unsupported_money_transfer" in withheld[0]
+    assert "clause_counts=unsupported_actor_interpretation:1,unsupported_money_transfer:1" in withheld[0]
+    assert "Directional flows" not in withheld[0] and "Institutions are buying" not in withheld[0]
+
+
+def test_prompt_gives_exact_caveats_and_context_drops_hedge_wording(tmp_path, monkeypatch):
+    fake_llm, _ = _run_with_sentiment(tmp_path, monkeypatch, "## Action\nWatch the tape.\n")
+    system = next(m["content"] for m in fake_llm.calls[0]["messages"] if m["role"] == "system")
+    user = next(m["content"] for m in fake_llm.calls[0]["messages"] if m["role"] == "user")
+    assert "write exactly: 'Actor actions and liquidity valves are unavailable or unknown.'" in system
+    assert "the positioning proxy score (+1.00)" in system
+    for banned in ("institutions, informed participants, large players, dealers, buyers or sellers, caution",
+                   "defensive or risk-off positioning"):
+        assert banned in system
+    assert "(supportive/unsupportive)" not in system and "(supportive/unsupportive)" not in user
+    assert "hedge intent" not in user and "institutional conviction" not in user
