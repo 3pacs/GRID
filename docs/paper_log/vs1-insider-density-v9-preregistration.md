@@ -18,6 +18,36 @@ VS1 v8 is stopped unopened with terminal status `STOP_SUPERSEDED_BY_V9_UNOPENED`
 
 Witness census rules: v1–v5 Technology and sectors-v2–v4 registration witnesses must each remain at exactly two records; v6, v7, v8, and sectors-v6 at exactly their three-record terminal STOPs. Sectors-v5 was never registered and can never open. The ten-sector generalization test bound to this v9 body is a distinct `sectors-v7` registration. It must be registered and witnessed while the v9 witness covers exactly v9's two registration records, after v9's registration witness and before any later v9 record (`inputs_frozen`, a STOP status, or `discovery_opened`) is witnessed. As a backstop enforced by v9, a `sectors-v7` witness that first appears after v9 `discovery_opened` is invalid: it refuses v9's holdout opening, counts as contamination, and that `sectors-v7` can never open. v9 openings accept a `sectors-v7` witness only at its canonical path as exactly one canonical two-record registration anchor (or absent); any `sectors-v7` growth past two records before v9 is terminal is contamination and refuses every v9 opening. Any unknown or non-canonical VS1 witness file refuses.
 
+### Related looks on the same Form 4 family (disclosure)
+
+Six looks outside every VS1 registry read SEC Form 4 insider data over parts of VS1's windows (Research Desk findings catalogue, record ids below). None is a VS1 trial. None read a VS1 manifest, label, rank IC, Stage-0, discovery or holdout record. None existed when this design's trial definitions were fixed: they are carried verbatim from the v6 body (witnessed 2026-09-27) through v8 (witnessed 2026-10-01), and this version's changes rest only on the v8 probe's non-outcome statistics. No result below informed any design choice here.
+
+| Record id | When, by whom | Universe | Events and clock | Label and horizon | Data read | Verdict class |
+| --- | --- | --- | --- | --- | --- | --- |
+| `gemini-ic1-form4-insider-2010-2018` | ran 2026-11-17, Gemini 4 Argon (Antigravity), outside any ledger | point-in-time S&P 500 members (603 tickers) | officer/director Form 4 buy clusters (IC1 state-gated, IC2/IC3 pure cluster) and non-exercise sales, by `acceptanceDatetime`; entry at the next session's open | stock minus equal-notional SPY, exit at the close of day 10, 15 or 20, after large-cap costs; four trials | filings accepted 2009-12-15..2018-12-31 (83,924); prices 2009-10-01..2019-02-28 | FAILED_BAR, all four |
+| `insider-buying-index-2010-2022` | recorded 2026-11-15, Research Desk | S&P 500 index members | officer or director purchase of at least $25,000, from when the filing is known | long buyers, short the rest of the index, a day at a time for 20 sessions | 2010..2022-12-30 | DESCRIPTION |
+| `insider-cluster-index-2010-2022` | recorded 2026-11-15, Research Desk | S&P 500 index members | two or more insider purchase filings, from when known | as above, 20 sessions | 2010..2022-12-30 | DESCRIPTION |
+| `insider-buying-smallcap-2010-2022` | recorded 2026-11-15, Research Desk | small-cap universe (dated identity, $5 and $1 million a day floors) | officer or director purchase of at least $25,000, from when known | long the names, short the rest of the eligible universe, 20 sessions, 1 bp a side | 2010..2022-12-30 | DESCRIPTION |
+| `insider-cluster-smallcap-2010-2022` | recorded 2026-11-15, Research Desk | small-cap universe, as above | two or more insider purchase filings, from when known | as above, 20 sessions | 2010..2022-12-30 | DESCRIPTION |
+| `insider-buying-longer-holds` | recorded 2026-11-15, Research Desk | index members and small caps | the insider-buying play above | holds of 20, 60, 120 and 250 sessions, 1 bp a side | 2010..2022-12-30 | DESCRIPTION |
+
+These looks differ from VS1's trials:
+- **Feature:** VS1 uses distinct insider-buyer density over the prior 90 or 30 days (`A90`, `A30`), not single filings or clusters.
+- **Events:** VS1 uses v6 §2.1 open-market purchases with `known_at` 22:00 America/New_York, not acceptance-time entry.
+- **Label:** VS1's label is the split-first forward return over 5 or 20 sessions, with no benchmark subtraction.
+- **Statistic:** VS1 tests the per-date cross-sectional Spearman rank IC, not long-short or benchmark-relative P&L.
+
+Their universes overlap this one's issuers.
+
+**Discovery `[2008-01-01, 2020-01-01)`.** All six overlap it.
+- Discovery is selection-only and exploratory by construction (§2). Its statistics are reported as exposed to these related looks and are never cited as independent confirmatory evidence.
+- No discovery rule changes.
+
+**Holdout `[2020-01-01, 2026-07-01)`.**
+- IC1 does not read it.
+- The five Research Desk descriptions read 2020-01-01..2022-12-30 of it, on S&P 500 and small-cap names that overlap this universe.
+- Owner ruling on that overlap: `@@OWNER_RULING_HOLDOUT_OVERLAP@@`. It is filled before final body SHA-256 approval, and this body refuses registration while it is unfilled.
+
 ## 1. What changed from v8 (non-outcome information only)
 
 1. **Benchmark does not gate admission or testability; pinned XNYS session calendar.**
@@ -53,7 +83,7 @@ Every data step passes through its own explicit owner gate (EVAL-E2F4). No step 
 1. **Pin probe/R9 hashes in v8 code and approve STOP `decision_ref`s:** Fill only the six probe/R9 tokens (`PROBE_REPORT_SHA256`, `CROSSCHECK_REPORT_SHA256`, `TIINGO_META_REPORT_SHA256`, `PROBE_CODE_SHA`, `OWNER_RULING_R9_VAULT_COMMIT`, `OWNER_RULING_R9_FILE_SHA256`) in the v8 code pins (`analysis/panel_insider_density_v8.py`, imported by v9) from `sha256sum` on the real probe and vault files. Do not fill the v9 body tokens or request final v9 body SHA-256 approval yet (the two STOP heads do not exist yet). Owner approves the v8 STOP and `sectors-v6` STOP `decision_ref` texts.
 2. **v8 terminal STOP:** Run `stop-superseded` (dry run, then `--execute --expected-stop-head`), publish and independently verify the 3-record `STOP_SUPERSEDED_BY_V9_UNOPENED` witness on vault `main`, and bind v8's terminal head and anchor line in code.
 3. **sectors-v6 terminal STOP:** Append, publish, and independently verify the 3-record `STOP_SUPERSEDED_BY_SECTORS_V7_UNOPENED` witness on vault `main` (carrying v8's verified terminal proof), and bind its terminal head and anchor line in code.
-   - **Step 3b — Fill body tokens, bind STOP pins, re-pin `PREREG_BODY_SHA256`, and obtain final owner SHA approval:** Fill the six probe/R9 tokens and the two STOP-head tokens (`V8_STOP_HEAD_SHA256`, `SECTORS_V6_STOP_HEAD_SHA256`) in this body and confirm both STOP heads and anchor lines are bound in v9 code (`analysis/panel_insider_density_v9.py`), recompute and re-pin `PREREG_BODY_SHA256`, and **then** obtain the owner's approval of the final v9 body SHA-256 (the `sectors-v7` body SHA-256 is approved only after v9 is registered and witnessed). The owner's approval of the final v9 body SHA-256 explicitly follows the witnessed v8 and `sectors-v6` STOPs.
+   - **Step 3b — Fill body tokens, bind STOP pins, re-pin `PREREG_BODY_SHA256`, and obtain final owner SHA approval:** Fill the six probe/R9 tokens, the two STOP-head tokens (`V8_STOP_HEAD_SHA256`, `SECTORS_V6_STOP_HEAD_SHA256`) and the owner's holdout-overlap ruling (`OWNER_RULING_HOLDOUT_OVERLAP`, §0) in this body and confirm both STOP heads and anchor lines are bound in v9 code (`analysis/panel_insider_density_v9.py`), recompute and re-pin `PREREG_BODY_SHA256`, and **then** obtain the owner's approval of the final v9 body SHA-256 (the `sectors-v7` body SHA-256 is approved only after v9 is registered and witnessed). The owner's approval of the final v9 body SHA-256 explicitly follows the witnessed v8 and `sectors-v6` STOPs.
 4. **v9 registration:** Verify v8's terminal STOP (`verify_v8_terminal`) and the v9 pre-registration census; register exactly one v9 header and one preregistration record (`granular_panel_prereg_v9.jsonl`), publish and independently verify the 2-record v9 anchor on vault `main`, and pin v9's registration records and anchor line in code.
 5. **sectors-v7 registration:** Register and witness `sectors-v7` on vault `main` while the v9 witness covers exactly v9's two registration records.
 6. **Owner data-step gate:** Owner confirms explicitly whether the 2026-11-22 "go with v9" decision authorizes Stage-0, input freeze, and discovery opening individually.
