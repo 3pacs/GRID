@@ -25,7 +25,7 @@ from loguru import logger as log
 from outputs.path_utils import ensure_output_dir
 from pydantic import BaseModel
 
-from api.auth import require_auth
+from api.auth import require_auth, token_role
 
 router = APIRouter(
     prefix="/api/v1/ollama",
@@ -186,7 +186,7 @@ def read_briefing(filename: str) -> dict[str, Any]:
 
 
 @router.post("/ask")
-def ask_ollama(req: AskRequest) -> dict[str, Any]:
+def ask_ollama(req: AskRequest, token: str = Depends(require_auth)) -> dict[str, Any]:
     """Ask a free-form question with optional context.
 
     Injects relevant past Q&As as institutional memory, stores the new
@@ -216,7 +216,8 @@ def ask_ollama(req: AskRequest) -> dict[str, Any]:
     try:
         from api.dependencies import get_db_engine
         from intelligence.report_reader import context_for_prompt as reports_for_prompt
-        reports_context = reports_for_prompt(get_db_engine(), req.question, limit=5)
+        if token_role(token) == "admin":   # agent reports are admin-only, in the chat as on the endpoint
+            reports_context = reports_for_prompt(get_db_engine(), req.question, limit=5)
     except Exception as exc:
         log.debug("Agent report context skipped: {e}", e=str(exc))
 
@@ -243,11 +244,12 @@ def ask_ollama(req: AskRequest) -> dict[str, Any]:
         system_knowledge=["01_grid_overview", "06_market_analysis_framework"],
     )
 
-    # Store the Q&A in the knowledge tree
+    # Store the Q&A in the knowledge tree, unless it drew on agent reports: the tree is shared with contributors
+    # and report-informed answers are admin-only, so they are not persisted there.
     stored = None
     try:
         from knowledge.tree import store_qa
-        stored = store_qa(
+        stored = None if reports_context else store_qa(
             question=req.question,
             answer=response or "",
             model=client.model or "unknown",
