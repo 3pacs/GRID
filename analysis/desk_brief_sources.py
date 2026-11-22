@@ -417,6 +417,81 @@ def trader_day(spec: dict, kind: str, session: SessionTimes, as_of: datetime) ->
     return Trial(have=None, today=today, withheld=withheld, clock=clock, **base)
 
 
+# ── factory live slots (panel-factory/1, gex-signals; slot owner: the factory-slot session) ──────────────────
+
+_FIRES_SQL = ("SELECT trial_id, decision, z, fired, side, abstain, recorded_at FROM factory_fires WHERE day = ?")
+_FEATURES_SQL = ("SELECT eligible, recorded_at FROM factory_feature_values WHERE day = ?")
+
+
+def factory_slots(panel_path: str, signals_db: str | None, kind: str, session: SessionTimes,
+                  as_of: datetime) -> tuple[Section, list[Trial]]:
+    """The live slots as gex-signals publishes them: the panel's ``factory`` block (rewritten every 30 s in session,
+    so read as live) for registration, state and counts, and ``signals.db`` (``mode=ro``) for each slot's say on the
+    session (``factory_fires``: fired, or the abstain reason) and the session's feature values. Only a slot whose
+    ``citable`` is true may be cited; every other slot reads "unproven, n of N"."""
+    title, key = "Factory live slots (panel-factory/1)", "factory_slots"
+    try:
+        panel = json.loads(Path(panel_path).read_text())
+    except Exception as exc:  # noqa: BLE001
+        return Section(key, title, "unknown", panel_path, problems=(f"panel unreadable ({type(exc).__name__})",)), []
+    f = panel.get("factory")
+    clock = parse_clock(panel.get("generated_at"))
+    if not isinstance(f, dict) or f.get("version") != "panel-factory/1":
+        return Section(key, title, "unknown", panel_path, clock,
+                       problems=("the panel has no panel-factory/1 block",)), []
+    fam, feats, slots = f.get("family") or {}, f.get("features") or {}, f.get("slots") or []
+    lines, problems = [], []
+    if slots:
+        lines.append(f"slots registered: {len(slots)} of {fam.get('k')} (family looks used {fam.get('used')})")
+    else:
+        lines.append(f"no slot registered (0 of {fam.get('k')})")
+    lines.append(f"feature history: {feats.get('z_history_have_min')} of {feats.get('z_history_needed')} sessions "
+                 "(the fewest at any decision time)")
+    if f.get("status") != "ok":
+        problems.append(f"factory block status {f.get('status')}")
+    fires: dict[str, Any] = {}
+    if signals_db:
+        day = session.day.isoformat()
+        try:
+            con = ro_sqlite(signals_db)
+            con.row_factory = sqlite3.Row
+            rows = con.execute(_FIRES_SQL, (day,)).fetchall()
+            fv = con.execute(_FEATURES_SQL, (day,)).fetchall()
+            con.close()
+        except Exception as exc:  # noqa: BLE001
+            rows, fv = [], []
+            problems.append(f"slot ledger unreadable ({type(exc).__name__}); per-session says not shown")
+        for r in rows:
+            c = parse_clock(r["recorded_at"])
+            if c is not None and c <= as_of:
+                fires[r["trial_id"]] = r
+        known = [r for r in fv if (c := parse_clock(r["recorded_at"])) and c <= as_of]
+        if known:
+            lines.append(f"session {day} feature values recorded: {sum(1 for r in known if r['eligible'])} of "
+                         f"{len(known)} eligible")
+        elif kind == "post_close":
+            problems.append(f"no feature values recorded for {day} by the brief's clock")
+    trials = []
+    for sl in slots:
+        tid = str(sl.get("trial_id"))
+        r = fires.get(tid)
+        today = withheld = None
+        if r is not None:
+            if r["fired"]:
+                today = f"fired at {r['decision']} (side {r['side']:+d})"
+            else:
+                withheld = f"no fire at {r['decision']}" + (f": {r['abstain']}" if r["abstain"] else "")
+        have, need = sl.get("resolved_fires"), sl.get("min_n")
+        trials.append(Trial(
+            trial_id=tid, name=str(sl.get("name") or tid), source=f"{panel_path}:factory", registration=sl.get("rule"),
+            have=have if isinstance(have, int) else None, need=need if isinstance(need, int) else None,
+            unit="resolved fires", today=today, withheld=withheld, status=sl.get("state"), clock=clock, live=True,
+            decides="10:00-15:00 ET decision times", counts_in=None,
+            citable=bool(sl.get("citable"))))
+    return Section(key, title, "ok", panel_path, clock, tuple(lines),
+                   {"slots": len(slots), "k": fam.get("k"), "live": True}, tuple(problems)), trials
+
+
 # ── desk-state daily files ───────────────────────────────────────────────────
 
 def _latest_file(folder: Path, last: date, clock_key: str, as_of: datetime) -> tuple[dict, datetime] | None:
@@ -552,7 +627,8 @@ def paper_record(path: str | None, kind: str, as_of: datetime | None = None) -> 
         look = m.get("look") or {}
         status = LOOK_WORDS.get(look.get("status"), str(look.get("status")))
         g = m.get("grades") or {}
-        line = (f"{m.get('name') or m.get('module_id')}: {status}; {look.get('have')} of {look.get('need')} "
+        need = f" of {look['need']}" if look.get("need") is not None else ""
+        line = (f"{m.get('name') or m.get('module_id')}: {status}; {look.get('have')}{need} "
                 f"{look.get('unit') or ''}".rstrip() + f"; graded {g.get('graded', 0)}, no trade {g.get('no_trade', 0)}")
         st = m.get("stats")
         if isinstance(st, dict):
