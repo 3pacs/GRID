@@ -101,15 +101,38 @@ decision time over the ``RETURN_SPREAD_HISTORY`` eligible research sessions
 before that day (the factory's own z scale: 1.4826 MAD, then the standard
 deviation). That quotient is the difference between the two z values the two
 sides would compute on one history. It must be within
-``RETURN_TOLERANCE_SPREADS`` at every value, and over the verdict sessions the
-mean signed quotient must be within ``RETURN_BIAS_SPREADS`` of zero: a
-tolerance wide enough for sampling noise would otherwise pass a small constant
-error, and the prior close is where one can enter. A return value whose spread
-cannot be computed (fewer research sessions than the history needs) is not a
-match (``research_spread_unavailable``). Range features are judged as before.
-The three numbers are fixed here, not arguments. They were chosen from what a
-changed decision costs, after looking at those eight sessions; they are not to
-be tuned on later reports.
+``RETURN_TOLERANCE_SPREADS`` at every value, and at each decision time the
+mean signed quotient over the verdict sessions must be within
+``RETURN_BIAS_SPREADS`` of zero: a tolerance wide enough for sampling noise
+would otherwise pass a small constant error, and the prior close is where one
+can enter. The bias is judged at each decision time on its own. Averaged over
+decision times, an error of +0.06 at 15:00 and -0.06 at 14:30 would cancel and
+hide exactly the bias a slot at 15:00 has. A return value whose spread cannot
+be computed (fewer research sessions than the history needs) is not a match
+(``research_spread_unavailable``). Range features are judged as before. The
+three numbers are fixed here, not arguments. They are sizes chosen for a
+diagnostic, after looking at those eight sessions; they are not to be tuned on
+later reports, and they bound nothing about how many decisions change.
+
+**What this report is, and is not.** A feature's ``live_ready`` says the
+recording's values agree with research on the verdict sessions. It is a
+diagnostic about the source. It is not the gate for a slot. A slot is one
+feature at one decision time with one threshold and side, and it fires on a z
+taken against the live recorder's own history, not research's. So a slot is
+judged only as a named **candidate** (``--candidate``), by ``slot_gate``:
+
+* every value at the candidate's own decision time matched on each verdict
+  session, and the signed bias at that time is inside the limit;
+* on each verdict session the candidate's trigger agrees: research's z on
+  research's history and the recorder's z on the recorder's own history (its
+  ``RETURN_SPREAD_HISTORY`` earlier eligible values bound to these terms) are
+  on the same side of the candidate's threshold. Until the recorder holds that
+  history the trigger is ``trigger_unavailable`` and the candidate is not
+  ready.
+
+A ready candidate is evidence about the recording at that decision time. The
+five recorded sessions, the pre-screen, the slot's registration and the owner's
+activation are separate gates, and this report sets none of them.
 
 Read-only: both databases are opened ``mode=ro``. Nothing here scores a module
 or registers anything. Five matching sessions are evidence about the source
@@ -133,10 +156,12 @@ from analysis.module_factory import (
     FEATURE_SPECS,
     FEATURES,
     NY,
+    Z_CAP,
     Session,
     _hm,
     _minutes,
     raw_features,
+    robust_z,
 )
 from ingestion.market_calendar import is_market_open, market_close_time
 
@@ -146,13 +171,14 @@ OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
 
 # Tolerance per feature type.
-#   return: 0.1 of the research feature's robust spread at that decision time (version 4; 1 bp before). At a
-#           threshold of z = 0.5 a z that moves by at most 0.1 changes at most about 3.5% of decisions.
+#   return: 0.1 of the research feature's robust spread at that decision time (version 4; 1 bp before). A size
+#           chosen for the diagnostic. It is not a bound on changed decisions: whether a candidate's trigger
+#           agrees is checked on its own z values (slot_gate), never inferred from this number.
 #   range:  0.03 of the range on the raw value, i.e. three points on a 0-100 position scale.
 FEATURE_TYPE = {"F1": "return", "F1_shift30": "return", "F10": "range", "F11": "range"}
 RETURN_SPREAD_HISTORY = 60        # eligible research sessions before the day: the factory's z history
 RETURN_TOLERANCE_SPREADS = 0.1    # per value
-RETURN_BIAS_SPREADS = 0.03        # the mean signed difference over the verdict sessions
+RETURN_BIAS_SPREADS = 0.03        # the mean signed difference over the verdict sessions, at each decision time
 SPREAD_LOOKBACK_SESSIONS = RETURN_SPREAD_HISTORY + 30   # sessions read before the window: the history and a margin for ineligible ones
 TOLERANCE = {"return": RETURN_TOLERANCE_SPREADS, "range": 0.03}
 TOLERANCE_UNIT = {"return": "research_spreads", "range": "raw_value"}
@@ -191,7 +217,13 @@ RULE_NOT_RECORDED = "live_rule_not_recorded"
 SESSION_MISSING = "session_missing"       # an expected recent session is absent from research, from live, or from both
 RECORDED_DIFFERS = "recorded_value_differs_from_bars"
 SPREAD_UNAVAILABLE = "research_spread_unavailable"   # a return value with no research spread to judge it on
-VALUE_BIASED = "value_biased"                         # the mean signed difference of a return feature is not near zero
+VALUE_BIASED = "value_biased"                         # at some decision time the mean signed difference is not near zero
+# A named candidate's own gate (slot_gate).
+CANDIDATE_OPS = (">=", "<=")
+VALUE_NOT_MATCHED = "value_parity_not_matched"        # a verdict session whose value at the candidate's time did not match
+TRIGGER_UNAVAILABLE = "trigger_unavailable"           # a z is missing: most often the recorder's own history is too short
+TRIGGER_DISAGREES = "trigger_disagrees"               # the two sides are on different sides of the candidate's threshold
+BIAS_UNAVAILABLE = "bias_unavailable"                 # a return candidate without a judged value on every verdict session
 
 Bars = dict[str, dict[str, tuple]]
 Backstop = dict[str, dict[str, tuple]]   # {day: {hm: ((o, h, l, c, v), first seen, aware datetime)}}
@@ -312,9 +344,9 @@ def load_recorded(db: Path, first: str, last: str) -> dict[tuple[str, str, str],
         if "factory_feature_values" not in tables:
             return None
         values = con.execute("select day, decision, feature, raw, eligible, recorded_at from factory_feature_values "
-                             "where day between ? and ?", (first, last)).fetchall()
+                             "where day >= ? and day <= ?", (first, last)).fetchall()
         terms = con.execute("select day, decision, feature, terms_sha256, recorded_at from factory_feature_terms "
-                            "where day between ? and ?", (first, last)).fetchall() if "factory_feature_terms" in tables else []
+                            "where day >= ? and day <= ?", (first, last)).fetchall() if "factory_feature_terms" in tables else []
     finally:
         con.close()
     bound = {(day, decision, feature): (sha, at) for day, decision, feature, sha, at in terms}
@@ -601,34 +633,138 @@ def robust_spread(history) -> float | None:
     return spread or None
 
 
-def research_spreads(bars: Bars, decisions: list[str]) -> dict[tuple[str, str, str], float]:
-    """{(feature, decision, day): spread} for the return features, from research bars alone.
+def research_histories(bars: Bars, decisions: list[str]) -> dict[tuple[str, str, str], tuple]:
+    """{(feature, decision, day): the z history research would use that day}, from research bars alone.
 
-    The spread for a day is taken over the ``RETURN_SPREAD_HISTORY`` eligible research values of that feature at
-    that decision time on the sessions before it, as the factory's z is. A day with a shorter history has no entry.
+    The history for a day is the ``RETURN_SPREAD_HISTORY`` eligible research values of that feature at that decision
+    time on the sessions before it, oldest first, as the factory's z uses. A day with a shorter history has no entry.
     """
-    out: dict[tuple[str, str, str], float] = {}
-    returns = [f for f in FEATURES if FEATURE_TYPE[f] == "return"]
+    out: dict[tuple[str, str, str], tuple] = {}
     for decision in decisions:
-        history = {f: deque(maxlen=RETURN_SPREAD_HISTORY) for f in returns}
+        history = {f: deque(maxlen=RETURN_SPREAD_HISTORY) for f in FEATURES}
         for day in sorted(d for d in bars if close_minute(d) is not None):
-            for f in returns:
+            for f in FEATURES:
                 if len(history[f]) == RETURN_SPREAD_HISTORY:
-                    spread = robust_spread(history[f])
-                    if spread is not None:
-                        out[(f, decision, day)] = spread
+                    out[(f, decision, day)] = tuple(history[f])
             if signal_reasons(bars, day, decision):
                 continue
             values = feature_values(bars, day, decision)
-            for f in returns:
+            for f in FEATURES:
                 if values[f] is not None:
                     history[f].append(values[f])
     return out
 
 
+def research_spreads(bars: Bars, decisions: list[str], histories: dict | None = None) -> dict[tuple[str, str, str], float]:
+    """{(feature, decision, day): spread} for the return features: the robust spread of that day's research history."""
+    out: dict[tuple[str, str, str], float] = {}
+    for key, history in (research_histories(bars, decisions) if histories is None else histories).items():
+        if FEATURE_TYPE[key[0]] != "return":
+            continue
+        spread = robust_spread(history)
+        if spread is not None:
+            out[key] = spread
+    return out
+
+
+def recorder_history(recorded: dict | None, feature: str, decision: str, before_day: str) -> tuple:
+    """The z history the live recorder itself would use on ``before_day``: its last ``RETURN_SPREAD_HISTORY`` earlier
+    values of (feature, decision) that are eligible, hold a number and are bound to these terms, oldest first.
+
+    This is gex-signals ``factory_slots.history()``. A value an earlier generation recorded is in no history."""
+    rows = sorted((day, row["raw"]) for (day, t, f), row in (recorded or {}).items()
+                  if f == feature and t == decision and day < before_day and row["eligible"] and row["raw"] is not None
+                  and binding_problem(row) is None)
+    return tuple(raw for _day, raw in rows[-RETURN_SPREAD_HISTORY:])
+
+
+def parse_candidate(feature: str, decision: str, op: str, k: str | float, decisions: list[str]) -> dict:
+    """One named candidate: a feature at a decision time with a threshold and side. Refuses anything else."""
+    try:
+        k = float(k)
+    except (TypeError, ValueError):
+        raise ParityError(f"candidate threshold {k!r} is not a number") from None
+    if feature not in FEATURES:
+        raise ParityError(f"candidate feature {feature!r} is not a factory feature")
+    if decision not in decisions:
+        raise ParityError(f"candidate decision time {decision} is not one of the compared decision times")
+    if structurally_undefined(feature, decision):
+        raise ParityError(f"{feature} has no value at {decision} by definition")
+    if op not in CANDIDATE_OPS:
+        raise ParityError(f"candidate op {op!r} is not one of {CANDIDATE_OPS}")
+    if not 0 < k <= Z_CAP:
+        raise ParityError(f"candidate threshold {k} is not in (0, {Z_CAP}]")
+    return {"feature": feature, "decision": decision, "op": op, "k": k}
+
+
+def _fires(z: float, op: str, k: float) -> bool:
+    return z >= k if op == ">=" else z <= -k          # the recorder's rule (factory_slots.decide)
+
+
+def slot_gate(candidate: dict, compared: dict, histories: dict, recorded_history: dict | None,
+              verdict_sessions: list[str]) -> dict:
+    """One candidate judged at its own decision time, threshold and side, on the verdict sessions.
+
+    The value rows and the bias come from ``compare`` at the candidate's decision time only. The trigger is taken on
+    each side's own history: research's z on research's history, the recorder's z on the recorder's own bound values.
+    The same value against two histories gives two z values, so agreement is checked, never assumed.
+    """
+    f, t, op, k = candidate["feature"], candidate["decision"], candidate["op"], candidate["k"]
+    rows = {r["day"]: r for r in compared["value_rows"] if r["feature"] == f and r["decision"] == t}
+    sessions, unmatched, unavailable, disagree = [], [], [], []
+    have = []
+    for day in verdict_sessions:
+        row = rows.get(day)
+        matched = bool(row and row["matched"])
+        if not matched:
+            unmatched.append(day)
+        research_history = histories.get((f, t, day))
+        live_history = recorder_history(recorded_history, f, t, day)
+        have.append(len(live_history))
+        recorded = (recorded_history or {}).get((day, t, f))
+        live_value = recorded["raw"] if recorded and recorded["eligible"] and binding_problem(recorded) is None else None
+        research_z = (robust_z(row["research"], deque(research_history, maxlen=RETURN_SPREAD_HISTORY))
+                      if row and row["research"] is not None and research_history else None)
+        live_z = (robust_z(live_value, deque(live_history, maxlen=RETURN_SPREAD_HISTORY))
+                  if live_value is not None and len(live_history) == RETURN_SPREAD_HISTORY else None)
+        entry = {"day": day, "value_matched": matched, "research_z": research_z, "live_z": live_z,
+                 "recorder_history_have": len(live_history), "research_fires": None, "live_fires": None, "agree": None}
+        if research_z is None or live_z is None:
+            unavailable.append(day)
+        else:
+            entry["research_fires"], entry["live_fires"] = _fires(research_z, op, k), _fires(live_z, op, k)
+            entry["agree"] = entry["research_fires"] == entry["live_fires"]
+            if not entry["agree"]:
+                disagree.append(day)
+        sessions.append(entry)
+    bias = compared["features"][f]["verdict_on"]["mean_signed_diff_in_spreads_by_decision_time"].get(t)
+    is_return = FEATURE_TYPE[f] == "return"
+    reasons = []
+    if len(verdict_sessions) < MIN_SESSIONS:
+        reasons.append(SESSION_MISSING)
+    if unmatched:
+        reasons.append(VALUE_NOT_MATCHED)
+    if is_return and bias is None:
+        reasons.append(BIAS_UNAVAILABLE)
+    elif is_return and abs(bias) > RETURN_BIAS_SPREADS:
+        reasons.append(VALUE_BIASED)
+    if unavailable:
+        reasons.append(TRIGGER_UNAVAILABLE)
+    if disagree:
+        reasons.append(TRIGGER_DISAGREES)
+    return {**candidate, "status": "not_ready" if reasons else "ready", "reasons": reasons,
+            "sessions": sessions, "value_not_matched": unmatched,
+            "mean_signed_diff_in_spreads": bias, "bias_limit_in_spreads": RETURN_BIAS_SPREADS if FEATURE_TYPE[f] == "return" else None,
+            "trigger_unavailable": unavailable, "trigger_disagrees": disagree,
+            "recorder_history": {"needed": RETURN_SPREAD_HISTORY, "have_min": min(have) if have else 0,
+                                 "have_max": max(have) if have else 0},
+            "note": ("ready is evidence about the recording at this decision time; the recorded sessions, the "
+                     "pre-screen, the registration and the owner's activation are separate gates")}
+
+
 def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str],
             backstop: Backstop | None, recorded: dict | None, verdict_sessions: list[str],
-            history: Bars | None = None) -> dict:
+            history: Bars | None = None, histories: dict | None = None) -> dict:
     """Availability agreement and value differences on the sessions both sides hold.
 
     Research is judged by the research rule, live by the live recorder's rule, feature by feature. The live value
@@ -648,13 +784,13 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
     missing, it is not skipped. The argument has no default, so no caller gets a verdict on the data's own dates.
     """
     days = sorted(d for d in set(research) & set(live) if close_minute(d) is not None)
-    spreads = research_spreads({**(history or {}), **research}, decisions)
+    spreads = research_spreads({**(history or {}), **research}, decisions, histories)
     rows = []
     per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0, "matched_values": 0,
                        "applicable": Counter(), "matched": Counter(), "no_value": 0, "no_value_by_day": Counter(),
                        "unbound": Counter(), "differs": Counter(), "bound_values": 0,
                        "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None,
-                       "no_spread": Counter(), "scaled_by_day": {}, "max_abs_diff_in_spreads": None}
+                       "no_spread": Counter(), "scaled": {}, "max_abs_diff_in_spreads": None}
                    for f in FEATURES}
     availability_mismatch = []
     label_rows = []
@@ -688,7 +824,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                     if diff is not None and spread is None and applicable:
                         stat["no_spread"][day] += 1
                     if scaled is not None and applicable:
-                        stat["scaled_by_day"].setdefault(day, []).append(scaled)
+                        stat["scaled"][(day, decision)] = scaled
                         worst = stat["max_abs_diff_in_spreads"]
                         stat["max_abs_diff_in_spreads"] = abs(scaled) if worst is None else max(worst, abs(scaled))
                 else:
@@ -758,12 +894,16 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
         recent_not_recorded = [d for d in recent if stat["unbound"][d]]      # a required value without its own binding
         recent_differs = [d for d in recent if stat["differs"][d]]            # a bound value the bars do not give
         recent_no_spread = [d for d in recent if stat["no_spread"][d]]        # a return value with no spread to judge it on
-        # The bias of a return feature: the mean over the verdict sessions of each session's mean signed difference.
-        bias = None
+        # The bias of a return feature, at each decision time on its own: the mean signed difference over the verdict
+        # sessions at that time. Never averaged over decision times: opposite errors at two times would cancel.
+        bias_by_time: dict[str, float | None] = {}
         if FEATURE_TYPE[f] == "return":
-            session_means = [statistics.fmean(stat["scaled_by_day"][d]) for d in recent if stat["scaled_by_day"].get(d)]
-            if len(recent) == MIN_SESSIONS and len(session_means) == MIN_SESSIONS:
-                bias = statistics.fmean(session_means)
+            for t in applicable_times:
+                at_t = [stat["scaled"][(d, t)] for d in recent if (d, t) in stat["scaled"]]
+                bias_by_time[t] = statistics.fmean(at_t) if len(recent) == MIN_SESSIONS and len(at_t) == MIN_SESSIONS else None
+        known = [abs(v) for v in bias_by_time.values() if v is not None]
+        worst_bias = max(known) if known else None
+        biased_times = [t for t, v in bias_by_time.items() if v is not None and abs(v) > RETURN_BIAS_SPREADS]
         reasons = []
         if not applicable_times:
             reasons.append("no_applicable_decision_time")
@@ -781,7 +921,7 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             reasons.append("value_missing")           # both sides eligible, a value defined, and no number to compare
         if recent_no_spread:
             reasons.append(SPREAD_UNAVAILABLE)
-        if bias is not None and abs(bias) > RETURN_BIAS_SPREADS:
+        if biased_times:
             reasons.append(VALUE_BIASED)
         if recent_disagreed:
             reasons.append("availability_mismatch")
@@ -796,7 +936,9 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                            "values_out_of_tolerance": recent_out, "eligible_rows_with_no_value": recent_no_value,
                            "sessions_with_an_availability_disagreement": recent_disagreed,
                            "sessions_with_no_research_spread": recent_no_spread,
-                           "mean_signed_diff_in_spreads": bias,
+                           "mean_signed_diff_in_spreads_by_decision_time": bias_by_time,
+                           "largest_abs_mean_signed_diff_in_spreads": worst_bias,
+                           "decision_times_biased": biased_times,
                            "bias_limit_in_spreads": RETURN_BIAS_SPREADS if FEATURE_TYPE[f] == "return" else None},
             "whole_window": {"sessions_with_an_availability_disagreement":
                              len({m["day"] for m in availability_mismatch if f in m["features"]})},
@@ -826,8 +968,13 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
 
 
 def report(research_db: Path, signals_db: Path, *, first: str, last: str,
-           decisions: list[str], horizons: list[str], symbol: str = "SPY") -> dict:
-    """The parity report: live availability on every recorded session, then the overlap comparison."""
+           decisions: list[str], horizons: list[str], symbol: str = "SPY",
+           candidates: list[tuple] | None = None) -> dict:
+    """The parity report: live availability on every recorded session, then the overlap comparison.
+
+    ``candidates`` are (feature, decision, op, k) tuples: each gets its own ``slot_gate`` entry. Without one the
+    report is the diagnostic alone and judges no slot."""
+    named = [parse_candidate(*c, decisions) for c in (candidates or [])]
     research = load_research(research_db, symbol, first, last)
     live, sources = load_live(signals_db, symbol, first, last)
     backstop = load_backstop(signals_db, symbol, first, last)
@@ -839,7 +986,10 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
     in_window = [d for d in expected_sessions_between(first, last) if verdict_sessions and d <= verdict_sessions[-1]]
     # The first recorded session has no recorded prior; it is counted and its reason shown.
     history = load_research_history(research_db, symbol, first)
-    compared = compare(research, live, decisions, horizons, backstop, recorded, verdict_sessions, history)
+    histories = research_histories({**history, **research}, decisions)
+    compared = compare(research, live, decisions, horizons, backstop, recorded, verdict_sessions, history, histories)
+    recorded_history = load_recorded(signals_db, "", last) if named else None     # every earlier row: the recorder's own history
+    gates = [slot_gate(c, compared, histories, recorded_history, verdict_sessions) for c in named]
     statuses = {f: v["status"] for f, v in compared["features"].items()}
     return {
         "schema": SCHEMA,
@@ -875,6 +1025,12 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "comparison": compared,
         "live_ready": sorted(f for f, s in statuses.items() if s == "live_ready"),
         "research_only": sorted(f for f, s in statuses.items() if s == "research_only"),
+        "slot_gate": {"candidates": gates,
+                      "ready": [f"{g['feature']}@{g['decision']}{g['op']}{g['k']:g}" for g in gates if g["status"] == "ready"],
+                      "note": ("live_ready above is a diagnostic about the recording's values and is not the gate for a "
+                               "slot; a slot is judged only as a named candidate, at its own decision time, threshold "
+                               "and side, with each side's z on its own history"
+                               + ("" if gates else "; no candidate was named, so no slot was judged"))},
         "promotion_allowed": False,
         "note": ("matching sessions are evidence about the source and the implementation, "
                  "not about any edge; no feature becomes live-ready by back-filling; the verdict is taken on the "
@@ -891,11 +1047,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--last", required=True)
     parser.add_argument("--decision-times", nargs="+", default=["15:00"])
     parser.add_argument("--horizons", nargs="+", default=["close"])
+    parser.add_argument("--candidate", nargs=4, action="append", metavar=("FEATURE", "DECISION", "OP", "K"), default=[],
+                        help="judge one candidate at its own decision time, e.g. --candidate F1 15:00 '>=' 0.5; repeatable")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--summary", action="store_true", help="print the totals without the per-row detail")
     args = parser.parse_args(argv)
     doc = report(args.research_db, args.signals_db, first=args.first, last=args.last,
-                 decisions=args.decision_times, horizons=args.horizons)
+                 decisions=args.decision_times, horizons=args.horizons, candidates=[tuple(c) for c in args.candidate])
     if args.out:
         with open(args.out, "x", encoding="utf-8") as stream:
             json.dump(doc, stream, indent=1, sort_keys=True)

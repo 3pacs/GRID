@@ -6,8 +6,10 @@
 * A live recording with a missing read bar, or more than two lost minutes, fails:
   values that agree are not parity when live would abstain.
 * Version 4: a return value is judged on the research feature's own spread (a tenth of it
-  per value, and the mean signed difference over the verdict sessions near zero), not in
-  basis points. A return value with no research spread to judge it on is not a match.
+  per value, and at each decision time the mean signed difference over the verdict sessions
+  near zero), not in basis points. A return value with no research spread to judge it on is
+  not a match. A slot is judged only as a named candidate, at its own decision time, with
+  each side's z on its own history; the feature-level verdict is a diagnostic.
 * Version 3: the verdict is taken on the five most recent closed exchange sessions the
   calendar expects; a session either side lacks is missing, not skipped.
   An older bad session stays in the whole-window counts and no longer blocks.
@@ -160,13 +162,13 @@ def _after_close(day):
 def run(tmp_path, monkeypatch):
     calls = []
 
-    def go(research, live, decisions=("15:00",), last=SESSIONS[-1], clock=None, history=True, **kwargs):
+    def go(research, live, decisions=("15:00",), last=SESSIONS[-1], clock=None, history=True, candidates=None, **kwargs):
         calls.append(1)                                   # a test may build more than one pair of databases
         r, lv = tmp_path / f"r{len(calls)}.db", tmp_path / f"l{len(calls)}.db"
         monkeypatch.setattr(flp, "_clock", lambda: clock or _after_close(last))     # the report is made after that close
         research = {**(_history() if history else {}), **research}                 # the history is research only
         return flp.report(_research_db(r, research), _live_db(lv, live, decisions=decisions, **kwargs),
-                          first=SESSIONS[0], last=last, decisions=list(decisions), horizons=["close"])
+                          first=SESSIONS[0], last=last, decisions=list(decisions), horizons=["close"], candidates=candidates)
     return go
 
 
@@ -543,7 +545,9 @@ def test_the_verdict_is_taken_on_the_five_most_recent_sessions_and_an_older_fail
                                 "recorded_values_differ_from_the_bars": [],
                                 "values_out_of_tolerance": 0, "eligible_rows_with_no_value": 0,
                                 "sessions_with_an_availability_disagreement": [],
-                                "sessions_with_no_research_spread": [], "mean_signed_diff_in_spreads": 0.0,
+                                "sessions_with_no_research_spread": [],
+                                "mean_signed_diff_in_spreads_by_decision_time": {"15:00": 0.0},
+                                "largest_abs_mean_signed_diff_in_spreads": 0.0, "decision_times_biased": [],
                                 "bias_limit_in_spreads": flp.RETURN_BIAS_SPREADS}
     assert doc["verdict_sessions"] == LONGER[-5:] and doc["as_of"] == "2026-11-12T17:00:00-05:00"
     assert f1["matched_sessions"] == 6 and f1["overlapping_sessions"] == 9             # the whole window, as before
@@ -723,7 +727,7 @@ def test_sampling_sized_differences_match_and_one_value_over_a_tenth_of_the_spre
     f1 = doc["comparison"]["features"]["F1"]
     assert "F1" in doc["live_ready"] and f1["reasons"] == []
     assert f1["max_abs_diff_in_spreads"] == pytest.approx(0.08, rel=2e-2)
-    assert abs(f1["verdict_on"]["mean_signed_diff_in_spreads"]) < flp.RETURN_BIAS_SPREADS
+    assert f1["verdict_on"]["largest_abs_mean_signed_diff_in_spreads"] < flp.RETURN_BIAS_SPREADS
     assert f1["max_abs_diff"] > 1e-4, "these differences are over the 1 bp of version 3 and are now a match"
     row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == SESSIONS[-1])
     assert row["diff_in_spreads"] == pytest.approx(0.05, rel=2e-2) and row["within_tolerance"] is True
@@ -745,10 +749,11 @@ def test_a_constant_error_inside_the_tolerance_is_a_bias_and_blocks(run):
     f1 = doc["comparison"]["features"]["F1"]
     assert f1["verdict_on"]["values_out_of_tolerance"] == 0 and f1["verdict_on"]["matched"] == 5
     assert f1["status"] == "research_only" and f1["reasons"] == [flp.VALUE_BIASED]
-    assert f1["verdict_on"]["mean_signed_diff_in_spreads"] == pytest.approx(0.06, rel=2e-2)
-    assert f1["verdict_on"]["bias_limit_in_spreads"] == 0.03
+    assert f1["verdict_on"]["mean_signed_diff_in_spreads_by_decision_time"]["15:00"] == pytest.approx(0.06, rel=2e-2)
+    assert f1["verdict_on"]["decision_times_biased"] == ["15:00"] and f1["verdict_on"]["bias_limit_in_spreads"] == 0.03
     assert "F1" not in doc["live_ready"] and "F10" in doc["live_ready"]
-    assert doc["comparison"]["features"]["F10"]["verdict_on"]["mean_signed_diff_in_spreads"] is None   # ranges have no bias test
+    f10 = doc["comparison"]["features"]["F10"]["verdict_on"]                                       # ranges have no bias test
+    assert f10["mean_signed_diff_in_spreads_by_decision_time"] == {} and f10["bias_limit_in_spreads"] is None
 
 
 def test_a_bias_is_judged_on_the_verdict_sessions_only(run):
@@ -759,7 +764,7 @@ def test_a_bias_is_judged_on_the_verdict_sessions_only(run):
     f1 = run(_days(LONGER), live, last=LONGER[-1])["comparison"]["features"]["F1"]
 
     assert f1["verdict_on"]["sessions"] == LONGER[-5:]
-    assert f1["status"] == "live_ready" and f1["verdict_on"]["mean_signed_diff_in_spreads"] == 0.0
+    assert f1["status"] == "live_ready" and f1["verdict_on"]["mean_signed_diff_in_spreads_by_decision_time"] == {"15:00": 0.0}
 
 
 def test_a_return_value_with_no_research_spread_is_not_a_match(run):
@@ -772,7 +777,8 @@ def test_a_return_value_with_no_research_spread_is_not_a_match(run):
         assert f[name]["verdict_on"]["sessions_with_no_research_spread"] == SESSIONS[-5:]
         assert f[name]["values_with_no_research_spread"] == f[name]["values_compared"] == 6
         assert f[name]["values_out_of_tolerance"] == 0                   # not judged is not "out of tolerance"
-        assert f[name]["verdict_on"]["mean_signed_diff_in_spreads"] is None
+        assert f[name]["verdict_on"]["mean_signed_diff_in_spreads_by_decision_time"] == {"15:00": None}
+        assert f[name]["verdict_on"]["largest_abs_mean_signed_diff_in_spreads"] is None
     row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == SESSIONS[-1])
     assert (row["abs_diff"], row["research_spread"], row["diff_in_spreads"], row["matched"]) == (0.0, None, None, False)
     assert row["within_tolerance"] is None
@@ -801,3 +807,183 @@ def test_the_history_never_reaches_before_dev(tmp_path):
     db = _research_db(tmp_path / "old.db", {d: _history_session(i) for i, d in enumerate(days)})
 
     assert sorted(flp.load_research_history(db, "SPY", "2022-11-16")) == [mf.DEV_FIRST, "2022-11-15"]
+
+
+# ── after the hold on fb69ebcf: the bias at each decision time, and a named candidate's own gate ──────────
+
+
+def test_opposite_errors_at_two_decision_times_do_not_cancel(run):
+    """The reviewer's case: +0.06 at 15:00 and -0.06 at 14:30. Averaged over decision times that is no bias at all."""
+    live = _days()
+    for day in SESSIONS[-5:]:
+        _nudged(live, day, "14:59", _f1_dollars(day, 0.06, decision="15:00"))
+        _nudged(live, day, "14:29", -_f1_dollars(day, 0.06, decision="14:30"))
+
+    doc = run(_days(), live, decisions=("14:30", "15:00"))
+
+    f1 = doc["comparison"]["features"]["F1"]
+    by_time = f1["verdict_on"]["mean_signed_diff_in_spreads_by_decision_time"]
+    assert by_time["15:00"] == pytest.approx(0.06, rel=2e-2) and by_time["14:30"] == pytest.approx(-0.06, rel=2e-2)
+    assert abs(by_time["15:00"] + by_time["14:30"]) / 2 < 0.005, "the average over both times is inside the limit"
+    assert f1["verdict_on"]["values_out_of_tolerance"] == 0                  # every value is inside a tenth
+    assert f1["status"] == "research_only" and flp.VALUE_BIASED in f1["reasons"]
+    assert f1["verdict_on"]["decision_times_biased"] == ["14:30", "15:00"]
+    assert f1["verdict_on"]["largest_abs_mean_signed_diff_in_spreads"] == pytest.approx(0.06, rel=2e-2)
+
+
+def test_a_bias_at_one_decision_time_is_found_beside_a_clean_one(run):
+    live = _days()
+    for day in SESSIONS[-5:]:
+        _nudged(live, day, "14:59", _f1_dollars(day, 0.06, decision="15:00"))
+
+    f1 = run(_days(), live, decisions=("14:30", "15:00"))["comparison"]["features"]["F1"]
+
+    assert f1["verdict_on"]["decision_times_biased"] == ["15:00"]
+    assert f1["verdict_on"]["mean_signed_diff_in_spreads_by_decision_time"]["14:30"] == 0.0
+
+
+def _recorder_history(shift: float = 0.0, feature: str = "F1", decision: str = "15:00"):
+    """A ``recorded`` hook that gives the recorder its own earlier values of one (feature, decision): research's
+    value on each history session, plus ``shift``, each bound to the terms with its own stamp."""
+    bars = {**_history(), **_days()}
+
+    def add(rows):
+        for day in HISTORY_DAYS:
+            if flp.signal_reasons(bars, day, decision):
+                continue
+            value = flp.feature_values(bars, day, decision)[feature]
+            at = _utc(day, decision, 20)
+            rows.append({"day": day, "decision": decision, "feature": feature, "raw": value + shift, "eligible": 1,
+                         "recorded_at": at, "terms_sha256": flp.LIVE_RULE_TERMS_SHA256, "terms_recorded_at": at})
+    return add
+
+
+def test_without_a_candidate_no_slot_is_judged(run):
+    doc = run(_days(), _days())
+
+    assert doc["live_ready"] == sorted(mf.FEATURES)                          # the diagnostic
+    assert doc["slot_gate"]["candidates"] == [] and doc["slot_gate"]["ready"] == []
+    assert "no candidate was named, so no slot was judged" in doc["slot_gate"]["note"]
+    assert doc["promotion_allowed"] is False
+
+
+def test_a_candidate_is_not_ready_until_the_recorder_has_its_own_history(run):
+    doc = run(_days(), _days(), candidates=[("F1", "15:00", ">=", 0.5)])
+
+    assert "F1" in doc["live_ready"], "the values agree, and that alone judges no slot"
+    gate = doc["slot_gate"]["candidates"][0]
+    assert (gate["feature"], gate["decision"], gate["op"], gate["k"]) == ("F1", "15:00", ">=", 0.5)
+    assert gate["status"] == "not_ready" and gate["reasons"] == [flp.TRIGGER_UNAVAILABLE]
+    assert gate["trigger_unavailable"] == SESSIONS[-5:] and gate["value_not_matched"] == []
+    assert gate["recorder_history"] == {"needed": 60, "have_min": 1, "have_max": 5}     # the window's own earlier sessions
+    assert all(e["live_z"] is None and e["research_z"] is not None and e["agree"] is None for e in gate["sessions"])
+    assert doc["slot_gate"]["ready"] == []
+
+
+def _a_threshold_research_crosses(run):
+    """(op, k) that research's z crosses on at least one verdict session, read from a run with the full history."""
+    gate = run(_days(), _days(), candidates=[("F1", "15:00", ">=", 0.5)], recorded=_recorder_history())["slot_gate"]["candidates"][0]
+    zs = [e["research_z"] for e in gate["sessions"]]
+    top, bottom = max(zs), min(zs)
+    return (">=", round(top - 0.05, 4)) if top > 0.1 else ("<=", round(-bottom - 0.05, 4))
+
+
+def test_a_candidate_with_both_histories_is_ready_when_the_trigger_agrees(run):
+    op, k = _a_threshold_research_crosses(run)
+
+    doc = run(_days(), _days(), candidates=[("F1", "15:00", op, k)], recorded=_recorder_history())
+
+    gate = doc["slot_gate"]["candidates"][0]
+    assert gate["status"] == "ready" and gate["reasons"] == [], gate
+    assert gate["recorder_history"]["have_min"] == 60
+    assert any(e["research_fires"] for e in gate["sessions"]), "the threshold is one research crosses"
+    for e in gate["sessions"]:
+        assert e["agree"] is True and e["value_matched"] is True
+        assert e["live_z"] == pytest.approx(e["research_z"], abs=0.15)
+        assert e["research_fires"] == (e["research_z"] >= k if op == ">=" else e["research_z"] <= -k)
+    # The two histories differ by one value: the window's first session has no live prior session, so the recorder's
+    # history reaches one session further back. The z values are close, and on some sessions not equal.
+    assert any(e["live_z"] != e["research_z"] for e in gate["sessions"])
+    assert doc["slot_gate"]["ready"] == [f"F1@15:00{op}{k:g}"]
+    assert "separate gates" in gate["note"]
+
+
+def test_the_same_values_on_another_history_can_disagree_about_the_trigger(run):
+    """Every value matches and nothing is biased. The recorder's own history sits elsewhere, so its z does not cross."""
+    op, k = _a_threshold_research_crosses(run)
+    spread = flp.research_spreads({**_history(), **_days()}, ["15:00"])[("F1", "15:00", SESSIONS[-1])]
+    shift = 3 * spread if op == ">=" else -3 * spread                        # the recorder's earlier values, three spreads away
+
+    doc = run(_days(), _days(), candidates=[("F1", "15:00", op, k)], recorded=_recorder_history(shift))
+
+    gate = doc["slot_gate"]["candidates"][0]
+    assert "F1" in doc["live_ready"] and gate["value_not_matched"] == [] and gate["mean_signed_diff_in_spreads"] == 0.0
+    assert gate["status"] == "not_ready" and gate["reasons"] == [flp.TRIGGER_DISAGREES]
+    crossed = [e["day"] for e in gate["sessions"] if e["research_fires"]]
+    assert gate["trigger_disagrees"] == crossed and crossed
+    assert not any(e["live_fires"] for e in gate["sessions"])
+
+
+def test_a_candidate_is_judged_at_its_own_decision_time(run):
+    live = _days()
+    for day in SESSIONS[-5:]:
+        _nudged(live, day, "14:59", _f1_dollars(day, 0.06, decision="15:00"))        # biased at 15:00, clean at 14:30
+    _nudged(live, SESSIONS[-2], "14:29", _f1_dollars(SESSIONS[-2], 0.2, decision="14:30"))   # one bad value at 14:30
+
+    doc = run(_days(), live, decisions=("14:30", "15:00"),
+              candidates=[("F1", "15:00", ">=", 0.5), ("F1", "14:30", "<=", 1.0)])
+
+    at_1500, at_1430 = doc["slot_gate"]["candidates"]
+    assert at_1500["reasons"] == [flp.VALUE_BIASED, flp.TRIGGER_UNAVAILABLE]
+    assert at_1500["mean_signed_diff_in_spreads"] == pytest.approx(0.06, rel=2e-2) and at_1500["value_not_matched"] == []
+    assert at_1430["value_not_matched"] == [SESSIONS[-2]]
+    assert at_1430["reasons"] == [flp.VALUE_NOT_MATCHED, flp.VALUE_BIASED, flp.TRIGGER_UNAVAILABLE]   # 0.2 / 5 = 0.04 at that time
+
+
+def test_the_recorders_history_is_its_own_bound_eligible_values_before_the_day():
+    at = "2026-11-02T15:00:20+00:00"
+    row = lambda raw, eligible=True, sha=flp.LIVE_RULE_TERMS_SHA256, bound_at=at: {
+        "raw": raw, "eligible": eligible, "recorded_at": at, "terms_sha256": sha, "terms_recorded_at": bound_at}
+    days = flp.expected_sessions_between("2026-06-01", "2026-10-30")
+    recorded = {(d, "15:00", "F1"): row(float(i)) for i, d in enumerate(days)}
+    recorded[(days[-1], "15:00", "F1")] = row(999.0, sha=None)               # an earlier generation's value
+    recorded[(days[-2], "15:00", "F1")] = row(998.0, eligible=False)
+    recorded[(days[-3], "15:00", "F1")] = row(None)
+    recorded[(days[-4], "15:00", "F1")] = row(997.0, bound_at="another stamp")
+    recorded[(days[-5], "14:30", "F1")] = row(996.0)                         # another decision time
+    recorded[("2026-11-03", "15:00", "F1")] = row(995.0)                     # not before the day
+
+    history = flp.recorder_history(recorded, "F1", "15:00", "2026-11-02")
+
+    assert len(history) == 60 and history == tuple(float(i) for i in range(len(days) - 64, len(days) - 4))
+    assert flp.recorder_history(None, "F1", "15:00", "2026-11-02") == ()
+    assert len(flp.recorder_history(recorded, "F1", "15:00", days[10])) == 10
+
+
+@pytest.mark.parametrize("candidate, why", [
+    (("F9", "15:00", ">=", 0.5), "not a factory feature"),
+    (("F1", "12:00", ">=", 0.5), "not one of the compared decision times"),
+    (("F1_shift30", "10:00", ">=", 0.5), "no value at 10:00 by definition"),
+    (("F1", "15:00", ">", 0.5), "is not one of"),
+    (("F1", "15:00", ">=", 0), "is not in (0, 4.0]"),
+    (("F1", "15:00", ">=", 4.5), "is not in (0, 4.0]"),
+    (("F1", "15:00", ">=", "high"), "is not a number"),
+])
+def test_a_candidate_that_cannot_be_a_slot_is_refused(candidate, why):
+    with pytest.raises(flp.ParityError, match=why.replace("(", r"\(").replace("]", r"\]")):
+        flp.parse_candidate(*candidate, ["10:00", "15:00"])
+
+
+def test_the_command_takes_a_candidate(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(flp, "_clock", lambda: _after_close(SESSIONS[-1]))
+    r = _research_db(tmp_path / "r.db", {**_history(), **_days()})
+    lv = _live_db(tmp_path / "l.db", _days())
+    args = ["--research-db", str(r), "--signals-db", str(lv), "--first", SESSIONS[0], "--last", SESSIONS[-1],
+            "--candidate", "F1", "15:00", ">=", "0.5", "--summary"]
+
+    assert flp.main(args) == 0                                               # the exit code is the diagnostic's, as before
+
+    gate = json.loads(capsys.readouterr().out)["slot_gate"]
+    assert [(g["feature"], g["decision"], g["op"], g["k"], g["status"]) for g in gate["candidates"]] == [("F1", "15:00", ">=", 0.5, "not_ready")]
+    with pytest.raises(flp.ParityError):
+        flp.main(args[:-6] + ["--candidate", "F1", "09:45", ">=", "0.5"])
