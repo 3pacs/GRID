@@ -55,12 +55,29 @@ panel, session labels that are not dates (or ``NaT``), duplicate sessions,
 and a ``members_on`` that returns something other than a collection of
 tickers or :class:`UnknownMembership`.
 
+Tickers are compared normalized: stripped and upper-cased on both sides (price
+columns and members; the membership file spells them upper-case, ``BRK.B``).
+Two price columns, or two members, that normalize to the same ticker (``AAPL``
+twice, or ``aapl`` and `` AAPL ``) raise ``ValueError`` naming them; a duplicate
+would otherwise count one name twice and push coverage above 1 or past the
+threshold. Coverage is therefore always in ``[0, 1]``.
+
+Session dates. The index must be naive: each label is read as the session's
+calendar date (a time of day is dropped). A timezone-aware index is refused
+(``ValueError``), whatever its zone: an instant does not say which session it
+labels (Tiingo stamps a daily bar at 00:00 UTC, which is the previous evening
+in New York), so a local index and a UTC index for the same instants are
+refused alike rather than silently mapped to possibly different sessions.
+Convert to naive session dates (for NYSE sessions, the America/New_York date of
+the close) before calling.
+
 No writer: nothing stores these series in this change.
 """
 
 from __future__ import annotations
 
 import warnings
+from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -139,23 +156,50 @@ def _mcclellan(net_adv: pd.Series) -> pd.Series:
     return out
 
 
-def _session_frame(prices: pd.DataFrame, what: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(clean float frame, invalid-price mask) on a sorted, de-duplicated date index.
+def normalize_ticker(ticker: object, what: str = "ticker") -> str:
+    """Stripped, upper-cased ticker; ``ValueError`` for a non-string or empty one."""
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise ValueError(f"{what} must be a non-empty ticker string, got {ticker!r}")
+    return ticker.strip().upper()
 
-    Raises ``ValueError`` for non-numeric values, non-date or NaT labels and
-    duplicate sessions. Present-but-unusable prices (non-finite or ``<= 0``)
-    become NaN in the clean frame and True in the mask.
+
+def _unique_tickers(tickers: Collection[object], what: str) -> list[str]:
+    """Normalized tickers in input order; ``ValueError`` naming any that collide."""
+    names = [normalize_ticker(t, what) for t in tickers]
+    counts = Counter(names)
+    dupes = sorted(n for n, c in counts.items() if c > 1)
+    if dupes:
+        spelled = {n: sorted(repr(t) for t in tickers if isinstance(t, str) and t.strip().upper() == n)
+                   for n in dupes}
+        raise ValueError(f"{what} has duplicate tickers after strip/upper-case: "
+                         + "; ".join(f"{n} <- {', '.join(spelled[n])}" for n in dupes))
+    return names
+
+
+def _session_frame(prices: pd.DataFrame, what: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(clean float frame, invalid-price mask) on unique tickers and a sorted naive date index.
+
+    Raises ``ValueError`` for non-numeric values, ticker columns that collide
+    after normalization, non-date, NaT or timezone-aware labels and duplicate
+    sessions. Present-but-unusable prices (non-finite or ``<= 0``) become NaN
+    in the clean frame and True in the mask.
     """
+    columns = _unique_tickers(list(prices.columns), f"{what} columns")
     try:
         raw = prices.astype(float)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{what} must be numeric: {exc}") from exc
+    raw.columns = columns
+    if isinstance(raw.index, pd.DatetimeIndex) and raw.index.tz is not None:
+        raise ValueError(f"{what} index is timezone-aware ({raw.index.tz}); pass naive session dates")
     try:
         with warnings.catch_warnings():  # garbage labels fall back to dateutil; the ValueError below is the answer
             warnings.simplefilter("ignore", UserWarning)
             idx = pd.DatetimeIndex(pd.to_datetime(raw.index))
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{what} index must be session dates: {exc}") from exc
+        raise ValueError(f"{what} index must be naive session dates: {exc}") from exc
+    if idx.tz is not None:
+        raise ValueError(f"{what} index is timezone-aware ({idx.tz}); pass naive session dates")
     if idx.hasnans:
         raise ValueError(f"{what} index has NaT session labels")
     idx = idx.normalize()
@@ -168,6 +212,18 @@ def _session_frame(prices: pd.DataFrame, what: str) -> tuple[pd.DataFrame, pd.Da
     invalid_mask = pd.DataFrame(invalid, index=raw.index, columns=raw.columns)
     clean = raw.mask(invalid_mask)
     return clean, invalid_mask
+
+
+def _member_set(
+    members: Collection[object], d: date, cache: dict[frozenset[str], frozenset[str]],
+) -> frozenset[str]:
+    """Normalized members of one date; ``ValueError`` when two collide after normalization."""
+    if isinstance(members, frozenset) and members in cache:
+        return cache[members]
+    out = frozenset(_unique_tickers(list(members), f"members_on({d})"))
+    if isinstance(members, frozenset):
+        cache[members] = out
+    return out
 
 
 def compute_true_breadth_panel(
@@ -209,6 +265,7 @@ def compute_true_breadth_panel(
     up = {"50ma": px > ma50, "200ma": px > ma200, "ret1": ret1 > 0}
     down_ret1 = ret1 < 0
     columns = set(px.columns)
+    member_cache: dict[frozenset[str], frozenset[str]] = {}
 
     rows: list[dict[str, object]] = []
     out_dates: list[date] = []
@@ -224,12 +281,13 @@ def compute_true_breadth_panel(
         if isinstance(members, (str, bytes)) or not isinstance(members, Collection):
             raise ValueError(f"members_on({d}) must return a collection of tickers or UnknownMembership, "
                              f"got {type(members).__name__}")
-        n_members = len(members)
+        member_set = _member_set(members, d, member_cache)
+        n_members = len(member_set)
         if n_members == 0:
             row.update(members=0, invalid_prices=0, status=STATUS_UNKNOWN, reason="no members on this date")
             rows.append(row)
             continue
-        cols = [c for c in members if c in columns]
+        cols = sorted(c for c in member_set if c in columns)
         row["members"] = n_members
         row["invalid_prices"] = int(invalid.loc[idx_val, cols].sum()) if cols else 0
         reasons: list[str] = []
@@ -238,6 +296,8 @@ def compute_true_breadth_panel(
             ok = valid[key].loc[idx_val, cols] if cols else pd.Series(dtype=bool)
             n_obs = int(ok.sum())
             coverage = n_obs / n_members
+            if not 0.0 <= coverage <= 1.0:  # unique columns within unique members: cannot happen
+                raise RuntimeError(f"{stat} coverage {coverage} outside [0, 1] on {d}")
             row[f"observed_{key}"] = n_obs
             row[f"coverage_{key}"] = coverage
             if coverage < min_coverage or n_obs == 0:

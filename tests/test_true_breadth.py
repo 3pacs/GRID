@@ -317,3 +317,100 @@ def test_sector_iqr_ignores_bad_prices_and_validates_arguments() -> None:
     for kwargs in ({"horizon_days": 0}, {"horizon_days": True}, {"min_sectors": 1}):
         with pytest.raises(ValueError):
             compute_sector_dispersion_iqr(sec, **kwargs)
+
+
+# ── Unique normalized tickers and naive session dates (Codex, 393f1e29) ────
+
+def _dup_frame(columns: list[str], n_days: int = 3) -> pd.DataFrame:
+    rising = np.arange(n_days, dtype=float) + 100.0
+    return pd.DataFrame(np.column_stack([rising] * len(columns)), columns=columns,
+                        index=pd.bdate_range("2026-01-05", periods=n_days))
+
+
+@pytest.mark.parametrize("columns,named", [
+    (["T0", "T1", "T0"], "T0 <- 'T0', 'T0'"),
+    (["AAPL", "aapl", "MSFT"], "AAPL <- 'AAPL', 'aapl'"),
+    (["AAPL", " AAPL ", "MSFT"], "AAPL <- ' AAPL ', 'AAPL'"),
+    (["brk.b", "BRK.B"], "BRK.B <- 'BRK.B', 'brk.b'"),
+])
+def test_duplicate_ticker_columns_are_refused_by_name(columns: list[str], named: str) -> None:
+    px = _dup_frame(columns)
+    with pytest.raises(ValueError, match="duplicate tickers") as exc:
+        compute_true_breadth_panel(px, members_on=lambda _d: frozenset(c.strip().upper() for c in columns))
+    assert named in str(exc.value)
+    with pytest.raises(ValueError, match="duplicate tickers"):
+        compute_sector_dispersion_iqr(px)
+
+
+def test_duplicate_members_are_refused_by_name() -> None:
+    px = _dup_frame(["AAPL", "MSFT"])
+    with pytest.raises(ValueError, match=r"members_on\(2026-01-05\) has duplicate tickers.*AAPL"):
+        compute_true_breadth_panel(px, members_on=lambda _d: ["AAPL", " aapl", "MSFT"])
+    with pytest.raises(ValueError, match="members_on"):
+        compute_true_breadth_panel(px, members_on=lambda _d: frozenset({"AAPL", "", "MSFT"}))
+
+
+def test_tickers_match_across_case_and_whitespace() -> None:
+    # Columns as a lower-case feed spells them; members as the membership file does.
+    cols = [f" t{i} " for i in range(20)]
+    panel = compute_true_breadth_panel(_dup_frame(cols), members_on=lambda _d: frozenset(f"T{i}" for i in range(20)))
+    assert panel.iloc[-1]["observed_ret1"] == 20 and panel.iloc[-1]["coverage_ret1"] == pytest.approx(1.0)
+
+
+def test_duplicates_cannot_push_coverage_past_one_or_the_threshold() -> None:
+    # 90 real names plus 10 re-spelled copies against 100 members: counted naively
+    # that is 100 observations, exactly the 95% threshold passed. It is refused.
+    members = frozenset(f"T{i}" for i in range(100))
+    cols = [f"T{i}" for i in range(90)]
+    for copies in ([f"T{i}" for i in range(10)], [f"t{i}" for i in range(10)], [f" T{i}" for i in range(10)]):
+        with pytest.raises(ValueError, match="duplicate tickers"):
+            compute_true_breadth_panel(_dup_frame(cols + copies), members_on=lambda _d: members)
+    # Without the copies the same date is UNKNOWN: 90 of 100 is below 0.95.
+    panel = compute_true_breadth_panel(_dup_frame(cols), members_on=lambda _d: members)
+    assert panel.iloc[-1]["coverage_ret1"] == pytest.approx(0.90)
+    assert panel.iloc[-1]["status"] == STATUS_UNKNOWN and np.isnan(panel.iloc[-1]["net_adv_ratio"])
+
+
+def test_coverage_is_always_within_zero_and_one() -> None:
+    rng = np.random.default_rng(23)
+    for trial in range(20):
+        n_cols = int(rng.integers(1, 40))
+        members = frozenset(f"T{i}" for i in rng.choice(60, size=int(rng.integers(1, 60)), replace=False))
+        px = _prices(n_tickers=n_cols, n_days=60, seed=trial)
+        px = px.mask(rng.random(px.shape) < 0.1)
+        panel = compute_true_breadth_panel(px, members_on=lambda _d, m=members: m, min_coverage=0.3)
+        cov = panel[["coverage_50ma", "coverage_200ma", "coverage_ret1"]].astype(float).to_numpy()
+        cov = cov[~np.isnan(cov)]
+        assert ((cov >= 0.0) & (cov <= 1.0)).all()
+
+
+def _closes_at(zone: str) -> pd.DatetimeIndex:
+    # The same instants: 16:00 New York closes on three sessions.
+    local = pd.DatetimeIndex(["2026-01-05 16:00", "2026-01-06 16:00", "2026-01-07 16:00"],
+                             tz="America/New_York")
+    return local if zone == "America/New_York" else local.tz_convert(zone)
+
+
+@pytest.mark.parametrize("zone", ["America/New_York", "UTC", "Asia/Tokyo"])
+def test_timezone_aware_indexes_are_refused_alike(zone: str) -> None:
+    px = _dup_frame([f"T{i}" for i in range(20)]).set_axis(_closes_at(zone))
+    members = frozenset(f"T{i}" for i in range(20))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        compute_true_breadth_panel(px, members_on=lambda _d: members)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        compute_sector_dispersion_iqr(px)
+    # Offset-bearing strings are instants too.
+    as_text = px.set_axis([ts.isoformat() for ts in px.index])
+    with pytest.raises(ValueError, match="naive session dates|timezone-aware"):
+        compute_true_breadth_panel(as_text, members_on=lambda _d: members)
+
+
+def test_naive_labels_are_session_dates_whatever_the_time_of_day() -> None:
+    members = frozenset(f"T{i}" for i in range(20))
+    base = _dup_frame(sorted(members))
+    stamped = base.set_axis([pd.Timestamp("2026-01-05 16:00"), pd.Timestamp("2026-01-06 09:30"),
+                             pd.Timestamp("2026-01-07 23:59")])
+    a = compute_true_breadth_panel(base, members_on=lambda _d: members)
+    b = compute_true_breadth_panel(stamped, members_on=lambda _d: members)
+    assert list(a.index) == list(b.index) == [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+    pd.testing.assert_frame_equal(a, b)

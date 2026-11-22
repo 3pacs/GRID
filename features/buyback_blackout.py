@@ -37,10 +37,14 @@ Invalid input raises ``ValueError`` at the boundary; it is never coerced. A
 weight must be a real, finite number ``>= 0`` (NaN, inf, negative, boolean,
 ``None`` and non-numeric weights raise, naming the ticker); zero weights are
 ignored, and a date whose weights sum to zero is UNKNOWN (``no_positive_weight``).
-A weight total that overflows raises. Every date (``as_of``, ``earnings_date``,
-``known_at``) must be a real ``datetime.date`` (not a ``datetime``, ``NaT`` or
-string) between :data:`MIN_DATE` and :data:`MAX_DATE`; tickers must be
-non-empty strings; ``pre_days``, ``post_days`` and ``max_lookahead_days`` must
+A weight total that overflows raises. Weight keys are stripped and
+upper-cased, and two keys that collide after that (``AAPL`` and `` aapl``)
+raise, naming them, instead of being summed. Every date (``as_of``,
+``earnings_date``, ``known_at``, series ``dates``) must be a real
+``datetime.date`` between :data:`MIN_DATE` and :data:`MAX_DATE`: a
+``datetime`` or ``pandas.Timestamp`` (naive or timezone-aware), ``NaT`` or a
+string raises, so no instant is ever silently mapped to a session date in some
+zone; tickers must be non-empty strings; ``pre_days``, ``post_days`` and ``max_lookahead_days`` must
 be non-negative integers and ``min_coverage`` in ``(0, 1]``. Raising (rather
 than marking the name UNKNOWN) is deliberate: a weight that is not a number
 leaves the index total itself unknown, so no coverage could be stated. With
@@ -122,13 +126,19 @@ def _check_params(pre_days: int, post_days: int, max_lookahead_days: int, min_co
 
 
 def _clean_weights(market_cap_weights: Mapping[str, float]) -> dict[str, float]:
-    """Validated weights by upper-cased ticker (duplicates after normalising are summed)."""
+    """Validated weights by stripped, upper-cased ticker.
+
+    Two keys that normalize to one ticker (``"AAPL"`` and ``" aapl"``) raise
+    ``ValueError`` naming them: summing them would count the name twice.
+    """
     if not isinstance(market_cap_weights, Mapping):
         raise ValueError("market_cap_weights must be a mapping of ticker -> weight")
     weights: dict[str, float] = {}
+    spelled: dict[str, list[str]] = {}
     for tk, w in market_cap_weights.items():
         if not isinstance(tk, str) or not tk.strip():
             raise ValueError(f"weight key must be a non-empty ticker string, got {tk!r}")
+        spelled.setdefault(tk.strip().upper(), []).append(tk)
         try:
             fw = float(w) if isinstance(w, Real) and not isinstance(w, bool) else math.nan
         except OverflowError:
@@ -136,8 +146,12 @@ def _clean_weights(market_cap_weights: Mapping[str, float]) -> dict[str, float]:
         if not math.isfinite(fw) or fw < 0.0:
             raise ValueError(f"weight for {tk!r} must be a finite number >= 0, got {w!r}")
         if fw > 0.0:
-            key = tk.strip().upper()
-            weights[key] = weights.get(key, 0.0) + fw
+            weights[tk.strip().upper()] = fw
+    dupes = {n: keys for n, keys in sorted(spelled.items()) if len(keys) > 1}
+    if dupes:
+        raise ValueError("market_cap_weights has duplicate tickers after strip/upper-case: "
+                         + "; ".join(f"{n} <- {', '.join(repr(k) for k in sorted(keys))}"
+                                     for n, keys in dupes.items()))
     if not math.isfinite(sum(weights.values())):
         raise ValueError("weights overflow: their total is not finite")
     return weights

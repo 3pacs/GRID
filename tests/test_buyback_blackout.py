@@ -8,7 +8,7 @@ from __future__ import annotations
 import itertools
 import math
 import socket
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pandas as pd
@@ -254,3 +254,38 @@ def test_valid_extreme_weights_give_finite_unit_values(weights) -> None:
     for v in (r.share, r.share_lower, r.share_upper, r.coverage):
         assert v is not None and math.isfinite(v) and 0.0 <= v <= 1.0
     assert r.share_lower <= r.share_upper
+
+
+# ── Normalized tickers and naive dates (Codex, 393f1e29) ───────────────────
+
+@pytest.mark.parametrize("weights,named", [
+    ({"AAPL": 0.4, "aapl": 0.4, "MSFT": 0.2}, "AAPL <- 'AAPL', 'aapl'"),
+    ({"AAPL": 0.4, " AAPL ": 0.4, "MSFT": 0.2}, "AAPL <- ' AAPL ', 'AAPL'"),
+    ({"MSFT": 0.2, "msft": 0.0}, "MSFT <- 'MSFT', 'msft'"),    # even a zero-weight copy
+])
+def test_colliding_weight_keys_raise_instead_of_summing(weights, named) -> None:
+    with pytest.raises(ValueError, match="duplicate tickers") as exc:
+        compute_blackout_reading(AS_OF, _full_schedule(), weights)
+    assert named in str(exc.value)
+
+
+def test_weight_keys_match_schedules_across_case_and_whitespace() -> None:
+    r = compute_blackout_reading(AS_OF, _full_schedule(), {" aapl": 0.40, "Msft ": 0.35, "nvda": 0.25})
+    assert r.status == STATUS_OK and r.share == pytest.approx(0.75) and r.coverage == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("stamp", [
+    pd.Timestamp("2026-11-20"),                                  # naive Timestamp: still an instant type
+    pd.Timestamp("2026-11-20 16:00", tz="America/New_York"),
+    pd.Timestamp("2026-11-20 21:00", tz="UTC"),
+    datetime(2026, 11, 20, 16, 0, tzinfo=timezone.utc),
+], ids=repr)
+def test_timestamps_are_refused_everywhere_whatever_the_zone(stamp) -> None:
+    with pytest.raises(ValueError):
+        compute_blackout_reading(stamp, _full_schedule(), WEIGHTS)
+    with pytest.raises(ValueError):
+        ScheduledEarnings("AAPL", date(2026, 11, 25), stamp)
+    with pytest.raises(ValueError):
+        ScheduledEarnings("AAPL", stamp, KNOWN)
+    with pytest.raises(ValueError):
+        compute_blackout_series([stamp], _full_schedule(), lambda _d: WEIGHTS)
