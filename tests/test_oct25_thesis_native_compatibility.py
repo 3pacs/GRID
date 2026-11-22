@@ -320,33 +320,51 @@ def test_scorer_writer_invalid_unknown_before_effects(native_modules, native_pg_
     (["other", None], (0, 0, 0, 2), 0),
 ])
 def test_category_denominator_native_sql(native_modules, native_pg_engine, directions, expected_counts, expected_score):
-    # One break per feature counts. Not counted: a feature's older break, legacy
-    # rows (no provenance), rows outside the window, future rows, a break whose
-    # latest row is a withdrawal (without hiding feature_0's other break), and a
-    # recent row of a break whose effective known-at is older than the window.
+    # One break per feature counts at as_of. Not counted: a feature's older
+    # break, legacy rows (no provenance), rows outside the window, rows valid
+    # or published after as_of (a late first publish, a withdrawal published
+    # later), a break whose latest row is a withdrawal (without hiding
+    # feature_0's other break), a row with no published_at, and a recent row
+    # of a break whose effective known-at is older than the window.
     scorer = native_modules[1]
     version = scorer.CHANGEPOINT_DETECTOR_VERSION
-    aged = json.dumps({"effective_known_at": (datetime.now(timezone.utc) - timedelta(days=6)).isoformat()})
-    insert = text("INSERT INTO signal_registry VALUES (:sid,:t,:d,:c,1,NOW() + make_interval(secs => :s),"
+    now = datetime.now(timezone.utc)
+    hour = timedelta(hours=1)
+    insert = text("INSERT INTO signal_registry VALUES (:sid,:t,:d,:c,1,:vf,"
                   "'discovery.changepoint_detector','regime_change',:p,CAST(:m AS jsonb))")
+
+    def meta(valid_hours, published_hours=None, **extra):
+        published = now + (valid_hours if published_hours is None else published_hours) * hour
+        return json.dumps({"published_at": published.isoformat(), **extra})
+
     with native_pg_engine.begin() as conn:
         conn.execute(text("CREATE TABLE signal_registry (signal_id TEXT, ticker TEXT, direction TEXT, confidence NUMERIC, value NUMERIC, valid_from TIMESTAMPTZ, source_module TEXT, signal_type TEXT, provenance TEXT, metadata JSONB)"))
         for i, direction in enumerate(directions):
-            conn.execute(insert, {"sid": f"break_{i}", "t": f"feature_{i}", "d": direction, "c": 0 if direction in ("other", None) else 0.75, "s": -3600, "p": version, "m": None})
-        for sid, ticker, hours, provenance, meta in (
-                ("break_0_old", "feature_0", -48, version, None), ("legacy", "legacy", -1, None, None),
-                ("stale", "stale", -24 * 6, version, None), ("future", "future", 1, version, None),
-                ("w", "withdrawn", -30, version, '{"status": "live"}'),
-                ("w", "withdrawn", -2, version, '{"status": "withdrawn"}'),
-                ("f0_w", "feature_0", -30, version, '{"status": "live"}'),
-                ("f0_w", "feature_0", -1 / 6, version, '{"status": "withdrawn"}'),
-                ("aged", "aged", -1, version, aged)):
-            conn.execute(insert, {"sid": sid, "t": ticker, "d": "bearish", "c": 1, "s": hours * 3600, "p": provenance, "m": meta})
+            conn.execute(insert, {"sid": f"break_{i}", "t": f"feature_{i}", "d": direction, "c": 0 if direction in ("other", None) else 0.75, "vf": now - hour, "p": version, "m": meta(-1)})
+        for sid, ticker, hours, provenance, row_meta in (
+                ("break_0_old", "feature_0", -48, version, meta(-48)), ("legacy", "legacy", -1, None, meta(-1)),
+                ("stale", "stale", -24 * 6, version, meta(-144)), ("future", "future", 1, version, meta(1)),
+                ("w", "withdrawn", -30, version, meta(-30, status="live")),
+                ("w", "withdrawn", -2, version, meta(-2, status="withdrawn")),
+                ("f0_w", "feature_0", -30, version, meta(-30, status="live")),
+                ("f0_w", "feature_0", -1 / 6, version, meta(-1 / 6, status="withdrawn")),
+                ("aged", "aged", -1, version, meta(-1, effective_known_at=(now - timedelta(days=6)).isoformat())),
+                ("late", "late", -2, version, meta(-2, 1)),
+                ("break_1", "feature_1", -1 / 6, version, meta(-1 / 6, 1, status="withdrawn")),
+                ("nopub", "nopub", -1, version, '{"status": "live"}')):
+            conn.execute(insert, {"sid": sid, "t": ticker, "d": "bearish", "c": 1, "vf": now + hours * hour, "p": provenance, "m": row_meta})
     verdict = scorer._score_regime_changepoints(native_pg_engine, 0.5)
     counts = verdict["category_counts"]
     assert tuple(counts[k] for k in ("bullish", "bearish", "neutral", "other_unknown")) == expected_counts
     assert counts["total"] == len(directions) and counts["rows_read"] == len(directions) + 6
-    assert (counts["breaks_read"], counts["withdrawn"], counts["aged_out"]) == (len(directions) + 4, 2, 1)
+    assert (counts["breaks_read"], counts["withdrawn"], counts["aged_out"], counts["unpublished"]) == (len(directions) + 4, 2, 1, 1)
+    # Replays at an explicit as_of. Two hours on, the late break, the future
+    # row and feature_1's withdrawal are published.
+    later = scorer._score_regime_changepoints(native_pg_engine, 0.5, as_of=now + 2 * hour)["category_counts"]
+    assert (later["total"], later["bearish"], later["withdrawn"]) == (counts["total"] + 1, counts["bearish"] + 2, 3)
+    # Ninety minutes back, f0_w was still live and the main rows were not yet available.
+    earlier = scorer._score_regime_changepoints(native_pg_engine, 0.5, as_of=now - 1.5 * hour)["category_counts"]
+    assert (earlier["total"], earlier["bearish"], earlier["withdrawn"]) == (1, 1, 1)
     assert counts["known_categories_exhaustive"] == (expected_counts[-1] == 0)
     assert verdict["score"] == expected_score
     if expected_score == 6.0:

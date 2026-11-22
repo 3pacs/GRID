@@ -146,9 +146,10 @@ CHANGEPOINT_READER = ["DEFAULT_ACCURACY", "CHANGEPOINT_DETECTOR_VERSION", "CHANG
 
 
 def categories(directions, confidences=None, tickers=None, statuses=None, sids=None, valid_froms=None,
-               break_dates=None):
+               break_dates=None, unpublished=None, as_of=None):
     """Reader over invented rows (signal_id, ticker, direction, confidence, valid_from, status,
-    break_date, effective_known_at). Each row is its own break unless ``sids`` says otherwise."""
+    break_date, effective_known_at, unpublished) as its query returns them (already fenced).
+    Each row is its own break unless ``sids`` says otherwise."""
     ns = load(PATHS[1], CHANGEPOINT_READER)
     n = len(directions)
     values = confidences if confidences is not None else [0.5] * n
@@ -157,9 +158,10 @@ def categories(directions, confidences=None, tickers=None, statuses=None, sids=N
     ids = sids if sids is not None else [f"break-{i}" for i in range(n)]
     times = valid_froms if valid_froms is not None else [NOW - timedelta(seconds=i) for i in range(n)]
     dates = break_dates if break_dates is not None else ["2026-10-20"] * n
-    boundary = MemoryBoundary([(sid, t, d, c, vf, st, bd, vf) for sid, t, d, c, vf, st, bd
-                               in zip(ids, names, directions, values, times, status, dates)])
-    return ns["_score_regime_changepoints"](boundary, 0.5), boundary
+    flags = unpublished if unpublished is not None else [False] * n
+    boundary = MemoryBoundary([(sid, t, d, c, vf, st, bd, vf, u) for sid, t, d, c, vf, st, bd, u
+                               in zip(ids, names, directions, values, times, status, dates, flags)])
+    return ns["_score_regime_changepoints"](boundary, 0.5, as_of=as_of), boundary
 
 
 class ThesisContracts(unittest.TestCase):
@@ -202,7 +204,7 @@ class ThesisContracts(unittest.TestCase):
 
     def test_T2_explicit_neutral_is_valid(self):
         out, _ = categories(["bullish"] * 4 + ["bearish"] * 4 + ["neutral"] * 2)
-        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, breaks_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, withdrawn=0, aged_out=0, known_categories_exhaustive=True))
+        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, breaks_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, withdrawn=0, aged_out=0, unpublished=0, known_categories_exhaustive=True))
         self.assertEqual(out["score"], 0)
 
     def test_T2_other_unknown_is_not_neutral(self):
@@ -219,9 +221,9 @@ class ThesisContracts(unittest.TestCase):
         self.assertEqual(out["confidence"], 57.0)
         self.assertEqual(out["category_counts"]["total"], 5)
         sql, params = boundary.statements[-1]
-        self.assertIn("make_interval(days => :days)", sql)
-        self.assertIn("valid_from <= NOW()", sql)
-        self.assertEqual(params["days"], 5)
+        self.assertIn("valid_from > :window_start", sql)
+        self.assertIn("valid_from <= :as_of", sql)
+        self.assertEqual(params["window_start"], params["as_of"] - timedelta(days=5))
 
     def test_T2_counts_features_not_rows(self):
         # One feature re-published many times counts once, by its latest break.
@@ -267,6 +269,24 @@ class ThesisContracts(unittest.TestCase):
                         counts = out["category_counts"]
                         self.assertEqual((counts["total"], counts["bearish"], counts["withdrawn"]), (1, 1, 1),
                                          "WITHDRAWAL_RECONCILED_BY_SIGNAL_ID_FIRST")
+
+    def test_T2_both_fences_bound_at_an_explicit_as_of(self):
+        replay = NOW - timedelta(days=1)
+        _, boundary = categories(["bullish"], valid_froms=[replay - timedelta(hours=1)], as_of=replay)
+        sql, params = boundary.statements[-1]
+        self.assertIn("valid_from <= :as_of", sql, "AVAILABILITY_FENCE")
+        self.assertIn("CAST(metadata->>'published_at' AS timestamptz) <= :as_of", sql, "PUBLICATION_FENCE")
+        self.assertNotIn("NOW()", sql)
+        self.assertEqual((params["as_of"], params["window_start"]), (replay, replay - timedelta(days=5)))
+        _, live = categories(["bullish"])
+        self.assertEqual(live.statements[-1][1]["as_of"], NOW, "LIVE_CALL_IS_AS_OF_NOW")
+
+    def test_T2_unpublished_rows_drop_before_reconciliation(self):
+        # A withdrawal with no published_at must not hide the break it names.
+        out, _ = categories(["neutral", "bearish"], [0, 0.8], ["vix_spot", "vix_spot"], ["withdrawn", "live"],
+                            sids=["A", "A"], unpublished=[True, False])
+        c = out["category_counts"]
+        self.assertEqual((c["total"], c["bearish"], c["withdrawn"], c["unpublished"]), (1, 1, 0, 1))
 
     def test_T2_only_the_current_detector_version_counts(self):
         _, boundary = categories(["bullish"])

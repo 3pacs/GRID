@@ -697,6 +697,163 @@ class TestRunChangepointCycle:
 
 
 # ---------------------------------------------------------------------------
+# thesis_scorer as of an instant: availability and publication fences (#1367)
+# ---------------------------------------------------------------------------
+
+
+class RegistryReader:
+    """A signal_registry for the reader's query: applies its WHERE clause from the bound parameters."""
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+        self.params: list[dict] = []
+
+    @classmethod
+    def from_writer(cls, engine: "FakeEngine") -> "RegistryReader":
+        rows = []
+        for r in engine.rows:
+            meta = json.loads(r["meta"])
+            rows.append(dict(sid=r["sid"], ticker=r["ticker"], direction=r["direction"], conf=r["conf"],
+                             vfrom=r["vfrom"], status=meta.get("status"), break_date=meta.get("break_date"),
+                             eff=datetime.fromisoformat(meta["effective_known_at"]),
+                             published=datetime.fromisoformat(meta["published_at"]), version=r["version"]))
+        return cls(rows)
+
+    def connect(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        if "LIMIT 0" in sql:
+            return _Result()
+        p = statement.compile().params
+        self.params.append(p)
+        assert "valid_from <= :as_of" in sql and "valid_from > :window_start" in sql
+        assert "CAST(metadata->>'published_at' AS timestamptz) <= :as_of" in sql
+        out = []
+        for r in self.rows:
+            if r.get("version", CHANGEPOINT_DETECTOR_VERSION) != p["version"]:
+                continue
+            if not p["window_start"] < r["vfrom"] <= p["as_of"]:
+                continue
+            if r.get("published") is not None and r["published"] > p["as_of"]:
+                continue
+            out.append((r["sid"], r["ticker"], r["direction"], r["conf"], r["vfrom"], r.get("status"),
+                        r.get("break_date"), r.get("eff") or r["vfrom"], r.get("published") is None))
+        out.sort(key=lambda t: t[4], reverse=True)
+        return _Result(out)
+
+
+def read_as_of(registry: RegistryReader, as_of: datetime | None) -> dict:
+    from analysis import thesis_scorer
+
+    return thesis_scorer._score_regime_changepoints(registry, 0.5, as_of=as_of)
+
+
+def reg_row(sid, direction, conf, vfrom, published, *, ticker="vix_spot", status="live",
+            break_date="2026-11-10", eff=None) -> dict:
+    return dict(sid=sid, ticker=ticker, direction=direction, conf=conf, vfrom=vfrom, status=status,
+                break_date=break_date, eff=eff or vfrom, published=published)
+
+
+class TestReaderAsOf:
+    def test_late_first_publish_is_not_visible_before_the_scan(self) -> None:
+        # Inputs known by 11-18; the detector's first scan runs on 11-21 (three days late).
+        days = business_days(end=date(2026, 11, 18))
+        engine = FakeEngine(VIX)
+        scan_at = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        run_changepoint_cycle(engine, as_of=date(2026, 11, 21), now=scan_at,
+                              pit=window(vintages(11, days, drift_shift_series()), [11]))
+        (row,) = engine.rows
+        meta = json.loads(row["meta"])
+        assert row["vfrom"] < datetime(2026, 11, 19, tzinfo=timezone.utc)      # valid_from = effective known-at
+        assert meta["published_at"] == meta["first_published_at"] == scan_at.isoformat()
+        registry = RegistryReader.from_writer(engine)
+        before = read_as_of(registry, datetime(2026, 11, 19, 12, tzinfo=timezone.utc))
+        assert before["status"] == "no_data", "a replay before the scan must not see the break"
+        after = read_as_of(registry, scan_at + timedelta(hours=1))
+        assert after["category_counts"]["total"] == 1 and after["category_counts"]["bearish"] == 1
+        assert read_as_of(registry, scan_at)["category_counts"]["total"] == 1   # visible at its own scan
+
+    def test_a_revision_published_after_as_of_is_invisible(self) -> None:
+        t1 = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        t2 = t1 + timedelta(days=1)
+        registry = RegistryReader([
+            reg_row("A", "bullish", 0.6, t1, t1),
+            reg_row("A", "bearish", 0.9, t2, t2),                              # the revision
+            reg_row("A", "bearish", 0.9, t1 + timedelta(hours=1), t2),         # valid early, written late
+        ])
+        between = read_as_of(registry, t1 + timedelta(hours=12))
+        assert (between["category_counts"]["bullish"], between["category_counts"]["bearish"]) == (1, 0)
+        after = read_as_of(registry, t2 + timedelta(hours=1))
+        assert (after["category_counts"]["bullish"], after["category_counts"]["bearish"]) == (0, 1)
+
+    def test_a_withdrawal_published_after_as_of_does_not_hide_a_live_break(self) -> None:
+        t1 = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        t2 = t1 + timedelta(days=1)
+        for withdrawal_valid_from in (t2, t1 + timedelta(hours=1)):
+            registry = RegistryReader([
+                reg_row("A", "bearish", 0.8, t1, t1),
+                reg_row("A", "neutral", 0.0, withdrawal_valid_from, t2, status="withdrawn"),
+            ])
+            between = read_as_of(registry, t1 + timedelta(hours=12))
+            assert between["category_counts"]["total"] == 1 and between["category_counts"]["withdrawn"] == 0
+            assert read_as_of(registry, t2 + timedelta(hours=1))["status"] == "no_data"
+
+    def test_detector_withdrawal_replayed_before_and_after_its_scan(self) -> None:
+        days = business_days(end=date(2026, 11, 19))
+        values, quiet = drift_shift_series(), drift_shift_series(drift=0.0)
+        engine = FakeEngine(VIX)
+        run_changepoint_cycle(engine, as_of=AS_OF, now=NOW, pit=window(vintages(11, days, values), [11]))
+        refetch = [(11, d, float(v), d, AS_OF, None) for d, v in zip(days[-20:], quiet[-20:])]
+        later = NOW + timedelta(hours=12)
+        run_changepoint_cycle(engine, as_of=AS_OF, now=later, pit=window(vintages(11, days, values) + refetch, [11]))
+        assert [json.loads(r["meta"])["status"] for r in engine.rows] == ["live", "withdrawn"]
+        registry = RegistryReader.from_writer(engine)
+        assert read_as_of(registry, NOW + timedelta(hours=6))["category_counts"]["total"] == 1
+        assert read_as_of(registry, later + timedelta(hours=1))["status"] == "no_data"
+
+    def test_every_written_row_carries_published_at(self) -> None:
+        days = business_days(end=date(2026, 11, 19))
+        values = drift_shift_series()
+        engine = FakeEngine(VIX)
+        run_changepoint_cycle(engine, as_of=AS_OF, now=NOW, pit=window(vintages(11, days, values), [11]))
+        revised = vintages(11, days, values) + [(11, days[-5], float(values[-5]) + 0.05, days[-5],
+                                                 date(2026, 11, 18), None)]
+        run_changepoint_cycle(engine, as_of=AS_OF, now=NOW + timedelta(hours=12), pit=window(revised, [11]))
+        quiet = drift_shift_series(drift=0.0)
+        refetch = [(11, d, float(v), d, AS_OF, None) for d, v in zip(days[-20:], quiet[-20:])]
+        run_changepoint_cycle(engine, as_of=AS_OF, now=NOW + timedelta(hours=24), pit=window(revised + refetch, [11]))
+        statuses = [json.loads(r["meta"])["status"] for r in engine.rows]
+        assert statuses == ["live", "live", "withdrawn"]
+        published = [json.loads(r["meta"])["published_at"] for r in engine.rows]
+        assert published == [(NOW + timedelta(hours=h)).isoformat() for h in (0, 12, 24)]
+
+    def test_rows_without_published_at_are_not_visible_and_counted(self) -> None:
+        t1 = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        registry = RegistryReader([reg_row("A", "bearish", 0.8, t1, None),
+                                   reg_row("B", "bullish", 0.8, t1, t1, ticker="sp500_full")])
+        verdict = read_as_of(registry, t1 + timedelta(hours=1))
+        counts = verdict["category_counts"]
+        assert (counts["total"], counts["bullish"], counts["unpublished"], counts["rows_read"]) == (1, 1, 1, 1)
+        only = read_as_of(RegistryReader([reg_row("A", "bearish", 0.8, t1, None)]), t1 + timedelta(hours=1))
+        assert only["status"] == "no_data" and "1 row without published_at not visible" in only["reasoning"]
+
+    def test_naive_as_of_is_utc_and_bound(self) -> None:
+        t1 = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        registry = RegistryReader([reg_row("A", "bearish", 0.8, t1, t1)])
+        verdict = read_as_of(registry, datetime(2026, 11, 18, 13))
+        assert verdict["category_counts"]["total"] == 1
+        assert registry.params[-1]["as_of"] == datetime(2026, 11, 18, 13, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
 # thesis_scorer: the reader of these rows, and the FRAGILE regime context
 # ---------------------------------------------------------------------------
 
@@ -719,9 +876,11 @@ class TestThesisReader:
         return thesis_scorer._score_regime_changepoints(engine, 0.5), conn
 
     @staticmethod
-    def _row(sid, ticker, direction, conf, valid_from, status="live", break_date="2026-11-10", effective=None):
-        """(signal_id, ticker, direction, confidence, valid_from, status, break_date, effective_known_at)"""
-        return (sid, ticker, direction, conf, valid_from, status, break_date, effective or valid_from)
+    def _row(sid, ticker, direction, conf, valid_from, status="live", break_date="2026-11-10", effective=None,
+             unpublished=False):
+        """(signal_id, ticker, direction, confidence, valid_from, status, break_date, effective_known_at,
+        unpublished): a row as the reader's query returns it (already fenced)."""
+        return (sid, ticker, direction, conf, valid_from, status, break_date, effective or valid_from, unpublished)
 
     def test_reader_over_published_rows(self) -> None:
         from analysis import thesis_scorer
@@ -769,6 +928,17 @@ class TestThesisReader:
         assert verdict["status"] == "active"
         assert (counts["total"], counts["bearish"], counts["bullish"], counts["withdrawn"]) == (1, 1, 0, 1)
         assert "risk-off (vix_spot)" in verdict["reasoning"]
+
+    def test_live_call_fences_at_now(self) -> None:
+        verdict, conn = self._read([self._row("A", "vix_spot", "bearish", 1.0,
+                                              datetime.now(timezone.utc) - timedelta(hours=1))])
+        statement = conn.execute.call_args_list[-1].args[0]
+        sql, params = str(statement), statement.compile().params
+        assert "NOW()" not in sql
+        assert "valid_from <= :as_of" in sql and "CAST(metadata->>'published_at' AS timestamptz) <= :as_of" in sql
+        assert abs((params["as_of"] - datetime.now(timezone.utc)).total_seconds()) < 60
+        assert params["window_start"] == params["as_of"] - timedelta(days=FRESH_BREAK_DAYS)
+        assert verdict["category_counts"]["total"] == 1
 
     def test_freshness_is_measured_on_effective_known_at(self) -> None:
         # A revision written an hour ago does not make a break known six days ago fresh again.

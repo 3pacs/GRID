@@ -921,8 +921,8 @@ def _score_trust_convergence(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
-    """Regime changepoints: which declared regime features broke recently.
+def _score_regime_changepoints(engine: Engine, accuracy: float, as_of: datetime | None = None) -> dict:
+    """Regime changepoints: which declared regime features broke recently, as of ``as_of``.
 
     Logic: discovery/changepoint_detector.py writes one signal_registry row
     per point-in-time drift break on a declared regime feature (VIX, credit
@@ -930,14 +930,30 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
     stamped with its version in ``provenance``. ``direction`` is already the
     risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Counts *features*, not rows, in three steps:
+    ``as_of`` is an explicit instant (default: now, UTC; a naive value is
+    UTC). A row is visible at ``as_of`` only if both fences hold, each on the
+    row itself, in SQL and before any reconciliation:
+
+    * ``valid_from <= as_of``: its availability;
+    * ``metadata.published_at <= as_of``: the scan that actually wrote it.
+      A break's first row written by a late scan has valid_from = its
+      effective known-at, earlier than the scan; without this fence a replay
+      between the two would see a break GRID did not hold yet, and a
+      withdrawal or revision published after ``as_of`` could change what was
+      live then.
+
+    A row with no ``published_at`` (none is written by detector version 2)
+    is not visible and is counted as ``unpublished``.
+
+    Counts *features*, not visible rows, in three steps:
 
     1. Each break (``signal_id``) is reduced to its latest availability row
        (``valid_from``). A break re-evaluated on a later vintage has a later
        row of the same signal_id; one no longer detected has a row with
        metadata status ``withdrawn``.
     2. Breaks whose latest row is a withdrawal are dropped, and so are breaks
-       whose effective known-at is older than CHANGEPOINT_FRESH_DAYS.
+       whose effective known-at is older than CHANGEPOINT_FRESH_DAYS
+       before ``as_of``.
     3. Each feature counts once, by its surviving break with the latest
        break date, so withdrawing one break never hides another on the same
        feature.
@@ -958,6 +974,9 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
     CHANGEPOINT_CONFIDENCE_CAP.
     """
     try:
+        as_of = as_of or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
         with engine.connect() as conn:
             # Guard: table might not exist yet
             try:
@@ -970,40 +989,51 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
-            # valid_from >= effective known-at on every row, so this window
-            # holds every row whose break can still be fresh.
+            # Both fences on every row, before reconciliation. valid_from >=
+            # effective known-at on every row, so the window holds every row
+            # whose break can still be fresh at as_of. Rows without
+            # published_at come back flagged and are dropped below.
             rows = conn.execute(text(
                 "SELECT signal_id, ticker, direction, confidence, valid_from, "
                 "metadata->>'status', metadata->>'break_date', "
-                "COALESCE(CAST(metadata->>'effective_known_at' AS timestamptz), valid_from) "
+                "COALESCE(CAST(metadata->>'effective_known_at' AS timestamptz), valid_from), "
+                "metadata->>'published_at' IS NULL "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
                 "AND provenance = :version "
-                "AND valid_from <= NOW() "
-                "AND valid_from > NOW() - make_interval(days => :days) "
+                "AND valid_from <= :as_of "
+                "AND valid_from > :window_start "
+                "AND (metadata->>'published_at' IS NULL "
+                "OR CAST(metadata->>'published_at' AS timestamptz) <= :as_of) "
                 "ORDER BY valid_from DESC "
                 "LIMIT :row_limit"
             ).bindparams(
                 src="discovery.changepoint_detector",
                 stype="regime_change",
                 version=CHANGEPOINT_DETECTOR_VERSION,
-                days=CHANGEPOINT_FRESH_DAYS,
+                as_of=as_of,
+                window_start=as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS),
                 row_limit=1000,
             )).fetchall()
 
         window = f"{CHANGEPOINT_FRESH_DAYS}d"
+        unpublished_count = sum(1 for r in rows if r[8])
+        rows = [r for r in rows if not r[8]]
         if not rows:
             return _verdict(
                 "regime_changepoints", "Regime Changepoints",
                 0, 0, "no fresh breaks", "",
                 f"No declared regime feature has a break known in the last {window} "
-                f"(detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                f"as of {as_of.isoformat()} (detector {CHANGEPOINT_DETECTOR_VERSION}"
+                + (f"; {unpublished_count} row{'s' if unpublished_count != 1 else ''} without "
+                   "published_at not visible" if unpublished_count else "")
+                + ").",
                 status="no_data", historical_accuracy=accuracy,
             )
 
         # rows: (signal_id, ticker, direction, confidence, valid_from, status,
-        # break_date, effective_known_at), newest valid_from first.
+        # break_date, effective_known_at, unpublished), newest valid_from first.
         def _utc(ts: Any) -> Any:
             return ts if ts is None or ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
@@ -1017,7 +1047,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
         # 2. Drop withdrawn breaks, then breaks no longer fresh by effective known-at.
         live = [r for r in latest_by_break.values() if r[5] != "withdrawn"]
         withdrawn_count = len(latest_by_break) - len(live)
-        fresh_after = datetime.now(timezone.utc) - timedelta(days=CHANGEPOINT_FRESH_DAYS)
+        fresh_after = as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS)
         fresh = [r for r in live if _utc(r[7]) is not None and _utc(r[7]) > fresh_after]
         aged_count = len(live) - len(fresh)
         # 3. One break per feature: the latest break date, then the latest availability.
@@ -1033,7 +1063,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 0, 0, "no fresh breaks", "",
                 f"No live regime break known in the last {window}: {withdrawn_count} "
                 f"withdrawn on later data, {aged_count} older than the window "
-                f"(detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                f"(as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}).",
                 status="no_data", historical_accuracy=accuracy,
             )
         total = len(features)
@@ -1064,7 +1094,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
         if most_recent:
             try:
                 ts = most_recent if most_recent.tzinfo else most_recent.replace(tzinfo=timezone.utc)
-                age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                age_hours = (as_of - ts).total_seconds() / 3600
             except Exception as exc:
                 log.warning("Failed to compute regime changepoints age: {e}", e=exc)
 
@@ -1097,7 +1127,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                    else "Net risk-off regime shifts suggest deteriorating conditions. "
                    if net < 0
                    else "Balanced regime shifts — no clear directional signal. ")
-                + f"Point-in-time drift breaks, detector {CHANGEPOINT_DETECTOR_VERSION}."
+                + f"Point-in-time drift breaks as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}."
             ),
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
@@ -1106,7 +1136,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             "unit": "features", "rows_read": len(rows), "breaks_read": len(latest_by_break),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
-            "withdrawn": withdrawn_count, "aged_out": aged_count,
+            "withdrawn": withdrawn_count, "aged_out": aged_count, "unpublished": unpublished_count,
             "known_categories_exhaustive": other_count == 0,
         }
         return result

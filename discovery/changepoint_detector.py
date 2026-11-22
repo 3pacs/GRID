@@ -57,8 +57,10 @@ Detector version ``changepoint_detector/2``. What it does, in order:
      valid from the later of its own effective known-at and the scan that
      saw it, so a late or back-dated vintage can never move a break to an
      earlier ``valid_from``. Rows are only ever inserted, never updated.
-     Readers reduce each ``signal_id`` to its latest row first, then drop
-     withdrawn breaks, then pick per feature.
+     Readers fence every row on both ``valid_from`` and ``published_at``
+     at their as-of (a late first scan's row has valid_from = effective
+     known-at, before it was written), reduce each ``signal_id`` to its
+     latest visible row, drop withdrawn breaks, then pick per feature.
    * ``provenance`` = ``CHANGEPOINT_DETECTOR_VERSION`` on every row. Rows
      from the earlier detector have no provenance, and readers ignore them by
      version. Nothing is deleted.
@@ -702,14 +704,15 @@ def _base_meta(series_spec: RegimeFeature, feature: str, feature_id: int, signal
 
 
 def _signal_params(
-    b: FeatureBreak, as_of: date | None, *, valid_from: datetime | None = None,
-    supersedes: datetime | None = None, published_at: datetime | None = None,
+    b: FeatureBreak, as_of: date | None, *, published_at: datetime,
+    valid_from: datetime | None = None, supersedes: datetime | None = None,
     first_published_at: str | None = None,
 ) -> dict[str, Any]:
     """Bind parameters for one live row of a break.
 
     ``effective_known_at`` (inputs) and ``first_published_at`` /
-    ``published_at`` (the detector's scans) are separate fields.
+    ``published_at`` (the detector's scans) are separate fields. Every row
+    carries ``published_at``: readers fence on it as well as on valid_from.
     """
     sig = b.signal
     statistic = float(np.clip(sig.statistic or 0.0, -_STAT_CLIP, _STAT_CLIP))
@@ -724,7 +727,7 @@ def _signal_params(
         "known_at_date": b.known_at_date.isoformat(),
         "effective_known_at": b.effective_known_at.isoformat(),
         "first_published_at": first_published_at,
-        "published_at": published_at.isoformat() if published_at else None,
+        "published_at": published_at.isoformat(),
         "support_sha256": b.support_sha256,
         "supersedes_valid_from": supersedes.isoformat() if supersedes else None,
         "pre_regime": sig.pre_regime,
