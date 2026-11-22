@@ -27,10 +27,10 @@ class TestCombineVerdict:
         assert v == "no_trade"
         assert any("no_trade" in r for r in reasons)
 
-    def test_red_team_veto(self):
-        v, reasons = combine_verdict("high", 0.7, "robust", 0.95, red_team_risk=0.85)
-        assert v == "no_trade"
-        assert any("red-team" in r.lower() for r in reasons)
+    def test_red_team_advisory_only_does_not_veto(self):
+        # LLM red team is advisory only: high risk does not veto the verdict.
+        v, _reasons = combine_verdict("high", 0.7, "robust", 0.95, red_team_risk=0.85)
+        assert v == "high"
 
     def test_fragile_stress_downgrades_one_level(self):
         v, reasons = combine_verdict(
@@ -214,12 +214,13 @@ class TestShouldITrade:
         assert response.trade_ticket is ticket
         assert response.stage_errors == {}
 
-    def test_red_team_veto_zeros_verdict(self):
+    def test_red_team_high_risk_advisory_only_keeps_verdict(self):
         engine = MagicMock()
         pred = _mock_prediction()
         prov = _mock_provenance("high")
         pattern = SimpleNamespace(confidence_signal=0.75)
         stress = SimpleNamespace(robustness_label="robust", robustness_score=0.95)
+        ticket = SimpleNamespace(ticker="NVDA", verdict="high")
 
         with patch(
             "oracle.engine.EnsemblePredictor"
@@ -235,6 +236,9 @@ class TestShouldITrade:
         ), patch(
             "intelligence.counterfactual_stress.run_stress_test",
             return_value=stress,
+        ), patch(
+            "trading.trade_ticket_generator.generate_ticket",
+            return_value=ticket,
         ):
             MockPredictor.return_value.predict.return_value = pred
             response = should_i_trade(
@@ -245,9 +249,9 @@ class TestShouldITrade:
                 vol_30d=0.35,
             )
 
-        assert response.unified_verdict == "no_trade"
-        assert response.trade_ticket is None
-        assert any("red-team" in r.lower() for r in response.verdict_reasons)
+        assert response.unified_verdict == "high"
+        assert response.trade_ticket is ticket
+        assert response.red_team_report.epistemic_risk_score == 0.9
 
     def test_prediction_failure_partial_response(self):
         engine = MagicMock()

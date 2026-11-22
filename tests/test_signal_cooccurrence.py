@@ -507,17 +507,17 @@ class TestReadPath:
 
 
 class TestGetLiftMultiplier:
-    def test_no_history_returns_neutral(self) -> None:
+    def test_no_history_returns_none(self) -> None:
         engine = FakeEngine()
         result = get_lift_multiplier(
             engine, {"a": 0.4, "b": 0.4}
         )
-        assert result == 1.0
+        assert result is None
 
-    def test_single_firing_signal_returns_neutral(self) -> None:
+    def test_single_firing_signal_returns_none(self) -> None:
         engine = FakeEngine()
         result = get_lift_multiplier(engine, {"a": 0.5, "b": 0.05})
-        assert result == 1.0
+        assert result is None
 
     def test_compounding_pair(self) -> None:
         engine = FakeEngine()
@@ -556,29 +556,30 @@ class TestGetLiftMultiplier:
         result = get_lift_multiplier(engine, {"a": 0.4, "b": 0.4})
         assert 1.0 < result <= MAX_LIFT_MULTIPLIER
 
-    def test_db_failure_returns_neutral(self) -> None:
+    def test_db_failure_returns_none(self) -> None:
         engine = FakeEngine(should_fail=True)
         result = get_lift_multiplier(
             engine, {"a": 0.4, "b": 0.4}
         )
-        assert result == 1.0
+        assert result is None
 
     def test_stale_pair_stats_are_ignored(self) -> None:
         """2026-11-11: the table was last written 2026-05-17 and nothing
         refreshes it. Stats older than COOCCURRENCE_MAX_STALE_DAYS must not
-        move live conviction."""
+        move live conviction and report unavailable (None)."""
         from datetime import timedelta
 
         from intelligence import signal_cooccurrence as sc
 
         engine = FakeEngine()
         _saturate_pair(engine, "a", "b", hits=12, total=15)
-        assert get_lift_multiplier(engine, {"a": 0.4, "b": 0.4}) > 1.0
+        fresh = get_lift_multiplier(engine, {"a": 0.4, "b": 0.4})
+        assert fresh is not None and fresh > 1.0
 
         old = datetime.utcnow() - timedelta(days=sc.COOCCURRENCE_MAX_STALE_DAYS + 1)
         for row in engine.pairs.values():
             row["last_updated"] = old
-        assert get_lift_multiplier(engine, {"a": 0.4, "b": 0.4}) == 1.0
+        assert get_lift_multiplier(engine, {"a": 0.4, "b": 0.4}) is None
 
 
 # ── ensure_cooccurrence_table ────────────────────────────────────────────

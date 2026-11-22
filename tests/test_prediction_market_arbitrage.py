@@ -542,17 +542,16 @@ class TestArbitrageConvictionMultiplier:
         assert isinstance(m, float)
         assert m == pytest.approx(1.10)
 
-    def test_returns_one_on_engine_connect_failure(self) -> None:
+    def test_returns_none_on_engine_connect_failure(self) -> None:
         engine = FakeEngine(should_fail=True)
         m = arbitrage_conviction_multiplier(
             engine, ticker=TICKER, as_of=AS_OF, direction="bullish",
             horizon_days=HORIZON, oracle_confidence=0.72,
         )
-        # engine.connect() raises; get_market_implied_prob catches in its
-        # broad except → returns None → report is neutral → multiplier 1.00
-        assert m == 1.00
+        # engine.connect() raises; get_market_implied_prob returns None -> unavailable
+        assert m is None
 
-    def test_returns_one_when_db_raises_unknown_exception(self) -> None:
+    def test_returns_none_when_db_raises_unknown_exception(self) -> None:
         class ExplodingEngine:
             def connect(self) -> Any:
                 raise RuntimeError("boom")
@@ -562,7 +561,7 @@ class TestArbitrageConvictionMultiplier:
             ticker=TICKER, as_of=AS_OF, direction="bullish",
             horizon_days=HORIZON, oracle_confidence=0.72,
         )
-        assert m == 1.0
+        assert m is None
 
     def test_never_raises_on_bad_inputs(self) -> None:
         engine = FakeEngine(prediction_rows=[], oracle_rows=[])
@@ -570,7 +569,7 @@ class TestArbitrageConvictionMultiplier:
             engine, ticker="", as_of=AS_OF, direction="nonsense",
             horizon_days=-5, oracle_confidence=float("inf"),
         )
-        assert m == 1.0
+        assert m is None
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -592,11 +592,11 @@ def test_parse_signals_regime_garbage_defaults_neutral() -> None:
 # ── null_hypothesis_penalty shortcut ──────────────────────────────────────
 
 
-def test_null_hypothesis_penalty_returns_neutral_on_raise() -> None:
+def test_null_hypothesis_penalty_returns_none_on_raise() -> None:
     engine = FakeEngine(predictions=[])
     engine.raise_on_connect = True
     penalty = nhf.null_hypothesis_penalty(engine)
-    assert penalty == nhf.NEUTRAL_PENALTY
+    assert penalty is None
 
 
 def test_null_hypothesis_penalty_happy_path_matches_report() -> None:
@@ -607,9 +607,9 @@ def test_null_hypothesis_penalty_happy_path_matches_report() -> None:
     assert penalty == report.penalty_multiplier
 
 
-def test_null_hypothesis_penalty_neutral_on_thin_history() -> None:
+def test_null_hypothesis_penalty_none_on_thin_history() -> None:
     engine = FakeEngine(predictions=_make_rows(5, verdicts=["hit"]))
-    assert nhf.null_hypothesis_penalty(engine) == nhf.NEUTRAL_PENALTY
+    assert nhf.null_hypothesis_penalty(engine) is None
 
 
 # ── to_dict round-trip ───────────────────────────────────────────────────

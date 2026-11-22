@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from features.per_signal_brier import (
     SignalScorecard,
 )
+from intelligence.signal_convergence_scanner import ConvergenceReport
 from intelligence.signal_provenance import (
     CausationChain,
     SignalEvidence,
@@ -101,30 +102,29 @@ class TestAggregateConviction:
         base = compute_aggregate_conviction(ev)
         assert abs(base - 0.9) < 0.001
 
-    def test_disagreement_penalty(self):
+    def test_disagreement_not_double_counted_in_provenance(self):
+        # Disagreement is already applied to confidence in EnsemblePredictor.predict.
         card = _card("jodi_oil", 7, 50, 0.06, 1.5)
         ev = [SignalEvidence("jodi_oil", 1.0, card, "strong")]
         clean = compute_aggregate_conviction(ev, disagreement_score=0.0)
         dampened = compute_aggregate_conviction(ev, disagreement_score=1.0)
-        assert dampened < clean
-        # Max 40% dampening at disagreement=1.0 → 1.5 * 0.6 = 0.9
-        assert abs(dampened - 0.9) < 0.01
+        assert dampened == clean == 1.5
 
-    def test_fragility_penalty(self):
+    def test_fragility_not_double_counted_in_provenance(self):
+        # Fragility is already applied to confidence in EnsemblePredictor.predict.
         card = _card("jodi_oil", 7, 50, 0.06, 1.5)
         ev = [SignalEvidence("jodi_oil", 1.0, card, "strong")]
         clean = compute_aggregate_conviction(ev, fragility_multiplier=1.0)
         fragile = compute_aggregate_conviction(ev, fragility_multiplier=0.5)
-        assert fragile < clean
-        assert abs(fragile - 0.75) < 0.01  # 1.5 * 0.5 = 0.75
+        assert fragile == clean == 1.5
 
-    def test_red_team_penalty(self):
+    def test_red_team_advisory_only_in_provenance(self):
+        # LLM red team is advisory only: no numeric multiplier.
         card = _card("jodi_oil", 7, 50, 0.06, 1.5)
         ev = [SignalEvidence("jodi_oil", 1.0, card, "strong")]
         clean = compute_aggregate_conviction(ev, red_team_epistemic_risk=0.0)
         risky = compute_aggregate_conviction(ev, red_team_epistemic_risk=1.0)
-        assert risky < clean
-        assert abs(risky - 0.75) < 0.01  # 1.5 * (1 - 0.5*1.0) = 0.75
+        assert risky == clean == 1.5
 
     def test_fudge_alert_penalty(self):
         card = _card("jodi_oil", 7, 50, 0.06, 1.5)
@@ -289,16 +289,20 @@ class TestExtractCausation:
 class TestBuildReport:
     def test_high_verdict_end_to_end(self):
         engine = MagicMock()
-        # Mock scorecard returns (strong conviction for both signals)
-        strong_card = _card("flow_momentum", 7, 50, 0.06, 1.5)
-        other_card = _card("regime_contrarian", 7, 50, 0.07, 1.42)
+        # Mock scorecards keyed by contributing signal families (matching
+        # bootstrap_per_signal_brier / oracle_models.signal_families).
+        family_cards = {
+            "equity": _card("equity", 7, 50, 0.06, 1.5),
+            "flows": _card("flows", 7, 50, 0.06, 1.5),
+            "breadth": _card("breadth", 7, 50, 0.06, 1.5),
+            "vol": _card("vol", 7, 50, 0.07, 1.42),
+            "rates": _card("rates", 7, 50, 0.07, 1.42),
+            "credit": _card("credit", 7, 50, 0.07, 1.42),
+            "macro": _card("macro", 7, 50, 0.07, 1.42),
+        }
 
         def fake_get(eng, source, h, regime=None):
-            if source == "flow_momentum":
-                return strong_card
-            if source == "regime_contrarian":
-                return other_card
-            return None
+            return family_cards.get(source)
 
         with patch(
             "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
@@ -328,10 +332,27 @@ class TestBuildReport:
             "intelligence.signal_provenance.arbitrage_conviction_multiplier",
             return_value=1.0,
         ), patch(
-            "intelligence.signal_provenance.convergence_conviction_multiplier",
-            return_value=1.0,
+            "intelligence.signal_convergence_scanner.scan_convergence",
+            return_value=ConvergenceReport(
+                ticker="TEST",
+                as_of="2026-11-21",
+                window_days=7,
+                target_direction="bullish",
+                stream_signals=(),
+                n_active_streams=2,
+                n_aligned=2,
+                n_opposed=0,
+                convergence_score=0.5,
+                conviction_multiplier=1.0,
+                evidence_chain=(),
+                advisory="neutral",
+                missing_stream_count=6,
+            ),
         ), patch(
             "intelligence.signal_provenance.money_flow_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.memory_lesson_conviction_multiplier",
             return_value=1.0,
         ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
@@ -367,12 +388,12 @@ class TestBuildReport:
             )
         assert report.ticker == "NVDA"
         assert report.verdict == "high"
-        assert len(report.signal_evidence) == 2
+        assert len(report.signal_evidence) == 7
         assert report.aggregate_conviction >= 1.2
 
-    def test_no_trade_when_red_team_high(self):
+    def test_red_team_high_stays_advisory_in_report(self):
         engine = MagicMock()
-        strong_card = _card("flow_momentum", 7, 50, 0.06, 1.5)
+        strong_card = _card("equity", 7, 50, 0.06, 1.5)
 
         with patch(
             "intelligence.signal_provenance.get_scorecard_with_regime_fallback",
@@ -402,10 +423,27 @@ class TestBuildReport:
             "intelligence.signal_provenance.arbitrage_conviction_multiplier",
             return_value=1.0,
         ), patch(
-            "intelligence.signal_provenance.convergence_conviction_multiplier",
-            return_value=1.0,
+            "intelligence.signal_convergence_scanner.scan_convergence",
+            return_value=ConvergenceReport(
+                ticker="TEST",
+                as_of="2026-11-21",
+                window_days=7,
+                target_direction="bullish",
+                stream_signals=(),
+                n_active_streams=2,
+                n_aligned=2,
+                n_opposed=0,
+                convergence_score=0.5,
+                conviction_multiplier=1.0,
+                evidence_chain=(),
+                advisory="neutral",
+                missing_stream_count=6,
+            ),
         ), patch(
             "intelligence.signal_provenance.money_flow_conviction_multiplier",
+            return_value=1.0,
+        ), patch(
+            "intelligence.signal_provenance.memory_lesson_conviction_multiplier",
             return_value=1.0,
         ), patch(
             "intelligence.signal_provenance._recent_fudge_alerts",
@@ -424,8 +462,8 @@ class TestBuildReport:
                 model_votes=[{"model_name": "flow_momentum", "weight": 1.0}],
                 shapley_top_contributor="flow_momentum",
                 shapley_top_share=0.9,
-                fragility_multiplier=0.5,  # fragile
-                disagreement_score=0.8,    # disagreeing models
+                fragility_multiplier=0.5,  # displayed only (already in confidence)
+                disagreement_score=0.8,    # displayed only (already in confidence)
                 crowd_aligned=True,
                 market_implied_prob=0.4,
                 catalyst_type="",
@@ -434,10 +472,13 @@ class TestBuildReport:
             report = build_provenance_report(
                 engine,
                 prediction=pred,
-                red_team_epistemic_risk=0.9,  # red team screamed
+                red_team_epistemic_risk=0.9,  # advisory only
             )
-        # Heavy penalties should cascade to low verdict
-        assert report.verdict in ("low", "no_trade")
+        # Red team / fragility / disagreement stay displayed without penalizing conviction.
+        assert report.red_team_epistemic_risk == 0.9
+        assert report.fragility_multiplier == 0.5
+        assert report.disagreement_score == 0.8
+        assert report.verdict == "high"
 
     def test_fudge_alerts_penalize_conviction(self):
         engine = MagicMock()
@@ -482,8 +523,22 @@ class TestBuildReport:
             "intelligence.signal_provenance.arbitrage_conviction_multiplier",
             return_value=1.0,
         ), patch(
-            "intelligence.signal_provenance.convergence_conviction_multiplier",
-            return_value=1.0,
+            "intelligence.signal_convergence_scanner.scan_convergence",
+            return_value=ConvergenceReport(
+                ticker="TEST",
+                as_of="2026-11-21",
+                window_days=7,
+                target_direction="bullish",
+                stream_signals=(),
+                n_active_streams=2,
+                n_aligned=2,
+                n_opposed=0,
+                convergence_score=0.5,
+                conviction_multiplier=1.0,
+                evidence_chain=(),
+                advisory="neutral",
+                missing_stream_count=6,
+            ),
         ), patch(
             "intelligence.signal_provenance.money_flow_conviction_multiplier",
             return_value=1.0,

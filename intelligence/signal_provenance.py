@@ -30,9 +30,11 @@ classification (strong/neutral/weak/anti).
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -44,6 +46,7 @@ from features.per_signal_brier import (
 from features.regime_conditional_brier import (
     get_scorecard_with_regime_fallback,
 )
+from intelligence import signal_convergence_scanner as _convergence_mod
 from intelligence.confidence_bucket_tracker import (
     conviction_multiplier_for_bucket,
 )
@@ -66,9 +69,6 @@ from intelligence.reasoning_bank import (
     memory_lesson_conviction_multiplier,
 )
 from intelligence.short_squeeze_composite import squeeze_conviction_multiplier
-from intelligence.signal_convergence_scanner import (
-    convergence_conviction_multiplier,
-)
 from intelligence.signal_cooccurrence import get_lift_multiplier
 
 
@@ -171,7 +171,7 @@ class TradeProvenanceReport:
     disagreement_score: float
     crowd_aligned: bool
     market_implied_prob: float
-    red_team_epistemic_risk: float
+    red_team_epistemic_risk: float | None
     shipping_fudge_alerts: list[dict[str, Any]]
     causation: CausationChain
     cooccurrence_lift: float  # pair-lift multiplier ∈ [0.75, 1.25] (CAT-177 signal_cooccurrence)
@@ -189,10 +189,10 @@ class TradeProvenanceReport:
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
     memory_lesson_multiplier: float = 1.0  # ∈ [0.85, 1.15] (15th layer — reasoning_bank). Default 1.0 (neutral) so older callers remain valid.
     # Coverage (2026-09-10, GRID-4 pivot §2.2/§7): which adjuster layers
-    # actually computed a value, and how much Shapley weight sits on signals
-    # with a calibrated scorecard. A layer that failed or was never attempted
-    # is reported as absent instead of silently reading as neutral 1.0.
-    layer_coverage: dict[str, bool] = field(default_factory=dict)
+    # actually computed a value (True), failed/had no data (False), or are
+    # not applicable ("not_applicable", excluded from layers_total), plus
+    # how much Shapley weight sits on signals with a calibrated scorecard.
+    layer_coverage: dict[str, bool | str] = field(default_factory=dict)
     layers_present: int = 0
     layers_total: int = 0
     evidence_coverage: float = 0.0
@@ -217,7 +217,11 @@ class TradeProvenanceReport:
             "disagreement_score": round(self.disagreement_score, 4),
             "crowd_aligned": self.crowd_aligned,
             "market_implied_prob": round(self.market_implied_prob, 4),
-            "red_team_epistemic_risk": round(self.red_team_epistemic_risk, 4),
+            "red_team_epistemic_risk": (
+                round(self.red_team_epistemic_risk, 4)
+                if self.red_team_epistemic_risk is not None
+                else None
+            ),
             "shipping_fudge_alerts": self.shipping_fudge_alerts,
             "causation": self.causation.to_dict(),
             "cooccurrence_lift": round(self.cooccurrence_lift, 4),
@@ -245,17 +249,26 @@ class TradeProvenanceReport:
 # ── Aggregate conviction ──────────────────────────────────────────────────
 
 
-# The adjuster layers, in the order they were added. A layer is *present*
-# when its caller computed a real value; ``None`` means the upstream lookup
-# failed, had no data, or was never attempted. Presence is reported as
+# Quantitative provenance adjuster layers. A layer is *present* when its
+# upstream computed a real value; ``None`` means the upstream lookup failed,
+# had no data, was not applicable (e.g. shipping fudge alerts on a non-shipping
+# ticker), or was never attempted (``edge_signal``). Presence is reported as
 # coverage so the verdict can distinguish "checked and neutral" from "not
 # checked" — the distinction whose absence produced the 11.9%-hit-rate HIGH
 # bucket (docs/planning/GRID-4-PRODUCT-PIVOT.md §2.2 and §7; LEVER-PACKAGE.md
-# §3D / §7 T0.3). Before 2026-09-10 every missing layer read as 1.0.
+# §3D / §7 T0.3).
+#
+# Deliberately excluded from CONVICTION_LAYERS (and from the multiplier stack):
+# - ``disagreement`` and ``fragility``: already multiplied into
+#   ``EnsemblePrediction.confidence`` in ``oracle.engine.EnsemblePredictor.predict``
+#   (lines ~3014 and ~3062), and carried as dataclass defaults (0.0 / 1.0) that
+#   cannot distinguish a computed neutral value from a failure. Keeping them
+#   solely on the ``confidence`` axis prevents double-counting while still
+#   displaying both values on ``TradeProvenanceReport``.
+# - ``red_team``: advisory only (no numeric multiplier, no veto). An
+#   LLM-derived layer may affect conviction only after it passes the same
+#   out-of-sample gate as quantitative layers.
 CONVICTION_LAYERS: tuple[str, ...] = (
-    "disagreement",
-    "fragility",
-    "red_team",
     "fudge_alerts",
     "cooccurrence",
     "confidence_bucket",
@@ -271,6 +284,11 @@ CONVICTION_LAYERS: tuple[str, ...] = (
     "edge_signal",
 )
 
+# Sentinel stored in ``layer_coverage`` for layers that do not apply to a
+# given report (e.g. ``fudge_alerts`` on non-shipping-exposed tickers, or the
+# unwired ``edge_signal`` layer). Excluded from the coverage denominator.
+LAYER_NOT_APPLICABLE: str = "not_applicable"
+
 # Evidence rows whose scorecard has enough history to mean something.
 _CALIBRATED_CLASSIFICATIONS = frozenset({"strong", "neutral", "weak", "anti_predictive"})
 
@@ -280,16 +298,26 @@ class ConvictionAggregate:
     """Aggregate conviction plus the coverage that produced it."""
 
     value: float
-    layer_coverage: dict[str, bool]
+    layer_coverage: dict[str, bool | str]
     evidence_coverage: float
 
     @property
     def layers_present(self) -> int:
-        return sum(1 for present in self.layer_coverage.values() if present)
+        return sum(1 for status in self.layer_coverage.values() if status is True)
+
+    @property
+    def layers_not_applicable(self) -> int:
+        return sum(
+            1 for status in self.layer_coverage.values()
+            if status == LAYER_NOT_APPLICABLE
+        )
 
     @property
     def layers_total(self) -> int:
-        return len(self.layer_coverage)
+        return sum(
+            1 for status in self.layer_coverage.values()
+            if status != LAYER_NOT_APPLICABLE
+        )
 
     @property
     def layer_coverage_ratio(self) -> float:
@@ -338,6 +366,7 @@ def aggregate_conviction_with_coverage(
     money_flow_multiplier: float | None = None,
     memory_lesson_multiplier: float | None = None,
     edge_signal_multiplier: float | None = None,
+    not_applicable: Iterable[str] = (),
 ) -> ConvictionAggregate:
     """Combine per-signal conviction weights into a single scalar, and say
     which layers actually contributed.
@@ -349,9 +378,11 @@ def aggregate_conviction_with_coverage(
         aggregate = clamp(base × penalty, 0.0, 1.5)
 
     A layer passed as ``None`` is absent: it multiplies nothing (the value is
-    identical to the old neutral-1.0 behaviour) but is reported as
-    ``layer_coverage[name] = False``. Callers that want the scalar only use
-    :func:`compute_aggregate_conviction`.
+    identical to the old neutral-1.0 behaviour) and is reported as
+    ``layer_coverage[name] = False``. Layers named in ``not_applicable`` are
+    recorded as ``layer_coverage[name] = "not_applicable"`` and excluded from
+    the coverage denominator (``layers_total``). Callers that want the scalar
+    only use :func:`compute_aggregate_conviction`.
 
     ``cooccurrence_lift`` comes from ``intelligence.signal_cooccurrence.
     get_lift_multiplier`` (CAT-177): pairs of firing signals that
@@ -373,21 +404,30 @@ def aggregate_conviction_with_coverage(
         else:
             base += ev.shapley_weight * ev.scorecard.conviction_weight * override
 
-    coverage: dict[str, bool] = {}
+    coverage: dict[str, bool | str] = {}
+    na_layers = frozenset(not_applicable)
     penalty = 1.0
 
     def layer(name: str, value: Any, multiplier_of: Callable[[Any], float]) -> None:
         nonlocal penalty
+        if name in na_layers:
+            coverage[name] = LAYER_NOT_APPLICABLE
+            return
         present = value is not None
         coverage[name] = present
         if present:
             penalty *= multiplier_of(value)
 
-    layer("disagreement", disagreement_score,
-          lambda v: max(0.0, 1.0 - 0.4 * _clamp(v, 0.0, 1.0)))
-    layer("fragility", fragility_multiplier, lambda v: _clamp(v, 0.0, 1.5))
-    layer("red_team", red_team_epistemic_risk,
-          lambda v: max(0.0, 1.0 - 0.5 * _clamp(v, 0.0, 1.0)))
+    # Signature retains fragility_multiplier, disagreement_score, and
+    # red_team_epistemic_risk for caller compatibility, but none of the three
+    # are multiplied into aggregate conviction or counted in layer_coverage:
+    # - disagreement and fragility are already applied to confidence in
+    #   oracle.engine.EnsemblePredictor.predict() (~L3014, ~L3062) and act on
+    #   the verdict via the confidence axis alone (no double counting).
+    # - red_team is advisory only: an LLM-derived layer may affect conviction
+    #   only after it passes the same out-of-sample gate as quantitative layers.
+    _ = (fragility_multiplier, disagreement_score, red_team_epistemic_risk)
+
     layer("fudge_alerts", fudge_alert_count,
           lambda v: max(0.1, 1.0 - 0.15 * max(0, int(v))))
     layer("cooccurrence", cooccurrence_lift, lambda v: _clamp(v, 0.75, 1.25))
@@ -527,6 +567,10 @@ def _verdict_from_aggregate(
        pivot's rule that a signal whose layers cannot compute is not
        surfaced. Callers that pass no coverage keep the pre-gate behaviour.
     """
+    # Single-use axis note: ``confidence`` already incorporates engine-level
+    # disagreement and Shapley fragility dampening (oracle/engine.py ~L3014,
+    # ~L3062), while ``conviction`` no longer re-applies either penalty. Both
+    # verdict axes therefore stay orthogonal without double counting.
     if conviction < 0.3:
         return "no_trade"
     if conviction < 0.7 or confidence < 0.55:
@@ -571,59 +615,359 @@ def _verdict_reason(
     return f"{verdict}: conviction {conviction:.2f}, confidence {confidence:.2f}, coverage ok"
 
 
-# ── Shapley contribution extraction ───────────────────────────────────────
+# ── Shapley contribution extraction & model→signal key mapping ────────────
+
+
+def _normalize_weight_dict(raw: Any) -> dict[str, float]:
+    """Coerce a ``{key: weight}`` mapping into a normalized positive-finite dict."""
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    cleaned: dict[str, float] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k.strip():
+            continue
+        try:
+            w = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(w) or w <= 0.0:
+            continue
+        key = k.strip()
+        cleaned[key] = cleaned.get(key, 0.0) + w
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return {}
+    return {k: v / total for k, v in cleaned.items()}
+
+
+def _parse_string_list(raw: Any) -> list[str]:
+    """Parse a JSONB / list column into a clean list of non-empty strings."""
+    if raw is None:
+        return []
+    val = raw
+    if isinstance(val, (bytes, bytearray)):
+        try:
+            val = val.decode("utf-8")
+        except UnicodeDecodeError:
+            return []
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(val, (list, tuple)):
+        return []
+    return [s.strip() for s in val if isinstance(s, str) and s.strip()]
+
+
+def _default_model_signal_map() -> dict[str, list[str]]:
+    """Fallback model_name → signal_families/signal_sources map from code defaults.
+
+    Mirrors ``scripts/bootstrap_per_signal_brier.py`` Layer 2: prefers
+    ``oracle.engine.DEFAULT_MODELS`` ``signal_families`` (which bootstrap writes
+    into ``per_signal_brier_history``) and supplements with
+    ``oracle.model_factory._DEFAULT_SIGNAL_SOURCES`` for models not in
+    ``DEFAULT_MODELS`` (e.g. ``ai_trader_crowd``).
+    """
+    mapping: dict[str, list[str]] = {}
+    try:
+        from oracle.engine import DEFAULT_MODELS
+
+        for model in DEFAULT_MODELS:
+            fams = _parse_string_list(getattr(model, "signal_families", None))
+            if fams:
+                mapping[model.name] = fams
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from oracle.model_factory import _DEFAULT_SIGNAL_SOURCES
+
+        for name, sources in _DEFAULT_SIGNAL_SOURCES.items():
+            if name not in mapping:
+                parsed = _parse_string_list(sources)
+                if parsed:
+                    mapping[name] = parsed
+    except Exception:  # noqa: BLE001
+        pass
+    return mapping
+
+
+def _load_model_signal_map(
+    engine: Engine,
+    model_names: Iterable[str],
+) -> dict[str, list[str]]:
+    """Map oracle model names to their contributing signal families/sources.
+
+    Queries ``oracle_models`` (parameterized SQL) for ``signal_families`` /
+    ``signal_sources`` first, then fills any missing known models from code
+    defaults so scorecard lookups land in the same key space that
+    ``scripts/bootstrap_per_signal_brier.py`` writes.
+    """
+    names = sorted({str(n).strip() for n in model_names if isinstance(n, str) and n.strip()})
+    if not names:
+        return {}
+
+    mapping: dict[str, list[str]] = {}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT name, signal_families, signal_sources "
+                    "FROM oracle_models "
+                    "WHERE name = ANY(:names)"
+                ),
+                {"names": names},
+            ).fetchall()
+        for row in rows or []:
+            if not isinstance(row, (tuple, list)) and not hasattr(row, "__getitem__"):
+                continue
+            try:
+                name = row[0]
+                fams = _parse_string_list(row[1] if len(row) > 1 else None)
+                srcs = _parse_string_list(row[2] if len(row) > 2 else None)
+            except (IndexError, TypeError):
+                continue
+            if not isinstance(name, str) or not name.strip():
+                continue
+            resolved = fams or srcs
+            if resolved:
+                mapping[name.strip()] = resolved
+    except Exception as exc:  # noqa: BLE001
+        log.debug("signal_provenance: oracle_models lookup skipped: {e}", e=str(exc))
+
+    defaults = _default_model_signal_map()
+    for name in names:
+        if name not in mapping and name in defaults:
+            mapping[name] = defaults[name]
+    return mapping
 
 
 def _extract_signal_contributions(
     prediction: Any,
+    *,
+    model_signal_map: dict[str, list[str]] | None = None,
 ) -> dict[str, float]:
-    """Pull a normalized {signal_source: weight} dict out of an
+    """Pull a normalized ``{signal_source: weight}`` dict out of an
     ``EnsemblePrediction``.
 
-    The Shapley attribution from ALPHA-9 lives on the prediction in two
-    places: ``shapley_top_contributor`` / ``shapley_top_share`` carries
-    the dominant single source, and ``model_votes`` carries per-model
-    vote weights that can be decomposed into per-signal shares via the
-    model's ``signal_sources`` list (when available).
-
-    This helper is defensive: when model_votes is empty or lacks
-    contribution data, it falls back to a single-entry dict with the
-    top contributor at its reported share plus an implicit "other"
-    bucket for the remainder.
+    Resolution order:
+      1. Explicit per-signal ``signal_contributions`` on the prediction
+         (top-level attribute or nested inside ``prediction.signals``).
+      2. ``model_votes`` decomposed via each vote's own ``signal_sources`` /
+         ``signal_families`` (when present), or via ``model_signal_map``
+         (mapping oracle model names to their contributing signal families
+         so lookups match the Brier scorecard key space).
+      3. Fallback to ``shapley_top_contributor`` / ``shapley_top_share``
+         (also mapped through ``model_signal_map`` when provided) plus
+         ``"other"`` for any remainder.
     """
+    explicit = _normalize_weight_dict(getattr(prediction, "signal_contributions", None))
+    if explicit:
+        return explicit
+
+    signals_blob = getattr(prediction, "signals", None)
+    if isinstance(signals_blob, dict):
+        nested = _normalize_weight_dict(signals_blob.get("signal_contributions"))
+        if nested:
+            return nested
+
     contributions: dict[str, float] = {}
+    lookup = model_signal_map or {}
+
+    def _add_source_weight(name: str, weight: float) -> None:
+        mapped = lookup.get(name)
+        if mapped:
+            share = weight / len(mapped)
+            for sig in mapped:
+                contributions[sig] = contributions.get(sig, 0.0) + share
+        else:
+            contributions[name] = contributions.get(name, 0.0) + weight
 
     top_source = getattr(prediction, "shapley_top_contributor", "") or ""
     top_share = float(getattr(prediction, "shapley_top_share", 0.0) or 0.0)
 
     model_votes = list(getattr(prediction, "model_votes", []) or [])
-    # Per-model vote weight is roughly per-source weight when each
-    # model is single-source, which is a reasonable zeroth-order
-    # approximation.
     for vote in model_votes:
         if not isinstance(vote, dict):
             continue
-        source = vote.get("model_name") or vote.get("model") or vote.get("source")
-        weight = vote.get("weight") or vote.get("vote_weight") or 0.0
-        if not source or weight <= 0:
+        weight_raw = vote.get("weight") or vote.get("vote_weight") or 0.0
+        try:
+            weight = float(weight_raw)
+        except (TypeError, ValueError):
             continue
-        contributions[str(source)] = contributions.get(str(source), 0.0) + float(weight)
+        if not math.isfinite(weight) or weight <= 0.0:
+            continue
+
+        vote_signals = (
+            vote.get("signal_sources")
+            or vote.get("signal_families")
+        )
+        if isinstance(vote_signals, dict):
+            norm_vote = _normalize_weight_dict(vote_signals)
+            if norm_vote:
+                for sig, share in norm_vote.items():
+                    contributions[sig] = contributions.get(sig, 0.0) + weight * share
+                continue
+        else:
+            parsed_vote_signals = _parse_string_list(vote_signals)
+            if parsed_vote_signals:
+                share = weight / len(parsed_vote_signals)
+                for sig in parsed_vote_signals:
+                    contributions[sig] = contributions.get(sig, 0.0) + share
+                continue
+
+        source = vote.get("model_name") or vote.get("model") or vote.get("source")
+        if not source:
+            continue
+        _add_source_weight(str(source), weight)
 
     if not contributions and top_source:
-        # Fallback: the top contributor at its reported share, with
-        # the remainder attributed to an opaque "other" bucket so the
-        # weights sum to 1.0 and compute_aggregate_conviction is valid.
-        contributions[top_source] = top_share
+        _add_source_weight(str(top_source), top_share)
         if top_share < 1.0:
-            contributions["other"] = 1.0 - top_share
+            contributions["other"] = contributions.get("other", 0.0) + (1.0 - top_share)
 
     total = sum(contributions.values())
-    if total <= 0:
+    if total <= 0.0:
         return {}
     return {k: v / total for k, v in contributions.items()}
 
 
-# ── Shipping fudge alert lookup ───────────────────────────────────────────
+def _resolve_signal_contributions(
+    engine: Engine,
+    prediction: Any,
+) -> dict[str, float]:
+    """Resolve per-signal/family contributions for ``prediction`` using
+    ``oracle_models`` to translate model names into their signal key space.
+    """
+    raw_names: list[str] = []
+    for vote in list(getattr(prediction, "model_votes", []) or []):
+        if isinstance(vote, dict):
+            name = vote.get("model_name") or vote.get("model") or vote.get("source")
+            if isinstance(name, str) and name.strip():
+                raw_names.append(name.strip())
+    top_source = getattr(prediction, "shapley_top_contributor", "") or ""
+    if isinstance(top_source, str) and top_source.strip():
+        raw_names.append(top_source.strip())
+
+    model_signal_map = _load_model_signal_map(engine, raw_names)
+    return _extract_signal_contributions(prediction, model_signal_map=model_signal_map)
+
+
+def _lookup_scorecard(
+    engine: Engine,
+    source: str,
+    horizon_days: int,
+    regime: str | None,
+) -> SignalScorecard | None:
+    """Look up a per-signal/regime scorecard, reconciling ``feature:<family>``
+    and bare ``<family>`` key spellings written by different bootstrap paths.
+    """
+    card = get_scorecard_with_regime_fallback(engine, source, horizon_days, regime)
+    if card is not None:
+        return card
+    if source.startswith("feature:"):
+        bare = source.split(":", 1)[1].strip()
+        if bare:
+            return get_scorecard_with_regime_fallback(engine, bare, horizon_days, regime)
+    elif ":" not in source and source not in ("other", "oracle_aggregate"):
+        return get_scorecard_with_regime_fallback(
+            engine, f"feature:{source}", horizon_days, regime
+        )
+    return None
+
+
+# ── Shipping fudge alert lookup (sector-gated) ────────────────────────────
+
+
+# Sectors materially exposed to maritime/freight/port statistics, using the
+# canonical sector taxonomy from ``analysis.sector_map.SECTOR_MAP`` and
+# ``analysis.market_universe.MARKET_UNIVERSE`` (stored lowercase for case-
+# insensitive matching, plus ``marine`` / ``transportation`` aliases).
+SHIPPING_EXPOSED_SECTORS: frozenset[str] = frozenset({
+    "industrials",
+    "transportation",
+    "transportation & logistics",
+    "marine",
+    "energy",
+    "materials",
+})
+
+_TICKER_SECTORS_CACHE: dict[str, frozenset[str]] | None = None
+
+
+def _load_ticker_sector_index() -> dict[str, frozenset[str]]:
+    """Build a cached ``{TICKER: frozenset[sector_lower]}`` index from the
+    codebase's existing ticker sector taxonomies (``SECTOR_MAP`` and
+    ``MARKET_UNIVERSE``). Never raises.
+    """
+    global _TICKER_SECTORS_CACHE
+    if _TICKER_SECTORS_CACHE is not None:
+        return _TICKER_SECTORS_CACHE
+
+    acc: dict[str, set[str]] = {}
+
+    def _add(ticker_raw: Any, sector_raw: Any) -> None:
+        if not isinstance(ticker_raw, str) or not isinstance(sector_raw, str):
+            return
+        t = ticker_raw.strip().upper()
+        s = sector_raw.strip().lower()
+        if t and s:
+            acc.setdefault(t, set()).add(s)
+
+    try:
+        from analysis.sector_map import SECTOR_MAP
+
+        for sector_name, sector_data in (SECTOR_MAP or {}).items():
+            if not isinstance(sector_data, dict):
+                continue
+            _add(sector_data.get("etf"), sector_name)
+            for sub in (sector_data.get("subsectors") or {}).values():
+                if not isinstance(sub, dict):
+                    continue
+                for actor in sub.get("actors") or []:
+                    if not isinstance(actor, dict):
+                        continue
+                    if actor.get("type") == "company":
+                        _add(actor.get("ticker"), sector_name)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("signal_provenance: SECTOR_MAP load skipped: {e}", e=str(exc))
+
+    try:
+        from analysis.market_universe import MARKET_UNIVERSE
+
+        for sector_name, sector_data in (MARKET_UNIVERSE or {}).items():
+            if not isinstance(sector_data, dict):
+                continue
+            _add(sector_data.get("etf"), sector_name)
+            for ind_name, ind_data in (sector_data.get("industries") or {}).items():
+                if not isinstance(ind_data, dict):
+                    continue
+                _add(ind_data.get("etf"), sector_name)
+                for comp in ind_data.get("companies") or []:
+                    if isinstance(comp, dict):
+                        _add(comp.get("ticker"), sector_name)
+                        if isinstance(ind_name, str) and "transport" in ind_name.lower():
+                            _add(comp.get("ticker"), "transportation")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("signal_provenance: MARKET_UNIVERSE load skipped: {e}", e=str(exc))
+
+    _TICKER_SECTORS_CACHE = {k: frozenset(v) for k, v in acc.items()}
+    return _TICKER_SECTORS_CACHE
+
+
+def _is_shipping_exposed_ticker(ticker: str) -> bool:
+    """True iff ``ticker`` belongs to a sector in :data:`SHIPPING_EXPOSED_SECTORS`.
+
+    Fails closed (returns ``False``) for empty or unknown tickers so shipping
+    alerts never penalize unexposed names.
+    """
+    symbol = (ticker or "").strip().upper()
+    if not symbol:
+        return False
+    sectors = _load_ticker_sector_index().get(symbol)
+    if not sectors:
+        return False
+    return bool(sectors & SHIPPING_EXPOSED_SECTORS)
 
 
 def _recent_fudge_alerts(
@@ -631,14 +975,22 @@ def _recent_fudge_alerts(
     *,
     ticker: str,
     window_days: int = 7,
-) -> list[dict[str, Any]]:
-    """Pull any shipping-category cross-reference alerts from the last
-    ``window_days`` that could plausibly overlap the ticker's sector.
+) -> list[dict[str, Any]] | None:
+    """Pull shipping-category cross-reference alerts from the last
+    ``window_days`` for tickers in :data:`SHIPPING_EXPOSED_SECTORS`.
 
-    This is a generous match — we don't have a ticker→port lookup yet,
-    so every shipping alert bubbles up to commodity/industrial tickers
-    and the trader can filter. Future work: build a sector→port map.
+    Returns:
+      - ``None`` when ``ticker`` is not in a shipping-exposed sector (layer
+        not applicable / unavailable) OR when the DB lookup fails.
+      - A list of alert dicts (possibly empty ``[]`` when checked cleanly with
+        zero active alerts) for shipping-exposed tickers.
     """
+    if not _is_shipping_exposed_ticker(ticker):
+        log.debug(
+            "signal_provenance: shipping fudge alerts unavailable for non-shipping ticker {t}",
+            t=ticker,
+        )
+        return None
     try:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -662,7 +1014,7 @@ def _recent_fudge_alerts(
             "signal_provenance: fudge alert lookup failed for {t}: {e}",
             t=ticker, e=str(exc),
         )
-        return []
+        return None
 
 
 # ── Causation chain extraction ────────────────────────────────────────────
@@ -703,6 +1055,46 @@ def _extract_causation(prediction: Any) -> CausationChain:
     )
 
 
+# ── Coercion & convergence scanner lookup ───────────────────────────────────
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _lookup_convergence(
+    engine: Engine,
+    *,
+    ticker: str,
+    as_of: date,
+    target_direction: str,
+    window_days: int = 7,
+) -> float | None:
+    """Query ``signal_convergence_scanner.scan_convergence`` so empty scans
+    report ``None`` instead of 1.0 without editing the scanner module.
+    """
+    report = _convergence_mod.scan_convergence(
+        engine,
+        ticker=ticker,
+        as_of=as_of,
+        target_direction=target_direction,
+        window_days=window_days,
+    )
+    if report.n_active_streams <= 0:
+        log.debug(
+            "signal_provenance: convergence unavailable for {t} (0 active streams)",
+            t=ticker,
+        )
+        return None
+    return _finite_float_or_none(report.conviction_multiplier)
+
+
 # ── Main entry point ──────────────────────────────────────────────────────
 
 
@@ -710,7 +1102,7 @@ def build_provenance_report(
     engine: Engine,
     *,
     prediction: Any,
-    red_team_epistemic_risk: float = 0.0,
+    red_team_epistemic_risk: float | None = None,
 ) -> TradeProvenanceReport:
     """Build the full per-ticker provenance report from an
     ``EnsemblePrediction``.
@@ -725,17 +1117,15 @@ def build_provenance_report(
     horizon_days = int(getattr(prediction, "horizon", 7) or 7)
     regime = getattr(prediction, "regime", None) or None
 
-    contributions = _extract_signal_contributions(prediction)
+    contributions = _resolve_signal_contributions(engine, prediction)
 
     signal_evidence: list[SignalEvidence] = []
     regime_calibrated_count = 0
     for source, weight in contributions.items():
         # Regime-conditional Brier first, with graceful fallback to the
-        # flat per-signal scorecard (CAT-180 wiring). The fallback API
-        # guarantees we never have to branch here.
-        scorecard = get_scorecard_with_regime_fallback(
-            engine, source, horizon_days, regime
-        )
+        # flat per-signal scorecard (CAT-180 wiring), reconciled across
+        # bare family and ``feature:<family>`` spellings.
+        scorecard = _lookup_scorecard(engine, source, horizon_days, regime)
         if scorecard is not None and regime is not None:
             regime_calibrated_count += 1
         signal_evidence.append(
@@ -747,26 +1137,33 @@ def build_provenance_report(
             )
         )
 
-    fudge_alerts = _recent_fudge_alerts(engine, ticker=ticker)
+    # Non-applicable layers are kept in layer_coverage as "not_applicable"
+    # and excluded from the coverage denominator (layers_total).
+    not_applicable_layers: list[str] = ["edge_signal"]
+    if _is_shipping_exposed_ticker(ticker):
+        fudge_alerts_raw = _recent_fudge_alerts(engine, ticker=ticker)
+    else:
+        fudge_alerts_raw = None
+        not_applicable_layers.append("fudge_alerts")
     causation = _extract_causation(prediction)
 
-    # Pair lift multiplier (CAT-177): history of which firing signal
-    # pairs amplify or drag each other down. Neutral 1.0 if fewer than
-    # two firing signals or no calibrated pair stats.
+    # Pair lift multiplier (CAT-177): None if fewer than two firing signals,
+    # stale, uncalibrated, or lookup fails.
     try:
-        cooccurrence_lift = float(get_lift_multiplier(engine, contributions))
+        cooccurrence_lift = _finite_float_or_none(
+            get_lift_multiplier(engine, contributions)
+        )
     except Exception as exc:  # noqa: BLE001
         log.debug(
             "signal_provenance: cooccurrence lift lookup failed: {e}", e=str(exc)
         )
         cooccurrence_lift = None
 
-    # Confidence-bucket calibration (CAT-180): does the oracle's claimed
-    # probability match reality in this bucket historically? Over-confident
-    # buckets get dampened, under-confident ones get a mild boost.
+    # Confidence-bucket calibration (CAT-180): None on cold-start / missing /
+    # DB error so absence is counted honestly in coverage.
     conf_value = float(getattr(prediction, "confidence", 0.0) or 0.0)
     try:
-        confidence_bucket_mult = float(
+        confidence_bucket_mult = _finite_float_or_none(
             conviction_multiplier_for_bucket(
                 engine, confidence=conf_value, horizon_days=horizon_days
             )
@@ -777,14 +1174,15 @@ def build_provenance_report(
         )
         confidence_bucket_mult = None
 
-    # Historical scenario analog multiplier (CAT-176): how did setups that
-    # looked like TODAY'S macro snapshot actually play out? Uses PIT price
-    # replay internally so no lookahead leak.
+    today = date.today()
+    direction_str = str(getattr(prediction, "direction", "") or "")
+
+    # Historical scenario analog multiplier (CAT-176).
     try:
-        scenario_mult = float(
+        scenario_mult = _finite_float_or_none(
             scenario_conviction_multiplier(
                 engine,
-                as_of=date.today(),
+                as_of=today,
                 horizon_days=horizon_days,
                 direction=getattr(prediction, "direction", None),
             )
@@ -795,10 +1193,9 @@ def build_provenance_report(
         )
         scenario_mult = None
 
-    # Null hypothesis skeptic penalty (CAT-186): if the oracle barely
-    # beats a dumb baseline on its recent history, haircut the conviction.
+    # Null hypothesis skeptic penalty (CAT-186).
     try:
-        null_penalty = float(
+        null_penalty = _finite_float_or_none(
             null_hypothesis_penalty(engine, horizon_days=horizon_days)
         )
     except Exception as exc:  # noqa: BLE001
@@ -807,11 +1204,7 @@ def build_provenance_report(
         )
         null_penalty = None
 
-    today = date.today()
-    direction_str = str(getattr(prediction, "direction", "") or "")
-
-    # Meta-learning per-condition edge (CAT-193): has this signal×regime×
-    # vol×fci combination historically produced edge, or has it been noise?
+    # Meta-learning per-condition edge (CAT-193).
     try:
         signals_blob = getattr(prediction, "signals", None) or {}
         vix_level = None
@@ -823,7 +1216,7 @@ def build_provenance_report(
             fci_regime=getattr(prediction, "fci_regime", None),
             vix_level=vix_level,
         )
-        meta_mult = float(
+        meta_mult = _finite_float_or_none(
             get_aggregate_weight_multiplier(
                 engine,
                 signal_contributions=contributions,
@@ -836,10 +1229,9 @@ def build_provenance_report(
         )
         meta_mult = None
 
-    # Contra-indicator ensemble (CAT-184): is retail/sell-side extreme in
-    # a direction that favors (or opposes) this trade?
+    # Contra-indicator ensemble (CAT-184).
     try:
-        contra_mult = float(
+        contra_mult = _finite_float_or_none(
             contra_conviction_multiplier(
                 engine, as_of=today, trade_direction=direction_str
             )
@@ -850,11 +1242,9 @@ def build_provenance_report(
         )
         contra_mult = None
 
-    # Short squeeze composite (CAT-138): per-ticker squeeze loadedness —
-    # bullish calls on high-squeeze names get a boost, bearish gets a
-    # haircut (shorting loaded guns is dangerous).
+    # Short squeeze composite (CAT-138).
     try:
-        squeeze_mult = float(
+        squeeze_mult = _finite_float_or_none(
             squeeze_conviction_multiplier(
                 engine,
                 ticker=ticker,
@@ -868,9 +1258,9 @@ def build_provenance_report(
         )
         squeeze_mult = None
 
-    # Prediction-market arbitrage (CAT-183): oracle-vs-Polymarket edge.
+    # Prediction-market arbitrage (CAT-183).
     try:
-        arb_mult = float(
+        arb_mult = _finite_float_or_none(
             arbitrage_conviction_multiplier(
                 engine,
                 ticker=ticker,
@@ -886,20 +1276,15 @@ def build_provenance_report(
         )
         arb_mult = None
 
-    # Convergence scanner — the dots-connector. Scans congressional /
-    # insider / dark-pool / options-flow / smart-money / 13F / social /
-    # prediction-market streams for orthogonal confirmation of the
-    # target direction in the last 7 days. Rewards rare multi-stream
-    # alignment; penalizes when orthogonal streams oppose the call.
+    # Convergence scanner (dots-connector) — uses scan_convergence report API
+    # without editing signal_convergence_scanner.py.
     try:
-        convergence_mult = float(
-            convergence_conviction_multiplier(
-                engine,
-                ticker=ticker,
-                as_of=today,
-                target_direction=direction_str,
-                window_days=7,
-            )
+        convergence_mult = _lookup_convergence(
+            engine,
+            ticker=ticker,
+            as_of=today,
+            target_direction=direction_str,
+            window_days=7,
         )
     except Exception as exc:  # noqa: BLE001
         log.debug(
@@ -907,11 +1292,9 @@ def build_provenance_report(
         )
         convergence_mult = None
 
-    # Money flow engine (14th adjuster layer). Walks the 8-layer
-    # junction-point graph and returns [0.70, 1.30] based on whether
-    # the trade is aligned with inferred global capital rotation.
+    # Money flow engine (14th adjuster layer).
     try:
-        money_flow_mult = float(
+        money_flow_mult = _finite_float_or_none(
             money_flow_conviction_multiplier(
                 engine,
                 as_of=today,
@@ -924,10 +1307,7 @@ def build_provenance_report(
         )
         money_flow_mult = None
 
-    # ReasoningBank prior (15th adjuster layer). Counts outcome classes
-    # of past distilled lessons matching this (ticker, direction, regime,
-    # horizon) fingerprint. Narrow range [0.85, 1.15] — a prior, not
-    # direct evidence. Empty bank → neutral 1.0.
+    # ReasoningBank prior (15th adjuster layer).
     try:
         memory_fp: dict[str, Any] = {}
         if ticker:
@@ -944,7 +1324,7 @@ def build_provenance_report(
             memory_fp["horizon_bucket"] = _bh(int(horizon_days))
         except Exception:
             pass
-        memory_lesson_mult = float(
+        memory_lesson_mult = _finite_float_or_none(
             memory_lesson_conviction_multiplier(engine, fingerprint=memory_fp)
         )
     except Exception as exc:  # noqa: BLE001
@@ -953,17 +1333,15 @@ def build_provenance_report(
         )
         memory_lesson_mult = None
 
-    # Prediction-level adjusters are absent (None) when the prediction object
-    # does not carry them, instead of reading as neutral.
+    # Prediction-level fields kept for report display only (disagreement and
+    # fragility are already applied to confidence in EnsemblePredictor.predict;
+    # red_team is advisory only).
     fragility_raw = getattr(prediction, "fragility_multiplier", None)
     disagreement_raw = getattr(prediction, "disagreement_score", None)
 
     agg = aggregate_conviction_with_coverage(
         signal_evidence,
-        fragility_multiplier=(None if fragility_raw is None else float(fragility_raw)),
-        disagreement_score=(None if disagreement_raw is None else float(disagreement_raw)),
-        red_team_epistemic_risk=float(red_team_epistemic_risk or 0.0),
-        fudge_alert_count=len(fudge_alerts),
+        fudge_alert_count=(None if fudge_alerts_raw is None else len(fudge_alerts_raw)),
         cooccurrence_lift=cooccurrence_lift,
         confidence_bucket_multiplier=confidence_bucket_mult,
         scenario_multiplier=scenario_mult,
@@ -975,6 +1353,8 @@ def build_provenance_report(
         convergence_multiplier=convergence_mult,
         money_flow_multiplier=money_flow_mult,
         memory_lesson_multiplier=memory_lesson_mult,
+        edge_signal_multiplier=None,
+        not_applicable=not_applicable_layers,
     )
     aggregate = agg.value
 
@@ -1017,8 +1397,8 @@ def build_provenance_report(
         market_implied_prob=float(
             getattr(prediction, "market_implied_prob", 0.0) or 0.0
         ),
-        red_team_epistemic_risk=float(red_team_epistemic_risk or 0.0),
-        shipping_fudge_alerts=fudge_alerts,
+        red_team_epistemic_risk=_finite_float_or_none(red_team_epistemic_risk),
+        shipping_fudge_alerts=([] if fudge_alerts_raw is None else list(fudge_alerts_raw)),
         causation=causation,
         cooccurrence_lift=_or1(cooccurrence_lift),
         regime_calibrated_signal_count=regime_calibrated_count,

@@ -665,27 +665,23 @@ def get_aggregate_weight_multiplier(
     *,
     signal_contributions: dict[str, float],
     condition: ConditionTuple,
-) -> float:
+) -> float | None:
     """Weighted harmonic mean of per-signal multipliers in this condition.
 
     Weights come from ``signal_contributions`` (Shapley weights). Only
     signals that (a) are firing (weight >= SHAPLEY_FIRING_THRESHOLD)
-    AND (b) have a non-neutral resolved multiplier (i.e. their cell
-    passed the ``MIN_META_SAMPLES`` gate) participate.
+    AND (b) have a calibrated cell (passed the ``MIN_META_SAMPLES`` gate)
+    participate.
 
-    Returns 1.0 when no signal has enough history — the fallback keeps
-    the stack bounded even during cold start. The harmonic mean is the
-    correct aggregation for "multiply N independent log-space
-    adjusters": it matches how fragility × red-team × co-occurrence
-    already stack upstream, and it punishes a single very-low
-    multiplier harder than an arithmetic mean would.
+    Returns ``None`` when no signal has enough history or lookup fails, so
+    provenance reports the layer as unavailable rather than neutral 1.0.
 
         weighted_harmonic(w_i, m_i) = (Σ w_i) / (Σ w_i / m_i)
 
     Never raises.
     """
     if not signal_contributions:
-        return 1.0
+        return None
 
     total_weight = 0.0
     total_weight_over_multiplier = 0.0
@@ -718,10 +714,10 @@ def get_aggregate_weight_multiplier(
             "meta_learning_matrix.get_aggregate_weight_multiplier failed: {e}",
             e=str(exc),
         )
-        return 1.0
+        return None
 
     if total_weight <= 0.0 or total_weight_over_multiplier <= 0.0:
-        return 1.0
+        return None
 
     aggregate = total_weight / total_weight_over_multiplier
     return max(

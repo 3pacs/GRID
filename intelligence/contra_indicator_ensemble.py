@@ -734,18 +734,12 @@ def contra_conviction_multiplier(
     *,
     as_of: date,
     trade_direction: str,
-) -> float:
-    """Live-path convenience. Returns a multiplier to apply to conviction.
+) -> float | None:
+    """Live-path convenience. Returns a multiplier to apply to conviction,
+    or ``None`` when all indicators are missing or lookup fails.
 
-    Callers (e.g. ``signal_provenance.build_provenance_report``) can do::
-
-        mult = contra_conviction_multiplier(
-            engine, as_of=today, trade_direction='bullish',
-        )
-        conviction *= mult
-
-    Never raises. Returns :data:`MULT_NEUTRAL` (``1.0``) on any failure or
-    unknown ``trade_direction``.
+    Never raises. Returns ``None`` on failure or missing indicator data so
+    provenance reports the layer as unavailable rather than neutral 1.0.
     """
     try:
         report = build_contra_report(engine, as_of=as_of)
@@ -754,16 +748,22 @@ def contra_conviction_multiplier(
             "contra_indicator_ensemble: build_contra_report raised: {e}",
             e=exc,
         )
-        return MULT_NEUTRAL
+        return None
+
+    if not report.indicators or report.missing_indicator_count >= len(report.indicators):
+        log.debug(
+            "contra_indicator_ensemble: all indicators missing; layer unavailable"
+        )
+        return None
 
     try:
-        return _multiplier_from_report(report, trade_direction)
+        return float(_multiplier_from_report(report, trade_direction))
     except Exception as exc:  # pragma: no cover
         log.warning(
             "contra_indicator_ensemble: multiplier lookup failed: {e}",
             e=exc,
         )
-        return MULT_NEUTRAL
+        return None
 
 
 __all__ = [

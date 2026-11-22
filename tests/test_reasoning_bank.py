@@ -420,12 +420,12 @@ def _mk_lesson(outcome: str, direction: str = "long") -> ReasoningLesson:
     )
 
 
-def test_memory_lesson_multiplier_empty_bank_returns_neutral(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_memory_lesson_multiplier_empty_bank_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_retrieve(monkeypatch, [])
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(), fingerprint={"ticker": "TSM", "direction": "long"},
     )
-    assert mult == 1.0
+    assert mult is None
 
 
 def test_memory_lesson_multiplier_one_sided_record_is_neutral(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -478,10 +478,10 @@ def test_memory_lesson_multiplier_balanced_returns_neutral(monkeypatch: pytest.M
 
 
 def test_memory_lesson_multiplier_neutral_lessons_apply_mild_haircut(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Neutral lessons alone are not a record (neutral); beside a two-sided
-    # one they are a mild haircut.
+    # Neutral lessons alone are not a two-sided record (unavailable -> None);
+    # beside a two-sided one they are a mild haircut.
     _stub_retrieve(monkeypatch, [_mk_lesson("neutral") for _ in range(4)])
-    assert memory_lesson_conviction_multiplier(_FakeEngine(), fingerprint={"direction": "long"}) == 1.0
+    assert memory_lesson_conviction_multiplier(_FakeEngine(), fingerprint={"direction": "long"}) is None
     _stub_retrieve(monkeypatch, [_mk_lesson("success")] * 3 + [_mk_lesson("failure")] * 3
                    + [_mk_lesson("neutral")] * 4)
     mult = memory_lesson_conviction_multiplier(
@@ -502,7 +502,7 @@ def test_memory_lesson_multiplier_filters_direction_when_required(monkeypatch: p
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(), fingerprint={"direction": "long"},
     )
-    assert mult == 1.0
+    assert mult is None
 
 
 def test_memory_lesson_multiplier_includes_all_when_match_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -526,18 +526,19 @@ def test_memory_lesson_multiplier_defensive_on_retrieve_exception(monkeypatch: p
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(), fingerprint={"direction": "long"},
     )
-    assert mult == 1.0
+    assert mult is None
 
 
 def test_memory_lesson_multiplier_clamps_within_range(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Even pathological mixes must stay within [0.85, 1.15].
+    # Even heavily skewed two-sided mixes must stay within [0.85, 1.15].
     _stub_retrieve(
         monkeypatch,
-        [_mk_lesson("success") for _ in range(20)] + [_mk_lesson("neutral")],
+        [_mk_lesson("success")] * 20 + [_mk_lesson("failure")] * 3 + [_mk_lesson("neutral")],
     )
     mult = memory_lesson_conviction_multiplier(
         _FakeEngine(), fingerprint={"direction": "long"},
     )
+    assert mult is not None
     assert MEMORY_LESSON_MULT_MIN <= mult <= MEMORY_LESSON_MULT_MAX
 
 

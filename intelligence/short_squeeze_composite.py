@@ -481,12 +481,13 @@ def squeeze_conviction_multiplier(
     ticker: str,
     as_of: date,
     trade_direction: str,
-) -> float:
-    """Return a conviction multiplier ``∈ {0.90, 1.00, 1.05, 1.10, 1.15}``.
+) -> float | None:
+    """Return a conviction multiplier ``∈ {0.90, 1.00, 1.05, 1.10, 1.15}``,
+    or ``None`` when all components are missing or lookup fails.
 
-    Intended to be called from the live signal provenance path and from the
-    trade-ticket generator. This function NEVER raises — any failure returns
-    ``1.0`` so an upstream bug can never blow up a trade recommendation.
+    Intended to be called from the live signal provenance path. This function
+    NEVER raises — any failure or missing data returns ``None`` so provenance
+    reports the layer as unavailable rather than neutral 1.0.
     """
     try:
         report = compute_squeeze_report(engine, ticker=ticker, as_of=as_of)
@@ -494,8 +495,14 @@ def squeeze_conviction_multiplier(
         log.warning(
             "squeeze_conviction_multiplier failed for {t}: {e}", t=ticker, e=exc
         )
-        return 1.0
-    return _multiplier_for(report.squeeze_probability, trade_direction)
+        return None
+    if not report.components or report.missing_component_count >= len(report.components):
+        log.debug(
+            "squeeze_conviction_multiplier: all components missing for {t}; layer unavailable",
+            t=ticker,
+        )
+        return None
+    return float(_multiplier_for(report.squeeze_probability, trade_direction))
 
 
 # ---------------------------------------------------------------------------

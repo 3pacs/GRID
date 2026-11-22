@@ -42,6 +42,7 @@ from intelligence.signal_provenance import (
     CausationChain,
     SignalEvidence,
     TradeProvenanceReport,
+    _is_shipping_exposed_ticker,
     _verdict_from_aggregate,
     compute_aggregate_conviction,
 )
@@ -100,18 +101,17 @@ def main() -> int:
         SignalEvidence("news_energy",       0.10, scorecards["news_energy"],       "strong"),
     ]
 
-    # Penalty knobs — realistic for the current setup
-    fragility_multiplier = 0.95    # slight Shapley concentration, not fragile
-    disagreement_score = 0.15      # small disagreement between model heads
-    red_team_epistemic_risk = 0.10 # LLM raised weak counters, no veto
-    fudge_alert_count = 0          # no Taiwan shipping fudge alerts active
+    # Diagnostic / advisory metadata — fragility and disagreement are already
+    # applied to oracle confidence in EnsemblePredictor.predict(), and red team
+    # is advisory only (none of the three multiply aggregate conviction).
+    fragility_multiplier = 0.95    # slight Shapley concentration, display only
+    disagreement_score = 0.15      # small head disagreement, display only
+    red_team_epistemic_risk = 0.10 # LLM raised weak counters, advisory only
+    fudge_alert_count = 0 if _is_shipping_exposed_ticker(ticker) else None
 
     # ─── STAGE 1: aggregate conviction ───────────────────────────────
     aggregate = compute_aggregate_conviction(
         signal_evidence,
-        fragility_multiplier=fragility_multiplier,
-        disagreement_score=disagreement_score,
-        red_team_epistemic_risk=red_team_epistemic_risk,
         fudge_alert_count=fudge_alert_count,
     )
     confidence = 0.78
@@ -197,11 +197,14 @@ def main() -> int:
             f"{sc.conviction_weight:>12.3f}"
         )
     print()
-    print(f"Raw confidence:        {confidence:.2f}  (lower={provenance.confidence_lower}, upper={provenance.confidence_upper})")
-    print(f"Disagreement penalty:  × {1 - 0.4 * disagreement_score:.3f}")
-    print(f"Fragility multiplier:  × {fragility_multiplier:.3f}")
-    print(f"Red-team penalty:      × {1 - 0.5 * red_team_epistemic_risk:.3f}")
-    print(f"Fudge penalty:         × {max(0.1, 1 - 0.15 * fudge_alert_count):.3f}")
+    print(f"Oracle confidence:     {confidence:.2f}  (lower={provenance.confidence_lower}, upper={provenance.confidence_upper})")
+    print(f"Disagreement (in conf):{disagreement_score:6.3f}  (display only; applied on confidence axis)")
+    print(f"Fragility (in conf):   {fragility_multiplier:6.3f}  (display only; applied on confidence axis)")
+    print(f"Red-team risk:         {red_team_epistemic_risk:6.3f}  (advisory only; no numeric multiplier)")
+    if fudge_alert_count is not None:
+        print(f"Fudge penalty:         × {max(0.1, 1 - 0.15 * fudge_alert_count):.3f}")
+    else:
+        print("Fudge alerts:          not_applicable (non-shipping sector)")
     print("─────────────────────")
     print(f"Aggregate conviction:  {aggregate:.3f}")
     print(f"Provenance verdict:    {verdict.upper()}")
