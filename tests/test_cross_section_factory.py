@@ -967,3 +967,66 @@ def test_on_a_clean_store_the_reader_holds_every_cell_as_served(tmp_path):
     np.testing.assert_array_equal(panel.intra, (f["close"] / f["open"] - 1).values)
     np.testing.assert_array_equal(panel.cc, (f["adjClose"] / f["adjClose"].shift(1) - 1).values)
     np.testing.assert_array_equal(panel.on, (f["adjOpen"] / f["adjClose"].shift(1) - 1).values)
+
+
+@pytest.mark.parametrize("field", [*PRICES, "volume"])
+def test_a_cell_that_is_not_a_number_refuses_the_file_by_name(tmp_path, field):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    sym, r = "S1N04", 40
+    _edit_row(tmp_path, sym, days[r], **{field: "not_available"})
+    for read in (lambda: X.universe(tmp_path, **SMALL), lambda: X.load_panel(tmp_path, _small_run())):
+        with pytest.raises(X.PriceFileError) as err:                         # a named error, not a TypeError from numpy
+            read()
+        said = str(err.value)
+        assert f"prices/{sym}.csv" in said and f"{field} (first on {days[r]})" in said
+        assert "not_available" not in said                                   # the cell's own text is not repeated
+    assert issubclass(X.PriceFileError, X.RunFileError)                      # so every caller that refuses a store sees it
+
+
+@pytest.mark.parametrize("text", ["NA", "null", "NaN", ""])
+def test_a_missing_value_spelled_the_csv_way_is_a_blank_and_the_bar_is_invalid(tmp_path, text):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    whole = X.universe(tmp_path, **SMALL)
+    sym, r = "S1N04", 40
+    j = whole.cols.index(sym)
+    _edit_row(tmp_path, sym, days[r], adjHigh=text)
+    u = X.universe(tmp_path, **SMALL)                                        # read, not refused
+    assert np.isnan(u.frames["adjHigh"].iloc[r, j]) and not u.ok.iloc[r, j] and not u.base[r, j]
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+
+
+def _rewrite(root, sym, change):
+    p = root / "prices" / f"{sym}.csv"
+    p.write_text(change(p.read_text()))
+
+
+@pytest.mark.parametrize("what, change, says", [
+    ("a column is missing", lambda s: "\n".join(",".join(c for i, c in enumerate(line.split(",")) if i != HEADER.index("adjLow"))
+                                                for line in s.splitlines()) + "\n", "cannot be read as a Tiingo daily file"),
+    ("the days are not text", lambda s: s.replace("-", ""), "the date column does not hold days as text"),
+    # every cell of the long row is a number, so the columns picked by name would be read one place along
+    ("a row has a cell too many", lambda s: "\n".join(line.replace(",2000000,", ",7,2000000,", 1) if n == 41 else line
+                                                      for n, line in enumerate(s.splitlines())) + "\n", "line 42 does not have the header's 13 cells"),
+    ("a row is cut short", lambda s: "\n".join(",".join(line.split(",")[:8]) if n == 41 else line
+                                               for n, line in enumerate(s.splitlines())) + "\n", "line 42 does not have the header's 13 cells"),
+    ("the file is empty", lambda s: "", "cannot be read as a Tiingo daily file"),
+])
+def test_a_price_file_that_is_not_a_tiingo_daily_file_is_refused_by_name(tmp_path, what, change, says):
+    build(tmp_path, n_per=10, n_days=60)
+    X.universe(tmp_path, **SMALL)                                            # the store reads before the change
+    _rewrite(tmp_path, "S1N04", change)
+    with pytest.raises(X.PriceFileError, match=r"prices/S1N04\.csv") as err:
+        X.universe(tmp_path, **SMALL)
+    assert says in str(err.value), what
+
+
+def test_a_run_on_a_store_with_a_malformed_cell_is_abandoned_with_the_named_error(tmp_path):
+    days, _ = build(tmp_path, n_days=120)
+    _edit_row(tmp_path, "S1N04", days[80], adjHigh="not_available")
+    ledger = ledger_at(tmp_path)
+    with pytest.raises(X.PriceFileError, match=r"prices/S1N04\.csv.*adjHigh"):
+        X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    kinds = [json.loads(line)["kind"] for line in _ledger_lines(tmp_path)][-2:]
+    assert kinds == [lse.FACTORY_DECLARED, lse.FACTORY_ABANDONED] and lse.factory_open_run(ledger) is None
+    assert not (tmp_path / "out" / "report.json").exists()                   # declared, read, refused: no result

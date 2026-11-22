@@ -124,10 +124,26 @@ declaration abandoning the run; a missing session and a zero adjusted close taki
 
 ## All eight prices (2026-11-21, review fixes 2026-11-22)
 
+In short: a blank or a number that is not finite makes the bar invalid; anything that is not a Tiingo daily file
+refuses the store by name; and an invalid bar's prices reach no signal and no outcome.
+
 **The rule.** A Tiingo daily row carries eight prices: `open`, `high`, `low`, `close`, `adjOpen`, `adjHigh`, `adjLow`,
 `adjClose`. `universe()` reads all eight, and a row is a valid bar only when every one of them is present, finite and
 positive, with the open and the close inside the day's range. A cell that is not a finite number (`inf`, `-inf`) is
 read as a blank, in the eight prices and in the volume. Files are otherwise read as served: a blank is never filled.
+
+**A file that is not a Tiingo daily file is refused, not repaired.** Before a price file's rows are used, the reader
+checks its shape, and raises `PriceFileError` (a `RunFileError`) naming the file when:
+
+- a row does not have the header's number of cells, too many or too few;
+- one of the nine columns it reads (the eight prices and the volume) holds a cell that is neither a number nor a
+  blank, such as `not_available` (the error names the column and the first day);
+- the date column does not hold days as text, a column is missing, or the file cannot be parsed at all.
+
+Nothing is coerced. A cell of text is not turned into a blank, because a file that carries one is not what Tiingo
+serves and the rest of it cannot be trusted either. The words CSV readers take for a missing value (an empty cell,
+`NA`, `null`, `NaN`) are blanks, as before. The check runs when the store is loaded, which is after the run is
+declared, so the ledger records such a run as abandoned: check the store before running on the shared ledger.
 
 **An invalid bar reaches no signal and no outcome.** A stock with an invalid bar is out of `universe.ok`,
 `universe.base` and `load_panel(...).base` for that session. Its returns into and out of that session are blank, and
@@ -158,6 +174,11 @@ spread. And the panel carried every adjusted close as served, so a close on a ba
 the signals built from closes: on a synthetic store, with a blank `adjHigh` and an adjusted close ten times the true
 one, the stock's 5-session momentum read +895 % the next session and nine other stocks' sector momentum moved with it.
 
+A second review found that a cell of text made the reader fail with a `TypeError` from numpy, an error that names
+neither the file nor the column. Checking that turned up a worse case in the same family: pandas, asked for columns
+by name, reads a row that has one cell too many without complaint and takes every value from one column along. On a
+synthetic store one such row was a valid bar with a close-to-close return of 2,058,000 %.
+
 **What it changes on the index store: nothing.** The three cross-section runs on the factory ledger declared one data
 manifest (`31513c21…`, 814 price files), and the nine scratch runs that wrote a manifest list the same files. The
 store was checked against that manifest by hash, then every row was counted, read-only, on 2026-11-21 and again on
@@ -172,6 +193,7 @@ store was checked against that manifest by hash, then every row was counted, rea
 | Blank cells in any of the eight price columns | 0 |
 | Cells that are `inf` or `-inf`, prices and volume | 0 |
 | Invalid bars among the rows a run loads | 0 |
+| Price files the shape check refuses | 0 of 814 |
 
 The count read price cells in rows after 2022-12-30 for presence, sign and finiteness only; no return was computed
 from them. With main's reader and the changed one, `universe` and `load_panel` on that store give the same `ok`,
@@ -180,9 +202,9 @@ signal matrix for each of the six signal kinds (compared by hash; 3,357 sessions
 stock-sessions). No ledgered result can move.
 
 A run on an unchanged store gives the same `report.json`, `discovery-frozen.json`, `report.md` and
-`data-manifest.json` byte for byte on main's factory (451d4428) and the changed one. Checked on the synthetic test
-store with four runs: plain, gated, one with momentum, reversal, 52-week-high and intraday signals, and one with
-sector momentum.
+`data-manifest.json` byte for byte on main's factory (3e250cea, residual card included) and the changed one.
+Checked on the synthetic test store with four runs: plain, gated, one with momentum, reversal, 52-week-high and
+intraday signals, and one with sector momentum.
 
 **What it changes on the small-cap store.** The sealed generation `g-55610e73…` (9,471 price files, discovery from
 2016-01-04) was counted the same way on 2026-11-22, on the 16,942,103 rows a run loads:
@@ -194,6 +216,7 @@ sector momentum.
 | of them with a blank `low` and `adjLow` | 617 |
 | of them with the open or the close outside the day's range | 591 |
 | Invalid bars with an adjusted close present | 1,208 |
+| Price files the shape check refuses | 0 of 9,471 |
 
 By year: 504 in 2010, 469 in 2011, 136 in 2012, 42 in 2013, 10 in 2014, 2 in 2015, 11 in 2016 and 34 in 2017.
 Every one of these bars was already invalid under the six-price rule: no row is blank, zero or negative in `adjHigh`
@@ -202,9 +225,10 @@ or `adjLow` alone (the 617 blank adjusted lows are the 617 rows with a blank low
 closes on those bars no longer reach the signals built from closes; 45 of them are in the discovery years. No
 cross-section run on this store is on the factory ledger, so no recorded result moves.
 
-**What it costs.** Two more columns per file, one pass over the frames for the finite check and one mask. On the
-index store, four loads each on 2026-11-22: `universe()` took 21.0 s against 19.5 s on main (+1.5 s, 8 %) and peak
-memory was 904 MB against 823 MB (+81 MB, 10 %). The bar frames it returns hold 188 MB against 146 MB.
+**What it costs.** Two more columns per file, the shape check on every file, one pass over the frames for the finite
+check and one mask. On the index store, four loads each on 2026-11-22: `universe()` took 22.2 s against 17.6 s on
+main (+4.6 s, 26 %) and peak memory was 905 MB against 823 MB (+82 MB, 10 %). The bar frames it returns hold 188 MB
+against 146 MB.
 
 Tests (synthetic stores only):
 
@@ -218,7 +242,14 @@ Tests (synthetic stores only):
 - an invalid bar (blank `adjHigh`; blank `low` and `adjLow`) whose adjusted close is wrong by a factor of 10 and of
   100 gives the clean store's panel with that one bar taken out, the same signals for both factors, no signal on the
   adjacent sessions named above, and a sector mean for the other members worked out by hand without it;
-- on a clean store every cell of every frame is the file's own number and nothing in the panel is masked.
+- on a clean store every cell of every frame is the file's own number and nothing in the panel is masked;
+- `not_available` in each of the eight prices and in the volume refuses the file with an error that names the file,
+  the column and the day, and does not repeat the cell;
+- a missing column, days that are not text, a row with a cell too many (every cell a number), a row cut short and an
+  empty file are each refused by name;
+- `NA`, `null`, `NaN` and an empty cell are blanks: the bar is invalid and the store is read;
+- a run on a store with one such cell is declared, then closed as abandoned with the named error, and writes no
+  report.
 
 ## Signals and horizons
 

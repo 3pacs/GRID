@@ -89,6 +89,11 @@ class RunFileError(ValueError):
     """A run file the factory refuses."""
 
 
+class PriceFileError(RunFileError):
+    """A price file that is not a Tiingo daily file: a column missing, a row that does not parse, or a cell that is
+    neither a number nor a blank where a price or a volume belongs."""
+
+
 @dataclass(frozen=True)
 class RunFile:
     run_id: str
@@ -314,7 +319,7 @@ class Panel:
 class Universe:
     sessions: list
     cols: list
-    frames: dict              # one frame per bar field, by session and price file; a cell that is not a finite number is blank
+    frames: dict              # one frame per bar field, by session and price file; a number that is not finite is blank
     ok: pd.DataFrame          # a valid bar: all eight prices finite and positive, open and close inside the day's range
     member: np.ndarray
     base: np.ndarray          # member, valid bar, price and liquidity floors
@@ -335,6 +340,35 @@ def _read(data_dir: Path, name: str, files: dict | None) -> bytes:
     return raw
 
 
+def _price_rows(raw: bytes, name: str, fields: tuple) -> pd.DataFrame:
+    """One price file's rows, checked: every row has the header's number of cells, ``date`` holds text, and each of
+    ``fields`` holds numbers and blanks only. A file that fails is refused by name. Nothing is coerced or realigned: a
+    cell such as ``not_available`` is never turned into a blank, and a row with a cell too many is never read with
+    its values one column along (which pandas does, silently, when columns are picked by name)."""
+    lines = raw.split(b"\n")
+    cells = lines[0].count(b",")
+    ragged = next((n for n, line in enumerate(lines[1:], 2) if line.count(b",") != cells and line.strip()), None)
+    if ragged is not None:
+        raise PriceFileError(f"{name}: line {ragged} does not have the header's {cells + 1} cells; the file is refused, "
+                             "not repaired")
+    try:
+        df = pd.read_csv(io.BytesIO(raw), usecols=["date", *fields])
+    except ValueError as exc:   # a column missing, no header, a row with the wrong number of cells
+        raise PriceFileError(f"{name} cannot be read as a Tiingo daily file: {exc}") from exc
+    if df.empty:
+        return df
+    if not pd.api.types.is_string_dtype(df["date"]):
+        raise PriceFileError(f"{name}: the date column does not hold days as text (YYYY-MM-DD)")
+    bad = []
+    for k in fields:
+        if df[k].dtype.kind not in "fiu":
+            first = df.loc[df[k].notna() & pd.to_numeric(df[k], errors="coerce").isna(), "date"]
+            bad.append(f"{k} (first on {str(first.iloc[0])[:10]})" if len(first) else k)
+    if bad:
+        raise PriceFileError(f"{name}: a cell that is not a number in {', '.join(bad)}; the file is refused, not repaired")
+    return df
+
+
 def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dollar_volume: float,
              files: dict | None = None) -> Universe:
     """Which stock may be ranked on which session. This is the one definition: ``load_panel`` builds on it, and a
@@ -345,8 +379,10 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
     dollar volume over the ``DOLLAR_VOLUME_WINDOW`` sessions ending the session before is at least
     ``min_dollar_volume``. "The session before" is the store's previous session, not the stock's previous bar: a
     stock with no bar on it has no prior close and is out. A valid bar has all eight prices of the row (open, high,
-    low, close and their adjusted values) finite and positive. A cell that is not a finite number (``inf``) is read
-    as a blank, in the prices and in the volume. Bars after ``DEV_LAST_BAR`` are dropped."""
+    low, close and their adjusted values) finite and positive. A number that is not finite (``inf``) is read as a
+    blank, in the prices and in the volume. A cell that is not a number at all is not a Tiingo row: the file is
+    refused by name (``PriceFileError``) and nothing is computed from the store. Bars after ``DEV_LAST_BAR`` are
+    dropped."""
     data_dir = Path(data_dir)
     on_disk = sorted(str(p.relative_to(data_dir)) for p in sorted((data_dir / "prices").glob("*.csv")))
     names = on_disk if files is None else sorted(n for n in files if n.startswith("prices/"))
@@ -355,7 +391,7 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
     cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "adjHigh",
                                                   "adjLow", "volume")}
     for name in names:
-        df = pd.read_csv(io.BytesIO(_read(data_dir, name, files)), usecols=["date", *cols_data])
+        df = _price_rows(_read(data_dir, name, files), name, tuple(cols_data))
         if df.empty:
             continue
         df["date"] = df["date"].str[:10]
