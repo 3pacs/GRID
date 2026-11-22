@@ -36,9 +36,10 @@ SCHEMA = (
         bid REAL, ask REAL, volume INTEGER, open_interest INTEGER, implied_vol REAL,
         in_the_money BOOLEAN, created_at TEXT, capture_batch_id TEXT, capture_ordinal INTEGER,
         capture_started_at TEXT, capture_completed_at TEXT, provider_regular_market_at TEXT)""",
-    # Same shape as migrations/versions/options_append_only_20260930.py.
+    # Same shape as migrations/versions/options_append_only_20260930.py: no
+    # ``implied_volatility`` alias (one here once hid a reader's bad column).
     """CREATE VIEW options_snapshots AS
-        SELECT s.*, s.implied_vol AS implied_volatility FROM options_snapshots_all s
+        SELECT s.* FROM options_snapshots_all s
         WHERE NOT EXISTS (SELECT 1 FROM options_capture_batches b
             WHERE b.ticker = s.ticker AND b.snap_date = s.snap_date
               AND b.capture_batch_id IS NOT s.capture_batch_id

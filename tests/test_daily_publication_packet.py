@@ -465,3 +465,92 @@ def test_cli_no_publish_flag(job, tmp_path, monkeypatch):
 def test_service_template_sets_the_public_root():
     text = (ROOT / "deploy" / "systemd" / "grid-publication-packet.service.template").read_text()
     assert "GRID_PUBLICATION_PACKET_PUBLIC_ROOT=/data/grid/outputs/publication-packets" in text
+
+
+# --- Claim-guard verdict carried even when the generator snapshot is over cap ---
+
+def _withheld_briefing(i: int, hour: int, draft: str) -> dict:
+    row = _briefing(i, hour, "**AI narrative withheld: unsupported source interpretation. Data summary only.**\n\n- VIX: 20.1")
+    row.update({
+        "snapshot_bytes": 5_800_000, "snapshot_data": None,
+        "claim_guard_meta": {"passed": False, "reasons": ["unsupported_actor_interpretation"],
+                             "reason_counts": {"unsupported_actor_interpretation": 2},
+                             "scope": "bounded_publication_claims_v1",
+                             "fallback": {"passed": True, "reasons": [], "scope": "bounded_publication_claims_v1"}},
+        "claim_guard_draft_prefix": draft[:65_536],  # SQL left() bound, in characters
+        "claim_guard_draft_bytes": len(draft.encode("utf-8")),
+        "claim_guard_draft_sha256": hashlib.sha256(draft.encode("utf-8")).hexdigest(),
+    })
+    return row
+
+
+def test_briefing_query_always_selects_the_bounded_claim_guard(job):
+    sql = job.QUERIES["market_briefings"]
+    for column in ("claim_guard_meta", "claim_guard_draft_prefix", "claim_guard_draft_bytes", "claim_guard_draft_sha256"):
+        assert f"AS {column}" in sql
+    assert "left(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate', 65536)" in sql
+    assert job.CLAIM_GUARD_DRAFT_CAP_BYTES == 65_536
+    # Still bound, never interpolated; the snapshot cap itself is unchanged.
+    assert ":start" in sql and ":end" in sql and ":asof" in sql and ":limit" in sql
+    assert "<= 250000 THEN snapshot_data ELSE NULL END" in sql
+
+
+def test_bound_claim_guard_shapes(job):
+    assert job.bound_claim_guard({"id": 1, "content": "x"}) == {"id": 1, "content": "x"}  # older callers unchanged
+    empty = job.bound_claim_guard({"id": 1, "claim_guard_meta": None, "claim_guard_draft_prefix": None,
+                                   "claim_guard_draft_bytes": None, "claim_guard_draft_sha256": None})
+    assert empty == {"id": 1, "publication_claim_guard": None}
+    passed = job.bound_claim_guard({"id": 2, "claim_guard_meta": '{"passed": true, "reasons": []}',
+                                    "claim_guard_draft_prefix": None, "claim_guard_draft_bytes": None,
+                                    "claim_guard_draft_sha256": None})
+    assert passed["publication_claim_guard"] == {"passed": True, "reasons": []}
+    small = job.bound_claim_guard({"id": 3, "claim_guard_meta": {"passed": False, "reasons": ["r"]},
+                                   "claim_guard_draft_prefix": "short draft", "claim_guard_draft_bytes": 11,
+                                   "claim_guard_draft_sha256": "ab" * 32})
+    guard = small["publication_claim_guard"]
+    assert guard["rejected_candidate"] == "short draft"
+    assert guard["rejected_candidate_bound"] == {"utf8_bytes": 11, "retained_utf8_bytes": 11, "sha256": "ab" * 32,
+                                                 "cap_bytes": 65_536, "truncated": False, "note": None}
+
+
+def test_long_rejected_draft_is_truncated_with_declared_note_on_a_character_boundary(job):
+    draft = "é" * 70_000  # 2 bytes each: 140,000 bytes
+    row = job.bound_claim_guard({"id": 4, "claim_guard_meta": {"passed": False, "reasons": ["r"]},
+                                 "claim_guard_draft_prefix": draft[:65_536],
+                                 "claim_guard_draft_bytes": len(draft.encode()),
+                                 "claim_guard_draft_sha256": hashlib.sha256(draft.encode()).hexdigest()})
+    guard = row["publication_claim_guard"]
+    kept = guard["rejected_candidate"]
+    assert kept == "é" * 32_768 and len(kept.encode()) == 65_536
+    bound = guard["rejected_candidate_bound"]
+    assert bound["truncated"] is True and bound["utf8_bytes"] == 140_000 and bound["retained_utf8_bytes"] == 65_536
+    assert bound["sha256"] == hashlib.sha256(draft.encode()).hexdigest()
+    assert "65536 of 140000" in bound["note"]
+
+
+def test_oversized_guard_metadata_keeps_verdict_reasons_and_counts(job):
+    meta = {"passed": False, "reasons": ["r"], "reason_counts": {"r": 1}, "scope": "s",
+            "fallback": {"blob": "x" * 70_000}}
+    guard = job.bound_claim_guard({"id": 5, "claim_guard_meta": meta, "claim_guard_draft_prefix": None,
+                                   "claim_guard_draft_bytes": None, "claim_guard_draft_sha256": None})["publication_claim_guard"]
+    assert guard["passed"] is False and guard["reasons"] == ["r"] and guard["reason_counts"] == {"r": 1}
+    assert "fallback" not in guard and guard["metadata_bound"]["truncated"] is True
+
+
+def test_withheld_briefing_over_snapshot_cap_still_carries_reasons_and_draft(job, tmp_path):
+    draft = "## What's Happening Now\nInstitutions are selling.\n" + "Long tail. " * 8_000
+    briefings = [_briefing(1, 1), _withheld_briefing(2, 13, draft)]
+    result = _run(job, tmp_path, FakeEngine(_data(briefings=briefings)))
+    assert result["state"] == "PRODUCED"
+    packet = json.loads((tmp_path / "packets" / "2026-11-06" / "packet.json").read_bytes())
+    withheld = next(p for p in packet["publications"] if p["id"] == "market_briefings:5002")
+    record = withheld["source_record"]
+    assert record["snapshot_data"] is None
+    guard = record["publication_claim_guard"]
+    assert guard["reasons"] == ["unsupported_actor_interpretation"]
+    assert guard["reason_counts"] == {"unsupported_actor_interpretation": 2}
+    assert guard["rejected_candidate"].startswith("## What's Happening Now\nInstitutions are selling.")
+    assert guard["rejected_candidate_bound"]["truncated"] is True
+    assert len(guard["rejected_candidate"].encode()) <= job.CLAIM_GUARD_DRAFT_CAP_BYTES
+    assert not any(k.startswith("claim_guard_") for k in record)
+    assert any("claim-guard verdict carried separately" in b for b in packet["blockers"])

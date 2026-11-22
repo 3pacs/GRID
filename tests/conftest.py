@@ -210,3 +210,9 @@ def _options_provider_offline_default(monkeypatch):
     that exercise the Cboe path opt in by deleting this variable.
     """
     monkeypatch.setenv("GRID_OPTIONS_PRIMARY_PROVIDER", "yahoo")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_options_tail_cursor(tmp_path, monkeypatch):
+    """Keep schwab-mode tail cursors (ingestion/options_schwab.py) out of the operator's state directory."""
+    monkeypatch.setenv("GRID_OPTIONS_TAIL_CURSOR_DIR", str(tmp_path / "options-tail-cursor"))
