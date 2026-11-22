@@ -693,12 +693,14 @@ def test_code_change_abandons_a_forward_registration_at_once(tmp_path, monkeypat
     state = L.load_state(led)
     rec = state.abandoned[sha]
     assert rec["cause"] == L.CODE_CHANGED and rec["read_evidence"]["ledger_reads"] == []
-    assert not state.unread_abandoned(sha) and state.reregistrable(sha)  # forward: never frees its window
+    # abandoned before its first presence count: nothing of it was read, so it is unread like history
+    assert state.unread_abandoned(sha) and state.reregistrable(sha)
+    assert not any(c["source"] == sha for c in state.consumption())
 
 
-def test_forward_progress_then_code_change_keeps_the_window(tmp_path, monkeypatch):
-    """Codex 6010600452: two cycles of forward progress, then a code change. The window stays
-    consumed and the alpha spent; only a new forward window may register."""
+def test_forward_progress_then_code_change_keeps_the_window_and_the_group(tmp_path, monkeypatch):
+    """Codex 6010600452 / 6011669661: two cycles of forward progress, then a code change. A presence
+    count is a read: the window stays consumed, the alpha spent, and the group closed (no re-entry)."""
     led = L.memory()
     sha = register(led, F.build_proposal(_forward_item(), TODAY))
     alpha = L.load_state(led).registrations[sha]["alpha_look"]
@@ -714,15 +716,14 @@ def test_forward_progress_then_code_change_keeps_the_window(tmp_path, monkeypatc
     ev = state.abandoned[sha]["read_evidence"]
     assert ev["ledger_reads"] == ["progress"] and state.reads[sha] == {"progress"} and ev["report_staged"] is False
     assert sum(1 for r in led.records if r.get("kind") == L.READ_KIND) == 1  # first read of a kind only
-    assert not state.unread_abandoned(sha)
+    assert not state.unread_abandoned(sha) and not state.reregistrable(sha)
     assert any(c["source"] == sha for c in state.consumption())
     assert state.abandoned[sha]["alpha_spent"] == alpha and state.stage1_count(2026) == 1
-    assert state.reregistrable(sha)
-    nxt = NOW + timedelta(days=6)  # Thursday: a forward window from Friday, after the abandoned one
+    nxt = NOW + timedelta(days=6)
     monkeypatch.setattr(R, "QUEUE", (_forward_item(),))
     s = R.run_cycle(led, StaticSource({}, today=nxt.date()), tmp_path, now=nxt)
-    reg = [r for r in L.load_state(led).registrations.values() if r["lane"] == "forward"][-1]
-    assert s["registered"] and reg["window"]["start"] > state.abandoned[sha]["recorded_at"][:10]
+    assert s["registered"] == [] and s["rejected"] == []  # the group is done: not even proposed
+    assert len(L.load_state(led).registrations) == 1
 
 
 @pytest.mark.parametrize("trace", ["staged_report", "aborted_attempt", "look_read_only"])
@@ -828,28 +829,20 @@ def test_other_abandonments_keep_their_window(tmp_path, monkeypatch):
     assert not any(r["proposal_id"].startswith("IM1-v1:metals") for r in s["registered"])
 
 
-def test_no_window_is_freed_for_a_registration_sealed_before_policy_4():
-    """Codex 6010864065: the 2026-11-20 single-stocks abandonment (no cause, no evidence) is not
-    freed by anything in policy 4; only the live forward registration is named, for a new window."""
-    live = "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b"
-    assert all(a["registration_sha256"] != live and a["frees_window"] is False
-               for a in P.UNREAD_ABANDONMENT["attested"])
+def test_no_registration_sealed_before_policy_4_is_freed_or_reopened():
+    """Codex 6010864065 / 6011669661: policy 4 names no registration. The live single-stocks
+    abandonment and the live SPY/QQQ/IWM forward registration stay closed whatever their records say."""
+    assert P.UNREAD_ABANDONMENT["attested"] == []
+    live_ss = "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b"
+    live_fwd = "69a8482023b8306323ac5d18d5e70e5af2451fa2846912f24a1990656660218d"
     state = L.StreamState(policy=P.policy_payload(), policy_sha256=P.policy_sha256())
-    state.registrations[live] = {"lane": "history", "stage": 1}
-    state.abandoned[live] = {"reason": "family IM1 code differs from the registered sha"}
-    assert not state.unread_abandoned(live) and not state.reregistrable(live)
-    fwd = P.UNREAD_ABANDONMENT["attested"][0]["registration_sha256"]
+    state.registrations[live_ss] = {"lane": "history", "stage": 1}
+    state.abandoned[live_ss] = {"reason": "family IM1 code differs from the registered sha"}
     clean = {"ledger_reads": [], "failed_attempts": 0, "report_staged": False}
-    state.registrations[fwd] = {"lane": "forward", "stage": 1}
-    state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
-    assert state.reregistrable(fwd) and not state.unread_abandoned(fwd)  # new window only
-    # an attestation never overrides contrary evidence
-    for bad in ({**clean, "failed_attempts": 1}, {**clean, "report_staged": True}, {**clean, "ledger_reads": ["look"]}):
-        state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": bad}
-        assert not state.reregistrable(fwd), bad
-    state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
-    state.reads[fwd] = {"look"}  # the ledger disputes the recorded evidence
-    assert not state.reregistrable(fwd)
+    state.registrations[live_fwd] = {"lane": "forward", "stage": 1}
+    state.abandoned[live_fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
+    for sha in (live_ss, live_fwd):
+        assert not state.unread_abandoned(sha) and not state.reregistrable(sha)
 
 
 def test_a_lost_sidecar_cannot_free_a_read_window(tmp_path, monkeypatch):

@@ -12,8 +12,8 @@ environment.
 Version 4 (2026-11-21) adds one owner decision (:data:`UNREAD_ABANDONMENT`): a history
 registration sealed under it, abandoned because its family's code changed, whose ledger
 holds no read of its window, has that window freed, and its (family, group, lane) may
-register again on a new window. A forward window whose presence was counted stays
-consumed. Its alpha stays spent and it still counts toward the yearly maximum. Every
+register again on a new window. A forward registration whose presence was counted
+was read and stays closed. Its alpha stays spent and it still counts toward the yearly maximum. Every
 other abandonment, and every registration sealed before it, keeps its window consumed.
 
 Version 3 (2026-11-16) carries the owner's two-stage evidence bar (GRID issue 1213):
@@ -126,26 +126,14 @@ UNREAD_ABANDONMENT: dict = {
     "rule": "unread status is a positive receipt in the ledger, never inferred. Before the first read of each "
             "kind of an open registration's window (progress: a forward presence count; look: a look) the runner "
             "appends an edge_read record to this hash-chained, anchored ledger; a dry run reads no open window. "
-            "A history registration sealed under this policy or a later one, with no edge_read record, abandoned "
-            "at the code-hash check with no failed attempt and no staged report in the data dir, has its window "
-            "freed and its (family, group, lane) may register again on a new window. A forward window stays "
-            "consumed; with no look read, failed attempt or staged report a new forward window may register, "
-            "starting after the new registration. Any registration sealed before this policy, and any whose "
-            "evidence is missing, partial or disputed, keeps its window and its (family, group, lane) closed. "
-            "The alpha of an abandoned registration stays spent and it counts toward max_registrations",
-    "attested": [
-        {
-            "registration_sha256": "69a8482023b8306323ac5d18d5e70e5af2451fa2846912f24a1990656660218d",
-            "lane": "forward",
-            "frees_window": False,
-            "proposal_id": "IM1-v1:us_equity_index:forward:2026-11-23",
-            "evidence": "sealed 2026-11-20 under policy 3, before edge_read records. Its window stays consumed; it "
-                        "may register again on a new window only when its abandonment records no failed attempt and "
-                        "no staged report. The code it ran under (15975857, 586ba09b) calls compute_look for a "
-                        "forward registration only once forward_progress is ready (100 sessions from 2026-11-23 or "
-                        "250 weekdays), so no look of it can precede its abandonment",
-        },
-    ],
+            "A registration on either lane sealed under this policy or a later one, with no edge_read record at "
+            "all, abandoned at the code-hash check with no failed attempt and no staged report in the data dir, "
+            "has its window freed and its (family, group, lane) may register again on a new window. A forward "
+            "registration whose presence was counted was read: its window stays consumed and its (family, group, "
+            "lane) stays closed. Any registration sealed before this policy, and any whose evidence is missing, "
+            "partial or disputed, keeps its window and its (family, group, lane) closed. The alpha of an abandoned "
+            "registration stays spent and it counts toward max_registrations",
+    "attested": [],
 }
 
 # --- looks ------------------------------------------------------------------------

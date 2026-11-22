@@ -160,12 +160,6 @@ class StreamState:
         return bool(rule.get("decision")) and rule.get("cause") == CODE_CHANGED and any(
             d.get("id") == rule["decision"] for d in self.policy.get("owner_decisions", []))
 
-    def _attested_forward(self) -> set[str]:
-        """Forward registrations sealed before read records that the policy in force names (a new
-        window only; nothing is freed by an attestation)."""
-        rule = self.policy.get("unread_abandonment") or {}
-        return {a["registration_sha256"] for a in rule.get("attested", []) if a.get("lane") == "forward"}
-
     def _code_abandonment(self, reg_sha: str, lane: str) -> dict | None:
         """The record of a code-change abandonment on ``lane`` whose own evidence shows no sign of a
         look (no look read in the ledger, no failed attempt, no staged report); ``None`` when it is
@@ -181,22 +175,19 @@ class StreamState:
         return rec
 
     def unread_abandoned(self, reg_sha: str) -> bool:
-        """A history registration no cycle read: sealed under policy 4 (so every read of it is an
-        ``edge_read`` record in this ledger), with none, abandoned at the code check with no failed
-        attempt and no staged report. Its window is freed under :meth:`reopens_unread`. Anything
-        else, including any registration sealed before policy 4, keeps its window consumed."""
-        return reg_sha in self.marked and not self.reads.get(reg_sha) \
-            and self._code_abandonment(reg_sha, "history") is not None
+        """A registration no cycle read, on either lane: sealed under policy 4 (so every read of it
+        is an ``edge_read`` record in this ledger), with none at all (a forward presence count is a
+        read), abandoned at the code check with no failed attempt and no staged report. Its window is
+        freed under :meth:`reopens_unread`. Anything else, including any registration sealed before
+        policy 4, keeps its window consumed and its (family, group, lane) closed."""
+        reg = self.registrations.get(reg_sha)
+        return reg is not None and reg_sha in self.marked and not self.reads.get(reg_sha) \
+            and self._code_abandonment(reg_sha, reg["lane"]) is not None
 
     def reregistrable(self, reg_sha: str) -> bool:
-        """Its (family, group, lane) may register again on a new window: an unread history
-        abandonment, or a forward one abandoned at the code check with no look read, failed attempt
-        or staged report (sealed under policy 4, or attested by name). A forward window's presence
-        was read, so it stays consumed; the new window starts after the new registration."""
-        if self.unread_abandoned(reg_sha):
-            return True
-        return self._code_abandonment(reg_sha, "forward") is not None and (
-            reg_sha in self.marked or reg_sha in self._attested_forward())
+        """Its (family, group, lane) may register again on a new window: only an unread abandonment.
+        A forward registration whose presence was counted was read, and stays closed."""
+        return self.unread_abandoned(reg_sha)
 
     def proposal_ids(self) -> set[str]:
         return {r["proposal_id"] for r in self.registrations.values()}
