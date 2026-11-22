@@ -1,7 +1,7 @@
 """regime_history keeps every version it replaces (#1302).
 
 Revision ID: regime_history_revs_20261122
-Revises: agent_report_ask_checks_20261122
+Revises: agent_report_ask_owner_20261122
 Create Date: 2026-11-22 00:00:00.000000
 
 ``scripts/auto_regime.py`` used to upsert ``regime_history`` with ``ON CONFLICT
@@ -59,7 +59,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "regime_history_revs_20261122"
-down_revision: Union[str, Sequence[str], None] = "agent_report_ask_checks_20261122"
+down_revision: Union[str, Sequence[str], None] = "agent_report_ask_owner_20261122"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
