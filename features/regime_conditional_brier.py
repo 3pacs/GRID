@@ -87,6 +87,8 @@ Functions
 
 from __future__ import annotations
 
+import math
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -100,6 +102,7 @@ from sqlalchemy.engine import Engine
 from features.per_signal_brier import (  # noqa: F401
     CANONICAL_HORIZONS,
     MIN_CALIBRATED_SAMPLES,
+    MIN_EFFECTIVE_WEIGHT_SUM,
     SignalScorecard,
     _canonical_horizon,
     compute_conviction_weight,
@@ -233,9 +236,13 @@ def _row_to_scorecard(
     signal_source and horizon_days from the query parameters, which is
     why they're passed in explicitly rather than selected from the row.
 
-    Uses ``compute_conviction_weight`` imported from per_signal_brier so
-    the regime scorecard produces the *same* weighting curve as the
-    non-regime scorecard when both have enough samples.
+    Conservative read-time floor: ``regime_conditional_brier_history`` has
+    no ``weight_sum`` (Σw) or JSON/metadata column on the current schema, so
+    read-time enforces ``scored_count < MIN_CALIBRATED_SAMPLES (20)`` →
+    ``is_calibrated=False`` and neutral ``conviction_weight=1.0`` (even when
+    ``MIN_REGIME_SAMPLES (10) <= scored_count < 20``). The bootstrap writer
+    enforces ``Σw >= MIN_EFFECTIVE_WEIGHT_SUM (5.0)`` fail-closed at write
+    time.
     """
     count = int(row[0] or 0)
     brier = float(row[1] or 0.0)
@@ -243,13 +250,11 @@ def _row_to_scorecard(
     hits = int(row[3] or 0)
     last_updated = row[4] if len(row) > 4 else None
     hit_rate = (hits / count) if count > 0 else 0.0
-    # Reuse the non-regime calibration threshold for the
-    # ``is_calibrated`` flag so the dashboard shows a single consistent
-    # definition of "calibrated." MIN_REGIME_SAMPLES governs the
-    # *fallback* decision, not the displayed calibration state.
     is_calibrated = count >= MIN_CALIBRATED_SAMPLES
     conviction = (
-        compute_conviction_weight(brier, count) if is_calibrated else 1.0
+        compute_conviction_weight(brier, count)
+        if is_calibrated
+        else 1.0
     )
     return SignalScorecard(
         signal_source=signal_source,
@@ -261,7 +266,39 @@ def _row_to_scorecard(
         last_updated=last_updated,
         is_calibrated=is_calibrated,
         conviction_weight=conviction,
+        weight_sum=None,
     )
+
+
+# ── Live-skip tracking (no weight_sum column on current schema) ───────────
+
+_SKIPPED_LIVE_UPDATES_LOCK = threading.Lock()
+_SKIPPED_LIVE_UPDATE_COUNTS: dict[tuple[str, int], int] = {}
+
+
+def _record_live_skip(source: str, horizon: int) -> bool:
+    """Increment skipped live update count for ``(source, horizon)``.
+
+    Returns True on the first skip per process for that key so callers log
+    once at INFO instead of spamming per prediction.
+    """
+    key = (source, int(horizon))
+    with _SKIPPED_LIVE_UPDATES_LOCK:
+        prev = _SKIPPED_LIVE_UPDATE_COUNTS.get(key, 0)
+        _SKIPPED_LIVE_UPDATE_COUNTS[key] = prev + 1
+        return prev == 0
+
+
+def get_skipped_live_update_counts() -> dict[tuple[str, int], int]:
+    """Return a snapshot of skipped live update counts keyed by ``(source, horizon)``."""
+    with _SKIPPED_LIVE_UPDATES_LOCK:
+        return dict(_SKIPPED_LIVE_UPDATE_COUNTS)
+
+
+def _reset_skipped_live_update_counts() -> None:
+    """Clear process-local skip counts and log deduplication state (for tests)."""
+    with _SKIPPED_LIVE_UPDATES_LOCK:
+        _SKIPPED_LIVE_UPDATE_COUNTS.clear()
 
 
 # ── Core update path ──────────────────────────────────────────────────────
@@ -276,153 +313,42 @@ def record_scored_prediction(
     signal_contributions: dict[str, float],
     regime: str,
 ) -> dict[str, Any]:
-    """Update the per-(signal_source, horizon, regime) running Brier /
-    ECE / hit counters after a prediction is scored.
+    """Live incremental updater hook for regime-conditional Brier tracking.
 
-    Mirrors the signature of ``features.per_signal_brier.record_scored_prediction``
-    with an added ``regime`` kwarg. The confidence is decomposed into
-    signal contributions (upstream Shapley attribution) and each
-    contributor's regime bucket is updated via Welford incremental
-    averaging.
-
-    Parameters
-    ----------
-    horizon_days
-        Horizon of the scored prediction, snapped to the canonical
-        bucket {1, 7, 30, 90} via the imported ``_canonical_horizon``.
-    confidence
-        Oracle confidence in [0, 1] at prediction time.
-    outcome
-        Observed outcome in [0, 1] (1 = hit, 0.5 = partial, 0 = miss).
-    signal_contributions
-        Normalized Shapley share per contributing signal, summing to
-        ~1.0. Produced upstream by ``intelligence.shapley_attribution``.
-    regime
-        Liquidity regime active when the prediction was made. Normalized
-        via ``_canonical_regime`` — unknown values fall back to
-        ``"NEUTRAL"`` so the DB key space stays bounded.
-
-    Returns
-    -------
-    Dict keyed on signal source with ``{scored_count, running_brier,
-    regime}`` per contributor. Empty dict on DB error or when
-    ``signal_contributions`` is empty.
+    Proper incremental weighted averaging ``Σ(w·se) / Σw`` requires a
+    persisted ``weight_sum`` (Σw) column. Because the current
+    ``regime_conditional_brier_history`` schema has no ``weight_sum`` column,
+    the live path refuses both incremental UPDATEs and brand-new ``count=1``
+    INSERTs (which could never advance). Every valid contributor is skipped,
+    counted in ``get_skipped_live_update_counts()``, and logged once per
+    process per ``(source, horizon)`` at INFO. Recompute exact weighted means
+    via ``bootstrap_from_oracle_predictions``.
     """
+    del engine, confidence, outcome  # unused while schema lacks Σw
     if not signal_contributions:
         return {}
 
-    confidence = float(max(0.0, min(1.0, confidence)))
-    outcome = float(max(0.0, min(1.0, outcome)))
     horizon = _canonical_horizon(horizon_days)
     canonical = _canonical_regime(regime)
-    squared_error = (confidence - outcome) ** 2
-    absolute_error = abs(confidence - outcome)
-    directional_hit = 1 if (confidence >= 0.5) == (outcome >= 0.5) else 0
+    for source, weight in signal_contributions.items():
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(w) or w <= 0.0:
+            continue
+        if _record_live_skip(source, horizon):
+            log.info(
+                "regime_conditional_brier.record_scored_prediction: skipping "
+                "live incremental write for ({s}, {h}d) (first seen in "
+                "regime={r}) — table has no persisted weight_sum (Σw) column; "
+                "recompute via bootstrap_from_oracle_predictions",
+                s=source,
+                h=horizon,
+                r=canonical,
+            )
 
-    ensure_regime_brier_table(engine)
-    updates: dict[str, Any] = {}
-
-    try:
-        with engine.begin() as conn:
-            for source, weight in signal_contributions.items():
-                try:
-                    w = float(weight)
-                except (TypeError, ValueError):
-                    continue
-                if w <= 0:
-                    continue
-
-                weighted_brier = squared_error * w
-                weighted_ece = absolute_error * w
-
-                row = conn.execute(
-                    text(
-                        "SELECT scored_count, running_brier, running_ece, "
-                        "hit_count "
-                        "FROM regime_conditional_brier_history "
-                        "WHERE signal_source = :s "
-                        "  AND horizon_days = :h "
-                        "  AND regime = :r"
-                    ),
-                    {"s": source, "h": horizon, "r": canonical},
-                ).fetchone()
-
-                if row is None:
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO regime_conditional_brier_history
-                                (signal_source, horizon_days, regime,
-                                 scored_count, running_brier, running_ece,
-                                 hit_count, last_updated)
-                            VALUES (:s, :h, :r, 1, :b, :e, :hit, NOW())
-                            ON CONFLICT (signal_source, horizon_days, regime)
-                            DO NOTHING
-                            """
-                        ),
-                        {
-                            "s": source,
-                            "h": horizon,
-                            "r": canonical,
-                            "b": weighted_brier,
-                            "e": weighted_ece,
-                            "hit": directional_hit,
-                        },
-                    )
-                    updates[source] = {
-                        "scored_count": 1,
-                        "running_brier": weighted_brier,
-                        "regime": canonical,
-                    }
-                    continue
-
-                old_count = int(row[0] or 0)
-                old_brier = float(row[1] or 0.0)
-                old_ece = float(row[2] or 0.0)
-                old_hits = int(row[3] or 0)
-                new_count = old_count + 1
-                # Welford incremental mean — matches per_signal_brier.
-                new_brier = old_brier + (weighted_brier - old_brier) / new_count
-                new_ece = old_ece + (weighted_ece - old_ece) / new_count
-                new_hits = old_hits + directional_hit
-
-                conn.execute(
-                    text(
-                        """
-                        UPDATE regime_conditional_brier_history
-                        SET scored_count  = :n,
-                            running_brier = :b,
-                            running_ece   = :e,
-                            hit_count     = :h,
-                            last_updated  = NOW()
-                        WHERE signal_source = :s
-                          AND horizon_days = :hz
-                          AND regime        = :r
-                        """
-                    ),
-                    {
-                        "n": new_count,
-                        "b": new_brier,
-                        "e": new_ece,
-                        "h": new_hits,
-                        "s": source,
-                        "hz": horizon,
-                        "r": canonical,
-                    },
-                )
-                updates[source] = {
-                    "scored_count": new_count,
-                    "running_brier": new_brier,
-                    "regime": canonical,
-                }
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "regime_conditional_brier.record_scored_prediction failed: {e}",
-            e=str(exc),
-        )
-        return {}
-
-    return updates
+    return {}
 
 
 # ── Read path ─────────────────────────────────────────────────────────────
@@ -737,6 +663,10 @@ def bootstrap_from_oracle_predictions(
     skipped = 0
     bucket_counts: dict[tuple[str, str], int] = {}
     regime_histogram: dict[str, int] = {}
+    # Aggregate weighted sums in memory across all raw rows so each persisted
+    # bucket stores the exact weighted mean Σ(w·se)/Σw without requiring a
+    # schema change to hold Σw per row.
+    accumulators: dict[tuple[str, int, str], dict[str, Any]] = {}
 
     for row in rows:
         try:
@@ -757,10 +687,15 @@ def bootstrap_from_oracle_predictions(
             except (TypeError, ValueError):
                 skipped += 1
                 continue
+            if not math.isfinite(confidence):
+                skipped += 1
+                continue
             confidence = max(0.0, min(1.0, confidence))
             outcome = _verdict_to_outcome(verdict)
-            horizon_days = _coerce_horizon_days(
-                row_dict.get("created_at"), row_dict.get("expiry")
+            horizon_days = _canonical_horizon(
+                _coerce_horizon_days(
+                    row_dict.get("created_at"), row_dict.get("expiry")
+                )
             )
             contributions = _coerce_contributions(
                 row_dict.get("signal_contributions")
@@ -773,15 +708,37 @@ def bootstrap_from_oracle_predictions(
                 contributions = {"oracle_aggregate": 1.0}
             canonical = _canonical_regime(row_dict.get("regime"))
 
-            updates = record_scored_prediction(
-                engine,
-                horizon_days=horizon_days,
-                confidence=confidence,
-                outcome=outcome,
-                signal_contributions=contributions,
-                regime=canonical,
-            )
-            if updates:
+            squared_error = (confidence - outcome) ** 2
+            absolute_error = abs(confidence - outcome)
+            directional_hit = 1 if (confidence >= 0.5) == (outcome >= 0.5) else 0
+
+            contributed = False
+            for source, weight in contributions.items():
+                try:
+                    w = float(weight)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(w) or w <= 0.0:
+                    continue
+                acc_key = (source, horizon_days, canonical)
+                acc = accumulators.get(acc_key)
+                if acc is None:
+                    acc = {
+                        "scored_count": 0,
+                        "weight_sum": 0.0,
+                        "weighted_brier_sum": 0.0,
+                        "weighted_ece_sum": 0.0,
+                        "hit_count": 0,
+                    }
+                    accumulators[acc_key] = acc
+                acc["scored_count"] += 1
+                acc["weight_sum"] += w
+                acc["weighted_brier_sum"] += w * squared_error
+                acc["weighted_ece_sum"] += w * absolute_error
+                acc["hit_count"] += directional_hit
+                contributed = True
+
+            if contributed:
                 replayed += 1
                 regime_histogram[canonical] = (
                     regime_histogram.get(canonical, 0) + 1
@@ -798,6 +755,68 @@ def bootstrap_from_oracle_predictions(
                 e=str(exc),
             )
             continue
+
+    if accumulators:
+        try:
+            with engine.begin() as conn:
+                for (source, horizon_days, canonical), acc in accumulators.items():
+                    weight_sum = acc["weight_sum"]
+                    if weight_sum <= 0.0:
+                        continue
+                    scored_count = int(acc["scored_count"])
+                    if (
+                        scored_count >= MIN_REGIME_SAMPLES
+                        and weight_sum + 1e-12 < MIN_EFFECTIVE_WEIGHT_SUM
+                    ):
+                        # Fail closed on current schema (no weight_sum column):
+                        # persisting scored_count >= threshold with Σw < 5
+                        # would let readers bypass the effective-sample floor.
+                        log.warning(
+                            "regime_conditional_brier.bootstrap: skipping "
+                            "({s}, {h}d, {r}) — scored_count={n} but effective "
+                            "weight Σw={w:.3f} < {floor}",
+                            s=source,
+                            h=horizon_days,
+                            r=canonical,
+                            n=scored_count,
+                            w=weight_sum,
+                            floor=MIN_EFFECTIVE_WEIGHT_SUM,
+                        )
+                        continue
+                    running_brier = acc["weighted_brier_sum"] / weight_sum
+                    running_ece = acc["weighted_ece_sum"] / weight_sum
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO regime_conditional_brier_history
+                                (signal_source, horizon_days, regime,
+                                 scored_count, running_brier, running_ece,
+                                 hit_count, last_updated)
+                            VALUES (:s, :h, :r, :n, :b, :e, :hit, NOW())
+                            ON CONFLICT (signal_source, horizon_days, regime)
+                            DO UPDATE SET
+                                scored_count  = EXCLUDED.scored_count,
+                                running_brier = EXCLUDED.running_brier,
+                                running_ece   = EXCLUDED.running_ece,
+                                hit_count     = EXCLUDED.hit_count,
+                                last_updated  = EXCLUDED.last_updated
+                            """
+                        ),
+                        {
+                            "s": source,
+                            "h": horizon_days,
+                            "r": canonical,
+                            "n": scored_count,
+                            "b": running_brier,
+                            "e": running_ece,
+                            "hit": int(acc["hit_count"]),
+                        },
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "regime_conditional_brier.bootstrap: persist failed: {e}",
+                e=str(exc),
+            )
 
     summary["replayed_count"] = replayed
     summary["skipped_count"] = skipped

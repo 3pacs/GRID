@@ -10,6 +10,7 @@ and reliability diagrams for the Oracle's predictions.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -217,6 +218,177 @@ def compute_calibration(
     return report
 
 
+_RUNNING_ECE_BINS: int = 10
+# Minimum binned sample count before a bucket's binned ECE is considered valid
+# for overwriting legacy MAE, persisting non-null calibration snapshots, or
+# running ECE drift checks.
+_MIN_ECE_BIN_SAMPLES: int = 30
+# Stored as a sibling top-level key inside ``oracle_models.horizon_buckets``
+# JSONB (outside the "1d"/"7d"/"30d"/"90d" bucket objects) so that
+# ``oracle.engine.ModelRegistry._nudge_single_model`` — which updates only
+# ``'{7d}'`` etc. via ``jsonb_set`` — preserves per-bin ECE state untouched.
+_ECE_BINS_KEY: str = "_ece_bins"
+# Nested key inside ``_ece_bins`` recording the UTC ISO timestamp when each
+# horizon bucket first reached ``_MIN_ECE_BIN_SAMPLES`` binned observations.
+_ECE_VALID_SINCE_KEY: str = "_valid_since"
+
+
+def _empty_ece_bins(n_bins: int = _RUNNING_ECE_BINS) -> list[list[float | int]]:
+    """Return ``n_bins`` empty ``[count, sum_p, sum_y]`` accumulators."""
+    return [[0, 0.0, 0.0] for _ in range(n_bins)]
+
+
+def _ece_bin_sample_count(bins: Sequence[Sequence[float | int]]) -> int:
+    """Return total sample count accumulated across all ECE bins."""
+    return sum(int(b[0]) for b in bins if int(b[0]) > 0)
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    """Coerce an ISO string or datetime to a timezone-aware UTC datetime."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def _parse_ece_bins(
+    raw: Any,
+    n_bins: int = _RUNNING_ECE_BINS,
+) -> list[list[float | int]]:
+    """Validate and copy persisted ``[[count, sum_p, sum_y], ...]`` bins."""
+    if not isinstance(raw, list) or len(raw) != n_bins:
+        return _empty_ece_bins(n_bins)
+    parsed: list[list[float | int]] = []
+    for entry in raw:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            return _empty_ece_bins(n_bins)
+        try:
+            count = int(entry[0])
+            sum_p = float(entry[1])
+            sum_y = float(entry[2])
+        except (TypeError, ValueError):
+            return _empty_ece_bins(n_bins)
+        if count < 0 or not (math.isfinite(sum_p) and math.isfinite(sum_y)):
+            return _empty_ece_bins(n_bins)
+        parsed.append([count, sum_p, sum_y])
+    return parsed
+
+
+def _ece_bin_index(prediction: float, n_bins: int = _RUNNING_ECE_BINS) -> int:
+    """Map a probability in [0, 1] to one of ``n_bins`` equal-width bins."""
+    p = max(0.0, min(1.0, float(prediction)))
+    return min(n_bins - 1, int(p * n_bins))
+
+
+def _update_ece_bins(
+    bins: Sequence[Sequence[float | int]],
+    prediction: float,
+    actual: float,
+) -> list[list[float | int]]:
+    """Return updated bin sums after adding one ``(prediction, actual)`` pair."""
+    updated = [[int(b[0]), float(b[1]), float(b[2])] for b in bins]
+    idx = _ece_bin_index(prediction, len(updated))
+    updated[idx][0] += 1
+    updated[idx][1] += float(prediction)
+    updated[idx][2] += float(actual)
+    return updated
+
+
+def _binned_ece_from_bins(bins: Sequence[Sequence[float | int]]) -> float:
+    """Compute true binned ECE = Σ_b (n_b / N) · |mean_p_b − mean_y_b|."""
+    total_n = sum(int(b[0]) for b in bins if int(b[0]) > 0)
+    if total_n <= 0:
+        return 0.0
+    weighted_err = 0.0
+    for b in bins:
+        n_b = int(b[0])
+        if n_b <= 0:
+            continue
+        mean_p = float(b[1]) / n_b
+        mean_y = float(b[2]) / n_b
+        weighted_err += (n_b / total_n) * abs(mean_p - mean_y)
+    return weighted_err
+
+
+def _extract_all_ece_bins(
+    raw_dict: dict[str, Any] | None,
+    horizon_keys: Sequence[str],
+) -> dict[str, list[list[float | int]]]:
+    """Extract persisted per-horizon 10-bin ECE accumulators from JSONB."""
+    if not isinstance(raw_dict, dict):
+        return {}
+    raw_map = raw_dict.get(_ECE_BINS_KEY)
+    if not isinstance(raw_map, dict):
+        return {}
+    out: dict[str, list[list[float | int]]] = {}
+    for hk in horizon_keys:
+        if hk in raw_map:
+            out[hk] = _parse_ece_bins(raw_map[hk])
+    return out
+
+
+def _extract_ece_valid_since(
+    raw_dict: dict[str, Any] | None,
+    horizon_keys: Sequence[str],
+) -> dict[str, str]:
+    """Extract per-horizon UTC cutover timestamps from ``_ece_bins._valid_since``."""
+    if not isinstance(raw_dict, dict):
+        return {}
+    raw_map = raw_dict.get(_ECE_BINS_KEY)
+    if not isinstance(raw_map, dict):
+        return {}
+    raw_since = raw_map.get(_ECE_VALID_SINCE_KEY)
+    if not isinstance(raw_since, dict):
+        return {}
+    out: dict[str, str] = {}
+    for hk in horizon_keys:
+        val = raw_since.get(hk)
+        if isinstance(val, str) and _parse_utc_datetime(val) is not None:
+            out[hk] = val
+    return out
+
+
+def _serialize_ece_bins_payload(
+    all_bins: dict[str, list[list[float | int]]],
+    valid_since: dict[str, str],
+) -> dict[str, Any]:
+    """Build the JSONB payload stored under ``horizon_buckets._ece_bins``."""
+    payload: dict[str, Any] = dict(all_bins)
+    if valid_since:
+        payload[_ECE_VALID_SINCE_KEY] = dict(valid_since)
+    return payload
+
+
+def _pool_ece_bins(
+    all_bins: dict[str, list[list[float | int]]],
+    n_bins: int = _RUNNING_ECE_BINS,
+) -> list[list[float | int]]:
+    """Pool per-horizon bin sums into a single cross-horizon bin table."""
+    pooled = _empty_ece_bins(n_bins)
+    for horizon_bins in all_bins.values():
+        if len(horizon_bins) != n_bins:
+            continue
+        for i, b in enumerate(horizon_bins):
+            pooled[i][0] += int(b[0])
+            pooled[i][1] += float(b[1])
+            pooled[i][2] += float(b[2])
+    return pooled
+
+
 def update_running_metrics(
     engine: Engine,
     *,
@@ -225,16 +397,19 @@ def update_running_metrics(
     actual: float,
     horizon: int | str | None = None,
 ) -> dict[str, float]:
-    """Update the running Brier / ECE counters on ``oracle_models``.
+    """Update the running Brier / binned-ECE counters on ``oracle_models``.
 
-    Uses Welford-style incremental running averages so that each scored
-    prediction costs exactly one UPDATE per metric surface. Two surfaces
-    are maintained:
+    Uses Welford-style incremental running averages for Brier and 10 equal-width
+    per-bin running sums ``[count, Σp, Σy]`` persisted in ``horizon_buckets``
+    (under sibling key ``_ece_bins``) so that both per-horizon ``ece`` and
+    model-level ``running_ece`` are true binned Expected Calibration Error:
+    ``ECE = Σ_b (n_b / N) · |mean_p_b − mean_y_b|``.
+
+    Two surfaces are maintained:
 
     * Legacy scalar columns (``running_brier`` / ``running_ece`` /
-      ``scored_prediction_count``) — the unweighted average across all
-      horizons so existing callers (scoreboard, legacy report) keep
-      working. Kept in lockstep with the bucket state.
+      ``scored_prediction_count``) — kept in lockstep with the bucket state
+      (``running_ece`` is computed from the pooled bins across horizons).
     * Per-horizon JSON buckets inside ``horizon_buckets`` (ALPHA-3 /
       task #106) — the targeted ``horizon`` kwarg determines which
       bucket is updated. When ``horizon`` is ``None`` the 7d bucket is
@@ -258,8 +433,10 @@ def update_running_metrics(
     bucket_key = _horizon_key(horizon)
     prediction = float(prediction)
     actual = float(actual)
+    if not (math.isfinite(prediction) and math.isfinite(actual)):
+        raise ValueError("prediction and actual must be finite numbers")
     squared_error = (prediction - actual) ** 2
-    absolute_error = abs(prediction - actual)
+    abs_err_sample = abs(prediction - actual)
 
     with engine.begin() as conn:
         row = conn.execute(
@@ -274,6 +451,8 @@ def update_running_metrics(
             # Auto-seed a skeleton row so contract handlers never crash on
             # an unknown model id. Real model metadata is populated by
             # ``OracleEngine._load_models`` when the engine first runs.
+            seed_bins = _update_ece_bins(_empty_ece_bins(), prediction, actual)
+            initial_ece = _binned_ece_from_bins(seed_bins)
             conn.execute(
                 text(
                     "INSERT INTO oracle_models (name, version, signal_families, "
@@ -282,15 +461,16 @@ def update_running_metrics(
                     "VALUES (:m, '1.0', '[]'::jsonb, :b, :e, 1, NOW()) "
                     "ON CONFLICT (name) DO NOTHING"
                 ),
-                {"m": model_id, "b": squared_error, "e": absolute_error},
+                {"m": model_id, "b": squared_error, "e": initial_ece},
             )
-            # Best-effort: try to seed the horizon bucket too. Swallow
-            # errors so an un-migrated DB still returns normally.
+            # Best-effort: try to seed the horizon bucket + 10-bin ECE state too.
+            # Swallow errors so an un-migrated DB still returns normally.
             try:
-                seed_buckets = _parse_horizon_buckets(None)
+                seed_buckets: dict[str, Any] = _parse_horizon_buckets(None)
                 seed_buckets[bucket_key]["scored"] = 1
                 seed_buckets[bucket_key]["brier"] = squared_error
-                seed_buckets[bucket_key]["ece"] = absolute_error
+                seed_buckets[bucket_key]["ece"] = round(initial_ece, 6)
+                seed_buckets[_ECE_BINS_KEY] = {bucket_key: seed_bins}
                 conn.execute(
                     text(
                         "UPDATE oracle_models "
@@ -306,7 +486,7 @@ def update_running_metrics(
                 )
             return {
                 "running_brier": squared_error,
-                "running_ece": absolute_error,
+                "running_ece": initial_ece,
                 "count": 1,
             }
 
@@ -317,14 +497,18 @@ def update_running_metrics(
 
         if old_count == 0:
             new_brier = squared_error
-            new_ece = absolute_error
+            running_mae = abs_err_sample
         else:
             # Incremental running mean:
             #   new_avg = old_avg + (x - old_avg) / new_count
             new_brier = old_brier + (squared_error - old_brier) / new_count
-            new_ece = old_ece + (absolute_error - old_ece) / new_count
+            # Un-migrated scalar fallback only (no horizon_buckets JSONB to
+            # hold per-bin sums): this is running MAE stored in the legacy
+            # running_ece slot until horizon_buckets is available.
+            running_mae = old_ece + (abs_err_sample - old_ece) / new_count
+        new_ece = running_mae
 
-        # ── Per-horizon bucket update (ALPHA-3 / task #106) ────────────
+        # ── Per-horizon bucket + 10-bin ECE update (ALPHA-3 / task #106) ─
         # Pulled in a best-effort branch so an un-migrated DB (missing
         # the horizon_buckets column) still lets the legacy update
         # succeed. The bucket SELECT is wrapped separately because the
@@ -338,38 +522,75 @@ def update_running_metrics(
                 {"m": model_id},
             ).fetchone()
             raw_bucket_payload = bucket_row[0] if bucket_row else None
-            # Only treat the payload as real persisted bucket data when
-            # it is a dict or JSON-encoded dict. Mocked fetchone results
-            # (tuples, scalars) fall through to the default factory and
-            # the legacy column override is suppressed so existing Wave
-            # A tests that exercise update_running_metrics keep their
-            # Welford-computed expectations intact.
-            _bucket_payload_is_real = isinstance(raw_bucket_payload, dict)
-            if isinstance(raw_bucket_payload, str):
+            raw_dict: dict[str, Any] | None = None
+            if isinstance(raw_bucket_payload, dict):
+                raw_dict = raw_bucket_payload
+            elif isinstance(raw_bucket_payload, str):
                 try:
                     _candidate = json.loads(raw_bucket_payload)
-                    _bucket_payload_is_real = isinstance(_candidate, dict)
+                    if isinstance(_candidate, dict):
+                        raw_dict = _candidate
                 except (TypeError, ValueError):
-                    _bucket_payload_is_real = False
+                    raw_dict = None
+            # Only treat the payload as real persisted bucket state when the DB
+            # returned a JSONB dict, JSON-encoded dict, or a 1-column NULL row
+            # ``(None,)``. Wave A mocks return a 3-tuple ``(brier, ece, count)``
+            # for every SELECT and fall through to the legacy scalar fallback.
+            _bucket_payload_is_real = (
+                raw_dict is not None
+                or (
+                    bucket_row is not None
+                    and len(bucket_row) == 1
+                    and raw_bucket_payload is None
+                )
+            )
             parsed = _parse_horizon_buckets(
-                raw_bucket_payload if _bucket_payload_is_real else None
+                raw_dict if _bucket_payload_is_real else None
             )
             bucket = dict(parsed.get(bucket_key, {}))
             b_scored = int(bucket.get("scored", 0) or 0)
             b_brier = float(bucket.get("brier", 0.0) or 0.0)
-            b_ece = float(bucket.get("ece", 0.0) or 0.0)
             new_b_scored = b_scored + 1
             if b_scored == 0:
                 new_b_brier = squared_error
-                new_b_ece = absolute_error
             else:
                 new_b_brier = b_brier + (squared_error - b_brier) / new_b_scored
-                new_b_ece = b_ece + (absolute_error - b_ece) / new_b_scored
+
+            all_ece_bins = _extract_all_ece_bins(raw_dict, HORIZON_BUCKETS)
+            valid_since_map = _extract_ece_valid_since(raw_dict, HORIZON_BUCKETS)
+            if bucket_key not in all_ece_bins and b_scored > 0:
+                log.debug(
+                    "update_running_metrics: initializing 10-bin ECE state for "
+                    "legacy bucket {m}/{bk} (prior scored={n})",
+                    m=model_id, bk=bucket_key, n=b_scored,
+                )
+            updated_bins = _update_ece_bins(
+                all_ece_bins.get(bucket_key, _empty_ece_bins()),
+                prediction,
+                actual,
+            )
+            all_ece_bins[bucket_key] = updated_bins
+            bin_samples = _ece_bin_sample_count(updated_bins)
+            new_b_ece = _binned_ece_from_bins(updated_bins)
+            ece_is_valid = bin_samples >= _MIN_ECE_BIN_SAMPLES
+            is_legacy_bucket = bin_samples < new_b_scored
+
             bucket.update({
                 "scored": new_b_scored,
                 "brier": round(new_b_brier, 6),
-                "ece": round(new_b_ece, 6),
             })
+            if ece_is_valid:
+                if bucket_key not in valid_since_map:
+                    valid_since_map[bucket_key] = datetime.now(timezone.utc).isoformat()
+                bucket["ece"] = round(new_b_ece, 6)
+            elif not is_legacy_bucket:
+                # Fresh bucket with no pre-cutover MAE: store running binned
+                # ECE for display, while ece_valid remains False until 30
+                # binned samples accumulate (snapshots store NULL; drift skips).
+                bucket["ece"] = round(new_b_ece, 6)
+            # Legacy bucket warming up (< 30 binned samples): leave bucket["ece"]
+            # untouched so a 1-sample |p-y| never overwrites legacy MAE.
+
             # Keep default weight / counter fields intact.
             bucket.setdefault("weight", 1.0)
             bucket.setdefault("hits", 0)
@@ -381,45 +602,50 @@ def update_running_metrics(
                 text(
                     "UPDATE oracle_models "
                     "SET horizon_buckets = jsonb_set("
-                    "    COALESCE(horizon_buckets, '{}'::jsonb), "
-                    "    :path, CAST(:bucket AS JSONB), true) "
+                    "    jsonb_set("
+                    "        COALESCE(horizon_buckets, '{}'::jsonb), "
+                    "        :path, CAST(:bucket AS JSONB), true"
+                    "    ), "
+                    "    :ece_path, CAST(:ece_bins AS JSONB), true"
+                    ") "
                     "WHERE name = :m"
                 ),
                 {
                     "path": "{" + bucket_key + "}",
                     "bucket": json.dumps(bucket),
+                    "ece_path": "{" + _ECE_BINS_KEY + "}",
+                    "ece_bins": json.dumps(
+                        _serialize_ece_bins_payload(all_ece_bins, valid_since_map)
+                    ),
                     "m": model_id,
                 },
             )
 
-            # Refresh the legacy scalar Brier/ECE to the unweighted mean
-            # across buckets that actually have scored events. Unscored
-            # buckets are ignored so they don't drag the legacy average
-            # toward zero on cold starts.
+            # Refresh the legacy scalar Brier (unweighted mean across scored
+            # buckets) and legacy scalar ECE (true pooled 10-bin ECE once
+            # pooled bins reach >= 30 samples or on a fresh post-cutover model).
             if _bucket_payload_is_real:
                 scored_buckets = [
                     parsed[k] for k in HORIZON_BUCKETS
                     if int(parsed.get(k, {}).get("scored", 0) or 0) > 0
                 ]
                 if scored_buckets:
-                    legacy_brier = sum(
+                    new_brier = sum(
                         float(b.get("brier", 0.0) or 0.0)
                         for b in scored_buckets
                     ) / len(scored_buckets)
-                    legacy_ece = sum(
-                        float(b.get("ece", 0.0) or 0.0)
-                        for b in scored_buckets
-                    ) / len(scored_buckets)
-                    # Override the Welford-computed values so the legacy
-                    # columns reflect the bucket average (single-bucket
-                    # callers see identical values to the pre-ALPHA-3
-                    # path). Only fires when the DB actually returned a
-                    # dict-shaped bucket payload — otherwise the Welford
-                    # values from the legacy row are left intact so
-                    # Wave A test_subsequent_value_is_running_mean keeps
-                    # passing against the mock_engine fixture.
-                    new_brier = legacy_brier
-                    new_ece = legacy_ece
+                pooled_bins = _pool_ece_bins(all_ece_bins)
+                pooled_samples = _ece_bin_sample_count(pooled_bins)
+                total_bucket_scored = sum(
+                    int(b.get("scored", 0) or 0) for b in scored_buckets
+                )
+                if (
+                    pooled_samples >= _MIN_ECE_BIN_SAMPLES
+                    or pooled_samples >= total_bucket_scored
+                ):
+                    new_ece = _binned_ece_from_bins(pooled_bins)
+                else:
+                    new_ece = old_ece
         except Exception as exc:
             log.debug(
                 "update_running_metrics: bucket update skipped for {m}/{bk}: {e}",
@@ -507,7 +733,21 @@ def compute_per_horizon_calibration(
     if not row:
         return {}
 
-    parsed = _parse_horizon_buckets(row[0])
+    raw_hb = row[0]
+    raw_hb_dict: dict[str, Any] | None = None
+    if isinstance(raw_hb, dict):
+        raw_hb_dict = raw_hb
+    elif isinstance(raw_hb, str):
+        try:
+            _cand = json.loads(raw_hb)
+            if isinstance(_cand, dict):
+                raw_hb_dict = _cand
+        except (TypeError, ValueError):
+            raw_hb_dict = None
+
+    parsed = _parse_horizon_buckets(raw_hb)
+    all_ece_bins = _extract_all_ece_bins(raw_hb_dict, HORIZON_BUCKETS)
+    valid_since_map = _extract_ece_valid_since(raw_hb_dict, HORIZON_BUCKETS)
     regime_weight_multiplier = 1.0
     if regime is not None and len(row) > 1 and row[1] is not None:
         try:
@@ -527,37 +767,43 @@ def compute_per_horizon_calibration(
                 "{m}/{r}: {e}", m=model_name, r=regime, e=str(exc),
             )
             regime_weight_multiplier = 1.0
-    out: dict[int, dict[str, float]] = {}
-    for h in horizons:
-        key = f"{int(h)}d"
-        if key not in parsed:
-            continue
-        b = parsed[key]
-        out[int(h)] = {
+
+    def _build_bucket_entry(bucket_key: str, b: dict[str, Any]) -> dict[str, Any]:
+        h_bins = all_ece_bins.get(bucket_key)
+        ece_bin_samples = _ece_bin_sample_count(h_bins) if h_bins is not None else 0
+        ece_valid = ece_bin_samples >= _MIN_ECE_BIN_SAMPLES
+        ece_binned = (
+            round(_binned_ece_from_bins(h_bins), 6)
+            if ece_valid and h_bins is not None
+            else None
+        )
+        return {
             "brier": float(b.get("brier", 0.0) or 0.0),
             "ece": float(b.get("ece", 0.0) or 0.0),
+            "ece_binned": ece_binned,
+            "ece_bin_samples": ece_bin_samples,
+            "ece_valid": ece_valid,
+            "ece_valid_since": valid_since_map.get(bucket_key) if ece_valid else None,
             "scored": int(b.get("scored", 0) or 0),
             "weight": float(b.get("weight", 1.0) or 1.0) * regime_weight_multiplier,
             "hits": int(b.get("hits", 0) or 0),
             "misses": int(b.get("misses", 0) or 0),
             "partials": int(b.get("partials", 0) or 0),
         }
+
+    out: dict[int, dict[str, Any]] = {}
+    for h in horizons:
+        key = f"{int(h)}d"
+        if key not in parsed:
+            continue
+        out[int(h)] = _build_bucket_entry(key, parsed[key])
     # Also include any canonical bucket present in the JSON but not
     # explicitly requested — a report pulling the standard 1/7/30/90 set
     # should never surprise the caller with a missing bucket.
     for key in HORIZON_BUCKETS:
         days = int(key.rstrip("d"))
         if days not in out and key in parsed:
-            b = parsed[key]
-            out[days] = {
-                "brier": float(b.get("brier", 0.0) or 0.0),
-                "ece": float(b.get("ece", 0.0) or 0.0),
-                "scored": int(b.get("scored", 0) or 0),
-                "weight": float(b.get("weight", 1.0) or 1.0) * regime_weight_multiplier,
-                "hits": int(b.get("hits", 0) or 0),
-                "misses": int(b.get("misses", 0) or 0),
-                "partials": int(b.get("partials", 0) or 0),
-            }
+            out[days] = _build_bucket_entry(key, parsed[key])
     return out
 
 
@@ -637,6 +883,20 @@ def snapshot_calibration_history(
                     if scored < _DRIFT_MIN_SCORED:
                         counts["skipped"] += 1
                         continue
+                    ece_valid = bool(bucket.get("ece_valid", True))
+                    if ece_valid:
+                        raw_ece = bucket.get("ece_binned")
+                        ece_param: float | None = (
+                            float(raw_ece)
+                            if raw_ece is not None
+                            else float(bucket.get("ece", 0.0) or 0.0)
+                        )
+                    else:
+                        # Record NULL until the bucket's 10-bin ECE state holds
+                        # at least _MIN_ECE_BIN_SAMPLES (30) observations so
+                        # drift baselines are never contaminated by legacy MAE
+                        # or thin-sample cutover noise.
+                        ece_param = None
                     try:
                         conn.execute(
                             text(
@@ -654,7 +914,7 @@ def snapshot_calibration_history(
                                 "m": model_name,
                                 "h": int(horizon),
                                 "b": float(bucket.get("brier", 0.0) or 0.0),
-                                "e": float(bucket.get("ece", 0.0) or 0.0),
+                                "e": ece_param,
                                 "s": scored,
                                 "w": float(bucket.get("weight", 1.0) or 1.0),
                             },
@@ -733,7 +993,7 @@ def detect_calibration_drift(
                     hist_rows = conn.execute(
                         text(
                             """
-                            SELECT brier, ece
+                            SELECT brier, ece, snapshot_at
                             FROM oracle_calibration_history
                             WHERE model_name = :m
                               AND horizon_days = :h
@@ -756,10 +1016,28 @@ def detect_calibration_drift(
                 continue
 
             brier_hist = [float(r[0]) for r in hist_rows if r[0] is not None]
-            ece_hist = [float(r[1]) for r in hist_rows if r[1] is not None]
+
+            ece_valid = bool(bucket.get("ece_valid", True))
+            valid_since_dt = _parse_utc_datetime(bucket.get("ece_valid_since"))
+            if not ece_valid:
+                ece_hist: list[float] = []
+            elif valid_since_dt is not None:
+                ece_hist = []
+                for r in hist_rows:
+                    if r[1] is None or len(r) < 3 or r[2] is None:
+                        continue
+                    snap_dt = _parse_utc_datetime(r[2])
+                    if snap_dt is not None and snap_dt >= valid_since_dt:
+                        ece_hist.append(float(r[1]))
+            else:
+                ece_hist = [float(r[1]) for r in hist_rows if r[1] is not None]
 
             cur_brier = float(bucket.get("brier", 0.0) or 0.0)
-            cur_ece = float(bucket.get("ece", 0.0) or 0.0)
+            cur_ece = (
+                float(bucket["ece_binned"])
+                if bucket.get("ece_binned") is not None
+                else float(bucket.get("ece", 0.0) or 0.0)
+            )
 
             for metric, cur, hist in (
                 ("brier", cur_brier, brier_hist),

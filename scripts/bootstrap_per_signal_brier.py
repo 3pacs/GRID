@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -57,11 +58,12 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-# IMPORT — never reimplement. record_scored_prediction owns the Welford
-# update path for per_signal_brier_history.
 from features.per_signal_brier import (
+    MIN_CALIBRATED_SAMPLES,
+    MIN_EFFECTIVE_WEIGHT_SUM,
+    _canonical_horizon,
     ensure_tables,
-    record_scored_prediction,
+    record_scored_prediction,  # noqa: F401 — kept for backward-compat imports
 )
 
 
@@ -386,6 +388,122 @@ def _fetch_scored_predictions(
     return [dict(zip(_ORACLE_COLUMNS, row)) for row in rows or []]
 
 
+def _write_bootstrapped_buckets(
+    engine: Engine,
+    buckets: dict[tuple[str, int], dict[str, Any]],
+    *,
+    append: bool = False,
+) -> dict[str, int]:
+    """Persist aggregated weighted-mean Brier buckets to ``per_signal_brier_history``.
+
+    Computes ``running_brier = Σ(w·se) / Σw`` and ``running_ece = Σ(w·ae) / Σw``
+    from the full in-memory accumulators so rows never suffer count-dilution or
+    incremental drift without a persisted ``weight_sum`` column.
+
+    When ``append=True``, existing rows are skipped (``ON CONFLICT DO NOTHING``)
+    because merging into a pre-existing row without persisted ``Σw`` would drift.
+    Buckets that reach ``MIN_CALIBRATED_SAMPLES`` with ``Σw < MIN_EFFECTIVE_WEIGHT_SUM``
+    are also skipped (fail closed) because the current schema has no ``weight_sum``
+    column to guard them on read.
+    """
+    ensure_tables(engine)
+    stats = {"written": 0, "skipped_low_effective_weight": 0, "skipped_existing": 0}
+    if not buckets:
+        return stats
+
+    insert_sql = (
+        text(
+            """
+            INSERT INTO per_signal_brier_history
+                (signal_source, horizon_days, scored_count,
+                 running_brier, running_ece, hit_count, last_updated)
+            VALUES (:s, :h, :n, :b, :e, :hit, COALESCE(:scored_at, NOW()))
+            ON CONFLICT (signal_source, horizon_days) DO NOTHING
+            """
+        )
+        if append
+        else text(
+            """
+            INSERT INTO per_signal_brier_history
+                (signal_source, horizon_days, scored_count,
+                 running_brier, running_ece, hit_count, last_updated)
+            VALUES (:s, :h, :n, :b, :e, :hit, COALESCE(:scored_at, NOW()))
+            ON CONFLICT (signal_source, horizon_days)
+            DO UPDATE SET
+                scored_count  = EXCLUDED.scored_count,
+                running_brier = EXCLUDED.running_brier,
+                running_ece   = EXCLUDED.running_ece,
+                hit_count     = EXCLUDED.hit_count,
+                last_updated  = GREATEST(per_signal_brier_history.last_updated,
+                                         EXCLUDED.last_updated)
+            """
+        )
+    )
+
+    pending_written = 0
+    pending_skipped_low = 0
+    pending_skipped_existing = 0
+    try:
+        with engine.begin() as conn:
+            for (source, horizon), acc in buckets.items():
+                weight_sum = float(acc["weight_sum"])
+                if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+                    continue
+                scored_count = int(acc["scored_count"])
+                if (
+                    scored_count >= MIN_CALIBRATED_SAMPLES
+                    and weight_sum + 1e-12 < MIN_EFFECTIVE_WEIGHT_SUM
+                ):
+                    log.warning(
+                        "bootstrap_per_signal_brier: skipping ({s}, {h}d) — "
+                        "scored_count={n} but effective weight Σw={w:.3f} < {floor} "
+                        "(schema lacks weight_sum column; failing closed)",
+                        s=source,
+                        h=horizon,
+                        n=scored_count,
+                        w=weight_sum,
+                        floor=MIN_EFFECTIVE_WEIGHT_SUM,
+                    )
+                    pending_skipped_low += 1
+                    continue
+
+                running_brier = float(acc["weighted_brier_sum"]) / weight_sum
+                running_ece = float(acc["weighted_ece_sum"]) / weight_sum
+                result = conn.execute(
+                    insert_sql,
+                    {
+                        "s": source,
+                        "h": int(horizon),
+                        "n": scored_count,
+                        "b": running_brier,
+                        "e": running_ece,
+                        "hit": int(acc["hit_count"]),
+                        "scored_at": acc.get("last_updated"),
+                    },
+                )
+                rowcount = getattr(result, "rowcount", 1)
+                if append and rowcount == 0:
+                    log.warning(
+                        "bootstrap_per_signal_brier: --append skipped existing "
+                        "({s}, {h}d) without persisted Σw to prevent drift",
+                        s=source,
+                        h=horizon,
+                    )
+                    pending_skipped_existing += 1
+                else:
+                    pending_written += 1
+        # Commit succeeded — record counts only after the transaction finishes cleanly.
+        stats["written"] = pending_written
+        stats["skipped_low_effective_weight"] = pending_skipped_low
+        stats["skipped_existing"] = pending_skipped_existing
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "bootstrap_per_signal_brier: bucket write failed: {e}",
+            e=str(exc),
+        )
+    return stats
+
+
 # ── Main replay path ──────────────────────────────────────────────────────
 
 
@@ -399,7 +517,8 @@ def replay_predictions(
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Walk historical scored predictions and seed
-    ``per_signal_brier_history``.
+    ``per_signal_brier_history`` with exact weighted-mean Brier scores
+    ``Σ(w·se) / Σw``.
 
     Parameters
     ----------
@@ -410,8 +529,8 @@ def replay_predictions(
         Lookback window in days (default 365).
     append
         If False (default) the table is truncated before replay. If True
-        the existing buckets are kept and the replay extends them — used
-        for incremental top-ups.
+        existing buckets are preserved and never drifted (only brand-new
+        buckets are inserted).
     dry_run
         If True, no writes occur but rows are still walked and counted.
     limit
@@ -433,6 +552,7 @@ def replay_predictions(
         rows = rows[: int(limit)]
 
     signal_counts: dict[str, int] = {}
+    buckets: dict[tuple[str, int], dict[str, Any]] = {}
     replayed = 0
     skipped = 0
 
@@ -454,7 +574,7 @@ def replay_predictions(
                 continue
 
             outcome = verdict_to_outcome(verdict)
-            horizon_days = _coerce_horizon_days(row)
+            horizon_days = _canonical_horizon(_coerce_horizon_days(row))
             contributions = extract_signal_contributions(
                 row,
                 oracle_models_lookup=oracle_models_lookup,
@@ -471,26 +591,40 @@ def replay_predictions(
                     n=len(contributions),
                 )
 
-            if not dry_run:
-                # Pass scored_at so the per-bucket ``last_updated`` reflects
-                # WHEN this prediction was actually scored, not when the
-                # bootstrap ran. Walk-forward audits filter by
-                # ``last_updated <= as_of`` to prevent lookahead leak; a
-                # bootstrap that stamps every row with NOW() makes the
-                # scorecards invisible to every historical replay. With
-                # ``scored_at`` plumbed through, replaying the corpus in
-                # chronological order produces a per_signal_brier_history
-                # that the walk-forward harness can actually consume.
-                record_scored_prediction(
-                    engine,
-                    horizon_days=horizon_days,
-                    confidence=confidence,
-                    outcome=outcome,
-                    signal_contributions=contributions,
-                    scored_at=row.get("scored_at"),
-                )
+            squared_error = (confidence - outcome) ** 2
+            absolute_error = abs(confidence - outcome)
+            directional_hit = 1 if (confidence >= 0.5) == (outcome >= 0.5) else 0
+            scored_at = row.get("scored_at")
 
-            for source in contributions:
+            for source, weight in contributions.items():
+                w = float(weight)
+                if not math.isfinite(w) or w <= 0.0:
+                    continue
+                key = (source, horizon_days)
+                acc = buckets.get(key)
+                if acc is None:
+                    acc = {
+                        "scored_count": 0,
+                        "weight_sum": 0.0,
+                        "weighted_brier_sum": 0.0,
+                        "weighted_ece_sum": 0.0,
+                        "hit_count": 0,
+                        "last_updated": None,
+                    }
+                    buckets[key] = acc
+                acc["scored_count"] += 1
+                acc["weight_sum"] += w
+                acc["weighted_brier_sum"] += w * squared_error
+                acc["weighted_ece_sum"] += w * absolute_error
+                acc["hit_count"] += directional_hit
+                # Preserve the latest scored_at timestamp for PIT lookahead guards
+                # (walk-forward audits filter per_signal_brier_history by
+                # last_updated <= as_of).
+                if scored_at is not None:
+                    prev_ts = acc["last_updated"]
+                    if prev_ts is None or scored_at > prev_ts:
+                        acc["last_updated"] = scored_at
+
                 signal_counts[source] = signal_counts.get(source, 0) + 1
             replayed += 1
         except Exception as exc:  # noqa: BLE001
@@ -502,8 +636,13 @@ def replay_predictions(
             )
             continue
 
+    write_stats = {"written": 0, "skipped_low_effective_weight": 0, "skipped_existing": 0}
+    if not dry_run:
+        write_stats = _write_bootstrapped_buckets(engine, buckets, append=append)
+
     summary = _compose_summary(replayed, signal_counts)
     summary["skipped_count"] = skipped
+    summary["skipped_low_effective_weight"] = write_stats["skipped_low_effective_weight"]
     summary["dry_run"] = bool(dry_run)
     summary["append"] = bool(append)
     summary["lookback_days"] = int(days)
