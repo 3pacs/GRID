@@ -460,3 +460,53 @@ def test_pull_log_summary_plan_is_one_scan(pipeline_pg):
 
     assert scans(plan["Plan"]) == 1
     print(f"pull_log_summary_pg_plan rows=20010 exec_ms={plan['Execution Time']:.3f}")
+
+
+def test_finra_shared_row_is_judged_by_its_own_series(pipeline_pg):
+    """A DIX-only day: FINRA_SHORT_VOLUME is not healthy and is listed stale.
+
+    finra_dix writes finra:dix_sp500 under the FINRA_SHORT_VOLUME catalog row
+    and bumps its last_pull_at. Its row, its run and the bump must not stand
+    in for the short-volume puller's own series, which last landed 72 h ago
+    (ingestion/source_freshness.py::SERIES_ANCHORS).
+    """
+    with pipeline_pg.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE raw_series ADD COLUMN obs_date date, ADD COLUMN value double precision"
+        ))
+        conn.execute(text(
+            "INSERT INTO source_catalog (id, name, last_pull_at, active) "
+            "VALUES (4679, 'FINRA_SHORT_VOLUME', now() - interval '4 hours', true)"
+        ))
+        conn.execute(text(
+            "INSERT INTO raw_series (source_id, series_id, obs_date, value, pull_timestamp, pull_status) VALUES "
+            "(4679, 'finra:short_volume_agg:market_ratio', CURRENT_DATE - 4, 0.48, now() - interval '72 hours', 'SUCCESS'), "
+            "(4679, 'finra:short_volume:SPY', CURRENT_DATE - 4, 0.51, now() - interval '72 hours', 'SUCCESS'), "
+            "(4679, 'finra:short_volume_agg:market_ratio', CURRENT_DATE - 1, 0, now() - interval '3 hours', 'FAILED'), "
+            "(4679, 'finra:dix_sp500', CURRENT_DATE - 1, 0.45, now() - interval '4 hours', 'SUCCESS')"
+        ))
+        conn.execute(text(
+            "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, status, rows_inserted, error_message) VALUES "
+            "('smart:finra_dix', 4679, now() - interval '4 hours', now() - interval '4 hours', 'SUCCESS', 1, NULL), "
+            "('smart:finra_short_volume', 4679, now() - interval '2 hours', now() - interval '2 hours', "
+            "  'SUCCESS', 0, 'NO_NEW_DATA: run completed, 0 rows written')"
+        ))
+
+    response = _response(pipeline_pg)
+    assert response.status_code == 200
+    finra = {row["name"]: row for row in response.json()["sources"]}["FINRA_SHORT_VOLUME"]
+    assert finra["status"] == "quiet"  # was "healthy" on DIX's row and run
+    landed = datetime.fromisoformat(finra["last_pull"])
+    assert timedelta(hours=71) < datetime.now(timezone.utc) - landed < timedelta(hours=73)
+    assert finra["last_error"].startswith("NO_NEW_DATA")
+    assert finra["runs_7d"] == 1  # the DIX run is not the short-volume puller's
+
+    with patch("api.routers.system.get_db_engine", return_value=pipeline_pg):
+        fresh = TestClient(app).get(
+            "/api/v1/system/freshness",
+            headers={"Authorization": f"Bearer {create_token(expires_hours=1)}"},
+        )
+    assert fresh.status_code == 200
+    stale = {row["source"]: row for row in fresh.json()["stale_sources"]}
+    assert stale["FINRA_SHORT_VOLUME"]["last_pull"] == finra["last_pull"]
+    assert "yfinance" not in stale  # pulled now(); the anchored rule changes nothing else

@@ -1558,7 +1558,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
 # several entries share one catalog row (FRED, yfinance, Kalshi,
 # polymarket) and a shared row cannot say when each job last ran.
 REGISTRY_CATALOG_NAMES: dict[str, str] = {
-    "finra_dix":              "FINRA_SHORT_VOLUME",   # DIX rows ride the FINRA file's own catalog row
+    # DIX rows ride the FINRA file's own catalog row. That row's freshness is
+    # judged by the short-volume puller's own series, not by DIX's rows or
+    # last_pull_at bumps: ingestion/source_freshness.py::SERIES_ANCHORS.
+    "finra_dix":              "FINRA_SHORT_VOLUME",
     "options":                "YFINANCE_OPTIONS",
     "insider_filings":        "SEC_INSIDER",
     "congressional":          "CONGRESS_TRADING",

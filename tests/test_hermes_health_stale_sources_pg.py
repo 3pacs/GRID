@@ -56,10 +56,22 @@ _SCHEMA_DDL = (
 )
 
 
+# Set by the dedicated CI step (.github/workflows/test.yml, "Hermes
+# stale-sources PostgreSQL contract") so a missing or unreachable database
+# fails that step instead of skipping every test in it.
+_REQUIRE_ENV = "REQUIRE_HERMES_STALE_SOURCES_PG"
+
+
+def _skip_or_fail(reason: str) -> None:
+    if os.environ.get(_REQUIRE_ENV) == "1":
+        pytest.fail(f"{reason} ({_REQUIRE_ENV}=1)")
+    pytest.skip(reason)
+
+
 def _require_test_db_url() -> str:
     db_url = os.environ.get("GRID_TEST_DB_URL")
     if not db_url:
-        pytest.skip("GRID_TEST_DB_URL not set")
+        _skip_or_fail("GRID_TEST_DB_URL not set")
     return db_url
 
 
@@ -72,7 +84,7 @@ def health_engine():
             conn.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
         root_engine.dispose()
-        pytest.skip(f"GRID_TEST_DB_URL set but unreachable: {exc}")
+        _skip_or_fail(f"GRID_TEST_DB_URL set but unreachable: {exc}")
 
     schema = f"hermes_health_{uuid.uuid4().hex[:12]}"
     with root_engine.begin() as conn:
@@ -284,4 +296,113 @@ class TestStaleSourceLastAttempt:
         n = by_name["never_attempted_source"]
         assert n["last_attempt_status"] is None and n["not_configured"] is False
         # The health transaction survived the lookup: later keys still populated.
+        assert result["healthy"] is True
+
+
+class TestSharedCatalogRowJudgedByOwnSeries:
+    """FINRA_SHORT_VOLUME is judged by the short-volume puller's own series.
+
+    finra_dix writes finra:dix_sp500 under the same catalog row and the
+    SmartScheduler bumps its last_pull_at for every DIX run, so on
+    2026-11-18..11-20 (no short-volume obs; DIX landing each morning) the
+    old "newer of last_pull_at and the newest row for the source" rule read
+    it fresh and neither the alert nor Hermes's stale-refresh saw the gap.
+    See ingestion/source_freshness.py::SERIES_ANCHORS.
+    """
+
+    # Friday 2026-11-20 14:00Z, the third skipped trade date in a row.
+    NOW = datetime(2026, 11, 20, 14, tzinfo=timezone.utc)
+    SHORT_VOLUME_LANDED = datetime(2026, 11, 18, 7, 50, tzinfo=timezone.utc)  # obs 11-17
+    DIX_LANDED = datetime(2026, 11, 20, 7, 30, tzinfo=timezone.utc)           # obs 11-19
+
+    @pytest.fixture(autouse=True)
+    def _clock(self, monkeypatch):
+        now = self.NOW
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+        monkeypatch.setattr("scripts.hermes_health.datetime", Clock)
+
+    @staticmethod
+    def _row(conn, source_id, series_id, obs_date, landed):
+        conn.execute(
+            text(
+                "INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, pull_status) "
+                "VALUES (:series, :sid, :obs, :ts, 0.48, 'SUCCESS')"
+            ),
+            {"series": series_id, "sid": source_id, "obs": obs_date, "ts": landed},
+        )
+
+    def _dix_only_day(self, conn):
+        finra = _add_source(conn, "FINRA_SHORT_VOLUME", last_pull_at=self.DIX_LANDED)
+        for series in ("finra:short_volume_agg:market_ratio", "finra:short_volume:SPY"):
+            self._row(conn, finra, series, self.SHORT_VOLUME_LANDED.date() - timedelta(days=1),
+                      self.SHORT_VOLUME_LANDED)
+        self._row(conn, finra, "finra:dix_sp500", self.DIX_LANDED.date() - timedelta(days=1),
+                  self.DIX_LANDED)
+        return finra
+
+    def test_dix_only_day_reads_stale_for_the_short_volume_puller(self, health_engine):
+        from scripts.hermes_health import check_db_health
+
+        with health_engine.begin() as conn:
+            self._dix_only_day(conn)
+
+        result = check_db_health(health_engine)
+
+        assert "error" not in result
+        by_name = {s["source"]: s for s in result["stale_sources"]}
+        entry = by_name["FINRA_SHORT_VOLUME"]
+        assert entry["last_pull"] == self.SHORT_VOLUME_LANDED.isoformat()
+        assert entry["cadence"] == "DAILY"
+        assert entry["age_hours"] == pytest.approx(54.2, abs=0.1)
+        judged = entry["judged_by"]
+        assert judged["owner"] == "finra_short_volume"
+        assert {s["series_id"]: s["obs_date"] for s in judged["series"]} == {
+            "finra:short_volume_agg:market_ratio": "2026-11-17",
+            "finra:short_volume:SPY": "2026-11-17",
+        }
+
+    def test_fresh_short_volume_series_is_not_flagged(self, health_engine):
+        from scripts.hermes_health import check_db_health
+
+        landed = datetime(2026, 11, 20, 8, 5, tzinfo=timezone.utc)
+        with health_engine.begin() as conn:
+            finra = self._dix_only_day(conn)
+            for series in ("finra:short_volume_agg:market_ratio", "finra:short_volume:SPY"):
+                self._row(conn, finra, series, landed.date() - timedelta(days=1), landed)
+
+        result = check_db_health(health_engine)
+
+        assert "FINRA_SHORT_VOLUME" not in _stale_names(result)
+
+    def test_dix_attempt_is_not_the_short_volume_last_attempt(self, health_engine):
+        """A DIX "no TIINGO_API_KEY" skip must not mark short volume not_configured."""
+        from scripts.hermes_health import check_db_health
+
+        with health_engine.begin() as conn:
+            conn.execute(text(TestStaleSourceLastAttempt._PULL_LOG_DDL))
+            finra = self._dix_only_day(conn)
+            for name, started, status, error in (
+                ("smart:finra_short_volume", datetime(2026, 11, 20, 9, tzinfo=timezone.utc),
+                 "SUCCESS", "NO_NEW_DATA: run completed, 0 rows written"),
+                ("smart:finra_dix", datetime(2026, 11, 20, 10, tzinfo=timezone.utc),
+                 "SUCCESS", "SKIPPED: missing API key TIINGO_API_KEY not configured"),
+            ):
+                conn.execute(
+                    text(
+                        "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, "
+                        "status, error_message) VALUES (:n, :sid, :st, :st, :status, :err)"
+                    ),
+                    {"n": name, "sid": finra, "st": started, "status": status, "err": error},
+                )
+
+        result = check_db_health(health_engine)
+
+        entry = {s["source"]: s for s in result["stale_sources"]}["FINRA_SHORT_VOLUME"]
+        assert entry["last_attempt_reason"].startswith("NO_NEW_DATA")
+        assert entry["not_configured"] is False
         assert result["healthy"] is True

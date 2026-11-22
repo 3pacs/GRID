@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -38,6 +38,7 @@ from ingestion.smart_scheduler import (
     SMART_PULL_LOG_PREFIX,
     catalog_name_for,
 )
+from store.observations import read_latest
 
 FRESH = "FRESH"
 PARTIAL = "PARTIAL"          # rows landed since the last SUCCESS, but no run was logged SUCCESS
@@ -377,10 +378,18 @@ def merge_catalog_runs(
     registry's catalog mapping, otherwise the puller name itself) and is
     dropped when no catalog row has that name. ``catalog_ids`` is keyed by
     lower-cased catalog name.
+
+    The exception is a catalog row in ``SERIES_ANCHORS``: runs of the other
+    registry entries that share it (``smart:finra_dix`` under
+    FINRA_SHORT_VOLUME) are not its runs and are dropped, so a DIX success
+    can neither stand in for the short-volume puller's run nor a DIX
+    failure for its failure.
     """
     merged: dict[int, CatalogRunSummary] = {}
     for row in rows:
         source_id, puller_name, last_run_at, last_rows_at, runs_7d, status, rows_inserted, error = row[:8]
+        if str(puller_name or "") in GUEST_PULL_LOG_NAMES:
+            continue
         if source_id is None:
             source_id = catalog_ids.get(_catalog_key_for_puller(str(puller_name or "")))
             if source_id is None:
@@ -508,3 +517,179 @@ def safe_last_error(message: str | None, max_chars: int = LAST_ERROR_MAX_CHARS) 
     if len(cleaned) > max_chars:
         cleaned = cleaned[: max_chars - 1].rstrip() + "…"
     return cleaned
+
+
+# ── Shared catalog rows: judged by the owner's own series ─────────────────
+#
+# Several registry entries can write under one source_catalog row. The
+# source-level checks (scripts/hermes_health.py::check_db_health's
+# stale_sources, which feeds the db.stale_sources alert and Hermes's
+# stale-refresh; /system/pipeline-health; /system/freshness; the
+# architecture puller stats) judge a row by "the newest raw_series row, or
+# source_catalog.last_pull_at, for the source". On a shared row that reads
+# one writer's output as another's.
+#
+# FINRA_SHORT_VOLUME is the row where that cost data. finra_dix writes
+# finra:dix_sp500 under it every morning, and SmartScheduler._update_last_pull
+# bumps its last_pull_at for each DIX run (REGISTRY_CATALOG_NAMES). From
+# 2026-11-12 the short-volume puller skipped obs 11-12, 11-13 and 11-18..11-20
+# (PR #1325) and every one of those checks still read the row as fresh for
+# 8 days.
+#
+# A row listed here is judged by its owner's own series only: the newest
+# accepted observation of each anchor series, read through
+# store.observations (SUCCESS rows, newest obs_date at or before today, that
+# date's latest vintage, this catalog row's rows only). The row is as fresh
+# as its stalest anchor, so either half of the short-volume write (the
+# pinned producer's per-symbol rows, or the aggregate subclass's ratios)
+# going dark reads stale. Neither last_pull_at nor any other series under
+# the same source_id counts, and pull_log runs of the other entries sharing
+# the row are not its runs (merge_catalog_runs).
+
+
+@dataclass(frozen=True)
+class SeriesAnchor:
+    """A source_catalog row judged by the series its owning registry entry writes."""
+
+    catalog_name: str
+    owner: str  # PULLER_REGISTRY name whose freshness the catalog row reports
+    series: tuple[str, ...]
+
+
+SERIES_ANCHORS: tuple[SeriesAnchor, ...] = (
+    SeriesAnchor(
+        catalog_name="FINRA_SHORT_VOLUME",
+        owner="finra_short_volume",
+        series=(
+            # finra_short_volume_agg.AGG_MARKET_RATIO: one row per trade date.
+            "finra:short_volume_agg:market_ratio",
+            # FINRAShortVolumePuller.series_id("SPY"): the pinned producer's
+            # per-symbol rows, present in every CNMS file.
+            "finra:short_volume:SPY",
+        ),
+    ),
+)
+
+
+def anchor_for(catalog_name: str | None) -> SeriesAnchor | None:
+    """The anchor for a catalog row (case-insensitive), or ``None``."""
+    key = (catalog_name or "").strip().lower()
+    return next((a for a in SERIES_ANCHORS if a.catalog_name.lower() == key), None)
+
+
+def guest_pull_log_names(anchor: SeriesAnchor) -> frozenset[str]:
+    """pull_log names of the other registry entries writing under ``anchor``'s row."""
+    key = anchor.catalog_name.lower()
+    return frozenset(
+        SMART_PULL_LOG_PREFIX + e["name"]
+        for e in PULLER_REGISTRY
+        if e["name"] != anchor.owner and catalog_name_for(e["name"]).lower() == key
+    )
+
+
+GUEST_PULL_LOG_NAMES: frozenset[str] = frozenset().union(
+    *(guest_pull_log_names(a) for a in SERIES_ANCHORS)
+)
+
+
+@dataclass(frozen=True)
+class AnchorReading:
+    """The newest accepted observation of one anchor series."""
+
+    series_id: str
+    obs_date: date | None
+    landed_at: datetime | None  # pull_timestamp of that observation, UTC
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "series_id": self.series_id,
+            "obs_date": self.obs_date.isoformat() if self.obs_date else None,
+            "landed_at": self.landed_at.isoformat() if self.landed_at else None,
+        }
+
+
+@dataclass(frozen=True)
+class AnchoredFreshness:
+    """A shared catalog row's freshness, read from its owner's anchor series."""
+
+    catalog_name: str
+    owner: str
+    readings: tuple[AnchorReading, ...]
+    error: str | None = None
+
+    @property
+    def stalest(self) -> AnchorReading | None:
+        """The anchor that decides: one with no observation, else the oldest landing."""
+        oldest: AnchorReading | None = None
+        for reading in self.readings:
+            if reading.landed_at is None:
+                return reading
+            if oldest is None or (oldest.landed_at is not None and reading.landed_at < oldest.landed_at):
+                oldest = reading
+        return oldest
+
+    @property
+    def landed_at(self) -> datetime | None:
+        """When the stalest anchor's newest observation landed.
+
+        ``None`` (never) when any anchor has no accepted observation, when
+        there are no readings, or when the read failed: an unread source is
+        not a fresh one.
+        """
+        if self.error is not None:
+            return None
+        stalest = self.stalest
+        return stalest.landed_at if stalest is not None else None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "series": [r.as_dict() for r in self.readings],
+            "error": self.error,
+        }
+
+
+def read_anchored_freshness(
+    conn: Any,
+    anchor: SeriesAnchor,
+    *,
+    as_of: date | None = None,
+) -> AnchoredFreshness:
+    """Read each anchor series' newest accepted observation (read-only).
+
+    One ``store.observations.read_latest`` per anchor, constrained to the
+    anchor's catalog row and to ``obs_date <= as_of``, each an index seek
+    on ``idx_raw_series_series_obs``. Runs in a savepoint, so a failed read
+    (reported in ``error``, which makes ``landed_at`` ``None``) never aborts
+    the caller's transaction.
+    """
+    readings: list[AnchorReading] = []
+    try:
+        with conn.begin_nested():
+            for series_id in anchor.series:
+                obs = read_latest(conn, series_id, source=anchor.catalog_name, as_of=as_of)
+                readings.append(AnchorReading(
+                    series_id=series_id,
+                    obs_date=obs.obs_date if obs is not None else None,
+                    landed_at=_as_utc(obs.pull_timestamp) if obs is not None else None,
+                ))
+    except Exception as exc:  # noqa: BLE001 - a health read reports, it never raises
+        return AnchoredFreshness(
+            catalog_name=anchor.catalog_name,
+            owner=anchor.owner,
+            readings=tuple(readings),
+            error=f"{type(exc).__name__}: {exc}"[:LAST_ERROR_MAX_CHARS],
+        )
+    return AnchoredFreshness(
+        catalog_name=anchor.catalog_name, owner=anchor.owner, readings=tuple(readings),
+    )
+
+
+def anchored_run(run: CatalogRunSummary | None) -> CatalogRunSummary | None:
+    """An anchored row's pull_log summary, with the write evidence left to its anchors.
+
+    pull_log still says whether and how the owner last ran (FAILED, quiet,
+    skipped). Whether it wrote is the anchor series' call: a run that
+    committed per-symbol rows but no aggregate must not read healthy.
+    """
+    return replace(run, last_success_with_rows_at=None) if run is not None else None
