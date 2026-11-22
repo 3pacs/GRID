@@ -22,6 +22,18 @@ Confirmation and forward status say not_supplied, never passed. A separate
 failed-confirmation record must still be joined by its actual owner; this
 report schema does not contain it. Do not replace or erase it with this card.
 
+## The factory's paid / did-not lists
+Since #1212 each factory card also carries `where_it_paid` and `where_it_did_not`
+(`cross_section_factory.paid_split`): the 100+-night cuts split by net sign and
+sorted by size. That sort is the favorable-cut ranking this adapter never carries.
+Each entry must repeat a preserved cut exactly (same dimension, stratum, nights,
+net_bp, t_gross; paid ones net > 0, the rest net <= 0; each cut once; both lists
+present) and the lists are then dropped. The card says
+`producer_paid_split: checked_against_cuts_not_carried` (or `not_supplied`). An
+entry that is not such a copy rejects; any other unknown card key still rejects.
+`FactoryReportTest` and `FactoryRunReceiptTest` feed a synthetic factory run's
+own report and ledger result line, so producer and adapter cannot drift silently.
+
 ## Validation and display
 Uses the existing report hash/clock/selection validation. Cards must belong to
 ranked trials; overall nights equal the ranked count. Cuts cannot exceed overall.
@@ -32,11 +44,11 @@ source labels. Withheld/stale evidence remains visible as withheld, not current.
 
 ## Checks
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_conditional_cards.py' -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_factory_report.py' -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_desk_evidence.py' -v
+python -m pytest -q tests/test_desk_conditional_cards.py tests/test_desk_conditional_receipt.py \
+  tests/test_desk_factory_report.py tests/test_desk_evidence.py tests/test_cross_section_factory.py
 ```
-Expected 19 + 26 + 17 synthetic tests. No actual research artifacts or holdouts.
+The factory round-trip tests need numpy and pandas (they run a synthetic
+factory store). No actual research artifacts or holdouts.
 Claude verifies exact kit; Anik applies. Full #1164 still requires real caller
 wiring, separate confirmation/forward outcomes, hypothesis/invalidation context
 and the other desk inputs. This is not an automatically validated strategy.

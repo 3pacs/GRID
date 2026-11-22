@@ -1,0 +1,13 @@
+{"run_id": "xs-smallcap-published-effects-1-20261120", "first_session": "2016-01-04", "last_session": "2022-12-29",
+ "signals": [{"name": "reversal_21d", "kind": "reversal", "lookback": 21, "horizons": ["close_1d"]},
+             {"name": "reversal_5d", "kind": "reversal", "lookback": 5, "horizons": ["close_1d"]},
+             {"name": "momentum_12_1", "kind": "momentum", "lookback": 231, "skip": 21, "horizons": ["close_1d"]},
+             {"name": "near_52w_high", "kind": "high_52w", "lookback": 252, "horizons": ["close_1d"]}],
+ "rankings": ["pooled"], "fractions": [0.1, 0.2], "cost_bp_per_side": 25.0, "alpha": 0.05,
+ "perms": 10000, "seed": 20261107, "cards": 4, "null_block_sessions": 10,
+ "min_price": 2, "min_dollar_volume": 1000000,
+ "prior_dev_looks": ["xs-published-effects-1-20261115 (S&P 500 members)", "xs-gated-1-20261115 (S&P 500 members)",
+                     "xs-playbook-1-20261115 (S&P 500 members)",
+                     "xsq-short-term-reversal-monthly-v1 (S&P 500 members, scratch ledger xs-queue-scratch-20261119)",
+                     "xsq-52-week-high-v1 (S&P 500 members, scratch ledger xs-queue-scratch-20261119)",
+                     "spread estimate on the small-cap daily bars 2016-2022 (cost input only; no signal ranked, no outcome read)"]}

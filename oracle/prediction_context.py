@@ -121,6 +121,7 @@ def _latest_feature_value(
                       AND rs.obs_date <= :aod
                       AND rs.obs_date >= :cut
                       AND rs.release_date <= :aod
+                      AND rs.vintage_date <= :aod
                       AND NOT EXISTS (
                           SELECT 1 FROM resolved_series_retractions rr
                           WHERE rr.feature_id = rs.feature_id
@@ -128,7 +129,7 @@ def _latest_feature_value(
                             AND rr.vintage_date = rs.vintage_date
                             AND rr.retracted_at <= :retraction_cutoff
                       )
-                    ORDER BY rs.obs_date DESC, rs.release_date DESC
+                    ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
                     LIMIT 1
                     """
                 )
