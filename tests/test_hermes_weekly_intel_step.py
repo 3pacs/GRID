@@ -192,6 +192,9 @@ def test_real_task_table_calls_the_same_functions_with_the_same_arguments(clock,
     monkeypatch.setattr(supply_chain_parser, "run_weekly", rec("parser"))
     monkeypatch.setattr(supply_chain_edge_validator, "run_weekly", rec("validator"))
 
+    # Real budgets: the trust report's budget is the whole cycle budget, so
+    # in production it starts a cycle of its own. One call here.
+    monkeypatch.setattr(ho, "WEEKLY_INTEL_CYCLE_BUDGET_SECONDS", 10**6)
     engine = MagicMock()
     state = OperatorState()
     state.last_weekly_intel = LAST_COMPLETE
@@ -468,7 +471,8 @@ def test_daily_block_runs_first_and_weekly_tasks_are_not_in_intelligence_tasks(c
     ho._run_weekly_intel_step(MagicMock(), state, False, cycle_result)
 
     assert order == ["daily"] + [t.name for t in ho.WEEKLY_INTEL_TASKS]
-    intel = cycle_result["intelligence"]
+    # An empty intelligence result is not recorded; a timeout would be.
+    intel = cycle_result.get("intelligence") or {}
     assert intel != {"timeout": True}
     assert not any(k.startswith("weekly_") for k in intel)
     assert cycle_result["weekly_intel"]["complete"] is True
@@ -500,7 +504,7 @@ def test_hung_weekly_task_does_not_hold_the_intelligence_step(clock, monkeypatch
     finally:
         release.set()
     assert daily == [FIXED_NOW]
-    assert cycle_result["intelligence"] != {"timeout": True}
+    assert cycle_result.get("intelligence") != {"timeout": True}
     assert state.weekly_intel_outcome["weekly_cross_reference"] == "timed_out"
     assert state.weekly_intel_outcome[VALIDATOR] == "done"
 
@@ -542,3 +546,25 @@ def test_weekly_table_order_is_the_pre_existing_order():
         "weekly_cross_reference", "weekly_lever_report", "weekly_trust_report",
         "weekly_actor_report", "weekly_supply_chain_parser", VALIDATOR,
     ]
+
+
+def test_real_budgets_spread_the_block_over_cycles_without_reordering(clock, monkeypatch):
+    """With the real budgets and instant tasks: cross-reference and lever in
+    the first cycle, the trust report (budget = the whole cycle budget)
+    opens the second, and the validator still comes after the parser."""
+    calls: list[str] = []
+    tasks = [ho.WeeklyIntelTask(t.name, _recording(t.name, calls), t.budget_s, t.waits_for_trust_cycle)
+             for t in ho.WEEKLY_INTEL_TASKS]
+    _tasks(monkeypatch, *tasks)
+    state = OperatorState()
+    state.last_weekly_intel = LAST_COMPLETE
+    per_cycle: list[list[str]] = []
+    for _ in range(4):
+        out: dict[str, Any] = {}
+        ho._run_weekly_intel_step(MagicMock(), state, False, out)
+        if "weekly_intel" in out:
+            per_cycle.append(out["weekly_intel"]["ran"])
+    assert per_cycle[0] == ["weekly_cross_reference", "weekly_lever_report"]
+    assert per_cycle[1][0] == "weekly_trust_report"
+    assert calls == [t.name for t in ho.WEEKLY_INTEL_TASKS]
+    assert state.last_weekly_intel == FIXED_NOW
