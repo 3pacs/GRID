@@ -330,6 +330,8 @@ class TestSingleSourceUnit:
             # its progress — see normalization.resolver._scan_series_ids.
             "scanned_through", "scan_complete", "resolved_count_status",
             "batch_failure_outcomes", "other_writer_outcomes_unknown",
+            # Raw rows the future-date guard dropped, per series family.
+            "future_obs_skipped",
         }
 
     @patch("normalization.resolver.EntityMap")
@@ -1411,6 +1413,7 @@ class TestResolutionWindow:
             "series_scanned", "duration_s", "dry_run", "unmapped",
             "scanned_through", "scan_complete", "resolved_count_status",
             "batch_failure_outcomes", "other_writer_outcomes_unknown",
+            "future_obs_skipped",
         }
         assert set(summary["unmapped"]) == {
             "lookups_missed", "series_ids", "unregistered_features",

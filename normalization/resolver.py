@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -22,7 +23,12 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from binance_close_contract import CANONICAL_CLOSE_SERIES, is_completed_canonical_close
-from normalization.entity_map import EntityMap, SELECTED_ROW_CAP, validate_selected_request
+from normalization.entity_map import (
+    EntityMap,
+    SELECTED_ROW_CAP,
+    series_family,
+    validate_selected_request,
+)
 from tiingo_symbol_contract import is_foreign_tiingo_row
 from price_close_contract import (
     SPY_CLOSE_CONTRACT,
@@ -275,6 +281,176 @@ def _vintage_of(pull_timestamp: Any) -> Any:
     return pull_timestamp.date() if hasattr(pull_timestamp, "date") else pull_timestamp
 
 
+# ---------------------------------------------------------------------------
+# Future-dated raw rows
+# ---------------------------------------------------------------------------
+#
+# A raw row whose obs_date lies days or centuries past its own pull is not an
+# observation: it is a forecast, a computed table or a parse error. Live
+# examples: FinBERT scores dated 3018, Open-Meteo forecast days stored as
+# daily weather (ingestion/physical/weather_puller.py reads the /forecast
+# endpoint), and ephemeris rows computed out to 2100. Resolved, such a row
+# gets vintage_date = its pull date, so a FIRST_RELEASE read serves the
+# forecast as the first release and an unbounded "latest" read serves a value
+# nobody had observed yet. The resolver skips these rows and counts them.
+
+#: How many calendar days an obs_date may run past the UTC date of its pull.
+#: One, not zero: a source that stamps rows with its local calendar date
+#: (Asia/Pacific sessions, up to UTC+14) is a day ahead of UTC for part of
+#: every UTC day. Every resolve path uses this one constant.
+FUTURE_OBS_TOLERANCE_DAYS: int = 1
+
+#: Raw series whose obs_date is a scheduled event date, so it lies past the
+#: pull by design. These pass the future-date guard. Each entry is
+#: ``(name, full-match series_id pattern, writer, why)``. Keep the patterns
+#: narrow. A family that only sometimes writes ahead (a forecast stored as an
+#: observation, an ephemeris table computed to 2100, a USASpending start
+#: date) does not belong here: its future rows are skipped and counted.
+#:
+#: Passing the guard does not make a family a model input. None of these is
+#: mapped in normalization/entity_map.py today; their readers use raw_series
+#: or the earnings_calendar table directly.
+FUTURE_BY_DESIGN_SERIES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "earnings_calendar_estimate",
+        r"EARNINGS:[^:]+:estimate",
+        "ingestion/altdata/earnings_calendar.py",
+        "EarningsCalendarPuller._store_raw_vintages keys the consensus EPS "
+        "estimate to the report date (obs_date = earn_date). yfinance "
+        "Ticker.earnings_dates lists the upcoming quarters, so the estimate "
+        "for the next report is stored before the report happens. The "
+        "matching ':actual' rows exist only once reported and are not "
+        "allowlisted.",
+    ),
+    (
+        "earnings_eps_estimate",
+        r"earnings:[^:]+:eps_estimate",
+        "ingestion/altdata/earnings_puller.py",
+        "EarningsPuller._process_earnings_dates stores 'EPS Estimate' at the "
+        "Ticker.earnings_dates index date, upcoming quarters included. The "
+        "FMP writer of the same ids stores past report dates only. Actuals, "
+        "surprises and beat flags are not allowlisted.",
+    ),
+    (
+        "legislation_hearing",
+        r"LEGISLATION:[^:]+:hearing",
+        "ingestion/altdata/legislation.py",
+        "LegislationPuller.pull_hearings stores scheduled committee hearings "
+        "up to 14 days ahead (cutoff_future in _fetch_hearings), with "
+        "obs_date = the hearing date. Bill-action and vote rows are dated by "
+        "the action and are not allowlisted.",
+    ),
+)
+
+_FUTURE_BY_DESIGN_RE = re.compile(
+    "|".join("(?:" + entry[1] + ")" for entry in FUTURE_BY_DESIGN_SERIES)
+)
+
+
+def is_future_by_design(series_id: Any) -> bool:
+    """True when ``series_id`` belongs to a declared future-by-design family."""
+    return (isinstance(series_id, str)
+            and _FUTURE_BY_DESIGN_RE.fullmatch(series_id) is not None)
+
+
+def _calendar_date(value: Any) -> date | None:
+    """A date, datetime or ISO string as a calendar date; None when unreadable.
+
+    A datetime keeps its own calendar date (an obs_date is a label, not an
+    instant, so it is not shifted to UTC).
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and len(value) >= 10:
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _pull_date_utc(pull_timestamp: Any) -> date | None:
+    """The UTC calendar date of a pull; a naive timestamp is taken as UTC."""
+    if isinstance(pull_timestamp, datetime):
+        if pull_timestamp.tzinfo is not None and pull_timestamp.utcoffset() is not None:
+            return pull_timestamp.astimezone(timezone.utc).date()
+        return pull_timestamp.date()
+    if isinstance(pull_timestamp, date):
+        return pull_timestamp
+    return None
+
+
+def is_future_observation(
+    obs_date_val: Any,
+    pull_timestamp: Any,
+    *,
+    tolerance_days: int = FUTURE_OBS_TOLERANCE_DAYS,
+) -> bool:
+    """True when ``obs_date_val`` is more than ``tolerance_days`` past the pull.
+
+    The comparison is calendar days against the pull's UTC date. Either
+    clock unreadable means the row is not judged here (False). raw_series
+    stores both clocks as typed columns, so that case is a test or caller
+    artefact, and an unreadable obs_date fails at the insert anyway.
+    """
+    obs_d = _calendar_date(obs_date_val)
+    pull_d = _pull_date_utc(pull_timestamp)
+    if obs_d is None or pull_d is None:
+        return False
+    return (obs_d - pull_d).days > tolerance_days
+
+
+def skip_future_observation(
+    series_id: Any,
+    obs_date_val: Any,
+    pull_timestamp: Any,
+    skipped: dict[str, int],
+) -> bool:
+    """The resolver's future-date guard. Every resolve path calls this.
+
+    Returns True when the row must not be resolved: its obs_date is more than
+    ``FUTURE_OBS_TOLERANCE_DAYS`` past its pull and its series is not in
+    ``FUTURE_BY_DESIGN_SERIES``. A skipped row is counted in ``skipped``
+    under its series family (``entity_map.series_family``).
+    """
+    if is_future_by_design(series_id):
+        return False
+    if not is_future_observation(obs_date_val, pull_timestamp):
+        return False
+    family = series_family(series_id) if isinstance(series_id, str) else "unknown"
+    skipped[family] = skipped.get(family, 0) + 1
+    return True
+
+
+def _merge_future_skips(into: dict[str, int], counts: dict[str, int] | None) -> None:
+    """Add one per-family skip count into another, in place."""
+    for family, count in (counts or {}).items():
+        into[family] = into.get(family, 0) + count
+
+
+def _sorted_future_skips(counts: dict[str, int]) -> dict[str, int]:
+    """Per-family skip counts, largest first, for summaries and logs."""
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _warn_future_skips(where: str, counts: dict[str, int]) -> None:
+    """One warning per run with the per-family counts; silent when none.
+
+    A warning, not an error: a feed writing ahead is a data issue the run
+    handled, not an application bug (CLAUDE.md log levels).
+    """
+    if not counts:
+        return
+    log.warning(
+        "{w}: skipped {n} future-dated raw row(s) (obs_date more than {t} "
+        "day(s) past the UTC pull date), by series family: {f}",
+        w=where, n=sum(counts.values()), t=FUTURE_OBS_TOLERANCE_DAYS,
+        f=_sorted_future_skips(counts),
+    )
+
+
 def _split_by_vintage(sources: list[dict]) -> list[list[dict]]:
     """Group one (series_id, obs_date)'s raw candidates by vintage date.
 
@@ -402,6 +578,16 @@ class Resolver:
         routine does not attest their custody. It constructs rows for the existing
         resolved schema; an API read must never invoke a writer on its behalf.
         Storage vintages are UTC pull dates, not provider publication instants.
+
+        Two date bounds apply, and they answer different questions. The replay
+        window (``start_date <= obs_date <= as_of`` and ``pull <= as_of``)
+        keeps a PIT replay to what was observable at its cutoff. The
+        future-date guard (``skip_future_observation``, shared with
+        ``resolve_pending``) drops a row whose obs_date is more than
+        ``FUTURE_OBS_TOLERANCE_DAYS`` past its own pull, wherever the cutoff
+        is. A row must pass both, so a future-by-design family still cannot
+        pass the cutoff here. Skips are counted per series family in
+        ``future_obs_skipped``.
         """
         request = validate_selected_request(selections, as_of=as_of, start_date=start_date,
                                             vintage_policy=vintage_policy)
@@ -423,6 +609,7 @@ class Resolver:
         groups = {}
         mismatches = set()
         invalid = set()
+        future_skipped: dict[str, int] = {}
         deadline = time.monotonic() + 5.0
         for row in raw_rows:
             if time.monotonic() >= deadline:
@@ -455,6 +642,10 @@ class Resolver:
                 valid = False
             if not valid:
                 invalid.add(key)
+                continue
+            # Last admission check before grouping, as in resolve_pending, so
+            # it never hides a source mismatch or an invalid value above.
+            if skip_future_observation(row["series_id"], observed, pulled, future_skipped):
                 continue
             group = (row["series_id"], observed, pulled.date())
             groups.setdefault(group, []).append({"value": float(value), "source_id": source["id"],
@@ -500,8 +691,10 @@ class Resolver:
                 reason = reasons.get(key, "no_resolved_row")
             status.append({"source_key": key, "status": "available" if reason == "resolved_observation"
                            else "unavailable", "reason": reason})
+        _warn_future_skips("Selected resolution", future_skipped)
         return {"resolved_rows": resolved, "selections": status,
-                "storage_clock": "pull_date_not_provider_publication", "persisted": False}
+                "storage_clock": "pull_date_not_provider_publication", "persisted": False,
+                "future_obs_skipped": _sorted_future_skips(future_skipped)}
 
     # Bulk resolution scans tens of millions of raw_series rows; the
     # default per-statement timeout (120s, see db.get_engine) is too tight
@@ -783,10 +976,12 @@ class Resolver:
 
         Returns:
             dict with resolved, conflicts_found, errors, series_scanned,
-            duration_s, dry_run, scanned_through, scan_complete and unmapped
+            duration_s, dry_run, scanned_through, scan_complete, unmapped
             (the EntityMap miss summary — see
-            EntityMap.missing_feature_report). Every return path carries the
-            same keys.
+            EntityMap.missing_feature_report) and future_obs_skipped (raw
+            rows dropped by ``skip_future_observation``, counted per series
+            family, largest first; ``{}`` when none). Every return path
+            carries the same keys.
 
             ``scanned_through`` is the exclusive upper bound of the range
             this run actually enumerated and resolved, and ``scan_complete``
@@ -843,6 +1038,7 @@ class Resolver:
             unmapped: dict[str, Any] | None = None,
             scanned_through: datetime | None = None,
             scan_complete: bool = False,
+            future_obs_skipped: dict[str, int] | None = None,
         ) -> dict[str, Any]:
             # A path that never reached the scan has enumerated nothing, so
             # it reports the window's own lower bound: a watermark holder
@@ -869,6 +1065,7 @@ class Resolver:
                 ),
                 "scan_complete": scan_complete,
                 "unmapped": unmapped if unmapped is not None else dict(empty_unmapped),
+                "future_obs_skipped": _sorted_future_skips(future_obs_skipped or {}),
             }
 
         # Pre-load entity map and feature families (shared, read-only)
@@ -943,7 +1140,8 @@ class Resolver:
         totals = {"resolved": 0, "conflicts_found": 0, "errors": 0,
                   "batch_failure_outcomes": {"not_started": 0, "rolled_back": 0,
                                              "unknown": 0},
-                  "other_writer_outcomes_unknown": 0}
+                  "other_writer_outcomes_unknown": 0,
+                  "future_obs_skipped": {}}
 
         def _flush(batch: list[dict]) -> int | None:
             """Persist a batch, or just count it when dry-running."""
@@ -956,7 +1154,8 @@ class Resolver:
             local = {"resolved": 0, "conflicts_found": 0, "errors": 0,
                      "batch_failure_outcomes": {"not_started": 0, "rolled_back": 0,
                                                 "unknown": 0},
-                     "other_writer_outcomes_unknown": 0}
+                     "other_writer_outcomes_unknown": 0,
+                     "future_obs_skipped": {}}
 
             def _add_resolved(count: int | None) -> None:
                 if local["resolved"] is None or count is None:
@@ -1028,6 +1227,11 @@ class Resolver:
                 for row in rows:
                     if is_foreign_tiingo_row(row[0], row[6], row[1]):
                         continue  # another instrument's price (tiingo_symbol_contract)
+                    # Last admission check before grouping, as in
+                    # resolve_selected_rows: obs_date too far past its pull.
+                    if skip_future_observation(row[0], row[1], row[4],
+                                               local["future_obs_skipped"]):
+                        continue
                     key = (row[0], row[1])
                     if key not in groups:
                         groups[key] = []
@@ -1139,6 +1343,7 @@ class Resolver:
                 for outcome, count in local["batch_failure_outcomes"].items():
                     totals["batch_failure_outcomes"][outcome] += count
                 totals["other_writer_outcomes_unknown"] += local["other_writer_outcomes_unknown"]
+                _merge_future_skips(totals["future_obs_skipped"], local["future_obs_skipped"])
 
             return local
 
@@ -1186,6 +1391,8 @@ class Resolver:
                 n=unmapped["lookups_missed"], top=unmapped["top_series"],
             )
 
+        _warn_future_skips("Resolution", totals["future_obs_skipped"])
+
         summary = _summary(
             resolved=totals["resolved"],
             conflicts=totals["conflicts_found"],
@@ -1194,15 +1401,17 @@ class Resolver:
             unmapped=unmapped,
             scanned_through=scanned_through,
             scan_complete=scan_complete,
+            future_obs_skipped=totals["future_obs_skipped"],
         )
         summary["batch_failure_outcomes"] = totals["batch_failure_outcomes"]
         summary["other_writer_outcomes_unknown"] = totals["other_writer_outcomes_unknown"]
         log.info(
             "Resolution {k} — resolved={r}, conflicts={c}, errors={e}, "
-            "series={s}, scanned through {w}, {t}s{d}",
+            "series={s}, future_skipped={f}, scanned through {w}, {t}s{d}",
             k="complete" if scan_complete else "partial (budget)",
             r=summary["resolved"], c=summary["conflicts_found"],
             e=summary["errors"], s=summary["series_scanned"],
+            f=sum(summary["future_obs_skipped"].values()),
             w=summary["scanned_through"], t=summary["duration_s"],
             d=" (dry run — nothing written)" if dry_run else "",
         )
@@ -1293,6 +1502,9 @@ class Resolver:
         for outcome, count in result.get("batch_failure_outcomes", {}).items():
             totals["batch_failure_outcomes"][outcome] += count
         totals["other_writer_outcomes_unknown"] += result.get("other_writer_outcomes_unknown", 0)
+        merged_skips = dict(totals["future_obs_skipped"])
+        _merge_future_skips(merged_skips, result.get("future_obs_skipped"))
+        totals["future_obs_skipped"] = _sorted_future_skips(merged_skips)
         totals["duration_s"] = round(totals["duration_s"] + result["duration_s"], 2)
         totals["chunks"] += 1
         if result["errors"]:
@@ -1352,7 +1564,8 @@ class Resolver:
             dict with the same keys as ``resolve_pending`` plus ``chunks``,
             ``chunks_failed`` and ``failed_ranges`` (one entry per slice
             that raised or reported worker errors, carrying ``since``,
-            ``until``, ``error`` and ``error_class``).
+            ``until``, ``error`` and ``error_class``). ``future_obs_skipped``
+            sums every chunk's per-family skip counts.
         """
         if chunk_days < 1:
             raise ValueError("chunk_days must be >= 1")
@@ -1373,6 +1586,7 @@ class Resolver:
             "series_scanned": 0, "duration_s": 0.0,
             "dry_run": dry_run, "chunks": 0, "chunks_failed": 0,
             "chunks_narrowed": 0, "failed_ranges": [],
+            "future_obs_skipped": {},
         }
         cursor = start
         while cursor < end:
@@ -1390,10 +1604,10 @@ class Resolver:
             )
         log.info(
             "Range resolution complete — chunks={n} ({f} failed, {w} narrowed "
-            "after a timeout), resolved={r}, errors={e}, {t}s",
+            "after a timeout), resolved={r}, errors={e}, future_skipped={s}, {t}s",
             n=totals["chunks"], f=totals["chunks_failed"],
             w=totals["chunks_narrowed"], r=totals["resolved"],
-            e=totals["errors"], t=totals["duration_s"],
+            e=totals["errors"], s=totals["future_obs_skipped"], t=totals["duration_s"],
         )
         return totals
 
