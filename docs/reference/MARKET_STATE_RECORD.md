@@ -103,7 +103,8 @@ display only (owner's decision, bring-up plan rev 100).
   - Its provenance says `mode: provisional`, `decision_use: display_only`, the cutoff, the minutes after the
     close, `vintage_refresh: never` and the calendar version.
   - Timer: `deploy/systemd/grid-market-state-provisional.*.template`, weekdays 21:15Z, `Persistent=false`, with its
-    own lock. It is not installed: the operator installs it after the migration is applied.
+    own lock. Installed on grid-svr 2026-11-22 (first run 2026-11-23), with the Python 3.14 drop-in
+    `deploy/python314/dropins/grid-market-state-provisional.service.d-py314.conf`.
 - **Reader**: only the post-close desk brief, and only while the session's decision record is not there yet
   (`docs/reference/DESK_BRIEF.md`). Every line starts with `PROVISIONAL (display only)` and states the cutoff and
   how long after the close the record was computed. A record whose cutoff is not the session's close is not shown.
