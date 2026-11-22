@@ -777,3 +777,256 @@ def test_a_run_with_nothing_carded_has_an_empty_residual_section(tmp_path):
     rep = X.run(write_run(tmp_path, body), tmp_path, tmp_path / "state.db", ledger_at(tmp_path), tmp_path / "out")
     assert rep["cards"] == {} and rep["residual"]["modules"] == {} and rep["residual"]["correlation"] == {}
     assert "Residual cards" not in (tmp_path / "out" / "report.md").read_text()
+
+
+PRICES = ("open", "high", "low", "close", "adjOpen", "adjHigh", "adjLow", "adjClose")
+
+
+def _edit_row(root, sym, day, **cells):
+    """Rewrite one served row of a price file, cell by cell as text; every other row keeps its bytes."""
+    p = root / "prices" / f"{sym}.csv"
+    lines = p.read_text().splitlines()
+    n = next(i for i, line in enumerate(lines) if line.startswith(day + ","))
+    row = lines[n].split(",")
+    for name, text in cells.items():
+        row[HEADER.index(name)] = text
+    lines[n] = ",".join(row)
+    p.write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("volume", [0, 2_000_000])
+@pytest.mark.parametrize("field", PRICES)
+def test_a_row_with_any_one_of_its_eight_prices_blank_is_not_a_valid_bar(tmp_path, field, volume):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    floors = {"min_session_bars": 20, "min_price": 5.0, "min_dollar_volume": 10e6}
+    whole = X.universe(tmp_path, **floors)
+    sym, r = "S1N04", 40
+    j = whole.cols.index(sym)
+    assert whole.ok.iloc[r, j] and whole.base[r, j]
+    _edit_row(tmp_path, sym, days[r], **{field: "", "volume": str(volume), "adjVolume": str(volume)})
+    u = X.universe(tmp_path, **floors)
+    assert u.sessions == whole.sessions == days and u.cols == whole.cols
+    assert np.isnan(u.frames[field].iloc[r, j])                              # the blank is read as served, not filled
+    assert all(u.frames[k].iloc[r, j] > 0 for k in PRICES if k != field)     # and it is the row's only blank
+    assert not u.ok.iloc[r, j] and not u.base[r, j]
+    assert u.ok.iloc[r - 1, j] and u.base[r - 1, j]
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.ok.values[:, others], whole.ok.values[:, others])
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+    panel = X.load_panel(tmp_path, X.RunFile.from_dict({**RUN, "min_session_bars": 20}))
+    np.testing.assert_array_equal(panel.base, u.base)
+    assert not panel.base[r, j] and np.isnan(panel.intra[r, j]) and np.isnan(panel.cc[r, j]) and np.isnan(panel.on[r, j])
+
+
+def test_a_sealed_export_with_a_row_blank_only_in_its_adjusted_high_is_out_that_session(tmp_path):
+    # 25 companies, 60 weekday sessions from 2016-02-01, $20 bars, $2M a day, no sector labels; sealed directly with
+    # seal_export, which hashes the files and never parses a row
+    days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2016-02-01", periods=60)]
+    syms = [f"C{i:02d}" for i in range(25)]
+    witness = "2016-04-01,20,21,19,20,0,20,,19,20,0,0,1"
+    (tmp_path / "prices").mkdir()
+    for sym in syms:
+        rows = [witness if (sym, d) == ("C07", "2016-04-01") else f"{d},20,21,19,20,100000,20,21,19,20,100000,0,1" for d in days]
+        (tmp_path / "prices" / f"{sym}.csv").write_text("\n".join([",".join(HEADER), *rows]) + "\n")
+    (tmp_path / "members.csv").write_text(f'date,tickers\n2016-01-04,"{",".join(syms)}"\n')
+    (tmp_path / "sectors.csv").write_text("Symbol,GICS Sector\n")
+    (tmp_path / "renames.json").write_text(json.dumps({"renames": {}}))
+    sealed = X.seal_export(tmp_path, discovery_first_session="2016-02-01", source={"provider": "synthetic"})
+    files = X.input_files(tmp_path)
+    assert X.read_export(tmp_path, files)["generation"] == sealed["generation"]
+    assert (witness + "\n").encode() in (tmp_path / "prices" / "C07.csv").read_bytes()
+
+    u = X.universe(tmp_path, min_session_bars=20, min_price=1.0, min_dollar_volume=1e6, files=files)
+    r, j = u.sessions.index("2016-04-01"), u.cols.index("C07")
+    assert (r, len(u.sessions), len(u.cols)) == (44, 60, 25)
+    assert not u.ok.iloc[r, j] and not u.base[r, j]
+    assert u.ok.iloc[r - 1, j] and u.base[r - 1, j] and u.ok.iloc[r + 1, j] and u.base[r + 1, j]   # one session, not the company
+    others = [k for k in range(25) if k != j]
+    assert u.ok.values[:, others].all() and u.base[r, others].all()
+    run = X.RunFile.from_dict({**RUN, "first_session": "2016-03-01", "last_session": "2016-04-20", "rankings": ["pooled"],
+                               "min_ranked": 20, "min_session_bars": 20, "min_price": 1, "min_dollar_volume": 1_000_000})
+    panel = X.load_panel(tmp_path, run, files)                              # the verified read a run makes
+    np.testing.assert_array_equal(panel.base, u.base)
+    assert not panel.base[r, j] and panel.base[r, others].all()
+    assert np.isnan(panel.cc[r, j]) and np.isnan(panel.cc[r + 1, j])        # no return into or out of the blank session
+
+
+FEATURES = ({"kind": "momentum", "lookback": 5, "skip": 0}, {"kind": "reversal", "lookback": 5},
+            {"kind": "high_52w", "lookback": 10}, {"kind": "sector_momentum", "lookback": 5, "skip": 0},
+            {"kind": "mean_overnight", "lookback": 5}, {"kind": "mean_intraday", "lookback": 5})
+SMALL = {"min_session_bars": 20, "min_price": 5.0, "min_dollar_volume": 10e6}
+
+
+def _small_run():
+    return X.RunFile.from_dict({**RUN, "min_session_bars": 20})
+
+
+@pytest.mark.parametrize("text", ["inf", "-inf"])
+@pytest.mark.parametrize("field", PRICES)
+def test_a_price_that_is_not_a_finite_number_is_read_as_a_blank(tmp_path, field, text):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    whole = X.universe(tmp_path, **SMALL)
+    sym, r = "S1N04", 40
+    j = whole.cols.index(sym)
+    _edit_row(tmp_path, sym, days[r], **{field: text})
+    u = X.universe(tmp_path, **SMALL)
+    assert np.isnan(u.frames[field].iloc[r, j])                              # never held as inf
+    assert all(np.isfinite(v.values[~np.isnan(v.values)]).all() for v in u.frames.values())
+    assert whole.ok.iloc[r, j] and whole.base[r, j] and not u.ok.iloc[r, j] and not u.base[r, j]
+    assert u.base[r + 1, j] == (field != "close")                            # no finite prior close, no price floor passed
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.ok.values[:, others], whole.ok.values[:, others])
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+    panel = X.load_panel(tmp_path, _small_run())
+    np.testing.assert_array_equal(panel.base, u.base)
+    for a in (panel.on, panel.intra, panel.cc, panel.adj, *(X.signal_matrix(panel, spec) for spec in FEATURES)):
+        assert not np.isinf(a).any()                                         # no return, close or signal is infinite
+    assert np.isnan(panel.adj[r, j]) and np.isnan(panel.cc[r, j]) and np.isnan(panel.on[r, j]) and np.isnan(panel.intra[r, j])
+
+
+def test_a_volume_that_is_not_a_finite_number_does_not_pass_the_liquidity_floor(tmp_path):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    sym = "S1N04"
+    _rescale(tmp_path, sym, volume=0.0025)                                   # about $0.5M a day against a $10M floor
+    thin = X.universe(tmp_path, **SMALL)
+    j = thin.cols.index(sym)
+    assert thin.ok.values[:, j].all() and not thin.base[:, j].any()
+    for d in days[25:40]:                                                    # 15 of any 21 sessions: the median would be inf
+        _edit_row(tmp_path, sym, d, volume="inf", adjVolume="inf")
+    u = X.universe(tmp_path, **SMALL)
+    assert np.isnan(u.frames["volume"].values[25:40, j]).all()
+    assert u.ok.values[:, j].all() and not u.base[:, j].any()                # the bars stay valid; the floor is still not met
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.base[:, others], thin.base[:, others])
+
+
+def _same(a, b):
+    return (a == b) | (np.isnan(a) & np.isnan(b))
+
+
+@pytest.mark.parametrize("blank", [("adjHigh",), ("low", "adjLow")])
+def test_an_invalid_bar_s_adjusted_close_reaches_no_feature(tmp_path, blank):
+    # the bar is invalid for a blank price; its adjusted close is present and wrong by a factor of 10, then of 100
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    run = _small_run()
+    clean = X.load_panel(tmp_path, run)
+    sym, r = "S1N04", 40
+    j = clean.cols.index(sym)
+    mates = [k for k, c in enumerate(clean.cols) if c.startswith("S1") and k != j]
+    panels = []
+    for factor in (10, 100):
+        _edit_row(tmp_path, sym, days[r], adjClose=repr(float(clean.adj[r, j]) * factor), **{name: "" for name in blank})
+        panels.append(X.load_panel(tmp_path, run))
+    p = panels[0]
+
+    # the panel is the clean one with that one bar taken out: nothing else moved, and the wrong close is nowhere
+    want = {"adj": clean.adj.copy(), "on": clean.on.copy(), "cc": clean.cc.copy(), "intra": clean.intra.copy(), "base": clean.base.copy()}
+    want["adj"][r, j] = want["intra"][r, j] = np.nan
+    want["on"][r:r + 2, j] = want["cc"][r:r + 2, j] = np.nan
+    want["base"][r, j] = False
+    for q in panels:
+        for name, a in want.items():
+            np.testing.assert_array_equal(getattr(q, name), a)
+        np.testing.assert_array_equal(q.sector, clean.sector)
+
+    for spec in FEATURES:
+        before, sig = X.signal_matrix(clean, spec), X.signal_matrix(p, spec)
+        np.testing.assert_array_equal(sig, X.signal_matrix(panels[1], spec))   # what the invalid close says changes nothing
+        assert np.nanmax(np.abs(sig)) <= np.nanmax(np.abs(before))             # no signal is larger than on the clean store
+        if spec["kind"] in ("momentum", "reversal"):
+            # adjacent sessions: the two whose window ends or starts on the invalid bar have no signal; the rest are untouched
+            assert np.flatnonzero(~_same(sig, before)[:, j]).tolist() == [r + 1, r + 6]
+            assert np.isnan(sig[[r + 1, r + 6], j]).all() and _same(np.delete(sig, j, axis=1), np.delete(before, j, axis=1)).all()
+        if spec["kind"] == "high_52w":
+            assert np.isnan(sig[r + 1, j])                                     # the close of the session before is the invalid one
+            for d in range(r + 2, r + 11):                                     # later windows take their highest close without it
+                window = [clean.adj[s, j] for s in range(d - 10, d) if s != r]
+                assert sig[d, j] == clean.adj[d - 1, j] / max(window)
+        if spec["kind"] == "sector_momentum":
+            # another symbol's sector aggregate: the mean of its sector's other members, the invalid name left out
+            own = pd.DataFrame(clean.adj).shift(1) / pd.DataFrame(clean.adj).shift(6) - 1
+            for d in (r + 1, r + 6):
+                np.testing.assert_allclose(sig[d, mates], own.values[d, mates].mean(), rtol=1e-12)
+            rest = [d for d in range(len(days)) if d not in (r + 1, r + 6)]
+            assert _same(sig[rest], before[rest]).all()
+            assert _same(sig[:, [k for k in range(len(clean.cols)) if k not in mates and k != j]],
+                         before[:, [k for k in range(len(clean.cols)) if k not in mates and k != j]]).all()
+
+
+def test_on_a_clean_store_the_reader_holds_every_cell_as_served(tmp_path):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    u = X.universe(tmp_path, **SMALL)
+    assert u.sessions == days and u.ok.values.all()                          # every row of a clean store is a valid bar
+    for field, frame in u.frames.items():                                    # each cell is the file's own number
+        for sym in u.cols:
+            served = pd.read_csv(tmp_path / "prices" / f"{sym}.csv").set_index("date")[field]
+            np.testing.assert_array_equal(frame[sym].values, served.reindex(days).values)
+    panel = X.load_panel(tmp_path, _small_run())
+    f = u.frames
+    np.testing.assert_array_equal(panel.adj, f["adjClose"].values)           # nothing is masked where every bar is valid
+    np.testing.assert_array_equal(panel.intra, (f["close"] / f["open"] - 1).values)
+    np.testing.assert_array_equal(panel.cc, (f["adjClose"] / f["adjClose"].shift(1) - 1).values)
+    np.testing.assert_array_equal(panel.on, (f["adjOpen"] / f["adjClose"].shift(1) - 1).values)
+
+
+@pytest.mark.parametrize("field", [*PRICES, "volume"])
+def test_a_cell_that_is_not_a_number_refuses_the_file_by_name(tmp_path, field):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    sym, r = "S1N04", 40
+    _edit_row(tmp_path, sym, days[r], **{field: "not_available"})
+    for read in (lambda: X.universe(tmp_path, **SMALL), lambda: X.load_panel(tmp_path, _small_run())):
+        with pytest.raises(X.PriceFileError) as err:                         # a named error, not a TypeError from numpy
+            read()
+        said = str(err.value)
+        assert f"prices/{sym}.csv" in said and f"{field} (first on {days[r]})" in said
+        assert "not_available" not in said                                   # the cell's own text is not repeated
+    assert issubclass(X.PriceFileError, X.RunFileError)                      # so every caller that refuses a store sees it
+
+
+@pytest.mark.parametrize("text", ["NA", "null", "NaN", ""])
+def test_a_missing_value_spelled_the_csv_way_is_a_blank_and_the_bar_is_invalid(tmp_path, text):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    whole = X.universe(tmp_path, **SMALL)
+    sym, r = "S1N04", 40
+    j = whole.cols.index(sym)
+    _edit_row(tmp_path, sym, days[r], adjHigh=text)
+    u = X.universe(tmp_path, **SMALL)                                        # read, not refused
+    assert np.isnan(u.frames["adjHigh"].iloc[r, j]) and not u.ok.iloc[r, j] and not u.base[r, j]
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+
+
+def _rewrite(root, sym, change):
+    p = root / "prices" / f"{sym}.csv"
+    p.write_text(change(p.read_text()))
+
+
+@pytest.mark.parametrize("what, change, says", [
+    ("a column is missing", lambda s: "\n".join(",".join(c for i, c in enumerate(line.split(",")) if i != HEADER.index("adjLow"))
+                                                for line in s.splitlines()) + "\n", "cannot be read as a Tiingo daily file"),
+    ("the days are not text", lambda s: s.replace("-", ""), "the date column does not hold days as text"),
+    # every cell of the long row is a number, so the columns picked by name would be read one place along
+    ("a row has a cell too many", lambda s: "\n".join(line.replace(",2000000,", ",7,2000000,", 1) if n == 41 else line
+                                                      for n, line in enumerate(s.splitlines())) + "\n", "line 42 does not have the header's 13 cells"),
+    ("a row is cut short", lambda s: "\n".join(",".join(line.split(",")[:8]) if n == 41 else line
+                                               for n, line in enumerate(s.splitlines())) + "\n", "line 42 does not have the header's 13 cells"),
+    ("the file is empty", lambda s: "", "cannot be read as a Tiingo daily file"),
+])
+def test_a_price_file_that_is_not_a_tiingo_daily_file_is_refused_by_name(tmp_path, what, change, says):
+    build(tmp_path, n_per=10, n_days=60)
+    X.universe(tmp_path, **SMALL)                                            # the store reads before the change
+    _rewrite(tmp_path, "S1N04", change)
+    with pytest.raises(X.PriceFileError, match=r"prices/S1N04\.csv") as err:
+        X.universe(tmp_path, **SMALL)
+    assert says in str(err.value), what
+
+
+def test_a_run_on_a_store_with_a_malformed_cell_is_abandoned_with_the_named_error(tmp_path):
+    days, _ = build(tmp_path, n_days=120)
+    _edit_row(tmp_path, "S1N04", days[80], adjHigh="not_available")
+    ledger = ledger_at(tmp_path)
+    with pytest.raises(X.PriceFileError, match=r"prices/S1N04\.csv.*adjHigh"):
+        X.run(write_run(tmp_path, {**RUN, "last_session": "2015-05-29"}), tmp_path, tmp_path / "state.db", ledger, tmp_path / "out")
+    kinds = [json.loads(line)["kind"] for line in _ledger_lines(tmp_path)][-2:]
+    assert kinds == [lse.FACTORY_DECLARED, lse.FACTORY_ABANDONED] and lse.factory_open_run(ledger) is None
+    assert not (tmp_path / "out" / "report.json").exists()                   # declared, read, refused: no result

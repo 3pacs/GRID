@@ -89,6 +89,11 @@ class RunFileError(ValueError):
     """A run file the factory refuses."""
 
 
+class PriceFileError(RunFileError):
+    """A price file that is not a Tiingo daily file: a column missing, a row that does not parse, or a cell that is
+    neither a number nor a blank where a price or a volume belongs."""
+
+
 @dataclass(frozen=True)
 class RunFile:
     run_id: str
@@ -301,7 +306,7 @@ class Panel:
     on: np.ndarray            # overnight return ending at each session's open
     intra: np.ndarray         # open to close of each session
     cc: np.ndarray            # close to close ending at each session
-    adj: np.ndarray           # adjusted close
+    adj: np.ndarray           # adjusted close of a valid bar; NaN on a session whose bar is missing or invalid
     base: np.ndarray          # member, valid bar, price and liquidity floors (signal presence is added per signal)
     member: np.ndarray
     sector: np.ndarray        # sector index per column, -1 = none
@@ -314,8 +319,8 @@ class Panel:
 class Universe:
     sessions: list
     cols: list
-    frames: dict              # one frame per bar field, indexed by session, one column per price file
-    ok: pd.DataFrame          # a valid bar: positive unadjusted and adjusted prices, open and close inside the day's range
+    frames: dict              # one frame per bar field, by session and price file; a number that is not finite is blank
+    ok: pd.DataFrame          # a valid bar: all eight prices finite and positive, open and close inside the day's range
     member: np.ndarray
     base: np.ndarray          # member, valid bar, price and liquidity floors
     dollar: pd.DataFrame | None = None   # the median dollar volume the liquidity floor reads
@@ -335,6 +340,35 @@ def _read(data_dir: Path, name: str, files: dict | None) -> bytes:
     return raw
 
 
+def _price_rows(raw: bytes, name: str, fields: tuple) -> pd.DataFrame:
+    """One price file's rows, checked: every row has the header's number of cells, ``date`` holds text, and each of
+    ``fields`` holds numbers and blanks only. A file that fails is refused by name. Nothing is coerced or realigned: a
+    cell such as ``not_available`` is never turned into a blank, and a row with a cell too many is never read with
+    its values one column along (which pandas does, silently, when columns are picked by name)."""
+    lines = raw.split(b"\n")
+    cells = lines[0].count(b",")
+    ragged = next((n for n, line in enumerate(lines[1:], 2) if line.count(b",") != cells and line.strip()), None)
+    if ragged is not None:
+        raise PriceFileError(f"{name}: line {ragged} does not have the header's {cells + 1} cells; the file is refused, "
+                             "not repaired")
+    try:
+        df = pd.read_csv(io.BytesIO(raw), usecols=["date", *fields])
+    except ValueError as exc:   # a column missing, no header, a row with the wrong number of cells
+        raise PriceFileError(f"{name} cannot be read as a Tiingo daily file: {exc}") from exc
+    if df.empty:
+        return df
+    if not pd.api.types.is_string_dtype(df["date"]):
+        raise PriceFileError(f"{name}: the date column does not hold days as text (YYYY-MM-DD)")
+    bad = []
+    for k in fields:
+        if df[k].dtype.kind not in "fiu":
+            first = df.loc[df[k].notna() & pd.to_numeric(df[k], errors="coerce").isna(), "date"]
+            bad.append(f"{k} (first on {str(first.iloc[0])[:10]})" if len(first) else k)
+    if bad:
+        raise PriceFileError(f"{name}: a cell that is not a number in {', '.join(bad)}; the file is refused, not repaired")
+    return df
+
+
 def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dollar_volume: float,
              files: dict | None = None) -> Universe:
     """Which stock may be ranked on which session. This is the one definition: ``load_panel`` builds on it, and a
@@ -344,15 +378,20 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
     d when it is a member, has a valid bar on d, closed at ``min_price`` or more on the session before, and its median
     dollar volume over the ``DOLLAR_VOLUME_WINDOW`` sessions ending the session before is at least
     ``min_dollar_volume``. "The session before" is the store's previous session, not the stock's previous bar: a
-    stock with no bar on it has no prior close and is out. Bars after ``DEV_LAST_BAR`` are dropped."""
+    stock with no bar on it has no prior close and is out. A valid bar has all eight prices of the row (open, high,
+    low, close and their adjusted values) finite and positive. A number that is not finite (``inf``) is read as a
+    blank, in the prices and in the volume. A cell that is not a number at all is not a Tiingo row: the file is
+    refused by name (``PriceFileError``) and nothing is computed from the store. Bars after ``DEV_LAST_BAR`` are
+    dropped."""
     data_dir = Path(data_dir)
     on_disk = sorted(str(p.relative_to(data_dir)) for p in sorted((data_dir / "prices").glob("*.csv")))
     names = on_disk if files is None else sorted(n for n in files if n.startswith("prices/"))
     if names != on_disk:
         raise RunFileError("the price files changed between the run's declaration and its read; read a fixed copy")
-    cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "volume")}
+    cols_data: dict[str, dict] = {k: {} for k in ("open", "close", "high", "low", "adjOpen", "adjClose", "adjHigh",
+                                                  "adjLow", "volume")}
     for name in names:
-        df = pd.read_csv(io.BytesIO(_read(data_dir, name, files)), usecols=["date", *cols_data])
+        df = _price_rows(_read(data_dir, name, files), name, tuple(cols_data))
         if df.empty:
             continue
         df["date"] = df["date"].str[:10]
@@ -360,13 +399,16 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
         for k, store in cols_data.items():
             store[Path(name).stem] = df[k]
     f = {k: pd.DataFrame(v).sort_index() for k, v in cols_data.items()}
+    f = {k: v.where(np.isfinite(v)) for k, v in f.items()}   # inf is not a price or a volume: read it as a blank
     counts = f["close"].notna().sum(axis=1)
     sessions = [d for d, n in counts.items() if n >= min_session_bars]
     if not sessions or sessions[-1] > DEV_LAST_BAR:
         raise RunFileError("no development sessions in the data")
     f = {k: v.reindex(sessions) for k, v in f.items()}
     lo, hi = f["low"] * (1 - BAR_TOL), f["high"] * (1 + BAR_TOL)
+    # all eight prices of the row: a blank in any one of them, adjHigh and adjLow included, is not a valid bar
     ok = ((f["open"] > 0) & (f["close"] > 0) & (f["high"] > 0) & (f["low"] > 0) & (f["adjOpen"] > 0) & (f["adjClose"] > 0)
+          & (f["adjHigh"] > 0) & (f["adjLow"] > 0)
           & (f["open"] >= lo) & (f["open"] <= hi) & (f["close"] >= lo) & (f["close"] <= hi))
     cols = list(ok.columns)
 
@@ -395,7 +437,11 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
 
 def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel:
     """The bars a run evaluates. ``files`` is the declared manifest's file table; ``run`` always passes it, so every
-    file parsed is the one that was hashed before the declaration."""
+    file parsed is the one that was hashed before the declaration.
+
+    Every price a signal or an outcome reads comes from a valid bar. The returns are masked by the bar and the one
+    before it, and the adjusted close is blank on an invalid bar, so the momentum, reversal, 52-week-high and
+    sector-momentum signals never read a close the valid-bar rule turned away."""
     u = universe(data_dir, min_session_bars=run.min_session_bars, min_price=run.min_price,
                  min_dollar_volume=run.min_dollar_volume, files=files)
     f, ok, cols, member = u.frames, u.ok, u.cols, u.member
@@ -417,7 +463,8 @@ def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel
         code = np.full(len(cols), -1)
         how = {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None, "placed_by_correlation": 0,
                "unplaced": int(member.any(axis=0).sum())}
-    return Panel(u.sessions, cols, on.values, intra.values, cc.values, f["adjClose"].values, u.base, member, code, sectors, how,
+    adj = f["adjClose"].where(ok)   # an invalid bar's adjusted close reaches no signal
+    return Panel(u.sessions, cols, on.values, intra.values, cc.values, adj.values, u.base, member, code, sectors, how,
                  u.dollar.values.astype(np.float32))
 
 
