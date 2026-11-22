@@ -141,6 +141,41 @@ def test_dix_failure_is_reported_once_and_again_only_when_it_fails_again(monkeyp
     assert not [i for i in _issues() if i["severity"] == "CRITICAL"]
 
 
+def test_report_dedupe_is_per_process(monkeypatch):
+    # The record is process memory: a restart (every deploy) forgets it, so
+    # the same failure is reported again. Only the warning repeats in
+    # production; log_issue drops a second unresolved row with the same
+    # source and title in the database (OPERATOR_ISSUE_DEDUPE_HOURS).
+    _record_retries(monkeypatch)
+    log = MagicMock()
+    monkeypatch.setattr(hf, "log", log)
+    rows = [("smart:finra_dix", 1, T0, "DIX_FAIL")]
+
+    hf.diagnose_and_fix_pulls(_engine(rows), False, OperatorState())
+    hf.diagnose_and_fix_pulls(_engine(rows), False, OperatorState())
+    monkeypatch.setattr(hf, "_UNROUTED_FAILURES_REPORTED", {})  # a restart
+    hf.diagnose_and_fix_pulls(_engine(rows), False, OperatorState())
+
+    assert sum(1 for c in log.warning.call_args_list if c.args[0].startswith("Not repairing")) == 2
+    issues = _issues()
+    assert len(issues) == 2
+    assert {(i["category"], i["severity"], i["source"], i["title"]) for i in issues} == {
+        ("ingestion", "WARNING", "smart:finra_dix", "No Hermes pull handler — smart:finra_dix")}
+
+
+def test_log_issue_dedupes_an_unresolved_issue_in_the_database():
+    # The durable half of the dedupe lives in log_issue's own query.
+    import inspect
+
+    from scripts import hermes_health
+
+    source = inspect.getsource(hermes_health.log_issue)
+    for clause in ("AND source IS NOT DISTINCT FROM :src", "AND title = :title",
+                   "AND resolved_at IS NULL", ":hours * INTERVAL '1 hour'"):
+        assert clause in source
+    assert hermes_health.OPERATOR_ISSUE_DEDUPE_HOURS > 0
+
+
 def test_dry_run_reports_a_dix_failure_without_recording_it(monkeypatch):
     _record_retries(monkeypatch)
     log = MagicMock()

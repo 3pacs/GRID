@@ -245,7 +245,13 @@ _REPEATED_FAILURES: dict[str, list[Any]] = {}
 _REPAIR_RECOVERED_AT: dict[str, datetime] = {}
 # source_key -> latest failure time already reported for a source no repair
 # can be routed to (guest pull_log names, see _guest_pull_log_names): one
-# warning and one operator issue per new failure, nothing on later passes.
+# warning and one operator issue per new failure per process. Process memory
+# only, like the other tables here: a restart (every deploy) forgets it, so
+# the first pass after one warns again for a failure still in the 24 h window.
+# The operator issue is deduplicated durably by log_issue instead (no second
+# unresolved row with the same source and title within
+# OPERATOR_ISSUE_DEDUPE_HOURS). Not persisted: the cost of a restart is one
+# log line per failing guest, and there is one guest today.
 _UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
 
 # Exception classes that mean "this retry will fail the same way next time"
@@ -482,11 +488,13 @@ UNROUTED_GUEST_REASON = (
 def _report_unrouted_failures(
     engine: Any, unrouted: list[dict[str, Any]], state: Any, dry_run: bool,
 ) -> None:
-    """Report failures no repair can be routed to, once per new failure.
+    """Report failures no repair can be routed to, once per new failure per process.
 
     They are not diagnosed, retried or escalated, so they take no LLM slot,
     no repair budget and no CRITICAL issue. A new failure (a later
-    ``last_fail``) is reported again; repeats of one failure are silent.
+    ``last_fail``) is reported again; repeats of one failure are silent
+    until the process restarts (``_UNROUTED_FAILURES_REPORTED`` is process
+    memory; log_issue deduplicates the operator issue in the database).
     A dry run reports without recording.
     """
     for info in unrouted:
@@ -2549,9 +2557,9 @@ def diagnose_and_fix_pulls(
     )
 
     # A guest run's failure has no repair route (UNROUTED_GUEST_REASON):
-    # reported once per new failure, then left out of diagnosis, retry and
-    # escalation, so it takes no LLM slot, no repair budget and no CRITICAL
-    # issue on any pass.
+    # reported once per new failure per process, and left out of diagnosis,
+    # retry and escalation on every pass, so it takes no LLM slot, no repair
+    # budget and no CRITICAL issue.
     unrouted = [f for f in failed_info if f["source"] in guest_names]
     if unrouted:
         result["skipped_no_handler"] += len(unrouted)
