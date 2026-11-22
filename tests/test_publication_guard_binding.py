@@ -703,53 +703,132 @@ def test_auto_regime_saves_snapshot_before_journal_and_shares_one_run_tag():
 
     src = inspect.getsource(auto.run)
     i_tag = src.index('run_tag = f"auto_regime.run:{uuid4().hex}"')
+    i_check = src.index("_journal_will_accept(confidence, trans_prob)")
     i_snap = src.index("snap_store.save_snapshot(")
-    i_hash = src.index("stored_payload_sha256(snapshot_payload)")
+    i_bind = src.index("_stored_snapshot_binding(engine, snapshot_id)")
     i_journal = src.index("journal.log_decision(")
     i_history = src.index("persist_regime_history(")
-    assert i_tag < i_snap < i_hash < i_journal < i_history
+    assert i_tag < i_check < i_snap < i_bind < i_journal < i_history
     assert "contradiction_flags={**contradictions, **binding}" in src
     assert "RegimeReplacement(SAME_DAY_REFRESH_REASON, run_tag)" in src
     assert src.count("uuid4()") == 1
     assert src.count("save_snapshot(") == 1
 
 
-def test_producer_binding_round_trips_through_the_briefing_guard(tmp_path):
-    """What auto_regime writes (payload stored via _safe_json, flags with the
-    stored-payload hash) is exactly what the briefing guard accepts. The
-    binding keys never show up as contradictions."""
+@pytest.mark.parametrize("confidence,trans_prob,ok", [
+    (0.71, 0.15, True),
+    (0.0, 1.0, True),
+    (float("nan"), 0.1, False),
+    (0.7, float("inf"), False),
+    (1.2, 0.1, False),
+    (0.7, -0.01, False),
+    (True, 0.1, False),
+])
+def test_snapshot_is_not_saved_when_the_journal_would_reject_the_values(confidence, trans_prob, ok):
     import numpy as np
 
-    from store.snapshots import _safe_json, stored_payload_sha256
+    import scripts.auto_regime as auto
+
+    assert auto._journal_will_accept(confidence, trans_prob) is ok
+    if ok:
+        assert auto._journal_will_accept(np.float64(confidence), np.float32(trans_prob)) is True
+
+
+def _pg_jsonb_roundtrip(obj):
+    """What Postgres 15 JSONB hands back: -0.0 -> 0.0, and integral floats at
+    or above 1e16 come back as integers (measured by the regime/state owner:
+    '{"a": -0.0, "b": 1e20, "c": 1e-05}'::jsonb -> {"a": 0.0, "b":
+    100000000000000000000, "c": 0.00001})."""
+    from store.snapshots import _safe_json
+
+    def norm(v):
+        if isinstance(v, float):
+            if v == 0.0:
+                return 0.0
+            if v.is_integer() and abs(v) >= 1e16:
+                return int(v)
+            return v
+        if isinstance(v, dict):
+            return {k: norm(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [norm(x) for x in v]
+        return v
+
+    return norm(json.loads(_safe_json(obj)))
+
+
+def test_producer_binding_round_trips_through_the_briefing_guard(tmp_path):
+    """auto_regime hashes the payload it reads back after saving, so its
+    binding matches what the briefing guard hashes, even when JSONB
+    normalized numbers (round(ds, 4) gives -0.0 for tiny negative slopes)."""
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    import scripts.auto_regime as auto
+    from store.snapshots import canonical_payload_sha256
 
     payload = {
         "regime": "FRAGILE",
         "confidence": np.float64(0.7134),
         "stress_index": 1.2345,
+        "stress_derivative": round(-0.00001, 4),  # -0.0
+        "contributions": {"big": {"z": 1e20, "contribution": 0.1}},
         "n_features": np.int64(9),
         "features_used": {f"concept_{i}": f"feature_{i}" for i in range(9)},
         "data_as_of": date(2026, 11, 18),
         "regime_run_tag": "auto_regime.run:abc123",
     }
-    stored = json.loads(_safe_json(payload))  # what JSONB hands back
+    stored = _pg_jsonb_roundtrip(payload)
+    # Hashing the in-memory form would NOT match what the reader sees.
+    assert canonical_payload_sha256(json.loads(json.dumps(payload, default=str))) != canonical_payload_sha256(stored)
+
+    engine = MagicMock()
+    conn = MagicMock()
+    conn.__enter__.return_value = conn
+    conn.__exit__.return_value = False
+    conn.execute.return_value.fetchone.return_value = (stored,)
+    engine.connect.return_value = conn
+    binding = auto._stored_snapshot_binding(engine, 42)
+    params = conn.execute.call_args[0][1]
+    assert params == {"sid": 42, "category": "regime_detection"}
+    assert binding == {"snapshot_id": 42, "snapshot_hash": canonical_payload_sha256(stored)}
+
     flags = {
         "calm_in_stress": "vix z=-1.2 is calm despite FRAGILE regime",
-        "snapshot_id": 42,
-        "snapshot_hash": stored_payload_sha256(payload),
+        **binding,
         "regime_run_tag": "auto_regime.run:abc123",
     }
     regime_row = ("FRAGILE", 0.7134, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
-    conn = _BoundRegimeConn(
+    bconn = _BoundRegimeConn(
         regime_row, snap_rows=[(42, stored, "2026-11-18T09:59:00Z", date(2026, 11, 18))],
     )
-
-    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(bconn), tmp_path)._gather_market_snapshot()
 
     lr = snap["latest_regime"]
     assert lr["state"] == "FRAGILE"
     assert lr["snapshot_id"] == 42
     assert lr["bound_inputs"] == 9
     assert lr["contradictions"] == {"calm_in_stress": flags["calm_in_stress"]}
+
+
+@pytest.mark.parametrize("readback", [None, ("not json",), ([1, 2],), RuntimeError("db down")])
+def test_failed_snapshot_read_back_gives_no_binding(readback):
+    from unittest.mock import MagicMock
+
+    import scripts.auto_regime as auto
+
+    engine = MagicMock()
+    conn = MagicMock()
+    conn.__enter__.return_value = conn
+    conn.__exit__.return_value = False
+    if isinstance(readback, Exception):
+        conn.execute.side_effect = readback
+    else:
+        conn.execute.return_value.fetchone.return_value = readback
+    engine.connect.return_value = conn
+    assert auto._stored_snapshot_binding(engine, 42) == {}
+    assert auto._stored_snapshot_binding(engine, None) == {}
 
 
 def test_regime_current_lists_contradictions_without_binding_keys():

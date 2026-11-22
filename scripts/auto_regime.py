@@ -592,6 +592,56 @@ def _binding_summary(bindings: dict[str, dict[str, Any]]) -> dict[str, str]:
     return {concept: b["feature"] for concept, b in bindings.items()}
 
 
+_STORED_SNAPSHOT_PAYLOAD_SQL = text(
+    "SELECT payload FROM analytical_snapshots WHERE id = :sid AND category = :category"
+)
+
+
+def _stored_snapshot_binding(engine, snapshot_id: int | None) -> dict[str, Any]:
+    """``{snapshot_id, snapshot_hash}`` for a saved regime_detection snapshot.
+
+    The hash is taken over the payload as read back from the database, not
+    the in-memory dict: JSONB normalizes numbers (``-0.0`` becomes ``0.0``,
+    ``1e20`` becomes an integer), and readers hash what they read back. So
+    both sides hash the identical post-JSONB object. Returns ``{}`` (no
+    binding, so readers withhold the regime) when the row can't be read back.
+    """
+    from store.snapshots import canonical_payload_sha256
+
+    if snapshot_id is None:
+        return {}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                _STORED_SNAPSHOT_PAYLOAD_SQL,
+                {"sid": int(snapshot_id), "category": "regime_detection"},
+            ).fetchone()
+        stored = row[0] if row else None
+        if isinstance(stored, str):
+            stored = json.loads(stored)
+        if not isinstance(stored, dict):
+            log.warning("Snapshot {sid} could not be read back; journal entry carries no snapshot binding", sid=snapshot_id)
+            return {}
+        return {"snapshot_id": int(snapshot_id), "snapshot_hash": canonical_payload_sha256(stored)}
+    except Exception as exc:
+        log.warning("Snapshot {sid} read-back failed: {e}; journal entry carries no snapshot binding", sid=snapshot_id, e=str(exc))
+        return {}
+
+
+def _journal_will_accept(confidence: float, transition_probability: float) -> bool:
+    """Mirror DecisionJournal.log_decision's numeric checks (finite, in [0, 1]).
+
+    The snapshot is saved before the journal entry so the entry can name it;
+    when the journal would reject the values anyway, skip the save, as the
+    journal-first order did, so no unbound snapshot is left behind.
+    """
+    return all(
+        isinstance(v, (int, float, np.floating)) and not isinstance(v, bool)
+        and bool(np.isfinite(v)) and 0.0 <= float(v) <= 1.0
+        for v in (confidence, transition_probability)
+    )
+
+
 def compute_regime_at(
     engine,
     as_of: date,
@@ -1166,7 +1216,12 @@ def run() -> dict[str, Any]:
     # journal then carries no snapshot binding and readers withhold the regime.
     binding: dict[str, Any] = {"regime_run_tag": run_tag}
     try:
-        from store.snapshots import AnalyticalSnapshotStore, stored_payload_sha256
+        if not _journal_will_accept(confidence, trans_prob):
+            raise ValueError(
+                f"journal would reject confidence={confidence} / transition_probability={trans_prob}; "
+                "not saving an unbound snapshot"
+            )
+        from store.snapshots import AnalyticalSnapshotStore
 
         snapshot_payload = {
             "regime": regime,
@@ -1199,12 +1254,9 @@ def run() -> dict[str, Any]:
                 "stress_derivative": round(ds, 4),
             },
         )
-        if snapshot_id is not None:
-            snapshot_hash = stored_payload_sha256(snapshot_payload)
-            binding["snapshot_id"] = int(snapshot_id)
-            binding["snapshot_hash"] = snapshot_hash
-        else:
+        if snapshot_id is None:
             log.warning("Snapshot persistence returned no id; the regime journal entry carries no snapshot binding")
+        binding.update(_stored_snapshot_binding(engine, snapshot_id))
     except Exception as exc:
         binding = {"regime_run_tag": run_tag}
         log.warning("Snapshot persistence failed: {e}", e=str(exc))

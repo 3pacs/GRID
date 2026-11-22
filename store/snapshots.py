@@ -65,9 +65,10 @@ REGIME_BINDING_FLAG_KEYS: frozenset[str] = frozenset(
 def canonical_payload_sha256(payload: dict[str, Any]) -> str:
     """SHA-256 of a snapshot payload in canonical JSON (sorted keys, compact).
 
-    The one hash both sides of a producer→reader snapshot binding use: the
-    reader hashes the payload it reads back, and the producer hashes
-    ``stored_payload_sha256(payload)``. Raises ``ValueError`` on NaN/inf.
+    The one hash both sides of a producer→reader snapshot binding use. Both
+    hash the payload as read back from the database (JSONB normalizes
+    numbers, e.g. -0.0 -> 0.0), never the producer's in-memory dict. Raises
+    ``ValueError`` on NaN/inf.
     """
     import hashlib
 
@@ -76,15 +77,6 @@ def canonical_payload_sha256(payload: dict[str, Any]) -> str:
         separators=(",", ":"), default=str,
     ).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
-
-
-def stored_payload_sha256(payload: dict[str, Any]) -> str:
-    """Canonical hash of ``payload`` as ``save_snapshot`` stores and returns it.
-
-    ``save_snapshot`` serializes with ``_safe_json`` (numpy/pandas/date
-    handling), so hash that same JSON form, not the in-memory dict.
-    """
-    return canonical_payload_sha256(json.loads(_safe_json(payload)))
 
 
 def strip_binding_flags(flags: Any) -> Any:
