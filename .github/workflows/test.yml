@@ -145,6 +145,36 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
 
+      # scripts/hermes_health.py::check_db_health's stale_sources feeds the
+      # db.stale_sources alert and Hermes's stale-refresh. It reads through a
+      # PostgreSQL-only LATERAL join and savepoints, so these tests skip in
+      # the general run above. Includes the FINRA_SHORT_VOLUME DIX-only-day
+      # case (ingestion/source_freshness.py::SERIES_ANCHORS).
+      - name: Hermes stale-sources PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_HERMES_STALE_SOURCES_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_hermes_health_stale_sources_pg.py -q -rA
+
+      # scripts/hermes_fixers.py::diagnose_and_fix_pulls's failed-pull query
+      # (window functions, = ANY(array) binds, JSONB text). The file is
+      # opt-in and bound to an isolated target, so it never ran and its
+      # fixture went stale unnoticed after the 2026-11-05 recovery clause.
+      # Includes the smart:finra_dix guest-name cases (a DIX run is not a
+      # FINRA_SHORT_VOLUME run, on either side of the query).
+      - name: Hermes failed-pull PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          GRID_HERMES_FAILURE_PG_OPT_IN: "1"
+          GRID_HERMES_FAILURE_PG_TARGET_BINDING: '{"host": "localhost", "port": 5432, "database": "griddb_test", "username": "grid", "isolated": true, "purpose": "hermes-latest-failure-regression"}'
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_hermes_latest_failure_diagnostic_pg.py -q -rA
+
       # astrogrid.backtest_run_invalidation (ag_backtest_invalid_20261110):
       # the migration marks only rotation_variant_* runs, the marks are
       # append-only, and list_backtest_results skips marked runs. A skip
@@ -232,6 +262,27 @@ jobs:
             exit 1
           fi
 
+      # regime_history keeps every version (#1302, regime_history_revs_20261122):
+      # proves on real PostgreSQL that a second default write leaves the row
+      # unchanged, every change keeps the superseded version in
+      # regime_history_revisions (an unattributed one, like the pinned
+      # scheduler's upsert, is archived as such), TRUNCATE and obs_date changes
+      # are refused, revisions are append-only, the readers see the current
+      # label, and downgrade refuses while revisions exist. A skip must fail.
+      - name: regime_history revisions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_regime_history_revisions.py -q -rA | tee /tmp/grid-regime-history-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-regime-history-pg.txt; then
+            echo "::error::regime_history revisions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Each database fixture uses a private schema. Run the competing
       # writers, scorers and hourly advisory-lock tests serially.
       - name: Oracle forward measurement PostgreSQL contracts
@@ -272,7 +323,8 @@ jobs:
 
       # #1322: Schwab-captured options rows reach admin requests only. The
       # LATERAL fragments and the GEX batch-then-chain read run on real
-      # PostgreSQL only; a skip must fail this step.
+      # PostgreSQL only; a skip must fail this step. test_options_column_reads
+      # runs the readers whose columns did not exist on schema.sql's own DDL.
       - name: Options Schwab-provenance PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -282,7 +334,7 @@ jobs:
           TESTING: "true"
         run: |
           set -o pipefail
-          python -m pytest tests/test_options_provenance_pg.py -q -rA | tee /tmp/grid-options-provenance-pg.txt
+          python -m pytest tests/test_options_provenance_pg.py tests/test_options_column_reads.py -q -rA | tee /tmp/grid-options-provenance-pg.txt
           if grep -q "SKIPPED" /tmp/grid-options-provenance-pg.txt; then
             echo "::error::Options Schwab-provenance PostgreSQL contract was skipped"
             exit 1

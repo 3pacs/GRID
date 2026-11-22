@@ -1104,7 +1104,9 @@ class _OptionsSchedulerAdapter:
         self._engine = db_engine
         self._puller = None
 
-    def pull(self, should_continue: Any = None) -> dict[str, Any]:
+    def pull(self, should_continue: Any = None, deadline_at: float | None = None) -> dict[str, Any]:
+        import os
+
         from ingestion.options import OptionsPuller, automatic_options_capture_guard
 
         guarded = automatic_options_capture_guard(getattr(self, "_engine", None))
@@ -1112,8 +1114,24 @@ class _OptionsSchedulerAdapter:
             return guarded
         if self._puller is None:
             self._puller = OptionsPuller(db_engine=self._engine)
+        # Schwab mode (PR1331, 2026-11-21): a full run (~80 Schwab calls plus ~960 Yahoo requests
+        # at >= 1 s, ~19 min) does not fit this job's 840 s window. timeout_s stays 900: at 1,500 s
+        # the smart_ingestion step in scripts/hermes_operator.py (TICK_TIME_BUDGET_S + timeout_s + 60,
+        # 1260 s, pinned by tests/test_hermes_timeout_budgets.py) would have to grow to 1,860 s and
+        # hold every later Hermes step up to 31 min on each options run and 30-min PARTIAL retry,
+        # or abandon a cooperating capture as an orphaned thread. Instead this passes deadline_at so
+        # the run's Yahoo budget fits the time left, and options_schwab.TailCursor resumes the next
+        # run where this one stopped. Every other provider gets exactly the call it got before; the
+        # environment check comes first, so none of them even imports the selector here.
+        schwab_only: dict[str, Any] = {}
+        if (deadline_at is not None
+                and os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() == "schwab"):
+            from ingestion.options import options_primary_provider
+
+            if options_primary_provider() == "schwab":
+                schwab_only["deadline_at"] = deadline_at
         return self._puller.pull_all(
-            should_continue=should_continue, capture_source="smart_scheduler",
+            should_continue=should_continue, capture_source="smart_scheduler", **schwab_only,
         ).summary
 
 

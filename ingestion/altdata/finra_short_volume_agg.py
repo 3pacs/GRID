@@ -29,11 +29,30 @@ invalidate that admission chain. The scheduler's ordinary
 instead, a subclass that leaves the producer's per-symbol behaviour byte for
 byte as it was and adds the aggregates after each successful pull.
 
-``pull_recent`` skips trade dates that already have rows for this source, so
-dates ingested before this module existed (or whose aggregate write failed
-after the per-symbol commit) are filled by :meth:`backfill_aggregates`::
+Which dates count as "already stored"
+-------------------------------------
+The producer's ``pull_recent`` skips a trade date when
+``_get_existing_source_dates`` returns it. BasePuller's version returns
+every date with ANY row under source ``FINRA_SHORT_VOLUME``. Since
+2026-11-13 ``finra_dix.py`` also writes ``finra:dix_sp500`` under that
+source, and its scheduler slot runs hours earlier each morning. So the DIX
+row for trade date D landed first, and ``pull_recent`` then skipped D for
+good: no per-symbol rows, no aggregates (obs 11-12, 11-13, 11-18, 11-19 and
+11-20 were lost that way). This class overrides the check. A date counts as
+stored only when it has per-symbol rows AND the market-wide ratio. A date
+missing either one is pulled again: per-symbol inserts stay idempotent, and
+any missing aggregates are written.
 
-    python -m ingestion.altdata.finra_short_volume_agg --backfill-aggregates 2026-09-01 2026-11-04
+Backfill
+--------
+Dates older than the ``pull_recent`` window are filled by
+:meth:`backfill_aggregates`, which writes only the aggregates and labels
+each row it writes (``raw_payload["backfill"]``)::
+
+    python -m ingestion.altdata.finra_short_volume_agg --backfill-aggregates 2026-11-12 2026-11-20 \
+        --run-tag finra-agg-gap-20261121
+
+(The first backfill, 2026-08-03..2026-11-04, ran before rows were labelled.)
 
 Every aggregate row carries the pull's own ``pull_timestamp``, so a
 point-in-time read sees backfilled history only from the day it was
@@ -58,6 +77,8 @@ from ingestion.base import _http_status_from_exc
 
 AGG_PREFIX = "finra:short_volume_agg"
 AGG_MARKET_RATIO = f"{AGG_PREFIX}:market_ratio"
+# The producer's per-symbol series, i.e. FINRAShortVolumePuller.series_id(sym).
+SYMBOL_PREFIX = "finra:short_volume:"
 # Index ETFs whose own short-volume ratio is the classic positioning read.
 AGG_ETF_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ", "IWM")
 
@@ -119,6 +140,29 @@ class FINRAShortVolumeAggPuller(FINRAShortVolumePuller):
     # Same source_catalog row as the producer. Restated literally because the
     # registry/catalog tests read it from this class body, not its bases.
     SOURCE_NAME: str = "FINRA_SHORT_VOLUME"
+
+    def _get_existing_source_dates(
+        self,
+        conn: Any,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> set[date]:
+        """Trade dates this puller has finished: per-symbol rows AND the market ratio.
+
+        Overrides BasePuller's "any row for this source" check, which other
+        writers on the same source (``finra:dix_sp500``) satisfy (see the
+        module docstring). ``pull_recent`` is the only caller and always
+        passes both bounds. They are required here because one unbounded
+        pairs read would cover ~12k rows per trade date of history.
+        """
+        if start_date is None or end_date is None:
+            raise ValueError("FINRAShortVolumeAggPuller._get_existing_source_dates needs both bounds")
+        pairs = self._get_existing_pairs_in_range(conn, start_date, end_date)
+        with_symbols: set[date] = set()
+        for sid, dates in pairs.items():
+            if sid.startswith(SYMBOL_PREFIX):
+                with_symbols |= dates
+        return with_symbols & pairs.get(AGG_MARKET_RATIO, set())
 
     def pull(
         self,
@@ -185,19 +229,26 @@ class FINRAShortVolumeAggPuller(FINRAShortVolumePuller):
         conn: Any,
         aggregates: dict[str, dict[str, Any]],
         existing_pairs: dict[str, set[date]],
+        *,
+        backfill: dict[str, Any] | None = None,
     ) -> int:
-        """Write each aggregate not already stored for its (series, date)."""
+        """Write each aggregate not already stored for its (series, date).
+
+        ``backfill``, when given, is stored as ``raw_payload["backfill"]`` so
+        rows written by a backfill run can be told from the daily pull's.
+        """
         inserted = 0
         for sid, agg in aggregates.items():
             existing_dates = existing_pairs.setdefault(sid, set())
             if agg["obs_date"] in existing_dates:
                 continue
+            payload = agg["payload"] if backfill is None else {**agg["payload"], "backfill": backfill}
             self._insert_raw(
                 conn=conn,
                 series_id=sid,
                 obs_date=agg["obs_date"],
                 value=agg["value"],
-                raw_payload=agg["payload"],
+                raw_payload=payload,
             )
             existing_dates.add(agg["obs_date"])
             inserted += 1
@@ -209,12 +260,17 @@ class FINRAShortVolumeAggPuller(FINRAShortVolumePuller):
         end: date | str,
         *,
         market_prefix: str = _DEFAULT_MARKET_PREFIX,
+        run_tag: str | None = None,
     ) -> dict[str, Any]:
         """Re-fetch past daily files and write only their missing aggregates.
 
         Walks ``start``..``end`` (weekdays, inclusive). Per-symbol rows are
         never written. A date with no published file (HTTP 403/404) is
         skipped; any other failure is counted and the walk continues.
+
+        Every row written carries ``raw_payload["backfill"] =
+        {"by": "backfill_aggregates", "run_tag": run_tag}``. Its
+        ``pull_timestamp`` is the time of the backfill, as for any pull.
 
         Returns:
             dict with ``status``, ``aggregates_inserted`` and date counts:
@@ -224,20 +280,21 @@ class FINRAShortVolumeAggPuller(FINRAShortVolumePuller):
         start_d = date.fromisoformat(start) if isinstance(start, str) else start
         end_d = date.fromisoformat(end) if isinstance(end, str) else end
         counts = {"dates_written": 0, "dates_complete": 0, "dates_skipped": 0, "dates_failed": 0}
+        label = {"by": "backfill_aggregates", "run_tag": run_tag}
         total = 0
         d = start_d
         while d <= end_d:
             if d.weekday() < 5:
-                outcome, n = self._backfill_one(d, market_prefix)
+                outcome, n = self._backfill_one(d, market_prefix, label)
                 counts[outcome] += 1
                 total += n
             d += timedelta(days=1)
-        log.info("{s}: aggregate backfill {a}..{b}: {n} rows, {c}",
-                 s=self.SOURCE_NAME, a=start_d, b=end_d, n=total, c=counts)
+        log.info("{s}: aggregate backfill {a}..{b} (run_tag={t}): {n} rows, {c}",
+                 s=self.SOURCE_NAME, a=start_d, b=end_d, t=run_tag, n=total, c=counts)
         return {"status": "FAILED" if counts["dates_failed"] else "SUCCESS",
-                "aggregates_inserted": total, **counts}
+                "aggregates_inserted": total, "run_tag": run_tag, **counts}
 
-    def _backfill_one(self, d: date, market_prefix: str) -> tuple[str, int]:
+    def _backfill_one(self, d: date, market_prefix: str, label: dict[str, Any]) -> tuple[str, int]:
         try:
             raw_text = self._fetch_raw_text(d, market_prefix=market_prefix)
             aggregates = compute_daily_aggregates(parse_daily_short_volume_file(raw_text)["rows"])
@@ -246,7 +303,7 @@ class FINRAShortVolumeAggPuller(FINRAShortVolumePuller):
             with self.engine.begin() as conn:
                 self._file_advisory_lock(conn, "pull", d.isoformat())
                 existing = self._get_existing_pairs_in_range(conn, d, d)
-                n = self._insert_missing_aggregates(conn, aggregates, existing)
+                n = self._insert_missing_aggregates(conn, aggregates, existing, backfill=label)
         except Exception as exc:  # noqa: BLE001 -- counted, the walk continues
             if _http_status_from_exc(exc) in (403, 404):
                 return "dates_skipped", 0
@@ -265,10 +322,13 @@ if __name__ == "__main__":
     )
     _parser.add_argument("--backfill-aggregates", nargs=2, metavar=("START", "END"), required=True,
                          help="Inclusive YYYY-MM-DD trade-date range.")
+    _parser.add_argument("--run-tag", required=True,
+                         help="Stored in each written row's raw_payload['backfill'] to name this run.")
     _args = _parser.parse_args()
 
     from db import get_engine
 
-    _result = FINRAShortVolumeAggPuller(get_engine()).backfill_aggregates(*_args.backfill_aggregates)
+    _result = FINRAShortVolumeAggPuller(get_engine()).backfill_aggregates(
+        *_args.backfill_aggregates, run_tag=_args.run_tag)
     print(json.dumps(_result, sort_keys=True))
     raise SystemExit(0 if _result["status"] == "SUCCESS" else 1)

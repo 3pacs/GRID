@@ -19,7 +19,7 @@ def staged(tmp_path):
     shutil.copyfile(ROOT / "analysis/factory_session_calendar.py", root / "analysis/factory_session_calendar.py")
     dest = root / "docs/reference/calendar-manifests"
     dest.mkdir(parents=True)
-    for source in (ROOT / "docs/reference/calendar-manifests").glob("factory-xnys-*.json"):
+    for source in sorted((ROOT / "docs/reference/calendar-manifests").glob("*-xnys-*.json")):  # factory + prescreen
         shutil.copyfile(source, dest / source.name)
         (dest / source.name).chmod(0o664)
     return root, sorted(dest.glob("*.json"))
@@ -127,3 +127,72 @@ def test_hook_prepares_after_pin_before_dependency_side_effects():
     text = (ROOT / "scripts/deploy_build_hook.sh").read_text()
     assert text.index('bash "${SCRIPT_DIR}/deploy_pin_candidate_sha.sh"') < text.index(
         'python3 "${SCRIPT_DIR}/prepare_factory_calendars.py"') < text.index('pip install')
+
+
+def _assigned(path, name):
+    import ast
+
+    tree = ast.parse(path.read_text())
+    return [ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)]
+
+
+def test_prescreen_pins_equal_the_prescreen_module():
+    """factory_session_calendar.PRESCREEN_PINS is the list the deploy prepares and market-state reads;
+    factory_prescreen.PINS is the prescreen's own copy. They must not drift."""
+    assert _assigned(ROOT / "analysis/factory_session_calendar.py", "PRESCREEN_PINS") == \
+        _assigned(ROOT / "analysis/factory_prescreen.py", "PINS")
+
+
+def test_prescreen_parts_are_prepared_with_the_factory_parts(tmp_path):
+    root, files = staged(tmp_path)
+    assert {p.name.split("-")[0] for p in files} == {"factory", "prescreen"}
+    rows = M.prepare(root)["files"]
+    assert sorted(r["file"] for r in rows) == [p.name for p in files]
+    assert all(mode(p) == 0o644 for p in files)
+
+
+def test_candidate_without_prescreen_pins_prepares_pins_only(tmp_path):
+    root, files = staged(tmp_path)
+    source = root / "analysis/factory_session_calendar.py"
+    text = source.read_text()
+    start = text.index("PRESCREEN_PINS = (")
+    source.write_text(text[:start] + text[text.index("\n)\n", start) + 3:])
+    assert not _assigned(source, "PRESCREEN_PINS")
+    M.prepare(root)
+    assert {p.name: mode(p) for p in files} == {
+        p.name: 0o644 if p.name.startswith("factory-") else 0o664 for p in files}
+
+
+def test_market_state_reads_a_umask002_candidate_only_after_prepare(tmp_path, monkeypatch):
+    """Codex's deploy witness (#1324): a release built under umask 002 has 664 manifests, and the strict
+    reader refuses them; the deploy's prepare() must cover every part market-state opens."""
+    from datetime import date
+
+    from intelligence.regime import market_state as MS
+
+    source, _ = staged(tmp_path)
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path),
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    def git(*args):
+        return subprocess.run(["git", *args], env=env, check=True, capture_output=True)
+    git("init", str(source))
+    git("-C", str(source), "add", ".")
+    git("-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "synthetic local fixture")
+    checkout = tmp_path / "checkout"
+    old = os.umask(0o002)
+    try:
+        git("clone", "--local", str(source), str(checkout))
+    finally:
+        os.umask(old)
+    manifests = checkout / "docs/reference/calendar-manifests"
+    assert all(mode(p) == 0o664 for p in manifests.glob("*.json"))
+    monkeypatch.setattr(MS, "_MANIFEST_ROOT", manifests)
+    monkeypatch.setattr(MS, "_xnys_cache", None)
+    with pytest.raises(ValueError, match="non-group/world-writable"):
+        MS.compute_market_state(None, date(2026, 11, 20))      # refused before any read
+    M.prepare(checkout)
+    assert all(mode(p) == 0o644 for p in manifests.glob("*.json"))
+    assert MS.sessions_after(date(2026, 11, 19), date(2026, 11, 20)) == (1, False)
+    assert MS.sessions_after(date(2020, 6, 17), date(2020, 6, 22)) == (3, False)   # a prescreen-part date

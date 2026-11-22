@@ -505,6 +505,7 @@ for _label, _module_path, _required in [
     ("ollama", "api.routers.ollama", False),
     ("knowledge", "api.routers.knowledge", False),
     ("research_findings", "api.routers.research_findings", False),
+    ("agent_report_reads", "api.routers.agent_report_reads", False),
     ("backtest", "api.routers.backtest", False),
     ("options", "api.routers.options", False),
     ("celestial", "api.routers.celestial", False),

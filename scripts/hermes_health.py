@@ -457,6 +457,25 @@ class OperatorState:
         # period's.
         self.daily_intel_period_outcome: str | None = None
 
+        # Weekly-intel per-task ledger (2026-11-22). See
+        # scripts/hermes_operator.py::WEEKLY_INTEL_TASKS and
+        # _run_weekly_intel_block. weekly_intel_period is the ISO date of the
+        # Sunday 03:00 UTC boundary the three dicts belong to; a new period
+        # clears them. weekly_intel_outcome: task name -> "done" |
+        # "done_late" | "timed_out" | "failed" | "failed_in_flight" |
+        # "failed_deferred" (final for the period) or "retry_pending" |
+        # "deferred" (runs again on a later cycle). weekly_intel_attempts
+        # counts attempts (timeouts and exceptions); weekly_intel_deferrals
+        # counts cycles the trust report waited for a running trust-cycle
+        # pass. state.last_weekly_intel is set only once every task has a
+        # final outcome; weekly_intel_period_outcome is then "complete" or
+        # "complete_with_failures".
+        self.weekly_intel_period: str | None = None
+        self.weekly_intel_outcome: dict[str, str] = {}
+        self.weekly_intel_attempts: dict[str, int] = {}
+        self.weekly_intel_deferrals: dict[str, int] = {}
+        self.weekly_intel_period_outcome: str | None = None
+
         # capital_flow_ttm_watermark (fable-daily-intel-sql-tasks,
         # 2026-09-20 follow-up; made VESTIGIAL by the SAME-DAY SECOND
         # follow-up): originally a durable, restart-safe scalar ``as_of``
@@ -590,6 +609,11 @@ class OperatorState:
             "daily_intel_attempts": self.daily_intel_attempts,
             "daily_intel_task_outcome": self.daily_intel_task_outcome,
             "daily_intel_period_outcome": self.daily_intel_period_outcome,
+            "weekly_intel_period": self.weekly_intel_period,
+            "weekly_intel_outcome": self.weekly_intel_outcome,
+            "weekly_intel_attempts": self.weekly_intel_attempts,
+            "weekly_intel_deferrals": self.weekly_intel_deferrals,
+            "weekly_intel_period_outcome": self.weekly_intel_period_outcome,
             "capital_flow_ttm_watermark": self.capital_flow_ttm_watermark,
         }
 
@@ -712,12 +736,31 @@ class OperatorState:
             }
             hydrated_any = hydrated_any or bool(self.daily_intel_task_outcome)
 
+        # Weekly-intel ledger (2026-11-22) — same "only if currently unset"
+        # rule, so a restart mid-period resumes the tasks without a final
+        # outcome instead of starting the week over.
+        weekly_intel_outcome = op_state.get("weekly_intel_outcome")
+        if isinstance(weekly_intel_outcome, dict) and not self.weekly_intel_outcome:
+            self.weekly_intel_outcome = {
+                str(k): str(v) for k, v in weekly_intel_outcome.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.weekly_intel_outcome)
+
+        for int_dict_field in ("weekly_intel_attempts", "weekly_intel_deferrals"):
+            raw_counts = op_state.get(int_dict_field)
+            if isinstance(raw_counts, dict) and not getattr(self, int_dict_field):
+                setattr(self, int_dict_field, {
+                    str(k): int(v) for k, v in raw_counts.items() if isinstance(v, int)
+                })
+                hydrated_any = hydrated_any or bool(getattr(self, int_dict_field))
+
         # Plain string fields (not timestamps, not counters) — restore
         # verbatim, same "only if currently unset" rule as the datetime
         # fields above.
         for str_field in (
             "last_sector_health_outcome", "daily_intel_period",
             "daily_intel_period_outcome", "capital_flow_ttm_watermark",
+            "weekly_intel_period", "weekly_intel_period_outcome",
         ):
             val = op_state.get(str_field)
             if isinstance(val, str) and getattr(self, str_field, None) is None:
@@ -799,7 +842,12 @@ def is_not_configured_reason(reason: str | None) -> bool:
     return any(marker in text_ for marker in _NOT_CONFIGURED_MARKERS)
 
 
-def _attach_last_attempts(conn: Any, stale: list[dict[str, Any]], stale_ids: dict[str, int]) -> None:
+def _attach_last_attempts(
+    conn: Any,
+    stale: list[dict[str, Any]],
+    stale_ids: dict[str, int],
+    skip_puller_names: frozenset[str] = frozenset(),
+) -> None:
     """Annotate each stale source with its latest pull_log attempt.
 
     The alert used to say only "N sources past freshness window"; this adds
@@ -808,6 +856,12 @@ def _attach_last_attempts(conn: Any, stale: list[dict[str, Any]], stale_ids: dic
     ``not_configured`` flag. pull_log is small (~13k rows on 2026-11-04)
     and the lookup is restricted to the stale source ids. Best-effort: a
     failure leaves the entries unannotated rather than failing health.
+
+    ``skip_puller_names`` are runs that share a source id without being its
+    owner's runs (``smart:finra_dix`` under FINRA_SHORT_VOLUME, see
+    ingestion/source_freshness.py::GUEST_PULL_LOG_NAMES): a DIX
+    "SKIPPED: no TIINGO_API_KEY" must not mark the short-volume source
+    not_configured, nor a DIX success read as its last attempt.
     """
     from sqlalchemy import text
 
@@ -824,9 +878,10 @@ def _attach_last_attempts(conn: Any, stale: list[dict[str, Any]], stale_ids: dic
                     "       COALESCE(completed_at, started_at) AS attempted_at "
                     "FROM pull_log "
                     "WHERE source_id = ANY(:ids) "
+                    "  AND NOT (puller_name = ANY(:skip)) "
                     "ORDER BY source_id, started_at DESC"
                 ),
-                {"ids": ids},
+                {"ids": ids, "skip": sorted(skip_puller_names)},
             ).fetchall()
     except Exception as exc:
         log.warning("stale_sources last-attempt lookup failed: {e}", e=str(exc))
@@ -966,30 +1021,61 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                     "WHERE sc.active = TRUE"
                 )
             ).fetchall()
+            # Lazy (ingestion.source_freshness imports the SmartScheduler
+            # registry); inside the try so a failed import is reported in
+            # result["error"], not silently judged the old way.
+            from ingestion.source_freshness import (
+                GUEST_PULL_LOG_NAMES,
+                anchor_for,
+                read_anchored_freshness,
+            )
+
             now = datetime.now(timezone.utc)
             stale: list[dict[str, Any]] = []
             stale_ids: dict[str, int] = {}
             for name, last_pull_at, latency_class, update_frequency, latest_success, source_id in rows:
                 if is_excluded(name):
                     continue
-                effective = last_pull_at
-                if latest_success is not None and (effective is None or latest_success > effective):
-                    effective = latest_success
-                cadence = cadence_for_source(
-                    name, update_frequency=update_frequency, latency_class=latency_class,
+                # A catalog row other pullers share (FINRA_SHORT_VOLUME: DIX
+                # writes and bumps last_pull_at under it every morning) is
+                # judged by whether its owner's own series cover the trade
+                # date due by now, never by the newest row or last_pull_at
+                # for the source. Landing time is reported, not judged: a
+                # re-pull of an old date is not the current one. See
+                # ingestion/source_freshness.py::SERIES_ANCHORS.
+                anchor = anchor_for(name)
+                anchored = (
+                    read_anchored_freshness(conn, anchor, now=now)
+                    if anchor is not None else None
                 )
-                if is_stale(effective, now, cadence):
+                if anchored is not None:
+                    effective = anchored.landed_at
+                    stale_now = not anchored.covered
+                    cadence_kind = "TRADE_DATE"
+                else:
+                    effective = last_pull_at
+                    if latest_success is not None and (effective is None or latest_success > effective):
+                        effective = latest_success
+                    cadence = cadence_for_source(
+                        name, update_frequency=update_frequency, latency_class=latency_class,
+                    )
+                    stale_now = is_stale(effective, now, cadence)
+                    cadence_kind = cadence.kind
+                if stale_now:
                     age = (now - effective).total_seconds() / 3600.0 if effective else None
-                    stale.append({
+                    entry: dict[str, Any] = {
                         "source": name,
                         "last_pull": effective.isoformat() if effective else "never",
-                        "cadence": cadence.kind,
+                        "cadence": cadence_kind,
                         "age_hours": round(age, 1) if age is not None else None,
-                    })
+                    }
+                    if anchored is not None:
+                        entry["judged_by"] = anchored.as_dict()
+                    stale.append(entry)
                     stale_ids[name] = source_id
             stale.sort(key=lambda s: (s["age_hours"] is None, -(s["age_hours"] or 0)))
             if stale and _relation_exists(conn, "pull_log"):
-                _attach_last_attempts(conn, stale, stale_ids)
+                _attach_last_attempts(conn, stale, stale_ids, GUEST_PULL_LOG_NAMES)
             result["stale_sources"] = stale
 
             # QUARANTINED rows (migrations/versions/raw_series_quarantined_20260926.py)

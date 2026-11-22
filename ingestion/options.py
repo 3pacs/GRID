@@ -19,7 +19,7 @@ import os
 import re
 import time
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -214,17 +214,34 @@ class OptionsPullResults(list[dict[str, Any]]):
     # (``OptionsSourceStopped``).
     _RUN_STOP_REASONS: frozenset[str] = frozenset({"source_access_denied", "source_stopped"})
 
-    def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
+    def __init__(self, items: list[dict[str, Any]], *, full_universe: bool,
+                 covered_earlier: frozenset[str] | None = None) -> None:
         super().__init__(items)
         self.full_universe = full_universe
         self.publication_error: str | None = None
+        # Schwab-mode full-universe runs only (ingestion/options_schwab.py TailCursor): names an
+        # earlier run of this session day captured or accounted for. None on every other path,
+        # where coverage is this run's alone.
+        self.covered_earlier = covered_earlier
 
-    def _is_clean_no_chain(self, result: dict[str, Any]) -> bool:
+    @classmethod
+    def _is_clean_no_chain(cls, result: Mapping[str, Any]) -> bool:
         return (
             result.get("status") == "SKIPPED"
-            and result.get("reason") in self._CLEAN_NO_CHAIN_REASONS
-            and result.get("ticker") not in self._CORE_TICKERS
+            and result.get("reason") in cls._CLEAN_NO_CHAIN_REASONS
+            and result.get("ticker") not in cls._CORE_TICKERS
         )
+
+    @classmethod
+    def accounts_for(cls, result: Mapping[str, Any]) -> bool:
+        """True when ``result`` completes its ticker's coverage: the three cases ``summary`` counts."""
+        return (result.get("status") == "SUCCESS"
+                or bool(result.get("no_options") and result.get("status") == "NO_NEW_DATA")
+                or cls._is_clean_no_chain(result))
+
+    def _covered_earlier(self, result: dict[str, Any]) -> bool:
+        return (self.covered_earlier is not None and result.get("ticker") in self.covered_earlier
+                and not self.accounts_for(result))
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -240,6 +257,8 @@ class OptionsPullResults(list[dict[str, Any]]):
         # for non-core tickers. A row is one or the other, never both.
         no_options = sum(1 for r in self if r.get("no_options") and r.get("status") == "NO_NEW_DATA")
         no_data = [r.get("ticker") for r in self if self._is_clean_no_chain(r)]
+        # Always empty unless covered_earlier is set (schwab-mode session cycle).
+        earlier = [r.get("ticker") for r in self if self._covered_earlier(r)]
         if not self or all(s == "SKIPPED" for s in statuses):
             reasons = sorted({str(r["reason"]) for r in self if r.get("reason")})
             status, note = "SKIPPED", "no ticker capture completed"
@@ -248,15 +267,18 @@ class OptionsPullResults(list[dict[str, Any]]):
         elif not ok and not deferred and not no_options:
             status, note = "FAILED", "no ticker succeeded"
         elif (self.publication_error or not self.full_universe
-                or ok + no_options + len(no_data) != len(self) or not known_rows):
+                or ok + no_options + len(no_data) + len(earlier) != len(self) or not known_rows):
             status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
             if not self.publication_error and self.full_universe and known_rows:
                 missing = [r.get("ticker") for r in self
                            if r.get("status") != "SUCCESS" and not self._is_clean_no_chain(r)
-                           and not (r.get("no_options") and r.get("status") == "NO_NEW_DATA")]
+                           and not (r.get("no_options") and r.get("status") == "NO_NEW_DATA")
+                           and not self._covered_earlier(r)]
                 note = f"{note}: {len(missing)} tickers not captured ({', '.join(map(str, missing[:10]))})"
         elif not rows:
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
+        elif earlier:
+            status, note = "SUCCESS", "full default universe captured across this session's runs"
         else:
             status, note = "SUCCESS", "full default universe captured"
         denied = next((r for r in self if r.get("reason") in self._RUN_STOP_REASONS), None)
@@ -268,7 +290,7 @@ class OptionsPullResults(list[dict[str, Any]]):
             limited = next((r.get("rate_limited") for r in self if r.get("rate_limited")), None)
             if limited is not None:
                 note = f"{note}; {limited}"
-        return {
+        summary = {
             "status": status, "rows_inserted": rows,
             "scope": "full_universe" if self.full_universe else "subset",
             "tickers_total": len(self), "tickers_ok": ok,
@@ -280,6 +302,11 @@ class OptionsPullResults(list[dict[str, Any]]):
             "error": note if status in ("PARTIAL", "FAILED") else None,
             "reason": note,
         }
+        if self.covered_earlier is not None:
+            # Schwab mode only, so the default summary keeps its exact keys.
+            summary["coverage"] = "session_cycle"
+            summary["tickers_covered_earlier"] = len(earlier)
+        return summary
 
 
 
@@ -293,13 +320,21 @@ def _before_regular_open(now: datetime) -> bool:
     return (local.hour, local.minute) < REGULAR_SESSION_OPEN_ET
 
 
-def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
+def automatic_options_capture_guard(engine: Engine, *, writer: str | None = None) -> dict[str, Any] | None:
     """Owner-gated daily-writer policy for automatic secondary callers only.
 
     Batch existence is diagnostic, never proof of complete source coverage or
     scheduler provenance. Secondary writers also defer with no batches: letting
     one start while the daily writer is fetching would recreate the race. The
     daily scheduler and explicit GEM capture do not call this guard.
+
+    ``writer``: only the dedicated options runner passes one
+    (``DEDICATED_CAPTURE_SOURCE``). Under the ``daily_scheduler`` policy it is
+    accepted only while the dedicated hand-off is active
+    (``dedicated_handoff_active``): then it runs the daily scheduler's
+    handed-off slots, so it is that writer's stand-in, not a secondary one.
+    Without the hand-off it is refused like any other writer. Every other
+    caller passes no writer and is judged exactly as before.
     """
     policy = os.getenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "legacy").strip().lower()
     if policy in {"", "legacy"}:
@@ -313,6 +348,8 @@ def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
     if policy != "daily_scheduler":
         result["reason"] = "invalid_options_writer_policy"
         return result
+    if writer is not None and writer == DEDICATED_CAPTURE_SOURCE and dedicated_handoff_active():
+        return None
     try:
         with engine.connect() as conn:
             conn.execute(text("SET TRANSACTION READ ONLY"))
@@ -792,6 +829,55 @@ def options_primary_provider() -> str:
     return value if value in ("yahoo", "schwab") else "cboe"
 
 
+# Schwab mode only (2026-11-22, pre-open list item 7): the full-universe run (~80 Schwab calls plus
+# ~960 Yahoo requests at >= 1 s, ~19 min) gets its own systemd timer
+# (deploy/systemd/grid-options-dedicated.*, scripts/run_options_dedicated.py) instead of the smart
+# scheduler's 840 s window. The operator declares that timer installed with
+# GRID_OPTIONS_DEDICATED_TIMER=1; only then do the scheduler writers hand their full-universe run
+# to it (``dedicated_timer_handoff``). Without schwab mode and the flag nothing here applies.
+DEDICATED_CAPTURE_SOURCE = "options_dedicated"
+DEDICATED_HANDOFF_REASON = "dedicated_options_timer"
+# GEM's event trigger (scripts/gem_daily_capture.py) waits for the daily scheduler's own "Options
+# daily pull complete" line up to its absolute 10:20 New York deadline. So the daily scheduler keeps
+# its morning pull and hands off only from 10:20 New York (its 16:00Z / 20:00Z / 22:00Z slots).
+GEM_TRIGGER_WINDOW_END_ET = (10, 20)
+
+
+def dedicated_timer_declared() -> bool:
+    """True when GRID_OPTIONS_DEDICATED_TIMER=1: the operator installed the dedicated options timer."""
+    return os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1"
+
+
+def dedicated_handoff_active() -> bool:
+    """True when the timer is declared and schwab mode is fully on (``options_primary_provider`` chose it)."""
+    if not dedicated_timer_declared():
+        return False
+    # The raw value first, so cboe/yahoo never consult the selector (it logs for schwab without readers).
+    if os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() != "schwab":
+        return False
+    return options_primary_provider() == "schwab"
+
+
+def dedicated_timer_handoff(capture_source: str, now: datetime | None = None) -> str | None:
+    """``DEDICATED_HANDOFF_REASON`` when this writer's full-universe run belongs to the dedicated timer.
+
+    Only with schwab mode fully on (``options_primary_provider`` chose schwab) and the timer
+    declared. Only the two scheduler writers hand off: the smart scheduler always, the daily
+    scheduler from ``GEM_TRIGGER_WINDOW_END_ET`` New York on. Every other writer (the dedicated
+    runner itself, GEM, the oracle forward pass, a manual run) is never handed off, and callers
+    apply this to full-universe runs only.
+    """
+    if not dedicated_handoff_active():
+        return None
+    if capture_source == "smart_scheduler":
+        return DEDICATED_HANDOFF_REASON
+    if capture_source == "daily_scheduler":
+        local = (now if now is not None else _utc_now()).astimezone(_EQUITY_TZ)
+        if (local.hour, local.minute) >= GEM_TRIGGER_WINDOW_END_ET:
+            return DEDICATED_HANDOFF_REASON
+    return None
+
+
 class CboeFirstOptionsClient:
     """Cboe primary, Yahoo fallback, one provider per ticker capture.
 
@@ -929,6 +1015,7 @@ class OptionsPuller(BasePuller):
         max_expirations: int = MAX_EXPIRATIONS,
         should_continue: Callable[[], bool] | None = None,
         capture_source: str = DEFAULT_CAPTURE_SOURCE,
+        deadline_at: float | None = None,
     ) -> OptionsPullResults:
         """Pull options chains for all tickers and compute signals.
 
@@ -948,6 +1035,24 @@ class OptionsPuller(BasePuller):
                 ticker and reports it and the remaining tickers as DEFERRED.
             capture_source: Writer label recorded on each registered batch
                 in ``options_capture_batches`` (e.g. "gem_daily").
+            deadline_at: Schwab mode only. The caller's cooperative deadline
+                (``time.monotonic()``); when the Yahoo-served names begin, the
+                run's Yahoo request budget is sized to the time left
+                (``options_schwab.yahoo_budget_for_window``). Ignored on every
+                other path.
+
+        Schwab mode, full default universe only: the Yahoo-served names start
+        after the last one the previous run of this writer finished, wrapping
+        around (``options_schwab.TailCursor``), and a name an earlier run of
+        the same session day and cycle captured counts toward this run's
+        coverage. So source freshness moves once every name has been captured
+        within the session's runs, by the run that completes that cycle, which
+        then starts the next cycle with nothing covered.
+
+        Schwab mode with GRID_OPTIONS_DEDICATED_TIMER=1: a full-universe run by
+        the smart or daily scheduler writer that ``dedicated_timer_handoff``
+        hands off requests nothing; every core ticker is SKIPPED
+        ``dedicated_options_timer`` (summary SKIPPED).
 
         A 401/403 stops this entire run, including when it first occurs in
         the catalyst tail after every core ticker succeeds. Earlier complete
@@ -966,6 +1071,20 @@ class OptionsPuller(BasePuller):
             raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
 
         full_universe = tickers is None and include_catalyst_universe and max_expirations == MAX_EXPIRATIONS
+        # Schwab mode with the dedicated timer declared (``dedicated_timer_handoff``): the scheduler
+        # writers leave the full universe to it. The literal flag check comes first, so without
+        # GRID_OPTIONS_DEDICATED_TIMER=1 nothing else here is evaluated and the run is unchanged.
+        if full_universe and os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1":
+            handoff = dedicated_timer_handoff(capture_source)
+            if handoff is not None:
+                log.info(
+                    "Options pull handed off: the dedicated options timer runs the schwab-mode full "
+                    "universe ({w} writer, GRID_OPTIONS_DEDICATED_TIMER=1)", w=capture_source,
+                )
+                return OptionsPullResults([
+                    {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": handoff}
+                    for ticker in EQUITY_TICKERS
+                ], full_universe=full_universe)
         if tickers is None:
             tickers = list(EQUITY_TICKERS)
             if include_catalyst_universe:
@@ -1002,6 +1121,10 @@ class OptionsPuller(BasePuller):
         # name: callers and tests inject any ``get_options`` client there.
         primary = options_primary_provider()
         core_block: str | None = None
+        # Schwab mode, full default universe only: where the Yahoo names resume
+        # and what this session's earlier runs covered. None on every other path.
+        cursor: Any = None
+        yahoo_budget_sized = False
         # Schwab mode only: why the Yahoo-served names are not requested, and
         # their smaller expiry cap. None / the run's own cap on every other path.
         tail_block: str | None = None
@@ -1016,8 +1139,10 @@ class OptionsPuller(BasePuller):
             from ingestion.options_schwab import (
                 YAHOO_MAX_EXPIRATIONS,
                 SchwabFirstOptionsClient,
+                TailCursor,
                 schwab_core_block,
                 schwab_post_session,
+                yahoo_budget_for_window,
                 yahoo_tail_hold,
             )
 
@@ -1040,6 +1165,19 @@ class OptionsPuller(BasePuller):
                     log.info("Options pull: Yahoo names not requested ({why})", why=tail_block)
             tail_expirations = min(max_expirations, YAHOO_MAX_EXPIRATIONS)
             self._yahoo = SchwabFirstOptionsClient(writer=capture_source)
+            if full_universe:
+                # ``catalyst_options_universe`` orders by ticker, so without this
+                # every budget-limited run re-read the same early names and the
+                # last ones were never reached.
+                cursor = TailCursor.load(tickers, today_str, writer=capture_source)
+                core = [t for t in tickers if t in EQUITY_TICKERS]
+                tail = cursor.order([t for t in tickers if t not in EQUITY_TICKERS])
+                tickers = core + tail
+                log.info(
+                    "options: Yahoo names resume at {first} ({n} names; {c} of {total} covered earlier this session)",
+                    first=tail[0] if tail else "-", n=len(tail),
+                    c=len(cursor.covered_before & set(tickers)), total=len(tickers),
+                )
         elif primary == "yahoo":
             self._yahoo = YahooOptionsClient()
         else:
@@ -1064,6 +1202,12 @@ class OptionsPuller(BasePuller):
                                 "reason": core_block, "provider": "schwab"})
                 continue
             in_tail = primary == "schwab" and ticker not in EQUITY_TICKERS
+            if in_tail and tail_block is None and deadline_at is not None and not yahoo_budget_sized:
+                # Sized once, when the Yahoo names begin: what is left of the window.
+                yahoo_budget_sized = True
+                self._yahoo.yahoo_request_budget = yahoo_budget_for_window(deadline_at - time.monotonic())
+                log.info("options: Yahoo request budget {n} for the time left in this run",
+                         n=self._yahoo.yahoo_request_budget)
             if in_tail and tail_block is None and getattr(self._yahoo, "yahoo_budget_spent", False):
                 tail_block = "yahoo_request_budget"
             if in_tail and tail_block is not None:
@@ -1083,6 +1227,8 @@ class OptionsPuller(BasePuller):
             if in_tail and not limited_before and getattr(self._yahoo, "yahoo_rate_limited", False):
                 result["rate_limited"] = "yahoo rate limited (HTTP 429)"
             results.append(result)
+            if cursor is not None:
+                cursor.record(ticker, result, tail=in_tail)
             if result.get("reason") in OptionsPullResults._RUN_STOP_REASONS:
                 results.extend(
                     {"ticker": t, "status": "SKIPPED", "rows_inserted": 0,
@@ -1108,12 +1254,19 @@ class OptionsPuller(BasePuller):
             "{no} without listed options",
             ok=succeeded, total=len(tickers), snaps=total_snaps, no=no_options,
         )
-        outcome = OptionsPullResults(results, full_universe=full_universe)
+        outcome = OptionsPullResults(
+            results, full_universe=full_universe,
+            covered_earlier=cursor.covered_before if cursor is not None else None,
+        )
         if outcome.summary["status"] == "SUCCESS":
             if should_continue is not None and not should_continue():
                 outcome.publication_error = "time budget expired before catalog publication"
             elif not self._mark_catalog_pulled(should_continue=should_continue):
                 outcome.publication_error = "catalog publication deferred or failed"
+        if cursor is not None and outcome.summary["status"] == "SUCCESS":
+            # Freshness was published for this cycle; the next one starts empty, so a later run
+            # that reads one name cannot publish again on top of it (review of #1331).
+            cursor.complete_cycle()
         return outcome
 
     def _mark_catalog_pulled(self, *, should_continue: Callable[[], bool] | None = None) -> bool:

@@ -499,9 +499,16 @@ class FinraCompositionTests(unittest.TestCase):
 # checking the original pin; altered guards/provenance or unrelated edits fail.
 _PRE_PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        from ingestion.options import OptionsPuller\n\n        self._puller = OptionsPuller(db_engine=db_engine)\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
 _PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        # Do not construct the puller (which resolves catalog identity) until\n        # the secondary-writer policy has allowed a real attempt.\n        self._engine = db_engine\n        self._puller = None\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        from ingestion.options import OptionsPuller, automatic_options_capture_guard\n\n        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))\n        if guarded is not None:\n            return guarded\n        if self._puller is None:\n            self._puller = OptionsPuller(db_engine=self._engine)\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
+# PR1331 (schwab-mode tail budget, 2026-11-21) changes only the options adapter's pull
+# method: a schwab-only deadline_at pass-through and its comment. Reverse that exact text
+# to the PR806 method first; any other edit to it fails as PR1331_OPTIONS_DELTA_CHANGED.
+_PR806_OPTIONS_PULL = _PR806_OPTIONS_METHODS[_PR806_OPTIONS_METHODS.index("    def pull("):]
+_PR1331_OPTIONS_PULL = '    def pull(self, should_continue: Any = None, deadline_at: float | None = None) -> dict[str, Any]:\n        import os\n\n        from ingestion.options import OptionsPuller, automatic_options_capture_guard\n\n        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))\n        if guarded is not None:\n            return guarded\n        if self._puller is None:\n            self._puller = OptionsPuller(db_engine=self._engine)\n        # Schwab mode (PR1331, 2026-11-21): a full run (~80 Schwab calls plus ~960 Yahoo requests\n        # at >= 1 s, ~19 min) does not fit this job\'s 840 s window. timeout_s stays 900: at 1,500 s\n        # the smart_ingestion step in scripts/hermes_operator.py (TICK_TIME_BUDGET_S + timeout_s + 60,\n        # 1260 s, pinned by tests/test_hermes_timeout_budgets.py) would have to grow to 1,860 s and\n        # hold every later Hermes step up to 31 min on each options run and 30-min PARTIAL retry,\n        # or abandon a cooperating capture as an orphaned thread. Instead this passes deadline_at so\n        # the run\'s Yahoo budget fits the time left, and options_schwab.TailCursor resumes the next\n        # run where this one stopped. Every other provider gets exactly the call it got before; the\n        # environment check comes first, so none of them even imports the selector here.\n        schwab_only: dict[str, Any] = {}\n        if (deadline_at is not None\n                and os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() == "schwab"):\n            from ingestion.options import options_primary_provider\n\n            if options_primary_provider() == "schwab":\n                schwab_only["deadline_at"] = deadline_at\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler", **schwab_only,\n        ).summary\n'
 
 def scheduler_tail_before_reviewed_options_delta(source):
     tail = source.split('\nimport calendar\n', 1)[1]
+    assert tail.count(_PR1331_OPTIONS_PULL) == 1, 'PR1331_OPTIONS_DELTA_CHANGED'
+    tail = tail.replace(_PR1331_OPTIONS_PULL, _PR806_OPTIONS_PULL, 1)
     assert tail.count(_PR806_OPTIONS_METHODS) == 1, 'PR806_OPTIONS_DELTA_CHANGED'
     # The separately reviewed backlog fix changes exactly this one reporting
     # line. Reverse only that exact occurrence before applying the historical
@@ -711,10 +718,21 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # comments of smart_money / social_sentiment plus the 4-line comment
         # above social_ticker_series. No SEC, FINRA or dispatch code changes.
         # Needs reviewer acceptance like the prior pins.
+        # OPER re-pinned 7a85e9a0 -> 754dfee2 (2026-11-22,
+        # claude/hermes-weekly-due-20261122): the Sunday weekly block leaves
+        # run_intelligence_tasks for its own step (_run_weekly_intel_step,
+        # dispatched in run_cycle after _run_trust_cycle_step): a due-period
+        # rule from Sunday 03:00 UTC (24 h minimum gap after a completed run)
+        # instead of the 03:00-03:10 start window,
+        # WEEKLY_INTEL_TASKS with per-task budgets, a per-cycle budget, a
+        # persisted per-task ledger, and last_weekly_intel set only when every
+        # task has a final outcome. Each weekly call is unchanged. No SEC,
+        # FINRA or dispatch-prefix change. Needs reviewer acceptance like the
+        # prior pins.
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','7a85e9a0a9cd25723384357ded951f455c63884647ec357226b5e3dc4057027e'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
@@ -746,6 +764,8 @@ class CurrentSecDefaultTests(unittest.TestCase):
             ('if guarded is not None:', 'if False:'),
             ('self._puller = None', 'self._puller = OptionsPuller(db_engine=db_engine)'),
             ('capture_source="smart_scheduler"', 'capture_source="options_puller"'),
+            ('schwab_only["deadline_at"] = deadline_at', 'schwab_only["deadline_at"] = None'),
+            ('== "schwab"):', '!= "cboe"):'),
             ('SKIP_RETRY_MINUTES = 30', 'SKIP_RETRY_MINUTES = 31'),
         ]
         read = Path.read_text

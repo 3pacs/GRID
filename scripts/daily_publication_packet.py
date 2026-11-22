@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -104,10 +105,39 @@ CHANNEL_TEXT = {"market_briefings": "content", "thesis_snapshots": "narrative",
 CHANNEL_CLOCK = {"market_briefings": "created_at", "thesis_snapshots": "timestamp",
                  "market_diary": "generated_at", "audio": "generated_at"}
 
+# The briefing claim guard's verdict travels with every briefing, even when the
+# whole generator snapshot is over its 250 KB cap (every withheld snapshot from
+# 2026-11-05 on was 0.49-8.6 MB, so no withheld record carried its reasons).
+# Its rejected draft is bounded to CLAIM_GUARD_DRAFT_CAP_BYTES with a declared
+# truncation record (full size + sha256), never silently dropped. This field is
+# not part of the publication text, so TEXT_FIELD_CAP_BYTES and
+# PUBLICATIONS_AGGREGATE_CAP_BYTES (which count publication text only) do not
+# govern it; this cap does.
+CLAIM_GUARD_DRAFT_CAP_BYTES = 65_536
+CLAIM_GUARD_META_CAP_BYTES = 65_536
+# Static SQL text only (no interpolation); 65536 below equals CLAIM_GUARD_DRAFT_CAP_BYTES
+# (left() counts characters, so the prefix is re-bounded to bytes in Python).
+CLAIM_GUARD_COLUMNS = (
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN (snapshot_data -> 'publication_claim_guard') - 'rejected_candidate' END AS claim_guard_meta, "
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN left(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate', 65536) END "
+    "AS claim_guard_draft_prefix, "
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN octet_length(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate') END "
+    "AS claim_guard_draft_bytes, "
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN encode(sha256(convert_to(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate', "
+    "'UTF8')), 'hex') END AS claim_guard_draft_sha256, "
+)
+_CLAIM_GUARD_KEYS = ("claim_guard_meta", "claim_guard_draft_prefix", "claim_guard_draft_bytes",
+                     "claim_guard_draft_sha256")
+
 QUERIES = {
     "market_briefings": (
         "SELECT id, briefing_type, briefing_date, content, sentiment_score, sentiment_label, "
         "created_at, octet_length(snapshot_data::text) AS snapshot_bytes, "
+        + CLAIM_GUARD_COLUMNS +
         "CASE WHEN octet_length(snapshot_data::text) <= 250000 THEN snapshot_data ELSE NULL END "
         "AS snapshot_data FROM market_briefings "
         "WHERE created_at >= :start AND created_at < :end AND created_at <= :asof "
@@ -221,6 +251,53 @@ def screen_row(row: Any) -> list[str]:
     return reasons
 
 
+def _utf8_prefix(text: str, cap: int) -> str:
+    """Longest prefix of ``text`` within ``cap`` UTF-8 bytes, never splitting a character."""
+    return text.encode("utf-8")[:cap].decode("utf-8", errors="ignore")
+
+
+def bound_claim_guard(record: dict[str, Any]) -> dict[str, Any]:
+    """Fold the claim-guard columns into one bounded ``publication_claim_guard`` field.
+
+    Rows without the columns (older callers) are returned unchanged. A missing
+    guard is an explicit ``None``. The draft keeps at most
+    CLAIM_GUARD_DRAFT_CAP_BYTES and declares its full size, sha256 and whether
+    it was truncated.
+    """
+    if not any(key in record for key in _CLAIM_GUARD_KEYS):
+        return record
+    meta, prefix, draft_bytes, draft_sha = (record.pop(key, None) for key in _CLAIM_GUARD_KEYS)
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = None
+    if not isinstance(meta, dict):
+        record["publication_claim_guard"] = None
+        return record
+    guard: dict[str, Any] = dict(meta)
+    meta_bytes = len(canonical(guard))
+    if meta_bytes > CLAIM_GUARD_META_CAP_BYTES:
+        guard = {key: guard.get(key) for key in ("passed", "reasons", "reason_counts", "scope")}
+        guard["metadata_bound"] = {"utf8_bytes": meta_bytes, "cap_bytes": CLAIM_GUARD_META_CAP_BYTES,
+                                   "truncated": True,
+                                   "note": "guard metadata over cap; only verdict, reasons and counts kept"}
+    if isinstance(prefix, str):
+        kept = _utf8_prefix(prefix, CLAIM_GUARD_DRAFT_CAP_BYTES)
+        kept_bytes = len(kept.encode("utf-8"))
+        full_bytes = draft_bytes if isinstance(draft_bytes, int) else len(prefix.encode("utf-8"))
+        truncated = full_bytes > kept_bytes
+        guard["rejected_candidate"] = kept
+        guard["rejected_candidate_bound"] = {
+            "utf8_bytes": full_bytes, "retained_utf8_bytes": kept_bytes, "sha256": draft_sha,
+            "cap_bytes": CLAIM_GUARD_DRAFT_CAP_BYTES, "truncated": truncated,
+            "note": (f"rejected draft truncated to its first {kept_bytes} of {full_bytes} UTF-8 bytes; "
+                     "sha256 is of the full stored draft") if truncated else None,
+        }
+    record["publication_claim_guard"] = guard
+    return record
+
+
 def bounded_read(path: Path) -> bytes:
     """No symlink following and a hard byte bound, even if the file grows."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -274,6 +351,8 @@ def read_publications(engine: Any, day: date, limit: int) -> dict[str, Any]:
                          "bounded by the snapshot transaction timestamp",
             }
             for record in records:
+                if channel == "market_briefings":
+                    bound_claim_guard(record)
                 bundle["records"].append({"channel": channel, "record": record})
         try:
             rows = conn.execute(text(DIARY_CONTEXT_QUERY), {
@@ -402,6 +481,353 @@ def diary_run_evidence(bundle: dict[str, Any], day: date, unit_evidence: dict[st
     return state, body
 
 
+# Packet guards: regime bound-input minimum and cadence-aware staleness limits.
+MIN_REGIME_BOUND_INPUTS = 8
+REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE = "regime bound-input count unavailable"
+_UNASSERTED_REGIME_LABELS = frozenset({"", "UNKNOWN", "UNCALIBRATED", "NONE", "N/A"})
+# Only actual bound-input fields; n_features / feature_count / n_features_used
+# reflect registry or matrix sizes rather than bound inputs and are ignored.
+_BOUND_INPUT_KEYS = (
+    "features_used",
+    "bound_inputs",
+)
+# Cadence-aware max-age defaults (days), matching auto_regime.py (5d) and
+# intelligence/regime/state_vector.py (monthly 70d, general features 30d).
+DEFAULT_MAX_AGE_DAYS: dict[str, int] = {
+    "equities": 5,
+    "equity_volume": 5,
+    "rates": 5,
+    "credit": 5,
+    "volatility": 5,
+    "commodities": 5,
+    "fx": 5,
+    "equity_etf_proxies": 5,
+    "options": 5,
+    "latest_regime": 5,
+    "regime": 5,
+    "regime_detection": 5,
+    "market_moves": 5,
+    "features": 30,
+    "macro": 70,
+    "models": 30,
+    "model_states": 30,
+}
+DAILY_MACRO_SERIES = frozenset({"T5YIE", "T10YIE"})
+MONTHLY_MACRO_SERIES = frozenset({
+    "CPIAUCSL", "PCEPILFE", "UNRATE", "RSAFS", "UMCSENT",
+    "INDPRO", "TCU", "M2SL", "PAYEMS",
+})
+
+
+def _extract_bound_input_count(mapping: dict[str, Any]) -> int | None:
+    """Return an integer bound-input count from *mapping* if available, else None.
+
+    Reads ``features_used`` (collection length) before ``bound_inputs`` (int or
+    collection length). Registry-size fields (``n_features``, ``feature_count``,
+    ``n_features_used``) are never treated as bound-input counts.
+    """
+    for key in _BOUND_INPUT_KEYS:
+        if key not in mapping:
+            continue
+        raw = mapping[key]
+        if key == "features_used":
+            if isinstance(raw, (list, tuple, dict, set)):
+                return len(raw)
+            continue
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            return raw
+        if isinstance(raw, (list, tuple, dict, set)):
+            return len(raw)
+    return None
+
+
+def _extract_regime_label(mapping: dict[str, Any]) -> str | None:
+    """Return an asserted regime label string from *mapping*, or None."""
+    for key in ("state", "regime", "inferred_state", "regime_label"):
+        val = mapping.get(key)
+        if isinstance(val, str) and val.strip().upper() not in _UNASSERTED_REGIME_LABELS:
+            return val.strip()
+    return None
+
+
+def inspect_regime_bound_inputs(row: dict[str, Any]) -> tuple[str, str | None, int | None]:
+    """Read-only inspection of any carried regime label's bound-input count.
+
+    Returns:
+        (``"insufficient"``, label, count) when a carried regime label has a
+            bound-input count < MIN_REGIME_BOUND_INPUTS;
+        (``"unavailable"``, label, None) when a carried regime label has no
+            available bound-input count;
+        (``"ok"``, None, None) when no regime label is asserted or every
+            asserted regime label meets MIN_REGIME_BOUND_INPUTS.
+    """
+    if not isinstance(row, dict):
+        return "ok", None, None
+    containers: list[tuple[dict[str, Any], dict[str, Any] | None]] = [(row, None)]
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        containers.append((snap, row))
+    for container, parent in list(containers):
+        for key in ("latest_regime", "regime", "regime_detection"):
+            sub = container.get(key)
+            if isinstance(sub, dict):
+                containers.append((sub, container))
+    unavailable_label: str | None = None
+    for mapping, parent in containers:
+        label = _extract_regime_label(mapping)
+        if label is None:
+            continue
+        count = _extract_bound_input_count(mapping)
+        if count is None and isinstance(parent, dict):
+            count = _extract_bound_input_count(parent)
+        if count is not None and count < MIN_REGIME_BOUND_INPUTS:
+            return "insufficient", label, count
+        if count is None and unavailable_label is None:
+            unavailable_label = label
+    if unavailable_label is not None:
+        return "unavailable", unavailable_label, None
+    return "ok", None, None
+
+
+def check_regime_bound_inputs(row: dict[str, Any]) -> tuple[str, int] | None:
+    """Read-only check: return (label, bound_count) if a carried regime label was
+    computed from fewer than MIN_REGIME_BOUND_INPUTS bound inputs and that count
+    is available in *row*; otherwise None."""
+    status, label, count = inspect_regime_bound_inputs(row)
+    if status == "insufficient" and label is not None and count is not None:
+        return label, count
+    return None
+
+
+def _parse_observed_clock(value: Any) -> tuple[date | None, datetime | None, str | None]:
+    """Parse an ISO date or timestamp without mutating input. Returns (date, utc_dt, raw_str)."""
+    if isinstance(value, datetime):
+        dt = clock(value)
+        return dt.date(), dt, iso(dt)
+    if isinstance(value, date):
+        return value, datetime.combine(value, time(), timezone.utc), value.isoformat()
+    if not isinstance(value, str) or not value.strip():
+        return None, None, None
+    raw = value.strip()
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        try:
+            d = date.fromisoformat(raw)
+            return d, datetime.combine(d, time(), timezone.utc), d.isoformat()
+        except ValueError:
+            return None, None, None
+    try:
+        dt = clock(raw)
+        return dt.date(), dt, iso(dt)
+    except ValueError:
+        return None, None, None
+
+
+def _resolve_item_max_age(item: dict[str, Any], category: str, name: str | None) -> tuple[float, str] | None:
+    """Resolve (limit, unit) from explicit per-item max-age fields or category defaults."""
+    for key, unit in (("max_age_seconds", "seconds"), ("max_age_hours", "hours"), ("max_age_days", "days")):
+        val = item.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+            return float(val), unit
+    nested = item.get("max_age")
+    if isinstance(nested, dict):
+        unit = nested.get("unit")
+        limit = nested.get("limit")
+        if unit in ("days", "hours", "seconds") and isinstance(limit, (int, float)) and not isinstance(limit, bool) and math.isfinite(limit) and limit >= 0:
+            return float(limit), unit
+        for unit in ("seconds", "hours", "days"):
+            val = nested.get(unit)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+                return float(val), unit
+    if category == "macro" and isinstance(name, str):
+        upper = name.upper()
+        if upper in DAILY_MACRO_SERIES:
+            return 5.0, "days"
+        if upper in MONTHLY_MACRO_SERIES:
+            return 70.0, "days"
+    default_days = DEFAULT_MAX_AGE_DAYS.get(category)
+    if default_days is not None:
+        return float(default_days), "days"
+    return None
+
+
+def _check_entry_staleness(
+    item: dict[str, Any],
+    path: str,
+    category: str,
+    kind: str,
+    as_of: datetime,
+    name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read-only staleness check for one carried input or model dict."""
+    findings: list[dict[str, Any]] = []
+    as_of_iso = iso(as_of)
+    as_of_date = as_of.date()
+
+    # 1. Explicit freshness block (e.g. market_state.py shape)
+    fresh = item.get("freshness")
+    if isinstance(fresh, dict):
+        f_status = fresh.get("status")
+        f_age = fresh.get("age")
+        f_limit = fresh.get("limit")
+        f_unit = fresh.get("unit") or "days"
+        over_limit = (
+            isinstance(f_age, (int, float)) and not isinstance(f_age, bool)
+            and isinstance(f_limit, (int, float)) and not isinstance(f_limit, bool)
+            and f_age > f_limit
+        )
+        if f_status == "stale" or over_limit:
+            findings.append({
+                "path": path, "kind": kind, "status": "stale",
+                "observed_at": str(item.get("obs_date") or item.get("date") or "unknown"),
+                "as_of": as_of_iso, "age": f_age, "max_age": f_limit, "unit": f_unit,
+            })
+            return findings
+
+    # 2. Explicit stale_features / stale_dimensions lists (auto_regime / state_vector)
+    stale_feat_map = item.get("stale_features")
+    if isinstance(stale_feat_map, dict):
+        limit_days = item.get("max_age_days", DEFAULT_MAX_AGE_DAYS.get(category, 5))
+        for fname, age_d in sorted(stale_feat_map.items()):
+            findings.append({
+                "path": f"{path}.stale_features.{fname}", "kind": "input", "status": "stale",
+                "observed_at": "unknown", "as_of": as_of_iso, "age": age_d,
+                "max_age": limit_days, "unit": "days",
+            })
+    for dims_key in ("stale_dimensions", "stale_dims"):
+        dims = item.get(dims_key)
+        if isinstance(dims, list):
+            for dname in dims:
+                findings.append({
+                    "path": f"{path}.{dims_key}.{dname}", "kind": "input", "status": "stale",
+                    "observed_at": "unknown", "as_of": as_of_iso, "age": None,
+                    "max_age": None, "unit": "days",
+                })
+
+    max_spec = _resolve_item_max_age(item, category, name)
+    if max_spec is None:
+        return findings
+    limit, unit = max_spec
+
+    # 3. Direct numeric age fields (age_days / data_staleness_days / age_hours / age_seconds)
+    explicit_age: float | None = None
+    for age_key, age_unit in (
+        ("age_seconds", "seconds"), ("age_hours", "hours"),
+        ("age_days", "days"), ("data_staleness_days", "days"),
+    ):
+        raw_age = item.get(age_key)
+        if isinstance(raw_age, (int, float)) and not isinstance(raw_age, bool) and math.isfinite(raw_age):
+            if age_unit == unit:
+                explicit_age = float(raw_age)
+                break
+            if age_unit == "days" and unit == "hours":
+                explicit_age = float(raw_age) * 24.0
+                break
+            if age_unit == "days" and unit == "seconds":
+                explicit_age = float(raw_age) * 86400.0
+                break
+            if age_unit == "hours" and unit == "days":
+                explicit_age = float(raw_age) / 24.0
+                break
+            if age_unit == "seconds" and unit == "days":
+                explicit_age = float(raw_age) / 86400.0
+                break
+
+    obs_date: date | None = None
+    obs_dt: datetime | None = None
+    obs_str: str | None = None
+    for ts_key in (
+        "data_as_of", "obs_date", "date", "as_of_date", "as_of",
+        "trained_at", "model_updated_at", "updated_at", "timestamp",
+        "collected_at", "checked_at",
+    ):
+        if ts_key in item and item[ts_key] is not None:
+            obs_date, obs_dt, obs_str = _parse_observed_clock(item[ts_key])
+            if obs_date is not None:
+                break
+
+    computed_age: float | None = explicit_age
+    if computed_age is None and obs_date is not None and obs_dt is not None:
+        if unit == "days":
+            computed_age = float((as_of_date - obs_date).days)
+        elif unit == "hours":
+            computed_age = round((as_of - obs_dt).total_seconds() / 3600.0, 3)
+        elif unit == "seconds":
+            computed_age = round((as_of - obs_dt).total_seconds(), 3)
+
+    if computed_age is not None and computed_age > limit:
+        age_out: int | float = int(computed_age) if unit == "days" and computed_age.is_integer() else computed_age
+        limit_out: int | float = int(limit) if limit.is_integer() else limit
+        findings.append({
+            "path": path, "kind": kind, "status": "stale",
+            "observed_at": obs_str or "unknown", "as_of": as_of_iso,
+            "age": age_out, "max_age": limit_out, "unit": unit,
+        })
+    return findings
+
+
+def find_stale_carried_items(row: dict[str, Any], as_of: datetime) -> list[dict[str, Any]]:
+    """Read-only scan of carried inputs and models in *row* older than their max age."""
+    if not isinstance(row, dict):
+        return []
+    stale: list[dict[str, Any]] = []
+    input_categories = (
+        "equities", "equity_volume", "rates", "credit", "volatility",
+        "commodities", "fx", "equity_etf_proxies", "macro", "features",
+        "options", "inputs",
+    )
+    model_categories = ("models", "model_states")
+    regime_categories = ("latest_regime", "regime", "regime_detection")
+
+    def _scan_container(container: dict[str, Any], prefix: str) -> None:
+        for cat in input_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        stale.extend(_check_entry_staleness(
+                            entry, f"{prefix}{cat}.{name}", cat, "input", as_of, name=str(name),
+                        ))
+        for cat in model_categories:
+            group = container.get(cat)
+            if isinstance(group, dict):
+                for name, entry in group.items():
+                    if isinstance(entry, dict):
+                        stale.extend(_check_entry_staleness(
+                            entry, f"{prefix}{cat}.{name}", cat, "model", as_of, name=str(name),
+                        ))
+        for cat in regime_categories:
+            entry = container.get(cat)
+            if isinstance(entry, dict):
+                stale.extend(_check_entry_staleness(
+                    entry, f"{prefix}{cat}", cat, "model", as_of,
+                ))
+
+    snap = row.get("snapshot_data")
+    if isinstance(snap, dict):
+        _scan_container(snap, "snapshot_data.")
+    _scan_container(row, "")
+
+    moves = row.get("market_moves")
+    if isinstance(moves, dict):
+        indices = moves.get("indices")
+        if isinstance(indices, dict):
+            for name, entry in indices.items():
+                if isinstance(entry, dict):
+                    stale.extend(_check_entry_staleness(
+                        entry, f"market_moves.indices.{name}", "market_moves", "input", as_of, name=str(name),
+                    ))
+        for list_key in ("notable", "sector_leaders", "sector_laggards"):
+            items = moves.get(list_key)
+            if isinstance(items, list):
+                for idx, entry in enumerate(items):
+                    if isinstance(entry, dict):
+                        label = str(entry.get("asset") or entry.get("etf") or entry.get("sector") or idx)
+                        stale.extend(_check_entry_staleness(
+                            entry, f"market_moves.{list_key}.{label}", "market_moves", "input", as_of, name=label,
+                        ))
+    return stale
+
+
 # ---------------------------------------------------------------------------
 # Packet (screened) and receipts
 # ---------------------------------------------------------------------------
@@ -415,7 +841,7 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         "publication_day": bundle["publication_day"],
         "session_start": bundle["session_start"], "session_end": bundle["session_end"],
         "publication_set_complete": False, "publications": [], "evidence": [], "claims": [],
-        "hypotheses": [], "blockers": [
+        "hypotheses": [], "stale_items": [], "notices": [], "blockers": [
             "Capture-only packet: exact claim extraction and independent review remain required.",
             "Matched outcomes, frozen resolution rules, input vintages and price basis unavailable; no performance scoring.",
             "All-channel publication inventory not proven; channels outside market_briefings, thesis_snapshots, "
@@ -461,7 +887,8 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         identity = f"{channel}:{row['id']}"
         content = row.get(CHANNEL_TEXT[channel])
         if channel == "market_briefings" and (row.get("snapshot_bytes") or 0) > 250000:
-            packet["blockers"].append(f"{identity}: stored generator context exceeds byte cap; omitted")
+            packet["blockers"].append(f"{identity}: stored generator context exceeds byte cap; omitted "
+                                      "(claim-guard verdict carried separately in publication_claim_guard)")
         if not isinstance(content, str) or not content.strip():
             packet["blockers"].append(f"{identity}: original text missing; no invented replacement")
             packet["capture_receipt"]["omitted_publication_ids"].append(identity)
@@ -471,12 +898,20 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         # Screen the WHOLE canonical row: source_record (snapshot_data, grounding, etc.) enters packet.json too.
         reasons = screen_row(row)
         disposition = None
+        regime_status, regime_label, bound_count = inspect_regime_bound_inputs(row)
         if reasons:
             disposition = "QUARANTINED_SCREEN_HIT"
         elif len(text_bytes) > TEXT_FIELD_CAP_BYTES:
             disposition = "EXCLUDED_TEXT_OVER_FIELD_CAP"
         elif aggregate + len(text_bytes) > PUBLICATIONS_AGGREGATE_CAP_BYTES:
             disposition = "EXCLUDED_AGGREGATE_CAP_REACHED"
+        elif regime_status == "insufficient" and regime_label is not None and bound_count is not None:
+            disposition = "REFUSED_INSUFFICIENT_REGIME_INPUTS"
+            reasons = [f"regime_bound_inputs_below_minimum:{bound_count}<{MIN_REGIME_BOUND_INPUTS}"]
+            packet["blockers"].append(
+                f"{identity}: refused to carry regime label {regime_label!r} computed from "
+                f"{bound_count} bound inputs (minimum {MIN_REGIME_BOUND_INPUTS})"
+            )
         if disposition:
             exclusions.append({"publication_id": identity, "channel": channel, "disposition": disposition,
                                "reasons": reasons, "text_sha256": text_sha, "text_utf8_bytes": len(text_bytes),
@@ -484,9 +919,21 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
             packet["capture_receipt"]["quarantined_publication_ids"].append(identity)
             continue
         aggregate += len(text_bytes)
-        packet["publications"].append({
+        pub_entry: dict[str, Any] = {
             "id": identity, "source": channel, "published_at": iso(published), "text": content,
-            "sha256": text_sha, "claims_complete": False, "source_record": row})
+            "sha256": text_sha, "claims_complete": False, "source_record": row,
+        }
+        if regime_status == "unavailable":
+            pub_entry["notices"] = [REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE]
+            packet["notices"].append(f"{identity}: {REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE}")
+        stale_items = find_stale_carried_items(row, published)
+        if stale_items:
+            pub_entry["stale"] = True
+            pub_entry["stale_items"] = stale_items
+            packet["stale_items"].extend(
+                {"publication_id": identity, **entry} for entry in stale_items
+            )
+        packet["publications"].append(pub_entry)
         packet["evidence"].append({"id": identity + ":receipt", "source": identity, "sha256": sha256(canonical(row)),
                                    "role": "hindsight", "available_at": None, "captured_at": bundle["captured_at"]})
         packet["claims"].append({

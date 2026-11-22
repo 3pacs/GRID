@@ -81,7 +81,7 @@ def readiness(record: dict, target: date) -> dict:
         "dealer_target_ready": dealer_ready,
         "dealer_observation_date": gamma.get("obs_date"),
         "dealer_reason": None if dealer_ready else gamma.get("reason", "no exact target-session dealer row"),
-        "variable_status": {k: {a: v.get(a) for a in ("status", "obs_date", "age_days", "reason")}
+        "variable_status": {k: {a: v.get(a) for a in ("status", "obs_date", "age_days", "freshness", "reason")}
                             for k, v in variables.items()},
         "analysis_gaps": sorted(k for k, v in variables.items() if v.get("status") != "ok"),
         "event_status": (record.get("events") or {}).get("status", "unknown"),
@@ -96,7 +96,7 @@ def code_receipt() -> dict:
     names = ("scripts/run_market_state.py", "intelligence/regime/market_state.py",
              "intelligence/regime/baseline.py", "intelligence/regime/state_vector.py",
              "physics/dealer_gex_daily.py", "ingestion/market_calendar.py",
-             "store/observations.py", "store/fred_vintages.py",
+             "store/observations.py", "store/fred_vintages.py", "analysis/factory_session_calendar.py",
              "config/econ_release_dates.json")
     return {name: hashlib.sha256((_ROOT / name).read_bytes()).hexdigest()
             if (_ROOT / name).is_file() else None for name in names}
