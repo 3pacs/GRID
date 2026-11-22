@@ -303,6 +303,38 @@ state recorded the evening before each decision day in the sector state record (
 market phase, Fed balance-sheet phase, VIX third, spike state, and for within-sector modules each sector, the three
 groups, the sector's own phase, and leading against lagging sectors. Cuts are descriptions of a searched sample.
 
+**What a cut is charged (2026-11-22).** A cut's cost is a replaced-name cost proxy, conditional on the cut. It is
+not the cost of a book anyone traded on its own.
+- A cut of whole nights (year, market phase and the other night states) is the module on those nights, so it pays
+  the module's cost.
+- A sector cut pays that sector's replaced-name share at the run's rate: the share of its current picks that were not
+  among its picks on the module's previous traded night. It is 1 on the first night of a stretch, or when the sector
+  did not trade the night before.
+- A cut of several sectors (a group, a sector phase, leading or lagging) pays its sectors' shares, weighted by their
+  names like its spread. A sector phase or leading/lagging cut changes its sectors from night to night, and moving
+  between those sets costs nothing here.
+- **The proxy counts entries only.** It divides the names that are new by the current book's size, as the module's
+  own `_turnover` does. A sector or a name that leaves the book, or a book that shrinks, is charged nothing for the
+  exit: `[A, B]` then `[A]` reads 0. Pricing holdings changes, exits included, would be a different measure.
+- **The identity with the module holds only on complete nights.** Weighted by their names, the shares of every
+  sector the module filled give back the module's turnover exactly, since a name stays in its sector. The cuts,
+  though, weight only the sectors with outcomes that night. On a night when a filled sector has none, the module's
+  turnover still counts that sector's picks (its gross does not), and the cuts leave it out. Take an unchanged
+  sector and an equal-sized, fully replaced sector without outcomes: the module's turnover is 0.5, and a cut of the
+  usable sector is charged 0.
+- Overnight and intraday turn over every name, so nothing changes there. On `close_1d` a slow sector used to be
+  charged a fast one's churn and the other way round, which is the gap Codex found in the residual card's liquidity
+  halves (#1363). Only the `net_bp` of those cuts, and the paid / did-not lists built from them, move.
+- **On the monthly reversal's development replay** (grid-svr scratch ledgers, the 11-19 run's 817 files, main
+  `2157fe94` against this change):
+  - only `cards` differed, and within it only sector-based `net_bp`;
+  - the within-sector modules' sector cuts moved by at most 0.12 bp a night (Communication Services, 2.52 to 2.40 at
+    10 %);
+  - their groups and leading / lagging cuts moved by at most 0.03 bp;
+  - the pooled modules and every whole-night cut were unchanged.
+  - That signal's sectors churn at much the same rate; the gap is large only when they do not, as in the test's
+    fixture, where a slow sector paid 0.58 bp a night instead of 0.11.
+
 Every card also carries `where_it_paid` and `where_it_did_not`: each cut with at least 100 traded nights, split by
 the sign of its net return and sorted by size, and `report.md` prints the six largest of each. A run file may list
 `prior_dev_looks` (earlier development runs at the same effect); they are named in `max_t.multiplicity`.
@@ -415,8 +447,8 @@ sector by correlation over the whole sample, so a sector's membership in 2010 us
   including a known effect the set lacks (value, quality, earnings drift). Its liquidity factor stands in for size.
   Below the condition-number line, collinear factors still share their credit by least squares, so read two named
   parts that both move with one effect as one part between them.
-- The sector cuts on the module cards (`card`) still charge each sector the module's cost. Only the residual card's
-  liquidity halves price their own turnover.
+- A card's sector-based cuts and the residual card's liquidity halves each pay their own turnover (see "What a cut
+  is charged"). A cut of whole nights pays the module's.
 - A night with fewer than `min_session_bars` priced names is dropped, so an overnight or close-to-close return after
   it spans more than one session.
 

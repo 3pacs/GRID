@@ -224,6 +224,118 @@ def test_turnover_is_full_overnight_and_partial_for_a_slow_signal_held_close_to_
     assert X._turnover((np.array([1, 2]), np.array([3, 4])), np.array([1, 9]), np.array([3, 4])) == 0.25
 
 
+def test_each_sector_cut_pays_for_its_own_turnover(tmp_path):
+    full = tmp_path / "full"
+    full.mkdir()
+    build(full, tilt_of=lambda sym: 3.0 if sym.startswith("S0") else 0.0)   # Energy's ranks hold still, the others churn
+    tech = tmp_path / "tech"                     # Information Technology's names alone, ranked as a store of their own
+    shutil.copytree(full, tech)
+    keep = {f"S1N{i:02d}" for i in range(20)}
+    for p in (tech / "prices").glob("*.csv"):
+        if p.stem not in keep:
+            p.unlink()
+    for name in ("members.csv", "sectors.csv"):
+        with open(tech / name, newline="") as fh:
+            rows = list(csv.reader(fh))
+        if name == "members.csv":
+            rows[1][1] = ",".join(s for s in rows[1][1].split(",") if s in keep)
+        else:
+            rows = rows[:1] + [r for r in rows[1:] if r[0] in keep]
+        with open(tech / name, "w", newline="") as fh:
+            csv.writer(fh).writerows(rows)
+
+    body = {**RUN, "signals": [{"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["close_1d", "overnight"]}],
+            "rankings": ["within_sector"]}
+    rep = X.run(write_run(full, body), full, full / "state.db", ledger_at(full), full / "out")
+    run = X.RunFile.from_dict(body)
+    panel = X.load_panel(full, run)
+    res = X.evaluate(panel, run, X.state_arrays(panel, X.load_state(full / "state.db")))
+    slow = res["on21|within_sector|q20|close_1d"]
+    ps, ks, ts = slow["per_sector"], slow["k_sector"], slow["turnover_sector"]
+    traded = ~np.isnan(slow["turnover"])
+    # a name stays in its sector, so the sectors' turnovers weighted by their names make the module's, night by night
+    np.testing.assert_allclose(np.nansum(ks * ts, axis=1)[traded] / np.where(np.isnan(ts), 0, ks).sum(axis=1)[traded],
+                               slow["turnover"][traded], rtol=0, atol=1e-12)
+    t = np.nanmean(ts, axis=0)
+    assert t[1] > 3 * t[0] and t[2] > 3 * t[0]                                 # the planted difference is there
+
+    c = rep["cards"]["on21|within_sector|q20|close_1d"]
+    rate = 4 * run.cost_bp_per_side                                             # bp for a turnover of 1
+    for j, s in enumerate(SECTORS):
+        own = ts[~np.isnan(ps[:, j]), j].mean()
+        assert c["sector"][s]["net_bp"] == pytest.approx(c["sector"][s]["gross_bp"] - rate * own, abs=2e-3)
+        assert c["group"][X.GROUP_OF[s]] == c["sector"][s]                     # one sector per group in this store
+    assert c["sector_vs_market"]["leading"] == c["sector"]["Energy"]           # Energy leads every night here
+    use = ~np.isnan(ps[:, 1:]) & (ks[:, 1:] > 0)
+    w = np.where(use, ks[:, 1:], 0.0)
+    on = w.sum(axis=1) > 0
+    lag_cost = (np.where(use, ts[:, 1:], 0.0) * w).sum(axis=1)[on] / w.sum(axis=1)[on]
+    lagging = c["sector_vs_market"]["lagging"]                                 # two sectors, weighted like the spread
+    assert lagging["net_bp"] == pytest.approx(lagging["gross_bp"] - rate * lag_cost.mean(), abs=2e-3)
+    assert c["sector"]["Energy"]["net_bp"] - c["sector"]["Information Technology"]["net_bp"] > (
+        c["sector"]["Energy"]["gross_bp"] - c["sector"]["Information Technology"]["gross_bp"])   # the churn costs more
+    for s, cut in rep["cards"]["on21|within_sector|q20|overnight"]["sector"].items():
+        assert cut["net_bp"] == pytest.approx(cut["gross_bp"] - rate, abs=2e-3)   # overnight: every name, every night
+
+    # ranked on its own, the sector trades the same book: the same spread and the same turnover, night by night
+    alone_run = X.RunFile.from_dict({**body, "rankings": ["pooled"], "min_ranked": 20, "min_session_bars": 20})
+    pa = X.load_panel(tech, alone_run)
+    alone = X.evaluate(pa, alone_run, X.state_arrays(pa, X.load_state(tech / "state.db")))["on21|pooled|q20|close_1d"]
+    k = ~np.isnan(alone["gross"])
+    assert pa.sessions == panel.sessions and k.sum() == (~np.isnan(ps[:, 1])).sum() > 100
+    np.testing.assert_allclose(alone["gross"][k], ps[k, 1], rtol=0, atol=1e-15)
+    np.testing.assert_allclose(alone["turnover"][k], ts[k, 1], rtol=0, atol=1e-15)
+
+
+def test_a_sector_cut_is_a_replaced_name_proxy_that_matches_the_module_only_on_complete_nights(tmp_path):
+    # the proxy counts entries only: an exit, or a book that shrinks, costs nothing; an entry is charged
+    a, b = np.array([1, 2]), np.array([3, 4])
+    assert X._turnover((a, b), a[:1], b[:1]) == 0.0                              # [A, B] -> [A]
+    assert X._turnover((a[:1], b[:1]), a, b) == 0.5                              # [A] -> [A, B]
+    # Codex's case: sector A unchanged, an equal sector B fully replaced and without outcomes. The module's turnover
+    # is 0.5; a cut of the usable sector A is charged 0
+    A, B, B2 = np.array([1, 2]), np.array([3, 4]), np.array([5, 6])
+    assert X._turnover((np.r_[A, B], np.r_[A, B] + 10), np.r_[A, B2], np.r_[A, B2] + 10) == 0.5
+    assert X._turnover((A, A + 10), A, A + 10) == 0.0
+
+    build(tmp_path, tilt_of=lambda sym: 3.0 if sym.startswith("S0") else 0.0)  # Energy slow, the others churn
+    body = {**RUN, "signals": [{"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["close_1d"]}],
+            "rankings": ["within_sector"]}
+    tid = "on21|within_sector|q20|close_1d"
+    run = X.RunFile.from_dict(body)
+    panel = X.load_panel(tmp_path, run)
+    states = X.state_arrays(panel, X.load_state(tmp_path / "state.db"))
+    whole = X.evaluate(panel, run, states)[tid]
+    ts0 = whole["turnover_sector"]
+    nights = np.flatnonzero(~np.isnan(whole["turnover"]))
+    far = [int(r) for r in nights[1:] if abs(ts0[r, 0] - ts0[r, 1:].mean()) > 0.05]
+    r0 = far[len(far) // 2]
+    energy = np.flatnonzero(panel.sector == 0)
+    panel.cc = panel.cc.copy()               # the loaded array can be a read-only view (pandas copy-on-write)
+    panel.cc[r0 + 1, energy] = np.nan        # Energy's close-to-close outcomes of night r0 go missing; picks do not move
+    res = X.evaluate(panel, run, states)[tid]
+    ps, ks, ts = res["per_sector"], res["k_sector"], res["turnover_sector"]
+    np.testing.assert_array_equal(np.nan_to_num(ts, nan=-1), np.nan_to_num(ts0, nan=-1))
+    np.testing.assert_array_equal(np.nan_to_num(res["turnover"], nan=-1), np.nan_to_num(whole["turnover"], nan=-1))
+    assert np.isnan(ps[r0, 0]) and ks[r0, 0] > 0                                 # filled and priced, no outcome
+
+    filled = ~np.isnan(ts)
+    usable = filled & ~np.isnan(ps)
+    over_filled = np.where(filled, ks * ts, 0).sum(axis=1) / np.where(filled, ks, 0).sum(axis=1).clip(min=1)
+    over_usable = np.where(usable, ks * ts, 0).sum(axis=1) / np.where(usable, ks, 0).sum(axis=1).clip(min=1)
+    traded = ~np.isnan(res["turnover"])
+    np.testing.assert_allclose(over_filled[traded], res["turnover"][traded], rtol=0, atol=1e-12)   # every night
+    complete = traded & (usable == filled).all(axis=1)
+    assert not complete[r0] and complete.sum() == traded.sum() - 1
+    np.testing.assert_allclose(over_usable[complete], res["turnover"][complete], rtol=0, atol=1e-12)
+    assert abs(over_usable[r0] - res["turnover"][r0]) > 0.02                     # the sparse night: the cuts differ
+
+    rate = 4 * run.cost_bp_per_side * 1e-4
+    c, c0 = X.card(panel, res, states, rate), X.card(panel, whole, states, rate)
+    assert c["sector"]["Energy"]["nights"] == c0["sector"]["Energy"]["nights"] - 1
+    assert c["sector"]["Utilities"] == c0["sector"]["Utilities"]                 # the other sectors are untouched
+
+
 def test_sign_flip_bar():
     rng = np.random.default_rng(1)
     x = rng.normal(0, 0.01, (1200, 25))
