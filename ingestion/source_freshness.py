@@ -25,9 +25,10 @@ read-only transaction with a bounded statement timeout. Nothing is written.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -536,15 +537,51 @@ def safe_last_error(message: str | None, max_chars: int = LAST_ERROR_MAX_CHARS) 
 # (PR #1325) and every one of those checks still read the row as fresh for
 # 8 days.
 #
-# A row listed here is judged by its owner's own series only: the newest
-# accepted observation of each anchor series, read through
-# store.observations (SUCCESS rows, newest obs_date at or before today, that
-# date's latest vintage, this catalog row's rows only). The row is as fresh
-# as its stalest anchor, so either half of the short-volume write (the
-# pinned producer's per-symbol rows, or the aggregate subclass's ratios)
-# going dark reads stale. Neither last_pull_at nor any other series under
-# the same source_id counts, and pull_log runs of the other entries sharing
-# the row are not its runs (merge_catalog_runs).
+# A row listed here is judged by whether its owner's own series cover the
+# newest trade date that is due by now:
+#
+# * due date: the newest NYSE session on the hash-pinned XNYS calendar
+#   (intelligence.regime.market_state.xnys_sessions, the calendar the
+#   market-state freshness rule uses, never the approximate scheduler
+#   helpers) whose release clock has passed: published at the anchor's local
+#   release time on that session, plus the owner's scheduler cadence for the
+#   pull to land;
+# * coverage: each anchor series' newest accepted observation, read through
+#   store.observations (SUCCESS rows, newest obs_date at or before today,
+#   that date's latest vintage, this catalog row's rows only), is dated on
+#   or after the due date. The stalest anchor decides, so either half of the
+#   short-volume write (the pinned producer's per-symbol rows, or the
+#   aggregate subclass's ratios) going dark reads stale.
+#
+# When the newest observation landed (its pull_timestamp) is reported, never
+# judged: a repair or re-pull of an old trade date lands a fresh vintage of
+# an old date and says nothing about the current one. (Codex review
+# 6009985487: obs 2026-11-10 re-landed at 17:40Z on 11-20 read HEALTHY under
+# the landing rule.) Neither last_pull_at nor any other series under the same
+# source_id counts, and pull_log runs of the other entries sharing the row
+# are not its runs (merge_catalog_runs).
+
+
+@dataclass(frozen=True)
+class ReleaseClock:
+    """When the observation for trade session ``d`` is due.
+
+    Public at ``local_time`` on ``d`` in ``tz`` (so daylight saving is the
+    exchange's), then ``due_after`` of elapsed time for the owner's scheduled
+    pull to land it. Late, never early: a source is not called stale while
+    its normal pull could still be on its way.
+    """
+
+    local_time: time
+    tz: str
+    due_after: timedelta
+    basis: str
+
+    def due_at(self, session: date) -> datetime:
+        from zoneinfo import ZoneInfo
+
+        public = datetime.combine(session, self.local_time, tzinfo=ZoneInfo(self.tz))
+        return public.astimezone(timezone.utc) + self.due_after
 
 
 @dataclass(frozen=True)
@@ -554,6 +591,7 @@ class SeriesAnchor:
     catalog_name: str
     owner: str  # PULLER_REGISTRY name whose freshness the catalog row reports
     series: tuple[str, ...]
+    release: ReleaseClock
 
 
 SERIES_ANCHORS: tuple[SeriesAnchor, ...] = (
@@ -566,6 +604,17 @@ SERIES_ANCHORS: tuple[SeriesAnchor, ...] = (
             # FINRAShortVolumePuller.series_id("SPY"): the pinned producer's
             # per-symbol rows, present in every CNMS file.
             "finra:short_volume:SPY",
+        ),
+        release=ReleaseClock(
+            local_time=time(18, 0),
+            tz="America/New_York",
+            # The owner's freq_h (tests/test_source_freshness_anchors.py pins it).
+            due_after=timedelta(hours=24),
+            basis=(
+                "FINRA posts each session's Reg SHO daily file that evening, ~18:00 ET "
+                "(smart_scheduler._finra_short_volume_trade_date's cutoff); due one "
+                "24 h scheduler cadence later"
+            ),
         ),
     ),
 )
@@ -592,6 +641,29 @@ GUEST_PULL_LOG_NAMES: frozenset[str] = frozenset().union(
 )
 
 
+def expected_obs_date(anchor: SeriesAnchor, now: datetime) -> tuple[date, str]:
+    """The newest pinned-XNYS session whose observation is due by ``now``, and the calendar version.
+
+    Raises ValueError when ``now`` is outside the pinned calendar (extend the
+    manifests rather than guess) or the manifests fail their pin check.
+    """
+    from intelligence.regime.market_state import xnys_sessions  # pinned manifests, read once per process
+
+    start, end, days, version = xnys_sessions()
+    now_utc = _as_utc(now) or datetime.now(timezone.utc)
+    today = now_utc.date()  # no session dated after the UTC date can be due yet
+    if not start <= today <= end:
+        raise ValueError(
+            f"{today} is outside the pinned XNYS calendar ({start}..{end}); extend the manifests"
+        )
+    i = bisect_right(days, today) - 1
+    while i >= 0:
+        if anchor.release.due_at(days[i]) <= now_utc:
+            return days[i], version
+        i -= 1
+    raise ValueError(f"no XNYS session in the pinned calendar is due by {now_utc.isoformat()}")
+
+
 @dataclass(frozen=True)
 class AnchorReading:
     """The newest accepted observation of one anchor series."""
@@ -610,86 +682,131 @@ class AnchorReading:
 
 @dataclass(frozen=True)
 class AnchoredFreshness:
-    """A shared catalog row's freshness, read from its owner's anchor series."""
+    """A shared catalog row's coverage of its due trade date, read from its owner's anchors."""
 
     catalog_name: str
     owner: str
     readings: tuple[AnchorReading, ...]
+    expected_obs_date: date | None = None
+    release_basis: str = ""
+    calendar: str | None = None
     error: str | None = None
 
     @property
     def stalest(self) -> AnchorReading | None:
-        """The anchor that decides: one with no observation, else the oldest landing."""
+        """The anchor that decides: one with no observation, else the oldest newest-observation date."""
         oldest: AnchorReading | None = None
         for reading in self.readings:
-            if reading.landed_at is None:
+            if reading.obs_date is None:
                 return reading
-            if oldest is None or (oldest.landed_at is not None and reading.landed_at < oldest.landed_at):
+            if oldest is None or (oldest.obs_date is not None and reading.obs_date < oldest.obs_date):
                 oldest = reading
         return oldest
 
     @property
-    def landed_at(self) -> datetime | None:
-        """When the stalest anchor's newest observation landed.
+    def covered(self) -> bool:
+        """Every anchor has an accepted observation dated on or after the due trade date.
 
-        ``None`` (never) when any anchor has no accepted observation, when
-        there are no readings, or when the read failed: an unread source is
-        not a fresh one.
+        False when anything could not be read: an unread source is not a
+        fresh one.
         """
-        if self.error is not None:
-            return None
+        if self.error is not None or self.expected_obs_date is None or not self.readings:
+            return False
+        due = self.expected_obs_date
+        return all(r.obs_date is not None and r.obs_date >= due for r in self.readings)
+
+    @property
+    def newest_obs_date(self) -> date | None:
+        """The stalest anchor's newest observation date (what coverage is judged on)."""
+        stalest = self.stalest
+        return stalest.obs_date if stalest is not None else None
+
+    @property
+    def landed_at(self) -> datetime | None:
+        """When the stalest anchor's newest observation landed. Reported, never judged."""
         stalest = self.stalest
         return stalest.landed_at if stalest is not None else None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "owner": self.owner,
+            "rule": "trade_date_coverage",
+            "covered": self.covered,
+            "expected_obs_date": self.expected_obs_date.isoformat() if self.expected_obs_date else None,
+            "newest_obs_date": self.newest_obs_date.isoformat() if self.newest_obs_date else None,
+            "landed_at": self.landed_at.isoformat() if self.landed_at else None,
+            "release": self.release_basis,
+            "calendar": self.calendar,
             "series": [r.as_dict() for r in self.readings],
             "error": self.error,
         }
 
 
-def read_anchored_freshness(
-    conn: Any,
-    anchor: SeriesAnchor,
-    *,
-    as_of: date | None = None,
-) -> AnchoredFreshness:
-    """Read each anchor series' newest accepted observation (read-only).
+def read_anchored_freshness(conn: Any, anchor: SeriesAnchor, *, now: datetime) -> AnchoredFreshness:
+    """The due trade date at ``now`` and each anchor series' newest accepted observation (read-only).
 
     One ``store.observations.read_latest`` per anchor, constrained to the
-    anchor's catalog row and to ``obs_date <= as_of``, each an index seek
-    on ``idx_raw_series_series_obs``. Runs in a savepoint, so a failed read
-    (reported in ``error``, which makes ``landed_at`` ``None``) never aborts
-    the caller's transaction.
+    anchor's catalog row and to ``obs_date <= now``'s UTC date, each an index
+    seek on ``idx_raw_series_series_obs``. The reads run in a savepoint, so a
+    failed read never aborts the caller's transaction. A failed read or an
+    unreadable calendar is reported in ``error`` and makes ``covered`` False.
     """
+    now_utc = _as_utc(now) or datetime.now(timezone.utc)
+    base: dict[str, Any] = {
+        "catalog_name": anchor.catalog_name,
+        "owner": anchor.owner,
+        "release_basis": anchor.release.basis,
+    }
+    errors: list[str] = []
+    try:
+        expected, calendar = expected_obs_date(anchor, now_utc)
+        base.update(expected_obs_date=expected, calendar=calendar)
+    except Exception as exc:  # noqa: BLE001 - a health read reports, it never raises
+        errors.append(f"calendar: {type(exc).__name__}: {exc}")
     readings: list[AnchorReading] = []
     try:
         with conn.begin_nested():
             for series_id in anchor.series:
-                obs = read_latest(conn, series_id, source=anchor.catalog_name, as_of=as_of)
+                obs = read_latest(conn, series_id, source=anchor.catalog_name, as_of=now_utc.date())
                 readings.append(AnchorReading(
                     series_id=series_id,
                     obs_date=obs.obs_date if obs is not None else None,
                     landed_at=_as_utc(obs.pull_timestamp) if obs is not None else None,
                 ))
     except Exception as exc:  # noqa: BLE001 - a health read reports, it never raises
-        return AnchoredFreshness(
-            catalog_name=anchor.catalog_name,
-            owner=anchor.owner,
-            readings=tuple(readings),
-            error=f"{type(exc).__name__}: {exc}"[:LAST_ERROR_MAX_CHARS],
-        )
-    return AnchoredFreshness(
-        catalog_name=anchor.catalog_name, owner=anchor.owner, readings=tuple(readings),
-    )
+        errors.append(f"read: {type(exc).__name__}: {exc}")
+    error = "; ".join(errors)[:LAST_ERROR_MAX_CHARS] if errors else None
+    return AnchoredFreshness(readings=tuple(readings), error=error, **base)
 
 
 def anchored_run(run: CatalogRunSummary | None) -> CatalogRunSummary | None:
     """An anchored row's pull_log summary, with the write evidence left to its anchors.
 
-    pull_log still says whether and how the owner last ran (FAILED, quiet,
-    skipped). Whether it wrote is the anchor series' call: a run that
-    committed per-symbol rows but no aggregate must not read healthy.
+    pull_log still says whether and how the owner last ran (FAILED, skipped).
+    Whether it wrote the due trade date is the anchor series' call: a run
+    that committed per-symbol rows but no aggregate must not read healthy.
     """
     return replace(run, last_success_with_rows_at=None) if run is not None else None
+
+
+def classify_anchored_source(
+    *,
+    now: datetime,
+    fresh_hours: float,
+    anchored: AnchoredFreshness,
+    run: CatalogRunSummary | None,
+) -> str:
+    """Pipeline status for a ``SERIES_ANCHORS`` row (one of ``PIPELINE_STATUSES``).
+
+    ``healthy`` only when the anchors cover the due trade date. Otherwise the
+    owner's own runs say why (failing, skipped_config, stopped, inactive),
+    and a recent landing or a "no new data" run reads ``stale``: the calendar
+    says a trade date is due and it is not there, so it is neither healthy
+    nor quiet.
+    """
+    if anchored.covered:
+        return PIPELINE_HEALTHY
+    status = classify_catalog_source(
+        now=now, fresh_hours=fresh_hours, last_write_at=anchored.landed_at, run=anchored_run(run),
+    )
+    return PIPELINE_STALE if status in (PIPELINE_HEALTHY, PIPELINE_QUIET) else status
