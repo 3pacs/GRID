@@ -1,11 +1,14 @@
 """/system/pipeline-health, /system/freshness and the architecture puller stats
-judge FINRA_SHORT_VOLUME by the short-volume puller's own series.
+judge FINRA_SHORT_VOLUME by trade-date coverage of the short-volume puller's
+own series.
 
 finra_dix writes under the same source_catalog row and bumps its
 last_pull_at, so on 2026-11-18..11-20 (short-volume obs missing, DIX landing
-daily) every one of these read the row as fresh. See
-ingestion/source_freshness.py::SERIES_ANCHORS and
-tests/test_source_freshness_anchors.py for the store-level reads.
+daily) every one of these read the row as fresh. A fresh landing of an old
+trade date must not read fresh either (Codex review 6009985487). See
+ingestion/source_freshness.py::SERIES_ANCHORS; the due-date calendar cases
+are in tests/test_source_freshness_anchors.py. Here the due date is pinned
+(``_due``) so a test cannot straddle a release boundary.
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from __future__ import annotations
 import os
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 os.environ.setdefault("ENVIRONMENT", "development")
 os.environ.setdefault("GRID_JWT_SECRET", "test-secret-key-for-testing-only")
@@ -47,6 +52,14 @@ def _ago(hours: float) -> datetime:
 # DIX landed this morning; the short-volume series last landed 3 days ago.
 DIX_LANDED = _ago(4)
 SHORT_VOLUME_LANDED = _ago(72)
+# The trade date due "now" in these tests (pinned by the _due fixture).
+DUE = date.today() - timedelta(days=1)
+
+
+@pytest.fixture(autouse=True)
+def _due():
+    with patch("ingestion.source_freshness.expected_obs_date", return_value=(DUE, "pinned XNYS: test")):
+        yield
 
 
 def _engine(*, source_rows=(), run_rows=(), stale_rows=(), puller_rows=(), anchors=None):
@@ -90,12 +103,17 @@ def _engine(*, source_rows=(), run_rows=(), stale_rows=(), puller_rows=(), ancho
 
 
 STALE_ANCHORS = {
-    MARKET_RATIO: (date.today() - timedelta(days=4), SHORT_VOLUME_LANDED),
-    SPY: (date.today() - timedelta(days=4), SHORT_VOLUME_LANDED),
+    MARKET_RATIO: (DUE - timedelta(days=3), SHORT_VOLUME_LANDED),
+    SPY: (DUE - timedelta(days=3), SHORT_VOLUME_LANDED),
 }
 FRESH_ANCHORS = {
-    MARKET_RATIO: (date.today() - timedelta(days=1), _ago(3)),
-    SPY: (date.today() - timedelta(days=1), _ago(3)),
+    MARKET_RATIO: (DUE, _ago(3)),
+    SPY: (DUE, _ago(3)),
+}
+# An old trade date landed again an hour ago (a repair or re-pull).
+RELANDED_ANCHORS = {
+    MARKET_RATIO: (DUE - timedelta(days=10), _ago(1)),
+    SPY: (DUE - timedelta(days=10), _ago(1)),
 }
 # (source_id, puller_name, last_run_at, last_rows_at, runs_7d, status, rows_inserted, error)
 DIX_ONLY_RUNS = [
@@ -115,12 +133,14 @@ def _pipeline(engine) -> dict:
     return {s["name"]: s for s in resp.json()["sources"]}[FINRA]
 
 
-def test_pipeline_health_dix_only_day_is_not_healthy():
+def test_pipeline_health_dix_only_day_is_stale():
     engine, calls = _engine(source_rows=FINRA_SOURCE_ROW, run_rows=DIX_ONLY_RUNS, anchors=STALE_ANCHORS)
 
     finra = _pipeline(engine)
 
-    assert finra["status"] == "quiet"  # the owner ran and wrote nothing; not "healthy"
+    # Was "healthy" on DIX's row and run. A trade date is due and missing, so
+    # "stale", not "quiet", although the owner's last run found nothing new.
+    assert finra["status"] == "stale"
     assert finra["last_pull"] == SHORT_VOLUME_LANDED.isoformat()
     assert finra["last_success_with_rows_at"] == SHORT_VOLUME_LANDED.isoformat()
     assert finra["last_status"] == "SUCCESS"
@@ -142,6 +162,15 @@ def test_pipeline_health_dix_failure_is_not_the_short_volume_failure():
     assert finra["status"] == "healthy"
     assert finra["last_status"] == "SUCCESS"
     assert finra["error"] is None
+
+
+def test_pipeline_health_relanded_old_trade_date_is_stale():
+    engine, _ = _engine(source_rows=FINRA_SOURCE_ROW, run_rows=DIX_ONLY_RUNS, anchors=RELANDED_ANCHORS)
+
+    finra = _pipeline(engine)
+
+    assert finra["status"] == "stale"
+    assert finra["last_pull"] == RELANDED_ANCHORS[MARKET_RATIO][1].isoformat()  # context only
 
 
 def test_pipeline_health_missing_anchor_is_not_healthy():
@@ -187,6 +216,14 @@ def test_freshness_fresh_short_volume_series_is_not_listed():
     assert _freshness(engine) == []
 
 
+def test_freshness_relanded_old_trade_date_is_listed():
+    engine, _ = _engine(stale_rows=[(FINRA, DIX_LANDED)], anchors=RELANDED_ANCHORS)
+
+    stale = {s["source"]: s for s in _freshness(engine)}
+
+    assert stale[FINRA]["last_pull"] == RELANDED_ANCHORS[MARKET_RATIO][1].isoformat()
+
+
 def test_architecture_puller_stats_judge_finra_by_its_series():
     # (name, 48h row count, newest row or last_pull_at, series count)
     engine, _ = _engine(puller_rows=[(FINRA, 1, DIX_LANDED, 3)], anchors=STALE_ANCHORS)
@@ -197,3 +234,20 @@ def test_architecture_puller_stats_judge_finra_by_its_series():
     # The DIX row (4 h old) used to make this "healthy".
     assert stats["finra_short_volume"]["status"] == "stale"
     assert stats["finra_short_volume"]["last_run"] == "3d ago"
+
+
+def test_architecture_relanded_old_trade_date_is_stale():
+    engine, _ = _engine(puller_rows=[(FINRA, 1, DIX_LANDED, 3)], anchors=RELANDED_ANCHORS)
+
+    stats = {p["id"]: p for p in system._get_puller_stats(engine)}
+
+    assert stats["finra_short_volume"]["status"] == "stale"  # landed 1 h ago, but not the due date
+
+
+def test_architecture_covered_is_healthy_whatever_the_landing_age():
+    covered_long_ago = {sid: (DUE, _ago(80)) for sid in (MARKET_RATIO, SPY)}
+    engine, _ = _engine(puller_rows=[(FINRA, 1, DIX_LANDED, 3)], anchors=covered_long_ago)
+
+    stats = {p["id"]: p for p in system._get_puller_stats(engine)}
+
+    assert stats["finra_short_volume"]["status"] == "healthy"

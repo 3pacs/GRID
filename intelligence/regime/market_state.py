@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_right
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
@@ -51,7 +52,9 @@ from sqlalchemy.engine import Engine
 from intelligence.regime.baseline import BASELINE_RULE, standardize_last, window_for
 from store.observations import MixedSourceError, PublicationLag, read_window_known_at
 
-RECORD_RULE = "market-state/1"
+# market-state/2 = market-state/1 plus freshness (#1303): an input older than its maximum age reads ``stale``, not ok.
+RECORD_RULE = "market-state/2"
+FRESHNESS_RULE = "max-age/1"
 
 # ── Publication lags (modeled availability for backfilled history; late on purpose) ──
 _NEXT_BD = PublicationLag(1, "business", "posted the next business day (FRED daily / Cboe close / FINRA evening file)")
@@ -414,14 +417,22 @@ def _change(series_id: str, periods: int) -> Callable[["_Reads"], pd.Series]:
 
 
 def gamma_state(df: pd.DataFrame, as_of: date) -> dict[str, Any]:
-    """The latest dealer-gamma row's categorical read (regime, flip), or unavailable."""
+    """The latest dealer-gamma row's categorical read (regime, flip), or unavailable.
+
+    ``stale`` (with the read kept) when that row is not from the ``as_of`` session itself (:data:`MAX_AGE`).
+    """
     if df is None or df.empty:
         return {"status": "unavailable", "reason": "no dealer_gex_daily row at or before as_of"}
     d = df.index[-1]
     row = df.iloc[-1]
-    return {"status": "ok", "obs_date": str(d), "age_days": (as_of - d).days, "regime": row["gex_regime"],
-            "gamma_flip": float(row["gamma_flip_strike"]), "spot": float(row["spot_price"]),
-            "spot_vs_flip": "above" if float(row["spot_to_flip_pct"]) >= 0 else "below"}
+    fresh = freshness(d, as_of, MAX_AGE["dealer_gamma"])
+    out = {"status": "ok" if fresh["status"] == "fresh" else "stale", "obs_date": str(d),
+           "age_days": (as_of - d).days, "regime": row["gex_regime"],
+           "gamma_flip": float(row["gamma_flip_strike"]), "spot": float(row["spot_price"]),
+           "spot_vs_flip": "above" if float(row["spot_to_flip_pct"]) >= 0 else "below", "freshness": fresh}
+    if out["status"] == "stale":
+        out["reason"] = _stale_reason(d, fresh)
+    return out
 
 
 VARIABLES: list[VarSpec] = [
@@ -460,6 +471,157 @@ VARIABLES: list[VarSpec] = [
             "EPU index, newest weekday first print", "timely but noisy: compared only with past first prints"),
 ]
 VAR_NAMES = [v.name for v in VARIABLES]
+
+
+# ── Freshness (max-age/1) ─────────────────────────────────────────────────
+#
+# A reading is ``stale`` when its newest observation is older than that variable normally is. Measured over every
+# stored record (2019-01-02..2026-11-19): next-business-day series are 1 session old (2 when a federal holiday falls
+# on a trading day), same-session reads are 0, and each weekly or monthly series peaks at exactly one period plus its
+# declared publication lag, minus a day. Older readings were real gaps: news vintages up to 23 sessions old
+# (2022-03), SPY 5 sessions (2026-04), claims 18 days (2026-08), dealer gamma 4 sessions (2026-10), the 2025
+# shutdown releases. Before this rule every one of them read ``ok``.
+
+@dataclass(frozen=True)
+class MaxAge:
+    """How old a variable's newest observation may be before its reading is ``stale``."""
+
+    limit: int
+    unit: str          # 'sessions': NYSE sessions after the observation, up to and including as_of | 'days'
+    basis: str
+
+
+def _after_next_release(series_id: str, period_days: int) -> MaxAge:
+    """Calendar-day limit for a weekly or monthly input: one period plus its declared publication lag, minus a day.
+
+    Under the declared (deliberately late) lag the next observation is public ``period + lag`` days after the current
+    one, so the current one is normally at most ``period + lag - 1`` days old. Older means the next observation is
+    overdue or was never published (documented shutdown releases read stale, which is what they are).
+    """
+    lag = LAGS[series_id]
+    if lag is None or lag.unit != "calendar":
+        raise ValueError(f"{series_id}: a calendar-day publication lag is required for a day limit")
+    return MaxAge(period_days + lag.days - 1, "days",
+                  f"{series_id}: {period_days}-day period + {lag.days}-day publication lag - 1")
+
+
+_NEXT_SESSION = MaxAge(2, "sessions", "posted the next business day: 1 session old, 2 when a federal holiday "
+                                      "falls on a trading day")
+_SAME_SESSION = MaxAge(1, "sessions", "read for the session itself: one missed session allowed")
+_EXACT_SESSION = MaxAge(0, "sessions", "dealer positioning changes every session with open interest and expiries: "
+                                       "only the session's own capture describes it")
+_WEEK, _LONGEST_MONTH = 7, 31
+
+MAX_AGE: dict[str, MaxAge] = {
+    "vix": _NEXT_SESSION,
+    "vix_term": _NEXT_SESSION,
+    "hy_spread": _NEXT_SESSION,
+    "ig_spread": _NEXT_SESSION,
+    "yield_curve": _NEXT_SESSION,
+    "fed_funds": _NEXT_SESSION,
+    "real_fed_funds": _NEXT_SESSION,
+    "net_liquidity": _after_next_release("WALCL", _WEEK),
+    "net_liquidity_4w": _after_next_release("WALCL", _WEEK),
+    "initial_claims": _after_next_release("ICSA", _WEEK),
+    "unemployment": _after_next_release("UNRATE", _LONGEST_MONTH),
+    "payrolls_3m": _after_next_release("PAYEMS", _LONGEST_MONTH),
+    "cpi_yoy": _after_next_release("CPIAUCSL", _LONGEST_MONTH),
+    "industrial_production_yoy": _after_next_release("INDPRO", _LONGEST_MONTH),
+    "consumer_sentiment": _after_next_release("UMCSENT", _LONGEST_MONTH),
+    "spy_vs_50d": _SAME_SESSION,
+    "spy_vs_200d": _SAME_SESSION,
+    "short_volume_ratio": _NEXT_SESSION,
+    "dix": _NEXT_SESSION,
+    "dix_change_5d": _NEXT_SESSION,
+    "dealer_gamma": _EXACT_SESSION,
+    "spot_vs_gamma_flip": _EXACT_SESSION,
+    "news_uncertainty": _SAME_SESSION,
+    "equity_news_uncertainty": _SAME_SESSION,
+    "news_first_print": _SAME_SESSION,
+}
+if set(MAX_AGE) != set(VAR_NAMES):
+    raise RuntimeError(f"MAX_AGE must cover exactly VARIABLES: {sorted(set(MAX_AGE) ^ set(VAR_NAMES))}")
+
+
+# Session ages count real NYSE sessions from the hash-pinned XNYS manifests in docs/reference/calendar-manifests,
+# never the approximate scheduler helpers in ingestion.market_calendar. Those close Juneteenth before it existed
+# (2020, 2021) and miss one-off closures such as 2025-01-09, so they misjudge ages both ways. The parts are
+# analysis/factory_session_calendar.PRESCREEN_PINS then PINS: the same lists the deploy's
+# scripts/prepare_factory_calendars.py normalizes, so a deployed tree can always open them. Prescreen ends
+# 2022-11-11 and the factory parts start 2022-11-01: the overlap must agree.
+_MANIFEST_ROOT = Path(__file__).resolve().parents[2] / "docs/reference/calendar-manifests"
+_xnys_cache: tuple[date, date, tuple[date, ...], str] | None = None
+
+
+def xnys_sessions() -> tuple[date, date, tuple[date, ...], str]:
+    """(first covered day, last covered day, every session in order, version) from the pinned manifests.
+
+    Raises ValueError when a manifest fails its pin or permission check, the parts leave a gap, or two parts
+    disagree on a day both cover: an age is never counted on a calendar that is not the pinned one.
+    """
+    global _xnys_cache
+    if _xnys_cache is None:
+        from analysis.factory_session_calendar import PINS, PRESCREEN_PINS
+        from ingestion.market_calendar import ManifestCalendar
+
+        pins = tuple(PRESCREEN_PINS) + tuple(PINS)
+        days: set[date] = set()
+        start = end = None
+        for name, sha in pins:
+            part = ManifestCalendar(_MANIFEST_ROOT / name, sha)
+            own = {date.fromisoformat(s.key.split(":")[1]) for s in part.sessions}
+            if end is not None:
+                if part.start > end + timedelta(days=1):
+                    raise ValueError(f"XNYS calendar gap between {end} and {part.start}")
+                if {d for d in days if d >= part.start} != {d for d in own if d <= end}:
+                    raise ValueError(f"XNYS calendar parts disagree between {part.start} and {end}")
+            days |= own
+            start = part.start if start is None else start
+            end = part.end if end is None else max(end, part.end)
+        _xnys_cache = (start, end, tuple(sorted(days)), "pinned XNYS: " + ",".join(sha for _, sha in pins))
+    return _xnys_cache
+
+
+def sessions_after(obs_date: date, as_of: date) -> tuple[int, bool]:
+    """NYSE sessions strictly after ``obs_date`` up to and including ``as_of``, and whether that is a lower bound.
+
+    An ``obs_date`` before the calendar's first day counts from that day, so the count is a lower bound. An ``as_of``
+    past its last day raises: extend the manifests rather than guess.
+    """
+    start, end, days, _ = xnys_sessions()
+    if not start <= as_of <= end:
+        raise ValueError(f"as_of {as_of} is outside the pinned XNYS calendar ({start}..{end}); extend the manifests")
+    lower_bound = obs_date < start
+    first = bisect_right(days, max(obs_date, start - timedelta(days=1)))
+    return bisect_right(days, as_of) - first, lower_bound
+
+
+def freshness(obs_date: date, as_of: date, max_age: MaxAge) -> dict[str, Any]:
+    """Age of ``obs_date`` at ``as_of`` in ``max_age``'s unit, and whether it is past the limit.
+
+    A limit of 0 sessions is the same-date rule: fresh only when ``obs_date`` is ``as_of`` itself.
+    """
+    out: dict[str, Any] = {"unit": max_age.unit, "limit": max_age.limit, "basis": max_age.basis}
+    if max_age.unit == "sessions":
+        age, lower_bound = sessions_after(obs_date, as_of)
+        if lower_bound:
+            out["age_is_lower_bound"] = True
+        if max_age.limit == 0:
+            stale = obs_date != as_of
+        elif lower_bound and age <= max_age.limit:
+            raise ValueError(f"cannot establish the age of {obs_date}: it is before the pinned XNYS calendar")
+        else:
+            stale = age > max_age.limit
+    else:
+        age = (as_of - obs_date).days
+        stale = age > max_age.limit
+    return {"status": "stale" if stale else "fresh", "age": age, **out}
+
+
+def _stale_reason(obs_date: date, fresh: dict[str, Any]) -> str:
+    return (f"newest observation {obs_date.isoformat()} is {fresh['age']} {fresh['unit']} old; "
+            f"limit {fresh['limit']} ({fresh['basis']})")
+
 
 # Five years of the slowest cadence plus transform warm-up (12-month change, 200-day average).
 LOOKBACK_DAYS = 365 * 7
@@ -517,12 +679,15 @@ class MarketState:
     spy_basis: str | None = None
     writer_provenance: dict[str, Any] | None = None
     source_lineage: dict[str, Any] | None = None
+    freshness_calendar: str | None = None   # the pinned XNYS manifests session ages were counted on
 
     def to_dict(self) -> dict[str, Any]:
         ok = [k for k, v in self.variables.items() if v.get("status") == "ok"]
         return {
             "rule": RECORD_RULE,
             "baseline_rule": BASELINE_RULE,
+            "freshness_rule": FRESHNESS_RULE,
+            "freshness_calendar": self.freshness_calendar,
             "as_of": self.as_of.isoformat(),
             "availability": "date-bounded with source-specific availability rules; modeled-lag backfills may use revised vintages",
             "variables": self.variables,
@@ -532,6 +697,7 @@ class MarketState:
             "pending": PENDING,
             "coverage": {"ok": len(ok), "no_baseline": sum(1 for v in self.variables.values()
                                                            if v.get("status") == "no_baseline"),
+                         "stale": sum(1 for v in self.variables.values() if v.get("status") == "stale"),
                          "total": len(self.variables)},
             "spy_basis": self.spy_basis,
             "writer_provenance": self.writer_provenance,
@@ -541,8 +707,9 @@ class MarketState:
 
 def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, list[date]] | None = None) -> MarketState:
     """Every variable in :data:`VARIABLES` at ``as_of``, standardized against its own trailing baseline."""
+    sessions_after(as_of, as_of)  # fail before any read when as_of is outside the pinned XNYS calendar
     reads = _Reads(engine, as_of, LOOKBACK_DAYS)
-    state = MarketState(as_of=as_of)
+    state = MarketState(as_of=as_of, freshness_calendar=xnys_sessions()[3])
     for spec in VARIABLES:
         window, min_obs = window_for(spec.cadence)
         base = {"group": spec.group, "unit": spec.unit, "cadence": spec.cadence}
@@ -561,13 +728,22 @@ def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, lis
         last_obs = hist.index[-1]
         if reading is None:
             # Known value, too little history to say what normal is: report the value, no z or label.
-            state.variables[spec.name] = {**base, "status": "no_baseline", "obs_date": str(last_obs),
-                                          "value": round(float(hist.iloc[-1]), 6), "n": int(len(hist) - 1),
-                                          "reason": f"{len(hist) - 1} prior observations known; baseline needs {min_obs}"}
-            continue
-        state.variables[spec.name] = {**base, "status": "ok", "obs_date": str(last_obs),
-                                      "age_days": (as_of - last_obs).days if isinstance(last_obs, date) else None,
-                                      **reading.to_dict()}
+            entry = {**base, "status": "no_baseline", "obs_date": str(last_obs),
+                     "value": round(float(hist.iloc[-1]), 6), "n": int(len(hist) - 1),
+                     "reason": f"{len(hist) - 1} prior observations known; baseline needs {min_obs}"}
+        else:
+            entry = {**base, "status": "ok", "obs_date": str(last_obs),
+                     "age_days": (as_of - last_obs).days if isinstance(last_obs, date) else None,
+                     **reading.to_dict()}
+        if isinstance(last_obs, date):
+            # Too old outranks both ok and no_baseline; the reading is kept so a reader can see what was stale.
+            fresh = freshness(last_obs, as_of, MAX_AGE[spec.name])
+            entry["freshness"] = fresh
+            if fresh["status"] == "stale":
+                stale = _stale_reason(last_obs, fresh)
+                entry["reason"] = stale if entry["status"] == "ok" else f"{stale}; {entry['reason']}"
+                entry["status"] = "stale"
+        state.variables[spec.name] = entry
     state.spy_basis = reads.spy_basis
     cal = load_calendar() if calendar is None else calendar
     state.events = events_state(as_of, cal)

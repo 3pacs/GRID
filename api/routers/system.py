@@ -51,10 +51,12 @@ from ingestion.source_freshness import (
     PIPELINE_STATUSES,
     PIPELINE_STOPPED,
     SERIES_ANCHORS,
+    AnchoredFreshness,
     CatalogRunSummary,
     anchor_for,
     anchored_run,
     catalog_freshness_hours,
+    classify_anchored_source,
     classify_catalog_source,
     error_class,
     merge_catalog_runs,
@@ -623,7 +625,6 @@ def _read_daily_freshness_audit(engine) -> DailyFreshnessAudit:
     )
 
 
-_FRESHNESS_STALE_AFTER = timedelta(hours=48)
 _FRESHNESS_STALE_LIMIT = 20
 
 
@@ -632,8 +633,9 @@ def _judge_anchored_rows(conn: Any, rows: list[Any]) -> list[tuple[str, datetime
 
     The query returns every ``SERIES_ANCHORS`` row present, whatever its
     ``last_pull_at`` (DIX bumps FINRA_SHORT_VOLUME's every morning). Each is
-    kept only if its anchors say it is stale by the same 48 h rule, with
-    ``last_pull`` replaced by when its stalest anchor last landed.
+    kept only when its anchors do not cover the trade date due by now, with
+    ``last_pull`` replaced by when its stalest anchor's newest observation
+    landed (context only: a re-landed old date is still stale).
     """
     now = datetime.now(timezone.utc)
     out: list[tuple[str, datetime | None]] = []
@@ -643,9 +645,9 @@ def _judge_anchored_rows(conn: Any, rows: list[Any]) -> list[tuple[str, datetime
         if anchor is None:
             out.append((name, last_pull_at))
             continue
-        landed = read_anchored_freshness(conn, anchor, as_of=now.date()).landed_at
-        if landed is None or now - landed > _FRESHNESS_STALE_AFTER:
-            out.append((name, landed))
+        anchored = read_anchored_freshness(conn, anchor, now=now)
+        if not anchored.covered:
+            out.append((name, anchored.landed_at))
     return out
 
 
@@ -859,19 +861,26 @@ def _pipeline_source_status(
     catalog_active: bool | None,
     run: CatalogRunSummary | None,
     now: datetime,
+    anchored: AnchoredFreshness | None = None,
 ) -> PipelineSourceStatus:
     """One source_catalog row's status, using raw_series + pull_log facts.
 
     ``last_pull`` is the newest raw_series write (or source_catalog's own
     last_pull_at); ``run`` is the row's pull_log summary, if any. The status
-    vocabulary and its rules live in ingestion/source_freshness.py.
+    vocabulary and its rules live in ingestion/source_freshness.py. A
+    ``SERIES_ANCHORS`` row passes ``anchored``: it is healthy only when its
+    owner's series cover the trade date due by now, and ``last_pull`` is
+    then when that series' newest observation landed.
     """
     last_pull_utc = _as_utc(last_pull)
     schedule_info = _SOURCE_SCHEDULE.get(name)
     fresh_hours = catalog_freshness_hours(name, _SOURCE_SCHEDULE)
-    status = classify_catalog_source(
-        now=now, fresh_hours=fresh_hours, last_write_at=last_pull_utc, run=run,
-    )
+    if anchored is not None:
+        status = classify_anchored_source(now=now, fresh_hours=fresh_hours, anchored=anchored, run=run)
+    else:
+        status = classify_catalog_source(
+            now=now, fresh_hours=fresh_hours, last_write_at=last_pull_utc, run=run,
+        )
     rows_at = newest_rows_at(last_pull_utc, run)
     last_error = safe_last_error(run.last_error) if run else None
 
@@ -1013,8 +1022,9 @@ def pipeline_health(
                 # the newest row for the source; pull_log only says how the
                 # owner last ran (ingestion/source_freshness.py::SERIES_ANCHORS).
                 anchor = anchor_for(row[0])
-                if anchor is not None:
-                    last_pull = read_anchored_freshness(conn, anchor, as_of=now.date()).landed_at
+                anchored = read_anchored_freshness(conn, anchor, now=now) if anchor is not None else None
+                if anchored is not None:
+                    last_pull = anchored.landed_at
                     run = anchored_run(run)
                 sources.append(_pipeline_source_status(
                     name=row[0],
@@ -1023,6 +1033,7 @@ def pipeline_health(
                     catalog_active=row[4],
                     run=run,
                     now=now,
+                    anchored=anchored,
                 ))
 
             # ── Coverage by family ─────────────────────────────────────
@@ -1929,9 +1940,11 @@ def _get_puller_stats(engine) -> list[dict]:
                 last_pull = row[2]
                 series_count = row[3] or 0
                 anchor = anchor_for(name)
-                if anchor is not None:
-                    # Shared catalog row: its owner's own series decide.
-                    last_pull = read_anchored_freshness(conn, anchor, as_of=now.date()).landed_at
+                anchored = read_anchored_freshness(conn, anchor, now=now) if anchor is not None else None
+                if anchored is not None:
+                    # Shared catalog row: its owner's own series decide, by
+                    # coverage of the due trade date; landing is context.
+                    last_pull = anchored.landed_at
 
                 # Determine status
                 if last_pull is None:
@@ -1952,6 +1965,13 @@ def _get_puller_stats(engine) -> list[dict]:
                         status = "stale"
                     else:
                         status = "broken"
+                    if anchored is not None:
+                        # Coverage of the due trade date decides; a recent
+                        # landing of an old date is still stale.
+                        if anchored.covered:
+                            status = "healthy"
+                        elif status == "healthy":
+                            status = "stale"
 
                     # Human-readable last run
                     if age_hours < 1:

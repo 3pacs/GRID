@@ -300,14 +300,16 @@ class TestStaleSourceLastAttempt:
 
 
 class TestSharedCatalogRowJudgedByOwnSeries:
-    """FINRA_SHORT_VOLUME is judged by the short-volume puller's own series.
+    """FINRA_SHORT_VOLUME is judged by trade-date coverage of the short-volume series.
 
     finra_dix writes finra:dix_sp500 under the same catalog row and the
     SmartScheduler bumps its last_pull_at for every DIX run, so on
     2026-11-18..11-20 (no short-volume obs; DIX landing each morning) the
     old "newer of last_pull_at and the newest row for the source" rule read
     it fresh and neither the alert nor Hermes's stale-refresh saw the gap.
-    See ingestion/source_freshness.py::SERIES_ANCHORS.
+    The trade date due at 11-20 14:00Z is 11-18 (pinned XNYS calendar,
+    ~18:00 ET release, one 24 h cadence). See
+    ingestion/source_freshness.py::SERIES_ANCHORS.
     """
 
     # Friday 2026-11-20 14:00Z, the third skipped trade date in a row.
@@ -356,11 +358,14 @@ class TestSharedCatalogRowJudgedByOwnSeries:
         assert "error" not in result
         by_name = {s["source"]: s for s in result["stale_sources"]}
         entry = by_name["FINRA_SHORT_VOLUME"]
-        assert entry["last_pull"] == self.SHORT_VOLUME_LANDED.isoformat()
-        assert entry["cadence"] == "DAILY"
+        assert entry["last_pull"] == self.SHORT_VOLUME_LANDED.isoformat()  # landing: context only
+        assert entry["cadence"] == "TRADE_DATE"
         assert entry["age_hours"] == pytest.approx(54.2, abs=0.1)
         judged = entry["judged_by"]
         assert judged["owner"] == "finra_short_volume"
+        assert judged["covered"] is False
+        assert judged["expected_obs_date"] == "2026-11-18"
+        assert judged["newest_obs_date"] == "2026-11-17"
         assert {s["series_id"]: s["obs_date"] for s in judged["series"]} == {
             "finra:short_volume_agg:market_ratio": "2026-11-17",
             "finra:short_volume:SPY": "2026-11-17",
@@ -378,6 +383,24 @@ class TestSharedCatalogRowJudgedByOwnSeries:
         result = check_db_health(health_engine)
 
         assert "FINRA_SHORT_VOLUME" not in _stale_names(result)
+
+    def test_old_trade_date_landed_again_is_flagged(self, health_engine):
+        """A repair or re-pull of obs 11-10 that lands at 13:40Z on 11-20 is not 11-18."""
+        from scripts.hermes_health import check_db_health
+
+        relanded = datetime(2026, 11, 20, 13, 40, tzinfo=timezone.utc)
+        with health_engine.begin() as conn:
+            finra = _add_source(conn, "FINRA_SHORT_VOLUME", last_pull_at=relanded)
+            for series in ("finra:short_volume_agg:market_ratio", "finra:short_volume:SPY"):
+                self._row(conn, finra, series, datetime(2026, 11, 10).date(), relanded)
+
+        result = check_db_health(health_engine)
+
+        entry = {s["source"]: s for s in result["stale_sources"]}["FINRA_SHORT_VOLUME"]
+        assert entry["last_pull"] == relanded.isoformat()
+        assert entry["age_hours"] == pytest.approx(0.3, abs=0.1)
+        assert entry["judged_by"]["newest_obs_date"] == "2026-11-10"
+        assert entry["judged_by"]["expected_obs_date"] == "2026-11-18"
 
     def test_dix_attempt_is_not_the_short_volume_last_attempt(self, health_engine):
         """A DIX "no TIINGO_API_KEY" skip must not mark short volume not_configured."""

@@ -1038,29 +1038,35 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                     continue
                 # A catalog row other pullers share (FINRA_SHORT_VOLUME: DIX
                 # writes and bumps last_pull_at under it every morning) is
-                # judged by its owner's own series, never by the newest row
-                # or last_pull_at for the source -- see
+                # judged by whether its owner's own series cover the trade
+                # date due by now, never by the newest row or last_pull_at
+                # for the source. Landing time is reported, not judged: a
+                # re-pull of an old date is not the current one. See
                 # ingestion/source_freshness.py::SERIES_ANCHORS.
                 anchor = anchor_for(name)
                 anchored = (
-                    read_anchored_freshness(conn, anchor, as_of=now.date())
+                    read_anchored_freshness(conn, anchor, now=now)
                     if anchor is not None else None
                 )
                 if anchored is not None:
                     effective = anchored.landed_at
+                    stale_now = not anchored.covered
+                    cadence_kind = "TRADE_DATE"
                 else:
                     effective = last_pull_at
                     if latest_success is not None and (effective is None or latest_success > effective):
                         effective = latest_success
-                cadence = cadence_for_source(
-                    name, update_frequency=update_frequency, latency_class=latency_class,
-                )
-                if is_stale(effective, now, cadence):
+                    cadence = cadence_for_source(
+                        name, update_frequency=update_frequency, latency_class=latency_class,
+                    )
+                    stale_now = is_stale(effective, now, cadence)
+                    cadence_kind = cadence.kind
+                if stale_now:
                     age = (now - effective).total_seconds() / 3600.0 if effective else None
                     entry: dict[str, Any] = {
                         "source": name,
                         "last_pull": effective.isoformat() if effective else "never",
-                        "cadence": cadence.kind,
+                        "cadence": cadence_kind,
                         "age_hours": round(age, 1) if age is not None else None,
                     }
                     if anchored is not None:

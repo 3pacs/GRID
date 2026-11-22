@@ -148,8 +148,11 @@ nothing. Each step runs on the owner's word.
 built with `scripts/build_factory_calendar_manifest.py`. That script rebuilt the two
 reviewed development manifests with identical sessions before it was used for these.
 They are named `prescreen-xnys-*` on purpose: `scripts/prepare_factory_calendars.py` and its
-tests own every `factory-xnys-*` file and normalize only the development pins. Run a look
-from a checkout made under `umask 022`, or the reader refuses a group-writable manifest.
+tests own every `factory-xnys-*` file. Since #1303 the deployed market-state record counts session
+ages on these two parts as well. The same pins are therefore restated in
+`factory_session_calendar.PRESCREEN_PINS` (a test keeps them equal), and the deploy normalizes them
+too. Run a look from a deployed tree or from a checkout made under `umask 022`; otherwise the reader
+refuses a group-writable manifest.
 
 ## Where the result shows
 

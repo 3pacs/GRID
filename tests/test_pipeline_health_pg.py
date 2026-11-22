@@ -463,11 +463,12 @@ def test_pull_log_summary_plan_is_one_scan(pipeline_pg):
 
 
 def test_finra_shared_row_is_judged_by_its_own_series(pipeline_pg):
-    """A DIX-only day: FINRA_SHORT_VOLUME is not healthy and is listed stale.
+    """A DIX-only day: FINRA_SHORT_VOLUME reads stale and is listed stale.
 
     finra_dix writes finra:dix_sp500 under the FINRA_SHORT_VOLUME catalog row
     and bumps its last_pull_at. Its row, its run and the bump must not stand
-    in for the short-volume puller's own series, which last landed 72 h ago
+    in for the short-volume puller's own series, whose newest trade date is
+    ten days old, past any due date the pinned calendar can give
     (ingestion/source_freshness.py::SERIES_ANCHORS).
     """
     with pipeline_pg.begin() as conn:
@@ -480,8 +481,8 @@ def test_finra_shared_row_is_judged_by_its_own_series(pipeline_pg):
         ))
         conn.execute(text(
             "INSERT INTO raw_series (source_id, series_id, obs_date, value, pull_timestamp, pull_status) VALUES "
-            "(4679, 'finra:short_volume_agg:market_ratio', CURRENT_DATE - 4, 0.48, now() - interval '72 hours', 'SUCCESS'), "
-            "(4679, 'finra:short_volume:SPY', CURRENT_DATE - 4, 0.51, now() - interval '72 hours', 'SUCCESS'), "
+            "(4679, 'finra:short_volume_agg:market_ratio', CURRENT_DATE - 10, 0.48, now() - interval '72 hours', 'SUCCESS'), "
+            "(4679, 'finra:short_volume:SPY', CURRENT_DATE - 10, 0.51, now() - interval '72 hours', 'SUCCESS'), "
             "(4679, 'finra:short_volume_agg:market_ratio', CURRENT_DATE - 1, 0, now() - interval '3 hours', 'FAILED'), "
             "(4679, 'finra:dix_sp500', CURRENT_DATE - 1, 0.45, now() - interval '4 hours', 'SUCCESS')"
         ))
@@ -495,7 +496,7 @@ def test_finra_shared_row_is_judged_by_its_own_series(pipeline_pg):
     response = _response(pipeline_pg)
     assert response.status_code == 200
     finra = {row["name"]: row for row in response.json()["sources"]}["FINRA_SHORT_VOLUME"]
-    assert finra["status"] == "quiet"  # was "healthy" on DIX's row and run
+    assert finra["status"] == "stale"  # was "healthy" on DIX's row and run
     landed = datetime.fromisoformat(finra["last_pull"])
     assert timedelta(hours=71) < datetime.now(timezone.utc) - landed < timedelta(hours=73)
     assert finra["last_error"].startswith("NO_NEW_DATA")
