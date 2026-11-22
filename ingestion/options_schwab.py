@@ -19,7 +19,15 @@ default path Yahoo serves only fallbacks; here it serves every non-core name
 * a non-core name is read to ``YAHOO_MAX_EXPIRATIONS`` expiries, not twelve;
 * a run sends at most about ``YAHOO_RUN_REQUEST_BUDGET`` requests (1,000, enough
   for about 160 names at six expiries); names past it are SKIPPED
-  ``yahoo_request_budget``. The caller's time budget can end a run sooner;
+  ``yahoo_request_budget``. A caller with a deadline (the smart scheduler's
+  840 s window) gets a smaller budget sized to the time left when the Yahoo
+  names begin (``yahoo_budget_for_window``); the caller's time budget can still
+  end a run sooner;
+* a full default-universe run starts its Yahoo names after the last one the
+  previous run of the same writer finished, wrapping around (``TailCursor``,
+  a 0600 file per writer in GRID's state directory, keyed by the universe and
+  failing open), so budget-limited runs cover the whole list between them
+  instead of re-reading its first names (2026-11-21);
 * a 429 latches for the run: the remaining expiries of that ticker are not
   requested (its capture is refused as incomplete) and the next non-core name
   stops the run (``OptionsSourceStopped("yahoo", 429)``);
@@ -40,7 +48,11 @@ default path's fallback already does, and records the provider per ticker.
 A batch never mixes providers. A core ticker is never retried on Yahoo. With
 every name read or accounted for, a default-universe run can be complete, so
 source freshness moves again (review of #1299, item 6; owner's word relayed
-2026-11-21).
+2026-11-21). A full run does not fit one smart-scheduler window, and a retry
+within ``MIN_RUN_GAP_SECONDS`` does not read the core, so completeness is
+judged over the session: a name captured by an earlier run of the same writer
+on the same New York session day counts, and the run that completes that cycle
+publishes freshness (``TailCursor.covered``). A partial cycle never does.
 
 Shared allowance: the Schwab app's per-minute allowance is shared with the
 live quote recorder (gex-watch), whose lost minutes cost live evidence
@@ -95,6 +107,7 @@ never written to ``resolved_series`` (review of #1299, item 3).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -116,14 +129,26 @@ CLIENT_NAME = "grid-options"
 REFUSAL_STATUSES: frozenset[int] = frozenset({401, 403})
 YAHOO_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 # About 160 non-core names at YAHOO_MAX_EXPIRATIONS is up to 960 requests, so 1,000 lets a full run
-# finish on requests. At one request a second that tail alone is about 16 minutes, which is longer
-# than the 900 s the smart scheduler gives the options job (ingestion/smart_scheduler.py); under
-# that job the time budget ends the run first and the remaining names are DEFERRED.
+# finish on requests. That is the cap for a caller with no deadline (ingestion/scheduler.py). At one
+# request a second that tail alone is about 16 minutes, longer than the 840 s the smart scheduler's
+# options job may use (timeout_s 900 less stop_margin_s 60). A caller that passes ``deadline_at``
+# gets a smaller budget sized to the time left (``yahoo_budget_for_window``), and the tail cursor
+# (``TailCursor``) picks the next run up where this one stopped.
 YAHOO_RUN_REQUEST_BUDGET = 1000
+# Window sizing (schwab mode, a caller with a deadline). Seconds of the window one Yahoo request is
+# budgeted at: the 1.0 s pacing floor, the request's own latency past it, and the per-name database
+# write and 0.3 s inter-ticker pause spread over its six expiries. The reserve is kept for the last
+# name started on the final budgeted request (six requests), the catalog publication
+# (``options.CATALOG_PUBLICATION_SECONDS``, 15 s) and slack, so a run that completes the cycle can
+# still publish freshness before ``should_continue`` turns false.
+YAHOO_BUDGET_SECONDS_PER_REQUEST = 1.5
+YAHOO_WINDOW_RESERVE_SECONDS = 45.0
 YAHOO_MAX_EXPIRATIONS = 6
 YAHOO_RATE_LIMIT_HOLD_SECONDS = 30 * 60
 # GRID's per-user state directory (the scheduler and the AV transcript ledger keep theirs there).
 YAHOO_HOLD_FILE_DEFAULT = "~/.local/state/grid/options_yahoo_hold.json"
+TAIL_CURSOR_DIR_DEFAULT = "~/.local/state/grid"
+TAIL_CURSOR_VERSION = 1
 MIN_REQUEST_INTERVAL_SECONDS = 2.0
 RATE_LIMIT_HOLD_SECONDS = 600
 MIN_RUN_GAP_SECONDS = 45 * 60
@@ -319,6 +344,23 @@ def schwab_post_session(now: datetime | None = None) -> bool:
     return moment > regular_session(moment.astimezone(_options._EQUITY_TZ).date())[1]
 
 
+def _write_state_json(target: Path, payload: Any, *, prefix: str) -> None:
+    """Replace ``target`` atomically with ``payload`` as JSON; raises OSError.
+
+    mkstemp creates the file 0600. The directory is created 0700 only when it does not exist; an
+    existing shared state directory keeps its mode. A failed write leaves no temp file behind.
+    """
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(dir=target.parent, prefix=prefix)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle)
+        os.replace(temp, target)
+    except OSError:
+        Path(temp).unlink(missing_ok=True)
+        raise
+
+
 def yahoo_hold_file() -> Path:
     """Marker of the last Yahoo 429 seen in schwab mode (GRID_OPTIONS_YAHOO_HOLD_FILE)."""
     return Path(os.getenv("GRID_OPTIONS_YAHOO_HOLD_FILE", "").strip() or YAHOO_HOLD_FILE_DEFAULT).expanduser()
@@ -334,15 +376,8 @@ def record_yahoo_rate_limit(now_epoch: float, path: str | Path | None = None) ->
     target = Path(path) if path is not None else yahoo_hold_file()
     until = datetime.fromtimestamp(now_epoch + YAHOO_RATE_LIMIT_HOLD_SECONDS, timezone.utc)
     try:
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, temp = tempfile.mkstemp(dir=target.parent, prefix=".options-yahoo-hold-")
-        try:
-            with os.fdopen(fd, "w") as handle:
-                json.dump({"held_until": until.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": 429}, handle)
-            os.replace(temp, target)
-        except OSError:
-            Path(temp).unlink(missing_ok=True)
-            raise
+        _write_state_json(target, {"held_until": until.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": 429},
+                          prefix=".options-yahoo-hold-")
         return True
     except OSError as exc:
         log.warning("options: Yahoo rate-limit marker not written ({kind})", kind=type(exc).__name__)
@@ -383,6 +418,137 @@ def schwab_core_block(now: datetime | None = None, *, writer: str | None = None)
     if schwab_post_session(moment):
         return "post-session"
     return schwab_capture_hold(moment.timestamp(), writer=writer)
+
+
+def yahoo_budget_for_window(seconds_left: float) -> int:
+    """Yahoo requests that fit ``seconds_left`` of a caller's window, at most ``YAHOO_RUN_REQUEST_BUDGET``.
+
+    Pure. Measured from the moment the non-core names begin, so a run whose core was held (the
+    45-minute Schwab gap) spends the whole window on them, and one that read the core spends what
+    is left. Never negative.
+    """
+    if not isinstance(seconds_left, (int, float)) or not math.isfinite(seconds_left):
+        return 0
+    fit = int((seconds_left - YAHOO_WINDOW_RESERVE_SECONDS) // YAHOO_BUDGET_SECONDS_PER_REQUEST)
+    return max(0, min(YAHOO_RUN_REQUEST_BUDGET, fit))
+
+
+def tail_cursor_file(writer: str | None = None) -> Path:
+    """One writer's cursor file, in GRID_OPTIONS_TAIL_CURSOR_DIR or GRID's state directory.
+
+    One file per writer (``capture_source``): the smart scheduler and the daily scheduler run in
+    different processes and must not overwrite each other's progress.
+    """
+    label = re.sub(r"[^A-Za-z0-9_-]", "_", writer or _options.DEFAULT_CAPTURE_SOURCE)[:64]
+    folder = os.getenv("GRID_OPTIONS_TAIL_CURSOR_DIR", "").strip() or TAIL_CURSOR_DIR_DEFAULT
+    return Path(folder).expanduser() / f"options_tail_cursor.{label}.json"
+
+
+def universe_identity(tickers: list[str]) -> str:
+    """SHA-256 of the run's universe (core and catalyst names, order-free): a changed list resets the cursor."""
+    return hashlib.sha256("\n".join(sorted(set(tickers))).encode("utf-8")).hexdigest()
+
+
+_CURSOR_TICKER = re.compile(r"^[A-Z0-9./-]{1,12}$")
+
+
+class TailCursor:
+    """Where a schwab-mode full-universe run resumes its non-core names, and what this session covered.
+
+    State, per writer, in one small 0600 JSON file (atomic replace):
+
+    * ``last_completed``: the last non-core name a run finished (captured, confirmed without a
+      chain, or failed: a name that keeps failing must not pin the cursor). The next run starts
+      after it and wraps around. Keyed by ``universe_identity``: a changed catalyst list starts
+      from the beginning. A name a run did not finish (time budget, request budget, a hold, a stop,
+      or the name a Yahoo 429 cut short) does not move it.
+    * ``covered``: every name, core included, that a run of this New York session day captured or
+      accounted for (``OptionsPullResults.accounts_for``). Keyed by session day only: a capture is
+      a fact whatever the list is now. It lets a later run of the same session count a name an
+      earlier run captured, so the session's cycle can complete (``OptionsPullResults``).
+
+    Fails open: a missing, unreadable or malformed file is logged (unless missing) and means "start
+    from the beginning, nothing covered yet". So a bad file can cost a re-read, never a skipped name,
+    and never moves source freshness. A file that cannot be written is logged and the run goes on.
+    """
+
+    def __init__(self, path: Path, universe: str, session_day: str,
+                 last_completed: str | None = None, covered: set[str] | None = None) -> None:
+        self.path = path
+        self.universe = universe
+        self.session_day = session_day
+        self.last_completed = last_completed
+        self.covered: set[str] = set(covered or ())
+        # Coverage from earlier runs of this session, fixed when the cursor is loaded.
+        self.covered_before: frozenset[str] = frozenset(self.covered)
+
+    @classmethod
+    def load(cls, tickers: list[str], session_day: str, *, writer: str | None = None,
+             path: str | Path | None = None) -> TailCursor:
+        target = Path(path) if path is not None else tail_cursor_file(writer)
+        universe = universe_identity(tickers)
+        fresh = cls(target, universe, session_day)
+        try:
+            raw = target.read_bytes()
+        except FileNotFoundError:
+            return fresh
+        except OSError as exc:
+            log.warning("options: tail cursor unreadable ({kind}); starting from the first name", kind=type(exc).__name__)
+            return fresh
+        try:
+            state = json.loads(raw.decode("utf-8"))
+            if not isinstance(state, dict) or state.get("version") != TAIL_CURSOR_VERSION:
+                raise ValueError("version")
+            stored_universe, stored_day = state["universe"], state["session_day"]
+            last, covered = state["last_completed"], state["covered"]
+            if (not isinstance(stored_universe, str) or not isinstance(stored_day, str)
+                    or not (last is None or (isinstance(last, str) and _CURSOR_TICKER.match(last)))
+                    or not isinstance(covered, list)
+                    or not all(isinstance(t, str) and _CURSOR_TICKER.match(t) for t in covered)):
+                raise ValueError("shape")
+        except Exception as exc:  # noqa: BLE001 -- any content at all must fail open, as the Yahoo hold marker does
+            log.warning("options: tail cursor is not in the expected form ({kind}); starting from the first name",
+                        kind=type(exc).__name__)
+            return fresh
+        return cls(target, universe, session_day,
+                   last_completed=last if stored_universe == universe else None,
+                   covered=set(covered) if stored_day == session_day else None)
+
+    def order(self, tail: list[str]) -> list[str]:
+        """``tail`` rotated to start after ``last_completed``; unchanged when it is unset or not in the list."""
+        if self.last_completed is None or self.last_completed not in tail:
+            return list(tail)
+        start = tail.index(self.last_completed) + 1
+        return tail[start:] + tail[:start]
+
+    @staticmethod
+    def finished(result: Mapping[str, Any]) -> bool:
+        """True when a name was requested and its outcome is final for this run (the cursor may pass it)."""
+        return (result.get("status") != "DEFERRED"
+                and result.get("reason") not in _options.OptionsPullResults._RUN_STOP_REASONS
+                and not result.get("rate_limited"))
+
+    def record(self, ticker: str, result: Mapping[str, Any], *, tail: bool) -> None:
+        """Note one requested name's outcome and save when anything changed."""
+        changed = False
+        if _options.OptionsPullResults.accounts_for(result) and ticker not in self.covered:
+            self.covered.add(ticker)
+            changed = True
+        if tail and self.finished(result) and self.last_completed != ticker:
+            self.last_completed = ticker
+            changed = True
+        if changed:
+            self.save()
+
+    def save(self) -> bool:
+        payload = {"version": TAIL_CURSOR_VERSION, "universe": self.universe, "session_day": self.session_day,
+                   "last_completed": self.last_completed, "covered": sorted(self.covered)}
+        try:
+            _write_state_json(self.path, payload, prefix=".options-tail-cursor-")
+            return True
+        except OSError as exc:
+            log.warning("options: tail cursor not written ({kind})", kind=type(exc).__name__)
+            return False
 
 
 class SchwabOptionsClient:
@@ -533,6 +699,9 @@ class SchwabFirstOptionsClient:
         self._yahoo_last: float | None = None
         self._yahoo_limited = False
         self.yahoo_requests = 0
+        # None: the module cap (YAHOO_RUN_REQUEST_BUDGET). pull_all sets it from the caller's
+        # deadline when the non-core names begin (yahoo_budget_for_window).
+        self.yahoo_request_budget: int | None = None
         self.provider_by_ticker: dict[str, str] = {}
 
     @property
@@ -556,7 +725,8 @@ class SchwabFirstOptionsClient:
     @property
     def yahoo_budget_spent(self) -> bool:
         """True once this run has sent its budget of Yahoo requests; later names are not started."""
-        return self.yahoo_requests >= YAHOO_RUN_REQUEST_BUDGET
+        budget = YAHOO_RUN_REQUEST_BUDGET if self.yahoo_request_budget is None else self.yahoo_request_budget
+        return self.yahoo_requests >= budget
 
     def _yahoo_request(self, ticker: str, expiry_ts: int | None) -> Any:
         if self._yahoo_limited:

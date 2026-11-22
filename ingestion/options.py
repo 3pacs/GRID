@@ -19,7 +19,7 @@ import os
 import re
 import time
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -214,17 +214,34 @@ class OptionsPullResults(list[dict[str, Any]]):
     # (``OptionsSourceStopped``).
     _RUN_STOP_REASONS: frozenset[str] = frozenset({"source_access_denied", "source_stopped"})
 
-    def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
+    def __init__(self, items: list[dict[str, Any]], *, full_universe: bool,
+                 covered_earlier: frozenset[str] | None = None) -> None:
         super().__init__(items)
         self.full_universe = full_universe
         self.publication_error: str | None = None
+        # Schwab-mode full-universe runs only (ingestion/options_schwab.py TailCursor): names an
+        # earlier run of this session day captured or accounted for. None on every other path,
+        # where coverage is this run's alone.
+        self.covered_earlier = covered_earlier
 
-    def _is_clean_no_chain(self, result: dict[str, Any]) -> bool:
+    @classmethod
+    def _is_clean_no_chain(cls, result: Mapping[str, Any]) -> bool:
         return (
             result.get("status") == "SKIPPED"
-            and result.get("reason") in self._CLEAN_NO_CHAIN_REASONS
-            and result.get("ticker") not in self._CORE_TICKERS
+            and result.get("reason") in cls._CLEAN_NO_CHAIN_REASONS
+            and result.get("ticker") not in cls._CORE_TICKERS
         )
+
+    @classmethod
+    def accounts_for(cls, result: Mapping[str, Any]) -> bool:
+        """True when ``result`` completes its ticker's coverage: the three cases ``summary`` counts."""
+        return (result.get("status") == "SUCCESS"
+                or bool(result.get("no_options") and result.get("status") == "NO_NEW_DATA")
+                or cls._is_clean_no_chain(result))
+
+    def _covered_earlier(self, result: dict[str, Any]) -> bool:
+        return (self.covered_earlier is not None and result.get("ticker") in self.covered_earlier
+                and not self.accounts_for(result))
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -240,6 +257,8 @@ class OptionsPullResults(list[dict[str, Any]]):
         # for non-core tickers. A row is one or the other, never both.
         no_options = sum(1 for r in self if r.get("no_options") and r.get("status") == "NO_NEW_DATA")
         no_data = [r.get("ticker") for r in self if self._is_clean_no_chain(r)]
+        # Always empty unless covered_earlier is set (schwab-mode session cycle).
+        earlier = [r.get("ticker") for r in self if self._covered_earlier(r)]
         if not self or all(s == "SKIPPED" for s in statuses):
             reasons = sorted({str(r["reason"]) for r in self if r.get("reason")})
             status, note = "SKIPPED", "no ticker capture completed"
@@ -248,15 +267,18 @@ class OptionsPullResults(list[dict[str, Any]]):
         elif not ok and not deferred and not no_options:
             status, note = "FAILED", "no ticker succeeded"
         elif (self.publication_error or not self.full_universe
-                or ok + no_options + len(no_data) != len(self) or not known_rows):
+                or ok + no_options + len(no_data) + len(earlier) != len(self) or not known_rows):
             status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
             if not self.publication_error and self.full_universe and known_rows:
                 missing = [r.get("ticker") for r in self
                            if r.get("status") != "SUCCESS" and not self._is_clean_no_chain(r)
-                           and not (r.get("no_options") and r.get("status") == "NO_NEW_DATA")]
+                           and not (r.get("no_options") and r.get("status") == "NO_NEW_DATA")
+                           and not self._covered_earlier(r)]
                 note = f"{note}: {len(missing)} tickers not captured ({', '.join(map(str, missing[:10]))})"
         elif not rows:
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
+        elif earlier:
+            status, note = "SUCCESS", "full default universe captured across this session's runs"
         else:
             status, note = "SUCCESS", "full default universe captured"
         denied = next((r for r in self if r.get("reason") in self._RUN_STOP_REASONS), None)
@@ -268,7 +290,7 @@ class OptionsPullResults(list[dict[str, Any]]):
             limited = next((r.get("rate_limited") for r in self if r.get("rate_limited")), None)
             if limited is not None:
                 note = f"{note}; {limited}"
-        return {
+        summary = {
             "status": status, "rows_inserted": rows,
             "scope": "full_universe" if self.full_universe else "subset",
             "tickers_total": len(self), "tickers_ok": ok,
@@ -280,6 +302,11 @@ class OptionsPullResults(list[dict[str, Any]]):
             "error": note if status in ("PARTIAL", "FAILED") else None,
             "reason": note,
         }
+        if self.covered_earlier is not None:
+            # Schwab mode only, so the default summary keeps its exact keys.
+            summary["coverage"] = "session_cycle"
+            summary["tickers_covered_earlier"] = len(earlier)
+        return summary
 
 
 
@@ -929,6 +956,7 @@ class OptionsPuller(BasePuller):
         max_expirations: int = MAX_EXPIRATIONS,
         should_continue: Callable[[], bool] | None = None,
         capture_source: str = DEFAULT_CAPTURE_SOURCE,
+        deadline_at: float | None = None,
     ) -> OptionsPullResults:
         """Pull options chains for all tickers and compute signals.
 
@@ -948,6 +976,18 @@ class OptionsPuller(BasePuller):
                 ticker and reports it and the remaining tickers as DEFERRED.
             capture_source: Writer label recorded on each registered batch
                 in ``options_capture_batches`` (e.g. "gem_daily").
+            deadline_at: Schwab mode only. The caller's cooperative deadline
+                (``time.monotonic()``); when the Yahoo-served names begin, the
+                run's Yahoo request budget is sized to the time left
+                (``options_schwab.yahoo_budget_for_window``). Ignored on every
+                other path.
+
+        Schwab mode, full default universe only: the Yahoo-served names start
+        after the last one the previous run of this writer finished, wrapping
+        around (``options_schwab.TailCursor``), and a name an earlier run of
+        the same session day captured counts toward this run's coverage. So
+        source freshness moves once every name has been captured within the
+        session's runs, by the run that completes that cycle.
 
         A 401/403 stops this entire run, including when it first occurs in
         the catalyst tail after every core ticker succeeds. Earlier complete
@@ -1002,6 +1042,10 @@ class OptionsPuller(BasePuller):
         # name: callers and tests inject any ``get_options`` client there.
         primary = options_primary_provider()
         core_block: str | None = None
+        # Schwab mode, full default universe only: where the Yahoo names resume
+        # and what this session's earlier runs covered. None on every other path.
+        cursor: Any = None
+        yahoo_budget_sized = False
         # Schwab mode only: why the Yahoo-served names are not requested, and
         # their smaller expiry cap. None / the run's own cap on every other path.
         tail_block: str | None = None
@@ -1016,8 +1060,10 @@ class OptionsPuller(BasePuller):
             from ingestion.options_schwab import (
                 YAHOO_MAX_EXPIRATIONS,
                 SchwabFirstOptionsClient,
+                TailCursor,
                 schwab_core_block,
                 schwab_post_session,
+                yahoo_budget_for_window,
                 yahoo_tail_hold,
             )
 
@@ -1040,6 +1086,19 @@ class OptionsPuller(BasePuller):
                     log.info("Options pull: Yahoo names not requested ({why})", why=tail_block)
             tail_expirations = min(max_expirations, YAHOO_MAX_EXPIRATIONS)
             self._yahoo = SchwabFirstOptionsClient(writer=capture_source)
+            if full_universe:
+                # ``catalyst_options_universe`` orders by ticker, so without this
+                # every budget-limited run re-read the same early names and the
+                # last ones were never reached.
+                cursor = TailCursor.load(tickers, today_str, writer=capture_source)
+                core = [t for t in tickers if t in EQUITY_TICKERS]
+                tail = cursor.order([t for t in tickers if t not in EQUITY_TICKERS])
+                tickers = core + tail
+                log.info(
+                    "options: Yahoo names resume at {first} ({n} names; {c} of {total} covered earlier this session)",
+                    first=tail[0] if tail else "-", n=len(tail),
+                    c=len(cursor.covered_before & set(tickers)), total=len(tickers),
+                )
         elif primary == "yahoo":
             self._yahoo = YahooOptionsClient()
         else:
@@ -1064,6 +1123,12 @@ class OptionsPuller(BasePuller):
                                 "reason": core_block, "provider": "schwab"})
                 continue
             in_tail = primary == "schwab" and ticker not in EQUITY_TICKERS
+            if in_tail and tail_block is None and deadline_at is not None and not yahoo_budget_sized:
+                # Sized once, when the Yahoo names begin: what is left of the window.
+                yahoo_budget_sized = True
+                self._yahoo.yahoo_request_budget = yahoo_budget_for_window(deadline_at - time.monotonic())
+                log.info("options: Yahoo request budget {n} for the time left in this run",
+                         n=self._yahoo.yahoo_request_budget)
             if in_tail and tail_block is None and getattr(self._yahoo, "yahoo_budget_spent", False):
                 tail_block = "yahoo_request_budget"
             if in_tail and tail_block is not None:
@@ -1083,6 +1148,8 @@ class OptionsPuller(BasePuller):
             if in_tail and not limited_before and getattr(self._yahoo, "yahoo_rate_limited", False):
                 result["rate_limited"] = "yahoo rate limited (HTTP 429)"
             results.append(result)
+            if cursor is not None:
+                cursor.record(ticker, result, tail=in_tail)
             if result.get("reason") in OptionsPullResults._RUN_STOP_REASONS:
                 results.extend(
                     {"ticker": t, "status": "SKIPPED", "rows_inserted": 0,
@@ -1108,7 +1175,10 @@ class OptionsPuller(BasePuller):
             "{no} without listed options",
             ok=succeeded, total=len(tickers), snaps=total_snaps, no=no_options,
         )
-        outcome = OptionsPullResults(results, full_universe=full_universe)
+        outcome = OptionsPullResults(
+            results, full_universe=full_universe,
+            covered_earlier=cursor.covered_before if cursor is not None else None,
+        )
         if outcome.summary["status"] == "SUCCESS":
             if should_continue is not None and not should_continue():
                 outcome.publication_error = "time budget expired before catalog publication"

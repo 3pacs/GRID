@@ -1094,6 +1094,17 @@ class _OptionsSchedulerAdapter:
     TICK_TIME_BUDGET_S stops scheduling subsequent jobs after it returns.
     Subset and incomplete runs retain committed rows but never claim the
     entire source fresh. The puller also uses this summary for daily runs.
+
+    Schwab mode (GRID_OPTIONS_PRIMARY_PROVIDER=schwab, 2026-11-21): a full run
+    is about 80 paced Schwab calls for the core plus about 960 Yahoo requests
+    at >= 1 s, about 19 minutes, so it does not fit this job's 840 s
+    cooperative window. The window is kept, not raised (see the "options"
+    registry row): this call also receives ``deadline_at`` and, in schwab mode
+    only, passes it on so the run's Yahoo request budget is sized to the time
+    left; the tail cursor in ``ingestion/options_schwab.py`` resumes the next
+    run (the 30-minute PARTIAL retry) where this one stopped, and freshness
+    moves when the session's runs have covered every name. Every other
+    provider gets exactly the call it got before.
     """
 
     SOURCE_NAME = "YFINANCE_OPTIONS"
@@ -1104,7 +1115,9 @@ class _OptionsSchedulerAdapter:
         self._engine = db_engine
         self._puller = None
 
-    def pull(self, should_continue: Any = None) -> dict[str, Any]:
+    def pull(self, should_continue: Any = None, deadline_at: float | None = None) -> dict[str, Any]:
+        import os
+
         from ingestion.options import OptionsPuller, automatic_options_capture_guard
 
         guarded = automatic_options_capture_guard(getattr(self, "_engine", None))
@@ -1112,8 +1125,16 @@ class _OptionsSchedulerAdapter:
             return guarded
         if self._puller is None:
             self._puller = OptionsPuller(db_engine=self._engine)
+        schwab_only: dict[str, Any] = {}
+        # The environment check first, so no other provider even imports the selector here.
+        if (deadline_at is not None
+                and os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() == "schwab"):
+            from ingestion.options import options_primary_provider
+
+            if options_primary_provider() == "schwab":
+                schwab_only["deadline_at"] = deadline_at
         return self._puller.pull_all(
-            should_continue=should_continue, capture_source="smart_scheduler",
+            should_continue=should_continue, capture_source="smart_scheduler", **schwab_only,
         ).summary
 
 
@@ -1279,6 +1300,15 @@ def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
 PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Fast domestic (run frequently) ──
     {"name": "yfinance",          "mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller",           "method": "pull_all",  "freq_h": 4,  "timeout_s": 240, "kwargs": {"start_date": _yfinance_incremental_start}},
+    # options: timeout_s stays 900 in every mode (decision 2026-11-21). A full schwab-mode run
+    # (~19 min) would need about 1,500 s, but scripts/hermes_operator.py's smart_ingestion step
+    # encloses TICK_TIME_BUDGET_S + this timeout_s + 60 s (1260 s, pinned by
+    # tests/test_hermes_timeout_budgets.py), so 1,500 s means a 1,860 s step: every Hermes cycle
+    # that runs options (each 6 h and every 30-min PARTIAL retry in the session) would hold
+    # resolution, diagnostics, intelligence and oracle steps up to 31 min against a 5-min cadence
+    # and the 4,500 s cycle watchdog; shorter, the step would abandon a cooperating capture as an
+    # orphaned thread (DEV-NOTES H17). Instead schwab mode sizes its Yahoo budget to the window
+    # (deadline_at) and resumes the tail across runs (_OptionsSchedulerAdapter).
     {"name": "options",           "mod": "ingestion.smart_scheduler",     "cls": "_OptionsSchedulerAdapter", "method": "pull",      "freq_h": 6, "timeout_s": 900, "stop_margin_s": 60},
     {"name": "coingecko",         "mod": "ingestion.coingecko",           "cls": "CoinGeckoPuller",          "method": "pull_all",  "freq_h": 4,  "timeout_s": 60},
     # fred: 87 series took 91-176 s per pass on 2026-10-06 (grid-scheduler journal); one
