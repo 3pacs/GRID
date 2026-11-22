@@ -195,7 +195,7 @@ def test_only_the_reviewed_migration_creates_the_table_outside_sqlite():
     users = {node.name for node in ast.parse(SOURCES[RECORD]).body if isinstance(node, ast.FunctionDef)
              and any(isinstance(n, ast.Name) and n.id == "_PROVISIONAL_TABLE_SQL" for n in ast.walk(node))}
     assert users == {"ensure_provisional_table"}
-    pg = create_engine("postgresql+psycopg2://nobody:nothing@127.0.0.1:9/none")     # never connected
+    pg = create_engine("postgresql+psycopg2://")  # a PostgreSQL dialect, never connected; no credentials
     with pytest.raises(RuntimeError, match="market_state_prov_20261122"):
         M.ensure_provisional_table(pg)
 
