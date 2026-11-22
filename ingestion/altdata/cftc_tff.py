@@ -38,6 +38,7 @@ derived from it is stored; the derived metrics are re-checked for finiteness.
 from __future__ import annotations
 
 import math
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -175,13 +176,21 @@ def _parse_tff_metrics(rec: dict[str, Any]) -> tuple[dict[str, float] | None, st
     return metrics, None
 
 
-def _report_date(raw_rd: Any) -> date | None:
-    """The report date as a real ``date``; None for missing, unparseable, NaT or non-text.
+_ISO_REPORT_DATE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)?")
 
-    Only a string or a date is accepted: pandas would read a bare number such
-    as ``20261117`` as nanoseconds since 1970.
+
+def _report_date(raw_rd: Any) -> date | None:
+    """The report date as a real ``date``; None for missing, unparseable, NaT or non-ISO input.
+
+    Only a date or an ISO ``YYYY-MM-DD[THH:MM[:SS[.fff]]]`` string (Socrata's
+    floating timestamp) is read: pandas would take a bare number as nanoseconds
+    since 1970, and digits-only text such as ``"20261117"`` is not the
+    dataset's format, so both are refused rather than guessed.
     """
-    if not isinstance(raw_rd, (str, date)):
+    if isinstance(raw_rd, str):
+        if not _ISO_REPORT_DATE.fullmatch(raw_rd.strip()):
+            return None
+    elif not isinstance(raw_rd, date):
         return None
     try:
         ts = pd.Timestamp(raw_rd)

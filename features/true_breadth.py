@@ -71,17 +71,28 @@ refused alike rather than silently mapped to possibly different sessions.
 Convert to naive session dates (for NYSE sessions, the America/New_York date of
 the close) before calling.
 
+Labels are checked before any conversion. Accepted: a naive ``DatetimeIndex``,
+or labels that are each a ``datetime.date``, a naive ``datetime``/``Timestamp``
+or ``numpy.datetime64``, or an ISO ``YYYY-MM-DD`` string (optionally with a
+``THH:MM[:SS[.f]]`` time). Numeric labels are refused (``ValueError`` naming the
+dtype or the first offending label): ``pd.to_datetime([0, 86400000000000])``
+would silently read them as nanoseconds since 1970, so an integer, float,
+boolean, ``RangeIndex`` (a frame built without an index) or an object index
+holding any number is never a session. Other strings (``"20260105"``,
+``"Jan 5 2026"``), timedelta and period indexes are refused too.
+
 No writer: nothing stores these series in this change.
 """
 
 from __future__ import annotations
 
+import re
 import warnings
 from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import date, datetime
-from numbers import Real
+from numbers import Number, Real
 from pathlib import Path
 
 import numpy as np
@@ -120,6 +131,13 @@ class UnknownMembership:
 MembersOn = Callable[[date], Collection[str] | UnknownMembership]
 
 
+def _membership_date(value: object, name: str) -> date:
+    """A membership-file date: an ISO ``YYYY-MM-DD`` string only (no numbers, no other text)."""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        raise ValueError(f"membership {name} must be an ISO YYYY-MM-DD string, got {value!r}")
+    return date.fromisoformat(value.strip())
+
+
 def sp500_members_on(path: Path | None = None) -> Callable[[date], frozenset[str] | UnknownMembership]:
     """``members_on`` over the dated S&P 500 membership file.
 
@@ -130,8 +148,8 @@ def sp500_members_on(path: Path | None = None) -> Callable[[date], frozenset[str
     from ingestion.altdata.finra_dix import MEMBERSHIP_PATH, Membership
 
     membership = Membership.load(path or MEMBERSHIP_PATH)
-    base = date.fromisoformat(str(membership.base_date))
-    covers_to = date.fromisoformat(str(membership.covers_to))
+    base = _membership_date(membership.base_date, "base_date")
+    covers_to = _membership_date(membership.covers_to, "covers_to")
 
     def members_on(d: date) -> frozenset[str] | UnknownMembership:
         if d < base:
@@ -176,11 +194,65 @@ def _unique_tickers(tickers: Collection[object], what: str) -> list[str]:
     return names
 
 
+_ISO_NAIVE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)?")
+_ISO_WITH_OFFSET = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}(?::?\d{2})?)")
+
+
+def _label_problem(label: object) -> str | None:
+    """Why one index label is not a naive session date, or None (NaT is left to the caller)."""
+    if label is pd.NaT or (isinstance(label, np.datetime64) and np.isnat(label)):
+        return None
+    if isinstance(label, (bool, np.bool_, Number)):
+        return f"numeric label {label!r} ({type(label).__name__})"
+    if isinstance(label, datetime):
+        if label.tzinfo is not None and label.utcoffset() is not None:
+            return f"timezone-aware label {label!r}"
+        return None
+    if isinstance(label, (date, np.datetime64)):
+        return None
+    if isinstance(label, str):
+        text = label.strip()
+        if _ISO_WITH_OFFSET.fullmatch(text):
+            return f"timezone-aware label {label!r}"
+        if _ISO_NAIVE.fullmatch(text):
+            return None
+        return f"label {label!r} is not an ISO YYYY-MM-DD date string"
+    return f"label {label!r} of type {type(label).__name__} is not a session date"
+
+
+def _session_index(index: pd.Index, what: str) -> pd.DatetimeIndex:
+    """Validated naive ``DatetimeIndex`` for ``index``; numbers are refused before any conversion."""
+    if isinstance(index, pd.DatetimeIndex):
+        if index.tz is not None:
+            raise ValueError(f"{what} index is timezone-aware ({index.tz}); pass naive session dates")
+        return index
+    if isinstance(index, (pd.RangeIndex, pd.TimedeltaIndex, pd.PeriodIndex)) or (
+            pd.api.types.is_numeric_dtype(index.dtype) or pd.api.types.is_bool_dtype(index.dtype)):
+        raise ValueError(f"{what} index has numeric or non-date labels ({type(index).__name__}, "
+                         f"dtype {index.dtype}); pass session dates")
+    for label in index:
+        problem = _label_problem(label)
+        if problem is not None:
+            kind = "timezone-aware" if problem.startswith("timezone-aware") else "must be naive session dates"
+            raise ValueError(f"{what} index {kind}: {problem}")
+    try:
+        with warnings.catch_warnings():  # labels are validated above; mixed ISO forms may fall back to dateutil
+            warnings.simplefilter("ignore", UserWarning)
+            idx = pd.DatetimeIndex(pd.to_datetime(list(index)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{what} index must be naive session dates: {exc}") from exc
+    if idx.tz is not None:
+        raise ValueError(f"{what} index is timezone-aware ({idx.tz}); pass naive session dates")
+    return idx
+
+
 def _session_frame(prices: pd.DataFrame, what: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(clean float frame, invalid-price mask) on unique tickers and a sorted naive date index.
 
     Raises ``ValueError`` for non-numeric values, ticker columns that collide
-    after normalization, non-date, NaT or timezone-aware labels and duplicate
+    after normalization, numeric, non-date, NaT or timezone-aware labels
+    (checked before any conversion, see :func:`_session_index`) and duplicate
     sessions. Present-but-unusable prices (non-finite or ``<= 0``) become NaN
     in the clean frame and True in the mask.
     """
@@ -190,16 +262,7 @@ def _session_frame(prices: pd.DataFrame, what: str) -> tuple[pd.DataFrame, pd.Da
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{what} must be numeric: {exc}") from exc
     raw.columns = columns
-    if isinstance(raw.index, pd.DatetimeIndex) and raw.index.tz is not None:
-        raise ValueError(f"{what} index is timezone-aware ({raw.index.tz}); pass naive session dates")
-    try:
-        with warnings.catch_warnings():  # garbage labels fall back to dateutil; the ValueError below is the answer
-            warnings.simplefilter("ignore", UserWarning)
-            idx = pd.DatetimeIndex(pd.to_datetime(raw.index))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{what} index must be naive session dates: {exc}") from exc
-    if idx.tz is not None:
-        raise ValueError(f"{what} index is timezone-aware ({idx.tz}); pass naive session dates")
+    idx = _session_index(raw.index, what)
     if idx.hasnans:
         raise ValueError(f"{what} index has NaT session labels")
     idx = idx.normalize()
