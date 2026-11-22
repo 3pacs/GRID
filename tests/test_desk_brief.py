@@ -388,6 +388,134 @@ def test_market_state_2_stale_inputs_are_not_usable(tmp_path):
     assert "dealer gamma: stale" in sec.lines and any("stale 1" in line for line in sec.lines)
 
 
+# ── provisional market state at the close (#1312, display only) ──────────────
+
+_DECISION = {"variables": {"vix": {"status": "ok", "label": "high", "robust_z": 3.1, "obs_date": "2026-11-18"}},
+             "events": {"within_14d": [{"date": "2026-11-25", "event": "gdp"}]}, "coverage": {"ok": 1},
+             "pending": {"release_surprise": "x"}}
+
+
+def _provisional_rec(day="2026-11-20", **over):
+    rec = {"as_of": day, "rule": "market-state/2", "provisional": True, "decision_use": "display_only",
+           "label": MS.PROVISIONAL_LABEL.format(day=day),
+           "variables": {"hy_spread": {"status": "ok", "label": "low", "robust_z": -2.2, "obs_date": "2026-11-19"},
+                         "dealer_gamma": {"status": "stale"}},
+           "gamma_state": {"status": "stale", "obs_date": "2026-11-19"},
+           "events": {"within_14d": [{"date": "2026-11-27", "event": "provisional-only-event"}]},
+           "coverage": {"ok": 1, "stale": 1}}
+    rec.update(over)
+    return rec
+
+
+def _ms_engine(tmp_path, decision=(), provisional=()):
+    """decision / provisional: (session, computed_at as stored, record) rows."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    eng = create_engine(f"sqlite:///{tmp_path / 'ms.db'}")
+    MS.ensure_table(eng)
+    with eng.begin() as c:
+        for day, at, rec in decision:
+            c.execute(text("INSERT INTO market_state_daily (as_of_date, rule, record, computed_at) VALUES "
+                           "(:d, 'market-state/2', :r, :at)"), {"d": day, "r": json.dumps(rec), "at": at})
+    if provisional:
+        MS.ensure_provisional_table(eng)
+        with eng.begin() as c:
+            for day, at, rec in provisional:
+                c.execute(text("INSERT INTO market_state_provisional (as_of_date, rule, record, computed_at) VALUES "
+                               "(:d, 'market-state/2', :r, :at)"), {"d": day, "r": json.dumps(rec), "at": at})
+    return eng
+
+
+def test_post_close_shows_the_provisional_record_apart_from_the_decision_record(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)],
+                     provisional=[("2026-11-20", "2026-11-20 21:15:30", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "ok" and sec.problems == ()
+    assert "market_state_provisional" in sec.source and sec.source.startswith("griddb market_state_daily")
+    # The decision record's lines come first, exactly as without a provisional record; every line the
+    # provisional record adds is prefixed.
+    assert sec.lines == (
+        "record for session 2026-11-19 (rule market-state/2), computed 2026-11-20T23:15:41Z",
+        "coverage: ok 1",
+        "away from normal: vix high (z +3.10, observed 2026-11-18)",
+        ("PROVISIONAL (display only): record for session 2026-11-20 (rule market-state/2), computed "
+         "2026-11-20T21:15:30Z after the close from the data available then; the session's decision record is "
+         "written the next evening (#1191) and nothing that decides reads this one"),
+        "PROVISIONAL (display only): coverage: ok 1, stale 1",
+        "PROVISIONAL (display only): away from normal: hy_spread low (z -2.20, observed 2026-11-19)",
+        "PROVISIONAL (display only): not usable: dealer_gamma (stale)",
+        "PROVISIONAL (display only): dealer gamma: stale",
+    )
+    alone = S.market_state(_ms_engine(tmp_path / "alone", decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)]),
+                           "post_close", SESSION, POST, PREV)
+    assert sec.lines[:3] == alone.lines and alone.source == "griddb market_state_daily"
+    # The decision record's facts are its own; the provisional record's sit under their own key.
+    assert sec.facts["record_date"] == "2026-11-19" and sec.source_clock == z("2026-11-20T23:15:41Z")
+    assert sec.facts["notable"] == ["vix high (z +3.10, observed 2026-11-18)"]
+    assert sec.facts["events"] == _DECISION["events"] and sec.facts["pending"] == ["release_surprise"]
+    p = sec.facts["provisional"]
+    assert p["record_date"] == "2026-11-20" and p["decision_use"] == "display_only"
+    assert p["table"] == "market_state_provisional" and p["computed_at"] == "2026-11-20T21:15:30Z"
+    assert p["notable"] == ["hy_spread low (z -2.20, observed 2026-11-19)"]
+    assert p["label"].startswith("Provisional, display only")
+    assert "provisional-only-event" not in json.dumps({k: v for k, v in sec.facts.items() if k != "provisional"})
+    # The calendar section copies the decision record's release list, never the provisional one's.
+    cal = S.calendar(SESSION, POST, market_events=sec.facts.get("events"))
+    assert not any("provisional-only-event" in ln for ln in cal.lines)
+    md = B.render_markdown(B.build_brief("post_close", SESSION, POST, [sec], [], as_of_registered=True,
+                                         generated_at=POST))
+    assert "- PROVISIONAL (display only): record for session 2026-11-20" in md
+
+
+def test_provisional_record_not_shown_once_the_decision_record_is_there(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION),
+                                         ("2026-11-20", "2026-11-21 01:00:00", _DECISION)],
+                     provisional=[("2026-11-20", "2026-11-20 21:15:30", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.facts["record_date"] == "2026-11-20" and "provisional" not in sec.facts
+    assert not any("PROVISIONAL" in ln for ln in sec.lines) and sec.source == "griddb market_state_daily"
+
+
+def test_pre_open_never_shows_a_provisional_record(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-18", "2026-11-19 23:15:41", _DECISION)],
+                     provisional=[("2026-11-19", "2026-11-19 21:15:30", _provisional_rec("2026-11-19")),
+                                  ("2026-11-20", "2026-11-20 13:00:00", _provisional_rec())])
+    sec = S.market_state(eng, "pre_open", SESSION, PRE)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-18"
+    assert "provisional" not in sec.facts and not any("PROVISIONAL" in ln for ln in sec.lines)
+    assert sec.source == "griddb market_state_daily" and sec.problems == ()
+
+
+def test_provisional_after_the_brief_clock_is_not_shown(tmp_path):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)],
+                     provisional=[("2026-11-20", "2026-11-21 03:20:01", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert "provisional" not in sec.facts and not any("PROVISIONAL" in ln for ln in sec.lines)
+    assert sec.problems == ()
+
+
+@pytest.mark.parametrize("at, rec, why", [
+    ("2026-11-20 20:59:00", _provisional_rec(), "before the session's close 2026-11-20T21:00:00Z"),
+    ("2026-11-20 21:15:30", _provisional_rec(provisional=False), "does not declare itself provisional"),
+    ("2026-11-20 21:15:30", _provisional_rec(decision_use="decision"), "does not declare itself provisional"),
+    ("2026-11-20 21:15:30", _provisional_rec(as_of="2026-11-19"), "for that session"),
+])
+def test_provisional_record_that_breaks_its_rules_is_a_problem_not_a_line(tmp_path, at, rec, why):
+    eng = _ms_engine(tmp_path, decision=[("2026-11-19", "2026-11-20 23:15:41", _DECISION)],
+                     provisional=[("2026-11-20", at, rec)])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-19" and "provisional" not in sec.facts
+    assert not any("PROVISIONAL" in ln for ln in sec.lines)
+    assert len(sec.problems) == 1 and why in sec.problems[0] and "not shown" in sec.problems[0]
+
+
+def test_provisional_without_any_decision_record_keeps_the_section_empty(tmp_path):
+    eng = _ms_engine(tmp_path, provisional=[("2026-11-20", "2026-11-20 21:15:30", _provisional_rec())])
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "empty" and sec.problems == ("no record computed before the brief's clock",)
+    assert sec.lines and all(ln.startswith("PROVISIONAL (display only): ") for ln in sec.lines)
+    assert set(sec.facts) == {"provisional"}
+
+
 # ── event calendar (the pinned parts in the repo) ────────────────────────────
 
 def test_calendar_unknown_past_forward_part():

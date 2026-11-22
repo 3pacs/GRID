@@ -151,3 +151,50 @@ def test_range_preserves_existing_and_writes_only_missing(engine, capsys):
     assert rows[0] == before
     assert rows[1]["record"]["writer_provenance"]["mode"] == "backfill"
     assert not rows[1]["record"]["writer_provenance"]["readiness"]["forward_qualified"]
+
+
+# ── provisional record at the close (#1312, display only) ────────────────────
+
+def test_provisional_table_is_jsonb_timestamptz_and_provisional_only(engine, monkeypatch, capsys):
+    from datetime import datetime, timezone
+
+    from sqlalchemy.exc import IntegrityError
+
+    monkeypatch.setattr(W, "utc_now", lambda: datetime(2026, 11, 13, 21, 15, tzinfo=timezone.utc))  # after 21:00Z
+    assert W.main(["--provisional", "--json", "--no-refresh"], engine) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["written"] == 1 and out["target_session"] == "2026-11-13"
+    with engine.connect() as c:
+        row = c.execute(text("SELECT record, computed_at, provisional, pg_typeof(record)::text AS rt, "
+                             "pg_typeof(computed_at)::text AS ct FROM market_state_provisional")).mappings().one()
+    assert row["rt"] == "jsonb" and row["ct"] == "timestamp with time zone" and row["provisional"] is True
+    assert row["computed_at"].utcoffset() is not None
+    assert row["record"]["provisional"] is True and row["record"]["decision_use"] == "display_only"
+    assert row["record"]["writer_provenance"]["mode"] == "provisional"
+    assert not inspect(engine).has_table("market_state_daily")
+    with pytest.raises(IntegrityError), engine.begin() as c:
+        c.execute(text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                       "VALUES ('2026-11-12', 'market-state/2', CAST('{}' AS JSONB), FALSE)"))
+    assert W.main(["--provisional", "--json", "--no-refresh"], engine) == 0       # insert-only
+    assert json.loads(capsys.readouterr().out)["already_present"] == 1
+
+
+def test_desk_brief_reads_the_provisional_record_in_its_read_only_transaction(engine, monkeypatch, capsys):
+    from datetime import datetime, timedelta, timezone
+
+    from analysis import desk_brief_sources as S
+    from analysis.desk_brief import SessionTimes
+
+    assert W.main(["--json", "--no-refresh"], engine) == 0                       # decision record for 2026-11-13
+    monkeypatch.setattr(W, "utc_today", lambda: date(2026, 11, 16))
+    monkeypatch.setattr(W, "utc_now", lambda: datetime(2026, 11, 16, 21, 15, tzinfo=timezone.utc))
+    assert W.main(["--provisional", "--json", "--no-refresh"], engine) == 0      # provisional for 2026-11-16
+    capsys.readouterr()
+    session = SessionTimes(date(2026, 11, 16), datetime(2026, 11, 16, 14, 30, tzinfo=timezone.utc),
+                           datetime(2026, 11, 16, 21, 0, tzinfo=timezone.utc))
+    as_of = datetime.now(timezone.utc) + timedelta(seconds=1)   # both rows carry CURRENT_TIMESTAMP
+    sec = S.market_state(engine, "post_close", session, as_of)
+    assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-13"
+    assert sec.facts["provisional"]["record_date"] == "2026-11-16"
+    assert any(line.startswith("PROVISIONAL (display only): record for session 2026-11-16") for line in sec.lines)
+    assert "market_state_provisional" in sec.source and not sec.problems

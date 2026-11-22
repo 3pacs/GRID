@@ -30,6 +30,9 @@ DIX is GRID's ``finra:dix_sp500`` series (``ingestion/altdata/finra_dix.py``). D
 ``dealer_gex_daily`` (``physics/dealer_gex_daily.py``), whose SPY history starts with registered option captures on
 2026-09-26; until it has a baseline's worth of sessions it is reported ``no_baseline`` with its value, and
 ``gamma_state`` gives the regime and flip. Release and earnings surprises are listed in :data:`PENDING`.
+
+A provisional record computed at the session's close (#1312) is display only and has its own table and store
+functions at the end of this module; :func:`store_market_state` refuses one.
 """
 
 from __future__ import annotations
@@ -792,10 +795,98 @@ _INSERT_SQL = {
 
 
 def store_market_state(engine: Engine, state: MarketState, *, replace: bool = False) -> bool:
-    """Write one record. Returns False when a row for that date exists and ``replace`` is False."""
+    """Write one record. Returns False when a row for that date exists and ``replace`` is False.
+
+    A provisional record (writer mode ``provisional``, #1312) is refused before the table is touched: it goes to
+    its own table through :func:`store_provisional_market_state`, never here.
+    """
+    if is_provisional(state):
+        raise ValueError("market_state_daily takes decision records only; a provisional record goes to "
+                         "market_state_provisional (#1312)")
     ensure_table(engine)
     with engine.begin() as conn:
         dialect = "postgresql" if conn.dialect.name == "postgresql" else "other"
         res = conn.execute(_INSERT_SQL[(dialect, bool(replace))],
                            {"d": state.as_of, "r": RECORD_RULE, "rec": json.dumps(state.to_dict())})
+    return bool(res.rowcount)
+
+
+# ── Provisional record at the close (#1312): display only ─────────────────
+#
+# Owner's decision (bring-up plan rev 100): #1191's previous-session rule stays for anything that decides. A record
+# computed at the session's close is for display only, labelled provisional, and kept in its own table, so no reader
+# of market_state_daily can pick one up by accident. Same record rule (compute_market_state is unchanged), earlier
+# clock: the writer (scripts/run_market_state.py --provisional) runs only at or after the session's close in the
+# pinned XNYS calendar, so the record holds the data available then. The only reader is the post-close desk brief
+# (analysis/desk_brief_sources.market_state). tests/test_market_state_provisional_guard.py keeps it that way.
+
+PROVISIONAL_TABLE = "market_state_provisional"
+PROVISIONAL_MODE = "provisional"            # writer_provenance["mode"] of every provisional record
+PROVISIONAL_DECISION_USE = "display_only"
+PROVISIONAL_LABEL = ("Provisional, display only: computed at the close of session {day} from the data available then. "
+                     "The session's decision record is written to market_state_daily the next evening (#1191); "
+                     "nothing that decides reads this one.")
+
+# record JSONB on Postgres (TEXT on SQLite, which would give a JSONB column numeric affinity). computed_at is
+# TIMESTAMPTZ on Postgres, so the clock reads the same whatever the session TimeZone. The CHECK makes a
+# non-provisional row impossible in this table.
+_PROVISIONAL_TABLE_SQL = {
+    "postgresql": text("CREATE TABLE IF NOT EXISTS market_state_provisional ("
+                       " as_of_date DATE PRIMARY KEY,"
+                       " rule TEXT NOT NULL,"
+                       " record JSONB NOT NULL,"
+                       " computed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                       " provisional BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional))"),
+    "other": text("CREATE TABLE IF NOT EXISTS market_state_provisional ("
+                  " as_of_date DATE PRIMARY KEY,"
+                  " rule TEXT NOT NULL,"
+                  " record TEXT NOT NULL,"
+                  " computed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                  " provisional BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional))"),
+}
+
+_PROVISIONAL_INSERT_SQL = {
+    ("postgresql", False): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                                "VALUES (:d, :r, CAST(:rec AS JSONB), TRUE) ON CONFLICT (as_of_date) DO NOTHING"),
+    ("postgresql", True): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                               "VALUES (:d, :r, CAST(:rec AS JSONB), TRUE) ON CONFLICT (as_of_date) DO UPDATE SET "
+                               "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP"),
+    ("other", False): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                           "VALUES (:d, :r, :rec, TRUE) ON CONFLICT (as_of_date) DO NOTHING"),
+    ("other", True): text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
+                          "VALUES (:d, :r, :rec, TRUE) ON CONFLICT (as_of_date) DO UPDATE SET "
+                          "rule = EXCLUDED.rule, record = EXCLUDED.record, computed_at = CURRENT_TIMESTAMP"),
+}
+
+
+def is_provisional(state: MarketState) -> bool:
+    """True for a record the provisional writer made (its provenance says mode ``provisional``)."""
+    return (state.writer_provenance or {}).get("mode") == PROVISIONAL_MODE
+
+
+def provisional_record(state: MarketState) -> dict[str, Any]:
+    """The stored form of a provisional record: the record itself plus its display-only label.
+
+    Raises ValueError unless the provisional writer made it, so the label never lands on a decision record.
+    """
+    if not is_provisional(state):
+        raise ValueError("a provisional record needs writer provenance with mode 'provisional' "
+                         "(scripts/run_market_state.py --provisional)")
+    return {**state.to_dict(), "provisional": True, "decision_use": PROVISIONAL_DECISION_USE,
+            "label": PROVISIONAL_LABEL.format(day=state.as_of.isoformat())}
+
+
+def ensure_provisional_table(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(_PROVISIONAL_TABLE_SQL["postgresql" if conn.dialect.name == "postgresql" else "other"])
+
+
+def store_provisional_market_state(engine: Engine, state: MarketState, *, replace: bool = False) -> bool:
+    """Write one provisional record (insert-only per date; ``replace`` rewrites it). False when one exists."""
+    rec = provisional_record(state)
+    ensure_provisional_table(engine)
+    with engine.begin() as conn:
+        dialect = "postgresql" if conn.dialect.name == "postgresql" else "other"
+        res = conn.execute(_PROVISIONAL_INSERT_SQL[(dialect, bool(replace))],
+                           {"d": state.as_of, "r": RECORD_RULE, "rec": json.dumps(rec)})
     return bool(res.rowcount)

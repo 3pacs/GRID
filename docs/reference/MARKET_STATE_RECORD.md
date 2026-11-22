@@ -56,6 +56,36 @@ Dry runs of the new rule against griddb (2026-11-21, read-only) flag only real g
 
 Rows written before market-state/2 carry `rule = market-state/1` and no `freshness`; in them, `ok` never meant fresh.
 
+## Provisional record at the close (#1312, display only)
+
+The decision record for session D is written the evening after D (`grid-market-state.timer`, 23:15Z on D+1), under
+#1191's previous-session rule. Anything that decides keeps reading that record. The post-close desk brief (22:20
+America/New_York on D) runs before it exists, so a second record, computed at D's close, fills that gap. It is for
+display only (owner's decision, bring-up plan rev 100).
+
+- **Table**: `market_state_provisional` (as_of_date PK, rule, record JSONB, computed_at TIMESTAMPTZ, `provisional
+  BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional)`). It is created by the writer, like `market_state_daily`.
+  `store_market_state` refuses a provisional record, so one never lands in `market_state_daily`.
+- **Record**: `compute_market_state` unchanged: the same rule, at an earlier clock. Each stored record adds
+  `"provisional": true`, `"decision_use": "display_only"` and a `label`. The label says the record was computed at
+  the close from the data available then, and that the session's decision record is written the next evening.
+- **Writer**: `scripts/run_market_state.py --provisional`. It targets today's UTC session, and only at or after
+  that session's `closes` in the pinned XNYS parts (`factory_session_calendar.PINS`). That close is 21:00Z, 20:00Z
+  in summer, or 18:00Z on an early close.
+  - Before the close, or on a day that is not a session, it refuses with exit 2.
+  - It never takes `--from/--to`, `--as-of` or `--require-target-dealer`.
+  - It is insert-only (`--replace` rewrites) and refreshes the FRED vintages first, as the nightly writer does.
+  - Its provenance says `mode: provisional`, `decision_use: display_only`, the session's close and the calendar version.
+  - Timer: `deploy/systemd/grid-market-state-provisional.*.template`, weekdays 21:15Z, `Persistent=false`, with its
+    own lock. Not installed; the operator installs it.
+- **Reader**: only the post-close desk brief, and only while the session's decision record is not there yet
+  (`docs/reference/DESK_BRIEF.md`). Every line starts with `PROVISIONAL (display only)`.
+- **Guard**: `tests/test_market_state_provisional_guard.py`.
+  - Only the writer, this module and `analysis/desk_brief_sources.py` may name the table (docs aside).
+  - Inside those three, only reviewed definitions may name it.
+  - No reader of `market_state_daily` names it.
+  - The decision writer still refuses today and targets the prior session.
+
 ## Variables (v1)
 
 | Group | Variable | Input | Window |

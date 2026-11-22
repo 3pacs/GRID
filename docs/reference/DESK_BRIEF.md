@@ -46,7 +46,7 @@ Rules, each tested (`tests/test_desk_brief.py`):
 
 | Section | Source | Read |
 |---|---|---|
-| Market state | `griddb.market_state_daily` (market-state/1, #1191) | latest row computed before the as-of, read-only transaction. The writer computes a session's record the next evening, so post-close normally shows the previous session and pre-open the one before. Only an older record is a data problem. |
+| Market state | `griddb.market_state_daily` (market-state/1, #1191); post-close also `griddb.market_state_provisional` (#1312, display only) | latest row computed before the as-of, read-only transaction. The writer computes a session's record the next evening, so post-close normally shows the previous session and pre-open the one before. Only an older record is a data problem. Post-close adds the session's provisional record (below). |
 | Event calendar | pinned XNYS and factory-events parts (`analysis/factory_session_calendar.py`, forward parts #1293) | `FactoryEvents.known(day, as_of)` for 5 sessions. A day no part answers is printed as unknown, never quiet. Beside it: the market-state record's FRED release list (GDP, PCE, ...), which has no known-at. |
 | Session in prices | desk-state `desk-evening/1` files | the evening text for the session (post-close) or the one before (pre-open) |
 | GEX lane records | gex-watch `/api/records` (gex-records/1) | every gex-signals trial, the factory slots' feature history, the shadow trader, GEX levels v1: counts and look status as published |
@@ -56,6 +56,29 @@ Rules, each tested (`tests/test_desk_brief.py`):
 | GEX site state | gex-watch `/api/state` | current GEX served or withheld, and why; a withheld reason other than the scheduled stop is a data problem |
 | Desk health | desk-state `desk-health/1` files | the latest health line and its problems |
 | Paper record | D4 #14: `/data/agent-home/anikdang/desk-paper-data/summary.json` (desk-paper-summary/1, written by the paper-record job in 3pacs/gex) | the summary only, never its ledger: per module the look status and counts, and `stats` where the registration allows; LOOK DUE reads "the owner runs the registered look once (not a pass)", NO LOOK reads "description, not evidence"; `errors` and a summary older than 36 h are data problems. Not supplied until the file exists. Format agreed with its owner on 2026-11-21 (side-session note `paper-record-read-format-20261121.md`). |
+
+### Provisional market state (post-close only, display only, #1312)
+
+The post-close brief runs before the session's decision record exists, which is written the next evening. So it
+also reads the record `scripts/run_market_state.py --provisional` computed at the session's close
+(`market_state_provisional`, `docs/reference/MARKET_STATE_RECORD.md`). It shows that record only when all of these hold:
+
+- the brief is post-close;
+- no decision record for the session was computed before the brief's clock;
+- the provisional record was computed after the session's close and before the brief's clock;
+- the record declares `provisional: true`, `decision_use: display_only` and the session's own date.
+
+A row that breaks one of these is a data problem, not a line. A missing table is quiet, as it is until the timer is
+installed.
+
+How it is shown:
+- Every line it adds starts with `PROVISIONAL (display only)` and comes after the decision record's lines.
+- Its facts sit under their own `provisional` key. `record_date`, `notable` and `events` stay the decision
+  record's, and the calendar section copies only the decision record's release list.
+- The section's source names `market_state_provisional` when the record contributes.
+- Pre-open briefs never read it.
+
+Nothing that decides reads the provisional record (`tests/test_market_state_provisional_guard.py`).
 
 Identifiers in ledger SQL come from the reviewed config, are checked against `[a-z_][a-z0-9_]*` and against the
 table's own columns. Every value is a bound parameter. The config holds each registration's look count (`need`);
