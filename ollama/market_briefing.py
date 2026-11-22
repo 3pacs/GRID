@@ -25,7 +25,12 @@ from typing import Any, Callable
 import schedule
 from loguru import logger as log
 from outputs.path_utils import ensure_output_dir
-from store.snapshots import canonical_payload_sha256, strip_binding_flags
+from store.snapshots import (
+    InvalidFeatureFilter,
+    canonical_payload_sha256,
+    producer_feature_filters,
+    strip_binding_flags,
+)
 
 # Output directory for saved briefings
 _BRIEFING_DIR = Path(__file__).parent.parent / "outputs" / "market_briefings"
@@ -1456,52 +1461,56 @@ class MarketBriefingEngine:
                                 else:
                                     s_id, s_payload, c_dt, _ = matched_row
                                     actual_hash = self._canonical_snapshot_hash(s_payload)
-                                    excl_raw = s_payload.get("ineligible_features") or s_payload.get("excluded_features")
-                                    excluded_set: set[tuple[str, Any]] | None = None
-                                    if isinstance(excl_raw, (list, tuple, set, dict)):
-                                        excl_items = excl_raw.keys() if isinstance(excl_raw, dict) else excl_raw
-                                        excluded_set = {
+                                    try:
+                                        elig_items, excl_items = producer_feature_filters(s_payload)
+                                    except InvalidFeatureFilter as filter_exc:
+                                        elig_items, excl_items = None, None
+                                        _withhold_regime(
+                                            "producer_snapshot_invalid_feature_filter",
+                                            snapshot_id=s_id,
+                                            detail=str(filter_exc),
+                                        )
+                                    if excl_items is not None:
+                                        excluded_set: set[tuple[str, Any]] | None = {
                                             pair[0]
                                             for item in excl_items
                                             if (pair := self._normalize_typed_feature_id(item)) is not None
-                                        }
-                                    elig_raw = s_payload.get("eligible_feature_ids") or s_payload.get("eligible_features")
-                                    eligible_set: set[tuple[str, Any]] | None = None
-                                    if isinstance(elig_raw, (list, tuple, set)):
-                                        eligible_set = {
+                                        } or None
+                                        # A declared empty eligibility list means nothing is eligible.
+                                        eligible_set: set[tuple[str, Any]] | None = None if elig_items is None else {
                                             pair[0]
-                                            for item in elig_raw
+                                            for item in elig_items
                                             if (pair := self._normalize_typed_feature_id(item)) is not None
                                         }
-                                    distinct_ids = self._extract_distinct_eligible_feature_ids(
-                                        s_payload.get("features_used"),
-                                        eligible_ids=eligible_set,
-                                        eligible_int_ids=eligible_int_ids,
-                                        excluded_ids=excluded_set,
-                                        as_of_dt=now_utc,
-                                    )
-                                    avail_iso = c_dt.isoformat()
-                                    latest_regime: dict[str, Any] = {
-                                        "state": state_label,
-                                        "confidence": round(regime_row[1], 4),
-                                        "transition_prob": round(regime_row[2], 4),
-                                        "contradictions": strip_binding_flags(regime_row[3]),
-                                        "recommendation": regime_row[4],
-                                        "timestamp": str(regime_row[5]),
-                                        "snapshot_id": s_id,
-                                        "snapshot_hash": actual_hash,
-                                        "snapshot_available_at": avail_iso,
-                                        "producer_snapshot": {
+                                        distinct_ids = self._extract_distinct_eligible_feature_ids(
+                                            s_payload.get("features_used"),
+                                            eligible_ids=eligible_set,
+                                            eligible_int_ids=eligible_int_ids,
+                                            excluded_ids=excluded_set,
+                                            as_of_dt=now_utc,
+                                        )
+                                        avail_iso = c_dt.isoformat()
+                                        latest_regime: dict[str, Any] = {
+                                            "state": state_label,
+                                            "confidence": round(regime_row[1], 4),
+                                            "transition_prob": round(regime_row[2], 4),
+                                            "contradictions": strip_binding_flags(regime_row[3]),
+                                            "recommendation": regime_row[4],
+                                            "timestamp": str(regime_row[5]),
                                             "snapshot_id": s_id,
                                             "snapshot_hash": actual_hash,
-                                            "available_at": avail_iso,
-                                            "regime": self._extract_asserted_regime_label(s_payload),
-                                        },
-                                    }
-                                    if distinct_ids is not None:
-                                        latest_regime["bound_inputs"] = len(distinct_ids)
-                                        latest_regime["eligible_feature_ids"] = distinct_ids
-                                    snapshot["latest_regime"] = latest_regime
+                                            "snapshot_available_at": avail_iso,
+                                            "producer_snapshot": {
+                                                "snapshot_id": s_id,
+                                                "snapshot_hash": actual_hash,
+                                                "available_at": avail_iso,
+                                                "regime": self._extract_asserted_regime_label(s_payload),
+                                            },
+                                        }
+                                        if distinct_ids is not None:
+                                            latest_regime["bound_inputs"] = len(distinct_ids)
+                                            latest_regime["eligible_feature_ids"] = distinct_ids
+                                        snapshot["latest_regime"] = latest_regime
                             elif "features_used" in flags_dict:
                                 # Legacy journal rows list features inline, with no producer
                                 # snapshot to prove them: a hash of the journal row itself
