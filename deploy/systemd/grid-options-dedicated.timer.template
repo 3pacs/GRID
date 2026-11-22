@@ -1,0 +1,25 @@
+# TEMPLATE — NOT INSTALLED. See grid-options-dedicated.service.template.
+# The daily scheduler's in-session options slots after GEM's window (ingestion/scheduler.py
+# DOMESTIC_UTC_SLOTS 16:00Z and 20:00Z), 10 minutes later: in those slots the scheduler ran FRED,
+# yfinance and Form 4 (~8 min) before options, so starting at :10 keeps the Yahoo tail after the
+# scheduler's own yfinance price pull instead of on top of it. The 22:00Z slot is always after the
+# cash close, when schwab mode requests nothing, so it is not scheduled. 20:10Z is 15:10 New York
+# in winter (a ~19 min run ends before the close) and after the close in summer (the run skips).
+# The 09:30 New York morning pull stays in grid-scheduler: GEM's trigger
+# (scripts/gem_daily_capture.py) reads its completion line, so it is never handed off.
+# Holidays and half days are handled by the runner (NYSE calendar, cash close), not the timer.
+# No catch-up after downtime: a late run could start after the close or on top of the next slot.
+# deploy-sync: managed  (deploys reinstall this unit when the template changes; see deploy/systemd/README.md)
+[Unit]
+Description=Run the GRID schwab-mode full-universe options pull in the scheduler's afternoon slots
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:10:00 UTC
+OnCalendar=Mon..Fri *-*-* 20:10:00 UTC
+Persistent=false
+RandomizedDelaySec=0
+AccuracySec=30s
+Unit=grid-options-dedicated.service
+
+[Install]
+WantedBy=timers.target

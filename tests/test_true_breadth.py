@@ -262,7 +262,7 @@ def test_a_zero_previous_close_never_yields_an_infinite_return() -> None:
 def test_randomly_corrupted_panels_only_emit_finite_or_unknown_values() -> None:
     rng = np.random.default_rng(11)
     px = _prices(n_tickers=80, n_days=260, seed=3)
-    values = px.to_numpy()
+    values = px.to_numpy(copy=True)  # writable under copy-on-write (pandas 3)
     for bad in (np.nan, np.inf, -np.inf, 0.0, -1.0):
         mask = rng.random(values.shape) < 0.01
         values[mask] = bad

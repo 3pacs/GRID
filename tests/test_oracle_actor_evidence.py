@@ -88,10 +88,10 @@ def test_real_generation_uses_decision_clock_and_persists_audit(monkeypatch, bas
     monkeypatch.setattr(oe, "_USE_SIGNAL_REGISTRY", False)
     monkeypatch.setattr(oracle, "_get_flow_context", lambda ticker: {})
     monkeypatch.setattr(oracle, "_get_entry_price_reference", lambda ticker: {"price": 100, "status": "measured"})
-    monkeypatch.setattr(oracle, "_get_credit_cycle_routing", lambda: {})
     monkeypatch.setattr(oracle, "_get_journal_feedback", lambda ticker: {})
     monkeypatch.setattr(oracle, "_get_convergence_for_ticker", lambda ticker: [])
-    monkeypatch.setattr(oracle, "_find_anti_signals", lambda signals, direction: [])
+    monkeypatch.setattr(oracle, "_find_anti_signals", lambda signals, direction, ticker=None, **kw: [])
+    monkeypatch.setattr(oracle, "_get_realized_daily_vol", lambda ticker, **kw: 0.01)
     monkeypatch.setitem(sys.modules, "config", SimpleNamespace(settings=SimpleNamespace(SIGNAL_OVERRIDES_ENABLED=False)))
     monkeypatch.setitem(sys.modules, "intelligence.confidence_calibration", SimpleNamespace(calibrate_confidence=lambda value, *args: value))
     # Three neutral context observations ensure the standard model data gate
@@ -110,8 +110,8 @@ def test_real_generation_uses_decision_clock_and_persists_audit(monkeypatch, bas
     assert predictions[0].flow_context["actor_evidence"] is not predictions[1].flow_context["actor_evidence"]
     pred = predictions[0]
     assert pred.direction == "CALL"
-    assert pred.signal_strength == .675
-    assert pred.expected_move_pct == .34  # One .5*.9*1.5 vote, not five.
+    assert pred.signal_strength == 1.5  # One .5*.9*1.5 vote (|w*z|/sqrt(w^2)=1.5), not five (1.5*sqrt(5)).
+    assert pred.expected_move_pct == 1.1  # clamp(1.5/3, 0.25, 1) * 0.01 * sqrt(7 * 252/365) * 100.
     assert pred.coherence == 1.0
     payload = pred.to_dict()
     json.dumps(payload, allow_nan=False)

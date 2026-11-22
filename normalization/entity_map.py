@@ -636,7 +636,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "OPT:IWM:iv_atm": "iwm_iv_atm",
 
     # EIA energy data
+    "EIA:eia_brent_spot": "eia_brent_spot",
     "EIA:eia_crude_price": "eia_crude_price",
+    "EIA:eia_cushing_crude_stocks": "eia_cushing_crude_stocks",
     "EIA:eia_crude_refinery_input": "eia_crude_refinery_input",
     "EIA:eia_distillate_production": "eia_distillate_production",
     "EIA:eia_distillate_stocks": "eia_distillate_stocks",
