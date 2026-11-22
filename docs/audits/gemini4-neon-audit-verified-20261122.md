@@ -1,12 +1,21 @@
 # Gemini 4 Neon audit of GRID, verified (2026-11-22)
 
-On 2026-11-21 Gemini 4 Neon (in Antigravity) audited GRID at origin/main `56a5a86b`. Its claims were then checked line by line by four independent Claude reviewers at `586ba09b`. Every file the claims cite is unchanged between those two commits.
+On 2026-11-21 Gemini 4 Neon (in Antigravity) audited GRID at origin/main `56a5a86b`. Its claims were then checked line by line by four independent Claude reviewers at `586ba09b`.
 
-This ledger records each claim's verdict and fix owner. Line numbers refer to `586ba09b`.
+**Two snapshots.** The claims come from Neon's read of `56a5a86b`. The verdicts, evidence and line numbers in this ledger come from `586ba09b`. Three cited files differ between those commits:
+- `api/routers/chat.py` (modified; cited in 3.10);
+- `docs/reference/FACTORY_PRESCREEN.md` (modified; cited in 5.1);
+- `analysis/desk_brief_sources.py` (added after Neon's snapshot; cited in 2.1–2.3 as later context only).
+
+Every other cited file is identical in both. A verdict therefore describes the code as verified at `586ba09b`, not necessarily the bytes Neon read.
+
+This ledger records each claim's verdict and fix owner.
 
 **Verdicts:** CONFIRMED, PARTLY (some of the claim holds), WRONG, or UNCLEAR (needs a production read).
 
-**Reach** says where the code is called from:
+**Reach** says where the code was called from, as observed in the read-only grid-svr survey of 2026-11-22 ~03:45Z. It describes that moment only. Units were repointed later that day (from 08:03Z), and merges after 10:20Z redeployed several of them, so re-check current state before relying on a reach label.
+
+Reach labels:
 - **live**: a scheduled job or an always-on route.
 - **API**: an on-demand route.
 - **Hermes**: runs inside `grid-hermes`, which is **active**. It has run since at least the 11-15 boot, and every deploy restarts it (most recently 2026-11-22 03:12Z), so Hermes items are live.
@@ -14,6 +23,19 @@ This ledger records each claim's verdict and fix owner. Line numbers refer to `5
 - **dead**: no non-test caller.
 
 **Slice** is the fix branch (`claude/fp-<slice>-20261122`), or the owner if the fix lives elsewhere. Regime and state items go to the regime and state work (#1301).
+
+**Status as of 2026-11-22 ~11:00Z.**
+- **Merged and deployed** (owner's instruction):
+  - #1350 oracle-polarity
+  - #1349 options-recommender
+  - #1373 briefing-diary
+  - #1370 ingest-integrity
+  - #1366 thesis-models
+- **Codex HOLDs on three of those**, closed forward in follow-up branches:
+  - #1373 → `claude/fp-publication-guard-binding-20261122`
+  - #1370 → `claude/fp-ingest-validation-20261122`
+  - #1366 → `claude/fp-thesis-asof-20261122`
+- **Still draft:** every other slice.
 
 ## Scoreboard context
 
@@ -147,7 +169,7 @@ The defects below are reasons the system could not have found or used an edge ev
 | 1.4: the stress index has zeroed concepts | PARTLY | 56–59% of nominal weight is unbound (not ">60%"), with no vol and no curve input. A warning is logged, so it isn't silent. |
 | 1.6: max-pain unit mix | PARTLY | The raw value is about 90%, but the 63-day z-score removes it. Negligible. |
 | 1.7: clustering drops equity and macro series on a 7-day calendar | CONFIRMED | Taken off the daily analytics timer on 11-12; API only now |
-| 2.1–2.3: `market_state_daily` unread; 27-year z-scores; classifier order and pro-cyclicality | CONFIRMED | `desk_brief_sources.py:90` now reads it for display |
+| 2.1–2.3: `market_state_daily` unread; 27-year z-scores; classifier order and pro-cyclicality | CONFIRMED | Later context, not part of Neon's snapshot: `desk_brief_sources.py:90` (added after `56a5a86b`) now reads it for display |
 | 2.4: slope blows up at zero crossings | PARTLY | Max about 36, not ±1e6 |
 | 2.5: DIM_WEIGHTS squared; cosine scale-invariant | PARTLY | Uncentered dimensions inflate similarity (new) |
 | 2.6: autobnn fallback cliff | CONFIRMED | JAX is in no requirements file, so the fallback runs |
