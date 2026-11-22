@@ -17,11 +17,13 @@ def upgrade():
             report_id   UUID NOT NULL,
             ask         TEXT NOT NULL,
             settled     BOOLEAN NOT NULL,
+            source      TEXT NOT NULL CHECK (source IN ('github', 'model')),
             settled_by  UUID,
             how         TEXT NOT NULL DEFAULT '',
             later_seen  INTEGER NOT NULL CHECK (later_seen >= 0),
             checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CHECK (NOT settled OR settled_by IS NOT NULL OR how LIKE 'github:%'),
+            CHECK (source = 'github' OR NOT settled OR settled_by IS NOT NULL),
+            CHECK (source = 'model' OR (settled AND settled_by IS NULL)),
             CHECK (settled OR settled_by IS NULL)
         )""")
     op.execute("CREATE INDEX IF NOT EXISTS idx_agent_report_ask_checks_key ON agent_report_ask_checks (ask_key, checked_at DESC)")

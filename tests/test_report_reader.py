@@ -186,6 +186,7 @@ def test_parse_settle():
     assert RR.parse_settle('{"settled": true, "by": 2, "how": "installed"}', 3) == {"settled": True, "by": 2, "how": "installed"}
     assert RR.parse_settle('{"settled": true, "by": 9}', 3) is None            # points past the list
     assert RR.parse_settle('{"settled": false, "by": null}', 3)["settled"] is False
+    assert RR.parse_settle('{"settled": true, "by": 1, "how": "GitHub: #1 merged"}', 3)["how"] == "#1 merged"
     assert RR.parse_settle("no", 3) is None
 
 
@@ -251,7 +252,7 @@ def test_settle_asks(monkeypatch):
     client = Client('{"settled": true, "by": 1, "how": "installed"}')
     out = RR.settle_asks(eng, client, since=None)
     assert (out["open"], out["checked"], out["settled"], out["no_new_reports"]) == (3, 1, 1, 2)
-    assert eng.rows == [{"ask_key": "a", "report_id": "r-a", "ask": asks[0]["ask"], "settled": True,
+    assert eng.rows == [{"ask_key": "a", "report_id": "r-a", "ask": asks[0]["ask"], "settled": True, "source": "model",
                          "settled_by": "l1", "how": "installed", "later_seen": 1}]
     assert client.calls == 1
     assert RR.settle_asks(eng, None, since=None)["checked"] == 0                    # no model: nothing decided
@@ -275,15 +276,15 @@ def test_merge_asks_settle_on_github(monkeypatch):
     monkeypatch.setattr(RR, "open_asks", lambda engine, since: [ask("m", "Merge #1335: Anik's word.")])
     out = RR.settle_asks(eng, None, since=None)                                         # no model needed
     assert out["settled_on_github"] == 1 and eng.rows[0]["how"] == "github: #1335 merged"
-    assert eng.rows[0]["settled_by"] is None
+    assert eng.rows[0]["settled_by"] is None and eng.rows[0]["source"] == "github"
 
 
 def test_repeated_ask_reopens_and_digest_never_drops_a_model_verdict(monkeypatch):
     from datetime import date, datetime, timezone
 
     class Chk:
-        def __init__(self, settled, how, at):
-            self.settled, self.how, self.later_seen = settled, how, 1
+        def __init__(self, settled, how, at, source="model", by="x"):
+            self.settled, self.how, self.later_seen, self.source, self.settled_by = settled, how, 1, source, by
             self.checked_at = datetime(2026, 11, 22, at, tzinfo=timezone.utc)
 
     def a(key, line, chk, created_hour):
@@ -292,11 +293,12 @@ def test_repeated_ask_reopens_and_digest_never_drops_a_model_verdict(monkeypatch
         x["date"] = x["first_date"] = "2026-11-22"
         return x
 
-    asks = [a("g", "Merge GRID #1335.", Chk(True, "github: #1335 merged", 5), 4),
+    asks = [a("g", "Merge GRID #1335.", Chk(True, "github: #1335 merged", 5, "github", None), 4),
+            a("s", "Merge GRID #1400.", Chk(True, "github: spoofed by the model", 5), 4),     # model text, model source
             a("m", "Install the cron: Anik's word.", Chk(True, "Anik ran the installer", 5), 4),
             a("r", "Deploy at close: Anik's word.", Chk(True, "deployed", 5), 6),       # repeated after the check
             a("o", "Pick a slice: Anik.", None, 4)]
-    assert not RR.is_current(asks[2]) and RR.is_current(asks[1])
+    assert not RR.is_current(asks[3]) and RR.is_current(asks[2])
     monkeypatch.setattr(RR, "open_asks", lambda engine, since: asks)
     monkeypatch.setattr(RR, "coverage", lambda engine, since: [])
 
@@ -307,5 +309,6 @@ def test_repeated_ask_reopens_and_digest_never_drops_a_model_verdict(monkeypatch
     text = RR.digest(E(), date(2026, 11, 22))
     waiting = text.split("Waiting on you")[1].split("Probably settled")[0]
     assert "Deploy at close" in waiting and "Pick a slice" in waiting                   # reopened + never checked
-    assert "Probably settled, check (1):" in text and "Install the cron" in text         # model verdict still shown
+    assert "Probably settled, check (2):" in text and "Install the cron" in text         # model verdicts still shown
+    assert "Merge GRID #1400" in text                                                    # a spoofed 'github:' stays visible
     assert "Settled on GitHub (merged): 1." in text and "Merge GRID #1335" not in text

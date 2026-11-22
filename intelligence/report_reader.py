@@ -277,15 +277,15 @@ ASKS = text(
     "FROM agent_reports r JOIN agent_report_reads x ON x.report_id = r.id "
     "WHERE x.needs_anik AND r.date >= :since ORDER BY r.created_at")
 LATEST_CHECKS = text(
-    "SELECT DISTINCT ON (ask_key) ask_key, settled, settled_by::text AS settled_by, how, later_seen, checked_at "
+    "SELECT DISTINCT ON (ask_key) ask_key, settled, source, settled_by::text AS settled_by, how, later_seen, checked_at "
     "FROM agent_report_ask_checks ORDER BY ask_key, checked_at DESC")
 LATER = text(
     "SELECT r.id::text AS report_id, r.created_at, r.agent, x.summary, x.open_items FROM agent_reports r "
     "JOIN agent_report_reads x ON x.report_id = r.id WHERE r.created_at > :after AND x.how <> 'routine' "
     "ORDER BY r.created_at")
 INSERT_CHECK = text(
-    "INSERT INTO agent_report_ask_checks (ask_key, report_id, ask, settled, settled_by, how, later_seen) "
-    "VALUES (:ask_key, CAST(:report_id AS uuid), :ask, :settled, CAST(:settled_by AS uuid), :how, :later_seen)")
+    "INSERT INTO agent_report_ask_checks (ask_key, report_id, ask, settled, source, settled_by, how, later_seen) "
+    "VALUES (:ask_key, CAST(:report_id AS uuid), :ask, :settled, :source, CAST(:settled_by AS uuid), :how, :later_seen)")
 
 
 def open_asks(engine: Engine, since: date) -> list[dict]:
@@ -388,7 +388,8 @@ def parse_settle(raw: str | None, n: int) -> dict | None:
     by = by if isinstance(by, int) and 1 <= by <= n else None
     if d["settled"] and by is None:
         return None
-    return {"settled": d["settled"], "by": by, "how": str(d.get("how") or "")[:200]}
+    how = re.sub(r"^\s*github\s*:\s*", "", str(d.get("how") or ""), flags=re.I)   # the model cannot claim GitHub's voice
+    return {"settled": d["settled"], "by": by, "how": how[:200]}
 
 
 def settle_asks(engine: Engine, client: Any | None, *, since: date, limit: int = 20, dry_run: bool = False) -> dict:
@@ -405,7 +406,7 @@ def settle_asks(engine: Engine, client: Any | None, *, since: date, limit: int =
         if gh:
             counts["settled_on_github"] += 1
             row = {"ask_key": a["key"], "report_id": a["report_id"], "ask": a["ask"][:1000], "settled": True,
-                   "settled_by": None, "how": gh, "later_seen": chk.later_seen if chk is not None else 0}
+                   "source": "github", "settled_by": None, "how": gh, "later_seen": chk.later_seen if chk is not None else 0}
             out.append(row)
             if not dry_run:
                 with engine.begin() as conn:
@@ -442,7 +443,7 @@ def settle_asks(engine: Engine, client: Any | None, *, since: date, limit: int =
         settled_by = cands[res["by"] - 1].report_id if res["settled"] else None
         counts["settled"] += int(res["settled"])
         row = {"ask_key": a["key"], "report_id": a["report_id"], "ask": a["ask"][:1000], "settled": res["settled"],
-               "settled_by": settled_by, "how": res["how"], "later_seen": len(matches)}
+               "source": "model", "settled_by": settled_by, "how": res["how"], "later_seen": len(matches)}
         out.append(row)
         if not dry_run:
             with engine.begin() as conn:
@@ -461,8 +462,8 @@ def digest(engine: Engine, day: date, max_items: int = 10) -> str:
         unreadable = conn.execute(q, {"d": day}).fetchall()
     asks = open_asks(engine, day - timedelta(days=ASK_WINDOW_DAYS - 1))
     done = lambda a: is_current(a) and a["check"].settled  # noqa: E731
-    on_github = [a for a in asks if done(a) and (a["check"].how or "").startswith("github:")]
-    probably = [a for a in asks if done(a) and not (a["check"].how or "").startswith("github:")]
+    on_github = [a for a in asks if done(a) and a["check"].source == "github" and a["check"].settled_by is None]
+    probably = [a for a in asks if done(a) and not (a["check"].source == "github" and a["check"].settled_by is None)]
     still = [a for a in asks if not done(a)]
     lines = [f"Reports {day.isoformat()}: {c['received']} in, {c['read']} read, {c['unread']} unread, "
              f"{c['unreadable']} unreadable."]
