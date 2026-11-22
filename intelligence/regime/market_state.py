@@ -166,10 +166,11 @@ class _Reads:
     """Known-at reads for one ``as_of``, memoized per series.
 
     ``known_by`` (the provisional record's availability cutoff, #1312) cuts every read at that instant, each on the
-    clock its store keeps: raw_series ``pull_timestamp``, fred_vintages ``fetched_at`` (intervals rebuilt from the
-    versions known then, since ``realtime_end`` is extended in place), dealer_gex_daily
-    ``created_at``, and for resolved ``spy_full`` (dates only) ``release_date`` before the cutoff's UTC day. Without
-    it every read is the decision record's own end-of-``as_of`` read, unchanged.
+    clock its store keeps: raw_series ``pull_timestamp`` (no modeled path), fred_vintages ``fetched_at``
+    (intervals rebuilt from the versions known then, since ``realtime_end`` is extended in place) and
+    dealer_gex_daily ``created_at``. Resolved ``spy_full`` is not read, because ``resolved_series`` has no write
+    clock; SPY comes from ``YF:SPY:close``. Without ``known_by`` every read is the decision record's own
+    end-of-``as_of`` read, unchanged.
     """
 
     def __init__(self, engine: Engine, as_of: date, lookback_days: int, known_by: datetime | None = None) -> None:
@@ -253,10 +254,10 @@ class _Reads:
             from intelligence.regime.state_vector import SPY_CLOSE_LAG, _fetch_resolved_spy_full
 
             start = self.as_of - timedelta(days=self.lookback_days)
-            # resolved_series has dates only: at a cutoff, only rows released on a day that ended before it count.
-            release = ({"release_as_of": self.known_by.date() - timedelta(days=1)}
-                       if self.known_by is not None else {})
-            resolved = _fetch_resolved_spy_full(self.engine, self.as_of, start, **release)
+            # Under a cutoff the resolved feature is not read: resolved_series has no write clock, and the resolver
+            # stamps release_date with the raw pull date, so a row it wrote after the cutoff looks the same as one
+            # written before. YF:SPY:close below has pull timestamps.
+            resolved = None if self.known_by is not None else _fetch_resolved_spy_full(self.engine, self.as_of, start)
             resolved = resolved if resolved is not None else pd.Series(dtype=float)
             prices, basis = resolved, ("spy_full" if len(resolved) else None)
             if len(resolved) < SPY_NEED_OBS:
@@ -884,11 +885,13 @@ PROVISIONAL_LABEL = ("Provisional, display only: computed from the inputs GRID h
                      "market_state_daily the next evening (#1191); nothing that decides reads this one.")
 # How each read is cut at the provisional record's availability cutoff (compute_market_state(known_by=...)).
 CUTOFF_READS = {
-    "raw_series": "pull_timestamp at or before the cutoff; a modeled known-at date counts once its UTC day has ended",
+    "raw_series": "pull_timestamp at or before the cutoff only: a modeled known-at date never admits a row first "
+                  "pulled later; a release override still delays one until its UTC day has ended",
     "fred_vintages": "fetched_at at or before the cutoff; each version's interval rebuilt from the versions known "
                      "then (the stored realtime_end is extended in place by later refreshes and is not read)",
     "dealer_gex_daily": "created_at at or before the cutoff; a row without one is not known",
-    "resolved_series": "release_date before the cutoff's UTC day (the table keeps no finer write clock)",
+    "resolved_series": "not read: it keeps no write clock (the resolver stamps release_date with the raw pull "
+                       "date), so SPY comes from YF:SPY:close by pull_timestamp, the record's own fallback basis",
 }
 # The table is created by the reviewed migration migrations/versions/market_state_prov_20261122.py; production
 # never runs CREATE TABLE for it. This copy exists for SQLite tests only and keeps the same columns

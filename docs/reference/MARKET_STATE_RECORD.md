@@ -76,13 +76,13 @@ display only (owner's decision, bring-up plan rev 100).
 
   | Read | Cut |
   |---|---|
-  | `raw_series` (`read_window_known_at(as_of_ts=)`) | `pull_timestamp` at or before the cutoff. A modeled known-at date or a release override counts only once its UTC day has ended. |
+  | `raw_series` (`read_window_known_at(as_of_ts=)`) | `pull_timestamp` at or before the cutoff, and nothing else. There is no modeled path: a modeled known-at date never admits a row GRID first pulled later. A release override still delays a row until its UTC day has ended. |
   | `fred_vintages` (`load(fetched_by=)`) | `fetched_at` at or before the cutoff. Each version's live interval is rebuilt from the versions known then: it ends the day before the next one, or is open. The stored `realtime_end` is never read, because a later refresh extends it in place. |
   | `dealer_gex_daily` | `created_at` at or before the cutoff; a row without one is not known |
-  | resolved `spy_full` | `release_date` before the session's day, because `resolved_series` has no finer write clock |
+  | resolved `spy_full` | not read. `resolved_series` has no write clock (the resolver stamps `release_date` with the raw pull date), so SPY comes from `YF:SPY:close` by `pull_timestamp`. That is the record's own fallback basis, and `spy_basis` names it. |
 
-  The last row has a cost. When the resolver released the previous session's SPY close on the session's own
-  day, the provisional SPY trend reads one session older, and so `stale`. That is honest, but it is a gap.
+  A read with no clock that can prove GRID held a row by the cutoff is not used. A later quarantine
+  (`pull_status`) still removes a row; it adds nothing that arrived after the close.
 - **Record**: each stored record adds the following:
   - `"provisional": true` and `"decision_use": "display_only"`.
   - A `label`: computed from the inputs GRID held at the close, with nothing that arrived later; the decision

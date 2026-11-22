@@ -181,16 +181,19 @@ def test_raw_reads_cut_at_the_instant_by_pull_and_by_modeled_lag(engine):
     assert cut[-1].obs_date == PREV and cut[-1].value not in (79.0, 80.0)
     assert len(day) == len(cut) + 1 and day[:-2] == cut[:-1]
     assert (late_cut[-1].obs_date, late_cut[-1].value) == (DAY, 80.0)
-    # Modeled lag (backfilled history): a date-only clock counts by the end of its day, never earlier.
+    # A row first pulled after the cutoff (backfilled VIX3M, pulled 11-21) is not admitted by its modeled known-at
+    # date (11-19) at any cutoff: GRID did not hold it (Codex HOLD on #1360 at 3a35b6ee). The end-of-day read, the
+    # decision record's, still admits it by the modeled lag.
     _raw(engine, [(date(2026, 11, 18), 1.0, "2026-11-21 06:00:00")], series="CBOE:VIX3M")
     with engine.connect() as c:
         def known(ts):
             return [o.obs_date for o in read_window_known_at(c, "CBOE:VIX3M", as_of=DAY, lag=lag, source="CBOE",
                                                              as_of_ts=ts)]
-        assert known(z("2026-11-19T23:59:59Z")) == []                 # modeled known 11-19: not before its end
-        assert known(z("2026-11-20T00:00:00Z")) == [date(2026, 11, 18)]
-        assert [o.obs_date for o in read_window_known_at(c, "CBOE:VIX3M", as_of=PREV, lag=lag,
-                                                         source="CBOE")] == [date(2026, 11, 18)]
+        assert known(z("2026-11-19T23:59:59Z")) == []
+        assert known(z("2026-11-20T00:00:00Z")) == []
+        assert known(z("2026-11-20T23:59:59Z")) == []
+        modeled = read_window_known_at(c, "CBOE:VIX3M", as_of=PREV, lag=lag, source="CBOE")
+        assert [(o.obs_date, o.known_at_basis) for o in modeled] == [(date(2026, 11, 18), "modeled_lag")]
     with pytest.raises(ValueError):
         read_window_known_at(engine.connect(), "CBOE:VIX", as_of=DAY, lag=lag, as_of_ts=datetime(2026, 11, 20))  # noqa: DTZ001
 
@@ -285,18 +288,65 @@ def test_dealer_rows_cut_at_their_creation_time_and_unclocked_rows_are_not_known
     assert [str(d) for d in M._Reads(engine, DAY, 30).gex_rows().index] == ["2026-11-18", "2026-11-19", "2026-11-20"]
 
 
-def test_resolved_spy_counts_only_rows_released_before_the_session_day(monkeypatch):
-    seen = {}
-
-    def fake(engine, as_of, start, **kw):
-        seen.update(as_of=as_of, **kw)
+def test_resolved_spy_is_not_read_under_a_cutoff(engine, monkeypatch):
+    """resolved_series keeps no write clock (the resolver stamps release_date with the raw pull date), so a row it
+    wrote after the cutoff cannot be told apart. Under a cutoff SPY comes from YF:SPY:close by pull time."""
+    seen = []
 
     import intelligence.regime.state_vector as SV
 
-    monkeypatch.setattr(SV, "_fetch_resolved_spy_full", fake)
-    reads = M._Reads(create_engine("sqlite://"), DAY, 30, known_by=CLOSE)
-    reads.spy()
-    assert seen == {"as_of": DAY, "release_as_of": PREV}
-    seen.clear()
-    M._Reads(create_engine("sqlite://"), DAY, 30).spy()
-    assert seen == {"as_of": DAY}                               # the decision record's call is unchanged
+    monkeypatch.setattr(SV, "_fetch_resolved_spy_full", lambda engine, as_of, start, **kw: seen.append(kw) or None)
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO source_catalog (id, name) VALUES (3, 'yfinance')"))
+    rows = [(d, 600.0 + i * 0.1, "2026-11-20 05:15:00") for i, d in enumerate(_bdays(PREV, 30))]
+    rows.append((DAY, 999.0, "2026-11-20 20:30:00"))            # pulled before the close: held at the close
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                       "pull_status) VALUES ('YF:SPY:close', 3, :d, :ts, :v, '{}', 'SUCCESS')"),
+                  [{"d": d.isoformat(), "ts": ts, "v": v} for d, v, ts in rows]
+                  + [{"d": PREV.isoformat(), "ts": "2026-11-20 22:00:00", "v": 1.0}])   # a re-pull after the close
+    reads = M._Reads(engine, DAY, 60, known_by=CLOSE)
+    spy = reads.spy()
+    assert seen == [] and reads.spy_basis == "YF:SPY:close"
+    assert spy.index[-1] == DAY and spy.loc[PREV] != 1.0
+    M._Reads(engine, DAY, 60).spy()
+    assert seen == [{}]                                          # the decision record's call is unchanged
+
+
+# ── a row GRID first pulled after the cutoff (Codex HOLD on #1360 at 3a35b6ee) ────────────────────────────────
+
+def test_a_series_first_pulled_after_the_cutoff_is_not_read_even_if_modeled_known_earlier(engine):
+    lag = M.LAGS["CBOE:VIX3M"]                                   # next business day
+    history = [(d, 18.0, "2026-11-20 22:00:00") for d in _bdays(PREV, 200)]      # backfilled after the close
+    _raw(engine, history, series="CBOE:VIX3M")
+    with engine.connect() as c:
+        assert read_window_known_at(c, "CBOE:VIX3M", as_of=DAY, lag=lag, source="CBOE", as_of_ts=CLOSE) == []
+        # The end-of-day read (the decision record) admits all of it: pulled on its own day, or modeled.
+        assert len(read_window_known_at(c, "CBOE:VIX3M", as_of=DAY, lag=lag, source="CBOE")) == 200
+
+
+def test_a_late_backfill_does_not_change_the_provisional_record(engine, monkeypatch, capsys):
+    at_close = _provisional(engine, monkeypatch, capsys, "2026-11-20T21:15:00Z")
+    assert at_close["variables"]["vix_term"]["status"] == "unavailable"
+    _raw(engine, [(d, 18.0 + (i % 5) * 0.2, "2026-11-20 22:00:00") for i, d in enumerate(_bdays(PREV, 300))],
+         series="CBOE:VIX3M")                                    # VIX3M history backfilled an hour after the close
+    late = _provisional(engine, monkeypatch, capsys, "2026-11-20T23:30:00Z", "--replace")
+    assert _facts(late) == _facts(at_close)
+    assert "CBOE:VIX3M" not in late["source_lineage"]["raw_series"] or \
+        late["source_lineage"]["raw_series"]["CBOE:VIX3M"]["rows"] == 0
+    # The decision record (no cutoff) reads the backfill.
+    assert M.compute_market_state(engine, DAY, calendar={}).to_dict()["variables"]["vix_term"]["status"] == "ok"
+
+
+def test_a_row_pulled_before_the_cutoff_counts_and_a_release_override_still_delays_it(engine):
+    """Pull evidence admits a row GRID held at the cutoff, as in the decision record, even when its modeled
+    known-at date is later. A release override (an official embargo) still keeps it out until its day has ended."""
+    nbd = M.LAGS["CBOE:VIX"]
+    _raw(engine, [(DAY, 21.0, "2026-11-20 20:30:00")], series="CBOE:VIX3M")      # modeled known 11-23
+    embargo = PublicationLag(1, "calendar", "x", release_overrides=((date(2026, 11, 2), date(2026, 11, 21)),))
+    _raw(engine, [(date(2026, 11, 2), 4.2, "2026-11-20 12:00:00")], series="UNRATE")   # an early pull
+    with engine.connect() as c:
+        held = read_window_known_at(c, "CBOE:VIX3M", as_of=DAY, lag=nbd, source="CBOE", as_of_ts=CLOSE)
+        assert [(o.obs_date, o.value, o.known_at_basis) for o in held] == [(DAY, 21.0, "pulled")]
+        assert read_window_known_at(c, "UNRATE", as_of=DAY, lag=embargo, source="CBOE", as_of_ts=CLOSE) == []
+        assert read_window_known_at(c, "UNRATE", as_of=DAY, lag=embargo, source="CBOE") == []

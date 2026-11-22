@@ -509,11 +509,12 @@ def read_window_known_at(
     Each returned :class:`Observation` has ``known_at`` set and
     ``known_at_basis`` = ``"pulled"`` or ``"modeled_lag"``.
 
-    ``as_of_ts`` (timezone-aware, before the end of ``as_of``'s UTC day) moves the knowledge cutoff from the end of
-    ``as_of`` to that instant; observation dates are still bounded by ``as_of``. A vintage counts as pulled only when
-    its ``pull_timestamp`` (naive taken as UTC) is at or before ``as_of_ts``. A date-only clock (a modeled known-at
-    date, a release override) counts only once that whole UTC day has ended by ``as_of_ts``, since the time of day
-    is not known. Without ``as_of_ts`` the result is exactly the end-of-day read above.
+    ``as_of_ts`` (timezone-aware, before the end of ``as_of``'s UTC day) answers "what GRID held at that instant";
+    observation dates are still bounded by ``as_of``. An observation counts only when one of its vintages has a
+    ``pull_timestamp`` (naive taken as UTC) at or before ``as_of_ts``, and the value is the latest such vintage.
+    There is no modeled path: a modeled known-at date never admits a row GRID first pulled later. A release
+    override can still delay a row: it counts only once the override's whole UTC day has ended by ``as_of_ts``,
+    since the time of day is not known. Without ``as_of_ts`` the result is exactly the end-of-day read above.
     """
     if as_of_ts is None:
         def pulled_by(ts: datetime | None, pull_day: date | None) -> bool:
@@ -572,7 +573,9 @@ def read_window_known_at(
             known = max(d, known, release_overrides.get(d, date.min))
             out.append(Observation(series_id, d, v, ts, s, known, "pulled"))
             known_sources.update(p[2] for p in proven if p[2] is not None)
-        elif modeled_known is not None and known_by(modeled_known):
+        elif as_of_ts is None and modeled_known is not None and known_by(modeled_known):
+            # End-of-day reads only. Under as_of_ts every vintage here was pulled after the cutoff, so GRID did not
+            # hold the observation then, whatever its modeled publication date (#1312).
             v, ts, s, _ = pulled[-1]  # earliest pulled vintage
             out.append(Observation(series_id, d, v, ts, s, modeled_known, "modeled_lag"))
             # SQL does not order sources tied at the earliest timestamp.
