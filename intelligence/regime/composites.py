@@ -13,6 +13,9 @@ pass series aligned to when each value was known, e.g. via
 ``store.observations.read_window_known_at``. Otherwise a reading for day D uses values
 not yet public on D.
 
+The one-factor Kalman filter (PBWG) assumes every channel loads on the factor with the same sign;
+there is no per-channel sign map.
+
 Implements 8 PIT-clean, mathematically grounded composite estimators designed to
 capture latent trends and non-linear regime particulars that produce oversized
 convexity across specific investment vehicles:
