@@ -31,7 +31,9 @@ def _load(source: str | None = None):
              "_chat_kwargs_without_thinking", "_warn_throttled", "_run_bounded",
              "note_repair_failure", "note_repair_recovered",
              # Held/recovered failed-list filter (2026-11-08).
-             "_recovered_after", "_held_source_names"}
+             "_recovered_after", "_held_source_names",
+             # Guest pull_log runs with no repair route (2026-11-21).
+             "_report_unrouted_failures"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
     clock = SimpleNamespace(now=0.0)
@@ -58,7 +60,11 @@ def _load(source: str | None = None):
                  "_REPEATED_FAILURES": {}, "_REPAIR_RECOVERED_AT": {},
                  "REPEATED_FAILURE_THRESHOLD": 3,
                  "REPEATED_FAILURE_COOLDOWN_SECONDS": 86400.0,
-                 "REPEATED_FAILURE_MAX_COOLDOWN_SECONDS": 604800.0}
+                 "REPEATED_FAILURE_MAX_COOLDOWN_SECONDS": 604800.0,
+                 # The scheduler-derived guest list; none of these rows is a guest.
+                 "_guest_pull_log_names": lambda: frozenset({"smart:finra_dix"}),
+                 "_UNROUTED_FAILURES_REPORTED": {},
+                 "UNROUTED_GUEST_REASON": "synthetic no-route reason"}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec",
                  flags=__future__.annotations.compiler_flag), namespace)
     return namespace, clock

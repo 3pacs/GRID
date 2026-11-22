@@ -12,11 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_role
 from api.dependencies import get_db_engine
 from intelligence.report_reader import KINDS, coverage
 
-router = APIRouter(prefix="/api/v1/agent-reports", tags=["agent-reports"], dependencies=[Depends(require_auth)])
+# Agent reports carry internal operations detail and the owner's own tasks: admin only, never contributors.
+router = APIRouter(prefix="/api/v1/agent-reports", tags=["agent-reports"], dependencies=[Depends(require_role("admin"))])
 
 _FILTERS = {"agent": "r.agent = :agent", "kind": "x.kind = :kind", "needs_anik": "x.needs_anik = :needs_anik"}
 

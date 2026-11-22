@@ -273,6 +273,49 @@ and $10M. Those years are before the discovery start and are read only for a sig
 No Tiingo key was set for any of this and nothing was asked of the provider. No signal was run. The old
 in-place files under `panel/` are still there beside the generation; nothing reads them.
 
+## The first run file (2026-11-22, not run)
+
+`docs/research/cross-section-runs/xs-smallcap-published-effects-1-20261120.json`. One run, four published
+effects that need only daily prices and no sector, eight modules judged together:
+
+| Signal | Rule | Fractions |
+|---|---|---|
+| `reversal_21d` | Return over the last 21 sessions, sign reversed | Top and bottom 10 % and 20 % |
+| `reversal_5d` | Return over the last 5 sessions, sign reversed | 10 % and 20 % |
+| `momentum_12_1` | Return over 231 sessions, skipping the last 21 | 10 % and 20 % |
+| `near_52w_high` | Last close against the highest close of 252 sessions | 10 % and 20 % |
+
+- Window 2016-01-04 to 2022-12-29, pooled ranking, one-session holds (`close_1d`), floors $2 and $1M a day
+  (owner decision, 2026-11-20), 10,000 draws in blocks of 10 sessions, alpha 0.05.
+- One run, not four, so the step-down test counts all eight modules together. Industry momentum is left
+  out: it needs sectors.
+- Cost 25 bp a side (owner decision, 2026-11-20; a stand-in, see below). The factory charges four sides
+  times turnover each night, so a module's nightly cost is 100 bp times the share of names it replaces.
+  Turnover on small caps has not been measured. On S&P 500 members the monthly reversal replaced 23 % of
+  its names a night and the 52-week high 11 % (queue runs of 2026-11-19); at those rates the cost here
+  would be about 23 bp and 11 bp a night. The 5-day reversal turns over faster than the monthly one. A
+  module passes only when its gross spread is larger than its cost. That is a high bar: the monthly
+  reversal earned about 4 bp a night gross on index members. So the gross spreads are the more informative
+  part of this run: they say whether an effect exists in small caps before cost. A hold of many sessions,
+  which small-cap costs call for, needs a module kind the factory does not have yet.
+- `prior_dev_looks` names the earlier development looks at these effects on S&P 500 members, and the spread
+  estimate made on these bars for the cost figure (no signal ranked, no outcome read).
+- It is meant for the sealed generation `g-55610e7331c3126c`. On that export the factory refuses any window
+  that starts before 2016-01-04.
+- Read any result beside the store's known gap: about a quarter of the companies that ended from 2016 have
+  no prices here, which flatters a rule that buys fallen names. Reversal is such a rule. The price and
+  volume floors do not correct for this: they decide which of the companies present may be ranked, and say
+  nothing about the ones that are absent.
+
+The file validates on main's factory (eight modules, no sector use). It has not been run on any ledger,
+scratch or real. Review accepted it as a file to register, not as permission to run. Before a run:
+
+- the owner's word for that run;
+- the data's provenance stated beside the result: the generation and its manifest hash, the pull it came
+  from, and that the survey of the real store was made by its builder and not checked independently;
+- the cost's provenance stated beside the result: 25 bp a side is an assumption from a rough estimate on
+  daily bars, not a measurement on tickets.
+
 ## What is not done
 
 - **The factory change is merged (PR #1291, 2026-11-21).** Floors are optional run-file fields; a
