@@ -52,6 +52,7 @@ from sqlalchemy.engine import Engine
 
 from analysis.sec_valuation import trailing_pe
 from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
+from ingestion.market_calendar import trading_days_between
 from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
@@ -61,6 +62,50 @@ from store.journal_qualification import DECISION_JOURNAL, non_provisional_journa
 EVALUATION_WINDOW_DAYS = 5
 STALE_HOURS = 72  # data older than this gets downweighted
 DEFAULT_ACCURACY = 0.50  # start at coin-flip until we have history
+
+# Fed Net Liquidity 30-day change bands (millions USD; WALCL/WTREGEN are millions,
+# RRPONTSYD is converted from billions via RRPONTSYD_TO_MILLIONS).
+FED_LIQ_MODERATE_MILLIONS = 50_000.0   # $50B
+FED_LIQ_STRONG_MILLIONS = 100_000.0    # $100B
+FED_LIQ_BAND_STEP_MILLIONS = 50_000.0  # $50B linear ramp width
+
+# Options-derived models (dealer_gamma, vanna_charm) freshness gate
+OPTIONS_MAX_AGE_TRADING_DAYS = 2
+
+# News sentiment scoring thresholds
+NEWS_MIN_DIRECTIONAL_ARTICLES = 5
+NEWS_DEFAULT_ARTICLE_CONF = 0.5
+NEWS_SCORE_SCALE = 100.0
+
+# Social sentiment contrarian scoring thresholds
+SOCIAL_SENTIMENT_MAX_SCORE = 80.0
+SOCIAL_SENTIMENT_EXTREME_RATIO = 2.0
+
+# CFTC COT positioning thresholds (net speculative contracts) and asset-class weights
+CFTC_EXTREME_NET_CONTRACTS = 100_000.0
+CFTC_MODERATE_NET_CONTRACTS = 50_000.0
+CFTC_VIX_EXTREME_CONTRACTS = 50_000.0
+CFTC_VIX_MODERATE_CONTRACTS = 20_000.0
+CFTC_EQUITY_WEIGHT = 2.0
+CFTC_SAFE_HAVEN_WEIGHT = 1.0
+CFTC_VIX_WEIGHT = 1.0
+
+# Valuation compression thresholds
+VALUATION_MAX_PE = 500.0
+VALUATION_MIN_TICKERS = 3
+VALUATION_PE_CHANGE_MODERATE_PCT = 5.0
+VALUATION_PE_CHANGE_STRONG_PCT = 10.0
+VALUATION_MIN_EPS_GROWTH_PCT = 0.0  # EPS growth must be > 0% for earnings-driven compression
+
+# Snapshot summary limits
+TOP_RISK_FACTORS_LIMIT = 3
+
+
+def _trading_days_age(sig_date: date, as_of: date) -> int:
+    """Count US equity trading days elapsed strictly after ``sig_date`` through ``as_of``."""
+    if sig_date >= as_of:
+        return 0
+    return len(trading_days_between(sig_date + timedelta(days=1), as_of))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -115,9 +160,11 @@ def _verdict(
 def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
     """Fed net liquidity: balance sheet minus TGA minus reverse repo.
 
-    Logic: 30-day change in net liquidity.
-    Existing arithmetic compares millions to 50/100, i.e. $50M/$100M.
-    These bands are preserved here; recalibration requires a separate review.
+    Logic: 30-day change in net liquidity (all inputs converted to millions USD:
+    WALCL and WTREGEN are FRED millions; RRPONTSYD is FRED billions scaled by
+    RRPONTSYD_TO_MILLIONS). Thresholds are ±$50B (±50,000M) moderate and
+    ±$100B (±100,000M) strong. Fails closed if any current or 30-day baseline
+    component is missing.
 
     Score scales linearly within bands.  Confidence from data freshness
     and historical accuracy.
@@ -140,15 +187,28 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                 "ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
 
-            if not bs:
+            missing_cur = [
+                name for name, row in (("WALCL", bs), ("RRPONTSYD", rr), ("WTREGEN", tga))
+                if not row or row[0] is None
+            ]
+            if missing_cur:
+                log.warning(
+                    "Fed liquidity: missing current component(s) {m} — failing closed",
+                    m=", ".join(missing_cur),
+                )
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 0, "no data", "", "No Fed balance sheet data available.",
+                    0, 0, "no data", "",
+                    f"Missing current Fed liquidity component(s): {', '.join(missing_cur)}.",
                     status="no_data", historical_accuracy=accuracy)
 
             # RRPONTSYD is billions; WALCL/WTREGEN are millions
-            net_liq = float(bs[0]) - (float(rr[0]) * RRPONTSYD_TO_MILLIONS if rr else 0) - (float(tga[0]) if tga else 0)
+            net_liq = float(bs[0]) - float(rr[0]) * RRPONTSYD_TO_MILLIONS - float(tga[0])
             pull_ts = bs[1] if bs[1] else datetime.now(timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - pull_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600 if hasattr(pull_ts, 'replace') else None
+            if hasattr(pull_ts, "replace"):
+                ts_utc = pull_ts.astimezone(timezone.utc) if pull_ts.tzinfo else pull_ts.replace(tzinfo=timezone.utc)
+                age_hours = (datetime.now(timezone.utc) - ts_utc).total_seconds() / 3600
+            else:
+                age_hours = None
 
             # 30-day prior
             bs_30 = conn.execute(text(
@@ -170,31 +230,44 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                 "ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
 
-            if not bs_30:
+            missing_30 = [
+                name for name, row in (("WALCL", bs_30), ("RRPONTSYD", rr_30), ("WTREGEN", tga_30))
+                if not row or row[0] is None
+            ]
+            if missing_30:
+                log.warning(
+                    "Fed liquidity: missing 30d baseline component(s) {m} — failing closed",
+                    m=", ".join(missing_30),
+                )
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 20, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
-                    "need 30d history", "Current net liquidity known but no 30-day baseline.",
+                    0, 0, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
+                    "need 30d history",
+                    f"Current net liquidity known but missing 30-day baseline ({', '.join(missing_30)}).",
                     data_age_hours=age_hours, historical_accuracy=accuracy, status="stale")
 
             # RRPONTSYD is billions; WALCL/WTREGEN are millions
-            net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) * RRPONTSYD_TO_MILLIONS if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
+            net_liq_30 = float(bs_30[0]) - float(rr_30[0]) * RRPONTSYD_TO_MILLIONS - float(tga_30[0])
             change = net_liq - net_liq_30
 
-            # Score: linear scale within bands
-            if change >= 100:
-                score = 60 + min(20, (change - 100) / 50 * 20)
-            elif change >= 50:
-                score = 30 + (change - 50) / 50 * 30
-            elif change >= -50:
-                score = change / 50 * 25
-            elif change >= -100:
-                score = -30 + (change + 50) / 50 * -30
+            # Score: odd-symmetric linear scale within ±$50B / ±$100B bands (millions USD)
+            if change >= FED_LIQ_STRONG_MILLIONS:
+                score = 60 + min(
+                    20, (change - FED_LIQ_STRONG_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 20
+                )
+            elif change >= FED_LIQ_MODERATE_MILLIONS:
+                score = 30 + (change - FED_LIQ_MODERATE_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 30
+            elif change > -FED_LIQ_MODERATE_MILLIONS:
+                score = change / FED_LIQ_MODERATE_MILLIONS * 25
+            elif change > -FED_LIQ_STRONG_MILLIONS:
+                score = -30 - (abs(change) - FED_LIQ_MODERATE_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 30
             else:
-                score = -60 - min(20, (abs(change) - 100) / 50 * 20)
+                score = -60 - min(
+                    20, (abs(change) - FED_LIQ_STRONG_MILLIONS) / FED_LIQ_BAND_STEP_MILLIONS * 20
+                )
 
             # Confidence: base 60%, +20% if data fresh, scale by accuracy
             conf_base = 60
-            conf_fresh = 20 if (age_hours and age_hours < 24) else 0
+            conf_fresh = 20 if (age_hours is not None and age_hours < 24) else 0
             conf_accuracy = accuracy * 20  # 0-20% from track record
             confidence = min(95, conf_base + conf_fresh + conf_accuracy)
 
@@ -203,11 +276,11 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                 score, confidence,
                 data_point=(f"{format_liquidity_usd(change, unit='millions_usd', signed=True)} "
                             f"30d change (current {format_liquidity_usd(net_liq, unit='millions_usd')})"),
-                threshold="current scoring bands: bearish < -$50M, bullish > +$50M, strong at ±$100M",
+                threshold="bearish < -$50B (-$50,000M), bullish > +$50B (+$50,000M), strong at ±$100B (±$100,000M)",
                 reasoning=(
                     f"Net liquidity {'rose' if change > 0 else 'fell' if change < 0 else 'was unchanged by'} "
                     f"{format_liquidity_usd(abs(change), unit='millions_usd')} over 30 days. "
-                    f"{'Expanding liquidity supports risk assets.' if change > 50 else 'Contracting liquidity pressures risk assets.' if change < -50 else 'Liquidity roughly flat — no strong directional signal.'}"
+                    f"{'Expanding liquidity supports risk assets.' if change >= FED_LIQ_MODERATE_MILLIONS else 'Contracting liquidity pressures risk assets.' if change <= -FED_LIQ_MODERATE_MILLIONS else 'Liquidity roughly flat — no strong directional signal.'}"
                 ),
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
@@ -248,7 +321,33 @@ def _score_dealer_gamma(engine: Engine, accuracy: float) -> dict:
             pcr = float(row[0])
             spot = float(row[1]) if row[1] else None
             sig_date = row[2]
-            age_hours = (datetime.now(timezone.utc).date() - sig_date).days * 24 if sig_date else None
+            if isinstance(sig_date, datetime):
+                sig_date = sig_date.date()
+            today = datetime.now(timezone.utc).date()
+            if sig_date is None:
+                log.warning("Dealer gamma: missing signal_date — marking stale and excluding from score")
+                return _verdict(
+                    "dealer_gamma", "Options Sentiment (PCR)",
+                    0, 0, f"stale SPY PCR = {pcr:.2f} (unknown date)",
+                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+                    "SPY options signal_date is missing; excluded from score.",
+                    data_age_hours=None, historical_accuracy=accuracy, status="stale",
+                )
+            age_hours = (today - sig_date).days * 24
+            trading_age = _trading_days_age(sig_date, today)
+            if trading_age > OPTIONS_MAX_AGE_TRADING_DAYS:
+                log.warning(
+                    "Dealer gamma stale: signal_date={sd}, trading_days_old={td} > {m}",
+                    sd=sig_date, td=trading_age, m=OPTIONS_MAX_AGE_TRADING_DAYS,
+                )
+                return _verdict(
+                    "dealer_gamma", "Options Sentiment (PCR)",
+                    0, 0, f"stale SPY PCR = {pcr:.2f} (as of {sig_date})",
+                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+                    f"SPY options data is {trading_age} trading days old (last signal {sig_date}, "
+                    f"max {OPTIONS_MAX_AGE_TRADING_DAYS}); excluded from score.",
+                    data_age_hours=age_hours, historical_accuracy=accuracy, status="stale",
+                )
 
             # Contrarian scoring
             if pcr < 0.6:
@@ -315,8 +414,34 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy)
 
             mp, spot, sig_date = float(row[0]), float(row[1]), row[2]
+            if isinstance(sig_date, datetime):
+                sig_date = sig_date.date()
+            today = datetime.now(timezone.utc).date()
+            if sig_date is None:
+                log.warning("Vanna/charm: missing signal_date — marking stale and excluding from score")
+                return _verdict(
+                    "vanna_charm", "Vanna/Charm (Max Pain)",
+                    0, 0, f"stale max pain ${mp:.0f} (unknown date)",
+                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+                    "SPY options signal_date is missing; excluded from score.",
+                    data_age_hours=None, historical_accuracy=accuracy, status="stale",
+                )
+            age_hours = (today - sig_date).days * 24
+            trading_age = _trading_days_age(sig_date, today)
+            if trading_age > OPTIONS_MAX_AGE_TRADING_DAYS:
+                log.warning(
+                    "Vanna/charm stale: signal_date={sd}, trading_days_old={td} > {m}",
+                    sd=sig_date, td=trading_age, m=OPTIONS_MAX_AGE_TRADING_DAYS,
+                )
+                return _verdict(
+                    "vanna_charm", "Vanna/Charm (Max Pain)",
+                    0, 0, f"stale max pain ${mp:.0f} (as of {sig_date})",
+                    f"max age {OPTIONS_MAX_AGE_TRADING_DAYS} trading days",
+                    f"SPY options data is {trading_age} trading days old (last signal {sig_date}, "
+                    f"max {OPTIONS_MAX_AGE_TRADING_DAYS}); excluded from score.",
+                    data_age_hours=age_hours, historical_accuracy=accuracy, status="stale",
+                )
             gap_pct = (spot - mp) / spot * 100
-            age_hours = (datetime.now(timezone.utc).date() - sig_date).days * 24 if sig_date else None
 
             # Score: linear in gap
             if gap_pct > 2:
@@ -331,7 +456,6 @@ def _score_vanna_charm(engine: Engine, accuracy: float) -> dict:
                 score = 30 + min(20, (abs(gap_pct) - 2) * 10)
 
             # Confidence: higher closer to Friday (OpEx)
-            today = date.today()
             days_to_friday = (4 - today.weekday()) % 7
             opex_boost = max(0, 15 - days_to_friday * 3)
             confidence = 40 + opex_boost + (accuracy * 15)
@@ -991,9 +1115,10 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             """)).fetchall()
 
         if not rows:
+            log.debug("News sentiment: no articles in last 6h — excluding from score")
             return _verdict(
                 "news_sentiment", "News Sentiment",
-                0, 10, "no recent articles", "",
+                0, 0, "no recent articles", "",
                 "No news articles in the last 6 hours.",
                 status="stale", historical_accuracy=accuracy,
             )
@@ -1003,28 +1128,34 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
         bear = sum(1 for r in rows if r[2] and r[2].upper() == "BEARISH")
         neutral = total - bull - bear
 
-        # Weighted score: high-confidence articles count more
+        # Weighted score: high-confidence articles count more, including neutrals in denominator
         weighted_bull = 0.0
         weighted_bear = 0.0
+        weighted_neutral = 0.0
         for r in rows:
             sent = (r[2] or "").upper()
-            conf = float(r[4]) if r[4] is not None else 0.5
+            conf = float(r[4]) if r[4] is not None else NEWS_DEFAULT_ARTICLE_CONF
             if sent == "BULLISH":
                 weighted_bull += conf
             elif sent == "BEARISH":
                 weighted_bear += conf
+            else:
+                weighted_neutral += conf
 
-        # Score: weighted net sentiment scaled to [-100, +100]
-        weight_total = weighted_bull + weighted_bear
-        if weight_total > 0:
+        # Score: weighted net sentiment over ALL articles (including neutrals), scaled to [-100, +100].
+        # Require at least NEWS_MIN_DIRECTIONAL_ARTICLES directional headlines for a nonzero score.
+        directional_count = bull + bear
+        weight_total = weighted_bull + weighted_bear + weighted_neutral
+        if directional_count >= NEWS_MIN_DIRECTIONAL_ARTICLES and weight_total > 0:
             net_pct = (weighted_bull - weighted_bear) / weight_total
-            score = net_pct * 100
+            score = net_pct * NEWS_SCORE_SCALE
+            conf_skew = min(30, abs(bull - bear) * 2)
         else:
-            score = 0
+            score = 0.0
+            conf_skew = 0.0
 
         # Confidence: volume + skew + quality
         conf_volume = min(40, total * 0.5)
-        conf_skew = min(30, abs(bull - bear) * 2)
         conf_accuracy = accuracy * 20
         confidence = min(90, 20 + conf_volume + conf_skew + conf_accuracy)
 
@@ -1057,7 +1188,12 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             except Exception:
                 pass
 
-        if bear > bull * 2:
+        if directional_count < NEWS_MIN_DIRECTIONAL_ARTICLES:
+            mood = (
+                f"insufficient directional articles ({directional_count} < "
+                f"{NEWS_MIN_DIRECTIONAL_ARTICLES}) — neutral"
+            )
+        elif bear > bull * 2:
             mood = "strongly negative — risk-off environment"
         elif bear > bull:
             mood = "leaning negative"
@@ -1078,7 +1214,10 @@ def _score_news_sentiment(engine: Engine, accuracy: float) -> dict:
             "news_sentiment", "News Sentiment",
             score, confidence,
             data_point=f"{total} articles: {bull} bullish, {bear} bearish, {neutral} neutral",
-            threshold="net sentiment % scaled to [-100, +100]",
+            threshold=(
+                f"weighted (bull - bear) / (bull + bear + neutral) scaled to [-100, +100]; "
+                f"requires >={NEWS_MIN_DIRECTIONAL_ARTICLES} directional articles"
+            ),
             reasoning=reasoning,
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
@@ -1273,41 +1412,51 @@ def _score_social_sentiment(engine: Engine, accuracy: float) -> dict:
                                   "Treat as neutral until signal_feed captures direction.",
                         historical_accuracy=accuracy,
                     )
+                log.debug("Social sentiment: no signals in last 24h — excluding from score")
                 return _verdict(
                     "social_sentiment", "Social Sentiment",
-                    0, 10, "no social signals", "",
+                    0, 0, "no social signals", "",
                     "No social media signals in the last 24 hours.",
                     status="stale", historical_accuracy=accuracy,
                 )
 
             net_pct = (bull - bear) / total if total > 0 else 0
-            score = net_pct * 80  # cap at ±80 (social is noisy)
+            # Contrarian: retail euphoria (bull > bear) scores bearish; panic scores bullish.
+            score = -net_pct * SOCIAL_SENTIMENT_MAX_SCORE
 
             confidence = min(70, 15 + total * 0.5 + accuracy * 15)
 
-            if bull > bear * 2:
-                mood = "retail euphoria"
+            if bull > bear * SOCIAL_SENTIMENT_EXTREME_RATIO:
+                mood = "retail euphoria (contrarian bearish)"
+                implication = "Extreme retail euphoria often precedes corrections — contrarian bearish signal."
             elif bull > bear:
-                mood = "leaning positive"
-            elif bear > bull * 2:
-                mood = "retail panic"
+                mood = "leaning positive (mildly contrarian bearish)"
+                implication = "Skewed bullish retail chatter leans contrarian bearish."
+            elif bear > bull * SOCIAL_SENTIMENT_EXTREME_RATIO:
+                mood = "retail panic (contrarian bullish)"
+                implication = "Extreme retail panic often marks capitulation — contrarian bullish signal."
             elif bear > bull:
-                mood = "leaning negative"
+                mood = "leaning negative (mildly contrarian bullish)"
+                implication = "Skewed bearish retail chatter leans contrarian bullish."
             else:
-                mood = "mixed chatter"
+                mood = "mixed chatter (neutral)"
+                implication = "Balanced retail chatter — no contrarian directional edge."
 
             reasoning = (
                 f"{total} social signals (24h): {bull} bullish, {bear} bearish. "
                 f"Retail mood: {mood}. "
-                "Social sentiment is a lagging/contrarian indicator — "
-                "extreme retail euphoria often precedes corrections."
+                f"Social sentiment is a lagging/contrarian indicator: {implication}"
             )
 
             return _verdict(
                 "social_sentiment", "Social Sentiment",
                 score, confidence,
                 data_point=f"{total} signals: {bull} bullish, {bear} bearish",
-                threshold="net social direction scaled to [-80, +80]",
+                threshold=(
+                    f"contrarian -(bull - bear)/total scaled to "
+                    f"[-{int(SOCIAL_SENTIMENT_MAX_SCORE)}, +{int(SOCIAL_SENTIMENT_MAX_SCORE)}] "
+                    "(euphoria = bearish, panic = bullish)"
+                ),
                 reasoning=reasoning,
                 historical_accuracy=accuracy,
             )
@@ -1436,13 +1585,18 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
 
 
 def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
-    """CFTC Commitments of Traders — net speculative positioning.
+    """CFTC Commitments of Traders — net speculative positioning for equity direction.
 
-    Tracks smart-money futures bets across SP500, Gold, Crude Oil, VIX.
-    - Extreme net long + rising → institutions riding trend (+60)
-    - Net long shrinking → profit-taking, caution (-20)
-    - Net short + increasing → hedging/bear bet (-60)
-    - VIX net long spike → fear hedging, contrarian bullish (+30)
+    Tracks smart-money futures positioning with asset-class-appropriate signs:
+    - ES (E-mini S&P, equity index, weight 2x): net long + rising → bullish (+60),
+      net short → bearish (-20 to -50).
+    - GC (Gold, safe haven, weight 1x, INVERSE): heavy net long Gold reflects
+      flight-to-safety / risk-off positioning (bearish for equities, -10 to -30);
+      net short Gold reflects risk-on (+10 to +20).
+    - VX (VIX, equity vol, weight 1x, CONTRARIAN): extreme net long VIX → fear
+      hedging / contrarian bullish (+15 to +30); extreme net short → complacency (-20).
+    - CL (WTI crude, commodity): reported for context only and excluded from
+      the equity-direction score so commodity longs cannot flip equity positioning.
 
     Data is weekly (Tuesday snapshot, Friday release).
 
@@ -1456,8 +1610,9 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
     KEY_CONTRACTS = {"ES": "E-mini S&P", "GC": "Gold", "CL": "WTI", "VX": "VIX"}
     try:
         with engine.connect() as conn:
-            scores = []
-            details = []
+            weighted_scores: list[tuple[float, float]] = []
+            details: list[str] = []
+            context_details: list[str] = []
             oldest_date = None
 
             for root, contract in KEY_CONTRACTS.items():
@@ -1480,39 +1635,66 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
 
                 val = float(cur[0])
                 obs = cur[1]
-                if oldest_date is None or (obs and obs < oldest_date):
-                    oldest_date = obs
                 # No prior observation -> momentum unknown (never "val - 0").
                 momentum = val - float(prior[0]) if prior else None
+                direction = "long" if val > 0 else "short" if val < 0 else "flat"
 
-                # VIX is contrarian: net long VIX = fear = bullish for equities
-                if root == "VX":
-                    if val > 50000:
-                        s = 30  # extreme fear → contrarian bullish
-                    elif val > 20000:
-                        s = 15
-                    elif val < -50000:
-                        s = -20  # complacency
-                    else:
-                        s = 0
-                else:
-                    # SP500/Gold/Crude: net long = bullish, momentum matters
-                    if val > 100000 and momentum is not None and momentum > 0:
-                        s = 60
-                    elif val > 50000:
-                        s = 30
+                if root == "CL":
+                    # Non-equity commodity positioning: context only, excluded from equity score.
+                    context_details.append(f"{contract}: {val:+,.0f} net spec ({direction}, context only)")
+                    continue
+
+                if oldest_date is None or (obs and obs < oldest_date):
+                    oldest_date = obs
+
+                if root == "ES":
+                    # Equity index: pro-equity direction (primary weight).
+                    if val > CFTC_EXTREME_NET_CONTRACTS and momentum is not None and momentum > 0:
+                        s = 60.0
+                    elif val > CFTC_MODERATE_NET_CONTRACTS:
+                        s = 30.0
                     elif val > 0:
-                        s = 10
-                    elif val > -50000:
-                        s = -20
+                        s = 10.0
+                    elif val == 0:
+                        s = 0.0
+                    elif val > -CFTC_MODERATE_NET_CONTRACTS:
+                        s = -20.0
                     else:
-                        s = -50
+                        s = -50.0
+                    weighted_scores.append((s, CFTC_EQUITY_WEIGHT))
+                    details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
+                elif root == "GC":
+                    # Safe haven: net long Gold = risk-off (bearish for equities).
+                    if val > CFTC_EXTREME_NET_CONTRACTS and momentum is not None and momentum > 0:
+                        s = -30.0
+                    elif val > CFTC_MODERATE_NET_CONTRACTS:
+                        s = -20.0
+                    elif val > 0:
+                        s = -10.0
+                    elif val == 0:
+                        s = 0.0
+                    elif val > -CFTC_MODERATE_NET_CONTRACTS:
+                        s = 10.0
+                    else:
+                        s = 20.0
+                    weighted_scores.append((s, CFTC_SAFE_HAVEN_WEIGHT))
+                    tag = "long, risk-off" if val > 0 else "short, risk-on" if val < 0 else "flat"
+                    details.append(f"{contract}: {val:+,.0f} net spec ({tag})")
+                elif root == "VX":
+                    # VIX is contrarian: net long VIX = fear = bullish for equities.
+                    if val > CFTC_VIX_EXTREME_CONTRACTS:
+                        s = 30.0  # extreme fear → contrarian bullish
+                    elif val > CFTC_VIX_MODERATE_CONTRACTS:
+                        s = 15.0
+                    elif val < -CFTC_VIX_EXTREME_CONTRACTS:
+                        s = -20.0  # complacency
+                    else:
+                        s = 0.0
+                    weighted_scores.append((s, CFTC_VIX_WEIGHT))
+                    details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
 
-                scores.append(s)
-                direction = "long" if val > 0 else "short"
-                details.append(f"{contract}: {val:+,.0f} net spec ({direction})")
-
-            if not scores:
+            if not weighted_scores:
+                log.debug("CFTC positioning: no scored equity/safe-haven/VIX COT series found")
                 return _verdict(
                     "cftc_positioning", "Futures Positioning (COT)",
                     0, 0, "no CFTC data", "",
@@ -1520,7 +1702,9 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
-            score = sum(scores) / len(scores)
+            total_weight = sum(w for _, w in weighted_scores)
+            score = sum(s * w for s, w in weighted_scores) / total_weight
+            all_details = details + context_details
 
             age_hours = None
             if oldest_date:
@@ -1528,26 +1712,30 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                 age_hours = days * 24.0
 
             # Weekly data → lower confidence, but high-signal
-            confidence = min(80, 45 + len(scores) * 5 + accuracy * 15)
+            confidence = min(80, 45 + len(weighted_scores) * 5 + accuracy * 15)
             if age_hours and age_hours > 168:  # older than 1 week
                 confidence *= 0.7
 
-            reasoning = "Futures positioning from CFTC COT report. "
+            reasoning = "Futures positioning from CFTC COT report (equity-weighted; Gold longs scored risk-off). "
             if score > 30:
-                reasoning += "Smart money heavily long — institutions riding the trend. "
+                reasoning += "Smart money heavily long equities — institutions riding the trend. "
             elif score > 0:
-                reasoning += "Modest net long positioning — cautiously bullish. "
+                reasoning += "Modest risk-on / net long equity positioning — cautiously bullish. "
             elif score > -20:
-                reasoning += "Near-neutral positioning — no strong conviction. "
+                reasoning += "Near-neutral equity positioning — no strong conviction. "
             else:
-                reasoning += "Net short positioning — institutions hedging or betting on decline. "
-            reasoning += "; ".join(details[:3]) + "."
+                reasoning += "Risk-off / net short equity positioning — institutions hedging or betting on decline. "
+            reasoning += "; ".join(all_details[:4]) + "."
 
             return _verdict(
                 "cftc_positioning", "Futures Positioning (COT)",
                 score, confidence,
-                data_point="; ".join(details[:2]),
-                threshold="net long >100K = bullish (+60), net short >50K = bearish (-50)",
+                data_point="; ".join(all_details[:2]),
+                threshold=(
+                    "ES equity (2x): long >100K rising (+60), short <-50K (-50); "
+                    "GC safe-haven (1x, risk-off inverse): long >100K rising (-30); "
+                    "VX contrarian (1x); CL context only"
+                ),
                 reasoning=reasoning,
                 data_age_hours=age_hours,
                 historical_accuracy=accuracy,
@@ -1707,7 +1895,9 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
     try:
         with engine.connect() as conn:
             pe_current = []
-            pe_30d = []
+            paired_cur_pe = []
+            paired_prior_pe = []
+            eps_changes = []
 
             today = date.today()
             for ticker in TICKERS:
@@ -1715,12 +1905,19 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
                 prior = trailing_pe(conn, ticker, today - timedelta(days=30))
                 # Same 0-500 band as the old Tiingo reads: a near-zero EPS
                 # makes a P/E in the thousands that would swamp the average.
-                if cur is not None and cur.pe < 500:
+                cur_ok = cur is not None and cur.pe < VALUATION_MAX_PE
+                prior_ok = prior is not None and prior.pe < VALUATION_MAX_PE
+                if cur_ok:
                     pe_current.append(cur.pe)
-                if prior is not None and prior.pe < 500:
-                    pe_30d.append(prior.pe)
+                if cur_ok and prior_ok:
+                    paired_cur_pe.append(cur.pe)
+                    paired_prior_pe.append(prior.pe)
+                    cur_eps = getattr(cur, "eps_ttm", None)
+                    prior_eps = getattr(prior, "eps_ttm", None)
+                    if cur_eps is not None and prior_eps is not None and prior_eps > 0:
+                        eps_changes.append((cur_eps - prior_eps) / prior_eps * 100.0)
 
-            if len(pe_current) < 3:
+            if len(pe_current) < VALUATION_MIN_TICKERS:
                 return _verdict(
                     "valuation_compression", "Valuation Momentum",
                     0, 0, f"only {len(pe_current)} tickers with PE data", "",
@@ -1729,8 +1926,28 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
                 )
 
             avg_pe = sum(pe_current) / len(pe_current)
-            avg_pe_30d = sum(pe_30d) / len(pe_30d) if pe_30d else avg_pe
-            pe_change_pct = ((avg_pe - avg_pe_30d) / avg_pe_30d * 100) if avg_pe_30d > 0 else 0
+            if paired_cur_pe and paired_prior_pe:
+                avg_pe_paired = sum(paired_cur_pe) / len(paired_cur_pe)
+                avg_pe_30d = sum(paired_prior_pe) / len(paired_prior_pe)
+                pe_change_pct = (
+                    ((avg_pe_paired - avg_pe_30d) / avg_pe_30d * 100.0)
+                    if avg_pe_30d > 0
+                    else 0.0
+                )
+            else:
+                pe_change_pct = 0.0
+
+            avg_eps_change_pct = (
+                sum(eps_changes) / len(eps_changes) if eps_changes else None
+            )
+            earnings_growing = (
+                avg_eps_change_pct is not None
+                and avg_eps_change_pct > VALUATION_MIN_EPS_GROWTH_PCT
+            )
+            price_driven_compression = (
+                pe_change_pct < -VALUATION_PE_CHANGE_MODERATE_PCT
+                and not earnings_growing
+            )
 
             # Score based on level AND direction
             if avg_pe > 35:
@@ -1746,19 +1963,23 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
             else:
                 level_score = 60
 
-            # Momentum adjustment: compression = bullish, expansion = bearish
-            if pe_change_pct > 10:
+            # Momentum adjustment: expansion = bearish; compression is bullish ONLY
+            # when trailing EPS actually grew (> 0%) over the 30-day window.
+            if pe_change_pct > VALUATION_PE_CHANGE_STRONG_PCT:
                 momentum_adj = -20  # rapid expansion
-            elif pe_change_pct > 5:
+            elif pe_change_pct > VALUATION_PE_CHANGE_MODERATE_PCT:
                 momentum_adj = -10
-            elif pe_change_pct < -10:
-                momentum_adj = 20  # rapid compression (value appearing)
-            elif pe_change_pct < -5:
+            elif pe_change_pct < -VALUATION_PE_CHANGE_STRONG_PCT and earnings_growing:
+                momentum_adj = 20  # rapid earnings-driven compression (value appearing)
+            elif pe_change_pct < -VALUATION_PE_CHANGE_MODERATE_PCT and earnings_growing:
                 momentum_adj = 10
             else:
                 momentum_adj = 0
 
             score = max(-80, min(80, level_score + momentum_adj))
+            if price_driven_compression:
+                # Price-driven P/E compression (prices fell without EPS growth): never score bullish.
+                score = min(0, score)
 
             confidence = min(75, 35 + len(pe_current) * 3 + accuracy * 15)
 
@@ -1775,18 +1996,31 @@ def _score_valuation_compression(engine: Engine, accuracy: float) -> dict:
                 f"(avg across {len(pe_current)} major stocks). "
                 f"PE ratios {direction} {abs(pe_change_pct):.1f}% over 30 days. "
             )
-            if avg_pe > 30 and pe_change_pct > 5:
+            if avg_pe > 30 and pe_change_pct > VALUATION_PE_CHANGE_MODERATE_PCT:
                 reasoning += "Investors paying more and more for each dollar of earnings — classic late-cycle stretch. Risky. "
+            elif price_driven_compression:
+                eps_note = (
+                    f"avg trailing EPS {avg_eps_change_pct:+.1f}%"
+                    if avg_eps_change_pct is not None
+                    else "trailing EPS growth unavailable"
+                )
+                reasoning += (
+                    f"Price-driven compression ({eps_note} over 30d) — P/E fell because prices dropped "
+                    "without positive earnings growth; not scored bullish. "
+                )
+            elif pe_change_pct < -VALUATION_PE_CHANGE_MODERATE_PCT and earnings_growing:
+                reasoning += (
+                    f"Earnings growing faster than prices (avg trailing EPS {avg_eps_change_pct:+.1f}%) "
+                    "— value is appearing. "
+                )
             elif avg_pe < 20:
                 reasoning += "Stocks are historically cheap relative to earnings — potential bargains. "
-            elif pe_change_pct < -5:
-                reasoning += "Earnings growing faster than prices — value is appearing. "
 
             return _verdict(
                 "valuation_compression", "Valuation Momentum",
                 score, confidence,
                 data_point=f"avg PE {avg_pe:.1f}x ({pe_change_pct:+.1f}% 30d), {len(pe_current)} stocks",
-                threshold="PE >30 expensive, <20 cheap; expansion = bearish, compression = bullish",
+                threshold="PE >30 expensive, <20 cheap; expansion = bearish, compression = bullish only when 30d EPS growth > 0%",
                 reasoning=reasoning,
                 historical_accuracy=accuracy,
             )
@@ -2531,7 +2765,7 @@ def score_thesis(engine: Engine, force_refresh: bool = False) -> dict[str, Any]:
 
     for v in verdicts:
         conf = v["confidence"]
-        if conf <= 0 or v["status"] in ("broken", "no_data"):
+        if conf <= 0 or v["status"] in ("broken", "no_data", "stale"):
             continue
         weighted_sum += v["score"] * conf
         conf_sum += conf
@@ -2551,7 +2785,7 @@ def score_thesis(engine: Engine, force_refresh: bool = False) -> dict[str, Any]:
 
     # Assign weight_in_final to each verdict
     for v in verdicts:
-        if conf_sum > 0 and v["confidence"] > 0 and v["status"] not in ("broken", "no_data"):
+        if conf_sum > 0 and v["confidence"] > 0 and v["status"] not in ("broken", "no_data", "stale"):
             v["weight_in_final"] = round(v["confidence"] / conf_sum, 3)
         else:
             v["weight_in_final"] = 0.0
@@ -2624,18 +2858,24 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
                 "status": m["status"],
             }
 
+        top_risk_limit = globals().get("TOP_RISK_FACTORS_LIMIT", 3)
+        active_models = [m for m in thesis.get("models", []) if m["status"] == "active"]
         key_drivers = [
             {"key": m["key"], "name": m["name"], "detail": m["reasoning"]}
-            for m in sorted(thesis.get("models", []), key=lambda x: -abs(x["score"]))[:3]
-            if m["status"] == "active"
+            for m in sorted(active_models, key=lambda x: -abs(x["score"]))[:top_risk_limit]
         ]
+        thesis_dir = thesis["direction"]
+        if thesis_dir == "BULLISH":
+            risk_candidates = [m for m in active_models if m["direction"] == "bearish"]
+        elif thesis_dir == "BEARISH":
+            risk_candidates = [m for m in active_models if m["direction"] == "bullish"]
+        else:
+            risk_candidates = [m for m in active_models if m["direction"] != "neutral"]
         risk_factors = [
             {"key": m["key"], "name": m["name"], "detail": m["reasoning"]}
-            for m in thesis.get("models", [])
-            if m["status"] == "active" and (
-                (thesis["direction"] == "BULLISH" and m["direction"] == "bearish")
-                or (thesis["direction"] == "BEARISH" and m["direction"] == "bullish")
-            )
+            for m in sorted(
+                risk_candidates, key=lambda x: (-abs(x["score"]), x["score"])
+            )[:top_risk_limit]
         ]
 
         with engine.begin() as conn:

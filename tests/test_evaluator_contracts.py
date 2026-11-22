@@ -684,7 +684,7 @@ def test_single_asof_batch_then_mask_is_not_equivalent_to_per_day_fetch():
 
     ``PITStore.get_feature_matrix`` (via ``get_pit``) runs
     ``DISTINCT ON (feature_id, obs_date) ... WHERE release_date <= :aod
-    ORDER BY vintage_date ASC`` for FIRST_RELEASE -- it commits to the row
+    AND vintage_date <= :aod ORDER BY vintage_date ASC`` for FIRST_RELEASE -- it commits to the row
     with the SMALLEST vintage_date among rows satisfying the ONE as_of_date
     given, and the SQL permanently discards every other vintage for that
     (feature_id, obs_date) before anything is returned. A single fetch at
@@ -713,7 +713,9 @@ def test_single_asof_batch_then_mask_is_not_equivalent_to_per_day_fetch():
         rows=[
             # The contested obs_date, two competing vintages:
             Row(feature_id=1, obs_date=day(5), value=111.0, release_date=day(10), vintage_date=day(1)),
-            Row(feature_id=1, obs_date=day(5), value=999.0, release_date=day(5), vintage_date=day(6)),
+            # Held from day 5 (release = vintage): a per-day fetch at day 5
+            # sees it once store/pit.py fences vintage_date <= as_of too.
+            Row(feature_id=1, obs_date=day(5), value=999.0, release_date=day(5), vintage_date=day(5)),
         ]
     )
 
