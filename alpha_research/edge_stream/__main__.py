@@ -40,7 +40,7 @@ def _paths(args) -> tuple[str | None, str | None, Path]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m alpha_research.edge_stream")
-    ap.add_argument("command", choices=("genesis", "cycle", "status", "verify"))
+    ap.add_argument("command", choices=("genesis", "cycle", "status", "verify", "unread-receipt"))
     ap.add_argument("--ledger")
     ap.add_argument("--anchor")
     ap.add_argument("--data-dir")
@@ -48,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-register", action="store_true")
     ap.add_argument("--max-requests", type=int, default=400)
     ap.add_argument("--family", help="with --dry-run: preview this family's next queue item")
+    ap.add_argument("--registration", help="unread-receipt: the abandoned registration's full sha256")
+    ap.add_argument("--cache", action="append", default=[], help="unread-receipt: a bar cache to scan (repeat)")
+    ap.add_argument("--runner-source", help="unread-receipt: runner.py of the release that ran the abandoning cycle")
+    ap.add_argument("--release-sha", help="unread-receipt: that release's commit")
+    ap.add_argument("--out", help="unread-receipt: the receipt file to create (0444, never overwritten)")
     args = ap.parse_args(argv)
     if args.family and not args.dry_run:
         ap.error("--family is a dry-run preview")
@@ -81,6 +86,18 @@ def main(argv: list[str] | None = None) -> int:
         print("edge_stream: EDGE_STREAM_LEDGER_PATH / _ANCHOR_PATH not set; nothing written", file=sys.stderr)
         return 2
 
+    if args.command == "unread-receipt":
+        if not (args.registration and args.runner_source and args.release_sha and args.out and data):
+            ap.error("unread-receipt needs --registration, --runner-source, --release-sha, --out and --data-dir")
+        ledger.verify(full=True)
+        from . import receipt as RC
+
+        rc = RC.build(ledger, args.registration, Path(data), [Path(c) for c in args.cache],
+                      Path(args.runner_source).read_text(), args.release_sha)
+        sha = RC.write(rc, Path(args.out))
+        print(json.dumps({"verdict": rc["verdict"], "failed": rc.get("failed"), "out": args.out, "sha256": sha,
+                          "consumed_through_exclusive": rc.get("consumed_through_exclusive")}))
+        return 0 if rc["verdict"] != "REFUSED" else 1
     if args.command == "verify":
         ledger.verify(full=True)
         state = L.load_state(ledger)

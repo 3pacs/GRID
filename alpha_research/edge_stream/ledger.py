@@ -160,6 +160,35 @@ class StreamState:
         return bool(rule.get("decision")) and rule.get("cause") == CODE_CHANGED and any(
             d.get("id") == rule["decision"] for d in self.policy.get("owner_decisions", []))
 
+    def _attested_history(self) -> dict[str, dict]:
+        """History registrations sealed before read records that an owner decision in the policy in
+        force attests by name, each with a pinned receipt and the date its consumed part ends."""
+        rule = self.policy.get("unread_abandonment") or {}
+        decisions = {d.get("id") for d in self.policy.get("owner_decisions", [])}
+        out = {}
+        for a in rule.get("attested", []):
+            if a.get("lane") == "history" and a.get("frees_window") is True and a.get("decision") in decisions \
+                    and len(str(a.get("receipt_sha256", ""))) == 64 and a.get("consumed_through_exclusive"):
+                out[a["registration_sha256"]] = a
+        return out
+
+    def _attested_unread(self, reg_sha: str) -> dict | None:
+        """The attestation of ``reg_sha`` when nothing in the ledger contradicts it: abandoned, no
+        look, no edge_read, and its abandonment record carries no evidence of a read."""
+        a = self._attested_history().get(reg_sha)
+        rec, reg = self.abandoned.get(reg_sha), self.registrations.get(reg_sha)
+        if a is None or rec is None or reg is None or reg["lane"] != "history" or reg_sha in self.looks \
+                or self.reads.get(reg_sha) or reg_sha in self.marked:
+            return None
+        if "cause" in rec and self._code_abandonment(reg_sha, "history") is None:
+            return None  # an abandonment that recorded evidence must show it clean
+        return a
+
+    def consumed_through(self, reg_sha: str) -> str | None:
+        """For an attested registration, the date its still-consumed part ends (exclusive)."""
+        a = self._attested_unread(reg_sha)
+        return a["consumed_through_exclusive"] if a else None
+
     def _code_abandonment(self, reg_sha: str, lane: str) -> dict | None:
         """The record of a code-change abandonment on ``lane`` whose own evidence shows no sign of a
         look (no look read in the ledger, no failed attempt, no staged report); ``None`` when it is
@@ -180,6 +209,8 @@ class StreamState:
         read), abandoned at the code check with no failed attempt and no staged report. Its window is
         freed under :meth:`reopens_unread`. Anything else, including any registration sealed before
         policy 4, keeps its window consumed and its (family, group, lane) closed."""
+        if self._attested_unread(reg_sha) is not None:
+            return True
         reg = self.registrations.get(reg_sha)
         return reg is not None and reg_sha in self.marked and not self.reads.get(reg_sha) \
             and self._code_abandonment(reg_sha, reg["lane"]) is not None
@@ -204,6 +235,11 @@ class StreamState:
         freed = self.reopens_unread()
         for sha, reg in self.registrations.items():
             if freed and self.unread_abandoned(sha):
+                through = self.consumed_through(sha)
+                if through is None or through <= reg["window"]["start"]:
+                    continue
+                out.append({"group": reg["group"], "horizon": reg["horizon"], "start": reg["window"]["start"],
+                            "end": through, "source": sha, "by": reg["proposal_id"] + " (read sessions kept)"})
                 continue
             w = reg["window"]
             end = w.get("end")

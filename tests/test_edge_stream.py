@@ -830,12 +830,14 @@ def test_other_abandonments_keep_their_window(tmp_path, monkeypatch):
 
 
 def test_no_registration_sealed_before_policy_4_is_freed_or_reopened():
-    """Codex 6010864065 / 6011669661: policy 4 names no registration. The live single-stocks
-    abandonment and the live SPY/QQQ/IWM forward registration stay closed whatever their records say."""
-    assert P.UNREAD_ABANDONMENT["attested"] == []
+    """Codex 6010864065 / 6011669661: without an attestation nothing sealed before policy 4 is freed;
+    the live SPY/QQQ/IWM forward registration is named by nothing and stays closed."""
+    assert [a["lane"] for a in P.UNREAD_ABANDONMENT["attested"]] == ["history"]
     live_ss = "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b"
     live_fwd = "69a8482023b8306323ac5d18d5e70e5af2451fa2846912f24a1990656660218d"
-    state = L.StreamState(policy=P.policy_payload(), policy_sha256=P.policy_sha256())
+    pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    pol["unread_abandonment"]["attested"] = []
+    state = L.StreamState(policy=pol, policy_sha256="x")
     state.registrations[live_ss] = {"lane": "history", "stage": 1}
     state.abandoned[live_ss] = {"reason": "family IM1 code differs from the registered sha"}
     clean = {"ledger_reads": [], "failed_attempts": 0, "report_staged": False}
@@ -843,6 +845,57 @@ def test_no_registration_sealed_before_policy_4_is_freed_or_reopened():
     state.abandoned[live_fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
     for sha in (live_ss, live_fwd):
         assert not state.unread_abandoned(sha) and not state.reregistrable(sha)
+
+
+LIVE_SS = "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b"
+
+
+def _live_ss_state(policy=None) -> L.StreamState:
+    pol = policy or P.policy_payload()
+    state = L.StreamState(policy=pol, policy_sha256="x")
+    state.registrations[LIVE_SS] = {"lane": "history", "stage": 1, "group": "us_single_stocks",
+                                    "horizon": "intraday", "window": {"start": "2024-12-19", "end": "2026-11-19"},
+                                    "proposal_id": "IM1-v1:us_single_stocks:history:2024-12-19"}
+    state.abandoned[LIVE_SS] = {"reason": "family IM1 code differs from the registered sha"}
+    return state
+
+
+def test_policy_5_frees_single_stocks_except_the_sessions_read():
+    """The receipt's four read sessions stay consumed; the rest of the window is freed."""
+    state = _live_ss_state()
+    assert state.unread_abandoned(LIVE_SS) and state.reregistrable(LIVE_SS)
+    kept = [c for c in state.consumption() if c["source"] == LIVE_SS]
+    assert [(c["start"], c["end"]) for c in kept] == [("2024-12-19", "2024-12-25")]
+    hits = L.conflicts(state, "us_single_stocks", "intraday", "2024-12-24", "2026-11-24", "history")
+    assert hits and L.conflicts(state, "us_single_stocks", "intraday", "2024-12-25", "2026-11-25", "history") == []
+
+
+def test_policy_4_frees_nothing_sealed_before_it():
+    pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    pol["owner_decisions"] = pol["owner_decisions"][:2]
+    pol["unread_abandonment"]["attested"] = [a for a in pol["unread_abandonment"]["attested"] if a["lane"] == "forward"]
+    state = _live_ss_state(pol)
+    assert not state.unread_abandoned(LIVE_SS) and not state.reregistrable(LIVE_SS)
+    assert any(c["source"] == LIVE_SS and c["end"] == "2026-11-19" for c in state.consumption())
+
+
+@pytest.mark.parametrize("contrary", ["look", "edge_read", "dirty_evidence", "no_decision", "bad_receipt_sha"])
+def test_contrary_evidence_beats_the_attestation(contrary):
+    pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    state = _live_ss_state(pol)
+    if contrary == "look":
+        state.looks[LIVE_SS] = {"verdict": "FAIL"}
+    elif contrary == "edge_read":
+        state.reads[LIVE_SS] = {"progress"}
+    elif contrary == "dirty_evidence":
+        state.abandoned[LIVE_SS] = {"reason": "x", "cause": L.CODE_CHANGED,
+                                    "read_evidence": {"ledger_reads": [], "failed_attempts": 1, "report_staged": False}}
+    elif contrary == "no_decision":
+        pol["owner_decisions"] = pol["owner_decisions"][:2]
+    else:
+        next(a for a in pol["unread_abandonment"]["attested"] if a["lane"] == "history")["receipt_sha256"] = "x"
+    assert not state.unread_abandoned(LIVE_SS) and not state.reregistrable(LIVE_SS)
+    assert any(c["source"] == LIVE_SS and c["end"] == "2026-11-19" for c in state.consumption())
 
 
 def test_a_lost_sidecar_cannot_free_a_read_window(tmp_path, monkeypatch):

@@ -82,6 +82,23 @@ V2_RULE = ("per calendar year (UTC): q_year over at most max_registrations stage
            "confirmations (forward, after a stage-1 PASS) at confirm_alpha/k outside the yearly count")
 
 
+V5_EXCEPTION = (", except a history registration an owner decision names below with a reconciled receipt (its "
+                "sha256 pinned): its window up to consumed_through_exclusive stays consumed and the rest is freed, "
+                "and only while the ledger still holds no look and no edge_read of it and its abandonment shows no "
+                "read. ")
+
+
+def v4_payload() -> dict:
+    """Policy 4 (GRID#1337): policy 5 without its single-stocks decision and attestation."""
+    pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    pol["owner_decisions"] = pol["owner_decisions"][:2]
+    ua = pol["unread_abandonment"]
+    ua["attested"] = [a for a in ua["attested"] if a["lane"] == "forward"]
+    ua["rule"] = ua["rule"].replace(V5_EXCEPTION, ". ")
+    pol["policy_version"] = "edge-stream-policy/4"
+    return pol
+
+
 def v3_payload() -> dict:
     """Policy 3 (live from 2026-11-20, amendment 2811e06b): policy 4 without its owner decision
     on unread abandonments."""
@@ -756,12 +773,42 @@ def test_code_hash_covers_the_universe_through_the_policy(monkeypatch):
 
 
 def test_policy_4_adds_one_owner_decision_and_loosens_nothing_else():
-    old, new = v3_payload(), P.policy_payload()
-    assert new["policy_version"] == "edge-stream-policy/4"
+    old, new = v3_payload(), v4_payload()
+    # policy 4 exactly as GRID#1337 ships it (10616fb2), byte for byte
+    assert L.sha256_bytes(P.canonical_bytes(new)).startswith("861064dce13e")
     assert P.tightening_violations(old, new) == []  # a new section and a new decision only
-    assert P.amendment_violations(old, new) == []   # fails until the decision's url and sha are filled
+    assert P.amendment_violations(old, new) == []
     first, decision = new["owner_decisions"]
     assert first == old["owner_decisions"][0] and decision["waives"] == []
     assert decision["id"] == "GRID#1336" and decision["url"].startswith("https://github.com/3pacs/GRID/issues/1336#issuecomment-")
     assert new["unread_abandonment"]["decision"] == decision["id"]
     assert new["unread_abandonment"]["cause"] == L.CODE_CHANGED
+
+
+def test_policy_5_changes_only_the_unread_section_under_its_decision():
+    new = P.policy_payload()
+    assert new["policy_version"] == "edge-stream-policy/5"
+    for old in (v4_payload(), v3_payload()):  # after #1337 has amended, or straight from the live policy 3
+        assert P.amendment_violations(old, new) == []  # fails until the decision's url and sha are filled
+    assert P.tightening_violations(v4_payload(), new) == ["unread_abandonment changed"]
+    decision = new["owner_decisions"][2]
+    assert decision["waives"] == ["unread_abandonment"]
+    assert decision["id"] == "GRID#1379" and decision["url"].startswith("https://github.com/3pacs/GRID/issues/1379#issuecomment-")
+    hist, = [a for a in new["unread_abandonment"]["attested"] if a["lane"] == "history"]
+    assert hist["decision"] == decision["id"] and hist["frees_window"] is True
+    # a decision cannot touch anything else under the same waiver
+    pol = json.loads(P.canonical_bytes(new))
+    pol["cost_floors"]["liquid"] = {"usd": 0.0, "bp": 0.0}
+    assert "cost floor liquid lowered or removed" in P.amendment_violations(v4_payload(), pol)
+
+
+def test_the_pinned_receipt_is_the_file_in_the_repo():
+    hist, = [a for a in P.UNREAD_ABANDONMENT["attested"] if a["lane"] == "history"]
+    body = (REPO / hist["receipt"]).read_bytes()
+    assert L.sha256_bytes(body) == hist["receipt_sha256"]
+    rc = json.loads(body)
+    assert rc["schema"] == "edge-unread-receipt/1" and rc["registration_sha256"] == hist["registration_sha256"]
+    assert rc["verdict"] == hist["receipt_verdict"] == "UNREAD_EXCEPT" and rc["failed"] == []
+    assert rc["consumed_through_exclusive"] == hist["consumed_through_exclusive"] == "2024-12-25"
+    assert rc["sessions_read_on_or_after_start"] == ["2024-12-19", "2024-12-20", "2024-12-23", "2024-12-24"]
+    assert all(c["ok"] for c in rc["checks"].values())

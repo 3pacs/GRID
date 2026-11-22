@@ -63,6 +63,17 @@ as done, so single stocks could never be tested. Policy 4 adds `unread_abandonme
 after the amendment. Before merging a change to an evaluation module, check `status.json` for an open history
 registration due a look and merge after it.
 
+## Single stocks (policy 5, owner decision GRID#1379)
+
+`IM1-v1:us_single_stocks:history:2024-12-19` was sealed before `edge_read` records existed, so its own ledger
+cannot prove it unread. `python -m alpha_research.edge_stream unread-receipt` (`receipt.py`, read-only) reconciles
+the ledger, `cycle.log`, the runner of the release that ran the abandoning cycle, the data dir and every bar cache
+given to it. The receipt is `docs/receipts/edge-stream/unread-cfa25376-20261122.json` (sha256 pinned in
+`policy.UNREAD_ABANDONMENT`), verdict `UNREAD_EXCEPT`. Its four sessions read in rehearsal copies (2024-12-19..24)
+stay consumed, and the rest of the window is freed. A look, an `edge_read`, or an abandonment with dirty evidence
+for that registration voids the attestation. Owner decisions may change `unread_abandonment` (`OWNER_WAIVABLE`), so
+policy 5 amends from 3 or from 4.
+
 ## The evidence bar (policy 3, owner decision GRID#1213)
 
 Recorded by the owner on 2026-11-16

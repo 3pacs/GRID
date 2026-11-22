@@ -1,4 +1,4 @@
-"""Frozen policy of the edge stream (``edge-stream-policy/4``).
+"""Frozen policy of the edge stream (``edge-stream-policy/5``).
 
 Everything a look is judged by lives here and is written, whole, into the
 ledger's ``edge_policy`` record at genesis (its sha256 is pinned in every
@@ -8,6 +8,13 @@ prior consumption, more groups or instruments. The one exception is a recorded
 owner decision (:data:`OWNER_DECISIONS`), which may change the few fields in
 :data:`OWNER_WAIVABLE` and nothing else. Nothing here is read from the
 environment.
+
+Version 5 (2026-11-22) adds one owner decision that names one registration sealed before
+read records existed: the single-stocks history registration abandoned on 2026-11-20. A
+receipt reconciled from the ledger, cycle.log, the release that ran the cycle, the data
+dir and every edge-stream bar cache on grid-svr (sha256 pinned below) shows no read of its
+window except four sessions (2024-12-19..24) whose move sizes rehearsal copies read; those
+stay consumed and the rest of its window is freed.
 
 Version 4 (2026-11-21) adds one owner decision (:data:`UNREAD_ABANDONMENT`): a history
 registration sealed under it, abandoned because its family's code changed, whose ledger
@@ -58,7 +65,7 @@ import re
 
 from .universe import SP500_20251231
 
-POLICY_VERSION = "edge-stream-policy/4"
+POLICY_VERSION = "edge-stream-policy/5"
 LEDGER_ID = "grid-edge-looks"
 
 # --- budget -----------------------------------------------------------------------
@@ -91,7 +98,8 @@ NOISE_UNITS = {"session": r"\d{4}-\d{2}-\d{2}", "iso_week": r"\d{4}-W\d{2}"}
 #: ``waives`` names the fields the decision changes; only :data:`OWNER_WAIVABLE` fields can
 #: be named. ``text_sha256`` is the sha256 of the decision as posted (LF line ends, one
 #: trailing newline). Entries are never edited or removed.
-OWNER_WAIVABLE = frozenset({"budget.alpha_per_look", "budget.rule", "promotion", "evidence_bar"})
+OWNER_WAIVABLE = frozenset({"budget.alpha_per_look", "budget.rule", "promotion", "evidence_bar",
+                            "unread_abandonment"})
 OWNER_DECISIONS: tuple[dict, ...] = (
     {
         "id": "GRID#1213",
@@ -115,6 +123,17 @@ OWNER_DECISIONS: tuple[dict, ...] = (
                    "again on a new window; its alpha stays spent and it counts toward the yearly maximum",
         "waives": [],
     },
+    {
+        "id": "GRID#1379",
+        "url": "PENDING",
+        "decided_by": "Anik (repository owner)",
+        "decided_on": "2026-11-22",
+        "text_sha256": "6be31fb6445aa04bd58fc236a9575ec47a39f2df896dd5f2ac176e842655cb9c",
+        "summary": "the 2026-11-20 abandonment of IM1-v1:us_single_stocks:history:2024-12-19 is attested unread by "
+                   "receipt 4d866b59 except 2024-12-19..24, which stay consumed; the rest of its window is freed and "
+                   "single stocks may register again; its alpha stays spent",
+        "waives": ["unread_abandonment"],
+    },
 )
 
 #: The rule the second owner decision adds (a new top-level policy section). The ledger's
@@ -131,9 +150,31 @@ UNREAD_ABANDONMENT: dict = {
             "has its window freed and its (family, group, lane) may register again on a new window. A forward "
             "registration whose presence was counted was read: its window stays consumed and its (family, group, "
             "lane) stays closed. Any registration sealed before this policy, and any whose evidence is missing, "
-            "partial or disputed, keeps its window and its (family, group, lane) closed. The alpha of an abandoned "
+            "partial or disputed, keeps its window and its (family, group, lane) closed, except a history "
+            "registration an owner decision names below with a reconciled receipt (its sha256 pinned): its window "
+            "up to consumed_through_exclusive stays consumed and the rest is freed, and only while the ledger still "
+            "holds no look and no edge_read of it and its abandonment shows no read. The alpha of an abandoned "
             "registration stays spent and it counts toward max_registrations",
-    "attested": [],
+    "attested": [
+        {
+            "registration_sha256": "cfa2537678d7af7153e767810fda3d87a9316c45687d9cc2747e54a1fd0b224b",
+            "lane": "history",
+            "frees_window": True,
+            "proposal_id": "IM1-v1:us_single_stocks:history:2024-12-19",
+            "decision": "GRID#1379",
+            "receipt": "docs/receipts/edge-stream/unread-cfa25376-20261122.json",
+            "receipt_sha256": "4d866b59699f5134308447288c8c722f7dfa598e9e7e854c5d8a767903904828",
+            "receipt_verdict": "UNREAD_EXCEPT",
+            "consumed_through_exclusive": "2024-12-25",
+            "evidence": "receipt edge-unread-receipt/1 built read-only on grid-svr 2026-11-22: the ledger holds only its "
+                        "abandonment (no look, no edge_read); cycle.log holds one cycle between its registration and "
+                        "abandonment (2026-11-20 11:05:50Z, not a dry run, looks []) and no look line for it; release "
+                        "15975857 runs the code-hash check before any read in compute_look; no staged report or "
+                        "failed attempt; of eleven bar caches only two rehearsal copies (2026-11-22) hold sessions "
+                        "in its window, 2024-12-19..24, read as G11 pre-window move sizes of a rehearsed "
+                        "re-registration. Those four sessions stay consumed",
+        },
+    ],
 }
 
 # --- looks ------------------------------------------------------------------------
