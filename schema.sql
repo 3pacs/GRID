@@ -387,6 +387,86 @@ CREATE TABLE IF NOT EXISTS regime_history (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- regime_history keeps every version it replaces (#1302, migrations/versions/regime_history_revs_20261122.py).
+-- A change that alters a row copies the old version into regime_history_revisions and stamps the new
+-- version's created_at. Writers name a reason and run (set_config 'grid.regime_history_reason' and
+-- 'grid.regime_history_run', transaction-local); a change without them is archived as unattributed.
+-- obs_date cannot change, TRUNCATE is refused and revisions are append-only.
+CREATE TABLE IF NOT EXISTS regime_history_revisions (
+    id             BIGSERIAL PRIMARY KEY,
+    obs_date       DATE NOT NULL,
+    regime         TEXT NOT NULL,
+    confidence     DOUBLE PRECISION,
+    source         TEXT,
+    data_as_of     DATE,
+    created_at     TIMESTAMPTZ,
+    superseded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    operation      TEXT NOT NULL CHECK (operation IN ('UPDATE', 'DELETE')),
+    reason         TEXT NOT NULL CHECK (btrim(reason) <> ''),
+    run_tag        TEXT NOT NULL CHECK (btrim(run_tag) <> ''),
+    attributed     BOOLEAN NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_regime_history_revisions_obs_date
+    ON regime_history_revisions (obs_date, superseded_at);
+
+CREATE OR REPLACE FUNCTION regime_history_keep_revisions()
+RETURNS TRIGGER AS $$
+DECLARE
+    why TEXT := nullif(btrim(coalesce(current_setting('grid.regime_history_reason', true), '')), '');
+    run TEXT := nullif(btrim(coalesce(current_setting('grid.regime_history_run', true), '')), '');
+    app TEXT := nullif(btrim(coalesce(current_setting('application_name', true), '')), '');
+BEGIN
+    IF TG_OP = 'TRUNCATE' THEN
+        RAISE EXCEPTION 'regime_history keeps every version: TRUNCATE refused';
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.obs_date IS DISTINCT FROM OLD.obs_date THEN
+        RAISE EXCEPTION 'regime_history: obs_date % cannot change', OLD.obs_date;
+    END IF;
+    IF TG_OP = 'UPDATE' AND (NEW.regime, NEW.confidence, NEW.source, NEW.data_as_of)
+            IS NOT DISTINCT FROM (OLD.regime, OLD.confidence, OLD.source, OLD.data_as_of) THEN
+        RETURN NEW;
+    END IF;
+    INSERT INTO regime_history_revisions
+        (obs_date, regime, confidence, source, data_as_of, created_at, operation, reason, run_tag,
+         attributed)
+    VALUES
+        (OLD.obs_date, OLD.regime, OLD.confidence, OLD.source, OLD.data_as_of, OLD.created_at,
+         TG_OP, coalesce(why, 'unattributed: the writer named no grid.regime_history_reason'),
+         coalesce(run, 'unattributed: application_name ' || coalesce(app, '(none)')),
+         why IS NOT NULL AND run IS NOT NULL);
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    NEW.created_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION regime_history_revisions_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'regime_history_revisions is append-only: % refused', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS regime_history_keep_revisions ON regime_history;
+CREATE TRIGGER regime_history_keep_revisions
+    BEFORE UPDATE OR DELETE ON regime_history
+    FOR EACH ROW EXECUTE FUNCTION regime_history_keep_revisions();
+DROP TRIGGER IF EXISTS regime_history_no_truncate ON regime_history;
+CREATE TRIGGER regime_history_no_truncate
+    BEFORE TRUNCATE ON regime_history
+    FOR EACH STATEMENT EXECUTE FUNCTION regime_history_keep_revisions();
+DROP TRIGGER IF EXISTS regime_history_revisions_no_mutation ON regime_history_revisions;
+CREATE TRIGGER regime_history_revisions_no_mutation
+    BEFORE UPDATE OR DELETE ON regime_history_revisions
+    FOR EACH ROW EXECUTE FUNCTION regime_history_revisions_append_only();
+DROP TRIGGER IF EXISTS regime_history_revisions_no_truncate ON regime_history_revisions;
+CREATE TRIGGER regime_history_revisions_no_truncate
+    BEFORE TRUNCATE ON regime_history_revisions
+    FOR EACH STATEMENT EXECUTE FUNCTION regime_history_revisions_append_only();
+
 -- Partial index for conflict reporting
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict_detail
     ON resolved_series (feature_id, obs_date) WHERE conflict_flag = TRUE;
