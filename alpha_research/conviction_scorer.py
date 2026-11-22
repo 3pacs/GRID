@@ -35,7 +35,7 @@ from store.pit import retraction_cutoff
 @dataclass(frozen=True)
 class LayerResult:
     name: str
-    score: float
+    score: float  # may be negative (e.g., SMART_MONEY Form 4 net sell, capped at -2)
     max_score: float
     trust: float  # 0-1, how much we trust this data
     signals: tuple[str, ...]
@@ -50,6 +50,7 @@ class ConvictionReport:
     layers: tuple[LayerResult, ...]
     alert_level: str  # WATCH / PILOT / SCALE / FIRE / CONVICTION
     timestamp: str
+    unavailable_layers: tuple[str, ...] = ()
 
 
 def _resolve_as_of_date(as_of_date: date | None) -> date:
@@ -136,6 +137,33 @@ def _load_raw_series(
           AND pull_timestamp::date <= :as_of
         ORDER BY obs_date, pull_timestamp
     """), {"s": series_id, "d": cutoff, "as_of": as_of}).fetchall()
+    if not rows:
+        return pd.Series(dtype=float)
+    return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE wildcards (\\, %, _) for ESCAPE '\\' queries."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _load_raw_series_like(
+    conn,
+    series_pattern: str,
+    days: int = 90,
+    as_of_date: date | None = None,
+) -> pd.Series:
+    as_of = _resolve_as_of_date(as_of_date)
+    cutoff = as_of - timedelta(days=days)
+    rows = conn.execute(text("""
+        SELECT obs_date, value FROM raw_series
+        WHERE series_id LIKE :p ESCAPE '\\'
+          AND pull_status = 'SUCCESS'
+          AND obs_date >= :d
+          AND obs_date <= :as_of
+          AND pull_timestamp::date <= :as_of
+        ORDER BY obs_date, pull_timestamp
+    """), {"p": series_pattern, "d": cutoff, "as_of": as_of}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
@@ -253,8 +281,16 @@ def score_company(
     conn,
     ticker: str,
     as_of_date: date | None = None,
-) -> LayerResult:
+) -> LayerResult | None:
     """Layer 2: Is the company healthy? Revenue, EPS, shares, cash."""
+    # no XBRL:{ticker}:* writer exists in the repo (sec_xbrl_financials writes capital_flows); re-enable when a writer exists
+    log.debug(
+        "COMPANY layer unavailable for {t} (as_of={a}): no XBRL:* writer exists in raw_series",
+        t=ticker,
+        a=_resolve_as_of_date(as_of_date),
+    )
+    return None
+
     score = 0.0
     signals = []
     has_data = False
@@ -349,6 +385,20 @@ def score_company(
     return LayerResult("COMPANY", max(score, 0), 15, trust, tuple(signals), has_data)
 
 
+# Signed Form 4 point mapping over the trailing 90d window:
+#   Positive side keeps the +5 / +2 scale for net open-market buying.
+#   Negative side is capped at -2 because open-market net selling by insiders
+#   is mostly routine liquidity / 10b5-1 selling (not strong bearish conviction).
+#   Because of this negative branch, SMART_MONEY layer scores can be negative.
+#   Primary  — FORM4:{ticker}:OPEN_MKT_NET_VALUE (signed USD, open-market P/S):
+#     >= +$500k -> +5,  > $0 -> +2,  == $0 -> 0,  < $0 -> -2
+#   Fallback — FORM4:{ticker}:NET_SHARES (signed shares, when OPEN_MKT_NET_VALUE is empty):
+#     >= +10k   -> +5,  > 0  -> +2,  == 0  -> 0,  < 0  -> -2
+_FORM4_VALUE_STRONG_USD = 500_000.0
+_FORM4_SHARES_STRONG = 10_000.0
+_FORM4_SELL_CAP = -2.0
+
+
 def score_smart_money(
     conn,
     ticker: str,
@@ -359,21 +409,49 @@ def score_smart_money(
     signals = []
     has_data = False
 
-    # Form 4 monthly filing count (increasing = more insider activity)
-    f4 = _load_raw_series(conn, f"SEC_FORM4:{ticker}:monthly", 365, as_of_date=as_of_date)
-    if len(f4) >= 3:
+    # Form 4 signed open-market net dollar value (written by ingestion/edgar.py),
+    # falling back to signed NET_SHARES when OPEN_MKT_NET_VALUE has no rows.
+    f4_val = _load_raw_series(
+        conn, f"FORM4:{ticker}:OPEN_MKT_NET_VALUE", 90, as_of_date=as_of_date
+    ).dropna()
+    if not f4_val.empty:
         has_data = True
-        recent = f4.tail(3).mean()
-        older = f4.head(3).mean() if len(f4) >= 6 else recent
-        if recent > older * 1.5:
+        net_val = float(f4_val[~f4_val.index.duplicated(keep="last")].sum())
+        if net_val >= _FORM4_VALUE_STRONG_USD:
             score += 5
-            signals.append(f"Insider activity surging ({recent:.0f}/mo vs {older:.0f})")
-        elif recent > 3:
+            signals.append(f"Insider open-market net buy ${net_val:,.0f}")
+        elif net_val > 0:
             score += 2
-            signals.append(f"Active insider trading ({recent:.0f}/mo)")
+            signals.append(f"Insider open-market net buy ${net_val:,.0f}")
+        elif net_val < 0:
+            # Open-market insider selling is mostly routine liquidity/10b5-1; cap at -2.
+            score += _FORM4_SELL_CAP
+            signals.append(f"Insider open-market net sell ${abs(net_val):,.0f}")
+        else:
+            signals.append("Insider open-market flow flat")
+    else:
+        f4_shares = _load_raw_series(
+            conn, f"FORM4:{ticker}:NET_SHARES", 90, as_of_date=as_of_date
+        ).dropna()
+        if not f4_shares.empty:
+            has_data = True
+            net_shares = float(f4_shares[~f4_shares.index.duplicated(keep="last")].sum())
+            if net_shares >= _FORM4_SHARES_STRONG:
+                score += 5
+                signals.append(f"Insider net share buy +{net_shares:,.0f} sh")
+            elif net_shares > 0:
+                score += 2
+                signals.append(f"Insider net share buy +{net_shares:,.0f} sh")
+            elif net_shares < 0:
+                # Open-market insider selling is mostly routine liquidity/10b5-1; cap at -2.
+                score += _FORM4_SELL_CAP
+                signals.append(f"Insider net share sell {net_shares:,.0f} sh")
+            else:
+                signals.append("Insider net shares flat")
 
-    # Institutional flows (if available)
-    inst = _load_raw_series(conn, f"INST_FLOW:{ticker}:%", 90, as_of_date=as_of_date)
+    # Institutional flows (if available) — bound LIKE with escaped ticker wildcards.
+    inst_pattern = f"INST_FLOW:{_escape_like(ticker)}:%"
+    inst = _load_raw_series_like(conn, inst_pattern, 90, as_of_date=as_of_date).dropna()
     if not inst.empty:
         has_data = True
         if inst.iloc[-1] > 0:
@@ -383,7 +461,14 @@ def score_smart_money(
             signals.append("Institutional net outflow")
 
     trust = 0.85 if has_data else 0.15
-    return LayerResult("SMART_MONEY", min(score, 15), 15, trust, tuple(signals), has_data)
+    return LayerResult(
+        "SMART_MONEY",
+        max(_FORM4_SELL_CAP, min(score, 15.0)),
+        15,
+        trust,
+        tuple(signals),
+        has_data,
+    )
 
 
 def score_crowd(
@@ -575,6 +660,9 @@ def score_confirmation(price: pd.Series) -> LayerResult:
 # MAIN SCORER
 # ═══════════════════════════════════════════════════════════════
 
+MIN_COVERAGE_FOR_ALERT = 0.5
+
+
 def score_ticker(
     engine: Engine,
     ticker: str,
@@ -585,26 +673,38 @@ def score_ticker(
     with engine.connect() as conn:
         price = _load_price(conn, ticker, as_of_date=as_of)
 
-        layers = [
-            score_setup(conn, ticker, price, as_of_date=as_of),
-            score_company(conn, ticker, as_of_date=as_of),
-            score_smart_money(conn, ticker, as_of_date=as_of),
-            score_crowd(conn, ticker, as_of_date=as_of),
-            score_narrative(conn, ticker, as_of_date=as_of),
-            score_flow(conn, ticker, price, as_of_date=as_of),
-            score_confirmation(price),
+        named_layers: list[tuple[str, LayerResult | None]] = [
+            ("SETUP", score_setup(conn, ticker, price, as_of_date=as_of)),
+            ("COMPANY", score_company(conn, ticker, as_of_date=as_of)),
+            ("SMART_MONEY", score_smart_money(conn, ticker, as_of_date=as_of)),
+            ("CROWD", score_crowd(conn, ticker, as_of_date=as_of)),
+            ("NARRATIVE", score_narrative(conn, ticker, as_of_date=as_of)),
+            ("FLOW", score_flow(conn, ticker, price, as_of_date=as_of)),
+            ("CONFIRM", score_confirmation(price)),
         ]
 
-    # Weighted score
-    weighted_score = sum(layer.score * layer.trust for layer in layers)
-    weighted_max = sum(layer.max_score * layer.trust for layer in layers)
-    total = int(round(weighted_score / weighted_max * 100)) if weighted_max > 0 else 0
+    present_layers = tuple(layer for _, layer in named_layers if layer is not None)
+    available_layers = [layer for layer in present_layers if layer.data_available]
+    unavailable_layers = tuple(
+        name for name, layer in named_layers if layer is None or not layer.data_available
+    )
 
-    # Confidence = how much data we actually have
-    data_coverage = sum(1 for layer in layers if layer.data_available) / len(layers)
+    # Exclude never-written None layers (COMPANY) from the weighted total, while
+    # keeping data_available=False layers as before (counted as 0) so thin data
+    # cannot inflate total_score.
+    weighted_score = sum(layer.score * layer.trust for layer in present_layers)
+    weighted_max = sum(layer.max_score * layer.trust for layer in present_layers)
+    total = (
+        max(0, min(100, int(round(weighted_score / weighted_max * 100))))
+        if weighted_max > 0
+        else 0
+    )
+
+    # Confidence = how much data we actually have across the 7 designed layers
+    data_coverage = len(available_layers) / len(named_layers)
     confidence = total * data_coverage
 
-    # Alert level
+    # Alert level (coverage floor: thin data < 50% coverage is capped at WATCH)
     if total >= 85 and data_coverage >= 0.8:
         level = "CONVICTION"
     elif total >= 70:
@@ -618,13 +718,22 @@ def score_ticker(
     else:
         level = "PASS"
 
+    if data_coverage < MIN_COVERAGE_FOR_ALERT and level in {
+        "CONVICTION",
+        "FIRE",
+        "SCALE",
+        "PILOT",
+    }:
+        level = "WATCH"
+
     return ConvictionReport(
         ticker=ticker,
         total_score=total,
         confidence_pct=round(confidence, 1),
-        layers=tuple(layers),
+        layers=present_layers,
         alert_level=level,
         timestamp=pd.Timestamp.now().isoformat(),
+        unavailable_layers=unavailable_layers,
     )
 
 
@@ -671,3 +780,7 @@ def print_report(report: ConvictionReport) -> None:
             max=layer.max_score, t=layer.trust,
             sigs=" | ".join(layer.signals) if layer.signals else "[no data]",
         )
+    present_names = {layer.name for layer in report.layers}
+    for name in report.unavailable_layers:
+        if name not in present_names:
+            log.info("    - {name:12s} [unavailable]", name=name)

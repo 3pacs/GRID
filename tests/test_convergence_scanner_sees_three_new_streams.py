@@ -122,7 +122,8 @@ def seeded_engine() -> _FakeEngine:
             "signal_type": "NET_POSITION_DELTA",
             "signal_value": {"manager": f"FUND_{i}",
                              "action": "INCREASED",
-                             "pct_change": 0.4},
+                             "pct_change": 0.4,
+                             "period_end": sd.isoformat()},
         })
         rows.append({
             "source_type": "social",

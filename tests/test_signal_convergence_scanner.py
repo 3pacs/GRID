@@ -262,16 +262,18 @@ def _institutional_row(
     sdate: date,
     new_positions: int = 4,
     closed_positions: int = 1,
+    period_end: date | None = None,
 ) -> tuple:
-    payload = json.dumps(
-        {
-            "new_positions": new_positions,
-            "increased": 3,
-            "closed_positions": closed_positions,
-            "decreased": 0,
-            "total_changes": new_positions + 3 + closed_positions,
-        }
-    )
+    payload_dict: dict[str, Any] = {
+        "new_positions": new_positions,
+        "increased": 3,
+        "closed_positions": closed_positions,
+        "decreased": 0,
+        "total_changes": new_positions + 3 + closed_positions,
+    }
+    if period_end is not None:
+        payload_dict["period_end"] = period_end.isoformat()
+    payload = json.dumps(payload_dict)
     return (
         "BLACKROCK_CIK",
         sdate,
@@ -409,14 +411,16 @@ class TestExtractorDarkpool:
         engine = FakeEngine(FakeConnection(stream_rows={STREAM_DARKPOOL: rows}))
         sig = scs._scan_darkpool(engine, "AAPL", AS_OF, WINDOW, {})
         assert sig is not None
-        assert sig.direction == BEARISH
+        assert sig.direction == NEUTRAL
+        assert sig.raw_payload["avg_short_ratio"] == pytest.approx(0.75)
 
     def test_bullish_short_ratio(self) -> None:
         rows = [_darkpool_row(T3, spike_ratio=3.0, short_ratio=0.15)]
         engine = FakeEngine(FakeConnection(stream_rows={STREAM_DARKPOOL: rows}))
         sig = scs._scan_darkpool(engine, "AAPL", AS_OF, WINDOW, {})
         assert sig is not None
-        assert sig.direction == BULLISH
+        assert sig.direction == NEUTRAL
+        assert sig.raw_payload["avg_short_ratio"] == pytest.approx(0.15)
 
     def test_missing_table(self) -> None:
         engine = FakeEngine(FakeConnection(missing_streams={STREAM_DARKPOOL}))
@@ -477,7 +481,7 @@ class TestExtractorSmartMoney:
 
 class TestExtractorInstitutional:
     def test_net_buying(self) -> None:
-        rows = [_institutional_row(T3, new_positions=5, closed_positions=1)]
+        rows = [_institutional_row(T3, new_positions=5, closed_positions=1, period_end=T3)]
         engine = FakeEngine(
             FakeConnection(stream_rows={STREAM_INSTITUTIONAL: rows})
         )
@@ -486,7 +490,7 @@ class TestExtractorInstitutional:
         assert sig.direction == BULLISH
 
     def test_net_selling(self) -> None:
-        rows = [_institutional_row(T3, new_positions=0, closed_positions=6)]
+        rows = [_institutional_row(T3, new_positions=0, closed_positions=6, period_end=T3)]
         engine = FakeEngine(
             FakeConnection(stream_rows={STREAM_INSTITUTIONAL: rows})
         )
@@ -537,7 +541,7 @@ class TestExtractorPredictionMarket:
         assert sig.direction == BULLISH
 
     def test_bearish_shift(self) -> None:
-        rows = [_prediction_row(T3, direction="down", shift=0.18)]
+        rows = [_prediction_row(T3, direction="down", shift=-0.18)]
         engine = FakeEngine(
             FakeConnection(stream_rows={STREAM_PREDICTION_MARKET: rows})
         )
@@ -576,7 +580,7 @@ class TestConvergenceMath:
             _make_signal(s, BULLISH, 0.8, 1.0)
             for s in ALL_STREAM_NAMES[:5]
         ]
-        score, n_al, n_op, w_a, w_o, _ = _compute_convergence(sigs, BULLISH)
+        score, n_al, n_op, w_a, w_o = _compute_convergence(sigs, BULLISH)
         assert n_al == 5
         assert n_op == 0
         assert score >= 0.70
@@ -588,7 +592,7 @@ class TestConvergenceMath:
             _make_signal(s, BULLISH, 0.6, 1.0)
             for s in ALL_STREAM_NAMES[:3]
         ]
-        score, n_al, _, _, _, _ = _compute_convergence(sigs, BULLISH)
+        score, n_al, _, _, _ = _compute_convergence(sigs, BULLISH)
         assert n_al == 3
         assert score >= 0.50
 
@@ -599,24 +603,25 @@ class TestConvergenceMath:
             _make_signal("c", BEARISH, 0.9, 1.0),
             _make_signal("d", BEARISH, 0.9, 1.0),
         ]
-        score, n_al, n_op, w_a, w_o, _ = _compute_convergence(sigs, BULLISH)
+        score, n_al, n_op, w_a, w_o = _compute_convergence(sigs, BULLISH)
         assert n_al == 2
         assert n_op == 2
         assert w_o > w_a
 
-    def test_compute_neutral_half_weight(self) -> None:
-        """Neutral streams count at half weight."""
+    def test_compute_neutral_denominator_only(self) -> None:
+        """Neutral streams dilute via the denominator only (never add to numerator)."""
         sigs_full = [_make_signal("a", BULLISH, 1.0, 1.0)]
         sigs_with_neutral = [
             _make_signal("a", BULLISH, 1.0, 1.0),
             _make_signal("b", NEUTRAL, 1.0, 1.0),
         ]
-        score_full, _, _, _, _, _ = _compute_convergence(sigs_full, BULLISH)
-        score_n, _, _, _, _, w_neut = _compute_convergence(sigs_with_neutral, BULLISH)
-        assert w_neut == pytest.approx(0.5)
-        # score_n should still be high but not higher than score_full
-        # (denominator grew by 1.0 while numerator grew by 0.5).
-        assert score_n <= score_full
+        score_full, _, _, _, _ = _compute_convergence(sigs_full, BULLISH)
+        score_n, n_al, n_op, w_a, w_o = _compute_convergence(sigs_with_neutral, BULLISH)
+        assert (n_al, n_op) == (1, 0)
+        assert w_a == pytest.approx(1.0)
+        assert w_o == pytest.approx(0.0)
+        assert score_n == pytest.approx(0.5)
+        assert score_n < score_full
 
 
 class TestMultiplierLadder:
@@ -665,16 +670,16 @@ class TestMultiplierLadder:
 # ── scan_convergence integration ──────────────────────────────────────────
 
 def _five_aligned_rows() -> dict[str, list[tuple]]:
-    """Build five streams that all co-fire bullish in the window."""
+    """Build five directional streams that all co-fire bullish in the window."""
     return {
-        STREAM_CONGRESSIONAL: [_congress_row(T3, "BUY", 800_000.0)],
-        STREAM_INSIDER: [_insider_row(T3, "CLUSTER_BUY", 2_000_000.0)],
-        STREAM_DARKPOOL: [_darkpool_row(T3, spike_ratio=4.0, short_ratio=0.2)],
+        STREAM_CONGRESSIONAL: [_congress_row(T3, "BUY", 50_000_000.0)],
+        STREAM_INSIDER: [_insider_row(T3, "CLUSTER_BUY", 100_000_000.0)],
         STREAM_OPTIONS_FLOW: [
-            _whales_row(T3, direction="BULLISH", notional=5_000_000.0)
+            _whales_row(T3, direction="BULLISH", notional=10_000_000.0)
         ],
-        STREAM_INSTITUTIONAL: [
-            _institutional_row(T3, new_positions=6, closed_positions=0)
+        STREAM_SMART_MONEY: [_smart_money_row(T3, delta=100_000_000.0)],
+        STREAM_PREDICTION_MARKET: [
+            _prediction_row(T3, direction="UP", shift=0.45)
         ],
     }
 
@@ -702,7 +707,7 @@ class TestScanConvergence:
         report = scan_convergence(
             engine, ticker="AAPL", as_of=AS_OF, target_direction=BULLISH,
         )
-        assert report.n_aligned >= 4  # darkpool is bullish (short<0.3), insider cluster, congress, whales, 13f
+        assert report.n_aligned >= 4  # congress, insider cluster, whales, smart_money, prediction_market
         assert report.conviction_multiplier >= MULTIPLIER_SOLID
         assert len(report.evidence_chain) == report.n_active_streams
 
@@ -734,7 +739,7 @@ class TestScanConvergence:
                 _whales_row(T3, direction="BEARISH", notional=9_000_000.0)
             ],
             STREAM_PREDICTION_MARKET: [
-                _prediction_row(T3, direction="down", shift=0.35)
+                _prediction_row(T3, direction="down", shift=-0.35)
             ],
         }
         engine = FakeEngine(

@@ -165,42 +165,31 @@ def test_score_setup_bucket_maxes_on_extreme_macro_conditions(
     assert any("[EXTREME]" in signal for signal in result.signals)
 
 
-def test_score_company_buckets_growth_profit_buyback_and_cash(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    data = {
-        "XBRL:ABC:Revenues": _series([100.0, 120.0]),
-        "XBRL:ABC:EarningsPerShareDiluted": _series([-1.0, 1.0]),
-        "XBRL:ABC:CommonStockSharesOutstanding": _series([100.0, 90.0]),
-        "XBRL:ABC:CashAndCashEquivalentsAtCarryingValue": _series([60.0]),
-        "XBRL:ABC:Liabilities": _series([100.0]),
-    }
-
-    def fake_raw_series(_conn: Any, series_id: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return data.get(series_id, pd.Series(dtype=float))
-
-    monkeypatch.setattr(cs, "_load_raw_series", fake_raw_series)
-
-    result = cs.score_company(object(), "ABC", as_of_date=date(2026, 5, 13))
-
-    assert result.name == "COMPANY"
-    assert result.score == 15
-    assert result.trust == pytest.approx(0.90)
-    assert result.data_available is True
+def test_score_company_returns_none_without_xbrl_writer() -> None:
+    """No XBRL:* writer exists in raw_series, so COMPANY returns None (unavailable)."""
+    conn = _RecordingConn()
+    assert cs.score_company(conn, "ABC", as_of_date=date(2026, 5, 13)) is None
+    assert conn.calls == []
 
 
 def test_score_smart_money_buckets_insider_surge_and_inflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = {
-        "SEC_FORM4:ABC:monthly": _series([1.0, 1.0, 1.0, 3.0, 3.0, 3.0]),
+    exact_data = {
+        "FORM4:ABC:OPEN_MKT_NET_VALUE": _series([600_000.0]),
+    }
+    like_data = {
         "INST_FLOW:ABC:%": _series([-1.0, 2.0]),
     }
 
     def fake_raw_series(_conn: Any, series_id: str, *_args: Any, **_kwargs: Any) -> pd.Series:
-        return data.get(series_id, pd.Series(dtype=float))
+        return exact_data.get(series_id, pd.Series(dtype=float))
+
+    def fake_raw_series_like(_conn: Any, pattern: str, *_args: Any, **_kwargs: Any) -> pd.Series:
+        return like_data.get(pattern, pd.Series(dtype=float))
 
     monkeypatch.setattr(cs, "_load_raw_series", fake_raw_series)
+    monkeypatch.setattr(cs, "_load_raw_series_like", fake_raw_series_like)
 
     result = cs.score_smart_money(object(), "ABC", as_of_date=date(2026, 5, 13))
 
