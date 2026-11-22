@@ -63,7 +63,12 @@ def _recent_closes(conn: Any, series_id: str, n: int) -> list[Any]:
     )
 
 
-def _latest_daily_close(conn: Any, series_id: str) -> Any | None:
+def _latest_daily_close(
+    conn: Any,
+    series_id: str,
+    *,
+    now: datetime | None = None,
+) -> Any | None:
     """Newest policy-eligible yfinance daily close for ``series_id``, or ``None``.
 
     Matches ``ollama/market_briefing.py::_read_yf_snapshot_value``: reads via
@@ -71,21 +76,21 @@ def _latest_daily_close(conn: Any, series_id: str) -> Any | None:
     so in-progress intraday pulls are withheld rather than mixed with prior-day
     completed closes.
     """
-    now = datetime.now(timezone.utc)
+    ref_now = now if now is not None else datetime.now(timezone.utc)
     rows = read_daily_policy_n(
         conn,
         series_id,
         1,
         source="yfinance",
-        start=now.date() - timedelta(days=_YF_DAILY_LOOKBACK_DAYS),
-        as_of_ts=now,
+        start=ref_now.date() - timedelta(days=_YF_DAILY_LOOKBACK_DAYS),
+        as_of_ts=ref_now,
     )
     return rows[0] if rows else None
 
 
 def _is_unavailable_component(comp: SentimentComponent) -> bool:
     """True when a component abstained / has no directional reading."""
-    return comp.detail.endswith("available")
+    return comp.abstain_reason is not None or comp.detail.endswith("available")
 
 # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -100,7 +105,7 @@ DEFAULT_WEIGHTS = {
     "trend": 0.06,             # SPY vs 50d/200d moving averages
     # ── Volatility & Fear ──
     "volatility": 0.06,        # VIX absolute level
-    "vol_term_structure": 0.05, # VIX vs VIX3M (contango/backwardation)
+    "vol_term_structure": 0.05, # VIX/VIX3M spot term-structure slope
     "put_call_ratio": 0.05,    # Options put/call ratio
     # ── Flows & Positioning ──
     "flows": 0.08,             # Net dollar flows (inflow vs outflow)
@@ -154,6 +159,8 @@ class SentimentComponent:
     score: float          # Normalized to [-1, 1]
     weight: float         # Current weight
     detail: str           # Human-readable explanation
+    abstain_reason: str | None = None
+    obs_date: str | None = None
 
 
 @dataclass
@@ -177,6 +184,8 @@ class SentimentResult:
                     "score": round(c.score, 4),
                     "weight": round(c.weight, 4),
                     "detail": c.detail,
+                    **({"abstain_reason": c.abstain_reason} if c.abstain_reason is not None else {}),
+                    **({"obs_date": c.obs_date} if c.obs_date is not None else {}),
                 }
                 for c in self.components
             ],
@@ -306,6 +315,7 @@ def _score_flows(engine: Engine, days: int = 7) -> SentimentComponent:
                 "SELECT direction, SUM(amount_usd) "
                 "FROM dollar_flows "
                 "WHERE flow_date >= :cutoff AND flow_date <= :today "
+                "AND NOT (source_type = '13f' AND COALESCE(confidence, '') != 'derived') "
                 "GROUP BY direction"
             ), {"cutoff": cutoff, "today": today}).fetchall()
 
@@ -453,29 +463,131 @@ def _score_volatility(engine: Engine) -> SentimentComponent:
 
 
 def _score_vol_term_structure(engine: Engine) -> SentimentComponent:
-    """VIX vs VIX3M: contango = complacent (bullish), backwardation = fear (bearish)."""
+    """VIX/VIX3M spot term-structure slope: upward-sloping (VIX < VIX3M) = calm/bullish,
+    inverted (VIX > VIX3M) = fear/bearish.
+
+    Pairs VIX and VIX3M strictly on the same latest policy-eligible observation
+    date; abstains with an explicit reason when either leg is missing, invalid,
+    or observed on a different date.
+    """
     try:
+        now = datetime.now(timezone.utc)
         with engine.connect() as conn:
-            vix_obs = _latest_daily_close(conn, "YF:^VIX:close")
-            vix3m_obs = _latest_daily_close(conn, "YF:^VIX3M:close")
-            vix = vix_obs.value if vix_obs else None
-            vix3m = vix3m_obs.value if vix3m_obs else None
-            if vix and vix3m and vix3m > 0:
-                ratio = vix / vix3m
-                # ratio < 1 = contango (normal/bullish), > 1 = backwardation (fear)
-                score = max(-1.0, min(1.0, (1.0 - ratio) * 3))
-                as_of_note = (
-                    f"as of {vix_obs.obs_date}"
-                    if vix_obs.obs_date == vix3m_obs.obs_date
-                    else f"VIX {vix_obs.obs_date} / VIX3M {vix3m_obs.obs_date}"
+            vix_obs = _latest_daily_close(conn, "YF:^VIX:close", now=now)
+            vix3m_obs = _latest_daily_close(conn, "YF:^VIX3M:close", now=now)
+
+            if vix_obs is None and vix3m_obs is None:
+                return SentimentComponent(
+                    name="vol_term_structure",
+                    raw_value=0.0,
+                    score=0.0,
+                    weight=0.0,
+                    detail="VIX/VIX3M spot term-structure slope abstained (missing VIX and VIX3M closes): no data available",
+                    abstain_reason="missing_vix_and_vix3m",
+                )
+            if vix_obs is None:
+                log.info(
+                    "Sentiment vol_term_structure abstaining: missing VIX close (VIX3M as of {d3})",
+                    d3=vix3m_obs.obs_date,
                 )
                 return SentimentComponent(
-                    name="vol_term_structure", raw_value=ratio, score=score, weight=0.0,
-                    detail=f"VIX/VIX3M={ratio:.2f} {as_of_note} ({'contango' if ratio < 1 else 'backwardation'})",
+                    name="vol_term_structure",
+                    raw_value=0.0,
+                    score=0.0,
+                    weight=0.0,
+                    detail=(
+                        f"VIX/VIX3M spot term-structure slope abstained "
+                        f"(missing VIX close; VIX3M as of {vix3m_obs.obs_date}): "
+                        f"date-matched pair unavailable"
+                    ),
+                    abstain_reason="missing_vix",
                 )
+            if vix3m_obs is None:
+                log.info(
+                    "Sentiment vol_term_structure abstaining: missing VIX3M close (VIX as of {d1})",
+                    d1=vix_obs.obs_date,
+                )
+                return SentimentComponent(
+                    name="vol_term_structure",
+                    raw_value=0.0,
+                    score=0.0,
+                    weight=0.0,
+                    detail=(
+                        f"VIX/VIX3M spot term-structure slope abstained "
+                        f"(missing VIX3M close; VIX as of {vix_obs.obs_date}): "
+                        f"date-matched pair unavailable"
+                    ),
+                    abstain_reason="missing_vix3m",
+                )
+
+            if vix_obs.obs_date != vix3m_obs.obs_date:
+                log.info(
+                    "Sentiment vol_term_structure abstaining: mismatched observation dates "
+                    "(VIX={d1} vs VIX3M={d3})",
+                    d1=vix_obs.obs_date,
+                    d3=vix3m_obs.obs_date,
+                )
+                return SentimentComponent(
+                    name="vol_term_structure",
+                    raw_value=0.0,
+                    score=0.0,
+                    weight=0.0,
+                    detail=(
+                        f"VIX/VIX3M spot term-structure slope abstained "
+                        f"(mismatched observation dates: VIX {vix_obs.obs_date} vs VIX3M {vix3m_obs.obs_date}): "
+                        f"date-matched pair unavailable"
+                    ),
+                    abstain_reason="mismatched_observation_dates",
+                )
+
+            vix = float(vix_obs.value)
+            vix3m = float(vix3m_obs.value)
+            if not math.isfinite(vix) or not math.isfinite(vix3m) or vix <= 0 or vix3m <= 0:
+                log.warning(
+                    "Sentiment vol_term_structure abstaining: non-positive/non-finite closes "
+                    "on {d} (VIX={v1}, VIX3M={v3})",
+                    d=vix_obs.obs_date,
+                    v1=vix_obs.value,
+                    v3=vix3m_obs.value,
+                )
+                return SentimentComponent(
+                    name="vol_term_structure",
+                    raw_value=0.0,
+                    score=0.0,
+                    weight=0.0,
+                    detail=(
+                        f"VIX/VIX3M spot term-structure slope abstained "
+                        f"(invalid VIX/VIX3M close on {vix_obs.obs_date}): valid data unavailable"
+                    ),
+                    abstain_reason="invalid_vix_or_vix3m_value",
+                )
+
+            ratio = vix / vix3m
+            # ratio < 1 = upward-sloping spot term structure (calm/bullish),
+            # ratio > 1 = inverted spot term structure (near-term fear/bearish).
+            score = max(-1.0, min(1.0, (1.0 - ratio) * 3))
+            slope_state = (
+                "upward-sloping" if ratio < 1.0 else ("inverted" if ratio > 1.0 else "flat")
+            )
+            obs_iso = vix_obs.obs_date.isoformat()
+            return SentimentComponent(
+                name="vol_term_structure",
+                raw_value=ratio,
+                score=score,
+                weight=0.0,
+                detail=f"VIX/VIX3M spot term-structure slope={ratio:.2f} as of {obs_iso} ({slope_state})",
+                obs_date=obs_iso,
+            )
     except Exception as e:
         log.debug("Vol term structure scoring failed: {e}", e=e)
-    return SentimentComponent(name="vol_term_structure", raw_value=0.0, score=0.0, weight=0.0, detail="No data available")
+    return SentimentComponent(
+        name="vol_term_structure",
+        raw_value=0.0,
+        score=0.0,
+        weight=0.0,
+        detail="VIX/VIX3M spot term-structure slope abstained: no data available",
+        abstain_reason="query_error",
+    )
 
 
 def _score_breadth(engine: Engine) -> SentimentComponent:

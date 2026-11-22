@@ -197,9 +197,24 @@ def test_13f_skips_3part_metrics_and_unknown_actions():
     _insert_raw(engine, "13F:0001067983:037833100:UNKNOWN", filing_day, 50_000_000.0,
                 payload={"manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL"})
     _insert_raw(engine, "13F:0001067983:037833100:NEW", filing_day, 120_000_000.0,
-                payload={"manager_name": "Berkshire", "cusip": "037833100", "issuer_name": "APPLE INC", "ticker": "AAPL"})
+                payload={
+                    "manager_name": "Berkshire", "cusip": "037833100", "issuer_name": "APPLE INC",
+                    "ticker": "AAPL", "value_units": "usd", "value_multiplier": 1,
+                    "share_type": "SH", "prev_shares": 0, "curr_shares": 600_000,
+                    "delta_shares": 600_000, "curr_value_usd": 120_000_000.0,
+                    "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+                    "qualified_for_directional_flow": True,
+                })
     _insert_raw(engine, "13F:0001067983:594918104:DECREASED", filing_day, 45_000_000.0,
-                payload={"manager_name": "Berkshire", "cusip": "594918104", "issuer_name": "MICROSOFT CORP", "ticker": "MSFT"})
+                payload={
+                    "manager_name": "Berkshire", "cusip": "594918104", "issuer_name": "MICROSOFT CORP",
+                    "ticker": "MSFT", "value_units": "usd", "value_multiplier": 1,
+                    "share_type": "SH", "prev_shares": 300_000, "curr_shares": 150_000,
+                    "delta_shares": -150_000, "curr_value_usd": 45_000_000.0,
+                    "prev_value_usd": 90_000_000.0,
+                    "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+                    "qualified_for_directional_flow": True,
+                })
 
     flows = dollar_flows._normalize_13f_flows(engine, days=30)
 
@@ -225,18 +240,39 @@ def test_13f_dedups_vintages_and_respects_pit_as_of():
     _insert_raw(
         engine, "13F:0001067983:037833100:INCREASED", obs1, 10_000_000.0,
         pull_ts=datetime(2026, 11, 11, 10, 0, 0),
-        payload={"manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL"},
+        payload={
+            "manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL",
+            "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
+            "prev_shares": 100_000, "curr_shares": 150_000, "delta_shares": 50_000,
+            "curr_value_usd": 30_000_000.0, "prev_value_usd": 20_000_000.0,
+            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+            "qualified_for_directional_flow": True,
+        },
     )
     _insert_raw(
         engine, "13F:0001067983:037833100:INCREASED", obs1, 12_000_000.0,
         pull_ts=datetime(2026, 11, 15, 10, 0, 0),
-        payload={"manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL"},
+        payload={
+            "manager_name": "Berkshire", "cusip": "037833100", "ticker": "AAPL",
+            "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
+            "prev_shares": 100_000, "curr_shares": 160_000, "delta_shares": 60_000,
+            "curr_value_usd": 32_000_000.0, "prev_value_usd": 20_000_000.0,
+            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+            "qualified_for_directional_flow": True,
+        },
     )
     # Later filing obs2 on Nov 18 ($8M CLOSED).
     _insert_raw(
         engine, "13F:0001067983:594918104:CLOSED", obs2, 8_000_000.0,
         pull_ts=datetime(2026, 11, 18, 10, 0, 0),
-        payload={"manager_name": "Berkshire", "cusip": "594918104", "ticker": "MSFT"},
+        payload={
+            "manager_name": "Berkshire", "cusip": "594918104", "ticker": "MSFT",
+            "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
+            "prev_shares": 40_000, "curr_shares": 0, "delta_shares": -40_000,
+            "prev_value_usd": 8_000_000.0, "curr_value_usd": 0.0,
+            "flow_estimation_method": "delta_shares_x_prev_quarter_end_price",
+            "qualified_for_directional_flow": True,
+        },
     )
 
     # As of Nov 20: obs1 deduplicated to latest vintage ($12M), plus obs2 ($8M).
@@ -271,12 +307,26 @@ def test_13f_resolves_cusip_to_ticker_and_requires_real_ticker_for_sector_agg():
     # Row A: no ticker in payload, only cusip + issuer_name -> resolves via security_identifiers.
     _insert_raw(
         engine, "13F:0001067983:037833100:NEW", filing_day, 120_000_000.0,
-        payload={"manager_name": "Berkshire", "cusip": "037833100", "issuer_name": "APPLE INC"},
+        payload={
+            "manager_name": "Berkshire", "cusip": "037833100", "issuer_name": "APPLE INC",
+            "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
+            "prev_shares": 0, "curr_shares": 600_000, "delta_shares": 600_000,
+            "curr_value_usd": 120_000_000.0,
+            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+            "qualified_for_directional_flow": True,
+        },
     )
     # Row B: unmapped CUSIP, only issuer_name -> ticker must be None, NOT 'MYSTERY CORP'.
     _insert_raw(
         engine, "13F:0001067983:ZZZ999999:NEW", filing_day, 30_000_000.0,
-        payload={"manager_name": "Berkshire", "cusip": "ZZZ999999", "issuer_name": "MYSTERY CORP"},
+        payload={
+            "manager_name": "Berkshire", "cusip": "ZZZ999999", "issuer_name": "MYSTERY CORP",
+            "value_units": "usd", "value_multiplier": 1, "share_type": "SH",
+            "prev_shares": 0, "curr_shares": 150_000, "delta_shares": 150_000,
+            "curr_value_usd": 30_000_000.0,
+            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+            "qualified_for_directional_flow": True,
+        },
     )
 
     flows = dollar_flows._normalize_13f_flows(engine, days=30, cusip_map=None)
@@ -589,7 +639,8 @@ def test_sentiment_yf_reads_ignore_intraday_incomplete_and_match_market_briefing
 
     vts = sentiment_scorer._score_vol_term_structure(engine)
     assert vts.raw_value == pytest.approx(26.0 / 24.0)
-    assert "backwardation" in vts.detail
+    assert "VIX/VIX3M spot term-structure slope" in vts.detail
+    assert "inverted" in vts.detail
 
     fg = sentiment_scorer._score_fear_greed(engine)
     expected_fg = 100 - (26.0 - 10) * (100 / 30)

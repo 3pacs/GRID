@@ -73,6 +73,15 @@ _VWAP_MAX_AGE_TRADING_DAYS: int = 5
 # NUM_POSITIONS, TOP5_CONCENTRATION) and unrecognized actions are never flows.
 _VALID_13F_ACTIONS: frozenset[str] = frozenset({"NEW", "INCREASED", "DECREASED", "CLOSED"})
 
+# SEC Form 13F XML <value> cutover: whole dollars >= 2023-01-03, thousands earlier.
+_13F_DOLLAR_CUTOVER_DATE: date = date(2023, 1, 3)
+
+# Documented share-based flow estimation methods accepted for 13F directional flows.
+_QUALIFIED_13F_FLOW_METHODS: frozenset[str] = frozenset({
+    "delta_shares_x_curr_quarter_end_price",
+    "delta_shares_x_prev_quarter_end_price",
+})
+
 # Strict equity/ETF ticker pattern (rejects issuer names like "APPLE INC").
 _TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
 
@@ -888,6 +897,440 @@ def _normalize_lobbying(row: dict) -> dict | None:
 
 # ── 13F + ETF flow normalization (from raw_series) ───────────────────────
 
+def _parse_13f_shares(raw: Any) -> int | float | None:
+    """Parse a non-negative finite 13F share count, or ``None`` if invalid."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float):
+        if not math.isfinite(raw) or raw < 0:
+            return None
+        return int(raw) if raw.is_integer() else raw
+    if isinstance(raw, str):
+        cleaned = raw.replace(",", "").strip()
+        if not cleaned:
+            return None
+        try:
+            val = float(cleaned)
+        except ValueError:
+            return None
+        if not math.isfinite(val) or val < 0:
+            return None
+        return int(val) if val.is_integer() else val
+    return None
+
+
+def _parse_positive_float(raw: Any) -> float | None:
+    """Parse a strictly positive finite float, or ``None``."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return val
+
+
+def _parse_signed_number(raw: Any) -> float | None:
+    """Parse any finite numeric value (signed), or ``None``."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(str(raw).replace(",", "").strip() if isinstance(raw, str) else raw)
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _extract_13f_vintage_meta(payload: dict[str, Any], obs_date: date) -> dict[str, Any]:
+    """Extract filing/amendment vintage metadata from a 13F raw_payload."""
+    report_date = _as_date(
+        payload.get("report_date")
+        or payload.get("period_of_report")
+        or payload.get("quarter_end")
+    )
+    filing_date = _as_date(payload.get("filing_date") or payload.get("filed_date")) or obs_date
+    form_type = str(payload.get("form_type") or payload.get("form") or "").strip().upper()
+    replaces_acc = str(
+        payload.get("replaces_accession")
+        or payload.get("supersedes_accession")
+        or payload.get("restates_accession")
+        or payload.get("amended_accession")
+        or ""
+    ).strip()
+    amendment_type = str(payload.get("amendment_type") or "").strip().upper()
+    is_amendment = (
+        bool(payload.get("is_amendment"))
+        or form_type.endswith("/A")
+        or form_type in ("13F-A", "13F/A")
+        or bool(amendment_type)
+        or bool(replaces_acc)
+    )
+    filing_accession = str(payload.get("filing_accession") or "").strip()
+    return {
+        "report_date": report_date,
+        "filing_date": filing_date,
+        "form_type": form_type,
+        "is_amendment": is_amendment,
+        "amendment_type": amendment_type,
+        "filing_accession": filing_accession,
+        "replaces_accession": replaces_acc,
+    }
+
+
+def _resolve_13f_amendments(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Ensure amended 13F filings (13F-HR/A restatements) replace originals for
+    each filer-quarter instead of double counting.
+
+    Applies three deterministic, PIT-safe rules over already PIT-filtered rows:
+      1. Explicit accession supersession (``replaces_accession`` /
+         ``supersedes_accession`` / ``restates_accession``).
+      2. Filer-quarter ``(cik, report_date)`` replacement: full-filing
+         restatements (``13F-HR/A`` unless ``amendment_type == 'NEW HOLDINGS'``)
+         replace the entire original filing for that ``(cik, report_date)``.
+         ``NEW HOLDINGS`` add-ons supplement the winning base filing and only
+         override matching CUSIPs.
+      3. Per-position ``(cik, cusip, report_date or obs_date)`` dedup across
+         actions so direction flips (e.g. ``INCREASED`` -> ``DECREASED``) never
+         emit both sides.
+    """
+    superseded = 0
+
+    # 1. Explicit accession replacement (scoped by CIK)
+    replaced_accs: set[tuple[str, str]] = {
+        (c["cik"], c["meta"]["replaces_accession"])
+        for c in candidates
+        if c["meta"]["replaces_accession"]
+    }
+    after_explicit: list[dict[str, Any]] = []
+    for c in candidates:
+        acc = c["meta"]["filing_accession"]
+        if acc and (c["cik"], acc) in replaced_accs:
+            superseded += 1
+            continue
+        after_explicit.append(c)
+
+    # 2. Filer-quarter (cik, report_date) replacement
+    by_quarter: dict[tuple[str, date], list[dict[str, Any]]] = defaultdict(list)
+    no_quarter: list[dict[str, Any]] = []
+    for c in after_explicit:
+        rd = c["meta"]["report_date"]
+        if rd is not None:
+            by_quarter[(c["cik"], rd)].append(c)
+        else:
+            no_quarter.append(c)
+
+    after_quarter: list[dict[str, Any]] = list(no_quarter)
+    for _qk, q_rows in by_quarter.items():
+        restatement_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+        addon_rows: list[dict[str, Any]] = []
+        for c in q_rows:
+            m = c["meta"]
+            if m["amendment_type"] == "NEW HOLDINGS":
+                addon_rows.append(c)
+            else:
+                if m["filing_accession"]:
+                    gkey: tuple[Any, ...] = ("acc", m["filing_accession"])
+                else:
+                    gkey = ("date_form", m["filing_date"], m["is_amendment"], m["form_type"])
+                restatement_groups[gkey].append(c)
+
+        winning_date = date.min
+        if restatement_groups:
+            def _group_rank(items: list[dict[str, Any]]) -> tuple[date, int, datetime, str]:
+                max_fd = max(x["meta"]["filing_date"] for x in items)
+                any_am = 1 if any(x["meta"]["is_amendment"] for x in items) else 0
+                max_pt = max(_ts_utc(x["pull_ts"]) for x in items)
+                max_acc = max(x["meta"]["filing_accession"] for x in items)
+                return (max_fd, any_am, max_pt, max_acc)
+
+            winner_key = max(restatement_groups, key=lambda k: _group_rank(restatement_groups[k]))
+            winner_rows = restatement_groups[winner_key]
+            winner_rank = _group_rank(winner_rows)
+            winning_date = winner_rank[0]
+            for k, grp in restatement_groups.items():
+                if k == winner_key:
+                    after_quarter.extend(grp)
+                    continue
+                grp_rank = _group_rank(grp)
+                # Only supersede an earlier/distinct filing vintage (newer filing_date,
+                # an amendment, or two distinct non-empty accessions). A same-day
+                # non-amendment row lacking an accession stays eligible for per-CUSIP
+                # dedup and qualification/quarantine rather than being misclassified
+                # as a superseded vintage.
+                both_non_amend_same_day = (
+                    winner_rank[0] == grp_rank[0]
+                    and winner_rank[1] == 0
+                    and grp_rank[1] == 0
+                    and (not winner_rank[3] or not grp_rank[3])
+                )
+                if both_non_amend_same_day:
+                    after_quarter.extend(grp)
+                else:
+                    superseded += len(grp)
+
+        for addon in addon_rows:
+            if addon["meta"]["filing_date"] >= winning_date:
+                after_quarter.append(addon)
+            else:
+                superseded += 1
+
+    # 3. Per-position (cik, cusip, report_date or obs_date) dedup across actions
+    best_pos: dict[tuple[str, str, date], tuple[tuple[date, int, datetime, str], dict[str, Any]]] = {}
+    for c in after_quarter:
+        m = c["meta"]
+        period = m["report_date"] if m["report_date"] is not None else c["obs_date"]
+        pkey = (c["cik"], c["cusip"], period)
+        rank = (m["filing_date"], 1 if m["is_amendment"] else 0, _ts_utc(c["pull_ts"]), m["filing_accession"])
+        prev = best_pos.get(pkey)
+        if prev is None:
+            best_pos[pkey] = (rank, c)
+        else:
+            superseded += 1
+            if rank > prev[0]:
+                best_pos[pkey] = (rank, c)
+
+    survivors = [item[1] for item in best_pos.values()]
+    survivors.sort(key=lambda c: (c["obs_date"], c["cik"], c["cusip"]), reverse=True)
+    return survivors, superseded
+
+
+def _qualify_and_estimate_13f_flow(
+    action: str,
+    raw_val: Any,
+    payload: dict[str, Any],
+    obs_date: date,
+    meta: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Qualify a 13F position-change row and compute its share-based flow estimate.
+
+    Option (a) documented share-based estimate: ``|delta_shares| * stated price``
+    where stated price is the later quarter-end implied price
+    (``curr_value_usd / curr_shares``) for ``NEW``/``INCREASED``/``DECREASED``
+    and prior quarter-end implied price (``prev_value_usd / prev_shares``) for
+    ``CLOSED``.
+
+    Returns:
+      - ``(estimate_dict, None)`` for a qualified non-zero directional flow;
+      - ``(None, "zero_share_delta")`` when shares are unchanged (0 flow);
+      - ``(None, "quarantine:<reason>")`` for legacy whole-position, mixed or
+        unknown units, missing share counts, non-equity/PRN, or disqualified rows.
+    """
+    if payload.get("qualified_for_directional_flow") is False:
+        return None, "quarantine:failed_qualification"
+    if payload.get("put_call"):
+        return None, "quarantine:non_equity_option"
+
+    share_type = str(payload.get("share_type") or "").strip().upper()
+    if share_type and share_type != "SH":
+        return None, "quarantine:non_share_unit"
+
+    if (
+        str(payload.get("position_basis") or "").strip().lower() == "whole_position"
+        or payload.get("is_legacy_whole_position") is True
+    ):
+        return None, "quarantine:legacy_whole_position"
+
+    declared_method = payload.get("flow_estimation_method")
+    if declared_method is not None and str(declared_method).strip() not in _QUALIFIED_13F_FLOW_METHODS:
+        return None, "quarantine:unqualified_estimation_method"
+
+    # Unit verification: require explicit value_units='usd' (quarantines legacy
+    # pre-fix 1000x-multiplied rows, unknown-unit rows, and mixed-unit rows).
+    value_units = str(payload.get("value_units") or "").strip().lower()
+    if value_units != "usd":
+        return None, "quarantine:unknown_or_mixed_units"
+
+    effective_filing_date = meta["filing_date"] or obs_date
+    if "value_multiplier" in payload:
+        vm = payload.get("value_multiplier")
+        if isinstance(vm, bool) or vm not in (1, 1000):
+            return None, "quarantine:unknown_or_mixed_units"
+        expected_vm = 1 if effective_filing_date >= _13F_DOLLAR_CUTOVER_DATE else 1000
+        if vm != expected_vm:
+            return None, "quarantine:mixed_or_invalid_units"
+
+    if "prev_value_multiplier" in payload and payload.get("prev_filing_date"):
+        pvm = payload.get("prev_value_multiplier")
+        pfd = _as_date(payload.get("prev_filing_date"))
+        if isinstance(pvm, bool) or pvm not in (1, 1000):
+            return None, "quarantine:unknown_or_mixed_units"
+        if pfd is not None:
+            expected_pvm = 1 if pfd >= _13F_DOLLAR_CUTOVER_DATE else 1000
+            if pvm != expected_pvm:
+                return None, "quarantine:mixed_or_invalid_units"
+
+    raw_num = _parse_signed_number(raw_val)
+    curr_val = _parse_positive_float(payload.get("curr_value_usd"))
+    prev_val = _parse_positive_float(payload.get("prev_value_usd"))
+    stated_price = _parse_positive_float(payload.get("valuation_price_usd"))
+
+    if action in ("INCREASED", "DECREASED"):
+        prev_shares = _parse_13f_shares(payload.get("prev_shares"))
+        curr_shares = _parse_13f_shares(
+            payload.get("curr_shares") if "curr_shares" in payload else payload.get("shares")
+        )
+        if prev_shares is None or prev_shares <= 0 or curr_shares is None or curr_shares <= 0:
+            return None, "quarantine:missing_share_counts"
+
+        # Detect legacy whole-position row stored in raw_series.value on INCREASED
+        if (
+            action == "INCREASED"
+            and curr_val is not None
+            and raw_num is not None
+            and declared_method is None
+            and abs(raw_num - curr_val) / curr_val < 1e-6
+        ):
+            return None, "quarantine:legacy_whole_position"
+
+        delta_shares = curr_shares - prev_shares
+        if payload.get("delta_shares") is not None:
+            declared_delta = _parse_signed_number(payload.get("delta_shares"))
+            if declared_delta is None or abs(declared_delta - delta_shares) > 1e-6:
+                return None, "quarantine:inconsistent_share_delta"
+
+        if delta_shares == 0:
+            return None, "zero_share_delta"
+
+        if (action == "INCREASED" and delta_shares < 0) or (action == "DECREASED" and delta_shares > 0):
+            return None, "quarantine:action_share_direction_mismatch"
+
+        if curr_val is not None:
+            price = curr_val / curr_shares
+            if stated_price is not None and abs(price - stated_price) / price > 0.01:
+                return None, "quarantine:inconsistent_valuation_price"
+        elif stated_price is not None:
+            price = stated_price
+        else:
+            return None, "quarantine:missing_valuation_price"
+
+        estimated_flow = abs(delta_shares) * price
+        if not math.isfinite(estimated_flow) or estimated_flow <= 0:
+            return None, "quarantine:invalid_flow_estimate"
+
+        return {
+            "estimated_flow_usd": round(estimated_flow, 2),
+            "direction": "inflow" if delta_shares > 0 else "outflow",
+            "prev_shares": prev_shares,
+            "curr_shares": curr_shares,
+            "delta_shares": delta_shares,
+            "valuation_price_usd": round(price, 6),
+            "valuation_price_basis": "curr_quarter_end_implied",
+            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+            "holdings_value_delta_usd": (curr_val - prev_val) if (curr_val is not None and prev_val is not None) else None,
+        }, None
+
+    if action == "NEW":
+        curr_shares = _parse_13f_shares(
+            payload.get("curr_shares") if "curr_shares" in payload else payload.get("shares")
+        )
+        if curr_shares is None or curr_shares <= 0:
+            return None, "quarantine:missing_share_counts"
+        if payload.get("prev_shares") is not None:
+            ps = _parse_13f_shares(payload.get("prev_shares"))
+            if ps is None or ps != 0:
+                return None, "quarantine:inconsistent_new_position"
+
+        if curr_val is not None:
+            price = curr_val / curr_shares
+            if stated_price is not None and abs(price - stated_price) / price > 0.01:
+                return None, "quarantine:inconsistent_valuation_price"
+        elif stated_price is not None:
+            price = stated_price
+        elif raw_num is not None and raw_num > 0:
+            curr_val = raw_num
+            price = curr_val / curr_shares
+        else:
+            return None, "quarantine:missing_valuation_price"
+
+        estimated_flow = curr_shares * price
+        if not math.isfinite(estimated_flow) or estimated_flow <= 0:
+            return None, "quarantine:invalid_flow_estimate"
+
+        return {
+            "estimated_flow_usd": round(estimated_flow, 2),
+            "direction": "inflow",
+            "prev_shares": 0,
+            "curr_shares": curr_shares,
+            "delta_shares": curr_shares,
+            "valuation_price_usd": round(price, 6),
+            "valuation_price_basis": "curr_quarter_end_implied",
+            "flow_estimation_method": "delta_shares_x_curr_quarter_end_price",
+            "holdings_value_delta_usd": curr_val,
+        }, None
+
+    if action == "CLOSED":
+        prev_shares = _parse_13f_shares(
+            payload.get("prev_shares") if "prev_shares" in payload else payload.get("shares")
+        )
+        if prev_shares is None or prev_shares <= 0:
+            return None, "quarantine:missing_share_counts"
+        if payload.get("curr_shares") is not None:
+            cs = _parse_13f_shares(payload.get("curr_shares"))
+            if cs is None or cs != 0:
+                return None, "quarantine:inconsistent_closed_position"
+
+        if prev_val is not None:
+            price = prev_val / prev_shares
+            if stated_price is not None and abs(price - stated_price) / price > 0.01:
+                return None, "quarantine:inconsistent_valuation_price"
+        elif stated_price is not None:
+            price = stated_price
+        elif raw_num is not None and raw_num > 0:
+            prev_val = raw_num
+            price = prev_val / prev_shares
+        else:
+            return None, "quarantine:missing_valuation_price"
+
+        estimated_flow = prev_shares * price
+        if not math.isfinite(estimated_flow) or estimated_flow <= 0:
+            return None, "quarantine:invalid_flow_estimate"
+
+        return {
+            "estimated_flow_usd": round(estimated_flow, 2),
+            "direction": "outflow",
+            "prev_shares": prev_shares,
+            "curr_shares": 0,
+            "delta_shares": -prev_shares,
+            "valuation_price_usd": round(price, 6),
+            "valuation_price_basis": "prev_quarter_end_implied",
+            "flow_estimation_method": "delta_shares_x_prev_quarter_end_price",
+            "holdings_value_delta_usd": -prev_val if prev_val is not None else None,
+        }, None
+
+    return None, "quarantine:unknown_action"
+
+
+def _is_qualified_13f_dollar_flow_row(confidence: str | None, raw_evidence: Any) -> bool:
+    """True only when a persisted ``dollar_flows`` 13F row carries documented
+    share-based qualification (excludes legacy un-rebuilt mark-to-market rows)."""
+    if confidence != "derived":
+        return False
+    ev = raw_evidence
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(ev, dict):
+        return False
+    if ev.get("qualified_for_directional_flow") is not True:
+        return False
+    if str(ev.get("value_units") or "").strip().lower() != "usd":
+        return False
+    if str(ev.get("flow_estimation_method") or "").strip() not in _QUALIFIED_13F_FLOW_METHODS:
+        return False
+    delta = _parse_signed_number(ev.get("delta_shares"))
+    if delta is None or delta == 0:
+        return False
+    return True
+
+
 def _normalize_13f_flows(
     engine: Engine,
     days: int,
@@ -896,15 +1339,19 @@ def _normalize_13f_flows(
     as_of_ts: datetime | None = None,
     cusip_map: Any = _UNSET,
     skipped_counts: dict[str, int] | None = None,
+    quarantine_reasons: dict[str, int] | None = None,
 ) -> list[dict]:
-    """Extract 13F position changes (raw_series) and normalize to USD.
+    """Extract 13F position changes (raw_series) and compute share-based flow estimates.
 
     Only 4-part flow keys ``13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED}``
     are accepted; 3-part portfolio summaries (``TOTAL_VALUE``, ``NUM_POSITIONS``,
     ``TOP5_CONCENTRATION``) and unknown actions are skipped (fail closed).
-    Deduplicates vintages to the latest PIT-eligible pull per
-    ``(series_id, obs_date)`` and resolves CUSIPs to real tickers instead of
-    copying ``issuer_name``.
+    Resolves PIT-eligible vintages and 13F-HR/A amendments so restatements
+    replace originals for each filer-quarter instead of double counting.
+    Computes documented share-based estimates (``|delta_shares| * quarter-end
+    implied price``) so constant shares at a new price produce zero flow, and
+    quarantines legacy whole-position, mixed/unknown-unit, missing-share, and
+    unqualified rows with logged reasons and counts.
 
     Parameters:
         engine: SQLAlchemy engine.
@@ -914,7 +1361,10 @@ def _normalize_13f_flows(
         cusip_map: Optional CUSIP->ticker mapper override (None disables FTD
             CSV fallback; default lazily loads ``CusipTickerMap``).
         skipped_counts: Optional dict updated in place with ``future_date``,
-            ``non_flow_13f``, and ``unmapped_cusip`` counters.
+            ``non_flow_13f``, ``unmapped_cusip``, ``quarantined_13f``,
+            ``superseded_13f_vintages``, and ``zero_share_delta_13f``.
+        quarantine_reasons: Optional dict updated in place with per-reason
+            quarantine counts.
 
     Returns:
         List of normalized flow dicts.
@@ -927,6 +1377,9 @@ def _normalize_13f_flows(
     flows: list[dict] = []
     skipped_non_flow = 0
     unmapped_cusip = 0
+    zero_share_delta = 0
+    local_quarantine: dict[str, int] = defaultdict(int)
+    superseded_vintages = 0
 
     try:
         with engine.connect() as conn:
@@ -959,8 +1412,9 @@ def _normalize_13f_flows(
             has_inst_holdings = _table_exists(conn, "institutional_holdings")
             ticker_cache: dict[tuple[str, date], str | None] = {}
 
-            for series_id, obs_date, raw_val, raw_payload, _pull_ts in deduped:
-                # Strict 4-part flow key: 13F:{cik}:{cusip}:{action}
+            # Stage 1: parse 4-part keys and enforce PIT bounds before amendment resolution
+            candidates: list[dict[str, Any]] = []
+            for series_id, obs_date, raw_val, raw_payload, pull_ts in deduped:
                 parts = series_id.split(":")
                 if len(parts) != 4 or parts[0] != "13F" or not parts[1].strip() or not parts[2].strip():
                     skipped_non_flow += 1
@@ -978,12 +1432,6 @@ def _normalize_13f_flows(
                         skipped_counts["future_date"] = skipped_counts.get("future_date", 0) + 1
                     continue
 
-                if raw_val is None:
-                    continue
-                value_usd = float(raw_val)
-                if not math.isfinite(value_usd) or abs(value_usd) <= 0:
-                    continue
-
                 payload = raw_payload or {}
                 if isinstance(payload, str):
                     try:
@@ -993,7 +1441,52 @@ def _normalize_13f_flows(
                 if not isinstance(payload, dict):
                     payload = {}
 
-                direction = "inflow" if action in ("NEW", "INCREASED") else "outflow"
+                meta = _extract_13f_vintage_meta(payload, obs_date)
+                if meta["filing_date"] > effective_as_of:
+                    if skipped_counts is not None:
+                        skipped_counts["future_date"] = skipped_counts.get("future_date", 0) + 1
+                    continue
+
+                candidates.append({
+                    "series_id": series_id,
+                    "cik": cik,
+                    "cusip": cusip,
+                    "action": action,
+                    "obs_date": obs_date,
+                    "raw_val": raw_val,
+                    "payload": payload,
+                    "pull_ts": pull_ts,
+                    "meta": meta,
+                })
+
+            # Stage 2: resolve 13F-HR/A amendments & filer-quarter vintages before
+            # zero-delta / quarantine filtering so restatements supersede originals.
+            resolved_candidates, superseded_vintages = _resolve_13f_amendments(candidates)
+
+            # Stage 3: qualify rows and compute share-based flow estimates
+            for item in resolved_candidates:
+                cik = item["cik"]
+                cusip = item["cusip"]
+                action = item["action"]
+                obs_date = item["obs_date"]
+                raw_val = item["raw_val"]
+                payload = item["payload"]
+                meta = item["meta"]
+
+                estimate, reject_reason = _qualify_and_estimate_13f_flow(
+                    action, raw_val, payload, obs_date, meta
+                )
+                if reject_reason == "zero_share_delta":
+                    zero_share_delta += 1
+                    continue
+                if reject_reason is not None and reject_reason.startswith("quarantine:"):
+                    reason_key = reject_reason.split(":", 1)[1]
+                    local_quarantine[reason_key] += 1
+                    continue
+                if estimate is None:
+                    local_quarantine["failed_qualification"] += 1
+                    continue
+
                 manager_name = payload.get("manager_name") or cik
                 resolved_ticker = _resolve_13f_ticker(
                     conn,
@@ -1012,27 +1505,63 @@ def _normalize_13f_flows(
                     "source_type": "13f",
                     "actor_name": manager_name,
                     "ticker": resolved_ticker,
-                    "amount_usd": abs(value_usd),
-                    "direction": direction,
-                    "confidence": "confirmed",
+                    "amount_usd": estimate["estimated_flow_usd"],
+                    "direction": estimate["direction"],
+                    "confidence": "derived",
                     "evidence": {
                         "cusip": payload.get("cusip") or cusip,
                         "issuer_name": payload.get("issuer_name"),
                         "action": action,
                         "pct_change": payload.get("pct_change"),
-                        "shares": payload.get("shares"),
-                        "filing_accession": payload.get("filing_accession"),
+                        "shares": estimate["curr_shares"] if action != "CLOSED" else estimate["prev_shares"],
+                        "prev_shares": estimate["prev_shares"],
+                        "curr_shares": estimate["curr_shares"],
+                        "delta_shares": estimate["delta_shares"],
+                        "valuation_price_usd": estimate["valuation_price_usd"],
+                        "valuation_price_basis": estimate["valuation_price_basis"],
+                        "flow_estimation_method": estimate["flow_estimation_method"],
+                        "holdings_value_delta_usd": estimate["holdings_value_delta_usd"],
+                        "value_units": "usd",
+                        "qualified_for_directional_flow": True,
+                        "filing_accession": meta["filing_accession"] or payload.get("filing_accession"),
+                        "report_date": meta["report_date"].isoformat() if meta["report_date"] else None,
+                        "form_type": meta["form_type"] or None,
+                        "is_amendment": meta["is_amendment"],
                     },
                     "flow_date": obs_date,
                 })
 
+        quarantined_total = sum(local_quarantine.values())
+        if quarantine_reasons is not None:
+            for r_key, cnt in local_quarantine.items():
+                quarantine_reasons[r_key] = quarantine_reasons.get(r_key, 0) + cnt
         if skipped_counts is not None:
             skipped_counts["non_flow_13f"] = skipped_counts.get("non_flow_13f", 0) + skipped_non_flow
             skipped_counts["unmapped_cusip"] = skipped_counts.get("unmapped_cusip", 0) + unmapped_cusip
-        if skipped_non_flow or unmapped_cusip:
+            skipped_counts["quarantined_13f"] = skipped_counts.get("quarantined_13f", 0) + quarantined_total
+            skipped_counts["superseded_13f_vintages"] = (
+                skipped_counts.get("superseded_13f_vintages", 0) + superseded_vintages
+            )
+            skipped_counts["zero_share_delta_13f"] = (
+                skipped_counts.get("zero_share_delta_13f", 0) + zero_share_delta
+            )
+        if quarantined_total:
+            log.warning(
+                "13F normalization quarantined {q} non-qualified/legacy rows from directional flows "
+                "(reasons={reasons}, kept={k})",
+                q=quarantined_total,
+                reasons=dict(local_quarantine),
+                k=len(flows),
+            )
+        if skipped_non_flow or unmapped_cusip or superseded_vintages or zero_share_delta:
             log.debug(
-                "13F normalization kept {k} flows (skipped_non_flow={nf}, unmapped_cusip={uc})",
-                k=len(flows), nf=skipped_non_flow, uc=unmapped_cusip,
+                "13F normalization kept {k} flows (skipped_non_flow={nf}, unmapped_cusip={uc}, "
+                "superseded_vintages={sv}, zero_share_delta={zd})",
+                k=len(flows),
+                nf=skipped_non_flow,
+                uc=unmapped_cusip,
+                sv=superseded_vintages,
+                zd=zero_share_delta,
             )
     except Exception as exc:
         log.warning("13F flow normalization failed: {e}", e=str(exc))
@@ -1166,6 +1695,10 @@ class FlowNormalizationSummary(list):
         skipped_no_vwap: int = 0,
         skipped_stale_vwap: int = 0,
         skipped_future_date: int = 0,
+        quarantined_13f: int = 0,
+        quarantined_13f_reasons: dict[str, int] | None = None,
+        superseded_13f_vintages: int = 0,
+        zero_share_delta_13f: int = 0,
         by_source: dict[str, int] | None = None,
         persisted: int = 0,
         dry_run: bool = False,
@@ -1174,6 +1707,10 @@ class FlowNormalizationSummary(list):
         self.skipped_no_vwap = skipped_no_vwap
         self.skipped_stale_vwap = skipped_stale_vwap
         self.skipped_future_date = skipped_future_date
+        self.quarantined_13f = quarantined_13f
+        self.quarantined_13f_reasons = dict(quarantined_13f_reasons or {})
+        self.superseded_13f_vintages = superseded_13f_vintages
+        self.zero_share_delta_13f = zero_share_delta_13f
         self.by_source = by_source or {}
         self.persisted = persisted
         self.dry_run = dry_run
@@ -1185,6 +1722,10 @@ class FlowNormalizationSummary(list):
             "skipped_no_vwap": self.skipped_no_vwap,
             "skipped_stale_vwap": self.skipped_stale_vwap,
             "skipped_future_date": self.skipped_future_date,
+            "quarantined_13f": self.quarantined_13f,
+            "quarantined_13f_reasons": self.quarantined_13f_reasons,
+            "superseded_13f_vintages": self.superseded_13f_vintages,
+            "zero_share_delta_13f": self.zero_share_delta_13f,
             "by_source": self.by_source,
             "dry_run": self.dry_run,
         }
@@ -1294,8 +1835,14 @@ def normalize_all_flows(
 
     # 2. Normalize raw_series-based flows (13F + ETF), same future-date guard
     raw_skips: dict[str, int] = {}
+    quarantine_reasons: dict[str, int] = {}
     for f in (
-        _normalize_13f_flows(engine, days, skipped_counts=raw_skips)
+        _normalize_13f_flows(
+            engine,
+            days,
+            skipped_counts=raw_skips,
+            quarantine_reasons=quarantine_reasons,
+        )
         + _normalize_etf_flows(engine, days, skipped_counts=raw_skips)
     ):
         fdate = f.get("flow_date")
@@ -1305,6 +1852,9 @@ def normalize_all_flows(
         all_flows.append(f)
         by_source[f["source_type"]] += 1
     skipped_future_date += raw_skips.get("future_date", 0)
+    quarantined_13f = raw_skips.get("quarantined_13f", 0)
+    superseded_13f_vintages = raw_skips.get("superseded_13f_vintages", 0)
+    zero_share_delta_13f = raw_skips.get("zero_share_delta_13f", 0)
 
     # 3. Persist to dollar_flows table (skipped entirely in a dry run)
     persisted = 0
@@ -1314,13 +1864,17 @@ def normalize_all_flows(
     log.info(
         "Normalized {n} dollar flows across {d} days (persisted={p}, "
         "skipped_no_vwap={sv}, skipped_stale_vwap={ss}, "
-        "skipped_future_date={sf}, dry_run={dr})",
+        "skipped_future_date={sf}, quarantined_13f={q13}, "
+        "superseded_13f_vintages={sup13}, zero_share_delta_13f={zd13}, dry_run={dr})",
         n=len(all_flows),
         d=days,
         p=persisted,
         sv=skipped_no_vwap,
         ss=skipped_stale_vwap,
         sf=skipped_future_date,
+        q13=quarantined_13f,
+        sup13=superseded_13f_vintages,
+        zd13=zero_share_delta_13f,
         dr=dry_run,
     )
     return FlowNormalizationSummary(
@@ -1328,6 +1882,10 @@ def normalize_all_flows(
         skipped_no_vwap=skipped_no_vwap,
         skipped_stale_vwap=skipped_stale_vwap,
         skipped_future_date=skipped_future_date,
+        quarantined_13f=quarantined_13f,
+        quarantined_13f_reasons=quarantine_reasons,
+        superseded_13f_vintages=superseded_13f_vintages,
+        zero_share_delta_13f=zero_share_delta_13f,
         by_source=dict(by_source),
         persisted=persisted,
         dry_run=dry_run,
@@ -1544,7 +2102,8 @@ def get_aggregate_flows(
     with engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT source_type, actor_name, ticker, amount_usd, direction "
+                "SELECT source_type, actor_name, ticker, amount_usd, direction, "
+                "confidence, CASE WHEN source_type = '13f' THEN evidence ELSE NULL END "
                 "FROM dollar_flows "
                 "WHERE flow_date >= :cutoff AND flow_date <= :as_of"
             ),
@@ -1563,6 +2122,8 @@ def get_aggregate_flows(
 
     total_inflow = 0.0
     total_outflow = 0.0
+    quarantined_13f = 0
+    counted_rows = 0
 
     for r in rows:
         source_type = r[0]
@@ -1570,6 +2131,17 @@ def get_aggregate_flows(
         ticker = r[2]
         amount = float(r[3]) if r[3] else 0.0
         direction = r[4]
+        confidence = r[5] if len(r) > 5 else None
+        raw_evidence = r[6] if len(r) > 6 else None
+
+        if source_type == "13f" and not _is_qualified_13f_dollar_flow_row(confidence, raw_evidence):
+            quarantined_13f += 1
+            continue
+        if direction == "quarantined":
+            quarantined_13f += 1
+            continue
+
+        counted_rows += 1
 
         # Require a real ticker-to-sector mapping before sector aggregation.
         sector = _get_sector(ticker) if ticker else "Unknown"
@@ -1588,6 +2160,12 @@ def get_aggregate_flows(
             source_type_flows[source_type]["outflow"] += amount
             actor_flows[actor_name]["outflow"] += amount
         # Unsigned / neutral rows contribute no directional inflow or outflow.
+
+    if quarantined_13f:
+        log.warning(
+            "get_aggregate_flows: quarantined {n} legacy/unqualified 13f rows from directional totals",
+            n=quarantined_13f,
+        )
 
     # Compute net flows
     def _net(d: dict[str, float]) -> dict[str, float]:
@@ -1612,7 +2190,8 @@ def get_aggregate_flows(
         "total_outflow": total_outflow,
         "net_flow": total_inflow - total_outflow,
         "days": days,
-        "flow_count": len(rows),
+        "flow_count": counted_rows,
+        "quarantined_13f": quarantined_13f,
     }
 
 
