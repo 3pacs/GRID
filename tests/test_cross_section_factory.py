@@ -311,6 +311,7 @@ def test_a_sector_cut_is_a_replaced_name_proxy_that_matches_the_module_only_on_c
     far = [int(r) for r in nights[1:] if abs(ts0[r, 0] - ts0[r, 1:].mean()) > 0.05]
     r0 = far[len(far) // 2]
     energy = np.flatnonzero(panel.sector == 0)
+    panel.cc = panel.cc.copy()               # the loaded array can be a read-only view (pandas copy-on-write)
     panel.cc[r0 + 1, energy] = np.nan        # Energy's close-to-close outcomes of night r0 go missing; picks do not move
     res = X.evaluate(panel, run, states)[tid]
     ps, ks, ts = res["per_sector"], res["k_sector"], res["turnover_sector"]
