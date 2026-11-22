@@ -172,16 +172,25 @@ state recorded the evening before each decision day in the sector state record (
 market phase, Fed balance-sheet phase, VIX third, spike state, and for within-sector modules each sector, the three
 groups, the sector's own phase, and leading against lagging sectors. Cuts are descriptions of a searched sample.
 
-**What a cut is charged (2026-11-22).**
+**What a cut is charged (2026-11-22).** A cut's cost is a replaced-name cost proxy, conditional on the cut. It is
+not the cost of a book anyone traded on its own.
 - A cut of whole nights (year, market phase and the other night states) is the module on those nights, so it pays
   the module's cost.
-- A sector cut pays that sector's own turnover: the share of the sector's picks replaced since the module's previous
-  traded night (1 on the first night of a stretch, or when the sector did not trade the night before), at the run's
-  rate.
-- A cut of several sectors (a group, a sector phase, leading or lagging) pays its sectors' turnovers, weighted by
-  their names like its spread.
-- A name stays in its sector, so the sectors' turnovers weighted by their names give back the module's turnover
-  night by night.
+- A sector cut pays that sector's replaced-name share at the run's rate: the share of its current picks that were not
+  among its picks on the module's previous traded night. It is 1 on the first night of a stretch, or when the sector
+  did not trade the night before.
+- A cut of several sectors (a group, a sector phase, leading or lagging) pays its sectors' shares, weighted by their
+  names like its spread. A sector phase or leading/lagging cut changes its sectors from night to night, and moving
+  between those sets costs nothing here.
+- **The proxy counts entries only.** It divides the names that are new by the current book's size, as the module's
+  own `_turnover` does. A sector or a name that leaves the book, or a book that shrinks, is charged nothing for the
+  exit: `[A, B]` then `[A]` reads 0. Pricing holdings changes, exits included, would be a different measure.
+- **The identity with the module holds only on complete nights.** Weighted by their names, the shares of every
+  sector the module filled give back the module's turnover exactly, since a name stays in its sector. The cuts,
+  though, weight only the sectors with outcomes that night. On a night when a filled sector has none, the module's
+  turnover still counts that sector's picks (its gross does not), and the cuts leave it out. Take an unchanged
+  sector and an equal-sized, fully replaced sector without outcomes: the module's turnover is 0.5, and a cut of the
+  usable sector is charged 0.
 - Overnight and intraday turn over every name, so nothing changes there. On `close_1d` a slow sector used to be
   charged a fast one's churn and the other way round, which is the gap Codex found in the residual card's liquidity
   halves (#1363). Only the `net_bp` of those cuts, and the paid / did-not lists built from them, move.

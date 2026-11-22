@@ -694,8 +694,9 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
                 res["turnover"][r] = _turnover(last[1] if adjacent else None, lo, hi) if m["horizon"] == "close_1d" else 1.0
                 prev[m["trial_id"]] = (r, (lo, hi))
                 if m["ranking"] != "pooled":
-                    # each sector's own share replaced against its own picks the night before; their k-weighted mean
-                    # is the module's turnover, since a name stays in its sector
+                    # each filled sector's replaced-name share against its own picks the night before. Over every
+                    # filled sector their k-weighted mean is the module's turnover (a name stays in its sector); the
+                    # card's cuts weight only the sectors with outcomes, so they match the module on complete nights
                     before = prev_sector[m["trial_id"]][1] if adjacent else {}
                     for s, (lo_s, hi_s) in book.sector_picks.items():
                         res["turnover_sector"][r, s] = (_turnover(before.get(s), lo_s, hi_s)
@@ -776,8 +777,10 @@ def _cut(gross: np.ndarray, cost: np.ndarray) -> dict:
 def card(panel: Panel, res: dict, states: States, rate: float) -> dict:
     """Where the module paid: by year and by the states recorded the evening before each decision day.
 
-    ``rate`` is the cost of a turnover of 1 (sides x cost per side). A cut of whole nights pays the module's turnover;
-    a sector pays its own, and a cut of several sectors pays their turnovers weighted like its spread."""
+    ``rate`` is the cost of a turnover of 1 (sides x cost per side). A cut of whole nights pays the module's turnover.
+    A sector pays its own replaced-name share, and a cut of several sectors pays their shares weighted like its
+    spread. That is a cost proxy conditional on the cut, not an independently traded book. It counts entries only (an
+    exit or a shrinking book costs nothing), and its sectors are only those with outcomes that night."""
     gross = res["gross"]
     cost = rate * res["turnover"]
     traded = ~np.isnan(gross)
@@ -1239,7 +1242,11 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
                              sector_limit,
                              "cost is sides x cost x turnover at a flat rate per side, with no borrow fee on the short side",
                              ("the residual card knows five factors and the sector; whatever else the spread holds, a "
-                              "known effect the set lacks included, stays in its residual")],
+                              "known effect the set lacks included, stays in its residual"),
+                             ("a card's sector cuts pay a replaced-name cost proxy, not an independently traded book: "
+                              "the share of each sector's current picks that are new, weighted like the cut's spread over "
+                              "the sectors with outcomes that night; exits and a shrinking book cost nothing, and a cut "
+                              "matches the module's cost only on nights every filled sector has outcomes")],
         }
         write_once(out / "report.json", rep)
         with (out / "report.md").open("x", encoding="utf-8") as stream:

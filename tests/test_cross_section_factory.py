@@ -287,6 +287,54 @@ def test_each_sector_cut_pays_for_its_own_turnover(tmp_path):
     np.testing.assert_allclose(alone["turnover"][k], ts[k, 1], rtol=0, atol=1e-15)
 
 
+def test_a_sector_cut_is_a_replaced_name_proxy_that_matches_the_module_only_on_complete_nights(tmp_path):
+    # the proxy counts entries only: an exit, or a book that shrinks, costs nothing; an entry is charged
+    a, b = np.array([1, 2]), np.array([3, 4])
+    assert X._turnover((a, b), a[:1], b[:1]) == 0.0                              # [A, B] -> [A]
+    assert X._turnover((a[:1], b[:1]), a, b) == 0.5                              # [A] -> [A, B]
+    # Codex's case: sector A unchanged, an equal sector B fully replaced and without outcomes. The module's turnover
+    # is 0.5; a cut of the usable sector A is charged 0
+    A, B, B2 = np.array([1, 2]), np.array([3, 4]), np.array([5, 6])
+    assert X._turnover((np.r_[A, B], np.r_[A, B] + 10), np.r_[A, B2], np.r_[A, B2] + 10) == 0.5
+    assert X._turnover((A, A + 10), A, A + 10) == 0.0
+
+    build(tmp_path, tilt_of=lambda sym: 3.0 if sym.startswith("S0") else 0.0)  # Energy slow, the others churn
+    body = {**RUN, "signals": [{"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["close_1d"]}],
+            "rankings": ["within_sector"]}
+    tid = "on21|within_sector|q20|close_1d"
+    run = X.RunFile.from_dict(body)
+    panel = X.load_panel(tmp_path, run)
+    states = X.state_arrays(panel, X.load_state(tmp_path / "state.db"))
+    whole = X.evaluate(panel, run, states)[tid]
+    ts0 = whole["turnover_sector"]
+    nights = np.flatnonzero(~np.isnan(whole["turnover"]))
+    far = [int(r) for r in nights[1:] if abs(ts0[r, 0] - ts0[r, 1:].mean()) > 0.05]
+    r0 = far[len(far) // 2]
+    energy = np.flatnonzero(panel.sector == 0)
+    panel.cc[r0 + 1, energy] = np.nan        # Energy's close-to-close outcomes of night r0 go missing; picks do not move
+    res = X.evaluate(panel, run, states)[tid]
+    ps, ks, ts = res["per_sector"], res["k_sector"], res["turnover_sector"]
+    np.testing.assert_array_equal(np.nan_to_num(ts, nan=-1), np.nan_to_num(ts0, nan=-1))
+    np.testing.assert_array_equal(np.nan_to_num(res["turnover"], nan=-1), np.nan_to_num(whole["turnover"], nan=-1))
+    assert np.isnan(ps[r0, 0]) and ks[r0, 0] > 0                                 # filled and priced, no outcome
+
+    filled = ~np.isnan(ts)
+    usable = filled & ~np.isnan(ps)
+    over_filled = np.where(filled, ks * ts, 0).sum(axis=1) / np.where(filled, ks, 0).sum(axis=1).clip(min=1)
+    over_usable = np.where(usable, ks * ts, 0).sum(axis=1) / np.where(usable, ks, 0).sum(axis=1).clip(min=1)
+    traded = ~np.isnan(res["turnover"])
+    np.testing.assert_allclose(over_filled[traded], res["turnover"][traded], rtol=0, atol=1e-12)   # every night
+    complete = traded & (usable == filled).all(axis=1)
+    assert not complete[r0] and complete.sum() == traded.sum() - 1
+    np.testing.assert_allclose(over_usable[complete], res["turnover"][complete], rtol=0, atol=1e-12)
+    assert abs(over_usable[r0] - res["turnover"][r0]) > 0.02                     # the sparse night: the cuts differ
+
+    rate = 4 * run.cost_bp_per_side * 1e-4
+    c, c0 = X.card(panel, res, states, rate), X.card(panel, whole, states, rate)
+    assert c["sector"]["Energy"]["nights"] == c0["sector"]["Energy"]["nights"] - 1
+    assert c["sector"]["Utilities"] == c0["sector"]["Utilities"]                 # the other sectors are untouched
+
+
 def test_sign_flip_bar():
     rng = np.random.default_rng(1)
     x = rng.normal(0, 0.01, (1200, 25))
