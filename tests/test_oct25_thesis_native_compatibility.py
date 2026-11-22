@@ -314,24 +314,32 @@ def test_scorer_writer_invalid_unknown_before_effects(native_modules, native_pg_
 
 
 @pytest.mark.parametrize("directions,expected_counts,expected_score", [
-    (["bullish", "bullish", "bearish", "neutral", "other"], (2, 1, 1, 1), 7.2),
+    (["bullish", "bullish", "bearish", "neutral", "other"], (2, 1, 1, 1), 6.0),
     (["bullish"]*4+["bearish"]*4+["neutral"]*2, (4, 4, 2, 0), 0),
     (["other", None], (0, 0, 0, 2), 0),
 ])
 def test_category_denominator_native_sql(native_modules, native_pg_engine, directions, expected_counts, expected_score):
+    # One row per feature counts; a feature's older break, legacy rows (no
+    # provenance), breaks outside the fresh window and future rows do not.
     scorer = native_modules[1]
+    version = scorer.CHANGEPOINT_DETECTOR_VERSION
+    insert = text("INSERT INTO signal_registry VALUES (:t,:d,:c,1,NOW() + make_interval(hours => :h),"
+                  "'discovery.changepoint_detector','regime_change',:p)")
     with native_pg_engine.begin() as conn:
-        conn.execute(text("CREATE TABLE signal_registry (direction TEXT, confidence NUMERIC, value NUMERIC, valid_from TIMESTAMPTZ, source_module TEXT, signal_type TEXT)"))
-        for direction in directions:
-            conn.execute(text("INSERT INTO signal_registry VALUES (:d,:c,1,NOW(),'discovery.changepoint_detector','regime_change')"), {"d": direction, "c": 0 if direction in ("other", None) else 0.75})
+        conn.execute(text("CREATE TABLE signal_registry (ticker TEXT, direction TEXT, confidence NUMERIC, value NUMERIC, valid_from TIMESTAMPTZ, source_module TEXT, signal_type TEXT, provenance TEXT)"))
+        for i, direction in enumerate(directions):
+            conn.execute(insert, {"t": f"feature_{i}", "d": direction, "c": 0 if direction in ("other", None) else 0.75, "h": -1, "p": version})
+        for ticker, hours, provenance in (("feature_0", -48, version), ("legacy", -1, None),
+                                          ("stale", -24 * 6, version), ("future", 1, version)):
+            conn.execute(insert, {"t": ticker, "d": "bearish", "c": 1, "h": hours, "p": provenance})
     verdict = scorer._score_regime_changepoints(native_pg_engine, 0.5)
     counts = verdict["category_counts"]
     assert tuple(counts[k] for k in ("bullish", "bearish", "neutral", "other_unknown")) == expected_counts
-    assert counts["total"] == len(directions)
+    assert counts["total"] == len(directions) and counts["rows_read"] == len(directions) + 1
     assert counts["known_categories_exhaustive"] == (expected_counts[-1] == 0)
     assert verdict["score"] == expected_score
-    if expected_score == 7.2:
-        assert verdict["confidence"] == 72.5
+    if expected_score == 6.0:
+        assert verdict["confidence"] == 57.0
     assert "other/unknown" in verdict["data_point"]
 
 

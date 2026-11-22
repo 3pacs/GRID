@@ -4485,10 +4485,10 @@ The modules below are still on disk, so they keep their entries, but they do not
 #### `discovery/__init__.py` — 6 LOC
 **Docstring:** GRID discovery engine.
 
-#### `discovery/changepoint_detector.py` — 240 LOC
-**Docstring:** AutoBNN-powered changepoint detection for GRID's discovery pipeline.
-**Functions:** `ChangeReport`, `scan_for_changepoints`, `publish_regime_signals`, `run_changepoint_cycle`
-**Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `numpy`, `sqlalchemy`, `time`, `timeseries`, `typing`
+#### `discovery/changepoint_detector.py` — 623 LOC
+**Docstring:** Regime changepoints over GRID's declared regime features (#1301).
+**Functions:** `RegimeFeature`, `check_declared_features`, `FeatureBreak`, `ChangeReport`, `changepoint_signal_id`, `known_by`, `break_direction`, `scan_for_changepoints`, `publish_regime_signals`, `run_changepoint_cycle`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `numpy`, `pandas`, `scripts`, `sqlalchemy`, `store`, `time`, `timeseries`, `typing`
 
 #### `discovery/clustering.py` — 752 LOC
 **Docstring:** GRID cluster discovery engine.
@@ -4873,9 +4873,9 @@ The modules below are still on disk, so they keep their entries, but they do not
 **Reads:** `__future__`, `loguru`, `threading`, `timesfm`, `torch`, `typing`
 **Imported by:** `inference/timesfm_service.py`, `timeseries/timesfm_forecaster.py`
 
-#### `timeseries/autobnn.py` — 399 LOC
+#### `timeseries/autobnn.py` — 575 LOC
 **Docstring:** GRID AutoBNN — Interpretable Signal Decomposition.
-**Functions:** `DecompositionResult`, `RegimeChangeSignal`, `AutoBNNDecomposer`, `get_decomposer`
+**Functions:** `DecompositionResult`, `RegimeChangeSignal`, `causal_context_start`, `AutoBNNDecomposer`, `get_decomposer`
 **Reads:** `__future__`, `autobnn`, `config`, `dataclasses`, `datetime`, `jax`, `loguru`, `numpy`, `pandas`, `typing`
 **Imported by:** `discovery/changepoint_detector.py`
 

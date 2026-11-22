@@ -100,10 +100,19 @@ def connection_contract(connection, *, expected_schema):
     return expected_schema
 
 
+def _node_name(node):
+    if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+        return node.name
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        return node.targets[0].id
+    return None
+
+
 def load(path, names, **overrides):
+    """Exec exactly the named top-level functions, classes and constant assignments."""
     tree = ast.parse(SOURCES[path], filename=path)
-    nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
-    if {n.name for n in nodes} != set(names):
+    nodes = [n for n in tree.body if _node_name(n) in names]
+    if sorted(_node_name(n) for n in nodes) != sorted(set(names)):
         raise AssertionError("EXACT_AST_SELECTION_REQUIRED")
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)] + nodes, type_ignores=[])
     namespace = dict(__name__=__name__, Any=Any, datetime=Clock, timezone=timezone,
@@ -131,10 +140,17 @@ def tracker():
                           "get_thesis_history", "ThesisSnapshot", "_parse_json"])
 
 
-def categories(directions, confidences=None):
-    ns = load(PATHS[1], ["_verdict", "_score_regime_changepoints"])
+CHANGEPOINT_READER = ["DEFAULT_ACCURACY", "CHANGEPOINT_DETECTOR_VERSION", "CHANGEPOINT_FRESH_DAYS",
+                      "CHANGEPOINT_POINTS_PER_FEATURE", "CHANGEPOINT_SCORE_CAP",
+                      "CHANGEPOINT_CONFIDENCE_CAP", "_verdict", "_score_regime_changepoints"]
+
+
+def categories(directions, confidences=None, tickers=None):
+    """Reader over invented rows (ticker, direction, confidence, valid_from), newest first."""
+    ns = load(PATHS[1], CHANGEPOINT_READER)
     values = confidences if confidences is not None else [0.5] * len(directions)
-    boundary = MemoryBoundary([(d, c, 2.0, NOW) for d, c in zip(directions, values)])
+    names = tickers if tickers is not None else [f"SYNTH-{i}" for i in range(len(directions))]
+    boundary = MemoryBoundary([(t, d, c, NOW) for t, d, c in zip(names, directions, values)])
     return ns["_score_regime_changepoints"](boundary, 0.5), boundary
 
 
@@ -178,7 +194,7 @@ class ThesisContracts(unittest.TestCase):
 
     def test_T2_explicit_neutral_is_valid(self):
         out, _ = categories(["bullish"] * 4 + ["bearish"] * 4 + ["neutral"] * 2)
-        self.assertEqual(out["category_counts"], dict(total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, known_categories_exhaustive=True))
+        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, known_categories_exhaustive=True))
         self.assertEqual(out["score"], 0)
 
     def test_T2_other_unknown_is_not_neutral(self):
@@ -190,10 +206,39 @@ class ThesisContracts(unittest.TestCase):
 
     def test_T2_unknown_retains_original_denominator_and_confidence(self):
         out, boundary = categories(["bullish", "bullish", "bearish", "neutral", "unclassified"], [1, 1, 1, 0, 0])
-        self.assertEqual(out["score"], 7.2, "UNKNOWN_DENOMINATOR_MUST_REMAIN")
-        self.assertEqual(out["confidence"], 72.5)
+        # net 1 feature x 10 points x avg conf 0.6 (unknown in the denominator)
+        self.assertEqual(out["score"], 6.0, "UNKNOWN_DENOMINATOR_MUST_REMAIN")
+        self.assertEqual(out["confidence"], 57.0)
         self.assertEqual(out["category_counts"]["total"], 5)
-        self.assertIn("48 hours", boundary.statements[-1][0])
+        sql, params = boundary.statements[-1]
+        self.assertIn("make_interval(days => :days)", sql)
+        self.assertIn("valid_from <= NOW()", sql)
+        self.assertEqual(params["days"], 5)
+
+    def test_T2_counts_features_not_rows(self):
+        # One feature re-published many times counts once, by its latest break.
+        out, _ = categories(["bearish"] + ["bullish"] * 50 + ["bullish"],
+                            [0.5] * 52, ["vix_spot"] * 51 + ["sp500_full"])
+        c = out["category_counts"]
+        self.assertEqual((c["total"], c["bullish"], c["bearish"], c["rows_read"]), (2, 1, 1, 52), "FEATURES_NOT_ROWS")
+        self.assertEqual(out["score"], 0)
+        self.assertIn("2 features with a fresh break", out["data_point"])
+        self.assertIn("risk-off (vix_spot)", out["reasoning"])
+        self.assertIn("risk-on (sp500_full)", out["reasoning"])
+
+    def test_T2_contribution_is_capped(self):
+        out, _ = categories(["bearish"] * 12, [1.0] * 12)
+        self.assertEqual(out["score"], -30.0, "SCORE_CAP")
+        self.assertLessEqual(out["confidence"], 60.0, "CONFIDENCE_CAP")
+        self.assertEqual(out["direction"], "bearish")
+
+    def test_T2_only_the_current_detector_version_counts(self):
+        _, boundary = categories(["bullish"])
+        sql, params = boundary.statements[-1]
+        self.assertIn("provenance = :version", sql, "LEGACY_ROWS_IGNORED_BY_VERSION")
+        self.assertEqual(params["version"], "changepoint_detector/2")
+        self.assertEqual((params["src"], params["stype"]), ("discovery.changepoint_detector", "regime_change"))
+        self.assertNotIn("48 hours", sql)
 
     def test_T2_all_unknown_is_not_exhaustive(self):
         out, _ = categories([None, "BULLISH", "unmapped"])
@@ -206,15 +251,34 @@ class ThesisContracts(unittest.TestCase):
         self.assertEqual(out["status"], "no_data")
         self.assertNotIn("category_counts", out)
 
-    def test_T2_publisher_unchanged_declared_partition(self):
-        ns = load(PATHS[2], ["publish_regime_signals"])
+    def test_T2_publisher_declared_partition_by_stress_sign(self):
+        import numpy
+        ns = load(PATHS[2], ["CHANGEPOINT_DETECTOR_VERSION", "SOURCE_MODULE", "SIGNAL_TYPE", "_STAT_CLIP",
+                             "_INSERT_SQL", "_signal_params", "publish_regime_signals"],
+                  np=numpy, CAUSAL_PRE_WINDOW=60, CAUSAL_POST_WINDOW=10, CAUSAL_PEAK_WINDOW=3)
         boundary = MemoryBoundary()
-        report = SimpleNamespace(regime_changes=[SimpleNamespace(series_id=f"SYNTH-{i}", change_index=i, magnitude=1, confidence=0.5, pre_regime="stable", post_regime=r) for i, r in enumerate(["rising", "falling", "stable", "other"])])
-        self.assertEqual(ns["publish_regime_signals"](boundary, report), 4)
+        boundary.rowcount = 1
+        known = NOW - timedelta(hours=10)
+        later = NOW + timedelta(hours=1)
+        def brk(i, direction, valid_from=known, stat=4.2):
+            spec = SimpleNamespace(key=f"k{i}", concept="vol", stress_sign=1)
+            sig = SimpleNamespace(statistic=stat, confidence=0.7, magnitude=0.5, pre_regime="flat", post_regime="rising")
+            return SimpleNamespace(spec=spec, feature=f"SYNTH-{i}", feature_id=i, signal=sig,
+                                   signal_id=f"changepoint_detector/2:SYNTH-{i}:2026-10-20",
+                                   break_date=NOW.date(), confirm_date=NOW.date(), known_at_date=NOW.date(),
+                                   valid_from=valid_from, direction=direction, fresh=True)
+        report = SimpleNamespace(as_of=NOW.date(), fresh_breaks=[
+            brk(0, "bearish"), brk(1, "bullish", stat=-4.2), brk(2, "neutral", stat=0.0),
+            brk(3, "bearish", valid_from=later)])
+        self.assertEqual(ns["publish_regime_signals"](boundary, report, now=NOW), 3, "FUTURE_VALID_FROM_DEFERRED")
         params = [p for q, p in boundary.statements if "INSERT" in q]
-        self.assertEqual([p["direction"] for p in params], ["bullish", "bearish", "neutral", "neutral"])
-        self.assertTrue(all(p["vfrom"] == NOW for p in params))
-        self.assertIn('"post_regime": "other"', params[-1]["meta"])
+        self.assertEqual([p["direction"] for p in params], ["bearish", "bullish", "neutral"])
+        self.assertTrue(all(p["vfrom"] == known for p in params), "VALID_FROM_IS_KNOWN_AT_NOT_NOW")
+        self.assertTrue(all(p["version"] == "changepoint_detector/2" for p in params))
+        self.assertEqual(params[0]["sid"], "changepoint_detector/2:SYNTH-0:2026-10-20")
+        self.assertIn('"risk": "risk_off"', params[0]["meta"])
+        self.assertIn('"risk": "risk_on"', params[1]["meta"])
+        self.assertIn("WHERE NOT EXISTS (SELECT 1 FROM signal_registry WHERE signal_id = :sid)", boundary.statements[0][0])
 
     def test_T3_declared_units_disambiguate_one(self):
         f = tracker()["_snapshot_conviction_fraction"]

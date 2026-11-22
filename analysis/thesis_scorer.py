@@ -62,6 +62,21 @@ EVALUATION_WINDOW_DAYS = 5
 STALE_HOURS = 72  # data older than this gets downweighted
 DEFAULT_ACCURACY = 0.50  # start at coin-flip until we have history
 
+# Regime changepoints (_score_regime_changepoints). The detector
+# (discovery/changepoint_detector.py) stamps its version in
+# signal_registry.provenance and writes a break only while it is fresh; these
+# two values are its CHANGEPOINT_DETECTOR_VERSION and FRESH_BREAK_DAYS (a test
+# pins them together). Rows from the earlier detector (provenance NULL; about
+# 1.08M rows, and 59% of all registry rows written 2026-11-08..22) are ignored
+# by version, not deleted.
+CHANGEPOINT_DETECTOR_VERSION = "changepoint_detector/2"
+CHANGEPOINT_FRESH_DAYS = 5
+# Each feature with a fresh break moves the score by this times the average
+# confidence; the tally is capped so it can never dominate the thesis.
+CHANGEPOINT_POINTS_PER_FEATURE = 10.0
+CHANGEPOINT_SCORE_CAP = 30.0
+CHANGEPOINT_CONFIDENCE_CAP = 60.0
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # MODEL VERDICT (immutable output per model)
@@ -783,14 +798,21 @@ def _score_trust_convergence(engine: Engine, accuracy: float) -> dict:
 
 
 def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
-    """Regime changepoint signals from the discovery pipeline.
+    """Regime changepoints: which declared regime features broke recently.
 
-    Logic: The changepoint detector publishes regime change signals
-    (rising/falling/stable) to signal_registry every 12h.  Count
-    bullish vs bearish regime transitions in the last 48 hours.
+    Logic: discovery/changepoint_detector.py writes one signal_registry row
+    per point-in-time drift break on a declared regime feature (VIX, credit
+    spreads, curve, 10y, S&P 500, net liquidity, dollar, claims, breakevens),
+    stamped with its version in ``provenance``. ``direction`` is already the
+    risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Score scales with the net direction and average confidence of
-    the detected changepoints.
+    Counts *features*, not rows: the latest break per feature known in the
+    last CHANGEPOINT_FRESH_DAYS days. Only rows of
+    CHANGEPOINT_DETECTOR_VERSION count; the earlier detector's rows (about
+    1.08M, one per feature per index per 12 h scan) are ignored. Score = net
+    (risk-on minus risk-off features) x CHANGEPOINT_POINTS_PER_FEATURE x
+    average confidence, capped at +/-CHANGEPOINT_SCORE_CAP; confidence is
+    capped at CHANGEPOINT_CONFIDENCE_CAP.
     """
     try:
         with engine.connect() as conn:
@@ -806,51 +828,61 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 )
 
             rows = conn.execute(text(
-                "SELECT direction, confidence, value, valid_from "
+                "SELECT ticker, direction, confidence, valid_from "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
-                "AND valid_from >= NOW() - INTERVAL '48 hours' "
-                "ORDER BY valid_from DESC"
+                "AND provenance = :version "
+                "AND valid_from <= NOW() "
+                "AND valid_from > NOW() - make_interval(days => :days) "
+                "ORDER BY valid_from DESC "
+                "LIMIT :row_limit"
             ).bindparams(
                 src="discovery.changepoint_detector",
                 stype="regime_change",
+                version=CHANGEPOINT_DETECTOR_VERSION,
+                days=CHANGEPOINT_FRESH_DAYS,
+                row_limit=1000,
             )).fetchall()
 
+        window = f"{CHANGEPOINT_FRESH_DAYS}d"
         if not rows:
             return _verdict(
                 "regime_changepoints", "Regime Changepoints",
-                0, 0, "no recent signals", "",
-                "No regime change signals in last 48 hours.",
+                0, 0, "no fresh breaks", "",
+                f"No declared regime feature has a break known in the last {window} "
+                f"(detector {CHANGEPOINT_DETECTOR_VERSION}).",
                 status="no_data", historical_accuracy=accuracy,
             )
 
-        bullish = [r for r in rows if r[0] == "bullish"]
-        bearish = [r for r in rows if r[0] == "bearish"]
-        total = len(rows)
+        # Latest fresh break per feature (rows are newest first).
+        latest: dict[Any, Any] = {}
+        for r in rows:
+            latest.setdefault(r[0], r)
+        features = list(latest.values())
+        total = len(features)
+        bullish = sorted(str(r[0]) for r in features if r[1] == "bullish")
+        bearish = sorted(str(r[0]) for r in features if r[1] == "bearish")
         bull_count = len(bullish)
         bear_count = len(bearish)
-        neutral_count = sum(r[0] == "neutral" for r in rows)
+        neutral_count = sum(r[1] == "neutral" for r in features)
         other_count = total - bull_count - bear_count - neutral_count
 
-        # Average confidence across all signals (0-1 scale)
-        avg_conf = sum(float(r[1]) for r in rows) / total
-        # Average magnitude
-        avg_mag = sum(abs(float(r[2])) for r in rows) / total
+        # Average confidence over every counted feature, unknown ones included
+        avg_conf = sum(float(r[2] or 0) for r in features) / total
 
-        # Net direction: each signal ~ 12 points, scaled by avg confidence
         net = bull_count - bear_count
-        score = net * 12 * avg_conf
-        score = max(-80, min(80, score))
+        score = net * CHANGEPOINT_POINTS_PER_FEATURE * avg_conf
+        score = max(-CHANGEPOINT_SCORE_CAP, min(CHANGEPOINT_SCORE_CAP, score))
 
-        # Confidence: base from signal count and their confidence values
-        conf_base = 25
-        conf_volume = min(25, total * 5)
-        conf_quality = avg_conf * 25  # 0-25 from signal confidence
-        conf_accuracy = accuracy * 15
-        confidence = min(90, conf_base + conf_volume + conf_quality + conf_accuracy)
+        conf_base = 20
+        conf_volume = min(20, total * 4)
+        conf_quality = avg_conf * 20  # 0-20 from break confidence
+        conf_accuracy = accuracy * 10
+        confidence = min(CHANGEPOINT_CONFIDENCE_CAP,
+                         conf_base + conf_volume + conf_quality + conf_accuracy)
 
-        # Data age from most recent signal
+        # Data age from most recent break
         most_recent = rows[0][3]  # valid_from of most recent
         age_hours = None
         if most_recent:
@@ -860,31 +892,40 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             except Exception as exc:
                 log.warning("Failed to compute regime changepoints age: {e}", e=exc)
 
+        def _named(names: list[str]) -> str:
+            return f" ({', '.join(names)})" if names else ""
+
         result = _verdict(
             "regime_changepoints", "Regime Changepoints",
             score, confidence,
             data_point=(
+                f"{total} feature{'s' if total != 1 else ''} with a fresh break: "
                 f"{bull_count} bullish, {bear_count} bearish, "
                 f"{neutral_count} neutral, {other_count} other/unknown "
-                f"(48h, avg conf {avg_conf:.0%})"
+                f"({window}, avg conf {avg_conf:.0%})"
             ),
-            threshold="each changepoint ~ +/-12 pts scaled by confidence; net direction determines signal",
+            threshold=(
+                f"each feature ~ +/-{CHANGEPOINT_POINTS_PER_FEATURE:g} pts scaled by confidence, "
+                f"capped at +/-{CHANGEPOINT_SCORE_CAP:g}; latest break per feature in {window}"
+            ),
             reasoning=(
-                f"{total} regime changepoints in 48h: "
-                f"{bull_count} bullish, {bear_count} bearish. "
-                f"{neutral_count} explicitly neutral; {other_count} other/unknown. "
-                f"Average confidence {avg_conf:.0%}, magnitude {avg_mag:.2f}. "
-                + ("Net bullish regime shifts suggest improving conditions. "
+                f"{total} declared regime feature{'s' if total != 1 else ''} broke in the last {window}: "
+                f"{bull_count} toward risk-on{_named(bullish)}, "
+                f"{bear_count} toward risk-off{_named(bearish)}. "
+                f"{neutral_count} neutral; {other_count} other/unknown. "
+                f"Average confidence {avg_conf:.0%}. "
+                + ("Net risk-on regime shifts suggest improving conditions. "
                    if net > 0
-                   else "Net bearish regime shifts suggest deteriorating conditions. "
+                   else "Net risk-off regime shifts suggest deteriorating conditions. "
                    if net < 0
                    else "Balanced regime shifts — no clear directional signal. ")
-                + "Changepoints detect structural breaks in feature time series."
+                + f"Point-in-time drift breaks, detector {CHANGEPOINT_DETECTOR_VERSION}."
             ),
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
         )
         result["category_counts"] = {
+            "unit": "features", "rows_read": len(rows),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
             "known_categories_exhaustive": other_count == 0,
@@ -2451,6 +2492,17 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
                 "regime_changepoints": 1.3,
                 "supply_chain": 0.7,
                 "crucix_osint": 1.5, "gdelt_geopolitical": 1.4,
+            }
+        elif regime == "FRAGILE":
+            # scripts/auto_regime.py's elevated-stress state (stress index
+            # above 0.6 or rising fast; posture DEFENSIVE): the CRISIS tilts
+            # at half strength.
+            adjustments = {
+                "dealer_gamma": 1.2, "vanna_charm": 1.2,
+                "capital_flows": 1.1, "trust_convergence": 1.15,
+                "regime_changepoints": 1.15,
+                "supply_chain": 0.85,
+                "crucix_osint": 1.25, "gdelt_geopolitical": 1.2,
             }
         elif regime in ("EXPANSION", "RISK_ON", "GROWTH"):
             adjustments = {
