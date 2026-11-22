@@ -283,16 +283,13 @@ jobs:
             exit 1
           fi
 
-      # Eligibility change log (eligibility_core_20261122 +
-      # scripts/apply_eligibility_change.py, #1301): proves on real PostgreSQL
-      # that the migration creates only the append-only log and flips no flag,
-      # that the application role can read it but never write a pre-image,
-      # that --apply refuses without the Oracle polarity and auto_regime
-      # hysteresis prerequisites, without an owner-approved evidence receipt
-      # that still matches every running unit's process and tree, or without
-      # migration authority, and that a rollback restores only its own change
-      # set and refuses any divergence (rolling back set 2 leaves set 1's
-      # vix_spot enabled). A skip must fail.
+      # Eligibility change log (eligibility_core_20261122, #1301): proves on
+      # real PostgreSQL that the migration creates only the append-only log
+      # and flips no flag, that the application role can read it but never
+      # write a pre-image, that its constraints refuse a malformed change,
+      # that downgrade refuses once a change is recorded, and that an
+      # app-role deploy warns with the ownership statements. Nothing in this
+      # release writes to the log. A skip must fail.
       - name: Eligibility change log PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -301,8 +298,8 @@ jobs:
           TESTING: "true"
         run: |
           set -o pipefail
-          python -m pytest tests/test_eligibility_core_migration_pg.py tests/test_apply_eligibility_change.py \
-            -q -rA | tee /tmp/grid-eligibility-migration-pg.txt
+          python -m pytest tests/test_eligibility_core_migration_pg.py -q -rA \
+            | tee /tmp/grid-eligibility-migration-pg.txt
           if grep -q "SKIPPED" /tmp/grid-eligibility-migration-pg.txt; then
             echo "::error::Eligibility change log PostgreSQL contract was skipped"
             exit 1

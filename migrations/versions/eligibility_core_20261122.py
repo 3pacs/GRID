@@ -6,10 +6,10 @@ Create Date: 2026-11-22 00:00:00.000000
 
 ``feature_registry.model_eligible`` is a global switch read by the Oracle, inference, discovery, feature
 selection and the auto_regime BUY gate, and every deploy runs ``alembic upgrade head``. So this migration
-flips nothing: a deploy only creates the place where a change is recorded. The flags change only when an
-operator runs ``scripts/apply_eligibility_change.py --apply``, which refuses until the Oracle polarity fix
-and auto_regime's own bindings plus hysteresis (#1307) are in the deployed code, and refuses unless it is
-connected as this table's owner (migration authority).
+flips nothing: a deploy only creates the place where a change is recorded. Nothing in this release writes to
+it. The tool that changes flags (``--apply``, its owner-approved evidence receipt and its rollback) is a
+separate reviewed PR, held until the Oracle polarity fix and auto_regime's own bindings plus hysteresis
+(#1307) are deployed. Until then the table stays empty.
 
 What it creates:
 
@@ -22,9 +22,9 @@ What it creates:
   revokes everything, so default privileges cannot widen it.
 
 When the role running this migration is ``grid`` itself (the deploy hook sources the application's env),
-``grid`` owns the table and no grant can stop it writing. The migration still succeeds and logs a warning;
-``scripts/apply_eligibility_change.py`` then refuses every write until a superuser moves the ownership
-(a dry run prints the statements).
+``grid`` owns the table and no grant can stop it writing. The migration still succeeds and logs a warning
+that lists the ownership statements; any future writer must refuse while ``grid`` owns the table or the
+function its triggers run.
 
 Downgrade drops the table only while it is empty. Once any change is recorded it refuses, because the
 rows are the only record of what each flag was before.
@@ -116,6 +116,17 @@ SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :role)
                    'MEMBER')
 """)
 
+# What a superuser runs, once, when the application role owns the log (logged by upgrade()).
+# grid_eligibility_owner is an example name; grid must not be a member of it.
+OWNERSHIP_FIX_SQL = (
+    "CREATE ROLE grid_eligibility_owner NOLOGIN;",
+    "ALTER TABLE feature_eligibility_changes OWNER TO grid_eligibility_owner;",  # its id sequence moves with it
+    "ALTER FUNCTION feature_eligibility_changes_append_only() OWNER TO grid_eligibility_owner;",
+    "REVOKE ALL ON feature_eligibility_changes FROM grid;",
+    "REVOKE ALL ON SEQUENCE feature_eligibility_changes_id_seq FROM grid;",
+    "GRANT SELECT ON feature_eligibility_changes TO grid;",
+)
+
 REFUSE_DOWNGRADE_WITH_HISTORY = """
 DO $$
 BEGIN
@@ -142,8 +153,8 @@ def upgrade() -> None:
     if op.get_bind().execute(APP_OWNS_THE_LOG, {"role": APP_ROLE}).scalar():
         log.warning(
             "feature_eligibility_changes: the application role %s owns it (or is a member of its owner), so it "
-            "can write pre-images. scripts/apply_eligibility_change.py refuses every write until a superuser "
-            "moves the ownership; its dry run prints the statements.", APP_ROLE)
+            "could write pre-images. Nothing writes to it in this release; before any tool records a change, a "
+            "superuser should run: %s", APP_ROLE, " ".join(OWNERSHIP_FIX_SQL))
 
 
 def downgrade() -> None:
