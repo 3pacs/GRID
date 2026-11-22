@@ -16,11 +16,20 @@ with full provenance (hypothesis ID, signal strength, physics score).
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+#: Minimum closed trades required before sizing via Kelly criterion
+#: (matches the auto-kill threshold in PaperTradingEngine._check_kill).
+MIN_TRADES_FOR_KELLY: int = 20
+
+#: Maximum single-trade position fraction from half-Kelly sizing.
+MAX_KELLY_FRACTION: float = 0.25
 
 
 class PaperTradingEngine:
@@ -353,23 +362,39 @@ class PaperTradingEngine:
 
     def kelly_position_size(
         self, win_rate: float, avg_win: float, avg_loss: float,
-        max_fraction: float = 0.25,
+        max_fraction: float = MAX_KELLY_FRACTION,
     ) -> float:
         """Compute Kelly criterion position size.
 
-        Returns fraction of capital to risk (capped at max_fraction).
+        Returns fraction of capital to risk (capped at max_fraction), or 0.0
+        when edge is non-positive or inputs are invalid/non-finite.
         """
-        if avg_loss == 0 or win_rate <= 0:
+        if not (
+            math.isfinite(win_rate)
+            and math.isfinite(avg_win)
+            and math.isfinite(avg_loss)
+            and math.isfinite(max_fraction)
+        ):
+            return 0.0
+        if max_fraction <= 0 or win_rate <= 0 or win_rate > 1.0 or avg_win <= 0:
+            return 0.0
+        if avg_loss == 0:
+            # Valid only with zero losses (win_rate == 1.0): f* = p - q/b = 1.0
+            # -> half-Kelly = 0.5, capped at max_fraction.
+            if win_rate == 1.0:
+                return float(min(0.5, max_fraction))
             return 0.0
 
         # Kelly: f* = (bp - q) / b
-        # b = avg_win / avg_loss, p = win_rate, q = 1 - p
+        # b = avg_win / |avg_loss|, p = win_rate, q = 1 - p
         b = abs(avg_win / avg_loss)
+        if b <= 0 or not math.isfinite(b):
+            return 0.0
         p = win_rate
-        q = 1 - p
+        q = 1.0 - p
 
         kelly = (b * p - q) / b
         # Half-Kelly for safety
-        half_kelly = kelly / 2
+        half_kelly = kelly / 2.0
 
-        return max(0, min(half_kelly, max_fraction))
+        return float(max(0.0, min(half_kelly, max_fraction)))

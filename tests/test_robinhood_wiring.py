@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -200,15 +200,23 @@ class TestTradablePairs:
 
 
 class TestVenueTag:
-    def _tag(self, wallet=None, **kw):
+    def _tag(self, wallet=None, venue="spot_test", **kw):
         from trading.signal_executor import VenueTag
 
-        return VenueTag("robinhood", StubTrader(**kw), wallet)
+        return VenueTag(venue, StubTrader(**kw), wallet)
 
-    def test_long_crypto_signal_is_routed(self):
-        tag = self._tag(wallet={"id": "w1", "current_capital": 500.0, "status": "ACTIVE"})
+    def test_robinhood_mirror_refuses_open_orders_fail_closed(self):
+        tag = self._tag(venue="robinhood", wallet={"id": "w1", "current_capital": 500.0, "status": "ACTIVE"})
         order = tag.submit("btc_close", "LONG", 0.1)
         assert order["venue"] == "robinhood" and order["wallet_id"] == "w1"
+        assert order["error"] == "robinhood mirror disabled: close mirroring not implemented"
+        assert order["result"]["status"] == "disabled"
+        assert tag.trader.orders == []
+
+    def test_long_crypto_signal_is_routed_for_enabled_venue(self):
+        tag = self._tag(wallet={"id": "w1", "current_capital": 500.0, "status": "ACTIVE"})
+        order = tag.submit("btc_close", "LONG", 0.1)
+        assert order["venue"] == "spot_test" and order["wallet_id"] == "w1"
         assert order["asset"] == "BTC" and order["size_usd"] == 50.0
         assert order["result"]["status"] == "dry_run"
         assert tag.trader.orders == [{"ticker": "BTC", "direction": "LONG", "size_usd": 50.0}]
@@ -262,57 +270,13 @@ class TestBuildVenueTag:
         with pytest.raises(ValueError, match="Unsupported venue"):
             se.build_venue_tag(mock_engine, "coinbase")
 
-    def test_unconfigured_connector_degrades_to_paper(self, mock_engine):
+    def test_robinhood_venue_fails_closed(self, mock_engine):
         from trading import signal_executor as se
 
-        with patch("trading.robinhood.get_robinhood_trader",
-                   return_value=StubTrader(configured=False)):
-            assert se.build_venue_tag(mock_engine, "robinhood") is None
-
-    def test_killed_wallet_routes_nothing(self, mock_engine):
-        from trading import signal_executor as se
-
-        wm = MagicMock()
-        wm.return_value.get_wallet.return_value = {"id": "w1", "status": "KILLED"}
-        with patch("trading.robinhood.get_robinhood_trader", return_value=StubTrader()), \
-             patch("trading.wallet_manager.WalletManager", wm):
-            assert se.build_venue_tag(mock_engine, "robinhood", "w1") is None
-
-    def test_active_wallet_builds_a_tag(self, mock_engine):
-        from trading import signal_executor as se
-
-        wallet = {"id": "w1", "status": "ACTIVE", "current_capital": 250.0}
-        wm = MagicMock()
-        wm.return_value.get_wallet.return_value = wallet
-        with patch("trading.robinhood.get_robinhood_trader", return_value=StubTrader()), \
-             patch("trading.wallet_manager.WalletManager", wm):
-            tag = se.build_venue_tag(mock_engine, "Robinhood", "w1")
-        assert tag is not None and tag.venue == "robinhood"
-        assert tag.wallet_id == "w1" and tag.capital == 250.0
-
-    def test_no_wallet_id_auto_resolves_the_active_wallet(self, mock_engine):
-        """Closes the gap where no wallet_id used to mean no gate at all —
-        the newest ACTIVE wallet for the exchange is resolved instead."""
-        from trading import signal_executor as se
-
-        wallet = {"id": "auto-w1", "status": "ACTIVE", "current_capital": 300.0}
-        wm = MagicMock()
-        wm.return_value.get_all_wallets.return_value = [wallet]
-        with patch("trading.robinhood.get_robinhood_trader", return_value=StubTrader()), \
-             patch("trading.wallet_manager.WalletManager", wm):
-            tag = se.build_venue_tag(mock_engine, "robinhood")
-        assert tag is not None
-        assert tag.wallet_id == "auto-w1" and tag.capital == 300.0
-        wm.return_value.get_all_wallets.assert_called_once_with(exchange="robinhood", status="ACTIVE")
-
-    def test_no_wallet_id_and_no_active_wallet_routes_nothing(self, mock_engine):
-        from trading import signal_executor as se
-
-        wm = MagicMock()
-        wm.return_value.get_all_wallets.return_value = []
-        with patch("trading.robinhood.get_robinhood_trader", return_value=StubTrader()), \
-             patch("trading.wallet_manager.WalletManager", wm):
-            assert se.build_venue_tag(mock_engine, "robinhood") is None
+        with pytest.raises(ValueError, match="robinhood mirror disabled: close mirroring not implemented"):
+            se.build_venue_tag(mock_engine, "robinhood")
+        with pytest.raises(ValueError, match="robinhood mirror disabled: close mirroring not implemented"):
+            se.build_venue_tag(mock_engine, "Robinhood", "w1")
 
 
 # ── signal executor: end-to-end signal → paper trade + venue order ─────────
@@ -348,7 +312,14 @@ def _executor_engine(strategies):
     return engine
 
 
-def _run_executor(monkeypatch, tag, follower="btc_close", leader_prices=(102.0, 100.0)):
+def _run_executor(
+    monkeypatch,
+    tag,
+    follower="btc_close",
+    leader_prices=(102.0, 100.0),
+    venue=None,
+    is_exploration=False,
+):
     from trading import signal_executor as se
 
     engine = _executor_engine([("s1", None, "spy_close", follower, None)])
@@ -359,32 +330,42 @@ def _run_executor(monkeypatch, tag, follower="btc_close", leader_prices=(102.0, 
 
     breaker = MagicMock()
     breaker.should_execute.return_value = True
+    breaker.last_error = None
     monkeypatch.setattr(se, "StrategyCircuitBreaker", lambda _e: breaker)
 
     monkeypatch.setattr(se, "build_venue_tag", lambda *_a, **_k: tag)
-    monkeypatch.setattr(se, "_compute_kelly_size", lambda *_a: 0.1)
+    monkeypatch.setattr(se, "_compute_position_size", lambda *_a: (0.1, is_exploration))
     monkeypatch.setattr(se, "_get_expected_lag", lambda *_a: 1)
 
+    today = date.today()
     prices = {
-        "spy_close": [(date(2026, 9, 10), leader_prices[0]), (date(2026, 9, 9), leader_prices[1])],
-        follower: [(date(2026, 9, 10), 60000.0)],
+        "spy_close": [(today, leader_prices[0]), (today - timedelta(days=1), leader_prices[1])],
+        follower: [(today, 60000.0)],
     }
     monkeypatch.setattr(se, "_get_latest_prices", lambda _c, name, n=2: prices[name][:n])
     monkeypatch.setattr("intelligence.trust_scorer.detect_convergence", lambda *_a, **_k: [])
 
-    return se.execute_signals(engine, venue="robinhood", venue_wallet_id="w1"), paper
+    return se.execute_signals(engine, venue=venue, venue_wallet_id="w1" if venue else None), paper
 
 
 class TestExecutorVenueRouting:
-    def test_paper_trade_and_venue_order_both_happen(self, monkeypatch):
+    def test_robinhood_venue_fails_closed(self, monkeypatch):
+        summary, paper = _run_executor(monkeypatch, None, venue="robinhood")
+
+        assert summary["error"] == "robinhood mirror disabled: close mirroring not implemented"
+        assert summary["trades_opened"] == 0
+        assert summary["venue_orders"] == []
+        assert not paper.open_trade.called
+
+    def test_paper_trade_and_enabled_venue_order_both_happen(self, monkeypatch):
         from trading.signal_executor import VenueTag
 
-        tag = VenueTag("robinhood", StubTrader(), {"id": "w1", "current_capital": 400.0})
-        summary, paper = _run_executor(monkeypatch, tag)
+        tag = VenueTag("spot_test", StubTrader(), {"id": "w1", "current_capital": 400.0})
+        summary, paper = _run_executor(monkeypatch, tag, venue="spot_test")
 
         assert summary["trades_opened"] == 1
         assert paper.open_trade.call_args.kwargs["direction"] == "LONG"
-        assert summary["venue"] == "robinhood" and summary["venue_mode"] == "DRY_RUN"
+        assert summary["venue"] == "spot_test" and summary["venue_mode"] == "DRY_RUN"
         assert len(summary["venue_orders"]) == 1
         order = summary["venue_orders"][0]
         assert order["asset"] == "BTC" and order["trade_id"] == 7
@@ -394,9 +375,9 @@ class TestExecutorVenueRouting:
     def test_short_signal_opens_paper_only(self, monkeypatch):
         from trading.signal_executor import VenueTag
 
-        tag = VenueTag("robinhood", StubTrader(), {"id": "w1", "current_capital": 400.0})
+        tag = VenueTag("spot_test", StubTrader(), {"id": "w1", "current_capital": 400.0})
         # Leader down 2% → SHORT signal → nothing reaches the spot venue.
-        summary, paper = _run_executor(monkeypatch, tag, leader_prices=(98.0, 100.0))
+        summary, paper = _run_executor(monkeypatch, tag, leader_prices=(98.0, 100.0), venue="spot_test")
 
         assert summary["trades_opened"] == 1
         assert paper.open_trade.call_args.kwargs["direction"] == "SHORT"
@@ -404,7 +385,7 @@ class TestExecutorVenueRouting:
         assert tag.trader.orders == []
 
     def test_paper_only_run_is_unchanged(self, monkeypatch):
-        summary, paper = _run_executor(monkeypatch, None)
+        summary, paper = _run_executor(monkeypatch, None, venue=None)
         assert summary["trades_opened"] == 1 and paper.open_trade.called
         assert summary["venue"] is None and summary["venue_orders"] == []
 
@@ -598,15 +579,25 @@ class TestWalletCreation:
 
 
 class TestExecuteSignalsEndpoint:
-    def test_venue_is_passed_through(self, client):
+    def test_paper_only_passes_through(self, client):
         with patch("trading.signal_executor.execute_signals",
-                   return_value={"venue": "robinhood"}) as run:
+                   return_value={"venue": None, "trades_opened": 0}) as run:
+            resp = client.post(
+                "/api/v1/trading/execute-signals",
+                headers=_auth_header(),
+            )
+        assert resp.status_code == 200 and resp.json()["venue"] is None
+        assert run.call_args.kwargs == {"venue": None, "venue_wallet_id": None}
+
+    def test_robinhood_venue_is_refused_fail_closed(self, client):
+        with patch("trading.signal_executor.execute_signals") as run:
             resp = client.post(
                 "/api/v1/trading/execute-signals?venue=robinhood&wallet_id=w1",
                 headers=_auth_header(),
             )
-        assert resp.status_code == 200 and resp.json()["venue"] == "robinhood"
-        assert run.call_args.kwargs == {"venue": "robinhood", "venue_wallet_id": "w1"}
+        assert resp.status_code == 400
+        assert "robinhood mirror disabled: close mirroring not implemented" in resp.json()["detail"]
+        run.assert_not_called()
 
     def test_unknown_venue_is_rejected_at_the_boundary(self, client):
         resp = client.post("/api/v1/trading/execute-signals?venue=coinbase",

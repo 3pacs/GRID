@@ -131,7 +131,8 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "physics/verify.py": 4,
     "store/astrogrid.py": 5,
     "trading/options_recommender.py": 2,
-    "trading/signal_executor.py": 2,
+    # trading/signal_executor.py: 2 -> 0: _get_latest_prices now enforces PIT bounds
+    # and the resolved_series_retractions anti-join.
 }
 
 # Readers that must keep honouring retractions (a refactor that drops the
