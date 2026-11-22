@@ -271,51 +271,23 @@ class CFTCTFFPuller(BasePuller):
         target_codes = [c for c in requested if c in TFF_MARKET_CODES]
         inserted = 0
         failed: list[str] = []
+        errors: dict[str, str] = {}
         skipped_rows = 0
         no_release = 0
 
         for code in target_codes:
-            start_d = self._start_date(code)
+            # One guard around the market's whole lifecycle: its latest-date lookup, fetch, parse and write. A
+            # failure at any stage is recorded for this market only, with the stage, and the next market runs.
             try:
-                raw_rows = self._fetch_market(code, start_d)
-            except Exception as exc:  # noqa: BLE001
-                log_pull_failure("CFTC_TFF", code, exc)
+                market = self._pull_market(code)
+            except _MarketFailure as failure:
+                log_pull_failure("CFTC_TFF", code, failure.cause)
                 failed.append(code)
+                errors[code] = f"{failure.stage}: {type(failure.cause).__name__}: {failure.cause}"[:300]
                 continue
-
-            outcome = parse_tff_records(code, raw_rows)
-            for s in outcome.skipped:
-                log.warning("CFTC TFF {c}: skipped row ({r})", c=code, r=s)
-            skipped_rows += len(outcome.skipped)
-
-            code_inserted = 0
-            try:
-                with self.engine.begin() as conn:
-                    for metric in TFF_METRICS:
-                        sid = tff_series_id(code, metric)
-                        existing = self._get_existing_dates(sid, conn, start_date=start_d)
-                        for rep in outcome.reports:
-                            if rep.report_date in existing or rep.report_date > date.today():
-                                continue
-                            payload = build_tff_payload(code, rep, metric)
-                            if payload["release_at"] is None:
-                                no_release += 1
-                                continue
-                            self._insert_raw(
-                                conn=conn,
-                                series_id=sid,
-                                obs_date=rep.report_date,
-                                value=rep.metrics[metric],
-                                raw_payload=payload,
-                            )
-                            existing.add(rep.report_date)
-                            code_inserted += 1
-            except Exception as exc:  # noqa: BLE001
-                # The transaction rolled back; no FAILED/zero marker row is written.
-                log_pull_failure("CFTC_TFF", code, exc)
-                failed.append(code)
-                continue
-            inserted += code_inserted
+            inserted += market["inserted"]
+            skipped_rows += market["skipped_rows"]
+            no_release += market["no_release_rows"]
             time.sleep(_RATE_LIMIT_DELAY)
 
         if not target_codes or len(failed) == len(target_codes):
@@ -328,7 +300,56 @@ class CFTCTFFPuller(BasePuller):
             "status": status,
             "rows_inserted": inserted,
             "failed": failed,
+            "errors": errors,
             "unknown_codes": unknown,
             "skipped_rows": skipped_rows,
             "no_release_rows": no_release,
         }
+
+    def _pull_market(self, code: str) -> dict[str, int]:
+        """One market's latest-date lookup, fetch, parse and write; any failure is raised as ``_MarketFailure``."""
+        stage = "latest_date"
+        try:
+            start_d = self._start_date(code)
+            stage = "fetch"
+            raw_rows = self._fetch_market(code, start_d)
+            stage = "parse"
+            outcome = parse_tff_records(code, raw_rows)
+            for s in outcome.skipped:
+                log.warning("CFTC TFF {c}: skipped row ({r})", c=code, r=s)
+            stage = "write"
+            code_inserted = 0
+            no_release = 0
+            # The transaction rolls back on any error; no FAILED/zero marker row is written.
+            with self.engine.begin() as conn:
+                for metric in TFF_METRICS:
+                    sid = tff_series_id(code, metric)
+                    existing = self._get_existing_dates(sid, conn, start_date=start_d)
+                    for rep in outcome.reports:
+                        if rep.report_date in existing or rep.report_date > date.today():
+                            continue
+                        payload = build_tff_payload(code, rep, metric)
+                        if payload["release_at"] is None:
+                            no_release += 1
+                            continue
+                        self._insert_raw(
+                            conn=conn,
+                            series_id=sid,
+                            obs_date=rep.report_date,
+                            value=rep.metrics[metric],
+                            raw_payload=payload,
+                        )
+                        existing.add(rep.report_date)
+                        code_inserted += 1
+        except Exception as exc:  # noqa: BLE001
+            raise _MarketFailure(stage, exc) from exc
+        return {"inserted": code_inserted, "skipped_rows": len(outcome.skipped), "no_release_rows": no_release}
+
+
+class _MarketFailure(Exception):
+    """One market's pull failed at ``stage``; the caller records it and moves on."""
+
+    def __init__(self, stage: str, cause: BaseException) -> None:
+        super().__init__(f"{stage}: {cause}")
+        self.stage = stage
+        self.cause = cause

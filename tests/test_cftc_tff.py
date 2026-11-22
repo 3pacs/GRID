@@ -162,3 +162,43 @@ def test_untracked_codes_are_reported_not_fetched(monkeypatch) -> None:
     result = puller.pull_all(codes=["088691"])  # gold: legacy COT only, not in TFF
     assert fake_get.call_count == 0 and inserted == []
     assert result["status"] == "FAILED" and result["unknown_codes"] == ["088691"]
+
+
+def test_a_malformed_first_market_still_lets_a_later_valid_market_run(monkeypatch) -> None:
+    """Codex (6011669449): parsing sat outside the per-market guard, so one bad row shape stopped every later
+    market. The whole lifecycle is guarded now, and the error is recorded against that market with its stage."""
+    puller, inserted, _ = _offline_puller(monkeypatch, [["not a record"], [_row(code="044601")]])
+    result = puller.pull_all(codes=["043602", "044601"])
+    assert result["failed"] == ["043602"] and result["status"] == "PARTIAL"
+    assert result["errors"]["043602"].startswith("parse: ")
+    assert {r["series_id"].split(".")[1] for r in inserted} == {"044601"}
+    assert result["rows_inserted"] == len(TFF_METRICS)
+
+
+def test_a_failed_latest_date_lookup_is_recorded_for_that_market_only(monkeypatch) -> None:
+    puller, inserted, fake_get = _offline_puller(monkeypatch, [[_row(code="044601")]])
+
+    def _latest(sid):
+        if ".043602." in sid:
+            raise RuntimeError("synthetic latest-date failure")
+        return None
+
+    puller._get_latest_date = _latest
+    result = puller.pull_all(codes=["043602", "044601"])
+    assert result["failed"] == ["043602"]
+    assert result["errors"]["043602"].startswith("latest_date: RuntimeError")
+    assert fake_get.call_count == 1                         # the failing market was never fetched
+    assert {r["series_id"].split(".")[1] for r in inserted} == {"044601"}
+
+
+def test_every_failure_names_its_market_and_stage(monkeypatch) -> None:
+    puller, inserted, _ = _offline_puller(monkeypatch, [[_row(code="043602")], [_row(code="044601")]])
+
+    def _flaky_insert(**kw):
+        if kw["series_id"].startswith("cftc_tff.043602."):
+            raise RuntimeError("synthetic database failure")
+        inserted.append(kw)
+
+    puller._insert_raw = _flaky_insert
+    result = puller.pull_all(codes=["043602", "044601"])
+    assert result["errors"] == {"043602": "write: RuntimeError: synthetic database failure"}
