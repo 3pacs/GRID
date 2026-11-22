@@ -143,7 +143,7 @@ def test_backfill_writes_only_missing_aggregates_and_never_symbol_rows() -> None
     result = p.backfill_aggregates("2026-09-16", "2026-09-20")  # Wed..Sun
 
     assert result == {
-        "status": "SUCCESS", "aggregates_inserted": 3,
+        "status": "SUCCESS", "aggregates_inserted": 3, "run_tag": None,
         "dates_written": 2, "dates_complete": 0, "dates_skipped": 1, "dates_failed": 0,
     }
     assert not [r for r in engine.store["rows"] if r["series_id"].startswith("finra:short_volume:")]
@@ -170,6 +170,108 @@ def test_backfill_counts_a_real_failure_and_keeps_going() -> None:
 
     assert result["status"] == "FAILED"
     assert result["dates_failed"] == 1 and result["dates_written"] == 1
+
+
+def test_backfill_labels_every_row_it_writes_and_the_daily_pull_does_not() -> None:
+    engine = FakeEngine()
+    p = _puller(engine)
+    p._fetch_raw_text = lambda trade_date, url=None, **kw: _load("good.txt").replace(
+        "20260916", trade_date.strftime("%Y%m%d"))
+
+    p.pull("2026-09-16")
+    result = p.backfill_aggregates("2026-09-16", "2026-09-17", run_tag="finra-agg-gap-test")
+
+    assert result["run_tag"] == "finra-agg-gap-test" and result["aggregates_inserted"] == 2
+    payloads = {(r["series_id"], r["obs_date"]): json.loads(r["raw_payload"])
+                for r in engine.store["rows"] if r["series_id"].startswith("finra:short_volume_agg:")}
+    assert "backfill" not in payloads[(AGG_MARKET_RATIO, D)]  # written by the daily pull
+    late = payloads[(AGG_MARKET_RATIO, date(2026, 9, 17))]
+    assert late["backfill"] == {"by": "backfill_aggregates", "run_tag": "finra-agg-gap-test"}
+    assert late["scope"] == "all symbols"  # the ordinary payload is kept
+
+
+# ── pull_recent: which dates count as already stored ──────────────────────
+# Since 2026-11-13 finra_dix writes finra:dix_sp500 under the same source.
+# Its scheduler slot runs first each morning, and BasePuller's "any row for
+# this source" check then made pull_recent skip that trade date for good
+# (obs 2026-11-12, 11-13, 11-18, 11-19, 11-20 lost in production).
+
+
+def _counting_fetch(p: FINRAShortVolumeAggPuller) -> list[date]:
+    fetched: list[date] = []
+
+    def _fetch(trade_date, url=None, **kw):
+        fetched.append(trade_date)
+        return _load("good.txt").replace("20260916", trade_date.strftime("%Y%m%d"))
+
+    p._fetch_raw_text = _fetch
+    return fetched
+
+
+def test_a_dix_row_on_the_same_source_does_not_mark_the_date_stored() -> None:
+    engine = FakeEngine()
+    p = _puller(engine)
+    fetched = _counting_fetch(p)
+    # finra_dix ran first that morning: same source_id, same obs_date.
+    p._insert_raw(conn=engine.begin(), series_id="finra:dix_sp500", obs_date=D, value=0.45,
+                  raw_payload={"method": "dix"})
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=1)
+
+    assert fetched == [D]
+    (per_date,) = result["dates"]
+    assert per_date["status"] == "SUCCESS" and per_date["rows_inserted"] == 3
+    assert per_date["aggregates_inserted"] == 2
+    assert AGG_MARKET_RATIO in _agg_rows(engine)
+
+
+def test_a_date_with_symbol_rows_and_the_market_ratio_is_skipped() -> None:
+    engine = FakeEngine()
+    p = _puller(engine)
+    fetched = _counting_fetch(p)
+    p.pull("2026-09-16")
+    fetched.clear()
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=1)
+
+    assert fetched == []
+    assert result["dates"] == [{"date": "2026-09-16", "status": "SKIPPED", "reason": "already stored"}]
+
+
+def test_a_date_missing_its_aggregates_is_pulled_again_and_only_they_are_written() -> None:
+    engine = FakeEngine()
+    p = _puller(engine)
+    fetched = _counting_fetch(p)
+    FINRAShortVolumePuller.pull(p, "2026-09-16")  # the producer alone: symbol rows, no aggregates
+    symbol_rows = len(engine.store["rows"])
+    fetched.clear()
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=1)
+
+    assert fetched == [D]
+    (per_date,) = result["dates"]
+    assert per_date["rows_inserted"] == 0 and per_date["aggregates_inserted"] == 2
+    assert len(engine.store["rows"]) == symbol_rows + 2
+
+
+def test_a_date_with_aggregates_but_no_symbol_rows_is_pulled_again() -> None:
+    engine = FakeEngine()
+    p = _puller(engine)
+    fetched = _counting_fetch(p)
+    p.backfill_aggregates("2026-09-16", "2026-09-16", run_tag="t")
+    fetched.clear()
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=1)
+
+    assert fetched == [D]
+    (per_date,) = result["dates"]
+    assert per_date["rows_inserted"] == 3 and per_date["aggregates_inserted"] == 0
+
+
+def test_stored_dates_check_refuses_an_unbounded_read() -> None:
+    p = _puller()
+    with pytest.raises(ValueError, match="both bounds"):
+        p._get_existing_source_dates(p.engine.connect(), start_date=D)
 
 
 # ── mapping + registration ────────────────────────────────────────────────
