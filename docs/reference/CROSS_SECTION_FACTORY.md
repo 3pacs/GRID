@@ -122,12 +122,27 @@ an export dated 2016-01-04 refusing a 2015 window; a window one session early re
 file and an edited manifest refused before declaration; a price file, `members.csv` or `sectors.csv` changed after
 declaration abandoning the run; a missing session and a zero adjusted close taking a stock out of the universe.
 
-## All eight prices (2026-11-21)
+## All eight prices (2026-11-21, review fixes 2026-11-22)
 
 **The rule.** A Tiingo daily row carries eight prices: `open`, `high`, `low`, `close`, `adjOpen`, `adjHigh`, `adjLow`,
-`adjClose`. `universe()` reads all eight, and a row is a valid bar only when every one of them is present and
-positive. A blank in any one takes that stock out of `universe.ok`, `universe.base` and `load_panel(...).base` for
-that session, and no return is computed into or out of it. Files are still read as served: a blank is never filled.
+`adjClose`. `universe()` reads all eight, and a row is a valid bar only when every one of them is present, finite and
+positive, with the open and the close inside the day's range. A cell that is not a finite number (`inf`, `-inf`) is
+read as a blank, in the eight prices and in the volume. Files are otherwise read as served: a blank is never filled.
+
+**An invalid bar reaches no signal and no outcome.** A stock with an invalid bar is out of `universe.ok`,
+`universe.base` and `load_panel(...).base` for that session. Its returns into and out of that session are blank, and
+so is its adjusted close in the panel (`Panel.adj`), which is what the momentum, reversal, 52-week-high and
+sector-momentum signals read. So:
+
+- a momentum or reversal signal has no value on the two sessions whose window starts or ends on the invalid bar;
+- the 52-week high has no value the session after, and later windows take their highest close without that bar;
+- a sector's mean momentum leaves the stock out on those sessions, so no other stock's signal carries its close.
+
+**What still reads an invalid bar.** The two floors. The price floor reads the unadjusted close of the session before,
+and the liquidity floor the median of close times volume over the 21 sessions before, both as served. A day without a
+trade has to count as a day of no volume, or a thin stock would look liquid. So a stock is rankable the session after
+an invalid bar when that session's own bar is valid (tested since #1291). A close or a volume that is not finite does
+not count: it is a blank, so it passes no floor.
 
 **The reason.** Until this change the reader took six prices and never opened `adjHigh` or `adjLow`. A row whose
 only blank was one of those two was a valid, rankable bar. Review of the small-cap builder (#1294) reproduced it on
@@ -136,9 +151,16 @@ read back. The builder refuses such a row when it fetches, binds or builds, but 
 definition of the universe, where every store and every caller meets it. Tiingo does serve blank prices on some days
 without a trade, so the case is real on thinly traded names.
 
+Review of this change (#1326) then found two more gaps in the shared reader, both older than it. `inf` is greater
+than zero, so a row with an infinite price passed every positive-price check and could put an infinite return into a
+spread. And the panel carried every adjusted close as served, so a close on a bar the rule had turned away still fed
+the signals built from closes: on a synthetic store, with a blank `adjHigh` and an adjusted close ten times the true
+one, the stock's 5-session momentum read +895 % the next session and nine other stocks' sector momentum moved with it.
+
 **What it changes on the index store: nothing.** The three cross-section runs on the factory ledger declared one data
 manifest (`31513c21…`, 814 price files), and the nine scratch runs that wrote a manifest list the same files. The
-store was checked against that manifest by hash, then every row was counted, read-only, on 2026-11-21:
+store was checked against that manifest by hash, then every row was counted, read-only, on 2026-11-21 and again on
+2026-11-22:
 
 | Measure | Count |
 |---|---|
@@ -147,24 +169,55 @@ store was checked against that manifest by hash, then every row was counted, rea
 | Rows blank in `adjHigh` or `adjLow` with the other six prices present | 0 |
 | Rows valid under the six-price rule and not valid under the eight-price rule | 0 |
 | Blank cells in any of the eight price columns | 0 |
+| Cells that are `inf` or `-inf`, prices and volume | 0 |
+| Invalid bars among the rows a run loads | 0 |
 
-The count read price cells in rows after 2022-12-30 for presence and sign only; no return was computed from them.
-With main's reader and the changed one, `universe` and `load_panel` on that store give the same `ok`, `base`,
-overnight, intraday and close-to-close arrays, adjusted closes and sector placement (compared by hash; 3,357
-sessions, 814 files, 1,563,261 rankable stock-sessions). No ledgered result can move.
+The count read price cells in rows after 2022-12-30 for presence, sign and finiteness only; no return was computed
+from them. With main's reader and the changed one, `universe` and `load_panel` on that store give the same `ok`,
+`base`, bar frames, overnight, intraday and close-to-close arrays, adjusted closes and sector placement, and the same
+signal matrix for each of the six signal kinds (compared by hash; 3,357 sessions, 814 files, 1,563,261 rankable
+stock-sessions). No ledgered result can move.
 
 A run on an unchanged store gives the same `report.json`, `discovery-frozen.json`, `report.md` and
-`data-manifest.json` byte for byte on main's factory (f8a2425b) and the changed one: checked on the synthetic test
-store with a plain run and a gated run.
+`data-manifest.json` byte for byte on main's factory (451d4428) and the changed one. Checked on the synthetic test
+store with four runs: plain, gated, one with momentum, reversal, 52-week-high and intraday signals, and one with
+sector momentum.
 
-**What it costs.** Two more columns per file. On the index store, four loads each: `universe()` took 20.9 s against
-18.4 s (+2.5 s, 14 %), peak memory 905 MB against 823 MB (+82 MB, 10 %), and the bar frames it returns hold 188 MB
-against 146 MB.
+**What it changes on the small-cap store.** The sealed generation `g-55610e73…` (9,471 price files, discovery from
+2016-01-04) was counted the same way on 2026-11-22, on the 16,942,103 rows a run loads:
 
-Tests (synthetic stores only): each of the eight prices blank on its own, at volume 0 and at a positive volume, is
-out of `ok` and `base` in `universe` and `load_panel` for that session and back the session before; a 25-company
-store with one row blank only in `adjHigh`, sealed directly with `seal_export` and read through the verified path,
-loses that company for that session only.
+| Measure | Count |
+|---|---|
+| Cells that are `inf` or `-inf`, prices and volume (all 22,162,940 rows) | 0 |
+| Invalid bars | 1,208 in 35 files |
+| of them with a blank `low` and `adjLow` | 617 |
+| of them with the open or the close outside the day's range | 591 |
+| Invalid bars with an adjusted close present | 1,208 |
+
+By year: 504 in 2010, 469 in 2011, 136 in 2012, 42 in 2013, 10 in 2014, 2 in 2015, 11 in 2016 and 34 in 2017.
+Every one of these bars was already invalid under the six-price rule: no row is blank, zero or negative in `adjHigh`
+or `adjLow` alone (the 617 blank adjusted lows are the 617 rows with a blank low). With no cell to read as a blank,
+`ok`, `base` and the universe counts on this generation are what they were. What changes is that the 1,208 adjusted
+closes on those bars no longer reach the signals built from closes; 45 of them are in the discovery years. No
+cross-section run on this store is on the factory ledger, so no recorded result moves.
+
+**What it costs.** Two more columns per file, one pass over the frames for the finite check and one mask. On the
+index store, four loads each on 2026-11-22: `universe()` took 21.0 s against 19.5 s on main (+1.5 s, 8 %) and peak
+memory was 904 MB against 823 MB (+81 MB, 10 %). The bar frames it returns hold 188 MB against 146 MB.
+
+Tests (synthetic stores only):
+
+- each of the eight prices blank on its own, at volume 0 and at a positive volume, is out of `ok` and `base` in
+  `universe` and `load_panel` for that session and back the session before;
+- a 25-company store with one row blank only in `adjHigh`, sealed directly with `seal_export` and read through the
+  verified path, loses that company for that session only;
+- each of the eight prices set to `inf` and to `-inf` is read as a blank, and no return, adjusted close or signal in
+  the panel is infinite;
+- a thin stock with `inf` volume on 15 sessions still fails the liquidity floor;
+- an invalid bar (blank `adjHigh`; blank `low` and `adjLow`) whose adjusted close is wrong by a factor of 10 and of
+  100 gives the clean store's panel with that one bar taken out, the same signals for both factors, no signal on the
+  adjacent sessions named above, and a sector mean for the other members worked out by hand without it;
+- on a clean store every cell of every frame is the file's own number and nothing in the panel is masked.
 
 ## Signals and horizons
 

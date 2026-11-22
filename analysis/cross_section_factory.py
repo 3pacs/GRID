@@ -301,7 +301,7 @@ class Panel:
     on: np.ndarray            # overnight return ending at each session's open
     intra: np.ndarray         # open to close of each session
     cc: np.ndarray            # close to close ending at each session
-    adj: np.ndarray           # adjusted close
+    adj: np.ndarray           # adjusted close of a valid bar; NaN on a session whose bar is missing or invalid
     base: np.ndarray          # member, valid bar, price and liquidity floors (signal presence is added per signal)
     member: np.ndarray
     sector: np.ndarray        # sector index per column, -1 = none
@@ -313,8 +313,8 @@ class Panel:
 class Universe:
     sessions: list
     cols: list
-    frames: dict              # one frame per bar field, indexed by session, one column per price file
-    ok: pd.DataFrame          # a valid bar: all eight prices present and positive, open and close inside the day's range
+    frames: dict              # one frame per bar field, by session and price file; a cell that is not a finite number is blank
+    ok: pd.DataFrame          # a valid bar: all eight prices finite and positive, open and close inside the day's range
     member: np.ndarray
     base: np.ndarray          # member, valid bar, price and liquidity floors
 
@@ -343,7 +343,8 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
     dollar volume over the ``DOLLAR_VOLUME_WINDOW`` sessions ending the session before is at least
     ``min_dollar_volume``. "The session before" is the store's previous session, not the stock's previous bar: a
     stock with no bar on it has no prior close and is out. A valid bar has all eight prices of the row (open, high,
-    low, close and their adjusted values) present and positive. Bars after ``DEV_LAST_BAR`` are dropped."""
+    low, close and their adjusted values) finite and positive. A cell that is not a finite number (``inf``) is read
+    as a blank, in the prices and in the volume. Bars after ``DEV_LAST_BAR`` are dropped."""
     data_dir = Path(data_dir)
     on_disk = sorted(str(p.relative_to(data_dir)) for p in sorted((data_dir / "prices").glob("*.csv")))
     names = on_disk if files is None else sorted(n for n in files if n.startswith("prices/"))
@@ -360,6 +361,7 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
         for k, store in cols_data.items():
             store[Path(name).stem] = df[k]
     f = {k: pd.DataFrame(v).sort_index() for k, v in cols_data.items()}
+    f = {k: v.where(np.isfinite(v)) for k, v in f.items()}   # inf is not a price or a volume: read it as a blank
     counts = f["close"].notna().sum(axis=1)
     sessions = [d for d, n in counts.items() if n >= min_session_bars]
     if not sessions or sessions[-1] > DEV_LAST_BAR:
@@ -397,7 +399,11 @@ def universe(data_dir: Path, *, min_session_bars: int, min_price: float, min_dol
 
 def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel:
     """The bars a run evaluates. ``files`` is the declared manifest's file table; ``run`` always passes it, so every
-    file parsed is the one that was hashed before the declaration."""
+    file parsed is the one that was hashed before the declaration.
+
+    Every price a signal or an outcome reads comes from a valid bar. The returns are masked by the bar and the one
+    before it, and the adjusted close is blank on an invalid bar, so the momentum, reversal, 52-week-high and
+    sector-momentum signals never read a close the valid-bar rule turned away."""
     u = universe(data_dir, min_session_bars=run.min_session_bars, min_price=run.min_price,
                  min_dollar_volume=run.min_dollar_volume, files=files)
     f, ok, cols, member = u.frames, u.ok, u.cols, u.member
@@ -419,7 +425,8 @@ def load_panel(data_dir: Path, run: RunFile, files: dict | None = None) -> Panel
         code = np.full(len(cols), -1)
         how = {"labels": "none", "labelled_checked": 0, "leave_one_out_accuracy": None, "placed_by_correlation": 0,
                "unplaced": int(member.any(axis=0).sum())}
-    return Panel(u.sessions, cols, on.values, intra.values, cc.values, f["adjClose"].values, u.base, member, code, sectors, how)
+    adj = f["adjClose"].where(ok)   # an invalid bar's adjusted close reaches no signal
+    return Panel(u.sessions, cols, on.values, intra.values, cc.values, adj.values, u.base, member, code, sectors, how)
 
 
 def assign_sectors(cc: np.ndarray, member: np.ndarray, cols: list, labels: dict, sectors: list) -> tuple[np.ndarray, dict]:

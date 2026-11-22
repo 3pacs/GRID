@@ -661,3 +661,121 @@ def test_a_sealed_export_with_a_row_blank_only_in_its_adjusted_high_is_out_that_
     np.testing.assert_array_equal(panel.base, u.base)
     assert not panel.base[r, j] and panel.base[r, others].all()
     assert np.isnan(panel.cc[r, j]) and np.isnan(panel.cc[r + 1, j])        # no return into or out of the blank session
+
+
+FEATURES = ({"kind": "momentum", "lookback": 5, "skip": 0}, {"kind": "reversal", "lookback": 5},
+            {"kind": "high_52w", "lookback": 10}, {"kind": "sector_momentum", "lookback": 5, "skip": 0},
+            {"kind": "mean_overnight", "lookback": 5}, {"kind": "mean_intraday", "lookback": 5})
+SMALL = {"min_session_bars": 20, "min_price": 5.0, "min_dollar_volume": 10e6}
+
+
+def _small_run():
+    return X.RunFile.from_dict({**RUN, "min_session_bars": 20})
+
+
+@pytest.mark.parametrize("text", ["inf", "-inf"])
+@pytest.mark.parametrize("field", PRICES)
+def test_a_price_that_is_not_a_finite_number_is_read_as_a_blank(tmp_path, field, text):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    whole = X.universe(tmp_path, **SMALL)
+    sym, r = "S1N04", 40
+    j = whole.cols.index(sym)
+    _edit_row(tmp_path, sym, days[r], **{field: text})
+    u = X.universe(tmp_path, **SMALL)
+    assert np.isnan(u.frames[field].iloc[r, j])                              # never held as inf
+    assert all(np.isfinite(v.values[~np.isnan(v.values)]).all() for v in u.frames.values())
+    assert whole.ok.iloc[r, j] and whole.base[r, j] and not u.ok.iloc[r, j] and not u.base[r, j]
+    assert u.base[r + 1, j] == (field != "close")                            # no finite prior close, no price floor passed
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.ok.values[:, others], whole.ok.values[:, others])
+    np.testing.assert_array_equal(u.base[:, others], whole.base[:, others])
+    panel = X.load_panel(tmp_path, _small_run())
+    np.testing.assert_array_equal(panel.base, u.base)
+    for a in (panel.on, panel.intra, panel.cc, panel.adj, *(X.signal_matrix(panel, spec) for spec in FEATURES)):
+        assert not np.isinf(a).any()                                         # no return, close or signal is infinite
+    assert np.isnan(panel.adj[r, j]) and np.isnan(panel.cc[r, j]) and np.isnan(panel.on[r, j]) and np.isnan(panel.intra[r, j])
+
+
+def test_a_volume_that_is_not_a_finite_number_does_not_pass_the_liquidity_floor(tmp_path):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    sym = "S1N04"
+    _rescale(tmp_path, sym, volume=0.0025)                                   # about $0.5M a day against a $10M floor
+    thin = X.universe(tmp_path, **SMALL)
+    j = thin.cols.index(sym)
+    assert thin.ok.values[:, j].all() and not thin.base[:, j].any()
+    for d in days[25:40]:                                                    # 15 of any 21 sessions: the median would be inf
+        _edit_row(tmp_path, sym, d, volume="inf", adjVolume="inf")
+    u = X.universe(tmp_path, **SMALL)
+    assert np.isnan(u.frames["volume"].values[25:40, j]).all()
+    assert u.ok.values[:, j].all() and not u.base[:, j].any()                # the bars stay valid; the floor is still not met
+    others = [k for k in range(len(u.cols)) if k != j]
+    np.testing.assert_array_equal(u.base[:, others], thin.base[:, others])
+
+
+def _same(a, b):
+    return (a == b) | (np.isnan(a) & np.isnan(b))
+
+
+@pytest.mark.parametrize("blank", [("adjHigh",), ("low", "adjLow")])
+def test_an_invalid_bar_s_adjusted_close_reaches_no_feature(tmp_path, blank):
+    # the bar is invalid for a blank price; its adjusted close is present and wrong by a factor of 10, then of 100
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    run = _small_run()
+    clean = X.load_panel(tmp_path, run)
+    sym, r = "S1N04", 40
+    j = clean.cols.index(sym)
+    mates = [k for k, c in enumerate(clean.cols) if c.startswith("S1") and k != j]
+    panels = []
+    for factor in (10, 100):
+        _edit_row(tmp_path, sym, days[r], adjClose=repr(float(clean.adj[r, j]) * factor), **{name: "" for name in blank})
+        panels.append(X.load_panel(tmp_path, run))
+    p = panels[0]
+
+    # the panel is the clean one with that one bar taken out: nothing else moved, and the wrong close is nowhere
+    want = {"adj": clean.adj.copy(), "on": clean.on.copy(), "cc": clean.cc.copy(), "intra": clean.intra.copy(), "base": clean.base.copy()}
+    want["adj"][r, j] = want["intra"][r, j] = np.nan
+    want["on"][r:r + 2, j] = want["cc"][r:r + 2, j] = np.nan
+    want["base"][r, j] = False
+    for q in panels:
+        for name, a in want.items():
+            np.testing.assert_array_equal(getattr(q, name), a)
+        np.testing.assert_array_equal(q.sector, clean.sector)
+
+    for spec in FEATURES:
+        before, sig = X.signal_matrix(clean, spec), X.signal_matrix(p, spec)
+        np.testing.assert_array_equal(sig, X.signal_matrix(panels[1], spec))   # what the invalid close says changes nothing
+        assert np.nanmax(np.abs(sig)) <= np.nanmax(np.abs(before))             # no signal is larger than on the clean store
+        if spec["kind"] in ("momentum", "reversal"):
+            # adjacent sessions: the two whose window ends or starts on the invalid bar have no signal; the rest are untouched
+            assert np.flatnonzero(~_same(sig, before)[:, j]).tolist() == [r + 1, r + 6]
+            assert np.isnan(sig[[r + 1, r + 6], j]).all() and _same(np.delete(sig, j, axis=1), np.delete(before, j, axis=1)).all()
+        if spec["kind"] == "high_52w":
+            assert np.isnan(sig[r + 1, j])                                     # the close of the session before is the invalid one
+            for d in range(r + 2, r + 11):                                     # later windows take their highest close without it
+                window = [clean.adj[s, j] for s in range(d - 10, d) if s != r]
+                assert sig[d, j] == clean.adj[d - 1, j] / max(window)
+        if spec["kind"] == "sector_momentum":
+            # another symbol's sector aggregate: the mean of its sector's other members, the invalid name left out
+            own = pd.DataFrame(clean.adj).shift(1) / pd.DataFrame(clean.adj).shift(6) - 1
+            for d in (r + 1, r + 6):
+                np.testing.assert_allclose(sig[d, mates], own.values[d, mates].mean(), rtol=1e-12)
+            rest = [d for d in range(len(days)) if d not in (r + 1, r + 6)]
+            assert _same(sig[rest], before[rest]).all()
+            assert _same(sig[:, [k for k in range(len(clean.cols)) if k not in mates and k != j]],
+                         before[:, [k for k in range(len(clean.cols)) if k not in mates and k != j]]).all()
+
+
+def test_on_a_clean_store_the_reader_holds_every_cell_as_served(tmp_path):
+    days, _ = build(tmp_path, n_per=10, n_days=60)
+    u = X.universe(tmp_path, **SMALL)
+    assert u.sessions == days and u.ok.values.all()                          # every row of a clean store is a valid bar
+    for field, frame in u.frames.items():                                    # each cell is the file's own number
+        for sym in u.cols:
+            served = pd.read_csv(tmp_path / "prices" / f"{sym}.csv").set_index("date")[field]
+            np.testing.assert_array_equal(frame[sym].values, served.reindex(days).values)
+    panel = X.load_panel(tmp_path, _small_run())
+    f = u.frames
+    np.testing.assert_array_equal(panel.adj, f["adjClose"].values)           # nothing is masked where every bar is valid
+    np.testing.assert_array_equal(panel.intra, (f["close"] / f["open"] - 1).values)
+    np.testing.assert_array_equal(panel.cc, (f["adjClose"] / f["adjClose"].shift(1) - 1).values)
+    np.testing.assert_array_equal(panel.on, (f["adjOpen"] / f["adjClose"].shift(1) - 1).values)
