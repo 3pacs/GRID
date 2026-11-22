@@ -544,6 +544,18 @@ is the 1,000-request module cap, not a window size. The Yahoo pacing, 429 latch,
 cursor all apply. Names the wall budget does not reach are DEFERRED, and the
 next slot reads them first. Exit 1 only when the run is FAILED.
 
+**Writer policy.** `GRID_OPTIONS_AUTOMATIC_WRITER_POLICY` still applies: the
+runner calls `automatic_options_capture_guard(engine, writer="options_dedicated")`.
+
+- Unset or `legacy`: the run goes ahead.
+- `daily_scheduler`: the dedicated writer is accepted only while the hand-off is
+  active (the flag set and schwab mode confirmed), because it is then running
+  the daily scheduler's handed-off slots. Any other writer is still refused.
+- Any other value: refused (`invalid_options_writer_policy`).
+
+A refused run exits 0 with an `OPTIONS_DEDICATED {"status": "REFUSED", "reason":
+"writer policy: ..."}` line.
+
 ### Install (owner decision)
 
 Check that the runner refuses before you enable anything. Run it read-only first:

@@ -510,3 +510,96 @@ def test_the_timer_calendars_parse() -> None:
         done = subprocess.run(["systemd-analyze", "calendar", spec], capture_output=True, text=True, timeout=30)
         assert done.returncode == 0, done.stderr
         assert f"Normalized form: {spec}" in done.stdout
+
+
+# ── the automatic-writer policy recognises the dedicated writer ──────────
+
+
+class _ObservedEngine:
+    """The guard's read-only observation: counts connections, answers (0, 0)."""
+
+    def __init__(self) -> None:
+        self.connections = 0
+
+    def connect(self) -> _ObservedEngine:
+        self.connections += 1
+        return self
+
+    def __enter__(self) -> _ObservedEngine:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, *_args: Any) -> _ObservedEngine:
+        return self
+
+    def fetchone(self) -> tuple[int, int]:
+        return (0, 0)
+
+
+def test_policy_unset_lets_the_dedicated_writer_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", raising=False)
+    for flag in (None, "1"):
+        _schwab_env(monkeypatch, flag=flag)
+        engine = _ObservedEngine()
+        assert options.automatic_options_capture_guard(engine, writer="options_dedicated") is None
+        assert engine.connections == 0
+
+
+def test_daily_scheduler_policy_accepts_the_dedicated_writer_only_with_the_hand_off(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    _schwab_env(monkeypatch)
+    engine = _ObservedEngine()
+    assert options.automatic_options_capture_guard(engine, writer="options_dedicated") is None
+    assert engine.connections == 0
+    # Every other writer is still refused while the hand-off is active.
+    for writer in (None, "smart_scheduler", "oracle_forward", "options_puller"):
+        refused = options.automatic_options_capture_guard(_ObservedEngine(), writer=writer)
+        assert refused is not None and refused["reason"] == "daily_scheduler_owns_options"
+
+
+@pytest.mark.parametrize("change", [
+    {"GRID_OPTIONS_DEDICATED_TIMER": None}, {"GRID_OPTIONS_DEDICATED_TIMER": "0"},
+    {"GRID_OPTIONS_PRIMARY_PROVIDER": "cboe"}, {"GRID_OPTIONS_SCHWAB_READERS": None},
+], ids=lambda c: ",".join(f"{k.removeprefix('GRID_OPTIONS_')}={v}" for k, v in c.items()))
+def test_daily_scheduler_policy_refuses_the_dedicated_writer_without_the_hand_off(
+        monkeypatch: pytest.MonkeyPatch, change: dict) -> None:
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    _schwab_env(monkeypatch)
+    for key, value in change.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    engine = _ObservedEngine()
+    refused = options.automatic_options_capture_guard(engine, writer="options_dedicated")
+    assert refused is not None and refused["status"] == "SKIPPED"
+    assert refused["reason"] == "daily_scheduler_owns_options" and engine.connections == 1
+
+
+def test_an_invalid_policy_refuses_the_dedicated_writer_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "bogus")
+    _schwab_env(monkeypatch)
+    refused = options.automatic_options_capture_guard(_ObservedEngine(), writer="options_dedicated")
+    assert refused is not None and refused["reason"] == "invalid_options_writer_policy"
+
+
+def test_the_runner_runs_under_the_daily_scheduler_policy(monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    _schwab_env(monkeypatch)
+    env = _setup(monkeypatch, _body())
+    rc = rod.main([], engine=_ObservedEngine())
+    out = json.loads(capsys.readouterr().out.splitlines()[-1].removeprefix("OPTIONS_DEDICATED "))
+    assert rc == 0 and out["status"] == "SUCCESS" and env.writers == ["options_dedicated"]
+
+
+def test_the_runner_obeys_a_refusing_policy(monkeypatch: pytest.MonkeyPatch,
+                                            capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "bogus")
+    _schwab_env(monkeypatch)
+    monkeypatch.setattr(options, "OptionsPuller", lambda **_kw: pytest.fail("the policy refused"))
+    rc, out = _main(capsys)
+    assert (rc, out["status"], out["reason"]) == (0, "REFUSED", "writer policy: invalid_options_writer_policy")

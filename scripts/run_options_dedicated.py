@@ -30,7 +30,10 @@ Refusals, all exit 0 with one ``OPTIONS_DEDICATED`` JSON line and no provider,
 database or lock touched: not in schwab mode (GRID_OPTIONS_PRIMARY_PROVIDER is
 not schwab, GRID_OPTIONS_SCHWAB_READERS is not admin-only, or the selector did
 not choose schwab), or the timer not declared (GRID_OPTIONS_DEDICATED_TIMER is
-not 1). A second run while one holds the lock file also exits 0.
+not 1). A second run while one holds the lock file also exits 0, and so does a
+run that GRID_OPTIONS_AUTOMATIC_WRITER_POLICY refuses
+(``automatic_options_capture_guard`` with ``writer="options_dedicated"``: under
+``daily_scheduler`` it is accepted only while the hand-off is active).
 
 Exit status: 0 for every run outcome except FAILED (no ticker succeeded), which
 is 1 so the unit shows red; an unexpected error propagates (non-zero).
@@ -139,6 +142,14 @@ def main(argv: list[str] | None = None, *, engine: Any = None,
             from db import get_engine
 
             engine = get_engine()
+        # The owner's automatic-writer policy still applies: under daily_scheduler it accepts this
+        # writer only while the hand-off is active, and refuses it (and any other writer) otherwise.
+        guarded = options.automatic_options_capture_guard(engine, writer=options.DEDICATED_CAPTURE_SOURCE)
+        if guarded is not None:
+            log.info("options-dedicated: writer policy refused the run ({why})", why=guarded.get("reason"))
+            _report({"status": "REFUSED", "reason": f"writer policy: {guarded.get('reason')}",
+                     "policy_result": guarded})
+            return 0
         end = clock() + args.budget_seconds
         log.info("options-dedicated: schwab-mode full universe, wall budget {s} s, writer {w}",
                  s=args.budget_seconds, w=options.DEDICATED_CAPTURE_SOURCE)

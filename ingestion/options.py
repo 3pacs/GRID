@@ -320,13 +320,21 @@ def _before_regular_open(now: datetime) -> bool:
     return (local.hour, local.minute) < REGULAR_SESSION_OPEN_ET
 
 
-def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
+def automatic_options_capture_guard(engine: Engine, *, writer: str | None = None) -> dict[str, Any] | None:
     """Owner-gated daily-writer policy for automatic secondary callers only.
 
     Batch existence is diagnostic, never proof of complete source coverage or
     scheduler provenance. Secondary writers also defer with no batches: letting
     one start while the daily writer is fetching would recreate the race. The
     daily scheduler and explicit GEM capture do not call this guard.
+
+    ``writer``: only the dedicated options runner passes one
+    (``DEDICATED_CAPTURE_SOURCE``). Under the ``daily_scheduler`` policy it is
+    accepted only while the dedicated hand-off is active
+    (``dedicated_handoff_active``): then it runs the daily scheduler's
+    handed-off slots, so it is that writer's stand-in, not a secondary one.
+    Without the hand-off it is refused like any other writer. Every other
+    caller passes no writer and is judged exactly as before.
     """
     policy = os.getenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "legacy").strip().lower()
     if policy in {"", "legacy"}:
@@ -340,6 +348,8 @@ def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
     if policy != "daily_scheduler":
         result["reason"] = "invalid_options_writer_policy"
         return result
+    if writer is not None and writer == DEDICATED_CAPTURE_SOURCE and dedicated_handoff_active():
+        return None
     try:
         with engine.connect() as conn:
             conn.execute(text("SET TRANSACTION READ ONLY"))
@@ -838,6 +848,16 @@ def dedicated_timer_declared() -> bool:
     return os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1"
 
 
+def dedicated_handoff_active() -> bool:
+    """True when the timer is declared and schwab mode is fully on (``options_primary_provider`` chose it)."""
+    if not dedicated_timer_declared():
+        return False
+    # The raw value first, so cboe/yahoo never consult the selector (it logs for schwab without readers).
+    if os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() != "schwab":
+        return False
+    return options_primary_provider() == "schwab"
+
+
 def dedicated_timer_handoff(capture_source: str, now: datetime | None = None) -> str | None:
     """``DEDICATED_HANDOFF_REASON`` when this writer's full-universe run belongs to the dedicated timer.
 
@@ -847,12 +867,7 @@ def dedicated_timer_handoff(capture_source: str, now: datetime | None = None) ->
     runner itself, GEM, the oracle forward pass, a manual run) is never handed off, and callers
     apply this to full-universe runs only.
     """
-    if not dedicated_timer_declared():
-        return None
-    # The raw value first, so cboe/yahoo never consult the selector (it logs for schwab without readers).
-    if os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() != "schwab":
-        return None
-    if options_primary_provider() != "schwab":
+    if not dedicated_handoff_active():
         return None
     if capture_source == "smart_scheduler":
         return DEDICATED_HANDOFF_REASON
