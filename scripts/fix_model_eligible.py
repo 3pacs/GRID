@@ -1,40 +1,30 @@
-"""Fix model_eligible flags: IDs 1-25 FALSE (no data), IDs 102-136 TRUE (have data).
+"""RETIRED: Legacy one-off model_eligible fixer (IDs 1-25 / 102-136).
 
-Idempotent — safe to run multiple times.
+Retired 2026-11-21: Hardcoding ``WHERE id BETWEEN 1 AND 25`` disabled
+``vix_spot`` (id 11) and ``yld_curve_2s10s`` (id 1), blinding ``auto_regime.py``
+during live volatility shocks.
+
+Use ``normalization.eligibility_audit`` (a dry-run report: observation count, freshness,
+no future dates, non-zero variance) to see what should change, and ship any change as a
+reviewed Alembic migration that records the pre-image of every row it touches.
 """
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from db import get_connection
-from loguru import logger as log
 
 
 def fix_model_eligible() -> None:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE feature_registry SET model_eligible = FALSE WHERE id BETWEEN 1 AND 25"
-            )
-            log.info("Set model_eligible=FALSE for {} rows (IDs 1-25)", cur.rowcount)
-
-            cur.execute(
-                "UPDATE feature_registry SET model_eligible = TRUE WHERE id BETWEEN 102 AND 136"
-            )
-            log.info("Set model_eligible=TRUE for {} rows (IDs 102-136)", cur.rowcount)
-
-            # Verify
-            cur.execute(
-                "SELECT id, name, model_eligible FROM feature_registry ORDER BY id"
-            )
-            log.info("--- Verification ---")
-            for row in cur.fetchall():
-                log.info("  ID {:>4}: {:<35} eligible={}", row[0], row[1], row[2])
+    raise RuntimeError(
+        "scripts/fix_model_eligible.py is retired because hardcoded ID ranges "
+        "disabled vix_spot and yld_curve_2s10s. Run "
+        "`python -m normalization.eligibility_audit` instead."
+    )
 
 
 if __name__ == "__main__":
-    fix_model_eligible()
+    print(
+        "RETIRED: use `python -m normalization.eligibility_audit` instead.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
