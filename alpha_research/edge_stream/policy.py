@@ -125,7 +125,7 @@ OWNER_DECISIONS: tuple[dict, ...] = (
     },
     {
         "id": "GRID#1379",
-        "url": "PENDING",
+        "url": "https://github.com/3pacs/GRID/issues/1379#issuecomment-7078049008",
         "decided_by": "Anik (repository owner)",
         "decided_on": "2026-11-22",
         "text_sha256": "6be31fb6445aa04bd58fc236a9575ec47a39f2df896dd5f2ac176e842655cb9c",
