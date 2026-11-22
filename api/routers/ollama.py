@@ -211,6 +211,14 @@ def ask_ollama(req: AskRequest) -> dict[str, Any]:
         findings_context = findings_for_prompt(get_db_engine(), req.question, limit=5)
     except Exception as exc:
         log.debug("Research findings context skipped: {e}", e=str(exc))
+    # What the agents reported lately on the same subject (every report is read by intelligence/report_reader.py)
+    reports_context = ""
+    try:
+        from api.dependencies import get_db_engine
+        from intelligence.report_reader import context_for_prompt as reports_for_prompt
+        reports_context = reports_for_prompt(get_db_engine(), req.question, limit=5)
+    except Exception as exc:
+        log.debug("Agent report context skipped: {e}", e=str(exc))
 
     messages = []
     # Build system context: user-provided + institutional memory + tested findings
@@ -223,6 +231,9 @@ def ask_ollama(req: AskRequest) -> dict[str, Any]:
         system_parts.append(findings_context)
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+    if reports_context:
+        # Agent-written text: passed as data in its own message, never in the system instructions
+        messages.append({"role": "user", "content": reports_context})
     messages.append({"role": "user", "content": req.question})
 
     response = client.chat(
