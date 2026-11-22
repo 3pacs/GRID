@@ -58,7 +58,7 @@ def _squash(sql: str) -> str:
 def test_schema_sql_declares_exactly_what_the_migration_installs():
     m = importlib.import_module(_MIGRATION)
     schema = _squash((ROOT / "schema.sql").read_text())
-    for statement in (m.REVISIONS_TABLE, m.REVISIONS_INDEX, m.KEEP_REVISIONS_FUNCTION,
+    for statement in (m.EPOCH_TABLE, m.EPOCH_ROW, m.REVISIONS_TABLE, m.REVISIONS_INDEX, m.KEEP_REVISIONS_FUNCTION,
                       m.APPEND_ONLY_FUNCTION, *m.TRIGGERS):
         assert _squash(statement) + ";" in schema, statement.strip().splitlines()[0]
 
@@ -264,3 +264,55 @@ def test_downgrade_refuses_while_revisions_exist(scratch):
     with pytest.raises(DBAPIError, match="downgrade refused"):
         _run(scratch, "downgrade")
     assert len(_revisions(scratch)) == 1
+
+
+def test_writers_cannot_set_or_rewrite_a_version_clock(scratch):
+    _run(scratch, "upgrade")
+    with scratch.begin() as conn:
+        conn.execute(text("INSERT INTO regime_history (obs_date, regime, confidence, source, created_at) "
+                          "VALUES (:d, 'NEUTRAL', 0.5, 'auto_regime', '2000-01-01')"), {"d": DAY})
+    stamped = _row(scratch)[4]
+    assert stamped.year >= 2026                                # the trigger's clock, not the writer's
+    with scratch.begin() as conn:                              # a timestamp-only rewrite changes nothing
+        conn.execute(text("UPDATE regime_history SET created_at = '2000-01-01' WHERE obs_date = :d"), {"d": DAY})
+    assert _row(scratch)[4] == stamped and _revisions(scratch) == []
+
+
+def test_interleaved_sessions_archive_with_ordered_clocks(scratch):
+    """Codex's case: A begins, B replaces and commits, then A replaces B's version. With now() A would archive
+    B's version with a superseded_at before B's created_at; the mutation clock is read under the row lock."""
+    _run(scratch, "upgrade")
+    persist_regime_history(scratch, DAY, "NEUTRAL", 0.5)
+    conn_a = scratch.connect()
+    trans_a = conn_a.begin()
+    try:
+        conn_a.execute(text("SELECT now()"))                   # A's transaction clock is fixed here
+        persist_regime_history(scratch, DAY, "GROWTH", 0.6, replace=RegimeReplacement("B", "run-B"))
+        b_version = _row(scratch)[4]
+        conn_a.execute(text("SELECT set_config('grid.regime_history_reason', 'A', true), "
+                            "set_config('grid.regime_history_run', 'run-A', true)"))
+        conn_a.execute(text("UPDATE regime_history SET regime = 'CRISIS', confidence = 0.9 WHERE obs_date = :d"),
+                       {"d": DAY})
+        trans_a.commit()
+    finally:
+        conn_a.close()
+    first, second = _revisions(scratch)
+    assert (first.regime, second.regime) == ("NEUTRAL", "GROWTH")
+    assert second.created_at == b_version == first.superseded_at
+    assert second.superseded_at > second.created_at            # B's version ends after it began
+    assert _row(scratch)[4] == second.superseded_at            # and A's begins where B's ends
+    with scratch.connect() as conn:
+        xids = conn.execute(text("SELECT superseded_by_xid FROM regime_history_revisions ORDER BY id")).scalars().all()
+    assert len(set(xids)) == 2 and all(xids)
+
+
+def test_versions_from_before_the_migration_have_an_unknown_start(scratch):
+    with scratch.begin() as conn:                              # the old upsert never moved created_at
+        conn.execute(text("INSERT INTO regime_history (obs_date, regime, confidence, source, created_at) "
+                          "VALUES (:d, 'NEUTRAL', 0.5, 'auto_regime', '2026-03-30')"), {"d": DAY})
+    _run(scratch, "upgrade")
+    persist_regime_history(scratch, DAY, "FRAGILE", 0.7, replace=RegimeReplacement("re-run", "run-F"))
+    persist_regime_history(scratch, DAY, "CRISIS", 0.9, replace=RegimeReplacement("re-run", "run-G"))
+    legacy, known = _revisions(scratch)
+    assert legacy.regime == "NEUTRAL" and legacy.created_at is None
+    assert known.regime == "FRAGILE" and known.created_at == legacy.superseded_at
