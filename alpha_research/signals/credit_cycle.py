@@ -128,13 +128,19 @@ def _expansion_families() -> dict:
 def _get_feature_series(
     engine: Engine, feature_id: int, start: date, end: date
 ) -> pd.Series:
-    """Fetch a single feature as a time series from resolved_series."""
+    """Fetch a single feature as a time series from resolved_series.
+
+    PIT as of ``end``: ``release_date`` and ``vintage_date`` both <= ``end``
+    (E1-V7c), retractions honoured, one value per obs_date (the latest such
+    vintage, store/pit.py's LATEST_AS_OF pick).
+    """
     query = text("""
-        SELECT rs.obs_date, rs.value
+        SELECT DISTINCT ON (rs.obs_date) rs.obs_date, rs.value
         FROM resolved_series rs
         WHERE rs.feature_id = :fid
           AND rs.obs_date BETWEEN :start AND :end
           AND rs.release_date <= :as_of
+          AND rs.vintage_date <= :as_of
           AND NOT EXISTS (
               SELECT 1 FROM resolved_series_retractions rr
               WHERE rr.feature_id = rs.feature_id
@@ -142,7 +148,7 @@ def _get_feature_series(
                 AND rr.vintage_date = rs.vintage_date
                 AND rr.retracted_at <= :retraction_cutoff
           )
-        ORDER BY rs.obs_date
+        ORDER BY rs.obs_date, rs.vintage_date DESC
     """)
     with engine.connect() as conn:
         rows = conn.execute(
