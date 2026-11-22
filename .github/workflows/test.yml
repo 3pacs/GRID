@@ -272,7 +272,8 @@ jobs:
 
       # #1322: Schwab-captured options rows reach admin requests only. The
       # LATERAL fragments and the GEX batch-then-chain read run on real
-      # PostgreSQL only; a skip must fail this step.
+      # PostgreSQL only; a skip must fail this step. test_options_column_reads
+      # runs the readers whose columns did not exist on schema.sql's own DDL.
       - name: Options Schwab-provenance PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -282,7 +283,7 @@ jobs:
           TESTING: "true"
         run: |
           set -o pipefail
-          python -m pytest tests/test_options_provenance_pg.py -q -rA | tee /tmp/grid-options-provenance-pg.txt
+          python -m pytest tests/test_options_provenance_pg.py tests/test_options_column_reads.py -q -rA | tee /tmp/grid-options-provenance-pg.txt
           if grep -q "SKIPPED" /tmp/grid-options-provenance-pg.txt; then
             echo "::error::Options Schwab-provenance PostgreSQL contract was skipped"
             exit 1
