@@ -10,6 +10,7 @@ import pytest
 
 from analysis import cross_section_factory as X
 from analysis import ledger_steered_exploration as lse
+from analysis.desk_conditional_cards import conditional_factory_cards
 from analysis.desk_factory_report import factory_report_cards
 
 SECTORS = ("Energy", "Information Technology", "Utilities")
@@ -638,12 +639,16 @@ def test_the_residual_card_splits_each_spread_exactly_and_never_reaches_the_bar(
     assert (tmp_path / "out" / "discovery-frozen.json").read_bytes() == (other / "out" / "discovery-frozen.json").read_bytes()
     assert {k: v for k, v in rep.items() if k != "residual"} == {k: v for k, v in rep2.items() if k != "residual"}
 
-    # the desk evidence adapter still reads the report as written
+    # the desk evidence and conditional-card adapters still read the report as written
     import hashlib
     raw = (tmp_path / "out" / "report.json").read_bytes()
     now = datetime.now(UTC)
-    assert factory_report_cards(raw, expected_sha256=hashlib.sha256(raw).hexdigest(), receipt_id="r1", observed_at=now,
-                                available_at=now, as_of=now, max_age=timedelta(days=1))["tested_trials"] == 4
+    args = {"expected_sha256": hashlib.sha256(raw).hexdigest(), "receipt_id": "r1", "observed_at": now,
+            "available_at": now, "as_of": now, "max_age": timedelta(days=1)}
+    assert factory_report_cards(raw, **args)["tested_trials"] == 4
+    conditional = conditional_factory_cards(raw, **args)
+    assert {c["trial_id"] for c in conditional["cards"]} == set(rep["cards"])
+    assert conditional["promotion_allowed"] is False
 
 
 def test_a_module_that_is_a_known_factor_is_explained_by_it_and_a_new_effect_is_not(tmp_path):
