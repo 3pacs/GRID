@@ -954,6 +954,49 @@ class CboeFirstOptionsClient:
         return cboe_first
 
 
+_DAILY_SIGNALS_UPSERT_SQL = text(
+    "INSERT INTO options_daily_signals "
+    "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
+    "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
+    "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
+    "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
+    ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
+    "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
+    # created_at is the row's revision clock: it moves to NOW() only when a
+    # stored value actually changes (SET expressions read the existing row),
+    # so an as-of reader (analysis/thesis_scorer) never takes a value revised
+    # after its decision clock.
+    "created_at = CASE WHEN ("
+    "options_daily_signals.put_call_ratio, options_daily_signals.max_pain, "
+    "options_daily_signals.iv_skew, options_daily_signals.total_oi, "
+    "options_daily_signals.total_volume, options_daily_signals.near_expiry, "
+    "options_daily_signals.spot_price, options_daily_signals.iv_atm, "
+    "options_daily_signals.iv_m90_put_v1, options_daily_signals.iv_m110_call_v1, "
+    "options_daily_signals.wing_iv_metadata, options_daily_signals.term_structure_slope, "
+    "options_daily_signals.oi_concentration"
+    ") IS DISTINCT FROM ("
+    "EXCLUDED.put_call_ratio, EXCLUDED.max_pain, EXCLUDED.iv_skew, "
+    "EXCLUDED.total_oi, EXCLUDED.total_volume, EXCLUDED.near_expiry, "
+    "EXCLUDED.spot_price, EXCLUDED.iv_atm, EXCLUDED.iv_m90_put_v1, "
+    "EXCLUDED.iv_m110_call_v1, EXCLUDED.wing_iv_metadata, "
+    "EXCLUDED.term_structure_slope, EXCLUDED.oi_concentration"
+    ") THEN NOW() ELSE options_daily_signals.created_at END, "
+    "put_call_ratio = EXCLUDED.put_call_ratio, "
+    "max_pain = EXCLUDED.max_pain, "
+    "iv_skew = EXCLUDED.iv_skew, "
+    "total_oi = EXCLUDED.total_oi, "
+    "total_volume = EXCLUDED.total_volume, "
+    "near_expiry = EXCLUDED.near_expiry, "
+    "spot_price = EXCLUDED.spot_price, "
+    "iv_atm = EXCLUDED.iv_atm, "
+    "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
+    "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
+    "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
+    "term_structure_slope = EXCLUDED.term_structure_slope, "
+    "oi_concentration = EXCLUDED.oi_concentration"
+)
+
+
 class OptionsPuller(BasePuller):
     """Pull options chains and compute daily signals for watchlist tickers.
 
@@ -1662,28 +1705,7 @@ class OptionsPuller(BasePuller):
                 # Insert daily signals
                 _check_budget(should_continue)
                 signal_write = conn.execute(
-                    text(
-                        "INSERT INTO options_daily_signals "
-                        "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
-                        "total_oi, total_volume, near_expiry, spot_price, iv_atm, "
-                        "iv_m90_put_v1, iv_m110_call_v1, wing_iv_metadata, term_structure_slope, oi_concentration) "
-                        "VALUES (:ticker, :sd, :pcr, :mp, :ivs, :oi, :vol, :ne, :spot, "
-                        ":iv_atm, :iv_m90_put_v1, :iv_m110_call_v1, CAST(:wing_meta AS JSONB), :ts_slope, :oi_conc) "
-                        "ON CONFLICT (ticker, signal_date) DO UPDATE SET "
-                        "put_call_ratio = EXCLUDED.put_call_ratio, "
-                        "max_pain = EXCLUDED.max_pain, "
-                        "iv_skew = EXCLUDED.iv_skew, "
-                        "total_oi = EXCLUDED.total_oi, "
-                        "total_volume = EXCLUDED.total_volume, "
-                        "near_expiry = EXCLUDED.near_expiry, "
-                        "spot_price = EXCLUDED.spot_price, "
-                        "iv_atm = EXCLUDED.iv_atm, "
-                        "iv_m90_put_v1 = EXCLUDED.iv_m90_put_v1, "
-                        "iv_m110_call_v1 = EXCLUDED.iv_m110_call_v1, "
-                        "wing_iv_metadata = EXCLUDED.wing_iv_metadata, "
-                        "term_structure_slope = EXCLUDED.term_structure_slope, "
-                        "oi_concentration = EXCLUDED.oi_concentration"
-                    ),
+                    _DAILY_SIGNALS_UPSERT_SQL,
                     {
                         "ticker": ticker, "sd": today_str,
                         "pcr": put_call_ratio, "mp": max_pain, "ivs": iv_skew,
