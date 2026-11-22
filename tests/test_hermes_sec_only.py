@@ -499,9 +499,16 @@ class FinraCompositionTests(unittest.TestCase):
 # checking the original pin; altered guards/provenance or unrelated edits fail.
 _PRE_PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        from ingestion.options import OptionsPuller\n\n        self._puller = OptionsPuller(db_engine=db_engine)\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
 _PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        # Do not construct the puller (which resolves catalog identity) until\n        # the secondary-writer policy has allowed a real attempt.\n        self._engine = db_engine\n        self._puller = None\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        from ingestion.options import OptionsPuller, automatic_options_capture_guard\n\n        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))\n        if guarded is not None:\n            return guarded\n        if self._puller is None:\n            self._puller = OptionsPuller(db_engine=self._engine)\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
+# PR1331 (schwab-mode tail budget, 2026-11-21) changes only the options adapter's pull
+# method: a schwab-only deadline_at pass-through and its comment. Reverse that exact text
+# to the PR806 method first; any other edit to it fails as PR1331_OPTIONS_DELTA_CHANGED.
+_PR806_OPTIONS_PULL = _PR806_OPTIONS_METHODS[_PR806_OPTIONS_METHODS.index("    def pull("):]
+_PR1331_OPTIONS_PULL = '    def pull(self, should_continue: Any = None, deadline_at: float | None = None) -> dict[str, Any]:\n        import os\n\n        from ingestion.options import OptionsPuller, automatic_options_capture_guard\n\n        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))\n        if guarded is not None:\n            return guarded\n        if self._puller is None:\n            self._puller = OptionsPuller(db_engine=self._engine)\n        # Schwab mode (PR1331, 2026-11-21): a full run (~80 Schwab calls plus ~960 Yahoo requests\n        # at >= 1 s, ~19 min) does not fit this job\'s 840 s window. timeout_s stays 900: at 1,500 s\n        # the smart_ingestion step in scripts/hermes_operator.py (TICK_TIME_BUDGET_S + timeout_s + 60,\n        # 1260 s, pinned by tests/test_hermes_timeout_budgets.py) would have to grow to 1,860 s and\n        # hold every later Hermes step up to 31 min on each options run and 30-min PARTIAL retry,\n        # or abandon a cooperating capture as an orphaned thread. Instead this passes deadline_at so\n        # the run\'s Yahoo budget fits the time left, and options_schwab.TailCursor resumes the next\n        # run where this one stopped. Every other provider gets exactly the call it got before; the\n        # environment check comes first, so none of them even imports the selector here.\n        schwab_only: dict[str, Any] = {}\n        if (deadline_at is not None\n                and os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() == "schwab"):\n            from ingestion.options import options_primary_provider\n\n            if options_primary_provider() == "schwab":\n                schwab_only["deadline_at"] = deadline_at\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler", **schwab_only,\n        ).summary\n'
 
 def scheduler_tail_before_reviewed_options_delta(source):
     tail = source.split('\nimport calendar\n', 1)[1]
+    assert tail.count(_PR1331_OPTIONS_PULL) == 1, 'PR1331_OPTIONS_DELTA_CHANGED'
+    tail = tail.replace(_PR1331_OPTIONS_PULL, _PR806_OPTIONS_PULL, 1)
     assert tail.count(_PR806_OPTIONS_METHODS) == 1, 'PR806_OPTIONS_DELTA_CHANGED'
     # The separately reviewed backlog fix changes exactly this one reporting
     # line. Reverse only that exact occurrence before applying the historical
@@ -746,6 +753,8 @@ class CurrentSecDefaultTests(unittest.TestCase):
             ('if guarded is not None:', 'if False:'),
             ('self._puller = None', 'self._puller = OptionsPuller(db_engine=db_engine)'),
             ('capture_source="smart_scheduler"', 'capture_source="options_puller"'),
+            ('schwab_only["deadline_at"] = deadline_at', 'schwab_only["deadline_at"] = None'),
+            ('== "schwab"):', '!= "cboe"):'),
             ('SKIP_RETRY_MINUTES = 30', 'SKIP_RETRY_MINUTES = 31'),
         ]
         read = Path.read_text
