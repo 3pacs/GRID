@@ -851,12 +851,45 @@ def regime_snapshot_refs(record: dict[str, Any]) -> list[int]:
     return sorted(refs)
 
 
+def _typed_id_keys(raw: Any) -> set[tuple[str, Any]] | None:
+    """Normalized keys of a list/tuple/set (or a dict's keys) of feature ids."""
+    if isinstance(raw, dict):
+        raw = raw.keys()
+    elif not isinstance(raw, (list, tuple, set)):
+        return None
+    return {pair[0] for item in raw if (pair := _normalize_typed_feature_id(item)) is not None}
+
+
+def producer_eligible_feature_ids(payload: dict[str, Any], *, as_of: datetime | None = None) -> list[str | int] | None:
+    """Distinct eligible feature ids a producer payload actually lists, or None.
+
+    Only ``features_used`` entries count, filtered by ``eligible_feature_ids``
+    (else ``eligible_features``) and by ``ineligible_features`` (else
+    ``excluded_features``): the same rule the briefing applies to the same
+    payload (``MarketBriefingEngine._gather_market_snapshot``). A scalar such
+    as ``bound_inputs``, ``n_features`` or ``feature_count`` is never a count,
+    so a payload without feature entries proves nothing.
+    """
+    raw = payload.get("features_used")
+    if not isinstance(raw, (dict, list, tuple)):
+        return None
+    excl_raw = payload.get("ineligible_features") or payload.get("excluded_features")
+    elig_raw = payload.get("eligible_feature_ids") or payload.get("eligible_features")
+    return _extract_distinct_eligible_feature_ids(
+        raw,
+        eligible_ids=_typed_id_keys(elig_raw) if isinstance(elig_raw, (list, tuple, set)) else None,
+        excluded_ids=_typed_id_keys(excl_raw),
+        as_of=as_of,
+    )
+
+
 def describe_producer_snapshot(row: Any) -> dict[str, Any]:
     """What the packet needs from one analytical_snapshots row, derived from it.
 
     Hashes the payload exactly as read back (``store.snapshots`` canonical
-    form, the hash the producer stored), and derives the eligible-feature count
-    from the payload itself. The payload is not carried.
+    form, the hash the producer stored), and lists the eligible feature ids the
+    payload itself names (``producer_eligible_feature_ids``); the count is their
+    number. The payload is not carried.
     """
     from store.snapshots import canonical_payload_sha256
 
@@ -881,8 +914,10 @@ def describe_producer_snapshot(row: Any) -> dict[str, Any]:
         "payload_valid": True,
         "payload_sha256": digest,
         "regime": _extract_regime_label(payload),
-        "bound_inputs": _extract_bound_input_count(payload, as_of=created),
     })
+    ids = producer_eligible_feature_ids(payload, as_of=created)
+    entry["eligible_feature_ids"] = ids
+    entry["bound_inputs"] = len(ids) if ids is not None else None
     return entry
 
 
@@ -939,10 +974,14 @@ def _verified_producer_count(
         return ("unverified", "missing_publication_clock"), None
     if available > as_of:
         return ("mismatch", "producer_snapshot_future_clock"), None
-    count = entry.get("bound_inputs")
-    if type(count) is not int or count < 0:
+    producer_ids = entry.get("eligible_feature_ids")
+    if not isinstance(producer_ids, list):
         return ("unverified", "producer_snapshot_missing_bound_inputs"), None
-    return None, count
+    inline_ids = mapping.get("eligible_feature_ids")
+    if inline_ids is not None and _typed_id_keys(inline_ids) != _typed_id_keys(producer_ids):
+        # Same count is not enough: the carried ids must be the producer's ids.
+        return ("mismatch", "inline_feature_ids_disagree_with_producer"), None
+    return None, len(producer_ids)
 
 
 def inspect_regime_binding(

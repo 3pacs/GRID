@@ -951,6 +951,9 @@ def _bound_regime(payload: dict, *, sid: int = 42, **extra) -> dict:
      ("REFUSED_UNVERIFIED_REGIME_BINDING", "producer_snapshot_not_captured")),
     # eight inline ids against a verified producer count of one
     (_bound_regime(_PAYLOAD_1, **_INLINE_8), {"payload": _PAYLOAD_1},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "inline_feature_ids_disagree_with_producer")),
+    # an inline scalar count of eight against a verified producer count of one
+    (_bound_regime(_PAYLOAD_1, bound_inputs=8), {"payload": _PAYLOAD_1},
      ("REFUSED_REGIME_BINDING_MISMATCH", "inline_bound_inputs_disagree_with_producer:8!=1")),
     # verified producer with one feature and no inline count
     (_bound_regime(_PAYLOAD_1), {"payload": _PAYLOAD_1},
@@ -973,7 +976,7 @@ def _bound_regime(payload: dict, *, sid: int = 42, **extra) -> dict:
     # hash that is not a sha256 digest
     ({**_bound_regime(_PAYLOAD_8), "snapshot_hash": "abc"}, {"payload": _PAYLOAD_8},
      ("REFUSED_UNVERIFIED_REGIME_BINDING", "missing_producer_snapshot_binding")),
-], ids=["inline_only", "not_captured", "inline8_vs_producer1", "producer1", "not_found",
+], ids=["inline_only", "not_captured", "inline8_vs_producer1", "inline_scalar8_vs_producer1", "producer1", "not_found",
         "hash_mismatch", "future_producer", "regime_mismatch", "wrong_category", "bad_hash"])
 def test_packet_takes_the_regime_count_only_from_the_captured_producer(latest_regime, producer, expected):
     job = _load_packet_module()
@@ -1145,3 +1148,96 @@ def test_packet_refuses_odd_snapshot_ids_without_aborting_the_run(sid):
         ("market_briefings:8300", "REFUSED_UNVERIFIED_REGIME_BINDING"),
     ]
     assert [p["id"] for p in packet["publications"]] == ["market_briefings:8301"]
+
+
+# ── Follow-up to Codex's accept of #1386 (review 6014483299 on 59bd9bee) ─────
+# "describe_producer_snapshot's generic count helper can still accept scalar
+# bound_inputs when a producer payload lacks feature entries ... Require actual
+# eligible ID entries on the producer side."
+
+
+@pytest.mark.parametrize("payload", [
+    {"regime": "FRAGILE", "bound_inputs": 12},
+    {"regime": "FRAGILE", "n_features": 12, "feature_count": 12, "n_features_used": 12},
+    {"regime": "FRAGILE", "features_used": "feat_0,feat_1,feat_2,feat_3,feat_4,feat_5,feat_6,feat_7"},
+    {"regime": "FRAGILE", "features_used": None, "bound_inputs": 9},
+], ids=["scalar_bound_inputs", "registry_sizes", "features_used_string", "features_used_null"])
+def test_producer_without_feature_entries_proves_no_count(payload):
+    """A producer payload that only states a number is not evidence of eight
+    distinct eligible ids: the regime is refused as unverified."""
+    job = _load_packet_module()
+    entry = job.describe_producer_snapshot(
+        {"id": 42, "category": "regime_detection", "payload": payload, "created_at": "2026-11-18T09:59:00Z"}
+    )
+    assert entry["eligible_feature_ids"] is None and entry["bound_inputs"] is None
+    record = _briefing_record(8400, {"latest_regime": _bound_regime(payload)})
+    packet, exclusions = job.build_packet(_packet_bundle([record], producer_snapshots={"42": entry}))
+    assert packet["publications"] == []
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_UNVERIFIED_REGIME_BINDING", ["producer_snapshot_missing_bound_inputs"]),
+    ]
+
+
+def test_producer_scalar_count_never_overrides_its_feature_entries():
+    job = _load_packet_module()
+    payload = {**_PAYLOAD_1, "bound_inputs": 12, "n_features": 12}
+    entry = job.describe_producer_snapshot(
+        {"id": 42, "category": "regime_detection", "payload": payload, "created_at": "2026-11-18T09:59:00Z"}
+    )
+    assert entry["eligible_feature_ids"] == ["feat_0"] and entry["bound_inputs"] == 1
+    record = _briefing_record(8401, {"latest_regime": _bound_regime(payload)})
+    _, exclusions = job.build_packet(_packet_bundle([record], producer_snapshots={"42": entry}))
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_INSUFFICIENT_REGIME_INPUTS", ["regime_bound_inputs_below_minimum:1<8"]),
+    ]
+
+
+def test_carried_ids_must_be_the_producers_ids_not_just_as_many():
+    job = _load_packet_module()
+    others = {"bound_inputs": 8, "eligible_feature_ids": [f"other_{i}" for i in range(8)]}
+    record = _briefing_record(8402, {"latest_regime": _bound_regime(_PAYLOAD_8, **others)})
+    _, exclusions = job.build_packet(_packet_bundle(
+        [record], producer_snapshots=_captured_producer(job, 42, _PAYLOAD_8),
+    ))
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_REGIME_BINDING_MISMATCH", ["inline_feature_ids_disagree_with_producer"]),
+    ]
+
+
+@pytest.mark.parametrize("filter_key", ["eligible_feature_ids", "eligible_features"])
+def test_packet_and_briefing_count_the_same_producer_payload_alike(tmp_path, filter_key):
+    """The producer lists ten features but marks eight eligible. The briefing
+    counts eight; the packet must count the same eight, or it would refuse a
+    correctly bound briefing (on main it counted ten)."""
+    payload = {
+        "regime": "FRAGILE",
+        "features_used": {f"c{i}": f"feat_{i}" for i in range(10)},
+        filter_key: [f"feat_{i}" for i in range(8)],
+        "ineligible_features": ["feat_9"],
+    }
+    digest = _canonical_sha256(payload)
+    regime_row = ("FRAGILE", 0.72, 0.15, {"snapshot_id": 42, "snapshot_hash": digest},
+                  "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(regime_row, snap_rows=[(42, payload, "2026-11-18T09:59:00Z", date(2026, 11, 18))])
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+    assert snap["latest_regime"]["bound_inputs"] == 8
+
+    job = _load_packet_module()
+    captured = _captured_producer(job, 42, payload)
+    assert captured["42"]["bound_inputs"] == 8
+    packet, exclusions = job.build_packet(_packet_bundle([_briefing_record(8403, snap)], producer_snapshots=captured))
+    assert exclusions == []
+    assert [p["id"] for p in packet["publications"]] == ["market_briefings:8403"]
+
+
+def test_auto_regime_payload_shape_counts_its_concept_feature_names():
+    """auto_regime writes features_used = {concept: feature_name}; the
+    feature names are the ids."""
+    job = _load_packet_module()
+    payload = {"regime": "FRAGILE", "n_features": 40,
+               "features_used": {f"concept_{i}": f"feature_{i % 9}" for i in range(12)}}
+    entry = job.describe_producer_snapshot(
+        {"id": 7, "category": "regime_detection", "payload": payload, "created_at": "2026-11-18T09:59:00Z"}
+    )
+    assert entry["bound_inputs"] == 9
+    assert sorted(entry["eligible_feature_ids"]) == sorted(f"feature_{i}" for i in range(9))
