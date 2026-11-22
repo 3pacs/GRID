@@ -5,6 +5,9 @@
   tolerance and no session where the two sides disagree about availability.
 * A live recording with a missing read bar, or more than two lost minutes, fails:
   values that agree are not parity when live would abstain.
+* Version 4: a return value is judged on the research feature's own spread (a tenth of it
+  per value, and the mean signed difference over the verdict sessions near zero), not in
+  basis points. A return value with no research spread to judge it on is not a match.
 * Version 3: the verdict is taken on the five most recent closed exchange sessions the
   calendar expects; a session either side lacks is missing, not skipped.
   An older bad session stays in the whole-window counts and no longer blocks.
@@ -17,6 +20,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import statistics
+from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -43,6 +48,38 @@ def _session(day_index: int, minutes=FULL) -> dict:
 
 def _days(sessions=SESSIONS) -> dict:
     return {day: _session(i) for i, day in enumerate(sessions)}
+
+
+HISTORY_DAYS = flp.expected_sessions_between("2026-07-15", "2026-10-30")     # research sessions before the window
+
+
+def _history_session(i: int) -> dict:
+    """A session whose level, drift and last half hour differ from day to day, so every return feature has a spread."""
+    level = 700.0 + 0.9 * ((i * 37) % 17 - 8)
+    slope = 0.004 * ((i * 13) % 11 - 5)
+    late = 0.006 * ((i * 7) % 13 - 6)
+    out = {}
+    for m, hm in enumerate(FULL):
+        close = level + slope * m + late * max(0, m - 300)
+        out[hm] = (close - 0.02, close + 0.05, close - 0.06, close, 1000 + m)
+    return out
+
+
+def _history() -> dict:
+    """Research bars before the window: read only for the spread a return difference is judged on (version 4)."""
+    return {day: _history_session(i) for i, day in enumerate(HISTORY_DAYS)}
+
+
+def _f1_dollars(day: str, spreads: float, sessions=None, decision: str = "15:00") -> float:
+    """What to add to a live close so that F1 at ``decision`` on ``day`` moves by ``spreads`` research spreads."""
+    days = _days(sessions or SESSIONS)
+    spread = flp.research_spreads({**_history(), **days}, [decision])[("F1", decision, day)]
+    return spreads * spread * days[flp.previous_session(day)]["15:59"][3]
+
+
+def _nudged(live: dict, day: str, hm: str, dollars: float) -> None:
+    o, h, low, c, v = live[day][hm]
+    live[day][hm] = (o, h, low, c + dollars, v)
 
 
 def _research_db(path, bars):
@@ -123,10 +160,11 @@ def _after_close(day):
 def run(tmp_path, monkeypatch):
     calls = []
 
-    def go(research, live, decisions=("15:00",), last=SESSIONS[-1], clock=None, **kwargs):
+    def go(research, live, decisions=("15:00",), last=SESSIONS[-1], clock=None, history=True, **kwargs):
         calls.append(1)                                   # a test may build more than one pair of databases
         r, lv = tmp_path / f"r{len(calls)}.db", tmp_path / f"l{len(calls)}.db"
         monkeypatch.setattr(flp, "_clock", lambda: clock or _after_close(last))     # the report is made after that close
+        research = {**(_history() if history else {}), **research}                 # the history is research only
         return flp.report(_research_db(r, research), _live_db(lv, live, decisions=decisions, **kwargs),
                           first=SESSIONS[0], last=last, decisions=list(decisions), horizons=["close"])
     return go
@@ -197,7 +235,7 @@ def test_three_lost_morning_minutes_withhold_that_day_and_the_next(run):
     assert doc["live_availability"]["signal_eligible"] == 4
     assert doc["comparison"]["features"]["F1"]["matched_sessions"] == 4
     assert doc["research_only"] == sorted(mf.FEATURES)
-    assert doc["schema"] == "factory-live-parity-v3"
+    assert doc["schema"] == "factory-live-parity-v4"
 
 
 def test_one_lost_minute_keeps_the_return_features_and_withholds_the_range_that_reads_it(run):
@@ -416,8 +454,7 @@ def test_what_a_binding_must_be():
 
 def test_a_value_outside_tolerance_is_counted_and_blocks_the_feature(run):
     live = _days()
-    o, h, low, c, v = live["2026-11-05"]["14:59"]
-    live["2026-11-05"]["14:59"] = (o, h, low, c + 0.30, v)     # about 4 bp on the return
+    _nudged(live, "2026-11-05", "14:59", _f1_dollars("2026-11-05", 0.12))     # 0.12 of the spread: over the tenth allowed
 
     doc = run(_days(), live)
 
@@ -425,7 +462,8 @@ def test_a_value_outside_tolerance_is_counted_and_blocks_the_feature(run):
     assert f1["values_out_of_tolerance"] == 1 and f1["matched_sessions"] == 5
     assert f1["status"] == "research_only"
     assert f1["reasons"] == ["insufficient_matched_sessions", "value_out_of_tolerance"]
-    assert f1["max_abs_diff"] > flp.TOLERANCE["return"]
+    assert f1["max_abs_diff_in_spreads"] == pytest.approx(0.12, rel=1e-3) and f1["max_abs_diff_in_spreads"] > flp.TOLERANCE["return"]
+    assert (f1["tolerance"], f1["tolerance_unit"]) == (0.1, "research_spreads")
     bad = [r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["within_tolerance"] is False]
     assert [r["day"] for r in bad] == ["2026-11-05"]
 
@@ -504,7 +542,9 @@ def test_the_verdict_is_taken_on_the_five_most_recent_sessions_and_an_older_fail
                                 "missing": {"research": [], "live": []}, "not_recorded_under_the_rule": [],
                                 "recorded_values_differ_from_the_bars": [],
                                 "values_out_of_tolerance": 0, "eligible_rows_with_no_value": 0,
-                                "sessions_with_an_availability_disagreement": []}
+                                "sessions_with_an_availability_disagreement": [],
+                                "sessions_with_no_research_spread": [], "mean_signed_diff_in_spreads": 0.0,
+                                "bias_limit_in_spreads": flp.RETURN_BIAS_SPREADS}
     assert doc["verdict_sessions"] == LONGER[-5:] and doc["as_of"] == "2026-11-12T17:00:00-05:00"
     assert f1["matched_sessions"] == 6 and f1["overlapping_sessions"] == 9             # the whole window, as before
     assert f1["whole_window"] == {"sessions_with_an_availability_disagreement": 2}
@@ -519,8 +559,7 @@ def test_the_verdict_is_taken_on_the_five_most_recent_sessions_and_an_older_fail
 
 def test_an_old_value_out_of_tolerance_is_still_counted_and_a_recent_one_still_blocks(run):
     live = _days(LONGER)
-    o, h, low, c, v = live["2026-11-04"]["14:59"]
-    live["2026-11-04"]["14:59"] = (o, h, low, c + 0.30, v)
+    _nudged(live, "2026-11-04", "14:59", _f1_dollars("2026-11-04", 0.12, LONGER))
 
     doc = run(_days(LONGER), live, last=LONGER[-1])
 
@@ -528,8 +567,7 @@ def test_an_old_value_out_of_tolerance_is_still_counted_and_a_recent_one_still_b
     assert f1["status"] == "live_ready" and f1["values_out_of_tolerance"] == 1         # counted, outside the verdict
     assert f1["verdict_on"]["values_out_of_tolerance"] == 0
 
-    o, h, low, c, v = live["2026-11-12"]["14:59"]
-    live["2026-11-12"]["14:59"] = (o, h, low, c + 0.30, v)
+    _nudged(live, "2026-11-12", "14:59", _f1_dollars("2026-11-12", 0.12, LONGER))
     f1 = run(_days(LONGER), live, last=LONGER[-1])["comparison"]["features"]["F1"]
     assert f1["status"] == "research_only" and f1["verdict_on"]["values_out_of_tolerance"] == 1
     assert f1["reasons"] == ["insufficient_matched_sessions", "value_out_of_tolerance"]
@@ -645,3 +683,121 @@ def test_the_binding_gate_is_applied_to_the_verdict_sessions(run):
     f10 = wrong["comparison"]["features"]["F10"]
     assert "F10" not in wrong["live_ready"] and f10["verdict_on"]["recorded_values_differ_from_the_bars"] == [LONGER[-2]]
     assert flp.RECORDED_DIFFERS in f10["reasons"]
+
+
+# ── version 4: a return value is judged on the research feature's own spread ──────────────
+
+
+def test_the_spread_is_the_scale_of_the_factorys_own_z():
+    history = deque([0.001 * ((i * 7) % 13 - 6) + 0.0001 * i for i in range(60)], maxlen=60)
+    spread = flp.robust_spread(history)
+    for x in (0.0031, -0.0007, 0.0):
+        assert (x - statistics.median(history)) / spread == pytest.approx(mf.robust_z(x, history))
+    assert flp.robust_spread([0.002] * 60) is None                       # no spread at all: nothing to judge on
+    two_valued = [0.001] * 40 + [0.003] * 20                             # MAD is zero, the standard deviation is not
+    assert flp.robust_spread(two_valued) == pytest.approx(statistics.pstdev(two_valued))
+    assert (flp.RETURN_SPREAD_HISTORY, flp.RETURN_TOLERANCE_SPREADS, flp.RETURN_BIAS_SPREADS) == (60, 0.1, 0.03)
+    assert flp.RETURN_SPREAD_HISTORY == mf.RunFile.__dataclass_fields__["z_history"].default
+
+
+def test_a_days_spread_is_taken_from_the_sessions_before_it_only():
+    bars = {**_history(), **_days()}
+    spreads = flp.research_spreads(bars, ["15:00"])
+    day = SESSIONS[3]
+    before = {d: s for d, s in bars.items() if d < day}
+    changed = {**before, **{d: _history_session(40 + i) for i, d in enumerate(sorted(d for d in bars if d >= day))}}
+    assert flp.research_spreads(changed, ["15:00"])[("F1", "15:00", day)] == spreads[("F1", "15:00", day)]
+    assert ("F1", "15:00", HISTORY_DAYS[30]) not in spreads               # fewer than 60 sessions before it
+    assert {f for f, _t, _d in spreads} == {"F1", "F1_shift30"}           # range features are judged on the raw value
+    short = {d: s for d, s in bars.items() if d >= HISTORY_DAYS[-50]}
+    assert not any(d == SESSIONS[0] for _f, _t, d in flp.research_spreads(short, ["15:00"]))
+
+
+def test_sampling_sized_differences_match_and_one_value_over_a_tenth_of_the_spread_does_not(run):
+    live = _days()
+    for day, k in zip(SESSIONS[-5:], (0.08, -0.07, 0.06, -0.08, 0.05)):   # each inside a tenth, no common sign
+        _nudged(live, flp.previous_session(day), "15:59", -_f1_dollars(day, k))    # the prior close, as a sampled quote would miss it
+
+    doc = run(_days(), live)
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert "F1" in doc["live_ready"] and f1["reasons"] == []
+    assert f1["max_abs_diff_in_spreads"] == pytest.approx(0.08, rel=2e-2)
+    assert abs(f1["verdict_on"]["mean_signed_diff_in_spreads"]) < flp.RETURN_BIAS_SPREADS
+    assert f1["max_abs_diff"] > 1e-4, "these differences are over the 1 bp of version 3 and are now a match"
+    row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == SESSIONS[-1])
+    assert row["diff_in_spreads"] == pytest.approx(0.05, rel=2e-2) and row["within_tolerance"] is True
+    assert row["research_spread"] == pytest.approx(row["abs_diff"] / abs(row["diff_in_spreads"]))
+
+    _nudged(live, flp.previous_session(SESSIONS[-2]), "15:59", -_f1_dollars(SESSIONS[-2], 0.2))
+    f1 = run(_days(), live)["comparison"]["features"]["F1"]
+    assert f1["status"] == "research_only" and "value_out_of_tolerance" in f1["reasons"]
+
+
+def test_a_constant_error_inside_the_tolerance_is_a_bias_and_blocks(run):
+    """Every value is inside a tenth of the spread and all on one side: the prior close read wrong the same way."""
+    live = _days()
+    for day in SESSIONS[-5:]:
+        _nudged(live, flp.previous_session(day), "15:59", -_f1_dollars(day, 0.06))
+
+    doc = run(_days(), live)
+
+    f1 = doc["comparison"]["features"]["F1"]
+    assert f1["verdict_on"]["values_out_of_tolerance"] == 0 and f1["verdict_on"]["matched"] == 5
+    assert f1["status"] == "research_only" and f1["reasons"] == [flp.VALUE_BIASED]
+    assert f1["verdict_on"]["mean_signed_diff_in_spreads"] == pytest.approx(0.06, rel=2e-2)
+    assert f1["verdict_on"]["bias_limit_in_spreads"] == 0.03
+    assert "F1" not in doc["live_ready"] and "F10" in doc["live_ready"]
+    assert doc["comparison"]["features"]["F10"]["verdict_on"]["mean_signed_diff_in_spreads"] is None   # ranges have no bias test
+
+
+def test_a_bias_is_judged_on_the_verdict_sessions_only(run):
+    live = _days(LONGER)
+    for day in LONGER[1:4]:                                              # three older sessions, all one side
+        _nudged(live, flp.previous_session(day), "15:59", -_f1_dollars(day, 0.09, LONGER))
+
+    f1 = run(_days(LONGER), live, last=LONGER[-1])["comparison"]["features"]["F1"]
+
+    assert f1["verdict_on"]["sessions"] == LONGER[-5:]
+    assert f1["status"] == "live_ready" and f1["verdict_on"]["mean_signed_diff_in_spreads"] == 0.0
+
+
+def test_a_return_value_with_no_research_spread_is_not_a_match(run):
+    doc = run(_days(), _days(), history=False)                           # identical bars, and nothing to judge a return on
+
+    f = doc["comparison"]["features"]
+    assert doc["live_ready"] == ["F10", "F11"]
+    for name in ("F1", "F1_shift30"):
+        assert f[name]["reasons"] == ["insufficient_matched_sessions", flp.SPREAD_UNAVAILABLE]
+        assert f[name]["verdict_on"]["sessions_with_no_research_spread"] == SESSIONS[-5:]
+        assert f[name]["values_with_no_research_spread"] == f[name]["values_compared"] == 6
+        assert f[name]["values_out_of_tolerance"] == 0                   # not judged is not "out of tolerance"
+        assert f[name]["verdict_on"]["mean_signed_diff_in_spreads"] is None
+    row = next(r for r in doc["comparison"]["value_rows"] if r["feature"] == "F1" and r["day"] == SESSIONS[-1])
+    assert (row["abs_diff"], row["research_spread"], row["diff_in_spreads"], row["matched"]) == (0.0, None, None, False)
+    assert row["within_tolerance"] is None
+    assert doc["return_tolerance"]["research_sessions_read_before_the_window"] == 0
+
+
+def test_the_history_is_read_for_the_spread_and_never_compared(run, tmp_path):
+    doc = run(_days(), _days())
+
+    assert doc["comparison"]["overlapping_sessions"] == SESSIONS         # the sessions both sides hold: no history day
+    assert doc["research_sessions"] == len(SESSIONS)                     # the window's own sessions
+    assert doc["return_tolerance"] == {
+        "unit": "research_spreads", "per_value": 0.1, "bias": 0.03, "spread_history_sessions": 60,
+        "research_sessions_read_before_the_window": len(HISTORY_DAYS), "note": doc["return_tolerance"]["note"]}
+    assert not any(r["day"] < SESSIONS[0] for r in doc["comparison"]["value_rows"])
+
+    many = {d: _history_session(i) for i, d in enumerate(flp.expected_sessions_between("2026-01-05", "2026-10-30"))}
+    db = _research_db(tmp_path / "many.db", many)
+    held = flp.load_research_history(db, "SPY", SESSIONS[0])
+    assert len(held) == flp.SPREAD_LOOKBACK_SESSIONS == 90 and max(held) == "2026-10-30"
+    assert flp.load_research_history(db, "SPY", "2026-01-05") == {}
+
+
+def test_the_history_never_reaches_before_dev(tmp_path):
+    days = ["2022-11-10", "2022-11-11", mf.DEV_FIRST, "2022-11-15"]
+    db = _research_db(tmp_path / "old.db", {d: _history_session(i) for i, d in enumerate(days)})
+
+    assert sorted(flp.load_research_history(db, "SPY", "2022-11-16")) == [mf.DEV_FIRST, "2022-11-15"]

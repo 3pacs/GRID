@@ -89,6 +89,28 @@ fixed here, not an argument: a verdict must not depend on a window chosen after
 the fact. The whole-window counts are still reported beside the verdict, so an
 older failure stays visible.
 
+A return feature is judged on the feature's own scale, not in basis points
+(version 4). The live close is a quote sampled a few seconds before the minute
+ends; the research close is the minute's last trade. Measured on eight sessions
+in November 2026, the two differ by about half a basis point at the median and
+1 to 3.5 bp at the worst, without bias, so the 1 bp of versions 1 to 3 could
+not be met by a sound recording. What a difference means for a rule is its size
+against the feature's spread, because a slot fires on a z. So the difference of
+a return value is divided by the research feature's robust spread at that
+decision time over the ``RETURN_SPREAD_HISTORY`` eligible research sessions
+before that day (the factory's own z scale: 1.4826 MAD, then the standard
+deviation). That quotient is the difference between the two z values the two
+sides would compute on one history. It must be within
+``RETURN_TOLERANCE_SPREADS`` at every value, and over the verdict sessions the
+mean signed quotient must be within ``RETURN_BIAS_SPREADS`` of zero: a
+tolerance wide enough for sampling noise would otherwise pass a small constant
+error, and the prior close is where one can enter. A return value whose spread
+cannot be computed (fewer research sessions than the history needs) is not a
+match (``research_spread_unavailable``). Range features are judged as before.
+The three numbers are fixed here, not arguments. They were chosen from what a
+changed decision costs, after looking at those eight sessions; they are not to
+be tuned on later reports.
+
 Read-only: both databases are opened ``mode=ro``. Nothing here scores a module
 or registers anything. Five matching sessions are evidence about the source
 and the implementation, not about any edge.
@@ -100,8 +122,9 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import statistics
 import sys
-from collections import Counter
+from collections import Counter, deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -117,17 +140,22 @@ from analysis.module_factory import (
 )
 from ingestion.market_calendar import is_market_open, market_close_time
 
-SCHEMA = "factory-live-parity-v3"
+SCHEMA = "factory-live-parity-v4"
 MIN_SESSIONS = 5                  # the verdict: each of the most recent MIN_SESSIONS expected closed exchange sessions matched
 OPEN_MIN = 9 * 60 + 30
 FULL_SESSION_MIN = 390
 
-# Tolerance per feature type, on the raw (un-standardized) value.
-#   return: 1 bp. gex-signals' own live-bars/1 gate allows a $0.05 median close
-#           difference between sources, about 0.7 bp at SPY 730.
-#   range:  0.03 of the range, i.e. three points on a 0-100 position scale.
+# Tolerance per feature type.
+#   return: 0.1 of the research feature's robust spread at that decision time (version 4; 1 bp before). At a
+#           threshold of z = 0.5 a z that moves by at most 0.1 changes at most about 3.5% of decisions.
+#   range:  0.03 of the range on the raw value, i.e. three points on a 0-100 position scale.
 FEATURE_TYPE = {"F1": "return", "F1_shift30": "return", "F10": "range", "F11": "range"}
-TOLERANCE = {"return": 1e-4, "range": 0.03}
+RETURN_SPREAD_HISTORY = 60        # eligible research sessions before the day: the factory's z history
+RETURN_TOLERANCE_SPREADS = 0.1    # per value
+RETURN_BIAS_SPREADS = 0.03        # the mean signed difference over the verdict sessions
+SPREAD_LOOKBACK_SESSIONS = RETURN_SPREAD_HISTORY + 30   # sessions read before the window: the history and a margin for ineligible ones
+TOLERANCE = {"return": RETURN_TOLERANCE_SPREADS, "range": 0.03}
+TOLERANCE_UNIT = {"return": "research_spreads", "range": "raw_value"}
 LABEL_TOLERANCE_DOLLARS = 0.05
 
 PRIOR_MISSING = "prior_session_missing"
@@ -162,6 +190,8 @@ LIVE_RULE_TERMS_SHA256 = hashlib.sha256(LIVE_RULE_TERMS_JSON.encode()).hexdigest
 RULE_NOT_RECORDED = "live_rule_not_recorded"
 SESSION_MISSING = "session_missing"       # an expected recent session is absent from research, from live, or from both
 RECORDED_DIFFERS = "recorded_value_differs_from_bars"
+SPREAD_UNAVAILABLE = "research_spread_unavailable"   # a return value with no research spread to judge it on
+VALUE_BIASED = "value_biased"                         # the mean signed difference of a return feature is not near zero
 
 Bars = dict[str, dict[str, tuple]]
 Backstop = dict[str, dict[str, tuple]]   # {day: {hm: ((o, h, l, c, v), first seen, aware datetime)}}
@@ -187,6 +217,29 @@ def load_research(db: Path, symbol: str, first: str, last: str) -> Bars:
         rows = con.execute(
             "select day, hm, o, h, l, c, v from bars where sym = ? and day between ? and ? order by day, hm",
             (symbol, first, last),
+        ).fetchall()
+    finally:
+        con.close()
+    out: Bars = {}
+    for day, hm, o, h, low, c, v in rows:
+        out.setdefault(day, {})[hm] = (o, h, low, c, v)
+    return out
+
+
+def load_research_history(db: Path, symbol: str, before: str, sessions: int = SPREAD_LOOKBACK_SESSIONS) -> Bars:
+    """The ``sessions`` most recent research days strictly before ``before``, never a day before dev.
+
+    Read only for the spread a return difference is judged on. These days are not compared with live."""
+    con = _connect(db)
+    try:
+        days = [r[0] for r in con.execute(
+            "select distinct day from bars where sym = ? and day < ? and day >= ? order by day desc limit ?",
+            (symbol, before, DEV_FIRST, sessions))]
+        if not days:
+            return {}
+        rows = con.execute(
+            "select day, hm, o, h, l, c, v from bars where sym = ? and day between ? and ? order by day, hm",
+            (symbol, min(days), max(days)),
         ).fetchall()
     finally:
         con.close()
@@ -539,8 +592,43 @@ def feature_values(bars: Bars, day: str, decision: str) -> dict[str, float | Non
     return raw_features(Session(today), Session(prior), _hm(_minutes(decision) - 1))
 
 
+def robust_spread(history) -> float | None:
+    """The scale of ``module_factory.robust_z``: 1.4826 MAD, then the standard deviation; None when both are zero."""
+    med = statistics.median(history)
+    spread = 1.4826 * statistics.median(abs(h - med) for h in history)
+    if spread == 0:
+        spread = statistics.pstdev(history)
+    return spread or None
+
+
+def research_spreads(bars: Bars, decisions: list[str]) -> dict[tuple[str, str, str], float]:
+    """{(feature, decision, day): spread} for the return features, from research bars alone.
+
+    The spread for a day is taken over the ``RETURN_SPREAD_HISTORY`` eligible research values of that feature at
+    that decision time on the sessions before it, as the factory's z is. A day with a shorter history has no entry.
+    """
+    out: dict[tuple[str, str, str], float] = {}
+    returns = [f for f in FEATURES if FEATURE_TYPE[f] == "return"]
+    for decision in decisions:
+        history = {f: deque(maxlen=RETURN_SPREAD_HISTORY) for f in returns}
+        for day in sorted(d for d in bars if close_minute(d) is not None):
+            for f in returns:
+                if len(history[f]) == RETURN_SPREAD_HISTORY:
+                    spread = robust_spread(history[f])
+                    if spread is not None:
+                        out[(f, decision, day)] = spread
+            if signal_reasons(bars, day, decision):
+                continue
+            values = feature_values(bars, day, decision)
+            for f in returns:
+                if values[f] is not None:
+                    history[f].append(values[f])
+    return out
+
+
 def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str],
-            backstop: Backstop | None, recorded: dict | None, verdict_sessions: list[str]) -> dict:
+            backstop: Backstop | None, recorded: dict | None, verdict_sessions: list[str],
+            history: Bars | None = None) -> dict:
     """Availability agreement and value differences on the sessions both sides hold.
 
     Research is judged by the research rule, live by the live recorder's rule, feature by feature. The live value
@@ -551,16 +639,22 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
     for it: bound to these exact terms when it was written, and equal to what the terms give on the recorded bars.
     A row with no value by definition is not applicable and counts for nothing.
 
+    A return value is in tolerance when its difference, divided by the research feature's spread for that day and
+    decision time, is within ``RETURN_TOLERANCE_SPREADS``. ``history`` holds research sessions before the window,
+    read only for that spread; without enough of them a return value has no spread and is not a match.
+
     ``verdict_sessions`` are the sessions the verdict is taken on. They come from the exchange calendar and a clock
     (``expected_recent_sessions``), never from what the two sides happen to hold: a session either side lacks is
     missing, it is not skipped. The argument has no default, so no caller gets a verdict on the data's own dates.
     """
     days = sorted(d for d in set(research) & set(live) if close_minute(d) is not None)
+    spreads = research_spreads({**(history or {}), **research}, decisions)
     rows = []
     per_feature = {f: {"matched_sessions": set(), "bad_sessions": set(), "compared": 0, "matched_values": 0,
                        "applicable": Counter(), "matched": Counter(), "no_value": 0, "no_value_by_day": Counter(),
                        "unbound": Counter(), "differs": Counter(), "bound_values": 0,
-                       "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None}
+                       "out_of_tolerance": 0, "out_of_tolerance_by_day": Counter(), "max_abs_diff": None,
+                       "no_spread": Counter(), "scaled_by_day": {}, "max_abs_diff_in_spreads": None}
                    for f in FEATURES}
     availability_mismatch = []
     label_rows = []
@@ -582,15 +676,30 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                 stat = per_feature[f]
                 both_eligible = not r_why and not l_why[f]
                 diff = None if a is None or b is None else abs(a - b)
-                within = diff is not None and diff <= TOLERANCE[FEATURE_TYPE[f]]
                 applicable = not structurally_undefined(f, decision)
+                spread = scaled = None
+                judged = diff is not None                     # a number on both sides, and something to judge it on
+                if FEATURE_TYPE[f] == "return":
+                    spread = spreads.get((f, decision, day))
+                    if diff is not None and spread is not None:
+                        scaled = (b - a) / spread             # live minus research, in research spreads: the z difference
+                    judged = scaled is not None               # with no spread the value is not judged: never a match, not "out of tolerance"
+                    within = judged and abs(scaled) <= TOLERANCE["return"]
+                    if diff is not None and spread is None and applicable:
+                        stat["no_spread"][day] += 1
+                    if scaled is not None and applicable:
+                        stat["scaled_by_day"].setdefault(day, []).append(scaled)
+                        worst = stat["max_abs_diff_in_spreads"]
+                        stat["max_abs_diff_in_spreads"] = abs(scaled) if worst is None else max(worst, abs(scaled))
+                else:
+                    within = diff is not None and diff <= TOLERANCE["range"]
                 row = (recorded or {}).get((day, decision, f))
                 unbound = binding_problem(row)
                 agrees = row is not None and row["eligible"] == (not l_why[f]) and _same_value(row["raw"], rule_val[f])
                 if diff is not None:
                     stat["compared"] += 1
                     stat["max_abs_diff"] = diff if stat["max_abs_diff"] is None else max(stat["max_abs_diff"], diff)
-                    if not within:
+                    if judged and not within:
                         stat["out_of_tolerance"] += 1
                         stat["out_of_tolerance_by_day"][day] += 1
                 if not applicable:
@@ -611,7 +720,8 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                     else:
                         stat["bad_sessions"].add(day)
                 rows.append({"day": day, "decision": decision, "feature": f, "research": a, "live": b,
-                             "abs_diff": diff, "within_tolerance": within if diff is not None else None,
+                             "abs_diff": diff, "within_tolerance": within if judged else None,
+                             "research_spread": spread, "diff_in_spreads": scaled,
                              "both_eligible": both_eligible, "live_withheld": l_why[f],
                              "applicable": applicable, "matched": matched,
                              "recorded_value": None if row is None else row["raw"],
@@ -647,6 +757,13 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
         recent_disagreed = sorted({m["day"] for m in availability_mismatch if f in m["features"] and m["day"] in recent})
         recent_not_recorded = [d for d in recent if stat["unbound"][d]]      # a required value without its own binding
         recent_differs = [d for d in recent if stat["differs"][d]]            # a bound value the bars do not give
+        recent_no_spread = [d for d in recent if stat["no_spread"][d]]        # a return value with no spread to judge it on
+        # The bias of a return feature: the mean over the verdict sessions of each session's mean signed difference.
+        bias = None
+        if FEATURE_TYPE[f] == "return":
+            session_means = [statistics.fmean(stat["scaled_by_day"][d]) for d in recent if stat["scaled_by_day"].get(d)]
+            if len(recent) == MIN_SESSIONS and len(session_means) == MIN_SESSIONS:
+                bias = statistics.fmean(session_means)
         reasons = []
         if not applicable_times:
             reasons.append("no_applicable_decision_time")
@@ -662,10 +779,14 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             reasons.append("value_out_of_tolerance")
         if recent_no_value:
             reasons.append("value_missing")           # both sides eligible, a value defined, and no number to compare
+        if recent_no_spread:
+            reasons.append(SPREAD_UNAVAILABLE)
+        if bias is not None and abs(bias) > RETURN_BIAS_SPREADS:
+            reasons.append(VALUE_BIASED)
         if recent_disagreed:
             reasons.append("availability_mismatch")
         features[f] = {
-            "type": FEATURE_TYPE[f], "tolerance": TOLERANCE[FEATURE_TYPE[f]],
+            "type": FEATURE_TYPE[f], "tolerance": TOLERANCE[FEATURE_TYPE[f]], "tolerance_unit": TOLERANCE_UNIT[FEATURE_TYPE[f]],
             "live_source_tag": FEATURE_SPECS[f]["live_source"],
             "status": "research_only" if reasons else "live_ready",
             "reasons": reasons,
@@ -673,7 +794,10 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
                            "missing": missing, "not_recorded_under_the_rule": recent_not_recorded,
                            "recorded_values_differ_from_the_bars": recent_differs,
                            "values_out_of_tolerance": recent_out, "eligible_rows_with_no_value": recent_no_value,
-                           "sessions_with_an_availability_disagreement": recent_disagreed},
+                           "sessions_with_an_availability_disagreement": recent_disagreed,
+                           "sessions_with_no_research_spread": recent_no_spread,
+                           "mean_signed_diff_in_spreads": bias,
+                           "bias_limit_in_spreads": RETURN_BIAS_SPREADS if FEATURE_TYPE[f] == "return" else None},
             "whole_window": {"sessions_with_an_availability_disagreement":
                              len({m["day"] for m in availability_mismatch if f in m["features"]})},
             "matched_sessions": len(matched), "required_sessions": MIN_SESSIONS,
@@ -684,6 +808,8 @@ def compare(research: Bars, live: Bars, decisions: list[str], horizons: list[str
             "values_bound_to_the_terms": stat["bound_values"], "values_not_bound": sum(stat["unbound"].values()),
             "recorded_values_that_differ_from_the_bars": sum(stat["differs"].values()),
             "max_abs_diff": stat["max_abs_diff"],
+            "max_abs_diff_in_spreads": stat["max_abs_diff_in_spreads"],
+            "values_with_no_research_spread": sum(stat["no_spread"].values()),
         }
     labels_compared = [r for r in label_rows if r["within_tolerance"] is not None]
     return {
@@ -712,7 +838,8 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
     # Every session the calendar expects in the window, up to the newest one closed at the as-of time.
     in_window = [d for d in expected_sessions_between(first, last) if verdict_sessions and d <= verdict_sessions[-1]]
     # The first recorded session has no recorded prior; it is counted and its reason shown.
-    compared = compare(research, live, decisions, horizons, backstop, recorded, verdict_sessions)
+    history = load_research_history(research_db, symbol, first)
+    compared = compare(research, live, decisions, horizons, backstop, recorded, verdict_sessions, history)
     statuses = {f: v["status"] for f, v in compared["features"].items()}
     return {
         "schema": SCHEMA,
@@ -723,6 +850,12 @@ def report(research_db: Path, signals_db: Path, *, first: str, last: str,
         "symbol": symbol, "window": {"first": first, "last": last},
         "decision_times": decisions, "horizons": horizons,
         "research_sessions": len(research), "live_sessions": len(live_days),
+        "return_tolerance": {"unit": "research_spreads", "per_value": RETURN_TOLERANCE_SPREADS, "bias": RETURN_BIAS_SPREADS,
+                             "spread_history_sessions": RETURN_SPREAD_HISTORY,
+                             "research_sessions_read_before_the_window": len(history),
+                             "note": ("a return difference is divided by the research feature's robust spread at that "
+                                      "decision time over the eligible research sessions before the day (the factory's z "
+                                      "scale); the result is the difference between the two sides' z on one history")},
         "research_last_session": max(research) if research else None,
         "live_first_session": min(live_days) if live_days else None,
         "live_last_session": max(live_days) if live_days else None,
