@@ -64,6 +64,21 @@ EVALUATION_WINDOW_DAYS = 5
 STALE_HOURS = 72  # data older than this gets downweighted
 DEFAULT_ACCURACY = 0.50  # start at coin-flip until we have history
 
+# Regime changepoints (_score_regime_changepoints). The detector
+# (discovery/changepoint_detector.py) stamps its version in
+# signal_registry.provenance and writes a break only while it is fresh; these
+# two values are its CHANGEPOINT_DETECTOR_VERSION and FRESH_BREAK_DAYS (a test
+# pins them together). Rows from the earlier detector (provenance NULL; about
+# 1.08M rows, and 59% of all registry rows written 2026-11-08..22) are ignored
+# by version, not deleted.
+CHANGEPOINT_DETECTOR_VERSION = "changepoint_detector/2"
+CHANGEPOINT_FRESH_DAYS = 5
+# Each feature with a fresh break moves the score by this times the average
+# confidence; the tally is capped so it can never dominate the thesis.
+CHANGEPOINT_POINTS_PER_FEATURE = 10.0
+CHANGEPOINT_SCORE_CAP = 30.0
+CHANGEPOINT_CONFIDENCE_CAP = 60.0
+
 # Fed Net Liquidity 30-day change bands (millions USD; WALCL/WTREGEN are millions,
 # RRPONTSYD is converted from billions via RRPONTSYD_TO_MILLIONS).
 FED_LIQ_MODERATE_MILLIONS = 50_000.0   # $50B
@@ -1077,17 +1092,62 @@ def _score_trust_convergence(engine: Engine, accuracy: float) -> dict:
             status="broken", historical_accuracy=accuracy)
 
 
-def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
-    """Regime changepoint signals from the discovery pipeline.
+def _score_regime_changepoints(engine: Engine, accuracy: float, as_of: datetime | None = None) -> dict:
+    """Regime changepoints: which declared regime features broke recently, as of ``as_of``.
 
-    Logic: The changepoint detector publishes regime change signals
-    (rising/falling/stable) to signal_registry every 12h.  Count
-    bullish vs bearish regime transitions in the last 48 hours.
+    Logic: discovery/changepoint_detector.py writes one signal_registry row
+    per point-in-time drift break on a declared regime feature (VIX, credit
+    spreads, curve, 10y, S&P 500, net liquidity, dollar, claims, breakevens),
+    stamped with its version in ``provenance``. ``direction`` is already the
+    risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Score scales with the net direction and average confidence of
-    the detected changepoints.
+    ``as_of`` is an explicit instant (default: now, UTC; a naive value is
+    UTC). A row is visible at ``as_of`` only if both fences hold, each on the
+    row itself, in SQL and before any reconciliation:
+
+    * ``valid_from <= as_of``: its availability;
+    * ``metadata.published_at <= as_of``: the scan that actually wrote it.
+      A break's first row written by a late scan has valid_from = its
+      effective known-at, earlier than the scan; without this fence a replay
+      between the two would see a break GRID did not hold yet, and a
+      withdrawal or revision published after ``as_of`` could change what was
+      live then.
+
+    A row with no ``published_at`` (none is written by detector version 2)
+    is not visible and is counted as ``unpublished``.
+
+    Counts *features*, not visible rows, in three steps:
+
+    1. Each break (``signal_id``) is reduced to its latest availability row
+       (``valid_from``). A break re-evaluated on a later vintage has a later
+       row of the same signal_id; one no longer detected has a row with
+       metadata status ``withdrawn``.
+    2. Breaks whose latest row is a withdrawal are dropped, and so are breaks
+       whose effective known-at is older than CHANGEPOINT_FRESH_DAYS
+       before ``as_of``.
+    3. Each feature counts once, by its surviving break with the latest
+       break date, so withdrawing one break never hides another on the same
+       feature.
+
+    Two times are kept apart. ``metadata.effective_known_at`` is when the
+    break became knowable from its inputs (release, vintage and retraction
+    dates); the freshness window is measured on it. ``metadata.
+    first_published_at`` is when the detector first wrote the break; it is
+    informational and never extends freshness. ``valid_from`` is the row's
+    availability: the effective known-at for a break's first row, and never
+    before the scan that saw a revision or withdrawal.
+
+    Only rows of CHANGEPOINT_DETECTOR_VERSION count; the earlier detector's
+    rows (about 1.08M, one per feature per index per 12 h scan) are ignored.
+    Score = net (risk-on minus risk-off features) x
+    CHANGEPOINT_POINTS_PER_FEATURE x average confidence, capped at
+    +/-CHANGEPOINT_SCORE_CAP; confidence is capped at
+    CHANGEPOINT_CONFIDENCE_CAP.
     """
     try:
+        as_of = as_of or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
         with engine.connect() as conn:
             # Guard: table might not exist yet
             try:
@@ -1100,88 +1160,154 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
+            # Both fences on every row, before reconciliation. valid_from >=
+            # effective known-at on every row, so the window holds every row
+            # whose break can still be fresh at as_of. Rows without
+            # published_at come back flagged and are dropped below.
             rows = conn.execute(text(
-                "SELECT direction, confidence, value, valid_from "
+                "SELECT signal_id, ticker, direction, confidence, valid_from, "
+                "metadata->>'status', metadata->>'break_date', "
+                "COALESCE(CAST(metadata->>'effective_known_at' AS timestamptz), valid_from), "
+                "metadata->>'published_at' IS NULL "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
-                "AND valid_from >= NOW() - INTERVAL '48 hours' "
-                "ORDER BY valid_from DESC"
+                "AND provenance = :version "
+                "AND valid_from <= :as_of "
+                "AND valid_from > :window_start "
+                "AND (metadata->>'published_at' IS NULL "
+                "OR CAST(metadata->>'published_at' AS timestamptz) <= :as_of) "
+                "ORDER BY valid_from DESC "
+                "LIMIT :row_limit"
             ).bindparams(
                 src="discovery.changepoint_detector",
                 stype="regime_change",
+                version=CHANGEPOINT_DETECTOR_VERSION,
+                as_of=as_of,
+                window_start=as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS),
+                row_limit=1000,
             )).fetchall()
 
+        window = f"{CHANGEPOINT_FRESH_DAYS}d"
+        unpublished_count = sum(1 for r in rows if r[8])
+        rows = [r for r in rows if not r[8]]
         if not rows:
             return _verdict(
                 "regime_changepoints", "Regime Changepoints",
-                0, 0, "no recent signals", "",
-                "No regime change signals in last 48 hours.",
+                0, 0, "no fresh breaks", "",
+                f"No declared regime feature has a break known in the last {window} "
+                f"as of {as_of.isoformat()} (detector {CHANGEPOINT_DETECTOR_VERSION}"
+                + (f"; {unpublished_count} row{'s' if unpublished_count != 1 else ''} without "
+                   "published_at not visible" if unpublished_count else "")
+                + ").",
                 status="no_data", historical_accuracy=accuracy,
             )
 
-        bullish = [r for r in rows if r[0] == "bullish"]
-        bearish = [r for r in rows if r[0] == "bearish"]
-        total = len(rows)
+        # rows: (signal_id, ticker, direction, confidence, valid_from, status,
+        # break_date, effective_known_at, unpublished), newest valid_from first.
+        def _utc(ts: Any) -> Any:
+            return ts if ts is None or ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+        # 1. Latest availability per break (by valid_from, whatever the row order).
+        latest_by_break: dict[Any, Any] = {}
+        for i, r in enumerate(rows):
+            key = r[0] if r[0] is not None else ("row", i)
+            current = latest_by_break.get(key)
+            if current is None or _utc(r[4]) > _utc(current[4]):
+                latest_by_break[key] = r
+        # 2. Drop withdrawn breaks, then breaks no longer fresh by effective known-at.
+        live = [r for r in latest_by_break.values() if r[5] != "withdrawn"]
+        withdrawn_count = len(latest_by_break) - len(live)
+        fresh_after = as_of - timedelta(days=CHANGEPOINT_FRESH_DAYS)
+        fresh = [r for r in live if _utc(r[7]) is not None and _utc(r[7]) > fresh_after]
+        aged_count = len(live) - len(fresh)
+        # 3. One break per feature: the latest break date, then the latest availability.
+        by_feature: dict[Any, Any] = {}
+        for r in fresh:
+            current = by_feature.get(r[1])
+            if current is None or (str(r[6] or ""), _utc(r[4])) > (str(current[6] or ""), _utc(current[4])):
+                by_feature[r[1]] = r
+        features = [(r[1], r[2], r[3], r[7]) for r in by_feature.values()]
+        if not features:
+            return _verdict(
+                "regime_changepoints", "Regime Changepoints",
+                0, 0, "no fresh breaks", "",
+                f"No live regime break known in the last {window}: {withdrawn_count} "
+                f"withdrawn on later data, {aged_count} older than the window "
+                f"(as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                status="no_data", historical_accuracy=accuracy,
+            )
+        total = len(features)
+        bullish = sorted(str(r[0]) for r in features if r[1] == "bullish")
+        bearish = sorted(str(r[0]) for r in features if r[1] == "bearish")
         bull_count = len(bullish)
         bear_count = len(bearish)
-        neutral_count = sum(r[0] == "neutral" for r in rows)
+        neutral_count = sum(r[1] == "neutral" for r in features)
         other_count = total - bull_count - bear_count - neutral_count
 
-        # Average confidence across all signals (0-1 scale)
-        avg_conf = sum(float(r[1]) for r in rows) / total
-        # Average magnitude
-        avg_mag = sum(abs(float(r[2])) for r in rows) / total
+        # Average confidence over every counted feature, unknown ones included
+        avg_conf = sum(float(r[2] or 0) for r in features) / total
 
-        # Net direction: each signal ~ 12 points, scaled by avg confidence
         net = bull_count - bear_count
-        score = net * 12 * avg_conf
-        score = max(-80, min(80, score))
+        score = net * CHANGEPOINT_POINTS_PER_FEATURE * avg_conf
+        score = max(-CHANGEPOINT_SCORE_CAP, min(CHANGEPOINT_SCORE_CAP, score))
 
-        # Confidence: base from signal count and their confidence values
-        conf_base = 25
-        conf_volume = min(25, total * 5)
-        conf_quality = avg_conf * 25  # 0-25 from signal confidence
-        conf_accuracy = accuracy * 15
-        confidence = min(90, conf_base + conf_volume + conf_quality + conf_accuracy)
+        conf_base = 20
+        conf_volume = min(20, total * 4)
+        conf_quality = avg_conf * 20  # 0-20 from break confidence
+        conf_accuracy = accuracy * 10
+        confidence = min(CHANGEPOINT_CONFIDENCE_CAP,
+                         conf_base + conf_volume + conf_quality + conf_accuracy)
 
-        # Data age from most recent signal
-        most_recent = rows[0][3]  # valid_from of most recent
+        # Data age from the most recently knowable counted break
+        most_recent = max(_utc(r[3]) for r in features)
         age_hours = None
         if most_recent:
             try:
                 ts = most_recent if most_recent.tzinfo else most_recent.replace(tzinfo=timezone.utc)
-                age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                age_hours = (as_of - ts).total_seconds() / 3600
             except Exception as exc:
                 log.warning("Failed to compute regime changepoints age: {e}", e=exc)
+
+        def _named(names: list[str]) -> str:
+            return f" ({', '.join(names)})" if names else ""
 
         result = _verdict(
             "regime_changepoints", "Regime Changepoints",
             score, confidence,
             data_point=(
+                f"{total} feature{'s' if total != 1 else ''} with a fresh break: "
                 f"{bull_count} bullish, {bear_count} bearish, "
                 f"{neutral_count} neutral, {other_count} other/unknown "
-                f"(48h, avg conf {avg_conf:.0%})"
+                f"({window}, avg conf {avg_conf:.0%})"
             ),
-            threshold="each changepoint ~ +/-12 pts scaled by confidence; net direction determines signal",
+            threshold=(
+                f"each feature ~ +/-{CHANGEPOINT_POINTS_PER_FEATURE:g} pts scaled by confidence, "
+                f"capped at +/-{CHANGEPOINT_SCORE_CAP:g}; latest break per feature in {window}"
+            ),
             reasoning=(
-                f"{total} regime changepoints in 48h: "
-                f"{bull_count} bullish, {bear_count} bearish. "
-                f"{neutral_count} explicitly neutral; {other_count} other/unknown. "
-                f"Average confidence {avg_conf:.0%}, magnitude {avg_mag:.2f}. "
-                + ("Net bullish regime shifts suggest improving conditions. "
+                f"{total} declared regime feature{'s' if total != 1 else ''} broke in the last {window}: "
+                f"{bull_count} toward risk-on{_named(bullish)}, "
+                f"{bear_count} toward risk-off{_named(bearish)}. "
+                f"{neutral_count} neutral; {other_count} other/unknown. "
+                + (f"{withdrawn_count} break{'s' if withdrawn_count != 1 else ''} withdrawn on later data, "
+                   "not counted. " if withdrawn_count else "")
+                + f"Average confidence {avg_conf:.0%}. "
+                + ("Net risk-on regime shifts suggest improving conditions. "
                    if net > 0
-                   else "Net bearish regime shifts suggest deteriorating conditions. "
+                   else "Net risk-off regime shifts suggest deteriorating conditions. "
                    if net < 0
                    else "Balanced regime shifts — no clear directional signal. ")
-                + "Changepoints detect structural breaks in feature time series."
+                + f"Point-in-time drift breaks as of {as_of.isoformat()}, detector {CHANGEPOINT_DETECTOR_VERSION}."
             ),
             data_age_hours=age_hours,
             historical_accuracy=accuracy,
         )
         result["category_counts"] = {
+            "unit": "features", "rows_read": len(rows), "breaks_read": len(latest_by_break),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
+            "withdrawn": withdrawn_count, "aged_out": aged_count, "unpublished": unpublished_count,
             "known_categories_exhaustive": other_count == 0,
         }
         return result
@@ -2856,6 +2982,17 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
                 "regime_changepoints": 1.3,
                 "supply_chain": 0.7,
                 "crucix_osint": 1.5, "gdelt_geopolitical": 1.4,
+            }
+        elif regime == "FRAGILE":
+            # scripts/auto_regime.py's elevated-stress state (stress index
+            # above 0.6 or rising fast; posture DEFENSIVE): the CRISIS tilts
+            # at half strength.
+            adjustments = {
+                "dealer_gamma": 1.2, "vanna_charm": 1.2,
+                "capital_flows": 1.1, "trust_convergence": 1.15,
+                "regime_changepoints": 1.15,
+                "supply_chain": 0.85,
+                "crucix_osint": 1.25, "gdelt_geopolitical": 1.2,
             }
         elif regime in ("EXPANSION", "RISK_ON", "GROWTH"):
             adjustments = {
