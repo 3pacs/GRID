@@ -316,7 +316,8 @@ def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkey
     assert elig.main(["--apply", "--db-url-env", "ELIG_TEST_DB_URL"]) == 2
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "refused" and not report["writes_to_database"]
-    assert len(report["refusals"]) == 2
+    assert len(report["refusals"]) == 3                       # no service inventory here, and neither constant
+    assert any("deployed service inventory cannot be checked" in r for r in report["refusals"])
     assert any("SIGNAL_POLARITY_RULE" in r for r in report["refusals"])
     assert any("REGIME_HYSTERESIS_RULE" in r for r in report["refusals"])
     assert "testpass" not in report["database"]
@@ -326,7 +327,7 @@ def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkey
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "dry_run" and report["authority"]["ok"]
     assert _changes(report) == FIRST_SET
-    assert len(report["would_refuse"]) == 2
+    assert len(report["would_refuse"]) == 3
     assert _flags(db.admin) == before and _log(db.admin) == []
 
 

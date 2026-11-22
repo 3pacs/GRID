@@ -30,9 +30,11 @@ the exact values in ``PREREQUISITES``:
   auto_regime's own declared bindings plus hysteresis (#1307).
 
 The files are read with ``ast``; nothing is imported or executed. The trees checked are this script's own,
-every ``--code-root``, and the ``WorkingDirectory`` of each loaded unit in ``SERVICE_UNITS`` as systemd reports
-it (the scheduler, for one, is pinned to an older release than the API). A missing file, a missing or
-non-literal constant, a different value, or a loaded unit whose tree cannot be named all refuse.
+every ``--code-root``, and the ``WorkingDirectory`` of every unit in ``SERVICE_UNITS``, the deployed service
+inventory, as systemd reports it (the scheduler and grid-realtime are pinned to exact releases). The gate needs
+positive evidence: a host without systemctl, an inventory unit that is not loaded, a loaded unit whose tree
+cannot be named, a missing file, a missing or non-literal constant, or a different value all refuse. Run
+``--apply`` on the host that runs the GRID units; a remote caller is refused.
 
 **Migration authority (every write).** Checked in ``pg_catalog`` on the open connection, never taken from a
 flag. The connected role must own ``feature_eligibility_changes`` or be a member of its owner role, and must be
@@ -135,9 +137,14 @@ PREREQUISITES = (
 )
 
 # Units whose code reads model_eligible (directly or through the Oracle, inference, discovery or auto_regime).
+# The deployed service inventory the gate needs positive evidence for: every long-running GRID unit that runs
+# analysis code and so reads feature_registry.model_eligible (grid-svr, 2026-11-22). Each must be loaded with an
+# absolute WorkingDirectory, and that tree must carry the prerequisites. grid-scheduler and grid-realtime are
+# pinned to exact releases, so a deploy alone does not move them.
 SERVICE_UNITS = (
     "grid-api.service", "grid-hermes.service", "grid-scheduler.service",
     "grid-coordinator.service", "grid-worker.service", "grid-intelligence.service",
+    "grid-realtime.service",
 )
 
 
@@ -199,7 +206,11 @@ def systemctl_show(unit: str) -> Optional[dict[str, str]]:
 
 def code_roots(extra: Sequence[Path] = (), units: Sequence[str] = SERVICE_UNITS,
                show: Optional[UnitShow] = None) -> tuple[list[tuple[str, Path]], list[str], list[str]]:
-    """Every deployed code tree: this script's, each ``extra`` and each loaded unit's. Returns (roots, problems, notes)."""
+    """Every deployed code tree: this script's, each ``extra`` and each inventory unit's. Returns (roots, problems, notes).
+
+    The gate needs positive evidence. No systemctl on this host, or an inventory unit that is not loaded, is a
+    problem (a refusal), never a note: a laptop with the right literals must not certify the production database.
+    """
     show = show or systemctl_show
     roots: list[tuple[str, Path]] = [("this script's tree", ROOT)]
     roots += [("--code-root", Path(p)) for p in extra]
@@ -212,10 +223,12 @@ def code_roots(extra: Sequence[Path] = (), units: Sequence[str] = SERVICE_UNITS,
             problems.append(f"cannot ask systemd about {unit}: {exc}")
             continue
         if props is None:
-            notes.append("systemctl is not available on this host, so no service tree was checked")
+            problems.append("systemctl is not available on this host, so the deployed service inventory cannot be "
+                            "checked; run --apply on the host that runs the GRID units")
             break
         if props.get("LoadState") != "loaded":
-            notes.append(f"{unit}: {props.get('LoadState') or 'unknown'}, skipped")
+            problems.append(f"{unit} is in the deployed service inventory but is "
+                            f"{props.get('LoadState') or 'unknown'} here, so its code tree cannot be checked")
             continue
         directory = (props.get("WorkingDirectory") or "").lstrip("-!")
         if not directory.startswith("/"):

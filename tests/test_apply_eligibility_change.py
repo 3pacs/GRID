@@ -77,6 +77,14 @@ def test_the_gate_reads_without_importing(tmp_path):
     assert elig.check_prerequisites([("t", _tree(tmp_path, oracle, GOOD_REGIME))])["ok"]
 
 
+def _inventory(tree, **overrides) -> dict[str, dict[str, str] | Exception]:
+    """Every inventory unit loaded on ``tree``, with per-unit overrides."""
+    table = {u: {"LoadState": "loaded", "ActiveState": "active", "WorkingDirectory": str(tree)}
+             for u in elig.SERVICE_UNITS}
+    table.update(overrides)
+    return table
+
+
 def _units(table: dict[str, dict[str, str] | Exception]):
     def show(unit: str):
         value = table.get(unit, {"LoadState": "not-found"})
@@ -91,17 +99,12 @@ def test_every_deployed_tree_must_pass(tmp_path, monkeypatch):
     current = _tree(tmp_path / "current", GOOD_ORACLE, GOOD_REGIME)
     pinned = _tree(tmp_path / "pinned", GOOD_ORACLE, "import os\n")
     monkeypatch.setattr(elig, "ROOT", current)
-    show = _units({
-        "grid-api.service": {"LoadState": "loaded", "ActiveState": "active", "WorkingDirectory": str(current)},
-        "grid-scheduler.service": {"LoadState": "loaded", "ActiveState": "active", "WorkingDirectory": str(pinned)},
-    })
+    show = _units(_inventory(current, **{
+        "grid-scheduler.service": {"LoadState": "loaded", "ActiveState": "active", "WorkingDirectory": str(pinned)}}))
     roots, problems, notes = elig.code_roots(show=show)
-    assert problems == []
-    assert [(label, path) for label, path in roots] == [
-        ("this script's tree, grid-api.service (active)", current),
-        ("grid-scheduler.service (active)", pinned),
-    ]
-    assert "grid-hermes.service: not-found, skipped" in notes
+    assert problems == [] and notes == []
+    assert [path for _, path in roots] == [current, pinned]
+    assert roots[1][0] == "grid-scheduler.service (active)"
     gate = elig.deployed_prerequisites(show=show)
     assert not gate["ok"]
     assert gate["refusals"] == [
@@ -111,7 +114,7 @@ def test_every_deployed_tree_must_pass(tmp_path, monkeypatch):
 
 def test_extra_code_roots_are_checked_too(tmp_path, monkeypatch):
     monkeypatch.setattr(elig, "ROOT", _tree(tmp_path / "current", GOOD_ORACLE, GOOD_REGIME))
-    gate = elig.deployed_prerequisites([tmp_path / "missing"], show=_units({}))
+    gate = elig.deployed_prerequisites([tmp_path / "missing"], show=_units(_inventory(elig.ROOT)))
     assert not gate["ok"] and len(gate["refusals"]) == 2
     assert all("cannot read" in r for r in gate["refusals"])
 
@@ -123,23 +126,49 @@ def test_extra_code_roots_are_checked_too(tmp_path, monkeypatch):
 ])
 def test_a_unit_whose_tree_cannot_be_named_refuses(tmp_path, monkeypatch, props, problem):
     monkeypatch.setattr(elig, "ROOT", _tree(tmp_path, GOOD_ORACLE, GOOD_REGIME))
-    gate = elig.deployed_prerequisites(show=_units({"grid-worker.service": props}))
+    gate = elig.deployed_prerequisites(show=_units(_inventory(elig.ROOT, **{"grid-worker.service": props})))
     assert not gate["ok"]
     assert len(gate["refusals"]) == 1 and problem in gate["refusals"][0]
 
 
-def test_a_host_without_systemd_checks_this_tree_and_says_so(tmp_path, monkeypatch):
+def test_a_host_without_systemd_refuses_even_with_valid_local_literals(tmp_path, monkeypatch):
+    """Codex (6011670010): no systemctl was a note, so a laptop with compliant literals could certify the database."""
     monkeypatch.setattr(elig, "ROOT", _tree(tmp_path, GOOD_ORACLE, GOOD_REGIME))
     gate = elig.deployed_prerequisites(show=lambda unit: None)
-    assert gate["ok"]
-    assert gate["notes"] == ["systemctl is not available on this host, so no service tree was checked"]
+    assert not gate["ok"]
+    assert gate["refusals"] == [
+        "systemctl is not available on this host, so the deployed service inventory cannot be checked; "
+        "run --apply on the host that runs the GRID units"]
+    assert all(c["ok"] for c in gate["checks"])               # the local literals were fine
+
+
+@pytest.mark.parametrize("unit", elig.SERVICE_UNITS)
+def test_a_missing_inventory_unit_refuses_even_with_valid_local_literals(tmp_path, monkeypatch, unit):
+    tree = _tree(tmp_path, GOOD_ORACLE, GOOD_REGIME)
+    monkeypatch.setattr(elig, "ROOT", tree)
+    gate = elig.deployed_prerequisites(show=_units(_inventory(tree, **{unit: {"LoadState": "not-found"}})))
+    assert not gate["ok"]
+    assert gate["refusals"] == [f"{unit} is in the deployed service inventory but is not-found here, "
+                                "so its code tree cannot be checked"]
+    assert all(c["ok"] for c in gate["checks"])
+
+
+def test_the_full_inventory_on_compliant_trees_passes(tmp_path, monkeypatch):
+    tree = _tree(tmp_path, GOOD_ORACLE, GOOD_REGIME)
+    monkeypatch.setattr(elig, "ROOT", tree)
+    gate = elig.deployed_prerequisites(show=_units(_inventory(tree)))
+    assert gate["ok"] and gate["refusals"] == []
+
+
+def test_the_inventory_includes_the_pinned_units():
+    assert {"grid-scheduler.service", "grid-realtime.service"} <= set(elig.SERVICE_UNITS)
 
 
 def test_systemd_working_directory_prefixes_are_stripped(tmp_path, monkeypatch):
     monkeypatch.setattr(elig, "ROOT", _tree(tmp_path / "a", GOOD_ORACLE, GOOD_REGIME))
     other = _tree(tmp_path / "b", GOOD_ORACLE, GOOD_REGIME)
-    roots, problems, _ = elig.code_roots(show=_units({
-        "grid-hermes.service": {"LoadState": "loaded", "ActiveState": "inactive", "WorkingDirectory": f"-{other}"}}))
+    roots, problems, _ = elig.code_roots(show=_units(_inventory(elig.ROOT, **{
+        "grid-hermes.service": {"LoadState": "loaded", "ActiveState": "inactive", "WorkingDirectory": f"-{other}"}})))
     assert problems == [] and roots[-1] == ("grid-hermes.service (inactive)", other)
 
 
