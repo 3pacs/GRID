@@ -633,6 +633,72 @@ FEATURE_POLARITY: dict[str, int] = {
     "pump_fun_live_token_count": 0,
     "pump_fun_koth_reply_count": 0,
     "pump_fun_graduated_avg_mcap": 0,
+
+    # ── entity_map NEW_MAPPINGS_V2 targets (#1345; unregistered on griddb, so inert until registered) ──
+    # Credit spreads: wider is bearish, as hy_oas_spread / ig_oas_spread.
+    "us_hy_ccc_oas": -1,
+    "us_hy_bb_oas": -1,
+    "us_hy_b_oas": -1,
+    "us_bbb_oas": -1,
+    "euro_hy_oas": -1,
+    "em_hy_oas": -1,
+    # OFR Financial Stress Index categories: every category is signed so positive = above-average stress,
+    # as ofr_financial_stress.
+    "ofr_fsi_credit": -1,
+    "ofr_fsi_equity_valuation": -1,
+    "ofr_fsi_funding": -1,
+    "ofr_fsi_safe_assets": -1,
+    "ofr_fsi_volatility": -1,
+    # Activity: stationary diffusion / nowcast series, as ism_pmi_mfg and nyfed_nowcast_gdp_*.
+    "chicago_fed_cfnai": 1,
+    "empire_mfg_index": 1,
+    "philly_fed_mfg_index": 1,
+    "dallas_fed_mfg_index": 1,
+    "atlanta_fed_gdpnow": 1,
+    # Rate levels and Fed plumbing levels: non-directional, as fed_funds_rate, total_reserves and
+    # repo_volume. Facility usage (discount window, repo operations) stays elevated long after a stress
+    # event, so its level does not vote either.
+    "fed_iorb_rate": 0,
+    "fed_reserve_balances_weekly": 0,
+    "fed_discount_window_primary": 0,
+    "fed_standing_repo_ops": 0,
+    "commercial_paper_3m_nonfin": 0,
+    "treasury_bill_3m": 0,
+    "pboc_omo_on_inject_cny_bn": 0,
+    # Energy and freight prices: commodity levels, as eia_wti_spot / eia_diesel_price. Container freight
+    # spikes have been supply shocks (2021, 2024) as often as demand, so it does not vote.
+    "refinery_crack_321": 0,
+    "gulf_diesel_spot": 0,
+    "gulf_gasoline_spot": 0,
+    "eia_wti_spot_v2": 0,
+    "eia_brent_spot_v2": 0,
+    "scfi_container_freight": 0,
+    # Sector job-posting indices: sector-specific, weak for broad equities.
+    "indeed_hiring_software_dev": 0,
+    "indeed_hiring_retail": 0,
+    # Speculative positioning: contrarian-ambiguous, so it does not vote.
+    "cftc_es_net_spec": 0,
+    "cftc_nq_net_spec": 0,
+    "cftc_vx_net_spec": 0,
+    "cftc_ust_2y_net_spec": 0,
+    "cftc_ust_5y_net_spec": 0,
+    "cftc_ust_10y_net_spec": 0,
+    "cftc_ust_30y_net_spec": 0,
+    "cftc_gold_net_spec": 0,
+    "cftc_silver_net_spec": 0,
+    "cftc_copper_net_spec": 0,
+    "cftc_wti_net_spec": 0,
+    "cftc_natgas_net_spec": 0,
+    "cftc_tff_ust_2y_lev_net": 0,
+    "cftc_tff_ust_5y_lev_net": 0,
+    "cftc_tff_ust_10y_lev_net": 0,
+    "cftc_tff_ust_30y_lev_net": 0,
+    "cftc_tff_es_lev_net": 0,
+    "cftc_tff_nq_lev_net": 0,
+    "cftc_tff_vx_lev_net": 0,
+    # Rates implied volatility: higher is bearish, as move_index.
+    "rates_vol_tlt_iv_30d": -1,
+    "rates_vol_ief_iv_30d": -1,
 }
 
 # Tightly anchored dynamic template patterns for generated feature series.
