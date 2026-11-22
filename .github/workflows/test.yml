@@ -288,9 +288,11 @@ jobs:
       # that the migration creates only the append-only log and flips no flag,
       # that the application role can read it but never write a pre-image,
       # that --apply refuses without the Oracle polarity and auto_regime
-      # hysteresis prerequisites or without migration authority, and that a
-      # rollback restores only its own change set and refuses any divergence
-      # (rolling back set 2 leaves set 1's vix_spot enabled). A skip must fail.
+      # hysteresis prerequisites, without an owner-approved evidence receipt
+      # that still matches every running unit's process and tree, or without
+      # migration authority, and that a rollback restores only its own change
+      # set and refuses any divergence (rolling back set 2 leaves set 1's
+      # vix_spot enabled). A skip must fail.
       - name: Eligibility change log PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test

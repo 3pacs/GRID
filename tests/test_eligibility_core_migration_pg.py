@@ -20,11 +20,13 @@ step that fails on any skip. It proves:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -32,6 +34,7 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError, ProgrammingError
 
 from scripts import apply_eligibility_change as elig
+from tests.eligibility_fakes import FakeHost
 
 _MIGRATION = "migrations.versions.eligibility_core_20261122"
 
@@ -165,8 +168,16 @@ def _set(engine: Engine, change_set: str):
                   for r in _log(engine) if r.change_set == change_set)
 
 
-def _apply(engine: Engine, **kw):
-    return elig.run(engine, write=True, prerequisites=PASSING_GATE, **kw)
+def _planned(engine: Engine):
+    with engine.connect() as conn:
+        return elig.planned_changes(conn)
+
+
+def _apply(engine: Engine, approved=None, **kw):
+    """The owner's flow: the rows the plan would change are read first (what the dry run's receipt records), then
+    the apply is given exactly those."""
+    return elig.run(engine, write=True, prerequisites=PASSING_GATE,
+                    approved_changes=_planned(engine) if approved is None else approved, **kw)
 
 
 def _rollback(engine: Engine, change_set: str, *, write: bool = True):
@@ -308,18 +319,25 @@ def test_an_app_owned_log_refuses_every_write_until_ownership_moves(db, caplog):
 # ── the prerequisite gate and migration authority ──────────────────────────────────────────────────────────
 
 
-def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkeypatch, capsys):
+def _no_systemd(tmp_path):
+    fake = FakeHost(tmp_path)
+    probes = fake.probes()
+    return lambda: elig.Probes(**{**probes.__dict__, "show": lambda unit: None})
+
+
+def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkeypatch, capsys, tmp_path):
     _migrate(db.owner)
     before = _flags(db.admin)
     monkeypatch.setenv("ELIG_TEST_DB_URL", db.url(db.owner_role))
-    monkeypatch.setattr(elig, "systemctl_show", lambda unit: None)
+    monkeypatch.setattr(elig, "default_probes", _no_systemd(tmp_path))   # this repo's own tree, no GRID units
     assert elig.main(["--apply", "--db-url-env", "ELIG_TEST_DB_URL"]) == 2
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "refused" and not report["writes_to_database"]
-    assert len(report["refusals"]) == 3                       # no service inventory here, and neither constant
+    assert len(report["refusals"]) == 4         # no service inventory, neither constant, no approved receipt
     assert any("deployed service inventory cannot be checked" in r for r in report["refusals"])
     assert any("SIGNAL_POLARITY_RULE" in r for r in report["refusals"])
     assert any("REGIME_HYSTERESIS_RULE" in r for r in report["refusals"])
+    assert any("--apply needs --approved-receipt" in r for r in report["refusals"])
     assert "testpass" not in report["database"]
     assert _flags(db.admin) == before and _log(db.admin) == []
 
@@ -328,6 +346,98 @@ def test_apply_refuses_today_because_neither_prerequisite_is_deployed(db, monkey
     assert report["status"] == "dry_run" and report["authority"]["ok"]
     assert _changes(report) == FIRST_SET
     assert len(report["would_refuse"]) == 3
+    assert len(report["receipt"]["refusals"]) == 3          # a receipt is printed for review, but cannot approve
+    assert report["receipt_sha256"] == hashlib.sha256(elig.canonical(report["receipt"])).hexdigest()
+    assert _flags(db.admin) == before and _log(db.admin) == []
+
+
+@pytest.fixture()
+def owner_flow(db, monkeypatch, capsys, tmp_path):
+    """main() as the owner runs it, on a fake grid-svr whose every tree carries the prerequisites."""
+    _migrate(db.owner)
+    fake = FakeHost(tmp_path)
+    monkeypatch.setattr(elig, "ROOT", fake.current)
+    monkeypatch.setattr(elig, "default_probes", fake.probes)
+    monkeypatch.setenv("ELIG_TEST_DB_URL", db.url(db.owner_role))
+    receipt_file = tmp_path / "receipt.json"
+
+    def dry_run():
+        assert elig.main(["--db-url-env", "ELIG_TEST_DB_URL", "--receipt-out", str(receipt_file)]) == 0
+        return json.loads(capsys.readouterr().out)
+
+    def apply(sha: str):
+        code = elig.main(["--apply", "--approved-receipt", str(receipt_file), "--approved-receipt-sha256", sha,
+                          "--db-url-env", "ELIG_TEST_DB_URL"])
+        return code, json.loads(capsys.readouterr().out)
+
+    return fake, receipt_file, dry_run, apply
+
+
+def test_the_owner_flow_dry_run_review_then_apply(db, owner_flow):
+    fake, receipt_file, dry_run, apply = owner_flow
+    before = _flags(db.admin)
+    dry = dry_run()
+    receipt = dry["receipt"]
+    assert receipt["refusals"] == [] and dry["would_refuse"] == []
+    assert _changes({"changes": receipt["planned_changes"]}) == FIRST_SET
+    assert receipt_file.read_bytes() == elig.canonical(receipt)
+    assert hashlib.sha256(receipt_file.read_bytes()).hexdigest() == dry["receipt_sha256"]
+    assert set(receipt["units"]) == set(elig.SERVICE_UNITS) and len(receipt["trees"]) == 2
+    assert _flags(db.admin) == before and _log(db.admin) == []     # the dry run wrote nothing
+
+    fake.now += timedelta(minutes=10)                               # the owner reviews it
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 0 and report["status"] == "applied"
+    assert report["approved_receipt_sha256"] == dry["receipt_sha256"]
+    assert _changes(report) == FIRST_SET and _set(db.admin, report["change_set"]) == FIRST_SET
+
+
+def test_a_restart_between_the_dry_run_and_the_apply_refuses(db, owner_flow):
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    fake.run("grid-scheduler.service", 7777, fake.pinned, fake.pinned)
+    before = _flags(db.admin)
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 2 and report["status"] == "refused"
+    assert any("['grid-scheduler.service']['main_pid']: approved 2003, now 7777" in r for r in report["refusals"])
+    assert _flags(db.admin) == before and _log(db.admin) == []
+
+
+def test_the_0803z_repin_refuses_the_apply(db, owner_flow):
+    """The scheduler's configuration repinned after the receipt; its process still runs the approved tree."""
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    fake.units["grid-scheduler.service"]["WorkingDirectory"] = str(fake.current)
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 2
+    assert any("runs from" in r and "the configuration is not what runs" in r for r in report["refusals"])
+    assert any("['grid-scheduler.service']['working_directory']" in r for r in report["refusals"])
+    assert _log(db.admin) == []
+
+
+def test_rows_that_changed_since_the_receipt_refuse_the_apply(db, owner_flow):
+    fake, _, dry_run, apply = owner_flow
+    dry = dry_run()
+    _as_app(db, "UPDATE feature_registry SET model_eligible = TRUE WHERE name = 'vix_spot'")
+    before = _flags(db.admin)
+    code, report = apply(dry["receipt_sha256"])
+    assert code == 2 and report["status"] == "refused" and not report["writes_to_database"]
+    assert report["refusals"][0].startswith("the rows the plan would change differ from the approved receipt's")
+    assert "planned_changes['11']: approved {'name': 'vix_spot', 'old_eligible': False, 'new_eligible': True}, " \
+           "absent now" in report["refusals"]
+    assert _flags(db.admin) == before and _log(db.admin) == []
+
+
+def test_a_row_that_changes_during_the_apply_rolls_the_set_back(db, monkeypatch):
+    """The pre-check saw the approved rows; the locked update found another set: nothing is kept."""
+    _migrate(db.owner)
+    approved = _planned(db.owner)
+    _as_app(db, "UPDATE feature_registry SET model_eligible = TRUE WHERE name = 'vix_spot'")
+    before = _flags(db.admin)
+    monkeypatch.setattr(elig, "planned_changes", lambda conn, plan=elig.PLAN: approved)
+    report = _apply(db.owner, approved=approved)
+    assert report["status"] == "refused" and not report["writes_to_database"]
+    assert report["refusals"][0] == "the rows changed while the apply ran; nothing was written"
     assert _flags(db.admin) == before and _log(db.admin) == []
 
 
