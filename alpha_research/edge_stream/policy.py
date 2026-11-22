@@ -36,6 +36,8 @@ of a multi-day trade, the SPY hedge leg, and a consumption entry that keeps the 
 off the years the D0 research contract reserves for its own earnings test.
 :func:`amendment_violations` is the rule an amendment record is checked by.
 
+Version 4 decision: https://github.com/3pacs/GRID/issues/1336#issuecomment-7073862603 (posted 2026-11-22).
+
 Owner decisions behind the numbers (Anik, 2026-11-13, roast of the design):
 
 * budget: q 0.05 per calendar year shared by at most 40 stage-1 registrations
@@ -103,7 +105,7 @@ OWNER_DECISIONS: tuple[dict, ...] = (
     },
     {
         "id": "GRID#1336",
-        "url": "PENDING",
+        "url": "https://github.com/3pacs/GRID/issues/1336#issuecomment-7073862603",
         "decided_by": "Anik (repository owner)",
         "decided_on": "2026-11-21",
         "text_sha256": "491fa4b3b9f645566e0b1e4fc9c683fb791aaf8986e57a13acbb4cca07f905a3",
