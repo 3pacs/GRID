@@ -340,6 +340,25 @@ def _validate_eia_records(
     return valid, rejected
 
 
+def _drop_unverified_units(rows: list[dict[str, Any]], *, label: str) -> list[dict[str, Any]]:
+    """Rows whose unit was verified; the rest are quarantined before any raw write.
+
+    A record with no unit alias at all is accepted by validation only as
+    ``units_verified=False``. It never becomes a canonical ``raw_series`` row,
+    because the entity map and the resolver would normalize it like any other.
+    """
+    verified = [r for r in rows if r.get("units_verified") is True]
+    dropped = len(rows) - len(verified)
+    if dropped:
+        log.warning(
+            "{lbl}: quarantined {n} record(s) with no unit field before the raw write "
+            "(units_verified=false; nothing written for them)",
+            lbl=label,
+            n=dropped,
+        )
+    return verified
+
+
 def parse_daily_spot_response(
     payload: dict[str, Any],
     *,
@@ -505,6 +524,13 @@ class EIAPuller(BasePuller):
                 time.sleep(1.0)
                 continue
 
+            verified_records = _drop_unverified_units(valid_records, label=f"EIA daily spot ({facet})")
+            if valid_records and not verified_records:
+                failed_facets.append(facet)
+                time.sleep(1.0)
+                continue
+            valid_records = verified_records
+
             if valid_records:
                 with self.engine.begin() as conn:
                     existing = self._get_existing_dates(sid, conn)
@@ -559,6 +585,9 @@ class EIAPuller(BasePuller):
                 allow_negative=False,
                 label=f"EIA weekly stocks ({DEFAULT_WEEKLY_STOCKS_SERIES})",
             )
+            verified_weekly = _drop_unverified_units(
+                valid_weekly, label=f"EIA weekly stocks ({DEFAULT_WEEKLY_STOCKS_SERIES})"
+            )
             if rejected_weekly > 0 and not valid_weekly:
                 log.warning(
                     "EIA fetch failed for {f}: rejected all {n} record(s)",
@@ -566,7 +595,10 @@ class EIAPuller(BasePuller):
                     n=rejected_weekly,
                 )
                 failed_facets.append(DEFAULT_WEEKLY_STOCKS_SERIES)
-            elif valid_weekly:
+            elif valid_weekly and not verified_weekly:
+                failed_facets.append(DEFAULT_WEEKLY_STOCKS_SERIES)
+            elif verified_weekly:
+                valid_weekly = verified_weekly
                 with self.engine.begin() as conn:
                     existing = self._get_existing_dates(WEEKLY_STOCKS_SERIES_ID, conn)
                     for row in valid_weekly:

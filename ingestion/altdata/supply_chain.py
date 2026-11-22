@@ -215,6 +215,25 @@ def _drewry_names_wci(texts: Any) -> bool:
     return False
 
 
+def _drewry_scoped_heading_text(table: Any) -> str:
+    """Text of the nearest heading before *table* that belongs to the table's own scope.
+
+    Inside a ``<section>``/``<article>``, the heading must be inside that same
+    element. Outside any, the heading must not sit inside a section/article of
+    its own. A heading from a different section never lends WCI context.
+    """
+    heading = table.find_previous(["h1", "h2", "h3", "h4"])
+    if heading is None:
+        return ""
+    scope = table.find_parent(["section", "article"])
+    if scope is not None:
+        if scope not in heading.parents:
+            return ""
+    elif heading.find_parent(["section", "article"]) is not None:
+        return ""
+    return heading.get_text(" ", strip=True)
+
+
 def _is_drewry_composite_table_label(raw: str, *, context_names_wci: bool = False) -> bool:
     """Return True only if a table header/row label positively attributes the WCI composite.
 
@@ -529,8 +548,7 @@ def _parse_drewry_wci_html(
             continue
         # The table's own caption, or the nearest heading before it, must name
         # the WCI before a bare "Composite" column or row counts.
-        heading_tag = table.find_previous(["h1", "h2", "h3", "h4"])
-        heading_text = heading_tag.get_text(" ", strip=True) if heading_tag is not None else ""
+        heading_text = _drewry_scoped_heading_text(table)
         table_names_wci = _drewry_names_wci([cap_text] if cap_text else [heading_text])
 
         raw_rows = [

@@ -388,7 +388,8 @@ class TestEIADailySpotValidation:
                     {"period": "2026-11-17", "value": "71.00", "units": "$/BBL"},
                     # Wrong unit (MBBL instead of $/BBL)
                     {"period": "2026-11-18", "series": "RBRTE", "value": "72.50", "units": "MBBL"},
-                    # Missing unit field on an exact series match: accepted (logged once)
+                    # Missing unit field on an exact series match: validated as
+                    # units_verified=false, then quarantined before the raw write
                     {"period": "2026-11-16", "series": "RBRTE", "value": "71.50"},
                     # Future date
                     {"period": tomorrow, "series": "RBRTE", "value": "73.00", "units": "$/BBL"},
@@ -427,13 +428,13 @@ class TestEIADailySpotValidation:
             result = eia.EIAPuller(db_engine=engine).pull(days_back=30)
 
         assert result["status"] == "SUCCESS"
-        assert result["rows_inserted"] == 4
+        assert result["rows_inserted"] == 3
         brent_rows = engine.store.rows_for("EIA:eia_brent_spot")
         assert {r["obs_date"]: r["value"] for r in brent_rows} == {
             date(2026, 11, 18): pytest.approx(72.50),
-            date(2026, 11, 16): pytest.approx(71.50),
         }
         assert any("carried no unit field" in w for w in captured_warnings)
+        assert any("quarantined 1 record(s) with no unit field" in w for w in captured_warnings)
 
         wti_rows = engine.store.rows_for("EIA:eia_crude_price")
         assert {r["obs_date"]: r["value"] for r in wti_rows} == {
@@ -956,6 +957,45 @@ class TestDrewryWCIPositiveAttribution:
             {"date": "2026-11-19", "value": 2145.0},
         ]
 
+    def test_bare_composite_in_a_heading_less_section_after_a_wci_section_is_refused(self):
+        """Codex HOLD on 4a1738df: the nearest-heading fallback must not lend a
+        WCI heading from another section to a heading-less one."""
+        html = """
+        <html><body>
+          <section>
+            <h2>World Container Index, 19 Nov 2026</h2>
+            <table>
+              <thead><tr><th>Date</th><th>Shanghai - Rotterdam</th></tr></thead>
+              <tbody><tr><td>2026-11-19</td><td>$2,680</td></tr></tbody>
+            </table>
+          </section>
+          <section>
+            <table>
+              <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+              <tbody><tr><td>2026-11-19</td><td>$9,999</td></tr></tbody>
+            </table>
+          </section>
+          <table>
+            <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+            <tbody><tr><td>2026-11-12</td><td>$8,888</td></tr></tbody>
+          </table>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(html, pull_date=self.PULL) == []
+
+        same_section = """
+        <html><body>
+          <section>
+            <h2>World Container Index, 19 Nov 2026</h2>
+            <div class="wrap"><table>
+              <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+              <tbody><tr><td>2026-11-19</td><td>$2,145</td></tr></tbody>
+            </table></div>
+          </section>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(same_section, pull_date=self.PULL) == [{"date": "2026-11-19", "value": 2145.0}]
+
     @pytest.mark.parametrize("label,ctx,ok", [
         ("WCI Composite", False, True),
         ("Drewry World Container Index composite", False, True),
@@ -1001,9 +1041,11 @@ class TestEIAUnitAliases:
         ]}})
         assert [(r["value"], r["units"], r["units_verified"]) for r in rows] == [(24531.0, "MBBL", True)]
 
-    def test_writer_keeps_omitted_units_separate_and_refuses_alias_conflicts(
+    def test_writer_quarantines_omitted_units_before_the_raw_write_and_refuses_alias_conflicts(
         self, monkeypatch, captured_warnings
     ):
+        """Codex HOLD on 4a1738df: a record with no unit field must not become a
+        canonical raw_series row (the entity map and resolver would normalize it)."""
         monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         monkeypatch.setattr(eia.time, "sleep", lambda _s: None)
         empty = {"response": {"data": []}}
@@ -1020,15 +1062,30 @@ class TestEIAUnitAliases:
         ):
             result = eia.EIAPuller(db_engine=engine).pull(days_back=60)
 
-        assert result["status"] == "SUCCESS" and result["rows_inserted"] == 2
-        rows = {r["obs_date"]: r for r in engine.store.rows_for("EIA:eia_cushing_crude_stocks")}
-        assert sorted(rows) == [date(2026, 11, 6), date(2026, 11, 13)]
+        assert result["status"] == "SUCCESS" and result["rows_inserted"] == 1
+        rows = engine.store.rows_for("EIA:eia_cushing_crude_stocks")
+        assert [r["obs_date"] for r in rows] == [date(2026, 11, 13)]
+        raw = rows[0]["raw_payload"]
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        assert payload["units"] == "MBBL" and payload["units_verified"] is True
+        assert any("quarantined 1 record(s) with no unit field" in str(w) for w in captured_warnings)
 
-        def payload(r):
-            raw = r["raw_payload"]
-            return json.loads(raw) if isinstance(raw, str) else raw
+    def test_a_facet_with_only_unit_less_records_writes_nothing_and_reports_failure(
+        self, monkeypatch, captured_warnings
+    ):
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
+        monkeypatch.setattr(eia.time, "sleep", lambda _s: None)
+        brent = {"response": {"data": [{"period": "2026-11-18", "series": "RBRTE", "value": "72.50"}]}}
+        wti = {"response": {"data": [{"period": "2026-11-18", "series": "RWTC", "value": "68.90", "units": "$/BBL"}]}}
+        stocks = {"response": {"data": [_eia_rec("2026-11-13", "24531")]}}
+        engine = FakeEngine()
+        with patch(
+            "ingestion.altdata.eia_puller.requests.get",
+            side_effect=[_http_resp(json_body=brent), _http_resp(json_body=wti), _http_resp(json_body=stocks)],
+        ):
+            result = eia.EIAPuller(db_engine=engine).pull(days_back=30)
 
-        assert payload(rows[date(2026, 11, 13)])["units"] == "MBBL"
-        assert payload(rows[date(2026, 11, 13)])["units_verified"] is True
-        assert payload(rows[date(2026, 11, 6)])["units"] is None
-        assert payload(rows[date(2026, 11, 6)])["units_verified"] is False
+        assert result["status"] == "PARTIAL" and result["rows_inserted"] == 1
+        assert engine.store.rows_for("EIA:eia_brent_spot") == []
+        assert engine.store.rows_for("EIA:eia_cushing_crude_stocks") == []
+        assert len(engine.store.rows_for("EIA:eia_crude_price")) == 1
