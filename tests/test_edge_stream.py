@@ -674,20 +674,132 @@ def _v3_ledger(monkeypatch):
     return L.memory("2026-11-13T06:27:00+00:00")
 
 
+def _forward_item():
+    return dict(next(q for q in TQ.QUEUE if q["lane"] == "forward"))
+
+
+class _NoReads(StaticSource):
+    def sessions(self, *a, **k):
+        raise AssertionError("a window was read")
+
+
 def test_code_change_abandons_a_forward_registration_at_once(tmp_path, monkeypatch):
     """A forward registration is checked before its sessions are counted, not only when it is due."""
     led = L.memory()
-    sha = register(led, F.build_proposal(dict(next(q for q in TQ.QUEUE if q["lane"] == "forward")), TODAY))
+    sha = register(led, F.build_proposal(_forward_item(), TODAY))
     monkeypatch.setattr(R, "code_sha256", lambda fam: "f" * 64)
-    monkeypatch.setattr(R, "forward_progress", lambda *a, **k: (_ for _ in ()).throw(AssertionError("read")))
-    s = R.run_cycle(led, StaticSource({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), register=False)
+    s = R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), register=False)
     assert s["abandoned"][0]["registration"] == sha[:16]
-    rec = L.load_state(led).abandoned[sha]
-    assert rec["cause"] == L.CODE_CHANGED and L.load_state(led).unread_abandoned(sha)
+    state = L.load_state(led)
+    rec = state.abandoned[sha]
+    assert rec["cause"] == L.CODE_CHANGED and rec["read_evidence"]["progress_reads"] == 0
+    assert not state.unread_abandoned(sha) and state.reregistrable(sha)  # forward: never frees its window
 
 
-def test_unread_abandonment_frees_its_window_only_under_policy_4(tmp_path, monkeypatch):
-    with monkeypatch.context() as m:  # policy 3: metals registered, then abandoned for a code change
+def test_forward_progress_then_code_change_keeps_the_window(tmp_path, monkeypatch):
+    """Codex 6010600452: two cycles of forward progress, then a code change. The window stays
+    consumed and the alpha spent; only a new forward window may register."""
+    led = L.memory()
+    sha = register(led, F.build_proposal(_forward_item(), TODAY))
+    alpha = L.load_state(led).registrations[sha]["alpha_look"]
+    for k in (3, 4):
+        day = TODAY + timedelta(days=k)
+        src = StaticSource(synthetic_bars(("SPY", "QQQ", "IWM"), TODAY, day, 0.002), today=day)
+        s = R.run_cycle(led, src, tmp_path, now=NOW + timedelta(days=k), register=False)
+        assert s["forward"][0]["ready"] is False
+    with monkeypatch.context() as m:
+        m.setattr(R, "code_sha256", lambda fam: "f" * 64)
+        R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=5), register=False)
+    state = L.load_state(led)
+    ev = state.abandoned[sha]["read_evidence"]
+    assert ev["progress_reads"] == 2 and ev["look_reads"] == 0 and ev["report_staged"] is False
+    assert not state.unread_abandoned(sha)
+    assert any(c["source"] == sha for c in state.consumption())
+    assert state.abandoned[sha]["alpha_spent"] == alpha and state.stage1_count(2026) == 1
+    assert state.reregistrable(sha)
+    nxt = NOW + timedelta(days=6)  # Thursday: a forward window from Friday, after the abandoned one
+    monkeypatch.setattr(R, "QUEUE", (_forward_item(),))
+    s = R.run_cycle(led, StaticSource({}, today=nxt.date()), tmp_path, now=nxt)
+    reg = [r for r in L.load_state(led).registrations.values() if r["lane"] == "forward"][-1]
+    assert s["registered"] and reg["window"]["start"] > state.abandoned[sha]["recorded_at"][:10]
+
+
+@pytest.mark.parametrize("trace", ["staged_report", "aborted_attempt", "look_read_only"])
+def test_any_trace_of_a_look_keeps_the_window_and_the_group(tmp_path, monkeypatch, trace):
+    """Codex 6010600452: a staged report (crash after the report, before append_look), a failed
+    attempt, or a look read with nothing after it (crash mid-look) each keep the window consumed and
+    the group closed after a code change."""
+    led = L.memory()
+    sha = register(led, metals_proposal())
+    if trace == "staged_report":
+        (tmp_path / "looks").mkdir()
+        (tmp_path / "looks" / f"{sha[:16]}.json").write_bytes(b"{}")
+    elif trace == "aborted_attempt":
+        R._mark_read(tmp_path, sha, "look", NOW)
+        R._append_jsonl(tmp_path / "attempts.jsonl", {"registration_sha256": sha, "at": NOW.isoformat(),
+                                                     "error": "SourceError: x"})
+    else:
+        R._mark_read(tmp_path, sha, "look", NOW)
+    with monkeypatch.context() as m:
+        m.setattr(R, "code_sha256", lambda fam: "f" * 64)
+        R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), register=False)
+    state = L.load_state(led)
+    assert state.abandoned[sha]["cause"] == L.CODE_CHANGED
+    assert not state.unread_abandoned(sha) and not state.reregistrable(sha)
+    assert any(c["source"] == sha for c in state.consumption())
+    later = NOW + timedelta(days=4)
+    s = R.run_cycle(led, metals_source(0.002, later.date()), tmp_path, now=later)
+    assert not any(r["proposal_id"].startswith("IM1-v1:metals") for r in s["registered"])
+
+
+def test_a_look_read_is_marked_before_the_data_is_read(tmp_path):
+    led = L.memory()
+    sha = register(led, metals_proposal())
+    seen = []
+
+    class Watch(StaticSource):
+        def sessions(self, *a, **k):
+            seen.append([r["kind"] for r in R._jsonl(tmp_path / R.READS_FILE)])
+            return super().sessions(*a, **k)
+
+    src = Watch(synthetic_bars(("GLD", "SLV"), date(2024, 11, 1), TODAY, 0.002), today=TODAY)
+    R.run_cycle(led, src, tmp_path, now=NOW + timedelta(days=3), register=False)
+    assert seen and all(k == ["look"] for k in seen)
+    assert R.read_evidence(tmp_path, sha)["look_reads"] == 1
+
+
+def test_a_dry_run_reads_no_open_window_and_writes_nothing(tmp_path):
+    led = L.memory()
+    register(led, metals_proposal())
+    register(led, F.build_proposal(_forward_item(), TODAY))
+    n = len(led.records)
+    s = R.run_cycle(led, _NoReads({}, today=TODAY), tmp_path, now=NOW + timedelta(days=3), dry_run=True,
+                    register=False)
+    assert all(x.get("dry_run") == "window not read" for x in s["looks"] + s["forward"])
+    assert len(led.records) == n and not (tmp_path / R.READS_FILE).exists()
+
+
+def test_unread_abandonment_frees_its_window_under_policy_4(tmp_path, monkeypatch):
+    led = L.memory()  # sealed under policy 4: every cycle of its life marks reads
+    src = metals_source(0.002)
+    R.run_cycle(led, src, tmp_path, now=NOW)
+    reg_sha, = L.load_state(led).registrations
+    with monkeypatch.context() as m:
+        m.setattr(R, "code_sha256", lambda fam: "f" * 64)
+        R.run_cycle(led, src, tmp_path, now=NOW + timedelta(days=3), register=False)
+    state = L.load_state(led)
+    assert reg_sha in state.marked and state.unread_abandoned(reg_sha)
+    assert not any(c["source"] == reg_sha for c in state.consumption())
+    later = NOW + timedelta(days=4)
+    s = R.run_cycle(led, metals_source(0.002, today=later.date()), tmp_path, now=later)
+    assert s["registered"][0]["proposal_id"].startswith("IM1-v1:metals:history:")
+    state = L.load_state(led)
+    assert state.stage1_count(2026) == 2 and state.abandoned[reg_sha]["alpha_spent"] > 0
+
+
+def test_a_registration_sealed_before_policy_4_needs_an_attestation(tmp_path, monkeypatch):
+    """Its earlier cycles ran code that marked no reads, so clean-looking evidence proves nothing."""
+    with monkeypatch.context() as m:
         led = _v3_ledger(m)
         src = metals_source(0.002)
         R.run_cycle(led, src, tmp_path, now=NOW)
@@ -695,18 +807,14 @@ def test_unread_abandonment_frees_its_window_only_under_policy_4(tmp_path, monke
         m.setattr(R, "code_sha256", lambda fam: "f" * 64)
         R.run_cycle(led, src, tmp_path, now=NOW + timedelta(days=3), register=False)
         state = L.load_state(led)
-        assert state.unread_abandoned(reg_sha) and not state.reopens_unread()
-        assert any(c["source"] == reg_sha for c in state.consumption())  # still consumed under policy 3
-        again = F.build_proposal(dict(TQ.QUEUE[0]), TODAY + timedelta(days=3))
-        assert "reuses consumed data" in S.check(again, state, TODAY + timedelta(days=3))["G7_fresh"]
-    # policy 4 (the code's policy): the cycle amends, then registers metals again on a new window
-    later = NOW + timedelta(days=4)  # Tuesday
+        assert not state.reopens_unread() and any(c["source"] == reg_sha for c in state.consumption())
+    later = NOW + timedelta(days=4)  # the cycle amends to policy 4; the window stays consumed
     s = R.run_cycle(led, metals_source(0.002, today=later.date()), tmp_path, now=later)
-    assert s["policy_amended"] and s["registered"][0]["proposal_id"].startswith("IM1-v1:metals:history:")
     state = L.load_state(led)
-    assert state.reopens_unread() and not any(c["source"] == reg_sha for c in state.consumption())
-    assert state.stage1_count(2026) == 2  # the abandoned one still counts against the year
-    assert state.abandoned[reg_sha]["alpha_spent"] > 0
+    assert s["policy_amended"] and state.reopens_unread() and reg_sha not in state.marked
+    assert not state.unread_abandoned(reg_sha) and not state.reregistrable(reg_sha)
+    assert any(c["source"] == reg_sha for c in state.consumption())
+    assert not any(r["proposal_id"].startswith("IM1-v1:metals") for r in s["registered"])
 
 
 def test_other_abandonments_keep_their_window(tmp_path, monkeypatch):
@@ -720,12 +828,38 @@ def test_other_abandonments_keep_their_window(tmp_path, monkeypatch):
     assert not any(r["proposal_id"].startswith("IM1-v1:metals") for r in s["registered"])
 
 
-def test_the_live_abandonment_record_reads_as_unread():
-    """The 2026-11-20 single-stocks abandonment carries only the reason text (no cause field)."""
+def test_the_live_abandonment_is_unread_only_by_attestation():
+    """The 2026-11-20 single-stocks abandonment has no cause or evidence fields; only policy 4's
+    attestation by name frees it. The same reason text on any other record frees nothing."""
+    live = P.UNREAD_ABANDONMENT["attested"][0]["registration_sha256"]
+    reg = {"lane": "history", "stage": 1}
     state = L.StreamState(policy=P.policy_payload(), policy_sha256=P.policy_sha256())
-    state.abandoned["a"] = {"reason": "family IM1 code differs from the registered sha"}
-    state.abandoned["b"] = {"reason": "family IM1 code differs from the registered sha; and more"}
-    assert state.unread_abandoned("a") and not state.unread_abandoned("b")
+    for sha in (live, "b" * 64):
+        state.registrations[sha] = reg
+        state.abandoned[sha] = {"reason": "family IM1 code differs from the registered sha"}
+    assert state.unread_abandoned(live) and state.reregistrable(live)
+    assert not state.unread_abandoned("b" * 64) and not state.reregistrable("b" * 64)
+    state.looks[live] = {"verdict": "FAIL"}
+    assert not state.unread_abandoned(live)
+    fwd = P.UNREAD_ABANDONMENT["attested"][1]["registration_sha256"]
+    clean = {"reads_file": R.READS_FILE, "progress_reads": 3, "look_reads": 0, "failed_attempts": 0,
+             "report_staged": False}
+    state.registrations[fwd] = {"lane": "forward", "stage": 1}
+    state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": clean}
+    assert state.reregistrable(fwd) and not state.unread_abandoned(fwd)  # new window only
+    state.abandoned[fwd] = {"reason": "x", "cause": L.CODE_CHANGED, "read_evidence": {**clean, "failed_attempts": 1}}
+    assert not state.reregistrable(fwd)
+    old = L.StreamState(policy=_v3_payload(), policy_sha256="x")  # policy 3 attests nothing
+    old.registrations[live], old.abandoned[live] = reg, {"reason": "x"}
+    assert not old.unread_abandoned(live)
+
+
+def test_abandonment_evidence_is_complete_or_refused():
+    led = L.memory()
+    sha = register(led, metals_proposal())
     with pytest.raises(L.StreamRefused, match="unknown abandonment cause"):
-        led = L.memory()
-        L.append_abandoned(led, register(led, metals_proposal()), "x", cause="bored")
+        L.append_abandoned(led, sha, "x", cause="bored", read_evidence={})
+    with pytest.raises(L.StreamRefused, match="read evidence goes with"):
+        L.append_abandoned(led, sha, "x", cause=L.CODE_CHANGED)
+    with pytest.raises(L.StreamRefused, match="incomplete"):
+        L.append_abandoned(led, sha, "x", cause=L.CODE_CHANGED, read_evidence={"look_reads": 0})
