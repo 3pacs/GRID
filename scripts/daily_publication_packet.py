@@ -360,6 +360,14 @@ def read_publications(engine: Any, day: date, limit: int) -> dict[str, Any]:
             bundle["existing_diary_context"] = [dict(row) for row in rows]
         except Exception as exc:  # noqa: BLE001
             bundle["failures"].append(f"market_diary context: {type(exc).__name__}; details suppressed")
+        # Last in the transaction: a failed read here leaves the other channels intact.
+        try:
+            bundle["producer_snapshots"] = read_producer_snapshots(conn, bundle["records"], asof)
+        except Exception as exc:  # noqa: BLE001
+            bundle["producer_snapshots"] = None
+            bundle["failures"].append(
+                f"producer snapshots: {type(exc).__name__}; details suppressed; carried regimes unverified"
+            )
         conn.rollback()
     return bundle
 
@@ -483,7 +491,17 @@ def diary_run_evidence(bundle: dict[str, Any], day: date, unit_evidence: dict[st
 
 # Packet guards: regime bound-input minimum and cadence-aware staleness limits.
 MIN_REGIME_BOUND_INPUTS = 8
-REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE = "regime bound-input count unavailable"
+# A carried regime label is verified only against its producer snapshot as
+# read from analytical_snapshots in the capture transaction: exact id, the
+# canonical payload hash, created_at <= publication, and the eligible-feature
+# count derived from that payload. Inline counts are never a source.
+REGIME_CONTAINER_KEYS = ("latest_regime", "regime", "regime_detection")
+PRODUCER_SNAPSHOT_CATEGORY = "regime_detection"
+MAX_PRODUCER_SNAPSHOT_LOOKUPS = 500
+PRODUCER_SNAPSHOT_QUERY = (
+    "SELECT id, category, payload, created_at FROM analytical_snapshots "
+    "WHERE id = :sid AND category = :category AND created_at <= :asof"
+)
 _UNASSERTED_REGIME_LABELS = frozenset({"", "UNKNOWN", "UNCALIBRATED", "NONE", "N/A"})
 _INVALID_FEATURE_ID_STRINGS = frozenset({
     "", "null", "none", "n/a", "na", "unknown", "missing", "unavailable", "-",
@@ -792,9 +810,156 @@ def _verify_producer_snapshot_binding(
     return True, None, snap_count
 
 
-def inspect_regime_binding(row: dict[str, Any], as_of: datetime | None = None) -> dict[str, Any]:
+def _normalize_sha256_hex(value: Any) -> str | None:
+    """A 64-hex sha256 digest (``sha256:`` prefix allowed), lower-cased, else None."""
+    if type(value) is not str:
+        return None
+    digest = value.strip().lower()
+    if digest.startswith("sha256:"):
+        digest = digest[7:]
+    if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+        return digest
+    return None
+
+
+def _snapshot_ref_key(snapshot_id: Any) -> str | None:
+    """Lookup key for a cited analytical_snapshots id (non-negative integer)."""
+    if type(snapshot_id) is int and snapshot_id >= 0:
+        return str(snapshot_id)
+    if type(snapshot_id) is str:
+        raw = snapshot_id.strip()
+        # isascii(): str.isdigit() also accepts digits like "²" that int() rejects.
+        if raw.isascii() and raw.isdigit():
+            return str(int(raw))
+    return None
+
+
+def regime_snapshot_refs(record: dict[str, Any]) -> list[int]:
+    """Producer snapshot ids a captured row cites for any carried regime."""
+    refs: set[int] = set()
+    roots: list[Any] = [record]
+    if isinstance(record.get("snapshot_data"), dict):
+        roots.append(record["snapshot_data"])
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        for mapping in (root, *(root.get(k) for k in REGIME_CONTAINER_KEYS)):
+            if isinstance(mapping, dict):
+                key = _snapshot_ref_key(_extract_snapshot_id(mapping))
+                if key is not None:
+                    refs.add(int(key))
+    return sorted(refs)
+
+
+def describe_producer_snapshot(row: Any) -> dict[str, Any]:
+    """What the packet needs from one analytical_snapshots row, derived from it.
+
+    Hashes the payload exactly as read back (``store.snapshots`` canonical
+    form, the hash the producer stored), and derives the eligible-feature count
+    from the payload itself. The payload is not carried.
+    """
+    from store.snapshots import canonical_payload_sha256
+
+    if row is None:
+        return {"found": False}
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = None
+    entry: dict[str, Any] = {"found": True, "category": row["category"], "payload_valid": False}
+    _, created, _, _ = _parse_observed_clock(row["created_at"])
+    entry["created_at"] = iso(created) if created is not None else None
+    if not isinstance(payload, dict):
+        return entry
+    try:
+        digest = canonical_payload_sha256(payload)
+    except ValueError:
+        return entry
+    entry.update({
+        "payload_valid": True,
+        "payload_sha256": digest,
+        "regime": _extract_regime_label(payload),
+        "bound_inputs": _extract_bound_input_count(payload, as_of=created),
+    })
+    return entry
+
+
+def read_producer_snapshots(conn: Any, records: list[dict[str, Any]], asof: datetime) -> dict[str, dict[str, Any]]:
+    """Read every producer snapshot the captured briefings cite, by exact id."""
+    from sqlalchemy import text
+
+    ids: set[int] = set()
+    for item in records:
+        if item.get("channel") == "market_briefings" and isinstance(item.get("record"), dict):
+            ids.update(regime_snapshot_refs(item["record"]))
+    out: dict[str, dict[str, Any]] = {}
+    for sid in sorted(ids)[:MAX_PRODUCER_SNAPSHOT_LOOKUPS]:
+        row = conn.execute(
+            text(PRODUCER_SNAPSHOT_QUERY),
+            {"sid": sid, "category": PRODUCER_SNAPSHOT_CATEGORY, "asof": asof},
+        ).mappings().first()
+        out[str(sid)] = describe_producer_snapshot(row)
+    return out
+
+
+def _verified_producer_count(
+    mapping: dict[str, Any],
+    label: str,
+    producer_snapshots: dict[str, dict[str, Any]] | None,
+    as_of: datetime | None,
+) -> tuple[tuple[str, str] | None, int | None]:
+    """``(None, count)`` when *mapping*'s regime is bound to a captured producer
+    snapshot; otherwise ``(("mismatch" | "unverified", reason), None)``.
+
+    "mismatch" means the evidence contradicts the claim; "unverified" means the
+    evidence needed to check it is absent.
+    """
+    key = _snapshot_ref_key(_extract_snapshot_id(mapping))
+    digest = _normalize_sha256_hex(_extract_snapshot_hash(mapping))
+    if key is None or digest is None:
+        return ("unverified", "missing_producer_snapshot_binding"), None
+    if producer_snapshots is None or key not in producer_snapshots:
+        return ("unverified", "producer_snapshot_not_captured"), None
+    entry = producer_snapshots[key]
+    if entry.get("found") is not True:
+        return ("mismatch", "producer_snapshot_not_found"), None
+    if entry.get("category") != PRODUCER_SNAPSHOT_CATEGORY or entry.get("payload_valid") is not True:
+        return ("mismatch", "producer_snapshot_malformed_payload"), None
+    if entry.get("payload_sha256") != digest:
+        return ("mismatch", "producer_snapshot_hash_mismatch"), None
+    producer_label = entry.get("regime")
+    if type(producer_label) is not str or producer_label.upper() != label.upper():
+        return ("mismatch", "producer_snapshot_regime_mismatch"), None
+    _, available, _, _ = _parse_observed_clock(entry.get("created_at"))
+    if available is None:
+        return ("mismatch", "producer_snapshot_missing_availability_clock"), None
+    if as_of is None:
+        return ("unverified", "missing_publication_clock"), None
+    if available > as_of:
+        return ("mismatch", "producer_snapshot_future_clock"), None
+    count = entry.get("bound_inputs")
+    if type(count) is not int or count < 0:
+        return ("unverified", "producer_snapshot_missing_bound_inputs"), None
+    return None, count
+
+
+def inspect_regime_binding(
+    row: dict[str, Any],
+    as_of: datetime | None = None,
+    producer_snapshots: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Read-only inspection of regime label binding, snapshot match, clock sanity,
-    and distinct eligible bound-input count."""
+    and distinct eligible bound-input count.
+
+    A carried regime label is "ok" only when it names its producer snapshot by
+    id and canonical payload hash and *producer_snapshots* (read by exact id in
+    the capture transaction) shows that snapshot existed by *as_of* with the
+    same regime and at least MIN_REGIME_BOUND_INPUTS eligible features. Without
+    that evidence the label is "unverified"; inline feature lists or counts can
+    lower the verdict to "insufficient" but never raise it to "ok".
+    """
     if not isinstance(row, dict):
         return {"status": "ok", "label": None, "count": None, "reason": None}
 
@@ -837,7 +1002,7 @@ def inspect_regime_binding(row: dict[str, Any], as_of: datetime | None = None) -
                     "reason": "conflicting_regime_snapshot_ids",
                 }
 
-    unavailable_label: str | None = None
+    unverified: tuple[str, str] | None = None
 
     def _inspect_one(
         mapping: dict[str, Any],
@@ -845,7 +1010,7 @@ def inspect_regime_binding(row: dict[str, Any], as_of: datetime | None = None) -
         *,
         explicit_regime_container: bool,
     ) -> dict[str, Any] | None:
-        nonlocal unavailable_label
+        nonlocal unverified
         label = _extract_regime_label(mapping)
         if label is None:
             if explicit_regime_container:
@@ -879,61 +1044,48 @@ def inspect_regime_binding(row: dict[str, Any], as_of: datetime | None = None) -
                 "reason": "invalid_bound_inputs",
             }
 
-        snap_count_from_producer: int | None = None
+        # Embedded producer metadata (written by the briefing) must agree with
+        # this container, but it is never the source of the count.
         for snap_key in ("producer_snapshot", "analytical_snapshot"):
             if snap_key in mapping and mapping[snap_key] is not None:
-                ok, reason, scount = _verify_producer_snapshot_binding(
+                ok, reason, _ = _verify_producer_snapshot_binding(
                     mapping, label, mapping[snap_key], resolved_as_of,
                 )
                 if not ok:
                     return {"status": "mismatch", "label": label, "count": None, "reason": reason}
-                if scount is not None:
-                    snap_count_from_producer = scount
 
-        has_own_collection = any(
-            k in mapping and isinstance(mapping[k], (dict, list, tuple, set))
-            for k in ("features_used", "eligible_feature_ids", "bound_inputs")
-        )
-        count = _extract_bound_input_count(mapping, as_of=resolved_as_of)
-        if snap_count_from_producer is not None:
-            if count is None or (not has_own_collection and snap_count_from_producer < count):
-                count = snap_count_from_producer
+        inline_count = _extract_bound_input_count(mapping, as_of=resolved_as_of)
+        problem, count = _verified_producer_count(mapping, label, producer_snapshots, resolved_as_of)
+        if problem is not None:
+            kind, reason = problem
+            if kind == "mismatch":
+                return {"status": "mismatch", "label": label, "count": None, "reason": reason}
+            if inline_count is not None and inline_count < MIN_REGIME_BOUND_INPUTS:
+                # The row's own claim already admits too few inputs.
+                return {
+                    "status": "insufficient",
+                    "label": label,
+                    "count": inline_count,
+                    "reason": f"regime_bound_inputs_below_minimum:{inline_count}<{MIN_REGIME_BOUND_INPUTS}",
+                }
+            if unverified is None:
+                unverified = (label, reason)
+            return None
 
-        if count is None and isinstance(parent, dict):
-            parent_count = _extract_bound_input_count(parent, as_of=resolved_as_of)
-            if parent_count is not None:
-                # Never borrow a feature count from an unrelated/unbound parent snapshot.
-                map_sid = _extract_snapshot_id(mapping)
-                parent_sid = _extract_snapshot_id(parent, allow_bare_id=False)
-                map_hash = _extract_snapshot_hash(mapping)
-                parent_label = _extract_regime_label(parent)
-                if (
-                    map_sid is not None
-                    and parent_sid is not None
-                    and map_sid == parent_sid
-                    and (map_hash is None or _snapshot_hash_matches(parent, map_hash))
-                    and parent_label is not None
-                    and parent_label.upper() == label.upper()
-                    and (resolved_as_of is None or not _check_entry_clock_sanity(parent, "parent_snapshot", "model", resolved_as_of))
-                ):
-                    count = parent_count
-                else:
-                    return {
-                        "status": "mismatch",
-                        "label": label,
-                        "count": None,
-                        "reason": "unrelated_parent_snapshot",
-                    }
-
-        if count is not None and count < MIN_REGIME_BOUND_INPUTS:
+        if inline_count is not None and inline_count != count:
+            return {
+                "status": "mismatch",
+                "label": label,
+                "count": None,
+                "reason": f"inline_bound_inputs_disagree_with_producer:{inline_count}!={count}",
+            }
+        if count < MIN_REGIME_BOUND_INPUTS:
             return {
                 "status": "insufficient",
                 "label": label,
                 "count": count,
                 "reason": f"regime_bound_inputs_below_minimum:{count}<{MIN_REGIME_BOUND_INPUTS}",
             }
-        if count is None and unavailable_label is None:
-            unavailable_label = label
         return None
 
     for _, mapping, parent in explicit_containers:
@@ -946,12 +1098,16 @@ def inspect_regime_binding(row: dict[str, Any], as_of: datetime | None = None) -
         if verdict is not None:
             return verdict
 
-    if unavailable_label is not None:
-        return {"status": "unavailable", "label": unavailable_label, "count": None, "reason": None}
+    if unverified is not None:
+        return {"status": "unverified", "label": unverified[0], "count": None, "reason": unverified[1]}
     return {"status": "ok", "label": None, "count": None, "reason": None}
 
 
-def inspect_regime_bound_inputs(row: dict[str, Any], as_of: datetime | None = None) -> tuple[str, str | None, int | None]:
+def inspect_regime_bound_inputs(
+    row: dict[str, Any],
+    as_of: datetime | None = None,
+    producer_snapshots: dict[str, dict[str, Any]] | None = None,
+) -> tuple[str, str | None, int | None]:
     """Read-only inspection of any carried regime label's bound-input count.
 
     Returns:
@@ -959,20 +1115,26 @@ def inspect_regime_bound_inputs(row: dict[str, Any], as_of: datetime | None = No
             distinct eligible bound-input count < MIN_REGIME_BOUND_INPUTS;
         (``"mismatch"``, label, None) when a carried regime container has a
             missing label, unrelated/mismatched producer snapshot, or invalid clock;
-        (``"unavailable"``, label, None) when a carried regime label has no
-            available bound-input count;
+        (``"unverified"``, label, None) when a carried regime label is not bound
+            to a captured producer snapshot (no id/hash, or the snapshot was not
+            read), so its count cannot be checked;
         (``"ok"``, None, None) when no regime label is asserted or every
-            asserted regime label meets MIN_REGIME_BOUND_INPUTS.
+            asserted regime label is producer-verified with at least
+            MIN_REGIME_BOUND_INPUTS eligible features.
     """
-    info = inspect_regime_binding(row, as_of=as_of)
+    info = inspect_regime_binding(row, as_of=as_of, producer_snapshots=producer_snapshots)
     return info["status"], info["label"], info["count"]
 
 
-def check_regime_bound_inputs(row: dict[str, Any], as_of: datetime | None = None) -> tuple[str, int] | None:
+def check_regime_bound_inputs(
+    row: dict[str, Any],
+    as_of: datetime | None = None,
+    producer_snapshots: dict[str, dict[str, Any]] | None = None,
+) -> tuple[str, int] | None:
     """Read-only check: return (label, bound_count) if a carried regime label was
     computed from fewer than MIN_REGIME_BOUND_INPUTS bound inputs and that count
     is available in *row*; otherwise None."""
-    status, label, count = inspect_regime_bound_inputs(row, as_of=as_of)
+    status, label, count = inspect_regime_bound_inputs(row, as_of=as_of, producer_snapshots=producer_snapshots)
     if status == "insufficient" and label is not None and count is not None:
         return label, count
     return None
@@ -1447,7 +1609,9 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         # Screen the WHOLE canonical row: source_record (snapshot_data, grounding, etc.) enters packet.json too.
         reasons = screen_row(row)
         disposition = None
-        regime_info = inspect_regime_binding(row, as_of=published)
+        regime_info = inspect_regime_binding(
+            row, as_of=published, producer_snapshots=bundle.get("producer_snapshots"),
+        )
         regime_status = regime_info["status"]
         regime_label = regime_info["label"]
         bound_count = regime_info["count"]
@@ -1473,6 +1637,15 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
             packet["blockers"].append(
                 f"{identity}: refused carried regime ({mismatch_reason})"
             )
+        elif regime_status == "unverified":
+            disposition = "REFUSED_UNVERIFIED_REGIME_BINDING"
+            unverified_reason = regime_info["reason"] or "missing_producer_snapshot_binding"
+            reasons = [unverified_reason]
+            log.warning("publication-packet: refused {} carrying an unverified regime: {}", identity, unverified_reason)
+            packet["blockers"].append(
+                f"{identity}: refused regime label {regime_label!r}: not verified against its "
+                f"producer snapshot ({unverified_reason})"
+            )
         elif clock_violations:
             disposition = "REFUSED_INVALID_SOURCE_CLOCK"
             reasons = [f"{v['reason']}:{v['path']}" for v in clock_violations]
@@ -1491,9 +1664,6 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
             "id": identity, "source": channel, "published_at": iso(published), "text": content,
             "sha256": text_sha, "claims_complete": False, "source_record": row,
         }
-        if regime_status == "unavailable":
-            pub_entry["notices"] = [REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE]
-            packet["notices"].append(f"{identity}: {REGIME_BOUND_INPUT_UNAVAILABLE_NOTICE}")
         stale_items = find_stale_carried_items(row, published)
         if stale_items:
             pub_entry["stale"] = True

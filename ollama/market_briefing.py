@@ -16,6 +16,7 @@ import hashlib
 import math
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -752,6 +753,20 @@ class MarketBriefingEngine:
     _SNAPSHOT_HASH_KEYS = ("snapshot_hash", "producer_snapshot_hash", "snapshot_sha256", "payload_sha256")
 
     @staticmethod
+    def _row_values(row: Any) -> tuple[Any, ...] | None:
+        """A database result row as a plain tuple, or ``None`` if *row* is not one.
+
+        SQLAlchemy 2.0's ``Row`` is a ``collections.abc.Sequence`` but not a
+        ``tuple`` subclass, so a bare ``isinstance(row, tuple)`` check rejects
+        every real result row (tuple-shaped test doubles hide that).
+        """
+        if row is None or isinstance(row, (str, bytes, bytearray)):
+            return None
+        if isinstance(row, (tuple, list, Sequence)):
+            return tuple(row)
+        return None
+
+    @staticmethod
     def _parse_utc_clock(value: Any) -> tuple[date | None, datetime | None, bool]:
         """Parse an ISO date/datetime into ``(date, utc_datetime, is_date_only)``."""
         if isinstance(value, datetime):
@@ -1381,8 +1396,9 @@ class MarketBriefingEngine:
 
                                 matched_row: tuple[Any, dict[str, Any], datetime, date | None] | None = None
                                 mismatch_reason = "producer_snapshot_not_found"
-                                for srow in candidate_rows:
-                                    if not isinstance(srow, (tuple, list)) or len(srow) < 3:
+                                for raw_srow in candidate_rows:
+                                    srow = self._row_values(raw_srow)
+                                    if srow is None or len(srow) < 3:
                                         mismatch_reason = "producer_snapshot_incomplete_columns"
                                         continue
                                     s_id = srow[0]
@@ -1487,33 +1503,10 @@ class MarketBriefingEngine:
                                         latest_regime["eligible_feature_ids"] = distinct_ids
                                     snapshot["latest_regime"] = latest_regime
                             elif "features_used" in flags_dict:
-                                inline_label = self._extract_asserted_regime_label(flags_dict)
-                                if any(k in flags_dict for k in ("regime", "state", "inferred_state", "regime_label")) and (
-                                    inline_label is None or inline_label.upper() != state_label.upper()
-                                ):
-                                    _withhold_regime("inline_regime_label_mismatch")
-                                else:
-                                    distinct_ids = self._extract_distinct_eligible_feature_ids(
-                                        flags_dict.get("features_used"),
-                                        eligible_int_ids=eligible_int_ids,
-                                        as_of_dt=now_utc,
-                                    )
-                                    if distinct_ids is None:
-                                        _withhold_regime("invalid_inline_features_used")
-                                    else:
-                                        inline_hash = self._canonical_snapshot_hash(flags_dict)
-                                        snapshot["latest_regime"] = {
-                                            "state": state_label,
-                                            "confidence": round(regime_row[1], 4),
-                                            "transition_prob": round(regime_row[2], 4),
-                                            "contradictions": strip_binding_flags(regime_row[3]),
-                                            "recommendation": regime_row[4],
-                                            "timestamp": str(regime_row[5]),
-                                            "snapshot_hash": inline_hash,
-                                            "snapshot_available_at": dec_dt.isoformat(),
-                                            "bound_inputs": len(distinct_ids),
-                                            "eligible_feature_ids": distinct_ids,
-                                        }
+                                # Legacy journal rows list features inline, with no producer
+                                # snapshot to prove them: a hash of the journal row itself
+                                # proves nothing. The regime stays unverified and is withheld.
+                                _withhold_regime("unverified_inline_binding")
                             else:
                                 # Fail closed: never select an unbound latest analytical_snapshots
                                 # row to lend its feature count to this regime.

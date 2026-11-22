@@ -63,9 +63,9 @@ def _canonical_sha256(payload: dict) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _packet_bundle(records: list[dict]) -> dict:
+def _packet_bundle(records: list[dict], producer_snapshots: dict | None = None) -> dict:
     day = "2026-11-18"
-    return {
+    bundle = {
         "version": "publication-capture-v1",
         "producer": "scripts/daily_publication_packet.py",
         "publication_day": day,
@@ -85,6 +85,15 @@ def _packet_bundle(records: list[dict]) -> dict:
         "existing_diary_context": [],
         "records": records,
     }
+    if producer_snapshots is not None:
+        bundle["producer_snapshots"] = producer_snapshots
+    return bundle
+
+
+def _captured_producer(job, snapshot_id: int, payload: dict, created_at: str = "2026-11-18T09:59:00Z") -> dict:
+    """The packet's capture of one analytical_snapshots row, keyed by id."""
+    row = {"id": snapshot_id, "category": "regime_detection", "payload": payload, "created_at": created_at}
+    return {str(snapshot_id): job.describe_producer_snapshot(row)}
 
 
 def _briefing_record(row_id: int, snapshot_data: dict, *, created_at: str = "2026-11-18T14:00:00Z") -> dict:
@@ -245,11 +254,19 @@ def test_briefing_bound_producer_snapshot_passes_and_carries_binding_metadata(tm
     assert "## Latest Regime" in fallback
     assert "FRAGILE" in fallback
 
-    # And passes daily_publication_packet cleanly
+    # And passes daily_publication_packet cleanly once the packet has read the
+    # producer snapshot it cites
     job = _load_packet_module()
-    packet, exclusions = job.build_packet(_packet_bundle([_briefing_record(8002, snap)]))
+    packet, exclusions = job.build_packet(_packet_bundle(
+        [_briefing_record(8002, snap)], producer_snapshots=_captured_producer(job, 42, payload),
+    ))
     assert exclusions == []
     assert [p["id"] for p in packet["publications"]] == ["market_briefings:8002"]
+    # Without that read, the same row is refused as unverified
+    _, unread = job.build_packet(_packet_bundle([_briefing_record(8002, snap)]))
+    assert [(e["disposition"], e["reasons"]) for e in unread] == [
+        ("REFUSED_UNVERIFIED_REGIME_BINDING", ["producer_snapshot_not_captured"]),
+    ]
 
 
 @pytest.mark.parametrize("snapshot_data,case_id", [
@@ -855,3 +872,280 @@ def test_regime_current_lists_contradictions_without_binding_keys():
     with patch.object(regime_router, "get_db_engine", return_value=engine):
         resp = regime_router.get_current(_token="t")
     assert resp.contradiction_flags == ["calm_in_stress: x"]
+
+
+# ── Codex HOLD on #1386 head 032cd9ae ────────────────────────────────────────
+# (1) a real SQLAlchemy Row is not a tuple; (2) the packet must take the count
+# from the producer snapshot it reads, never from inline ids or counts.
+
+
+def _real_rows(*rows: tuple) -> list:
+    """Real ``sqlalchemy.engine.Row`` objects (from in-memory SQLite)."""
+    from sqlalchemy import create_engine, text
+
+    out = []
+    eng = create_engine("sqlite://")
+    with eng.connect() as conn:
+        for sid, payload, created, as_of in rows:
+            out.append(conn.execute(
+                text("SELECT :id AS id, :payload AS payload, :created AS created_at, :as_of AS as_of_date"),
+                {"id": sid, "payload": json.dumps(payload), "created": created, "as_of": as_of},
+            ).fetchone())
+    eng.dispose()
+    return out
+
+
+@pytest.mark.parametrize("flag_key", ["snapshot_id", None])
+def test_briefing_accepts_real_sqlalchemy_rows_for_the_producer_snapshot(tmp_path, flag_key):
+    from sqlalchemy.engine import Row
+
+    payload = {"regime": "FRAGILE", "features_used": {f"c{i}": f"feat_{i}" for i in range(8)}}
+    digest = _canonical_sha256(payload)
+    flags = {"snapshot_hash": digest} if flag_key is None else {"snapshot_id": 42, "snapshot_hash": digest}
+    regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    rows = _real_rows((42, payload, "2026-11-18T09:59:00Z", "2026-11-18"))
+    assert isinstance(rows[0], Row) and not isinstance(rows[0], (tuple, list))
+
+    conn = _BoundRegimeConn(regime_row, snap_rows=rows)
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+
+    assert "latest_regime_withheld" not in snap, snap.get("latest_regime_withheld")
+    lr = snap["latest_regime"]
+    assert (lr["snapshot_id"], lr["snapshot_hash"], lr["bound_inputs"]) == (42, digest, 8)
+
+
+def test_briefing_row_helper_normalizes_rows_and_rejects_non_rows():
+    row = _real_rows((1, {"a": 1}, "2026-11-18T09:59:00Z", "2026-11-18"))[0]
+    assert MarketBriefingEngine._row_values(row) == (1, json.dumps({"a": 1}), "2026-11-18T09:59:00Z", "2026-11-18")
+    assert MarketBriefingEngine._row_values((1, 2, 3)) == (1, 2, 3)
+    for not_a_row in (None, "abc", b"abc", {"id": 1}, 7):
+        assert MarketBriefingEngine._row_values(not_a_row) is None
+
+
+def test_briefing_withholds_a_regime_bound_only_by_inline_features(tmp_path):
+    flags = {"regime": "FRAGILE", "features_used": {f"c{i}": f"feat_{i}" for i in range(9)}}
+    regime_row = ("FRAGILE", 0.72, 0.15, flags, "DEFENSIVE", "2026-11-18T10:00:00Z")
+    conn = _BoundRegimeConn(regime_row)
+    snap = _make_engine(_FakeOllamaClient(None), _FakeEngine(conn), tmp_path)._gather_market_snapshot()
+    assert "latest_regime" not in snap
+    assert snap["latest_regime_withheld"]["reason"] == "unverified_inline_binding"
+    assert conn.snap_queries == []
+
+
+_PAYLOAD_8 = {"regime": "FRAGILE", "features_used": {f"c{i}": f"feat_{i}" for i in range(8)}}
+_PAYLOAD_1 = {"regime": "FRAGILE", "features_used": {"c0": "feat_0"}}
+_INLINE_8 = {"bound_inputs": 8, "eligible_feature_ids": [f"feat_{i}" for i in range(8)]}
+
+
+def _bound_regime(payload: dict, *, sid: int = 42, **extra) -> dict:
+    return {"state": "FRAGILE", "snapshot_id": sid, "snapshot_hash": _canonical_sha256(payload),
+            "timestamp": "2026-11-18T10:00:00Z", **extra}
+
+
+@pytest.mark.parametrize("latest_regime,producer,expected", [
+    # inline ids only, no producer binding at all
+    ({"state": "FRAGILE", "timestamp": "2026-11-18T10:00:00Z", **_INLINE_8}, {},
+     ("REFUSED_UNVERIFIED_REGIME_BINDING", "missing_producer_snapshot_binding")),
+    # bound, but the packet holds no read of that snapshot
+    (_bound_regime(_PAYLOAD_8, **_INLINE_8), {},
+     ("REFUSED_UNVERIFIED_REGIME_BINDING", "producer_snapshot_not_captured")),
+    # eight inline ids against a verified producer count of one
+    (_bound_regime(_PAYLOAD_1, **_INLINE_8), {"payload": _PAYLOAD_1},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "inline_bound_inputs_disagree_with_producer:8!=1")),
+    # verified producer with one feature and no inline count
+    (_bound_regime(_PAYLOAD_1), {"payload": _PAYLOAD_1},
+     ("REFUSED_INSUFFICIENT_REGIME_INPUTS", "regime_bound_inputs_below_minimum:1<8")),
+    # cited id read but absent
+    (_bound_regime(_PAYLOAD_8), {"row": None},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "producer_snapshot_not_found")),
+    # stored payload differs from the cited hash
+    (_bound_regime(_PAYLOAD_8), {"payload": {**_PAYLOAD_8, "n_features": 99}},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "producer_snapshot_hash_mismatch")),
+    # producer saved after the briefing was published
+    (_bound_regime(_PAYLOAD_8), {"payload": _PAYLOAD_8, "created_at": "2026-11-18T15:00:00Z"},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "producer_snapshot_future_clock")),
+    # producer asserts a different regime
+    (_bound_regime({**_PAYLOAD_8, "regime": "GROWTH"}), {"payload": {**_PAYLOAD_8, "regime": "GROWTH"}},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "producer_snapshot_regime_mismatch")),
+    # wrong category under the cited id
+    (_bound_regime(_PAYLOAD_8), {"payload": _PAYLOAD_8, "category": "other"},
+     ("REFUSED_REGIME_BINDING_MISMATCH", "producer_snapshot_malformed_payload")),
+    # hash that is not a sha256 digest
+    ({**_bound_regime(_PAYLOAD_8), "snapshot_hash": "abc"}, {"payload": _PAYLOAD_8},
+     ("REFUSED_UNVERIFIED_REGIME_BINDING", "missing_producer_snapshot_binding")),
+], ids=["inline_only", "not_captured", "inline8_vs_producer1", "producer1", "not_found",
+        "hash_mismatch", "future_producer", "regime_mismatch", "wrong_category", "bad_hash"])
+def test_packet_takes_the_regime_count_only_from_the_captured_producer(latest_regime, producer, expected):
+    job = _load_packet_module()
+    if not producer:
+        captured = {}
+    else:
+        row = None if "row" in producer else {
+            "id": 42, "category": producer.get("category", "regime_detection"),
+            "payload": producer["payload"], "created_at": producer.get("created_at", "2026-11-18T09:59:00Z"),
+        }
+        captured = {"42": job.describe_producer_snapshot(row)}
+    record = _briefing_record(8100, {"latest_regime": latest_regime})
+    packet, exclusions = job.build_packet(_packet_bundle([record], producer_snapshots=captured))
+    assert packet["publications"] == []
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [(expected[0], [expected[1]])]
+
+
+def test_packet_carries_a_producer_verified_regime_with_matching_inline_count():
+    job = _load_packet_module()
+    record = _briefing_record(8101, {"latest_regime": _bound_regime(_PAYLOAD_8, **_INLINE_8)})
+    packet, exclusions = job.build_packet(_packet_bundle(
+        [record], producer_snapshots=_captured_producer(job, 42, _PAYLOAD_8),
+    ))
+    assert exclusions == []
+    assert [p["id"] for p in packet["publications"]] == ["market_briefings:8101"]
+
+
+def test_packet_refuses_every_carried_regime_when_the_producer_read_failed():
+    job = _load_packet_module()
+    bundle = _packet_bundle([_briefing_record(8102, {"latest_regime": _bound_regime(_PAYLOAD_8)})])
+    bundle["producer_snapshots"] = None
+    _, exclusions = job.build_packet(bundle)
+    assert [(e["disposition"], e["reasons"]) for e in exclusions] == [
+        ("REFUSED_UNVERIFIED_REGIME_BINDING", ["producer_snapshot_not_captured"]),
+    ]
+
+
+def test_packet_hash_is_the_producer_hash():
+    from store.snapshots import canonical_payload_sha256
+
+    job = _load_packet_module()
+    payload = {"regime": "FRAGILE", "x": -0.0, "big": 10**20, "d": "é"}
+    entry = job.describe_producer_snapshot(
+        {"id": 1, "category": "regime_detection", "payload": json.dumps(payload), "created_at": "2026-11-18T09:59:00Z"}
+    )
+    assert entry["payload_sha256"] == canonical_payload_sha256(payload)
+    assert entry["regime"] == "FRAGILE" and entry["bound_inputs"] is None
+
+
+def test_read_producer_snapshots_queries_each_cited_id_once_with_bound_parameters():
+    job = _load_packet_module()
+    asof = datetime(2026, 11, 19, 6, tzinfo=timezone.utc)
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def mappings(self):
+            return self
+
+        def first(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, stmt, params):
+            self.calls.append((str(stmt), dict(params)))
+            if params["sid"] == 42:
+                return _Result({"id": 42, "category": "regime_detection", "payload": _PAYLOAD_8,
+                                "created_at": datetime(2026, 11, 18, 9, 59, tzinfo=timezone.utc)})
+            return _Result(None)
+
+    records = [
+        _briefing_record(1, {"latest_regime": _bound_regime(_PAYLOAD_8, sid=42)}),
+        _briefing_record(2, {"latest_regime": _bound_regime(_PAYLOAD_8, sid=42)}),
+        _briefing_record(3, {"regime_detection": {"state": "FRAGILE", "producer_snapshot_id": "7"}}),
+        {"channel": "thesis_snapshots", "record": {"id": 9, "snapshot_id": 5}},
+    ]
+    conn = _Conn()
+    got = job.read_producer_snapshots(conn, records, asof)
+    assert [c[1]["sid"] for c in conn.calls] == [7, 42]
+    assert all(c[0] == job.PRODUCER_SNAPSHOT_QUERY for c in conn.calls)
+    assert all(c[1]["category"] == "regime_detection" and c[1]["asof"] == asof for c in conn.calls)
+    assert got["7"] == {"found": False}
+    assert got["42"]["found"] is True and got["42"]["bound_inputs"] == 8
+    assert got["42"]["payload_sha256"] == _canonical_sha256(_PAYLOAD_8)
+
+
+_PG_URL = os.environ.get("GRID_TEST_DB_URL")
+
+
+@pytest.mark.skipif(not _PG_URL, reason="requires disposable PostgreSQL via GRID_TEST_DB_URL")
+def test_real_postgres_result_binds_briefing_and_packet(tmp_path):
+    """The briefing guard and the packet read the producer row from a real
+    PostgreSQL result (JSONB payload, timestamptz clock), not a tuple double."""
+    from sqlalchemy import create_engine, event, text
+
+    from store.snapshots import canonical_payload_sha256
+
+    eng = create_engine(_PG_URL)
+
+    @event.listens_for(eng, "connect")
+    def _search_path(dbapi_conn, _record):  # pragma: no cover - driver hook
+        cur = dbapi_conn.cursor()
+        cur.execute("SET search_path TO rc_publication_binding_test")
+        cur.close()
+
+    with eng.begin() as c:
+        c.execute(text("DROP SCHEMA IF EXISTS rc_publication_binding_test CASCADE"))
+        c.execute(text("CREATE SCHEMA rc_publication_binding_test"))
+        c.execute(text(
+            "CREATE TABLE analytical_snapshots (id BIGSERIAL PRIMARY KEY, category TEXT NOT NULL, "
+            "payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL, as_of_date DATE)"
+        ))
+        payload = {**_PAYLOAD_8, "stress_derivative": -0.0, "big": 1e20}
+        sid = c.execute(
+            text("INSERT INTO analytical_snapshots (category, payload, created_at, as_of_date) "
+                 "VALUES ('regime_detection', CAST(:p AS JSONB), :ts, :d) RETURNING id"),
+            {"p": json.dumps(payload), "ts": datetime(2026, 11, 18, 9, 59, tzinfo=timezone.utc),
+             "d": date(2026, 11, 18)},
+        ).scalar_one()
+        stored = c.execute(text("SELECT payload FROM analytical_snapshots WHERE id = :i"), {"i": sid}).scalar_one()
+    try:
+        digest = canonical_payload_sha256(stored)
+        regime_row = ("FRAGILE", 0.72, 0.15, {"snapshot_id": sid, "snapshot_hash": digest},
+                      "DEFENSIVE", "2026-11-18T10:00:00Z")
+
+        pg_conn = eng.connect()
+
+        class _PgSnapshotConn(_BoundRegimeConn):
+            """Every other query is faked; the producer lookup runs on PostgreSQL."""
+
+            def execute(self, stmt, params=None):
+                if "FROM analytical_snapshots" in str(stmt):
+                    return pg_conn.execute(stmt, params)
+                return super().execute(stmt, params)
+
+        try:
+            snap = _make_engine(
+                _FakeOllamaClient(None), _FakeEngine(_PgSnapshotConn(regime_row)), tmp_path,
+            )._gather_market_snapshot()
+        finally:
+            pg_conn.close()
+        assert "latest_regime_withheld" not in snap, snap.get("latest_regime_withheld")
+        assert snap["latest_regime"]["snapshot_hash"] == digest
+
+        job = _load_packet_module()
+        records = [_briefing_record(8200, snap, created_at="2026-11-18T14:00:00Z")]
+        with eng.connect() as pg:
+            captured = job.read_producer_snapshots(pg, records, datetime(2026, 11, 19, 6, tzinfo=timezone.utc))
+        assert captured[str(sid)]["payload_sha256"] == digest
+        packet, exclusions = job.build_packet(_packet_bundle(records, producer_snapshots=captured))
+        assert exclusions == []
+        assert [p["id"] for p in packet["publications"]] == ["market_briefings:8200"]
+    finally:
+        with eng.begin() as c:
+            c.execute(text("DROP SCHEMA rc_publication_binding_test CASCADE"))
+        eng.dispose()
+
+
+@pytest.mark.parametrize("sid", ["\u00b2", "\u0663", " 4\u00b2 ", True, -1, 1.5])
+def test_packet_refuses_odd_snapshot_ids_without_aborting_the_run(sid):
+    """A non-ASCII digit id ("²", Arabic-Indic "٣") made int() raise and abort
+    the whole packet; it now refuses that row as unverified."""
+    job = _load_packet_module()
+    regime = {**_bound_regime(_PAYLOAD_8), "snapshot_id": sid}
+    records = [_briefing_record(8300, {"latest_regime": regime}), _briefing_record(8301, {"note": "no regime"})]
+    assert job.regime_snapshot_refs(records[0]["record"]) == []
+    packet, exclusions = job.build_packet(_packet_bundle(records, producer_snapshots={}))
+    assert [(e["publication_id"], e["disposition"]) for e in exclusions] == [
+        ("market_briefings:8300", "REFUSED_UNVERIFIED_REGIME_BINDING"),
+    ]
+    assert [p["id"] for p in packet["publications"]] == ["market_briefings:8301"]
