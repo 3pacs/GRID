@@ -833,31 +833,84 @@ _ACTOR_SUBJECT_RE = re.compile(
     r"\b(?:institution(?:al|s)?|retail|smart money|professional investors|"
     r"informed (?:participants?|sell\w*|buy\w*|traders?|trading|money|investors?|caution\w*|positioning)|"
     r"large[- ](?:players?|participants?|holders?))\b")
-# Participant posture read off aggregate ratios, price proxies or scores.
+# Participant posture read off aggregate ratios, price proxies or scores. Runs on
+# the clause as written (never on label-stripped text).
 _POSTURE_RE = re.compile(
-    r"\b(?:defensive|risk[- ]off|cautious)\s+positioning\b|"
+    r"\b(?:defensive|risk[- ]off|cautious|short|long|bearish|bullish)\s+(?:[\w/-]+\s+){0,3}?positioning\b|"
     r"\bpositioning\s+(?:is|remains|looks|appears|was)\s+(?:defensive|risk[- ]off|cautious)\b|"
     r"\b(?:signal\w*|suggest\w*|indicat\w*|point\w*\s+to|consistent\s+with|associated\s+with|"
     r"correlat\w*\s+with|reflect\w*)\s+(?:\w+\s+)?caution\b")
+_ACTOR_KEYWORD_RE = re.compile(
+    r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|"
+    r"led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*|"
+    r"conviction|euphori\w*|exit\w*|caution\w*|cautious|defensiv\w*)\b")
+_POSTURE_ADJECTIVE_RE = re.compile(r"\b(?:defensive|risk[- ]off|cautious|short|long|bearish|bullish)\b")
 # GRID's own proxy component labels (market_briefing._PROXY_COMPONENT_LABELS)
-# are nouns, not participant positioning. Normalization strips the label text
-# only; any actor word or posture in the same clause is still checked.
+# are nouns, not participant positioning. A label is recognised only as the
+# whole noun phrase: at the clause start or right after "the", "grid('s)" or a
+# score. An actor adjective or possessive in front ("institutional positioning
+# proxy") is therefore never recognised.
 _PROXY_LABEL_RE = re.compile(
-    r"\b(?:(?:computed\s+)?(?:sentiment|equity)\s+)?(?:positioning|etf activity|dark pool)\s?prox(?:y|ies)\b")
+    r"(?:^\s*|(?<=\bthe )|(?<=\bgrid )|(?<=\bgrid's )|(?<=[\d%)] ))"
+    r"(?P<label>(?:(?:computed\s+)?(?:sentiment|equity)\s+)?(?:positioning|etf activity|dark pool)\s?prox(?:y|ies))\b")
 # The label's direction word is the score sign the prompt asks for. It binds to
 # the label only when the clause also carries that signed score and no actor.
 _PROXY_SCORE_RE = re.compile(r"(?<![\w.])[+-]\d+(?:\.\d+)?\b")
 _CONTRACT_POSITIONING_RE = re.compile(r"\b(?:relative\s+)?(?:put\s+|call\s+)?contract\s+positioning\b")
+_DIRECTION_WORD_RE = re.compile(r"\b(?:un)?supportive\b")
 _PAREN_RE = re.compile(r"\([^()\n]{0,80}\)")
+_PAREN_CONTENT_RE = re.compile(r"\(([^()]*)\)")
+# Closed grammar for a parenthetical that carries numbers only, e.g.
+# "(21% and 25% buy ratios)", "(21%/25%)", "(score +1.00)", "(-0.20)".
+_NUMERIC_PAREN_BODY = (r"(?:score\s+)?[+-]?\d+(?:\.\d+)?%?(?:\s*(?:/|&|and)\s*[+-]?\d+(?:\.\d+)?%?)*"
+                       r"(?:\s+(?:buy|sell)\s+ratios?)?")
+_NUMERIC_PAREN = r"\(" + _NUMERIC_PAREN_BODY + r"\)"
+# Literal parentheticals that the closed nonclaim grammars themselves define.
+_FIXED_PAREN_LITERALS = frozenset({"higher conviction", "lower conviction", "unverified", "calibration unverified"})
 
 
-def _strip_proxy_labels(clause: str) -> str:
-    """Remove GRID proxy labels and an open-interest description, never a claim."""
-    labelled = bool(_PROXY_LABEL_RE.search(clause))
-    stripped = _CONTRACT_POSITIONING_RE.sub("", _PROXY_LABEL_RE.sub("", clause))
-    if labelled and _PROXY_SCORE_RE.search(stripped) and not _ACTOR_SUBJECT_RE.search(stripped):
-        stripped = re.sub(r"\b(?:un)?supportive\b", "", stripped)
-    return stripped
+def _relaxed_spans(clause: str) -> list[tuple[int, int]]:
+    """Spans the actor-keyword check may ignore: GRID label nouns, never a predicate.
+
+    The clause is never rewritten; posture and every other rule read it as
+    written. Only these spans are discounted from the actor-keyword search.
+    """
+    spans = [m.span("label") for m in _PROXY_LABEL_RE.finditer(clause)]
+    actor = bool(_ACTOR_SUBJECT_RE.search(clause))
+    if not actor and not _POSTURE_ADJECTIVE_RE.search(clause):
+        spans += [m.span() for m in _CONTRACT_POSITIONING_RE.finditer(clause)]
+    if spans and not actor and _PROXY_SCORE_RE.search(clause) and _PROXY_LABEL_RE.search(clause):
+        spans += [m.span() for m in _DIRECTION_WORD_RE.finditer(clause)]
+    return spans
+
+
+def _actor_keyword_hit(clause: str) -> bool:
+    spans = _relaxed_spans(clause)
+    return any(not any(s <= m.start() and m.end() <= e for s, e in spans)
+               for m in _ACTOR_KEYWORD_RE.finditer(clause))
+
+
+def _parenthetical_reasons(clause: str, actor_context: bool) -> set[str]:
+    """Check every parenthetical on its own, so no grammar can hide a claim in one.
+
+    A numbers-only parenthetical (closed grammar), or the direction word of a
+    scored GRID label, carries no claim. Anything else gets the full clause
+    checks, plus the actor carry already open.
+    """
+    found: set[str] = set()
+    relaxed = _relaxed_spans(clause)
+    for match in _PAREN_CONTENT_RE.finditer(clause):
+        inner = match.group(1).strip()
+        if not inner or re.fullmatch(_NUMERIC_PAREN_BODY, inner) or inner in _FIXED_PAREN_LITERALS:
+            continue
+        # "(supportive)" after a scored GRID label is that label's direction word.
+        if _DIRECTION_WORD_RE.fullmatch(inner) and any(
+                s <= match.start(1) and match.end(1) <= e for s, e in relaxed):
+            continue
+        found.update(_check_claims(inner)["reasons"])
+        if actor_context and _actor_keyword_hit(inner) and not _actor_clause_nonclaim(inner):
+            found.add("unsupported_actor_interpretation")
+    return found
 
 
 def _publication_inference_nonclaim(clause: str) -> bool:
@@ -875,7 +928,7 @@ def _publication_inference_nonclaim(clause: str) -> bool:
     # drafts). Whole-clause only: a subject outside this closed list, or any
     # trailing words, still fail closed.
     lead = (r"(?:(?:though|but|yet)\s+)?(?:(?:it|this|this metric|this ratio|the ratio|"
-            r"the (?:spy )?put/call ratio|these|they|the insider/congressional ratios(?: \([^()]*\))?)\s+)?")
+            r"the (?:spy )?put/call ratio|these|they|the insider/congressional ratios(?: " + _NUMERIC_PAREN + r")?)\s+)?")
     return bool(
         re.fullmatch(lead + r"(?:does not|do not|cannot)\s+(?:measure|confirm|establish|prove)\s+" + targets, clause)
         or re.fullmatch(r"not\s+" + targets, clause)
@@ -910,6 +963,11 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
     must identify its structured source and direction with a matching amount.
     This is deliberately conservative, not a complete natural-language verifier.
     """
+    return _check_claims(text, flow_edges, actor_evidence)
+
+
+def _check_claims(text: str, flow_edges: list[dict[str, Any]] | None = None, actor_evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Implementation of check_publication_claims; also checks parentheticals."""
     normalized = _strip_publication_disclosures(_publication_normalized(text))
     reasons: set[str] = set()
     # Clause-level hit counts per reason code (observability only; no text).
@@ -938,7 +996,6 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
         # Remove only fixed nonclaim phrases, never a whole sentence containing
         # an unmeasured/unavailable adjective (which can precede a false claim).
         sentence = re.sub(r"\b(?:transfer amount (?:unmeasured|unavailable)|(?:unmeasured|unavailable) transfer amount|hedging intent unmeasured|realized vol(?:atility)? (?:is )?(?:unavailable|unmeasured)|hedge funds?|inflation hedge|(?:operating|free) cash flows?|(?:money )?flow engine)\b", "", sentence)
-        sentence = _strip_proxy_labels(sentence)
         if not sentence.strip():
             continue
         # A model observation never erases an earlier protected actor. Its
@@ -953,11 +1010,16 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
             r"driven by conflicting signals: strong trend \([+-]?\d+(?:\.\d+)?\)", sentence.strip()))
         sentiment_subject = bool(re.fullmatch(
             r"sentiment is (?:neutral|bullish|bearish)(?: \([+-]?\d+(?:\.\d+)?\))?", sentence.strip()))
+        # Parentheticals are checked on their own before any nonclaim exit, so
+        # an accepted denial or a kept-together parenthesis cannot carry a claim.
+        found.update(_parenthetical_reasons(sentence, actor_context))
         if inference_nonclaim:
             # A denial can still be the antecedent of a later unsupported
             # assertion. It grants no permission to a following amount/claim.
             flow_clause_context = flow_clause_context or bool(re.search(r"\bflow\b", sentence))
             intent_context = intent_context or bool(re.search(r"\b(?:hedg\w*|intent|initiation|protection)\b", sentence))
+            reasons.update(found)
+            reason_counts.update(found)
             continue
         if intent_context and re.match(
             r"^\s*(?:(?:but|and|however|yet|whereas)\s+)?(?:it|they|this|that|these|those|is|are)\b", sentence
@@ -970,7 +1032,7 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
             # named actor). Removed only by a whole-clause denial above.
             found.add("unsupported_positioning_posture")
         if (actor_context
-                and re.search(r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*|conviction|euphori\w*|exit\w*|caution\w*|cautious|defensiv\w*)\b", sentence)
+                and _actor_keyword_hit(sentence)
                 and not _actor_clause_nonclaim(sentence.strip())
                 and not _structure_clause_nonclaim(sentence)
                 and not model_nonclaim and not sentiment_continuation
@@ -992,7 +1054,7 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
             if not _reported_flow_clause_supported(sentence.strip(), reported):
                 found.add("unsupported_money_transfer")
         flow_clause_context = bool(flow_claim) or flow_clause_context
-        # Every early `continue` above precedes any finding in this clause.
+        # The only early `continue` after a finding merges it first (above).
         reasons.update(found)
         reason_counts.update(found)
     return {"passed": not reasons, "reasons": sorted(reasons),

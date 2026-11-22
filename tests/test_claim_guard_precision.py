@@ -231,3 +231,66 @@ def test_prompt_caveat_sentences_pass_the_guard() -> None:
                  sentence + " The positioning proxy score (+1.00) is supportive."]:
         result = check_publication_claims(text)
         assert result["passed"], (text, result["reasons"])
+
+
+# Security review of a902c304: two validator bypasses.
+# (1) A claim hidden in a parenthetical that a denial grammar or the
+#     parenthesis-aware splitter keeps inside the clause.
+# (2) Label normalization stripping the predicate the posture/actor rules need.
+PARENTHETICAL_BYPASSES = [
+    "The insider ratios (institutions are selling) do not establish conviction.",
+    "The insider/congressional ratios (institutions are distributing) do not establish institutional conviction.",
+    "The insider/congressional ratios (21% and institutions sold) do not establish institutional conviction.",
+    "(informed caution) though it does not measure buyer intent.",
+    "Though it does not measure buyer intent (informed caution).",
+    "Not a measure of hedging intent (dealers bought puts).",
+    "Not a measure of buyer initiation or intent (money flowed into tech).",
+    "Sentiment is neutral (institutions are selling).",
+    "Institutional distribution is unknown (defensive positioning).",
+    "The positioning proxy (+1.00) is supportive (flows rotated into tech).",
+]
+NORMALIZATION_BYPASSES = [
+    "Defensive relative contract positioning.",
+    "The ratio shows defensive relative contract positioning.",
+    "The put/call ratio implies bearish relative contract positioning.",
+    "Institutional positioning proxy is supportive.",
+    "The institutional positioning proxy is supportive (+1.00).",
+    "Institutions' positioning proxy is supportive (+1.00).",
+    "The positioning proxy, reflecting informed selling, scores +1.00.",
+    "The positioning proxy (reflecting informed selling) scores +1.00.",
+    "Retail traders hold the positioning proxy at +1.00 (supportive).",
+]
+
+
+@pytest.mark.parametrize("text", PARENTHETICAL_BYPASSES + NORMALIZATION_BYPASSES)
+def test_security_review_bypasses_are_blocked(text: str) -> None:
+    assert not check_publication_claims(text)["passed"]
+
+
+@pytest.mark.parametrize("text", [
+    "The insider/congressional ratios (21% and 25% buy ratios) do not establish institutional conviction.",
+    "The insider/congressional ratios (21%/25%) do not establish institutional distribution.",
+    "No specific institutional distribution or accumulation is evidenced. The positioning proxy scores +1.00 (supportive).",
+    "No specific institutional distribution or accumulation is evidenced. The dark pool proxy (-0.20) is unsupportive.",
+])
+def test_numeric_parentheticals_and_scored_labels_still_pass(text: str) -> None:
+    result = check_publication_claims(text)
+    assert result["passed"], result["reasons"]
+
+
+def test_denial_lead_parenthetical_is_a_closed_numeric_grammar() -> None:
+    from ollama.number_grounding import _publication_inference_nonclaim
+
+    ok = "the insider/congressional ratios (21% & 25% buy ratios) do not establish institutional conviction"
+    assert _publication_inference_nonclaim(ok)
+    for inner in ("institutions are selling", "21% & institutions sold", "see note", "buy ratios"):
+        clause = f"the insider/congressional ratios ({inner}) do not establish institutional conviction"
+        assert not _publication_inference_nonclaim(clause), clause
+
+
+def test_posture_reads_the_clause_as_written() -> None:
+    assert "unsupported_positioning_posture" in check_publication_claims(
+        "Defensive relative contract positioning dominates.")["reasons"]
+    # Without a posture adjective the open-interest description stays a noun.
+    assert check_publication_claims(
+        "Institutional distribution is unknown. Watch for changes in relative contract positioning.")["passed"]
