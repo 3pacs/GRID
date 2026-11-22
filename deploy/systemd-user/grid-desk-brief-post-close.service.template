@@ -1,0 +1,31 @@
+# TEMPLATE. placement: pinned-checkout user unit (see deploy/systemd-user/README.md).
+# The post-close desk brief (3pacs/GRID#1164, docs/reference/DESK_BRIEF.md). NOT INSTALLED: the owner
+# decides when it runs. It reads the desk's records read-only and writes one private file per
+# session (0600, in a 0700 folder). It sends nothing and places no order.
+#
+# Pinned, like grid-desk-receipts: a brief is written once and read beside earlier briefs, so what
+# it says must not change because main moved. It moves only when a person moves @CODE@.
+#
+# Install (as grid, no sudo; linger is on), from a pinned checkout made under umask 022:
+#   sed "s#@CODE@#<pinned checkout>#g" deploy/systemd-user/grid-desk-brief-post-close.service.template \
+#       > ~/.config/systemd/user/grid-desk-brief-post-close.service
+#   cp deploy/systemd-user/grid-desk-brief-post-close.timer.template ~/.config/systemd/user/grid-desk-brief-post-close.timer
+#   systemctl --user daemon-reload && systemctl --user enable --now grid-desk-brief-post-close.timer
+[Unit]
+Description=GRID desk brief, post-close (read-only on sources, one private file per session)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@CODE@
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DESK_BRIEF_DIR=/data/agent-home/anikdang/desk-brief-data
+Environment=DESK_BRIEF_PYTHON=/data/grid_v4/grid_venv-314/bin/python
+Environment=DESK_BRIEF_NARRATE=0
+ExecStart=/usr/bin/flock -n /tmp/grid-desk-brief.lock /bin/bash @CODE@/scripts/desk_brief_run.sh post_close
+SuccessExitStatus=2
+TimeoutStartSec=10min
+Nice=10
+StandardOutput=journal
+StandardError=journal

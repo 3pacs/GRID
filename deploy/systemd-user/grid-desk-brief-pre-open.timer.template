@@ -1,0 +1,15 @@
+# TEMPLATE. See grid-desk-brief-pre-open.service.template.
+# Weekdays 09:01 New York, one minute after the brief's clock (30 minutes before the open), so a timer
+# that fires a moment early is not refused. On a holiday the next session's clock is still ahead: the
+# run refuses (exit 2) and writes nothing. Live reads (Records, GEX state) are used up to 10 minutes
+# after the clock; the gex-trader shadow run starts at 09:25.
+[Unit]
+Description=Write the GRID pre-open desk brief
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:01:00 America/New_York
+Persistent=false
+Unit=grid-desk-brief-pre-open.service
+
+[Install]
+WantedBy=timers.target
