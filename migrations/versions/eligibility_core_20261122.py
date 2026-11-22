@@ -1,33 +1,36 @@
-"""Turn core market and flow features model-eligible, and astrological ones off, keeping a pre-image (#1301).
+"""The append-only change log for ``feature_registry.model_eligible`` (#1301). It changes no flag.
 
 Revision ID: eligibility_core_20261122
-Revises: agent_report_ask_checks_20261122
+Revises: regime_history_revs_20261122
 Create Date: 2026-11-22 00:00:00.000000
 
-DO NOT MERGE before the order agreed for #1301:
-1. the Oracle polarity fix (claude/fp-oracle-polarity-20261122) is merged and deployed;
-2. auto_regime binds its own declared sources and has hysteresis (#1307).
+``feature_registry.model_eligible`` is a global switch read by the Oracle, inference, discovery, feature
+selection and the auto_regime BUY gate, and every deploy runs ``alembic upgrade head``. So this migration
+flips nothing: a deploy only creates the place where a change is recorded. The flags change only when an
+operator runs ``scripts/apply_eligibility_change.py --apply``, which refuses until the Oracle polarity fix
+and auto_regime's own bindings plus hysteresis (#1307) are in the deployed code, and refuses unless it is
+connected as this table's owner (migration authority).
 
-``feature_registry.model_eligible`` is a global switch read by the Oracle,
-inference, discovery, feature selection and the auto_regime BUY gate, and every
-deploy runs ``alembic upgrade head``. This migration therefore changes all of
-those consumers at once.
+What it creates:
 
-Why: the retired ``scripts/fix_model_eligible.py`` set ids 1..25 FALSE. That
-switched off vix_spot (id 11) and yld_curve_2s10s (id 1) although both are
-current, and on griddb the auto_regime stress index runs on 6 inputs with no
-VIX or curve. Meanwhile ``scripts/backfill_celestial_ephemeris.py`` registered
-ephemeris rows (dated to 2100) model-eligible.
+* ``feature_eligibility_changes``: one row per flag a run changed (feature id and name, old and new flag),
+  grouped by ``change_set`` (one uuid per run). ``action`` is ``apply`` or ``rollback``; a rollback row
+  names the change set it restores in ``rolls_back``. ``recorded_by`` is the role that wrote it.
+* Triggers that refuse UPDATE, DELETE and TRUNCATE on it (append-only).
+* Privileges: nothing for PUBLIC; the application role ``grid`` gets SELECT only (no INSERT, no sequence
+  use), so the application cannot write a pre-image that a rollback would later trust. The grant first
+  revokes everything, so default privileges cannot widen it.
 
-What it does:
-* ``feature_eligibility_changes`` (append-only) records the pre-image of every
-  row it changes: id, name, old and new flag, which migration, when.
-* It turns the listed core features on and the astrological ones off. Both lists
-  touch only rows that are not deprecated and whose flag actually differs.
-* Downgrade restores each changed row's old flag from that pre-image, so a
-  rollback never guesses, and it records the restore as well.
+When the role running this migration is ``grid`` itself (the deploy hook sources the application's env),
+``grid`` owns the table and no grant can stop it writing. The migration still succeeds and logs a warning;
+``scripts/apply_eligibility_change.py`` then refuses every write until a superuser moves the ownership
+(a dry run prints the statements).
+
+Downgrade drops the table only while it is empty. Once any change is recorded it refuses, because the
+rows are the only record of what each flag was before.
 """
 
+import logging
 from typing import Sequence, Union
 
 from alembic import op
@@ -36,37 +39,32 @@ from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
 revision: str = "eligibility_core_20261122"
-down_revision: Union[str, Sequence[str], None] = "agent_report_ask_checks_20261122"
+down_revision: Union[str, Sequence[str], None] = "regime_history_revs_20261122"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-CORE = (
-    "vix_spot", "vix9d_spot", "vix3m_spot", "vvix", "implied_correlation_3m",
-    "yld_curve_2s10s", "yld_curve_3m10y", "fed_funds_rate",
-    "finra_dix_sp500", "finra_short_volume_ratio_market",
-    "finra_short_volume_ratio_spy", "finra_short_volume_ratio_qqq",
-    "finra_short_volume_ratio_iwm",
-)
-ASTRO = (
-    "days_to_full_moon", "days_to_new_moon", "jupiter_saturn_angle",
-    "lunar_eclipse_proximity", "lunar_illumination", "lunar_phase",
-    "mars_volatility_index", "mercury_retrograde", "planetary_stress_index",
-    "solar_eclipse_proximity", "venus_cycle_phase", "chinese_element",
-    "chinese_lunar_month", "chinese_yin_yang", "chinese_zodiac_year",
-    "dasha_cycle_phase", "feng_shui_flying_star", "iching_hexagram_of_day",
-    "nakshatra_index", "nakshatra_quality", "rahu_ketu_axis", "tithi",
-)
+log = logging.getLogger("alembic.runtime.migration")
+
+# The application role. Tests replace it with a role they create (the test server's ``grid`` is a superuser).
+APP_ROLE = "grid"
 
 CHANGES_TABLE = """
 CREATE TABLE IF NOT EXISTS feature_eligibility_changes (
-    id               BIGSERIAL PRIMARY KEY,
-    feature_id       INTEGER NOT NULL,
-    name             TEXT NOT NULL,
-    old_eligible     BOOLEAN NOT NULL,
-    new_eligible     BOOLEAN NOT NULL,
-    migration        TEXT NOT NULL,
-    direction        TEXT NOT NULL CHECK (direction IN ('upgrade', 'downgrade')),
-    changed_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    id            BIGSERIAL PRIMARY KEY,
+    change_set    UUID NOT NULL,
+    action        TEXT NOT NULL CHECK (action IN ('apply', 'rollback')),
+    rolls_back    UUID,
+    feature_id    INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    old_eligible  BOOLEAN NOT NULL,
+    new_eligible  BOOLEAN NOT NULL,
+    plan          TEXT NOT NULL CHECK (btrim(plan) <> ''),
+    recorded_by   TEXT NOT NULL DEFAULT current_user,
+    changed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT feature_eligibility_changes_is_a_change CHECK (old_eligible IS DISTINCT FROM new_eligible),
+    CONSTRAINT feature_eligibility_changes_rollback_names_its_set
+        CHECK ((action = 'rollback') = (rolls_back IS NOT NULL)),
+    CONSTRAINT feature_eligibility_changes_one_row_per_feature UNIQUE (change_set, feature_id)
 )
 """
 
@@ -79,6 +77,8 @@ END;
 $$ LANGUAGE plpgsql
 """
 
+TRIGGER_NAMES = ("feature_eligibility_changes_no_mutation", "feature_eligibility_changes_no_truncate")
+
 TRIGGERS = (
     "DROP TRIGGER IF EXISTS feature_eligibility_changes_no_mutation ON feature_eligibility_changes",
     """CREATE TRIGGER feature_eligibility_changes_no_mutation
@@ -90,62 +90,44 @@ TRIGGERS = (
     FOR EACH STATEMENT EXECUTE FUNCTION feature_eligibility_changes_append_only()""",
 )
 
+# The role name is bound (set_config) and quoted server-side with format('%I'); no SQL is built in Python.
+BIND_APP_ROLE = text("SELECT set_config('grid.eligibility_app_role', :role, true)")
+
 GRANTS = """
 DO $$
+DECLARE
+    app   TEXT := current_setting('grid.eligibility_app_role');
+    owner OID  := (SELECT relowner FROM pg_class WHERE oid = 'feature_eligibility_changes'::regclass);
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grid') THEN
-        EXECUTE 'GRANT SELECT, INSERT ON feature_eligibility_changes TO grid';
-        EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE feature_eligibility_changes_id_seq TO grid';
+    REVOKE ALL ON feature_eligibility_changes FROM PUBLIC;
+    REVOKE ALL ON SEQUENCE feature_eligibility_changes_id_seq FROM PUBLIC;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = app) AND NOT pg_has_role(app, owner, 'MEMBER') THEN
+        EXECUTE format('REVOKE ALL ON feature_eligibility_changes FROM %I', app);
+        EXECUTE format('REVOKE ALL ON SEQUENCE feature_eligibility_changes_id_seq FROM %I', app);
+        EXECUTE format('GRANT SELECT ON feature_eligibility_changes TO %I', app);
     END IF;
 END
 $$
 """
 
-# Whole literal statements with bound values (.claude/rules/security.md): each records the pre-image and
-# flips the flag in one statement. Only non-deprecated rows whose flag differs are touched, so a re-run
-# changes and records nothing.
-ENABLE_CORE = text("""
-WITH targets AS (
-    SELECT id, name, model_eligible FROM feature_registry
-    WHERE deprecated_at IS NULL AND model_eligible IS DISTINCT FROM TRUE AND name = ANY(:names)
-    FOR UPDATE
-), recorded AS (
-    INSERT INTO feature_eligibility_changes (feature_id, name, old_eligible, new_eligible, migration, direction)
-    SELECT id, name, model_eligible, TRUE, :revision, 'upgrade' FROM targets
-)
-UPDATE feature_registry f SET model_eligible = TRUE FROM targets t WHERE f.id = t.id
+APP_OWNS_THE_LOG = text("""
+SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :role)
+   AND pg_has_role(:role, (SELECT relowner FROM pg_class WHERE oid = 'feature_eligibility_changes'::regclass),
+                   'MEMBER')
 """)
 
-DISABLE_ASTRO = text("""
-WITH targets AS (
-    SELECT id, name, model_eligible FROM feature_registry
-    WHERE deprecated_at IS NULL AND model_eligible IS DISTINCT FROM FALSE
-      AND (name LIKE 'ephemeris%' OR name = ANY(:names))
-    FOR UPDATE
-), recorded AS (
-    INSERT INTO feature_eligibility_changes (feature_id, name, old_eligible, new_eligible, migration, direction)
-    SELECT id, name, model_eligible, FALSE, :revision, 'upgrade' FROM targets
-)
-UPDATE feature_registry f SET model_eligible = FALSE FROM targets t WHERE f.id = t.id
-""")
-
-RESTORE = text("""
-WITH changed AS (
-    SELECT DISTINCT ON (feature_id) feature_id, name, old_eligible
-    FROM feature_eligibility_changes
-    WHERE migration = :revision AND direction = 'upgrade'
-    ORDER BY feature_id, id DESC
-), restore AS (
-    SELECT c.feature_id, c.name, c.old_eligible, f.model_eligible
-    FROM changed c JOIN feature_registry f ON f.id = c.feature_id
-    WHERE f.model_eligible IS DISTINCT FROM c.old_eligible
-    FOR UPDATE OF f
-), recorded AS (
-    INSERT INTO feature_eligibility_changes (feature_id, name, old_eligible, new_eligible, migration, direction)
-    SELECT feature_id, name, model_eligible, old_eligible, :revision, 'downgrade' FROM restore
-)
-UPDATE feature_registry f SET model_eligible = r.old_eligible FROM restore r WHERE f.id = r.feature_id
-""")
+REFUSE_DOWNGRADE_WITH_HISTORY = """
+DO $$
+BEGIN
+    IF to_regclass('feature_eligibility_changes') IS NOT NULL THEN
+        IF EXISTS (SELECT 1 FROM feature_eligibility_changes) THEN
+            RAISE EXCEPTION 'downgrade refused: feature_eligibility_changes holds recorded flag changes, '
+                            'and dropping it would destroy the only record of each flag''s previous value';
+        END IF;
+    END IF;
+END
+$$
+"""
 
 
 def upgrade() -> None:
@@ -153,11 +135,18 @@ def upgrade() -> None:
     op.execute(APPEND_ONLY)
     for statement in TRIGGERS:
         op.execute(statement)
+    op.execute(BIND_APP_ROLE.bindparams(role=APP_ROLE))
     op.execute(GRANTS)
-    op.execute(ENABLE_CORE.bindparams(names=list(CORE), revision=revision))
-    op.execute(DISABLE_ASTRO.bindparams(names=list(ASTRO), revision=revision))
+    if op.get_context().as_sql:  # offline (--sql) mode has no connection to ask
+        return
+    if op.get_bind().execute(APP_OWNS_THE_LOG, {"role": APP_ROLE}).scalar():
+        log.warning(
+            "feature_eligibility_changes: the application role %s owns it (or is a member of its owner), so it "
+            "can write pre-images. scripts/apply_eligibility_change.py refuses every write until a superuser "
+            "moves the ownership; its dry run prints the statements.", APP_ROLE)
 
 
 def downgrade() -> None:
-    # Restore exactly what this migration changed; the change log stays (it is the audit trail).
-    op.execute(RESTORE.bindparams(revision=revision))
+    op.execute(REFUSE_DOWNGRADE_WITH_HISTORY)
+    op.execute("DROP TABLE IF EXISTS feature_eligibility_changes")
+    op.execute("DROP FUNCTION IF EXISTS feature_eligibility_changes_append_only()")

@@ -232,12 +232,14 @@ jobs:
             exit 1
           fi
 
-      # Eligibility migration (eligibility_core_20261122, #1301): proves on real
-      # PostgreSQL that the upgrade records a pre-image for exactly the rows it
-      # changes and is a no-op when re-run, that downgrade restores each old flag
-      # from that pre-image, and that the change log is append-only. A skip
-      # must fail this step.
-      - name: Eligibility migration PostgreSQL contract
+      # regime_history keeps every version (#1302, regime_history_revs_20261122):
+      # proves on real PostgreSQL that a second default write leaves the row
+      # unchanged, every change keeps the superseded version in
+      # regime_history_revisions (an unattributed one, like the pinned
+      # scheduler's upsert, is archived as such), TRUNCATE and obs_date changes
+      # are refused, revisions are append-only, the readers see the current
+      # label, and downgrade refuses while revisions exist. A skip must fail.
+      - name: regime_history revisions PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
           DB_PASSWORD: testpass
@@ -245,9 +247,32 @@ jobs:
           TESTING: "true"
         run: |
           set -o pipefail
-          python -m pytest tests/test_eligibility_core_migration_pg.py -q -rA | tee /tmp/grid-eligibility-migration-pg.txt
+          python -m pytest tests/test_regime_history_revisions.py -q -rA | tee /tmp/grid-regime-history-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-regime-history-pg.txt; then
+            echo "::error::regime_history revisions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Eligibility change log (eligibility_core_20261122 +
+      # scripts/apply_eligibility_change.py, #1301): proves on real PostgreSQL
+      # that the migration creates only the append-only log and flips no flag,
+      # that the application role can read it but never write a pre-image,
+      # that --apply refuses without the Oracle polarity and auto_regime
+      # hysteresis prerequisites or without migration authority, and that a
+      # rollback restores only its own change set and refuses any divergence
+      # (rolling back set 2 leaves set 1's vix_spot enabled). A skip must fail.
+      - name: Eligibility change log PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_eligibility_core_migration_pg.py tests/test_apply_eligibility_change.py \
+            -q -rA | tee /tmp/grid-eligibility-migration-pg.txt
           if grep -q "SKIPPED" /tmp/grid-eligibility-migration-pg.txt; then
-            echo "::error::Eligibility migration PostgreSQL contract was skipped"
+            echo "::error::Eligibility change log PostgreSQL contract was skipped"
             exit 1
           fi
 
