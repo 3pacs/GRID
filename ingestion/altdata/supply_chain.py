@@ -57,6 +57,269 @@ _FREIGHTOS_RETIRED: bool = True
 
 # Drewry World Container Index — public page
 _DREWRY_URL: str = "https://www.drewry.co.uk/supply-chain-advisors/supply-chain-expertise/world-container-index-assessed-by-drewry"
+_DREWRY_WCI_MIN: float = 100.0
+_DREWRY_WCI_MAX: float = 25_000.0
+
+_DREWRY_ORDINAL_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
+_DREWRY_WEEKDAY_RE = re.compile(
+    r"^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s+",
+    re.IGNORECASE,
+)
+_DREWRY_DATE_FORMATS: tuple[str, ...] = (
+    "%Y-%m-%d",
+    "%d %b %Y",
+    "%d %b %y",
+    "%d %B %Y",
+    "%d %B %y",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%b %d %Y",
+    "%B %d %Y",
+    "%d-%b-%Y",
+    "%d-%b-%y",
+    "%d/%m/%Y",
+    "%Y/%m/%d",
+)
+_DREWRY_DATE_TOKEN = (
+    r"(?:\d{4}-\d{2}-\d{2}"
+    r"|\d{1,2}(?:st|nd|rd|th)?[\s-]+[A-Za-z]{3,9}[\s-]+\d{2,4}"
+    r"|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})"
+)
+_DREWRY_ASSESSMENT_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?:assessed(?:\s+on)?|published(?:\s+on)?|updated(?:\s+on)?|"
+        r"week\s+ending|as\s+of)\s*:?\s*"
+        r"(?:(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s*)?"
+        rf"({_DREWRY_DATE_TOKEN})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:World\s+Container\s+Index|WCI)\s*[-–—:,|]\s*"
+        r"(?:(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s*)?"
+        rf"({_DREWRY_DATE_TOKEN})",
+        re.IGNORECASE,
+    ),
+)
+_DREWRY_PROSE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?:WCI|World\s+Container\s+Index|composite)[^$]{0,200}\$\s*([\d,]+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:WCI|World\s+Container\s+Index|composite)[^0-9]{0,80}"
+        r"([\d,]+(?:\.\d+)?)\s*(?:USD|per\s*40[- ]?ft|/FEU)",
+        re.IGNORECASE,
+    ),
+)
+_DREWRY_USD_CELL_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)")
+
+
+def _parse_drewry_date(raw: str) -> date | None:
+    """Parse a Drewry assessment date string; returns None if unparseable."""
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().replace("\xa0", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = _DREWRY_WEEKDAY_RE.sub("", cleaned)
+    cleaned = _DREWRY_ORDINAL_RE.sub(r"\1", cleaned)
+    for fmt in _DREWRY_DATE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_drewry_usd(raw: str) -> float | None:
+    """Parse a Drewry USD/FEU cell and check plausible index bounds."""
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().replace("\xa0", " ")
+    if not cleaned or "%" in cleaned or cleaned in {"-", "—", "N/A", "n/a"}:
+        return None
+    match = _DREWRY_USD_CELL_RE.search(cleaned)
+    if match is None:
+        return None
+    try:
+        val = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    if not (_DREWRY_WCI_MIN <= val <= _DREWRY_WCI_MAX):
+        return None
+    return val
+
+
+def _parse_drewry_wci_html(
+    html: str,
+    *,
+    pull_date: date | None = None,
+) -> list[dict[str, Any]]:
+    """Parse Drewry WCI ``(date, value)`` observations from page HTML.
+
+    Requires an explicit assessment date from the page (HTML table, paired
+    chart date+value series, or visible assessment prose). Never substitutes
+    ``date.today()`` or synthetic weekly offsets, and refuses any
+    ``obs_date`` later than ``pull_date`` (fail closed).
+    """
+    if not html or not isinstance(html, str):
+        log.warning("Drewry WCI: empty HTML response — writing nothing (fail closed)")
+        return []
+
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log.warning("Drewry WCI: BeautifulSoup not installed — writing nothing (fail closed)")
+        return []
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Drewry WCI: HTML parse failed ({e}) — writing nothing", e=str(exc))
+        return []
+
+    effective_pull_date = pull_date or date.today()
+    candidates: dict[date, float] = {}
+
+    # 1. Structured HTML table (standard: rows=dates; or transposed: cols=dates)
+    for table in soup.find_all("table"):
+        raw_rows = [
+            [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            for tr in table.find_all("tr")
+        ]
+        raw_rows = [r for r in raw_rows if len(r) >= 2]
+        if len(raw_rows) < 2:
+            continue
+
+        headers = raw_rows[0]
+        headers_lower = [h.lower() for h in headers]
+
+        # Standard orientation: header names a Composite/WCI column, rows are dates
+        comp_col = next(
+            (
+                i
+                for i, h in enumerate(headers_lower)
+                if "composite" in h or h == "wci" or "world container index" in h
+            ),
+            None,
+        )
+        if comp_col is not None:
+            date_col = next(
+                (i for i, h in enumerate(headers_lower) if "date" in h or "week" in h),
+                0,
+            )
+            for row in raw_rows[1:]:
+                if max(date_col, comp_col) >= len(row):
+                    continue
+                obs_date = _parse_drewry_date(row[date_col])
+                val = _parse_drewry_usd(row[comp_col])
+                if obs_date is not None and val is not None:
+                    candidates[obs_date] = val
+            if candidates:
+                break
+
+        # Transposed orientation: header cells are assessment dates, Composite is a row
+        date_cols = {
+            i: d
+            for i, h in enumerate(headers)
+            if (d := _parse_drewry_date(h)) is not None
+        }
+        if date_cols:
+            for row in raw_rows[1:]:
+                label = row[0].lower()
+                if "composite" in label or label == "wci" or "world container index" in label:
+                    for col_idx, obs_date in date_cols.items():
+                        if col_idx < len(row):
+                            val = _parse_drewry_usd(row[col_idx])
+                            if val is not None:
+                                candidates[obs_date] = val
+                    break
+            if candidates:
+                break
+
+    # 2. Embedded chart <script> with EXPLICIT paired dates (never unlabeled arrays)
+    if not candidates:
+        labels_re = re.compile(r"(?:labels|categories|dates)\s*[=:]\s*\[([^\]]+)\]", re.DOTALL)
+        values_re = re.compile(r"(?:data|series|values)\s*[=:]\s*\[([^\]]+)\]", re.DOTALL)
+        for script in soup.find_all("script"):
+            script_text = script.string or script.get_text() or ""
+            if not script_text:
+                continue
+            label_match = labels_re.search(script_text)
+            value_match = values_re.search(script_text)
+            if label_match and value_match:
+                raw_dates = [
+                    d.strip().strip("\"'") for d in label_match.group(1).split(",") if d.strip()
+                ]
+                raw_vals = [
+                    v.strip().strip("\"'") for v in value_match.group(1).split(",") if v.strip()
+                ]
+                if raw_dates and len(raw_dates) == len(raw_vals):
+                    parsed_pairs: dict[date, float] = {}
+                    for raw_d, raw_v in zip(raw_dates, raw_vals):
+                        obs_date = _parse_drewry_date(raw_d)
+                        val = _parse_drewry_usd(raw_v)
+                        if obs_date is not None and val is not None:
+                            parsed_pairs[obs_date] = val
+                    if len(parsed_pairs) == len(raw_dates):
+                        candidates.update(parsed_pairs)
+                        break
+
+    # 3. Visible prose text WITH an explicit assessment date
+    if not candidates:
+        time_date: date | None = None
+        for time_tag in soup.find_all("time"):
+            dt_attr = time_tag.get("datetime")
+            if isinstance(dt_attr, str):
+                time_date = _parse_drewry_date(dt_attr[:10])
+            if time_date is None:
+                time_date = _parse_drewry_date(time_tag.get_text(" ", strip=True))
+            if time_date is not None:
+                break
+
+        for noise in soup.find_all(["script", "style", "noscript"]):
+            noise.decompose()
+        visible_text = soup.get_text(" ", strip=True)
+
+        assessment_date: date | None = None
+        for pattern in _DREWRY_ASSESSMENT_DATE_PATTERNS:
+            match = pattern.search(visible_text)
+            if match:
+                assessment_date = _parse_drewry_date(match.group(1))
+                if assessment_date is not None:
+                    break
+        if assessment_date is None:
+            assessment_date = time_date
+
+        if assessment_date is not None:
+            for pattern in _DREWRY_PROSE_VALUE_PATTERNS:
+                val_match = pattern.search(visible_text)
+                if val_match:
+                    val = _parse_drewry_usd(val_match.group(1))
+                    if val is not None:
+                        candidates[assessment_date] = val
+                        break
+
+    data_points: list[dict[str, Any]] = []
+    for obs_date in sorted(candidates):
+        if obs_date > effective_pull_date:
+            log.warning(
+                "Drewry WCI: refusing future obs_date {d} > pull_date {p}",
+                d=obs_date.isoformat(),
+                p=effective_pull_date.isoformat(),
+            )
+            continue
+        data_points.append({
+            "date": obs_date.isoformat(),
+            "value": candidates[obs_date],
+        })
+
+    if not data_points:
+        log.warning(
+            "Drewry WCI: could not parse assessment date and composite value "
+            "from page — writing nothing (fail closed)"
+        )
+
+    return data_points
 
 # FRED series for ISM manufacturing supply chain indicators
 ISM_FRED_SERIES: dict[str, dict[str, str]] = {
@@ -517,59 +780,7 @@ class SupplyChainPuller(BasePuller):
             timeout=_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        html = resp.text
-
-        data_points: list[dict[str, Any]] = []
-
-        try:
-            # Look for structured data in the page (JSON-LD or embedded data)
-            # Drewry embeds chart data in script tags
-            script_pattern = re.compile(
-                r'(?:data|series|values)\s*[=:]\s*\[([^\]]+)\]',
-                re.DOTALL,
-            )
-            matches = script_pattern.findall(html)
-
-            for match in matches:
-                # Try to parse as comma-separated values
-                try:
-                    values = [float(v.strip().strip('"\'')) for v in match.split(",") if v.strip()]
-                    if len(values) > 5 and all(100 < v < 20000 for v in values[:5]):
-                        # Likely container index values (typical range $500-$15000)
-                        today = date.today()
-                        for i, val in enumerate(values[-4:]):  # Last 4 weeks
-                            obs_date = today - timedelta(weeks=len(values[-4:]) - 1 - i)
-                            data_points.append({
-                                "date": obs_date.isoformat(),
-                                "value": val,
-                            })
-                        break
-                except (ValueError, TypeError):
-                    continue
-
-            # Fallback: look for a prominent number in a known pattern
-            if not data_points:
-                wci_pattern = re.compile(
-                    r'(?:WCI|World Container Index|composite)[^0-9]*'
-                    r'\$?\s*([\d,]+(?:\.\d+)?)',
-                    re.IGNORECASE,
-                )
-                wci_match = wci_pattern.search(html)
-                if wci_match:
-                    try:
-                        val = float(wci_match.group(1).replace(",", ""))
-                        data_points.append({
-                            "date": date.today().isoformat(),
-                            "value": val,
-                        })
-                    except (ValueError, TypeError):
-                        pass
-
-        except Exception as exc:
-            log.warning(
-                "Drewry WCI parse failed: {e}",
-                e=str(exc),
-            )
+        data_points = _parse_drewry_wci_html(resp.text, pull_date=date.today())
 
         log.info(
             "Drewry WCI: parsed {n} data points",
@@ -609,6 +820,9 @@ class SupplyChainPuller(BasePuller):
             }
 
         inserted = 0
+        rejected_future = 0
+        valid_points = 0
+        pull_date = date.today()
         series_id = "container_index"
 
         with self.engine.begin() as conn:
@@ -617,9 +831,19 @@ class SupplyChainPuller(BasePuller):
             for point in data:
                 try:
                     obs_date = date.fromisoformat(point["date"][:10])
-                except (ValueError, KeyError):
+                except (ValueError, KeyError, TypeError):
                     continue
 
+                if obs_date > pull_date:
+                    log.warning(
+                        "Drewry WCI: refusing future obs_date {d} > pull_date {p}",
+                        d=obs_date.isoformat(),
+                        p=pull_date.isoformat(),
+                    )
+                    rejected_future += 1
+                    continue
+
+                valid_points += 1
                 if obs_date < start_date or obs_date in existing:
                     continue
 
@@ -639,7 +863,16 @@ class SupplyChainPuller(BasePuller):
                         "unit": "USD/FEU",
                     },
                 )
+                existing.add(obs_date)
                 inserted += 1
+
+        if rejected_future > 0 and valid_points == 0:
+            return {
+                "source": "drewry",
+                "status": "PARTIAL",
+                "rows_inserted": 0,
+                "errors": ["All Drewry WCI dates were later than pull_date"],
+            }
 
         log.info("Drewry WCI: {n} rows inserted", n=inserted)
         return {
