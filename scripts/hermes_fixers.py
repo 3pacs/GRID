@@ -243,6 +243,16 @@ _REPEATED_FAILURES: dict[str, list[Any]] = {}
 # already repaired was diagnosed and retried until its next scheduled run
 # (OppInsights and Unusual_Whales, 2026-11-08).
 _REPAIR_RECOVERED_AT: dict[str, datetime] = {}
+# source_key -> latest failure time already reported for a source no repair
+# can be routed to (guest pull_log names, see _guest_pull_log_names): one
+# warning and one operator issue per new failure per process. Process memory
+# only, like the other tables here: a restart (every deploy) forgets it, so
+# the first pass after one warns again for a failure still in the 24 h window.
+# The operator issue is deduplicated durably by log_issue instead (no second
+# unresolved row with the same source and title within
+# OPERATOR_ISSUE_DEDUPE_HOURS). Not persisted: the cost of a restart is one
+# log line per failing guest, and there is one guest today.
+_UNROUTED_FAILURES_REPORTED: dict[str, str | None] = {}
 
 # Exception classes that mean "this retry will fail the same way next time"
 # (a code or wiring defect, not a transient provider condition). TypeError
@@ -437,6 +447,81 @@ def _held_source_names() -> dict[str, str]:
         for alias in (name, catalog_name_for(name), SMART_PULL_LOG_PREFIX + name):
             held[_normalize_source_key(alias)] = reason
     return held
+
+
+def _guest_pull_log_names() -> frozenset[str]:
+    """pull_log names of runs that write under another registry entry's catalog row.
+
+    ``smart:finra_dix`` logs its runs with FINRA_SHORT_VOLUME's source_id
+    (smart_scheduler.REGISTRY_CATALOG_NAMES). Naming a run by its catalog
+    row read a DIX failure as a short-volume failure, repaired by re-running
+    the short-volume puller (2026-11-18 07:53Z), and a DIX success as the
+    short-volume puller's recovery. The failed-pull query names these runs
+    by their own pull_log name on both sides.
+
+    Lazy (ingestion.source_freshness imports the scheduler registry) and not
+    caught: without the list the query would misattribute again, so a failed
+    import fails the pass, which the operator logs.
+    """
+    from ingestion.source_freshness import GUEST_PULL_LOG_NAMES
+
+    return GUEST_PULL_LOG_NAMES
+
+
+# Why a guest run's failure gets no repair. For smart:finra_dix:
+# FINRADixPuller declares SOURCE_NAME = "FINRA_SHORT_VOLUME", so routing a
+# retry to it would need an exception to _retry_target_matches, which exists
+# so no repair runs a class under another dataset's name. Nor would a retry
+# fit: DIX makes one Tiingo call per S&P 500 member, cannot be stopped
+# (pull_recent takes no should_continue) and is scheduled with
+# timeout_s=600, against PER_SOURCE_REPAIR_SECONDS=60 and a 180 s pass
+# budget. Its own daily run (pull_recent, weekdays_back=5: the ten calendar
+# days before the anchor date) recomputes every trade date in that window
+# that has no row, so a missed day is refilled without Hermes.
+UNROUTED_GUEST_REASON = (
+    "its runs write under another registry entry's source_catalog row and its "
+    "puller declares that row's SOURCE_NAME, so no retry handler can claim it; "
+    "its own scheduled run is its repair"
+)
+
+
+def _report_unrouted_failures(
+    engine: Any, unrouted: list[dict[str, Any]], state: Any, dry_run: bool,
+) -> None:
+    """Report failures no repair can be routed to, once per new failure per process.
+
+    They are not diagnosed, retried or escalated, so they take no LLM slot,
+    no repair budget and no CRITICAL issue. A new failure (a later
+    ``last_fail``) is reported again; repeats of one failure are silent
+    until the process restarts (``_UNROUTED_FAILURES_REPORTED`` is process
+    memory; log_issue deduplicates the operator issue in the database).
+    A dry run reports without recording.
+    """
+    for info in unrouted:
+        source = info["source"]
+        key = _normalize_source_key(source)
+        stamp = info.get("last_fail")
+        with _REPAIR_SCHEDULE_LOCK:
+            seen = key in _UNROUTED_FAILURES_REPORTED and _UNROUTED_FAILURES_REPORTED[key] == stamp
+            if not seen and not dry_run:
+                _UNROUTED_FAILURES_REPORTED[key] = stamp
+        if seen:
+            continue
+        error = (info.get("last_error") or "").strip().replace("\n", " ")[:160] or "no error message"
+        log.warning(
+            "Not repairing {s} — no retry handler: {r} (latest failure {t}: {e})",
+            s=source, r=UNROUTED_GUEST_REASON, t=stamp or "?", e=error,
+        )
+        if dry_run:
+            continue
+        log_issue(
+            engine, category="ingestion", severity="WARNING",
+            source=source,
+            title=f"No Hermes pull handler — {source}",
+            detail=f"Latest failure {stamp or '?'}: {error}. Not retried: {UNROUTED_GUEST_REASON}.",
+            fix_result="SKIPPED",
+            cycle_number=getattr(state, "cycle_count", None),
+        )
 
 
 def repair_deterministically_blocked(source_name: str) -> str | None:
@@ -2341,6 +2426,13 @@ def diagnose_and_fix_pulls(
     # statement naming a missing relation, and catching that error would leave
     # the transaction aborted. Without pull_log the raw_series failures are
     # still diagnosed, and the coverage gap is reported, not read as zero.
+    #
+    # A pull_log run is named by its catalog row, except a guest run
+    # (_guest_pull_log_names: smart:finra_dix under FINRA_SHORT_VOLUME),
+    # which is named by its own pull_log name in both the failure leg and the
+    # recovery check: a DIX failure is not a short-volume failure, and a DIX
+    # success does not recover one.
+    guest_names = _guest_pull_log_names()
     with engine.connect() as conn:
         pull_log_available = _relation_exists(conn, "pull_log")
         if pull_log_available:
@@ -2359,7 +2451,9 @@ def diagnose_and_fix_pulls(
                     "  JOIN source_catalog sc ON rs.source_id = sc.id "
                     "  WHERE rs.pull_status = 'FAILED' "
                     "  UNION ALL "
-                    "  SELECT COALESCE(sc.name, pl.puller_name) AS name, "
+                    "  SELECT CASE WHEN pl.puller_name = ANY(:guest_pull_log_names) "
+                    "              THEN pl.puller_name "
+                    "              ELSE COALESCE(sc.name, pl.puller_name) END AS name, "
                     "         COALESCE(pl.completed_at, pl.started_at) AS failed_at, "
                     "         pl.error_message AS error "
                     "  FROM pull_log pl "
@@ -2377,12 +2471,15 @@ def diagnose_and_fix_pulls(
                     "AND NOT EXISTS ("
                     " SELECT 1 FROM pull_log ok "
                     " LEFT JOIN source_catalog osc ON ok.source_id = osc.id "
-                    " WHERE COALESCE(osc.name, ok.puller_name) = latest_failed.name "
+                    " WHERE CASE WHEN ok.puller_name = ANY(:guest_pull_log_names) "
+                    "            THEN ok.puller_name "
+                    "            ELSE COALESCE(osc.name, ok.puller_name) END = latest_failed.name "
                     "   AND ok.status IN ('SUCCESS', 'NO_NEW_ROWS') "
                     "   AND COALESCE(ok.completed_at, ok.started_at) > latest_failed.last_fail"
                     ") "
                     "ORDER BY fail_count DESC"
-                )
+                ),
+                {"guest_pull_log_names": sorted(guest_names)},
             ).fetchall()
         else:
             failed = conn.execute(
@@ -2458,6 +2555,20 @@ def diagnose_and_fix_pulls(
         sources=failed_sources,
         detail="\n  ".join(summary_lines),
     )
+
+    # A guest run's failure has no repair route (UNROUTED_GUEST_REASON):
+    # reported once per new failure per process, and left out of diagnosis,
+    # retry and escalation on every pass, so it takes no LLM slot, no repair
+    # budget and no CRITICAL issue.
+    unrouted = [f for f in failed_info if f["source"] in guest_names]
+    if unrouted:
+        result["skipped_no_handler"] += len(unrouted)
+        _report_unrouted_failures(engine, unrouted, state, dry_run)
+        failed = [r for r in failed if (r[0] or "") not in guest_names]
+        failed_info = [f for f in failed_info if f["source"] not in guest_names]
+        failed_sources = [f["source"] for f in failed_info]
+        if not failed_info:
+            return result
 
     # If Hermes is available, get structured diagnosis with fix actions
     diagnosis_text: str | None = None

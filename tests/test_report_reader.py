@@ -342,3 +342,46 @@ def test_owner_closure(monkeypatch):
         RR.close_ask(eng, "nope", "x")
     with pytest.raises(ValueError):
         RR.close_ask(eng, "k1", "   ")
+
+
+
+# ---------------------------------------------------------------- access: agent reports are admin-only
+
+def test_agent_report_routes_require_admin():
+    from api.routers import agent_report_reads as AR
+    deps = [d.dependency for d in AR.router.dependencies]
+    assert len(deps) == 1 and deps[0].__name__ == "_check_role"            # require_role, not require_auth
+    import inspect
+    assert "admin" in inspect.getclosurevars(deps[0]).nonlocals.get("roles", ())
+
+
+def test_chat_adds_report_context_for_admin_only(monkeypatch):
+    from api.auth import create_token
+    from api.routers import ollama as O
+    import intelligence.report_reader as reader
+
+    calls = []
+    monkeypatch.setattr(reader, "context_for_prompt", lambda engine, q, limit=5: calls.append(q) or "REPORTS")
+
+    class Client:
+        is_available, model = True, "m"
+
+        def chat(self, messages, **kw):
+            self.messages = messages
+            return "answer"
+    client = Client()
+    monkeypatch.setattr(O, "_get_client", lambda: client)
+    import knowledge.tree as tree
+    monkeypatch.setattr(tree, "get_context_for_prompt", lambda q, limit=5: "")
+    stored = []
+    monkeypatch.setattr(tree, "store_qa", lambda **kw: stored.append(kw["question"]))
+    monkeypatch.setattr(tree, "get_related", lambda q, limit=3: [])
+    import api.dependencies as deps
+    monkeypatch.setattr(deps, "get_db_engine", lambda: object())
+
+    O.ask_ollama(O.AskRequest(question="what happened to the puller"), token=create_token(role="contributor", expires_hours=1))
+    assert calls == [] and not any(m["content"] == "REPORTS" for m in client.messages)
+    assert stored == ["what happened to the puller"]                              # a contributor's Q&A is kept
+    O.ask_ollama(O.AskRequest(question="what happened to the puller"), token=create_token(role="admin", expires_hours=1))
+    assert calls == ["what happened to the puller"] and any(m["content"] == "REPORTS" for m in client.messages)
+    assert stored == ["what happened to the puller"]                              # the report-informed answer is not
