@@ -93,7 +93,8 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "api/routers/watchlist_overview.py": 5,
     "astrogrid_api/astrogrid_celestial.py": 5,
     "astrogrid_api/astrogrid_helpers.py": 4,
-    "discovery/changepoint_detector.py": 1,
+    # discovery/changepoint_detector.py: 1 -> 0 (#1301): reads through
+    # store.pit.PITStore.get_pit (LATEST_AS_OF, obs_date <= as_of).
     "discovery/clustering.py": 1,
     "inference/timesfm_service.py": 3,
     "intelligence/adapters/feature_adapter.py": 2,
