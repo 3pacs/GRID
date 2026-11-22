@@ -111,6 +111,7 @@ def test_parse_weekly_stocks_response_documented_envelope():
         "period": date(2026, 9, 5),
         "value": 24531.0,
         "units": "MBBL",
+        "units_verified": True,
         "series": "W_EPC0_SAX_YCUOK_MBBL",
     }
     assert rows[1]["period"] == date(2026, 8, 29)
