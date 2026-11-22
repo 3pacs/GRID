@@ -171,6 +171,7 @@ class TestDrewryContainerIndexIntegrity:
     def test_uses_transposed_table_header_dates(self):
         html = """
         <html><body>
+          <h2>World Container Index, 19 Nov 2026</h2>
           <table>
             <thead>
               <tr><th>Route</th><th>12 Nov 26</th><th>19 Nov 26</th><th>Weekly change</th></tr>
@@ -218,6 +219,7 @@ class TestDrewryContainerIndexIntegrity:
         valid_past = date(2026, 11, 19)
         html = f"""
         <html><body>
+          <h1>Drewry World Container Index</h1>
           <table>
             <thead><tr><th>Date</th><th>Composite</th></tr></thead>
             <tbody>

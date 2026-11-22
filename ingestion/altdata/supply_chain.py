@@ -102,6 +102,18 @@ _DREWRY_COMPOSITE_WORD_RE = re.compile(
     r"(?:^|[^a-z])composite(?:[^a-z]|$)",
     re.IGNORECASE,
 )
+# Positive WCI attribution (Codex HOLD on #1384 42c3df0e): a generic
+# "composite" is not the Drewry WCI.
+_DREWRY_LABEL_UNITS_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_DREWRY_WCI_NAME_RE = re.compile(r"(?:world\s+container\s+index|\bwci\b)", re.IGNORECASE)
+_DREWRY_WCI_COMPOSITE_LABEL_RE = re.compile(
+    r"^(?:drewry\s+)?(?:"
+    r"(?:world\s+container\s+index|wci)\s+composite(?:\s+index)?"
+    r"|composite\s+(?:wci|world\s+container\s+index)(?:\s+index)?"
+    r")$",
+    re.IGNORECASE,
+)
+_DREWRY_BARE_COMPOSITE_RE = re.compile(r"^composite(?:\s+index)?$", re.IGNORECASE)
 _DREWRY_TABLE_WCI_EXACT_RE = re.compile(
     r"^(?:drewry\s+)?(?:world\s+container\s+index|wci)(?:\s*\([^)]*\))?$",
     re.IGNORECASE,
@@ -175,32 +187,65 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def _is_drewry_composite_table_label(raw: str) -> bool:
-    """Return True only if a table header/row label proves WCI composite."""
-    label = re.sub(r"\s+", " ", (raw or "").strip()).lower()
-    if not label:
-        return False
-    if _DREWRY_LANE_RE.search(label) or _DREWRY_FOREIGN_INDEX_RE.search(label):
-        return False
-    return bool(
-        _DREWRY_COMPOSITE_WORD_RE.search(label)
-        or _DREWRY_TABLE_WCI_EXACT_RE.match(label)
-    )
+def _drewry_label_core(raw: str) -> str | None:
+    """Whitespace-collapsed label without a trailing units parenthetical.
 
-
-def _is_drewry_composite_chart_label(raw: str) -> bool:
-    """Return True only if a chart/series identifier proves WCI composite.
-
-    Strict: requires an explicit ``composite`` identifier and rejects any
-    single-lane or foreign-index qualifier so sibling charts can never be
-    mistaken for the WCI composite.
+    None for an empty label or one naming a single lane or a foreign index.
     """
     label = re.sub(r"\s+", " ", (raw or "").strip())
     if not label:
-        return False
+        return None
     if _DREWRY_LANE_RE.search(label) or _DREWRY_FOREIGN_INDEX_RE.search(label):
+        return None
+    return _DREWRY_LABEL_UNITS_RE.sub("", label).strip()
+
+
+def _drewry_names_wci(texts: Any) -> bool:
+    """True if any context text (caption, heading, chart title) names the WCI.
+
+    A context that also names a single lane or a foreign index proves nothing.
+    """
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        if _DREWRY_LANE_RE.search(text) or _DREWRY_FOREIGN_INDEX_RE.search(text):
+            continue
+        if _DREWRY_WCI_NAME_RE.search(text):
+            return True
+    return False
+
+
+def _is_drewry_composite_table_label(raw: str, *, context_names_wci: bool = False) -> bool:
+    """Return True only if a table header/row label positively attributes the WCI composite.
+
+    The label must itself name the WCI ("World Container Index", "WCI",
+    "WCI Composite", "Composite WCI", ...), or be exactly "Composite" /
+    "Composite Index" inside a table whose own caption or heading names the
+    WCI. Any other wording ("Composite Warehousing Cost") is refused, so a
+    composite of something else on the same page is never read as the WCI.
+    """
+    core = _drewry_label_core(raw)
+    if core is None:
         return False
-    return bool(_DREWRY_COMPOSITE_WORD_RE.search(label))
+    if _DREWRY_TABLE_WCI_EXACT_RE.match(core) or _DREWRY_WCI_COMPOSITE_LABEL_RE.match(core):
+        return True
+    return context_names_wci and bool(_DREWRY_BARE_COMPOSITE_RE.match(core))
+
+
+def _is_drewry_composite_chart_label(raw: str, *, context_names_wci: bool = False) -> bool:
+    """Return True only if a chart/series identifier positively attributes the WCI composite.
+
+    The identifier must name both the WCI and the composite ("WCI Composite",
+    "World Container Index composite", "Composite WCI"), or be exactly
+    "Composite" / "Composite Index" in a chart whose own title or labels name
+    the WCI. Single-lane, foreign-index and other composites are refused.
+    """
+    core = _drewry_label_core(raw)
+    if core is None:
+        return False
+    if _DREWRY_WCI_COMPOSITE_LABEL_RE.match(core):
+        return True
+    return context_names_wci and bool(_DREWRY_BARE_COMPOSITE_RE.match(core))
 
 
 _MAX_JS_OBJECT_DEPTH = 50  # chart configs nest a handful of levels deep
@@ -357,6 +402,9 @@ def _extract_drewry_chart_candidates(script_text: str) -> tuple[dict[date, float
         ):
             saw_unproven = True
             continue
+        # The chart's own title/labels must name the WCI before a bare
+        # "Composite" series inside it counts.
+        chart_names_wci = _drewry_names_wci(outer_labels)
 
         ms_match = _DREWRY_JS_MULTISERIES_START_RE.search(obj)
         if ms_match is not None:
@@ -379,7 +427,10 @@ def _extract_drewry_chart_candidates(script_text: str) -> tuple[dict[date, float
                     ):
                         saw_unproven = True
                         continue
-                    if any(_is_drewry_composite_chart_label(lbl) for lbl in ds_labels):
+                    if any(
+                        _is_drewry_composite_chart_label(lbl, context_names_wci=chart_names_wci)
+                        for lbl in ds_labels
+                    ):
                         return dict(zip(dates, vals)), False
                     saw_unproven = True
                 continue
@@ -391,7 +442,10 @@ def _extract_drewry_chart_candidates(script_text: str) -> tuple[dict[date, float
         vals = _parse_js_usd_list(val_match.group(1))
         if vals is None or len(vals) != len(dates):
             continue
-        if any(_is_drewry_composite_chart_label(lbl) for lbl in outer_labels):
+        if any(
+            _is_drewry_composite_chart_label(lbl, context_names_wci=chart_names_wci)
+            for lbl in outer_labels
+        ):
             return dict(zip(dates, vals)), False
         saw_unproven = True
 
@@ -470,10 +524,14 @@ def _parse_drewry_wci_html(
     # 1. Structured HTML table (standard: rows=dates; or transposed: cols=dates)
     for table in soup.find_all("table"):
         caption_tag = table.find("caption")
-        if caption_tag is not None:
-            cap_text = caption_tag.get_text(" ", strip=True)
-            if _DREWRY_LANE_RE.search(cap_text) or _DREWRY_FOREIGN_INDEX_RE.search(cap_text):
-                continue
+        cap_text = caption_tag.get_text(" ", strip=True) if caption_tag is not None else ""
+        if cap_text and (_DREWRY_LANE_RE.search(cap_text) or _DREWRY_FOREIGN_INDEX_RE.search(cap_text)):
+            continue
+        # The table's own caption, or the nearest heading before it, must name
+        # the WCI before a bare "Composite" column or row counts.
+        heading_tag = table.find_previous(["h1", "h2", "h3", "h4"])
+        heading_text = heading_tag.get_text(" ", strip=True) if heading_tag is not None else ""
+        table_names_wci = _drewry_names_wci([cap_text] if cap_text else [heading_text])
 
         raw_rows = [
             [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
@@ -488,7 +546,11 @@ def _parse_drewry_wci_html(
 
         # Standard orientation: header names a Composite/WCI column, rows are dates
         comp_col = next(
-            (i for i, h in enumerate(headers) if _is_drewry_composite_table_label(h)),
+            (
+                i
+                for i, h in enumerate(headers)
+                if _is_drewry_composite_table_label(h, context_names_wci=table_names_wci)
+            ),
             None,
         )
         if comp_col is not None:
@@ -519,7 +581,7 @@ def _parse_drewry_wci_html(
         }
         if date_cols:
             for row in raw_rows[1:]:
-                if _is_drewry_composite_table_label(row[0]):
+                if _is_drewry_composite_table_label(row[0], context_names_wci=table_names_wci):
                     for col_idx, obs_date in date_cols.items():
                         if col_idx < len(row):
                             val = _parse_drewry_usd(row[col_idx])

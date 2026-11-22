@@ -74,6 +74,8 @@ EIA_MIN_OBS_DATE: date = date(1980, 1, 1)
 _SPOT_EXPECTED_UNITS: frozenset[str] = frozenset(
     {"$/BBL", "USD/BBL", "DOLLARS PER BARREL"}
 )
+# Every unit field name EIA API v2 records may carry; all supplied ones are checked.
+_EIA_UNIT_ALIASES: tuple[str, ...] = ("units", "value-units")
 _WEEKLY_STOCKS_EXPECTED_UNITS: frozenset[str] = frozenset(
     {"MBBL", "THOUSAND BARRELS"}
 )
@@ -179,31 +181,38 @@ def _validate_eia_records(
             rejected += 1
             continue
 
-        # 2. Unit verification. No recorded live response pins EIA's unit
-        # field, so a record with NO unit field is accepted only because its
-        # series id matched exactly above (counted, logged once below). A unit
-        # that is present but unexpected is always rejected.
-        raw_units = (
-            rec.get("units")
-            if rec.get("units") is not None
-            else rec.get("value-units")
-        )
-        units_absent = raw_units is None or (
-            isinstance(raw_units, str) and not raw_units.strip()
-        )
-        units_norm = raw_units.strip().upper() if isinstance(raw_units, str) else ""
-        if units_absent:
-            missing_units += 1
-        elif units_norm not in expected_units:
+        # 2. Unit verification. Every supported alias that the record supplies
+        # (``units``, ``value-units``) must be a non-blank expected unit: a
+        # blank, null, non-string or unexpected value under any alias rejects
+        # the record, so one alias can never mask another's contradiction. No
+        # recorded live response pins EIA's unit field, so a record that
+        # supplies NO unit alias at all is accepted only because its series id
+        # matched exactly above, and it is marked units_verified=False wherever
+        # it is written (counted, logged once below).
+        supplied_units = [
+            (alias, rec[alias]) for alias in _EIA_UNIT_ALIASES if alias in rec
+        ]
+        bad_units = [
+            (alias, value)
+            for alias, value in supplied_units
+            if not isinstance(value, str)
+            or not value.strip()
+            or value.strip().upper() not in expected_units
+        ]
+        if bad_units:
             log.warning(
-                "{lbl}: rejecting unexpected units for {s} (expected={exp}, got={got!r})",
+                "{lbl}: rejecting blank, malformed or unexpected units for {s} "
+                "(expected={exp}, got={got!r})",
                 lbl=label,
                 s=expected_series,
                 exp=sorted(expected_units),
-                got=raw_units,
+                got=dict(supplied_units),
             )
             rejected += 1
             continue
+        units_absent = not supplied_units
+        if units_absent:
+            missing_units += 1
 
         # 3. Observation date parsing and bounds
         raw_period = rec.get("period")
@@ -307,19 +316,22 @@ def _validate_eia_records(
             rejected += 1
             continue
 
-        valid.append(
-            {
-                "period": obs,
-                "value": fv,
-                "units": None if units_absent else raw_units.strip(),
-                "series": series_norm,
-            }
-        )
+        row: dict[str, Any] = {
+            "period": obs,
+            "value": fv,
+            "units_verified": not units_absent,
+            "series": series_norm,
+        }
+        if not units_absent:
+            # Omitted (not None) when no alias was supplied, so re-validating
+            # an already-validated row reaches the same verdict.
+            row["units"] = supplied_units[0][1].strip()
+        valid.append(row)
 
     if missing_units:
         log.warning(
             "{lbl}: {n} record(s) for {s} carried no unit field; accepted on exact "
-            "series match (expected units {exp})",
+            "series match as units_verified=False (expected units {exp})",
             lbl=label,
             n=missing_units,
             s=expected_series,
@@ -508,7 +520,8 @@ class EIAPuller(BasePuller):
                             raw_payload={
                                 "facet": facet,
                                 "series": row["series"],
-                                "units": row["units"],
+                                "units": row.get("units"),
+                                "units_verified": row["units_verified"],
                             },
                         )
                         total += 1
@@ -568,7 +581,8 @@ class EIAPuller(BasePuller):
                             raw_payload={
                                 "facet": DEFAULT_WEEKLY_STOCKS_SERIES,
                                 "series": row["series"],
-                                "units": row["units"],
+                                "units": row.get("units"),
+                                "units_verified": row["units_verified"],
                             },
                         )
                         total += 1

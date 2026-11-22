@@ -222,11 +222,14 @@ class TestEIAWeeklyStocksValidation:
             }
         }
         rows = eia.parse_weekly_stocks_response(payload)
-        assert [r["value"] for r in rows] == [24531.0, 24400.0]
-        assert all(r.get("units") is None for r in rows)
+        # Only the record with no unit alias at all passes, flagged unverified;
+        # a present blank unit is rejected (Codex HOLD on 42c3df0e).
+        assert [r["value"] for r in rows] == [24531.0]
+        assert all("units" not in r and r["units_verified"] is False for r in rows)
         joined = " ".join(str(w) for w in captured_warnings)
         assert "carried no unit field" in joined
         assert "series mismatch" in joined
+        assert "blank, malformed or unexpected units" in joined
 
     def test_rejects_future_and_absurdly_old_dates(self, captured_warnings):
         tomorrow = (_utc_today() + timedelta(days=1)).isoformat()
@@ -864,3 +867,168 @@ def test_drewry_js_object_scan_is_depth_capped_and_still_finds_shallow_charts():
     assert shallow in objs
     # Only the outermost _MAX_JS_OBJECT_DEPTH levels of the deep block are kept.
     assert len(objs) == sc._MAX_JS_OBJECT_DEPTH + 1
+
+
+
+# ===========================================================================
+# Codex HOLD on #1384 head 42c3df0e
+# (1) a generic "composite" is not positive Drewry WCI attribution;
+# (2) one EIA unit alias must not mask another's blank/malformed/contradicting value.
+# ===========================================================================
+
+
+class TestDrewryWCIPositiveAttribution:
+    PULL = date(2026, 11, 22)
+
+    def test_unrelated_composite_chart_on_a_wci_page_is_refused(self, captured_warnings):
+        html = """
+        <html><body>
+          <h1>Drewry World Container Index</h1>
+          <script>
+            new Chart(ctx, {
+              labels: ["12 Nov 2026", "19 Nov 2026"],
+              data: [2100, 2145],
+              label: "Composite Warehousing Cost"
+            });
+          </script>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(html, pull_date=self.PULL) == []
+
+    def test_unrelated_composite_table_column_on_a_wci_page_is_refused(self):
+        html = """
+        <html><body>
+          <h1>Drewry World Container Index</h1>
+          <table>
+            <thead><tr><th>Date</th><th>Composite Warehousing Cost</th></tr></thead>
+            <tbody><tr><td>2026-11-19</td><td>$2,145</td></tr></tbody>
+          </table>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(html, pull_date=self.PULL) == []
+
+    def test_bare_composite_needs_its_own_wci_context(self):
+        no_context = """
+        <html><body>
+          <table>
+            <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+            <tbody><tr><td>2026-11-19</td><td>$2,145</td></tr></tbody>
+          </table>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(no_context, pull_date=self.PULL) == []
+
+        chart_other_title = """
+        <html><body>
+          <h1>Drewry World Container Index</h1>
+          <script>
+            Highcharts.chart('c', {
+              title: { text: 'Warehousing cost index' },
+              xAxis: { categories: ['12 Nov 2026', '19 Nov 2026'] },
+              series: [ { name: 'Composite', data: [2100, 2145] } ]
+            });
+          </script>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(chart_other_title, pull_date=self.PULL) == []
+
+    def test_unrelated_composite_table_is_skipped_and_the_wci_table_is_read(self):
+        html = """
+        <html><body>
+          <h1>Drewry World Container Index</h1>
+          <h2>Warehousing costs</h2>
+          <table>
+            <thead><tr><th>Date</th><th>Composite</th></tr></thead>
+            <tbody><tr><td>2026-11-19</td><td>$9,999</td></tr></tbody>
+          </table>
+          <h2>World Container Index, 19 Nov 2026</h2>
+          <table>
+            <thead><tr><th>Date</th><th>Composite</th><th>Shanghai - Rotterdam</th></tr></thead>
+            <tbody>
+              <tr><td>2026-11-12</td><td>$2,100</td><td>$2,610</td></tr>
+              <tr><td>2026-11-19</td><td>$2,145</td><td>$2,680</td></tr>
+            </tbody>
+          </table>
+        </body></html>
+        """
+        assert sc._parse_drewry_wci_html(html, pull_date=self.PULL) == [
+            {"date": "2026-11-12", "value": 2100.0},
+            {"date": "2026-11-19", "value": 2145.0},
+        ]
+
+    @pytest.mark.parametrize("label,ctx,ok", [
+        ("WCI Composite", False, True),
+        ("Drewry World Container Index composite", False, True),
+        ("Composite WCI (USD/40ft)", False, True),
+        ("Composite", True, True),
+        ("Composite Index", True, True),
+        ("Composite", False, False),
+        ("Composite Warehousing Cost", True, False),
+        ("Composite index of warehousing", True, False),
+        ("WCI Composite Shanghai - Rotterdam", True, False),
+        ("SCFI Composite", True, False),
+    ])
+    def test_label_attribution_rule(self, label, ctx, ok):
+        assert sc._is_drewry_composite_chart_label(label, context_names_wci=ctx) is ok
+
+
+def _eia_rec(period: str, value: str, **units):
+    rec = {"period": period, "series": eia.DEFAULT_WEEKLY_STOCKS_SERIES, "value": value}
+    rec.update(units)
+    return rec
+
+
+class TestEIAUnitAliases:
+    @pytest.mark.parametrize("units", [
+        {"units": "", "value-units": "USD"},
+        {"units": "MBBL", "value-units": "USD"},
+        {"units": "   ", "value-units": "MBBL"},
+        {"units": None},
+        {"value-units": None},
+        {"units": 1000},
+        {"units": ["MBBL"]},
+        {"value-units": "MMBBL"},
+    ], ids=["blank_vs_usd", "mbbl_vs_usd", "blank_vs_mbbl", "null_units", "null_value_units",
+            "number", "list", "wrong_value_units"])
+    def test_every_supplied_alias_must_be_an_expected_unit(self, units, captured_warnings):
+        rows = eia.parse_weekly_stocks_response({"response": {"data": [_eia_rec("2026-11-13", "24531", **units)]}})
+        assert rows == []
+        assert any("blank, malformed or unexpected units" in str(w) for w in captured_warnings)
+
+    def test_agreeing_aliases_are_verified(self):
+        rows = eia.parse_weekly_stocks_response({"response": {"data": [
+            _eia_rec("2026-11-13", "24531", units="MBBL", **{"value-units": "thousand barrels"}),
+        ]}})
+        assert [(r["value"], r["units"], r["units_verified"]) for r in rows] == [(24531.0, "MBBL", True)]
+
+    def test_writer_keeps_omitted_units_separate_and_refuses_alias_conflicts(
+        self, monkeypatch, captured_warnings
+    ):
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
+        monkeypatch.setattr(eia.time, "sleep", lambda _s: None)
+        empty = {"response": {"data": []}}
+        stocks = {"response": {"data": [
+            _eia_rec("2026-11-13", "24531", units="MBBL"),                       # verified
+            _eia_rec("2026-11-06", "24400"),                                     # truly omitted
+            _eia_rec("2026-10-30", "24300", units="", **{"value-units": "USD"}),  # blank masks USD
+            _eia_rec("2026-10-23", "24200", units="MBBL", **{"value-units": "USD"}),  # MBBL masks USD
+        ]}}
+        engine = FakeEngine()
+        with patch(
+            "ingestion.altdata.eia_puller.requests.get",
+            side_effect=[_http_resp(json_body=empty), _http_resp(json_body=empty), _http_resp(json_body=stocks)],
+        ):
+            result = eia.EIAPuller(db_engine=engine).pull(days_back=60)
+
+        assert result["status"] == "SUCCESS" and result["rows_inserted"] == 2
+        rows = {r["obs_date"]: r for r in engine.store.rows_for("EIA:eia_cushing_crude_stocks")}
+        assert sorted(rows) == [date(2026, 11, 6), date(2026, 11, 13)]
+
+        def payload(r):
+            raw = r["raw_payload"]
+            return json.loads(raw) if isinstance(raw, str) else raw
+
+        assert payload(rows[date(2026, 11, 13)])["units"] == "MBBL"
+        assert payload(rows[date(2026, 11, 13)])["units_verified"] is True
+        assert payload(rows[date(2026, 11, 6)])["units"] is None
+        assert payload(rows[date(2026, 11, 6)])["units_verified"] is False
