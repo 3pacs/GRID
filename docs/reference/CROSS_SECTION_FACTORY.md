@@ -172,6 +172,29 @@ state recorded the evening before each decision day in the sector state record (
 market phase, Fed balance-sheet phase, VIX third, spike state, and for within-sector modules each sector, the three
 groups, the sector's own phase, and leading against lagging sectors. Cuts are descriptions of a searched sample.
 
+**What a cut is charged (2026-11-22).**
+- A cut of whole nights (year, market phase and the other night states) is the module on those nights, so it pays
+  the module's cost.
+- A sector cut pays that sector's own turnover: the share of the sector's picks replaced since the module's previous
+  traded night (1 on the first night of a stretch, or when the sector did not trade the night before), at the run's
+  rate.
+- A cut of several sectors (a group, a sector phase, leading or lagging) pays its sectors' turnovers, weighted by
+  their names like its spread.
+- A name stays in its sector, so the sectors' turnovers weighted by their names give back the module's turnover
+  night by night.
+- Overnight and intraday turn over every name, so nothing changes there. On `close_1d` a slow sector used to be
+  charged a fast one's churn and the other way round, which is the gap Codex found in the residual card's liquidity
+  halves (#1363). Only the `net_bp` of those cuts, and the paid / did-not lists built from them, move.
+- **On the monthly reversal's development replay** (grid-svr scratch ledgers, the 11-19 run's 817 files, main
+  `2157fe94` against this change):
+  - only `cards` differed, and within it only sector-based `net_bp`;
+  - the within-sector modules' sector cuts moved by at most 0.12 bp a night (Communication Services, 2.52 to 2.40 at
+    10 %);
+  - their groups and leading / lagging cuts moved by at most 0.03 bp;
+  - the pooled modules and every whole-night cut were unchanged.
+  - That signal's sectors churn at much the same rate; the gap is large only when they do not, as in the test's
+    fixture, where a slow sector paid 0.58 bp a night instead of 0.11.
+
 Every card also carries `where_it_paid` and `where_it_did_not`: each cut with at least 100 traded nights, split by
 the sign of its net return and sorted by size, and `report.md` prints the six largest of each. A run file may list
 `prior_dev_looks` (earlier development runs at the same effect); they are named in `max_t.multiplicity`.

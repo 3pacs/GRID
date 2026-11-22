@@ -592,12 +592,14 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
         mods = [m for m in run.modules() if m["signal"] == name]
         ys = {h: outcome(panel, h) for h in spec["horizons"]}
         prev: dict = {}
+        prev_sector: dict = {}     # trial -> (night, {sector: (bottom picks, top picks)}) of its last traded night
         for m in mods:
             within = m["ranking"] == "within_sector"
             out[m["trial_id"]] = {"gross": np.full(n_d, np.nan), "names": np.zeros(n_d), "turnover": np.full(n_d, np.nan),
                                   "picks": np.zeros(n_d), "dropped": np.zeros(n_d),
                                   "per_sector": np.full((n_d, n_s), np.nan) if within else None,
-                                  "k_sector": np.zeros((n_d, n_s)) if within else None}
+                                  "k_sector": np.zeros((n_d, n_s)) if within else None,
+                                  "turnover_sector": np.full((n_d, n_s), np.nan) if within else None}
         for r in rows:
             idx = np.flatnonzero(eligible[r])
             if len(idx) < run.min_ranked:
@@ -623,6 +625,7 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
                     floor = max(8, math.ceil(1 / q))
                     num = den = 0.0
                     los, his = [], []
+                    picked: dict = {}
                     dropped = 0
                     for s, sidx in enumerate(by_sector):
                         if len(sidx) < floor:
@@ -630,6 +633,7 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
                         k = max(1, math.floor(q * len(sidx)))
                         sv, lo_s, hi_s, d_s = _spread(sig[r], tick, sidx, k, y)
                         res["per_sector"][r, s], res["k_sector"][r, s] = sv, k
+                        picked[s] = (lo_s, hi_s)
                         los.append(lo_s)
                         his.append(hi_s)
                         dropped += d_s
@@ -645,6 +649,14 @@ def evaluate(panel: Panel, run: RunFile, states: States) -> dict:
                 adjacent = last is not None and last[0] == r - 1
                 res["turnover"][r] = _turnover(last[1] if adjacent else None, lo, hi) if m["horizon"] == "close_1d" else 1.0
                 prev[m["trial_id"]] = (r, (lo, hi))
+                if m["ranking"] != "pooled":
+                    # each sector's own share replaced against its own picks the night before; their k-weighted mean
+                    # is the module's turnover, since a name stays in its sector
+                    before = prev_sector[m["trial_id"]][1] if adjacent else {}
+                    for s, (lo_s, hi_s) in picked.items():
+                        res["turnover_sector"][r, s] = (_turnover(before.get(s), lo_s, hi_s)
+                                                        if m["horizon"] == "close_1d" else 1.0)
+                    prev_sector[m["trial_id"]] = (r, picked)
     return out
 
 
@@ -717,9 +729,13 @@ def _cut(gross: np.ndarray, cost: np.ndarray) -> dict:
             "sd_bp": round(sd * 1e4, 2), "t_gross": round(mean / (sd / math.sqrt(len(v))), 3) if sd else None}
 
 
-def card(panel: Panel, res: dict, states: States, cost: np.ndarray) -> dict:
-    """Where the module paid: by year and by the states recorded the evening before each decision day."""
+def card(panel: Panel, res: dict, states: States, rate: float) -> dict:
+    """Where the module paid: by year and by the states recorded the evening before each decision day.
+
+    ``rate`` is the cost of a turnover of 1 (sides x cost per side). A cut of whole nights pays the module's turnover;
+    a sector pays its own, and a cut of several sectors pays their turnovers weighted like its spread."""
     gross = res["gross"]
+    cost = rate * res["turnover"]
     traded = ~np.isnan(gross)
 
     def where(mask: np.ndarray) -> dict:
@@ -733,15 +749,18 @@ def card(panel: Panel, res: dict, states: States, cost: np.ndarray) -> dict:
         out[name] = {str(v): where(arr == v) for v in sorted({x for x, t in zip(states.night[name], traded) if t and x is not None})}
     if res["per_sector"] is not None:
         ps, ks = res["per_sector"], res["k_sector"]
+        sector_cost = rate * res["turnover_sector"]
 
         def pooled(pick: np.ndarray) -> dict:
             use = pick & ~np.isnan(ps) & (ks > 0)
             w = np.where(use, ks, 0.0)
             tot = w.sum(axis=1)
-            return _cut(np.where(tot > 0, (np.where(use, ps, 0.0) * w).sum(axis=1) / np.where(tot > 0, tot, 1), np.nan), cost)
+            den = np.where(tot > 0, tot, 1)
+            spread = np.where(tot > 0, (np.where(use, ps, 0.0) * w).sum(axis=1) / den, np.nan)
+            return _cut(spread, np.where(tot > 0, (np.where(use, sector_cost, 0.0) * w).sum(axis=1) / den, np.nan))
 
         every = np.ones_like(ps, dtype=bool)
-        out["sector"] = {s: _cut(ps[:, j], cost) for j, s in enumerate(panel.sectors)}
+        out["sector"] = {s: _cut(ps[:, j], sector_cost[:, j]) for j, s in enumerate(panel.sectors)}
         out["group"] = {g: pooled(every & np.array([GROUP_OF[s] == g for s in panel.sectors])[None, :]) for g in GROUPS}
         seen = sorted({x for x in states.sector_phase[traded].ravel() if x})
         out["sector_phase"] = {str(p): pooled(states.sector_phase == p) for p in seen}
@@ -808,7 +827,8 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
         modules = spec.modules()
         gates = {s["name"]: s.get("gate", {}) for s in spec.signal_specs()}
         per_side = spec.cost_bp_per_side * 1e-4
-        costs = {m["trial_id"]: SIDES[m["horizon"]] * per_side * results[m["trial_id"]]["turnover"] for m in modules}
+        rates = {m["trial_id"]: SIDES[m["horizon"]] * per_side for m in modules}
+        costs = {tid: rates[tid] * results[tid]["turnover"] for tid in rates}
         net = np.column_stack([results[m["trial_id"]]["gross"] - costs[m["trial_id"]] for m in modules])
         bar = sign_flip_max_t(net, spec.perms, spec.seed, spec.alpha, spec.null_block_sessions)
         counts_as_cleared = not spec.hypothesis_only
@@ -877,7 +897,7 @@ def run(run_file: Path, data_dir: Path, state_db: Path, ledger: lse.Ledger, out:
             "ranking": [{k: t[k] for k in ("trial_id", "family", "feature", "n", "r", "net_dollars", "gross_bp", "turnover",
                                            "share_of_nights", "gate", "t", "p", "adjusted_p", "passed_step_down",
                                            "dropped_pick_share", "selected")} for t in tested_rows],
-            "cards": {tid: card(panel, results[tid], states, costs[tid]) for tid in carded},
+            "cards": {tid: card(panel, results[tid], states, rates[tid]) for tid in carded},
             "hypothesis_only": spec.hypothesis_only,
             "note": ("development ranking only; a selected module is a candidate for one confirmation look, not a finding"
                      if counts_as_cleared else

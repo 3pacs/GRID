@@ -1,6 +1,7 @@
 """Cross-section factory: declared before data, development days only, by-hand arithmetic, the sign-flip bar."""
 import csv
 import json
+import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -16,8 +17,12 @@ SECTORS = ("Energy", "Information Technology", "Utilities")
 HEADER = ["date", "close", "high", "low", "open", "volume", "adjClose", "adjHigh", "adjLow", "adjOpen", "adjVolume", "divCash", "splitFactor"]
 
 
-def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False):
-    """Synthetic bars: every stock has its own steady overnight tilt that it gives back during the day."""
+def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False, revert=0.0, volume_of=None, tilt_of=None):
+    """Synthetic bars: every stock has its own steady overnight tilt that it gives back during the day.
+
+    ``revert`` adds a one-month reversal: each day's intraday return gives back that share of the stock's return over
+    the 21 sessions before. ``volume_of(sym)`` sets a stock's daily volume, ``tilt_of(sym)`` scales its tilt. The
+    defaults draw the same random numbers as before."""
     rng = np.random.default_rng(seed)
     days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2015-01-02", periods=n_days)]
     (root / "prices").mkdir(parents=True)
@@ -26,13 +31,16 @@ def build(root, n_per=20, n_days=220, seed=3, extra_late_bar=False):
         for i in range(n_per):
             sym = f"S{s}N{i:02d}"
             syms.append((sym, sector))
-            tilt[sym] = rng.normal(0, 0.002)
+            tilt[sym] = rng.normal(0, 0.002) * (tilt_of(sym) if tilt_of else 1.0)
     for sym, _ in syms:
-        prev, rows = 100.0, []
+        prev, rows, closes = 100.0, [], []
+        vol = volume_of(sym) if volume_of else 2_000_000
         for d in days:
+            back = revert * (prev / closes[-21] - 1) if revert and len(closes) >= 21 else 0.0
             o = prev * (1 + tilt[sym] + rng.normal(0, 0.003))
-            c = o * (1 - tilt[sym] + rng.normal(0, 0.003))
-            rows.append([d, c, max(o, c) * 1.001, min(o, c) * 0.999, o, 2_000_000, c, max(o, c) * 1.001, min(o, c) * 0.999, o, 2_000_000, 0.0, 1.0])
+            c = o * (1 - tilt[sym] + rng.normal(0, 0.003) - back)
+            rows.append([d, c, max(o, c) * 1.001, min(o, c) * 0.999, o, vol, c, max(o, c) * 1.001, min(o, c) * 0.999, o, vol, 0.0, 1.0])
+            closes.append(prev)
             prev = c
         if extra_late_bar:
             rows.append(["2023-01-03", prev, prev * 1.01, prev * 0.99, prev, 2_000_000, prev, prev * 1.01, prev * 0.99, prev, 2_000_000, 0.0, 1.0])
@@ -213,6 +221,69 @@ def test_turnover_is_full_overnight_and_partial_for_a_slow_signal_held_close_to_
     assert t[0] == 1.0 and 0.0 < t[1:].mean() < 0.5                         # the first night buys everything, later ones a part
     assert X._turnover(None, np.array([1, 2]), np.array([3, 4])) == 1.0
     assert X._turnover((np.array([1, 2]), np.array([3, 4])), np.array([1, 9]), np.array([3, 4])) == 0.25
+
+
+def test_each_sector_cut_pays_for_its_own_turnover(tmp_path):
+    full = tmp_path / "full"
+    full.mkdir()
+    build(full, tilt_of=lambda sym: 3.0 if sym.startswith("S0") else 0.0)   # Energy's ranks hold still, the others churn
+    tech = tmp_path / "tech"                     # Information Technology's names alone, ranked as a store of their own
+    shutil.copytree(full, tech)
+    keep = {f"S1N{i:02d}" for i in range(20)}
+    for p in (tech / "prices").glob("*.csv"):
+        if p.stem not in keep:
+            p.unlink()
+    for name in ("members.csv", "sectors.csv"):
+        with open(tech / name, newline="") as fh:
+            rows = list(csv.reader(fh))
+        if name == "members.csv":
+            rows[1][1] = ",".join(s for s in rows[1][1].split(",") if s in keep)
+        else:
+            rows = rows[:1] + [r for r in rows[1:] if r[0] in keep]
+        with open(tech / name, "w", newline="") as fh:
+            csv.writer(fh).writerows(rows)
+
+    body = {**RUN, "signals": [{"name": "on21", "kind": "mean_overnight", "lookback": 21, "horizons": ["close_1d", "overnight"]}],
+            "rankings": ["within_sector"]}
+    rep = X.run(write_run(full, body), full, full / "state.db", ledger_at(full), full / "out")
+    run = X.RunFile.from_dict(body)
+    panel = X.load_panel(full, run)
+    res = X.evaluate(panel, run, X.state_arrays(panel, X.load_state(full / "state.db")))
+    slow = res["on21|within_sector|q20|close_1d"]
+    ps, ks, ts = slow["per_sector"], slow["k_sector"], slow["turnover_sector"]
+    traded = ~np.isnan(slow["turnover"])
+    # a name stays in its sector, so the sectors' turnovers weighted by their names make the module's, night by night
+    np.testing.assert_allclose(np.nansum(ks * ts, axis=1)[traded] / np.where(np.isnan(ts), 0, ks).sum(axis=1)[traded],
+                               slow["turnover"][traded], rtol=0, atol=1e-12)
+    t = np.nanmean(ts, axis=0)
+    assert t[1] > 3 * t[0] and t[2] > 3 * t[0]                                 # the planted difference is there
+
+    c = rep["cards"]["on21|within_sector|q20|close_1d"]
+    rate = 4 * run.cost_bp_per_side                                             # bp for a turnover of 1
+    for j, s in enumerate(SECTORS):
+        own = ts[~np.isnan(ps[:, j]), j].mean()
+        assert c["sector"][s]["net_bp"] == pytest.approx(c["sector"][s]["gross_bp"] - rate * own, abs=2e-3)
+        assert c["group"][X.GROUP_OF[s]] == c["sector"][s]                     # one sector per group in this store
+    assert c["sector_vs_market"]["leading"] == c["sector"]["Energy"]           # Energy leads every night here
+    use = ~np.isnan(ps[:, 1:]) & (ks[:, 1:] > 0)
+    w = np.where(use, ks[:, 1:], 0.0)
+    on = w.sum(axis=1) > 0
+    lag_cost = (np.where(use, ts[:, 1:], 0.0) * w).sum(axis=1)[on] / w.sum(axis=1)[on]
+    lagging = c["sector_vs_market"]["lagging"]                                 # two sectors, weighted like the spread
+    assert lagging["net_bp"] == pytest.approx(lagging["gross_bp"] - rate * lag_cost.mean(), abs=2e-3)
+    assert c["sector"]["Energy"]["net_bp"] - c["sector"]["Information Technology"]["net_bp"] > (
+        c["sector"]["Energy"]["gross_bp"] - c["sector"]["Information Technology"]["gross_bp"])   # the churn costs more
+    for s, cut in rep["cards"]["on21|within_sector|q20|overnight"]["sector"].items():
+        assert cut["net_bp"] == pytest.approx(cut["gross_bp"] - rate, abs=2e-3)   # overnight: every name, every night
+
+    # ranked on its own, the sector trades the same book: the same spread and the same turnover, night by night
+    alone_run = X.RunFile.from_dict({**body, "rankings": ["pooled"], "min_ranked": 20, "min_session_bars": 20})
+    pa = X.load_panel(tech, alone_run)
+    alone = X.evaluate(pa, alone_run, X.state_arrays(pa, X.load_state(tech / "state.db")))["on21|pooled|q20|close_1d"]
+    k = ~np.isnan(alone["gross"])
+    assert pa.sessions == panel.sessions and k.sum() == (~np.isnan(ps[:, 1])).sum() > 100
+    np.testing.assert_allclose(alone["gross"][k], ps[k, 1], rtol=0, atol=1e-15)
+    np.testing.assert_allclose(alone["turnover"][k], ts[k, 1], rtol=0, atol=1e-15)
 
 
 def test_sign_flip_bar():
