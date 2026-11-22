@@ -69,7 +69,7 @@ def test_gather_signals_uses_pit_matrix_and_never_resolved_series_directly() -> 
     (vix,) = [s for s in signals if s.name == "vix_spot"]
     assert vix.family == "vol"
     assert vix.value == 5.0
-    assert vix.direction == "bullish"
+    assert vix.direction == "bearish"  # VIX spike has polarity -1 -> bearish; raw z_score stays positive
     assert vix.z_score > 0.5
     assert vix.freshness_hours == 0
 

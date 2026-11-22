@@ -4,12 +4,14 @@ Used only by ``tests/test_evaluator_contracts.py`` so the walk-forward
 evaluator contract tests never need a real database. It reproduces the
 same PIT semantics as the real store (see ``store/pit.py``):
 
-    HARD CONSTRAINT 1: every returned row has release_date <= as_of_date.
+    HARD CONSTRAINT 1: every returned row has release_date <= as_of_date
+        and vintage_date <= as_of_date.
     HARD CONSTRAINT 2: every returned row has obs_date <= as_of_date.
     HARD CONSTRAINT 3:
-        FIRST_RELEASE — earliest vintage_date per (feature_id, obs_date).
+        FIRST_RELEASE — earliest vintage_date per (feature_id, obs_date)
+                        among the rows constraint 1 admits.
         LATEST_AS_OF  — latest vintage_date per (feature_id, obs_date)
-                        where release_date <= as_of_date.
+                        among the rows constraint 1 admits.
 
 so that a bug in the *caller's* use of ``as_of_date`` (e.g. passing a
 single window-end cutoff instead of each row's own date) shows up as a
@@ -63,6 +65,7 @@ class FakePITStore:
             if r.feature_id in feature_ids
             and r.obs_date <= as_of_date
             and r.release_date <= as_of_date
+            and r.vintage_date <= as_of_date
             and start_date <= r.obs_date <= end_date
         ]
 

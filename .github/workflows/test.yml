@@ -283,6 +283,27 @@ jobs:
             exit 1
           fi
 
+      # model_eligible dry-run audit (#1301): the health half reads
+      # resolved_series point-in-time (obs/release/vintage <= as_of,
+      # retractions by the end of as_of removed before the latest-vintage
+      # pick, equal to PITStore.get_pit on resolver-shaped rows); future-dated
+      # rows appear only in the separate contamination report; NaN/inf/overflow
+      # values fail variance without aborting the scan. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Eligibility audit point-in-time PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_eligibility_audit_pg.py -q -rA | tee /tmp/grid-eligibility-audit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-eligibility-audit-pg.txt; then
+            echo "::error::Eligibility audit point-in-time PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Eligibility change log (eligibility_core_20261122, #1301): proves on
       # real PostgreSQL that the migration creates only the append-only log
       # and flips no flag, that the application role can read it but never
@@ -342,6 +363,20 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
+
+      # #1344: scripts/bulk_resolve.py (run by scripts/server_startup.sh)
+      # writes resolved_series in SQL, outside normalization/resolver.py, so
+      # its obs_date guard is SQL too. Run it on real PostgreSQL with the
+      # session TimeZone west of UTC; a missing DB URL fails instead of
+      # skipping.
+      - name: Bulk resolver obs_date guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BULK_RESOLVE_GUARD_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_bulk_resolve_future_guard_pg.py -q -rA
 
       # #1322: Schwab-captured options rows reach admin requests only. The
       # LATERAL fragments and the GEX batch-then-chain read run on real

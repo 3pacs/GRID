@@ -210,7 +210,7 @@ grid/
 │   ├── autoresearch.py           # Automated research runner
 │   ├── compute_coordinator.py    # Compute task coordination
 │   ├── signal_taxonomy.py        # Signal classification utility
-│   ├── fix_model_eligible.py     # Database maintenance: fix feature eligibility flags
+│   ├── fix_model_eligible.py     # RETIRED (refuses to run): use normalization/eligibility_audit.py (dry-run)
 │   ├── bridge_to_pg.py           # Migration: DuckDB -> PostgreSQL bridge
 │   ├── bridge_crucix.py          # Crucix data bridge
 │   ├── sources_expanded.py       # Expanded source definitions for run_pipeline.py
