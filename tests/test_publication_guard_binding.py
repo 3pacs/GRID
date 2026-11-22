@@ -1071,17 +1071,13 @@ _PG_URL = os.environ.get("GRID_TEST_DB_URL")
 def test_real_postgres_result_binds_briefing_and_packet(tmp_path):
     """The briefing guard and the packet read the producer row from a real
     PostgreSQL result (JSONB payload, timestamptz clock), not a tuple double."""
-    from sqlalchemy import create_engine, event, text
+    from sqlalchemy import create_engine, text
 
     from store.snapshots import canonical_payload_sha256
 
-    eng = create_engine(_PG_URL)
-
-    @event.listens_for(eng, "connect")
-    def _search_path(dbapi_conn, _record):  # pragma: no cover - driver hook
-        cur = dbapi_conn.cursor()
-        cur.execute("SET search_path TO rc_publication_binding_test")
-        cur.close()
+    # A connection option, not a SET in a connect hook: that SET runs in an
+    # implicit transaction, and the first rollback quietly reverts it.
+    eng = create_engine(_PG_URL, connect_args={"options": "-csearch_path=rc_publication_binding_test"})
 
     with eng.begin() as c:
         c.execute(text("DROP SCHEMA IF EXISTS rc_publication_binding_test CASCADE"))
