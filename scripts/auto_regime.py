@@ -734,7 +734,8 @@ _REGIME_HISTORY_REPLACE_SQL = text(
 
 _REGIME_HISTORY_ARCHIVED_SQL = text(
     "SELECT count(*) FROM regime_history_revisions "
-    "WHERE obs_date = :obs_date AND run_tag = :run_tag AND superseded_at = now()"
+    "WHERE obs_date = :obs_date AND run_tag = :run_tag "
+    "AND superseded_by_xid = pg_current_xact_id()::text"
 )
 
 
