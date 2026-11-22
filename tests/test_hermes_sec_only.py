@@ -711,11 +711,12 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # comments of smart_money / social_sentiment plus the 4-line comment
         # above social_ticker_series. No SEC, FINRA or dispatch code changes.
         # Needs reviewer acceptance like the prior pins.
-        # OPER re-pinned 7a85e9a0 -> 66a8ffac (2026-11-22,
+        # OPER re-pinned 7a85e9a0 -> 754dfee2 (2026-11-22,
         # claude/hermes-weekly-due-20261122): the Sunday weekly block leaves
         # run_intelligence_tasks for its own step (_run_weekly_intel_step,
         # dispatched in run_cycle after _run_trust_cycle_step): a due-period
-        # rule from Sunday 03:00 UTC instead of the 03:00-03:10 start window,
+        # rule from Sunday 03:00 UTC (24 h minimum gap after a completed run)
+        # instead of the 03:00-03:10 start window,
         # WEEKLY_INTEL_TASKS with per-task budgets, a per-cycle budget, a
         # persisted per-task ledger, and last_weekly_intel set only when every
         # task has a final outcome. Each weekly call is unchanged. No SEC,
@@ -724,7 +725,7 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # PR1102 (9fe8b16b) replaces the ordinary Oracle slot with a bounded
         # forward pass and adds its helpers and budget. The SEC dispatch
         # prefix and entire smart_scheduler.py match parent 18e49822.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','66a8ffac042ec547b878caaa74fbed8ed53e3738d8affd4d4ff7829929d2bf6a'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','754dfee2fee4d4c7ab454a1b689fb5963a16d6f03269efdae93f0a1635638381'),(SCHED,'\nimport calendar\n','08c0356fbced3dc0bc2183d9ffdd60540084a4bc723a8a205ee51a6fea688b44')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

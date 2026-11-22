@@ -3377,6 +3377,14 @@ def _run_daily_intel_block(
 #     most recent Sunday 03:00 UTC boundary, as long as no COMPLETED weekly
 #     run has landed since that boundary and the last completed run is at
 #     least WEEKLY_INTEL_MIN_HOURS_BETWEEN old. No upper bound on the window.
+#     The gap is 24 h, not the old 160 h: measured from a completion time,
+#     160 h makes one late catch-up push every later week late. Example: a
+#     run that completes Tuesday 10:00 would hold the next period until
+#     Monday 18:00, that one until the Monday after, and so on, coming back
+#     to Sunday 03:00 by only 8 h a week (about five weeks). The period rule
+#     already stops a second run in the same week; 24 h only stops a
+#     catch-up that finishes just before 03:00 Sunday from being followed by
+#     a full second run minutes later.
 #   * Own run_cycle step (_run_weekly_intel_step), dispatched after
 #     intelligence_tasks (so the daily block always goes first) and after the
 #     trust cycle. It is not inside the 900 s intelligence_tasks cap.
@@ -3404,7 +3412,7 @@ def _run_daily_intel_block(
 # each call, so a failure _run_intel_task swallowed is visible to the ledger.
 WEEKLY_INTEL_BOUNDARY_WEEKDAY = 6             # Sunday (datetime.weekday()); the old window's day
 WEEKLY_INTEL_BOUNDARY_HOUR = 3                # UTC hour the weekly due period opens; the old window's hour
-WEEKLY_INTEL_MIN_HOURS_BETWEEN = 160          # the old guard, now measured from the last COMPLETED run
+WEEKLY_INTEL_MIN_HOURS_BETWEEN = 24           # minimum gap after the last COMPLETED run (was 160 h from the start; see above for why 160 h from a completion would make the schedule drift)
 WEEKLY_INTEL_CYCLE_BUDGET_SECONDS = 1200      # per-cycle cap for this step; a task starts only if its own budget fits in what is left. Pin: every task budget <= this, and this + INTELLIGENCE_TASKS_TIMEOUT_SECONDS + TRUST_CYCLE_TIMEOUT_SECONDS < CYCLE_TIMEOUT_SECONDS (tests/test_hermes_weekly_intel_step.py).
 WEEKLY_INTEL_MAX_ATTEMPTS = 2                 # exception attempts per period before a task is "failed" (a timeout is final at once)
 WEEKLY_INTEL_MAX_DEFERRALS = 6                # cycles the trust report may wait for a running trust-cycle pass before it is "failed_deferred"

@@ -126,12 +126,18 @@ VALIDATOR = "weekly_supply_chain_edge_validator"
      datetime(2026, 11, 22, 3, 30, tzinfo=timezone.utc), False),
     (datetime(2026, 11, 29, 3, 0, tzinfo=timezone.utc),
      datetime(2026, 11, 22, 3, 30, tzinfo=timezone.utc), True),
-    # completed late (Monday 05:00): the 160 h guard holds the next period
-    # until 160 h have passed, then it is due
-    (datetime(2026, 11, 29, 3, 30, tzinfo=timezone.utc),
-     datetime(2026, 11, 23, 5, 0, tzinfo=timezone.utc), False),
-    (datetime(2026, 11, 29, 21, 0, tzinfo=timezone.utc),
-     datetime(2026, 11, 23, 5, 0, tzinfo=timezone.utc), True),
+    # a late catch-up (Tuesday) does not make the next week late: due again
+    # at the next boundary (a 160 h gap from Tuesday would hold it to Monday)
+    (datetime(2026, 11, 29, 3, 0, tzinfo=timezone.utc),
+     datetime(2026, 11, 24, 10, 0, tzinfo=timezone.utc), True),
+    # a catch-up that completed just before the boundary is not followed by
+    # a second full run minutes later; it is due 24 h after it completed
+    (datetime(2026, 11, 22, 3, 10, tzinfo=timezone.utc),
+     datetime(2026, 11, 22, 2, 50, tzinfo=timezone.utc), False),
+    (datetime(2026, 11, 23, 2, 49, tzinfo=timezone.utc),
+     datetime(2026, 11, 22, 2, 50, tzinfo=timezone.utc), False),
+    (datetime(2026, 11, 23, 2, 50, tzinfo=timezone.utc),
+     datetime(2026, 11, 22, 2, 50, tzinfo=timezone.utc), True),
     # Saturday before the boundary, last run the previous Sunday
     (datetime(2026, 11, 28, 23, 0, tzinfo=timezone.utc),
      datetime(2026, 11, 22, 3, 5, tzinfo=timezone.utc), False),
