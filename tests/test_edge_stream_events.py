@@ -82,9 +82,19 @@ V2_RULE = ("per calendar year (UTC): q_year over at most max_registrations stage
            "confirmations (forward, after a stage-1 PASS) at confirm_alpha/k outside the yearly count")
 
 
+def v3_payload() -> dict:
+    """Policy 3 (live from 2026-11-20, amendment 2811e06b): policy 4 without its owner decision
+    on unread abandonments."""
+    pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    pol.pop("unread_abandonment")
+    pol["owner_decisions"] = pol["owner_decisions"][:1]
+    pol["policy_version"] = "edge-stream-policy/3"
+    return pol
+
+
 def v2_payload() -> dict:
     """Policy 2: the single 0.00125 stage-1 bar, before the two-stage evidence bar."""
-    pol = json.loads(P.canonical_bytes(P.policy_payload()))
+    pol = v3_payload()
     pol.pop("owner_decisions")
     pol.pop("evidence_bar")
     pol["budget"].update(alpha_per_look=0.00125, rule=V2_RULE)
@@ -231,7 +241,9 @@ def test_cycle_amends_the_live_v1_ledger_before_it_registers(monkeypatch, tmp_pa
 
 
 def test_policy_3_changes_only_what_the_owner_decision_waives():
-    new = P.policy_payload()
+    new = v3_payload()
+    # the live ledger's policy 3 (amendment 2811e06b, 2026-11-20), byte for byte
+    assert L.sha256_bytes(P.canonical_bytes(new)).startswith("1986091237b7")
     assert new["policy_version"] == "edge-stream-policy/3" and new["evidence_bar"]["version"] == P.EVIDENCE_BAR
     b = new["budget"]
     assert b["alpha_per_look"] == pytest.approx(0.025)
@@ -249,7 +261,7 @@ def test_an_owner_decision_cannot_be_stretched():
     old = v2_payload()
 
     def refused(mutate) -> list[str]:
-        pol = json.loads(P.canonical_bytes(P.policy_payload()))
+        pol = v3_payload()
         mutate(pol)
         return P.amendment_violations(old, pol)
 
@@ -273,12 +285,12 @@ def test_an_owner_decision_cannot_be_stretched():
     # once recorded, a decision is never edited or dropped, and a later version needs its own
     cur = P.policy_payload()
     later = json.loads(P.canonical_bytes(cur))
-    later["policy_version"] = "edge-stream-policy/4"
+    later["policy_version"] = "edge-stream-policy/9"
     assert P.amendment_violations(cur, later) == []
     later["owner_decisions"] = []
     assert P.amendment_violations(cur, later) == ["an owner decision was removed or edited"]
     later = json.loads(P.canonical_bytes(cur))
-    later["policy_version"] = "edge-stream-policy/4"
+    later["policy_version"] = "edge-stream-policy/9"
     later["budget"]["alpha_per_look"] = 0.03  # the recorded decision does not cover a second loosening
     assert "budget.alpha_per_look raised or missing" in P.amendment_violations(cur, later)
 
@@ -299,10 +311,10 @@ def test_registrations_sealed_under_policy_1_replay_on_their_own_terms(monkeypat
         old_sha = L.append_registration(led, {**prop, "sanity": report, "recorded_at": "2026-11-13T11:05:00+00:00"})
         L.append_look(led, old_sha, {"verdict": "FAIL", "trials": [{"trial_id": "pooled", "verdict": "FAIL"}],
                                      "data": {"window_end": "2026-11-13"}, "report_sha256": "0" * 64})
-    assert L.amend_policy(led, "code policy edge-stream-policy/3", NOW.isoformat())
+    assert L.amend_policy(led, f"code policy {P.POLICY_VERSION}", NOW.isoformat())
     state = L.load_state(led)  # the 0.00125 registration is still valid under the policy it was sealed with
     assert state.registrations[old_sha]["alpha_look"] == pytest.approx(0.00125)
-    assert state.policy["policy_version"] == "edge-stream-policy/3" and state.closed_families() == {}
+    assert state.policy["policy_version"] == P.POLICY_VERSION and state.closed_families() == {}
     new = F.build_proposal({"family": "IM1", "group": "energy", "instruments": ("USO", "UNG"), "lane": "history"},
                            TODAY)
     report = S.check(new, state, TODAY)
@@ -738,3 +750,18 @@ def test_code_hash_covers_the_universe_through_the_policy(monkeypatch):
     smaller["groups"]["sp500_events"] = smaller["groups"]["sp500_events"][:-1]
     monkeypatch.setattr(P, "policy_payload", lambda: smaller)
     assert F.code_sha256(EC1) != before
+
+
+# --- policy 4: unread abandonments (owner decision, 2026-11-21) -------------------------
+
+
+def test_policy_4_adds_one_owner_decision_and_loosens_nothing_else():
+    old, new = v3_payload(), P.policy_payload()
+    assert new["policy_version"] == "edge-stream-policy/4"
+    assert P.tightening_violations(old, new) == []  # a new section and a new decision only
+    assert P.amendment_violations(old, new) == []   # fails until the decision's url and sha are filled
+    first, decision = new["owner_decisions"]
+    assert first == old["owner_decisions"][0] and decision["waives"] == []
+    assert decision["id"] == "GRID#1336" and decision["url"].startswith("https://github.com/3pacs/GRID/issues/1336#issuecomment-")
+    assert new["unread_abandonment"]["decision"] == decision["id"]
+    assert new["unread_abandonment"]["cause"] == L.CODE_CHANGED

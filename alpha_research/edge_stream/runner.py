@@ -8,7 +8,7 @@ Order inside a cycle (under an exclusive lock on the data dir):
    weekdays have passed;
 2. a stage-1 PASS (a discovery that survived its largest year left out) registers its one
    forward confirmation (stage 2, alpha 0.05/k);
-3. at most one new stage-1 registration per weekday, from :data:`families.QUEUE`, then
+3. at most one new stage-1 registration per weekday, from :data:`template_queue.QUEUE`, then
    ``inbox/*.json`` proposals, each through :func:`sanity.check` first;
 4. ``status.json`` (machine-readable state) and ``DIGEST.md`` are rewritten.
 
@@ -35,8 +35,9 @@ from . import policy as P
 from . import sanity
 from .data import BarSource, RequestCapReached, SourceError, manifest_sha256, today_et
 from .ledger import sha256_bytes
-from .families import FAMILIES, QUEUE, build_proposal, code_sha256
+from .families import FAMILIES, build_proposal, code_sha256
 from .stats import judge
+from .template_queue import QUEUE
 
 REPORT_SCHEMA = "edge-look-report/1"
 STATUS_SCHEMA = "edge-stream-status/1"
@@ -138,11 +139,17 @@ def _event_look(reg_sha: str, reg: dict, family, today: date, extras: dict | Non
     return _finish(reg_sha, reg, result, {}, data, trades)
 
 
-def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date,
-                 extras: dict | None = None) -> tuple[dict, bytes]:
+def _check_code(reg: dict):
+    """The registration's family, or :class:`CodeChanged` when its code hash differs. Reads no data."""
     family = FAMILIES.get(reg["family"])
     if family is None or code_sha256(family) != reg["code_sha256"]:
         raise CodeChanged(f"family {reg['family']} code differs from the registered sha")
+    return family
+
+
+def compute_look(reg_sha: str, reg: dict, source: BarSource, today: date,
+                 extras: dict | None = None) -> tuple[dict, bytes]:
+    family = _check_code(reg)
     if _is_event(family):
         return _event_look(reg_sha, reg, family, today, extras)
     bars, start, end = _read(reg, source, today)
@@ -333,6 +340,9 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
         # 1. looks
         for reg_sha, reg in state.open_registrations():
             try:
+                # before any data: a registration whose family code changed is abandoned now,
+                # unread, on every lane (a forward one would otherwise collect to its look first)
+                _check_code(reg)
                 if reg["lane"] == "forward":
                     prog = forward_progress(reg, source, today, extras)
                     summary["forward"].append({"registration": reg_sha[:16], **prog})
@@ -349,7 +359,7 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
                 look, body = compute_look(reg_sha, reg, source, today, extras)
             except CodeChanged as exc:
                 if not dry_run:
-                    L.append_abandoned(ledger, reg_sha, str(exc))
+                    L.append_abandoned(ledger, reg_sha, str(exc), cause=L.CODE_CHANGED)
                 summary["abandoned"].append({"registration": reg_sha[:16], "reason": str(exc)})
                 continue
             except NotReady:
@@ -399,7 +409,11 @@ def run_cycle(ledger, source: BarSource, data_dir: str | Path, *, now: datetime 
             state = L.load_state(ledger)
         # 3. one new stage-1 registration a weekday
         if register and today.weekday() < 5 and state.registered_on(now.date()) < P.MAX_NEW_REGISTRATIONS_PER_DAY:
-            done = {(r["family"], r["group"], r["lane"]) for r in state.registrations.values() if r["stage"] == 1}
+            # a registration abandoned unread for a code change does not count as done once the
+            # policy in force says so (policy.UNREAD_ABANDONMENT); its alpha stays spent
+            reopen = state.reopens_unread()
+            done = {(r["family"], r["group"], r["lane"]) for sha, r in state.registrations.items()
+                    if r["stage"] == 1 and not (reopen and state.unread_abandoned(sha))}
             for item in [dict(q, proposer="template") for q in QUEUE] + _inbox(data_dir):
                 if "invalid" in item:
                     summary["rejected"].append(item)

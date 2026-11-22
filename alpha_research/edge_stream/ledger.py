@@ -14,7 +14,10 @@ genesis; no S11 allocation ever runs on it):
                        sealed under its sha256 and checked against its numbers.
 ``edge_registration``  sealed before the look's data is read; its line sha256 is the seal.
 ``edge_look``          the one look of a registration (verdicts + report sha); SPENT.
-``edge_abandoned``     a registration closed without a look; its alpha stays spent.
+``edge_abandoned``     a registration closed without a look; its alpha stays spent. One
+                       abandoned for a code change (``cause: code_changed``) had none of
+                       its window read; under a policy with ``unread_abandonment`` its
+                       window is no longer consumed (:meth:`StreamState.unread_abandoned`).
 
 :func:`load_state` re-derives and re-checks every invariant from the records, so a
 ledger written by any other code path is refused rather than trusted.
@@ -22,6 +25,7 @@ ledger written by any other code path is refused rather than trusted.
 
 from __future__ import annotations
 
+import re
 import signal
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -43,6 +47,11 @@ PLACEHOLDER_CATALOG = Catalog(
     features=("none|x",),
     classes=(("none|x", "edge_looks_only"),),
 )
+
+#: ``cause`` of an abandonment whose look stopped at the code-hash check, before any data.
+CODE_CHANGED = "code_changed"
+#: The reason text such abandonments carried before ``cause`` was recorded (runner.CodeChanged).
+_CODE_CHANGED_REASON = re.compile(r"family \S+ code differs from the registered sha")
 
 #: EPISODE: a stage-1 discovery that did not survive its largest year left out (policy 3 on).
 VERDICTS = ("PASS", "FAIL", "UNDERPOWERED", "EPISODE")
@@ -134,6 +143,21 @@ class StreamState:
                 out.setdefault((reg["family"], reg["group"]), reg["proposal_id"])
         return out
 
+    def reopens_unread(self) -> bool:
+        """The policy in force carries the owner decision that frees unread abandoned windows."""
+        rule = self.policy.get("unread_abandonment") or {}
+        return bool(rule.get("decision")) and rule.get("cause") == CODE_CHANGED and any(
+            d.get("id") == rule["decision"] for d in self.policy.get("owner_decisions", []))
+
+    def unread_abandoned(self, reg_sha: str) -> bool:
+        """Abandoned at the code-hash check, before its window was read, and never looked at
+        (and so freed when :meth:`reopens_unread`)."""
+        rec = self.abandoned.get(reg_sha)
+        if rec is None or reg_sha in self.looks:
+            return False
+        return rec.get("cause") == CODE_CHANGED or (
+            "cause" not in rec and bool(_CODE_CHANGED_REASON.fullmatch(rec.get("reason", ""))))
+
     def proposal_ids(self) -> set[str]:
         return {r["proposal_id"] for r in self.registrations.values()}
 
@@ -142,9 +166,14 @@ class StreamState:
 
         A history registration consumes its window from the moment it is sealed. An open
         forward registration consumes ``[from, open)``; once looked, ``[from, last session]``.
+        A registration abandoned unread for a code change consumes nothing once the policy
+        in force carries ``unread_abandonment``.
         """
         out = [dict(c, source="prior") for c in self.policy["prior_consumption"]]
+        freed = self.reopens_unread()
         for sha, reg in self.registrations.items():
+            if freed and self.unread_abandoned(sha):
+                continue
             w = reg["window"]
             end = w.get("end")
             if reg["lane"] == "forward":
@@ -194,6 +223,8 @@ def load_state(ledger: Ledger) -> StreamState:
                 state.looks[ref] = rec
             else:
                 _require(bool(rec.get("reason")), f"record {rec['seq']}: abandonment without a reason")
+                _require(rec.get("cause", CODE_CHANGED) == CODE_CHANGED,
+                         f"record {rec['seq']}: unknown abandonment cause {rec.get('cause')!r}")
                 state.abandoned[ref] = rec
     return state
 
@@ -355,13 +386,17 @@ def append_look(ledger: Ledger, reg_sha: str, look: dict) -> str:
     return sha
 
 
-def append_abandoned(ledger: Ledger, reg_sha: str, reason: str, recorded_at: str | None = None) -> str:
+def append_abandoned(ledger: Ledger, reg_sha: str, reason: str, recorded_at: str | None = None,
+                     cause: str | None = None) -> str:
+    """``cause=CODE_CHANGED`` only from the code-hash check that runs before any window data."""
     state = load_state(ledger)
     _require(reg_sha in state.registrations, f"unknown registration {reg_sha}")
     _require(not state.closed(reg_sha), f"registration {reg_sha[:12]} already closed")
     _require(bool(reason), "an abandonment needs a reason")
+    _require(cause in (None, CODE_CHANGED), f"unknown abandonment cause {cause!r}")
     _, sha = _append(ledger, {
         "kind": ABANDONED_KIND, "registration_sha256": reg_sha, "reason": reason,
         "alpha_spent": state.registrations[reg_sha]["alpha_look"], "recorded_at": recorded_at or now_iso(),
+        **({"cause": cause} if cause else {}),
     })
     return sha

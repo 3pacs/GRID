@@ -13,7 +13,7 @@ Without the three `EDGE_STREAM_*` variables it does nothing. The cycle, under `c
 1. runs the one look of every open history registration (Polygon minute bars, cached in `bars.sqlite3`); forward
    registrations only count sessions whose bars exist until `n_target_sessions` (100) or `max_sessions` (250);
 2. a stage-1 PASS registers its forward confirmation (stage 2, alpha 0.05/k);
-3. registers at most one new stage-1 proposal per weekday (queue in `families.QUEUE`, then `inbox/*.json`),
+3. registers at most one new stage-1 proposal per weekday (queue in `template_queue.QUEUE`, then `inbox/*.json`),
    each after the sanity gate (`sanity.check`, G1–G11); rejections go to `rejections.jsonl` and a refused
    queue item is checked again the next weekday;
 4. rewrites `status.json` (machine-readable, schema `edge-stream-status/1`) and `DIGEST.md` (a view of it).
@@ -33,7 +33,9 @@ Look reports: `looks/<registration sha[:16]>.json` (0444, schema `edge-look-repo
 | noise is measured per day or ISO week; a finer unit in a trade's `session` is refused | `stats.judge` |
 | no reuse of (group, horizon class, period): prior consumption table + every registration | `ledger.conflicts` |
 | forward windows start after registration; no outcome computed before the look | `runner.forward_progress` (presence only) |
-| look runs only on the registered family code (`code_sha256`), else abandoned | `runner.compute_look` |
+| look runs only on the registered family code (`code_sha256`), else abandoned; the check runs first in every cycle, on every lane, before any data is read (a forward registration is not left to collect to its look) | `runner._check_code` |
+| the hash is per family: its own class, the shared code of `families.py` and the other evaluation modules (`stats`, `runner`, `data`, `policy`); other families' classes, the `FAMILIES` registry and the queue (`template_queue.py`) are left out, so adding or changing one family abandons no other family's registration | `families.code_sha256` |
+| a registration abandoned at the code check (`cause: code_changed`) had none of its window read: under policy 4 its window is no longer consumed and its (family, group, lane) may register again on a new window; its alpha stays spent and it counts toward the 40. Any other abandonment keeps its window | `ledger.StreamState.unread_abandoned` / `consumption`, `runner.run_cycle` step 3 |
 | bars after the decision minute never reach the rule | `families.decision_bars` / `assert_no_lookahead` |
 | a stage-1 trial of a session family must be able to pay its costs: pooled break-even hit rate (1 + round-trip cost floor / mean \|move\|) / 2 ≤ 0.60, measured on the ~13–16 sessions **before** the window (unsigned sizes only); event families (EC1) are not priced by it | `sanity` G11 (bar source set by the CLI; `sanity` is not hashed, so the gate never abandons an open registration) |
 | expectancy test: n ≥ 100, ≥ 50 a side, both sides > 0, session bootstrap LB and clustered-t LB at 1−alpha/k > 0, beats always-long, 2 of 3 thirds | `stats.judge` |
@@ -52,6 +54,15 @@ carry on the short leg; the years before 2026 are reserved for the D0 research c
 without sealing or forming a trade:
 `python -m alpha_research.edge_stream cycle --dry-run --family EC1 --data-dir <scratch>` (prints sessions,
 filings found, companies left out, and the hour of day filings were accepted).
+
+## Unread abandonments (policy 4, owner decision 2026-11-21)
+
+The policy 3 merge (#1238) changed IM1's code while `IM1-v1:us_single_stocks:history:2024-12-19` waited for its
+look: the 2026-11-20 cycle abandoned it unread, and under policy 3 its window stayed consumed and its group counted
+as done, so single stocks could never be tested. Policy 4 adds `unread_abandonment` and the owner decision behind
+it; the ledger's consumption and the runner's queue read it from the policy in force, so it applies only to records
+after the amendment. Before merging a change to an evaluation module, check `status.json` for an open history
+registration due a look and merge after it.
 
 ## The evidence bar (policy 3, owner decision GRID#1213)
 

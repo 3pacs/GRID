@@ -1,4 +1,4 @@
-"""Frozen policy of the edge stream (``edge-stream-policy/3``).
+"""Frozen policy of the edge stream (``edge-stream-policy/4``).
 
 Everything a look is judged by lives here and is written, whole, into the
 ledger's ``edge_policy`` record at genesis (its sha256 is pinned in every
@@ -8,6 +8,12 @@ prior consumption, more groups or instruments. The one exception is a recorded
 owner decision (:data:`OWNER_DECISIONS`), which may change the few fields in
 :data:`OWNER_WAIVABLE` and nothing else. Nothing here is read from the
 environment.
+
+Version 4 (2026-11-21) adds one owner decision (:data:`UNREAD_ABANDONMENT`): a
+registration abandoned because its family's code changed before its look had none of
+its window read, so that window stops counting as consumed and the (family, group,
+lane) may register again on a new window. Its alpha stays spent and it still counts
+toward the yearly maximum. Every other abandonment keeps its window consumed.
 
 Version 3 (2026-11-16) carries the owner's two-stage evidence bar (GRID issue 1213):
 
@@ -49,7 +55,7 @@ import re
 
 from .universe import SP500_20251231
 
-POLICY_VERSION = "edge-stream-policy/3"
+POLICY_VERSION = "edge-stream-policy/4"
 LEDGER_ID = "grid-edge-looks"
 
 # --- budget -----------------------------------------------------------------------
@@ -95,7 +101,32 @@ OWNER_DECISIONS: tuple[dict, ...] = (
                    "the single 0.00125 history bar is retired for new work",
         "waives": ["budget.alpha_per_look", "budget.rule", "promotion"],
     },
+    {
+        "id": "GRID#1336",
+        "url": "PENDING",
+        "decided_by": "Anik (repository owner)",
+        "decided_on": "2026-11-21",
+        "text_sha256": "491fa4b3b9f645566e0b1e4fc9c683fb791aaf8986e57a13acbb4cca07f905a3",
+        "summary": "a registration abandoned because its family's code changed before its look had none of its "
+                   "window read: the window stops counting as consumed and the (family, group, lane) may register "
+                   "again on a new window; its alpha stays spent and it counts toward the yearly maximum",
+        "waives": [],
+    },
 )
+
+#: The rule the second owner decision adds (a new top-level policy section). The ledger's
+#: consumption and the runner's queue read it from the policy *in force*, so it applies only
+#: to records appended after the amendment that carries it.
+UNREAD_ABANDONMENT: dict = {
+    "decision": OWNER_DECISIONS[1]["id"],
+    "cause": "code_changed",
+    "rule": "a registration abandoned because its family's code hash changed before its look (the check runs "
+            "before any bar or event of its window is read, on every lane, in the first cycle after the change) "
+            "had none of its window read: that window stops counting as consumed and its (family, group, lane) "
+            "may register again on a new window, sealed and gated like any other. Its alpha stays spent and it "
+            "still counts toward max_registrations. An abandonment for any other cause (failed fetches, a look "
+            "recomputed to different bytes) keeps its window consumed",
+}
 
 # --- looks ------------------------------------------------------------------------
 FETCH_ATTEMPTS_BEFORE_ABANDON = 5
@@ -311,6 +342,7 @@ def policy_payload() -> dict:
                        "version on; earlier registrations keep the terms they were sealed with",
         },
         "owner_decisions": [dict(d) for d in OWNER_DECISIONS],
+        "unread_abandonment": dict(UNREAD_ABANDONMENT),
         "orders": "the stream never places, reviews or cancels an order",
     }
 
@@ -406,6 +438,7 @@ def amendment_violations(old: dict, new: dict) -> list[str]:
     for d in new.get("owner_decisions", [])[len(old.get("owner_decisions", [])):]:
         name = d.get("id") or "?"
         if not all(isinstance(d.get(k), str) and d[k] for k in ("id", "url", "decided_by", "decided_on", "summary")) \
+                or not re.fullmatch(r"https://github\.com/3pacs/GRID/issues/\d+#issuecomment-\d+", str(d.get("url"))) \
                 or not re.fullmatch(r"[0-9a-f]{64}", str(d.get("text_sha256", ""))) \
                 or not isinstance(d.get("waives"), list):
             bad.append(f"owner decision {name} is incomplete")
