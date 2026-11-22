@@ -125,12 +125,12 @@ OWNER_DECISIONS: tuple[dict, ...] = (
     },
     {
         "id": "GRID#1379",
-        "url": "https://github.com/3pacs/GRID/issues/1379#issuecomment-7078049008",
+        "url": "https://github.com/3pacs/GRID/issues/1379#issuecomment-7085985405",
         "decided_by": "Anik (repository owner)",
         "decided_on": "2026-11-22",
-        "text_sha256": "6be31fb6445aa04bd58fc236a9575ec47a39f2df896dd5f2ac176e842655cb9c",
+        "text_sha256": "603ac1939d464ce6962a08e09b5df2806ee75d084ec0c4880770aff531642715",
         "summary": "the 2026-11-20 abandonment of IM1-v1:us_single_stocks:history:2024-12-19 is attested unread by "
-                   "receipt 4d866b59 except 2024-12-19..24, which stay consumed; the rest of its window is freed and "
+                   "receipt 5e002ed6 except 2024-12-19..24, which stay consumed; the rest of its window is freed and "
                    "single stocks may register again; its alpha stays spent",
         "waives": ["unread_abandonment"],
     },
@@ -151,8 +151,9 @@ UNREAD_ABANDONMENT: dict = {
             "registration whose presence was counted was read: its window stays consumed and its (family, group, "
             "lane) stays closed. Any registration sealed before this policy, and any whose evidence is missing, "
             "partial or disputed, keeps its window and its (family, group, lane) closed, except a history "
-            "registration an owner decision names below with a reconciled receipt (its sha256 pinned): its window "
-            "up to consumed_through_exclusive stays consumed and the rest is freed, and only while the ledger still "
+            "registration an owner decision names below with a reconciled receipt (its sha256 pinned; its bytes, "
+            "shipped with this code, must agree with this ledger on every load): its window up to "
+            "consumed_through_exclusive stays consumed and the rest is freed, and only while the ledger still "
             "holds no look and no edge_read of it and its abandonment shows no read. The alpha of an abandoned "
             "registration stays spent and it counts toward max_registrations",
     "attested": [
@@ -162,17 +163,20 @@ UNREAD_ABANDONMENT: dict = {
             "frees_window": True,
             "proposal_id": "IM1-v1:us_single_stocks:history:2024-12-19",
             "decision": "GRID#1379",
-            "receipt": "docs/receipts/edge-stream/unread-cfa25376-20261122.json",
-            "receipt_sha256": "4d866b59699f5134308447288c8c722f7dfa598e9e7e854c5d8a767903904828",
+            "receipt": "unread-cfa25376-v2-20261122.json",
+            "receipt_sha256": "5e002ed65f177e6a39a7b5a07d7bb1cb8b102c300b75d69564a95753a555ff0a",
             "receipt_verdict": "UNREAD_EXCEPT",
             "consumed_through_exclusive": "2024-12-25",
-            "evidence": "receipt edge-unread-receipt/1 built read-only on grid-svr 2026-11-22: the ledger holds only its "
-                        "abandonment (no look, no edge_read); cycle.log holds one cycle between its registration and "
-                        "abandonment (2026-11-20 11:05:50Z, not a dry run, looks []) and no look line for it; release "
-                        "15975857 runs the code-hash check before any read in compute_look; no staged report or "
-                        "failed attempt; of eleven bar caches only two rehearsal copies (2026-11-22) hold sessions "
-                        "in its window, 2024-12-19..24, read as G11 pre-window move sizes of a rehearsed "
-                        "re-registration. Those four sessions stay consumed",
+            "evidence": "receipt edge-unread-receipt/2 built read-only on grid-svr 2026-11-22 against the 14-record "
+                        "ledger (head line 69a84820): the ledger holds only its abandonment (seq 11, no look, no "
+                        "edge_read); cycle.log holds one cycle between its registration and abandonment, not a dry "
+                        "run, with no look line for it; release 1c94dae9 rebuilds its registered code hash 799ed2d5 "
+                        "and release 15975857 rebuilds a9f28c3a, the hash the forward registration 69a84820 sealed "
+                        "in the abandoning cycle, and runs the code-hash check before any read; no staged report or "
+                        "failed attempt; every SQLite file changed since its registration on the host's disk "
+                        "filesystems was opened read-only: of ten bar caches, the live one holds nothing in its "
+                        "window and only three rehearsal copies (2026-11-22) hold sessions in it, 2024-12-19..24. "
+                        "Those four sessions stay consumed",
         },
     ],
 }

@@ -66,13 +66,44 @@ registration due a look and merge after it.
 ## Single stocks (policy 5, owner decision GRID#1379)
 
 `IM1-v1:us_single_stocks:history:2024-12-19` was sealed before `edge_read` records existed, so its own ledger
-cannot prove it unread. `python -m alpha_research.edge_stream unread-receipt` (`receipt.py`, read-only) reconciles
-the ledger, `cycle.log`, the runner of the release that ran the abandoning cycle, the data dir and every bar cache
-given to it. The receipt is `docs/receipts/edge-stream/unread-cfa25376-20261122.json` (sha256 pinned in
-`policy.UNREAD_ABANDONMENT`), verdict `UNREAD_EXCEPT`. Its four sessions read in rehearsal copies (2024-12-19..24)
-stay consumed, and the rest of the window is freed. A look, an `edge_read`, or an abandonment with dirty evidence
-for that registration voids the attestation. Owner decisions may change `unread_abandonment` (`OWNER_WAIVABLE`), so
-policy 5 amends from 3 or from 4.
+cannot prove it unread. `python -m alpha_research.edge_stream unread-receipt` (`receipt.py`, schema
+`edge-unread-receipt/2`, read-only) finds every input itself; it takes no runner bytes or cache list from the caller:
+
+- **Ledger:** the registration, its abandonment and no look or `edge_read`. The receipt pins the ledger prefix it
+  read (record count and last line sha256) and copies the registration and abandonment fields.
+- **Release bytes:** the policy-3 code hash covered every evaluation module's AST, so it identifies the code that
+  ran. The builder rebuilds it from git blobs and checks three things:
+  - the registering release reproduces the registration's `code_sha256`;
+  - a registration sealed in the abandoning cycle (the witness) reproduces under the abandoning release;
+  - the abandoned family's hash under the abandoning release differs from the registered one, the exact
+    `CodeChanged` cause.
+
+  That release's `compute_look` checks the code hash before any read.
+- **`cycle.log`:** sha256 pinned; one cycle between registration and abandonment; not a dry run; no look line.
+- **Data dir:** no staged report and no failed attempt.
+- **Every bar cache on the host:** the builder reads the mount table and walks every local filesystem. It opens every
+  SQLite file changed since the registration was sealed (WAL files from a private copy), and a file counts as a bar
+  cache when it has a schema the stream writes. The stream's own cache must be among them. The walk stops at every
+  mount point without touching it: a disk mount is walked as its own root, and the rest (proc, overlay, the FUSE
+  document portal, …) are not disks and are counted by type. Names containing `ocmri` are never opened (PHI floor)
+  and are counted and hashed per root, never named. Other SQLite files are listed by path sha256. Any unreadable
+  file refuses.
+
+The receipt lives in `alpha_research/edge_stream/receipts/` with its sha256 pinned in
+`policy.UNREAD_ABANDONMENT`. On every load, `receipt.verify` re-reads its bytes and compares them with the ledger:
+the bytes against the pinned sha, the verdict, the retained range, the ledger prefix, the registration and
+abandonment fields, and the witness code hash. Any disagreement voids the attestation, and the window stays
+consumed. So do a look, an `edge_read`, or an abandonment with dirty evidence for that registration. Sessions any
+cache holds on or after the window start stay consumed (`consumed_through_exclusive`); the rest of the window is
+freed. The first receipt (`docs/receipts/edge-stream/unread-cfa25376-20261122.json`, schema 1) took caller-supplied
+runner bytes and cache paths. Codex review of #1380 at `b31e1d68` held it, and schema 2 replaces it. Owner decisions
+may change `unread_abandonment` (`OWNER_WAIVABLE`), so policy 5 amends from 3 or from 4.
+
+The pinned receipt (`unread-cfa25376-v2-20261122.json`, sha256 `5e002ed6…`, built on grid-svr 2026-11-22 against the
+14-record ledger) is `UNREAD_EXCEPT`: about 18 million files on 14 roots, no errors, ten bar caches. The live cache
+holds nothing in the window; three rehearsal copies from 2026-11-22 hold 2024-12-19..24, which stay consumed. The
+owner decision naming it is https://github.com/3pacs/GRID/issues/1379#issuecomment-7085985405; it supersedes the
+earlier comment 7078049008, which named the schema-1 receipt.
 
 ## The evidence bar (policy 3, owner decision GRID#1213)
 

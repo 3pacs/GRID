@@ -860,9 +860,16 @@ def _live_ss_state(policy=None) -> L.StreamState:
     return state
 
 
-def test_policy_5_frees_single_stocks_except_the_sessions_read():
-    """The receipt's four read sessions stay consumed; the rest of the window is freed."""
+def test_policy_5_frees_single_stocks_except_the_sessions_read(monkeypatch):
+    """The receipt's four read sessions stay consumed; the rest of the window is freed. (The
+    receipt's binding to the ledger is tested in test_edge_stream_receipt.py; here it is taken
+    as verified, and without it nothing is freed.)"""
+    from alpha_research.edge_stream import receipt as RC
+
     state = _live_ss_state()
+    assert RC.verify(state, P.UNREAD_ABANDONMENT["attested"][0])  # a hand-built state has no ledger prefix
+    assert not state.unread_abandoned(LIVE_SS)
+    monkeypatch.setattr(RC, "verify", lambda st, entry: [])
     assert state.unread_abandoned(LIVE_SS) and state.reregistrable(LIVE_SS)
     kept = [c for c in state.consumption() if c["source"] == LIVE_SS]
     assert [(c["start"], c["end"]) for c in kept] == [("2024-12-19", "2024-12-25")]
@@ -880,7 +887,10 @@ def test_policy_4_frees_nothing_sealed_before_it():
 
 
 @pytest.mark.parametrize("contrary", ["look", "edge_read", "dirty_evidence", "no_decision", "bad_receipt_sha"])
-def test_contrary_evidence_beats_the_attestation(contrary):
+def test_contrary_evidence_beats_the_attestation(contrary, monkeypatch):
+    from alpha_research.edge_stream import receipt as RC
+
+    monkeypatch.setattr(RC, "verify", lambda st, entry: [])  # even a receipt that verifies loses
     pol = json.loads(P.canonical_bytes(P.policy_payload()))
     state = _live_ss_state(pol)
     if contrary == "look":

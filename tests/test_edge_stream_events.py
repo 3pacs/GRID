@@ -83,7 +83,8 @@ V2_RULE = ("per calendar year (UTC): q_year over at most max_registrations stage
 
 
 V5_EXCEPTION = (", except a history registration an owner decision names below with a reconciled receipt (its "
-                "sha256 pinned): its window up to consumed_through_exclusive stays consumed and the rest is freed, "
+                "sha256 pinned; its bytes, shipped with this code, must agree with this ledger on every load): its "
+                "window up to consumed_through_exclusive stays consumed and the rest is freed, "
                 "and only while the ledger still holds no look and no edge_read of it and its abandonment shows no "
                 "read. ")
 
@@ -802,13 +803,28 @@ def test_policy_5_changes_only_the_unread_section_under_its_decision():
     assert "cost floor liquid lowered or removed" in P.amendment_violations(v4_payload(), pol)
 
 
-def test_the_pinned_receipt_is_the_file_in_the_repo():
+def test_the_pinned_receipt_binds_to_the_live_ledger():
+    """The pinned bytes are the shipped file, and they agree with a copy of the live ledger taken
+    when the receipt was built (tests/fixtures/edge_stream, 14 records, 2026-11-22)."""
+    from alpha_research.edge_stream import receipt as RC
+
     hist, = [a for a in P.UNREAD_ABANDONMENT["attested"] if a["lane"] == "history"]
-    body = (REPO / hist["receipt"]).read_bytes()
+    body = (RC.RECEIPTS_DIR / hist["receipt"]).read_bytes()
     assert L.sha256_bytes(body) == hist["receipt_sha256"]
     rc = json.loads(body)
-    assert rc["schema"] == "edge-unread-receipt/1" and rc["registration_sha256"] == hist["registration_sha256"]
-    assert rc["verdict"] == hist["receipt_verdict"] == "UNREAD_EXCEPT" and rc["failed"] == []
-    assert rc["consumed_through_exclusive"] == hist["consumed_through_exclusive"] == "2024-12-25"
-    assert rc["sessions_read_on_or_after_start"] == ["2024-12-19", "2024-12-20", "2024-12-23", "2024-12-24"]
-    assert all(c["ok"] for c in rc["checks"].values())
+    assert rc["schema"] == RC.SCHEMA and rc["registration_sha256"] == hist["registration_sha256"]
+    assert rc["verdict"] == hist["receipt_verdict"] and rc["failed"] == []
+    assert rc["consumed_through_exclusive"] == hist["consumed_through_exclusive"]
+    rel = rc["checks"]["release"]["detail"]
+    assert rel["registered_release"]["code_sha256"][:8] == "799ed2d5"
+    assert [(w["registration_sha256"][:8], w["code_sha256"][:8]) for w in rel["witnesses"]] == [("69a84820", "a9f28c3a")]
+    assert rel["code_changed"] and rel["code_order"]["ok"]
+    assert rc["checks"]["caches"]["detail"]["live_cache_found"] and not rc["checks"]["caches"]["detail"]["errors"]
+    fx = REPO / "tests" / "fixtures" / "edge_stream"
+    state = L.load_state(L.open_ledger(fx / "live-ledger-20261122.jsonl", fx / "live-ledger-20261122.anchors.jsonl"))
+    assert RC.verify(state, hist) == []
+    state.policy = P.policy_payload()  # as after the amendment to policy 5
+    sha = hist["registration_sha256"]
+    assert state.reopens_unread() and state.unread_abandoned(sha) and state.reregistrable(sha)
+    kept = [(c["start"], c["end"]) for c in state.consumption() if c["source"] == sha]
+    assert kept == [("2024-12-19", hist["consumed_through_exclusive"])]

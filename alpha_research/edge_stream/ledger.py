@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from loguru import logger as log  # same logger config.log re-exports; no settings import
+
 from analysis.ledger_steered_exploration import Catalog, Ledger, sha256_bytes
 
 from . import policy as P
@@ -117,6 +119,7 @@ class StreamState:
     #: is an ``edge_read`` record in this ledger, so the absence of one is positive evidence
     marked: set[str] = field(default_factory=set)
     reads: dict[str, set[str]] = field(default_factory=dict)  # registration sha -> edge_read kinds
+    line_shas: list[str] = field(default_factory=list)  # seq -> sha256 of that ledger line
 
     def closed(self, reg_sha: str) -> bool:
         return reg_sha in self.looks or reg_sha in self.abandoned
@@ -162,7 +165,8 @@ class StreamState:
 
     def _attested_history(self) -> dict[str, dict]:
         """History registrations sealed before read records that an owner decision in the policy in
-        force attests by name, each with a pinned receipt and the date its consumed part ends."""
+        force attests by name, each with a pinned receipt and the date its consumed part ends. The
+        receipt's bytes and their agreement with this ledger are checked in :meth:`_attested_unread`."""
         rule = self.policy.get("unread_abandonment") or {}
         decisions = {d.get("id") for d in self.policy.get("owner_decisions", [])}
         out = {}
@@ -182,6 +186,12 @@ class StreamState:
             return None
         if "cause" in rec and self._code_abandonment(reg_sha, "history") is None:
             return None  # an abandonment that recorded evidence must show it clean
+        from . import receipt as RC  # imported here: receipt imports this module
+
+        problems = RC.verify(self, a)
+        if problems:
+            log.warning("edge_stream: attestation of {} void: {}", reg_sha[:12], "; ".join(problems))
+            return None
         return a
 
     def consumed_through(self, reg_sha: str) -> str | None:
@@ -268,6 +278,7 @@ def load_state(ledger: Ledger) -> StreamState:
     _require(sha256_bytes(P.canonical_bytes(pol["policy"])) == pol["policy_sha256"],
              "edge_policy payload does not match its sha256")
     state = StreamState(policy=pol["policy"], policy_sha256=pol["policy_sha256"])
+    state.line_shas = [ledger.line_sha(r["seq"]) for r in records]
     for rec in records[2:]:
         kind = rec.get("kind")
         _require(kind in STREAM_KINDS and kind != POLICY_KIND,
