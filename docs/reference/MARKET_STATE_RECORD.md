@@ -31,11 +31,21 @@ gives the age, unit, limit and basis. `stale` outranks both `ok` and `no_baselin
 | dealer gamma, spot vs flip, `gamma_state` | 0 sessions | positioning changes every session with open interest and expiries |
 | weekly and monthly inputs | period + declared lag − 1 days | claims 12, net liquidity 9, labor 72, CPI and industrial production 80, sentiment 90 |
 
-Sessions are NYSE sessions after the observation, up to and including `as_of`. The weekly and monthly limits come from
+Sessions are NYSE sessions after the observation, up to and including `as_of`. They are counted on the hash-pinned
+XNYS manifests in `docs/reference/calendar-manifests` (the prescreen parts, then `factory_session_calendar.PINS`:
+2018-04-02 to 2027-12-31), never on the approximate scheduler helpers in `ingestion/market_calendar.py`. Those
+helpers close Juneteenth in 2018–2021, before it existed, and keep 2018-12-05 and 2025-01-09 open, so they miscount
+ages in both directions. Each record names the calendar it used in `freshness_calendar`.
+- A record for a day after 2027-12-31 is refused until the manifests are extended.
+- An observation from before 2018-04-02 gets a lower-bound age (`age_is_lower_bound`).
+- The 0-session limit is a same-date rule: dealer gamma is fresh only when its row's date is the record's own date.
+
+The weekly and monthly limits come from
 `LAGS`: the next observation is public one period plus its declared lag after the current one, so anything older means
 it is overdue or was never published. Documented shutdown releases therefore read `stale`, which is what they are.
 
 The limits were measured on every stored record from 2019-01-02 to 2026-11-19, and no normal reading exceeds them.
+Counting on the pinned calendar instead of the scheduler helpers changes the status of none of those stored readings.
 Dry runs of the new rule against griddb (2026-11-21, read-only) flag only real gaps:
 - 2022-03-28: the news readings, 23 sessions old.
 - 2025-12-19: CPI, 109 days old (shutdown).

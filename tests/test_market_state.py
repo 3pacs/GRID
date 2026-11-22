@@ -340,6 +340,58 @@ def test_daily_age_counts_trading_sessions_not_calendar_days():
     assert M.freshness(date(2025, 4, 1), date(2025, 6, 21), M.MAX_AGE["cpi_yoy"])["age"] == 81
 
 
+def test_session_ages_use_the_pinned_calendar_not_the_scheduler_helpers():
+    """ingestion.market_calendar's helpers close Juneteenth before it existed and miss one-off closures; ages must
+    come from the pinned XNYS manifests (docs/reference/calendar-manifests)."""
+    from ingestion.market_calendar import trading_days_between
+
+    nxt = M.MAX_AGE["vix"]
+    # Juneteenth became an NYSE holiday in 2022: Friday 2020-06-19 was a session, so Wed -> Mon is 3 sessions.
+    assert len(trading_days_between(date(2020, 6, 18), date(2020, 6, 22))) == 2          # the helper's wrong count
+    assert M.freshness(date(2020, 6, 17), date(2020, 6, 22), nxt) | {"basis": ""} == {
+        "status": "stale", "age": 3, "unit": "sessions", "limit": 2, "basis": ""}
+    assert M.sessions_after(date(2021, 6, 17), date(2021, 6, 18)) == (1, False)          # 2021-06-18 traded
+    # 2025-01-09 (national day of mourning) and 2018-12-05 were one-off closures the helper treats as sessions.
+    assert len(trading_days_between(date(2025, 1, 8), date(2025, 1, 10))) == 3
+    assert M.freshness(date(2025, 1, 7), date(2025, 1, 10), nxt)["status"] == "fresh"   # 01-08, 01-10
+    assert M.sessions_after(date(2018, 12, 4), date(2018, 12, 6)) == (1, False)
+    start, end, days, version = M.xnys_sessions()
+    assert (start, end) == (date(2018, 4, 2), date(2027, 12, 31)) and version.startswith("pinned XNYS: ")
+    assert date(2022, 11, 11) in days and date(2022, 11, 24) not in days                # prescreen/factory seam
+
+
+def test_gamma_freshness_is_the_same_date_rule_not_a_zero_session_count():
+    g = M.MAX_AGE["dealer_gamma"]
+    assert M.freshness(date(2021, 6, 17), date(2021, 6, 18), g)["status"] == "stale"     # 06-18 was a session
+    assert M.freshness(date(2025, 6, 9), date(2025, 6, 9), g)["status"] == "fresh"
+    # A Friday row read on Saturday is 0 sessions old but is still not that day's capture.
+    assert M.freshness(date(2025, 6, 6), date(2025, 6, 7), g) | {"basis": ""} == {
+        "status": "stale", "age": 0, "unit": "sessions", "limit": 0, "basis": ""}
+
+
+def test_session_ages_outside_the_pinned_calendar_never_guess():
+    with pytest.raises(ValueError, match="outside the pinned XNYS calendar"):
+        M.sessions_after(date(2027, 12, 30), date(2028, 1, 3))
+    age, lower_bound = M.sessions_after(date(2017, 12, 29), date(2018, 4, 5))
+    assert (age, lower_bound) == (4, True)                                               # 04-02..04-05, at least
+    fresh = M.freshness(date(2017, 12, 29), date(2018, 4, 5), M.MAX_AGE["vix"])
+    assert fresh["status"] == "stale" and fresh["age_is_lower_bound"] is True
+    with pytest.raises(ValueError, match="before the pinned XNYS calendar"):
+        M.freshness(date(2018, 3, 29), date(2018, 4, 2), M.MAX_AGE["vix"])               # 1 known session, maybe more
+    with pytest.raises(ValueError, match="outside the pinned XNYS calendar"):
+        M.compute_market_state(None, date(2028, 1, 3))                                   # refused before any read
+
+
+def test_prescreen_pins_restated_here_match_the_prescreen_module():
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "analysis/factory_prescreen.py").read_text()
+    pins = [ast.literal_eval(n.value) for n in ast.parse(src).body if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "PINS" for t in n.targets)]
+    assert pins == [M.PRESCREEN_XNYS_PINS]
+
+
 def test_a_daily_input_that_stops_arriving_reads_stale_with_its_reading_kept(engine):
     _seed(engine)
     _drop(engine, ["CBOE:VIX", "CBOE:VIX3M"], date(2025, 6, 3))
@@ -371,6 +423,7 @@ def test_gamma_from_an_earlier_session_is_stale_not_current(engine):
     gs = st["gamma_state"]
     assert gs["status"] == "stale" and gs["obs_date"] == "2025-06-09" and gs["regime"] == "negative_gamma"
     assert gs["freshness"]["age"] == 1 and gs["freshness"]["limit"] == 0 and "limit 0" in gs["reason"]
+    assert st["freshness_calendar"] == M.xnys_sessions()[3]
     g = st["variables"]["dealer_gamma"]
     # No baseline and stale: stale wins, and the reason keeps both facts.
     assert g["status"] == "stale" and "baseline needs 120" in g["reason"] and "robust_z" not in g

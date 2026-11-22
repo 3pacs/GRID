@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_right
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
@@ -542,16 +543,83 @@ if set(MAX_AGE) != set(VAR_NAMES):
     raise RuntimeError(f"MAX_AGE must cover exactly VARIABLES: {sorted(set(MAX_AGE) ^ set(VAR_NAMES))}")
 
 
-def freshness(obs_date: date, as_of: date, max_age: MaxAge) -> dict[str, Any]:
-    """Age of ``obs_date`` at ``as_of`` in ``max_age``'s unit, and whether it is past the limit."""
-    if max_age.unit == "sessions":
-        from ingestion.market_calendar import trading_days_between
+# Session ages count real NYSE sessions from the hash-pinned XNYS manifests in docs/reference/calendar-manifests,
+# never the approximate scheduler helpers in ingestion.market_calendar. Those close Juneteenth before it existed
+# (2020, 2021) and miss one-off closures such as 2025-01-09, so they misjudge ages both ways. The prescreen parts
+# are analysis/factory_prescreen.PINS, restated because that module imports the whole factory (a test keeps them
+# equal); the later parts are analysis/factory_session_calendar.PINS. Prescreen ends 2022-11-11 and the factory
+# parts start 2022-11-01: the overlap must agree.
+PRESCREEN_XNYS_PINS = (
+    ("prescreen-xnys-2018-04-02-2020-12-31.json", "88312f9a547c809737a8c94b5d9b51e0e5f38117cb51ecaec2bd639ced7138ba"),
+    ("prescreen-xnys-2021-01-01-2022-11-11.json", "aee287ed567cf53c072d2378aa6437fe9bfcbbe8b6186fcc8bf4ab6109bc4dc5"),
+)
+_MANIFEST_ROOT = Path(__file__).resolve().parents[2] / "docs/reference/calendar-manifests"
+_xnys_cache: tuple[date, date, tuple[date, ...], str] | None = None
 
-        age = len(trading_days_between(obs_date + timedelta(days=1), as_of))
+
+def xnys_sessions() -> tuple[date, date, tuple[date, ...], str]:
+    """(first covered day, last covered day, every session in order, version) from the pinned manifests.
+
+    Raises ValueError when a manifest fails its pin or permission check, the parts leave a gap, or two parts
+    disagree on a day both cover: an age is never counted on a calendar that is not the pinned one.
+    """
+    global _xnys_cache
+    if _xnys_cache is None:
+        from analysis.factory_session_calendar import PINS as FACTORY_XNYS_PINS
+        from ingestion.market_calendar import ManifestCalendar
+
+        pins = PRESCREEN_XNYS_PINS + tuple(FACTORY_XNYS_PINS)
+        days: set[date] = set()
+        start = end = None
+        for name, sha in pins:
+            part = ManifestCalendar(_MANIFEST_ROOT / name, sha)
+            own = {date.fromisoformat(s.key.split(":")[1]) for s in part.sessions}
+            if end is not None:
+                if part.start > end + timedelta(days=1):
+                    raise ValueError(f"XNYS calendar gap between {end} and {part.start}")
+                if {d for d in days if d >= part.start} != {d for d in own if d <= end}:
+                    raise ValueError(f"XNYS calendar parts disagree between {part.start} and {end}")
+            days |= own
+            start = part.start if start is None else start
+            end = part.end if end is None else max(end, part.end)
+        _xnys_cache = (start, end, tuple(sorted(days)), "pinned XNYS: " + ",".join(sha for _, sha in pins))
+    return _xnys_cache
+
+
+def sessions_after(obs_date: date, as_of: date) -> tuple[int, bool]:
+    """NYSE sessions strictly after ``obs_date`` up to and including ``as_of``, and whether that is a lower bound.
+
+    An ``obs_date`` before the calendar's first day counts from that day, so the count is a lower bound. An ``as_of``
+    past its last day raises: extend the manifests rather than guess.
+    """
+    start, end, days, _ = xnys_sessions()
+    if not start <= as_of <= end:
+        raise ValueError(f"as_of {as_of} is outside the pinned XNYS calendar ({start}..{end}); extend the manifests")
+    lower_bound = obs_date < start
+    first = bisect_right(days, max(obs_date, start - timedelta(days=1)))
+    return bisect_right(days, as_of) - first, lower_bound
+
+
+def freshness(obs_date: date, as_of: date, max_age: MaxAge) -> dict[str, Any]:
+    """Age of ``obs_date`` at ``as_of`` in ``max_age``'s unit, and whether it is past the limit.
+
+    A limit of 0 sessions is the same-date rule: fresh only when ``obs_date`` is ``as_of`` itself.
+    """
+    out: dict[str, Any] = {"unit": max_age.unit, "limit": max_age.limit, "basis": max_age.basis}
+    if max_age.unit == "sessions":
+        age, lower_bound = sessions_after(obs_date, as_of)
+        if lower_bound:
+            out["age_is_lower_bound"] = True
+        if max_age.limit == 0:
+            stale = obs_date != as_of
+        elif lower_bound and age <= max_age.limit:
+            raise ValueError(f"cannot establish the age of {obs_date}: it is before the pinned XNYS calendar")
+        else:
+            stale = age > max_age.limit
     else:
         age = (as_of - obs_date).days
-    return {"status": "stale" if age > max_age.limit else "fresh", "age": age, "unit": max_age.unit,
-            "limit": max_age.limit, "basis": max_age.basis}
+        stale = age > max_age.limit
+    return {"status": "stale" if stale else "fresh", "age": age, **out}
 
 
 def _stale_reason(obs_date: date, fresh: dict[str, Any]) -> str:
@@ -615,6 +683,7 @@ class MarketState:
     spy_basis: str | None = None
     writer_provenance: dict[str, Any] | None = None
     source_lineage: dict[str, Any] | None = None
+    freshness_calendar: str | None = None   # the pinned XNYS manifests session ages were counted on
 
     def to_dict(self) -> dict[str, Any]:
         ok = [k for k, v in self.variables.items() if v.get("status") == "ok"]
@@ -622,6 +691,7 @@ class MarketState:
             "rule": RECORD_RULE,
             "baseline_rule": BASELINE_RULE,
             "freshness_rule": FRESHNESS_RULE,
+            "freshness_calendar": self.freshness_calendar,
             "as_of": self.as_of.isoformat(),
             "availability": "date-bounded with source-specific availability rules; modeled-lag backfills may use revised vintages",
             "variables": self.variables,
@@ -641,8 +711,9 @@ class MarketState:
 
 def compute_market_state(engine: Engine, as_of: date, *, calendar: dict[str, list[date]] | None = None) -> MarketState:
     """Every variable in :data:`VARIABLES` at ``as_of``, standardized against its own trailing baseline."""
+    sessions_after(as_of, as_of)  # fail before any read when as_of is outside the pinned XNYS calendar
     reads = _Reads(engine, as_of, LOOKBACK_DAYS)
-    state = MarketState(as_of=as_of)
+    state = MarketState(as_of=as_of, freshness_calendar=xnys_sessions()[3])
     for spec in VARIABLES:
         window, min_obs = window_for(spec.cadence)
         base = {"group": spec.group, "unit": spec.unit, "cadence": spec.cadence}

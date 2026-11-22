@@ -96,7 +96,7 @@ def code_receipt() -> dict:
     names = ("scripts/run_market_state.py", "intelligence/regime/market_state.py",
              "intelligence/regime/baseline.py", "intelligence/regime/state_vector.py",
              "physics/dealer_gex_daily.py", "ingestion/market_calendar.py",
-             "store/observations.py", "store/fred_vintages.py",
+             "store/observations.py", "store/fred_vintages.py", "analysis/factory_session_calendar.py",
              "config/econ_release_dates.json")
     return {name: hashlib.sha256((_ROOT / name).read_bytes()).hexdigest()
             if (_ROOT / name).is_file() else None for name in names}
