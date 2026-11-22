@@ -50,7 +50,7 @@ REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v9-preregistration.md")
 #: SHA-256 of the UTF-8 LF body strictly between <!-- PREREG-BODY-START --> and <!-- PREREG-BODY-END -->.
 #: Recompute and re-pin after filling operator placeholder tokens in the body.
-PREREG_BODY_SHA256 = "7d7b42ac4093d1051e60013317ff438cf47d4921e93420d4f19048fe43ffd077"
+PREREG_BODY_SHA256 = "cb0780b4f027033f89124d0c7725f6e49124cc3ec70b78cec2741b87097aaece"
 
 #: Pinned XNYS session calendar manifest (replaces XLK closes as the session calendar).
 XNYS_MANIFEST_PATH = Path("docs/reference/calendar-manifests/vs1-xnys-2007-11-01-2026-06-30.json")

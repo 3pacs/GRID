@@ -508,6 +508,7 @@ def _bind_v9_all(monkeypatch, tmp_path: Path):
         "@@OWNER_RULING_R9_FILE_SHA256@@": SYNTH_R9_SHA,
         "@@V8_STOP_HEAD_SHA256@@": v8_stop_head,
         "@@SECTORS_V6_STOP_HEAD_SHA256@@": s6_stop_head,
+        "@@OWNER_RULING_HOLDOUT_OVERLAP@@": SYNTH_HOLDOUT_OVERLAP_RULING,
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -522,6 +523,34 @@ def _bind_v9_all(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(v9, "SECTORS_V6_STOP_HEAD_SHA256", s6_stop_head)
     monkeypatch.setattr(v9, "SECTORS_V6_STOP_ANCHOR_LINE", s6_stop_line)
     return vault, v8_reg, v8_stop_head, s6_stop_head, probe_dir, body_sha
+
+
+SYNTH_HOLDOUT_OVERLAP_RULING = "synthetic owner ruling on the 2020-2022 related-look overlap"
+
+
+def test_v9_body_discloses_related_form4_looks_and_holds_registration_for_the_owner_ruling(tmp_path, monkeypatch):
+    """Codex GRID-DESK-BOUNDARIES-20261122: the body names each related Form 4
+    look and the windows it read, and registration refuses until the owner
+    rules on the 2020-2022 holdout overlap."""
+    body = v1.prereg_body((REPO / v9.PREREG_PATH).read_text(encoding="utf-8"))
+    for record_id in (
+        "gemini-ic1-form4-insider-2010-2018", "insider-buying-index-2010-2022",
+        "insider-cluster-index-2010-2022", "insider-buying-smallcap-2010-2022",
+        "insider-cluster-smallcap-2010-2022", "insider-buying-longer-holds",
+    ):
+        assert f"`{record_id}`" in body
+    assert "2009-12-15..2018-12-31" in body and "2020-01-01..2022-12-30" in body
+    assert "@@OWNER_RULING_HOLDOUT_OVERLAP@@" in body
+
+    _bind_v9_all(monkeypatch, tmp_path)
+    filled = Path(v9.PREREG_PATH)
+    unruled = filled.read_text(encoding="utf-8").replace(SYNTH_HOLDOUT_OVERLAP_RULING, "@@OWNER_RULING_HOLDOUT_OVERLAP@@")
+    unruled_path = tmp_path / "vs1-v9-prereg-unruled.md"
+    unruled_path.write_text(unruled, encoding="utf-8")
+    monkeypatch.setattr(v9, "PREREG_PATH", unruled_path)
+    monkeypatch.setattr(v9, "PREREG_BODY_SHA256", v1.prereg_body_sha256(unruled_path))
+    with pytest.raises(PermissionError, match="placeholder"):
+        v9.check_ready_to_register(tmp_path)
 
 
 def test_v9_verify_v8_terminal_and_census_mirror_v8(tmp_path, monkeypatch):
