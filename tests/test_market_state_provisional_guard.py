@@ -16,6 +16,9 @@ What this file holds fixed:
 * The decision writer still refuses today's date and still targets the prior session, also when the provisional
   writer has already run for today after the close.
 * A provisional record cannot land in ``market_state_daily``.
+* The provisional path never refreshes the FRED vintages, no flag can turn a refresh on, and its compute always
+  passes the availability cutoff (Codex HOLD on #1360).
+* Only the reviewed migration creates the table outside SQLite tests: production never runs CREATE TABLE for it.
 """
 
 from __future__ import annotations
@@ -42,14 +45,17 @@ WRITE_API = ("store_provisional_market_state", "ensure_provisional_table", "prov
 WRITER = "scripts/run_market_state.py"
 RECORD = "intelligence/regime/market_state.py"
 DISPLAY = "analysis/desk_brief_sources.py"
+MIGRATION = "migrations/versions/market_state_prov_20261122.py"
 # token -> the only non-test .py files that may contain it
-ALLOWED_FILES = {TABLE: {WRITER, RECORD, DISPLAY}, **{name: {WRITER, RECORD} for name in WRITE_API}}
+ALLOWED_FILES = {TABLE: {WRITER, RECORD, DISPLAY, MIGRATION}, **{name: {WRITER, RECORD} for name in WRITE_API}}
 # file -> the top-level definitions whose string literals may name the provisional table
 ALLOWED_DEFINITIONS = {
     RECORD: {"store_market_state",            # its refusal message names the right table
-             "PROVISIONAL_TABLE", "_PROVISIONAL_TABLE_SQL", "_PROVISIONAL_INSERT_SQL"},
+             "PROVISIONAL_TABLE", "PROVISIONAL_MIGRATION", "_PROVISIONAL_TABLE_SQL", "_PROVISIONAL_INSERT_SQL",
+             "ensure_provisional_table"},     # SQLite only; its docstring names the migration
     WRITER: {"<module docstring>", "existing_provisional_row", "run_provisional"},
     DISPLAY: {"<module docstring>", "_MSP_SQL", "_provisional", "market_state"},
+    MIGRATION: {"<module docstring>", "TABLE", "GRANTS", "downgrade"},
 }
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".claude", ".pytest_cache", "pwa_dist",
              "tests"}
@@ -161,12 +167,47 @@ def test_decision_writer_main_only_dispatches_to_the_provisional_mode():
         assert "provisional" not in ast.unparse(node).lower(), fn
 
 
+def _function(path: str, name: str) -> ast.FunctionDef:
+    return next(n for n in ast.parse(SOURCES[path]).body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_the_provisional_path_has_no_refresh_and_always_passes_the_cutoff():
+    fn = _function(WRITER, "run_provisional")
+    called = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert not called & {"refresh", "refresh_vintages", "backfill", "fetch", "no_refresh", "SERIES"}
+    imports = {n.module for n in ast.walk(fn) if isinstance(n, ast.ImportFrom)}
+    assert not any(m and "fred_vintages" in m for m in imports), imports
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "compute_market_state"]
+    assert len(calls) == 1 and [k.arg for k in calls[0].keywords if k.arg == "known_by"] == ["known_by"]
+
+
+def test_no_flag_turns_a_vintage_refresh_on():
+    options = {o for a in W.build_parser()._actions for o in a.option_strings if "refresh" in o}
+    assert options == {"--no-refresh"}, "a refresh-on flag must be refused with --provisional before it lands"
+
+
+def test_only_the_reviewed_migration_creates_the_table_outside_sqlite():
+    ddl = ("CREATE TABLE IF NOT EXISTS market_state_provisional", "CREATE TABLE market_state_provisional")
+    creators = sorted(f for f, src in SOURCES.items() if any(d in src for d in ddl))
+    assert creators == sorted({MIGRATION, RECORD})
+    # In market_state.py the SQLite DDL is executed only by ensure_provisional_table, which refuses other databases.
+    users = {node.name for node in ast.parse(SOURCES[RECORD]).body if isinstance(node, ast.FunctionDef)
+             and any(isinstance(n, ast.Name) and n.id == "_PROVISIONAL_TABLE_SQL" for n in ast.walk(node))}
+    assert users == {"ensure_provisional_table"}
+    pg = create_engine("postgresql+psycopg2://nobody:nothing@127.0.0.1:9/none")     # never connected
+    with pytest.raises(RuntimeError, match="market_state_prov_20261122"):
+        M.ensure_provisional_table(pg)
+
+
 # ── behaviour: the decision writer and the decision table ────────────────────
 
-def _state(target: date) -> M.MarketState:
+def _state(target: date, known_by: datetime | None = None) -> M.MarketState:
     st = M.MarketState(target)
     st.gamma_state = {"status": "ok", "obs_date": target.isoformat()}
     st.variables = {"vix": {"status": "ok", "obs_date": target.isoformat(), "age_days": 0}}
+    st.source_lineage = ({"availability_cutoff": {"at": known_by.isoformat(), "reads": dict(M.CUTOFF_READS)}}
+                         if known_by is not None else {})
     return st
 
 
@@ -178,7 +219,7 @@ def engine():
 @pytest.fixture(autouse=True)
 def bounded(monkeypatch):
     monkeypatch.setattr(M, "load_calendar", dict)
-    monkeypatch.setattr(M, "compute_market_state", lambda e, t, **kw: _state(t))
+    monkeypatch.setattr(M, "compute_market_state", lambda e, t, **kw: _state(t, kw.get("known_by")))
 
 
 def _clock(monkeypatch, now: str) -> None:

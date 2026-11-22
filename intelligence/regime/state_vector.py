@@ -481,8 +481,13 @@ def _fill_vix_trailing_gap(reader: _AsOfReader) -> int:
     return len(fill)
 
 
-def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
+def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date, *,
+                             release_as_of: date | None = None) -> pd.Series | None:
     """Best-effort PIT read of the resolved ``spy_full`` feature.
+
+    ``release_as_of`` (default ``as_of``) bounds ``release_date`` separately from the observation window: the
+    provisional market-state record (#1312) counts only rows released before its session's day, because
+    ``resolved_series`` keeps no write clock finer than a date.
 
     Mirrors ``alpha_research.realized_alpha.resolve_spy_feature`` +
     ``load_price_path`` (the re-resolve's own PIT reader, through
@@ -496,7 +501,7 @@ def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Se
         from alpha_research.realized_alpha import load_price_path, resolve_spy_feature
 
         feature_id, _name = resolve_spy_feature(engine)
-        series = load_price_path(engine, feature_id, cutoff, as_of, as_of)
+        series = load_price_path(engine, feature_id, cutoff, as_of, as_of if release_as_of is None else release_as_of)
     except Exception as exc:
         log.debug("state_vector: resolved spy_full unavailable ({e}); falling back to raw YF series", e=str(exc))
         return None

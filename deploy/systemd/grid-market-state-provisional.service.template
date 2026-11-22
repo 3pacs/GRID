@@ -4,6 +4,11 @@
 # decision record is still written the next evening by grid-market-state.service.
 # The only reader is the post-close desk brief (analysis/desk_brief_sources.py), which labels every line
 # "PROVISIONAL (display only)" and shows it only until the session's decision record exists.
+# The record is computed from the inputs GRID held at the session's close (an exact availability cutoff), and the
+# writer never refreshes the FRED vintages: --no-refresh below is kept for clarity and changes nothing.
+# The table comes from alembic migration market_state_prov_20261122 (deploy.yml runs `alembic upgrade head`);
+# the writer never creates it and refuses while it is missing. Check it exists before enabling the timer:
+#   psql -d griddb -c "SELECT to_regclass('market_state_provisional')"
 # Install (on grid-svr), only after an explicit operator decision:
 #   sudo cp deploy/systemd/grid-market-state-provisional.service.template /etc/systemd/system/grid-market-state-provisional.service
 #   sudo cp deploy/systemd/grid-market-state-provisional.timer.template   /etc/systemd/system/grid-market-state-provisional.timer

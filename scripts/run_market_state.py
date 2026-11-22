@@ -15,10 +15,12 @@ Usage:
 
 ``--provisional`` (#1312) writes a display-only record for today's UTC session, and only at or after that session's
 close in the pinned XNYS calendar (``analysis/factory_session_calendar.PINS``); before the close, or on a day that is
-not a session, it refuses with exit 2. It uses the same ``compute_market_state`` at an earlier clock, writes to its
-own table (never ``market_state_daily``), insert-only unless ``--replace``, and never takes ``--from/--to``,
-``--as-of`` or ``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is
-still the one this writer makes the next evening.
+not a session, it refuses with exit 2. It runs ``compute_market_state`` with ``known_by`` = that close, an exact
+availability cutoff, so a rerun hours later reads only what GRID held at the close. It never refreshes the FRED
+vintages (``--no-refresh`` is accepted and changes nothing; no flag turns a refresh on). It writes to its own table
+(never ``market_state_daily``), insert-only unless ``--replace``, and never takes ``--from/--to``, ``--as-of`` or
+``--require-target-dealer``. Nothing that decides reads it; the decision record for the session is still the one
+this writer makes the next evening.
 
 Before computing, a real run fetches the FRED vintages published since the last stored one for the news indexes
 (``ingestion/fred_vintages.py``; ``--no-refresh`` skips it). First time: ``python -m ingestion.fred_vintages backfill``.
@@ -61,8 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-target-dealer", action="store_true",
                    help="hold a daily write unless dealer gamma is from the exact target session; exit 3 on hold")
     p.add_argument("--provisional", action="store_true",
-                   help="display-only record for today's UTC session, at or after its close (#1312); "
-                        "refuses before the close or on a non-session (exit 2)")
+                   help="display-only record for today's UTC session, from the inputs held at its close (#1312); "
+                        "refuses before the close or on a non-session (exit 2); never refreshes vintages")
     return p
 
 
@@ -259,7 +261,11 @@ def existing_provisional_row(engine, target: date) -> dict | None:  # engine: sq
 
 
 def run_provisional(a: argparse.Namespace, engine=None) -> int:
-    """Today's UTC session at or after its close, into market_state_provisional. Display only (#1312)."""
+    """Today's UTC session at or after its close, into market_state_provisional. Display only (#1312).
+
+    The record is computed with the session's close as its availability cutoff, and this path never refreshes the
+    FRED vintages: a refresh writes rows fetched now, and those are after the close by construction.
+    """
     if a.start or a.end or a.as_of or a.require_target_dealer:
         print("market-state: --provisional targets today's session only; no --from/--to, --as-of or "
               "--require-target-dealer", file=sys.stderr)
@@ -286,27 +292,24 @@ def run_provisional(a: argparse.Namespace, engine=None) -> int:
 
         engine = get_engine()
     started = now.isoformat()
+    cutoff = session.closes.astimezone(timezone.utc)
     run_id = str(uuid.uuid4())
-    refresh, written = [], 0
+    written = 0
     old = None if a.dry_run or a.replace else existing_provisional_row(engine, target)
     if old is not None:
         outcome = {"target_session": target.isoformat(), "outcome": "already_present", "written_this_run": False,
                    "forward_qualified": False, "stored_computed_at": str(old["computed_at"]),
                    "stored_rule": old["rule"], "reason": "existing provisional row preserved"}
     else:
-        if not a.dry_run and not a.no_refresh:
-            from ingestion.fred_vintages import SERIES
-            from ingestion.fred_vintages import refresh as refresh_vintages
-
-            refresh = [refresh_vintages(engine, s) for s in SERIES]
-        state = compute_market_state(engine, target, calendar=load_calendar())
+        state = compute_market_state(engine, target, calendar=load_calendar(), known_by=cutoff)
         ready = readiness(state.to_dict(), target)
         state.writer_provenance = {
             "run_id": run_id, "started_at": started, "target_session": target.isoformat(),
-            "cutoff_exclusive": (target + timedelta(days=1)).isoformat() + "T00:00:00+00:00",
+            "availability_cutoff": cutoff.isoformat(),
+            "minutes_after_close": round((now - cutoff).total_seconds() / 60, 1),
             "mode": PROVISIONAL_MODE, "decision_use": PROVISIONAL_DECISION_USE, "table": PROVISIONAL_TABLE,
             "session_closes": session.closes.isoformat(), "calendar": cal.version,
-            "computed_after_close": True,
+            "computed_after_close": True, "vintage_refresh": "never",
             "dry_run": a.dry_run, "replace": a.replace, "target_dealer_required": False,
             "execution_origin": "unverified", "code_sha256": code_receipt(), "readiness": ready,
         }
@@ -330,7 +333,8 @@ def run_provisional(a: argparse.Namespace, engine=None) -> int:
                "table": PROVISIONAL_TABLE, "run_id": run_id, "target_session": target.isoformat(),
                "session_closes": session.closes.isoformat(), "written": written,
                "already_present": int(outcome["outcome"].startswith("already_present")), "outcomes": [outcome],
-               "vintage_refresh": [{k: r.get(k) for k in ("series", "status", "rows_sent")} for r in refresh],
+               "availability_cutoff": cutoff.isoformat(),
+               "vintage_refresh": "never: a provisional run reads only what GRID held at the close",
                "generated_at": datetime.now(timezone.utc).isoformat()}
     print(json.dumps(summary, default=str) if a.json else
           f"market-state provisional {target}: {written} written, {summary['already_present']} already present")

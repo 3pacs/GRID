@@ -15,7 +15,7 @@ daily indexes in the morning, US Central).
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import pandas as pd
@@ -51,6 +51,12 @@ _READ_SQL = text(
     "WHERE series_id = :s AND obs_date >= :o0 AND obs_date <= :o1 AND realtime_start <= :rt1"
 )
 
+# The same read with the row's fetch clock, for a read cut at an instant (fetched_at is set on first insert only).
+_READ_FETCHED_SQL = text(
+    "SELECT obs_date, realtime_start, realtime_end, value, fetched_at FROM fred_vintages "
+    "WHERE series_id = :s AND obs_date >= :o0 AND obs_date <= :o1 AND realtime_start <= :rt1"
+)
+
 _LAST_SQL = text("SELECT MAX(realtime_start), MIN(realtime_start), COUNT(*) FROM fred_vintages WHERE series_id = :s")
 
 
@@ -81,10 +87,30 @@ def coverage(engine: Engine, series_id: str) -> dict[str, Any]:
     return {"rows": int(n or 0), "first_vintage": str(first) if first else None, "last_vintage": str(last) if last else None}
 
 
-def load(engine: Engine, series_id: str, obs_start: date, obs_end: date, rt_until: date) -> pd.DataFrame:
-    """Vintage rows for observations in ``[obs_start, obs_end]`` published by ``rt_until``."""
+def _fetched_instant(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    ts = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+
+
+def load(engine: Engine, series_id: str, obs_start: date, obs_end: date, rt_until: date, *,
+         fetched_by: datetime | None = None) -> pd.DataFrame:
+    """Vintage rows for observations in ``[obs_start, obs_end]`` published by ``rt_until``.
+
+    ``fetched_by`` (timezone-aware) keeps only the rows GRID had fetched by that instant (``fetched_at``, a naive
+    CURRENT_TIMESTAMP taken as UTC; a row without one is not known). Without it the read is unchanged.
+    """
+    if fetched_by is not None and fetched_by.utcoffset() is None:
+        raise ValueError("fetched_by must be timezone-aware")
+    params = {"s": series_id, "o0": obs_start, "o1": obs_end, "rt1": rt_until}
     with engine.connect() as conn:
-        rows = conn.execute(_READ_SQL, {"s": series_id, "o0": obs_start, "o1": obs_end, "rt1": rt_until}).fetchall()
+        if fetched_by is None:
+            rows = conn.execute(_READ_SQL, params).fetchall()
+        else:
+            cut = fetched_by.astimezone(timezone.utc)
+            rows = [r[:4] for r in conn.execute(_READ_FETCHED_SQL, params).fetchall()
+                    if (t := _fetched_instant(r[4])) is not None and t <= cut]
     df = pd.DataFrame(rows, columns=["obs_date", "realtime_start", "realtime_end", "value"])
     for c in ("obs_date", "realtime_start", "realtime_end"):
         # Plain dates: the open end 9999-12-31 is past pandas' nanosecond Timestamp range.

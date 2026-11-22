@@ -67,6 +67,10 @@ def collect(kind: str, session: B.SessionTimes, prev_day: date, as_of: datetime,
     sec, tr = S.records(cfg["records_url"], as_of)
     sections.append(sec)
     trials += tr
+    if cfg.get("factory"):
+        sec, tr = S.factory_slots(cfg["factory"]["panel"], cfg["factory"].get("signals_db"), kind, session, as_of)
+        sections.append(sec)
+        trials += tr
     for spec in cfg.get("ledgers") or []:
         trials.append(S.ledger_trial(spec, kind, session, prev_day, as_of))
     if cfg.get("selector"):

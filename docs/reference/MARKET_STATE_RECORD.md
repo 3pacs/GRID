@@ -64,27 +64,57 @@ America/New_York on D) runs before it exists, so a second record, computed at D'
 display only (owner's decision, bring-up plan rev 100).
 
 - **Table**: `market_state_provisional` (as_of_date PK, rule, record JSONB, computed_at TIMESTAMPTZ, `provisional
-  BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional)`). It is created by the writer, like `market_state_daily`.
-  `store_market_state` refuses a provisional record, so one never lands in `market_state_daily`.
-- **Record**: `compute_market_state` unchanged: the same rule, at an earlier clock. Each stored record adds
-  `"provisional": true`, `"decision_use": "display_only"` and a `label`. The label says the record was computed at
-  the close from the data available then, and that the session's decision record is written the next evening.
+  BOOLEAN NOT NULL DEFAULT TRUE CHECK (provisional)`). It comes from the alembic migration
+  `migrations/versions/market_state_prov_20261122.py`, with the GRANT footer, and `schema.sql` declares the same
+  statement. Production never creates it at runtime: the module's ensure runs on SQLite (tests) only, and on
+  Postgres the store refuses to write while the table is missing. `store_market_state` refuses a provisional
+  record, so one never lands in `market_state_daily`.
+- **Availability cutoff**: the session's close, exactly. The record is `compute_market_state(..., known_by=close)`:
+  the same record rule, with every read cut at that instant instead of the end of the UTC day. A rerun hours
+  later reads the same inputs, so nothing that reached GRID after the close can appear in it (Codex HOLD on
+  #1360). The decision record passes no cutoff and is unchanged. Each read is cut on the clock its store keeps:
+
+  | Read | Cut |
+  |---|---|
+  | `raw_series` (`read_window_known_at(as_of_ts=)`) | `pull_timestamp` at or before the cutoff. A modeled known-at date or a release override counts only once its UTC day has ended. |
+  | `fred_vintages` (`load(fetched_by=)`) | `fetched_at` at or before the cutoff |
+  | `dealer_gex_daily` | `created_at` at or before the cutoff; a row without one is not known |
+  | resolved `spy_full` | `release_date` before the session's day, because `resolved_series` has no finer write clock |
+
+  The last row has a cost. When the resolver released the previous session's SPY close on the session's own
+  day, the provisional SPY trend reads one session older, and so `stale`. That is honest, but it is a gap.
+- **Record**: each stored record adds the following:
+  - `"provisional": true` and `"decision_use": "display_only"`.
+  - A `label`: computed from the inputs GRID held at the close, with nothing that arrived later; the decision
+    record is written the next evening.
+  - `availability_cutoff`, the writer's clock `computed_at`, and `minutes_after_close`.
+  - `source_lineage.availability_cutoff`, which names each read's cut.
+
+  A late run is labelled, not refused. With the cutoff in place it cannot change the inputs, and a fixed limit
+  would mark every early-close day late (21:15Z is 195 minutes after an 18:00Z close).
 - **Writer**: `scripts/run_market_state.py --provisional`. It targets today's UTC session, and only at or after
   that session's `closes` in the pinned XNYS parts (`factory_session_calendar.PINS`). That close is 21:00Z, 20:00Z
   in summer, or 18:00Z on an early close.
   - Before the close, or on a day that is not a session, it refuses with exit 2.
   - It never takes `--from/--to`, `--as-of` or `--require-target-dealer`.
-  - It is insert-only (`--replace` rewrites) and refreshes the FRED vintages first, as the nightly writer does.
-  - Its provenance says `mode: provisional`, `decision_use: display_only`, the session's close and the calendar version.
+  - It never refreshes the FRED vintages, whatever flags are passed. `--no-refresh` is accepted and changes
+    nothing, and no flag turns a refresh on (`--refresh` is an argparse usage error).
+  - It is insert-only; `--replace` rewrites.
+  - Its provenance says `mode: provisional`, `decision_use: display_only`, the cutoff, the minutes after the
+    close, `vintage_refresh: never` and the calendar version.
   - Timer: `deploy/systemd/grid-market-state-provisional.*.template`, weekdays 21:15Z, `Persistent=false`, with its
-    own lock. Not installed; the operator installs it.
+    own lock. It is not installed: the operator installs it after the migration is applied.
 - **Reader**: only the post-close desk brief, and only while the session's decision record is not there yet
-  (`docs/reference/DESK_BRIEF.md`). Every line starts with `PROVISIONAL (display only)`.
+  (`docs/reference/DESK_BRIEF.md`). Every line starts with `PROVISIONAL (display only)` and states the cutoff and
+  how long after the close the record was computed. A record whose cutoff is not the session's close is not shown.
 - **Guard**: `tests/test_market_state_provisional_guard.py`.
-  - Only the writer, this module and `analysis/desk_brief_sources.py` may name the table (docs aside).
-  - Inside those three, only reviewed definitions may name it.
+  - Only the writer, this module, `analysis/desk_brief_sources.py` and the migration may name the table (docs aside).
+  - Inside those files, only reviewed definitions may name it.
   - No reader of `market_state_daily` names it.
+  - The provisional path has no refresh and always passes the cutoff.
+  - Only the migration creates the table outside SQLite.
   - The decision writer still refuses today and targets the prior session.
+  - `tests/test_market_state_provisional_cutoff.py` holds the delayed-input test.
 
 ## Variables (v1)
 

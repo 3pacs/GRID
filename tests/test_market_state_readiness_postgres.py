@@ -154,14 +154,58 @@ def test_range_preserves_existing_and_writes_only_missing(engine, capsys):
 
 
 # ── provisional record at the close (#1312, display only) ────────────────────
+#
+# Production never creates market_state_provisional: these tests create it with the reviewed migration's own DDL.
 
-def test_provisional_table_is_jsonb_timestamptz_and_provisional_only(engine, monkeypatch, capsys):
+CLOSE_1113 = "2026-11-13T21:00:00+00:00"
+
+
+def _migration():
+    spec = importlib.util.spec_from_file_location(
+        "market_state_prov_migration", Path(__file__).resolve().parents[1] / "migrations/versions/market_state_prov_20261122.py")
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+    return mig
+
+
+def _migrate(engine):
+    mig = _migration()
+    with engine.begin() as c:
+        c.execute(text(mig.TABLE))
+        c.execute(text(mig.GRANTS))
+
+
+def _with_cutoff(s, known_by):
+    s.source_lineage = {"availability_cutoff": {"at": known_by.isoformat(), "reads": dict(M.CUTOFF_READS)}}
+    return s
+
+
+@pytest.fixture()
+def provisional_compute(monkeypatch):
+    """compute_market_state as the real one reports a cutoff: only when it is given one (the provisional writer)."""
+    monkeypatch.setattr(M, "compute_market_state", lambda e, t, **kw: _with_cutoff(state(t), kw["known_by"])
+                        if kw.get("known_by") is not None else state(t))
+
+
+def test_provisional_store_refuses_while_the_migration_is_not_applied(engine, monkeypatch, provisional_compute):
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(W, "utc_now", lambda: datetime(2026, 11, 13, 21, 15, tzinfo=timezone.utc))
+    with pytest.raises(RuntimeError, match="apply alembic migration market_state_prov_20261122"):
+        W.main(["--provisional", "--json"], engine)
+    with pytest.raises(RuntimeError, match="production never creates it"):
+        M.ensure_provisional_table(engine)
+    assert not inspect(engine).has_table("market_state_provisional")
+
+
+def test_provisional_table_is_jsonb_timestamptz_and_provisional_only(engine, monkeypatch, capsys, provisional_compute):
     from datetime import datetime, timezone
 
     from sqlalchemy.exc import IntegrityError
 
+    _migrate(engine)
     monkeypatch.setattr(W, "utc_now", lambda: datetime(2026, 11, 13, 21, 15, tzinfo=timezone.utc))  # after 21:00Z
-    assert W.main(["--provisional", "--json", "--no-refresh"], engine) == 0
+    assert W.main(["--provisional", "--json"], engine) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["written"] == 1 and out["target_session"] == "2026-11-13"
     with engine.connect() as c:
@@ -171,24 +215,28 @@ def test_provisional_table_is_jsonb_timestamptz_and_provisional_only(engine, mon
     assert row["computed_at"].utcoffset() is not None
     assert row["record"]["provisional"] is True and row["record"]["decision_use"] == "display_only"
     assert row["record"]["writer_provenance"]["mode"] == "provisional"
+    assert row["record"]["availability_cutoff"] == CLOSE_1113
     assert not inspect(engine).has_table("market_state_daily")
     with pytest.raises(IntegrityError), engine.begin() as c:
         c.execute(text("INSERT INTO market_state_provisional (as_of_date, rule, record, provisional) "
                        "VALUES ('2026-11-12', 'market-state/2', CAST('{}' AS JSONB), FALSE)"))
-    assert W.main(["--provisional", "--json", "--no-refresh"], engine) == 0       # insert-only
+    assert W.main(["--provisional", "--json"], engine) == 0       # insert-only
     assert json.loads(capsys.readouterr().out)["already_present"] == 1
+    with engine.begin() as c:                                    # the GRANT footer ran (the role exists here)
+        assert c.execute(text("SELECT has_table_privilege('grid', 'market_state_provisional', 'INSERT')")).scalar()
 
 
-def test_desk_brief_reads_the_provisional_record_in_its_read_only_transaction(engine, monkeypatch, capsys):
+def test_desk_brief_reads_the_provisional_record_in_its_read_only_transaction(engine, monkeypatch, capsys,
+                                                                               provisional_compute):
     from datetime import datetime, timedelta, timezone
 
     from analysis import desk_brief_sources as S
     from analysis.desk_brief import SessionTimes
 
+    _migrate(engine)
     assert W.main(["--json", "--no-refresh"], engine) == 0                       # decision record for 2026-11-13
-    monkeypatch.setattr(W, "utc_today", lambda: date(2026, 11, 16))
     monkeypatch.setattr(W, "utc_now", lambda: datetime(2026, 11, 16, 21, 15, tzinfo=timezone.utc))
-    assert W.main(["--provisional", "--json", "--no-refresh"], engine) == 0      # provisional for 2026-11-16
+    assert W.main(["--provisional", "--json"], engine) == 0                      # provisional for 2026-11-16
     capsys.readouterr()
     session = SessionTimes(date(2026, 11, 16), datetime(2026, 11, 16, 14, 30, tzinfo=timezone.utc),
                            datetime(2026, 11, 16, 21, 0, tzinfo=timezone.utc))
@@ -196,5 +244,32 @@ def test_desk_brief_reads_the_provisional_record_in_its_read_only_transaction(en
     sec = S.market_state(engine, "post_close", session, as_of)
     assert sec.status == "ok" and sec.facts["record_date"] == "2026-11-13"
     assert sec.facts["provisional"]["record_date"] == "2026-11-16"
+    assert sec.facts["provisional"]["availability_cutoff"] == "2026-11-16T21:00:00Z"
     assert any(line.startswith("PROVISIONAL (display only): record for session 2026-11-16") for line in sec.lines)
     assert "market_state_provisional" in sec.source and not sec.problems
+
+
+def test_cutoff_reads_on_postgres_column_types(engine):
+    """fred_vintages.fetched_at is a naive TIMESTAMP (UTC session); dealer_gex_daily.created_at is TIMESTAMPTZ."""
+    from datetime import datetime, timezone
+
+    from store import fred_vintages as FV
+
+    close = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
+    FV.ensure_table(engine)
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE dealer_gex_daily (obs_date DATE, ticker TEXT, spot_price DOUBLE PRECISION, "
+                       "net_gex_usd_m DOUBLE PRECISION, spot_to_flip_pct DOUBLE PRECISION, "
+                       "gamma_flip_strike DOUBLE PRECISION, gex_regime TEXT, created_at TIMESTAMPTZ DEFAULT NOW())"))
+        c.execute(text("INSERT INTO dealer_gex_daily VALUES ('2026-11-19', 'SPY', 600, -1, -1, 606, 'S', "
+                       "'2026-11-19 22:00:00+00'), ('2026-11-20', 'SPY', 600, -1, -1, 606, 'L', "
+                       "'2026-11-20 17:30:00-05')")) # 22:30Z, written after the close
+        c.execute(text("INSERT INTO fred_vintages (series_id, obs_date, realtime_start, realtime_end, value, fetched_at) "
+                       "VALUES ('USEPUINDXD', '2026-11-18', '2026-11-19', '9999-12-31', 1, '2026-11-19 23:15:00'), "
+                       "('USEPUINDXD', '2026-11-19', '2026-11-20', '9999-12-31', 2, '2026-11-20 23:15:00')"))
+    reads = M._Reads(engine, date(2026, 11, 20), 30, known_by=close)
+    assert [str(d) for d in reads.gex_rows().index] == ["2026-11-19"]
+    assert len(M._Reads(engine, date(2026, 11, 20), 30).gex_rows()) == 2
+    cut = FV.load(engine, "USEPUINDXD", date(2026, 11, 1), date(2026, 11, 20), date(2026, 11, 20), fetched_by=close)
+    assert list(cut["value"]) == [1.0]
+    assert len(FV.load(engine, "USEPUINDXD", date(2026, 11, 1), date(2026, 11, 20), date(2026, 11, 20))) == 2

@@ -1,15 +1,30 @@
-"""Synthetic cuts only; never opens a research artifact."""
+"""Synthetic cuts and a synthetic factory run only; never opens a research artifact."""
 import copy
 import hashlib
 import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from analysis import cross_section_factory as X
 from analysis.desk_conditional_cards import conditional_factory_cards, render_conditional_cards
+from tests.test_cross_section_factory import RUN, build, ledger_at, write_run
 
 
 def cut(n=40, net=-2.5):
     return {"nights": n, "gross_bp": 1.5, "net_bp": net, "sd_bp": 10.0, "t_gross": 0.95}
+
+
+def entry(dim, group, net, n=40):
+    return {"cut": dim, "value": group, "nights": n, "net_bp": net, "t_gross": 0.95}
+
+
+def paid_split():
+    """What the factory's paid_split would list for fixture() if its floor were 40 nights."""
+    return {"where_it_paid": [entry("market_phase", "rising", 4.0)],
+            "where_it_did_not": [entry("market_phase", "falling", -9.0), entry("sector", "tech", -5.0),
+                                 entry("year", "2020", -2.5)]}
 
 
 def fixture():
@@ -111,6 +126,40 @@ class ConditionalTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.adapt()
 
+    def test_paid_split_checked_against_cuts_and_not_carried(self):
+        self.assertEqual(self.adapt()["cards"][0]["producer_paid_split"], "not_supplied")
+        self.rep["cards"]["a"].update(paid_split())
+        result = self.adapt()
+        card = result["cards"][0]
+        self.assertEqual(card["producer_paid_split"], "checked_against_cuts_not_carried")
+        self.assertEqual(card["cuts"]["market_phase"], self.rep["cards"]["a"]["market_phase"])
+        # The favorable cuts are never re-listed in size order, in the dict or the text.
+        self.assertNotIn("where_it_paid", json.dumps(result))
+        self.assertNotIn("where_it_did_not", json.dumps(result))
+        self.assertNotIn("where_it", self.adapt(render=True))
+
+    def test_paid_split_that_is_not_a_copy_of_a_cut_rejected(self):
+        def net_changed(s): s["where_it_paid"][0]["net_bp"] = 4.5
+        def nights_changed(s): s["where_it_did_not"][0]["nights"] = 39
+        def t_changed(s): s["where_it_did_not"][0]["t_gross"] = None
+        def missing_cut(s): s["where_it_paid"].append(entry("market_phase", "sideways", 1.0))
+        def missing_dimension(s): s["where_it_paid"].append(entry("unknown_regime", "good", 1.0))
+        def unscored_cut(s): s["where_it_paid"].append({**entry("year", "2021", 1.0), "nights": 20})
+        def wrong_side(s): s["where_it_paid"].append(s["where_it_did_not"].pop(0))
+        def listed_twice(s): s["where_it_did_not"].append(dict(s["where_it_did_not"][0]))
+        def extra_field(s): s["where_it_paid"][0]["rank"] = 1
+        def non_text_label(s): s["where_it_paid"][0]["value"] = ["rising"]
+        def not_a_list(s): s["where_it_paid"] = {"0": s["where_it_paid"][0]}
+        def one_side_only(s): del s["where_it_did_not"]
+        for change in (net_changed, nights_changed, t_changed, missing_cut, missing_dimension, unscored_cut,
+                       wrong_side, listed_twice, extra_field, non_text_label, not_a_list, one_side_only):
+            self.rep = fixture()
+            split = paid_split()
+            change(split)
+            self.rep["cards"]["a"].update(split)
+            with self.subTest(change=change.__name__), self.assertRaises(ValueError):
+                self.adapt()
+
     def test_missing_and_empty_cards_distinct(self):
         del self.rep["cards"]
         with self.assertRaises(ValueError):
@@ -180,6 +229,45 @@ class ConditionalTest(unittest.TestCase):
         for dim in ("fed_balance_sheet", "vix_third", "sector_phase", "group", "sector_vs_market", "sector"):
             self.assertEqual(result["cuts"][dim], card[dim])
         self.assertNotIn("sector", result["partition_coverage"])
+
+
+class FactoryReportTest(unittest.TestCase):
+    """The adapter reads the report the cross-section factory actually writes, so the two cannot drift apart."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build(root)
+            cls.report = X.run(write_run(root, RUN), root, root / "state.db", ledger_at(root), root / "out")
+            cls.raw = (root / "out" / "report.json").read_bytes()
+        cls.now = datetime.now(timezone.utc)
+
+    def adapt(self, raw, render=False):
+        return (render_conditional_cards if render else conditional_factory_cards)(
+            raw, expected_sha256=hashlib.sha256(raw).hexdigest(), receipt_id="r1", observed_at=self.now,
+            available_at=self.now, as_of=self.now, max_age=timedelta(days=1))
+
+    def test_a_factory_report_is_adapted_with_every_cut_and_no_paid_ranking(self):
+        result = self.adapt(self.raw)
+        self.assertTrue(result["cards_complete_for_ranking"])
+        self.assertEqual(len(result["cards"]), self.report["trial_count"])
+        self.assertTrue(any(self.report["cards"][c["trial_id"]]["where_it_paid"] for c in result["cards"]))
+        for card in result["cards"]:
+            source = self.report["cards"][card["trial_id"]]
+            self.assertEqual(card["producer_paid_split"], "checked_against_cuts_not_carried")
+            self.assertEqual(card["overall"], source["overall"])
+            self.assertEqual(card["cuts"], {k: v for k, v in source.items() if k in card["cuts"]})
+            self.assertEqual(set(source) - set(card["cuts"]),
+                             {"overall", "state_rows_matched", "where_it_paid", "where_it_did_not"})
+        self.assertNotIn("where_it_paid", json.dumps(result))
+        self.assertIn("# Development conditional outcomes", self.adapt(self.raw, render=True))
+
+    def test_an_unknown_field_on_a_factory_card_is_still_refused(self):
+        rep = json.loads(self.raw)
+        next(iter(rep["cards"].values()))["unknown_regime"] = {"good": {"nights": 5}}
+        with self.assertRaisesRegex(ValueError, "unknown conditional card fields"):
+            self.adapt(json.dumps(rep, indent=2).encode())
 
 
 if __name__ == "__main__":

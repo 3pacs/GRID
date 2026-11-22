@@ -36,8 +36,12 @@ def engine():
     return create_engine("sqlite://")
 
 
-def state(target: date) -> M.MarketState:
+def state(target: date, known_by: datetime | None = None) -> M.MarketState:
+    """What compute_market_state returns; with ``known_by`` it names its cutoff, as the real one does."""
     st = M.MarketState(target)
+    st.source_lineage = {"schema": "market-state-source-lineage/1"}
+    if known_by is not None:
+        st.source_lineage["availability_cutoff"] = {"at": known_by.isoformat(), "reads": dict(M.CUTOFF_READS)}
     st.gamma_state = {"status": "stale", "obs_date": "2026-11-19", "reason": "no capture for the session yet"}
     st.variables = {"vix": {"status": "ok", "obs_date": "2026-11-19", "age_days": 1, "label": "high",
                             "robust_z": 2.4},
@@ -52,7 +56,8 @@ def bounded(monkeypatch):
 
     def compute(engine, target, **kw):
         calls.append(target)
-        return state(target)
+        assert kw["known_by"] == W.provisional_target(W.utc_now())[1].closes     # always the session's close
+        return state(target, kw["known_by"])
 
     monkeypatch.setattr(W, "utc_now", lambda: z("2026-11-20T21:15:00Z"))
     monkeypatch.setattr(W, "utc_today", lambda: date(2026, 11, 20))
@@ -147,14 +152,21 @@ def test_record_is_labelled_provisional_with_writer_provenance(engine, capsys):
     assert rule == M.RECORD_RULE == rec["rule"] and rec["as_of"] == "2026-11-20" and provisional in (1, True)
     assert computed_at is not None
     assert rec["provisional"] is True and rec["decision_use"] == "display_only"
-    assert rec["label"] == M.PROVISIONAL_LABEL.format(day="2026-11-20")
-    assert "computed at the close of session 2026-11-20 from the data available then" in rec["label"]
+    assert rec["label"] == M.PROVISIONAL_LABEL.format(day="2026-11-20", cutoff="2026-11-20T21:00:00+00:00")
+    assert "inputs GRID held at the close of session 2026-11-20 (2026-11-20T21:00:00+00:00)" in rec["label"]
+    assert "nothing that arrived later is in it" in rec["label"]
     assert "decision record is written to market_state_daily the next evening (#1191)" in rec["label"]
+    assert rec["availability_cutoff"] == "2026-11-20T21:00:00+00:00"
+    assert rec["computed_at"] == "2026-11-20T21:15:00+00:00" and rec["minutes_after_close"] == 15.0
+    assert summary["availability_cutoff"] == "2026-11-20T21:00:00+00:00"
+    assert summary["vintage_refresh"].startswith("never")
     p = rec["writer_provenance"]
     assert p["mode"] == "provisional" and p["decision_use"] == "display_only"
     assert p["table"] == "market_state_provisional" and p["target_session"] == "2026-11-20"
     assert p["started_at"] == "2026-11-20T21:15:00+00:00" and p["session_closes"] == "2026-11-20T21:00:00+00:00"
     assert p["computed_after_close"] is True and p["calendar"].startswith("pinned XNYS: ")
+    assert p["availability_cutoff"] == "2026-11-20T21:00:00+00:00" and p["minutes_after_close"] == 15.0
+    assert p["vintage_refresh"] == "never" and "cutoff_exclusive" not in p
     assert p["run_id"] == summary["run_id"] and p["execution_origin"] == "unverified"
     assert p["target_dealer_required"] is False and p["dry_run"] is False and p["replace"] is False
     assert p["readiness"]["forward_qualified"] is False and p["readiness"]["dealer_target_ready"] is False
@@ -182,14 +194,21 @@ def test_insert_only_unless_replace(engine, monkeypatch, capsys, bounded):
 
 
 def test_store_is_insert_only_and_refuses_a_decision_record(engine):
-    st = state(DAY)
+    close = z("2026-11-20T21:00:00Z")
+    st = state(DAY, close)
     with pytest.raises(ValueError, match="mode 'provisional'"):
         M.store_provisional_market_state(engine, st)        # no provenance: not the provisional writer's
     st.writer_provenance = {"mode": "daily"}
     with pytest.raises(ValueError, match="mode 'provisional'"):
         M.store_provisional_market_state(engine, st)
+    # A provisional record must carry the cutoff it was computed with.
+    st.writer_provenance = {"mode": "provisional", "availability_cutoff": close.isoformat()}
+    for lineage in ({}, {"availability_cutoff": {"at": "2026-11-20T20:00:00+00:00"}}):
+        no_cut = state(DAY)
+        no_cut.source_lineage, no_cut.writer_provenance = lineage, st.writer_provenance
+        with pytest.raises(ValueError, match="availability cutoff"):
+            M.store_provisional_market_state(engine, no_cut)
     assert tables(engine) == set()
-    st.writer_provenance = {"mode": "provisional"}
     assert M.store_provisional_market_state(engine, st) is True
     assert M.store_provisional_market_state(engine, st) is False
     assert M.store_provisional_market_state(engine, st, replace=True) is True
@@ -214,12 +233,21 @@ def test_dry_run_prints_the_labelled_record_and_writes_nothing(engine, capsys):
     assert tables(engine) == set()
 
 
-def test_refreshes_vintages_first_like_the_decision_writer(engine, monkeypatch, capsys):
+@pytest.mark.parametrize("extra", [[], ["--no-refresh"], ["--replace"], ["--dry-run"]])
+def test_never_refreshes_vintages_whatever_flags_are_passed(engine, monkeypatch, capsys, extra):
     import ingestion.fred_vintages as F
 
-    seen = []
-    monkeypatch.setattr(F, "refresh", lambda eng, s: seen.append(s) or {"series": s, "status": "SUCCESS",
-                                                                         "rows_sent": 0})
-    assert W.main(["--provisional", "--json"], engine) == 0
-    summary = json.loads(capsys.readouterr().out)
-    assert seen == list(F.SERIES) and [r["series"] for r in summary["vintage_refresh"]] == list(F.SERIES)
+    for name in ("refresh", "backfill", "fetch"):
+        monkeypatch.setattr(F, name, lambda *a, _n=name, **kw: pytest.fail(f"provisional run called {_n}"))
+    assert W.main(["--provisional", "--json", *extra], engine) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert (out["writer_provenance"] if "--dry-run" in extra else out)["vintage_refresh"].startswith("never")
+
+
+def test_an_explicit_refresh_is_a_usage_error(engine, capsys):
+    """No flag turns a refresh on; asking for one with --provisional is refused before anything runs."""
+    for extra in (["--refresh"], ["--refresh-vintages"]):
+        with pytest.raises(SystemExit) as stop:
+            W.main(["--provisional", *extra], engine)
+        assert stop.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
+    assert tables(engine) == set()
