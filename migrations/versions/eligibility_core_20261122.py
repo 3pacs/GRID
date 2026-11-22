@@ -1,7 +1,7 @@
 """Turn core market and flow features model-eligible, and astrological ones off, keeping a pre-image (#1301).
 
 Revision ID: eligibility_core_20261122
-Revises: agent_report_reads_20261122
+Revises: agent_report_ask_checks_20261122
 Create Date: 2026-11-22 00:00:00.000000
 
 DO NOT MERGE before the order agreed for #1301:
@@ -36,7 +36,7 @@ from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
 revision: str = "eligibility_core_20261122"
-down_revision: Union[str, Sequence[str], None] = "agent_report_reads_20261122"
+down_revision: Union[str, Sequence[str], None] = "agent_report_ask_checks_20261122"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
