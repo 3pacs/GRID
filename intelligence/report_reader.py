@@ -265,7 +265,7 @@ def ask_key(line: str) -> str:
     """The same ask written twice (two reports, small wording changes) keys the same: words, lower case, sorted."""
     import hashlib
     words = sorted(set(_WORD.findall(line.lower())) - _STOP)
-    return hashlib.sha1(" ".join(words).encode()).hexdigest()[:16]
+    return hashlib.sha256(" ".join(words).encode()).hexdigest()[:16]
 
 
 def _terms(s: str) -> set[str]:
