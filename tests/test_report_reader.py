@@ -297,7 +297,8 @@ def test_repeated_ask_reopens_and_digest_never_drops_a_model_verdict(monkeypatch
             a("s", "Merge GRID #1400.", Chk(True, "github: spoofed by the model", 5), 4),     # model text, model source
             a("m", "Install the cron: Anik's word.", Chk(True, "Anik ran the installer", 5), 4),
             a("r", "Deploy at close: Anik's word.", Chk(True, "deployed", 5), 6),       # repeated after the check
-            a("o", "Pick a slice: Anik.", None, 4)]
+            a("o", "Pick a slice: Anik.", None, 4),
+            a("w", "Run deploy-alerting.sh: Anik.", Chk(True, "owner: done", 5, "owner", None), 4)]
     assert not RR.is_current(asks[3]) and RR.is_current(asks[2])
     monkeypatch.setattr(RR, "open_asks", lambda engine, since: asks)
     monkeypatch.setattr(RR, "coverage", lambda engine, since: [])
@@ -312,6 +313,36 @@ def test_repeated_ask_reopens_and_digest_never_drops_a_model_verdict(monkeypatch
     assert "Probably settled, check (2):" in text and "Install the cron" in text         # model verdicts still shown
     assert "Merge GRID #1400" in text                                                    # a spoofed 'github:' stays visible
     assert "Settled on GitHub (merged): 1." in text and "Merge GRID #1335" not in text
+    assert "Closed by you: 1." in text and "deploy-alerting" not in text
+
+
+def test_local_client_never_returns_a_paid_provider(monkeypatch):
+    import llm.router as router
+    asked = []
+
+    def fake(p):
+        asked.append(p)
+        return object() if p in ("ollama", "gemini") else None
+    monkeypatch.setattr(router, "get_provider_client", fake)
+    client, provider = RR.local_client()
+    assert provider == "ollama" and client is not None
+    assert not set(asked) & set(router._PAID_PROVIDERS)                          # paid names never even asked
+    monkeypatch.setattr(router, "get_provider_client", lambda p: None)
+    assert RR.local_client() == (None, None)
+
+
+def test_owner_closure(monkeypatch):
+    import pytest
+    eng = AskEngine([])
+    monkeypatch.setattr(RR, "open_asks", lambda engine, since: [ask("k1", "Pick a slice: Anik.")])
+    row = RR.close_ask(eng, "k1", "  done:\n#1290 merged ")
+    assert row["source"] == "owner" and row["settled"] is True and row["settled_by"] is None
+    assert row["how"] == "owner: done: #1290 merged" and eng.rows == [row]
+    with pytest.raises(KeyError):
+        RR.close_ask(eng, "nope", "x")
+    with pytest.raises(ValueError):
+        RR.close_ask(eng, "k1", "   ")
+
 
 
 # ---------------------------------------------------------------- access: agent reports are admin-only
