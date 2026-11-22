@@ -821,6 +821,9 @@ FACTORS = {   # every value is known before the close of decision day d, like th
     "reversal_21": "the opposite of the return over the 21 sessions through the close of d-1 (one-month reversal)",
     "momentum_12_1": "the return over the 231 sessions ending 21 sessions before the close of d-1 (12-1 momentum)",
 }
+MAX_CONDITION = 30.0   # Belsley, Kuh and Welsch's line for a strong near-dependence among scaled columns
+IDENTIFIED, RANK_DEFICIENT, ILL_CONDITIONED = 0, 1, 2
+_FIT_STATUS = ("identified", "rank_deficient", "ill_conditioned")
 RESIDUAL_METHOD = [
     ("each night, the ranked names' factor values become cross-sectional ranks scaled to -0.5 .. 0.5 (a missing value "
      "sits at 0, the middle)"),
@@ -829,9 +832,14 @@ RESIDUAL_METHOD = [
     ("attribution: each night's outcomes are regressed across the ranked names on the factor ranks and sector dummies; "
      "the module's spread then splits exactly into each factor's coefficient times the book's exposure, a sector part "
      "and a residual"),
+    ("identification: a night's split between the named factors and the sector counts only when the factor ranks, with "
+     "the intercept and sector dummies taken out and each column scaled to unit length, have full rank and a condition "
+     f"number of at most {MAX_CONDITION:g}. On any other night the factors and the sector together go to "
+     "'unidentified' and only the residual, which does not depend on the split, is kept. A factor that no ranked name "
+     "has that night is left out of the check: its exposure and its part are 0"),
     "the regression uses that night's own outcomes, so it describes what the spread was made of; it forecasts nothing",
     ("liquidity halves: the same module ranked again inside the names at or above, and below, that night's median "
-     "dollar volume, charged the module's own cost"),
+     "dollar volume; each half is charged the run's cost rule on its own turnover"),
     "names: each name's share of the mean spread; gross_without_top_bp leaves out the largest contributors",
     "correlation: Pearson of the nightly gross spreads of two carded modules on the nights both traded (30 or more)",
     "descriptive only: nothing here enters the bar or the selection",
@@ -895,16 +903,40 @@ def _centered_ranks(block: np.ndarray) -> np.ndarray:
     return np.where(np.isnan(out), 0.0, out)
 
 
+def _identified(x: np.ndarray, dummies: np.ndarray | None) -> tuple[int, float | None]:
+    """(status, condition number) of the factor ranks ``x`` once the intercept and the sector dummies are projected
+    out and each column is scaled to unit length: IDENTIFIED with full column rank and a condition number of at most
+    MAX_CONDITION, else RANK_DEFICIENT or ILL_CONDITIONED. A factor no name has (ranks all 0) is left out: it adds
+    nothing to any spread. The condition number is None when it is not defined."""
+    live = np.flatnonzero(np.any(x != 0, axis=0))
+    if not len(live):
+        return IDENTIFIED, None
+    base = np.column_stack([np.ones(len(x))] + ([dummies] if dummies is not None else []))
+    xs = x[:, live]
+    xt = xs - base @ np.linalg.lstsq(base, xs, rcond=None)[0]
+    norm = np.linalg.norm(xt, axis=0)
+    if (norm <= 1e-9 * np.linalg.norm(xs, axis=0)).any():        # a factor the sectors account for on their own
+        return RANK_DEFICIENT, None
+    s = np.linalg.svd(xt / norm, compute_uv=False)
+    if s[-1] <= s[0] * max(xt.shape) * np.finfo(float).eps:
+        return RANK_DEFICIENT, None
+    cond = float(s[0] / s[-1])
+    return (IDENTIFIED if cond <= MAX_CONDITION else ILL_CONDITIONED), cond
+
+
 def _fit(x: np.ndarray, dummies: np.ndarray | None, y: np.ndarray) -> tuple | None:
     """Cross-sectional OLS of y on an intercept, the factor ranks and the sector dummies: (factor coefficients,
-    sector coefficients, residual per row; NaN where y is missing), or None with too few outcomes to fit."""
+    sector coefficients, residual per row with NaN where y is missing, ``_identified`` status, condition number), or
+    None with too few outcomes to fit. The fitted values, and so the residual, are unique even when the coefficients
+    are not; the factor and sector coefficients are used only on an IDENTIFIED night."""
     ok = ~np.isnan(y)
     a = np.column_stack([np.ones(len(y)), x] + ([dummies] if dummies is not None else []))
     if ok.sum() < 3 * a.shape[1]:
         return None
     coef = np.linalg.lstsq(a[ok], y[ok], rcond=None)[0]
     k = x.shape[1]
-    return coef[1:1 + k], coef[1 + k:], y - a @ coef
+    status, cond = _identified(x[ok], dummies[ok] if dummies is not None else None)
+    return coef[1:1 + k], coef[1 + k:], y - a @ coef, status, cond
 
 
 def _weights(book: Book, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -947,8 +979,10 @@ def residual_cards(panel: Panel, run: RunFile, states: States, results: dict, co
     tick = np.array(panel.cols, dtype=object)
     rows = [r for r, d in enumerate(panel.sessions[:-1]) if run.first_session <= d <= run.last_session]
     n_d, n_s, n_f = len(panel.sessions), len(panel.sectors), len(names_f)
+    per_side = run.cost_bp_per_side * 1e-4
     wanted = set(carded)
     acc = {}
+    half_prev: dict = {}            # (trial, half) -> (night, (bottom picks, top picks)) of that half's last book
     for spec in run.signal_specs():
         mods = [m for m in run.modules() if m["signal"] == spec["name"] and m["trial_id"] in wanted]
         if not mods:
@@ -960,8 +994,11 @@ def residual_cards(panel: Panel, run: RunFile, states: States, results: dict, co
         for m in mods:
             acc[m["trial_id"]] = {"expo": np.full((n_d, n_f), np.nan), "part": np.full((n_d, n_f), np.nan),
                                   "known": np.full((n_d, n_f), np.nan),
-                                  "sector": np.full(n_d, np.nan), "resid": np.full(n_d, np.nan),
-                                  "liquid": np.full(n_d, np.nan), "other": np.full(n_d, np.nan),
+                                  "sector": np.full(n_d, np.nan), "unident": np.full(n_d, np.nan),
+                                  "resid": np.full(n_d, np.nan), "status": np.full(n_d, -1, dtype=np.int8),
+                                  "cond": np.full(n_d, np.nan),
+                                  **{f"{h}{s}": np.full(n_d, np.nan) for h in ("liquid", "other")
+                                     for s in ("", "_turnover", "_cost")},
                                   "by_name": np.zeros(len(panel.cols))}
         for r in rows:
             idx = _night_index(panel, run, states, eligible[r], gate, r)
@@ -979,29 +1016,42 @@ def residual_cards(panel: Panel, run: RunFile, states: States, results: dict, co
             fits: dict = {}
             for m in mods:
                 tid, y = m["trial_id"], ys[m["horizon"]][r]
+                a = acc[tid]
+                for key, half in halves.items():   # each half is a book of its own: its picks, turnover and cost
+                    hb = _book(sig[r], tick, half, m, y, half_sectors[key])
+                    if hb is None or not hb.traded:
+                        continue
+                    last = half_prev.get((tid, key))
+                    adjacent = last is not None and last[0] == r - 1
+                    turn = _turnover(last[1] if adjacent else None, hb.lo, hb.hi) if m["horizon"] == "close_1d" else 1.0
+                    a[key][r], a[f"{key}_turnover"][r] = hb.gross, turn
+                    a[f"{key}_cost"][r] = SIDES[m["horizon"]] * per_side * turn
+                    half_prev[(tid, key)] = (r, (hb.lo, hb.hi))
                 book = _book(sig[r], tick, idx, m, y, by_sector)
                 if book is None or not book.traded or math.isnan(book.gross):
                     continue
                 cols, w = _weights(book, y)
-                if abs(float(w @ y[cols]) - results[tid]["gross"][r]) > 1e-9:
+                spread = float(w @ y[cols])
+                if abs(spread - results[tid]["gross"][r]) > 1e-9:
                     raise RuntimeError(f"the residual card's book for {tid} on {panel.sessions[r]} does not give back "
                                        "the spread the bar judged")
                 if m["horizon"] not in fits:
                     fits[m["horizon"]] = _fit(x, dummies, y[idx])
                 fit = fits[m["horizon"]]
-                a = acc[tid]
-                for key, half in halves.items():
-                    hb = _book(sig[r], tick, half, m, y, half_sectors[key])
-                    if hb is not None and hb.traded and not math.isnan(hb.gross):
-                        a[key][r] = hb.gross
                 if fit is None:
                     continue
-                coef_f, coef_s, resid = fit
+                coef_f, coef_s, resid, status, cond = fit
                 p = np.searchsorted(idx, cols)
                 ex = w @ x[p]
-                a["expo"][r], a["part"][r], a["known"][r] = ex, coef_f * ex, known
-                a["sector"][r] = float(w @ (dummies[p] @ coef_s)) if dummies is not None else 0.0
+                a["expo"][r], a["known"][r], a["status"][r] = ex, known, status
                 a["resid"][r] = float(w @ resid[p])
+                if cond is not None:
+                    a["cond"][r] = cond
+                if status == IDENTIFIED:
+                    a["part"][r] = coef_f * ex
+                    a["sector"][r] = float(w @ (dummies[p] @ coef_s)) if dummies is not None else 0.0
+                else:                              # factors and sector together; how they split is not pinned down
+                    a["unident"][r] = spread - a["resid"][r]
                 np.add.at(a["by_name"], cols, w * y[cols])
     for tid in carded:
         if tid in acc:
@@ -1009,19 +1059,34 @@ def residual_cards(panel: Panel, run: RunFile, states: States, results: dict, co
     return body
 
 
+def _half_cut(a: dict, key: str) -> dict:
+    """A liquidity half's summary, net of its own cost, with its mean turnover on the nights it is summarised."""
+    out = _cut(a[key], a[f"{key}_cost"])
+    if "gross_bp" in out:
+        out["turnover"] = round(float(a[f"{key}_turnover"][~np.isnan(a[key])].mean()), 4)
+    return out
+
+
 def _residual_summary(a: dict, gross: np.ndarray, cost: np.ndarray, tick: np.ndarray, names_f: list) -> dict:
+    """Means over the fitted nights. The named factor and sector parts sum over the identified nights only and
+    ``unidentified`` over the rest, all divided by every fitted night, so the parts still add up to the gross."""
     keep = ~np.isnan(a["resid"])
     n = int(keep.sum())
-    halves = {k: _cut(a[k], cost) for k in ("liquid", "other")}
+    halves = {k: _half_cut(a, k) for k in ("liquid", "other")}
     if n < 30:
         return {"nights": n, "liquidity_halves": halves}
-    part = {f: _bp(a["part"][keep, j].mean()) for j, f in enumerate(names_f)}
+    ident = keep & (a["status"] == IDENTIFIED)
+    part = {f: _bp(a["part"][ident, j].sum() / n) for j, f in enumerate(names_f)}
+    cond = a["cond"][keep & ~np.isnan(a["cond"])]
     top = [int(j) for j in np.argsort(-a["by_name"], kind="stable")[:TOP_NAMES] if a["by_name"][j] > 0]
     return {
         "nights": n,
+        "fit": {**{s: int((a["status"][keep] == c).sum()) for c, s in enumerate(_FIT_STATUS)},
+                "condition_median": round(float(np.median(cond)), 2) if len(cond) else None},
         "exposure": {f: round(float(a["expo"][keep, j].mean()), 4) + 0.0 for j, f in enumerate(names_f)},
         "factor_known_share": {f: round(float(a["known"][keep, j].mean()), 4) for j, f in enumerate(names_f)},
-        "attribution_bp": {"gross": _bp(gross[keep].mean()), **part, "sector": _bp(a["sector"][keep].mean()),
+        "attribution_bp": {"gross": _bp(gross[keep].mean()), **part, "sector": _bp(a["sector"][ident].sum() / n),
+                           "unidentified": _bp(a["unident"][keep & ~ident].sum() / n),
                            "residual": _bp(a["resid"][keep].mean())},
         "residual": _cut(np.where(keep, a["resid"], np.nan), cost),
         "liquidity_halves": halves,
@@ -1211,7 +1276,8 @@ def _residual_markdown(res: dict | None) -> list:
     def cut(v: dict) -> str:
         if "gross_bp" not in v:
             return f"{v.get('nights', 0):,} nights (too few to summarise)"
-        return f"{v['gross_bp']:+.2f} bp gross, {v['net_bp']:+.2f} net, t {v['t_gross']} ({v['nights']:,} nights)"
+        turn = f", turnover {v['turnover']:.2f}" if "turnover" in v else ""
+        return f"{v['gross_bp']:+.2f} bp gross, {v['net_bp']:+.2f} net, t {v['t_gross']} ({v['nights']:,} nights{turn})"
 
     lines = ["", f"## Residual cards ({res['schema']})", "",
              ("What each carded module's spread is made of: its exposure to five known factors and the sector, the "
@@ -1226,10 +1292,17 @@ def _residual_markdown(res: dict | None) -> list:
         known = m.get("factor_known_share", {})
         lines += ["| Part | Exposure (rank gap) | Names with the factor | bp of the spread |", "|---|---|---|---|"]
         lines += [f"| {f} | {m['exposure'][f]:+.3f} | {known.get(f, 0):.0%} | {att[f]:+.2f} |" for f in m["exposure"]]
-        lines += [f"| sector | | | {att['sector']:+.2f} |", f"| residual | | | {att['residual']:+.2f} |",
+        fit = m["fit"]
+        cond = "" if fit["condition_median"] is None else f"; median condition number {fit['condition_median']:g}"
+        lines += [f"| sector | | | {att['sector']:+.2f} |",
+                  f"| unidentified (factors and sector, split not pinned down) | | | {att['unidentified']:+.2f} |",
+                  f"| residual | | | {att['residual']:+.2f} |",
                   f"| **gross** | | | **{att['gross']:+.2f}** |", "",
+                  (f"Named split identified on {fit['identified']:,} of {m['nights']:,} nights (rank-deficient "
+                   f"{fit['rank_deficient']:,}, condition number over {MAX_CONDITION:g} {fit['ill_conditioned']:,}{cond})."),
                   f"Residual: {cut(m['residual'])}.",
-                  f"Liquid half: {cut(m['liquidity_halves']['liquid'])}. Other half: {cut(m['liquidity_halves']['other'])}.",
+                  (f"Liquid half (its own turnover and cost): {cut(m['liquidity_halves']['liquid'])}. "
+                   f"Other half: {cut(m['liquidity_halves']['other'])}."),
                   f"Without its {len(m['names']['top'])} largest contributors: {m['names']['gross_without_top_bp']:+.2f} bp "
                   f"gross (" + (", ".join(f"{n['ticker']} {n['bp']:+.2f}" for n in m["names"]["top"]) or "none") + ")."]
     corr = {a: row for a, row in res.get("correlation", {}).items() if row}
