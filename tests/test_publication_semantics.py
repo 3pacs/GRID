@@ -44,7 +44,10 @@ def isolated(path, names=None, extra=None):
 GUARD = isolated('ollama/number_grounding.py')
 UNITS = isolated('ingestion/altdata/fed_liquidity.py', ['format_liquidity_usd'])
 SCORER = isolated('analysis/thesis_scorer.py', ['_score_fed_liquidity', '_verdict'],
-                  {'format_liquidity_usd': UNITS.format_liquidity_usd})
+                  {'format_liquidity_usd': UNITS.format_liquidity_usd,
+                   'FED_LIQ_MODERATE_MILLIONS': 50_000.0,
+                   'FED_LIQ_STRONG_MILLIONS': 100_000.0,
+                   'FED_LIQ_BAND_STEP_MILLIONS': 50_000.0})
 AUDIO = isolated('intelligence/audio_briefing.py',
                  ['_collect_flow_state', '_finite_briefing_amount', '_format_edge_for_briefing', '_build_briefing_prompt', '_generate_script_text'],
                  {'flow_evidence_kind': GUARD.flow_evidence_kind,
@@ -111,13 +114,13 @@ class UnitsTests(unittest.TestCase):
         self.assertEqual(UNITS.format_liquidity_usd(24262, unit='millions_usd', display_unit='?'), 'unavailable')
 
     def test_production_scorer_signed_zero_scores_preserved(self):
-        for change, score in [(24262, 80), (-24262, -80), (0, 0)]:
+        for change, score in [(24262, 12.1), (-24262, -12.1), (150000, 80), (-150000, -80), (0, 0)]:
             engine = types.SimpleNamespace(connect=lambda: Conn(change))
             result = SCORER._score_fed_liquidity(engine, 0.5)
             self.assertEqual(result['score'], score)
             self.assertIn(f'${abs(change):,.0f}M', result['reasoning'])
             self.assertNotIn(f'${abs(change):,.0f}B', result['reasoning'])
-            self.assertIn('$50M', result['threshold'])
+            self.assertIn('$50B', result['threshold'])
         self.assertIn('unchanged', SCORER._score_fed_liquidity(engine, 0.5)['reasoning'])
 
     def test_missing_baseline(self):
