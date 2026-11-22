@@ -44,6 +44,14 @@ EXTENDED_UNIVERSE = MAG7_TICKERS + [
     "AVGO", "JPM", "BRK-B", "XOM", "JNJ", "WMT", "HD",
 ]
 
+# A fractional return times this is basis points (0.03 -> 300 bps).
+BPS_PER_UNIT = 10_000
+# Stored deep-dive payloads (news_impact_reports.payload) carry this. Version 2
+# (2026-11-21): move, macro and sector bps are real basis points; version 1
+# payloads (no field) multiplied fractional returns by 100, and their moves
+# were always empty because the price read named columns that do not exist.
+REPORT_VERSION = 2
+
 # Time horizon thresholds
 SHORT_TERM_DAYS = 5          # < 1 week
 MEDIUM_TERM_DAYS = 60        # 1 week to ~2 months
@@ -349,14 +357,17 @@ class PriceDecomposer:
             4. Estimate each catalyst's bps contribution
             5. Compute unexplained residual
         """
-        move_bps = abs(move_pct) * 100
+        # move_pct is a fraction (0.03 = 3%); 1 bp = 0.0001, so 3% = 300 bps,
+        # the scale of CATALYST_TYPES' typical_bps. Before report version 2
+        # this multiplied by 100 (percent labelled as bps).
+        move_bps = abs(move_pct) * BPS_PER_UNIT
         move_dir = "up" if move_pct > 0 else "down"
 
         # 1. Market and sector decomposition
         spy_ret = self._get_return(
             "SPY" if ticker != "SPY" else "QQQ", move_date
         )
-        macro_bps = abs(spy_ret * 100) if spy_ret else 0.0
+        macro_bps = abs(spy_ret * BPS_PER_UNIT) if spy_ret else 0.0
 
         # Sector beta (rough: tech stocks move ~1.2x SPY)
         sector_beta = 1.2 if ticker in MAG7_TICKERS else 1.0
@@ -724,7 +735,7 @@ class DeepDiveEngine:
 
         # Avg explanation rate
         explained_rates = [
-            a.total_explained_bps / max(abs(a.move_pct) * 100, 1)
+            a.total_explained_bps / max(abs(a.move_pct) * BPS_PER_UNIT, 1)
             for a in attributions
         ]
         avg_explained = (
@@ -835,6 +846,8 @@ Be specific with numbers. Use short/medium/long-term framing."""
         """Store deep dive report to DB."""
         try:
             payload = {
+                "report_version": REPORT_VERSION,
+                "bps_scale": "basis_points",
                 "ticker": report.ticker,
                 "name": report.name,
                 "total_moves_analyzed": report.total_moves_analyzed,
@@ -914,6 +927,7 @@ def run_deep_dive_task(engine: Engine, context: dict) -> str:
     dive = DeepDiveEngine(engine)
     report = dive.generate_deep_dive(ticker, days)
     return json.dumps({
+        "report_version": REPORT_VERSION,
         "ticker": report.ticker,
         "moves_analyzed": report.total_moves_analyzed,
         "avg_explained_pct": report.avg_explained_pct,
