@@ -290,20 +290,31 @@ effects that need only daily prices and no sector, eight modules judged together
 - One run, not four, so the step-down test counts all eight modules together. Industry momentum is left
   out: it needs sectors.
 - Cost 25 bp a side (owner decision, 2026-11-20; a stand-in, see below). The factory charges four sides
-  times turnover each night. A reversal module replaces nearly all its names every night, so it pays about
-  100 bp a night and cannot pass after cost whatever its gross spread. Momentum and the 52-week high
-  replace about a tenth and pay about 10 bp a night. The run still reports gross spreads, which say whether
-  an effect exists in small caps before cost. A hold of many sessions, which small-cap costs call for, needs
-  a module kind the factory does not have yet.
+  times turnover each night, so a module's nightly cost is 100 bp times the share of names it replaces.
+  Turnover on small caps has not been measured. On S&P 500 members the monthly reversal replaced 23 % of
+  its names a night and the 52-week high 11 % (queue runs of 2026-11-19); at those rates the cost here
+  would be about 23 bp and 11 bp a night. The 5-day reversal turns over faster than the monthly one. A
+  module passes only when its gross spread is larger than its cost. That is a high bar: the monthly
+  reversal earned about 4 bp a night gross on index members. So the gross spreads are the more informative
+  part of this run: they say whether an effect exists in small caps before cost. A hold of many sessions,
+  which small-cap costs call for, needs a module kind the factory does not have yet.
 - `prior_dev_looks` names the earlier development looks at these effects on S&P 500 members, and the spread
   estimate made on these bars for the cost figure (no signal ranked, no outcome read).
 - It is meant for the sealed generation `g-55610e7331c3126c`. On that export the factory refuses any window
   that starts before 2016-01-04.
 - Read any result beside the store's known gap: about a quarter of the companies that ended from 2016 have
-  no prices here, which flatters a rule that buys fallen names. Reversal is such a rule.
+  no prices here, which flatters a rule that buys fallen names. Reversal is such a rule. The price and
+  volume floors do not correct for this: they decide which of the companies present may be ranked, and say
+  nothing about the ones that are absent.
 
 The file validates on main's factory (eight modules, no sector use). It has not been run on any ledger,
-scratch or real. A run needs the owner's word.
+scratch or real. Review accepted it as a file to register, not as permission to run. Before a run:
+
+- the owner's word for that run;
+- the data's provenance stated beside the result: the generation and its manifest hash, the pull it came
+  from, and that the survey of the real store was made by its builder and not checked independently;
+- the cost's provenance stated beside the result: 25 bp a side is an assumption from a rough estimate on
+  daily bars, not a measurement on tickets.
 
 ## What is not done
 
