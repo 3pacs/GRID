@@ -166,7 +166,8 @@ class _Reads:
     """Known-at reads for one ``as_of``, memoized per series.
 
     ``known_by`` (the provisional record's availability cutoff, #1312) cuts every read at that instant, each on the
-    clock its store keeps: raw_series ``pull_timestamp``, fred_vintages ``fetched_at``, dealer_gex_daily
+    clock its store keeps: raw_series ``pull_timestamp``, fred_vintages ``fetched_at`` (intervals rebuilt from the
+    versions known then, since ``realtime_end`` is extended in place), dealer_gex_daily
     ``created_at``, and for resolved ``spy_full`` (dates only) ``release_date`` before the cutoff's UTC day. Without
     it every read is the decision record's own end-of-``as_of`` read, unchanged.
     """
@@ -884,7 +885,8 @@ PROVISIONAL_LABEL = ("Provisional, display only: computed from the inputs GRID h
 # How each read is cut at the provisional record's availability cutoff (compute_market_state(known_by=...)).
 CUTOFF_READS = {
     "raw_series": "pull_timestamp at or before the cutoff; a modeled known-at date counts once its UTC day has ended",
-    "fred_vintages": "fetched_at at or before the cutoff",
+    "fred_vintages": "fetched_at at or before the cutoff; each version's interval rebuilt from the versions known "
+                     "then (the stored realtime_end is extended in place by later refreshes and is not read)",
     "dealer_gex_daily": "created_at at or before the cutoff; a row without one is not known",
     "resolved_series": "release_date before the cutoff's UTC day (the table keeps no finer write clock)",
 }

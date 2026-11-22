@@ -77,7 +77,7 @@ display only (owner's decision, bring-up plan rev 100).
   | Read | Cut |
   |---|---|
   | `raw_series` (`read_window_known_at(as_of_ts=)`) | `pull_timestamp` at or before the cutoff. A modeled known-at date or a release override counts only once its UTC day has ended. |
-  | `fred_vintages` (`load(fetched_by=)`) | `fetched_at` at or before the cutoff |
+  | `fred_vintages` (`load(fetched_by=)`) | `fetched_at` at or before the cutoff. Each version's live interval is rebuilt from the versions known then: it ends the day before the next one, or is open. The stored `realtime_end` is never read, because a later refresh extends it in place. |
   | `dealer_gex_daily` | `created_at` at or before the cutoff; a row without one is not known |
   | resolved `spy_full` | `release_date` before the session's day, because `resolved_series` has no finer write clock |
 

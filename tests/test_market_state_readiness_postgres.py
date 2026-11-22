@@ -265,11 +265,22 @@ def test_cutoff_reads_on_postgres_column_types(engine):
                        "'2026-11-19 22:00:00+00'), ('2026-11-20', 'SPY', 600, -1, -1, 606, 'L', "
                        "'2026-11-20 17:30:00-05')")) # 22:30Z, written after the close
         c.execute(text("INSERT INTO fred_vintages (series_id, obs_date, realtime_start, realtime_end, value, fetched_at) "
-                       "VALUES ('USEPUINDXD', '2026-11-18', '2026-11-19', '9999-12-31', 1, '2026-11-19 23:15:00'), "
+                       "VALUES ('USEPUINDXD', '2026-11-18', '2026-11-19', '2026-11-19', 1, '2026-11-19 23:15:00'), "
                        "('USEPUINDXD', '2026-11-19', '2026-11-20', '9999-12-31', 2, '2026-11-20 23:15:00')"))
     reads = M._Reads(engine, date(2026, 11, 20), 30, known_by=close)
     assert [str(d) for d in reads.gex_rows().index] == ["2026-11-19"]
     assert len(M._Reads(engine, date(2026, 11, 20), 30).gex_rows()) == 2
-    cut = FV.load(engine, "USEPUINDXD", date(2026, 11, 1), date(2026, 11, 20), date(2026, 11, 20), fetched_by=close)
-    assert list(cut["value"]) == [1.0]
-    assert len(FV.load(engine, "USEPUINDXD", date(2026, 11, 1), date(2026, 11, 20), date(2026, 11, 20))) == 2
+    window = ("USEPUINDXD", date(2026, 11, 1), date(2026, 11, 20), date(2026, 11, 20))
+    cut = FV.load(engine, *window, fetched_by=close)
+    assert list(cut["value"]) == [1.0] and FV.values_as_of(cut, [date(2026, 11, 18)], date(2026, 11, 20)) == {
+        date(2026, 11, 18): 1.0}
+    assert len(FV.load(engine, *window)) == 2
+    # The refresh after the close extends the first version's end in place (real upsert on Postgres): the read cut
+    # at the close is unchanged.
+    FV.upsert(engine, "USEPUINDXD", [{"obs_date": date(2026, 11, 18), "realtime_start": date(2026, 11, 19),
+                                      "realtime_end": FV.OPEN_END, "value": 1.0}])
+    with engine.connect() as c:
+        end, fetched = c.execute(text("SELECT realtime_end, fetched_at FROM fred_vintages "
+                                      "WHERE obs_date = '2026-11-18'")).one()
+    assert end == FV.OPEN_END and fetched == datetime(2026, 11, 19, 23, 15)  # noqa: DTZ001 - fetched_at is naive
+    assert FV.load(engine, *window, fetched_by=close).equals(cut)

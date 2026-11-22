@@ -212,6 +212,71 @@ def test_vintages_cut_at_their_fetch_time(engine):
         FV.load(engine, "USEPUINDXD", PREV, DAY, DAY, fetched_by=datetime(2026, 11, 20, 21))  # noqa: DTZ001
 
 
+# ── vintages: a refresh extends realtime_end in place (Codex HOLD on #1360 at d58cb1ec) ─────────────────────────
+#
+# store.fred_vintages.upsert keeps a row's fetched_at and value but moves its realtime_end later whenever a refresh
+# sees the version still live. A version GRID fetched before the close, stored with an end capped at that fetch's
+# range, is therefore "extended" by the next evening's refresh. A read cut at the close must not change with it.
+
+_O, _RS = date(2026, 11, 18), date(2026, 11, 19)          # EPU for 11-18, first printed 11-19
+
+
+def _vintage_fetched_before_the_close(eng, end: date = date(2026, 11, 19)) -> None:
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO fred_vintages (series_id, obs_date, realtime_start, realtime_end, value, "
+                       "fetched_at) VALUES ('USEPUINDXD', :o, :rs, :re, 140.0, '2026-11-19 23:15:00')"),
+                  {"o": _O.isoformat(), "rs": _RS.isoformat(), "re": end.isoformat()})
+
+
+def _refresh_extends_it(eng) -> None:
+    """What the 23:15Z refresh does: the real upsert, seeing the same version still live."""
+    FV.upsert(eng, "USEPUINDXD", [{"obs_date": _O, "realtime_start": _RS, "realtime_end": FV.OPEN_END,
+                                   "value": 140.0}])
+    with eng.connect() as c:
+        end, fetched = c.execute(text("SELECT realtime_end, fetched_at FROM fred_vintages WHERE obs_date = :o"),
+                                 {"o": _O.isoformat()}).one()
+    assert str(end)[:10] == "9999-12-31" and str(fetched).startswith("2026-11-19 23:15")   # in place, same clock
+
+
+def test_a_late_in_place_extension_does_not_change_a_same_cutoff_vintage_read(engine):
+    _vintage_fetched_before_the_close(engine)
+    before = FV.load(engine, "USEPUINDXD", _O, DAY, DAY, fetched_by=CLOSE)
+    seen_before = FV.values_as_of(before, [_O], DAY)
+    _refresh_extends_it(engine)
+    after = FV.load(engine, "USEPUINDXD", _O, DAY, DAY, fetched_by=CLOSE)
+    assert after.equals(before) and FV.values_as_of(after, [_O], DAY) == seen_before == {_O: 140.0}
+    # Without a cutoff (the decision record) the stored end is read, as before.
+    assert FV.load(engine, "USEPUINDXD", _O, DAY, DAY)["realtime_end"].tolist() == [FV.OPEN_END]
+
+
+def test_vintage_intervals_under_a_cutoff_come_from_the_versions_known_then(engine):
+    """Each version ends the day before the next version GRID had fetched by the cutoff, else it is open."""
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO fred_vintages (series_id, obs_date, realtime_start, realtime_end, value, fetched_at) "
+                       "VALUES ('USEPUINDXD', '2026-11-10', '2026-11-11', '9999-12-31', 50.0, '2026-11-11 23:15:00'),"
+                       " ('USEPUINDXD', '2026-11-10', '2026-11-14', '2026-11-16', 60.0, '2026-11-14 23:15:00'),"
+                       " ('USEPUINDXD', '2026-11-10', '2026-11-17', '9999-12-31', 70.0, '2026-11-20 23:15:00')"))
+    got = FV.load(engine, "USEPUINDXD", date(2026, 11, 10), DAY, DAY, fetched_by=CLOSE)
+    assert [(str(r.realtime_start), str(r.realtime_end), r.value) for r in got.itertuples()] == [
+        ("2026-11-11", "2026-11-13", 50.0),     # ended by the next known version, not its stored open end
+        ("2026-11-14", "9999-12-31", 60.0)]     # the 11-17 version was fetched after the cutoff: open as known then
+    assert FV.values_as_of(got, [date(2026, 11, 10)], DAY) == {date(2026, 11, 10): 60.0}
+    assert FV.values_as_of(FV.load(engine, "USEPUINDXD", date(2026, 11, 10), DAY, DAY), [date(2026, 11, 10)],
+                           DAY) == {date(2026, 11, 10): 70.0}
+
+
+def test_a_late_in_place_extension_does_not_change_the_provisional_record(engine, monkeypatch, capsys):
+    _vintage_fetched_before_the_close(engine)
+    at_close = _provisional(engine, monkeypatch, capsys, "2026-11-20T21:15:00Z")
+    _refresh_extends_it(engine)
+    late = _provisional(engine, monkeypatch, capsys, "2026-11-20T23:30:00Z", "--replace")
+    assert late["variables"]["news_first_print"] == at_close["variables"]["news_first_print"]
+    assert late["news_shock"] == at_close["news_shock"]
+    # The reading is the version GRID held at the close, for the session itself.
+    assert late["variables"]["news_first_print"]["obs_date"] == "2026-11-20"
+    assert late["variables"]["news_first_print"]["value"] == 140.0
+
+
 def test_dealer_rows_cut_at_their_creation_time_and_unclocked_rows_are_not_known(engine):
     _delayed_inputs(engine)
     _gex(engine, date(2026, 11, 18), "SHORT_GAMMA", None)
