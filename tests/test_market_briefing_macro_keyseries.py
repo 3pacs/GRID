@@ -71,7 +71,19 @@ def test_key_series_uses_bare_fred_ids_and_includes_macro(tmp_path):
     for sid in RATES + MACRO:
         assert sid in conn.sids, sid
     assert not any(s.startswith("FRED:") for s in conn.sids)
-    assert "DGS10" not in conn.sids  # not in FRED_SERIES_LIST
+    # The live 10-year arrives as raw "yc_10y"; bare raw "DGS10" is stale
+    # (no pull since 2026-04) and must never be read.
+    assert "yc_10y" in conn.sids
+    assert "DGS10" not in conn.sids
+
+
+def test_ten_year_comes_from_yc_10y_under_the_dgs10_label(tmp_path):
+    rows = {sid: (4.5, date(2026, 10, 16)) for sid in RATES + MACRO}
+    rows["yc_10y"] = (4.35, date(2026, 11, 19))
+    rows["DGS10"] = (3.99, date(2026, 4, 2))  # stale bare series: never used
+    snap = _engine(_Conn(rows), tmp_path)._gather_market_snapshot()
+    assert snap["rates"]["DGS10"] == {"value": 4.35, "date": "2026-11-19"}
+    assert "yc_10y" not in snap["rates"]
 
 
 def test_bare_fred_rows_populate_rates_and_macro(tmp_path):

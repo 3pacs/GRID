@@ -6,31 +6,22 @@ Pulls Brent/WTI crude oil daily spot prices from the EIA API v2.
 Data source: https://api.eia.gov/v2/petroleum/pri/spt/data/
 API key required (free): set EIA_API_KEY env var.
 
-Series stored:
-- eia.brent_spot: Brent crude oil spot price (USD/bbl)
-- eia.wti_spot: WTI crude oil spot price (USD/bbl)
+Series stored (aligned with ``normalization/entity_map.py``):
+- ``EIA:eia_brent_spot``: Brent crude oil spot price (RBRTE, USD/bbl)
+- ``EIA:eia_crude_price``: WTI crude oil spot price (RWTC, USD/bbl)
+- ``EIA:eia_cushing_crude_stocks``: Weekly Cushing, OK crude oil stocks excl. SPR
+  (``W_EPC0_SAX_YCUOK_MBBL``, thousand barrels)
 
-Weekly Cushing crude stocks -- request contract only (W5c, 2026-09-18)
-------------------------------------------------------------------------
+Weekly Cushing crude stocks
+---------------------------
 ``build_weekly_stocks_request`` / ``fetch_weekly_stocks`` /
-``parse_weekly_stocks_response`` below add the v2 request *contract* for
+``parse_weekly_stocks_response`` implement the v2 request contract for
 the weekly petroleum stocks route, documented at
 https://www.eia.gov/opendata/browser/petroleum/stoc/wstk (route + facet
 shape) and https://www.eia.gov/opendata/documentation.php (general query
 parameter shape: ``data[0]=value``, ``facets[series][]=...``,
-``frequency``, ``api_key``, ``sort[...]``, ``length``). Per this
-workstream's constraints, calling EIA needs a real key, so
-``fetch_weekly_stocks`` is NOT called anywhere in this pass -- only the
-request builder and the response parser are implemented and tested (with
-a constructed response, not a live one). See
-``docs/handoffs/2026-09-18/fable-w5b-source-contracts.md`` for the exact
-bounded ``curl`` the operator can run once to confirm this contract
-against the live API.
-
-This does NOT duplicate the EIA hardening work tracked separately on
-another branch (#553) -- ``pull()``/``_fetch_series()`` above (Brent/WTI
-spot prices) are untouched; only the new weekly-stocks functions are
-added.
+``frequency``, ``api_key``, ``sort[...]``, ``length``), and are wired
+into ``EIAPuller.pull()``.
 """
 
 from __future__ import annotations
@@ -51,15 +42,27 @@ from ingestion.base import BasePuller, retry_on_failure
 
 _EIA_BASE = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
 _REQUEST_TIMEOUT: int = 30
-_SERIES_MAP: dict[str, str] = {"RBRTE": "brent_spot", "RWTC": "wti_spot"}
-_SERIES_PREFIX = "eia"
+_SERIES_PREFIX = "EIA"
+# EIA API v2 daily spot facet -> entity_map suffix (RWTC aligns to existing
+# EIA:eia_crude_price mapping in normalization/entity_map.py).
+_SERIES_MAP: dict[str, str] = {
+    "RBRTE": "eia_brent_spot",
+    "RWTC": "eia_crude_price",
+}
 
-# ---- Weekly Cushing, OK crude oil stocks (request contract only) ----
+# ---- Weekly Cushing, OK crude oil stocks ----
 # Route documented at https://www.eia.gov/opendata/browser/petroleum/stoc/wstk.
 _WEEKLY_STOCKS_ROUTE = "petroleum/stoc/wstk"
 # "Stocks of Crude Oil, Cushing, OK (excl. SPR)" -- the series id shown on
 # that browser page for the Cushing storage hub.
 DEFAULT_WEEKLY_STOCKS_SERIES = "W_EPC0_SAX_YCUOK_MBBL"
+WEEKLY_STOCKS_SERIES_ID: str = f"{_SERIES_PREFIX}:eia_cushing_crude_stocks"
+
+# Single source of truth for every raw_series.series_id this puller emits.
+EMITTED_SERIES_IDS: tuple[str, ...] = (
+    *(f"{_SERIES_PREFIX}:{suffix}" for suffix in _SERIES_MAP.values()),
+    WEEKLY_STOCKS_SERIES_ID,
+)
 
 # EIA requests carry ``api_key=<value>`` in the query string, so any
 # exception raised by ``requests`` (e.g. ``HTTPError.__str__``, which embeds
@@ -150,7 +153,7 @@ class EIAPuller(BasePuller):
         failed_facets: list[str] = []
 
         for facet, suffix in _SERIES_MAP.items():
-            sid = f"{_SERIES_PREFIX}.{suffix}"
+            sid = f"{_SERIES_PREFIX}:{suffix}"
             try:
                 records = self._fetch_series(facet, start_str, end_str)
             except Exception as exc:
@@ -192,9 +195,45 @@ class EIAPuller(BasePuller):
                     existing.add(obs)
             time.sleep(1.0)
 
+        # Weekly Cushing, OK crude oil stocks (petroleum/stoc/wstk)
+        weekly_length = max(5, (days_back // 7) + 2)
+        try:
+            weekly_rows = fetch_weekly_stocks(
+                DEFAULT_WEEKLY_STOCKS_SERIES,
+                length=weekly_length,
+                api_key=self._api_key,
+            )
+        except Exception as exc:
+            log.warning(
+                "EIA fetch failed for {f}: {e}",
+                f=DEFAULT_WEEKLY_STOCKS_SERIES,
+                e=_redact_api_key(str(exc)),
+            )
+            failed_facets.append(DEFAULT_WEEKLY_STOCKS_SERIES)
+        else:
+            with self.engine.begin() as conn:
+                existing = self._get_existing_dates(WEEKLY_STOCKS_SERIES_ID, conn)
+                for row in weekly_rows:
+                    obs = row["period"]
+                    if obs in existing:
+                        continue
+                    self._insert_raw(
+                        conn=conn,
+                        series_id=WEEKLY_STOCKS_SERIES_ID,
+                        obs_date=obs,
+                        value=row["value"],
+                        raw_payload={
+                            "facet": DEFAULT_WEEKLY_STOCKS_SERIES,
+                            "series": row.get("series"),
+                            "units": row.get("units"),
+                        },
+                    )
+                    total += 1
+                    existing.add(obs)
+
         log.info("EIA: {n} rows inserted", n=total)
 
-        if len(failed_facets) == len(_SERIES_MAP):
+        if len(failed_facets) == len(EMITTED_SERIES_IDS):
             return {
                 "status": "FAILED",
                 "rows_inserted": total,
@@ -300,32 +339,36 @@ def parse_weekly_stocks_response(payload: dict[str, Any]) -> list[dict[str, Any]
 
 
 def fetch_weekly_stocks(
-    series_id: str = DEFAULT_WEEKLY_STOCKS_SERIES, *, length: int = 5
+    series_id: str = DEFAULT_WEEKLY_STOCKS_SERIES,
+    *,
+    length: int = 5,
+    api_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch and parse weekly petroleum stocks for one series.
 
-    NOT called anywhere in this pass (see module docstring) -- calling
-    EIA needs a real ``EIA_API_KEY``, which this workstream's constraints
-    do not permit spending. Provided so the contract is runnable once a
-    key is available; fails closed (no request) if the key is unset.
+    Fails closed (no request) if the API key is unset.
 
     Parameters:
         series_id: EIA series id (default: Cushing, OK crude stocks).
         length: Number of most-recent periods to request.
+        api_key: Optional API key override; defaults to ``settings.EIA_API_KEY``.
 
     Returns:
         Parsed rows -- see :func:`parse_weekly_stocks_response`.
 
     Raises:
-        RuntimeError: if ``settings.EIA_API_KEY`` is unset.
+        RuntimeError: if the effective EIA API key is unset.
         requests.RequestException: on HTTP failure.
     """
-    if not settings.EIA_API_KEY:
+    effective_key = settings.EIA_API_KEY if api_key is None else api_key
+    if not effective_key:
         raise RuntimeError(
             "EIA_API_KEY is not set -- refusing to call the EIA API. Set "
             "EIA_API_KEY in .env (see .env.example) first."
         )
-    request = build_weekly_stocks_request(series_id, length=length)
+    request = build_weekly_stocks_request(
+        series_id, length=length, api_key=effective_key
+    )
     log.info("EIA weekly stocks request: {u}", u=as_display_url(request))  # key masked
     resp = requests.get(
         request["url"], params=request["params"], timeout=_REQUEST_TIMEOUT

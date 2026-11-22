@@ -125,20 +125,25 @@ class _OneConnection:
     def __init__(self, conn):
         self.conn = conn
         self.queries = []
+        self.params = []
         self.probes = []
         self.rows = None
         self.value = None
     def connect(self):
         return contextlib.nullcontext(self)
     def execute(self, statement, params=None):
-        if params is not None:
-            # Only the optional-relation probe is parameterized; it runs natively.
-            assert str(statement) == "SELECT to_regclass(:relation) IS NOT NULL"
+        if params is not None and str(statement) == "SELECT to_regclass(:relation) IS NOT NULL":
+            # The optional-relation probe runs natively.
             self.probes.append(params["relation"])
             self.value = self.conn.execute(statement, params).scalar()
             return self
+        # The pull_log statement binds exactly the guest pull_log names; the
+        # raw_series-only statement binds nothing.
+        assert ("pull_log" in str(statement)) == (params is not None)
+        assert params is None or set(params) == {"guest_pull_log_names"}
         self.queries.append(str(statement))
-        self.rows = self.conn.execute(statement).fetchall()
+        self.params.append(params)
+        self.rows = self.conn.execute(statement, params).fetchall()
         return self
     def fetchall(self):
         return self.rows
@@ -146,25 +151,38 @@ class _OneConnection:
         return self.value
 
 
+GUEST_PULL_LOG_NAMES = frozenset({"smart:finra_dix"})
+
+
 def _diagnose(conn):
     # Execute actual function source, not a replacement query or a live import.
     tree = ast.parse(SOURCE.read_bytes())
     projected = ("_normalize_source_key", "_classify_pull_failure", "_recovered_after",
-                 "_held_source_names", "diagnose_and_fix_pulls")
+                 "_held_source_names", "_report_unrouted_failures", "diagnose_and_fix_pulls")
     functions = {
         node.name: node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in projected
     }
     assert set(functions) == set(projected), "MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY"
+    # The actual no-route reason constant (a module-level assignment).
+    constants = [n for n in tree.body if isinstance(n, ast.Assign)
+                 and [getattr(t, "id", None) for t in n.targets] == ["UNROUTED_GUEST_REASON"]]
+    assert len(constants) == 1, "MISSING_UNROUTED_GUEST_REASON"
     # The optional-relation probe is the actual hermes_health helper.
     probe = [n for n in ast.parse(HEALTH.read_bytes()).body
              if isinstance(n, ast.FunctionDef) and n.name == "_relation_exists"]
     assert len(probe) == 1, "MISSING_RELATION_PROBE"
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    module = ast.fix_missing_locations(ast.Module(body=[future, *probe, *(functions[name] for name in projected)], type_ignores=[]))
+    module = ast.fix_missing_locations(ast.Module(
+        body=[future, *probe, *constants, *(functions[name] for name in projected)], type_ignores=[]))
     log = _Log()
+    # _guest_pull_log_names imports the scheduler registry (no application
+    # modules here); GUEST_PULL_LOG_NAMES is the one guest it derives today,
+    # pinned against the real helper in test_hermes_fixers_guest_attribution.py.
     namespace = {"log": log, "json": json, "re": re, "datetime": datetime, "timezone": timezone,
-                 "_REPAIR_SCHEDULE_LOCK": threading.Lock(), "_REPAIR_RECOVERED_AT": {}}
+                 "_REPAIR_SCHEDULE_LOCK": threading.Lock(), "_REPAIR_RECOVERED_AT": {},
+                 "_UNROUTED_FAILURES_REPORTED": {},
+                 "_guest_pull_log_names": lambda: GUEST_PULL_LOG_NAMES}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     engine = _OneConnection(conn)
     # BOTH flags are necessary: production dry_run is checked after optional LLM diagnosis.
@@ -270,7 +288,10 @@ def test_native_pull_log_failures_merge_with_raw_series(latest_failure_pg_connec
     _pull_log(conn, "synth_a_job", a, now - timedelta(hours=2), now - timedelta(hours=1),
               "PARTIAL", "PL_NEWER")
     _pull_log(conn, "synth_job", None, now - timedelta(hours=2), None, "FAILED", "STARTED_ONLY")
-    _pull_log(conn, "synth_job", None, now - timedelta(hours=1), now, "SUCCESS", "NOT_FAILED")
+    # Before the failure: a later SUCCESS is a recovery (2026-11-05 clause);
+    # here it only must not count as a failure.
+    _pull_log(conn, "synth_job", None, now - timedelta(hours=4), now - timedelta(hours=3),
+              "SUCCESS", "NOT_FAILED")
     _pull_log(conn, "synth_job", None, now - timedelta(hours=26), now - timedelta(hours=25),
               "FAILED", "TOO_OLD")
     rows, _, logs = _diagnose(conn)
@@ -292,7 +313,8 @@ def test_native_window_is_pushed_into_both_union_legs(latest_failure_pg_connecti
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
         and node.value.startswith("SELECT name, fail_count") and "FROM pull_log" in node.value
     )
-    plan = "\n".join(r[0] for r in conn.execute(text("EXPLAIN " + statement)))
+    plan = "\n".join(r[0] for r in conn.execute(
+        text("EXPLAIN " + statement), {"guest_pull_log_names": sorted(GUEST_PULL_LOG_NAMES)}))
     assert "raw_series" in plan and "pull_log" in plan
     # The 24h predicate must filter each leg's scan, not only the appended result.
     assert plan.count("now() - '24:00:00'::interval") >= 2
@@ -350,3 +372,48 @@ def test_native_raw_only_statement_window_and_relations(latest_failure_pg_connec
     plan = "\n".join(r[0] for r in conn.execute(text("EXPLAIN " + statement)))
     assert "raw_series" in plan and "pull_log" not in plan
     assert "now() - '24:00:00'::interval" in plan
+
+
+# ── Guest pull_log names (smart:finra_dix under FINRA_SHORT_VOLUME, 2026-11-21) ──
+
+
+def test_native_dix_failure_is_named_by_its_own_pull_log_name(latest_failure_pg_connection):
+    conn, now = latest_failure_pg_connection
+    sv = _source(conn, "FINRA_SHORT_VOLUME")
+    _pull_log(conn, "smart:finra_dix", sv, now - timedelta(hours=2), now - timedelta(hours=1),
+              "FAILED", "DIX_FAIL")
+    rows, result, logs = _diagnose(conn)
+    assert [tuple(r) for r in rows] == [("smart:finra_dix", 1, now - timedelta(hours=1), "DIX_FAIL")]
+    assert result["skipped_no_handler"] == 1
+    assert "fix_actions" not in result
+    assert any(level == "WARNING" and text.startswith("Not repairing smart:finra_dix")
+               for level, text in logs)
+
+
+def test_native_dix_success_does_not_recover_short_volume_failure(latest_failure_pg_connection):
+    conn, now = latest_failure_pg_connection
+    sv = _source(conn, "FINRA_SHORT_VOLUME")
+    _pull_log(conn, "smart:finra_short_volume", sv, now - timedelta(hours=4), now - timedelta(hours=3),
+              "FAILED", "SV_FAIL")
+    _pull_log(conn, "smart:finra_dix", sv, now - timedelta(hours=2), now - timedelta(hours=1),
+              "SUCCESS", None)
+    _failure(conn, sv, now - timedelta(hours=5), {"error": "SV_RAW_OLDER"}, series="finra:short_volume:SPY")
+    rows, result, _ = _diagnose(conn)
+    assert [tuple(r) for r in rows] == [("FINRA_SHORT_VOLUME", 2, now - timedelta(hours=3), "SV_FAIL")]
+    assert result["fix_actions"] == {}
+    assert result["skipped_no_handler"] == 0
+
+
+def test_native_short_volume_own_success_recovers_and_single_writer_unchanged(latest_failure_pg_connection):
+    conn, now = latest_failure_pg_connection
+    sv = _source(conn, "FINRA_SHORT_VOLUME")
+    other = _source(conn, "SYNTH_SINGLE")
+    _pull_log(conn, "smart:finra_short_volume", sv, now - timedelta(hours=4), now - timedelta(hours=3),
+              "FAILED", "SV_FAIL")
+    _pull_log(conn, "smart:finra_short_volume", sv, now - timedelta(hours=2), now - timedelta(hours=1),
+              "SUCCESS", None)
+    _pull_log(conn, "smart:synth_single", other, now - timedelta(hours=2), now - timedelta(hours=1),
+              "FAILED", "SINGLE_FAIL")
+    rows, _, _ = _diagnose(conn)
+    assert [tuple(r) for r in rows] == [("SYNTH_SINGLE", 1, now - timedelta(hours=1), "SINGLE_FAIL")]
+
