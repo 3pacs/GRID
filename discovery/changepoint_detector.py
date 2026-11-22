@@ -16,6 +16,9 @@ Detector version ``changepoint_detector/2``. What it does, in order:
    (LATEST_AS_OF): one value per obs_date, the latest vintage released by
    ``as_of``, obs_date <= as_of, retracted vintages excluded. A feature with
    too little history or a stale newest observation is skipped and reported.
+   Each value is known from the later of its release_date and vintage_date
+   (a value fetched or revised after its release date is not known before
+   the fetch), and the retractions visible at as_of are read alongside.
 3. **Causal detection.** ``AutoBNNDecomposer.detect_causal_breaks`` (the
    drift-break test in ``timeseries/autobnn.py``). A break's decision reads no
    observation after its confirming observation, so a later scan finds the
@@ -23,17 +26,29 @@ Detector version ``changepoint_detector/2``. What it does, in order:
 4. **Direction per feature.** The sign of the drift change times the
    feature's stress sign. VIX or a credit spread drifting up is risk-off
    (``bearish``); the S&P 500 drifting up is risk-on (``bullish``).
-5. **Identity and dates.**
-   * ``signal_id`` = ``"<detector version>:<feature>:<break obs_date>"``.
-   * ``valid_from`` = the end of the UTC day on which the last observation
-     the decision read was released. That is the day-level "known by the end
-     of the release day" rule of ``store.pit.retraction_cutoff``; it is never
-     ``now()``.
+5. **Identity and availability.**
+   * The break's support is every observation its decision read: index
+     i - 2 * pre_window through the confirming observation i + peak + post.
+   * ``known_at`` = the latest of release_date, vintage_date and visible
+     retraction date over that whole support. ``valid_from`` = the end of
+     that UTC day (the day-level rule of ``store.pit.retraction_cutoff``),
+     never ``now()`` for a break's first row. A break whose ``known_at`` is
+     after ``as_of`` (a vintage the read should not see yet) waits.
+   * ``signal_id`` is the logical break: ``"<detector version>:<feature>:
+     <break obs_date>"``. Availability is the row's ``valid_from``; the
+     table's key is ``(signal_id, valid_from)``. ``metadata.support_sha256``
+     fingerprints the support's values.
    * Only fresh breaks are written: the confirming observation is one of the
      feature's newest ``RECENCY_OBSERVATIONS``, and the break became known
-     within ``FRESH_BREAK_DAYS`` of ``as_of``. A break whose ``valid_from``
-     is still in the future waits for the next scan. An id already in the
-     registry is never written again, so a re-scan writes nothing new.
+     within ``FRESH_BREAK_DAYS`` of ``as_of``.
+   * A re-scan on unchanged support writes nothing. If a later vintage or a
+     retraction changes the support of a break already written, the
+     re-evaluation is a new availability row of the same ``signal_id``
+     (``metadata.status`` ``live``), and if the break is no longer detected,
+     a ``withdrawn`` row (direction ``neutral``, confidence 0). Either is
+     valid from the later of its own ``known_at`` day-end and the scan that
+     saw it, so a late or back-dated vintage can never move a break to an
+     earlier ``valid_from``. Rows are only ever inserted, never updated.
    * ``provenance`` = ``CHANGEPOINT_DETECTOR_VERSION`` on every row. Rows
      from the earlier detector have no provenance, and readers ignore them by
      version. Nothing is deleted.
@@ -41,8 +56,10 @@ Detector version ``changepoint_detector/2``. What it does, in order:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time as _time
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -54,7 +71,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, REGIME_FEATURE_SOURCES
-from store.pit import PITStore
+from store.pit import PITStore, retraction_cutoff
 from timeseries.autobnn import (
     CAUSAL_PEAK_WINDOW,
     CAUSAL_POST_WINDOW,
@@ -84,6 +101,9 @@ MIN_OBSERVATIONS = 2 * CAUSAL_PRE_WINDOW + CAUSAL_PEAK_WINDOW + CAUSAL_POST_WIND
 # FRESH_BREAK_DAYS of as_of.
 RECENCY_OBSERVATIONS = 3
 FRESH_BREAK_DAYS = 5
+# metadata.status of a written row.
+STATUS_LIVE = "live"
+STATUS_WITHDRAWN = "withdrawn"
 # Stored statistics are clipped so a near-noiseless series cannot write an
 # absurd number (the old detector's headline magnitude was 13,629,417.65).
 _STAT_CLIP = 99.0
@@ -197,6 +217,58 @@ check_declared_features(REGIME_CHANGEPOINT_FEATURES)
 # ── Results ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
+class FeatureSeries:
+    """The point-in-time series one feature was scanned on.
+
+    Attributes:
+        spec: The declared feature.
+        feature: The bound feature_registry name (the signals' ticker).
+        feature_id: Its feature_registry id.
+        obs: obs_date per observation, in order.
+        values: The selected vintage's value per observation.
+        known: Per observation, the later of its release_date and
+            vintage_date: the day that value became readable point-in-time.
+        retracted: (obs_date, retraction UTC date) for every retraction of
+            this feature visible at as_of inside the read window.
+    """
+
+    spec: RegimeFeature
+    feature: str
+    feature_id: int
+    obs: tuple[date, ...]
+    values: tuple[float, ...]
+    known: tuple[date, ...]
+    retracted: tuple[tuple[date, date], ...] = ()
+
+    def support(self, change_index: int) -> tuple[int, int]:
+        """First and last observation index a break decision at ``change_index`` read."""
+        last = change_index + CAUSAL_PEAK_WINDOW + CAUSAL_POST_WINDOW
+        return causal_context_start(change_index), min(len(self.obs) - 1, last)
+
+    def decidable(self, change_index: int) -> bool:
+        """Whether this series holds the full support of a break at ``change_index``."""
+        return (change_index - 2 * CAUSAL_PRE_WINDOW >= 0
+                and change_index + CAUSAL_PEAK_WINDOW + CAUSAL_POST_WINDOW <= len(self.obs) - 1)
+
+    def support_known_at(self, start: int, end: int) -> date:
+        """Latest release, vintage or visible retraction date over obs ``start..end``."""
+        known = max(self.known[start:end + 1])
+        lo, hi = self.obs[start], self.obs[end]
+        for obs_date, retracted_on in self.retracted:
+            if lo <= obs_date <= hi and retracted_on > known:
+                known = retracted_on
+        return known
+
+    def support_sha256(self, start: int, end: int) -> str:
+        """Fingerprint of the values a decision over obs ``start..end`` read."""
+        payload = [
+            self.feature_id, [CAUSAL_PRE_WINDOW, CAUSAL_POST_WINDOW, CAUSAL_PEAK_WINDOW],
+            [[self.obs[i].isoformat(), repr(float(self.values[i]))] for i in range(start, end + 1)],
+        ]
+        return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
 class FeatureBreak:
     """A detected break on one bound feature.
 
@@ -207,11 +279,14 @@ class FeatureBreak:
         signal: The detector output.
         break_date: obs_date of the break observation.
         confirm_date: obs_date of the last observation the decision read.
-        known_at_date: Latest release_date among the observations the
-            decision read.
-        valid_from: End of known_at_date, UTC.
+        support_start_date: obs_date of the first observation it read.
+        known_at_date: Latest release, vintage or visible retraction date
+            over the whole support.
+        valid_from: End of known_at_date, UTC (the first row's availability).
         direction: bullish (risk-on) | bearish (risk-off) | neutral.
-        fresh: Whether the break is inside the recency window of as_of.
+        fresh: Whether the break is inside the recency window of as_of and
+            known by as_of.
+        support_sha256: Fingerprint of the support's values.
     """
 
     spec: RegimeFeature
@@ -224,9 +299,12 @@ class FeatureBreak:
     valid_from: datetime
     direction: str
     fresh: bool
+    support_start_date: date | None = None
+    support_sha256: str = ""
 
     @property
     def signal_id(self) -> str:
+        """The logical break id (version, feature, break date); not its availability."""
         return changepoint_signal_id(self.feature, self.break_date)
 
 
@@ -237,7 +315,7 @@ class ChangeReport:
     Attributes:
         timestamp: When the detection was run.
         features_scanned: Number of features analysed.
-        changepoints_found: Fresh breaks (the ones a publish writes).
+        changepoints_found: Fresh breaks (the ones a publish may write).
         regime_changes: The fresh breaks' detector outputs.
         elapsed_seconds: Time taken for the analysis.
         breaks: Every break in the lookback, fresh or not, with its feature,
@@ -245,6 +323,10 @@ class ChangeReport:
         skipped: Declared feature key -> why it was not scanned.
         as_of: The point-in-time date of the read.
         detector_version: CHANGEPOINT_DETECTOR_VERSION.
+        series: Feature name -> the series it was scanned on.
+        min_confidence: The confidence floor of this scan.
+        waiting: Breaks detected on a value not known by as_of.
+        publish_counts: Filled by publish_regime_signals.
     """
 
     timestamp: datetime
@@ -256,6 +338,10 @@ class ChangeReport:
     skipped: dict[str, str] = field(default_factory=dict)
     as_of: date | None = None
     detector_version: str = CHANGEPOINT_DETECTOR_VERSION
+    series: dict[str, FeatureSeries] = field(default_factory=dict)
+    min_confidence: float = 0.5
+    waiting: int = 0
+    publish_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def fresh_breaks(self) -> list[FeatureBreak]:
@@ -265,7 +351,7 @@ class ChangeReport:
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 def changepoint_signal_id(feature: str, break_date: date) -> str:
-    """Deterministic id: detector version, feature, break obs_date."""
+    """Logical break id: detector version, feature, break obs_date."""
     return f"{CHANGEPOINT_DETECTOR_VERSION}:{feature}:{break_date.isoformat()}"
 
 
@@ -293,7 +379,7 @@ def break_direction(signal: RegimeChangeSignal, stress_sign: int) -> str:
 
 def _as_date(value: Any) -> date:
     if isinstance(value, datetime):
-        return value.date()
+        return value.astimezone(timezone.utc).date() if value.tzinfo else value.date()
     if isinstance(value, date):
         return value
     return pd.Timestamp(value).date()
@@ -363,32 +449,63 @@ def _bind(
     return "; ".join(reasons) or "no candidates"
 
 
+def _retractions(
+    engine: Engine, feature_ids: list[int], start: date, as_of: date,
+) -> dict[int, list[tuple[date, date]]]:
+    """feature_id -> [(obs_date, retraction UTC date)] visible at as_of in the read window."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT feature_id, obs_date, retracted_at FROM resolved_series_retractions "
+                "WHERE feature_id = ANY(:fids) AND obs_date BETWEEN :start AND :end "
+                "AND retracted_at <= :cutoff"
+            ),
+            {"fids": feature_ids, "start": start, "end": as_of, "cutoff": retraction_cutoff(as_of)},
+        ).fetchall()
+    out: dict[int, list[tuple[date, date]]] = {}
+    for fid, obs_date, retracted_at in rows:
+        out.setdefault(int(fid), []).append((_as_date(obs_date), _as_date(retracted_at)))
+    return out
+
+
+def _feature_series(
+    spec: RegimeFeature, feature: str, feature_id: int, rows: pd.DataFrame,
+    retracted: list[tuple[date, date]],
+) -> FeatureSeries:
+    obs = tuple(_as_date(v) for v in rows["obs_date"])
+    known = tuple(
+        max(_as_date(r), _as_date(v)) for r, v in zip(rows["release_date"], rows["vintage_date"])
+    )
+    return FeatureSeries(
+        spec=spec, feature=feature, feature_id=feature_id, obs=obs,
+        values=tuple(float(v) for v in rows["value"]), known=known,
+        retracted=tuple(sorted(retracted)),
+    )
+
+
 def _feature_breaks(
-    spec: RegimeFeature,
-    feature: str,
-    feature_id: int,
-    series: pd.DataFrame,
+    series: FeatureSeries,
     signals: list[RegimeChangeSignal],
     as_of: date,
 ) -> list[FeatureBreak]:
-    obs = [_as_date(v) for v in series["obs_date"]]
-    released = [_as_date(v) for v in series["release_date"]]
-    n = len(obs)
+    n = len(series.obs)
     out: list[FeatureBreak] = []
     for sig in signals:
         if sig.confirm_index is None or sig.confirm_index >= n:
             continue
-        start = causal_context_start(sig.change_index)
-        known_at = max(released[start:sig.confirm_index + 1])
+        start, end = series.support(sig.change_index)
+        known_at = series.support_known_at(start, end)
         fresh = (
             sig.confirm_index >= n - RECENCY_OBSERVATIONS
+            and known_at <= as_of
             and (as_of - known_at).days <= FRESH_BREAK_DAYS
         )
         out.append(FeatureBreak(
-            spec=spec, feature=feature, feature_id=feature_id, signal=sig,
-            break_date=obs[sig.change_index], confirm_date=obs[sig.confirm_index],
+            spec=series.spec, feature=series.feature, feature_id=series.feature_id, signal=sig,
+            break_date=series.obs[sig.change_index], confirm_date=series.obs[sig.confirm_index],
             known_at_date=known_at, valid_from=known_by(known_at),
-            direction=break_direction(sig, spec.stress_sign), fresh=fresh,
+            direction=break_direction(sig, series.spec.stress_sign), fresh=fresh,
+            support_start_date=series.obs[start], support_sha256=series.support_sha256(start, end),
         ))
     return out
 
@@ -419,14 +536,15 @@ def scan_for_changepoints(
 
     Returns:
         ChangeReport with every break in the lookback, which of them are
-        fresh, and the features skipped with their reasons.
+        fresh, the series they were found on, and the features skipped with
+        their reasons.
     """
     start = _time.monotonic()
     as_of = as_of or datetime.now(timezone.utc).date()
     specs = tuple(features[:max_features] if max_features else features)
     report = ChangeReport(
         timestamp=datetime.now(timezone.utc), features_scanned=0, changepoints_found=0,
-        regime_changes=[], elapsed_seconds=0.0, as_of=as_of,
+        regime_changes=[], elapsed_seconds=0.0, as_of=as_of, min_confidence=min_confidence,
     )
     if not specs:
         log.info("Changepoint scan: no declared features")
@@ -435,13 +553,23 @@ def scan_for_changepoints(
     names = sorted({c for s in specs for c in s.candidates})
     registry = _registry_rows(engine, names)
     fids = sorted({registry[n][0] for n in names if n in registry})
+    window_start = as_of - timedelta(days=lookback_days)
+    retractions: dict[int, list[tuple[date, date]]] = {}
     if fids:
         rows = (pit or PITStore(engine)).get_pit(
-            fids, as_of, "LATEST_AS_OF",
-            start_date=as_of - timedelta(days=lookback_days), end_date=as_of,
+            fids, as_of, "LATEST_AS_OF", start_date=window_start, end_date=as_of,
         )
+        retractions = _retractions(engine, fids, window_start, as_of)
     else:
         rows = pd.DataFrame(columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"])
+    if not rows.empty:
+        late = sum(_as_date(v) > as_of for v in rows["vintage_date"])
+        if late:
+            log.warning(
+                "Changepoint scan: {n} PIT rows have vintage_date after as_of {d}; "
+                "breaks that read them wait until that vintage is known",
+                n=late, d=as_of.isoformat(),
+            )
 
     decomposer = AutoBNNDecomposer(num_samples=100, num_chains=1)
     used: set[int] = set()
@@ -450,19 +578,23 @@ def scan_for_changepoints(
         if isinstance(bound, str):
             report.skipped[spec.key] = bound
             continue
-        feature, fid, series = bound
+        feature, fid, frame = bound
         used.add(fid)
         report.features_scanned += 1
+        series = _feature_series(spec, feature, fid, frame, retractions.get(fid, []))
+        report.series[feature] = series
         signals = decomposer.detect_causal_breaks(
-            series["value"].to_numpy(dtype=np.float64),
-            dates=[_as_date(v) for v in series["obs_date"]],
+            np.asarray(series.values, dtype=np.float64),
+            dates=list(series.obs),
             series_id=feature,
             min_confidence=min_confidence,
             pre_window=CAUSAL_PRE_WINDOW,
             post_window=CAUSAL_POST_WINDOW,
             peak_window=CAUSAL_PEAK_WINDOW,
         )
-        report.breaks.extend(_feature_breaks(spec, feature, fid, series, signals, as_of))
+        breaks = _feature_breaks(series, signals, as_of)
+        report.waiting += sum(1 for b in breaks if b.known_at_date > as_of)
+        report.breaks.extend(breaks)
 
     fresh = report.fresh_breaks
     report.regime_changes = [b.signal for b in fresh]
@@ -472,15 +604,28 @@ def scan_for_changepoints(
         log.warning("Changepoint scan skipped {n} declared features: {s}",
                     n=len(report.skipped), s=report.skipped)
     log.info(
-        "Changepoint scan as_of {d}: {n} features scanned, {c} breaks in lookback, {f} fresh, {t:.1f}s",
+        "Changepoint scan as_of {d}: {n} features scanned, {c} breaks in lookback, {f} fresh, "
+        "{w} waiting on a later vintage, {t:.1f}s",
         d=as_of.isoformat(), n=report.features_scanned, c=len(report.breaks),
-        f=len(fresh), t=report.elapsed_seconds,
+        f=len(fresh), w=report.waiting, t=report.elapsed_seconds,
     )
     return report
 
 
 # ── Publish ─────────────────────────────────────────────────────────────
 
+# Rows already written for these logical breaks, and every row of the scanned
+# features inside the readers' window (to find breaks that were withdrawn).
+_EXISTING_SQL = text("""
+    SELECT signal_id, ticker, valid_from, confidence,
+           metadata->>'support_sha256', metadata->>'status', metadata->>'break_date'
+    FROM signal_registry
+    WHERE source_module = :src AND signal_type = :stype AND provenance = :version
+      AND (signal_id = ANY(:ids) OR (ticker = ANY(:tickers) AND valid_from > :since))
+""")
+
+# Insert-only. A row is never written at or before an existing availability
+# of the same logical break, so nothing can be back-dated.
 _INSERT_SQL = text("""
     INSERT INTO signal_registry
         (signal_id, source_module, signal_type, ticker, value,
@@ -490,34 +635,75 @@ _INSERT_SQL = text("""
         CAST(:val AS double precision), CAST(:zscore AS double precision),
         CAST(:conf AS double precision), CAST(:direction AS text),
         CAST(:vfrom AS timestamptz), CAST(:meta AS jsonb), CAST(:version AS text)
-    WHERE NOT EXISTS (SELECT 1 FROM signal_registry WHERE signal_id = :sid)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM signal_registry WHERE signal_id = :sid AND valid_from >= CAST(:vfrom AS timestamptz)
+    )
     ON CONFLICT (signal_id, valid_from) DO NOTHING
 """)
 
 
-def _signal_params(b: FeatureBreak, as_of: date | None) -> dict[str, Any]:
-    """Bind parameters for one break's row."""
+@dataclass(frozen=True)
+class _Written:
+    """The latest row already written for one logical break."""
+
+    signal_id: str
+    ticker: str
+    valid_from: datetime
+    confidence: float
+    support_sha256: str | None
+    status: str
+    break_date: date | None
+
+
+def _latest_written(rows: list) -> dict[str, _Written]:
+    latest: dict[str, _Written] = {}
+    for sid, ticker, vfrom, conf, sha, status, bdate in rows:
+        vfrom = vfrom if vfrom.tzinfo else vfrom.replace(tzinfo=timezone.utc)
+        row = _Written(str(sid), str(ticker or ""), vfrom, float(conf or 0.0), sha,
+                       status or STATUS_LIVE, date.fromisoformat(bdate) if bdate else None)
+        if sid not in latest or vfrom > latest[sid].valid_from:
+            latest[sid] = row
+    return latest
+
+
+def _base_meta(series_spec: RegimeFeature, feature: str, feature_id: int, signal_id: str,
+               as_of: date | None) -> dict[str, Any]:
+    return {
+        "detector_version": CHANGEPOINT_DETECTOR_VERSION,
+        "break_id": signal_id,
+        "feature": feature,
+        "feature_id": feature_id,
+        "regime_key": series_spec.key,
+        "concept": series_spec.concept,
+        "stress_sign": series_spec.stress_sign,
+        "as_of": as_of.isoformat() if as_of else None,
+        "windows": {"pre": CAUSAL_PRE_WINDOW, "post": CAUSAL_POST_WINDOW, "peak": CAUSAL_PEAK_WINDOW},
+    }
+
+
+def _signal_params(
+    b: FeatureBreak, as_of: date | None, *, valid_from: datetime | None = None,
+    supersedes: datetime | None = None,
+) -> dict[str, Any]:
+    """Bind parameters for one live row of a break."""
     sig = b.signal
     statistic = float(np.clip(sig.statistic or 0.0, -_STAT_CLIP, _STAT_CLIP))
     risk = {"bearish": "risk_off", "bullish": "risk_on"}.get(b.direction, "none")
-    meta = {
-        "detector_version": CHANGEPOINT_DETECTOR_VERSION,
-        "feature": b.feature,
-        "feature_id": b.feature_id,
-        "regime_key": b.spec.key,
-        "concept": b.spec.concept,
-        "stress_sign": b.spec.stress_sign,
+    meta = _base_meta(b.spec, b.feature, b.feature_id, b.signal_id, as_of)
+    meta.update({
+        "status": STATUS_LIVE,
         "risk": risk,
         "break_date": b.break_date.isoformat(),
         "confirm_date": b.confirm_date.isoformat(),
+        "support_start_date": b.support_start_date.isoformat() if b.support_start_date else None,
         "known_at_date": b.known_at_date.isoformat(),
-        "as_of": as_of.isoformat() if as_of else None,
+        "support_sha256": b.support_sha256,
+        "supersedes_valid_from": supersedes.isoformat() if supersedes else None,
         "pre_regime": sig.pre_regime,
         "post_regime": sig.post_regime,
         "drift_change": sig.magnitude if statistic >= 0 else -sig.magnitude,
         "statistic": statistic,
-        "windows": {"pre": CAUSAL_PRE_WINDOW, "post": CAUSAL_POST_WINDOW, "peak": CAUSAL_PEAK_WINDOW},
-    }
+    })
     return {
         "sid": b.signal_id,
         "src": SOURCE_MODULE,
@@ -527,10 +713,85 @@ def _signal_params(b: FeatureBreak, as_of: date | None) -> dict[str, Any]:
         "zscore": statistic,
         "conf": float(sig.confidence),
         "direction": b.direction,
-        "vfrom": b.valid_from,
+        "vfrom": valid_from or b.valid_from,
         "meta": json.dumps(meta, sort_keys=True),
         "version": CHANGEPOINT_DETECTOR_VERSION,
     }
+
+
+def _withdrawal(
+    prev: _Written, series: FeatureSeries, as_of: date | None, now: datetime,
+) -> dict[str, Any] | None:
+    """Bind parameters for a withdrawal of ``prev``, or None if the scan cannot tell."""
+    bd = prev.break_date
+    if bd is None or not series.obs or not series.obs[0] <= bd <= series.obs[-1]:
+        return None
+    idx = bisect_left(series.obs, bd)
+    present = idx < len(series.obs) and series.obs[idx] == bd
+    if present and not series.decidable(idx):
+        return None
+    start, end = series.support(idx if present else max(0, idx - 1))
+    end = max(end, start)
+    sha = series.support_sha256(start, end)
+    if present and sha == prev.support_sha256:
+        return None   # same inputs give the same decision; nothing was withdrawn
+    known_at = series.support_known_at(start, end)
+    meta = _base_meta(series.spec, series.feature, series.feature_id, prev.signal_id, as_of)
+    meta.update({
+        "status": STATUS_WITHDRAWN,
+        "break_date": bd.isoformat(),
+        "known_at_date": known_at.isoformat(),
+        "support_sha256": sha,
+        "supersedes_valid_from": prev.valid_from.isoformat(),
+        "reason": ("the break is no longer detected on the current vintages"
+                   if present else "the break observation is no longer in the series"),
+    })
+    return {
+        "sid": prev.signal_id, "src": SOURCE_MODULE, "stype": SIGNAL_TYPE, "ticker": series.feature,
+        "val": 0.0, "zscore": 0.0, "conf": 0.0, "direction": "neutral",
+        "vfrom": max(known_by(known_at), now),
+        "meta": json.dumps(meta, sort_keys=True), "version": CHANGEPOINT_DETECTOR_VERSION,
+    }
+
+
+def _plan_writes(
+    report: ChangeReport, written: dict[str, _Written], now: datetime,
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int]]:
+    """The rows a publish inserts, as (kind, params), and counts by outcome."""
+    counts = {"first": 0, "revision": 0, "withdrawal": 0, "unchanged": 0, "waiting": 0}
+    plan: list[tuple[str, dict[str, Any]]] = []
+    for b in report.fresh_breaks:
+        prev = written.get(b.signal_id)
+        if prev is not None and prev.status == STATUS_LIVE and prev.support_sha256 == b.support_sha256:
+            counts["unchanged"] += 1
+            continue
+        if prev is None:
+            kind, vfrom = "first", b.valid_from
+        else:
+            # Seen only now: never earlier than this scan, so a late or
+            # back-dated vintage cannot move the break before its last row.
+            kind, vfrom = "revision", max(b.valid_from, now)
+        if vfrom > now:
+            counts["waiting"] += 1
+            continue
+        plan.append((kind, _signal_params(b, report.as_of, valid_from=vfrom,
+                                          supersedes=prev.valid_from if prev else None)))
+
+    detected = {b.signal_id for b in report.breaks}
+    since = now - timedelta(days=FRESH_BREAK_DAYS)
+    for sid, prev in written.items():
+        series = report.series.get(prev.ticker)
+        if (prev.status != STATUS_LIVE or prev.valid_from <= since or sid in detected
+                or series is None or prev.confidence < report.min_confidence):
+            continue
+        params = _withdrawal(prev, series, report.as_of, now)
+        if params is None:
+            continue
+        if params["vfrom"] > now:
+            counts["waiting"] += 1
+            continue
+        plan.append(("withdrawal", params))
+    return plan, counts
 
 
 def publish_regime_signals(
@@ -539,11 +800,16 @@ def publish_regime_signals(
     *,
     now: datetime | None = None,
 ) -> int:
-    """Write the report's fresh breaks to signal_registry.
+    """Write the report's fresh breaks, revisions and withdrawals to signal_registry.
 
-    A break whose valid_from is after ``now`` is deferred to a later scan, so
-    no row is ever valid from the future. A signal_id already present is not
-    written again.
+    * A logical break not written before gets a row valid from the end of
+      its known_at day; one still in the future waits for a later scan.
+    * A break whose support values are unchanged since its latest row is not
+      written again.
+    * A break whose support changed (a later vintage, a retraction) gets a
+      new row of the same signal_id, valid from the later of its known_at
+      day-end and ``now``; a break no longer detected gets a ``withdrawn``
+      row the same way. Rows are never updated or deleted.
 
     Parameters:
         engine: SQLAlchemy database engine.
@@ -551,25 +817,37 @@ def publish_regime_signals(
         now: Current time (default: now, UTC).
 
     Returns:
-        int: Number of rows inserted.
+        int: Number of rows inserted. ``report.publish_counts`` has them by
+        kind, plus the unchanged and waiting breaks.
     """
-    fresh = report.fresh_breaks
-    if not fresh:
-        return 0
     now = now or datetime.now(timezone.utc)
-    due = [b for b in fresh if b.valid_from <= now]
-    if len(due) < len(fresh):
-        log.info("Changepoint publish: {n} fresh breaks not known yet (valid_from > now), deferred",
-                 n=len(fresh) - len(due))
+    fresh = report.fresh_breaks
+    tickers = sorted(report.series)
+    if not fresh and not tickers:
+        report.publish_counts = {}
+        return 0
 
-    published = 0
     with engine.begin() as conn:
-        for b in due:
-            result = conn.execute(_INSERT_SQL, _signal_params(b, report.as_of))
-            published += max(0, int(result.rowcount or 0))
+        rows = conn.execute(_EXISTING_SQL, {
+            "src": SOURCE_MODULE, "stype": SIGNAL_TYPE, "version": CHANGEPOINT_DETECTOR_VERSION,
+            "ids": sorted({b.signal_id for b in fresh}), "tickers": tickers,
+            "since": now - timedelta(days=FRESH_BREAK_DAYS),
+        }).fetchall()
+        plan, counts = _plan_writes(report, _latest_written(rows), now)
+        published = 0
+        for kind, params in plan:
+            result = conn.execute(_INSERT_SQL, params)
+            inserted = max(0, int(result.rowcount or 0))
+            published += inserted
+            counts[kind] += inserted
 
+    report.publish_counts = counts
+    if counts["waiting"]:
+        log.info("Changepoint publish: {n} rows not known yet (valid_from > now), deferred",
+                 n=counts["waiting"])
     if published:
-        log.info("Published {n} regime change signals ({v})", n=published, v=CHANGEPOINT_DETECTOR_VERSION)
+        log.info("Published {n} regime change rows ({v}): {c}",
+                 n=published, v=CHANGEPOINT_DETECTOR_VERSION, c=counts)
     return published
 
 
@@ -606,7 +884,9 @@ def run_changepoint_cycle(
         "features_skipped": dict(report.skipped),
         "changepoints_found": report.changepoints_found,
         "breaks_in_lookback": len(report.breaks),
+        "breaks_waiting_on_a_vintage": report.waiting,
         "signals_published": published,
+        "publish": dict(report.publish_counts),
         "elapsed_seconds": round(report.elapsed_seconds, 2),
         "top_changes": [
             {

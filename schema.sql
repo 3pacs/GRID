@@ -387,6 +387,119 @@ CREATE TABLE IF NOT EXISTS regime_history (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- regime_history keeps every version it replaces (#1302, migrations/versions/regime_history_revs_20261122.py).
+-- The trigger owns every version clock (clock_timestamp() under the row lock, strictly increasing): a change
+-- that alters a row copies the old version into regime_history_revisions; writers cannot set created_at.
+-- Clocks are mutation times, not commit visibility (superseded_by_xid records the transaction). Writers name
+-- a reason and run (set_config 'grid.regime_history_reason' / 'grid.regime_history_run', transaction-local);
+-- a change without them is archived as unattributed. Versions written before regime_history_revision_epoch
+-- have an unknown start (created_at NULL in their revision). obs_date changes and TRUNCATE are refused.
+CREATE TABLE IF NOT EXISTS regime_history_revision_epoch (
+    singleton       BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    revisions_from  TIMESTAMPTZ NOT NULL
+);
+
+INSERT INTO regime_history_revision_epoch (revisions_from)
+SELECT clock_timestamp() WHERE NOT EXISTS (SELECT 1 FROM regime_history_revision_epoch);
+
+CREATE TABLE IF NOT EXISTS regime_history_revisions (
+    id             BIGSERIAL PRIMARY KEY,
+    obs_date       DATE NOT NULL,
+    regime         TEXT NOT NULL,
+    confidence     DOUBLE PRECISION,
+    source         TEXT,
+    data_as_of     DATE,
+    created_at     TIMESTAMPTZ,
+    superseded_at  TIMESTAMPTZ NOT NULL,
+    superseded_by_xid TEXT NOT NULL,
+    operation      TEXT NOT NULL CHECK (operation IN ('UPDATE', 'DELETE')),
+    reason         TEXT NOT NULL CHECK (btrim(reason) <> ''),
+    run_tag        TEXT NOT NULL CHECK (btrim(run_tag) <> ''),
+    attributed     BOOLEAN NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_regime_history_revisions_obs_date
+    ON regime_history_revisions (obs_date, superseded_at);
+
+CREATE OR REPLACE FUNCTION regime_history_keep_revisions()
+RETURNS TRIGGER AS $$
+DECLARE
+    why TEXT := nullif(btrim(coalesce(current_setting('grid.regime_history_reason', true), '')), '');
+    run TEXT := nullif(btrim(coalesce(current_setting('grid.regime_history_run', true), '')), '');
+    app TEXT := nullif(btrim(coalesce(current_setting('application_name', true), '')), '');
+    clock TIMESTAMPTZ := clock_timestamp();
+    epoch TIMESTAMPTZ;
+BEGIN
+    IF TG_OP = 'TRUNCATE' THEN
+        RAISE EXCEPTION 'regime_history keeps every version: TRUNCATE refused';
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        NEW.created_at := clock;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.obs_date IS DISTINCT FROM OLD.obs_date THEN
+        RAISE EXCEPTION 'regime_history: obs_date % cannot change', OLD.obs_date;
+    END IF;
+    IF TG_OP = 'UPDATE' AND (NEW.regime, NEW.confidence, NEW.source, NEW.data_as_of)
+            IS NOT DISTINCT FROM (OLD.regime, OLD.confidence, OLD.source, OLD.data_as_of) THEN
+        NEW.created_at := OLD.created_at;
+        RETURN NEW;
+    END IF;
+    IF OLD.created_at IS NOT NULL AND clock <= OLD.created_at THEN
+        clock := OLD.created_at + interval '1 microsecond';
+    END IF;
+    SELECT revisions_from INTO epoch FROM regime_history_revision_epoch;
+    INSERT INTO regime_history_revisions
+        (obs_date, regime, confidence, source, data_as_of, created_at, superseded_at, superseded_by_xid,
+         operation, reason, run_tag, attributed)
+    VALUES
+        (OLD.obs_date, OLD.regime, OLD.confidence, OLD.source, OLD.data_as_of,
+         CASE WHEN epoch IS NULL OR OLD.created_at IS NULL OR OLD.created_at < epoch
+              THEN NULL ELSE OLD.created_at END,
+         clock, pg_current_xact_id()::text,
+         TG_OP, coalesce(why, 'unattributed: the writer named no grid.regime_history_reason'),
+         coalesce(run, 'unattributed: application_name ' || coalesce(app, '(none)')),
+         why IS NOT NULL AND run IS NOT NULL);
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    NEW.created_at := clock;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION regime_history_revisions_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only: % refused', TG_TABLE_NAME, TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS regime_history_keep_revisions ON regime_history;
+CREATE TRIGGER regime_history_keep_revisions
+    BEFORE INSERT OR UPDATE OR DELETE ON regime_history
+    FOR EACH ROW EXECUTE FUNCTION regime_history_keep_revisions();
+DROP TRIGGER IF EXISTS regime_history_no_truncate ON regime_history;
+CREATE TRIGGER regime_history_no_truncate
+    BEFORE TRUNCATE ON regime_history
+    FOR EACH STATEMENT EXECUTE FUNCTION regime_history_keep_revisions();
+DROP TRIGGER IF EXISTS regime_history_revisions_no_mutation ON regime_history_revisions;
+CREATE TRIGGER regime_history_revisions_no_mutation
+    BEFORE UPDATE OR DELETE ON regime_history_revisions
+    FOR EACH ROW EXECUTE FUNCTION regime_history_revisions_append_only();
+DROP TRIGGER IF EXISTS regime_history_revisions_no_truncate ON regime_history_revisions;
+CREATE TRIGGER regime_history_revisions_no_truncate
+    BEFORE TRUNCATE ON regime_history_revisions
+    FOR EACH STATEMENT EXECUTE FUNCTION regime_history_revisions_append_only();
+DROP TRIGGER IF EXISTS regime_history_revision_epoch_no_mutation ON regime_history_revision_epoch;
+CREATE TRIGGER regime_history_revision_epoch_no_mutation
+    BEFORE UPDATE OR DELETE ON regime_history_revision_epoch
+    FOR EACH ROW EXECUTE FUNCTION regime_history_revisions_append_only();
+DROP TRIGGER IF EXISTS regime_history_revision_epoch_no_truncate ON regime_history_revision_epoch;
+CREATE TRIGGER regime_history_revision_epoch_no_truncate
+    BEFORE TRUNCATE ON regime_history_revision_epoch
+    FOR EACH STATEMENT EXECUTE FUNCTION regime_history_revisions_append_only();
+
 -- Partial index for conflict reporting
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict_detail
     ON resolved_series (feature_id, obs_date) WHERE conflict_flag = TRUE;

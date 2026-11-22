@@ -806,10 +806,13 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
     stamped with its version in ``provenance``. ``direction`` is already the
     risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Counts *features*, not rows: the latest break per feature known in the
-    last CHANGEPOINT_FRESH_DAYS days. Only rows of
-    CHANGEPOINT_DETECTOR_VERSION count; the earlier detector's rows (about
-    1.08M, one per feature per index per 12 h scan) are ignored. Score = net
+    Counts *features*, not rows: the latest row per feature known in the
+    last CHANGEPOINT_FRESH_DAYS days. A break re-evaluated on a later vintage
+    gets a later row of the same signal_id, and one no longer detected gets a
+    row with metadata status ``withdrawn``; a feature whose latest row is a
+    withdrawal is not counted. Only rows of CHANGEPOINT_DETECTOR_VERSION
+    count; the earlier detector's rows (about 1.08M, one per feature per
+    index per 12 h scan) are ignored. Score = net
     (risk-on minus risk-off features) x CHANGEPOINT_POINTS_PER_FEATURE x
     average confidence, capped at +/-CHANGEPOINT_SCORE_CAP; confidence is
     capped at CHANGEPOINT_CONFIDENCE_CAP.
@@ -828,7 +831,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 )
 
             rows = conn.execute(text(
-                "SELECT ticker, direction, confidence, valid_from "
+                "SELECT ticker, direction, confidence, valid_from, metadata->>'status' "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
@@ -855,11 +858,22 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 status="no_data", historical_accuracy=accuracy,
             )
 
-        # Latest fresh break per feature (rows are newest first).
+        # Latest row per feature (rows are newest first); a withdrawal there
+        # means the feature has no live fresh break.
         latest: dict[Any, Any] = {}
         for r in rows:
             latest.setdefault(r[0], r)
-        features = list(latest.values())
+        features = [r for r in latest.values() if r[4] != "withdrawn"]
+        withdrawn_count = len(latest) - len(features)
+        if not features:
+            return _verdict(
+                "regime_changepoints", "Regime Changepoints",
+                0, 0, "no fresh breaks", "",
+                f"Every regime break known in the last {window} was withdrawn on later data "
+                f"({withdrawn_count} feature{'s' if withdrawn_count != 1 else ''}, "
+                f"detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                status="no_data", historical_accuracy=accuracy,
+            )
         total = len(features)
         bullish = sorted(str(r[0]) for r in features if r[1] == "bullish")
         bearish = sorted(str(r[0]) for r in features if r[1] == "bearish")
@@ -882,8 +896,8 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
         confidence = min(CHANGEPOINT_CONFIDENCE_CAP,
                          conf_base + conf_volume + conf_quality + conf_accuracy)
 
-        # Data age from most recent break
-        most_recent = rows[0][3]  # valid_from of most recent
+        # Data age from the most recent live break
+        most_recent = max(r[3] for r in features)
         age_hours = None
         if most_recent:
             try:
@@ -913,7 +927,8 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 f"{bull_count} toward risk-on{_named(bullish)}, "
                 f"{bear_count} toward risk-off{_named(bearish)}. "
                 f"{neutral_count} neutral; {other_count} other/unknown. "
-                f"Average confidence {avg_conf:.0%}. "
+                + (f"{withdrawn_count} withdrawn on later data, not counted. " if withdrawn_count else "")
+                + f"Average confidence {avg_conf:.0%}. "
                 + ("Net risk-on regime shifts suggest improving conditions. "
                    if net > 0
                    else "Net risk-off regime shifts suggest deteriorating conditions. "
@@ -928,6 +943,7 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             "unit": "features", "rows_read": len(rows),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
+            "withdrawn": withdrawn_count,
             "known_categories_exhaustive": other_count == 0,
         }
         return result

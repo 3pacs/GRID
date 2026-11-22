@@ -145,12 +145,13 @@ CHANGEPOINT_READER = ["DEFAULT_ACCURACY", "CHANGEPOINT_DETECTOR_VERSION", "CHANG
                       "CHANGEPOINT_CONFIDENCE_CAP", "_verdict", "_score_regime_changepoints"]
 
 
-def categories(directions, confidences=None, tickers=None):
-    """Reader over invented rows (ticker, direction, confidence, valid_from), newest first."""
+def categories(directions, confidences=None, tickers=None, statuses=None):
+    """Reader over invented rows (ticker, direction, confidence, valid_from, status), newest first."""
     ns = load(PATHS[1], CHANGEPOINT_READER)
     values = confidences if confidences is not None else [0.5] * len(directions)
     names = tickers if tickers is not None else [f"SYNTH-{i}" for i in range(len(directions))]
-    boundary = MemoryBoundary([(t, d, c, NOW) for t, d, c in zip(names, directions, values)])
+    status = statuses if statuses is not None else [None] * len(directions)
+    boundary = MemoryBoundary([(t, d, c, NOW, st) for t, d, c, st in zip(names, directions, values, status)])
     return ns["_score_regime_changepoints"](boundary, 0.5), boundary
 
 
@@ -194,7 +195,7 @@ class ThesisContracts(unittest.TestCase):
 
     def test_T2_explicit_neutral_is_valid(self):
         out, _ = categories(["bullish"] * 4 + ["bearish"] * 4 + ["neutral"] * 2)
-        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, known_categories_exhaustive=True))
+        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, withdrawn=0, known_categories_exhaustive=True))
         self.assertEqual(out["score"], 0)
 
     def test_T2_other_unknown_is_not_neutral(self):
@@ -232,6 +233,17 @@ class ThesisContracts(unittest.TestCase):
         self.assertLessEqual(out["confidence"], 60.0, "CONFIDENCE_CAP")
         self.assertEqual(out["direction"], "bearish")
 
+    def test_T2_withdrawn_break_is_not_counted(self):
+        # vix_spot's latest row withdraws its break; its older live row does not count either.
+        out, _ = categories(["neutral", "bullish", "bearish"], [0, 1, 1], ["vix_spot", "sp500_full", "vix_spot"],
+                            ["withdrawn", "live", "live"])
+        c = out["category_counts"]
+        self.assertEqual((c["total"], c["bullish"], c["bearish"], c["withdrawn"]), (1, 1, 0, 1), "WITHDRAWN_NOT_COUNTED")
+        self.assertIn("1 withdrawn on later data", out["reasoning"])
+        only, _ = categories(["neutral"], [0], ["vix_spot"], ["withdrawn"])
+        self.assertEqual(only["status"], "no_data")
+        self.assertNotIn("category_counts", only)
+
     def test_T2_only_the_current_detector_version_counts(self):
         _, boundary = categories(["bullish"])
         sql, params = boundary.statements[-1]
@@ -251,26 +263,42 @@ class ThesisContracts(unittest.TestCase):
         self.assertEqual(out["status"], "no_data")
         self.assertNotIn("category_counts", out)
 
-    def test_T2_publisher_declared_partition_by_stress_sign(self):
+    PUBLISHER = ["CHANGEPOINT_DETECTOR_VERSION", "SOURCE_MODULE", "SIGNAL_TYPE", "FRESH_BREAK_DAYS",
+                 "STATUS_LIVE", "STATUS_WITHDRAWN", "_STAT_CLIP", "_EXISTING_SQL", "_INSERT_SQL", "_Written",
+                 "_latest_written", "_base_meta", "_signal_params", "_withdrawal", "_plan_writes",
+                 "publish_regime_signals"]
+
+    def _publisher(self):
         import numpy
-        ns = load(PATHS[2], ["CHANGEPOINT_DETECTOR_VERSION", "SOURCE_MODULE", "SIGNAL_TYPE", "_STAT_CLIP",
-                             "_INSERT_SQL", "_signal_params", "publish_regime_signals"],
-                  np=numpy, CAUSAL_PRE_WINDOW=60, CAUSAL_POST_WINDOW=10, CAUSAL_PEAK_WINDOW=3)
+        from datetime import date
+        return load(PATHS[2], self.PUBLISHER, np=numpy, date=date,
+                    CAUSAL_PRE_WINDOW=60, CAUSAL_POST_WINDOW=10, CAUSAL_PEAK_WINDOW=3)
+
+    @staticmethod
+    def _report(*breaks):
+        return SimpleNamespace(as_of=NOW.date(), fresh_breaks=list(breaks), breaks=list(breaks),
+                               series={}, min_confidence=0.5)
+
+    @staticmethod
+    def _brk(i, direction, valid_from, stat=4.2, sha=None):
+        spec = SimpleNamespace(key=f"k{i}", concept="vol", stress_sign=1)
+        sig = SimpleNamespace(statistic=stat, confidence=0.7, magnitude=0.5, pre_regime="flat", post_regime="rising")
+        return SimpleNamespace(spec=spec, feature=f"SYNTH-{i}", feature_id=i, signal=sig,
+                               signal_id=f"changepoint_detector/2:SYNTH-{i}:2026-10-20",
+                               break_date=NOW.date(), confirm_date=NOW.date(), known_at_date=NOW.date(),
+                               support_start_date=NOW.date(), support_sha256=sha or f"sha{i}",
+                               valid_from=valid_from, direction=direction, fresh=True)
+
+    def test_T2_publisher_declared_partition_by_stress_sign(self):
+        ns = self._publisher()
         boundary = MemoryBoundary()
         boundary.rowcount = 1
         known = NOW - timedelta(hours=10)
-        later = NOW + timedelta(hours=1)
-        def brk(i, direction, valid_from=known, stat=4.2):
-            spec = SimpleNamespace(key=f"k{i}", concept="vol", stress_sign=1)
-            sig = SimpleNamespace(statistic=stat, confidence=0.7, magnitude=0.5, pre_regime="flat", post_regime="rising")
-            return SimpleNamespace(spec=spec, feature=f"SYNTH-{i}", feature_id=i, signal=sig,
-                                   signal_id=f"changepoint_detector/2:SYNTH-{i}:2026-10-20",
-                                   break_date=NOW.date(), confirm_date=NOW.date(), known_at_date=NOW.date(),
-                                   valid_from=valid_from, direction=direction, fresh=True)
-        report = SimpleNamespace(as_of=NOW.date(), fresh_breaks=[
-            brk(0, "bearish"), brk(1, "bullish", stat=-4.2), brk(2, "neutral", stat=0.0),
-            brk(3, "bearish", valid_from=later)])
+        report = self._report(self._brk(0, "bearish", known), self._brk(1, "bullish", known, stat=-4.2),
+                              self._brk(2, "neutral", known, stat=0.0),
+                              self._brk(3, "bearish", NOW + timedelta(hours=1)))
         self.assertEqual(ns["publish_regime_signals"](boundary, report, now=NOW), 3, "FUTURE_VALID_FROM_DEFERRED")
+        self.assertEqual((report.publish_counts["first"], report.publish_counts["waiting"]), (3, 1))
         params = [p for q, p in boundary.statements if "INSERT" in q]
         self.assertEqual([p["direction"] for p in params], ["bearish", "bullish", "neutral"])
         self.assertTrue(all(p["vfrom"] == known for p in params), "VALID_FROM_IS_KNOWN_AT_NOT_NOW")
@@ -278,7 +306,26 @@ class ThesisContracts(unittest.TestCase):
         self.assertEqual(params[0]["sid"], "changepoint_detector/2:SYNTH-0:2026-10-20")
         self.assertIn('"risk": "risk_off"', params[0]["meta"])
         self.assertIn('"risk": "risk_on"', params[1]["meta"])
-        self.assertIn("WHERE NOT EXISTS (SELECT 1 FROM signal_registry WHERE signal_id = :sid)", boundary.statements[0][0])
+        self.assertIn('"break_id": "changepoint_detector/2:SYNTH-0:2026-10-20"', params[0]["meta"])
+        self.assertIn("metadata->>'support_sha256'", boundary.statements[0][0])
+        insert = next(q for q, _ in boundary.statements if "INSERT" in q)
+        self.assertIn("valid_from >= CAST(:vfrom AS timestamptz)", insert, "NEVER_BEHIND_AN_EXISTING_ROW")
+
+    def test_T2_publisher_revision_is_dated_no_earlier_than_the_scan(self):
+        ns = self._publisher()
+        earlier = NOW - timedelta(days=2)
+        sid0, sid1 = (f"changepoint_detector/2:SYNTH-{i}:2026-10-20" for i in (0, 1))
+        boundary = MemoryBoundary([(sid0, "SYNTH-0", earlier, 0.7, "old-sha", "live", "2026-10-20"),
+                                   (sid1, "SYNTH-1", earlier, 0.7, "sha1", "live", "2026-10-20")])
+        boundary.rowcount = 1
+        # SYNTH-0's support changed; its new known_at is BEFORE its first row (a back-dated vintage).
+        report = self._report(self._brk(0, "bearish", earlier - timedelta(days=1)),
+                              self._brk(1, "bearish", earlier))
+        self.assertEqual(ns["publish_regime_signals"](boundary, report, now=NOW), 1)
+        (params,) = [p for q, p in boundary.statements if "INSERT" in q]
+        self.assertEqual((params["sid"], params["vfrom"]), (sid0, NOW), "REVISION_NOT_BACKDATED")
+        self.assertIn(f'"supersedes_valid_from": "{earlier.isoformat()}"', params["meta"])
+        self.assertEqual((report.publish_counts["revision"], report.publish_counts["unchanged"]), (1, 1))
 
     def test_T3_declared_units_disambiguate_one(self):
         f = tracker()["_snapshot_conviction_fraction"]

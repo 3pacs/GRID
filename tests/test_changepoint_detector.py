@@ -84,12 +84,31 @@ class _Result:
 
 
 class FakeEngine:
-    """feature_registry name lookups and a signal_registry keyed by signal_id."""
+    """feature_registry and retraction lookups, and an insert-only signal_registry.
 
-    def __init__(self, registry: list[tuple]):
+    The signal store applies the publisher's SQL rules: the read of rows
+    already written (by signal_id, or by ticker inside the window), and the
+    insert guard (no row at or before an existing availability of the same
+    signal_id; (signal_id, valid_from) unique).
+    """
+
+    def __init__(self, registry: list[tuple], retractions: list[tuple] = ()):
         self.registry = registry                 # (id, name, family, deprecated_at)
-        self.signals: dict[str, dict] = {}
+        self.retractions = list(retractions)     # (feature_id, obs_date, retracted_at)
+        self.rows: list[dict] = []               # insert params, in write order
         self.statements: list[tuple[str, dict]] = []
+
+    @property
+    def signals(self) -> dict[str, dict]:
+        """signal_id -> its latest row."""
+        out: dict[str, dict] = {}
+        for row in self.rows:
+            if row["sid"] not in out or row["vfrom"] > out[row["sid"]]["vfrom"]:
+                out[row["sid"]] = row
+        return out
+
+    def rows_for(self, sid: str) -> list[dict]:
+        return sorted((r for r in self.rows if r["sid"] == sid), key=lambda r: r["vfrom"])
 
     def connect(self):
         return _Conn(self)
@@ -114,11 +133,27 @@ class _Conn:
         if "FROM feature_registry" in sql:
             names = set(params["names"])
             return _Result([r for r in self.engine.registry if r[1] in names])
+        if "FROM resolved_series_retractions" in sql:
+            return _Result([
+                r for r in self.engine.retractions
+                if r[0] in params["fids"] and params["start"] <= r[1] <= params["end"]
+                and r[2] <= params["cutoff"]
+            ])
+        if "metadata->>'support_sha256'" in sql and sql.lstrip().startswith("SELECT"):
+            out = []
+            for r in self.engine.rows:
+                if (r["src"], r["stype"], r["version"]) != (params["src"], params["stype"], params["version"]):
+                    continue
+                if r["sid"] in params["ids"] or (r["ticker"] in params["tickers"] and r["vfrom"] > params["since"]):
+                    meta = json.loads(r["meta"])
+                    out.append((r["sid"], r["ticker"], r["vfrom"], r["conf"],
+                                meta.get("support_sha256"), meta.get("status"), meta.get("break_date")))
+            return _Result(out)
         if "INSERT INTO signal_registry" in sql:
-            assert "WHERE NOT EXISTS (SELECT 1 FROM signal_registry WHERE signal_id = :sid)" in sql
-            if params["sid"] in self.engine.signals:
+            assert "valid_from >= CAST(:vfrom AS timestamptz)" in sql
+            if any(r["sid"] == params["sid"] and r["vfrom"] >= params["vfrom"] for r in self.engine.rows):
                 return _Result(rowcount=0)
-            self.engine.signals[params["sid"]] = params
+            self.engine.rows.append(params)
             return _Result(rowcount=1)
         raise AssertionError(f"unexpected statement: {sql}")
 
@@ -458,6 +493,125 @@ class TestIdentityAndRecency:
 
 
 # ---------------------------------------------------------------------------
+# Late vintages: known_at, waiting, revisions and withdrawals (#1367 review)
+# ---------------------------------------------------------------------------
+#
+# Fixture shape: a quiet first print ending 11-17 (each value released and
+# fetched on its own obs_date), then a re-fetch of the last 20 observations
+# that adds a strong up-drift. The re-fetch keeps release_date = obs_date
+# (the bridge's back-dated stamp) and carries the fetch day as vintage_date.
+
+LAST_OBS = date(2026, 11, 17)
+
+
+def late_vintage_rows(fetched: date, *, seed: int = 3) -> list[tuple]:
+    days = business_days(end=LAST_OBS)
+    quiet = drift_shift_series(drift=0.0, seed=seed)
+    drifted = drift_shift_series(drift=3.0, seed=seed)
+    refetch = [(11, d, float(v), d, fetched, None) for d, v in zip(days[-20:], drifted[-20:])]
+    return vintages(11, days, quiet) + refetch
+
+
+class TestLateVintages:
+    def test_backdated_refetch_takes_its_vintage_day(self) -> None:
+        # Fetched 11-19 with release_date = obs_date: known on 11-19, not on
+        # the release dates (9ff1bf4a used max(release_date) = 11-17).
+        pit = window(late_vintage_rows(date(2026, 11, 19)), [11])
+        (b,) = scan(FakeEngine(VIX), pit, (one_feature(),)).fresh_breaks
+        assert b.known_at_date == date(2026, 11, 19)
+        assert b.valid_from == datetime.combine(date(2026, 11, 19), time.max, tzinfo=timezone.utc)
+        assert b.support_start_date is not None and b.support_start_date < b.break_date
+
+    def test_refetched_old_observations_are_not_discarded_as_old(self) -> None:
+        # Weekly-style lag: newest obs 8 days before as_of, fetched yesterday.
+        # On release dates alone the break reads 8 days old and is dropped.
+        as_of = LAST_OBS + timedelta(days=8)
+        pit = window(late_vintage_rows(as_of - timedelta(days=1)), [11])
+        report = scan(FakeEngine(VIX), pit, (one_feature(max_age_days=12),), as_of=as_of)
+        (b,) = report.fresh_breaks
+        assert b.known_at_date == as_of - timedelta(days=1)
+
+    def test_vintage_after_as_of_waits_then_publishes_on_its_day(self) -> None:
+        # release_date <= as_of < vintage_date: a value the read at as_of must
+        # not use. Whether or not get_pit fences it (#1365), nothing dated
+        # before the fetch may be written.
+        fetched = date(2026, 11, 22)
+        engine = FakeEngine(VIX)
+        pit = window(late_vintage_rows(fetched), [11])
+        spec = (one_feature(max_age_days=10),)
+        report = scan(engine, pit, spec)
+        assert not report.fresh_breaks
+        assert all(b.known_at_date > AS_OF for b in report.breaks if b.break_date > date(2026, 10, 20))
+        assert cd.publish_regime_signals(engine, report, now=NOW) == 0 and engine.rows == []
+
+        # Once the fetch day is past, the break is written, valid from that day.
+        report = scan(engine, pit, spec, as_of=date(2026, 11, 23))
+        assert cd.publish_regime_signals(engine, report, now=datetime(2026, 11, 24, 12, tzinfo=timezone.utc)) == 1
+        (row,) = engine.rows
+        assert row["vfrom"] == datetime.combine(fetched, time.max, tzinfo=timezone.utc)
+        assert json.loads(row["meta"])["known_at_date"] == fetched.isoformat()
+
+    def test_rescan_after_a_backdated_revision_never_moves_valid_from_earlier(self) -> None:
+        days = business_days(end=date(2026, 11, 19))
+        values = drift_shift_series()
+        engine = FakeEngine(VIX)
+        first = run_changepoint_cycle(engine, as_of=AS_OF, now=NOW, pit=window(vintages(11, days, values), [11]))
+        assert first["publish"]["first"] == 1
+        (sid,) = engine.signals
+        v1 = engine.signals[sid]["vfrom"]
+        # A revision of one support value lands later, stamped with a vintage
+        # day before the first row's valid_from.
+        revised = vintages(11, days, values) + [(11, days[-5], float(values[-5]) + 0.05, days[-5],
+                                                 date(2026, 11, 18), None)]
+        later = NOW + timedelta(hours=12)
+        second = run_changepoint_cycle(engine, as_of=AS_OF, now=later, pit=window(revised, [11]))
+        rows = engine.rows_for(sid)
+        assert second["publish"]["revision"] == 1 and len(rows) == 2
+        assert rows[0]["vfrom"] == v1 and rows[1]["vfrom"] == later > v1
+        meta = json.loads(rows[1]["meta"])
+        assert meta["supersedes_valid_from"] == v1.isoformat() and meta["status"] == "live"
+        assert meta["support_sha256"] != json.loads(rows[0]["meta"])["support_sha256"]
+        # The same revised data again: nothing new.
+        third = run_changepoint_cycle(engine, as_of=AS_OF, now=later + timedelta(hours=12), pit=window(revised, [11]))
+        assert third["signals_published"] == 0 and third["publish"]["unchanged"] == 1
+
+    def test_revision_that_removes_the_break_writes_a_withdrawal(self) -> None:
+        days = business_days(end=date(2026, 11, 19))
+        values = drift_shift_series()
+        quiet = drift_shift_series(drift=0.0)
+        engine = FakeEngine(VIX)
+        run_changepoint_cycle(engine, as_of=AS_OF, now=NOW, pit=window(vintages(11, days, values), [11]))
+        (sid,) = engine.signals
+        refetch = [(11, d, float(v), d, AS_OF, None) for d, v in zip(days[-20:], quiet[-20:])]
+        later = NOW + timedelta(hours=12)
+        out = run_changepoint_cycle(engine, as_of=AS_OF, now=later,
+                                    pit=window(vintages(11, days, values) + refetch, [11]))
+        assert out["publish"]["withdrawal"] == 1
+        latest = engine.signals[sid]
+        meta = json.loads(latest["meta"])
+        assert (latest["direction"], latest["conf"], meta["status"]) == ("neutral", 0.0, "withdrawn")
+        assert latest["vfrom"] == later
+        again = run_changepoint_cycle(engine, as_of=AS_OF, now=later + timedelta(hours=12),
+                                      pit=window(vintages(11, days, values) + refetch, [11]))
+        assert again["signals_published"] == 0
+
+    def test_retraction_inside_the_support_moves_known_at(self) -> None:
+        days = business_days(end=date(2026, 11, 19))
+        values = drift_shift_series()
+        wrong_day = days[-3]
+        retracted_at = datetime(2026, 11, 20, 10, tzinfo=timezone.utc)
+        rows = vintages(11, days, values) + [(11, wrong_day, 99.0, wrong_day, wrong_day + timedelta(days=1),
+                                              retracted_at)]
+        engine = FakeEngine(VIX, retractions=[(11, wrong_day, retracted_at)])
+        (b,) = scan(engine, window(rows, [11]), (one_feature(),)).fresh_breaks
+        # The retracted value is not read, and the break is only known once it was retracted.
+        assert b.known_at_date == date(2026, 11, 20)
+        clean = scan(FakeEngine(VIX), window(vintages(11, days, values), [11]), (one_feature(),)).fresh_breaks
+        assert [c.support_sha256 for c in clean] == [b.support_sha256]
+        assert clean[0].known_at_date == clean[0].confirm_date == date(2026, 11, 18)
+
+
+# ---------------------------------------------------------------------------
 # No edge artifacts
 # ---------------------------------------------------------------------------
 
@@ -550,8 +704,11 @@ class TestThesisReader:
     def test_reader_over_published_rows(self) -> None:
         from analysis import thesis_scorer
 
-        rows = [("vix_spot", "bearish", 1.0, NOW), ("hy_oas_spread", "bearish", 1.0, NOW),
-                ("sp500_full", "bullish", 0.5, NOW), ("vix_spot", "bullish", 1.0, NOW - timedelta(days=2))]
+        rows = [("vix_spot", "bearish", 1.0, NOW, "live"), ("hy_oas_spread", "bearish", 1.0, NOW, None),
+                ("sp500_full", "bullish", 0.5, NOW, "live"),
+                ("ig_oas_spread", "neutral", 0.0, NOW, "withdrawn"),
+                ("vix_spot", "bullish", 1.0, NOW - timedelta(days=2), "live"),
+                ("ig_oas_spread", "bearish", 1.0, NOW - timedelta(days=1), "live")]
         engine = MagicMock()
         conn = engine.connect.return_value.__enter__.return_value
         conn.execute.return_value.fetchall.return_value = rows
@@ -560,7 +717,10 @@ class TestThesisReader:
         assert "provenance = :version" in str(statement)
         assert statement.compile().params["version"] == CHANGEPOINT_DETECTOR_VERSION
         counts = verdict["category_counts"]
-        assert (counts["total"], counts["bearish"], counts["bullish"], counts["rows_read"]) == (3, 2, 1, 4)
+        # ig_oas_spread's latest row withdraws its break: not counted.
+        assert (counts["total"], counts["bearish"], counts["bullish"], counts["withdrawn"], counts["rows_read"]) \
+            == (3, 2, 1, 1, 6)
+        assert "1 withdrawn on later data" in verdict["reasoning"]
         # net -1 feature x 10 points x average confidence 2.5 / 3
         assert verdict["score"] == round(-10 * 2.5 / 3, 1)
         assert verdict["confidence"] <= thesis_scorer.CHANGEPOINT_CONFIDENCE_CAP
