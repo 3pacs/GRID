@@ -209,10 +209,25 @@ def _fmt_ts(iso: str | None) -> str:
 def _format_stale_source(s: dict[str, Any]) -> str:
     age = s.get("age_hours")
     age_txt = f"{age / 24:.1f}d ago" if age is not None else "never succeeded"
-    line = (
-        f"  - {s['source']}: last success {_fmt_ts(s.get('last_pull'))} "
-        f"({age_txt}, cadence {s.get('cadence') or '?'})"
-    )
+    judged = s.get("judged_by")
+    if isinstance(judged, dict):
+        # A shared catalog row judged by trade-date coverage (ingestion/
+        # source_freshness.py::SERIES_ANCHORS): say what is missing, and give
+        # the landing time only as context, since a re-landed old date is
+        # not the current one.
+        landed_txt = f"{age / 24:.1f}d ago" if age is not None else "never"
+        line = (
+            f"  - {s['source']}: newest trade date {judged.get('newest_obs_date') or 'none'}, "
+            f"due {judged.get('expected_obs_date') or '?'} "
+            f"(newest landed {_fmt_ts(s.get('last_pull'))}, {landed_txt})"
+        )
+        if judged.get("error"):
+            line += f"; check failed: {str(judged['error'])[:160]}"
+    else:
+        line = (
+            f"  - {s['source']}: last success {_fmt_ts(s.get('last_pull'))} "
+            f"({age_txt}, cadence {s.get('cadence') or '?'})"
+        )
     if s.get("last_attempt_status"):
         line += f"; last attempt {s['last_attempt_status']} {_fmt_ts(s.get('last_attempt_at'))}"
     return line

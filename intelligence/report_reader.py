@@ -169,6 +169,26 @@ def read_one(row: dict, client: Any | None) -> dict | None:
     return r
 
 
+LOCAL_PROVIDERS = ("llamacpp_z4", "llamacpp_threadripper", "llamacpp", "llamacpp_oracle", "ollama")
+
+
+def local_client() -> tuple[Any | None, str | None]:
+    """A client on a local node and its provider name, or (None, None). Walks LOCAL_PROVIDERS with
+    get_provider_client (that node or nothing, never a fallback) and skips any paid provider whatever the
+    environment says, so a report is never sent off the fleet."""
+    from llm.router import _PAID_PROVIDERS, get_provider_client
+    for p in LOCAL_PROVIDERS:
+        if p in _PAID_PROVIDERS:
+            continue
+        try:
+            c = get_provider_client(p)
+        except Exception:  # noqa: BLE001 - a dark node is skipped
+            c = None
+        if c is not None:
+            return c, p
+    return None, None
+
+
 # ---------------------------------------------------------------- database
 
 PENDING = text(
@@ -451,6 +471,24 @@ def settle_asks(engine: Engine, client: Any | None, *, since: date, limit: int =
     return {**counts, "checks": out if dry_run else None}
 
 
+def close_ask(engine: Engine, key: str, how: str, *, dry_run: bool = False) -> dict:
+    """Record that the owner settled an ask (source 'owner'). It leaves the digest until a newer report repeats it."""
+    how = re.sub(r"\s+", " ", how or "").strip()
+    if not how:
+        raise ValueError("say why the ask is closed")
+    asks = {a["key"]: a for a in open_asks(engine, date.today() - timedelta(days=ASK_WINDOW_DAYS))}
+    if key not in asks:
+        raise KeyError(f"no open ask with key {key} in the last {ASK_WINDOW_DAYS} days")
+    a = asks[key]
+    row = {"ask_key": key, "report_id": a["report_id"], "ask": a["ask"][:1000], "settled": True, "source": "owner",
+           "settled_by": None, "how": ("owner: " + how)[:200],
+           "later_seen": a["check"].later_seen if a["check"] is not None else 0}
+    if not dry_run:
+        with engine.begin() as conn:
+            conn.execute(INSERT_CHECK, row)
+    return row
+
+
 def digest(engine: Engine, day: date, max_items: int = 10) -> str:
     """The morning text: yesterday's counts and unreadable reports, then every ask to the owner from the last
     ASK_WINDOW_DAYS still open (once each, newest first), and how many were settled by later reports."""
@@ -463,7 +501,8 @@ def digest(engine: Engine, day: date, max_items: int = 10) -> str:
     asks = open_asks(engine, day - timedelta(days=ASK_WINDOW_DAYS - 1))
     done = lambda a: is_current(a) and a["check"].settled  # noqa: E731
     on_github = [a for a in asks if done(a) and a["check"].source == "github" and a["check"].settled_by is None]
-    probably = [a for a in asks if done(a) and not (a["check"].source == "github" and a["check"].settled_by is None)]
+    by_owner = [a for a in asks if done(a) and a["check"].source == "owner" and a["check"].settled_by is None]
+    probably = [a for a in asks if done(a) and a not in on_github and a not in by_owner]
     still = [a for a in asks if not done(a)]
     lines = [f"Reports {day.isoformat()}: {c['received']} in, {c['read']} read, {c['unread']} unread, "
              f"{c['unreadable']} unreadable."]
@@ -482,6 +521,8 @@ def digest(engine: Engine, day: date, max_items: int = 10) -> str:
             lines.append(f"- and {len(probably) - max_items} more")
     if on_github:
         lines.append(f"Settled on GitHub (merged): {len(on_github)}.")
+    if by_owner:
+        lines.append(f"Closed by you: {len(by_owner)}.")
     if unreadable:
         lines.append("Unreadable: " + "; ".join(f"{r.agent}: {r.title[:60]}" for r in unreadable[:4]))
     return "\n".join(lines)
@@ -537,18 +578,21 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--dry-run", action="store_true")
     c = sub.add_parser("coverage")
     c.add_argument("--days", type=int, default=7)
+    cl = sub.add_parser("close", help="record that the owner settled an ask")
+    cl.add_argument("--key", required=True)
+    cl.add_argument("--how", required=True)
+    cl.add_argument("--dry-run", action="store_true")
+    ls = sub.add_parser("asks", help="list open asks with their keys")
+    ls.add_argument("--days", type=int, default=ASK_WINDOW_DAYS)
     d = sub.add_parser("digest")
     d.add_argument("--day", help="YYYY-MM-DD (default: yesterday, UTC)")
     a = ap.parse_args(argv)
     from db import get_engine
     engine = get_engine()
     if a.cmd == "run":
-        client = None
-        try:
-            from llm.router import Tier, get_llm
-            client = get_llm(Tier.LOCAL)
-        except Exception as exc:  # noqa: BLE001 - routine and structured reads go on without a model
-            log.warning("report reader: no LLM client: {e}", e=str(exc))
+        client, provider = local_client()
+        if client is None:
+            log.warning("report reader: no local model answered; routine and structured reads only")
         res = read_batch(engine, limit=a.limit, llm_limit=a.llm_limit, client=client, dry_run=a.dry_run)
         if a.dry_run:
             for x in (res["reads"] or [])[:15]:
@@ -559,12 +603,20 @@ def main(argv: list[str] | None = None) -> int:
             for x in (settle.get("checks") or [])[:15]:
                 print(json.dumps({k: x[k] for k in ("ask", "settled", "how")})[:400])
         settle.pop("checks", None)
-        print(json.dumps({"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), **res["counts"],
-                          "asks": settle}))
+        print(json.dumps({"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "model": provider,
+                          **res["counts"], "asks": settle}))
         return 0
     if a.cmd == "coverage":
         for row in coverage(engine, date.today() - timedelta(days=a.days)):
             print(json.dumps(row))
+        return 0
+    if a.cmd == "close":
+        print(json.dumps(close_ask(engine, a.key, a.how, dry_run=a.dry_run)))
+        return 0
+    if a.cmd == "asks":
+        for x in open_asks(engine, date.today() - timedelta(days=a.days - 1)):
+            state = "open" if not (is_current(x) and x["check"].settled) else x["check"].source
+            print(json.dumps({"key": x["key"], "date": x["date"], "agent": x["agent"], "state": state, "ask": x["ask"][:300]}))
         return 0
     day = date.fromisoformat(a.day) if a.day else datetime.now(timezone.utc).date() - timedelta(days=1)
     print(digest(engine, day))
