@@ -145,13 +145,20 @@ CHANGEPOINT_READER = ["DEFAULT_ACCURACY", "CHANGEPOINT_DETECTOR_VERSION", "CHANG
                       "CHANGEPOINT_CONFIDENCE_CAP", "_verdict", "_score_regime_changepoints"]
 
 
-def categories(directions, confidences=None, tickers=None, statuses=None):
-    """Reader over invented rows (ticker, direction, confidence, valid_from, status), newest first."""
+def categories(directions, confidences=None, tickers=None, statuses=None, sids=None, valid_froms=None,
+               break_dates=None):
+    """Reader over invented rows (signal_id, ticker, direction, confidence, valid_from, status,
+    break_date, effective_known_at). Each row is its own break unless ``sids`` says otherwise."""
     ns = load(PATHS[1], CHANGEPOINT_READER)
-    values = confidences if confidences is not None else [0.5] * len(directions)
-    names = tickers if tickers is not None else [f"SYNTH-{i}" for i in range(len(directions))]
-    status = statuses if statuses is not None else [None] * len(directions)
-    boundary = MemoryBoundary([(t, d, c, NOW, st) for t, d, c, st in zip(names, directions, values, status)])
+    n = len(directions)
+    values = confidences if confidences is not None else [0.5] * n
+    names = tickers if tickers is not None else [f"SYNTH-{i}" for i in range(n)]
+    status = statuses if statuses is not None else [None] * n
+    ids = sids if sids is not None else [f"break-{i}" for i in range(n)]
+    times = valid_froms if valid_froms is not None else [NOW - timedelta(seconds=i) for i in range(n)]
+    dates = break_dates if break_dates is not None else ["2026-10-20"] * n
+    boundary = MemoryBoundary([(sid, t, d, c, vf, st, bd, vf) for sid, t, d, c, vf, st, bd
+                               in zip(ids, names, directions, values, times, status, dates)])
     return ns["_score_regime_changepoints"](boundary, 0.5), boundary
 
 
@@ -195,7 +202,7 @@ class ThesisContracts(unittest.TestCase):
 
     def test_T2_explicit_neutral_is_valid(self):
         out, _ = categories(["bullish"] * 4 + ["bearish"] * 4 + ["neutral"] * 2)
-        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, withdrawn=0, known_categories_exhaustive=True))
+        self.assertEqual(out["category_counts"], dict(unit="features", rows_read=10, breaks_read=10, total=10, bullish=4, bearish=4, neutral=2, other_unknown=0, withdrawn=0, aged_out=0, known_categories_exhaustive=True))
         self.assertEqual(out["score"], 0)
 
     def test_T2_other_unknown_is_not_neutral(self):
@@ -234,15 +241,32 @@ class ThesisContracts(unittest.TestCase):
         self.assertEqual(out["direction"], "bearish")
 
     def test_T2_withdrawn_break_is_not_counted(self):
-        # vix_spot's latest row withdraws its break; its older live row does not count either.
+        # Break A on vix_spot: live, then withdrawn (its latest row). Neither row counts.
         out, _ = categories(["neutral", "bullish", "bearish"], [0, 1, 1], ["vix_spot", "sp500_full", "vix_spot"],
-                            ["withdrawn", "live", "live"])
+                            ["withdrawn", "live", "live"], sids=["A", "S", "A"])
         c = out["category_counts"]
         self.assertEqual((c["total"], c["bullish"], c["bearish"], c["withdrawn"]), (1, 1, 0, 1), "WITHDRAWN_NOT_COUNTED")
-        self.assertIn("1 withdrawn on later data", out["reasoning"])
+        self.assertIn("1 break withdrawn on later data", out["reasoning"])
         only, _ = categories(["neutral"], [0], ["vix_spot"], ["withdrawn"])
         self.assertEqual(only["status"], "no_data")
         self.assertNotIn("category_counts", only)
+
+    def test_T2_withdrawal_does_not_hide_another_break_on_the_feature(self):
+        # vix_spot: A live then withdrawn, B live. B counts, in either row order and either break order.
+        hour = timedelta(hours=1)
+        for withdrawal_newest in (True, False):
+            for b_later in (True, False):
+                with self.subTest(withdrawal_newest=withdrawal_newest, b_later=b_later):
+                    a_date, b_date = ("2026-10-01", "2026-10-20") if b_later else ("2026-10-20", "2026-10-01")
+                    rows = [("A", "bullish", 0.9, NOW - 48 * hour, "live", a_date),
+                            ("A", "neutral", 0, NOW - (1 if withdrawal_newest else 3) * hour, "withdrawn", a_date),
+                            ("B", "bearish", 0.8, NOW - (3 if withdrawal_newest else 1) * hour, "live", b_date)]
+                    for order in (rows, rows[::-1]):
+                        sid, d, c, vf, st, bd = zip(*order)
+                        out, _ = categories(list(d), list(c), ["vix_spot"] * 3, list(st), list(sid), list(vf), list(bd))
+                        counts = out["category_counts"]
+                        self.assertEqual((counts["total"], counts["bearish"], counts["withdrawn"]), (1, 1, 1),
+                                         "WITHDRAWAL_RECONCILED_BY_SIGNAL_ID_FIRST")
 
     def test_T2_only_the_current_detector_version_counts(self):
         _, boundary = categories(["bullish"])
@@ -271,7 +295,7 @@ class ThesisContracts(unittest.TestCase):
     def _publisher(self):
         import numpy
         from datetime import date
-        return load(PATHS[2], self.PUBLISHER, np=numpy, date=date,
+        return load(PATHS[2], self.PUBLISHER, np=numpy, date=date, datetime=datetime,
                     CAUSAL_PRE_WINDOW=60, CAUSAL_POST_WINDOW=10, CAUSAL_PEAK_WINDOW=3)
 
     @staticmethod
@@ -287,7 +311,8 @@ class ThesisContracts(unittest.TestCase):
                                signal_id=f"changepoint_detector/2:SYNTH-{i}:2026-10-20",
                                break_date=NOW.date(), confirm_date=NOW.date(), known_at_date=NOW.date(),
                                support_start_date=NOW.date(), support_sha256=sha or f"sha{i}",
-                               valid_from=valid_from, direction=direction, fresh=True)
+                               valid_from=valid_from, effective_known_at=valid_from,
+                               direction=direction, fresh=True)
 
     def test_T2_publisher_declared_partition_by_stress_sign(self):
         ns = self._publisher()
@@ -308,6 +333,8 @@ class ThesisContracts(unittest.TestCase):
         self.assertIn('"risk": "risk_on"', params[1]["meta"])
         self.assertIn('"break_id": "changepoint_detector/2:SYNTH-0:2026-10-20"', params[0]["meta"])
         self.assertIn("metadata->>'support_sha256'", boundary.statements[0][0])
+        self.assertIn(f'"effective_known_at": "{known.isoformat()}"', params[0]["meta"])
+        self.assertIn(f'"first_published_at": "{NOW.isoformat()}"', params[0]["meta"], "DETECTOR_CLOCK_SEPARATE")
         insert = next(q for q, _ in boundary.statements if "INSERT" in q)
         self.assertIn("valid_from >= CAST(:vfrom AS timestamptz)", insert, "NEVER_BEHIND_AN_EXISTING_ROW")
 
@@ -315,8 +342,9 @@ class ThesisContracts(unittest.TestCase):
         ns = self._publisher()
         earlier = NOW - timedelta(days=2)
         sid0, sid1 = (f"changepoint_detector/2:SYNTH-{i}:2026-10-20" for i in (0, 1))
-        boundary = MemoryBoundary([(sid0, "SYNTH-0", earlier, 0.7, "old-sha", "live", "2026-10-20"),
-                                   (sid1, "SYNTH-1", earlier, 0.7, "sha1", "live", "2026-10-20")])
+        first = (earlier - timedelta(hours=1)).isoformat()
+        boundary = MemoryBoundary([(sid0, "SYNTH-0", earlier, 0.7, "old-sha", "live", "2026-10-20", earlier.isoformat(), first),
+                                   (sid1, "SYNTH-1", earlier, 0.7, "sha1", "live", "2026-10-20", earlier.isoformat(), first)])
         boundary.rowcount = 1
         # SYNTH-0's support changed; its new known_at is BEFORE its first row (a back-dated vintage).
         report = self._report(self._brk(0, "bearish", earlier - timedelta(days=1)),
@@ -325,6 +353,9 @@ class ThesisContracts(unittest.TestCase):
         (params,) = [p for q, p in boundary.statements if "INSERT" in q]
         self.assertEqual((params["sid"], params["vfrom"]), (sid0, NOW), "REVISION_NOT_BACKDATED")
         self.assertIn(f'"supersedes_valid_from": "{earlier.isoformat()}"', params["meta"])
+        self.assertIn(f'"first_published_at": "{first}"', params["meta"], "FIRST_PUBLICATION_CARRIED")
+        self.assertIn(f'"published_at": "{NOW.isoformat()}"', params["meta"])
+        self.assertIn(f'"effective_known_at": "{(earlier - timedelta(days=1)).isoformat()}"', params["meta"])
         self.assertEqual((report.publish_counts["revision"], report.publish_counts["unchanged"]), (1, 1))
 
     def test_T3_declared_units_disambiguate_one(self):

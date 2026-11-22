@@ -30,10 +30,16 @@ Detector version ``changepoint_detector/2``. What it does, in order:
    * The break's support is every observation its decision read: index
      i - 2 * pre_window through the confirming observation i + peak + post.
    * ``known_at`` = the latest of release_date, vintage_date and visible
-     retraction date over that whole support. ``valid_from`` = the end of
-     that UTC day (the day-level rule of ``store.pit.retraction_cutoff``),
-     never ``now()`` for a break's first row. A break whose ``known_at`` is
-     after ``as_of`` (a vintage the read should not see yet) waits.
+     retraction date over that whole support. Its UTC day-end (the day-level
+     rule of ``store.pit.retraction_cutoff``) is the break's *effective
+     known-at* (``metadata.effective_known_at``): when it became knowable
+     from its inputs. A break whose ``known_at`` is after ``as_of`` (a
+     vintage the read should not see yet) waits.
+   * The detector's own clock is kept apart: ``metadata.first_published_at``
+     is the scan that first wrote the break (carried onto its later rows),
+     ``metadata.published_at`` the scan that wrote the row. The freshness
+     window (here and in thesis_scorer) is measured on the effective
+     known-at only; publication times never extend it.
    * ``signal_id`` is the logical break: ``"<detector version>:<feature>:
      <break obs_date>"``. Availability is the row's ``valid_from``; the
      table's key is ``(signal_id, valid_from)``. ``metadata.support_sha256``
@@ -41,14 +47,18 @@ Detector version ``changepoint_detector/2``. What it does, in order:
    * Only fresh breaks are written: the confirming observation is one of the
      feature's newest ``RECENCY_OBSERVATIONS``, and the break became known
      within ``FRESH_BREAK_DAYS`` of ``as_of``.
+   * ``valid_from`` is the row's availability: the effective known-at for a
+     break's first row (never ``now()``).
    * A re-scan on unchanged support writes nothing. If a later vintage or a
      retraction changes the support of a break already written, the
      re-evaluation is a new availability row of the same ``signal_id``
      (``metadata.status`` ``live``), and if the break is no longer detected,
      a ``withdrawn`` row (direction ``neutral``, confidence 0). Either is
-     valid from the later of its own ``known_at`` day-end and the scan that
+     valid from the later of its own effective known-at and the scan that
      saw it, so a late or back-dated vintage can never move a break to an
      earlier ``valid_from``. Rows are only ever inserted, never updated.
+     Readers reduce each ``signal_id`` to its latest row first, then drop
+     withdrawn breaks, then pick per feature.
    * ``provenance`` = ``CHANGEPOINT_DETECTOR_VERSION`` on every row. Rows
      from the earlier detector have no provenance, and readers ignore them by
      version. Nothing is deleted.
@@ -282,7 +292,8 @@ class FeatureBreak:
         support_start_date: obs_date of the first observation it read.
         known_at_date: Latest release, vintage or visible retraction date
             over the whole support.
-        valid_from: End of known_at_date, UTC (the first row's availability).
+        valid_from: End of known_at_date, UTC: the effective known-at, which
+            is the availability of the break's first row.
         direction: bullish (risk-on) | bearish (risk-off) | neutral.
         fresh: Whether the break is inside the recency window of as_of and
             known by as_of.
@@ -306,6 +317,11 @@ class FeatureBreak:
     def signal_id(self) -> str:
         """The logical break id (version, feature, break date); not its availability."""
         return changepoint_signal_id(self.feature, self.break_date)
+
+    @property
+    def effective_known_at(self) -> datetime:
+        """When the break became knowable from its inputs (``known_by(known_at_date)``)."""
+        return known_by(self.known_at_date)
 
 
 @dataclass
@@ -618,7 +634,8 @@ def scan_for_changepoints(
 # features inside the readers' window (to find breaks that were withdrawn).
 _EXISTING_SQL = text("""
     SELECT signal_id, ticker, valid_from, confidence,
-           metadata->>'support_sha256', metadata->>'status', metadata->>'break_date'
+           metadata->>'support_sha256', metadata->>'status', metadata->>'break_date',
+           metadata->>'effective_known_at', metadata->>'first_published_at'
     FROM signal_registry
     WHERE source_module = :src AND signal_type = :stype AND provenance = :version
       AND (signal_id = ANY(:ids) OR (ticker = ANY(:tickers) AND valid_from > :since))
@@ -653,14 +670,17 @@ class _Written:
     support_sha256: str | None
     status: str
     break_date: date | None
+    effective_known_at: datetime | None = None
+    first_published_at: str | None = None
 
 
 def _latest_written(rows: list) -> dict[str, _Written]:
     latest: dict[str, _Written] = {}
-    for sid, ticker, vfrom, conf, sha, status, bdate in rows:
+    for sid, ticker, vfrom, conf, sha, status, bdate, effective, first_published in rows:
         vfrom = vfrom if vfrom.tzinfo else vfrom.replace(tzinfo=timezone.utc)
         row = _Written(str(sid), str(ticker or ""), vfrom, float(conf or 0.0), sha,
-                       status or STATUS_LIVE, date.fromisoformat(bdate) if bdate else None)
+                       status or STATUS_LIVE, date.fromisoformat(bdate) if bdate else None,
+                       datetime.fromisoformat(effective) if effective else None, first_published)
         if sid not in latest or vfrom > latest[sid].valid_from:
             latest[sid] = row
     return latest
@@ -683,9 +703,14 @@ def _base_meta(series_spec: RegimeFeature, feature: str, feature_id: int, signal
 
 def _signal_params(
     b: FeatureBreak, as_of: date | None, *, valid_from: datetime | None = None,
-    supersedes: datetime | None = None,
+    supersedes: datetime | None = None, published_at: datetime | None = None,
+    first_published_at: str | None = None,
 ) -> dict[str, Any]:
-    """Bind parameters for one live row of a break."""
+    """Bind parameters for one live row of a break.
+
+    ``effective_known_at`` (inputs) and ``first_published_at`` /
+    ``published_at`` (the detector's scans) are separate fields.
+    """
     sig = b.signal
     statistic = float(np.clip(sig.statistic or 0.0, -_STAT_CLIP, _STAT_CLIP))
     risk = {"bearish": "risk_off", "bullish": "risk_on"}.get(b.direction, "none")
@@ -697,6 +722,9 @@ def _signal_params(
         "confirm_date": b.confirm_date.isoformat(),
         "support_start_date": b.support_start_date.isoformat() if b.support_start_date else None,
         "known_at_date": b.known_at_date.isoformat(),
+        "effective_known_at": b.effective_known_at.isoformat(),
+        "first_published_at": first_published_at,
+        "published_at": published_at.isoformat() if published_at else None,
         "support_sha256": b.support_sha256,
         "supersedes_valid_from": supersedes.isoformat() if supersedes else None,
         "pre_regime": sig.pre_regime,
@@ -741,6 +769,9 @@ def _withdrawal(
         "status": STATUS_WITHDRAWN,
         "break_date": bd.isoformat(),
         "known_at_date": known_at.isoformat(),
+        "effective_known_at": known_by(known_at).isoformat(),
+        "first_published_at": prev.first_published_at,
+        "published_at": now.isoformat(),
         "support_sha256": sha,
         "supersedes_valid_from": prev.valid_from.isoformat(),
         "reason": ("the break is no longer detected on the current vintages"
@@ -774,15 +805,18 @@ def _plan_writes(
         if vfrom > now:
             counts["waiting"] += 1
             continue
-        plan.append((kind, _signal_params(b, report.as_of, valid_from=vfrom,
-                                          supersedes=prev.valid_from if prev else None)))
+        plan.append((kind, _signal_params(
+            b, report.as_of, valid_from=vfrom, supersedes=prev.valid_from if prev else None,
+            published_at=now, first_published_at=prev.first_published_at if prev else now.isoformat(),
+        )))
 
     detected = {b.signal_id for b in report.breaks}
     since = now - timedelta(days=FRESH_BREAK_DAYS)
     for sid, prev in written.items():
         series = report.series.get(prev.ticker)
-        if (prev.status != STATUS_LIVE or prev.valid_from <= since or sid in detected
-                or series is None or prev.confidence < report.min_confidence):
+        # Only a break a reader can still count (fresh by effective known-at).
+        if (prev.status != STATUS_LIVE or (prev.effective_known_at or prev.valid_from) <= since
+                or sid in detected or series is None or prev.confidence < report.min_confidence):
             continue
         params = _withdrawal(prev, series, report.as_of, now)
         if params is None:

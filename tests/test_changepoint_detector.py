@@ -147,7 +147,8 @@ class _Conn:
                 if r["sid"] in params["ids"] or (r["ticker"] in params["tickers"] and r["vfrom"] > params["since"]):
                     meta = json.loads(r["meta"])
                     out.append((r["sid"], r["ticker"], r["vfrom"], r["conf"],
-                                meta.get("support_sha256"), meta.get("status"), meta.get("break_date")))
+                                meta.get("support_sha256"), meta.get("status"), meta.get("break_date"),
+                                meta.get("effective_known_at"), meta.get("first_published_at")))
             return _Result(out)
         if "INSERT INTO signal_registry" in sql:
             assert "valid_from >= CAST(:vfrom AS timestamptz)" in sql
@@ -568,9 +569,14 @@ class TestLateVintages:
         rows = engine.rows_for(sid)
         assert second["publish"]["revision"] == 1 and len(rows) == 2
         assert rows[0]["vfrom"] == v1 and rows[1]["vfrom"] == later > v1
-        meta = json.loads(rows[1]["meta"])
+        meta, first_meta = json.loads(rows[1]["meta"]), json.loads(rows[0]["meta"])
         assert meta["supersedes_valid_from"] == v1.isoformat() and meta["status"] == "live"
-        assert meta["support_sha256"] != json.loads(rows[0]["meta"])["support_sha256"]
+        assert meta["support_sha256"] != first_meta["support_sha256"]
+        # Two clocks, two fields: the inputs' effective known-at, and the detector's scans.
+        assert first_meta["effective_known_at"] == v1.isoformat()
+        assert first_meta["first_published_at"] == first_meta["published_at"] == NOW.isoformat()
+        assert meta["first_published_at"] == NOW.isoformat() and meta["published_at"] == later.isoformat()
+        assert datetime.fromisoformat(meta["effective_known_at"]) < rows[1]["vfrom"]
         # The same revised data again: nothing new.
         third = run_changepoint_cycle(engine, as_of=AS_OF, now=later + timedelta(hours=12), pit=window(revised, [11]))
         assert third["signals_published"] == 0 and third["publish"]["unchanged"] == 1
@@ -591,6 +597,8 @@ class TestLateVintages:
         meta = json.loads(latest["meta"])
         assert (latest["direction"], latest["conf"], meta["status"]) == ("neutral", 0.0, "withdrawn")
         assert latest["vfrom"] == later
+        assert (meta["first_published_at"], meta["published_at"]) == (NOW.isoformat(), later.isoformat())
+        assert meta["effective_known_at"] == datetime.combine(AS_OF, time.max, tzinfo=timezone.utc).isoformat()
         again = run_changepoint_cycle(engine, as_of=AS_OF, now=later + timedelta(hours=12),
                                       pit=window(vintages(11, days, values) + refetch, [11]))
         assert again["signals_published"] == 0
@@ -701,30 +709,79 @@ class TestThesisReader:
         assert thesis_scorer.CHANGEPOINT_FRESH_DAYS == FRESH_BREAK_DAYS
         assert (cd.SOURCE_MODULE, cd.SIGNAL_TYPE) == ("discovery.changepoint_detector", "regime_change")
 
-    def test_reader_over_published_rows(self) -> None:
+    @staticmethod
+    def _read(rows: list[tuple]) -> tuple[dict, object]:
         from analysis import thesis_scorer
 
-        rows = [("vix_spot", "bearish", 1.0, NOW, "live"), ("hy_oas_spread", "bearish", 1.0, NOW, None),
-                ("sp500_full", "bullish", 0.5, NOW, "live"),
-                ("ig_oas_spread", "neutral", 0.0, NOW, "withdrawn"),
-                ("vix_spot", "bullish", 1.0, NOW - timedelta(days=2), "live"),
-                ("ig_oas_spread", "bearish", 1.0, NOW - timedelta(days=1), "live")]
         engine = MagicMock()
         conn = engine.connect.return_value.__enter__.return_value
         conn.execute.return_value.fetchall.return_value = rows
-        verdict = thesis_scorer._score_regime_changepoints(engine, 0.5)
+        return thesis_scorer._score_regime_changepoints(engine, 0.5), conn
+
+    @staticmethod
+    def _row(sid, ticker, direction, conf, valid_from, status="live", break_date="2026-11-10", effective=None):
+        """(signal_id, ticker, direction, confidence, valid_from, status, break_date, effective_known_at)"""
+        return (sid, ticker, direction, conf, valid_from, status, break_date, effective or valid_from)
+
+    def test_reader_over_published_rows(self) -> None:
+        from analysis import thesis_scorer
+
+        now = datetime.now(timezone.utc)
+        r = self._row
+        rows = [r("vix-b", "vix_spot", "bearish", 1.0, now - timedelta(hours=1), break_date="2026-11-12"),
+                r("hy-a", "hy_oas_spread", "bearish", 1.0, now - timedelta(hours=1), status=None),
+                r("spx-a", "sp500_full", "bullish", 0.5, now - timedelta(hours=1)),
+                r("ig-a", "ig_oas_spread", "neutral", 0.0, now - timedelta(hours=2), status="withdrawn"),
+                r("vix-a", "vix_spot", "bullish", 1.0, now - timedelta(days=2), break_date="2026-11-03"),
+                r("ig-a", "ig_oas_spread", "bearish", 1.0, now - timedelta(days=1))]
+        verdict, conn = self._read(rows)
         statement = conn.execute.call_args_list[-1].args[0]
         assert "provenance = :version" in str(statement)
+        assert "metadata->>'effective_known_at'" in str(statement)
         assert statement.compile().params["version"] == CHANGEPOINT_DETECTOR_VERSION
         counts = verdict["category_counts"]
-        # ig_oas_spread's latest row withdraws its break: not counted.
-        assert (counts["total"], counts["bearish"], counts["bullish"], counts["withdrawn"], counts["rows_read"]) \
-            == (3, 2, 1, 1, 6)
-        assert "1 withdrawn on later data" in verdict["reasoning"]
+        # ig-a's latest row withdraws it; vix_spot counts once, by its later break (vix-b).
+        assert (counts["total"], counts["bearish"], counts["bullish"], counts["withdrawn"],
+                counts["breaks_read"], counts["rows_read"]) == (3, 2, 1, 1, 5, 6)
+        assert "1 break withdrawn on later data" in verdict["reasoning"]
         # net -1 feature x 10 points x average confidence 2.5 / 3
         assert verdict["score"] == round(-10 * 2.5 / 3, 1)
         assert verdict["confidence"] <= thesis_scorer.CHANGEPOINT_CONFIDENCE_CAP
         assert verdict["data_point"].startswith("3 features with a fresh break")
+
+    @pytest.mark.parametrize("survivor_is_later_break", [True, False])
+    @pytest.mark.parametrize("withdrawal_is_newest_row", [True, False])
+    @pytest.mark.parametrize("rows_newest_first", [True, False])
+    def test_withdrawing_one_break_does_not_hide_another_on_the_same_feature(
+        self, survivor_is_later_break: bool, withdrawal_is_newest_row: bool, rows_newest_first: bool,
+    ) -> None:
+        # Feature vix_spot: break A (live, then withdrawn) and break B (live).
+        now = datetime.now(timezone.utc)
+        a_date, b_date = ("2026-11-03", "2026-11-12") if survivor_is_later_break else ("2026-11-12", "2026-11-03")
+        withdrawn_at, b_at = ((now - timedelta(hours=1), now - timedelta(hours=3)) if withdrawal_is_newest_row
+                              else (now - timedelta(hours=3), now - timedelta(hours=1)))
+        rows = [self._row("A", "vix_spot", "bullish", 0.9, now - timedelta(days=2), break_date=a_date),
+                self._row("A", "vix_spot", "neutral", 0.0, withdrawn_at, status="withdrawn", break_date=a_date),
+                self._row("B", "vix_spot", "bearish", 0.8, b_at, break_date=b_date)]
+        rows.sort(key=lambda row: row[4], reverse=rows_newest_first)
+        verdict, _ = self._read(rows)
+        counts = verdict["category_counts"]
+        assert verdict["status"] == "active"
+        assert (counts["total"], counts["bearish"], counts["bullish"], counts["withdrawn"]) == (1, 1, 0, 1)
+        assert "risk-off (vix_spot)" in verdict["reasoning"]
+
+    def test_freshness_is_measured_on_effective_known_at(self) -> None:
+        # A revision written an hour ago does not make a break known six days ago fresh again.
+        now = datetime.now(timezone.utc)
+        old_break = self._row("A", "vix_spot", "bearish", 1.0, now - timedelta(hours=1),
+                              effective=now - timedelta(days=6))
+        verdict, _ = self._read([old_break])
+        assert verdict["status"] == "no_data" and "1 older than the window" in verdict["reasoning"]
+        fresh = self._row("B", "sp500_full", "bullish", 1.0, now - timedelta(hours=1),
+                          effective=now - timedelta(days=4))
+        verdict, _ = self._read([old_break, fresh])
+        counts = verdict["category_counts"]
+        assert (counts["total"], counts["bullish"], counts["aged_out"]) == (1, 1, 1)
 
     @pytest.mark.parametrize("regime", ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"])
     def test_every_auto_regime_label_has_adjustments(self, regime: str) -> None:

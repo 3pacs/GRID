@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -319,27 +320,33 @@ def test_scorer_writer_invalid_unknown_before_effects(native_modules, native_pg_
     (["other", None], (0, 0, 0, 2), 0),
 ])
 def test_category_denominator_native_sql(native_modules, native_pg_engine, directions, expected_counts, expected_score):
-    # One row per feature counts; a feature's older break, legacy rows (no
-    # provenance), breaks outside the fresh window, future rows and a feature
-    # whose latest row is a withdrawal do not.
+    # One break per feature counts. Not counted: a feature's older break, legacy
+    # rows (no provenance), rows outside the window, future rows, a break whose
+    # latest row is a withdrawal (without hiding feature_0's other break), and a
+    # recent row of a break whose effective known-at is older than the window.
     scorer = native_modules[1]
     version = scorer.CHANGEPOINT_DETECTOR_VERSION
-    insert = text("INSERT INTO signal_registry VALUES (:t,:d,:c,1,NOW() + make_interval(hours => :h),"
+    aged = json.dumps({"effective_known_at": (datetime.now(timezone.utc) - timedelta(days=6)).isoformat()})
+    insert = text("INSERT INTO signal_registry VALUES (:sid,:t,:d,:c,1,NOW() + make_interval(secs => :s),"
                   "'discovery.changepoint_detector','regime_change',:p,CAST(:m AS jsonb))")
     with native_pg_engine.begin() as conn:
-        conn.execute(text("CREATE TABLE signal_registry (ticker TEXT, direction TEXT, confidence NUMERIC, value NUMERIC, valid_from TIMESTAMPTZ, source_module TEXT, signal_type TEXT, provenance TEXT, metadata JSONB)"))
+        conn.execute(text("CREATE TABLE signal_registry (signal_id TEXT, ticker TEXT, direction TEXT, confidence NUMERIC, value NUMERIC, valid_from TIMESTAMPTZ, source_module TEXT, signal_type TEXT, provenance TEXT, metadata JSONB)"))
         for i, direction in enumerate(directions):
-            conn.execute(insert, {"t": f"feature_{i}", "d": direction, "c": 0 if direction in ("other", None) else 0.75, "h": -1, "p": version, "m": None})
-        for ticker, hours, provenance, meta in (("feature_0", -48, version, None), ("legacy", -1, None, None),
-                                                ("stale", -24 * 6, version, None), ("future", 1, version, None),
-                                                ("withdrawn", -30, version, '{"status": "live"}'),
-                                                ("withdrawn", -2, version, '{"status": "withdrawn"}')):
-            conn.execute(insert, {"t": ticker, "d": "bearish", "c": 1, "h": hours, "p": provenance, "m": meta})
+            conn.execute(insert, {"sid": f"break_{i}", "t": f"feature_{i}", "d": direction, "c": 0 if direction in ("other", None) else 0.75, "s": -3600, "p": version, "m": None})
+        for sid, ticker, hours, provenance, meta in (
+                ("break_0_old", "feature_0", -48, version, None), ("legacy", "legacy", -1, None, None),
+                ("stale", "stale", -24 * 6, version, None), ("future", "future", 1, version, None),
+                ("w", "withdrawn", -30, version, '{"status": "live"}'),
+                ("w", "withdrawn", -2, version, '{"status": "withdrawn"}'),
+                ("f0_w", "feature_0", -30, version, '{"status": "live"}'),
+                ("f0_w", "feature_0", -1 / 6, version, '{"status": "withdrawn"}'),
+                ("aged", "aged", -1, version, aged)):
+            conn.execute(insert, {"sid": sid, "t": ticker, "d": "bearish", "c": 1, "s": hours * 3600, "p": provenance, "m": meta})
     verdict = scorer._score_regime_changepoints(native_pg_engine, 0.5)
     counts = verdict["category_counts"]
     assert tuple(counts[k] for k in ("bullish", "bearish", "neutral", "other_unknown")) == expected_counts
-    assert counts["total"] == len(directions) and counts["rows_read"] == len(directions) + 3
-    assert counts["withdrawn"] == 1
+    assert counts["total"] == len(directions) and counts["rows_read"] == len(directions) + 6
+    assert (counts["breaks_read"], counts["withdrawn"], counts["aged_out"]) == (len(directions) + 4, 2, 1)
     assert counts["known_categories_exhaustive"] == (expected_counts[-1] == 0)
     assert verdict["score"] == expected_score
     if expected_score == 6.0:

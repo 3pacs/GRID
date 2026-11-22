@@ -930,16 +930,32 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
     stamped with its version in ``provenance``. ``direction`` is already the
     risk reading: bullish = toward risk-on, bearish = toward risk-off.
 
-    Counts *features*, not rows: the latest row per feature known in the
-    last CHANGEPOINT_FRESH_DAYS days. A break re-evaluated on a later vintage
-    gets a later row of the same signal_id, and one no longer detected gets a
-    row with metadata status ``withdrawn``; a feature whose latest row is a
-    withdrawal is not counted. Only rows of CHANGEPOINT_DETECTOR_VERSION
-    count; the earlier detector's rows (about 1.08M, one per feature per
-    index per 12 h scan) are ignored. Score = net
-    (risk-on minus risk-off features) x CHANGEPOINT_POINTS_PER_FEATURE x
-    average confidence, capped at +/-CHANGEPOINT_SCORE_CAP; confidence is
-    capped at CHANGEPOINT_CONFIDENCE_CAP.
+    Counts *features*, not rows, in three steps:
+
+    1. Each break (``signal_id``) is reduced to its latest availability row
+       (``valid_from``). A break re-evaluated on a later vintage has a later
+       row of the same signal_id; one no longer detected has a row with
+       metadata status ``withdrawn``.
+    2. Breaks whose latest row is a withdrawal are dropped, and so are breaks
+       whose effective known-at is older than CHANGEPOINT_FRESH_DAYS.
+    3. Each feature counts once, by its surviving break with the latest
+       break date, so withdrawing one break never hides another on the same
+       feature.
+
+    Two times are kept apart. ``metadata.effective_known_at`` is when the
+    break became knowable from its inputs (release, vintage and retraction
+    dates); the freshness window is measured on it. ``metadata.
+    first_published_at`` is when the detector first wrote the break; it is
+    informational and never extends freshness. ``valid_from`` is the row's
+    availability: the effective known-at for a break's first row, and never
+    before the scan that saw a revision or withdrawal.
+
+    Only rows of CHANGEPOINT_DETECTOR_VERSION count; the earlier detector's
+    rows (about 1.08M, one per feature per index per 12 h scan) are ignored.
+    Score = net (risk-on minus risk-off features) x
+    CHANGEPOINT_POINTS_PER_FEATURE x average confidence, capped at
+    +/-CHANGEPOINT_SCORE_CAP; confidence is capped at
+    CHANGEPOINT_CONFIDENCE_CAP.
     """
     try:
         with engine.connect() as conn:
@@ -954,8 +970,12 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                     status="no_data", historical_accuracy=accuracy,
                 )
 
+            # valid_from >= effective known-at on every row, so this window
+            # holds every row whose break can still be fresh.
             rows = conn.execute(text(
-                "SELECT ticker, direction, confidence, valid_from, metadata->>'status' "
+                "SELECT signal_id, ticker, direction, confidence, valid_from, "
+                "metadata->>'status', metadata->>'break_date', "
+                "COALESCE(CAST(metadata->>'effective_known_at' AS timestamptz), valid_from) "
                 "FROM signal_registry "
                 "WHERE source_module = :src "
                 "AND signal_type = :stype "
@@ -982,20 +1002,38 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 status="no_data", historical_accuracy=accuracy,
             )
 
-        # Latest row per feature (rows are newest first); a withdrawal there
-        # means the feature has no live fresh break.
-        latest: dict[Any, Any] = {}
-        for r in rows:
-            latest.setdefault(r[0], r)
-        features = [r for r in latest.values() if r[4] != "withdrawn"]
-        withdrawn_count = len(latest) - len(features)
+        # rows: (signal_id, ticker, direction, confidence, valid_from, status,
+        # break_date, effective_known_at), newest valid_from first.
+        def _utc(ts: Any) -> Any:
+            return ts if ts is None or ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+        # 1. Latest availability per break (by valid_from, whatever the row order).
+        latest_by_break: dict[Any, Any] = {}
+        for i, r in enumerate(rows):
+            key = r[0] if r[0] is not None else ("row", i)
+            current = latest_by_break.get(key)
+            if current is None or _utc(r[4]) > _utc(current[4]):
+                latest_by_break[key] = r
+        # 2. Drop withdrawn breaks, then breaks no longer fresh by effective known-at.
+        live = [r for r in latest_by_break.values() if r[5] != "withdrawn"]
+        withdrawn_count = len(latest_by_break) - len(live)
+        fresh_after = datetime.now(timezone.utc) - timedelta(days=CHANGEPOINT_FRESH_DAYS)
+        fresh = [r for r in live if _utc(r[7]) is not None and _utc(r[7]) > fresh_after]
+        aged_count = len(live) - len(fresh)
+        # 3. One break per feature: the latest break date, then the latest availability.
+        by_feature: dict[Any, Any] = {}
+        for r in fresh:
+            current = by_feature.get(r[1])
+            if current is None or (str(r[6] or ""), _utc(r[4])) > (str(current[6] or ""), _utc(current[4])):
+                by_feature[r[1]] = r
+        features = [(r[1], r[2], r[3], r[7]) for r in by_feature.values()]
         if not features:
             return _verdict(
                 "regime_changepoints", "Regime Changepoints",
                 0, 0, "no fresh breaks", "",
-                f"Every regime break known in the last {window} was withdrawn on later data "
-                f"({withdrawn_count} feature{'s' if withdrawn_count != 1 else ''}, "
-                f"detector {CHANGEPOINT_DETECTOR_VERSION}).",
+                f"No live regime break known in the last {window}: {withdrawn_count} "
+                f"withdrawn on later data, {aged_count} older than the window "
+                f"(detector {CHANGEPOINT_DETECTOR_VERSION}).",
                 status="no_data", historical_accuracy=accuracy,
             )
         total = len(features)
@@ -1020,8 +1058,8 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
         confidence = min(CHANGEPOINT_CONFIDENCE_CAP,
                          conf_base + conf_volume + conf_quality + conf_accuracy)
 
-        # Data age from the most recent live break
-        most_recent = max(r[3] for r in features)
+        # Data age from the most recently knowable counted break
+        most_recent = max(_utc(r[3]) for r in features)
         age_hours = None
         if most_recent:
             try:
@@ -1051,7 +1089,8 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
                 f"{bull_count} toward risk-on{_named(bullish)}, "
                 f"{bear_count} toward risk-off{_named(bearish)}. "
                 f"{neutral_count} neutral; {other_count} other/unknown. "
-                + (f"{withdrawn_count} withdrawn on later data, not counted. " if withdrawn_count else "")
+                + (f"{withdrawn_count} break{'s' if withdrawn_count != 1 else ''} withdrawn on later data, "
+                   "not counted. " if withdrawn_count else "")
                 + f"Average confidence {avg_conf:.0%}. "
                 + ("Net risk-on regime shifts suggest improving conditions. "
                    if net > 0
@@ -1064,10 +1103,10 @@ def _score_regime_changepoints(engine: Engine, accuracy: float) -> dict:
             historical_accuracy=accuracy,
         )
         result["category_counts"] = {
-            "unit": "features", "rows_read": len(rows),
+            "unit": "features", "rows_read": len(rows), "breaks_read": len(latest_by_break),
             "total": total, "bullish": bull_count, "bearish": bear_count,
             "neutral": neutral_count, "other_unknown": other_count,
-            "withdrawn": withdrawn_count,
+            "withdrawn": withdrawn_count, "aged_out": aged_count,
             "known_categories_exhaustive": other_count == 0,
         }
         return result

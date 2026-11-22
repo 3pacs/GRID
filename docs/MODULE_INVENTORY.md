@@ -4485,7 +4485,7 @@ The modules below are still on disk, so they keep their entries, but they do not
 #### `discovery/__init__.py` — 6 LOC
 **Docstring:** GRID discovery engine.
 
-#### `discovery/changepoint_detector.py` — 903 LOC
+#### `discovery/changepoint_detector.py` — 937 LOC
 **Docstring:** Regime changepoints over GRID's declared regime features (#1301).
 **Functions:** `RegimeFeature`, `check_declared_features`, `FeatureSeries`, `FeatureBreak`, `ChangeReport`, `changepoint_signal_id`, `known_by`, `break_direction`, `scan_for_changepoints`, `publish_regime_signals`, `run_changepoint_cycle`
 **Reads:** `__future__`, `bisect`, `dataclasses`, `datetime`, `hashlib`, `json`, `loguru`, `numpy`, `pandas`, `scripts`, `sqlalchemy`, `store`, `time`, `timeseries`, `typing`
