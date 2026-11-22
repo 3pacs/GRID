@@ -24,6 +24,7 @@ Designed to be called by hermes_operator or via the API.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
@@ -55,6 +56,10 @@ FAILURE_CATEGORIES = [
     # distinct from "bad_data" so these rows can be counted and fixed rather
     # than averaged into the model's failure profile.
     "not_measured",
+    # Underlying spot at decision/entry time could not be resolved from any
+    # PIT-safe price source, so the underlying price path cannot be compared
+    # like-for-like against an entry basis.
+    "insufficient_data",
 ]
 
 
@@ -213,8 +218,19 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     if decision_opposing:
         data_at_decision["decision_signals_opposing"] = decision_opposing
 
-    # Load price path from entry to outcome
-    price_path = _load_price_path(engine, ticker, generated_at, closed_at or expiry)
+    # Load price path from entry to outcome, tracking which source supplied it
+    price_path, price_source = _load_price_path_with_source(
+        engine, ticker, generated_at, closed_at or expiry,
+    )
+
+    # Underlying spot at decision/entry time (PIT-safe, same price source as
+    # the path). options_recommendations.entry_price is the option premium, NOT
+    # underlying spot — never mix units when evaluating the underlying path.
+    underlying_spot = _load_underlying_entry_spot(
+        engine, ticker, generated_at, data_at_decision, price_source=price_source,
+    )
+    if underlying_spot is not None:
+        data_at_decision["underlying_entry_spot"] = underlying_spot
 
     # Classify the failure
     category, root_cause, signals_wrong, signals_right, what_missed = _classify_failure(
@@ -229,6 +245,8 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         price_path=price_path,
         data_at_decision=data_at_decision,
         sanity=sanity,
+        underlying_entry_price=underlying_spot,
+        generated_at=generated_at,
     )
 
     # What actually happened (factual summary)
@@ -447,6 +465,12 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
 
     _store_postmortem(engine, pm, trade_id=None, prediction_id=prediction_id)
 
+    _emit_prediction_postmortem(
+        pm=pm,
+        prediction_id=prediction_id,
+        model_name=model_name,
+    )
+
     log.info(
         "Post-mortem generated for prediction {id} ({t} {d}): {cat}",
         id=prediction_id, t=ticker, d=direction, cat=category,
@@ -661,20 +685,135 @@ def generate_lessons_learned(engine: Engine, postmortems: list[PostMortem]) -> s
 
 # ── Persistence ───────────────────────────────────────────────────────────
 
-_PRODUCER_MODULE = "intelligence.postmortem"
+# Canonical producer tags for PostmortemCompleted events.
+# Options-trade outcomes (options_recommendations / options scanner) are NOT
+# produced by oracle models and must carry OPTIONS_RECOMMENDER_PRODUCER so
+# oracle_weights skips oracle-model decay. Only oracle-prediction outcomes
+# carrying an exact model name use ORACLE_MODEL_PRODUCER_PREFIX.
+OPTIONS_RECOMMENDER_PRODUCER = "trading.options_recommender"
+ORACLE_MODEL_PRODUCER_PREFIX = "oracle.model:"
+_SELF_MODULE_NAME = "intelligence.postmortem"
+
+_OPTIONS_PRODUCER_ALIASES: frozenset[str] = frozenset({
+    "trading.options_recommender",
+    "options_recommender",
+    "options_recommendations",
+    "discovery.options_scanner",
+    "options_scanner",
+})
+
+
+def _oracle_model_producer(model_name: Any) -> str | None:
+    """Format an oracle prediction's ``model_name`` as ``oracle.model:<name>``."""
+    if not isinstance(model_name, str):
+        return None
+    name = model_name.strip()
+    if not name:
+        return None
+    low = name.lower()
+    if low in ("unknown", _SELF_MODULE_NAME) or any(ch.isspace() for ch in name):
+        return None
+    if name.startswith(ORACLE_MODEL_PRODUCER_PREFIX):
+        return _normalize_producer_key(name)
+    return f"{ORACLE_MODEL_PRODUCER_PREFIX}{name}"
+
+
+def _normalize_producer_key(raw: Any) -> str | None:
+    """Normalize a mapped producer identifier onto a canonical producer key.
+
+    Recognizes only:
+      - Options recommender / scanner producers -> ``"trading.options_recommender"``
+      - Explicit oracle-model tags ``"oracle.model:<model_name>"``
+
+    Returns ``None`` (→ skip) for unmapped, blank, or self-attributed values
+    rather than passing arbitrary strings through.
+    """
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    low = val.lower()
+    if low in (_SELF_MODULE_NAME, "unknown"):
+        return None
+    if low in _OPTIONS_PRODUCER_ALIASES:
+        return OPTIONS_RECOMMENDER_PRODUCER
+    if val.startswith(ORACLE_MODEL_PRODUCER_PREFIX):
+        model_name = val[len(ORACLE_MODEL_PRODUCER_PREFIX):].strip()
+        if (
+            not model_name
+            or model_name.lower() in ("unknown", _SELF_MODULE_NAME)
+            or any(ch.isspace() for ch in model_name)
+        ):
+            return None
+        return f"{ORACLE_MODEL_PRODUCER_PREFIX}{model_name}"
+    return None
+
+
+def _resolve_originating_producer(
+    pm: "PostMortem",
+    producer_module: str | None = None,
+    *,
+    is_options_trade: bool = False,
+) -> str:
+    """Resolve the canonical ``producer_module`` for a postmortem event.
+
+    - Options-trade outcomes (derived from ``options_recommendations`` / the
+      scanner) resolve to ``"trading.options_recommender"``.
+    - Oracle-prediction outcomes with a valid ``model_name`` resolve to
+      ``"oracle.model:<model_name>"``.
+    - Unmapped explicit values or unattributed outcomes never pass through and
+      never return ``"intelligence.postmortem"``; they log a warning and return
+      ``"unknown"``.
+    """
+    if producer_module is not None:
+        explicit = _normalize_producer_key(producer_module)
+        if explicit:
+            return explicit
+        log.warning(
+            "postmortem: unmapped producer_module={p!r} for trade {tid} ({t}); "
+            "emitting producer_module='unknown'",
+            p=producer_module, tid=pm.trade_id, t=pm.ticker,
+        )
+        return "unknown"
+
+    if is_options_trade or (isinstance(pm.trade_id, int) and pm.trade_id > 0):
+        return OPTIONS_RECOMMENDER_PRODUCER
+
+    data = pm.data_at_decision if isinstance(pm.data_at_decision, dict) else {}
+
+    oracle_model = _oracle_model_producer(data.get("model_name"))
+    if oracle_model:
+        return oracle_model
+
+    for key in ("producer_module", "source_module"):
+        resolved = _normalize_producer_key(data.get(key))
+        if resolved:
+            return resolved
+
+    if "scanner_signals" in data or "decision_signals" in data:
+        return OPTIONS_RECOMMENDER_PRODUCER
+
+    log.warning(
+        "postmortem: originating producer unknown for trade {tid} ({t}); "
+        "emitting producer_module='unknown'",
+        tid=pm.trade_id, t=pm.ticker,
+    )
+    return "unknown"
 
 
 def _verdict_from_outcome(outcome: str) -> str:
     """Map free-text outcome strings onto the PostmortemCompleted verdict
     enum ({HIT, MISS, PARTIAL}). Trade postmortems only run on failures
-    so the default is ``MISS``.
+    so the default is ``MISS``. ``EXPIRED`` options expired worthless
+    (intrinsic <= 0, -100% return) and map to ``MISS`` (total loss).
     """
     if not outcome:
         return "MISS"
     s = str(outcome).strip().upper()
     if s in {"HIT", "WIN"}:
         return "HIT"
-    if s in {"PARTIAL", "NEUTRAL", "EXPIRED"}:
+    if s in {"PARTIAL", "NEUTRAL"}:
         return "PARTIAL"
     return "MISS"
 
@@ -712,7 +851,12 @@ def _build_signals_used_from_pm(
     return refs
 
 
-def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
+def _emit_trade_postmortem(
+    *,
+    pm: "PostMortem",
+    trade_id: int,
+    producer_module: str | None = None,
+) -> None:
     """Non-fatal PostmortemCompleted emit for the trade postmortem path."""
     try:
         from decimal import Decimal
@@ -744,11 +888,16 @@ def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
     # ``contributing_signal_ids`` must be a list of UUIDs only — reuse
     # the signal_id from each SignalRef so the two fields agree.
     contributing_ids = [r.signal_id for r in signals_used]
+    origin_producer = _resolve_originating_producer(
+        pm,
+        producer_module=producer_module,
+        is_options_trade=True,
+    )
 
     try:
         _emit(
             PostmortemCompleted(
-                producer_module=_PRODUCER_MODULE,
+                producer_module=origin_producer,
                 correlation_id=corr_id,
                 prediction_id=prediction_uuid,
                 ticker=str(pm.ticker).upper(),
@@ -763,6 +912,83 @@ def _emit_trade_postmortem(*, pm: "PostMortem", trade_id: int) -> None:
         log.debug(
             "postmortem emit failed for trade {i}: {e}",
             i=trade_id, e=str(exc),
+        )
+
+
+def _emit_prediction_postmortem(
+    *,
+    pm: "PostMortem",
+    prediction_id: str,
+    model_name: str | None = None,
+) -> None:
+    """Non-fatal PostmortemCompleted emit for the oracle-prediction postmortem path.
+
+    Attributes the event to ``oracle.model:<model_name>`` only when the
+    prediction carries a valid oracle model name; otherwise emits ``"unknown"``
+    so ``oracle_weights`` skips decay cleanly.
+    """
+    try:
+        from decimal import Decimal
+        from uuid import UUID, uuid5, NAMESPACE_URL
+
+        from contracts.correlation import (
+            get_current_correlation_id,
+            new_correlation_id,
+        )
+        from contracts.emit import emit as _emit
+        from contracts.schemas import PostmortemCompleted
+    except Exception as exc:  # pragma: no cover — defensive import guard
+        log.debug("postmortem: contracts import failed: {e}", e=str(exc))
+        return
+
+    try:
+        corr_id = get_current_correlation_id() or new_correlation_id()
+    except Exception:
+        return
+
+    try:
+        try:
+            prediction_uuid = UUID(str(prediction_id))
+        except (ValueError, TypeError):
+            prediction_uuid = uuid5(
+                NAMESPACE_URL, f"grid:pm:prediction:{prediction_id}:{pm.ticker}"
+            )
+    except Exception:
+        return
+
+    signals_used = _build_signals_used_from_pm(pm)
+    contributing_ids = [r.signal_id for r in signals_used]
+
+    resolved_model = model_name
+    if not resolved_model and isinstance(pm.data_at_decision, dict):
+        resolved_model = pm.data_at_decision.get("model_name")
+    origin_producer = _oracle_model_producer(resolved_model)
+    if not origin_producer:
+        log.warning(
+            "postmortem: oracle prediction {pid} ({t}) has no valid model_name; "
+            "emitting producer_module='unknown'",
+            pid=prediction_id, t=pm.ticker,
+        )
+        origin_producer = "unknown"
+
+    try:
+        _emit(
+            PostmortemCompleted(
+                producer_module=origin_producer,
+                correlation_id=corr_id,
+                prediction_id=prediction_uuid,
+                ticker=str(pm.ticker).upper(),
+                verdict=_verdict_from_outcome(pm.outcome),
+                realized_pnl=Decimal(str(float(pm.actual_return or 0.0))),
+                signals_used=signals_used,
+                root_cause=str(pm.root_cause or "")[:2000],
+                contributing_signal_ids=contributing_ids,
+            )
+        )
+    except Exception as exc:  # non-fatal per SYNTH-C contract
+        log.debug(
+            "postmortem emit failed for prediction {i}: {e}",
+            i=prediction_id, e=str(exc),
         )
 
 
@@ -1132,6 +1358,36 @@ def _parse_json(val: Any) -> Any:
     return {}
 
 
+def _to_date(val: Any) -> date | None:
+    """Coerce a date, datetime, or ISO string to a ``date``, else None."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    try:
+        s = str(val).strip()
+        if not s:
+            return None
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date() if ("T" in s or " " in s) else date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _finite_positive(val: Any) -> float | None:
+    """Return float(val) if it is a finite positive number (not bool), else None."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0.0:
+        return None
+    return f
+
+
 def _reconstruct_decision_data(
     engine: Engine,
     ticker: str,
@@ -1149,19 +1405,10 @@ def _reconstruct_decision_data(
         "dealer_context": dealer_context,
     }
 
-    if not decision_date:
+    as_of = _to_date(decision_date)
+    if as_of is None:
         return data
-
-    # Coerce to date
-    if isinstance(decision_date, datetime):
-        as_of = decision_date.date()
-    elif isinstance(decision_date, date):
-        as_of = decision_date
-    else:
-        try:
-            as_of = datetime.fromisoformat(str(decision_date)).date()
-        except (ValueError, TypeError):
-            return data
+    data["decision_date"] = as_of.isoformat()
 
     with engine.connect() as conn:
         # Options scanner signals near decision date
@@ -1216,34 +1463,21 @@ def _reconstruct_decision_data(
     return data
 
 
-def _load_price_path(
+def _load_price_path_with_source(
     engine: Engine,
     ticker: str,
     start_date: Any,
     end_date: Any,
-) -> list[dict]:
-    """Load day-by-day price data from entry to exit.
+) -> tuple[list[dict], str | None]:
+    """Load day-by-day underlying price data from entry to exit plus source tag.
 
-    Returns a list of {date, price} dicts.
+    Returns ``(path, source)`` where ``source`` is ``"options_daily_signals"``,
+    ``"raw_series"``, or ``None`` when no rows were found.
     """
-    if not start_date or not end_date:
-        return []
-
-    # Coerce dates
-    def _to_date(val: Any) -> date | None:
-        if isinstance(val, datetime):
-            return val.date()
-        if isinstance(val, date):
-            return val
-        try:
-            return datetime.fromisoformat(str(val)).date()
-        except (ValueError, TypeError):
-            return None
-
     start = _to_date(start_date)
     end = _to_date(end_date)
     if not start or not end:
-        return []
+        return [], None
 
     path: list[dict] = []
 
@@ -1258,22 +1492,109 @@ def _load_price_path(
 
         if rows:
             for r in rows:
-                path.append({"date": str(r[0]), "price": float(r[1])})
-            return path
+                price = _finite_positive(r[1])
+                if price is not None:
+                    path.append({"date": str(r[0]), "price": price})
+            if path:
+                return path, "options_daily_signals"
 
-        # Fallback to raw_series
+        # Fallback to raw_series (latest vintage per obs_date)
         rows = conn.execute(text("""
             SELECT obs_date, value FROM raw_series
             WHERE series_id = :sid
               AND obs_date >= :s AND obs_date <= :e
               AND pull_status = 'SUCCESS'
-            ORDER BY obs_date
+              AND value > 0
+            ORDER BY obs_date ASC, pull_timestamp DESC
         """), {"sid": f"YF:{ticker}:close", "s": start, "e": end}).fetchall()
 
+        seen_dates: set[str] = set()
         for r in rows:
-            path.append({"date": str(r[0]), "price": float(r[1])})
+            d_str = str(r[0])
+            if d_str in seen_dates:
+                continue
+            price = _finite_positive(r[1])
+            if price is not None:
+                seen_dates.add(d_str)
+                path.append({"date": d_str, "price": price})
 
+    return (path, "raw_series") if path else ([], None)
+
+
+def _load_price_path(
+    engine: Engine,
+    ticker: str,
+    start_date: Any,
+    end_date: Any,
+) -> list[dict]:
+    """Load day-by-day price data from entry to exit.
+
+    Returns a list of {date, price} dicts.
+    """
+    path, _ = _load_price_path_with_source(engine, ticker, start_date, end_date)
     return path
+
+
+def _load_underlying_entry_spot(
+    engine: Engine,
+    ticker: str,
+    decision_date: Any,
+    data_at_decision: dict[str, Any],
+    *,
+    price_source: str | None = None,
+) -> float | None:
+    """Return PIT-safe underlying spot at or before ``decision_date``.
+
+    Reads from the same price source that supplied ``price_path`` so the entry
+    basis and path share units and vendor conventions:
+      - ``"options_daily_signals"``: uses reconstructed scanner ``spot_price``
+        or queries ``VISIBLE_DAILY_SIGNALS`` with ``signal_date <= as_of``.
+      - ``"raw_series"``: queries ``raw_series`` (``YF:{ticker}:close``) with
+        ``obs_date <= as_of``.
+      - ``None`` (no path loaded): checks scanner spot first, then ``raw_series``.
+
+    Returns ``None`` when no positive finite PIT price exists — never falls
+    back to option premium or looks past ``decision_date``.
+    """
+    as_of = _to_date(decision_date)
+    scanner_spot = _finite_positive(
+        (data_at_decision.get("scanner_signals") or {}).get("spot_price")
+    )
+
+    if price_source != "raw_series" and scanner_spot is not None:
+        return scanner_spot
+
+    if as_of is None:
+        return None
+
+    with engine.connect() as conn:
+        if price_source in ("options_daily_signals", None):
+            row = conn.execute(visible_sql("""
+                SELECT spot_price FROM """ + VISIBLE_DAILY_SIGNALS + """ ods
+                WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
+                ORDER BY signal_date DESC LIMIT 1
+            """), {"t": ticker, "d": as_of}).fetchone()
+            if row is not None:
+                spot = _finite_positive(row[0])
+                if spot is not None:
+                    return spot
+
+        if price_source in ("raw_series", None):
+            row = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = :sid
+                  AND obs_date <= :d
+                  AND pull_status = 'SUCCESS'
+                  AND value > 0
+                ORDER BY obs_date DESC, pull_timestamp DESC
+                LIMIT 1
+            """), {"sid": f"YF:{ticker}:close", "d": as_of}).fetchone()
+            if row is not None:
+                spot = _finite_positive(row[0])
+                if spot is not None:
+                    return spot
+
+    return None
 
 
 def _classify_failure(
@@ -1289,8 +1610,16 @@ def _classify_failure(
     price_path: list[dict],
     data_at_decision: dict,
     sanity: dict,
+    underlying_entry_price: float | None = None,
+    generated_at: Any = None,
 ) -> tuple[str, str, list[str], list[str], str]:
     """Classify a trade failure into a category with root cause analysis.
+
+    ``entry_price`` on ``options_recommendations`` is the OPTION PREMIUM;
+    ``price_path`` is UNDERLYING spot. Directional timing is always computed
+    against ``underlying_entry_price`` (or PIT scanner ``spot_price`` in
+    ``data_at_decision``), never against the option premium. If no underlying
+    entry spot is available, fails closed with ``"insufficient_data"``.
 
     Returns:
         (failure_category, root_cause, signals_wrong, signals_right, what_we_missed)
@@ -1298,24 +1627,6 @@ def _classify_failure(
     signals_wrong: list[str] = []
     signals_right: list[str] = []
     what_missed = ""
-
-    # Check if direction was ever right during the trade. `move_pct` divides
-    # by the entry, so an entry that is None, zero or negative is settled
-    # before the loop: `None > 0` raises and a zero basis is not a 0% move.
-    direction_was_right_at_some_point = False
-    max_favorable_move = 0.0
-    if price_path and entry_price is not None and entry_price > 0:
-        for p in price_path:
-            price = p.get("price", 0)
-            if not price:
-                continue
-            move_pct = (price - entry_price) / entry_price * 100
-            if direction == "CALL" and move_pct > 0:
-                direction_was_right_at_some_point = True
-                max_favorable_move = max(max_favorable_move, move_pct)
-            elif direction == "PUT" and move_pct < 0:
-                direction_was_right_at_some_point = True
-                max_favorable_move = max(max_favorable_move, abs(move_pct))
 
     # Check scanner signals
     scanner = data_at_decision.get("scanner_signals", {})
@@ -1358,6 +1669,44 @@ def _classify_failure(
             elif status == "PASS":
                 signals_right.append(f"sanity_{layer}_passed")
 
+    # Resolve underlying entry spot — NEVER substitute option premium entry_price.
+    spot_basis = (
+        _finite_positive(underlying_entry_price)
+        or _finite_positive(data_at_decision.get("underlying_entry_spot"))
+        or _finite_positive((scanner or {}).get("spot_price"))
+    )
+    if spot_basis is None:
+        log.warning(
+            "Post-mortem: missing underlying entry spot for {t}; "
+            "labeling insufficient_data instead of guessing",
+            t=ticker,
+        )
+        return (
+            "insufficient_data",
+            f"Underlying spot price at entry time is unavailable for {ticker}; "
+            f"cannot compare underlying price path against option premium.",
+            signals_wrong,
+            signals_right,
+            "Underlying entry spot price was not available at decision time.",
+        )
+
+    # Check if direction was ever right during the trade (underlying vs underlying)
+    direction_was_right_at_some_point = False
+    max_favorable_move = 0.0
+    dir_upper = (direction or "").strip().upper()
+    if price_path:
+        for p in price_path:
+            price = _finite_positive(p.get("price"))
+            if price is None:
+                continue
+            move_pct = (price - spot_basis) / spot_basis * 100
+            if dir_upper in ("CALL", "LONG") and move_pct > 0:
+                direction_was_right_at_some_point = True
+                max_favorable_move = max(max_favorable_move, move_pct)
+            elif dir_upper in ("PUT", "SHORT") and move_pct < 0:
+                direction_was_right_at_some_point = True
+                max_favorable_move = max(max_favorable_move, abs(move_pct))
+
     # Classify
     # 1. Right direction, wrong timing
     if direction_was_right_at_some_point and max_favorable_move > 1.0:
@@ -1370,22 +1719,22 @@ def _classify_failure(
         what_missed = "Expiry was too short or position should have been rolled."
         return category, root_cause, signals_wrong, signals_right, what_missed
 
-    # 2. Bad data — check for stale signals
-    scanner_date = data_at_decision.get("scanner_signals", {}).get("signal_date")
-    if scanner_date:
-        try:
-            sig_date = datetime.fromisoformat(str(scanner_date)).date() if "T" in str(scanner_date) else date.fromisoformat(str(scanner_date))
-            expiry_d = datetime.fromisoformat(str(expiry)).date() if isinstance(expiry, str) else expiry
-            if isinstance(expiry_d, date) and (expiry_d - sig_date).days > 7:
+    # 2. Bad data — check for stale signals at decision/entry time (NOT future expiry)
+    scanner_date = (scanner or {}).get("signal_date")
+    decision_ref = generated_at if generated_at is not None else data_at_decision.get("decision_date")
+    if scanner_date and decision_ref is not None:
+        sig_date = _to_date(scanner_date)
+        decision_d = _to_date(decision_ref)
+        if sig_date is not None and decision_d is not None:
+            signal_age_days = (decision_d - sig_date).days
+            if signal_age_days > 7:
                 category = "bad_data"
                 root_cause = (
-                    f"Scanner signals were {(expiry_d - sig_date).days} days old at decision time. "
+                    f"Scanner signals were {signal_age_days} days old at decision time. "
                     f"Data may have been stale."
                 )
                 what_missed = "Data freshness check should have flagged stale signals."
                 return category, root_cause, signals_wrong, signals_right, what_missed
-        except (ValueError, TypeError):
-            pass
 
     # 3. Check for external shock — large sudden move against position
     if price_path and len(price_path) >= 2:
@@ -1576,8 +1925,8 @@ def _summarise_what_happened(
     parts = [f"{ticker} {direction}: {entry_str}, strike ${strike:.2f}."]
 
     if price_path:
-        first_price = price_path[0].get("price", entry_price)
-        last_price = price_path[-1].get("price", entry_price)
+        first_price = price_path[0].get("price")
+        last_price = price_path[-1].get("price")
         if first_price and last_price:
             total_move = (last_price - first_price) / first_price * 100
             parts.append(
@@ -1995,24 +2344,41 @@ def _compute_implied_pct(
     actual_price_move_pct: float,
     shock_magnitude: float,
     pass_through: float = DEFAULT_PASS_THROUGH,
+    predicted_margin_impact_pct: float | None = None,
 ) -> float | None:
     """Return the pct_downstream_cogs that WOULD have produced the actual
-    move, given the shock magnitude and a pass-through assumption.
+    move, given the shock magnitude, pass-through assumption, and predicted
+    direction.
 
-    ``implied = |actual| / (|shock| * pass_through)``
+    Uses the signed actual move relative to the predicted direction:
+      ``signed_move = actual_price_move_pct * pred_sign``
+    where ``pred_sign`` is the sign of ``predicted_margin_impact_pct`` (or,
+    when omitted, ``-1`` for a positive upstream cost shock and ``+1`` for a
+    negative shock, matching ``chain_contagion._edge_impact``).
 
-    Returns None when inputs are invalid or when the implied value blows
-    past 1.0 (which means our pass-through assumption is wrong, not the
-    edge weight).
+    A wrong-direction (or zero) move yields ``signed_move <= 0`` and returns
+    ``0.0`` so the edge decays toward zero instead of being reinforced.
+    Returns ``None`` when inputs are invalid or when ``implied > 1.0``.
     """
     if actual_price_move_pct is None or shock_magnitude is None:
         return None
-    mag = abs(float(shock_magnitude))
+    shock_f = float(shock_magnitude)
+    mag = abs(shock_f)
     if mag < 1e-9:
         return None
+    if predicted_margin_impact_pct is not None:
+        pred_f = float(predicted_margin_impact_pct)
+        if abs(pred_f) < 1e-9:
+            return None
+        pred_sign = 1.0 if pred_f > 0 else -1.0
+    else:
+        pred_sign = -1.0 if shock_f > 0 else 1.0
+    signed_move = float(actual_price_move_pct) * pred_sign
+    if signed_move <= 0.0:
+        return 0.0
     pt = max(1e-6, float(pass_through))
-    implied = abs(float(actual_price_move_pct)) / (mag * pt)
-    if implied > 1.0 or implied < 0.0:
+    implied = signed_move / (mag * pt)
+    if implied > 1.0:
         return None
     return implied
 
@@ -2210,6 +2576,7 @@ def apply_contagion_feedback(
                         implied = _compute_implied_pct(
                             actual_price_move_pct=row["actual_price_move_pct"],
                             shock_magnitude=row["shock_magnitude"],
+                            predicted_margin_impact_pct=row["predicted_margin_impact_pct"],
                         )
                         if implied is None:
                             summary["skipped_no_implied"] += 1
