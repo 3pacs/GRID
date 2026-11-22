@@ -545,14 +545,10 @@ if set(MAX_AGE) != set(VAR_NAMES):
 
 # Session ages count real NYSE sessions from the hash-pinned XNYS manifests in docs/reference/calendar-manifests,
 # never the approximate scheduler helpers in ingestion.market_calendar. Those close Juneteenth before it existed
-# (2020, 2021) and miss one-off closures such as 2025-01-09, so they misjudge ages both ways. The prescreen parts
-# are analysis/factory_prescreen.PINS, restated because that module imports the whole factory (a test keeps them
-# equal); the later parts are analysis/factory_session_calendar.PINS. Prescreen ends 2022-11-11 and the factory
-# parts start 2022-11-01: the overlap must agree.
-PRESCREEN_XNYS_PINS = (
-    ("prescreen-xnys-2018-04-02-2020-12-31.json", "88312f9a547c809737a8c94b5d9b51e0e5f38117cb51ecaec2bd639ced7138ba"),
-    ("prescreen-xnys-2021-01-01-2022-11-11.json", "aee287ed567cf53c072d2378aa6437fe9bfcbbe8b6186fcc8bf4ab6109bc4dc5"),
-)
+# (2020, 2021) and miss one-off closures such as 2025-01-09, so they misjudge ages both ways. The parts are
+# analysis/factory_session_calendar.PRESCREEN_PINS then PINS: the same lists the deploy's
+# scripts/prepare_factory_calendars.py normalizes, so a deployed tree can always open them. Prescreen ends
+# 2022-11-11 and the factory parts start 2022-11-01: the overlap must agree.
 _MANIFEST_ROOT = Path(__file__).resolve().parents[2] / "docs/reference/calendar-manifests"
 _xnys_cache: tuple[date, date, tuple[date, ...], str] | None = None
 
@@ -565,10 +561,10 @@ def xnys_sessions() -> tuple[date, date, tuple[date, ...], str]:
     """
     global _xnys_cache
     if _xnys_cache is None:
-        from analysis.factory_session_calendar import PINS as FACTORY_XNYS_PINS
+        from analysis.factory_session_calendar import PINS, PRESCREEN_PINS
         from ingestion.market_calendar import ManifestCalendar
 
-        pins = PRESCREEN_XNYS_PINS + tuple(FACTORY_XNYS_PINS)
+        pins = tuple(PRESCREEN_PINS) + tuple(PINS)
         days: set[date] = set()
         start = end = None
         for name, sha in pins:

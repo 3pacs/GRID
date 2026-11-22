@@ -382,15 +382,6 @@ def test_session_ages_outside_the_pinned_calendar_never_guess():
         M.compute_market_state(None, date(2028, 1, 3))                                   # refused before any read
 
 
-def test_prescreen_pins_restated_here_match_the_prescreen_module():
-    import ast
-    from pathlib import Path
-
-    src = (Path(__file__).resolve().parents[1] / "analysis/factory_prescreen.py").read_text()
-    pins = [ast.literal_eval(n.value) for n in ast.parse(src).body if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "PINS" for t in n.targets)]
-    assert pins == [M.PRESCREEN_XNYS_PINS]
-
 
 def test_a_daily_input_that_stops_arriving_reads_stale_with_its_reading_kept(engine):
     _seed(engine)
