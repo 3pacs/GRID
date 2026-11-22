@@ -457,6 +457,25 @@ class OperatorState:
         # period's.
         self.daily_intel_period_outcome: str | None = None
 
+        # Weekly-intel per-task ledger (2026-11-22). See
+        # scripts/hermes_operator.py::WEEKLY_INTEL_TASKS and
+        # _run_weekly_intel_block. weekly_intel_period is the ISO date of the
+        # Sunday 03:00 UTC boundary the three dicts belong to; a new period
+        # clears them. weekly_intel_outcome: task name -> "done" |
+        # "done_late" | "timed_out" | "failed" | "failed_in_flight" |
+        # "failed_deferred" (final for the period) or "retry_pending" |
+        # "deferred" (runs again on a later cycle). weekly_intel_attempts
+        # counts attempts (timeouts and exceptions); weekly_intel_deferrals
+        # counts cycles the trust report waited for a running trust-cycle
+        # pass. state.last_weekly_intel is set only once every task has a
+        # final outcome; weekly_intel_period_outcome is then "complete" or
+        # "complete_with_failures".
+        self.weekly_intel_period: str | None = None
+        self.weekly_intel_outcome: dict[str, str] = {}
+        self.weekly_intel_attempts: dict[str, int] = {}
+        self.weekly_intel_deferrals: dict[str, int] = {}
+        self.weekly_intel_period_outcome: str | None = None
+
         # capital_flow_ttm_watermark (fable-daily-intel-sql-tasks,
         # 2026-09-20 follow-up; made VESTIGIAL by the SAME-DAY SECOND
         # follow-up): originally a durable, restart-safe scalar ``as_of``
@@ -590,6 +609,11 @@ class OperatorState:
             "daily_intel_attempts": self.daily_intel_attempts,
             "daily_intel_task_outcome": self.daily_intel_task_outcome,
             "daily_intel_period_outcome": self.daily_intel_period_outcome,
+            "weekly_intel_period": self.weekly_intel_period,
+            "weekly_intel_outcome": self.weekly_intel_outcome,
+            "weekly_intel_attempts": self.weekly_intel_attempts,
+            "weekly_intel_deferrals": self.weekly_intel_deferrals,
+            "weekly_intel_period_outcome": self.weekly_intel_period_outcome,
             "capital_flow_ttm_watermark": self.capital_flow_ttm_watermark,
         }
 
@@ -712,12 +736,31 @@ class OperatorState:
             }
             hydrated_any = hydrated_any or bool(self.daily_intel_task_outcome)
 
+        # Weekly-intel ledger (2026-11-22) — same "only if currently unset"
+        # rule, so a restart mid-period resumes the tasks without a final
+        # outcome instead of starting the week over.
+        weekly_intel_outcome = op_state.get("weekly_intel_outcome")
+        if isinstance(weekly_intel_outcome, dict) and not self.weekly_intel_outcome:
+            self.weekly_intel_outcome = {
+                str(k): str(v) for k, v in weekly_intel_outcome.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.weekly_intel_outcome)
+
+        for int_dict_field in ("weekly_intel_attempts", "weekly_intel_deferrals"):
+            raw_counts = op_state.get(int_dict_field)
+            if isinstance(raw_counts, dict) and not getattr(self, int_dict_field):
+                setattr(self, int_dict_field, {
+                    str(k): int(v) for k, v in raw_counts.items() if isinstance(v, int)
+                })
+                hydrated_any = hydrated_any or bool(getattr(self, int_dict_field))
+
         # Plain string fields (not timestamps, not counters) — restore
         # verbatim, same "only if currently unset" rule as the datetime
         # fields above.
         for str_field in (
             "last_sector_health_outcome", "daily_intel_period",
             "daily_intel_period_outcome", "capital_flow_ttm_watermark",
+            "weekly_intel_period", "weekly_intel_period_outcome",
         ):
             val = op_state.get(str_field)
             if isinstance(val, str) and getattr(self, str_field, None) is None:
