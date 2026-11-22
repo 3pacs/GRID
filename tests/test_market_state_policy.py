@@ -302,3 +302,16 @@ def test_policy_inputs_have_lags_and_max_ages():
     for k in ("ust_2y_change_5d", "fed_path_next_meeting", "fed_path_change_5d", "fed_priced_move_next_meeting"):
         assert k in M.MAX_AGE and k in M.VAR_NAMES
     assert M.RECORD_RULE == "market-state/3"
+
+
+def test_the_desk_brief_shows_the_block_as_research_only(engine):
+    from analysis.desk_brief_sources import _record_lines
+
+    _seed(engine)
+    lines, _ = _record_lines(_record(engine))
+    line = next(x for x in lines if x.startswith("policy response"))
+    assert "research only, decides nothing" in line and "put_absent" in line and "hike" in line
+    unknown, _ = _record_lines({"policy_response": {"rule": M.POLICY_RESPONSE_RULE, "status": "unknown",
+                                                    "reason": "vix: stale"}})
+    assert unknown[-1].endswith("unknown (vix: stale)")
+    assert not any(x.startswith("policy response") for x in _record_lines({"variables": {}})[0])

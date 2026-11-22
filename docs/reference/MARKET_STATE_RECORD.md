@@ -1,4 +1,4 @@
-# Market-state record (market-state/2)
+# Market-state record (market-state/3)
 
 One machine-readable row per session in `market_state_daily`: every state variable reported against its own trailing
 baseline, so each reads as "this far above or below its normal". Code: `intelligence/regime/market_state.py`
@@ -135,6 +135,10 @@ display only (owner's decision, bring-up plan rev 100).
 | news | news_first_print | USEPUINDXD: newest weekday first print, compared only with past first prints | daily fast |
 | events | today, next, within_14d | FRED release dates (CPI, PPI, NFP, GDP, PCE, retail sales) + Fed calendar (FOMC) | — |
 | news_shock | elevated_uncertainty / not_elevated | news_first_print z ≥ 2; calendar co-occurrence separate, attribution unverified | — |
+| rates | ust_2y_change_5d (market-state/3) | DGS2, change over 5 sessions | daily fast |
+| policy | fed_path_next_meeting, fed_path_change_5d (market-state/3) | Kalshi KXFED strike ladder for the next FOMC meeting (`intelligence/regime/policy_path.py`); change within one meeting's contract | daily fast |
+| policy | fed_priced_move_next_meeting (market-state/3) | fed_path_next_meeting − DFEDTARU, refused until FRED prints the target after a decision | daily fast |
+| policy_response | put_priced / partial_response / put_absent / no_stress / unknown | VIX z vs. mean easing z of ust_2y_change_5d and fed_path_change_5d | — |
 
 Pending (listed in every record as `pending`): release surprise (no consensus source yet), earnings surprise.
 
@@ -189,3 +193,82 @@ No raw payload, URL, credential or extra provider request is included. Values/se
 distinct from an empty successful read. Nothing is promoted to PIT-qualified. ALFRED selection/capture,
 dealer capture, the selected SPY window and calendar publication/capture are explicitly unqualified paths.
 This first slice does not wire catch-up, prove scheduled operation, revise historical rows or change timers.
+
+## Policy path and policy response (market-state/3)
+
+market-state/3 adds the policy-path variables and the `policy_response` block. Rows written earlier keep their
+`rule`; a reader spanning the switch sees both, and a record is never rewritten to change its rule without `--replace`.
+
+**The Kalshi ladder.** `ingestion/altdata/kalshi_markets.py` stores one row per open KXFED event (one per meeting) per
+daily pull. The row's `value` is the price of whichever strike traded most that day, so it changes question when that
+strike changes (KXFED-26DEC moved from "above 4.00%" to "above 4.25%" around 2026-11-12). It is never read. Every
+strike's bid and ask are in `raw_payload.all_strikes`, and `policy_path.price_ladder` prices those:
+
+- **Contract check.** Each strike must be titled "upper bound of the federal funds rate be above X%", with X
+  matching its ticker.
+- **Quotes.** Mids are used only when the quote is two-sided and the spread is at most 0.10. Last trades are never
+  used.
+- **Shape.** Strikes must be contiguous in 0.25 steps. The ladder is made non-increasing by a running minimum, and
+  the adjustments are counted.
+- **Coverage.** Either tail above 0.05 makes the snapshot unusable.
+
+A snapshot is known from its pull clock only, with no modeled path. The pull runs about 00:00–06:00 UTC, so the row
+dated D is the market overnight before session D. The next meeting is the earliest meeting after that day's newest
+pull. If that event's row is missing or unusable, the day has no reading; a later meeting is never substituted.
+
+The 5-session change is taken inside one contract. The priced move is set against DFEDTARU only when FRED's
+observation postdates the last decision taking effect: right after a meeting the ladder already prices the next one
+while FRED still prints the old target.
+
+**policy_response (policy-response/1)** is Neon's PRFD ("is the Fed put alive?") with only the legs Codex's triage
+admitted first (GRID-COMPOSITE-TRIAGE-20261122): VIX, plus the front end (2-year change, path change). There are no
+EMPS or news-tone legs.
+
+- stress = VIX robust z.
+- easing = −(z of ust_2y_change_5d + z of fed_path_change_5d) / 2.
+- score = stress − easing.
+- Labels:
+  - `no_stress` when stress < 1.5;
+  - otherwise `put_priced` when easing ≥ 1.0;
+  - `put_absent` when easing ≤ 0;
+  - `partial_response` in between.
+- Equal weights and round thresholds, declared and never fitted.
+- `controls` carries VIX-only and front-end-only readings.
+- The block is `unknown` unless all three legs read `ok` with a finite z. That covers stale, no baseline, zero spread
+  and missing.
+- `decision_use: none`: nothing reads it to decide, and it has no registered test (#1311). The desk brief prints it,
+  labelled research only.
+
+Read against griddb on 2026-11-22 (dry run, nothing written):
+
+| Record | VIX | 2y 5-session | Path 5-session | Reading |
+|---|---|---|---|---|
+| 2026-11-19 | 24.56, z +3.2 | +7 bp | −0.6 bp | `put_absent` |
+| 2026-11-20 | 28.44, z +4.8 | −10 bp | −0.9 bp | `partial_response` |
+
+The 2026-11-20 snapshot priced the 2026-12-09 meeting at 97.5 % hike, 2 % hold and 0.5 % cut, with the upper bound
+at 4.00 %.
+
+## Composite register (Neon and Codex proposals, 2026-11-22)
+
+Where each proposed composite stands. A composite enters the record only through #1311: one at a time, inputs read
+point in time with a maximum age, and `unknown` when a leg is missing. Live use needs a registered test.
+
+| Composite | Source | Status |
+|---|---|---|
+| PRFD (Fed put) | Neon global levers | **Tracked**: `policy_response` + four variables, market-state/3 |
+| SRLI (custody / auction stress) | Neon; Codex second ticket | Data path started: WMTSECL1 in the FRED pull (raw only). Composite not built; needs release-dated custody plus auction tenors |
+| EMPS (energy → inflation pass-through) | Neon; Codex first ticket | Queued: oil / lagged-breakeven / real-yield baseline, then release-aligned EIA Gulf Coast ULSD. SCFI parked (rights) |
+| ICBD (insider vs. CFO behaviour) | Neon; Codex paper-only | Queued: needs a Form 4 + 8-K event pipeline with filing clocks |
+| DBFL, FWAS (natural gas only), GCIR, WPCI, CSVL | Neon | Queued in Codex's order. Inputs exist in part (WLCFLPCL, DTB3 since #1347) |
+| SSSF (settlement squeeze) | Neon | Rejected as written: FTD balances carry no age or cohort |
+| RSPI, HCDW, RDFM, CDDS, FDTP, PBWG, ODFC, ACPB | Antigravity composites branch | Held library code, #1341 (Codex HOLD: as_of does not filter inputs) |
+
+Neon's uncommitted `global_levers.py` (branch `claude/global-machinery-levers-20261122`, never pushed) has three
+problems:
+
+- It reads the KXFED `value` column. Its "3% December cut odds" was the price of "above 4.25%", i.e. a second hike.
+- It reads `obs_date <= as_of` with the latest pull, which is not known-at.
+- It replaces `tests/test_global_levers.py`, which covers the existing `intelligence/global_levers.py`.
+
+None of it is used here except the PRFD idea.
