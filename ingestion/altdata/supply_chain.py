@@ -26,6 +26,7 @@ Schedule: Weekly (shipping data updates weekly)
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -85,33 +86,316 @@ _DREWRY_DATE_TOKEN = (
     r"|\d{1,2}(?:st|nd|rd|th)?[\s-]+[A-Za-z]{3,9}[\s-]+\d{2,4}"
     r"|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})"
 )
-_DREWRY_ASSESSMENT_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+_DREWRY_LANE_RE = re.compile(
+    r"\b(?:shanghai|rotterdam|los\s+angeles|new\s+york|genoa|"
+    r"long\s+beach|ningbo|hamburg|antwerp|singapore|"
+    r"transpacific|asia[-–—\s]+europe|east\s+coast|west\s+coast)\b"
+    r"|\b(?:la|ny)\s*[-–—/]\s*(?:shanghai|rotterdam)\b"
+    r"|\b(?:shanghai|rotterdam)\s*[-–—/]\s*(?:la|ny)\b",
+    re.IGNORECASE,
+)
+_DREWRY_FOREIGN_INDEX_RE = re.compile(
+    r"\b(?:scfi|fbx|freightos|baltic\s+dry|bdi|tanker|bulk|capesize|panamax)\b",
+    re.IGNORECASE,
+)
+_DREWRY_COMPOSITE_WORD_RE = re.compile(
+    r"(?:^|[^a-z])composite(?:[^a-z]|$)",
+    re.IGNORECASE,
+)
+_DREWRY_TABLE_WCI_EXACT_RE = re.compile(
+    r"^(?:drewry\s+)?(?:world\s+container\s+index|wci)(?:\s*\([^)]*\))?$",
+    re.IGNORECASE,
+)
+_DREWRY_COLOCATED_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"(?:assessed(?:\s+on)?|published(?:\s+on)?|updated(?:\s+on)?|"
-        r"week\s+ending|as\s+of)\s*:?\s*"
+        r"(?:assessed(?:\s+on)?|week\s+ending|as\s+of|"
+        r"for(?:\s+the\s+week\s+(?:ending|of))?)\s*:?\s*"
         r"(?:(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s*)?"
         rf"({_DREWRY_DATE_TOKEN})",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:World\s+Container\s+Index|WCI)\s*[-–—:,|]\s*"
+        r"(?:World\s+Container\s+Index|WCI)(?:\s+composite(?:\s+index)?)?"
+        r"\s*(?:[-–—:,|]|\()\s*"
         r"(?:(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*,?\s*)?"
         rf"({_DREWRY_DATE_TOKEN})",
         re.IGNORECASE,
     ),
 )
+_DREWRY_WCI_HEADING_DATE_RE = _DREWRY_COLOCATED_DATE_PATTERNS[1]
 _DREWRY_PROSE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"(?:WCI|World\s+Container\s+Index|composite)[^$]{0,200}\$\s*([\d,]+(?:\.\d+)?)",
+        r"(?:(?:Drewry\s+)?World\s+Container\s+Index(?:\s+composite)?|"
+        r"WCI\s+composite|composite\s+(?:WCI|World\s+Container\s+Index))"
+        r"[^$]{0,160}\$\s*([\d,]+(?:\.\d+)?)",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:WCI|World\s+Container\s+Index|composite)[^0-9]{0,80}"
-        r"([\d,]+(?:\.\d+)?)\s*(?:USD|per\s*40[- ]?ft|/FEU)",
+        r"(?:(?:Drewry\s+)?World\s+Container\s+Index(?:\s+composite)?|"
+        r"WCI\s+composite|composite\s+(?:WCI|World\s+Container\s+Index))"
+        r"[^0-9]{0,80}([\d,]+(?:\.\d+)?)\s*(?:USD|per\s*40[- ]?ft|/FEU)",
         re.IGNORECASE,
     ),
 )
+_DREWRY_SENTENCE_SPLIT_RE = re.compile(r"(?<!\d)\.(?:\s+|$)|[;!?]\s+")
 _DREWRY_USD_CELL_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)")
+_DREWRY_JS_PROP_STR_RE = re.compile(
+    r"(?:[\"']?(?:label|name|title|id|seriesName|caption|metric|index)[\"']?)"
+    r"\s*:\s*([\"'])(.*?)\1",
+    re.IGNORECASE,
+)
+_DREWRY_JS_TITLE_TEXT_RE = re.compile(
+    r"[\"']?title[\"']?\s*:\s*\{[^{}]*[\"']?text[\"']?\s*:\s*([\"'])(.*?)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+_DREWRY_JS_DATES_RE = re.compile(
+    r"(?:[\"']?(?:labels|categories|dates)[\"']?)\s*[=:]\s*\[([^\[\]]+)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_DREWRY_JS_XAXIS_RE = re.compile(
+    r"[\"']?xAxis[\"']?\s*:\s*\{([^{}]*)\}",
+    re.IGNORECASE | re.DOTALL,
+)
+_DREWRY_JS_VALUES_RE = re.compile(
+    r"(?:[\"']?(?:data|values|series)[\"']?)\s*[=:]\s*\[([^\[\]]+)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_DREWRY_JS_DATA_ONLY_RE = re.compile(
+    r"(?:[\"']?(?:data|values)[\"']?)\s*[=:]\s*\[([^\[\]]+)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_DREWRY_JS_MULTISERIES_START_RE = re.compile(
+    r"(?:[\"']?(?:datasets|series)[\"']?)\s*:\s*\[",
+    re.IGNORECASE,
+)
+
+
+def _utc_today() -> date:
+    """Return the current UTC calendar date (pull clock)."""
+    return datetime.now(timezone.utc).date()
+
+
+def _is_drewry_composite_table_label(raw: str) -> bool:
+    """Return True only if a table header/row label proves WCI composite."""
+    label = re.sub(r"\s+", " ", (raw or "").strip()).lower()
+    if not label:
+        return False
+    if _DREWRY_LANE_RE.search(label) or _DREWRY_FOREIGN_INDEX_RE.search(label):
+        return False
+    return bool(
+        _DREWRY_COMPOSITE_WORD_RE.search(label)
+        or _DREWRY_TABLE_WCI_EXACT_RE.match(label)
+    )
+
+
+def _is_drewry_composite_chart_label(raw: str) -> bool:
+    """Return True only if a chart/series identifier proves WCI composite.
+
+    Strict: requires an explicit ``composite`` identifier and rejects any
+    single-lane or foreign-index qualifier so sibling charts can never be
+    mistaken for the WCI composite.
+    """
+    label = re.sub(r"\s+", " ", (raw or "").strip())
+    if not label:
+        return False
+    if _DREWRY_LANE_RE.search(label) or _DREWRY_FOREIGN_INDEX_RE.search(label):
+        return False
+    return bool(_DREWRY_COMPOSITE_WORD_RE.search(label))
+
+
+_MAX_JS_OBJECT_DEPTH = 50  # chart configs nest a handful of levels deep
+
+
+def _iter_js_objects(text: str) -> list[str]:
+    """Extract balanced ``{ ... }`` blocks while respecting string literals.
+
+    Blocks nested deeper than ``_MAX_JS_OBJECT_DEPTH`` are skipped, so a
+    pathological page cannot make extraction quadratic in nesting depth.
+    """
+    objects: list[str] = []
+    stack: list[int] = []
+    in_quote: str | None = None
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+        elif ch == "{":
+            stack.append(idx)
+        elif ch == "}" and stack:
+            start = stack.pop()
+            if len(stack) < _MAX_JS_OBJECT_DEPTH:
+                objects.append(text[start : idx + 1])
+    return objects
+
+
+def _extract_balanced_bracket(text: str, open_idx: int) -> str | None:
+    """Return the balanced ``[ ... ]`` slice starting at ``open_idx``."""
+    depth = 0
+    in_quote: str | None = None
+    escaped = False
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if in_quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx : idx + 1]
+    return None
+
+
+def _strip_nested_braces(obj_text: str) -> str:
+    """Return the interior of ``{ ... }`` with nested ``{ ... }`` replaced by ``{}``."""
+    if len(obj_text) < 2 or obj_text[0] != "{" or obj_text[-1] != "}":
+        return obj_text
+    out: list[str] = []
+    depth = 0
+    in_quote: str | None = None
+    escaped = False
+    for ch in obj_text[1:-1]:
+        if in_quote is not None:
+            if depth == 0:
+                out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+            if depth == 0:
+                out.append(ch)
+        elif ch == "{":
+            if depth == 0:
+                out.append("{}")
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def _parse_js_date_list(raw_list: str) -> list[date] | None:
+    tokens = [t.strip().strip("\"'") for t in raw_list.split(",") if t.strip()]
+    if not tokens:
+        return None
+    dates: list[date] = []
+    for tok in tokens:
+        parsed = _parse_drewry_date(tok)
+        if parsed is None:
+            return None
+        dates.append(parsed)
+    return dates
+
+
+def _parse_js_usd_list(raw_list: str) -> list[float] | None:
+    tokens = [t.strip().strip("\"'") for t in raw_list.split(",") if t.strip()]
+    if not tokens:
+        return None
+    vals: list[float] = []
+    for tok in tokens:
+        parsed = _parse_drewry_usd(tok)
+        if parsed is None:
+            return None
+        vals.append(parsed)
+    return vals
+
+
+def _extract_drewry_chart_candidates(script_text: str) -> tuple[dict[date, float], bool]:
+    """Extract WCI composite ``{date: value}`` pairs from an embedded chart script.
+
+    Requires explicit composite proof directly on the matched chart/series
+    object and refuses unlabeled or sibling-lane charts. Returns
+    ``(candidates, saw_unproven_chart)``.
+    """
+    saw_unproven = False
+    objects = _iter_js_objects(script_text)
+
+    # First pass: multi-series chart objects (Chart.js datasets / Highcharts series)
+    for obj in objects:
+        direct = _strip_nested_braces(obj)
+        dates_match = _DREWRY_JS_DATES_RE.search(direct)
+        if dates_match is None:
+            xaxis_match = _DREWRY_JS_XAXIS_RE.search(obj)
+            if xaxis_match:
+                dates_match = _DREWRY_JS_DATES_RE.search(xaxis_match.group(1))
+        if dates_match is None:
+            continue
+        dates = _parse_js_date_list(dates_match.group(1))
+        if not dates:
+            continue
+
+        # Check enclosing chart title/labels do not declare a single lane or foreign index
+        outer_labels = [m.group(2) for m in _DREWRY_JS_PROP_STR_RE.finditer(direct)]
+        title_text_match = _DREWRY_JS_TITLE_TEXT_RE.search(obj)
+        if title_text_match:
+            outer_labels.append(title_text_match.group(2))
+        if any(
+            _DREWRY_LANE_RE.search(lbl) or _DREWRY_FOREIGN_INDEX_RE.search(lbl)
+            for lbl in outer_labels
+        ):
+            saw_unproven = True
+            continue
+
+        ms_match = _DREWRY_JS_MULTISERIES_START_RE.search(obj)
+        if ms_match is not None:
+            bracket_slice = _extract_balanced_bracket(obj, ms_match.end() - 1)
+            if bracket_slice and "{" in bracket_slice:
+                for ds_obj in _iter_js_objects(bracket_slice):
+                    ds_direct = _strip_nested_braces(ds_obj)
+                    val_match = _DREWRY_JS_DATA_ONLY_RE.search(ds_direct)
+                    if val_match is None:
+                        continue
+                    vals = _parse_js_usd_list(val_match.group(1))
+                    if vals is None or len(vals) != len(dates):
+                        continue
+                    ds_labels = [
+                        m.group(2) for m in _DREWRY_JS_PROP_STR_RE.finditer(ds_direct)
+                    ]
+                    if any(
+                        _DREWRY_LANE_RE.search(lbl) or _DREWRY_FOREIGN_INDEX_RE.search(lbl)
+                        for lbl in ds_labels
+                    ):
+                        saw_unproven = True
+                        continue
+                    if any(_is_drewry_composite_chart_label(lbl) for lbl in ds_labels):
+                        return dict(zip(dates, vals)), False
+                    saw_unproven = True
+                continue
+
+        # Single-series chart object: direct numeric array + direct composite label
+        val_match = _DREWRY_JS_VALUES_RE.search(direct)
+        if val_match is None:
+            continue
+        vals = _parse_js_usd_list(val_match.group(1))
+        if vals is None or len(vals) != len(dates):
+            continue
+        if any(_is_drewry_composite_chart_label(lbl) for lbl in outer_labels):
+            return dict(zip(dates, vals)), False
+        saw_unproven = True
+
+    return {}, saw_unproven
 
 
 def _parse_drewry_date(raw: str) -> date | None:
@@ -144,7 +428,7 @@ def _parse_drewry_usd(raw: str) -> float | None:
         val = float(match.group(1).replace(",", ""))
     except ValueError:
         return None
-    if not (_DREWRY_WCI_MIN <= val <= _DREWRY_WCI_MAX):
+    if not math.isfinite(val) or not (_DREWRY_WCI_MIN <= val <= _DREWRY_WCI_MAX):
         return None
     return val
 
@@ -154,12 +438,14 @@ def _parse_drewry_wci_html(
     *,
     pull_date: date | None = None,
 ) -> list[dict[str, Any]]:
-    """Parse Drewry WCI ``(date, value)`` observations from page HTML.
+    """Parse Drewry WCI composite ``(date, value)`` observations from page HTML.
 
-    Requires an explicit assessment date from the page (HTML table, paired
-    chart date+value series, or visible assessment prose). Never substitutes
-    ``date.today()`` or synthetic weekly offsets, and refuses any
-    ``obs_date`` later than ``pull_date`` (fail closed).
+    Requires proof that the value and date belong to the WCI composite
+    (structured composite table column/row, composite-labeled chart series
+    with paired dates, or a visible WCI composite prose sentence with a
+    co-located assessment date). Refuses sibling-lane charts/prose, generic
+    unlabeled charts, generic page/chart dates, synthetic weekly offsets,
+    and any ``obs_date`` later than ``pull_date`` (UTC clock; fail closed).
     """
     if not html or not isinstance(html, str):
         log.warning("Drewry WCI: empty HTML response — writing nothing (fail closed)")
@@ -177,11 +463,18 @@ def _parse_drewry_wci_html(
         log.warning("Drewry WCI: HTML parse failed ({e}) — writing nothing", e=str(exc))
         return []
 
-    effective_pull_date = pull_date or date.today()
+    effective_pull_date = pull_date or _utc_today()
     candidates: dict[date, float] = {}
+    saw_unproven_chart = False
 
     # 1. Structured HTML table (standard: rows=dates; or transposed: cols=dates)
     for table in soup.find_all("table"):
+        caption_tag = table.find("caption")
+        if caption_tag is not None:
+            cap_text = caption_tag.get_text(" ", strip=True)
+            if _DREWRY_LANE_RE.search(cap_text) or _DREWRY_FOREIGN_INDEX_RE.search(cap_text):
+                continue
+
         raw_rows = [
             [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
             for tr in table.find_all("tr")
@@ -195,25 +488,26 @@ def _parse_drewry_wci_html(
 
         # Standard orientation: header names a Composite/WCI column, rows are dates
         comp_col = next(
-            (
-                i
-                for i, h in enumerate(headers_lower)
-                if "composite" in h or h == "wci" or "world container index" in h
-            ),
+            (i for i, h in enumerate(headers) if _is_drewry_composite_table_label(h)),
             None,
         )
         if comp_col is not None:
             date_col = next(
-                (i for i, h in enumerate(headers_lower) if "date" in h or "week" in h),
-                0,
+                (
+                    i
+                    for i, h in enumerate(headers_lower)
+                    if i != comp_col and ("date" in h or "week" in h)
+                ),
+                0 if comp_col != 0 else None,
             )
-            for row in raw_rows[1:]:
-                if max(date_col, comp_col) >= len(row):
-                    continue
-                obs_date = _parse_drewry_date(row[date_col])
-                val = _parse_drewry_usd(row[comp_col])
-                if obs_date is not None and val is not None:
-                    candidates[obs_date] = val
+            if date_col is not None:
+                for row in raw_rows[1:]:
+                    if max(date_col, comp_col) >= len(row):
+                        continue
+                    obs_date = _parse_drewry_date(row[date_col])
+                    val = _parse_drewry_usd(row[comp_col])
+                    if obs_date is not None and val is not None:
+                        candidates[obs_date] = val
             if candidates:
                 break
 
@@ -225,8 +519,7 @@ def _parse_drewry_wci_html(
         }
         if date_cols:
             for row in raw_rows[1:]:
-                label = row[0].lower()
-                if "composite" in label or label == "wci" or "world container index" in label:
+                if _is_drewry_composite_table_label(row[0]):
                     for col_idx, obs_date in date_cols.items():
                         if col_idx < len(row):
                             val = _parse_drewry_usd(row[col_idx])
@@ -236,68 +529,84 @@ def _parse_drewry_wci_html(
             if candidates:
                 break
 
-    # 2. Embedded chart <script> with EXPLICIT paired dates (never unlabeled arrays)
+    # 2. Embedded chart <script> with EXPLICIT paired dates AND WCI composite proof
     if not candidates:
-        labels_re = re.compile(r"(?:labels|categories|dates)\s*[=:]\s*\[([^\]]+)\]", re.DOTALL)
-        values_re = re.compile(r"(?:data|series|values)\s*[=:]\s*\[([^\]]+)\]", re.DOTALL)
         for script in soup.find_all("script"):
             script_text = script.string or script.get_text() or ""
             if not script_text:
                 continue
-            label_match = labels_re.search(script_text)
-            value_match = values_re.search(script_text)
-            if label_match and value_match:
-                raw_dates = [
-                    d.strip().strip("\"'") for d in label_match.group(1).split(",") if d.strip()
-                ]
-                raw_vals = [
-                    v.strip().strip("\"'") for v in value_match.group(1).split(",") if v.strip()
-                ]
-                if raw_dates and len(raw_dates) == len(raw_vals):
-                    parsed_pairs: dict[date, float] = {}
-                    for raw_d, raw_v in zip(raw_dates, raw_vals):
-                        obs_date = _parse_drewry_date(raw_d)
-                        val = _parse_drewry_usd(raw_v)
-                        if obs_date is not None and val is not None:
-                            parsed_pairs[obs_date] = val
-                    if len(parsed_pairs) == len(raw_dates):
-                        candidates.update(parsed_pairs)
-                        break
-
-    # 3. Visible prose text WITH an explicit assessment date
-    if not candidates:
-        time_date: date | None = None
-        for time_tag in soup.find_all("time"):
-            dt_attr = time_tag.get("datetime")
-            if isinstance(dt_attr, str):
-                time_date = _parse_drewry_date(dt_attr[:10])
-            if time_date is None:
-                time_date = _parse_drewry_date(time_tag.get_text(" ", strip=True))
-            if time_date is not None:
+            chart_pairs, unproven = _extract_drewry_chart_candidates(script_text)
+            if chart_pairs:
+                candidates.update(chart_pairs)
                 break
+            if unproven:
+                saw_unproven_chart = True
 
+    if saw_unproven_chart and not candidates:
+        log.warning(
+            "Drewry WCI: ignoring chart script without proven WCI composite "
+            "label/identifier (possible sibling lane or generic chart)"
+        )
+
+    # 3. Visible prose text WITH co-located WCI composite label AND assessment date
+    #    (never accepts generic <time> tags or decoupled page/chart update dates)
+    if not candidates:
         for noise in soup.find_all(["script", "style", "noscript"]):
             noise.decompose()
-        visible_text = soup.get_text(" ", strip=True)
 
-        assessment_date: date | None = None
-        for pattern in _DREWRY_ASSESSMENT_DATE_PATTERNS:
-            match = pattern.search(visible_text)
-            if match:
-                assessment_date = _parse_drewry_date(match.group(1))
+        for block in soup.find_all(["p", "li", "dd", "div", "section", "article"]):
+            if block.find(["p", "li", "dd", "section", "article", "table"]) is not None:
+                continue
+            block_text = block.get_text(" ", strip=True)
+            if not block_text:
+                continue
+
+            # Optional WCI-labeled heading inside the same enclosing article/section
+            scoped_heading_date: date | None = None
+            container = block.find_parent(["article", "section"])
+            if container is not None:
+                for heading in container.find_all(["h1", "h2", "h3"]):
+                    h_text = heading.get_text(" ", strip=True)
+                    if _DREWRY_LANE_RE.search(h_text) or _DREWRY_FOREIGN_INDEX_RE.search(h_text):
+                        continue
+                    h_match = _DREWRY_WCI_HEADING_DATE_RE.search(h_text)
+                    if h_match:
+                        scoped_heading_date = _parse_drewry_date(h_match.group(1))
+                        if scoped_heading_date is not None:
+                            break
+
+            for sentence in _DREWRY_SENTENCE_SPLIT_RE.split(block_text):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                if _DREWRY_LANE_RE.search(sentence) or _DREWRY_FOREIGN_INDEX_RE.search(sentence):
+                    continue
+
+                val: float | None = None
+                for pattern in _DREWRY_PROSE_VALUE_PATTERNS:
+                    val_match = pattern.search(sentence)
+                    if val_match:
+                        val = _parse_drewry_usd(val_match.group(1))
+                        if val is not None:
+                            break
+                if val is None:
+                    continue
+
+                assessment_date: date | None = None
+                for d_pattern in _DREWRY_COLOCATED_DATE_PATTERNS:
+                    d_match = d_pattern.search(sentence)
+                    if d_match:
+                        assessment_date = _parse_drewry_date(d_match.group(1))
+                        if assessment_date is not None:
+                            break
+                if assessment_date is None:
+                    assessment_date = scoped_heading_date
+
                 if assessment_date is not None:
+                    candidates[assessment_date] = val
                     break
-        if assessment_date is None:
-            assessment_date = time_date
-
-        if assessment_date is not None:
-            for pattern in _DREWRY_PROSE_VALUE_PATTERNS:
-                val_match = pattern.search(visible_text)
-                if val_match:
-                    val = _parse_drewry_usd(val_match.group(1))
-                    if val is not None:
-                        candidates[assessment_date] = val
-                        break
+            if candidates:
+                break
 
     data_points: list[dict[str, Any]] = []
     for obs_date in sorted(candidates):
@@ -315,8 +624,8 @@ def _parse_drewry_wci_html(
 
     if not data_points:
         log.warning(
-            "Drewry WCI: could not parse assessment date and composite value "
-            "from page — writing nothing (fail closed)"
+            "Drewry WCI: could not prove WCI composite value and co-located "
+            "assessment date from page — writing nothing (fail closed)"
         )
 
     return data_points
@@ -780,7 +1089,7 @@ class SupplyChainPuller(BasePuller):
             timeout=_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        data_points = _parse_drewry_wci_html(resp.text, pull_date=date.today())
+        data_points = _parse_drewry_wci_html(resp.text, pull_date=_utc_today())
 
         log.info(
             "Drewry WCI: parsed {n} data points",
@@ -822,7 +1131,7 @@ class SupplyChainPuller(BasePuller):
         inserted = 0
         rejected_future = 0
         valid_points = 0
-        pull_date = date.today()
+        pull_date = _utc_today()
         series_id = "container_index"
 
         with self.engine.begin() as conn:
@@ -850,6 +1159,13 @@ class SupplyChainPuller(BasePuller):
                 try:
                     val = float(point["value"])
                 except (ValueError, TypeError):
+                    continue
+                if not math.isfinite(val):
+                    log.warning(
+                        "Drewry WCI: refusing non-finite value {v!r} on {d}",
+                        v=point.get("value"),
+                        d=obs_date.isoformat(),
+                    )
                     continue
 
                 self._insert_raw(
