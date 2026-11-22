@@ -2,8 +2,8 @@
 
 Every adapter reads a record another job already keeps and copies what it says, with that record's own clock:
 
-* ``market_state``: the latest ``market_state_daily`` row (market-state/1, #1191) for an earlier session, computed
-  before the brief's clock. Read-only transaction, parameterized SQL. ``computed_at`` is a naive TIMESTAMP written
+* ``market_state``: the latest ``market_state_daily`` row (#1191; its own ``rule``, market-state/1 or /2) for an earlier
+  session, computed before the brief's clock. Read-only transaction, parameterized SQL. ``computed_at`` is a naive TIMESTAMP written
   with CURRENT_TIMESTAMP; it is read as UTC only when the session's TimeZone is UTC, otherwise the section is unknown.
 * ``calendar``: the pinned XNYS parts and the pinned event parts (``analysis/factory_session_calendar``, forward
   parts from #1293), asked "what was known at the brief's clock" (``FactoryEvents.known``). A day the parts do not
@@ -96,7 +96,7 @@ def market_state(engine: Engine, kind: str, session: SessionTimes, as_of: dateti
     """``expected``: the newest session the writer normally has computed by the brief's clock (it writes a session's
     record the evening after it). An older record is a data problem; the expected lag is only stated."""
     title, key = "Market state", "market_state"
-    src = "griddb market_state_daily (market-state/1)"
+    src = "griddb market_state_daily"  # each row names its own rule (market-state/1, /2 since #1303)
     last = session.day - timedelta(days=1) if kind == "pre_open" else session.day
     try:
         with engine.connect() as conn:

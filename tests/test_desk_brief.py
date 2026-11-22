@@ -371,6 +371,23 @@ def test_market_state_latest_before_clock(tmp_path):
     assert pre.status == "empty"                       # 11-19's row was computed after 09:00 ET on 11-20
 
 
+def test_market_state_2_stale_inputs_are_not_usable(tmp_path):
+    # market-state/2 (#1303): a stale input keeps its reading but is not ok, so the brief must not call it notable.
+    eng = create_engine(f"sqlite:///{tmp_path / 'ms.db'}")
+    MS.ensure_table(eng)
+    rec = {"variables": {"vix": {"status": "stale", "label": "high", "robust_z": 3.1, "obs_date": "2026-11-12",
+                                 "freshness": {"status": "stale", "age": 5, "unit": "sessions", "limit": 2}}},
+           "gamma_state": {"status": "stale", "regime": "SHORT_GAMMA", "obs_date": "2026-11-18"},
+           "coverage": {"ok": 0, "stale": 1}}
+    with eng.begin() as c:
+        c.execute(text("INSERT INTO market_state_daily (as_of_date, rule, record, computed_at) VALUES "
+                       "('2026-11-19', 'market-state/2', :r, '2026-11-20 23:15:41')"), {"r": json.dumps(rec)})
+    sec = S.market_state(eng, "post_close", SESSION, POST, PREV)
+    assert sec.status == "ok" and "rule market-state/2" in sec.lines[0]
+    assert "away from normal: none" in sec.lines and "not usable: vix (stale)" in sec.lines
+    assert "dealer gamma: stale" in sec.lines and any("stale 1" in line for line in sec.lines)
+
+
 # ── event calendar (the pinned parts in the repo) ────────────────────────────
 
 def test_calendar_unknown_past_forward_part():
