@@ -41,7 +41,9 @@ from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
 from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
 
-_USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
+from oracle.model_factory import signal_registry_enabled as _signal_registry_enabled
+
+_USE_SIGNAL_REGISTRY = _signal_registry_enabled()
 
 
 # ── Prediction Types ────────────────────────────────────────────────────────
@@ -2818,6 +2820,12 @@ class EnsemblePrediction:
 class EnsemblePredictor:
     """Meta-predictor that combines active oracle model heads."""
 
+    _HIT_RATE_PRIOR_HITS: float = 5.0
+    _HIT_RATE_PRIOR_N: float = 10.0
+    _TARGET_MOVE_SIGMA_K: float = 1.0
+    _REALIZED_VOL_LOOKBACK_DAYS: int = 45
+    _REALIZED_VOL_MIN_RETURNS: int = 10
+
     def __init__(self, engine: Engine):
         from oracle.model_factory import ModelFactory
         from oracle.signal_aggregator import SignalAggregator
@@ -2825,6 +2833,17 @@ class EnsemblePredictor:
         self.engine = engine
         self.factory = ModelFactory(engine)
         self.aggregator = SignalAggregator()
+
+    @staticmethod
+    def _vote_p_up(direction: str, confidence: float) -> float:
+        """Map a head's (direction, confidence) into signed P(up) in [0, 1]."""
+        c = max(0.0, min(1.0, float(confidence)))
+        d = (direction or "").strip().lower()
+        if d == "bullish":
+            return c
+        if d == "bearish":
+            return 1.0 - c
+        return 0.5
 
     def predict(
         self,
@@ -2887,12 +2906,20 @@ class EnsemblePredictor:
                     except Exception:
                         regime_weight = 1.0
                 regime_router_weights[model.name] = round(regime_weight, 4)
+                # vote_weight uses the Beta-shrunk hit_rate ONCE. bucket_weight
+                # and regime_weight are both updated via 0.5 + 2*adj_rate from
+                # the same oracle_models hit/miss history (_nudge_single_model),
+                # so multiplying them here would triple-count one track record.
+                # They remain attached to each vote dict for diagnostics only.
+                vote_weight = round(max(0.0, float(hit_rate)), 4)
+                head_p_up = self._vote_p_up(agg.direction, float(agg.confidence))
                 votes.append(
                     {
                         "model_name": model.name,
                         "direction": agg.direction,
                         "strength": agg.strength,
                         "confidence": agg.confidence,
+                        "p_up": round(head_p_up, 4),
                         "coherence": agg.coherence,
                         "signal_count": agg.signal_count,
                         "hit_rate": hit_rate,
@@ -2900,13 +2927,7 @@ class EnsemblePredictor:
                         "bucket_weight": bucket_weight,
                         "regime": regime_state_for_routing,
                         "regime_weight": round(regime_weight, 4),
-                        "vote_weight": round(
-                            hit_rate
-                            * float(agg.confidence)
-                            * bucket_weight
-                            * regime_weight,
-                            4,
-                        ),
+                        "vote_weight": vote_weight,
                     }
                 )
             except Exception as exc:
@@ -2943,27 +2964,31 @@ class EnsemblePredictor:
                 regime_router_weights=regime_router_weights,
             )
 
-        total_weight = sum(float(v["vote_weight"]) for v in votes) or 1.0
-        bullish_weight = sum(
-            float(v["vote_weight"]) for v in votes if v["direction"] == "bullish"
-        )
-        bearish_weight = sum(
-            float(v["vote_weight"]) for v in votes if v["direction"] == "bearish"
-        )
+        raw_weights = [max(0.0, float(v["vote_weight"])) for v in votes]
+        total_weight = sum(raw_weights)
+        if total_weight <= 0.0:
+            raw_weights = [1.0] * len(votes)
+            total_weight = float(len(votes))
 
-        if bullish_weight > bearish_weight:
+        ensemble_p_up = (
+            sum(
+                w * self._vote_p_up(v["direction"], float(v["confidence"]))
+                for w, v in zip(raw_weights, votes)
+            )
+            / total_weight
+        )
+        ensemble_p_up = max(0.0, min(1.0, ensemble_p_up))
+
+        if ensemble_p_up > 0.5 + 1e-9:
             direction = "bullish"
-        elif bearish_weight > bullish_weight:
+        elif ensemble_p_up < 0.5 - 1e-9:
             direction = "bearish"
         else:
             direction = "neutral"
 
-        strength = round(abs(bullish_weight - bearish_weight) / total_weight, 4)
-        confidence = round(
-            sum(float(v["vote_weight"]) * float(v["confidence"]) for v in votes)
-            / total_weight,
-            4,
-        )
+        signed_edge = 2.0 * ensemble_p_up - 1.0
+        strength = round(abs(signed_edge), 4)
+        confidence = round(max(ensemble_p_up, 1.0 - ensemble_p_up), 4)
 
         directional_votes = [v for v in votes if v["direction"] != "neutral"]
         if directional_votes:
@@ -2977,6 +3002,22 @@ class EnsemblePredictor:
             )
         else:
             coherence = 0.0
+
+        disagreement_score_val = 0.0
+        directional_entropy_val = 0.0
+        try:
+            from oracle.disagreement import compute_metrics
+
+            disagreement = compute_metrics(votes)
+            disagreement_score_val = float(disagreement.disagreement_score)
+            directional_entropy_val = float(disagreement.directional_entropy)
+        except Exception as exc:
+            log.debug("disagreement metrics failed for {t}: {e}", t=ticker, e=str(exc))
+        if disagreement_score_val > 0 and confidence > 0.5:
+            confidence = round(
+                0.5 + (confidence - 0.5) * (1.0 - 0.4 * disagreement_score_val),
+                4,
+            )
 
         catalyst_proximity = 0.0
         catalyst_type: str | None = None
@@ -2999,19 +3040,6 @@ class EnsemblePredictor:
             )
         if catalyst_proximity > 0:
             confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
-
-        disagreement_score_val = 0.0
-        directional_entropy_val = 0.0
-        try:
-            from oracle.disagreement import compute_metrics
-
-            disagreement = compute_metrics(votes)
-            disagreement_score_val = float(disagreement.disagreement_score)
-            directional_entropy_val = float(disagreement.directional_entropy)
-        except Exception as exc:
-            log.debug("disagreement metrics failed for {t}: {e}", t=ticker, e=str(exc))
-        if disagreement_score_val > 0:
-            confidence = round(confidence * (1.0 - 0.4 * disagreement_score_val), 4)
 
         liquidity_state_val = ""
         liquidity_level_pct = 50.0
@@ -3042,8 +3070,15 @@ class EnsemblePredictor:
             fci_result = compute_fci(self.engine)
             fci_score_val = float(fci_result.score)
             fci_regime_val = str(fci_result.regime)
+            clamped_fci = max(-3.0, min(3.0, fci_score_val))
+            # Positive FCI = easier / risk-on conditions: supports bullish,
+            # opposes bearish, and does not alter neutral calls.
+            fci_dir_sign = (
+                1.0 if direction == "bullish"
+                else (-1.0 if direction == "bearish" else 0.0)
+            )
             confidence = round(
-                confidence * (1.0 + 0.05 * max(-3.0, min(3.0, fci_score_val))),
+                confidence * (1.0 + 0.05 * fci_dir_sign * clamped_fci),
                 4,
             )
         except Exception as exc:
@@ -3083,33 +3118,46 @@ class EnsemblePredictor:
 
         market_prob_val = 0.0
         market_sev = ""
-        try:
-            from intelligence.market_implied_prob import (
-                compare_to_oracle,
-                options_implied_probability,
-            )
+        if direction in ("bullish", "bearish"):
+            try:
+                sigma_daily = self._get_realized_daily_vol(ticker, as_of)
+                if sigma_daily is None:
+                    log.debug(
+                        "market_implied_prob abstained for {t}: realized vol unavailable",
+                        t=ticker,
+                    )
+                else:
+                    from intelligence.market_implied_prob import (
+                        compare_to_oracle,
+                        options_implied_probability,
+                    )
 
-            target_move = 0.03 if direction == "bullish" else -0.03
-            market = options_implied_probability(
-                self.engine,
-                ticker,
-                target_move_pct=target_move,
-                horizon_days=horizon,
-            )
-            if market is not None:
-                market_prob_val = float(market.prob)
-                div_report = compare_to_oracle(confidence, market.prob)
-                market_sev = str(div_report.severity)
-                confidence = round(
-                    confidence * float(div_report.confidence_multiplier),
-                    4,
+                    horizon_eff = max(1, int(horizon))
+                    move_mag = min(
+                        0.95,
+                        self._TARGET_MOVE_SIGMA_K * sigma_daily * float(np.sqrt(horizon_eff)),
+                    )
+                    target_move = move_mag if direction == "bullish" else -move_mag
+                    market = options_implied_probability(
+                        self.engine,
+                        ticker,
+                        target_move_pct=target_move,
+                        horizon_days=horizon,
+                    )
+                    if market is not None:
+                        market_prob_val = float(market.prob)
+                        div_report = compare_to_oracle(confidence, market.prob)
+                        market_sev = str(div_report.severity)
+                        confidence = round(
+                            confidence * float(div_report.confidence_multiplier),
+                            4,
+                        )
+            except Exception as exc:
+                log.debug(
+                    "market_implied_prob unavailable for {t}: {e}",
+                    t=ticker,
+                    e=str(exc),
                 )
-        except Exception as exc:
-            log.debug(
-                "market_implied_prob unavailable for {t}: {e}",
-                t=ticker,
-                e=str(exc),
-            )
 
         confidence = max(0.0, min(1.0, confidence))
 
@@ -3124,7 +3172,7 @@ class EnsemblePredictor:
         except Exception as exc:
             log.debug("uncertainty CI failed for {t}: {e}", t=ticker, e=str(exc))
 
-        raw_score = 50 + (bullish_weight - bearish_weight) / total_weight * 50 * confidence
+        raw_score = 50 + signed_edge * 50 * confidence
         score = max(0, min(100, round(raw_score)))
 
         # Contrast-distillation (ReasoningBank-style): runs only when models
@@ -3276,12 +3324,100 @@ class EnsemblePredictor:
             ],
         }
 
+    def _get_realized_daily_vol(
+        self,
+        ticker: str,
+        as_of: datetime,
+    ) -> float | None:
+        """PIT daily realized volatility (sample std of daily log returns).
+
+        Reads ``YF:{symbol}:close`` through ``store.observations.read_window``
+        bounded by ``as_of`` and ``as_of_ts`` and split-adjusts with
+        ``read_splits`` / ``adjust_history_for_splits``. Returns ``None``
+        (fail closed) when insufficient valid closes exist.
+        """
+        from store.observations import (
+            adjust_history_for_splits,
+            read_splits,
+            read_window,
+        )
+
+        sym = ticker.strip().upper()
+        try:
+            from ticker_symbols import get_yf_symbol
+
+            sym = get_yf_symbol(sym)
+        except Exception:
+            pass
+
+        end_date = as_of.date()
+        start_date = end_date - timedelta(days=self._REALIZED_VOL_LOOKBACK_DAYS)
+        series_id = f"YF:{sym}:close"
+
+        try:
+            with self.engine.connect() as conn:
+                points: list[tuple[date, float]] = []
+                for source in ("yfinance", "TIINGO"):
+                    obs = read_window(
+                        conn,
+                        series_id,
+                        source=source,
+                        start=start_date,
+                        as_of=end_date,
+                        as_of_ts=as_of,
+                    )
+                    valid = [
+                        (o.obs_date, float(o.value))
+                        for o in obs
+                        if o.value is not None
+                        and np.isfinite(float(o.value))
+                        and float(o.value) > 0.0
+                    ]
+                    if len(valid) >= self._REALIZED_VOL_MIN_RETURNS + 1:
+                        points = valid
+                        break
+                if len(points) < self._REALIZED_VOL_MIN_RETURNS + 1:
+                    return None
+                try:
+                    splits = read_splits(
+                        conn, sym, start=start_date, end=end_date, as_of_ts=as_of,
+                    )
+                    if splits:
+                        points, _ = adjust_history_for_splits(points, splits)
+                except Exception as exc:
+                    log.debug(
+                        "_get_realized_daily_vol split lookup skipped for {t}: {e}",
+                        t=ticker,
+                        e=str(exc),
+                    )
+        except Exception as exc:
+            log.debug(
+                "_get_realized_daily_vol read failed for {t}: {e}",
+                t=ticker,
+                e=str(exc),
+            )
+            return None
+
+        closes = np.array([p[1] for p in points], dtype=float)
+        if len(closes) < self._REALIZED_VOL_MIN_RETURNS + 1 or np.any(closes <= 0.0):
+            return None
+        log_returns = np.diff(np.log(closes))
+        if len(log_returns) < self._REALIZED_VOL_MIN_RETURNS:
+            return None
+        sigma_daily = float(np.std(log_returns, ddof=1))
+        if not np.isfinite(sigma_daily) or sigma_daily <= 0.0:
+            return None
+        return sigma_daily
+
     def _get_hit_rate(
         self,
         model_name: str,
         *,
         horizon: int | str | None = None,
     ) -> float:
+        prior_hits = self._HIT_RATE_PRIOR_HITS
+        prior_n = self._HIT_RATE_PRIOR_N
+        default_rate = prior_hits / prior_n
         try:
             with self.engine.connect() as conn:
                 if horizon is not None:
@@ -3301,7 +3437,7 @@ class EnsemblePredictor:
                             partials = int(bucket.get("partials", 0) or 0)
                             total = hits + misses + partials
                             if total >= 5:
-                                return (hits + partials * 0.5) / total
+                                return (hits + partials * 0.5 + prior_hits) / (total + prior_n)
                     except Exception as exc:
                         log.debug(
                             "_get_hit_rate bucket lookup failed {m}: {e}",
@@ -3316,15 +3452,17 @@ class EnsemblePredictor:
                     {"n": model_name},
                 ).fetchone()
             if not row:
-                return 0.5
+                return default_rate
             hits = int(row[0] or 0)
             misses = int(row[1] or 0)
             partials = int(row[2] or 0)
             total = hits + misses + partials
-            return (hits + partials * 0.5) / total if total >= 5 else 0.5
+            if total <= 0:
+                return default_rate
+            return (hits + partials * 0.5 + prior_hits) / (total + prior_n)
         except Exception as exc:
             log.warning("Hit rate lookup failed for {m}: {e}", m=model_name, e=str(exc))
-            return 0.5
+            return default_rate
 
     def _get_bucket_weight(
         self,
