@@ -357,7 +357,7 @@ def _build_holdout_db(
 # --- 1. Refusal tests (every refusal in the spec) --------------------------------------------------
 
 
-def test_refuses_without_witnessed_discovery_frozen(tmp_path):
+def test_refuses_without_witnessed_discovery_frozen(tmp_path, monkeypatch):
     from analysis import holdout_basis_probe as hb
 
     # (a) discovery_frozen absent from local chain
@@ -372,10 +372,12 @@ def test_refuses_without_witnessed_discovery_frozen(tmp_path):
     log_dir2, vault2, prereg2, _ = _make_sealed_registry(
         tmp_path / "b", seal_discovery=True, witness_discovery_frozen=False,
     )
+    _bind_v9_study_pins(monkeypatch, log_dir2)
     with pytest.raises(hb.HoldoutProbeRefused, match="witness"):
         hb.verify_witnessed_discovery_frozen(
             log_dir2, vault2.cache, prereg_sha256=prereg2, snapshot_as_of_ts=SNAPSHOT,
             allow_holdout=True, remote_url=str(vault2.remote),
+            expected_manifest_digest="e" * 64,
         )
 
 
@@ -572,7 +574,7 @@ def test_splice_check_includes_the_2020_01_01_boundary(tmp_path):
     )
     meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", ["AAA", "BBB", "CCC", "XLK"])
     cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
-    cal = hb.load_calendar_manifest(cal_path)
+    cal = hb.load_calendar_manifest(cal_path, expected_sha256=gd4.file_sha256(cal_path))
     manifest_path, _ = _write_manifest(
         tmp_path / "m.json", ["AAA", "BBB", "CCC"],
         {"AAA": "2010-01-04", "BBB": "2010-01-04", "CCC": "2010-01-04"},
@@ -617,7 +619,7 @@ def test_c1_and_start_date_bounds_and_vendor_guards(tmp_path):
         missing=("NOMETA",),
     )
     cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
-    cal = hb.load_calendar_manifest(cal_path)
+    cal = hb.load_calendar_manifest(cal_path, expected_sha256=gd4.file_sha256(cal_path))
     issuers_list = ["OK1", "SHIFT", "NOMETA", "OUTC1", "FUTURETD", "PRESEAL"]
     manifest_path, _ = _write_manifest(
         tmp_path / "m.json", issuers_list, {t: "2010-01-04" for t in issuers_list},
@@ -686,12 +688,20 @@ def test_end_to_end_cli_outputs_window_holdout_tickers_subset_and_xlk_magnitudes
     engine = _build_holdout_db(series, extra_rows=extra_rows)
     td_dir = _write_td_dir(tmp_path / "td", series, bad_tickers=("DDD", "XLK"))
     meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", list(series))
+    from analysis import panel_insider_density_v9 as v9
+
     cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
+    cal_sha = gd4.file_sha256(cal_path)
     admitted_in = ["AAA", "BBB", "CCC", "DDD"]  # XLK deliberately absent (v9 manifest)
-    manifest_path, m_digest = _write_manifest(
-        tmp_path / "price_manifest.json", admitted_in, {t: "2010-01-04" for t in admitted_in},
+    manifest_path, m_digest = _write_v9_manifest(
+        tmp_path / "price_manifest.json",
+        admitted_in,
+        {t: "2010-01-04" for t in admitted_in},
+        calendar_manifest_sha256=cal_sha,
     )
     log_dir, vault, prereg, frozen_sha = _make_sealed_registry(tmp_path, manifest_digest=m_digest)
+    _bind_v9_study_pins(monkeypatch, log_dir)
+    monkeypatch.setattr(v9, "XNYS_MANIFEST_SHA256", cal_sha)
 
     # Synthetic C1 submissions, issuers JSON, and SIC map (required by v6 §2.3, §8 — HOLD-N2).
     issuers_path = tmp_path / "issuers.json"
@@ -771,7 +781,7 @@ def test_end_to_end_cli_outputs_window_holdout_tickers_subset_and_xlk_magnitudes
     assert report["crosscheck_report_sha256"] == gd4.file_sha256(out / "crosscheck_report.json")
 
     # Requesting a ticker outside manifest.admitted refuses
-    cal = hb.load_calendar_manifest(cal_path)
+    cal = hb.load_calendar_manifest(cal_path, expected_sha256=cal_sha)
     manifest = hb.load_price_manifest(manifest_path)
     vendors = hb.HoldoutVendorFiles(td_dir, meta_dir, lo=HO_LO, hi=HO_HI, boundary_anchor=cal.boundary_anchor)
     with engine.connect() as conn:
@@ -815,7 +825,8 @@ def test_basis_checks_2_and_3_crosscheck_tolerances_and_source_refusal(tmp_path)
     engine = _build_holdout_db(series)
     td_dir = _write_td_dir(tmp_path / "td", series)
     meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", list(series))
-    cal = hb.load_calendar_manifest(_write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS))
+    cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
+    cal = hb.load_calendar_manifest(cal_path, expected_sha256=gd4.file_sha256(cal_path))
     # v6/v8-style manifest with XLK inside manifest.admitted
     admitted = ["ADJDOM", "GAP", "OK", "SHORT", "SPLIT", "XLK"]
     manifest_path, _ = _write_manifest(
@@ -1071,7 +1082,8 @@ def test_cli_refuses_missing_submissions_issuers_or_sic_map_and_empty_sec_names_
     engine = _build_holdout_db(series)
     td_dir = _write_td_dir(tmp_path / "td", series)
     meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", list(series))
-    cal = hb.load_calendar_manifest(_write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS))
+    cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
+    cal = hb.load_calendar_manifest(cal_path, expected_sha256=gd4.file_sha256(cal_path))
     m_path, _ = _write_manifest(tmp_path / "m.json", ["AAA"], {"AAA": "2010-01-04"})
     manifest = hb.load_price_manifest(m_path)
     vendors = hb.HoldoutVendorFiles(td_dir, meta_dir, lo=HO_LO, hi=HO_HI, boundary_anchor=cal.boundary_anchor)
@@ -1085,6 +1097,7 @@ def test_cli_refuses_missing_submissions_issuers_or_sic_map_and_empty_sec_names_
 
 
 def test_cli_computes_code_sha_from_clean_git_tree_and_asserts_flag(tmp_path, monkeypatch):
+    from analysis import panel_insider_density_v9 as v9
     from scripts import run_holdout_basis_probe as cli
     import scripts.run_real_panel_scan as rps
 
@@ -1106,8 +1119,13 @@ def test_cli_computes_code_sha_from_clean_git_tree_and_asserts_flag(tmp_path, mo
     td_dir = _write_td_dir(tmp_path / "td", series)
     meta_dir = _write_tiingo_meta_dir(tmp_path / "meta", list(series))
     cal_path = _write_calendar_manifest(tmp_path / "cal.json", [BOUNDARY_ANCHOR] + HO_SESSIONS)
-    manifest_path, m_digest = _write_manifest(tmp_path / "m.json", ["AAA"], {"AAA": "2010-01-04"})
+    cal_sha = gd4.file_sha256(cal_path)
+    manifest_path, m_digest = _write_v9_manifest(
+        tmp_path / "m.json", ["AAA"], {"AAA": "2010-01-04"}, calendar_manifest_sha256=cal_sha,
+    )
     log_dir, vault, prereg, _ = _make_sealed_registry(tmp_path, manifest_digest=m_digest)
+    _bind_v9_study_pins(monkeypatch, log_dir)
+    monkeypatch.setattr(v9, "XNYS_MANIFEST_SHA256", cal_sha)
 
     issuers_path = tmp_path / "issuers.json"
     sic_map_path = tmp_path / "sic_map.jsonl"
@@ -1155,3 +1173,622 @@ def test_cli_computes_code_sha_from_clean_git_tree_and_asserts_flag(tmp_path, mo
     with pytest.raises(SystemExit, match="modified|dirty|code_sha"):
         cli.main([*base_args, "--out", str(tmp_path / "out_dirty")])
     assert not (tmp_path / "out_dirty").exists()
+
+
+# --- 7. Canonical study pins, mandatory digest/manifest verification, archival re-verification -----
+
+
+def _write_v9_manifest(
+    path: Path,
+    admitted: list[str],
+    listed_from: dict[str, str],
+    *,
+    probe_report_sha256: str = "a" * 64,
+    crosscheck_report_sha256: str = "c" * 64,
+    tiingo_meta_report_sha256: str = "d" * 64,
+    calendar_manifest: str | None = None,
+    calendar_manifest_sha256: str | None = None,
+    benchmark: str = "XLK",
+    benchmark_admitted: bool = False,
+) -> tuple[Path, str]:
+    from analysis import panel_insider_density_v9 as v9
+
+    cal_rel = v9.XNYS_MANIFEST_PATH.as_posix() if calendar_manifest is None else calendar_manifest
+    cal_sha = v9.XNYS_MANIFEST_SHA256 if calendar_manifest_sha256 is None else calendar_manifest_sha256
+    doc = {
+        "admitted": sorted(admitted),
+        "basis": "split+dividend adjusted",
+        "benchmark": benchmark,
+        "benchmark_admitted": benchmark_admitted,
+        "calendar_manifest": cal_rel,
+        "calendar_manifest_sha256": cal_sha,
+        "crosscheck_report_sha256": crosscheck_report_sha256,
+        "listed_from": dict(sorted(listed_from.items())),
+        "probe_report_sha256": probe_report_sha256,
+        "probe_snapshot_as_of_ts": v9.PROBE_SNAPSHOT_AS_OF_TS,
+        "selected_adj_close_sha256": {
+            t: v1.digest({"ticker": t}) for t in sorted(admitted) if t != benchmark
+        },
+        "series_template": "YF:{ticker}:adj_close",
+        "source": "TIINGO",
+        "tiingo_meta_report_sha256": tiingo_meta_report_sha256,
+    }
+    path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    digest_val = v1.digest({
+        **doc,
+        "admitted": list(sorted(admitted)),
+        "listed_from": [[t, d] for t, d in sorted(listed_from.items())],
+        "selected_adj_close_sha256": [
+            [t, h] for t, h in sorted(doc["selected_adj_close_sha256"].items())
+        ],
+    })
+    return path, digest_val
+
+
+def _bind_v9_study_pins(
+    monkeypatch,
+    log_dir: Path,
+    *,
+    probe_report_sha256: str = "a" * 64,
+    crosscheck_report_sha256: str = "c" * 64,
+    tiingo_meta_report_sha256: str = "d" * 64,
+) -> None:
+    from analysis import panel_insider_density_v9 as v9
+    from analysis.research_forward_log import _lines
+
+    log = ForwardLog(
+        log_dir,
+        log_filename=v9.REGISTRY_LOG,
+        anchor_filename=v9.REGISTRY_ANCHORS,
+        lock_filename=v9.REGISTRY_LOCK,
+        prereg_sha256=v9.PREREG_BODY_SHA256,
+    )
+    heads = tuple(v1._line_sha256(log)[:2])
+    anchor = list(_lines(log.anchor_path))[0]
+    monkeypatch.setattr(v9, "REGISTERED_RECORD_SHA256", heads)
+    monkeypatch.setattr(v9, "REGISTERED_ANCHOR_LINE", anchor)
+    monkeypatch.setattr(v9, "PROBE_REPORT_SHA256", probe_report_sha256)
+    monkeypatch.setattr(v9, "CROSSCHECK_REPORT_SHA256", crosscheck_report_sha256)
+    monkeypatch.setattr(v9, "TIINGO_META_REPORT_SHA256", tiingo_meta_report_sha256)
+
+
+def _make_sealed_registry_custom_inputs(
+    tmp_path: Path,
+    *,
+    inputs_dict: dict,
+    study: str = "vs1-v9",
+    prereg_sha256: str | None = None,
+    frozen_at: datetime = DISC_FROZEN_AT,
+) -> tuple[Path, _LocalVault, str, str]:
+    """Sealed & witnessed registry whose ``inputs_frozen.inputs`` is caller-controlled."""
+    if prereg_sha256 is None:
+        from analysis import panel_insider_density_v9 as v9
+
+        prereg_sha256 = v9.PREREG_BODY_SHA256 if study == "vs1-v9" else "9" * 64
+    log_dir = tmp_path / "registry"
+    num = study.split("-v")[1]
+    stem = f"granular_panel_prereg_v{num}"
+    log = ForwardLog(
+        log_dir,
+        log_filename=f"{stem}.jsonl",
+        anchor_filename=f"{stem}.anchors.jsonl",
+        lock_filename=f".{stem}.lock",
+        prereg_sha256=prereg_sha256,
+    )
+    witness_path = v1.canonical_witness_path(study)
+    vault = _LocalVault(tmp_path / "vault")
+
+    t0 = frozen_at - timedelta(days=2)
+    log.append([
+        {"kind": "header", "version": study, "run_at": t0.isoformat(), "code_sha": CODE_SHA,
+         "prereg_sha256": prereg_sha256, "promotion_allowed": False},
+        {"kind": "preregistration", "version": study, "run_at": t0.isoformat(), "code_sha": CODE_SHA,
+         "prereg_sha256": prereg_sha256, "promotion_allowed": False},
+    ])
+    vault.publish_anchors(log.anchor_path, witness_path, "register")
+
+    t1 = frozen_at - timedelta(days=1)
+    frozen_in = log.append([{
+        "kind": "inputs_frozen", "run_at": t1.isoformat(), "prereg_sha256": prereg_sha256,
+        "inputs": dict(inputs_dict), "supersedes": None, "promotion_allowed": False,
+    }])[0]
+    inputs_sha = v1._record_sha256(frozen_in)
+
+    log.append([{
+        "kind": "discovery_opened", "run_at": (t1 + timedelta(hours=1)).isoformat(),
+        "prereg_sha256": prereg_sha256, "inputs_frozen_sha256": inputs_sha,
+        "promotion_allowed": False,
+    }])
+    vault.publish_anchors(log.anchor_path, witness_path, "discovery_opened")
+
+    rec = log.append([{
+        "kind": "discovery_frozen", "run_at": frozen_at.isoformat(),
+        "prereg_sha256": prereg_sha256, "inputs_frozen_sha256": inputs_sha,
+        "discovery_sha256": "f" * 64, "calibration": "CONSISTENT", "selected": ["A90|fwd5"],
+        "promotion_allowed": False,
+    }])[0]
+    vault.publish_anchors(log.anchor_path, witness_path, "discovery_frozen")
+    return log_dir, vault, prereg_sha256, v1._record_sha256(rec)
+
+
+def _install_loader_traps(monkeypatch):
+    """Patch every downstream data/DB/vendor/C1 loader to fail loudly if invoked."""
+    from unittest.mock import MagicMock
+    from analysis import holdout_basis_probe as hb
+    from scripts import run_holdout_basis_probe as cli
+    import scripts.run_real_panel_scan as rps
+
+    traps = {
+        "issuers": MagicMock(side_effect=AssertionError("issuers loader must not be called")),
+        "sec_names": MagicMock(side_effect=AssertionError("sec_names loader must not be called")),
+        "c1_interval": MagicMock(side_effect=AssertionError("C1 interval loader must not be called")),
+        "vendors": MagicMock(side_effect=AssertionError("HoldoutVendorFiles must not be called")),
+        "read_only_engine": MagicMock(side_effect=AssertionError("DB engine loader must not be called")),
+        "run_holdout_probe": MagicMock(side_effect=AssertionError("run_holdout_probe must not be called")),
+    }
+    monkeypatch.setattr(cli, "_issuers", traps["issuers"])
+    monkeypatch.setattr(gd4, "sec_names_by_ticker", traps["sec_names"])
+    monkeypatch.setattr(hb, "load_c1_interval", traps["c1_interval"])
+    monkeypatch.setattr(hb, "HoldoutVendorFiles", traps["vendors"])
+    monkeypatch.setattr(rps, "read_only_engine", traps["read_only_engine"])
+    monkeypatch.setattr(hb, "run_holdout_probe", traps["run_holdout_probe"])
+    return traps
+
+
+def _dummy_cli_sidecars(tmp_path: Path) -> dict[str, Path]:
+    issuers = tmp_path / "issuers.json"
+    sic_map = tmp_path / "sic_map.jsonl"
+    subs = tmp_path / "subs.csv"
+    td_dir = tmp_path / "td"
+    meta_dir = tmp_path / "meta"
+    td_dir.mkdir(exist_ok=True)
+    meta_dir.mkdir(exist_ok=True)
+    (td_dir / "fetch_log.jsonl").write_text("", encoding="utf-8")
+    (meta_dir / "fetch_log.jsonl").write_text("", encoding="utf-8")
+    issuers.write_text(
+        json.dumps({"issuers": [{"ticker": "AAA", "cik": 1000, "current_tickers": ["AAA"]}]}),
+        encoding="utf-8",
+    )
+    sic_map.write_text(
+        json.dumps({"cik": 1000, "sic": 7372, "name": "AAA Systems Inc"}) + "\n",
+        encoding="utf-8",
+    )
+    subs.write_text(
+        "accession_number,filing_date,issuer_cik,document_type,issuer_ticker\n1000-1,2019-06-01,1000,4,AAA\n",
+        encoding="utf-8",
+    )
+    return {"issuers": issuers, "sic_map": sic_map, "subs": subs, "td_dir": td_dir, "meta_dir": meta_dir}
+
+
+def test_pin_readiness_refuses_missing_price_manifest_pin_before_loaders(tmp_path, monkeypatch):
+    from analysis import holdout_basis_probe as hb
+    from analysis import panel_insider_density_v9 as v9
+    from scripts import run_holdout_basis_probe as cli
+
+    manifest_path, m_digest = _write_v9_manifest(tmp_path / "price_manifest.json", ["AAA"], {"AAA": "2010-01-04"})
+    sidecars = _dummy_cli_sidecars(tmp_path)
+    real_cal = v2.REPO / v9.XNYS_MANIFEST_PATH
+
+    # (a) Frozen registry inputs_frozen omits price_manifest_sha256 (and also None / "" / malformed)
+    for idx, bad_pin in enumerate(("OMIT", None, "", "not-a-hex-digest")):
+        inputs_dict = {
+            "sector": "Technology",
+            "probe_report_sha256": "a" * 64,
+            "form4_sha256": "1" * 64,
+            "submissions_sha256": "2" * 64,
+            "issuer_map_sha256": "3" * 64,
+            "power_sha256": "4" * 64,
+            "sic_map_sha256": "5" * 64,
+            "accept_underpowered": False,
+            "as_of_ts": (DISC_FROZEN_AT - timedelta(days=1, hours=1)).isoformat(),
+        }
+        if bad_pin != "OMIT":
+            inputs_dict["price_manifest_sha256"] = bad_pin
+        log_dir, vault, prereg, _ = _make_sealed_registry_custom_inputs(
+            tmp_path / f"missing_pin_{idx}", inputs_dict=inputs_dict,
+        )
+        _bind_v9_study_pins(monkeypatch, log_dir)
+        traps = _install_loader_traps(monkeypatch)
+        monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+        monkeypatch.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
+
+        with pytest.raises(SystemExit, match="price_manifest_sha256|manifest"):
+            cli.main([
+                "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+                "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+                "--calendar-manifest", str(real_cal), "--submissions", str(sidecars["subs"]),
+                "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+                "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+                "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / f"out_{idx}"),
+            ])
+        for name, mock in traps.items():
+            mock.assert_not_called(), f"{name} was invoked despite missing frozen price_manifest_sha256"
+
+        # Direct Python API also fails closed even when caller supplies expected_manifest_digest!
+        with pytest.raises(hb.HoldoutProbeRefused, match="price_manifest_sha256"):
+            hb.verify_witnessed_discovery_frozen(
+                log_dir, vault.cache, prereg_sha256=prereg, snapshot_as_of_ts=SNAPSHOT,
+                allow_holdout=True, remote_url=str(vault.remote),
+                expected_manifest_digest=m_digest,
+            )
+
+    # (b) Direct verify_witnessed_discovery_frozen without expected_manifest_digest refuses (never optional!)
+    log_ok, vault_ok, prereg_ok, _ = _make_sealed_registry(tmp_path / "omit_expected", manifest_digest=m_digest)
+    _bind_v9_study_pins(monkeypatch, log_ok)
+    with pytest.raises(hb.HoldoutProbeRefused, match="expected_manifest|price_manifest"):
+        hb.verify_witnessed_discovery_frozen(
+            log_ok, vault_ok.cache, prereg_sha256=prereg_ok, snapshot_as_of_ts=SNAPSHOT,
+            allow_holdout=True, remote_url=str(vault_ok.remote),
+        )
+
+    # (c) Unbound study-specific canonical probe pin (placeholder on v9) fails closed before any loader!
+    monkeypatch.setattr(v9, "PROBE_REPORT_SHA256", "PLACEHOLDER_OPERATOR_FILL_FROM_SHA256SUM_64d29785")
+    traps = _install_loader_traps(monkeypatch)
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault_ok.remote))
+    monkeypatch.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
+    with pytest.raises(SystemExit, match="PROBE_REPORT_SHA256|pin|unbound|placeholder"):
+        cli.main([
+            "--manifest", str(manifest_path), "--log-dir", str(log_ok), "--vault-repo", str(vault_ok.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(real_cal), "--submissions", str(sidecars["subs"]),
+            "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg_ok, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_placeholder"),
+        ])
+    for mock in traps.values():
+        mock.assert_not_called()
+
+
+def test_pin_readiness_refuses_mismatched_price_manifest_bytes_before_loaders(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from analysis import holdout_basis_probe as hb
+    from analysis import panel_insider_density_v9 as v9
+    from scripts import run_holdout_basis_probe as cli
+
+    orig_path, m_digest = _write_v9_manifest(tmp_path / "orig_manifest.json", ["AAA"], {"AAA": "2010-01-04"})
+    orig_file_sha = gd4.file_sha256(orig_path)
+    sidecars = _dummy_cli_sidecars(tmp_path)
+    real_cal = v2.REPO / v9.XNYS_MANIFEST_PATH
+
+    log_dir, vault, prereg, _ = _make_sealed_registry(tmp_path / "reg_ok", manifest_digest=m_digest)
+    _bind_v9_study_pins(monkeypatch, log_dir)
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+    monkeypatch.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
+
+    # (a) Mutated semantic bytes in price_manifest.json (different listed_from date) -> fails before loaders!
+    tampered_path, _ = _write_v9_manifest(tmp_path / "tampered_manifest.json", ["AAA"], {"AAA": "2011-01-04"})
+    traps = _install_loader_traps(monkeypatch)
+    with pytest.raises(SystemExit, match="manifest|price_manifest"):
+        cli.main([
+            "--manifest", str(tampered_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(real_cal), "--submissions", str(sidecars["subs"]),
+            "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_tampered"),
+        ])
+    for mock in traps.values():
+        mock.assert_not_called()
+
+    # (b) Raw 1-byte whitespace tamper rejected BEFORE JSON parsing when pinned by file sha256!
+    byte_tampered = tmp_path / "byte_tampered_manifest.json"
+    byte_tampered.write_bytes(orig_path.read_bytes() + b" ")
+    parse_spy = MagicMock(side_effect=AssertionError("json.loads must not run after raw byte sha mismatch"))
+    with monkeypatch.context() as m:
+        m.setattr(hb.json, "loads", parse_spy)
+        with pytest.raises(hb.HoldoutProbeRefused, match="sha256|manifest"):
+            hb.load_price_manifest(byte_tampered, expected_file_sha256=orig_file_sha)
+    parse_spy.assert_not_called()
+
+    # (c) Manifest carrying wrong study-level probe_report_sha256 (even if frozen registry matched its digest!)
+    forged_path, forged_digest = _write_v9_manifest(
+        tmp_path / "forged_manifest.json", ["AAA"], {"AAA": "2010-01-04"},
+        probe_report_sha256="9" * 64,
+    )
+    log_forged, vault_forged, prereg_forged, _ = _make_sealed_registry_custom_inputs(
+        tmp_path / "reg_forged",
+        inputs_dict={
+            "sector": "Technology", "price_manifest_sha256": forged_digest,
+            "probe_report_sha256": "9" * 64, "form4_sha256": "1" * 64,
+            "submissions_sha256": "2" * 64, "issuer_map_sha256": "3" * 64,
+            "power_sha256": "4" * 64, "sic_map_sha256": "5" * 64,
+            "accept_underpowered": False, "as_of_ts": (DISC_FROZEN_AT - timedelta(days=1, hours=1)).isoformat(),
+        },
+    )
+    _bind_v9_study_pins(monkeypatch, log_forged, probe_report_sha256="a" * 64)
+    traps = _install_loader_traps(monkeypatch)
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault_forged.remote))
+    with pytest.raises(SystemExit, match="probe_report_sha256|canonical|pin"):
+        cli.main([
+            "--manifest", str(forged_path), "--log-dir", str(log_forged), "--vault-repo", str(vault_forged.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(real_cal), "--submissions", str(sidecars["subs"]),
+            "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg_forged, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_forged"),
+        ])
+    for mock in traps.values():
+        mock.assert_not_called()
+
+
+def test_pin_readiness_refuses_missing_calendar_digest_before_loaders(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from analysis import holdout_basis_probe as hb
+    from analysis import panel_insider_density_v9 as v9
+    from scripts import run_holdout_basis_probe as cli
+
+    real_cal = v2.REPO / v9.XNYS_MANIFEST_PATH
+
+    # (a) Direct load_calendar_manifest without expected_sha256 (or None / empty / malformed) fails BEFORE parse!
+    parse_spy = MagicMock(side_effect=AssertionError("json.loads must not run when calendar digest is missing"))
+    with monkeypatch.context() as m:
+        m.setattr(hb.json, "loads", parse_spy)
+        with pytest.raises(hb.HoldoutProbeRefused, match="expected_sha256|sha256|digest"):
+            hb.load_calendar_manifest(real_cal)
+        for bad in (None, "", "not-hex"):
+            with pytest.raises(hb.HoldoutProbeRefused, match="expected_sha256|sha256|digest"):
+                hb.load_calendar_manifest(real_cal, expected_sha256=bad)
+    parse_spy.assert_not_called()
+
+    # (b) CLI / probe fails closed when study lacks a canonical XNYS_MANIFEST_SHA256 pin, BEFORE ANY loader!
+    manifest_path, m_digest = _write_v9_manifest(tmp_path / "price_manifest.json", ["AAA"], {"AAA": "2010-01-04"})
+    sidecars = _dummy_cli_sidecars(tmp_path)
+    log_dir, vault, prereg, _ = _make_sealed_registry(tmp_path / "reg_nocal", manifest_digest=m_digest)
+    with monkeypatch.context() as m:
+        _bind_v9_study_pins(m, log_dir)
+        m.setattr(v9, "XNYS_MANIFEST_SHA256", None)
+        cal_loader_trap = MagicMock(
+            side_effect=AssertionError("load_calendar_manifest must not run without canonical pin")
+        )
+        m.setattr(hb, "load_calendar_manifest", cal_loader_trap)
+        traps = _install_loader_traps(m)
+        m.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+        m.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
+
+        with pytest.raises(SystemExit, match="calendar|XNYS"):
+            cli.main([
+                "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+                "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+                "--calendar-manifest", str(real_cal), "--submissions", str(sidecars["subs"]),
+                "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+                "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+                "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_nocal"),
+            ])
+        cal_loader_trap.assert_not_called()
+        for mock in traps.values():
+            mock.assert_not_called()
+
+    # (c) Direct run_holdout_probe with an unverified CalendarManifest (verified_sha256=None) refuses before DB/vendors!
+    unverified_cal = hb.CalendarManifest(
+        path=real_cal, sha256=v9.XNYS_MANIFEST_SHA256 or ("b" * 64),
+        start=date(2007, 11, 1), end=HO_HI,
+        calendar_version=v9.XNYS_CALENDAR_VERSION,
+        sessions=tuple([BOUNDARY_ANCHOR] + HO_SESSIONS),
+        verified_sha256=None,
+    )
+    fake_conn = MagicMock()
+    fake_conn.execute.side_effect = AssertionError("DB query must not run with unverified calendar")
+    fake_vendors = MagicMock()
+    fake_vendors.td.side_effect = AssertionError("vendor loader must not run with unverified calendar")
+    loaded_manifest = hb.load_price_manifest(manifest_path)
+    with pytest.raises(hb.HoldoutProbeRefused, match="verified|pinned|sha256"):
+        hb.run_holdout_probe(
+            fake_conn, manifest=loaded_manifest, calendar=unverified_cal,
+            lo=HO_LO, hi=HO_HI, as_of_ts=SNAPSHOT, vendors=fake_vendors,
+        )
+    fake_conn.execute.assert_not_called()
+    fake_vendors.td.assert_not_called()
+
+
+def test_pin_readiness_refuses_mismatched_calendar_digest_before_loaders(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from analysis import holdout_basis_probe as hb
+    from analysis import panel_insider_density_v9 as v9
+    from scripts import run_holdout_basis_probe as cli
+
+    real_cal = v2.REPO / v9.XNYS_MANIFEST_PATH
+    tampered_cal = tmp_path / "tampered_xnys.json"
+    tampered_cal.write_bytes(real_cal.read_bytes() + b" ")
+    tampered_sha = gd4.file_sha256(tampered_cal)
+    assert tampered_sha != v9.XNYS_MANIFEST_SHA256
+
+    # (a) Direct load_calendar_manifest rejects mismatched bytes BEFORE json.loads!
+    parse_spy = MagicMock(side_effect=AssertionError("json.loads must not run on mismatched calendar digest"))
+    with monkeypatch.context() as m:
+        m.setattr(hb.json, "loads", parse_spy)
+        with pytest.raises(hb.HoldoutProbeRefused, match="sha256|pinned"):
+            hb.load_calendar_manifest(tampered_cal, expected_sha256=v9.XNYS_MANIFEST_SHA256)
+    parse_spy.assert_not_called()
+
+    # (b) CLI rejects tampered calendar bytes (without --calendar-sha256) BEFORE any loader!
+    manifest_path, m_digest = _write_v9_manifest(tmp_path / "price_manifest.json", ["AAA"], {"AAA": "2010-01-04"})
+    sidecars = _dummy_cli_sidecars(tmp_path)
+    log_dir, vault, prereg, _ = _make_sealed_registry(tmp_path / "reg_badcal", manifest_digest=m_digest)
+    _bind_v9_study_pins(monkeypatch, log_dir)
+    traps = _install_loader_traps(monkeypatch)
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+    monkeypatch.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
+
+    with pytest.raises(SystemExit, match="sha256|calendar|pinned"):
+        cli.main([
+            "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(tampered_cal), "--submissions", str(sidecars["subs"]),
+            "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_badcal_1"),
+        ])
+    for mock in traps.values():
+        mock.assert_not_called()
+
+    # (c) CLI caller CANNOT override canonical pin by passing --calendar-sha256 matching tampered bytes!
+    traps2 = _install_loader_traps(monkeypatch)
+    with pytest.raises(SystemExit, match="calendar|canonical|pin|sha256"):
+        cli.main([
+            "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(tampered_cal), "--calendar-sha256", tampered_sha,
+            "--submissions", str(sidecars["subs"]), "--issuers", str(sidecars["issuers"]),
+            "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_badcal_2"),
+        ])
+    for mock in traps2.values():
+        mock.assert_not_called()
+
+
+def test_pin_readiness_positive_canonical_and_archival_reverification(tmp_path, monkeypatch):
+    import stat as stat_mod
+    from contextlib import nullcontext
+    from analysis import holdout_basis_probe as hb
+    from analysis import panel_insider_density_v9 as v9
+    from scripts import run_holdout_basis_probe as cli
+    import scripts.run_real_panel_scan as rps
+
+    manifest_path, m_digest = _write_v9_manifest(tmp_path / "price_manifest.json", ["AAA"], {"AAA": "2010-01-04"})
+    sidecars = _dummy_cli_sidecars(tmp_path)
+    log_dir, vault, prereg, frozen_sha = _make_sealed_registry(tmp_path / "reg_pos", manifest_digest=m_digest)
+    _bind_v9_study_pins(monkeypatch, log_dir)
+    monkeypatch.setattr(v1, "WITNESS_REMOTE_URL", str(vault.remote))
+    monkeypatch.setattr(cli, "resolve_code_sha", lambda repo_root=cli.REPO: CODE_SHA)
+
+    # Pure mock DB engine + probe runner (no database, no network) to verify readiness + output wiring.
+    class _DummyEngine:
+        def connect(self):
+            return nullcontext(object())
+
+        def dispose(self):
+            return None
+
+    probe_calls: list[dict] = []
+
+    def _fake_run_probe(conn, *, manifest, calendar, lo, hi, as_of_ts, vendors, sec_names=None,
+                        interval=None, progress=None, proof=None, **kw):
+        probe_calls.append({"calendar_sha": calendar.sha256, "manifest_digest": manifest.digest, "proof": proof})
+        sessions = calendar.window_sessions(lo, hi)
+        rec = {
+            "ticker": "AAA", "benchmark": False, "admitted": True, "abstains": False,
+            "reasons": [], "listed_from": "2010-01-04",
+            "crosscheck": {
+                "passed": True, "reason": "pass", "pairs": 300, "share_within": 1.0,
+                "excluded_adjustment_pairs": 0, "dropped_nonconsecutive": 0,
+            },
+            "twelvedata": {"state": "ok", "out_of_window_rows": 0, "pre_holdout_rows": 0},
+        }
+        bench = {
+            "ticker": "XLK", "benchmark": True, "admitted": False, "abstains": True,
+            "reasons": ["crosscheck_disagreement"], "listed_from": None,
+            "crosscheck": {
+                "passed": False, "reason": "disagreement", "pairs": 300, "share_within": 0.95,
+                "excluded_adjustment_pairs": 0, "dropped_nonconsecutive": 0,
+            },
+            "twelvedata": {"state": "ok", "out_of_window_rows": 0, "pre_holdout_rows": 0},
+        }
+        return {
+            "source": {"name": "TIINGO", "id": TIINGO},
+            "calendar_sessions": len(sessions),
+            "calendar_range": [sessions[0].isoformat(), sessions[-1].isoformat()],
+            "boundary_anchor": calendar.boundary_anchor.isoformat() if calendar.boundary_anchor else None,
+            "interval_receipt_sha256": interval.receipt_sha256 if interval is not None else None,
+            "other_sources": [],
+            "benchmark": "XLK",
+            "benchmark_record": bench,
+            "records": {"AAA": rec},
+        }
+
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: _DummyEngine())
+    monkeypatch.setattr(hb, "run_holdout_probe", _fake_run_probe)
+
+    # (a) Canonical path: omitting --calendar-manifest and --calendar-sha256 uses v9's canonical pins!
+    out_canon = tmp_path / "out_canonical"
+    cli.main([
+        "--manifest", str(manifest_path), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+        "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+        "--submissions", str(sidecars["subs"]), "--issuers", str(sidecars["issuers"]),
+        "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+        "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+        "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(out_canon),
+    ])
+    rep_canon = json.loads((out_canon / "holdout_basis_report.json").read_text(encoding="utf-8"))
+    assert rep_canon["calendar"]["sha256"] == v9.XNYS_MANIFEST_SHA256
+    assert rep_canon["manifest"]["digest"] == m_digest
+    assert rep_canon["discovery_frozen"]["sha256"] == frozen_sha
+    assert probe_calls[-1]["calendar_sha"] == v9.XNYS_MANIFEST_SHA256
+    assert probe_calls[-1]["manifest_digest"] == m_digest
+
+    # (b) Archival byte re-verification against immutable read-only artifact copies!
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    arch_cal = archive_dir / "vs1-xnys-archive.json"
+    arch_manifest = archive_dir / "price-manifest-archive.json"
+    arch_cal.write_bytes((v2.REPO / v9.XNYS_MANIFEST_PATH).read_bytes())
+    arch_manifest.write_bytes(manifest_path.read_bytes())
+    arch_cal.chmod(stat_mod.S_IRUSR | stat_mod.S_IRGRP | stat_mod.S_IROTH)
+    arch_manifest.chmod(stat_mod.S_IRUSR | stat_mod.S_IRGRP | stat_mod.S_IROTH)
+
+    out_arch = tmp_path / "out_archival"
+    cli.main([
+        "--manifest", str(arch_manifest), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+        "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+        "--calendar-manifest", str(arch_cal), "--calendar-sha256", v9.XNYS_MANIFEST_SHA256,
+        "--submissions", str(sidecars["subs"]), "--issuers", str(sidecars["issuers"]),
+        "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+        "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+        "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(out_arch),
+    ])
+    rep_arch = json.loads((out_arch / "holdout_basis_report.json").read_text(encoding="utf-8"))
+    assert rep_arch["calendar"]["sha256"] == v9.XNYS_MANIFEST_SHA256
+    assert rep_arch["manifest"]["digest"] == m_digest
+    assert len(probe_calls) == 2
+
+    # (c) Symlinks pointing to archival calendar or price manifest are refused before loading!
+    cal_link = tmp_path / "cal_symlink.json"
+    cal_link.symlink_to(arch_cal)
+    traps = _install_loader_traps(monkeypatch)
+    with pytest.raises(SystemExit, match="symlink"):
+        cli.main([
+            "--manifest", str(arch_manifest), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(cal_link), "--submissions", str(sidecars["subs"]),
+            "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_symlink"),
+        ])
+    for mock in traps.values():
+        mock.assert_not_called()
+
+    manifest_link = tmp_path / "manifest_symlink.json"
+    manifest_link.symlink_to(arch_manifest)
+    traps2 = _install_loader_traps(monkeypatch)
+    with pytest.raises(SystemExit, match="symlink"):
+        cli.main([
+            "--manifest", str(manifest_link), "--log-dir", str(log_dir), "--vault-repo", str(vault.cache),
+            "--twelvedata-dir", str(sidecars["td_dir"]), "--tiingo-meta-dir", str(sidecars["meta_dir"]),
+            "--calendar-manifest", str(arch_cal), "--submissions", str(sidecars["subs"]),
+            "--issuers", str(sidecars["issuers"]), "--sic-map", str(sidecars["sic_map"]), "--unpinned-sic-map",
+            "--as-of-ts", SNAPSHOT.isoformat(), "--allow-holdout",
+            "--prereg-sha256", prereg, "--code-sha", CODE_SHA, "--out", str(tmp_path / "out_manifest_symlink"),
+        ])
+    for mock in traps2.values():
+        mock.assert_not_called()
+
+
+def test_pin_readiness_v9_stop_registration_open_gates_remain_unchanged(tmp_path):
+    from analysis import panel_insider_density_v9 as v9
+
+    assert v9.V8_STOP_HEAD_SHA256 is None
+    assert v9.V8_STOP_ANCHOR_LINE is None
+    assert v9.SECTORS_V6_STOP_HEAD_SHA256 is None
+    assert v9.SECTORS_V6_STOP_ANCHOR_LINE is None
+    assert v9.REGISTERED_RECORD_SHA256 is None
+    assert v9.REGISTERED_ANCHOR_LINE is None
+    assert v9.check_prereg() == v9.PREREG_BODY_SHA256
+    with pytest.raises(PermissionError):
+        v9.register(tmp_path / "reg", SNAPSHOT, CODE_SHA, v8_log_dir=tmp_path / "v8", vault_repo=tmp_path / "vault")
+    with pytest.raises(PermissionError):
+        v9.check_offhost(tmp_path / "vault")
+    with pytest.raises(PermissionError):
+        v9.append_stop_status(
+            tmp_path / "reg", SNAPSHOT, power_path=tmp_path / "p.json",
+            decision_ref="ref", expected_prev_sha256="0" * 64, witness=None,
+        )

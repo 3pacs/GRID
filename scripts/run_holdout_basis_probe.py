@@ -3,10 +3,11 @@
     python -m scripts.run_holdout_basis_probe \\
         --manifest PRICE_MANIFEST.json --log-dir REGISTRY_DIR --vault-repo VAULT_CLONE \\
         --twelvedata-dir HOLDOUT_TD_DIR --tiingo-meta-dir HOLDOUT_META_DIR \\
-        --calendar-manifest XNYS_MANIFEST.json --as-of-ts ISO_UTC \\
-        --allow-holdout --prereg-sha256 HEX64 --code-sha SHA --out NEW_DIR
+        [--calendar-manifest ARCHIVAL_XNYS_MANIFEST.json] --as-of-ts ISO_UTC \\
+        --allow-holdout --prereg-sha256 HEX64 [--code-sha SHA] --out NEW_DIR
 
 Refuses unless a witnessed ``discovery_frozen`` exists in ``--log-dir`` / ``--vault-repo``,
+canonical study-specific price-manifest and calendar pins are present and match,
 ``--as-of-ts`` is strictly later than ``discovery_frozen.run_at``, ``--allow-holdout`` is set,
 ``--prereg-sha256`` matches the registry, ``--out`` does not exist yet, the window lies inside
 ``2020-01-01 .. 2026-06-30``, and no Form 4 input is supplied.
@@ -61,8 +62,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vault-repo", required=True, help="local git repo to fetch the pinned vault main into")
     parser.add_argument("--twelvedata-dir", required=True, help="holdout-window TwelveData cache dir")
     parser.add_argument("--tiingo-meta-dir", required=True, help="holdout-window Tiingo metadata cache dir")
-    parser.add_argument("--calendar-manifest", required=True, help="pinned grid.xnys-session-manifest.v1 JSON")
-    parser.add_argument("--calendar-sha256", help="optional pinned sha256 of --calendar-manifest")
+    parser.add_argument(
+        "--calendar-manifest",
+        default=None,
+        help=(
+            "optional immutable archival path to grid.xnys-session-manifest.v1 JSON "
+            "(defaults to the study's canonical path; bytes are always re-hashed against the study pin)"
+        ),
+    )
+    parser.add_argument(
+        "--calendar-sha256",
+        help="optional assertion: if given, must equal the study's canonical pinned calendar sha256 (cannot override)",
+    )
     parser.add_argument("--as-of-ts", required=True, help="UTC snapshot instant (must be > discovery_frozen.run_at)")
     parser.add_argument("--allow-holdout", action="store_true", help="explicit authorization to read holdout basis")
     parser.add_argument("--prereg-sha256", required=True, help="pinned preregistration body sha256")
@@ -113,16 +124,18 @@ def main(argv: list[str] | None = None) -> None:
             raise hb.HoldoutProbeRefused(
                 f"--code-sha ({args.code_sha!r}) does not match computed running code SHA {code_sha}"
             )
-        manifest = hb.load_price_manifest(Path(args.manifest))
-        calendar = hb.load_calendar_manifest(Path(args.calendar_manifest), expected_sha256=args.calendar_sha256)
-        calendar.window_sessions(lo, hi)
-        proof = hb.verify_witnessed_discovery_frozen(
-            Path(args.log_dir), Path(args.vault_repo),
+        proof, manifest, calendar = hb.prepare_holdout_inputs(
+            Path(args.log_dir),
+            Path(args.vault_repo),
+            manifest_path=Path(args.manifest),
             prereg_sha256=args.prereg_sha256,
             snapshot_as_of_ts=snapshot,
             allow_holdout=bool(args.allow_holdout),
-            expected_manifest_digest=manifest.digest,
-            expected_manifest_file_sha256=manifest.file_sha256,
+            lo=lo,
+            hi=hi,
+            calendar_manifest_path=Path(args.calendar_manifest) if args.calendar_manifest else None,
+            calendar_sha256=args.calendar_sha256,
+            repo_root=REPO,
         )
         hb.check_submissions_not_form4(Path(args.submissions))
         issuers = _issuers(Path(args.issuers))
@@ -157,7 +170,7 @@ def main(argv: list[str] | None = None) -> None:
                 probe = hb.run_holdout_probe(
                     conn, manifest=manifest, calendar=calendar, lo=lo, hi=hi,
                     as_of_ts=snapshot, vendors=vendors, sec_names=sec_names,
-                    interval=interval, progress=progress,
+                    interval=interval, progress=progress, proof=proof,
                 )
         finally:
             engine.dispose()
@@ -166,7 +179,7 @@ def main(argv: list[str] | None = None) -> None:
             "manifest_file": Path(args.manifest).name,
             "manifest_file_sha256": manifest.file_sha256,
             "manifest_digest": manifest.digest,
-            "calendar_manifest": Path(args.calendar_manifest).name,
+            "calendar_manifest": calendar.path.name,
             "calendar_manifest_sha256": calendar.sha256,
             "twelvedata_fetch_log_sha256": fetch.fetch_log_sha256(Path(args.twelvedata_dir)),
             "tiingo_meta_fetch_log_sha256": fetch.fetch_log_sha256(Path(args.tiingo_meta_dir)),

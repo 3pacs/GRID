@@ -46,7 +46,10 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 import re
+import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -192,6 +195,7 @@ class CalendarManifest:
     end: date
     calendar_version: str
     sessions: tuple[date, ...]
+    verified_sha256: str | None = None
 
     def window_sessions(self, lo: date, hi: date) -> list[date]:
         check_holdout_window(lo, hi)
@@ -226,30 +230,68 @@ def _parse_iso_date(value: Any, label: str) -> date:
         raise HoldoutProbeRefused(f"invalid ISO date for {label}: {value!r}") from exc
 
 
-def load_calendar_manifest(path: Path, *, expected_sha256: str | None = None) -> CalendarManifest:
-    """Load and validate a pinned ``grid.xnys-session-manifest.v1`` calendar manifest."""
+def _unique_json_pairs(pairs: list[tuple[str, Any]], *, label: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, val in pairs:
+        if k in out:
+            raise HoldoutProbeRefused(f"duplicate JSON key {k!r} in {label}")
+        out[k] = val
+    return out
+
+
+def _reject_nonfinite_json(token: str) -> Any:
+    raise HoldoutProbeRefused(f"non-finite JSON constant {token!r} refused")
+
+
+def _read_regular_file_bytes(path: Path, *, label: str) -> tuple[Path, bytes]:
+    """Read raw bytes of a non-symlink regular file once (no TOCTOU)."""
     p = Path(path)
     if p.is_symlink():
-        raise HoldoutProbeRefused("calendar manifest symlink refused")
-    if not p.is_file():
-        raise HoldoutProbeRefused(f"calendar manifest not found: {p}")
-    raw = p.read_bytes()
-    sha = hashlib.sha256(raw).hexdigest()
-    if expected_sha256 is not None:
-        if not v1._is_hex64(expected_sha256) or sha != expected_sha256:
-            raise HoldoutProbeRefused("calendar manifest sha256 does not match the pinned hash")
+        raise HoldoutProbeRefused(f"{label} symlink refused")
+    try:
+        st = os.lstat(p)
+    except OSError as exc:
+        raise HoldoutProbeRefused(f"{label} not found: {p}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise HoldoutProbeRefused(f"{label} is not a regular file: {p}")
+    return p, p.read_bytes()
 
-    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for k, val in pairs:
-            if k in out:
-                raise HoldoutProbeRefused(f"duplicate JSON key {k!r} in calendar manifest")
-            out[k] = val
-        return out
+
+def _resolve_repo_relative_no_symlinks(repo_root: Path, rel: Path, *, label: str) -> Path:
+    cur = Path(repo_root)
+    for part in Path(rel).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise HoldoutProbeRefused(f"{label} path traverses a symlink: {cur}")
+    return cur
+
+
+def load_calendar_manifest(path: Path, *, expected_sha256: str | None = None) -> CalendarManifest:
+    """Load and validate a pinned ``grid.xnys-session-manifest.v1`` calendar manifest.
+
+    Fails closed before reading or parsing unless ``expected_sha256`` is a 64-hex SHA-256
+    digest matching the raw bytes of the immutable regular file at ``path``.
+    """
+    if not v1._is_hex64(expected_sha256):
+        raise HoldoutProbeRefused(
+            "calendar manifest requires a pinned 64-hex expected_sha256 digest"
+        )
+    p, raw = _read_regular_file_bytes(path, label="calendar manifest")
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha != expected_sha256:
+        raise HoldoutProbeRefused(
+            f"calendar manifest sha256 ({sha}) does not match the pinned hash ({expected_sha256})"
+        )
 
     try:
-        doc = json.loads(raw, object_pairs_hook=unique_pairs)
-    except ValueError as exc:
+        doc = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=lambda pairs: _unique_json_pairs(pairs, label="calendar manifest"),
+            parse_constant=_reject_nonfinite_json,
+        )
+    except HoldoutProbeRefused:
+        raise
+    except (UnicodeDecodeError, ValueError) as exc:
         raise HoldoutProbeRefused(f"calendar manifest is not valid JSON: {exc}") from exc
 
     required = {"schema", "exchange", "session_type", "timezone", "start", "end", "calendar_version", "sessions"}
@@ -295,7 +337,13 @@ def load_calendar_manifest(path: Path, *, expected_sha256: str | None = None) ->
         sessions.append(day)
         last_day = day
     return CalendarManifest(
-        path=p, sha256=sha, start=begin, end=finish, calendar_version=cal_ver, sessions=tuple(sessions)
+        path=p,
+        sha256=sha,
+        start=begin,
+        end=finish,
+        calendar_version=cal_ver,
+        sessions=tuple(sessions),
+        verified_sha256=expected_sha256,
     )
 
 
@@ -337,14 +385,36 @@ def _manifest_digest(raw: Mapping[str, Any]) -> str:
     return digest(payload)
 
 
-def load_price_manifest(path: Path) -> PriceManifestInfo:
-    """Load and validate the frozen discovery price manifest."""
-    p = Path(path)
-    if not p.is_file():
-        raise HoldoutProbeRefused(f"price manifest not found: {p}")
+def load_price_manifest(
+    path: Path,
+    *,
+    expected_digest: str | None = None,
+    expected_file_sha256: str | None = None,
+    expected_sha256: str | None = None,
+) -> PriceManifestInfo:
+    """Load and validate the frozen discovery price manifest (with optional cryptographic pin checks)."""
+    for label, val in (
+        ("expected_digest", expected_digest),
+        ("expected_file_sha256", expected_file_sha256),
+        ("expected_sha256", expected_sha256),
+    ):
+        if val is not None and not v1._is_hex64(val):
+            raise HoldoutProbeRefused(f"price manifest {label} must be a 64-character hex sha256 digest")
+    p, raw_bytes = _read_regular_file_bytes(path, label="price manifest")
+    file_sha = hashlib.sha256(raw_bytes).hexdigest()
+    if expected_file_sha256 is not None and file_sha != expected_file_sha256:
+        raise HoldoutProbeRefused(
+            f"price manifest file sha256 ({file_sha}) does not match the pinned hash ({expected_file_sha256})"
+        )
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except ValueError as exc:
+        raw = json.loads(
+            raw_bytes.decode("utf-8"),
+            object_pairs_hook=lambda pairs: _unique_json_pairs(pairs, label="price manifest"),
+            parse_constant=_reject_nonfinite_json,
+        )
+    except HoldoutProbeRefused:
+        raise
+    except (UnicodeDecodeError, ValueError) as exc:
         raise HoldoutProbeRefused(f"price manifest is not valid JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise HoldoutProbeRefused("price manifest must be a JSON object")
@@ -376,10 +446,17 @@ def load_price_manifest(path: Path) -> PriceManifestInfo:
             raise HoldoutProbeRefused(f"price manifest listed_from names non-admitted ticker {sym!r}")
         parsed = _parse_iso_date(str(d)[:10], f"listed_from[{sym}]")
         listed_from[sym] = parsed.isoformat()
+    manifest_digest = _manifest_digest(raw)
+    if expected_digest is not None and manifest_digest != expected_digest:
+        raise HoldoutProbeRefused(
+            f"price manifest digest ({manifest_digest}) does not match the pinned hash ({expected_digest})"
+        )
+    if expected_sha256 is not None and expected_sha256 not in {manifest_digest, file_sha}:
+        raise HoldoutProbeRefused("price manifest does not match the pinned price_manifest_sha256")
     return PriceManifestInfo(
         path=p,
-        file_sha256=gd4.file_sha256(p),
-        digest=_manifest_digest(raw),
+        file_sha256=file_sha,
+        digest=manifest_digest,
         source=source.strip().upper(),
         series_template=SERIES_TEMPLATE,
         basis=BASIS,
@@ -388,6 +465,130 @@ def load_price_manifest(path: Path) -> PriceManifestInfo:
         listed_from=dict(sorted(listed_from.items())),
         raw=raw,
     )
+
+
+# --- canonical study-specific pins -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StudyPins:
+    """Canonical study-specific pins resolved from the study's code module."""
+
+    study: str
+    prereg_body_sha256: str
+    calendar_manifest_path: Path
+    calendar_manifest_relpath: str
+    calendar_manifest_sha256: str
+    registered_record_sha256: tuple[str, str] | None = None
+    registered_anchor_line: bytes | None = None
+    requires_registration_pins: bool = False
+    probe_report_sha256: str | None = None
+    crosscheck_report_sha256: str | None = None
+    tiingo_meta_report_sha256: str | None = None
+    requires_manifest_calendar_pin: bool = False
+    price_manifest_sha256: str | None = None
+
+
+def resolve_study_pins(study: str, *, repo_root: Path = v2.REPO) -> StudyPins:
+    """Resolve mandatory canonical study-specific pins from the study's code constants.
+
+    Fails closed unless the study module exists and carries valid 64-hex canonical pins for
+    its preregistration body, XNYS calendar manifest, and any study-declared probe/manifest
+    or registration pins.
+    """
+    mod = _load_study_module(study)
+    if mod is None:
+        raise HoldoutProbeRefused(f"no canonical study module found for {study!r}")
+    pinned_body = getattr(mod, "PREREG_BODY_SHA256", None)
+    if not v1._is_hex64(pinned_body):
+        raise HoldoutProbeRefused(f"study {study!r} lacks a valid canonical PREREG_BODY_SHA256 pin")
+
+    cal_rel = getattr(mod, "XNYS_MANIFEST_PATH", None)
+    cal_sha = getattr(mod, "XNYS_MANIFEST_SHA256", None)
+    if cal_rel is None or not str(cal_rel).strip() or not v1._is_hex64(cal_sha):
+        raise HoldoutProbeRefused(
+            f"study {study!r} lacks a canonical pinned XNYS calendar manifest/sha256"
+        )
+    cal_rel_path = Path(cal_rel)
+    cal_path = cal_rel_path if cal_rel_path.is_absolute() else Path(repo_root) / cal_rel_path
+
+    probe_pins: dict[str, str | None] = {}
+    for attr in ("PROBE_REPORT_SHA256", "CROSSCHECK_REPORT_SHA256", "TIINGO_META_REPORT_SHA256"):
+        if hasattr(mod, attr):
+            val = getattr(mod, attr)
+            if not v1._is_hex64(val) or "PLACEHOLDER" in str(val):
+                raise HoldoutProbeRefused(
+                    f"study {study!r} canonical pin {attr} is unbound or invalid"
+                )
+            probe_pins[attr] = val
+        else:
+            probe_pins[attr] = None
+
+    price_manifest_pin: str | None = None
+    if hasattr(mod, "PRICE_MANIFEST_SHA256"):
+        val = getattr(mod, "PRICE_MANIFEST_SHA256")
+        if not v1._is_hex64(val) or "PLACEHOLDER" in str(val):
+            raise HoldoutProbeRefused(
+                f"study {study!r} canonical pin PRICE_MANIFEST_SHA256 is unbound or invalid"
+            )
+        price_manifest_pin = val
+
+    pm_cls = getattr(mod, "PriceManifest", None)
+    pm_fields = getattr(pm_cls, "__dataclass_fields__", None) or {}
+    requires_manifest_cal = "calendar_manifest_sha256" in pm_fields
+
+    has_reg_attrs = hasattr(mod, "REGISTERED_RECORD_SHA256") or hasattr(mod, "REGISTERED_ANCHOR_LINE")
+    pinned_recs = getattr(mod, "REGISTERED_RECORD_SHA256", None)
+    pinned_anchor = getattr(mod, "REGISTERED_ANCHOR_LINE", None)
+    if has_reg_attrs and (pinned_recs is None or pinned_anchor is None):
+        raise HoldoutProbeRefused(
+            f"study {study!r} registration pins (REGISTERED_RECORD_SHA256 / REGISTERED_ANCHOR_LINE) are not bound"
+        )
+
+    return StudyPins(
+        study=study,
+        prereg_body_sha256=pinned_body,
+        calendar_manifest_path=cal_path,
+        calendar_manifest_relpath=cal_rel_path.as_posix(),
+        calendar_manifest_sha256=cal_sha,
+        registered_record_sha256=tuple(pinned_recs) if pinned_recs is not None else None,
+        registered_anchor_line=pinned_anchor,
+        requires_registration_pins=has_reg_attrs,
+        probe_report_sha256=probe_pins["PROBE_REPORT_SHA256"],
+        crosscheck_report_sha256=probe_pins["CROSSCHECK_REPORT_SHA256"],
+        tiingo_meta_report_sha256=probe_pins["TIINGO_META_REPORT_SHA256"],
+        requires_manifest_calendar_pin=requires_manifest_cal,
+        price_manifest_sha256=price_manifest_pin,
+    )
+
+
+def verify_manifest_against_study_pins(manifest: PriceManifestInfo, pins: StudyPins) -> None:
+    """Enforce a study's canonical probe-report, calendar, and manifest pins against a price manifest."""
+    raw = manifest.raw
+    for field_name, pinned in (
+        ("probe_report_sha256", pins.probe_report_sha256),
+        ("crosscheck_report_sha256", pins.crosscheck_report_sha256),
+        ("tiingo_meta_report_sha256", pins.tiingo_meta_report_sha256),
+    ):
+        if pinned is not None and raw.get(field_name) != pinned:
+            raise HoldoutProbeRefused(
+                f"price manifest {field_name} does not match the canonical {pins.study} pin"
+            )
+    if pins.requires_manifest_calendar_pin:
+        if raw.get("calendar_manifest") != pins.calendar_manifest_relpath:
+            raise HoldoutProbeRefused(
+                f"price manifest calendar_manifest does not match canonical {pins.study} path "
+                f"{pins.calendar_manifest_relpath!r}"
+            )
+        if raw.get("calendar_manifest_sha256") != pins.calendar_manifest_sha256:
+            raise HoldoutProbeRefused(
+                f"price manifest calendar_manifest_sha256 does not match the canonical {pins.study} pin"
+            )
+    if pins.price_manifest_sha256 is not None:
+        if pins.price_manifest_sha256 not in {manifest.digest, manifest.file_sha256}:
+            raise HoldoutProbeRefused(
+                f"price manifest does not match the canonical {pins.study} PRICE_MANIFEST_SHA256 pin"
+            )
 
 
 # --- witnessed discovery_frozen custody gate -------------------------------------------------------
@@ -408,7 +609,9 @@ class DiscoveryFrozenProof:
     witness_tip: str
     witness_path: str
     inputs_frozen_sha256: str
-    price_manifest_sha256: str | None
+    price_manifest_sha256: str
+    calendar_manifest_sha256: str = ""
+    calendar_manifest_path: str = ""
 
 
 def _registry_id(study: str) -> str:
@@ -456,30 +659,15 @@ def _locate_registry_log(log_dir: Path) -> Path:
     return candidates[0]
 
 
-def verify_witnessed_discovery_frozen(
+def _verify_local_registry_for_holdout(
     log_dir: Path,
-    vault_repo: Path,
     *,
     prereg_sha256: str,
     snapshot_as_of_ts: datetime,
     allow_holdout: bool,
-    remote_url: str | None = None,
-    expected_manifest_digest: str | None = None,
-    expected_manifest_file_sha256: str | None = None,
-) -> DiscoveryFrozenProof:
-    """Verify explicit holdout authorization, prereg pin, witnessed ``discovery_frozen``, and snapshot time.
-
-    Refuses unless:
-    1. ``allow_holdout is True``;
-    2. ``prereg_sha256`` is a 64-hex digest matching the registry's header, preregistration, and
-       ``discovery_frozen`` records;
-    3. ``snapshot_as_of_ts`` is timezone-aware and strictly later than ``discovery_frozen.run_at``;
-    4. the local hash chain is intact, carries no terminal STOP or prior ``holdout_result``, and holds
-       exactly one ``discovery_frozen`` record;
-    5. the off-host witness on the pinned vault ``main`` is append-only, matches the local chain, and
-       already covers the ``discovery_frozen`` record (plus every prior ``prices_read`` witness tip);
-    6. when a discovery manifest digest/sha is supplied, it matches the discovery's ``inputs_frozen`` record.
-    """
+    repo_root: Path = v2.REPO,
+) -> dict[str, Any]:
+    """Verify local chain, ``discovery_frozen``, mandatory ``inputs_frozen`` manifest pin, and study pins."""
     if allow_holdout is not True:
         raise HoldoutProbeRefused("holdout basis probe requires explicit --allow-holdout (allow_holdout=True)")
     if not v1._is_hex64(prereg_sha256):
@@ -526,18 +714,12 @@ def verify_witnessed_discovery_frozen(
     if not local_anchors:
         raise HoldoutProbeRefused("registry anchor file is empty")
 
-    # If the study version has a pinned code module, enforce its pinned prereg hash and registration.
+    # Enforce study prereg hash immediately so prereg mismatch fails with a clear message.
     mod = _load_study_module(study)
     if mod is not None:
         pinned_body = getattr(mod, "PREREG_BODY_SHA256", None)
         if pinned_body is not None and prereg_sha256 != pinned_body:
             raise HoldoutProbeRefused(f"prereg_sha256 does not match the pinned {study} PREREG_BODY_SHA256")
-        pinned_recs = getattr(mod, "REGISTERED_RECORD_SHA256", None)
-        if pinned_recs is not None and tuple(line_hashes[:2]) != tuple(pinned_recs):
-            raise HoldoutProbeRefused(f"registry does not match the pinned {study} registration")
-        pinned_anchor = getattr(mod, "REGISTERED_ANCHOR_LINE", None)
-        if pinned_anchor is not None and local_anchors[0] != pinned_anchor:
-            raise HoldoutProbeRefused(f"registry anchor does not match the pinned {study} anchor line")
 
     if v1._kind(records, "status"):
         raise HoldoutProbeRefused(f"{study} registry carries a terminal STOP status record")
@@ -567,14 +749,77 @@ def verify_witnessed_discovery_frozen(
     matched_inputs = [r for r in v1._kind(records, "inputs_frozen") if v1._record_sha256(r) == inputs_sha]
     if len(matched_inputs) != 1:
         raise HoldoutProbeRefused("discovery_frozen does not name a single inputs_frozen record of this chain")
-    frozen_manifest_sha = (matched_inputs[0].get("inputs") or {}).get("price_manifest_sha256")
-    if frozen_manifest_sha and (expected_manifest_digest or expected_manifest_file_sha256):
-        if frozen_manifest_sha not in {expected_manifest_digest, expected_manifest_file_sha256}:
-            raise HoldoutProbeRefused(
-                "supplied --manifest does not match the discovery's inputs_frozen price_manifest_sha256"
-            )
+    frozen_inputs = matched_inputs[0].get("inputs")
+    if not isinstance(frozen_inputs, Mapping):
+        raise HoldoutProbeRefused("discovery inputs_frozen record lacks an inputs mapping")
+    frozen_manifest_sha = frozen_inputs.get("price_manifest_sha256")
+    if not v1._is_hex64(frozen_manifest_sha):
+        raise HoldoutProbeRefused(
+            f"{study} discovery inputs_frozen lacks a valid canonical price_manifest_sha256 pin"
+        )
 
-    # Off-host witness verification (vault main must witness discovery_frozen, append-only)
+    # Require canonical study-specific pins from the study's code module (never optional).
+    pins = resolve_study_pins(study, repo_root=repo_root)
+    if prereg_sha256 != pins.prereg_body_sha256:
+        raise HoldoutProbeRefused(f"prereg_sha256 does not match the pinned {study} PREREG_BODY_SHA256")
+    if pins.registered_record_sha256 is not None and tuple(line_hashes[:2]) != pins.registered_record_sha256:
+        raise HoldoutProbeRefused(f"registry does not match the pinned {study} registration")
+    if pins.registered_anchor_line is not None and local_anchors[0] != pins.registered_anchor_line:
+        raise HoldoutProbeRefused(f"registry anchor does not match the pinned {study} anchor line")
+    frozen_probe_sha = frozen_inputs.get("probe_report_sha256")
+    if pins.probe_report_sha256 is not None:
+        if not v1._is_hex64(frozen_probe_sha) or frozen_probe_sha != pins.probe_report_sha256:
+            raise HoldoutProbeRefused(
+                f"{study} discovery inputs_frozen probe_report_sha256 does not match the canonical study pin"
+            )
+    frozen_manifest_file_sha = frozen_inputs.get("price_manifest_file_sha256")
+    if frozen_manifest_file_sha is not None and not v1._is_hex64(frozen_manifest_file_sha):
+        raise HoldoutProbeRefused(
+            f"{study} discovery inputs_frozen price_manifest_file_sha256 is malformed"
+        )
+
+    return {
+        "log": log,
+        "records": records,
+        "local_anchors": local_anchors,
+        "study": study,
+        "witness_path": witness_path,
+        "frozen_rec": frozen_rec,
+        "frozen_position": frozen_position,
+        "frozen_sha256": frozen_sha256,
+        "frozen_run_at_raw": frozen_run_at_raw,
+        "frozen_run_at": frozen_run_at,
+        "inputs_sha": inputs_sha,
+        "frozen_inputs": frozen_inputs,
+        "frozen_manifest_sha": frozen_manifest_sha,
+        "frozen_manifest_file_sha": frozen_manifest_file_sha,
+        "frozen_probe_sha": frozen_probe_sha,
+        "pins": pins,
+    }
+
+
+def _verify_offhost_witness_for_holdout(
+    local: Mapping[str, Any],
+    vault_repo: Path,
+    *,
+    prereg_sha256: str,
+    remote_url: str | None = None,
+) -> DiscoveryFrozenProof:
+    """Verify the off-host witness on vault ``main`` covers ``discovery_frozen`` and all ``prices_read`` tips."""
+    log = local["log"]
+    records = local["records"]
+    local_anchors = local["local_anchors"]
+    study = local["study"]
+    witness_path = local["witness_path"]
+    frozen_rec = local["frozen_rec"]
+    frozen_position = local["frozen_position"]
+    frozen_sha256 = local["frozen_sha256"]
+    frozen_run_at_raw = local["frozen_run_at_raw"]
+    frozen_run_at = local["frozen_run_at"]
+    inputs_sha = local["inputs_sha"]
+    frozen_manifest_sha = local["frozen_manifest_sha"]
+    pins: StudyPins = local["pins"]
+
     url = v1.WITNESS_REMOTE_URL if remote_url is None else remote_url
     repo = Path(vault_repo)
     witness_ref = f"refs/{study}-holdout-witness/main"
@@ -609,7 +854,6 @@ def verify_witnessed_discovery_frozen(
             f"off-host witness covers {covered} records; discovery_frozen at record {frozen_position} "
             f"must be witnessed on {v1.WITNESS_BRANCH}:{witness_path} first"
         )
-    import subprocess
     for record in v1._kind(records, "prices_read"):
         wtip = record.get("witness_tip")
         if wtip:
@@ -635,7 +879,187 @@ def verify_witnessed_discovery_frozen(
         witness_path=witness_path,
         inputs_frozen_sha256=inputs_sha,
         price_manifest_sha256=frozen_manifest_sha,
+        calendar_manifest_sha256=pins.calendar_manifest_sha256,
+        calendar_manifest_path=pins.calendar_manifest_relpath,
     )
+
+
+def verify_witnessed_discovery_frozen(
+    log_dir: Path,
+    vault_repo: Path,
+    *,
+    prereg_sha256: str,
+    snapshot_as_of_ts: datetime,
+    allow_holdout: bool,
+    remote_url: str | None = None,
+    expected_manifest_digest: str | None = None,
+    expected_manifest_file_sha256: str | None = None,
+    manifest: PriceManifestInfo | None = None,
+    calendar: CalendarManifest | None = None,
+    calendar_sha256: str | None = None,
+    repo_root: Path = v2.REPO,
+) -> DiscoveryFrozenProof:
+    """Verify explicit holdout authorization, prereg pin, canonical study pins, witnessed
+    ``discovery_frozen``, mandatory frozen price-manifest pin match, and snapshot time.
+
+    Refuses unless:
+    1. ``allow_holdout is True``;
+    2. ``prereg_sha256`` is a 64-hex digest matching the registry's header, preregistration,
+       ``discovery_frozen`` record, and canonical study module pin;
+    3. ``snapshot_as_of_ts`` is timezone-aware and strictly later than ``discovery_frozen.run_at``;
+    4. the local hash chain is intact, carries no terminal STOP or prior ``holdout_result``, and
+       holds exactly one ``discovery_frozen`` record;
+    5. the study's canonical code pins (registration, calendar digest, and any bound probe pins)
+       are present and valid, and ``inputs_frozen`` carries a valid 64-hex ``price_manifest_sha256``
+       that matches the caller's mandatory supplied manifest digest/sha256;
+    6. the off-host witness on the pinned vault ``main`` is append-only, matches the local chain,
+       and already covers the ``discovery_frozen`` record (plus every prior ``prices_read`` tip).
+    """
+    local = _verify_local_registry_for_holdout(
+        log_dir,
+        prereg_sha256=prereg_sha256,
+        snapshot_as_of_ts=snapshot_as_of_ts,
+        allow_holdout=allow_holdout,
+        repo_root=repo_root,
+    )
+    pins: StudyPins = local["pins"]
+    frozen_manifest_sha: str = local["frozen_manifest_sha"]
+    frozen_manifest_file_sha: str | None = local["frozen_manifest_file_sha"]
+    frozen_probe_sha: str | None = local["frozen_probe_sha"]
+
+    if manifest is not None:
+        if not isinstance(manifest, PriceManifestInfo):
+            raise HoldoutProbeRefused("manifest must be a PriceManifestInfo")
+        if expected_manifest_digest is None:
+            expected_manifest_digest = manifest.digest
+        elif expected_manifest_digest != manifest.digest:
+            raise HoldoutProbeRefused("expected_manifest_digest disagrees with loaded manifest")
+        if expected_manifest_file_sha256 is None:
+            expected_manifest_file_sha256 = manifest.file_sha256
+        elif expected_manifest_file_sha256 != manifest.file_sha256:
+            raise HoldoutProbeRefused("expected_manifest_file_sha256 disagrees with loaded manifest")
+
+    supplied_hashes: set[str] = set()
+    if expected_manifest_digest is not None:
+        if not v1._is_hex64(expected_manifest_digest):
+            raise HoldoutProbeRefused("expected_manifest_digest must be a 64-character hex sha256 digest")
+        supplied_hashes.add(expected_manifest_digest)
+    if expected_manifest_file_sha256 is not None:
+        if not v1._is_hex64(expected_manifest_file_sha256):
+            raise HoldoutProbeRefused("expected_manifest_file_sha256 must be a 64-character hex sha256 digest")
+        supplied_hashes.add(expected_manifest_file_sha256)
+    if not supplied_hashes:
+        raise HoldoutProbeRefused(
+            "verify_witnessed_discovery_frozen requires expected_manifest_digest or expected_manifest_file_sha256"
+        )
+    if frozen_manifest_sha not in supplied_hashes:
+        raise HoldoutProbeRefused(
+            "supplied --manifest does not match the discovery's inputs_frozen price_manifest_sha256"
+        )
+    if frozen_manifest_file_sha is not None and expected_manifest_file_sha256 != frozen_manifest_file_sha:
+        raise HoldoutProbeRefused(
+            "supplied --manifest file bytes do not match inputs_frozen price_manifest_file_sha256"
+        )
+    if pins.price_manifest_sha256 is not None and pins.price_manifest_sha256 not in supplied_hashes:
+        raise HoldoutProbeRefused(
+            f"supplied --manifest does not match the canonical {pins.study} PRICE_MANIFEST_SHA256 pin"
+        )
+    if manifest is not None:
+        verify_manifest_against_study_pins(manifest, pins)
+        if v1._is_hex64(frozen_probe_sha) and manifest.raw.get("probe_report_sha256") != frozen_probe_sha:
+            raise HoldoutProbeRefused(
+                "supplied --manifest probe_report_sha256 does not match the discovery's inputs_frozen"
+            )
+
+    if calendar is not None:
+        if not isinstance(calendar, CalendarManifest) or calendar.verified_sha256 != calendar.sha256:
+            raise HoldoutProbeRefused("calendar manifest was not verified against a pinned sha256 digest")
+        if calendar.sha256 != pins.calendar_manifest_sha256:
+            raise HoldoutProbeRefused(
+                f"calendar manifest sha256 ({calendar.sha256}) does not match the canonical "
+                f"{pins.study} pin ({pins.calendar_manifest_sha256})"
+            )
+    if calendar_sha256 is not None:
+        if not v1._is_hex64(calendar_sha256) or calendar_sha256 != pins.calendar_manifest_sha256:
+            raise HoldoutProbeRefused(
+                f"calendar_sha256 ({calendar_sha256!r}) does not match the canonical "
+                f"{pins.study} pin ({pins.calendar_manifest_sha256})"
+            )
+
+    return _verify_offhost_witness_for_holdout(
+        local, vault_repo, prereg_sha256=prereg_sha256, remote_url=remote_url,
+    )
+
+
+def prepare_holdout_inputs(
+    log_dir: Path,
+    vault_repo: Path,
+    *,
+    manifest_path: Path,
+    prereg_sha256: str,
+    snapshot_as_of_ts: datetime,
+    allow_holdout: bool,
+    lo: date = HOLDOUT_START,
+    hi: date = HOLDOUT_END,
+    calendar_manifest_path: Path | None = None,
+    calendar_sha256: str | None = None,
+    repo_root: Path = v2.REPO,
+    remote_url: str | None = None,
+) -> tuple[DiscoveryFrozenProof, PriceManifestInfo, CalendarManifest]:
+    """Fail-closed readiness gate: verify canonical study pins, calendar, manifest, and witness before loading.
+
+    Resolves all canonical pins from the study's code constants and witnessed ``inputs_frozen``
+    record first. An explicit ``calendar_manifest_path`` or ``manifest_path`` is treated as an
+    immutable archival artifact whose bytes are re-hashed and compared against those same
+    canonical pins; caller arguments can never weaken or override canonical pins.
+    """
+    check_holdout_window(lo, hi)
+    local = _verify_local_registry_for_holdout(
+        log_dir,
+        prereg_sha256=prereg_sha256,
+        snapshot_as_of_ts=snapshot_as_of_ts,
+        allow_holdout=allow_holdout,
+        repo_root=repo_root,
+    )
+    pins: StudyPins = local["pins"]
+    frozen_manifest_sha: str = local["frozen_manifest_sha"]
+    frozen_manifest_file_sha: str | None = local["frozen_manifest_file_sha"]
+    frozen_probe_sha: str | None = local["frozen_probe_sha"]
+
+    if calendar_sha256 is not None:
+        if not v1._is_hex64(calendar_sha256) or calendar_sha256 != pins.calendar_manifest_sha256:
+            raise HoldoutProbeRefused(
+                f"--calendar-sha256 ({calendar_sha256!r}) does not match the canonical "
+                f"{pins.study} XNYS_MANIFEST_SHA256 pin ({pins.calendar_manifest_sha256})"
+            )
+
+    if calendar_manifest_path is not None:
+        cal_target = Path(calendar_manifest_path)
+    else:
+        cal_rel = Path(pins.calendar_manifest_relpath)
+        cal_target = (
+            cal_rel
+            if cal_rel.is_absolute()
+            else _resolve_repo_relative_no_symlinks(repo_root, cal_rel, label="calendar manifest")
+        )
+    calendar = load_calendar_manifest(cal_target, expected_sha256=pins.calendar_manifest_sha256)
+    calendar.window_sessions(lo, hi)
+
+    manifest = load_price_manifest(
+        Path(manifest_path),
+        expected_sha256=frozen_manifest_sha,
+        expected_file_sha256=frozen_manifest_file_sha,
+    )
+    verify_manifest_against_study_pins(manifest, pins)
+    if v1._is_hex64(frozen_probe_sha) and manifest.raw.get("probe_report_sha256") != frozen_probe_sha:
+        raise HoldoutProbeRefused(
+            "supplied --manifest probe_report_sha256 does not match the discovery's inputs_frozen"
+        )
+
+    proof = _verify_offhost_witness_for_holdout(
+        local, vault_repo, prereg_sha256=prereg_sha256, remote_url=remote_url,
+    )
+    return proof, manifest, calendar
 
 
 # --- C1 submissions loader (rejects Form 4 transaction tables) -------------------------------------
@@ -1272,6 +1696,8 @@ def run_holdout_probe(
     sec_names: Mapping[str, str] | None = None,
     interval: gd4.C1Interval | None = None,
     progress=None,
+    proof: DiscoveryFrozenProof | None = None,
+    study: str | None = None,
     **forbidden: Any,
 ) -> dict[str, Any]:
     """Run holdout basis checks for tickers in ``manifest.admitted`` plus the XLK magnitudes check."""
@@ -1279,6 +1705,31 @@ def run_holdout_probe(
     if forbidden:
         raise TypeError(f"unexpected keyword arguments: {sorted(forbidden)}")
     check_holdout_window(lo, hi)
+    if not isinstance(calendar, CalendarManifest) or not v1._is_hex64(calendar.sha256):
+        raise HoldoutProbeRefused("calendar manifest lacks a valid sha256 digest")
+    if calendar.verified_sha256 != calendar.sha256:
+        raise HoldoutProbeRefused(
+            "calendar manifest was not verified against a pinned sha256 digest"
+        )
+    if (
+        not isinstance(manifest, PriceManifestInfo)
+        or not v1._is_hex64(manifest.digest)
+        or not v1._is_hex64(manifest.file_sha256)
+    ):
+        raise HoldoutProbeRefused("price manifest lacks a valid sha256 digest")
+    if proof is not None:
+        if not v1._is_hex64(proof.price_manifest_sha256) or proof.price_manifest_sha256 not in {
+            manifest.digest,
+            manifest.file_sha256,
+        }:
+            raise HoldoutProbeRefused("price manifest does not match the verified discovery_frozen proof")
+        if not v1._is_hex64(proof.calendar_manifest_sha256) or calendar.sha256 != proof.calendar_manifest_sha256:
+            raise HoldoutProbeRefused("calendar manifest does not match the verified discovery_frozen proof")
+    if study is not None:
+        pins = resolve_study_pins(study)
+        if calendar.sha256 != pins.calendar_manifest_sha256:
+            raise HoldoutProbeRefused(f"calendar manifest does not match the canonical {study} pin")
+        verify_manifest_against_study_pins(manifest, pins)
     check_source(manifest.source)
     benchmark = manifest.benchmark
     if benchmark != BENCHMARK:
