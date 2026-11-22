@@ -31,10 +31,15 @@ Reach labels:
   - #1373 briefing-diary
   - #1370 ingest-integrity
   - #1366 thesis-models
-- **Codex HOLDs on three of those**, closed forward in follow-up branches:
-  - #1373 → `claude/fp-publication-guard-binding-20261122`
-  - #1370 → `claude/fp-ingest-validation-20261122`
-  - #1366 → `claude/fp-thesis-asof-20261122`
+- **Codex HOLDs on three of those**, closed forward in follow-up draft PRs:
+  - #1373 → #1386. It includes the `auto_regime.py` producer binding that the guard depends on.
+  - #1370 → #1384.
+  - #1366 → #1382.
+- **Codex HOLDs on unmerged drafts**, fixed on their own branches:
+  - #1369 (13F share-based flows, VIX/VIX3M same date);
+  - #1375 (mandatory probe pins);
+  - #1378 (v9 lock held through the append);
+  - #1358 (this ledger's wording).
 - **Still draft:** every other slice.
 
 ## Scoreboard context
