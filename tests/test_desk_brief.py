@@ -465,11 +465,11 @@ def test_sources_config_is_valid():
 
 # ── factory slots (panel-factory/1) ──────────────────────────────────────────
 
-def _panel(tmp_path, slots, generated_at="2026-11-21T03:19:00+00:00"):
+def _panel(tmp_path, slots, generated_at="2026-11-21T03:19:00+00:00", **block):
     p = tmp_path / "panel.json"
     p.write_text(json.dumps({"generated_at": generated_at, "factory": {
         "version": "panel-factory/1", "status": "ok", "family": {"k": 10, "used": 0},
-        "features": {"z_history_have_min": 1, "z_history_needed": 60}, "slots": slots}}))
+        "features": {"z_history_have_min": 1, "z_history_needed": 60}, "slots": slots, **block}}))
     db = tmp_path / "signals.db"
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE factory_fires (trial_id TEXT, day TEXT, decision TEXT, z REAL, fired INTEGER, side INTEGER, "
@@ -515,3 +515,47 @@ def test_slot_fire_after_clock_not_shown(tmp_path):
     panel, db = _panel(tmp_path, slots)
     sec, trials = S.factory_slots(panel, db, "pre_open", SESSION, PRE)
     assert trials[0].today is None and trials[0].withheld is None    # recorded 19:00Z, after 09:00 ET
+
+
+def _slot(tid, state, **kw):
+    return {"trial_id": tid, "name": tid, "state": state, "resolved_fires": 100, "min_n": 100, **kw}
+
+
+def test_slot_states_never_read_as_a_plain_pass(tmp_path):
+    slots = [_slot("p", "pass", citable=True), _slot("r", "retirement_check_due", citable=False),
+             _slot("l", "lapsed", citable=False), _slot("d", "look_due", citable=False),
+             _slot("u", "underpowered_due", resolved_fires=40, citable=False)]
+    panel, db = _panel(tmp_path, slots)
+    _, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    lab = {t.trial_id: t.card(POST)["label"] for t in trials}
+    st = {t.trial_id: t.status for t in trials}
+    assert lab["p"].startswith("citable per its owner's record")
+    assert lab["r"] == "passed, re-check owed; not citable"
+    assert lab["l"] == "passed, then lapsed; not citable"
+    assert lab["d"] == "unproven, 100 of 100; sample requirement met, validation pending"
+    assert st["d"] == "look due: the owner runs the one look"
+    assert lab["u"] == "unproven, 40 of 100" and "owner's look is owed" in st["u"]
+
+
+def test_citable_only_for_pass(tmp_path):
+    panel, db = _panel(tmp_path, [_slot("x", "retirement_check_due", citable=True)])
+    _, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert not trials[0].citable and "re-check owed" in trials[0].card(POST)["label"]
+
+
+def test_panel_factory_2_and_calendar_exhausted(tmp_path):
+    slots = [_slot("p", "pass", citable=True, citable_withheld="the calendar ended; re-pin first")]
+    panel, db = _panel(tmp_path, slots, version="panel-factory/2", status="calendar_exhausted",
+                       calendar={"first_day": "2026-11-11", "last_day": "2027-12-31", "exhausted": True})
+    sec, trials = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert sec.status == "ok"
+    assert "calendar ended 2027-12-31: nothing recorded since, nothing citable" in sec.lines
+    assert any("calendar ended 2027-12-31" in p for p in sec.problems)
+    assert not trials[0].citable
+    assert trials[0].card(POST)["label"] == "passed its look; not citable (the calendar ended; re-pin first)"
+
+
+def test_factory_block_error_is_a_problem(tmp_path):
+    panel, db = _panel(tmp_path, [], status="error", error="signals.db locked")
+    sec, _ = S.factory_slots(panel, db, "post_close", SESSION, POST)
+    assert sec.problems == ("factory block status error: signals.db locked",)
