@@ -23,11 +23,12 @@ default path Yahoo serves only fallbacks; here it serves every non-core name
   840 s window) gets a smaller budget sized to the time left when the Yahoo
   names begin (``yahoo_budget_for_window``); the caller's time budget can still
   end a run sooner;
-* a full default-universe run starts its Yahoo names after the last one the
-  previous run of the same writer finished, wrapping around (``TailCursor``,
-  a 0600 file per writer in GRID's state directory, keyed by the universe and
-  failing open), so budget-limited runs cover the whole list between them
-  instead of re-reading its first names (2026-11-21);
+* a full default-universe run reads first the Yahoo names its cycle has not
+  covered yet, starting alphabetically after the last one the previous run of
+  the same writer finished and wrapping around (``TailCursor``, a 0600 file
+  per writer in GRID's state directory, failing open), so budget-limited runs
+  cover the whole list between them instead of re-reading its first names,
+  even while the catalyst list changes (2026-11-21);
 * a 429 latches for the run: the remaining expiries of that ticker are not
   requested (its capture is refused as incomplete) and the next non-core name
   stops the run (``OptionsSourceStopped("yahoo", 429)``);
@@ -52,7 +53,8 @@ source freshness moves again (review of #1299, item 6; owner's word relayed
 within ``MIN_RUN_GAP_SECONDS`` does not read the core, so completeness is
 judged over the session: a name captured by an earlier run of the same writer
 on the same New York session day counts, and the run that completes that cycle
-publishes freshness (``TailCursor.covered``). A partial cycle never does.
+publishes freshness and starts the next cycle empty (``TailCursor``). A partial
+cycle never publishes.
 
 Shared allowance: the Schwab app's per-minute allowance is shared with the
 live quote recorder (gex-watch), whose lost minutes cost live evidence
@@ -107,6 +109,7 @@ never written to ``resolved_series`` (review of #1299, item 3).
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -445,27 +448,100 @@ def tail_cursor_file(writer: str | None = None) -> Path:
 
 
 def universe_identity(tickers: list[str]) -> str:
-    """SHA-256 of the run's universe (core and catalyst names, order-free): a changed list resets the cursor."""
+    """SHA-256 of the run's universe (core and catalyst names, order-free). Recorded for diagnosis only."""
     return hashlib.sha256("\n".join(sorted(set(tickers))).encode("utf-8")).hexdigest()
 
 
 _CURSOR_TICKER = re.compile(r"^[A-Z0-9./-]{1,12}$")
+# The cursor's sidecar lock (``<cursor>.lock``) is tried this many times, this far apart, before a
+# save goes ahead without it (fail open: a lost merge only under-counts coverage).
+TAIL_CURSOR_LOCK_ATTEMPTS = 20
+TAIL_CURSOR_LOCK_WAIT_SECONDS = 0.05
+
+
+def _read_cursor_state(path: Path) -> dict[str, Any] | None:
+    """The cursor file's fields, or None (missing: silently; unreadable or malformed: logged)."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("options: tail cursor unreadable ({kind}); starting from the first name", kind=type(exc).__name__)
+        return None
+    try:
+        state = json.loads(raw.decode("utf-8"))
+        if not isinstance(state, dict) or state.get("version") != TAIL_CURSOR_VERSION:
+            raise ValueError("version")
+        universe, day, cycle = state["universe"], state["session_day"], state["cycle"]
+        last, covered = state["last_completed"], state["covered"]
+        if (not isinstance(universe, str) or not isinstance(day, str)
+                or not isinstance(cycle, int) or isinstance(cycle, bool) or cycle < 0
+                or not (last is None or (isinstance(last, str) and _CURSOR_TICKER.match(last)))
+                or not isinstance(covered, list)
+                or not all(isinstance(t, str) and _CURSOR_TICKER.match(t) for t in covered)):
+            raise ValueError("shape")
+    except Exception as exc:  # noqa: BLE001 -- any content at all must fail open, as the Yahoo hold marker does
+        log.warning("options: tail cursor is not in the expected form ({kind}); starting from the first name",
+                    kind=type(exc).__name__)
+        return None
+    return {"universe": universe, "session_day": day, "cycle": cycle, "last_completed": last, "covered": set(covered)}
+
+
+def _lock_cursor(path: Path) -> int | None:
+    """An exclusive flock on ``<cursor>.lock`` (created 0600), or None when it cannot be had."""
+    fd: int | None = None
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        for attempt in range(TAIL_CURSOR_LOCK_ATTEMPTS):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if attempt + 1 < TAIL_CURSOR_LOCK_ATTEMPTS:
+                    time.sleep(TAIL_CURSOR_LOCK_WAIT_SECONDS)
+        log.warning("options: tail cursor lock busy; saving without it")
+    except OSError as exc:
+        log.warning("options: tail cursor lock unavailable ({kind}); saving without it", kind=type(exc).__name__)
+    if fd is not None:
+        os.close(fd)
+    return None
+
+
+def _unlock_cursor(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 class TailCursor:
-    """Where a schwab-mode full-universe run resumes its non-core names, and what this session covered.
+    """Where a schwab-mode full-universe run resumes its non-core names, and what this cycle covered.
 
-    State, per writer, in one small 0600 JSON file (atomic replace):
+    State, per writer, in one small 0600 JSON file (atomic replace, under a sidecar flock):
 
     * ``last_completed``: the last non-core name a run finished (captured, confirmed without a
       chain, or failed: a name that keeps failing must not pin the cursor). The next run starts
-      after it and wraps around. Keyed by ``universe_identity``: a changed catalyst list starts
-      from the beginning. A name a run did not finish (time budget, request budget, a hold, a stop,
-      or the name a Yahoo 429 cut short) does not move it.
-    * ``covered``: every name, core included, that a run of this New York session day captured or
-      accounted for (``OptionsPullResults.accounts_for``). Keyed by session day only: a capture is
-      a fact whatever the list is now. It lets a later run of the same session count a name an
-      earlier run captured, so the session's cycle can complete (``OptionsPullResults``).
+      at the first name alphabetically after it and wraps around, whatever the list is now: the
+      catalyst list can change between runs (review of #1331), and a list that changed every run
+      would otherwise never be read to its end. A name a run did not finish (time budget, request
+      budget, a hold, a stop, or the name a Yahoo 429 cut short) does not move it.
+    * ``covered``: every name, core included, that a run of the current cycle captured or accounted
+      for (``OptionsPullResults.accounts_for``) on this New York session day. It lets a later run
+      count a name an earlier run captured, so a cycle can complete (``OptionsPullResults``). Names
+      not yet covered are read first, then the covered ones, each in the rotated order above.
+    * ``cycle``: how many cycles have completed. The run that completes one (its summary SUCCESS,
+      freshness published) clears ``covered`` and bumps it (``complete_cycle``), so freshness
+      always means a new full cycle, never one extra name on top of an old one.
+    * ``universe``: the list's identity, for diagnosis only.
+
+    Two processes of the same writer: each save takes the lock, re-reads the file and keeps the
+    union of both ``covered`` sets for the same session day and cycle; a newer cycle on disk wins.
+    A lock that cannot be had within about a second is logged and the save goes ahead.
 
     Fails open: a missing, unreadable or malformed file is logged (unless missing) and means "start
     from the beginning, nothing covered yet". So a bad file can cost a re-read, never a skipped name,
@@ -473,13 +549,14 @@ class TailCursor:
     """
 
     def __init__(self, path: Path, universe: str, session_day: str,
-                 last_completed: str | None = None, covered: set[str] | None = None) -> None:
+                 last_completed: str | None = None, covered: set[str] | None = None, cycle: int = 0) -> None:
         self.path = path
         self.universe = universe
         self.session_day = session_day
         self.last_completed = last_completed
         self.covered: set[str] = set(covered or ())
-        # Coverage from earlier runs of this session, fixed when the cursor is loaded.
+        self.cycle = cycle
+        # Coverage from earlier runs of this cycle, fixed when the cursor is loaded.
         self.covered_before: frozenset[str] = frozenset(self.covered)
 
     @classmethod
@@ -487,39 +564,25 @@ class TailCursor:
              path: str | Path | None = None) -> TailCursor:
         target = Path(path) if path is not None else tail_cursor_file(writer)
         universe = universe_identity(tickers)
-        fresh = cls(target, universe, session_day)
-        try:
-            raw = target.read_bytes()
-        except FileNotFoundError:
-            return fresh
-        except OSError as exc:
-            log.warning("options: tail cursor unreadable ({kind}); starting from the first name", kind=type(exc).__name__)
-            return fresh
-        try:
-            state = json.loads(raw.decode("utf-8"))
-            if not isinstance(state, dict) or state.get("version") != TAIL_CURSOR_VERSION:
-                raise ValueError("version")
-            stored_universe, stored_day = state["universe"], state["session_day"]
-            last, covered = state["last_completed"], state["covered"]
-            if (not isinstance(stored_universe, str) or not isinstance(stored_day, str)
-                    or not (last is None or (isinstance(last, str) and _CURSOR_TICKER.match(last)))
-                    or not isinstance(covered, list)
-                    or not all(isinstance(t, str) and _CURSOR_TICKER.match(t) for t in covered)):
-                raise ValueError("shape")
-        except Exception as exc:  # noqa: BLE001 -- any content at all must fail open, as the Yahoo hold marker does
-            log.warning("options: tail cursor is not in the expected form ({kind}); starting from the first name",
-                        kind=type(exc).__name__)
-            return fresh
-        return cls(target, universe, session_day,
-                   last_completed=last if stored_universe == universe else None,
-                   covered=set(covered) if stored_day == session_day else None)
+        state = _read_cursor_state(target)
+        if state is None:
+            return cls(target, universe, session_day)
+        return cls(target, universe, session_day, last_completed=state["last_completed"],
+                   covered=state["covered"] if state["session_day"] == session_day else None,
+                   cycle=state["cycle"])
 
     def order(self, tail: list[str]) -> list[str]:
-        """``tail`` rotated to start after ``last_completed``; unchanged when it is unset or not in the list."""
-        if self.last_completed is None or self.last_completed not in tail:
-            return list(tail)
-        start = tail.index(self.last_completed) + 1
-        return tail[start:] + tail[:start]
+        """Not-yet-covered names first, then covered ones; each from the first name after ``last_completed``.
+
+        ``tail`` keeps its order (``catalyst_options_universe`` sorts by ticker) and is rotated to
+        start at its first name that sorts after ``last_completed``, wrapping, whether or not that
+        name is still in the list.
+        """
+        start = 0
+        if self.last_completed is not None:
+            start = next((i for i, t in enumerate(tail) if t > self.last_completed), 0)
+        rotated = tail[start:] + tail[:start]
+        return [t for t in rotated if t not in self.covered] + [t for t in rotated if t in self.covered]
 
     @staticmethod
     def finished(result: Mapping[str, Any]) -> bool:
@@ -540,15 +603,31 @@ class TailCursor:
         if changed:
             self.save()
 
+    def complete_cycle(self) -> bool:
+        """The cycle was published: clear ``covered`` and start the next one (the position stays)."""
+        self.covered = set()
+        self.cycle += 1
+        return self.save()
+
     def save(self) -> bool:
-        payload = {"version": TAIL_CURSOR_VERSION, "universe": self.universe, "session_day": self.session_day,
-                   "last_completed": self.last_completed, "covered": sorted(self.covered)}
+        fd = _lock_cursor(self.path)
         try:
+            disk = _read_cursor_state(self.path) if self.path.exists() else None
+            if disk is not None and disk["session_day"] == self.session_day:
+                if disk["cycle"] == self.cycle:
+                    self.covered |= disk["covered"]            # another run of this cycle: keep both
+                elif disk["cycle"] > self.cycle:
+                    # Another process completed a cycle meanwhile: its reset stands, ours is stale.
+                    self.cycle, self.covered = disk["cycle"], set(disk["covered"])
+            payload = {"version": TAIL_CURSOR_VERSION, "universe": self.universe, "session_day": self.session_day,
+                       "cycle": self.cycle, "last_completed": self.last_completed, "covered": sorted(self.covered)}
             _write_state_json(self.path, payload, prefix=".options-tail-cursor-")
             return True
         except OSError as exc:
             log.warning("options: tail cursor not written ({kind})", kind=type(exc).__name__)
             return False
+        finally:
+            _unlock_cursor(fd)
 
 
 class SchwabOptionsClient:

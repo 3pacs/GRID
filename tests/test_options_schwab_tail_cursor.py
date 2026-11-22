@@ -94,6 +94,8 @@ def test_a_budget_limited_run_is_resumed_where_it_stopped_and_the_cycle_then_pub
     assert puller.published == [True]
     # The smart scheduler's own classifier agrees, so the job's streak closes and it waits freq_h.
     assert ss._classify_outcome(summary)[0] == ss.OUTCOME_SUCCESS
+    state = json.loads(_cursor_file().read_text())
+    assert (state["covered"], state["cycle"], state["last_completed"]) == ([], 1, "OLMA")   # next cycle starts empty
 
 
 def test_the_cursor_wraps_around(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,31 +117,64 @@ def test_a_run_that_reads_every_name_ends_where_it_began(monkeypatch: pytest.Mon
     assert _tail_order(yahoo) == ["ACIU", "AGEN", "NUOX", "OLMA"]                  # after OLMA comes ACIU
 
 
-def test_a_changed_catalyst_list_starts_from_the_first_name(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_published_cycle_starts_the_next_one_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review of #1331: a later same-day run that read one name used to return SUCCESS and republish.
     monkeypatch.setattr(options_schwab, "YAHOO_RUN_REQUEST_BUDGET", 3)
     _run(monkeypatch)
-    assert json.loads(_cursor_file().read_text())["last_completed"] == "AGEN"
-    changed = ["ACIU", "AGEN", "BEAM", "NUOX", "OLMA"]
-    _p, _m, yahoo, results = _run(monkeypatch, core_held=True, catalysts=changed)
-    assert _tail_order(yahoo) == ["ACIU", "AGEN"]                                  # not resumed after AGEN
+    _p, _m, _y, done = _run(monkeypatch, core_held=True, publish=True)
+    assert done.summary["status"] == "SUCCESS"
+    monkeypatch.setattr(options_schwab, "YAHOO_RUN_REQUEST_BUDGET", 1)   # one name
+    _p, _m, yahoo, later = _run(monkeypatch, core_held=True)               # must not publish
+    assert _tail_order(yahoo) == ["ACIU"]                                  # after OLMA, wrapping
+    assert later.summary["status"] == "PARTIAL" and later.summary["tickers_covered_earlier"] == 0
+    assert "4 tickers not captured (KO, AGEN, NUOX, OLMA)" in later.summary["error"]
+    assert json.loads(_cursor_file().read_text())["covered"] == ["ACIU"]
+
+
+def test_a_partial_cycle_does_not_reset_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(options_schwab, "YAHOO_RUN_REQUEST_BUDGET", 3)
+    _run(monkeypatch)
     state = json.loads(_cursor_file().read_text())
-    assert state["universe"] == options_schwab.universe_identity(CORE + changed)
-    # Captures are facts of the session whatever the list: KO still counts, so the run says 3 remain.
-    assert results.summary["tickers_covered_earlier"] == 1
-    assert "3 tickers not captured (BEAM, NUOX, OLMA)" in results.summary["error"]
+    assert (state["covered"], state["cycle"]) == (["ACIU", "AGEN", "KO"], 0)
+
+
+def test_a_list_that_changes_every_run_still_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review of #1331: resetting the position on every list change re-read the early names forever.
+    monkeypatch.setattr(options_schwab, "YAHOO_RUN_REQUEST_BUDGET", 3)   # two names a run
+    _p, _m, yahoo, _r = _run(monkeypatch)
+    assert _tail_order(yahoo) == ["ACIU", "AGEN"]
+    second = ["ACIU", "AGEN", "BEAM", "NUOX", "OLMA"]
+    _p, _m, yahoo, results = _run(monkeypatch, core_held=True, catalysts=second)
+    assert _tail_order(yahoo) == ["BEAM", "NUOX"]                          # resumed after AGEN, not restarted
+    assert [r["ticker"] for r in results] == ["KO", "BEAM", "NUOX", "OLMA", "ACIU", "AGEN"]   # uncovered first
+    third = ["ABCD", "ACIU", "AGEN", "BEAM", "NUOX", "OLMA"]
+    puller, _m, yahoo, results = _run(monkeypatch, core_held=True, catalysts=third, publish=True)
+    assert _tail_order(yahoo) == ["OLMA", "ABCD"]                          # the two names never read
+    assert results.summary["status"] == "SUCCESS" and puller.published == [True]
+    assert json.loads(_cursor_file().read_text())["universe"] == options_schwab.universe_identity(CORE + third)
+
+
+def test_uncovered_names_come_first_then_the_rest_in_rotation(tmp_path: Path) -> None:
+    cursor = options_schwab.TailCursor.load(CORE + TAIL, DAY, path=tmp_path / "c.json")
+    cursor.last_completed, cursor.covered = "AGEN", {"NUOX", "ACIU"}
+    assert cursor.order(TAIL) == ["OLMA", "AGEN", "NUOX", "ACIU"]
+    cursor.last_completed = "AZZZ"                                         # gone from the list: still a position
+    assert cursor.order(["ACIU", "AGEN", "BEAM", "NUOX", "OLMA"]) == ["BEAM", "OLMA", "AGEN", "NUOX", "ACIU"]
+    cursor.last_completed, cursor.covered = None, set()
+    assert cursor.order(["OLMA", "ACIU"]) == ["OLMA", "ACIU"]             # a fresh cursor keeps the list's order
 
 
 def test_coverage_from_an_earlier_session_day_does_not_count(monkeypatch: pytest.MonkeyPatch) -> None:
     path = _cursor_file()
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"version": 1, "universe": options_schwab.universe_identity(CORE + TAIL),
-                                "session_day": "2026-11-04", "last_completed": "AGEN",
+                                "session_day": "2026-11-04", "cycle": 3, "last_completed": "AGEN",
                                 "covered": ["KO", "ACIU", "AGEN", "NUOX", "OLMA"]}))
     _p, _m, yahoo, results = _run(monkeypatch, core_held=True, publish=False)
     assert _tail_order(yahoo) == ["NUOX", "OLMA", "ACIU", "AGEN"]                  # the position carries over
     assert results.summary["status"] == "PARTIAL" and results.summary["tickers_covered_earlier"] == 0
     assert "1 tickers not captured (KO)" in results.summary["error"]
-    assert json.loads(path.read_text())["session_day"] == DAY
+    assert json.loads(path.read_text())["session_day"] == DAY and json.loads(path.read_text())["cycle"] == 3
 
 
 class _FailingYahoo(_FakeYahoo):
@@ -190,11 +225,14 @@ def test_a_held_tail_leaves_the_cursor_where_it_was(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.parametrize("content", [
     b"", b"not json", b"[]", b"null", b"\xff\xfe\x00", b"[" * 200_000 + b"]" * 200_000,
-    b'{"version": 2, "universe": "x", "session_day": "2026-11-05", "last_completed": null, "covered": []}',
-    b'{"version": 1, "universe": "x", "session_day": "2026-11-05", "last_completed": 5, "covered": []}',
-    b'{"version": 1, "universe": "x", "session_day": "2026-11-05", "last_completed": null, "covered": [1]}',
-    b'{"version": 1, "session_day": "2026-11-05", "last_completed": null, "covered": []}',
-], ids=["empty", "text", "list", "null", "not-utf8", "nested", "version", "last-type", "covered-type", "missing"])
+    b'{"version": 2, "universe": "x", "session_day": "2026-11-05", "cycle": 0, "last_completed": null, "covered": []}',
+    b'{"version": 1, "universe": "x", "session_day": "2026-11-05", "cycle": 0, "last_completed": 5, "covered": []}',
+    b'{"version": 1, "universe": "x", "session_day": "2026-11-05", "cycle": 0, "last_completed": null, "covered": [1]}',
+    b'{"version": 1, "universe": "x", "session_day": "2026-11-05", "cycle": -1, "last_completed": null, "covered": []}',
+    b'{"version": 1, "universe": "x", "session_day": "2026-11-05", "cycle": true, "last_completed": null, "covered": []}',
+    b'{"version": 1, "session_day": "2026-11-05", "cycle": 0, "last_completed": null, "covered": []}',
+], ids=["empty", "text", "list", "null", "not-utf8", "nested", "version", "last-type", "covered-type", "cycle-negative",
+        "cycle-bool", "missing"])
 def test_a_corrupt_cursor_fails_open_and_is_replaced(monkeypatch: pytest.MonkeyPatch, content: bytes) -> None:
     path = _cursor_file()
     path.parent.mkdir(parents=True)
@@ -225,9 +263,12 @@ def test_the_cursor_file_is_owner_only_and_leaves_a_shared_directory_alone(
     monkeypatch.setenv("GRID_OPTIONS_TAIL_CURSOR_DIR", str(shared))
     _run(monkeypatch, publish=True)
     path = shared / "options_tail_cursor.options_puller.json"
+    lock = shared / "options_tail_cursor.options_puller.json.lock"
     assert path.stat().st_mode & 0o777 == 0o600 and shared.stat().st_mode & 0o777 == 0o755
-    assert sorted(p.name for p in shared.iterdir()) == [path.name]                 # no temp file left behind
-    assert set(json.loads(path.read_text())) == {"version", "universe", "session_day", "last_completed", "covered"}
+    assert lock.stat().st_mode & 0o777 == 0o600
+    assert sorted(p.name for p in shared.iterdir()) == [path.name, lock.name]      # no temp file left behind
+    assert set(json.loads(path.read_text())) == {"version", "universe", "session_day", "cycle", "last_completed",
+                                                 "covered"}
 
 
 def test_each_writer_has_its_own_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,14 +297,60 @@ def test_order_and_load_units(tmp_path: Path) -> None:
     assert cursor.order(TAIL) == ["OLMA", "ACIU", "AGEN", "NUOX"]
     cursor.last_completed = "OLMA"
     assert cursor.order(TAIL) == TAIL
-    cursor.last_completed = "ZZZ"                                                  # not in the list
+    cursor.last_completed = "ZZZ"                                                  # past every name: wraps
     assert cursor.order(TAIL) == TAIL and cursor.order([]) == []
     cursor.last_completed, cursor.covered = "AGEN", {"KO"}
     assert cursor.save() is True
-    same = options_schwab.TailCursor.load(list(reversed(CORE + TAIL)), DAY, path=path)   # order-free identity
-    assert same.last_completed == "AGEN" and same.covered_before == frozenset({"KO"})
+    changed = options_schwab.TailCursor.load(CORE + ["BEAM"], DAY, path=path)   # another list keeps the position
+    assert changed.last_completed == "AGEN" and changed.covered_before == frozenset({"KO"})
     other_day = options_schwab.TailCursor.load(CORE + TAIL, "2026-11-06", path=path)
     assert other_day.last_completed == "AGEN" and other_day.covered_before == frozenset()
+
+
+def test_two_processes_of_one_writer_keep_both_coverages(tmp_path: Path) -> None:
+    path = tmp_path / "c.json"
+    first = options_schwab.TailCursor.load(CORE + TAIL, DAY, path=path)
+    second = options_schwab.TailCursor.load(CORE + TAIL, DAY, path=path)   # loaded before either saved
+    first.record("ACIU", {"status": "SUCCESS"}, tail=True)
+    second.record("OLMA", {"status": "SUCCESS"}, tail=True)
+    state = json.loads(path.read_text())
+    assert state["covered"] == ["ACIU", "OLMA"] and state["last_completed"] == "OLMA"   # union; last writer's position
+    first.record("NUOX", {"status": "SUCCESS"}, tail=True)
+    assert json.loads(path.read_text())["covered"] == ["ACIU", "NUOX", "OLMA"]
+
+
+def test_a_cycle_another_process_completed_is_not_undone(tmp_path: Path) -> None:
+    path = tmp_path / "c.json"
+    stale = options_schwab.TailCursor.load(CORE + TAIL, DAY, path=path)
+    stale.record("ACIU", {"status": "SUCCESS"}, tail=True)
+    done = options_schwab.TailCursor.load(CORE + TAIL, DAY, path=path)
+    assert done.complete_cycle() is True
+    stale.record("AGEN", {"status": "SUCCESS"}, tail=True)               # still at cycle 0 in memory
+    state = json.loads(path.read_text())
+    assert (state["cycle"], state["covered"]) == (1, [])                   # under-counts, never over-counts
+    assert stale.cycle == 1
+
+
+def test_a_busy_lock_is_waited_for_briefly_then_the_save_goes_ahead(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import fcntl
+
+    path = tmp_path / "c.json"
+    cursor = options_schwab.TailCursor.load(CORE + TAIL, DAY, path=path)
+    sleeps: list[float] = []
+    warnings: list[str] = []
+    monkeypatch.setattr(options_schwab.time, "sleep", sleeps.append)
+    monkeypatch.setattr(options_schwab.log, "warning", lambda message, **_kw: warnings.append(message))
+    holder = os.open(tmp_path / "c.json.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        cursor.covered = {"KO"}
+        assert cursor.save() is True
+    finally:
+        os.close(holder)
+    assert len(sleeps) == options_schwab.TAIL_CURSOR_LOCK_ATTEMPTS - 1
+    assert sum(sleeps) == pytest.approx(0.95) and warnings == ["options: tail cursor lock busy; saving without it"]
+    assert json.loads(path.read_text())["covered"] == ["KO"]
 
 
 # ── the budget ───────────────────────────────────────────────────────────

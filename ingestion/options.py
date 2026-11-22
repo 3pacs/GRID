@@ -985,9 +985,10 @@ class OptionsPuller(BasePuller):
         Schwab mode, full default universe only: the Yahoo-served names start
         after the last one the previous run of this writer finished, wrapping
         around (``options_schwab.TailCursor``), and a name an earlier run of
-        the same session day captured counts toward this run's coverage. So
-        source freshness moves once every name has been captured within the
-        session's runs, by the run that completes that cycle.
+        the same session day and cycle captured counts toward this run's
+        coverage. So source freshness moves once every name has been captured
+        within the session's runs, by the run that completes that cycle, which
+        then starts the next cycle with nothing covered.
 
         A 401/403 stops this entire run, including when it first occurs in
         the catalyst tail after every core ticker succeeds. Earlier complete
@@ -1184,6 +1185,10 @@ class OptionsPuller(BasePuller):
                 outcome.publication_error = "time budget expired before catalog publication"
             elif not self._mark_catalog_pulled(should_continue=should_continue):
                 outcome.publication_error = "catalog publication deferred or failed"
+        if cursor is not None and outcome.summary["status"] == "SUCCESS":
+            # Freshness was published for this cycle; the next one starts empty, so a later run
+            # that reads one name cannot publish again on top of it (review of #1331).
+            cursor.complete_cycle()
         return outcome
 
     def _mark_catalog_pulled(self, *, should_continue: Callable[[], bool] | None = None) -> bool:
