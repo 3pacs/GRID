@@ -1,7 +1,7 @@
 """market_state_provisional: the display-only market-state record computed at a session's close (#1312).
 
 Revision ID: market_state_prov_20261122
-Revises: regime_history_revs_20261122
+Revises: eligibility_core_20261122
 Create Date: 2026-11-22 00:00:00.000000
 
 Owner's decision (bring-up plan rev 100): #1191's previous-session rule stays for anything that decides. A record
@@ -24,7 +24,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic (version_num is VARCHAR(32), so the id is shorter than the table's name).
 revision = "market_state_prov_20261122"
-down_revision = "regime_history_revs_20261122"
+down_revision = "eligibility_core_20261122"
 branch_labels = None
 depends_on = None
 
