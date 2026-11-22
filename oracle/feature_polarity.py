@@ -212,6 +212,7 @@ FEATURE_POLARITY: dict[str, int] = {
     "eia_diesel_price": 0,
     "eia_jet_fuel_stocks": 0,
     "eia_crude_stocks": 0,
+    "eia_cushing_crude_stocks": 0,
     "eia_gas_stocks": 0,
     "eia_natgas_storage": 0,
     "eia_crude_production": 0,
