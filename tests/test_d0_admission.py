@@ -123,13 +123,15 @@ def _build(root: Path, hid: str, n: int) -> dict:
              coverage={"measured_n": n,
                        "receipt": _write_json(root, f"receipts/{hid}.coverage.json", _coverage_body(hid, n, g15_sha))},
              admission={"signed_at": "2026-11-15"})
+    # the reviewer's date is inside the digest and the statement: it is set before anyone signs
+    m["reviewer"]["signed_at"] = "2026-11-15"
     keys = {p: _keygen(root, p) for p in A.REQUIRED_PRINCIPALS}
     signers = "".join(f'{p} namespaces="{A.NAMESPACE}" {pub}\n' for p, (_, pub) in keys.items())
     _write(root, str(A.ALLOWED_SIGNERS), signers.encode())
     for p, (key, _) in keys.items():
         _sign(root, m, hid, p, key)
-    # reviewer result fields are outside the digest, so recording them does not touch the signatures
-    m["reviewer"].update(signed=True, signed_at="2026-11-15", manifest_sha256=A.manifest_digest(m))
+    # only the reviewer's result fields are outside the digest, so recording them keeps the signatures
+    m["reviewer"].update(signed=True, manifest_sha256=A.manifest_digest(m))
     return {"root": root, "m": m, "keys": keys, "hid": hid}
 
 
@@ -212,10 +214,14 @@ def test_any_manifest_edit_after_signing_invalidates_signatures(world):
 
 
 def test_reviewer_result_fields_are_outside_the_digest(world):
+    assert A.DIGEST_EXCLUDED_REVIEWER_KEYS == ("signed", "manifest_sha256")
     m = copy.deepcopy(world["m"])
-    m["reviewer"].update(signed=True, signed_at="2026-11-16", manifest_sha256=A.manifest_digest(world["m"]))
+    m["reviewer"].update(signed=True, manifest_sha256=A.manifest_digest(world["m"]))
     assert A.manifest_digest(m) == A.manifest_digest(world["m"])
     assert _errs(world, m) == []
+    dated = copy.deepcopy(m)
+    dated["reviewer"]["signed_at"] = "2026-11-16"  # the reviewer's date is inside the digest
+    assert A.manifest_digest(dated) != A.manifest_digest(world["m"])
     m["reviewer"]["manifest_sha256"] = "c" * 64
     ok, errs = _has(_errs(world, m), "does not equal the manifest digest")
     assert ok, errs
@@ -589,3 +595,143 @@ def test_a_manifest_drift_is_refused_by_validate_even_without_admission():
 def test_statement_binds_the_frozen_spec(world):
     body = json.loads(A.admission_statement(world["m"], HYP))
     assert body["frozen_spec_sha256"] == A.FROZEN_SPEC_SHA256
+
+
+# --- chronology: G15 closure <= measurement <= reviewer <= admission <= today, and no relabelling ---
+
+def _dates(m, hid, *, owner=None, reviewer=None, admission=None):
+    if owner is not None:
+        m["signed_at"] = owner
+    if reviewer is not None:
+        m["reviewer"]["signed_at"] = reviewer
+    if admission is not None:
+        _hyp(m, hid)["admission"] = {"signed_at": admission}
+    return m
+
+
+def _move_g15(w, m, closed_at):
+    """Close G15 on ``closed_at`` with fresh typed evidence, and point the D1 receipt at that evidence."""
+    _gap(m, "G15")["closure"]["closed_at"] = closed_at
+    _rewrite_closure(w, m, "G15", closed_at=closed_at)
+    return _rewrite_coverage(w, m, w["hid"], g15_closure_sha256=_gap(m, "G15")["closure"]["evidence"]["sha256"])
+
+
+@pytest.mark.parametrize("fixture", ["world", "d1world"])
+def test_the_fixture_chronology_is_the_allowed_order(request, fixture):
+    w = request.getfixturevalue(fixture)
+    m, h = w["m"], _hyp(w["m"], w["hid"])
+    cov = json.loads((w["root"] / h["coverage"]["receipt"]["path"]).read_text())
+    assert m["signed_at"] <= m["reviewer"]["signed_at"] <= h["admission"]["signed_at"] <= TODAY.isoformat()
+    assert cov["measured_at"] <= m["reviewer"]["signed_at"]
+    if fixture == "d1world":
+        assert _gap(m, "G15")["closure"]["closed_at"] <= cov["measured_at"]
+
+
+def test_equal_dates_and_an_earlier_g15_closure_verify(d1world):
+    m = copy.deepcopy(d1world["m"])
+    _move_g15(d1world, m, "2026-11-14")
+    _rewrite_coverage(d1world, m, "D1-F1", measured_at="2026-11-14")
+    assert _errs(d1world, _resign(d1world, m)) == []
+
+
+@pytest.mark.parametrize("change, needle", [
+    # signing dates: real, never in the future, in the signing order
+    (lambda w, m: _dates(m, HYP, owner="2026-11-21", reviewer="2026-11-21", admission="2026-11-21"),
+     "manifest signed_at is in the future"),
+    (lambda w, m: _dates(m, HYP, reviewer="2026-11-21"), "reviewer.signed_at is in the future"),
+    (lambda w, m: _dates(m, HYP, reviewer="2026-11-21", admission="2026-11-21"), "reviewer.signed_at is in the future"),
+    (lambda w, m: _dates(m, HYP, reviewer="2026-11-13"), "reviewer.signed_at is before the owner's signature"),
+    (lambda w, m: _dates(m, HYP, reviewer="2026-11-16"), "admission.signed_at is before the reviewer's signature"),
+    (lambda w, m: _dates(m, HYP, reviewer="2026-11-17", admission="2026-11-16"),
+     "admission.signed_at is before the reviewer's signature"),
+    # the measurement precedes the reviewer's signature and the admission
+    (lambda w, m: _rewrite_coverage(w, m, HYP, measured_at="2026-11-16"), "measured_at is after the admission date"),
+    (lambda w, m: (_dates(m, HYP, admission="2026-11-17"), _rewrite_coverage(w, m, HYP, measured_at="2026-11-16")),
+     "measured_at is after the reviewer's signature"),
+    (lambda w, m: (_dates(m, HYP, reviewer="2026-11-17", admission="2026-11-17"),
+                   _rewrite_coverage(w, m, HYP, measured_at="2026-11-18")), "measured_at is after the admission date"),
+    (lambda w, m: _rewrite_coverage(w, m, HYP, measured_at="2026-11-15T00:00"), "measured_at is not a real"),
+    (lambda w, m: _rewrite_coverage(w, m, HYP, measured_at=_DROP), "measured_at is not a real"),
+])
+def test_signing_and_measurement_dates_run_in_order(world, change, needle):
+    base = _errs(world)
+    m = copy.deepcopy(world["m"])
+    change(world, m)
+    _refused(world, _resign(world, m), needle, base)
+
+
+@pytest.mark.parametrize("change, needle", [
+    # the receipt names the right G15 closure hash, but was measured before G15 closed
+    (lambda w, m: _rewrite_coverage(w, m, "D1-F1", measured_at="2026-11-14"), "measured_at is before the G15 closure"),
+    (lambda w, m: (_move_g15(w, m, "2026-11-15"), _rewrite_coverage(w, m, "D1-F1", measured_at="2026-11-01")),
+     "measured_at is before the G15 closure"),
+    # the G15 closure itself after the admission, with consistent evidence and receipt hash
+    (lambda w, m: (_move_g15(w, m, "2026-11-16")), "blocking gap G15 is not closed: closure.closed_at is after"),
+    # ... and a closure that is not frozen before the look closes nothing for the receipt to cite
+    (lambda w, m: (_move_g15(w, m, "2026-11-16")), "a judged historical D1 result requires the frozen G15 closure"),
+    (lambda w, m: (_move_g15(w, m, "2026-11-21")), "closure.closed_at is in the future"),
+])
+def test_a_judged_d1_count_is_measured_after_g15_closed(d1world, change, needle):
+    base = _errs(d1world)
+    m = copy.deepcopy(d1world["m"])
+    change(d1world, m)
+    _refused(d1world, _resign(d1world, m), needle, base)
+
+
+@pytest.fixture()
+def spread(world):
+    """``world`` re-signed with distinct dates: owner 11-14, measured 11-15, reviewer 11-16, admission 11-17."""
+    m = _dates(copy.deepcopy(world["m"]), HYP, reviewer="2026-11-16", admission="2026-11-17")
+    _resign(world, m)
+    assert _errs(world, m) == []
+    return {**world, "m": m}
+
+
+@pytest.mark.parametrize("change", [
+    # each relabel keeps the chronology valid, so only the signed statement can catch it
+    lambda w, m: _dates(m, HYP, reviewer="2026-11-15"),
+    lambda w, m: _dates(m, HYP, reviewer="2026-11-17"),
+    lambda w, m: _dates(m, HYP, admission="2026-11-16"),
+    lambda w, m: _dates(m, HYP, admission="2026-11-18"),
+    lambda w, m: _dates(m, HYP, owner="2026-11-13"),
+    lambda w, m: _rewrite_coverage(w, m, HYP, measured_at="2026-11-14"),
+])
+def test_relabelling_a_date_after_signing_is_refused(spread, change):
+    m = copy.deepcopy(spread["m"])
+    change(spread, m)
+    m["reviewer"]["manifest_sha256"] = A.manifest_digest(m)  # the relabeller recomputes the unsigned field
+    errs = _errs(spread, m)
+    assert any("does not verify for 'reviewer'" in e for e in errs), errs
+    assert any("does not verify for 'operator'" in e for e in errs), errs
+    assert not any("signed_at is" in e or "measured_at is" in e for e in errs), errs
+
+
+def test_relabelling_the_reviewer_date_without_the_digest_is_refused(spread):
+    m = copy.deepcopy(spread["m"])
+    m["reviewer"]["signed_at"] = "2026-11-15"  # manifest_sha256 left as signed
+    _refused(spread, m, "reviewer.manifest_sha256 does not equal the manifest digest")
+
+
+def test_relabelling_the_g15_date_is_refused(d1world):
+    m = copy.deepcopy(d1world["m"])
+    _gap(m, "G15")["closure"]["closed_at"] = "2026-11-14"  # manifest only: evidence still says 11-15
+    m["reviewer"]["manifest_sha256"] = A.manifest_digest(m)
+    errs = _errs(d1world, m)
+    assert any("G15" in e and "closed_at differs from the manifest" in e for e in errs), errs
+    assert any("does not verify" in e for e in errs), errs
+
+
+def test_relabelling_a_receipt_date_on_disk_is_refused(world):
+    path = world["root"] / _hyp(world["m"], HYP)["coverage"]["receipt"]["path"]
+    base = _errs(world)
+    body = json.loads(path.read_text())
+    body["measured_at"] = "2026-11-14"
+    path.write_text(json.dumps(body, indent=1, sort_keys=True) + "\n")
+    _refused(world, world["m"], "does not hash", base)
+
+
+def test_statement_binds_every_signing_date(world):
+    body = json.loads(A.admission_statement(world["m"], HYP))
+    assert body["owner_signed_at"] == world["m"]["signed_at"]
+    assert body["reviewer_signed_at"] == world["m"]["reviewer"]["signed_at"]
+    assert body["admission_signed_at"] == _hyp(world["m"], HYP)["admission"]["signed_at"]

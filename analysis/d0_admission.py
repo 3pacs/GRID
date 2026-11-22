@@ -31,18 +31,34 @@ What a hypothesis labelled ``ADMITTED`` must carry (review of bc52a40c):
   ``status`` string never closes a gap. G15 needs the typed price-only exception fields.
 - ``admission``: ``{"signed_at": "YYYY-MM-DD"}``, a real calendar date, not before the
   owner's signature and not in the future.
-- ``reviewer.signed`` must be exactly ``true`` (contract §8), with ``manifest_sha256``.
+- ``reviewer.signed`` must be exactly ``true`` (contract §8), with ``signed_at`` and
+  ``manifest_sha256``.
 
 The manifest as a whole must be owner-signed with the pinned contract body
 (``analysis/d0_manifest.contract_pin_errors``). If ``reviewer.signed`` is true,
 ``reviewer.manifest_sha256`` must equal :func:`manifest_digest`.
 
+Chronology (:func:`_owner_errors`, :func:`hypothesis_errors`, :func:`gap_closure_errors`,
+:func:`coverage_receipt_errors`). Every date is a real ``YYYY-MM-DD`` no later than
+today, and they run in this order::
+
+    owner signed_at <= reviewer.signed_at <= admission.signed_at
+    every blocking-gap closed_at <= admission.signed_at
+    G15 closed_at <= coverage measured_at <= reviewer.signed_at      (judged historical D1)
+    coverage measured_at <= reviewer.signed_at                       (every hypothesis)
+
+The reviewer re-runs each coverage query before signing (contract §8), so the count is
+measured before the reviewer's date, and a judged historical D1 count is measured under a
+G15 exception that was already closed.
+
 What each signature covers: :func:`admission_statement`. This is canonical JSON of the
 contract id, the pinned body hash, the frozen spec hash, the hypothesis id, its admission
-date and the manifest digest. The digest is canonical JSON of the whole manifest except ``reviewer.signed``,
-``reviewer.signed_at`` and ``reviewer.manifest_sha256``, so recording the result after
-signing does not change what was signed (no self-referential field). Any other manifest
-edit after signing invalidates every signature.
+date, the owner's and the reviewer's signing dates, and the manifest digest. The digest is
+canonical JSON of the whole manifest except ``reviewer.signed`` and
+``reviewer.manifest_sha256``, so recording the result after signing does not change what
+was signed (no self-referential field). ``reviewer.signed_at`` is inside the digest and
+named in the statement, so relabelling it, like any other manifest edit after signing,
+invalidates every signature.
 
 A file receipt is ``{"path": <repo-relative path>, "sha256": <hex>}``. The file must
 exist inside the repository and hash to that value; a string is never a receipt.
@@ -72,7 +88,9 @@ NAMESPACE = "grid-d0-admission"
 SIGNATURE_DIR = Path("docs/research/d0-admission")
 ALLOWED_SIGNERS = SIGNATURE_DIR / "allowed_signers"
 REQUIRED_PRINCIPALS: tuple[str, ...] = ("reviewer", "operator")
-DIGEST_EXCLUDED_REVIEWER_KEYS: tuple[str, ...] = ("signed", "signed_at", "manifest_sha256")
+#: Only the reviewer's result fields. ``signed_at`` is NOT excluded: the reviewer's date is
+#: committed by the digest and by every admission statement (no date relabelling).
+DIGEST_EXCLUDED_REVIEWER_KEYS: tuple[str, ...] = ("signed", "manifest_sha256")
 VISIBILITY_OK = {"qualified", "not_applicable"}
 VISIBILITY_STATES = VISIBILITY_OK | {"applicable"}
 
@@ -294,12 +312,15 @@ def admission_statement(manifest: dict[str, Any], hypothesis_id: str) -> bytes:
     if hyp is None:
         raise KeyError(f"no hypothesis {hypothesis_id!r}")
     admission = hyp.get("admission") if isinstance(hyp.get("admission"), dict) else {}
+    reviewer = manifest.get("reviewer") if isinstance(manifest.get("reviewer"), dict) else {}
     return canonical({
         "contract": manifest.get("contract"),
         "contract_body_sha256": M.D0_CONTRACT_BODY_SHA256,
         "frozen_spec_sha256": FROZEN_SPEC_SHA256,
         "hypothesis": hypothesis_id,
         "admission_signed_at": admission.get("signed_at"),
+        "owner_signed_at": manifest.get("signed_at"),
+        "reviewer_signed_at": reviewer.get("signed_at"),
         "manifest_sha256": manifest_digest(manifest),
         "namespace": NAMESPACE,
     }) + b"\n"
@@ -415,7 +436,8 @@ def gap_closure_errors(gid: str, gap: dict[str, Any], repo_root: Path, admitted_
 
 
 def coverage_receipt_errors(hid: str, spec: dict[str, Any], cov: dict[str, Any], repo_root: Path,
-                            today: date, g15_sha256: str | None) -> list[str]:
+                            today: date, g15_sha256: str | None, *, admitted_on: date | None = None,
+                            reviewer_on: date | None = None, g15_closed_on: date | None = None) -> list[str]:
     """The coverage receipt's content must be the frozen count and scope, not only authentic bytes.
 
     The receipt file is JSON ``{"schema": "d0-coverage-receipt/1", "hypothesis": hid,
@@ -424,6 +446,11 @@ def coverage_receipt_errors(hid: str, spec: dict[str, Any], cov: dict[str, Any],
     "measured_at": "YYYY-MM-DD"}``. D1 receipts add ``cells`` (one per frozen horizon, each
     with the frozen cell floors met, and ``measured_n`` = the smallest top-quintile count) and
     ``g15_closure_sha256``, the evidence hash of the typed G15 closure it was measured under.
+
+    Chronology: ``measured_at`` is no later than today, the admission date and the reviewer's
+    signing date (the reviewer re-runs the count before signing, contract §8). For a judged
+    historical D1 it is no earlier than the G15 closure: the count is measured under an
+    exception that was already closed, so naming the right closure hash is not enough.
     """
     label = f"{hid}: coverage receipt"
     body, errs = receipt_json(cov.get("receipt"), repo_root, label)
@@ -452,8 +479,17 @@ def coverage_receipt_errors(hid: str, spec: dict[str, Any], cov: dict[str, Any],
     measured_at = parse_date(body.get("measured_at"))
     if measured_at is None:
         errs.append(f"{label}: measured_at is not a real YYYY-MM-DD date")
-    elif measured_at > today:
-        errs.append(f"{label}: measured_at is in the future")
+    else:
+        if measured_at > today:
+            errs.append(f"{label}: measured_at is in the future")
+        if admitted_on is not None and measured_at > admitted_on:
+            errs.append(f"{label}: measured_at is after the admission date (not measured before the look)")
+        if reviewer_on is not None and measured_at > reviewer_on:
+            errs.append(f"{label}: measured_at is after the reviewer's signature (contract §8: the reviewer "
+                        "re-runs the count before signing)")
+        if spec["judged_historical_d1"] and g15_closed_on is not None and measured_at < g15_closed_on:
+            errs.append(f"{label}: measured_at is before the G15 closure (a judged historical D1 count must "
+                        "be measured under the closed price-only exception)")
     if spec["cells"]:
         cells = body.get("cells")
         if not (isinstance(cells, dict) and sorted(cells) == sorted(spec["cells"])):
@@ -521,12 +557,21 @@ def input_errors(inp: dict[str, Any], repo_root: Path) -> list[str]:
     return errs
 
 
-def _owner_errors(manifest: dict[str, Any], repo_root: Path) -> list[str]:
+def reviewer_signed_on(manifest: dict[str, Any]) -> date | None:
+    """The reviewer's signing date, only when ``reviewer.signed`` is exactly true and the date is real."""
+    reviewer = manifest.get("reviewer") if isinstance(manifest.get("reviewer"), dict) else {}
+    return parse_date(reviewer.get("signed_at")) if reviewer.get("signed") is True else None
+
+
+def _owner_errors(manifest: dict[str, Any], repo_root: Path, today: date) -> list[str]:
     errs = list(M.contract_pin_errors(manifest, repo_root=repo_root))
     if (manifest.get("research_owner") or {}).get("signed") is not True:
         errs.append("research owner has not signed (research_owner.signed must be exactly true)")
-    if parse_date(manifest.get("signed_at")) is None:
+    owner_on = parse_date(manifest.get("signed_at"))
+    if owner_on is None:
         errs.append("manifest signed_at is not a real YYYY-MM-DD date")
+    elif owner_on > today:
+        errs.append("manifest signed_at is in the future")
     reviewer = manifest.get("reviewer") if isinstance(manifest.get("reviewer"), dict) else {}
     signed = reviewer.get("signed")
     # type check, not equality: 0 == False and 1 == True, so `in (True, False)` let 0 and 1 through
@@ -537,8 +582,14 @@ def _owner_errors(manifest: dict[str, Any], repo_root: Path) -> list[str]:
     else:
         if reviewer.get("manifest_sha256") != manifest_digest(manifest):
             errs.append("reviewer.manifest_sha256 does not equal the manifest digest")
-        if parse_date(reviewer.get("signed_at")) is None:
+        reviewer_on = parse_date(reviewer.get("signed_at"))
+        if reviewer_on is None:
             errs.append("reviewer.signed_at is not a real YYYY-MM-DD date")
+        else:
+            if reviewer_on > today:
+                errs.append("reviewer.signed_at is in the future")
+            if owner_on is not None and reviewer_on < owner_on:
+                errs.append("reviewer.signed_at is before the owner's signature (contract signing order)")
     return errs
 
 
@@ -617,7 +668,7 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
     """Why one ADMITTED hypothesis is not authenticated, judged against its frozen spec."""
     hid = hyp.get("id", "<no id>")
     today = today or _today()
-    errs = [f"{hid}: {e}" for e in frozen_spec_errors() + _owner_errors(manifest, repo_root)]
+    errs = [f"{hid}: {e}" for e in frozen_spec_errors() + _owner_errors(manifest, repo_root, today)]
     spec = frozen_hypothesis(hid)
     if spec is None:
         errs.append(f"{hid}: not a supported hypothesis (no frozen admission spec; contract §5.1, §6.2)")
@@ -637,6 +688,12 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
         errs.append(f"{hid}: admission.signed_at is in the future")
     elif owner_when is not None and when < owner_when:
         errs.append(f"{hid}: admission.signed_at is before the owner's signature")
+    reviewer_on = reviewer_signed_on(manifest)
+    if reviewer_on is not None and reviewer_on > today:
+        reviewer_on = None  # refused in _owner_errors; no later date is bounded by a future one
+    if when is not None and reviewer_on is not None and when < reviewer_on:
+        errs.append(f"{hid}: admission.signed_at is before the reviewer's signature (contract §8: the reviewer "
+                    "signs the manifest before admission)")
     admitted_on = when if when is not None and when <= today else today
 
     # dependencies: the frozen required inputs, never the manifest's list
@@ -662,6 +719,7 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
     else:
         listed = list(blocking)
     g15_sha256: str | None = None
+    g15_closed_on: date | None = None
     for gid in sorted(set(spec["blocking_gaps"]) | set(listed)):
         if gid not in gaps:
             errs.append(f"{hid}: unknown blocking gap {gid!r}")
@@ -670,6 +728,8 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
         errs += [f"{hid}: {e}" for e in gerrs]
         if gid == "G15":
             g15_sha256 = sha
+            if sha is not None:
+                g15_closed_on = parse_date(gaps[gid]["closure"].get("closed_at"))
 
     # coverage: the measured count against the frozen floor, and the receipt's typed content
     cov = hyp.get("coverage") if isinstance(hyp.get("coverage"), dict) else None
@@ -682,7 +742,10 @@ def hypothesis_errors(hyp: dict[str, Any], manifest: dict[str, Any], repo_root: 
         elif _is_int(spec["n_floor"]) and n < spec["n_floor"]:
             errs.append(f"{hid}: coverage {n} is below the sample floor {spec['n_floor']} (frozen)")
         if spec["scope"] is not None:
-            errs += coverage_receipt_errors(hid, spec, cov, repo_root, today, g15_sha256)
+            errs += coverage_receipt_errors(
+                hid, spec, cov, repo_root, today, g15_sha256,
+                admitted_on=when if when is not None and when <= today else None,
+                reviewer_on=reviewer_on, g15_closed_on=g15_closed_on)
         else:
             errs += file_receipt_errors(cov.get("receipt"), repo_root, f"{hid}: coverage receipt")
 
