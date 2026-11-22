@@ -199,6 +199,58 @@ Every card also carries `where_it_paid` and `where_it_did_not`: each cut with at
 the sign of its net return and sorted by size, and `report.md` prints the six largest of each. A run file may list
 `prior_dev_looks` (earlier development runs at the same effect); they are named in `max_t.multiplicity`.
 
+## The residual card (`xs-residual-card/1`, 2026-11-22)
+
+A module that passes may only be a known effect in another form. A one-month reversal ranked inside sectors is still
+the one-month reversal, and a tilt toward small or volatile names earns what those names earn. Numerai scores a
+signal only after taking out its exposure to known factors, and WorldQuant BRAIN rejects an alpha that lives only in
+illiquid names or repeats one already submitted. This section borrows those checks as descriptions. It is computed
+for every carded module and kept in its own top-level `residual` key, so `cards`, `ranking`, the bar,
+`discovery-frozen.json` and the ledger records are exactly what they were. Nothing in it enters the selection.
+
+**Factors.** Each is known before the close of decision day d, like the signals:
+
+| Factor | Definition |
+|---|---|
+| `beta_252` | beta of the close-to-close return to the members' equal-weighted mean, 252 sessions through d−1 |
+| `volatility_63` | standard deviation of the close-to-close return, 63 sessions through d−1 |
+| `liquidity_21` | log median dollar volume over the 21 sessions through d−1, the size proxy (the store has no shares outstanding) |
+| `reversal_21` | the opposite of the return over the 21 sessions through d−1 (one-month reversal) |
+| `momentum_12_1` | the return over the 231 sessions ending 21 sessions before d−1 (12-1 momentum) |
+
+Each night the ranked names' values become cross-sectional ranks scaled to −0.5 .. 0.5. A missing value sits at 0,
+the middle, and `factor_known_share` says how many names had each factor (a store shorter than 252 sessions has no
+momentum at all).
+
+**What a module's entry holds:**
+
+- `exposure`: the book's weighted rank gap, longs minus shorts. A pooled 20 % module on its own factor reads about
+  0.8.
+- `attribution_bp`: each night, the outcomes of the ranked names are regressed on the factor ranks and the sector
+  dummies. The module's spread then splits exactly into each factor's coefficient times the book's exposure, a
+  sector part and a `residual`. The parts, with `unidentified` below, add up to `gross`. The regression reads that
+  night's own outcomes, so this describes what the spread was made of; it forecasts nothing. A within-sector book is
+  balanced inside each sector, so its sector part is 0.
+- `fit`: on how many nights the named split is pinned down. Exact arithmetic is not identification: when two factors'
+  ranks move together, any split between them fits as well as any other. So each night the factor ranks are taken
+  with the intercept and sector dummies projected out and each column scaled to unit length. The split counts only
+  when that matrix has full rank and a condition number of at most `MAX_CONDITION` (30, Belsley, Kuh and Welsch's
+  line for a strong near-dependence). The counts are `identified`, `rank_deficient` and `ill_conditioned`, with
+  `condition_median`. On a night that fails, the factors and the sector together go to `unidentified` and no named
+  part is credited. The residual is kept, because the fitted values do not depend on the split. A factor no ranked
+  name has that night (all ranks 0) is left out of the check: its exposure and its part are 0.
+- `residual`: the residual's own cut (nights, gross, net of the module's cost, t).
+- `liquidity_halves`: the same module ranked again inside the names at or above, and below, that night's median
+  dollar volume. Each half is a book of its own: its picks, its turnover (close-to-close: the share of its names
+  replaced since its previous night) and the run's cost rule on that turnover. Each half also reports `turnover`. An
+  effect that lives only in the less liquid half shows here, and so does one whose cost does.
+- `names`: the ten largest contributors to the mean spread, and the spread without them.
+- `correlation` (beside the modules): Pearson of the nightly gross spreads of each pair of carded modules, on the
+  nights both traded.
+
+The card ranks every night again with the code `evaluate` uses (`_night_index`, `_book`) and refuses to go on if a
+book does not give back the spread the bar judged.
+
 ## The queue of published effects (#1212)
 
 `docs/research/cross-section-queue.json` is the file the factory takes its next run from
@@ -251,6 +303,12 @@ sector by correlation over the whole sample, so a sector's membership in 2010 us
 - The flat cost per side was set for index members at the auctions. A run with lower floors ranks stocks that cost
   more to trade, so its run file should set `cost_bp_per_side` to a measured figure; the default 1 bp is not one.
 - Cost is a floor: a flat rate per side at the auctions, four sides a night, no borrow fee on the short side.
+- The residual card knows five factors and the sector. Anything else the spread holds stays in its residual,
+  including a known effect the set lacks (value, quality, earnings drift). Its liquidity factor stands in for size.
+  Below the condition-number line, collinear factors still share their credit by least squares, so read two named
+  parts that both move with one effect as one part between them.
+- A card's sector-based cuts and the residual card's liquidity halves each pay their own turnover (see "What a cut
+  is charged"). A cut of whole nights pays the module's.
 - A night with fewer than `min_session_bars` priced names is dropped, so an overnight or close-to-close return after
   it spans more than one session.
 
@@ -361,3 +419,49 @@ Where each card says it paid, cuts of 100+ nights, net bp:
 
 Two entries stay queued (weekly reversal, 12-1 momentum, both seen before on development days), one is blocked
 (post-earnings drift) and one retired (overnight persistence).
+
+## The residual card on the monthly reversal (2026-11-22, scratch ledger, development days only)
+
+`xsq-short-term-reversal-monthly-v1`'s run file was run again with only its `run_id` changed
+(`…-residual-replay-20261122`). It ran on grid-svr, on a fresh scratch ledger, against a copy of exactly the 817
+files and the state record its 11-19 run declared, every hash checked. The run took 2 min 25 s and peaked at 0.96 GB.
+
+**Parity.** The same files were run again with main's code (`df1dee69`). The two runs give byte-identical
+`data-manifest.json` and `discovery-frozen.json`. Their `report.json` differs only in the new `residual` key and one
+added known limit. Both differ slightly from the 11-19 report because of main's later changes to the valid-bar rule.
+Pooled 10 % moved from 3.532 to 3.535 bp gross. The within-sector 10 % module is unchanged at 4.43 gross, 3.53 net,
+t 2.17, and it still passes.
+
+What its spread is made of:
+
+| Module | Gross bp | One-month reversal | Beta | Momentum | Volatility | Liquidity | Sector | Residual gross | Residual net | Residual t |
+|---|---|---|---|---|---|---|---|---|---|---|
+| within sector 10 % (passed) | 4.43 | 2.85 (rank gap 0.83) | 0.39 | 0.59 | −0.30 | 0.05 | 0.00 | 0.84 | −0.06 | 1.90 |
+| pooled 10 % | 3.53 | 3.25 (rank gap 0.90) | 0.67 | 0.63 | −0.57 | 0.05 | −0.95 | 0.45 | −0.34 | 0.98 |
+
+The parts of each row add up to its gross. The named split is identified on all 3,271 nights of every module
+(median condition number 2.25; no night is rank-deficient or over 30), so the identification check changes none of
+these figures.
+
+The figures are from a second branch run (2026-11-22, `monthly-reversal-r2`, fresh scratch ledger, 2 min 18 s,
+0.96 GB). It carries Codex's review fixes, the identification check and halves priced on their own turnover, and
+matches the first branch run byte for byte except in `residual`. Report sha256: branch `5f278419…` (the first
+branch run was `dc6165ea…`), main `2446e59e…`.
+
+**What the card shows:**
+
+- **It is the one-month reversal factor, not a new effect.** That is what the queue entry was set up to test (Jegadeesh 1990), and its
+  book is the factor's top and bottom tenth inside each sector. Once that factor, beta, momentum and volatility take
+  their parts, 0.84 bp a night is left before cost and nothing after it.
+- **It holds in both halves.** The liquid half earns 4.76 bp gross and 3.76 net on its own turnover of 0.25 a night.
+  The other half earns 4.24 gross and 3.18 net on 0.26, against the whole module's 0.23. Charged the module's cost
+  instead, the halves read 3.86 and 3.33 net, which is what the first run reported.
+- **It is not a few names.** It earns 3.33 bp without its ten largest contributors (ETFC, CCL, UAL, EXPE, UAA and
+  others, each 0.09 to 0.18 bp).
+
+A confirmation look would therefore test the published one-month reversal inside sectors, which is a fair question.
+A pass would replicate a known factor; it would not find anything new.
+
+Outputs: grid-svr `/data/agent-home/anikdang/xs-residual-card-20261122/runs/monthly-reversal-r2/` (branch,
+code `code-r2/`), `monthly-reversal/` (the first branch run) and `monthly-reversal-main/` (main), with the code
+copies beside them.
