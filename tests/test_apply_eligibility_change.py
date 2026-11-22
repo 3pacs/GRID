@@ -192,3 +192,23 @@ def test_the_migration_changes_no_flag():
            if isinstance(n, ast.Constant) and isinstance(n.value, str) and n is not docstring]
     assert sql and not [s for s in sql if "feature_registry" in s or "model_eligible" in s]
     assert m.down_revision == "regime_history_revs_20261122"
+
+
+
+@pytest.mark.parametrize("flag, value, ok", [
+    ("--lock-timeout", "0", False), ("--lock-timeout", "61", False), ("--lock-timeout", "5", True),
+    ("--statement-timeout", "9", False), ("--statement-timeout", "601", False), ("--statement-timeout", "60", True),
+])
+def test_timeouts_are_bounded_at_the_command_line(flag, value, ok):
+    parse = {"--lock-timeout": elig._bounded_seconds(1, 60), "--statement-timeout": elig._bounded_seconds(10, 600)}[flag]
+    if ok:
+        assert parse(value) == int(value)
+    else:
+        with pytest.raises(Exception, match="between"):
+            parse(value)
+
+
+def test_the_blocker_query_is_one_literal_with_bound_values():
+    sql = str(elig.BLOCKERS_SQL)
+    assert ":key" in sql and "AccessShareLock" in sql and "pg_backend_pid()" in sql
+    assert "{" not in sql and "%" not in sql

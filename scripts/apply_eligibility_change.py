@@ -53,6 +53,13 @@ change set that is still in effect changed it. If any row diverges the whole rol
 divergent rows are reported; nothing is partly restored. A set can be rolled back once, a rollback set cannot
 itself be rolled back (apply again instead), and the rollback is recorded as its own change set
 (``action = 'rollback'``, ``rolls_back = X``). The prerequisite gate does not apply to a rollback.
+
+**Bounded waits and blockers.** Every run sets ``lock_timeout`` (``--lock-timeout``, default 5 s) and
+``statement_timeout`` (``--statement-timeout``, default 60 s) for its transaction. Before a write takes any lock,
+it lists other sessions holding or waiting for anything stronger than a read lock on ``feature_registry`` or the
+log, or holding this script's advisory lock, and refuses while any exists. A dry run reports them under
+``blockers``. A lock wait that still runs out is reported as a refusal with the blockers at that moment, and
+nothing is written.
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ from typing import Any, Callable, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import DBAPIError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -347,6 +355,38 @@ def check_authority(conn: Connection, app_role: Optional[str] = None) -> dict[st
 # ── apply ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 TIMEOUTS_SQL = text("SELECT set_config('lock_timeout', :lock, true), set_config('statement_timeout', :stmt, true)")
+
+# ── bounded waits and blockers ──────────────────────────────────────────────────────────────────────────────
+# Every run sets lock_timeout and statement_timeout for its own transaction (TIMEOUTS_SQL), so no wait is
+# unbounded. Before a write takes any lock, BLOCKERS_SQL lists every other session that holds or waits for a
+# lock stronger than AccessShareLock on feature_registry or the change log, or that holds this script's advisory
+# lock. A write refuses while any exists ("retry when they finish") rather than queueing behind it. Plain reads
+# (AccessShareLock) never block an apply. A lock wait that still runs out (a blocker that arrived after the
+# preflight) becomes a refusal with the blockers at that moment, never a traceback.
+LOCK_TIMEOUT_DEFAULT_S, STATEMENT_TIMEOUT_DEFAULT_S = 5, 60
+BLOCKERS_SQL = text("""
+SELECT l.pid, a.usename, a.application_name, a.state, l.locktype, l.mode, l.granted,
+       coalesce(c.relname, '') AS relation,
+       extract(epoch FROM (clock_timestamp() - a.xact_start))::int AS xact_seconds
+FROM pg_locks l
+LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+LEFT JOIN pg_class c ON c.oid = l.relation
+WHERE l.pid <> pg_backend_pid()
+  AND (
+        (l.locktype = 'relation'
+         AND l.relation IN (to_regclass('feature_registry'), to_regclass('feature_eligibility_changes'))
+         AND l.mode <> 'AccessShareLock')
+     OR (l.locktype = 'advisory' AND l.objsubid = 1
+         AND ((l.classid::bigint << 32) | l.objid::bigint) = :key)
+      )
+ORDER BY l.pid, l.mode
+""")
+LOCK_WAIT_SQLSTATES = {"55P03": "lock_timeout", "57014": "statement_timeout"}
+
+
+def find_blockers(conn: Connection) -> list[dict[str, Any]]:
+    """Other sessions that would make a write wait, or that a write would queue behind."""
+    return [dict(r) for r in conn.execute(BLOCKERS_SQL, {"key": ADVISORY_LOCK_KEY}).mappings()]
 LOCK_SQL = text("SELECT pg_advisory_xact_lock(:key)")
 
 PLANNED_SQL = text("""
@@ -506,7 +546,8 @@ def apply_rollback(conn: Connection, target: uuid.UUID, change_set: uuid.UUID) -
 
 def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
         prerequisites: Optional[dict[str, Any]] = None, app_role: Optional[str] = None, plan: Plan = PLAN,
-        lock_timeout: str = "5s", statement_timeout: str = "60s") -> dict[str, Any]:
+        lock_timeout: str = f"{LOCK_TIMEOUT_DEFAULT_S}s",
+        statement_timeout: str = f"{STATEMENT_TIMEOUT_DEFAULT_S}s") -> dict[str, Any]:
     """One dry run, apply or rollback in one transaction. ``prerequisites`` is ``deployed_prerequisites()``."""
     mode = ("rollback" if rollback_of else "apply") + ("" if write else "_dry_run")
     report: dict[str, Any] = {"mode": mode, "plan": plan.name, "writes_to_database": False, "refusals": []}
@@ -525,6 +566,14 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
             if not write:
                 conn.execute(text("SET TRANSACTION READ ONLY"))
             conn.execute(TIMEOUTS_SQL, {"lock": lock_timeout, "stmt": statement_timeout})
+            blockers = find_blockers(conn)
+            report["blockers"] = blockers
+            if blockers:
+                reason = (f"{len({b['pid'] for b in blockers})} other session(s) hold or wait for locks on "
+                          "feature_registry or the change log (or this script's advisory lock); retry when they finish")
+                if write:
+                    raise Refused([reason])
+                would_refuse.append(reason)
             if write:
                 conn.execute(LOCK_SQL, {"key": ADVISORY_LOCK_KEY})
             authority = check_authority(conn, app_role)
@@ -556,9 +605,29 @@ def run(engine: Engine, *, write: bool, rollback_of: Optional[uuid.UUID] = None,
         report.update(status="refused", refusals=refused.reasons, **refused.details)
         report["writes_to_database"] = False
         return report
+    except DBAPIError as exc:
+        which = LOCK_WAIT_SQLSTATES.get(getattr(getattr(exc, "orig", None), "pgcode", None))
+        if which is None:
+            raise
+        limit = lock_timeout if which == "lock_timeout" else statement_timeout
+        with engine.connect() as conn:
+            blockers = find_blockers(conn)
+        report.update(status="refused", writes_to_database=False, blockers=blockers,
+                      refusals=[f"a lock wait exceeded {which} {limit}; the transaction was rolled back and "
+                                "nothing was written; retry when the blocking sessions finish"])
+        return report
     if not write:
         report["would_refuse"] = would_refuse
     return report
+
+
+def _bounded_seconds(low: int, high: int):
+    def parse(raw: str) -> int:
+        value = int(raw)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low} and {high} seconds")
+        return value
+    return parse
 
 
 def _redacted(url: str) -> str:
@@ -573,6 +642,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--rollback", type=uuid.UUID, metavar="CHANGE_SET", help="roll back this change set")
     ap.add_argument("--code-root", type=Path, action="append", default=[],
                     help="another deployed code tree the prerequisite gate must also find (repeatable)")
+    ap.add_argument("--lock-timeout", type=_bounded_seconds(1, 60), default=LOCK_TIMEOUT_DEFAULT_S,
+                    help=f"seconds any lock may be waited for (1-60, default {LOCK_TIMEOUT_DEFAULT_S})")
+    ap.add_argument("--statement-timeout", type=_bounded_seconds(10, 600), default=STATEMENT_TIMEOUT_DEFAULT_S,
+                    help=f"seconds any statement may run (10-600, default {STATEMENT_TIMEOUT_DEFAULT_S})")
     ap.add_argument("--db-url-env", default=DB_URL_ENV,
                     help=f"environment variable holding the database URL (default {DB_URL_ENV}); "
                          "unset falls back to config.settings.DB_URL")
@@ -588,7 +661,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prerequisites = None if args.rollback else deployed_prerequisites(args.code_root)
     engine = create_engine(db_url, pool_pre_ping=True)
     try:
-        report = run(engine, write=args.apply, rollback_of=args.rollback, prerequisites=prerequisites)
+        report = run(engine, write=args.apply, rollback_of=args.rollback, prerequisites=prerequisites,
+                     lock_timeout=f"{args.lock_timeout}s", statement_timeout=f"{args.statement_timeout}s")
     finally:
         engine.dispose()
     report["database"] = _redacted(db_url)

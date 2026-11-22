@@ -481,3 +481,93 @@ def test_rollback_refuses_while_a_later_set_on_the_same_feature_is_in_effect(db)
     report = _rollback(db.owner, set_1)  # lunar_phase was turned back on by hand before set 2: still divergent
     assert report["status"] == "refused"
     assert report["divergent"][0]["reasons"] == ["its flag is True, not the False this set left"]
+
+
+# ── bounded waits and blockers (Codex's release-owner note on #1346) ────────────────────────────────────────
+
+
+class _Held:
+    """Another session holding locks in an open transaction until closed."""
+
+    def __init__(self, engine: Engine, *statements: str, params: dict | None = None):
+        self.conn = engine.connect()
+        self.trans = self.conn.begin()
+        for statement in statements:
+            self.conn.execute(text(statement), params or {})
+        self.pid = self.conn.execute(text("SELECT pg_backend_pid()")).scalar_one()
+
+    def close(self) -> None:
+        self.trans.rollback()
+        self.conn.close()
+
+
+@pytest.mark.parametrize("statements, mode", [
+    (("LOCK TABLE feature_registry IN SHARE MODE",), "ShareLock"),
+    (("SELECT id FROM feature_registry WHERE name = 'vix_spot' FOR UPDATE",), "RowShareLock"),
+    (("UPDATE feature_registry SET deprecated_at = deprecated_at WHERE name = 'copper'",), "RowExclusiveLock"),
+])
+def test_a_write_refuses_before_any_lock_while_another_session_holds_feature_registry(db, statements, mode):
+    _migrate(db.owner)
+    before = _flags(db.admin)
+    held = _Held(db.admin, *statements)
+    try:
+        dry = elig.run(db.owner, write=False, prerequisites=PASSING_GATE)
+        assert any(b["pid"] == held.pid and b["mode"] == mode for b in dry["blockers"])
+        assert any("retry when they finish" in r for r in dry["would_refuse"])
+        report = _apply(db.owner)
+        assert report["status"] == "refused" and not report["writes_to_database"]
+        assert any(b["pid"] == held.pid and b["relation"] == "feature_registry" for b in report["blockers"])
+    finally:
+        held.close()
+    assert _flags(db.admin) == before and _log(db.admin) == []
+    assert _apply(db.owner)["status"] == "applied"           # once the session is gone the same run goes through
+
+
+def test_a_plain_read_never_blocks_an_apply(db):
+    _migrate(db.owner)
+    held = _Held(db.admin, "SELECT count(*) FROM feature_registry")
+    try:
+        report = _apply(db.owner)
+    finally:
+        held.close()
+    assert report["status"] == "applied" and report["blockers"] == []
+
+
+def test_another_run_holding_the_advisory_lock_is_a_blocker(db):
+    _migrate(db.owner)
+    held = _Held(db.admin, "SELECT pg_advisory_xact_lock(:key)", params={"key": elig.ADVISORY_LOCK_KEY})
+    try:
+        report = _apply(db.owner)
+    finally:
+        held.close()
+    assert report["status"] == "refused"
+    assert [b["locktype"] for b in report["blockers"] if b["pid"] == held.pid] == ["advisory"]
+
+
+def test_a_lock_wait_that_runs_out_is_a_bounded_refusal_not_a_traceback(db, monkeypatch):
+    """A blocker that arrives after the preflight: the wait is bounded by lock_timeout, nothing is written, and the
+    report names the blocker."""
+    import time
+
+    _migrate(db.owner)
+    before = _flags(db.admin)
+    held = _Held(db.admin, "LOCK TABLE feature_registry IN SHARE MODE")
+    real_find = elig.find_blockers
+    calls = {"n": 0}
+
+    def _miss_the_first_look(conn):
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else real_find(conn)
+
+    monkeypatch.setattr(elig, "find_blockers", _miss_the_first_look)
+    try:
+        started = time.monotonic()
+        report = _apply(db.owner, lock_timeout="300ms")
+        elapsed = time.monotonic() - started
+    finally:
+        held.close()
+    assert report["status"] == "refused" and not report["writes_to_database"]
+    assert "lock_timeout 300ms" in report["refusals"][0]
+    assert any(b["pid"] == held.pid for b in report["blockers"])
+    assert elapsed < 5
+    assert _flags(db.admin) == before and _log(db.admin) == []
