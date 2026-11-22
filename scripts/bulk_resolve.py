@@ -4,6 +4,15 @@
 Directly inserts into resolved_series from raw_series using entity_map lookups,
 processing in batches to handle 2.5M+ rows without memory issues.
 
+scripts/server_startup.sh runs this after every reboot. Both raw_series reads
+below apply the resolver's obs_date guard in SQL (see obs_date_guard_params
+and normalization.resolver.obs_date_verdict): an observation may not be dated
+after its pull's UTC date, a declared local-date series may be one day ahead,
+an event-dated series passes, and an undeclared next-day row is left out.
+Rows left out are not counted here (the resolver's own paths count theirs).
+This guards new inserts only; rows already in resolved_series are not
+re-checked.
+
 Usage:
   python scripts/bulk_resolve.py                        # resolve all gaps
   python scripts/bulk_resolve.py --family macro          # resolve one family
@@ -18,6 +27,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 # Allow running from repo root: python scripts/bulk_resolve.py
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -27,6 +37,12 @@ from sqlalchemy import text
 
 from db import get_engine
 from normalization.entity_map import SEED_MAPPINGS, NEW_MAPPINGS_V2
+from normalization.resolver import (
+    FUTURE_OBS_TOLERANCE_DAYS,
+    LOCAL_DATE_TOLERANCE_DAYS,
+    is_event_dated_series,
+    is_local_date_series,
+)
 
 BATCH_SIZE = 10_000
 
@@ -90,6 +106,23 @@ def get_features_needing_data(engine, feature_ids: set[int]) -> set[int]:
     return gaps
 
 
+def obs_date_guard_params(series_ids: list[str]) -> dict[str, Any]:
+    """Bound parameters for the obs_date guard in both raw_series reads below.
+
+    The same verdict as ``normalization.resolver.obs_date_verdict``, in SQL.
+    The series patterns are matched here, in Python, against the exact ids
+    this call resolves, so the SQL sees only bound id arrays and day counts,
+    never a pattern. The pull date is ``pull_timestamp``'s UTC date, as in
+    the resolver; ``pull_timestamp::date`` would use the session time zone.
+    """
+    return {
+        "observed_days": FUTURE_OBS_TOLERANCE_DAYS,
+        "local_date_days": LOCAL_DATE_TOLERANCE_DAYS,
+        "local_date_sids": [sid for sid in series_ids if is_local_date_series(sid)],
+        "event_dated_sids": [sid for sid in series_ids if is_event_dated_series(sid)],
+    }
+
+
 def resolve_feature_batch(
     engine,
     feature_id: int,
@@ -99,6 +132,7 @@ def resolve_feature_batch(
     """Resolve all raw_series rows for a single feature, inserting in batches.
 
     Selects from raw_series WHERE series_id IN (...) AND pull_status = 'SUCCESS',
+    keeps only rows the obs_date guard admits (``obs_date_guard_params``),
     groups by obs_date (taking the row with lowest source priority_rank), and
     inserts directly into resolved_series.
 
@@ -109,14 +143,23 @@ def resolve_feature_batch(
     # single INSERT ... SELECT with window functions for priority resolution.
     # This avoids pulling millions of rows into Python.
 
+    guard = obs_date_guard_params(series_ids)
+
     if dry_run:
         with engine.connect() as conn:
             count = conn.execute(
-                text(
-                    "SELECT COUNT(DISTINCT obs_date) FROM raw_series "
-                    "WHERE series_id = ANY(:sids) AND pull_status = 'SUCCESS'"
-                ),
-                {"sids": series_ids},
+                text("""
+                    SELECT COUNT(DISTINCT rs.obs_date) FROM raw_series rs
+                    WHERE rs.series_id = ANY(:sids)
+                      AND rs.pull_status = 'SUCCESS'
+                      AND (
+                        rs.obs_date <= (rs.pull_timestamp AT TIME ZONE 'UTC')::date + :observed_days
+                        OR (rs.series_id = ANY(CAST(:local_date_sids AS text[]))
+                            AND rs.obs_date <= (rs.pull_timestamp AT TIME ZONE 'UTC')::date + :local_date_days)
+                        OR rs.series_id = ANY(CAST(:event_dated_sids AS text[]))
+                      )
+                """),
+                {"sids": series_ids, **guard},
             ).scalar()
         return count or 0
 
@@ -144,6 +187,12 @@ def resolve_feature_batch(
                         JOIN source_catalog sc ON rs.source_id = sc.id
                         WHERE rs.series_id = ANY(:sids)
                           AND rs.pull_status = 'SUCCESS'
+                          AND (
+                            rs.obs_date <= (rs.pull_timestamp AT TIME ZONE 'UTC')::date + :observed_days
+                            OR (rs.series_id = ANY(CAST(:local_date_sids AS text[]))
+                                AND rs.obs_date <= (rs.pull_timestamp AT TIME ZONE 'UTC')::date + :local_date_days)
+                            OR rs.series_id = ANY(CAST(:event_dated_sids AS text[]))
+                          )
                     ),
                     winners AS (
                         SELECT obs_date, value, pull_timestamp, source_id
@@ -171,6 +220,7 @@ def resolve_feature_batch(
                     "feature_id": feature_id,
                     "batch_size": BATCH_SIZE,
                     "offset": offset,
+                    **guard,
                 },
             )
             rows_affected = result.rowcount
