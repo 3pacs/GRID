@@ -3352,6 +3352,401 @@ def _run_daily_intel_block(
         )
 
 
+# ─── Weekly intelligence block — own step, due period, resumable ─────────
+#     (2026-11-22)
+#
+# Until 2026-11-22 the weekly block sat at the end of run_intelligence_tasks.
+# It ran only when that step STARTED inside Sunday 03:00-03:10 UTC with
+# state.last_weekly_intel at least 160 h old, it ran after the daily
+# catch-up inside the step's 900 s cap, and state.last_weekly_intel was set
+# to the start time when the code after the last task was reached. Evidence
+# (griddb hermes_operator snapshots, read-only, 2026-11-21):
+#   * Loop cycles start 5-30 min apart, so a 10-minute start window is often
+#     missed; since 2026-11-16 a cycle evaluated intelligence_tasks inside
+#     03:00-03:10 UTC on 3 of 6 days. 2026-11-08: the block never started.
+#   * 2026-11-15: started 03:02 UTC. weekly_cross_reference (20.9 s) and
+#     weekly_lever_report (20.0 s) recorded; weekly_trust_report and
+#     weekly_actor_report never did; last_weekly_intel stayed 2026-11-01.
+#   * The edge validator is the last task. supply_chain_edges.
+#     last_validation_at is at most 2026-04-13: it has never run from here.
+#   * The last full run (2026-11-01, before the supply-chain tasks were
+#     added): trust report 537.5 s, actor report 178.6 s.
+#
+# Now:
+#   * Due rule (weekly_intel_due): due on the first cycle at or after the
+#     most recent Sunday 03:00 UTC boundary, as long as no COMPLETED weekly
+#     run has landed since that boundary and the last completed run is at
+#     least WEEKLY_INTEL_MIN_HOURS_BETWEEN old. No upper bound on the window.
+#   * Own run_cycle step (_run_weekly_intel_step), dispatched after
+#     intelligence_tasks (so the daily block always goes first) and after the
+#     trust cycle. It is not inside the 900 s intelligence_tasks cap.
+#   * Each task runs under its own _run_with_timeout budget. A task starts
+#     only if its budget fits in what is left of WEEKLY_INTEL_CYCLE_BUDGET_
+#     SECONDS this cycle, so the step never runs longer than that budget
+#     (plus bookkeeping). The rest wait for the next cycle.
+#   * Per-task outcomes for the current period are kept on OperatorState
+#     (weekly_intel_period / weekly_intel_outcome / weekly_intel_attempts /
+#     weekly_intel_deferrals) and persisted with the rest of the state, so an
+#     interrupted block (budget, restart) resumes with the tasks that have
+#     no final outcome yet.
+#   * A timeout is final for the period ("timed_out"): the worker cannot be
+#     killed, and a retry would run beside it. An exception is retried on a
+#     later cycle, up to WEEKLY_INTEL_MAX_ATTEMPTS, then "failed". Tasks that
+#     have never been tried go before retries, so one failing task cannot
+#     hold back the tasks behind it.
+#   * state.last_weekly_intel is set only when every task has a final
+#     outcome (done, done_late, timed_out, failed, failed_in_flight,
+#     failed_deferred).
+#
+# Task bodies are the pre-existing calls, unchanged (same function, same
+# arguments, same _run_intel_task name so state.task_status keys stay the
+# same). The one addition is _daily_intel_raise_if_task_status_failed after
+# each call, so a failure _run_intel_task swallowed is visible to the ledger.
+WEEKLY_INTEL_BOUNDARY_WEEKDAY = 6             # Sunday (datetime.weekday()); the old window's day
+WEEKLY_INTEL_BOUNDARY_HOUR = 3                # UTC hour the weekly due period opens; the old window's hour
+WEEKLY_INTEL_MIN_HOURS_BETWEEN = 160          # the old guard, now measured from the last COMPLETED run
+WEEKLY_INTEL_CYCLE_BUDGET_SECONDS = 1200      # per-cycle cap for this step; a task starts only if its own budget fits in what is left. Pin: every task budget <= this, and this + INTELLIGENCE_TASKS_TIMEOUT_SECONDS + TRUST_CYCLE_TIMEOUT_SECONDS < CYCLE_TIMEOUT_SECONDS (tests/test_hermes_weekly_intel_step.py).
+WEEKLY_INTEL_MAX_ATTEMPTS = 2                 # exception attempts per period before a task is "failed" (a timeout is final at once)
+WEEKLY_INTEL_MAX_DEFERRALS = 6                # cycles the trust report may wait for a running trust-cycle pass before it is "failed_deferred"
+# Per-task budgets, sized from the 2026-11-01 run (the last one that got
+# through the four reports) and the parser's own budget:
+WEEKLY_INTEL_REPORT_BUDGET_S = 300            # cross_reference (20.9 s on 11-01 and 11-15) and lever report (20.0 s): one LLM narrative each
+WEEKLY_INTEL_TRUST_REPORT_BUDGET_S = 1200     # 537.5 s on 11-01. Without a trust_result it re-runs update_trust_scores (one full propagation of ~13.6k sources); a trust cycle with two propagations took 2326 s on 11-18, so ~1160 s per propagation under load.
+WEEKLY_INTEL_ACTOR_REPORT_BUDGET_S = 360      # 178.6 s on 11-01; ~2x
+WEEKLY_INTEL_PARSER_BUDGET_S = 1020           # supply_chain_parser.WEEKLY_BUDGET_SECONDS (900 s, checked between tickers) + 120 s for the ticker in progress (SEC requests time out at 45 s each)
+WEEKLY_INTEL_VALIDATOR_BUDGET_S = 300         # 316 edges validated in ~17 s on 2026-04-13; 868 edges now (~50 s at that rate); ~6x
+
+_WEEKLY_INTEL_FINAL_OUTCOMES = frozenset({
+    "done", "done_late", "timed_out", "failed", "failed_in_flight", "failed_deferred",
+})
+
+
+class WeeklyIntelTask(NamedTuple):
+    """One task of the weekly intelligence block (see WEEKLY_INTEL_TASKS).
+
+    ``fn(engine, state)`` runs the task's pre-existing call and returns its
+    result. ``budget_s`` is the task's own ``_run_with_timeout`` budget.
+    ``waits_for_trust_cycle``: the task is deferred while a trust-cycle
+    pass's worker is still alive (the trust report re-runs
+    update_trust_scores, which writes signal_sources; two of those never run
+    at once by _run_trust_cycle_step's rules).
+    """
+    name: str
+    fn: Callable[[Any, OperatorState], Any]
+    budget_s: int
+    waits_for_trust_cycle: bool = False
+
+
+def _weekly_cross_reference(engine: Any, state: OperatorState) -> Any:
+    from intelligence.cross_reference import run_all_checks
+    result = _run_intel_task(
+        "weekly_cross_reference", run_all_checks, state, engine, skip_narrative=False,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "weekly_cross_reference")
+    return result
+
+
+def _weekly_lever_report(engine: Any, state: OperatorState) -> Any:
+    from intelligence.lever_pullers import generate_lever_report
+    result = _run_intel_task("weekly_lever_report", generate_lever_report, state, engine)
+    _daily_intel_raise_if_task_status_failed(state, "weekly_lever_report")
+    return result
+
+
+def _weekly_trust_report(engine: Any, state: OperatorState) -> Any:
+    from intelligence.trust_scorer import generate_trust_report
+    result = _run_intel_task("weekly_trust_report", generate_trust_report, state, engine)
+    _daily_intel_raise_if_task_status_failed(state, "weekly_trust_report")
+    return result
+
+
+def _weekly_actor_report(engine: Any, state: OperatorState) -> Any:
+    from intelligence.actor_network import generate_actor_report
+    result = _run_intel_task("weekly_actor_report", generate_actor_report, state, engine)
+    _daily_intel_raise_if_task_status_failed(state, "weekly_actor_report")
+    return result
+
+
+def _weekly_supply_chain_parser(engine: Any, state: OperatorState) -> Any:
+    # Supply-chain graph upkeep (3pacs/GRID#1179). The graph had no new edge
+    # after 2026-07-14: both jobs existed (_SOURCE_EXTRAS lists them) but
+    # nothing ran them. The 10-K parser is deterministic regex mining of SEC
+    # filings (no LLM; edges upsert as confidence 'derived'), SEC
+    # rate-limited, 15 minutes a week, resuming its pass from a persistent
+    # checkpoint. The validator then re-checks every edge against prices.
+    from ingestion.altdata.supply_chain_parser import (
+        run_weekly as run_supply_chain_parser,
+    )
+    result = _run_intel_task(
+        "weekly_supply_chain_parser", run_supply_chain_parser, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "weekly_supply_chain_parser")
+    return result
+
+
+def _weekly_supply_chain_edge_validator(engine: Any, state: OperatorState) -> Any:
+    from intelligence.supply_chain_edge_validator import (
+        run_weekly as run_supply_chain_edge_validator,
+    )
+    result = _run_intel_task(
+        "weekly_supply_chain_edge_validator", run_supply_chain_edge_validator, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "weekly_supply_chain_edge_validator")
+    return result
+
+
+# Same order as the pre-existing block. The validator stays after the parser
+# so it re-checks the edges the parser just added.
+WEEKLY_INTEL_TASKS: tuple[WeeklyIntelTask, ...] = (
+    WeeklyIntelTask("weekly_cross_reference", _weekly_cross_reference, WEEKLY_INTEL_REPORT_BUDGET_S),
+    WeeklyIntelTask("weekly_lever_report", _weekly_lever_report, WEEKLY_INTEL_REPORT_BUDGET_S),
+    WeeklyIntelTask("weekly_trust_report", _weekly_trust_report, WEEKLY_INTEL_TRUST_REPORT_BUDGET_S, waits_for_trust_cycle=True),
+    WeeklyIntelTask("weekly_actor_report", _weekly_actor_report, WEEKLY_INTEL_ACTOR_REPORT_BUDGET_S),
+    WeeklyIntelTask("weekly_supply_chain_parser", _weekly_supply_chain_parser, WEEKLY_INTEL_PARSER_BUDGET_S),
+    WeeklyIntelTask("weekly_supply_chain_edge_validator", _weekly_supply_chain_edge_validator, WEEKLY_INTEL_VALIDATOR_BUDGET_S),
+)
+
+# Same no-overlap registry pattern as _DAILY_INTEL_IN_FLIGHT, for weekly
+# task names: name -> {"token", "thread", "timed_out", "box"}. Process-local;
+# a restart loses it along with any orphaned worker it tracked.
+_WEEKLY_INTEL_LOCK = threading.RLock()
+_WEEKLY_INTEL_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+_weekly_intel_token_seq = 0
+
+
+def _next_weekly_intel_token() -> int:
+    global _weekly_intel_token_seq
+    with _WEEKLY_INTEL_LOCK:
+        _weekly_intel_token_seq += 1
+        return _weekly_intel_token_seq
+
+
+def _trust_cycle_worker_alive() -> bool:
+    """True while a trust-cycle pass's worker thread is still running."""
+    with _TRUST_CYCLE_LOCK:
+        worker = _TRUST_CYCLE_WORKER.get("thread")
+    return worker is not None and _daily_intel_thread_alive(worker)
+
+
+def weekly_intel_period_start(now: datetime) -> datetime:
+    """The most recent Sunday 03:00 UTC at or before *now*."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    days_back = (now.weekday() - WEEKLY_INTEL_BOUNDARY_WEEKDAY) % 7
+    boundary = (now - timedelta(days=days_back)).replace(
+        hour=WEEKLY_INTEL_BOUNDARY_HOUR, minute=0, second=0, microsecond=0,
+    )
+    if boundary > now:
+        boundary -= timedelta(days=7)
+    return boundary
+
+
+def weekly_intel_due(last_completed: datetime | None, now: datetime) -> bool:
+    """Return True if the weekly block is due at *now*.
+
+    Due when no completed weekly run has landed since the most recent Sunday
+    03:00 UTC boundary and the last completed run is at least
+    WEEKLY_INTEL_MIN_HOURS_BETWEEN hours old. Replaces the old
+    ``Sunday and hour == 3 and minute < 10`` start window. Naive datetimes
+    are taken as UTC (the hydrate_from_snapshot convention).
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if last_completed is None:
+        return True
+    if last_completed.tzinfo is None:
+        last_completed = last_completed.replace(tzinfo=timezone.utc)
+    return (
+        last_completed < weekly_intel_period_start(now)
+        and now - last_completed >= timedelta(hours=WEEKLY_INTEL_MIN_HOURS_BETWEEN)
+    )
+
+
+def _run_weekly_intel_block(
+    engine: Any, state: OperatorState, now: datetime,
+) -> dict[str, Any]:
+    """Run, or resume, the weekly tasks for the current due period.
+
+    See the comment block above WEEKLY_INTEL_BOUNDARY_WEEKDAY for the rules.
+    Returns a summary for ``cycle_result["weekly_intel"]``; task return
+    values (the report texts and summaries the old block put in
+    ``cycle_result["intelligence"]`` under the same names) are under
+    ``"results"``.
+
+    State is persisted at the end of the cycle (save_cycle_snapshot), not
+    after each task, so a restart in the middle of this call can run a task
+    again. The same is true of the daily block; the weekly tasks are reports
+    and idempotent upserts.
+    """
+    period_iso = weekly_intel_period_start(now).date().isoformat()
+    if state.weekly_intel_period != period_iso:
+        state.weekly_intel_period = period_iso
+        state.weekly_intel_outcome = {}
+        state.weekly_intel_attempts = {}
+        state.weekly_intel_deferrals = {}
+        state.weekly_intel_period_outcome = None
+
+    outcome = state.weekly_intel_outcome
+    attempts = state.weekly_intel_attempts
+    pending = [t for t in WEEKLY_INTEL_TASKS if outcome.get(t.name) not in _WEEKLY_INTEL_FINAL_OUTCOMES]
+    order = (
+        [t for t in pending if attempts.get(t.name, 0) == 0]
+        + [t for t in pending if attempts.get(t.name, 0) > 0]
+    )
+
+    results: dict[str, Any] = {}
+    ran: list[str] = []
+    waiting: list[str] = []
+    budget_used = 0.0
+
+    for task in order:
+        if budget_used + task.budget_s > WEEKLY_INTEL_CYCLE_BUDGET_SECONDS:
+            # Keep table order: the validator must not jump ahead of the
+            # parser whose edges it checks.
+            waiting = [t.name for t in order[order.index(task):]]
+            break
+
+        with _WEEKLY_INTEL_LOCK:
+            existing = _WEEKLY_INTEL_IN_FLIGHT.get(task.name)
+            if existing is not None and _daily_intel_thread_alive(existing.get("thread")):
+                # An earlier attempt's worker (a timeout this process could
+                # not kill) is still doing this task's work.
+                outcome[task.name] = "failed_in_flight"
+                log.warning(
+                    "weekly_intel task '{n}': an earlier worker is still running "
+                    "— recorded failed_in_flight for period {p}",
+                    n=task.name, p=period_iso,
+                )
+                continue
+
+        if task.waits_for_trust_cycle and _trust_cycle_worker_alive():
+            deferrals = state.weekly_intel_deferrals.get(task.name, 0) + 1
+            state.weekly_intel_deferrals[task.name] = deferrals
+            if deferrals >= WEEKLY_INTEL_MAX_DEFERRALS:
+                outcome[task.name] = "failed_deferred"
+            else:
+                outcome[task.name] = "deferred"
+            log.warning(
+                "weekly_intel task '{n}' deferred ({d}/{m}): a trust-cycle pass "
+                "is still running",
+                n=task.name, d=deferrals, m=WEEKLY_INTEL_MAX_DEFERRALS,
+            )
+            continue
+
+        with _WEEKLY_INTEL_LOCK:
+            token = _next_weekly_intel_token()
+            box: dict[str, Any] = {}
+            _WEEKLY_INTEL_IN_FLIGHT[task.name] = {
+                "token": token, "thread": None, "timed_out": False, "box": box,
+            }
+
+        def _run_task(t: WeeklyIntelTask = task, tok: int = token, bx: dict[str, Any] = box) -> None:
+            with _WEEKLY_INTEL_LOCK:
+                entry = _WEEKLY_INTEL_IN_FLIGHT.get(t.name)
+                if entry is not None and entry.get("token") == tok:
+                    entry["thread"] = threading.get_ident()
+            fn_ok = False
+            try:
+                bx["result"] = t.fn(engine, state)
+                fn_ok = True
+            finally:
+                with _WEEKLY_INTEL_LOCK:
+                    bx["finished"] = True
+                    bx["fn_ok"] = fn_ok
+                    entry = _WEEKLY_INTEL_IN_FLIGHT.get(t.name)
+                    if entry is not None and entry.get("thread") == threading.get_ident():
+                        entry["thread"] = None
+                    if (entry is not None and entry.get("token") == tok
+                            and entry.get("timed_out") and fn_ok
+                            and state.weekly_intel_period == period_iso
+                            and state.weekly_intel_outcome.get(t.name) == "timed_out"):
+                        # Finished after its wrapper gave up. Record it;
+                        # the result is not published (no caller is left).
+                        state.weekly_intel_outcome[t.name] = "done_late"
+                        log.info("weekly_intel task {n} done_late", n=t.name)
+
+        state.current_step = f"weekly_intel:{task.name}"
+        t0 = time.monotonic()
+        _, ok = _run_with_timeout(f"weekly_intel:{task.name}", _run_task, task.budget_s, state)
+        budget_used += time.monotonic() - t0
+        ran.append(task.name)
+
+        with _WEEKLY_INTEL_LOCK:
+            if ok or (box.get("finished") and box.get("fn_ok")):
+                results[task.name] = box.get("result")
+                outcome[task.name] = "done"
+            elif box.get("finished"):
+                n = attempts.get(task.name, 0) + 1
+                attempts[task.name] = n
+                outcome[task.name] = "failed" if n >= WEEKLY_INTEL_MAX_ATTEMPTS else "retry_pending"
+            else:
+                entry = _WEEKLY_INTEL_IN_FLIGHT.get(task.name)
+                if entry is not None and entry.get("token") == token:
+                    entry["timed_out"] = True
+                attempts[task.name] = attempts.get(task.name, 0) + 1
+                outcome[task.name] = "timed_out"
+
+    complete = all(outcome.get(t.name) in _WEEKLY_INTEL_FINAL_OUTCOMES for t in WEEKLY_INTEL_TASKS)
+    if complete:
+        state.last_weekly_intel = now
+        clean = all(outcome.get(t.name) in ("done", "done_late") for t in WEEKLY_INTEL_TASKS)
+        state.weekly_intel_period_outcome = "complete" if clean else "complete_with_failures"
+
+    log.info(
+        "weekly_intel: period={p} ran={r} waiting={w} outcomes={o} budget_used={b:.1f}s "
+        "complete={c}",
+        p=period_iso, r=ran, w=waiting, o=dict(outcome), b=budget_used, c=complete,
+    )
+    return {
+        "period": period_iso,
+        "ran": ran,
+        "waiting_for_next_cycle": waiting,
+        "outcomes": dict(outcome),
+        "budget_used_s": round(budget_used, 1),
+        "complete": complete,
+        "period_outcome": state.weekly_intel_period_outcome,
+        "results": results,
+    }
+
+
+def _run_weekly_intel_step(
+    engine: Any,
+    state: OperatorState,
+    dry_run: bool,
+    cycle_result: dict[str, Any],
+) -> None:
+    """Run the weekly intelligence block as its own ``run_cycle`` step.
+
+    Dispatched after ``intelligence_tasks`` (so the daily block runs first
+    in every cycle) and after the trust cycle. No ``_run_with_timeout``
+    around the whole step: each task already has its own, and an abandoned
+    driver would keep starting tasks in the background. The step is bounded
+    by WEEKLY_INTEL_CYCLE_BUDGET_SECONDS because a task only starts when its
+    own budget fits in what is left.
+
+    ``state.cooldowns.can_retry`` is not consulted, for the reason
+    ``_run_sector_and_intelligence_steps`` gives: the 24 h timeout blacklist
+    would hold a task for a day after one slow run; the per-period outcomes
+    are this step's throttle.
+    """
+    if dry_run:
+        return
+    now = datetime.now(timezone.utc)
+    if not weekly_intel_due(state.last_weekly_intel, now):
+        return
+    log.info(
+        "Running weekly intelligence block (period from {b})",
+        b=weekly_intel_period_start(now).isoformat(),
+    )
+    try:
+        state.current_step = "weekly_intel"
+        cycle_result["weekly_intel"] = _run_weekly_intel_block(engine, state, now)
+    except Exception as exc:  # noqa: BLE001 — never let this step end the cycle
+        log.warning("Weekly intelligence step failed: {e}", e=str(exc))
+        cycle_result["weekly_intel"] = {"error": str(exc)}
+
+
 def run_intelligence_tasks(
     engine: Any,
     state: OperatorState,
@@ -3379,11 +3774,9 @@ def run_intelligence_tasks(
             - options_tracker.run_improvement_cycle
             - backtest_scanner.review_existing_hypotheses
 
-        Weekly (Sunday 3:00 AM):
-            - cross_reference.run_all_checks (full, with LLM narrative)
-            - lever_pullers.generate_lever_report
-            - trust_scorer.generate_trust_report
-            - actor_network.generate_actor_report
+        Weekly (due from Sunday 03:00 UTC): moved out to its own run_cycle
+        step on 2026-11-22 (see _run_weekly_intel_step and
+        WEEKLY_INTEL_TASKS); not run here.
     """
     results: dict[str, Any] = {}
     now = datetime.now(timezone.utc)
@@ -3747,93 +4140,13 @@ def run_intelligence_tasks(
             results["contagion_feedback"] = {"status": "failed", "error": str(exc)}
         state.last_contagion_feedback = now
 
-    # ── Weekly (Sunday 3:00 AM) ──────────────────────────────────────
-
-    is_sunday = now.weekday() == 6
-    is_weekly_window = is_sunday and (now.hour == 3 and now.minute < 10)
-    weekly_due = is_weekly_window and _hours_since(state.last_weekly_intel) >= 160
-
-    if weekly_due:
-        log.info("Running weekly intelligence reports (Sunday 3:00 AM)")
-
-        try:
-            from intelligence.cross_reference import run_all_checks
-            results["weekly_cross_reference"] = _run_intel_task(
-                "weekly_cross_reference",
-                run_all_checks,
-                state,
-                engine,
-                skip_narrative=False,
-            )
-        except Exception as exc:
-            log.warning("Weekly cross-reference import failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.lever_pullers import generate_lever_report
-            results["weekly_lever_report"] = _run_intel_task(
-                "weekly_lever_report",
-                generate_lever_report,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Lever report import failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.trust_scorer import generate_trust_report
-            results["weekly_trust_report"] = _run_intel_task(
-                "weekly_trust_report",
-                generate_trust_report,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Trust report import failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.actor_network import generate_actor_report
-            results["weekly_actor_report"] = _run_intel_task(
-                "weekly_actor_report",
-                generate_actor_report,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Actor report import failed: {e}", e=str(exc))
-
-        # Supply-chain graph upkeep (3pacs/GRID#1179). The graph had no new
-        # edge after 2026-07-14: both jobs existed (_SOURCE_EXTRAS lists them)
-        # but nothing ran them. The 10-K parser is deterministic regex mining
-        # of SEC filings (no LLM; edges upsert as confidence 'derived'), SEC
-        # rate-limited, 15 minutes a week, resuming its pass from a persistent
-        # checkpoint. The validator then re-checks every edge against prices.
-        try:
-            from ingestion.altdata.supply_chain_parser import (
-                run_weekly as run_supply_chain_parser,
-            )
-            results["weekly_supply_chain_parser"] = _run_intel_task(
-                "weekly_supply_chain_parser",
-                run_supply_chain_parser,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Supply-chain parser import failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.supply_chain_edge_validator import (
-                run_weekly as run_supply_chain_edge_validator,
-            )
-            results["weekly_supply_chain_edge_validator"] = _run_intel_task(
-                "weekly_supply_chain_edge_validator",
-                run_supply_chain_edge_validator,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Supply-chain edge validator import failed: {e}", e=str(exc))
-
-        state.last_weekly_intel = now
+    # ── Weekly (Sunday 03:00 UTC) ────────────────────────────────────
+    # Moved out of this step on 2026-11-22 to its own run_cycle step,
+    # _run_weekly_intel_step (dispatched after the trust cycle). It used to
+    # run here only when this step STARTED inside Sunday 03:00-03:10 UTC,
+    # after the daily block and inside this step's 900 s cap, so most weeks
+    # it never started or was abandoned part-way. Do not re-add weekly
+    # tasks to this function; add them to WEEKLY_INTEL_TASKS.
 
     return results
 
@@ -5006,6 +5319,14 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     #      resumable (2026-11-18). It used to run inside intelligence_tasks
     #      and starve the daily-intel block; see _run_trust_cycle_step.
     _run_trust_cycle_step(engine, state, dry_run, cycle_result)
+
+    # 7f''. Weekly intelligence block — own step, after the daily block (in
+    #       intelligence_tasks) and the trust cycle; due from Sunday 03:00
+    #       UTC until it completes, resumable, own per-task budgets
+    #       (2026-11-22). It used to run inside intelligence_tasks only when
+    #       that step started inside Sunday 03:00-03:10 UTC; see
+    #       _run_weekly_intel_step.
+    _run_weekly_intel_step(engine, state, dry_run, cycle_result)
 
     # 7g. Rotation paper trading — daily after 17:00 UTC (market close)
     try:
