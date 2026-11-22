@@ -489,3 +489,109 @@ the vault witness file `05-GRID/Paper-Log/e2/` in its own clone
 pushes after each run. No database connection, no
 orders. Templates only; installing them is an owner step (see the service
 template header and `evals/e2/README.md`).
+
+## `grid-options-dedicated.{service,timer}` (templates, not installed)
+
+The schwab-mode full-universe options pull on its own timer
+(`scripts/run_options_dedicated.py`). A full schwab-mode run is about 19 min:
+about 80 Schwab calls at 2 s, plus about 160 Yahoo names × 6 expiries at ≥ 1 s,
+with a 1,000-request Yahoo cap. That does not fit the smart scheduler's options
+job: 840 s, inside a Hermes step pinned at 1,260 s. This unit gives the run its
+own budget:
+
+- a cooperative wall budget of 25 min;
+- `TimeoutStartSec=35min` as the backstop. The unit is `Type=oneshot`, and
+  `RuntimeMaxSec` has no effect on oneshot units.
+
+It runs as `grid` from the release tree, with the repo `.env` and the 3.14 venv.
+It takes no root actions.
+
+**Inert until both switches are on.** Every run exits 0 with an
+`OPTIONS_DEDICATED {"status": "REFUSED", ...}` line, touching no provider, DB or
+lock, unless all of these hold:
+
+- `GRID_OPTIONS_PRIMARY_PROVIDER=schwab`;
+- `GRID_OPTIONS_SCHWAB_READERS=admin-only`;
+- the provider selector confirms schwab;
+- `GRID_OPTIONS_DEDICATED_TIMER=1`.
+
+**What `GRID_OPTIONS_DEDICATED_TIMER=1` changes in schwab mode.** The smart
+scheduler's options job, and the daily scheduler's slots from 10:20 New York
+(16:00Z / 20:00Z / 22:00Z), hand their full-universe run to this unit. They
+request nothing and report SKIPPED `dedicated_options_timer`; the daily
+scheduler logs `Options daily pull handed off …`.
+
+Three things stay as they are:
+
+- **The 09:30 New York morning pull stays in grid-scheduler.** GEM's trigger
+  (`scripts/gem_daily_capture.py`) waits for that pull's `Options daily pull
+  complete` line, until its 10:20 New York deadline.
+- **GEM and the oracle forward pass are not handed off.** They are subset
+  writers.
+- **Nothing changes without schwab mode or the flag.**
+
+**Schedule.** Mon–Fri at 16:10Z and 20:10Z: the daily scheduler's in-session
+UTC slots, 10 minutes later. The scheduler ran FRED, yfinance and Form 4 before
+options, so the Yahoo tail still follows its yfinance price pull. 22:00Z is
+always after the cash close and is not scheduled. In summer, 20:10Z is after the
+close too, so that run logs a post-session skip. `Persistent=false`.
+
+**What it honours.** Writer label `options_dedicated`, which gives it its own
+tail cursor (`~/.local/state/grid/options_tail_cursor.options_dedicated.json`)
+and its own 45-min Schwab gap. It passes no `deadline_at`, so the Yahoo budget
+is the 1,000-request module cap, not a window size. The Yahoo pacing, 429 latch,
+30-min hold marker (shared with the scheduler writers), cash-close cut-off and
+cursor all apply. Names the wall budget does not reach are DEFERRED, and the
+next slot reads them first. Exit 1 only when the run is FAILED.
+
+### Install (owner decision)
+
+Check that the runner refuses before you enable anything. Run it read-only first:
+
+```bash
+cd /data/grid_v4/grid_release
+sudo -u grid sh -c 'set -a; . /home/grid/grid_v4/grid_repo/.env; set +a; \
+  /data/grid_v4/grid_venv-314/bin/python scripts/run_options_dedicated.py'
+# without GRID_OPTIONS_DEDICATED_TIMER=1: OPTIONS_DEDICATED {"reason": "dedicated timer not declared: ...", "status": "REFUSED"}
+```
+
+Install the units. Until the flag is set, the timer fires and every run refuses:
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-options-dedicated.service.template \
+    /etc/systemd/system/grid-options-dedicated.service
+sudo install -m 0644 deploy/systemd/grid-options-dedicated.timer.template \
+    /etc/systemd/system/grid-options-dedicated.timer
+sudo systemctl daemon-reload
+systemd-analyze verify /etc/systemd/system/grid-options-dedicated.service /etc/systemd/system/grid-options-dedicated.timer
+sudo systemctl enable --now grid-options-dedicated.timer
+systemctl list-timers grid-options-dedicated.timer      # NEXT: a weekday 16:10 or 20:10 UTC
+```
+
+Hand off: set `GRID_OPTIONS_DEDICATED_TIMER=1` in `/home/grid/grid_v4/grid_repo/.env`
+(schwab mode must already be on). Then restart the two scheduler processes so
+they read it:
+
+```bash
+sudo systemctl restart grid-hermes                       # smart scheduler (options job)
+# grid-scheduler is in deploy/python314 NO_AUTO_RESTART: restart it when
+# `journalctl -u grid-scheduler -f` shows it idle between passes.
+sudo systemctl restart grid-scheduler
+```
+
+The dedicated unit reads the `.env` on every run, so it needs no restart.
+
+First-run check, after a 16:10Z slot:
+
+```bash
+journalctl -u grid-options-dedicated.service -n 80 --no-pager | grep -E 'OPTIONS_DEDICATED|Yahoo request budget|resume'
+journalctl -u grid-scheduler --since today | grep -E 'Options daily pull (complete|handed off)'
+journalctl -u grid-hermes --since today | grep -E 'options skipped .*dedicated_options_timer'
+```
+
+### Roll back
+
+To roll back, remove `GRID_OPTIONS_DEDICATED_TIMER` from the `.env` (or set it to
+anything but `1`) and restart grid-hermes and grid-scheduler as above. The
+schedulers take the run back, and the timer's runs refuse. To remove the unit
+too, run `sudo systemctl disable --now grid-options-dedicated.timer`.

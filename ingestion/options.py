@@ -819,6 +819,50 @@ def options_primary_provider() -> str:
     return value if value in ("yahoo", "schwab") else "cboe"
 
 
+# Schwab mode only (2026-11-22, pre-open list item 7): the full-universe run (~80 Schwab calls plus
+# ~960 Yahoo requests at >= 1 s, ~19 min) gets its own systemd timer
+# (deploy/systemd/grid-options-dedicated.*, scripts/run_options_dedicated.py) instead of the smart
+# scheduler's 840 s window. The operator declares that timer installed with
+# GRID_OPTIONS_DEDICATED_TIMER=1; only then do the scheduler writers hand their full-universe run
+# to it (``dedicated_timer_handoff``). Without schwab mode and the flag nothing here applies.
+DEDICATED_CAPTURE_SOURCE = "options_dedicated"
+DEDICATED_HANDOFF_REASON = "dedicated_options_timer"
+# GEM's event trigger (scripts/gem_daily_capture.py) waits for the daily scheduler's own "Options
+# daily pull complete" line up to its absolute 10:20 New York deadline. So the daily scheduler keeps
+# its morning pull and hands off only from 10:20 New York (its 16:00Z / 20:00Z / 22:00Z slots).
+GEM_TRIGGER_WINDOW_END_ET = (10, 20)
+
+
+def dedicated_timer_declared() -> bool:
+    """True when GRID_OPTIONS_DEDICATED_TIMER=1: the operator installed the dedicated options timer."""
+    return os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1"
+
+
+def dedicated_timer_handoff(capture_source: str, now: datetime | None = None) -> str | None:
+    """``DEDICATED_HANDOFF_REASON`` when this writer's full-universe run belongs to the dedicated timer.
+
+    Only with schwab mode fully on (``options_primary_provider`` chose schwab) and the timer
+    declared. Only the two scheduler writers hand off: the smart scheduler always, the daily
+    scheduler from ``GEM_TRIGGER_WINDOW_END_ET`` New York on. Every other writer (the dedicated
+    runner itself, GEM, the oracle forward pass, a manual run) is never handed off, and callers
+    apply this to full-universe runs only.
+    """
+    if not dedicated_timer_declared():
+        return None
+    # The raw value first, so cboe/yahoo never consult the selector (it logs for schwab without readers).
+    if os.getenv("GRID_OPTIONS_PRIMARY_PROVIDER", "").strip().lower() != "schwab":
+        return None
+    if options_primary_provider() != "schwab":
+        return None
+    if capture_source == "smart_scheduler":
+        return DEDICATED_HANDOFF_REASON
+    if capture_source == "daily_scheduler":
+        local = (now if now is not None else _utc_now()).astimezone(_EQUITY_TZ)
+        if (local.hour, local.minute) >= GEM_TRIGGER_WINDOW_END_ET:
+            return DEDICATED_HANDOFF_REASON
+    return None
+
+
 class CboeFirstOptionsClient:
     """Cboe primary, Yahoo fallback, one provider per ticker capture.
 
@@ -990,6 +1034,11 @@ class OptionsPuller(BasePuller):
         within the session's runs, by the run that completes that cycle, which
         then starts the next cycle with nothing covered.
 
+        Schwab mode with GRID_OPTIONS_DEDICATED_TIMER=1: a full-universe run by
+        the smart or daily scheduler writer that ``dedicated_timer_handoff``
+        hands off requests nothing; every core ticker is SKIPPED
+        ``dedicated_options_timer`` (summary SKIPPED).
+
         A 401/403 stops this entire run, including when it first occurs in
         the catalyst tail after every core ticker succeeds. Earlier complete
         captures remain, but coverage is PARTIAL and source freshness is not
@@ -1007,6 +1056,20 @@ class OptionsPuller(BasePuller):
             raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
 
         full_universe = tickers is None and include_catalyst_universe and max_expirations == MAX_EXPIRATIONS
+        # Schwab mode with the dedicated timer declared (``dedicated_timer_handoff``): the scheduler
+        # writers leave the full universe to it. The literal flag check comes first, so without
+        # GRID_OPTIONS_DEDICATED_TIMER=1 nothing else here is evaluated and the run is unchanged.
+        if full_universe and os.getenv("GRID_OPTIONS_DEDICATED_TIMER", "").strip() == "1":
+            handoff = dedicated_timer_handoff(capture_source)
+            if handoff is not None:
+                log.info(
+                    "Options pull handed off: the dedicated options timer runs the schwab-mode full "
+                    "universe ({w} writer, GRID_OPTIONS_DEDICATED_TIMER=1)", w=capture_source,
+                )
+                return OptionsPullResults([
+                    {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": handoff}
+                    for ticker in EQUITY_TICKERS
+                ], full_universe=full_universe)
         if tickers is None:
             tickers = list(EQUITY_TICKERS)
             if include_catalyst_universe:
