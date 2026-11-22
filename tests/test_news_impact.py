@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -290,3 +292,60 @@ class TestDeepDiveEngine:
         assert report.name == "Apple"
         assert report.narrative == "Test narrative"
         mock_store.assert_called_once()
+
+
+# ── Basis points (report version 2, 2026-11-21) ──────────────────────────
+
+class TestBasisPoints:
+    """A fractional move times 10,000 is bps, the scale of CATALYST_TYPES' typical_bps."""
+
+    @staticmethod
+    def _catalyst(classifier, title: str = "NVIDIA beats Q3 earnings") -> Any:
+        return classifier.classify_news(
+            ticker="NVDA", title=title, summary="", sentiment="BULLISH",
+            source="Reuters", pub_date=date(2026, 11, 18), confidence=1.0,
+        )
+
+    def test_a_3pct_move_is_300_bps(self, decomposer):
+        with patch.object(decomposer, "_get_return", return_value=None), \
+                patch.object(decomposer, "_gather_catalysts", return_value=[]):
+            attr = decomposer.decompose_move("NVDA", date(2026, 11, 18), 0.03)
+        assert attr.total_explained_bps + attr.unexplained_bps == pytest.approx(300.0)
+        assert attr.unexplained_bps == pytest.approx(300.0)
+
+    def test_market_return_is_macro_bps(self, decomposer):
+        # SPY +1% on the day is 100 bps of macro; MAG7 sector beta 1.2 adds 20.
+        with patch.object(decomposer, "_get_return", return_value=0.01), \
+                patch.object(decomposer, "_gather_catalysts", return_value=[]):
+            attr = decomposer.decompose_move("NVDA", date(2026, 11, 18), -0.03)
+        assert attr.macro_contribution_bps == pytest.approx(100.0)
+        assert attr.sector_contribution_bps == pytest.approx(20.0)
+        assert attr.unexplained_bps == pytest.approx(180.0)
+
+    def test_an_earnings_beat_explains_a_3pct_move_on_the_same_scale(self, decomposer, classifier):
+        cat = self._catalyst(classifier)
+        assert cat.catalyst_type == "earnings"
+        assert cat.estimated_bps >= 300  # typical_bps 300 for earnings
+        with patch.object(decomposer, "_get_return", return_value=None), \
+                patch.object(decomposer, "_gather_catalysts", return_value=[cat]):
+            attr = decomposer.decompose_move("NVDA", date(2026, 11, 18), 0.03)
+        # The whole 300 bps move goes to the one aligned catalyst: nothing is
+        # left unexplained, and the attribution is no larger than the move.
+        assert attr.catalysts[0].estimated_bps == pytest.approx(300.0)
+        assert attr.total_explained_bps == pytest.approx(300.0)
+        assert attr.unexplained_bps == pytest.approx(0.0)
+
+    def test_stored_report_carries_its_version(self, mock_engine):
+        from intelligence import news_impact as ni
+
+        assert ni.BPS_PER_UNIT == 10_000 and ni.REPORT_VERSION == 2
+        engine = ni.DeepDiveEngine(mock_engine)
+        conn = mock_engine.begin.return_value.__enter__.return_value
+        with patch.object(engine.decomposer, "decompose_history", return_value=[]), \
+                patch.object(engine, "_generate_narrative", return_value=""):
+            engine.generate_deep_dive("NVDA", 30)
+        inserts = [c for c in conn.execute.call_args_list
+                   if "news_impact_reports" in str(c.args[0])]
+        assert inserts, conn.execute.call_args_list
+        payload = json.loads(inserts[-1].args[1]["p"])
+        assert payload["report_version"] == 2 and payload["bps_scale"] == "basis_points"

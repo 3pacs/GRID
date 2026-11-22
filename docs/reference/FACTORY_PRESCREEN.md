@@ -163,8 +163,11 @@ the slot.
 
 - No registration is on the ledger and no look has been run.
 - That the anchor copy is the one held off-host is not checked by code; the record says a person must.
-- The witness needs the receipt log's anchors exported to the vault file (`ReceiptLog.export_anchors`) and that
-  file committed and pushed. The nightly job posts each head to the hub; it does not export the anchors.
+- The witness needs the receipt log's anchors exported to the vault file and that file committed and pushed:
+  `scripts/desk_receipts_witness_sync.sh` does this after every receipt run once the owner installs it
+  (DESK_SOURCE_RECEIPTS.md, "Not done"). Before any registration, the receipt unit must also move to a pinned
+  checkout whose factory-ledger reader knows `FACTORY_PRESCREEN_REGISTERED` (7e3a263, the copy running on
+  2026-11-21, does not, and would record `factory_ledger` as unknown on the night after a registration).
 - Calendar-flag, cross-symbol, options and macro features cannot be pre-screened.
 - The block bootstrap handles neighbouring days. Dependence across longer stretches (a whole
   regime) is not modelled; the by-year means are there to be read.

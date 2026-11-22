@@ -618,24 +618,46 @@ def _gather_lever_pullers() -> tuple[str, str]:
     return "", ""
 
 
+def _fmt_options_value(value: Any) -> str:
+    """One measured options value for chat context; ``n/a`` when it was not measured."""
+    if value is None:
+        return "n/a"
+    import math
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{number:.4g}" if math.isfinite(number) else "n/a"
+
+
 def _gather_options_context(ticker: str | None) -> tuple[str, str]:
     """Return options signals from DB (never a Schwab-captured day: chat context is not admin-only)."""
     try:
         engine = _get_db_engine()
 
         from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+        # options_daily_signals holds measured values per ticker and day, not a
+        # call with a direction and a confidence: the signal_type / direction /
+        # confidence / detail columns this read named never existed, so it
+        # failed on PostgreSQL and chat had no options context until
+        # 2026-11-21. It now reports the measured values as they are.
         with engine.connect() as conn:
             rows = conn.execute(visible_sql(
-                "SELECT ticker, signal_type, direction, confidence, detail, signal_date "
+                "SELECT ticker, signal_date, put_call_ratio, iv_atm, iv_skew, max_pain, spot_price "
                 "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
-                "WHERE (:t IS NULL OR ticker = :t) "
+                # CAST: a server-side PREPARE cannot type a bare ":t IS NULL".
+                "WHERE (CAST(:t AS TEXT) IS NULL OR ticker = :t) "
                 "ORDER BY signal_date DESC LIMIT :lim"
-            ), {"t": ticker, "lim": 8}).fetchall()
+            ), {"t": ticker.upper() if ticker else None, "lim": 8}).fetchall()
             if rows:
-                lines = ["Options signals:"]
+                lines = ["Options signals (measured, per ticker and day):"]
                 for r in rows:
-                    detail = r[4][:80] if r[4] else ""
-                    lines.append(f"  {r[0]} [{r[1]}]: {r[2]} ({r[3]:.0%} confidence) — {detail}")
+                    lines.append(f"  {r[0]} {r[1]}: " + ", ".join(
+                        f"{name} {_fmt_options_value(value)}"
+                        for name, value in (("put/call", r[2]), ("ATM IV", r[3]), ("IV skew", r[4]),
+                                            ("max pain", r[5]), ("spot", r[6]))
+                    ))
                 return "\n".join(lines), "options_signals"
     except Exception as exc:
         log.debug("Chat context: options signals query failed: {e}", e=str(exc))

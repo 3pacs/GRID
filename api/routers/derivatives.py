@@ -444,11 +444,14 @@ def get_vol_surface(ticker: str, include_schwab: bool = Depends(viewer_is_admin)
             snap_date = latest[0]
 
             rows = conn.execute(visible_sql(
+                # The contract IV column is ``implied_vol`` (schema.sql, the
+                # options_snapshots view). ``implied_volatility`` never existed,
+                # so this read failed on PostgreSQL until 2026-11-21.
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
-                "implied_volatility, open_interest, volume, opt_type "
+                "implied_vol, open_interest, volume, opt_type "
                 "FROM " + VISIBLE_SNAPSHOTS + " s "
                 "WHERE ticker = :t AND snap_date = :sd "
-                "AND implied_volatility > 0 AND open_interest > 0 "
+                "AND implied_vol > 0 AND open_interest > 0 "
                 "AND expiry > :sd "
                 "ORDER BY expiry, strike",
                 include_schwab,
@@ -501,10 +504,10 @@ def get_skew(ticker: str, include_schwab: bool = Depends(viewer_is_admin)) -> di
 
             rows = conn.execute(visible_sql(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
-                "implied_volatility, opt_type "
+                "implied_vol, opt_type "
                 "FROM " + VISIBLE_SNAPSHOTS + " s "
                 "WHERE ticker = :t AND snap_date = :sd "
-                "AND implied_volatility > 0 AND expiry > :sd "
+                "AND implied_vol > 0 AND expiry > :sd "
                 "ORDER BY expiry, strike",
                 include_schwab,
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()

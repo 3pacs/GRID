@@ -38,6 +38,12 @@ Environment=DESK_FACTORY_ANCHOR=/data/grid_ledgers/factory/anchor/grid-module-fa
 Environment=DESK_PANEL_TRIALS_DB=/data/agent-home/anikdang/gex-signals-data/signals.db
 Environment=DESK_RECEIPTS_PYTHON=/data/grid_v4/grid_venv-314/bin/python
 ExecStart=/usr/bin/flock -n /tmp/grid-desk-receipts.lock /bin/bash @CODE@/scripts/desk_receipts_run.sh
+# Off-host witness (2026-11-21): after every run, failed runs included, export the anchor lines to the
+# dedicated vault clone, commit only 05-GRID/Paper-Log/desk-receipts/ and push it, so the factory
+# pre-screen look can verify against the pushed copy (scripts/desk_receipts_witness_sync.sh).
+# The clone must exist first: git clone 3pacs/obsidian-vault /home/grid/dev/obsidian-vault-deskwitness.
+ExecStopPost=/bin/bash @CODE@/scripts/desk_receipts_witness_sync.sh /home/grid/dev/obsidian-vault-deskwitness
+TimeoutStopSec=5min
 TimeoutStartSec=10min
 Nice=10
 StandardOutput=journal

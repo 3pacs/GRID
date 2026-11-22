@@ -104,10 +104,39 @@ CHANNEL_TEXT = {"market_briefings": "content", "thesis_snapshots": "narrative",
 CHANNEL_CLOCK = {"market_briefings": "created_at", "thesis_snapshots": "timestamp",
                  "market_diary": "generated_at", "audio": "generated_at"}
 
+# The briefing claim guard's verdict travels with every briefing, even when the
+# whole generator snapshot is over its 250 KB cap (every withheld snapshot from
+# 2026-11-05 on was 0.49-8.6 MB, so no withheld record carried its reasons).
+# Its rejected draft is bounded to CLAIM_GUARD_DRAFT_CAP_BYTES with a declared
+# truncation record (full size + sha256), never silently dropped. This field is
+# not part of the publication text, so TEXT_FIELD_CAP_BYTES and
+# PUBLICATIONS_AGGREGATE_CAP_BYTES (which count publication text only) do not
+# govern it; this cap does.
+CLAIM_GUARD_DRAFT_CAP_BYTES = 65_536
+CLAIM_GUARD_META_CAP_BYTES = 65_536
+# Static SQL text only (no interpolation); 65536 below equals CLAIM_GUARD_DRAFT_CAP_BYTES
+# (left() counts characters, so the prefix is re-bounded to bytes in Python).
+CLAIM_GUARD_COLUMNS = (
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN (snapshot_data -> 'publication_claim_guard') - 'rejected_candidate' END AS claim_guard_meta, "
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN left(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate', 65536) END "
+    "AS claim_guard_draft_prefix, "
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN octet_length(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate') END "
+    "AS claim_guard_draft_bytes, "
+    "CASE WHEN jsonb_typeof(snapshot_data -> 'publication_claim_guard') = 'object' "
+    "THEN encode(sha256(convert_to(snapshot_data -> 'publication_claim_guard' ->> 'rejected_candidate', "
+    "'UTF8')), 'hex') END AS claim_guard_draft_sha256, "
+)
+_CLAIM_GUARD_KEYS = ("claim_guard_meta", "claim_guard_draft_prefix", "claim_guard_draft_bytes",
+                     "claim_guard_draft_sha256")
+
 QUERIES = {
     "market_briefings": (
         "SELECT id, briefing_type, briefing_date, content, sentiment_score, sentiment_label, "
         "created_at, octet_length(snapshot_data::text) AS snapshot_bytes, "
+        + CLAIM_GUARD_COLUMNS +
         "CASE WHEN octet_length(snapshot_data::text) <= 250000 THEN snapshot_data ELSE NULL END "
         "AS snapshot_data FROM market_briefings "
         "WHERE created_at >= :start AND created_at < :end AND created_at <= :asof "
@@ -221,6 +250,53 @@ def screen_row(row: Any) -> list[str]:
     return reasons
 
 
+def _utf8_prefix(text: str, cap: int) -> str:
+    """Longest prefix of ``text`` within ``cap`` UTF-8 bytes, never splitting a character."""
+    return text.encode("utf-8")[:cap].decode("utf-8", errors="ignore")
+
+
+def bound_claim_guard(record: dict[str, Any]) -> dict[str, Any]:
+    """Fold the claim-guard columns into one bounded ``publication_claim_guard`` field.
+
+    Rows without the columns (older callers) are returned unchanged. A missing
+    guard is an explicit ``None``. The draft keeps at most
+    CLAIM_GUARD_DRAFT_CAP_BYTES and declares its full size, sha256 and whether
+    it was truncated.
+    """
+    if not any(key in record for key in _CLAIM_GUARD_KEYS):
+        return record
+    meta, prefix, draft_bytes, draft_sha = (record.pop(key, None) for key in _CLAIM_GUARD_KEYS)
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = None
+    if not isinstance(meta, dict):
+        record["publication_claim_guard"] = None
+        return record
+    guard: dict[str, Any] = dict(meta)
+    meta_bytes = len(canonical(guard))
+    if meta_bytes > CLAIM_GUARD_META_CAP_BYTES:
+        guard = {key: guard.get(key) for key in ("passed", "reasons", "reason_counts", "scope")}
+        guard["metadata_bound"] = {"utf8_bytes": meta_bytes, "cap_bytes": CLAIM_GUARD_META_CAP_BYTES,
+                                   "truncated": True,
+                                   "note": "guard metadata over cap; only verdict, reasons and counts kept"}
+    if isinstance(prefix, str):
+        kept = _utf8_prefix(prefix, CLAIM_GUARD_DRAFT_CAP_BYTES)
+        kept_bytes = len(kept.encode("utf-8"))
+        full_bytes = draft_bytes if isinstance(draft_bytes, int) else len(prefix.encode("utf-8"))
+        truncated = full_bytes > kept_bytes
+        guard["rejected_candidate"] = kept
+        guard["rejected_candidate_bound"] = {
+            "utf8_bytes": full_bytes, "retained_utf8_bytes": kept_bytes, "sha256": draft_sha,
+            "cap_bytes": CLAIM_GUARD_DRAFT_CAP_BYTES, "truncated": truncated,
+            "note": (f"rejected draft truncated to its first {kept_bytes} of {full_bytes} UTF-8 bytes; "
+                     "sha256 is of the full stored draft") if truncated else None,
+        }
+    record["publication_claim_guard"] = guard
+    return record
+
+
 def bounded_read(path: Path) -> bytes:
     """No symlink following and a hard byte bound, even if the file grows."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -274,6 +350,8 @@ def read_publications(engine: Any, day: date, limit: int) -> dict[str, Any]:
                          "bounded by the snapshot transaction timestamp",
             }
             for record in records:
+                if channel == "market_briefings":
+                    bound_claim_guard(record)
                 bundle["records"].append({"channel": channel, "record": record})
         try:
             rows = conn.execute(text(DIARY_CONTEXT_QUERY), {
@@ -461,7 +539,8 @@ def build_packet(bundle: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str,
         identity = f"{channel}:{row['id']}"
         content = row.get(CHANNEL_TEXT[channel])
         if channel == "market_briefings" and (row.get("snapshot_bytes") or 0) > 250000:
-            packet["blockers"].append(f"{identity}: stored generator context exceeds byte cap; omitted")
+            packet["blockers"].append(f"{identity}: stored generator context exceeds byte cap; omitted "
+                                      "(claim-guard verdict carried separately in publication_claim_guard)")
         if not isinstance(content, str) or not content.strip():
             packet["blockers"].append(f"{identity}: original text missing; no invented replacement")
             packet["capture_receipt"]["omitted_publication_ids"].append(identity)
