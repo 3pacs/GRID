@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -105,6 +105,35 @@ _EDGAR_RATE_DELAY: float = 0.15
 
 # Minimum position change threshold to flag as INCREASED/DECREASED (20%)
 _POSITION_CHANGE_THRESHOLD: float = 0.20
+
+# SEC Form 13F XML <value> switched from thousands of dollars to whole dollars
+# for filings made on or after 2023-01-03 (SEC Final Rule, Release No. 34-95148).
+_13F_DOLLAR_CUTOVER_DATE: date = date(2023, 1, 3)
+
+
+def _13f_value_multiplier(filing_date: date | str | None) -> int:
+    """Return USD multiplier for Form 13F ``<value>`` based on filing date.
+
+    Filings made on or after 2023-01-03 report ``<value>`` in whole dollars
+    (multiplier 1); earlier filings report in thousands of dollars (1000).
+    """
+    parsed: date | None = None
+    if isinstance(filing_date, datetime):
+        parsed = filing_date.date()
+    elif isinstance(filing_date, date):
+        parsed = filing_date
+    elif isinstance(filing_date, str) and filing_date.strip():
+        try:
+            parsed = date.fromisoformat(filing_date.strip()[:10])
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        log.warning(
+            "13F filing_date missing/unparseable ({d!r}); defaulting to whole-dollar multiplier (1)",
+            d=filing_date,
+        )
+        return 1
+    return 1 if parsed >= _13F_DOLLAR_CUTOVER_DATE else 1000
 
 # Request timeout
 _REQUEST_TIMEOUT: int = 30
@@ -369,7 +398,10 @@ class InstitutionalFlowsPuller(BasePuller):
         retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_13f_holdings(
-        self, cik: str, accession: str
+        self,
+        cik: str,
+        accession: str,
+        filing_date: date | str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch parsed holdings from a specific 13F filing.
 
@@ -379,10 +411,14 @@ class InstitutionalFlowsPuller(BasePuller):
         Parameters:
             cik: SEC CIK of the filer.
             accession: Accession number (e.g., '0001067983-24-000019').
+            filing_date: Filing date (``date`` or ISO string) used to determine
+                whether ``<value>`` is reported in whole dollars (>= 2023-01-03)
+                or thousands of dollars (< 2023-01-03).
 
         Returns:
             List of holding dicts.
         """
+        value_mult = _13f_value_multiplier(filing_date)
         # Build the filing directory URL
         acc_clean = accession.replace("-", "")
         base_url = f"{_EDGAR_13F_XML_BASE}/{cik}/{acc_clean}"
@@ -440,7 +476,7 @@ class InstitutionalFlowsPuller(BasePuller):
                 for field, tag in [
                     ("name", "nameOfIssuer"),
                     ("cusip", "cusip"),
-                    ("value", "value"),  # in thousands
+                    ("value", "value"),  # whole dollars >= 2023-01-03; thousands earlier
                     ("shares", "sshPrnamt"),
                     ("share_type", "sshPrnamtType"),
                     ("investment_discretion", "investmentDiscretion"),
@@ -452,10 +488,10 @@ class InstitutionalFlowsPuller(BasePuller):
                     if el is not None and el.text:
                         holding[field] = el.text.strip()
                 if holding.get("name") and holding.get("cusip"):
-                    # Convert value from thousands to actual
+                    # Normalize <value> to whole USD per filing date cutover
                     if "value" in holding:
                         try:
-                            holding["value_usd"] = int(holding["value"]) * 1000
+                            holding["value_usd"] = int(holding["value"]) * value_mult
                         except (ValueError, TypeError):
                             holding["value_usd"] = 0
                     holdings.append(holding)
@@ -524,7 +560,8 @@ class InstitutionalFlowsPuller(BasePuller):
                 "cusip": cusip,
                 "name": curr_holdings[cusip].get("name", ""),
                 "action": action,
-                "value_usd": curr_val,
+                "value_usd": abs(curr_val - prev_val),
+                "curr_value_usd": curr_val,
                 "prev_value_usd": prev_val,
                 "pct_change": round(pct_change, 4),
                 "shares": curr_holdings[cusip].get("shares"),
@@ -568,7 +605,11 @@ class InstitutionalFlowsPuller(BasePuller):
                         # Still store current holdings
                         accession = filings[0]["accession"]
                         if accession:
-                            holdings = self._fetch_13f_holdings(cik, accession)
+                            holdings = self._fetch_13f_holdings(
+                                cik,
+                                accession,
+                                filing_date=filings[0].get("filing_date"),
+                            )
                             time.sleep(_EDGAR_RATE_DELAY)
                             results.append({
                                 "feature": f"13F:{cik}",
@@ -583,13 +624,18 @@ class InstitutionalFlowsPuller(BasePuller):
                 curr_acc = filings[0]["accession"]
                 prev_acc = filings[1]["accession"]
                 curr_date_str = filings[0].get("filing_date", "")
+                prev_date_str = filings[1].get("filing_date", "")
 
                 if not curr_acc or not prev_acc:
                     continue
 
-                curr_holdings_list = self._fetch_13f_holdings(cik, curr_acc)
+                curr_holdings_list = self._fetch_13f_holdings(
+                    cik, curr_acc, filing_date=curr_date_str
+                )
                 time.sleep(_EDGAR_RATE_DELAY)
-                prev_holdings_list = self._fetch_13f_holdings(cik, prev_acc)
+                prev_holdings_list = self._fetch_13f_holdings(
+                    cik, prev_acc, filing_date=prev_date_str
+                )
                 time.sleep(_EDGAR_RATE_DELAY)
 
                 # Index by CUSIP
@@ -632,9 +678,12 @@ class InstitutionalFlowsPuller(BasePuller):
                                 "cusip": chg["cusip"],
                                 "issuer_name": chg.get("name", ""),
                                 "action": chg["action"],
+                                "curr_value_usd": chg.get("curr_value_usd"),
+                                "prev_value_usd": chg.get("prev_value_usd"),
                                 "pct_change": chg.get("pct_change"),
                                 "shares": chg.get("shares"),
                                 "filing_accession": curr_acc,
+                                "prev_filing_accession": prev_acc,
                             },
                         )
                         rows_inserted += 1
@@ -678,12 +727,18 @@ class InstitutionalFlowsPuller(BasePuller):
                                         "issuer_name": chg.get("name", ""),
                                         "action": chg.get("action"),
                                         "value_usd": float(chg.get("value_usd", 0) or 0),
+                                        "curr_value_usd": (
+                                            float(chg["curr_value_usd"])
+                                            if chg.get("curr_value_usd") is not None
+                                            else None
+                                        ),
                                         "prev_value_usd": float(
                                             chg.get("prev_value_usd", 0) or 0
                                         ),
                                         "pct_change": chg.get("pct_change"),
                                         "shares": chg.get("shares"),
                                         "filing_accession": curr_acc,
+                                        "prev_filing_accession": prev_acc,
                                     }),
                                 },
                             )

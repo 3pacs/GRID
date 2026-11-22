@@ -215,9 +215,14 @@ _DUMB_MONEY_SOURCES = {"prediction_market", "etf_flow"}
 
 
 def _signed_amount(flow: dict) -> float:
-    """Return positive for inflow, negative for outflow."""
+    """Return positive for inflow, negative for outflow, 0 for neutral/unsigned."""
     amt = flow["amount_usd"]
-    return amt if flow["direction"] == "inflow" else -amt
+    direction = flow.get("direction")
+    if direction == "inflow":
+        return amt
+    if direction == "outflow":
+        return -amt
+    return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -263,13 +268,15 @@ def aggregate_by_sector(engine: Engine, days: int = 30) -> dict[str, Any]:
 
     for f in flows:
         sector = _get_sector(f["ticker"])
+        if sector == "Unknown":
+            continue
         amt = f["amount_usd"]
         signed = _signed_amount(f)
         sd = sector_data[sector]
 
         if f["direction"] == "inflow":
             sd["inflow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             sd["outflow"] += amt
 
         # Actor accumulation (net signed)
@@ -431,7 +438,7 @@ def aggregate_by_time(
         if f["direction"] == "inflow":
             b["inflows"] += amt
             b["net_flow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             b["outflows"] += amt
             b["net_flow"] -= amt
 
@@ -490,10 +497,11 @@ def aggregate_by_actor_tier(engine: Engine, days: int = 30) -> dict[str, Any]:
 
         if f["direction"] == "inflow":
             td["inflow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             td["outflow"] += amt
 
-        td["sectors"][sector] += signed
+        if sector != "Unknown":
+            td["sectors"][sector] += signed
         actor = f["actor_name"] or "Unknown"
         td["actors"][actor] += signed
 
@@ -617,7 +625,7 @@ def compute_flow_momentum(engine: Engine, ticker: str, days: int = 30) -> dict[s
         direction = r[1]
         fdate = r[2]
 
-        signed = amt if direction == "inflow" else -amt
+        signed = amt if direction == "inflow" else (-amt if direction == "outflow" else 0.0)
 
         if isinstance(fdate, date):
             if fdate >= five_ago:
@@ -786,7 +794,7 @@ def aggregate_smart_vs_dumb(engine: Engine, days: int = 30) -> dict[str, Any]:
         bucket["sectors"][sector] += signed
         if f["direction"] == "inflow":
             bucket["inflow"] += amt
-        else:
+        elif f["direction"] == "outflow":
             bucket["outflow"] += amt
 
     # Divergence: when smart and dumb money disagree
@@ -882,7 +890,10 @@ def compute_sector_conviction(engine: Engine, days: int = 30) -> dict[str, dict]
         majority_dir = "inflow" if net_flow >= 0 else "outflow"
         agreeing_sources = set()
         for f in sflows:
-            f_dir = "inflow" if _signed_amount(f) >= 0 else "outflow"
+            signed_val = _signed_amount(f)
+            if signed_val == 0:
+                continue
+            f_dir = "inflow" if signed_val > 0 else "outflow"
             if f_dir == majority_dir:
                 agreeing_sources.add(f["source_type"])
         diversity_score = min(20, len(agreeing_sources) * 5)

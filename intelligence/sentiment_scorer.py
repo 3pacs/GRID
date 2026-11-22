@@ -30,8 +30,9 @@ Score interpretation:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -39,21 +40,52 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.journal_qualification import DECISION_JOURNAL, non_provisional_journal_select
-from store.observations import read_latest, read_latest_n, read_window
-from store.options_provenance import LATEST_DAILY_SIGNALS, visible_sql
+from store.observations import read_daily_policy_n, read_latest, read_window
+from store.options_provenance import VISIBLE_DAILY_SIGNALS, visible_sql
+
+_YF_DAILY_LOOKBACK_DAYS = 14
 
 
 def _recent_closes(conn: Any, series_id: str, n: int) -> list[Any]:
-    """The ``n`` newest yfinance closes for ``series_id``, newest first.
+    """The ``n`` newest policy-eligible yfinance daily closes for ``series_id``, newest first.
 
-    Bounds the scan to a calendar window that holds ``n`` sessions (7/5 per
-    session plus a 14-day holiday/gap margin). An unbounded ``read_latest_n``
-    fetched every vintage back to 1990 (~2M rows, ~8 s per call) for each of
-    the 15 reads a briefing makes. Same SUCCESS-only, latest-vintage rows; a
-    series with a gap longer than the margin returns fewer than ``n``.
+    Uses ``store.observations.read_daily_policy_n`` (matching
+    ``ollama/market_briefing.py::_read_yf_snapshot_value`` and
+    ``intelligence/market_diary.py``) so intraday ``INCOMPLETE`` or unmarked
+    captures are never mixed with completed prior-session closes. Bounds the
+    scan to a calendar window that holds ``n`` sessions (7/5 per session plus
+    a 14-day holiday/gap margin).
     """
-    start = datetime.now(timezone.utc).date() - timedelta(days=(n * 7) // 5 + 14)
-    return read_latest_n(conn, series_id, n, source="yfinance", start=start)
+    now = datetime.now(timezone.utc)
+    start = now.date() - timedelta(days=(n * 7) // 5 + 14)
+    return read_daily_policy_n(
+        conn, series_id, n, source="yfinance", start=start, as_of_ts=now,
+    )
+
+
+def _latest_daily_close(conn: Any, series_id: str) -> Any | None:
+    """Newest policy-eligible yfinance daily close for ``series_id``, or ``None``.
+
+    Matches ``ollama/market_briefing.py::_read_yf_snapshot_value``: reads via
+    ``read_daily_policy_n(..., 1, source="yfinance", ...)`` with ``as_of_ts=now``
+    so in-progress intraday pulls are withheld rather than mixed with prior-day
+    completed closes.
+    """
+    now = datetime.now(timezone.utc)
+    rows = read_daily_policy_n(
+        conn,
+        series_id,
+        1,
+        source="yfinance",
+        start=now.date() - timedelta(days=_YF_DAILY_LOOKBACK_DAYS),
+        as_of_ts=now,
+    )
+    return rows[0] if rows else None
+
+
+def _is_unavailable_component(comp: SentimentComponent) -> bool:
+    """True when a component abstained / has no directional reading."""
+    return comp.detail.endswith("available")
 
 # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -261,32 +293,43 @@ def _score_signals(engine: Engine, days: int = 7) -> SentimentComponent:
 
 
 def _score_flows(engine: Engine, days: int = 7) -> SentimentComponent:
-    """Score from net dollar flow direction."""
+    """Score from net directional dollar flows (unsigned/neutral rows abstain)."""
     inflow = 0.0
     outflow = 0.0
+    neutral = 0.0
+    today = date.today()
+    cutoff = today - timedelta(days=days)
 
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT direction, SUM(amount_usd) "
                 "FROM dollar_flows "
-                "WHERE flow_date >= CURRENT_DATE - :days "
+                "WHERE flow_date >= :cutoff AND flow_date <= :today "
                 "GROUP BY direction"
-            ), {"days": days}).fetchall()
+            ), {"cutoff": cutoff, "today": today}).fetchall()
 
             for direction, amount in rows:
+                amt = float(amount or 0)
                 if direction == "inflow":
-                    inflow = float(amount or 0)
+                    inflow += amt
                 elif direction == "outflow":
-                    outflow = float(amount or 0)
+                    outflow += amt
+                else:
+                    neutral += amt
     except Exception as e:
         log.warning("Flow scoring failed: {e}", e=e)
 
     total = inflow + outflow
     if total == 0:
+        if neutral > 0:
+            log.info(
+                "Sentiment flows component abstaining: ${m:.1f}M unsigned/neutral volume has no directional measure",
+                m=neutral / 1e6,
+            )
         return SentimentComponent(
             name="flows", raw_value=0.0, score=0.0,
-            weight=0.0, detail="No flow data available",
+            weight=0.0, detail="No directional flow data available",
         )
 
     # Net flow ratio, clamped
@@ -379,7 +422,7 @@ def _score_volatility(engine: Engine) -> SentimentComponent:
     """Score from VIX level — high VIX = bearish, low VIX = bullish."""
     try:
         with engine.connect() as conn:
-            row = read_latest(conn, "YF:^VIX:close", source="yfinance")
+            row = _latest_daily_close(conn, "YF:^VIX:close")
 
             if row:
                 vix = row.value
@@ -398,7 +441,7 @@ def _score_volatility(engine: Engine) -> SentimentComponent:
                     raw_value=vix,
                     score=max(-1.0, min(1.0, score)),
                     weight=0.0,
-                    detail=f"VIX={vix:.1f} → score={score:+.2f} (12=calm, 20=normal, 35+=fear)",
+                    detail=f"VIX={vix:.1f} as of {row.obs_date} → score={score:+.2f} (12=calm, 20=normal, 35+=fear)",
                 )
     except Exception as e:
         log.warning("Volatility scoring failed: {e}", e=e)
@@ -413,17 +456,22 @@ def _score_vol_term_structure(engine: Engine) -> SentimentComponent:
     """VIX vs VIX3M: contango = complacent (bullish), backwardation = fear (bearish)."""
     try:
         with engine.connect() as conn:
-            vix_obs = read_latest(conn, "YF:^VIX:close", source="yfinance")
-            vix3m_obs = read_latest(conn, "YF:^VIX3M:close", source="yfinance")
+            vix_obs = _latest_daily_close(conn, "YF:^VIX:close")
+            vix3m_obs = _latest_daily_close(conn, "YF:^VIX3M:close")
             vix = vix_obs.value if vix_obs else None
             vix3m = vix3m_obs.value if vix3m_obs else None
             if vix and vix3m and vix3m > 0:
                 ratio = vix / vix3m
                 # ratio < 1 = contango (normal/bullish), > 1 = backwardation (fear)
                 score = max(-1.0, min(1.0, (1.0 - ratio) * 3))
+                as_of_note = (
+                    f"as of {vix_obs.obs_date}"
+                    if vix_obs.obs_date == vix3m_obs.obs_date
+                    else f"VIX {vix_obs.obs_date} / VIX3M {vix3m_obs.obs_date}"
+                )
                 return SentimentComponent(
                     name="vol_term_structure", raw_value=ratio, score=score, weight=0.0,
-                    detail=f"VIX/VIX3M={ratio:.2f} ({'contango' if ratio < 1 else 'backwardation'})",
+                    detail=f"VIX/VIX3M={ratio:.2f} {as_of_note} ({'contango' if ratio < 1 else 'backwardation'})",
                 )
     except Exception as e:
         log.debug("Vol term structure scoring failed: {e}", e=e)
@@ -461,27 +509,33 @@ def _score_trend(engine: Engine) -> SentimentComponent:
     try:
         with engine.connect() as conn:
             rows = _recent_closes(conn, "YF:^GSPC:close", 200)
-            if len(rows) >= 50:
+            n_sessions = len(rows)
+            if n_sessions >= 50:
                 latest = rows[0].value
                 ma50 = sum(r.value for r in rows[:50]) / 50
                 above_50 = latest > ma50
-                above_200 = False
-                if len(rows) >= 200:
+                if n_sessions < 200:
+                    if above_50:
+                        score = 0.3
+                        detail = f"SPY above 50d MA; 200d MA unavailable ({n_sessions} sessions)"
+                    else:
+                        score = -0.3
+                        detail = f"SPY below 50d MA; 200d MA unavailable ({n_sessions} sessions)"
+                else:
                     ma200 = sum(r.value for r in rows[:200]) / 200
                     above_200 = latest > ma200
-
-                if above_50 and above_200:
-                    score = 0.8
-                    detail = "SPY above 50d & 200d MA (strong uptrend)"
-                elif above_50:
-                    score = 0.3
-                    detail = "SPY above 50d but below 200d MA (recovery)"
-                elif above_200:
-                    score = -0.2
-                    detail = "SPY below 50d but above 200d MA (pullback)"
-                else:
-                    score = -0.8
-                    detail = "SPY below 50d & 200d MA (downtrend)"
+                    if above_50 and above_200:
+                        score = 0.8
+                        detail = "SPY above 50d & 200d MA (strong uptrend)"
+                    elif above_50:
+                        score = 0.3
+                        detail = "SPY above 50d but below 200d MA (recovery)"
+                    elif above_200:
+                        score = -0.2
+                        detail = "SPY below 50d but above 200d MA (pullback)"
+                    else:
+                        score = -0.8
+                        detail = "SPY below 50d & 200d MA (downtrend)"
 
                 return SentimentComponent(
                     name="trend", raw_value=latest, score=score, weight=0.0, detail=detail,
@@ -492,43 +546,62 @@ def _score_trend(engine: Engine) -> SentimentComponent:
 
 
 def _score_put_call_ratio(engine: Engine) -> SentimentComponent:
-    """Put/call ratio from options data — high = fear (contrarian bullish)."""
+    """SPY put/call ratio from options data — high = fear (contrarian bullish)."""
     try:
+        today = date.today()
         with engine.connect() as conn:
-            row = conn.execute(visible_sql(
-                "SELECT AVG(put_call_ratio) FROM " + LATEST_DAILY_SIGNALS + " ods"
-            )).scalar()
-            if row:
-                pcr = float(row)
-                # PCR < 0.7 = complacent (bearish contrarian), > 1.0 = fear (bullish contrarian)
-                if pcr < 0.7:
-                    score = -0.5
-                elif pcr < 0.85:
-                    score = 0.0
-                elif pcr < 1.0:
-                    score = 0.3
+            row = conn.execute(
+                visible_sql(
+                    "SELECT ods.put_call_ratio, ods.signal_date "
+                    "FROM " + VISIBLE_DAILY_SIGNALS + " ods "
+                    "WHERE ods.ticker = :ticker "
+                    "AND ods.put_call_ratio IS NOT NULL "
+                    "AND ods.put_call_ratio > 0 "
+                    "AND ods.signal_date <= :as_of "
+                    "ORDER BY ods.signal_date DESC LIMIT 1"
+                ),
+                {"ticker": "SPY", "as_of": today},
+            ).fetchone()
+            if row and row[0] is not None:
+                pcr = float(row[0])
+                if not math.isfinite(pcr) or pcr <= 0:
+                    log.warning("SPY put/call ratio non-positive or non-finite ({v}); abstaining", v=row[0])
                 else:
-                    score = min(1.0, (pcr - 1.0) * 2 + 0.5)
-                return SentimentComponent(
-                    name="put_call_ratio", raw_value=pcr, score=max(-1.0, min(1.0, score)), weight=0.0,
-                    detail=f"P/C ratio={pcr:.2f} ({'fear/contrarian bullish' if pcr > 1.0 else 'complacent' if pcr < 0.7 else 'normal'})",
-                )
+                    sig_date = row[1]
+                    # SPY PCR < 0.7 = complacent (bearish contrarian), > 1.0 = fear (bullish contrarian)
+                    if pcr < 0.7:
+                        score = -0.5
+                    elif pcr < 0.85:
+                        score = 0.0
+                    elif pcr < 1.0:
+                        score = 0.3
+                    else:
+                        score = min(1.0, (pcr - 1.0) * 2 + 0.5)
+                    date_note = f" as of {sig_date}" if sig_date else ""
+                    return SentimentComponent(
+                        name="put_call_ratio", raw_value=pcr, score=max(-1.0, min(1.0, score)), weight=0.0,
+                        detail=f"SPY P/C ratio={pcr:.2f}{date_note} ({'fear/contrarian bullish' if pcr > 1.0 else 'complacent' if pcr < 0.7 else 'normal'})",
+                    )
     except Exception as e:
         log.debug("Put/call scoring failed: {e}", e=e)
     return SentimentComponent(name="put_call_ratio", raw_value=0.0, score=0.0, weight=0.0, detail="No data available")
 
 
 def _score_dark_pool(engine: Engine, days: int = 7) -> SentimentComponent:
-    """Dark pool buy/sell imbalance from dollar_flows."""
+    """Dark pool buy/sell imbalance from dollar_flows (abstains on unsigned volume)."""
+    today = date.today()
+    cutoff = today - timedelta(days=days)
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT direction, SUM(amount_usd) FROM dollar_flows "
-                "WHERE source_type = 'darkpool' AND flow_date >= CURRENT_DATE - :days "
+                "WHERE source_type = 'darkpool' "
+                "AND flow_date >= :cutoff AND flow_date <= :today "
                 "GROUP BY direction"
-            ), {"days": days}).fetchall()
-            inflow = sum(float(r[1]) for r in rows if r[0] == "inflow")
-            outflow = sum(float(r[1]) for r in rows if r[0] == "outflow")
+            ), {"cutoff": cutoff, "today": today}).fetchall()
+            inflow = sum(float(r[1] or 0) for r in rows if r[0] == "inflow")
+            outflow = sum(float(r[1] or 0) for r in rows if r[0] == "outflow")
+            neutral = sum(float(r[1] or 0) for r in rows if r[0] not in ("inflow", "outflow"))
             total = inflow + outflow
             if total > 0:
                 net = (inflow - outflow) / total
@@ -537,22 +610,31 @@ def _score_dark_pool(engine: Engine, days: int = 7) -> SentimentComponent:
                     name="dark_pool", raw_value=net, score=score, weight=0.0,
                     detail=f"Dark pool: ${inflow/1e6:.0f}M in, ${outflow/1e6:.0f}M out, net={net:+.2f}",
                 )
+            if neutral > 0:
+                log.info(
+                    "Sentiment dark_pool component abstaining: ${m:.1f}M unsigned/neutral volume has no directional measure",
+                    m=neutral / 1e6,
+                )
     except Exception as e:
         log.debug("Dark pool scoring failed: {e}", e=e)
-    return SentimentComponent(name="dark_pool", raw_value=0.0, score=0.0, weight=0.0, detail="No data available")
+    return SentimentComponent(name="dark_pool", raw_value=0.0, score=0.0, weight=0.0, detail="No directional dark pool data available")
 
 
 def _score_etf_flows(engine: Engine, days: int = 7) -> SentimentComponent:
-    """ETF fund flows from dollar_flows table."""
+    """ETF fund flows from dollar_flows table (abstains on unsigned volume)."""
+    today = date.today()
+    cutoff = today - timedelta(days=days)
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT direction, SUM(amount_usd) FROM dollar_flows "
-                "WHERE source_type IN ('etf_flow', 'etf_flows') AND flow_date >= CURRENT_DATE - :days "
+                "WHERE source_type IN ('etf_flow', 'etf_flows') "
+                "AND flow_date >= :cutoff AND flow_date <= :today "
                 "GROUP BY direction"
-            ), {"days": days}).fetchall()
-            inflow = sum(float(r[1]) for r in rows if r[0] == "inflow")
-            outflow = sum(float(r[1]) for r in rows if r[0] == "outflow")
+            ), {"cutoff": cutoff, "today": today}).fetchall()
+            inflow = sum(float(r[1] or 0) for r in rows if r[0] == "inflow")
+            outflow = sum(float(r[1] or 0) for r in rows if r[0] == "outflow")
+            neutral = sum(float(r[1] or 0) for r in rows if r[0] not in ("inflow", "outflow"))
             total = inflow + outflow
             if total > 0:
                 net = (inflow - outflow) / total
@@ -561,9 +643,14 @@ def _score_etf_flows(engine: Engine, days: int = 7) -> SentimentComponent:
                     name="etf_flows", raw_value=net, score=score, weight=0.0,
                     detail=f"ETF flows: ${inflow/1e6:.0f}M in, ${outflow/1e6:.0f}M out",
                 )
+            if neutral > 0:
+                log.info(
+                    "Sentiment etf_flows component abstaining: ${m:.1f}M unsigned/neutral volume has no directional measure",
+                    m=neutral / 1e6,
+                )
     except Exception as e:
         log.debug("ETF flow scoring failed: {e}", e=e)
-    return SentimentComponent(name="etf_flows", raw_value=0.0, score=0.0, weight=0.0, detail="No data available")
+    return SentimentComponent(name="etf_flows", raw_value=0.0, score=0.0, weight=0.0, detail="No directional ETF flow data available")
 
 
 def _score_insider(engine: Engine, days: int = 14) -> SentimentComponent:
@@ -699,7 +786,7 @@ def _score_fear_greed(engine: Engine) -> SentimentComponent:
     # We compute it from existing data rather than external API
     try:
         with engine.connect() as conn:
-            vix_obs = read_latest(conn, "YF:^VIX:close", source="yfinance")
+            vix_obs = _latest_daily_close(conn, "YF:^VIX:close")
             if vix_obs:
                 vix_val = vix_obs.value
                 # Simple fear/greed: VIX < 15 = extreme greed, > 30 = extreme fear
@@ -709,7 +796,7 @@ def _score_fear_greed(engine: Engine) -> SentimentComponent:
                 label = "extreme fear" if fg_score < 20 else "fear" if fg_score < 40 else "neutral" if fg_score < 60 else "greed" if fg_score < 80 else "extreme greed"
                 return SentimentComponent(
                     name="fear_greed", raw_value=fg_score, score=max(-1.0, min(1.0, score)), weight=0.0,
-                    detail=f"Fear/Greed proxy={fg_score:.0f}/100 ({label})",
+                    detail=f"Fear/Greed proxy={fg_score:.0f}/100 ({label}, VIX as of {vix_obs.obs_date})",
                 )
     except Exception as e:
         log.debug("Fear/greed scoring failed: {e}", e=e)
@@ -775,21 +862,29 @@ def compute_sentiment(engine: Engine) -> SentimentResult:
         _score_convergence(engine),
     ]
 
-    # Apply weights
-    total_weight = 0.0
-    weighted_sum = 0.0
+    # Apply weights: only components with a directional/valid reading participate.
+    # Abstained/unavailable components keep weight=0.0, and active weights are
+    # renormalized to sum to 1.0 so missing/unsigned proxies carry zero weight.
+    active_raw: list[tuple[SentimentComponent, float]] = []
     for comp in components:
-        w = weights.get(comp.name, 0.0)
-        comp.weight = w
-        # Skip components with no data (weight stays 0 in output)
-        if comp.detail.endswith("available"):
+        if _is_unavailable_component(comp):
+            comp.weight = 0.0
             continue
-        weighted_sum += comp.score * w
-        total_weight += w
+        w = float(weights.get(comp.name, 0.0))
+        if w <= 0.0:
+            comp.weight = 0.0
+            continue
+        active_raw.append((comp, w))
 
-    # Normalize
-    score = (weighted_sum / total_weight) if total_weight > 0 else 0.0
-    score = max(-1.0, min(1.0, score))
+    total_weight = sum(w for _, w in active_raw)
+    weighted_sum = 0.0
+    if total_weight > 0:
+        for comp, w in active_raw:
+            norm_w = w / total_weight
+            comp.weight = norm_w
+            weighted_sum += comp.score * norm_w
+
+    score = max(-1.0, min(1.0, weighted_sum)) if total_weight > 0 else 0.0
 
     # Determine label
     label = "NEUTRAL"
@@ -799,7 +894,7 @@ def compute_sentiment(engine: Engine) -> SentimentResult:
             break
 
     # Build context sentence
-    active = [c for c in components if not c.detail.endswith("available")]
+    active = [comp for comp, _ in active_raw]
     if active:
         strongest = max(active, key=lambda c: abs(c.score * c.weight))
         context = (
@@ -1020,6 +1115,8 @@ def _update_weights(engine: Engine) -> None:
                 comps = comp_json if isinstance(comp_json, list) else json.loads(comp_json)
 
                 for c in comps:
+                    if float(c.get("weight") or 0.0) <= 0.0:
+                        continue
                     name = c["name"]
                     comp_score = c["score"]
                     comp_total[name] = comp_total.get(name, 0) + 1

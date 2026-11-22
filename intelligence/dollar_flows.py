@@ -31,13 +31,14 @@ Key entry points:
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.engine import Engine
 
 from ingestion.market_calendar import trading_days_between
@@ -66,6 +67,17 @@ _AMOUNT_RANGES: dict[str, tuple[int, int]] = {
 # dropped and counted in skipped_stale_vwap rather than priced off a stale
 # close. Pinned per code review on PR #712.
 _VWAP_MAX_AGE_TRADING_DAYS: int = 5
+
+# Valid 4-part 13F position-change actions (13F:{cik}:{cusip}:{action}).
+# 3-part portfolio summary keys from ingestion/edgar.py (TOTAL_VALUE,
+# NUM_POSITIONS, TOP5_CONCENTRATION) and unrecognized actions are never flows.
+_VALID_13F_ACTIONS: frozenset[str] = frozenset({"NEW", "INCREASED", "DECREASED", "CLOSED"})
+
+# Strict equity/ETF ticker pattern (rejects issuer names like "APPLE INC").
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
+
+_UNSET = object()
+_CUSIP_TICKER_MAP: Any = None
 
 # Source types we normalize
 _SOURCE_TYPES = [
@@ -128,9 +140,250 @@ def _as_date(value: Any) -> date | None:
         return None
 
 
+def _coerce_ts(value: Any) -> datetime | None:
+    """Coerce a raw pull_timestamp value to ``datetime`` (Postgres or SQLite)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _ts_utc(ts: datetime | None) -> datetime:
+    """Normalize a timestamp to UTC (naive taken as UTC, matching griddb)."""
+    if ts is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _utc_date(ts: datetime | None) -> date | None:
+    if ts is None:
+        return None
+    return _ts_utc(ts).date()
+
+
+def _dedup_raw_series_vintages(
+    rows: list[Any],
+    *,
+    as_of: date | None = None,
+    as_of_ts: datetime | None = None,
+    filter_pull_by_as_of: bool = False,
+) -> list[tuple[str, date, Any, Any, datetime | None]]:
+    """Collapse ``(series_id, obs_date, value, raw_payload, pull_timestamp)``
+    rows to the latest PIT-eligible vintage per ``(series_id, obs_date)``.
+
+    Mirrors ``store/observations.py`` ``LATEST_AS_OF`` semantics in Python so
+    behavior is identical on PostgreSQL and SQLite.
+    """
+    as_of_ts_utc = _ts_utc(as_of_ts) if as_of_ts is not None else None
+    best: dict[tuple[str, date], tuple[datetime, tuple[str, date, Any, Any, datetime | None]]] = {}
+
+    for row in rows:
+        series_id = row[0]
+        obs_date = _as_date(row[1])
+        if obs_date is None:
+            continue
+        pull_ts = _coerce_ts(row[4]) if len(row) > 4 else None
+        pull_utc = _ts_utc(pull_ts)
+
+        if as_of_ts_utc is not None and pull_ts is not None and pull_utc > as_of_ts_utc:
+            continue
+        if as_of_ts_utc is None and filter_pull_by_as_of and as_of is not None:
+            if pull_ts is not None and pull_utc.date() > as_of:
+                continue
+
+        key = (series_id, obs_date)
+        prev = best.get(key)
+        if prev is None or pull_utc > prev[0]:
+            best[key] = (pull_utc, (series_id, obs_date, row[2], row[3], pull_ts))
+
+    ordered = sorted(best.values(), key=lambda item: (item[1][1], item[1][0]), reverse=True)
+    return [item[1] for item in ordered]
+
+
+def _signed_direction_from_payload(
+    payload: dict[str, Any],
+    *,
+    buy_key: str | None = None,
+    sell_key: str | None = None,
+) -> tuple[str, str]:
+    """Derive directional label only when an explicit signed measure exists.
+
+    Unsigned volume fails closed to ``("neutral", "unsigned_volume")`` so it
+    never fabricates an inflow or outflow.
+    """
+    for key in ("net_flow", "signed_flow", "signed_volume", "buy_sell_imbalance"):
+        raw = payload.get(key)
+        if raw is not None and not isinstance(raw, bool):
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                val = float("nan")
+            if math.isfinite(val):
+                if val > 0:
+                    return "inflow", key
+                if val < 0:
+                    return "outflow", key
+                return "neutral", key
+
+    if buy_key and sell_key and payload.get(buy_key) is not None and payload.get(sell_key) is not None:
+        raw_b, raw_s = payload.get(buy_key), payload.get(sell_key)
+        if not isinstance(raw_b, bool) and not isinstance(raw_s, bool):
+            try:
+                buy_v, sell_v = float(raw_b), float(raw_s)
+            except (TypeError, ValueError):
+                buy_v = sell_v = float("nan")
+            if math.isfinite(buy_v) and math.isfinite(sell_v):
+                basis = f"{buy_key}_vs_{sell_key}"
+                if buy_v > sell_v:
+                    return "inflow", basis
+                if sell_v > buy_v:
+                    return "outflow", basis
+                return "neutral", basis
+
+    raw_dir = payload.get("direction")
+    if isinstance(raw_dir, str) and raw_dir.strip():
+        d_low = raw_dir.strip().lower()
+        if d_low in ("inflow", "buy", "bullish", "accumulation"):
+            return "inflow", "explicit_direction"
+        if d_low in ("outflow", "sell", "bearish", "distribution"):
+            return "outflow", "explicit_direction"
+        if d_low == "neutral":
+            return "neutral", "explicit_direction"
+
+    return "neutral", "unsigned_volume"
+
+
+def _normalize_ticker_candidate(raw: Any) -> str | None:
+    """Return a clean uppercase ticker symbol, or ``None`` for non-tickers."""
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.strip().upper()
+    if not candidate or not _TICKER_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _get_cusip_ticker_map() -> Any:
+    """Lazily load ``CusipTickerMap`` (FTD CSV corpus) for CUSIP -> ticker lookup."""
+    global _CUSIP_TICKER_MAP
+    if _CUSIP_TICKER_MAP is None:
+        try:
+            from ingestion.altdata.sec_13f_live import CusipTickerMap
+            _CUSIP_TICKER_MAP = CusipTickerMap()
+        except Exception as exc:
+            log.debug("CusipTickerMap unavailable: {e}", e=str(exc))
+            _CUSIP_TICKER_MAP = False
+    return _CUSIP_TICKER_MAP if _CUSIP_TICKER_MAP else None
+
+
+def _table_exists(conn: Any, table_name: str) -> bool:
+    try:
+        return bool(sa_inspect(conn).has_table(table_name))
+    except Exception:
+        return False
+
+
+def _resolve_13f_ticker(
+    conn: Any,
+    cusip: str,
+    payload: dict[str, Any],
+    obs_date: date,
+    *,
+    has_sec_ids: bool,
+    has_inst_holdings: bool,
+    cusip_map: Any,
+    cache: dict[tuple[str, date], str | None],
+) -> str | None:
+    """Resolve a 13F holding to a real ticker symbol (never ``issuer_name``).
+
+    Resolution order (PIT-safe):
+      1. Explicit ``payload["ticker"]`` if valid.
+      2. ``security_identifiers`` (cusip -> entity_id -> ticker valid on ``obs_date``).
+      3. ``institutional_holdings`` (cusip -> ticker filed on/before ``obs_date``).
+      4. ``CusipTickerMap`` fallback (if provided or lazily loaded).
+    Returns ``None`` when no real ticker mapping exists.
+    """
+    explicit = _normalize_ticker_candidate(payload.get("ticker"))
+    if explicit is not None:
+        return explicit
+
+    cusip_norm = cusip.strip().upper()
+    if not cusip_norm:
+        return None
+
+    cache_key = (cusip_norm, obs_date)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    resolved: str | None = None
+
+    if has_sec_ids:
+        try:
+            hit = conn.execute(
+                text(
+                    "SELECT t.id_value "
+                    "FROM security_identifiers c "
+                    "JOIN security_identifiers t ON t.entity_id = c.entity_id "
+                    "WHERE c.id_scheme = :c_scheme AND UPPER(c.id_value) = :cusip "
+                    "AND c.valid_from <= :as_of "
+                    "AND (c.valid_to IS NULL OR c.valid_to >= :as_of) "
+                    "AND t.id_scheme = :t_scheme "
+                    "AND t.valid_from <= :as_of "
+                    "AND (t.valid_to IS NULL OR t.valid_to >= :as_of) "
+                    "ORDER BY t.is_primary DESC, t.valid_from DESC, t.entity_id ASC "
+                    "LIMIT 1"
+                ),
+                {
+                    "c_scheme": "cusip",
+                    "t_scheme": "ticker",
+                    "cusip": cusip_norm,
+                    "as_of": obs_date,
+                },
+            ).fetchone()
+            if hit and hit[0]:
+                resolved = _normalize_ticker_candidate(hit[0])
+        except Exception as exc:
+            log.debug("security_identifiers CUSIP lookup failed for {c}: {e}", c=cusip_norm, e=str(exc))
+
+    if resolved is None and has_inst_holdings:
+        try:
+            hit = conn.execute(
+                text(
+                    "SELECT ticker FROM institutional_holdings "
+                    "WHERE UPPER(cusip) = :cusip "
+                    "AND COALESCE(filed_date, report_date) <= :as_of "
+                    "ORDER BY COALESCE(filed_date, report_date) DESC LIMIT 1"
+                ),
+                {"cusip": cusip_norm, "as_of": obs_date},
+            ).fetchone()
+            if hit and hit[0]:
+                resolved = _normalize_ticker_candidate(hit[0])
+        except Exception as exc:
+            log.debug("institutional_holdings CUSIP lookup failed for {c}: {e}", c=cusip_norm, e=str(exc))
+
+    if resolved is None:
+        cmap = _get_cusip_ticker_map() if cusip_map is _UNSET else cusip_map
+        if cmap is not None:
+            try:
+                resolved = _normalize_ticker_candidate(cmap.lookup(cusip_norm))
+            except Exception as exc:
+                log.debug("CusipTickerMap lookup failed for {c}: {e}", c=cusip_norm, e=str(exc))
+
+    cache[cache_key] = resolved
+    return resolved
+
+
 def _ensure_table(engine: Engine) -> None:
     """Create dollar_flows table if it does not exist."""
     with engine.begin() as conn:
+        if _table_exists(conn, "dollar_flows"):
+            return
         for stmt in CREATE_TABLE_SQL.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
@@ -434,13 +687,16 @@ def _normalize_darkpool(row: dict, engine: Engine) -> tuple[dict | None, str | N
         return None, "stale_vwap"
 
     amount = volume * vwap_obs.value
+    direction, direction_basis = _signed_direction_from_payload(
+        sv, buy_key="buy_volume", sell_key="sell_volume",
+    )
 
     return {
         "source_type": "darkpool",
         "actor_name": row.get("source_id", ""),
         "ticker": ticker,
         "amount_usd": amount,
-        "direction": "inflow",  # Dark pool direction is ambiguous
+        "direction": direction,  # neutral on unsigned ATS volume; signed only when measured
         "confidence": "estimated",
         "evidence": {
             "volume": volume,
@@ -448,6 +704,7 @@ def _normalize_darkpool(row: dict, engine: Engine) -> tuple[dict | None, str | N
             "vwap_obs_date": vwap_obs.obs_date.isoformat(),
             "spike_ratio": sv.get("spike_ratio"),
             "signal_type": row.get("signal_type"),
+            "direction_basis": direction_basis,
         },
         "flow_date": obs_date,
     }, None
@@ -631,92 +888,181 @@ def _normalize_lobbying(row: dict) -> dict | None:
 
 # ── 13F + ETF flow normalization (from raw_series) ───────────────────────
 
-def _normalize_13f_flows(engine: Engine, days: int) -> list[dict]:
-    """Extract 13F position changes from raw_series and normalize to USD.
+def _normalize_13f_flows(
+    engine: Engine,
+    days: int,
+    *,
+    as_of: date | None = None,
+    as_of_ts: datetime | None = None,
+    cusip_map: Any = _UNSET,
+    skipped_counts: dict[str, int] | None = None,
+) -> list[dict]:
+    """Extract 13F position changes (raw_series) and normalize to USD.
+
+    Only 4-part flow keys ``13F:{cik}:{cusip}:{NEW|INCREASED|DECREASED|CLOSED}``
+    are accepted; 3-part portfolio summaries (``TOTAL_VALUE``, ``NUM_POSITIONS``,
+    ``TOP5_CONCENTRATION``) and unknown actions are skipped (fail closed).
+    Deduplicates vintages to the latest PIT-eligible pull per
+    ``(series_id, obs_date)`` and resolves CUSIPs to real tickers instead of
+    copying ``issuer_name``.
 
     Parameters:
         engine: SQLAlchemy engine.
         days: Lookback window in days.
+        as_of: Optional PIT observation date upper bound (defaults to today).
+        as_of_ts: Optional PIT pull-timestamp upper bound.
+        cusip_map: Optional CUSIP->ticker mapper override (None disables FTD
+            CSV fallback; default lazily loads ``CusipTickerMap``).
+        skipped_counts: Optional dict updated in place with ``future_date``,
+            ``non_flow_13f``, and ``unmapped_cusip`` counters.
 
     Returns:
         List of normalized flow dicts.
     """
-    cutoff = date.today() - timedelta(days=days)
+    effective_as_of = as_of or date.today()
+    cutoff = effective_as_of - timedelta(days=days)
+    # Direct callers enforce obs_date <= effective_as_of in SQL; normalize_all_flows
+    # passes skipped_counts so future-dated 13F rows are counted and dropped below.
+    sql_as_of = effective_as_of if skipped_counts is None else as_of
     flows: list[dict] = []
+    skipped_non_flow = 0
+    unmapped_cusip = 0
 
     try:
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT series_id, obs_date, value, raw_payload "
+                    "SELECT series_id, obs_date, value, raw_payload, pull_timestamp "
                     "FROM raw_series "
                     "WHERE series_id LIKE :pattern "
                     "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= :cutoff "
-                    "ORDER BY obs_date DESC"
+                    "AND (:as_of IS NULL OR obs_date <= :as_of) "
+                    "AND (:as_of_ts IS NULL OR pull_timestamp <= :as_of_ts) "
+                    "ORDER BY series_id ASC, obs_date DESC, pull_timestamp DESC"
                 ),
-                {"pattern": "13F:%", "cutoff": cutoff},
+                {
+                    "pattern": "13F:%",
+                    "cutoff": cutoff,
+                    "as_of": sql_as_of,
+                    "as_of_ts": as_of_ts,
+                },
             ).fetchall()
 
-        for row in rows:
-            series_id = row[0]
-            obs_date = _as_date(row[1])
-            value_usd = float(row[2]) if row[2] else 0.0
-            payload = row[3] or {}
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except (json.JSONDecodeError, TypeError):
+            deduped = _dedup_raw_series_vintages(
+                rows,
+                as_of=as_of,
+                as_of_ts=as_of_ts,
+                filter_pull_by_as_of=(as_of is not None),
+            )
+            has_sec_ids = _table_exists(conn, "security_identifiers")
+            has_inst_holdings = _table_exists(conn, "institutional_holdings")
+            ticker_cache: dict[tuple[str, date], str | None] = {}
+
+            for series_id, obs_date, raw_val, raw_payload, _pull_ts in deduped:
+                # Strict 4-part flow key: 13F:{cik}:{cusip}:{action}
+                parts = series_id.split(":")
+                if len(parts) != 4 or parts[0] != "13F" or not parts[1].strip() or not parts[2].strip():
+                    skipped_non_flow += 1
+                    continue
+
+                cik = parts[1].strip()
+                cusip = parts[2].strip().upper()
+                action = parts[3].strip().upper()
+                if action not in _VALID_13F_ACTIONS:
+                    skipped_non_flow += 1
+                    continue
+
+                if obs_date > effective_as_of:
+                    if skipped_counts is not None:
+                        skipped_counts["future_date"] = skipped_counts.get("future_date", 0) + 1
+                    continue
+
+                if raw_val is None:
+                    continue
+                value_usd = float(raw_val)
+                if not math.isfinite(value_usd) or abs(value_usd) <= 0:
+                    continue
+
+                payload = raw_payload or {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except (json.JSONDecodeError, TypeError):
+                        payload = {}
+                if not isinstance(payload, dict):
                     payload = {}
 
-            if abs(value_usd) <= 0:
-                continue
+                direction = "inflow" if action in ("NEW", "INCREASED") else "outflow"
+                manager_name = payload.get("manager_name") or cik
+                resolved_ticker = _resolve_13f_ticker(
+                    conn,
+                    cusip,
+                    payload,
+                    obs_date,
+                    has_sec_ids=has_sec_ids,
+                    has_inst_holdings=has_inst_holdings,
+                    cusip_map=cusip_map,
+                    cache=ticker_cache,
+                )
+                if resolved_ticker is None:
+                    unmapped_cusip += 1
 
-            # Parse series_id: 13F:{cik}:{cusip}:{action}
-            parts = series_id.split(":")
-            action = parts[3] if len(parts) > 3 else "UNKNOWN"
-            manager_name = payload.get("manager_name", parts[1] if len(parts) > 1 else "")
+                flows.append({
+                    "source_type": "13f",
+                    "actor_name": manager_name,
+                    "ticker": resolved_ticker,
+                    "amount_usd": abs(value_usd),
+                    "direction": direction,
+                    "confidence": "confirmed",
+                    "evidence": {
+                        "cusip": payload.get("cusip") or cusip,
+                        "issuer_name": payload.get("issuer_name"),
+                        "action": action,
+                        "pct_change": payload.get("pct_change"),
+                        "shares": payload.get("shares"),
+                        "filing_accession": payload.get("filing_accession"),
+                    },
+                    "flow_date": obs_date,
+                })
 
-            if action in ("NEW", "INCREASED"):
-                direction = "inflow"
-            elif action in ("CLOSED", "DECREASED"):
-                direction = "outflow"
-            else:
-                direction = "inflow"
-
-            flows.append({
-                "source_type": "13f",
-                "actor_name": manager_name,
-                "ticker": payload.get("issuer_name", ""),
-                "amount_usd": abs(value_usd),
-                "direction": direction,
-                "confidence": "confirmed",
-                "evidence": {
-                    "cusip": payload.get("cusip"),
-                    "action": action,
-                    "pct_change": payload.get("pct_change"),
-                    "shares": payload.get("shares"),
-                    "filing_accession": payload.get("filing_accession"),
-                },
-                "flow_date": obs_date,
-            })
+        if skipped_counts is not None:
+            skipped_counts["non_flow_13f"] = skipped_counts.get("non_flow_13f", 0) + skipped_non_flow
+            skipped_counts["unmapped_cusip"] = skipped_counts.get("unmapped_cusip", 0) + unmapped_cusip
+        if skipped_non_flow or unmapped_cusip:
+            log.debug(
+                "13F normalization kept {k} flows (skipped_non_flow={nf}, unmapped_cusip={uc})",
+                k=len(flows), nf=skipped_non_flow, uc=unmapped_cusip,
+            )
     except Exception as exc:
         log.warning("13F flow normalization failed: {e}", e=str(exc))
 
     return flows
 
 
-def _normalize_etf_flows(engine: Engine, days: int) -> list[dict]:
+def _normalize_etf_flows(
+    engine: Engine,
+    days: int,
+    *,
+    as_of: date | None = None,
+    as_of_ts: datetime | None = None,
+    skipped_counts: dict[str, int] | None = None,
+) -> list[dict]:
     """Extract ETF flow data from raw_series and normalize to USD.
 
     Parameters:
         engine: SQLAlchemy engine.
         days: Lookback window in days.
+        as_of: Optional PIT observation date upper bound (defaults to today).
+        as_of_ts: Optional PIT pull-timestamp upper bound.
+        skipped_counts: Optional dict updated in place with ``future_date``.
 
     Returns:
         List of normalized flow dicts.
     """
-    cutoff = date.today() - timedelta(days=days)
+    effective_as_of = as_of or date.today()
+    cutoff = effective_as_of - timedelta(days=days)
+    sql_as_of = effective_as_of if skipped_counts is None else as_of
     flows: list[dict] = []
 
     try:
@@ -724,51 +1070,71 @@ def _normalize_etf_flows(engine: Engine, days: int) -> list[dict]:
             # ETF_FLOW:{ticker}:5d series contains 5-day rolling $ flows
             rows = conn.execute(
                 text(
-                    "SELECT series_id, obs_date, value, raw_payload "
+                    "SELECT series_id, obs_date, value, raw_payload, pull_timestamp "
                     "FROM raw_series "
                     "WHERE series_id LIKE :pattern "
                     "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= :cutoff "
-                    "ORDER BY obs_date DESC"
+                    "AND (:as_of IS NULL OR obs_date <= :as_of) "
+                    "AND (:as_of_ts IS NULL OR pull_timestamp <= :as_of_ts) "
+                    "ORDER BY series_id ASC, obs_date DESC, pull_timestamp DESC"
                 ),
-                {"pattern": "ETF_FLOW:%:5d", "cutoff": cutoff},
+                {
+                    "pattern": "ETF_FLOW:%:5d",
+                    "cutoff": cutoff,
+                    "as_of": sql_as_of,
+                    "as_of_ts": as_of_ts,
+                },
             ).fetchall()
 
-        for row in rows:
-            series_id = row[0]
-            obs_date = _as_date(row[1])
-            value = float(row[2]) if row[2] else 0.0
-            payload = row[3] or {}
+        deduped = _dedup_raw_series_vintages(
+            rows,
+            as_of=as_of,
+            as_of_ts=as_of_ts,
+            filter_pull_by_as_of=(as_of is not None),
+        )
+
+        for series_id, obs_date, raw_val, raw_payload, _pull_ts in deduped:
+            if obs_date > effective_as_of:
+                if skipped_counts is not None:
+                    skipped_counts["future_date"] = skipped_counts.get("future_date", 0) + 1
+                continue
+            if raw_val is None:
+                continue
+            value = float(raw_val)
+            if not math.isfinite(value) or abs(value) <= 0:
+                continue
+
+            payload = raw_payload or {}
             if isinstance(payload, str):
                 try:
                     payload = json.loads(payload)
                 except (json.JSONDecodeError, TypeError):
                     payload = {}
-
-            if abs(value) <= 0:
-                continue
+            if not isinstance(payload, dict):
+                payload = {}
 
             # Parse series_id: ETF_FLOW:{ticker}:5d
-            # Note: ETF 5d series is total $ volume, not net flow.
-            # Use a fraction (~2%) as estimated net flow; direction from
-            # price change would be more accurate but volume is a proxy.
+            # ETF 5d series is unsigned dollar volume (Close * Volume), not
+            # signed creations/redemptions. Emit direction='neutral' unless a
+            # signed measure is present in the payload.
             parts = series_id.split(":")
             ticker = parts[1] if len(parts) > 1 else ""
-            # Real ETF net flow is ~0.1-0.5% of daily volume.
-            # SPY daily volume ~$50B, net flow ~$200M-$2B = 0.4-4%
-            # Use 0.3% as conservative estimate
+            # Conservative magnitude proxy (~0.3% of 5d dollar volume)
             estimated_net = value * 0.003
+            direction, direction_basis = _signed_direction_from_payload(payload)
 
             flows.append({
                 "source_type": "etf_flow",
                 "actor_name": f"ETF:{ticker}",
                 "ticker": ticker,
                 "amount_usd": abs(estimated_net),
-                "direction": "inflow",  # volume-based proxy; needs price direction for accuracy
+                "direction": direction,
                 "confidence": "estimated",
                 "evidence": {
                     "series_id": series_id,
                     "raw_value": value,
+                    "direction_basis": direction_basis,
                 },
                 "flow_date": obs_date,
             })
@@ -927,13 +1293,18 @@ def normalize_all_flows(
             by_source[normalized["source_type"]] += 1
 
     # 2. Normalize raw_series-based flows (13F + ETF), same future-date guard
-    for f in _normalize_13f_flows(engine, days) + _normalize_etf_flows(engine, days):
+    raw_skips: dict[str, int] = {}
+    for f in (
+        _normalize_13f_flows(engine, days, skipped_counts=raw_skips)
+        + _normalize_etf_flows(engine, days, skipped_counts=raw_skips)
+    ):
         fdate = f.get("flow_date")
         if fdate and fdate > today:
             skipped_future_date += 1
             continue
         all_flows.append(f)
         by_source[f["source_type"]] += 1
+    skipped_future_date += raw_skips.get("future_date", 0)
 
     # 3. Persist to dollar_flows table (skipped entirely in a dry run)
     persisted = 0
@@ -1152,28 +1523,32 @@ def get_flows_by_sector(engine: Engine, sector: str, days: int = 30) -> list[dic
     ]
 
 
-def get_aggregate_flows(engine: Engine, days: int = 30) -> dict[str, Any]:
+def get_aggregate_flows(
+    engine: Engine, days: int = 30, *, as_of: date | None = None
+) -> dict[str, Any]:
     """Compute aggregate net flows per sector and per actor tier.
 
     Parameters:
         engine: SQLAlchemy engine.
         days: Lookback window in days (default 30).
+        as_of: Optional PIT upper bound on ``flow_date`` (defaults to today).
 
     Returns:
         Dict with 'by_sector', 'by_source_type', 'by_actor' aggregations
         and 'total_inflow', 'total_outflow', 'net_flow'.
     """
     _ensure_table(engine)
-    cutoff = date.today() - timedelta(days=days)
+    ref_date = as_of or date.today()
+    cutoff = ref_date - timedelta(days=days)
 
     with engine.connect() as conn:
         rows = conn.execute(
             text(
                 "SELECT source_type, actor_name, ticker, amount_usd, direction "
                 "FROM dollar_flows "
-                "WHERE flow_date >= :cutoff"
+                "WHERE flow_date >= :cutoff AND flow_date <= :as_of"
             ),
-            {"cutoff": cutoff},
+            {"cutoff": cutoff, "as_of": ref_date},
         ).fetchall()
 
     sector_flows: dict[str, dict[str, float]] = defaultdict(
@@ -1196,18 +1571,23 @@ def get_aggregate_flows(engine: Engine, days: int = 30) -> dict[str, Any]:
         amount = float(r[3]) if r[3] else 0.0
         direction = r[4]
 
-        sector = _get_sector(ticker)
+        # Require a real ticker-to-sector mapping before sector aggregation.
+        sector = _get_sector(ticker) if ticker else "Unknown"
+        has_real_sector = bool(ticker) and sector != "Unknown"
 
         if direction == "inflow":
             total_inflow += amount
-            sector_flows[sector]["inflow"] += amount
+            if has_real_sector:
+                sector_flows[sector]["inflow"] += amount
             source_type_flows[source_type]["inflow"] += amount
             actor_flows[actor_name]["inflow"] += amount
-        else:
+        elif direction == "outflow":
             total_outflow += amount
-            sector_flows[sector]["outflow"] += amount
+            if has_real_sector:
+                sector_flows[sector]["outflow"] += amount
             source_type_flows[source_type]["outflow"] += amount
             actor_flows[actor_name]["outflow"] += amount
+        # Unsigned / neutral rows contribute no directional inflow or outflow.
 
     # Compute net flows
     def _net(d: dict[str, float]) -> dict[str, float]:
